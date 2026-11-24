@@ -206,6 +206,40 @@ __device__ __forceinline__ void rope8(uint32_t (&w)[4], uint2 cs, uint2 sn)
     }
 }
 
+// Select the packed coefficient and (-odd, even) directly in the BF16
+// instructions. Preserve rope8's BF16 multiply followed by BF16 FMA rounding.
+template <bool HIGH>
+__device__ __forceinline__ uint32_t rope_pair_select(uint32_t w, uint32_t cs, uint32_t sn)
+{
+    uint32_t t, out;
+    if constexpr(HIGH)
+    {
+        asm("v_pk_mul_bf16 %0, %1, %2 op_sel:[1,1] op_sel_hi:[0,1] neg_lo:[1,0]"
+            : "=v"(t) : "v"(w), "v"(sn));
+        asm("v_pk_fma_bf16 %0, %1, %2, %3 op_sel:[0,1,0] op_sel_hi:[1,1,1]"
+            : "=v"(out) : "v"(w), "v"(cs), "v"(t));
+    }
+    else
+    {
+        asm("v_pk_mul_bf16 %0, %1, %2 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[1,0]"
+            : "=v"(t) : "v"(w), "v"(sn));
+        asm("v_pk_fma_bf16 %0, %1, %2, %3 op_sel:[0,0,0] op_sel_hi:[1,0,1]"
+            : "=v"(out) : "v"(w), "v"(cs), "v"(t));
+    }
+    return out;
+}
+
+__device__ __forceinline__ void rope8_select(uint32_t (&w)[4], uint2 cs, uint2 sn)
+{
+#pragma unroll
+    for(int p = 0; p < 4; ++p)
+    {
+        const uint32_t cw = p < 2 ? cs.x : cs.y, sw = p < 2 ? sn.x : sn.y;
+        w[p] = (p & 1) ? rope_pair_select<true>(w[p], cw, sw)
+                       : rope_pair_select<false>(w[p], cw, sw);
+    }
+}
+
 __device__ __forceinline__ void unpack8(const uint32_t (&w)[4], float* x)
 {
 #pragma unroll
@@ -481,10 +515,10 @@ __device__ __forceinline__ void k_block(const Args& a, int n, uint16_t* lds)
             *reinterpret_cast<uint4*>(aux_tile + 1792 + (t - 76) * 16) = f;
     }
 }
-// BS=1536 joint path: four Q waves cover 128 heads, eight K waves
+// Joint Q/K path: four Q waves cover 128 heads, eight K waves
 // cover the tail tile. Each Q wave loads 32 heads and computes four passes.
 // Q and K have disjoint LDS and output regions; no CTA barrier is needed.
-template<bool ROPE>
+template<bool ROPE, bool PACKED_ROPE = false>
 __device__ __forceinline__ void q_block_joint(const Args& a,int qb,uint16_t* lds){
  const int lane=threadIdx.x&31;
  const int wave=__builtin_amdgcn_readfirstlane(int(threadIdx.x>>5));
@@ -498,8 +532,8 @@ __device__ __forceinline__ void q_block_joint(const Args& a,int qb,uint16_t* lds
  win.async_load(0u);
  uint8_t* out=a.qa+(int64_t(b)*128+h8+hl)*128;
  if(meta_slot<0){
- // Retain the loop: unrolling extends live ranges and reduces residency.
- #pragma unroll 1
+ // Packed RoPE leaves register headroom for unrolled padding writes.
+ #pragma clang loop unroll_count(PACKED_ROPE ? 4 : 1)
  for(int pass=0;pass<4;pass++){
   *reinterpret_cast<uint4*>(out+pass*8*128+16*j)=make_uint4(0,0,0,0);
   uint32_t v=j==0?0:0x7f7f7f7f;
@@ -517,7 +551,10 @@ __device__ __forceinline__ void q_block_joint(const Args& a,int qb,uint16_t* lds
  const uint4 raw0=*reinterpret_cast<const uint4*>(tile+(hl+8*pass)*64+16*j);
  const uint4 raw1=*reinterpret_cast<const uint4*>(tile+(hl+8*pass)*64+16*j+8);
  uint32_t w0[4]={raw0.x,raw0.y,raw0.z,raw0.w},w1[4]={raw1.x,raw1.y,raw1.z,raw1.w};
- if(ROPE){rope8(w0,cs0,sn0);rope8(w1,cs1,sn1);}
+ if(ROPE){
+  if constexpr(PACKED_ROPE){rope8_select(w0,cs0,sn0);rope8_select(w1,cs1,sn1);}
+  else {rope8(w0,cs0,sn0);rope8(w1,cs1,sn1);}
+ }
  float x[16],res[16];unpack8(w0,x);unpack8(w1,x+8);
  float m=0;
  #pragma unroll
@@ -600,13 +637,13 @@ else
 }
 
 // Fixed-stride DSR1 entry. The host checks every specialized stride.
-template<bool ROPE>
-__global__ __launch_bounds__(384) void mla_nvfp4_decode_prep_dsr1_kernel(const uint16_t* p_q_rope,uint8_t* p_qa,uint16_t* p_ring,const uint16_t* p_k_nope,const uint16_t* p_k_rope,const int32_t* p_req,uint8_t* p_kv_nope,uint8_t* p_kv_aux,const int64_t* p_pos,const int64_t* p_slot,const uint16_t* p_cos,const uint16_t* p_sin,int64_t p_ring_rows,int64_t p_pages) {
+template<bool ROPE, bool PACKED_ROPE = false>
+__global__ __launch_bounds__(384) void mla_nvfp4_decode_prep_dsr1_kernel(const uint16_t* p_q_rope,uint8_t* p_qa,uint16_t* p_ring,const uint16_t* p_k_nope,const uint16_t* p_k_rope,const int32_t* p_req,uint8_t* p_kv_nope,uint8_t* p_kv_aux,const int64_t* p_pos,const int64_t* p_slot,const uint16_t* p_cos,const uint16_t* p_sin,int64_t p_ring_rows,int64_t p_pages,int p_batch) {
 #if defined(__gfx1250__)
 using namespace mla_nvfp4_prep;
 Args a{};
-a.k_blocks = 1536;
-a.q_rows = 1536;
+a.k_blocks = p_batch;
+a.q_rows = p_batch;
 a.slot = p_slot;
 a.pos = p_pos;
 a.cos = p_cos;
@@ -628,7 +665,7 @@ a.kv_nope = p_kv_nope;
 a.kv_aux = p_kv_aux;
 a.pages = p_pages;
 __shared__ uint16_t lds[16384];
-const int bid=blockIdx.x; if(threadIdx.x<128) q_block_joint<ROPE>(a,bid,lds); else k_block<ROPE,128,true>(a,bid,lds+8192);
+const int bid=blockIdx.x; if(threadIdx.x<128) q_block_joint<ROPE,PACKED_ROPE>(a,bid,lds); else k_block<ROPE,128,true>(a,bid,lds+8192);
 #endif
 }
 
@@ -769,16 +806,28 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
         a.cos        = static_cast<const uint16_t*>(cos_cache->data_ptr());
         a.sin        = static_cast<const uint16_t*>(sin_cache->data_ptr());
         a.stride_cos = cos_cache->stride(0);
-        // Enabled only for the measured DSR1 batch and fused RoPE path.
-        // Flattened kernel arguments also enable kernarg preload on gfx1250.
-        // All used arguments fit the gfx1250 kernarg preload window here.
-        if(b == 1536 && a.stride_qrh == 192 && a.stride_knope == 512 &&
-           a.stride_krope == 2112 && a.stride_req == 61 * 16 * 576 &&
-           a.stride_slot == 576 && a.stride_cos == 32)
-            mla_nvfp4_decode_prep_dsr1_kernel<true><<<int(b), 384, 0, stream>>>(
-                a.q_rope, a.qa, a.ring, a.k_nope, a.k_rope, a.req,
-                a.kv_nope, a.kv_aux, a.pos, a.slot, a.cos, a.sin, a.ring_rows, a.pages);
-        else if(b == 1536)
+        // Keep small batches on the separate Q/K-block path. Large batches
+        // share one joint block per request, including graph-padding rows.
+        // Fixed model strides keep the runtime-batch argument list compact
+        // (116 bytes), within gfx1250's kernarg preload window.
+        if(b >= 1024 && a.stride_qrh == 192 && a.stride_knope == 512 &&
+            a.stride_krope == 2112 && a.stride_req == 61 * 16 * 576 &&
+            a.stride_slot == 576 && a.stride_cos == 32)
+        {
+            // Packed Q RoPE reduces VGPRs from 76 to 60. Its measured benefit
+            // starts at larger batches; preserve the smaller-batch schedule.
+            if(b >= 2048)
+                mla_nvfp4_decode_prep_dsr1_kernel<true, true><<<int(b), 384, 0, stream>>>(
+                    a.q_rope, a.qa, a.ring, a.k_nope, a.k_rope, a.req,
+                    a.kv_nope, a.kv_aux, a.pos, a.slot, a.cos, a.sin, a.ring_rows, a.pages,
+                    int(b));
+            else
+                mla_nvfp4_decode_prep_dsr1_kernel<true><<<int(b), 384, 0, stream>>>(
+                    a.q_rope, a.qa, a.ring, a.k_nope, a.k_rope, a.req,
+                    a.kv_nope, a.kv_aux, a.pos, a.slot, a.cos, a.sin, a.ring_rows, a.pages,
+                    int(b));
+        }
+        else if(b >= 1024)
             mla_nvfp4_decode_prep_joint_kernel<true><<<int(b), 384, 0, stream>>>(
                 a.k_blocks,a.q_rows,a.slot,a.pos,a.cos,a.sin,a.stride_cos,a.q_rope,a.qa,a.stride_qrh,a.ring,a.req,a.k_nope,a.k_rope,a.stride_knope,a.stride_krope,a.ring_rows,a.stride_req,a.stride_slot,a.kv_nope,a.kv_aux,a.pages);
         else

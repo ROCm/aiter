@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Run on gfx1250: python -m pytest op_tests/test_mla_nvfp4_decode_prep.py -q.
+"""Run on gfx1250:
+
+python op_tests/test_mla_nvfp4_decode_prep.py --batch 1536 2048 2200 2240 2300
+python -m pytest op_tests/test_mla_nvfp4_decode_prep.py -q.
 
 mla_nvfp4_decode_prep against the module's own producers, byte for byte, over
 several decode steps from the same stale bytes: Q's RoPE bytes against
@@ -11,6 +14,7 @@ Triton RoPE (RotaryEmbedding.forward_triton, AITER_ROPE_TRITON_BACKEND=1).
 
 import pytest
 import torch
+from aiter.test_common import benchmark
 
 from aiter.ops.mla_nvfp4 import (
     mla_nvfp4_decode_prep,
@@ -39,8 +43,7 @@ def require_gpu():
         pytest.skip("requires gfx1250")
 
 
-@pytest.fixture(scope="module")
-def rope():
+def make_rope():
     from aiter.rotary_embedding import get_rope
 
     r = get_rope(
@@ -54,6 +57,11 @@ def rope():
     ).to("cuda")
     assert r.cos_cache.dtype == torch.bfloat16 and r.cos_cache.shape[-1] == 32
     return r
+
+
+@pytest.fixture(scope="module")
+def rope():
+    return make_rope()
 
 
 def values(gen, *shape, s=1.0):
@@ -145,7 +153,14 @@ def reference_step(case, ring, cn, ca, q, k, rope_mod, fused):
 
 @pytest.mark.parametrize("fused", [True, False])
 @pytest.mark.parametrize(
-    "b,live,steps,seed", [(1, 1, 3, 0), (37, 30, 6, 1), (1536, 1519, 3, 2)]
+    "b,live,steps,seed",
+    [
+        (1, 1, 3, 0),
+        (37, 30, 6, 1),
+        (1536, 1519, 3, 2),
+        (2048, 2031, 3, 3),
+        (2300, 2283, 3, 4),
+    ],
 )
 def test_decode_prep_matches_the_producers(rope, fused, b, live, steps, seed):
     case = Case(b, live, seed)
@@ -269,3 +284,228 @@ def test_contracts(rope):
         call(q_rope=q.transpose(0, 1).contiguous().transpose(0, 1)[..., 512:])
     with pytest.raises(RuntimeError):
         call(q_rope=q[..., 512:].float())
+
+
+@pytest.mark.parametrize("qstride", [192, 200])
+@pytest.mark.parametrize(
+    "b", [1023, 1024, 1025, 1536, 1537, 2047, 2048, 2049, 2200, 2240, 2300]
+)
+@pytest.mark.parametrize("padding", [0, 17, None])
+def test_dsr1_strides_eager_and_graph(rope, b, padding, qstride):
+    live = b if padding is None else b - padding
+    case = Case(b, live, 913 + live)
+    backing = torch.full(
+        (b + 3, 61, 16, 576), 0.75, dtype=torch.bfloat16, device="cuda"
+    )
+    ring = backing[:, 17]
+    ring.copy_(case.ring)
+    ref_ring = case.ring.clone()
+    cn, ca = case.cn.clone(), case.ca.clone()
+    ref_cn, ref_ca = case.cn.clone(), case.ca.clone()
+    q_storage = torch.empty((b, 128, qstride), dtype=torch.bfloat16, device="cuda")
+    q_pe = q_storage[..., -64:]
+    kn = torch.empty((b, 512), dtype=torch.bfloat16, device="cuda")
+    k_storage = torch.empty((b, 2112), dtype=torch.bfloat16, device="cuda")
+    k_pe = k_storage[:, 2048:]
+    qa = torch.empty((b, 128, 128), dtype=torch.uint8, device="cuda")
+    slots = case.slots()
+    graph = None
+    assert (
+        q_pe.stride(1),
+        kn.stride(0),
+        k_pe.stride(0),
+        ring.stride(0),
+        ring.stride(1),
+        rope.cos_cache.stride(0),
+    ) == (qstride, 512, 2112, 562176, 576, 32)
+
+    def run():
+        mla_nvfp4_decode_prep(
+            q_pe,
+            qa,
+            ring,
+            case.req,
+            kn,
+            k_pe,
+            case.pos,
+            slots,
+            cn,
+            ca,
+            rope.cos_cache,
+            rope.sin_cache,
+        )
+
+    for step in range(3):
+        if padding is None:
+            # Replay the same captured shape as the scheduler changes live rows.
+            case.live = live = (b, b // 2, 0)[step]
+        q = values(case.gen, b, 128, 576, s=2.0)
+        k = values(case.gen, b, 576, s=0.5)
+        q_pe.copy_(q[..., 512:])
+        kn.copy_(k[:, :512])
+        k_pe.copy_(k[:, 512:])
+        stale = torch.randint(
+            0, 256, qa.shape, generator=case.gen, dtype=torch.uint8, device="cuda"
+        )
+        qa.copy_(stale)
+        slots.copy_(case.slots())
+        if step == 0:
+            run()
+        else:
+            if graph is None:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+            graph.replay()
+        want = reference_step(case, ref_ring, ref_cn, ref_ca, q, k, rope, True)
+        torch.cuda.synchronize()
+        assert torch.equal(qa[:live, :, :64], want[:live, :, :64])
+        assert torch.equal(qa[:live, :, 96:], want[:live, :, 96:])
+        assert torch.equal(qa[..., 64:96], stale[..., 64:96])
+        assert (qa[live:, :, :64] == 0).all()
+        assert (qa[live:, :, 96:104] == 0).all()
+        assert (qa[live:, :, 104:] == 127).all()
+        assert torch.equal(ring, ref_ring)
+        assert torch.equal(cn, ref_cn), f"step {step}: kv_nope differs"
+        assert torch.equal(ca, ref_ca), f"step {step}: kv_aux differs"
+        assert (backing[:, :17] == 0.75).all() and (backing[:, 18:] == 0.75).all()
+        case.pos.add_(1)
+
+
+# The script benchmark uses normal finite inputs. The pytest cases above also
+# cover tiny values/FTZ, stale cache bytes, changing positions and padding.
+def run_torch(q, cos, sin, positions):
+    """Independent BF16 RoPE + FP4 base/residual oracle, without native producers."""
+    cs = cos.reshape(-1, 32)[positions].float()[:, None, :]
+    sn = sin.reshape(-1, 32)[positions].float()[:, None, :]
+    even, odd = q[..., 0::2].float(), q[..., 1::2].float()
+    # BF16 multiply followed by a BF16 FMA, not FP32 RoPE. Double precision
+    # retains the exact finite BF16 product/add before the final BF16 rounding.
+    te = (-odd * sn).bfloat16().double()
+    to = (even * sn).bfloat16().double()
+    roped = torch.empty_like(q)
+    roped[..., 0::2] = (even.double() * cs.double() + te).bfloat16()
+    roped[..., 1::2] = (odd.double() * cs.double() + to).bfloat16()
+    f4 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=q.device)
+    gain = torch.tensor(6.72, dtype=torch.float32, device=q.device)
+
+    def quant(x):
+        blocks = x.reshape(*x.shape[:-1], 4, 16)
+        amax = blocks.abs().amax(-1)
+        ideal = torch.where(amax == 0, 1.0, amax / 6.0)
+        sf = (ideal * gain).clamp(1 / 512, 448).to(torch.float8_e4m3fn)
+        divisor = sf.float() / gain
+        v = blocks / divisor[..., None]
+        hi = torch.bucketize(v.abs().contiguous(), f4).clamp_max(7)
+        lo = (hi - 1).clamp_min(0)
+        dl, dh = v.abs() - f4[lo], f4[hi] - v.abs()
+        code = torch.where((dl < dh) | ((dl == dh) & ((lo & 1) == 0)), lo, hi)
+        code = (code | (torch.signbit(v).long() << 3)).to(torch.uint8)
+        vals = torch.where(
+            (code & 8) != 0, -f4[(code & 7).long()], f4[(code & 7).long()]
+        )
+        deq = (vals * sf.float()[..., None]) / gain
+        packed = code[..., 0::2] | (code[..., 1::2] << 4)
+        return packed.flatten(-2), sf.view(torch.uint8), deq.reshape_as(x)
+
+    bc, bs, deq = quant(roped.float())
+    ec, es, _ = quant(roped.float() - deq)
+    aux = torch.full((*q.shape[:2], 128), 127, dtype=torch.uint8, device=q.device)
+    aux[..., :32], aux[..., 32:64] = bc, ec
+    aux[..., 64:96] = 106
+    aux[..., 96:100], aux[..., 100:104] = bs, es
+    return roped, aux
+
+
+@benchmark()
+def bench_decode_prep(b, layout):
+    import aiter
+    from aiter import dtypes
+    from aiter.test_common import checkAllclose, run_perftest
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    torch.manual_seed(174)
+    # DSR1 q_b_proj gives 192 BF16 columns/head; ring has a 61-layer stride.
+    stride = 192 if layout == "dsr1" else 200
+    q = torch.randn((b, H, stride), dtype=dtypes.bf16, device="cuda")[..., -64:]
+    kn = torch.randn((b, 512), dtype=dtypes.bf16, device="cuda")
+    kr = torch.randn((b, 2112), dtype=dtypes.bf16, device="cuda")[:, 2048:]
+    pos = torch.arange(b, device="cuda", dtype=torch.int64) % 64
+    req = torch.arange(b, device="cuda", dtype=torch.int32)
+    slots = req.long() * 64 + pos
+    backing = torch.full((b, 61, 16, 576), 0.75, dtype=dtypes.bf16, device="cuda")
+    ring = backing[:, 17]
+    qa = torch.full((b, H, 128), 106, dtype=torch.uint8, device="cuda")
+    cn = torch.full((b, 16384), 90, dtype=torch.uint8, device="cuda")
+    ca = torch.full((b, 8192), 127, dtype=torch.uint8, device="cuda")
+    r = make_rope()
+    _, want = run_torch(q, r.cos_cache, r.sin_cache, pos)
+    candidates = {
+        "decode_prep": lambda: mla_nvfp4_decode_prep(
+            q, qa, ring, req, kn, kr, pos, slots, cn, ca, r.cos_cache, r.sin_cache
+        )
+    }
+    # Nominal RoPE FLOPs only (6/pair); quantization arithmetic is excluded.
+    flops = 6 * 32 * (H + 1) * b
+    # Logical global bytes, not measured HBM transactions. Count each input
+    # once, including shared cos/sin and metadata, and all output writes:
+    # Q: 128 BF16 bytes + 96 AUX bytes per head;
+    # K: new BF16 row read/write, historical NoPE rows read, the full 16-row
+    # NoPE code/scale tile written, and 72 new RoPE code/scale bytes.
+    # At tile start, another 1464 AUX bytes initialize later rows/padding.
+    # Excludes repeated lane loads, LDS traffic and cache-line amplification.
+    rn = pos % 16
+    nbytes = b * (H * (128 + 96) + 2 * 576 * 2 + 4608 + 72 + 128 + 20)
+    nbytes += int(rn.sum()) * 512 * 2 + int((rn == 0).sum()) * 1464
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        _, us = run_perftest(fn)
+        err = checkAllclose(want.float(), qa.float(), rtol=0, atol=0, msg=name)
+        assert err == 0, f"{name}: Q RoPE packed output differs"
+        assert torch.equal(ring[req.long(), pos % 16, :512], kn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+# Keep imports and GPU initialization inside main for collection on other hosts.
+def main():
+    import argparse
+    import itertools
+    import pandas as pd
+    import aiter
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        aiter.logger.warning(
+            "decode_prep unsupported on %s; skipping", get_gfx_runtime()
+        )
+        return
+    parser = argparse.ArgumentParser(description="NVFP4 decode-prep batch/layout sweep")
+    # Current DSR1 deployment: about 2200-2300 live requests per rank.
+    # This is the benchmark focus, not a kernel batch-size restriction.
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="+",
+        default=[1536, 2048, 2176, 2200, 2240, 2300],
+    )
+    parser.add_argument(
+        "--layout", nargs="+", choices=["dsr1", "generic"], default=["dsr1", "generic"]
+    )
+    args = parser.parse_args()
+    rows = [
+        bench_decode_prep(b, layout)
+        for b, layout in itertools.product(args.batch, args.layout)
+    ]
+    aiter.logger.info(
+        "decode_prep summary (RoPE-only FLOPs; logical bytes):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()

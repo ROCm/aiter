@@ -182,22 +182,46 @@ must be 128 head strides apart: contiguous, or the RoPE slice of a
 recycling: a tile's first token overwrites row 0. The op is graph-safe; warm
 it up before capture.
 
-For fused RoPE at B=1536, each 384-thread block handles one request: four Q
+For fused RoPE at B >= 1024, each 384-thread block handles one request: four Q
 waves each load 32 heads through TDM and process four groups of eight heads,
 while eight K waves handle the tail tile. Q and K use disjoint LDS and output
-regions, and K RoPE processing overlaps the historical NoPE tile load. A
-fixed-stride DSR1 entry checks all specialized strides before dispatch and
-uses a compact 112-byte kernel argument list for gfx1250 kernarg preload.
-Other B=1536 layouts use the generic-stride joint entry; other batch sizes
-and the already-rotated path retain the 256-thread implementation.
+regions, and K RoPE processing overlaps the historical NoPE tile load. Batch
+size is a runtime argument: non-aligned sizes such as 1537, 2049 and 4097 use
+the same kernel. A fixed-stride DSR1 entry checks all specialized strides
+before dispatch and uses a compact 116-byte kernel argument list for gfx1250
+kernarg preload. Other layouts at B >= 1024 use the generic-stride joint
+entry; smaller batches and the already-rotated path retain the 256-thread
+implementation. A captured graph keeps its launch batch size; changes to the
+live request count use the existing negative-slot padding convention.
+
+For the fixed-stride entry at B >= 2048, Q RoPE keeps cos/sin packed and uses
+BF16 instruction operand selectors for coefficient broadcast and GPT-J rotation.
+The BF16 multiply/FMA rounding is unchanged. This lowers VGPR allocation from
+76 to 60 without changing LDS or kernel arguments; padding writes are unrolled
+in this specialization. Smaller batches and other strides retain their previous
+scheduling; K and quantization arithmetic are unchanged.
 
 On a four-gfx1250 DeepSeek-R1 MLPerf trace using ATOM 1117 dev10 and the
 `gfx1250-atom-20261117-dsr1` image, logical rank dp0's complete decode-prep
 kernel medians were 10.494, 10.815 and 10.895 us in the 300/600/900-second
 windows. Actual 61-layer per-graph sums had medians of 0.647, 0.665 and
 0.670 ms. These are model trace observations, not a bandwidth benchmark.
-The 4388-sample accuracy run passed with exact_match 80.674567% and
-3927.594348 tokens/sample.
+They predate the runtime-batch extension and packed Q RoPE optimization.
+
+On 2026-11-24, full 4388-sample model accuracy runs passed with the latest
+K-up and decode-prep optimizations, attention #8200 at b3bef9970, and the
+same image:
+
+| Maximum graph batch | Exact match | Tokens/sample |
+| ---: | ---: | ---: |
+| 1536 | 80.674567% | 3927.594348 |
+| 2048 | 80.674567% | 3927.594348 |
+
+All four ranks replayed each run's largest graph bucket. At the first
+observed replay, active requests ranged from 1026 to 1091 per rank for the
+1536 run, and from 1042 to 1091 for the 2048 run. The other rows were padding;
+these runs do not establish full live-request occupancy at those batch sizes.
+Op tests cover full batches and changing padding. No new model trace was run.
 
 ## Unified MLA entry
 
