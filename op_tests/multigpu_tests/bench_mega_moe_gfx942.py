@@ -274,7 +274,7 @@ def _bench(rank, args):
     for kind in ("decode", "extend"):
         first = next((c for c in calls if c[1] == kind), None)
         for cfg in args.configs if first else ():
-            for copy in range(2):
+            for copy in range(min(2, args.copies)):
                 timed(cfg, kind, copy, *inputs(first))
 
     times = torch.zeros((len(calls), len(args.configs)), device="cuda")

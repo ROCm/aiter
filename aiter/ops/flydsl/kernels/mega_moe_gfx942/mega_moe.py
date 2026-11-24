@@ -232,7 +232,8 @@ class MegaMoEGfx942:
         """One layer's local experts -> ``(w1, w1_scale, w2, w2_scale)`` as the kernels
         read them. a8w4: the standard aiter a16w4 preshuffle -> fd2; a8w8: fp8 in aiter's
         (16, 16) preshuffle with f32 128x128 block scales, read as they are (the W of
-        zero-scale blocks zeroed in place). Load time, once per layer."""
+        zero-scale blocks zeroed in place, their returned scales nonzero). Load time,
+        once per layer."""
         if w1_gate_up_interleaved:
             raise NotImplementedError(
                 "MegaMoEGfx942 takes w1 shuffled with gate_up=False for now"
@@ -353,12 +354,15 @@ class MegaMoEGfx942:
         for name, t in (("x", x), ("topk_ids", topk_ids), ("wts", wts)):
             if t.device != self.dev:
                 raise ValueError(f"{name} is on {t.device}, the layer on {self.dev}")
-        if x.dim() != 2 or any(
-            tuple(t.shape) != (T, self.topk) for t in (topk_ids, wts)
+        if (
+            x.dim() != 2
+            or x.shape[1] != self.model_dim
+            or any(tuple(t.shape) != (T, self.topk) for t in (topk_ids, wts))
         ):
             raise ValueError(
                 f"x {tuple(x.shape)}, topk_ids {tuple(topk_ids.shape)}, wts "
-                f"{tuple(wts.shape)}: expected [T, H], [T, {self.topk}], [T, {self.topk}]"
+                f"{tuple(wts.shape)}: expected [T, {self.model_dim}], "
+                f"[T, {self.topk}], [T, {self.topk}]"
             )
         # Out-of-range ids are no routes, as in MegaMoEV2 (sglang marks padding rows with
         # id == experts); the kernels skip negative ids only.
@@ -391,6 +395,10 @@ class MegaMoEGfx942:
         [T, H], a view of an internal buffer that the next call overwrites. Invalid ids
         are always skipped, so ``mask_invalid_slots`` has no effect; the output is always
         sliced to T rows."""
+        if x_bf16.shape[0] > self.mtpr:
+            raise ValueError(
+                f"{x_bf16.shape[0]} rows: at most max_tok_per_rank={self.mtpr}"
+            )
         with _on(stream):
             if self._large_on:
                 ids, w = self._routes(x_bf16, topk_ids, wts)
@@ -407,6 +415,8 @@ class MegaMoEGfx942:
         float8_e4m3fnuz [T, H] and x_scale f32 [T, H / 128] ("per_1x128") or [T]
         ("per_token")."""
         T, H = x_q.shape
+        if T > self.mtpr:
+            raise ValueError(f"{T} rows: at most max_tok_per_rank={self.mtpr}")
         shape = (T, H // 128) if self._qx else (T,)
         if x_q.dtype != torch.float8_e4m3fnuz or x_scale.dtype != torch.float32:
             raise TypeError(
@@ -435,6 +445,8 @@ class MegaMoEGfx942:
             raise RuntimeError(
                 "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
             )
+        if x_bf16.dtype != torch.bfloat16:
+            raise TypeError(f"x is {x_bf16.dtype}, forward_small_m takes bfloat16")
         need = int(max_tokens)
         if need < int(x_bf16.shape[0]) or need > self._small_mtpr:
             raise ValueError(

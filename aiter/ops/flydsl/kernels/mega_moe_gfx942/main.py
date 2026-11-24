@@ -400,9 +400,9 @@ def ep_mega_kernel(
             from the f32 block scales at ``scales`` (``nbytes`` of them; ``rows``: each
             block's scale row of G). The K loop scales acc by them at every group start
             (with x's ratios), so acc ends in units of s[G - 1]. A zero scale acts as 1
-            (its W block is all zero, see weights.prepare_weights_a8w8). Called after
-            pre_a's barrier (before it, the previous task's scatter may still read this
-            LDS); visible after the K loop's first barrier."""
+            (the scales of weights.prepare_weights_a8w8 have none). Called after pre_a's
+            barrier (before it, the previous task's scatter may still read this LDS);
+            visible after the K loop's first barrier."""
             ok = tx < fx.Int32(len(rows) * G)
             idx = ok.select(tx, fx.Int32(0))
             t = idx // fx.Int32(G)

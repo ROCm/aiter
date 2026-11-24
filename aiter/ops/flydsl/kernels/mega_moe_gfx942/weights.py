@@ -9,11 +9,12 @@ Input, this rank's E experts of one layer:
   w2        [E, H, I/2]   fp4x2 / uint8, ``shuffle_weight_a16w4(w2, 16, False)``
   w*_scale  e8m0 per 1x32 K group, ``shuffle_scale_a16w4(s, E, False)``
 Output, still four tensors (``prepare_weights``):
-  w1, w2    the nibbles k0..k7 of each dword as bytes (k_j | k_{j+4} << 4), -0 -> +0;
-            the W of groups that decode to 0 (scale code <= channel max - 12) zeroed
+  w1, w2    the nibbles k0..k7 of each dword as bytes (k_j | k_{j+4} << 4), -0 -> +0
   w*_scale  per 32-K group min(channel max code - group code, 11) * 8, followed by the
             per-output-channel max e8m0 codes (int32 [E, 2I] / [E, H]; ``tail_exp``)
-Decoding the output gives the same bits as decoding the input.
+The kernels' FP8 operands are then exactly the input's MXFP4 values: a group within
+2^11 of its output channel's largest scale decodes exactly, and the decode flushes a
+group further below to 0, so such a group must hold only zeros (ValueError otherwise).
 
 a8w8 (``prepare_weights_a8w8``): fp8 W with f32 128x128 block scales.
   w1        [E, 2I, H]    float8_e4m3fnuz, rows [gate (I); up (I)], in aiter's fp8 MoE
@@ -21,8 +22,9 @@ a8w8 (``prepare_weights_a8w8``): fp8 W with f32 128x128 block scales.
   w2        [E, H, I]     float8_e4m3fnuz, ``shuffle_weight(w, layout=(16, 16))``
   w*_scale  f32 [E, N/128, K/128], the dequant scale of each 128x128 block
 Output: the same W, which the K loop reads as they are (so other readers of the
-preshuffle can share them); a block whose scale is 0 has its W zeroed in place (the
-kernels treat a zero scale as 1); the scales as f32.
+preshuffle can share them); a block whose scale is 0 has its W zeroed in place, and in
+the returned f32 scales the largest scale of its 128-row block row (1 if that row is all
+zero), so the K loop's ratios of consecutive scales stay within the checked span.
 """
 
 import functools
@@ -121,9 +123,9 @@ def _fast_decode(w_u8):
 
 
 def _predelta(w_u8, scale_u8, exp):
-    """fd2 scales from the standard preshuffled W / e8m0 scale bytes (before
-    ``_fast_decode``): scale byte -> min(max_code - code, 11) * 8, and the W of flushed
-    groups (max_code - code > 11, which the kernels decode to 0) set to 0. ``exp``:
+    """fd2 scales from the standard preshuffled W / e8m0 scale bytes: scale byte ->
+    min(max_code - code, 11) * 8. The kernels decode a group with max_code - code > 11
+    to 0, so its W must be all zero (ValueError otherwise). ``exp``:
     ``channel_exponents`` of the original scales.
 
     W bytes are (N/16, K/128, klane 4, nlane 16, 16 B): 16 B = the 32-K group
@@ -142,9 +144,14 @@ def _predelta(w_u8, scale_u8, exp):
     d8 = (diff.clamp(max=11) * 8).to(torch.uint8)
     s = d8.view(NT // 32, 2, 16, K // 256, 2, 4).permute(0, 3, 5, 2, 4, 1)
     flushed = (diff > 11).view(NT // 16, 16, K // 128, 4).permute(0, 2, 3, 1)
-    w = w_u8.reshape(NT // 16, K // 128, 4, 16, 16).clone()
-    w[flushed] = 0
-    return w.view(w_u8.shape), s.contiguous().view(-1)
+    groups = w_u8.reshape(NT // 16, K // 128, 4, 16, 16)[flushed]
+    lost = int((groups & 0x77).ne(0).any(-1).sum())  # nonzero FP4 magnitudes
+    if lost:
+        raise ValueError(
+            f"{lost} 32-K groups hold nonzero weights more than 11 binades below their "
+            "output channel's largest scale; the kernels' FP8 decode would flush them"
+        )
+    return s.contiguous().view(-1)
 
 
 def prepare_weights(w1, w1_scale, w2, w2_scale):
@@ -158,7 +165,7 @@ def prepare_weights(w1, w1_scale, w2, w2_scale):
         w_u8 = w.contiguous().view(torch.uint8)
         s_u8 = s.contiguous().view(torch.uint8).view(-1)
         exp = channel_exponents(w_u8, s_u8)  # from the original scales
-        w_u8, s_u8 = _predelta(w_u8, s_u8, exp)
+        s_u8 = _predelta(w_u8, s_u8, exp)
         tail = exp.contiguous().view(-1).view(torch.uint8)
         out += [_fast_decode(w_u8).view(w_u8.shape), torch.cat([s_u8, tail])]
     return tuple(out)
@@ -203,7 +210,8 @@ def _zero_unscaled(w, scale):
 def prepare_weights_a8w8(w1, w1_scale, w2, w2_scale):
     """One layer's experts in aiter's fp8 (16, 16) preshuffle -> ``(w1, w1_scale, w2,
     w2_scale)`` as the kernels read them: the same W (zero-scale blocks zeroed in
-    place), f32 scales (see the module docstring). w1 [E, 2I, H], w2 [E, H, I]."""
+    place), f32 scales without zeros (see the module docstring). w1 [E, 2I, H], w2
+    [E, H, I]."""
     E, n2, h = w1.shape
     if tuple(w2.shape) != (E, h, n2 // 2):
         raise ValueError(f"w1 {tuple(w1.shape)} and w2 {tuple(w2.shape)} do not match")
@@ -213,5 +221,9 @@ def prepare_weights_a8w8(w1, w1_scale, w2, w2_scale):
             raise TypeError(f"{w.dtype} weights: expected float8_e4m3fnuz")
         s = s.to(torch.float32).contiguous()
         _zero_unscaled(w, s)
+        # A stand-in of 1 for a zero scale would overflow the K loop's ratio next to a
+        # tiny scale; the largest scale of the block row keeps it in the checked span.
+        row_max = s.amax(dim=-1, keepdim=True)
+        s = torch.where(s > 0, s, torch.where(row_max > 0, row_max, 1.0))
         out += [w, s]
     return tuple(out)

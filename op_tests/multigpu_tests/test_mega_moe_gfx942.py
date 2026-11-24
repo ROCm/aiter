@@ -69,7 +69,8 @@ MODELS = {
 SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0  # Kimi-K3's SiTUv2
 H, I, E, TOPK, ACT, SWIGLU_LIMIT = MODELS["DeepSeek-V4-Flash"]
 E_LOCAL = E // WORLD
-MTPR, SMALL_MTPR = 1024, 128
+# Not a power of two: max_tok_per_rank is a hard limit below the capacity (1024).
+MTPR, SMALL_MTPR = 1000, 128
 # Bound on |out - ref| / rms(reference row) over every element of a routed row. The
 # kernels quantize x and the gemm1 output to fp8 e4m3 (3 mantissa bits): the largest
 # error measured over all cases is 0.31 (8 x 8192 tokens to one rank).
@@ -144,9 +145,13 @@ def _make_weights_a8w8(rank):
         zero = torch.rand(
             (E_LOCAL, rows // 128, cols // 128), device="cuda", generator=gen
         ).lt(0.03)
+        # Expert 0's first 128 rows: a zero-scale block before blocks whose scales
+        # (2^-130) are too small for a ratio to a stand-in of 1 for the zero.
+        zero[0, 0, 0] = True
         scale = (w.abs().amax(dim=(2, 4)) / fp8_max).masked_fill(zero, 0.0)
         q = (w / scale.clamp_min(1e-30)[:, :, None, :, None]).to(dtypes.fp8)
         del w
+        scale[0, 0, 1:] = 2.0**-130
         junk = (torch.rand(shape, device="cuda", generator=gen) * 2 - 1).to(dtypes.fp8)
         q = torch.where(zero[:, :, None, :, None], junk, q)
         ref = q.float() * scale[:, :, None, :, None]
@@ -189,6 +194,43 @@ def _make_weights_a8w4(rank):
 
     ref = (dequant(w1_q, w1_scale, 2 * I, H), dequant(w2_q, w2_scale, H, I))
     return kernel, ref
+
+
+def test_prepare_weights_flush():
+    """prepare_weights refuses MXFP4 weights that the kernels' FP8 decode would flush: a
+    32-K group 12 binades below its output channel's largest scale must hold only
+    zeros. A one-expert layer, H 512, I 256."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
+
+    quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    layer = []
+    for rows, cols in ((512, 512), (512, 256)):
+        w = torch.randn(
+            (1, rows, cols), dtype=dtypes.bf16, device="cuda", generator=gen
+        )
+        layer.append(quant(w, quant_dtype=dtypes.fp4x2))
+
+    def prepare():
+        (w1, s1), (w2, s2) = layer
+        return MegaMoEGfx942.prepare_weights(
+            shuffle_weight_a16w4(w1, 16, False),
+            shuffle_scale_a16w4(s1, 1, False),
+            shuffle_weight_a16w4(w2, 16, False),
+            shuffle_scale_a16w4(s2, 1, False),
+        )
+
+    w1, s1 = layer[0]
+    codes = s1.view(torch.uint8).view(512, 512 // 32)
+    codes[0, 0], codes[0, 1] = 130, 130 - 12  # w1 row 0: group 1 is 12 binades down
+    try:
+        prepare()
+    except ValueError as err:
+        assert "binades" in str(err), err
+    else:
+        raise AssertionError("prepare_weights took weights its FP8 decode flushes")
+    w1.view(torch.uint8)[0, 0, 16:32] = 0  # row 0, K 32..63: group 1 all zero
+    prepare()
 
 
 def _make_inputs(tokens, rank, seed, routing="uniform", padding=True):
@@ -352,7 +394,7 @@ def _run_paths(tokens, paths, inputs, stale, graph, ret):
         assert ret[f"{path} err"] == 0, (
             f"{path} {tokens}: {ret[f'{path} err']:.2%} of elements outside the "
             f"tolerance, max |out - ref| / rms {ret[f'{path} max_err']:.3f} "
-            f"(atol {_STATE['atol']})"
+            f"(atol {ATOL})"
         )
     return ret
 
@@ -412,6 +454,44 @@ def _layer(rank, weights, mtpr, small, large):
     return mega
 
 
+def test_input_checks():
+    """Calls the layer refuses before it launches anything: one row more than
+    max_tok_per_rank on forward / forward_prequant, and x of another width or dtype on
+    forward_small_m."""
+    mega = _STATE["layers"]["large"]
+    n = MTPR + 1
+    ids = torch.zeros((n, TOPK), dtype=torch.int32, device="cuda")
+    wts = torch.zeros((n, TOPK), dtype=torch.float32, device="cuda")
+    x = torch.zeros((n, H), dtype=dtypes.bf16, device="cuda")
+    x_q = x.to(dtypes.fp8)
+    x_scale = torch.ones((n, H // 128), dtype=torch.float32, device="cuda")
+    small = {"max_tokens": SMALL_MTPR}
+    cases = {
+        "forward past max_tok_per_rank": (
+            ValueError,
+            lambda: mega.forward(x, wts, ids),
+        ),
+        "forward_prequant past max_tok_per_rank": (
+            ValueError,
+            lambda: mega.forward_prequant(x_q, x_scale, wts, ids),
+        ),
+        "forward_small_m with x of half width": (
+            ValueError,
+            lambda: mega.forward_small_m(x[:1, : H // 2], wts[:1], ids[:1], **small),
+        ),
+        "forward_small_m with f32 x": (
+            TypeError,
+            lambda: mega.forward_small_m(x[:1].float(), wts[:1], ids[:1], **small),
+        ),
+    }
+    for name, (error, call) in cases.items():
+        try:
+            call()
+        except error:
+            continue
+        raise AssertionError(f"{name}: no {error.__name__}")
+
+
 def _summary(title, rows, rank):
     if rank == 0 and rows:
         aiter.logger.info(
@@ -451,6 +531,8 @@ def _worker(rank, port, args):
         from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
         quant = _STATE["quant"] = args.quant
+        if quant == "a8w4":
+            test_prepare_weights_flush()
         weights, ref_weights = _make_weights(rank, quant)
         weights = MegaMoEGfx942.prepare_weights(
             *weights, w1_gate_up_interleaved=False, quant=quant
@@ -460,6 +542,7 @@ def _worker(rank, port, args):
             "large": _layer(rank, weights, MTPR, small=True, large=True),
             "main": _layer(rank, weights, MTPR, small=False, large=False),
         }
+        test_input_checks()
         rows = [
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)

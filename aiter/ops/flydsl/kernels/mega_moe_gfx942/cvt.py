@@ -47,8 +47,8 @@ def _fp8x4_pack(a, b, c, d):
 # (k_j, k_{j+4}) in byte j (low, high nibble) and no -0 nibble, so even nibbles decode
 # straight to K 0..3 and odd nibbles to K 4..7 (no interleave v_perm), and the sign is
 # bit 3 of the nibble moved to bit 7 (no sign-table v_perm). The scale byte already
-# holds min(delta, 11) * 8; groups below 2**-11 of the channel max (delta > 11) are
-# zeroed in W, so they decode to 0.
+# holds min(delta, 11) * 8; groups below 2**-11 of the channel max (delta > 11) hold
+# only zeros (``prepare_weights`` refuses other weights), so they decode to 0.
 
 
 def _perm_u32(hi, lo, sel):
