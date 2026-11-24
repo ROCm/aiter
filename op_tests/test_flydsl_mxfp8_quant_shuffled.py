@@ -71,3 +71,25 @@ def test_quant_shuffled(m, k):
         assert torch.equal(
             s.view(-1)[: ref_s.numel()], ref_s.view(-1)
         ), f"scales differ (m={m} k={k} scale={sc})"
+
+
+def test_rejects_non_bf16_and_unpadded_rpw():
+    from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import (
+        mxfp8_quantize_shuffled,
+        quantize,
+    )
+
+    with pytest.raises(ValueError):
+        mxfp8_quantize_shuffled(torch.ones(1, 256, dtype=torch.float32), 16)
+    x = torch.ones(1, 256, dtype=torch.bfloat16)
+    quant = torch.empty(16, 256, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(32, 8, dtype=torch.uint8)
+    with pytest.raises(ValueError):
+        quantize(x, quant, scale, shuffled=True, rpw=4)
+
+
+if __name__ == "__main__":
+    # CI runs op tests as `python3 <file>` (.github/scripts/aiter_test.sh): run the cases under pytest
+    import sys
+
+    sys.exit(pytest.main([__file__, "-q"]))
