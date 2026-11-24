@@ -792,6 +792,11 @@ def _grouped_a8w4_tdm_moe(
         stage2_scatter = _compact_ctx
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
     a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    # Select GEMM2's input independently; GEMM1's quant epilogue writes it.
+    a2_preshuffled = a_preshuffled or (
+        data_format == "fp4"
+        and _as_bool(os.environ.get("AITER_FLYDSL_A2_PRESHUFFLE"), False)
+    )
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -1405,6 +1410,7 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            quant_out_preshuffled=int(a2_preshuffled),
             persistent_workers=persistent_workers,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
@@ -1474,7 +1480,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
-            payload_preshuffled=a_preshuffled,
+            payload_preshuffled=a2_preshuffled,
             **_a2_activation_kw,
         )
 
@@ -1499,7 +1505,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
-        a_preshuffled=int(a_preshuffled),
+        a_preshuffled=int(a2_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1555,7 +1561,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
-                        payload_preshuffled=a_preshuffled,
+                        payload_preshuffled=a2_preshuffled,
                         **_a2_activation_kw,
                     ),
                 )
@@ -1591,6 +1597,7 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        quant_out_preshuffled=int(a2_preshuffled),
                         persistent_workers=persistent_workers,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
@@ -1672,7 +1679,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
-                    a_preshuffled=int(a_preshuffled),
+                    a_preshuffled=int(a2_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
