@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from contextlib import ExitStack, nullcontext
+from unittest.mock import patch
 
 import pandas as pd
 import torch
@@ -2708,6 +2709,45 @@ def _plain_fp8_limit_weights(quant_type):
     return weights
 
 
+def _plain_fp8_limit_dispatch(token, q, limit, inter=None, w_dtype=dtypes.fp8):
+    model_dim, inter_dim, experts, topk = _PLAIN_FP8_LIMIT_SHAPE
+    get_2stage_cfgs.cache_clear()
+    return get_2stage_cfgs(
+        token,
+        model_dim,
+        inter or inter_dim,
+        experts,
+        topk,
+        dtypes.bf16,
+        w_dtype,
+        w_dtype,
+        q,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+        swiglu_limit=limit,
+    )
+
+
+def _plain_fp8_limit_flydsl_config(token, q, limit):
+    """Config of the gfx942 FlyDSL backend the call dispatches to; None when
+    CK / ASM run it."""
+    # Returns the chosen kernel name in place of its implementation.
+    with patch(
+        "aiter.fused_moe.resolve_fused_moe_impl",
+        lambda name: name if name.startswith("impl__") else None,
+    ):
+        name = _plain_fp8_limit_dispatch(token, q, limit).full_impl
+    get_2stage_cfgs.cache_clear()
+    if name is None:
+        return None
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+    return Config.from_string(name.removeprefix("impl__flydsl_gfx942__"))
+
+
 @benchmark()
 def test_plain_fp8_swiglu_limit(quant_type, token, swiglu_limit):
     model_dim, inter_dim, experts, topk = _PLAIN_FP8_LIMIT_SHAPE
@@ -2717,10 +2757,19 @@ def test_plain_fp8_swiglu_limit(quant_type, token, swiglu_limit):
     router = torch.randn(token, experts, dtype=dtypes.bf16)
     weights, ids = fused_topk(x, router, topk, True)
     torch_quant = aiter.get_torch_quant(quant_type)
-    xq, xs = torch_quant(x, quant_dtype=dtypes.fp8)
+    flydsl = _plain_fp8_limit_flydsl_config(token, quant_type, swiglu_limit)
+
+    def quantize_activation(a):
+        # The gfx942 FlyDSL decode kernels read BF16 activations even with FP8
+        # weights; its prefill pipeline, CK and ASM quantize them.
+        if flydsl is not None and not flydsl.use_prefill:
+            return a, torch.ones(1, dtype=torch.float32)
+        return torch_quant(a, quant_dtype=dtypes.fp8)
+
+    xq, xs = quantize_activation(x)
 
     def stage2_reference(y):
-        yq, ys = torch_quant(y, quant_dtype=dtypes.fp8)
+        yq, ys = quantize_activation(y)
         return torch_moe_stage2(
             yq.view(token, topk, -1),
             w["w1"],
@@ -2802,6 +2851,7 @@ def test_plain_fp8_swiglu_limit(quant_type, token, swiglu_limit):
     )
     ret = {
         "gfx": get_gfx_runtime(),
+        "flydsl": flydsl.to_string() if flydsl else "",
         "unclamped row err": unclamped_row_err,
         "swapped row err": swapped_row_err,
     }
@@ -2829,26 +2879,11 @@ def test_plain_fp8_swiglu_limit_dispatch():
     fused_moe_mod = sys.modules["aiter.fused_moe"]
     fp8 = dtypes.fp8
     quant_types = (aiter.QuantType.per_Token, aiter.QuantType.per_Tensor)
+    dispatch = _plain_fp8_limit_dispatch
 
-    def dispatch(token, q, limit, inter=inter_dim, w_dtype=fp8):
-        get_2stage_cfgs.cache_clear()
-        return get_2stage_cfgs(
-            token,
-            model_dim,
-            inter,
-            experts,
-            topk,
-            dtypes.bf16,
-            w_dtype,
-            w_dtype,
-            q,
-            True,
-            aiter.ActivationType.Silu,
-            False,
-            0,
-            0,
-            swiglu_limit=limit,
-        )
+    def flydsl_clamps(q):
+        # Without a tuned CK row, the gfx942 FlyDSL backend clamps per_Token FP8.
+        return get_gfx_runtime() == "gfx942" and q == aiter.QuantType.per_Token
 
     def raises(error, match, fn, *args, **kwargs):
         try:
@@ -2862,6 +2897,9 @@ def test_plain_fp8_swiglu_limit_dispatch():
         # Without a limit, 64+ per_Token tokens take ASM 1-stage.
         for limit in (7.0, 5.0):
             md = dispatch(token, q, limit)
+            if md.full_impl is not None:
+                assert flydsl_clamps(q), (q, token, limit)
+                continue
             name = md.stage1.keywords.get("kernelName", "")
             assert md.stage1.func is fused_moe_mod.ck_moe_stage1, (q, token, limit)
             assert not md.run_1stage and int(md.ksplit or 0) == 0, (q, token, limit)
@@ -2914,8 +2952,12 @@ def test_plain_fp8_swiglu_limit_dispatch():
         get_2stage_cfgs.cache_clear()
 
     for q in quant_types:
-        # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0;
+        # the gfx942 FlyDSL backend takes per_Token FP8 at any inter_dim.
+        if flydsl_clamps(q):
+            assert dispatch(64, q, 7.0, inter=192).full_impl is not None
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
         raises(
             NotImplementedError,
             "swiglu_limit",
