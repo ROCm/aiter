@@ -26,6 +26,10 @@ at a time). What changes:
   starts at ``(w % 8) * G / 8 + w / 8`` and strides by ``G``, so each XCD runs
   32 consecutive tiles at a time: N-blocks of a row tile are adjacent, so the
   A tile and an expert's weight panel stay in that XCD's L2.
+* Stage 2 (K = 1024, 8 K-steps a tile) runs one K-step stream across its
+  tiles: the last two K-steps load the next tile's first two, so the
+  pipeline never drains, and a tile's output is converted and stored in the
+  next tile's first K-step, a quadrant at a time (``run_tile_stream``).
 """
 
 import flydsl.compiler as flyc
@@ -173,13 +177,13 @@ class StoreSlotBf16:
     plain top-k sum finishes the layer. Padding rows name token T, which lands
     past the descriptor: their stores are dropped without a branch.
 
-    The tile's 256 routes are loaded in its prologue (``fetch``, two loads a
-    lane, 32 rows a wave), parked in ``route`` LDS once the prologue's waits
-    have passed (``stash``) and read back by the epilogue (``rows``). Loaded
-    at the epilogue instead, their latency sat behind the K-2 step's
-    vmcnt(0) on every tile: 25% of the kernel (stage 2 453 -> 342 us at
-    T=4096 with constant routes). ``route`` is double-buffered by tile
-    parity: a wave may start the next tile while another still reads.
+    The tile's 256 routes are loaded in its first K-step (``fetch``, two
+    loads a lane, 32 rows a wave), parked in ``route`` LDS once that step's
+    waits have passed (``stash``) and read back when the next tile stores
+    this one (``rows_half``). Loaded at the epilogue instead, their latency
+    sat behind a vmcnt(0) on every tile: 25% of the kernel (stage 2 453 ->
+    342 us at T=4096 with constant routes). ``route`` is double-buffered by
+    tile parity: a tile's routes are read while the next tile's are parked.
     """
 
     def __init__(self, C, n_tokens, topk, D, ids_div, w_div, route):
@@ -212,11 +216,19 @@ class StoreSlotBf16:
         fx.memref_store_vec(fx.full(1, fetched[0], fx.Int32), self._at(base))
         fx.memref_store_vec(fx.full(1, fetched[1], fx.Int32), self._at(base + 256))
 
-    def rows(self, base_row, slot):
-        """(output row, routing weight) of this lane's row in each row tile; ``base_row`` is tile-local."""
+    def rows_half(self, wave_m, slot, h):
+        """(output row, routing weight) of this lane's row in each row tile of row half ``h``.
+
+        Every read is a constant offset from one opaque base. Formed as
+        ``slot * 512 + h * 128 + ...`` per read, the row half 1 reads lost the
+        route field's alias scope (the half 0 address plus a constant: a
+        deeper GEP chain), so the first drew an s_waitcnt vmcnt(0) behind the
+        streamed next-tile LDS-DMA (ISA).
+        """
+        base = _opaque_vgpr(slot * 512 + wave_m * A_GRP_ROWS + self.lane_row)
         out = []
         for i in range_constexpr(N_TILES_A):
-            r = slot * 512 + base_row + i * 16 + self.lane_row
+            r = base + (h * LDS_BLOCK_M + i * 16)
             sid = Vec(self._at(r).load())[0]
             w = Vec(self._at(r + 256).load())[0].bitcast(fx.Float32)
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
@@ -244,10 +256,6 @@ class StoreSlotBf16:
             if const_expr(valid is not None):
                 idx = valid.select(idx, fx.Int32(1 << 30))
             fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
-
-    def store(self, c_frag, rows, base_col):
-        """``c_frag[j * N_TILES_A + i]``: N-tile j (of 2), row tile i."""
-        self.store_words(self.pack(c_frag, rows), rows, base_col)
 
 
 class SwigluFp8Epilogue:
@@ -752,26 +760,14 @@ def compile_moe_bs_gemm_8w(
             n_tokens = _load_i32(nv_div, 1)
             store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div, lds.T_lds)
 
-        # Stage 2 defers a tile's 16 output stores (128 KB a CU) into the next
-        # tile's first K-step: issued in the epilogue, all 8 waves' stores
-        # drained together while no MFMA ran, the lagging group stalled up to
-        # ~5k cy behind the leading group's, and the leading group then waited
-        # for it at the next prologue's barrier (ATT, T=8192: last MFMA -> next
-        # first MFMA was ~43% of a wave's time). Carried as 64 packed bf16
-        # words + 8 output rows a wave. vmcnt is in order, so a store is
-        # drained by the first wait for a load issued after it: row half 0's
-        # stores follow step 0's A1 load (drained at step 1's middle wait),
-        # half 1's follow its A0 load (drained at step 1's end wait). All 16
-        # after A1 (ed13799dc), or half 1 after step 0's B1 load (7 spills),
-        # measured ~2% slower than this split at T=4096 / 16384 (vs HK, ABAB).
+        # Stage 2 runs one K-step stream across its tiles (run_tile_stream).
+        # Each tile's output (16 stores, 128 KB a CU) is converted and stored
+        # in the next tile's step 0, a quadrant at a time just before its
+        # accumulators are reused. Issued in the epilogue, all 8 waves' stores
+        # drained together while no MFMA ran (ATT, T=8192: last MFMA -> next
+        # first MFMA was ~43% of a wave's time).
         deferred = epilogue == "slot_bf16"
-        # 4 accumulator groups x N_TILES_A stores x 4 words, then the output
-        # row of each (row half, row tile): read from the route LDS at step 0
-        # instead, those reads got an s_waitcnt vmcnt(0) behind the step's
-        # first LDS-DMA (no alias proof), ~1.4k cy a tile (ATT).
-        N_WORDS = 4 * 4 * N_TILES_A
-        N_PENDING = N_WORDS + 2 * N_TILES_A
-        STORES = 4 * N_TILES_A
+        QUAD_STORES = N_TILES_A
 
         def slot_cols(nb):
             return (
@@ -779,25 +775,7 @@ def compile_moe_bs_gemm_8w(
                 half_row0(nb, 1) + wave_n * B_GRP_ROWS,
             )
 
-        HALF_STORES = STORES // 2
-
-        def deferred_store(prev_tile, pending, halves=(0, 1)):
-            """The previous tile's stores of row ``halves``: ``pending`` = its packed words, then its output rows."""
-            valid = prev_tile >= 0
-            pcol0, pcol1 = slot_cols(fx.Int32(prev_tile) % NB)
-            words = pending[:N_WORDS]
-            rows = [
-                [(pending[N_WORDS + h * N_TILES_A + i], None) for i in range(N_TILES_A)]
-                for h in range(2)
-            ]
-            n = 4 * N_TILES_A
-            for g, (h, col) in enumerate(
-                ((0, pcol0), (0, pcol1), (1, pcol0), (1, pcol1))
-            ):
-                if const_expr(h in halves):
-                    store_c.store_words(words[g * n : (g + 1) * n], rows[h], col, valid)
-
-        def run_tile(tile, parity, prev=None):
+        def run_tile(tile):
             m_blk = tile // NB
             nb = tile % NB
             expert = _load_i32(eids_div, m_blk)
@@ -899,10 +877,6 @@ def compile_moe_bs_gemm_8w(
                 ):
                     raw_sc.dma(chunk)
 
-            if const_expr(epilogue == "slot_bf16"):
-                # Older than every K-step load, so the prologue's waits drain them.
-                routes = store_c.fetch(row0)
-
             c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
             c01 = list(c00)
             c10 = list(c00)
@@ -926,8 +900,6 @@ def compile_moe_bs_gemm_8w(
             b_g2s.load(b_next1, B1_off + B_K_STEP)
 
             wait_barrier(3 * N_LDS_STEPS)
-            if const_expr(epilogue == "slot_bf16"):
-                store_c.stash(routes, parity)
 
             for k in range_constexpr(K_ITERS - 2):
                 sa0 = scale_read(k, "a0")
@@ -935,8 +907,6 @@ def compile_moe_bs_gemm_8w(
                 b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
                 a_load(1, a_next1, k + 1)
-                if const_expr(deferred and k == 0):
-                    deferred_store(prev[0], prev[1], (0,))
                 rocdl.s_barrier()
                 scale_chunk_dma(k)
 
@@ -952,21 +922,12 @@ def compile_moe_bs_gemm_8w(
                 sa1 = scale_read(k, "a1")
                 a1_frag = a_s2r.load(a_cur1)
                 a_load(0, a_cur0, k + 2)
-                if const_expr(deferred and k == 0):
-                    deferred_store(prev[0], prev[1], (1,))
-                # The deferred stores stay in flight through step 0's two
-                # waits; step 1's middle wait needs the loads issued between
-                # the halves, so only half 1 still does.
-                wait_barrier(
-                    4 * N_LDS_STEPS
-                    + (STORES if deferred and k == 0 else 0)
-                    + (HALF_STORES if deferred and k == 1 else 0)
-                )
+                wait_barrier(4 * N_LDS_STEPS)
 
                 c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
                 b_g2s.load(b_cur1, B1_off + (k + 2) * B_K_STEP)
-                wait_barrier(3 * N_LDS_STEPS + (STORES if deferred and k == 0 else 0))
+                wait_barrier(3 * N_LDS_STEPS)
 
                 c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
 
@@ -1035,7 +996,6 @@ def compile_moe_bs_gemm_8w(
             # Pairs the lagging group's last barrier above (see the dense kernel).
             barrier_if_zero(leading)
 
-            pending = None
             base_row = row0 + wave_m * A_GRP_ROWS
             col0 = half_row0(nb, 0) + wave_n * B_GRP_ROWS
             col1 = half_row0(nb, 1) + wave_n * B_GRP_ROWS
@@ -1044,52 +1004,264 @@ def compile_moe_bs_gemm_8w(
                 store_c.store(c01, base_row, col1)
                 store_c.store(c10, base_row + LDS_BLOCK_M, col0)
                 store_c.store(c11, base_row + LDS_BLOCK_M, col1)
-            elif const_expr(epilogue == "swiglu_fp8"):
-                store_c.store([(c00, c01), (c10, c11)], row0, nb)
             else:
-                slot_rows = [
-                    store_c.rows(wave_m * A_GRP_ROWS + h * LDS_BLOCK_M, parity)
-                    for h in range_constexpr(2)
-                ]
-                pending = (
-                    store_c.pack(c00, slot_rows[0])
-                    + store_c.pack(c01, slot_rows[0])
-                    + store_c.pack(c10, slot_rows[1])
-                    + store_c.pack(c11, slot_rows[1])
-                    + [row for h in range(2) for row, _ in slot_rows[h]]
+                store_c.store([(c00, c01), (c10, c11)], row0, nb)
+
+        LDS_BUFS = (
+            lds.A_lds_cur_0,
+            lds.A_lds_cur_1,
+            lds.A_lds_next_0,
+            lds.A_lds_next_1,
+            lds.B_lds_cur_0,
+            lds.B_lds_cur_1,
+            lds.B_lds_next_0,
+            lds.B_lds_next_1,
+        )
+
+        def make_ctx(tile, expert):
+            """Stage 2's loaders of one tile (contiguous A rows), from its index and expert."""
+            m_blk = tile // NB
+            nb = tile % NB
+            row0 = m_blk * BLOCK_M
+            a_g2s = G2SRounds(a_div, gl_off_a[0], N_LDS_STEPS, F8_IR_t, wave_id, 64 * K)
+            a_base = [(row0 + h * LDS_BLOCK_M) * K for h in range_constexpr(2)]
+            b_buf = fx.rocdl.make_buffer_tensor(
+                fx.make_view(
+                    b_iter + fx.Int64(expert) * (N * K), fx.make_layout(N * K, 1)
+                ),
+                max_size=False,
+                num_records_bytes=N * K,
+            )
+            b_g2s = G2SRounds(
+                fx.logical_divide(b_buf, fx.make_layout(1, 1)),
+                gl_off_b[0],
+                N_LDS_STEPS,
+                F8_IR_t,
+                wave_id,
+                64 * K,
+            )
+            b_off = [half_row0(nb, h) * K for h in range_constexpr(2)]
+            b_sc_row = expert * (N // 128) + (
+                (lane_id % 2 == 0).select(half_row0(nb, 0), half_row0(nb, 1)) // 128
+            )
+            raw_sc = MoeScaleLds(
+                a_scale_rsrc,
+                [sc_col[s] * m_pad + row0 + sc_row for s in range_constexpr(2)],
+                m_pad,
+                b_scale_div,
+                b_sc_row * k128,
+                k128,
+                wave_id,
+                wave_m * A_GRP_ROWS,
+                lds.S_lds,
+            )
+
+            def a_load(h, dst, k):
+                a_g2s.load(dst, a_base[h] + k * BLOCK_K)
+
+            def b_load(h, dst, k):
+                b_g2s.load(dst, b_off[h] + k * B_K_STEP)
+
+            return {"a": a_load, "b": b_load, "sc": raw_sc, "row0": row0}
+
+        def run_tile_stream(tile, expert, next_tile, parity, prev_tile, prev_acc):
+            """Stage 2: K-steps 0 .. K - 1 of ``tile``.
+
+            One K-step stream runs across tiles: step k loads A half 1 of step
+            k + 1 and all of step k + 2, which for the last two steps are
+            ``next_tile``'s steps 0 and 1, and scale chunk k / 4 + 1 at
+            k % 4 == 0, which at k = K - 4 is the next tile's chunk 0. Step 0
+            also fetches this tile's routes, loads the next tile's expert and
+            converts and stores the previous tile's accumulators ``prev_acc``,
+            each just before its registers start accumulating again (HK's
+            stage-2 epilogue): the conversion then runs while the other
+            group's MFMAs do. Returns (accumulators, next expert).
+            """
+            valid = prev_tile >= 0
+            pcols = slot_cols(fx.Int32(prev_tile) % NB)
+            prev_slot = 1 - parity
+
+            def store_prev(g, rows):
+                """Accumulator group g = (row half, column half) g // 2, g % 2."""
+                words = store_c.pack(prev_acc[g], rows)
+                store_c.store_words(words, rows, pcols[g % 2], valid)
+
+            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
+                LDS_BUFS
+            )
+            cur = make_ctx(tile, expert)
+            nxt = None
+            nxt_expert = None
+            c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
+            c01 = list(c00)
+            c10 = list(c00)
+            c11 = list(c00)
+
+            def src(kk):
+                return (cur, kk) if kk < K_ITERS else (nxt, kk - K_ITERS)
+
+            def sc_read(k, which):
+                op, h = int(which[0] == "b"), int(which[1])
+                half_row = h * (LDS_BLOCK_N if op else LDS_BLOCK_M)
+                return cur["sc"].read(op, half_row, N_TILES_B if op else N_TILES_A, k)
+
+            for k in range_constexpr(K_ITERS):
+                if const_expr(k == K_ITERS - 4):
+                    nxt = make_ctx(next_tile, nxt_expert)
+                sa0 = sc_read(k, "a0")
+                sb0 = sc_read(k, "b0")
+                b0_frag = b_s2r.load(b_cur0)
+                a0_frag = a_s2r.load(a_cur0)
+                if const_expr(k == 0):
+                    # Older than this step's A1 load: its end wait drains them.
+                    routes = store_c.fetch(cur["row0"])
+                    nxt_eid = _load_i32_lane(eids_div, next_tile // NB)
+                ctx, kk = src(k + 1)
+                ctx["a"](1, a_next1, kk)
+                if const_expr(k == 0):
+                    prev_rows = store_c.rows_half(wave_m, prev_slot, 0)
+                    store_prev(0, prev_rows)
+                rocdl.s_barrier()
+                # Chunk k / 4 + 1 lands in the slot chunk k / 4 - 1 held, which
+                # both groups have finished reading once past this barrier.
+                sc_dma = k % MoeScaleLds.CHUNK == 0
+                if const_expr(sc_dma):
+                    chunk = k // MoeScaleLds.CHUNK + 1
+                    if const_expr(chunk < n_chunks):
+                        cur["sc"].dma(chunk)
+                    else:
+                        nxt["sc"].dma(0)
+
+                c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
+
+                sb1 = sc_read(k, "b1")
+                b1_frag = b_s2r.load(b_cur1)
+                ctx, kk = src(k + 2)
+                ctx["b"](0, b_cur0, kk)
+                if const_expr(k == 0):
+                    store_prev(1, prev_rows)
+                rocdl.s_barrier()
+
+                c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
+
+                sa1 = sc_read(k, "a1")
+                a1_frag = a_s2r.load(a_cur1)
+                ctx["a"](0, a_cur0, kk)
+                if const_expr(k == 0):
+                    prev_rows = store_c.rows_half(wave_m, prev_slot, 1)
+                    store_prev(2, prev_rows)
+                n_sc = 4 if sc_dma else 0
+                # vmcnt is in order: a store is drained by the first wait for a
+                # load issued after it, so step 0's stores stay in flight
+                # through its own waits; step 1's middle wait drains the
+                # quadrant (0, *) ones.
+                wait_barrier(
+                    4 * N_LDS_STEPS
+                    + n_sc
+                    + (3 + 3 * QUAD_STORES if k == 0 else 0)
+                    + (2 * QUAD_STORES if k == 1 else 0)
                 )
-            return pending
+
+                c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
+
+                ctx["b"](1, b_cur1, kk)
+                if const_expr(k == 0):
+                    store_prev(3, prev_rows)
+                wait_barrier(
+                    3 * N_LDS_STEPS + n_sc + (4 * QUAD_STORES if k == 0 else 0)
+                )
+                if const_expr(k == 0):
+                    store_c.stash(routes, parity)
+                    nxt_expert = _sgpr(nxt_eid)
+
+                c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
+
+                a_cur0, a_next0 = a_next0, a_cur0
+                a_cur1, a_next1 = a_next1, a_cur1
+                b_cur0, b_next0 = b_next0, b_cur0
+                b_cur1, b_next1 = b_next1, b_cur1
+
+            return [c00, c01, c10, c11], nxt_expert
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
         start = (bid % NUM_XCDS) * (grid // NUM_XCDS) + bid // NUM_XCDS
         n_tiles = _sgpr((_load_i32(nv_div, 0) // BLOCK_M) * NB)
         if const_expr(gather):
-            # i32 bounds and implicit carried state keep this an i32 loop: an
-            # init= loop is index (i64), and with no scalar 64-bit less-than
-            # its bound sits in a VGPR pair that spills; the reload's vmcnt(0)
-            # at the tile's end then also waits out the epilogue stores.
-            # Stage 1 (32 KB of fp8 stores a tile) is ~2% faster without it,
-            # stage 2 (128 KB of bf16) 2-5% slower: there the drain keeps its
-            # stores off the next tile's first loads (A/B twice, ABAB).
-            trip = fx.Int32(0)
+            # i32 bounds keep this an i32 loop: an init= loop is index (i64),
+            # and with no scalar 64-bit less-than its bound sits in a VGPR
+            # pair that spilled; the reload's vmcnt(0) at the tile's end then
+            # also waited out the epilogue stores (stage 1 ~2% slower).
             for tile in range(start, n_tiles, grid):
-                run_tile(fx.Int32(tile), trip & 1)
-                trip = trip + 1
+                run_tile(fx.Int32(tile))
         elif const_expr(deferred):
-            init = [fx.Int32(0), fx.Int32(-1)] + [fx.Int32(0)] * N_PENDING
+            # Prologue: the first tile's scale chunk 0 and K-steps 0 and 1, as
+            # the stream's steps -4, -2 and -1 would have loaded them. A
+            # workgroup without a tile still runs it, on tile 0 of expert 0:
+            # sorted_expert_ids past the last valid tile is unwritten, and a
+            # garbage expert rebases the weight descriptor anywhere (with no
+            # valid tile at all, a memory fault).
+            has_tile = start < n_tiles
+            first_tile = has_tile.select(start, fx.Int32(0))
+            first_expert = has_tile.select(
+                _load_i32(eids_div, first_tile // NB), fx.Int32(0)
+            )
+            first = make_ctx(first_tile, first_expert)
+            first["sc"].dma(0)
+            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
+                LDS_BUFS
+            )
+            first["b"](0, b_cur0, 0)
+            first["a"](0, a_cur0, 0)
+            first["b"](1, b_cur1, 0)
+            first["a"](1, a_cur1, 0)
+            # The wave_m == 1 group runs one barrier behind, for the whole kernel.
+            barrier_if_zero(lagging)
+            wait_barrier(2 * N_LDS_STEPS)
+            first["b"](0, b_next0, 1)
+            first["a"](0, a_next0, 1)
+            first["b"](1, b_next1, 1)
+            wait_barrier(3 * N_LDS_STEPS)
+
+            n_acc = N_TILES_A * N_TILES_B
+            init = [fx.Int32(0), fx.Int32(-1), first_expert] + [mfma.zero_value] * (
+                4 * n_acc
+            )
             for tile, state in range(start, n_tiles, grid, init=init):
-                words = run_tile(
-                    fx.Int32(tile), state[0] & 1, (state[1], list(state[2:]))
+                nt = fx.Int32(tile) + grid
+                # The last tile streams itself again; nothing reads those loads.
+                nt = (nt < n_tiles).select(nt, fx.Int32(tile))
+                acc = state[3:]
+                acc, nxt_expert = run_tile_stream(
+                    fx.Int32(tile),
+                    state[2],
+                    nt,
+                    state[0] & 1,
+                    state[1],
+                    [acc[g * n_acc : (g + 1) * n_acc] for g in range(4)],
                 )
-                final = yield [state[0] + 1, fx.Int32(tile)] + words
+                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert] + [
+                    v for g in acc for v in g
+                ]
             # The last tile's stores (a workgroup without a tile sends them
             # out of bounds).
-            deferred_store(final[1], list(final[2:]))
+            last_slot = (final[0] + 1) & 1
+            last_cols = slot_cols(fx.Int32(final[1]) % NB)
+            for g in range_constexpr(4):
+                rows = store_c.rows_half(wave_m, last_slot, g // 2)
+                store_c.store_words(
+                    store_c.pack(final[3 + g * n_acc : 3 + (g + 1) * n_acc], rows),
+                    rows,
+                    last_cols[g % 2],
+                    final[1] >= 0,
+                )
+            # No LDS-DMA may land after the workgroup exits; the leading
+            # group's barrier pairs the lagging group's prologue one.
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            barrier_if_zero(leading)
         else:
-            for tile, state in range(start, n_tiles, grid, init=[fx.Int32(0)]):
-                run_tile(fx.Int32(tile), state[0] & 1)
-                _ = yield [state[0] + 1]
+            for tile in range(start, n_tiles, grid):
+                run_tile(fx.Int32(tile))
 
     @flyc.jit
     def launch(
