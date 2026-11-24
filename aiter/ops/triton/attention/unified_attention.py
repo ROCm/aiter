@@ -92,6 +92,12 @@ _GFX12_3D_MIN_SEGMENTS = 4
 # blocks with a long one's masked warps measured slower. Off: AITER_UA3D_QPACK=0.
 _GFX12_3D_QPACK = os.environ.get("AITER_UA3D_QPACK", "1") == "1"
 _GFX12_3D_QPACK_ROWS = 64
+# gfx1250 3D decode (one query block a sequence): the hardware sends workgroups to the 8 XCDs
+# round robin by dispatch id. With the sequences a multiple of 8, all segments of a sequence go
+# to one XCD, and an XCD with long sequences can get more than its 128 resident programs.
+# AITER_UA3D_XCD_ROTATE=1 rotates the sequences by the segment index, so that the segments of a
+# sequence go to all XCDs. Each program does the same work: the output is bitwise the same.
+_GFX12_3D_XCD_ROTATE = os.environ.get("AITER_UA3D_XCD_ROTATE", "0") == "1"
 # gfx1250 3D kernel, a prefill chunk that the attn_3d entry routes to the 3D split: the
 # entry's PREFILL_SPLIT_* keys size its workgroups and KV split (_gfx12_prefill_split)
 # in place of the decode token split. Off: AITER_UA3D_PREFILL_SPLIT=0.
@@ -2001,6 +2007,7 @@ def _unified_attention_3d_gfx1250(
         V_PT_MODE=V_PT_MODE,
         PV_WARPS_M=pv_warps_m,
         XCD_REMAP=xcd_remap,
+        XCD_ROTATE=_GFX12_3D_XCD_ROTATE,
         USE_STORE_TDM=True,
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(

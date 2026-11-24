@@ -2313,6 +2313,7 @@ def _unified_attention_gluon_kernel_3d(
     V_PT_MODE: gl.constexpr = 2,  # A8K4V4PT (V_CACHE_DTYPE "fp4pt") PV variant: 1 SCALE_ON_P, 2 PV_FP8FP4
     PV_WARPS_M: gl.constexpr = False,  # bool, warps split the query rows in PV as in QK (not the head dim)
     XCD_REMAP: gl.constexpr = False,  # bool, spec decode: the query blocks of a seq on one XCD
+    XCD_ROTATE: gl.constexpr = False,  # bool, decode of one query block a seq: its segments over all XCDs
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2364,6 +2365,9 @@ def _unified_attention_gluon_kernel_3d(
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     segm_idx = gl.program_id(2)
+    if XCD_ROTATE and (ALL_DECODE or (SPEC_DECODE and SEQLEN_Q <= BLOCK_Q)):
+        # Rotate the seqs by the segment: the segments of a seq go round robin over the XCDs (dispatch id % 8).
+        q_block_global_idx = (q_block_global_idx + segm_idx) % gl.num_programs(0)
 
     # Find sequence index using binary search
     if cfg.ALL_DECODE:
