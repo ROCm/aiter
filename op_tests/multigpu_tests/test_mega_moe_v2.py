@@ -14,9 +14,10 @@ each call's route picked by forward(max_tokens=...). Accuracy against the fp32
 reference and the pinned staged route (uneven, idle, padded ranks), per-layer
 weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
-The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
+The fused routes need a layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
 (--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+With --quant a4w4 the instance has the small-input and staged routes (no large-input route).
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -25,6 +26,7 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash --quant a4w4
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -1242,7 +1244,7 @@ def _routes_instance(args, rank, world, device):
     moe = MegaMoEV2(
         rank=rank,
         world_size=world,
-        quant="a8w4",
+        quant=args.quant,
         w1=packs[0][0],
         w1_scale=packs[0][1],
         w2=packs[0][2],
@@ -1256,7 +1258,7 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
+            "layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
@@ -1605,7 +1607,7 @@ def _run_routes(args, rank, world, device):
     moe = ctx.moe
     if rank == 0:
         print(
-            f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
+            f"[SETUP] network={args.network} quant={args.quant} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
             f"large_m={ctx.large_m} world={world}",
             flush=True,
         )
@@ -1780,7 +1782,7 @@ def main():
     parser.add_argument(
         "--rtol",
         type=float,
-        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 in the routes suite",
+        help="relL2 gate; default 0.10 in the size suite, 0.08 in the routes suite (0.25 for a4w4 in both)",
     )
     parser.add_argument(
         "--max-tok-per-rank",
@@ -1858,12 +1860,11 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
-            raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
-            )
+        if args.network not in ("v4_pro", "v41_flash"):
+            raise ValueError("--suite routes needs --network v4_pro or v41_flash")
         args.seed = 7 if args.seed is None else args.seed
-        args.rtol = 0.08 if args.rtol is None else args.rtol
+        if args.rtol is None:
+            args.rtol = 0.25 if args.quant == "a4w4" else 0.08
         if args.max_tok_per_rank is None:
             args.max_tok_per_rank = 8192
         if args.large_m_state_slots is None:
