@@ -4150,7 +4150,7 @@ def test_mha_v4_sol_head_dim_256_tilt_reaches_the_pooled_values(name):
     case = _hd256_sol_case(name, q, k, v)
     plan = _hd256_sol_prepare(case, q, beta=0.5)
     planes = sol_tilt_planes(
-        q_abs_max=sol_q_abs_max(q, q_tile, rotate=case["rotated"]),
+        q_abs_max=sol_q_abs_max(q, q_tile),
         mean_k=plan["mean_k"],
         mean_v=plan["mean_v"],
         softmax_scale=_HD256_SOFTMAX_SCALE,
