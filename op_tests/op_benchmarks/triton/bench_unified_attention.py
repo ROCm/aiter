@@ -376,12 +376,14 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend, max_sk=0
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
     Argument names match a rotating-buffer pool entry's keys (``**_``
-    absorbs the ones the kernel call does not need).
+    absorbs the ones the kernel call does not need). A nonzero max_sk raises
+    max_seqlen_k to that bound, as a CUDA-graph caller passes it (vLLM captures
+    with max_model_len); the real lengths stay in seqused_k.
     """
 
     def kernel_fn(
@@ -410,7 +412,7 @@ def _make_unified_attention_fn(
             cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=max(max_seqlen_k, max_sk),
             softmax_scale=softmax_scale,
             causal=True,
             window_size=window_size,
@@ -597,6 +599,7 @@ def run_benchmark(custom, args):
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
+            max_sk=args.max_sk,
         )
 
         if args.equal_seqlen_q:
@@ -755,6 +758,14 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=parse_int_or_list,
         default=0,
         help="Key sequence length (single int or comma-separated list, defaults to sq if 0)",
+    )
+    parser.add_argument(
+        "-max_sk",
+        type=int,
+        default=0,
+        help="max_seqlen_k passed to the kernel when above the longest key length: "
+        "the bound a CUDA-graph caller passes (e.g. vLLM's max_model_len), with the "
+        "real lengths from -sk (default: the longest key length)",
     )
     parser.add_argument("-d", type=int, default=0, help="Q/K head size")
     parser.add_argument("-dv", type=int, default=0, help="V head size (defaults to -d)")
