@@ -60,4 +60,19 @@ def compute_mcast_masks(local_x, local_y, cluster_m: int, cluster_n: int):
     return a_mask.ir_value(), b_mask.ir_value()
 
 
-__all__ = ["compute_mcast_masks"]
+@dsl_loc_tracing
+def compute_mcast_masks_runtime(local_x, local_y, cluster_m, cluster_n: int):
+    """:func:`compute_mcast_masks` for a ``cluster_m`` given at run time (cluster_n stays a Python int)."""
+    local_x_i32 = fx.Int32(local_x)
+    local_y_i32 = fx.Int32(local_y)
+    cm = fx.Int32(cluster_m)
+
+    a_pattern = fx.Int32(0)
+    for ly in range(cluster_n):
+        a_pattern = a_pattern | (fx.Int32(1) << (cm * ly))
+    a_mask = a_pattern << local_x_i32
+    b_mask = ((fx.Int32(1) << cm) - 1) << (local_y_i32 * cm)
+    return a_mask.ir_value(), b_mask.ir_value()
+
+
+__all__ = ["compute_mcast_masks", "compute_mcast_masks_runtime"]
