@@ -1762,6 +1762,44 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     )
 
 
+def _tune_v41_flash_ep8_a4w4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 EP8 DeepSeek-V4.1-Flash small-input kernel: the A8W4 tune (_tune_v41_flash_ep8_small) with wider GEMM1
+    tiles, measured on gfx950 (8 ranks, MTPR 16384 routes suite, uniform, zipf 1.0 and all-to-rank-0 routing).
+    Launch protocol knobs are unchanged. The A8W4 tune's 256-wide GEMM1 / GEMM2 tiles at 32 tokens and its GEMM1
+    m-tile pairs at 64 and 128 tokens (pair_tiles) carry over: the paired body reads FP4 A as the single one does.
+    """
+    if bucket == 1:
+        # Cached W1 (b_nt 0) instead of the EP4 1-token tune's streamed W1.
+        return replace(config, stage1=replace(config.stage1, b_nt=0))
+    if bucket == 16:
+        # 256-wide GEMM1 / GEMM2 tiles (as the A8W4 tune), the partial last GEMM1 round split in half-width units.
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
+            fused_stage1=replace(config.fused_stage1, g1_split_tail=64),
+        )
+    if bucket in (256, 512):
+        # 256-wide GEMM1 tiles on the 64-row expert tiles: each streams a longer W1 slab (the gain is largest under
+        # zipf routing).
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    return config
+
+
+def _tune_v41_flash_ep8_a4w4_large(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 EP8 DeepSeek-V4.1-Flash large-input kernel: the A8W4 tune (_tune_v41_flash_ep8_large) per EP-wide
+    max_tokens bucket, measured on gfx950 (8 ranks, MTPR 16384 routes suite, uniform, zipf 1.0 and all-to-rank-0
+    routing). 512 and 1024 rows keep the A8W4 tune.
+    """
+    if bucket >= 2048:
+        # Fewer payload producers per destination (4, not 8) from 2048 rows.
+        return replace(
+            config,
+            fused_stage1=replace(config.fused_stage1, payload_min_blocks=4),
+        )
+    return config
+
+
 def _tune_a4w4_small(
     config: MegaMoEConfig, layout: tuple[int, int, int, int], bucket: int
 ) -> MegaMoEConfig:
@@ -1773,6 +1811,8 @@ def _tune_a4w4_small(
     """
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_small(config, bucket)
+    if layout == V41_FLASH_EP8_LAYOUT:
+        return _tune_v41_flash_ep8_a4w4_small(config, bucket)
     return config
 
 
@@ -1813,6 +1853,8 @@ def _tune_a4w4_large(
     """
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_large(config, bucket)
+    if layout == V41_FLASH_EP8_LAYOUT:
+        return _tune_v41_flash_ep8_a4w4_large(config, bucket)
     return config
 
 
