@@ -468,8 +468,8 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # pid_b = pid // QH
         # pid_hq = pid % QH
         # This is a new optimization that prioritized heavy workload WGs first
-        pid_hq = pid // B
-        pid_b = pid % B
+        pid_hq = (pid // B).to(tl.int64)
+        pid_b = (pid % B).to(tl.int64)
 
         # NoPE models (e.g. Kimi-K3) pass no pos/cos/sin: the PE halves are
         # copied through and only the cat + cache write are fused.

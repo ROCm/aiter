@@ -32,6 +32,7 @@ from .. import logger
 from .. import plugin as _plugin
 from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from ..jit.utils.build_targets import is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..plugin import route as _route
@@ -525,7 +526,7 @@ def _v41_runtime_arch(device: torch.device | str) -> str | None:
     if not 0 <= index < torch.cuda.device_count():
         raise ValueError(f"CUDA device index is out of range: {index}")
     gfx = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0].lower()
-    if gfx not in ("gfx950", "gfx1250"):
+    if gfx not in ("gfx950", "gfx1250", "gfx1250-strict"):
         return None
     # Native dispatch currently uses a node-wide cached architecture. Do not
     # promise support for a different target on a heterogeneous node.
@@ -543,7 +544,7 @@ def _v41_asm_eligible(gfx, shape, dtypes_, layout, scale):
         kv_scale_dtype,
     ) = dtypes_
     return (
-        gfx == "gfx1250"
+        is_gfx1250_family(gfx)
         and h == 64
         and d == 512
         and n <= 65536
@@ -768,8 +769,7 @@ def _mla_sparse_prefill_fake(
 # AITER would run natively, which is a question the dispatcher answers before
 # the op begins; a provider asked to serve this contract is not offered it and
 # so cannot be asked to honour a pin it has no kernel for.
-@_route(op="mla_sparse_prefill", version=1)
-def _mla_sparse_prefill_routed(
+def _mla_sparse_prefill_native(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -789,6 +789,128 @@ def _mla_sparse_prefill_routed(
     either way, so a provider that allocates must still return what it wrote.
     """
     return _opus_sparse_prefill(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
+def _mla_sparse_prefill_contract_fake(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """The tensor the routed form returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason the
+    v2 contract carries no output buffer: see
+    :func:`_mla_sparse_prefill_routed`.
+    """
+    return torch.empty_like(q)
+
+
+@_route(
+    op="mla_sparse_prefill",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_mla_sparse_prefill_contract_fake,
+    mutates_args=[],
+)
+def _mla_sparse_prefill_contract(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512) -- the routed contract.
+
+    v2 drops the ``out=`` buffer v1 carried, which is what lets this op be
+    registered as a custom op at all. Shapes and meanings are otherwise those
+    of :func:`mla_sparse_prefill`, minus its ``backend`` argument.
+
+    Returns a newly allocated tensor shaped like ``q``. It writes through
+    none of its arguments: a provider serving this contract must allocate its
+    result too, and a caller that wants the result in a buffer it owns passes
+    ``out=``, which does not route.
+    """
+    return _mla_sparse_prefill_native(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        None,
+        num_kv_splits,
+    )
+
+
+def _mla_sparse_prefill_routed(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """Where the op begins, for both public spellings.
+
+    ``out`` is a pre-allocated output buffer, and passing it bypasses
+    routing. The reason is a schema one rather than a policy one: with a
+    buffer this op RETURNS the tensor it was given, while the schema a custom
+    op is registered under declares that its results do not alias its inputs.
+    `opcheck` reports the contradiction, and under compile both ways of
+    resolving it are wrong -- a fake that allocates leaves the caller's buffer
+    UNWRITTEN while still returning the right value, with nothing to say so.
+
+    Leaving the buffer out of the contract removes the contradiction instead
+    of picking a side of it. A provider therefore serves the allocating form
+    only; the buffered form runs AITER's own kernel, which is what naming the
+    buffer asked for.
+    """
+    if out is None:
+        return _mla_sparse_prefill_contract(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            num_kv_splits,
+        )
+    return _mla_sparse_prefill_native(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -883,6 +1005,68 @@ def _mla_sparse_prefill_v4_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
 
 
+def _v4_auto_tries_asm(
+    q_nope: torch.Tensor, attn_sink: torch.Tensor | None, num_kv_splits: int | None
+) -> bool:
+    """Whether the default backend choice of v4 tries asm before opus."""
+    return (
+        num_kv_splits in (None, 1)
+        and attn_sink is not None
+        and get_gfx_runtime() == "gfx1250"
+        and q_nope.size(1) == _ASM_HEADS
+    )
+
+
+# Routed below the backend pin, as `mla_sparse_prefill_v41` is. The native body
+# keeps the default choice between asm and opus.
+@_route(op="mla_sparse_prefill_v4", version=1)
+def _mla_sparse_prefill_v4_routed(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA v4 sparse prefill, below the backend pin.
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill_v4`, minus its
+    ``backend`` argument. The second argument is ``q_rope``, the bf16 RoPE
+    part of the query: ``mla_sparse_prefill_v41`` has the same arity, and its
+    second argument is ``q_scale``. ``out`` is written in place when given and
+    returned either way, so a provider returns what it wrote.
+    """
+    args = (
+        q_nope,
+        q_rope,
+        unified_kv_nope,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_nope,
+        kv_rope,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+    )
+    if _v4_auto_tries_asm(q_nope, attn_sink, num_kv_splits):
+        try:
+            return _asm_sparse_prefill_v4(*args)
+        except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
+            _warn_asm_fallback(str(e))
+    return _opus_sparse_prefill_v4(*args, num_kv_splits)
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v4_fake)
 def mla_sparse_prefill_v4(
     q_nope: torch.Tensor,
@@ -922,7 +1106,8 @@ def mla_sparse_prefill_v4(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
-      backend:           ``"asm"``, ``"opus"`` or ``None``.
+      backend:           ``"asm"``, ``"opus"`` or ``None``. Enabled plugins are
+        tried first only with ``None``; they do not receive this native pin.
 
     Returns:
       ``out``.
@@ -943,22 +1128,12 @@ def mla_sparse_prefill_v4(
         softmax_scale,
         out,
     )
-    unsplit = num_kv_splits in (None, 1)
+    if backend is None:
+        return _mla_sparse_prefill_v4_routed(*args, num_kv_splits)
     if backend == "asm":
-        if not unsplit:
+        if num_kv_splits not in (None, 1):
             raise RuntimeError("the asm backend has no split-K")
         return _asm_sparse_prefill_v4(*args)
-    if (
-        backend is None
-        and unsplit
-        and attn_sink is not None
-        and get_gfx_runtime() == "gfx1250"
-        and q_nope.size(1) == _ASM_HEADS
-    ):
-        try:
-            return _asm_sparse_prefill_v4(*args)
-        except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
-            _warn_asm_fallback(str(e))
     return _opus_sparse_prefill_v4(*args, num_kv_splits)
 
 
@@ -993,7 +1168,42 @@ def _mla_sparse_prefill_v41_fake(
 # Version 2: v1 was this signature WITH `backend` in it. A v1 provider was
 # built for fifteen arguments and a v2 call offers fourteen, so v1 is not
 # superseded -- the arity check rejecting it is the correct outcome.
-@_route(op="mla_sparse_prefill_v41", version=2)
+def _mla_sparse_prefill_v41_contract_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """The tensor the v3 contract returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason v3
+    carries no output buffer: see :func:`mla_sparse_prefill_v41`.
+    """
+    t, h, _ = q.shape
+    return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
+
+
+# v3 drops the ``out=`` buffer v2 carried. The older version stays acceptable:
+# the only change is removing an OPTIONAL output buffer, so a v2 provider handed
+# a v3 call simply sees ``out=None`` and allocates -- which is v3's semantics
+# exactly. (`rmsnorm` v1 was left out of its own supersedes for the opposite
+# reason: a v1 kernel handed a v2 call writes the caller's INPUT.)
+@_route(
+    op="mla_sparse_prefill_v41",
+    version=3,
+    supersedes={2: "a later aiter release"},
+    fake=_mla_sparse_prefill_v41_contract_fake,
+    mutates_args=[],
+)
 def _mla_sparse_prefill_v41_routed(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -1007,14 +1217,17 @@ def _mla_sparse_prefill_v41_routed(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor | None,
     softmax_scale: float,
-    out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """MLA v4.1 sparse prefill, below the backend pin.
 
     Shapes and meanings are those of :func:`mla_sparse_prefill_v41`, minus its
-    ``backend`` argument. ``out`` is written when given and returned either
-    way, so a provider returns what it wrote.
+    ``backend`` argument.
+
+    Returns a newly allocated ``[T, H, 512]`` bf16 tensor. It writes through
+    none of its arguments: a provider serving this contract must allocate its
+    result too, and a caller that wants the result in a buffer it owns passes
+    ``out=`` to :func:`mla_sparse_prefill_v41`, which does not route.
     """
     return _opus_sparse_prefill_v41(
         q,
@@ -1029,7 +1242,7 @@ def _mla_sparse_prefill_v41_routed(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
-        out,
+        None,
         num_kv_splits,
     )
 
@@ -1129,6 +1342,39 @@ def mla_sparse_prefill_v41(
         )
         return implementation(*native_args, **native_kwargs)
 
+    # `out` is a pre-allocated output buffer, and passing it bypasses routing.
+    # The reason is a schema one rather than a policy one: with a buffer this op
+    # RETURNS the tensor it was given, while the schema a custom op is registered
+    # under declares that its results do not alias its inputs. `opcheck` reports
+    # the contradiction, and under compile both ways of resolving it are wrong --
+    # a fake that allocates leaves the caller's buffer UNWRITTEN while still
+    # returning the right value, with nothing to say so.
+    #
+    # The v3 contract leaves the buffer out instead of picking a side. A provider
+    # serves the allocating form only; the buffered form runs AITER's own kernel,
+    # which is what naming the buffer asked for.
+    if out is not None:
+        return native_fallback(
+            q,
+            q_scale,
+            unified_kv,
+            unified_kv_scale,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_scale,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            out,
+            num_kv_splits,
+        )
+
+    # The v3 contract args, which carry no output buffer. The implementations
+    # beneath still take one positionally, so the fallback puts `None` back in
+    # that slot rather than forwarding this tuple as-is -- forwarding it would
+    # slide `num_kv_splits` into `out`'s position.
     args = (
         q,
         q_scale,
@@ -1142,13 +1388,45 @@ def mla_sparse_prefill_v41(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
-        out,
         num_kv_splits,
     )
+
+    def contract_fallback(
+        q_,
+        q_scale_,
+        unified_kv_,
+        unified_kv_scale_,
+        kv_indices_prefix_,
+        kv_indptr_prefix_,
+        kv_,
+        kv_scale_,
+        kv_indices_extend_,
+        kv_indptr_extend_,
+        attn_sink_,
+        softmax_scale_,
+        num_kv_splits_=None,
+    ):
+        return native_fallback(
+            q_,
+            q_scale_,
+            unified_kv_,
+            unified_kv_scale_,
+            kv_indices_prefix_,
+            kv_indptr_prefix_,
+            kv_,
+            kv_scale_,
+            kv_indices_extend_,
+            kv_indptr_extend_,
+            attn_sink_,
+            softmax_scale_,
+            None,
+            num_kv_splits_,
+        )
+
     operation = _mla_sparse_prefill_v41_routed.__aiter_plugin_op__
     registered = _plugin._routed_ops[operation.name]
     return _plugin._dispatch(
-        operation, registered.canonicalize, native_fallback, args, {}
+        operation, registered.canonicalize, contract_fallback, args, {}
     )
 
 
