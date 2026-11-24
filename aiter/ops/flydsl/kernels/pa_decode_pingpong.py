@@ -992,7 +992,6 @@ def compile_pa_decode_pingpong(
         query_map: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = kernel_name
         pa_decode_pingpong_kernel(
             pmax,
             psum,
@@ -1095,7 +1094,6 @@ def compile_pa_decode_pingpong(
         num_kv_heads: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = kernel_name
         pa_decode_pingpong_window_kernel(
             out,
             query,

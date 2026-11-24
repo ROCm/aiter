@@ -571,7 +571,7 @@ def test_varlen_optimized_workspace_covers_tail_plan():
     assert need["tail_output"][1] == torch.float32
 
 
-def test_varlen_optimized_dispatch_and_kill_switch(monkeypatch):
+def test_varlen_optimized_dispatch_cu_count_and_kill_switch(monkeypatch):
     qlen = 8192
     args = _inputs((qlen,), 128, qlen=qlen)
     calls = []
@@ -588,6 +588,11 @@ def test_varlen_optimized_dispatch_and_kill_switch(monkeypatch):
     monkeypatch.setattr(flydsl_ua, "_unified_attention_varlen", baseline)
     _call(*args, qlen=qlen, backend="flydsl")
     assert calls == ["optimized"]
+
+    calls.clear()
+    monkeypatch.setattr(flydsl_ua, "_num_cu", lambda _device: 128)
+    _call(*args, qlen=qlen, backend="flydsl")
+    assert calls == ["baseline"]
 
     calls.clear()
     monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "0")

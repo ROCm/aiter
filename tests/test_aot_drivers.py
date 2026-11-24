@@ -244,3 +244,30 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 if job["model_dim"] == 5120
             ]
         )
+
+
+class UnifiedAttentionAotTest(unittest.TestCase):
+    def test_contexts_cover_each_partition_on_supported_cu_counts(self):
+        from aiter.aot.flydsl import unified_attention
+
+        for cu_num in unified_attention._CU_NUMS:
+            partitions = {
+                min(cu_num, -(-context // 256))
+                for context in unified_attention._partition_contexts(cu_num)
+            }
+            self.assertEqual(partitions, set(range(1, cu_num + 1)))
+
+    def test_shape_jobs_keep_cu_specific_route_inputs(self):
+        from aiter.aot.flydsl import unified_attention
+
+        jobs = [
+            *unified_attention.jobs_for_shape(
+                128, 1, 127, "f32", 192**-0.5, 32, cu_num=128
+            ),
+            *unified_attention.jobs_for_shape(
+                128, 1, 127, "f32", 192**-0.5, 32, cu_num=256
+            ),
+        ]
+        self.assertEqual({job["cu_num"] for job in jobs}, {128, 256})
+        for job in jobs:
+            self.assertIn(f"_cu{job['cu_num']}_", job["kernel_name"])

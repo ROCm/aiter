@@ -8,13 +8,13 @@
 ``unified_attention_flydsl`` derives its kernels from the call's shapes: the
 query length, power-of-two buckets of the batch and of its query blocks, the
 planner's block size, whether CTAs pair, and the reducer's partition count,
-which follows ``max_seqlen_k`` in 256-token steps up to 64 partitions and in
-powers of two beyond. A serving process therefore JIT-compiles a new kernel
-whenever traffic reaches a new combination. This module replays the router
-itself on FakeTensors inside :func:`aiter.aot.flydsl.dry_run.dry_run` (see
-``replay.py``) for each geometry in ``DEFAULT_SHAPES``, over a grid of batch
-sizes, query token counts and KV lengths, so the heuristics stay the router's
-own and changing them needs no AOT change.
+which follows ``max_seqlen_k`` in 256-token steps up to the device's CU count.
+A serving process therefore JIT-compiles a new kernel whenever traffic reaches
+a new combination. This module replays the router itself on FakeTensors inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` (see ``replay.py``) for each geometry
+in ``DEFAULT_SHAPES``, over a grid of batch sizes, query token counts, KV
+lengths and supported CU counts, so the heuristics stay the router's own and
+changing them needs no AOT change.
 
 A job is one slice of that grid; its ``m`` indexes the slice's points
 (``_points``). ``SCAN_ARCHS`` has every point identified without compiling
@@ -40,8 +40,8 @@ LABEL = "UNIFIED_ATTENTION"
 DEFAULT_CSVS: list[str] = []
 AOT_ARCH_DEFAULT = "gfx950"
 SCAN_ARCHS = ("gfx950",)
-# The optimized varlen specialization needs 256 CUs (MI350X, MI355X).
-_CU_NUM = 256
+# gfx950 serving parts: MI350P and the 256-CU MI350X/MI355X.
+_CU_NUMS = (128, 256)
 _HEAD_DIM, _VALUE_DIM, _GQA = 192, 128, 16
 _SINK_DTYPES = ("f32", "bf16", "f16")
 # Geometries to pre-compile, per model: (page size, KV heads per rank, left
@@ -57,20 +57,18 @@ DEFAULT_SHAPES = {
 # The largest query token count of a varlen call (the engine's batched-token
 # budget).
 DEFAULT_MAX_TOKENS = 32768
-# KV lengths: every partition count the reducer specializes exactly (1..64 of
-# 256 tokens), its power-of-two rungs beyond, and the optimized varlen
-# specialization's 4096-token floor.
-_CONTEXTS = (
-    *(256 * p for p in range(1, 65)),
-    4095,
-    16385,
-    32769,
-    65536,
-    262144,
-)
 
 
-def _batches(kv_heads: int, dense: bool) -> tuple[int, ...]:
+def _partition_contexts(cu_num: int) -> tuple[int, ...]:
+    """KV lengths reaching every exact reducer partition count on ``cu_num`` CUs.
+
+    ``4095`` keeps the generic-varlen side of the optimized route's 4096-token
+    threshold covered, and the final long context exercises the CU-count cap.
+    """
+    return (*(256 * p for p in range(1, cu_num + 1)), 4095, 262144)
+
+
+def _batches(kv_heads: int, dense: bool, cu_num: int) -> tuple[int, ...]:
     """Batch sizes to replay. ``dense``: every batch up to 64 (the reducer's
     group count follows batch x query rows), else 1..3. Then each power of two
     and its successor up to the router's limit, and the batch from which the
@@ -80,7 +78,7 @@ def _batches(kv_heads: int, dense: bool) -> tuple[int, ...]:
     sizes = set(range(1, 65 if dense else 4))
     for bit in range(1, _MAX_BATCH.bit_length()):
         sizes |= {1 << bit, (1 << bit) + 1}
-    full = -(-2 * _CU_NUM // kv_heads)
+    full = -(-2 * cu_num // kv_heads)
     sizes |= {full - 1, full}
     return tuple(sorted(s for s in sizes if s <= _MAX_BATCH))
 
@@ -99,11 +97,16 @@ def _varlen_tokens(num_seqs: int, max_tokens: int) -> list[int]:
     )
 
 
-def _contexts(window: int, min_context: int) -> tuple[int, ...]:
+def _contexts(window: int, min_context: int, cu_num: int) -> tuple[int, ...]:
     if window:
         # A window launch is independent of the KV length.
         return (min_context,)
-    return tuple(sorted({c for c in _CONTEXTS if c >= min_context} | {min_context}))
+    return tuple(
+        sorted(
+            {c for c in _partition_contexts(cu_num) if c >= min_context}
+            | {min_context}
+        )
+    )
 
 
 @functools.cache
@@ -114,13 +117,14 @@ def _points(
     batches: tuple,
     tokens: int | None,
     max_tokens: int,
+    cu_num: int,
 ) -> tuple[tuple[int, int, int, int], ...]:
     """(num_seqs, num_tokens, max_seqlen_q, max_seqlen_k) of each point.
     Varlen points take every ``_varlen_tokens`` count, or only ``tokens``."""
     points = []
     for s in batches:
         if route == "uniform":
-            for c in _contexts(window, query_length):
+            for c in _contexts(window, query_length, cu_num):
                 points.append((s, s * query_length, query_length, c))
             continue
         for t in _varlen_tokens(s, max_tokens):
@@ -128,7 +132,7 @@ def _points(
                 continue
             # One long sequence, the rest a token each.
             q = t - s + 1
-            for c in _contexts(window, q):
+            for c in _contexts(window, q, cu_num):
                 points.append((s, t, q, c))
     return tuple(points)
 
@@ -141,6 +145,7 @@ def _job_points(job: dict) -> tuple:
         job["batches"],
         job["tokens"],
         job["max_tokens"],
+        job["cu_num"],
     )
 
 
@@ -162,6 +167,7 @@ def jobs_for_shape(
     sink: str | None,
     scale: float,
     max_tokens: int,
+    cu_num: int = _CU_NUMS[-1],
 ) -> list[dict]:
     """Jobs that together cover the router's uniform (1..8 queries per
     sequence) and varlen routes for one geometry. Without a window, a uniform
@@ -173,7 +179,7 @@ def jobs_for_shape(
 
     base = {
         "gfx": AOT_ARCH_DEFAULT,
-        "cu_num": _CU_NUM,
+        "cu_num": cu_num,
         "page": page,
         "kv_heads": kv_heads,
         "window": window,
@@ -183,18 +189,18 @@ def jobs_for_shape(
         "m_low": 0,
     }
     name = (
-        f"ua_bf16_p{page}_hkv{kv_heads}_"
+        f"ua_bf16_cu{cu_num}_p{page}_hkv{kv_heads}_"
         f"{f'sw{window}' if window else 'full'}_{sink or 'nosink'}"
     )
     slices = []
-    dense = _batches(kv_heads, dense=True)
+    dense = _batches(kv_heads, dense=True, cu_num=cu_num)
     for q in range(1, _MAX_QUERY_LENGTH + 1):
         if window:
             slices.append(("uniform", q, dense, None))
         else:
             slices += [("uniform", q, (s,), None) for s in dense]
     if window or sink is None:
-        sparse = _batches(kv_heads, dense=False)
+        sparse = _batches(kv_heads, dense=False, cu_num=cu_num)
         if window:
             slices.append(("varlen", 0, sparse, None))
         else:
@@ -224,18 +230,25 @@ def shape_jobs(
     shapes: dict[str, list] = DEFAULT_SHAPES,
     scale: float = _HEAD_DIM**-0.5,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    cu_nums: tuple[int, ...] = _CU_NUMS,
 ) -> list[dict]:
     jobs = []
     for entries in shapes.values():
         for page, kv_heads, window, sink in entries:
-            jobs += jobs_for_shape(page, kv_heads, window, sink, scale, max_tokens)
+            for cu_num in cu_nums:
+                jobs += jobs_for_shape(
+                    page, kv_heads, window, sink, scale, max_tokens, cu_num
+                )
     return dedupe_jobs(jobs)
 
 
 def replay(job: dict) -> None:
     import torch
 
-    from aiter.ops.flydsl.unified_attention_bf16 import unified_attention_flydsl
+    from aiter.ops.flydsl import unified_attention_bf16
+
+    # One replay worker can process jobs for both gfx950 CU counts.
+    unified_attention_bf16._num_cu.cache_clear()
 
     num_seqs, num_tokens, max_q, max_k = _job_points(job)[job["m"]]
     page, kv_heads = job["page"], job["kv_heads"]
@@ -256,7 +269,7 @@ def replay(job: dict) -> None:
             }[job["sink"]],
         )
     window = job["window"]
-    unified_attention_flydsl(
+    unified_attention_bf16.unified_attention_flydsl(
         empty(num_tokens, heads, _HEAD_DIM),
         empty(pages + 1, page, kv_heads, _HEAD_DIM),
         empty(pages + 1, page, kv_heads, _VALUE_DIM),
@@ -280,7 +293,8 @@ def replay(job: dict) -> None:
 def describe(job: dict) -> str:
     num_seqs, num_tokens, max_q, max_k = _job_points(job)[job["m"]]
     return (
-        f"{job['kernel_name']} seqs={num_seqs} tokens={num_tokens} "
+        f"{job['kernel_name']} cu_num={job['cu_num']} "
+        f"seqs={num_seqs} tokens={num_tokens} "
         f"max_q={max_q} max_k={max_k}"
     )
 
@@ -288,17 +302,26 @@ def describe(job: dict) -> str:
 def collect_jobs(_csv_paths: list[str], args: argparse.Namespace | None) -> list:
     scale = _HEAD_DIM**-0.5 if args is None else args.scale
     max_tokens = DEFAULT_MAX_TOKENS if args is None else args.max_tokens
+    cu_nums = _CU_NUMS if args is None or not args.cu_num else tuple(args.cu_num)
     if args is None or not args.shape:
-        return shape_jobs(scale=scale, max_tokens=max_tokens)
+        return shape_jobs(scale=scale, max_tokens=max_tokens, cu_nums=cu_nums)
     try:
         shapes = {"cli": [parse_shape(spec) for spec in args.shape]}
     except ValueError as error:
         print(f"Error: {error}")
         sys.exit(1)
-    return shape_jobs(shapes, scale, max_tokens)
+    return shape_jobs(shapes, scale, max_tokens, cu_nums)
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cu-num",
+        action="append",
+        type=int,
+        choices=_CU_NUMS,
+        default=[],
+        help="gfx950 CU count to compile; repeatable (default: 128 and 256)",
+    )
     parser.add_argument(
         "--shape",
         action="append",

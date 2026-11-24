@@ -1108,7 +1108,6 @@ def compile_tile_kernel(block_size, softmax_scale):
         n_ctas: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = kernel_name
         pa_decode_pingpong_kernel(
             pmax,
             psum,
