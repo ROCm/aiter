@@ -293,22 +293,34 @@ def quantize(x, quant, scale, shuffled=False, rpw=DEFAULT_RPW):
     ``shuffled``), ``scale`` uint8 [padded M, K/32] (shuffled scale layout); one launch. The scale tensor's row count
     sets the tiles."""
     m, k = x.shape
+    if x.dtype != torch.bfloat16 or not x.is_contiguous():
+        raise ValueError(
+            f"needs a contiguous bf16 input, got {x.dtype} contiguous={x.is_contiguous()}"
+        )
+    if rpw > 2 and m != scale.shape[0]:
+        # the scalar-offset row loads of the rpw > 2 paths are not bounds-checked against X: whole 32-row tiles only
+        raise ValueError(
+            f"rpw {rpw} needs M padded to whole 32-row tiles, got M {m}, tile rows {scale.shape[0]}"
+        )
     exe = _launcher(k, shuffled, rpw)
     n_tiles = (scale.shape[0] // 32) * (k // 256)
     per_wg = exe.tiles_per_wg
     grid = (n_tiles + per_wg - 1) // per_wg
     u8 = lambda t: t.view(torch.uint8).view(-1)
-    _run_compiled(
-        exe,
-        u8(x),
-        u8(quant),
-        u8(scale),
-        m,
-        quant.shape[0],
-        n_tiles,
-        grid,
-        torch.cuda.current_stream(),
-    )
+    with torch.cuda.device(x.device):
+        # a compiled handle is bound to the device it was first launched on: key it per device
+        _run_compiled(
+            exe,
+            u8(x),
+            u8(quant),
+            u8(scale),
+            m,
+            quant.shape[0],
+            n_tiles,
+            grid,
+            torch.cuda.current_stream(x.device),
+            specialization_key=("dev", x.device.index),
+        )
 
 
 def mxfp8_quantize_shuffled(x: torch.Tensor, block_m: int):
