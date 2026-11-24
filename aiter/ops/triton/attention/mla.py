@@ -320,13 +320,17 @@ def _tuned_decode_config(
     """Measured overrides of select_3d_config's attention config, keyed on query
     heads per KV head (H), sequences (B) and max_seqlen_kv (KV). Empty where
     nothing was measured."""
-    # Zero means max_seqlen_kv is unknown (graph capture), not a short context.
-    if max_seqlen_kv == 0:
-        return {}
     cfg_dir = resolve_config_dir(
         "attention", "MLA-DECODE", backend="gluon", arch=DEVICE_ARCH
     )
     table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    # Zero means max_seqlen_kv is unknown (graph capture), not a short context.
+    # The kernel reads each sequence length at run time. Thus the table can
+    # supply the entry of a fixed KV, if the arch's table gives that KV.
+    if max_seqlen_kv == 0:
+        max_seqlen_kv = table.get("unknown_max_seqlen_kv", {}).get("KV", 0)
+        if max_seqlen_kv == 0:
+            return {}
     entries = table.get(kernel, {}).get(f"{query_dtype}_{kv_cache_dtype}")
     if entries is None:
         return {}
@@ -585,10 +589,11 @@ def mla_decode_fwd(
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
             # NPOT_SPLITS keeps its count. Else use a power of 2.
             # The reduce kernel pads its segment aranges to a power of 2.
-            num_segments = min(
-                tuned["NUM_SEGMENTS_PER_SEQ"],
-                triton.cdiv(max_seqlen_kv, block_size),
-            )
+            num_segments = tuned["NUM_SEGMENTS_PER_SEQ"]
+            # An unknown length (zero) gives no limit. Splits after the end of
+            # a sequence do not run, and the reduce does not read them.
+            if max_seqlen_kv > 0:
+                num_segments = min(num_segments, triton.cdiv(max_seqlen_kv, block_size))
             tuned["NUM_SEGMENTS_PER_SEQ"] = (
                 num_segments if npot_splits else triton.next_power_of_2(num_segments)
             )

@@ -2,6 +2,9 @@
   "triton_mla_decode_fwd_reduce_kernel": {
     "waves_per_eu": 0
   },
+  "unknown_max_seqlen_kv": {
+    "KV": 32768
+  },
   "pipelined_unshuffled": {
     "fp8_fp8": {
       "H_LEQ_32": {},

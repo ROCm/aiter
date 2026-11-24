@@ -823,9 +823,12 @@ def _run_tuned_unshuffled_decode(
     kv_lora_rank=512,
     fp8_query=True,
     skip_reduce=False,
+    wrapper_max_seqlen_kv=None,
 ):
     """Runs mla_decode_fwd on the unshuffled path and captures the one
-    attention launch. Returns (grid, kwargs, num_pages, result, ref_args)."""
+    attention launch. Returns (grid, kwargs, num_pages, result, ref_args).
+    wrapper_max_seqlen_kv, if set, is the max_seqlen_kv that the wrapper gets.
+    The sequence lengths stay the same."""
     import aiter.ops.triton.attention.mla as mla_module
 
     qk_rope_head_dim = 64
@@ -875,7 +878,9 @@ def _run_tuned_unshuffled_decode(
         out=output,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seq_lens_kv,
-        max_seqlen_kv=max_seqlen_kv,
+        max_seqlen_kv=(
+            max_seqlen_kv if wrapper_max_seqlen_kv is None else wrapper_max_seqlen_kv
+        ),
         block_tables=block_tables,
         softmax_scale=qk_head_dim**-0.5,
         kv_lora_rank=kv_lora_rank,
@@ -1050,6 +1055,57 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
         assert kwargs["segm_output_ptr"].dtype == partial_dtype
     _check_tuned_unshuffled_output(
         ref_args, f"mla_decode_fwd tuned TP8 bf16 output, H={num_query_heads}"
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size, max_seqlen_kv",
+    [
+        (32, 32768),
+        (64, 32768),
+        (32, 131072),
+        (8, 9216),
+        (128, 9216),
+        # More splits than pages: the splits after the end do not run.
+        (8, 1024),
+    ],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16_unknown_kv(
+    monkeypatch, batch_size, max_seqlen_kv
+):
+    """sglang gives max_seqlen_kv = 0 for each decode step. With zero, the TP8
+    path uses the entry of the table's unknown_max_seqlen_kv KV. The split
+    count has no length limit, and the output stays correct."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    def lookup(kv):
+        return mla_module._tuned_decode_config(
+            "pipelined_unshuffled", "bf16", "fp8", 8, batch_size, kv
+        )
+
+    entry = lookup(0)
+    assert entry, "gfx1250 table must give an entry for an unknown KV"
+    assert any(entry == lookup(kv) for kv in (16384, 32768, 65536, 131072)), entry
+    grid, kwargs, _, _, ref_args = _run_tuned_unshuffled_decode(
+        monkeypatch,
+        8,
+        batch_size,
+        max_seqlen_kv,
+        fp8_query=False,
+        wrapper_max_seqlen_kv=0,
+    )
+    for key in ("num_warps", "num_stages", "waves_per_eu"):
+        assert kwargs[key] == entry[key], (key, kwargs[key], entry[key])
+    for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8", "ROWSPLIT"):
+        assert kwargs.get(key, 0) == entry.get(key, 0), (key, kwargs, entry)
+    if "NPOT_SPLITS" in entry:
+        assert grid[2] == entry["NPOT_SPLITS"], (grid, entry)
+    _check_tuned_unshuffled_output(
+        ref_args, f"mla_decode_fwd TP8 bf16 output, max_seqlen_kv=0, B={batch_size}"
     )
 
 
