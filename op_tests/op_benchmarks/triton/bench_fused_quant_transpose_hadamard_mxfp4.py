@@ -3,24 +3,31 @@
 
 """Benchmark fused quantization, transpose and H16 MXFP4."""
 
-import argparse
+import functools
 import sys
 
 import torch
 import triton
 
-from aiter.ops.triton.quant import (
-    dynamic_mxfp4_quant,
-    fused_quant_transpose_hadamard_mxfp4,
-)
+from aiter.ops.triton.quant import fused_quant_transpose_hadamard_mxfp4
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.quant.test_fused_quant_transpose_hadamard_mxfp4 import (
+    _signs,
+)
 
 _BLOCK_SIZE = 32
-_HADAMARD_SIZE = 16
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -31,54 +38,16 @@ def _dtype(name: str) -> torch.dtype:
     raise ValueError(f"unsupported dtype: {name}")
 
 
-def _hadamard16(device: torch.device) -> torch.Tensor:
-    matrix = torch.ones((1, 1), dtype=torch.float32, device=device)
-    while matrix.shape[0] < _HADAMARD_SIZE:
-        matrix = torch.cat(
-            (
-                torch.cat((matrix, matrix), dim=1),
-                torch.cat((matrix, -matrix), dim=1),
-            ),
-            dim=0,
-        )
-    return matrix / (_HADAMARD_SIZE**0.5)
+def _generate_rot_inputs(M: int, N: int, dtype: str):
+    return (torch.randn((M, N), dtype=_dtype(dtype), device="cuda"),)
 
 
-def _decomposed_rtn(
-    x: torch.Tensor,
-    sign: torch.Tensor,
-    hadamard: torch.Tensor,
-):
-    M, N = x.shape
-    row = dynamic_mxfp4_quant(x)
-    transposed_blocks = x.T.float().reshape(N, M // _HADAMARD_SIZE, _HADAMARD_SIZE)
-    transposed = (transposed_blocks * sign.float().reshape(1, 1, -1)) @ hadamard
-    transposed = transposed.reshape(N, M)
-    return (*row, *dynamic_mxfp4_quant(transposed))
+def _generate_fixed_inputs():
+    return (_signs(torch.device("cuda")),)
 
 
-def _decomposed_rtn_layout(
-    x: torch.Tensor,
-    sign: torch.Tensor,
-    hadamard: torch.Tensor,
-):
-    row, row_scale, col, col_scale = _decomposed_rtn(x, sign, hadamard)
-    return (
-        row,
-        shuffle_scale_gemm(
-            row_scale,
-            arch="gfx950",
-            preshuffle_factor=32,
-            scale_kwidth=8,
-        ),
-        shuffle_weight(col, arch="gfx950", layout=(16, 16)),
-        shuffle_scale_gemm(
-            col_scale,
-            arch="gfx950",
-            preshuffle_factor=32,
-            scale_kwidth=8,
-        ),
-    )
+_ROT_KEYS = ["x"]
+_FIXED_KEYS = ["sign"]
 
 
 def _default_shapes() -> list[tuple[int, int]]:
@@ -100,13 +69,7 @@ def run_benchmark(args) -> None:
         )
     shapes = [tuple(args.shape)] if args.shape is not None else _default_shapes()
     providers = args.provider.split(",")
-    known_providers = {
-        "fused_rtn",
-        "fused_rtn_layout",
-        "fused_sr",
-        "decomposed_rtn",
-        "decomposed_rtn_layout",
-    }
+    known_providers = {"fused_rtn", "fused_rtn_layout", "fused_sr"}
     unknown_providers = set(providers) - known_providers
     if unknown_providers:
         raise ValueError(f"unknown providers: {sorted(unknown_providers)}")
@@ -122,8 +85,6 @@ def run_benchmark(args) -> None:
         "fused_rtn": ("green", "-"),
         "fused_rtn_layout": ("green", "--"),
         "fused_sr": ("red", "-"),
-        "decomposed_rtn": ("blue", "-"),
-        "decomposed_rtn_layout": ("blue", "--"),
     }
     benchmark = triton.testing.Benchmark(
         x_names=["M", "N"],
@@ -143,6 +104,10 @@ def run_benchmark(args) -> None:
         },
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_fused_quant_transpose_hadamard_mxfp4(
         M,
@@ -152,22 +117,14 @@ def run_benchmark(args) -> None:
         metric,
         peak_bandwidth_gbps,
     ):
-        x = torch.randn((M, N), dtype=_dtype(dtype), device="cuda")
-        sign = torch.where(
-            torch.arange(_HADAMARD_SIZE, device=x.device) % 2 == 0,
-            -torch.ones(_HADAMARD_SIZE, device=x.device),
-            torch.ones(_HADAMARD_SIZE, device=x.device),
-        ).to(torch.bfloat16)
-        hadamard = _hadamard16(x.device)
-
         if provider == "fused_rtn":
 
-            def fn():
+            def fn(x, sign):
                 return fused_quant_transpose_hadamard_mxfp4(x, sign)
 
         elif provider == "fused_rtn_layout":
 
-            def fn():
+            def fn(x, sign):
                 return fused_quant_transpose_hadamard_mxfp4(
                     x,
                     sign,
@@ -177,7 +134,7 @@ def run_benchmark(args) -> None:
 
         elif provider == "fused_sr":
 
-            def fn():
+            def fn(x, sign):
                 return fused_quant_transpose_hadamard_mxfp4(
                     x,
                     sign,
@@ -186,24 +143,21 @@ def run_benchmark(args) -> None:
                     philox_seed=1234,
                 )
 
-        elif provider == "decomposed_rtn":
-
-            def fn():
-                return _decomposed_rtn(x, sign, hadamard)
-
-        elif provider == "decomposed_rtn_layout":
-
-            def fn():
-                return _decomposed_rtn_layout(x, sign, hadamard)
-
         else:
             raise AssertionError(f"unvalidated provider: {provider}")
 
-        elapsed_ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        bencher.build_pool(
+            [functools.partial(_generate_rot_inputs, M, N, dtype)],
+            [_ROT_KEYS],
+            [_generate_fixed_inputs],
+            [_FIXED_KEYS],
+        )
+        elapsed_ms = bencher.bench(fn)
 
         # Useful traffic for the fused contract: one dense read plus both
         # packed payloads and both raw E8M0 scale grids.
-        total_bytes = x.numel() * x.element_size() + x.numel() + x.numel() // 16
+        numel = M * N
+        total_bytes = numel * _dtype(dtype).itemsize + numel + numel // 16
         bandwidth_gbps = total_bytes / (elapsed_ms * 1e-3) * 1e-9
         if metric == "time":
             return elapsed_ms
@@ -220,10 +174,7 @@ def run_benchmark(args) -> None:
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused quantization, transpose and H16 MXFP4",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused quantization, transpose and H16 MXFP4")
     parser.add_argument(
         "--shape",
         type=int,
@@ -233,12 +184,13 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--provider",
-        default="fused_rtn,fused_rtn_layout,fused_sr,decomposed_rtn,decomposed_rtn_layout",
-        help="Comma-separated fused or decomposed providers.",
+        default="fused_rtn,fused_rtn_layout,fused_sr",
+        help="Comma-separated providers: fused_rtn, fused_rtn_layout, fused_sr.",
     )
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
-    parser.add_argument(
-        "--metric",
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["time", "bandwidth", "utilization"],
         default="bandwidth",
     )
