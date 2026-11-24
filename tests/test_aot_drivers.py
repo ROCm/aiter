@@ -167,7 +167,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 (96, 5120, 2304, 6),
             )
         self.assertEqual(len({job["kernel_name"] for job in jobs}), len(jobs))
-        # The prefill instances (8192, 16384) build the large-input kernel too.
+        # The prefill instances (8192, 16384) build the large-input kernel too, for both quants.
         from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
             large_m_mtprs_for,
         )
@@ -176,7 +176,15 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
         self.assertEqual(
             {job["mtpr"] for job in ep4 if job["mtpr"] in large}, {8192, 16384}
         )
-        # A4W4 ships its staged and small-input routes (no large-input route).
+        self.assertEqual(
+            {
+                job["mtpr"]
+                for job in ep4
+                if job["quant"] == "a4w4" and job["mtpr"] in large
+            },
+            {8192, 16384},
+        )
+        # A4W4 ships the staged, small-input and large-input routes: one job a rank and MTPR, as A8W4.
         self.assertEqual(
             len(
                 [
@@ -219,6 +227,14 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             {job["mtpr"] for job in ep2 if job["mtpr"] in large}, {8192, 16384}
         )
         self.assertEqual(
+            {
+                job["mtpr"]
+                for job in ep2
+                if job["quant"] == "a4w4" and job["mtpr"] in large
+            },
+            {8192, 16384},
+        )
+        self.assertEqual(
             len(
                 [
                     job
@@ -249,4 +265,19 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             self.assertEqual(
                 (job["experts_per_rank"], job["inter_dim"], job["topk"]),
                 (48, 2304, 6),
+            )
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+            large_m_mtprs_for,
+        )
+
+        # Both quants build the large-input kernel at the prefill MTPRs.
+        large = large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304)
+        for quant in ("a8w4", "a4w4"):
+            self.assertEqual(
+                {
+                    job["mtpr"]
+                    for job in ep8
+                    if job["quant"] == quant and job["mtpr"] in large
+                },
+                {8192, 16384},
             )
