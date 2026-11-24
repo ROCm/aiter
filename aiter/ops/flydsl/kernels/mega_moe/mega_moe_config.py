@@ -1800,6 +1800,40 @@ def _tune_v41_flash_ep8_a4w4_large(config: MegaMoEConfig, bucket: int) -> MegaMo
     return config
 
 
+def _tune_v41_flash_ep4_a4w4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 EP4 DeepSeek-V4.1-Flash small-input kernel: the A8W4 tune (_tune_v41_flash_ep4_small) with changes at
+    64, 256 and 512 tokens, measured on gfx950 (4 ranks, routes suite, MTPR 16384)."""
+    if bucket in (64, 256):
+        # Wider GEMM1 n-tiles, the partial last round split into half tiles: 314 -> 300 us (64), 365 -> 353 us (256).
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            fused_stage1=replace(config.fused_stage1, g1_split_tail=64),
+        )
+    if bucket == 512:
+        # Streamed weights (an expert has about one m-tile) and later early-GEMM2 exit: 436 -> 412 us.
+        return replace(
+            config,
+            fused_stage1=replace(config.fused_stage1, stream_w=True),
+            fused_stage2=replace(config.fused_stage2, early_p=6),
+        )
+    return config
+
+
+def _tune_v41_flash_ep4_a4w4_large(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 EP4 DeepSeek-V4.1-Flash large-input kernel: the A8W4 tune (_tune_v41_flash_ep4_large) with changes from
+    4096 tokens, measured on gfx950 (4 ranks, routes suite, MTPR 16384)."""
+    if bucket >= 4096:
+        # GEMM-bound launches: cached W1 (the m-tiles of an expert reread its slab from L2), fewer producer CTAs
+        # and an earlier GEMM2 start: 4-5% at 4096..16384.
+        return replace(
+            config,
+            stage1=replace(config.stage1, b_nt=0, num_dispatch_cu=64),
+            fused_stage2=replace(config.fused_stage2, early_p=2),
+        )
+    return config
+
+
 def _tune_a4w4_small(
     config: MegaMoEConfig, layout: tuple[int, int, int, int], bucket: int
 ) -> MegaMoEConfig:
@@ -1809,6 +1843,8 @@ def _tune_a4w4_small(
     The ranks of a launch may pick different buckets, so a change here keeps the launch protocol knobs (dedup_rows,
     plan_local, direct_done, tok_counters, bf16_head_tokens) the same for every bucket of a layout.
     """
+    if layout == V41_FLASH_EP4_LAYOUT:
+        return _tune_v41_flash_ep4_a4w4_small(config, bucket)
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
@@ -1851,6 +1887,8 @@ def _tune_a4w4_large(
     the runtime's buffers or set what its routes share (large_m_runtime_knobs) stay the same for every bucket
     of a layout.
     """
+    if layout == V41_FLASH_EP4_LAYOUT:
+        return _tune_v41_flash_ep4_a4w4_large(config, bucket)
     if layout == V4_PRO_EP8_LAYOUT:
         return _tune_a4w4_v4_pro_large(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
