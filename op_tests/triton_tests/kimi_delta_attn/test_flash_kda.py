@@ -22,6 +22,7 @@ import pytest
 import torch
 import triton
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch as _fast_launch
@@ -139,7 +140,7 @@ def _count_launches(module, names):
 def _gluon_k2_module():
     return importlib.import_module(
         "aiter.ops.triton._gluon_kernels."
-        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
+        f"{base_gfx_arch(_flash_kda.DEVICE_ARCH)}.kimi_delta_attn.flash_kda_k2"
     )
 
 
@@ -481,7 +482,7 @@ def test_published_k2_schedules_can_split_their_tile():
     ):
         pytest.skip("this arch publishes no Gluon K2 schedules")
     kernels = ["k2_ab_fused_gluon"]
-    if _flash_kda.DEVICE_ARCH == "gfx1250":
+    if _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         kernels.append("k2_c_gluon")
     for kernel in kernels:
         reached = set()
@@ -1404,7 +1405,7 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     views = _LAYOUTS[layout](*args[:4])
     assert not any(x.is_contiguous() for x in views)
 
-    reads_strided = _flash_kda.DEVICE_ARCH in ("gfx950", "gfx1250")
+    reads_strided = _flash_kda.DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
     with _route(k1=True, k2=True):
         o_ref, ht_ref = run_flash(*args, **kw)
         seen = _record_in_place_operands(monkeypatch) if reads_strided else None
@@ -1512,7 +1513,7 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
 
     # On gfx950 this small shape can take the Triton pass C, which reads a
     # packed v.
-    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    on_tdm = _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
     seen = _record_in_place_operands(monkeypatch) if on_tdm else None
     o, ht = flash_kda_fwd(*(by_name[name] for name in params))
     assert ht is None
