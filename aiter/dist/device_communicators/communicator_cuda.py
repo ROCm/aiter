@@ -908,7 +908,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             (gluon or lamport)
             and ca_comm is not None
-            and ca_comm.should_k5_ar(input_, res_inp_, weight_)
+            and ca_comm.should_k5_ar(input_, res_inp_, weight_, fp8_out=True)
         ):
             return ca_comm.k5_fused_ar_rms(
                 input_,
