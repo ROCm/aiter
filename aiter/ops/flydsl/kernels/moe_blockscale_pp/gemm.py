@@ -589,7 +589,6 @@ def compile_moe_bs_gemm_8w(
     gate_up_inter: int = 0,
     epilogue: str = "bf16",
     topk: int = 0,
-    waves_per_eu: int = 2,
 ):
     """Build the persistent grouped GEMM launcher.
 
@@ -632,7 +631,7 @@ def compile_moe_bs_gemm_8w(
 
     _kname = (
         f"flydsl_moe_bs_8w_{'gather' if gather else 'sorted'}_n{N}_k{K}"
-        f"{'_gu' if gate_up_inter else ''}_{epilogue}{topk or ''}_w{waves_per_eu}"
+        f"{'_gu' if gate_up_inter else ''}_{epilogue}{topk or ''}"
     )
 
     @fx.struct
@@ -1039,7 +1038,8 @@ def compile_moe_bs_gemm_8w(
             m_pad,
             limit,
             value_attrs={
-                "rocdl.waves_per_eu": waves_per_eu,
+                # 512 threads put two waves on every SIMD.
+                "rocdl.waves_per_eu": 2,
                 "rocdl.flat_work_group_size": "512,512",
             },
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)

@@ -30,7 +30,7 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
 
 
 @functools.lru_cache(maxsize=64)
-def _compile(K, N, gather, gate_up_inter, epilogue, topk, waves_per_eu):
+def _compile(K, N, gather, gate_up_inter, epilogue, topk):
     from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
 
     return compile_moe_bs_gemm_8w(
@@ -40,7 +40,6 @@ def _compile(K, N, gather, gate_up_inter, epilogue, topk, waves_per_eu):
         gate_up_inter=gate_up_inter,
         epilogue=epilogue,
         topk=topk,
-        waves_per_eu=waves_per_eu,
     )
 
 
@@ -70,7 +69,6 @@ def moe_bs_gemm(
     sorted_weights: Tensor | None = None,
     topk: int = 0,
     swiglu_limit: float = 0.0,
-    waves_per_eu: int = 2,
     grid: int | None = None,
 ) -> Tensor:
     """Grouped GEMM ``a[row(r)] @ w[expert(r)].T`` over ``moe_sorting``'s 256-row tiles.
@@ -121,7 +119,6 @@ def moe_bs_gemm(
         int(gate_up_inter),
         epilogue,
         int(topk) if epilogue == "slot_bf16" else 0,
-        int(waves_per_eu),
     )
     _run_compiled(
         exe,
@@ -159,7 +156,6 @@ def moe_bs_forward(
     *,
     out: Tensor | None = None,
     swiglu_limit: float = 0.0,
-    waves_per_eu: int = 2,
 ) -> Tensor:
     """Block-FP8 MoE layer forward: ``sum_k w_k * W2[e_k] act(W13[e_k] x)``.
 
@@ -213,7 +209,6 @@ def moe_bs_forward(
         epilogue="swiglu_fp8",
         out_scale=a2s,
         swiglu_limit=swiglu_limit,
-        waves_per_eu=waves_per_eu,
     )
     slots = torch.empty(T * topk, D, dtype=torch.bfloat16, device=x.device)
     moe_bs_gemm(
@@ -229,7 +224,6 @@ def moe_bs_forward(
         epilogue="slot_bf16",
         sorted_weights=sorted_w,
         topk=topk,
-        waves_per_eu=waves_per_eu,
     )
     # Nontemporal loads pay once the slot rows outgrow the 256 MB MALL
     # (T=16384: 239 -> 204 us); at 268 MB (T=4096, top-k 8) they cost 5 us.
