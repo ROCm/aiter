@@ -791,7 +791,16 @@ def _grouped_a8w4_tdm_moe(
     if _compact:
         stage2_scatter = _compact_ctx
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
-    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    if (
+        _a_preshuffle_requested
+        and _compact
+        and not getattr(_compact_ctx, "compact_row_gather", False)
+    ):
+        raise ValueError(
+            "compact A-preshuffle requires separate dispatch and GEMM1; "
+            "set AITER_MEGA_S1F=0"
+        )
+    a_preshuffled = _a_preshuffle_requested
     # Select GEMM2's input independently; GEMM1's quant epilogue writes it.
     a2_preshuffled = a_preshuffled or (
         data_format == "fp4"
@@ -946,7 +955,7 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
         and os.environ.get("AITER_TDM_APRE_ROUTE_FOLD", "1") in ("1", "true", "True")
     )
-    if a_preshuffled:
+    if a_preshuffled and not _compact:
         _apre_row_to_token = (
             torch.empty((int(contiguous_m),), dtype=torch.int32, device=device)
             if _apre_route_fold
@@ -1249,7 +1258,9 @@ def _grouped_a8w4_tdm_moe(
         and int(token_num) >= _rm_min_tokens
         and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
-    _row_major_ascale = (_compact and _prequantized) or _row_major_a1
+    _row_major_ascale = (
+        (_compact and _prequantized) or _row_major_a1
+    ) and not a_preshuffled
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -1291,6 +1302,8 @@ def _grouped_a8w4_tdm_moe(
                 topk=int(topk),
                 masked_m=stage2_scatter.compact_masked_m,
                 psum=stage2_scatter.compact_psum,
+                payload_preshuffled=a_preshuffled,
+                wmma_rep=wmma_rep,
             )
             _row_gather = False
             _a1_wire_stride = 0
@@ -2574,12 +2587,18 @@ def flydsl_moe_scatter_copy_compact(
     grouped_scale: torch.Tensor | None = None,
     masked_m: torch.Tensor | None = None,
     psum: torch.Tensor | None = None,
+    payload_preshuffled: bool = False,
+    wmma_rep: int = 1,
 ):
     """Materialize compact token-major wire rows in expert-contiguous order.
 
     Compact dispatch keeps one payload per source token and peer. ``ep_rowmap``
     names that source payload for each final expert row. Scatter it once before
     GEMM1 so the grouped kernel can use its normal contiguous-A TDM loads.
+    For MXFP4, payload_preshuffled also writes M16/K32 payload slabs and
+    M16K4 scales for the requested GEMM1 wmma_rep, in the same copy pass.
+    Expert starts (psum - masked_m) must be M16-aligned, as guaranteed by
+    the compact dispatch plan. Device-resident route bounds are not read back.
     """
     if wire_row_stride <= 0:
         raise ValueError(f"wire_row_stride must be positive, got {wire_row_stride}")
@@ -2590,6 +2609,61 @@ def flydsl_moe_scatter_copy_compact(
         raise ValueError(f"ep_rowmap needs at least two rows, got {ep_rowmap.shape}")
     device = a1_payload.device
     payload_w = int(a1_payload.shape[-1])
+    if payload_preshuffled:
+        if wmma_rep <= 0 or num_dst % (wmma_rep * 16):
+            raise ValueError("A-preshuffle rows must align to positive wmma_rep * 16")
+        if (
+            payload_w <= 0
+            or payload_w % 64
+            or a1_scale is None
+            or int(a1_scale.shape[-1]) * 16 != payload_w
+            or wire_row_stride % 16
+        ):
+            raise ValueError("compact A-preshuffle requires K128 MXFP4 wire rows")
+        if (
+            masked_m is None
+            or psum is None
+            or masked_m.numel() == 0
+            or masked_m.ndim != 1
+            or masked_m.shape != psum.shape
+        ):
+            raise ValueError(
+                "compact A-preshuffle requires matching expert counts/psum"
+            )
+        for tensor in (a1_payload, a1_scale):
+            if (
+                tensor.dtype != torch.uint8
+                or tensor.device != device
+                or not tensor.is_cuda
+                or tensor.ndim not in (2, 3)
+                or (tensor.ndim == 3 and tensor.shape[0] != 1)
+                or tensor.stride(-1) != 1
+                or tensor.stride(-2) != wire_row_stride
+            ):
+                raise ValueError("A-preshuffle needs byte wire views on one GPU")
+        if a1_payload.data_ptr() % 16 or a1_scale.data_ptr() % 4:
+            raise ValueError("A-preshuffle wire payload/scale must align to 16/4 bytes")
+        if ep_rowmap.ndim != 2 or ep_rowmap.shape[1] != 2:
+            raise ValueError("A-preshuffle ep_rowmap must have shape (rows + 1, 2)")
+        for tensor in (ep_rowmap, masked_m, psum):
+            if (
+                tensor.dtype != torch.int32
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError("A-preshuffle needs contiguous int32 route metadata")
+        for tensor, width in (
+            (grouped_payload, payload_w),
+            (grouped_scale, int(a1_scale.shape[-1])),
+        ):
+            if tensor is not None and (
+                tensor.dtype != torch.uint8
+                or tensor.device != device
+                or not tensor.is_contiguous()
+                or tensor.numel() != num_dst * width
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError("A-preshuffle output must be aligned contiguous bytes")
     if wire_row_stride % 16 == 0:
         payload_unit = 16
     elif wire_row_stride % 8 == 0:
@@ -2607,14 +2681,44 @@ def flydsl_moe_scatter_copy_compact(
     if (
         a1_scale is not None
         and payload_w % 16 == 0
-        and int(a1_scale.shape[-1]) % 16 == 0
+        and int(a1_scale.shape[-1]) % (4 if payload_preshuffled else 16) == 0
         and wire_row_stride % 16 == 0
     ):
         scale_w = int(a1_scale.shape[-1])
         if grouped_scale is None:
             grouped_scale = torch.empty(
-                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+                (
+                    (1, num_dst // wmma_rep, scale_w * wmma_rep)
+                    if payload_preshuffled
+                    else (1, num_dst, scale_w)
+                ),
+                dtype=torch.uint8,
+                device=device,
             )
+        if payload_preshuffled:
+            from aiter.ops.flydsl.moe_kernels import _get_compiled_apre_scatter
+
+            _run_compiled(
+                _get_compiled_apre_scatter(
+                    payload_w * 2,
+                    wmma_rep,
+                    src_scale_stride_bytes=wire_row_stride,
+                    src_payload_stride_bytes=wire_row_stride,
+                    compact_topk=topk,
+                    compact_experts=int(masked_m.numel()),
+                ),
+                ptr_arg(a1_payload, fx.Uint8),
+                ptr_arg(a1_scale, fx.Uint8),
+                ptr_arg(grouped_payload, fx.Uint8),
+                ptr_arg(grouped_scale, fx.Uint8),
+                ptr_arg(ep_rowmap, fx.Int32),
+                ptr_arg(masked_m, fx.Int32),
+                ptr_arg(psum, fx.Int32),
+                num_dst,
+                fx.Stream(torch.cuda.current_stream()),
+                specialization_key=(device.type, device.index),
+            )
+            return grouped_payload, grouped_scale
         if (
             masked_m is not None
             and psum is not None
@@ -2642,6 +2746,7 @@ def flydsl_moe_scatter_copy_compact(
                 n_experts,
                 n_split,
                 fx.Stream(torch.cuda.current_stream()),
+                specialization_key=(device.type, device.index),
             )
             return grouped_payload, grouped_scale
     _run_compiled(

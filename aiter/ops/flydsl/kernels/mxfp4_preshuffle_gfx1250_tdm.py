@@ -444,18 +444,24 @@ def build_gemm_a8w4_tdm_task(
     num_waves = m_warp * n_warp
     block = num_waves * k_waves * WAVE
     overlap_scatter = bool(
-        persistent_workers == 256
-        and enable_ep_scatter
-        and ep_world_size > 1
-        and not ep_quant_bits
-        and a_is_fp4
-        and a_preshuffled
-        and tile_m == tile_n == tile_k == 256
+        persistent_workers > 0
         and num_buffers == 3
-        and m_warp == n_warp == 2
-        and next_stage_on
-        and not tdm_as_in_prologue
-        and k_waves == 1
+        and ep_scatter_common.can_overlap_scatter(
+            enable_ep_scatter=enable_ep_scatter,
+            ep_world_size=ep_world_size,
+            ep_quant_bits=ep_quant_bits,
+            a_is_fp4=a_is_fp4,
+            a_preshuffled=a_preshuffled,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            next_stage_prefetch=next_stage_on,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            k_waves=k_waves,
+            k_tiles=K_TILES,
+        )
     )
     scatter_waves = ep_scatter_common.STORE_WAVE_COUNT if overlap_scatter else num_waves
     SCATTER_GROUP_ROWS = ep_scatter_common.ROWS_PER_GATHER
