@@ -5,9 +5,7 @@ import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
-    _mxfp4_quant_op,
-)
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
@@ -29,8 +27,6 @@ _MOE_GEMM_A4W4_REPR_KEYS = [
 ]
 
 _MOE_GEMM_A4W4_PREFILL_REPR_KEYS = _MOE_GEMM_A4W4_REPR_KEYS + [
-    "PRELOAD_X_SCALES",
-    "XS_SLAB_COLS",
     "L2_PREFETCH_DISTANCE",
 ]
 
@@ -162,11 +158,17 @@ def get_moe_a4w4_layouts_prefill(
     if num_warps == 4:
         if BLOCK_M == 16:
             warp_bases = [[0, 1], [0, 2]]
+        elif BLOCK_M == 64 and BLOCK_N >= 256:
+            # 1 (M) x 4 (N) warps: 64 x 64 a warp (the FlyDSL w1x4 tile)
+            warp_bases = [[0, 1], [0, 2]]
         else:
             warp_bases = [[0, 1], [1, 0]]
     else:
         if BLOCK_M == 16:
             warp_bases = [[0, 1], [0, 2], [0, 4]]
+        elif BLOCK_M == 128 and BLOCK_N >= 256:
+            # 2 (M) x 4 (N) warps: 64 x 64 a warp at 128 x 256 (the FlyDSL w2x4 tile)
+            warp_bases = [[0, 1], [0, 2], [1, 0]]
         else:
             warp_bases = [[0, 1], [1, 0], [2, 0]]
     WMMA_LAYOUT = gl.amd.AMDWMMALayout(
@@ -277,7 +279,18 @@ def get_moe_a4w4_layouts_prefill(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    if X_SCALES_TDM:
+    if X_SCALES_TDM and MX_SCALE_BLOCK_K < 8:
+        # BLOCK_K 128: a 4-byte scale row. TDM needs a pad interval of at least
+        # 2 dwords; the gather path does not reject 4 bytes but writes wrong
+        # bytes. Unpadded, as in the decode layout.
+        SHARED_LAYOUT_X_SCALES = gl.SwizzledSharedLayout(
+            vec=1,
+            per_phase=1,
+            max_phase=1,
+            order=[1, 0],
+            cga_layout=CGA_A,
+        )
+    elif X_SCALES_TDM:
         SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
             shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
@@ -558,6 +571,36 @@ def unshuffle_weights_gfx1250(
     )
 
 
+@gluon.jit
+def load_k_tile_gfx1250(
+    x_slot,
+    w_slot,
+    x_scales_slot,
+    w_scales_slot,
+    PRESHUFFLE_WEIGHTS: gl.constexpr,
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    PACKED_BLOCK_K_W: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    DOT_LAYOUT_X: gl.constexpr,
+    DOT_LAYOUT_W: gl.constexpr,
+    DOT_LAYOUT_X_SCALES: gl.constexpr,
+    DOT_LAYOUT_W_SCALES: gl.constexpr,
+):
+    """One K tile from its LDS slots into the WMMA operand registers: x, w, x scales, w scales."""
+    x = x_slot.load(layout=DOT_LAYOUT_X)
+    if PRESHUFFLE_WEIGHTS:
+        w_slot = unshuffle_weights_gfx1250(w_slot, BLOCK_N, PACKED_BLOCK_K_W)
+    w = w_slot.permute((1, 0)).load(layout=DOT_LAYOUT_W)
+    x_scales = x_scales_slot.load(layout=DOT_LAYOUT_X_SCALES)
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        w_scales_slot = unswizzle_scales_gfx1250(
+            w_scales_slot, BLOCK_N, MX_SCALE_BLOCK_K, 32, 4
+        )
+    w_scales = w_scales_slot.load(layout=DOT_LAYOUT_W_SCALES)
+    return x, w, x_scales, w_scales
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_prefill_repr)
 def _moe_gemm_a4w4_prefill(
     Y,
@@ -641,8 +684,6 @@ def _moe_gemm_a4w4_prefill(
     EP_SCATTER: gl.constexpr = False,
     # Row extent of the combine window, so an out-of-range index is droppable.
     Y_ROWS=0,
-    PRELOAD_X_SCALES: gl.constexpr = False,
-    XS_SLAB_COLS: gl.constexpr = 0,
     # Warm L2 with the first this-many K-tiles of w during the prologue.
     # 0 disables. Costs no LDS, unlike raising NUM_BUFFERS, which would
     # cost a whole workgroup per CU on both prefill GEMMs.
@@ -653,10 +694,7 @@ def _moe_gemm_a4w4_prefill(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
 
-    # Preloading takes x scales out of the loop entirely
-    if PRELOAD_X_SCALES:
-        NUM_TDM_OPS: gl.constexpr = 3
-    elif X_SCALES_TDM:
+    if X_SCALES_TDM:
         # via TDM: w, w scales, x, x scales
         NUM_TDM_OPS: gl.constexpr = 4
     else:
@@ -700,6 +738,13 @@ def _moe_gemm_a4w4_prefill(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
+
+    # gammas of the tile rows: load now, multiply in the epilogue
+    if Gammas is not None:
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_m, mask=offs_m < M, other=0.0
+        )
 
     # get the packed block sizes
     # both A and B tensors are mxfp4
@@ -774,7 +819,6 @@ def _moe_gemm_a4w4_prefill(
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 32
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR_WS
         SHUFFLED_BLOCK_N_WS: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR_WS
-        SCALE_KWIDTH: gl.constexpr = 4
     else:
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 1
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K
@@ -837,77 +881,28 @@ def _moe_gemm_a4w4_prefill(
     w_buffer = gl.allocate_shared_memory(
         w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout
     )
-    if PRELOAD_X_SCALES:
-        XS_SLAB_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
-        XS_SLOTS: gl.constexpr = XS_SLAB_COLS // MX_SCALE_BLOCK_K
-        xs_offs_kg = gl.arange(
-            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES)
-        )
-        xs_zeros_row = gl.zeros(
-            (PACKED_BLOCK_M_X,),
-            dtype=gl.int32,
-            layout=gl.SliceLayout(1, DOT_LAYOUT_X_SCALES),
-        )
-        gl.static_assert(
-            XS_SLAB_COLS % MX_SCALE_BLOCK_K == 0,
-            "XS_SLAB_COLS must be a whole number of MX_SCALE_BLOCK_K tiles",
-        )
-        gl.static_assert(XS_SLOTS >= 1, "x-scale slab needs at least one slot")
-        x_scales_slab = gl.allocate_shared_memory(
-            x_scales_desc.dtype,
-            shape=[PACKED_BLOCK_M_X, XS_SLAB_COLS],
-            layout=XS_SLAB_LAYOUT,
-        )
-        if GatherIndx is None:
-            xs_slab_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=XMxScale,
-                shape=(M, gl.cdiv(K, MX_PACK_DIVISOR)),
-                strides=(stride_x_mx_m, stride_x_mx_k),
-                block_shape=(PACKED_BLOCK_M_X, XS_SLAB_COLS),
-                layout=XS_SLAB_LAYOUT,
-            )
-        else:
-            xs_slab_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=XMxScale,
-                shape=(num_tokens, gl.cdiv(K, MX_PACK_DIVISOR)),
-                strides=(stride_x_mx_m, stride_x_mx_k),
-                block_shape=(PACKED_BLOCK_M_X, XS_SLAB_COLS),
-                layout=XS_SLAB_LAYOUT,
-            )
-    else:
-        x_scales_buffer = gl.allocate_shared_memory(
-            x_scales_desc.dtype,
-            shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
-            layout=x_scales_desc.layout,
-        )
+    x_scales_buffer = gl.allocate_shared_memory(
+        x_scales_desc.dtype,
+        shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
+        layout=x_scales_desc.layout,
+    )
     w_scales_buffer = gl.allocate_shared_memory(
         w_scales_desc.dtype,
         shape=[NUM_BUFFERS] + w_scales_desc.block_shape,
         layout=w_scales_desc.layout,
     )
 
-    load_idx = 0
-    wmma_idx = 0
-
     num_k_iter = gl.cdiv(K, BLOCK_K)
 
-    if PRELOAD_X_SCALES:
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(xs_slab_desc, [offs_x_m, 0], x_scales_slab)
-        else:
-            gl.amd.gfx1250.tdm.async_gather(xs_slab_desc, offs_x_m, x_scales_slab)
-
     # prologue: fill NUM_BUFFERS LDS slots via TDM
-    for _ in gl.static_range(NUM_BUFFERS):
+    for load_idx in gl.static_range(NUM_BUFFERS):
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
                 [offs_x_m, 0],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM and not PRELOAD_X_SCALES:
+            if X_SCALES_TDM:
                 gl.amd.gfx1250.tdm.async_load(
                     x_scales_desc,
                     [offs_x_m, 0],
@@ -919,7 +914,7 @@ def _moe_gemm_a4w4_prefill(
                 offs_x_m,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM and not PRELOAD_X_SCALES:
+            if X_SCALES_TDM:
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
@@ -929,13 +924,14 @@ def _moe_gemm_a4w4_prefill(
             w_desc,
             [offs_w_n, 0],
             w_buffer.index(load_idx % NUM_BUFFERS),
+            cache_modifier=".cs",
         )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
             [offs_w_n_scale, 0],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
-        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
+        if not X_SCALES_TDM:
             gl.amd.gfx1250.async_copy.global_to_shared(
                 x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 x_scales_ptrs,
@@ -947,7 +943,7 @@ def _moe_gemm_a4w4_prefill(
         x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             x_desc, add_offsets=[0, PACKED_BLOCK_K_X], clamp_bounds=CLAMP_BOUNDS
         )
-        if X_SCALES_TDM and not PRELOAD_X_SCALES:
+        if X_SCALES_TDM:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_scales_desc,
                 add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -961,197 +957,90 @@ def _moe_gemm_a4w4_prefill(
             add_offsets=[0, SHUFFLED_BLOCK_K_WS],
             clamp_bounds=CLAMP_BOUNDS,
         )
-
-        load_idx += 1
 
     if L2_PREFETCH_DISTANCE > 0:
         for pf_j in gl.static_range(L2_PREFETCH_DISTANCE):
             gl.amd.gfx1250.tdm.prefetch(w_desc, [offs_w_n, pf_j * SHUFFLED_BLOCK_K_W])
 
-    # preload tile 0 from LDS into registers
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-    if not X_SCALES_TDM and not PRELOAD_X_SCALES:
-        gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
-    cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-    if PRESHUFFLE_WEIGHTS:
-        cur_w = (
-            (
-                unshuffle_weights_gfx1250(
-                    w_buffer.index(wmma_idx % NUM_BUFFERS),
-                    PACKED_BLOCK_N_W,
-                    PACKED_BLOCK_K_W,
-                )
-            )
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
-    else:
-        cur_w = (
-            w_buffer.index(wmma_idx % NUM_BUFFERS)
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
-    if PRELOAD_X_SCALES:
-        cur_x_scales = x_scales_slab.gather(
-            ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
-            + xs_zeros_row[:, None],
-            1,
-        )
-    else:
-        cur_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-            layout=DOT_LAYOUT_X_SCALES
-        )
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-        cur_w_scales = (
-            unswizzle_scales_gfx1250(
-                w_scales_buffer.index(wmma_idx % NUM_BUFFERS),
-                BLOCK_N,
-                MX_SCALE_BLOCK_K,
-                PRESHUFFLE_FACTOR_WS,
-                SCALE_KWIDTH,
-            )
-        ).load(layout=DOT_LAYOUT_W_SCALES)
-    else:
-        cur_w_scales = w_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-            layout=DOT_LAYOUT_W_SCALES
-        )
-    wmma_idx += 1
-
-    # main loop: perform wmma and fill LDS with next tile
+    # main loop: wait for tile k, load it from LDS, WMMA, refill its slot with tile k + NUM_BUFFERS
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    for _ in range(num_k_iter - NUM_BUFFERS):
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
+    for k in range(num_k_iter):
+        if k + NUM_BUFFERS <= num_k_iter:
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+            if not X_SCALES_TDM:
+                gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
+        else:
+            gl.amd.gfx1250.tdm.async_wait(0)
+            if not X_SCALES_TDM:
+                gl.amd.gfx1250.async_copy.wait_group(0)
+        slot = k % NUM_BUFFERS
+        cur_x, cur_w, cur_x_scales, cur_w_scales = load_k_tile_gfx1250(
+            x_buffer.index(slot),
+            w_buffer.index(slot),
+            x_scales_buffer.index(slot),
+            w_scales_buffer.index(slot),
+            PRESHUFFLE_WEIGHTS,
+            SWIZZLE_MX_SCALE,
+            BLOCK_N,
+            PACKED_BLOCK_K_W,
+            MX_SCALE_BLOCK_K,
+            DOT_LAYOUT_X,
+            DOT_LAYOUT_W,
+            DOT_LAYOUT_X_SCALES,
+            DOT_LAYOUT_W_SCALES,
+        )
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
-
-        # fill next tile to LDS
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(
-                x_desc,
-                [offs_x_m, 0],
-                x_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            if X_SCALES_TDM and not PRELOAD_X_SCALES:
+        if k + NUM_BUFFERS < num_k_iter:
+            if GatherIndx is None:
                 gl.amd.gfx1250.tdm.async_load(
-                    x_scales_desc,
-                    [offs_x_m, 0],
-                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+                    x_desc, [offs_x_m, 0], x_buffer.index(slot)
                 )
-        else:
-            gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
-                offs_x_m,
-                x_buffer.index(load_idx % NUM_BUFFERS),
+                if X_SCALES_TDM:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc, [offs_x_m, 0], x_scales_buffer.index(slot)
+                    )
+            else:
+                gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_buffer.index(slot))
+                if X_SCALES_TDM:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc, offs_x_m, x_scales_buffer.index(slot)
+                    )
+            gl.amd.gfx1250.tdm.async_load(
+                w_desc, [offs_w_n, 0], w_buffer.index(slot), cache_modifier=".cs"
             )
-            if X_SCALES_TDM and not PRELOAD_X_SCALES:
-                gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
-                    offs_x_m,
-                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+            gl.amd.gfx1250.tdm.async_load(
+                w_scales_desc, [offs_w_n_scale, 0], w_scales_buffer.index(slot)
+            )
+            if not X_SCALES_TDM:
+                gl.amd.gfx1250.async_copy.global_to_shared(
+                    x_scales_buffer.index(slot), x_scales_ptrs
                 )
-        gl.amd.gfx1250.tdm.async_load(
-            w_desc,
-            [offs_w_n, 0],
-            w_buffer.index(load_idx % NUM_BUFFERS),
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            w_scales_desc,
-            [offs_w_n_scale, 0],
-            w_scales_buffer.index(load_idx % NUM_BUFFERS),
-        )
-        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
-            gl.amd.gfx1250.async_copy.global_to_shared(
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-                x_scales_ptrs,
+                gl.amd.gfx1250.async_copy.commit_group()
+                x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
+            x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                x_desc, add_offsets=[0, PACKED_BLOCK_K_X], clamp_bounds=CLAMP_BOUNDS
             )
-            gl.amd.gfx1250.async_copy.commit_group()
-            x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
-
-        # update descriptors
-        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            x_desc, add_offsets=[0, PACKED_BLOCK_K_X], clamp_bounds=CLAMP_BOUNDS
-        )
-        if X_SCALES_TDM and not PRELOAD_X_SCALES:
-            x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                x_scales_desc,
-                add_offsets=[0, MX_SCALE_BLOCK_K],
+            if X_SCALES_TDM:
+                x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_scales_desc,
+                    add_offsets=[0, MX_SCALE_BLOCK_K],
+                    clamp_bounds=CLAMP_BOUNDS,
+                )
+            w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                w_desc,
+                add_offsets=[0, SHUFFLED_BLOCK_K_W],
                 clamp_bounds=CLAMP_BOUNDS,
             )
-        w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            w_desc, add_offsets=[0, SHUFFLED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
-        )
-        w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            w_scales_desc,
-            add_offsets=[0, SHUFFLED_BLOCK_K_WS],
-            clamp_bounds=CLAMP_BOUNDS,
-        )
-        load_idx += 1
-
-        # wait for next tile to be filled
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
-            gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
-
-        # load next tile from LDS into registers
-        next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        if PRESHUFFLE_WEIGHTS:
-            next_w = (
-                (
-                    unshuffle_weights_gfx1250(
-                        w_buffer.index(wmma_idx % NUM_BUFFERS),
-                        PACKED_BLOCK_N_W,
-                        PACKED_BLOCK_K_W,
-                    )
-                )
-                .permute((1, 0))
-                .load(layout=DOT_LAYOUT_W)
+            w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                w_scales_desc,
+                add_offsets=[0, SHUFFLED_BLOCK_K_WS],
+                clamp_bounds=CLAMP_BOUNDS,
             )
-        else:
-            next_w = (
-                w_buffer.index(wmma_idx % NUM_BUFFERS)
-                .permute((1, 0))
-                .load(layout=DOT_LAYOUT_W)
-            )
-        if PRELOAD_X_SCALES:
-            next_x_scales = x_scales_slab.gather(
-                ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
-                + xs_zeros_row[:, None],
-                1,
-            )
-        else:
-            next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-                layout=DOT_LAYOUT_X_SCALES
-            )
-        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            next_w_scales = (
-                unswizzle_scales_gfx1250(
-                    w_scales_buffer.index(wmma_idx % NUM_BUFFERS),
-                    BLOCK_N,
-                    MX_SCALE_BLOCK_K,
-                    PRESHUFFLE_FACTOR_WS,
-                    SCALE_KWIDTH,
-                )
-            ).load(layout=DOT_LAYOUT_W_SCALES)
-        else:
-            next_w_scales = w_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-                layout=DOT_LAYOUT_W_SCALES
-            )
-        wmma_idx += 1
-
-        # prepare next iteration
-        cur_x = next_x
-        cur_w = next_w
-        cur_x_scales = next_x_scales
-        cur_w_scales = next_w_scales
-
-    # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
-        SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(
+        BIAS_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         bias_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -1159,93 +1048,12 @@ def _moe_gemm_a4w4_prefill(
             shape=(1, N),
             strides=(stride_b_e, 1),
             block_shape=(1, BLOCK_N),
-            layout=SHARED_LAYOUT_BIAS,
+            layout=BIAS_LAYOUT,
         )
         bias_buffer = gl.allocate_shared_memory(
             bias_desc.dtype, shape=[1, BLOCK_N], layout=bias_desc.layout
         )
-        gl.amd.gfx1250.tdm.async_load(
-            bias_desc,
-            [0, pid_n * BLOCK_N],
-            bias_buffer,
-        )
-        TDM_BIAS_WAIT: gl.constexpr = 1
-    else:
-        TDM_BIAS_WAIT: gl.constexpr = 0
-
-    # epilogue: drain remaining tiles
-    for k_ep in gl.static_range(NUM_BUFFERS - 1):
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
-        acc = gl.amd.gfx1250.wmma_scaled(
-            cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
-        )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
-
-        # wait for next tile to be filled
-        gl.amd.gfx1250.tdm.async_wait(
-            (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
-        )
-        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
-            gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
-
-        # load next tile from LDS into registers
-        next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        if PRESHUFFLE_WEIGHTS:
-            next_w = (
-                (
-                    unshuffle_weights_gfx1250(
-                        w_buffer.index(wmma_idx % NUM_BUFFERS),
-                        PACKED_BLOCK_N_W,
-                        PACKED_BLOCK_K_W,
-                    )
-                )
-                .permute((1, 0))
-                .load(layout=DOT_LAYOUT_W)
-            )
-        else:
-            next_w = (
-                w_buffer.index(wmma_idx % NUM_BUFFERS)
-                .permute((1, 0))
-                .load(layout=DOT_LAYOUT_W)
-            )
-        if PRELOAD_X_SCALES:
-            next_x_scales = x_scales_slab.gather(
-                ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
-                + xs_zeros_row[:, None],
-                1,
-            )
-        else:
-            next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-                layout=DOT_LAYOUT_X_SCALES
-            )
-        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            next_w_scales = (
-                unswizzle_scales_gfx1250(
-                    w_scales_buffer.index(wmma_idx % NUM_BUFFERS),
-                    BLOCK_N,
-                    MX_SCALE_BLOCK_K,
-                    PRESHUFFLE_FACTOR_WS,
-                    SCALE_KWIDTH,
-                )
-            ).load(layout=DOT_LAYOUT_W_SCALES)
-        else:
-            next_w_scales = w_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-                layout=DOT_LAYOUT_W_SCALES
-            )
-        wmma_idx += 1
-
-        # prepare next iteration
-        cur_x = next_x
-        cur_w = next_w
-        cur_x_scales = next_x_scales
-        cur_w_scales = next_w_scales
-
-    # issue last wmma
-    acc = gl.amd.gfx1250.wmma_scaled(
-        cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
-    )
+        gl.amd.gfx1250.tdm.async_load(bias_desc, [0, pid_n * BLOCK_N], bias_buffer)
 
     # bias
     if B is not None:
@@ -1272,20 +1080,15 @@ def _moe_gemm_a4w4_prefill(
 
     # apply gammas
     if Gammas is not None:
-        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
-        mask_m = offs_m < M
-        gammas = gl.amd.gfx1250.buffer_load(
-            Gammas + start_m, offs_m, mask=mask_m, other=0.0
-        )
         out *= gammas[:, None]
 
     if HAS_MX_OUT:
         # MXFP4 emit. The consuming GEMM reads ACTIVATION scales unswizzled in
         # every branch -- SWIZZLE_MX_SCALE gates only w_scales -- so plain
         # row-major [M, yN/32] e8m0 is exactly the layout it wants. And
-        # _mxfp4_quant_op is the same device function `mxfp4_quant` calls, so
-        # the nibble packing is byte-identical to the standalone launch this
-        # replaces.
+        # mx_e8m0_scale + scaled_downcast are what `mxfp4_quant` runs on gfx1250
+        # (gluon_dynamic_mxfp4_quant_kernel_gfx1250), so the bytes are identical
+        # to the standalone launch this replaces.
         gl.static_assert(
             OUT_BLOCK_N % 32 == 0, "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0"
         )
@@ -1293,9 +1096,16 @@ def _moe_gemm_a4w4_prefill(
         # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
         # group lies inside this tile: no cross-program reduction, and the
         # amax of a padding row can only ever affect that same padding row.
-        packed, bs_e8m0 = _mxfp4_quant_op(
-            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        # e8m0 scale: the same amax rounding as _mxfp4_quant_op; e2m1 payload: the
+        # hardware v_cvt_scalef32_pk8_fp4 (8 values a lane, divides by 2^(e8m0 - 127)).
+        xq = out.to(gl.bfloat16).to(gl.float32)
+        amax = gl.max(
+            gl.abs(xq.reshape(BLOCK_M, NUM_QB, 32)),
+            axis=-1,
+            keep_dims=True,
         )
+        bs_e8m0 = mx_e8m0_scale(amax, 2).reshape(BLOCK_M, NUM_QB)
+        packed = gl.amd.cdna5.scaled_downcast(xq, bs_e8m0, "e2m1", axis=1)
         # The two stores get their own row offsets rather than sharing one. The
         # values and the scales come off different tails of the reshape/split
         # chain and so carry different layouts; a shared offset tensor would have
@@ -1411,40 +1221,36 @@ def _moe_gemm_a4w4_prefill(
     repr=_moe_gemm_a4w4_decode_repr,
 )
 def _moe_gemm_a4w4_decode(
-    Y,
-    stride_y_m,
-    stride_y_n,
-    X,
-    stride_x_m,
-    stride_x_k,
-    XMxScale,
-    stride_x_mx_m,
-    stride_x_mx_k,
-    W,
-    stride_w_e,
-    stride_w_k,
-    stride_w_n,
-    WMxScale,
-    stride_w_mx_e,
-    stride_w_mx_k,
-    stride_w_mx_n,
-    # bias
-    B,
-    stride_b_e,
-    Gammas,
-    # shapes
-    num_tokens,
-    N: gl.constexpr,
-    K: gl.constexpr,
-    # expt data
     GatherIndx,
     ExptHist,
     ExptOffs,
     ExptOffsSum,
     ExptData,
-    # true grid size
+    X,
+    XMxScale,
+    W,
+    WMxScale,
     grid_m,
     grid_n,
+    num_tokens,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    stride_x_m,
+    stride_x_k,
+    stride_x_mx_m,
+    stride_x_mx_k,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    stride_w_mx_e,
+    stride_w_mx_k,
+    stride_w_mx_n,
+    B,
+    stride_b_e,
+    Gammas,
+    Y,
+    stride_y_m,
+    stride_y_n,
     # fused activation function
     APPLY_SWIGLU: gl.constexpr,
     alpha,
@@ -1522,16 +1328,17 @@ def _moe_gemm_a4w4_decode(
     # get program id
     pid = gl.program_id(0)
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
+    # grid_n is N / BLOCK_N (no split-k here): a constexpr divisor, no runtime division in the prologue
+    GRID_N: gl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
     if XCD_SWIZZLE != 1:
-        padding_m = grid_m - gl.load(ExptOffsSum)
-        unpadded_m = grid_m - padding_m
-        total_actual_tiles = unpadded_m * grid_n
-        if padding_m > 0 and pid >= total_actual_tiles:
+        unpadded_m = gl.load(ExptOffsSum)
+        total_actual_tiles = unpadded_m * GRID_N
+        if pid >= total_actual_tiles:
             return
         pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
     else:
         unpadded_m = grid_m
-    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
+    pid_m, pid_n = pid_grid(pid, unpadded_m, GRID_N, 1)
 
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
@@ -2118,9 +1925,9 @@ def _moe_gemm_a4w4_decode(
         # MXFP4 emit. The consuming GEMM reads ACTIVATION scales unswizzled in
         # every branch -- SWIZZLE_MX_SCALE gates only w_scales -- so plain
         # row-major [M, yN/32] e8m0 is exactly the layout it wants. And
-        # _mxfp4_quant_op is the same device function `mxfp4_quant` calls, so
-        # the nibble packing is byte-identical to the standalone launch this
-        # replaces.
+        # mx_e8m0_scale + scaled_downcast are what `mxfp4_quant` runs on gfx1250
+        # (gluon_dynamic_mxfp4_quant_kernel_gfx1250), so the bytes are identical
+        # to the standalone launch this replaces.
         gl.static_assert(
             OUT_BLOCK_N % 32 == 0, "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0"
         )
@@ -2128,9 +1935,16 @@ def _moe_gemm_a4w4_decode(
         # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
         # group lies inside this tile: no cross-program reduction, and the
         # amax of a padding row can only ever affect that same padding row.
-        packed, bs_e8m0 = _mxfp4_quant_op(
-            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        # e8m0 scale: the same amax rounding as _mxfp4_quant_op; e2m1 payload: the
+        # hardware v_cvt_scalef32_pk8_fp4 (8 values a lane, divides by 2^(e8m0 - 127)).
+        xq = out.to(gl.bfloat16).to(gl.float32)
+        amax = gl.max(
+            gl.abs(xq.reshape(BLOCK_M, NUM_QB, 32)),
+            axis=-1,
+            keep_dims=True,
         )
+        bs_e8m0 = mx_e8m0_scale(amax, 2).reshape(BLOCK_M, NUM_QB)
+        packed = gl.amd.cdna5.scaled_downcast(xq, bs_e8m0, "e2m1", axis=1)
         # The two stores get their own row offsets rather than sharing one. The
         # values and the scales come off different tails of the reshape/split
         # chain and so carry different layouts; a shared offset tensor would have
