@@ -1,0 +1,230 @@
+---
+name: flydsl-aot-export
+description: >
+  Route an aiter FlyDSL kernel launch through the export_to_c AOT cache
+  (aot_factory / bind_aot / FlyDSLAotCache) so a new process loads a prebuilt
+  object instead of tracing. Use when converting a wrapper's _run_compiled
+  launch to the AOT cache, when reviewing such a conversion (is every
+  constexpr in the key or specialization_key?), when an entry falls back to
+  the JIT path or raises a baked-argument error, and when validating a
+  conversion without the target GPU.
+argument-hint: [wrapper module, op name or cache name]
+allowed-tools: Read Edit Bash Grep Glob
+---
+
+# FlyDSL AOT cache: converting a launch to export_to_c
+
+How to move a `_run_compiled(launcher, ...)` launch onto
+`aiter/ops/flydsl/aot_cache.py`, and how to check the result. The design, the
+invalidation rules and the validated cases are in `docs/flydsl_aot_cache.md`;
+read its §4.1 (keys), §4.2 (invalidation) and §6 (adopting) before a
+non-trivial conversion. This file is the procedure and the checks.
+
+Converted wrappers to copy from:
+
+| Shape of the launcher | Example |
+|---|---|
+| Factory takes the constexprs, launcher takes runtime arguments only | `gemm_kernels.py` (`_preshuffle_launcher`), `gemm_a8w8_blockscale.py` (`_compile_gemm`) |
+| Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`) |
+| Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
+| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`) |
+
+## The one rule
+
+**Everything that changes the compiled code must be in the key.** The key is
+the factory's arguments plus `_run_compiled`'s `specialization_key`. Arch, CU
+count, FlyDSL itself, the kernel's source files and the environment variables
+those files read are tracked for you. Tensor dtype, rank and unit-stride axis
+are in the disk digest, but not in the in-memory key.
+
+So, for each launch, list what the trace depends on and tick each item off:
+
+- every `Constexpr[T]` parameter of the launcher, including those left to
+  their default;
+- every value the factory closes over;
+- a tensor dtype that can vary for one launcher (`q.dtype`, an output dtype);
+- a device, when the factory keeps one launcher per device (pass the
+  `torch.device`, not its index: on disk a device is only its type, so one
+  entry serves every GPU);
+- a module global or a config file the kernel reads at trace time. The cache
+  does not see these: pass the value in the key.
+
+## Steps
+
+1. **Find the launcher and what selects it.** Read the `_run_compiled` call
+   and the launcher's signature. Note which parameters are `Constexpr`, which
+   object caches the launcher today (`functools.cache`, a module dict, a
+   module-level function) and who else launches the same launcher.
+2. **Pick the pattern.**
+
+   Constexprs go to the factory:
+
+   ```python
+   @aot_factory("my_kernel")            # the cache name; above functools.cache
+   @functools.cache
+   def _my_launcher(N, K, tile_m, out_dtype):
+       from .kernels.my_kernel import compile_my_kernel   # import inside
+       return compile_my_kernel(N, K, tile_m, out_dtype)
+
+   _run_compiled(_my_launcher.lazy(N, K, tile_m, out_dtype), *args, stream)
+   ```
+
+   A module-level launcher that takes its constexprs at launch: a factory with
+   no argument, and the constexprs in `specialization_key`:
+
+   ```python
+   @aot_factory("my_kernel")
+   @functools.cache
+   def _my_launcher():
+       from .kernels.my_kernel import launch_my_kernel
+       return launch_my_kernel
+
+   spec = (tile_m, tile_n, out_is_f16, split_k)       # every Constexpr argument
+   _run_compiled(_my_launcher.lazy(), *runtime_args, *spec, specialization_key=spec)
+   ```
+
+   A launcher built where a factory cannot return it (a dict of launchers, a
+   launcher shared by several argument sets): bind it where it is built, keyed
+   by the values that determine it, and give `make_exe` a fresh build:
+
+   ```python
+   bind_aot(launch, _MY_AOT, dataclasses.astuple(traits),
+            make_exe=lambda: _build(traits)["launch"])
+   ```
+
+3. **Launch `factory.lazy(...)`, not `factory(...)`.** A hit then never calls
+   the factory. Move the kernel-module imports into the factory and out of the
+   wrapper's `_lazy_import`, or the hit still pays the `@flyc.kernel`
+   definitions (a few hundred ms per module in a fresh process).
+4. **One launcher, one cache.** When several wrappers launch the same
+   launcher, define its factory once and import it. Two factories
+   returning one launcher object bind it to two keys, and it falls back to
+   the JIT path.
+5. **Update what else compiles the kernel.** A preload or warm-up helper must
+   go through the same launch path under compile-only
+   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set),
+   or it warms FlyDSL's cache and not the entry the launch loads. An AOT replay
+   under `aiter/aot/flydsl/` needs no change if it enters at the public op.
+6. **Document it.** Add the cache name, wrapper and key to
+   `docs/flydsl_aot_cache.md` §5, and remove the op from the "not converted"
+   list in §7.
+
+## Checks before calling it done
+
+Key coverage:
+
+- [ ] Every `Constexpr` launch argument is in `specialization_key`, by value
+      and in a stable order. Compare the tuple with the launcher signature
+      line by line; defaults count.
+- [ ] `specialization_key` tuples that reach one launcher from different call
+      sites cannot be equal for different constexprs (different lengths, or a
+      leading tag).
+- [ ] Key elements are ints, floats, bools, strings, `None`, torch dtypes and
+      devices, and tuples/lists/dicts of those. A numpy scalar, an Enum or a
+      tensor-derived value leaves the launch on the JIT path. Convert at the
+      call site (`int(x)`, `bool(x)`, `.value`).
+- [ ] Every flag has one type, whatever the caller passed: coerce with
+      `bool()` / `int()` before building the key and the launch arguments. A
+      constexpr launch argument is compared by value with the one its entry
+      was built with, and `False` and `0` differ there, so a key first
+      launched with `False` raises when launched with `0`. As factory
+      arguments they hash alike but give two disk digests.
+
+Launch arguments:
+
+- [ ] Runtime arguments are tensors, pointer arguments (`ptr_arg`,
+      `flyc.from_c_void_p`), `fx` numerics or a stream. A torch stream is
+      converted only as the last argument; pass `fx.Stream(...)` elsewhere.
+- [ ] One key always launches with the same argument list. A later launch
+      of a key with more arguments than its first, or too few to reach its
+      constexprs, raises: do not pass an optional trailing constexpr on some
+      calls of a key and not on others.
+
+Behaviour kept:
+
+- [ ] Nothing else refers to the launcher global, dict or helper you removed
+      (`grep` the repo, including `op_tests/`, `csrc/` tuners and
+      `aiter/aot/`).
+- [ ] The wrapper has no AOT branch of its own: `_run_compiled` handles mode
+      `0`, the fallback and compile-only.
+- [ ] A kernel file shared with another arch keeps that arch's path as it
+      was, unless you validate it too.
+
+## Validating
+
+Use a fresh `AITER_FLYDSL_AOT_CACHE_DIR` and `FLYDSL_RUNTIME_CACHE_DIR` for
+each round. The log line `[FlyDSL AOT] built <path>.o` marks a build. A
+`[FlyDSL AOT]` line that ends in `through the JIT path` or `using the JIT path
+for it` marks a fallback and is a failure of the conversion.
+
+1. **Build.** Run the op once. Expect one `built` line per specialization and
+   no fallback.
+2. **Hit.** Run it again on the same directory in a new process. Expect no
+   `built` line.
+3. **Verify.** Run it again with `AITER_FLYDSL_AOT_CACHE=verify`: every entry
+   loaded from disk is re-traced and byte-compared. A mismatch means the key
+   misses an input.
+4. **Mode 0.** Run with `AITER_FLYDSL_AOT_CACHE=0`: the JIT path must still
+   work, since it is the fallback.
+5. **Sidecar.** Open a `<digest>-<variant>.json` of the new cache: `baked`
+   lists the constexpr argument indexes and values, `sources` the kernel's
+   files. A kernel file missing from `sources` means the trace did not run
+   it; see §4.2 of the doc for the holes and `extra_sources`.
+6. **Result.** On the target GPU, compare the op's output bitwise against
+   mode `0`, and run its op test twice on one cache directory.
+
+Without the target GPU, steps 1-5 run compile-only on any host:
+
+```bash
+# tuned GEMM / MoE rows of one arch, through the public op
+GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.gemm --csv <tuned.csv>
+```
+
+For an op with no replay module, call the wrapper on FakeTensors:
+
+```python
+import os
+os.environ["GPU_ARCHS"] = "gfx1250"       # before importing aiter
+os.environ["AITER_AOT_REPLAY"] = "1"
+import torch
+from aiter.aot.flydsl.dry_run import dry_run
+
+with dry_run("gfx1250", 256, python_ops=True):
+    my_op(torch.empty(4, 128, 576, dtype=torch.bfloat16, device="cuda"), ...)
+```
+
+Fake storage addresses are made up, so a host check that compares pointers
+(an overlap or alignment test) can fail there for no real reason; patch that
+check in the script, not in the wrapper. Say in the PR that the validation
+was compile-only and that step 6 is still owed.
+
+Run `python -m pytest -q tests/test_flydsl_aot_launch.py
+tests/test_flydsl_aot_cache.py` after touching `aot_cache.py`, `aot_launch.py`
+or `tensor_shim.py`, and after a FlyDSL pin bump.
+
+## When it goes wrong
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `was compiled with constexpr ...; pass every constexpr launch argument in specialization_key` | One key launched with two values of a constexpr, or with one value in two types (`False` and `0`) | Add the argument to `specialization_key`; coerce flags to one type |
+| `was compiled for N launch arguments and is launched with ...` | One key launched with different argument lists | Pass the same arguments at every launch of the key |
+| `no exported entry for ...; using the JIT path for it` | The build, export or load of the entry failed; the reason is in the message | Fix the reason (an argument type `export_to_c` does not support, a stream that is not last) |
+| `one launcher bound to keys ... and ...` | Two factories or keys return one launcher object | One factory per launcher; for shared launchers use `bind_aot` at the build |
+| `cannot bind a dict` / `tuple` | The factory returns several launchers | `bind_aot` each launcher where it is built |
+| `... launching through the JIT path` at bind time | A key element the cache cannot store | Convert it to a plain value at the call site |
+| `changed after this process started; not caching` | A recorded source was edited while the process ran | Rerun in a new process |
+| A second run builds again | The key or a recorded env variable differs between runs, or the sources differ (first build of a process records import side effects) | Diff the two sidecars |
+| `verify` mismatch | The trace reads something the key does not hold | Find it (a global, a config, a device property) and put it in the key |
+| The preload/tuner precompile does not speed up the first launch | It compiles the raw launcher | Step 5 above |
+
+## Limits to state, not to hide
+
+- A hit skips the trace. With `bind_aot` on a launcher built before the bind,
+  the kernel definition still runs once per process.
+- `factory.lazy()` handles and loaded entries are not evicted, whatever
+  `maxsize` the factory's `lru_cache` has.
+- `COMPILE_ONLY` is read for the whole process, so a launch on another thread
+  during a preload compiles and does not run. Preload in tuner and prebuild
+  workers, not beside inference.
+- Entries are built at the first call on a machine unless a replay under
+  `aiter/aot/flydsl/` prebuilds them.
