@@ -58,7 +58,7 @@ from .gemm2 import (
     issue_a_scale_lds_dt,
 )
 from .mega_moe_config import (
-    LARGE_M_QUANTS,
+    FUSED_QUANTS,
     MegaMoEConfig,
     fused_layout_supported,
     large_m_mtprs_for,
@@ -69,7 +69,11 @@ from .mega_moe_fused_gemm import (
     load_at,
     store_at,
 )
-from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
+from .mega_moe_stage1 import (
+    _dispatch_dtype,
+    _validate_dispatch_capacity,
+    stage1_output_buffers,
+)
 from .mega_moe_stage2 import (
     _SC0_SC1_CACHE,
     Stage2Meta,
@@ -272,13 +276,17 @@ def _store_expert_metadata(
         store_at(fx.Int32(invalid_source), srcmap, local_row_base + total_count + pad)
 
 
-def _token_row(addr):
-    """A token row at ``addr`` as 16-byte units: unit ``lane + 64 c`` is lane ``lane``'s dwordx4 of column block c."""
-    return ptr_buf_tensor(addr, fx.Int32, unit_elems=4)
+def _token_row(addr, unit_i32=4):
+    """A token row at ``addr`` as units of unit_i32 dwords: unit ``lane + 64 c`` is lane ``lane``'s of column block c.
+
+    A column block is 64 units: 1 KiB of an FP8 row (dwordx4 units), 1024 values of an FP4 row (dwordx2 units).
+    """
+    return ptr_buf_tensor(addr, fx.Int32, unit_elems=unit_i32)
 
 
 @flyc.jit
 def _copy_token_row(source_rsrc, destination_rsrc, lane, *, fz_safe_end_i32, fz_n_i32):
+    assert fz_n_i32 % 4 == 0, "a token row is copied in dwordx4 units"
     lane_offset = lane * fx.Int32(4)
     if const_expr(fz_safe_end_i32 > 0):
         for column in range(lane_offset, fz_safe_end_i32, 512):
@@ -1041,12 +1049,13 @@ def emit_dispatch_group(
 def emit_presend(
     *, num_waves, fz_k, fz_epr, fz_mtpr, fz_rank, fz_npes, fz_total_experts, fz_nbytes, fz_n_i32, fz_scale_n_i32,
     fz_enable_scales, addr_disp, addr_in_tok, addr_in_sc, addr_in_idx, i32_cur_tok, worker, workers, payload_epoch,
-    presend_experts, presend_limit=None,
+    presend_experts, presend_limit=None, fz_unit_i32=4,
 ):
 # fmt: on
     """Dedup rows, before the plan: send every token row whose lowest expert at a destination is one of that
     destination's first presend_experts local experts (the first payload round), then stamp its arrival.
     presend_limit: a runtime expert count used in place of presend_experts.
+    fz_unit_i32: the dwords a lane copies per column block of the row (_token_row).
     The token-scale reads are bounded by the mtpr-row scale buffer (see emit_dispatch_payload).
 
     A dedup row's place (rank * mtpr + token) does not depend on the plan, so the first round's rows cross XGMI while
@@ -1060,6 +1069,8 @@ def emit_presend(
     p_rx = dp(DispatchSlot.P2P_TOKEN)
     p_sc = dp(DispatchSlot.P2P_SCALE)
     p_row_arrived = dp(DispatchSlot.P2P_ROW_ARRIVED)
+    row_blocks = fz_n_i32 // (64 * fz_unit_i32)
+    assert row_blocks * 64 * fz_unit_i32 == fz_n_i32, "a token row must tile by 64-lane column blocks"
     lane = fx.thread_idx.x & fx.Int32(63)
     warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.thread_idx.x >> fx.Int32(6)))
     r_idx = AddrBuffer(addr_in_idx)
@@ -1075,17 +1086,17 @@ def emit_presend(
                 local < fx.Int32(fz_epr))
             lowest = (here & (local < lowest)).select(local, lowest)
         if lowest < (fx.Int32(presend_experts) if presend_limit is None else presend_limit):
-            source_row = _token_row(addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes))
-            row_values = [buf_copy_load(source_row, lane + fx.Int32(c * 64), unit_elems=4)
-                for c in range_constexpr(fz_n_i32 // 256)]
+            source_row = _token_row(addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes), fz_unit_i32)
+            row_values = [buf_copy_load(source_row, lane + fx.Int32(c * 64), unit_elems=fz_unit_i32)
+                for c in range_constexpr(row_blocks)]
             if const_expr(fz_enable_scales):
                 row_values.append(load_at(r_sc, token * fx.Int32(fz_scale_n_i32)
                     + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
             token_row = fx.Int32(fz_rank * fz_mtpr) + token
             destination_row = _token_row(ptr_buf_tensor(p_rx, fx.Int64)[destination]
-                + fx.Int64(token_row) * fx.Int64(fz_nbytes))
-            for c in range_constexpr(fz_n_i32 // 256):
-                buf_copy_store(destination_row, lane + fx.Int32(c * 64), row_values[c], unit_elems=4)
+                + fx.Int64(token_row) * fx.Int64(fz_nbytes), fz_unit_i32)
+            for c in range_constexpr(row_blocks):
+                buf_copy_store(destination_row, lane + fx.Int32(c * 64), row_values[c], unit_elems=fz_unit_i32)
             if const_expr(fz_enable_scales):  # noqa: SIM102
                 if lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32):
                     store_at(row_values[-1], AddrBuffer(load_at(AddrBuffer(p_sc), destination, fx.Int64, 1)),
@@ -1120,7 +1131,7 @@ def emit_dispatch_payload(
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
     dedup=False, addr_in_idx=None, merge_release=False, skip_payload_ready=False, chunk_release=True,
     batch_rows=False, lds_pool_ptr=None, presend_experts=0, bucket_pairs=False, presend_limit=None,
-    hoist_peer=False,
+    hoist_peer=False, fz_unit_i32=4,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
@@ -1138,7 +1149,8 @@ def emit_dispatch_payload(
     batch_rows (set with dedup): a chunk resolves its routes one per thread, lists the token rows it sends in LDS
     (lds_pool_ptr), then its waves copy them. The token-scale reads are bounded by the mtpr-row scale buffer: a row's
     scales take its first lanes, and the masked loads of the other lanes move past the buffer bound, which without it
-    is 4 GiB, so they would read 2 GiB past the buffer and fault where nothing is mapped there.
+    is 4 GiB, so they would read 2 GiB past the buffer and fault where nothing is mapped there. A lane copies
+    fz_unit_i32 dwords per column block of the row (_token_row).
 
     presend_experts (batch_rows): emit_presend already sent the token rows whose lowest expert at the destination is
     below presend_experts (presend_limit, when given).
@@ -1151,7 +1163,8 @@ def emit_dispatch_payload(
     assert dedup == batch_rows
     assert not presend_experts or batch_rows
     if const_expr(batch_rows):
-        assert payload_chunk_rows <= num_waves * 64 and fz_n_i32 % 256 == 0
+        row_blocks = fz_n_i32 // (64 * fz_unit_i32)
+        assert payload_chunk_rows <= num_waves * 64 and row_blocks * 64 * fz_unit_i32 == fz_n_i32
         assert not fz_enable_scales or fz_scale_n_i32 % 4 == 0
         r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4))
         # The chunk's sent-row list in the (then idle) LDS pool: a count at word 4, the rows from word 16.
@@ -1320,9 +1333,9 @@ def emit_dispatch_payload(
                 tokens = [fx.Int32(fx.rocdl.readfirstlane(T.i32, send_slots[i])) for i in pair]
                 values = []
                 for token in tokens:
-                    source_row = _token_row(addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes))
-                    row_values = [buf_copy_load(source_row, lane + fx.Int32(c * 64), unit_elems=4)
-                        for c in range_constexpr(fz_n_i32 // 256)]
+                    source_row = _token_row(addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes), fz_unit_i32)
+                    row_values = [buf_copy_load(source_row, lane + fx.Int32(c * 64), unit_elems=fz_unit_i32)
+                        for c in range_constexpr(row_blocks)]
                     if const_expr(fz_enable_scales):
                         row_values.append(load_at(r_sc, token * fx.Int32(fz_scale_n_i32)
                             + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
@@ -1330,9 +1343,9 @@ def emit_dispatch_payload(
 
                 def _store_row(token, row_values):
                     token_row = fx.Int32(fz_rank * fz_mtpr) + token
-                    destination_row = _token_row(token_remote + fx.Int64(token_row) * fx.Int64(fz_nbytes))
-                    for c in range_constexpr(fz_n_i32 // 256):
-                        buf_copy_store(destination_row, lane + fx.Int32(c * 64), row_values[c], unit_elems=4)
+                    destination_row = _token_row(token_remote + fx.Int64(token_row) * fx.Int64(fz_nbytes), fz_unit_i32)
+                    for c in range_constexpr(row_blocks):
+                        buf_copy_store(destination_row, lane + fx.Int32(c * 64), row_values[c], unit_elems=fz_unit_i32)
                     if const_expr(fz_enable_scales):  # noqa: SIM102
                         if lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32):
                             store_at(row_values[-1], scale_remote_rsrc,
@@ -1859,9 +1872,10 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int = 4, payload_chunk_rows: int = 384, swiglu_limit: float = 0.0, fused_g2_chunk: int = 1,
-    payload_min_blocks: int = 0,
+    payload_min_blocks: int = 0, a_dtype: str = "fp8",
 ):
     # fused_stage2 / fused_combine are hashable (key, value) specs and part of the compile key.
+    # a_dtype: the dispatched rows and GEMM1 A are FP8 or packed FP4 (MXFP4); the GEMM1 output is FP8 for both.
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise RuntimeError(f"MegaMoE stage1 requires gfx950, got {arch}")
@@ -1890,10 +1904,10 @@ def compile_mega_moe_stage1(
     NUM_ACC_N = n_per_wave // 16
     assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
 
-    TILE_K_BYTES = tile_k // 2
-    assert TILE_K_BYTES % 128 == 0
-    A_K_STEP_BYTES = tile_k
-    assert A_K_STEP_BYTES == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
+    assert a_dtype in ("fp8", "fp4")
+    a_fp4 = a_dtype == "fp4"
+    assert tile_k == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
+    A_K_STEP_BYTES = tile_k // (2 if a_fp4 else 1)
     K_ITERS = model_dim // tile_k
     TOTAL_THREADS = NUM_WAVES * 64
     WORK_SHARDS = int(work_shards)
@@ -2068,7 +2082,11 @@ def compile_mega_moe_stage1(
     fz_total_experts = fz_npes * fz_epr
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
-    fz_n_i32, fz_nbytes = model_dim // 4, model_dim
+    # A token row: model_dim FP8 bytes or model_dim / 2 packed FP4 bytes. The batched row copies move it in
+    # 64-lane column blocks of 1024 values: one dwordx4 a lane (FP8) or one dwordx2 (FP4).
+    fz_nbytes = model_dim // (2 if a_fp4 else 1)
+    fz_n_i32 = fz_nbytes // 4
+    fz_unit_i32 = 2 if a_fp4 else 4
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
     fz_enable_scales = fz_scale_bytes > 0
@@ -2093,6 +2111,7 @@ def compile_mega_moe_stage1(
         f"{f'_pmb{payload_min_blocks}' if payload_min_blocks else ''}"
         f"{swiglu_suffix}"
         f"_s2bm{S2_BM}bn{S2_BN}nw{S2_NW}c{G2_CHUNK}_{S2_KEY}_combu{C_U}"
+        f"{'_afp4' if a_fp4 else ''}"
     )
 
     def _g2_decode(unit, total_m):
@@ -2356,7 +2375,7 @@ def compile_mega_moe_stage1(
                     addr_in_tok=addr_in_tok, addr_in_sc=addr_in_sc, addr_in_idx=addr_in_idx, i32_cur_tok=i32_cur_tok,
                     worker=ticket - fx.Int32(dispatch_blocks + 1), workers=fx.Int32(launch_grid_x - 1 - dispatch_blocks),
                     payload_epoch=(payload_expected // fx.Int32(fz_npes)) * fx.Int32(2) - payload_parity,
-                    presend_experts=DISP_PRESEND, presend_limit=presend_limit)
+                    presend_experts=DISP_PRESEND, presend_limit=presend_limit, fz_unit_i32=fz_unit_i32)
                 # fmt: on
 
         if producer:
@@ -2390,7 +2409,7 @@ def compile_mega_moe_stage1(
                     merge_release=DISP_MERGE_REL, skip_payload_ready=DISP_NO_READY, chunk_release=not DISP_NO_REL,
                     batch_rows=DISP_BATCH, lds_pool_ptr=lds.pool.ptr,
                     presend_experts=DISP_PRESEND, bucket_pairs=DISP_BUCKET, presend_limit=presend_limit,
-                    hoist_peer=DISP_PEER_HOIST,
+                    hoist_peer=DISP_PEER_HOIST, fz_unit_i32=fz_unit_i32,
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
@@ -2433,7 +2452,7 @@ def compile_mega_moe_stage1(
 
             g1_row_map = {
                 "srcmap": ptr_buf_tensor(_disp_ptr(DispatchSlot.SRCMAP), fx.Int32), "x_token": 0,
-                "x_bytes": fz_npes * fz_mtpr * model_dim, "scale_token": 0, "rows": fz_npes * fz_mtpr,
+                "x_bytes": fz_npes * fz_mtpr * fz_nbytes, "scale_token": 0, "rows": fz_npes * fz_mtpr,
                 "wait": _wait_rows,
             }
         g1_runners = build_fused_gemm1(
@@ -2450,7 +2469,7 @@ def compile_mega_moe_stage1(
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
             evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
             fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_SHORT_ROWS, fold_rows=G1_FOLD, row_map=g1_row_map,
-            a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK,
+            a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype,
         )
         _do_scheduled_tile = g1_runners[1]
         _do_short_tile = g1_runners[2] if G1_SHORT_ROWS else None
@@ -2471,7 +2490,7 @@ def compile_mega_moe_stage1(
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
                 evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
                 fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_MID_ROWS, row_map=g1_row_map,
-                a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK,
+                a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype,
             )[2]
 
         if tid == fx.Int32(0):
@@ -2986,7 +3005,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     fused_combine_args, sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2, b_nt=-1, work_shards=4, payload_chunk_rows=384,
-    swiglu_limit=0.0, fused_g2_chunk=1, payload_min_blocks=0):
+    swiglu_limit=0.0, fused_g2_chunk=1, payload_min_blocks=0, a_dtype="fp8"):
     """The persistent kernel's launcher and its fused Stage2/Combine launch arguments.
 
     Returns ``(launch, fused, combine_cur_tok, combine_row_nbytes)``: ``fused`` are the i64 addresses that
@@ -3009,6 +3028,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=int(work_shards), payload_chunk_rows=payload_chunk_rows,
         swiglu_limit=swiglu_limit, fused_g2_chunk=int(fused_g2_chunk), payload_min_blocks=int(payload_min_blocks),
+        a_dtype=a_dtype,
     )
     fused = (fx.Int64(int(mtile_ctr)), *[fx.Int64(int(v)) for v in s2_args], *[fx.Int64(int(v)) for v in c_args[:5]])
     return launch, fused, int(c_args[5]), fx.Int32(int(c_args[6]))
@@ -3059,16 +3079,25 @@ class LargeMRuntime:
 
     @classmethod
     def payload_capacity(
-        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
-        """group_major_capacity() of this runtime's dispatch, for a shared payload arena."""
+        """group_major_capacity() of this runtime's dispatch (rows of the ``a_dtype`` GEMM1 A), for a shared
+        payload arena."""
         return group_major_capacity(
             world_size=world_size,
             hidden_dim=model_dim,
             max_tok_per_rank=max_tok_per_rank,
             experts_per_rank=experts // world_size,
             topk=topk,
-            data_type=torch.float8_e4m3fn,
+            data_type=_dispatch_dtype(a_dtype),
             unit_size=cls.GM_UNIT_SIZE,
             scale_dim=model_dim // 32,
             compact=cls.GM_COMPACT,
@@ -3111,9 +3140,10 @@ class LargeMRuntime:
         """``payload_arena`` / ``s1_output_arena`` / ``combine_input`` / ``quant_buffers``:
         storage shared by the routes of one MegaMoEV2 (see GroupMajorPayloadArena,
         stage1_output_buffers and FlyDSLDispatchCombineIntraNodeOp; the quant buffers are
-        the FP8 rows and E8M0 scales of max_tok_per_rank inputs); None allocates."""
-        if quant not in LARGE_M_QUANTS:
-            raise ValueError(f"LargeMRuntime supports quant in {LARGE_M_QUANTS}")
+        the FP8 (a8w4) or packed FP4 (a4w4) rows and E8M0 scales of max_tok_per_rank
+        inputs); None allocates. The GEMM1 output is FP8 for both quants."""
+        if quant not in FUSED_QUANTS:
+            raise ValueError(f"LargeMRuntime supports quant in {FUSED_QUANTS}")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
@@ -3124,7 +3154,7 @@ class LargeMRuntime:
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
         ) or max_tok_per_rank not in large_mtprs:
             raise ValueError(
-                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 / EP8 "
+                "the large-input path requires a fused layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 / EP8 "
                 "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
                 f"({large_mtprs or 'none'})"
             )
@@ -3136,6 +3166,10 @@ class LargeMRuntime:
         self.epr = int(experts // world_size)
         self.topk = int(topk)
         self.mtpr = int(max_tok_per_rank)
+        self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
+        # Packed FP4 rows hold two values a byte; the quant kernel writes them as uint8.
+        self._a_row_bytes = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
+        self._quant_dtype = torch.uint8 if self._a_dtype == "fp4" else torch.float8_e4m3fn
         self.state_slots = int(state_slots)
         if self.state_slots <= 0:
             raise ValueError("state_slots must be positive")
@@ -3149,7 +3183,7 @@ class LargeMRuntime:
         self.comb_cfg = FlyDSLDispatchCombineConfig(rank=self.rank, world_size=self.world_size,
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
-            dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
+            dispatch_dtype=_dispatch_dtype(self._a_dtype), scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT,
             gm_indexed_payload=self.indexed_payload(world_size=self.world_size, model_dim=self.model_dim,
@@ -3177,10 +3211,12 @@ class LargeMRuntime:
         self._build_fused_stage1(w1, w1_scale)
         if quant_buffers is None:
             quant_buffers = (
-                torch.empty((self.mtpr, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev),
+                torch.empty((self.mtpr, self._a_row_bytes), dtype=self._quant_dtype, device=self.dev),
                 torch.empty((self.mtpr, self._s1_scale_dim), dtype=torch.uint8, device=self.dev),
             )
         self._quant_x, self._quant_scale = quant_buffers
+        # per_1x32_mx_quant writes FP4 rows as bytes.
+        self._quant_x = self._quant_x.view(self._quant_dtype)
         self._build_stage2_invariants()
         self._allocate_fused_counters()
         self.select_layer_state(0)
@@ -3229,7 +3265,8 @@ class LargeMRuntime:
         self._s1_mega = run_mega_moe_stage1
 
         v = op._ll_views()
-        self._s1_rx = v["rx_em"]
+        # The kernel reads the FP4 rows as bytes.
+        self._s1_rx = v["rx_em"].view(torch.uint8) if self._a_dtype == "fp4" else v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
 
         self._s1_out, self._s1_osd = stage1_output_buffers(
@@ -3414,10 +3451,11 @@ class LargeMRuntime:
         cur_tok = int(x.shape[0])
         if cur_tok > self.mtpr:
             raise ValueError(f"run_tokens={cur_tok} > max_tok_per_rank={self.mtpr}")
-        if x.dtype != torch.float8_e4m3fn or not x.is_contiguous():
-            raise ValueError("x must be contiguous float8_e4m3fn")
-        if tuple(x.shape) != (cur_tok, self.model_dim):
-            raise ValueError(f"x must have shape ({cur_tok}, {self.model_dim})")
+        x_dtypes = (torch.float4_e2m1fn_x2, torch.uint8) if self._a_dtype == "fp4" else (torch.float8_e4m3fn,)
+        if x.dtype not in x_dtypes or not x.is_contiguous():
+            raise ValueError(f"x must be contiguous {' or '.join(str(t) for t in x_dtypes)}")
+        if tuple(x.shape) != (cur_tok, self._a_row_bytes):
+            raise ValueError(f"x must have shape ({cur_tok}, {self._a_row_bytes})")
         if wts.dtype != torch.float32 or not wts.is_contiguous():
             raise ValueError("wts must be contiguous float32")
         if tuple(wts.shape) != (cur_tok, self.topk):
@@ -3479,7 +3517,7 @@ class LargeMRuntime:
             waves_per_eu_hint=s1.waves_per_eu_hint, b_nt=s1.b_nt,
             work_shards=s1.work_shards, payload_chunk_rows=s1.payload_chunk_rows,
             payload_min_blocks=config.fused_stage1.payload_min_blocks,
-            swiglu_limit=self.swiglu_limit, preload=preload, **fused_kw)
+            swiglu_limit=self.swiglu_limit, a_dtype=self._a_dtype, preload=preload, **fused_kw)
         # fmt: on
         self._s1_active_tile_m = s1.sort_block_m
 
@@ -3500,7 +3538,7 @@ class LargeMRuntime:
             waves_per_eu_hint=s1.waves_per_eu_hint, b_nt=s1.b_nt,
             work_shards=s1.work_shards, payload_chunk_rows=s1.payload_chunk_rows,
             payload_min_blocks=config.fused_stage1.payload_min_blocks,
-            swiglu_limit=self.swiglu_limit, **fused_kw)
+            swiglu_limit=self.swiglu_limit, a_dtype=self._a_dtype, **fused_kw)
         # fmt: on
         op = self._s1_op
         head = (
@@ -3516,10 +3554,10 @@ class LargeMRuntime:
             # A zero-token rank still joins the persistent protocol, but HIP
             # rejects a zero-grid quant kernel launch.
             return (
-                torch.empty((0, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev),
+                torch.empty((0, self._a_row_bytes), dtype=_dispatch_dtype(self._a_dtype), device=self.dev),
                 torch.empty((0, self._s1_scale_dim), dtype=torch.uint8, device=self.dev),
             )
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+        return per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype)
 
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         if not 0 <= run_tokens <= self.mtpr:
@@ -3622,11 +3660,11 @@ class LargeMRuntime:
         # Two rows: a unit dimension would record a stride signature real inputs never match.
         rows = 2
         x_bf16 = torch.empty((rows, self.model_dim), dtype=torch.bfloat16, device=self.dev)
-        x_q = torch.empty((rows, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev)
+        x_q = torch.empty((rows, self._a_row_bytes), dtype=self._quant_dtype, device=self.dev)
         scales = torch.empty((rows, self._s1_scale_dim), dtype=torch.uint8, device=self.dev)
         quant_blocks = (rows * self._s1_scale_dim + 63) // 64
         _preload_compiled(
-            _get_quant_launcher(self.model_dim, "fp8"), x_bf16, x_q, scales, rows, quant_blocks, stream
+            _get_quant_launcher(self.model_dim, self._a_dtype), x_bf16, x_q, scales, rows, quant_blocks, stream
         )
         wts = torch.empty((rows, self.topk), dtype=torch.float32, device=self.dev)
         topk_ids = torch.empty((rows, self.topk), dtype=torch.int32, device=self.dev)
@@ -3644,7 +3682,7 @@ class LargeMRuntime:
         scales = self._quant_scale[:run_tokens]
         if run_tokens:
             with torch.cuda.stream(torch_stream(stream)):
-                per_1x32_mx_quant(x_bf16, quant_mode="fp8", out=(x_q, scales))
+                per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype, out=(x_q, scales))
         return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):

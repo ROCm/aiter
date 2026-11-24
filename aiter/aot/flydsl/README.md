@@ -103,10 +103,10 @@ variant of the profile's bundle plan.
   fused routes (`FUSED_LAYOUTS`: DeepSeek-V4-Pro EP8 and DeepSeek-V4.1-Flash
   EP8 / EP4 / EP2), `preload_aot_bundles()` also loads the small-input kernel
   (a8w4 or a4w4) of every token bucket of each reachable small-input capacity
-  (256 and 512), and, for an a8w4 instance at an MTPR in `large_m_mtprs_for()`
-  of the layout (1024..16384 for V4-Pro EP8 and V4.1-Flash EP8, 8192 and 16384
-  for V4.1-Flash EP4 and EP2), the large-input persistent kernel; the
-  large-input route is a8w4 only. The default build covers the V4.1-Flash EP4,
+  (256 and 512), and, for an instance at an MTPR in `large_m_mtprs_for()` of
+  the layout (1024..16384 for V4-Pro EP8 and V4.1-Flash EP8, 8192 and 16384
+  for V4.1-Flash EP4 and EP2), the large-input persistent kernel (a8w4 or
+  a4w4). The default build covers the V4.1-Flash EP4,
   EP2 and EP8 profiles at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`:
   128, 8192, 16384; the large-input kernel at 8192 and 16384); one MTPR of the
   EP4 profile alone:

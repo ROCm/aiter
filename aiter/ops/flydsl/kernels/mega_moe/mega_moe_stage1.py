@@ -61,6 +61,11 @@ def _validate_fixed_slot_geometry(
         raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
 
 
+def _dispatch_dtype(a_dtype: str) -> torch.dtype:
+    """Payload row dtype of the GEMM1 A dtype (the fused routes' GEMM1 output and GEMM2 stay FP8 for both)."""
+    return torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn
+
+
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
     """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
     out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)

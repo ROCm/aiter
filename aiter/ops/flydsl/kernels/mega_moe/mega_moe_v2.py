@@ -24,7 +24,6 @@ from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
-    LARGE_M_QUANTS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -138,7 +137,6 @@ class MegaMoEV2:
             ),
             large_m=(
                 fused
-                and quant in LARGE_M_QUANTS
                 and large_m_enabled
                 and self.mtpr
                 in large_m_mtprs_for(
@@ -417,8 +415,8 @@ class MegaMoEV2:
         of any route, into its peers. The small-input runtimes also keep their
         own combine input, whose rows their combine leaves poisoned
         (bf16_head_tokens). The GEMM1 output is rank-local, so it stays shared,
-        sized for each route's output dtype (the small-input route writes FP8
-        for A4W4 too).
+        sized for each route's output dtype (the fused routes write FP8 for
+        A4W4 too, the staged route packed FP4).
         """
         self._payload_arena = None
         self._s1_output_arena = None
@@ -456,8 +454,8 @@ class MegaMoEV2:
         if plan.large_m:
             from .mega_moe_large_m import LargeMRuntime
 
-            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
-            route_outputs.append((capacity[0], self._a_dtype))
+            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, a_dtype=self._a_dtype, **fused)
+            route_outputs.append((capacity[0], "fp8"))
             self._large_m_shares_payload = LargeMRuntime.ends_all_ranks(
                 max_tok_per_rank=self.mtpr, **fused
             )

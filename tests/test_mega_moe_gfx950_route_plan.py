@@ -94,7 +94,7 @@ def test_fused_layout_gate():
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "inter_dim": 3072})
     assert not fused_layout_supported(**{**V41_FLASH_EP8, "inter_dim": 3072})
     assert not fused_layout_supported(**{**V41_FLASH_EP8, "model_dim": 7168})
-    # A4W4 takes the small-input kernel on every layout; the large-input kernel stays A8W4.
+    # A4W4 takes both fused kernels (small- and large-input) on every layout, like A8W4.
     for layout in (V4_PRO, V41_FLASH_EP4, V41_FLASH_EP2, V41_FLASH_EP8):
         assert fused_layout_supported(**{**layout, "quant": "a4w4"})
     for field, value in (
@@ -222,8 +222,9 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
 
 
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("layout", ("ep8", "ep4", "ep2", "ep8f"))
-def test_large_m_buffers_fit_32bit_offsets(layout):
+def test_large_m_buffers_fit_32bit_offsets(layout, quant):
     """Every large-input capacity keeps its buffer-resource views inside 32-bit offsets and its encodings in
     their bit fields (the kernel and LargeMRuntime raise past them; this pins the margin).
     """
@@ -238,6 +239,9 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
         "ep2": (2, 192, 5120, 2304),
         "ep8f": (8, 48, 5120, 2304),
     }[layout]
+    a_dtype = "fp4" if quant == "a4w4" else "fp8"
+    # Packed FP4 payload rows hold two values a byte.
+    row_bytes = model_dim // 2 if a_dtype == "fp4" else model_dim
     for mtpr in large_m_mtprs_for(
         world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
     ):
@@ -249,18 +253,22 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
             model_dim=model_dim,
             inter_dim=inter_dim,
         )
-        num_valid_max, payload_rows, _, _ = LargeMRuntime.payload_capacity(
-            world_size=world_size,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=world_size * epr,
-            topk=6,
-            max_tok_per_rank=mtpr,
+        num_valid_max, payload_rows, payload_row_bytes, _ = (
+            LargeMRuntime.payload_capacity(
+                world_size=world_size,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=world_size * epr,
+                topk=6,
+                max_tok_per_rank=mtpr,
+                a_dtype=a_dtype,
+            )
         )
+        assert payload_row_bytes == row_bytes, (layout, mtpr)
         # dedup_rows writes and GEMM1 reads payload rows [0, world_size * mtpr) only: one row a source token.
         if config.fused_stage1.dedup_rows:
             assert payload_rows == world_size * mtpr + 1, (layout, mtpr)
-            assert world_size * mtpr * model_dim < 1 << 31, (layout, mtpr)
+            assert world_size * mtpr * row_bytes < 1 << 31, (layout, mtpr)
         else:
             assert payload_rows == num_valid_max, (layout, mtpr)
         s2_spec, _ = large_m_kernel_specs(
@@ -783,14 +791,14 @@ _ROUTED_LAYOUTS = {
 }
 
 
-@pytest.mark.parametrize("mtpr", (128, 8192))
+@pytest.mark.parametrize("mtpr", (128, 8192, 16384))
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_routed_instance_routes(layout, quant, mtpr):
     """A routed instance (built offline, as the AOT replay does) serves up to 512 rows a rank through the
-    small-input route for both quants; above that A8W4 takes the large-input route and A4W4 the staged one.
-    The A4W4 small-input route sends FP4 payload rows and writes an FP8 GEMM1 output, which the shared GEMM1-output
-    arena must hold."""
+    small-input route and, at a large-input capacity of its layout, the larger calls through the large-input route,
+    for both quants. The A4W4 fused routes send FP4 payload rows and write an FP8 GEMM1 output, which the shared
+    GEMM1-output arena must hold (the staged A4W4 route writes FP4)."""
     import torch
 
     from aiter.aot.flydsl import mega_moe as aot
@@ -826,11 +834,27 @@ def test_routed_instance_routes(layout, quant, mtpr):
     plan = moe._bundle_plan
     small = small_m_mtprs_for(mtpr)
     assert plan.small_m_mtprs == small
-    large = quant == "a8w4" and mtpr in large_m_mtprs_for(
+    large = mtpr in large_m_mtprs_for(
         world_size=world, model_dim=model_dim, inter_dim=inter_dim
     )
     assert plan.large_m == large == (moe._large_m is not None)
+    assert large == (mtpr != 128)
     row_bytes = model_dim // 2 if quant == "a4w4" else model_dim
+    a_dtype = "fp4" if quant == "a4w4" else "fp8"
+    if large:
+        runtime = moe._large_m
+        assert runtime._a_dtype == a_dtype
+        assert runtime._s1_op.row_bytes == row_bytes
+        assert runtime._s1_rx.shape[1] == row_bytes
+        # The large-input route quantizes into the staged route's buffers, as bytes for FP4.
+        assert runtime._quant_x.shape == (mtpr, row_bytes)
+        assert runtime._quant_x.dtype == (
+            torch.uint8 if quant == "a4w4" else torch.float8_e4m3fn
+        )
+        assert (
+            stage1_output_nbytes(runtime._s1_nvm, inter_dim, "fp8")[0]
+            <= moe._s1_output_arena[0].numel()
+        )
     for runtime in moe._small_m_runtimes:
         assert runtime._s1_op.row_bytes == row_bytes
         assert runtime._s1_rx.shape[1] == row_bytes
@@ -861,13 +885,16 @@ def test_routed_instance_routes(layout, quant, mtpr):
         "experts": world * epr,
         "topk": 6,
     }
-    a_dtype = "fp4" if quant == "a4w4" else "fp8"
     shared = [staged] + [
         SmallMRuntime.payload_capacity(max_tok_per_rank=m, a_dtype=a_dtype, **fused)
         for m in moe._small_m_shared
     ]
     if moe._large_m_shares_payload:
-        shared.append(LargeMRuntime.payload_capacity(max_tok_per_rank=mtpr, **fused))
+        shared.append(
+            LargeMRuntime.payload_capacity(
+                max_tok_per_rank=mtpr, a_dtype=a_dtype, **fused
+            )
+        )
     assert moe._payload_arena.rx_bytes == max(rows * rb for _, rows, rb, _ in shared)
     for max_tokens in (0, 1, 128, 129, 256, 257, 512, 513, 4096, mtpr):
         if max_tokens > mtpr:
@@ -880,3 +907,65 @@ def test_routed_instance_routes(layout, quant, mtpr):
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
         else:
             assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
+
+
+@pytest.mark.parametrize("mtpr", (8192, 16384))
+@pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
+def test_large_m_a4w4_runs_the_a8w4_config(layout, mtpr):
+    """The A4W4 large-input kernel runs the A8W4 large-input config (untuned for A4W4; select_fused_config takes no
+    quant): its fused Stage2 spec and the payload geometry other than the row bytes do not depend on the quant.
+    """
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import (
+        LargeMRuntime,
+        large_m_kernel_specs,
+    )
+
+    shape = _ROUTED_LAYOUTS[layout]
+    world, epr = shape["world_size"], shape["experts_per_rank"]
+    model_dim, inter_dim = shape["model_dim"], shape["inter_dim"]
+    assert mtpr in large_m_mtprs_for(
+        world_size=world, model_dim=model_dim, inter_dim=inter_dim
+    )
+    fused = {
+        "world_size": world,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": world * epr,
+        "topk": 6,
+        "max_tok_per_rank": mtpr,
+    }
+    fp8 = LargeMRuntime.payload_capacity(a_dtype="fp8", **fused)
+    fp4 = LargeMRuntime.payload_capacity(a_dtype="fp4", **fused)
+    assert fp8[2] == model_dim and fp4[2] == model_dim // 2
+    assert (fp4[0], fp4[1], fp4[3]) == (fp8[0], fp8[1], fp8[3])
+    config = select_fused_config(mtpr, mtpr, **shape)
+    s2_spec, _ = large_m_kernel_specs(
+        config,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        topk=6,
+        rank=0,
+        npes=world,
+        mtpr=mtpr,
+        experts_per_rank=epr,
+        num_valid_max=fp4[0],
+    )
+    # GEMM2 reads the FP8 GEMM1 output for both quants.
+    assert dict(s2_spec)["a_dtype"] == "fp8"
+    # The dispatch copies a token row in 64-lane column blocks of 1024 values: a dwordx4 a lane for FP8, a dwordx2
+    # for FP4, so the row must tile by 1024 values.
+    assert model_dim % 1024 == 0
+    for unit_i32, row_bytes in ((4, model_dim), (2, model_dim // 2)):
+        assert (model_dim // 1024) * 64 * unit_i32 * 4 == row_bytes
+    # The GEMM1 tiles copy whole 64-chunk waves of 16-byte A chunks (FP4 K-steps are 128 bytes).
+    k1 = config.fused_stage1
+    sbm = config.stage1.sort_block_m
+    rows = [sbm]
+    if k1.short_tail_rows:
+        rows.append(k1.short_tail_rows)
+    if k1.mid_tail_rows:
+        rows.append(k1.mid_tail_rows)
+    if k1.fold_tail:
+        rows.append(sbm + k1.short_tail_rows)
+    for tile_rows in rows:
+        assert tile_rows * (128 // 16) % 64 == 0, tile_rows

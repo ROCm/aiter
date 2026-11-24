@@ -57,7 +57,11 @@ from .mega_moe_config import (
     small_m_cu_supported,
 )
 from .mega_moe_fused_gemm import AddrBuffer, load_at, store_at
-from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
+from .mega_moe_stage1 import (
+    _dispatch_dtype,
+    _validate_dispatch_capacity,
+    stage1_output_buffers,
+)
 from .mega_moe_stage2 import (
     _SC0_SC1_CACHE,
     Stage2Meta,
@@ -1848,11 +1852,6 @@ _PLAN_FP8_ROWS_BIT = 30
 _ROW_POISON = -1
 # dedup_rows: byte offset (from the payload / scale buffer base) that the token-row regions end below.
 _TOKEN_REGION_END = (1 << 31) - (1 << 16)
-
-
-def _dispatch_dtype(a_dtype: str) -> torch.dtype:
-    """Payload row dtype of the GEMM1 A dtype (the GEMM1 output and GEMM2 stay FP8 for both)."""
-    return torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn
 
 
 def _kernel_knobs(config: MegaMoEConfig) -> dict:

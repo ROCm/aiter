@@ -72,9 +72,9 @@ FUSED_LAYOUTS = frozenset(
         ),
     }
 )
-# Quant modes of the fused routes: the small-input kernel takes both, the large-input kernel A8W4 only.
+# Quant modes of the fused routes (small- and large-input kernels alike). Both run the A8W4 tunes: the A4W4
+# kernels are not tuned of their own.
 FUSED_QUANTS = ("a8w4", "a4w4")
-LARGE_M_QUANTS = ("a8w4",)
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -481,7 +481,7 @@ def fused_layout_supported(
     """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a FUSED_QUANTS quant on gfx950.
 
     The small-input kernel serves every such layout; the large-input kernel the
-    LARGE_M_QUANTS layouts at the capacities large_m_mtprs_for() gives it.
+    capacities large_m_mtprs_for() gives it.
     """
     return (
         arch.split(":", 1)[0] == "gfx950"
@@ -1768,7 +1768,8 @@ def select_fused_config(
 ) -> MegaMoEConfig:
     """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
     config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) for
-    ``tokens`` rows on a rank; an idle rank takes the 1-token config."""
+    ``tokens`` rows on a rank; an idle rank takes the 1-token config. A4W4 takes
+    the A8W4 config (untuned for A4W4)."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     large_mtprs = large_m_mtprs_for(
