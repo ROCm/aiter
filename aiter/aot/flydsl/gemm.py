@@ -158,12 +158,15 @@ def _a8w8_blockscale_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
+    dtype = _dtype(job["outdtype"])
+    # Passing out= skips the routed op, whose fake would run under the dry run.
     gemm_a8w8_blockscale_bpreshuffle(
         _empty(m, k, dtype=dtypes.fp8),
         _empty(n, k, dtype=dtypes.fp8),
         _empty(m, k // 128, dtype=dtypes.fp32),
         _empty(-(-n // 128), k // 128, dtype=dtypes.fp32),
-        dtype=_dtype(job["outdtype"]),
+        dtype=dtype,
+        out=_empty(m, n, dtype=dtype),
     )
 
 
@@ -214,6 +217,7 @@ def _a8w8_blockscale_mxscale_bpreshuffle(job: dict) -> None:
         _empty(m, k // x_block, dtype=dtypes.fp8_e8m0),
         _empty(-(-n // rows), k // cols, dtype=dtypes.fp8_e8m0),
         dtype=dtypes.bf16,
+        out=_empty(m, n, dtype=dtypes.bf16),  # skips the routed op, as above
     )
 
 

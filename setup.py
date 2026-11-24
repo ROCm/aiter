@@ -24,7 +24,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.5.2"
+FLYDSL_VERSION = "flydsl==0.5.3"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -133,6 +133,11 @@ if _torch_version_below("2.9.1"):
     )
     print(
         "[aiter] To use aiter-compatible triton, please upgrade torch to 2.9.1 or later."
+    )
+elif sys.version_info < (3, 11):
+    print(
+        "[aiter] aiter's triton (3.9) needs Python 3.11 or newer; skipping the triton install"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
     )
 elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
