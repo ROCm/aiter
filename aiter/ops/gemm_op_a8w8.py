@@ -2474,16 +2474,14 @@ def _reduce_mxfp8_partials(partials: Tensor, out: Tensor | None = None) -> Tenso
     """
     import flydsl.expr as fx
 
-    from .flydsl.kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
-        compile_gemm_a8w8_splitk_reduce,
-    )
     from .flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import splitk_reduce_launcher
 
     splitk, M, N = partials.shape
     if out is None:
         out = torch.empty((M, N), dtype=partials.dtype, device=partials.device)
     _run_compiled(
-        compile_gemm_a8w8_splitk_reduce(split_k=splitk, out_dtype_str="bf16"),
+        splitk_reduce_launcher.lazy(splitk, "bf16", "bf16"),
         ptr_arg(partials),
         ptr_arg(out),
         M * N,

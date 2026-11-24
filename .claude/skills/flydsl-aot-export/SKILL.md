@@ -24,10 +24,10 @@ Converted wrappers to copy from:
 
 | Shape of the launcher | Example |
 |---|---|
-| Factory takes the constexprs, launcher takes runtime arguments only | `gemm_kernels.py` (`_preshuffle_launcher`), `gemm_a8w8_blockscale.py` (`_compile_gemm`) |
-| Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`) |
+| Factory takes the constexprs, launcher takes runtime arguments only | `gemm_kernels.py` (`_preshuffle_launcher`), `gemm_a8w8_blockscale.py` (`_compile_gemm`), `kernels/fmha_gfx1250/fmha_fwd_prefill_a16w16_m32x8.py` |
+| Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`); `mxfp8_bpreshuffle_gemm_gfx1250.py`, `mla_kernels.py`, `gather_kv_b_proj_gfx1250.py` (a factory with no argument, the constexprs in `specialization_key`) |
 | Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
-| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`) |
+| Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py`, `kernels/pa_decode_kernel.py` (`bind_aot` with `make_exe`) |
 
 ## The one rule
 
@@ -97,12 +97,14 @@ So, for each launch, list what the trace depends on and tick each item off:
    wrapper's `_lazy_import`, or the hit still pays the `@flyc.kernel`
    definitions (a few hundred ms per module in a fresh process).
 4. **One launcher, one cache.** When several wrappers launch the same
-   launcher, define its factory once and import it. Two factories
+   launcher, define its factory once and import it (as
+   `mxfp8_bpreshuffle_gemm_gfx1250.gemm_a8w8_launcher` is). Two factories
    returning one launcher object bind it to two keys, and it falls back to
    the JIT path.
 5. **Update what else compiles the kernel.** A preload or warm-up helper must
    go through the same launch path under compile-only
-   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set),
+   (`tensor_shim._compile_only()` around `_run_compiled(factory.lazy(), ...)`,
+   as `preload_a4w4_kernel` does),
    or it warms FlyDSL's cache and not the entry the launch loads. An AOT replay
    under `aiter/aot/flydsl/` needs no change if it enters at the public op.
 6. **Document it.** Add the cache name, wrapper and key to
@@ -223,8 +225,8 @@ or `tensor_shim.py`, and after a FlyDSL pin bump.
   the kernel definition still runs once per process.
 - `factory.lazy()` handles and loaded entries are not evicted, whatever
   `maxsize` the factory's `lru_cache` has.
-- `COMPILE_ONLY` is read for the whole process, so a launch on another thread
-  during a preload compiles and does not run. Preload in tuner and prebuild
-  workers, not beside inference.
+- `COMPILE_ONLY` is read for the whole process, and `tensor_shim._compile_only()`
+  sets it, so a launch on another thread during a preload compiles and does
+  not run. Preload in tuner and prebuild workers, not beside inference.
 - Entries are built at the first call on a machine unless a replay under
   `aiter/aot/flydsl/` prebuilds them.

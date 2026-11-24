@@ -8,23 +8,34 @@ import functools
 import torch
 from torch import Tensor
 
+from .aot_launch import aot_factory
+
 _KV_C = 512
 _KV_PE = 64
 _NOPE = 128
 _V_DIM = 128
 
 
-@functools.lru_cache(maxsize=1)
-def _projection_runtime():
-    """Import the gfx1250 compiler path only when this specialization runs."""
-    import flydsl.expr as fx
-
+@aot_factory("gather_kv_b_proj_8wave_gfx1250")
+@functools.cache
+def _projection_launcher():
+    """The kernel launcher. Its Constexprs are launch arguments, passed in
+    specialization_key; a launch the AOT cache serves does not import it."""
     from .kernels.gather_kv_b_proj_gfx1250 import (
         launch_gather_kv_b_proj_8wave_gfx1250,
     )
+
+    return launch_gather_kv_b_proj_8wave_gfx1250
+
+
+@functools.lru_cache(maxsize=1)
+def _projection_runtime():
+    """Import the FlyDSL launch helpers only when this specialization runs."""
+    import flydsl.expr as fx
+
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
-    return launch_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx, _run_compiled
+    return ptr_arg, fx, _run_compiled
 
 
 def _cluster_n(m: int, n_heads: int) -> int:
@@ -47,7 +58,7 @@ def _run_projection(
     v_out_scale: Tensor | None = None,
 ) -> None:
     """Launch the fixed-width indexed MLA WMMA kernel."""
-    launch_projection, ptr_arg, fx, run_compiled = _projection_runtime()
+    ptr_arg, fx, run_compiled = _projection_runtime()
 
     scale_is_ptr = activation_scale.device.type != "cpu"
     scale_ptr = activation_scale if scale_is_ptr else cache
@@ -70,7 +81,7 @@ def _run_projection(
     )
     projection_spec = (n_heads, int(scale_is_ptr), cluster_n, int(output_fp8))
     run_compiled(
-        launch_projection,
+        _projection_launcher.lazy(),
         *args,
         *projection_spec,
         specialization_key=projection_spec,

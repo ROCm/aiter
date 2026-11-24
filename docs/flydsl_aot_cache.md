@@ -547,8 +547,7 @@ aiter.aot.flydsl.gemm` on two tuned CSVs: 20 a8w8 mxfp8 rows (bmm split-K
   per-name ISA dumps, which keep only the last of several compiles), identical
   to the earlier FlyDSL as well.
 
-Runtime on gfx950 hardware is still to be checked. gfx1250 mxfp8 kernels are
-not converted.
+Runtime on gfx950 hardware is still to be checked.
 
 ### 5.4 gfx942 / gfx950: every GEMM and 2-stage MoE launcher of the AOT replays
 
@@ -602,6 +601,59 @@ built on every call:
 
 The HGEMM row is a launcher of the HGEMM's argument shape run on gfx942; it
 gives the same results on both paths for row- and column-major tensors.
+
+### 5.5 gfx1250: GEMMs and attention
+
+| Cache | Wrapper | Key |
+|---|---|---|
+| `gemm_a8w8_gfx1250`, `gemm_a8w8_256x256_gfx1250` | `mxfp8_bpreshuffle_gemm_gfx1250`, `bpreshuffle_gemm_gfx1250`, `batched_gemm_a8w8_gfx1250` | `specialization_key`: the launcher's constexprs |
+| `gemm_a8w8_splitk_reduce_gfx1250` | the two GEMM wrappers above, `gemm_op_a8w8._reduce_mxfp8_partials` | `(split_k, out_dtype, partial_dtype)` |
+| `gemm_a4w4_gfx1250`, `gemm_a4w4_256x256_gfx1250` | `a4w4_mxscale_bpreshuffle_gemm_gfx1250` | `specialization_key`: the launcher's constexprs |
+| `gemm_a16w16_gfx1250` | `gemm_a16w16_gfx1250.gemm_a16w16` | the compile config (`N`, `K`, tiles, dtypes, ...) |
+| `gemm_a16w16_tdm_gfx1250` | `gemm_a16w16_tdm` | `build_gemm_gfx1250`'s arguments; the device keys the launcher in memory only, one entry on disk serves every device |
+| `gather_kv_b_proj_8wave_gfx1250` | `gather_kv_b_proj_gfx1250` | `specialization_key`: the launcher's constexprs |
+| `fmha_fwd_prefill_{a16w16,a8w8}_m32x8_{thd,paged,bshd}` | `kernels/fmha_gfx1250` | the launcher factory's arguments |
+| `mla_pagesize1_fp8_fp8`, `mla_pagesize1_bf16_bf16`, `mla_pagesize64_fp8_fp8` | `mla_kernels` | `specialization_key`: the launcher's constexprs |
+| `mla_decode_reduce` | `mla_kernels.flydsl_mla_decode_reduce` | `(H, Dv, out_dtype)` |
+| `pa_decode_tile_gfx1250` | `kernels/pa_decode_kernel.compile_gfx1250_pa_decode` | the fields of `Gfx1250Traits` |
+| `pa_decode_ps_reduce_gfx1250` | `pa_decode.launch_pa_decode_ps_reduce` | `compile_pa_decode_ps_reduce`'s arguments |
+
+Most gfx1250 kernel launchers are module-level `@flyc.jit` functions that take
+their constexprs as launch arguments. Their factory takes no argument and only
+imports the kernel module; the launch passes the constexprs in
+`specialization_key`, as it did on the JIT path, and each entry records them
+under `baked` (§6). One launcher has one cache, also when several wrappers
+launch it: `launch_gemm_a8w8` serves the mxfp8, the plain bpreshuffle and the
+batched GEMM through `gemm_a8w8_launcher`. The wrappers no longer import the
+kernel modules themselves, so a hit skips their `@flyc.kernel` definitions.
+
+The PA tile launcher is bound where it is built (`bind_aot`), because
+`compile_pa_decode_tile` returns a dict and several argument sets select one
+launcher. Its `make_exe` builds the launcher again, so that the files the
+kernel definition runs (`pa_decode/traits.py`, ...) are recorded with the
+entry. A hit therefore skips the trace but still runs the kernel definition
+once per traits and process. The reducer is shared with gfx942/gfx950, which keep the JIT path; only
+its gfx1250 launches go through the cache. The gfx942/gfx950 tile kernels and
+the MXFP4 path are not converted.
+
+Validated compile-only on gfx942 (FlyDSL 0.5.3), without gfx1250 hardware:
+
+- `GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.gemm` on 29 tuned rows (plain
+  bpreshuffle, mxfp8_32 general and compute-bound, a4w4 general and
+  compute-bound, bmm mxfp8_128): 64 `.o`, none through the JIT fallback. A
+  second run on the same directory builds nothing, and a run under `verify`
+  re-exports every entry it loads to the same bytes.
+- The launches without a tuned-CSV replay (the six fmha launchers with bf16
+  and fp8 inputs, the three MLA kernels and the decode reduce, the PA tile and
+  reducer, `gemm_a16w16`, `gemm_a16w16_tdm`, `gather_kv_b_proj`), called
+  under `dry_run("gfx1250", 256)`: one `.o` each (two for pagesize64, with and
+  without splits). A second run builds nothing and `verify` passes.
+- `op_tests/test_flydsl_pa_decode.py` on gfx942, whose kernels share the
+  edited files: 414 passed, 128 skipped.
+
+Runtime on gfx1250 hardware is still to be checked: a bitwise comparison of
+each op against `AITER_FLYDSL_AOT_CACHE=0`, and its op test run twice on one
+cache directory.
 
 ## 6. Adopting it for another op
 
@@ -708,11 +760,15 @@ path's). Issue 4 is in the JIT path and remains.
   as a batched mxfp8 GEMM that falls back to its heuristic config, is built
   at its first call; tuning the shape adds it to the prebuild.
 - Only the launchers in §5 are converted: the GEMMs and the 2-stage MoE of
-  gfx942 and gfx950. Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
-  the attention kernels, MegaMoE and the a8w4 `comm_fused_moe`, still trace
-  and compile on their first call in each process. (`moe_reduction` is not
+  gfx942 and gfx950, and the GEMMs and attention kernels of gfx1250. Other
+  FlyDSL kernels, e.g. the gfx1250 grouped MoE and conv3d, the gfx942/gfx950
+  PA decode tiles, MegaMoE and the a8w4 `comm_fused_moe`, still trace and
+  compile on their first call in each process. (`moe_reduction` is not
   specific to an arch, so a gfx1250 MoE that calls it launches it through the
   cache; that is not validated.)
+- The gfx1250 GEMM replay (`aiter.aot.flydsl.gemm`) prebuilds the tuned GEMM
+  rows. The gfx1250 attention kernels have no replay module yet, so their
+  entries are built at the first call on a machine.
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
   24136 rows) writes about 5240 entries, 180 MB, in 15 to 20 minutes. Rows
   tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to

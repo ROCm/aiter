@@ -46,6 +46,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E
@@ -57,7 +58,7 @@ from ..tensor_shim import _run_compiled
 #
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in fmha_buffer_managers. Under mode 2 the LLVM setreg (via the
-# amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
+# amdgpu-expert-scheduling-mode hint, set in the _*_launcher factories) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
 from .fmha_buffer_managers import (
     ENABLE_SCHED_MODE2,
@@ -3003,18 +3004,15 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
 # Launch wrappers + host entries
 # ============================================================================
 
-_launch_fns = (
-    {}
-)  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
-
-
 def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     """True when the launch bounds every WG to a single KV tile."""
     n_block = pick_n_block(qk_hdim, v_hdim, DTYPE_MAP[kv_dtype_str])
     return int(max_seqlen_k) <= n_block
 
 
-def _ensure_thd_kernel(
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_thd")
+@functools.cache
+def _thd_launcher(
     mask_left: bool,
     mask_right: bool,
     one_kv_tile: bool,
@@ -3028,23 +3026,6 @@ def _ensure_thd_kernel(
     kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
-    key = (
-        "thd",
-        bool(mask_left),
-        bool(mask_right),
-        bool(return_lse),
-        bool(has_sink),
-        bool(has_descale),
-        int(gqa_ratio),
-        int(qk_hdim),
-        int(v_hdim),
-        str(q_dtype_str),
-        str(kv_dtype_str),
-        int(num_q_tiles_per_wave),
-        bool(one_kv_tile),
-    )
-    if key in _launch_fns:
-        return
     kernel = build_fmha_fwd_prefill_a8w8_m32x8(
         layout="thd",
         qk_hdim=qk_hdim,
@@ -3141,10 +3122,12 @@ def _ensure_thd_kernel(
         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
     }
     _launch.compile_hints["waves_per_eu"] = 2
-    _launch_fns[key] = _launch
+    return _launch
 
 
-def _ensure_paged_kernel(
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_paged")
+@functools.cache
+def _paged_launcher(
     mask_left: bool,
     mask_right: bool,
     return_lse: bool,
@@ -3158,23 +3141,6 @@ def _ensure_paged_kernel(
     kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
-    key = (
-        "paged",
-        bool(mask_left),
-        bool(mask_right),
-        bool(return_lse),
-        bool(has_sink),
-        bool(has_descale),
-        int(gqa_ratio),
-        int(qk_hdim),
-        int(v_hdim),
-        str(q_dtype_str),
-        str(kv_dtype_str),
-        int(num_q_tiles_per_wave),
-        int(page_size),
-    )
-    if key in _launch_fns:
-        return
     kernel = build_fmha_fwd_prefill_a8w8_m32x8(
         layout="paged",
         page_size=page_size,
@@ -3278,10 +3244,12 @@ def _ensure_paged_kernel(
         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
     }
     _launch.compile_hints["waves_per_eu"] = 2
-    _launch_fns[key] = _launch
+    return _launch
 
 
-def _ensure_bshd_kernel(
+@aot_factory("fmha_fwd_prefill_a8w8_m32x8_bshd")
+@functools.cache
+def _bshd_launcher(
     mask_left: bool,
     mask_right: bool,
     one_kv_tile: bool,
@@ -3295,23 +3263,6 @@ def _ensure_bshd_kernel(
     kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
-    key = (
-        "bshd",
-        bool(mask_left),
-        bool(mask_right),
-        bool(return_lse),
-        bool(has_sink),
-        bool(has_descale),
-        int(gqa_ratio),
-        int(qk_hdim),
-        int(v_hdim),
-        str(q_dtype_str),
-        str(kv_dtype_str),
-        int(num_q_tiles_per_wave),
-        bool(one_kv_tile),
-    )
-    if key in _launch_fns:
-        return
     kernel = build_fmha_fwd_prefill_a8w8_m32x8(
         layout="bshd",
         qk_hdim=qk_hdim,
@@ -3406,7 +3357,7 @@ def _ensure_bshd_kernel(
         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
     }
     _launch.compile_hints["waves_per_eu"] = 2
-    _launch_fns[key] = _launch
+    return _launch
 
 
 def flash_attn_a8w8_m32x8_supported(
@@ -3599,39 +3550,21 @@ def flash_attn_varlen_a8w8_m32x8(
 
     one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str)
 
-    _ensure_thd_kernel(
-        mask_left,
-        mask_right,
-        one_kv_tile,
-        bool(return_lse),
-        has_sink,
-        has_descale,
-        gqa,
-        qk_hdim=qk_hdim,
-        v_hdim=v_hdim,
-        q_dtype_str=q_dtype_str,
-        kv_dtype_str=kv_dtype_str,
-        num_q_tiles_per_wave=num_q_tiles_per_wave,
-    )
-
     _run_compiled(
-        _launch_fns[
-            (
-                "thd",
-                mask_left,
-                mask_right,
-                bool(return_lse),
-                has_sink,
-                has_descale,
-                gqa,
-                qk_hdim,
-                v_hdim,
-                q_dtype_str,
-                kv_dtype_str,
-                num_q_tiles_per_wave,
-                one_kv_tile,
-            )
-        ],
+        _thd_launcher.lazy(
+            mask_left,
+            mask_right,
+            one_kv_tile,
+            bool(return_lse),
+            has_sink,
+            has_descale,
+            gqa,
+            qk_hdim=qk_hdim,
+            v_hdim=v_hdim,
+            q_dtype_str=q_dtype_str,
+            kv_dtype_str=kv_dtype_str,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+        ),
         out,
         q,
         k,
@@ -3829,39 +3762,21 @@ def flash_attn_paged_a8w8_m32x8(
         )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
-    _ensure_paged_kernel(
-        mask_left,
-        mask_right,
-        bool(return_lse),
-        has_sink,
-        has_descale,
-        gqa,
-        page_size,
-        qk_hdim=qk_hdim,
-        v_hdim=v_hdim,
-        q_dtype_str=q_dtype_str,
-        kv_dtype_str=kv_dtype_str,
-        num_q_tiles_per_wave=num_q_tiles_per_wave,
-    )
-
     _run_compiled(
-        _launch_fns[
-            (
-                "paged",
-                mask_left,
-                mask_right,
-                bool(return_lse),
-                has_sink,
-                has_descale,
-                gqa,
-                qk_hdim,
-                v_hdim,
-                q_dtype_str,
-                kv_dtype_str,
-                num_q_tiles_per_wave,
-                page_size,
-            )
-        ],
+        _paged_launcher.lazy(
+            mask_left,
+            mask_right,
+            bool(return_lse),
+            has_sink,
+            has_descale,
+            gqa,
+            page_size,
+            qk_hdim=qk_hdim,
+            v_hdim=v_hdim,
+            q_dtype_str=q_dtype_str,
+            kv_dtype_str=kv_dtype_str,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+        ),
         out,
         q,
         k,
@@ -4044,39 +3959,21 @@ def flash_attn_batch_a8w8_m32x8(
 
     one_kv_tile = _pick_one_kv_tile(seq_len_k, qk_hdim, v_hdim, kv_dtype_str)
 
-    _ensure_bshd_kernel(
-        mask_left,
-        mask_right,
-        one_kv_tile,
-        bool(return_lse),
-        has_sink,
-        has_descale,
-        gqa,
-        qk_hdim=qk_hdim,
-        v_hdim=v_hdim,
-        q_dtype_str=q_dtype_str,
-        kv_dtype_str=kv_dtype_str,
-        num_q_tiles_per_wave=num_q_tiles_per_wave,
-    )
-
     _run_compiled(
-        _launch_fns[
-            (
-                "bshd",
-                mask_left,
-                mask_right,
-                bool(return_lse),
-                has_sink,
-                has_descale,
-                gqa,
-                qk_hdim,
-                v_hdim,
-                q_dtype_str,
-                kv_dtype_str,
-                num_q_tiles_per_wave,
-                one_kv_tile,
-            )
-        ],
+        _bshd_launcher.lazy(
+            mask_left,
+            mask_right,
+            one_kv_tile,
+            bool(return_lse),
+            has_sink,
+            has_descale,
+            gqa,
+            qk_hdim=qk_hdim,
+            v_hdim=v_hdim,
+            q_dtype_str=q_dtype_str,
+            kv_dtype_str=kv_dtype_str,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+        ),
         out,
         q,
         k,

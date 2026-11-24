@@ -40,6 +40,7 @@ from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
     MX32_COMPUTE_WMMA_NAME_PREFIX,
     compute_kernel_k_pair,
+    gemm_a8w8_launcher,
     is_compute_wmma_kernel_name,
     parse_mxfp8_32_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
@@ -65,7 +66,6 @@ _BMM_MX32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}$"
 )
 
-_launch_gemm_a8w8 = None
 _run_compiled = None
 _ptr_arg = None
 _check_e8m0 = None
@@ -73,16 +73,14 @@ _fx = None
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8, _run_compiled, _ptr_arg, _check_e8m0, _fx
-    if _launch_gemm_a8w8 is not None:
+    global _run_compiled, _ptr_arg, _check_e8m0, _fx
+    if _run_compiled is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
     from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import check_e8m0, ptr_arg
 
-    _launch_gemm_a8w8 = launch_gemm_a8w8
     _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _check_e8m0 = check_e8m0
@@ -603,7 +601,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
-        _launch_gemm_a8w8,
+        gemm_a8w8_launcher.lazy(),
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -711,7 +709,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
-        _launch_gemm_a8w8,
+        gemm_a8w8_launcher.lazy(),
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),

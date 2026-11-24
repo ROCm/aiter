@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import os
 import threading
 from abc import ABC, abstractmethod
@@ -368,6 +369,23 @@ def _run_compiled(exe, *args, specialization_key=None):
         exe._cf_by_specialization[specialization_key] = cf
 
 
+@contextlib.contextmanager
+def _compile_only():
+    """FlyDSL's ``COMPILE_ONLY`` mode for the block: ``_run_compiled`` and
+    ``flyc.compile`` compile without launching. A launcher bound to the AOT
+    cache builds its entry."""
+    with _PRELOAD_COMPILE_LOCK:
+        old_compile_only = os.environ.get("COMPILE_ONLY")
+        os.environ["COMPILE_ONLY"] = "1"
+        try:
+            yield
+        finally:
+            if old_compile_only is None:
+                os.environ.pop("COMPILE_ONLY", None)
+            else:
+                os.environ["COMPILE_ONLY"] = old_compile_only
+
+
 def _preload_compiled(exe, *args):
     """Materialize a JIT artifact without dispatching its GPU kernels.
 
@@ -381,16 +399,8 @@ def _preload_compiled(exe, *args):
     if callable(preload):
         return preload(*args)
 
-    with _PRELOAD_COMPILE_LOCK:
-        old_compile_only = os.environ.get("COMPILE_ONLY")
-        os.environ["COMPILE_ONLY"] = "1"
-        try:
-            return flyc.compile(exe, *args)
-        finally:
-            if old_compile_only is None:
-                os.environ.pop("COMPILE_ONLY", None)
-            else:
-                os.environ["COMPILE_ONLY"] = old_compile_only
+    with _compile_only():
+        return flyc.compile(exe, *args)
 
 
 def _to_raw(v):
