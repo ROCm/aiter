@@ -25,6 +25,9 @@ Environment knobs:
   from the runner environment, then `claude-glm`.
 - `AITER_TEST_FAILURE_AGENT_TIMEOUT`: agent timeout in seconds; default `1800`.
 - `AITER_TEST_FAILURE_SKIP_DOWNLOADS=1`: skip log/artifact downloads for dry runs.
+- `AITER_BOT_TOKEN`: optional token used only by the post-analysis auto-revert
+  script to push a revert branch and create a PR. The analysis agent is run with
+  GitHub tokens removed from its environment.
 - `GITHUB_STEP_SUMMARY`: summary output file; GitHub Actions provides this.
 - `GH_TOKEN` or `GITHUB_TOKEN`: token with `actions:read` and `contents:read`.
 
@@ -39,8 +42,12 @@ Environment knobs:
 4. Extracts likely failure snippets from `latest_test.log` and job logs.
 5. Finds the latest successful Aiter Test run before the failed run and ranks commits in
    that range by path and keyword overlap with the failure surface.
-6. Gives the evidence to the configured headless agent for a concise report. If the agent
+6. Writes `evidence.json` and `culprit.json` for downstream automation.
+7. Gives the evidence to the configured headless agent for a concise report. If the agent
    is unavailable, it writes the deterministic fallback report instead.
+8. In the GitHub Actions workflow, a separate `box308-pr-revert` job may create
+   a revert PR only when `culprit.json` has `auto_revert_ready: true` and
+   `confidence: high`.
 
 ## Reporting Rules
 

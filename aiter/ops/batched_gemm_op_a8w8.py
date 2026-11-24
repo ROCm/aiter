@@ -456,9 +456,17 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     standalone ``quantize_fp8`` of the bf16 output is removed.
 
     Returns ``(y_fp8 [M, G, N] e4m3, y_scale [M, (G*N)//32] e8m0)``, bit-identical
-    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 only;
-    raises ``NotImplementedError`` otherwise so a caller can fall back to the
-    bf16 GEMM + ``quantize_fp8``.
+    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 and
+    gfx950 flydsl bmm (row-major x_scale); raises ``NotImplementedError``
+    otherwise so a caller can fall back to the bf16 GEMM + ``quantize_fp8``.
+    On gfx950 the shape's flydsl tuned row, the one the bf16 entry runs,
+    picks the tile; an opus row or none leaves the choice to the runner, as
+    does every other arch. A gfx950 row the fused epilogue would run slower
+    (``_fused_quant_falls_back``) runs as bf16 plus the same quant instead.
+    The quant is exact for the bf16 output of the kernel the fused call runs.
+    Where that kernel or its K split differs from the bf16 entry's (an opus
+    row, a split-K row run unsplit, the runner's own tile), the GEMM may
+    differ from the bf16 entry's by an fp32 rounding, on gfx1250 as well.
     """
     from .flydsl.batched_gemm_a8w8 import (
         bmm_a8w8_mxfp8_fused_quant_supported,
@@ -473,19 +481,70 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
             f"fused output quant unsupported for a {w_scale_block} w_scale on "
             f"{get_gfx()}; use batched_gemm_a8w8_mxscale_bpreshuffle + quantize_fp8"
         )
+    from .opus._arch import _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(x.device)
+    kernel_name = _fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num)
+    if kernel_name is not None and gfx == "gfx950":
+        from .flydsl.batched_gemm_a8w8_gfx950 import _fused_quant_falls_back
+
+        if _fused_quant_falls_back(kernel_name):
+            # The row's split-K bf16 kernel, then the group-32 quant the
+            # epilogue applies (byte-identical), returned without a copy.
+            from .quant import per_1x32_mx_quant_hip
+
+            y = torch.empty((m, g, n), dtype=dtypes.bf16, device=x.device)
+            run_bmm_a8w8_mxfp8(x, wo_a, x_scale, w_scale, y, kernel_name=kernel_name)
+            q, s = per_1x32_mx_quant_hip(
+                y.view(m, g * n), quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+            return q.view(m, g, n), s
     y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
     y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
     run_bmm_a8w8_mxfp8(
-        x, wo_a, x_scale, w_scale, y8, y_scale_out=y_scale.view(torch.uint8)
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        y8,
+        kernel_name=kernel_name,
+        y_scale_out=y_scale.view(torch.uint8),
     )
     return y8, y_scale
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_quant_tuned_kernel(
+    g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
+) -> str | None:
+    """The kernelName of the preshuffle table's flydsl row for this shape, the
+    row the bf16 entry runs, so both entries share the tuned tile, on gfx950.
+    None (the runner's own choice) when there is no row or the row is not a
+    flydsl one, and on every other arch: a gfx1250 32x32 table row may name a
+    compute kernel, which has no fused epilogue, so that runner keeps its own
+    pick there."""
+    if gfx != "gfx950":
+        return None
+    cfg = lookup_mxscale_bmm_config(
+        g,
+        m,
+        n,
+        k,
+        w_scale_block=w_scale_block,
+        bpreshuffle=True,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if cfg is None or cfg["libtype"] != "flydsl":
+        return None
+    return cfg["kernelName"]
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
     w_scale: tuple[int, ...], n: int, k: int
 ) -> bool:
     """Whether :func:`batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant` can run
-    this shape (gfx1250 flydsl mxfp8_32). Lets a caller choose the fused path
+    this shape (gfx1250 flydsl mxfp8_32, gfx950 flydsl bmm). Lets a caller choose the fused path
     once instead of catching ``NotImplementedError`` per call."""
     from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_fused_quant_supported
 
