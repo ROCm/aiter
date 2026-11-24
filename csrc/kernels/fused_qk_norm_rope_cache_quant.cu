@@ -300,7 +300,12 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
             // Before data exchange within warp, we need to sync.
             __syncwarp();
+            // The partner of a rotary lane is laneId +/- partner_lane_delta. An XOR mask finds
+            // it only when the delta is a power of two (e.g. not for rotary_dim 96 of head 128).
             int const partner_lane_delta = embed_dim / numElemsPerThread;
+            int const partner_lane       = laneId < partner_lane_delta
+                                               ? laneId + partner_lane_delta
+                                               : laneId - partner_lane_delta;
             // Get the data from the other half of the warp. Use pre-computed cos/sin values.
 #pragma unroll
             for(int i = 0; i < numElemsPerThread; i++)
@@ -309,7 +314,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
                 if(dim_idx < rotary_dim)
                 {
                     elements2[i] = static_cast<scalar_t>(
-                        __shfl_xor(float(elements[i]), partner_lane_delta, 32));
+                        __shfl(float(elements[i]), partner_lane, 32));
                     if(dim_idx < embed_dim)
                     {
                         elements2[i] = -elements2[i];
@@ -2732,7 +2737,12 @@ minimax_apply_neox_rope_pack(vec_t<scalar_t, PackSize> x,
     scalar_t const* sin_ptr   = cache_ptr + embed_dim;
     int const cos_base =
         access_id_in_head < embed_dim ? access_id_in_head : access_id_in_head - embed_dim;
+    // The partner pack is one partner_delta lanes away; an XOR mask finds it only when
+    // partner_delta is a power of two.
     int const partner_delta = embed_dim / PackSize;
+    int const lane          = threadIdx.x % WARP_SIZE;
+    int const partner_lane  = access_id_in_head < embed_dim ? lane + partner_delta
+                                                            : lane - partner_delta;
 
     vec_t<scalar_t, PackSize> y;
 #pragma unroll
@@ -2742,7 +2752,7 @@ minimax_apply_neox_rope_pack(vec_t<scalar_t, PackSize> x,
         if(dim < rotary_dim)
         {
             float const self = static_cast<float>(x[i]);
-            float const peer = __shfl_xor(self, partner_delta, WARP_SIZE);
+            float const peer = __shfl(self, partner_lane, WARP_SIZE);
             float const c    = static_cast<float>(cos_ptr[cos_base + i]);
             float const s    = static_cast<float>(sin_ptr[cos_base + i]);
             y[i]             = dim < embed_dim ? static_cast<scalar_t>(self * c - peer * s)
