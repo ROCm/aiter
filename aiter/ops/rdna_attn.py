@@ -37,7 +37,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from ..jit.core import compile_ops
+from ..jit.core import _pybind_develop_hooks, compile_ops
 from ..jit.utils.chip_info import get_gfx_list, get_gfx_runtime_for_device
 
 MD_NAME = "module_rdna_attn"
@@ -1008,6 +1008,13 @@ def _encoder_layout(
     )
 
 
+def _current_stream(device: torch.device) -> int:
+    """The handle of a device's current stream, without building the Stream
+    object: this runs on every encoder call."""
+    raw_stream = _pybind_develop_hooks()[2]
+    return raw_stream(_device_id(device))
+
+
 def _heads_contiguous(x: torch.Tensor) -> torch.Tensor:
     """x, or a copy with each token's heads contiguous."""
     return x if x.stride(2) == 1 and x.stride(1) == x.shape[2] else x.contiguous()
@@ -1054,7 +1061,7 @@ def encoder_forward(
     shape = (hq, hkv, d, ENCODER_PAGE_SIZE, 0, dtype)
     # A launch's partials and counters are its own until it ends: launches of
     # one stream run in order, those of different streams may overlap.
-    key = (shape, dev, torch.cuda.current_stream(dev).cuda_stream)
+    key = (shape, dev, _current_stream(dev))
     scratch = _ENCODER_SCRATCH.get(key)
     if scratch is None or scratch[1].numel() < 2 * lay.variant.scratch_rows(dev):
         scratch = make_prefill_scratch(
