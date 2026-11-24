@@ -489,6 +489,45 @@ def test_source_edited_after_this_process_imported_it_is_not_cached(
         cache._disk_key(("k",), ())
 
 
+def test_source_edited_after_its_digest_was_read_is_not_stored(tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    src = _old_file(tmp_path / "late_import.py", "X = 1\n")
+    cache = aot_cache.FlyDSLAotCache("test_edited_late", sources=[src])
+    # The digest is read once, here as for a key that hit the disk: a hit
+    # imports nothing, so a factory may import its kernel module after this.
+    cache._disk_key(("k",), ())
+    src.write_text("X = 2\n")
+    made = []
+    out_dir = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="changed after"):
+        cache._build(lambda: made.append(1), (), out_dir, "sym", "digest")
+    # Nothing was traced and nothing stored under the earlier digest.
+    assert not made
+    assert not list(out_dir.glob("*.o")) and not list(out_dir.glob("*.json"))
+
+
+def test_source_edited_while_its_entry_is_built_is_not_stored(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    src = _old_file(tmp_path / "imported_by_the_trace.py", "X = 1\n")
+    cache = aot_cache.FlyDSLAotCache("test_edited_in_build", sources=[src])
+    cache._disk_key(("k",), ())
+
+    def export(exe, args, out_dir, sym, libs=None):
+        # The trace imports the kernel's modules; one was edited before that.
+        src.write_text("X = 2\n")
+        obj = out_dir / f"{sym}.o"
+        obj.write_bytes(b"object of the edited code")
+        return obj
+
+    monkeypatch.setattr(aot_cache, "_export", export)
+    out_dir = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="changed after"):
+        cache._build(_Launcher, (), out_dir, "sym", "digest")
+    assert not list(out_dir.glob("*.o")) and not list(out_dir.glob("*.json"))
+
+
 def test_cache_names_are_unique_per_file(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
     from aiter.ops.flydsl.aot_cache import FlyDSLAotCache

@@ -260,7 +260,10 @@ A process runs the code it imported, so a declared `.py` edited after the
 process imported aiter's FlyDSL code (`git checkout` during a test run) no
 longer matches what it would trace. That cache then takes the JIT path in
 this process, with a warning, and the next process builds or loads the
-entries of the new code.
+entries of the new code. The contents are compared again whenever an entry is
+built, since a factory may import its kernel module only on its first miss,
+after the digest was read: a source that changed since is found then, and
+that build is not stored.
 
 A cache name is unique: creating a cache of one name from two files raises,
 since the two would share a directory.

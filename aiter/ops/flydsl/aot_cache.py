@@ -763,8 +763,10 @@ class FlyDSLAotCache:
             sources = (site, *sources)
         self._files = _source_files(sources)
         self._env = tuple(sorted({env} if isinstance(env, str) else set(env)))
-        # [(source, sha256)] and its hash, once the files were read (_sources).
+        # [(source, sha256)] and its hash, once the files were read (_sources),
+        # and the same hashes by path (_check_unchanged).
         self._hashes = None
+        self._read = {}
         self._digest = None
         self._imports_checked = False
         self._mem = {}
@@ -795,10 +797,30 @@ class FlyDSLAotCache:
                     f"{changed[0]} changed after this process imported it; "
                     f"not using the AOT cache for it"
                 )
-            self._hashes = sorted((_portable(f), _file_digest(f)) for f in self._files)
+            self._read = {f: _file_digest(f) for f in self._files}
+            self._hashes = sorted((_portable(f), d) for f, d in self._read.items())
             blob = json.dumps(self._hashes, sort_keys=True).encode()
             self._digest = hashlib.sha256(blob).hexdigest()
         return self._digest
+
+    def _check_unchanged(self) -> None:
+        """Raise if a declared source no longer has the contents the digest was
+        made from. The digest is read once per process, but a kernel module
+        may be imported later than that (a factory importing it on its first
+        miss, a helper importing another while it traces): a build would then
+        store the edited code under the digest of the earlier contents, for
+        every later process to load."""
+        self._sources()
+        for f, read in self._read.items():
+            try:
+                now = hashlib.sha256(Path(f).read_bytes()).hexdigest()
+            except OSError:
+                now = None
+            if now != read:
+                raise RuntimeError(
+                    f"{f} changed after this process hashed it; not caching "
+                    f"a build that may hold either version of it"
+                )
 
     def _inputs(self) -> dict:
         return {name: _input(name) for name in self._env}
@@ -963,10 +985,14 @@ class FlyDSLAotCache:
         tmp = Path(tempfile.mkdtemp(dir=out_dir, prefix=".tmp-"))
         try:
             self._check_declared()
+            # Before the trace, which a changed source makes pointless, and
+            # after it: the trace is what imports the kernel's modules.
+            self._check_unchanged()
             libs = set()
             exe = make_exe()
             tmp_obj = _export(exe, args, tmp, sym, libs)
             self._check_declared(libs)
+            self._check_unchanged()
             meta = {
                 # In the digest already; kept here to say what an entry is.
                 "sources": dict(self._hashes),
