@@ -235,6 +235,7 @@ def test_changing_arena_selects_a_new_specialization(dispatch):
     "overrides,env,expected_workers,expected_buffers",
     [
         ({}, {}, 256, 3),
+        ({}, {"AITER_FLYDSL_EP_SCATTER_NUM_BUFFERS": "2"}, 256, 2),
         ({"persistent_workers": 128}, {}, 128, 3),
         ({"persistent_workers": 512, "num_buffers": 2}, {}, 512, 3),
         ({}, {"AITER_FLYDSL_EP_SCATTER_OVERLAP": "0"}, 0, 4),
@@ -275,6 +276,7 @@ def test_overlap_defaults_preserve_launch_configuration(
         "AITER_TDM_NEXT_STAGE_PREFETCH",
         "AITER_GROUPED_GEMM_AS_PROLOGUE",
         "AITER_FLYDSL_EP_SCATTER_OVERLAP",
+        "AITER_FLYDSL_EP_SCATTER_NUM_BUFFERS",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
@@ -547,7 +549,10 @@ def test_compact_preshuffle_validates_before_launch(overrides, message):
 
 @pytest.mark.parametrize("first", [6, 7, 8])
 @pytest.mark.parametrize("wave", [2, 3])
-def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave):
+@pytest.mark.parametrize("buffers", [2, 3])
+def test_scatter_split_preserves_destinations_and_tail(
+    monkeypatch, first, wave, buffers
+):
     """Execute callbacks with scalar CPU stubs to audit nonaligned tails."""
     from aiter.ops.flydsl.kernels import ep_scatter_common as scatter
 
@@ -555,7 +560,9 @@ def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave)
     monkeypatch.setattr(scatter.fx, "Int32", int)
     monkeypatch.setattr(scatter, "range_constexpr", range)
     monkeypatch.setattr(scatter, "const_expr", bool)
-    monkeypatch.setattr(scatter.tdm_ops, "tensor_wait", lambda _: None)
+    waits = []
+    stages = []
+    monkeypatch.setattr(scatter.tdm_ops, "tensor_wait", waits.append)
     monkeypatch.setattr(scatter, "workgroup_barrier", lambda: None)
     monkeypatch.setattr(scatter.rocdl, "s_nop", lambda _: None)
     emitted = []
@@ -569,12 +576,13 @@ def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave)
             wave - 2,
             state,
             last,
-            lambda *_: None,
+            lambda stage, _: stages.append(stage),
             lambda: None,
             lambda _: None,
             0,
             lambda _: None,
             first,
+            buffers,
         )
 
     vectors = (100, 200, 300, 400)
@@ -587,6 +595,8 @@ def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave)
     assert emitted == expected[:first]
     prologue, _, skip = callbacks(state, 0)
     prologue(False)
+    assert stages == list(range(buffers))
+    assert waits == ([] if buffers == 2 else [0])
     assert emitted == expected
     emitted.clear()
     skip()
@@ -599,19 +609,22 @@ def test_scatter_split_preserves_destinations_and_tail(monkeypatch, first, wave)
 
 
 @pytest.mark.parametrize("first", [6, 7, 8])
-def test_scatter_pending_rows_do_not_alias_inputs(first):
+@pytest.mark.parametrize("buffers", [2, 3])
+def test_scatter_pending_rows_do_not_alias_inputs(first, buffers):
     """A next-task input write must not overwrite a deferred output row."""
     from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
     from aiter.ops.flydsl.kernels import ep_scatter_common as scatter
 
-    input_end = 32768 + 3 * 65536
+    input_end = 32768 + buffers * 65536
     stage2_start = 32768 + 2 * 65536
     offset = scatter.overlap_output_offset(input_end, stage2_start, 528, first)
     assert offset >= stage2_start
     assert offset % 512 == 0
     assert offset + first * 2 * 8 * 528 >= input_end
     assert offset + 256 * 528 <= get_lds_capacity_bytes("gfx1250")
-    if first == 8:
+    if buffers == 2:
+        assert input_end <= offset
+    if first == 8 or buffers == 2:
         assert offset == stage2_start
 
 
@@ -651,3 +664,90 @@ def test_scatter_split_override_separates_cached_launches(dispatch, monkeypatch)
         )
     assert len(compiled) == 3
     assert len(launches) == 4
+
+
+def test_scatter_buffer_override_separates_cached_launches(dispatch, monkeypatch):
+    """NB2 and NB3 need distinct compiled handles."""
+    compiled, launches = dispatch
+    data = torch.empty((256, 1024), dtype=torch.uint8, device="meta")
+    ids = torch.empty(64, dtype=torch.int32, device="meta")
+    scatter = Stage2ScatterContext(123456, 0, 16384, 8192, 4, ids)
+    for buffers in ("3", "2", "3"):
+        monkeypatch.setenv("AITER_FLYDSL_EP_SCATTER_NUM_BUFFERS", buffers)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            data,
+            data,
+            data,
+            data,
+            data,
+            ids,
+            n_experts=64,
+            contiguous_m=256,
+            N=1024,
+            K=2048,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            num_buffers=3,
+            next_stage_prefetch=1,
+            cluster_m=1,
+            cluster_n=4,
+            persistent_workers=512,
+            stream=0,
+            stage2_scatter=scatter,
+        )
+    assert len(compiled) == 2
+    assert len(launches) == 3
+
+
+@pytest.mark.parametrize("buffers", [2, 3])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_overlap_always_enables_early_timeout(monkeypatch, buffers, overlap):
+    """Changing shared tuning defaults cannot disable overlap's early timeout."""
+    from aiter.ops.flydsl.kernels import mxfp4_preshuffle_gfx1250_tdm as kernel
+
+    monkeypatch.setitem(
+        kernel.HYPER_PARAMS["a4w4"]["prefill"], "tdm_early_timeout", False
+    )
+    signature = inspect.signature(kernel.build_gemm_a8w4_tdm_task)
+    config = {
+        name: 0
+        for name, parameter in signature.parameters.items()
+        if parameter.default is inspect.Parameter.empty
+    }
+    config.update(
+        K=2048,
+        tile_m=256,
+        tile_n=256,
+        tile_k=256,
+        m_warp=2,
+        n_warp=2,
+        num_buffers=buffers,
+        a_is_fp4=1,
+        n_experts=65,
+        quant_wmma_rep=8,
+        cluster_n=4,
+        cluster_m=1,
+        next_stage_prefetch=1,
+        num_waves_per_tensor_tdm=2,
+        enable_ep_scatter=1,
+        ep_arena_handle=123456,
+        ep_slot_stride_bytes=16384,
+        ep_destination_stride=8192,
+        ep_world_size=4,
+        lds_soa_load_interleave=1,
+        persistent_workers=512,
+        a_preshuffled=1,
+        b_placed=2,
+        loc_sched=1,
+        loc_group=2,
+        explicit_tile=1,
+        ep_scatter_overlap=int(overlap),
+    )
+    _, _, name, _, layout = kernel.build_gemm_a8w4_tdm_task(**config)
+    assert layout["overlap_scatter"] == overlap
+    assert f"_et{int(overlap)}_" in name

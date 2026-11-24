@@ -165,10 +165,10 @@ def make_scatter_store(
         # destination rows are encoded in desc, not in the instruction name.
         # Keep the compiler-inserted tensorcnt(0xa) hardware workaround: it
         # limits outstanding tensor operations to 10, rather than draining all
-        # stores. In the overlap path, waves 2/3 issue no tensor loads and at
-        # most ten stores between explicit drains, so this guard does not
-        # require the burst to finish. The callbacks still use tensor_wait(0)
-        # at LDS reuse boundaries; the compiler guard cannot replace those
+        # stores. Overlap waves 2/3 issue no tensor loads. NB2 can issue all
+        # 16 stores without an explicit drain because inputs do not alias C;
+        # this compiler guard still limits queue depth. The callbacks use
+        # tensor_wait(0) at LDS reuse boundaries; the compiler guard cannot replace those
         # completion waits. Ordinary and overlapped scatter share this emitter.
         tensor_store_gather(desc)
 
@@ -187,6 +187,7 @@ def make_overlap_callbacks(
     tdm_per,
     load_first,
     prologue_gathers=8,
+    num_buffers=3,
 ):
     """Overlap each store wave's two bursts with the following GEMM task.
 
@@ -194,8 +195,9 @@ def make_overlap_callbacks(
     Six/seven-gather first bursts end inside a vector; their tails retain that
     vector and start at its original lane offset. The default eight-gather
     first burst needs only two vectors; its third state value stays zero.
-    Stages 0/1 are disjoint from C. Stage 2 may overwrite only the retired
-    prefix. The next epilogue waits for the deferred tail before reusing C.
+    Stages 0/1 are disjoint from C. NB2 therefore needs no scatter drain in
+    its prologue. NB3's stage 2 may overwrite only the retired prefix. Both
+    paths wait for the deferred tail before the next epilogue reuses C.
     """
     scatter_schedule(prologue_gathers)
     mainloop_gathers = 16 - prologue_gathers
@@ -223,13 +225,14 @@ def make_overlap_callbacks(
     @flyc.jit
     def overlap_prologue(interleaved_lds_load):
         # Stages 0/1 are disjoint from old C. One rendezvous covers both
-        # the first input's readiness and retirement of C's first burst.
+        # the first input's readiness and, for NB3, retirement of C's prefix.
         for i in range_constexpr(2):
             issue(i, i)
         init_accumulators()
         tdm_wait_per_wave(tdm_per)
-        if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
-            tdm_ops.tensor_wait(0)
+        if const_expr(num_buffers == 3):
+            if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
+                tdm_ops.tensor_wait(0)
         workgroup_barrier()
         load_first(interleaved_lds_load)
         if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
@@ -243,7 +246,8 @@ def make_overlap_callbacks(
                 ),
                 scatter_column_offset,
             )
-        issue(2, 2)
+        if const_expr(num_buffers == 3):
+            issue(2, 2)
 
     @flyc.jit
     def overlap_epilogue(index_lanes, column_offset):
