@@ -149,10 +149,12 @@ Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
 | Config loading | `utils/config_utils.py` and the `utils/*_config_utils.py` loaders |
 | Autotune config lists | `utils/tuned_config_utils.py::autotune_configs` |
 | Split-K second-stage reduce | `_triton_kernels/common/splitk_reduce.py` |
+| Split-K in one launch (the last split adds the partials) | `_tile_on_xcd` and `_sum_splits_on_xcd` in `_triton_kernels/common/splitk_reduce.py`, counters and partials from `utils/fused_splitk.py` |
 | Program ID and XCD remapping | `_triton_kernels/common/pid_preprocessing.py` |
 | Tile lookup for ragged batches | `_triton_kernels/common/segment_tile.py` |
 | Architecture checks | `utils/_triton/arch_info.py::get_arch` |
 | Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
+| Launches without Triton's per-call dispatch | `utils/fast_launch.py::fast_launch` |
 | Logging in library code | `utils/logger.py::AiterTritonLogger`, level from `AITER_TRITON_LOG_LEVEL` |
 | Logging in tests and benchmarks | `from aiter import logger`, level from `AITER_LOG_LEVEL` |
 
