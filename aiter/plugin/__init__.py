@@ -50,6 +50,11 @@ SUPERSEDED_API_SPELLING: str | None = "a later aiter release"
 # the role this module asks, the way a pytest plugin implements hooks.
 ENTRY_POINT_GROUP = "aiter.plugins"
 
+# The reason a route carries when a reported measurement decided it, kept
+# distinct from plain "selected" so that decision_counts() can answer how
+# often comparison actually changed anything.
+PROVIDER_FASTER = "provider-faster"
+
 _Canonicalizer = Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -85,10 +90,33 @@ class KernelCandidate:
     extrapolating; omission is how to say "I do not know", which is why zero, a
     negative, ``inf`` and ``nan`` are refused rather than recorded.
 
-    It never influences routing. Preference is the enable list, which names an
-    owner for that decision; a number a provider picks for itself must not be
-    able to outrank it. AITER records it, hands it back, and does nothing else
-    with it.
+    It does not make a provider eligible. Eligibility is the enable list, which
+    names an owner for that decision, and nothing reported here can add to it.
+    Among providers a framework has already enabled, a *comparable* report --
+    one carrying the four fields below -- selects which kernel runs; see
+    ``_choose``.
+
+    A report is comparable only with all of:
+
+    ``baseline_us``
+        what AITER's own path took, measured by the provider under the same
+        conditions. Without it ``latency_us`` says a kernel took 7.70us and
+        leaves open whether AITER would have taken 6 or 60. AITER cannot supply
+        this at dispatch time -- it would have to run both kernels to find out,
+        which is the cost the mechanism exists to avoid.
+    ``baseline_path``
+        which AITER path that was: a tuned row, the bmm heuristic, a named
+        kernel. The same shape reaches different AITER code depending on
+        whether it was tuned, so the number alone does not say what was beaten.
+    ``measured_under``
+        the conditions: graph replay or eager, cold or warm weights, rounds.
+    ``measurement_ref``
+        how to reproduce it.
+
+    An incomplete report is not an error and not a rejection. The candidate
+    stays eligible and is selected by enable order exactly as before -- it
+    simply does not participate in the comparison. Silence costs a provider the
+    comparison, never correctness.
     """
 
     provider: str
@@ -102,6 +130,13 @@ class KernelCandidate:
     # anything before `run` would silently take its argument. See the docstring
     # for what the number means -- that is where a provider author reads it.
     latency_us: float | None = None
+    # Appended for the same reason, and in the order the docstring introduces
+    # them. All four are needed for a report to be comparable; any one missing
+    # leaves the candidate on the enable-order path.
+    baseline_us: float | None = None
+    baseline_path: str | None = None
+    measured_under: Mapping[str, Any] | None = None
+    measurement_ref: str | None = None
 
     def __post_init__(self) -> None:
         identity = (self.provider, self.kernel_id, self.artifact_digest)
@@ -117,6 +152,15 @@ class KernelCandidate:
             raise ValueError(
                 f"latency_us must be a positive finite number of microseconds, "
                 f"or omitted entirely; got {self.latency_us!r}"
+            )
+        # The same reasoning as latency_us: a baseline of zero or nan would be
+        # compared against and would win or lose on nonsense.
+        if self.baseline_us is not None and not (
+            isfinite(self.baseline_us) and self.baseline_us > 0
+        ):
+            raise ValueError(
+                f"baseline_us must be a positive finite number of microseconds, "
+                f"or omitted entirely; got {self.baseline_us!r}"
             )
 
 
@@ -169,6 +213,11 @@ class Decision:
     # candidate reported, unchanged; None on a native route, where there is no
     # candidate to report one.
     latency_us: float | None = None
+    # What the selection was made against, when it was made by comparison.
+    # Both None unless `reason` is PROVIDER_FASTER: enable order records no
+    # comparison because it performed none.
+    baseline_us: float | None = None
+    selected_over: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +238,7 @@ class _FrameworkDefault:
 
     enable: tuple[str, ...]
     source: str
+    exclude: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,11 +254,20 @@ class _Config:
     enabled: tuple[str, ...]
     source: str
     generation: int
+    # (provider, op) pairs barred from serving. Empty for every caller that
+    # does not pass `exclude`, which is every caller that exists today.
+    excluded: frozenset[tuple[str, str]] = frozenset()
 
     def _settings(self) -> tuple[Any, ...]:
-        """Everything that defines this configuration except its generation."""
+        """Everything that defines this configuration except its generation.
 
-        return (self.kill_switch, self.enabled, self.source)
+        ``excluded`` belongs here: a configure() that changes only exclusions
+        must still produce a new generation, or the change is accepted and does
+        not take effect -- the failure mode this interface removed environment
+        controls to avoid.
+        """
+
+        return (self.kill_switch, self.enabled, self.excluded, self.source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +319,26 @@ class Explanation:
 
     decision: Decision | None
     declines: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderReport:
+    """What ``validate()`` could check about one provider, without running it.
+
+    ``problems`` empty means every check here passed. It does not mean the
+    provider works: nothing below executes a kernel, and the checks it cannot
+    perform are listed in ``validate``'s docstring rather than implied by
+    silence.
+    """
+
+    provider: str
+    installed: bool
+    api_version: int | None
+    ops: Mapping[str, str]
+    problems: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return self.installed and not self.problems
 
 
 _routed_ops: dict[str, _RoutedOp] = {}
@@ -319,7 +398,81 @@ def last_decision() -> Decision | None:
     return _last_decision.get()
 
 
-def configure(*, source: str, enable: Sequence[str] = ()) -> None:
+def _served_ops_by_provider() -> Mapping[str, frozenset[str]]:
+    """Which op names each installed provider declares. Discovery is forced."""
+
+    served: dict[str, set[str]] = {}
+    for record in _providers():
+        names = served.setdefault(record.name, set())
+        try:
+            # A provider may be a proxy whose attributes throw; reading it must
+            # not turn a configure() into that provider's failure. An
+            # unreadable provider contributes no op names, so excluding one of
+            # them raises the ordinary "does not serve" error.
+            declared = record.provider.op_versions
+            names.update(declared if isinstance(declared, Mapping) else set(declared))
+        except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+            logger.warning(
+                "Provider %s has invalid op_versions: %s", record.name, error
+            )
+    return {name: frozenset(ops) for name, ops in served.items()}
+
+
+def _parse_exclusions(exclude: Sequence[str]) -> frozenset[tuple[str, str]]:
+    """``("amd_kernels:rmsnorm", ...)`` -> ``{("amd_kernels", "rmsnorm")}``.
+
+    Every rejection here is an exception, never a skip. The environment
+    controls this interface removed failed for exactly one reason -- they
+    accepted input and did nothing with it -- and an exclusion that is accepted
+    and does not exclude is the same failure wearing a different name. The op
+    is AITER's contract name, not the provider's internal kernel name: a
+    framework excludes using the names it already calls.
+
+    Forces discovery, which ``configure()`` does not otherwise do. That cost is
+    only paid by a caller passing exclusions, and it is what makes an unknown
+    provider an error here rather than a surprise at the first dispatch.
+    """
+
+    if not exclude:
+        return frozenset()
+
+    served = _served_ops_by_provider()
+    parsed: set[tuple[str, str]] = set()
+    for raw in exclude:
+        entry = raw.strip()
+        if not entry:
+            raise ValueError("exclude entries cannot be empty")
+        if entry.count(":") != 1:
+            raise ValueError(
+                f"exclude entry must be exactly 'provider:op'; got {raw!r}. "
+                f"A bare op name cannot say whose op it is, and a bare provider "
+                f"name is not an exclusion -- drop it from enable instead."
+            )
+        provider, _, op_name = entry.partition(":")
+        provider, op_name = provider.strip(), op_name.strip()
+        if not provider or not op_name:
+            raise ValueError(
+                f"exclude entry must name both a provider and an op; got {raw!r}"
+            )
+        if provider not in served:
+            installed = ", ".join(sorted(served)) or "none"
+            raise ValueError(
+                f"exclude names provider {provider!r}, which is not installed; "
+                f"installed providers: {installed}"
+            )
+        if op_name not in served[provider]:
+            serves = ", ".join(sorted(served[provider])) or "no ops"
+            raise ValueError(
+                f"provider {provider!r} does not serve op {op_name!r}; "
+                f"it serves: {serves}"
+            )
+        parsed.add((provider, op_name))
+    return frozenset(parsed)
+
+
+def configure(
+    *, source: str, enable: Sequence[str] = (), exclude: Sequence[str] = ()
+) -> None:
     """Set which providers may serve. This is the only way to enable one.
 
     ``enable`` is a provider list in preference order and **replaces** any
@@ -327,6 +480,18 @@ def configure(*, source: str, enable: Sequence[str] = ()) -> None:
     rocm defaults 2026.11") and is recorded so every route names an owner --
     the reason enablement lives here rather than in the environment, which
     cannot say who set it.
+
+    ``exclude`` bars one provider from one op: ``"amd_kernels:rmsnorm"``. It
+    exists because selection can be automatic, and a framework that finds a
+    single kernel unfit should not have to deny every provider to stop it --
+    which is all ``AITER_PLUGINS=0`` can do. It is an argument rather than an
+    environment variable so that the exclusion carries the same ``source`` as
+    everything else; an environment variable cannot say who set it.
+
+    ``exclude`` outranks ``enable``, and a malformed or unknown entry raises.
+    Passing it forces provider discovery, so an unknown name is an error here
+    rather than silence later. An empty ``exclude`` -- every caller that exists
+    today -- changes nothing and forces nothing.
 
     Init-time by convention. A call after the first dispatch takes effect on the
     next dispatch and bumps the config generation; it is never silent. All
@@ -337,11 +502,16 @@ def configure(*, source: str, enable: Sequence[str] = ()) -> None:
     global _framework_default
     if not source.strip():
         raise ValueError("configure() requires a non-empty source")
+    # Parsed before the lock: it discovers providers, and holding the config
+    # lock across discovery would serialise an arbitrary amount of metadata
+    # reading behind a lock dispatch also wants.
+    exclusions = _parse_exclusions(exclude)
     with _config_lock:
         _framework_default = _FrameworkDefault(
             # dict.fromkeys de-duplicates while preserving the preference order.
             enable=tuple(dict.fromkeys(n.strip() for n in enable if n.strip())),
             source=source.strip(),
+            exclude=exclusions,
         )
         _swap_config_locked()
 
@@ -368,13 +538,14 @@ def _build_config(default: _FrameworkDefault | None, generation: int) -> _Config
 
     kill_switch = os.getenv("AITER_PLUGINS", "1").strip().lower() in _FALSY
     enabled = default.enable if default else ()
+    excluded = default.exclude if default else frozenset()
     if kill_switch:
         source = "env"
     elif default:
         source = f"configure:{default.source}"
     else:
         source = "default-deny"
-    return _Config(kill_switch, enabled, source, generation)
+    return _Config(kill_switch, enabled, source, generation, excluded)
 
 
 def _swap_config_locked() -> _Config:
@@ -397,7 +568,24 @@ def _swap_config_locked() -> _Config:
 
 
 def _config() -> _Config:
-    """The current snapshot, built on first dispatch. Lock-free on the hot path."""
+    """The current snapshot. A plain read, with nothing to trace around.
+
+    Built at import rather than on first dispatch, which is not a performance
+    choice. Building it lazily put a lock acquisition and an ``os.getenv`` on
+    the first dispatch of the process -- and torch.compile cannot trace either,
+    so that first call graph-breaks. A routed op whose first call lands inside
+    a compiled region therefore splits its graph in two, and a framework that
+    allows one backend invocation per compilation (ATOM's ``VllmBackend``) is
+    handed a second one and asserts.
+
+    Measured, with a counting backend: a routed op called with the snapshot
+    unbuilt compiles two graphs, and exactly one once it is built. Nothing else
+    on the dispatch path breaks, so building it eagerly is the whole fix.
+
+    The fallback is kept because `_config_snapshot` is cleared by
+    `_reset_for_testing`, and a test that clears it must not then be the one
+    call that pays for a rebuild inside somebody's graph.
+    """
 
     snapshot = _config_snapshot
     if snapshot is None:
@@ -406,11 +594,101 @@ def _config() -> _Config:
     return snapshot
 
 
+_CUSTOM_OP_NAMESPACE = "aiter_routed"
+_custom_op_library: Any = None
+
+
+def _as_custom_op(
+    op: str,
+    native: Callable[..., Any],
+    routed: Callable[..., Any],
+    fake: Callable[..., Any] | None,
+    mutates_args: list[str] | str = "unknown",
+) -> Callable[..., Any] | None:
+    """Register ``routed`` as a torch custom op, or return None to stay as is.
+
+    torch.compile traces through a Python wrapper, so a routed op puts this
+    module's dispatch inside the caller's graph -- and anything in it that
+    Dynamo cannot trace splits that graph. A registered custom op is one
+    opaque node instead: nothing in here can reach the caller's graph at all.
+
+    ``mutates_args="unknown"`` rather than a per-op list, for a reason that
+    is about who has to be right rather than about measured breakage. A list
+    has to be correct for every routed op, including ops added later by
+    people who did not read this, and an under-declaration is undefined
+    behaviour rather than an error -- so being wrong about it is both easy
+    and quiet. "unknown" says every argument may be written, which is never
+    wrong about any op, only conservative about all of them: it costs
+    optimisation, not correctness.
+
+    There is one measured exception to "only costs optimisation": inductor
+    wraps an op with any mutable argument in an ``auto_functionalized_v2``
+    node, and torch 2.10's post-grad decompose can fail to remove it,
+    asserting the graph still holds the wrapper. An op whose semantics are
+    provably pure may pass an explicit ``mutates_args`` list (identical to
+    ``torch_compile_guard``'s knob) so the schema is functional and that
+    wrapping never happens. The declaration must be true for the op as
+    written, not for what the caller intended -- an under-declared list is
+    the undefined behaviour above.
+
+    Honesty about what was measured: an op that writes through an argument
+    gives the same answer under inductor whether it declares "unknown" or
+    declares nothing, so the permissive option was not observed to break
+    anything here. That is not a reason to take it. It is a reason not to
+    claim this choice prevents a failure that has been seen.
+
+    What was measured is the part that matters: such an op compiles to one
+    graph and returns exactly what the eager path does, with the compiled
+    region reading the written buffer afterwards.
+
+    Returning None is a real outcome, not a failure path. An op with no fake,
+    with an unannotated parameter, or with an argument no schema can express
+    stays exactly as it is today -- traced, and no worse than before this
+    existed. That is what makes this safe to apply to every op at once:
+    nothing regresses, and an op becomes protected the day it acquires what
+    registration needs.
+    """
+
+    if fake is None:
+        return None
+    try:
+        import torch
+        from torch.library import Library, infer_schema, register_fake
+    except Exception:  # noqa: BLE001 -- see below; import must never fail here
+        return None
+
+    try:
+        schema = infer_schema(native, mutates_args=mutates_args)
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, no schema: %s", op, error)
+        return None
+
+    name = op.replace(".", "_")
+    try:
+        global _custom_op_library
+        if _custom_op_library is None:
+            _custom_op_library = Library(_CUSTOM_OP_NAMESPACE, "FRAGMENT")
+        _custom_op_library.define(f"{name}{schema}")
+        for backend in ("CPU", "CUDA"):
+            _custom_op_library.impl(name, routed, backend)
+        register_fake(f"{_CUSTOM_OP_NAMESPACE}::{name}", fake)
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, registration failed: %s", op, error)
+        return None
+
+    entry = getattr(torch.ops, _CUSTOM_OP_NAMESPACE)
+    bound = getattr(entry, name)
+    bound.__aiter_plugin_op__ = routed.__aiter_plugin_op__
+    return bound
+
+
 def route(
     *,
     op: str,
     version: int = 1,
     supersedes: Mapping[int, str] = MappingProxyType({}),
+    fake: Callable[..., Any] | None = None,
+    mutates_args: list[str] | str = "unknown",
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Route an AITER op through a compatible provider before its native path.
 
@@ -423,6 +701,13 @@ def route(
     AITER can say that a provider written against the older version is still
     acceptable for calls on this one; declaring it here makes that assertion
     explicit and dated rather than implied.
+
+    ``mutates_args`` overrides the conservative default only for ops whose
+    mutation semantics are actually known. See ``_as_custom_op``: the default
+    "unknown" costs nothing worse than an ``auto_functionalized_v2`` wrap that
+    inductor may fail to decompose, while a declared list that lies is
+    undefined behaviour -- so pass ``[]`` only when the op genuinely writes
+    through no argument.
     """
 
     operation = Op(op, version)
@@ -445,7 +730,8 @@ def route(
             return _dispatch(operation, canonicalize, native, args, kwargs)
 
         routed.__aiter_plugin_op__ = operation
-        return routed
+        opaque = _as_custom_op(op, native, routed, fake, mutates_args)
+        return opaque if opaque is not None else routed
 
     return decorate
 
@@ -484,28 +770,25 @@ def _dispatch(
 
     provider_args, provider_kwargs = canonicalize(*args, **kwargs)
     readonly_kwargs = MappingProxyType(provider_kwargs)
-    declined = False
-    failure: tuple[str, str] | None = None
-    for record in eligible.providers:
-        candidate, rejection = _ask_provider(record, op, provider_args, readonly_kwargs)
-        if rejection is not None:
-            # Isolation: this provider is unusable for this call, but it may not
-            # deny service to a well-behaved one. The first error is the recorded
-            # one; either kind outranks a decline.
-            failure = failure or (rejection, record.name)
-            continue
-        if candidate is None:
-            declined = True
-            continue
-
+    offers = _collect(op, eligible.providers, provider_args, readonly_kwargs)
+    chosen, over = _choose(offers.candidates)
+    if chosen is not None:
         _record(
-            _selected(op, candidate, config), config.generation, candidate.kernel_id
+            _selected(op, chosen, config, over), config.generation, chosen.kernel_id
         )
         # Once provider execution starts, errors propagate. Falling back here could
         # repeat side effects or hide a broken kernel behind a successful result.
-        return cast(_R, candidate.run(*provider_args, **provider_kwargs))
+        try:
+            return cast(_R, chosen.run(*provider_args, **provider_kwargs))
+        except BaseException as error:
+            # Not caught, not retried, not substituted. Annotated on the way out,
+            # because the containment for an unfit kernel is a framework
+            # excluding it, and a framework cannot exclude what it reads as
+            # AITER's own failure.
+            _attribute(error, chosen, config)
+            raise
 
-    reason, provider_name = _native_outcome(failure, declined)
+    reason, provider_name = _native_outcome(offers.failure, offers.declined)
     return _run_native(
         op,
         native,
@@ -518,7 +801,167 @@ def _dispatch(
     )
 
 
-def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
+@dataclass(frozen=True, slots=True)
+class _Offers:
+    """What the eligible providers answered for one call."""
+
+    candidates: tuple[KernelCandidate, ...]
+    declined: bool
+    failure: tuple[str, str] | None
+
+
+def _collect(
+    op: Op,
+    records: Sequence[_ProviderRecord],
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> _Offers:
+    """Ask the eligible providers, in preference order, and keep the offers.
+
+    Every eligible provider is asked. Comparing requires every offer in hand,
+    and whether a later provider reports a faster kernel is not knowable
+    without asking it, so there is no stopping at the first. With one eligible
+    provider -- the shape of every deployment this interface has had so far --
+    that is one call, exactly as before comparison existed.
+
+    ``select()`` is specified to be cheap and pure, so asking more of them is
+    affordable. A provider whose ``select()`` has side effects violates that
+    specification; it cannot deny service to a well-behaved one, because
+    ``_ask_provider`` isolates it.
+    """
+
+    candidates: list[KernelCandidate] = []
+    declined = False
+    failure: tuple[str, str] | None = None
+    for record in records:
+        candidate, rejection = _ask_provider(record, op, args, kwargs)
+        if rejection is not None:
+            # Isolation: this provider is unusable for this call, but it may not
+            # deny service to a well-behaved one. The first error is the recorded
+            # one; either kind outranks a decline.
+            failure = failure or (rejection, record.name)
+            continue
+        if candidate is None:
+            declined = True
+            continue
+        candidates.append(candidate)
+    return _Offers(tuple(candidates), declined, failure)
+
+
+def _comparable(candidate: KernelCandidate) -> bool:
+    """Whether this offer carries a comparison AITER can read.
+
+    All four fields or none of it. A latency without a baseline says a kernel
+    took some number of microseconds and leaves open what it was faster than;
+    a baseline without the conditions it was measured under does not say
+    whether the two numbers describe the same situation.
+    """
+
+    return (
+        candidate.latency_us is not None
+        and candidate.baseline_us is not None
+        and bool(candidate.baseline_path)
+        and candidate.measured_under is not None
+        and bool(candidate.measurement_ref)
+    )
+
+
+def _choose(
+    candidates: Sequence[KernelCandidate],
+) -> tuple[KernelCandidate | None, str | None]:
+    """Pick the kernel, and say what the pick was made against.
+
+    Comparable offers that beat their own baseline come first, fastest by
+    reported time. Absolute time rather than relative gain: the offers answer
+    the same call, so their times are comparable, while their baselines may
+    have been measured on different machines and theirs are not.
+
+    An offer that reports nothing is not treated as slower -- it may well be
+    faster and simply unmeasured -- so it stays selectable by enable order,
+    exactly as before this comparison existed. An offer that *does* report, and
+    reports losing to AITER, is the one kind that drops out: a provider that
+    measured itself against AITER and found itself slower has said so, and
+    running it anyway would make the report pointless.
+
+    AITER does not verify any of these numbers. The second return value is what
+    was compared, recorded so that "why did this route" is answerable later
+    without re-running anything.
+
+    Under CUDA graph capture this runs once, at capture. Replay executes no
+    Python, so the comparison made at capture is the comparison for the life of
+    the graph: a provider that retunes afterwards does not change a captured
+    route. That is the existing contract for capture, not a new effect of
+    comparing.
+    """
+
+    beating: list[KernelCandidate] = []
+    unmeasured: list[KernelCandidate] = []
+    for candidate in candidates:
+        if not _comparable(candidate):
+            unmeasured.append(candidate)
+        elif cast(float, candidate.latency_us) < cast(float, candidate.baseline_us):
+            beating.append(candidate)
+        # Comparable and not beating its own baseline is the one case that
+        # removes a candidate from consideration: the provider measured itself
+        # against AITER and reported losing. Routing to it anyway would make
+        # the report pointless and the slower kernel the one that runs.
+
+    if beating:
+        best = min(beating, key=lambda c: cast(float, c.latency_us))
+        return best, (
+            f"{best.latency_us}us vs {best.baseline_path} {best.baseline_us}us"
+        )
+    return (unmeasured[0], None) if unmeasured else (None, None)
+
+
+def _not_taken(candidate: KernelCandidate) -> str:
+    """Why an offer that was made did not run."""
+
+    missing = check_report(candidate)
+    if missing:
+        return (
+            "offered; not compared, because the report is incomplete " f"({missing[0]})"
+        )
+    if cast(float, candidate.latency_us) >= cast(float, candidate.baseline_us):
+        return (
+            f"offered; reported {candidate.latency_us}us against its own "
+            f"baseline of {candidate.baseline_us}us, so it did not serve"
+        )
+    return f"offered at {candidate.latency_us}us; another candidate was faster"
+
+
+def _attribute(
+    error: BaseException, candidate: KernelCandidate, config: _Config
+) -> None:
+    """Mark a failure as a provider's, on its way out.
+
+    The exception is not caught, not retried and not replaced; only labelled.
+    Containment for an unfit kernel is a framework excluding it, and a
+    framework reaching an unfamiliar traceback through an AITER entry point
+    reads it as AITER's and never starts looking. ``last_decision()`` already
+    holds this, but only for somebody who thinks to ask; the identity has to
+    arrive with the failure.
+
+    Python 3.10 is supported, so there is no ``add_note``: the attributes are
+    set instead, and the message is left exactly as the provider raised it.
+    """
+
+    try:
+        error.__aiter_provider__ = candidate.provider  # type: ignore[attr-defined]
+        error.__aiter_kernel_id__ = candidate.kernel_id  # type: ignore[attr-defined]
+        error.__aiter_artifact_digest__ = (  # type: ignore[attr-defined]
+            candidate.artifact_digest
+        )
+        error.__aiter_config_source__ = config.source  # type: ignore[attr-defined]
+    except Exception as marking:  # noqa: BLE001 - labelling never replaces a failure
+        logger.debug(
+            "Could not attribute failure to %s: %s", candidate.provider, marking
+        )
+
+
+def _selected(
+    op: Op, candidate: KernelCandidate, config: _Config, over: str | None = None
+) -> Decision:
     """The Decision a selected candidate produces.
 
     Dispatch records it and explain returns it without running anything. They
@@ -529,12 +972,14 @@ def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
     return Decision(
         op=op,
         route="provider",
-        reason="selected",
+        reason=PROVIDER_FASTER if over else "selected",
         provider=candidate.provider,
         kernel_id=candidate.kernel_id,
         artifact_digest=candidate.artifact_digest,
         qualification=candidate.qualification,
         latency_us=candidate.latency_us,
+        baseline_us=candidate.baseline_us if over else None,
+        selected_over=over,
         config_source=config.source,
     )
 
@@ -655,6 +1100,12 @@ def status() -> Mapping[str, Any]:
             "config_source": config.source,
             "kill_switch": config.kill_switch,
             "enabled": config.enabled,
+            # What configure(exclude=...) barred, as the same "provider:op"
+            # strings it accepts. The names a framework needs to build these
+            # are each provider's "op_versions", below.
+            "excluded": tuple(
+                sorted(f"{provider}:{op_name}" for provider, op_name in config.excluded)
+            ),
             "providers": tuple(_described(record) for record in _providers()),
             "skipped_providers": tuple(
                 {"entry_point": skipped.entry_point, "reason": skipped.reason}
@@ -695,6 +1146,140 @@ def status() -> Mapping[str, Any]:
     )
 
 
+def check_report(candidate: KernelCandidate) -> tuple[str, ...]:
+    """What is missing before this candidate's measurement can be compared.
+
+    An empty result means the four comparison fields are present and usable, so
+    this candidate participates in selection. Written for a provider to assert
+    on in its own tests -- ``assert plugin.check_report(c) == ()`` -- because
+    the alternative is discovering at runtime that a report was silently
+    ignored, which looks exactly like not being selected for any other reason.
+    """
+
+    if candidate.latency_us is None:
+        return ("latency_us is not reported, so nothing is compared",)
+    missing = []
+    if candidate.baseline_us is None:
+        missing.append(
+            "baseline_us: what AITER's own path took, under the same conditions"
+        )
+    if not candidate.baseline_path:
+        missing.append("baseline_path: which AITER path that was")
+    if candidate.measured_under is None:
+        missing.append("measured_under: the conditions it was measured under")
+    if not candidate.measurement_ref:
+        missing.append("measurement_ref: how to reproduce it")
+    return tuple(missing)
+
+
+def validate(provider: str) -> ProviderReport:
+    """Check an installed provider against this AITER, without running it.
+
+    A provider author otherwise learns what is wrong from a routing decision
+    that quietly went native. This answers the questions that have static
+    answers:
+
+    * is the provider discovered at all, and does it load;
+    * is the provider API version one this AITER accepts;
+    * is every name in ``op_versions`` an op AITER actually routes;
+    * is each declared version one that op's contract accepts, directly or
+      through ``supersedes``;
+    * is ``select`` present and callable.
+
+    **What it cannot check, and a passing report does not claim:** that ``run``
+    computes the right answer, that ``run`` takes the contract (arity is
+    checked when a candidate is offered, since the callable is only known
+    then), that a measurement is honest, or that ``run`` avoids calling the
+    public name that routes to it -- the re-entrancy a provider wrapping AITER
+    meets first. For the measurement fields, ``check_report`` answers the part
+    that has a static answer.
+    """
+
+    records = [record for record in _providers() if record.name == provider]
+    if not records:
+        skipped = tuple(
+            f"{item.entry_point}: {item.reason}"
+            for item in _skipped_providers
+            if provider in item.entry_point
+        )
+        return ProviderReport(
+            provider=provider,
+            installed=False,
+            api_version=None,
+            ops=MappingProxyType({}),
+            problems=skipped
+            or (
+                (
+                    "not discovered: no entry point in group "
+                    f"{ENTRY_POINT_GROUP!r} loaded under this name"
+                ),
+            ),
+        )
+
+    record = records[0]
+    problems: list[str] = []
+    ops: dict[str, str] = {}
+
+    if record.api_version in SUPERSEDED_API_VERSIONS:
+        problems.append(
+            f"provider API version {record.api_version} is accepted but "
+            f"removed in {SUPERSEDED_API_VERSIONS[record.api_version]}"
+        )
+
+    if not callable(getattr(record.provider, "select", None)):
+        problems.append("select is missing or not callable")
+
+    try:
+        declared = record.provider.op_versions
+        pairs = (
+            declared.items()
+            if isinstance(declared, Mapping)
+            else ((name, ()) for name in declared)
+        )
+    except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+        return ProviderReport(
+            provider=provider,
+            installed=True,
+            api_version=record.api_version,
+            ops=MappingProxyType({}),
+            problems=(*problems, f"op_versions is unreadable: {error}"),
+        )
+
+    for name, versions in pairs:
+        routed = _routed_ops.get(name)
+        if routed is None:
+            known = ", ".join(sorted(_routed_ops)) or "none"
+            ops[name] = f"not an op AITER routes; routed ops are: {known}"
+            continue
+        wanted = frozenset(versions) or frozenset({routed.op.version})
+        accepted = {routed.op.version, *routed.superseded}
+        unusable = sorted(wanted - accepted)
+        if unusable:
+            ops[name] = (
+                f"declares version(s) {unusable} that this contract does not "
+                f"accept; it is at version {routed.op.version}"
+            )
+        elif wanted == {routed.op.version}:
+            ops[name] = "ok"
+        else:
+            deprecated = sorted(wanted & set(routed.superseded))
+            ops[name] = (
+                f"ok on superseded version(s) {deprecated}; "
+                f"the contract is at {routed.op.version}"
+            )
+
+    problems.extend(
+        f"{name}: {state}" for name, state in ops.items() if not state.startswith("ok")
+    )
+    return ProviderReport(
+        provider=provider,
+        installed=True,
+        api_version=record.api_version,
+        ops=MappingProxyType(ops),
+        problems=tuple(problems),
+    )
+
+
 def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     """Dry-run dispatch: gates, eligibility, selection -- but never ``run()``.
 
@@ -720,25 +1305,35 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     canonical_args, canonical_kwargs = routed.canonicalize(*args, **kwargs)
     readonly = MappingProxyType(canonical_kwargs)
     declines: dict[str, str] = dict(eligible.ineligible)
-    failure: tuple[str, str] | None = None
-    declined = False
+    # The same collection and the same choice dispatch makes. Repeating either
+    # of them here is how explain() starts reporting a route that dispatch no
+    # longer takes -- a diagnostic that disagrees with the thing it diagnoses
+    # is worse than none.
+    offers = _collect(operation, eligible.providers, canonical_args, readonly)
+    chosen, over = _choose(offers.candidates)
+    offered = {candidate.provider: candidate for candidate in offers.candidates}
     for record in eligible.providers:
-        candidate, rejection = _ask_provider(
-            record, operation, canonical_args, readonly
-        )
-        if rejection is not None:
-            declines[record.name] = rejection
-            failure = failure or (rejection, record.name)
+        if record.name in declines:
             continue
+        candidate = offered.get(record.name)
         if candidate is None:
-            declines[record.name] = "declined"
-            declined = True
-            continue
+            declines[record.name] = (
+                offers.failure[0]
+                if offers.failure and offers.failure[1] == record.name
+                else "declined"
+            )
+        elif chosen is None or candidate is not chosen:
+            # It offered and was not taken. Saying nothing about it would make
+            # explain() silent on the only question it exists to answer: a
+            # provider that is installed, enabled, offering, and not running
+            # looks identical to one that declined.
+            declines[record.name] = _not_taken(candidate)
+    if chosen is not None:
         return Explanation(
-            _selected(operation, candidate, config), MappingProxyType(declines)
+            _selected(operation, chosen, config, over), MappingProxyType(declines)
         )
 
-    reason, provider_name = _native_outcome(failure, declined)
+    reason, provider_name = _native_outcome(offers.failure, offers.declined)
     return _explained(operation, reason, config.source, declines, provider_name)
 
 
@@ -1022,6 +1617,7 @@ def _build_eligible(op: Op, config: _Config, *, warn: bool = True) -> _Eligibili
     providers: list[_ProviderRecord] = []
     ineligible: dict[str, str] = {}
     installed_enabled = False
+    excluded_here = False
     for name in config.enabled:
         records = by_name.get(name, ())
         if not records:
@@ -1029,7 +1625,13 @@ def _build_eligible(op: Op, config: _Config, *, warn: bool = True) -> _Eligibili
             continue
         installed_enabled = True
         for record in records:
-            if _supports(record, op, warn=warn):
+            # Kept distinct from "declares the wrong op version": one is a
+            # person turning this off, the other is the provider saying it
+            # cannot serve. explain() exists to tell them apart.
+            if (record.name, op.name) in config.excluded:
+                excluded_here = True
+                ineligible[record.name] = "excluded by configure()"
+            elif _supports(record, op, warn=warn):
                 providers.append(record)
             else:
                 ineligible[record.name] = _unsupported_reason(record, op)
@@ -1038,6 +1640,8 @@ def _build_eligible(op: Op, config: _Config, *, warn: bool = True) -> _Eligibili
         reason = "selected"
     elif not config.enabled:
         reason = "provider-not-enabled" if _providers() else "no-provider"
+    elif excluded_here:
+        reason = "provider-excluded"
     elif installed_enabled:
         reason = "provider-op-unsupported"
     else:
@@ -1213,7 +1817,18 @@ def _discover_providers() -> (
     for entry_point in entry_points:
         try:
             loaded = entry_point.load()
-            provider = loaded if hasattr(loaded, "select") else loaded()
+            # A class has a `select` attribute too -- the unbound function --
+            # so `hasattr` alone treats the class as its own instance and
+            # later calls `select(op, args, kwargs)` with `op` landing in
+            # `self`. The entry point in this interface's own documentation
+            # points at a class, so that is the common spelling, not an edge
+            # case. Instantiate anything that is a class; a zero-argument
+            # factory and a ready instance both still work.
+            provider = (
+                loaded()
+                if isinstance(loaded, type) or not hasattr(loaded, "select")
+                else loaded
+            )
             name = provider.name
             _ = provider.op_versions
             declared = _declared_api_versions(provider, name)
@@ -1313,6 +1928,7 @@ def _reset_for_testing() -> None:
 __all__ = [
     "API_VERSION",
     "ENTRY_POINT_GROUP",
+    "PROVIDER_FASTER",
     "SUPERSEDED_API_SPELLING",
     "SUPERSEDED_API_VERSIONS",
     "Decision",
@@ -1320,6 +1936,8 @@ __all__ = [
     "KernelCandidate",
     "KernelProvider",
     "Op",
+    "ProviderReport",
+    "check_report",
     "configure",
     "decision_counts",
     "explain",
@@ -1328,4 +1946,10 @@ __all__ = [
     "reload_config",
     "route",
     "status",
+    "validate",
 ]
+
+
+# Build the snapshot now, so no dispatch ever pays for it. See _config().
+with _config_lock:
+    _swap_config_locked()

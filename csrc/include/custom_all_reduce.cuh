@@ -306,6 +306,27 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_naive(RankD
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Meta buffer layout: [Signal][LL / LL128 scratch][tmp]. The LL kernels write
+// into peers' scratch without a barrier, while the 2-stage kernels have no
+// final barrier, so peers may still read their tmp when the next LL kernel
+// starts. The two regions must not overlap.
+constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
+constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
+// LL sub-region size: 2 banks * ngpus * slotCap * 16B, sized for kLLMaxRanks
+// so the LL128 sub-region can start after it at a fixed offset.
+constexpr size_t kLLPocRegionBytes =
+    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
+// Max message (bytes) the LL128 fast path serves; bounds its scratch. The
+// dispatch sends at most 896 KB (gfx942 TP2).
+constexpr size_t kLL128PocCapBytes = (size_t)1024 * 1024;
+// Per-rank LL128 slot stride in uint32 words, sized for kLL128PocCapBytes so
+// that consecutive calls of different sizes never overlap a peer's unread slots.
+constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
+// LL128 sub-region: 2 banks * ngpus * kLL128SlotStride words.
+constexpr size_t kLLScratchBytes =
+    kLLPocRegionBytes + (size_t)2 * kLLMaxRanks * kLL128SlotStride * sizeof(uint32_t);
+static_assert(kLLScratchBytes % 16 == 0, "tmp buffer must stay 16B aligned");
+
 template <typename P>
 #ifdef USE_ROCM
 DINLINE P* get_tmp_buf(Signal* sg)
@@ -314,7 +335,7 @@ DINLINE P* get_tmp_buf(Signal* sg)
 DINLINE P* get_tmp_buf(volatile Signal* sg)
 {
 #endif
-    return (P*)(((Signal*)sg) + 1);
+    return (P*)((char*)(((Signal*)sg) + 1) + kLLScratchBytes);
 }
 
 // HAS_RESIDUAL adds residual (identical on every rank) to the reduced value
@@ -865,6 +886,60 @@ __global__ void __launch_bounds__(512, 1)
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// allgather along the last dim fused with the residual adds that follow it:
+// result = T(T(gathered + b) [+ c]), the same double rounding as the unfused
+// add-then-add (sglang add3). b and c are [rows, ngpus * last_dim] like result.
+template <typename T, int ngpus, bool kHasC>
+__global__ void __launch_bounds__(512, 1) allgather_lastdim_add(RankData* _dp,
+                                                                RankSignals sg,
+                                                                Signal* self_sg,
+                                                                T* __restrict__ result,
+                                                                int rank,
+                                                                int size,
+                                                                int last_dim_size,
+                                                                const T* __restrict__ add_b,
+                                                                const T* __restrict__ add_c)
+{
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int tid                 = blockIdx.x * tnum_gpu + lane_id;
+    int stride              = gridDim.x * tnum_gpu;
+
+    last_dim_size /= pack_size;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    const P* bp = reinterpret_cast<const P*>(add_b);
+    const P* cp = reinterpret_cast<const P*>(add_c);
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int idx = tid; idx < size; idx += stride)
+    {
+        int y         = idx / last_dim_size;
+        int x         = idx % last_dim_size;
+        int write_idx = (ngpus * y + warp_id) * last_dim_size + x;
+        A acc         = upcast(ptrs[warp_id][idx]);
+        packed_assign_add<opus::fp32_t, pack_size>(acc, upcast(bp[write_idx]));
+        P out = downcast<P>(acc);
+        if constexpr(kHasC)
+        {
+            A acc2 = upcast(out);
+            packed_assign_add<opus::fp32_t, pack_size>(acc2, upcast(cp[write_idx]));
+            out = downcast<P>(acc2);
+        }
+        *(reinterpret_cast<P*>(&result[0]) + write_idx) = out;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
                                                             RankSignals sg,
@@ -913,33 +988,54 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
 // Each non-first-dim case has a vectorized kernel (pack 16B per thread) and a
 // naive fallback for shapes that cannot be vectorized along the inner dim.
 //
+// Block size of reduce_scatter_split_first_dim, timed on MI355X over 256 ... 1024.
+// TP8: 512 is the fastest. TP4: 512 is up to 10% slower at 7-14 MiB; 320 is
+// within 1% of 256 above that and the closest to the old kernel below. TP2:
+// within 2% across them.
+constexpr int rs_first_dim_threads(int ngpus) { return ngpus == 4 ? 320 : 512; }
+
 // reduce_scatter, scatter on first dim.
 // Note: `range` is the per-rank packed element count, i.e. total_elems / (ngpus * pack_size).
 // cond: total_elems % (ngpus * pack_size) == 0
+// One group of threads per peer loads a pack into LDS and group 0 sums, as in
+// stage 1 of cross_device_reduce_2stage: a thread keeps one remote load in
+// flight, not ngpus.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range)
 {
-    int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride              = blockDim.x * gridDim.x;
     constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = rs_first_dim_threads(ngpus) / ngpus;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int stride              = gridDim.x * tnum_gpu;
+    __shared__ P tmp_smem[tnum_gpu * ngpus];
+    // Keep the sum order independent of the reduce-scatter owner.
+    const P* src = (const P*)_dp->ptrs[warp_id] + rank * range;
     const P* ptrs[ngpus];
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        // Keep the sum order independent of the reduce-scatter owner.
-        ptrs[i] = (const P*)_dp->ptrs[i];
+        ptrs[i] = tmp_smem + i * tnum_gpu;
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    for(int idx = tid; idx < range; idx += stride)
+    for(int base = blockIdx.x * tnum_gpu; base < range; base += stride)
     {
-        int load_index  = rank * range + idx;
-        int store_index = idx;
-        *(reinterpret_cast<P*>(result) + store_index) =
-            packed_reduce<P, ngpus, A>(ptrs, load_index);
+        int idx       = base + lane_id;
+        bool in_range = idx < range;
+        if(in_range)
+        {
+            tmp_smem[threadIdx.x] = src[idx];
+        }
+        __syncthreads();
+        if(warp_id == 0 && in_range)
+        {
+            *(reinterpret_cast<P*>(result) + idx) = packed_reduce<P, ngpus, A>(ptrs, lane_id);
+        }
+        __syncthreads();
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -3662,23 +3758,11 @@ __global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
 //   * ar_ll_gfx9       — LL, 16B lines carrying 8B payload + epoch flags.
 //   * ar_ll128_unroll2 — LL128, 128B/16-lane lines, 15 payload words + 1 flag.
 // Both stage into a per-rank scratch that peers write into and the owner polls
-// (spinning on a per-epoch flag), then reduce in fp32. On this port the scratch
-// is NOT independently allocated: it reuses the meta/Signal buffer's post-Signal
-// region (the same region the 2-stage kernel uses as tmp), which is already
-// IPC-exchanged at construction. A peer's scratch base is therefore
-// (char*)sg_.signals[peer] + sizeof(Signal). LL and 2-stage never run on the
-// same message concurrently, and the per-epoch flag + double-buffered banks keep
-// scratch reuse safe across CUDA-graph replay.
-
-constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
-constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
-// LL sub-region size in the reused scratch: 2 banks * ngpus * slotCap * 16B.
-// Sized for the worst case (kLLMaxRanks) so the LL128 sub-region can start after
-// it at a fixed offset regardless of world size.
-constexpr size_t kLLPocRegionBytes =
-    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
-// Max message (bytes) the LL128 fast path serves; bounds its dynamic scratch.
-constexpr size_t kLL128PocCapBytes = (size_t)4 * 1024 * 1024;
+// (spinning on a per-epoch flag), then reduce in fp32. The scratch is the
+// meta/Signal buffer's kLLScratchBytes region between the Signal and the tmp
+// buffer, already IPC-exchanged at construction. A peer's scratch base is
+// therefore (char*)sg_.signals[peer] + sizeof(Signal). The per-epoch flag +
+// double-buffered banks keep scratch reuse safe across CUDA-graph replay.
 
 // 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
 union LLPackedMsg
@@ -3763,6 +3847,43 @@ DINLINE void ll_load_b128(
     o3  = u.w[3];
 }
 
+// d = d + a for one 8B payload (two 4B words), rounded to T per element so the
+// published value matches what a separate elementwise add would have produced.
+template <typename T>
+DINLINE void ll_add_payload(uint32_t& d0, uint32_t& d1, uint32_t a0, uint32_t a1)
+{
+    constexpr int LP = 8 / sizeof(T);
+    using PL         = typename opus::vector_t<T, LP>;
+    const uint32_t dw[2] = {d0, d1};
+    const uint32_t aw[2] = {a0, a1};
+    PL pd = *reinterpret_cast<const PL*>(dw);
+    PL pa = *reinterpret_cast<const PL*>(aw);
+#pragma unroll
+    for(int j = 0; j < LP; ++j)
+        pd[j] = downcast_s<T>(upcast_s(pd[j]) + upcast_s(pa[j]));
+    uint32_t rw[2];
+    __builtin_memcpy(rw, &pd, 8);
+    d0 = rw[0];
+    d1 = rw[1];
+}
+
+// out = a + b over 16B packs. Stages the summed input into the registered
+// buffer for all-reduce paths that read peer inputs over IPC.
+template <typename T>
+__global__ void __launch_bounds__(256) ar_add_inputs(
+    const T* __restrict__ a, const T* __restrict__ b, T* __restrict__ out, size_t nPacks)
+{
+    constexpr int N = 16 / sizeof(T);
+    using P         = opus::vector_t<T, N>;
+    for(size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < nPacks;
+        i += (size_t)gridDim.x * blockDim.x)
+    {
+        P va = reinterpret_cast<const P*>(a)[i];
+        packed_assign_add<T, N>(va, reinterpret_cast<const P*>(b)[i]);
+        reinterpret_cast<P*>(out)[i] = va;
+    }
+}
+
 // LL flat all-reduce. 1D grid over 8-byte packets.
 //
 // Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
@@ -3775,7 +3896,10 @@ DINLINE void ll_load_b128(
 // block_flags[blockIdx.x] that the kernel itself bumps. Scratch is
 // double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
 // lines, so no clearing is needed and it survives CUDA-graph replay.
-template <typename T, int ngpus, int BLOCK_SIZE = 256>
+//
+// HAS_ADDEND: reduce (sendbuff + addend) instead of sendbuff. The addend is only
+// read locally, so it needs no IPC registration.
+template <typename T, int ngpus, int BLOCK_SIZE = 256, bool HAS_ADDEND = false>
 __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
     T* __restrict__ recvbuff,
@@ -3783,7 +3907,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
     size_t nPk,          // number of 8-byte packets = bytes / 8
     int rank,
     uint32_t* __restrict__ block_flags, // device array[gridDim.x], persisted
-    size_t slotStridePk = kLLPocSlotCapPk) // per-rank slot capacity in packets
+    size_t slotStridePk = kLLPocSlotCapPk, // per-rank slot capacity in packets
+    const T* __restrict__ addend = nullptr)
 {
     constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
     using PL         = typename opus::vector_t<T, LP>;
@@ -3805,13 +3930,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
     const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
 
-    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
+    const uint32_t* in  = reinterpret_cast<const uint32_t*>(sendbuff);
+    const uint32_t* add = reinterpret_cast<const uint32_t*>(addend);
 
     // Phase 1: publish my payload into every peer's slot[rank].
     for(size_t pk = gtid; pk < nPk; pk += stride)
     {
-        const uint32_t d0 = in[2 * pk];
-        const uint32_t d1 = in[2 * pk + 1];
+        uint32_t d0 = in[2 * pk];
+        uint32_t d1 = in[2 * pk + 1];
+        if constexpr(HAS_ADDEND)
+            ll_add_payload<T>(d0, d1, add[2 * pk], add[2 * pk + 1]);
 #pragma unroll
         for(int r = 1; r < ngpus; ++r)
         {
@@ -3827,7 +3955,17 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
         reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
     for(size_t pk = gtid; pk < nPk; pk += stride)
     {
-        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
+        PL selfv;
+        if constexpr(HAS_ADDEND)
+        {
+            uint32_t sw[2] = {in[2 * pk], in[2 * pk + 1]};
+            ll_add_payload<T>(sw[0], sw[1], add[2 * pk], add[2 * pk + 1]);
+            selfv = *reinterpret_cast<const PL*>(sw);
+        }
+        else
+        {
+            selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
+        }
         AL acc;
 #pragma unroll
         for(int j = 0; j < LP; ++j)
@@ -3900,9 +4038,6 @@ constexpr int    kLL128LineElems = 16;
 constexpr int    kLL128DataElems = 15;
 constexpr int    kLL128FlagElem  = 15;
 constexpr int    kLL128Lanes     = 16;
-// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
-// consecutive calls of different sizes never overlap a peer's unread slots.
-constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
 
 struct LLLine128
 {
@@ -3999,20 +4134,36 @@ DINLINE void ll128_check_flag(uint32_t& flag0, uint32_t& flag1, uint32_t* src)
   flag1 = u.w[3];
 }
 
-template <typename T>
-__device__ void loadDataFromHBMToReg(
-    int group_index, int lane_index, int total_group, int last_group_pack_num, uint32_t flag,
-    const T* hbm_buffer, opus::vector_t<T, 16 / sizeof(T)> (&dst_reg)[2]
-)
+template <typename T, bool HAS_ADDEND>
+__device__ __forceinline__ opus::vector_t<T, 16 / sizeof(T)>
+ll128_load_pack(const T* hbm_buffer, const T* addend, int pack_index)
 {
   using P = opus::vector_t<T, 16 / sizeof(T)>;
+  P v = *(reinterpret_cast<const P*>(hbm_buffer) + pack_index);
+  if constexpr (HAS_ADDEND)
+  {
+    P a = *(reinterpret_cast<const P*>(addend) + pack_index);
+    packed_assign_add<T, 16 / sizeof(T)>(v, a);
+  }
+  return v;
+}
+
+template <typename T, bool HAS_ADDEND = false>
+__device__ void loadDataFromHBMToReg(
+    int group_index, int lane_index, int total_group, int last_group_pack_num, uint32_t flag,
+    const T* hbm_buffer, opus::vector_t<T, 16 / sizeof(T)> (&dst_reg)[2],
+    const T* addend = nullptr
+)
+{
   constexpr int pack_per_group = 15;
   if (group_index != total_group - 1)
   {
-    dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+    dst_reg[0] = ll128_load_pack<T, HAS_ADDEND>(
+        hbm_buffer, addend, group_index * pack_per_group + lane_index);
     if (lane_index < 7)
     {
-      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index + 8);
+      dst_reg[1] = ll128_load_pack<T, HAS_ADDEND>(
+          hbm_buffer, addend, group_index * pack_per_group + lane_index + 8);
     }
     else
     {
@@ -4027,7 +4178,8 @@ __device__ void loadDataFromHBMToReg(
   {
     if (lane_index < last_group_pack_num)
     {
-      dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+      dst_reg[0] = ll128_load_pack<T, HAS_ADDEND>(
+          hbm_buffer, addend, group_index * pack_per_group + lane_index);
     }
     else
     {
@@ -4040,7 +4192,8 @@ __device__ void loadDataFromHBMToReg(
 
     if (lane_index < last_group_pack_num - 8)
     {
-      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + 8 + lane_index);
+      dst_reg[1] = ll128_load_pack<T, HAS_ADDEND>(
+          hbm_buffer, addend, group_index * pack_per_group + 8 + lane_index);
     }
     else if (lane_index == 7)
     {
@@ -4075,11 +4228,12 @@ __device__ void loadDataFromHBMToReg(
 
 // LL128 unroll2 1-shot all-reduce. 2B dtype only (fp16 / bf16). 8-lane groups,
 // 15-pack lines. Internally resets the per-block epoch up to LL128_MAX_BLOCK_NUM.
-template <typename T, int ngpus, int block_size>
+// HAS_ADDEND: reduce (input + addend) instead of input; addend is read locally.
+template <typename T, int ngpus, int block_size, bool HAS_ADDEND = false>
 __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
     const T* __restrict__ input, T* __restrict__ output,
     T* const* __restrict__ peer_scratch, uint32_t* __restrict__ graph_safe_flag,
-    int self_rank, int size
+    int self_rank, int size, const T* __restrict__ addend = nullptr
 )
 {
   constexpr int pack_size = 16 / sizeof(T);
@@ -4105,7 +4259,8 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
   for (int idx = g_index; idx < total_group; idx += stride)
   {
     P inp_reg[2];
-    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+    loadDataFromHBMToReg<T, HAS_ADDEND>(
+        idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg, addend);
 #pragma unroll
     for (int i = 1; i < ngpus; ++i)
     {
@@ -4123,7 +4278,8 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
   for (int idx = g_index; idx < total_group; idx += stride)
   {
     P inp_reg[2];
-    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+    loadDataFromHBMToReg<T, HAS_ADDEND>(
+        idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg, addend);
     A reduce_rslt_f32[2];
 #pragma unroll
     for (int i = 0; i < pack_size; ++i)
@@ -4689,6 +4845,7 @@ class CustomAllreduce
     int rank_;
     int world_size_;
     bool full_nvlink_;
+    bool is_gfx950_ = false;
 
     // below are device pointers
     RankSignals sg_;
@@ -4703,7 +4860,7 @@ class CustomAllreduce
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char*> ipc_handles_;
 
-    // LL / LL128 fast-path staging (reuses the meta buffer's post-Signal region,
+    // LL / LL128 fast-path staging (the meta buffer's kLLScratchBytes region,
     // already IPC-exchanged via sg_). Device table of per-rank scratch bases,
     // computed in the constructor from sg_.signals[]; no second IPC exchange.
     //   [0, world_size_)              -> LL   scratch bases (signals[i]+sizeof(Signal))
@@ -4720,14 +4877,14 @@ class CustomAllreduce
     template <typename T>
     T* local_tmp_reduced_ptr() const
     {
-        return reinterpret_cast<T*>(self_sg_ + 1);
+        return reinterpret_cast<T*>(reinterpret_cast<char*>(self_sg_ + 1) + kLLScratchBytes);
     }
 
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
      *
-     * There's a total of sizeof(Signal) of prefix before the actual data,
-     * so meta + 1 points to actual temporary buffer.
+     * The Signal struct and the LL / LL128 scratch (kLLScratchBytes) precede
+     * the temporary buffer, see get_tmp_buf.
      *
      * note: this class does not own any device memory. Any required buffers
      * are passed in from the constructor
@@ -4761,6 +4918,11 @@ class CustomAllreduce
             }
             sg_.signals[i] = rank_sg;
         }
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        is_gfx950_ = std::string(dev_prop.gcnArchName).find("gfx950") != std::string::npos;
         init_ll_fast_path_();
     }
 
@@ -5121,17 +5283,16 @@ class CustomAllreduce
      */
 
     // -----------------------------------------------------------------------
-    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch reuses the
-    // meta buffer's post-Signal region (peer bases in d_ll_scratch_peers_, built
-    // at construction from sg_.signals[]); no separate alloc / IPC exchange. NOT
-    // wired into the size-based dispatch below yet — that lands in step 2 once
-    // the bench thresholds are in. The caller must keep the message within the
-    // LL / LL128 caps (kLLPocSlotCapPk / kLL128PocCapBytes) so the scratch fits
-    // the reused tmp region (2 * max_size).
+    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch is the
+    // meta buffer's kLLScratchBytes region (peer bases in d_ll_scratch_peers_,
+    // built at construction from sg_.signals[]); no separate alloc / IPC
+    // exchange. The caller must keep the message within the LL / LL128 caps
+    // (kLLPocSlotCapPk / kLL128PocCapBytes) so it fits that region.
     // -----------------------------------------------------------------------
     template <typename T>
     void allreduce_ll_poc(hipStream_t stream, const T* input, T* output,
-                          int numel, int threads_per_block = 256)
+                          int numel, int threads_per_block = 256,
+                          const T* addend = nullptr)
     {
         const size_t bytes = (size_t)numel * sizeof(T);
         if(bytes % 8 != 0)
@@ -5151,8 +5312,13 @@ class CustomAllreduce
         T* const* peers = reinterpret_cast<T* const*>(d_ll_scratch_peers_);
 
 #define LAUNCH_LL_POC(NGPUS, BS)                                             \
-    ar_ll_gfx9<T, NGPUS, BS><<<blocks, BS, 0, stream>>>(                     \
-        peers, output, input, nPk, rank_, d_ll_poc_block_flags_, slotCap)
+    if(addend)                                                               \
+        ar_ll_gfx9<T, NGPUS, BS, true><<<blocks, BS, 0, stream>>>(           \
+            peers, output, input, nPk, rank_, d_ll_poc_block_flags_, slotCap, \
+            addend);                                                         \
+    else                                                                     \
+        ar_ll_gfx9<T, NGPUS, BS><<<blocks, BS, 0, stream>>>(                 \
+            peers, output, input, nPk, rank_, d_ll_poc_block_flags_, slotCap)
 
 #define DISPATCH_LL_POC_BS(NGPUS)                                            \
     switch(threads_per_block)                                               \
@@ -5182,10 +5348,11 @@ class CustomAllreduce
 
     // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
     // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
-    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
+    // spans 2 * ngpus * kLL128SlotStride words of the LL scratch region.
     template <typename T>
     void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
-                                 int numel, int threads_per_block = 512)
+                                 int numel, int threads_per_block = 512,
+                                 const T* addend = nullptr)
     {
         static_assert(sizeof(T) == 2,
                       "allreduce_ll128_unroll2 only supports 2-byte dtypes");
@@ -5213,8 +5380,13 @@ class CustomAllreduce
             LL128_MAX_BLOCK_NUM, (totalGroup + groupsPerBlock - 1) / groupsPerBlock); \
         if(blocks < 1)                                                          \
             blocks = 1;                                                         \
-        ar_ll128_unroll2<T, NGPUS, BS><<<blocks, (BS), 0, stream>>>(            \
-            input, output, peers, d_ll128_unroll2_epoch_, rank_, numel);        \
+        if(addend)                                                              \
+            ar_ll128_unroll2<T, NGPUS, BS, true><<<blocks, (BS), 0, stream>>>(  \
+                input, output, peers, d_ll128_unroll2_epoch_, rank_, numel,     \
+                addend);                                                        \
+        else                                                                    \
+            ar_ll128_unroll2<T, NGPUS, BS><<<blocks, (BS), 0, stream>>>(        \
+                input, output, peers, d_ll128_unroll2_epoch_, rank_, numel);    \
     } while(0)
 
 #define DISPATCH_LL128_UNROLL2_BS(NGPUS)                                        \
@@ -5245,14 +5417,103 @@ class CustomAllreduce
 #undef LAUNCH_LL128_UNROLL2
     }
 
-    // 1-/2-stage crossover of the use_new kernels. Neither is set when the peers
-    // are not fully connected.
+    // LL / LL128 fast path of allreduce for 2-byte dtypes (use_new, output not
+    // broadcast). Sets the block size of the chosen kernel, both 0 for none.
+    // numel notation a*b mirrors the (tokens, hidden) bench shapes.
+    //
+    // gfx950 caps are measured against the 1-/2-stage kernels (bf16/fp16,
+    // TP2/4/8, registered and eager inputs). With an addend, LL / LL128 fuse
+    // the add while 2-stage needs a separate staging add, so they win to larger
+    // sizes. Unaligned sizes (bytes not divisible by world_size * 16) can only
+    // use 1-stage or the slower naive 2-stage kernel, so they get larger caps.
+    void select_ll_path(size_t nbytes, bool has_addend, int& ll_bs, int& ll128_bs) const
+    {
+        const size_t numel = nbytes / 2;
+        ll_bs              = 0;
+        ll128_bs           = 0;
+        if(is_gfx950_)
+        {
+            const bool aligned = nbytes % (world_size_ * 16) == 0;
+            size_t ll_cap_kb = 0, ll128_cap_kb = 0;
+            if(world_size_ == 2)
+            {
+                ll_cap_kb    = has_addend ? 80 : (aligned ? 64 : 72);
+                ll128_cap_kb = has_addend ? (aligned ? 208 : 384) : (aligned ? 0 : 96);
+            }
+            else if(world_size_ == 4)
+                ll_cap_kb = has_addend ? (aligned ? 64 : 112) : (aligned ? 40 : 56);
+            else if(world_size_ == 8)
+                ll_cap_kb = has_addend ? (aligned ? 56 : 96) : (aligned ? 32 : 48);
+            if(nbytes <= ll_cap_kb * 1024)
+                ll_bs = 256;
+            else if(nbytes <= ll128_cap_kb * 1024)
+                ll128_bs = numel <= 16 * 8192 ? 256 : 512;
+        }
+        else if(world_size_ == 8)
+        {
+            if(numel <= 4 * 8192)
+                ll_bs = 256;
+        }
+        else if(world_size_ == 4)
+        {
+            if(numel <= 4 * 7168)
+                ll_bs = 256;
+            else if(numel <= 4 * 8192)
+                ll128_bs = 256;
+        }
+        else if(world_size_ == 2)
+        {
+            if(numel <= 4 * 8192)
+                ll_bs = 256;
+            else if(numel <= 16 * 8192)
+                ll128_bs = 256;
+            else if(numel <= 64 * 7168)
+                ll128_bs = 512;
+        }
+    }
+
+    // 1-/2-stage crossover of the use_new kernels, shared by allreduce and
+    // allreduce_residual. Neither is set when the peers are not fully connected.
     void select_ar_stage(size_t bytes, bool& call_1stage, bool& call_2stage) const
     {
+        // gfx950 (bf16/fp16/fp32, TP2/4/8, with and without residual, broadcast
+        // and non-broadcast, 2KB to 16MB): 2-stage beats 1-stage at every
+        // aligned size. Unaligned sizes run the naive 2-stage kernel, which only
+        // wins from 104KB at TP4 and 256KB at TP8, and at every size at TP2.
+        if(is_gfx950_ &&
+           (world_size_ == 2 || ((world_size_ == 4 || world_size_ == 8) && full_nvlink_)))
+        {
+            size_t max_1stage_bytes = 0;
+            if(bytes % (world_size_ * 16) != 0)
+                max_1stage_bytes = world_size_ == 4 ? 104 * 1024 : world_size_ == 8 ? 256 * 1024 : 0;
+            // 2-stage needs at least one pack per rank, else it launches 0 blocks.
+            call_1stage = bytes < max_1stage_bytes || bytes / 16 < (size_t)world_size_;
+            call_2stage = !call_1stage;
+            return;
+        }
         call_1stage =
             world_size_ == 2 || (full_nvlink_ && ((world_size_ <= 4 && bytes < 160 * 1024) ||
                                                   (world_size_ <= 8 && bytes < 80 * 1024)));
         call_2stage = !call_1stage && full_nvlink_;
+    }
+
+    // Whether allreduce (use_new, no addend) runs a one-shot kernel: lamport
+    // one-shot, LL, LL128 or 1-stage. elem_size is sizeof(T).
+    bool runs_one_shot(size_t nbytes, int elem_size, bool is_broadcast_reg_outptr) const
+    {
+        const LamportKernel lamport_kernel = lamportDispatch(nbytes / elem_size, elem_size, true);
+        if(lamport_kernel != LamportKernel::none)
+            return lamport_kernel == LamportKernel::one_shot;
+        if(elem_size == 2 && !is_broadcast_reg_outptr)
+        {
+            int ll_bs, ll128_bs;
+            select_ll_path(nbytes, false, ll_bs, ll128_bs);
+            if(ll_bs || ll128_bs)
+                return true;
+        }
+        bool call_1stage, call_2stage;
+        select_ar_stage(nbytes, call_1stage, call_2stage);
+        return call_1stage;
     }
 
     // Write-mode switch, shared by allreduce and allreduce_residual.
@@ -5341,6 +5602,21 @@ class CustomAllreduce
         return elem_size == 2 && use_new ? lamportKernel(numel) : LamportKernel::none;
     }
 
+    // Whether, for a message lamport takes, the fused LL / LL128 add beats
+    // lamport on the staged sum. gfx950 (bf16/fp16, aligned and unaligned): at
+    // TP2 up to the fused caps of select_ll_path, at TP4 up to 48KB, at TP8 up
+    // to 24KB. Unmeasured elsewhere, so lamport, as for a separate add.
+    bool fused_add_beats_lamport(size_t nbytes) const
+    {
+        if(!is_gfx950_)
+            return false;
+        if(world_size_ != 2 && nbytes > (world_size_ == 4 ? 48 : 24) * 1024)
+            return false;
+        int ll_bs, ll128_bs;
+        select_ll_path(nbytes, true, ll_bs, ll128_bs);
+        return ll_bs || ll128_bs;
+    }
+
     // Runs one lamport kernel; LamportKernel::none does nothing.
     template <typename T>
     void runLamport(hipStream_t stream, const T* input, T* output, int64_t numel, LamportKernel kernel)
@@ -5354,12 +5630,25 @@ class CustomAllreduce
     }
 
     template <typename T>
+    void add_inputs(hipStream_t stream, const T* a, const T* b, T* out, int numel)
+    {
+        const size_t nPacks = (size_t)numel * sizeof(T) / 16;
+        const int blocks = (int)std::min<size_t>(1024, std::max<size_t>(1, (nPacks + 255) / 256));
+        ar_add_inputs<T><<<blocks, 256, 0, stream>>>(a, b, out, nPacks);
+    }
+
+    // addend != nullptr reduces (input + addend). LL / LL128 read the addend
+    // directly; every other path first stages the sum into addend_stage, which
+    // must be an IPC-registered buffer (the eager input buffer).
+    template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
                    T* output,
                    int size,
                    bool use_new                 = true,
                    bool is_broadcast_reg_outptr = false,
+                   const T* addend              = nullptr,
+                   T* addend_stage              = nullptr,
 #ifndef USE_ROCM
                    int threads     = 512,
                    int block_limit = 20){
@@ -5380,12 +5669,22 @@ class CustomAllreduce
     // Lamport one-shot / two-shot, ahead of every other path (see
     // lamportKernel). It reads only this rank's input, so the registered input,
     // the copy-in pool and an unregistered input all work, and it records no
-    // graph buffer.
+    // graph buffer. It has no addend input, so with an addend it reduces the
+    // staged sum, unless the fused LL / LL128 add below is faster.
+    auto stage_addend = [&] {
+        if(addend_stage == nullptr)
+            throw std::runtime_error("allreduce with addend requires a staging buffer");
+        add_inputs<T>(stream, input, addend, addend_stage, size);
+        input = addend_stage;
+    };
     if constexpr(sizeof(T) == 2)
     {
         const LamportKernel lamport_kernel = lamportDispatch(size, sizeof(T), use_new);
-        if(lamport_kernel != LamportKernel::none)
+        if(lamport_kernel != LamportKernel::none &&
+           (addend == nullptr || !fused_add_beats_lamport((size_t)size * sizeof(T))))
         {
+            if(addend != nullptr)
+                stage_addend();
             runLamport<T>(stream, input, output, size, lamport_kernel);
             return;
         }
@@ -5395,56 +5694,34 @@ class CustomAllreduce
     // LL / LL128 small-message fast path (gfx9). Routes small messages to the
     // ar_ll_gfx9 / ar_ll128_unroll2 kernels per measured thresholds; anything
     // larger falls through to the existing 1-/2-stage dispatch below. Staging
-    // scratch reuses the meta buffer's post-Signal region (see
-    // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
-    // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
-    // ~38 MiB at tp4); true for the default max_size (1 GiB).
+    // scratch is the meta buffer's kLLScratchBytes region (see
+    // allreduce_ll_poc / allreduce_ll128_unroll2).
     //
     // `size` here is still the element count (numel); it is divided down to
     // 16-byte packs only after this block. Thresholds were measured on bf16, so
     // the path is gated to 2-byte dtypes (if constexpr also keeps the LL128
-    // 2-byte static_assert out of the fp32 instantiation). numel notation a*b
-    // mirrors the (tokens, hidden) bench shapes.
+    // 2-byte static_assert out of the fp32 instantiation).
     if constexpr(sizeof(T) == 2)
     {
         if(use_new && !is_broadcast_reg_outptr)
         {
-            const int numel    = size;
-            int       ll_bs    = 0; // >0 -> LL    with this block size
-            int       ll128_bs = 0; // >0 -> LL128 with this block size
-            if(world_size_ == 8)
-            {
-                if(numel <= 4 * 8192)
-                    ll_bs = 256;
-            }
-            else if(world_size_ == 4)
-            {
-                if(numel <= 4 * 7168)
-                    ll_bs = 256;
-                else if(numel <= 4 * 8192)
-                    ll128_bs = 256;
-            }
-            else if(world_size_ == 2)
-            {
-                if(numel <= 4 * 8192)
-                    ll_bs = 256;
-                else if(numel <= 16 * 8192)
-                    ll128_bs = 256;
-                else if(numel <= 64 * 7168)
-                    ll128_bs = 512;
-            }
+            int ll_bs, ll128_bs;
+            select_ll_path((size_t)size * sizeof(T), addend != nullptr, ll_bs, ll128_bs);
             if(ll_bs)
             {
-                allreduce_ll_poc<T>(stream, input, output, numel, ll_bs);
+                allreduce_ll_poc<T>(stream, input, output, size, ll_bs, addend);
                 return;
             }
             if(ll128_bs)
             {
-                allreduce_ll128_unroll2<T>(stream, input, output, numel, ll128_bs);
+                allreduce_ll128_unroll2<T>(stream, input, output, size, ll128_bs, addend);
                 return;
             }
         }
     }
+
+    if(addend != nullptr)
+        stage_addend();
 
     RankData* input_ptrs  = get_buffer_RD(stream, input);
     RankData* output_ptrs = nullptr;
@@ -5624,13 +5901,10 @@ name<T, ngpus, bcast, __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
 
     // The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and, for
     // 2-stage, the same pack count on every rank; the rest go naive. TP6 does
-    // not instantiate the warp-split kernels. TP2 is always 1-stage
-    // (select_ar_stage), so it instantiates only that kernel. Write mode is TP8 only.
+    // not instantiate the warp-split kernels. Write mode is TP8 only.
 #define RESIDUAL_CASE(ngpus)                                                   \
 case ngpus: {                                                                  \
-    if constexpr(ngpus == 2)                                                   \
-        KL_RES(ngpus, cross_device_reduce_1stage, false, true);                \
-    else if constexpr(ngpus == 6)                                              \
+    if constexpr(ngpus == 6)                                                   \
         KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \
     else if(call_2stage && bytes % (ngpus * 16) != 0)                          \
         KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \
@@ -5691,8 +5965,11 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
     case ReduceScatterSplitDim::kFirst: {
         // Python guarantees k % (ngpus * pack_size) == 0 here.
         int range = k / (world_size_ * pack_size);
-        dim3 block(512);
-        dim3 grid(std::min(kGridCap, (range + 511) / 512));
+        // each block reduces threads / world_size packs per round
+        int threads = rs_first_dim_threads(world_size_);
+        int lanes   = threads / world_size_;
+        dim3 block(threads);
+        dim3 grid(std::min(kGridCap, (range + lanes - 1) / lanes));
         switch(world_size_)
         {
         case 8:
@@ -5912,6 +6189,43 @@ void dispatchAllGatherV(hipStream_t stream,
 // bf16, hidden 7168: 1.08-1.10x at <= 80 rows, 0.94x at 88, 0.79x at 8192.
 // TP2/TP8 use the TP4 value until measured.
 static constexpr int kFusedArRms2StageMaxRows = kMaxBlocks;
+
+template <typename T>
+void dispatchAllGatherLastDimAdd(hipStream_t stream,
+                                 T* input,
+                                 T* output,
+                                 int size,
+                                 int last_dim_size,
+                                 const T* add_b,
+                                 const T* add_c)
+{
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d         = 16 / sizeof(T);
+    if(size % d != 0 || last_dim_size % d != 0)
+        throw std::runtime_error("allgather_lastdim_add needs 16-byte aligned rows");
+    size /= d;
+    dim3 block(512);
+    int tnum_per_block = 512 / world_size_;
+    int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(std::min(block_num, 80));
+#define AG_ADD_CASE(ngpus)                                                                  \
+    case ngpus:                                                                            \
+        if(add_c != nullptr)                                                               \
+            allgather_lastdim_add<T, ngpus, true><<<grid, block, 0, stream>>>(             \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        else                                                                               \
+            allgather_lastdim_add<T, ngpus, false><<<grid, block, 0, stream>>>(            \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        break;
+    switch(world_size_)
+    {
+        AG_ADD_CASE(8)
+        AG_ADD_CASE(4)
+        AG_ADD_CASE(2)
+    default: throw std::runtime_error("allgather_lastdim_add world_size error");
+    }
+#undef AG_ADD_CASE
+}
 
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,

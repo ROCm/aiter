@@ -16,15 +16,17 @@ in, so a kernel, its name parser or its launcher can change without an AOT
 change.
 
 A row tuned at M also serves the M between the previous tuned M of its shape
-and M, and some compile-time parameters follow the actual M (a4w4's cluster_m
-and bounded-M variants, mxfp8's split-K and cluster fallbacks), so every row
-is replayed at its M and at the smaller M it serves. On gfx1250 those M are
-identified without compiling at the sizes where the runtime's choice can
-change (:func:`scan_sizes`: tile-count edges, padded-M lookup pieces, the
-heuristics' size classes), and one M per set of kernels they request is
-replayed (``SCAN_ARCHS``, ``replay.py``): bisecting between the two ends
-would not do there, as cluster_m is the largest that divides M's tile count,
-so the kernels change and change back as M grows. Rows of other archs
+and M, and the kernels the runtime requests follow the actual M (the row the
+padded-M lookup finds, the untuned-shape heuristics' size classes, and on
+gfx1250 whether a cluster_m divides M's tile count: a compute kernel is one
+binary for every cluster_m, but a launch that fits to one workgroup runs the
+plain kernel), so every row is replayed at its M and at the smaller M it
+serves. On gfx1250 those M are identified without compiling at the sizes
+where the runtime's choice can change (:func:`scan_sizes`: tile-count edges,
+padded-M lookup pieces, the heuristics' size classes), and one M per set of
+kernels they request is replayed (``SCAN_ARCHS``, ``replay.py``): bisecting
+between the two ends would not do there, as the choices are not monotonic in
+M. Rows of other archs
 are replayed at the smallest M they serve and bisected between the two ends
 where they request different kernels. Either way that also reaches the FlyDSL
 heuristic kernels the runtime falls back to below a shape's smallest tuned M.
@@ -59,9 +61,9 @@ from aiter.jit.core import AITER_CONFIGS
 
 LABEL = "GEMM"
 AOT_ARCH_DEFAULT = "gfx950"
-# Archs whose GEMMs pick kernels non-monotonically in M: cluster_m is fitted to
-# the number of M tiles, and a ragged last tile is a variant of its own. Their
-# rows are scanned at the sizes scan_sizes() names.
+# Archs whose GEMMs pick kernels non-monotonically in M: the heuristics follow
+# M's tile counts, and a cluster launch that fits to one workgroup runs the
+# plain kernel. Their rows are scanned at the sizes scan_sizes() names.
 SCAN_ARCHS = ("gfx1250",)
 # The runtime's own limits at an M inside a row's range (``replay.py``): for
 # some untuned M, gemm_a8w8_blockscale_abpreshuffle has no FlyDSL kernel that
@@ -124,9 +126,10 @@ def _a8w8_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
+    q_dtype = dtypes.i8 if job["q_dtype_w"] == "torch.int8" else dtypes.fp8
     gemm_a8w8_bpreshuffle(
-        _empty(m, k, dtype=dtypes.fp8),
-        _empty(n, k, dtype=dtypes.fp8),
+        _empty(m, k, dtype=q_dtype),
+        _empty(n, k, dtype=q_dtype),
         _empty(m, 1, dtype=dtypes.fp32),
         _empty(n, 1, dtype=dtypes.fp32),
         dtype=_out_dtype(job["kernel_name"]),
@@ -155,12 +158,15 @@ def _a8w8_blockscale_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
+    dtype = _dtype(job["outdtype"])
+    # Passing out= skips the routed op, whose fake would run under the dry run.
     gemm_a8w8_blockscale_bpreshuffle(
         _empty(m, k, dtype=dtypes.fp8),
         _empty(n, k, dtype=dtypes.fp8),
         _empty(m, k // 128, dtype=dtypes.fp32),
         _empty(-(-n // 128), k // 128, dtype=dtypes.fp32),
-        dtype=_dtype(job["outdtype"]),
+        dtype=dtype,
+        out=_empty(m, n, dtype=dtype),
     )
 
 
@@ -211,6 +217,7 @@ def _a8w8_blockscale_mxscale_bpreshuffle(job: dict) -> None:
         _empty(m, k // x_block, dtype=dtypes.fp8_e8m0),
         _empty(-(-n // rows), k // cols, dtype=dtypes.fp8_e8m0),
         dtype=dtypes.bf16,
+        out=_empty(m, n, dtype=dtypes.bf16),  # skips the routed op, as above
     )
 
 
