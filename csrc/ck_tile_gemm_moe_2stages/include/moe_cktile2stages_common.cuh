@@ -146,6 +146,21 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 
     using BaseGemmPipeline = ck_tile::BaseFlatmmPipelineAGmemBGmemCRegV1<GemmPipelineProblem>;
 
+    // kPadK is false and the kernel's SplitKBatchOffset rounds a split only to
+    // the warp K, so each split must be whole K tiles. Otherwise its last tile
+    // reads the next split's K range, the next row of A and the next expert's
+    // weights, or faults past the end of a buffer.
+    if constexpr(moe_kind != ck_tile::MoeFlatmmKind::kFFN_gemm2)
+    {
+        TORCH_CHECK(args.k_batch >= 1 && args.K % (args.k_batch * FlatmmConfig::K_Tile) == 0,
+                    "CK-Tile MoE gemm1: K=",
+                    args.K,
+                    " must be a multiple of k_batch * KPerBlock = ",
+                    args.k_batch,
+                    " * ",
+                    FlatmmConfig::K_Tile);
+    }
+
     const ck_tile::index_t k_grain     = args.k_batch * FlatmmConfig::K_Tile;
     const ck_tile::index_t K_split     = (args.K + k_grain - 1) / k_grain * FlatmmConfig::K_Tile;
     const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);

@@ -11,72 +11,12 @@ which exports a POSIX fd that can be passed across processes via Unix sockets.
 
 import array
 import ctypes
-import functools
-import logging
 import os
 import socket
 import struct
 import threading
 
-logger = logging.getLogger(__name__)
-
-
-def load_hip_runtime() -> ctypes.CDLL:
-    """Load the HIP runtime shared library robustly.
-
-    Split rocm-sdk pip layouts (e.g. `_rocm_sdk_core/lib`) ship only the
-    versioned soname `libamdhip64.so.N` on the runtime path; the unversioned
-    `libamdhip64.so` symlink lives in the -devel package which need not be on
-    LD_LIBRARY_PATH at runtime.
-
-    If a HIP runtime is already mapped (torch's), bind to that copy. Otherwise
-    try the plain name, then the versioned sonames.
-
-    When -devel is on LD_LIBRARY_PATH, the plain name maps a second runtime,
-    and other ctypes HIP users that pick the copy from /proc/self/maps (e.g.
-    SGLang's vattn_asm) can bind the wrong one: their launches on torch
-    streams fail with hipErrorContextIsDestroyed.
-    """
-    try:
-        with open("/proc/self/maps", "rb") as f:
-            maps = [os.fsdecode(line) for line in f]
-    except OSError:
-        maps = []
-    mapped_err = None
-    for line in maps:
-        # The kernel escapes only "\n" in maps paths, as "\012".
-        path = line[line.find("/") :].rstrip("\n").removesuffix(" (deleted)")
-        path = path.replace("\\012", "\n")
-        if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
-            try:
-                return ctypes.CDLL(path)
-            except OSError as e:
-                mapped_err = e
-    if mapped_err is not None:
-        logger.warning(
-            "Could not load the mapped HIP runtime (%s). The soname search can "
-            "map a second runtime.",
-            mapped_err,
-        )
-    candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
-    last_err = None
-    for name in candidates:
-        try:
-            return ctypes.CDLL(name)
-        except OSError as e:
-            last_err = e
-    raise OSError(
-        f"Could not load the HIP runtime; tried {candidates}. "
-        f"Last error: {last_err}"
-    )
-
-
-@functools.cache
-def _hip() -> ctypes.CDLL:
-    # Not at import: a module imported before torch maps its HIP runtime would
-    # find nothing in /proc/self/maps and map a second runtime by name.
-    return load_hip_runtime()
-
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 
 # ---- HIP VMM ctypes structs ----
 
@@ -134,7 +74,7 @@ def _get_granularity(device_id: int) -> int:
     prop = _make_prop(device_id)
     gran = ctypes.c_size_t()
     _check(
-        _hip().hipMemGetAllocationGranularity(
+        load_hip_runtime().hipMemGetAllocationGranularity(
             ctypes.byref(gran), ctypes.byref(prop), _RECOMMENDED
         ),
         "hipMemGetAllocationGranularity",
@@ -161,7 +101,7 @@ class VMMBuffer:
         prop = _make_prop(device_id)
         self._phys_handle = ctypes.c_void_p()
         _check(
-            _hip().hipMemCreate(
+            load_hip_runtime().hipMemCreate(
                 ctypes.byref(self._phys_handle),
                 self._alloc_size,
                 ctypes.byref(prop),
@@ -172,7 +112,7 @@ class VMMBuffer:
 
         self._va = ctypes.c_void_p()
         _check(
-            _hip().hipMemAddressReserve(
+            load_hip_runtime().hipMemAddressReserve(
                 ctypes.byref(self._va),
                 self._alloc_size,
                 self._gran,
@@ -183,7 +123,9 @@ class VMMBuffer:
         )
 
         _check(
-            _hip().hipMemMap(self._va, self._alloc_size, 0, self._phys_handle, 0),
+            load_hip_runtime().hipMemMap(
+                self._va, self._alloc_size, 0, self._phys_handle, 0
+            ),
             "hipMemMap",
         )
 
@@ -193,7 +135,7 @@ class VMMBuffer:
         for dev in device_ids:
             desc = _hipMemAccessDesc(_DEVICE, dev, _READ_WRITE)
             _check(
-                _hip().hipMemSetAccess(
+                load_hip_runtime().hipMemSetAccess(
                     self._va, self._alloc_size, ctypes.byref(desc), 1
                 ),
                 f"hipMemSetAccess dev={dev}",
@@ -210,7 +152,7 @@ class VMMBuffer:
     def export_fd(self) -> int:
         fd = ctypes.c_int()
         _check(
-            _hip().hipMemExportToShareableHandle(
+            load_hip_runtime().hipMemExportToShareableHandle(
                 ctypes.byref(fd), self._phys_handle, _POSIX_FD, 0
             ),
             "hipMemExportToShareableHandle",
@@ -233,7 +175,7 @@ class VMMBuffer:
 
         obj._phys_handle = ctypes.c_void_p()
         _check(
-            _hip().hipMemImportFromShareableHandle(
+            load_hip_runtime().hipMemImportFromShareableHandle(
                 ctypes.byref(obj._phys_handle), ctypes.c_void_p(fd), _POSIX_FD
             ),
             "hipMemImportFromShareableHandle",
@@ -241,7 +183,7 @@ class VMMBuffer:
 
         obj._va = ctypes.c_void_p()
         _check(
-            _hip().hipMemAddressReserve(
+            load_hip_runtime().hipMemAddressReserve(
                 ctypes.byref(obj._va),
                 alloc_size,
                 obj._gran,
@@ -252,7 +194,7 @@ class VMMBuffer:
         )
 
         _check(
-            _hip().hipMemMap(obj._va, alloc_size, 0, obj._phys_handle, 0),
+            load_hip_runtime().hipMemMap(obj._va, alloc_size, 0, obj._phys_handle, 0),
             "hipMemMap (import)",
         )
 
@@ -261,11 +203,11 @@ class VMMBuffer:
 
     def close(self):
         if hasattr(self, "_va") and self._va.value:
-            _hip().hipMemUnmap(self._va, self._alloc_size)
-            _hip().hipMemAddressFree(self._va, self._alloc_size)
+            load_hip_runtime().hipMemUnmap(self._va, self._alloc_size)
+            load_hip_runtime().hipMemAddressFree(self._va, self._alloc_size)
             self._va = ctypes.c_void_p(0)
         if hasattr(self, "_phys_handle") and self._phys_handle.value:
-            _hip().hipMemRelease(self._phys_handle)
+            load_hip_runtime().hipMemRelease(self._phys_handle)
             self._phys_handle = ctypes.c_void_p(0)
 
     def __del__(self):
