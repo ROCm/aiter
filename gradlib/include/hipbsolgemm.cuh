@@ -95,13 +95,15 @@ int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
                                   const aiter_tensor_t& result,
                                   int64_t group_size,
                                   bool has_zp,
-                                  int64_t int4_encoding);
+                                  int64_t int4_encoding,
+                                  bool has_bias);
 
-void hipb_w4a16_mm(const aiter_tensor_t& x,
+bool hipb_w4a16_mm(const aiter_tensor_t& x,
                    const aiter_tensor_t& w_q,
                    const aiter_tensor_t& scale,
                    aiter_tensor_t& result,
                    std::optional<aiter_tensor_t> workspace,
+                   std::optional<aiter_tensor_t> bias,
                    int64_t group_size,
                    bool has_zp,
                    int64_t int4_encoding);
