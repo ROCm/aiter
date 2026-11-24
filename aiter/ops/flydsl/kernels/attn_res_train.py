@@ -110,6 +110,36 @@ def _pin(values):
     )
 
 
+def _fma(a, b, c):
+    """``a * b + c`` on 8-lane fp32 vectors, scalars broadcast.
+
+    FlyDSL emits ``*`` and ``+`` without contraction, so ``c + a * b`` costs a
+    V_PK_MUL_F32 and a V_PK_ADD_F32 where this is one V_PK_FMA_F32.
+    """
+
+    def lanes(x):
+        return x if isinstance(x, fx.Vector) else fx.full(_VEC, x, fx.Float32)
+
+    return fmath.fma(lanes(a), lanes(b), lanes(c))
+
+
+def _lane_sums(s_part, base, n_values, n_waves, lane):
+    """The block totals of ``n_values`` wave partials laid out ``[value][wave]``.
+
+    Lane ``i`` adds up value ``i`` and V_READLANE_B32 hands every total to SGPRs,
+    so a wave issues ``n_waves`` LDS reads instead of ``n_values * n_waves``.
+    """
+    mine = (lane < n_values).select(lane, fx.Int32(0))
+    total = fx.memref_load(s_part, base + mine * n_waves)
+    for w in range_constexpr(1, n_waves):
+        total = total + fx.memref_load(s_part, base + mine * n_waves + w)
+    bits = total.bitcast(fx.Int32)
+    return [
+        fx.Int32(fx.rocdl.readlane(T.i32, bits, fx.Int32(i))).bitcast(fx.Float32)
+        for i in range_constexpr(n_values)
+    ]
+
+
 def _uniform(value):
     """A wave-uniform fp32 value moved to an SGPR, so it costs no VGPR."""
     bits = value.bitcast(fx.Int32)
@@ -191,10 +221,11 @@ def _row_helpers(tid, threads, tiles, fm):
         fx.copy(f32x1_atom, reg, fx.slice(div, (None, index)))
 
     def dot(a, b):
-        total = (a[0] * b[0]).reduce(ReductionOp.ADD, fastmath=fm)
+        # Accumulate lane-wise across tiles, then reduce the 8 lanes once.
+        acc = a[0] * b[0]
         for tile in range_constexpr(1, tiles):
-            total = total + (a[tile] * b[tile]).reduce(ReductionOp.ADD, fastmath=fm)
-        return total
+            acc = _fma(a[tile], b[tile], acc)
+        return acc.reduce(ReductionOp.ADD, fastmath=fm)
 
     return load_bf16_nt, load_weight, store_bf16_nt, store_f32, store_scalar, dot
 
@@ -333,6 +364,8 @@ def build_attn_res_fwd(
                 for i in range_constexpr(len(totals)):
                     fx.memref_store(totals[i], s_part, base + i * n_waves + wave)
             fx.gpu.barrier()
+            if const_expr(len(totals) > 2):
+                return _lane_sums(s_part, base, len(totals), n_waves, lane)
             sums = []
             for i in range_constexpr(len(totals)):
                 total = fx.memref_load(s_part, base + i * n_waves)
@@ -408,7 +441,7 @@ def build_attn_res_fwd(
                 if const_expr(src == 0):
                     acc = [vals[t] * p for t in range_constexpr(tiles)]
                 else:
-                    acc = [acc[t] + vals[t] * p for t in range_constexpr(tiles)]
+                    acc = [_fma(vals[t], p, acc[t]) for t in range_constexpr(tiles)]
                 _pin(acc)
                 # This thread is done with its part of the slot: refill it.
                 if next_token < num_tokens:
@@ -595,6 +628,8 @@ def build_attn_res_bwd(
                 for i in range_constexpr(len(totals)):
                     fx.memref_store(totals[i], s_part, base + i * n_waves + wave)
             fx.gpu.barrier()
+            if const_expr(len(totals) > 2):
+                return _lane_sums(s_part, base, len(totals), n_waves, lane)
             sums = []
             for i in range_constexpr(len(totals)):
                 total = fx.memref_load(s_part, base + i * n_waves)
@@ -679,20 +714,20 @@ def build_attn_res_bwd(
                     if const_expr(src == 0):
                         out = [vals[t] * p for t in range_constexpr(tiles)]
                     else:
-                        out = [out[t] + vals[t] * p for t in range_constexpr(tiles)]
+                        out = [_fma(vals[t], p, out[t]) for t in range_constexpr(tiles)]
                     _pin(out)
                 # Output RMSNorm backward and delta = <g, o>, in one reduction:
                 # with xhat = o * r_o, <xhat, w_o dy> is r_o * <w_o dy, o>.
                 out_r = _load_uniform(out_rstd_buf, token)
                 for t in range_constexpr(tiles):
-                    store_dwo(t, load_dwo(t) + out[t] * (dy_vals[t] * out_r))
+                    store_dwo(t, _fma(out[t], dy_vals[t] * out_r, load_dwo(t)))
                 wdy = [w_out[t] * dy_vals[t] for t in range_constexpr(tiles)]
                 b, c = block_sum([dot(wdy, out), dot(out, out)], 0)
                 c1 = out_r * b * inv_h
                 delta = out_r * b - out_r * out_r * c1 * c
                 xhat_coef = out_r * c1
                 g = [
-                    (wdy[t] - out[t] * xhat_coef) * out_r
+                    _fma(out[t], -xhat_coef, wdy[t]) * out_r
                     for t in range_constexpr(tiles)
                 ]
                 _pin(g)
@@ -733,11 +768,12 @@ def build_attn_res_bwd(
                     key_coef = dz * r
                     key_shift = r * z * inv_h
                     dv = [
-                        g[t] * p + (qw_vals[t] - vals[t] * key_shift) * key_coef
+                        _fma(_fma(vals[t], -key_shift, qw_vals[t]), key_coef, g[t] * p)
                         for t in range_constexpr(tiles)
                     ]
                     dqw_acc = [
-                        dqw_acc[t] + vals[t] * key_coef for t in range_constexpr(tiles)
+                        _fma(vals[t], key_coef, dqw_acc[t])
+                        for t in range_constexpr(tiles)
                     ]
                     _pin(dqw_acc)
                 if const_expr(src < num_bank):
