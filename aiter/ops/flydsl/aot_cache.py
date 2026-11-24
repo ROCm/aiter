@@ -1256,7 +1256,19 @@ class FlyDSLAotCache:
             stem = sidecar.with_suffix("")
             try:
                 meta = json.loads(sidecar.read_text())
-                current = _entry_current(meta, args)
+                current = (
+                    meta["fingerprint"] == out_dir.parent.name
+                    and meta["key"] == digest
+                    and _entry_current(meta, args)
+                )
+                # A valid foreign object can load successfully. Check its
+                # contents against this key's sidecar before handing it to
+                # FlyDSL, including after a cache copy or interrupted repair.
+                if current:
+                    current = (
+                        hashlib.sha256(stem.with_suffix(".o").read_bytes()).hexdigest()
+                        == meta["object_sha256"]
+                    )
             except (OSError, ValueError, KeyError):
                 continue
             if current and stem.with_suffix(".o").exists():
@@ -1296,6 +1308,9 @@ class FlyDSLAotCache:
             # compile read it just now, whenever it was written.
             sources = {_portable(f): _file_digest(f) for f in sorted(files | libs)}
             meta = {
+                "fingerprint": out_dir.parent.name,
+                "key": digest,
+                "object_sha256": hashlib.sha256(tmp_obj.read_bytes()).hexdigest(),
                 "sources": sources,
                 "env": _entry_env(files, read, calls, called),
                 "baked": _baked_args(exe, args),

@@ -312,21 +312,21 @@ def launch_pa_decode_ps_reduce(
         ):
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
-    reduce_options = dict(
-        architecture=arch,
-        max_context_partition_num=partitions,
-        head_size=head_size,
-        output_dtype_str=get_dtype_str(output.dtype),
-        logits_dtype_str=get_dtype_str(logits.dtype),
-        sink_dtype_str=get_dtype_str(
+    reduce_options = {
+        "architecture": arch,
+        "max_context_partition_num": partitions,
+        "head_size": head_size,
+        "output_dtype_str": get_dtype_str(output.dtype),
+        "logits_dtype_str": get_dtype_str(logits.dtype),
+        "sink_dtype_str": get_dtype_str(
             output.dtype if sink_token is None else sink_token.dtype
         ),
-        use_sinks=sink_token is not None,
-        query_group_size=query_group_size,
-        pairs=pairs,
-        parallel_groups=groups,
-        num_xcds=num_xcds,
-    )
+        "use_sinks": sink_token is not None,
+        "query_group_size": query_group_size,
+        "pairs": pairs,
+        "parallel_groups": groups,
+        "num_xcds": num_xcds,
+    }
     launch = (
         _gfx1250_ps_reduce_launcher.lazy(**reduce_options)
         if arch in ("gfx1250", "gfx1250-strict")

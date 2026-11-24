@@ -297,6 +297,14 @@ instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
+Each sidecar also records its target/toolchain directory fingerprint, disk key
+and the SHA-256 of its exported object. Before loading, the cache checks all
+three against the requested entry. A foreign
+object copied over a valid entry, a pair renamed under another key, or an old
+sidecar without these fields is a cache miss and is rebuilt. This check runs
+on disk resolution, not on the in-memory dispatch path. Existing caches made
+before these fields were added require a one-time rebuild.
+
 A process runs the code it imported, so a source edited after it started
 (`git checkout` during a test run) no longer matches what it would trace. A
 build that records such a file is not written: that key takes the JIT path
@@ -618,6 +626,14 @@ gives the same results on both paths for row- and column-major tensors.
 | `pa_decode_tile_gfx1250` | `kernels/pa_decode_kernel.compile_gfx1250_pa_decode` | the fields of `Gfx1250Traits` |
 | `pa_decode_ps_reduce_gfx1250` | `pa_decode.launch_pa_decode_ps_reduce` | `compile_pa_decode_ps_reduce`'s arguments |
 
+This is not every gfx1250 GEMM. The batched A8W4 wrapper
+(`batched_gemm_mxfp4.py`) and grouped A8W4/A4W4 MoE GEMMs
+(`grouped_gemm_mxfp4.py`, `grouped_moe_gfx1250.py`) still use JIT launchers.
+ASM and Triton selections do not use this FlyDSL cache. Even for a converted
+wrapper, only replayed specializations are prebuilt: an unseen specialization
+builds its entry on the first call. Mode `0` explicitly selects JIT, and an
+unsupported export can fall back to JIT as described in §1.
+
 Most gfx1250 kernel launchers are module-level `@flyc.jit` functions that take
 their constexprs as launch arguments. Their factory takes no argument and only
 imports the kernel module; the launch passes the constexprs in
@@ -651,9 +667,35 @@ Validated compile-only on gfx942 (FlyDSL 0.5.3), without gfx1250 hardware:
 - `op_tests/test_flydsl_pa_decode.py` on gfx942, whose kernels share the
   edited files: 414 passed, 128 skipped.
 
-Runtime on gfx1250 hardware is still to be checked: a bitwise comparison of
-each op against `AITER_FLYDSL_AOT_CACHE=0`, and its op test run twice on one
-cache directory.
+Hardware validation on 2026-11-24 used gfx1250 (256 CUs), FlyDSL 0.5.3 and
+Torch 2.11.0+rocm10.1.0a20260811-bkc.20260820:
+
+- 36 representative cases across GEMM, FMHA, MLA, gather, PA decode and
+  FP8/A4W4 GEMM ran in six fresh processes: build, hit, verify, JIT, hit, JIT.
+  After the PS64 fix below, first and steady outputs matched bitwise across
+  modes, and the existing reference checks passed. Every hit and verify round
+  built zero entries. This is sampled coverage, not every supported shape.
+- Full tuned GEMM replay produced 721 objects. Fresh-process hit and verify
+  preserved all object/sidecar hashes and mtimes. Seventeen tuned rows were
+  unreached because they selected ASIC-gated ASM or Triton paths; four interior
+  sizes had no valid configuration. Script-reported build/hit/verify times
+  were 84.6/47.5/73.0 seconds; these include replay work, not just kernel load.
+- CPU-preloaded A4W4 general split-1/split-2 and compute entries were reused on
+  hardware without rebuilding. Their first-dispatch wall times on a hit were
+  1.86/1.49/1.67 ms, versus steady GPU latencies of 4.69/5.35/6.07 us.
+- Native `run_perftest` comparisons used 101 iterations and two warmups.
+  Interleaved FMHA graph repeats differed by less than 1% between AOT and JIT
+  for three representative cases. Eager host dispatch retained about
+  3.5–6 us extra cost. Compile/load wall time and steady GPU time must be
+  reported separately.
+
+Validation exposed two pre-existing issues: dry-run storage metadata addresses
+could falsely overlap for large fake tensors, and the PS64 paired-page loop
+unconditionally consumed a pending PV on its first iteration. Disjoint virtual
+storage ranges fix replay; checking `pending_valid` on the even page fixes
+the unready LDS read that could produce NaNs in both AOT and JIT. The PS64
+op test now checks the first output before warmup, which previously hid this
+failure. These results include both fixes.
 
 ## 6. Adopting it for another op
 

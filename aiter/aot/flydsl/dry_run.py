@@ -211,18 +211,23 @@ def dry_run(
         name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
     )
     real_data_ptr = torch.Tensor.data_ptr
+    storage_addresses = {}
+    next_address = 256
 
     def data_ptr(tensor):
+        nonlocal next_address
         if not isinstance(tensor, FakeTensor):
             return real_data_ptr(tensor)
         if tensor.numel() == 0:
             return 0
-        # Storage identity keeps aliasing visible to host code comparing
-        # pointers; the address is never dereferenced.
-        return (
-            tensor.untyped_storage()._cdata
-            + tensor.storage_offset() * tensor.element_size()
-        )
+        storage = tensor.untyped_storage()
+        if storage._cdata not in storage_addresses:
+            # Host overlap checks need disjoint byte ranges, not the addresses
+            # of metadata objects. Keep the storage alive to prevent ID reuse.
+            storage_addresses[storage._cdata] = (storage, next_address)
+            next_address += (storage.nbytes() + 255) // 256 * 256
+        _, base = storage_addresses[storage._cdata]
+        return base + tensor.storage_offset() * tensor.element_size()
 
     real_getitem = torch.Tensor.__getitem__
     real_setitem = torch.Tensor.__setitem__

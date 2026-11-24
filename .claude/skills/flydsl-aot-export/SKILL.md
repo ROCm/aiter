@@ -8,7 +8,7 @@ description: >
   constexpr in the key or specialization_key?), when an entry falls back to
   the JIT path or raises a baked-argument error, and when validating a
   conversion without the target GPU.
-argument-hint: [wrapper module, op name or cache name]
+argument-hint: "[wrapper module, op name or cache name]"
 allowed-tools: Read Edit Bash Grep Glob
 ---
 
@@ -172,8 +172,18 @@ for it` marks a fallback and is a failure of the conversion.
    lists the constexpr argument indexes and values, `sources` the kernel's
    files. A kernel file missing from `sources` means the trace did not run
    it; see §4.2 of the doc for the holes and `extra_sources`.
+   `fingerprint` must match the target/toolchain directory, `key` must match
+   the filename's digest, and `object_sha256` must match the `.o` bytes.
+   Disk resolution rejects mismatched pairs and old sidecars
+   without these identity fields; those entries need a one-time rebuild.
 6. **Result.** On the target GPU, compare the op's output bitwise against
    mode `0`, and run its op test twice on one cache directory.
+7. **Timing.** Use the op test's native timer with the same shapes, inputs,
+   warmup and iteration count for AOT hits and mode `0`. Record compilation
+   or preload time and fresh-process first-call wall time separately from
+   steady kernel latency. Interleave repeat runs when the difference is
+   comparable to timing variation; a fast cache hit does not imply a faster
+   GPU kernel.
 
 Without the target GPU, steps 1-5 run compile-only on any host:
 
@@ -195,10 +205,12 @@ with dry_run("gfx1250", 256, python_ops=True):
     my_op(torch.empty(4, 128, 576, dtype=torch.bfloat16, device="cuda"), ...)
 ```
 
-Fake storage addresses are made up, so a host check that compares pointers
-(an overlap or alignment test) can fail there for no real reason; patch that
-check in the script, not in the wrapper. Say in the PR that the validation
-was compile-only and that step 6 is still owed.
+Fake storage addresses are synthetic. `dry_run` assigns disjoint aligned
+byte ranges to independent storages and preserves view offsets and aliases,
+so host overlap checks still apply. If a legal call fails only under the
+dry run, check its storage ranges and fix the simulation rather than
+disabling the wrapper's guard. Say in the PR when validation was
+compile-only and steps 6-7 are still owed.
 
 Run `python -m pytest -q tests/test_flydsl_aot_launch.py
 tests/test_flydsl_aot_cache.py` after touching `aot_cache.py`, `aot_launch.py`

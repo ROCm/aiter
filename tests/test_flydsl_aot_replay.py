@@ -6,6 +6,7 @@ These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
 
 import csv
+import itertools
 import os
 import pathlib
 import subprocess
@@ -107,6 +108,23 @@ def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
     monkeypatch.setattr(tensor_shim, "_get_current_raw_stream", no_gpu)
     with dry_run("gfx950", 256):
         assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
+
+
+def test_dry_run_pointer_ranges_preserve_storage_aliases():
+    """Large independent fake allocations must not trip real overlap guards."""
+    with dry_run("gfx1250", 256):
+        tensors = [
+            torch.empty(4, 2**32, dtype=torch.uint8, device="cuda") for _ in range(3)
+        ]
+        spans = sorted(
+            (t.data_ptr(), t.data_ptr() + t.untyped_storage().nbytes()) for t in tensors
+        )
+        assert all(left[1] <= right[0] for left, right in itertools.pairwise(spans))
+        assert all(start % 256 == 0 for start, _ in spans)
+        tensor = tensors[0]
+        assert tensor[1:, 16:].data_ptr() == tensor.data_ptr() + 2**32 + 16
+        assert tensor.view(torch.int32).data_ptr() == tensor.data_ptr()
+        assert tensor[:0].data_ptr() == 0
 
 
 def test_the_dry_run_builds_capture_scoped_scratch_without_asking_hip(monkeypatch):

@@ -335,6 +335,39 @@ def test_compile_hints_of_the_caller_select_the_entry():
     assert hinted != plain == cache._disk_key(("k",), (1,))
 
 
+def test_runtime_abi_and_target_select_distinct_entries(monkeypatch):
+    import torch
+
+    from aiter.ops.flydsl import aot_cache
+
+    cache = aot_cache.FlyDSLAotCache("test_abi_identity")
+    x = torch.empty(4, 8, dtype=torch.float16)
+    variants = (x, x.to(torch.bfloat16), x.t(), x.reshape(2, 2, 8))
+    digests = {cache._disk_key(("k",), (v,)) for v in variants}
+    assert len(digests) == len(variants)
+    # Changing a runtime address alone must reuse the same compiled ABI.
+    assert cache._disk_key(("k",), (x.clone(),)) == cache._disk_key(("k",), (x,))
+
+    monkeypatch.setattr(aot_cache, "_target_arch", lambda: "gfx1250")
+    monkeypatch.setattr(aot_cache, "_cu_num", lambda: 256)
+    monkeypatch.setattr(aot_cache, "_toolchain_digest", lambda: "compiler one")
+    monkeypatch.setattr(aot_cache, "_device_bitcode_digest", lambda: "bitcode")
+    base = aot_cache.fingerprint()
+    with monkeypatch.context() as patch:
+        patch.setattr(aot_cache, "_target_arch", lambda: "gfx950")
+        assert aot_cache.fingerprint() != base
+    with monkeypatch.context() as patch:
+        patch.setattr(aot_cache, "_cu_num", lambda: 128)
+        assert aot_cache.fingerprint() != base
+    with monkeypatch.context() as patch:
+        patch.setattr(aot_cache, "_toolchain_digest", lambda: "compiler two")
+        assert aot_cache.fingerprint() != base
+    with monkeypatch.context() as patch:
+        patch.setenv("LLVM_GFX1250_ANY_XNACK_CODEGEN", "identity-test")
+        assert aot_cache.fingerprint() != base
+    assert aot_cache.fingerprint() == base
+
+
 def test_linked_bitcode_is_an_input_of_the_entry(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
@@ -401,6 +434,50 @@ def test_compile_hook_that_only_identifies_kernels_is_not_a_verify_failure(
     monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", export_failed)
     with pytest.raises(RuntimeError, match="export failed"):
         cache._kernel(("k",), make_exe, ())
+
+
+@pytest.mark.parametrize("damage", ["object", "pair", "target", "legacy"])
+def test_mismatched_object_is_rebuilt_before_loading(monkeypatch, tmp_path, damage):
+    from aiter.ops.flydsl import aot_cache
+
+    def export(exe, args, out_dir, sym, link_libs=None):
+        obj = out_dir / f"{sym}.o"
+        obj.write_bytes(exe())
+        return obj
+
+    loaded = []
+    monkeypatch.setattr(aot_cache, "_export", export)
+    monkeypatch.setattr(
+        aot_cache, "_load_module", lambda path: loaded.append(path.read_bytes())
+    )
+    cache = aot_cache.FlyDSLAotCache("test_object_identity")
+    monkeypatch.setattr(cache, "directory", lambda: tmp_path)
+    factories = (lambda: lambda: b"expected", lambda: lambda: b"other kernel")
+    for key, factory in enumerate(factories):
+        cache._resolve(key, factory, ())
+    digest = cache._disk_key(0, ())
+    stem = cache._find(tmp_path, digest, ())
+    other = cache._find(tmp_path, cache._disk_key(1, ()), ())
+    loaded.clear()
+    if damage in ("object", "pair"):
+        stem.with_suffix(".o").write_bytes(other.with_suffix(".o").read_bytes())
+    if damage == "pair":
+        stem.with_suffix(".json").write_bytes(other.with_suffix(".json").read_bytes())
+    elif damage in ("target", "legacy"):
+        meta = json.loads(stem.with_suffix(".json").read_text())
+        if damage == "target":
+            meta["fingerprint"] = "another target or toolchain"
+        else:
+            meta.pop("object_sha256", None)
+        stem.with_suffix(".json").write_text(json.dumps(meta))
+
+    cache._resolve(0, factories[0], ())
+    assert loaded == [b"expected"]
+    assert cache._builds == 3
+    # A sound pair remains a trace-free hit after the repair.
+    cache._resolve(0, factories[0], ())
+    assert loaded == [b"expected", b"expected"]
+    assert cache._builds == 3
 
 
 def test_fingerprint_covers_what_flydsl_keys_its_cache_on():

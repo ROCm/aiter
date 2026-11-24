@@ -721,7 +721,10 @@ def launch_mla_pagesize64_fp8_fp8(
                 state,
                 mask_last=False,
                 pv_masked=False,
-                pv_pending=True,
+                # The first pair has no previous page. Check pending_valid
+                # before reading LDS: zero probabilities do not suppress NaNs
+                # from data that has not passed the producer barrier yet.
+                pv_pending=False,
             )
             odd_state = pipeline_step(
                 fx.Int32(page_iter) + num_splits,
