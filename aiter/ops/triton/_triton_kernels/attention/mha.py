@@ -192,7 +192,7 @@ def _attn_fwd_inner(
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask & causal_mask
 
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW >= 0:
             k_pos = start_n + tl.arange(0, BLOCK_N)
             q_adj = OFFS_M + seqlen_k - seqlen_q
             window_mask = k_pos[None, :] >= (q_adj[:, None] - SLIDING_WINDOW)
@@ -214,7 +214,7 @@ def _attn_fwd_inner(
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(qk - m_ij[:, None])
 
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW >= 0:
             # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
             # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
             p = tl.where(mask, p, 0.0)
@@ -247,7 +247,7 @@ def _attn_fwd_inner(
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
         alpha = tl.math.exp2(m_i - m_ij)
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW >= 0:
             # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
             # (no rescaling needed since max didn't change).
             alpha = tl.where(m_i == m_ij, 1.0, alpha)
@@ -719,7 +719,7 @@ def _attn_fwd(
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
     skipped_blocks = 0
-    if SLIDING_WINDOW > 0:
+    if SLIDING_WINDOW >= 0:
         # Skip K blocks that are fully left of the earliest key position
         # reachable by this Q block. The first retained block can still be
         # partially outside the window, so we keep the per-element mask below.
