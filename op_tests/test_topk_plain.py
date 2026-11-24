@@ -124,22 +124,28 @@ def check_multi_block_filter(dtype):
 
 def check_fewer_than_k_candidates(dtype):
     # -inf never displaces the -inf sentinel, so a row with fewer than k other
-    # values outputs sentinel slots. Their ids used to be uninitialized.
+    # values outputs sentinel slots: value -inf and an in-range index (they used
+    # to be uninitialized) that need not point at a -inf, as in the
+    # [5, -inf, ...] row, so gather(ids) == values holds only for the others.
+    hiddensize, topk = 248320, 16
     for batch_size in (1, 7, 448):
-        hiddensize, topk = 248320, 16
-        x = torch.randn(batch_size, hiddensize, dtype=dtype)
-        x[0] = float("-inf")
-        x[0, [5, 70000, 248000]] = torch.tensor([1.0, 3.0, 2.0], dtype=dtype)
-        topk_ids = torch.empty((batch_size, topk), dtype=dtypes.i32)
-        topk_value = torch.empty((batch_size, topk), dtype=dtype)
-        topk_plain(x, topk_ids, topk_value, topk, True)
-        ids = topk_ids.to(torch.long)
-        assert ((ids >= 0) & (ids < hiddensize)).all(), (
-            f"topk_plain returned out-of-range ids (batch_size={batch_size}, "
-            f"dtype={dtype})"
-        )
-        assert ids[0, :3].tolist() == [70000, 248000, 5]
-        assert torch.equal(x.gather(1, ids), topk_value)
+        for live in ({5: 1.0, 70000: 3.0, 248000: 2.0}, {0: 5.0}):
+            x = torch.randn(batch_size, hiddensize, dtype=dtype)
+            x[0] = float("-inf")
+            x[0, list(live)] = torch.tensor(list(live.values()), dtype=dtype)
+            topk_ids = torch.empty((batch_size, topk), dtype=dtypes.i32)
+            topk_value = torch.empty((batch_size, topk), dtype=dtype)
+            topk_plain(x, topk_ids, topk_value, topk, True)
+            ids = topk_ids.to(torch.long)
+            assert ((ids >= 0) & (ids < hiddensize)).all(), (
+                f"topk_plain returned out-of-range ids (batch_size={batch_size}, "
+                f"dtype={dtype})"
+            )
+            n = len(live)
+            assert ids[0, :n].tolist() == sorted(live, key=live.get, reverse=True)
+            assert (topk_value[0, n:] == float("-inf")).all()
+            assert torch.equal(x[0, ids[0, :n]], topk_value[0, :n])
+            assert torch.equal(x[1:].gather(1, ids[1:]), topk_value[1:])
 
 
 def test_strided_rows():

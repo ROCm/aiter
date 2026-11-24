@@ -1105,7 +1105,8 @@ struct WaveBuffer
             // An input equal to the sentinel (-inf when finding the largest) never
             // displaces a sentinel slot, so a row with fewer than k other values
             // flushes sentinel slots. Give them an in-range row offset instead of
-            // an uninitialized register.
+            // an uninitialized register. x[0] need not be the sentinel, so such
+            // slots are told apart by their value (see topk_plain's docstring).
             positions[i] = 0;
         }
     }
@@ -2854,8 +2855,10 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
 
 // Exposed to Python so topk_plain's radix scratch can be sized, allocated and
 // cached on the Python side (torch caching allocator) and passed in. Returns the
-// max(mb, ob) workspace for the float radix path; only fp32 inputs reach that
-// path, so non-fp32 callers do not need to allocate a workspace at all.
+// max(mb, ob) workspace for the float radix path, which only fp32 inputs reach.
+// Every dtype also needs topk_plain_merge_workspace_size for the multi-block
+// merge; one call takes at most one of the two paths, so callers allocate the
+// max of both.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 {
     return invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(

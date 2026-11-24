@@ -160,6 +160,13 @@ def topk_plain(
     kernels `topk_plain_reads_pitch` names, and copied densely first elsewhere;
     their pitch is always `x`'s own.
 
+    Rows with fewer than `topk` values ranking above -inf (+inf when not
+    `largest`): the block-sort fallback fills the slots left over with that
+    infinity as the value and an in-range index that need not point at an
+    infinity and may repeat (0 where no input reached the slot), so
+    `x.gather(-1, ids) == values` holds only for the other slots. Tell the
+    filler apart by its value.
+
     NaN: on the radix path (fp32, `largest=True`, where
     `topk_plain_batches_ragged_rows` holds) +nan ranks above +inf, as in
     `torch.topk`, and a NaN with the sign bit set ranks below -inf, so it is
