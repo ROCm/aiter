@@ -2500,8 +2500,8 @@ def test_mha_v4_fp6_p_keeps_each_rows_largest_weight(qk_format, v_format):
     scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
     reference = torch.softmax(scores * 128**-0.5, dim=-1)[..., :128]
     largest = weights.float().amax(dim=-1) / reference.permute(0, 2, 1, 3).amax(dim=-1)
-    # A block max that saturates its FP6 code loses 6% of the weight.
-    assert largest.mean() > 0.96, largest.mean()
+    # A block max that saturates its FP6 code loses 6% of the weight; over-sharpened Q/K gains some.
+    assert abs(largest.mean() - 1) < 0.04, largest.mean()
 
 
 # hd256 runs a 64-token KV tile where hd128 runs 128, so the aligned/partial split moves.
