@@ -118,6 +118,24 @@ from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
+
+def _pin_handshake(rung, handshake):
+    """*rung* on *handshake*, in the plain and the fused engine alike.
+
+    The mesh knobs need the Lamport handshake, so pinning another one resets a
+    tuned rung to the default knobs, and says so.
+    """
+    if handshake == "lamport" or rung.knobs.is_default():
+        return dataclasses.replace(rung, handshake=handshake)
+    logger.info(
+        "handshake=%r drops the mesh knobs %s of the rung from %d B",
+        handshake,
+        rung.knobs,
+        rung.min_bytes,
+    )
+    return dataclasses.replace(rung, handshake=handshake, knobs=DEFAULT_MESH_KNOBS)
+
+
 # The sum is restored in fp16 before the bf16 store, by scaling each group's
 # dequant step (group scale * 1/bias) by the divisor. With the E5M2 group
 # scale every fp16 extremum fits at divisor 1, so the divisor is opt-in and the
@@ -515,18 +533,7 @@ class FlyQuickAllReduce:
                     f"every rung of a ladder must name one handshake, got {named}"
                 )
             (handshake,) = named
-        ladder = tuple(
-            dataclasses.replace(
-                r,
-                handshake=handshake,
-                **(
-                    {"knobs": DEFAULT_MESH_KNOBS}
-                    if handshake != "lamport" and not r.knobs.is_default()
-                    else {}
-                ),
-            )
-            for r in ladder
-        )
+        ladder = tuple(_pin_handshake(r, handshake) for r in ladder)
         if not algo.has_knobs:
             for r in ladder:
                 if not r.knobs.is_default():
@@ -1394,15 +1401,15 @@ class FlyQuickAllReduceRMSNorm:
         hidden = int(hidden)
         got = self._ladders.get(hidden)
         if got is None:
-            rungs = tuple(
-                dataclasses.replace(r, **self._pins)
-                for r in self._algo.fused_st_ladder(
-                    world_size=self.world_size,
-                    link=self.link,
-                    arch=self.arch,
-                    hidden=hidden,
-                )
+            rungs = self._algo.fused_st_ladder(
+                world_size=self.world_size,
+                link=self.link,
+                arch=self.arch,
+                hidden=hidden,
             )
+            if "handshake" in self._pins and "knobs" not in self._pins:
+                rungs = [_pin_handshake(r, self._pins["handshake"]) for r in rungs]
+            rungs = tuple(dataclasses.replace(r, **self._pins) for r in rungs)
             named = {r.handshake for r in rungs}
             if len(named) != 1:
                 raise ValueError(

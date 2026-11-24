@@ -6097,9 +6097,9 @@ def main():
         choices=("lamport",),
         default=None,
         help="verify: run every plain mesh, ring and hier engine on the Lamport\n"
-        "handshake, e.g. on PCIe, whose ladders ship flag (its fine-grained\n"
-        "inbox re-arms a round late). The fused and production-dispatch checks\n"
-        "keep their ladders' handshakes.\n"
+        "handshake, e.g. the PCIe ring ladders, which still ship flag (the\n"
+        "fine-grained inbox re-arms a round late). The fused and\n"
+        "production-dispatch checks keep their ladders' handshakes.\n"
         "    e.g.: --handshake lamport",
     )
     fab.add_bench_args(parser)

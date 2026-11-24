@@ -1714,6 +1714,26 @@ def test_fused_rung_knob_rules():
         )
 
 
+@pytest.mark.parametrize("rung_cls", [P.TwoShotRung, P.FusedTwoShotRung])
+def test_handshake_pin_resets_knobs_alike_in_both_engines(rung_cls):
+    from aiter.ops.flydsl.quick_allreduce import _pin_handshake
+
+    on = P.MeshKnobs.parse("stripe=full;fanout=peer")
+    extra = {"block": 256} if rung_cls is P.TwoShotRung else {}
+    tuned = rung_cls(
+        min_bytes=0,
+        super_tile=1,
+        grid_cap=64,
+        handshake="lamport",
+        knobs=on,
+        **extra,
+    )
+    assert _pin_handshake(tuned, "lamport") == tuned
+    flagged = _pin_handshake(tuned, "flag")
+    assert flagged.handshake == "flag"
+    assert flagged.knobs == P.DEFAULT_MESH_KNOBS
+
+
 def test_shipped_fused_ladders_knobs_are_legal():
     ladders = P.load_fused_ladders(P.fused_ladders_path())
     for rungs in ladders.ring.values():
