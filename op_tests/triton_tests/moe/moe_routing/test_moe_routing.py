@@ -45,7 +45,7 @@ n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
 @pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
 @pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
 def test_topk_in_range(n_tokens: int, n_expts_tot: int):
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     n_expts_act = 4
@@ -92,7 +92,7 @@ def test_topk_in_range(n_tokens: int, n_expts_tot: int):
 )
 @pytest.mark.parametrize("sm_first", [True, False])
 def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
@@ -377,7 +377,7 @@ def test_routing_score_mode(
     routed_scaling_factor,
     dtype,
 ):
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
@@ -446,7 +446,7 @@ def test_routing_from_hash(
     routed_scaling_factor,
     block_m,
 ):
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
@@ -597,7 +597,9 @@ def _ref_arbitrary_grouped(
         scores = f32
     choice = scores + bias.float().unsqueeze(0) if bias is not None else scores
 
-    group_scores = torch.empty((nt, num_expert_group), device=logits.device)
+    group_scores = torch.empty(
+        (nt, num_expert_group), device=logits.device, dtype=torch.float32
+    )
     for g in range(num_expert_group):
         cols = (expert_group == g).nonzero(as_tuple=False).flatten()
         sub = choice[:, cols]
@@ -684,7 +686,7 @@ SCORE_COMBOS = [
 def _maybe_skip():
     if not torch.cuda.is_available():
         pytest.skip("grouped_topk requires a GPU")
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
 

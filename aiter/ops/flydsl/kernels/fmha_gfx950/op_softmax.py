@@ -49,13 +49,13 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         s_lo, s_hi = v_s
         kv_tile_start = tile_idx * traits.BLOCK_N
         kv_start_i32 = fx.Int32(kv_tile_start)
-        lane_off_i32 = fx.Int32(self.lane_div_32) * fx.Int32(4)
+        lane_off_i32 = fx.Int32(self.lane_div_32) * 4
         # q_row_i32 is set by init_q_row (called after helper construction), so read
         # it from the live ctx.
         rel_lo_i32 = fx.Int32(
             self.ctx_ref.q_row_i32 + self.delta_i32 - kv_start_i32 - lane_off_i32
         )
-        rel_hi_i32 = fx.Int32(rel_lo_i32 - fx.Int32(32))
+        rel_hi_i32 = rel_lo_i32 - 32
         neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
         pair_thresholds = _causal_pair_thresholds(False)
         _apply_dualwave_causal_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds)
@@ -98,11 +98,11 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         traits = self.traits
         s_lo, s_hi = v_s_lists
         kv_tile_start = tile_idx * traits.BLOCK_N
-        col_base = fx.Int32(kv_tile_start) + fx.Int32(self.lane_div_32) * fx.Int32(4)
+        col_base = fx.Int32(kv_tile_start) + fx.Int32(self.lane_div_32) * 4
         for r in range_constexpr(16):
             thr = (r // 4) * 8 + (r % 4)
             col_lo = col_base + fx.Int32(thr)
-            col_hi = col_lo + fx.Int32(32)
+            col_hi = col_lo + 32
             s_lo[r] = (col_lo < self.seqlen_kv_i32).select(s_lo[r], self.c_neg_inf)
             s_hi[r] = (col_hi < self.seqlen_kv_i32).select(s_hi[r], self.c_neg_inf)
 
@@ -168,7 +168,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
     def rescale_from_tile_max(self, m_row, m_tile_max):
         row_max = fx.maxnumf(m_row, m_tile_max)
         diff_scaled = (m_row - row_max) * self.c_logit_scale
-        rescale = rocdl.exp2(T.f32, as_mlir_value(diff_scaled))
+        rescale = fx.Float32(diff_scaled).exp2(fastmath="afn").ir_value()
         return row_max, rescale
 
     def apply_l_rescale(self, l_row, rescale):

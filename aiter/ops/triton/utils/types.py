@@ -5,7 +5,8 @@ from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_dtype_max(dtype):
-    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+    # Make this tensor on the CPU. It only checks the dtype.
+    if torch.is_floating_point(torch.tensor([], dtype=dtype, device="cpu")):
         return torch.finfo(dtype).max
     else:
         return torch.iinfo(dtype).max
@@ -22,6 +23,7 @@ def get_fp8_dtypes():
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
     ):
         e5m2_dtype = torch.float8_e5m2
         e4m3_dtype = torch.float8_e4m3fn
@@ -95,6 +97,11 @@ def _is_fp8(x):
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
     }:
+        # Native fp8 only. The Triton backend of attention.mha does not pass the
+        # descale factors on to _FlashAttnFunc, and its backward kernels read
+        # descale_q.stride(0) when IS_FP8, so software-emulated fp8
+        # (arch_info.is_sw_emulated_fp8_avail(), gfx11) cannot be enabled here
+        # until that path takes descales.
         if arch_info.is_fp8_avail():
             return True
         else:

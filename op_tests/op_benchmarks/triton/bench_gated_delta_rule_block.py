@@ -16,7 +16,6 @@ Example::
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import statistics
 import sys
@@ -31,6 +30,10 @@ from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
 from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 
 CHUNK_SIZE = 64
 
@@ -137,7 +140,7 @@ def _build_inputs(case, seed, with_state_pool=False):
         batch = 1
         num_states = len(context_lens)
         cu_seqlens = torch.tensor(
-            [0] + torch.tensor(context_lens).cumsum(0).tolist(),
+            [0] + torch.tensor(context_lens, device=device).cumsum(0).tolist(),
             dtype=torch.int32,
             device=device,
         )
@@ -151,14 +154,33 @@ def _build_inputs(case, seed, with_state_pool=False):
         metadata = None
 
     q = F.normalize(
-        torch.randn(batch, total_tokens, num_kv_heads, case.K, device=device), dim=-1
+        torch.randn(
+            batch,
+            total_tokens,
+            num_kv_heads,
+            case.K,
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
     ).to(case.dtype)
     k = F.normalize(
-        torch.randn(batch, total_tokens, num_kv_heads, case.K, device=device), dim=-1
+        torch.randn(
+            batch,
+            total_tokens,
+            num_kv_heads,
+            case.K,
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
     ).to(case.dtype)
-    v = (torch.randn(batch, total_tokens, num_heads, case.V, device=device) * 0.1).to(
-        case.dtype
-    )
+    v = (
+        torch.randn(
+            batch, total_tokens, num_heads, case.V, device=device, dtype=torch.float32
+        )
+        * 0.1
+    ).to(case.dtype)
     beta = torch.sigmoid(
         torch.randn(batch, total_tokens, num_heads, device=device, dtype=torch.float32)
     ).to(case.dtype)
@@ -177,7 +199,7 @@ def _build_inputs(case, seed, with_state_pool=False):
     initial_state = make_states(num_states)
     state_pool = make_states(2 * num_states) if with_state_pool else None
     state_indices = (
-        torch.randperm(2 * num_states).to(device=device, dtype=torch.int32)[:num_states]
+        torch.randperm(2 * num_states, device=device).to(dtype=torch.int32)[:num_states]
         if with_state_pool
         else None
     )
@@ -449,15 +471,16 @@ def _selected_cases(args, PrefillArgs):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark GDN prefill block for Qwen3.5-35B / 397B shapes."
-    )
-    parser.add_argument(
+    parser = get_parser(kernel_name="Gated Delta Rule Block")
+
+    override_parser_action(
+        parser,
         "--model",
-        choices=sorted(MODELS),
         default="35b",
+        choices=sorted(MODELS),
         help="Qwen3.5-35B (Hv=32) or Qwen3.5-397B (Hv=64).",
     )
+
     parser.add_argument(
         "--tp",
         type=int,

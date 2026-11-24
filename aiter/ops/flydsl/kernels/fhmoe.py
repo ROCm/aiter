@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Heterogeneous MoE facades for the shared MXFP4/FP8 kernel builders."""
+"""Heterogeneous MoE facades for MXFP4/MXFP8 routed and FP8 shared weights."""
 
 import functools
 
@@ -43,9 +43,10 @@ def compile_mixed_fhmoe_gemm1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     shared_expert_id: int,
+    clamp_shared: bool = True,
 ):
     """Compile a stage1 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
@@ -78,6 +79,7 @@ def compile_mixed_fhmoe_gemm1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
@@ -111,7 +113,7 @@ def compile_mixed_fhmoe_gemm2(
     use_global_a: bool = True,
 ):
     """Compile a stage2 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"

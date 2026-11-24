@@ -17,7 +17,7 @@ _MXFP8_GEMM_CONFIG_KEYS = ("gfx", "M", "N", "K", "b_intype", "a_preshuffle", "ou
 
 
 class _Mxfp8Config(AITER_CONFIG):
-    def update_config_files(self, file_path, merge_name):
+    def update_config_files(self, file_path, merge_name, env_name=None):
         # Validate before the shared merger fills missing columns or writes back
         # duplicate winners. A malformed source must not displace a valid one.
         paths = file_path.split(os.pathsep) if file_path else []
@@ -63,7 +63,9 @@ class _Mxfp8Config(AITER_CONFIG):
                     "Conflicting MXFP8 GEMM configs differ only in cu_num/_tag; "
                     "these are not runtime lookup keys. Select one variant per shape."
                 )
-        return super().update_config_files(os.pathsep.join(valid_paths), merge_name)
+        return super().update_config_files(
+            os.pathsep.join(valid_paths), merge_name, env_name
+        )
 
 
 # A separate instance keeps MXFP8 validation out of all other config families.

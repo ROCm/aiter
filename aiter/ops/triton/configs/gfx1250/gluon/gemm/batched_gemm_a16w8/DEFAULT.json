@@ -7,7 +7,8 @@
         "NUM_BUFFERS": 2,
         "WG_PER_CU": 2,
         "STORE_MODE": 1,
-        "C_PAD": 16
+        "C_PAD": 16,
+        "waves_per_eu": 1
     },
     "any": {
         "BLOCK_SIZE_M": 128,
@@ -17,6 +18,7 @@
         "NUM_BUFFERS": 2,
         "WG_PER_CU": 1,
         "STORE_MODE": 2,
-        "C_PAD": 16
+        "C_PAD": 16,
+        "waves_per_eu": 1
     }
 }

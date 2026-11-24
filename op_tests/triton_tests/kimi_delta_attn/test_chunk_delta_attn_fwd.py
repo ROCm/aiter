@@ -6,11 +6,6 @@ Tests for chunk_delta_attn forward pass and constituent kernels.
 
 """
 
-import os
-
-os.environ.setdefault("AITER_TRITON_ONLY", "1")
-os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
-
 import math
 
 import pytest
