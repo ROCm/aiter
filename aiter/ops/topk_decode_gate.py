@@ -40,6 +40,17 @@ _FLYDSL_TOPK_DECODE_GATES = {
         False: ((131_072, None, 32),),
     },
 }
+# Where a device's single-launch bands differ from its arch's, keyed by CU count
+# like the adaptive bands below. An emit mode a device leaves out takes its
+# arch's bands.
+_FLYDSL_TOPK_DECODE_GATES_BY_DEVICE = {
+    # MI300X and MI325X. Measured on MI325X against the C++ one-block kernel,
+    # which every shape outside these bands runs here. Up to 20,000 wide the
+    # single-launch path runs FlyDSL's one-workgroup kernel, which is slower.
+    ("gfx942", 304): {
+        False: ((20_001, None, 1_024),),
+    },
+}
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 
 # What the gate answers. `default` names no kernel: the call keeps its entry
@@ -208,6 +219,14 @@ def _in_bands(bands, width: int, num_rows: int) -> bool:
     )
 
 
+def flydsl_topk_decode_gates(arch: str, cu_count: int, stable: bool) -> tuple:
+    """The single-launch bands for this device: its own, else its arch's."""
+    per_device = _FLYDSL_TOPK_DECODE_GATES_BY_DEVICE.get((arch, cu_count), {})
+    if stable in per_device:
+        return per_device[stable]
+    return _FLYDSL_TOPK_DECODE_GATES.get(arch, {}).get(stable, ())
+
+
 @functools.lru_cache(maxsize=256)
 def _decode_backend(
     arch: str,
@@ -236,17 +255,13 @@ def _decode_backend(
         per_k = _ADAPTIVE_BANDS.get((arch, cu_count), {}).get(stable, {})
         if _in_bands(per_k.get(k, ()), adaptive_width, num_rows):
             return BACKEND_ADAPTIVE
-    if (
-        arch in _FLYDSL_TOPK_DECODE_GATES
-        and k in _FLYDSL_TOPK_DECODE_KS
-        and _in_bands(
-            (
-                (lo, hi, 1, rows)
-                for lo, hi, rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
-            ),
-            width,
-            num_rows,
-        )
+    if k in _FLYDSL_TOPK_DECODE_KS and _in_bands(
+        (
+            (lo, hi, 1, rows)
+            for lo, hi, rows in flydsl_topk_decode_gates(arch, cu_count, stable)
+        ),
+        width,
+        num_rows,
     ):
         return BACKEND_SINGLE
     return BACKEND_DEFAULT
