@@ -736,3 +736,16 @@ def qkv_a_rmsnorm_fp4(
     bf16 tensors of the matching width. Row pointers and bf16 weights must be
     16-byte aligned, and row strides must fit int32. wave64 GPUs are rejected.
     """
+
+
+def qkv_a_rmsnorm_fp4_supported(q_dim: int, kv_dim: int) -> bool:
+    """Whether ``qkv_a_rmsnorm_fp4`` serves a q width of ``q_dim`` and a kv width
+    of ``kv_dim`` (0 for no kv) on this device: the widths its launch accepts
+    on the gfx1250 family, the wave32 arch it is built and checked for. Callers
+    use this instead of repeating the launch's checks."""
+    return (
+        get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+        and 1024 < q_dim <= 1536
+        and q_dim % 128 == 0
+        and (kv_dim == 0 or (0 < kv_dim <= 512 and kv_dim % 8 == 0))
+    )
