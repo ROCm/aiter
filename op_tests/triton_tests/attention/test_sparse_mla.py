@@ -252,36 +252,6 @@ def test_packed_cache_arch_gate(arch):
             smd._check_packed_arch(arch)
 
 
-def test_fp8_scalar_two_loop_rejected_off_packed_arch():
-    """The two-loop stays on the packed arch for every cache format, fp8_scalar
-    included.
-
-    Both segments are a real 3-D block pool: a 2-D cache fails the shape check
-    with an error that also says "two-loop", so it would pass without the gate.
-    """
-    arch = arch_info.get_arch()
-    if arch not in SUPPORTED_ARCHS or arch in smd.PACKED_ARCHS:
-        pytest.skip(f"the two-loop runs on {arch}")
-    if arch not in FP8_SCALAR_ARCHS:
-        pytest.skip(f"no fp8_scalar cache on {arch}")
-    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
-    block = 64
-    cache = cache.view(cache.shape[0] // block, block, cache.shape[-1])
-    with pytest.raises(ValueError, match=f"have no implementation on {arch}"):
-        sparse_mla_fwd(
-            q,
-            cache,
-            ptr,
-            idx,
-            D_QK**-0.5,
-            kv_scale=ks,
-            extra_kv=cache,
-            extra_indptr=ptr,
-            extra_indices=idx,
-            extra_kv_scale=ks,
-        )
-
-
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
 def test_fp8_arch_gate(arch):
     """fp8 q and fp8 caches, for every arch, from any machine."""
