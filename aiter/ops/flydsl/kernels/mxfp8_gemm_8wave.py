@@ -13,10 +13,13 @@ scales, so the epilogue only converts. ``MxMfma`` issues one scaled atom per
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import flydsl.expr.arith as farith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
     S2RLoader,
@@ -391,6 +394,168 @@ class StoreBf16:
                     )
 
 
+class StoreSwigluMx8W4:
+    """gate_up epilogue: SwiGLU-OAI and the MXFP8 quant of the down projection's
+    input, with its e8m0 scales in the shuffle_scale_w4 layout.
+
+    The launch points the B tile's two 128-row halves at gate rows [128 t, +128) and
+    the matching up rows [I + 128 t, +128) of the [gate | up] weight, so a lane holds
+    the gate and the up of the same output elements. Each element gets the bytes of
+    the bf16 GEMM output followed by SwiGLU-OAI in this order: g = min(gate, L),
+    u = clamp(up, -L, L), (beta + u) * (g * (1 / (exp2(alpha * -g * log2 e) + 1))),
+    rounded to bf16; then the MXFP8 quant of each 32-column group: code =
+    ceil_pow2(max(amax, 1e-10) * (1 / 448)), q = clamp(x * 2^(127 - code), +-448) to
+    e4m3. Output: one byte buffer, e4m3 [c_m, I] row-major, then the scales of
+    [pad256(c_m), I / 32].
+    Same bytes, fewer instructions: 1 / y as v_rcp plus one Newton step for y < 2^126
+    (the correctly rounded quotient there) and 0 above (gate <= -51.3: the element's
+    e4m3 byte is the same signed zero and cannot set its group's amax); raw
+    v_exp_f32 (llvm.exp2 for inputs >= -126, which the gate clamp keeps); the up clamp
+    as one v_med3_f32 (LLVM would narrow the clamp of a bf16-exact value to bf16);
+    the group amax as an integer max of |x| bit patterns over a 16-lane DPP row.
+    """
+
+    def __init__(
+        self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, alpha, beta, limit
+    ):
+        assert n_tiles_b == 2
+        self.c_rows = c_rows
+        self.n_out = c_cols // 2
+        self.q_bytes = c_rows * self.n_out
+        self.nb256 = self.n_out // 256
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.alpha = alpha
+        self.beta = beta
+        self.limit = limit
+        rows_pad = (c_rows + 255) // 256 * 256
+        gC = fx.rocdl.make_buffer_tensor(
+            C,
+            max_size=False,
+            num_records_bytes=self.q_bytes + rows_pad * (self.n_out // 32),
+        )
+        self.rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(gC))
+
+    def _swiglu(self, g_raw, u_raw):
+        from flydsl.expr.typing import T
+
+        F = fx.Float32
+        lim = F(self.limit)
+        g = g_raw.minimumf(lim)
+        t = F(self.alpha) * (-g)
+        m = t * F(1.4426950408889634)
+        e = F(fmath.exp2(m, fastmath="afn"))
+        y = e + F(1.0)
+        r0 = F(rocdl.rcp(T.f32, y.ir_value()))
+        err = F(fmath.fma(-y, r0, F(1.0)))
+        sig = F(fmath.fma(err, r0, r0))
+        sig = (y < F(2.0**126)).select(sig, F(0.0))
+        gs = g * sig
+        u = F(
+            rocdl.fmed3(
+                T.f32, u_raw.ir_value(), F(-self.limit).ir_value(), lim.ir_value()
+            )
+        )
+        return (F(self.beta) + u) * gs
+
+    def _store(self, value, off):
+        from flydsl._mlir import ir
+        from flydsl.expr.typing import T
+
+        rocdl.raw_ptr_buffer_store(
+            value.ir_value(),
+            self.rsrc,
+            off.ir_value(),
+            fx.Int32(0).ir_value(),
+            aux=ir.IntegerAttr.get(T.i32, 0),
+        )
+
+    def store(self, c_gate, c_up, base_row, block_n, wave_n):
+        """``base_row``: first row of this wave's 64-row slice (a multiple of 64)."""
+        from flydsl.expr.typing import T
+
+        F = fx.Float32
+        lane_c = self.lane_id % 16
+        lane_g = self.lane_id // 16
+        odd = (self.lane_id % 2) == 1
+        oob = fx.Int32(0x7FFFFFF0)
+        out_col_base = block_n * 128 + wave_n * 32
+        lane_row0 = base_row + lane_g * 4
+        q_lane_base = (
+            lane_row0 * self.n_out + out_col_base + odd.select(lane_c + 15, lane_c)
+        )
+        # w4: group 4 block_n + wave_n -> 256-col block block_n // 2; row r -> 32-row
+        # block r // 32, word wave_n * 16 + r % 16, byte block_n % 2 * 2 + r // 16 % 2.
+        s_lane_base = (
+            self.q_bytes
+            + (base_row // 32 * self.nb256 + block_n // 2) * 256
+            + (wave_n * 16 + lane_g * 4) * 4
+            + (block_n % 2) * 2
+        )
+        for ti in range_constexpr(self.n_tiles_a):
+            xs = []
+            for tj in range_constexpr(2):
+                g4 = Vec(c_gate[self.c_idx_fn(ti, tj)]).to(fx.BFloat16).to(F)
+                u4 = Vec(c_up[self.c_idx_fn(ti, tj)]).to(fx.BFloat16).to(F)
+                vals = [self._swiglu(F(g4[i]), F(u4[i])) for i in range_constexpr(4)]
+                xs.append(Vec.from_elements(vals, F).to(fx.BFloat16).to(F))
+            for i in range_constexpr(4):
+                row = lane_row0 + ti * 16 + i
+                x0 = F(xs[0][i])
+                x1 = F(xs[1][i])
+                # amax over the 32-column group: |x| bit patterns, max over the 16-lane
+                # DPP row (row_ror folds into v_max_u32_dpp), then the 1e-10 floor.
+                absmask = fx.Int32(0x7FFFFFFF)
+                mi = fx.Int32(
+                    farith.maxui(
+                        (x0.bitcast(fx.Int32) & absmask).ir_value(),
+                        (x1.bitcast(fx.Int32) & absmask).ir_value(),
+                    )
+                )
+                for ror in (8, 4, 2, 1):
+                    rot = fx.Int32(
+                        rocdl.update_dpp(
+                            fx.Int32.ir_type,
+                            mi.ir_value(),
+                            mi.ir_value(),
+                            0x120 + ror,
+                            0xF,
+                            0xF,
+                            True,
+                        )
+                    )
+                    mi = fx.Int32(farith.maxui(mi.ir_value(), rot.ir_value()))
+                floor_bits = F(1e-10).bitcast(fx.Int32)
+                amax = fx.Int32(
+                    farith.maxui(mi.ir_value(), floor_bits.ir_value())
+                ).bitcast(F)
+                bits = (amax * F(1.0 / 448.0)).bitcast(fx.Int32)
+                code = (bits >> fx.Int32(23)) + (
+                    (bits & fx.Int32(0x7FFFFF)) != fx.Int32(0)
+                ).select(fx.Int32(1), fx.Int32(0))
+                rexp = fx.Int32(254) - code
+                rexp = (rexp > fx.Int32(0)).select(rexp, fx.Int32(0))
+                recip = (rexp << fx.Int32(23)).bitcast(F)
+                y0 = (x0 * recip).maximumf(F(-448.0)).minimumf(F(448.0))
+                y1 = (x1 * recip).maximumf(F(-448.0)).minimumf(F(448.0))
+                n0 = F(dpp_xor_f32(y0, 1))
+                n1 = F(dpp_xor_f32(y1, 1))
+                lo = odd.select(n1, y0)
+                hi = odd.select(y1, n0)
+                pk = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, lo, hi, fx.Int32(0), False))
+                row_ok = row < self.c_rows
+                q_off = row_ok.select(
+                    q_lane_base + fx.Int32((ti * 16 + i) * self.n_out), oob
+                )
+                s_off = s_lane_base + fx.Int32(
+                    (ti // 2) * self.nb256 * 256 + i * 4 + ti % 2
+                )
+                self._store(fx.Int16(pk.ir_value()), q_off)
+                s_off = (row_ok & (lane_c == 0)).select(s_off, oob)
+                self._store(fx.Int8(code.ir_value()), s_off)
+
+
 class StoreF32Slab:
     """Stores the fp32 accumulators of split-K segment ``seg`` into slab ``seg``
     of a contiguous ``[k_split, c_rows, c_cols]`` fp32 workspace."""
@@ -445,6 +610,8 @@ def compile_mxfp8_gemm_8w(
     b_scale_block: str = "1x32",
     a_scale_block: str = "1x32",
     k_split: int = 1,
+    epilogue: str = "bf16",
+    swiglu: tuple | None = None,
 ):
     """Build the MXFP8 launcher.
 
@@ -458,6 +625,12 @@ def compile_mxfp8_gemm_8w(
     runs K-segment ``s`` (``K // k_split`` deep) of output tile ``t`` (row-major
     tile order, no XCD swizzle) and writes its fp32 partial to slab ``s`` of
     ``C``, a contiguous ``[k_split, c_m, c_n]`` fp32 workspace (ldc unused).
+
+    ``epilogue="swiglu_mx8_w4"`` builds the gate_up GEMM of a SwiGLU-OAI MLP
+    (``swiglu`` = (alpha, beta, limit)): B is the unpermuted ``[gate | up]``
+    weight (c_n = 2I rows), each block tile computes 128 gate and the matching
+    128 up columns, and the epilogue writes the e4m3 activation of the down
+    projection plus its shuffle_scale_w4 e8m0 scales (StoreSwigluMx8W4).
     """
     assert b_scale_block in (
         "1x32",
@@ -489,6 +662,11 @@ def compile_mxfp8_gemm_8w(
         not scale_preshuffled and a_scale_block == "1x32" and b_scale_block != "128x128"
     ), "a split-K segment takes row-major 1x32 A and 1x32 / 32x32 B scales"
     assert k_split == 1 or xcd_swizzle == 0, "split-K tiles run in row-major order"
+    assert epilogue in ("bf16", "swiglu_mx8_w4"), epilogue
+    SWIGLU = epilogue == "swiglu_mx8_w4"
+    assert not SWIGLU or (
+        k_split == 1 and scale_preshuffled and swiglu is not None
+    ), "SwiGLU + MXFP8 (w4) epilogue: preshuffled scales, unsplit, (alpha, beta, L)"
     K_ITERS = K // BLOCK_K // k_split
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
@@ -528,6 +706,10 @@ def compile_mxfp8_gemm_8w(
         f"{waves_per_eu}x{xcd_swizzle}{_scale_tag}_k{K}"
         f"{f'_ks{k_split}' if k_split > 1 else ''}"
     )
+    if SWIGLU:
+        _kname += "_swiglu_mx8w4_" + "_".join(
+            f"{v:g}".replace(".", "p").replace("-", "m") for v in swiglu
+        )
 
     @fx.struct
     class SharedStorage:
@@ -589,8 +771,13 @@ def compile_mxfp8_gemm_8w(
 
         A0_gl_offset = (block_m * BLOCK_M) * K
         A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        if const_expr(SWIGLU):
+            # LDS half 0 <- gate rows [128 block_n, +128), half 1 <- the matching up
+            B0_gl_offset = (block_n * LDS_BLOCK_N) * K
+            B1_gl_offset = (c_n // 2 + block_n * LDS_BLOCK_N) * K
+        else:
+            B0_gl_offset = (block_n * BLOCK_N) * K
+            B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
         if const_expr(k_split > 1):
             A0_gl_offset = A0_gl_offset + a_k_off
             A1_gl_offset = A1_gl_offset + a_k_off
@@ -615,7 +802,19 @@ def compile_mxfp8_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        if const_expr(k_split > 1):
+        if const_expr(SWIGLU):
+            store_c = StoreSwigluMx8W4(
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                swiglu[0],
+                swiglu[1],
+                swiglu[2],
+            )
+        elif const_expr(k_split > 1):
             store_c = StoreF32Slab(
                 C, k_split, seg, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
@@ -650,10 +849,16 @@ def compile_mxfp8_gemm_8w(
             (block_m * BLOCK_M + h * LDS_BLOCK_M + wave_m * A_GRP_ROWS) // 16
             for h in range_constexpr(2)
         ]
-        b_base16 = [
-            (block_n * BLOCK_N + h * LDS_BLOCK_N + wave_n * B_GRP_ROWS) // 16
-            for h in range_constexpr(2)
-        ]
+        if const_expr(SWIGLU):
+            b_base16 = [
+                (h * (c_n // 2) + block_n * LDS_BLOCK_N + wave_n * B_GRP_ROWS) // 16
+                for h in range_constexpr(2)
+            ]
+        else:
+            b_base16 = [
+                (block_n * BLOCK_N + h * LDS_BLOCK_N + wave_n * B_GRP_ROWS) // 16
+                for h in range_constexpr(2)
+            ]
         SCALE_LOADS_PER_PAIR = 2 * (N_TILES_A // 2) + 2 * (N_TILES_B // 2)
         assert SCALE_LOADS_PER_PAIR == 6, (
             f"scale prefetch issues {SCALE_LOADS_PER_PAIR} VMEM loads per K-pair, not the 6 the "
@@ -840,10 +1045,15 @@ def compile_mxfp8_gemm_8w(
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        if const_expr(SWIGLU):
+            # gate in c00 / c10 (LDS half 0), the matching up in c01 / c11
+            store_c.store(c00_frag, c01_frag, base_row + 0, block_n, wave_n)
+            store_c.store(c10_frag, c11_frag, base_row + LDS_BLOCK_M, block_n, wave_n)
+        else:
+            store_c.store(c00_frag, base_row + 0, base_col + 0)
+            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
     @flyc.jit
     def launch_gemm(
