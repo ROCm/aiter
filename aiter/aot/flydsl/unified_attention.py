@@ -103,8 +103,7 @@ def _contexts(window: int, min_context: int, cu_num: int) -> tuple[int, ...]:
         return (min_context,)
     return tuple(
         sorted(
-            {c for c in _partition_contexts(cu_num) if c >= min_context}
-            | {min_context}
+            {c for c in _partition_contexts(cu_num) if c >= min_context} | {min_context}
         )
     )
 

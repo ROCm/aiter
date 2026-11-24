@@ -47,10 +47,20 @@ from .kernels.tensor_shim import (
 )
 from .kernels.utils import (
     afn_rcp_f32 as rcp_f32,
+)
+from .kernels.utils import (
     opaque_i32 as opaque,
+)
+from .kernels.utils import (
     permlane16_swap_i32 as permlane16_swap,
+)
+from .kernels.utils import (
     pin_vector as _pin,
+)
+from .kernels.utils import (
     uniform_i32 as uniform,
+)
+from .kernels.utils import (
     uniform_i64 as uniform64,
 )
 

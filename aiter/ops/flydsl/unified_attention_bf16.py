@@ -701,9 +701,7 @@ def _unified_attention_varlen(
         # The shared ping-pong launch ABI has two scale-pointer slots. BF16
         # uses neither; the direct-output specialization deliberately carries
         # ``out`` in the key-scale slot to avoid a second launcher signature.
-        direct_output_or_key_scale = (
-            ptr_arg(out, fx.BFloat16) if direct else no_scale
-        )
+        direct_output_or_key_scale = ptr_arg(out, fx.BFloat16) if direct else no_scale
         _run_compiled(
             compiled,
             *partials,

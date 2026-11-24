@@ -249,19 +249,21 @@ def build_inputs(batch, args, device, q_pool, out_pool):
         cu.append(cu[-1] + q)
     seqused = [r.computed + q for r, q in batch]
     table = [r.pages for r, _ in batch]
-    return dict(
-        q=q_pool[:tokens],
-        out=out_pool[:tokens],
-        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32).to(device, non_blocking=True),
-        max_seqlen_q=max(query_lens),
-        seqused_k=torch.tensor(seqused, dtype=torch.int32).to(
+    return {
+        "q": q_pool[:tokens],
+        "out": out_pool[:tokens],
+        "cu_seqlens_q": torch.tensor(cu, dtype=torch.int32).to(
             device, non_blocking=True
         ),
-        max_seqlen_k=max(seqused),
-        block_table=torch.tensor(table, dtype=torch.int32).to(
+        "max_seqlen_q": max(query_lens),
+        "seqused_k": torch.tensor(seqused, dtype=torch.int32).to(
             device, non_blocking=True
         ),
-    )
+        "max_seqlen_k": max(seqused),
+        "block_table": torch.tensor(table, dtype=torch.int32).to(
+            device, non_blocking=True
+        ),
+    }
 
 
 def main():
@@ -315,8 +317,8 @@ def main():
     out_pool = torch.empty(max_tokens, hq, VALUE_DIM, device=device).bfloat16()
     sinks = None if args.no_sinks else torch.randn(hq, device=device)
     layers = {
-        "global": dict(window_size=(-1, -1), sinks=None),
-        "swa": dict(window_size=(args.window, 0), sinks=sinks),
+        "global": {"window_size": (-1, -1), "sinks": None},
+        "swa": {"window_size": (args.window, 0), "sinks": sinks},
     }
     layers = {name: layers[name] for name in args.layers.split(",")}
 
@@ -358,23 +360,23 @@ def main():
             after = COUNTERS.snapshot()
             delta = [b - a for a, b in zip(before, after)]
             records.append(
-                dict(
-                    step=step,
-                    layer=layer,
-                    route=take_route() or args.backend or "triton",
-                    decode_only=decode_only,
-                    num_seqs=len(batch),
-                    num_tokens=int(inputs["q"].shape[0]),
-                    max_seqlen_q=inputs["max_seqlen_q"],
-                    max_seqlen_k=inputs["max_seqlen_k"],
-                    ms=elapsed * 1e3,
-                    fly_misses=delta[0],
-                    fly_jit_ms=delta[1] * 1e3,
-                    fly_compiles=delta[2],
-                    fly_disk_hits=delta[4],
-                    triton_compiles=delta[5],
-                    triton_jit_ms=delta[6] * 1e3,
-                )
+                {
+                    "step": step,
+                    "layer": layer,
+                    "route": take_route() or args.backend or "triton",
+                    "decode_only": decode_only,
+                    "num_seqs": len(batch),
+                    "num_tokens": int(inputs["q"].shape[0]),
+                    "max_seqlen_q": inputs["max_seqlen_q"],
+                    "max_seqlen_k": inputs["max_seqlen_k"],
+                    "ms": elapsed * 1e3,
+                    "fly_misses": delta[0],
+                    "fly_jit_ms": delta[1] * 1e3,
+                    "fly_compiles": delta[2],
+                    "fly_disk_hits": delta[4],
+                    "triton_compiles": delta[5],
+                    "triton_jit_ms": delta[6] * 1e3,
+                }
             )
         sched.commit(batch)
     wall = time.perf_counter() - started

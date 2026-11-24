@@ -28,11 +28,16 @@ from .pa_decode.traits import KV_COMPUTE_BLOCK, LOG2E, WAVE
 from .tensor_shim import buf_base_i64, buf_copy_store, buf_scalar_load, ptr_buf_tensor
 from .utils import (
     afn_rcp_f32 as _rcp,
+)
+from .utils import (
     pin_vector as _pin,
+)
+from .utils import (
     uniform_i32 as _uni,
+)
+from .utils import (
     uniform_i64 as _uni64,
 )
-
 
 TILE = 64
 # Scores may exceed the row's reference max by 2**RESCALE_LOG2 before P is
