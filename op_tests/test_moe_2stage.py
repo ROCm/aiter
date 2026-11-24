@@ -1053,11 +1053,13 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
-        # AOT cache entry, so let those cases compile on demand.
+        # AOT cache entry, so let those cases compile on demand. Neither do
+        # whole-graph impl__ rows, until aiter/aot/flydsl/moe.py replays them.
         kwargs["check_aot_cache"] = (
             args.csv_filter is None
             and not post_reduce
             and kwargs["actType"] != aiter.ActivationType.Situv2
+            and not kernel_name1.startswith("impl__")
         )
         # Only Swiglu callers pass an expert bias; the AOT cache has no bias
         # variant for other activations.
@@ -2913,7 +2915,13 @@ def test_plain_fp8_swiglu_limit_dispatch():
 
     for q in quant_types:
         # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        # per_Token still has the gfx942 whole-graph backend for that shape.
+        # per_Tensor does not, so it raises.
+        if q == aiter.QuantType.per_Token and get_gfx_runtime() == "gfx942":
+            md = dispatch(64, q, 7.0, inter=192)
+            assert md.full_impl is not None and md.stage1 is None, md
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
         raises(
             NotImplementedError,
             "swiglu_limit",

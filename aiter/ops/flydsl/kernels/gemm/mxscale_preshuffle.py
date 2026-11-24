@@ -1924,14 +1924,19 @@ def launch_splitk_reduce(
     arg_out: fx.Pointer,
     n_out_dw: fx.Int32,  # output dwords = M*N // 2 (2 out elems per dword)
     slab_stride_dw: fx.Int32,  # dwords per split slab = M*N (fp32: 1 dword/elem)
+    row_dw: fx.Int32,  # N // 2: output dwords per row
+    ldc_dw: fx.Int32,  # Out's row stride // 2 (== row_dw unless strided)
     stream: fx.Stream,
     split_k: Constexpr[int],
     out_dtype: Constexpr[str],
+    strided: Constexpr[bool] = False,
 ):
     """Sum ``split_k`` fp32 slabs of ``arg_tmp`` -> bf16/fp16 ``arg_out``.
 
-    arg_tmp: (split_k, M, N) fp32 contiguous. arg_out: (M, N) out_dtype. One output
-    dword (= 2 out elems = 2 fp32 inputs per slab) per thread; grid.x covers all.
+    arg_tmp: (split_k, M, N) fp32 contiguous. arg_out: (M, N) out_dtype, row
+    stride ``2 * ldc_dw`` elements when ``strided`` (a column slice of a wider
+    output), else contiguous. One output dword (= 2 out elems = 2 fp32 inputs
+    per slab) per thread; grid.x covers all.
     """
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
@@ -1948,6 +1953,8 @@ def launch_splitk_reduce(
         out: fx.Pointer,
         n_out_dw_i: fx.Int32,
         slab_dw_i: fx.Int32,
+        row_dw_i: fx.Int32,
+        ldc_dw_i: fx.Int32,
     ):
         frag_layout = fx.make_layout(_REDUCE_VEC, 1)
         vt = fx.Int32(fx.block_idx.x) * fx.Int32(_REDUCE_BLOCK) + fx.Int32(
@@ -1974,7 +1981,12 @@ def launch_splitk_reduce(
             return fx.logical_divide(buf, frag_layout)
 
         in_t = _tiled(tmp, Float32, fx.Int64(slab_dw_i) * fx.Int64(split_k) * 4)
-        out_t = _tiled(out, out_elem, fx.Int64(n_out_dw_i) * 4)
+        if const_expr(strided):
+            # Dwords from the first output element to one past the last.
+            out_span_dw = (n_out_dw_i // row_dw_i - 1) * ldc_dw_i + row_dw_i
+        else:
+            out_span_dw = n_out_dw_i
+        out_t = _tiled(out, out_elem, fx.Int64(out_span_dw) * 4)
         in_copy = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), Float32)  # 2 x f32
         out_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), out_elem)  # 2 x 16b
 
@@ -1990,10 +2002,14 @@ def launch_splitk_reduce(
                 acc = acc + frag.load()
             out_frag = fx.make_rmem_tensor(frag_layout, out_elem)
             out_frag.store(acc.to(out_elem))
-            fx.copy_atom_call(out_copy, out_frag, fx.slice(out_t, (None, vt)))
+            if const_expr(strided):
+                out_vt = vt + (vt // row_dw_i) * (ldc_dw_i - row_dw_i)
+            else:
+                out_vt = vt
+            fx.copy_atom_call(out_copy, out_frag, fx.slice(out_t, (None, out_vt)))
 
     gx = (n_out_dw + (_REDUCE_BLOCK - 1)) // _REDUCE_BLOCK
-    reduce_kernel(arg_tmp, arg_out, n_out_dw, slab_stride_dw).launch(
+    reduce_kernel(arg_tmp, arg_out, n_out_dw, slab_stride_dw, row_dw, ldc_dw).launch(
         grid=(gx, 1, 1), block=(_REDUCE_BLOCK, 1, 1), stream=stream
     )
 
