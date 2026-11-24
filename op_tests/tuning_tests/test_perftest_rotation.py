@@ -225,6 +225,13 @@ class TestPerftestWarmupAndFlush(unittest.TestCase):
         self.assertEqual(buf.nbytes, 2 * measure.llc_bytes(device))
         self.assertIs(measure.llc_flush_buffer(device), buf)
 
+    def test_flush_reads_the_whole_buffer(self):
+        device = torch.cuda.current_device()
+        buf = measure.llc_flush_buffer(device)
+        buf.fill_(1)
+        measure.flush_llc(device)
+        self.assertEqual(measure._flush_partials(device).sum().item(), buf.numel())
+
 
 def _cache(level, kib, instances=1):
     return {"cache_level": level, "cache_size": kib, "num_cache_instance": instances}

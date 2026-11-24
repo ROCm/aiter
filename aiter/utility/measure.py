@@ -5,6 +5,8 @@
 import functools
 
 import torch
+import triton
+import triton.language as tl
 
 from aiter import logger
 
@@ -64,8 +66,27 @@ def llc_flush_buffer(device: int) -> torch.Tensor:
     return torch.empty(2 * llc_bytes(device) // 8, dtype=torch.int64, device=device)
 
 
+@triton.jit
+def _flush_kernel(buf_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    acc = tl.zeros([BLOCK], dtype=tl.int64)
+    for start in range(pid * BLOCK, n, tl.num_programs(0) * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        acc += tl.load(buf_ptr + offs, mask=offs < n, other=0)
+    tl.store(out_ptr + pid, tl.sum(acc))
+
+
+@functools.cache
+def _flush_partials(device: int) -> torch.Tensor:
+    """One int64 sum per `_flush_kernel` workgroup, four workgroups per CU."""
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    return torch.empty(4 * cus, dtype=torch.int64, device=device)
+
+
 def flush_llc(device: int) -> None:
-    """Push every earlier input out of the LLC of ``device`` by reading a buffer twice its size."""
-    # Summed as int64: on gfx942 torch's float and amax reductions of this buffer
-    # leave the inputs resident.
-    llc_flush_buffer(device).sum()
+    """Push every earlier input out of the L2s and the LLC of ``device``."""
+    # Our own kernel rather than a torch reduction: on gfx942 torch's float sum of
+    # this buffer leaves the inputs cached, so the load must not be torch's choice.
+    # Workgroups go round-robin over the XCDs, so every XCD's L2 is swept.
+    buf, out = llc_flush_buffer(device), _flush_partials(device)
+    _flush_kernel[(out.numel(),)](buf, out, buf.numel(), BLOCK=1024)
