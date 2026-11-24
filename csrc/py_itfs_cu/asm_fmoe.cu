@@ -3,6 +3,8 @@
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_fmoe_configs.hpp"
+#include <cmath>
+#include <cstddef>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
@@ -66,8 +68,13 @@ struct __attribute__((packed)) KernelArgs
     unsigned int total_tgs;
     p3 _p26;
     unsigned int ps_deno;
-    p3 _p27;
+    float swiglu_limit; // 0 = no clamp; read only by the *_silu_limit_* kernels
+    p2 _p27;
 };
+// The *_silu_limit_* kernels load swiglu_limit from this offset, declared as a pad in their
+// metadata.
+static_assert(offsetof(KernelArgs, swiglu_limit) == 0x1B4, "swiglu_limit kernarg offset");
+static_assert(sizeof(KernelArgs) == 448, "KernelArgs size");
 
 enum class AsmMoeMode : int
 {
@@ -134,7 +141,8 @@ class FMoeKernel
                        aiter_tensor_t* w1_dqn        = nullptr,
                        aiter_tensor_t* w2_dqn        = nullptr,
                        aiter_tensor_t* w2_smooth_qnt = nullptr,
-                       hipStream_t stream         = nullptr)
+                       hipStream_t stream            = nullptr,
+                       float swiglu_limit            = 0.f)
     {
         int token_cnt       = out->size(0);
         int dim             = w2->size(1);
@@ -207,6 +215,7 @@ class FMoeKernel
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
+        args.swiglu_limit = swiglu_limit;
         // Kernels that remap workgroups across XCDs need total_tgs to also be a
         // multiple of tgs_align (the XCD count), or the remap skips work.
         const uint32_t tgs_unit = std::lcm(args.ps_deno, this->tgs_align);
@@ -1109,8 +1118,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                         stream);
 }
 
-static CFG* get_blockscale_cfgs(ActivationType act, bool xquant)
+// With a swiglu_limit only the kernels that apply it (*_silu_limit_*) are selectable.
+static CFG* get_blockscale_cfgs(ActivationType act, bool xquant, bool swiglu_limit = false)
 {
+    if(swiglu_limit)
+        return act != ActivationType::Silu ? nullptr
+               : xquant                    ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu_limit
+                                           : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu_limit;
     if(act == ActivationType::Silu)
         return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu
                       : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
@@ -1141,8 +1155,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     int block_size_M,
+    float swiglu_limit,                // 0 or +inf = no clamp
     hipStream_t stream),
-    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc_scale_blkn, fc_scale_blkk, fc2_smooth_scale, activation, block_size_M, stream))
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc_scale_blkn, fc_scale_blkk, fc2_smooth_scale, activation, block_size_M, swiglu_limit, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -1152,14 +1167,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int inter_dim            = down->size(2);
     int sub_X_cnt            = sorted_expert_ids->size(0);
     std::string kernel_name_str = kernel_name ? kernel_name : "";
+    AITER_CHECK(!std::isnan(swiglu_limit) && swiglu_limit >= 0.f,
+                __func__,
+                "swiglu_limit must be >= 0 (0 or +inf = no clamp)");
+    // The kernels skip the clamp only for an all-zero bit pattern (+0, not -0).
+    if(std::isinf(swiglu_limit) || swiglu_limit == 0.f)
+        swiglu_limit = 0.f;
 
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
-        config_map = get_blockscale_cfgs(act, input->dtype() == AITER_DTYPE_bf16);
+        config_map =
+            get_blockscale_cfgs(act, input->dtype() == AITER_DTYPE_bf16, swiglu_limit != 0.f);
         AITER_CHECK(config_map != nullptr,
                     __func__,
-                    "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
+                    swiglu_limit != 0.f
+                        ? "no fmoe_fp8_blockscale_g1u1 kernel applies swiglu_limit for this "
+                          "activation"
+                        : "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr = get_heuristic_kernel(inter_dim,
                                         sorted_expert_ids->size(0),
@@ -1182,7 +1207,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                              fc1_scale,
                                              fc2_scale,
                                              fc2_smooth_scale,
-                                             stream);
+                                             stream,
+                                             swiglu_limit);
     }
     else
         AITER_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");

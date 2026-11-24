@@ -7,7 +7,8 @@ import itertools
 import logging
 import os
 import sys
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -2543,13 +2544,69 @@ def _quant_blockscale_weight(w):
     return q, scale.view(e, n // 128, k // 128)
 
 
+def _raises(error, match, fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except error as e:
+        assert match in str(e), e
+        return
+    raise AssertionError(f"expected {error.__name__} ({match})")
+
+
+def _fmoe_row_key(token, model_dim, inter_dim, experts, topk, q_type):
+    """Tuned-row key of an FP8 SiLU g1u1 MoE with bf16 output."""
+    fp8 = str(dtypes.fp8)
+    dims = (token, model_dim, inter_dim, experts, topk)
+    types = ("ActivationType.Silu", str(dtypes.bf16), fp8, fp8, str(q_type))
+    return (get_gfx_runtime(), get_cu_num(), *dims, *types, True, False)
+
+
+@contextmanager
+def _swiglu_limit_rows(limit, rows):
+    """Serve `rows` ({row key: row}) as the rows tuned with this swiglu_limit."""
+    fused_moe_mod = sys.modules["aiter.fused_moe"]
+    cache = fused_moe_mod.cfg_2stages_by_limit_tag
+    tag = fused_moe_mod.swiglu_limit_tag(limit)
+    slot = (AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE, tag)
+    saved = cache.get(slot)
+    cache[slot] = (rows, {})
+    get_2stage_cfgs.cache_clear()
+    try:
+        yield
+    finally:
+        if saved is None:
+            cache.pop(slot, None)
+        else:
+            cache[slot] = saved
+        get_2stage_cfgs.cache_clear()
+
+
+# gfx950 asm 1-stage kernels that apply swiglu_limit, with the (block_m, flat, xbf16)
+# of the tuned rows that name them, and the shape the tests run them at.
+_BLOCKSCALE_LIMIT_ASM_KERNELS = {
+    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x128E": (1, 1, 1),
+    "_ZN5aiter54fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_limit_1x256E": (1, 1, 1),
+    "_ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_limit_64x256E": (64, 0, 0),
+}
+_BLOCKSCALE_LIMIT_ASM_DIMS = (4096, 1024)
+
+
+def _blockscale_limit_asm_row(kernel, block_m=1, flat=1, xbf16=1):
+    row = {"block_m": block_m, "ksplit": 0, "run_1stage": 1, "kernelName1": kernel}
+    return {**row, "kernelName2": "", "flat": flat, "nt": 0, "xbf16": xbf16}
+
+
 @benchmark()
-def test_blockscale_swiglu_limit(token, swiglu_limit):
-    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
+def test_blockscale_swiglu_limit(token, swiglu_limit, asm_kernel=None):
+    # asm_kernel: the kernel a limit-tagged 1-stage row names; else the CK path.
+    model_dim, inter_dim = _BLOCKSCALE_LIMIT_ASM_DIMS if asm_kernel else (256, 256)
+    experts, topk = 8, 2
     torch.manual_seed(token)
     x = torch.randn(token, model_dim, dtype=dtypes.bf16)
+    # Gate/up pre-activations of std ~8 put most of them past the limits swept.
     w1, s1 = _quant_blockscale_weight(
-        torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16) * 0.5
+        torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16)
+        * (8.0 / model_dim**0.5)
     )
     w2, s2 = _quant_blockscale_weight(
         torch.randn(experts, model_dim, inter_dim, dtype=dtypes.bf16) / inter_dim**0.5
@@ -2558,19 +2615,23 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
     weights, ids = fused_topk(x, router, topk, True)
     xq, xs = aiter.pertoken_quant(x.view(token, -1, 128), quant_dtype=dtypes.fp8)
     xq = xq.view_as(x)
-    stage1 = torch_moe_stage1(
-        xq,
-        w1,
-        w2,
-        weights,
-        ids,
-        dtype=dtypes.bf16,
-        activation=aiter.ActivationType.Silu,
-        quant_type=aiter.QuantType.per_1x128,
-        a1_scale=xs.squeeze(-1),
-        w1_scale=s1,
-        swiglu_limit=swiglu_limit,
-    )
+
+    def stage1_reference(limit):
+        return torch_moe_stage1(
+            xq,
+            w1,
+            w2,
+            weights,
+            ids,
+            dtype=dtypes.bf16,
+            activation=aiter.ActivationType.Silu,
+            quant_type=aiter.QuantType.per_1x128,
+            a1_scale=xs.squeeze(-1),
+            w1_scale=s1,
+            swiglu_limit=limit,
+        )
+
+    stage1 = stage1_reference(swiglu_limit)
 
     def stage2_reference(y):
         yq, ys = aiter.pertoken_quant(y.view(token, -1, 128), quant_dtype=dtypes.fp8)
@@ -2604,54 +2665,117 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
         swapped_ref = stage2_reference(swapped.to(dtypes.bf16))
         swapped_diff = logits_difference(ref, swapped_ref)
         assert swapped_diff > 0.01, "test inputs must distinguish the clamp order"
+    unclamped_diff = None
+    if asm_kernel:
+        unclamped_diff = logits_difference(
+            ref, stage2_reference(stage1_reference(None))
+        )
+        assert unclamped_diff > 0.01, "test inputs must exercise the limit"
 
     w1_sh = shuffle_weight(w1, layout=(16, 16))
     w2_sh = shuffle_weight(w2, layout=(16, 16))
     out = torch.empty(token, model_dim, dtype=dtypes.bf16)
-    actual = fused_moe(
-        x,
-        w1_sh,
-        w2_sh,
-        weights,
-        ids,
-        w1_scale=s1,
-        w2_scale=s2,
-        quant_type=aiter.QuantType.per_128x128,
-        activation=aiter.ActivationType.Silu,
-        swiglu_limit=swiglu_limit,
-        output=out,
+    with ExitStack() as stack:
+        if asm_kernel:
+            key = (get_padded_M(token), model_dim, inter_dim, experts, topk)
+            key = _fmoe_row_key(*key, aiter.QuantType.per_1x128)
+            row = _blockscale_limit_asm_row(
+                asm_kernel, *_BLOCKSCALE_LIMIT_ASM_KERNELS[asm_kernel]
+            )
+            rows = {key: row}
+            stack.enter_context(_swiglu_limit_rows(swiglu_limit, rows))
+            op = stack.enter_context(
+                mock.patch.object(
+                    aiter,
+                    "fmoe_fp8_blockscale_g1u1",
+                    wraps=aiter.fmoe_fp8_blockscale_g1u1,
+                )
+            )
+        actual = fused_moe(
+            x,
+            w1_sh,
+            w2_sh,
+            weights,
+            ids,
+            w1_scale=s1,
+            w2_scale=s2,
+            quant_type=aiter.QuantType.per_128x128,
+            activation=aiter.ActivationType.Silu,
+            swiglu_limit=swiglu_limit,
+            output=out,
+        )
+    if asm_kernel:
+        # fused_moe_1stage passes the kernel name 13th.
+        launch = (op.call_args.args[12], op.call_args.kwargs["swiglu_limit"])
+        assert op.call_count == 1 and launch == (asm_kernel, swiglu_limit), launch
+    # 1-stage asm outputs differ element-wise from the two-stage reference with or
+    # without a limit; compare them by logits only.
+    msg = f"blockscale limit={swiglu_limit} {asm_kernel or 'ck'}"
+    err = checkAllclose(
+        ref.float(),
+        actual.float(),
+        rtol=0.05,
+        atol=0.05,
+        msg=msg,
+        printLog=not asm_kernel,
     )
-    msg = f"blockscale limit={swiglu_limit}"
-    err = checkAllclose(ref.float(), actual.float(), rtol=0.05, atol=0.05, msg=msg)
     logits_diff = logits_difference(ref, actual)
-    assert err < 0.05 and logits_diff < 1e-3, (err, logits_diff)
+    assert logits_diff < 1e-3 and (asm_kernel or err < 0.05), (err, logits_diff)
     return {
         "gfx": get_gfx(),
-        "ck logits_diff": logits_diff,
-        "ck err": err,
+        "logits_diff": logits_diff,
+        "err": err,
         "swapped logits_diff": swapped_diff,
+        "unclamped logits_diff": unclamped_diff,
     }
+
+
+def test_blockscale_swiglu_limit_kernel_guard():
+    # A swiglu_limit never reaches a kernel that cannot apply it.
+    shipped = "_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_1x128E"
+    model_dim, inter_dim = _BLOCKSCALE_LIMIT_ASM_DIMS
+    q = aiter.QuantType.per_1x128
+    key = _fmoe_row_key(1, model_dim, inter_dim, 8, 2, q)
+    with _swiglu_limit_rows(7.0, {key: _blockscale_limit_asm_row(shipped)}):
+        _raises(
+            ValueError,
+            "Incompatible",
+            get_2stage_cfgs,
+            *(1, model_dim, inter_dim, 8, 2, dtypes.bf16, dtypes.fp8, dtypes.fp8, q),
+            *(True, aiter.ActivationType.Silu, False, 0, 0),
+            swiglu_limit=7.0,
+        )
+    # The op looks the name up among the kernels that apply the limit only.
+    model_dim, inter_dim = 256, 128
+    f32 = torch.zeros(4, dtype=torch.float32)
+    i32 = torch.zeros(4, dtype=torch.int32)
+    _raises(
+        RuntimeError,
+        "not find kernel",
+        aiter.fmoe_fp8_blockscale_g1u1,
+        torch.empty((1, model_dim), dtype=dtypes.bf16),
+        torch.zeros((1, model_dim), dtype=dtypes.bf16),
+        torch.zeros((1, 2 * inter_dim, model_dim), dtype=dtypes.fp8),
+        torch.zeros((1, model_dim, inter_dim), dtype=dtypes.fp8),
+        *(i32, f32, i32, i32, 1, f32, f32, f32, shipped),
+        fc_scale_blkn=128,
+        fc_scale_blkk=128,
+        swiglu_limit=7.0,
+    )
 
 
 def test_swiglu_limit_guards():
     from aiter.ops.moe_limits import normalize_swiglu_limit as norm
 
-    def raises(error, fn, *args, **kwargs):
-        try:
-            fn(*args, **kwargs)
-        except error:
-            return
-        raise AssertionError(f"expected {error.__name__}")
-
     assert all(norm(x) is None for x in (None, 0, float("inf")))
     assert norm(5) == 5.0
     for invalid in (-1.0, float("nan")):
-        raises(ValueError, norm, invalid)
+        _raises(ValueError, "", norm, invalid)
     ck, asm = aiter.fused_moe.ck_moe_stage1, aiter.fused_moe.asm_stage1
     kw = {"activation": aiter.ActivationType.Silu, "swiglu_limit": 5.0}
     q = aiter.QuantType.No
-    raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
-    raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
+    _raises(NotImplementedError, "", ck, *([None] * 11), quant_type=q, **kw)
+    _raises(NotImplementedError, "", asm, *([None] * 9), ksplit=0, **kw)
 
 
 def run_blockscale_limit_cases():
@@ -2662,6 +2786,14 @@ def run_blockscale_limit_cases():
         # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
         if limit is not None or token <= 32
     ]
+    if get_gfx() == "gfx950":
+        rows += [
+            test_blockscale_swiglu_limit(token, limit, kernel)
+            for kernel, token, limit in itertools.product(
+                _BLOCKSCALE_LIMIT_ASM_KERNELS, (1, 4), (1.0, 7.0)
+            )
+        ]
+        test_blockscale_swiglu_limit_kernel_guard()
     aiter.logger.info(
         "blockscale SiLU limit summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
@@ -2850,14 +2982,6 @@ def test_plain_fp8_swiglu_limit_dispatch():
             swiglu_limit=limit,
         )
 
-    def raises(error, match, fn, *args, **kwargs):
-        try:
-            fn(*args, **kwargs)
-        except error as e:
-            assert match in str(e), e
-            return
-        raise AssertionError(f"expected {error.__name__} ({match})")
-
     for q, token in itertools.product(quant_types, (1, 64, 1024)):
         # Without a limit, 64+ per_Token tokens take ASM 1-stage.
         for limit in (7.0, 5.0):
@@ -2892,31 +3016,20 @@ def test_plain_fp8_swiglu_limit_dispatch():
     )
     row = {"block_m": 32, "ksplit": 0, "run_1stage": 0, "kernelName1": kn1}
     row.update(kernelName2=kn2, flat=0, nt=0, xbf16=0)
-    key = (get_gfx_runtime(), get_cu_num(), 1, model_dim, inter_dim, experts, topk)
-    key += ("ActivationType.Silu", str(dtypes.bf16), str(fp8), str(fp8))
-    key += (str(aiter.QuantType.per_Token), True, False)
-    cache = fused_moe_mod.cfg_2stages_by_limit_tag
-    slot = (AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE, "swiglu_limit=3")
-    saved = cache.get(slot)
-    try:
-        cache[slot] = ({key: row}, {})
-        md = dispatch(1, aiter.QuantType.per_Token, 3.0)
+    per_token = aiter.QuantType.per_Token
+    key = _fmoe_row_key(1, model_dim, inter_dim, experts, topk, per_token)
+    with _swiglu_limit_rows(3.0, {key: row}):
+        md = dispatch(1, per_token, 3.0)
         assert md.stage1.keywords["kernelName"] == kn1, md.stage1.keywords
         assert md.stage2.keywords["kernelName"] == kn2, md.stage2.keywords
         assert int(md.block_m) == 32, md.block_m
-        cache[slot] = ({key: {**row, "run_1stage": 1}}, {})
-        raises(ValueError, "Incompatible", dispatch, 1, aiter.QuantType.per_Token, 3.0)
-    finally:
-        if saved is None:
-            cache.pop(slot, None)
-        else:
-            cache[slot] = saved
-        get_2stage_cfgs.cache_clear()
+    with _swiglu_limit_rows(3.0, {key: {**row, "run_1stage": 1}}):
+        _raises(ValueError, "Incompatible", dispatch, 1, per_token, 3.0)
 
     for q in quant_types:
         # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
-        raises(
+        _raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        _raises(
             NotImplementedError,
             "swiglu_limit",
             fused_moe_mod.asm_stage1,
@@ -2929,7 +3042,7 @@ def test_plain_fp8_swiglu_limit_dispatch():
             quant_type=q,
             swiglu_limit=7.0,
         )
-    raises(
+    _raises(
         NotImplementedError,
         "swiglu_limit",
         dispatch,
