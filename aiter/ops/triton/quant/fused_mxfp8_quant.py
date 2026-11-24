@@ -821,6 +821,28 @@ def _launch_two_stage_sparse_attn_compressor(
     num_actual: int,
     compress_scratch: torch.Tensor,
 ) -> None:
+    if head_dim != 512:
+        raise NotImplementedError(
+            f"the two-stage compressor supports head_dim 512, got {head_dim}"
+        )
+    if compress_scratch.dtype != torch.float32:
+        raise ValueError(
+            "compress_scratch must be float32, got "
+            f"{compress_scratch.dtype}"
+        )
+    if compress_scratch.dim() != 2 or compress_scratch.shape[1] != head_dim:
+        raise ValueError(
+            f"compress_scratch must be [num_actual, {head_dim}], got "
+            f"{tuple(compress_scratch.shape)}"
+        )
+    if compress_scratch.shape[0] < num_actual:
+        raise ValueError(
+            f"compress_scratch has {compress_scratch.shape[0]} rows, "
+            f"need at least {num_actual}"
+        )
+    if not compress_scratch.is_contiguous():
+        raise ValueError("compress_scratch must be contiguous")
+
     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
     scratch = compress_scratch[:num_actual]
