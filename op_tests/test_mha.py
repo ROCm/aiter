@@ -1638,3 +1638,179 @@ def test_flash_attn_func_sink_bypasses_v3_asm(sink, window, monkeypatch):
         assert ck_args["sink_ptr"] is None
     else:
         assert torch.equal(ck_args["sink_ptr"], sink_ptr)
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 FlyDSL backward: bf16, hdim 128, batch mode, no mask or bottom-right
+# causal. Opt-in with AITER_FLYDSL_MHA_BWD=1; the default stays on the asm kernels.
+# ---------------------------------------------------------------------------
+
+#   (batch_size, seqlen_q, seqlen_k, nheads, nheads_k)
+_FLYDSL_BWD_CASES = [
+    (1, 128, 128, 1, 1),
+    (2, 256, 256, 4, 4),
+    (1, 97, 203, 2, 1),  # partial Q tile and KV block, seqlen_q < seqlen_k
+    (1, 203, 97, 2, 2),  # seqlen_q > seqlen_k: fully masked causal rows
+    (2, 1, 129, 2, 1),
+    (1, 513, 513, 8, 2),
+    (1, 1000, 1000, 4, 4),
+    (1, 640, 640, 16, 1),
+    (1, 2000, 100, 2, 1),
+    (1, 100, 2000, 2, 1),
+    # 640 work items: a whole XCD-swizzle run of 512 plus a partial one, and
+    # 2-3 items per persistent workgroup
+    (2, 2048, 2048, 20, 4),
+    (2, 2048, 2048, 40, 8),
+]
+
+
+def _flydsl_bwd_skip():
+    if get_gfx_runtime() != "gfx1250" or not mha_ops._FLYDSL_AVAILABLE:
+        pytest.skip("the FlyDSL hdim-128 backward targets gfx1250")
+
+
+def _flydsl_bwd_inputs(batch_size, seqlen_q, seqlen_k, nheads, nheads_k):
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            batch_size, s, h, 128, device="cuda", dtype=dtypes.bf16, requires_grad=True
+        )
+        for s, h in ((seqlen_q, nheads), (seqlen_k, nheads_k), (seqlen_k, nheads_k))
+    )
+    dout = torch.randn(
+        batch_size, seqlen_q, nheads, 128, device="cuda", dtype=dtypes.bf16
+    )
+    return q, k, v, dout
+
+
+def _flydsl_bwd_check(tag, grads, q, k, v, dout, causal):
+    """dq / dk / dv vs the fp32 reference, within 10x the error of a bf16 torch run."""
+    _, _, *ref = run_torch(q, k, v, dout=dout, causal=causal)
+    _, _, *pt = run_torch(
+        q, k, v, dout=dout, causal=causal, upcast=False, reorder_ops=True
+    )
+    for name, got, r, p in zip(("dq", "dk", "dv"), grads, ref, pt):
+        tol = max(10 * (p - r).abs().max().item(), 0.01)
+        diff = (got - r).abs().max().item()
+        print(f"[{tag}] {name} max diff: {diff} tol={tol}")
+        assert diff <= tol, f"{tag}: {name} max diff {diff} > {tol}"
+
+
+def _flydsl_bwd_spy(monkeypatch):
+    """Record the calls that reach flydsl_fmha_bwd."""
+    from aiter.ops.flydsl import fmha_kernels
+
+    calls = []
+    flydsl_fmha_bwd = fmha_kernels.flydsl_fmha_bwd
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return flydsl_fmha_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_kernels, "flydsl_fmha_bwd", spy)
+    return calls
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_k,nheads,nheads_k", _FLYDSL_BWD_CASES
+)
+def test_flash_attn_func_flydsl_bwd(
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, causal, monkeypatch
+):
+    """flash_attn_func autograd with the backward routed to FlyDSL."""
+    _flydsl_bwd_skip()
+    monkeypatch.setenv("AITER_FLYDSL_MHA_BWD", "1")
+    calls = _flydsl_bwd_spy(monkeypatch)
+    q, k, v, dout = _flydsl_bwd_inputs(batch_size, seqlen_q, seqlen_k, nheads, nheads_k)
+    # FlashAttnFunc saves the LSE for the backward only with return_lse=True, and
+    # flash_attn_func defaults to deterministic=True, which the FlyDSL backward declines
+    out, _ = aiter.flash_attn_func(
+        q, k, v, causal=causal, deterministic=False, return_lse=True
+    )
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    assert len(calls) == 1, "the backward did not reach the FlyDSL kernels"
+    _flydsl_bwd_check("flydsl-bwd", grads, q, k, v, dout, causal)
+
+
+def test_flash_attn_func_flydsl_bwd_off_by_default(monkeypatch):
+    """Without AITER_FLYDSL_MHA_BWD the backward stays on the asm kernels."""
+    _flydsl_bwd_skip()
+    monkeypatch.delenv("AITER_FLYDSL_MHA_BWD", raising=False)
+    calls = _flydsl_bwd_spy(monkeypatch)
+    asm_calls = _sink_dispatch_record(monkeypatch, "fmha_v3_bwd", "mha_bwd")
+    q, k, v, dout = _flydsl_bwd_inputs(2, 256, 256, 4, 4)
+    out, _ = aiter.flash_attn_func(
+        q, k, v, causal=True, deterministic=False, return_lse=True
+    )
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    assert not calls, "the backward took the FlyDSL path without AITER_FLYDSL_MHA_BWD"
+    assert asm_calls["asm"] == 1 and not asm_calls["ck"]
+    _flydsl_bwd_check("asm-bwd", grads, q, k, v, dout, True)
+
+
+def _flydsl_bwd_strided(t, layout):
+    """A copy of t ([b, s, h, d] values) as a view with another memory layout."""
+    if layout == "bhsd":
+        return t.transpose(1, 2).contiguous().transpose(1, 2)
+    if layout == "sbhd":
+        return t.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)
+    b, s, h, d = t.shape  # "padded": row stride (h + 1) * d
+    buf = torch.zeros(b, s, h + 1, d, dtype=t.dtype, device=t.device)
+    buf[:, :, :h] = t
+    return buf[:, :, :h]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("layout", ["bhsd", "sbhd", "padded"])
+def test_flydsl_fmha_bwd_layouts(layout, causal):
+    """flydsl_fmha_bwd on strided views, writing into strided dq / dk / dv views
+    prefilled with NaN so that an unwritten element fails the comparison."""
+    _flydsl_bwd_skip()
+    from aiter.ops.flydsl.fmha_kernels import (
+        flydsl_fmha_bwd,
+        flydsl_fmha_bwd_supported,
+    )
+
+    q, k, v, dout = _flydsl_bwd_inputs(2, 300, 333, 4, 2)
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    args = [_flydsl_bwd_strided(x.detach(), layout) for x in (dout, q, k, v, out)]
+    grads = [
+        _flydsl_bwd_strided(torch.full_like(x, float("nan")), layout) for x in (q, k, v)
+    ]
+    wr = 0 if causal else -1
+    assert flydsl_fmha_bwd_supported(*args, lse, 0.0, causal, -1, wr, False)
+    flydsl_fmha_bwd(
+        *args,
+        lse,
+        0.0,
+        128**-0.5,
+        causal,
+        -1,
+        wr,
+        False,
+        dq=grads[0],
+        dk=grads[1],
+        dv=grads[2],
+    )
+    _flydsl_bwd_check(f"flydsl-bwd-{layout}", grads, q, k, v, dout, causal)
+
+
+def test_flydsl_fmha_bwd_rejects():
+    """Configurations the FlyDSL backward leaves to the asm / CK kernels."""
+    _flydsl_bwd_skip()
+    from aiter.ops.flydsl.fmha_kernels import flydsl_fmha_bwd_supported
+
+    q, k, v, dout = (x.detach() for x in _flydsl_bwd_inputs(1, 64, 64, 2, 2))
+    out = torch.randn_like(q)
+    lse = torch.randn(1, 2, 64, device="cuda", dtype=torch.float32)
+    sup = flydsl_fmha_bwd_supported
+    assert sup(dout, q, k, v, out, lse, 0.0, False, -1, -1, False)
+    assert not sup(dout, q, k, v, out, lse, 0.1, False, -1, -1, False)  # dropout
+    assert not sup(dout, q, k, v, out, lse, 0.0, False, 16, 16, False)  # window
+    assert not sup(dout, q, k, v, out, lse, 0.0, True, -1, 0, True)  # deterministic
+    q64 = q[..., :64]
+    assert not sup(dout, q64, k, v, out, lse, 0.0, False, -1, -1, False)  # hdim 64
+    qh = q.half()
+    assert not sup(dout, qh, k, v, out, lse, 0.0, False, -1, -1, False)  # fp16

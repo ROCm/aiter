@@ -1,4 +1,4 @@
-# MI450/gfx1250 P1 operator selectors: 255 nodes.
+# MI450/gfx1250 P1 operator selectors: 287 nodes.
 #
 # Bounded from the P1 candidate files after a full gfx1250 triage; every node
 # passed on gfx1250 hardware. Each line is an exact selector and its node
@@ -78,3 +78,12 @@ op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[trit
 op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-False-True-192-9216-7168]
 op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-False-False-8000-7168-4608]
 op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-True-False-5120-5120-5120]
+
+# FlyDSL MHA backward (bf16, hdim 128, batch mode; opt-in with AITER_FLYDSL_MHA_BWD=1):
+# flash_attn_func autograd routed to it, the asm path kept without the variable,
+# strided views through flydsl_fmha_bwd, and the configurations it leaves to the
+# asm / CK kernels.
+op_tests/test_mha.py::test_flash_attn_func_flydsl_bwd 24
+op_tests/test_mha.py::test_flash_attn_func_flydsl_bwd_off_by_default 1
+op_tests/test_mha.py::test_flydsl_fmha_bwd_layouts 6
+op_tests/test_mha.py::test_flydsl_fmha_bwd_rejects 1

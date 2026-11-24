@@ -70,6 +70,8 @@ __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_fwd",
+    "flydsl_fmha_bwd",
+    "flydsl_fmha_bwd_supported",
 ]
 
 _FP8_DTYPES = (torch.float8_e4m3fn,)
@@ -1164,3 +1166,99 @@ def flydsl_flash_attn_varlen_bwd(
         dv=dv,
     )
     return dq, dk, dv, softmax_d
+
+
+def flydsl_fmha_bwd_supported(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    alibi_slopes: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+) -> bool:
+    """True when ``flydsl_fmha_bwd`` serves this batch-mode backward (gfx1250, bf16, hdim 128,
+    no mask or bottom-right causal, no dropout / alibi / bias / window / sink, not deterministic).
+    """
+    # imported here so that the other FlyDSL entry points do not load the gfx1250 kernels
+    from .fmha_bwd_gfx1250 import flash_attn_bwd_hd128_gfx1250_supported
+
+    return flash_attn_bwd_hd128_gfx1250_supported(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dropout_p=dropout_p,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        causal=is_causal,
+        alibi_slopes=alibi_slopes,
+        bias=bias,
+        deterministic=deterministic,
+        sink=sink,
+    )
+
+
+def flydsl_fmha_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool = True,
+    how_v3_bf16_cvt: int = 1,
+    dq: torch.Tensor | None = None,
+    dk: torch.Tensor | None = None,
+    dv: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    rng_state: torch.Tensor | None = None,
+    gen: torch.Generator | None = None,
+) -> list[torch.Tensor]:
+    """FlyDSL MHA backward, batch mode BSHD -- same arguments and return as ``fmha_v3_bwd``.
+
+    Returns ``[dq, dk, dv, softmax_d]``; ``dq`` / ``dk`` / ``dv`` are filled in place when
+    given. The kernels mirror the gfx1250 asm backward (fp32 dQ atomics, so
+    ``is_v3_atomic_fp32`` and ``how_v3_bf16_cvt`` have nothing to select; bf16 conversion is
+    round-to-nearest-even). ``rng_state`` / ``gen`` are unused because dropout is unsupported.
+    Raises ``ValueError`` when ``flydsl_fmha_bwd_supported`` rejects the configuration.
+    """
+    del is_v3_atomic_fp32, how_v3_bf16_cvt, rng_state, gen
+    if not flydsl_fmha_bwd_supported(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dropout_p,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        deterministic,
+        alibi_slopes,
+    ):
+        raise ValueError(
+            "flydsl_fmha_bwd: unsupported configuration (see flydsl_fmha_bwd_supported)"
+        )
+    from .fmha_bwd_gfx1250 import flash_attn_bwd_hd128_gfx1250
+
+    dq, dk, dv, softmax_d = flash_attn_bwd_hd128_gfx1250(
+        dout, q, k, v, out, softmax_lse, softmax_scale, is_causal, dq=dq, dk=dk, dv=dv
+    )
+    return [dq, dk, dv, softmax_d]

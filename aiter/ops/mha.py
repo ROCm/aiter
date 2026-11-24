@@ -2913,6 +2913,50 @@ def _flash_attn_backward(
     sink: Tensor | None = None,
     d_sink: Tensor | None = None,
 ) -> torch.Tensor:
+    # FlyDSL port of the gfx1250 hdim-128 asm backward, opt-in with AITER_FLYDSL_MHA_BWD=1;
+    # without it, or for a call it does not support, the dispatch below is unchanged
+    if (
+        _FLYDSL_AVAILABLE
+        and int(os.environ.get("AITER_FLYDSL_MHA_BWD", "0")) != 0
+        and dbias is None
+        and d_sink is None
+    ):
+        from .flydsl.fmha_kernels import flydsl_fmha_bwd, flydsl_fmha_bwd_supported
+
+        if flydsl_fmha_bwd_supported(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dropout_p,
+            causal,
+            window_size_left,
+            window_size_right,
+            deterministic,
+            alibi_slopes,
+            bias,
+            sink,
+        ):
+            return flydsl_fmha_bwd(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq=dq,
+                dk=dk,
+                dv=dv,
+            )[3]
+
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
         how_v3_bf16_cvt = 0
