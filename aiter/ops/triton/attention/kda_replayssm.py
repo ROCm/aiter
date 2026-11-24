@@ -56,7 +56,9 @@ def replayssm_sigmoid_gating_delta_rule(
     multiple of H. A_log and dt_bias contain HV and HV*128 FP32 values.
     Activations may use BF16, FP16 or FP32. K and V must both be 128.
 
-    ckpt is FP32 [slots, HV, 128, 128]. buf_k, buf_u and buf_g are
+    ckpt is FP32, FP16 or BF16 [slots, HV, 128, 128]. The replay and
+    the token steps run in FP32 whatever ckpt stores; a flush rounds the
+    rebuilt state to ckpt's dtype. buf_k, buf_u and buf_g are
     [slots, HV, capacity, 128] records. k/u records may use BF16, FP16
     or FP32; g records use FP32. The last record dimension is contiguous.
     write_pos is int32 [slots], slot_idx is int32 [requests], and
@@ -96,8 +98,10 @@ def replayssm_sigmoid_gating_delta_rule(
     floating = (torch.bfloat16, torch.float16, torch.float32)
     if any(x.dtype not in floating for x in (q, k, v, a, b, buf_k, buf_u)):
         raise ValueError("activations and k/u records must use BF16, FP16 or FP32")
-    if any(x.dtype != torch.float32 for x in (A_log, dt_bias, ckpt, buf_g)):
-        raise ValueError("gates, checkpoint and g records must use FP32")
+    if any(x.dtype != torch.float32 for x in (A_log, dt_bias, buf_g)):
+        raise ValueError("gates and g records must use FP32")
+    if ckpt.dtype not in floating:
+        raise ValueError("the checkpoint must use FP32, FP16 or BF16")
     if ckpt.ndim != 4 or ckpt.shape[1:] != (HV, V, K):
         raise ValueError("ckpt must have shape [slots, HV, V, K]")
     slots = ckpt.shape[0]

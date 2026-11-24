@@ -110,7 +110,17 @@ def ref_replayssm_kda(
     return o, ckpt, buf_k, buf_u, buf_g, flushed, record
 
 
-def make_inputs(m, mode, pad_rows=1, seed=0, *, t=None, cap=CAP, dtype=torch.bfloat16):
+def make_inputs(
+    m,
+    mode,
+    pad_rows=1,
+    seed=0,
+    *,
+    t=None,
+    cap=CAP,
+    dtype=torch.bfloat16,
+    ckpt_dtype=torch.float32,
+):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
 
     def randn(*shape, scale=1.0):
@@ -134,7 +144,8 @@ def make_inputs(m, mode, pad_rows=1, seed=0, *, t=None, cap=CAP, dtype=torch.bfl
         .log()
     )
     dt_bias = randn(PROJ, scale=0.5)
-    ckpt = randn(num_slots, H, V, K, scale=0.1)  # ssm_state: fp32, [slot, HV, V, K]
+    # ssm_state: [slot, HV, V, K], in the model's state dtype
+    ckpt = randn(num_slots, H, V, K, scale=0.1).to(ckpt_dtype)
     # Records as the kernel writes them: L2-normalised k, u, and a log-decay g in (lower_bound, 0)
     buf_k = F.normalize(randn(num_slots, H, cap, K), dim=-1).to(bf16)
     buf_u = randn(num_slots, H, cap, V, scale=0.1).to(bf16)
@@ -177,10 +188,20 @@ CASES = [("spec_verify", m) for m in (1, 8, 32, 128)] + [
     ("decode", m) for m in (1, 8, 32)
 ]
 
+# Checkpoint tolerance by dtype. Kernel and reference both replay in FP32 and
+# round a flushed state to the checkpoint dtype, so a 16-bit checkpoint may
+# differ by one unit in the last place.
+CKPT_TOL = {
+    torch.float32: (1e-5, 1e-4),
+    torch.float16: (1e-3, 1e-3),
+    torch.bfloat16: (1e-2, 1e-2),
+}
 
+
+@pytest.mark.parametrize("ckpt_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mode,m", CASES)
-def test_replayssm_kda_fwd(mode, m):
-    inp, live = make_inputs(m, mode)
+def test_replayssm_kda_fwd(mode, m, ckpt_dtype):
+    inp, live = make_inputs(m, mode, ckpt_dtype=ckpt_dtype)
     ref_o, ref_ckpt, ref_bk, ref_bu, ref_bg, flushed, record = ref_replayssm_kda(
         **inp, use_qk_l2norm=True, lower_bound=LOWER_BOUND
     )
@@ -210,7 +231,9 @@ def test_replayssm_kda_fwd(mode, m):
     )
 
     torch.testing.assert_close(out[:live], ref_o[:live], atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(state["ckpt"], ref_ckpt, atol=1e-5, rtol=1e-4)
+    assert state["ckpt"].dtype == ckpt_dtype
+    ckpt_atol, ckpt_rtol = CKPT_TOL[ckpt_dtype]
+    torch.testing.assert_close(state["ckpt"], ref_ckpt, atol=ckpt_atol, rtol=ckpt_rtol)
     torch.testing.assert_close(state["buf_k"], ref_bk, atol=1e-3, rtol=1e-2)
     torch.testing.assert_close(state["buf_u"], ref_bu, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(state["buf_g"], ref_bg, atol=1e-5, rtol=1e-5)
@@ -241,21 +264,25 @@ def _check_transition(inputs, out):
     )
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, expected[0], atol=2e-3, rtol=2e-2)
+    ckpt_atol, ckpt_rtol = CKPT_TOL[inputs["ckpt"].dtype]
     for key, want, atol, rtol in zip(
         ("ckpt", "buf_k", "buf_u", "buf_g"),
         expected[1:5],
-        (1e-5, 1e-3, 2e-3, 1e-5),
-        (1e-4, 1e-2, 2e-2, 1e-5),
+        (ckpt_atol, 1e-3, 2e-3, 1e-5),
+        (ckpt_rtol, 1e-2, 2e-2, 1e-5),
     ):
         torch.testing.assert_close(inputs[key], want, atol=atol, rtol=rtol)
     for key, want in metadata.items():
         assert torch.equal(inputs[key], want)
 
 
+@pytest.mark.parametrize("ckpt_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("live", [109, 128])
 @pytest.mark.parametrize("seed", [0, 7])
-def test_verify_two_transitions(live, seed):
-    inputs, _ = make_inputs(128, "spec_verify", pad_rows=0, seed=seed)
+def test_verify_two_transitions(live, seed, ckpt_dtype):
+    inputs, _ = make_inputs(
+        128, "spec_verify", pad_rows=0, seed=seed, ckpt_dtype=ckpt_dtype
+    )
     if live < 128:
         for key in ("q", "k", "v", "a", "b"):
             inputs[key] = inputs[key][:, : live * 5]
@@ -278,8 +305,9 @@ def test_dtypes_and_chunks(dtype, t, cap):
     _check_transition(inputs, out)
 
 
-def test_capture_and_side_stream():
-    inputs, _ = make_inputs(8, "spec_verify", pad_rows=0)
+@pytest.mark.parametrize("ckpt_dtype", [torch.float32, torch.float16])
+def test_capture_and_side_stream(ckpt_dtype):
+    inputs, _ = make_inputs(8, "spec_verify", pad_rows=0, ckpt_dtype=ckpt_dtype)
     captured = _clone_state(inputs)
     eager = _clone_state(inputs)
     out = torch.zeros((40, H, V), device=DEVICE, dtype=torch.bfloat16)
@@ -307,6 +335,13 @@ def test_capture_and_side_stream():
     torch.testing.assert_close(out, eager_out, atol=0, rtol=0)
     for key in ("ckpt", "buf_k", "buf_u", "buf_g"):
         torch.testing.assert_close(captured[key], eager[key], atol=0, rtol=0)
+
+
+def test_reject_fp64_checkpoint():
+    inputs, _ = make_inputs(1, "spec_verify", pad_rows=0)
+    inputs["ckpt"] = inputs["ckpt"].double()
+    with pytest.raises(ValueError, match="checkpoint"):
+        replayssm_sigmoid_gating_delta_rule(**inputs)
 
 
 def test_reject_short_record_capacity():
