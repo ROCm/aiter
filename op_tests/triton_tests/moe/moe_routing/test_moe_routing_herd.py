@@ -28,7 +28,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 def _skip_if_unsupported():
     if not torch.cuda.is_available():
         pytest.skip("HERD routing requires a GPU")
-    if get_arch() not in ["gfx950", "gfx1250"]:
+    if get_arch() not in ["gfx950", "gfx1250", "gfx1250-strict"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
 

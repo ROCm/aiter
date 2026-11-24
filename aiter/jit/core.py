@@ -22,6 +22,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -161,6 +162,17 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
 )
 
 AITER_CONFIG_FHMOE = os.getenv(
@@ -306,6 +318,18 @@ def _prebuild_mxfp4_tuning():
     return module
 
 
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
+
+
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
@@ -382,6 +406,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
         )
 
     @property
@@ -819,15 +851,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -838,9 +863,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
@@ -1063,6 +1086,50 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
+
+
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1434,21 +1501,6 @@ def build_module(
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
-    if md_name.startswith("module_mega_mhc_stream_"):
-        # Keep source selection and host dispatch in sync for JIT and prebuild.
-        mhc_gfx1250 = any(
-            arch in ("gfx1250", "gfx1250-strict")
-            for arch in _build_archs_from_env(get_gfx)
-        )
-        if not mhc_gfx1250:
-            srcs = [
-                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
-            ]
-        flags_extra_hip = [
-            *flags_extra_hip,
-            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
-        ]
-
     for tp in third_party:
         clone_3rdparty(tp)
 
@@ -1577,6 +1629,19 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
@@ -1904,6 +1969,9 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "flags_extra_hip_per_source": single_ops[
+                            "flags_extra_hip_per_source"
+                        ],
                         "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],

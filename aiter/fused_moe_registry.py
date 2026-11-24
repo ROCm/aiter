@@ -39,6 +39,8 @@ class FusedMoeRequest:
     gate_mode: Any = None
     q_dtype_a: torch.dtype | None = None
     q_dtype_w: torch.dtype | None = None
+    w1_global_scale: torch.Tensor | None = None
+    w2_global_scale: torch.Tensor | None = None
 
 
 FusedMoeImpl = Callable[[FusedMoeRequest, str], torch.Tensor]
