@@ -17,6 +17,7 @@ from flydsl.compiler.jit_function import _build_call_spec
 
 from aiter.ops.flydsl import grouped_gemm_mxfp4 as grouped
 from aiter.ops.flydsl import grouped_moe_gfx1250 as moe
+from aiter.ops.flydsl import iod_locality
 from aiter.ops.flydsl import moe_kernels
 from aiter.ops.flydsl.kernels import moe_apreshuffled_quant_scatter as apre_scatter
 from aiter.ops.flydsl.kernels import tensor_shim
@@ -318,6 +319,81 @@ def test_overlap_defaults_preserve_launch_configuration(
         "a_preshuffled",
     ):
         assert selected[name] == config[name]
+
+
+@pytest.mark.parametrize(
+    "cluster_m,requested,expected",
+    [
+        (1, 0, 1024),
+        (2, 0, 1024),
+        (4, 0, 1024),
+        (1, 1000, 992),
+        (2, 1000, 992),
+        (4, 1000, 960),
+        (1, 1, 16),
+        (2, 1, 32),
+        (4, 1, 64),
+    ],
+)
+def test_iod_workers_count_all_cluster_peers(
+    monkeypatch, cluster_m, requested, expected
+):
+    """M clustering must preserve total workers and eight-cluster IOD groups."""
+    from aiter.jit.utils import chip_info
+
+    for name in (
+        "AITER_FLYDSL_MXFP4_CLUSTER_M",
+        "AITER_FLYDSL_MXFP4_CLUSTER_N",
+        "AITER_FLYDSL_PERSISTENT_WORKERS",
+        "AITER_FLYDSL_PERSISTENT_WORKERS1",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AITER_MOE_LOC_PW", str(requested))
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    data = torch.empty((256, 1024), dtype=torch.uint8, device="meta")
+    ids = torch.empty(64, dtype=torch.int32, device="meta")
+    monkeypatch.setattr(iod_locality, "lookup", lambda *args: (ids, 1, 2))
+    monkeypatch.setattr(iod_locality, "mode", lambda: 1)
+    calls = []
+    signature = inspect.signature(launch_gemm_a8w4_tdm.func)
+
+    def capture_launch(exe, *args, specialization_key):
+        assert exe is launch_gemm_a8w4_tdm
+        calls.append(signature.bind(*args).arguments)
+
+    monkeypatch.setattr(grouped, "_run_compiled", capture_launch)
+    grouped.flydsl_grouped_gemm_a8w4_masked(
+        data,
+        data,
+        data,
+        data,
+        data,
+        ids,
+        n_experts=64,
+        contiguous_m=256,
+        N=4096,
+        K=7168,
+        tile_m=256,
+        tile_n=256,
+        tile_k=256,
+        m_warp=2,
+        n_warp=2,
+        waves_per_tensor_tdm=2,
+        a_is_fp4=1,
+        a_preshuffled=1,
+        stage1_act=1,
+        cluster_m=cluster_m,
+        cluster_n=2,
+        stream=0,
+    )
+    assert len(calls) == 1
+    selected = calls[0]
+    assert selected["loc_sched"] == 1
+    assert selected["cluster_m"] == cluster_m
+    assert selected["persistent_workers"] == expected
+    grid_x = selected["persistent_workers"] // cluster_m
+    assert grid_x * cluster_m == expected
+    assert grid_x % (8 * selected["cluster_n"]) == 0
 
 
 def test_compact_preshuffle_cache_separates_layout_and_scale_rep():

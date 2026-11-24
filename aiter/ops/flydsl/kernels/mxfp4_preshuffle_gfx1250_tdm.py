@@ -3350,7 +3350,7 @@ def launch_gemm_a8w4_tdm(
     )
     LOC_RUN = loc_group * max(b_placed, 1)
     if loc_sched:
-        assert b_placed and persistent_workers % (8 * cluster_n) == 0
+        assert b_placed and persistent_workers % (8 * cluster_m * cluster_n) == 0
         assert LOC_RUN % cluster_n == 0
     # The cache key follows only this body's globals, not the kernel's below.
     _ = launch_rotation
@@ -3435,7 +3435,12 @@ def launch_gemm_a8w4_tdm(
                     # m-units in turn, after their own columns.
                     nu = (cols > 0).select(cols, 1)
                     tasks = n_mu * cols + (n_run & 1) * ((n_mu + 1 - dom) >> 1)
-                for t in range(crank, tasks, persistent_workers // cluster_n // 2):
+                # M peers share one task; count physical clusters per domain.
+                # Omitting cluster_m skips tasks when the grid has M peers.
+                stride = persistent_workers // cluster_m // cluster_n // 2
+
+                def loc_coords(t):
+                    t = fx.Int32(t)
                     # n fastest: a domain's clusters share each m-unit's A.
                     mu = t // nu
                     c = t - mu * nu
@@ -3453,7 +3458,30 @@ def launch_gemm_a8w4_tdm(
                         shared = t >= n_mu * cols
                         mu = shared.select(((t - n_mu * cols) << 1) + dom, mu)
                         nt = shared.select(last_nt, nt)
-                    run_task(mu, nt)
+                    return mu, nt
+
+                if const_expr(layout["overlap_scatter"]):
+                    for t, scatter_dst_state in range(
+                        crank,
+                        tasks,
+                        stride,
+                        init=[fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0)],
+                    ):
+                        t_i32 = fx.Int32(t)
+                        mu, nt = loc_coords(t_i32)
+                        updated = run_task(
+                            mu,
+                            nt,
+                            scatter_dst_state,
+                            (t_i32 + fx.Int32(stride) >= fx.Int32(tasks)).select(
+                                fx.Int32(1), fx.Int32(0)
+                            ),
+                        )
+                        yield [updated[0], updated[1], updated[2], updated[3]]
+                else:
+                    for t in range(crank, tasks, stride):
+                        mu, nt = loc_coords(t)
+                        run_task(mu, nt)
             else:
                 tasks = ceildiv(rows, tile_m * cluster_m) * ceildiv(i32_n, tile_n)
                 stride = persistent_workers // cluster_m
@@ -3475,12 +3503,12 @@ def launch_gemm_a8w4_tdm(
                 else:
                     for task_id in range(fx.block_idx.x, tasks, stride):
                         run_task(task_id, rows)
-                if const_expr(layout["overlap_scatter"]):  # noqa: SIM102
-                    # No next epilogue will retire the last task's remote writes.
-                    if fx.thread_idx.x >= (
-                        ep_scatter_common.TDM_STORE_WAVE_START * ep_scatter_common.WAVE_SIZE
-                    ):
-                        tdm_ops.tensor_wait(0)
+            if const_expr(layout["overlap_scatter"]):  # noqa: SIM102
+                # No next epilogue will retire the last task's remote writes.
+                if fx.thread_idx.x >= (
+                    ep_scatter_common.TDM_STORE_WAVE_START * ep_scatter_common.WAVE_SIZE
+                ):
+                    tdm_ops.tensor_wait(0)
         else:
             run_task(fx.block_idx.x, i32_m)
 

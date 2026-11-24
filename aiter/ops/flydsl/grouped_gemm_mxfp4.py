@@ -323,9 +323,10 @@ def flydsl_grouped_gemm_a8w4_masked(
                 from aiter.jit.utils.chip_info import get_cu_num
 
                 pw = 4 * int(get_cu_num())
-            # The grid's x extent, whole groups of 8 clusters.
-            step = 8 * cluster_n
-            persistent_workers = max(step, pw // cluster_m // step * step)
+            # Total workgroups, in whole groups of 8 physical clusters.
+            # The launcher divides by cluster_m to obtain the grid's X extent.
+            step = 8 * cluster_m * cluster_n
+            persistent_workers = max(step, pw // step * step)
     rolled_drain = int(rolled_drain)
     if rolled_drain not in (0, 1):
         raise ValueError("rolled_drain must be 0 or 1")
