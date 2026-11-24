@@ -37,7 +37,6 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels.act import clamp_gate_up, sigmoid_f32
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
-    S2RLoader,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
     swizzle_128,
@@ -362,6 +361,75 @@ class SwigluFp8Epilogue:
                 )
 
 
+def _opaque_vgpr(value):
+    """``value`` in a VGPR the compiler cannot fold constants through.
+
+    Inline asm, as no stable API hides a value from constant folding. See
+    ``LdsFragReader`` for why the operand reads need it.
+    """
+    return fx.Int32(
+        _llvm.inline_asm(
+            res=fx.Int32.ir_type,
+            operands_=[fx.Int32(value).ir_value()],
+            asm_string="v_mov_b32 $0, $1",
+            constraints="=v,v",
+            has_side_effects=False,
+        )
+    )
+
+
+class LdsFragReader:
+    """MFMA operand fragments from one LDS region, one address VGPR per K half.
+
+    Tile ``i`` sits exactly ``i * 2048`` bytes past tile 0, in the plain (A)
+    and the ``shuffle_weight`` (16, 16) (B) layouts alike (the swizzle only
+    flips bits 4-6 from row bits 1-3), and a region's four 16 KB buffers lie
+    within 64 KB of its first one. Left alone, the compiler folds each
+    buffer's link-time address into its reads; past the 64 KB ds_read
+    immediate it then kept one VGPR per buffer, tile and K half (16 for B,
+    ISA) and spilled them, every reload draining the LDS-DMA prefetch with
+    an s_waitcnt vmcnt. Here the address is ``field + (opaque(lane + bias) -
+    bias)`` with ``bias`` the region's address: the compiler folds ``field -
+    bias + tile`` (< 64 KB) into the immediate, and the pointer still derives
+    from the struct field, whose alias scope keeps these reads from waiting
+    on LDS-DMA writes to other buffers (an inttoptr address loses it, and
+    every read then waited for vmcnt(0), ISA).
+    """
+
+    TILE_BYTES = 16 * BLOCK_K
+
+    def __init__(self, region, wave_idx, n_tiles, preshuffled):
+        lane = fx.thread_idx.x % 64
+        row = wave_idx * (n_tiles * 16) + lane % 16
+        col = (lane // 16) * 16
+        self.n_tiles = n_tiles
+        bias = fx.Int32(fx.ptrtoint(region.ptr))
+        if const_expr(preshuffled):
+            off = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
+            # K half 1 is 64 columns = 4 x 16-byte groups further on.
+            offs = [off, off + 4 * 128]
+        else:
+            offs = []
+            for step in range_constexpr(2):
+                r, c = swizzle_128(row, col + step * 64)
+                offs.append(r * 128 + c)
+        self.rel = [_opaque_vgpr(o + bias) - bias for o in offs]
+
+    def load(self, lds_src):
+        frag = []
+        for i in range_constexpr(self.n_tiles):
+            halves = []
+            for step in range_constexpr(2):
+                ptr = fx.add_offset(
+                    lds_src.ptr,
+                    fx.make_int_tuple(self.rel[step] + i * self.TILE_BYTES),
+                )
+                v = fx.make_view(fx.recast_iter(fx.Uint8, ptr), fx.make_layout(16, 1))
+                halves.append(v.load().bitcast(fx.Int32))
+            frag.append(halves[0].shuffle(halves[1], list(range(8))))
+        return frag
+
+
 class MoeScaleLds:
     """E8M0 A / B block scales of one tile, staged through LDS ``CHUNK`` K-steps at a time.
 
@@ -589,8 +657,8 @@ def compile_moe_bs_gemm_8w(
         # Operands swapped (weights as the MFMA's A): a lane then holds four
         # consecutive output columns of one row, which pack into wide stores.
         mfma = MxMfma(N_TILES_B, N_TILES_A, paired_tiles=False)
-        a_s2r = S2RLoader(wave_m, N_TILES_A)
-        b_s2r = S2RLoader(wave_n, N_TILES_B)
+        a_s2r = LdsFragReader(lds.A_lds_cur_0, wave_m, N_TILES_A, preshuffled=False)
+        b_s2r = LdsFragReader(lds.B_lds_cur_0, wave_n, N_TILES_B, preshuffled=True)
         if const_expr(epilogue == "bf16"):
             store_c = StoreBf16Rows(C, m_pad, N)
         elif const_expr(epilogue == "swiglu_fp8"):
@@ -731,7 +799,7 @@ def compile_moe_bs_gemm_8w(
             for k in range_constexpr(K_ITERS - 2):
                 sa0 = scale_read(k, "a0")
                 sb0 = scale_read(k, "b0")
-                b0_frag = b_s2r.load(b_cur0, preshuffled=True)
+                b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
                 a_load(1, a_next1, k + 1)
                 rocdl.s_barrier()
@@ -740,7 +808,7 @@ def compile_moe_bs_gemm_8w(
                 c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
                 sb1 = scale_read(k, "b1")
-                b1_frag = b_s2r.load(b_cur1, preshuffled=True)
+                b1_frag = b_s2r.load(b_cur1)
                 b_g2s.load(b_cur0, B0_off + (k + 2) * B_K_STEP)
                 rocdl.s_barrier()
 
@@ -766,7 +834,7 @@ def compile_moe_bs_gemm_8w(
             k = K_ITERS - 2
             sa0 = scale_read(k, "a0")
             sb0 = scale_read(k, "b0")
-            b0_frag = b_s2r.load(b_cur0, preshuffled=True)
+            b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
             if const_expr(epilogue == "slot_bf16"):
                 # The epilogue's routes, drained by the wait below.
@@ -779,7 +847,7 @@ def compile_moe_bs_gemm_8w(
             c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
             sb1 = scale_read(k, "b1")
-            b1_frag = b_s2r.load(b_cur1, preshuffled=True)
+            b1_frag = b_s2r.load(b_cur1)
             rocdl.s_barrier()
 
             c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
@@ -791,7 +859,7 @@ def compile_moe_bs_gemm_8w(
 
             c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
-            b0_frag = b_s2r.load(b_next0, preshuffled=True)
+            b0_frag = b_s2r.load(b_next0)
             rocdl.s_barrier()
 
             c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
@@ -809,7 +877,7 @@ def compile_moe_bs_gemm_8w(
             c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
             sb1 = scale_read(k, "b1")
-            b1_frag = b_s2r.load(b_cur1, preshuffled=True)
+            b1_frag = b_s2r.load(b_cur1)
             rocdl.s_barrier()
 
             c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
