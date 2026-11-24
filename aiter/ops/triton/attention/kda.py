@@ -29,15 +29,32 @@ elif _ARCH == "gfx950":
     )
 
 
+def is_gate_fold_supported(K: int) -> bool:
+    """Tell if ``fused_recurrent_kda`` can fold the gate projections.
+
+    Only the gfx950 kernel has the gate fold, and it needs ``K == 128``. A caller
+    uses the two gate GEMMs and ``g`` / ``out_gate`` when the result is False.
+
+    Args:
+        K: head dimension of q and k.
+
+    Returns:
+        True when the device and ``K`` support the gate fold arguments.
+    """
+    return _ARCH == "gfx950" and K == 128
+
+
 # Routed on the public entry: it takes no backend pin, and the gfx950 and
 # gfx1250 Gluon kernels are chosen beneath it. `config` is AITER's tuning dict,
 # a hint a provider may ignore.
-@_route(op="fused_recurrent_kda")
+# Version 2 adds the four gate fold arguments, and `g` and `out_gate` can be None.
+# A v1 provider cannot bind them or read a None gate, so v1 is not superseded.
+@_route(op="fused_recurrent_kda", version=2)
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
@@ -64,6 +81,10 @@ def fused_recurrent_kda(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    gate_in: torch.Tensor | None = None,
+    gate_weight: torch.Tensor | None = None,
+    out_gate_in: torch.Tensor | None = None,
+    out_gate_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx950/gfx1250 Gluon decode path.
 
@@ -74,7 +95,7 @@ def fused_recurrent_kda(
         q: [B, T, H, K] queries
         k: [B, T, H, K] keys
         v: [B, T, HV, V] values
-        g: [B, T, HV, K] log-space decay gates
+        g: [B, T, HV, K] log-space decay gates. None with the gate fold.
         beta: [B, T, HV] scalar or [B, T, HV, V] headwise write strengths.
         A_log: [HV] gate parameter
         dt_bias: [HV, K] optional bias added to g inside the gate chain.
@@ -108,6 +129,16 @@ def fused_recurrent_kda(
             use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
             from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
             and omitted keys inherit the resolved bucket's published values.
+        gate_in, gate_weight, out_gate_in, out_gate_weight: gate fold, gfx950
+            only. The kernel computes g = gate_weight[head] @ gate_in and
+            out_gate = out_gate_weight[head] @ out_gate_in in fp32. Set ``g``
+            and ``out_gate`` to None. The inputs are [B, 1, K]. The weights
+            are [HV * K, K] (out x in) and contiguous. All four have the
+            dtype of ``q``. Limits: T == 1, K == 128, ``conv_state`` and
+            ``norm_weight`` set, ``use_gate_in_kernel``, no ``cu_seqlens``, no
+            ``num_accepted_tokens``, no ``cache_state_updates``. See
+            ``is_gate_fold_supported``. With 64 heads and 16 or more sequences,
+            the fold is slower than the two gate GEMMs.
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
@@ -132,6 +163,11 @@ def fused_recurrent_kda(
         raise ValueError(
             "allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True"
         )
+    fold_gates = any(
+        x is not None for x in (gate_in, gate_weight, out_gate_in, out_gate_weight)
+    )
+    if fold_gates and _ARCH != "gfx950":
+        raise ValueError(f"the gate fold requires gfx950 (found {_ARCH})")
 
     if state_v_first is None:
         state_v_first = True
@@ -140,7 +176,37 @@ def fused_recurrent_kda(
     HV, V = v.shape[2], v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     use_conv = conv_state is not None
-    use_rms_gate = out_gate is not None
+    use_rms_gate = out_gate is not None or fold_gates
+    if fold_gates:
+        if g is not None or out_gate is not None:
+            raise ValueError("the gate fold computes g and out_gate: set them to None")
+        if (
+            T != 1
+            or cu_seqlens is not None
+            or num_accepted_tokens is not None
+            or cache_state_updates
+        ):
+            raise ValueError(
+                "the gate fold requires one token per sequence, without cu_seqlens, "
+                "num_accepted_tokens and cache_state_updates"
+            )
+        if not (use_conv and norm_weight is not None and use_gate_in_kernel):
+            raise ValueError(
+                "the gate fold requires conv_state, norm_weight and use_gate_in_kernel"
+            )
+        if K != 128:
+            raise ValueError(f"the gate fold requires K == 128 (found {K})")
+        for x in (gate_in, out_gate_in):
+            assert x is not None, "the gate fold needs both gate inputs"
+            assert x.shape == (B, T, K), "gate inputs must be [B, 1, K]"
+            assert x.stride(2) == 1, "gate inputs must be dense in [K]"
+            assert B == 1 or x.stride(0) == x.stride(1), "batches must be token-major"
+            assert x.dtype == q.dtype, "gate inputs must have the dtype of q"
+        for x in (gate_weight, out_gate_weight):
+            assert x is not None, "the gate fold needs both gate weights"
+            assert x.shape == (HV * K, K), "gate weights must be [HV * K, K]"
+            assert x.is_contiguous(), "gate weights must be contiguous"
+            assert x.dtype == q.dtype, "gate weights must have the dtype of q"
     W = conv_weight.shape[1] if use_conv else 4
     if use_conv:
         assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
@@ -148,15 +214,19 @@ def fused_recurrent_kda(
         if num_accepted_tokens is None:
             assert conv_state.shape[2] >= W - 1
     if use_rms_gate:
-        assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
-        assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
+        if not fold_gates:
+            assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
+            assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
         assert norm_weight.numel() == V and norm_weight.is_contiguous()
     if scale is None:
         scale = K**-0.5
 
     assert k.shape == q.shape, "q and k must match"
     assert v.shape[:2] == q.shape[:2], "v must share [B, T] with q"
-    assert g.shape == (B, T, HV, K), "g must be [B, T, HV, K]"
+    if not fold_gates:
+        assert g is not None, "g is required without the gate fold"
+        assert g.shape == (B, T, HV, K), "g must be [B, T, HV, K]"
+        assert g.stride()[2:] == (K, 1), "g must be dense in [HV, K]"
     assert beta.shape in (
         (B, T, HV),
         (B, T, HV, V),
@@ -165,13 +235,12 @@ def fused_recurrent_kda(
     assert q.stride()[2:] == (K, 1), "q must be dense in [H, K]"
     assert k.stride()[2:] == (K, 1), "k must be dense in [H, K]"
     assert v.stride()[2:] == (V, 1), "v must be dense in [HV, V]"
-    assert g.stride()[2:] == (K, 1), "g must be dense in [HV, K]"
     if beta.ndim == v.ndim:
         assert beta.stride()[2:] == (V, 1), "headwise beta must be dense in [HV, V]"
     else:
         assert beta.stride(2) == 1, "beta heads must be contiguous"
     if B > 1:
-        for x in (q, k, v, g, beta):
+        for x in (q, k, v, beta) if fold_gates else (q, k, v, g, beta):
             assert x.stride(0) == T * x.stride(1), "batches must be token-major"
     if cu_seqlens is not None:
         if B != 1:
@@ -236,6 +305,8 @@ def fused_recurrent_kda(
     assert (
         resident_state or not bf16_resident
     ), "bf16 state with T > 1 needs resident_state"
+    if fold_gates and resident_state:
+        raise ValueError("the gate fold does not support resident_state")
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -351,12 +422,15 @@ def fused_recurrent_kda(
             f"warps={num_warps} paged={is_paged} gate={use_gate_in_kernel}"
         )
 
+    # The folded kernel does not read g and out_gate. Bind their arguments to q.
+    g_arg = q if fold_gates else g
+    og_arg = q if fold_gates else out_gate
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_packed_decode_kernel[grid](
         q_ptr=q,
         k_ptr=k,
         v_ptr=v,
-        g_ptr=g,
+        g_ptr=g_arg,
         beta_ptr=beta,
         A_log_ptr=A_log,
         dt_bias_ptr=dt_bias,
@@ -368,7 +442,7 @@ def fused_recurrent_kda(
         num_accepted_ptr=num_accepted_tokens,
         conv_state_ptr=conv_state,
         conv_weight_ptr=conv_weight,
-        out_gate_ptr=out_gate,
+        out_gate_ptr=og_arg,
         norm_weight_ptr=norm_weight,
         lower_bound=lower_bound if lower_bound is not None else 0.0,
         norm_eps=norm_eps,
@@ -377,10 +451,10 @@ def fused_recurrent_kda(
         stride_q_token=q.stride(1),
         stride_k_token=k.stride(1),
         stride_v_token=v.stride(1),
-        stride_g_token=g.stride(1),
+        stride_g_token=g_arg.stride(1),
         stride_beta_token=beta.stride(1),
         stride_o_token=out.stride(1),
-        stride_og_token=out_gate.stride(1) if use_rms_gate else 0,
+        stride_og_token=og_arg.stride(1) if use_rms_gate else 0,
         stride_state_slot_rows=slot_rows_in,
         stride_state_out_slot_rows=slot_rows_out,
         state_rows=rows_in,
@@ -421,6 +495,19 @@ def fused_recurrent_kda(
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
         **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
+        **(
+            {
+                "gate_in_ptr": gate_in,
+                "out_gate_in_ptr": out_gate_in,
+                "gate_weight_ptr": gate_weight,
+                "out_gate_weight_ptr": out_gate_weight,
+                "stride_gate_in_token": gate_in.stride(1),
+                "stride_out_gate_in_token": out_gate_in.stride(1),
+                "FOLD_GATES": True,
+            }
+            if fold_gates
+            else {}
+        ),
         num_warps=num_warps,
         enable_fp_fusion=True,
         **(
@@ -435,10 +522,11 @@ def fused_recurrent_kda(
 # Routed on its public entry, ahead of fused_recurrent_kda: a provider with a
 # kernel for the packed one-token decode serves it here. When none does, the
 # native body calls fused_recurrent_kda, which a provider is asked about again.
-@_route(op="fused_recurrent_kda_packed_decode")
+# Version 2 adds the four gate fold arguments. See fused_recurrent_kda for v1.
+@_route(op="fused_recurrent_kda_packed_decode", version=2)
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -447,11 +535,15 @@ def fused_recurrent_kda_packed_decode(
     ssm_state_indices: torch.Tensor,
     conv_state: torch.Tensor,
     conv_weight: torch.Tensor,
-    out_gate: torch.Tensor,
+    out_gate: torch.Tensor | None,
     norm_weight: torch.Tensor,
     norm_eps: float,
     out: torch.Tensor,
     config: dict | None = None,
+    gate_in: torch.Tensor | None = None,
+    gate_weight: torch.Tensor | None = None,
+    out_gate_in: torch.Tensor | None = None,
+    out_gate_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One decode token per sequence of Kimi Delta Attention, with q, k and v
     packed in one row.
@@ -466,7 +558,7 @@ def fused_recurrent_kda_packed_decode(
         mixed_qkv: ``[n, 3 * H * K]``, one row per sequence: q, then k, then
             v, each ``H * K`` wide (``HV == H``, ``V == K``).
         g: ``[n, H, K]`` raw gate; the gate chain with ``A_log``, ``dt_bias``
-            and ``lower_bound`` runs in the kernel.
+            and ``lower_bound`` runs in the kernel. None with the gate fold.
         beta: ``[n, H]`` raw write strength; sigmoid runs in the kernel.
         A_log, dt_bias, lower_bound: the gate chain's parameters.
         initial_state: state slabs, indexed by ``ssm_state_indices``.
@@ -475,14 +567,24 @@ def fused_recurrent_kda_packed_decode(
         conv_state, conv_weight: the fused short convolution's state and
             ``[3, W, H * K]`` weight.
         out_gate: ``[n, H, V]`` gate of the gated RMSNorm; ``norm_weight`` is
-            ``[V]``.
+            ``[V]``. None with the gate fold.
         out: ``[n, H, V]`` destination.
         config: AITER's tuning dict; a provider may ignore it.
+        gate_in, gate_weight, out_gate_in, out_gate_weight: gate fold, gfx950
+            only. ``gate_in`` and ``out_gate_in`` are ``[n, K]``. The weights
+            are ``[H * K, K]``. The kernel computes
+            g = gate_weight[head] @ gate_in and
+            out_gate = out_gate_weight[head] @ out_gate_in. See
+            :func:`fused_recurrent_kda` for the limits.
 
     Writes ``out`` in place and returns it; updates ``initial_state``'s slabs
     and ``conv_state`` in place.
     """
-    n, H, K = g.shape
+    if g is None:
+        n, H = beta.shape
+        K = mixed_qkv.shape[-1] // (3 * H)
+    else:
+        n, H, K = g.shape
     s = mixed_qkv.stride(0)
 
     def qkv(off: int) -> torch.Tensor:
@@ -490,7 +592,9 @@ def fused_recurrent_kda_packed_decode(
             (n, 1, H, K), (s, s, K, 1), mixed_qkv.storage_offset() + off
         )
 
-    def tok(x: torch.Tensor) -> torch.Tensor:
+    def tok(x: torch.Tensor | None) -> torch.Tensor | None:
+        if x is None:
+            return None
         st = x.stride(0)
         return x.as_strided(
             (n, 1, *x.shape[1:]), (st, st, *x.stride()[1:]), x.storage_offset()
@@ -518,5 +622,9 @@ def fused_recurrent_kda_packed_decode(
         norm_eps=norm_eps,
         out=tok(out),
         config=config,
+        gate_in=tok(gate_in),
+        gate_weight=gate_weight,
+        out_gate_in=tok(out_gate_in),
+        out_gate_weight=out_gate_weight,
     )
     return out
