@@ -13,6 +13,7 @@ _wait_repr = make_kernel_repr("_pull_wait_kernel", ["FLAG", "DELTA"])
 _publish_wait_repr = make_kernel_repr("_pull_publish_wait_kernel", [])
 _copy_repr = make_kernel_repr("_pull_copy_kernel", ["W", "BLOCK", "ALL_TO_ALL"])
 _rs_repr = make_kernel_repr("_pull_rs_kernel", ["W", "BLOCK"])
+_rs_persistent_repr = make_kernel_repr("_pull_rs_persistent_kernel", ["W", "BLOCK"])
 _a2a_mxfp8_repr = make_kernel_repr(
     "_pull_a2a_mxfp8_kernel", ["W", "D64", "S64", "RC", "RS"]
 )
@@ -112,6 +113,38 @@ def _pull_rs_kernel(
         acc += tl.load(p + offs, mask=m).to(tl.float32)
     tl.store(out.to(tl.pointer_type(tl.bfloat16)) + offs, acc.to(tl.bfloat16), mask=m)
     _finish(base_ptrs, epoch_ptr, cnt_ptr, e, rank, total)
+
+
+@triton.jit(repr=_rs_persistent_repr)
+def _pull_rs_persistent_kernel(
+    out,
+    base_ptrs,
+    dptrs,
+    epoch_ptr,
+    cnt_ptr,
+    shard,
+    rank,
+    nprog,
+    ntiles,
+    W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Persistent: nprog programs loop over the tiles of my shard. Each tile sums
+    # the W ranks' rows in fp32, ascending rank order, and rounds once.
+    pid = tl.program_id(0)
+    e = tl.load(epoch_ptr)
+    base = rank * shard.to(tl.int64)
+    for t in range(pid, ntiles, nprog):
+        offs = t.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < shard
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for r in tl.static_range(W):
+            p = tl.load(dptrs + r).to(tl.pointer_type(tl.bfloat16)) + base
+            acc += tl.load(p + offs, mask=m).to(tl.float32)
+        tl.store(
+            out.to(tl.pointer_type(tl.bfloat16)) + offs, acc.to(tl.bfloat16), mask=m
+        )
+    _finish(base_ptrs, epoch_ptr, cnt_ptr, e, rank, nprog)
 
 
 @triton.jit(repr=_a2a_mxfp8_repr)

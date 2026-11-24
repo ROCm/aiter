@@ -49,6 +49,7 @@ from aiter.ops.triton._triton_kernels.comms.pull_collective import (
     _pull_copy_kernel,
     _pull_publish_wait_kernel,
     _pull_rs_kernel,
+    _pull_rs_persistent_kernel,
     _pull_wait_kernel,
 )
 
@@ -59,7 +60,8 @@ _AG_WARPS = 16
 _AG_PROGRAMS = (
     192  # programs per copy kernel: more than the CU count loses to a second wave
 )
-_RS_BLOCK, _RS_WARPS = 4096, 16  # bf16 elements per program
+_RS_BLOCK, _RS_WARPS = 4096, 16  # bf16 elements per tile
+_RS_PERSISTENT_TILES = 3072  # from here (8192 tokens at H 6144) the loop wins
 _A2A_WARPS = 16
 _MEMORY_MODES = {"uncached": 0x3, "fine_grained": 0x1, "coarse_grained": 0x0}
 
@@ -241,9 +243,26 @@ class PullCollective:
         if numel * 2 > self.max_bytes:
             raise ValueError("payload larger than the buffer")
         shard = numel // self.world
-        nb = triton.cdiv(shard, _RS_BLOCK)
+        ntiles = triton.cdiv(shard, _RS_BLOCK)
         self._publish()
-        _pull_rs_kernel[(nb,)](
+        if ntiles < _RS_PERSISTENT_TILES:  # short payload: one tile for each program
+            _pull_rs_kernel[(ntiles,)](
+                out,
+                self._flag_ptrs,
+                self._data_ptrs,
+                self._epoch,
+                self._cnt,
+                shard,
+                self.rank,
+                ntiles,
+                W=self.world,
+                BLOCK=_RS_BLOCK,
+                num_warps=_RS_WARPS,
+            )
+            return
+        # long payload: a persistent loop of 192 programs reaches a higher link rate
+        nprog = _AG_PROGRAMS
+        _pull_rs_persistent_kernel[(nprog,)](
             out,
             self._flag_ptrs,
             self._data_ptrs,
@@ -251,7 +270,8 @@ class PullCollective:
             self._cnt,
             shard,
             self.rank,
-            nb,
+            nprog,
+            ntiles,
             W=self.world,
             BLOCK=_RS_BLOCK,
             num_warps=_RS_WARPS,
