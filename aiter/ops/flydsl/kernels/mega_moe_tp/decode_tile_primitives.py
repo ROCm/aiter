@@ -16,12 +16,14 @@ own FlyDSL rule, because FlyDSL has no published wrapper for ``v_mfma_scale_f32_
 (the gfx950 scaled-MFMA op with explicit ``op_sel``/``cbsz``/``blgp`` immediates these call
 sites need) or for ``llvm.amdgcn.cvt.scalef32.pk.fp4.f32`` / ``...pk.fp8.f32``.
 """
+
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def _raw(x):
@@ -40,7 +42,13 @@ def _hold(xs):
     body one-for-one)."""
     ty = ir.Type.parse("!llvm.struct<(" + ", ".join(["vector<4xf32>"] * len(xs)) + ")>")
     cons = ",".join(["=a"] * len(xs) + [str(i) for i in range(len(xs))])
-    v = llvm.inline_asm(ty, [_raw(x) for x in xs], "s_nop 7\ns_nop 7\ns_nop 7", cons, has_side_effects=True)
+    v = llvm.inline_asm(
+        ty,
+        [_raw(x) for x in xs],
+        "s_nop 7\ns_nop 7\ns_nop 7",
+        cons,
+        has_side_effects=True,
+    )
     return [llvm.extractvalue(T.vec(4, T.f32), v, [i]) for i in range(len(xs))]
 
 
@@ -48,8 +56,15 @@ def _hold8(xs):
     """``_hold``, with the single-output guard amd-kernels' shared_gemm1_a8w8.py adds (an
     LLVM inline-asm struct type cannot have exactly one member)."""
     if len(xs) == 1:
-        return [llvm.inline_asm(T.vec(4, T.f32), [_raw(xs[0])], "s_nop 7\ns_nop 7\ns_nop 7", "=a,0",
-                                has_side_effects=True)]
+        return [
+            llvm.inline_asm(
+                T.vec(4, T.f32),
+                [_raw(xs[0])],
+                "s_nop 7\ns_nop 7\ns_nop 7",
+                "=a,0",
+                has_side_effects=True,
+            )
+        ]
     return _hold(xs)
 
 
@@ -61,8 +76,10 @@ def _mfma(a, b, acc, sa, sb, b_byte, transpose=False):
     if transpose:
         a, b, sa, sb = b, a, sb, sa
         a_byte, b_byte = b_byte, 0
-    asm = (f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, {'$0' if acc is not None else '0'}, $3, $4 "
-           f"op_sel:[{a_byte % 2},{b_byte % 2},0] op_sel_hi:[{a_byte // 2},{b_byte // 2},0] cbsz:4 blgp:4")
+    asm = (
+        f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, {'$0' if acc is not None else '0'}, $3, $4 "
+        f"op_sel:[{a_byte % 2},{b_byte % 2},0] op_sel_hi:[{a_byte // 2},{b_byte // 2},0] cbsz:4 blgp:4"
+    )
     ops = [_raw(a), _raw(b), _raw(sa), _raw(sb)]
     cons = "=a,v,v,v,v"
     if acc is not None:
@@ -76,14 +93,17 @@ def _mfma8(a, b, acc, sa, sb, b_byte, transpose=False):
     ``transpose`` selects GEMM1's C layout. Differs from ``_mfma`` only in the ``cbsz``/
     ``blgp`` immediates (0 here, selecting the A8W8 operand-format encoding vs. ``_mfma``'s
     A4W4 one) -- same instruction family, two operand formats, kept as two functions to match
-    amd-kernels' own source split (gemm1_a4w4_id_rows.py vs shared_gemm1_a8w8.py) one-for-one."""
+    amd-kernels' own source split (gemm1_a4w4_id_rows.py vs shared_gemm1_a8w8.py) one-for-one.
+    """
     ty = T.vec(4, T.f32)
     a_byte = 0
     if transpose:
         a, b, sa, sb = b, a, sb, sa
         a_byte, b_byte = b_byte, 0
-    asm = (f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, {'$0' if acc is not None else '0'}, $3, $4 "
-           f"op_sel:[{a_byte % 2},{b_byte % 2},0] op_sel_hi:[{a_byte // 2},{b_byte // 2},0] cbsz:0 blgp:0")
+    asm = (
+        f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, {'$0' if acc is not None else '0'}, $3, $4 "
+        f"op_sel:[{a_byte % 2},{b_byte % 2},0] op_sel_hi:[{a_byte // 2},{b_byte // 2},0] cbsz:0 blgp:0"
+    )
     ops = [_raw(a), _raw(b), _raw(sa), _raw(sb)]
     cons = "=a,v,v,v,v"
     if acc is not None:
@@ -94,8 +114,15 @@ def _mfma8(a, b, acc, sa, sb, b_byte, transpose=False):
 
 def _fp4(old, a, b, scale, sel):
     """FP32 pair -> packed MXFP4 (FlyDSL has no wrapper for this intrinsic)."""
-    return fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
-        [_raw(old), _raw(a), _raw(b), _raw(scale), _raw(fx.Int32(sel))], [], []))
+    return fx.Int32(
+        llvm.call_intrinsic(
+            T.i32,
+            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
+            [_raw(old), _raw(a), _raw(b), _raw(scale), _raw(fx.Int32(sel))],
+            [],
+            [],
+        )
+    )
 
 
 def _e8m0_fp8(amax):
@@ -112,15 +139,27 @@ def _fp8(old, a, b, scale, hi):
     high half of ``old``."""
     ty = ir.VectorType.get([2], ir.IntegerType.get_signless(16))
     old_v = llvm.bitcast(ty, fx.as_ir_value(old))
-    res = llvm.call_intrinsic(ty, "llvm.amdgcn.cvt.scalef32.pk.fp8.f32",
-        [old_v, fx.as_ir_value(a), fx.as_ir_value(b), fx.as_ir_value(scale), fx.Boolean(hi).ir_value()], [], [])
+    res = llvm.call_intrinsic(
+        ty,
+        "llvm.amdgcn.cvt.scalef32.pk.fp8.f32",
+        [
+            old_v,
+            fx.as_ir_value(a),
+            fx.as_ir_value(b),
+            fx.as_ir_value(scale),
+            fx.Boolean(hi).ir_value(),
+        ],
+        [],
+        [],
+    )
     return fx.Int32(llvm.bitcast(T.i32, res))
 
 
 def _swiglu(g, u):
     """SwiGLU-OAI in fp32: g <= 7, -7 <= u <= 7, g * sigmoid(1.702 g) * (u + 1), the sigmoid
     by exp2 + rcp. Identical formula in both the MXFP4 routed-expert tile and the MXFP8
-    shared-expert tile (amd-kernels keeps two copies; this is the one shared definition)."""
+    shared-expert tile (amd-kernels keeps two copies; this is the one shared definition).
+    """
     g = (g < fx.Float32(7)).select(g, fx.Float32(7))
     u = (u < fx.Float32(7)).select(u, fx.Float32(7))
     u = (u > fx.Float32(-7)).select(u, fx.Float32(-7))
@@ -133,9 +172,19 @@ def _swiglu(g, u):
 def _load8(rsrc, off, soff, plane=16):
     """Two 16-byte loads ``plane`` dwords apart as one 8-dword MFMA operand (MXFP8 tiles'
     wider K-step load)."""
-    lo = Vec(buffer_ops.buffer_load(rsrc, off, vec_width=4, dtype=fx.Int32, soffset_bytes=soff))
-    hi = Vec(buffer_ops.buffer_load(rsrc, off + plane, vec_width=4, dtype=fx.Int32, soffset_bytes=soff))
-    return Vec.from_elements([lo[j] for j in range(4)] + [hi[j] for j in range(4)], fx.Int32)
+    lo = Vec(
+        buffer_ops.buffer_load(
+            rsrc, off, vec_width=4, dtype=fx.Int32, soffset_bytes=soff
+        )
+    )
+    hi = Vec(
+        buffer_ops.buffer_load(
+            rsrc, off + plane, vec_width=4, dtype=fx.Int32, soffset_bytes=soff
+        )
+    )
+    return Vec.from_elements(
+        [lo[j] for j in range(4)] + [hi[j] for j in range(4)], fx.Int32
+    )
 
 
 # ---------------------------------------------------------------------------
