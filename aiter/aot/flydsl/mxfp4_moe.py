@@ -100,6 +100,9 @@ def _job_key(job: dict) -> tuple:
             job["native_scale_layout"],
             job["num_waves"],
             job["k_wave"],
+            job["pad_skip"],
+            job["a_depth"],
+            job["k_stages"],
             job["bf16_act_quant"],
         )
     return (
@@ -256,6 +259,9 @@ def parse_csv(
                                 "num_waves": p1.get("num_waves", 4),
                                 "k_wave": p1.get("k_wave", 1),
                                 "bf16_act_quant": p1["bf16_act_quant"],
+                                "pad_skip": p1["pad_skip"],
+                                "a_depth": p1["a_depth"],
+                                "k_stages": p1["k_stages"],
                             }
                         )
 
@@ -424,6 +430,9 @@ def _compile_stage1(job):
         num_waves=job["num_waves"],
         k_wave=job["k_wave"],
         bf16_act_quant=job["bf16_act_quant"],
+        pad_skip=job["pad_skip"],
+        a_depth=job["a_depth"],
+        k_stages=job["k_stages"],
         stream=0,
     )
 
