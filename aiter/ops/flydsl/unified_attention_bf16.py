@@ -43,6 +43,7 @@ import functools
 import os
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 
 from aiter import logger
 
@@ -325,6 +326,13 @@ def _common_decline(
         return "disabled by AITER_UNIFIED_ATTN_FLYDSL=0"
     if not q.is_cuda:
         return "query is not on a GPU"
+    if any(is_fake(t) for t in (q, k, v, out, seqused_k, block_table, sinks)):
+        # AOT deliberately traces FakeTensors under compile-only. Outside that
+        # mode ptr_arg turns them into null pointers, which must never launch.
+        from flydsl.utils import env
+
+        if not env.compile.compile_only:
+            return "FakeTensor inputs require AOT compile-only mode"
     arch = _arch()
     if arch != "gfx950":
         return f"requires gfx950, got {arch}"
