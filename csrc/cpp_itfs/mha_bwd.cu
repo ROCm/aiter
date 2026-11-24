@@ -636,7 +636,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.log2e      = ck_tile::log2e_v<float>;
     dqdkdv_args.ratio      = a.nhead_q / a.nhead_k;
     dqdkdv_args.seqlen_q   = a.seqlen_q;
-    dqdkdv_args.seqlen_k   = a.seqlen_k;
+    dqdkdv_args.seqlen_k   = a.is_group_mode ? a.max_seqlen_k : a.seqlen_k;
     dqdkdv_args.head_dim_q = a.hdim_q;
     dqdkdv_args.head_dim_v = a.hdim_v;
     dqdkdv_args.nhead_q    = a.nhead_q;
@@ -732,7 +732,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         arg_size = sizeof(dqdkdv_args);
         int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : (a.hdim_q == 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
-        if (a.hdim_q == 256) {
+        if (arch_id == "gfx950" && a.hdim_q == 256) {
             int gdx_q = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
             gdx = std::max(gdx, gdx_q);
         }

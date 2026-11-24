@@ -109,7 +109,29 @@ def _run_allgather_case(
         f"allgather (use custom {use_custom}): rank={rankID} "
         f"{shape=} {dtype=} {withGraph=} {us:>8.2f}"
     )
-    return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
+    return {
+        "us": us,
+        "err": checkAllclose(ref, out, msg=msg),
+        "exact": torch.equal(out, ref),
+    }
+
+
+class _TorchDistributedGathers:
+    """Counts the torch.distributed all-gathers issued inside the block."""
+
+    def __enter__(self):
+        self.count = 0
+        self._all_gather_into_tensor = dist.all_gather_into_tensor
+
+        def counted(*args, **kwargs):
+            self.count += 1
+            return self._all_gather_into_tensor(*args, **kwargs)
+
+        dist.all_gather_into_tensor = counted
+        return self
+
+    def __exit__(self, *exc):
+        dist.all_gather_into_tensor = self._all_gather_into_tensor
 
 
 def allgather_sweep(
@@ -145,21 +167,23 @@ def allgather_sweep(
     torch.cuda.synchronize()
 
     graphs = []
-    results = [
-        _run_allgather_case(
-            rankID,
-            tp_size,
-            case_idx,
-            case["shape"],
-            dtype,
-            withGraph,
-            case["use_custom"],
-            case["dim"],
-            graphs,
-            case.get("rank_offset", False),
-        )
-        for case_idx, case in enumerate(cases)
-    ]
+    results = []
+    for case_idx, case in enumerate(cases):
+        with _TorchDistributedGathers() as gathers:
+            result = _run_allgather_case(
+                rankID,
+                tp_size,
+                case_idx,
+                case["shape"],
+                dtype,
+                withGraph,
+                case["use_custom"],
+                case["dim"],
+                graphs,
+                case.get("rank_offset", False),
+            )
+        result["torch_distributed"] = gathers.count > 0
+        results.append(result)
 
     # destroy
     if dist.is_initialized():
@@ -286,9 +310,24 @@ def allgather_perftest(tp_size, pp_size, cases, dtype, withGraph=False):
                 "min_us": min(all_us),
                 "max_us": max(all_us),
                 "err": max(results[i]["err"] for results in per_rank),
+                "exact": all(results[i]["exact"] for results in per_rank),
+                "torch_distributed": any(
+                    results[i]["torch_distributed"] for results in per_rank
+                ),
             }
         )
     return rows
+
+
+def assert_nccl_path_on_pynccl(rows):
+    """all_gather(use_custom=False) gathers exactly, through the TP group's
+    PyNccl communicator rather than torch.distributed."""
+    wrong = [
+        row
+        for row in rows
+        if not row["use_custom"] and (not row["exact"] or row["torch_distributed"])
+    ]
+    assert not wrong, f"NCCL path not exact or not on PyNccl: {wrong}"
 
 
 l_dtype = ["bf16"]
@@ -382,9 +421,17 @@ if __name__ == "__main__":
         for shape in [(16,), (12, 50016)]
         for dim in l_dim
     ]
+    # the NCCL path again, captured in a CUDA graph
+    graph_cases = [case for case in cases if not case["use_custom"]]
     df = []
     for dtype in l_dtype:
-        df.extend(allgather_perftest(tp_size, 1, cases, dtype, withGraph=False))
+        rows = allgather_perftest(tp_size, 1, cases, dtype, withGraph=False)
+        # Before the graph sweep: while a graph that captured a torch.distributed
+        # all-gather is alive, the sweep's teardown hangs.
+        assert_nccl_path_on_pynccl(rows)
+        graph_rows = allgather_perftest(tp_size, 1, graph_cases, dtype, withGraph=True)
+        assert_nccl_path_on_pynccl(graph_rows)
+        df.extend(rows + graph_rows)
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",
@@ -397,6 +444,8 @@ if __name__ == "__main__":
         "min_us",
         "max_us",
         "err",
+        "exact",
+        "torch_distributed",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     logger.info(
