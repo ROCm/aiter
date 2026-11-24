@@ -283,7 +283,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         k_tiles=k_tiles,
     ):
         persistent_workers = persistent_workers or 256
-        num_buffers = 3
+        num_buffers = int(os.environ.get("AITER_FLYDSL_EP_SCATTER_NUM_BUFFERS", "3"))
+        if num_buffers not in (2, 3):
+            raise ValueError("scatter overlap needs 2 or 3 input buffers")
     if persistent_workers:
         if (
             stage2_scatter is None or stage2_scatter.world_size <= 1

@@ -474,7 +474,7 @@ def build_gemm_a8w4_tdm_task(
     overlap_scatter = bool(
         ep_scatter_overlap
         and persistent_workers > 0
-        and num_buffers == 3
+        and num_buffers in (2, 3)
         and ep_scatter_common.can_overlap_scatter(
             enable_ep_scatter=enable_ep_scatter,
             ep_world_size=ep_world_size,
@@ -492,6 +492,8 @@ def build_gemm_a8w4_tdm_task(
             k_tiles=K_TILES,
         )
     )
+    # Keep overlap's multicast behavior independent of shared tuning defaults.
+    tdm_early_timeout = bool(overlap_scatter or tdm_early_timeout)
     scatter_waves = ep_scatter_common.STORE_WAVE_COUNT if overlap_scatter else num_waves
     SCATTER_GROUP_ROWS = ep_scatter_common.ROWS_PER_GATHER
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
@@ -586,7 +588,8 @@ def build_gemm_a8w4_tdm_task(
     SB_LDS_STAGE = STAGE_SB if planar_lds_on else PITCH
     INPUT_LDS_B = PLANAR_END if planar_lds_on else num_buffers * PITCH
     if overlap_scatter:
-        # Only M256 nb3 aliases C; its third stage reuses the retired first half.
+        # NB2's inputs are disjoint from C. NB3's third input stage aliases
+        # only C's retired prefix; the overlap prologue protects that reuse.
         assert STAGE_A == tile_m * 128 and STAGE_B == 32768
         assert num_buffers * (STAGE_SA + STAGE_SB) <= STAGE_A
         A_LDS_OFF, B_LDS_OFF = STAGE_A, 2 * STAGE_A
@@ -634,6 +637,8 @@ def build_gemm_a8w4_tdm_task(
         assert scatter_groups == sum(m + n for m, n in scatter_schedule)
         retired_rows = ep_scatter_prologue_gathers * scatter_waves * SCATTER_GROUP_ROWS
         assert INPUT_LDS_B <= C_EP_OFF + retired_rows * _lds_row_bytes
+        if num_buffers == 2:
+            assert INPUT_LDS_B <= C_EP_OFF, "NB2 inputs must not alias pending C"
     request_lds_size = max(
         AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
         C_EP_OFF + C_STORE_B,
@@ -2264,6 +2269,7 @@ def build_gemm_a8w4_tdm_task(
                     TDM_PER,
                     load_first,
                     ep_scatter_prologue_gathers,
+                    num_buffers,
                 )
             )
         next_scatter_dst_index_low = fx.Int32(0)
@@ -2378,20 +2384,26 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
                     mainloop_a_ready_gate()
-                    for i in range_constexpr(num_buffers):
-                        issue(i, i)
-                    init_accumulators()
                     n_steady = K_TILES - num_buffers
-                    if const_expr(next_stage_on):
-                        # Every rolled iteration reads the carry, so prime it here --
-                        # outside ``dispatch_wave_job``, since every wave runs this once.
-                        tdm_wait_per_wave(TDM_PER * (num_buffers - 1))
-                        workgroup_barrier()
-                        first_lds_addr = calc_lds_addr(0)
-                        rocdl.sched_barrier(0)
-                        load_lds_data(
-                            rmem_slots[0], first_lds_addr, 0, 0, interleaved_lds_load
-                        )
+                    if const_expr(prologue_callback is not None):
+                        prologue_callback(interleaved_lds_load)
+                    else:
+                        for i in range_constexpr(num_buffers):
+                            issue(i, i)
+                        init_accumulators()
+                        if const_expr(next_stage_on):
+                            # Prime the register carry before any rolled iteration.
+                            tdm_wait_per_wave(TDM_PER * (num_buffers - 1))
+                            workgroup_barrier()
+                            first_lds_addr = calc_lds_addr(0)
+                            rocdl.sched_barrier(0)
+                            load_lds_data(
+                                rmem_slots[0],
+                                first_lds_addr,
+                                0,
+                                0,
+                                interleaved_lds_load,
+                            )
 
                     def steady_post(my_jobs):
                         for kt in range(n_steady):
