@@ -146,18 +146,40 @@ def test_binding_keeps_the_loaded_kernel_until_the_cache_is_invalidated(monkeypa
     binding = getattr(exe, _ATTR)
     for spec in (None, 7, None, 7):
         assert binding((1,), spec) is True
-    # One lookup of the whole key per specialization key; later launches go
-    # straight to the loaded kernel.
     assert resolved == [("a",), (("a",), 7)]
     assert [key for key, _ in ran] == [("a",), (("a",), 7), ("a",), (("a",), 7)]
+    # Later launches go straight to the loaded kernel, without the cache.
+    assert set(binding.kernels) == {None, 7}
+    launches = []
+    monkeypatch.setattr(cache, "launch", lambda *a: launches.append(a))
+    assert binding((1,), 7) is True and not launches and len(ran) == 5
+    monkeypatch.undo()
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_resolve", resolve)
+    monkeypatch.setattr(aot_cache, "_load_module", object())
 
-    # A cache that was reset does not launch what it loaded before.
+    # A cache invalidated while a launch is under way (by another thread):
+    # the kernel that launch read is not kept.
+    stale = lambda *a: ran.append(("stale", a))  # noqa: E731
+    launch = cache.launch
+
+    def racing_launch(key, make_exe, *args):
+        cache._mem[key] = stale
+        cache.epoch += 1
+
+    monkeypatch.setattr(cache, "launch", racing_launch)
+    assert binding((1,), 8) is True
+    assert 8 not in binding.kernels
+    monkeypatch.setattr(cache, "launch", launch)
+
+    # A cache that was reset does not launch what it loaded before, and the
+    # binding lets go of it.
     cache.invalidate()
     made = []
     binding.make_exe = lambda: made.append(1) or _Launcher()
     monkeypatch.setattr(aot_cache._JitKernel, "__call__", lambda self, *a: None)
+    n = len(ran)
     assert binding((1,), None) is True
-    assert made == [1] and len(ran) == 4
+    assert made == [1] and len(ran) == n and not binding.kernels
 
 
 @pytest.mark.skipif(

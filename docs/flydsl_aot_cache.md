@@ -550,15 +550,15 @@ aiter.aot.flydsl.gemm` on two tuned CSVs: 20 a8w8 mxfp8 rows (bmm split-K
 Runtime on gfx950 hardware is still to be checked. gfx1250 mxfp8 kernels are
 not converted.
 
-### 5.4 gfx942 / gfx950: every GEMM and 2-stage MoE launcher of the AOT replays
+### 5.4 gfx942 / gfx950: the GEMM and 2-stage MoE launchers of the AOT replays
 
 The replays in `aiter/aot/flydsl` (`gemm.py`, `moe.py`) name the FlyDSL
 launchers a build precompiles. On gfx942 and gfx950 every one of them now
-launches through this cache:
+launches through this cache, except the default gfx950 HGEMM
+(`gemm_a16w16_gfx950`, §7):
 
 | Cache | Launcher | How |
 |---|---|---|
-| `gemm_a16w16_gfx950` | the default HGEMM, one module-level launcher for every config | `bind_aot`; the `specialization_key` is the config items its constexpr param struct is made from, and the device |
 | `gemm_a16w16_band_gfx950`, `gemm_a16w16_skinny_gfx950` | band and skinny HGEMM | `aot_factory` |
 | `gemm_a8w8_fp8_8wave`, `gemm_a8w8_int8_4wave` | per-token-per-channel a8w8 | `aot_factory` |
 | `mixed_moe_gemm1`, `mixed_moe_gemm2`, `mixed_fhmoe_gemm1`, `mixed_fhmoe_gemm2` | MX 2-stage MoE and FHMoE | `aot_factory` |
@@ -566,24 +566,31 @@ launches through this cache:
 | `mxmoe_gemm2` | MX stage 2 (`mxmoe_dispatcher.get_g2`) | `bind_aot` under `get_g2`'s own key |
 | `moe_reduction` | stage-2 reduce | `aot_factory` |
 
-Their call sites are unchanged, except the HGEMM, which launched through its
-own `flyc.compile` cache and now calls `_run_compiled`.
+Their call sites are unchanged.
 
 Validated compile-only on gfx942 (FlyDSL 0.5.3) with the full replays, each
 run twice on one cache directory, recording every `flyc.compile`:
 
 | Replay | Entries | Second run builds | Launchers still compiled by the JIT path |
 |---|--:|--:|--:|
-| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm` | 5240 | 0 | 0 |
+| `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm` | 4081 | 0 | 1 (`gemm_a16w16_gfx950`) |
 | `GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.moe` | 2882 | 0 | 0 |
 | `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.gemm` | 80 | 0 | 0 |
 | `GPU_ARCHS=gfx942 python -m aiter.aot.flydsl.moe` | 132 | 0 | 0 |
 
-No launch fell back to the JIT path. The HGEMM passes its tensors as
-dynamic-layout `flyc.from_dlpack` arguments and its constexprs in an
-`fx.struct`; a launcher of that shape was run on gfx942 through
-`flyc.load_module`, with the same results as the JIT path across processes.
-Runtime on gfx950 hardware is still to be checked.
+No launch fell back to the JIT path. With `AITER_FLYDSL_AOT_CACHE=0` the
+same replays leave the same FlyDSL artifacts, byte for byte (4874, 2747, 80
+and 100 `.pkl` files), so the cache changes no compiled kernel. Runtime on
+gfx950 hardware is still to be checked.
+
+Host time of one launch, MI308X, an empty kernel, the launcher's arguments
+built on every call:
+
+| Launch arguments | as passed by | JIT path | this cache |
+|---|---|--:|--:|
+| 6 typed pointers, 2 ints | mxscale, bmm, the gfx942 MoE | 20.5 us | 20.3 us |
+| 6 raw addresses, 2 ints, 2 floats | the a16wmix and MX MoE GEMMs | 10.3 us | 11.3 us |
+| 5 flat tensors, 2 ints | preshuffle, blockscale, 8-wave | 12.1 us | 14.2 us |
 
 ## 6. Adopting it for another op
 
@@ -695,8 +702,15 @@ path's). Issue 4 is in the JIT path and remains.
   and compile on their first call in each process. (`moe_reduction` is not
   specific to an arch, so a gfx1250 MoE that calls it launches it through the
   cache; that is not validated.)
+- The default gfx950 HGEMM (`gemm_a16w16_gfx950`) stays on its own
+  `flyc.compile` cache. It passes its tensors as
+  `flyc.from_dlpack(t).mark_layout_dynamic(...)` arguments, and a function
+  loaded with `flyc.load_module` takes 27 us to launch with three of them,
+  against 9.6 us for the JIT one (and for either with plain tensors): a
+  launch would cost about 55 us of host time instead of 35 us. The object
+  itself exports and loads correctly.
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,
-  24136 rows) writes about 5240 entries, 180 MB, in 15 to 20 minutes. Rows
+  24136 rows) writes about 4080 entries, 140 MB, in 15 to 20 minutes. Rows
   tuned for another CU count (e.g. the MiniMax-M3 rows for 128 CUs) go to
   that CU count's fingerprint directory, which a GPU with another count
   does not read.

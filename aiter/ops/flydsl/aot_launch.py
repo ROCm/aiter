@@ -130,6 +130,12 @@ class _AotBinding:
             return False
         else:
             key = (self.key, specialization_key)
+        # Read before the launch: what is kept below belongs to this epoch
+        # even if another thread invalidates the cache meanwhile.
+        epoch = cache.epoch
+        if self.epoch != epoch:
+            self.kernels.clear()
+            self.epoch = epoch
         _inside.active = True
         try:
             cache.launch(key, self.make_exe, *args)
@@ -149,10 +155,11 @@ class _AotBinding:
         kernel = cache._mem.get(key)
         # A loaded object launches without coming back here; the JIT fallback
         # does (_inside), and compile-only leaves nothing to keep.
-        if kernel is not None and not isinstance(kernel, _JitKernel):
-            if self.epoch != cache.epoch:
-                self.kernels.clear()
-                self.epoch = cache.epoch
+        if (
+            kernel is not None
+            and not isinstance(kernel, _JitKernel)
+            and self.epoch == epoch == cache.epoch
+        ):
             self.kernels[specialization_key] = kernel
         return True
 
