@@ -16,7 +16,6 @@ import dataclasses
 import functools
 import hashlib
 import os
-import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +23,7 @@ from pathlib import Path
 
 import torch
 
+from aiter.jit.utils.cpp_extension import ROCM_HOME
 from aiter.ops import rdna_attn as R
 
 _CSRC = Path(__file__).resolve().parents[3] / "csrc" / "kernels" / "rdna_attn"
@@ -160,40 +160,12 @@ def source_digest(prefill: bool = False) -> str:
 
 @functools.cache
 def _toolchain() -> tuple[list[str], str]:
-    """(clang command, HIP runtime rpath). The pip ROCm SDK gets a shim
-    --rocm-path with the unversioned libamdhip64.so.
-    """
-    sdk = Path(torch.__file__).resolve().parents[1] / "_rocm_sdk_core"
-    if sdk.is_dir():
-        shim = _cache / "rocm"
-        if not (shim / "lib" / "libamdhip64.so").exists():
-            tmp = _cache / f"rocm.{os.getpid()}.{threading.get_ident()}"
-            (tmp / "lib").mkdir(parents=True)
-            for name in ("bin", "include", "share", "libexec", "etc"):
-                if (sdk / name).exists():
-                    (tmp / name).symlink_to(sdk / name)
-            for entry in (sdk / "lib").iterdir():
-                (tmp / "lib" / entry.name).symlink_to(entry)
-            hip = next((sdk / "lib").glob("libamdhip64.so.*"))
-            (tmp / "lib" / "libamdhip64.so").symlink_to(hip)
-            try:
-                os.rename(tmp, shim)
-            except OSError:  # made by another process
-                shutil.rmtree(tmp)
-        bitcode = sdk / "lib" / "llvm" / "amdgcn" / "bitcode"
-        return [
-            str(sdk / "lib" / "llvm" / "bin" / "clang++"),
-            f"--rocm-path={shim}",
-            f"--rocm-device-lib-path={bitcode}",
-        ], str(sdk / "lib")
-    from torch.utils.cpp_extension import ROCM_HOME
-
+    """(clang command, HIP runtime rpath) of the ROCm aiter builds with."""
     if ROCM_HOME is None:
-        raise RuntimeError("no ROCm found: neither the pip SDK nor ROCM_HOME")
+        raise RuntimeError("no ROCm found: set ROCM_HOME or install the ROCm SDK")
     rocm = Path(ROCM_HOME)
-    return [str(rocm / "lib" / "llvm" / "bin" / "clang++"), f"--rocm-path={rocm}"], (
-        str(rocm / "lib")
-    )
+    clang = rocm / "lib" / "llvm" / "bin" / "clang++"
+    return [str(clang), f"--rocm-path={rocm}"], str(rocm / "lib")
 
 
 def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
@@ -235,7 +207,9 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
     if so.is_file():
         return so
     tmp = so.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    proc = subprocess.run([*cmd, "-o", str(tmp)], capture_output=True, text=True)
+    proc = subprocess.run(
+        [*cmd, "-o", str(tmp)], capture_output=True, text=True, check=False
+    )
     if proc.returncode:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(proc.stderr.strip()[-2000:] or f"clang {proc.returncode}")

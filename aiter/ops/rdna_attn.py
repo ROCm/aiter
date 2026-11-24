@@ -32,13 +32,13 @@ without a build.
 
 import functools
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_list
+from ..jit.utils.chip_info import get_gfx_list, get_gfx_runtime_for_device
 
 MD_NAME = "module_rdna_attn"
 
@@ -53,7 +53,7 @@ _FAMILY_OF_ARCH = {
 }
 
 
-def _build_families() -> List[str]:
+def _build_families() -> list[str]:
     """The GPU families a module is built for: those of GPU_ARCHS, or of the
     GPUs of this machine."""
     return sorted({_FAMILY_OF_ARCH[a] for a in get_gfx_list() if a in _FAMILY_OF_ARCH})
@@ -86,19 +86,19 @@ def _unit_of_q(q: torch.Tensor, *args, **kwargs) -> dict:
 
 
 @compile_ops(MD_NAME)
-def rdna_decode_configs(device_id: int) -> List[int]: ...
+def rdna_decode_configs(device_id: int) -> list[int]: ...
 
 
 @compile_ops(MD_NAME)
-def rdna_decode_batch_configs(device_id: int) -> List[int]: ...
+def rdna_decode_batch_configs(device_id: int) -> list[int]: ...
 
 
 @compile_ops(MD_NAME)
-def rdna_prefill_configs(device_id: int) -> List[int]: ...
+def rdna_prefill_configs(device_id: int) -> list[int]: ...
 
 
 @compile_ops(MD_NAME)
-def rdna_prefill_batch_configs(device_id: int) -> List[int]: ...
+def rdna_prefill_batch_configs(device_id: int) -> list[int]: ...
 
 
 @compile_ops(MD_NAME, gen_func=_unit_of_q, develop=True)
@@ -109,12 +109,12 @@ def rdna_decode_attn(
     out: torch.Tensor,
     acc: torch.Tensor,
     m: torch.Tensor,
-    l: torch.Tensor,  # noqa: E741
+    l: torch.Tensor,
     cnt: torch.Tensor,
     seq_lens: torch.Tensor,
     config: int,
     scale: float,
-    mm_ranges: Optional[torch.Tensor] = None,
+    mm_ranges: torch.Tensor | None = None,
     batched: bool = False,
 ) -> None: ...
 
@@ -132,9 +132,9 @@ def rdna_prefill_attn(
     config: int,
     max_seq_len: int,
     scale: float,
-    mm_ranges: Optional[torch.Tensor] = None,
-    plan: Optional[torch.Tensor] = None,
-    query_start_loc: Optional[torch.Tensor] = None,
+    mm_ranges: torch.Tensor | None = None,
+    plan: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
     head_group: int = 0,
 ) -> None: ...
 
@@ -152,13 +152,13 @@ def rdna_encoder_attn(
     config: int,
     max_seq_len: int,
     scale: float,
-    plan: Optional[torch.Tensor] = None,
-    query_start_loc: Optional[torch.Tensor] = None,
+    plan: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
     head_group: int = 0,
 ) -> None: ...
 
 
-def _device_id(device: Optional[torch.device] = None) -> int:
+def _device_id(device: torch.device | None = None) -> int:
     """The index of a CUDA device; of the current one by default."""
     if device is None:
         return torch.cuda.current_device()
@@ -166,14 +166,12 @@ def _device_id(device: Optional[torch.device] = None) -> int:
     return torch.cuda.current_device() if device.index is None else device.index
 
 
-def device_family(device: Optional[torch.device] = None) -> Optional[str]:
+def device_family(device: torch.device | None = None) -> str | None:
     """The GPU family whose tables serve a device (the current one by
     default): "GFX1151", "GFX1150" or "GFX1201", or None on other GPUs."""
     if not torch.cuda.is_available():
         return None
-    props = torch.cuda.get_device_properties(_device_id(device))
-    name = getattr(props, "gcnArchName", "")
-    return next((f for arch, f in _FAMILY_OF_ARCH.items() if arch in name), None)
+    return _FAMILY_OF_ARCH.get(get_gfx_runtime_for_device(_device_id(device)))
 
 
 @dataclass(frozen=True)
@@ -369,11 +367,11 @@ class _Builtin:
         out: torch.Tensor,
         acc: torch.Tensor,
         m: torch.Tensor,
-        l: torch.Tensor,  # noqa: E741
+        l: torch.Tensor,
         cnt: torch.Tensor,
         seq_lens: torch.Tensor,
         scale: float,
-        mm_ranges: Optional[torch.Tensor] = None,
+        mm_ranges: torch.Tensor | None = None,
     ) -> None:
         """Launch the build: q and out (sequences * max_query_len, Hq, D),
         the scratch of make_scratch, int32 block_table and seq_lens."""
@@ -842,9 +840,9 @@ class _BuiltinPrefill:
         seq_lens: torch.Tensor,
         max_seq_len: int,
         scale: float,
-        mm_ranges: Optional[torch.Tensor] = None,
-        plan: Optional[torch.Tensor] = None,
-        query_start_loc: Optional[torch.Tensor] = None,
+        mm_ranges: torch.Tensor | None = None,
+        plan: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
         head_group: int = 0,
     ) -> None:
         """Launch the causal build over one sequence, or over a batch with
@@ -879,8 +877,8 @@ class _BuiltinPrefill:
         seq_lens: torch.Tensor,
         max_seq_len: int,
         scale: float,
-        plan: Optional[torch.Tensor] = None,
-        query_start_loc: Optional[torch.Tensor] = None,
+        plan: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
         head_group: int = 0,
     ) -> None:
         """Launch the non-causal build over Q, K and V read in place."""

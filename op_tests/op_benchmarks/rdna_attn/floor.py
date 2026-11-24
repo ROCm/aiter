@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -29,8 +28,8 @@ import torch
 from torch.utils.cpp_extension import load_inline
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import harness  # noqa: E402
-import utils  # noqa: E402
+import harness
+import utils
 
 _SRC = r"""
 #include <hip/hip_runtime.h>

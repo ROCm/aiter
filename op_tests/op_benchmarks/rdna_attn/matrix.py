@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -16,6 +15,7 @@ jit.py. --non-causal times encoder attention on segments of L = S tokens.
 
 import argparse
 import csv
+import functools
 import statistics
 import sys
 import time
@@ -25,7 +25,7 @@ from typing import NamedTuple
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent))
 
-import utils  # noqa: E402
+import utils
 
 _SHAPES = _HERE.parent / "shapes.csv"
 # Named batches for --batch.
@@ -161,6 +161,14 @@ def _segments(spec: str) -> list[int]:
     return [int(x) for x in spec.split(",")]
 
 
+def encoder_layers(inputs, segs, scale) -> None:
+    """Encoder attention of each layer's (Q, K, V) over the segments."""
+    from aiter.ops import rdna_attn as R
+
+    for q, k, v in inputs:
+        R.encoder_forward(q, k, v, segs, scale)
+
+
 def non_causal(args: argparse.Namespace, shapes: list[Shape]) -> None:
     """--non-causal: per shape and segment list, encoder attention."""
     import torch
@@ -213,11 +221,7 @@ def non_causal(args: argparse.Namespace, shapes: list[Shape]) -> None:
                 print(f"| {' | '.join(map(str, head))} | {why} |", flush=True)
                 continue
 
-            def ours():
-                for q, k, v in inputs:
-                    R.encoder_forward(q, k, v, segs, d**-0.5)
-
-            us = timed(ours)
+            us = timed(functools.partial(encoder_layers, inputs, segs, d**-0.5))
             cells = [*head, f"{us:.2f}", f"{roof / us * 100:.1f} %"]
             print("| " + " | ".join(map(str, cells)) + " |", flush=True)
 

@@ -97,8 +97,13 @@ kernel sources they are built from; `tune.py --apply` refuses the others.
 ## Test
 
 ```bash
-pytest op_tests/test_rdna_attn.py                    # every build
-pytest op_tests/test_rdna_attn.py -k "d64 and fp16"  # one head dim and dtype
+python3 op_tests/test_rdna_attn.py                           # every build
+python3 op_tests/test_rdna_attn.py -d fp16 -s 32,8,128,0 -m 1 4
+pytest tests/test_rdna_attn_tables.py                        # no GPU needed
 ```
 
-The tests that launch kernels skip on other GPUs.
+`op_tests/test_rdna_attn.py` times every build of the current GPU's tables,
+checks it against the fp32 reference and prints one table per kind of launch,
+then checks CUDA-graph replay, multimodal ranges, sliding windows and refused
+inputs. It skips on other GPUs. `tests/test_rdna_attn_tables.py` checks the
+rules the tables of every GPU family must keep, on the headers themselves.

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -35,9 +34,9 @@ import json
 import math
 import os
 import platform
+import re
 import statistics
 import sys
-import re
 import threading
 import time
 from pathlib import Path
@@ -45,7 +44,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent))
 
-import utils  # noqa: E402
+import utils
 
 CONTEXTS = [128, 512, 1024, 4096, 8192, 16384, 32768]
 LONG_S, LONG_TARGET = 16384, 0.90

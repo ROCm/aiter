@@ -12,7 +12,6 @@
 #include <iterator>
 #include <optional>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -94,21 +93,6 @@ Table table_of(Arch arch) {
           static_cast<int64_t>(prefill_batch.size())};
 }
 
-// Raises a std::runtime_error (a Python RuntimeError) of the streamed
-// arguments unless `cond`.
-template <typename... Args>
-[[noreturn]] void fail(const Args&... args) {
-  std::ostringstream message;
-  (message << ... << args);
-  throw std::runtime_error(message.str());
-}
-
-#define RDNA_CHECK(cond, ...)                 \
-  do {                                        \
-    if (!(cond)) [[unlikely]]                 \
-      fail("rdna_attn: ", __VA_ARGS__);       \
-  } while (0)
-
 std::string sizes(const aiter_tensor_t& t) {
   std::ostringstream text;
   text << "[";
@@ -130,9 +114,9 @@ const hipDeviceProp_t& device_properties(int64_t device_id) {
   static constexpr int kMaxDevices = 64;
   static hipDeviceProp_t props[kMaxDevices];
   static bool read[kMaxDevices] = {};
-  RDNA_CHECK(device_id >= 0 && device_id < kMaxDevices, "no GPU ", device_id);
+  AITER_CHECK(device_id >= 0 && device_id < kMaxDevices, "no GPU ", device_id);
   if (!read[device_id]) {
-    RDNA_CHECK(hipGetDeviceProperties(&props[device_id],
+    AITER_CHECK(hipGetDeviceProperties(&props[device_id],
                                       static_cast<int>(device_id)) == hipSuccess,
                "cannot read the properties of GPU ", device_id);
     read[device_id] = true;
@@ -155,7 +139,7 @@ Table device_table(int64_t device_id) {
 
 // The tables of the device a launch's tensors are on.
 Table device_table(const aiter_tensor_t& q) {
-  RDNA_CHECK(q.is_gpu(), "q must be on a GPU");
+  AITER_CHECK(q.is_gpu(), "q must be on a GPU");
   return device_table(q.device_id);
 }
 
@@ -168,7 +152,7 @@ const char* kNoUnit =
 void check_kv_cache(const aiter_tensor_t& kv_cache, int num_kv_heads,
                     int page_size, int head_dim) {
   const int64_t row = 2 * head_dim;
-  RDNA_CHECK(kv_cache.dim() == 4 && kv_cache.size(1) == num_kv_heads &&
+  AITER_CHECK(kv_cache.dim() == 4 && kv_cache.size(1) == num_kv_heads &&
                  kv_cache.size(2) == page_size && kv_cache.size(3) == row &&
                  kv_cache.stride(3) == 1 && kv_cache.stride(2) == row &&
                  kv_cache.stride(1) == page_size * row &&
@@ -181,7 +165,7 @@ void check_kv_cache(const aiter_tensor_t& kv_cache, int num_kv_heads,
 void check_device(const aiter_tensor_t& q,
                   std::initializer_list<const aiter_tensor_t*> others) {
   for (const aiter_tensor_t* t : others)
-    RDNA_CHECK(t->device_id == q.device_id, "every tensor must be on GPU ",
+    AITER_CHECK(t->device_id == q.device_id, "every tensor must be on GPU ",
                q.device_id, ", got one on device ", t->device_id);
 }
 
@@ -228,7 +212,7 @@ void check_prefill_scratch(const PrefillConfig& c, const aiter_tensor_t& q,
   const int64_t block_rows =
       c.waves / (c.head_dim_split * c.key_waves) * 16 * c.row_tiles;
   const int64_t rows = 2 * target * block_rows;
-  RDNA_CHECK((int64_t)partial_o.numel() >= rows * d &&
+  AITER_CHECK((int64_t)partial_o.numel() >= rows * d &&
                  (int64_t)partial_ml.numel() >= 2 * rows &&
                  (int64_t)counters.numel() >= target,
              "scratch too small for this build: needs ", rows * d, ", ",
@@ -238,16 +222,19 @@ void check_prefill_scratch(const PrefillConfig& c, const aiter_tensor_t& q,
 }  // namespace
 
 std::vector<int64_t> rdna_decode_configs(int64_t device_id) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   const Table t = device_table(device_id);
   return decode_configs(t.decode, t.num_decode);
 }
 
 std::vector<int64_t> rdna_decode_batch_configs(int64_t device_id) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   const Table t = device_table(device_id);
   return decode_configs(t.decode_batch, t.num_decode_batch);
 }
 
 std::vector<int64_t> rdna_prefill_configs(int64_t device_id) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   std::vector<int64_t> fields;
   const Table t = device_table(device_id);
   for (int64_t i = 0; i < t.num_prefill; ++i) {
@@ -264,6 +251,7 @@ std::vector<int64_t> rdna_prefill_configs(int64_t device_id) {
 
 // Raises if a cell names no prefill build.
 std::vector<int64_t> rdna_prefill_batch_configs(int64_t device_id) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   using namespace rdna;
   std::vector<int64_t> fields;
   const Table t = device_table(device_id);
@@ -277,7 +265,7 @@ std::vector<int64_t> rdna_prefill_batch_configs(int64_t device_id) {
                    c.page_size == b.page_size && c.dtype == dtype &&
                    c.min_query_len == b.min_query_len && c.causal == b.causal;
           });
-      RDNA_CHECK(built, "prefill batch cell of ", b.num_q_heads, "/",
+      AITER_CHECK(built, "prefill batch cell of ", b.num_q_heads, "/",
                  b.num_kv_heads, "/", static_cast<int>(b.head_dim), " window ",
                  b.window, " page ", b.page_size,
                  " names no prefill build with min_query_len ", b.min_query_len,
@@ -298,52 +286,53 @@ void rdna_decode_attn(aiter_tensor_t& q,
                       aiter_tensor_t& m, aiter_tensor_t& l, aiter_tensor_t& cnt,
                       aiter_tensor_t& seq_lens, int64_t config, float scale,
                       std::optional<aiter_tensor_t> mm_ranges, bool batched) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   using namespace rdna;
   const Table t = device_table(q);
   LaunchFn* launchers = batched ? t.decode_batch_launchers : t.decode_launchers;
-  RDNA_CHECK(
+  AITER_CHECK(
       config >= 0 && config < (batched ? t.num_decode_batch : t.num_decode),
       "no ", batched ? "batched " : "", "decode build ", config);
-  RDNA_CHECK(launchers[config], batched ? "batched " : "", "decode build ",
+  AITER_CHECK(launchers[config], batched ? "batched " : "", "decode build ",
              config, kNoUnit);
   const DecodeConfig& c = batched ? t.decode_batch[config] : t.decode[config];
   const int maxm = c.max_query_len;
-  RDNA_CHECK(q.is_contiguous() && out.is_contiguous(),
+  AITER_CHECK(q.is_contiguous() && out.is_contiguous(),
              "q and out must be contiguous");
-  RDNA_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
+  AITER_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
                  block_table.stride(-1) == 1,
              "block table must be int32 rows, contiguous within a row");
-  RDNA_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
+  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
              "seq_lens must be an int32 tensor holding the sequence length");
   // nseq sequences; sequence s reads row s of the block table and scratch.
-  RDNA_CHECK(q.dim() == 3 && q.size(0) % maxm == 0 && q.size(0) > 0, "q has ",
+  AITER_CHECK(q.dim() == 3 && q.size(0) % maxm == 0 && q.size(0) > 0, "q has ",
              q.dim() == 3 ? q.size(0) : -1,
              " tokens, not a multiple of max_query_len=", maxm);
   const int nseq = q.size(0) / maxm;
-  RDNA_CHECK(batched || nseq == 1, "one-sequence build launched for ", nseq,
+  AITER_CHECK(batched || nseq == 1, "one-sequence build launched for ", nseq,
              " sequences");
-  RDNA_CHECK((int64_t)seq_lens.numel() >= nseq, "seq_lens has ",
+  AITER_CHECK((int64_t)seq_lens.numel() >= nseq, "seq_lens has ",
              seq_lens.numel(), " entries for ", nseq, " sequences");
-  RDNA_CHECK(block_table.dim() == 2 ? block_table.size(0) >= nseq : nseq == 1,
+  AITER_CHECK(block_table.dim() == 2 ? block_table.size(0) >= nseq : nseq == 1,
              "block table has too few rows for ", nseq, " sequences");
-  RDNA_CHECK(
+  AITER_CHECK(
       !batched || (acc.dim() == 3 && acc.size(0) >= nseq && m.dim() >= 1 &&
                    m.size(0) >= nseq && l.dim() >= 1 && l.size(0) >= nseq &&
                    cnt.dim() == 2 && cnt.size(0) >= nseq),
       "scratch holds fewer sequences than the ", nseq, " launched");
-  RDNA_CHECK(
+  AITER_CHECK(
       q.size(1) == c.num_q_heads && q.size(2) == static_cast<int>(c.head_dim),
       "q shape does not match the build");
   const AiterDtype dtype =
       c.dtype == Dtype::kBf16 ? AITER_DTYPE_bf16 : AITER_DTYPE_fp16;
-  RDNA_CHECK(q.dtype() == dtype && kv_cache.dtype() == dtype &&
+  AITER_CHECK(q.dtype() == dtype && kv_cache.dtype() == dtype &&
                  out.dtype() == dtype,
              "kernel built for ", AiterDtype_to_str(dtype),
              ", got q=", AiterDtype_to_str(q.dtype()),
              " kv_cache=", AiterDtype_to_str(kv_cache.dtype()),
              " out=", AiterDtype_to_str(out.dtype()));
-  RDNA_CHECK(out.numel() == q.numel(), "out must hold q's ", q.numel(),
+  AITER_CHECK(out.numel() == q.numel(), "out must hold q's ", q.numel(),
              " elements, got ", out.numel());
   const int hq = c.num_q_heads, hkv = c.num_kv_heads,
             d = static_cast<int>(c.head_dim);
@@ -362,12 +351,12 @@ void rdna_decode_attn(aiter_tensor_t& q,
     rows = (int64_t)hkv * groups * segments * padded;
     counters = 4 * hkv * groups;
   }
-  RDNA_CHECK(
+  AITER_CHECK(
       acc.dtype() == AITER_DTYPE_fp32 && m.dtype() == AITER_DTYPE_fp32 &&
           l.dtype() == AITER_DTYPE_fp32 && cnt.dtype() == AITER_DTYPE_i32,
       "scratch must be float32 partials and int32 counters");
   const int64_t seqs = batched ? acc.size(0) : 1;
-  RDNA_CHECK((int64_t)acc.numel() / seqs >= rows * d &&
+  AITER_CHECK((int64_t)acc.numel() / seqs >= rows * d &&
                  (int64_t)m.numel() / seqs >= rows &&
                  (int64_t)l.numel() / seqs >= rows &&
                  (int64_t)cnt.numel() / seqs >= counters,
@@ -379,7 +368,7 @@ void rdna_decode_attn(aiter_tensor_t& q,
   int capacity = 0, mm_stride = 0;
   if (mm_ranges.has_value()) {
     const bool per_sequence = mm_ranges->dim() == 2;
-    RDNA_CHECK(
+    AITER_CHECK(
         mm_ranges->dtype() == AITER_DTYPE_i32 && mm_ranges->is_contiguous() &&
             (mm_ranges->dim() == 1 || per_sequence) &&
             mm_ranges->size(-1) % 2 == 1 &&
@@ -429,57 +418,58 @@ void rdna_prefill_attn(aiter_tensor_t& q,
                        std::optional<aiter_tensor_t> plan,
                        std::optional<aiter_tensor_t> query_start_loc,
                        int64_t head_group) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   using namespace rdna;
   const Table t = device_table(q);
-  RDNA_CHECK(config >= 0 && config < t.num_prefill, "no prefill build ",
+  AITER_CHECK(config >= 0 && config < t.num_prefill, "no prefill build ",
              config);
-  RDNA_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
+  AITER_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
   const PrefillConfig& c = t.prefill[config];
-  RDNA_CHECK(c.causal, "a non-causal build runs through rdna_encoder_attn");
-  RDNA_CHECK(q.dim() == 3 && q.is_contiguous() && out.is_contiguous(),
+  AITER_CHECK(c.causal, "a non-causal build runs through rdna_encoder_attn");
+  AITER_CHECK(q.dim() == 3 && q.is_contiguous() && out.is_contiguous(),
              "q and out must be contiguous (tokens, heads, head dim)");
-  RDNA_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
+  AITER_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
                  block_table.stride(-1) == 1,
              "block table must be an int32 row, contiguous");
-  RDNA_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
+  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
              "seq_lens must be an int32 tensor holding the sequence length");
-  RDNA_CHECK(plan.has_value() == query_start_loc.has_value(),
+  AITER_CHECK(plan.has_value() == query_start_loc.has_value(),
              "a batch takes both a plan and query_start_loc");
   if (plan) {
-    RDNA_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
+    AITER_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
                    plan->size(1) == 4 && plan->is_contiguous(),
                "plan must be plan_prefill's contiguous int32 [entries, 4]");
-    RDNA_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
+    AITER_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
                    query_start_loc->numel() >= 2,
                "query_start_loc must be int32, one entry per sequence and one");
     const int64_t nseq = query_start_loc->numel() - 1;
-    RDNA_CHECK(block_table.dim() == 2 && block_table.size(0) >= nseq &&
+    AITER_CHECK(block_table.dim() == 2 && block_table.size(0) >= nseq &&
                    (int64_t)seq_lens.numel() >= nseq,
                "block_table and seq_lens need a row per sequence");
-    RDNA_CHECK(head_group >= 0 &&
+    AITER_CHECK(head_group >= 0 &&
                    (head_group == 0 || c.num_kv_heads % head_group == 0),
                "head_group must divide the kv heads");
   } else {
-    RDNA_CHECK(q.size(0) > 0 && max_seq_len >= q.size(0),
+    AITER_CHECK(q.size(0) > 0 && max_seq_len >= q.size(0),
                "max_seq_len must cover the query tokens");
   }
-  RDNA_CHECK(
+  AITER_CHECK(
       q.size(1) == c.num_q_heads && q.size(2) == static_cast<int>(c.head_dim),
       "q shape does not match the build");
-  RDNA_CHECK(partial_o.dtype() == AITER_DTYPE_fp32 &&
+  AITER_CHECK(partial_o.dtype() == AITER_DTYPE_fp32 &&
                  partial_ml.dtype() == AITER_DTYPE_fp32 &&
                  counters.dtype() == AITER_DTYPE_i32,
              "scratch must be float32 partials and int32 counters");
   const AiterDtype dtype =
       c.dtype == Dtype::kBf16 ? AITER_DTYPE_bf16 : AITER_DTYPE_fp16;
-  RDNA_CHECK(q.dtype() == dtype && kv_cache.dtype() == dtype &&
+  AITER_CHECK(q.dtype() == dtype && kv_cache.dtype() == dtype &&
                  out.dtype() == dtype,
              "kernel built for ", AiterDtype_to_str(dtype),
              ", got q=", AiterDtype_to_str(q.dtype()),
              " kv_cache=", AiterDtype_to_str(kv_cache.dtype()),
              " out=", AiterDtype_to_str(out.dtype()));
-  RDNA_CHECK(out.numel() == q.numel(), "out must hold q's ", q.numel(),
+  AITER_CHECK(out.numel() == q.numel(), "out must hold q's ", q.numel(),
              " elements, got ", out.numel());
   const int d = static_cast<int>(c.head_dim);
   check_kv_cache(kv_cache, c.num_kv_heads, c.page_size, d);
@@ -492,7 +482,7 @@ void rdna_prefill_attn(aiter_tensor_t& q,
     // One sequence's (ranges, 2), or with a plan the batch's
     // (sequences, ranges, 2).
     const int dim = plan ? 3 : 2;
-    RDNA_CHECK(
+    AITER_CHECK(
         mm_ranges->dtype() == AITER_DTYPE_i32 && mm_ranges->is_contiguous() &&
             mm_ranges->dim() == dim && mm_ranges->size(-1) == 2 &&
             mm_ranges->device_id == q.device_id &&
@@ -539,18 +529,19 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
                        std::optional<aiter_tensor_t> plan,
                        std::optional<aiter_tensor_t> query_start_loc,
                        int64_t head_group) {
+  const aiter_detail::AiterThrowGuard throw_guard;
   using namespace rdna;
   const Table t = device_table(q);
-  RDNA_CHECK(config >= 0 && config < t.num_prefill, "no prefill build ",
+  AITER_CHECK(config >= 0 && config < t.num_prefill, "no prefill build ",
              config);
-  RDNA_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
+  AITER_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
   const PrefillConfig& c = t.prefill[config];
-  RDNA_CHECK(!c.causal, "a causal build runs through rdna_prefill_attn");
+  AITER_CHECK(!c.causal, "a causal build runs through rdna_prefill_attn");
   const int d = static_cast<int>(c.head_dim);
-  RDNA_CHECK(q.dim() == 3, "q must be (tokens, heads, head dim)");
+  AITER_CHECK(q.dim() == 3, "q must be (tokens, heads, head dim)");
   // (tokens, heads, D), each token's heads contiguous; any token stride.
   auto check = [&](const aiter_tensor_t& x, int heads, const char* name) {
-    RDNA_CHECK(x.dim() == 3 && x.size(0) == q.size(0) && x.size(1) == heads &&
+    AITER_CHECK(x.dim() == 3 && x.size(0) == q.size(0) && x.size(1) == heads &&
                    x.size(2) == d && x.stride(2) == 1 && x.stride(1) == d,
                name, " must be (", q.size(0), ", ", heads, ", ", d,
                ") with each token's heads contiguous, got ", sizes(x),
@@ -559,34 +550,34 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
   check(q, c.num_q_heads, "q");
   check(k, c.num_kv_heads, "k");
   check(v, c.num_kv_heads, "v");
-  RDNA_CHECK(out.is_contiguous() && same_sizes(out, q),
+  AITER_CHECK(out.is_contiguous() && same_sizes(out, q),
              "out must be contiguous and shaped as q");
   const AiterDtype dtype =
       c.dtype == Dtype::kBf16 ? AITER_DTYPE_bf16 : AITER_DTYPE_fp16;
-  RDNA_CHECK(q.dtype() == dtype && k.dtype() == dtype && v.dtype() == dtype &&
+  AITER_CHECK(q.dtype() == dtype && k.dtype() == dtype && v.dtype() == dtype &&
                  out.dtype() == dtype,
              "kernel built for ", AiterDtype_to_str(dtype));
-  RDNA_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
+  AITER_CHECK(seq_lens.dtype() == AITER_DTYPE_i32 && seq_lens.numel() >= 1,
              "seq_lens must be int32, a length per sequence");
-  RDNA_CHECK(plan.has_value() == query_start_loc.has_value(),
+  AITER_CHECK(plan.has_value() == query_start_loc.has_value(),
              "a batch takes both a plan and query_start_loc");
   if (plan) {
-    RDNA_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
+    AITER_CHECK(plan->dtype() == AITER_DTYPE_i32 && plan->dim() == 2 &&
                    plan->size(1) == 4 && plan->is_contiguous(),
                "plan must be plan_prefill's contiguous int32 [entries, 4]");
-    RDNA_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
+    AITER_CHECK(query_start_loc->dtype() == AITER_DTYPE_i32 &&
                    query_start_loc->numel() >= 2 &&
                    seq_lens.numel() >= query_start_loc->numel() - 1,
                "query_start_loc must be int32, one entry per sequence and "
                "one, with a length per sequence");
-    RDNA_CHECK(head_group >= 0 &&
+    AITER_CHECK(head_group >= 0 &&
                    (head_group == 0 || c.num_kv_heads % head_group == 0),
                "head_group must divide the kv heads");
   } else {
-    RDNA_CHECK(q.size(0) > 0 && max_seq_len == q.size(0),
+    AITER_CHECK(q.size(0) > 0 && max_seq_len == q.size(0),
                "one sequence: max_seq_len is its tokens");
   }
-  RDNA_CHECK(partial_o.dtype() == AITER_DTYPE_fp32 &&
+  AITER_CHECK(partial_o.dtype() == AITER_DTYPE_fp32 &&
                  partial_ml.dtype() == AITER_DTYPE_fp32 &&
                  counters.dtype() == AITER_DTYPE_i32,
              "scratch must be float32 partials and int32 counters");

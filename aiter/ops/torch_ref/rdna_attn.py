@@ -4,7 +4,7 @@
 """Float references of what aiter.ops.rdna_attn computes, for its tests and
 tuning tools: attention with every product and the softmax in fp32."""
 
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -15,7 +15,7 @@ def paged_attention(
     seq_len: int,
     window: int = 0,
     mm_ranges: Sequence[tuple[int, int]] = (),
-    block_table: Optional[torch.Tensor] = None,
+    block_table: torch.Tensor | None = None,
     causal: bool = True,
 ) -> torch.Tensor:
     """Attention of the last tokens of one sequence over its paged KV.

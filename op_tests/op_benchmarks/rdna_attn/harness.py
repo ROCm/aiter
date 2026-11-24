@@ -17,14 +17,15 @@ tables' builds) or jit.py (standalone builds with forced knobs).
 """
 
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
 import torch
+from batch_spec import parse_batch_spec
 
 from aiter.ops import rdna_attn as R
-from batch_spec import parse_batch_spec
 
 # Split-KV scratch of the decode builds, shared by the layers, by
 # (variant, device): the sequences it holds and the tensors. A batch of more
@@ -112,7 +113,7 @@ class Attention:
         self._built = None
         self._cap = 0
         # Why the last unserved call was refused.
-        self.rejected: Optional[str] = None
+        self.rejected: str | None = None
         self.decode_calls = 0
         self.prefill_calls = 0
         self.unserved_calls = 0
@@ -267,7 +268,7 @@ class Attention:
 
     def _prepare_prefill(
         self, q, out, kv_cache, batch: Batch, first: int = 0
-    ) -> Optional[Callable[[], None]]:
+    ) -> Callable[[], None] | None:
         """The prefill launch for the sequences from `first` on, or None.
 
         Not under CUDA-graph capture: the launch depends on the host's M and S.
@@ -411,7 +412,7 @@ def do_bench_cudagraph(fn: Callable[[], None], rep: int = 20) -> list[float]:
     return times
 
 
-_flush: Optional[torch.Tensor] = None
+_flush: torch.Tensor | None = None
 
 
 def do_bench(fn: Callable[[], None], warmup: int = 25, rep: int = 100) -> list[float]:
@@ -480,7 +481,7 @@ class Result:
     # "kernel" (decode), "prefill" or "unserved".
     path: str
     # Why, if unserved.
-    rejected: Optional[str]
+    rejected: str | None
     num_layers: int
 
     @property
@@ -500,7 +501,7 @@ def run(
     num_layers: int = 10,
     min_working_set_mb: float = 96,
     use_cuda_graphs: bool = True,
-    max_model_len: Optional[int] = None,
+    max_model_len: int | None = None,
     spec_tokens: int = 0,
     max_num_seqs: int = 256,
     kernels: Any = R,

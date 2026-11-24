@@ -120,7 +120,8 @@ python op_tests/op_benchmarks/rdna_attn/tune.py \
 ## Check
 
 ```bash
-pytest op_tests/test_rdna_attn.py
+pytest tests/test_rdna_attn_tables.py
+python3 op_tests/test_rdna_attn.py
 python op_tests/op_benchmarks/rdna_attn/matrix.py \
     --hq 16 --hkv 2 --head-dim 256 --m 1 2 3 4 5 6 7 8 > matrix.md
 python op_tests/op_benchmarks/rdna_attn/matrix.py \
