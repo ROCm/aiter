@@ -155,6 +155,7 @@ else:
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.kpool_compress import *
+    from .ops.m3_tt_sparse_prefill import tt_sparse_prefill  # noqa: F401
     from .ops.rmsnorm import *
     from .ops.communication import *
     from .ops.rope import *
