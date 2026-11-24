@@ -19,9 +19,9 @@ from .layout import STAGE1_RAIL_REGIONS, STAGE2_RAIL_REGIONS, _align_up
 
 logger = logging.getLogger(__name__)
 
-# Upper bound of one rail MR (CCO dmabuf/IOVA-zero path). A single MR of
-# ~60 GiB per GPU (K3 EP32 TPR 16384) hard-hung whole nodes; rail regions are
-# packed into windows of at most this size instead.
+# Upper bound of one rail MR (CCO dmabuf/IOVA-zero path). Very large single
+# MRs hard-hung whole nodes; rail regions are packed into windows of at most
+# this size instead.
 MAX_CCO_RAIL_MR_BYTES = 1 << 30
 CCO_ALLOCATION_ALIGNMENT = 64 << 20
 # The local (LSA-only) window's allocation size. A second operator on the same
@@ -89,7 +89,7 @@ class CcoBufferPlan:
 
         Rail allocations have equal padded sizes, while each NIC registers
         only its occupied prefix. Local and rail windows require distinct
-        communicators/VA spaces, as measured on 47+51.
+        communicators/VA spaces.
         """
         for field in ("world_size", "gpus_per_node", "parity_depth", "num_qp"):
             if getattr(stage1, field) != getattr(stage2, field):

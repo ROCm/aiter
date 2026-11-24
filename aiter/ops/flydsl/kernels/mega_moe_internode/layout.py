@@ -186,7 +186,7 @@ class Stage1DispatchWire:
     @property
     def records_per_chunk(self) -> int:
         # chunk controls signaling granularity; staging/rx register the full max_tokens buffer.
-        # One chunk per rank minimizes WQEs and doorbells (k1 latency reduced by 9%).
+        # One chunk per rank minimizes WQEs and doorbells.
         if self.max_tokens > 0:
             capacity = max(self.num_qp, self.max_tokens)
         else:

@@ -181,7 +181,7 @@ def _chip() -> tuple[str, int]:
 TILE_GROUPS = (1, 2, 3, 4)
 _DEFAULT_TILE_GROUPS = (1, 2, 4)
 _ARENA_BM = 32
-# Between the measured 36.6 (G=1 best) and 73 (G=4 best) rows per expert.
+# Rows per expert up to which G=1 is used.
 _G1_MAX_ROWS = 48
 # Split from this many tokens per rank up (token / topk; see ``split_local`` above).
 _SPLIT_MIN_TPR = 1024
@@ -252,8 +252,7 @@ def select_stage1_tile(
     shape; ``source`` is ``table`` or ``default`` (the built-in rule).  The kernel
     name (``_tg{G}``, ``_fos{N}``, ``_slg``) remains the ground truth for what ran.
 
-    ``split_local`` comes from the table row when there is one (EP16 K3 a8w4
-    TPR1024 measured 14% faster unsplit); otherwise the tokens-per-rank rule
+    ``split_local`` comes from the table row when there is one; otherwise the tokens-per-rank rule
     (``default_split_local``) picks it and the built-in G and fanout follow.
 
     The split path needs 16 remote fanout shards plus the CCO ticket,
@@ -311,12 +310,6 @@ def select_stage1_tile(
 STAGE2_FUSED_WAVES = 8
 
 
-# Stage1 and the fused Stage2 in one kernel (see single_kernel.py). Measured
-# faster than the two launches from EP16 TPR32 to TPR512 and at EP32 TPR128;
-# AITER_MEGAMOE_SINGLE_KERNEL=0 restores the two launches (stage1, fused stage2).
-SINGLE_KERNEL = os.environ.get("AITER_MEGAMOE_SINGLE_KERNEL", "1") == "1"
-
-
 def select_stage2_waves(n_blocks: int) -> int:
     """Waves per fused-stage2 CTA (see STAGE2_FUSED_WAVES)."""
     if int(n_blocks) % 2:
@@ -332,9 +325,8 @@ GEMM2_BNS = (128, 256)
 GEMM2_BMS = (32, 64, 96, 128)
 GEMM2_BKS = (256,)
 DEFAULT_GEMM2_BK = 256
-# Default GEMM2 M tile of the fused stage2 per intra-node path (46+50, K3 and
-# DSv4.1, TPR 1024..16384): xGMI 64 (-1.4~-10% vs 32; 128 stalls for ms at TPR
-# >= 4096), SDMA 128 (2048: 128 < 64 < 32 monotonically).
+# Default GEMM2 M tile of the fused stage2 per intra-node path: xGMI 64
+# (128 stalls at large TPR), SDMA 128.
 GEMM2_BM_XGMI, GEMM2_BM_SDMA = 64, 128
 STAGE2_INTRA_COMMS = ("xgmi", "sdma")
 DEFAULT_GEMM2_BN = 128
@@ -344,15 +336,14 @@ GEMM2_CU_MAX = 2048
 # the copy engines (SDMA) instead of xGMI stores from the GEMM2 epilogue.
 STAGE2_SDMA_MIN_TPR = 2048
 # SDMA chunk = tickets (32-row tiles) per engine-side wait.  The waits are all
-# posted up front and each costs ~14us on the queue, serialised, so the chunk
-# grows with the rows to keep ~STAGE2_SDMA_CHUNKS of them (K3 TPR 16384: 128
-# tiles/chunk +9~14% vs xGMI, 512 recovers it).  See select_sdma_chunk_tiles.
+# posted up front and serialised on the queue, so the chunk grows with the
+# rows to keep ~STAGE2_SDMA_CHUNKS of them.  See select_sdma_chunk_tiles.
 STAGE2_SDMA_CHUNKS = 16
 STAGE2_SDMA_CHUNK_TILES_MIN = 128
 # Send-buffer size in rows per max_tok_per_rank * topk; rows past it go out as
 # xGMI stores.
 # Bytes per peer that build up before the posted SDMA put is cut (the copy
-# engines reach ~55 GB/s per link from ~4 MB; 1 MB puts only ~44).
+# engines need multi-MB puts to reach full link bandwidth).
 STAGE2_SDMA_PUT_BYTES = 4 << 20
 STAGE2_SDMA_SEND_ROWS_PER_ROUTE = 2
 # Single kernel, remote-first stage2: the remote plane goes over the rail in
@@ -517,8 +508,8 @@ def select_stage2_sdma(
     table ``intra_comm`` > rule (TPR >= STAGE2_SDMA_MIN_TPR).  Only the fused
     stage2 has the SDMA path; the caller also needs Stage1's local/remote split.
 
-    The best path depends on the model, not just the TPR (46+50, vs xGMI BM64):
-    DSv4.1 TPR >= 2048 gains 5~10% with SDMA, K3 is within +-3% and loses on EPLB.
+    The best path depends on the model, not just the TPR, so the tune table
+    row takes precedence.
     """
     comm = str((tuned or {}).get("intra_comm", "") or "")
     if comm:

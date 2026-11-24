@@ -223,7 +223,7 @@ def _gemm1_body_m16(
 
     # LDS alias scopes: A's LDS DMA contributes to vmcnt. Without alias.scope,
     # LLVM conservatively waits for all outstanding LDS DMA before LDS accesses.
-    # This inserts vmcnt(0) before each A ds_read (41% of GMM1 cycles in ATT),
+    # This inserts vmcnt(0) before each A ds_read,
     # defeating the two-step A prefetch. Give each A slot and the A-scale region
     # a separate scope on both reads and writes, so LLVM waits only for that slot's DMA.
     from flydsl._mlir import ir as _ir

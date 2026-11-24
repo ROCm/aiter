@@ -49,7 +49,6 @@ from .layout import (
 )
 from .mega_moe_internode_config import (
     NUM_QP,
-    SINGLE_KERNEL,
     STAGE2_SDMA_PUT_BYTES,
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
@@ -71,14 +70,9 @@ from .stage2 import (
     K1_CLAIM_WORDS,
     K1_CTAS_PER_CU,
     SDMA_PLAN_WORDS_MAX,
-    compile_stage2_fused,
     peer_table_launcher,
     stage2_scratch_layout,
 )
-
-# Kernel2 (node reduce / rail / combine) CTAs: 96 measured best or tied from EP16 TPR32 to
-# EP16 TPR512 and EP32 TPR128 (64-112 is a plateau; 256 is slower).
-DEFAULT_K2_CTAS = 96
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
 
@@ -397,8 +391,7 @@ class MegaMoEInternode:
             self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
             remote_first=remote_first, sdma=self._stage2_sdma)
         self._gemm2_bk, _ = select_gemm2_bk(self._s2_tuned)
-        # Without a table row: one chunk per rail queue is the balanced
-        # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
+        # Without a table row: one chunk per rail queue.
         # Capped at 512 (the TPR 4096 value): k2 unrolls one ready store per chunk
         # token, so mtpr > 4096 adds chunks instead of widening them.
         self._chunk_tokens = int(s2_tuned.get(
@@ -421,10 +414,10 @@ class MegaMoEInternode:
             if self.buffer_plan is not None else ()
         )
         self._s2_waves = select_stage2_waves(self.model_dim // self._gemm2_bn)
-        self._single_kernel = bool(SINGLE_KERNEL)
-        # One-kernel Stage2 can post while Stage1 still retires its rail
-        # credits. Caller-ordered flushes require independent QP contexts.
-        self._stage2_context_base = NUM_QP if self._single_kernel else 0
+        # Stage1 and Stage2 run in one kernel: Stage2 can post while Stage1
+        # still retires its rail credits. Caller-ordered flushes require
+        # independent QP contexts.
+        self._stage2_context_base = NUM_QP
         self._gda_context_count = NUM_QP + self._stage2_context_base
         self._runtime: _CcoRuntime | None = None
         self._closed = False
@@ -456,7 +449,7 @@ class MegaMoEInternode:
                 swiglu_limit=(self.swiglu_limit or None),
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
-                group_ready=self._single_kernel,
+                group_ready=True,
                 buffer_regions=self._buffer_regions,
                 **self._transport_compile,
             )
@@ -694,7 +687,7 @@ class MegaMoEInternode:
             memory = communicator.alloc_mem(self.layout.total_bytes)
             # Only the RDMA prefix is registered with the NIC; node-local LSA
             # goes through alloc_mem's P2P mapping of the whole allocation.
-            # Registering the whole window hits ENOMEM at TPR 4096 (7.7 GB).
+            # Registering the whole window hits ENOMEM at large capacities.
             reg_bytes = min(memory.size, _align_up(self._rdma_prefix_end(), 64 << 20))
             window = communicator.register_window(memory.ptr, reg_bytes)
             requirements = CCODevCommRequirements()
@@ -911,7 +904,7 @@ class MegaMoEInternode:
         self._k1_compile["waves"] = s2_waves
         self._k2_compile["threads"] = 64 * s2_waves
         # Token-ready rail for the rail-bound low-topk SDMA path. High topk
-        # stays on the established local critical path (K3 measured regression).
+        # stays on the established local critical path.
         token_ready = (STAGE2_TOKEN_READY
                        and self.world_size == 2 * self.gpus_per_node
                        and self._k1_compile["remote_first"]
@@ -953,19 +946,12 @@ class MegaMoEInternode:
             "record_quant": self._record_quant,
             "record_quant_padded": self._record_quant_padded,
         }
-        if self._single_kernel:
-            self._launchers["single"] = compile_single_kernel(
-                self._stage1, self._k1_compile, self._k2_compile,
-                # Every CTA runs the combine in the single kernel: the
-                # plane-parallel Phase 1 wants several CTAs per (plane, chunk)
-                # (EP32 TPR128 min-rank: 96 CTAs 340.4, all 256 CTAs 336.0 us).
-                int(self._stage1.grid)
-            )
-        else:
-            self._launchers["stage1"] = self._stage1
-            self._launchers["stage2"] = compile_stage2_fused(
-                self._k1_compile, self._k2_compile, DEFAULT_K2_CTAS
-            )
+        self._launchers["single"] = compile_single_kernel(
+            self._stage1, self._k1_compile, self._k2_compile,
+            # Every CTA runs the combine in the single kernel: the
+            # plane-parallel Phase 1 wants several CTAs per (plane, chunk).
+            int(self._stage1.grid)
+        )
 
     def _compile_launcher(self, name, args) -> None:
         """Compile and execute once, or only compile during preload.
@@ -1148,11 +1134,7 @@ class MegaMoEInternode:
                                   "arg_sd_plan", "arg_sd_cdone", "arg_tr_mcnt", "arg_tr_sdprog")),
             stream,
         )
-        if self._single_kernel:
-            launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
-        else:
-            launches = (("stage1", (*s1_args, stream)),)
-            launches += (("stage2", (*gemm2_args, *s1_args[:3], *output_args, *extra_args)),)
+        launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
         for name, args in launches:
             compiled = self._compiled.get(name)
             if compiled is None or env.compile.compile_only:

@@ -309,8 +309,7 @@ def _compile_stage1(
     record_bytes = wire.record_bytes
     F2S = int(fan2_shards)
     # With more than one remote node, fan2 takes the nodes in arrival order (see
-    # the fan2 loop): EP32 TPR128 a8w4 -1.5~3.7% min-rank, a4w4 even. With one
-    # remote node there is nothing to order.
+    # the fan2 loop). With one remote node there is nothing to order.
     F2_DYN = NODES > 2
     if F2S and F2S > fanout_ctas_per_dest - 1:
         raise ValueError("fan2_shards must be <= fanout_ctas_per_dest - 1")
@@ -345,7 +344,7 @@ def _compile_stage1(
     # plan the SDMA layout while the others run GMM1 (see single_kernel.py).
     _NC_BASE = [t for t in range(COMPUTE_FIRST) if t not in _XC]
     N_NONCOMPUTE = len(_NC_BASE)
-    # GMM1 N width is arena.block_n (256; 128 was slower for every tested shape).
+    # GMM1 N width is arena.block_n (256).
     # Count jobs using GNB.
     GNB = (2 * INTER) // BN
 
@@ -353,7 +352,7 @@ def _compile_stage1(
     k_tiles_total = k_tiles_total_for(HIDDEN, BK)
     # Size LDS for GMM1's actual M tile, not the arena tile. With G>1, _gemm1_body
     # processes BM*G rows and needs BM*G*BN*4 accumulator bytes. Sizing for BM
-    # silently writes out of bounds (measured relL2=1.55 at G=2).
+    # silently writes out of bounds.
     _, _, _, lds_bytes = _bm_constants(GBM, BN, kh_tile, k_tiles_total)
     assert lds_bytes % 16 == 0
     NC_MBOX_DW = lds_bytes // 4  # Ready-queue job broadcast after all GEMM1 LDS.
@@ -496,7 +495,7 @@ def _compile_stage1(
         if const_expr(lds_raw is None):
             lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off.
-        # Each call reloads two window fields (~6.5% of routing time in ATT).
+        # Each call reloads two window fields.
         # Cache the base and peer stride at entry; later peer addresses use integer arithmetic.
         if const_expr(not buffer_regions):
             arena_window = cco.Window(arena_win)
@@ -880,8 +879,8 @@ def _compile_stage1(
                 # rail_soa reads contiguous [q|scale|ids|weights|pad] records, REC bytes/token,
                 # written by rail_record_quant into dispatch_staging's registered parity-0 plane.
                 # Each QP sends one contiguous token segment: one PUT, one ready word, and one
-                # doorbell. Reap requests at the final credit phase. WQE posting costs ~15us
-                # independent of size (TS3/TS5), so avoid separate PUTs by field.
+                # doorbell. Reap requests at the final credit phase. WQE posting has a fixed
+                # cost independent of size, so avoid separate PUTs by field.
                 # The source is single-buffered: complete this PUT at kernel exit before the
                 # next quantization. Tickets 1..RAIL_QPS post QPs at fanout entry; T0 does not.
                 comm.fence_system_release()
@@ -903,8 +902,8 @@ def _compile_stage1(
                 for token in range(tx, ntokens, fx.Int32(THREADS)):
                     remote_slot_mask = fx.Int32(0)
                     # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
-                    # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
-                    # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
+                    # generate readfirstlane waterfall loops (up to 64 iterations per load).
+                    # Use one RX descriptor with lane-specific offsets.
                     record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
                         REC_I // 4
                     )
@@ -1158,7 +1157,7 @@ def _compile_stage1(
         # _GB_NB=THREADS/TOPK tokens, one (token, slot) per thread. LDS atomics assign
         # batch-local positions; one system atomic per (dest, expert) reserves a
         # contiguous row segment. Its owner claims any group head in that segment.
-        # In ATT12, per-record routing spent 72% of cycles at s_barrier waiting for a
+        # Per-record routing spent most of its time at s_barrier waiting for a
         # serial chain: 16 mask loads, the A1 atomic, and A2 map_ready.
         # There are four barriers per batch; no final barrier is needed. Next-batch
         # P0/P1 writes only CNT/HIT, whose P2/P3 readers precede this batch's P3 barrier.
@@ -1589,8 +1588,8 @@ def _compile_stage1(
                         tr_group += fx.Int32(1)
 
         # early_local_gmm seals padding and group maps over expert*SPL threads instead
-        # of serially per expert. F8T2 phase 1 padding took ~12us and map/publication
-        # ~11us, both on local GMM1's critical path.
+        # of serially per expert. Serial padding and map publication were both on
+        # local GMM1's critical path.
         SPL = max(1, min(8, THREADS // max(1, LOCAL_EXPERTS)))
 
         def _seal_pad_par(EO):
@@ -2330,7 +2329,7 @@ def _compile_stage1(
         # GMM1 consumers.
         # Originally only 120 tickets >= ESSENTIAL_CTAS computed GMM1. Eight comm and
         # 128 producer CTAs exited after their work, leaving 136/256 CTAs idle throughout
-        # GMM1 (~797us, 46% of Stage1). All CTAs already crossed the same EOS gate,
+        # GMM1. All CTAs already crossed the same EOS gate,
         # so allowing them all to compute preserves ordering. The closed-form
         # (consumer_index, consumer_count) bookkeeping already supports this mapping.
         is_compute = ticket >= fx.Int32(COMPUTE_FIRST)
@@ -2447,8 +2446,7 @@ def _compile_stage1(
             # Compute CTAs passed the EOS spin above.
             eos_seen = is_compute.select(fx.Int64(1), fx.Int64(0))
             # Single fused kernel: hand generation and EOS-passed to Stage2
-            # through LDS words 0/1; reloading the global words there cost
-            # ~12us per CTA.
+            # through LDS words 0/1 instead of reloading the global words there.
             if tx == fx.Int32(0):
                 fx.ptr_store(
                     Vec.from_elements([generation, eos_seen], fx.Int64),
@@ -2517,7 +2515,7 @@ def _compile_stage1(
             ntokens,
             value_attrs={
                 # With 256 four-wave CTAs, one per CU, the =2 hint caps VGPRs at 256 and causes
-                # scratch spills in GMM1 (7 for K3 TPR128 and 29 for DSV4 TPR256).
+                # scratch spills in GMM1.
                 "rocdl.waves_per_eu": WAVES // 4,
                 "rocdl.flat_work_group_size": f"{THREADS},{THREADS}",
             },

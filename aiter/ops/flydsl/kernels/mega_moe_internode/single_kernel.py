@@ -28,9 +28,8 @@ from .buffer_addressing import region_local_address
 from .stage2 import SK_POLL  # ready-word poll back-off (s_sleep units)
 from .stage2_pipeline import compile_stage2_pipeline
 
-# The GMM1-skipping CTAs reach Stage2 hundreds of us early and plan the SDMA
-# layout while GMM1 runs (EP16 TPR2048 min: a8w4 -3.4%, a4w4 -5.6%); the compute
-# CTAs then find it done (plan_ctx below).
+# The GMM1-skipping CTAs reach Stage2 early and plan the SDMA layout while
+# GMM1 runs; the compute CTAs then find it done (plan_ctx below).
 # The hand-off EOS word is polled relaxed (an acquire load invalidates the XCD L2
 # on every poll); the per-XCD invalidate below is the acquire. Stage1 then skips
 # its per-CTA acquire after the EOS spin.
@@ -94,7 +93,7 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         s1_body(dev_comm, arena_win, arena_ptr, x_q, input_scale, route_weights,
                 topk_ids, w1q, w1scale, ntokens, lds_raw=lds)
         # Stage1 left (generation, EOS passed) in LDS words 0/1. Reloading the
-        # global epoch/EOS words here queued behind other traffic for ~12us.
+        # global epoch/EOS words here queued behind other traffic.
         gpu.barrier()
         gl = Vec(fx.make_view(fx.recast_iter(fx.Int64, lds), fx.make_layout(2, 1)).load())
         gen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[0]).ir_value()))
@@ -114,7 +113,7 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
                 comm2.spin_until_ge_i64_sleep_relaxed(eos, gen, SK_POLL)
             # One L2 invalidate per XCD and generation (MegaMoEV2 style): a
             # per-CTA buffer_inv sc1 wipes the XCD's shared L2 32 times and
-            # stalls this CTA's first load ~7-12us behind it. The word holds
+            # stalls this CTA's first load behind it. The word holds
             # the generation once an invalidate issued after EOS completed.
             xa = arena_ptr + fx.Int64(xcd_inv_off)
             if const_expr(bool(buffer_regions)):

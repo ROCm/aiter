@@ -68,8 +68,7 @@ def gemm2_compute_pipe(
     # With more waves than row groups (fp4 BM32: 4 groups, 8 waves) wave w and
     # w + A_NW load the same rows into the same LDS bytes: the duplicate DMA carries
     # identical data, and every wave waits for its own DMA before the step barrier.
-    # (Guarding the DMA with a runtime "if wave < A_NW" here gave wrong results:
-    # measured relL2 0.48 at a4w4 BM32.)
+    # (Guarding the DMA with a runtime "if wave < A_NW" here gave wrong results.)
     A_NW = min(NW, BM // rows_per_call)
     wave_a = (
         wave % fx.Int32(A_NW) if A_NW < NW else wave

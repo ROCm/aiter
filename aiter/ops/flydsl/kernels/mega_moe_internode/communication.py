@@ -157,10 +157,10 @@ def load_i64_global_system_relaxed(addr_i64):
 
     cco's wait_ready polls with system-*acquire* semantics, and every acquire
     load carries a buffer_inv.  That is right for a single handoff and ruinous
-    for a bulk wait: kernel2 checks 512 arrival flags per chunk from each of
-    ~10 CTAs, so the acquire form spends 82k L2 invalidations to observe words
-    that are almost always already set -- measured at +39us.  This is the
-    mirror image of the release-store writeback that cost kernel1 +6.7ms.
+    for a bulk wait: kernel2 checks many arrival flags per chunk from several
+    CTAs, so the acquire form spends one L2 invalidation per poll to observe
+    words that are almost always already set.  This is the mirror image of the
+    release-store writeback below.
 
     Monotonic keeps the one-as scope, so a peer's write is still observed on
     every iteration; only the invalidation goes away.  The caller owns the
@@ -197,8 +197,7 @@ def store_i64_global_system_relaxed(addr_i64, value):
     store_i64_global_system is a *release* store, and LLVM gives every one of
     those a buffer_wbl2 -- a full L2 writeback.  That is right when the store
     is what publishes the payload, and ruinous when the payload was already
-    flushed by a fence the caller issued once for a whole batch: measured at
-    +6.7ms on kernel1 for ~18k of them per generation.  Monotonic keeps the
+    flushed by a fence the caller issued once for a whole batch.  Monotonic keeps the
     one-as scope, so the store still lands where a peer can see it, and drops
     the writeback.  The caller owns the ordering.
     """

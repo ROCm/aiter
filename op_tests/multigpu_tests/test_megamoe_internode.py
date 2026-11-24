@@ -1887,7 +1887,6 @@ class Runner:
         res = {
             "quant": args.fused_quant,
             "cco_buffer_layout": op.buffer_layout,
-            "single_kernel": op._single_kernel,
             "gda_context_count": op._gda_context_count,
             "stage2_context_base": op._stage2_context_base,
             "logical_nodes": op.layout.stage1.source_nodes,

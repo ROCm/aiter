@@ -10,8 +10,8 @@ kernel2 (``megamoe_k2_*``) reduces within the node, sends over the rail, then
 reduces across nodes and unpermutes output.
 
 Neither has a launch of its own: both are inlined, on the same CTAs, by the
-fused stage2 kernel (two-kernel path, ``compile_stage2_fused``) and by the
-single kernel (``single_kernel.py``).
+operator's single kernel (``single_kernel.py``). ``compile_stage2_fused``
+also provides a standalone fused Stage2 helper.
 
 All CTAs pass through three phases rather than keeping fixed role partitions:
 
@@ -327,8 +327,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     single kernel; it has no standalone launch.  Eight waves: a CTA runs the
     n_block pair (2p, 2p+1) of each m-block it claims, waves 0-3 / 4-7 one
     n_block each over the shared A tile; the tickets are per n_block pair and
-    m-blocks are claimed dynamically (a static stride is badly imbalanced,
-    K3 TPR 1024: +22%).  Every CTA must be resident from the start (kernel2
+    m-blocks are claimed dynamically (a static stride is badly imbalanced).
+    Every CTA must be resident from the start (kernel2
     runs on the same CTAs), so the grid is capped by ``resident_ctas``.
 
     A is the FP4 GMM1 output, stored per physical 32-row tile and read through
@@ -347,7 +347,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     Stage1 already stores local expert ids.
     """
     # Unrolled GEMM2 K pipeline (gemm2_pipe) for fp8 and fp4 A, except BM128.
-    # Four B stages and three A stages measured best at BM32 (EP32 TPR128).
+    # Four B stages and three A stages.
     G2_PIPE = int(gemm2_bm) != 128
     G2_BSTAGES = 4
     BK = int(gemm2_bk)
@@ -455,7 +455,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SD_RB = model_dim + model_dim // 32  # one FP8 output row + its E8M0 scales
     SD_CTR_B, SD_SIG_B, SD_INV_B = 128, 136, 256  # bytes into a peer's arrival region
     # Plan CTAs: each lays out a contiguous share of the tickets, the last to
-    # finish adds the per-CTA offsets (one CTA alone took 142us at K3 TPR4096).
+    # finish adds the per-CTA offsets (one CTA alone is too slow at large TPR).
     SD_PLAN_CTAS = 32
     # i32 words of the plan buffer: [0,8) seg_off, [8,16) rbase, [16,24) rows
     # per dest, [24,32) of them by SDMA; i64 at 32: done generation; 40: plan-CTA arrival count;
@@ -526,7 +526,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
     claim_word = 0  # arg_arrival_count holds only kernel1's K1_CLAIM_WORDS words
     # Only resident CTAs claim, so none launches after the tickets run out
-    # just to bump the same two atomics (+200us at K3 TPR 1024 with 7168 CTAs).
+    # just to bump the same two atomics.
     ctas_per_nb = min(cu_num, max(1, res_eff // NB_CLAIM))
     # One CTA per CU, all of them: kernel2 (and in the single kernel Stage1)
     # runs on the same grid.  Tickets are dynamic, so a column may get one
@@ -586,7 +586,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
         # Stage1 wrote epoch_gate earlier on this stream; the kernel boundary provides
         # visibility, so use a relaxed agent-scope load. A system acquire adds
-        # buffer_inv at every CTA entry, disrupting GEMM2's L2 weight reuse (+97us measured).
+        # buffer_inv at every CTA entry, disrupting GEMM2's L2 weight reuse.
         if const_expr(gen_value is None):
             i64_generation = fx.Int64(rocdl.readfirstlane(
                 T.i64,
@@ -781,8 +781,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         # bx % 8), so number the CTAs XCD by XCD and cut that order into
         # NB_CLAIM runs. A column's CTAs then share one or two L2s, and the
         # m-blocks they take together (adjacent, mostly one expert) read its W2
-        # slice from HBM once instead of once per XCD (EP32 a8w4 min-rank vs
-        # bx % NB_CLAIM: TPR128 -8..-10us, 256 -2, 512 -6, 1024 -10).
+        # slice from HBM once instead of once per XCD.
         xc_grid = fx.Int32(gpu.grid_dim.x)
         xc_flat = (bx_i32 % fx.Int32(NUM_XCD)) * (xc_grid // fx.Int32(NUM_XCD)) + bx_i32 // fx.Int32(NUM_XCD)
         # Grids that are not a multiple of NUM_XCD keep the plain columns.
@@ -1728,7 +1727,7 @@ def compile_stage2_node_combine(
         if HIDDEN % 32:
             raise ValueError("fp8 rail 要求 hidden 能被 32 整除(e8m0 块大小)")
         # Quantization halves RECORD_BYTES per token for PUT/GET, reducing the rail's
-        # measured 78us line-rate payload cost.
+        # line-rate payload cost.
         RECORD_BYTES = HIDDEN + HIDDEN // 32
         if RECORD_BYTES % 8:
             raise ValueError(
@@ -1748,8 +1747,7 @@ def compile_stage2_node_combine(
     RED_BATCH = min(int(topk), 8)           # Outstanding top-k loads per reduction batch.
     RED_BATCHES = _ceil_div(int(topk), RED_BATCH)
     # Reduce units interleaved per wave step (see the reduce loop): at most 24
-    # row loads in flight per wave (K3, RED_BATCH 8: U=4 ran 7-70x slow in 4 of
-    # 8 TPR1024 cases, U=2 0 of 6; DSv4.1, RED_BATCH 6: U=4 clean).
+    # row loads in flight per wave (more intermittently ran far slower).
     RED_U = 4 if 4 * RED_BATCH <= 24 else 2
     CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)  # One wave covers 512 columns.
     # Phase 1 assigns each (plane, token, hidden partition) to one wave.
@@ -1779,14 +1777,12 @@ def compile_stage2_node_combine(
     # Phase1 / Phase3 entry acquires drop only L1: within a launch no CU reads an
     # inbox, rail or accumulator line before its ready flag, and the launch acquire
     # already dropped older L2 lines, so a whole-L2 buffer_inv per CTA / chunk only
-    # costs (Phase1 30->25us, Phase3 49->37us in the single kernel).
+    # costs time.
     # With CREDIT_ASYNC the kernel no longer waits for its own credit puts to land:
     # the next generation's Phase1 posts and Phase2 reap on the same ordered QP
     # (ctx 0 -> peer) drain their completions.
     CREDIT_NOWAIT = CREDIT_ASYNC
-    # Combine-tail paths (EP32 a8w4 min-rank, same session, all against the
-    # previous default: TPR128 341->328, 256 568->552, 512 864->835,
-    # 1024 1341->1296; a4w4 TPR128 354->329):
+    # Combine-tail paths:
     # QPDED: dedicated QP-owner CTAs (see the Phase 1 work split).
     QPDED = not token_ready
     # CRPAR: credits to the NODES-1 peers posted by one wave each (see
@@ -1957,8 +1953,8 @@ def compile_stage2_node_combine(
             """Poll arrival flags with relaxed loads; the caller acquires once after its barrier.
 
             CCO wait_ready acquires and invalidates L2 on every poll. Batched waits check
-            512 flags per chunk, repeated by about ten CTAs, usually finding them ready.
-            Avoid roughly 80,000 invalidations and their measured 39us overhead.
+            many flags per chunk, repeated by several CTAs, usually finding them ready.
+            Avoid those invalidations.
             """
             word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
             while word < expected:
@@ -2062,7 +2058,7 @@ def compile_stage2_node_combine(
         # Work CTAs for the Phase 1 / Phase 3 reductions. With QPDED the NUM_QP
         # QP-owner CTAs only wait for WQEs, ring and reap: as workers they posted
         # a group-ready value and flushed after every remote plane on their own
-        # critical path and finished Phase 3 ~30us after the rest (EP32 TPR128).
+        # critical path and finished Phase 3 after the rest.
         wbx, wgrid = bx, grid
         is_worker = fx.Int32(1) == fx.Int32(1)
         if const_expr(QPDED):
@@ -2118,8 +2114,7 @@ def compile_stage2_node_combine(
               uhi = ck_tok * fx.Int32(HPARTS)
               # RED_U units per wave per step, interleaved: their slot masks,
               # then their inv words, then their rows go out together, so the
-              # three dependent loads of a unit are paid once per RED_U units
-              # (part 1, DSv4.1 TPR4096: 60us at ~1.4 TB/s was this chain).
+              # three dependent loads of a unit are paid once per RED_U units.
               for u in range(ulo + unit0, uhi, ustep * fx.Int32(RED_U)):
                   _ok_u, _tok, _tix, _col, _sm, _tot = [], [], [], [], [], []
                   for _j in range_constexpr(RED_U):
@@ -2224,9 +2219,9 @@ def compile_stage2_node_combine(
                                       BFloat16).to(Float32)
                       if const_expr(_rb + 1 < RED_BATCHES):
                           rocdl.sched_barrier(0)
-                  # Keep the default accumulator store policy. ACCUM_WT=1 used sc0|sc1
-                  # write-through to avoid per-chunk fence_system_release L2 writeback, but
-                  # measured 194.5 versus 195.6 with no meaningful gain; the switch was removed.
+                  # Keep the default accumulator store policy. An sc0|sc1 write-through
+                  # variant (avoiding the per-chunk fence_system_release L2 writeback) gave
+                  # no meaningful gain and was removed.
                   for _j in range_constexpr(RED_U):
                       totals = _tot[_j]
                       token_index = _tix[_j]
@@ -2579,8 +2574,7 @@ def compile_stage2_node_combine(
             gpu.barrier()
             if const_expr(CRPAR):
                 # One wave per peer: each peer's ctx-0 QP has its own poster, so the
-                # NODES-1 put/flush pairs go out in parallel (serial wave0: ~16us
-                # kernel tail at EP32).
+                # NODES-1 put/flush pairs go out in parallel instead of serially on wave 0.
                 for _peer_index in range_constexpr(NODES - 1):
                     if wave == fx.Int32(_peer_index):
                         _peer_node = REMOTE_NODES[_peer_index]
@@ -3001,8 +2995,8 @@ def compile_stage2_node_combine(
 
 
 # ---------------------------------------------------------------------------
-# Fused stage2 (two-kernel path, after a Stage1 launch): kernel1 and kernel2
-# in one launch.
+# Standalone fused Stage2 helper: kernel1 and kernel2 in one launch after
+# a separate Stage1 launch. The operator uses single_kernel.py instead.
 #
 # Every CTA runs the kernel1 body (GEMM2 + node push + the once-per-kernel
 # arrival publish); CTAs below ``k2_ctas`` then run the kernel2 body with their
@@ -3010,7 +3004,6 @@ def compile_stage2_node_combine(
 # the arrival flags, and kernel1 never waits on kernel2.  The grid is the
 # resident CTA count (see ``resident_ctas`` in compile_mega_moe_stage2), so
 # every kernel2 CTA is resident; consecutive indices spread it over the CUs.
-# (All CTAs running kernel2 over the whole grid measured +5~29%.)
 # ---------------------------------------------------------------------------
 
 
