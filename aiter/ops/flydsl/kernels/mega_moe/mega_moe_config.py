@@ -57,6 +57,8 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# EP8 DeepSeek-V4-Pro, the default fused layout.
+V4_PRO_EP8_LAYOUT = (8, REFERENCE_EXPERTS_PER_RANK, V4_MODEL_DIM, V4_INTER_DIM)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
 # serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
@@ -1769,6 +1771,33 @@ def _tune_a4w4_small(
     The ranks of a launch may pick different buckets, so a change here keeps the launch protocol knobs (dedup_rows,
     plan_local, direct_done, tok_counters, bf16_head_tokens) the same for every bucket of a layout.
     """
+    if layout == V4_PRO_EP8_LAYOUT:
+        return _tune_a4w4_v4_pro_small(config, bucket)
+    return config
+
+
+def _tune_a4w4_v4_pro_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 small-input kernel of EP8 DeepSeek-V4-Pro, measured on gfx950 (8 ranks, MTPR 512, routes suite)."""
+    # The EP8 V4.1-Flash tune (same rank / expert geometry) with its launch protocol, without the parts measured on
+    # V4.1-Flash only: its 256-wide GEMM2 tiles at 32 tokens and its GEMM1 m-tile pairs at 64 and 128 tokens.
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket == 32:
+        config = replace(config, stage2=replace(config.stage2, block_n=128))
+    if bucket in (64, 128):
+        config = replace(
+            config, fused_stage1=replace(config.fused_stage1, pair_tiles=False)
+        )
+    if bucket == 1:
+        # Cached W1 (measured +2-3%).
+        config = replace(config, stage1=replace(config.stage1, b_nt=0))
+    if bucket in (256, 512):
+        # 256-wide GEMM1 n-tiles with the partial last round of each XCD slice split into half tiles over its idle
+        # CTAs (measured +1% at 256, +1-2% at 512).
+        config = replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            fused_stage1=replace(config.fused_stage1, g1_split_tail=64),
+        )
     return config
 
 
@@ -1782,6 +1811,36 @@ def _tune_a4w4_large(
     the runtime's buffers or set what its routes share (large_m_runtime_knobs) stay the same for every bucket
     of a layout.
     """
+    if layout == V4_PRO_EP8_LAYOUT:
+        return _tune_a4w4_v4_pro_large(config, bucket)
+    return config
+
+
+def _tune_a4w4_v4_pro_large(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """A4W4 large-input kernel of EP8 DeepSeek-V4-Pro, measured on gfx950 (8 ranks, MTPR 16384, routes suite)."""
+    # The EP4 V4.1-Flash knob set without what V4-Pro's dims cannot take: GEMM1 fold_tail (with mid_tail_rows)
+    # overflows LDS at 128 x 512 tiles, and GEMM2 fold_tail (with nt_single, early_p_mid) and ascale_lds need
+    # A-scale LDS rounds a 3072 inter dim does not give. Cached W1 (b_nt 0): each expert's m-tiles reread its slab.
+    config = _tune_v41_flash_ep4_large(config)
+    config = replace(
+        config,
+        stage1=replace(config.stage1, b_nt=0),
+        fused_stage1=replace(config.fused_stage1, fold_tail=0, mid_tail_rows=0),
+        fused_stage2=replace(
+            config.fused_stage2,
+            fold_tail=0,
+            nt_single=False,
+            ascale_lds=False,
+            early_p_mid=0,
+        ),
+    )
+    # Measured (A4W4, routes suite): 4 payload producers a destination at least, and GEMM2 CTAs leaving GEMM1
+    # after 2/16 of its work from 8192 rows, gain 1-3% at 8192 / 16384 rows and match 8 / 4 elsewhere.
+    config = replace(
+        config, fused_stage1=replace(config.fused_stage1, payload_min_blocks=4)
+    )
+    if bucket >= 8192:
+        config = replace(config, fused_stage2=replace(config.fused_stage2, early_p=2))
     return config
 
 

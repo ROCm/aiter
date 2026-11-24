@@ -913,10 +913,12 @@ def test_routed_instance_routes(layout, quant, mtpr):
 
 @pytest.mark.parametrize("mtpr", (8192, 16384))
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
-def test_large_m_a4w4_runs_the_a8w4_config(layout, mtpr):
-    """The A4W4 large-input kernel runs the A8W4 large-input config (untuned for A4W4; select_fused_config takes no
-    quant): its fused Stage2 spec and the payload geometry other than the row bytes do not depend on the quant.
+def test_large_m_a4w4_config_geometry(layout, mtpr):
+    """The A4W4 large-input kernel's config (its layout's A8W4 config unless tuned for A4W4): a GEMM2 reading FP8,
+    whole-wave FP4 A copies, and the A8W4 payload geometry other than the row bytes while the A4W4 tune keeps the
+    knobs that size the runtime (large_m_runtime_knobs).
     """
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_runtime_knobs
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import (
         LargeMRuntime,
         large_m_kernel_specs,
@@ -939,8 +941,11 @@ def test_large_m_a4w4_runs_the_a8w4_config(layout, mtpr):
     fp8 = LargeMRuntime.payload_capacity(a_dtype="fp8", **fused)
     fp4 = LargeMRuntime.payload_capacity(a_dtype="fp4", **fused)
     assert fp8[2] == model_dim and fp4[2] == model_dim // 2
-    assert (fp4[0], fp4[1], fp4[3]) == (fp8[0], fp8[1], fp8[3])
-    config = select_fused_config(mtpr, mtpr, **shape)
+    config = select_fused_config(mtpr, mtpr, quant="a4w4", **shape)
+    if large_m_runtime_knobs(config) == large_m_runtime_knobs(
+        select_fused_config(mtpr, mtpr, **shape)
+    ):
+        assert (fp4[0], fp4[1], fp4[3]) == (fp8[0], fp8[1], fp8[3])
     s2_spec, _ = large_m_kernel_specs(
         config,
         model_dim=model_dim,
