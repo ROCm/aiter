@@ -33,6 +33,9 @@ from flydsl._mlir import ir
 from flydsl.utils import env
 from typing_extensions import Self
 
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
+from aiter.utility.fp4_utils import e8m0_shuffle
+
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
 from .layout import (
@@ -500,6 +503,23 @@ class MegaMoEInternode:
             raise ValueError("fanout_masks are not supported by the internode dispatch")
         if str(comm_quant) not in _COMM_QUANT:
             raise ValueError(f"comm_quant must be one of {sorted(_COMM_QUANT)}, got {comm_quant!r}")
+
+    @staticmethod
+    def prepare_weights(w1, w1_scale, w2, w2_scale):
+        """Lay raw MXFP4 expert weights out for this operator.
+
+        ``w1`` [E, 2 * inter_dim, model_dim // 2] (gate rows, then up rows) and
+        ``w2`` [E, model_dim, inter_dim // 2] are packed FP4; their E8M0
+        scales are per 1x32 along K, [E, rows, K // 32] or [E * rows, K // 32].
+        Returns ``(w1, w1_scale, w2, w2_scale)`` for the constructor or
+        :meth:`bind_weights`; A4W4 and A8W4 take the same weights."""
+        experts = w1.shape[0]
+        return (
+            shuffle_weight(w1, layout=(16, 16)),
+            e8m0_shuffle(w1_scale.reshape(-1, w1_scale.shape[-1])),
+            shuffle_weight_a16w4(w2, 16, False),
+            shuffle_scale_a16w4(w2_scale.reshape(-1, w2_scale.shape[-1]), experts, False),
+        )
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         """Point the next forwards at another layer's weights (same layouts as
