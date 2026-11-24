@@ -668,33 +668,46 @@ def flash_attn_varlen_func_benchmark(
     )
 
 
+PAGED_KV_HEAD_CONFIGS = [(64, 8, 2), (96, 8, 2), (128, 8, 2), (256, 8, 8)]
+
+
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d, nheads, nheads_k", PAGED_KV_HEAD_CONFIGS)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("seqlens_q", [[1, 5, 16], [1, 1, 1]])
-def test_flash_attn_varlen_func_paged_kv(dtype, d, causal, return_lse, seqlens_q):
-    """block_table path must match the same batch with contiguous K/V."""
+def test_flash_attn_varlen_func_paged_kv(
+    dtype, d, nheads, nheads_k, causal, return_lse, seqlens_q
+):
+    """block_table path must match the same batch with contiguous K/V.
+
+    Cache slots that the block table does not reference hold +/-100, so a
+    kernel that reads the wrong page or past a sequence end fails.
+    """
     torch.random.manual_seed(0)
-    nheads, nheads_k, page_size = 8, 2, 128
+    page_size = 128
     seqlens_k = [300, 129, 16]
     num_pages = [(s + page_size - 1) // page_size for s in seqlens_k]
     total_pages = sum(num_pages) + 4
-    k_cache = torch.randn(
-        total_pages, page_size, nheads_k, d, device="cuda", dtype=dtype
+    k = torch.randn(sum(seqlens_k), nheads_k, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    k_cache = torch.full(
+        (total_pages, page_size, nheads_k, d), 100.0, device="cuda", dtype=dtype
     )
-    v_cache = torch.randn_like(k_cache)
+    v_cache = torch.full_like(k_cache, -100.0)
     pages = torch.randperm(total_pages, device="cuda", dtype=torch.int32)
     block_table = torch.zeros(
         len(seqlens_q), max(num_pages), device="cuda", dtype=torch.int32
     )
-    k_list, v_list, start = [], [], 0
+    page, start = 0, 0
     for i, (n, s) in enumerate(zip(num_pages, seqlens_k)):
-        block_table[i, :n] = pages[start : start + n]
-        start += n
-        idx = block_table[i, :n].long()
-        k_list.append(k_cache[idx].reshape(-1, nheads_k, d)[:s])
-        v_list.append(v_cache[idx].reshape(-1, nheads_k, d)[:s])
+        block_table[i, :n] = pages[page : page + n]
+        page += n
+        for j, p in enumerate(block_table[i, :n].tolist()):
+            lo, hi = start + j * page_size, min(start + (j + 1) * page_size, start + s)
+            k_cache[p, : hi - lo] = k[lo:hi]
+            v_cache[p, : hi - lo] = v[lo:hi]
+        start += s
     cu_seqlens_q = torch.tensor(
         [0] + list(itertools.accumulate(seqlens_q)), dtype=torch.int32, device="cuda"
     )
@@ -718,7 +731,7 @@ def test_flash_attn_varlen_func_paged_kv(dtype, d, causal, return_lse, seqlens_q
         )
 
     out = run(k_cache, v_cache, block_table)
-    out_ref = run(torch.cat(k_list), torch.cat(v_list), None)
+    out_ref = run(k, v, None)
     if return_lse:
         out, lse = out
         out_ref, lse_ref = out_ref
@@ -1186,11 +1199,15 @@ if __name__ == "__main__":
     df_padding = pd.DataFrame(padding_collected)
     aiter.logger.info(f"mha_varlen_seq_padding summary:\n{df_padding}")
 
-    for dtype, d, causal, return_lse, seqlens_q in itertools.product(
-        args.dtype, [64, 128], args.causal, [False, True], [[1, 5, 16], [1, 1, 1]]
+    for dtype, heads, causal, return_lse, seqlens_q in itertools.product(
+        args.dtype,
+        PAGED_KV_HEAD_CONFIGS,
+        args.causal,
+        [False, True],
+        [[1, 5, 16], [1, 1, 1]],
     ):
         test_flash_attn_varlen_func_paged_kv(
-            dtypes.d_dtypes[dtype], d, causal, return_lse, seqlens_q
+            dtypes.d_dtypes[dtype], *heads, causal, return_lse, seqlens_q
         )
 
 
