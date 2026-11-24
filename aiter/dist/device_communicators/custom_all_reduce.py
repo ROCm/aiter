@@ -301,6 +301,9 @@ _AR2S_RMS_MAX_BYTES = {4: 192 * 1024 * 1024}
 # k5_ar_errors, the result is then wrong) instead of hanging.
 _K5_AR_HIDDEN = 6144
 _K5_AR_MAX_ROWS = 256
+# With a bf16 output it wins only up to 128 rows (4x MI455X, graphs: 8.70 vs 11.25 us at 128,
+# 15.06 vs 14.18 at 160); with the MXFP8 output at every size up to _K5_AR_MAX_ROWS.
+_K5_AR_BF16_MAX_ROWS = 128
 _K5_AR_MAXIT = 20000000
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
@@ -2131,24 +2134,31 @@ class CustomAllreduce:
     def _k5_ar_bytes(self, world_size: int) -> int:
         """Bytes the one-shot decode AR + RMSNorm (k5_fused_ar_rms) sets aside at the end of the
         Lamport inbox allocation (TP4 only, the measured world size; 0 otherwise): its inbox and
-        its counters. Sharing that allocation adds no IPC buffer, export or peer mapping."""
+        its counters. Sharing that allocation adds no IPC buffer, export or peer mapping.
+        """
         if world_size != 4:
             return 0
         return ops.k5_ar_buffer_size_gfx1250(world_size, _K5_AR_MAX_ROWS, _K5_AR_HIDDEN)
 
     def should_k5_ar(
-        self, inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        fp8_out: bool = False,
     ) -> bool:
-        """Whether k5_fused_ar_rms can take this call: bf16 [rows, 6144], 0 < rows <= the cap.
-        Shapes and dtypes only, so every rank decides the same."""
+        """Whether k5_fused_ar_rms should take this call: bf16 [rows, 6144], 0 < rows <= the cap
+        for its output (fp8_out). Shapes and dtypes only, so every rank decides the same.
+        """
         if self.disabled or not self._k5_ctx:
             return False
+        max_rows = _K5_AR_MAX_ROWS if fp8_out else _K5_AR_BF16_MAX_ROWS
         return (
             inp.dim() == 2
             and inp.dtype == res_inp.dtype == w.dtype == torch.bfloat16
             and inp.shape[-1] == res_inp.shape[-1] == w.numel() == _K5_AR_HIDDEN
             and res_inp.shape == inp.shape
-            and 0 < inp.shape[0] <= _K5_AR_MAX_ROWS
+            and 0 < inp.shape[0] <= max_rows
         )
 
     def k5_fused_ar_rms(

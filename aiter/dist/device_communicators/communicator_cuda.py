@@ -964,7 +964,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             (gluon or lamport)
             and ca_comm is not None
-            and ca_comm.should_k5_ar(input_, res_inp_, weight_)
+            and ca_comm.should_k5_ar(input_, res_inp_, weight_, fp8_out=True)
         ):
             if tail is not None:
                 # the deferred MoE tail computed in the k5 prologue (same bits)
