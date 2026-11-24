@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from aiter.ops import rdna_attn as hip
+from aiter.ops.torch_ref.rdna_attn import full_attention, paged_attention
 
 # Relative error bound per dtype, for decode.
 TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
@@ -120,26 +121,6 @@ def _paged_inputs(seq_len, v, seed=0):
     return q * 0.5, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
-def _reference(q, kv, seq_len, window=0, mm_ranges=()):
-    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
-    flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len]
-    k, v = flat[..., :hd], flat[..., hd:]
-    gqa = hq // hkv
-    qf = q.float().permute(1, 0, 2)
-    kf = k.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
-    vf = v.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
-    scores = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
-    pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
-    lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim
-    for start, end in mm_ranges:
-        masked &= ~((lim >= start) & (lim <= end) & (pos >= start) & (pos <= end))
-    if window:
-        masked |= pos < lim - (window - 1)
-    scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
-    return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
-
-
 def _rounds_p(v) -> bool:
     """On RDNA4, fp16 WMMA decode builds with more than 8 rows per workgroup
     take P rounded to fp16 into P@V."""
@@ -172,7 +153,7 @@ def _check_one(v, module, lens):
         out = torch.full_like(q, float("nan"))
         _launch(module, q, kv, block_table, out, scratch, seq_len)
         torch.cuda.synchronize()
-        ref = _reference(q, kv, seq_len, v.window)
+        ref = paged_attention(q, kv, seq_len, v.window)
         got = out.float().nan_to_num(1e9)
         assert _max_rel(got, ref, v) <= TOL[v.dtype], f"{v.name}, S={seq_len}"
 
@@ -207,7 +188,7 @@ def _check_batch(v, module, lens):
         if s == 0:
             assert (rows == 7.0).all(), f"{v.name}: a padded sequence was written"
             continue
-        ref = _reference(parts[i][0], parts[i][1], s, v.window)
+        ref = paged_attention(parts[i][0], parts[i][1], s, v.window)
         assert _max_rel(rows, ref, v) <= TOL[v.dtype], f"{v.name}: sequence {i}, S={s}"
 
 
@@ -249,7 +230,7 @@ def test_every_listed_variant_loads():
 
 
 @pytest.mark.parametrize("unit", sorted({_unit(v) for v in hip.variants()}))
-def test_built_in_variants_match_reference(unit):
+def test_built_in_variants_matchpaged_attention(unit):
     """Every built decode variant matches the reference."""
     _skip_unless_rdna35_or_rdna4()
     for v in hip.variants():
@@ -268,11 +249,11 @@ def test_built_in_variants_match_reference(unit):
         q, kv, block_table = _paged_inputs(s, v)
         buf = _decode_mm_buf(ranges, q.device)
         got = _decode_mm(module, v, q, kv, block_table, s, buf)
-        ref = _reference(q, kv, s, v.window, ranges)
+        ref = paged_attention(q, kv, s, v.window, ranges)
         assert _max_rel(got, ref, v) <= TOL[v.dtype], f"{v.name}, image"
         # At M=1 the image ends at the only query token, so nothing changes.
         if m > 1:
-            causal = _reference(q, kv, s, v.window)
+            causal = paged_attention(q, kv, s, v.window)
             assert _max_rel(causal, ref) > 10 * TOL[v.dtype], f"{v.name}, image"
 
 
@@ -298,7 +279,7 @@ def test_sliding_window_never_reads_freed_pages(want):
     v, module = _built(**want)
     seq_len = 2016
     q, kv, block_table = _paged_inputs(seq_len, v)
-    ref = _reference(q, kv, seq_len, v.window)
+    ref = paged_attention(q, kv, seq_len, v.window)
     first = max(0, seq_len - v.max_query_len - (v.window - 1)) // v.page_size
     kv = torch.cat([kv, torch.full_like(kv[:1], float("nan"))])
     block_table = block_table.clone()
@@ -337,7 +318,7 @@ def test_graph_replay_follows_seq_lens():
         out.zero_()
         graph.replay()
         torch.cuda.synchronize()
-        ref = _reference(q, kv, s)
+        ref = paged_attention(q, kv, s)
         assert _max_rel(out.float(), ref, v) <= TOL[v.dtype], f"S={s}"
 
 
@@ -380,39 +361,6 @@ def test_build_of_another_head_dim_is_refused():
 # ---------------------------------------------------------------- prefill
 
 
-def _prefill_reference(
-    q, kv, block_table, seq_len, window=0, mm_ranges=(), causal=True
-):
-    """Float reference of a prefill; a token in a multimodal range [start, end]
-    also sees the range's later keys. Non-causal: every key."""
-    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
-    pages = kv[block_table.long()]
-    flat = pages.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len].float()
-    gqa = hq // hkv
-    pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
-    lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim if causal else torch.zeros_like(pos > lim)
-    for start, end in mm_ranges:
-        q_in = (lim >= start) & (lim <= end)
-        k_in = (pos >= start) & (pos <= end)
-        masked &= ~(q_in & k_in)
-    if window:
-        masked |= pos < lim - (window - 1)
-    out = torch.empty(m, hq, hd, device=q.device)
-    for h0 in range(0, hq, 4):
-        heads = range(h0, min(hq, h0 + 4))
-        kvh = [h // gqa for h in heads]
-        qf = q[:, h0 : h0 + len(heads)].float().permute(1, 0, 2)
-        k = flat[:, kvh, :hd].permute(1, 0, 2)
-        v = flat[:, kvh, hd:].permute(1, 0, 2)
-        scores = torch.bmm(qf, k.transpose(1, 2)) * (hd**-0.5)
-        scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
-        out[:, h0 : h0 + len(heads)] = torch.bmm(torch.softmax(scores, -1), v).permute(
-            1, 0, 2
-        )
-    return out
-
-
 def _mm_ranges_tensor(mm_ranges, device):
     """One sequence's ranges as (1, ranges, 2), padded with an
     empty range."""
@@ -422,7 +370,7 @@ def _mm_ranges_tensor(mm_ranges, device):
 
 def _assert_prefill_close(got, q, kv, block_table, seq_len, window, what, mm_ranges=()):
     """Against the float reference."""
-    ref = _prefill_reference(q, kv, block_table, seq_len, window, mm_ranges)
+    ref = paged_attention(q, kv, seq_len, window, mm_ranges, block_table)
     err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
     bound = PREFILL_TOL[q.dtype]
     assert err <= bound, f"{what}: max error {err:.2e}, bound {bound:.2e}"
@@ -503,7 +451,7 @@ def test_every_listed_prefill_variant_loads():
 @pytest.mark.parametrize(
     "unit", sorted({_prefill_unit(v) for v in _causal_prefill_rows()})
 )
-def test_built_in_prefill_variants_match_reference(unit):
+def test_built_in_prefill_variants_matchpaged_attention(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
     _skip_unless_rdna35_or_rdna4()
@@ -614,30 +562,14 @@ def _non_causal_inputs(v, lens, seed=0):
 
 def _assert_non_causal_close(got, q, k, v, what):
     """Against the float reference, for one sequence."""
-    m, hq, hd = q.shape
-    g = hq // k.shape[1]
-    # A few heads at a time: all 64 heads of a long sequence take 16 GiB.
-    step = max(1, (1 << 28) // (m * m))
-    ref = torch.cat(
-        [
-            torch.nn.functional.scaled_dot_product_attention(
-                *(
-                    x[:, h : h + step].float().transpose(0, 1)
-                    for x in (q, k.repeat_interleave(g, 1), v.repeat_interleave(g, 1))
-                ),
-                scale=hd**-0.5,
-            ).transpose(0, 1)
-            for h in range(0, hq, step)
-        ],
-        dim=1,
-    )
+    ref = full_attention(q, k, v)
     err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
     bound = PREFILL_TOL[q.dtype]
     assert err <= bound, f"{what}: max error {err:.2e}, bound {bound:.2e}"
 
 
 @pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _non_causal_rows()}))
-def test_built_in_non_causal_prefill_variants_match_reference(unit):
+def test_built_in_non_causal_prefill_variants_matchpaged_attention(unit):
     """Every non-causal build: each token sees every key of its sequence,
     read in place, also past the last whole step, including a last step whose
     later 16-key sub-tiles hold no key."""
@@ -684,7 +616,7 @@ _NON_CAUSAL_BATCHES = {
     ),
     ids=str,
 )
-def test_non_causal_prefill_batch_matches_reference(shape, batch):
+def test_non_causal_prefill_batch_matchespaged_attention(shape, batch):
     """An encoder's segments in one planned launch, each against its
     reference."""
     _skip_unless_rdna35_or_rdna4()
@@ -752,7 +684,7 @@ def test_non_causal_rows_are_full_attention():
     [[4, 8, 1, 3], [577, 5, 1024, 8, 9, 64, 8], [9] * 7, [4096], [5], []],
     ids=["short", "mixed", "first step", "one", "one short", "none"],
 )
-def test_encoder_forward_matches_reference(segments):
+def test_encoder_forward_matchespaged_attention(segments):
     """encoder_forward: every segment, however short, in one non-causal
     launch."""
     _skip_unless_rdna35_or_rdna4()
@@ -931,7 +863,7 @@ def _serve_batch(v, q, kv, block_table, starts, seq_lens, out, mm_ranges=None):
     [(32, 16, 256, 1024, torch.float16), (32, 4, 512, 0, torch.bfloat16)],
     ids=["swa_fp16", "global_bf16"],
 )
-def test_prefill_batch_mm_prefix_matches_reference(shape):
+def test_prefill_batch_mm_prefix_matchespaged_attention(shape):
     """A batch with each sequence's own multimodal ranges."""
     _skip_unless_rdna35_or_rdna4()
     hq, hkv, d, window, dtype = shape
@@ -960,7 +892,7 @@ def test_prefill_batch_mm_prefix_matches_reference(shape):
     "unit",
     sorted({_prefill_unit(v) for v in _causal_prefill_rows() if v.page_size == 16}),
 )
-def test_prefill_batch_matches_reference(unit):
+def test_prefill_batch_matchespaged_attention(unit):
     """A batch in one launch, each sequence against its reference."""
     _skip_unless_rdna35_or_rdna4()
     v = next(v for v in _prefill_rows() if _prefill_unit(v) == unit)
@@ -1052,7 +984,7 @@ def test_prefill_batch_features():
     ],
     ids=["two_images", "split_kv", "from_prefix", "longer_than_window"],
 )
-def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
+def test_prefill_mm_prefix_matchespaged_attention(shape, m, prefix, mm_ranges):
     """Tokens of a multimodal range see the whole range (Gemma4's shapes)."""
     _skip_unless_rdna35_or_rdna4()
     hq, hkv, d, window, dtype = shape
@@ -1185,7 +1117,7 @@ def _decode_mm(module, v, q, kv, block_table, seq_len, buf):
     ],
 )
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_decode_mm_prefix_matches_reference(want, min_m, image, dtype):
+def test_decode_mm_prefix_matchespaged_attention(want, min_m, image, dtype):
     """Decode-sized calls inside an image see the image's later keys, and the
     count comes from device memory."""
     v, module = _built(dtype, max_query_len=lambda m: m >= min_m, **want)
@@ -1197,15 +1129,15 @@ def test_decode_mm_prefix_matches_reference(want, min_m, image, dtype):
     got = _decode_mm(
         module, v, q, kv, block_table, seq_len, _decode_mm_buf(ranges, q.device)
     )
-    ref = _reference(q, kv, seq_len, v.window, ranges)
+    ref = paged_attention(q, kv, seq_len, v.window, ranges)
     assert _max_rel(got, ref, v) <= TOL[v.dtype], v.name
-    causal = _reference(q, kv, seq_len, v.window)
+    causal = paged_attention(q, kv, seq_len, v.window)
     assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
     # With several images over the query tokens, each one shows.
     cut = [r for r in ranges if r[0] < r[1] and r[1] >= seq_len - m]
     for r in cut if len(cut) > 1 else []:
         rest = [x for x in ranges if x != r]
-        without = _reference(q, kv, seq_len, v.window, rest)
+        without = paged_attention(q, kv, seq_len, v.window, rest)
         assert _max_rel(without, ref) > 10 * TOL[v.dtype], f"{r} changed nothing"
 
 
@@ -1232,12 +1164,12 @@ def test_decode_mm_ranges_stop_at_count_and_capacity(case):
     flat = [count, *(x for r in ranges for x in r), *trap]
     buf = torch.tensor(flat, dtype=torch.int32, device=q.device)[:size]
     got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
-    ref = _reference(q, kv, seq_len, 0, ranges)
+    ref = paged_attention(q, kv, seq_len, 0, ranges)
     assert _max_rel(got, ref, v) <= TOL[v.dtype], v.name
     # Reading the trap, or ignoring the ranges that fit, must show.
     for wrong in (ranges + [trap], []):
         if wrong != ranges:
-            wrong_ref = _reference(q, kv, seq_len, 0, wrong)
+            wrong_ref = paged_attention(q, kv, seq_len, 0, wrong)
             assert _max_rel(wrong_ref, ref) > 10 * TOL[v.dtype], wrong
 
 
@@ -1273,7 +1205,7 @@ def test_graph_replay_follows_mm_ranges():
         out.zero_()
         graph.replay()
         torch.cuda.synchronize()
-        ref = _reference(q, kv, seq_len, 0, ranges)
+        ref = paged_attention(q, kv, seq_len, 0, ranges)
         assert _max_rel(out.float(), ref, v) <= TOL[v.dtype], f"ranges={ranges}"
 
 
@@ -1326,10 +1258,10 @@ def test_batched_decode_follows_mm_ranges_per_sequence():
                 if s == 0:
                     assert (got == 7.0).all(), f"{lens}: padding {i} was written"
                     continue
-                ref = _reference(parts[i][0], parts[i][1], s, v.window, ranges)
+                ref = paged_attention(parts[i][0], parts[i][1], s, v.window, ranges)
                 assert _max_rel(got, ref, v) <= TOL[v.dtype], f"{step}, sequence {i}"
                 if ranges:
-                    causal = _reference(parts[i][0], parts[i][1], s, v.window)
+                    causal = paged_attention(parts[i][0], parts[i][1], s, v.window)
                     assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "no change"
 
 

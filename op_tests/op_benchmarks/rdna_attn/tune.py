@@ -221,79 +221,7 @@ def label(k):
     return " ".join([head, *extra])
 
 
-# ----------------------------------------------------------------- reference --
-
-
-def reference(q, kv, s, window=0):
-    import torch
-
-    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
-    flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:s]
-    k, v = flat[..., :hd], flat[..., hd:]
-    g = hq // hkv
-    qf = q.float().permute(1, 0, 2)
-    kf = k.float().permute(1, 0, 2).repeat_interleave(g, 0)
-    vf = v.float().permute(1, 0, 2).repeat_interleave(g, 0)
-    sc = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
-    pos = torch.arange(s, device=q.device).view(1, s)
-    lim = (s - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim
-    if window:
-        masked |= pos < lim - (window - 1)
-    sc = sc.masked_fill(masked.view(1, m, s), float("-inf"))
-    return torch.bmm(torch.softmax(sc, -1), vf).permute(1, 0, 2)
-
-
-def prefill_reference(q, kv, table, s, window=0):
-    """Float reference of a causal prefill of q's tokens, the last of a
-    sequence of s, over the paged cache."""
-    import torch
-
-    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
-    flat = kv[table.long()].transpose(1, 2).reshape(-1, hkv, 2 * hd)[:s].float()
-    g = hq // hkv
-    pos = torch.arange(s, device=q.device).view(1, s)
-    lim = (s - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim
-    if window:
-        masked |= pos < lim - (window - 1)
-    out = torch.empty(m, hq, hd, device=q.device)
-    # A few heads at a time: the scores of every head would not fit.
-    step = max(1, min(hq, (1 << 28) // (m * s)))
-    for h0 in range(0, hq, step):
-        heads = range(h0, min(hq, h0 + step))
-        kvh = [h // g for h in heads]
-        qf = q[:, h0 : h0 + len(heads)].float().permute(1, 0, 2)
-        k = flat[:, kvh, :hd].permute(1, 0, 2)
-        v = flat[:, kvh, hd:].permute(1, 0, 2)
-        sc = torch.bmm(qf, k.transpose(1, 2)) * (hd**-0.5)
-        sc = sc.masked_fill(masked.view(1, m, s), float("-inf"))
-        out[:, h0 : h0 + len(heads)] = torch.bmm(torch.softmax(sc, -1), v).permute(
-            1, 0, 2
-        )
-    return out
-
-
-def non_causal_reference(q, k, v):
-    """Float reference of one sequence whose tokens see every key."""
-    import torch
-
-    m, hq, hd = q.shape
-    g = hq // k.shape[1]
-    step = max(1, (1 << 28) // (m * m))
-    return torch.cat(
-        [
-            torch.nn.functional.scaled_dot_product_attention(
-                *(
-                    x[:, h : h + step].float().transpose(0, 1)
-                    for x in (q, k.repeat_interleave(g, 1), v.repeat_interleave(g, 1))
-                ),
-                scale=hd**-0.5,
-            ).transpose(0, 1)
-            for h in range(0, hq, step)
-        ],
-        dim=1,
-    )
+# -------------------------------------------------------------------- checks --
 
 
 def versions() -> dict:
@@ -315,6 +243,7 @@ def check_batch(module, v, repeat=2):
     import torch
 
     from aiter.ops.rdna_attn import make_scratch
+    from aiter.ops.torch_ref.rdna_attn import paged_attention
 
     base = max(1040, v.window + 64, v.page_size + 1000)
     lens = [base, 48, 0]
@@ -358,11 +287,12 @@ def check_batch(module, v, repeat=2):
                 continue
             if not torch.isfinite(rows).all():
                 return float("inf")
-            ref = reference(
+            ref = paged_attention(
                 q[i * v.max_query_len : (i + 1) * v.max_query_len],
-                kv[table[i].long()],
+                kv,
                 s,
                 v.window,
+                block_table=table[i],
             )
             err = ((rows - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
             worst = max(worst, err)
@@ -376,6 +306,7 @@ def check(module, v, repeat=2):
     import torch
 
     from aiter.ops.rdna_attn import make_scratch
+    from aiter.ops.torch_ref.rdna_attn import paged_attention
 
     worst = 0.0
     scratch = make_scratch(v, torch.device("cuda"))
@@ -405,7 +336,7 @@ def check(module, v, repeat=2):
             * 0.5
         )
         table = torch.arange(nb, device="cuda", dtype=torch.int32)
-        ref = reference(q, kv, s, v.window)
+        ref = paged_attention(q, kv, s, v.window)
         sl = torch.tensor([s], device="cuda", dtype=torch.int32)
         out = torch.empty_like(q)
         for _ in range(repeat):
@@ -857,6 +788,7 @@ def tune_prefill(a) -> None:
     import torch
 
     from aiter.ops import rdna_attn as R
+    from aiter.ops.torch_ref.rdna_attn import paged_attention
 
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
@@ -937,7 +869,8 @@ def tune_prefill(a) -> None:
             table = torch.randperm(pages, device=dev).to(torch.int32)
             q = (torch.randn(m, hq, d, device=dev) * 0.5).to(dtype)
             sl = torch.tensor([s], device=dev, dtype=torch.int32)
-            data[m, p] = (q, kv, table, sl, prefill_reference(q, kv, table, s, win))
+            ref = paged_attention(q, kv, s, win, block_table=table)
+            data[m, p] = (q, kv, table, sl, ref)
         return data[m, p]
 
     scratch = {}
@@ -1191,6 +1124,7 @@ def tune_prefill_non_causal(a) -> None:
     import torch
 
     from aiter.ops import rdna_attn as R
+    from aiter.ops.torch_ref.rdna_attn import full_attention
 
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
@@ -1272,7 +1206,7 @@ def tune_prefill_non_causal(a) -> None:
             k = (torch.randn(m, hkv, d, device=dev) * 0.5).to(dtype)
             v = (torch.randn(m, hkv, d, device=dev) * 0.5).to(dtype)
             sl = torch.tensor([m], device=dev, dtype=torch.int32)
-            data[m] = (q, k, v, sl, non_causal_reference(q, k, v))
+            data[m] = (q, k, v, sl, full_attention(q, k, v))
         return data[m]
 
     scratch = {}

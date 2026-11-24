@@ -159,22 +159,6 @@ Table device_table(const aiter_tensor_t& q) {
   return device_table(q.device_id);
 }
 
-// Makes a tensor's device current for a launch.
-class DeviceGuard {
- public:
-  explicit DeviceGuard(const aiter_tensor_t& t) {
-    RDNA_CHECK(hipGetDevice(&previous_) == hipSuccess &&
-                   hipSetDevice(t.device_id) == hipSuccess,
-               "cannot make GPU ", t.device_id, " current");
-  }
-  ~DeviceGuard() { (void)hipSetDevice(previous_); }
-  DeviceGuard(const DeviceGuard&) = delete;
-  DeviceGuard& operator=(const DeviceGuard&) = delete;
-
- private:
-  int previous_ = 0;
-};
-
 // Why a table's entry cannot launch here.
 const char* kNoUnit =
     ": this module is not built for its head dim, dtype and GPU family "
@@ -411,7 +395,7 @@ void rdna_decode_attn(aiter_tensor_t& q,
     mm_stride =
         batched && per_sequence ? static_cast<int>(mm_ranges->stride(0)) : 0;
   }
-  const DeviceGuard device_guard(q);
+  const HipDeviceGuard device_guard(q.device_id);
   launchers[config]({q.data_ptr(),
                      kv_cache.data_ptr(),
                      ints(block_table),
@@ -522,7 +506,7 @@ void rdna_prefill_attn(aiter_tensor_t& q,
     num_ranges = static_cast<int>(mm_ranges->size(-2));
   }
   check_prefill_scratch(c, q, partial_o, partial_ml, counters);
-  const DeviceGuard device_guard(q);
+  const HipDeviceGuard device_guard(q.device_id);
   PrefillArgs args{};
   args.q = q.data_ptr();
   args.kv = kv_cache.data_ptr();
@@ -610,7 +594,7 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
                {&k, &v, &out, &partial_o, &partial_ml, &counters, &seq_lens});
   if (plan) check_device(q, {&*plan, &*query_start_loc});
   check_prefill_scratch(c, q, partial_o, partial_ml, counters);
-  const DeviceGuard device_guard(q);
+  const HipDeviceGuard device_guard(q.device_id);
   PrefillArgs args{};
   args.q = q.data_ptr();
   args.kv = k.data_ptr();

@@ -31,7 +31,6 @@ without a build.
 """
 
 import functools
-import os
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
 
@@ -39,7 +38,7 @@ import numpy as np
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import _detect_native
+from ..jit.utils.chip_info import get_gfx_list
 
 MD_NAME = "module_rdna_attn"
 
@@ -57,10 +56,7 @@ _FAMILY_OF_ARCH = {
 def _build_families() -> List[str]:
     """The GPU families a module is built for: those of GPU_ARCHS, or of the
     GPUs of this machine."""
-    archs = [a.strip() for a in os.getenv("GPU_ARCHS", "native").split(";")]
-    if "native" in archs:
-        archs = [a for a in archs if a != "native"] + list(_detect_native())
-    return sorted({_FAMILY_OF_ARCH[a] for a in archs if a in _FAMILY_OF_ARCH})
+    return sorted({_FAMILY_OF_ARCH[a] for a in get_gfx_list() if a in _FAMILY_OF_ARCH})
 
 
 def unit_module_name(head_size: int, dtype: torch.dtype) -> str:
