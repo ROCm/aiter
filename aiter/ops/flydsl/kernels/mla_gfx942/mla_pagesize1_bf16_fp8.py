@@ -23,14 +23,22 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
+# MLA shapes: K is the full 576-wide latent+RoPE row; V is its first 512 columns.
 QK_DIM = 576
 V_DIM = 512
+# One get_mla_metadata_v1 work item: [batch, partial, q_start, q_end,
+# kv_start, kv_end, kv_tail_tokens, pad].
 WORK_INFO_COLS = 8
+
+# Workgroup shape: eight 64-lane waves around 16x16x16 BF16 MFMAs. Each KV loop
+# iteration stages KV_TILE_SIZE tokens in LDS; longer ranges loop over tiles.
 WAVE_SIZE = 64
 MFMA_SIZE = 16
 WAVES = 8
 BLOCK_THREADS = WAVES * WAVE_SIZE
 KV_TILE_SIZE = 32
+
+# Widest load/store (dwordx4 / ds_read_b128) and the BF16 values it holds.
 VECTOR_BYTES = 16
 BF16_VECTOR_SIZE = VECTOR_BYTES // 2
 
@@ -135,20 +143,34 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         and 1 <= max_seqlen_q <= 8
         and num_heads * max_seqlen_q <= 128
     )
+
+    # Work tiling. QK gives wave w query-row tile w (16 rows); waves without a
+    # row tile prefetch the next KV tile. PV gives each wave 64 output columns
+    # (four 16-column MFMA tiles) across all rows.
     ROW_TILES = (num_heads * max_seqlen_q + MFMA_SIZE - 1) // MFMA_SIZE
     PV_COL_TILES = V_DIM // (WAVES * MFMA_SIZE)
+
+    # LDS row pitches. The extra 16 bytes shift each row by four banks.
     KV_ROW_STRIDE = QK_DIM + BF16_VECTOR_SIZE
     PROB_ROW_STRIDE = KV_TILE_SIZE + 8
+
+    # KV gather: 12 lanes per token load its 576 FP8 bytes as three 16-byte
+    # chunks, so 32 tokens occupy waves 0-5.
     GATHER_BYTES = 48
     GATHER_LANES = QK_DIM // GATHER_BYTES
     GATHER_CHUNKS = GATHER_BYTES // VECTOR_BYTES
     GATHER_WAVES = KV_TILE_SIZE * GATHER_LANES // WAVE_SIZE
+
+    # QK walks 576 columns as 9 groups x 2 halves; each step issues two MFMAs.
     QK_COLUMN_GROUPS = QK_DIM // WAVE_SIZE
     QK_STEPS = QK_COLUMN_GROUPS * 2
+
     # Output columns are (wave, column_tile, lane_group, element).
     OUTPUT_COLUMN_LAYOUT = ((WAVES, PV_COL_TILES, 4, 4), (V_DIM // WAVES, 16, 4, 1))
     STAT_ALPHA, STAT_MAX, STAT_SUM = range(3)
 
+    # LDS: the BF16 KV tile (read as K and as V), softmax probabilities, the
+    # per-row (alpha, max, sum) handed from QK owners to PV, and page addresses.
     @fx.struct
     class Shared:
         kv: fx.Array[fx.BFloat16, KV_TILE_SIZE * KV_ROW_STRIDE, 16]
@@ -181,24 +203,34 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         num_work: fx.Int32,
         num_cus: fx.Constexpr[int],
     ):
+        # Thread coordinates. lane_row is the MFMA row/column a lane owns and
+        # lane_group its 4-element slice; wave is scalar for uniform branches.
         tid = fx.thread_idx.x
         lane = tid % WAVE_SIZE
         lane_row = lane % MFMA_SIZE
         lane_group = lane // MFMA_SIZE
         wave = _wave_uniform(tid // WAVE_SIZE)
         workgroup_id = fx.block_idx.x
+
+        # Global buffers. Q rows are token * num_heads + head; Q is viewed as
+        # 16-byte chunks so each load is one dwordx4.
         q_rows = total_q * num_heads
         p_rows = num_partial * num_heads
         q_global = _buffer(
             q, fx.BFloat16, fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1))
         )
         page_indices = _buffer(pages, fx.Int32, fx.make_layout(num_indices, 1))
+
+        # Planner output: work_indptr[g]..[g+1] are this workgroup's work items.
         work_indptr = _buffer(indptr, fx.Int32, fx.make_layout(num_cus + 1, 1))
         work_info = _buffer(
             info,
             fx.Int32,
             fx.make_layout((num_work, WORK_INFO_COLS), (WORK_INFO_COLS, 1)),
         )
+
+        # Outputs: FP32 split partials + LSE for mla_reduce_v1, or the final
+        # BF16 output (+ optional LSE) when a request is not split.
         partial_output = _buffer(
             partial,
             fx.Float32,
@@ -215,11 +247,15 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
             ),
         )
         final_lse_output = _buffer(output_lse, fx.Float32, fx.make_layout(q_rows, 1))
+
+        # The FP8 KV scale is applied twice, never per element: here for K,
+        # folded with log2(e) so softmax can use exp2, and in the epilogue for V.
         kv_scale_global = _buffer(kv_scale, fx.Float32, fx.make_layout(1, 1))
         kv_descale = _wave_uniform(kv_scale_global[0].bitcast(fx.Int32)).bitcast(
             fx.Float32
         )
         score_scale = scale * kv_descale * fx.Float32(LOG2E)
+
         shared = fx.SharedAllocator().allocate(Shared).peek()
         # One padded KV slab, viewed per access pattern: K operand rows, the
         # gather's (8 BF16, part, chunk, gather lane) stores, and V^T columns.
@@ -231,6 +267,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 )
             )
         )
+
+        # Write side of the same slab: the gather stores (8 BF16, gather lane,
+        # chunk, part) per token.
         gathered_kv_lds = fx.Tensor(
             shared.kv.view(
                 fx.make_layout(
@@ -239,6 +278,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 )
             )
         )
+
         # PV is V^T @ P^T. The MFMA atom partitions V into its A operand. V is
         # gathered element by element below: a vector load of the partition
         # lowers to the same ds_read_u16s but schedules ~0.4% slower cold.
@@ -252,6 +292,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 fx.make_layout((V_DIM // WAVES, KV_TILE_SIZE), (1, KV_ROW_STRIDE)),
             )
         )
+
         # QK owns a different row tile in each wave. Its eight scores per lane
         # are (element, lane_group, token_tile) = element + 4*group + 16*tile.
         # Keep this view explicit: the 0.5.0 partition_C store path hits a
@@ -266,16 +307,25 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 )
             )
         )
+
+        # Per-row (alpha, max, sum): written by the row's QK wave, read by every
+        # PV wave (alpha) and by the epilogue (max, sum).
         stats = fx.Tensor(
             shared.stats.view(fx.make_layout((ROW_TILES * 16, 3), (3, 1)))
         )
+        # Absolute KV row addresses, computed once per token for the gather lanes.
         page_addresses_lds = fx.Tensor(
             shared.pages.view(fx.make_layout(KV_TILE_SIZE, 1))
         )
         kv_lds_ptr = shared.kv.ptr
+
+        # Persistent loop: one workgroup per CU runs its planner-assigned work
+        # items. Each item is one request's query rows over one KV range.
         work_begin = _wave_uniform(work_indptr[workgroup_id])
         work_end = _wave_uniform(work_indptr[workgroup_id + 1])
         for work_index in range(work_begin, work_end, 1):
+            # Work item fields. partial_row >= 0 means this is one KV fragment
+            # of a split request; -1 means it covers the whole request.
             work = fx.Int64(work_index)
             partial_row = _wave_uniform(work_info[(work, 1)])
             q_begin = _wave_uniform(work_info[(work, 2)])
@@ -285,6 +335,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
             kv_tail_tokens = _wave_uniform(work_info[(work, 6)])
             qlen = q_end - q_begin
             active_rows = qlen * num_heads
+
+            # Q stays in registers for the whole KV range: each lane loads its
+            # row's 576 columns (18 x 16 bytes across the four lane groups).
             query_fragments = []
             row = wave * MFMA_SIZE + lane_row
             for column_group in range_constexpr(QK_COLUMN_GROUPS):
@@ -303,6 +356,10 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         query_offset, fx.Int64(total_q) * num_heads * (QK_DIM // 8)
                     )
                     query_fragments.append(q_global[(query_offset, None)].load())
+
+            # Online-softmax state carried across KV tiles: running max and sum
+            # of this lane's QK row, the unnormalized PV accumulators, and the
+            # raw FP8 bytes of the next tile when spare waves prefetch.
             # FlyDSL 0.5 carries nested Python containers through runtime loops.
             # Keep the algorithm's state named; no hand-packed SSA slot offsets.
             loop_state = {
@@ -314,6 +371,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 ],
                 "prefetch": [],
             }
+
             if ROW_TILES < WAVES:
                 # Tile zero is primed once; all lanes issue clamped loads, including
                 # the two waves whose gathered values are not stored to LDS.
@@ -336,14 +394,20 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                             result_type=fx.Vector.make_type(16, fx.Uint8),
                         ).bitcast(fx.Uint32)
                 loop_state["prefetch"] = prefetched_kv
+
+            # KV loop: KV_TILE_SIZE tokens per iteration over this work's range.
+            # Each iteration: page addresses -> gather to LDS -> QK + softmax ->
+            # prefetch next tile -> PV.
             carried = _flatten_state(loop_state)
             for tile_index, carried_in in range(
                 kv_begin, kv_end, KV_TILE_SIZE, init=carried
             ):
                 tile_start = fx.Int32(tile_index)
                 loop_state = _unflatten_state(carried_in, ROW_TILES, PV_COL_TILES)
-                # The prefetched path publishes next-tile addresses while PV
-                # consumes the current tile. At eight row tiles, load in place.
+
+                # Page addresses. The prefetched path publishes next-tile
+                # addresses while PV consumes the current tile. At eight row
+                # tiles, load in place.
                 if tid < KV_TILE_SIZE:
                     lookahead = KV_TILE_SIZE if ROW_TILES < WAVES else 0
                     idx = (tile_start + lookahead + tid < kv_end).select(
@@ -356,9 +420,11 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         tid,
                     )
                 fx.barrier()
+
+                # Gather: FP8 KV rows -> BF16 LDS slab (exact conversion; the
+                # scale is applied later). Twelve lanes gather each token in
+                # three aligned 16-byte chunks. Six waves cover all 32 tokens.
                 gather_tid = _defer_to_use(tid) if ROW_TILES >= 7 else tid
-                # Twelve lanes gather each token in three aligned 16-byte
-                # chunks. Six waves cover all 32 tokens; the slab is shared.
                 if wave < GATHER_WAVES:
                     token = gather_tid // GATHER_LANES
                     column_group = gather_tid % GATHER_LANES
@@ -403,6 +469,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                                 fx.Vector.from_elements(bf16_values, dtype=fx.BFloat16)
                             )
                 fx.barrier()
+
+                # QK: wave w computes scores for row tile w against all 32
+                # tokens, then runs the online-softmax update for those rows.
                 tile = wave
                 row = tile * 16 + lane_row
                 row_max = loop_state["row_max"]
@@ -413,7 +482,8 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         for _ in range_constexpr(KV_TILE_SIZE // 16)
                     ]
                     if const_expr(ROW_TILES <= 4):
-                        # Prefetch one K pair only on the small-row path.
+                        # Small-row path (<= 64 rows): load the next K pair
+                        # while the current pair feeds the MFMAs.
                         # Scheduler fences keep just two operand sets live.
                         key_values = [
                             keys_lds[
@@ -454,6 +524,8 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                             if const_expr(step + 1 < QK_STEPS):
                                 key_values = next_keys
                     else:
+                        # Large-row path: one K step live at a time, through
+                        # opaque LDS offsets, to fit beside Q and the outputs.
                         for column_group in range_constexpr(QK_COLUMN_GROUPS):
                             for half in range_constexpr(2):
                                 # Prevent full-K CSE/hoisting across row tiles:
@@ -496,6 +568,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                                             _mfma_fragment(query_values, sub * 4),
                                             score_fragments[token_tile],
                                         )
+
+                    # Mask: rows past active_rows, tokens past kv_end (the last
+                    # partial tile), and the causal tail.
                     visible_end = kv_end
                     if causal:
                         # Bottom-right mask: query i cannot see the last
@@ -517,6 +592,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                                     fx.Float32(float("-inf")),
                                 )
                             )
+
+                    # Row max over this tile's 32 tokens: 8 per lane, then
+                    # across the 4 lane groups sharing the row.
                     tile_max = scores[0]
                     for i in range_constexpr(1, KV_TILE_SIZE // 4):
                         tile_max = tile_max.maximumf(scores[i])
@@ -524,6 +602,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         tile_max = tile_max.maximumf(
                             fx.gpu.shuffle_xor(tile_max, 16 << delta, 64)
                         )
+
                     # Online softmax uses exp2 units. When the running maximum
                     # grows, alpha rescales BOTH the prior sum and PV output.
                     row_max = loop_state["row_max"].maximumf(tile_max)
@@ -543,6 +622,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                     for delta in range_constexpr(2):
                         row_sum = row_sum + fx.gpu.shuffle_xor(row_sum, 16 << delta, 64)
                     row_sum = loop_state["row_sum"] * alpha + row_sum
+
+                    # Publish BF16 P and the row statistics for the PV phase,
+                    # where every wave needs every row.
                     for token_tile in range_constexpr(KV_TILE_SIZE // 16):
                         for i in range_constexpr(4):
                             fx.memref_store(
@@ -559,6 +641,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 else:
                     row_max = loop_state["row_max"]
                     row_sum = loop_state["row_sum"]
+
+                # Prefetch: when spare waves exist, all lanes load the next
+                # tile's FP8 bytes into registers while PV runs on this tile.
                 next_kv_bytes = []
                 if ROW_TILES < WAVES:
                     # After the complete QK/softmax phase: never between MFMAs.
@@ -582,8 +667,10 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         )
                     fx.rocdl.sched_barrier(0)
                 fx.barrier()
-                next_output = []
+
                 # PV: A=V^T, B=P^T. All rows, disjoint column slices per wave.
+                # Each accumulator is first rescaled by its row's alpha.
+                next_output = []
                 for row_tile in range_constexpr(ROW_TILES):
                     row = row_tile * 16 + lane_row
                     alpha = stats[(row, STAT_ALPHA)]
@@ -608,6 +695,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                             acc = _mfma(value_values, prob_values, acc)
                         row_output.append(acc)
                     next_output.append(row_output)
+
                 carried = yield _flatten_state(
                     {
                         "row_max": row_max,
@@ -616,6 +704,9 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         "prefetch": next_kv_bytes,
                     }
                 )
+
+            # Epilogue: normalize by the row sum (and kv_descale for V), then
+            # store FP32 partial + LSE for a split request, or BF16 final output.
             loop_state = _unflatten_state(carried, ROW_TILES, PV_COL_TILES)
             # Shared statistics are final after the last PV barrier. A work
             # with zero tokens never enters the loop and writes zero/-inf.
@@ -626,6 +717,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
             store_lane_row = store_tid % 16
             store_lane_group = (store_tid % 64) // 16
             store_wave = store_tid // 64
+
             for row_tile in range_constexpr(ROW_TILES):
                 row = row_tile * 16 + store_lane_row
                 if row < active_rows:
@@ -636,13 +728,16 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         row_max = stats[(row, STAT_MAX)]
                     denom = (row_sum > 0).select(row_sum, fx.Float32(1.0))
                     factor = kv_descale / denom
+                    # LSE in natural log: row_max is in log2 units, so * ln(2).
                     lse = (row_sum > 0).select(
                         row_max * fx.Float32(0.6931471805599453) + fmath.log(denom),
                         fx.Float32(float("-inf")),
                     )
                     query_position = row // num_heads
                     head = row % num_heads
+
                     if partial_row >= 0:
+                        # Split request: FP32 slot in the reduce's partial buffer.
                         out_row = (
                             fx.Int64(partial_row + query_position) * num_heads + head
                         )
@@ -660,6 +755,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                         if (store_wave == 0) & (store_lane_group == 0):
                             fx.memref_store(lse, partial_lse_output, out_row)
                     else:
+                        # Whole request: write the final BF16 output directly.
                         out_row = fx.Int64(q_begin + query_position) * num_heads + head
                         for column_tile in range_constexpr(PV_COL_TILES):
                             acc = loop_state["output"][row_tile][column_tile]
