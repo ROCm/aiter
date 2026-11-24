@@ -1437,7 +1437,7 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
             n,
             k,
         )
-    if row is not None and row["libtype"] == "flydsl":
+    if row is not None and row.get("libtype") == "flydsl":
         from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
             is_compute_wmma_kernel_name,
             parse_wmma_kernel_name,
