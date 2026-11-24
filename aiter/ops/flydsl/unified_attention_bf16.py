@@ -36,7 +36,7 @@ workspace must not overlap. Workspaces and compiled kernels persist until
 
 The optimized varlen specialization is additionally limited to the global page-128,
 HKV=1, direct-output plan with ``max_seqlen_k >= 4096``. Set
-``AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED=0`` to retain the prior varlen
+``AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED=0`` to use the generic varlen
 kernel while leaving other FlyDSL routes enabled.
 """
 
@@ -505,7 +505,9 @@ def _partial_need(num_kv_heads, capacity, rows):
 def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
     """Whether the optimized varlen specialization (``unified_attention_varlen``)
     covers this call: one KV head, page 128, a context of at least 4096 tokens
-    and a contiguous ``out``. Every miss runs the generic varlen kernel.
+    and the canonical contiguous ``out`` strides. Every miss runs the generic
+    varlen kernel. The explicit stride check matters for size-one dimensions,
+    whose noncanonical strides may still satisfy ``out.is_contiguous()``.
     """
     if not _varlen_optimized_enabled():
         return False
@@ -515,7 +517,8 @@ def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
 
 
 def _use_varlen_optimized(q, k, out, num_seqs, max_seqlen_k, num_cu):
-    if not _varlen_enabled() or not _varlen_optimized_eligible(q, k, out, max_seqlen_k):
+    # _route has already applied the generic varlen kill switch.
+    if not _varlen_optimized_eligible(q, k, out, max_seqlen_k):
         return False
     # The specialization's schedule is tuned on the 256-CU MI355X. MI350X has the
     # same 256 CUs and takes it unmeasured; parts with fewer CUs keep the generic
@@ -695,6 +698,12 @@ def _unified_attention_varlen(
             varlen=True,
             direct_output=direct,
         )
+        # The shared ping-pong launch ABI has two scale-pointer slots. BF16
+        # uses neither; the direct-output specialization deliberately carries
+        # ``out`` in the key-scale slot to avoid a second launcher signature.
+        direct_output_or_key_scale = (
+            ptr_arg(out, fx.BFloat16) if direct else no_scale
+        )
         _run_compiled(
             compiled,
             *partials,
@@ -702,7 +711,7 @@ def _unified_attention_varlen(
             ptr_arg(k, fx.BFloat16),
             ptr_arg(v, fx.BFloat16),
             ptr_arg(block_table, fx.Int32),
-            ptr_arg(out, fx.BFloat16) if direct else no_scale,
+            direct_output_or_key_scale,
             no_scale,
             int(block_table.shape[1]),
             pseudo,

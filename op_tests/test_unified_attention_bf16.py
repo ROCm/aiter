@@ -552,9 +552,6 @@ def test_varlen_optimized_route_is_narrow(monkeypatch):
 
     monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "0")
     assert not eligible(q, k, out, 1, 8192, 256)
-    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "1")
-    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN", "0")
-    assert not eligible(q, k, out, 1, 8192, 256)
 
 
 def test_varlen_optimized_workspace_covers_tail_plan():
