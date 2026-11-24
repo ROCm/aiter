@@ -45,7 +45,7 @@ SUPPORTED_GFX = (GFX950,)
 HEADS = 32
 HEAD_DIM = 128
 MAX_KEYS = 1 << 24  # a key row's byte offset stays in 32 bits
-MAX_TOPK = 4096  # the select stages a row's pool (3 x topk slots) in LDS
+MAX_TOPK = 4096  # select keeps a row's 3 x topk candidates in registers
 _CHUNK_KEYS = 8192  # keys (samples, for the sample stage) a work item walks
 _MIN_CAP = 1024
 
