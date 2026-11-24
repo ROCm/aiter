@@ -162,13 +162,23 @@ class StoreSlotBf16:
     ``sorted_ids[r]``) after an fp32 multiply by ``sorted_weights[r]``, so a
     plain top-k sum finishes the layer. Padding rows name token T, which lands
     past the descriptor: their stores are dropped without a branch.
+
+    The tile's 256 routes are loaded in its prologue (``fetch``, two loads a
+    lane, 32 rows a wave), parked in ``route`` LDS once the prologue's waits
+    have passed (``stash``) and read back by the epilogue (``rows``). Loaded
+    at the epilogue instead, their latency sat behind the K-2 step's
+    vmcnt(0) on every tile: 25% of the kernel (stage 2 453 -> 342 us at
+    T=4096 with constant routes). ``route`` is double-buffered by tile
+    parity: a wave may start the next tile while another still reads.
     """
 
-    def __init__(self, C, n_tokens, topk, D, ids_div, w_div):
+    def __init__(self, C, n_tokens, topk, D, ids_div, w_div, route):
         self.D = D
         self.topk = topk
         self.ids_div = ids_div
         self.w_div = w_div
+        self.route = route
+        self.wave_row = fx.thread_idx.x // 64 * 32 + fx.thread_idx.x % 32
         self.lane_row = fx.thread_idx.x % 16
         self.lane_col = _lane_col8()
         n_rows = n_tokens * topk
@@ -176,13 +186,29 @@ class StoreSlotBf16:
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
 
-    def rows(self, base_row):
-        """(output row, routing weight) of this lane's row in each of the N_TILES_A row tiles."""
+    def _at(self, idx):
+        return fx.make_view(
+            fx.add_offset(self.route.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)
+        )
+
+    def fetch(self, row0):
+        """Issue this lane's share of the tile's route loads (row ``wave_row``)."""
+        r = row0 + self.wave_row
+        return _load_i32_lane(self.ids_div, r), _load_i32_lane(self.w_div, r)
+
+    def stash(self, fetched, slot):
+        # Lanes l and l + 32 hold the same row and store the same values.
+        base = slot * 512 + self.wave_row
+        fx.memref_store_vec(fx.full(1, fetched[0], fx.Int32), self._at(base))
+        fx.memref_store_vec(fx.full(1, fetched[1], fx.Int32), self._at(base + 256))
+
+    def rows(self, base_row, slot):
+        """(output row, routing weight) of this lane's row in each row tile; ``base_row`` is tile-local."""
         out = []
         for i in range_constexpr(N_TILES_A):
-            r = base_row + i * 16 + self.lane_row
-            sid = _load_i32_lane(self.ids_div, r)
-            w = _load_i32_lane(self.w_div, r).bitcast(fx.Float32)
+            r = slot * 512 + base_row + i * 16 + self.lane_row
+            sid = Vec(self._at(r).load())[0]
+            w = Vec(self._at(r + 256).load())[0].bitcast(fx.Float32)
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
         return out
 
@@ -576,6 +602,8 @@ def compile_moe_bs_gemm_8w(
         S_lds: fx.Array[fx.Float8E4M3FN, 2 * MoeScaleLds.BYTES, 16]
         if epilogue == "swiglu_fp8":
             R_lds: fx.Array[fx.Float32, 2 * 4 * 128, 16]
+        if epilogue == "slot_bf16":
+            T_lds: fx.Array[fx.Int32, 2 * 512, 16]
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -671,9 +699,9 @@ def compile_moe_bs_gemm_8w(
                 fx.make_layout(1, 1),
             )
             n_tokens = _load_i32(nv_div, 1)
-            store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div)
+            store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div, lds.T_lds)
 
-        def run_tile(tile):
+        def run_tile(tile, parity):
             m_blk = tile // NB
             nb = tile % NB
             expert = _load_i32(eids_div, m_blk)
@@ -772,6 +800,10 @@ def compile_moe_bs_gemm_8w(
                 ):
                     raw_sc.dma(chunk)
 
+            if const_expr(epilogue == "slot_bf16"):
+                # Older than every K-step load, so the prologue's waits drain them.
+                routes = store_c.fetch(row0)
+
             c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
             c01 = list(c00)
             c10 = list(c00)
@@ -795,6 +827,8 @@ def compile_moe_bs_gemm_8w(
             b_g2s.load(b_next1, B1_off + B_K_STEP)
 
             wait_barrier(3 * N_LDS_STEPS)
+            if const_expr(epilogue == "slot_bf16"):
+                store_c.stash(routes, parity)
 
             for k in range_constexpr(K_ITERS - 2):
                 sa0 = scale_read(k, "a0")
@@ -836,12 +870,6 @@ def compile_moe_bs_gemm_8w(
             sb0 = scale_read(k, "b0")
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
-            if const_expr(epilogue == "slot_bf16"):
-                # The epilogue's routes, drained by the wait below.
-                base_row = row0 + wave_m * A_GRP_ROWS
-                slot_rows = [
-                    store_c.rows(base_row + h * LDS_BLOCK_M) for h in range_constexpr(2)
-                ]
             wait_barrier(0)
 
             c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
@@ -908,6 +936,10 @@ def compile_moe_bs_gemm_8w(
             elif const_expr(epilogue == "swiglu_fp8"):
                 store_c.store([(c00, c01), (c10, c11)], row0, nb)
             else:
+                slot_rows = [
+                    store_c.rows(wave_m * A_GRP_ROWS + h * LDS_BLOCK_M, parity)
+                    for h in range_constexpr(2)
+                ]
                 store_c.store(c00, slot_rows[0], col0)
                 store_c.store(c01, slot_rows[0], col1)
                 store_c.store(c10, slot_rows[1], col0)
@@ -918,8 +950,8 @@ def compile_moe_bs_gemm_8w(
         start = (bid % NUM_XCDS) * (grid // NUM_XCDS) + bid // NUM_XCDS
         n_tiles = (_load_i32(nv_div, 0) // BLOCK_M) * NB
         for tile, state in range(start, n_tiles, grid, init=[fx.Int32(0)]):
-            run_tile(fx.Int32(tile))
-            _ = yield [state[0]]
+            run_tile(fx.Int32(tile), state[0] & 1)
+            _ = yield [state[0] + 1]
 
     @flyc.jit
     def launch(
