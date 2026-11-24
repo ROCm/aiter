@@ -27,11 +27,16 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
     MHA_V4_LOG2E,
+    MHA_V4_MXFP8_HD256_K_ROW_BYTES,
+    MHA_V4_MXFP8_HD256_K_TILE_BYTES,
+    k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
     mxfp6_k_view_hd256,
+    mxfp8_hd256_k_tiles,
+    mxfp8_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -44,7 +49,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_q,
     quantize_mxfp6_q_hd256,
     quantize_mxfp8_k,
+    quantize_mxfp8_k_hd256,
     quantize_mxfp8_q,
+    quantize_mxfp8_q_hd256,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp4_fp6_p_hd256,
@@ -87,6 +94,7 @@ __all__ = (
     "mxfp4_v_view",
     "mxfp6_k_view",
     "mxfp6_k_view_hd256",
+    "mxfp8_k_view_hd256",
     "native_fp8_format",
     "quantize_fp8",
     "quantize_fp8_rotated",
@@ -100,7 +108,9 @@ __all__ = (
     "quantize_mxfp6_q",
     "quantize_mxfp6_q_hd256",
     "quantize_mxfp8_k",
+    "quantize_mxfp8_k_hd256",
     "quantize_mxfp8_q",
+    "quantize_mxfp8_q_hd256",
     "quantize_v_fp8",
     "quantize_v_mxfp4_fp6_p",
     "quantize_v_mxfp4_fp6_p_hd256",
@@ -268,11 +278,14 @@ def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
     return _PACKED_QK_WIDTH[q_format] * head_dim // _MHA_V4_BASE_HEAD_DIM
 
 
-# (Q/K format, V format) pairs with a head-dim 256 object. All are dense-only.
+# (Q/K format, V format) pairs with a head-dim 256 object. All are dense-only, and FP8 Q/K only
+# under E8M0 block scales (MXFP8): there is no per-tensor FP8 hd256 row.
 _HD256_QV = frozenset(
     {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
     }
 )
 
@@ -283,6 +296,7 @@ def _check_head_dim(
     v_format: AttentionFormat,
     sparse: bool,
     operation: str,
+    mx_qk_scales: bool,
 ) -> None:
     if head_dim == _MHA_V4_BASE_HEAD_DIM:
         return
@@ -290,10 +304,13 @@ def _check_head_dim(
         raise ValueError(
             f"{operation} supports head dimension 128 or 256, got {head_dim}"
         )
-    if (q_format, v_format) not in _HD256_QV:
+    if (q_format, v_format) not in _HD256_QV or (
+        _is_fp8_format(q_format) and not mx_qk_scales
+    ):
         raise ValueError(
-            f"{operation} head dimension 256 is all-MXFP4 or all-MXFP6 only, got "
+            f"{operation} head dimension 256 is all-BF16, all-MXFP4, all-MXFP6 or MXFP8 only, got "
             f"{q_format.name} Q/K with {v_format.name} V"
+            + (" under per-tensor scales" if _is_fp8_format(q_format) else "")
         )
     if sparse:
         raise ValueError(f"{operation} head dimension 256 is dense-only")
@@ -1262,6 +1279,74 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
 
 
+def _fmha_v4_fwd_thd_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    kv_splits: int = 1,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
+
+
+@compile_ops(
+    "module_fmha_v4_fwd",
+    fc_name="fmha_v4_fwd_thd",
+    gen_fake=_fmha_v4_fwd_thd_fake,
+)
+def _fmha_v4_fwd_thd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    kv_splits: int = 1,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+) -> None: ...
+
+
+@_launch_op("aiter::mha_v4_fwd_thd_launch")
+def _mha_v4_fwd_thd_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    kv_splits: int,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    _fmha_v4_fwd_thd(
+        q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
+    )
+
+
+@_mha_v4_fwd_thd_launch.register_fake
+def _mha_v4_fwd_thd_launch_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    kv_splits: int,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
+
+
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
 # the s_lse kernarg, so an object without the epilogue would silently leave the buffer untouched
 # instead of failing. Keyed on the pair because one Q format spans several rows (FP8 Q reaches both
@@ -1612,6 +1697,41 @@ def _validate_gqa_heads(query_heads: int, kv_heads: int, operation: str) -> None
         raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
 
 
+def _check_block_tile(
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    operands: tuple[int, ...],
+    mode: int,
+    block_tile: tuple[int, int],
+) -> None:
+    """Refuse a geometry these operands have no `mode` row for.
+
+    The raw entry points call this before quantizing: an MX quantizer aborts rather than raises on
+    an arch without the row (the pybind path leaves g_aiter_can_throw unset), so an error raised
+    afterwards would never be seen.
+
+    A scalar query on the accepting path, not a membership test against mha_v4_block_tiles():
+    this sits on the torch.compile path, where only the guarded per-Q-tile read is traceable.
+    Asked for these operands rather than for any, because a geometry can be precision-specific.
+    """
+    q_tile, kv_tile = tuple(block_tile)
+    if kv_tile > 0 and mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) == kv_tile:
+        return
+    mode_name = "Sol-Attn" if mode == MHA_V4_SOL_MODE else "sorted-sparse"
+    if not mha_v4_block_tiles(operands, mode):
+        raise NotImplementedError(
+            f"{mode_name} MHA v4 has no {get_gfx()} row for "
+            f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+        )
+    raise ValueError(
+        f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
+        f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
+        f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
+        f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
+    )
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -1792,7 +1912,14 @@ def mha_v4_packed(
 
     # V is the only operand carrying the logical head dim in its last axis; Q/K carry packed ones.
     logical_head_dim = v.shape[-1]
-    _check_head_dim(logical_head_dim, q_format, v_format, lut is not None, "MHA v4")
+    _check_head_dim(
+        logical_head_dim,
+        q_format,
+        v_format,
+        lut is not None,
+        "MHA v4",
+        q_scale_mode == AttentionScaleMode.E8M0_PER_1X32,
+    )
     expected_q_width = _packed_qk_width(q_format, logical_head_dim)
     if q.shape[-1] != expected_q_width or k.shape[-1] != expected_q_width:
         raise ValueError(
@@ -1806,6 +1933,19 @@ def mha_v4_packed(
         expected_k_stride = (k.shape[2] * head_stride, row_bytes, head_stride, 1)
         if k.stride() != expected_k_stride:
             raise ValueError("MXFP4 K must use the coalesced MHA v4 tile layout")
+    elif logical_head_dim == MHA_V4_HD256 and _is_fp8_format(q_format):
+        # Its scales ride inside the 64-token records, so a natural BSHD K would run unscaled.
+        head_stride = mxfp8_hd256_k_tiles(k.shape[1]) * MHA_V4_MXFP8_HD256_K_TILE_BYTES
+        expected_k_stride = (
+            k.shape[2] * head_stride,
+            MHA_V4_MXFP8_HD256_K_ROW_BYTES,
+            head_stride,
+            1,
+        )
+        if k.stride() != expected_k_stride:
+            raise ValueError(
+                "hd256 MXFP8 K must be the record view from mxfp8_k_view_hd256"
+            )
 
     if softmax_scale is None:
         softmax_scale = logical_head_dim**-0.5
@@ -1858,10 +1998,6 @@ def mha_v4_packed(
         _mha_v4_fwd_launch(*launch_args, seqlens_k, lse)
     else:
         mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
-        # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
-        # torch.compile path, where only the guarded per-Q-tile read is traceable. Asked for these
-        # operands rather than for any, because a geometry can be precision-specific and the
-        # alternative is the launch failing on a missing row naming format codes and no tile.
         operands = mha_v4_operands(
             q_format,
             k_format,
@@ -1873,18 +2009,7 @@ def mha_v4_packed(
         )
         mode = MHA_V4_SOL_MODE if pooled is not None else MHA_V4_SPARSE_MODE
         q_tile, kv_tile = tuple(block_tile)
-        if kv_tile <= 0 or mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
-            if not mha_v4_block_tiles(operands, mode):
-                raise NotImplementedError(
-                    f"{mode_name} MHA v4 has no {get_gfx()} row for "
-                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-                )
-            raise ValueError(
-                f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
-                f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
-                f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
-                f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
-            )
+        _check_block_tile(q_format, k_format, v_format, operands, mode, block_tile)
         if k.shape[1] % kv_tile != 0 and not _mha_v4_ragged_kv_from_manifest(
             q_tile, kv_tile, *operands, mode
         ):
@@ -2064,6 +2189,60 @@ def _launch_mxfp6_fake(
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
     del sequence_k, heads, v_format, v_pack, softmax_scale, seqlens_k, lse
     del out
+
+
+@_launch_op("aiter::mha_v4_launch_mxfp8_hd256")
+def _launch_mxfp8_hd256(
+    q: Tensor,
+    q_descale: Tensor,
+    k_records: Tensor,
+    k_descale: Tensor,
+    v: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    sequence_k: int,
+    heads: int,
+    softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    # The record view is built here, behind the op boundary, as the MXFP6 launcher does its own.
+    mha_v4_packed(
+        q,
+        mxfp8_k_view_hd256(k_records, q.shape[0], sequence_k, heads),
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        AttentionFormat.FP8_E4M3,
+        AttentionFormat.FP8_E4M3,
+        AttentionFormat.FP8_E4M3,
+        *_MXFP8_SCALE_MODES,
+        softmax_scale=softmax_scale,
+        out=out,
+        lse=lse,
+        return_lse=lse is not None,
+        seqlens_k=seqlens_k,
+    )
+
+
+@_launch_mxfp8_hd256.register_fake
+def _launch_mxfp8_hd256_fake(
+    q: Tensor,
+    q_descale: Tensor,
+    k_records: Tensor,
+    k_descale: Tensor,
+    v: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    sequence_k: int,
+    heads: int,
+    softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    del q, q_descale, k_records, k_descale, v, v_descale, out
+    del sequence_k, heads, softmax_scale, seqlens_k, lse
 
 
 @_launch_op("aiter::mha_v4_merge_kv_splits")
@@ -2271,13 +2450,10 @@ def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
     """
     if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
         return None
-    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
-    sample = k[:, ::stride].float()
-    mean = sample.mean(dim=1)
-    # Compared squared to keep the whole gate to a handful of tiny kernels; it is launch-bound.
-    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
-    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
-    return (mean * gate.unsqueeze(-1)).contiguous()
+    # CPU operands are rejected after the remaining argument checks; let those run first.
+    if not k.is_cuda:
+        return None
+    return k_smooth_mean(k, _K_SMOOTH_SAMPLE_ROWS, _K_SMOOTH_MIN_COMMON)
 
 
 def _restore_k_mean_in_lse(
@@ -2338,6 +2514,136 @@ def _validate_mha_v4_raw_inputs(
     return out
 
 
+_MHA_V4_THD_MAX_SPLITS = 4
+
+
+def _resolve_thd_kv_splits(
+    kv_splits: Union[int, str],  # noqa: UP007
+    q: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    causal: bool,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+) -> int:
+    """The KV slices a THD launch cuts each work-group's key walk into.
+
+    A causal work-group owns Q tile i and its mirror n - 1 - i, which together walk n + 1 tiles
+    of keys; a non-causal one owns one Q tile and walks all n. A slice keeps at least one Q tile
+    of that walk.
+
+    Not mha_v4_kv_splits(), whose rule is the dense fold's: this row slices inside the one
+    launch, so a count neither has to divide the keys nor costs a copy at any batch. "auto"
+    takes the most slices, up to _MHA_V4_THD_MAX_SPLITS, whose work-groups still fit on the CUs
+    once, since a second slice on a CU reloads Q: the causal grid is one work-group per
+    (document, head, pair of Q tiles), so 6/1 heads at 4K launch 48 on MI355X's 256 CUs. There,
+    6/1 causal device time with the merge is 141 -> 83 us at 4K (4 slices) and 258 -> 209 us at
+    8K (2). Partials are FP32, so the merged error stays below CK's at any count.
+    """
+    q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
+    q_groups, most = ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
+    if kv_splits == "auto":
+        if _lse_unsupported(q_format, v_format) is not None:
+            return 1
+        work_groups = (cu_seqlens.numel() - 1) * q.shape[1] * q_groups
+        cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+        return max(1, min(_MHA_V4_THD_MAX_SPLITS, cus // max(work_groups, 1), most))
+    if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
+        raise ValueError(
+            f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
+        )
+    if kv_splits == 1:
+        return 1
+    _check_lse_capable(q_format, v_format)
+    if kv_splits > most:
+        raise ValueError(
+            f"kv_splits={kv_splits} must leave every slice at least one {_MHA_V4_Q_TILE}-key "
+            f"tile: at most {most} for max_seqlen {max_seqlen}"
+            + (" under a causal mask" if causal else "")
+        )
+    return kv_splits
+
+
+def _mha_v4_thd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    recipe: _RawRecipePlan,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+    cu_seqlens: Tensor,
+    max_seqlen: Optional[int],  # noqa: UP045
+    causal: bool,
+    softmax_scale: Optional[float],  # noqa: UP045
+    out: Optional[Tensor],  # noqa: UP045
+    return_lse: bool,
+    kv_splits: Union[int, str],  # noqa: UP007
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
+    """mha_v4 over THD operands; see its docstring. The launcher validates the tensors."""
+    if recipe.kind != _RawRecipeKind.BF16:
+        raise NotImplementedError(
+            "mha_v4 with cu_seqlens is implemented for all-BF16 operands only, got "
+            f"{q_format.name} Q/K with {v_format.name} V"
+        )
+    if max_seqlen is None:
+        raise ValueError(
+            "mha_v4 with cu_seqlens needs max_seqlen, its longest document"
+        )
+    if q.dim() != 3:
+        raise ValueError(
+            "mha_v4 with cu_seqlens expects THD [total_tokens, heads, head_dim] Q, K, and V"
+        )
+    _check_head_dim(q.shape[-1], q_format, v_format, False, "mha_v4", False)
+    if return_lse:
+        _check_lse_capable(q_format, v_format)
+    if out is None:
+        out = torch.empty_like(q)
+    elif out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
+        raise ValueError("out must match Q's shape/device and have BF16 dtype")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    max_seqlen = int(max_seqlen)
+    splits = _resolve_thd_kv_splits(
+        kv_splits, q, cu_seqlens, max_seqlen, causal, q_format, v_format
+    )
+
+    # The launcher writes [splits, total, heads, head_dim] and [splits, heads, total]: the answer
+    # itself at one slice, and otherwise the FP32 partials lse_merge folds as one batch of
+    # `splits`.
+    total, heads = q.shape[0], q.shape[1]
+    sliced_out = (
+        out.unsqueeze(0)
+        if splits == 1
+        else torch.empty((splits, *q.shape), dtype=torch.float32, device=q.device)
+    )
+    sliced_lse = (
+        torch.empty((splits, heads, total), dtype=torch.float32, device=q.device)
+        if return_lse or splits > 1
+        else None
+    )
+    _mha_v4_fwd_thd_launch(
+        q,
+        k,
+        v,
+        sliced_out,
+        cu_seqlens,
+        max_seqlen,
+        float(softmax_scale),
+        causal,
+        splits,
+        sliced_lse,
+    )
+    if splits == 1:
+        return (out, sliced_lse[0]) if return_lse else out
+    lse = (
+        torch.empty((1, heads, total), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    _merge_kv_splits(sliced_out, sliced_lse, out.unsqueeze(0), lse)
+    return (out, lse[0]) if return_lse else out
+
+
 def mha_v4(
     q: Tensor,
     k: Tensor,
@@ -2355,6 +2661,9 @@ def mha_v4(
     seqlens_k: Optional[Tensor] = None,  # noqa: UP045
     kv_splits: Union[int, str] = 1,  # noqa: UP007
     block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
+    cu_seqlens: Optional[Tensor] = None,  # noqa: UP045
+    max_seqlen: Optional[int] = None,  # noqa: UP045
+    causal: bool = False,
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Quantize BF16 BSHD operands and run non-causal MHA v4.
 
@@ -2397,7 +2706,52 @@ def mha_v4(
     merge's Triton launch, and at the short sequences it targets an eager call is already bound
     by host time: BF16/FP8 on MI355X at [1, 4352, 3, 128] took 40 us replayed at 4 splits
     against 61 us unsplit, but 105 us eager against 66 us.
+    ``cu_seqlens`` switches the operands to THD: whole documents concatenated along the token
+    axis, Q ``[total, Hq, D]`` and K/V ``[total, Hkv, D]`` for any ``Hq % Hkv == 0``, delimited
+    for Q and K alike by int32 ``cu_seqlens`` ``[batch + 1]``, with ``max_seqlen`` the longest
+    document. ``causal`` then keeps each query to its document's keys up to its own row. For
+    all-BF16 operands at head dimension 256 on gfx950, without ``block_mask`` or ``seqlens_k``.
+    ``out`` is shaped like Q and the LSE is ``[Hq, total]``. Token offsets are 64-bit, so a pack
+    may exceed 4 GiB. ``kv_splits`` here slices each work-group's key walk inside the one launch,
+    so a count has nothing to divide: a slice keeps at least 256 keys of the longest document's
+    walk, and the per-slice outputs hold a split pack's output under 4 GiB. ``"auto"`` takes the
+    most slices that still fit the grid on the CUs once.
     """
+    if cu_seqlens is not None:
+        if block_mask is not None or seqlens_k is not None:
+            raise NotImplementedError(
+                "mha_v4 with cu_seqlens attends over whole documents; it does not combine "
+                "with block_mask or seqlens_k"
+            )
+        return _mha_v4_thd(
+            q,
+            k,
+            v,
+            _resolve_raw_recipe(
+                q_format,
+                k_format,
+                v_format,
+                q_scale_mode,
+                k_scale_mode,
+                v_scale_mode,
+                sparse=False,
+            ),
+            q_format,
+            v_format,
+            cu_seqlens,
+            max_seqlen,
+            causal,
+            softmax_scale,
+            out,
+            return_lse,
+            kv_splits,
+        )
+    if causal:
+        raise NotImplementedError(
+            "mha_v4 masks causally over THD operands only; pass cu_seqlens and max_seqlen"
+        )
+    if max_seqlen is not None:
+        raise ValueError("max_seqlen is cu_seqlens' longest document; pass both")
     if return_lse:
         _check_lse_capable(q_format, v_format)
     # Checked before quantization so the MX paths fail here, not inside their own launcher.
@@ -2409,7 +2763,6 @@ def mha_v4(
         _check_varlen_capable(q_format, v_format)
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
-    _check_head_dim(q.shape[-1], q_format, v_format, sparse, "mha_v4")
     recipe = _resolve_raw_recipe(
         q_format,
         k_format,
@@ -2418,6 +2771,14 @@ def mha_v4(
         k_scale_mode,
         v_scale_mode,
         sparse=sparse,
+    )
+    _check_head_dim(
+        q.shape[-1],
+        q_format,
+        v_format,
+        sparse,
+        "mha_v4",
+        recipe.kind == _RawRecipeKind.MXFP8,
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
     splits = _resolve_kv_splits(
@@ -2445,26 +2806,22 @@ def mha_v4(
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
     if block_mask is not None:
+        operands = mha_v4_operands(
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            recipe.v_pack,
+        )
         # This recipe's own geometry, not the arch's: the rows do not agree on the KV tile at a
         # given Q tile, so the mask has to be cut to the tile these operands dispatch at.
         if block_tile is None:
-            block_tile = mha_v4_block_tile(
-                mha_v4_operands(
-                    q_format,
-                    k_format,
-                    v_format,
-                    q_scale_mode,
-                    k_scale_mode,
-                    v_scale_mode,
-                    recipe.v_pack,
-                ),
-                MHA_V4_SPARSE_MODE,
-            )
-            if block_tile[1] == 0:
-                raise NotImplementedError(
-                    f"block-sparse MHA v4 has no {get_gfx()} row for "
-                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-                )
+            block_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)
+        _check_block_tile(
+            q_format, k_format, v_format, operands, MHA_V4_SPARSE_MODE, block_tile
+        )
         lut_indices, lut_start, lut_count = _block_mask_to_lut(
             block_mask, q, k, block_tile
         )
@@ -2487,10 +2844,29 @@ def mha_v4(
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.MXFP8:
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp8_k(k, k_mean)
+            softmax_scale = q.shape[-1] ** -0.5
+        multiplier = mha_v4_q_multiplier(softmax_scale)
         v_quantized, v_descale = quantize_fp8(v)
+        if q.shape[-1] == MHA_V4_HD256:
+            q_quantized, q_descale = quantize_mxfp8_q_hd256(q, multiplier)
+            k_records, k_descale = quantize_mxfp8_k_hd256(k, k_mean)
+            launch = functools.partial(
+                _launch_mxfp8_hd256,
+                q_quantized,
+                q_descale,
+                k_records,
+                k_descale,
+                v_quantized,
+                v_descale,
+                out,
+                k.shape[1],
+                k.shape[2],
+                softmax_scale,
+                seqlens_k,
+            )
+        else:
+            q_quantized, q_descale = quantize_mxfp8_q(q, multiplier)
+            k_quantized, k_descale = quantize_mxfp8_k(k, k_mean)
     elif recipe.kind == _RawRecipeKind.INT8_FP8:
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)
@@ -2752,21 +3128,22 @@ def mha_v4_sol(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
     v_pack = recipe.v_pack
+    operands = mha_v4_operands(
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+    )
     tile_m, tile_n = (
-        mha_v4_block_tile(
-            mha_v4_operands(
-                q_format,
-                k_format,
-                v_format,
-                q_scale_mode,
-                k_scale_mode,
-                v_scale_mode,
-                v_pack,
-            ),
-            MHA_V4_SOL_MODE,
-        )
+        mha_v4_block_tile(operands, MHA_V4_SOL_MODE)
         if block_tile is None
         else block_tile
+    )
+    _check_block_tile(
+        q_format, k_format, v_format, operands, MHA_V4_SOL_MODE, (tile_m, tile_n)
     )
 
     # K smoothing as in mha_v4(). The shift moves every score of a query row by the same q @ k_mean,
