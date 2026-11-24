@@ -3055,9 +3055,20 @@ def _nvfp4_dequant(payload, scales):
 
 
 def _nvfp4_inputs(
-    rows, device, dtype, kv_heads=1, group=16, max_len=2048, query_length=1
+    rows,
+    device,
+    dtype,
+    kv_heads=1,
+    group=16,
+    max_len=2048,
+    query_length=1,
+    window=0,
+    sinks=False,
+    interleave=False,
 ):
-    """Query, (K, K scales, V, V scales), table, lengths and the fp32 reference."""
+    """Query, (K, K scales, V, V scales), table, lengths, sinks and the fp32
+    reference over the dequantized cache. ``interleave`` stores a page's K and V
+    scales side by side, so both planes are strided views."""
     g = torch.Generator(device=device).manual_seed(0)
     seqs, pages = rows // query_length, rows // query_length * 16 + 8
     shape = (2, pages, kv_heads, 128)
@@ -3072,28 +3083,25 @@ def _nvfp4_inputs(
     lengths = torch.randint(1, max_len + 1, (seqs,), generator=g, device=device)
     lengths[::7], lengths[3::11] = max_len, 0
     lengths[5::13] = lengths[5::13] % 128 + 1
-    if query_length > 1:  # MTP rows need their own query tokens in context
-        lengths = lengths.clamp(min=query_length)
-    lengths = lengths.int()
+    # Nonempty MTP sequences hold their own query tokens.
+    lengths = torch.where(lengths > 0, lengths.clamp(min=query_length), lengths).int()
     query = torch.randn(rows, kv_heads * group, 128, generator=g, device=device)
     query[:, ::5] *= 8  # o_proj inputs of very different magnitude per head
     query = query.to(dtype)
-    kv = _nvfp4_dequant(payload, scales)
-    expected = torch.zeros(query.shape, device=device)
+    # Sinks as large as the scores' log-sum-exp, so that dropping them shows.
+    sink = torch.linspace(0, 40, kv_heads * group, device=device) if sinks else None
+    k, v = _nvfp4_dequant(payload, scales).unbind(0)
+    expected = _reference(query, k, v, table, lengths, query_length, window, sink)
+    if interleave:
+        ks, vs = scales.transpose(0, 1).contiguous().unbind(1)
+    else:
+        ks, vs = scales.unbind(0)
     for seq, n in enumerate(lengths.tolist()):
-        pages_n = table[seq, : -(-n // 128)].long()
-        k, v = (x[pages_n].transpose(0, 1).flatten(1, 2)[:, :n] for x in kv)
-        for qi in range(query_length):
-            q = query[seq * query_length + qi].float().view(kv_heads, group, 128)
-            visible = n - query_length + qi + 1
-            s = (q @ k[:, :visible].transpose(1, 2)) * 128**-0.5
-            out = s.softmax(-1) @ v[:, :visible]
-            expected[seq * query_length + qi] = out.flatten(0, 1)
         if n % 128:  # never-written tail bytes must not be read
-            scales[:, table[seq, (n - 1) // 128], :, n % 128 :] = float("nan")
+            for plane in (ks, vs):
+                plane[table[seq, (n - 1) // 128], :, n % 128 :] = float("nan")
     k, v = payload.unbind(0)
-    ks, vs = scales.unbind(0)
-    return query, (k, ks, v, vs), table, lengths, expected
+    return query, (k, ks, v, vs), table, lengths, sink, expected
 
 
 def _nvfp4_mode(kwargs):
@@ -3108,7 +3116,8 @@ def _nvfp4_mode(kwargs):
 
 
 # name: (rows, plan kwargs, input kwargs, output mode). M3.1 TP4 shapes (GQA 16,
-# D128, top-16 pages); MTP rows are flattened to one row each.
+# D128, top-16 pages); MTP rows are flattened to one row each. Sequences of more
+# than 16 rows (query_length x GQA) split their query positions over CTAs.
 _NVFP4_CASES = {
     "decode-c4": (4, {}, {}, "cluster8"),
     "decode-c64": (64, {}, {}, "cluster8"),
@@ -3129,6 +3138,21 @@ _NVFP4_CASES = {
     "gqa8-two-kv-heads": (32, {}, {"kv_heads": 2, "group": 8}, "cluster8"),
     "mtp2-gqa8": (16, {}, {"group": 8, "query_length": 2}, "cluster8"),
     "mtp2-two-kv-heads-reducer": (600, {"max_partitions": 8, "workgroup_budget": 4800}, {"kv_heads": 2, "group": 8, "query_length": 2}, "reduce"),
+    "mtp2-split2": (16, {}, {"query_length": 2}, "cluster8"),
+    "mtp2-split2-direct": (32, {"max_partitions": 1}, {"query_length": 2}, "direct"),
+    "mtp4-split4-merge": (32, {"max_partitions": 8, "workgroup_budget": 1}, {"query_length": 4}, "merge"),
+    "mtp4-gqa8-two-kv-heads-split2": (64, {}, {"kv_heads": 2, "group": 8, "query_length": 4}, "cluster8"),
+    "mtp3-split3": (12, {}, {"query_length": 3}, "cluster8"),
+    "mtp3-gqa8-split3-merge": (24, {"max_partitions": 8, "workgroup_budget": 1}, {"group": 8, "query_length": 3}, "merge"),
+    "mtp8-split8-direct": (64, {"max_partitions": 1}, {"query_length": 8}, "direct"),
+    "sinks": (32, {}, {"sinks": True}, "reduce"),
+    "mtp2-split2-sinks": (32, {}, {"query_length": 2, "sinks": True}, "reduce"),
+    "mtp5-gqa4-split5-sinks": (20, {}, {"group": 4, "query_length": 5, "sinks": True}, "reduce"),
+    "window-direct": (32, {"max_partitions": 1}, {"window": 300}, "direct"),
+    "window-mtp2-merge": (16, {"max_partitions": 8, "workgroup_budget": 1}, {"group": 8, "query_length": 2, "window": 300}, "merge"),
+    "window-mtp2-split2": (16, {}, {"query_length": 2, "window": 300}, "cluster3"),
+    "window-sinks": (32, {}, {"window": 77, "sinks": True}, "reduce"),
+    "interleaved-scales": (32, {}, {"interleave": True}, "cluster8"),
 }  # fmt: skip
 
 
@@ -3142,12 +3166,16 @@ def test_pa_decode_nvfp4(case, device, monkeypatch):
     rows, plan_kwargs, kwargs, mode = _NVFP4_CASES[case]
     kwargs = dict(kwargs)
     dtype, view = kwargs.pop("dtype", torch.bfloat16), kwargs.pop("view", torch.uint8)
-    query, (k, ks, v, vs), table, lengths, expected = _nvfp4_inputs(
+    query, (k, ks, v, vs), table, lengths, sinks, expected = _nvfp4_inputs(
         rows, device, dtype, **kwargs
     )
-    query_length = kwargs.get("query_length", 1)
+    query_length, window = kwargs.get("query_length", 1), kwargs.get("window", 0)
     plan = pa.plan_pa_decode(
-        lengths, k.shape[1], query_length=query_length, **plan_kwargs
+        lengths,
+        k.shape[1],
+        query_length=query_length,
+        sliding_window=window,
+        **plan_kwargs,
     )
     compiled = []
     compile_tile = pa.compile_pa_decode_tile
@@ -3160,7 +3188,8 @@ def test_pa_decode_nvfp4(case, device, monkeypatch):
     launch = partial(
         pa.pa_decode, output, query, k.view(view), v.view(view), lengths, table,
         128**-0.5, query_length, key_scale=ks, value_scale=vs, work_plan=plan,
-        max_context_length=kwargs.get("max_len", 2048),
+        max_context_length=kwargs.get("max_len", 2048), sinks=sinks,
+        sliding_window=window,
     )  # fmt: skip
     for _ in range(2):  # the second call takes the recorded-launch path
         output.fill_(float("nan"))
@@ -3171,44 +3200,66 @@ def test_pa_decode_nvfp4(case, device, monkeypatch):
     assert _nvfp4_mode(compiled[-1]) == mode
     # Empty rows free slots, so merge plans split some row over several tasks.
     assert mode != "merge" or (plan.reduce_info[:, 1] > 1).any()
-    # One KV head a CTA, or a cluster merging one sequence, holds whole tokens.
-    fused = k.shape[1] == 1 and mode in ("direct", "cluster4", "cluster8")
+    # One KV head a CTA, or a cluster merging one sequence, holds whole tokens;
+    # query-split tiles do not.
+    fused = (
+        k.shape[1] == 1
+        and mode in ("direct", "cluster4", "cluster8")
+        and query_length * kwargs.get("group", 16) <= 16
+    )
     quant = {"quant": "fused" if fused else "fallback", "capture": True}
     _check_quant_output(launch, query, output, compiled, quant)
 
 
 def test_pa_decode_nvfp4_rejects(device):
-    """Sinks, partial scale planes and more than one 16-row query tile raise."""
+    """Partial or unaligned scale planes, pages other than 128 tokens and more
+    than 16 query heads a KV head raise."""
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("NVFP4 pa_decode runs on gfx1250")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    query, (k, ks, v, vs), table, lengths, _ = _nvfp4_inputs(4, device, torch.bfloat16)
+    query, (k, ks, v, vs), table, lengths, _, _ = _nvfp4_inputs(
+        6, device, torch.bfloat16
+    )
     plan = pa.plan_pa_decode(lengths, 1)
     call = partial(
-        pa.pa_decode, torch.empty_like(query), query, k, v, lengths, table, 0.1, 1
-    )
-    with pytest.raises(NotImplementedError):
-        call(
-            key_scale=ks,
-            value_scale=vs,
-            work_plan=plan,
-            sinks=torch.zeros(16, device=device),
-        )
-    with pytest.raises(ValueError):
-        call(key_scale=ks[..., :4], value_scale=vs[..., :4], work_plan=plan)
-    lengths = lengths[:2].clamp(min=2)
-    plan2 = pa.plan_pa_decode(lengths, 1, query_length=2)
-    with pytest.raises(ValueError):  # 2 query tokens x GQA 16 = 32 rows
+        pa.pa_decode, torch.empty_like(query), query, k, v, lengths, table, 0.1, 1,
+        work_plan=plan,
+    )  # fmt: skip
+    with pytest.raises(ValueError, match="key_scale/value_scale must be"):
+        call(key_scale=ks[..., :4], value_scale=vs[..., :4])
+    shifted = torch.empty(ks.numel() + 16, dtype=ks.dtype, device=device)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        call(key_scale=shifted[8 : 8 + ks.numel()].view(ks.shape), value_scale=vs)
+    # The same storage as 64-token pages: every page id stays in bounds even
+    # for the page-128 tile this call must not reach.
+    short = lengths.clamp(max=16 * 64)
+    k64, v64, ks64, vs64 = (x.view(2 * x.shape[0], 1, 64, -1) for x in (k, v, ks, vs))
+    with pytest.raises(NotImplementedError, match="page 128"):
         pa.pa_decode(
             torch.empty_like(query),
             query,
+            k64,
+            v64,
+            short,
+            table,
+            0.1,
+            1,
+            key_scale=ks64,
+            value_scale=vs64,
+            work_plan=pa.plan_pa_decode(short, 1),
+        )
+    wide = torch.cat([query, query], 1)  # 32 query heads over the one KV head
+    with pytest.raises(NotImplementedError, match="16 query rows"):
+        pa.pa_decode(
+            torch.empty_like(wide),
+            wide,
             k,
             v,
             lengths,
-            table[:2],
+            table,
             0.1,
-            2,
+            1,
             key_scale=ks,
             value_scale=vs,
-            work_plan=plan2,
+            work_plan=plan,
         )

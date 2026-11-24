@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""gfx1250 NVFP4 paged-attention tile with wave-owned tokens (one query tile).
+"""gfx1250 NVFP4 paged-attention tile with wave-owned tokens (one query tile a CTA).
 
 NVFP4 K/V per (page, KV head): token-major [128, D/2] e2m1 payload (element 2j in
 the low nibble of byte j) and [128, D/16] E4M3 block scales. Wave w owns tokens
@@ -113,12 +113,10 @@ def _e8m0_pow2(k):
 
 
 class Gfx1250Nvfp4WavePipeline:
-    """One query tile (<= 16 rows); every wave owns 32 tokens of each page."""
+    """One query tile (<= 16 rows) a CTA; every wave owns 32 tokens of each page."""
 
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
-        assert self.t.head_dim == 128 and self.t.block_size == 128
-        assert self.t.m_tiles == 1
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
@@ -161,6 +159,7 @@ class Gfx1250Nvfp4WavePipeline:
                 (valid * (_ROW // 2),),
                 8,
                 8,
+                fx.BFloat16,
             )
         for ptr, plane in (
             (ctx.key_scale_ptr, _PLANE_KS),
@@ -175,6 +174,7 @@ class Gfx1250Nvfp4WavePipeline:
                 (valid * (_SROW // 2),),
                 8,
                 8,
+                fx.BFloat16,
             )
 
     def _rows(self, base, plane, n):
@@ -393,6 +393,8 @@ class Gfx1250Nvfp4WavePipeline:
                 for r in range_constexpr(8):
                     token = token_base + ctx.warp * _TOKENS + n * 16 + ctx.half * 8 + r
                     visible = (token < upper) & (row < t.rows)
+                    if const_expr(t.sliding_window > 0):
+                        visible = visible & (token >= upper - t.sliding_window)
                     units.append(
                         visible.select(
                             scores[r] * fx.Float32(t.softmax_scale * LOG2E),
