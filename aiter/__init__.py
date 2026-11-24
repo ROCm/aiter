@@ -180,6 +180,7 @@ else:
         FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE,
         fused_qknorm_idxrqknorm,
     )
+    from .ops.m3_tp1_qknorm import *
     from .ops.fused_qk_norm_rope_cache_quant import *
     from .ops.fused_qk_rmsnorm_group_quant import *
     from .ops.inverse_rope_group_quant import *
