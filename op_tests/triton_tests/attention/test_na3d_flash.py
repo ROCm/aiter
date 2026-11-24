@@ -26,7 +26,7 @@ def _require_cuda():
         pytest.skip("CUDA device required for na3d_flash tests")
 
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1151"]
 
 
 # ---------------------------------------------------------------------------
@@ -355,4 +355,71 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
         atol=5e-2,
         tol_err_ratio=0.05,
         msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
+    )
+
+
+@pytest.mark.parametrize(
+    "B,T,H,W,NH,HD,KT,KH,KW",
+    [
+        # Strided QKV slice (LTX-2.5 consumer layout) across small/medium/large KT
+        (1, 6, 12, 24, 4, 64, 3, 5, 5),
+        (1, 8, 12, 24, 4, 64, 7, 7, 7),
+        # Head dims other than 64 (HD=32 and HD=128 large_hd bucket)
+        (1, 6, 8, 24, 4, 32, 3, 5, 5),
+        (1, 6, 8, 24, 4, 128, 3, 5, 5),
+        # Degenerate T=1 (Triton constexpr specialization) and max KW=33
+        (1, 1, 8, 32, 4, 64, 1, 5, 5),
+        (1, 3, 6, 48, 4, 64, 3, 5, 33),
+    ],
+)
+def test_na3d_flash_strided_and_edge_configs(B, T, H, W, NH, HD, KT, KH, KW):
+    """Verify strided QKV views, non-64 head dims, T=1, and max KW=33."""
+    if get_gfx() not in SUPPORTED_GFX:
+        pytest.skip(f"na3d_flash unsupported on {get_gfx()}")
+
+    scale = HD**-0.5
+    q = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda") * scale
+    k = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda")
+    qkv = torch.randn(B, T, H, W, 3 * NH * HD, dtype=torch.bfloat16, device="cuda")
+    v = qkv.chunk(3, dim=-1)[2].view(B, T, H, W, NH, HD)
+    assert not v.is_contiguous()
+
+    ref = _na3d_sdpa_exact(q, k, v.contiguous(), kernel_size=(KT, KH, KW))
+    out = na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW))
+
+    assertAllclose(
+        ref.float(),
+        out.float(),
+        rtol=1e-2,
+        atol=5e-2,
+        tol_err_ratio=0.01,
+        msg=f"na3d_flash strided/edge (T={T},H={H},W={W},HD={HD},k=({KT},{KH},{KW}))",
+    )
+
+
+def test_na3d_flash_non_linear_stride_fallback():
+    """Arbitrary non-linear strides must fall back cleanly to contiguous()."""
+    if get_gfx() not in SUPPORTED_GFX:
+        pytest.skip(f"na3d_flash unsupported on {get_gfx()}")
+
+    B, T, H, W, NH, HD = 1, 6, 8, 16, 4, 64
+    scale = HD**-0.5
+    q = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda") * scale
+    k = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16, device="cuda")
+    # Permute (T, H) storage order so stride(1) != H * W * stride(3)
+    v = torch.randn(B, H, T, W, NH, HD, dtype=torch.bfloat16, device="cuda").transpose(
+        1, 2
+    )
+    assert v.shape == q.shape and not v.is_contiguous()
+
+    ref = _na3d_sdpa_exact(q, k, v.contiguous(), kernel_size=(3, 5, 5))
+    out = na3d_flash_attn(q, k, v, kernel_size=(3, 5, 5))
+
+    assertAllclose(
+        ref.float(),
+        out.float(),
+        rtol=1e-2,
+        atol=5e-2,
+        tol_err_ratio=0.01,
+        msg="na3d_flash non-linear stride fallback",
     )

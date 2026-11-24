@@ -22,12 +22,34 @@ import triton
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton._triton_kernels.attention.na3d_flash import (
     _get_config,
+    _get_config_3d,
     _na3d_flash_fwd,
+    _na3d_flash_fwd_3d,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-_NA3D_FLASH_ARCHS = ("gfx942", "gfx950")
+_NA3D_FLASH_ARCHS = ("gfx942", "gfx950", "gfx1151")
+
+
+def _ensure_seq_strided_6d(t: torch.Tensor, T: int, H: int, W: int) -> torch.Tensor:
+    """Return ``t`` as-is if addressable via ``(stride_b, stride_nh, stride_seq)``.
+
+    Avoids full-volume staging copies for strided QKV views such as
+    ``qkv.chunk(3, dim=-1)[2].view(B, T, H, W, NH, HD)`` while falling back to
+    ``.contiguous()`` for arbitrary non-linear strides.
+    """
+    s0, s1, s2, s3, s4, s5 = t.stride()
+    if (
+        s5 == 1
+        and s0 >= 0
+        and s3 >= 0
+        and s4 >= 0
+        and (H == 1 or s2 == W * s3)
+        and (T == 1 or s1 == H * W * s3)
+    ):
+        return t
+    return t.contiguous()
 
 
 def na3d_flash_attn(
@@ -47,8 +69,8 @@ def na3d_flash_attn(
         Output tensor ``(B, T, H, W, NH, HD)`` bfloat16.
 
     Supported domain (all asserted):
-        - Device : running arch in ``{gfx942, gfx950}``; q/k/v on the current
-          CUDA/HIP device.
+        - Device : running arch in ``{gfx942, gfx950, gfx1151}``; q/k/v on the
+          current CUDA/HIP device.
         - dtype  : ``bfloat16`` for q, k, and v (shared).
         - Shape  : k and v match q's ``(B, T, H, W, NH, HD)``.
         - head_dim ``HD`` : power of two and ``>= 16`` (``tl.dot`` needs matrix
@@ -66,8 +88,10 @@ def na3d_flash_attn(
 
         Tensors are consumed in their native ``(B, T, H, W, NH, HD)`` layout; a
         ``contiguous()`` copy is made only for an input not already contiguous in
-        that order.  The tile (BLOCK_Q, BLOCK_KV, num_warps, num_stages) is read
-        from the per-arch config file (no runtime autotune).
+        that order (on ``gfx1151``, sequence-strided views such as
+        ``qkv.chunk(3, dim=-1)[2].view(...)`` are consumed directly without a
+        staging copy).  The tile configuration is read from the per-arch config
+        file (no runtime autotune).
     """
     B, T, H, W, NH, HD = q.shape
     KT, KH, KW = kernel_size
@@ -129,6 +153,72 @@ def na3d_flash_attn(
         f"(tl.dot requires matrix dimensions of at least 16)."
     )
     assert W >= 16, f"W={W} is too small; W must be >= the smallest BLOCK_Q (16)."
+
+    if gfx == "gfx1151":
+        q = _ensure_seq_strided_6d(q, T, H, W)
+        k = _ensure_seq_strided_6d(k, T, H, W)
+        v = _ensure_seq_strided_6d(v, T, H, W)
+        out = torch.empty((B, T, H, W, NH, HD), dtype=q.dtype, device=q.device)
+
+        cfg = _get_config_3d(KT, KH, KW, HD)
+        bt, bh, bw = cfg["BT"], cfg["BH"], cfg["BW"]
+        block_kv = cfg["BLOCK_KV"]
+        wu = bw + KW - 1
+        hu = bh + KH - 1
+        no_divmod_2d = (wu & (wu - 1)) != 0
+        # Bound includes masked tail lanes on the last HW iteration so int32
+        # relative indexing never overflows even before predicate masking.
+        max_rel_elems = (hu + block_kv) * W * max(k.stride(3), v.stride(3)) + HD
+        use_i32_rel = max_rel_elems < (1 << 31)
+
+        grid = (
+            B * NH,
+            triton.cdiv(T, bt) * triton.cdiv(H, bh) * triton.cdiv(W, bw),
+        )
+        launch_kwargs = {
+            "num_warps": cfg["num_warps"],
+            "num_stages": cfg["num_stages"],
+        }
+        waves_per_eu = cfg.get("waves_per_eu", 0)
+        if waves_per_eu > 0:
+            launch_kwargs["waves_per_eu"] = waves_per_eu
+
+        _na3d_flash_fwd_3d[grid](
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(4),
+            q.stride(3),
+            k.stride(0),
+            k.stride(4),
+            k.stride(3),
+            v.stride(0),
+            v.stride(4),
+            v.stride(3),
+            out.stride(0),
+            out.stride(4),
+            out.stride(3),
+            NH,
+            T,
+            H,
+            W,
+            HD=HD,
+            KT=KT,
+            KH=KH,
+            KW=KW,
+            BT=bt,
+            BH=bh,
+            BW=bw,
+            BLOCK_KV=block_kv,
+            SWIZZLE_T=cfg["SWIZZLE_T"],
+            SWIZZLE_H=cfg["SWIZZLE_H"],
+            USE_I32_REL=use_i32_rel,
+            NO_DIVMOD_2D=no_divmod_2d,
+            **launch_kwargs,
+        )
+        return out
 
     # Ensure contiguous layout
     q = q.contiguous()
