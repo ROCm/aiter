@@ -2731,7 +2731,7 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
 
 
 class _LaunchSpy:
-    """Forward each launch to the real kernel and record its grid and ONE_Q_BLOCK."""
+    """Forward each launch to the real kernel and record its grid, ONE_Q_BLOCK and NUM_SPLITS."""
 
     def __init__(self, kernel, launches):
         self._kernel = kernel
@@ -2741,40 +2741,21 @@ class _LaunchSpy:
         launch = self._kernel[grid]
 
         def run(*args, **kwargs):
-            self._launches.append((tuple(grid), kwargs["ONE_Q_BLOCK"]))
+            self._launches.append(
+                (tuple(grid), kwargs["ONE_Q_BLOCK"], kwargs["NUM_SPLITS"])
+            )
             return launch(*args, **kwargs)
 
         return run
 
 
-@pytest.mark.parametrize(
-    "seq_lens, num_heads, head_size, block_size",
-    [
-        # max query length 2: one query block per sequence, 3d path for 5000 keys
-        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
-        ([(2, 96)], (16, 2), 128, 16),
-        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
-        ([(4, 4096)] * 4, (16, 2), 128, 16),
-        # a zero-length sequence sits between the others in the search
-        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
-        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
-    ],
-)
-@pytest.mark.parametrize(
-    "q_dtype, use_descale",
-    [(torch.bfloat16, False), (e4m3_dtype, True)],
-)
-@torch.inference_mode()
-def test_triton_unified_attn_one_q_block(
+def _run_one_q_block(
     seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
 ):
-    """Short batches launch one query block per sequence, and the output is correct.
+    """Run unified_attention on the gfx950 gluon kernel and check it against the reference.
 
-    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
-    grid[1] == num_seqs.
+    Returns the recorded launches as (grid, ONE_Q_BLOCK, NUM_SPLITS).
     """
-    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
-        pytest.skip("gfx950 gluon one-query-block launch")
     query_lens = [q for q, _ in seq_lens]
     kv_lens_list = [kv for _, kv in seq_lens]
     (
@@ -2837,9 +2818,6 @@ def test_triton_unified_attn_one_q_block(
     )
 
     assert launches, "the gfx950 gluon kernel did not launch"
-    for grid, one_q_block in launches:
-        assert one_q_block, "short batch did not take the one-query-block launch"
-        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
 
     ref = ref_paged_attn(
         query=query,
@@ -2868,6 +2846,87 @@ def test_triton_unified_attn_one_q_block(
         )
     else:
         torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+    return launches
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, head_size, block_size",
+    [
+        # max query length 2: one query block per sequence, 3d path for 5000 keys
+        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
+        ([(2, 96)], (16, 2), 128, 16),
+        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
+        ([(4, 4096)] * 4, (16, 2), 128, 16),
+        # a zero-length sequence sits between the others in the search
+        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
+        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype, use_descale",
+    [(torch.bfloat16, False), (e4m3_dtype, True)],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block(
+    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+):
+    """Short batches launch one query block per sequence, and the output is correct.
+
+    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
+    grid[1] == num_seqs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    launches = _run_one_q_block(
+        seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+    )
+    for grid, one_q_block, _num_splits in launches:
+        assert one_q_block, "short batch did not take the one-query-block launch"
+        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
+
+
+@pytest.mark.parametrize(
+    "num_seqs, kv_len, num_splits",
+    [
+        # 64 * 2 one-block programs leave a 256-CU launch half empty, but the padded
+        # count (num_tokens // 4 + num_seqs per KV head) says the launch is full.
+        # Counting the one-block grid is what makes this launch split.
+        (64, 8192, 4),
+        # the padded count already splits, so it is kept. Counting the one-block
+        # grid here as well would give 32 segments instead of 8.
+        (8, 8192, 8),
+        # 256 * 2 one-block programs fill the CUs: nothing to split
+        (256, 1024, 1),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_split_transition(
+    num_seqs, kv_len, num_splits, monkeypatch
+):
+    """The one-block grid is counted for the split only while the padded count leaves
+    the launch unsplit (Qwen3.5-397B bf16: -hq 32 -hk 2 -d 256 -sq 4).
+
+    Checks the exact NUM_SPLITS of the launch, on top of the one-block launch and
+    the output. The counts are the kv_split table's for 256 CUs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    launches = _run_one_q_block(
+        [(4, kv_len)] * num_seqs,
+        (32, 2),
+        256,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, launched_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+    assert grid == (2, num_seqs) + ((num_splits,) if num_splits > 1 else ())
 
 
 class _TritonLaunchSpy:
