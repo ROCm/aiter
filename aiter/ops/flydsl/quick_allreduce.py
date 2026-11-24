@@ -43,6 +43,7 @@ from .allreduce_policy import (
     HIER_LOCAL_SCHEDULES,
     HIER_SUPER_TILES,
     HIER_X_CODEC,
+    INBOX_MEMORY_MODES,
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
     PAD_MASK_MAX_BYTES,
@@ -336,6 +337,24 @@ def _hier_codecs(requested, rung: HierRung, group_size: int):
     )
 
 
+def _check_inbox_agrees(resolved_inbox: str, group) -> None:
+    """Raise unless every rank in *group* resolved the same inbox memory.
+
+    The Lamport inbox holds 3 or 4 buffers (2 or 3 on the ring) by this memory
+    type, so a rank that resolved another one would lay its slots out
+    differently from its peers.
+    """
+    memory_id = INBOX_MEMORY_MODES.index(resolved_inbox)
+    bounds = torch.tensor([memory_id, -memory_id], dtype=torch.int64)
+    dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=group)
+    if int(bounds[0]) != -int(bounds[1]):
+        raise ValueError(
+            f"the ranks resolved different inbox memory (this rank: "
+            f"{resolved_inbox!r}); set inbox_memory or the link environment "
+            f"the same on every rank"
+        )
+
+
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     """Whether ``FlyQuickAllReduce`` batches publishes into super-tiles.
 
@@ -492,7 +511,18 @@ class FlyQuickAllReduce:
                     f"every rung of a ladder must name one handshake, got {named}"
                 )
             (handshake,) = named
-        ladder = tuple(dataclasses.replace(r, handshake=handshake) for r in ladder)
+        ladder = tuple(
+            dataclasses.replace(
+                r,
+                handshake=handshake,
+                **(
+                    {"knobs": DEFAULT_MESH_KNOBS}
+                    if handshake != "lamport" and not r.knobs.is_default()
+                    else {}
+                ),
+            )
+            for r in ladder
+        )
         if not algo.has_knobs:
             for r in ladder:
                 if not r.knobs.is_default():
@@ -505,6 +535,7 @@ class FlyQuickAllReduce:
         inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
+        _check_inbox_agrees(resolved_inbox, group)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -602,6 +633,7 @@ class FlyQuickAllReduce:
                         block=b,
                         handshake=handshake,
                         knobs=kn,
+                        **({"codec": rs_codec} if algo.single_codec else {}),
                     )
                     if algo.hierarchical:
                         wg_lds = hier_lds_bytes(
@@ -1042,6 +1074,7 @@ class FlyQuickAllReduceRMSNorm:
         inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
+        _check_inbox_agrees(resolved_inbox, group)
         self._device_index = _cuda_index(device, owner="FlyQuickAllReduceRMSNorm")
         self.group = group
         self.device = torch.device("cuda", self._device_index)

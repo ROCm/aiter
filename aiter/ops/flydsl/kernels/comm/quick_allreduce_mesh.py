@@ -155,6 +155,7 @@ _RESIDENT_WGS_PER_CU = {
     (8, 1): 4,
     (8, 8): 6,
 }
+_LAMPORT_RESIDENT_WGS_PER_CU = {"int5": 3, "int6": 3, "fp16": 2}
 
 
 class _LazyPolled:
@@ -187,6 +188,7 @@ def clamp_grid_cap(
     block: int = BLOCK,
     handshake: str = "flag",
     knobs: MeshKnobs = DEFAULT_MESH_KNOBS,
+    codec: str = "int4",
 ) -> int:
     """Clamp a requested persistent grid to what actually fits on the device.
 
@@ -239,6 +241,8 @@ def clamp_grid_cap(
                 f"world_size={world_size}"
             )
         resident = min(for_world)
+    if handshake == "lamport":
+        resident = min(resident, _LAMPORT_RESIDENT_WGS_PER_CU.get(codec, resident))
     if handshake == "lamport" and knobs.prefetch:
         resident = max(1, resident - 1)
     if block > BLOCK:

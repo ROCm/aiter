@@ -1131,6 +1131,21 @@ def test_fused_ladder_file_rejects(tmp_path, edit, match):
         P.load_fused_ladders(_write_ladders(tmp_path, doc))
 
 
+def test_fused_ladder_file_rejects_a_mixed_handshake_ladder(tmp_path):
+    """One engine set serves a width's ladder, so its rungs name one handshake;
+    the loader says so up front, not at the first launch."""
+    doc = _ladder_doc()
+    plat = doc["platforms"][0]
+    for edit in (
+        _set((*_MESH, "rungs", 0, "super_tile"), 1),
+        _set((*_MESH, "rungs", 1, "super_tile"), 1),
+        _set((*_MESH, "rungs", 1, "handshake"), "lamport"),
+    ):
+        edit(plat)
+    with pytest.raises(ValueError, match="one handshake"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
 @pytest.mark.parametrize("apr", [4, 8])
 def test_fused_ladder_file_takes_wide_mesh_rows(tmp_path, apr):
     """A mesh row may span several ranks' chunks (up to the tile's 8 atoms);
@@ -1886,3 +1901,38 @@ def test_groups_override_the_hier_kernel_cannot_build_on_is_rejected(text):
     with pytest.raises(ValueError):
         check_groups(groups, 8)
     assert check_groups(parse_groups_env("0,1,2,3;4,5,6,7", 8), 8)
+
+
+def test_check_groups_order_is_canonical():
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
+
+    a = check_groups(((4, 5, 6, 7), (0, 1, 2, 3)), 8)
+    assert (
+        a
+        == check_groups(((3, 2, 1, 0), (7, 6, 5, 4)), 8)
+        == ((0, 1, 2, 3), (4, 5, 6, 7))
+    )
+
+
+def test_lamport_grid_clamp_follows_the_codec():
+    """The Lamport mesh's VGPR count grows with the codec, so a wider one is
+    resident fewer workgroups per CU."""
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+
+    def cap(codec):
+        return clamp_grid_cap(
+            10_000,
+            arch="gfx950",
+            world_size=8,
+            super_tile=1,
+            cu_count=256,
+            handshake="lamport",
+            codec=codec,
+        )
+
+    assert [cap(c) for c in ("int4", "int5", "int6", "fp16")] == [
+        4 * 256,
+        3 * 256,
+        3 * 256,
+        2 * 256,
+    ]

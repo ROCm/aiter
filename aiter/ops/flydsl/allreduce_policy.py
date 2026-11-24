@@ -755,7 +755,9 @@ class FamilyPolicy:
             if self.hier.min <= mesh.min:
                 mesh = None
             else:
-                end = self.hier.min if mesh.max is None else min(mesh.max, self.hier.min)
+                end = (
+                    self.hier.min if mesh.max is None else min(mesh.max, self.hier.min)
+                )
                 mesh = Window(mesh.min, end)
         ring = self.ring
         if ring is not None and not ring.is_empty:
@@ -1850,6 +1852,12 @@ def load_fused_ladders(path: str) -> FusedLadders:
             for hidden, entry, ew in entries:
                 _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
                 rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                named = {r.handshake for r in rungs if hasattr(r, "handshake")}
+                if len(named) > 1:
+                    raise ValueError(
+                        f"{ew}: every rung must name one handshake, got "
+                        f"{sorted(named)}"
+                    )
                 if link != "xgmi" and any(
                     getattr(r, "low_latency", False) for r in rungs
                 ):

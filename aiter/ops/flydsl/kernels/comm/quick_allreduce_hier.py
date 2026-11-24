@@ -160,12 +160,17 @@ _LAMPORT_COLORS = 6
 
 
 def check_groups(groups, world_size: int) -> tuple[tuple[int, ...], ...]:
-    """*groups* as a tuple of sorted tuples, or raise.
+    """*groups* as a tuple of sorted tuples, itself sorted, or raise.
+
+    The order of the groups is canonical so that every rank agrees on which
+    group it is in: a caller that lists them differently per rank would
+    otherwise have both partners believe they are group 0 and poll a slot
+    nobody writes.
 
     Two groups of equal size ``G >= 2`` that together hold every rank once,
     with ``ATOMS`` divisible by ``G``.
     """
-    groups = tuple(tuple(sorted(int(r) for r in g)) for g in groups)
+    groups = tuple(sorted(tuple(sorted(int(r) for r in g)) for g in groups))
     if len(groups) != 2:
         raise ValueError(f"hier needs exactly 2 groups, got {groups}")
     size = len(groups[0])
@@ -345,6 +350,13 @@ def make_quick_allreduce_hier_kernel(
     x_base = rs_base + local_buffers * grid * rs_n * rs_slot
     ag_base = x_base + x_buffers * grid * 2 * x_slot
     inbox_i32 = ag_base + local_buffers * grid * ag_n * ag_slot
+    if inbox_i32 * 4 >= 1 << 32:
+        # The kernel addresses the inbox through 32-bit buffer-descriptor ranges.
+        raise ValueError(
+            f"hier inbox of {inbox_i32 * 4} B is past the 4 GiB buffer range; "
+            f"lower super_tile, grid or block (super_tile={super_tile}, "
+            f"grid={grid}, block={block})"
+        )
     rearm_cm = lamport_rearm_modifier(inbox_memory)
 
     lds_bytes = hier_lds_bytes(
@@ -844,7 +856,7 @@ def make_quick_allreduce_hier_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
                     if const_expr(h >= 2):
-                        _keys, bases = _rank_tiles(_rs_slot, [h - 2], s, rs, buf)
+                        _, bases = _rank_tiles(_rs_slot, [h - 2], s, rs, buf)
                         polled = _poll(rs, bases)
                     else:
                         pass  # hop 1 is a pure send
@@ -902,7 +914,7 @@ def make_quick_allreduce_hier_kernel(
                 chunk = (li - h + 1) % G
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
-                    _keys, bases = _rank_tiles(_ag_slot, [h - 2], s, ag, buf)
+                    _, bases = _rank_tiles(_ag_slot, [h - 2], s, ag, buf)
                     polled = _poll(ag, bases)
                     if const_expr(h < G):
                         _lds_free()

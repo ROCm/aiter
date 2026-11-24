@@ -134,12 +134,22 @@ ways (`TwoShotRung.handshake`, or the `handshake` argument of
   removes the drain, the flag store and two barriers from each lap. The poll,
   the re-arm and the release are in `quick_allreduce_lamport.py`.
 
-Only one packet can hold the sentinel: an INT4 nibble word whose eight values
-are all at code 15. The sender moves one of them down one step. This needs
-eight values at -7/8 of their group's extremum, which sits in the neighbour
-thread, so it is rare; a crafted input that hits it in every word still gives
-29.6 dB. Every rank decodes the same moved packet, so the ranks still agree
-bit for bit.
+`lamport_fix` keeps every polled dword off the sentinel, per plane:
+
+* The scale dword (four E5M2 bytes) cannot be the sentinel, because the scale
+  encode clamps its exponent field to 30. A finite fp16 extremum gives at most
+  28; `-Inf`, `+Inf` and NaN land on the clamp, not on `0xFF`, which four
+  `-Inf` pairs would turn into the sentinel.
+* The INT6 and INT5 extra planes and the INT5/INT6 nibble words are fixed as
+  the docstring of `lamport_fix` describes.
+* An INT4 nibble word whose eight values are all at code 15 moves one of them
+  down one step. This needs eight values at -7/8 of their group's extremum,
+  which sits in the neighbour thread, so it is rare; a crafted input that hits
+  it in every word still gives 29.6 dB.
+* The fp16 passthrough turns two NaN halves (`0xFFFF`) into `0x7FFF`.
+
+Every rank decodes the same fixed packet, so the ranks still agree bit for
+bit.
 
 The Lamport mesh rotates three inbox buffers (1.5x the flag inbox): the
 reduce-scatter and all-gather of a tile are two rounds of one sequence, and a
@@ -155,8 +165,8 @@ writer's release. It costs one more inbox buffer: four on the mesh (2x the flag
 inbox), three per hop on the ring (3x). The uncached inbox of xGMI keeps the
 re-arm right after the poll. The fused builds take the same handshake
 (`FusedTwoShotRung.handshake`, an optional `"handshake"` key on a rung of the
-ladder file); their epilogue hooks are unchanged. gfx950/xGMI runs Lamport,
-plain and fused; the other platforms run flag until they are measured.
+ladder file); their epilogue hooks are unchanged. gfx950 runs Lamport on
+xGMI and PCIe, plain and fused; gfx942 runs flag.
 
 The hierarchical kernel takes either handshake on all three laps, from its
 rungs as the mesh and the ring do (`HierRung` is a `TwoShotRung`; it takes no

@@ -225,10 +225,7 @@ FUSED_ALGORITHMS = ("mesh", "ring")
 # ~21 dB, so anything below 18.0 is a regression, not a known cost of the
 # schedule.
 SQNR_MIN_DB = 18.0
-
-# The hierarchical schedule is held to the TP8 mesh's accuracy (19.1 dB on the
-# normal fill). The floor sits just under it.
-HIER_SQNR_MIN_DB = 19.0
+HIER_SQNR_MIN_DB = SQNR_MIN_DB
 
 # INT4 at TP8 on the ring is still a supported configuration -- pinning both
 # laps reaches it -- and is held to what it actually delivers, not to the
@@ -3292,13 +3289,11 @@ def _fused_rung_grid(
     )
 
 
-def _fused_threshold_cases(
-    walk: list, algorithm: str, tp: int
-) -> list[fab.FusedCase]:
+def _fused_threshold_cases(walk: list, algorithm: str, tp: int) -> list[fab.FusedCase]:
     """Cases at both sides of the super-tile fallback of every ST>1 rung.
 
     A rung falls back to its ST=1 build below the tile count that fills the
-    grid and the walk's first and last payload of a rung may both sit on one 
+    grid and the walk's first and last payload of a rung may both sit on one
     side of it. Each probe is the last payload before and the first at the threshold.
     """
     link = fly_policy.detect_link()
@@ -3450,9 +3445,11 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
         )
         _check(
             f"tp={tp} fused {algorithm} shipped walk",
-            [f"{ARCH} ships a fused {algorithm} route here, but its walk is empty"]
-            if shipped
-            else [],
+            (
+                [f"{ARCH} ships a fused {algorithm} route here, but its walk is empty"]
+                if shipped
+                else []
+            ),
         )
         return {"gfx": ARCH, "skipped": not shipped, "empty_walk": True}
     batch = _fused_batch(
