@@ -311,6 +311,11 @@ def build_fused_slice(world_size, nvb, nwg, nwaves, rank, hidden, num_tokens, in
             if valid_keep[it]:
                 _buffer_store(out_buf, t * fx.Int32(hidden // 2) + col_keep[it], atom_f32_to_bf16(stored))
 
+        # advance this workgroup's inbox colour: the next call writes and polls the buffer this
+        # call re-armed two rounds ago, never the one it just read (stale peer data otherwise)
+        if tid == fx.Int32(0):
+            _store_color(_wrap3(color + fx.Int32(1)))
+
     @flyc.jit
     def launch(inp_ptr, prefix_ptr, bank_ptr, cw_ptr, ow_ptr, out_ptr,
                gpart_ptr, gsq_ptr, counter_ptr, peer_ptrs: fx.Int64, colors_ptr: fx.Int64,
