@@ -107,6 +107,13 @@ __global__ void fused_qk_rmsnorm_kernel(
             square_sum += (thread_data_float[i] * thread_data_float[i]);
 
         auto sum_f = [](float a, float b) { return a + b; };
+        // block_reduce stages partials in LDS with its only barrier after the write: wait
+        // until every wave has read the previous row's partials before writing this row's.
+        if constexpr(BlockSize > WARP_SIZE)
+        {
+            if(r > 0)
+                __syncthreads();
+        }
         rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
         rcp[0] = rsqrtf(rcp[0] / n + epsilon);
         rcp[1] = rcp[0];
