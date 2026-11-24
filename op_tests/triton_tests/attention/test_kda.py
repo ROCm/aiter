@@ -20,11 +20,13 @@ from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 arch = get_arch()
 
 pytestmark = pytest.mark.skipif(
-    arch not in ("gfx950", "gfx1250"),
+    arch not in ("gfx950", "gfx1250", "gfx1250-strict"),
     reason=f"KDA gluon decode needs gfx950/gfx1250, got {arch}",
 )
 
-gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
+gfx1250_only = pytest.mark.skipif(
+    arch not in ("gfx1250", "gfx1250-strict"), reason="gfx1250-only feature"
+)
 bf16_state_only = pytest.mark.skipif(
     arch != "gfx950", reason="bf16 state requires gfx950"
 )
@@ -193,7 +195,10 @@ def get_config(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
 def kda_store_mode(request, monkeypatch):
     """Run the suite twice: as-is, then routed through the cached-update path."""
-    if request.param == "cache_state_updates" and arch != "gfx1250":
+    if request.param == "cache_state_updates" and arch not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         pytest.skip("cache_state_updates is gfx1250 only")
     if request.param == "snapshots":
         yield request.param

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import os
 
 import pandas as pd
@@ -12,7 +13,7 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+from aiter.ops.gemm_op_a4w4 import _FLYDSL_AVAILABLE, gemm_a4w4
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.test_common import (
     assertAllclose,
@@ -32,7 +33,8 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 # leave a partial M tile of a general kernel, 2049 one of the compute kernel. 129 and 255 are
 # below the 256-row compute tile of N=36864 and reach it through the padded M, as one partial
 # tile. Together they reach the masked-M stores and partial-tile cluster reduction of both
-# kernel families.
+# kernel families. The last three leave 19 / 33 / 19 M tiles on compute kernels with cluster_m
+# 2 / 4 / 2: cluster_m shrinks to the largest power-of-two divisor of the tile count (1 / 1 / 1).
 OFF_GRID_SHAPES = {
     (1, 7168, 16384): False,
     (17, 7168, 16384): False,
@@ -40,7 +42,26 @@ OFF_GRID_SHAPES = {
     (2049, 7168, 16384): True,
     (129, 36864, 7168): True,
     (255, 36864, 7168): True,
+    (4609, 3584, 7168): True,
+    (8321, 3584, 7168): True,
+    (4609, 7168, 3584): True,
 }
+# (M, N, K, kernelName, other kernelName): two compute kernels that do not fit the instruction cache
+# together. Each prefetches its own code, so it must run as fast right after the other as back to back:
+# alternating vs back to back is 0.94-1.06 with the prefetch and 1.5-2.2 without. One launch holds three
+# kernels, picked by the K-tiles left after the full revolutions (0, 2 or any count); the K below leave
+# 0, 2 and 3. Other K add a data-side cost of up to 1.2 that the prefetch does not touch.
+SWITCH_CASES = tuple(
+    (
+        4096,
+        3584,
+        k,
+        "flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm2_cn2",
+        "flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn2",
+    )
+    for k in (7168, 3584, 7936)
+)
+SWITCH_RATIO_MAX = 1.15
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
@@ -110,17 +131,44 @@ def run_gemm_asm(
     return out
 
 
-def _test_gemm_gfx1250(dtype, M, N, K):
-    """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
-    32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
-    it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
-    # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
-    from aiter.ops.gemm_op_a4w4 import (
-        _FLYDSL_AVAILABLE,
-        _a4w4_mxscale_config,
-        gemm_mxfp4_asm,
+PS_KERNEL = "_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE"
+
+
+def ps_supported(x, w, x_scales, w_scales, out, tile=256):
+    # mirrors ps_supported() in csrc/py_itfs_cu/asm_gemm_a4w4.cu (B preshuffled, no bias term)
+    M, N, K = x.shape[0], w.shape[0], x.shape[1] * 2
+    return (
+        K % 64 == 0
+        and N % 16 == 0
+        and x.stride(0) % 16 == 0
+        and w.stride(0) * 2 == K
+        and x_scales.shape[0] >= (M + tile - 1) // tile * tile
+        and w_scales.shape[0] >= (N + tile - 1) // tile * tile
+        and M * x.stride(0) < 2**32
+        and N * w.stride(0) < 2**32
+        and tile * out.stride(0) * 2 < 2**31
     )
 
+
+def quantize(dtype, M, N, K):
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    x_scales = x_scales.view(torch.uint8)
+    w_scales = w_scales.view(torch.uint8)
+    a = run_torch(x, w, x_scales, w_scales, dtype)
+    return a, x, wshuffle, x_scales_shuffle, w_scales_shuffle
+
+
+def _gfx1250_operands(dtype, M, N, K):
+    """The operands of gemm_a4w4 as ATOM calls it on gfx1250: the weight and the
+    activation scale in the 32x4 layout, the activation quantized straight into it.
+    Returns xq, xs, wq, ws and the torch reference."""
     quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
@@ -134,6 +182,15 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     wq = shuffle_weight(wq_raw, layout=(16, 16))
     ws = shuffle_mxfp8fp4_scale(ws_raw)
     xq, xs = quant(x, quant_dtype=dtypes.fp4x2, scale_layout_m32k4=True)
+    return xq, xs, wq, ws, ref
+
+
+def _test_gemm_gfx1250(dtype, M, N, K):
+    """gemm_a4w4 as ATOM calls it on gfx1250. ``tuned`` is the public op, so it runs
+    the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
+    from aiter.ops.gemm_op_a4w4 import _a4w4_mxscale_config, gemm_mxfp4_asm
+
+    xq, xs, wq, ws, ref = _gfx1250_operands(dtype, M, N, K)
     candidates = {
         "tuned": lambda: gemm_a4w4(xq, wq, xs, ws, dtype=dtype),
         "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
@@ -143,6 +200,7 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     # Without FlyDSL there is no family to check: both candidates still verify ASM.
     want_compute = OFF_GRID_SHAPES.get((M, N, K))
     if want_compute is not None and _FLYDSL_AVAILABLE:
+        # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
         from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
             parse_a4w4_kernel_name,
         )
@@ -242,7 +300,98 @@ def test_gemm(dtype, M, N, K):
         )
         ret[f"{name} err"] = err
 
+    out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    if ps_supported(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out):
+        d, us = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, PS_KERNEL
+        )
+        err = checkAllclose(a, d[:M], msg="asm 256x256 ps", catastrophic_check=True)
+        ret["us 256x256_ps"] = us
+        ret["err 256x256_ps"] = err
+        # a bias with beta 0 adds nothing
+        bias = torch.randn(M, N, dtype=dtypes.fp32)
+        d, _ = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, PS_KERNEL, bias
+        )
+        ret["err 256x256_ps bias"] = checkAllclose(
+            a, d[:M], msg="asm 256x256 ps, bias, beta 0", catastrophic_check=True
+        )
+
     return ret
+
+
+@benchmark()
+def test_gemm_splitk(dtype, M, N, K, log2_k_split):
+    ret = {}
+    a, x, wshuffle, x_scales_shuffle, w_scales_shuffle = quantize(dtype, M, N, K)
+    for name in ["_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E", PS_KERNEL]:
+        tag = "256x256_ps" if name == PS_KERNEL else "256x256"
+        out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+        d, us = run_gemm_asm(
+            x,
+            wshuffle,
+            x_scales_shuffle,
+            w_scales_shuffle,
+            out,
+            name,
+            log2_k_split=log2_k_split,
+        )
+        err = checkAllclose(
+            a,
+            d[:M],
+            msg=f"asm {tag} log2_k_split={log2_k_split}",
+            catastrophic_check=True,
+        )
+        ret[f"us {tag}"] = us
+        ret[f"err {tag}"] = err
+    return ret
+
+
+@benchmark()
+def test_compute_switch_penalty(
+    M, N, K, kernel_name, other_kernel_name, dtype=dtypes.bf16
+):
+    """Two compute kernels run alternately must cost what they cost back to back,
+    and each must still produce its own correct result."""
+    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a4w4_mxscale_bpreshuffle_gfx1250,
+    )
+
+    xq, xs, wq, ws, ref = _gfx1250_operands(dtype, M, N, K)
+    out = torch.empty((M, N), dtype=dtype)
+    names = (kernel_name, other_kernel_name)
+    fns = [
+        functools.partial(
+            run_gemm_a4w4_mxscale_bpreshuffle_gfx1250, xq, wq, xs, ws, out, name
+        )
+        for name in names
+    ]
+    # The alternating run overwrites the output, so each kernel is checked on its own first.
+    for name, fn in zip(names, fns):
+        out.fill_(float("nan"))
+        fn()
+        assertAllclose(
+            ref, out, msg=f"{name}: a4w4 M={M} N={N} K={K}", catastrophic_check=True
+        )
+
+    def alternate():
+        fns[0]()
+        fns[1]()
+
+    _, us_a = run_perftest(fns[0])
+    _, us_b = run_perftest(fns[1])
+    _, us_ab = run_perftest(alternate)
+    assert us_ab <= SWITCH_RATIO_MAX * (us_a + us_b), (
+        f"{kernel_name} then {other_kernel_name}: {us_ab:.1f} us alternating vs "
+        f"{us_a:.1f} + {us_b:.1f} us back to back"
+    )
+    return {
+        "gfx": get_gfx(),
+        "compute us": us_a,
+        "compute TFLOPS": 2 * M * N * K / us_a / 1e6,
+        "other compute us": us_b,
+        "alternating us": us_ab,
+    }
 
 
 def tuned_shapes():
@@ -380,9 +529,31 @@ def main():
     off-grid M it lacks.
     e.g.: --csv aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_tuned_gemm.csv""",
     )
+    parser.add_argument(
+        "-mnk_splitk",
+        "--shape_splitk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (256, 256, 8192),
+            (128, 128, 16384),
+            (256, 256, 16384),
+            (256, 512, 8192),
+            (512, 512, 8192),
+            (2048, 2048, 8192),
+        ],
+        help="""Shapes of mnk for split K (log2_k_split 1..3) with the 256x256 kernels.
+    e.g. -mnk_splitk 256,256,8192""",
+    )
     args = parser.parse_args()
 
     gfx1250 = get_gfx() == "gfx1250"
+    if gfx1250 and _FLYDSL_AVAILABLE:
+        switch_rows = [test_compute_switch_penalty(*case) for case in SWITCH_CASES]
+        aiter.logger.info(
+            "a4w4 compute kernels run alternately vs back to back (markdown):\n%s",
+            pd.DataFrame(switch_rows).to_markdown(index=False),
+        )
     if args.csv is not None:
         if not os.path.exists(args.csv):
             raise FileNotFoundError(f"CSV file not found: {args.csv}")
@@ -414,6 +585,17 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
+
+    if gfx1250:
+        return  # the split-K test runs the gfx950 256x256 kernels
+    df = []
+    for dtype in args.dtype:
+        for m, n, k in args.shape_splitk:
+            for log2_k_split in (1, 2, 3):
+                df.append(test_gemm_splitk(dtype, m, n, k, log2_k_split))
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a4w4 split K summary (markdown):\n%s", df_md)
 
 
 if __name__ == "__main__":

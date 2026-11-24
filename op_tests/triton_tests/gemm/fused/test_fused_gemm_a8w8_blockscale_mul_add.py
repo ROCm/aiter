@@ -21,17 +21,10 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     run_torch as run_torch_gemm_a8w8_blockscale,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-def get_x_vals():
-
-    x_vals = [
-        (v, 7168, 256) for v in [2, 4, 8, 16, 1024]
-    ]  # TODO M = 1 triton upstream compilation error without AMDGCN_USE_BUFFER_OPS=0
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(min_k=128, max_size=1024 * 7168 * 256))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
