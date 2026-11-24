@@ -32,9 +32,12 @@ __all__ = [
 ]
 
 
-# _MTP_BY_ARCH is keyed on the base name; the hardware path already drops the
-# feature suffix, but an arch set by hand through the environment keeps it.
-GDR_GPU_ARCH = get_rocm_arch().split(":")[0]
+def _gdr_gpu_arch():
+    # _MTP_BY_ARCH is keyed on the base name; the hardware path already drops the
+    # feature suffix, but an arch set by hand through the environment keeps it.
+    # Resolved per call, not at import: FlyDSL >= 0.5.1 raises when no GPU and
+    # no FLYDSL_GPU_ARCH name the target, which would break a GPU-less import.
+    return get_rocm_arch().split(":")[0]
 
 
 def _mtp_variant(mode, has_tree):
@@ -318,7 +321,7 @@ def _mtp_kwargs(
         state_dtype,
         variant,
         get_num_sms(),
-        GDR_GPU_ARCH,
+        _gdr_gpu_arch(),
     )
     if d is None:
         # No tiling fits; hand back the decode default and let the builder be
