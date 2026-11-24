@@ -20,40 +20,36 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     tensor_store_gather,
 )
 
-# Per wave: (m: overlaps next prologue, n: overlaps next mainloop).
-# Both the GEMM's wave ownership and the callbacks use this table.
-# The m indices are consumed in the current epilogue. The n indices cross the
-# task boundary as previous_task_scatter_dst_index_low/high. Each wave-wide
-# index vector supplies GATHERS_PER_INDEX_VECTOR gathers (four for wave32
-# / eight-row gather).
-SCATTER_SCHEDULE = (
-    (0, 0),  # wave 0: load
-    (0, 0),  # wave 1: load
-    (8, 8),  # wave 2: store
-    (8, 8),  # wave 3: store
-)
+# Waves 0/1 load inputs; waves 2/3 each scatter 16 eight-row groups.
+# The default issues eight groups in the epilogue and defers eight to the
+# next task's mainloop. Tuning may defer nine or ten groups instead.
 WAVE_SIZE = 32
 ROWS_PER_GATHER = 8
 GATHERS_PER_INDEX_VECTOR = WAVE_SIZE // ROWS_PER_GATHER
-STORE_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if any(counts))
-LOAD_WAVES = tuple(w for w, counts in enumerate(SCATTER_SCHEDULE) if not any(counts))
+LOAD_WAVES = (0, 1)
+STORE_WAVES = (2, 3)
 STORE_WAVE_COUNT = len(STORE_WAVES)
-# Wave-ID boundary, not a count: load waves 0/1 precede store waves 2/3.
-TDM_STORE_WAVE_START = STORE_WAVES[0]
-PROLOGUE_GATHERS, MAINLOOP_GATHERS = SCATTER_SCHEDULE[TDM_STORE_WAVE_START]
-TAIL_FIRST_VECTOR = PROLOGUE_GATHERS // GATHERS_PER_INDEX_VECTOR
+TDM_STORE_WAVE_START = 2
 
-# The current row mapping interleaves equally sized bursts across a contiguous
-# suffix of store waves. The persistent task ABI carries two tail index vectors.
-assert len(LOAD_WAVES) == 2
-assert STORE_WAVES == tuple(range(TDM_STORE_WAVE_START, len(SCATTER_SCHEDULE)))
-assert all(
-    counts == (PROLOGUE_GATHERS, MAINLOOP_GATHERS)
-    for wave, counts in enumerate(SCATTER_SCHEDULE)
-    if wave in STORE_WAVES
-)
-assert PROLOGUE_GATHERS > 0 and PROLOGUE_GATHERS % GATHERS_PER_INDEX_VECTOR == 0
-assert 0 <= MAINLOOP_GATHERS <= 2 * GATHERS_PER_INDEX_VECTOR
+
+def scatter_schedule(prologue_gathers=8):
+    """Return the supported per-wave (prologue, mainloop) gather counts."""
+    if prologue_gathers not in (6, 7, 8):
+        raise ValueError("scatter prologue gathers must be 6, 7, or 8")
+    return (
+        (0, 0),
+        (0, 0),
+        (prologue_gathers, 16 - prologue_gathers),
+        (prologue_gathers, 16 - prologue_gathers),
+    )
+
+
+def overlap_output_offset(input_end, stage2_start, row_bytes, prologue_gathers):
+    """Keep pending C rows beyond all three input stages, aligned to 512B."""
+    scatter_schedule(prologue_gathers)
+    retired_bytes = prologue_gathers * STORE_WAVE_COUNT * ROWS_PER_GATHER * row_bytes
+    offset = max(stage2_start, input_end - retired_bytes)
+    return (offset + 511) // 512 * 512
 
 
 def can_overlap_scatter(
@@ -170,7 +166,7 @@ def make_scatter_store(
         # Keep the compiler-inserted tensorcnt(0xa) hardware workaround: it
         # limits outstanding tensor operations to 10, rather than draining all
         # stores. In the overlap path, waves 2/3 issue no tensor loads and at
-        # most eight stores between explicit drains, so this guard does not
+        # most ten stores between explicit drains, so this guard does not
         # require the burst to finish. The callbacks still use tensor_wait(0)
         # at LDS reuse boundaries; the compiler guard cannot replace those
         # completion waits. Ordinary and overlapped scatter share this emitter.
@@ -190,35 +186,25 @@ def make_overlap_callbacks(
     tdm_wait_per_wave,
     tdm_per,
     load_first,
+    prologue_gathers=8,
 ):
-    """Bind SCATTER_SCHEDULE to GEMM operations.
+    """Overlap each store wave's two bursts with the following GEMM task.
 
-    SCATTER_SCHEDULE is the source of the per-wave burst counts. Each gather
-    consumes ROWS_PER_GATHER lane indices; a full index vector spans WAVE_SIZE
-    lanes, so it supplies GATHERS_PER_INDEX_VECTOR gathers.
-
-    Task t's epilogue issues m. Task t+1's prologue waits for m after issuing
-    input stages 0/1, then uses one barrier before reusing C's head. It issues
-    n before input stage 2; n must retire before task t+1 overwrites C in its
-    epilogue. The final task issues both bursts without a following prologue.
-
-    Returns prologue, epilogue and skipped-task callbacks. ``scatter_dst_state``
-    holds the previous task's two destination index vectors, column offset and
-    valid flag.
-    Both index vectors belong to the table's n column: low supplies its first
-    GATHERS_PER_INDEX_VECTOR gathers, high the next group. The suffixes refer
-    to C row ranges, not address bits. With the default schedule, low covers
-    C rows 128:192 and high covers 192:256 across the store waves. Each lane
-    holds one flattened peer/slot index (or OOB), not a pointer. These indices
-    must survive the task boundary because the next task may target different
-    rows. The C data stays in LDS.
-    The epilogue returns the same four values for the next task; it never
-    mutates captured state. ``load_first`` loads the first register tile and
-    preserves GEMM's scheduling fence.
+    The state carries up to three destination vectors, an offset and validity.
+    Six/seven-gather first bursts end inside a vector; their tails retain that
+    vector and start at its original lane offset. The default eight-gather
+    first burst needs only two vectors; its third state value stays zero.
+    Stages 0/1 are disjoint from C. Stage 2 may overwrite only the retired
+    prefix. The next epilogue waits for the deferred tail before reusing C.
     """
+    scatter_schedule(prologue_gathers)
+    mainloop_gathers = 16 - prologue_gathers
+    tail_first_vector = prologue_gathers // GATHERS_PER_INDEX_VECTOR
+    tail_vectors = 4 - tail_first_vector
     (
         previous_task_scatter_dst_index_low,
         previous_task_scatter_dst_index_high,
+        previous_task_scatter_dst_index_extra,
         scatter_column_offset,
         scatter_valid,
     ) = scatter_dst_state
@@ -227,15 +213,17 @@ def make_overlap_callbacks(
         for i in range_constexpr(count):
             issue_scatter_group(
                 scatter_wave + fx.Int32((first + i) * STORE_WAVE_COUNT),
-                index_lanes[i // GATHERS_PER_INDEX_VECTOR],
-                i % GATHERS_PER_INDEX_VECTOR,
+                index_lanes[
+                    (first % GATHERS_PER_INDEX_VECTOR + i) // GATHERS_PER_INDEX_VECTOR
+                ],
+                (first + i) % GATHERS_PER_INDEX_VECTOR,
                 column_offset,
             )
 
     @flyc.jit
     def overlap_prologue(interleaved_lds_load):
         # Stages 0/1 are disjoint from old C. One rendezvous covers both
-        # the first input's readiness and retirement of C's first half.
+        # the first input's readiness and retirement of C's first burst.
         for i in range_constexpr(2):
             issue(i, i)
         init_accumulators()
@@ -246,11 +234,12 @@ def make_overlap_callbacks(
         load_first(interleaved_lds_load)
         if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
             issue_scatter_burst(
-                PROLOGUE_GATHERS,
-                MAINLOOP_GATHERS,
+                prologue_gathers,
+                mainloop_gathers,
                 (
                     previous_task_scatter_dst_index_low,
                     previous_task_scatter_dst_index_high,
+                    previous_task_scatter_dst_index_extra,
                 ),
                 scatter_column_offset,
             )
@@ -260,23 +249,30 @@ def make_overlap_callbacks(
     def overlap_epilogue(index_lanes, column_offset):
         next_scatter_dst_index_low = fx.Int32(0)
         next_scatter_dst_index_high = fx.Int32(0)
+        next_scatter_dst_index_extra = fx.Int32(0)
         next_scatter_column_offset = fx.Int32(0)
         next_scatter_valid = fx.Int32(0)
         if wave >= TDM_STORE_WAVE_START:
-            issue_scatter_burst(0, PROLOGUE_GATHERS, index_lanes, column_offset)
-            if const_expr(MAINLOOP_GATHERS > 0):
-                next_scatter_dst_index_low = index_lanes[TAIL_FIRST_VECTOR]
-            if const_expr(MAINLOOP_GATHERS > GATHERS_PER_INDEX_VECTOR):
-                next_scatter_dst_index_high = index_lanes[TAIL_FIRST_VECTOR + 1]
+            issue_scatter_burst(0, prologue_gathers, index_lanes, column_offset)
+            if const_expr(mainloop_gathers > 0):
+                next_scatter_dst_index_low = index_lanes[tail_first_vector]
+            if const_expr(mainloop_gathers > GATHERS_PER_INDEX_VECTOR):
+                next_scatter_dst_index_high = index_lanes[tail_first_vector + 1]
+            if const_expr(tail_vectors > 2):
+                next_scatter_dst_index_extra = index_lanes[tail_first_vector + 2]
             next_scatter_column_offset = fx.Int32(column_offset)
             next_scatter_valid = fx.Int32(1)
             if last_task != 0:
                 # No following prologue will issue the last task's tail.
                 tdm_ops.tensor_wait(0)
                 issue_scatter_burst(
-                    PROLOGUE_GATHERS,
-                    MAINLOOP_GATHERS,
-                    (next_scatter_dst_index_low, next_scatter_dst_index_high),
+                    prologue_gathers,
+                    mainloop_gathers,
+                    (
+                        next_scatter_dst_index_low,
+                        next_scatter_dst_index_high,
+                        next_scatter_dst_index_extra,
+                    ),
                     column_offset,
                 )
                 next_scatter_valid = fx.Int32(0)
@@ -284,6 +280,7 @@ def make_overlap_callbacks(
         return (
             next_scatter_dst_index_low,
             next_scatter_dst_index_high,
+            next_scatter_dst_index_extra,
             next_scatter_column_offset,
             next_scatter_valid,
         )
@@ -294,11 +291,12 @@ def make_overlap_callbacks(
         if (wave >= TDM_STORE_WAVE_START) & (scatter_valid != 0):
             tdm_ops.tensor_wait(0)
             issue_scatter_burst(
-                PROLOGUE_GATHERS,
-                MAINLOOP_GATHERS,
+                prologue_gathers,
+                mainloop_gathers,
                 (
                     previous_task_scatter_dst_index_low,
                     previous_task_scatter_dst_index_high,
+                    previous_task_scatter_dst_index_extra,
                 ),
                 scatter_column_offset,
             )

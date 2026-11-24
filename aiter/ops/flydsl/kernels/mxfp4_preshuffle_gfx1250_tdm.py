@@ -235,6 +235,7 @@ def build_gemm_a8w4_tdm_task(
     loc_sched=0,
     loc_group=1,
     ep_scatter_overlap=1,
+    ep_scatter_prologue_gathers=8,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -536,6 +537,7 @@ def build_gemm_a8w4_tdm_task(
         if const_expr(b_placed == 2):
             return (ksl // B_KSL_HALF) * SB_KHALF + (ksl % B_KSL_HALF) * 32
         return ksl * 32
+
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
@@ -622,13 +624,15 @@ def build_gemm_a8w4_tdm_task(
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     C_EP_OFF = A_LDS_OFF + 2 * A_LDS_STAGE if overlap_scatter else 0
     if overlap_scatter:
-        assert num_waves == len(ep_scatter_common.SCATTER_SCHEDULE)
-        assert scatter_groups == sum(
-            m + n for m, n in ep_scatter_common.SCATTER_SCHEDULE
+        scatter_schedule = ep_scatter_common.scatter_schedule(
+            ep_scatter_prologue_gathers
         )
-        retired_rows = (
-            ep_scatter_common.PROLOGUE_GATHERS * scatter_waves * SCATTER_GROUP_ROWS
+        C_EP_OFF = ep_scatter_common.overlap_output_offset(
+            INPUT_LDS_B, C_EP_OFF, _lds_row_bytes, ep_scatter_prologue_gathers
         )
+        assert num_waves == len(scatter_schedule)
+        assert scatter_groups == sum(m + n for m, n in scatter_schedule)
+        retired_rows = ep_scatter_prologue_gathers * scatter_waves * SCATTER_GROUP_ROWS
         assert INPUT_LDS_B <= C_EP_OFF + retired_rows * _lds_row_bytes
     request_lds_size = max(
         AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
@@ -728,7 +732,10 @@ def build_gemm_a8w4_tdm_task(
         f"{f'_ls{loc_sched}' if loc_sched else ''}"
     )
     if overlap_scatter:
-        _kname += "_overlap_scatter"
+        _kname += (
+            f"_overlap_scatter{ep_scatter_prologue_gathers}_"
+            f"{16 - ep_scatter_prologue_gathers}"
+        )
 
     # Compile the static path directly, preserving its launch ABI and the
     # compiler's knowledge of block IDs. Only persistent workers need a helper
@@ -763,11 +770,12 @@ def build_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
-        # Previous task's n-column indices from SCATTER_SCHEDULE. Low/high
+        # Previous task's deferred destination indices. Low/high/extra
         # refer to C row ranges (128:192 / 192:256 with the default schedule),
         # not address bits. Each i32 is one lane of a destination index vector.
         previous_task_scatter_dst_index_low: scatter_state_type = 0,
         previous_task_scatter_dst_index_high: scatter_state_type = 0,
+        previous_task_scatter_dst_index_extra: scatter_state_type = 0,
         # Destination byte offset and whether the deferred tail needs issuing.
         scatter_column_offset: scatter_state_type = 0,
         scatter_valid: scatter_state_type = 0,
@@ -2245,6 +2253,7 @@ def build_gemm_a8w4_tdm_task(
                     (
                         previous_task_scatter_dst_index_low,
                         previous_task_scatter_dst_index_high,
+                        previous_task_scatter_dst_index_extra,
                         scatter_column_offset,
                         scatter_valid,
                     ),
@@ -2254,10 +2263,12 @@ def build_gemm_a8w4_tdm_task(
                     tdm_wait_per_wave,
                     TDM_PER,
                     load_first,
+                    ep_scatter_prologue_gathers,
                 )
             )
         next_scatter_dst_index_low = fx.Int32(0)
         next_scatter_dst_index_high = fx.Int32(0)
+        next_scatter_dst_index_extra = fx.Int32(0)
         next_scatter_column_offset = fx.Int32(0)
         next_scatter_valid = fx.Int32(0)
         if const_expr(overlap_scatter):  # noqa: SIM102
@@ -3100,6 +3111,7 @@ def build_gemm_a8w4_tdm_task(
                     (
                         next_scatter_dst_index_low,
                         next_scatter_dst_index_high,
+                        next_scatter_dst_index_extra,
                         next_scatter_column_offset,
                         next_scatter_valid,
                     ) = epilogue_callback(_scatter_idx_lanes, _gboff)
@@ -3207,6 +3219,7 @@ def build_gemm_a8w4_tdm_task(
             return (
                 next_scatter_dst_index_low,
                 next_scatter_dst_index_high,
+                next_scatter_dst_index_extra,
                 next_scatter_column_offset,
                 next_scatter_valid,
             )
@@ -3282,6 +3295,7 @@ def launch_gemm_a8w4_tdm(
     arg_loc_phase: fx.Pointer = None,
     loc_group: Constexpr[int] = 1,
     ep_scatter_overlap: Constexpr[int] = 1,
+    ep_scatter_prologue_gathers: Constexpr[int] = 8,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3359,6 +3373,7 @@ def launch_gemm_a8w4_tdm(
         loc_sched=loc_sched,
         loc_group=loc_group,
         ep_scatter_overlap=ep_scatter_overlap,
+        ep_scatter_prologue_gathers=ep_scatter_prologue_gathers,
     )
     LOC_RUN = loc_group * max(b_placed, 1)
     if loc_sched:
@@ -3477,7 +3492,13 @@ def launch_gemm_a8w4_tdm(
                         crank,
                         tasks,
                         stride,
-                        init=[fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0)],
+                        init=[
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                        ],
                     ):
                         t_i32 = fx.Int32(t)
                         mu, nt = loc_coords(t_i32)
@@ -3489,7 +3510,13 @@ def launch_gemm_a8w4_tdm(
                                 fx.Int32(1), fx.Int32(0)
                             ),
                         )
-                        yield [updated[0], updated[1], updated[2], updated[3]]
+                        yield [
+                            updated[0],
+                            updated[1],
+                            updated[2],
+                            updated[3],
+                            updated[4],
+                        ]
                 else:
                     for t in range(crank, tasks, stride):
                         mu, nt = loc_coords(t)
@@ -3502,7 +3529,13 @@ def launch_gemm_a8w4_tdm(
                         fx.block_idx.x,
                         tasks,
                         stride,
-                        init=[fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0)],
+                        init=[
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                        ],
                     ):
                         task_i32 = fx.Int32(task_id)
                         updated = run_task(
@@ -3511,7 +3544,13 @@ def launch_gemm_a8w4_tdm(
                             scatter_dst_state,
                             (task_i32 + stride >= tasks).select(1, 0),
                         )
-                        yield [updated[0], updated[1], updated[2], updated[3]]
+                        yield [
+                            updated[0],
+                            updated[1],
+                            updated[2],
+                            updated[3],
+                            updated[4],
+                        ]
                 else:
                     for task_id in range(fx.block_idx.x, tasks, stride):
                         run_task(task_id, rows)
