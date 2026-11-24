@@ -58,8 +58,11 @@ def tracked_csvs(repo, rev):
     return {n for n in names if n.lower().endswith(".csv")}
 
 
-def changed_csvs(repo, base, head):
-    """(base_path_or_None, head_path_or_None) for every changed CSV; renames split."""
+def changed_csvs(repo, base, head, renames=None):
+    """(base_path_or_None, head_path_or_None) for every changed CSV; renames split.
+
+    Renames are also recorded in `renames` as {new_path: old_path}.
+    """
     data = git(
         repo, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z",
         "--find-renames", base, head, "--",
@@ -74,6 +77,8 @@ def changed_csvs(repo, base, head):
             # A rename is a removal at the old path plus an addition at the new one;
             # the cross-file hints below make the move visible to the reviewer.
             if status[0] == "R":
+                if renames is not None:
+                    renames[b] = a
                 yield a, None
             yield None, b
         elif status[0] == "A":
@@ -175,7 +180,8 @@ class Scan:
         self.repo, self.base, self.head = repo, base, head
         self.base_csvs = tracked_csvs(repo, base)
         self.head_csvs = tracked_csvs(repo, head)
-        self.changed = list(changed_csvs(repo, base, head))
+        self.renames = {}
+        self.changed = list(changed_csvs(repo, base, head, self.renames))
         self.cache = {}
         self.out = []
         self.failed = False
@@ -235,7 +241,10 @@ class Scan:
         tuned = sorted(t for t in group if t in head_files or t not in self.head_csvs)
         if not tuned:
             return  # input with no name-paired tuned file (e.g. shared input): skip
+        # A renamed input keeps its base rows, so its legacy rows are not "added".
         u_hdr_b, u_base = self.rows(self.base, untuned)
+        if u_hdr_b is None and untuned in self.renames:
+            u_hdr_b, u_base = self.rows(self.base, self.renames[untuned])
         u_hdr_h, u_head = self.rows(self.head, untuned)
         u_hdr = u_hdr_h or u_hdr_b
         base_t = [(t, *self.rows(self.base, t)) for t in tuned if t in self.base_csvs]

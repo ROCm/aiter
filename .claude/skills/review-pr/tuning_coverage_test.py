@@ -243,6 +243,25 @@ class TuningCoverageTest(unittest.TestCase):
         self.assertIn("CHECKED", out)
         self.assertNotIn('"M": "9"', out)
 
+    def test_renamed_input_keeps_its_legacy_rows(self):
+        # (5,5,5) is an untuned-only legacy row: never tuned, not this PR's problem.
+        inputs = ["1,2,3,False" + chr(10), "5,5,5,False" + chr(10)]
+        self.write(f"{CFG}/bf16_untuned_gemm.csv", GEMM_IN + "".join(inputs))
+        self.write(f"{CFG}/bf16_gfx950_untuned_gemm.csv", GEMM_IN + "".join(inputs))
+        self.write(f"{CFG}/bf16_tuned_gemm.csv", GEMM_OUT + "gfx950,256,1,2,3,False,k,4" + chr(10))
+        self.write(f"{CFG}/bf16_gfx950_tuned_gemm.csv",
+                   GEMM_OUT + "gfx950,256,1,2,3,False,k,4" + chr(10))
+        base = self.commit("pairs with untuned-only legacy rows")
+        self.git("mv", f"{CFG}/bf16_untuned_gemm.csv", f"{CFG}/untuned_bf16_gemm.csv")
+        self.git("rm", "-q", f"{CFG}/bf16_gfx950_tuned_gemm.csv")
+        self.git("mv", f"{CFG}/bf16_gfx950_untuned_gemm.csv", f"{CFG}/gfx950_untuned_gemm.csv")
+        self.write(f"{CFG}/gfx950_tuned_gemm.csv",
+                   GEMM_OUT + "gfx950,256,1,2,3,False,k,4" + chr(10))
+        out = self.scan(base, self.commit("renames that keep the pairing"))
+        self.assertNotIn("UNTUNED_NOT_IN_TUNED", out)
+        self.assertNotIn('"M": "5"', out)
+        self.assertIn(f"<-> {CFG}/untuned_bf16_gemm.csv", out)
+
     def test_new_hardware_column_does_not_make_legacy_rows_new(self):
         self.write(f"{CFG}/bf16_untuned_gemm.csv", GEMM_IN + "1,2,3,False\n")
         self.write(f"{CFG}/bf16_tuned_gemm.csv",
