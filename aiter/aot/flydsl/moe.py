@@ -708,10 +708,13 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         if target is None:
             skipped[job_arch(job)] += 1
             continue
-        # gfx1250-strict disables F4 WMMA (A0 errata); the fp4 mxfp4 rows are
-        # hollow on strict (fp8-activation a8w4 rows share the kernel name but
-        # are fine), so key on q_dtype_a. A0 falls back to runtime JIT.
-        if is_strict_identity(target) and _FP4 in str(job.get("q_dtype_a") or ""):
+        # Grouped FP4 MoE has an A0-safe N16 WMMA variant. Other FP4 families
+        # still emit the disabled N32 F4 instruction and cannot be prebuilt.
+        if (
+            is_strict_identity(target)
+            and _FP4 in str(job.get("q_dtype_a") or "")
+            and not _is_grouped(job)
+        ):
             skipped[job_arch(job)] += 1
             continue
         if targets and target != job_arch(job):
@@ -810,9 +813,12 @@ def main():
         for job in jobs:
             if resolve_target_arch(job_arch(job), {args.arch}) != args.arch:
                 continue
-            # gfx1250-strict disables F4 WMMA (A0 errata): mxfp4 rows hollow.
-            if is_strict_identity(args.arch) and _FP4 in str(
-                job.get("q_dtype_a") or ""
+            # Keep the grouped FP4 N16 variant; other FP4 kernels still use
+            # the disabled N32 F4 instruction.
+            if (
+                is_strict_identity(args.arch)
+                and _FP4 in str(job.get("q_dtype_a") or "")
+                and not _is_grouped(job)
             ):
                 continue
             if job_arch(job) != args.arch:

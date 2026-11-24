@@ -43,6 +43,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
@@ -101,11 +102,10 @@ def _require_gfx1250() -> None:
     if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
         return
     try:
-        from flydsl.runtime.device import get_rocm_arch
+        arch = get_gfx_runtime()
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"FlyDSL not importable: {exc}")
-    arch = get_rocm_arch()
-    if "gfx1250" not in arch.lower():
+        pytest.skip(f"GPU architecture unavailable: {exc}")
+    if arch not in ("gfx1250", "gfx1250-strict"):
         pytest.skip(f"requires gfx1250, got {arch!r}")
 
 
@@ -114,9 +114,7 @@ def is_gfx1250() -> bool:
     forcing the grouped path onto another arch (e.g. gfx942) still needs the GEMM
     mocked, so real-gemm defaults on only when the real WMMA kernel can run."""
     try:
-        from flydsl.runtime.device import get_rocm_arch
-
-        return "gfx1250" in get_rocm_arch().lower()
+        return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
     except Exception:  # noqa: BLE001
         return False
 
@@ -918,12 +916,25 @@ def run_moe(
 
 # model_dim=512 (not the 256 default): the grouped kernel needs
 # num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
-def test_grouped_a4w4_silu_matches_torch_ref():
+@pytest.mark.parametrize("tokens", [1, 65])
+@pytest.mark.parametrize("interleaved", [0, 1])
+def test_grouped_a4w4_silu_matches_torch_ref(tokens, interleaved, monkeypatch):
+    # #8527: Flash TP4's gate/up and down GEMMs use K=4096 and K=512.
+    # Nonconstant E8M0 scales expose a wrong N16 half/opsel mapping on A0;
+    # 65 tokens also exercise a partial output tile. Keep the case small by
+    # routing among eight experts instead of allocating all 256 model experts.
+    monkeypatch.setenv("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", str(interleaved))
     run_moe(
         "a4w4",
         activation=ActivationType.Silu,
-        model_dim=512,
+        experts=8,
+        tokens=tokens,
+        topk=2,
+        model_dim=4096,
         inter_dim=512,
+        use_bias=False,
+        data_init="uniform",
+        scale_init="auto",
     )
 
 
