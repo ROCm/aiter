@@ -1477,12 +1477,13 @@ def test_mhc_post_pre_decode_dispatch(
 ):
     """gfx950 with 256 CUs: the setting of the fused post+pre GEMM below 1024 rows.
 
-    At a row count of MHC_FUSED_DECODE_CONFIG_GFX950_256 the call must launch the
-    fused GEMM once with that row's split count and tiles; at every other row count
-    with the setting that get_mhc_fused_post_pre_config computes. The call is the
-    default one with the Gram route's table emptied, which is what runs wherever
-    that route does not list the row count. Weights and mixes are random and the
-    outputs are compared with the reference.
+    At a row count of MHC_FUSED_DECODE_CONFIG_GFX950_256 the default call must launch
+    the fused GEMM once with that row's split count and tiles; at every other row
+    count with the setting that get_mhc_fused_post_pre_config computes. A row count
+    of the table is called as it is, so the test also fails when the Gram route
+    answers there. The other row counts are called with the Gram route's table
+    emptied, because that route lists some of them. Weights and mixes are random and
+    the outputs are compared with the reference.
     """
     from aiter.ops import mhc as mhc_ops
 
@@ -1522,10 +1523,13 @@ def test_mhc_post_pre_decode_dispatch(
         launches.append((args[1].size(0), *args[8:11]))
         return fused_gemm(*args, **kwargs)
 
-    # The Gram route answers first at the row counts of its own table. This test
-    # is about the fused GEMM behind it, so that table is empty for the call.
+    row = mhc_ops._mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+    # A row count of the table keeps the Gram route's table: the default call has to
+    # reach the fused GEMM there. Next to the rows that route may answer first, so
+    # its table is empty for those calls.
+    gram_rows = dict(mhc_ops.MHC_GRAM_CONFIG_GFX950_256) if row else {}
     with patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record), patch.dict(
-        mhc_ops.MHC_GRAM_CONFIG_GFX950_256, clear=True
+        mhc_ops.MHC_GRAM_CONFIG_GFX950_256, gram_rows, clear=True
     ):
         outs = aiter.mhc_fused_post_pre(
             layer_input,
@@ -1538,7 +1542,6 @@ def test_mhc_post_pre_decode_dispatch(
             w_preshuffle_bf16=w_preshuffle_bf16,
             **extra_args,
         )
-    row = mhc_ops._mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
     # No row: the setting that the config function computes for this row count.
     expected = row or mhc_ops.get_mhc_fused_post_pre_config(
         m, hidden_size, w_preshuffle_bf16
@@ -1920,15 +1923,20 @@ if not args.hc_head:
         )
 
 
-# The table of the gfx950 decode settings: ascending row ranges below the fused bound
-# and settings that the fused GEMM has.
-for (hidden_size, _), rows in aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items():
+# The table of the gfx950 decode settings: ascending row ranges below the fused bound,
+# settings that the fused GEMM has, and no row count that the Gram route lists (the
+# default call with fused RMSNorm would never ask for its setting).
+for key, rows in aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items():
+    hidden_size = key[0]
+    gram_rows = aiter.ops.mhc.MHC_GRAM_CONFIG_GFX950_256.get(key, ())
     last = 0
     for m_first, m_last, split_k, tile_m, tile_k in rows:
         assert last < m_first <= m_last < 1024, rows
         assert tile_m in (16, 32) and tile_k in (32, 64), rows
         assert hidden_size % (split_k * tile_k) == 0, rows
         assert hidden_size // split_k >= 2 * tile_k, rows
+        for gram_first, gram_last, *_ in gram_rows:
+            assert m_last < gram_first or gram_last < m_first, (key, rows, gram_rows)
         last = m_last
 
 if get_gfx_runtime() == "gfx950" and get_cu_num() == 256:

@@ -630,28 +630,24 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
 # of _mhc_fused_config_gfx950_256, for FP32 fn with the tile_m of
 # _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256. Keyed by (hidden_size, w_preshuffle_bf16);
 # a row is (first m, last m, split_k, tile_m, tile_k) and tile_n is 32. Row counts in
-# no row keep the computed setting.
+# no row keep the computed setting. No row overlaps a row of
+# MHC_GRAM_CONFIG_GFX950_256: the default call with fused RMSNorm takes the Gram
+# route at those row counts and never asks for a setting of the fused GEMM.
 MHC_FUSED_DECODE_CONFIG_GFX950_256 = {
-    (4096, False): ((725, 768, 16, 16, 32),),
     (4096, True): (
-        (513, 576, 32, 32, 32),
-        (577, 768, 32, 32, 64),
+        (625, 768, 32, 32, 64),
         (769, 992, 16, 32, 64),
     ),
     (7168, False): (
-        (257, 272, 28, 16, 32),
-        (388, 432, 28, 16, 32),
-        (513, 544, 28, 32, 32),
-        (577, 768, 32, 32, 32),
+        (705, 768, 32, 32, 32),
         (775, 864, 28, 32, 32),
         (865, 1023, 16, 32, 32),
     ),
     (7168, True): (
-        (129, 160, 56, 16, 32),
-        (257, 272, 56, 32, 64),
-        (289, 416, 56, 32, 64),
+        (353, 416, 56, 32, 64),
         (417, 464, 16, 32, 32),
-        (513, 864, 28, 32, 64),
+        (513, 576, 28, 32, 64),
+        (641, 864, 28, 32, 64),
         (865, 1023, 16, 32, 64),
     ),
 }
