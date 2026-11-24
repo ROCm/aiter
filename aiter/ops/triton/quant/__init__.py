@@ -1,3 +1,6 @@
+from aiter.ops.triton.quant.dequant_hadamard_quant_mxfp4 import (
+    dequant_hadamard_quant_mxfp4,
+)
 from aiter.ops.triton.quant.fast_transpose import (
     fast_transpose_2d,
     transpose_packed_fp4,
@@ -17,12 +20,16 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
+    fused_rms_gated_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_dual_rmsnorm_mxfp8_quant,
     fused_flatten_mxfp8_quant,
     fused_rms_mxfp8_quant,
+)
+from aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4 import (
+    fused_quant_transpose_hadamard_mxfp4,
 )
 from aiter.ops.triton.quant.quant import (
     _mxfp4_quant_op,
@@ -59,6 +66,7 @@ __all__ = [
     # fast_transpose.py exports
     "convert_from_mxfp8",
     "convert_to_mxfp8",
+    "dequant_hadamard_quant_mxfp4",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp4_quant_blockscale",
     "dynamic_mxfp8_quant",
@@ -73,6 +81,7 @@ __all__ = [
     "fused_flatten_fp8_group_quant",
     "fused_flatten_mxfp4_quant",
     "fused_flatten_mxfp8_quant",
+    "fused_quant_transpose_hadamard_mxfp4",
     "fused_reduce_act_mul_and_mxfp4_quant",
     "fused_reduce_act_mul_fp8_group_quant",
     "fused_reduce_rms_fp8_group_quant",
@@ -81,6 +90,7 @@ __all__ = [
     "fused_rms_fp8_per_tensor_static_quant",
     "fused_rms_gated_fp8_group_quant",
     # fused_mxfp4_quant.py exports
+    "fused_rms_gated_mxfp4_quant",
     "fused_rms_mxfp4_quant",
     # fused_mxfp8_quant.py exports
     "fused_rms_mxfp8_quant",

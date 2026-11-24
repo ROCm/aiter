@@ -14,6 +14,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale_preshuffle,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 
@@ -45,20 +46,6 @@ def run_triton(impl, x, weight, w_scale, prequant, dtype=torch.bfloat16, y=None)
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
-    # GPT-OSS-120B attention projections
-    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
-    # gfx950's default config splits these K into 256-wide partitions, so the
-    # last one runs past K (K=640 -> 3 x 256)
-    x_vals += [(v, 6144, K) for v in (1, 16, 64) for K in (640, 896)]
-    return x_vals
-
-
 def generate_gemm_a16w8_blockscale_inputs(
     M: int,
     N: int,
@@ -80,9 +67,9 @@ def generate_gemm_a16w8_blockscale_inputs(
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     if layout[0] == "T":
-        x = torch.randn((M, K), dtype=torch.bfloat16).cuda() / 10
+        x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda") / 10
     else:
-        x = torch.randn((K, M), dtype=torch.bfloat16).cuda().T / 10
+        x = torch.randn((K, M), dtype=torch.bfloat16, device="cuda").T / 10
 
     if layout[1] == "N":
         weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
@@ -108,7 +95,7 @@ def generate_gemm_a16w8_blockscale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     return x, weight, weight_shuffled, w_scale, y
 
@@ -119,17 +106,17 @@ def generate_gemm_a16w8_blockscale_inputs(
         (dtype, *shape, output)
         for output in [False]
         for dtype in ["bf16"]
-        for shape in get_x_vals()
+        for shape in get_shapes()
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])
-def test_gemm(dtype, M, N, K, output, shuffle):
-    prequant = False
+@pytest.mark.parametrize("prequant", [False, True])
+def test_gemm(dtype, M, N, K, output, shuffle, prequant):
     block_shape_n, block_shape_k = block_shape
 
-    if shuffle and (N % 16 > 0 or K % 32 > 0):
+    if shuffle and (N % 16 > 0 or K % 128 > 0):
         pytest.skip(
-            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+            "N has to be multiple of 16 and K has to be multiple of 128 for preshuffle cases"
         )
 
     dtype = str_to_torch_dtype[dtype]

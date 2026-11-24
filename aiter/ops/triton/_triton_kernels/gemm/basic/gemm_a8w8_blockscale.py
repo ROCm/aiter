@@ -179,8 +179,10 @@ def _gemm_a8w8_blockscale_kernel(
             a_scale = tl.load(a_scale_ptrs)
             b_scale = tl.load(b_scale_ptrs)
 
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+            accumulator = tl.fma(
+                tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator
+            )
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -198,7 +200,7 @@ def _gemm_a8w8_blockscale_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
@@ -399,10 +401,15 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
                 .trans(1, 0)
             )
 
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
             if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
-                accumulator += tl.dot(a, b) * (a_scale * b_scale)[:, None]
+                accumulator = tl.fma(
+                    tl.dot(a, b), (a_scale * b_scale)[:, None], accumulator
+                )
             else:
-                accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
+                accumulator = tl.fma(
+                    tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator
+                )
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -423,7 +430,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

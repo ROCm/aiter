@@ -30,9 +30,12 @@ from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.plugin import route as _route
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
@@ -40,7 +43,7 @@ enable_aot_gluon_pa_mqa_logits = os.environ.get(
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
 triton_version = Version(Version(triton.__version__).base_version)
-_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250")
+_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250", "gfx1250-strict")
 if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 
@@ -324,13 +327,14 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
+    UseBufferLoad: bool = True,
     Persistent: bool = False,
     NextN: int = 1,
     ContextLenStride: int = 1,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
-    is_gfx1250 = gfx_version == "gfx1250"
+    is_gfx1250 = gfx_version in ("gfx1250", "gfx1250-strict")
     if is_gfx1250:
         if Preshuffle:
             assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
@@ -346,7 +350,19 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
-    target = GPUTarget("hip", gfx_version, warp_size)
+    # Compile for get_gfx_runtime() so gfx1250-strict never gets gfx1250-only instructions.
+    target_arch = gfx_version
+    try:
+        runtime_arch = get_gfx_runtime()
+    except (RuntimeError, KeyError):
+        runtime_arch = None
+    if (
+        runtime_arch
+        and runtime_arch != gfx_version
+        and base_gfx_arch(runtime_arch) == gfx_version
+    ):
+        target_arch = runtime_arch
+    target = GPUTarget("hip", target_arch, warp_size)
 
     # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
     # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
@@ -396,6 +412,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         fn_signature["PERSISTENT_NEXT_N"] = "constexpr"
         persistent_constexpr["PERSISTENT"] = Persistent
         persistent_constexpr["PERSISTENT_NEXT_N"] = NextN
+    if VarCtxOpt and triton_version >= Version("3.5.0"):
+        fn_signature["UseBufferLoad"] = "constexpr"
     fn_signature["ContextLenStride"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
@@ -407,7 +425,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "num_ctas": 1,
         "enable_fp_fusion": True,
         "cluster_dims": [1, 1, 1],
-        "arch": gfx_version,
+        "arch": target_arch,
         "backend_name": "hip",
         "warp_size": warp_size,
         "name": (
@@ -444,6 +462,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
             "ARCH": gfx_version,
+            **(
+                {"UseBufferLoad": UseBufferLoad}
+                if VarCtxOpt and triton_version >= Version("3.5.0")
+                else {}
+            ),
             **persistent_constexpr,
             "ContextLenStride": ContextLenStride,
         },
@@ -486,6 +509,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         )
         stride_suffix = f"_S{ContextLenStride}" if ContextLenStride != 1 else ""
         kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}{stride_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        if VarCtxOpt and triton_version >= Version("3.5.0") and not UseBufferLoad:
+            kernel_str += "_kv64"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -631,6 +656,8 @@ def deepgemm_fp8_paged_mqa_logits_persistent_schedule(
     return out
 
 
+# The public entry is the routed op. It has no backend argument.
+@_route(op="fp8_paged_mqa_logits", version=1)
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache,
@@ -644,14 +671,20 @@ def deepgemm_fp8_paged_mqa_logits(
     ChunkK: int = 256,
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
-    VarCtxSchedule: torch.Tensor = None,
+    VarCtxSchedule: torch.Tensor | None = None,
     SplitKV: int | None = None,
-    PersistentSchedule: torch.Tensor = None,
+    PersistentSchedule: torch.Tensor | None = None,
 ):
     """Compute paged FP8 decode logits, optionally using a persistent CTA table.
 
+    Writes the logits into ``out_logits`` in place. Returns the cache key of
+    the compiled Triton kernel, which only AOT tools read. A kernel plugin
+    that serves the call has no such key and returns None.
+
     Build ``PersistentSchedule`` with the same query geometry, context lengths,
     ``max_model_len`` and ``ChunkK`` using the persistent schedule helper above.
+    With ``PersistentSchedule``, the kernels read the row lengths from it and
+    not from ``context_lens``.
     The caller initializes logits outside the context to ``-inf`` as on the
     SplitKV path. Persistent AOT binaries use a separate ``_persistent`` name.
     """
@@ -691,7 +724,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 "PersistentSchedule must be contiguous int32 [NumCTAs, 4] on the query device"
             )
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         if Preshuffle and hidden_dim <= 128:
             WavePerEU = 4
         else:
@@ -699,7 +732,7 @@ def deepgemm_fp8_paged_mqa_logits(
 
     TileQCount = batch_size * next_n
     if SplitKV is None:
-        if get_gfx() == "gfx1250":
+        if get_gfx() in ("gfx1250", "gfx1250-strict"):
             SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
         else:
             # One full residency wave, with the context split evenly across it.
@@ -737,7 +770,7 @@ def deepgemm_fp8_paged_mqa_logits(
             f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
         )
         assert not (
-            KVBlockSize < 16 and get_gfx() == "gfx1250"
+            KVBlockSize < 16 and get_gfx() in ("gfx1250", "gfx1250-strict")
         ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
@@ -749,7 +782,7 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+    if VarCtxSchedule is not None and get_gfx() in ("gfx1250", "gfx1250-strict"):
         import warnings
 
         warnings.warn(
@@ -759,6 +792,8 @@ def deepgemm_fp8_paged_mqa_logits(
         VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
+    # buffer_load uses 32-bit offsets; the packed cache span covers K and scales.
+    use_buffer_load = max_addressable_bytes(kv_cache) < 2**31 - 1 if VarCtxOpt else True
     if Persistent:
         grid = (PersistentSchedule.shape[0], 1, 1)
     elif VarCtxOpt:
@@ -777,6 +812,7 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
+            UseBufferLoad=use_buffer_load,
             Persistent=Persistent,
             NextN=next_n if Persistent else 1,
             ContextLenStride=ctx_stride,
@@ -816,7 +852,11 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
-                *(() if VarCtxOpt else (Persistent, next_n if Persistent else 1)),
+                *(
+                    (use_buffer_load,)
+                    if VarCtxOpt
+                    else (Persistent, next_n if Persistent else 1)
+                ),
                 ctx_stride,
             )
         else:  #  load AOT compiled gluon kernel

@@ -25,7 +25,6 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_SPLITK",
-        "GRID_MN",
         "PREQUANT",
     ],
 )
@@ -36,8 +35,6 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
         == args["K"],
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -75,7 +72,6 @@ def _gemm_a16w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_SPLITK: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
@@ -185,10 +181,14 @@ def _gemm_a16w8_blockscale_kernel(
                 )
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator = tl.fma(
+                    tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator
+                )
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b) * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator = tl.fma(tl.dot(a, b), b_scale[None, :], accumulator)
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -208,7 +208,7 @@ def _gemm_a16w8_blockscale_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
@@ -230,7 +230,6 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_SPLITK",
-        "GRID_MN",
         "PREQUANT",
     ],
 )
@@ -241,8 +240,6 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
         == args["K"],
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -280,7 +277,6 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_SPLITK: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
@@ -428,7 +424,7 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

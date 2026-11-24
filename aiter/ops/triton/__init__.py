@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.abc
 import importlib.util
 import sys
 import warnings
@@ -12,31 +13,27 @@ try:
 except (ImportError, AttributeError):
     quant = None
 
-# Try to import comms module (requires iris)
+# Import the comms package. Its Iris-based primitives exist only when Iris is installed.
 try:
     from aiter.ops.triton import comms
+except ImportError:
+    comms = None
 
+IRIS_COMM_AVAILABLE = comms is not None and comms.IRIS_COMM_AVAILABLE
+if IRIS_COMM_AVAILABLE:
     # Re-export communication primitives at this level for convenience
     from aiter.ops.triton.comms import (  # noqa: F401  deliberate re-export for convenience
-        IRIS_COMM_AVAILABLE,
         IrisCommContext,
         all_gather,
         reduce_scatter,
         reduce_scatter_rmsnorm_quant_all_gather,
     )
 
-    _COMMS_AVAILABLE = True
-except ImportError:
-    # Iris not available - comms module won't be available
-    _COMMS_AVAILABLE = False
-    IRIS_COMM_AVAILABLE = False
-    comms = None
-
 __all__ = []
 if quant is not None:
     __all__.append("quant")
 
-if _COMMS_AVAILABLE:
+if IRIS_COMM_AVAILABLE:
     __all__.extend(
         [
             "IRIS_COMM_AVAILABLE",
@@ -181,6 +178,23 @@ def __getattr__(name):
     raise AttributeError(f"module 'aiter.ops.triton' has no attribute '{name}'")
 
 
+class _AliasLoader(importlib.abc.Loader):
+    """Gives an old module path the module that is loaded at its new path.
+
+    The module code runs only one time, so a route or custom op that the module
+    registers is not registered again under the old name.
+    """
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):
+        pass
+
+
 def _backward_compat_find_spec(fullname, path, target=None):
     """
     Handles the import of the triton module
@@ -194,10 +208,14 @@ def _backward_compat_find_spec(fullname, path, target=None):
             new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
             _warn_if_deprecated(name, new_path)
             try:
-                sys.modules[fullname] = importlib.import_module(new_path)
-                return importlib.util.find_spec(new_path)
+                module = importlib.import_module(new_path)
             except ImportError:
-                pass
+                return None
+            return importlib.util.spec_from_loader(
+                fullname,
+                _AliasLoader(module),
+                is_package=hasattr(module, "__path__"),
+            )
     return None
 
 
