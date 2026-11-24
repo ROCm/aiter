@@ -661,9 +661,12 @@ def compile_mixed_moe_gemm1_common(
                 body_lds_x_ping = lds_x_ping
                 body_b_has_full_operand = is_f8_b or shared_b
                 body_b_load_mult = 2 if body_b_has_full_operand else 1
+                # Leave only the previous half's B loads in flight. On gfx950 an
+                # A LDS-DMA can retire on vmcnt before its LDS write is visible to
+                # other waves' ds_read; also waiting for the scale loads issued
+                # after it closes that window (vmcnt one higher still races).
                 body_vmcnt_before_barrier = (
-                    tile_m // 32 // fp4_ratio
-                    + tile_n // 32 * gui_ratio * body_b_load_mult
+                    tile_n // 32 * gui_ratio * body_b_load_mult
                 )
                 expert_off_idx = expert_idx * (2 * inter_dim)
                 if const_expr(shared_b):
