@@ -15,6 +15,7 @@ node.
 | `quick_allreduce_epilogue.py` | The plain epilogue of the mesh and the ring, and the hooks every mesh or ring epilogue implements. |
 | `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
+| `quick_allreduce_pull.py` | The exact bf16 **pull** kernels of the fused Gemma all-reduce + RMSNorm on graph-registered inputs. |
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 | `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
@@ -23,7 +24,8 @@ The host classes are in `aiter/ops/flydsl/`:
 | File | Contents |
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
-| `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
+| `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring (and, fused only, the pull). |
+| `pull_allreduce_rmsnorm.py` | `PullAllReduceRMSNorm`, the engine behind `FlyQuickAllReduceRMSNorm(algorithm="pull")`. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
 | `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
@@ -246,11 +248,41 @@ a ladder of its own for a hidden size. A width without its own ladder runs the
 default, and the default one-shot ladder never splits a row. Every rank must
 read the same ladders, or the fused path declines.
 
+### Pull: exact Gemma all-reduce + RMSNorm on registered graph inputs
+
+`FlyQuickAllReduceRMSNorm(algorithm="pull")` is the third entry of
+`ALGORITHMS`, and it keeps the one host interface (`allreduce_rmsnorm`,
+`gemma_norm=True`). It is fused-only and it does not quantize: its codec is
+the identity, named `bf16`, and it is the only value `rs_codec` and `ag_codec`
+take. The engine hands the call to `PullAllReduceRMSNorm`, which has no
+inbox, ladder or super-tile.
+
+* Each rank reads the peers' inputs in place. `capture()` (entered by
+  `CustomAllreduce.capture()` and so by `graph_capture()`) gives every captured
+  call a row of an address table, and exchanges the IPC handles of the inputs
+  when the capture ends. A call outside a registered capture is declined, and
+  the next backend serves it.
+* The reducer of a row sums the four partials in fp32 in the order of AITER's
+  two-stage all-reduce (the chunk owner first, denormals flushed, one bf16
+  rounding), publishes it, and the three other ranks pull it. The norm follows
+  `gemma_add_rmsnorm`: Triton's `tl.sum` order and `y = s * rstd * (1 + w)`.
+  `residual_out` therefore equals the two-stage kernel's, except a rare fp32
+  summation-order difference; `out` differs from an fp32 reference by at most
+  one bf16 ulp, at rounding ties.
+* Tiers by rows, for hidden 6144 at TP4 on gfx950: 1-11 one-shot with read
+  acks, 12-287 one row per workgroup (block hand-offs, wave hand-offs from 37
+  to 96 and above 256), 288-640 streamed (2 rows per workgroup, 4 from 481).
+* `CustomAllreduce` builds it when `AITER_FLY_AR=1`, and
+  `CudaCommunicator.fused_allreduce_rmsnorm` tries it first for `gemma_norm`
+  calls. `AITER_FLY_AR_PULL=1` builds it without the rest of the FlyDSL
+  all-reduce, and `AITER_FLY_AR_PULL=0` switches it off. Every rank must set
+  these alike.
+
 The fused path declines a call if:
 
 * a tensor is not bf16, not contiguous, or not 16-byte aligned,
 * the caller asks for gemma norm or a padded output (the quick-reduce
-  classes themselves accept `gemma_norm`; the dispatcher does not route it),
+  classes themselves accept `gemma_norm`; the dispatcher routes it only to the pull schedule above),
 * no build exists for the hidden size. One workgroup covers one row, so only
   some widths are supported, some of them with padding.
 

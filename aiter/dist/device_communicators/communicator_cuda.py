@@ -486,6 +486,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         qr_comm = self.qr_comm
 
+        # Gemma on the exact bf16 pull schedule (AITER_FLY_AR_PULL=1): graph
+        # captures entered through ``capture()`` only; any other call falls
+        # through to the paths below.
+        if (
+            gemma_norm
+            and not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_fly_pull_rmsnorm(input_, res_inp_, weight_)
+        ):
+            return ca_comm.fly_pull_rmsnorm(input_, res_inp_, weight_, eps)
+
         # FlyDSL fused first when enabled. Try first the quantized kernels,
         # then exact one-shot.
         if (
