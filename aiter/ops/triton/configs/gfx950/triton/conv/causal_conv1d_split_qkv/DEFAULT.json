@@ -1,0 +1,18 @@
+{
+    "M_LEQ_2048": {
+        "R": 4,
+        "BC": 4,
+        "BD": 256,
+        "ORDER": 2,
+        "SEQ_VEC": 256,
+        "num_warps": 2
+    },
+    "any": {
+        "R": 4,
+        "BC": 8,
+        "BD": 512,
+        "ORDER": 2,
+        "SEQ_VEC": 256,
+        "num_warps": 4
+    }
+}
