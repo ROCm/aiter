@@ -341,7 +341,9 @@ def compile_tdm_compact_plan(
     the run's piece (this rank's segment clipped to the run's destination
     tile). The launcher takes one more pointer, ``addr_tile_src``
     (``compact_tile_capacity`` i32): for each of THIS rank's m-tiles,
-    ``tile_info = srcmask | expert << 8 | rows << 16``. ``srcmask`` is the
+    ``tile_info = srcmask | expert << 8 | rows << 16`` for ``npes <= 8``.
+    For ``npes > 8`` the mask takes 16 bits and rows move to the top byte:
+    ``srcmask | expert << 16 | rows << 24``, with ``rows <= 127``. ``srcmask`` is the
     bitmask of the sources with at least one row in it, which is the set of
     per-(tile, source) flags a GEMM1 item waits for; ``expert`` the local
     expert owning the tile and ``rows`` its valid rows (``min(tile_m, end -
@@ -1382,10 +1384,15 @@ def compile_tdm_compact_plan(
                                         _imax(bnd[src], lo) < _imin(bnd[src + 1], hi)
                                     ).select(fx.Int32(1 << src), fx.Int32(0))
                                 )
+                            # npes<=8: srcmask[7:0] | expert[15:8] | rows[31:16].
+                            # npes>8: srcmask[15:0] | expert[23:16] | rows[31:24].
                             buffer_store(
                                 mask
-                                | (e_t << fx.Int32(8))
-                                | (_imax(hi - lo, fx.Int32(0)) << fx.Int32(16)),
+                                | (e_t << fx.Int32(16 if int(npes) > 8 else 8))
+                                | (
+                                    _imax(hi - lo, fx.Int32(0))
+                                    << fx.Int32(24 if int(npes) > 8 else 16)
+                                ),
                                 rsrc_tsrc,
                                 t,
                             )
