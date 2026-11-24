@@ -58,6 +58,7 @@ is timed with such keys stripped (the record lists them as `dropped_keys`).
 ## The search space
 
 `SEARCH_SPACE` is always swept in full: the cartesian product of its lists for the discovered keys,
+minus the vector tiles (`BLOCK_SIZE_M/N` below 8, swept only for a kernel with `vector_tiles=True`),
 minus shape filters (block sizes above the next power of two of the dimension, `NUM_KSPLIT` values
 that do not divide K), the generic rules in `space.py` (the old split-K pruning rules, applied only
 when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)

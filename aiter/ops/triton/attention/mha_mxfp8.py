@@ -81,7 +81,7 @@ def mha_fwd(
     """
 
     arch = get_arch()
-    assert arch == "gfx1250", "Only supported on gfx1250"
+    assert arch in ("gfx1250", "gfx1250-strict"), "Only supported on the gfx1250 family"
 
     for t, name in zip((q, k, v), ("q", "k", "v")):
         assert t.dtype == torch.float8_e4m3fn, f"{name} must be float8_e4m3fn"

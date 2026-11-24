@@ -16,10 +16,12 @@ import torch.distributed as dist
 
 from aiter import logger
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import perftest
 
 set_start_method("spawn", force=True)
 
+SUPPORTED_GFX = ["gfx1250"]
 _INIT_TIMEOUT_SEC = 120
 _CASE_TIMEOUT_SEC = 10
 
@@ -95,6 +97,10 @@ def _sync_sweep(
     ca_comm = get_tp_group().device_communicator.ca_comm
     if ca_comm is None or ca_comm.disabled:
         raise RuntimeError("Custom allreduce not initialized")
+    # The *_sync_latency_gfx1250 ops cast _ptr to the gfx1250 CustomAllreduce;
+    # the old-arch one (e.g. AITER_CUSTOM_AR_DISABLE_GFX1250=1) would fault the GPU.
+    if not ca_comm._is_gfx1250:
+        raise RuntimeError("sync latency ops need the gfx1250 custom allreduce")
 
     results = []
     for grid, kernel in cases:
@@ -160,6 +166,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     tp_size = args.tp_size
 
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        logger.warning(
+            "gfx1250 sync latency sweep unsupported on %s; skipping",
+            get_gfx_runtime(),
+        )
+        sys.exit(0)
+
     num_gpus = torch.cuda.device_count()
     if num_gpus < tp_size:
         logger.error("Need %d GPUs, have %d", tp_size, num_gpus)
@@ -175,10 +188,12 @@ if __name__ == "__main__":
         per_rank = [["sweep failed"] * len(cases)]
 
     row_by_grid = {grid: {"grid": grid} for grid in _GRIDS}
+    failed = False
     for i, (grid, kernel) in enumerate(cases):
         rank_results = [results[i] for results in per_rank]
         failures = [r for r in rank_results if isinstance(r, str)]
         if failures:
+            failed = True
             print(failures[0], file=sys.stderr)
             logger.error("grid=%d kernel=%s FAILED", grid, kernel)
             latency_us = float("nan")
@@ -201,3 +216,5 @@ if __name__ == "__main__":
             f"{r['two_sync']:>14.2f}"
         )
     print(sep)
+    if failed:
+        sys.exit(1)
