@@ -893,6 +893,20 @@ def _grouped_a8w4_tdm_moe(
             contiguous_m = min(_compact_rows, contiguous_m)
         max_m = contiguous_m
 
+    # Compact GEMM1 reads the original pitched wire; only its quantized output
+    # adopts GEMM2's native M16/K32 payload layout. Keep unsupported shapes on
+    # the existing compact output layout.
+    a2_preshuffled = a_preshuffled or bool(
+        _compact
+        and _a_preshuffle_requested
+        and inter_dim % 128 == 0
+        and tile_n % 64 == 0
+        and tile_m % 16 == 0
+        and tile_m2 % 16 == 0
+        and tile_k2 % 128 == 0
+        and contiguous_m % 16 == 0
+    )
+
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
     # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
     # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
@@ -918,6 +932,9 @@ def _grouped_a8w4_tdm_moe(
     _fused_tp_route = (
         not herd_topk
         and not _compact
+        # APRE quantization consumes the inverse row_to_token map. This fused
+        # helper only builds topids_to_rows; the ordinary remapper fills both.
+        and not a_preshuffled
         and not _is_ep
         and not enable_ep_scatter
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
@@ -1403,6 +1420,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             stage1_quant_out=1,
+            quant_payload_preshuffled=int(a2_preshuffled),
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
@@ -1474,7 +1492,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
-            payload_preshuffled=a_preshuffled,
+            payload_preshuffled=a2_preshuffled,
             **_a2_activation_kw,
         )
 
@@ -1499,7 +1517,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
-        a_preshuffled=int(a_preshuffled),
+        a_preshuffled=int(a2_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1555,7 +1573,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
-                        payload_preshuffled=a_preshuffled,
+                        payload_preshuffled=a2_preshuffled,
                         **_a2_activation_kw,
                     ),
                 )
@@ -1589,6 +1607,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         stage1_quant_out=1,
+                        quant_payload_preshuffled=int(a2_preshuffled),
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
@@ -1672,7 +1691,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
-                    a_preshuffled=int(a_preshuffled),
+                    a_preshuffled=int(a2_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -1923,6 +1942,22 @@ def grouped_gemm_gfx1250_a8w4(
         quant_type=quant_type,
         ep_fused=stage2_scatter is not None,
     )
+    if _cctx is not None and _cctx.compact_layout:
+        from .kernels.mega_moe_gfx1250.s1f_ctl import s1f_prefill_config
+
+        tuned = s1f_prefill_config(
+            hidden_dim=model_dim,
+            inter_dim=inter_dim,
+            experts_per_rank=E,
+            topk=topk,
+            world_size=_cctx.world_size,
+            recv_bound=_csv_tokens,
+            dispatch_wire="fp4" if is_grouped_a4w4 else "fp8",
+            stage1_fused=_cctx.stage1_gemm1 is not None,
+            activation=activation,
+        )
+        if tuned is not None and dtype == dtypes.bf16:
+            cfg_row = tuned
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
