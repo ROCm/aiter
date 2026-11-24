@@ -363,13 +363,14 @@ def test_mla_decode_fwd(
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         # gfx1250 -> Gluon
         # gfx950 -> Triton
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
+        if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
             pytest.skip(f"NVFP4 requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 requires shuffled KV cache")
@@ -513,7 +514,7 @@ def test_mla_decode_fwd(
 def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
     monkeypatch, output_kind: str, num_kv_heads: int
 ):
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("LDS pipeline requires gfx1250")
 
     import aiter.ops.triton.attention.mla as mla_module
@@ -666,7 +667,7 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
 def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
     monkeypatch, kv_lora_rank, block_size, dtype
 ):
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
     import aiter.ops.triton.attention.mla as mla_module
