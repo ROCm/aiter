@@ -248,6 +248,16 @@ python -m op_tests.op_benchmarks.triton.bench_conv2d --model resnet50
 python -m op_tests.op_benchmarks.triton.bench_conv2d --model "FLUX.2-klein-9B" --miopen-solvers
 ```
 
+For grouped layers, use `--model resnext50_32x4d`, `mobilenet_v2`,
+`convnext_tiny`, or `synthetic-grouped-conv2d`. Each sweep uses the group
+count and bias setting in the shape record. Older records default to one
+group and a bias. Use `--groups` to set the group count on the command line.
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv2d \
+    --model mobilenet_v2 --layout nhwc --end-to-end
+```
+
 **Edge-case smoke sweep** (degenerate paths: `C=1`, dilation>1, asymmetric dims —
 NOT representative of production):
 
