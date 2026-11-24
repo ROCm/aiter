@@ -682,5 +682,42 @@ def test_mesh_rejects_two_different_laps():
         _resolve("mesh", 8, rs="int6", ag="int4")
 
 
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_pull_has_only_the_identity_wire_format(world_size):
+    """The pull schedule moves bf16 rows in place: its one codec is ``bf16``,
+    and it is the default whether or not the caller names it."""
+    assert _resolve("pull", world_size) == ("bf16", "bf16")
+    assert _resolve("pull", world_size, rs="bf16") == ("bf16", "bf16")
+    assert _resolve("pull", world_size, ag="bf16") == ("bf16", "bf16")
+
+
+@pytest.mark.parametrize("codec", ("int4", "int5", "int6", "fp16"))
+def test_pull_rejects_a_quantizing_codec(codec):
+    # one wire format: naming either lap pins both
+    with pytest.raises(ValueError, match="must be one of"):
+        _resolve("pull", 4, rs=codec)
+    with pytest.raises(ValueError, match="must be one of"):
+        _resolve("pull", 4, ag=codec)
+
+
+@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
+def test_quantized_schedules_reject_the_identity_codec(algorithm):
+    with pytest.raises(ValueError, match="rs_codec"):
+        _resolve(algorithm, 4, rs="bf16")
+
+
+def test_pull_is_a_fused_only_registered_schedule():
+    from aiter.ops.flydsl import quick_allreduce as host
+
+    algo = host.ALGORITHMS["pull"]
+    assert algo.registered and algo.build is None and algo.super_tiles == ()
+    assert not any(a.registered for n, a in host.ALGORITHMS.items() if n != "pull")
+    # The plain all-reduce has no pull kernel; it refuses before touching a group.
+    with pytest.raises(ValueError, match="fused-only"):
+        host.FlyQuickAllReduce(
+            group=None, device=None, rank=0, world_size=4, algorithm="pull"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

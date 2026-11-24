@@ -120,6 +120,10 @@ SUPER_TILES = (1, 8)
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
+# The pull schedule moves bf16 rows as they are: its one "wire format" is the
+# identity, so it has no quantization to choose.
+PULL_CODECS = ("bf16",)
+
 # Ring algorithm.
 #
 # Super-tile values the ring accepts.
@@ -165,6 +169,7 @@ RS_INT6_MIN_WORLD = 4
 _TWO_SHOT_CODECS = {
     "mesh": (MESH_CODECS, MESH_CODECS),
     "ring": (RS_CODECS, AG_CODECS),
+    "pull": (PULL_CODECS, PULL_CODECS),
 }
 
 
