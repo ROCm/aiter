@@ -65,6 +65,14 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     unit_scale,
     xlane4,
 )
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_select import (
+    CAND_DWORDS,
+    SEL_DWORDS,
+    SELECT_BLOCKS,
+    TMP_DWORDS,
+    first_window,
+    row_top16_prologue,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_copy_load,
@@ -93,7 +101,7 @@ def _atomic_add(addr_i64, value):
     )
 
 
-def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
+def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g, k_cache=NT):
     """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` returns a page as three
     buffer tensors (4-, 2- and 1-dword units) and ``load_k`` / ``load_v`` read this lane's
     share of its K / V side as raw dwords:
@@ -134,7 +142,7 @@ def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     def load_k(pr):
         raw = []
         for st in range_constexpr(2):
-            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=NT)
+            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=k_cache)
             raw += [kd[i] for i in range_constexpr(4)]
         raw.append(fx.Int32(buf_copy_load(pr[2], k_scale_load)))
         return raw
@@ -167,20 +175,33 @@ def compile_decode(
     topk: int = 16,
     xcds: int = 0,
     late_v: bool = False,
+    select: bool = False,
+    pins: bool = False,
 ):
     """Build the decode kernel for ``splits`` workgroups per (row, kv head). ``late_v`` issues
     the next page's V loads after the QK of the page in hand instead of together with its K
     loads: fewer bytes in flight, which pays when several
-    workgroups share a CU."""
+    workgroups share a CU.
+
+    ``select`` makes every workgroup pick its row's top-``topk`` (16) blocks from the fp32
+    index scores ``arg_score`` first (``sparse_pa_nvfp4_select``), store them to
+    ``topk_idx`` (every split of a row stores the same bytes) and attend over them: the
+    scorer -> selector -> attention chain loses its selector launch. ``pins`` also forces
+    the ``init_blocks`` leading / ``local_blocks`` trailing blocks in, as
+    ``topk_per_row_small_k`` does."""
     require(1 <= topk <= 64, f"topk must be in [1, 64], got {topk}")
     require(1 <= splits <= topk, f"splits must be in [1, topk = {topk}], got {splits}")
     SPLITS, TOPK, XCDS, LATE_V = splits, topk, xcds, late_v
+    SELECT, PINS = select, pins
+    K_CACHE = 0 if select else NT
+    require(not select or topk == 16, "the in-kernel selection picks the top 16")
     # Split partials need sc1 unless all splits of a row run on one XCD.
     PART_SCOPE = 0 if XCDS else SC1
     name = (
         f"m3_nvfp4_sparse_pa_decode_k{TOPK}_s{SPLITS}"
         + (f"_x{XCDS}" if XCDS else "")
         + ("_lv" if late_v else "")
+        + (("_selp" if pins else "_sel") if select else "")
     )
 
     @fx.struct
@@ -188,6 +209,11 @@ def compile_decode(
         o: fx.Array[fx.Int32, NW * NDT * 64 * 4, 16]
         ml: fx.Array[fx.Float32, NW * 2 * 64]
         ticket: fx.Array[fx.Int32, 4]
+        if SELECT:
+            # the selection's candidates, running top 16 and scratch
+            cand: fx.Array[fx.Int32, CAND_DWORDS, 16]
+            sel: fx.Array[fx.Int32, SEL_DWORDS, 16]
+            tmp: fx.Array[fx.Int32, TMP_DWORDS, 16]
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -212,6 +238,12 @@ def compile_decode(
         i64_part_bytes: fx.Int64,
         i32_page_byte: fx.Int32,
         f32_c: fx.Float32,  # sm_scale * log2(e)
+        arg_score: fx.Int64,  # select: [Hkv, rows, width] fp32 index scores
+        i64_s_head: fx.Int64,  # their strides over kv heads and rows (elements)
+        i64_s_row: fx.Int64,
+        i32_width: fx.Int32,  # their readable columns per row
+        i32_init: fx.Int32,  # pins: leading / trailing blocks forced in
+        i32_local: fx.Int32,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
@@ -242,23 +274,71 @@ def compile_decode(
         else:
             row, kvh, zz = fx.block_idx.x, fx.block_idx.y, fx.block_idx.z
             row_ok = row < i32_rows
+        if const_expr(SELECT):
+            # The row's first window of scores goes out before its length is known.
+            pre = first_window(
+                tx,
+                arg_score + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                i32_width,
+            )
         req = row // i32_ql
         pos = fx.Int32(seq_p[req]) - i32_ql + row % i32_ql
+        live_blocks = ((pos >= 0).select(pos, fx.Int32(-1)) + BLK) // BLK  # before row_ok
         pos = row_ok.select(pos, fx.Int32(-1))
         pos = (pos >= 0).select(pos, fx.Int32(-1))  # padding row: sees nothing
         pos = fx.Int32(fx.rocdl.readfirstlane(T.i32, pos))
         req = fx.Int32(fx.rocdl.readfirstlane(T.i32, req))
         self_blk = (pos >= 0).select(pos // BLK, fx.Int32(-1))
 
+        def load_q():
+            # Q does not wait for the ids: the selecting variant loads it under the selection.
+            qr = ptr_buf_tensor(
+                arg_q,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * (D * 2),
+            )
+            head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
+            q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
+            qf = [
+                bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
+                for ks in range_constexpr(NKS)
+            ]
+            return qf
+
+        if const_expr(SELECT):
+            qf = load_q()
+
         # Lane = top-k slot: its block id, the page behind it, and validity.
         slot_ok = lane < TOPK
-        blk = fx.Int32(
-            topk[
-                kvh * i32_topk_hs
-                + row * i32_topk_rs
-                + slot_ok.select(lane, fx.Int32(0))
-            ]
-        )
+        if const_expr(SELECT):
+            # The row's top 16 from its scores, stored where the unfused chain's selector
+            # stores them (padding units redo row 0's: the same bytes).
+            id_row = arg_topk + fx.Int64(kvh * i32_topk_hs + row * i32_topk_rs) * 4
+            row_top16_prologue(
+                tx,
+                arg_score + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                i32_width,
+                pre,
+                live_blocks,
+                i32_init,
+                i32_local,
+                PINS,
+                smem.cand.ptr,
+                smem.sel.ptr,
+                smem.tmp.ptr,
+                id_row,
+            )
+            blk = fx.Int32(smem.tmp.ptr[lane % TOPK])
+        else:
+            blk = fx.Int32(
+                topk[
+                    kvh * i32_topk_hs
+                    + row * i32_topk_rs
+                    + slot_ok.select(lane, fx.Int32(0))
+                ]
+            )
         ok = slot_ok & (blk >= 0) & (blk <= self_blk)
         # A slot that is not valid does not read the table (it may have no columns): its
         # lane loads the first request length instead, which is discarded.
@@ -281,22 +361,13 @@ def compile_decode(
         # The row's offset inside its tail block, relative to this wave's first key: the keys
         # of the tail block past it are masked.
         lim = pos % BLK - w * KPW
-        qr = ptr_buf_tensor(
-            arg_q,
-            fx.Int32,
-            unit_elems=4,
-            unit_stride=1,
-            num_records_bytes=i32_rows * i32_H * (D * 2),
-        )
-        head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
-        q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
-        qf = [
-            bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
-            for ks in range_constexpr(NKS)
-        ]
+        if const_expr(not SELECT):
+            qf = load_q()
 
+        # The selecting variant leaves K cacheable: measured faster with the selection's
+        # latency chain in front (the plain variant keeps streaming K).
         open_page, load_k, load_v = _page_loader(
-            arg_cache, i32_page_byte, kvh, i32_hkv, w, n, g
+            arg_cache, i32_page_byte, kvh, i32_hkv, w, n, g, K_CACHE
         )
         zero4 = Vec.filled(4, 0.0, fx.Float32)
         key_off = [
@@ -616,6 +687,12 @@ def compile_decode(
         i32_bt_s: fx.Int32,
         i32_page_b: fx.Int32,
         f32_c: fx.Float32,
+        arg_score: fx.Int64,
+        i64_s_head: fx.Int64,
+        i64_s_row: fx.Int64,
+        i32_width: fx.Int32,
+        i32_init: fx.Int32,
+        i32_local: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
@@ -640,6 +717,12 @@ def compile_decode(
             i64_part_bytes,
             i32_page_b,
             f32_c,
+            arg_score,
+            i64_s_head,
+            i64_s_row,
+            i32_width,
+            i32_init,
+            i32_local,
         ).launch(
             grid=(i32_grid_x, 1 if XCDS else i32_hkv, 1 if XCDS else SPLITS),
             block=(64 * NW, 1, 1),
@@ -655,10 +738,18 @@ def compile_decode(
 # host side
 # ---------------------------------------------------------------------------
 @functools.cache
-def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: int):
+def _get_kernel(
+    splits: int,
+    topk: int,
+    xcds: int,
+    late_v: bool,
+    select: bool,
+    pins: bool,
+    device_index: int,
+):
     # device_index only keys the cache: the launcher memoises its compiled handle, which
     # is bound to the device it was compiled on.
-    return compile_decode(splits, topk, xcds, late_v)
+    return compile_decode(splits, topk, xcds, late_v, select, pins)
 
 
 class DecodeWorkspace(NamedTuple):
@@ -747,11 +838,25 @@ def sparse_pa_nvfp4_decode(
     xcds: int | None = None,
     late_v: bool | None = None,
     workspace: DecodeWorkspace | None = None,  # from sparse_pa_nvfp4_decode_alloc
+    index_score: torch.Tensor | None = None,  # [Hkv, >= rows, width] fp32 block scores
+    index_max_seq_len: int | None = None,  # bound of seq_lens when ``index_score`` is given
+    init_blocks: int = 0,  # ``index_score``: leading blocks forced into the selection
+    local_blocks: int = 0,  # ``index_score``: trailing blocks forced in (outrank the leading)
 ) -> torch.Tensor:
     """Row i is query token i % query_len of request i // query_len and attends to
     the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
     be distinct (a selector emits every block once): the kernel attends once per slot,
     so a repeated id would be counted twice.
+
+    With ``index_score`` (the fp32 score rows of an index scorer; only the columns of a
+    row's live blocks are read) the kernel selects each row's top-16 blocks itself
+    (``sparse_pa_nvfp4_select``: descending score, ties to the larger block, NaN on top,
+    pins as ``topk_per_row_small_k``) and ``topk_idx`` is its OUTPUT, written with those ids
+    (-1 past the live count) for a later layer that reuses them. This replaces a selector
+    launch between the scorer and this kernel; ``decode_select_supported`` says where it
+    pays. ``index_max_seq_len`` bounds every ``seq_lens`` entry (``index_score`` must hold
+    that many blocks per row) and ``topk`` must be 16. Rows of up to ``SELECT_BLOCKS`` live
+    blocks (229K tokens) take the one-window selection, longer ones a windowed loop.
 
     gfx950 only. Every operand must be on ``q``'s device and ``sm_scale`` must be finite
     and positive.
@@ -789,6 +894,34 @@ def sparse_pa_nvfp4_decode(
     rows = q.shape[0]
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
+    select = index_score is not None
+    if select:
+        require(topk == 16, "the in-kernel selection picks 16 blocks: topk_idx [Hkv, rows, 16]")
+        require(
+            index_max_seq_len is not None and index_max_seq_len > 0,
+            "index_max_seq_len (the bound of seq_lens) is required with index_score",
+        )
+        require(
+            index_score.dtype == torch.float32
+            and index_score.dim() == 3
+            and index_score.shape[0] == hkv
+            and index_score.shape[1] >= rows
+            and index_score.stride(2) == 1
+            and index_score.device == q.device
+            and index_score.data_ptr() % 4 == 0,
+            "index_score must be fp32 [Hkv, >= rows, width] with a unit last stride, on q's device",
+        )
+        require(
+            index_score.shape[2] >= -(-index_max_seq_len // BLK)
+            and (hkv - 1) * index_score.stride(0) + rows * index_score.stride(1) < 2**31,
+            "index_score must cover every live block and keep its offsets below 2**31",
+        )
+        require(init_blocks >= 0 and local_blocks >= 0, "pins must be >= 0")
+    else:
+        require(
+            index_max_seq_len is None and not init_blocks and not local_blocks,
+            "index_max_seq_len and the pins are for index_score",
+        )
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
@@ -814,6 +947,9 @@ def sparse_pa_nvfp4_decode(
         splits = 1
         if rows * hkv <= MAX_SPLIT_ROWS:
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
+            if select:
+                # every split repeats the selection, and 4 reproduces amd-kernels' schedule bit for bit
+                splits = min(splits, 4)
     require(1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]")
     require(
         splits == 1 or rows * hkv <= MAX_SPLIT_ROWS,
@@ -869,9 +1005,19 @@ def sparse_pa_nvfp4_decode(
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:
         grid_x = rows
+    pins = bool(init_blocks or local_blocks)
+    if select:
+        score, s_head, s_row, width = (
+            index_score.data_ptr(),
+            index_score.stride(0),
+            index_score.stride(1),
+            index_score.shape[2],
+        )
+    else:  # placeholders the unfused kernel never reads
+        score, s_head, s_row, width = topk_idx.data_ptr(), 0, 0, 0
     with torch.cuda.device(q.device):
         _run_compiled(
-            _get_kernel(splits, topk, xcds, late_v, dev),
+            _get_kernel(splits, topk, xcds, late_v, select, pins, dev),
             q.data_ptr(),
             kv_cache.data_ptr(),
             topk_idx.data_ptr(),
@@ -894,6 +1040,21 @@ def sparse_pa_nvfp4_decode(
             block_table.stride(0),
             kv_cache.stride(0),
             c,
+            score,
+            s_head,
+            s_row,
+            width,
+            init_blocks,
+            local_blocks,
             torch.cuda.current_stream(q.device),
         )
     return out
+
+
+SELECT_MAX_ROWS = 256  # decode rows the in-kernel selection was measured to pay at
+
+
+def decode_select_supported(rows: int, topk: int = 16) -> bool:
+    """Whether ``sparse_pa_nvfp4_decode(index_score=...)`` should replace a selector launch
+    for ``rows`` decode rows: the row counts it was measured to pay at."""
+    return topk == 16 and 1 <= rows <= SELECT_MAX_ROWS
