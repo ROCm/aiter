@@ -46,8 +46,11 @@ sharing a line serialize their atomics and polls on it, which cost the merge
 chain up to 6 us a launch.
 
 * ``ROW_COUNT`` line ``row``: partials landed a row; the merging CTA zeroes it.
-* ``ROWS_DONE`` line ``parity``: rows published this launch. A launch uses the parity
-  of its epoch and zeroes the other one for the next launch.
+* ``ROWS_DONE`` line ``parity * ROW_GROUPS + row / 16``: rows of a 16-row
+  group published this launch. A launch uses the parity of its epoch and zeroes
+  the other one for the next launch. One counter for every row would take
+  every merge's atomic and every tile CTA's poll on one line: on gfx950 at 64
+  to 128 rows that delays the last row's visibility by about 3 us.
 * ``TASK_CLAIM`` line ``parity``: attention tasks past each CTA's first,
   claimed this launch (when there are more tasks than CTAs), the same way: a
   CU whose CTAs run alone takes more of them.
@@ -111,8 +114,9 @@ PASS_ROWS = WAVE
 # is read and written once a launch, so those share lines).
 SYNC_LINE = 32
 ROW_COUNT = 0
+ROW_GROUPS = MAX_ROWS // 16
 ROWS_DONE = MAX_ROWS * SYNC_LINE
-TILE_CLAIM = ROWS_DONE + 2 * SYNC_LINE
+TILE_CLAIM = ROWS_DONE + 2 * ROW_GROUPS * SYNC_LINE
 TASK_CLAIM = TILE_CLAIM + 2 * SYNC_LINE
 EPOCH = TASK_CLAIM + 2 * SYNC_LINE
 # ``trace`` int64 stamps a CTA: start, phases 1-2 done, rows ready, phase 3
@@ -134,6 +138,35 @@ INBOX_BUFFERS = 2
 # Every inbox byte starts as 0xFF: bf16 NaN 0xFFFF, the one-shot all-reduce's
 # sentinel (a sender rewrites its own 0xFFFF to 0x7FFF, still NaN).
 SENTINEL_FILL_BYTE = 0xFF
+
+
+def default_block_n(
+    *,
+    hidden: int,
+    max_rows: int,
+    world_size: int,
+    num_compute_units: int,
+    two_shot: bool,
+) -> int:
+    """o_proj tile width: the first of the preferred widths that splits
+    ``hidden`` (over the ranks too, for two-shot).
+
+    48 was tuned on gfx942's 80 CUs. On 256 CUs (gfx950, MI355X TP4, hidden
+    6144) 64 is as fast or faster up to 64 rows and 32 above (two 64-row
+    passes: smaller tiles start the first pass's push earlier).
+    """
+    if num_compute_units >= 256:
+        preferred = (64, 48, 32) if max_rows <= 64 else (32, 48, 64)
+    else:
+        preferred = (48, 64, 32)
+    for block_n in (*preferred, 96, 16):
+        n_tiles = hidden // block_n
+        if hidden % block_n == 0 and (
+            not (two_shot and world_size > 1)
+            or (n_tiles % world_size == 0 and (hidden // world_size) % ATOM_COLS == 0)
+        ):
+            return block_n
+    return preferred[0]
 
 
 def sync_words(grid: int) -> int:
@@ -360,7 +393,7 @@ def compile_mega_paged_attention(
     hidden: int,
     world_size: int = 1,
     rank: int = 0,
-    block_n: int = 48,
+    block_n: int | None = None,
     prefetch: int | None = None,
     occupancy: int = 1,
     two_shot: bool = True,
@@ -369,7 +402,8 @@ def compile_mega_paged_attention(
 ):
     """Build the mega paged attention launcher for one rank of ``world_size``.
 
-    ``hidden`` is o_proj's N (the model width), ``block_n`` its tile width and
+    ``hidden`` is o_proj's N (the model width), ``block_n`` its tile width
+    (``None``: ``default_block_n``) and
     ``prefetch`` how many K steps of x a wave keeps in flight (its W slice is
     loaded whole, as soon as the tile is claimed); ``None`` takes every step
     when the registers allow and four otherwise.
@@ -379,6 +413,14 @@ def compile_mega_paged_attention(
     ``trace`` records each CTA's phase boundaries (``s_memrealtime``) in
     ``trace[block * TRACE_STAMPS + point]``.
     """
+    if block_n is None:
+        block_n = default_block_n(
+            hidden=hidden,
+            max_rows=max_rows,
+            world_size=world_size,
+            num_compute_units=num_compute_units,
+            two_shot=two_shot,
+        )
     if max_rows > MAX_ROWS or max_rows % 16:
         raise ValueError(
             f"max_rows must be a multiple of 16 up to {MAX_ROWS}, got {max_rows}"
@@ -483,6 +525,8 @@ def compile_mega_paged_attention(
     # The planner's rows: a wave lane holds ``lane_rows`` consecutive ones.
     lane_rows = -(-max_rows // WAVE)
     plan_rows = lane_rows * WAVE
+    # The ``ROWS_DONE`` row groups this build counts.
+    row_groups = max_rows // 16
 
     @fx.struct
     class MegaStorage:
@@ -742,13 +786,18 @@ def compile_mega_paged_attention(
             )
 
     @flyc.jit
-    def _publish_row(sync_ptr, rows_done, tid):
-        """Count one published row once every thread's x stores have landed."""
+    def _publish_row(sync_ptr, rows_done, row, tid):
+        """Count one published row in its group once every thread's x stores
+        have landed."""
         rocdl.s_waitcnt(vmcnt=0)
         fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
         gpu.barrier()
         if tid == 0:
-            fx.atomic_add(_i32_ptr(sync_ptr, rows_done), fx.Int32(1), syncscope="agent")
+            fx.atomic_add(
+                _i32_ptr(sync_ptr, rows_done + (row // 16) * SYNC_LINE),
+                fx.Int32(1),
+                syncscope="agent",
+            )
 
     @flyc.jit
     def _land_partial(
@@ -808,7 +857,7 @@ def compile_mega_paged_attention(
                 fx.ptr_store(
                     fx.Int32(0), _i32_ptr(sync_ptr, ROW_COUNT + row * SYNC_LINE)
                 )
-            _publish_row(sync_ptr, rows_done, tid)
+            _publish_row(sync_ptr, rows_done, row, tid)
             t4 = _now()
             if const_expr(trace):
                 _stamp_value(trace_ptr, bid, 16, t1 - t0, tid)
@@ -830,7 +879,7 @@ def compile_mega_paged_attention(
                         fx.Float32(AMAX_FLOOR / fp8_max),
                         fx.add_offset(fx.recast_iter(fx.Float32, x_scale_ptr), row),
                     )
-                _publish_row(sync_ptr, rows_done, tid)
+                _publish_row(sync_ptr, rows_done, row, tid)
 
     @flyc.jit
     def _stamp(trace_ptr, bid, point, tid):
@@ -868,12 +917,17 @@ def compile_mega_paged_attention(
 
     @flyc.jit
     def _wait_rows(sync_ptr, rows_done, num_rows, tid):
-        """Phase 3 entry: every row of this launch is published as x."""
-        if tid == 0:
-            done = _load_agent(sync_ptr, rows_done)
-            while done < num_rows:
+        """Phase 3 entry: every row of this launch is published as x. Lane g of
+        wave 0 waits for row group g."""
+        if tid < row_groups:
+            need = num_rows - tid * 16
+            need = (need < 16).select(need, fx.Int32(16))
+            need = (need > 0).select(need, fx.Int32(0))
+            line = rows_done + tid * SYNC_LINE
+            done = _load_agent(sync_ptr, line)
+            while done < need:
                 rocdl.s_sleep(1)
-                done = _load_agent(sync_ptr, rows_done)
+                done = _load_agent(sync_ptr, line)
         gpu.barrier()
         # x is uncached and read past the caches: order the loads only.
         fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
@@ -1015,9 +1069,22 @@ def compile_mega_paged_attention(
         )
 
     def _rs_off(buf, src, row, col_local):
-        """Two-shot: a source rank's partial of this rank's column slice."""
+        """Two-shot: a source rank's partial of this rank's column slice,
+        tile-major (``[tile][row][block_n]``): a tile's pass reaches the peer
+        as one contiguous run, where row-major would be ``block_n`` x 2 B
+        pieces ``slice_cols`` x 2 B apart."""
+        tile_local = col_local // block_n
+        within = col_local - tile_local * block_n
         return fx.Int64(
-            (((buf * world_size + src) * max_rows + row) * slice_cols + col_local) * 2
+            (
+                (
+                    ((buf * world_size + src) * tiles_per_rank + tile_local) * max_rows
+                    + row
+                )
+                * block_n
+                + within
+            )
+            * 2
         )
 
     def _ag_off(buf, row, col):
@@ -1390,13 +1457,20 @@ def compile_mega_paged_attention(
         lengths = _load_lengths(context_ptr, num_rows, tid)
         epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, EPOCH + bid)))
         parity = epoch & 1
-        rows_done = ROWS_DONE + parity * SYNC_LINE
+        rows_done = ROWS_DONE + parity * (ROW_GROUPS * SYNC_LINE)
 
         _plan_tasks(lengths, num_rows, nblk, prefix_base, context_base, word_base, tid)
         if (bid == 0) & (tid == 0):
             # Nothing reads the other parity this launch; the next one counts on it.
             other = (parity ^ 1) * SYNC_LINE
-            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, ROWS_DONE + other))
+            for g in range_constexpr(row_groups):
+                fx.ptr_store(
+                    fx.Int32(0),
+                    _i32_ptr(
+                        sync_ptr,
+                        ROWS_DONE + ((parity ^ 1) * ROW_GROUPS + g) * SYNC_LINE,
+                    ),
+                )
             fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, TILE_CLAIM + other))
             fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, TASK_CLAIM + other))
         gpu.barrier()

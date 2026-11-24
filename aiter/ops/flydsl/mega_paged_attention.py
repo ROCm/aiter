@@ -70,7 +70,7 @@ class MegaPagedAttention:
         eps: float,
         group=None,
         max_tiles_per_task: int = 4,
-        block_n: int = 48,
+        block_n: int | None = None,
         prefetch: int | None = None,
         occupancy: int = 1,
         two_shot: bool = True,
