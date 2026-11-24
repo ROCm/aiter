@@ -173,33 +173,73 @@ __device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restric
     }
 }
 
+// What a lane reads from global memory for the norm and the rope: its kElemsPerLane norm weights
+// and the cos / sin pair of each of its dims. They stay in the storage type (converting would
+// make the loader wait for the loads), so a caller issues them together with the row's and
+// converts when it computes. The loads are unconditional, so the compiler cannot fold them into
+// the branches that use them: a lane without rotated dims reads (and ignores) a valid pair.
 template <typename scalar_t>
-__device__ __forceinline__ void normAndRope(
-    float (&elems)[kElemsPerLane],
-    int lane_id,
-    float eps,
-    const scalar_t* __restrict__ weight,
-    bool do_rope,
-    int rotary_dim,
-    const scalar_t* __restrict__ cos_ptr,
-    bool apply_norm)
+struct NormRopeOperands
 {
-    if(apply_norm)
+    scalar_t w[kElemsPerLane];
+    scalar_t c[kElemsPerLane];
+    scalar_t s[kElemsPerLane];
+};
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadNormWeights(const scalar_t* __restrict__ weight,
+                                                int lane_id,
+                                                NormRopeOperands<scalar_t>& ops)
+{
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
     {
-        float sumsq = 0.0f;
+        ops.w[i] = weight[lane_id * kElemsPerLane + i];
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadRopeOperands(const scalar_t* __restrict__ cos_sin_cache,
+                                                 int64_t pos,
+                                                 int lane_id,
+                                                 int rotary_dim,
+                                                 NormRopeOperands<scalar_t>& ops)
+{
+    const int half   = rotary_dim / 2;
+    const int dim0   = lane_id * kElemsPerLane;
+    const int i_base = min(dim0 < half ? dim0 : dim0 - half, half - kElemsPerLane);
+    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            sumsq += elems[i] * elems[i];
-        }
-        sumsq = warpReduceSum(sumsq);
-        const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        ops.c[i] = cos_ptr[i_base + i];
+        ops.s[i] = sin_ptr[i_base + i];
+    }
+}
+
+// RMSNorm (with the (1 + weight) form) and partial NeoX RoPE of one row, on the operands
+// loadNormWeights / loadRopeOperands read.
+template <typename scalar_t>
+__device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
+                                            int lane_id,
+                                            float eps,
+                                            const NormRopeOperands<scalar_t>& ops,
+                                            bool do_rope,
+                                            int rotary_dim)
+{
+    float sumsq = 0.0f;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            const int dim = lane_id * kElemsPerLane + i;
-            elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(weight[dim]));
-        }
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        sumsq += elems[i] * elems[i];
+    }
+    sumsq = warpReduceSum(sumsq);
+    const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(ops.w[i]));
     }
 
     if(do_rope)
@@ -211,18 +251,15 @@ __device__ __forceinline__ void normAndRope(
         if(in_rope)
         {
             const bool first_half = dim0 < half;
-            const int i_base = first_half ? dim0 : dim0 - half;
             const int partner_lane = first_half ? (dim0 + half) / kElemsPerLane
                                                 : (dim0 - half) / kElemsPerLane;
-            const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
             for(int i = 0; i < kElemsPerLane; ++i)
             {
-                const float c = static_cast<float>(cos_ptr[i_base + i]);
-                const float s = static_cast<float>(sin_ptr[i_base + i]);
+                const float c       = static_cast<float>(ops.c[i]);
+                const float s       = static_cast<float>(ops.s[i]);
                 const float partner = __shfl(elems[i], partner_lane, 32);
-                elems[i] = first_half ? elems[i] * c - partner * s
-                                      : elems[i] * c + partner * s;
+                elems[i] = first_half ? elems[i] * c - partner * s : elems[i] * c + partner * s;
             }
         }
     }
@@ -307,8 +344,9 @@ __device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ cache,
 
 // ---- NVFP4 row write (index K, main K/V) -----------------------------------------------
 // e2m1 data + one e4m3 scale per 16 elements (4 lanes), no per-token scale. The arithmetic is
-// integer/compare arithmetic (see the torch reference in op_tests/test_fused_qknorm_nvfp4.py),
-// not a hardware convert, so the bytes are the same on every arch. Pages:
+// that of the torch reference in op_tests/test_fused_qknorm_nvfp4.py, written as integer/compare
+// routines (nv*Int) and, on gfx950, as the same conversions in hardware; the bytes are the same
+// on every arch. Pages:
 //   index page, 9216 B : [128 tok x 64 B e2m1][128 tok x 8 B e4m3]
 //   KV page, 2*nkv*9216 B : [K: nkv x 8192 B data | nkv x 1024 B scale][V: same]
 //     K data  t*64 + d/2           K scale in MFMA lane order (nvKScaleOff)
@@ -321,7 +359,7 @@ constexpr int kNvHeadSide      = kNvHeadData + kNvHeadScale;  // 9216 == an inde
 constexpr int kNvIndexPage     = kNvHeadSide;
 
 // e4m3fn byte of x in [0, 448], round to nearest even.
-__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+__device__ __forceinline__ uint32_t nvE4m3ByteInt(float x)
 {
     const uint32_t bits   = __builtin_bit_cast(uint32_t, x);
     const uint32_t normal = ((bits + 0x7FFFFu + ((bits >> 20) & 1u)) >> 20) - 960u;
@@ -331,7 +369,7 @@ __device__ __forceinline__ uint32_t nvE4m3Byte(float x)
     return x >= 0.015625f ? normal : sub;
 }
 
-__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+__device__ __forceinline__ float nvE4m3ValueInt(uint32_t byte)
 {
     const uint32_t e = byte >> 3, m = byte & 7u;
     return e > 0 ? __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20))
@@ -339,7 +377,7 @@ __device__ __forceinline__ float nvE4m3Value(uint32_t byte)
 }
 
 // e2m1 code (sign in bit 3): nearest grid value, ties to the even code.
-__device__ __forceinline__ uint32_t nvE2m1Code(float y)
+__device__ __forceinline__ uint32_t nvE2m1CodeInt(float y)
 {
     const float a = fabsf(y);
     const int mag = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) +
@@ -347,10 +385,82 @@ __device__ __forceinline__ uint32_t nvE2m1Code(float y)
     return static_cast<uint32_t>(mag) | ((__builtin_bit_cast(uint32_t, y) >> 31) << 3);
 }
 
-// One lane's kElemsPerLane elements (already scalar_t-rounded) -> codes + the group's scale byte.
+// The same three on gfx950's converts (RNE, the same grids), which are a few instructions each
+// instead of a compare / select chain. They give the same bytes as the integer routines for every
+// input of the quantizer below: the e2m1 code on all 2^32 fp32 bit patterns, the e4m3 byte on all
+// of [0, 448], the e4m3 value on every byte it is given (0 .. 0x7E). op_tests/test_fused_qknorm_nvfp4.py
+// checks the kernel against a torch oracle. The integer routines stay as the other arches' path.
+// Like them, the quantizer needs gs > 0 (a negative scale gives a negative sf, which is outside
+// the e4m3 byte's [0, 448] and where the two differ).
+#if defined(__gfx950__)
+
+// x in [0, 448] (the mask drops the sign of -0). Past 448 the convert gives NaN.
+__device__ __forceinline__ uint32_t nvE4m3ByteHw(float x)
+{
+    int w = 0;
+    w     = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, 0);
+    return static_cast<uint32_t>(w) & 0x7Fu;
+}
+
+__device__ __forceinline__ float nvE4m3ValueHw(uint32_t byte)
+{
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<int>(byte), 0);
+}
+
+// Four e2m1 codes as nibbles, element 0 lowest. The convert gives a NaN the largest magnitude;
+// the integer code gives it magnitude 0 (every compare is false), so a NaN is first replaced by
+// the zero of its sign. Infinities saturate to the largest magnitude in both.
+__device__ __forceinline__ uint32_t nvE2m1PackHw(const float (&y)[kElemsPerLane])
+{
+    float t[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        t[i] = y[i] != y[i] ? __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, y[i]) &
+                                                            0x80000000u)
+                            : y[i];
+    }
+    uint32_t w = 0;
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[0], t[1], 1.0f, 0);
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[2], t[3], 1.0f, 1);
+    return w & 0xFFFFu;
+}
+#endif
+
+__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+{
+#if defined(__gfx950__)
+    return nvE4m3ByteHw(x);
+#else
+    return nvE4m3ByteInt(x);
+#endif
+}
+
+__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+{
+#if defined(__gfx950__)
+    return nvE4m3ValueHw(byte);
+#else
+    return nvE4m3ValueInt(byte);
+#endif
+}
+
+// Four e2m1 codes of y as nibbles, element 0 lowest.
+__device__ __forceinline__ uint32_t nvE2m1Pack(const float (&y)[kElemsPerLane])
+{
+#if defined(__gfx950__)
+    return nvE2m1PackHw(y);
+#else
+    return nvE2m1CodeInt(y[0]) | (nvE2m1CodeInt(y[1]) << 4) | (nvE2m1CodeInt(y[2]) << 8) |
+           (nvE2m1CodeInt(y[3]) << 12);
+#endif
+}
+
+// One lane's kElemsPerLane elements (already scalar_t-rounded) -> its four codes as nibbles
+// (element 0 lowest) + the group's scale byte.
 __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
                                                 float gs,
-                                                uint32_t (&code)[kElemsPerLane])
+                                                uint32_t& packed)
 {
     float amax = 0.0f;
 #pragma unroll
@@ -368,24 +478,22 @@ __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
     const uint32_t sbyte  = nvE4m3Byte(sf);
     const float sv        = nvE4m3Value(sbyte);
     const float quant     = sv != 0.0f ? __fdiv_rn(1.0f, sv * gs) : 0.0f;
+    float y[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        code[i] = nvE2m1Code(v[i] * quant);
+        y[i] = v[i] * quant;
     }
+    packed = nvE2m1Pack(y);
     return sbyte;
-}
-
-__device__ __forceinline__ uint16_t nvPackBytes(const uint32_t (&code)[kElemsPerLane])
-{
-    return static_cast<uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
 }
 
 // token-major data (low nibble = even element); the callers write the scale bytes.
 __device__ __forceinline__ void
-nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, const uint32_t (&code)[kElemsPerLane])
+nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, uint32_t packed)
 {
-    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) = nvPackBytes(code);
+    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) =
+        static_cast<uint16_t>(packed);
 }
 
 // K scale byte offset (MFMA lane order) of token pos, group g, inside a head's scale region.
@@ -409,9 +517,9 @@ __device__ __forceinline__ void storeNvfp4IndexRow(uint8_t* __restrict__ page,
     {
         v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, 1.0f, code);
-    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, 1.0f, packed);
+    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[kNvHeadData + pos * (kHeadDim / 16) + lane_id / kNvLanesPerGroup] = sb;
@@ -433,9 +541,9 @@ __device__ __forceinline__ void storeNvfp4KRow(uint8_t* __restrict__ page,
     {
         v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
-    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, gs, packed);
+    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[nkv * kNvHeadData + head * kNvHeadScale +
@@ -451,13 +559,13 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
                                                  int head,
                                                  int pos,
                                                  float gs,
-                                                 const scalar_t* __restrict__ row,
+                                                 const scalar_t (&row)[kElemsPerLane],
                                                  int lane_id)
 {
     float v[kElemsPerLane];
-    loadElems(row + lane_id * kElemsPerLane, v);
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
+    loadElems(row, v);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, gs, packed);
     uint32_t* words   = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
                                                   (pos / 8) * 512) +
                       lane_id * kElemsPerLane;
@@ -466,7 +574,7 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
     for(int i = 0; i < kElemsPerLane; ++i)
     {
         atomicAnd(words + i, ~(0xFu << shift));
-        atomicOr(words + i, code[i] << shift);
+        atomicOr(words + i, ((packed >> (4 * i)) & 0xFu) << shift);
     }
     if(lane_id % kNvLanesPerGroup == 0)
     {
@@ -620,17 +728,30 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
     }
 
-    int64_t mapped_slot = -1;
+    // The row and slot_mapping are loaded here, before the V branch, which uses both: the loads
+    // are in flight while the rest of the loads (position, norm weight, cos / sin) issue below,
+    // not chained behind them. V reuses `raw` so that the compiler keeps the row load here
+    // instead of sinking it past the branch into the non-V path.
+    scalar_t raw[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = row_ptr[dim_base + i];
+    }
+
+    int64_t slot_val = -1;
+    bool has_slot    = false;
     if constexpr(kInsertKV)
     {
         if constexpr(kProcessIndex)
         {
-            mapped_slot = is_ik ? index_slot_mapping[token_idx]
-                                : ((is_k || is_v) ? slot_mapping[token_idx] : -1);
+            slot_val = (is_ik ? index_slot_mapping : slot_mapping)[token_idx];
+            has_slot = is_ik || is_k || is_v;
         }
         else
         {
-            mapped_slot = (is_k || is_v) ? slot_mapping[token_idx] : -1;
+            slot_val = slot_mapping[token_idx];
+            has_slot = is_k || is_v;
         }
     }
 
@@ -638,6 +759,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         if(is_v)
         {
+            const int64_t mapped_slot = has_slot ? slot_val : -1;
             if constexpr(kKvFp4)
             {
                 if constexpr(kNvfp4)
@@ -654,7 +776,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                                                    head,
                                                    static_cast<int>(mapped_slot % kNvTokens),
                                                    *v_scale,
-                                                   row_ptr,
+                                                   raw,
                                                    lane_id);
                     }
                 }
@@ -662,7 +784,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 {
                     // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
                     float velems[kElemsPerLane];
-                    loadElems(row_ptr + dim_base, velems);
+                    loadElems(raw, velems);
                     storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
                                             mapped_slot,
                                             v_s_block,
@@ -734,11 +856,18 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         }
     }
 
-    float elems[kElemsPerLane];
-    loadElems(row_ptr + dim_base, elems);
+    // Past the V branch every warp has a norm weight and rotates. All the loads of the norm and
+    // the rope are issued together, none behind a condition (which the compiler would fold into
+    // the code that uses them, waiting for each right after issuing it): position, weight, then
+    // cos / sin once the position is back. They stay in the storage type until they are used.
+    NormRopeOperands<scalar_t> ops;
     const int64_t pos = positions[token_idx];
-    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    normAndRope(elems, lane_id, eps, norm_w, do_rope, rotary_dim, cos_ptr, norm_w != nullptr);
+    loadNormWeights(norm_w, lane_id, ops);
+    loadRopeOperands(cos_sin_cache, pos, lane_id, rotary_dim, ops);
+    float elems[kElemsPerLane];
+    loadElems(raw, elems);
+    normAndRope(elems, lane_id, eps, ops, do_rope, rotary_dim);
+    const int64_t mapped_slot = has_slot ? slot_val : -1;
 
     if constexpr(kInsertKV)
     {
