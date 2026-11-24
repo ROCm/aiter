@@ -60,6 +60,7 @@ def test_mxfp8_public_dispatch_rejects_incompatible_options(kwargs, message):
 
 def test_mxfp8_helper_returns_the_group_result():
     tensor = torch.empty((2, 32), dtype=torch.bfloat16)
+    weight = tensor[0]  # one view: the call is matched by identity
     result = (object(), object(), object())
     group = SimpleNamespace(fused_allreduce_rmsnorm_quant=Mock(return_value=result))
     with (
@@ -70,7 +71,7 @@ def test_mxfp8_helper_returns_the_group_result():
             communication_op.tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
                 tensor,
                 tensor,
-                tensor[0],
+                weight,
                 1e-6,
                 prefill_support=True,
                 gemma_norm=True,
@@ -81,7 +82,7 @@ def test_mxfp8_helper_returns_the_group_result():
     group.fused_allreduce_rmsnorm_quant.assert_called_once_with(
         tensor,
         tensor,
-        tensor[0],
+        weight,
         1e-6,
         True,
         quant_type="mxfp8",

@@ -14,7 +14,10 @@ from aiter import dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant,
 )
-from aiter.dist.parallel_state import get_tp_group, set_custom_all_reduce
+from aiter.dist.device_communicators.communicator_cuda import (
+    _GLUON_AR_NORM_MAX_TOKENS,
+)
+from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.triton.comms.all_reduce import (
@@ -110,7 +113,6 @@ def _same_ranks(outputs, group):
 
 def _worker(rank, init_method):
     torch.cuda.set_device(rank)
-    set_custom_all_reduce(False)
     os.environ["AITER_GLUON_FUSED_AR"] = "1"
     aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
     tp = get_tp_group()
@@ -157,7 +159,8 @@ def _worker(rank, init_method):
                     EPS,
                     gemma_norm=True,
                 )
-            if launch.called != bool(tokens):
+            # Above _GLUON_AR_NORM_MAX_TOKENS rows the Lamport one-shot may take it.
+            if tokens <= _GLUON_AR_NORM_MAX_TOKENS and launch.called != bool(tokens):
                 failures.append(f"rank {rank}: M={tokens} dispatch differs")
             if tokens and not _same_bits(public, want):
                 failures.append(f"rank {rank}: public M={tokens} differs")
