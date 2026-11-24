@@ -2,8 +2,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.activation import fused_silu_mul
-
-LOG2_E = 1.44269504089
+from op_tests.triton_tests.utils.activation_ref import silu_exp2_ref
 
 # GLM-4.7-FP8 MoE (e.g. zai-org/GLM-4.7-FP8): moe_intermediate_size=1536, top_k=8.
 # Column-parallel TP4: local d = 1536 // 4 = 384, fused silu-mul input last dim = 768.
@@ -14,12 +13,6 @@ _GLM47_TOP_K = 8
 # TP4: local d = 2048 // 4 = 512, last dim = 1024.
 _KIMI_K25_TP4_LAST = 1024
 _KIMI_K25_TOP_K = 8
-
-
-def silu_exp2_ref(t: torch.Tensor) -> torch.Tensor:
-    """Match ``_silu_exp2`` in Triton (same as MoE silu-fused path)."""
-    x = t.float()
-    return x / (1.0 + torch.exp2(-(x * LOG2_E)))
 
 
 def torch_silu_mul_last_dim_ref(x: torch.Tensor) -> torch.Tensor:
