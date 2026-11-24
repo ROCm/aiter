@@ -3,9 +3,11 @@
 """Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -19,7 +21,6 @@ from ..tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
-from . import envs
 from .dispatch import (
     FUSED_STAGE2_CLAIM,
     FUSED_STAGE2_DONE,
@@ -30,7 +31,6 @@ from .dispatch import (
     emit_direct_fixed_slot_payload,
     emit_dispatch_payload,
     fused_stage2_state_ints,
-    invalidate_l1,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
@@ -45,6 +45,10 @@ from .mega_moe_stage2 import Stage2Unit
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
+# MoRI's symmetric heap type, fixed for the process once MoRI initializes.
+_UNCACHED_HEAP = (
+    os.environ.get("MORI_SHMEM_HEAP_TYPE", "uncached").lower() == "uncached"
+)
 
 
 class _Stage1KernelSpec:
@@ -72,6 +76,33 @@ def _validate_fixed_slot_geometry(
             "fixed-slot dispatch requires the direct EP8 layout with "
             f"{FIXED_SLOT_EXPERTS_PER_RANK} experts per rank"
         )
+
+
+def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
+    """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
+    out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
+    prows = ceildiv(rows, 256) * 256
+    pcols = ceildiv(inter_dim // 32, 8) * 8
+    return out, prows * pcols + inter_dim
+
+
+def stage1_output_buffers(rows, inter_dim, device, a_dtype="fp8", arena=None):
+    """GEMM1 output ``[rows, inter_dim]`` (FP8, or packed FP4) and its scale buffer.
+
+    ``arena``: (output bytes, scale bytes) uint8 tensors to view instead of
+    allocating, shared by routes whose calls never overlap.
+    """
+    out_bytes, osd_bytes = stage1_output_nbytes(rows, inter_dim, a_dtype)
+    if arena is None:
+        out = torch.zeros(out_bytes, dtype=torch.uint8, device=device)
+        osd = torch.zeros(osd_bytes, dtype=torch.uint8, device=device)
+    else:
+        if out_bytes > arena[0].numel() or osd_bytes > arena[1].numel():
+            raise ValueError("the Stage1 output arena is smaller than this route needs")
+        out, osd = arena[0][:out_bytes], arena[1][:osd_bytes]
+    out = out.view(rows, out_bytes // rows)
+    out = out.view(torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn)
+    return out, osd
 
 
 def _validate_dispatch_capacity(
@@ -112,8 +143,8 @@ def compile_mega_moe_stage1(
     tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
-    bounds_check: bool = False,
-    fused_stage2: tuple | None = None,
+    early_tiles: bool = False, light_release: bool = False, resident_grid: bool = False,
+    unroll_k: bool = False, g1_split_tail: bool = False, fused_stage2: tuple | None = None,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -154,7 +185,7 @@ def compile_mega_moe_stage1(
     # The fixed-slot Stage1 options below are validated for the V4/V4.1 target layout (48 experts per rank)
     # only; other fixed-slot layouts (the V4.1-Flash DSpark draft MoE's 16 per rank) keep the base kernel.
     TARGET_FIXED = fixed_slot_dispatch and int(experts_per_rank) == REFERENCE_EXPERTS_PER_RANK
-    RESIDENT_GRID = TARGET_FIXED and envs.AITER_MEGA_S1_FIXED_RESIDENT_GRID
+    RESIDENT_GRID = TARGET_FIXED and resident_grid
     consumer_ticket_base = 0 if compact_dispatch or RESIDENT_GRID else dispatch_blocks + 1
     # Compact external-counting overwrites every source-owned histogram row
     # and publishes COUNT_DONE with the invocation generation.  That exchange
@@ -235,7 +266,6 @@ def compile_mega_moe_stage1(
     if fixed_slot_dispatch and fz_scale_n_i32 > 64:
         raise ValueError("direct fixed-slot dispatch supports at most 64 packed scale columns")
     fz_enable_scales = fz_scale_bytes > 0
-    fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
         fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim // out_pack, use_tile_resource
     )
@@ -243,15 +273,14 @@ def compile_mega_moe_stage1(
     # Fused GEMM2: once GEMM1 has no work left, consumers run Stage2's output
     # tiles in this kernel, each once its Stage1 M tile's GEMM1 work items are
     # done, instead of a separate Stage2 launch.  ``fused_stage2`` holds the
-    # Stage2Unit settings as sorted (name, value) pairs.  The unit's LDS offsets
-    # are absolute, so it runs in ``pool``, the first field below, as Stage2
-    # runs in its only buffer.
+    # Stage2Unit settings as sorted (name, value) pairs; the unit runs from the
+    # base of ``pool``.
     FUSE_G2 = TARGET_FIXED and fused_stage2 is not None
     if FUSE_G2:
         assert TOTAL_THREADS == 256, "fused GEMM2 runs Stage2's 256-thread tile"
         G2_UNIT = Stage2Unit(model_dim=model_dim, inter_dim=inter_dim, experts=fz_epr, topk=fz_k, rank=fz_rank,
             npes=fz_npes, max_tok=fz_mtpr, SBM=sort_block_m, a_dtype=out_dtype, has_pad=False,
-            wide_scatter=envs.AITER_MEGA_S2_FIXED_TUNED_GEMM2_V2, **dict(fused_stage2))
+            **dict(fused_stage2))
         assert sort_block_m % G2_UNIT.BM == 0 and model_dim % G2_UNIT.BN == 0
         G2_N_BLOCKS = model_dim // G2_UNIT.BN
         lds_pool_bytes = max(lds_pool_bytes, G2_UNIT.lds_bytes)
@@ -265,7 +294,7 @@ def compile_mega_moe_stage1(
     # G1_V2_TAIL_ITEMS (192) of them (at most the overflow) run as two 128-column items
     # each, so the partial last round is spread over every CTA. M-tile done counts
     # are in 128-column units (a whole item counts 2).
-    GEMM1_V2 = FUSE_G2 and envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1_V2 and tile_n == 256
+    GEMM1_V2 = FUSE_G2 and g1_split_tail and tile_n == 256
     TAIL_N = tile_n // 2
     N_TILES_TAIL = 2 * N_TILES
     G1_M_TARGET = N_TILES_TAIL if GEMM1_V2 else N_TILES
@@ -285,28 +314,19 @@ def compile_mega_moe_stage1(
         bc_work: fx.Array[fx.Int8, 16, 16]
         bc_sched: fx.Array[fx.Int8, 16, 16]
 
-    # Compact producers keep two rows in flight (emit_dispatch_payload).
-    FAST_COPY = compact_dispatch and envs.AITER_MEGA_DISPATCH_FAST_COPY
     # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
     # prefill is slower with it (its 8-wave tiles already hide the latency).
-    PAIR_K = fixed_slot_dispatch and async_a_copy and envs.AITER_MEGA_S1_FIXED_KPAIR
+    PAIR_K = fixed_slot_dispatch and async_a_copy
     # Fully unrolled fixed-slot GEMM1 K loop for the wide tuned tile.
-    UNROLL_K = (
-        TARGET_FIXED and async_a_copy and tile_n == 256
-        and envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1 and envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1_WIDE
-    )
+    UNROLL_K = TARGET_FIXED and async_a_copy and tile_n == 256 and unroll_k
     # Fixed-slot GEMM tiles wait for their expert's rows rather than for the
     # whole dispatch: TILE_READY[parity][local_expert * npes + source] counts
     # published rows against COUNT_MATRIX[parity][source][local_expert].
-    EARLY_TILES = TARGET_FIXED and envs.AITER_MEGA_S1_FIXED_EARLY_TILES
+    EARLY_TILES = TARGET_FIXED and early_tiles
     # A system acquire per tile invalidates L2 under the running GEMM, so on
     # mori's uncached heap a tile drops only its CU's L1 lines.
-    EARLY_L1_ONLY = EARLY_TILES and envs.MORI_SHMEM_HEAP_TYPE.lower() == "uncached"
-    LIGHT_RELEASE = (
-        TARGET_FIXED
-        and envs.AITER_MEGA_S1_FIXED_LIGHT_RELEASE
-        and envs.MORI_SHMEM_HEAP_TYPE.lower() == "uncached"
-    )
+    EARLY_L1_ONLY = EARLY_TILES and _UNCACHED_HEAP
+    LIGHT_RELEASE = TARGET_FIXED and light_release and _UNCACHED_HEAP
     if EARLY_TILES:
         assert tile_state_stride > fz_epr * fz_npes and fz_npes <= 64
         assert NUM_WAVES >= 2, "early tiles send counts from wave 1 during the handshake"
@@ -315,7 +335,8 @@ def compile_mega_moe_stage1(
     EPOCH_LDS_OFFSET = fz_total_experts * 4
     if EARLY_TILES:
         assert lds_pool_bytes >= EPOCH_LDS_OFFSET + 8
-    EPI_EVEC = envs.AITER_MEGA_S1_EPI_EVEC
+    # GEMM1 quant epilogue columns per lane (SiluQuantEpilogue; FP4 output uses 2).
+    EPI_EVEC = 8
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     # Activation is baked into the epilogue, so it (and its baked beta/linear_beta)
@@ -327,26 +348,6 @@ def compile_mega_moe_stage1(
     )
     WORK_BATCH = 1
 
-    # Optional hardware bounds checking.  A V# descriptor with a finite
-    # num_records makes the hardware drop out-of-range stores and return zero
-    # for out-of-range loads, so an indexing mistake surfaces as a wrong result
-    # instead of a page fault.  That matters because amdgpu runs with
-    # noretry=1 here: a fault is non-retryable and can leave the queue in a
-    # state only a privileged reset clears.
-    #
-    # Only buffers whose exact allocation is known at this level are bounded.
-    # A bound that is too small would silently clamp a valid access, which is
-    # worse than the fault it replaces, so anything uncertain keeps the
-    # unbounded default.  Notably tile_ready/tile_expected/ready_tile_queue are
-    # allocated as 2 * metadata_blocks while tile_state_stride carries only
-    # metadata_blocks, hence the doubling below.
-    WORK_HEAD_BYTES = 8 * 16 * 4  # workspace["work_head"] = zeros(8 * 16, int32)
-    TILE_STATE_BYTES = tile_state_stride * 2 * 4
-    PER_DESTINATION_BYTES = fz_npes * 4
-
-    def bounded(nbytes):
-        """Keyword arguments pinning a view's V# extent, when enabled."""
-        return {"num_records_bytes": nbytes} if bounds_check else {}
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
         f"_a{a_dtype}o{out_dtype}"
@@ -361,16 +362,15 @@ def compile_mega_moe_stage1(
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
         f"{act_suffix}"
+        # _ev8b / _fc: the epilogue width and the compact two-row payload copy,
+        # fixed now; kept so kernel names (and AOT caches) stay stable.
         f"_ev{EPI_EVEC}b"
-        f"{'_fc' if FAST_COPY else ''}"
+        f"{'_fc' if compact_dispatch else ''}"
         f"{'_kp2' if PAIR_K else ''}"
         f"{'_et' if EARLY_TILES else ''}{'' if EARLY_L1_ONLY or not EARLY_TILES else 'a'}"
         f"{'_lr' if LIGHT_RELEASE else ''}"
         f"{'_rg' if RESIDENT_GRID else ''}{'_uk' if UNROLL_K else ''}"
         f"{'_ac32' if NARROW_FINAL_A else ''}"
-        # Kept in the name so a bounds-checked build never reuses a cached
-        # unbounded kernel, or the reverse.
-        f"{'_bc1' if bounds_check else ''}"
         f"{G2_TAG if FUSE_G2 else ''}"
     )
 
@@ -388,8 +388,8 @@ def compile_mega_moe_stage1(
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
         disp_rsrc = ptr_buf_tensor(addr_disp, fx.Int64)
-        parity_rsrc = ptr_buf_tensor(addr_parity, fx.Int32, **bounded(4))
-        expected_rsrc = ptr_buf_tensor(addr_expected, fx.Int32, **bounded(8))
+        parity_rsrc = ptr_buf_tensor(addr_parity, fx.Int32)
+        expected_rsrc = ptr_buf_tensor(addr_expected, fx.Int32)
 
         def _disp_ptr(slot):
             return disp_rsrc[fx.Int32(int(slot))]
@@ -498,11 +498,7 @@ def compile_mega_moe_stage1(
                     )
                     comm_ops.fence_system_acquire()
                 if tid == fx.Int32(0):
-                    # work_shard indexes this at shard * 16 int32s, so an
-                    # out-of-range WORK_SHARDS lands here first.
-                    work_head_rsrc = ptr_buf_tensor(
-                        a_work_head, fx.Int32, **bounded(WORK_HEAD_BYTES)
-                    )
+                    work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
                     for shard in range_constexpr(WORK_SHARDS):
                         work_head_rsrc[fx.Int32(shard * 16)] = fx.Int32(0)
                     comm_ops.store_i32_system(
@@ -573,17 +569,15 @@ def compile_mega_moe_stage1(
                 producers_per_destination = ptr_buf_tensor(
                     a_payload_blocks_per_destination,
                     fx.Int32,
-                    **bounded(PER_DESTINATION_BYTES),
                 )[producer_destination]
                 chunks_per_destination = ptr_buf_tensor(
                     a_payload_chunks_per_destination,
                     fx.Int32,
-                    **bounded(PER_DESTINATION_BYTES),
                 )[producer_destination]
                 emit_dispatch_payload(
                     num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                     fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
-                    fz_safe_end_i32=fz_safe_end_i32, fz_scale_n_i32=fz_scale_n_i32,
+                    fz_scale_n_i32=fz_scale_n_i32,
                     fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
                     addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     dispatch_blocks=dispatch_blocks,
@@ -592,7 +586,6 @@ def compile_mega_moe_stage1(
                     chunks_per_destination=chunks_per_destination,
                     tile_state_stride=tile_state_stride,
                     indexed_payload=indexed_payload,
-                    fast_copy=FAST_COPY,
                 )
         if const_expr(fixed_slot_dispatch):
             if is_owner:
@@ -630,13 +623,9 @@ def compile_mega_moe_stage1(
                 out_rsrc = ptr_buf_tensor(
                     fx.get_iter(out), fx.Int8, num_records_bytes=out_nbytes
                 )
-            elif const_expr(EPI_EVEC == 8):
-                out_rsrc = ptr_buf_tensor(
-                    fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
-                )
             else:
                 out_rsrc = ptr_buf_tensor(
-                    fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes
+                    fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
                 )
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes
@@ -720,9 +709,9 @@ def compile_mega_moe_stage1(
             total_work = g1_big + g1_tail * fx.Int32(2)
         use_ready_order = fx.Int32(0) == 1
         if const_expr(compact_dispatch):
-            max_expert_tiles = ptr_buf_tensor(
-                a_max_expert_tiles, fx.Int32, **bounded(4)
-            )[fx.Int32(0)]
+            max_expert_tiles = ptr_buf_tensor(a_max_expert_tiles, fx.Int32)[
+                fx.Int32(0)
+            ]
             use_ready_order = max_expert_tiles * fx.Int32(4) >= num_m_tiles
 
         if const_expr(EARLY_TILES):
@@ -749,9 +738,7 @@ def compile_mega_moe_stage1(
 
         def _wait_tile_payload(flat):
             tile_index = flat // fx.Int32(N_TILES)
-            expected_tiles = ptr_buf_tensor(
-                addr_tile_expected, fx.Int32, **bounded(TILE_STATE_BYTES)
-            )[tile_index]
+            expected_tiles = ptr_buf_tensor(addr_tile_expected, fx.Int32)[tile_index]
             comm_ops.wait_i32_until_equals(
                 addr_tile_ready + fx.Int64(tile_index) * 4,
                 expected_tiles,
@@ -826,7 +813,7 @@ def compile_mega_moe_stage1(
                                     ),
                                     fx.Int32(G1_M_TARGET),
                                 )
-                                invalidate_l1()
+                                comm_ops.invalidate_l1()
                             fx.barrier()
                             G2_UNIT.run(
                                 lds_base, g2_unit, m_block,
@@ -885,7 +872,7 @@ def compile_mega_moe_stage1(
                                 else:
                                     _wait_fixed_tile_rows(work, tid)
                                 if const_expr(EARLY_L1_ONLY):
-                                    invalidate_l1()
+                                    comm_ops.invalidate_l1()
                                 else:
                                     comm_ops.fence_system_acquire()
                             fx.barrier()
@@ -1067,7 +1054,6 @@ def compile_mega_moe_stage1_bundle(
     act: str = "silu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    bounds_check: bool = False,
     a_dtype: str = "fp8",
     out_dtype: str = "fp8",
 ):
@@ -1109,7 +1095,10 @@ def compile_mega_moe_stage1_bundle(
             situ_linear_beta=situ_linear_beta,
             a_dtype=a_dtype,
             out_dtype=out_dtype,
-            bounds_check=bounds_check,
+            early_tiles=config.early_tiles,
+            light_release=config.light_release,
+            resident_grid=config.resident_grid,
+            unroll_k=config.unroll_k,
             _return_kernel_spec=True,
         )
         for config in variants
@@ -1191,7 +1180,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
     a_dtype="fp8", out_dtype="fp8",
-    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0, bounds_check=False,
+    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0,
+    early_tiles=False, light_release=False, resident_grid=False, unroll_k=False, g1_split_tail=False,
     fused_stage2=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
@@ -1204,7 +1194,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
         tile_state_stride=tile_state_stride, a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
-        bounds_check=bounds_check, fused_stage2=fused_stage2,
+        early_tiles=early_tiles, light_release=light_release, resident_grid=resident_grid,
+        unroll_k=unroll_k, g1_split_tail=g1_split_tail, fused_stage2=fused_stage2,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,

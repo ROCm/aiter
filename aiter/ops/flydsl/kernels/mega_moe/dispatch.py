@@ -7,7 +7,6 @@ from enum import IntEnum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
@@ -69,7 +68,7 @@ class DispatchSlot(IntEnum):
     P2P_TILE_EXPECTED = 50
     FANOUT_PAIR_CONFIG = 51
     BLOCK_HIST = 52
-    # Fused fixed-slot GEMM2 (AITER_MEGA_S1_FIXED_FUSED_STAGE2): Stage1's
+    # Fused fixed-slot GEMM2 (Stage1Config.fused_g2): Stage1's
     # output and its scales, the local route weights, the peers' combine
     # inputs, and the GEMM2 state (fused_stage2_state_index).  W2 changes per
     # layer and is a launch argument.
@@ -147,17 +146,6 @@ def _wave_reduce_max_i32(value, lane):
 @flyc.jit
 def _increment_i32(buffer, index):
     buffer[index] = buffer[index] + fx.Int32(1)
-
-
-def invalidate_l1():
-    """Drop this CU's vector L1 lines; L2 is left intact."""
-    llvm.InlineAsmOp(
-        None,
-        [],
-        "buffer_inv sc0\n\ts_waitcnt vmcnt(0)",
-        "~{memory}",
-        has_side_effects=True,
-    )
 
 
 @flyc.jit
@@ -392,32 +380,6 @@ def _initialize_section_ready(
                 tile_index = base_tile + boundary // fx.Int32(fz_tile_m)
                 _increment_i32(tile_expected, tile_index)
         sender_prefix = sender_prefix + source_count
-
-
-@flyc.jit
-def _copy_token_row(
-    source_buffer, destination_buffer, lane, *, fz_safe_end_i32, fz_n_i32
-):
-    safe_end_vec = fz_safe_end_i32 // 4
-    n_vec = fz_n_i32 // 4
-    if const_expr(fz_safe_end_i32 > 0):
-        for unit in range(lane, safe_end_vec, 128):
-            value0 = buf_copy_load(source_buffer, unit, fx.Int32, unit_elems=4)
-            value1 = buf_copy_load(
-                source_buffer, unit + fx.Int32(64), fx.Int32, unit_elems=4
-            )
-            buf_copy_store(destination_buffer, unit, value0, fx.Int32, unit_elems=4)
-            buf_copy_store(
-                destination_buffer,
-                unit + fx.Int32(64),
-                value1,
-                fx.Int32,
-                unit_elems=4,
-            )
-    if const_expr(fz_safe_end_i32 < fz_n_i32):
-        for unit in range(lane + safe_end_vec, n_vec, 64):
-            value = buf_copy_load(source_buffer, unit, fx.Int32, unit_elems=4)
-            buf_copy_store(destination_buffer, unit, value, fx.Int32, unit_elems=4)
 
 
 @flyc.jit
@@ -1807,14 +1769,13 @@ def emit_dispatch_group(
 # fmt: off
 @flyc.jit
 def emit_dispatch_payload(
-    *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32, fz_safe_end_i32,
+    *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     dispatch_blocks,
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination,
     payload_chunk_rows,
     tile_state_stride,
     indexed_payload=False,
-    fast_copy,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
@@ -2087,11 +2048,6 @@ def emit_dispatch_payload(
                         row_scale_remote[
                             payload_row * fx.Int32(fz_scale_n_i32) + scale_lane
                         ] = scale
-            source_buffer = ptr_buf_tensor(
-                addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes),
-                fx.Int32,
-                unit_elems=4,
-            )
             if const_expr(hoist_remote_resources):
                 destination_buffer = ptr_buf_tensor(
                     token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes),
@@ -2106,16 +2062,7 @@ def emit_dispatch_payload(
                     fx.Int32,
                     unit_elems=4,
                 )
-            if const_expr(fast_copy):
-                _store_token(destination_buffer, token_vals)
-            else:
-                _copy_token_row(
-                    source_buffer,
-                    destination_buffer,
-                    lane,
-                    fz_safe_end_i32=fz_safe_end_i32,
-                    fz_n_i32=fz_n_i32,
-                )
+            _store_token(destination_buffer, token_vals)
 
         def _load_token(wk):
             token = group_task.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(fz_k))
@@ -2141,32 +2088,24 @@ def emit_dispatch_payload(
                     if unit < fx.Int32(fz_n_i32 // 4):
                         buf_copy_store(destination_buffer, unit, vals[j], fx.Int32, unit_elems=4)
 
-        if const_expr(fast_copy):
-            # Two rows per step: both route ids are read back to back and both
-            # rows' loads are in flight before either is stored, instead of one
-            # dependent id read plus ~4 load round trips per row.
-            for row in range(row_begin + row0, row_end, row_stride * 2):
-                row_b = row + row_stride
-                has_b = row_b < row_end
-                wk_a_lane = fx.Int32(0)
-                wk_b_lane = fx.Int32(0)
-                if lane == fx.Int32(0):
-                    wk_a_lane = pair_order[source_base + row]
-                    wk_b_lane = pair_order[source_base + has_b.select(row_b, row)]
-                wk_a = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_a_lane))
-                wk_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_b_lane))
-                vals_a = _load_token(wk_a)
-                vals_b = _load_token(wk_b)
-                _row_body(row, wk_a, vals_a)
-                if has_b:
-                    _row_body(row_b, wk_b, vals_b)
-        else:
-            for row in range(row_begin + row0, row_end, row_stride):
-                wk_lane = fx.Int32(0)
-                if lane == fx.Int32(0):
-                    wk_lane = pair_order[source_base + row]
-                wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
-                _row_body(row, wk, None)
+        # Two rows per step: both route ids are read back to back and both
+        # rows' loads are in flight before either is stored, instead of one
+        # dependent id read plus ~4 load round trips per row.
+        for row in range(row_begin + row0, row_end, row_stride * 2):
+            row_b = row + row_stride
+            has_b = row_b < row_end
+            wk_a_lane = fx.Int32(0)
+            wk_b_lane = fx.Int32(0)
+            if lane == fx.Int32(0):
+                wk_a_lane = pair_order[source_base + row]
+                wk_b_lane = pair_order[source_base + has_b.select(row_b, row)]
+            wk_a = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_a_lane))
+            wk_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_b_lane))
+            vals_a = _load_token(wk_a)
+            vals_b = _load_token(wk_b)
+            _row_body(row, wk_a, vals_a)
+            if has_b:
+                _row_body(row_b, wk_b, vals_b)
 
         if chunk_active:
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
