@@ -1387,7 +1387,7 @@ def test_mla_gluon_fp8_query_rejects():
             **kw,
         )
 
-    with pytest.raises(AssertionError, match="bh16bn128"):
+    with pytest.raises(AssertionError, match="needs fp8 KV"):
         call(kv_dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="bh16bn128"):
         call(nhead=128)

@@ -990,6 +990,23 @@ def mla_gluon(
     prefill mode and a call with kv_split_info always run the Gluon kernel:
     kv_split_info is internal to it.
     """
+    # before the route: a plugin that serves the call never reaches _mla_gluon_launch
+    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
+        # a tensor would reach the kernel as a pointer
+        assert isinstance(
+            scale, (int, float)
+        ), f"{name} must be a Python float, got {type(scale).__name__}"
+    if q_nope.dtype == torch.float8_e4m3fn:
+        assert (
+            kv_c.dtype == torch.float8_e4m3fn
+        ), f"an fp8 query needs fp8 KV, got {kv_c.dtype}"
+        if has_pe:
+            assert (
+                q_pe.dtype == q_nope.dtype
+            ), f"q_nope/q_pe must have one dtype, got {q_nope.dtype}/{q_pe.dtype}"
+        assert o.dtype == torch.bfloat16, f"o must be bf16, got {o.dtype}"
+    else:
+        assert q_scale == 1.0, f"q_scale is for an fp8 query, got {q_scale}"
     if has_pe and attn_sink is None and kv_split_info is None:
         lse = _mla_paged_decode_routed(
             q_nope,
@@ -1198,23 +1215,12 @@ def _mla_gluon_launch(
     # MTP (qlen>1) uses the grid-axis path: q_pos is grid axis 2, so each query
     # position is a separate program.
     REGIME = _mla_gluon_regime(nhead, kv_c.dtype)
-    # a tensor would reach the kernel as a pointer
-    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
-        assert isinstance(
-            scale, (int, float)
-        ), f"{name} must be a Python float, got {type(scale).__name__}"
     fp8_query = q_nope.dtype == torch.float8_e4m3fn
     if fp8_query:
         assert REGIME == "bh16bn128" and has_pe, (
             "an fp8 query needs the bh16bn128 decode (fp8 KV, has_pe=True), "
             f"got {REGIME}, has_pe={has_pe}"
         )
-        assert (
-            q_pe.dtype == q_nope.dtype
-        ), f"q_nope/q_pe must have one dtype, got {q_nope.dtype}/{q_pe.dtype}"
-        assert o.dtype == torch.bfloat16, f"o must be bf16, got {o.dtype}"
-    else:
-        assert q_scale == 1.0, f"q_scale is for an fp8 query, got {q_scale}"
 
     PAGE_SIZE = 1
     split_rebalance = False

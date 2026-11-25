@@ -1112,11 +1112,12 @@ def _mhc_result():
     return (_z(2, 4, 1), _z(2, 4, 4), _z(2, 64, dtype=torch.bfloat16), _z(2, 4, 64))
 
 
-def _gluon_args():
+def _gluon_args(dtype=torch.bfloat16):
+    """A decode call with a query and KV of dtype (bf16, or float8_e4m3fn)."""
     return {
-        "q_nope": _z(2, 4, 512, dtype=torch.bfloat16),
-        "q_pe": _z(2, 4, 64, dtype=torch.bfloat16),
-        "kv_c": _z(8, 576, dtype=torch.bfloat16),
+        "q_nope": _z(2, 4, 512, dtype=dtype),
+        "q_pe": _z(2, 4, 64, dtype=dtype),
+        "kv_c": _z(8, 576, dtype=dtype),
         "o": _z(2, 4, 512, dtype=torch.bfloat16),
         "page_table": _z(2, 4, dtype=torch.int32),
         "seq_info": torch.tensor([4, 4], dtype=torch.int32),
@@ -1238,7 +1239,9 @@ def _route_cases():
         ),
         # The provider returns lse alone: an empty tensor when return_lse is False.
         "mla_paged_decode": (
-            lambda: mla_gluon.mla_gluon(**_gluon_args(), q_scale=2.0),
+            lambda: mla_gluon.mla_gluon(
+                **_gluon_args(torch.float8_e4m3fn), q_scale=2.0
+            ),
             "q_scale",
             2.0,
             _z(0),
@@ -1446,6 +1449,37 @@ def test_the_public_name_hands_a_provider_the_whole_contract(monkeypatch, case):
         assert result[1] is None, "return_lse=False must give no lse"
     elif isinstance(served, torch.Tensor):
         assert torch.equal(result, served)
+
+
+@pytest.mark.parametrize(
+    "dtype, changes, message",
+    [
+        (torch.bfloat16, {"q_scale": 2.0}, "q_scale is for an fp8 query"),
+        (
+            torch.float8_e4m3fn,
+            {"kv_c": _z(8, 576, dtype=torch.bfloat16)},
+            "needs fp8 KV",
+        ),
+        (
+            torch.float8_e4m3fn,
+            {"q_pe": _z(2, 4, 64, dtype=torch.bfloat16)},
+            "one dtype",
+        ),
+        (torch.float8_e4m3fn, {"o": _z(2, 4, 512)}, "o must be bf16"),
+    ],
+    ids=["bf16 query with q_scale", "fp8 query, bf16 KV", "mixed query", "fp32 o"],
+)
+def test_mla_gluon_checks_the_contract_before_a_provider(
+    monkeypatch, dtype, changes, message
+):
+    """A call that breaks the mla_paged_decode contract raises with a provider
+    enabled, and the provider is not asked."""
+    from aiter.ops.triton.gluon import mla_gluon
+
+    provider = _serve(monkeypatch, "mla_paged_decode", _candidate("aklr", _z(0)))
+    with pytest.raises(AssertionError, match=message):
+        mla_gluon.mla_gluon(**{**_gluon_args(dtype), **changes})
+    assert provider.select_calls == 0
 
 
 def test_the_old_triton_path_is_the_module_at_the_new_one():
