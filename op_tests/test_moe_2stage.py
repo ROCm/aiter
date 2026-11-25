@@ -1076,6 +1076,17 @@ def _iter_csv_cases():
             kwargs["disable_stage2_bias"] = True
             kwargs["check_aot_cache"] = False
             kwargs["expected_kernel1"] = kernel_name1
+        if (
+            kwargs["actType"] == aiter.ActivationType.Swiglu
+            and kwargs["qType"] == aiter.QuantType.per_1x32
+            and kwargs["AQDType"] == dtypes.bf16
+            and kwargs["WQDType"] == dtypes.fp4x2
+            and kwargs["inter_dim"] % 256 != 0
+        ):
+            # fused_moe reroutes these shards onto the a16w4 FlyDSL port, which
+            # rejects a per-expert bias; their callers (MiniMax-M3) pass none.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
