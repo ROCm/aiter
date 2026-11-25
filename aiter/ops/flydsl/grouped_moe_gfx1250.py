@@ -1264,6 +1264,103 @@ def _grouped_a8w4_tdm_moe(
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
         # quant_scale / arg_quant_scale).
+    _f12 = None
+    if _fuse_quant and os.environ.get("AITER_MOE_FUSED12", "0") == "1":
+        from aiter.ops.flydsl.moe_fused12 import (
+            fused12_eligible,
+            fused12_overrides,
+            fused12_stage2_waves,
+        )
+
+        # Fused-launch tile overrides (scheduling only, bitwise): s1 keeps its
+        # tile_m / m_warp (the a2 scale layout), the rest may change.
+        _f12c = dict(
+            tile_n=tile_n, tile_k=tile_k, n_warp=n_warp, num_buffers=num_buffers,
+            tile_n2=tile_n2, tile_k2=tile_k2, n_warp2=n_warp2,
+            num_buffers2=num_buffers2, waves_per_tensor_tdm=waves_per_tensor_tdm,
+            waves_per_tensor_tdm2=waves_per_tensor_tdm2,
+        )
+        _f12o = fused12_overrides(_get_padded_m(token_num))
+        _f12c.update({k: int(v) for k, v in (_f12o or {}).items() if k in _f12c})
+        _f12_w2 = (
+            None
+            if _f12o is None
+            else fused12_stage2_waves(
+                m_warp, _f12c["n_warp"], _f12c["tile_n2"], m_warp2, _f12c["n_warp2"]
+            )
+        )
+        if (
+            _f12_w2 is not None
+            and not (enable_ep_scatter or _compact or _is_ep or shared is not None)
+            and _b1 is None
+            and _b2 is None
+            and kernel_bench_callable is None
+            and tile_m2 // _f12_w2[0] // 16 == wmma_rep2
+            and fused12_eligible(
+                token_num=token_num, tile_m=tile_m, tile_m2=tile_m2,
+                cluster_m=cluster_m, cluster_n=cluster_n, cluster_m2=cluster_m2,
+                cluster_n2=cluster_n2, persistent_workers=persistent_workers,
+                persistent_workers2=persistent_workers2,
+                n_tiles1=(two_inter + _f12c["tile_n"] - 1) // _f12c["tile_n"],
+                n_tiles2=(model_dim + _f12c["tile_n2"] - 1) // _f12c["tile_n2"],
+                device=device,
+            )
+        ):
+            _f12 = _f12_w2
+    if _f12 is not None:
+        from aiter.ops.flydsl.moe_fused12 import flydsl_moe_fused12_a8w4
+
+        grouped_out = torch.empty(
+            (1, contiguous_m, model_dim), dtype=dtype, device=device
+        )
+        flydsl_moe_fused12_a8w4(
+            grouped_out,
+            a1_payload,
+            w1_u8,
+            a1_scale,
+            w1s_i32,
+            a2_payload,
+            a2_scale,
+            _grouped_weight_uint8(w2),
+            w2_scale.reshape(-1).view(torch.int32),
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N1=two_inter,
+            K1=model_dim,
+            N2=model_dim,
+            K2=inter_dim,
+            tile_m=tile_m,
+            tile_n=_f12c["tile_n"],
+            tile_k=_f12c["tile_k"],
+            m_warp=m_warp,
+            n_warp=_f12c["n_warp"],
+            num_buffers=_f12c["num_buffers"],
+            tile_n2=_f12c["tile_n2"],
+            tile_k2=_f12c["tile_k2"],
+            m_warp2=_f12[0],
+            n_warp2=_f12[1],
+            num_buffers2=_f12c["num_buffers2"],
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act,
+            swiglu_limit=sl,
+            quant_wmma_rep=wmma_rep2,
+            waves_per_tensor_tdm=_f12c["waves_per_tensor_tdm"],
+            waves_per_tensor_tdm2=_f12c["waves_per_tensor_tdm2"],
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
+            row_major_ascale=_row_major_ascale,
+            a_row_stride_bytes=_a1_wire_stride,
+            a_scale_row_stride_bytes=_a1_wire_stride,
+            a_row_map=_a_row_map,
+            max_routes=int(token_num) * int(topk),
+            **_situ_kw,
+        )
+    elif _fuse_quant:
         flydsl_grouped_gemm_a8w4_masked(
             a2_payload.view(torch.uint8),
             a1_payload,
@@ -1356,42 +1453,46 @@ def _grouped_a8w4_tdm_moe(
             topids_to_rows=None,
         )
 
-    grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    if _f12 is None:
+        grouped_out = torch.empty(
+            (1, contiguous_m, model_dim), dtype=dtype, device=device
+        )
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
-        grouped_out,
-        a2_payload,
-        w2_u8,
-        a2_scale,
-        w2s_i32,
-        psum,
-        n_experts=E,
-        contiguous_m=contiguous_m,
-        N=model_dim,
-        K=inter_dim,
-        tile_m=tile_m2,
-        tile_n=tile_n2,
-        tile_k=tile_k2,
-        m_warp=m_warp2,
-        n_warp=n_warp2,
-        out_is_f16=out_is_f16,
-        a_is_fp4=_a_is_fp4,
-        stage1_act=0,
-        **sh2,
-        bias=_b2,
-        num_buffers=num_buffers2,
-        persistent_workers=persistent_workers2,
-        cluster_m=cluster_m2,
-        cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm2,
-        next_stage_prefetch=next_stage_prefetch,
-        tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
-        lds_soa_load_interleave=lds_soa_load_interleave,
-        rolled_drain=rolled_drain,
-        **_ep_gemm2_kwargs,
-    )
+    if _f12 is None:
+        flydsl_grouped_gemm_a8w4_masked(
+            grouped_out,
+            a2_payload,
+            w2_u8,
+            a2_scale,
+            w2s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=model_dim,
+            K=inter_dim,
+            tile_m=tile_m2,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            m_warp=m_warp2,
+            n_warp=n_warp2,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=0,
+            **sh2,
+            bias=_b2,
+            num_buffers=num_buffers2,
+            persistent_workers=persistent_workers2,
+            cluster_m=cluster_m2,
+            cluster_n=cluster_n2,
+            waves_per_tensor_tdm=waves_per_tensor_tdm2,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
+            **_ep_gemm2_kwargs,
+        )
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
