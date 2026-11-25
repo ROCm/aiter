@@ -9,8 +9,12 @@ import torch
 from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.reduce_bf16 import (
     compile_moe_reduce_bf16,
 )
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import compile_moe_sort
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.tile_map import compile_tile_map
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import (
+    compile_moe_sort,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.tile_map import (
+    compile_tile_map,
+)
 
 
 def _u8_flat(t: torch.Tensor) -> torch.Tensor:

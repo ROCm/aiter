@@ -9,13 +9,13 @@ import functools
 
 import torch
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.flydsl_utils import run_compiled
 from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.launch import (
     _get_reduce_bf16,
     _get_sort,
     _get_tile_map,
     _u8_flat,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled as run_compiled
 
 MIN_PREFILL_TOKENS = 3072
 MAX_PREFILL_TOKENS = 65536
@@ -86,12 +86,13 @@ def a4w4_prefill_moe(
     """``x_quant`` = (fp4 ``[M, H/2]``, e8m0 ``[M, H/32]``) of aiter's per-token
     MXFP4 quant -> ``[M, H]`` bf16, on ``AiterMxfp4Experts``' weights."""
     from aiter import dtypes
-    from aiter.ops.quant import mxfp4_moe_sort_hip
-
-    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import SortBuffers
+    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import (
+        SortBuffers,
+    )
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.tile_map import (
         tile_map_grid,
     )
+    from aiter.ops.quant import mxfp4_moe_sort_hip
 
     from .gemm2_prefill import gemm2_grid
 
@@ -103,6 +104,18 @@ def a4w4_prefill_moe(
     assert x_s.shape == (n_tokens, hidden // 32) and x_s.is_contiguous()
     inter = intermediate_size
     topk = topk_ids.shape[1]
+    assert supports_shapes(hidden, inter), (hidden, inter)
+    assert topk_ids.shape == topk_weights.shape == (n_tokens, topk)
+    assert w2.shape == (num_experts, hidden, inter // 2) and w13.shape[0] == num_experts
+    assert all(
+        t.is_cuda and t.device == a_q.device for t in (w13, w13_scale, w2, w2_scale)
+    )
+    # shortcut: guards only the 2^32 wrap; whether the descriptor reads 2^31..2^32 as
+    # unsigned is unmeasured above 32K tokens, so verify on gfx950 before relying on it.
+    assert n_tokens * topk * hidden * 2 < 2**32, (n_tokens, topk, hidden)
+    if out is not None:
+        assert out.shape == (n_tokens, hidden) and out.dtype == torch.bfloat16
+        assert out.is_contiguous() and out.device == a_q.device
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.to(torch.float32).contiguous()
     device = topk_ids.device

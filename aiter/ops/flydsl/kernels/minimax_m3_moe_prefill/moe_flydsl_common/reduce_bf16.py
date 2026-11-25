@@ -6,12 +6,16 @@ One wave per (token, 512-column chunk), non-temporal loads."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.epilogue import _bf16x2
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import _as_f32
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.epilogue import (
+    _bf16x2,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import (
+    _as_f32,
+)
 from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.utils import (
     PRELOAD_HINTS,
     _tensor_addr,

@@ -25,15 +25,16 @@ Layouts (all bytes):
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import (
-    buffer_ops,  
-)
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import (
+    buffer_ops,
+)
 
 _N_WAVES = 4
 
@@ -96,7 +97,7 @@ def _uniform_i32(value):
 
 def _swizzled_col(row, col):
     """The swizzled 128-B-row byte column ``swizzle_128`` lands (row, col) on."""
-    r, c = swizzle_128(row, col)
+    _, c = swizzle_128(row, col)
     return c
 
 
@@ -225,7 +226,7 @@ def _riffle(glb, lds):
     li = 0
     for gi, t in enumerate(glb):
         out.append(t)
-        upto = int(round((gi + 1) * step))
+        upto = round((gi + 1) * step)
         out += lds[li:upto]
         li = upto
     return out + lds[li:]
@@ -574,7 +575,7 @@ def _permlane16_swap(d_a, d_b):
 def compile_moe_gemm1(
     *,
     H: int,
-    I: int,  # noqa: E741
+    I: int,
     E: int,
     BLOCK_M: int = 128,
 ):

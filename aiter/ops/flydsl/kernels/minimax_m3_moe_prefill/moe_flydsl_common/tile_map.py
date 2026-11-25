@@ -14,14 +14,16 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import _min
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import (
+    _min,
+)
 
 _THREADS = 256
 _MAX_BLOCKS = 4096  # >= max_sorted / BM (1409 at 65536 tokens, BM 256)
 _SEARCH_STEPS = 13  # 2^13 > _MAX_BLOCKS
 
 
-def compile_tile_map(*, I: int, BM: int = 128):  # noqa: E741
+def compile_tile_map(*, I: int, BM: int = 128):
     NB_N = I // 128
     N_BITS = (NB_N - 1).bit_length()
     N_CTAS = _MAX_BLOCKS // _THREADS
@@ -86,6 +88,6 @@ def compile_tile_map(*, I: int, BM: int = 128):  # noqa: E741
     return launch_tile_map
 
 
-def tile_map_grid(num_m_blocks: int, I: int) -> int:  # noqa: E741
+def tile_map_grid(num_m_blocks: int, I: int) -> int:
     """gemm1 grid: every (m, n) tile of the allocation, rounded up to 8 XCDs."""
     return (num_m_blocks * (I // 128) + 7) // 8 * 8

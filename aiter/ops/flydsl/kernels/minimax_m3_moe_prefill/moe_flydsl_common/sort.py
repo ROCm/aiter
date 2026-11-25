@@ -13,7 +13,9 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import range_constexpr
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.utils import _lds_atomic_add_i32
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.utils import (
+    _lds_atomic_add_i32,
+)
 
 SORT_CTAS = 128  # histogram / placement blocks
 THREADS = 1024  # >= E and >= block_m

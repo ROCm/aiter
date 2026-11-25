@@ -26,20 +26,6 @@ PRELOAD_HINTS = {
 }
 
 
-def run_compiled(exe, *args, waves_per_eu: int | None = None):
-    """Compiles and runs ``exe`` on the first call, then dispatches the cache."""
-    import flydsl.compiler as flyc
-    from flydsl.compiler.kernel_function import CompilationContext
-
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        hints = {"waves_per_eu": waves_per_eu} if waves_per_eu else {}
-        with CompilationContext.compile_hints(hints):
-            exe._cf = flyc.compile(exe, *args)
-    else:
-        cf(*args)
-
-
 @functools.cache
 def cu_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count

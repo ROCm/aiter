@@ -9,7 +9,9 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import _lds_ptr_t
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import (
+    _lds_ptr_t,
+)
 
 _NUM_XCDS = 8
 

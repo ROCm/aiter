@@ -26,7 +26,6 @@ Layouts (bytes):
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
@@ -34,6 +33,8 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .gemm1_prefill import (
     _N_WAVES,
@@ -285,7 +286,7 @@ _STORE_CPOL_SC = 0
 def compile_moe_gemm2(
     *,
     H: int,
-    I: int,  # noqa: E741
+    I: int,
     E: int,
     topk: int,
     n_split: int = 2,
