@@ -20,6 +20,11 @@
 #                        (stage-1 + stage-2 reduce into the final O). A partial
 #                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
 #
+# Split rebalance (bh16 decode, opt-in with kv_split_info): the grid is a fixed
+# number of work items shared by the batch, not NUM_KV_SPLITS per sequence.
+# mla_gluon_split_metadata cuts the batch's KV into segments of one length, so a
+# long sequence gets more segments and the call no longer waits on the longest one.
+#
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
 #
@@ -52,8 +57,12 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.gluon.mla_gluon_split import (
+    _mla_gluon_split_metadata_kernel,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.plugin import route as _route
 
 # fmt: off
 @gluon.jit
@@ -90,9 +99,10 @@ def _mla_gluon(
     stride_final_lse_b,
     stride_final_lse_s,  # MTP: q_pos stride; 0 when QLEN==1
     stride_final_lse_h,
+    Split_work,  # SPLIT_REBALANCE only: int32 [NUM_KV_SPLITS, 8] from mla_gluon_split_metadata
     BLOCK_H: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,  # SPLIT_REBALANCE: the work items of the batch
     PAGE_SIZE: gl.constexpr,
     HEAD_DIM_CKV: gl.constexpr,
     HEAD_DIM_KPE: gl.constexpr,
@@ -107,9 +117,10 @@ def _mla_gluon(
     # --- dsv4-prefill knobs ---
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
+    SPLIT_REBALANCE: gl.constexpr,  # read each work item's KV range from Split_work
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
-    # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
+    # use 2-D (batch, split) - for batch_size=1 this is (1, NUM_KV_SPLITS).
     # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
     # it into grid axis 1 (after the head-block index); bh16 uses grid axis 2.
     # When QLEN==1, q_pos is always 0 and the layout below is identical to before.
@@ -134,23 +145,37 @@ def _mla_gluon(
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
     # USE_2D_VIEW=False: flattened VarLen
     # Req_to_tokens = kv_indices[total_kv],           B_seq_len = kv_indptr[batch+1]
-    if USE_2D_VIEW:
-        batch_page_start = stride_req_to_tokens_bs * cur_batch
-        cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
+    if SPLIT_REBALANCE:
+        gl.static_assert(REGIME != 'bh64')
+        # grid axis 0 is the work item; it is also the slot of its partial output
+        split_kv_id = gl.program_id(0)
+        work_row = Split_work + split_kv_id * 8
+        cur_batch = gl.load(work_row)
+        split_kv_start = gl.load(work_row + 1)
+        split_kv_end = gl.load(work_row + 2)
+        cur_batch_seq_len = gl.load(work_row + 3)
+        if USE_2D_VIEW:
+            batch_page_start = stride_req_to_tokens_bs * cur_batch
+        else:
+            batch_page_start = gl.load(work_row + 4)
     else:
-        batch_page_start = gl.load(B_seq_len + cur_batch)
-        cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
+        if USE_2D_VIEW:
+            batch_page_start = stride_req_to_tokens_bs * cur_batch
+            cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
+        else:
+            batch_page_start = gl.load(B_seq_len + cur_batch)
+            cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # NUM_KV_SPLITS is a launch-time budget only. 
-    # the partition is derived here from the runtime per-batch KV length.
-    # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
-    #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
-    #     is spread over fewer, whole-block splits instead of many partial ones;
-    kv_len_per_split = gl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    if split_kv_id == NUM_KV_SPLITS - 1:
-        split_kv_end = cur_batch_seq_len
+        # NUM_KV_SPLITS is a launch-time budget only.
+        # the partition is derived here from the runtime per-batch KV length.
+        # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
+        #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
+        #     is spread over fewer, whole-block splits instead of many partial ones;
+        kv_len_per_split = gl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        if split_kv_id == NUM_KV_SPLITS - 1:
+            split_kv_end = cur_batch_seq_len
     # early return for inactive split
     if split_kv_start >= split_kv_end:
         return
@@ -725,6 +750,8 @@ def _mla_softmax_reducev_kernel(
     O,
     Final_lse,
     B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
+    Split_meta,  # SPLIT_REBALANCE only: batch b owns slots [Split_meta[b], Split_meta[b + 1])
+    Attn_sink,  # HAS_ATTN_SINK only: [nhead] fp32
     stride_l_b,
     stride_l_qs,  # MTP: q_pos (qlen) stride; 0 when QLEN==1
     stride_l_h,
@@ -745,27 +772,36 @@ def _mla_softmax_reducev_kernel(
     USE_2D_VIEW: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPLIT_REBALANCE: tl.constexpr,
+    HAS_ATTN_SINK: tl.constexpr,  # add the sink once for each sequence (stage-1 did not)
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     q_pos = tl.program_id(2)
 
-    # Recompute this batch's seq len exactly as the decode kernel did, so we can
-    # rederive which splits are empty. Stage-1 early-returns on empty splits
-    # (num_iter == 0) and writes nothing, so their logits_buf / mid_lse slots hold
-    # raw, uninitialised memory - they cannot be loaded or reduced.
-    if USE_2D_VIEW:
-        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    if SPLIT_REBALANCE:
+        # mla_gluon_split_metadata stored the partition; every slot in the
+        # range holds data
+        first_split = tl.load(Split_meta + cur_batch)
+        active_kv_splits = tl.load(Split_meta + cur_batch + 1) - first_split
     else:
-        batch_page_start = tl.load(B_seq_len + cur_batch)
-        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
-    # Mirror stage-1's partition (see _mla_gluon) so both stages agree on how many
-    # splits actually hold data. Splits >= active were early-returned by stage-1
-    # and never written; they are masked out of the reduce below.
-    kv_len_per_split = tl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
-    active_kv_splits = tl.minimum(
-        tl.cdiv(cur_batch_seq_len, kv_len_per_split), NUM_KV_SPLITS
-    )
+        first_split = 0
+        # Recompute this batch's seq len exactly as the decode kernel did, so we can
+        # rederive which splits are empty. Stage-1 early-returns on empty splits
+        # (num_iter == 0) and writes nothing, so their logits_buf / mid_lse slots hold
+        # raw, uninitialised memory - they cannot be loaded or reduced.
+        if USE_2D_VIEW:
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+        else:
+            batch_page_start = tl.load(B_seq_len + cur_batch)
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
+        # Mirror stage-1's partition (see _mla_gluon) so both stages agree on how many
+        # splits actually hold data. Splits >= active were early-returned by stage-1
+        # and never written; they are masked out of the reduce below.
+        kv_len_per_split = tl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
+        active_kv_splits = tl.minimum(
+            tl.cdiv(cur_batch_seq_len, kv_len_per_split), NUM_KV_SPLITS
+        )
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_s = tl.arange(0, BLOCK_S)
@@ -786,11 +822,12 @@ def _mla_softmax_reducev_kernel(
     for start in range(0, active_kv_splits, BLOCK_S):
         s_ids = start + offs_s  # [BLOCK_S]
         s_mask = s_ids < active_kv_splits
+        slots = first_split + s_ids
         lse = tl.load(
-            Mid_lse + base_ml + s_ids * stride_ml_s, mask=s_mask, other=-float("inf")
+            Mid_lse + base_ml + slots * stride_ml_s, mask=s_mask, other=-float("inf")
         )  # [BLOCK_S]
         logits = tl.load(
-            Logits + base_l + s_ids[:, None] * stride_l_s + offs_d_ckv[None, :],
+            Logits + base_l + slots[:, None] * stride_l_s + offs_d_ckv[None, :],
             mask=s_mask[:, None],
             other=0.0,
         )  # [BLOCK_S, HEAD_DIM_CKV]
@@ -804,6 +841,15 @@ def _mla_softmax_reducev_kernel(
         e_sum = e_sum * old_scale + tl.sum(w, axis=0)
         e_max = n_e_max
 
+    if HAS_ATTN_SINK:
+        # natural-log units, as stage-1 lse; no V contribution
+        sink = tl.load(Attn_sink + cur_head).to(tl.float32)
+        n_e_max = tl.maximum(e_max, sink)
+        old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
+        acc = acc * old_scale
+        e_sum = e_sum * old_scale + tl.exp(sink - n_e_max)
+        e_max = n_e_max
+
     out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
     tl.store(
         O + cur_batch * stride_o_b + q_pos * stride_o_qs + cur_head * stride_o_h + offs_d_ckv,
@@ -815,6 +861,30 @@ def _mla_softmax_reducev_kernel(
             e_max + tl.log(e_sum),
         )
 # fmt: on
+
+
+_BH16_BLOCK_N = {"bh16bn64": 64, "bh16bn128": 128}
+
+
+def _mla_gluon_regime(nhead, kv_dtype):
+    """The kernel regime for (nhead, kv dtype); see the top of this file."""
+    if nhead in (64, 128):
+        return "bh64"
+    if 1 <= nhead <= 96:
+        # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
+        # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
+        # nhead > 16 (e.g. 96) adds head-block programs. A partial last block
+        # (nhead % 16 != 0) masks OOB heads on Q load / O store.
+        if kv_dtype == torch.bfloat16:
+            return "bh16bn64"
+        if kv_dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
+            return "bh16bn128"
+        raise AssertionError(
+            f"mla_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_dtype}"
+        )
+    raise AssertionError(
+        f"mla_gluon requires nhead <= 96 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
+    )
 
 
 def mla_gluon(
@@ -836,8 +906,9 @@ def mla_gluon(
     return_lse=False,
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
+    kv_split_info=None,  # (work_info, split_meta) from mla_gluon_split_metadata
 ):
-    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+    """Unified Gluon MLA entry (gfx950 / CDNA4) - decode and DeepSeek V4 sparse prefill.
 
     `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
     fast path when NUM_KV_SPLITS==1) and writes the final attention into the
@@ -859,7 +930,175 @@ def mla_gluon(
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
     and attn_sink, q_pe / k_pe are unused placeholders.
+
+    kv_split_info (bh16 decode, has_pe=True): the split rebalance partition that
+        mla_gluon_split_metadata returns for this seq_info. A long sequence then
+        gets more KV splits than a short one, so a batch with mixed KV lengths
+        does not wait on its longest sequence. Build it once for each decode step
+        and pass it to the call of each layer. None (default) gives each sequence
+        the same number of splits. With attn_sink, the reduce adds the sink once
+        for each sequence.
+
+    The decode mode (has_pe=True, no attn_sink and no kv_split_info) is the
+    routed op `mla_paged_decode`. An enabled kernel plugin can serve it. The
+    prefill mode and a call with kv_split_info always run the Gluon kernel:
+    kv_split_info is internal to it.
     """
+    if has_pe and attn_sink is None and kv_split_info is None:
+        lse = _mla_paged_decode_routed(
+            q_nope,
+            q_pe,
+            kv_c,
+            o,
+            page_table,
+            seq_info,
+            sm_scale,
+            k_pe,
+            kv_pe_offset,
+            use_2d_view,
+            kv_scale,
+            min_kv_seq_len,
+            return_lse,
+        )
+        return o, (lse if return_lse else None)
+    return _mla_gluon_launch(
+        q_nope,
+        q_pe,
+        kv_c,
+        o,
+        page_table,
+        seq_info,
+        sm_scale,
+        k_pe,
+        kv_pe_offset,
+        use_2d_view,
+        kv_scale,
+        min_kv_seq_len,
+        return_lse,
+        has_pe,
+        attn_sink,
+        kv_split_info,
+    )
+
+
+def _mla_paged_decode_fake(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    o: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_info: torch.Tensor,
+    sm_scale: float,
+    k_pe: torch.Tensor | None = None,
+    kv_pe_offset: int = 512,
+    use_2d_view: bool = True,
+    kv_scale: float = 1.0,
+    min_kv_seq_len: int = 1,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    """The shape of the returned lse: see :func:`_mla_paged_decode_routed`."""
+    if not return_lse:
+        return q_nope.new_empty(0, dtype=torch.float32)
+    batch, qlen = q_nope.shape[0], q_nope.shape[1] if q_nope.dim() == 4 else 1
+    return q_nope.new_empty((batch, qlen, q_nope.shape[-2]), dtype=torch.float32)
+
+
+# Only the decode mode is routed. The op name tells the operation, not the backend.
+# The op returns lse alone, so no result aliases o: a custom op cannot return
+# Optional[Tensor], so "no lse" is an empty tensor.
+@_route(
+    op="mla_paged_decode",
+    version=1,
+    fake=_mla_paged_decode_fake,
+    mutates_args=["o"],
+)
+def _mla_paged_decode_routed(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    o: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_info: torch.Tensor,
+    sm_scale: float,
+    k_pe: torch.Tensor | None = None,
+    kv_pe_offset: int = 512,
+    use_2d_view: bool = True,
+    kv_scale: float = 1.0,
+    min_kv_seq_len: int = 1,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    """MLA decode over KV rows that a page table selects (page size 1).
+
+    This is the decode mode of :func:`mla_gluon`: ``has_pe=True`` and no
+    ``attn_sink``. The logits are ``(q_nope . k_nope + q_pe . k_pe) * sm_scale
+    * kv_scale``. The values are the first 512 columns of the KV rows, times
+    ``kv_scale``.
+
+    Args:
+        q_nope: ``[batch, nhead, 512]`` bf16. MTP: ``[batch, qlen, nhead, 512]``.
+        q_pe: ``[batch, nhead, 64]`` bf16. MTP: ``[batch, qlen, nhead, 64]``.
+        kv_c: KV rows, bf16 or fp8. Shared: ``[N, 576]``, the RoPE part at
+            column ``kv_pe_offset`` (512). Split: ``[N, 512]``.
+        o: the output, with the shape of ``q_nope``. The op writes it in place.
+        page_table: ``use_2d_view=True``: ``[batch, max_seqlen]`` KV row
+            indices. ``use_2d_view=False``: flat KV row indices of all requests.
+        seq_info: ``use_2d_view=True``: ``[batch]`` KV lengths.
+            ``use_2d_view=False``: ``[batch + 1]`` offsets into ``page_table``.
+        sm_scale: softmax scale.
+        k_pe: split mode: ``[N, 64]`` RoPE rows, with ``kv_pe_offset=0``.
+            Shared mode: None.
+        kv_pe_offset: first column of the RoPE part in its rows.
+        kv_scale: scale of the KV values. Use 1.0 for bf16 KV.
+        min_kv_seq_len: the caller promises that no request has fewer KV rows.
+            The value does not change the result.
+        return_lse: if True, also return the log-sum-exp.
+
+    MTP: query ``i`` of ``qlen`` reads the KV rows ``[0, seq_len - qlen + i]``.
+
+    Returns:
+        ``lse``. The attention is written into ``o`` in place. ``lse`` is a new
+        fp32 ``[batch, qlen, nhead]`` tensor (``qlen`` is 1 for 3-D ``q_nope``)
+        if ``return_lse`` is True, else a new empty fp32 tensor.
+    """
+    _, lse = _mla_gluon_launch(
+        q_nope,
+        q_pe,
+        kv_c,
+        o,
+        page_table,
+        seq_info,
+        sm_scale,
+        k_pe,
+        kv_pe_offset,
+        use_2d_view,
+        kv_scale,
+        min_kv_seq_len,
+        return_lse,
+        True,
+        None,
+    )
+    return lse if lse is not None else q_nope.new_empty(0, dtype=torch.float32)
+
+
+def _mla_gluon_launch(
+    q_nope,
+    q_pe,
+    kv_c,
+    o,
+    page_table,
+    seq_info,
+    sm_scale,
+    k_pe,
+    kv_pe_offset,
+    use_2d_view,
+    kv_scale,
+    min_kv_seq_len,
+    return_lse,
+    has_pe,
+    attn_sink,
+    kv_split_info=None,
+):
+    """Launch the Gluon MLA kernels. The arguments are those of :func:`mla_gluon`."""
     if k_pe is None:
         k_pe = kv_c
 
@@ -894,31 +1133,15 @@ def mla_gluon(
     if attn_sink is None:
         attn_sink = torch.empty(1, device=o.device, dtype=torch.float32)  # dummy ptr
 
-    # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path:
-    # q_pos is grid axis 2, so each query position is a separate program.
-    if nhead in (64, 128):
-        REGIME = "bh64"
-    elif 1 <= nhead <= 96:
-        # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
-        # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
-        # nhead > 16 (e.g. 96) adds head-block programs. A partial last block
-        # (nhead % 16 != 0) masks OOB heads on Q load / O store.
-        if kv_c.dtype == torch.bfloat16:
-            REGIME = "bh16bn64"
-        elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
-            REGIME = "bh16bn128"
-        else:
-            raise AssertionError(
-                f"mla_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_c.dtype}"
-            )
-    else:
-        raise AssertionError(
-            f"mla_gluon requires nhead <= 96 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
-        )
+    # MTP (qlen>1) uses the grid-axis path: q_pos is grid axis 2, so each query
+    # position is a separate program.
+    REGIME = _mla_gluon_regime(nhead, kv_c.dtype)
 
     PAGE_SIZE = 1
+    split_rebalance = False
 
     if REGIME == "bh64":
+        assert kv_split_info is None, "kv_split_info is for the bh16 regimes"
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
         # Auto-pick NUM_KV_SPLITS so the launch fills about one wave of workgroups.
@@ -951,7 +1174,7 @@ def mla_gluon(
         ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
     else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
         BLOCK_H = 16
-        BLOCK_N = 128 if REGIME == "bh16bn128" else 64
+        BLOCK_N = _BH16_BLOCK_N[REGIME]
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
         # One-wave launch budget, independent of sequence length so CUDA
@@ -960,6 +1183,22 @@ def mla_gluon(
         # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
         NUM_KV_SPLITS = max(1, get_num_sms() // (batch_size * qlen * NUM_M_BLOCKS))
+        # Split rebalance: NUM_KV_SPLITS becomes the work items of the whole batch.
+        if kv_split_info is not None:
+            assert has_pe, "kv_split_info is for decode (has_pe=True)"
+            split_work, split_meta = kv_split_info
+            assert (
+                split_work.dtype == split_meta.dtype == torch.int32
+                and split_work.dim() == 2
+                and split_work.shape[1] == 8
+                and split_work.is_contiguous()
+            ), "kv_split_info must come from mla_gluon_split_metadata"
+            assert split_meta.numel() == batch_size + 1, (
+                f"kv_split_info is for batch {split_meta.numel() - 1}, "
+                f"got batch {batch_size}"
+            )
+            split_rebalance = True
+            NUM_KV_SPLITS = split_work.shape[0]
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -1003,6 +1242,16 @@ def mla_gluon(
         stride_mid_lse_b = stride_mid_lse_s = stride_mid_lse_h = (
             stride_mid_lse_split
         ) = 0
+    elif split_rebalance:
+        # one slot per work item: [work item, qlen, nhead, ...]
+        logits_buf = torch.empty(
+            (NUM_KV_SPLITS, qlen, nhead, head_dim_ckv), dtype=o.dtype, device=o.device
+        )
+        mid_lse = torch.empty(
+            (NUM_KV_SPLITS, qlen, nhead), dtype=torch.float32, device=o.device
+        )
+        stride_mid_lse_split, stride_mid_lse_s, stride_mid_lse_h = mid_lse.stride()
+        stride_mid_lse_b = 0
     else:
         # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
         logits_buf = torch.empty(
@@ -1019,9 +1268,15 @@ def mla_gluon(
             mid_lse.stride()
         )
 
-    # logits_buf is [batch, qlen, nhead, split, dim] in both paths; reuse its
-    # strides for stage-1's O write (fast path aliases o, so this stays correct).
-    stride_o_b, stride_o_s, stride_o_h, stride_o_split, _ = logits_buf.stride()
+    if split_rebalance:
+        # every batch writes at its work item's slot
+        stride_o_split, stride_o_s, stride_o_h, _ = logits_buf.stride()
+        stride_o_b = 0
+    else:
+        # logits_buf is [batch, qlen, nhead, split, dim]; reuse its strides for
+        # stage-1's O write (fast path aliases o, so this stays correct).
+        stride_o_b, stride_o_s, stride_o_h, stride_o_split, _ = logits_buf.stride()
+        split_meta = split_work = seq_info  # unused
 
     if return_lse:
         final_lse = torch.empty(
@@ -1042,7 +1297,11 @@ def mla_gluon(
         # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
         # times qlen query positions. For nhead <= 16 this is just qlen (one head
         # block), i.e. the original grid-axis MTP mapping.
-        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
+        # Split rebalance: axis 0 carries the batch's work items instead.
+        if split_rebalance:
+            grid = (NUM_KV_SPLITS, 1, triton.cdiv(nhead, BLOCK_H) * qlen)
+        else:
+            grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_gluon[grid](
@@ -1078,6 +1337,7 @@ def mla_gluon(
         stride_final_lse_b,
         stride_final_lse_s,
         stride_final_lse_h,
+        split_work,
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
         NUM_KV_SPLITS=NUM_KV_SPLITS,
@@ -1093,7 +1353,10 @@ def mla_gluon(
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
-        HAS_ATTN_SINK=has_attn_sink,
+        # split rebalance: a sequence has several segments, so the reduce adds
+        # the sink once instead
+        HAS_ATTN_SINK=has_attn_sink and not split_rebalance,
+        SPLIT_REBALANCE=split_rebalance,
     )
 
     if NUM_KV_SPLITS == 1:
@@ -1103,14 +1366,24 @@ def mla_gluon(
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
     grid_reduce = (batch_size, nhead, qlen)
-    sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
-    reduce_num_warps = 1 if NUM_KV_SPLITS <= 8 else 8
+    if split_rebalance:
+        sl_split, sl_qs, sl_h, _ = logits_buf.stride()
+        sl_b = 0
+        # a sequence has about NUM_KV_SPLITS / batch_size splits, not NUM_KV_SPLITS
+        reduce_block_s = min(4, triton.next_power_of_2(NUM_KV_SPLITS))
+        reduce_num_warps = 1
+    else:
+        sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
+        reduce_block_s = min(64, triton.next_power_of_2(NUM_KV_SPLITS))
+        reduce_num_warps = 1 if NUM_KV_SPLITS <= 8 else 8
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
         mid_lse,
         o,
         final_lse,
         seq_info,
+        split_meta,
+        attn_sink,
         sl_b,
         sl_qs,
         sl_h,
@@ -1129,9 +1402,126 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
-        BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
+        BLOCK_S=reduce_block_s,
         BLOCK_N=BLOCK_N,
+        SPLIT_REBALANCE=split_rebalance,
+        HAS_ATTN_SINK=has_attn_sink and split_rebalance,
         num_warps=reduce_num_warps,
     )
 
     return o, final_lse
+
+
+def _mla_gluon_split_num_work(nhead, qlen):
+    """Work items of one split rebalance launch: one wave, a program for each CU,
+    shared by the head blocks and the query rows."""
+    return get_num_sms() // (qlen * triton.cdiv(nhead, 16))
+
+
+def mla_gluon_split_metadata_info(max_batch_size, nhead, kv_dtype, qlen=1):
+    """Shapes and dtypes of the kv_split_info tensors (work_info, split_meta) that
+    mla_gluon_split_metadata writes, for preallocated out= buffers.
+
+    Call it once, when you allocate the buffers (for example before CUDA-graph
+    capture). Then call mla_gluon_split_metadata for each decode step, with the
+    buffers as out=. A caller without preallocated buffers does not need it.
+
+    max_batch_size: the largest batch that the buffers serve (>= 1). It sets only
+        the split_meta size and does not change whether this returns None. Give
+        the same buffers for a batch of any size up to it.
+    nhead, kv_dtype, qlen: as the mla_gluon calls (kv_dtype: kv_c.dtype).
+
+    Returns ((shape, dtype), (shape, dtype)) for work_info and split_meta, or None
+    when the split rebalance cannot apply: the bh64 regime (nhead 64 or 128), or
+    fewer than two work items. Like mla_gluon, it raises for an nhead or a kv_dtype
+    that no regime supports. The rebalance applies to a batch with fewer
+    sequences than work items (the first dimension of the work_info shape);
+    for a batch with that many sequences or more, mla_gluon_split_metadata
+    returns None.
+    """
+    assert max_batch_size >= 1, f"max_batch_size must be >= 1, got {max_batch_size}"
+    if _mla_gluon_regime(nhead, kv_dtype) == "bh64":
+        return None
+    num_work = _mla_gluon_split_num_work(nhead, qlen)
+    if num_work < 2:
+        return None
+    return ((num_work, 8), torch.int32), ((max_batch_size + 1,), torch.int32)
+
+
+def mla_gluon_split_metadata(
+    seq_info,
+    nhead,
+    kv_dtype,
+    qlen=1,
+    use_2d_view=True,
+    out=None,
+):
+    """Split rebalance partition for the kv_split_info of mla_gluon (bh16 decode).
+
+    The batch's KV is cut into BLOCK_N-aligned segments of one length: the
+    shortest segments that fit in one wave of mla_gluon programs (about one for
+    each CU). A long sequence gets more segments than a short one. One launch
+    computes the KV range of each work item and the first work item of each
+    batch. All the layers of a decode step read the same seq_info, so build it
+    once for each step and pass it to each mla_gluon call. The grid does not
+    depend on the KV lengths, so a CUDA graph can capture the launch.
+
+    seq_info: as mla_gluon, cache_seqlens [batch] for use_2d_view, else
+        kv_indptr [batch + 1].
+    nhead, kv_dtype, qlen: as the mla_gluon calls (kv_dtype: kv_c.dtype).
+    out: optional (work_info, split_meta) to write into, with the shapes and dtypes
+        from mla_gluon_split_metadata_info, for example persistent CUDA-graph
+        buffers on the device of seq_info. split_meta can be larger than the
+        batch needs; this writes and returns its first batch + 1 elements.
+
+    Returns the kv_split_info for mla_gluon: (work_info, split_meta), two int32
+    tensors. Their contents are internal to mla_gluon; give the returned tuple to
+    mla_gluon unchanged. Returns None when the rebalance does not apply: the bh64 regime
+    (nhead 64 or 128), or not more work items than sequences. Like mla_gluon, it
+    raises for an nhead or a kv_dtype that no regime supports.
+    """
+    batch_size = seq_info.numel() if use_2d_view else seq_info.numel() - 1
+    regime = _mla_gluon_regime(nhead, kv_dtype)
+    if regime == "bh64":
+        return None
+    # each sequence needs at least one work item
+    num_work = _mla_gluon_split_num_work(nhead, qlen)
+    if num_work <= batch_size:
+        return None
+    if out is None:
+        work_info = torch.empty(
+            (num_work, 8), dtype=torch.int32, device=seq_info.device
+        )
+        split_meta = torch.empty(
+            batch_size + 1, dtype=torch.int32, device=seq_info.device
+        )
+    else:
+        work_info, split_meta = out
+        for name, t in (("work_info", work_info), ("split_meta", split_meta)):
+            assert t.dtype == torch.int32 and t.is_contiguous(), (
+                f"{name} must be a contiguous int32 tensor, "
+                f"got {t.dtype}, contiguous={t.is_contiguous()}"
+            )
+            assert (
+                t.device == seq_info.device
+            ), f"{name} is on {t.device}, seq_info on {seq_info.device}"
+        work_shape = (num_work, 8)
+        assert (
+            tuple(work_info.shape) == work_shape
+        ), f"work_info must be {work_shape}, got {tuple(work_info.shape)}"
+        assert split_meta.dim() == 1 and split_meta.numel() >= batch_size + 1, (
+            f"split_meta must be 1-D with at least {batch_size + 1} elements, "
+            f"got {tuple(split_meta.shape)}"
+        )
+        split_meta = split_meta[: batch_size + 1]
+    _mla_gluon_split_metadata_kernel[(num_work,)](
+        seq_info,
+        split_meta,
+        work_info,
+        batch_size,
+        USE_2D_VIEW=use_2d_view,
+        NUM_WORK=num_work,
+        BLOCK_N=_BH16_BLOCK_N[regime],
+        BLOCK_B=max(64, triton.next_power_of_2(batch_size)),
+    )
+    return work_info, split_meta

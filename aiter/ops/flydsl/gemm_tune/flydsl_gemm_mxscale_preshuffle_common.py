@@ -518,6 +518,7 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
 )
 from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
     make_mxfp8_8wave_kernel_name,
+    tail_split_n1,
 )
 
 # 8-wave ids share the ``flydsl`` libtype with mxpsh in the same table, so they
@@ -528,6 +529,9 @@ KERNEL_ID_BASE_8WAVE = 1_000_000
 # expressible; its only tile is 256x256.
 _WAVES_PER_EU_8WAVE = (1, 2, 3, 4)
 _XCD_SWIZZLE_8WAVE = (0, 4, 8)
+# K-splits of the last wave's tiles (_ns): timed only for shapes whose 256x256
+# tiles overrun the CUs by a partial wave that the split still fits in.
+_N_SPLIT_8WAVE = (2, 3, 4)
 _I32_MAX = 2**31
 
 
@@ -536,26 +540,54 @@ class EightWaveKernelInstance:
     waves_per_eu: int
     xcd_swizzle: int
     split_k: int = 1
+    n_split: int = (
+        1  # K-split of the last wave's tiles (_ns), see gemm_a8w8_mxfp8_8wave
+    )
 
     @property
     def name(self) -> str:
-        return make_mxfp8_8wave_kernel_name(self.waves_per_eu, self.xcd_swizzle)
+        return make_mxfp8_8wave_kernel_name(
+            self.waves_per_eu, self.xcd_swizzle, self.n_split
+        )
 
 
-def fits_shape_8wave(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+def _fits_tail_split(
+    ki: EightWaveKernelInstance, M: int, N: int, K: int, w_scale_block: str
+) -> bool:
+    """An _ns candidate fits a shape whose last wave it splits, with the split
+    tail still one wave of workgroups."""
+    if ki.n_split == 1:
+        return True
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    n1 = tail_split_n1(M, N, K, ki.n_split, False, w_scale_block)
+    if n1 is None:
+        return False
+    tail_tiles = -(-M // 256) * ((N - n1) // 256)
+    return tail_tiles * ki.n_split <= get_cu_num()
+
+
+def fits_shape_8wave(
+    ki: EightWaveKernelInstance, M: int, N: int, K: int, w_scale_block: str = "1x32"
+) -> bool:
     """M and N may be ragged (buffer-descriptor OOB + the kernel's column
     guard); K must hold whole 256-K scale pairs; the buffer descriptors index
     in 32 bits (C is bf16, so its byte count doubles)."""
-    del ki
     if M <= 0 or N % 16 != 0 or K <= 0 or K % K_ALIGN_8WAVE != 0:
         return False
-    return not (M * N * 2 >= _I32_MAX or M * K >= _I32_MAX or N * K >= _I32_MAX)
+    if M * N * 2 >= _I32_MAX or M * K >= _I32_MAX or N * K >= _I32_MAX:
+        return False
+    return _fits_tail_split(ki, M, N, K, w_scale_block)
 
 
+# The unsplit ids first (stable kernelIds), then the _ns variants.
 kernels_list_8wave = {
-    KERNEL_ID_BASE_8WAVE + i: EightWaveKernelInstance(wpe, xcd)
-    for i, (wpe, xcd) in enumerate(
-        (w, x) for w in _WAVES_PER_EU_8WAVE for x in _XCD_SWIZZLE_8WAVE
+    KERNEL_ID_BASE_8WAVE + i: EightWaveKernelInstance(wpe, xcd, n_split=ns)
+    for i, (ns, wpe, xcd) in enumerate(
+        (ns, w, x)
+        for ns in (1, *_N_SPLIT_8WAVE)
+        for w in _WAVES_PER_EU_8WAVE
+        for x in _XCD_SWIZZLE_8WAVE
     )
 }
 
@@ -620,7 +652,7 @@ def _fits_mxpsh_row_w32x32(ki: kernelInstance, M: int, N: int, K: int) -> bool:
 
 
 def _fits_8wave_w32x32(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
-    return N % 32 == 0 and fits_shape_8wave(ki, M, N, K)
+    return N % 32 == 0 and fits_shape_8wave(ki, M, N, K, "32x32")
 
 
 def _fits_mxpsh_row_w128x128(ki: kernelInstance, M: int, N: int, K: int) -> bool:
@@ -631,7 +663,12 @@ def _fits_mxpsh_row_w128x128(ki: kernelInstance, M: int, N: int, K: int) -> bool
 
 def _fits_8wave_w128x128(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
     # A chunk stages a dword of each 128x128 scale row: K // 128 >= 4.
-    return N % 128 == 0 and K >= 512 and fits_shape_8wave(ki, M, N, K)
+    return (
+        ki.n_split == 1
+        and N % 128 == 0
+        and K >= 512
+        and fits_shape_8wave(ki, M, N, K, "128x128")
+    )
 
 
 # Order is the order candidates are emitted per shape. mxpsh's _fsk variants
