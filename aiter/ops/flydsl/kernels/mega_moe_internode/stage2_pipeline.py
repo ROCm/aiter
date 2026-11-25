@@ -1,17 +1,17 @@
 """Shared GEMM2/reduce/RAIL pipeline for one- and two-kernel launches."""
 
+import functools
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu
 
-from .mega_moe_internode_config import STAGE2_PART1_PROBE
 from .stage2 import compile_mega_moe_stage2, compile_stage2_node_combine
 
 
 def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
-    k1 = compile_mega_moe_stage2(**k1_kw, fused=True)
+    k1 = compile_mega_moe_stage2(**k1_kw)
     k2 = compile_stage2_node_combine(**k2_kw)
     k1_body, k2_body = k1.body, k2.body
     grid = int(k1.grid_ctas)
@@ -43,34 +43,29 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
              arg_output_bf16: fx.Int64, arg_scratch: fx.Int64, local_tokens: fx.Int32,
              arg_expert_count: fx.Int64, arg_sd_send: fx.Int64, arg_sd_tb: fx.Int64,
              arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64, arg_tr_mcnt: fx.Int64,
-             arg_tr_sdprog: fx.Int64, lds_ptr=None, grp_sync=None):
+             arg_tr_sdprog: fx.Int64, lds_ptr=None, grp_sync=None, gen_value=None, plan_ctx=None):
     # fmt: on
         bx = fx.Int32(fx.block_idx.x)
+        k2_call = functools.partial(k2_body, gen_value=gen_value)
         if const_expr(tr):
             k2.tr_init(arena_ptr, local_tokens, bx, fx.Int32(grid))
 
+        # token_ready runs only with SDMA (compile_mega_moe_stage2 checks).
         def tr_unit(lw, pre, post):
-            if const_expr(k1_kw.get("sdma", False)):
-                k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post,
-                           owner_grid=grid)
-            else:
-                k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post)
+            k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, False, pre, post,
+                       owner_grid=grid)
 
         def tr_tail(lw):
             # After its GEMM2 tickets: claim and reduce until every position
             # of the remote plane has been claimed.
             more = fx.Int32(1)
             while more != fx.Int32(0):
-                if const_expr(k1_kw.get("sdma", False)):
-                    more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
-                                               lw, True, owner_grid=grid))
-                else:
-                    more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
-                                               lw, True))
+                more = fx.Int32(k2.tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx,
+                                           lw, True, owner_grid=grid))
 
         def remote_half_done():
             if bx < fx.Int32(k2_ctas):
-                k2_body(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
+                k2_call(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
                         local_tokens, bx, fx.Int32(k2_ctas), part=1)
 
         def remote_half_probe(word_ptr):
@@ -86,16 +81,15 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
                 i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map, i32_local_rank,
                 fx.block_idx.x, arg_expert_count=arg_expert_count,
                 boundary_hook=remote_half_done if remote_first and not tr else None,
-                boundary_probe=(remote_half_probe if remote_first and STAGE2_PART1_PROBE
-                                and not tr else None),
+                boundary_probe=remote_half_probe if remote_first and not tr else None,
                 arg_tr_mcnt=arg_tr_mcnt, arg_tr_sdprog=arg_tr_sdprog, unit_hook=tr_unit if tr else None,
                 tail_hook=tr_tail if tr else None,
                 dev_comm=dev_comm, arg_sd_send=arg_sd_send, arg_sd_tb=arg_sd_tb,
                 arg_sd_plan=arg_sd_plan, arg_sd_cdone=arg_sd_cdone,
                 arena_win=arena_win, arena_ptr=arena_ptr, lds_ptr=lds_ptr,
-                grp_sync=grp_sync)
+                grp_sync=grp_sync, gen_value=gen_value, plan_ctx=plan_ctx)
         if bx < fx.Int32(k2_ctas):
-            k2_body(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
+            k2_call(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
                     local_tokens, bx, fx.Int32(k2_ctas), part=2 if remote_first else 0)
 
     return SimpleNamespace(body=body, k1=k1, k2=k2, grid=grid, threads=threads,
