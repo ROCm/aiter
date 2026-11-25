@@ -114,6 +114,79 @@ def test_top_k_renorm_probs_per_row_k(batch_size, vocab_size):
         )
 
 
+_RADIX_ROWSTART_SRC = """
+#include "sampling.cuh"
+extern "C" void {{func_name}}(void* in, void* row_starts, void* row_ends,
+                              void* out, void* out_idx, void* pivot, void* norm,
+                              int len, int k, void* stream) {
+    auto s = reinterpret_cast<hipStream_t>(stream);
+    size_t buf_size = 0;
+    radix_topk::standalone_stable_radix_10bits<float, int, true>(
+        nullptr, buf_size, (float*)in, 1, (int64_t)len, (int*)row_starts,
+        (int*)row_ends, k, (float*)out, (int*)out_idx, true, s);
+    void* buf = nullptr;
+    (void)hipMalloc(&buf, buf_size);
+    radix_topk::standalone_stable_radix_10bits<float, int, true>(
+        buf, buf_size, (float*)in, 1, (int64_t)len, (int*)row_starts,
+        (int*)row_ends, k, (float*)out, (int*)out_idx, true, s, 0,
+        (float*)pivot, (float*)norm, nullptr);
+    (void)hipStreamSynchronize(s);
+    (void)hipFree(buf);
+}
+"""
+
+
+# No public op passes rowStarts to radix_topk_one_block_kernel, so call it via a shim.
+@pytest.mark.parametrize(
+    "length,k,row_start,row_end",
+    [(4096, 8, 1000, 1005), (1024, 3, 512, 1024)],  # copy path, radix path
+)
+def test_radix_topk_row_start(length, k, row_start, row_end):
+    from jinja2 import Template
+
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
+    from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op
+
+    d = f"{AITER_CORE_DIR}/csrc/cpp_itfs"
+    func = compile_template_op(
+        Template(_RADIX_ROWSTART_SRC),
+        "test_radix_topk_row_start",
+        [f"{d}/utils.h", f"{d}/sampling/sampling.cuh", f"{d}/sampling/vec_dtypes.cuh"],
+    )
+
+    torch.manual_seed(0)
+    probs = (torch.randperm(length) + 1).float().unsqueeze(0) / length
+    starts = torch.tensor([row_start], dtype=torch.int32)
+    ends = torch.tensor([row_end], dtype=torch.int32)
+    out = torch.empty(1, k)
+    out_idx = torch.empty(1, k, dtype=torch.int32)
+    pivot = torch.empty(1)
+    norm = torch.empty(1)
+    func(
+        *torch_to_c_types(
+            probs,
+            starts,
+            ends,
+            out,
+            out_idx,
+            pivot,
+            norm,
+            length,
+            k,
+            torch.cuda.current_stream(),
+        )
+    )
+
+    n = min(k, row_end - row_start)
+    ref_vals, ref_idx = probs[0, row_start:row_end].topk(n)
+    got_idx = out_idx[0, :n].long()
+    assert torch.equal(got_idx.sort().values, (ref_idx + row_start).sort().values)
+    assert torch.equal(out[0, :n], probs[0, got_idx])
+    torch.testing.assert_close(norm[0], 1.0 / ref_vals.sum(), rtol=1e-4, atol=0)
+    ref_pivot = ref_vals[-1].item() if row_end - row_start > k else 0.0
+    assert pivot[0].item() == ref_pivot
+
+
 # Runs in a child process: the workspace is a function-local `static`, malloc'd
 # once per process, so a process that already called this op is a spent trial.
 _MIXED_TOP_K_BATCH = """
@@ -681,6 +754,8 @@ def test_top_k_top_p_fast_path_vs_core_equivalence(vocab_size, k, p):
 
 if __name__ == "__main__":
     test_top_k_top_p_joint_sampling_from_probs(40, 129280, 0.6, 20)
+    test_radix_topk_row_start(4096, 8, 1000, 1005)
+    test_radix_topk_row_start(1024, 3, 512, 1024)
     # test_top_k_top_p_statistical_distribution(10, 10000, 5, 0.3)
     # test_top_k_renorm_probs(1, 129280, 10)
     # test_top_p_sampling(1, 129280, 0.1)
