@@ -239,6 +239,8 @@ def mla_nvfp4_decode_prep(
     of a [B,128,D] Q); req_ids is int32, positions and slots int64, all [B]. The
     caller owns the tail tiles and their recycling (a request's first token of
     a tile overwrites row 0) and must not repeat a request within a batch.
+    The written tensors (q_aux, ring, kv_nope, kv_aux) must not overlap each
+    other or the inputs; ring rows that overlap one another are rejected.
     gfx1250 only. Graph-safe; warm up before capture.
     """
     if (cos_cache is None) != (sin_cache is None):
@@ -247,20 +249,22 @@ def mla_nvfp4_decode_prep(
         # The rotary embedding's caches may carry singleton dims.
         cos_cache = cos_cache.reshape(cos_cache.shape[0], -1)
         sin_cache = sin_cache.reshape(sin_cache.shape[0], -1)
-    _mla_nvfp4_decode_prep(
-        q_rope,
-        q_aux,
-        ring,
-        req_ids,
-        k_nope,
-        k_rope,
-        positions,
-        slots,
-        kv_nope,
-        kv_aux,
-        cos_cache,
-        sin_cache,
-    )
+    # The launch takes the current device's stream.
+    with torch.cuda.device(q_rope.device):
+        _mla_nvfp4_decode_prep(
+            q_rope,
+            q_aux,
+            ring,
+            req_ids,
+            k_nope,
+            k_rope,
+            positions,
+            slots,
+            kv_nope,
+            kv_aux,
+            cos_cache,
+            sin_cache,
+        )
 
 
 __all__ = [

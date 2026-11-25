@@ -37,9 +37,9 @@ YARN = {
 
 @pytest.fixture(scope="module", autouse=True)
 def require_gpu():
-    if not torch.cuda.is_available() or not torch.cuda.get_device_properties(
-        0
-    ).gcnArchName.startswith("gfx1250"):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250":
         pytest.skip("requires gfx1250")
 
 
@@ -259,11 +259,11 @@ def test_contracts(rope):
     k = values(case.gen, b, 576)
     qa = torch.zeros((b, H, 128), dtype=torch.uint8, device="cuda")
 
-    def call(q_rope=None, cos=rope.cos_cache, sin=rope.sin_cache, batch=b):
+    def call(q_rope=None, cos=rope.cos_cache, sin=rope.sin_cache, batch=b, ring=None):
         mla_nvfp4_decode_prep(
             q[:batch, :, 512:] if q_rope is None else q_rope,
             qa[:batch],
-            case.ring,
+            case.ring if ring is None else ring,
             case.req[:batch],
             k[:batch, :512],
             k[:batch, 512:],
@@ -284,6 +284,53 @@ def test_contracts(rope):
         call(q_rope=q.transpose(0, 1).contiguous().transpose(0, 1)[..., 512:])
     with pytest.raises(RuntimeError):
         call(q_rope=q[..., 512:].float())
+    # Every request on one tile, or every row of a tile on one row.
+    for ring in (
+        case.ring[:1].expand(b + 3, 16, 576),
+        case.ring[:, :1].expand(-1, 16, -1),
+    ):
+        with pytest.raises(RuntimeError, match="overlap"):
+            call(ring=ring)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_launches_on_the_input_device(rope):
+    """Inputs on cuda:1 while cuda:0 is current: the same bytes as with cuda:1
+    current, so the launch went to cuda:1's stream."""
+    b = 37
+    with torch.cuda.device(1):
+        case = Case(b, 30, 11)
+        q = values(case.gen, b, H, 576, s=2.0)
+        k = values(case.gen, b, 576, s=0.5)
+        cos, sin = rope.cos_cache.to("cuda:1"), rope.sin_cache.to("cuda:1")
+        start = (case.ring, case.cn, case.ca)
+
+    def run():
+        ring, cn, ca = (t.clone() for t in start)
+        qa = torch.zeros((b, H, 128), dtype=torch.uint8, device="cuda:1")
+        mla_nvfp4_decode_prep(
+            q[..., 512:],
+            qa,
+            ring,
+            case.req,
+            k[:, :512],
+            k[:, 512:],
+            case.pos,
+            case.slots(),
+            cn,
+            ca,
+            cos,
+            sin,
+        )
+        torch.cuda.synchronize(1)
+        return qa, ring, cn, ca
+
+    with torch.cuda.device(1):
+        want = run()
+    with torch.cuda.device(0):
+        got = run()
+    for g, w in zip(got, want):
+        assert torch.equal(g, w)
 
 
 @pytest.mark.parametrize("qstride", [192, 200])

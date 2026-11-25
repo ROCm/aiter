@@ -178,7 +178,9 @@ aiter.mla_nvfp4_decode_prep(
 
 `req_ids` is int32, `positions` and `slots` are int64, all `[B]`. `q_rope` rows
 must be 128 head strides apart: contiguous, or the RoPE slice of a
-`[B,128,D]` Q. A batch must not repeat a request. The caller owns tail
+`[B,128,D]` Q. A batch must not repeat a request. The written tensors
+(`q_aux`, the ring, both cache planes) must not overlap each other or the
+inputs; a ring whose rows overlap is rejected. The caller owns tail
 recycling: a tile's first token overwrites row 0. The op is graph-safe; warm
 it up before capture.
 

@@ -735,6 +735,9 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
     AITER_CHECK(ring.dim() == 3 && ring.size(0) > 0, "ring must be [R,16,576]");
     check_shape(ring, "ring", {ring.size(0), 16, 576});
     check_rows16(ring, "ring");
+    // Each request's tile rows are written, so no two may share memory.
+    AITER_CHECK(ring.stride(1) >= 576 && ring.stride(0) >= 16 * ring.stride(1),
+                "ring rows must not overlap");
     check_tensor(req_ids, "req_ids", AITER_DTYPE_i32, dev, 4);
     AITER_CHECK(req_ids.is_contiguous(), "req_ids must be contiguous");
     check_shape(req_ids, "req_ids", {b});
