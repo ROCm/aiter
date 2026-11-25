@@ -42,18 +42,19 @@ from aiter.ops.flydsl.kernels.qkv_chain_cooperative import (
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 N, K = 2560, 6144
-KS = 3  # default split-K factor: K thirds (a tuning knob, see KS_CHOICES)
+KS = 3  # default split-K factor: K thirds (a kernel parameter, see KS_CHOICES)
 # split-K factors valid for K = 6144: a part holds KSTEPS / ks 128-K steps, an even count (it starts on a 256-K scale block)
 KS_CHOICES = (1, 2, 3, 4, 6)
 
-# (rows, row tiles RT, column tiles NI, non-temporal slab stores, interleave one W step with its A fragments).
-# Measured on the TP4 QKV shape: 65-80 rows one 80-row m-block of 32-column tiles (240 workgroups per K third);
-# 81-96 rows two 48-row m-blocks of 64-column tiles; 97-128 rows two 64-row m-blocks. The slab is read by the next
-# launch at once, so the two-block rows store it non-temporally (no dirty lines parked in the writer's L2).
+# (rows, row tiles RT, column tiles NI, non-temporal slab stores, interleave one W step with its A fragments): the tile
+# with the fastest whole QKV front (this GEMM + the reduce-insert) per row range, ks = 3, over every (RT, NI, nt, il)
+# on the TP4 QKV shape N 2560 x K 6144. 65-96 rows one 48-row m-block of 64-column tiles; 97-128 rows two 64-row
+# m-blocks. The slab is read by the next launch at once, so it is stored non-temporally (no dirty lines parked in the
+# writer's L2).
 ROWS = (65, 128)
 _ROWS_TABLE = (
-    (80, 5, 2, False, False),
-    (96, 3, 4, True, False),
+    (96, 3, 4, True, True),
+    (120, 4, 4, True, False),
     (128, 4, 4, True, True),
 )
 

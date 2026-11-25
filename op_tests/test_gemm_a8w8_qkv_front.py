@@ -18,54 +18,22 @@ needs_gfx950 = pytest.mark.skipif(get_gfx_runtime() != "gfx950", reason="gfx950 
 NB = 64
 
 
-def _row(m, tier):
-    return {
-        "libtype": "flydsl",
-        "kernelId": front.KERNEL_ID,
-        "kernelName": tier,
-        "us": 1.0,
-    }
-
-
-def test_front_tier_lookup(monkeypatch):
-    rows = {
-        ("gfx950", 256, 32, 2560, 6144, "1x32"): _row(32, "flydsl_qkvfront_coop"),
-        ("gfx950", 256, 64, 2560, 6144, "1x32"): _row(64, "flydsl_qkvfront_coop"),
-        ("gfx950", 256, 96, 2560, 6144, "1x32"): _row(
-            96, "flydsl_qkvfront_split_ks2_48x64_nt"
-        ),
-        ("gfx950", 256, 128, 2560, 6144, "1x32"): _row(128, "flydsl_qkvfront_plain"),
-        ("gfx950", 256, 80, 2560, 6144, "1x32"): _row(
-            80, "coop"
-        ),  # a tier that cannot serve 80 rows
-    }
-    monkeypatch.setattr(front, "_load_tuned", lambda: rows)
+def test_front_tier_is_static(monkeypatch):
     monkeypatch.setattr(front, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(front, "get_cu_num", lambda: 256)
-    front.front_plan.cache_clear()
-    try:
-        assert front.front_tier(32) == "coop"
-        assert front.front_tier(64) == "coop"
-        assert front.front_tier(96) == "split"
-        assert front.front_plan(96) == front.Plan("split", 2, (3, 4, True, False))
-        assert front.parse_kernel_name(
-            front.plan_kernel_name(front.front_plan(96))
-        ) == front.front_plan(96)
-        assert front.front_tier(128) == "plain"
-        assert front.front_tier(80) == "plain"  # the row's tier does not serve this m
-        assert front.front_tier(16) == "plain"  # below the window
-        assert front.front_tier(129) == "plain"  # above it
-        assert front.front_tier(32, 2560, 4096) == "plain"  # another projection
-    finally:
-        front.front_plan.cache_clear()
-
-
-def test_tier_applies():
-    assert front.tier_applies("plain", 5)
-    assert front.tier_applies("coop", 17) and front.tier_applies("coop", 64)
-    assert not front.tier_applies("coop", 16) and not front.tier_applies("coop", 65)
-    assert front.tier_applies("split", 65) and front.tier_applies("split", 128)
-    assert not front.tier_applies("split", 64) and not front.tier_applies("split", 129)
+    tiers = {m: front.front_tier(m) for m in (1, 16, 17, 40, 64, 65, 100, 128, 129)}
+    assert tiers == {
+        1: "plain",
+        16: "plain",
+        17: "coop",
+        40: "coop",
+        64: "coop",
+        65: "split",
+        100: "split",
+        128: "split",
+        129: "plain",
+    }
+    monkeypatch.setattr(front, "get_gfx", lambda: "gfx942")
+    assert front.front_tier(40) == "plain"  # the fused kernels are gfx950 only
 
 
 def _setup(seed=0):
@@ -126,25 +94,19 @@ def test_fused_tier_matches_plain_tier(m, ks):
         from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
 
         if "cfg" not in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
-            pytest.skip(
-                "split-3 row-major activation entry (A_ROW) not in this tree (#8610)"
-            )
+            pytest.skip("split-3 row-major activation entry (A_ROW) not in this tree")
     weight, w_scale, chain_scale, aux, cs = _setup()
     x, pos, slot = _inputs(m)
     kscale, vscale = torch.tensor([0.5], device="cuda"), torch.tensor(
         [0.7], device="cuda"
     )
-    tier = (
-        front.Plan("coop")
-        if m <= 64
-        else front.Plan("split", ks, front.DEFAULT_SPLIT[1])
-    )
+    tier = "coop" if m <= 64 else "split"
     out = {}
     for t in ("plain", tier):
         kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8, device="cuda")
         ix = torch.zeros(NB, 128, 72, dtype=torch.uint8, device="cuda")
         qkv = front.gemm_a8w8_qkv_front(
-            x, weight, w_scale, chain_scale, defer_ok=t != "plain", tier=t
+            x, weight, w_scale, chain_scale, defer_ok=t != "plain", tier=t, ks=ks
         )
         assert (getattr(front._STATE, "deferred", None) is not None) == (t != "plain")
         q, iq = _insert(qkv, aux, cs, pos, slot, kv, ix, m, kscale, vscale)
@@ -170,6 +132,13 @@ def test_defer_not_ok_and_mismatch():
     assert (
         qkv.shape == (40, front.N) and getattr(front._STATE, "deferred", None) is None
     )
+    # a parked front never consumed: the next projection on this thread raises (and drops it)
+    front.gemm_a8w8_qkv_front(
+        x, weight, w_scale, chain_scale, defer_ok=True, tier="coop"
+    )
+    with pytest.raises(RuntimeError, match="never consumed"):
+        front.gemm_a8w8_qkv_front(x, weight, w_scale, chain_scale, defer_ok=False)
+    assert getattr(front._STATE, "deferred", None) is None
     # a parked front consumed by a different tensor is an error, not a silent wrong insert
     qkv = front.gemm_a8w8_qkv_front(
         x, weight, w_scale, chain_scale, defer_ok=True, tier="coop"
@@ -187,6 +156,79 @@ def test_defer_not_ok_and_mismatch():
             None, 128, torch.empty(40, 2048, dtype=torch.bfloat16, device="cuda"),
             None, None, kv_cache_dtype="mxfp4", skip_index_branch=True,
         )  # fmt: skip
+
+
+@needs_gfx950
+@pytest.mark.parametrize("m", list(range(17, 129)))
+def test_quantizer_buffers_not_overrun(m):
+    """The quantizer call the front makes (``per_group_quant_hip`` -> ``dynamic_per_group_scaled_quant``: fp8 codes, row-major
+    E8M0 scales, group 32, K 6144, no transpose) writes inside its [m, K] / [m, K / 32] buffers for every row count, m not a
+    multiple of 32 included: guard bytes on both sides of both outputs stay intact."""
+    from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+    x = (torch.randn(m, front.K, device="cuda") * 2).to(torch.bfloat16)
+    ns, nq = m * (front.K // 32), m * front.K
+    g = 4096  # guard bytes either side
+
+    def guarded(n):
+        buf = torch.full((g + n + g,), 0xAB, dtype=torch.uint8, device="cuda")
+        return buf, buf[g : g + n]
+
+    sbuf, sv = guarded(ns)
+    ybuf, yv = guarded(nq)
+    dynamic_per_group_scaled_quant(
+        yv.view(dtypes.fp8).view(m, front.K), x, sv.view(dtypes.fp8_e8m0).view(m, front.K // 32), 32,
+        shuffle_scale=False, num_rows=None, num_rows_factor=1,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    for buf, n in ((sbuf, ns), (ybuf, nq)):
+        assert (buf[:g] == 0xAB).all() and (buf[g + n :] == 0xAB).all()
+    assert (sv != 0xAB).any() and (yv != 0xAB).any()
+
+
+@needs_gfx950
+@pytest.mark.parametrize("m", [17, 33, 64, 65, 97, 128])
+@pytest.mark.parametrize("ks", [3, 1, 2, 4, 6])
+def test_fused_front_is_bitwise_the_unfused_split_chain(m, ks):
+    """The fused kernels (GEMM + insert) against the same GEMM's fp32 K-part slabs summed in order, rounded to bf16 and
+    inserted by the unfused ``fused_qknorm_idxrqknorm``: q / index q bytes are identical, for every split factor.
+    """
+    from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
+    from aiter.ops.quant import per_group_quant_hip
+
+    if ks != 3 and m <= 64:
+        pytest.skip("the one-launch tier has a fixed K split")
+    if "cfg" not in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
+        pytest.skip("row-major split-K GEMM not in this tree")
+    weight, w_scale, chain_scale, aux, cs = _setup()
+    x, pos, slot = _inputs(m)
+    kscale, vscale = torch.tensor([0.5], device="cuda"), torch.tensor(
+        [0.7], device="cuda"
+    )
+    outs = []
+    for fused in (False, True):
+        kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8, device="cuda")
+        ix = torch.zeros(NB, 128, 72, dtype=torch.uint8, device="cuda")
+        if fused:
+            qkv = front.gemm_a8w8_qkv_front(
+                x, weight, w_scale, chain_scale, defer_ok=True,
+                tier="coop" if m <= 64 else "split", ks=ks,
+            )  # fmt: skip
+        else:
+            xq, xs = per_group_quant_hip(
+                x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+            )
+            slab = sk.mxfp8_gemm_decode_splitk(
+                xq, xs, weight, chain_scale, cfg=(3, 4, True, True), ks=ks
+            )
+            acc = torch.zeros_like(slab[0])
+            for z in range(ks):
+                acc = acc + slab[z]
+            qkv = acc.to(torch.bfloat16)
+        q, iq = _insert(qkv, aux, cs, pos, slot, kv, ix, m, kscale, vscale)
+        torch.cuda.synchronize()
+        outs.append((q, iq.view(torch.uint8)))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
 
 
 if __name__ == "__main__":
