@@ -139,10 +139,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
-# One-block grids (num_seqs * num_kv_heads programs) at least this many CU waves deep
-# already fill the GPU; splitting them adds partials and a reduce without more overlap.
-_GFX950_ONE_BLOCK_SPLIT_MAX_WAVES = 2.5
-
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
@@ -307,8 +303,11 @@ def _gfx950_split_params(params: _UAParams):
         config = get_unified_attention_config("kv_split", params, backend="gluon")
         if _split_launch_config(config)[0] > 1:
             return params
+        # ONE_BLOCK_SPLIT_MAX_FILL: programs per CU from which the one-block grid
+        # fills the GPU, so a split only adds partials and a reduce
         one_block_prgms = params.num_seqs * params.num_kv_heads
-        if one_block_prgms >= _GFX950_ONE_BLOCK_SPLIT_MAX_WAVES * params.num_sms:
+        max_fill = config.get("ONE_BLOCK_SPLIT_MAX_FILL")
+        if max_fill is not None and one_block_prgms >= max_fill * params.num_sms:
             return params
         return params._replace(num_2d_prgms=one_block_prgms)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
