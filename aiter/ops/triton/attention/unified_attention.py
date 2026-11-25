@@ -139,6 +139,10 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
+# One-block grids (num_seqs * num_kv_heads programs) at least this many CU waves deep
+# already fill the GPU; splitting them adds partials and a reduce without more overlap.
+_GFX950_ONE_BLOCK_SPLIT_MAX_WAVES = 2.5
+
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
@@ -299,11 +303,14 @@ def _gfx950_split_params(params: _UAParams):
         return params
     if q_rows <= 128 and params.sliding_window <= 0:
         # one query block per sequence; count that grid only while the
-        # padded count leaves the launch unsplit
+        # padded count leaves the launch unsplit and the grid does not fill the CUs
         config = get_unified_attention_config("kv_split", params, backend="gluon")
         if _split_launch_config(config)[0] > 1:
             return params
-        return params._replace(num_2d_prgms=params.num_seqs * params.num_kv_heads)
+        one_block_prgms = params.num_seqs * params.num_kv_heads
+        if one_block_prgms >= _GFX950_ONE_BLOCK_SPLIT_MAX_WAVES * params.num_sms:
+            return params
+        return params._replace(num_2d_prgms=one_block_prgms)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:
