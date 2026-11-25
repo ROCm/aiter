@@ -10,7 +10,10 @@ none able to cover the whole domain:
              across as many workgroups as it takes to fill the part. Owns k=1,
              and is the only one to take bf16/fp16 as well as fp32.
     small_k  one chunk per lane, so k <= wave_size, and a survivor buffer that
-             grows with the row bound. Unbeatable on short rows and tiny k.
+             grows with the row bound. Unbeatable on short rows and tiny k. At
+             k=16 on gfx950 it is a one-wave-per-row build where that wins
+             (narrow rows, and wider ones as the row count grows; 1.2-2.8x on
+             prefill-shaped rows), which also keeps ties exactly.
     plain    the C++/ASM radix selector. Bounded at k=2048. Scales with rows
              better than anything else, so it owns the wide-M middle.
     decode   a grid-wide radix select: histogram, reduce, gather. Owns the very
@@ -25,8 +28,10 @@ silently. The differences are listed on `topk_select` itself.
 
 Ties: as in DeepSelect, no prefix index may be assumed by default. `plain` has
 no tie order at all (measured: 40 equal scores, 8 places, a set that is neither
-the lowest nor the highest); `small_k` resolves toward the larger column and
-`stream` toward the smaller, whether or not they were asked to. `decode` gives
+the lowest nor the highest); `small_k` resolves toward the larger column
+(exactly so for its one-wave build; its chunked build, other k and wider rows,
+may keep a different tied column at the k-th place) and `stream` toward the
+smaller, whether or not they were asked to. `decode` gives
 the smaller column only when asked, since that is a mode of its kernel and the
 mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
 backend set to those that can promise a direction, which costs speed.

@@ -1,58 +1,61 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 prefill index top-16: the block ids of ragged fp32 score rows (FlyDSL, gfx950).
+"""Per-row top-16 of ragged fp32 score rows, one wave per row (FlyDSL, gfx950).
 
-Input: the scores ``score_prefill_flydsl*`` writes, ``[heads, rows, width]`` fp32 (the raw ``max(q . k)`` of each
-(row, block), no sentinels), and ``n_valid_column_per_row`` (live blocks of each row, head-major
-``[heads * rows]``). Output: ``[heads, rows, 16]`` int32 block ids, best first, ``-1`` after a row's live blocks.
-The ``init`` leading and ``local`` trailing live blocks of a row are forced into the selection, as in the
-selector the sentinels 1e30 (init) / 1e29 (local, wins over init) give: they are applied to the keys in the
-kernel, so the scores stay untouched.
+The wide-row, k=16 build behind ``topk_per_row_small_k``: one 64-lane wave selects a whole row, with no
+workgroup barrier, which is what a block-sparse indexer's prefill needs -- many rows of a few hundred to a few
+thousand scores each.
 
-Order: key = the fp32 score's order-preserving bits (NaN as -inf, -0 below +0), ties to the larger block index.
+Contract: ``scores`` are ``[rows, width]`` fp32 with inner stride 1, ``row_lens`` the live columns of each row
+(``None``: every row is ``width`` wide), and the output ``[rows, 16]`` int32 column ids, best first, ``-1`` after a
+row's live columns. The ``init`` leading and ``local`` trailing live columns of a row are forced into the selection
+(local outranks init), applied to the keys in the kernel so the scores stay untouched.
 
-One wave per (row, head). The row is read in windows of STRIPS 64-wide strips (lane l holds blocks 64 j + l); a
-window's candidates are the keys at or above the 16th largest lane maximum (and the running 16th of earlier
-windows), compacted into LDS and ranked against each other. A window whose candidates overflow one wave, or
-whose NaNs / -infs could reach the top 16, takes an exact bit search for its 16th key and the index cut.
+Order: key = the fp32 score's order-preserving bits (NaN as -inf, -0 below +0), ties to the larger column.
 
-Technique and kernel structure from amd-kernels (``indexer_nvfp4_d128_p128_top16/topk``, Apache-2.0).
+A row is read in windows of STRIPS 64-wide strips (lane l holds columns 64 j + l); a window's candidates are the
+keys at or above the 16th largest lane maximum (and the running 16th of earlier windows), compacted into LDS and
+ranked against each other. A window whose candidates overflow one wave, or whose NaNs / -infs could reach the top
+16, takes an exact bit search for its 16th key and the index cut.
+
+At most 8192 columns a row: the tie-break holds the column in 13 bits.
+
+Technique and kernel structure from amd-kernels (``indexer_nvfp4_d128_p128_top16/topk``, Apache-2.0), rewritten
+in FlyDSL; nothing is imported from it.
 """
 
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir.dialects import rocdl as _rocdl_ops
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-BLK = 128  # tokens per block
 TOPK = 16
-PREFILL_STRIPS = (
+STRIP_TILES = (
     4,
     8,
     16,
     20,
     26,
-)  # window tiles (64-block strips), chosen by max_seq_len
-MAX_SLOTS = 128  # 8192 blocks: the 13 index bits of the key tie-break
+)  # window tiles (64-column strips), chosen by the row width
+MAX_SLOTS = 128  # 8192 columns: the 13 index bits of the key tie-break
+MAX_WIDTH = MAX_SLOTS * 64
 CAP = 64  # candidates one rank pass holds (one per lane)
-IDX_BITS = 13  # block index bits (slots * 64 <= 8192)
+IDX_BITS = 13  # column index bits (slots * 64 <= 8192)
 INT_MIN = -(1 << 31)
 KEY_NEG_INF = (0xFF800000 ^ 0x7FFFFFFF) - (1 << 32)  # signed key of -inf (NaN's)
 KEY_POS_INF = 0x7F800000
 KEY_INIT = 0x7149F2CA  # fp32 bits of 1e30 (a positive float's key is its bits)
 KEY_LOCAL = 0x6FA18F08  # fp32 bits of 1e29
 # Bits of the 16th lane maximum that bound the candidates (swept 12-16 over 4-16K rows, 0-256K context).
-PREFILL_BOUND_BITS = 14
+BOUND_BITS = 14
 # Strips of the first window loaded before the row's length is known; the rest only up to the row's live end.
 FIRST_STRIPS = 4
 
@@ -125,7 +128,7 @@ def row_top16(
     lane,
     score_row,
     width,
-    nblk_fn,
+    len_fn,
     cand_ptr,
     cand_total,
     sel_ptr,
@@ -136,10 +139,10 @@ def row_top16(
     sync,
     init_blocks,
     local_blocks,
-    bound_bits=PREFILL_BOUND_BITS,
+    bound_bits=BOUND_BITS,
 ):
-    """One wave's top 16 of one score row (``strips`` x 64 blocks per window): ``score_row`` the row's i64 address,
-    ``width`` (i32) its readable blocks, ``nblk_fn()`` its block count (called once the first strips are in flight),
+    """One wave's top 16 of one score row (``strips`` x 64 columns per window): ``score_row`` the row's i64 address,
+    ``width`` (i32) its readable columns, ``len_fn()`` its live length (called once the first strips are in flight),
     the row's LDS at pair ``cbase`` of ``cand_ptr`` and quad ``sbase`` of ``sel_ptr`` (dwords ``cand_total`` /
     ``sel_total`` in all), the 16 ids (-1 past the row's count) to ``out_row``; ``sync()`` orders the wave's LDS
     writes before its reads of other lanes' (a workgroup barrier when the wave is the workgroup, else a wave-local
@@ -182,9 +185,9 @@ def row_top16(
 
     # the first window's first strips go out before the row's length is known
     head = load_strips(srs, fx.Int32(0), 0, FIRST)
-    nblk = nblk_fn()
-    nlive = (nblk < width).select(nblk, width)
-    # later windows: the row's live blocks only (no dead-tail reads)
+    row_len = len_fn()
+    nlive = (row_len < width).select(row_len, width)
+    # later windows: the row's live columns only (no dead-tail reads)
     live_end = nlive
     srs_live = _rsrc(score_row, live_end.to(fx.Int64) * 4)
     # the rest of the first window: the row's live strips only
@@ -293,11 +296,11 @@ def row_top16(
         """One window of keys merged into the running top 16 (sel)."""
         keys = []
         for j in range_constexpr(STRIPS):
-            blk = wbase + (j * 64) + lane
-            live = blk < nlive
+            col = wbase + (j * 64) + lane
+            live = col < nlive
             kj = _key(bits[j])
-            kj = (blk < init_blocks).select(fx.Int32(KEY_INIT), kj)
-            kj = (blk >= nblk - local_blocks).select(fx.Int32(KEY_LOCAL), kj)
+            kj = (col < init_blocks).select(fx.Int32(KEY_INIT), kj)
+            kj = (col >= nlive - local_blocks).select(fx.Int32(KEY_LOCAL), kj)
             keys.append(live.select(kj, fx.Int32(INT_MIN)))
         m = keys[0]
         for j in range_constexpr(1, STRIPS):
@@ -315,7 +318,7 @@ def row_top16(
         if (total > CAP) | (ta <= KEY_NEG_INF) | nan_hi:
             wl = nlive - wbase
             if wl <= CAP - nrun:
-                # every live block of the window is a candidate (strip 0)
+                # every live column of the window is a candidate (strip 0)
                 put_pair(
                     (lane < wl).select(nrun + lane, TRASH + lane),
                     wbase + lane,
@@ -396,9 +399,9 @@ def row_top16(
     # outputs
     sync()
     r = lds_get(atom128, fx.slice(sels, (None, at(sbase, lane & (TOPK - 1)))), 4)
-    blk = (lane < nrun).select(r[0], fx.Int32(-1))
+    ids = (lane < nrun).select(r[0], fx.Int32(-1))
     buffer_ops.buffer_store(
-        blk,
+        ids,
         _rsrc(out_row, TOPK * 4),
         lane,
         mask=lane < TOPK,
@@ -410,12 +413,15 @@ def row_top16(
 row_top16 = ASTRewriter.transform(row_top16)
 
 
-def compile_topk_prefill(strips: int):
-    """One window tile (``strips``); shapes, ``init`` / ``local`` are launch arguments."""
-    assert strips in PREFILL_STRIPS
+def build_topk_per_row_small_k_wave_module(strips: int, full_rows: bool):
+    """One window tile (``strips``); the row count, width, ``init`` / ``local`` and strides are launch arguments.
+
+    ``full_rows`` compiles every row's length in as the width, so the kernel reads no length tensor.
+    """
+    assert strips in STRIP_TILES
     STRIPS = strips
     CAND = cand_dwords(STRIPS) // 2
-    name = f"minimax_m3_index_top16_prefill_w{STRIPS}"
+    name = f"topk_per_row_small_k_wave_s{STRIPS}" + ("_full" if full_rows else "")
 
     @fx.struct
     class Shared:
@@ -425,29 +431,25 @@ def compile_topk_prefill(strips: int):
     @flyc.kernel(name=name, known_block_size=[64, 1, 1])
     def kernel(
         arg_score: fx.Int64,
-        i64_s_head: fx.Int64,
         i64_s_row: fx.Int64,
         i32_width: fx.Int32,
-        arg_nvp: fx.Int64,
-        i32_rows: fx.Int32,
+        arg_lens: fx.Int64,
         i32_init: fx.Int32,
         i32_local: fx.Int32,
-        arg_topk: fx.Int64,
-        i64_t_head: fx.Int64,
-        i64_t_row: fx.Int64,
+        arg_out: fx.Int64,
+        i64_o_row: fx.Int64,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
-        n, h = fx.block_idx.x, fx.block_idx.y
+        n = fx.block_idx.x
         lane = fx.thread_idx.x
         n64 = fx.Int32(n).to(fx.Int64)
-        h64 = fx.Int32(h).to(fx.Int64)
 
-        def nblk_fn():
-            # n_valid is head-major: row (h, n) at h * rows + n
-            idx = h64 * fx.Int32(i32_rows).to(fx.Int64) + n64
+        def len_fn():
+            if const_expr(full_rows):
+                return i32_width
             return fx.Int32(
                 buffer_ops.buffer_load(
-                    _rsrc(arg_nvp + idx * 4, fx.Int64(4)),
+                    _rsrc(arg_lens + n64 * 4, fx.Int64(4)),
                     fx.Int32(0),
                     vec_width=1,
                     is_scalar=True,
@@ -457,16 +459,16 @@ def compile_topk_prefill(strips: int):
         row_top16(
             STRIPS,
             lane,
-            arg_score + (h64 * i64_s_head + n64 * i64_s_row) * 4,
+            arg_score + n64 * i64_s_row * 4,
             i32_width,
-            nblk_fn,
+            len_fn,
             smem.cand.ptr,
             2 * CAND,
             smem.sel.ptr,
             SEL_DWORDS,
             0,
             0,
-            arg_topk + (h64 * i64_t_head + n64 * i64_t_row) * 4,
+            arg_out + n64 * i64_o_row * 4,
             fx.gpu.barrier,
             i32_init,
             i32_local,
@@ -475,39 +477,33 @@ def compile_topk_prefill(strips: int):
     @flyc.jit
     def launch(
         arg_score: fx.Int64,
-        i64_s_head: fx.Int64,
         i64_s_row: fx.Int64,
         i32_width: fx.Int32,
-        arg_nvp: fx.Int64,
-        i32_rows: fx.Int32,
+        arg_lens: fx.Int64,
         i32_init: fx.Int32,
         i32_local: fx.Int32,
-        arg_topk: fx.Int64,
-        i64_t_head: fx.Int64,
-        i64_t_row: fx.Int64,
-        i32_heads: fx.Int32,
+        arg_out: fx.Int64,
+        i64_o_row: fx.Int64,
+        i32_rows: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
             arg_score,
-            i64_s_head,
             i64_s_row,
             i32_width,
-            arg_nvp,
-            i32_rows,
+            arg_lens,
             i32_init,
             i32_local,
-            arg_topk,
-            i64_t_head,
-            i64_t_row,
+            arg_out,
+            i64_o_row,
         ).launch(
-            grid=(fx.Int64(i32_rows), fx.Int64(i32_heads), 1),
+            grid=(fx.Int64(i32_rows), 1, 1),
             block=(64, 1, 1),
             stream=stream,
         )
 
     launch.kernel_name = name
-    # the score / table / length addresses arrive in SGPRs: the first loads do not wait for the kernel-argument load
+    # the score / length / output addresses arrive in SGPRs: the first loads do not wait for the kernel-argument load
     launch.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
@@ -517,93 +513,12 @@ def compile_topk_prefill(strips: int):
     return launch
 
 
-@functools.cache
-def _get_kernel(strips: int, device_index: int):
-    # device_index only keys the cache: the launcher memoises a handle bound to the device it compiled on
-    return compile_topk_prefill(strips)
+build_topk_per_row_small_k_wave_module = functools.cache(
+    build_topk_per_row_small_k_wave_module
+)
 
 
-def _pow2_ceil(n: int) -> int:
-    return 1 << (n - 1).bit_length() if n >= 1 else 1
-
-
-def minimax_m3_index_topk_prefill_flydsl(
-    score: torch.Tensor,  # [heads, rows, width] fp32, raw scores (no sentinels)
-    n_valid_column_per_row: torch.Tensor,  # [heads * rows] int32, live blocks of each row
-    topk_idx: torch.Tensor,  # [heads, rows, 16] int32 out
-    max_seq_len: int,
-    init_blocks: int = 0,
-    local_blocks: int = 0,
-) -> torch.Tensor:
-    """Top-16 block ids of ragged prefill score rows (gfx950); see the module docstring for the contract.
-
-    ``score.stride(2)`` must be 1; reads of a row stay below ``min(n_valid, width)`` blocks. ``max_seq_len`` only
-    picks the window tile; longer rows continue through further windows. At most 8192 live blocks a row.
-    """
-    require_gfx950()
-    heads, rows, width = score.shape
-    if score.dtype != torch.float32 or score.stride(2) != 1:
-        raise ValueError("score must be fp32 with a unit last stride")
-    if (
-        topk_idx.dtype != torch.int32
-        or topk_idx.shape != (heads, rows, TOPK)
-        or topk_idx.stride(2) != 1
-    ):
-        raise ValueError(
-            f"topk_idx must be int32 [{heads}, {rows}, {TOPK}] with a unit last stride"
-        )
-    nv = n_valid_column_per_row
-    if not (
-        score.is_cuda and nv.device == score.device and topk_idx.device == score.device
-    ):
-        raise ValueError(
-            "score, n_valid_column_per_row and topk_idx must be on one GPU"
-        )
-    if nv.dtype != torch.int32 or not nv.is_contiguous() or nv.numel() < heads * rows:
-        raise ValueError(
-            "n_valid_column_per_row must be contiguous int32 with heads * rows values"
-        )
-    if (
-        _pow2_ceil(-(-max_seq_len // BLK)) > MAX_SLOTS * 64
-        or -(-max_seq_len // BLK) > MAX_SLOTS * 64
-    ):
-        raise ValueError("at most 8192 blocks per row")
-    if init_blocks < 0 or local_blocks < 0:
-        raise ValueError("init_blocks and local_blocks must be >= 0")
-    if rows == 0 or heads == 0:
-        return topk_idx
-    strips = next(
-        (s for s in PREFILL_STRIPS if max_seq_len <= s * BLK * 64), PREFILL_STRIPS[-1]
-    )
-    dev = (
-        score.device.index
-        if score.device.index is not None
-        else torch.cuda.current_device()
-    )
-    _run_compiled(
-        _get_kernel(strips, dev),
-        score.data_ptr(),
-        score.stride(0),
-        score.stride(1),
-        width,
-        nv.data_ptr(),
-        rows,
-        init_blocks,
-        local_blocks,
-        topk_idx.data_ptr(),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        heads,
-        torch.cuda.current_stream(score.device),
-    )
-    return topk_idx
-
-
-def require_gfx950():
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    arch = get_gfx_runtime()
-    if arch != "gfx950":
-        raise RuntimeError(
-            f"minimax_m3_index_topk_prefill_flydsl requires gfx950, got {arch}"
-        )
+def wave_strips(width: int) -> int:
+    """The window tile for rows of up to ``width`` columns: the narrowest that holds the row in one window, the
+    widest for anything longer (further windows continue the row)."""
+    return next((s for s in STRIP_TILES if width <= s * 64), STRIP_TILES[-1])
