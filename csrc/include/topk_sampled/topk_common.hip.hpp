@@ -127,7 +127,11 @@ __device__ __forceinline__ int row_len_of(int row, int pitch, RowExtents<RAGGED>
     return pitch;
 }
 
-__device__ __forceinline__ int n4_cover(int len) { return (len + FP32_EPT - 1) / FP32_EPT; }
+// Unsigned, so that a row of INT32_MAX columns does not wrap the round-up.
+__device__ __forceinline__ int n4_cover(int len)
+{
+    return static_cast<int>((static_cast<unsigned>(len) + FP32_EPT - 1) / FP32_EPT);
+}
 
 __device__ __forceinline__ int k_take_dev(int K, int len) { return len < K ? len : K; }
 
@@ -310,7 +314,8 @@ __device__ __forceinline__ vfloat4 load_row_f4(const float* __restrict__ row, in
     else
     {
         const int e = i * FP32_EPT;
-        if(e + FP32_EPT <= len)
+        // Unsigned: at e = 2^31 - 4 the signed sum wraps negative.
+        if(static_cast<unsigned>(e) + FP32_EPT <= static_cast<unsigned>(len))
         {
             if constexpr(NT)
                 return __builtin_nontemporal_load(v4 + i);
