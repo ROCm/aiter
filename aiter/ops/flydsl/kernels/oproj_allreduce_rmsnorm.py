@@ -9,17 +9,22 @@ One launch per TP rank and layer, for decode batches of at most ``max_rows``
 rows. ``grid`` persistent CTAs, all co-resident, walk the phases in program
 order:
 
-0. x into ``xs``: 1 KB chunks of 16 rows x 64 K in the order the MFMA lanes
-   load them (mega paged attention's x layout). Either x is the quantizer's
-   row-major FP8 [rows, K] and a wave copies a chunk (relayout), or x is bf16
-   [rows, K] and a wave quantizes a row with one scale into ``x_scale``, as
+0. x into ``xs``: 1 KB chunks of 16 rows x 64 K, which a wave's MFMA lanes
+   load with one 1 KB load, in mega paged attention's x layout
+   [K % 64 / 16][row % 16][16 K]. Either x is the quantizer's row-major FP8
+   [rows, K] and a wave copies a chunk (relayout), or x is bf16 [rows, K] and
+   a wave quantizes a row with one scale into ``x_scale``, as
    ``dynamic_per_token_scaled_quant`` (and mega paged attention) would
-   (``quantize``). Each CTA counts its chunks or rows once their stores have
+   (``quantize``; on gfx942 a chunk is [row // 4][K % 64 / 16][row % 4][16 K]
+   and a CTA stages its 4 rows in LDS, then stores each chunk's 256 B of them
+   as whole lines). Each CTA counts its chunks or rows once their stores have
    landed;
 1. o_proj: ``block_n``-column tiles of ``x @ W^T``, claimed by the CTAs as
-   they finish phase 0. A claimed tile's W slice is loaded into VGPRs before
-   the wait for every chunk; its bf16 partial tile goes to the rank owning
-   its columns (two-shot) or to every rank (one-shot);
+   they finish phase 0 (quantizing on gfx942 up to EARLY_CLAIM_ROWS rows, at
+   launch by CTAs with no phase-0 rows when each CTA claims once). A claimed
+   tile's W slice is loaded into VGPRs before the wait for every chunk; its
+   bf16 partial tile goes to the rank owning its columns (two-shot) or to
+   every rank (one-shot);
 2. all-reduce + residual + Gemma RMSNorm, a row per CTA.
 
 Phases 1 and 2 are mega paged attention's phases 3 and 4, unchanged: the same
@@ -31,7 +36,9 @@ the last 16 past the batch keep whatever they hold, so ``xs`` starts zeroed.
 ``sync`` (int32, zeroed once), a counter a 128 B line: x chunks or rows done
 (2 parities), o_proj tiles claimed (2 parities), then
 a word a CTA (epoch: launches each CTA has run, so every CTA agrees on the
-parity under graph replay).
+parity under graph replay). Quantizing on gfx942, x is counted a 16-row
+group (2 parities of ``max_rows / 16`` lines), and launch-time claims spread
+over CLAIM_LINES counters that never reset.
 
 ``trace`` (diagnostics): each CTA writes TRACE_STAMPS int64 100 MHz stamps
 into ``trace``: start, phase 0 done, x ready (0 if it ran no o_proj tile),
@@ -43,6 +50,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
+from flydsl.runtime.device import get_rocm_arch
 
 from .comm.one_shot_allreduce import _canonicalize, _has_sentinel
 from .comm.quick_allreduce_fusions import (
@@ -92,6 +100,11 @@ __all__ = [
 
 THREADS = 4 * WAVE
 TRACE_STAMPS = 8
+# gfx942 one-claim builds: tile claim counters (CTA bid claims on bid % 8).
+CLAIM_LINES = 8
+# ... and the largest max_rows that claims at launch: at 96 and 128 rows the
+# launch-time claims cost more than they save.
+EARLY_CLAIM_ROWS = 80
 
 
 def compile_oproj_allreduce_rmsnorm(
@@ -185,15 +198,46 @@ def compile_oproj_allreduce_rmsnorm(
     rs_in_tile = two_shot and max_rows <= 16
     gemm_stride = block_n + (4 - block_n) % 8
     gemm_region = 16 * pass_subs * gemm_stride * 4
+    # gfx942, quantizing: phase 0 hands x over in whole lines. A chunk is
+    # [row // 4][K % 64 / 16][row % 4][16 K] (``_x_lane``), so a CTA's
+    # ``waves`` rows own 256 B of each chunk. They are staged in LDS (in
+    # ``buf``, before phase 1 needs it), a row every ``stage_stride`` bytes,
+    # and each chunk's 256 B is stored as one run. The 32 B pad puts the 4
+    # rows 8 banks apart, so any 8 consecutive storing lanes (4 rows x 2 K
+    # groups) read 32 distinct banks. The FP8 x (relayout) keeps the original
+    # layout and hand-off.
+    staged_x = quantize and get_rocm_arch().split(":")[0] == "gfx942"
+    stage_stride = row_k + 32
+    stage_bytes = waves * stage_stride if staged_x else 0
+    stage_stores = (k_chunks * waves * 64) // (threads * 16)
+    # Row groups (``waves`` rows each) a quantizing CTA takes.
+    quant_iters = -(-max_rows // (grid * waves))
+    # One x_done counter a 16-row group, polled by a lane each, when a CTA's
+    # phase-0 rows (``waves`` from ``waves * bid``, once) fall in one group.
+    grouped_x = staged_x and 16 % waves == 0 and grid * waves >= max_rows
+    x_groups = m_sub if grouped_x else 1
+    # One claim a CTA: CTA bid claims on counter bid % CLAIM_LINES, which
+    # hands out tiles bid % CLAIM_LINES + CLAIM_LINES k. The counters never
+    # reset (k is the count less the epoch's), so a CTA with no phase-0 rows
+    # claims at launch instead of queueing on one line behind the rest. Only
+    # with the group counters (alone it loses at 128 rows), up to
+    # EARLY_CLAIM_ROWS.
+    early_claim = (
+        grouped_x
+        and max_rows <= EARLY_CLAIM_ROWS
+        and grid >= n_tiles
+        and grid % CLAIM_LINES == 0
+        and n_tiles % CLAIM_LINES == 0
+    )
     # ``sync`` words.
     x_done_at = 0
-    tile_claim_at = x_done_at + 2 * SYNC_LINE
-    epoch_at = tile_claim_at + 2 * SYNC_LINE
+    tile_claim_at = x_done_at + 2 * x_groups * SYNC_LINE
+    epoch_at = tile_claim_at + (CLAIM_LINES if early_claim else 2) * SYNC_LINE
 
     @fx.struct
     class OarStorage:
         # The two o_proj partial tiles (waves 0+1, 2+3).
-        buf: fx.Array[fx.Int32, 2 * gemm_region // 4, 16]
+        buf: fx.Array[fx.Int32, max(2 * gemm_region, stage_bytes) // 4, 16]
         w_scale: fx.Array[fx.Float32, block_n, 16]
         red: fx.Array[fx.Float32, 16, 16]
         word: fx.Array[fx.Int32, 4, 16]
@@ -220,6 +264,15 @@ def compile_oproj_allreduce_rmsnorm(
                 )
 
     # ---------------------------------------------------------------- phase 0
+    def _x_lane(lane):
+        """Byte offset in an x chunk of lane (n1, g)'s 16 B, row n1 = lane % 16
+        and K [16 g, 16 g + 16) with g = lane // 16: ``staged_x``'s layout (a
+        lane quad loads 64 B), or mega paged attention's ``_x_offset``
+        [K % 64 / 16][row % 16][16 K]."""
+        if staged_x:
+            return (lane % 16 // 4) * 256 + (lane // 16) * 64 + (lane % 4) * 16
+        return lane * 16
+
     @flyc.jit
     def _relayout(
         x_rsrc,
@@ -347,17 +400,200 @@ def compile_oproj_allreduce_rmsnorm(
         gpu.barrier()
 
     @flyc.jit
+    def _quantize_lines(
+        x_rsrc,
+        xs_ptr,
+        x_scale_ptr,
+        num_rows,
+        bid,
+        warp,
+        lane,
+        sync_ptr,
+        x_done,
+        word_base,
+        stage_base,
+        tid,
+    ):
+        """``_quantize`` into ``staged_x`` chunks (gfx942): a wave quantizes a
+        row of its CTA's row group (``waves`` rows from ``waves * bid``, then a
+        grid further) into the LDS stage, and the CTA stores each chunk's
+        ``waves`` x 64 B as one contiguous run, whole lines no other CTA writes.
+
+        Lane l takes the 16-K groups q WAVE + l of its wave's row, so a wave
+        stages 1 KB a group without bank conflicts."""
+        mine = fx.Int32(0)
+        for it in range_constexpr(quant_iters):
+            if const_expr(it > 0):
+                # The last group's stores have read the stage.
+                gpu.barrier()
+            row0 = (bid + it * grid) * waves
+            row = row0 + warp
+            live = row < num_rows
+            mine = mine + live.select(fx.Int32(1), fx.Int32(0))
+            if row0 < num_rows:
+                # A dead wave of a live group quantizes the last row again;
+                # its stage row is never stored.
+                src = live.select(row, num_rows - 1) * (row_k * 2) + lane * 32
+                atoms = [
+                    atom_bf16_to_f32(
+                        _bload(x_rsrc, src + (i // 2) * (WAVE * 32) + 16 * (i % 2), 4)
+                    )
+                    for i in range_constexpr(2 * q_groups)
+                ]
+                amax = fmath.absf(atoms[0]).reduce(ReductionOp.MAX)
+                for atom in atoms[1:]:
+                    amax = fx.maxnumf(amax, fmath.absf(atom).reduce(ReductionOp.MAX))
+                for off in range_constexpr(5, -1, -1):
+                    amax = fx.maxnumf(amax, amax.shuffle_xor(fx.Int32(1 << off), WAVE))
+                scale = fx.maxnumf(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(
+                    1.0 / fp8_max
+                )
+                inv_scale = fx.full(ATOM_COLS, fx.Float32(rcp_f32(scale)), fx.Float32)
+                for q in range_constexpr(q_groups):
+                    words = []
+                    for h in range_constexpr(2):
+                        scaled = atoms[2 * q + h] * inv_scale
+                        for i in range_constexpr(2):
+                            lo = rocdl.cvt_pk_fp8_f32(
+                                T.i32, scaled[4 * i], scaled[4 * i + 1], 0, False
+                            )
+                            words.append(
+                                rocdl.cvt_pk_fp8_f32(
+                                    T.i32,
+                                    scaled[4 * i + 2],
+                                    scaled[4 * i + 3],
+                                    lo,
+                                    True,
+                                )
+                            )
+                    kg = q * WAVE + lane
+                    fx.ptr_store(
+                        fx.Vector.from_elements(words, dtype=fx.Int32),
+                        _lds(stage_base, (warp * stage_stride + kg * 16) // 4),
+                    )
+                if live & (lane == 0):
+                    fx.ptr_store(
+                        scale,
+                        fx.add_offset(fx.recast_iter(fx.Float32, x_scale_ptr), row),
+                    )
+                gpu.barrier()
+                # Thread i stores 16 B of chunk c = i // 16: the run's 16 B
+                # i % 16 is row r = i % 4 of the group, K group 4 c + i % 16 // 4
+                # (``_x_lane``); 16 threads write 256 B.
+                chunk0 = (row0 // 16) * k_chunks
+                for st in range_constexpr(stage_stores):
+                    i = tid + st * threads
+                    c = i // 16
+                    seg = i % 16
+                    r = seg % 4
+                    kg = c * 4 + seg // 4
+                    if row0 + r < num_rows:
+                        atom = fx.Vector(
+                            fx.ptr_load(
+                                _lds(stage_base, (r * stage_stride + kg * 16) // 4),
+                                result_type=fx.Vector.make_type(4, fx.Int32),
+                            )
+                        )
+                        dst = (chunk0 + c) * X_CHUNK + (row0 % 16) * 64 + seg * 16
+                        fx.ptr_store(atom, _i32_ptr(xs_ptr, dst // 4))
+        rocdl.s_waitcnt(vmcnt=0)
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+        if lane == 0:
+            fx.ptr_store(fx.Int32(mine), _lds(word_base, warp))
+        gpu.barrier()
+        if tid == 0:
+            total = _lds_i32(word_base, 0)
+            for w in range_constexpr(1, waves):
+                total = total + _lds_i32(word_base, w)
+            if total > 0:
+                fx.atomic_add(_i32_ptr(sync_ptr, x_done), total, syncscope="agent")
+        gpu.barrier()
+
+    def _phase0(
+        x_rsrc,
+        xs_ptr,
+        x_scale_ptr,
+        num_rows,
+        bid,
+        nblk,
+        warp,
+        lane,
+        sync_ptr,
+        x_done,
+        word_base,
+        stage_base,
+        tid,
+    ):
+        """This build's phase 0, counting on ``x_done``."""
+        if staged_x:
+            _quantize_lines(
+                x_rsrc,
+                xs_ptr,
+                x_scale_ptr,
+                num_rows,
+                bid,
+                warp,
+                lane,
+                sync_ptr,
+                x_done,
+                word_base,
+                stage_base,
+                tid,
+            )
+        elif quantize:
+            _quantize(
+                x_rsrc,
+                xs_ptr,
+                x_scale_ptr,
+                num_rows,
+                bid,
+                nblk,
+                warp,
+                lane,
+                sync_ptr,
+                x_done,
+                word_base,
+                tid,
+            )
+        else:
+            _relayout(
+                x_rsrc,
+                xs_ptr,
+                num_rows,
+                bid,
+                nblk,
+                warp,
+                lane,
+                sync_ptr,
+                x_done,
+                word_base,
+                tid,
+            )
+
+    @flyc.jit
     def _wait_x(sync_ptr, x_done, num_rows, tid):
         """Phase 1 entry: every live chunk (or row) of xs has landed."""
-        if const_expr(quantize):
-            live = num_rows
+        if const_expr(grouped_x):
+            # Lane g polls group g's counter for its live rows.
+            if tid < x_groups:
+                live = num_rows - tid * 16
+                live = (live < 16).select(live, fx.Int32(16))
+                live = (live > 0).select(live, fx.Int32(0))
+                line = x_done + tid * SYNC_LINE
+                done = _load_agent(sync_ptr, line)
+                while done < live:
+                    rocdl.s_sleep(1)
+                    done = _load_agent(sync_ptr, line)
         else:
-            live = ((num_rows + 15) // 16) * k_chunks
-        if tid == 0:
-            done = _load_agent(sync_ptr, x_done)
-            while done < live:
-                rocdl.s_sleep(1)
+            if const_expr(quantize):
+                live = num_rows
+            else:
+                live = ((num_rows + 15) // 16) * k_chunks
+            if tid == 0:
                 done = _load_agent(sync_ptr, x_done)
+                while done < live:
+                    rocdl.s_sleep(1)
+                    done = _load_agent(sync_ptr, x_done)
         gpu.barrier()
         fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
 
@@ -388,7 +624,7 @@ def compile_oproj_allreduce_rmsnorm(
         return ws
 
     def _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count):
-        lane_off = lane * 16
+        lane_off = _x_lane(lane)
         base = _uniform(warp * (k_steps * X_CHUNK))
 
         def issue_x(s):
@@ -437,6 +673,27 @@ def compile_oproj_allreduce_rmsnorm(
             fx.ptr_store(fx.Int32(tile), _lds(word_base, 1))
         gpu.barrier()
         return _lds_i32(word_base, 1)
+
+    @flyc.jit
+    def _claim_once(sync_ptr, claim, epoch, bid, word_base, tid):
+        """``early_claim``: broadcast this launch's tile of CTA bid, or
+        ``n_tiles``. Each launch adds grid / CLAIM_LINES to every counter."""
+        if tid == 0:
+            old = fx.atomic_add(
+                _i32_ptr(sync_ptr, claim), fx.Int32(1), syncscope="agent"
+            )
+            k = fx.Int32(old) - epoch * (grid // CLAIM_LINES)
+            tile = (k < n_tiles // CLAIM_LINES).select(
+                bid % CLAIM_LINES + k * CLAIM_LINES, fx.Int32(n_tiles)
+            )
+            fx.ptr_store(tile, _lds(word_base, 1))
+        gpu.barrier()
+
+    def _first_tile(sync_ptr, claim, word_base, tid):
+        """The CTA's first tile: ``_claim_once``'s, or claimed now."""
+        if early_claim:
+            return _lds_i32(word_base, 1)
+        return _claim_tile(sync_ptr, claim, word_base, tid)
 
     def _stage_partial(acc, lane, region, accumulate):
         for m in range_constexpr(len(acc) // n_sub):
@@ -796,18 +1053,55 @@ def compile_oproj_allreduce_rmsnorm(
 
         epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, epoch_at + bid)))
         parity = epoch & 1
-        x_done = x_done_at + parity * SYNC_LINE
-        claim = tile_claim_at + parity * SYNC_LINE
+        x_done = x_done_at + parity * (x_groups * SYNC_LINE)
+        if const_expr(early_claim):
+            claim = tile_claim_at + (bid % CLAIM_LINES) * SYNC_LINE
+        else:
+            claim = tile_claim_at + parity * SYNC_LINE
         if (bid == 0) & (tid == 0):
             other = (parity ^ 1) * SYNC_LINE
-            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, x_done_at + other))
-            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, tile_claim_at + other))
+            if const_expr(grouped_x):
+                for g in range_constexpr(x_groups):
+                    fx.ptr_store(
+                        fx.Int32(0),
+                        _i32_ptr(
+                            sync_ptr, x_done_at + other * x_groups + g * SYNC_LINE
+                        ),
+                    )
+            else:
+                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, x_done_at + other))
+            if const_expr(not early_claim):
+                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, tile_claim_at + other))
 
         # Phase 0: x into MFMA-order chunks.
         x_rsrc = _rsrc(x_ptr)
         xs_rsrc = _rsrc(xs_ptr)
-        if const_expr(quantize):
-            _quantize(
+        if const_expr(grouped_x):
+            # This CTA's rows count on their group's line.
+            x_mine = x_done + (bid * waves // 16) * SYNC_LINE
+        else:
+            x_mine = x_done
+        if const_expr(early_claim):
+            # A CTA without phase-0 rows claims at launch.
+            if bid * waves < num_rows:
+                _phase0(
+                    x_rsrc,
+                    xs_ptr,
+                    x_scale_ptr,
+                    num_rows,
+                    bid,
+                    nblk,
+                    warp,
+                    lane,
+                    sync_ptr,
+                    x_mine,
+                    word_base,
+                    gemm_base,
+                    tid,
+                )
+            _claim_once(sync_ptr, claim, epoch, bid, word_base, tid)
+        else:
+            _phase0(
                 x_rsrc,
                 xs_ptr,
                 x_scale_ptr,
@@ -817,22 +1111,9 @@ def compile_oproj_allreduce_rmsnorm(
                 warp,
                 lane,
                 sync_ptr,
-                x_done,
+                x_mine,
                 word_base,
-                tid,
-            )
-        else:
-            _relayout(
-                x_rsrc,
-                xs_ptr,
-                num_rows,
-                bid,
-                nblk,
-                warp,
-                lane,
-                sync_ptr,
-                x_done,
-                word_base,
+                gemm_base,
                 tid,
             )
         _stamp(trace_ptr, bid, 1, tid)
@@ -843,7 +1124,7 @@ def compile_oproj_allreduce_rmsnorm(
             for d in range_constexpr(world_size)
         ]
         w_rsrc = _rsrc(w_ptr)
-        tile = _claim_tile(sync_ptr, claim, word_base, tid)
+        tile = _first_tile(sync_ptr, claim, word_base, tid)
         while tile < n_tiles:
             col_scales = _load_col_scales(tile, tid, w_scale_ptr)
             ws = _load_w_slice(tile, w_rsrc, lane, warp)
