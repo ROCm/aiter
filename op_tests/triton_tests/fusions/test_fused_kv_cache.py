@@ -2,7 +2,6 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.fusions import fused_kv_cache
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_cat_and_cache_mla,
     fused_qk_rope_cat_and_cache_mla,
@@ -1707,19 +1706,16 @@ def test_seg_packed_mla_cache_rejects_noncontiguous():
 
 
 def test_q_nope_prestored_supported_matches_the_wrapper():
-    # The query and the wrapper's q_nope_prestored check agree: the option is
-    # accepted on gfx1250 with the Gluon head-tile kernel and rejected otherwise.
-    supported = q_nope_prestored_supported()
-    assert supported == (
-        arch_info.get_arch() in ("gfx1250", "gfx1250-strict")
-        and fused_kv_cache.gluon_qpe_htile_kernel is not None
-    )
-    if supported:
-        return
+    # Where the query says yes the wrapper runs with q_nope_prestored=True, and
+    # elsewhere it rejects it. The case has one KV head, one slot per token and
+    # a q_out, so only the arch / kernel clause decides.
     case = _seg_case(7, 7, 8, torch.bfloat16)
     cache = _fresh_cache(256, torch.bfloat16)
-    with pytest.raises(AssertionError, match="q_nope_prestored"):
+    if q_nope_prestored_supported():
         _run_seg(case, cache, 0, True, None)
+    else:
+        with pytest.raises(AssertionError, match="gfx1250 pure-decode"):
+            _run_seg(case, cache, 0, True, None)
 
 
 try:

@@ -167,6 +167,7 @@ def fused_qk_rope_cat_and_cache_mla(
       ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
       gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
       full path.
+      Check ``q_nope_prestored_supported()`` before writing q_nope into ``q_out``.
     - seg_page_size: When > 0 (gfx1250 only, KH == 1), kv_cache is written as
       seg-packed pages of that many tokens, each [tokens x D1 nope | tokens x
       D2 rope], the layout of the gfx1250 asm MLA decode kernel. q_out may then
