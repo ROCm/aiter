@@ -14,6 +14,8 @@
 //   (per token, plus a residual) into the N16 AUX tile. A thread owns one tile
 //   row's 32 channels (two blocks); the 16 rows of a block are 16 lanes of a
 //   wave, and a wave's 64 channels of the older rows come in as one tensor load.
+// mla_nvfp4_decode_update_cache launches the K blocks alone, for a decoder
+//   that rotates and quantizes Q RoPE itself.
 //
 // The bytes are those of mla_nvfp4_quantize_q (bytes 0..63, 96..127) and
 // mla_nvfp4_update_cache on the tail tile. RoPE (optional) rounds as aiter's
@@ -600,6 +602,17 @@ __global__ __launch_bounds__(256) void mla_nvfp4_decode_prep_kernel(mla_nvfp4_pr
 #endif
 }
 
+// The K blocks alone, one per token.
+template <bool ROPE>
+__global__ __launch_bounds__(256) void mla_nvfp4_decode_update_cache_kernel(mla_nvfp4_prep::Args a)
+{
+#if defined(__gfx1250__)
+    using namespace mla_nvfp4_prep;
+    __shared__ uint16_t lds[kLds];
+    k_block<ROPE, 0, true>(a, blockIdx.x, lds);
+#endif
+}
+
 template<bool ROPE>
 __global__ __launch_bounds__(384) void mla_nvfp4_decode_prep_joint_kernel(int p_k_blocks,int p_q_rows,const int64_t* p_slot,const int64_t* p_pos,const uint16_t* p_cos,const uint16_t* p_sin,int64_t p_stride_cos,const uint16_t* p_q_rope,uint8_t* p_qa,int64_t p_stride_qrh,uint16_t* p_ring,const int32_t* p_req,const uint16_t* p_k_nope,const uint16_t* p_k_rope,int64_t p_stride_knope,int64_t p_stride_krope,int64_t p_ring_rows,int64_t p_stride_req,int64_t p_stride_slot,uint8_t* p_kv_nope,uint8_t* p_kv_aux,int64_t p_pages) {
 #if defined(__gfx1250__)
@@ -716,42 +729,23 @@ bool rows_disjoint(const aiter_tensor_t& t)
     }
     return true;
 }
-} // namespace
-
-void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
-                           aiter_tensor_t& q_aux,
-                           aiter_tensor_t& ring,
-                           aiter_tensor_t& req_ids,
-                           aiter_tensor_t& k_nope,
-                           aiter_tensor_t& k_rope,
-                           aiter_tensor_t& positions,
-                           aiter_tensor_t& slots,
-                           aiter_tensor_t& kv_nope,
-                           aiter_tensor_t& kv_aux,
-                           std::optional<aiter_tensor_t> cos_cache,
-                           std::optional<aiter_tensor_t> sin_cache)
+// The KV half of both entries: B tokens' k_nope / k_rope, their requests'
+// tail tiles, the page planes and the optional cos/sin caches, checked and set
+// into a. Returns whether the RoPE is applied here.
+bool kv_args(mla_nvfp4_prep::Args& a,
+             int64_t b,
+             int dev,
+             aiter_tensor_t& ring,
+             aiter_tensor_t& req_ids,
+             aiter_tensor_t& k_nope,
+             aiter_tensor_t& k_rope,
+             aiter_tensor_t& positions,
+             aiter_tensor_t& slots,
+             aiter_tensor_t& kv_nope,
+             aiter_tensor_t& kv_aux,
+             const std::optional<aiter_tensor_t>& cos_cache,
+             const std::optional<aiter_tensor_t>& sin_cache)
 {
-    // A failed check raises in Python instead of aborting the process.
-    aiter_detail::AiterThrowGuard throw_guard;
-    AITER_CHECK(q_rope.is_gpu(), "q_rope must be a GPU tensor");
-    const int dev = q_rope.device_id;
-    HipDeviceGuard device_guard(dev);
-    AITER_CHECK(get_gpu_arch() == "gfx1250", "the NVFP4 MLA decode prep requires gfx1250");
-
-    check_tensor(q_rope, "q_rope", AITER_DTYPE_bf16, dev, 16);
-    AITER_CHECK(q_rope.dim() == 3, "q_rope must be [B,128,64]");
-    const int64_t b = q_rope.size(0);
-    AITER_CHECK(b < (1LL << 25), "batch exceeds uint32 head indexing");
-    check_shape(q_rope, "q_rope", {b, 128, 64});
-    check_rows16(q_rope, "q_rope");
-    // Rows and heads are one axis of the Q tile loads: a contiguous q_rope or
-    // the RoPE slice of a [B,128,D] Q.
-    AITER_CHECK(q_rope.stride(0) == 128 * q_rope.stride(1),
-                "q_rope rows must be 128 head strides apart");
-    check_tensor(q_aux, "q_aux", AITER_DTYPE_u8, dev, 16);
-    AITER_CHECK(q_aux.is_contiguous(), "q_aux must be contiguous");
-    check_shape(q_aux, "q_aux", {b, 128, 128});
-
     check_tensor(ring, "ring", AITER_DTYPE_bf16, dev, 16);
     AITER_CHECK(ring.dim() == 3 && ring.size(0) > 0, "ring must be [R,16,576]");
     check_shape(ring, "ring", {ring.size(0), 16, 576});
@@ -796,39 +790,80 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
         AITER_CHECK(cos.stride(-1) == 1 && sin.stride(-1) == 1 && cos.stride(0) % 4 == 0 &&
                         sin.stride(0) == cos.stride(0),
                     "cos/sin caches need equal strides and 8-byte aligned rows");
+        a.cos        = static_cast<const uint16_t*>(cos.data_ptr());
+        a.sin        = static_cast<const uint16_t*>(sin.data_ptr());
+        a.stride_cos = cos.stride(0);
     }
+
+    a.k_blocks     = int(b);
+    a.ring         = static_cast<uint16_t*>(ring.data_ptr());
+    a.ring_rows    = ring.size(0);
+    a.stride_req   = ring.stride(0);
+    a.stride_slot  = ring.stride(1);
+    a.k_nope       = static_cast<const uint16_t*>(k_nope.data_ptr());
+    a.k_rope       = static_cast<const uint16_t*>(k_rope.data_ptr());
+    a.stride_knope = k_nope.stride(0);
+    a.stride_krope = k_rope.stride(0);
+    a.req          = static_cast<const int32_t*>(req_ids.data_ptr());
+    a.kv_nope      = static_cast<uint8_t*>(kv_nope.data_ptr());
+    a.kv_aux       = static_cast<uint8_t*>(kv_aux.data_ptr());
+    a.pages        = pages;
+    a.pos          = static_cast<const int64_t*>(positions.data_ptr());
+    a.slot         = static_cast<const int64_t*>(slots.data_ptr());
+    return rope;
+}
+} // namespace
+
+void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
+                           aiter_tensor_t& q_aux,
+                           aiter_tensor_t& ring,
+                           aiter_tensor_t& req_ids,
+                           aiter_tensor_t& k_nope,
+                           aiter_tensor_t& k_rope,
+                           aiter_tensor_t& positions,
+                           aiter_tensor_t& slots,
+                           aiter_tensor_t& kv_nope,
+                           aiter_tensor_t& kv_aux,
+                           std::optional<aiter_tensor_t> cos_cache,
+                           std::optional<aiter_tensor_t> sin_cache)
+{
+    // A failed check raises in Python instead of aborting the process.
+    aiter_detail::AiterThrowGuard throw_guard;
+    AITER_CHECK(q_rope.is_gpu(), "q_rope must be a GPU tensor");
+    const int dev = q_rope.device_id;
+    HipDeviceGuard device_guard(dev);
+    AITER_CHECK(get_gpu_arch() == "gfx1250", "the NVFP4 MLA decode prep requires gfx1250");
+
+    check_tensor(q_rope, "q_rope", AITER_DTYPE_bf16, dev, 16);
+    AITER_CHECK(q_rope.dim() == 3, "q_rope must be [B,128,64]");
+    const int64_t b = q_rope.size(0);
+    AITER_CHECK(b < (1LL << 25), "batch exceeds uint32 head indexing");
+    check_shape(q_rope, "q_rope", {b, 128, 64});
+    check_rows16(q_rope, "q_rope");
+    // Rows and heads are one axis of the Q tile loads: a contiguous q_rope or
+    // the RoPE slice of a [B,128,D] Q.
+    AITER_CHECK(q_rope.stride(0) == 128 * q_rope.stride(1),
+                "q_rope rows must be 128 head strides apart");
+    check_tensor(q_aux, "q_aux", AITER_DTYPE_u8, dev, 16);
+    AITER_CHECK(q_aux.is_contiguous(), "q_aux must be contiguous");
+    check_shape(q_aux, "q_aux", {b, 128, 128});
+
+    mla_nvfp4_prep::Args a{};
+    const bool rope = kv_args(a, b, dev, ring, req_ids, k_nope, k_rope, positions, slots,
+                              kv_nope, kv_aux, cos_cache, sin_cache);
     if(!b)
         return;
 
-    mla_nvfp4_prep::Args a{};
     a.q_rope                 = static_cast<const uint16_t*>(q_rope.data_ptr());
     a.qa                     = static_cast<uint8_t*>(q_aux.data_ptr());
     a.stride_qrb             = q_rope.stride(0);
     a.stride_qrh             = q_rope.stride(1);
     a.q_rows                 = int(b);
     a.q_blocks               = int(b) * mla_nvfp4_prep::kQBlocksPerRow;
-    a.k_blocks               = int(b);
-    a.ring                   = static_cast<uint16_t*>(ring.data_ptr());
-    a.ring_rows              = ring.size(0);
-    a.stride_req             = ring.stride(0);
-    a.stride_slot            = ring.stride(1);
-    a.k_nope                 = static_cast<const uint16_t*>(k_nope.data_ptr());
-    a.k_rope                 = static_cast<const uint16_t*>(k_rope.data_ptr());
-    a.stride_knope           = k_nope.stride(0);
-    a.stride_krope           = k_rope.stride(0);
-    a.req                    = static_cast<const int32_t*>(req_ids.data_ptr());
-    a.kv_nope                = static_cast<uint8_t*>(kv_nope.data_ptr());
-    a.kv_aux                 = static_cast<uint8_t*>(kv_aux.data_ptr());
-    a.pages                  = pages;
-    a.pos                    = static_cast<const int64_t*>(positions.data_ptr());
-    a.slot                   = static_cast<const int64_t*>(slots.data_ptr());
     const hipStream_t stream = getCurrentHIPStream();
     const int blocks         = a.k_blocks + a.q_blocks;
     if(rope)
     {
-        a.cos        = static_cast<const uint16_t*>(cos_cache->data_ptr());
-        a.sin        = static_cast<const uint16_t*>(sin_cache->data_ptr());
-        a.stride_cos = cos_cache->stride(0);
         // Keep small batches on the separate Q/K-block path. Large batches
         // share one joint block per request, including graph-padding rows.
         // Fixed model strides keep the runtime-batch argument list compact
@@ -860,6 +895,40 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
     {
         mla_nvfp4_decode_prep_kernel<false><<<blocks, 256, 0, stream>>>(a);
     }
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
+
+void mla_nvfp4_decode_update_cache(aiter_tensor_t& ring,
+                                   aiter_tensor_t& req_ids,
+                                   aiter_tensor_t& k_nope,
+                                   aiter_tensor_t& k_rope,
+                                   aiter_tensor_t& positions,
+                                   aiter_tensor_t& slots,
+                                   aiter_tensor_t& kv_nope,
+                                   aiter_tensor_t& kv_aux,
+                                   std::optional<aiter_tensor_t> cos_cache,
+                                   std::optional<aiter_tensor_t> sin_cache)
+{
+    aiter_detail::AiterThrowGuard throw_guard;
+    AITER_CHECK(k_nope.is_gpu(), "k_nope must be a GPU tensor");
+    const int dev = k_nope.device_id;
+    HipDeviceGuard device_guard(dev);
+    AITER_CHECK(get_gpu_arch() == "gfx1250",
+                "the NVFP4 MLA decode cache update requires gfx1250");
+    AITER_CHECK(k_nope.dim() == 2, "k_nope must be [B,512]");
+    const int64_t b = k_nope.size(0);
+    AITER_CHECK(b < (1LL << 31), "batch exceeds the launch grid");
+
+    mla_nvfp4_prep::Args a{};
+    const bool rope = kv_args(a, b, dev, ring, req_ids, k_nope, k_rope, positions, slots,
+                              kv_nope, kv_aux, cos_cache, sin_cache);
+    if(!b)
+        return;
+    const hipStream_t stream = getCurrentHIPStream();
+    if(rope)
+        mla_nvfp4_decode_update_cache_kernel<true><<<int(b), 256, 0, stream>>>(a);
+    else
+        mla_nvfp4_decode_update_cache_kernel<false><<<int(b), 256, 0, stream>>>(a);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

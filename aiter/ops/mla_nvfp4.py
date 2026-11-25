@@ -267,9 +267,74 @@ def mla_nvfp4_decode_prep(
         )
 
 
+@compile_ops(
+    "module_mla_nvfp4_decode_prep",
+    fc_name="mla_nvfp4_decode_update_cache",
+    develop=True,
+)
+def _mla_nvfp4_decode_update_cache(
+    ring: torch.Tensor,
+    req_ids: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    cos_cache: torch.Tensor | None = None,
+    sin_cache: torch.Tensor | None = None,
+) -> None: ...
+
+
+def mla_nvfp4_decode_update_cache(
+    ring: torch.Tensor,
+    req_ids: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    cos_cache: torch.Tensor | None = None,
+    sin_cache: torch.Tensor | None = None,
+) -> None:
+    """One decode step's KV cache append, one launch: the KV half of
+    mla_nvfp4_decode_prep, for a decoder that rotates and quantizes Q RoPE
+    itself (mla_decode_nvfp4_qrope_fwd).
+
+    Same arguments, bytes and contract as mla_nvfp4_decode_prep without
+    q_rope / q_aux: each token's row ``positions % 16`` of ``ring[req_ids]``
+    is set (k_rope rotated first when the cos/sin caches are given) and the
+    tile's rows 0..row are requantized into page ``slots // 64`` of kv_nope /
+    kv_aux as mla_nvfp4_update_cache writes it. Slot -1 is a padding row and
+    writes nothing. gfx1250 only. Graph-safe; warm up before capture.
+    """
+    if (cos_cache is None) != (sin_cache is None):
+        raise ValueError("cos_cache and sin_cache come together")
+    if cos_cache is not None:
+        # The rotary embedding's caches may carry singleton dims.
+        cos_cache = cos_cache.reshape(cos_cache.shape[0], -1)
+        sin_cache = sin_cache.reshape(sin_cache.shape[0], -1)
+    # The launch takes the current device's stream.
+    with torch.cuda.device(k_nope.device):
+        _mla_nvfp4_decode_update_cache(
+            ring,
+            req_ids,
+            k_nope,
+            k_rope,
+            positions,
+            slots,
+            kv_nope,
+            kv_aux,
+            cos_cache,
+            sin_cache,
+        )
+
+
 __all__ = [
     "mla_decode_nvfp4_fwd",
     "mla_nvfp4_decode_prep",
+    "mla_nvfp4_decode_update_cache",
     "mla_nvfp4_quantize_q",
     "mla_nvfp4_update_cache",
     "prepare_mla_nvfp4_params",

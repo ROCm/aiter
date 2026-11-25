@@ -184,6 +184,21 @@ inputs; a ring whose rows overlap is rejected. The caller owns tail
 recycling: a tile's first token overwrites row 0. The op is graph-safe; warm
 it up before capture.
 
+`mla_nvfp4_decode_update_cache` is the KV half alone, for a decoder that
+rotates and quantizes Q RoPE itself (`mla_decode_nvfp4_qrope_fwd`). It takes
+the same arguments without `q_rope` / `q_aux`, writes the same tail, KV page
+and AUX bytes, and follows the same padding, overlap and graph rules:
+
+```python
+aiter.mla_nvfp4_decode_update_cache(
+    ring, req_ids, k_nope, k_rope, positions, slots,
+    kv_nope, kv_aux, cos_cache, sin_cache,
+)
+```
+
+It launches one 256-thread block per token at every batch size: the K block
+of the decode prep, with K RoPE overlapping the tile load.
+
 For fused RoPE at B >= 1024, each 384-thread block handles one request: four Q
 waves each load 32 heads through TDM and process four groups of eight heads,
 while eight K waves handle the tail tile. Q and K use disjoint LDS and output

@@ -34,4 +34,18 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
                            std::optional<aiter_tensor_t> cos_cache,
                            std::optional<aiter_tensor_t> sin_cache);
 
+// The KV half of mla_nvfp4_decode_prep alone, one launch per decode step: the
+// same ring, page, req_ids, k_nope / k_rope, positions / slots and cos/sin
+// contract, for a decoder that rotates and quantizes Q RoPE itself.
+void mla_nvfp4_decode_update_cache(aiter_tensor_t& ring,
+                                   aiter_tensor_t& req_ids,
+                                   aiter_tensor_t& k_nope,
+                                   aiter_tensor_t& k_rope,
+                                   aiter_tensor_t& positions,
+                                   aiter_tensor_t& slots,
+                                   aiter_tensor_t& kv_nope,
+                                   aiter_tensor_t& kv_aux,
+                                   std::optional<aiter_tensor_t> cos_cache,
+                                   std::optional<aiter_tensor_t> sin_cache);
+
 } // namespace aiter

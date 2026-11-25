@@ -10,6 +10,7 @@ several decode steps from the same stale bytes: Q's RoPE bytes against
 mla_nvfp4_quantize_q, the tail tiles and both cache planes against
 mla_nvfp4_update_cache on the tiles, and the fused RoPE against aiter's
 Triton RoPE (RotaryEmbedding.forward_triton, AITER_ROPE_TRITON_BACKEND=1).
+mla_nvfp4_decode_update_cache, the KV half alone, against the same producer.
 """
 
 import pytest
@@ -17,6 +18,7 @@ import torch
 
 from aiter.ops.mla_nvfp4 import (
     mla_nvfp4_decode_prep,
+    mla_nvfp4_decode_update_cache,
     mla_nvfp4_quantize_q,
     mla_nvfp4_update_cache,
 )
@@ -125,16 +127,10 @@ class Case:
         return s
 
 
-def reference_step(case, ring, cn, ca, q, k, rope_mod, fused):
-    """The step through the separate producers: the Triton RoPE on copies,
-    mla_nvfp4_quantize_q, the tail row appended, mla_nvfp4_update_cache."""
-    b, live = case.b, case.live
-    q_pe, k_pe = q[..., 512:].clone(), k[:, 512:].clone().view(b, 1, 64)
-    if fused:
-        rope_mod.forward_triton(case.pos, q_pe, k_pe)
-    q_full = q.clone()
-    q_full[..., 512:] = q_pe
-    _, qa = mla_nvfp4_quantize_q(q_full)
+def reference_kv(case, ring, cn, ca, k, k_pe):
+    """The KV half through the producer: the live rows' K (RoPE part k_pe)
+    appended to their tail rows, their tiles through mla_nvfp4_update_cache."""
+    live = case.live
     if live:
         req = case.req[:live].long()
         rows = case.pos[:live] % 16
@@ -148,6 +144,19 @@ def reference_step(case, ring, cn, ca, q, k, rope_mod, fused):
             cn,
             ca,
         )
+
+
+def reference_step(case, ring, cn, ca, q, k, rope_mod, fused):
+    """The step through the separate producers: the Triton RoPE on copies,
+    mla_nvfp4_quantize_q, the tail row appended, mla_nvfp4_update_cache."""
+    b = case.b
+    q_pe, k_pe = q[..., 512:].clone(), k[:, 512:].clone().view(b, 1, 64)
+    if fused:
+        rope_mod.forward_triton(case.pos, q_pe, k_pe)
+    q_full = q.clone()
+    q_full[..., 512:] = q_pe
+    _, qa = mla_nvfp4_quantize_q(q_full)
+    reference_kv(case, ring, cn, ca, k, k_pe)
     return qa
 
 
@@ -464,6 +473,129 @@ def test_dsr1_strides_eager_and_graph(rope, b, padding, qstride):
         case.pos.add_(1)
 
 
+def update_cache_step(case, ring, cn, ca, k, cos, sin):
+    mla_nvfp4_decode_update_cache(
+        ring, case.req, k[:, :512], k[:, 512:], case.pos, case.slots(), cn, ca, cos, sin
+    )
+
+
+def reference_update_cache_step(case, ring, cn, ca, k, rope_mod, fused):
+    k_pe = k[:, 512:].clone().view(case.b, 1, 64)
+    if fused:
+        # forward_triton rotates a query alongside; a copy of K serves.
+        rope_mod.forward_triton(case.pos, k_pe.clone(), k_pe)
+    reference_kv(case, ring, cn, ca, k, k_pe)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize(
+    "b,live,steps,seed",
+    [(1, 1, 3, 20), (37, 30, 6, 21), (1536, 1519, 3, 22), (4096, 4079, 2, 23)],
+)
+def test_decode_update_cache_matches_the_producer(rope, fused, b, live, steps, seed):
+    """The KV half alone, step after step from the same stale bytes: the tail
+    tiles and both cache planes against mla_nvfp4_update_cache on the tiles."""
+    case = Case(b, live, seed)
+    ring, cn, ca = case.ring.clone(), case.cn.clone(), case.ca.clone()
+    ref_ring, ref_cn, ref_ca = case.ring.clone(), case.cn.clone(), case.ca.clone()
+    cos, sin = (rope.cos_cache, rope.sin_cache) if fused else (None, None)
+    for step in range(steps):
+        k = values(case.gen, b, 576, s=0.5)
+        update_cache_step(case, ring, cn, ca, k, cos, sin)
+        reference_update_cache_step(case, ref_ring, ref_cn, ref_ca, k, rope, fused)
+        torch.cuda.synchronize()
+        assert torch.equal(ring, ref_ring), f"step {step}: tail tiles differ"
+        assert torch.equal(cn, ref_cn), f"step {step}: kv_nope differs"
+        assert torch.equal(ca, ref_ca), f"step {step}: kv_aux differs"
+        case.pos = case.pos + 1
+
+
+def test_decode_update_cache_graph_replay(rope):
+    b = 64
+    case = Case(b, b - 9, 24)
+    k = values(case.gen, b, 576, s=0.5)
+    out = [[case.ring.clone(), case.cn.clone(), case.ca.clone()] for _ in range(2)]
+    update_cache_step(case, *out[0], k, rope.cos_cache, rope.sin_cache)
+    snapshot = [t.clone() for t in out[1]]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update_cache_step(case, *out[1], k, rope.cos_cache, rope.sin_cache)
+    for t, s in zip(out[1], snapshot):
+        t.copy_(s)
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(out[1], out[0]):
+        assert torch.equal(got, want)
+
+
+def test_decode_update_cache_contracts(rope):
+    b = 4
+    case = Case(b, b, 25)
+    k = values(case.gen, b, 576)
+
+    def call(
+        k_nope=None, k_rope=None, ring=None, cos=rope.cos_cache, sin=rope.sin_cache
+    ):
+        mla_nvfp4_decode_update_cache(
+            case.ring if ring is None else ring,
+            case.req,
+            k[:, :512] if k_nope is None else k_nope,
+            k[:, 512:] if k_rope is None else k_rope,
+            case.pos,
+            case.slots(),
+            case.cn,
+            case.ca,
+            cos,
+            sin,
+        )
+
+    call()
+    call(cos=None, sin=None)
+    empty = torch.empty((0, 576), dtype=torch.bfloat16, device="cuda")
+    mla_nvfp4_decode_update_cache(
+        case.ring,
+        case.req[:0],
+        empty[:, :512],
+        empty[:, 512:],
+        case.pos[:0],
+        case.slots()[:0],
+        case.cn,
+        case.ca,
+    )
+    with pytest.raises(ValueError):
+        call(sin=None)
+    with pytest.raises(RuntimeError, match="k_rope"):
+        call(k_rope=k[:2, 512:])
+    with pytest.raises(RuntimeError):
+        call(k_nope=k[:, :512].float())
+    with pytest.raises(RuntimeError, match="overlap"):
+        call(ring=case.ring[:1].expand(b + 3, 16, 576))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_decode_update_cache_launches_on_the_input_device(rope):
+    """Inputs on cuda:1 while cuda:0 is current: the same bytes as with cuda:1
+    current."""
+    b = 37
+    with torch.cuda.device(1):
+        case = Case(b, 30, 26)
+        k = values(case.gen, b, 576, s=0.5)
+        cos, sin = rope.cos_cache.to("cuda:1"), rope.sin_cache.to("cuda:1")
+
+    def run():
+        ring, cn, ca = case.ring.clone(), case.cn.clone(), case.ca.clone()
+        update_cache_step(case, ring, cn, ca, k, cos, sin)
+        torch.cuda.synchronize(1)
+        return ring, cn, ca
+
+    with torch.cuda.device(1):
+        want = run()
+    with torch.cuda.device(0):
+        got = run()
+    for g, w in zip(got, want):
+        assert torch.equal(g, w)
+
+
 # The script benchmark uses normal finite inputs. The pytest cases above also
 # cover tiny values/FTZ, stale cache bytes, changing positions and padding.
 def run_torch(q, cos, sin, positions):
@@ -531,13 +663,21 @@ def bench_decode_prep(b, layout):
     ca = torch.full((b, 8192), 127, dtype=torch.uint8, device="cuda")
     r = make_rope()
     _, want = run_torch(q, r.cos_cache, r.sin_cache, pos)
+    # Name -> (launch, query heads it writes).
     candidates = {
-        "decode_prep": lambda: mla_nvfp4_decode_prep(
-            q, qa, ring, req, kn, kr, pos, slots, cn, ca, r.cos_cache, r.sin_cache
-        )
+        "decode_prep": (
+            lambda: mla_nvfp4_decode_prep(
+                q, qa, ring, req, kn, kr, pos, slots, cn, ca, r.cos_cache, r.sin_cache
+            ),
+            H,
+        ),
+        "decode_update_cache": (
+            lambda: mla_nvfp4_decode_update_cache(
+                ring, req, kn, kr, pos, slots, cn, ca, r.cos_cache, r.sin_cache
+            ),
+            0,
+        ),
     }
-    # Nominal RoPE FLOPs only (6/pair); quantization arithmetic is excluded.
-    flops = 6 * 32 * (H + 1) * b
     # Logical global bytes, not measured HBM transactions. Count each input
     # once, including shared cos/sin and metadata, and all output writes:
     # Q: 128 BF16 bytes + 96 AUX bytes per head;
@@ -546,14 +686,19 @@ def bench_decode_prep(b, layout):
     # At tile start, another 1464 AUX bytes initialize later rows/padding.
     # Excludes repeated lane loads, LDS traffic and cache-line amplification.
     rn = pos % 16
-    nbytes = b * (H * (128 + 96) + 2 * 576 * 2 + 4608 + 72 + 128 + 20)
-    nbytes += int(rn.sum()) * 512 * 2 + int((rn == 0).sum()) * 1464
+    kv_bytes = b * (2 * 576 * 2 + 4608 + 72 + 128 + 20)
+    kv_bytes += int(rn.sum()) * 512 * 2 + int((rn == 0).sum()) * 1464
     ret = {"gfx": get_gfx_runtime()}
-    for name, fn in candidates.items():
+    for name, (fn, heads) in candidates.items():
         _, us = run_perftest(fn)
-        err = checkAllclose(want.float(), qa.float(), rtol=0, atol=0, msg=name)
-        assert err == 0, f"{name}: Q RoPE packed output differs"
+        err = 0
+        if heads:
+            err = checkAllclose(want.float(), qa.float(), rtol=0, atol=0, msg=name)
+            assert err == 0, f"{name}: Q RoPE packed output differs"
         assert torch.equal(ring[req.long(), pos % 16, :512], kn)
+        # Nominal RoPE FLOPs only (6/pair); quantization arithmetic is excluded.
+        flops = 6 * 32 * (heads + 1) * b
+        nbytes = b * heads * (128 + 96) + kv_bytes
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6

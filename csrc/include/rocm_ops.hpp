@@ -2331,6 +2331,18 @@ namespace py = pybind11;
           py::arg("kv_nope"),                        \
           py::arg("kv_aux"),                         \
           py::arg("cos_cache") = std::nullopt,       \
+          py::arg("sin_cache") = std::nullopt);      \
+    m.def("mla_nvfp4_decode_update_cache",           \
+          &aiter::mla_nvfp4_decode_update_cache,     \
+          py::arg("ring"),                           \
+          py::arg("req_ids"),                        \
+          py::arg("k_nope"),                         \
+          py::arg("k_rope"),                         \
+          py::arg("positions"),                      \
+          py::arg("slots"),                          \
+          py::arg("kv_nope"),                        \
+          py::arg("kv_aux"),                         \
+          py::arg("cos_cache") = std::nullopt,       \
           py::arg("sin_cache") = std::nullopt);
 
 #define SMOOTHQUANT_PYBIND                      \
