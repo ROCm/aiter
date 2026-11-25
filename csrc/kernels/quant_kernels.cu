@@ -1337,18 +1337,51 @@ dynamic_per_token_scaled_quant_tail_kernel(DTYPE_O* __restrict__ out,
 }
 
 // A thread's |x| max over its 8 inputs, the loop data_to_per_row_scale<DTYPE_I, DTYPE_O, 8> runs.
-// Its result for a signaling NaN input depends on how the compiler lowers that loop: ROCm 7.2
-// widens fp16 with v_cvt_f32_f16, which quiets it so the max drops it, while ROCm 7.14 keeps a
-// v_max3_f16 chain that passes it on as a quiet NaN. The multi-row kernel therefore runs the same
-// source per vector rather than a fixed instruction sequence.
+//
+// fp16: the result for a signaling NaN input depends on how the compiler lowers that loop. ROCm
+// 7.2 widens with v_cvt_f32_f16, which quiets it so the max drops it, while ROCm 7.14 keeps a
+// v_max3_f16 chain that passes it on as a quiet NaN. So fp16 runs the same source per vector.
+//
+// bf16: both lowerings fold v_max_f32 from +0 over |x| widened to f32, the running max in src0
+// (v_max_f32 picks between two NaNs by operand position). ROCm 7.2 emits v_max3_f32, which is
+// v_max_f32(v_max_f32(S0, S1), S2); ROCm 7.14 rounds the running max back to bf16 after each step,
+// an identity on a v_max_f32 result whose operands have zero low halves, at about 1.7x the VALU
+// work. So bf16 runs the fold directly, |x| being the source modifier on the widened value.
 template <typename DTYPE_I, int vec_size>
 __device__ __forceinline__ float per_token_thread_absmax(const opus::vector_t<DTYPE_I, vec_size>& v)
 {
-    float absMax = 0.f;
+    if constexpr(std::is_same_v<DTYPE_I, opus::bf16_t>)
+    {
+        static_assert(vec_size % 2 == 0);
+        struct Words
+        {
+            uint32_t w[vec_size / 2];
+        };
+        const Words d = __builtin_bit_cast(Words, v);
+        float acc;
 #pragma unroll
-    for(size_t j = 0; j < vec_size; j++)
-        absMax = max(absMax, abs(static_cast<float>(v[j])));
-    return absMax;
+        for(int k = 0; k < vec_size / 2; k++)
+        {
+            const float lo = __builtin_bit_cast(float, d.w[k] << 16);
+            const float hi = __builtin_bit_cast(float, d.w[k] & 0xffff0000u);
+            if(k == 0)
+                asm("v_max_f32 %0, 0, |%1|" : "=v"(acc) : "v"(lo));
+            else
+                asm("v_max_f32 %0, %1, |%2|" : "=v"(acc) : "v"(acc), "v"(lo));
+            asm("v_max_f32 %0, %1, |%2|" : "=v"(acc) : "v"(acc), "v"(hi));
+        }
+        // The result feeds a DPP move next; the hazard recognizer does not see into asm.
+        asm volatile("s_nop 1" : "+v"(acc));
+        return acc;
+    }
+    else
+    {
+        float absMax = 0.f;
+#pragma unroll
+        for(size_t j = 0; j < vec_size; j++)
+            absMax = max(absMax, abs(static_cast<float>(v[j])));
+        return absMax;
+    }
 }
 
 // Several rows per block for the thread_data_size = 8 shapes (cols <= 8 * BlockSize). One block
@@ -1374,7 +1407,7 @@ dynamic_per_token_scaled_quant_multirow_kernel(DTYPE_O* __restrict__ out,
                                                int32_t const* __restrict__ num_rows,
                                                const int32_t num_rows_factor)
 {
-#if defined(__GFX9__)
+#if defined(__gfx942__)
     static_assert(std::is_same_v<DTYPE_O, opus::fp8_t> || std::is_same_v<DTYPE_O, opus::i8_t>);
     static constexpr int32_t vec_size      = 8;
     static constexpr int32_t waves         = BlockSize / WARP_SIZE;
@@ -1518,7 +1551,7 @@ dynamic_per_token_scaled_quant_multirow_kernel(DTYPE_O* __restrict__ out,
         }
     }
 #else
-    // Wave64 layout; the host launches it on gfx942 only (per_token_multirow_enabled).
+    // Measured and launched on gfx942 only (per_token_multirow_enabled).
     __builtin_trap();
 #endif
 }
