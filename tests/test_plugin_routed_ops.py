@@ -11,11 +11,13 @@ they can gate every PR without a GPU runner (see tests/conftest.py).
 from __future__ import annotations
 
 import gc
+import json
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from inspect import signature
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -1063,7 +1065,8 @@ class _Recorder(_Provider):
 
 def _serve(monkeypatch, op, candidate):
     provider = _Recorder("aklr", candidate)
-    provider.op_versions = {op: {1}}
+    routed = plugin._routed_ops.get(op)
+    provider.op_versions = {op: {routed.op.version if routed else 1}}
     plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
@@ -1521,6 +1524,15 @@ def _pinned_cases():
             (mla_gluon, "_mla_gluon_launch"),
             (out, None),
         ),
+        "mla_gluon with kv_split_info": (
+            "mla_paged_decode",
+            lambda: mla_gluon.mla_gluon(
+                **_gluon_args(),
+                kv_split_info=(_z(8, 8, dtype=torch.int32), _z(3, dtype=torch.int32)),
+            ),
+            (mla_gluon, "_mla_gluon_launch"),
+            (out, None),
+        ),
     }
 
 
@@ -1535,6 +1547,7 @@ def _pinned_cases():
         "mhc_fused_post_pre, backend=",
         "mla_gluon prefill mode",
         "mla_gluon with a sink",
+        "mla_gluon with kv_split_info",
     ],
 )
 def test_a_pinned_call_runs_aiter_s_own_and_asks_no_provider(monkeypatch, case):
@@ -1656,3 +1669,217 @@ def test_a_triton_gemm_refuses_a_result_that_is_not_y(monkeypatch, op):
     y = _z(2, 3, dtype=torch.bfloat16)
     assert call(*args, y=y) is y
     assert torch.equal(y, torch.ones(2, 3, dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# Registration actually reaching torch, not just `fake=` being present
+#
+# `tests/test_plugin_contracts.py` reads the source and checks that a route
+# passes `fake=`; the registry check above reads the plugin's own dict. Neither
+# calls into torch. `_as_custom_op` returns None on any failure and logs at
+# debug level, so a torch change that broke `infer_schema` would un-register
+# every contract silently: the gate would stay green, the registry would still
+# list them, and the ops would be back to splitting a caller's graph with
+# nothing to say so.
+#
+# These names are the ones whose contract was changed to make registration
+# possible at all. If registration stops reaching torch, the change has no
+# remaining effect and this is where that shows up.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "gemm_a8w8_blockscale_bpreshuffle",
+        "mla_sparse_prefill",
+        "mla_sparse_prefill_v41",
+        "inverse_rope_group_quant",
+        "pa_decode_bf16",
+        "pa_fwd",
+    ],
+)
+def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
+    """Each contract is reachable as a real custom op after import."""
+    import aiter.ops.attention
+    import aiter.ops.gemm_op_a8w8
+    import aiter.ops.inverse_rope_group_quant
+    import aiter.ops.mla_sparse_prefill  # noqa: F401
+
+    namespace = getattr(torch.ops, "aiter_routed", None)
+    assert namespace is not None, "no routed op registered at all"
+    assert hasattr(namespace, op_name), (
+        f"{op_name} passes fake= but did not reach torch.ops.aiter_routed; "
+        "_as_custom_op swallows the reason, so check its debug log"
+    )
+
+    # The registered schema must carry exactly the contract's parameters.
+    # Comparing against the recorded baseline rather than a list of likely
+    # buffer names: `x_scale` is an output buffer for one of these ops and an
+    # input for another, so a name-based check reads the wrong way round
+    # depending on which op it is applied to.
+    # Split on the arrow first: a tuple return is parenthesised too, so the
+    # last ")" in the string belongs to the result for some of these ops.
+    schema = str(getattr(namespace, op_name).default._schema)
+    head = schema.split("->")[0]
+    parameters = head[head.index("(") + 1 : head.rindex(")")]
+    registered = [
+        part.strip().split()[-1].split("=")[0]
+        for part in parameters.split(",")
+        if part.strip() and part.strip() != "*"
+    ]
+
+    baseline = json.loads(
+        (Path(__file__).with_name("plugin_contracts.json")).read_text()
+    )[op_name]["signature"]
+    expected = [
+        piece.split(":")[0].strip()
+        for piece in baseline.split(", ->")[0].split(",")
+        if piece.strip()
+    ]
+
+    assert registered == expected, (
+        f"{op_name}'s registered schema does not match the recorded contract.\n"
+        f"  registered: {registered}\n"
+        f"  contract:   {expected}"
+    )
+
+    # Dropping the buffer bumped the op version, so the version a provider may
+    # still serve has to be announced. `status()` is the only place a framework
+    # can read that from.
+    superseded = [
+        entry
+        for entry in plugin.status()["deprecations"]
+        if entry["kind"] == "op-version" and entry["subject"] == op_name
+    ]
+    assert len(superseded) == 1, f"{op_name} does not announce its superseded version"
+    assert (
+        superseded[0]["version"]
+        == plugin.status()["routed_ops"][op_name]["version"] - 1
+    )
+
+
+# ---------------------------------------------------------------------------
+# pa_fwd: the out-buffer bypass, and which spellings route
+#
+# `pa_fwd` has two public spellings and one of them is named `_asm`, which
+# looks like a backend pin and is not: `pa_fwd_asm` predates the neutral name,
+# so an ordinary call through it routes. Only `kernelName` pins a kernel no
+# provider has, and only that bypasses on its own.
+#
+# The other bypass is `out_`. The buffered form RETURNS the buffer it was
+# given, while a custom op's schema declares its results do not alias its
+# inputs; v2 leaves the buffer out of the contract rather than picking a side
+# of that contradiction.
+#
+# Five call sites in op_tests pass `out_`, so after this change they exercise
+# the bypass and nothing exercises the routed path. These tests are that
+# coverage: each pins WHICH path ran, not merely that the call returned.
+# ---------------------------------------------------------------------------
+
+
+def _pa_fwd_args(device="cpu"):
+    """The eleven parameters of the v2 contract -- no output buffer."""
+    heads, head_dim, batch, pages = 2, 16, 1, 1
+    return (
+        torch.randn(batch, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.zeros(batch, 1, dtype=torch.int32, device=device),
+        torch.ones(batch, dtype=torch.int32, device=device),
+        1,
+    )
+
+
+def _serve_pa_fwd(monkeypatch, served):
+    """Enable a provider for the pa_fwd contract and hand back its spy."""
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"pa_fwd": {2}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_both_spellings_route_when_no_buffer_is_named(monkeypatch, spelling):
+    """`pa_fwd_asm` is a historical name, not a backend pin, so it routes too.
+
+    Parametrised over both names rather than testing the neutral one alone:
+    the `_asm` suffix reads like a pin, and a reader who assumes it bypasses
+    would leave half this op's callers unrouted without noticing.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    served = torch.zeros(1, 2, 16)
+    provider = _serve_pa_fwd(monkeypatch, served)
+
+    result = getattr(module, spelling)(*_pa_fwd_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert torch.equal(result, served)
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_naming_the_output_buffer_bypasses_routing(monkeypatch, spelling):
+    """A named `out_` must not reach a provider, from either spelling.
+
+    The native body is replaced so this runs without a device: what is under
+    test is which branch the public name picks, not what the kernel computes.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    args = _pa_fwd_args()
+    result = getattr(module, spelling)(*args, out_=torch.zeros(1, 2, 16))
+
+    assert result is sentinel, "naming out_ did not reach the native body"
+    assert provider.select_calls == 0, (
+        "a named buffer must not reach a provider: the buffered form returns "
+        "the tensor it was given, which the registered schema forbids"
+    )
+
+
+def test_pa_fwd_kernel_name_bypasses_routing(monkeypatch):
+    """`kernelName` pins one asm kernel, which no provider has.
+
+    This is the only argument that bypasses on its own; keeping it pinned
+    separately from `out_` stops the two reasons being merged into one.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    result = module.pa_fwd_asm(*_pa_fwd_args(), kernelName="pa_fwd_some_kernel")
+
+    assert result is sentinel
+    assert provider.select_calls == 0
+
+
+def test_pa_fwd_buffered_form_returns_the_caller_s_buffer(monkeypatch):
+    """Buffer identity through the dispatcher, not just a correct value.
+
+    A fake that allocates returns the right value while leaving the caller's
+    buffer unwritten -- correct return, stale buffer, no error. The assertion
+    is on `data_ptr`, so it fails if the dispatcher hands back a different
+    allocation that merely holds the right numbers.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    buffer = torch.zeros(1, 2, 16)
+
+    def native(*args, **kwargs):
+        # `out_` sits after V_QScale in the native signature.
+        assert args[9] is buffer
+        args[9].fill_(1.0)
+        return args[9]
+
+    monkeypatch.setattr(module, "_pa_fwd_native", native)
+    result = module.pa_fwd(*_pa_fwd_args(), out_=buffer)
+
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(result, torch.ones(1, 2, 16))
