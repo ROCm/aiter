@@ -73,7 +73,9 @@ def pa_sparse_prefill_nvfp4(
     with E8M0 ``output_scale`` (``[seqs + quantized_pad_rows, 64]``): o_proj's
     MXFP8 input instead of ``output`` (left unwritten), bit for bit the separate
     group-32 quant of the BF16 rows; the padded rows get FP8 zeros and unit
-    scales. One KV head.
+    scales. ``quantized_pad_rows`` counts flattened rows, a multiple of
+    ``kv_heads``: viewed as ``[tokens, kv_heads * 16 * 128]`` the output is the
+    row-major activation of o_proj, one KV head's slice a flattened row.
     """
     seqs = query.shape[0]
     dev = query.device
@@ -135,7 +137,8 @@ def pa_sparse_prefill_nvfp4(
     if quant:
         quant_rows = seqs + quantized_pad_rows
         if (
-            kv_heads != 1
+            quantized_pad_rows < 0
+            or quantized_pad_rows % kv_heads
             or quantized_output.dtype not in (torch.float8_e4m3fn, torch.uint8)
             or not quantized_output.is_contiguous()
             or quantized_output.numel() != quant_rows * GROUP * HEAD_DIM
@@ -145,7 +148,7 @@ def pa_sparse_prefill_nvfp4(
             or output_scale.numel() != quant_rows * GROUP * HEAD_DIM // 32
         ):
             raise ValueError(
-                "the MXFP8 output needs one KV head, contiguous FP8 "
+                "the MXFP8 output needs whole tokens of padding, contiguous FP8 "
                 "[seqs + pad, 16, 128] values and E8M0 [seqs + pad, 64] scales"
             )
     if seqs == 0 and quant_rows == 0:
@@ -176,7 +179,8 @@ def pa_sparse_prefill_nvfp4(
             if quant
             else (flyc.from_c_void_p(fx.Uint8, 0),) * 2
         ),
-        quant_rows,
+        # The kernel counts the padded bucket in tokens, as ``rows``.
+        quant_rows // kv_heads,
         torch.cuda.current_stream(dev),
         specialization_key=(dev.index,),
     )

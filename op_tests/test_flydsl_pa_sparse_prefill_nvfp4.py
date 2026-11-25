@@ -88,6 +88,7 @@ def test_pa_sparse_prefill_nvfp4(case):
     candidates = {  # pa_decode: the per-token path the reuse kernel replaces
         "pa_decode": lambda o: pa_decode(o, *pa_args, **pa_kw),
         "reuse": lambda o: reuse(o, *args),
+        "reuse 4 KV heads": lambda o: reuse(o, *args, kv_heads=4),
     }
     ref, ret = run_torch(*host), {}
     for name, fn in candidates.items():
@@ -96,24 +97,27 @@ def test_pa_sparse_prefill_nvfp4(case):
         err = checkAllclose(ref, out.cpu().float(), atol=3e-2, rtol=3e-2, msg=name)
         assert err == 0, f"{case} {name}: {err:.2%} mismatched"
         ret[f"{name} us"], ret[f"{name} err"] = us, err
-    rows, pad = q.shape[0], 5  # MXFP8 output: o_proj's group-32 quant, bitwise
-    u8 = {"dtype": torch.uint8, "device": "cuda"}
-    codes = torch.full((rows + pad, GROUP, D), 0x55, **u8)
-    scales = torch.full((rows + pad, GROUP * D // 32), 0x33, **u8)
-    out = torch.empty_like(q)
-    reuse(out, *args)
-    reuse(
-        torch.empty_like(q),
-        *args,
-        quantized_output=codes,
-        output_scale=scales,
-        quantized_pad_rows=pad,
-    )
-    ref_codes, ref_scales = mxfp8_ref(out.cpu())
-    codes, scales = codes.cpu(), scales.cpu()
-    assert torch.equal(codes[:rows].flatten(1), ref_codes)
-    assert torch.equal(scales[:rows], ref_scales)
-    assert (codes[rows:] == 0).all() and (scales[rows:] == 127).all()
+    # MXFP8 output: o_proj's group-32 quant of the BF16 rows, bitwise. With 4 KV
+    # heads (a PP x TP1 rank) the rows are (token, KV head) pairs, padded by token.
+    rows, u8 = q.shape[0], {"dtype": torch.uint8, "device": "cuda"}
+    for kv_heads, pad in ((1, 5), (4, 3 * 4)):
+        codes = torch.full((rows + pad, GROUP, D), 0x55, **u8)
+        scales = torch.full((rows + pad, GROUP * D // 32), 0x33, **u8)
+        out = torch.empty_like(q)
+        reuse(out, *args, kv_heads=kv_heads)
+        reuse(
+            torch.empty_like(q),
+            *args,
+            kv_heads=kv_heads,
+            quantized_output=codes,
+            output_scale=scales,
+            quantized_pad_rows=pad,
+        )
+        ref_codes, ref_scales = mxfp8_ref(out.cpu())
+        codes, scales = codes.cpu(), scales.cpu()
+        assert torch.equal(codes[:rows].flatten(1), ref_codes), kv_heads
+        assert torch.equal(scales[:rows], ref_scales), kv_heads
+        assert (codes[rows:] == 0).all() and (scales[rows:] == 127).all(), kv_heads
     return ret
 
 
