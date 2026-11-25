@@ -84,10 +84,6 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
 #define OPUS_WA_ISSUE_2028 0
 #endif
 
-#ifndef MOE_SORTING_FUSE_MP_01
-#define MOE_SORTING_FUSE_MP_01 1
-#endif
-
 namespace aiter {
 
 // ---------------------------------------------------------------------------
@@ -286,10 +282,6 @@ namespace aiter {
 
 #define MOE_SORTING_MOCK_ID(token_id_, topk_id_) \
     static_cast<uint32_t>(((token_id_) & 0x00ffffff) | (((topk_id_) & 0xff) << 24))
-
-#ifndef MOE_SORTING_FUSE_MP_01
-#define MOE_SORTING_FUSE_MP_01 1
-#endif
 
 // clang-format off
 // [indexing implementation-1]
@@ -1241,12 +1233,6 @@ OPUS_H_D opus::index_t moe_sorting_mp_cumsum_smem_size(opus::index_t num_experts
     return (row_size + chunk - 1) / chunk * chunk * sizeof(opus::index_t);
 };
 
-OPUS_H_D opus::index_t moe_sorting_mp_sem_smem_size()
-{
-    constexpr opus::index_t chunk = 32;
-    return chunk * sizeof(opus::index_t);
-};
-
 template <typename T, typename F, opus::index_t wave_size_ = opus::get_warp_size()>
 OPUS_D constexpr T moe_sorting_wave_reduce(T local, F reduce_f, opus::number<wave_size_> = {})
 {
@@ -1547,12 +1533,7 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
     if(moe_sorting_mp_uses_chunk(tokens_, num_experts_))
         return impl::moe_sorting_chunk_workspace_size(tokens_, num_experts_);
     opus::index_t s_ = impl::moe_sorting_mp_mesh_smem_size(tokens_, num_experts_, topk_) +
-                       impl::moe_sorting_mp_cumsum_smem_size(num_experts_)
-#if MOE_SORTING_FUSE_MP_01
-                       + impl::moe_sorting_mp_sem_smem_size();
-#else
-        ;
-#endif
+                       impl::moe_sorting_mp_cumsum_smem_size(num_experts_);
     return s_;
 }
 
@@ -1828,255 +1809,6 @@ struct MoeSortingMultiPhaseKernel_P0_v2
         }
     }
 };
-
-#if MOE_SORTING_FUSE_MP_01
-template <typename Problem_>
-struct MoeSortingMultiPhaseKernel_P01
-{
-    using Problem = opus::remove_cvref_t<Problem_>;
-
-    using IndexType  = typename Problem::IndexType;
-    using WeightType = typename Problem::WeightType;
-    using MeshType   = typename Problem::MeshType;
-
-    static constexpr opus::index_t kBlockSize = 256;
-    static constexpr opus::index_t OCCUPANCY  = 2; // hard coded
-
-    typedef MoeSortingHostArgs MoeSortingKargs;
-
-    using Hargs = MoeSortingHostArgs;
-
-    struct Kargs
-    {
-        const void* p_topk_ids;          // [tokens, topk]
-        const void* p_local_expert_mask; // [expert]
-        const void* p_local_tokens;      // [1]
-        void* p_expert_mesh;             // [expert, tokens]
-        void* p_expert_cumsum;           // [expert + 1]
-        void* p_expert_sem;              // [1]
-        opus::index_t tokens;
-        opus::index_t num_experts;
-        opus::index_t mesh_stride; // mesh_stride for p_expert_mesh
-        opus::index_t wg_count;    // used for semaphore
-        opus::mdiv topk_mdiv;
-    };
-
-    OPUS_H static constexpr auto get_num_cu()
-    {
-        opus::index_t num_cu = [&]() {
-            hipDeviceProp_t dev_prop;
-            hipDevice_t dev;
-            OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
-            OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
-            return dev_prop.multiProcessorCount;
-        }();
-        return num_cu;
-    }
-
-    OPUS_H static constexpr auto MakeKargs(const Hargs& h)
-    {
-        Kargs k;
-        k.p_topk_ids          = h.p_topk_ids;
-        k.p_local_expert_mask = h.p_local_expert_mask;
-        k.p_local_tokens      = h.p_local_tokens;
-        k.p_expert_mesh       = h.p_ws;
-        k.p_expert_cumsum     = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(h.p_ws) +
-            impl::moe_sorting_mp_mesh_smem_size(h.tokens, h.num_experts, h.topk));
-        k.p_expert_sem = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(h.p_ws) +
-            impl::moe_sorting_mp_mesh_smem_size(h.tokens, h.num_experts, h.topk) +
-            impl::moe_sorting_mp_cumsum_smem_size(h.num_experts));
-        k.tokens      = h.tokens;
-        k.num_experts = h.num_experts;
-        k.mesh_stride = impl::moe_sorting_mp_mesh_stride(h.tokens);
-        k.wg_count    = [&]() {
-            if constexpr(Problem::LocalToken)
-            {
-                return GridSize(h);
-            }
-            else
-            {
-                return WGCounts(h);
-            }
-        }();
-        k.topk_mdiv = opus::mdiv{static_cast<uint32_t>(h.topk)};
-        return k;
-    }
-
-    OPUS_H static constexpr auto GridSize(const Hargs&) { return get_num_cu() * OCCUPANCY; }
-
-    OPUS_H static constexpr auto BlockSize(const Hargs&) { return dim3(kBlockSize); }
-
-    OPUS_H static constexpr auto WGCounts(const Hargs& h)
-    {
-        opus::index_t total_elem = h.tokens * h.topk / Problem::SubTokenTile;
-        opus::index_t elem_cnt   = (total_elem + kBlockSize - 1) / kBlockSize;
-
-        // no more than grid_size
-        return min(elem_cnt, GridSize(h));
-    }
-
-    // in byte
-    OPUS_H_D static constexpr auto GetSmemSize()
-    {
-        return kBlockSize / opus::get_warp_size() * sizeof(IndexType);
-    }
-
-    OPUS_D void operator()(Kargs kargs) const
-    {
-        opus::workgroup_barrier wb{reinterpret_cast<uint32_t*>(kargs.p_expert_sem)};
-        opus::index_t tokens = [&]() {
-            if constexpr(Problem::LocalToken)
-            {
-                return reinterpret_cast<const opus::index_t*>(kargs.p_local_tokens)[0];
-            }
-            else
-            {
-                return kargs.tokens;
-            }
-        }();
-        opus::index_t rounded_tokens = [&]() {
-            if constexpr(Problem::LocalToken)
-            {
-                return (tokens + Problem::SubTokenTile - 1) / Problem::SubTokenTile *
-                       Problem::SubTokenTile;
-            }
-            else
-                return tokens;
-        }();
-        opus::index_t wg_count = [&]() {
-            if constexpr(Problem::LocalToken)
-            {
-                opus::index_t total_elem = rounded_tokens * kargs.topk / Problem::SubTokenTile;
-                opus::index_t elem_cnt   = (total_elem + kBlockSize - 1) / kBlockSize;
-
-                // no more than grid_size
-                return min(elem_cnt, kargs.wg_count);
-            }
-            else
-            {
-                return kargs.wg_count;
-            }
-        }();
-
-        {
-            using topk_id_t = opus::vector_t<IndexType, Problem::SubTokenTile>;
-
-            const topk_id_t* p_topk_ids = reinterpret_cast<const topk_id_t*>(kargs.p_topk_ids);
-            IndexType* p_expert_mesh    = reinterpret_cast<IndexType*>(kargs.p_expert_mesh);
-            opus::index_t total_elem =
-                rounded_tokens * kargs.topk_mdiv.divisor / Problem::SubTokenTile;
-
-#pragma unroll Problem::SubTokenTile
-            for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
-                i += kBlockSize * gridDim.x)
-            {
-                auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
-                    p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
-                opus::static_for<Problem::SubTokenTile>([&](auto j) {
-                    IndexType eid = x[j.value]; // ext_vector_type must use int to []
-                    uint32_t curr_token_id, curr_topk_id;
-                    kargs.topk_mdiv.divmod(
-                        i * Problem::SubTokenTile + j, curr_token_id, curr_topk_id);
-                    if(eid >= 0 && eid < kargs.num_experts)
-                    {
-                        if constexpr(Problem::LocalToken)
-                        {
-                            if(static_cast<opus::index_t>(curr_token_id) < tokens)
-                                p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] =
-                                    (curr_topk_id + 1) & 0xffff;
-                        }
-                        else
-                            p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] =
-                                (curr_topk_id + 1) & 0xffff;
-                    }
-                });
-            }
-            if(static_cast<opus::index_t>(blockIdx.x) < wg_count)
-            {
-                wb.inc();
-            }
-        }
-
-        {
-            __shared__ char smem[GetSmemSize()];
-            int eid = blockIdx.x;
-
-            // early exist in case of extra atomic wait
-            if(eid >= kargs.num_experts)
-                return;
-
-            wb.wait_lt(wg_count);
-
-            for(; eid < kargs.num_experts; eid += gridDim.x)
-            {
-                // if(threadIdx.x == 0)
-                //     printf("!!! bid:%d, eid:%d (%d, %d)\n",
-                //            static_cast<int>(blockIdx.x),
-                //            eid,
-                //            kargs.num_experts,
-                //            static_cast<int>(blockDim.x));
-                constexpr opus::index_t index_pack = 4;            // always packed
-                using r_t = opus::vector_t<IndexType, index_pack>; // always use int32x4
-                r_t* p_expert_mesh =
-                    reinterpret_cast<r_t*>(reinterpret_cast<opus::index_t*>(kargs.p_expert_mesh) +
-                                           eid * kargs.mesh_stride);
-
-                const IndexType* p_local_expert_mask =
-                    static_cast<const IndexType*>(kargs.p_local_expert_mask);
-                IndexType* p_expert_cumsum = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
-
-                auto f_sum = [](auto x_, auto y_) { return x_ + y_; };
-
-                int loops = (kargs.mesh_stride / index_pack + kBlockSize - 1) / kBlockSize;
-
-                if constexpr(Problem::LocalExpertMasking)
-                {
-                    IndexType mask = p_local_expert_mask[eid];
-                    if(mask == 0)
-                        continue; // skip
-                }
-
-                opus::index_t cnt = 0; // per-wave cnt
-                for(int i = 0; i < loops; i++)
-                {
-                    int position = i * kBlockSize + threadIdx.x;
-                    r_t v{0};
-                    if(position < (kargs.mesh_stride / index_pack))
-                        v = p_expert_mesh[position];
-                    opus::index_t local_sum = 0;
-                    opus::static_for<index_pack>(
-                        [&](auto i_vec) { local_sum += v[i_vec.value] != 0 ? 1 : 0; });
-                    cnt += impl::moe_sorting_wave_reduce(local_sum, f_sum);
-                }
-
-                opus::index_t lane_id = threadIdx.x % opus::get_warp_size();
-                opus::index_t wave_id = threadIdx.x / opus::get_warp_size();
-
-                // reduce cross wave
-                IndexType* s = reinterpret_cast<IndexType*>(smem);
-                __syncthreads();
-                if(lane_id == 0)
-                {
-                    s[wave_id] = cnt;
-                }
-                __syncthreads();
-
-                if(threadIdx.x == 0)
-                {
-                    opus::index_t c = 0;
-                    for(auto i = 0; i < (kBlockSize / opus::get_warp_size()); i++)
-                    {
-                        c += s[i];
-                    }
-                    p_expert_cumsum[eid] = c;
-                }
-            }
-        }
-    }
-};
-#endif
 
 // token count cumsum
 template <typename Problem_>
@@ -3805,7 +3537,7 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
         return aiter::make_kernel(kernel{}, grids, blocks, lds_size, kargs);                    \
     }()
 
-#define OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(mesh_type_, token_vec_0_, token_vec_1_, token_vec_23_) \
+#define OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(mesh_type_, token_vec_0_, token_vec_23_)               \
     if(t.local_expert_masking)                                                                     \
     {                                                                                              \
         if(is_local_token)                                                                         \
@@ -3932,11 +3664,11 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             {
                 if(a.tokens * a.topk % 4 == 0)
                 {
-                    OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(uint8_t, 4, 16, 16)
+                    OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(uint8_t, 4, 16)
                 }
                 else
                 {
-                    OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(uint8_t, 1, 16, 16)
+                    OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(uint8_t, 1, 16)
                 }
             }
             else if(mesh_byte_size == 2)
@@ -3946,7 +3678,7 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             }
             else
             {
-                OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(opus::index_t, 1, 1, 1)
+                OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(opus::index_t, 1, 1)
             }
         }
     }
