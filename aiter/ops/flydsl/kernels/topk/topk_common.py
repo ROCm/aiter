@@ -3,14 +3,16 @@
 
 """Scalar, load and wave helpers shared by the FlyDSL TopK kernels."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import Float32, Int32, arith, as_ir_value, const_expr
+from flydsl.expr import Float32, Int32, arith, as_ir_value, const_expr, gpu
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
+_DPP_ROW_SHR = 0x110  # row_shr:n is _DPP_ROW_SHR | n
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
@@ -68,16 +70,11 @@ def _load_f32x4(tensor, vec_idx, cache_modifier=0):
 def _warp_inclusive_prefix_i32(val, lane, wave_size):
     val_raw = as_ir_value(val)
     zero_raw = as_ir_value(fx.Int32(0))
-    for dpp_op, threshold in (
-        (0x111, 1),
-        (0x112, 2),
-        (0x114, 4),
-        (0x118, 8),
-    ):
+    for shift in (1, 2, 4, 8):
         remote = update_dpp_i32(
-            zero_raw, val_raw, dpp_op, _DPP_ROW_MASK, _DPP_BANK_MASK, True
+            zero_raw, val_raw, _DPP_ROW_SHR | shift, _DPP_ROW_MASK, _DPP_BANK_MASK, True
         )
-        val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+        val = (lane >= fx.Int32(shift)).select(val + fx.Int32(remote), val)
         val_raw = as_ir_value(val)
 
     remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 1) * 4, val)
@@ -86,3 +83,37 @@ def _warp_inclusive_prefix_i32(val, lane, wave_size):
         remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 17) * 4, val)
         val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote), val)
     return val
+
+
+def _wave32_inclusive_sum_i32(value, lane):
+    """Each lane's inclusive prefix sum of `value` across a wave32."""
+    zero = fx.Int32(0)
+    # DPP shifts stay inside 16-lane rows: a lane whose source falls outside
+    # its row reads `old`, zero. Lane 15's sum then crosses into the upper row.
+    for shift in (1, 2, 4, 8):
+        value = value + fx.Int32(update_dpp_i32(zero, value, _DPP_ROW_SHR | shift))
+    row_total = fx.coop.warp_broadcast(value, 15)
+    return value + (lane >= fx.Int32(16)).select(row_total, zero)
+
+
+@flyc.jit
+def _wave32_block_exclusive_sum_i32(value, slots, lane, NUM_WAVES: fx.Constexpr[int]):
+    """Each thread's exclusive prefix sum of `value` across the block, and the total.
+
+    `slots` holds one int32 per wave and is read after this call's barrier:
+    another barrier must pass before the next call writes it.
+    """
+    zero = fx.Int32(0)
+    value = fx.Int32(value)
+    wave = fx.Int32(fly_rocdl.wave_id())
+    inclusive = _wave32_inclusive_sum_i32(value, lane)
+    if lane == fx.Int32(31):
+        slots[wave] = inclusive
+    gpu.barrier()
+    has_slot = lane < fx.Int32(NUM_WAVES)
+    slot = has_slot.select(slots[has_slot.select(lane, zero)], zero)
+    slot_inclusive = _wave32_inclusive_sum_i32(slot, lane)
+    # warp_broadcast from a runtime lane would shuffle through LDS.
+    wave_prefix = fx.Int32(fly_rocdl.readlane(T.i32, slot_inclusive - slot, wave))
+    total = fx.coop.warp_broadcast(slot_inclusive, NUM_WAVES - 1)
+    return wave_prefix + inclusive - value, total
