@@ -43,6 +43,11 @@ def compile(
     v_head_dim: int,
     func_name: str | None = None,
 ):
+    if gqa_ratio == 128 and get_gpu_arch() == "gfx950":
+        raise ValueError(
+            "The legacy gfx950 QH128 MLA kernel is retired; "
+            "use aiter.mla.mla_decode_fwd for supported configurations"
+        )
     if func_name is None:
         func_name = get_default_func_name(
             MD_NAME,
