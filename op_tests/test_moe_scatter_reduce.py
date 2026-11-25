@@ -17,6 +17,8 @@ aiter = pytest.importorskip("aiter")
 
 pytest.importorskip("aiter.ops.moe_mxfp4_aux", reason="mxfp4 MoE aux module")
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 # (D_HIDDEN, TOPK) scatter keys from gen_instances.SHAPES: MiniMax-M3 TP4 (the
 # C40 fault) and Muse Spark TP4+EP4.
 SCATTER_KEYS = ((6144, 5), (4096, 2))
@@ -115,6 +117,11 @@ def test_scatter_reduce_skips_negative_and_oob_indices(mb, D, topk):
     _assert_bf16_matches(out, ref, exact=True)
 
 
+# opus::fp4_to_fp32_packed_x8 is a zero-returning stub on gfx942, so the packed
+# FP4 output cannot match the reference there.
+@pytest.mark.skipif(
+    get_gfx_runtime() != "gfx950", reason="MXFP4 scatter decode needs gfx950"
+)
 @pytest.mark.parametrize("D, topk", SCATTER_KEYS, ids=SCATTER_IDS)
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
 def test_scatter_reduce_mxfp4_bounds_and_reference(mb, D, topk):
