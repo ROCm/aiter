@@ -11,6 +11,7 @@ Run:
 """
 
 import csv
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -819,6 +820,187 @@ class TestFlydslRingPolicyNames(unittest.TestCase):
         )
         self.assertTrue(seen["bpreshuffle"])
         self.assertIsNone(seen["out_dtype"])
+
+
+class TestFlydslRingTunerCandidates(unittest.TestCase):
+    """Tuner side of the ring policies (``csrc/gemm_a16w16/gemm_a16w16_tune.py``) and the committed ring rows."""
+
+    FT = types.MappingProxyType(
+        {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 3,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+        }
+    )
+
+    @classmethod
+    def _tune(cls):
+        from csrc.gemm_a16w16 import gemm_a16w16_tune
+
+        return gemm_a16w16_tune
+
+    def _configs(self):
+        from aiter.ops.flydsl.gemm_a16w16_cat_x_ring import ring_splitk_config
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        return [dict(self.FT), ring_config(4, 1, 4), ring_splitk_config(4, 10, 5)]
+
+    def _catalog(self, **kw):
+        tune = self._tune()
+        tune.get_flydsl_bf16_catalog.cache_clear()
+        self.addCleanup(tune.get_flydsl_bf16_catalog.cache_clear)
+        with (
+            mock.patch.object(
+                tune, "get_flydsl_a16w16_configs", return_value=self._configs()
+            ),
+            mock.patch.object(tune, "get_gfx_runtime", return_value="gfx950"),
+        ):
+            return tune.get_flydsl_bf16_catalog(
+                64, 1536, 30720, torch.bfloat16, False, torch.bfloat16, **kw
+            )
+
+    @staticmethod
+    def _policies(catalog):
+        return sorted(cfg.get("policy", "ft") for _, _, cfg in catalog)
+
+    def test_policies_filter_keeps_only_the_named_policies(self):
+        self.assertEqual(self._policies(self._catalog()), ["ft", "rg", "rk"])
+        self.assertEqual(self._policies(self._catalog(policies=("rg",))), ["rg"])
+        self.assertEqual(
+            self._policies(self._catalog(policies=("ft", "rk"))), ["ft", "rk"]
+        )
+        self.assertEqual(self._policies(self._catalog(policies=("sk",))), [])
+
+    def test_policy_tuple_parsing(self):
+        tune = self._tune()
+        self.assertIsNone(tune._policy_tuple(None))
+        self.assertIsNone(tune._policy_tuple(""))
+        self.assertEqual(tune._policy_tuple("rg, rk,"), ("rg", "rk"))
+
+    def test_shuffled_catalog_is_ring_only(self):
+        catalog = self._catalog(is_shuffle=True)
+        self.assertEqual(self._policies(catalog), ["rg", "rk"])
+        for _, name, _ in catalog:
+            self.assertRegex(name, r"_p(rg|rk)_gfx950$")
+        # The policies filter composes with the shuffle restriction.
+        self.assertEqual(
+            self._policies(self._catalog(is_shuffle=True, policies=("rk",))), ["rk"]
+        )
+        self.assertEqual(
+            self._policies(self._catalog(is_shuffle=True, policies=("ft",))), []
+        )
+
+    def test_b_non_temporal_modes_pass_ring_configs_through_once(self):
+        tune = self._tune()
+        for mode, ft_count in (("off", 1), ("on", 1), ("both", 2)):
+            out = tune._flydsl_b_non_temporal_configs(self._configs(), mode, "gfx950")
+            by_policy = [c.get("policy", "ft") for c in out]
+            self.assertEqual(by_policy.count("ft"), ft_count, mode)
+            self.assertEqual(by_policy.count("rg"), 1, mode)
+            self.assertEqual(by_policy.count("rk"), 1, mode)
+            for c in out:
+                if c.get("policy") in ("rg", "rk"):
+                    self.assertFalse(c.get("b_non_temporal", False), mode)
+
+    def test_run_flydsl_gemm_bf16_forwards_bpreshuffle(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        tune = self._tune()
+
+        def run(**kw):
+            seen = {}
+            with mock.patch.object(
+                tune,
+                "flydsl_hgemm",
+                side_effect=lambda *a, **kwargs: seen.update(kwargs) or torch.empty(1),
+            ):
+                tune.run_flydsl_gemm_bf16(
+                    torch.empty(1),
+                    torch.empty(1),
+                    torch.empty(1),
+                    config=ring_config(4, 1, 4),
+                    **kw,
+                )
+            return seen
+
+        for shuffled in (False, True):
+            seen = run(bpreshuffle=shuffled)
+            self.assertEqual(seen["policy"], "rg")
+            self.assertIs(seen["bpreshuffle"], shuffled)
+        seen = run()
+        self.assertFalse(seen["bpreshuffle"])  # default stays row-major B
+
+    def test_committed_ring_rows_resolve(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_cat_x_ring import (
+            ring_splitk_config,
+            ring_splitk_name_tiling,
+        )
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config, ring_name_tiling
+
+        root = Path(__file__).resolve().parents[2] / "aiter" / "configs"
+        rows = []
+        for path in sorted(root.rglob("*_tuned_gemm.csv")):
+            with open(path, newline="") as f:
+                rows += [
+                    r
+                    for r in csv.DictReader(f)
+                    if r.get("libtype") == "flydsl"
+                    and r["kernelName"].startswith("flydsl_hgemm_")
+                ]
+        seen = {"rg": 0, "rk": 0}
+        for r in rows:
+            match = gemm_kernels._HGEMM_KERNEL_RE.match(r["kernelName"])
+            self.assertIsNotNone(match, r["kernelName"])
+            policy = match.group("policy")
+            if policy not in seen:
+                continue
+            seen[policy] += 1
+            params = gemm_kernels.get_flydsl_hgemm_kernel_params(r["kernelName"])
+            self.assertIsNotNone(params, r["kernelName"])
+            m = int(r["M"])
+            self.assertGreaterEqual(params["block_m"], m, r["kernelName"])
+            if policy == "rg":
+                tiling = ring_name_tiling(params)
+                config = ring_config(*tiling) if tiling else None
+            else:
+                tiling = ring_splitk_name_tiling(params)
+                config = ring_splitk_config(*tiling) if tiling else None
+                self.assertEqual(int(r["splitK"]), params["split_k"])
+            self.assertIsNotNone(tiling, r["kernelName"])
+            # The row's name is exactly what the tuner would emit for its tiling.
+            self.assertEqual(
+                gemm_kernels.flydsl_hgemm_kernel_name(
+                    dtype=torch.bfloat16,
+                    out_dtype=torch.bfloat16,
+                    config=config,
+                    has_bias=False,
+                    target_gfx="gfx950",
+                ),
+                r["kernelName"],
+            )
+        # lm_head (rg) and DSpark FC (rk) rows are both committed.
+        self.assertGreater(seen["rg"], 0)
+        self.assertGreater(seen["rk"], 0)
+
+    def test_ring_policy_exports(self):
+        self.assertEqual(gemm_kernels_module().RING_POLICY, "rg")
+        self.assertEqual(gemm_kernels_module().RING_SPLITK_POLICY, "rk")
+        for name in ("RING_POLICY", "RING_SPLITK_POLICY"):
+            self.assertIn(name, gemm_kernels_module().__all__)
+
+
+def gemm_kernels_module():
+    from aiter.ops.flydsl import gemm_kernels
+
+    return gemm_kernels
 
 
 if __name__ == "__main__":

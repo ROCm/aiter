@@ -31,6 +31,7 @@ from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
 from .kernels.tensor_shim import _run_compiled, current_stream_arg
 
 __all__ = [
+    "RING_POLICY",
     "RING_SPLITK_POLICY",
     "SKINNY_POLICY",
     "SPLIT_K_SEMAPHORE_MAX_LEN",
