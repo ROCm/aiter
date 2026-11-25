@@ -21,10 +21,11 @@ import importlib
 
 import pytest
 import torch
+from triton.runtime.autotuner import Autotuner, Heuristics
 
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import flash_kda_fwd
+from aiter.ops.triton.utils import fast_launch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="flash_kda needs a GPU"
@@ -148,9 +149,9 @@ def _wrapped():
 def test_entries_do_not_pin_their_inputs():
     """An entry outlives the call that made it, so it must not hold its tensors.
 
-    The binder hands back every argument bound together, which is the obvious
-    thing to keep for the grid callback and also every q, k, v and workspace of
-    whichever call arrived first, none of which any caller can then free.
+    The pre-run hook sees every argument of the launch, which is the obvious
+    thing to keep for the grid callback. Keeping all of them would also pin
+    the first call's q, k, v and workspace tensors.
     """
     for T_ in (256, 512, 1024):
         run(make_inputs(1, T_, 12))
@@ -159,7 +160,7 @@ def test_entries_do_not_pin_their_inputs():
     for wrapper in _wrapped():
         for entry in wrapper._cache.values():
             entries += 1
-            held = [v for part in entry[2:] for v in part.values()]
+            held = [*entry, *entry.frozen.values()]
             tensors = [v for v in held if isinstance(v, torch.Tensor)]
             assert not tensors, f"entry holds {len(tensors)} tensors"
     assert entries, "nothing was cached, so nothing was tested"
@@ -222,7 +223,7 @@ def test_a_second_device_does_not_reuse_the_first_entry():
 def test_alignment_is_part_of_the_key(monkeypatch):
     """A tensor off a 16-byte boundary must not reach a kernel told otherwise."""
     # The Triton K1 takes q as it is; gfx950's Gluon K1 would get an aligned copy.
-    monkeypatch.setattr(_flash_kda, "AITER_FDA_USE_GLUON_K1", False)
+    monkeypatch.setattr(flash_kda, "AITER_FDA_USE_GLUON_K1", False)
     B, T, H = 1, 512, 12
     args = make_inputs(B, T, H)
     run(args)
@@ -244,3 +245,30 @@ def test_alignment_is_part_of_the_key(monkeypatch):
     got_o, got_s = run(misaligned)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_prepare_fast", "_segment_fast", "_seg_scan_fast", "_seg_scan_prefetch_fast"],
+)
+def test_no_config_choice_reads_a_shape(name):
+    """What lets these launchers pass key_shapes=False: no heuristic reads any
+    property of an argument (it may only test it for None), and no autotuner
+    prunes or models configs from the arguments (its key holds ints, bools and
+    dtypes)."""
+    wrapped = getattr(flash_kda, name)
+    assert wrapped._key_shapes is False
+    params = wrapped._jit.arg_names
+    heuristics = 0
+    k = wrapped._kernel
+    while k is not wrapped._jit:
+        if isinstance(k, Heuristics):
+            heuristics += 1
+            for heur in k.values.values():
+                # Any attribute read on an object() raises.
+                heur({n: object() for n in params})
+                heur({n: None for n in params})
+        if isinstance(k, Autotuner):
+            assert k.early_config_prune is None and k.perf_model is None
+        k = k.fn
+    assert heuristics

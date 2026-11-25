@@ -12,8 +12,8 @@ from aiter.ops.triton._gluon_kernels.common.utils import (
     sigmoid_log2,
     sum_combine,
 )
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 # [C, K] tiles: warps split the rows, so the l2norm row sums stay within a warp.
 _BLK_CK: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [2, 1], [1, 0])
