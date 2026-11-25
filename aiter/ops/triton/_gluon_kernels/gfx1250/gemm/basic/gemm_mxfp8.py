@@ -2429,12 +2429,18 @@ def _gemm_mxfp8_preshuffle_kernel(
     stride_res_m=0,
     stride_ssq_m=0,
     RES_SSQ: gl.constexpr = 0,
+    RES_EARLY: gl.constexpr = 0,
+    XCD_TILES: gl.constexpr = 1,
 ):
     # RES_SSQ (ATOM_FOLD_POSTNORM, the post-attention RMSNorm folded away): the epilogue adds the bf16
     # residual (fp32 add of the bf16-rounded GEMM output, as _gluon_fused_rms_kernel), stores the sum
     # rounded to c's dtype as c, and stores the row's fp32 sum of squares over this tile's columns
     # (unrounded sum, as the norm) at ssq[row, tile_n]. The consumer (the fold D router kernel) applies
     # the norm. One CTA a tile (num_ctas == 1), EPI_SPLIT == 1.
+    # RES_EARLY: the residual tile is loaded before the K loop (its latency hides under the weight stream).
+    # XCD_TILES > 1: XCD_TILES consecutive N tiles run on one XCD, so the 256 B lines of the output / residual rows
+    # that narrow tiles share are written / read through one L2 (workgroups go round robin over the 8 XCDs in
+    # dispatch order). Both change only which program does what and when: bitwise.
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
     if num_warps == 2:
@@ -2512,6 +2518,17 @@ def _gemm_mxfp8_preshuffle_kernel(
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
+
+    if XCD_TILES > 1:
+        # within full groups of 8 * XCD_TILES programs: program p -> tile (p % 8) * XCD_TILES + p // 8
+        GRP: gl.constexpr = 8 * XCD_TILES
+        g0 = (pid // GRP) * GRP
+        q = pid - g0
+        pid = gl.where(
+            g0 + GRP <= gl.cdiv(M, BLOCK_SIZE_M) * tiles_n,
+            g0 + (q % 8) * XCD_TILES + q // 8,
+            pid,
+        )
 
     if GROUP_M == 1:
         tile_m = pid // tiles_n
@@ -2618,6 +2635,19 @@ def _gemm_mxfp8_preshuffle_kernel(
         )
         BS_ROWS: gl.constexpr = BLOCK_SIZE_N // W_SCALE_BN
         BS_COLS: gl.constexpr = BS_STEP
+
+    if RES_SSQ and RES_EARLY:
+        rr_e = tile_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout)
+        )
+        cc_e = tile_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout)
+        )
+        rv_early = gl.load(
+            res_ptr + rr_e[:, None] * stride_res_m + cc_e[None, :],
+            mask=(rr_e < M)[:, None] & (cc_e < N)[None, :],
+            other=0.0,
+        )
 
     # =====================================================================
     # Allocate shared memory
@@ -2940,9 +2970,12 @@ def _gemm_mxfp8_preshuffle_kernel(
             )
             rmask = rr < M
             msk = rmask[:, None] & (cc < N)[None, :]
-            rv = gl.load(
-                res_ptr + rr[:, None] * stride_res_m + cc[None, :], mask=msk, other=0.0
-            )
+            if RES_EARLY:
+                rv = rv_early
+            else:
+                rv = gl.load(
+                    res_ptr + rr[:, None] * stride_res_m + cc[None, :], mask=msk, other=0.0
+                )
             sv = acc.to(c_ptr.type.element_ty).to(gl.float32) + rv.to(gl.float32)
             gl.store(
                 ssq_ptr + rr * stride_ssq_m + tile_n,
