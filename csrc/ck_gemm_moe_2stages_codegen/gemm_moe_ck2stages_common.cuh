@@ -3,7 +3,9 @@
 #pragma once
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm.hpp"
+#include "ck/tensor_operation/gpu/element/moe_silu.hpp"
 #include "gemm_moe_ck2stages.h"
+#include <cmath>
 #include <iostream>
 
 template <typename A0DataType,
@@ -21,7 +23,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -39,8 +42,18 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        [[maybe_unused]] float swiglu_limit)
 {
+    const bool enabled = swiglu_limit > 0.0f && std::isfinite(swiglu_limit);
+    TORCH_CHECK(enabled == RuntimeSwigluLimit,
+                "Runtime SwiGLU limit module does not match the requested clamp state");
+    if constexpr(RuntimeSwigluLimit)
+    {
+        TORCH_CHECK(ck::MoeSilu::ValidRuntimeLimit(swiglu_limit),
+                    "Runtime SwiGLU limit must be positive and finite");
+    }
+
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
@@ -108,7 +121,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec>,
-               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType, A0DataType, A0DataType, A0DataType, RuntimeSwigluLimit>;
     // clang-format on
 
     auto a_element_op   = AElementOp{};
@@ -147,7 +160,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         KBatch,
         a_element_op,
         b_element_op,
-        cde_element_op);
+        cde_element_op,
+        swiglu_limit);
 
     if(!device_op.IsSupportedArgument(argument))
     {
@@ -176,24 +190,27 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
-                                            int tokens,                       \
-                                            int sorted_size,                  \
-                                            int N,                            \
-                                            int K,                            \
-                                            int topk,                         \
-                                            void*& hidden_states,             \
-                                            void*& w1,                        \
-                                            void*& w2,                        \
-                                            void*& sorted_token_ids,          \
-                                            void*& sorted_expert_ids,         \
-                                            void*& sorted_weights,            \
-                                            void*& num_valid_ids,             \
-                                            void*& out,                       \
-                                            std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale,    \
-                                            std::optional<int> splitk,        \
-                                            std::optional<bool> nt);
+                                     ActOP,                                   \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
+        const hipStream_t& stream,                                            \
+        int tokens,                                                           \
+        int sorted_size,                                                      \
+        int N,                                                                \
+        int K,                                                                \
+        int topk,                                                             \
+        void*& hidden_states,                                                 \
+        void*& w1,                                                            \
+        void*& w2,                                                            \
+        void*& sorted_token_ids,                                              \
+        void*& sorted_expert_ids,                                             \
+        void*& sorted_weights,                                                \
+        void*& num_valid_ids,                                                 \
+        void*& out,                                                           \
+        std::optional<void*> w1_scale,                                        \
+        std::optional<void*> a1_scale,                                        \
+        std::optional<int> splitk,                                            \
+        std::optional<bool> nt,                                               \
+        [[maybe_unused]] float swiglu_limit);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -228,7 +245,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
@@ -266,7 +284,9 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
     static constexpr ck::index_t K1 =
-        (BLOCKSIZE == 256 && KPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
+        (BLOCKSIZE == 256 && KPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1)
+            ? 8
+            : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 =
         ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : K1 / sizeof(B0DataType);
@@ -361,4 +381,4 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool>  nt);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);
