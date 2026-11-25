@@ -1771,8 +1771,9 @@ class Gfx1250Traits:
 
     @property
     def causal_rows(self):
-        # The per-wave tiles bound every row causally. One query token sees the
-        # same keys either way; longer non-causal blocks keep the shared tiles.
+        # One query token sees the same keys either way, so it keeps the causal
+        # row bound. The wave-pair tiles bound every row causally; longer
+        # non-causal blocks keep the shared tiles.
         return self.causal or self.query_length == 1
 
     @property

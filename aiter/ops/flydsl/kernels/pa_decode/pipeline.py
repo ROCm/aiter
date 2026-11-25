@@ -1764,7 +1764,7 @@ class Gfx1250Bf16Pipeline:
             for m in range_constexpr(t.m_tiles):
                 row = m * 16 + ctx.lane16
                 upper = ctx.planned_context
-                if const_expr(t.causal or t.sliding_window > 0):
+                if const_expr(t.causal_rows or t.sliding_window > 0):
                     # The row's causal bound; the window starts W keys before it.
                     causal_upper = (
                         upper
@@ -1773,7 +1773,7 @@ class Gfx1250Bf16Pipeline:
                         + row // t.query_group_size
                         + 1
                     )
-                    if const_expr(t.causal):
+                    if const_expr(t.causal_rows):
                         upper = causal_upper
                     elif const_expr(t.sliding_window < t.query_length):
                         upper = fx.min(upper, causal_upper + (t.sliding_window - 1))
@@ -2973,7 +2973,7 @@ class Gfx1250Pipeline:
                     ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
                     scale = scale * fx.Float32(ks[0])
                 upper = ctx.planned_context
-                if const_expr(t.causal or t.sliding_window > 0):
+                if const_expr(t.causal_rows or t.sliding_window > 0):
                     # The row's causal bound; the window starts W keys before it.
                     causal_upper = (
                         upper
@@ -2982,7 +2982,7 @@ class Gfx1250Pipeline:
                         + row // t.query_group_size
                         + 1
                     )
-                    if const_expr(t.causal):
+                    if const_expr(t.causal_rows):
                         upper = causal_upper
                     elif const_expr(t.sliding_window < t.query_length):
                         upper = fx.min(upper, causal_upper + (t.sliding_window - 1))
