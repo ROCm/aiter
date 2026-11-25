@@ -540,16 +540,15 @@ class G2SRounds(G2SLoader):
         super().__init__(gl_src, [base_offset], n_load_steps, lds_dtype, wave_id)
         self.round_bytes = round_bytes
 
-    def load(self, lds_dst, k_offset):
+    def load(self, lds_dst, k_offset, skip=(None, None)):
+        """``skip[r]`` != 0 sends round r out of range: no memory traffic, zeros in LDS, same vmcnt."""
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[0])))
             dst = self._lds_dst_at(lds_dst, step)
-            fx.copy(
-                self.g2lds_atom,
-                src,
-                dst,
-                soffset=fx.Int32(k_offset) + step * self.round_bytes,
-            )
+            soff = fx.Int32(k_offset) + step * self.round_bytes
+            if const_expr(skip[step] is not None):
+                soff = (skip[step] != 0).select(fx.Int32(1 << 30), soff)
+            fx.copy(self.g2lds_atom, src, dst, soffset=soff)
 
 
 class MoeScaleLds:
@@ -1148,7 +1147,7 @@ def compile_moe_bs_gemm_8w(
                 wave_m * A_GRP_ROWS,
             )
 
-        def make_ctx(tile, expert):
+        def make_ctx(tile, expert, pmask):
             """Stage 2's loaders of one tile (contiguous A rows), from its index and expert."""
             m_blk = tile // NB
             nb = tile % NB
@@ -1183,8 +1182,16 @@ def compile_moe_bs_gemm_8w(
                 for h in range_constexpr(2)
             ]
 
+            # Rounds whose 64 rows are all padding (``pmask`` bit q: rows 64 q
+            # + 64 on are padding) load nothing: at T = 4096 an expert fills
+            # ~114 of its 256 rows.
+            a_skip = [
+                (None, pmask & 1),
+                ((pmask >> 1) & 1, (pmask >> 2) & 1),
+            ]
+
             def a_load(h, dst, k):
-                a_g2s.load(dst, a_base[h] + (rot + k) % K_ITERS * BLOCK_K)
+                a_g2s.load(dst, a_base[h] + (rot + k) % K_ITERS * BLOCK_K, a_skip[h])
 
             def b_load(h, dst, k):
                 b_g2s.load(dst, b_off[h] + (rot + k) % K_ITERS * B_K_STEP)
@@ -1194,14 +1201,24 @@ def compile_moe_bs_gemm_8w(
 
             return {"a": a_load, "b": b_load, "sc": sc_dma, "row0": row0, "rot": rot}
 
-        def h1_pad_row(tile):
-            """The sorted row whose padding means this wave's row-half-1 rows are all padding."""
-            return tile // NB * BLOCK_M + LDS_BLOCK_M + wave_m * A_GRP_ROWS
+        def pad_rows(tile):
+            """Issue the loads of rows 64, 128 and 192 of ``tile``'s m-block (``pad_mask`` reads them)."""
+            row0 = tile // NB * BLOCK_M
+            return [_load_i32_lane(ids_div, row0 + 64 * q) for q in range(1, 4)]
 
-        def is_pad(sid):
-            # Padding rows name token T (moe_sorting) and sit at the end of an
-            # expert's block: past the first one, every row is padding.
-            return ((sid & 0xFFFFFF) >= n_tokens).select(fx.Int32(1), fx.Int32(0))
+        def pad_mask(sids):
+            """Bit q - 1: rows 64 q .. 255 of the m-block are all padding.
+
+            Padding rows name token T (moe_sorting) and sit at the end of an
+            expert's block, so a padded row means every later one is too.
+            """
+            m = fx.Int32(0)
+            for q in range_constexpr(3):
+                pad = ((sids[q] & 0xFFFFFF) >= n_tokens).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+                m = m | (pad << q)
+            return _sgpr(m)
 
         def mfma_skip(skip, burst, c):
             """``burst()`` unless ``skip``: a wave-uniform branch around an MFMA burst."""
@@ -1210,8 +1227,8 @@ def compile_moe_bs_gemm_8w(
                 out = burst()
             return out
 
-        def mfma_h1(b, a, c, sb, sa, skip):
-            """``mfma.call`` of a row-half-1 quadrant, dropped when this wave's rows there are padding."""
+        def mfma_q(b, a, c, sb, sa, skip):
+            """``mfma.call`` of a quadrant, dropped when this wave's rows of it are all padding."""
             rocdl.s_setprio(1)
             c = mfma_skip(
                 skip,
@@ -1223,7 +1240,7 @@ def compile_moe_bs_gemm_8w(
             return c
 
         def run_tile_stream(
-            tile, expert, skip_h1, next_tile, parity, prev_tile, prev_acc
+            tile, expert, pmask, next_tile, parity, prev_tile, prev_acc
         ):
             """Stage 2: K-steps 0 .. K - 1 of ``tile``.
 
@@ -1253,10 +1270,12 @@ def compile_moe_bs_gemm_8w(
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
             )
-            cur = make_ctx(tile, expert)
+            cur = make_ctx(tile, expert, pmask)
+            # This wave's rows of row half h: wave_m * 64 + 128 h + [0, 64).
+            skip_h1 = (pmask >> (wave_m + 1)) & 1
             nxt = None
             nxt_expert = None
-            nxt_skip = None
+            nxt_mask = None
             c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
             c01 = list(c00)
             c10 = list(c00)
@@ -1275,7 +1294,7 @@ def compile_moe_bs_gemm_8w(
 
             for k in range_constexpr(K_ITERS):
                 if const_expr(k == K_ITERS - 4):
-                    nxt = make_ctx(next_tile, nxt_expert)
+                    nxt = make_ctx(next_tile, nxt_expert, nxt_mask)
                 sa0 = sc_read(k, "a0")
                 sb0 = sc_read(k, "b0")
                 b0_frag = b_s2r.load(b_cur0)
@@ -1284,7 +1303,7 @@ def compile_moe_bs_gemm_8w(
                     # Older than this step's A1 load: its end wait drains them.
                     routes = store_c.fetch(cur["row0"])
                     nxt_eid = _load_i32_lane(eids_div, next_tile // NB)
-                    nxt_pad = _load_i32_lane(ids_div, h1_pad_row(next_tile))
+                    nxt_pad = pad_rows(next_tile)
                 ctx, kk = src(k + 1)
                 ctx["a"](1, a_next1, kk)
                 if const_expr(k == 0):
@@ -1321,11 +1340,11 @@ def compile_moe_bs_gemm_8w(
                 wait_barrier(
                     4 * N_LDS_STEPS
                     + n_sc
-                    + (4 + 3 * QUAD_STORES if k == 0 else 0)
+                    + (6 + 3 * QUAD_STORES if k == 0 else 0)
                     + (2 * QUAD_STORES if k == 1 else 0)
                 )
 
-                c10 = mfma_h1(b0_frag, a1_frag, c10, sb0, sa1, skip_h1)
+                c10 = mfma_q(b0_frag, a1_frag, c10, sb0, sa1, skip_h1)
 
                 ctx["b"](1, b_cur1, kk)
                 if const_expr(k == 0):
@@ -1336,16 +1355,16 @@ def compile_moe_bs_gemm_8w(
                 if const_expr(k == 0):
                     store_c.stash(routes, parity)
                     nxt_expert = _sgpr(nxt_eid)
-                    nxt_skip = _sgpr(is_pad(nxt_pad))
+                    nxt_mask = pad_mask(nxt_pad)
 
-                c11 = mfma_h1(b1_frag, a1_frag, c11, sb1, sa1, skip_h1)
+                c11 = mfma_q(b1_frag, a1_frag, c11, sb1, sa1, skip_h1)
 
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
                 b_cur1, b_next1 = b_next1, b_cur1
 
-            return [c00, c01, c10, c11], nxt_expert, nxt_skip
+            return [c00, c01, c10, c11], nxt_expert, nxt_mask
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -1370,7 +1389,8 @@ def compile_moe_bs_gemm_8w(
             first_expert = has_tile.select(
                 _load_i32(eids_div, first_tile // NB), fx.Int32(0)
             )
-            first = make_ctx(first_tile, first_expert)
+            first_mask = pad_mask(pad_rows(first_tile))
+            first = make_ctx(first_tile, first_expert, first_mask)
             first["sc"](0)
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
@@ -1387,9 +1407,8 @@ def compile_moe_bs_gemm_8w(
             first["b"](1, b_next1, 1)
             wait_barrier(3 * N_LDS_STEPS)
 
-            first_skip = _sgpr(is_pad(_load_i32_lane(ids_div, h1_pad_row(first_tile))))
             n_acc = N_TILES_A * N_TILES_B
-            init = [fx.Int32(0), fx.Int32(-1), first_expert, first_skip] + [
+            init = [fx.Int32(0), fx.Int32(-1), first_expert, first_mask] + [
                 mfma.zero_value
             ] * (4 * n_acc)
             for tile, state in range(start, n_tiles, grid, init=init):
@@ -1397,7 +1416,7 @@ def compile_moe_bs_gemm_8w(
                 # The last tile streams itself again; nothing reads those loads.
                 nt = (nt < n_tiles).select(nt, fx.Int32(tile))
                 acc = state[4:]
-                acc, nxt_expert, nxt_skip = run_tile_stream(
+                acc, nxt_expert, nxt_mask = run_tile_stream(
                     fx.Int32(tile),
                     state[2],
                     state[3],
@@ -1406,7 +1425,7 @@ def compile_moe_bs_gemm_8w(
                     state[1],
                     [acc[g * n_acc : (g + 1) * n_acc] for g in range(4)],
                 )
-                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert, nxt_skip] + [
+                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert, nxt_mask] + [
                     v for g in acc for v in g
                 ]
             # The last tile's stores (a workgroup without a tile sends them
