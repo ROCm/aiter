@@ -14,13 +14,13 @@ Triton RoPE (RotaryEmbedding.forward_triton, AITER_ROPE_TRITON_BACKEND=1).
 
 import pytest
 import torch
-from aiter.test_common import benchmark
 
 from aiter.ops.mla_nvfp4 import (
     mla_nvfp4_decode_prep,
     mla_nvfp4_quantize_q,
     mla_nvfp4_update_cache,
 )
+from aiter.test_common import benchmark
 
 H = 128
 # DeepSeek-R1's YaRN RoPE.
@@ -419,10 +419,9 @@ def run_torch(q, cos, sin, positions):
 
 @benchmark()
 def bench_decode_prep(b, layout):
-    import aiter
     from aiter import dtypes
-    from aiter.test_common import checkAllclose, run_perftest
     from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.test_common import checkAllclose, run_perftest
 
     torch.manual_seed(174)
     # DSR1 q_b_proj gives 192 BF16 columns/head; ring has a 61-layer stride.
@@ -474,7 +473,9 @@ def bench_decode_prep(b, layout):
 def main():
     import argparse
     import itertools
+
     import pandas as pd
+
     import aiter
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
