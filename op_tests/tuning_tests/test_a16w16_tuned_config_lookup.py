@@ -674,9 +674,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                         with self.assertRaisesRegex(
                             RuntimeError, "TDM HGEMM policies require gfx1250"
                         ):
-                            kernels.flydsl_hgemm(
-                                a, b, out=out, stream=stream, **kwargs
-                            )
+                            kernels.flydsl_hgemm(a, b, out=out, stream=stream, **kwargs)
                         launch.assert_not_called()
                         tdm_launch.assert_not_called()
                         band.assert_not_called()
