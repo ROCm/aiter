@@ -2,8 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import os
-
 import torch
 from torch import Tensor
 
@@ -67,24 +65,21 @@ def _fused_qknorm_idxrqknorm_hip(
     pass
 
 
-# ---- NVFP4 prefill front ----------------------------------------------------------------------
-# The MiniMax-M3 TP4 NVFP4 insert (16 q / 1 kv / 1 index heads, head_dim 128, rotary 64, bf16) at
-# prefill sizes runs a kernel that takes ~10 us of device time per 1K tokens less than the generic
-# one, and a call at those sizes is launched eagerly: the generic entry marshals 16 tensors through
-# aiter_tensor_t (about 20 us of host time per call). This front checks the operands of that one call
-# shape in Python and hands raw device pointers and the stream to a second entry of the same
-# module; any other call (and any call it declines) takes the generic path unchanged. The token
-# floor is the C++ one (AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS, default 2).
-_NV_PF_MIN_TOKENS = int(
-    os.environ.get("AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS", "2")
-)
+# ---- NVFP4 raw front ---------------------------------------------------------------------------
+# The MiniMax-M3 TP4 NVFP4 insert (16 q / 1 kv / 1 index heads, head_dim 128, rotary 64, bf16) is
+# launched eagerly at prefill sizes, where the generic entry's marshalling of 16 tensors through
+# aiter_tensor_t costs about 20 us of host time per call. This front checks the operands of that one
+# call shape in Python and hands raw device pointers and the stream to a second entry of the same
+# module, for every token count; the C++ launcher then picks the prefill variant from
+# AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS tokens (default 2) and the generic kernel below it.
+# Any other call (and any call the front declines) takes the generic path unchanged.
 _NV_PF_ROW = (16 + 2 * 1 + 1 + 1) * 128  # qkv row, elements
 _NV_PF_PAGE = 9216  # bytes of one K (or V) side of a 128-token NVFP4 page
 _nv_pf_mod = None
 _nv_pf_gfx950 = None
 
 
-def _nvfp4_prefill_front(
+def _nvfp4_raw_front(
     qkv,
     q_norm_weight,
     k_norm_weight,
@@ -103,10 +98,10 @@ def _nvfp4_prefill_front(
     k_scale,
     v_scale,
 ):
-    """True when the call was handed to the raw prefill entry."""
+    """True when the call was handed to the raw entry."""
     global _nv_pf_mod, _nv_pf_gfx950
     n = qkv.shape[0]
-    if n < _NV_PF_MIN_TOKENS or n < 2:
+    if n < 1:
         return False
     bf16 = torch.bfloat16
     if (
@@ -202,7 +197,7 @@ def _nvfp4_prefill_front(
             _nv_pf_mod = get_module("module_fused_qknorm_idxrqknorm")
         except ModuleNotFoundError:
             return False  # not built yet: the generic call below builds it
-    _nv_pf_mod.fused_qknorm_nvfp4_prefill_raw(
+    _nv_pf_mod.fused_qknorm_nvfp4_raw(
         qkv.data_ptr(),
         q_out.data_ptr(),
         index_q_out.data_ptr(),
@@ -295,7 +290,7 @@ def fused_qknorm_idxrqknorm(
         and num_index_heads == 1
         and rotary_dim == 64
         and block_size == 128
-        and _nvfp4_prefill_front(
+        and _nvfp4_raw_front(
             qkv,
             q_norm_weight,
             k_norm_weight,

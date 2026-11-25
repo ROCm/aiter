@@ -37,7 +37,7 @@ void fused_qknorm_idxrqknorm(
     bool asm_layout = false,
     bool skip_index_branch = false);
 
-void fused_qknorm_nvfp4_prefill_raw(int64_t qkv,
+void fused_qknorm_nvfp4_raw(int64_t qkv,
                                     int64_t q_out,
                                     int64_t index_q_out,
                                     int64_t q_norm_weight,

@@ -174,33 +174,35 @@ def make(n, kind, seed):
     idx = torch.randint(0, 255, (nb, PAGE), generator=gd, dtype=torch.uint8, device=dev)
     ks = torch.tensor([0.05 + 0.01 * (seed % 5)], device=dev)
     vs = torch.tensor([0.03 + 0.01 * (seed % 7)], device=dev)
-    return dict(
-        qkv=qkv,
-        w=w,
-        cs=cs,
-        pos=pos,
-        slot=slot.to(dev),
-        islot=islot.to(dev),
-        kv=kv,
-        idx=idx,
-        ks=ks,
-        vs=vs,
-    )
+    return {
+        "qkv": qkv,
+        "w": w,
+        "cs": cs,
+        "pos": pos,
+        "slot": slot.to(dev),
+        "islot": islot.to(dev),
+        "kv": kv,
+        "idx": idx,
+        "ks": ks,
+        "vs": vs,
+    }
 
 
-def run(c, n):
+def run(c, n, marshalled=False):
+    """marshalled=True calls the generic aiter_tensor_t entry directly, bypassing the raw-pointer front."""
     from aiter.ops import fused_qknorm_idxrqknorm as op
 
     kv, idx = c["kv"].clone(), c["idx"].clone()
     q = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
     iq = torch.zeros(n, NIQ * D, dtype=torch.float8_e4m3fn, device=dev)
-    op.fused_qknorm_idxrqknorm(
+    fn = op._fused_qknorm_idxrqknorm_hip if marshalled else op.fused_qknorm_idxrqknorm
+    fn(
         c["qkv"], c["w"][0], c["w"][1], c["cs"], c["pos"], NQ, NKV, ROT, EPS, c["w"][2], c["w"][3], NIQ,
         c["slot"], kv, kv, idx, 128, q, iq, c["islot"], kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4",
         k_scale=c["ks"], v_scale=c["vs"], asm_layout=False, skip_index_branch=False,
     )  # fmt: skip
     torch.cuda.synchronize()
-    return dict(kv=kv, idx=idx, q=q, iq=iq.view(torch.uint8))
+    return {"kv": kv, "idx": idx, "q": q, "iq": iq.view(torch.uint8)}
 
 
 def dig(t):
@@ -221,7 +223,11 @@ def child(args):
                 ):  # the pattern needs more slots than it can make for this n
                     continue
                 res[f"{n}/{kind}/{seed}"] = {k: dig(v) for k, v in run(c, n).items()}
-    json.dump(res, open(args.child, "w"))
+                res[f"{n}/{kind}/{seed}/marshalled"] = {
+                    k: dig(v) for k, v in run(c, n, marshalled=True).items()
+                }
+    with open(args.child, "w") as f:
+        json.dump(res, f)
 
 
 def main():
@@ -234,9 +240,15 @@ def main():
         type=int,
         nargs="*",
         default=[
+            1,
             2,
+            4,
             7,
+            8,
             9,
+            16,
+            64,
+            256,
             300,
             489,
             512,
@@ -279,7 +291,24 @@ def main():
             str(args.seeds),
         ]
         subprocess.run(cmd, env=env, check=True)
-        out[tag] = json.load(open(path))
+        with open(path) as f:
+            out[tag] = json.load(f)
+    # the raw-pointer entry (every token count) against the generic marshalled entry, per floor
+    for tag, digests in out.items():
+        rawbad = [
+            k
+            for k in digests
+            if not k.endswith("/marshalled")
+            and digests[k] != digests[k + "/marshalled"]
+        ]
+        print(f"[{tag}] raw entry vs marshalled entry: {len(rawbad)} differ")
+        assert not rawbad, (
+            f"the raw entry differs from the marshalled entry: {rawbad[:5]}"
+        )
+    out = {
+        tag: {k: v for k, v in digests.items() if not k.endswith("/marshalled")}
+        for tag, digests in out.items()
+    }
     bad = [k for k in out["generic"] if out["generic"][k] != out["prefill"][k]]
     for k in bad:
         print(

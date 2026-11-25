@@ -2084,8 +2084,8 @@ namespace py = pybind11;
           py::arg("v_scale")           = std::nullopt, \
           py::arg("asm_layout")        = false,        \
           py::arg("skip_index_branch") = false);        \
-    m.def("fused_qknorm_nvfp4_prefill_raw",                   \
-          &aiter::fused_qknorm_nvfp4_prefill_raw,             \
+    m.def("fused_qknorm_nvfp4_raw",                   \
+          &aiter::fused_qknorm_nvfp4_raw,             \
           py::arg("qkv"), \
           py::arg("q_out"), \
           py::arg("index_q_out"), \

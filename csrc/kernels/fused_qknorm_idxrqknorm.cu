@@ -2930,53 +2930,77 @@ void fused_qknorm_idxrqknorm(
 }
 
 
-// The NVFP4 prefill insert for a caller that has already validated its operands (the Python
-// front checks dtypes, shapes, strides, devices and the token floor): raw device pointers and the
-// stream, no aiter_tensor_t marshalling. The head set is the TP4 one (16 q / 1 kv / 1 index heads,
-// rotary 64, block_size 128), bf16 qkv, e4m3 index_q_out, gfx950.
-void fused_qknorm_nvfp4_prefill_raw(int64_t qkv,
-                                    int64_t q_out,
-                                    int64_t index_q_out,
-                                    int64_t q_norm_weight,
-                                    int64_t k_norm_weight,
-                                    int64_t index_q_norm_weight,
-                                    int64_t index_k_norm_weight,
-                                    int64_t cos_sin_cache,
-                                    int64_t positions,
-                                    int64_t slot_mapping,
-                                    int64_t index_slot_mapping,
-                                    int64_t kv_cache,
-                                    int64_t index_cache,
-                                    int64_t k_scale,
-                                    int64_t v_scale,
-                                    int64_t num_tokens,
-                                    int64_t kv_page_stride_bytes,
-                                    double eps,
-                                    int64_t stream)
+// The NVFP4 insert (decode and prefill) for a caller that has already validated its operands (the
+// Python front checks dtypes, shapes, strides, devices): raw device pointers and the stream, no
+// aiter_tensor_t marshalling. One entry for every token count: the launcher picks the prefill
+// variant from pfMinTokens() tokens and the generic (decode) kernel below that. The head set is the
+// TP4 one (16 q / 1 kv / 1 index heads, rotary 64, block_size 128), bf16 qkv, e4m3 index_q_out.
+void fused_qknorm_nvfp4_raw(int64_t qkv,
+                            int64_t q_out,
+                            int64_t index_q_out,
+                            int64_t q_norm_weight,
+                            int64_t k_norm_weight,
+                            int64_t index_q_norm_weight,
+                            int64_t index_k_norm_weight,
+                            int64_t cos_sin_cache,
+                            int64_t positions,
+                            int64_t slot_mapping,
+                            int64_t index_slot_mapping,
+                            int64_t kv_cache,
+                            int64_t index_cache,
+                            int64_t k_scale,
+                            int64_t v_scale,
+                            int64_t num_tokens,
+                            int64_t kv_page_stride_bytes,
+                            double eps,
+                            int64_t stream)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
-    using T = hip_bfloat16;
-    AITER_CHECK(num_tokens >= 2 && pfDeviceIsGfx950(),
-                "nvfp4 prefill insert: gfx950 and at least 2 tokens");
-    pfLaunch<T>(reinterpret_cast<const T*>(qkv),
-                reinterpret_cast<T*>(q_out),
-                reinterpret_cast<opus::fp8_t*>(index_q_out),
-                reinterpret_cast<const T*>(q_norm_weight),
-                reinterpret_cast<const T*>(k_norm_weight),
-                reinterpret_cast<const T*>(index_q_norm_weight),
-                reinterpret_cast<const T*>(index_k_norm_weight),
-                reinterpret_cast<const T*>(cos_sin_cache),
-                reinterpret_cast<const int64_t*>(positions),
-                reinterpret_cast<const int64_t*>(slot_mapping),
-                reinterpret_cast<const int64_t*>(index_slot_mapping),
-                reinterpret_cast<uint8_t*>(kv_cache),
-                reinterpret_cast<uint8_t*>(index_cache),
-                reinterpret_cast<const float*>(k_scale),
-                reinterpret_cast<const float*>(v_scale),
-                static_cast<float>(eps),
-                static_cast<int>(num_tokens),
-                kv_page_stride_bytes,
-                reinterpret_cast<hipStream_t>(stream));
+    using T  = hip_bfloat16;
+    using Dt = vllm::Fp8KVCacheDataType;
+    AITER_CHECK(num_tokens >= 1 && pfDeviceIsGfx950(), "nvfp4 insert: gfx950 and at least 1 token");
+    auto* kv = reinterpret_cast<uint8_t*>(kv_cache);
+    launchFusedQKNormIdxrQKNorm<T, uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, true, true, true>(
+        reinterpret_cast<T*>(qkv),
+        reinterpret_cast<T*>(q_out),
+        nullptr,
+        reinterpret_cast<opus::fp8_t*>(index_q_out),
+        reinterpret_cast<const T*>(q_norm_weight),
+        reinterpret_cast<const T*>(k_norm_weight),
+        reinterpret_cast<const T*>(index_q_norm_weight),
+        reinterpret_cast<const T*>(index_k_norm_weight),
+        reinterpret_cast<const T*>(cos_sin_cache),
+        reinterpret_cast<const int64_t*>(positions),
+        reinterpret_cast<const int64_t*>(slot_mapping),
+        reinterpret_cast<const int64_t*>(index_slot_mapping),
+        kv,
+        kv, // K and V share the pages
+        reinterpret_cast<uint8_t*>(index_cache),
+        reinterpret_cast<float*>(k_scale),
+        reinterpret_cast<float*>(v_scale),
+        static_cast<float>(eps),
+        kPfRot,
+        static_cast<int>(num_tokens),
+        kPfNQ,
+        kPfNKV,
+        kPfNIQ,
+        128, // block_size
+        0,   // x (asm_layout only)
+        0,   // max_kv_tokens (page-128 fp8 scales only)
+        kv_page_stride_bytes,
+        0,
+        0,
+        kv_page_stride_bytes,
+        0,
+        0,
+        true,  // has_index
+        true,  // process_index
+        true,  // insert_kv
+        false, // per_token_kv_scale
+        false, // static_kv_scale
+        false, // asm_layout
+        reinterpret_cast<hipStream_t>(stream),
+        nullptr);
 }
 
 } // namespace aiter
