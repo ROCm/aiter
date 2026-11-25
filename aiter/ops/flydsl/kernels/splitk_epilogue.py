@@ -5,6 +5,7 @@
 
 import math
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Float32, Int32
@@ -60,7 +61,7 @@ def reduce_thread_split(tile_m, tile_n, nthreads):
     return tm_thr, nthreads // tm_thr
 
 
-@comm_ops.traced
+@flyc.jit
 def splitk_reduce_epilogue(
     workspace,
     out,
@@ -160,4 +161,4 @@ def splitk_reduce_epilogue(
 
 def _semaphore_addr(semaphore, bid_x, bid_y, tiles_n):
     idx = fx.Int32(bid_x) * tiles_n + fx.Int32(bid_y)
-    return fx.Int64(fx.ptrtoint(fx.get_iter(semaphore))) + fx.Int64(idx) * fx.Int64(4)
+    return fx.Int64(fx.ptrtoint(fx.get_iter(semaphore))) + fx.Int64(idx) * 4

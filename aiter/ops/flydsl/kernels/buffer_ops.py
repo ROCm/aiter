@@ -35,7 +35,7 @@ import inspect
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
@@ -43,7 +43,7 @@ from flydsl.runtime.device import is_rdna_arch
 # FlyDSL changed raw buffer cache policy from an i32 operand to an enum
 # attribute. Keep this vendored compatibility layer usable with both forms.
 _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (
-    inspect.signature(rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+    inspect.signature(fx.rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
     is inspect.Parameter.KEYWORD_ONLY
 )
 
@@ -301,9 +301,9 @@ class BufferResourceDescriptor:
 
         # Create resource descriptor (returns !llvm.ptr<8>)
         rsrc_type = ir.Type.parse("!llvm.ptr<8>")
-        rsrc = rocdl.MakeBufferRsrcOp(
+        rsrc = fx.rocdl.make_buffer_rsrc(
             rsrc_type, base_ptr, stride_val, num_records, flags
-        ).result
+        )
 
         return BufferResourceDescriptor(rsrc)
 
@@ -333,8 +333,8 @@ def create_buffer_resource_from_addr(
         >>> data = buffer_load(rsrc, i32_zero, vec_width=4, dtype=T.i32)
     """
     addr_i64 = _unwrap_value(addr_i64)
-    ptr_type = ir.Type.parse("!llvm.ptr")
-    base_ptr = llvm.IntToPtrOp(ptr_type, addr_i64).result
+    ptr_type = fx.PointerType.get(T.i8(), fx.AddressSpace.Generic, 1)
+    base_ptr = fx.to_llvm_ptr(fx.inttoptr(ptr_type, addr_i64))
     flags = fx.Int32(_get_buffer_flags()).ir_value()
     stride = fx.Int16(0).ir_value()
     if num_records_bytes is None:
@@ -345,9 +345,7 @@ def create_buffer_resource_from_addr(
     else:
         num_records = fx.Int64(_unwrap_value(num_records_bytes)).ir_value()
     rsrc_type = ir.Type.parse("!llvm.ptr<8>")
-    return rocdl.MakeBufferRsrcOp(
-        rsrc_type, base_ptr, stride, num_records, flags
-    ).result
+    return fx.rocdl.make_buffer_rsrc(rsrc_type, base_ptr, stride, num_records, flags)
 
 
 @dsl_loc_tracing
@@ -416,7 +414,7 @@ def buffer_load(
                       extra VGPR address arithmetic.
         is_scalar: Emit a uniform/SGPR scalar load (llvm.amdgcn.s.buffer.load) instead of the
                       vector buffer load. Use only for wave-uniform addresses to route through the
-                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1 or 4;
+                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1, 4, 8 or 16;
                       dtype is forced to i32 (the result is raw i32 dwords). mask and soffset_bytes
                       are not supported in this mode and raise ValueError if provided.
 
@@ -433,7 +431,7 @@ def buffer_load(
     # Scalar (uniform) loads return raw i32 dwords; force the element type so the
     # element->byte offset math below uses 4 and the result type is i32 / v4i32.
     if is_scalar:
-        if vec_width not in (1, 4):
+        if vec_width not in (1, 4, 8, 16):
             raise ValueError(
                 f"buffer_load(is_scalar=True): unsupported vec_width={vec_width}"
             )
@@ -468,11 +466,11 @@ def buffer_load(
         result_type = ir.VectorType.get([vec_width], dtype)
 
     # Scalar/uniform load path: emit s.buffer.load with a v4i32 resource and the
-    # byte offset computed above. Returns i32 (vec_width 1) or v4i32 (vec_width 4).
+    # byte offset computed above. Returns i32 (vec_width 1) or v4i32 / v8i32.
     if is_scalar:
         rsrc_v4 = _ptr8_to_v4i32(rsrc)
         cache_policy = fx.Int32(cache_modifier).ir_value()
-        suffix = "i32" if vec_width == 1 else "v4i32"
+        suffix = "i32" if vec_width == 1 else f"v{vec_width}i32"
         return llvm.call_intrinsic(
             result_type,
             f"llvm.amdgcn.s.buffer.load.{suffix}",
@@ -492,15 +490,13 @@ def buffer_load(
     )
 
     # Emit buffer load
-    load_op = rocdl.RawPtrBufferLoadOp(
+    return fx.rocdl.raw_ptr_buffer_load(
         result_type,
         rsrc,
         offset.ir_value(),
         soffset,
         aux=aux,
     )
-
-    return load_op.result
 
 
 @dsl_loc_tracing
@@ -563,7 +559,7 @@ def buffer_store(
     )
 
     # Emit buffer store
-    rocdl.RawPtrBufferStoreOp(
+    fx.rocdl.raw_ptr_buffer_store(
         data,
         rsrc,
         offset.ir_value(),

@@ -1,11 +1,19 @@
+import functools
+
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 SCALE_GROUP_ELEMS = 32
 PRESHUFFLE_FACTOR = 32  # rows packed per scale-preshuffle stripe
+
+
+def _fp4_wmma_m():
+    # gfx1250-strict has no v_wmma_scale_f32_32x16x128_f4, so use v_wmma_scale_f32_16x16x128_f8f6f4.
+    return 16 if get_arch() == "gfx1250-strict" else 32
 
 
 @gluon.constexpr_function
@@ -22,6 +30,19 @@ def cluster_shape(num_ctas, BLOCK_M, BLOCK_N):
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(
+    num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+):
+    # Building the layouts costs ~1 ms of Python per call and depends only on
+    # these ints: build once per config, return a copy (callers may mutate it).
+    return dict(
+        _build_gemm_afp4wfp4_preshuffle_layouts(
+            num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+        )
+    )
+
+
+@functools.cache
+def _build_gemm_afp4wfp4_preshuffle_layouts(
     num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
@@ -47,7 +68,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[32, 16, 64],
+        instr_shape=[_fp4_wmma_m(), 16, 64],
         cga_layout=cga_layout,
     )
 
@@ -56,7 +77,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[32, 16, 128],
+        instr_shape=[_fp4_wmma_m(), 16, 128],
         cga_layout=cga_layout,
     )
 

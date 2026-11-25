@@ -263,6 +263,14 @@ def mxfp4_quant(
     return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
+def _gather_idx_bitwidth(gather_indx):
+    """Width of a GatherIndx element, as a plain int so the layouts stay cacheable."""
+    if gather_indx is None:
+        return 0
+    assert gather_indx.dtype == torch.uint16 or gather_indx.dtype == torch.int32
+    return 16 if gather_indx.dtype == torch.uint16 else 32
+
+
 def moe_gemm_a4w4(
     x,
     w,
@@ -315,11 +323,12 @@ def moe_gemm_a4w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250", "gfx1250-strict") else "triton"
     assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
     if backend == "gluon":
-        assert (
-            get_arch() == "gfx1250"
+        assert get_arch() in (
+            "gfx1250",
+            "gfx1250-strict",
         ), f"Gluon backend requires gfx1250, got {get_arch()}"
     use_gluon = backend == "gluon"
     if preshuffle_weights:
@@ -485,7 +494,8 @@ def moe_gemm_a4w4(
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            GatherIndx=gather_indx,
+            has_GatherIndx=gather_indx is not None,
+            gather_idx_bitwidth=_gather_idx_bitwidth(gather_indx),
             X_SCALES_TDM=x_scales_tdm,
         )
         # launch gluon kernel
@@ -557,7 +567,8 @@ def moe_gemm_a4w4(
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            GatherIndx=gather_indx,
+            has_GatherIndx=gather_indx is not None,
+            gather_idx_bitwidth=_gather_idx_bitwidth(gather_indx),
             X_SCALES_TDM=x_scales_tdm,
         )
         clamp_bounds = (K % config["block_k"] != 0) or (
@@ -802,7 +813,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:

@@ -124,11 +124,14 @@ def generate_rope_inputs(
     return x, y, gx, gy, freqs, positions, offsets, cos, sin
 
 
-def rope_3d_params(max_seq_len, dim, theta=10000):
+def rope_3d_params(max_seq_len, dim, theta=10000, device="cuda"):
     assert dim % 2 == 0
     freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+        torch.arange(max_seq_len, device=device),
+        1.0
+        / torch.pow(
+            theta, torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim)
+        ),
     )
     freqs = torch.polar(torch.ones_like(freqs), freqs)  # complex
     return freqs
@@ -406,7 +409,7 @@ def test_rope_thd_fwd(
         seqlens = [0] + seqlens + [T]
     else:
         seqlens = [0, T]
-    cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
+    cu_seqlens = torch.tensor(seqlens, dtype=torch.int, device=freqs.device)
 
     logger.debug("cu_seqlens=%s", cu_seqlens)
     logger.debug("x.shape=%s x=%s", x.shape, x)
@@ -494,7 +497,7 @@ def test_rope_thd_bwd(
         seqlens = [0] + seqlens + [T]
     else:
         seqlens = [0, T]
-    cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
+    cu_seqlens = torch.tensor(seqlens, dtype=torch.int, device=freqs.device)
 
     logger.debug("cu_seqlens=%s", cu_seqlens)
     logger.debug("x.shape=%s x=%s", x.shape, x)
@@ -1174,7 +1177,7 @@ def test_rope_fwd_3d(
     dtype: torch.dtype,
 ):
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     sp_size = 8
     max_seq_len = 1024
 
@@ -1188,10 +1191,10 @@ def test_rope_fwd_3d(
     d2 = 2 * (d_total // 6)
     d3 = 2 * (d_total // 6)
 
-    freqs_f = rope_3d_params(max_seq_len, d1)
-    freqs_h = rope_3d_params(max_seq_len, d2)
-    freqs_w = rope_3d_params(max_seq_len, d3)
-    freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=1).to(device)
+    freqs_f = rope_3d_params(max_seq_len, d1, device=device)
+    freqs_h = rope_3d_params(max_seq_len, d2, device=device)
+    freqs_w = rope_3d_params(max_seq_len, d3, device=device)
+    freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=1)
 
     sp_rank = 0
     out_orig = rope_fwd_3d_torch(

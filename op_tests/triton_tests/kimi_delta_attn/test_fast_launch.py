@@ -17,11 +17,15 @@ that produces. So the tests here are about the key, not about speed:
   alignment is one of the things the compiler was told it could assume.
 """
 
+import importlib
+
 import pytest
 import torch
+from triton.runtime.autotuner import Autotuner, Heuristics
 
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import flash_kda_fwd
+from aiter.ops.triton.utils import fast_launch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="flash_kda needs a GPU"
@@ -33,7 +37,7 @@ K_DIM = 128
 LOWER_BOUND = -5.0
 
 
-def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False):
+def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False, device=device):
     g = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(*shape, dt=dtype):
@@ -106,6 +110,8 @@ def test_matches_ordinary_path_varlen():
 
 
 def test_a_second_shape_does_not_reuse_the_first_entry():
+    for w in _wrapped():
+        w.clear()
     small, large = make_inputs(1, 512, 12), make_inputs(1, 1024, 12)
     run(small)  # whatever either shape needs is compiled and cached by now
     run(large)
@@ -122,28 +128,30 @@ def test_a_second_shape_does_not_reuse_the_first_entry():
 
 def _wrapped():
     """Every fast_launch-wrapped kernel the pipeline can reach."""
-    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-        flash_kda_k1,
-        flash_kda_k2,
-    )
     from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as fk
 
-    candidates = (
+    candidates = [
         fk._prepare_fast,
         fk._segment_fast,
         fk._seg_scan_fast,
-        flash_kda_k1._k1_fast,
-        flash_kda_k2.k2_ab_fused_fast,
-    )
+        fk._seg_scan_prefetch_fast,
+    ]
+    if fk._GLUON_ARCH_OK:
+        # gfx1250-strict runs the gfx1250 Gluon kernels; there is no gfx1250-strict package.
+        gluon_arch = "gfx1250" if fk._IS_GFX1250_FAMILY else fk.DEVICE_ARCH
+        pkg = f"aiter.ops.triton._gluon_kernels.{gluon_arch}.kimi_delta_attn"
+        k1 = importlib.import_module(f"{pkg}.flash_kda_k1")
+        k2 = importlib.import_module(f"{pkg}.flash_kda_k2")
+        candidates += [k1._k1_fast, k2.k2_ab_fused_fast, getattr(k2, "k2_c_fast", None)]
     return [c for c in candidates if isinstance(c, fast_launch._FastLaunch)]
 
 
 def test_entries_do_not_pin_their_inputs():
     """An entry outlives the call that made it, so it must not hold its tensors.
 
-    The binder hands back every argument bound together, which is the obvious
-    thing to keep for the grid callback and also every q, k, v and workspace of
-    whichever call arrived first, none of which any caller can then free.
+    The pre-run hook sees every argument of the launch, which is the obvious
+    thing to keep for the grid callback. Keeping all of them would also pin
+    the first call's q, k, v and workspace tensors.
     """
     for T_ in (256, 512, 1024):
         run(make_inputs(1, T_, 12))
@@ -152,7 +160,7 @@ def test_entries_do_not_pin_their_inputs():
     for wrapper in _wrapped():
         for entry in wrapper._cache.values():
             entries += 1
-            held = [v for part in entry[2:] for v in part.values()]
+            held = [*entry, *entry.frozen.values()]
             tensors = [v for v in held if isinstance(v, torch.Tensor)]
             assert not tensors, f"entry holds {len(tensors)} tensors"
     assert entries, "nothing was cached, so nothing was tested"
@@ -201,12 +209,8 @@ def test_a_second_device_does_not_reuse_the_first_entry():
     first = make_inputs(B, T, H)
     run(first)  # the entry for this shape is now held against device 0
 
-    torch.cuda.set_device(1)
-    try:
-        second = {
-            k: (v.to("cuda:1") if isinstance(v, torch.Tensor) else v)
-            for k, v in first.items()
-        }
+    with torch.cuda.device(1):
+        second = make_inputs(B, T, H, device="cuda:1")
         with fast_launch.recording() as misses:
             got_o, got_s = run(second)
         assert misses, "a second device has to miss, not reuse device 0's module"
@@ -214,8 +218,6 @@ def test_a_second_device_does_not_reuse_the_first_entry():
             want_o, want_s = run(second)
         assert torch.equal(got_o, want_o)
         assert torch.equal(got_s, want_s)
-    finally:
-        torch.cuda.set_device(0)
 
 
 def test_alignment_is_part_of_the_key():
@@ -241,3 +243,30 @@ def test_alignment_is_part_of_the_key():
     got_o, got_s = run(misaligned)
     assert torch.equal(got_o, want_o)
     assert torch.equal(got_s, want_s)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_prepare_fast", "_segment_fast", "_seg_scan_fast", "_seg_scan_prefetch_fast"],
+)
+def test_no_config_choice_reads_a_shape(name):
+    """What lets these launchers pass key_shapes=False: no heuristic reads any
+    property of an argument (it may only test it for None), and no autotuner
+    prunes or models configs from the arguments (its key holds ints, bools and
+    dtypes)."""
+    wrapped = getattr(flash_kda, name)
+    assert wrapped._key_shapes is False
+    params = wrapped._jit.arg_names
+    heuristics = 0
+    k = wrapped._kernel
+    while k is not wrapped._jit:
+        if isinstance(k, Heuristics):
+            heuristics += 1
+            for heur in k.values.values():
+                # Any attribute read on an object() raises.
+                heur({n: object() for n in params})
+                heur({n: None for n in params})
+        if isinstance(k, Autotuner):
+            assert k.early_config_prune is None and k.perf_model is None
+        k = k.fn
+    assert heuristics

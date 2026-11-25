@@ -6,8 +6,10 @@ import functools
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
+    _compute_fp8_scaling_factors,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -484,6 +486,10 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        else:
+            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
+            p = tl.where(mask_n[None, :], p, 0.0)
         if SLIDING_WINDOW > 0:
             window_mask = offs_n[None, :] >= (
                 offs_m[:, None] - delta_qk - SLIDING_WINDOW

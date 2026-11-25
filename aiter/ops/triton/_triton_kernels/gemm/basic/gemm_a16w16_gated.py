@@ -4,8 +4,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16w16_gated_repr = make_kernel_repr(
@@ -16,7 +19,6 @@ _gemm_a16w16_gated_repr = make_kernel_repr(
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
         "activation",
         "use_activation",
@@ -27,8 +29,6 @@ _gemm_a16w16_gated_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w16_gated_repr)
@@ -51,7 +51,6 @@ def _gemm_a16_w16_gated_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
@@ -74,7 +73,8 @@ def _gemm_a16_w16_gated_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    remap_xcd(pid, GRID_MN)
+    grid_mn = num_pid_m * num_pid_n
+    remap_xcd(pid, grid_mn)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 

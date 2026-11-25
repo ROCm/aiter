@@ -128,6 +128,95 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def mxfp4_apply_quant_scale(x, scale_e8m0, quant_scale):
+    """Scale values without flushing the raw E8M0 254 endpoint."""
+    safe_scale = tl.where(scale_e8m0 == 254, tl.exp2(-126.0), quant_scale)
+    scaled = x * safe_scale
+    return tl.where(scale_e8m0 == 254, scaled * 0.5, scaled)
+
+
+@triton.jit
+def normalized_hadamard16(x, rows: tl.constexpr):
+    """Apply normalized Hadamard-16 to the final dimension."""
+    x = x * 0.25
+    x_reshaped = tl.reshape(x, (rows, 8, 2, 1))
+    x_permuted = tl.permute(x_reshaped, (0, 1, 3, 2))
+    upper, lower = tl.split(x_permuted)
+    x = tl.reshape(
+        tl.permute(tl.join(upper + lower, upper - lower), (0, 1, 3, 2)),
+        (rows, 16),
+    )
+
+    x_reshaped = tl.reshape(x, (rows, 4, 2, 2))
+    x_permuted = tl.permute(x_reshaped, (0, 1, 3, 2))
+    upper, lower = tl.split(x_permuted)
+    x = tl.reshape(
+        tl.permute(tl.join(upper + lower, upper - lower), (0, 1, 3, 2)),
+        (rows, 16),
+    )
+
+    x_reshaped = tl.reshape(x, (rows, 2, 2, 4))
+    x_permuted = tl.permute(x_reshaped, (0, 1, 3, 2))
+    upper, lower = tl.split(x_permuted)
+    x = tl.reshape(
+        tl.permute(tl.join(upper + lower, upper - lower), (0, 1, 3, 2)),
+        (rows, 16),
+    )
+
+    x_reshaped = tl.reshape(x, (rows, 1, 2, 8))
+    x_permuted = tl.permute(x_reshaped, (0, 1, 3, 2))
+    upper, lower = tl.split(x_permuted)
+    return tl.reshape(
+        tl.permute(tl.join(upper + lower, upper - lower), (0, 1, 3, 2)),
+        (rows, 16),
+    )
+
+
+@triton.jit
+def mxfp4_shuffled_data_offsets(
+    rows,
+    byte_cols,
+    num_byte_cols,
+    tile_rows: tl.constexpr,
+    unit_bytes: tl.constexpr,
+):
+    """Return flat offsets for AITER's gfx950 shuffled B layout."""
+    units_per_group: tl.constexpr = 4
+    tile = rows // tile_rows
+    row = rows % tile_rows
+    unit = byte_cols // unit_bytes
+    within_unit = byte_cols % unit_bytes
+    group = unit // units_per_group
+    rest = unit % units_per_group
+    pair = rest // 2
+    half = rest % 2
+    groups = num_byte_cols // (unit_bytes * units_per_group)
+    dst_unit = ((tile * groups + group) * 2 + pair) * (tile_rows * 2) + row * 2 + half
+    return dst_unit * unit_bytes + within_unit
+
+
+@triton.jit
+def mxfp4_swizzled_scale_offsets(
+    rows,
+    cols,
+    num_cols,
+    stripe: tl.constexpr,
+    kchunk: tl.constexpr,
+):
+    """Return flat offsets for AITER's gfx950 MX scale layout."""
+    stripe_group = rows // stripe
+    row_half = (rows % stripe) // (stripe // 2)
+    row = rows % (stripe // 2)
+    chunk = cols // kchunk
+    col_half = (cols % kchunk) // (kchunk // 2)
+    col = cols % (kchunk // 2)
+    within = (
+        (chunk * (kchunk // 2) + col) * (stripe * 2) + row * 4 + col_half * 2 + row_half
+    )
+    return stripe_group * (num_cols * stripe) + within
+
+
+@triton.jit
 def _mxfp4_scale_from_amax(amax):
     """Convert an FP32 absolute maximum to E8M0 and its reciprocal."""
     amax = amax.to(tl.int32, bitcast=True)
@@ -143,13 +232,23 @@ def _mxfp4_scale_from_amax(amax):
 
 
 @triton.jit
-def _mxfp4_ceil_scale_from_amax(amax):
-    """E8M0 2^ceil(log2(amax / 6)) and its reciprocal, so no value saturates.
-    Exact, from the exponent bits."""
-    # An all-zero block still gets a normal scale, 2^-126.
-    ratio = tl.maximum(amax, 6.0 * (2**-126)) * (1.0 / 6.0)
-    # Adding 0x7FFFFF carries into the exponent unless the mantissa is zero.
-    bs_e8m0 = (ratio.to(tl.uint32, bitcast=True) + 0x7FFFFF) >> 23
+def _mxfp4_ceil_scale_from_amax(
+    amax,
+    MAX_SCALE_E8M0: tl.constexpr = 254,
+    AMAX_FLOOR: tl.constexpr = 6.0 * (2**-126),
+):
+    """E8M0 2^ceil(log2(max(amax, AMAX_FLOOR) / 6)), capped at MAX_SCALE_E8M0,
+    and its reciprocal, exact from the exponent bits."""
+    ratio = (tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)).to(tl.uint32, bitcast=True)
+    bs_e8m0 = (ratio >> 23) & 0xFF
+    # Round up if the mantissa is nonzero, unless the ratio is Inf or NaN.
+    bs_e8m0 = tl.where(
+        (bs_e8m0 < 0xFF) & ((ratio & 0x7FFFFF) != 0), bs_e8m0 + 1, bs_e8m0
+    )
+    # No finite amax goes past 253, so 254 leaves the scale (and the NaN 255 of
+    # an inf / NaN amax) as is.
+    if MAX_SCALE_E8M0 < 254:
+        bs_e8m0 = tl.minimum(bs_e8m0, MAX_SCALE_E8M0)
     quant_scale = ((254 - bs_e8m0) << 23).to(tl.float32, bitcast=True)
     return bs_e8m0.to(tl.uint8), quant_scale
 
@@ -162,13 +261,19 @@ def _mxfp4_quant_op(
     MXFP4_QUANT_BLOCK_SIZE,
     SCALING_MODE: tl.constexpr = 0,
     USE_ASM: tl.constexpr = False,
+    ROUNDING_MODE: tl.constexpr = 0,
+    MAX_SCALE_E8M0: tl.constexpr = 254,
 ):
     """
     Converts given x (in fp32) to mxfp4 format.
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
     SCALING_MODE: 0 is "even" (_mxfp4_scale_from_amax), 1 is "ceil"
-    (_mxfp4_ceil_scale_from_amax).
+    (_mxfp4_ceil_scale_from_amax), 2 is "roundup" (the same with the 1e-10
+    amax floor of the HIP quant).
     USE_ASM: see _mxfp4_pack_op.
+    ROUNDING_MODE: E2M1 ties go to nearest even (0) or away from zero (1).
+    MAX_SCALE_E8M0: cap on the "ceil" and "roundup" scales, see
+    _mxfp4_ceil_scale_from_amax.
 
     """
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
@@ -176,10 +281,17 @@ def _mxfp4_quant_op(
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     if SCALING_MODE == 0:
+        tl.static_assert(
+            MAX_SCALE_E8M0 == 254, "MAX_SCALE_E8M0 needs SCALING_MODE 1 or 2"
+        )
         bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
+    elif SCALING_MODE == 1:
+        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax, MAX_SCALE_E8M0)
     else:
-        tl.static_assert(SCALING_MODE == 1)
-        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
+        tl.static_assert(SCALING_MODE == 2)
+        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(
+            amax, MAX_SCALE_E8M0, AMAX_FLOOR=1e-10
+        )
 
     # Compute quantized x
     qx = x * quant_scale
@@ -189,6 +301,7 @@ def _mxfp4_quant_op(
         BLOCK_SIZE_M,
         MXFP4_QUANT_BLOCK_SIZE,
         USE_ASM,
+        ROUNDING_MODE,
     )
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
@@ -201,14 +314,21 @@ def _mxfp4_pack_op(
     BLOCK_SIZE_M: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     USE_ASM: tl.constexpr = False,
+    ROUNDING_MODE: tl.constexpr = 0,
 ):
     """Round normalized FP32 values to E2M1 and pack adjacent columns.
     USE_ASM opts in to the gfx950 instruction where there is one; the default
-    is the bit arithmetic."""
+    is the bit arithmetic. ROUNDING_MODE: see _mxfp4_pack_bits."""
+    tl.static_assert(
+        not USE_ASM or ROUNDING_MODE == 0,
+        "USE_ASM only rounds ties to nearest even (ROUNDING_MODE=0)",
+    )
     if USE_ASM and is_hip_cdna4():
         x_fp4 = _mxfp4_pack_cvt(qx, BLOCK_SIZE_N, BLOCK_SIZE_M)
     else:
-        x_fp4 = _mxfp4_pack_bits(qx, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE)
+        x_fp4 = _mxfp4_pack_bits(
+            qx, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE, ROUNDING_MODE
+        )
     return x_fp4
 
 
@@ -237,8 +357,11 @@ def _mxfp4_pack_bits(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    ROUNDING_MODE: tl.constexpr = 0,
 ):
-    """Round normalized FP32 values to E2M1 and pack adjacent columns."""
+    """Round normalized FP32 values to E2M1 and pack adjacent columns.
+    ROUNDING_MODE: ties go to nearest even (0, as v_cvt_scalef32_pk_fp4_f32)
+    or away from zero (1)."""
     EXP_BIAS_FP32: tl.constexpr = 127
     EXP_BIAS_FP4: tl.constexpr = 1
     EBITS_F32: tl.constexpr = 8
@@ -271,10 +394,15 @@ def _mxfp4_pack_bits(
     denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
     denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
 
-    denormal_x = qx_fp32 + denorm_mask_float
-    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
-    denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.to(tl.uint8)
+    if ROUNDING_MODE == 0:
+        denormal_x = qx_fp32 + denorm_mask_float
+        denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+        denormal_x -= denorm_mask_int
+        denormal_x = denormal_x.to(tl.uint8)
+    else:
+        tl.static_assert(ROUNDING_MODE == 1)
+        # Codes 0, 1 and 2 are 0, 0.5 and 1; the ties 0.25 and 0.75 go up.
+        denormal_x = (qx_fp32 >= 0.25).to(tl.uint8) + (qx_fp32 >= 0.75).to(tl.uint8)
 
     # Normal numbers
     normal_x = qx
@@ -284,7 +412,11 @@ def _mxfp4_pack_bits(
     val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
     normal_x += val_to_add
     # rounding bias part 2
-    normal_x += mant_odd
+    if ROUNDING_MODE == 0:
+        normal_x += mant_odd
+    else:
+        # The bias is then exactly half a step, so a tie always carries.
+        normal_x += 1
     # take the bits!
     normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
     normal_x = normal_x.to(tl.uint8)
@@ -385,8 +517,8 @@ def _nvfp4_quant_op(
     normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
     normal_x = normal_x.to(tl.uint8)
 
-    # Merge results
-    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+    # Merge results. Built from qx so it keeps qx's layout when called from a Gluon kernel.
+    e2m1_value = (qx * 0 + 0x7).to(tl.uint8)
     e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
     e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
     # add sign back
@@ -707,13 +839,16 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
 # values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
-# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
-# is the unbiased e8m0 exponent (dtypeMax = 2**8).
+# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() -
+# LOG2_DTYPE_MAX is the unbiased e8m0 exponent (8 for OCP e4m3fn, 7 for fnuz).
 
 
 @triton.jit
 def _mxfp8_quant_op(
-    x_grouped, QUANT_AXIS: tl.constexpr, LOG2_DTYPE_MAX: tl.constexpr = 8
+    x_grouped,
+    QUANT_AXIS: tl.constexpr,
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
+    AMAX_FLOOR: tl.constexpr = 0.0,
 ):
     """Shared MXFP8 (1x32 e8m0) scale derivation.
 
@@ -721,8 +856,11 @@ def _mxfp8_quant_op(
     returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
     matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
     so they broadcast against the input for in-place quantization.
+    AMAX_FLOOR > 0 floors each group's amax (none by default).
     """
     amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
+    if AMAX_FLOOR > 0:
+        amax = tl.maximum(amax, AMAX_FLOOR)
     amax_i32 = amax.to(tl.int32, bitcast=True)
     amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax_p2 = amax_i32.to(tl.float32, bitcast=True)
@@ -758,6 +896,7 @@ def _dynamic_mxfp8_quant_kernel(
     BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32
     NUM_PRGMS: tl.constexpr,  # row-loop range (usually =M)
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
 ):
     """
     Per-1x32 MXFP8 quant. One program per row, holding the full row in
@@ -771,6 +910,8 @@ def _dynamic_mxfp8_quant_kernel(
     n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
     for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
+        # row_idx * stride_xm can exceed int32 for stacked expert weights.
+        row_idx = row_idx.to(tl.int64)
         x = tl.load(
             x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
             mask=mask,
@@ -779,7 +920,9 @@ def _dynamic_mxfp8_quant_kernel(
 
         # (BLOCK_SIZE_N,) -> (n_groups, QUANT_BLOCK_SIZE)
         x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
-        scale_e8m0, quant_scale = _mxfp8_quant_op(x_2d, QUANT_AXIS=1)
+        scale_e8m0, quant_scale = _mxfp8_quant_op(
+            x_2d, QUANT_AXIS=1, LOG2_DTYPE_MAX=LOG2_DTYPE_MAX
+        )
 
         qx_2d = x_2d * quant_scale
         qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))

@@ -14,6 +14,8 @@ import argparse
 
 import torch
 
+from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx_runtime
+from aiter.ops import topk
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 
 
@@ -137,7 +139,7 @@ def check_prefill_many_tied_rows():
     return valid and det and ascending and matches_ref
 
 
-def check_decode(batch, ctx, k, next_n, tie_level):
+def check_decode(batch, ctx, k, next_n, tie_level, max_row_len=None, backend=None):
     num_rows = batch * next_n
     seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     row_idx = torch.arange(num_rows, device="cuda") // next_n
@@ -146,6 +148,11 @@ def check_decode(batch, ctx, k, next_n, tie_level):
     logits = make_logits(num_rows, ctx, tie_level, seed=321)
     for i in range(num_rows):
         logits[i, row_ends[i] :] = float("-inf")
+    idx = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+    call = (logits, next_n, seq_lens, idx, num_rows, *logits.stride(), k, True)
+    if backend is not None:
+        got = topk.decode_backend_for_call(*call, max_row_len=max_row_len)
+        assert got == backend, f"decode b={batch} ctx={ctx} k={k} took {got}"
 
     def run():
         idx = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
@@ -159,6 +166,7 @@ def check_decode(batch, ctx, k, next_n, tie_level):
             logits.stride(1),
             k=k,
             stable=True,
+            max_row_len=max_row_len,
         )
         torch.cuda.synchronize()
         return idx
@@ -175,7 +183,10 @@ def check_decode(batch, ctx, k, next_n, tie_level):
             ok_order = False
         if row != ref_stable_topk(logits[r][:rlen], k):
             ok_ref = False
-    tag = f"decode b={batch} ctx={ctx} k={k} n={next_n} tie={tie_level}"
+    tag = (
+        f"decode b={batch} ctx={ctx} k={k} n={next_n} tie={tie_level}"
+        f" max_row_len={max_row_len}"
+    )
     print(f"[{tag}] deterministic={det} ascending={ok_order} matches_ref={ok_ref}")
     return det and ok_order and ok_ref
 
@@ -221,12 +232,46 @@ def check_decode_packed(num_rows, width, k, tie_level):
     return ok
 
 
+def check_decode_cross_part_tie():
+    """Stable merge must keep the smallest global indices across equal parts."""
+    rows, width, k = 1, 131072, 512
+    logits = torch.zeros((rows, width), dtype=torch.float32, device="cuda")
+    part_width = width // 2
+    part0_ties = k // 4
+    logits[0, part_width - part0_ties : part_width + k] = 1
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        indices,
+        rows,
+        width,
+        1,
+        k=k,
+        stable=True,
+    )
+    torch.cuda.synchronize()
+    expected = torch.arange(
+        part_width - part0_ties,
+        part_width + k - part0_ties,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    ok = torch.equal(indices[0], expected)
+    print(f"[decode cross-part tie] smallest_indices={ok}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-k", type=int, default=None, help="top-k (default: sweep)")
     args = parser.parse_args()
 
     ks = [args.k] if args.k else [512, 1024, 2048]
+    card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
+    adaptive_ks = topk._ADAPTIVE_BANDS.get(card, {}).get(True, {})
     all_ok = True
     for tie in ("none", "mild", "heavy"):
         for k in ks:
@@ -237,12 +282,28 @@ def main():
         for k in ks:
             all_ok &= check_decode(4, 4096, k, 1, tie)
             all_ok &= check_decode(4, 61440, k, 1, tie)
+            # The stable check that reaches the adaptive kernel: 524288 at the
+            # fewest rows the card's band admits there; the assert catches a
+            # refit that moves it off the kernel.
+            bands = [
+                b for b in adaptive_ks.get(k, ()) if topk._in_bands((b,), 524288, b[2])
+            ]
+            backend = topk.BACKEND_ADAPTIVE if bands else None
+            all_ok &= check_decode(
+                bands[0][2] if bands else 1,
+                524288,
+                k,
+                1,
+                tie,
+                max_row_len=524288,
+                backend=backend,
+            )
     # k > 2048 -> scan fallback
     for tie in ("none", "heavy"):
         all_ok &= check_prefill(2, 16384, 4096, tie)
         all_ok &= check_decode(2, 16384, 4096, 1, tie)
     all_ok &= check_prefill_many_tied_rows()
-    # packed rows: few rows at a long width take the chunked kernel, many
+    # packed rows: few rows at a long width take the single-launch kernel, many
     # rows the one-block kernel, a short width the one-workgroup kernel, as
     # their plane would
     for tie in ("none", "heavy"):
@@ -250,6 +311,7 @@ def main():
             all_ok &= check_decode_packed(6, 262144, k, tie)
             all_ok &= check_decode_packed(96, 262144, k, tie)
             all_ok &= check_decode_packed(6, 16384, k, tie)
+    all_ok &= check_decode_cross_part_tie()
     print("\nRESULT:", "ALL PASS" if all_ok else "FAILURES PRESENT")
     assert all_ok, "stable top_k_per_row correctness failed"
 
