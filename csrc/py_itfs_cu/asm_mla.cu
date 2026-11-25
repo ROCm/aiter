@@ -310,7 +310,7 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
         config_max_seqlen_q = 0;
         sub_Q = 128;
         if (q_type == "bf16" && kv_type == "bf16"){
-            if(arch_id == "gfx942" || arch_id == "gfx950")
+            if(arch_id == "gfx942")
                 ps = 0; // not use ps
             // The decode kernel has no causal mask. Causal qlen > 1 runs the
             // masked prefill build instead; it takes the same arguments.
