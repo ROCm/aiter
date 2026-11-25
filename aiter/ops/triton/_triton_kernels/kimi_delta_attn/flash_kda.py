@@ -924,7 +924,18 @@ def _strided_operand(x: torch.Tensor, in_place: bool) -> tuple[torch.Tensor, int
         )
     if in_place and readable:
         return x, x.stride(1)
-    return x.contiguous(), H * D
+    x = x.contiguous()
+    if in_place and DEVICE_ARCH == "gfx950" and x.data_ptr() % 16:
+        x = x.clone()
+    return x, H * D
+
+
+def _gluon_addressable(*xs: torch.Tensor) -> bool:
+    """Whether the gfx950 Gluon kernels can address packed copies of ``xs``:
+    their buffer loads take byte offsets below 2 GiB."""
+    return DEVICE_ARCH != "gfx950" or all(
+        x.numel() * x.element_size() < 2**31 for x in xs
+    )
 
 
 def _log_route(k1: bool, k2a: bool | None, k2c: bool, C: int, K: int, V: int) -> None:
@@ -1300,8 +1311,10 @@ def flash_kda_fwd(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
-    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # The workspaces that K1 writes and passes A and C read are as large as q.
+    addressable = _gluon_addressable(q, k, g, v)
+    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K) and addressable
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and addressable
 
     if cu_seqlens is not None:
         if B != 1:
@@ -1380,7 +1393,8 @@ def flash_kda_fwd(
     # token stride. The Triton kernels need them packed.
     stride_q = stride_k = stride_g = H * K
     stride_v = H * V
-    if not (
+    # On gfx950 a contiguous operand can still need a copy, for its alignment.
+    if DEVICE_ARCH == "gfx950" or not (
         q.is_contiguous()
         and k.is_contiguous()
         and g.is_contiguous()

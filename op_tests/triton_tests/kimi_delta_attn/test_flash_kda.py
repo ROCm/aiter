@@ -1461,6 +1461,58 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
         assert in_place == (layout in in_place_layouts), key
 
 
+@pytest.mark.parametrize("chunks_per_seg", [0, 4])
+def test_misaligned_contiguous_operands_match_packed(chunks_per_seg, monkeypatch):
+    """Contiguous q, k, v and g at a base that is not 16-byte aligned give the
+    aligned answer, to the bit: gfx950 hands its Gluon kernels aligned copies."""
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("the alignment copy is for the gfx950 Gluon kernels")
+    args = make_inputs(1, 1024, 4)
+    kw = {
+        "cu_seqlens": _varlen([300, 200, 524]),
+        "output_final_state": True,
+        "state_v_first": True,
+        "chunks_per_seg": chunks_per_seg,
+    }
+    views = []
+    for x in args[:4]:
+        store = torch.empty(x.numel() + 1, device=device, dtype=x.dtype)
+        views.append(store[1:].view(x.shape).copy_(x))
+    assert all(x.is_contiguous() and x.data_ptr() % 16 for x in views)
+
+    with _route(k1=True, k2=True):
+        o_ref, ht_ref = run_flash(*args, **kw)
+        seen = _record_in_place_operands(monkeypatch)
+        o, ht = run_flash(*views, *args[4:], **kw)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    assert seen
+    for key, ptrs in seen.items():
+        assert all(ptr % 16 == 0 for ptr in ptrs), key
+
+
+def test_contiguous_operands_past_2gib_take_triton(monkeypatch):
+    """gfx950 runs the Triton kernels when a packed operand is 2 GiB or more,
+    which the Gluon kernels' byte offsets cannot reach."""
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("the 2 GiB offset limit is the gfx950 Gluon kernels'")
+    # One head: q, k, v and g are 2 GiB each.
+    args = make_inputs(1, 2**31 // (K_DIM * 2), 1)
+    assert args[0].numel() * args[0].element_size() == 2**31
+    kw = {"output_final_state": True, "state_v_first": True, "chunks_per_seg": 64}
+    with (
+        _route(k1=True, k2=True),
+        _count_launches(_gluon_module("flash_kda_k1"), ["_k1_fast"]) as k1_calls,
+        _count_launches(
+            _gluon_module("flash_kda_k2"), ["k2_ab_fused_fast", "k2_c_fast"]
+        ) as k2_calls,
+        _count_launches(_flash_kda, ["_prepare_fast", "_segment_fast"]) as calls,
+    ):
+        run_flash(*args, **kw)
+    assert not any(k1_calls.values()) and not any(k2_calls.values())
+    assert calls["_prepare_fast"] and calls["_segment_fast"]
+
+
 @pytest.mark.parametrize("past", [False, True])
 @pytest.mark.parametrize(
     "operand,T,chunks_per_seg",
