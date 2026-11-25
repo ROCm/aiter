@@ -16,12 +16,15 @@ import time
 import pandas as pd
 import torch
 import torch._dynamo
+import torch._dynamo.testing
 
 import aiter
 import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    _K_SMOOTH_MIN_COMMON,
+    _K_SMOOTH_SAMPLE_ROWS,
     MHA_V4_BLOCK_SPARSE_MODES,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
@@ -50,6 +53,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP8_HD256_K_DATA_BYTES,
     MHA_V4_MXFP8_HD256_K_TILE_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
+    k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -766,6 +770,93 @@ def _mx_recipe_args(recipe):
         # MXFP8 rows are OCP E4M3 on every arch, and native_fp8_format() is FNUZ on gfx942.
         return (AttentionFormat.FP8_E4M3,) * 3, _MXFP8_SCALE_MODES
     return (_MX_RECIPE_FORMATS[recipe],) * 3, {}
+
+
+def _k_smooth_mean_reference(k):
+    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
+    sample = k[:, ::stride].float()
+    mean = sample.mean(dim=1)
+    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
+    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
+    return mean * gate.unsqueeze(-1)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 MHA v4 K smoothing",
+)
+@parametrize(
+    "batch,seq,heads,head_dim,misaligned",
+    [
+        (1, 100, 3, 128, False),
+        (2, 2048, 4, 256, False),
+        (1, 4096, 16, 256, False),
+        (1, 65536, 5, 128, False),
+        (1, 3000, 4, 128, True),
+    ],
+)
+def test_mha_v4_k_smooth_mean_matches_reference(
+    batch, seq, heads, head_dim, misaligned
+):
+    """The fused gate keeps the strided-sample definition, on a head-sliced (strided) K view."""
+    torch.manual_seed(5)
+    shape = (batch, seq, heads + 2, head_dim)
+    wide = torch.randn(shape, device="cuda")
+    direction = torch.randn((batch, 1, heads + 2, head_dim), device="cuda")
+    # Odd heads carry a dominant shared direction, so both gate outcomes run.
+    common = (torch.arange(heads + 2, device="cuda") % 2 * 16.0).view(1, 1, -1, 1)
+    wide = (wide + common * direction).to(torch.bfloat16)
+    if misaligned:
+        # One element of offset takes the rows off 16-byte alignment.
+        storage = torch.empty(wide.numel() + 1, device="cuda", dtype=torch.bfloat16)
+        storage[1:].view(shape).copy_(wide)
+        wide = storage[1:].view(shape)
+    k = wide[:, :, 1 : heads + 1]
+
+    expected = _k_smooth_mean_reference(k)
+    actual = _k_mean(k, _RawRecipeKind.FP8)
+
+    gated = expected.abs().amax(dim=-1) > 0
+    assert gated.any() and not gated.all(), "case must exercise both gate outcomes"
+    assert torch.equal(actual.abs().amax(dim=-1) > 0, gated)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950") or torch.cuda.device_count() < 2,
+    reason="gfx942/gfx950 MHA v4 K smoothing on two devices",
+)
+def test_mha_v4_k_smooth_mean_runs_on_k_device():
+    """K on another device than the current one, which has a side stream current."""
+    torch.manual_seed(5)
+    k = torch.randn((1, 2048, 4, 128), device="cuda:1").to(torch.bfloat16)
+    expected = _k_smooth_mean_reference(k)
+    with torch.cuda.device(0), torch.cuda.stream(torch.cuda.Stream(0)):
+        actual = _k_mean(k, _RawRecipeKind.FP8)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    assert actual.device == k.device
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 MHA v4 K smoothing",
+)
+def test_mha_v4_k_smooth_mean_rejects_unsupported_inputs():
+    """Arguments the HIP op would abort the process on raise instead."""
+    k = torch.zeros((1, 64, 2, 128), device="cuda", dtype=torch.bfloat16)
+    cases = [
+        (k.cpu(), _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k[0], _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k.float(), _K_SMOOTH_SAMPLE_ROWS, "BF16 or FP16 input"),
+        (k[..., :96], _K_SMOOTH_SAMPLE_ROWS, "head dimension 64, 128 or 256"),
+        (k[..., ::2], _K_SMOOTH_SAMPLE_ROWS, "contiguous last dimension"),
+        (k, 0, "positive sample_rows"),
+    ]
+    for bad, sample_rows, match in cases:
+        with expect_raises(ValueError, match=match):
+            k_smooth_mean(bad, sample_rows, _K_SMOOTH_MIN_COMMON)
 
 
 @skipif(
@@ -1535,6 +1626,32 @@ def test_mha_v4_kv_splits_auto_fills_one_wave():
         assert mha_v4_kv_splits(2, 4352, 1, 4349, ragged=True) == 1
 
 
+def test_mha_v4_kv_splits_auto_shrinks_a_partial_last_round():
+    """Past half a wave, auto splits when the grid ends on a nearly idle round, not when it fills
+    whole rounds; the divisor and ragged rules still decide which counts are candidates.
+    """
+    with _patched_cu_count(256):
+        # 3 heads x 86 query tiles is 258 work-groups: two rounds for 1.01 of work.
+        assert mha_v4_kv_splits(1, 21890, 3, 21890) == 5
+        assert mha_v4_kv_splits(1, 16384, 5, 16384) == 4
+        assert mha_v4_kv_splits(1, 16400, 6, 16398) == 3
+        # A split costs more keys past batch 1, which copies the queries, and for 8-bit Q/K,
+        # whose rows walk a key faster, so both split less.
+        assert mha_v4_kv_splits(2, 21890, 3, 21890) == 2
+        assert mha_v4_kv_splits(1, 16400, 6, 16398, q_format=AttentionFormat.INT8) == 1
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True) == 5
+        fp8 = AttentionFormat.FP8
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True, q_format=fp8) == 4
+        fp4 = AttentionFormat.FP4_E2M1
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True, q_format=fp4) == 5
+        # Whole rounds gain nothing that pays for the merge.
+        assert mha_v4_kv_splits(1, 16384, 4, 16384) == 1
+        assert mha_v4_kv_splits(1, 8192, 48, 8192) == 1
+        # 21891 = 3 x 7297: without per-batch key lengths only 3 is even.
+        assert mha_v4_kv_splits(1, 21891, 3, 21891) == 3
+        assert mha_v4_kv_splits(1, 21891, 3, 21891, ragged=True) == 5
+
+
 @parametrize(
     "batch,key_length,splits",
     [(1, 1024, 4), (1, 1001, 3), (2, 1024, 4), (2, 1001, 3)],
@@ -1736,6 +1853,58 @@ def test_mha_v4_kv_splits_compile_parity(formats):
 
     assert torch.equal(eager[0], compiled[0])
     assert torch.equal(eager[1], compiled[1])
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_cost_model_compiles():
+    """The cost-model branch of auto runs inside fullgraph torch.compile and splits as eager."""
+    torch._dynamo.reset()
+    torch.manual_seed(62)
+    # 30 heads x 9 query tiles is 270 work-groups, past one wave of gfx950's 256 CUs.
+    q = torch.randn((1, 2304, 30, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 8192, 30, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    bf16 = (AttentionFormat.BF16,) * 3
+    assert mha_v4_kv_splits(1, 2304, 30, 8192, q.device, ragged=True) > 1
+
+    eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
+    compiled = torch.compile(mha_v4, fullgraph=True)(q, k, v, *bf16, kv_splits="auto")
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
+    """Auto under a dynamic sequence: one graph for every length, each split as eager picks.
+
+    A DiT's sequence follows its prompt, so a compiled model sees many key lengths. Traced, the
+    pick and the range lengths guard on the length, and the pick's arithmetic on its symbolic
+    size breaks the graph. A caller's `out` is filled by a copy from the compiled split.
+    """
+    torch._dynamo.reset()
+    torch.manual_seed(63)
+    formats = (AttentionFormat.BF16,) * 3
+    counter = torch._dynamo.testing.CompileCounterWithBackend("inductor")
+    compiled = torch.compile(mha_v4, backend=counter, fullgraph=True, dynamic=True)
+    picks = set()
+    # Around one wave of 3-head work-groups, where the pick and its divisibility change.
+    for length in (21890, 21891, 22006, 22016, 17794, 4352):
+        q = torch.randn((1, length, 3, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        picks.add(
+            mha_v4_kv_splits(
+                1, length, 3, length, q.device, ragged=True, q_format=formats[0]
+            )
+        )
+        eager = mha_v4(q, k, v, *formats, kv_splits="auto")
+        out = torch.full_like(q, float("nan"))
+        result = compiled(q, k, v, *formats, out=out, kv_splits="auto")
+        assert result.data_ptr() == out.data_ptr(), length
+        assert torch.equal(eager, out), length
+    assert len(picks) > 1
+    assert counter.frame_count == 1
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
@@ -2254,6 +2423,31 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     assert cosine > 0.998
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd128 BF16 XCD relabel")
+@parametrize(
+    ("v_format", "bound"),
+    [
+        param(AttentionFormat.BF16, 0.01, id="bf16"),
+        # FP8 V alone costs about 0.04 against float32 attention.
+        param(AttentionFormat.FP8, 0.1, id="bf16fp8"),
+    ],
+)
+def test_mha_v4_bf16_hd128_xcd_relabel_matches_attention(v_format, bound):
+    # 8 heads x 2 Q tiles: the kernel relabels its work-groups per XCD.
+    torch.manual_seed(46)
+    q = torch.randn((1, 300, 8, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 384, 8, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out = mha_v4(q, k, v, AttentionFormat.BF16, AttentionFormat.BF16, v_format)
+    torch.cuda.synchronize()
+
+    reference = _dense_reference(q.float(), k.float(), v.float(), k.shape[1])
+    error = ((out.float() - reference).norm() / reference.norm()).item()
+    # A work-group on the wrong (Q tile, head) leaves whole rows wrong or unwritten.
+    assert error < bound, error
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
 def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     torch.manual_seed(41)
@@ -2280,6 +2474,34 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     torch.cuda.synchronize()
 
     assert torch.equal(gqa, mha)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd128 FP6 P validation")
+@parametrize(
+    ("qk_format", "v_format"),
+    [
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="mxfp4"),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, id="mxfp6"),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, id="f6f4"),
+        param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
+    ],
+)
+def test_mha_v4_fp6_p_keeps_each_rows_largest_weight(qk_format, v_format):
+    torch.manual_seed(47)
+    q = torch.randn((1, 300, 8, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 384, 8, 128), device="cuda", dtype=torch.bfloat16)
+    # An identity V on the first 128 keys returns their attention weights as O.
+    v = torch.zeros_like(k)
+    v[:, :128] = torch.eye(128, device="cuda", dtype=torch.bfloat16)[None, :, None]
+
+    weights = mha_v4(q, k, v, qk_format, qk_format, v_format)
+    torch.cuda.synchronize()
+
+    scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+    reference = torch.softmax(scores * 128**-0.5, dim=-1)[..., :128]
+    largest = weights.float().amax(dim=-1) / reference.permute(0, 2, 1, 3).amax(dim=-1)
+    # A block max that saturates its FP6 code loses 6% of the weight; over-sharpened Q/K gains some.
+    assert abs(largest.mean() - 1) < 0.04, largest.mean()
 
 
 # hd256 runs a 64-token KV tile where hd128 runs 128, so the aligned/partial split moves.
@@ -2345,6 +2567,8 @@ _BF16_HD256_SHAPES = _HD256_SHAPES + [
     param(1, 300, 100, 2, id="dense_short"),
     param(1, 64, 1, 1, id="one_key"),
     param(1, 513, 1088, 3, id="ragged_q"),
+    # 8 heads x 2 Q tiles: the kernel relabels its work-groups per XCD.
+    param(1, 300, 384, 8, id="xcd_relabel"),
 ]
 
 
@@ -3239,6 +3463,7 @@ def benchmark_mha_v4(
                 heads,
                 sequence_k,
                 ragged=mha_v4_module._varlen_capable(q_format, v_format),
+                q_format=q_format,
             )
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
         # what carries their accuracy, so compare loosely and let the number speak.

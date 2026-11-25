@@ -1075,8 +1075,9 @@ def mla_decode_fwd(
     ``nvfp4_n128`` uses separate packed q/q_aux and kv_buffer/kv_aux tensors,
     page CSR, H128 and one query per request. Provide nvfp4_params prepared by
     prepare_mla_nvfp4_params; it owns the softmax scale and fixed NVFP4 gains,
-    so leave sm_scale/q_scale/kv_scale unset. nvfp4_lse is reusable scratch
-    even when return_lse=False. No planner, split-K, CP or implicit conversion.
+    so leave sm_scale/q_scale/kv_scale unset. This backend requires
+    return_lse=False; nvfp4_lse is optional and remains untouched.
+    No planner, split-K, CP or implicit conversion.
 
     Output: the attention is written in place into ``o``, and ``o`` is the
     result. The call returns ``(logits, lse)``. With ``return_logits=False``,

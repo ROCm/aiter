@@ -1053,11 +1053,13 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
-        # AOT cache entry, so let those cases compile on demand.
+        # AOT cache entry, so let those cases compile on demand. Neither do
+        # whole-graph impl__ rows, until aiter/aot/flydsl/moe.py replays them.
         kwargs["check_aot_cache"] = (
             args.csv_filter is None
             and not post_reduce
             and kwargs["actType"] != aiter.ActivationType.Situv2
+            and not kernel_name1.startswith("impl__")
         )
         # Only Swiglu callers pass an expert bias; the AOT cache has no bias
         # variant for other activations.
@@ -1912,8 +1914,8 @@ def test_presorted_moe_wrapper_error():
 def _presorted_aux_stub(ids, weights, E, block_m=16):
     """A registration whose sort tensors have the BM=16 aux-sort layout.
 
-    Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
-    matcher only checks the layout and no kernel reads them.
+    Sized like aiter.moev2.segments.sort._adaptive_moe_sort; contents are left unset,
+    since the matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
     BM = presorted_moe.PRESORTED_MOE_BLOCK_M
@@ -2305,7 +2307,11 @@ def test_output_buffer_contract():
         # whatever the fake said the op returned.
         return out.sum(), buf.sum()
 
-    sort = aiter.fused_moe._moe_sorting_impl
+    # moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+    # see aiter/moev2/README.md); its implementation is patched there.
+    import aiter.moev2.segments.sort as sorting
+
+    sort = sorting._moe_sorting_impl
 
     def sort_without_output(*a, **kw):
         kw["output"] = None
@@ -2316,7 +2322,7 @@ def test_output_buffer_contract():
     for in_place in (True, False):
         try:
             if not in_place:
-                aiter.fused_moe._moe_sorting_impl = sort_without_output
+                sorting._moe_sorting_impl = sort_without_output
             buf = fresh_buffer()
             assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
             assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
@@ -2328,7 +2334,7 @@ def test_output_buffer_contract():
             ], f"{in_place=}: eager {eager} != compiled {compiled}"
             assert eager[0] == eager[1] == ref.sum()
         finally:
-            aiter.fused_moe._moe_sorting_impl = sort
+            sorting._moe_sorting_impl = sort
 
     def expect_raise(described, **kwargs):
         try:

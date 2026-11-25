@@ -138,9 +138,10 @@ def get_GEMM_A16W16_tuned_config(
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
     # off the normal (non-strict) runtime path entirely.
-    if base_gfx_arch(gfx) != gfx and gfx not in {
+    borrowed_rows = base_gfx_arch(gfx) != gfx and gfx not in {
         k[0] for k in cfg if isinstance(k, tuple) and k
-    }:
+    }
+    if borrowed_rows:
         gfx = base_gfx_arch(gfx)
     warned_invalid_opus = set()
     for gl in [None, 0, 1]:
@@ -190,6 +191,11 @@ def get_GEMM_A16W16_tuned_config(
                     )
                     config = None
             if config is None:
+                continue
+            # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250
+            # OPUS row cannot launch on gfx1250-strict; fall through to the default.
+            if borrowed_rows and config["libtype"] == "opus":
+                config = None
                 continue
             if config["libtype"] == "opus":
                 resolved = None
@@ -486,31 +492,40 @@ def _gemm_a16w16(
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
     from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
 
-    gfx, cu_num = _device_arch_and_cu(inp_view.device)
-    if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx = get_gfx_runtime()
-        cu_num = get_cu_num()
-    config = get_GEMM_A16W16_config(
-        M=m,
-        N=n,
-        K=k,
-        bias=use_bias,
-        dtype=str(inp_view.dtype),
-        otype=str(otype),
-        scaleAB=scale_a is not None or scale_b is not None,
-        bpreshuffle=bpreshuffle,
-        gfx=gfx,
-        cu_num=cu_num,
-    )
-    if config["libtype"] == "opus" and not (
-        _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
-    ):
-        # Both backends read arbitrary strides, and an OPUS row implies no
-        # scales and no bpreshuffle, which is all Triton requires.
-        config = {
-            "libtype": "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch",
-            "solidx": 0,
-        }
+    try:
+        gfx, cu_num = _device_arch_and_cu(inp_view.device)
+    except RuntimeError:
+        # The arch lookup rejects non-GPU tensors; those keep the Torch fallback.
+        if inp_view.is_cuda:
+            raise
+        config = {"libtype": "torch", "solidx": 0}
+    else:
+        if gfx not in SUPPORTED_OPUS_ARCHES:
+            gfx = get_gfx_runtime()
+            cu_num = get_cu_num()
+        config = get_GEMM_A16W16_config(
+            M=m,
+            N=n,
+            K=k,
+            bias=use_bias,
+            dtype=str(inp_view.dtype),
+            otype=str(otype),
+            scaleAB=scale_a is not None or scale_b is not None,
+            bpreshuffle=bpreshuffle,
+            gfx=gfx,
+            cu_num=cu_num,
+        )
+        if config["libtype"] == "opus" and not (
+            _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
+        ):
+            # Both backends read arbitrary strides, and an OPUS row implies no
+            # scales and no bpreshuffle, which is all Triton requires.
+            config = {
+                "libtype": (
+                    "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch"
+                ),
+                "solidx": 0,
+            }
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
@@ -690,7 +705,12 @@ def torch_gemm(
         # `out_dtype` writes the accumulator instead, which is what the tuned
         # ASM (`bf16gemm_fp32bf16_*`) and OPUS kernels do -- an untuned shape
         # must not disagree with them about what `otype` means.
-        result = torch.mm(inp, weights.t(), out_dtype=otype, out=out)
+        if inp.is_cuda:
+            result = torch.mm(inp, weights.t(), out_dtype=otype, out=out)
+        else:
+            # out_dtype is CUDA-only; CPU matmul needs FP32 operands to retain
+            # the accumulator precision requested by the caller.
+            result = torch.mm(inp.to(otype), weights.t().to(otype), out=out)
         return result if bias is None else result.add_(bias)
     if out is not None and out.dtype == inp.dtype:
         # F.linear's own form, bias added in the accumulator.
