@@ -559,6 +559,41 @@ class G2SRounds(G2SLoader):
             fx.copy(self.g2lds_atom, src, dst, soffset=soff)
 
 
+class G2SRoundsNt(G2SRounds):
+    """``G2SRounds`` with the nontemporal (nt) cache policy, for data read once.
+
+    Raw intrinsic: the ``BufferCopyLDS`` atom has no cache-policy state.
+    """
+
+    NT = 2  # buffer instruction aux bit 1 (nt) on gfx94x / gfx950
+
+    def __init__(
+        self, rsrc, base_offset, n_load_steps, lds_dtype, wave_id, round_bytes
+    ):
+        super().__init__(
+            None, base_offset, n_load_steps, lds_dtype, wave_id, round_bytes
+        )
+        self.rsrc = rsrc
+
+    def load(self, lds_dst, k_offset, skip=(None, None)):
+        for step in range_constexpr(self.n_load_steps):
+            step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
+            base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
+            lds_ptr = fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(step_off))
+            soff = fx.Int32(k_offset) + step * self.round_bytes
+            if const_expr(skip[step] is not None):
+                soff = (skip[step] != 0).select(fx.Int32(1 << 30), soff)
+            rocdl.raw_ptr_buffer_load_lds(
+                self.rsrc,
+                fx.to_llvm_ptr(lds_ptr),
+                16,
+                fx.Int32(self.gl_offsets[0]).ir_value(),
+                soff.ir_value(),
+                0,
+                self.NT,
+            )
+
+
 class MoeScaleLds:
     """E8M0 A / B block scales of one tile, staged through LDS ``CHUNK`` K-steps at a time.
 
@@ -1184,6 +1219,14 @@ def compile_moe_bs_gemm_8w(
                 wave_id,
                 64 * K,
             )
+            b_g2s_nt = G2SRoundsNt(
+                fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf)),
+                gl_off_b[0],
+                N_LDS_STEPS,
+                F8_IR_t,
+                wave_id,
+                64 * K,
+            )
             b_off = [half_row0(nb, h) * K for h in range_constexpr(2)]
             b_rows = [
                 expert * (N // 128) + half_row0(nb, h) // 128
@@ -1202,7 +1245,17 @@ def compile_moe_bs_gemm_8w(
                 a_g2s.load(dst, a_base[h] + (rot + k) % K_ITERS * BLOCK_K, a_skip[h])
 
             def b_load(h, dst, k):
-                b_g2s.load(dst, b_off[h] + (rot + k) % K_ITERS * B_K_STEP)
+                off = b_off[h] + (rot + k) % K_ITERS * B_K_STEP
+                # A weight panel no other m-block of the expert reads streams
+                # through L2 nontemporally (leaving it to A panels and output
+                # lines): stage 2 alone, T = 4096 / 8192 / 16384: 295 / 375 /
+                # 609 -> 278 / 367 / 600 us; nt on every panel is +10% at
+                # 16384, where experts span ~2 m-blocks.
+                either(
+                    (pmask >> 3) & 1,
+                    lambda: b_g2s_nt.load(dst, off),
+                    lambda: b_g2s.load(dst, off),
+                )
 
             def sc_dma(slot):
                 tsc.dma(slot, row0, rot, b_rows)
@@ -1210,12 +1263,18 @@ def compile_moe_bs_gemm_8w(
             return {"a": a_load, "b": b_load, "sc": sc_dma, "row0": row0, "rot": rot}
 
         def pad_rows(tile):
-            """Issue the loads of rows 64, 128 and 192 of ``tile``'s m-block (``pad_mask`` reads them)."""
-            row0 = tile // NB * BLOCK_M
-            return [_load_i32_lane(ids_div, row0 + 64 * q) for q in range(1, 4)]
+            """Issue ``pad_mask``'s loads: rows 64 / 128 / 192 of ``tile``'s m-block, the neighbours' experts."""
+            m_blk = tile // NB
+            row0 = m_blk * BLOCK_M
+            vals = [_load_i32_lane(ids_div, row0 + 64 * q) for q in range(1, 4)]
+            prev_m = (m_blk > 0).select(m_blk - 1, m_blk)
+            next_m = (m_blk + 1 < n_tiles // NB).select(m_blk + 1, m_blk)
+            for m in (prev_m, m_blk, next_m):
+                vals.append(_load_i32_lane(eids_div, m))
+            return vals
 
         def pad_mask(sids):
-            """Bit q - 1: rows 64 q .. 255 of the m-block are all padding.
+            """Bit q - 1 (q = 1..3): rows 64 q .. 255 of the m-block are all padding.
 
             Padding rows name token T (moe_sorting) and sit at the end of an
             expert's block, so a padded row means every later one is too.
@@ -1226,13 +1285,18 @@ def compile_moe_bs_gemm_8w(
                     fx.Int32(1), fx.Int32(0)
                 )
                 m = m | (pad << q)
+            # Bit 3: the m-block before or after has the same expert, so its
+            # weight panel is read again and should stay in L2.
+            shared = (sids[3] == sids[4]) | (sids[5] == sids[4])
+            m = m | shared.select(fx.Int32(8), fx.Int32(0))
             return _sgpr(m)
 
-        def store_or_dummy(skip, real, dummy):
-            if skip == 0:
-                real()
+        def either(flag, if_zero, otherwise):
+            """``if_zero()`` or ``otherwise()`` on a wave-uniform flag (each issues the same VMEM count)."""
+            if flag == 0:
+                if_zero()
             else:
-                dummy()
+                otherwise()
 
         def mfma_skip(skip, burst, c):
             """``burst()`` unless ``skip``: a wave-uniform branch around an MFMA burst."""
@@ -1284,7 +1348,7 @@ def compile_moe_bs_gemm_8w(
                 else:
                     # This wave's row-half-1 rows of the previous tile are all
                     # padding: the same count of stores, without the 1 KB each.
-                    store_or_dummy(
+                    either(
                         prev_skip_h1,
                         lambda: store_c.store(
                             store_c.pack(prev_acc[g], rows), offs, pcols[g % 2]
@@ -1366,7 +1430,7 @@ def compile_moe_bs_gemm_8w(
                 wait_barrier(
                     4 * N_LDS_STEPS
                     + n_sc
-                    + (6 + 3 * QUAD_STORES if k == 0 else 0)
+                    + (9 + 3 * QUAD_STORES if k == 0 else 0)
                     + (2 * QUAD_STORES if k == 1 else 0)
                 )
 
