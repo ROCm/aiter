@@ -579,15 +579,14 @@ def validate_gemm_decode_tensors(
             raise ValueError(
                 f"{name} must have shape {(rows, cols)}, got {tuple(shape)}"
             )
-        stride = t.stride()
-        if name == "A":
-            if stride[1] != 1 or (rows > 1 and stride[0] < cols):
-                raise ValueError(
-                    "A must be row-major with a unit column stride and a row "
-                    f"stride of at least K, got strides {tuple(stride)}"
-                )
-        elif stride[0] != cols or stride[1] != 1:
-            raise ValueError(f"{name} must use packed row-major storage")
+    if not decode_layout_supported(A, B, bias, C):
+        raise ValueError(
+            "decode GEMM needs A row-major with a unit column stride and a row "
+            "stride of at least K, B and C packed row-major, and a contiguous "
+            f"bias; got strides A {tuple(A.stride())}, B {tuple(B.stride())}, "
+            f"C {tuple(C.stride())}"
+            + ("" if bias is None else f", bias {tuple(bias.stride())}")
+        )
 
     if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
@@ -656,8 +655,6 @@ def gemm_decode_bf16(
         bias=bias,
         arch=runtime_arch,
     )
-    if bias is not None and not bias.is_contiguous():
-        raise ValueError("bias must be contiguous")
     launch_stream = _normalize_launch_stream(A.device, stream)
     if m == 1 and A.stride() != (k, 1):
         # A size-1 row has no meaningful row stride; give it the packed one so
@@ -726,10 +723,11 @@ def decode_layout_supported(
 ) -> bool:
     """True when the operands' layouts are ones the decode kernels accept.
 
-    The layout half of ``validate_gemm_decode_tensors``: A row-major with a
-    unit column stride (any row stride ``>= K``), B and ``out`` packed, bias
-    contiguous. A tuned decode row is chosen from shape and dtype alone, so a
-    caller uses this to fall back instead of raising on other layouts.
+    The one copy of the decode layout rule: A row-major with a unit column
+    stride (any row stride ``>= K``), B and ``out`` packed, bias contiguous.
+    ``validate_gemm_decode_tensors`` raises when it is False. A tuned decode
+    row is chosen from shape and dtype alone, so a caller uses this to fall
+    back instead of raising on other layouts.
     """
     if inp.dim() != 2 or weights.dim() != 2:
         return False
