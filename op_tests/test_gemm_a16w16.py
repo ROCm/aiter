@@ -18,6 +18,7 @@ from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import (
+    asm_gemm,
     get_GEMM_A16W16_config,
     hipb_gemm,
     skinny_gemm,
@@ -687,6 +688,58 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
+def test_gemm_scaled():
+    """`tgemm.mm` with BF16/FP16 inputs and `scale_a`/`scale_b` applies them.
+
+    No tuned row has scaleAB, so these calls take the untuned default; it used
+    to return the unscaled product. The backends with no scale argument
+    refuse scales rather than drop them.
+    """
+    cu = get_cu_num()
+    rows = []
+    sa = torch.tensor([2.0], dtype=dtypes.fp32, device="cuda")
+    sb = torch.tensor([3.0], dtype=dtypes.fp32, device="cuda")
+    # (1, cu, 4096) is a skinny default shape: scaled, it must go to torch.
+    for dtype, otype, (m, n, k), use_bias in [
+        (dtypes.bf16, dtypes.bf16, (1, cu, 4096), False),
+        (dtypes.bf16, dtypes.bf16, (512, 4096, 4096), False),
+        (dtypes.bf16, dtypes.bf16, (512, 4096, 4096), True),
+        (dtypes.bf16, dtypes.fp32, (64, 1024, 2048), False),
+        (dtypes.fp16, dtypes.fp16, (128, 1024, 2048), True),
+    ]:
+        x = torch.randn(m, k, dtype=dtype, device="cuda")
+        w = torch.randn(n, k, dtype=dtype, device="cuda")
+        bias = torch.randn(n, dtype=otype, device="cuda") if use_bias else None
+        acc = F.linear(x.float(), w.float()) * 6.0
+        ref = (acc.to(otype) + bias) if bias is not None else acc.to(otype)
+        for label, kwargs in [
+            ("a,b", {"scale_a": sa, "scale_b": sb}),
+            ("a only", {"scale_a": sa * sb}),
+        ]:
+            out = tgemm.mm(x, w, bias, otype=otype, **kwargs)
+            msg = f"scaled {label} {(m, n, k)} {dtype} -> {otype} bias={use_bias}: "
+            err = checkAllclose(ref, out, msg=msg)
+            # Rounding before the bias add can move a near-cancelling element
+            # by one ulp; an ignored scale makes every element wrong.
+            assert err < 1e-3, msg
+            rows.append({"case": msg.rstrip(": "), "err": err})
+
+    x = torch.randn(1, 4096, dtype=dtypes.bf16, device="cuda")
+    w = torch.randn(256, 4096, dtype=dtypes.bf16, device="cuda")
+    for name, fn, config in [
+        ("skinny", skinny_gemm, None),
+        ("asm", asm_gemm, {"kernelName": None, "splitK": None}),
+    ]:
+        try:
+            fn(x, w, 2, None, dtypes.bf16, sa, sb, config=config)
+        except AssertionError as e:
+            assert "does not support scaling" in str(e), e
+        else:
+            raise AssertionError(f"{name} took scale_a/scale_b and dropped them")
+        rows.append({"case": f"{name} with scales", "err": "refused"})
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -696,13 +749,14 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "scaled"],
+    default=["normal", "scaled"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal scaled    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t scaled    # tgemm.mm with scale_a/scale_b on bf16/fp16""",
 )
 parser.add_argument(
     "-d",
@@ -792,6 +846,8 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
+    elif test == "scaled":
+        df += test_gemm_scaled()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
