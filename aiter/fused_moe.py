@@ -1382,17 +1382,17 @@ def fused_moe(
             shared_a1=shared_a1,
             shared_expert_id=shared_expert_id,
             output=output,
-            unsupported=dict(
-                expert_mask=expert_mask,
-                doweight_stage1=doweight_stage1,
-                hidden_pad=hidden_pad,
-                intermediate_pad=intermediate_pad,
-                bias1=bias1,
-                bias2=bias2,
-                stage2_scatter=stage2_scatter,
-                herd_topk=herd_topk,
-                deterministic=deterministic,
-            ),
+            unsupported={
+                "expert_mask": expert_mask,
+                "doweight_stage1": doweight_stage1,
+                "hidden_pad": hidden_pad,
+                "intermediate_pad": intermediate_pad,
+                "bias1": bias1,
+                "bias2": bias2,
+                "stage2_scatter": stage2_scatter,
+                "herd_topk": herd_topk,
+                "deterministic": deterministic,
+            },
         )
     has_shared_expert = (
         any(

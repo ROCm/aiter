@@ -32,34 +32,58 @@ from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import (
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_router_chain import route_quant_small
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_router_gemm import router_line_layout
 
-SHARED_COLUMNS = (
-    "gfx,cu_num,token,model_dim,inter_dim,expert,topk,shared_expert_id,act_type,dtype,q_dtype_a,q_dtype_w,q_type,"
-    "use_g1u1,doweight_stage1,hidden_pad,intermediate_pad,gate_mode,block_m,ksplit,us1,kernelName1,err1,us2,"
-    "kernelName2,err2,us"
-).split(",")
+SHARED_COLUMNS = [
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "shared_expert_id",
+    "act_type",
+    "dtype",
+    "q_dtype_a",
+    "q_dtype_w",
+    "q_type",
+    "use_g1u1",
+    "doweight_stage1",
+    "hidden_pad",
+    "intermediate_pad",
+    "gate_mode",
+    "block_m",
+    "ksplit",
+    "us1",
+    "kernelName1",
+    "err1",
+    "us2",
+    "kernelName2",
+    "err2",
+    "us",
+]
 
 
 def row_key(n, gfx, cu_num):
-    return dict(
-        gfx=gfx,
-        cu_num=cu_num,
-        token=n,
-        model_dim=B.H,
-        inter_dim=B.I,
-        expert=B.E,
-        topk=B.TOPK,
-        shared_expert_id=-1,
-        act_type="ActivationType.Swiglu",
-        dtype="torch.bfloat16",
-        q_dtype_a="torch.float4_e2m1fn_x2",
-        q_dtype_w="torch.float4_e2m1fn_x2",
-        q_type="QuantType.per_1x32",
-        use_g1u1=1,
-        doweight_stage1=0,
-        hidden_pad=0,
-        intermediate_pad=0,
-        gate_mode="GateMode.SEPARATED",
-    )
+    return {
+        "gfx": gfx,
+        "cu_num": cu_num,
+        "token": n,
+        "model_dim": B.H,
+        "inter_dim": B.I,
+        "expert": B.E,
+        "topk": B.TOPK,
+        "shared_expert_id": -1,
+        "act_type": "ActivationType.Swiglu",
+        "dtype": "torch.bfloat16",
+        "q_dtype_a": "torch.float4_e2m1fn_x2",
+        "q_dtype_w": "torch.float4_e2m1fn_x2",
+        "q_type": "QuantType.per_1x32",
+        "use_g1u1": 1,
+        "doweight_stage1": 0,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "gate_mode": "GateMode.SEPARATED",
+    }
 
 
 _ROW_FILE = os.path.join(
@@ -166,15 +190,13 @@ def tune_shape(n, gfx, cu_num, nsets=8, reps=30, full=False, log=print):
                 continue
             sets = list(range(nsets))
             us = B.graph_median_us(
-                lambda i: route_quant_small(
+                lambda i, cfg=cfg: route_quant_small(
                     x, gates[i][0], lines[i], gates[i][1], B.SCALE, cfg
                 ),
                 sets,
                 reps,
             )
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 - a candidate the kernels cannot build is not a result
+        except Exception as exc:  # noqa: BLE001
             log(
                 f"[decode-chain] n={n} router {cfg.name()}: {type(exc).__name__}: {str(exc)[:100]}"
             )
@@ -238,4 +260,4 @@ def tune_shape(n, gfx, cu_num, nsets=8, reps=30, full=False, log=print):
     )
 
 
-__all__ = ["tune_shape", "row_key", "SHARED_COLUMNS", "ExpertCfg"]
+__all__ = ["SHARED_COLUMNS", "ExpertCfg", "row_key", "tune_shape"]

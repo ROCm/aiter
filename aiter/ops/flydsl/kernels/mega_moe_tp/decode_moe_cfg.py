@@ -254,9 +254,7 @@ class RouterCfg:
         # measured: nbw >= 4 at 65-128 rows faults the GPU (the weight tile outgrows the LDS next to the x tile)
         if m > 64 and self.nbw > 2:
             return False
-        if self.x_direct and not (33 <= m <= 57):
-            return False
-        return True
+        return not (self.x_direct and not 33 <= m <= 57)
 
     @classmethod
     def default(cls, m: int) -> "RouterCfg":

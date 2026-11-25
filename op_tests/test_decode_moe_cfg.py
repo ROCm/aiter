@@ -72,7 +72,8 @@ def test_tuned_rows_name_valid_configs():
     path = os.path.join(
         CONFIGS, "model_configs", "minimax_m3_tp4_decode_tuned_shared_fmoe.csv"
     )
-    rows = list(csv.DictReader(open(path)))
+    with open(path) as fh:
+        rows = list(csv.DictReader(fh))
     assert {int(r["token"]) for r in rows} >= {8, 16, 32, 64, 128}
     seen = set()
     for r in rows:

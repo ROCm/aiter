@@ -31,11 +31,11 @@ from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_bench import (
     DEV as dev,
 )
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_bench import (
+    ROWS,
+    SCALE,
     E,
     H,
     I,
-    ROWS,
-    SCALE,
     _u8,
     chain_direct,
     graph_median_us,
@@ -94,9 +94,7 @@ def test_expert_configs_are_bit_identical(n):
     for cfg in expert_candidates(n):
         try:
             out, _, _ = chain_direct(x, L, gate, lines, bias, ecfg=cfg)
-        except (
-            Exception
-        ) as exc:  # a candidate the kernels cannot build is dropped by the tuner
+        except Exception as exc:  # noqa: BLE001
             print(f"n={n} {cfg.name()}: {type(exc).__name__}")
             continue
         if not torch.equal(out, ref):
@@ -117,7 +115,7 @@ def test_router_configs_pick_the_same_routes(n):
         torch.cuda.synchronize()
         if r is None:
             continue
-        (xq, _), (q8, _), w, ids = r
+        (_xq, _), (_q8, _), w, ids = r
         assert torch.equal(ids.sort(-1).values, ids0.sort(-1).values), cfg.name()
         torch.testing.assert_close(
             w.sort(-1).values, w0.sort(-1).values, rtol=1e-4, atol=1e-5
@@ -173,16 +171,16 @@ def run_timing(rows, nsets, abab, ecfgs=None):
     for n in rows:
         x = make_x(n)
 
-        def pub(L):
+        def pub(L, x=x):
             public_path(x, L, gate_bf16, bias)
 
-        def intp(L):
+        def intp(L, x=x):
             integrated_public_router(x, L, gate_bf16, bias)
 
-        def intr(L):
+        def intr(L, x=x):
             integrated_router(x, L, gate, bias)
 
-        def chain(L):
+        def chain(L, x=x):
             chain_direct(x, L, gate, lines, bias)
 
         paths = {

@@ -48,16 +48,16 @@ def make_layer(seed=0):
     )
     for w in (sw1, sw2):
         w.is_shuffled = True
-    return dict(
-        w1=w1,
-        w2=w2,
-        w1_scale=_u8((E, 2 * I, H // 32), g, 121, 124).view(dtypes.fp8_e8m0),
-        w2_scale=_u8((E, H, I // 32), g, 121, 124).view(dtypes.fp8_e8m0),
-        shared_w1=sw1,
-        shared_w2=sw2,
-        shared_w1_scale=_u8((2 * I, H // 32), g, 121, 124).view(dtypes.fp8_e8m0),
-        shared_w2_scale=_u8((H, I // 32), g, 121, 124).view(dtypes.fp8_e8m0),
-    )
+    return {
+        "w1": w1,
+        "w2": w2,
+        "w1_scale": _u8((E, 2 * I, H // 32), g, 121, 124).view(dtypes.fp8_e8m0),
+        "w2_scale": _u8((E, H, I // 32), g, 121, 124).view(dtypes.fp8_e8m0),
+        "shared_w1": sw1,
+        "shared_w2": sw2,
+        "shared_w1_scale": _u8((2 * I, H // 32), g, 121, 124).view(dtypes.fp8_e8m0),
+        "shared_w2_scale": _u8((H, I // 32), g, 121, 124).view(dtypes.fp8_e8m0),
+    }
 
 
 def make_router(seed=1):
@@ -85,7 +85,7 @@ def chain_direct(x, L, gate, lines, bias, ecfg=None, rcfg=None):
     plan = gemms.get_plan(
         n, w13_split=True, tiles=None if ecfg is None else ecfg.to_tiles()
     )
-    u = lambda t: t.view(torch.uint8).view(-1)  # noqa: E731
+    u = lambda t: t.view(torch.uint8).view(-1)
     slots, shared = gemms.decode_expert_gemms(
         plan,
         u(xq),
@@ -101,13 +101,13 @@ def chain_direct(x, L, gate, lines, bias, ecfg=None, rcfg=None):
 
 
 def shared_kw(L):
-    return dict(
-        shared_w1=L["shared_w1"],
-        shared_w2=L["shared_w2"],
-        shared_w1_scale=L["shared_w1_scale"],
-        shared_w2_scale=L["shared_w2_scale"],
-        shared_folded=True,
-    )
+    return {
+        "shared_w1": L["shared_w1"],
+        "shared_w2": L["shared_w2"],
+        "shared_w1_scale": L["shared_w1_scale"],
+        "shared_w2_scale": L["shared_w2_scale"],
+        "shared_folded": True,
+    }
 
 
 def integrated(x, L, w, ids):

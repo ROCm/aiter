@@ -24,12 +24,12 @@ import torch
 
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import (
-    E,
-    H,
-    I,
     ROWS,
     TOPK,
+    E,
     ExpertCfg,
+    H,
+    I,
 )
 
 SWIGLU_LIMIT = 7.0
@@ -176,7 +176,7 @@ def run_m3_decode(req: FusedMoeRequest, cfg: ExpertCfg) -> torch.Tensor:
         xq, xs = req.hidden_states, req.a1_scale
         q8, s8 = req.shared_a1
     plan = get_plan(n, w13_split=True, tiles=cfg.to_tiles())
-    u8 = lambda t: t.view(torch.uint8).view(-1)  # noqa: E731
+    u8 = lambda t: t.view(torch.uint8).view(-1)
     slots, shared = decode_expert_gemms(
         plan,
         u8(xq),
