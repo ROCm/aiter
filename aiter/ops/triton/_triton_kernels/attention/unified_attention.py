@@ -30,6 +30,92 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def _attend_unmasked_tile(
+    M,
+    L,
+    acc,
+    Q,
+    seq_offset,
+    block_tables_ptr,
+    block_table_offset,
+    key_cache_ptr,
+    value_cache_ptr,
+    stride_k_cache_0,
+    stride_k_cache_1,
+    stride_k_cache_2,
+    stride_k_cache_3,
+    stride_v_cache_0,
+    stride_v_cache_1,
+    stride_v_cache_2,
+    stride_v_cache_3,
+    kv_head_idx,
+    offs_d,
+    offs_vd,
+    dim_mask,
+    v_dim_mask,
+    qk_scale,
+    RCP_LN2,
+    softcap,
+    alibi_slope,
+    context_len,
+    USE_SOFTCAP: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KV_cache_modifier: tl.constexpr,
+):
+    physical_block_idx = tl.load(
+        block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+    ).to(tl.int64)
+    v_offset = (
+        physical_block_idx[:, None] * stride_v_cache_0
+        + kv_head_idx * stride_v_cache_2
+        + offs_vd[None, :] * stride_v_cache_3
+        + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+    )
+    k_offset = (
+        physical_block_idx[None, :] * stride_k_cache_0
+        + kv_head_idx * stride_k_cache_2
+        + offs_d[:, None] * stride_k_cache_3
+        + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+    )
+
+    K_load = tl.load(
+        key_cache_ptr + k_offset,
+        mask=dim_mask[:, None],
+        other=0.0,
+        cache_modifier=KV_cache_modifier,
+    )
+    K = K_load.to(Q.dtype)
+
+    V_load = tl.load(
+        value_cache_ptr + v_offset,
+        mask=v_dim_mask[None, :],
+        other=0.0,
+        cache_modifier=KV_cache_modifier,
+    )
+    V = V_load.to(Q.dtype)
+
+    S = qk_scale * tl.dot(Q, K)
+
+    if USE_SOFTCAP:
+        S = apply_softcap(S, softcap) * RCP_LN2
+
+    if USE_ALIBI_SLOPES:
+        S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+
+    m_j = tl.maximum(M, tl.max(S, axis=1))
+    m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+    P = tl.math.exp2(S - m_j[:, None])
+    l_j = tl.sum(P, axis=1)
+    alpha = tl.math.exp2(M - m_j)
+    acc = acc * alpha[:, None]
+    L = L * alpha + l_j
+    M = m_j
+    acc = tl.dot(P.to(V.dtype), V, acc=acc)
+    return M, L, acc
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -115,6 +201,7 @@ def kernel_unified_attention_2d(
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
+    qq_bias_stride_batch: tl.int64,
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
@@ -254,11 +341,15 @@ def kernel_unified_attention_2d(
         alibi_slope = tl.load(
             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
         )
+    else:
+        alibi_slope = None
 
     # query-query attention bias
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr
+            + seq_idx * qq_bias_stride_batch
+            + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -316,77 +407,65 @@ def kernel_unified_attention_2d(
 
     masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
-        min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
+        if USE_QQ_BIAS:
+            min_query_key_limit = context_len
+        else:
+            min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
 
         for j in range(tile_start, unmasked_tile_end):
-            seq_offset = j * TILE_SIZE + offs_t
-
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_vd[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            M, L, acc = _attend_unmasked_tile(
+                M,
+                L,
+                acc,
+                Q,
+                j * TILE_SIZE + offs_t,
+                block_tables_ptr,
+                block_table_offset,
+                key_cache_ptr,
+                value_cache_ptr,
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                kv_head_idx,
+                offs_d,
+                offs_vd,
+                dim_mask,
+                v_dim_mask,
+                qk_scale,
+                RCP_LN2,
+                softcap,
+                alibi_slope,
+                context_len,
+                USE_SOFTCAP,
+                USE_ALIBI_SLOPES,
+                BLOCK_SIZE,
+                KV_cache_modifier,
             )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
-            )
-            K = K_load.to(Q.dtype)
-
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=v_dim_mask[None, :],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
-            )
-            V = V_load.to(Q.dtype)
-
-            S = qk_scale * tl.dot(Q, K)
-
-            if USE_SOFTCAP:
-                S = apply_softcap(S, softcap) * RCP_LN2
-
-            if USE_ALIBI_SLOPES:
-                S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
-
-            if USE_QQ_BIAS:
-                key_rel_pos = seq_offset - context_len
-                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-                qq_bias = tl.load(
-                    qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=query_mask_0[:, None] & is_query_key[None, :],
-                    other=0.0,
-                )
-                S += qq_bias * RCP_LN2
-
-            m_j = tl.maximum(M, tl.max(S, axis=1))
-            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-            P = tl.math.exp2(S - m_j[:, None])
-            l_j = tl.sum(P, axis=1)
-            alpha = tl.math.exp2(M - m_j)
-            acc = acc * alpha[:, None]
-            L = L * alpha + l_j
-            M = m_j
-            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
         masked_tile_start = unmasked_tile_end
 
     for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
+        if USE_QQ_BIAS:
+            # skip the bias load on tiles without draft keys
+            has_draft_keys = (j + 1) * TILE_SIZE > context_len
+            if has_draft_keys:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :] & query_mask_0[:, None],
+                    other=0.0,
+                )
+            else:
+                qq_bias = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
         # to reduce the masking effect when not needed
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
@@ -499,18 +578,7 @@ def kernel_unified_attention_2d(
             # prescale w. RCP_LN2 for later exp2
             S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                # avoid OOB for context keys and for padded query rows
-                mask=query_mask_0[:, None] & is_query_key[None, :],
-                other=0.0,
-            )
-            # prescale w. RCP_LN2 for later exp2
+        if USE_QQ_BIAS and has_draft_keys:
             S += qq_bias * RCP_LN2
 
         # compute running maximum
@@ -613,6 +681,7 @@ def kernel_unified_attention_3d(
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
+    qq_bias_stride_batch: tl.int64,
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int, must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
@@ -645,7 +714,12 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
 ):
+    tl.static_assert(
+        not (SPLIT_UNMASKED_LOOP and (SHUFFLED_KV_CACHE or SLIDING_WINDOW > 0)),
+        "SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW",
+    )
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -763,11 +837,15 @@ def kernel_unified_attention_3d(
         alibi_slope = tl.load(
             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
         )
+    else:
+        alibi_slope = None
 
     # query-query attention bias
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr
+            + seq_idx * qq_bias_stride_batch
+            + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -808,12 +886,59 @@ def kernel_unified_attention_3d(
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
 
-    # iterate through tiles within current segment
-    for j in range(
-        segm_tile_start,
-        min(segm_tile_start + tiles_per_segment, num_tiles),
-    ):
+    segm_tile_end = min(segm_tile_start + tiles_per_segment, num_tiles)
+    masked_tile_start = segm_tile_start
+    if SPLIT_UNMASKED_LOOP:
+        unmasked_tile_end = tl.minimum(context_len // TILE_SIZE, segm_tile_end)
+        unmasked_tile_end = tl.maximum(unmasked_tile_end, segm_tile_start)
+
+        for j in range(segm_tile_start, unmasked_tile_end):
+            M, L, acc = _attend_unmasked_tile(
+                M,
+                L,
+                acc,
+                Q,
+                j * TILE_SIZE + offs_t,
+                block_tables_ptr,
+                block_table_offset,
+                key_cache_ptr,
+                value_cache_ptr,
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                kv_head_idx,
+                offs_d,
+                offs_vd,
+                dim_mask,
+                v_dim_mask,
+                qk_scale,
+                RCP_LN2,
+                softcap,
+                alibi_slope,
+                context_len,
+                USE_SOFTCAP,
+                USE_ALIBI_SLOPES,
+                BLOCK_SIZE,
+                KV_cache_modifier,
+            )
+
+        masked_tile_start = unmasked_tile_end
+
+    for j in range(masked_tile_start, segm_tile_end):
         seq_offset = j * TILE_SIZE + offs_t
+        if USE_QQ_BIAS:
+            key_rel_pos = seq_offset - context_len
+            is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
+            qq_bias = tl.load(
+                qq_bias_row_ptrs + key_rel_pos[None, :],
+                mask=is_query_key[None, :] & query_mask_0[:, None],
+                other=0.0,
+            )
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
@@ -927,17 +1052,6 @@ def kernel_unified_attention_3d(
             S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
         if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                # avoid OOB for context keys and for padded query rows
-                mask=query_mask_0[:, None] & is_query_key[None, :],
-                other=0.0,
-            )
-            # prescale w. RCP_LN2 for later exp2
             S += qq_bias * RCP_LN2
 
         # compute running maximum
