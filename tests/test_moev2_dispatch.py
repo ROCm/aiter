@@ -496,6 +496,7 @@ def test_op_call_matches_what_legacy_passes_to_the_custom_op(monkeypatch):
             "stage2_scatter": scatter,
             "block_size_M": 64,
             "quant_type_a": QuantType.per_Tensor,
+            "mxfp8_copy_out": ("payload", "scale"),
         },
     ):
         seen.clear()
@@ -549,6 +550,8 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
         {"deterministic": True},
         {"w1_global_scale": torch.empty(4, 2)},
         {"w2_global_scale": torch.empty(4)},
+        {"mxfp8_copy_payload": torch.empty(2, 64)},
+        {"mxfp8_copy_scale": torch.empty(2, 2)},
     ):
         assert not a8w8_pt.claims({**call, **change}), change
         assert a8w8_pt.why_not({**call, **change}), change
