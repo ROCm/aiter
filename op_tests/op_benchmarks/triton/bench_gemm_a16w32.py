@@ -13,9 +13,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
     get_model_configs,
     get_shape_benchmark_object,
+    metric_value,
     print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
@@ -32,20 +34,32 @@ def _gen_inputs(M, N, K, keys):
     return tuple(inputs[key] for key in keys)
 
 
-def bench_gemm_fn(
-    bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str, w_split: bool
+def make_bench_case(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    w_split: bool,
+    kernel_type: str | None,
 ):
-    # The fp32 FMA kernel reads w. The bf16x3 kernel reads w and splits it, or
-    # it reads the bf16 terms when the call gives them (w_split). The weight
-    # that the kernel reads rotates. The other weight is fixed.
-    config, _ = get_gemm_config("GEMM-A16W32", M, N, K)
-    read = "w"
-    if w_split and config["kernel_type"] == "compute_bound":
-        read = "w_bf16x3"
-    rot_keys = ["x", read, "y"]
-    fixed_keys = [name for name in ("w", "w_bf16x3") if name != read]
-    if not w_split:
-        fixed_keys.remove("w_bf16x3")
+    """(launch, rot_bufs, flops, mem) of one shape.
+
+    The fp32 FMA kernel (bandwidth_bound) reads w. The bf16x3 kernel (compute_bound) reads w and
+    splits it, or it reads the bf16 terms when the call gives them (w_split). The weight that
+    the kernel reads rotates; the other one is fixed. With kernel_type None (the tuner times
+    both kernels) every weight that the call gives rotates.
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
+    given = ["w", "w_bf16x3"] if w_split else ["w"]
+    if kernel_type is None:
+        read = given
+    elif w_split and kernel_type == "compute_bound":
+        read = ["w_bf16x3"]
+    else:
+        read = ["w"]
+    rot_keys = ["x", *read, "y"]
+    fixed_keys = [name for name in given if name not in read]
     fixed = {}
     if fixed_keys:
         fixed = {
@@ -55,25 +69,27 @@ def bench_gemm_fn(
     rot_bufs = bencher.build_pool(
         [functools.partial(_gen_inputs, M, N, K, rot_keys)], [rot_keys], **fixed
     )
+    launch = config_launch(gemm_a16w32)
 
     flops = 2.0 * M * N * K
     # The bytes of x and of the weight that the kernel reads, and of y.
-    weight = rot_bufs[0][read]
+    weight = rot_bufs[0][read[0]]
     mem_read = (M * K) * rot_bufs[0]["x"].element_size()
     mem_read += weight.numel() * weight.element_size()
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
+    return launch, rot_bufs, flops, mem
 
-    ms = bencher.bench(gemm_a16w32)
 
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        return flops / ms * 1e-9
-    elif metric == "bandwidth":
-        return mem / (ms * 1e-3) * 1e-9
-    else:
-        raise ValueError("Unknown metric: " + metric)
+def bench_gemm_fn(
+    bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str, w_split: bool
+):
+    config, _ = get_gemm_config("GEMM-A16W32", M, N, K)
+    launch, _, flops, mem = make_bench_case(
+        bencher, M, N, K, w_split, config["kernel_type"]
+    )
+    ms = bencher.bench(functools.partial(launch, None))
+    return metric_value(metric, ms, flops, mem)
 
 
 def model_benchmark_shapes(args):

@@ -1,12 +1,12 @@
 import functools
 import math
 import sys
-from collections.abc import Callable
 
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -16,9 +16,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
     print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
@@ -29,21 +31,25 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
 )
 
 # generate_gemm_a8w8_inputs returns (x, weight, weight_shuffled, x_scale, w_scale,
-# bias, y); the kernels take the (possibly shuffled) weight as `w`, and the plain
-# `weight` return value is unused here.
-_OUT_VALS_KEYS = ["x", "_", "w", "x_scale", "w_scale", "bias", "y"]
+# bias, y); the kernels take the (possibly shuffled) weight as `w`. The plain
+# `weight` is unused, and the bias too: most production linears have no bias.
+_OUT_VALS_KEYS = ["x", "_", "w", "x_scale", "w_scale", "_", "y"]
 
 
-def bench_gemm_fn(
+def make_bench_case(
     bencher: RotatingBufferBench,
     M: int,
     N: int,
     K: int,
-    metric: str,
     layout: str,
     shuffle: bool,
-    impl: Callable,
+    backend: str,
 ):
+    """(launch, rot_bufs, flops, mem) of one shape, without bias.
+
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
     _p_gen = functools.partial(
@@ -70,23 +76,35 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    kernel_fn = functools.partial(impl, dtype=c_dtype)
-    ms = bencher.bench(kernel_fn)
+    impl = gemm_a8w8_preshuffle if shuffle else triton_gemm_a8w8
+    launch = config_launch(
+        functools.partial(impl, dtype=c_dtype, backend=backend),
+        (
+            (lambda config: compute_splitk_params(config, K))
+            if backend == "triton"
+            else None
+        ),
+    )
 
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    return launch, rot_bufs, flops, mem
 
 
-def run_model_benchmark(args, impl):
+def bench_gemm_fn(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    shuffle: bool,
+    backend: str,
+):
+    launch, _, flops, mem = make_bench_case(bencher, M, N, K, layout, shuffle, backend)
+    ms = bencher.bench(functools.partial(launch, None))
+    return metric_value(metric, ms, flops, mem)
+
+
+def run_model_benchmark(args, backend):
     """
     Runs benchmark given a --model argument.
     """
@@ -132,13 +150,13 @@ def run_model_benchmark(args, impl):
             metric,
             args.layout,
             args.shuffle,
-            impl,
+            backend,
         )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args, impl):
+def run_shape_benchmark(args, backend):
     """
     Runs a benchmark with given tensor shapes.
     """
@@ -160,7 +178,7 @@ def run_shape_benchmark(args, impl):
             metric,
             args.layout,
             args.shuffle,
-            impl,
+            backend,
         )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -171,12 +189,6 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     backend = "gluon" if args.gluon else "triton"
-    if args.shuffle:
-        impl = functools.partial(gemm_a8w8_preshuffle, backend=backend)
-    elif args.gluon:
-        impl = functools.partial(triton_gemm_a8w8, backend="gluon")
-    else:
-        impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -184,7 +196,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args, impl)
+        run_model_benchmark(args, backend)
     else:
         unsupported_args = [
             "fc1",
@@ -196,7 +208,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args, impl)
+        run_shape_benchmark(args, backend)
 
 
 def parse_args():

@@ -57,7 +57,10 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 17. Add a benchmark: `op_tests/op_benchmarks/triton/bench_<op>.py`.
     Benchmarks obey the
     [device and dtype rules](../../../op_tests/triton_tests/README.md#device-and-dtype)
-    of the tests.
+    of the tests. A GEMM benchmark that the tuning scripts use has a
+    `make_bench_case` that takes a config (see `bench_gemm_a16w16.py`). The
+    tuner times configs only through it, so do not add a second timer or
+    launch for the tuner.
 
 ### Comments and docs
 
