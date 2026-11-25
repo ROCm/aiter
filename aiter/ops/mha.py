@@ -3476,16 +3476,16 @@ def _flash_attn_varlen_forward(
         return ret
 
     def is_fmha_v3_thd_bf16_hd256():
-        # gfx950 BF16 hd256 THD rows (whole documents, one cu_seqlens for Q and K), which take
-        # GQA. Mirrors is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu: the check is on the
-        # cu_seqlens pointer, so pass the same tensor for Q and K to reach these rows.
+        # gfx950 BF16 hd256 THD rows, which take GQA: varlen self-attention where every document
+        # has the same length for Q and K. The kernels take K/V offsets from cu_seqlens_q, so
+        # cu_seqlens_k must equal it; only host-visible conditions are checked here, to avoid a
+        # sync. Mirrors is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu.
         return (
             get_gfx() == "gfx950"
             and q.dtype == dtypes.bf16
             and hdim_q == 256
             and hdim_v == 256
             and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
-            and cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
             and cu_seqlens_q_padded is None
             and cu_seqlens_k_padded is None
             and block_table is None

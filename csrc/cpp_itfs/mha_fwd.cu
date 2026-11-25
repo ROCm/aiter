@@ -22,7 +22,7 @@ enum class FmhaFwdV3Mode : int
 {
     Batch = 0, // fixed seqlen_q / seqlen_k for every batch
     Group = 1, // varlen: per-batch seqstart_q / seqstart_k, optionally padded
-    Thd   = 2, // varlen whole documents: one cu_seqlens for Q and K, no padding
+    Thd   = 2, // varlen self-attention: equal per-document Q and K lengths, no padding
 };
 
 int get_cfg_mask_type(const mha_fwd_args& a)
@@ -94,9 +94,11 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
     return co_name;
 }
 
-// gfx950 BF16 hd256 THD rows: whole documents concatenated along the token axis, one cu_seqlens
-// for Q and K (the fmha_v4 THD objects). The check is on pointers only, so it never synchronizes:
-// Q and K must share the seqstart array, carry no padding, and have the same token count.
+// gfx950 BF16 hd256 THD rows (the fmha_v4 THD objects): varlen self-attention, every document
+// has the same length for Q and K. The objects read only ptr_qseq and take each document's K/V
+// rows from Q's offsets, so cu_seqlens_k must equal cu_seqlens_q. That is the caller's contract,
+// as the rest of cu_seqlens' contents are: checking it here would synchronize every launch. What
+// is checked is host-visible: no padding and the same token count for Q and K.
 // AITER_FMHA_V3_FWD_THD=0 keeps these calls on the hd256 group rows (MHA only).
 bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
 {
@@ -105,7 +107,7 @@ bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
         return false;
     if(const char* env = std::getenv("AITER_FMHA_V3_FWD_THD"); env && std::strcmp(env, "0") == 0)
         return false;
-    if(a.seqstart_q_ptr == nullptr || a.seqstart_q_ptr != a.seqstart_k_ptr)
+    if(a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr)
         return false;
     if(a.cu_seqlen_q_ptr || a.cu_seqlen_k_ptr || a.seqlen_q_ptr || a.seqlen_k_ptr)
         return false;
