@@ -26,7 +26,7 @@ from flydsl.expr.typing import BFloat16, Float32, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.fused_qknorm_idxr_nvfp4_insert import (
+from aiter.ops.flydsl.kernels.qkv_front_common import (
     BLK,
     F448,
     F448N,

@@ -2,8 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import os
-
 import torch
 from torch import Tensor
 
@@ -22,14 +20,6 @@ _FP8_E4M3_DTYPES = tuple(
     if dt is not None
 )
 
-
-# NVFP4 insert (gfx950, M3 TP4 head set): the FlyDSL kernel instead of the HIP one, same bytes.
-# AITER_FUSED_QKNORM_NVFP4_FLYDSL=0 keeps the HIP kernel.
-_NVFP4_INSERT_FLYDSL = os.environ.get("AITER_FUSED_QKNORM_NVFP4_FLYDSL", "1") != "0"
-# Prefill-sized calls only: the FlyDSL kernel merges a V octet by read-modify-write of one run of
-# consecutive slots (the HIP kernel uses atomics), so it is kept off the small decode-like calls
-# (scattered slots, several tokens of different requests in one octet) the HIP kernel documents.
-_NVFP4_INSERT_FLYDSL_MIN_TOKENS = 1024
 
 # Targets with opus::fp32_to_fp8 (opus.hpp).
 _FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
@@ -295,68 +285,6 @@ def fused_qknorm_idxrqknorm(
         else:
             assert k_scale is None
             assert v_scale is None
-
-    if (
-        _NVFP4_INSERT_FLYDSL
-        and kv_cache_dtype == "nvfp4"
-        and index_cache_dtype == "nvfp4"
-        and not skip_index_branch
-        and not asm_layout
-        and qkv.shape[0] >= _NVFP4_INSERT_FLYDSL_MIN_TOKENS
-    ):
-        if index_slot_mapping is None:
-            index_slot_mapping = slot_mapping
-        from .flydsl.kernels.fused_qknorm_idxr_nvfp4_insert import (
-            fused_qknorm_idxr_nvfp4_insert,
-            nvfp4_insert_blocker,
-        )
-
-        if (
-            nvfp4_insert_blocker(
-                qkv,
-                q_norm_weight,
-                k_norm_weight,
-                cos_sin_cache,
-                positions,
-                num_heads,
-                num_kv_heads,
-                rotary_dim,
-                eps,
-                index_q_norm_weight,
-                index_k_norm_weight,
-                num_index_heads,
-                slot_mapping,
-                kv_cache_k,
-                kv_cache_v,
-                index_cache,
-                block_size,
-                q_out,
-                index_q_out,
-                index_slot_mapping,
-                k_scale,
-                v_scale,
-            )
-            is None
-        ):
-            fused_qknorm_idxr_nvfp4_insert(
-                qkv,
-                q_norm_weight,
-                k_norm_weight,
-                cos_sin_cache,
-                positions,
-                eps,
-                index_q_norm_weight,
-                index_k_norm_weight,
-                slot_mapping,
-                kv_cache_k,
-                index_cache,
-                q_out,
-                index_q_out,
-                index_slot_mapping,
-                k_scale,
-                v_scale,
-            )
-            return
 
     _fused_qknorm_idxrqknorm_hip(
         qkv,

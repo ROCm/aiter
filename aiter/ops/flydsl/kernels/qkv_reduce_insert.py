@@ -6,11 +6,11 @@
 
 One launch in place of a split-K reduce and the standalone ``fused_qknorm_idxrqknorm`` insert: the QKV GEMM's three fp32
 K-third slabs ``[3, n, 2560]`` (``mxfp8_gemm_decode_splitk``) are summed in order (0 + s0 + s1 + s2), rounded to bf16 as a
-reduce store would, and fed to the norm / RoPE / NVFP4-insert arithmetic of ``fused_qknorm_idxr_nvfp4_insert`` unchanged;
+reduce store would, and fed to the norm / RoPE / NVFP4-insert arithmetic of the unfused ``fused_qknorm_idxrqknorm`` (HIP norm / RoPE + NVFP4 insert) unchanged;
 the bf16 QKV intermediate is never written.
 
 A norm / RoPE wave covers one slot (q / k / index-k / index-q head) of two tokens, 32 lanes of 4 dims per token (the
-lane map of ``fused_qknorm_idxr_nvfp4_insert``). V has workgroups of its own, 8 tokens each, ahead of the norm workgroups:
+lane map of the HIP norm / RoPE kernel). V has workgroups of its own, 8 tokens each, ahead of the norm workgroups:
 the rows of the 8 tokens and of the next 8 (halo, loaded only when a run can reach it) are summed, rounded and quantized
 once into LDS, and the first token of every octet run packs the run's codes and scales from LDS after one CTA barrier.
 """
@@ -25,7 +25,8 @@ from flydsl.expr.typing import BFloat16, Float32, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.fused_qknorm_idxr_nvfp4_insert import (
+from aiter.ops.flydsl.kernels.qkv_chain_cooperative import _lds_ptr
+from aiter.ops.flydsl.kernels.qkv_front_common import (
     BLK,
     F448,
     F448N,
@@ -45,7 +46,6 @@ from aiter.ops.flydsl.kernels.fused_qknorm_idxr_nvfp4_insert import (
     _xor_lane,
     _xsum,
 )
-from aiter.ops.flydsl.kernels.qkv_chain_cooperative import _lds_ptr
 
 NW = 4  # slots (waves) per workgroup
 SK = 3  # default number of K-part slabs (``ks`` of compile_qkv_reduce_insert)
