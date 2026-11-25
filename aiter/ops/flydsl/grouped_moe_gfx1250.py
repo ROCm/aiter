@@ -273,6 +273,19 @@ def _tp_route_quant_enabled() -> bool:
     return os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1") in ("1", "true", "True")
 
 
+def _tp_route_lite(
+    token_num: int, topk: int, experts: int, align: int, tile_m: int
+) -> int:
+    """Token bound (8 or 16) of the tp_gather GEMM1's wave-level route for a
+    decode batch of ``token_num`` tokens, 0 for the derived route: at most 16
+    tokens, top-4 of at most 256 experts, expert alignment and tile_m 16."""
+    if token_num > 16 or topk != 4 or experts > 256:
+        return 0
+    if align != 16 or tile_m != 16:
+        return 0
+    return 8 if token_num <= 8 else 16
+
+
 # The smallest decode batch whose GEMM1 gathers the router's rows: from here
 # up they replace the TP route token-multidest (T >= 64) or route-ksplit A1
 # launch, whose rows are the same MXFP4 bytes. The upper bound is the fused
@@ -1052,6 +1065,8 @@ def _grouped_a8w4_tdm_moe(
     persistent_workers2=0,
     k_waves1=1,
     k_waves2=1,
+    tile_order1=0,
+    tile_order2=0,
     tiles_configured=False,
     data_format="a8w4",
     expert_mask=None,
@@ -1637,7 +1652,7 @@ def _grouped_a8w4_tdm_moe(
         and _is_fp4
         and int(topk) == 4
         and mxfp8_copy_out is None
-        and int(k_waves1) == 1
+        and model_dim % (int(tile_k) * int(k_waves1)) == 0
         and not tdm_as_in_prologue
         and not _row_major_ascale
         and (int(tile_m) <= 32 or int(num_buffers) <= 2)
@@ -1744,8 +1759,14 @@ def _grouped_a8w4_tdm_moe(
             "masked_m": _masked_m,
             "align": int(_align_m),
         }
+        _lite = _tp_route_lite(
+            int(token_num), int(topk), int(E), int(_align_m), int(tile_m)
+        )
+        if _lite and _fold is None:
+            _tp_gather["lite"] = _lite
         a1_payload = _tp_rows.xq
         a1_scale = _tp_rows.xs
+        _p1_kw1 = {"tile_order": int(tile_order1)}
     elif _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
@@ -1894,7 +1915,7 @@ def _grouped_a8w4_tdm_moe(
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
             **_fold_kw1,
-            **({"tp_gather": _tp_gather} if _tp_gather is not None else {}),
+            **({"tp_gather": _tp_gather, **_p1_kw1} if _tp_gather is not None else {}),
         )
     else:
         # Raw GEMM1 writes both gate/up columns when activation moves to quant.
@@ -1989,6 +2010,15 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
+        **(
+            {"tile_order": 1}
+            if int(tile_order2)
+            and not _fold_kw2
+            and int(persistent_workers2) == 0
+            and int(cluster_m2) in (-1, 1)
+            and int(cluster_n2 if cluster_n2 is not None else -1) in (-1, 1)
+            else {}
+        ),
         **_ep_gemm2_kwargs,
         **_fold_kw2,
     )
@@ -2498,6 +2528,10 @@ def grouped_gemm_gfx1250_a8w4(
             # 0) means unset, i.e. no split.
             _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
             _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
+            # m-major tile ids (XCD-balanced, same bytes) for GEMM1 / GEMM2.
+            # Blank / absent / 0: the production schedule.
+            _tdm_kw["tile_order1"] = max(0, _as_int(cfg_row.get("tile_order1"), 0) or 0)
+            _tdm_kw["tile_order2"] = max(0, _as_int(cfg_row.get("tile_order2"), 0) or 0)
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)

@@ -115,8 +115,9 @@ def _tp_gather_args(tp_gather, block_threads: int):
 
     ``tp_gather``: ``{"topk_ids": int32 [T, 4], "topids_to_rows": int32 [T, 4]
     (written), "masked_m": int32 [E] (written), "align": expert row alignment,
-    "row_to_route": optional int32 [contiguous_m] (written)}``. ``psum`` is
-    written to the GEMM's tile-map argument.
+    "row_to_route": optional int32 [contiguous_m] (written), "lite": optional
+    token bound (<= 16) for the wave-level route}``. ``psum`` is written to the
+    GEMM's tile-map argument.
     """
     if tp_gather is None:
         null = _opt_ptr_arg(None)
@@ -202,6 +203,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     k_waves=1,
     shared_fold: SharedFoldTiles | None = None,
     tp_gather: dict | None = None,
+    tile_order=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -216,7 +218,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     ``tp_gather`` (stage 1 only): ``a`` / ``a_scales`` are token-major MXFP4
     rows and their E8M0 rows, no route/quant launch ran, and the GEMM derives
     the TP route itself (``_tp_gather_args``); it runs unclustered and
-    non-persistent.
+    non-persistent. ``k_waves`` > 1 splits its K over wave groups inside the
+    workgroup (K partials summed in group order: not bit-exact).
+
+    ``tile_order`` 1 (plain grid, no cluster / persistent workers): m-major
+    tile ids, so a decode step's populated tiles spread evenly over the XCDs.
+    Same tile bodies, same bytes.
     """
     if shared_fold is not None:
         return _grouped_gemm_shared_fold(
@@ -428,33 +435,41 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
         k_waves,
-    )
+    ) + ((int(tile_order),) if tile_order else ())
+    if tile_order and (cluster_n > 1 or cluster_m > 1 or persistent_workers):
+        raise ValueError("tile_order 1 needs the plain one-tile-per-workgroup grid")
     if tp_gather is not None:
         from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm_tpg
 
-        if tdm_spec[2] or tdm_spec[4] or k_waves != 1 or out_is_f16 or bias is not None:
+        if tdm_spec[2] or tdm_spec[4] or out_is_f16 or bias is not None:
             raise ValueError(
-                "tp_gather: no next-stage prefetch, As prologue, k_waves, f16 out or bias"
+                "tp_gather: no next-stage prefetch, As prologue, f16 out or bias"
             )
         if not stage1_quant_out or quant_scale is None:
             raise ValueError("tp_gather is the quantized stage-1 GEMM")
-        tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * 32)
+        tp_spec, tp_ptrs = _tp_gather_args(tp_gather, m_warp * n_warp * k_waves * 32)
+        split_spec = (k_waves, int(tile_order))
         tpg_spec = (
-            K,
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            num_buffers,
-            n_experts,
-            stage1_act,
-            quant_wmma_rep,
-            tdm_spec[3],
-            tdm_spec[5],
-            int(lds_soa_load_interleave),
-            rolled_drain,
-        ) + tp_spec[1:]
+            (
+                K,
+                tile_m,
+                tile_n,
+                tile_k,
+                m_warp,
+                n_warp,
+                num_buffers,
+                n_experts,
+                stage1_act,
+                quant_wmma_rep,
+                tdm_spec[3],
+                tdm_spec[5],
+                int(lds_soa_load_interleave),
+                rolled_drain,
+            )
+            + tp_spec[1:]
+            + split_spec
+        )
+        lite = int(tp_gather.get("lite", 0) or 0)
         _run_compiled(
             launch_gemm_a8w4_tdm_tpg,
             ptr_arg(out, out_dtype),
@@ -486,7 +501,9 @@ def flydsl_grouped_gemm_a8w4_masked(
             float(situ_linear_beta),
             *tp_spec[1:],
             *tp_ptrs,
-            specialization_key=("tpg", tpg_spec),
+            *split_spec,
+            lite,
+            specialization_key=("tpg", tpg_spec) + ((lite,) if lite else ()),
         )
         return out
     _run_compiled(
