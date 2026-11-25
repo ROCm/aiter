@@ -22,6 +22,8 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
         --expect-large-m --compare-main --bs-list 1,64,513,8192 --accuracy-max-bs 8192
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes
+    # MiniMax-M3.1 EP4 with its SwiGLU-OAI activation, staged route:
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --network m31 --bs-list 104,128
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
@@ -108,6 +110,16 @@ NETWORKS = {
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
     },
+    # MiniMax-M3.1 EP4 layout and activation: SwiGLU-OAI (alpha 1.702, up + 1)
+    # clamped at the checkpoint's swiglu_limit of 7.
+    "m31": {
+        "model_dim": 6144,
+        "inter_dim": 3072,
+        "experts": 128,
+        "topk": 4,
+        "swiglu_limit": 7.0,
+        "act": "swigluoai",
+    },
 }
 
 
@@ -155,6 +167,15 @@ def _rel_l2(output, reference):
     if not reference_sq.item():
         return -1.0
     return float(torch.sqrt(error_sq / reference_sq))
+
+
+def _mxfp8_round(v):
+    """Round-trip through MXFP8: 1x32 blocks, E8M0 scale rounded up, E4M3 values."""
+    blocks = v.float().reshape(*v.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
+    return q.reshape(v.shape)
 
 
 def _all_ranks(flag, device):
@@ -362,7 +383,10 @@ def _reference(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    quantize=False,
 ):
+    """fp32 MoE output; ``quantize`` emulates the a8w4 op's MXFP8 rounding of
+    the input and of the GEMM1 activation output."""
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
     ids_all, _ = _all_gather_variable(ids, token_counts)
@@ -384,6 +408,8 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
+        if quantize:
+            inp = _mxfp8_round(inp)
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
         if act == "situv2":
@@ -392,6 +418,10 @@ def _reference(
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             hidden = gate * up
+        elif act == "swigluoai":
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+            hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1)
         else:
             # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
             # unconditionally turns up into zeros at the operator's own default of
@@ -400,6 +430,8 @@ def _reference(
                 gate = gate.clamp(max=swiglu_limit)
                 up = up.clamp(-swiglu_limit, swiglu_limit)
             hidden = F.silu(gate) * up
+        if quantize:
+            hidden = _mxfp8_round(hidden)
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -408,7 +440,7 @@ def _reference(
     return partial[start : start + x.shape[0]]
 
 
-def _moe_reference(moe, x, route_weights, ids, ref_weights):
+def _moe_reference(moe, x, route_weights, ids, ref_weights, quantize=False):
     """_reference() for the layout and activation of ``moe``."""
     return _reference(
         x,
@@ -424,6 +456,7 @@ def _moe_reference(moe, x, route_weights, ids, ref_weights):
         moe.act,
         moe.situ_beta,
         moe.situ_linear_beta,
+        quantize,
     )
 
 

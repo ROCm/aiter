@@ -8,7 +8,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
+from ..act import sigmoid_f32, situ_mul, swiglu_mul_batch, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
 from ..kernels_common import LOG2E
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
@@ -860,7 +860,8 @@ class SiluQuantEpilogue:
         self._act = act
         self._situ_beta = float(situ_beta)
         self._situ_linear_beta = float(situ_linear_beta)
-        assert act in ("silu", "situv2"), f"unsupported mega_moe act {act!r}"
+        assert act in ("silu", "situv2", "swigluoai"), f"unsupported mega_moe act {act!r}"
+        assert act != "swigluoai" or self._swiglu_limit > 0, "swigluoai requires a positive swiglu_limit"
         if act == "situv2":
             assert self._situ_beta > 0.0 and self._situ_linear_beta > 0.0, \
                 "situv2 requires positive beta / linear_beta"
@@ -925,6 +926,14 @@ class SiluQuantEpilogue:
                 situ_mul(gv[i], uv[i], b, br, lb, lbr, tanh=tanh_via_sigmoid_f32)
                 for i in range_constexpr(4)
             ]
+            return Vec.from_elements(elems, fx.Float32)
+        if const_expr(self._act == "swigluoai"):
+            # SwiGLU-OAI: min(g, limit) * sigmoid(1.702 * min(g, limit)) * (clamp(u, +-limit) + 1).
+            elems = swiglu_mul_batch(
+                [gv[i] for i in range_constexpr(4)],
+                [uv[i] for i in range_constexpr(4)],
+                fx.Float32(-self._swiglu_limit),
+            )
             return Vec.from_elements(elems, fx.Float32)
         if self._swiglu_limit <= 0:
             elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
