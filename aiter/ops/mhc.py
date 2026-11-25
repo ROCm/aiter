@@ -460,7 +460,7 @@ def _mhc_fused_prefill_config_gfx950_256(m, hidden_size):
 # runs post + pre with regular stores in mhc_post. mhc_post on its own switches to
 # non-temporal stores above 8 * cu_num rows; mhc_pre reads that residual back at
 # once, and up to this row count it reads it faster after regular stores on both
-# MI350X and MI355X (at least 1.03x for hidden sizes 4096, 5120 and 7168). Above it
+# MI350X and MI355X (1.02x to 1.13x for hidden sizes 4096, 5120 and 7168). Above it
 # the two devices disagree and MI355X no longer gains. The results are the same bits.
 MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 8192
 
