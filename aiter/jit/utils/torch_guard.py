@@ -101,6 +101,11 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    # Host queries of the RDNA attention tables: no tensors, an int list back
+    "rdna_decode_configs",
+    "rdna_decode_batch_configs",
+    "rdna_prefill_configs",
+    "rdna_prefill_batch_configs",
     "init_custom_qr",
     "qr_max_size",
     "qr_destroy",

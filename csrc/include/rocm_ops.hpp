@@ -1657,6 +1657,67 @@ namespace py = pybind11;
           py::arg("window_size_left") = -1,           \
           py::arg("sink")             = std::nullopt);
 
+#define RDNA_ATTN_PYBIND                                                          \
+    m.def("rdna_decode_configs", &rdna_decode_configs, py::arg("device_id"));     \
+    m.def("rdna_decode_batch_configs",                                            \
+          &rdna_decode_batch_configs,                                             \
+          py::arg("device_id"));                                                  \
+    m.def("rdna_decode_attn",                                                     \
+          &rdna_decode_attn,                                                      \
+          py::arg("q"),                                                           \
+          py::arg("kv_cache"),                                                    \
+          py::arg("block_table"),                                                 \
+          py::arg("out"),                                                         \
+          py::arg("acc"),                                                         \
+          py::arg("m"),                                                           \
+          py::arg("l"),                                                           \
+          py::arg("cnt"),                                                         \
+          py::arg("seq_lens"),                                                    \
+          py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
+          py::arg("scale"),                                                       \
+          py::arg("mm_ranges") = std::nullopt,                                    \
+          py::arg("batched")   = false);                                          \
+    m.def("rdna_prefill_configs", &rdna_prefill_configs, py::arg("device_id"));   \
+    m.def("rdna_prefill_batch_configs",                                           \
+          &rdna_prefill_batch_configs,                                            \
+          py::arg("device_id"));                                                  \
+    m.def("rdna_prefill_attn",                                                    \
+          &rdna_prefill_attn,                                                     \
+          py::arg("q"),                                                           \
+          py::arg("kv_cache"),                                                    \
+          py::arg("block_table"),                                                 \
+          py::arg("out"),                                                         \
+          py::arg("partial_o"),                                                   \
+          py::arg("partial_ml"),                                                  \
+          py::arg("counters"),                                                    \
+          py::arg("seq_lens"),                                                    \
+          py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
+          py::arg("max_seq_len"),                                                 \
+          py::arg("scale"),                                                       \
+          py::arg("mm_ranges")       = std::nullopt,                              \
+          py::arg("plan")            = std::nullopt,                              \
+          py::arg("query_start_loc") = std::nullopt,                              \
+          py::arg("head_group")      = 0);                                        \
+    m.def("rdna_encoder_attn",                                                    \
+          &rdna_encoder_attn,                                                     \
+          py::arg("q"),                                                           \
+          py::arg("k"),                                                           \
+          py::arg("v"),                                                           \
+          py::arg("out"),                                                         \
+          py::arg("partial_o"),                                                   \
+          py::arg("partial_ml"),                                                  \
+          py::arg("counters"),                                                    \
+          py::arg("seq_lens"),                                                    \
+          py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
+          py::arg("max_seq_len"),                                                 \
+          py::arg("scale"),                                                       \
+          py::arg("plan")            = std::nullopt,                              \
+          py::arg("query_start_loc") = std::nullopt,                              \
+          py::arg("head_group")      = 0);
+
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
           &layernorm2d,                            \

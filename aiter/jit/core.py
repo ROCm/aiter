@@ -1465,6 +1465,77 @@ def _cluster_launch_target(detect_gfx) -> bool:
     return _targets_gfx1250(detect_gfx)
 
 
+def default_hip_flags(torch_exclude=False):
+    """The HIP flags every module is built with, before its own
+    (flags_extra_hip) and without the ones it leaves out (flags_hip_exclude).
+    Also for tools that build a module's kernels on their own and must match
+    its code generation."""
+    flags_hip = [
+        "-DLEGACY_HIPBLAS_DIRECT",
+        "-DUSE_PROF_API=1",
+        "-D__HIP_PLATFORM_HCC__=1",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "-U__HIP_NO_HALF_CONVERSIONS__",
+        "-U__HIP_NO_HALF_OPERATORS__",
+        # "-v --save-temps",
+        "-Wno-unused-result",
+        "-Wno-switch-bool",
+        "-Wno-vla-cxx-extension",
+        "-Wno-undefined-func-template",
+        "-Wno-macro-redefined",
+        "-Wno-missing-template-arg-list-after-template-kw",
+        "-fgpu-flush-denormals-to-zero",
+        f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
+    ]
+    if not AITER_DISABLE_KERNARG_PRELOAD:
+        flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
+
+    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+    hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+    if hip_version <= Version("6.3.42132"):
+        flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
+    if hip_version > Version("5.5.00000"):
+        flags_hip += ["-mllvm --lsr-drop-solution=1"]
+    if hip_version > Version("5.7.23302"):
+        flags_hip += ["-fno-offload-uniform-block"]
+    if hip_version > Version("6.1.40090"):
+        flags_hip += ["-mllvm -enable-post-misched=0"]
+    if hip_version > Version("6.2.41132"):
+        flags_hip += [
+            "-mllvm -amdgpu-early-inline-all=true",
+            "-mllvm -amdgpu-function-calls=false",
+        ]
+    if hip_version > Version("6.2.41133"):
+        flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+    # Starting with ROCm 10.1 (HIP 7.16), LLVM won't inline across differing target features,
+    # as in CK-tile's target("no-packed-fp32-ops") kentry. This flag restores the inlining.
+    if hip_version >= Version("7.16"):
+        flags_hip += ["-mllvm -ignore-tti-inline-compatible=true"]
+    if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+        flags_hip += ["-D__Float4_e2m1fn_x2"]
+    # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
+    # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
+    # this machine has -- so the arch test must accept a cross-compile for
+    # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
+    # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
+    # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+    # path was compiled out (AiterAsmKernelFast then rejects them at launch).
+    if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
+        flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+    # CK's CMakeLists forces the unified ck_tile framework off for any build that
+    # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
+    # It has to be a whole-TU define so the host and device passes agree.
+    if _targets_gfx1250(get_gfx):
+        flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
+
+    if not torch_exclude:
+        import torch
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+    return flags_hip
+
+
 def build_module(
     md_name,
     srcs,
@@ -1480,6 +1551,7 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
+    flags_hip_exclude=None,
     build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
@@ -1525,69 +1597,7 @@ def build_module(
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
         flags_cc = ["-O3", "-std=c++20", "-Wno-unknown-warning-option"]
-        flags_hip = [
-            "-DLEGACY_HIPBLAS_DIRECT",
-            "-DUSE_PROF_API=1",
-            "-D__HIP_PLATFORM_HCC__=1",
-            "-D__HIP_PLATFORM_AMD__=1",
-            "-U__HIP_NO_HALF_CONVERSIONS__",
-            "-U__HIP_NO_HALF_OPERATORS__",
-            # "-v --save-temps",
-            "-Wno-unused-result",
-            "-Wno-switch-bool",
-            "-Wno-vla-cxx-extension",
-            "-Wno-undefined-func-template",
-            "-Wno-macro-redefined",
-            "-Wno-missing-template-arg-list-after-template-kw",
-            "-fgpu-flush-denormals-to-zero",
-            f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
-        ]
-        if not AITER_DISABLE_KERNARG_PRELOAD:
-            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
-
-        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-        hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
-        if hip_version <= Version("6.3.42132"):
-            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
-        if hip_version > Version("5.5.00000"):
-            flags_hip += ["-mllvm --lsr-drop-solution=1"]
-        if hip_version > Version("5.7.23302"):
-            flags_hip += ["-fno-offload-uniform-block"]
-        if hip_version > Version("6.1.40090"):
-            flags_hip += ["-mllvm -enable-post-misched=0"]
-        if hip_version > Version("6.2.41132"):
-            flags_hip += [
-                "-mllvm -amdgpu-early-inline-all=true",
-                "-mllvm -amdgpu-function-calls=false",
-            ]
-        if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-        # Starting with ROCm 10.1 (HIP 7.16), LLVM won't inline across differing target features,
-        # as in CK-tile's target("no-packed-fp32-ops") kentry. This flag restores the inlining.
-        if hip_version >= Version("7.16"):
-            flags_hip += ["-mllvm -ignore-tti-inline-compatible=true"]
-        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
-            flags_hip += ["-D__Float4_e2m1fn_x2"]
-        # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
-        # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
-        # this machine has -- so the arch test must accept a cross-compile for
-        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
-        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
-        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
-        # path was compiled out (AiterAsmKernelFast then rejects them at launch).
-        if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
-            flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
-        # CK's CMakeLists forces the unified ck_tile framework off for any build that
-        # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
-        # It has to be a whole-TU define so the host and device passes agree.
-        if _targets_gfx1250(get_gfx):
-            flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
-
-        if not torch_exclude:
-            import torch
-
-            if hasattr(torch, "float4_e2m1fn_x2"):
-                flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+        flags_hip = default_hip_flags(torch_exclude)
 
         enable_ck = int(os.environ.get("ENABLE_CK", "1"))
         if not any("ENABLE_CK" in f for f in flags_extra_cc):
@@ -1630,6 +1640,9 @@ def build_module(
                 archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
+        if flags_hip_exclude:
+            # Default HIP flags the module opts out of.
+            flags_hip = [el for el in flags_hip if el not in flags_hip_exclude]
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
@@ -1887,6 +1900,10 @@ def get_args_of_build(ops_name: str, exclude=None):
         # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
         # leaving dispatcher / pybind TUs untouched.
         "flags_extra_hip_per_source": {},
+        # Optional default HIP flags (the ones build_module adds to every
+        # module) to leave out, each spelled as build_module adds it, e.g.
+        # "-mllvm --lsr-drop-solution=1". For kernels tuned without them.
+        "flags_hip_exclude": [],
     }
 
     def convert(d_ops: dict):
@@ -2031,6 +2048,7 @@ def build_ctypes_module(md_name: str) -> str:
             d_args["torch_exclude"],
             d_args.get("third_party", []),
             flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+            flags_hip_exclude=d_args.get("flags_hip_exclude", []),
         )
     return so_path
 
@@ -2459,6 +2477,7 @@ def compile_ops(
                         third_party,
                         hipify,
                         flags_extra_hip_per_source=flags_extra_hip_per_source,
+                        flags_hip_exclude=d_args.get("flags_hip_exclude", []),
                     )
 
                     if hip_clang_path is not None:
