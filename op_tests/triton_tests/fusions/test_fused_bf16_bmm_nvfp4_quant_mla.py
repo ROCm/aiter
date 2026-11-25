@@ -168,6 +168,12 @@ def test_rejects_bad_inputs():
     raw = torch.empty(aux.numel() + 1, dtype=torch.uint8, device="cuda")
     with pytest.raises(AssertionError):
         fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, raw[1:].view(aux.shape))
+    # Off q_nope's device.
+    with pytest.raises(AssertionError, match="one GPU"):
+        fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux.cpu())
+    if torch.cuda.device_count() > 1:
+        with pytest.raises(AssertionError, match="one GPU"):
+            fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk.to("cuda:1"), codes, aux)
 
 
 def test_codes_saturate_past_the_scale_range():

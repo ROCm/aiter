@@ -98,6 +98,9 @@ def fused_bf16_bmm_nvfp4_quant_mla(
         and q_nope_fp4.dtype == torch.uint8
     )
     assert q_aux.shape == (batch, heads, 128) and q_aux.dtype == torch.uint8
+    assert q_nope.is_cuda and all(
+        t.device == q_nope.device for t in (w_uk, q_nope_fp4, q_aux)
+    ), "q_nope, w_uk, q_nope_fp4 and q_aux must be on one GPU"
     assert q_nope_fp4.is_contiguous() and q_aux.is_contiguous()
     # The TDM stores need 16-byte bases; a contiguous view can start anywhere.
     assert (
