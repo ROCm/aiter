@@ -224,12 +224,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     shape(positions, "positions", {b});
     tensor(cos, "cos", AITER_DTYPE_bf16, dev, 16, false);
     tensor(sin, "sin", AITER_DTYPE_bf16, dev, 16, false);
-    AITER_CHECK(cos->dim() == 2 && cos->size(0) > 0, "cos must be [N,32], N > 0");
-    shape(cos, "cos", {cos->size(0), 32});
-    shape(sin, "sin", {cos->size(0), 32});
-    AITER_CHECK(cos->stride(0) == 64 && sin->stride(0) == 64 && cos->stride(1) == 1 &&
-                    sin->stride(1) == 1,
-                "cos and sin require 128-byte BF16 rows and contiguous last dimensions");
+    AITER_CHECK(cos->dim() >= 2 && cos->size(0) > 0, "cos needs N > 0 compact rows");
+    for(const auto* table : {cos, sin})
+    {
+        AITER_CHECK(table->dim() >= 2 && table->size(0) == cos->size(0) &&
+                        table->size(table->dim() - 1) == 32,
+                    "cos and sin must be [N,32] with optional singleton middle dimensions");
+        for(int dim = 1; dim < table->dim() - 1; ++dim)
+            AITER_CHECK(table->size(dim) == 1, "cos and sin middle dimensions must be singleton");
+        AITER_CHECK(table->stride(0) == 32 && table->stride(table->dim() - 1) == 1,
+                    "cos and sin require 64-byte BF16 rows and contiguous last dimensions");
+    }
     cache(cn, ca, dev);
     tensor(indptr, "kv_indptr", AITER_DTYPE_i32, dev, 4);
     shape(indptr, "kv_indptr", {b + 1});

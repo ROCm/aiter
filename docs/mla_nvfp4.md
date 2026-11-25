@@ -126,8 +126,9 @@ The cache writer only emits N16 AUX. Its `aux_layout` keyword and native layout
 flag have been removed. Existing calls should omit the keyword, and old N32 AUX
 caches must be rebuilt from original BF16 data. The layouts are incompatible
 despite having the same tensor shape. Q and NoPE layouts are unchanged.
-The ctypes module is `module_mla_nvfp4_v8`. This version adds the fused Q RoPE
-entry and prevents reuse of cached wrappers without that entry. Both decoders
+The ctypes module is `module_mla_nvfp4_v9`. This version accepts compact 64-byte
+RoPE rows and prevents reuse of cached v8 wrappers that require 128-byte rows.
+Both decoders
 load N128-named COs; v6 wrappers use an older N64-named file.
 Older argument lists and wrappers that require an LSE buffer also cannot be
 reused. No manual cache deletion is needed.
@@ -152,7 +153,7 @@ Only the output is written; the operation does not materialize Q AUX or LSE.
 | `q_scale` | uint8 `[B,128,32]`, NoPE E4M3 scale bits; compact or `q_aux[...,64:96]` |
 | `q_rope` | Pre-rotation BF16 `[B,128,64]`; compact or a view into a projection |
 | `positions` | Contiguous GPU int64 `[B]` |
-| `cos`, `sin` | BF16 `[N,32]`, each with element strides `(64,1)` |
+| `cos`, `sin` | BF16 `[N,32]` or `[N,1,...,1,32]`, 32-element row stride and contiguous last dimension |
 
 Q RoPE uses adjacent even/odd pairs (GPT-J), not split halves. It rounds
 `rotate_pairs(q_rope) * sin` to BF16, then computes a BF16 fused multiply-add
@@ -163,7 +164,11 @@ quantization rules. Inputs must be finite for nonempty requests.
 byte strides must be 16-byte aligned; outer strides must be positive and fit
 uint32. The per-wave span (`31 * head_stride_bytes + row_bytes`) must fit uint32,
 where row_bytes is 32 for scales and 128 for Q RoPE. Request-base arithmetic
-uses 64 bits. cos/sin have 16-byte aligned bases and fixed 128-byte rows.
+uses 64 bits. cos/sin have 16-byte aligned bases and fixed 64-byte rows.
+No table repacking or additional table allocation is required. The two tables
+may share storage (for example, the two planes of BF16 `[2,N,32]`).
+Existing `[N,1,1,32]` model caches are accepted directly; singleton dimensions
+require no reshape, squeeze, or framework-specific adaptation.
 The caller guarantees `0 <= positions[i] < N` for every nonempty request.
 Empty requests produce zero without reading Q or the cos/sin rows.
 
@@ -172,7 +177,7 @@ scale buffer directly, without an external Q RoPE quantization dispatch:
 
 ```python
 # q_projection: BF16 [B,128,192], with raw Q RoPE in its last 64 elements.
-# cos_sin_cache: BF16 [N,64], laid out as [cos(32), sin(32)].
+# cos_cache, sin_cache: existing BF16 [N,32] or [N,1,1,32] model tables.
 # q_nope/q_scale: the NoPE producer's gain-6.72 packed output and scale bytes.
 out, _ = aiter.mla_decode_nvfp4_qrope_fwd(
     q_nope=q_nope,
@@ -186,8 +191,8 @@ out, _ = aiter.mla_decode_nvfp4_qrope_fwd(
     kv_last_page_lens=last,
     params=params,
     positions=positions,
-    cos=cos_sin_cache[:, :32],
-    sin=cos_sin_cache[:, 32:],
+    cos=cos_cache,
+    sin=sin_cache,
 )
 ```
 

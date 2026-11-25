@@ -3,12 +3,15 @@
 """gfx1250 Q RoPE/quantization fusion: python -m pytest -q this_file.py."""
 
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
-from test_mla_decode_pagesize64 import (
+from op_tests.test_mla_decode_pagesize64 import (
     _check_nvfp4_page64_case,
     _make_nvfp4_page64_case,
+    _tail_guarded,
 )
 
 import aiter
@@ -25,14 +28,23 @@ def require_gpu():
 def rotate_reference(q, cos, sin, positions):
     """Independent adjacent-pair rotation with BF16 MUL then BF16 FMA."""
     x = q.cpu().double().reshape(*q.shape[:-1], 32, 2)
-    c = cos.cpu()[positions.cpu()].double()[:, None, :, None]
-    s = sin.cpu()[positions.cpu()].double()[:, None, :, None]
+    c = cos.cpu().reshape(-1, 32)[positions.cpu()].double()[:, None, :, None]
+    s = sin.cpu().reshape(-1, 32)[positions.cpu()].double()[:, None, :, None]
     pair = torch.stack((-x[..., 1], x[..., 0]), dim=-1)
     term = (pair * s).to(torch.bfloat16).double()
     return (x * c + term).to(torch.bfloat16).reshape(q.shape).to(q.device)
 
 
-def make_case(lengths, layout="projection", compact_scale=False, identity=False):
+def make_case(
+    lengths,
+    layout="projection",
+    compact_scale=False,
+    identity=False,
+    table_rows=257,
+    positions=None,
+    shared_tables=False,
+    table_singletons=0,
+):
     case = _make_nvfp4_page64_case(lengths, "randn")
     a = case["args"]
     b = len(lengths)
@@ -48,13 +60,21 @@ def make_case(lengths, layout="projection", compact_scale=False, identity=False)
         raw[:, 1, ::2] = -0.0
         raw[:, 2] *= 2**-12
         raw[:, 3] *= 2**12
-    theta = torch.rand((257, 32), device="cuda") * 6.28 - 3.14
-    cs = torch.cat((theta.cos(), theta.sin()), dim=1).to(torch.bfloat16)
-    cos, sin = cs[:, :32], cs[:, 32:]
+    theta = torch.rand((table_rows, 32), device="cuda") * 6.28 - 3.14
+    cos, sin = theta.cos().bfloat16(), theta.sin().bfloat16()
+    if shared_tables:
+        # Aliased planes retain compact 64-byte rows, including under compile.
+        cs = torch.stack((cos, sin))
+        cos, sin = cs[0], cs[1]
+    table_shape = (table_rows, *(1 for _ in range(table_singletons)), 32)
+    cos, sin = cos.view(table_shape), sin.view(table_shape)
     if identity:
         cos.fill_(1)
         sin.zero_()
-    positions = torch.randint(0, cs.shape[0], (b,), dtype=torch.int64, device="cuda")
+    if positions is None:
+        positions = torch.randint(0, table_rows, (b,), dtype=torch.int64, device="cuda")
+    else:
+        positions = torch.tensor(positions, dtype=torch.int64, device="cuda")
     # The separate path uses the existing public quantizer and pure decoder.
     rotated = rotate_reference(raw, cos, sin, positions)
     case["q"][..., 512:] = rotated
@@ -145,6 +165,25 @@ def test_layouts_and_page_tails(layout, compact_scale, identity):
     check(case, args, guard)
 
 
+@pytest.mark.parametrize("table_rows", [1, 2, 17, 257, 163840])
+@pytest.mark.parametrize("shared_tables", [False, True])
+@pytest.mark.parametrize("table_singletons", [0, 1, 2])
+def test_compact_table_boundaries(table_rows, shared_tables, table_singletons):
+    case, args, guard = make_case(
+        [1, 63, 65, 129],
+        table_rows=table_rows,
+        shared_tables=shared_tables,
+        table_singletons=table_singletons,
+        positions=[0, table_rows - 1, table_rows // 2, table_rows - 1],
+    )
+    assert (
+        args["cos"].stride()
+        == args["sin"].stride()
+        == (32,) * (table_singletons + 1) + (1,)
+    )
+    check(case, args, guard)
+
+
 def test_all_partial_page_lengths():
     case, args, guard = make_case(list(range(65)))
     check(case, args, guard)
@@ -173,7 +212,7 @@ def test_empty_batch():
 
 
 def test_stream_graph_compile():
-    case, args, guard = make_case([0, 65, 129])
+    case, args, guard = make_case([0, 65, 129], table_singletons=2)
     expected = check(case, args, guard)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -195,7 +234,7 @@ def test_stream_graph_compile():
     torch.cuda.current_stream().wait_stream(stream)
     assert (args["out"] == 0).all() and torch.isnan(guard[-256:]).all()
     assert (case["guards"][1] == 12345).all()
-    case, args, guard = make_case([65])
+    case, args, guard = make_case([65], shared_tables=True, table_singletons=2)
     expected = check(case, args, guard)
     before = {
         k: args[k].clone() for k in ("q_scale", "q_rope", "cos", "sin", "positions")
@@ -217,8 +256,12 @@ def test_contracts():
         {"q_rope": args["q_rope"].expand(2, -1, -1)},
         {"positions": args["positions"].int()},
         {"positions": args["positions"].cpu()},
-        {"cos": args["cos"].contiguous()},
+        {"cos": torch.empty((257, 64), dtype=torch.bfloat16, device="cuda")[:, :32]},
+        {"sin": torch.empty((257, 64), dtype=torch.bfloat16, device="cuda")[:, :32]},
+        {"cos": args["cos"][:0], "sin": args["sin"][:0]},
         {"sin": args["sin"][:-1]},
+        {"cos": args["cos"].view(257, 2, 16)},
+        {"sin": args["sin"].reshape(-1)},
         {"params": args["params"].float()},
         {"kv_indices": args["kv_indices"].long()},
         {"out": args["out"].float()},
@@ -257,7 +300,84 @@ def test_cache_addresses_above_4gib():
     assert torch.equal(out, expected) and torch.isnan(guard[-256:]).all()
 
 
-if __name__ == "__main__":
-    import sys
+@pytest.mark.skipif(
+    os.getenv("AITER_NVFP4_TEST_LARGE") != "1", reason="large GPU allocation"
+)
+def test_raw_query_and_scale_addresses_above_4gib():
+    case, args, guard = make_case([1, 65, 129])
+    for key, stride, dtype in (
+        ("q_rope", (2**30 + 128, 192, 1), torch.bfloat16),
+        ("q_scale", (2**31 + 128, 128, 1), torch.uint8),
+    ):
+        sparse = torch.empty_strided(
+            args[key].shape, stride, dtype=dtype, device="cuda"
+        )
+        sparse.copy_(args[key])
+        assert sparse.stride(0) * sparse.element_size() < 2**32
+        assert 2 * sparse.stride(0) * sparse.element_size() > 2**32
+        args[key] = sparse
+    check(case, args, guard)
 
-    sys.exit(pytest.main([__file__, "-q", *sys.argv[1:]]))
+
+@pytest.mark.skipif(
+    os.getenv("AITER_NVFP4_TEST_LARGE") != "1", reason="large GPU allocation"
+)
+def test_table_addresses_above_4gib():
+    case, args, guard = make_case([1, 65, 129])
+    expected = separate(case).clone()
+    rows = 2**26 + 2
+    positions = torch.tensor([2**26 - 1, 2**26, rows - 1], device="cuda")
+    for key in ("cos", "sin"):
+        table = torch.empty((rows, 32), dtype=torch.bfloat16, device="cuda")
+        table[positions] = args[key][args["positions"]]
+        args[key] = table
+    args["positions"] = positions
+    out, _ = aiter.mla_decode_nvfp4_qrope_fwd(**args)
+    assert torch.equal(out, expected) and torch.isnan(guard[-256:]).all()
+
+
+def _guard_case(ctx_len):
+    assert os.environ.get("PYTORCH_NO_HIP_MEMORY_CACHING") == "1"
+    case, args, _ = make_case(
+        [0, ctx_len, ctx_len], compact_scale=True, positions=[0, 0, 256]
+    )
+    expected = separate(case).clone()
+    # Preserve the real projection stride while placing the final raw-Q row
+    # at its own allocation's end. Guard all other complete tensor buffers.
+    physical_q = torch.full(
+        (3, 128, 192), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    physical_q[..., 128:] = args["q_rope"]
+    args["q_rope"] = _tail_guarded(physical_q)[..., 128:]
+    for name in args:
+        if name != "q_rope":
+            args[name] = _tail_guarded(args[name])
+    out, _ = aiter.mla_decode_nvfp4_qrope_fwd(**args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+    print("COMPLETED guarded compact Q RoPE", flush=True)
+
+
+@pytest.mark.skipif(
+    os.getenv("AITER_NVFP4_TEST_GUARDS") != "1",
+    reason="isolated allocation-tail checks",
+)
+@pytest.mark.parametrize("ctx_len", [1, 31, 63, 64, 65, 127, 128, 129, 257, 513])
+def test_guarded_compact_inputs(ctx_len):
+    env = os.environ | {"PYTORCH_NO_HIP_MEMORY_CACHING": "1"}
+    result = subprocess.run(
+        [sys.executable, __file__, "--guard-case", str(ctx_len)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "COMPLETED guarded compact Q RoPE" in result.stdout
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--guard-case":
+        _guard_case(int(sys.argv[2]))
+    else:
+        sys.exit(pytest.main([__file__, "-q", *sys.argv[1:]]))

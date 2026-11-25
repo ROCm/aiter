@@ -18,8 +18,8 @@ G_Q = 6.72
 G_KV = 89.6
 
 
-# v8 adds the 120-byte Q RoPE entry; cached v7 modules do not export it.
-@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
+# v9 accepts compact 64-byte RoPE rows; cached v8 modules require padded rows.
+@compile_ops("module_mla_nvfp4_v9", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -35,7 +35,7 @@ def mla_nvfp4_asm_fwd(
 
 
 # cos/sin can alias one cache; only out is mutated, including under compile.
-@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes", mutates_args=["out"])
+@compile_ops("module_mla_nvfp4_v9", ffi_type="ctypes", mutates_args=["out"])
 def mla_nvfp4_qrope_asm_fwd(
     q_nope: torch.Tensor,
     q_scale: torch.Tensor,
@@ -53,13 +53,13 @@ def mla_nvfp4_qrope_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v9", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v9", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,
@@ -183,7 +183,9 @@ def mla_decode_nvfp4_qrope_fwd(
     q_scale/q_rope require contiguous last dimensions, 16-byte aligned bases,
     and positive, 16-byte aligned uint32 byte strides. Each wave's 32 head
     span must fit uint32. cos/sin are BF16[N,32] views with element strides
-    (64,1), e.g. the two halves of BF16[N,64]. positions is GPU int64[B];
+    (32,1), optionally retaining singleton middle dimensions, as in the
+    model's BF16[N,1,1,32] cos_cache/sin_cache. No reshape or copy is needed.
+    positions is GPU int64[B];
     callers guarantee 0 <= positions[i] < N for nonempty requests.
 
     KV, CSR, params, output and stream contracts match mla_decode_nvfp4_fwd.
