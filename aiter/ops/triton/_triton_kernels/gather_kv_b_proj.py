@@ -701,39 +701,73 @@ def _triton_gather_kv_b_proj_impl(
             accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
             accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
         elif PER_ROW_SCALE:
-            accum_k += (
-                tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_0, k_nope_weight_0.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_0, v_nope_weight_0.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_1, k_nope_weight_1.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_1, v_nope_weight_1.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_2, k_nope_weight_2.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_2, v_nope_weight_2.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_3, k_nope_weight_3.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_3, v_nope_weight_3.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
         else:
-            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
-            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
-            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
-            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
-            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
-            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
-            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
-            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_0, k_nope_weight_0.T), k_nope_scale_0[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_0, v_nope_weight_0.T), v_nope_scale_0[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_1, k_nope_weight_1.T), k_nope_scale_1[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_1, v_nope_weight_1.T), v_nope_scale_1[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_2, k_nope_weight_2.T), k_nope_scale_2[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_2, v_nope_weight_2.T), v_nope_scale_2[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_3, k_nope_weight_3.T), k_nope_scale_3[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_3, v_nope_weight_3.T), v_nope_scale_3[None, :], accum_v
+            )
 
         accum_k *= k_scalar_scale
         accum_v *= k_scalar_scale
@@ -1005,39 +1039,73 @@ def _triton_gather_kv_b_proj_flat(
             accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
             accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
         elif PER_ROW_SCALE:
-            accum_k += (
-                tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_0, k_nope_weight_0.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_0, v_nope_weight_0.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_1, k_nope_weight_1.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_1, v_nope_weight_1.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_2, k_nope_weight_2.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_2, v_nope_weight_2.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
-            accum_k += (
-                tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[None, :]
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_3, k_nope_weight_3.T),
+                k_nope_scale_vec[None, :],
+                accum_k,
             )
-            accum_v += (
-                tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_3, v_nope_weight_3.T),
+                v_nope_scale_vec[None, :],
+                accum_v,
             )
         else:
-            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
-            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
-            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
-            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
-            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
-            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
-            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
-            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
+            # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_0, k_nope_weight_0.T), k_nope_scale_0[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_0, v_nope_weight_0.T), v_nope_scale_0[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_1, k_nope_weight_1.T), k_nope_scale_1[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_1, v_nope_weight_1.T), v_nope_scale_1[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_2, k_nope_weight_2.T), k_nope_scale_2[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_2, v_nope_weight_2.T), v_nope_scale_2[None, :], accum_v
+            )
+            accum_k = tl.fma(
+                tl.dot(kv_c_data_3, k_nope_weight_3.T), k_nope_scale_3[None, :], accum_k
+            )
+            accum_v = tl.fma(
+                tl.dot(kv_c_data_3, v_nope_weight_3.T), v_nope_scale_3[None, :], accum_v
+            )
 
         accum_k *= k_scalar_scale
         accum_v *= k_scalar_scale

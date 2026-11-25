@@ -151,9 +151,11 @@ def _is_grouped(row: dict) -> bool:
 def _reaches_flydsl(row: dict) -> bool:
     kernel1 = (row.get("kernelName1") or "").strip()
     kernel2 = (row.get("kernelName2") or "").strip()
-    # A cktile stage1 finishes with a FlyDSL activation epilogue.
+    # A cktile stage1 finishes with a FlyDSL activation epilogue. An impl__
+    # row is a whole-graph backend (fused_moe_gfx942) that launches FlyDSL
+    # kernels itself, so its name does not start with flydsl_.
     return (
-        kernel1.startswith(("flydsl_", "cktile_"))
+        kernel1.startswith(("flydsl_", "cktile_", "impl__flydsl_"))
         or kernel2.startswith("flydsl_")
         or _is_grouped(row)
     )
