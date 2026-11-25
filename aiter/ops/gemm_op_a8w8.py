@@ -2949,19 +2949,29 @@ _MXFP8_TUNED_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
 @functools.lru_cache(maxsize=1024)
 def _opus_mxfp8_kid(M: int, N: int, K: int, kernel_name: str, split_k: int = 0):
-    """Local kid of the OPUS a8w8_mxfp8_bpreshuffle instance ``kernel_name`` (a libtype "opus"
-    row's kernelName), or None when it cannot run (M, N, K) with ``split_k`` --
-    a padded-M row can name a shape a "nob" kid cannot run."""
+    """Local kid serving a libtype "opus" row that names the OPUS
+    a8w8_mxfp8_bpreshuffle instance ``kernel_name``, or None when none runs
+    (M, N, K) with ``split_k``. A "nob" kid runs whole tiles only, so a ragged
+    M under a padded-M row runs the "np" kid of the same tile."""
     from csrc.opus_gemm.opus_gemm_common import get_registry
 
     from .opus.gemm_op_a8w8 import a8w8_mxfp8_kid_runs
 
-    for kid, inst in get_registry(
-        "a8w8_mxfp8_bpreshuffle", get_gfx(), get_cu_num()
-    ).items():
-        if inst.name == kernel_name:
-            return kid if a8w8_mxfp8_kid_runs(inst, M, N, K, split_k) else None
-    raise ValueError(f"Invalid tuned OPUS kernel {kernel_name}")
+    kids = get_registry("a8w8_mxfp8_bpreshuffle", get_gfx(), get_cu_num())
+    named = next((inst for inst in kids.values() if inst.name == kernel_name), None)
+    if named is None:
+        raise ValueError(f"Invalid tuned OPUS kernel {kernel_name}")
+    tile = (named.B_M, named.B_N, named.B_K)
+    variants = ("nob", "np") if named.co_variant == "nob" else (named.co_variant,)
+    for variant in variants:
+        for kid, inst in kids.items():
+            if (
+                inst.co_variant == variant
+                and (inst.B_M, inst.B_N, inst.B_K) == tile
+                and a8w8_mxfp8_kid_runs(inst, M, N, K, split_k)
+            ):
+                return kid
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -2984,9 +2994,9 @@ def _get_mxfp8_bpreshuffle_config(
     A FlyDSL tuned row wins (exact M, else a padded M, the walk
     get_CKGEMM_config makes); an untuned shape uses the FlyDSL heuristic.
     gfx950 rows are FlyDSL mxpsh / 8-wave kernels, (kernelId "bmm") the
-    batched GEMM at B = 1, or (libtype "opus") an OPUS a8w8_mxfp8_bpreshuffle kid; an
-    untuned gfx950 shape, or an opus row whose tile does not divide the shape,
-    runs the mxpsh heuristic tile.
+    batched GEMM at B = 1, or (libtype "opus") an OPUS a8w8_mxfp8_bpreshuffle kid
+    (see _opus_mxfp8_kid); an untuned gfx950 shape, or an opus row no kid can
+    run, runs the mxpsh heuristic tile.
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     gfx, cu_num = get_gfx(), get_cu_num()
@@ -3104,16 +3114,18 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         if libtype == "opus":
             if (
                 Y.dtype == dtypes.bf16
-                and Y.is_contiguous()
                 and tuple(x_scale.shape) == (M, K // 32)
                 and tuple(w_scale.shape) == (N, K // 32)
             ):
                 from .opus import opus_gemm
 
-                return opus_gemm(
-                    XQ,
-                    WQ,
-                    Y,
+                # The OPUS kids take dense operands: a strided out is written
+                # through a dense one, as the 8-wave rows these replace did.
+                dense = Y if Y.is_contiguous() else Y.new_empty(M, N)
+                opus_gemm(
+                    XQ.contiguous(),
+                    WQ.contiguous(),
+                    dense,
                     kid=_opus_mxfp8_kid(M, N, K, kernel_name, split_k=split_k),
                     family="a8w8_mxfp8_bpreshuffle",
                     layout="bpreshuffle",
@@ -3121,7 +3133,10 @@ def gemm_a8w8_mxfp8_bpreshuffle(
                     w_scale=w_scale,
                     split_k=split_k,
                 )
-            # The OPUS kids write a dense bf16 [M, N]; let the mxpsh heuristic pick.
+                if dense is not Y:
+                    Y.copy_(dense)
+                return Y
+            # The OPUS kids write bf16 only; let the mxpsh heuristic pick.
             kernel_name = None
         is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"

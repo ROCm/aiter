@@ -3623,8 +3623,11 @@ void
     AITER_CHECK(K % {2 * k.B_K} == 0, "{k.name} needs K % {2 * k.B_K} == 0 (K=", K, ")");
     {align_code}
     // 32-bit buffer ranges: A / B and one C tile (the kernel bases C per tile in 64 bits) stay under 2 GiB.
+    // C is bounded on a whole {k.B_M}-row tile whatever M is: the epilogue stores every tile row at
+    // r * N + c (+ 2^30 elements for a masked column) and the buffer range drops the rows past M, so
+    // that offset must not wrap back into the range.
     AITER_CHECK((int64_t)M * K <= INT32_MAX && (int64_t)N * K <= INT32_MAX &&
-                    2 * (((int64_t)(M < {k.B_M} ? M : {k.B_M}) - 1) * N + {k.B_N}) <= INT32_MAX &&
+                    2 * ((int64_t)({k.B_M} - 1) * N + {k.B_N}) <= INT32_MAX &&
                     (batch == 1 || (int64_t)M * N <= INT32_MAX),
                 "{k.name}: M=", M, " N=", N, " K=", K, " batch=", batch, " exceeds the 32-bit buffer ranges");
     // Layout from strides: operand [rows, K] is dense K-contiguous (stored [rows, K]) or dense
@@ -3666,7 +3669,8 @@ void
     kargs.stride_c = N;
     kargs.stride_a_batch = M * K;
     kargs.stride_b_batch = N * K;
-    kargs.stride_c_batch = M * N;
+    // batch == 1: unused (batch_id is 0), and M * N may exceed int.
+    kargs.stride_c_batch = batch == 1 ? 0 : M * N;
     kargs.stride_sfa = K / 32;  // row-major [rows, K/32] e8m0
     kargs.stride_sfb = K / 32;
     kargs.stride_sfa_batch = M * (K / 32);

@@ -662,10 +662,8 @@ def a8w8_mxfp8_kid_runs(
         return False
     if K <= 0 or K % _MXFP8_K_ALIGN:
         return False
-    if (
-        max(M * K, N * K, 2 * ((min(M, instance.B_M) - 1) * N + instance.B_N))
-        > (1 << 31) - 1
-    ):
+    # C: a whole tile whatever M is (see the launcher's check).
+    if max(M * K, N * K, 2 * ((instance.B_M - 1) * N + instance.B_N)) > (1 << 31) - 1:
         return False
     if instance.co_variant == "nob":
         if M % instance.B_M or N % instance.B_N:

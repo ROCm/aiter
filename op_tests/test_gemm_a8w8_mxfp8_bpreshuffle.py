@@ -255,6 +255,60 @@ def test_opus_route(m, n, k, kid, split_k):
     return {"kernel": name, "us": round(us, 2), "err": err}
 
 
+def check_opus_route_fallbacks():
+    """A libtype "opus" row beyond its own dense shape: a ragged M under a
+    padded-M "nob" row (its tile's "np" kid), a strided out and a strided XQ."""
+    import aiter.ops.opus as opus_pkg
+    from aiter.ops import gemm_op_a8w8
+
+    kids = opus_registry(BPRESHUFFLE)
+    nob, inst = next((k, i) for k, i in kids.items() if i.co_variant == "nob")
+    np_kid = next(
+        k
+        for k, i in kids.items()
+        if i.co_variant == "np" and (i.B_M, i.B_N) == (inst.B_M, inst.B_N)
+    )
+    n, k = 3 * inst.B_N, 768
+    real_config, real_opus_gemm = (
+        gemm_op_a8w8._get_mxfp8_bpreshuffle_config,
+        opus_pkg.opus_gemm,
+    )
+    launched = []
+
+    def spy(*args, **kwargs):
+        launched.append(kwargs["kid"])
+        return real_opus_gemm(*args, **kwargs)
+
+    rows = []
+    gemm_op_a8w8._get_mxfp8_bpreshuffle_config = lambda *_: ("opus", inst.name, 1)
+    opus_pkg.opus_gemm = spy
+    try:
+        for case, m, want in (
+            ("ragged M under a nob row", 2 * inst.B_M + 1, np_kid),
+            ("strided out", 2 * inst.B_M, nob),
+            ("strided XQ", 2 * inst.B_M, nob),
+        ):
+            xq, x_scale, wq, w_scale, _, b = opus_inputs(m, n, k, "NT", BPRESHUFFLE)
+            a = xq
+            if case == "strided XQ":
+                a = torch.empty(m, k + 64, dtype=xq.dtype)[:, :k]
+                a.copy_(xq)
+            # NaN sentinel: the gap of a strided out must stay untouched.
+            base = torch.full((m, n + 16), float("nan"), dtype=dtypes.bf16)
+            out = base[:, :n] if case == "strided out" else base[:, :n].contiguous()
+            del launched[:]
+            got = aiter.gemm_a8w8_mxfp8_bpreshuffle(a, b, x_scale, w_scale, out=out)
+            err = opus_err(xq, x_scale, wq, w_scale, out)
+            assert got is out and launched == [want], (case, launched, want)
+            assert err == 0, f"{case}: err {err}"
+            assert bool(base[:, n:].isnan().all()), f"{case}: wrote outside out"
+            rows.append({"case": case, "M": m, "kid": launched[0], "err": err})
+    finally:
+        gemm_op_a8w8._get_mxfp8_bpreshuffle_config = real_config
+        opus_pkg.opus_gemm = real_opus_gemm
+    return rows
+
+
 def check_opus_rejects():
     """Inputs the launchers must refuse (a wrong result here is silent)."""
     kids = opus_registry()
@@ -309,6 +363,27 @@ def check_opus_rejects():
     over = not a8w8_mxfp8_kid_runs(kids[sk], 8192, 65536, 1536, 2)
     assert over, "split-K workspace over 4 GiB accepted"
     rows.append({"case": "split-K workspace > 4 GiB", "kid": sk, "rejected": over})
+    # A short M on a very wide N: the stores of the tile rows past M would wrap
+    # back into C, so planner and launcher bound a whole tile of rows.
+    inst = kids[np_kid]
+    wide_n = -(-(1 << 30) // (inst.B_M - 1) // 16) * 16
+    wide = not a8w8_mxfp8_kid_runs(inst, 16, wide_n, 256)
+    try:
+        run_opus(
+            torch.empty(16, 256, dtype=xq.dtype),
+            torch.empty(wide_n, 256, dtype=xq.dtype),
+            torch.empty(16, wide_n, dtype=dtypes.bf16),
+            torch.empty(16, 8, dtype=x_scale.dtype),
+            torch.empty(wide_n, 8, dtype=w_scale.dtype),
+            np_kid,
+            0,
+        )
+        torch.cuda.synchronize()
+        wide = False
+    except (RuntimeError, ValueError):
+        pass
+    assert wide, f"short M on N={wide_n} accepted (tile rows past M wrap into C)"
+    rows.append({"case": f"M=16 on N={wide_n}", "kid": np_kid, "rejected": wide})
     return rows
 
 
@@ -480,6 +555,10 @@ def main():
     ]
     summarize(
         "gemm_a8w8_mxfp8_bpreshuffle OPUS route", [test_opus_route(*r) for r in route]
+    )
+    summarize(
+        "gemm_a8w8_mxfp8_bpreshuffle OPUS route fallbacks",
+        check_opus_route_fallbacks(),
     )
     summarize("OPUS MXFP8 1x32 rejects", check_opus_rejects())
     summarize(
