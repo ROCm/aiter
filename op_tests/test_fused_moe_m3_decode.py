@@ -58,15 +58,30 @@ from aiter.ops.flydsl.kernels.mega_moe_tp.decode_router_gemm import router_line_
 # ---------------------------------------------------------------- tests
 
 
+def _tuned_router_cfg(n):
+    from aiter.fused_moe import _decode_route_cfg_names, get_padded_M
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import RouterCfg
+
+    names = _decode_route_cfg_names(AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE)
+    name = names.get(("gfx950", get_cu_num(), get_padded_M(n), H, I, E, 4))
+    cfg = None if name is None else RouterCfg.parse(name)
+    return cfg if cfg is not None and cfg.fits(n) else None
+
+
 @pytest.mark.parametrize("n", ROWS + (9, 24, 100))
 def test_integrated_matches_chain(n):
     L, (gate, bias), x = make_layer(), make_router(), make_x(n)
     lines = router_line_layout(gate)
     ref, w, ids = chain_direct(x, L, gate, lines, bias)
+    # the router entry runs the tuned row's router config (another split-K sums in another order: compare with
+    # the chain ops on that same config)
+    ref_r, _, _ = chain_direct(x, L, gate, lines, bias, rcfg=_tuned_router_cfg(n))
     # bf16 rows: the row-quant runs inside the whole-graph implementation
     assert torch.equal(integrated(x, L, w, ids), ref)
     # the router entry in front: bit-identical routes and output
-    assert torch.equal(integrated_router(x, L, gate, bias), ref)
+    assert torch.equal(integrated_router(x, L, gate, bias), ref_r)
 
 
 @pytest.mark.parametrize("n", ROWS)
