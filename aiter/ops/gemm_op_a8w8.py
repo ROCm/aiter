@@ -1250,10 +1250,32 @@ def gemm_a8w8_bpreshuffle_splitk_deferred(
     returns gemm_a8w8_bpreshuffle's output. Same kernel, same partials either way,
     so the finished tensor is bitwise what gemm_a8w8_bpreshuffle returns.
 
-    The hand-off is host state, decided when this function runs. Under graph
-    capture, capture the producer and its consumer (or the reduce) in the same
-    graph: a replay reruns both with the hand-off recorded at capture, while a
-    consumer outside the graph would read an output its replay leaves unreduced.
+    The partials sit behind Y instead of in a second tensor because whether a call
+    defers, and with which split_k, follows from the tuned row for this M and is
+    known only when the call runs. A caller that traces its model once for every
+    M and runs this GEMM as an opaque op of that graph (torch.compile, as ATOM's
+    LinearBase does) can hand its consumer Y, whose shape follows from the input
+    shapes; a [split_k, M, N] tensor that may not exist would need a
+    data-dependent shape there. The explicit form is ``partials=`` of
+    run_gemm_a8w8_bpreshuffle_gfx1250, for a caller that picks the kernel and
+    owns the buffer.
+
+    None of the following is detected:
+    - Y read before it is claimed gives wrong values: it is uninitialised memory.
+    - A copy of an unclaimed Y (clone, cast) reads as finished: the hand-off does
+      not know it, and it holds those wrong values. Claim Y itself, whole or as a
+      leading row slice (any other view raises).
+    - A consumer outside the graph that captured this call claims once, at its
+      first call; after every later replay it reads the values that claim left
+      in Y. The hand-off is host state, decided when this function runs: capture
+      the producer and its consumer (or the reduce) in the same graph, so that a
+      replay reruns both with the hand-off recorded at capture.
+
+    Y's storage is the whole allocation, about (2 + 4 * split_k) / 2 times an
+    [M, N] bf16 tensor (9x at split 4), for as long as Y lives, claimed or not. An
+    output never claimed stays listed, storage included; once 64 are listed, each
+    new deferred output finishes the oldest with the standalone reduce (or
+    raises, under graph capture).
     """
     deferred = _splitk_deferrable(XQ, WQ, dtype, max_m)
     if deferred is None:
@@ -1285,8 +1307,9 @@ def gemm_a8w8_bpreshuffle_splitk_partials(y: Tensor) -> Tensor | None:
     """Claim the unreduced fp32 [split_k, M, N] partials of ``y``, an output (or a
     leading row slice of one) of gemm_a8w8_bpreshuffle_splitk_deferred, or None
     when ``y`` already holds its values. Raises for any other view of a deferred
-    output; a copy of one (clone, dtype cast) is not recognised and reads as None. The claimer must leave ``y`` reduced: hand the partials to a consumer
-    that writes the row back, or to gemm_a8w8_bpreshuffle_splitk_reduce."""
+    output; a copy of one (clone, dtype cast) is not recognised and reads as None.
+    The claimer must leave ``y`` reduced: hand the partials to a consumer that
+    writes the row back, or to gemm_a8w8_bpreshuffle_splitk_reduce."""
     storage = y.untyped_storage()
     entry = _SPLITK_DEFERRED.get(storage.data_ptr())
     if entry is None:
