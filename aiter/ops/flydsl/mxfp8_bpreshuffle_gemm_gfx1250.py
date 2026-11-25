@@ -146,14 +146,10 @@ def _require_e8m0_scale(scale: Tensor, shape: tuple[int, int], name: str) -> Ten
 
 
 def check_persistent_n_tiles(
-    persistent_n_tiles: int,
-    N: int,
-    tile_n: int,
-    cluster_n: int,
-    split_k: int,
-    compute_bound: bool,
+    persistent_n_tiles: int, split_k: int, compute_bound: bool
 ) -> None:
-    """Validate a persistent (multi-tile-per-CTA) config against the shape."""
+    """Validate a persistent (multi-tile-per-CTA) config; an N that is not a whole
+    number of persistent groups is served with bounded_n."""
     if persistent_n_tiles < 1:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] persistent_n_tiles must be >= 1, "
@@ -168,13 +164,6 @@ def check_persistent_n_tiles(
     if split_k != 1:
         raise RuntimeError(
             "[FlyDSL gfx1250 mxfp8] persistent_n_tiles>1 requires split_k=1"
-        )
-    n_tiles = N // tile_n
-    if n_tiles % persistent_n_tiles or (n_tiles // persistent_n_tiles) % cluster_n:
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8] persistent_n_tiles={persistent_n_tiles} needs "
-            f"N/tile_n={n_tiles} divisible by it and the quotient a multiple "
-            f"of cluster_n={cluster_n}"
         )
 
 
@@ -314,7 +303,21 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] a gfx1250 cluster holds at most 16 "
             f"workgroups, got {cluster_m}x{cluster_n}"
         )
-    if N % (tile_n * cluster_n) != 0:
+    # A compute kernel serves an N that ends inside its last group of
+    # tile_n * cluster_n * persistent_n_tiles columns (bounded_n).
+    bounded_n = compute_bound and N % (tile_n * cluster_n * persistent_n_tiles) != 0
+    if bounded_n and (
+        int(split_k) != 1
+        or batch > 1
+        or fuse_quant
+        or N % (MX32_BLOCK_K if w_scale_32x32 else BLOCK_K)
+        or (mx32 and not w_scale_32x32)
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] a partial N tile needs split_k=1, no batch, no "
+            "fused quant and a 128x128 or 32x32 weight scale whose block divides N"
+        )
+    if not compute_bound and N % (tile_n * cluster_n) != 0:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] N={N} must be a multiple of "
             f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
@@ -419,9 +422,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 f"stride(0)={Out.stride(0)}"
             )
 
-    check_persistent_n_tiles(
-        persistent_n_tiles, N, tile_n, cluster_n, split_k, compute_bound
-    )
+    check_persistent_n_tiles(persistent_n_tiles, split_k, compute_bound)
 
     if mx32 and tile_n % 32 != 0:
         raise RuntimeError(
@@ -548,7 +549,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             *specialization,
             batch,
             fuse_quant,
-            specialization_key=specialization + (fuse_quant,),
+            bounded_n,
+            specialization_key=specialization + (fuse_quant, bounded_n),
         )
     else:
         specialization = constexpr_args + (

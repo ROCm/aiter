@@ -1728,6 +1728,7 @@ def _flydsl_mxfp8_fallback_kernel(
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         is_compute_kernel,
+        is_pow2_geometry,
         kernel_fits_shape,
         kernels_list,
     )
@@ -1741,6 +1742,7 @@ def _flydsl_mxfp8_fallback_kernel(
         if ki.split_k == 1
         and not ki.fused_splitk
         and ki.tile_n <= 256  # wider tiles measured slower
+        and is_pow2_geometry(ki)
         and kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
     ]
