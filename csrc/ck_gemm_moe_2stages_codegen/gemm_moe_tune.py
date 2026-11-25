@@ -6496,8 +6496,11 @@ class FmoeTuner(TunerCommon):
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
 
-                _topk_ids = torch.randint(
-                    0, expert, (token, topk), dtype=torch.int32, device="cuda"
+                # the sort rejects a token naming one expert twice
+                _topk_ids = (
+                    torch.rand((token, expert), device="cuda")
+                    .topk(topk, dim=1)
+                    .indices.to(torch.int32)
                 )
                 _topk_w = torch.rand((token, topk), dtype=dtypes.fp32, device="cuda")
                 us_sort_cache = {}
