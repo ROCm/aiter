@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """MXMOE GEMM1 ``_bf16q``: GEMM2 gets the same MXFP4 input as on the two-stage path.
+``_ks2_ad1_ps`` (deeper K pipeline, shallower A staging, padding skipped) keeps it.
 
 The MXMOE GEMM1 quantizes its SwiGLU output to MXFP4 in its epilogue. With the
 ``_bf16q`` kernel-name token it first rounds the activation to bf16 and scales
@@ -29,6 +30,7 @@ from aiter.test_common import checkAllclose, run_perftest
 E, HIDDEN, INTER, TOPK = 128, 6144, 3072, 4
 G1 = "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu"
 G1_BF16Q = G1 + "_bf16q"
+G1_PS = G1_BF16Q + "_ks2_ad1_ps"
 G2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_reduce_persist_sbm128"
 TWO_STAGE = (
     "flydsl_moe1_afp4_wfp4_bf16_t128x128x256_w2_bnt0",
@@ -49,7 +51,7 @@ def _unshuffle(scale):
     )
 
 
-def _case(tokens, seed):
+def _case(tokens, seed, skew=0.0):
     from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -68,6 +70,7 @@ def _case(tokens, seed):
     w2, w2_scale = mx(HIDDEN, INTER, False)
     x = torch.randn(tokens, HIDDEN, generator=g, device="cuda").to(dtypes.bf16)
     logits = torch.randn(tokens, E, generator=g, device="cuda")
+    logits += skew * torch.randn(E, generator=g, device="cuda")  # uneven experts
     topk_weights, topk_ids = torch.softmax(logits, -1).topk(TOPK, -1)
     return {
         "hidden_states": x,
@@ -173,6 +176,21 @@ def test_aot_stage1_jobs_carry_bf16_act_quant(monkeypatch):
     assert seen[0]["bf16_act_quant"] is True
 
 
+def test_k_split_tokens_reach_the_aot_stage1_jobs():
+    from aiter.aot.flydsl import mxfp4_moe
+
+    p = _parse_mxfp4_g1_kname(G1_PS)
+    assert (p["pad_skip"], p["a_depth"], p["k_stages"]) == (True, 1, 2)
+    base = _parse_mxfp4_g1_kname(G1_BF16Q)
+    assert (base["pad_skip"], base["a_depth"], base["k_stages"]) == (False, 2, 0)
+    row = {"token": 8192, "topk": TOPK, "model_dim": HIDDEN, "expert": E}
+    row.update(inter_dim=INTER, kernelName1=G1_PS, kernelName2=G2)
+    jobs = [j for j in mxfp4_moe.jobs_from_rows([row]) if j["stage"] == 1]
+    assert {(j["pad_skip"], j["a_depth"], j["k_stages"]) for j in jobs} == {
+        (True, 1, 2)
+    }
+
+
 def test_unshuffle_inverts_shuffle_scale():
     from aiter.ops.shuffle import shuffle_scale
 
@@ -208,15 +226,36 @@ def test_bf16q_gemm2_input_equals_two_stage(monkeypatch, tmp_path, tokens, seed)
     assert not torch.equal(got["plain"][0], got["ref"][0])
 
 
+@_GFX950
+@pytest.mark.parametrize("seed, skew", [(0, 0.0), (1, 0.0), (2, 2.0)])
+@pytest.mark.parametrize("tokens", [4096, 5000, 8192, 16384, 32768])
+def test_ks2_ad1_ps_gemm2_input_equals_bf16q(monkeypatch, tmp_path, tokens, seed, skew):
+    import aiter.fused_moe as fm
+
+    case = _case(tokens, seed, skew)
+    got = {}
+    try:
+        for kn1 in (G1_BF16Q, G1_PS):
+            _select_row(monkeypatch, tmp_path, tokens, kn1, G2)
+            got[kn1] = _gemm2_input(case)
+    finally:
+        fm.AITER_CONFIGS.get_config_file.cache_clear()
+        fm.get_2stage_cfgs.cache_clear()
+    for i, what in enumerate(("MXFP4 codes", "E8M0 scales")):
+        diff = int((got[G1_BF16Q][i] != got[G1_PS][i]).sum())
+        assert diff == 0, f"{what}: {diff} bytes differ"
+
+
 if __name__ == "__main__":
     print("us per call of fused_moe_prepare_stage2 (sort + GEMM1 + quant)")
     rows = (
         ("two-stage", TWO_STAGE),
         ("mxmoe", (G1, G2)),
         ("mxmoe_bf16q", (G1_BF16Q, G2)),
+        ("mxmoe_bf16q_ks2_ad1_ps", (G1_PS, G2)),
     )
     with pytest.MonkeyPatch.context() as mp, tempfile.TemporaryDirectory() as d:
-        for tokens in (4096, 8192, 16384):
+        for tokens in (4096, 8192, 16384, 32768):
             case = _case(tokens, 0)
             line = [f"tokens {tokens:6d}"]
             for name, kn in rows:

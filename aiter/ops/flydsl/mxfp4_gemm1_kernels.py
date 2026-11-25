@@ -34,6 +34,9 @@ def _get_compiled_mxfp4_gemm1_port(
     num_waves=4,
     k_wave=1,
     bf16_act_quant=False,
+    pad_skip=False,
+    a_depth=2,
+    k_stages=0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -60,6 +63,9 @@ def _get_compiled_mxfp4_gemm1_port(
         num_waves=num_waves,
         k_wave=k_wave,
         bf16_act_quant=bf16_act_quant,
+        pad_skip=pad_skip,
+        a_depth=a_depth,
+        k_stages=k_stages,
     )
 
 
@@ -235,6 +241,9 @@ def flydsl_mxfp4_gemm1(
     num_waves=4,
     k_wave=1,
     bf16_act_quant=False,
+    pad_skip=False,
+    a_depth=2,
+    k_stages=0,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
     _assert_supported(
@@ -284,6 +293,9 @@ def flydsl_mxfp4_gemm1(
         num_waves,
         k_wave,
         bf16_act_quant,
+        pad_skip,
+        a_depth,
+        k_stages,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

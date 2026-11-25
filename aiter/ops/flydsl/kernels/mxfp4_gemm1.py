@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -98,6 +99,8 @@ def _gemm1_body(
     epi_splits=1,
     k_stages=kStages,
     bf16_act_quant=False,
+    pad_skip=False,
+    a_depth=2,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -130,7 +133,7 @@ def _gemm1_body(
         and kMChunks > 1
         and kUnroll >= 1
     )
-    a_reg_depth = min(2, kUnroll) if k_split else 0
+    a_reg_depth = min(a_depth, kUnroll) if k_split else 0
 
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
@@ -150,6 +153,19 @@ def _gemm1_body(
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
     e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)
+
+    # pad_skip: a sort block's token rows are a prefix (moe_sorting pads at the
+    # end), so n_live (wave-uniform) counts the 16-row chunks whose first row is one.
+    n_live = None
+    if const_expr(pad_skip):
+        n_live = fx.Int32(1)
+        for c in range_constexpr(1, BM // 16):
+            tok_c = rocdl.readfirstlane(
+                T.i32, as_ir_value(_global_i32_at(arg_mind, m_row + fx.Int32(16 * c)))
+            )
+            live_c = fx.Uint32(tok_c) < fx.Uint32(i32_ntok)
+            n_live = n_live + live_c.select(fx.Int32(1), fx.Int32(0))
+        n_live = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(n_live)))
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -896,6 +912,40 @@ def _gemm1_body(
             scale_b=sb,
         )
 
+    def _no_sink():
+        # An empty side-effecting asm: keeps the A-fragment loads issued above it
+        # in this block instead of being sunk into the guarded MFMA blocks.
+        _llvm.inline_asm(
+            res=None, operands_=[], asm_string="", constraints="", has_side_effects=True
+        )
+
+    def _chunk_mmas(i, b_slot, a, a_scale, bs_slot, khalf):
+        # Chunk i's MFMAs of one k-half for every N tile J: the atoms and operands
+        # mfma_cluster gives accumulator (i, J), so each sees the same sequence.
+        sa = a_scale[i // 2]
+        for J in range_constexpr(N_REPS):
+            _mma(
+                accm[i][J],
+                (i % 2) + 2 * khalf,
+                2 * khalf + J // 2,
+                a[i][khalf],
+                b_slot[J],
+                sa,
+                bs_slot[J % 2],
+            )
+
+    def mfma_live_subs(b_slot, a, a_scale, bs_slot, khalf):
+        # Chunk-major MFMAs of one k-half; 32-row sub-blocks past the live
+        # chunks (all padding) are skipped by one uniform branch each.
+        for sub in range_constexpr(kSubBlocks):
+            if const_expr(sub == 0):
+                _chunk_mmas(0, b_slot, a, a_scale, bs_slot, khalf)
+                _chunk_mmas(1, b_slot, a, a_scale, bs_slot, khalf)
+            else:
+                if n_live > fx.Int32(2 * sub):
+                    _chunk_mmas(2 * sub, b_slot, a, a_scale, bs_slot, khalf)
+                    _chunk_mmas(2 * sub + 1, b_slot, a, a_scale, bs_slot, khalf)
+
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
         if const_expr(interleave):
             mni = J // 2
@@ -986,6 +1036,15 @@ def _gemm1_body(
                 rocdl.sched_barrier(0)
             for h in range_constexpr(2):
                 a_h = issue_a_ds_read(read_slot, khalf=h)
+                if const_expr(pad_skip):
+                    _no_sink()
+                    mfma_live_subs(bh[h], a_h, asc_cur, b_scale_v[slot_b], h)
+                    rocdl.sched_barrier(0)
+                    if const_expr(KT + 1 < K_TILES_PER_WAVE):
+                        for J in range_constexpr(N_REPS):
+                            issue_b_load_half(bh[h], global_k_tile(KT + 1), J, h)
+                    rocdl.sched_barrier(0)
+                    continue
                 for J in range_constexpr(N_REPS):
                     mfma_cluster(bh[h], a_h, asc_cur, b_scale_v[slot_b], J, khalf=h)
                     rocdl.sched_barrier(0)
@@ -1311,10 +1370,7 @@ def _gemm1_body(
                     arg_bias, bias_base + fx.Int32(inter) + out_col
                 )
 
-        for mr in range_constexpr(split * MR_PER_SPLIT, (split + 1) * MR_PER_SPLIT):
-            row_lds = fx.Int32((mr - split * MR_PER_SPLIT) * 16) + m_lane
-            row_local = fx.Int32(mr * 16) + m_lane
-
+        def epi_activation(row_lds):
             gate_vs = [None] * 8
             up_vs = [None] * 8
             for ee in range_constexpr(8):
@@ -1326,7 +1382,7 @@ def _gemm1_body(
                 if const_expr(enable_bias):
                     gate_vs[ee] = gate_vs[ee] + bias_gate[ee]
                     up_vs[ee] = up_vs[ee] + bias_up[ee]
-            result = _activation_mul_batch(
+            res = _activation_mul_batch(
                 gate_vs,
                 up_vs,
                 act=act,
@@ -1338,7 +1394,37 @@ def _gemm1_body(
             if const_expr(out_dtype == "fp8" or bf16_act_quant):
                 # Match the existing two-stage path: activation is materialized
                 # as BF16 before the inter-stage MX quantization.
-                result = [value.to(fx.BFloat16).to(fx.Float32) for value in result]
+                res = [value.to(fx.BFloat16).to(fx.Float32) for value in res]
+            return res
+
+        for mr in range_constexpr(split * MR_PER_SPLIT, (split + 1) * MR_PER_SPLIT):
+            row_lds = fx.Int32((mr - split * MR_PER_SPLIT) * 16) + m_lane
+            row_local = fx.Int32(mr * 16) + m_lane
+
+            if const_expr(pad_skip and mr > 0):
+                # An all-padding 16-row group kept its +0.0 accumulators, whose
+                # SwiGLU is +0.0: skip the LDS reads and the math, keep the quant.
+                r0 = fx.Float32(0.0)
+                r1 = fx.Float32(0.0)
+                r2 = fx.Float32(0.0)
+                r3 = fx.Float32(0.0)
+                r4 = fx.Float32(0.0)
+                r5 = fx.Float32(0.0)
+                r6 = fx.Float32(0.0)
+                r7 = fx.Float32(0.0)
+                if n_live > fx.Int32(mr):
+                    rr = epi_activation(row_lds)
+                    r0 = rr[0]
+                    r1 = rr[1]
+                    r2 = rr[2]
+                    r3 = rr[3]
+                    r4 = rr[4]
+                    r5 = rr[5]
+                    r6 = rr[6]
+                    r7 = rr[7]
+                result = [r0, r1, r2, r3, r4, r5, r6, r7]
+            else:
+                result = epi_activation(row_lds)
 
             local_max = _fabs_f32(result[0])
             for ee in range_constexpr(1, 8):
@@ -1593,8 +1679,19 @@ def compile_gemm1_a4w4_port(
     num_waves=4,
     k_wave=1,
     bf16_act_quant=False,
+    pad_skip=False,
+    a_depth=2,
+    k_stages=0,
 ):
-    """Compile GEMM1 with expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output.
+
+    For the k-split pipeline (BM128 / BN256 / 4-wave A4W4, separated gate/up, no
+    bias; other variants of a name compile without them): ``pad_skip`` (``_ps``)
+    skips the MFMAs of 32-row sub-blocks that hold only sorting padding and the
+    activation math of all-padding 16-row groups (same bits: their accumulators
+    stay +0.0); ``a_depth`` (``_ad<n>``) is how many K tiles the A register
+    staging runs ahead of its LDS write; ``k_stages`` (``_ks<n>``) the K pipeline
+    depth (LDS A slots - 1), overriding default_k_stages."""
     try:
         _assert_supported(
             D_HIDDEN=D_HIDDEN,
@@ -1644,9 +1741,23 @@ def compile_gemm1_a4w4_port(
             kmchunks_for(BM) % epi_splits == 0
         ), f"epi_splits={epi_splits} does not divide BM={BM} evenly"
 
-    k_stages = default_k_stages(
-        BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
-    )
+    if not (
+        a_dtype == "fp4"
+        and not inline_quant
+        and BM == 128
+        and BN == 256
+        and num_waves == 4
+        and k_wave == 1
+        and not interleave
+        and not enable_bias
+    ):
+        # the name's interleaved and bias variants compile without these tokens
+        pad_skip, a_depth, k_stages = False, 2, 0
+    k_stages_req = k_stages
+    if not k_stages:
+        k_stages = default_k_stages(
+            BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
+        )
     assert (
         1 <= k_stages <= K_TILES_TOTAL // k_wave
     ), f"k_stages must be in [1, {K_TILES_TOTAL // k_wave}], got {k_stages}"
@@ -1692,6 +1803,12 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_es{epi_splits}"
     if bf16_act_quant:
         name_suffix += "_bf16q"
+    if k_stages_req:
+        name_suffix += f"_ks{k_stages_req}"
+    if a_depth != 2:
+        name_suffix += f"_ad{a_depth}"
+    if pad_skip:
+        name_suffix += "_ps"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1793,6 +1910,8 @@ def compile_gemm1_a4w4_port(
                 epi_splits=epi_splits,
                 k_stages=k_stages,
                 bf16_act_quant=bf16_act_quant,
+                pad_skip=pad_skip,
+                a_depth=a_depth,
             )
 
     @flyc.jit

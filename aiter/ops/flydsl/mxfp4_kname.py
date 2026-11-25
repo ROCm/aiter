@@ -8,6 +8,10 @@ _MXMOE_NUMERIC_TOKENS = {
     "SK": "kSplitK",
     "KW": "k_wave",
     "XCD": "xcd_swizzle",
+    # GEMM1 k-split pipeline (BM128 BN256 4-wave A4W4): K pipeline depth and A
+    # register-staging depth.
+    "KS": "k_stages",
+    "AD": "a_depth",
 }
 _MXMOE_G1_FLAG_TOKENS = {
     "NT",
@@ -20,6 +24,8 @@ _MXMOE_G1_FLAG_TOKENS = {
     # GEMM1 rounds the activation to bf16 before its fused MX quant and scales
     # the gate by alpha before exp2, as the two-stage path does (MXFP4 output).
     "BF16Q",
+    # GEMM1 skips the MFMAs / activation math of sorting-padding rows (same bits).
+    "PS",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -128,6 +134,9 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
         "bf16_act_quant": "BF16Q" in flags,
+        "pad_skip": "PS" in flags,
+        "a_depth": nums.get("a_depth", 2),
+        "k_stages": nums.get("k_stages", 0),
     }
 
 

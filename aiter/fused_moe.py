@@ -3861,6 +3861,9 @@ def _mxfp4_a4w4_stage1(
         num_waves=num_waves,
         k_wave=k_wave,
         bf16_act_quant=_p1["bf16_act_quant"],
+        pad_skip=_p1["pad_skip"],
+        a_depth=_p1["a_depth"],
+        k_stages=_p1["k_stages"],
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
