@@ -38,6 +38,13 @@ def generate_inputs(batch, heads=HEADS, q_width=D_NOPE, seed=0):
         < 0.02
     )
     q = torch.where(tiny, q * 1e-33, q)
+    # All-zero blocks (amax 0, ideal scale 1): zero rows zero every block of
+    # their output, and a zero W_UK slice zeroes one block of every row.
+    zero = (
+        torch.rand((batch, heads, 1), dtype=torch.float32, device="cuda", generator=gen)
+        < 0.02
+    )
+    q = torch.where(zero, torch.zeros_like(q), q)
     q_nope = q.to(torch.bfloat16)[..., :D_NOPE]
     w_uk = (
         torch.randn(
@@ -45,6 +52,7 @@ def generate_inputs(batch, heads=HEADS, q_width=D_NOPE, seed=0):
         )
         * 0.05
     ).to(torch.bfloat16)
+    w_uk[::7, 32:48] = 0
     q_nope_fp4 = torch.empty(
         (batch, heads, KV_LORA // 2), dtype=torch.uint8, device="cuda"
     )
@@ -108,6 +116,10 @@ def test_fused_bf16_bmm_nvfp4_quant_mla(batch, q_width):
     assert torch.equal(got_aux[..., 64:96], want_scales), "NoPE scales differ"
     assert torch.equal(got_aux[..., :64], stale[..., :64])
     assert torch.equal(got_aux[..., 96:], stale[..., 96:])
+    # The block the zero W_UK slice leaves in every row: ideal scale 1, zero codes.
+    unit = torch.tensor(Q_GAIN).to(torch.float8_e4m3fn).view(torch.uint8).item()
+    assert (got_aux[:, ::7, 64 + 2] == unit).all()
+    assert (got_codes[:, ::7, 16:24] == 0).all()
 
 
 def test_allocates_outputs_and_empty_batch():
