@@ -32,6 +32,13 @@ AgentX 32768 on 65280, layer 30: 700 -> 753 -> 634. Decomposition (layer 30,
 v2): prologue + epilogue alone 40, the union walk's DMA alone 119, the math
 without DMA 191, all 271: the DMA and the math do not overlap.
 
+``pipe`` (opt-in; V dequantized inside the pair's block, ring of 2 or 3) splits
+a page's DMA into its K planes and its V planes: QK starts once the K planes
+landed and the V planes are awaited only before the V dequant, so they may
+still be in flight under QK; ``prefetch`` k adds L2 prefetch hints k pages
+ahead of the DMA ring. Both leave the arithmetic and its order alone: the
+output is bit for bit the default kernel's.
+
 ``dbg`` (benchmark decomposition only): 1 DMA walk without math, 2 prologue and
 epilogue only, 3 math without DMA, 4/5 fewer DMA planes, 6 every DMA the first
 union page.
@@ -105,8 +112,13 @@ def _wmma_scale16_32x16(a, b, scale_a, scale_b):
 
 
 def kernel_name(tq, nb, waves_per_eu, rebase_log2, v_hoist, fence, quant_mx, all_rows=False, v_wide=False,
-                v_valu=0, q_regs=False, dbg=0, async_dma=False, cta_dma=False):
+                v_valu=0, q_regs=False, dbg=0, async_dma=False, cta_dma=False,
+                pipe=False, prefetch=0):
     name = f"pa_sparse_prefill_nvfp4_v2_d128_bs128_gqa16_top16_tq{tq}_rb{rebase_log2}"
+    if pipe:
+        name += "_pipe"
+    if prefetch:
+        name += f"_pf{prefetch}"
     if cta_dma:
         name += "_cdma"
     if async_dma:
@@ -151,6 +163,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     dbg=0,
     async_dma=False,
     cta_dma=False,
+    pipe=False,
+    prefetch=0,
 ):
     """Compile (cached) the pair-batched reuse kernel; ``launch`` takes the same
     arguments as ``compile_pa_sparse_prefill_nvfp4``'s.
@@ -177,8 +191,18 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     ``cta_dma``: wave w DMAs plane w (K, V, K scales, V scales) of the whole
     page, then a CTA barrier a page: one tensor DMA a page and wave instead of
     four (the waves walk the same union in lockstep anyway).
+    ``pipe``: a page's tensor DMAs go K, K scales, V, V scales; a wave starts QK
+    when the K planes landed and waits for the V planes only before it reads
+    them (after QK and the maxima), instead of waiting for all four before QK.
+    Same arithmetic in the same order: bit for bit the default's output. Not
+    with ``v_hoist`` (V is read before QK) nor a ring of 4 (the compiler keeps
+    at most 10 tensor DMAs in flight, so staging the third page ahead would wait
+    for the V planes anyway).
+    ``prefetch`` k: L2 prefetch hints for this wave's slice of the union page k
+    pages past the newest one in the DMA ring (0: none).
     """
     tq, nb = int(tile_rows), int(nvfp4_buffers)
+    pipe, prefetch = bool(pipe), int(prefetch)
     # Defaults measured on real MiniMax-M3.1 picks (MI455X, 14336 new on 99968
     # cached): two rows a tile, the query terms in VGPRs, 3 waves a SIMD.
     if q_regs is None:
@@ -189,12 +213,19 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         raise ValueError(f"tile_rows must be one of {TILE_ROWS}")
     if nb not in (2, 3, 4):
         raise ValueError("nvfp4_buffers must be 2, 3 or 4")
+    if not 0 <= prefetch <= 8:
+        raise ValueError("prefetch must be 0..8 pages")
     pairs = tq // 2
     all_rows = bool(all_rows)
     v_hoist = (pairs > 1 and not all_rows) if v_hoist is None else bool(v_hoist)
+    if pipe and (async_dma or cta_dma or v_valu or v_hoist or nb == 4 or dbg in (4, 5)):
+        raise ValueError(
+            "pipe needs tile_rows 2 (or v_hoist=0 / all_rows=1), nvfp4_buffers 2 "
+            "or 3, the tensor DMAs (no async_dma / cta_dma) and v_valu 0"
+        )
     scale = float(softmax_scale)
     rb = int(rebase_log2)
-    key = (tq, nb, scale, int(waves_per_eu), rb, v_hoist, int(fence), bool(quant_mx), all_rows, bool(v_wide), int(v_valu), bool(q_regs), int(dbg), bool(async_dma), bool(cta_dma))
+    key = (tq, nb, scale, int(waves_per_eu), rb, v_hoist, int(fence), bool(quant_mx), all_rows, bool(v_wide), int(v_valu), bool(q_regs), int(dbg), bool(async_dma), bool(cta_dma), pipe, prefetch)
     if key in _CACHE:
         return _CACHE[key]
     lay = dict(_layout(tq, nb))
@@ -352,7 +383,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         return p.to(fx.BFloat16), total
 
     @flyc.kernel(
-        name=kernel_name(tq, nb, waves_per_eu, rb, v_hoist, fence, quant_mx, all_rows, v_wide, v_valu, q_regs, dbg, async_dma, cta_dma), known_block_size=(THREADS, 1, 1)
+        name=kernel_name(tq, nb, waves_per_eu, rb, v_hoist, fence, quant_mx, all_rows, v_wide, v_valu, q_regs, dbg, async_dma, cta_dma, pipe, prefetch), known_block_size=(THREADS, 1, 1)
     )
     def kernel(
         query: fx.Pointer,
@@ -530,15 +561,27 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             base = slot_base(slot)
             payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(warp * (_TOKENS * _ROW // 2))
             scales = fx.Int64(page) * fx.Int64(sk_block) // 2 + fx.Int64(warp * (_TOKENS * _SROW // 2))
-            for ptr, plane in (((key, _PLANE_K),) if dbg == 5 else ((key, _PLANE_K), (value, _PLANE_V))):
+            planes = [(key, _PLANE_K, payload, _ROW)]
+            if const_expr(dbg != 5):
+                planes.append((value, _PLANE_V, payload, _ROW))
+            if const_expr(dbg != 4):
+                planes += [
+                    (ks, _PLANE_KS, scales, _SROW),
+                    (vs, _PLANE_VS, scales, _SROW),
+                ]
+            if const_expr(pipe):
+                # K, K scales, V, V scales: QK's planes are the page's oldest.
+                planes.sort(key=lambda p: p[1] in (_PLANE_V, _PLANE_VS))
+            for ptr, plane, source, row in planes:
                 mem.tdm_copy(
-                    _gptr(ptr, fx.BFloat16, 16), payload, base + plane, (_TOKENS * _ROW // 2,), (1,),
-                    (valid * (_ROW // 2),), 8, 8,
-                )
-            for ptr, plane in (() if dbg == 4 else ((ks, _PLANE_KS), (vs, _PLANE_VS))):
-                mem.tdm_copy(
-                    _gptr(ptr, fx.BFloat16, 16), scales, base + plane, (_TOKENS * _SROW // 2,), (1,),
-                    (valid * (_SROW // 2),), 8, 8,
+                    _gptr(ptr, fx.BFloat16, 16),
+                    source,
+                    base + plane,
+                    (_TOKENS * row // 2,),
+                    (1,),
+                    (valid * (row // 2),),
+                    8,
+                    8,
                 )
 
         def stage_async(u, slot):
@@ -588,12 +631,52 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         if const_expr(cta_dma):
             stage = stage_cta  # noqa: F811
 
+        def wait_later(u, depth, extra):
+            """Until only ``extra`` DMAs of page u and those of the (at most
+            ``depth``) pages staged after it remain: a wave's DMAs finish in
+            issue order, as the default walk's waits assume."""
+            if const_expr(depth == 0):
+                tdm_ops.tensor_wait(extra)
+            else:
+                if u + depth < n_union:
+                    tdm_ops.tensor_wait(extra + 4 * depth)
+                else:
+                    wait_later(u, depth - 1, extra)
+
+        def prefetch_page(u):
+            """L2 hints for this wave's slice of union page u: a lane a 64 B line
+            of the K and of the V rows, four lanes a line of each scale plane."""
+            if u < n_union:
+                page = fx.Int64(page_of(u))
+                targets = [
+                    fx.Int64(fx.ptrtoint(ptr))
+                    + page * (PAGE * _ROW)
+                    + fx.Int64(warp * (_TOKENS * _ROW) + lane * 64)
+                    for ptr in (key, value)
+                ]
+                targets.append(
+                    (lane % 8 < 4).select(
+                        fx.Int64(fx.ptrtoint(ks)), fx.Int64(fx.ptrtoint(vs))
+                    )
+                    + page * fx.Int64(sk_block)
+                    + fx.Int64(warp * (_TOKENS * _SROW) + (lane % 4) * 64)
+                )
+                for target in targets:
+                    # Raw ROCDL: tdm_ops.l2_prefetch_tile hints one address a
+                    # thread of an fx.Tensor tile, not a byte address a lane.
+                    fx.rocdl.global_prefetch(
+                        create_llvm_ptr(target, address_space=1),
+                        cache_policy=_attr("8 : i32"),  # SE scope: L2
+                    )
+
         if const_expr(dbg != 3):
             if n_union > 0:
                 stage(fx.Int32(0), fx.Int32(0))
             for ahead in range_constexpr(1, nb - 1):
                 if ahead < n_union:
                     stage(fx.Int32(ahead), fx.Int32(ahead))
+            for ahead in range_constexpr(nb - 1, nb - 1 + prefetch):
+                prefetch_page(fx.Int32(ahead))
 
         # ---- queries: split once a CTA into LDS ----
         for t0 in range_constexpr(0, tq, NWARP):
@@ -696,24 +779,15 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                             fx.rocdl.s_wait_asynccnt(10)
                         else:
                             fx.rocdl.s_wait_asynccnt(0)
-            elif const_expr(nb == 2):
-                tdm_ops.tensor_wait(0)
-            elif const_expr(nb == 3):
-                if u + 1 < n_union:
-                    tdm_ops.tensor_wait(4)
-                else:
-                    tdm_ops.tensor_wait(0)
             else:
-                if u + 2 < n_union:
-                    tdm_ops.tensor_wait(8)
-                else:
-                    if u + 1 < n_union:
-                        tdm_ops.tensor_wait(4)
-                    else:
-                        tdm_ops.tensor_wait(0)
+                # Page u's DMAs are this wave's oldest; ``pipe``: only its K
+                # planes are due, its V planes may stay in flight.
+                wait_later(u, nb - 2, 2 if pipe else 0)
             if const_expr(dbg != 3):
                 if u + (nb - 1) < n_union:
                     stage(u + (nb - 1), (u + (nb - 1)) % nb)
+                if const_expr(prefetch):
+                    prefetch_page(u + (nb - 1) + prefetch)
             base = slot_base(slot)
             bounds = bounds_of(u)
             k_tiles = [rows_operand(lds_load, base, P_K, P_KS, n, lane16, half) for n in range_constexpr(2)]
@@ -789,6 +863,18 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     dtype=fx.Float32,
                 ).to(fx.BFloat16)
 
+            def v_operands():
+                """The page's raw V rows; ``pipe``: once its V planes landed."""
+                if const_expr(pipe and dbg != 3):
+                    wait_later(u, nb - 1, 0)
+                v_raw = [
+                    rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
+                    for n in range_constexpr(2)
+                ]
+                if const_expr(v_wide):
+                    v_raw.append(lds_load(base + P_VS + lane * _SROW, fx.Int64, 1)[0])
+                return v_raw
+
             v_hoisted = None
             if const_expr(v_hoist):
                 top = bounds[0]
@@ -796,25 +882,24 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     top = fx.max(top, bounds[t])
                 v_hoisted = [zero_v for _ in range_constexpr(8)]
                 if top > lo:
-                    v_raw_h = [rows_operand(lds_load, base, P_V, P_VS, n, lane16, half) for n in range_constexpr(2)]
-                    if const_expr(v_wide):
-                        v_raw_h.append(lds_load(base + P_VS + lane * _SROW, fx.Int64, 1)[0])
+                    v_raw_h = v_operands()
                     v_hoisted = [v_tile(v_raw_h, b) for b in range_constexpr(8)]
 
             def run_rows(rows_state, ts):
                 """One step of rows ``ts`` (all selected the page for this wave):
                 [QK, maxima] | per row a rare rebase branch | [V dequant, P, PV].
                 rows_state: per row [ref, l, acc x 8]."""
-                if const_expr(not v_hoist):
+                if const_expr(not (v_hoist or pipe)):
                     # Issued first: the LDS latency hides under QK.
-                    v_raw = [rows_operand(lds_load, base, P_V, P_VS, n, lane16, half) for n in range_constexpr(2)]
-                    if const_expr(v_wide):
-                        v_raw.append(lds_load(base + P_VS + lane * _SROW, fx.Int64, 1)[0])
+                    v_raw = v_operands()
                 raws, maxes = [], []
                 for t in ts:
                     raw = tail_mask(qk(q_resident[t] if q_regs else q_row(t), k_tiles), bounds[t])
                     raws.append(raw)
                     maxes.append(head_max(raw))
+                if const_expr(pipe):
+                    # After QK: the LDS latency hides under the rebase and P.
+                    v_raw = v_operands()
                 cur, refs_p = [], []
                 for i, t in enumerate(ts):
                     ref, l = rows_state[i * 10], rows_state[i * 10 + 1]

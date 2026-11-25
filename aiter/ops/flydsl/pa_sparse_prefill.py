@@ -157,9 +157,9 @@ def pa_sparse_prefill_nvfp4(
         compiled = compile_pa_sparse_prefill_nvfp4_v2(
             tile_rows=tile_rows,
             softmax_scale=softmax_scale,
-            nvfp4_buffers=nvfp4_buffers,
             quant_mx=quant,
-            **(v2 or {}),
+            # ``v2`` may set the ring too: ATOM passes only this option dict.
+            **{"nvfp4_buffers": nvfp4_buffers, **(v2 or {})},
         )
     else:
         compiled = compile_pa_sparse_prefill_nvfp4(
