@@ -103,7 +103,7 @@ def test_moe_route_sort_quant(m):
     logits = torch.randn((m, rsq.E_ROUTED), dtype=dtypes.fp32, generator=gen) * 2
     bias = torch.randn(rsq.E_ROUTED, dtype=dtypes.fp32, generator=gen) * 0.1
     block_m = mrsq.block_m_for(m)
-    router = mrsq.RouteA()
+    router = mrsq.MoeRouteSortQuant()
     ref = run_chain(x, logits, bias, block_m)
     check(x, ref, router(logits, bias, x))
     # read logits and x, write a1 and the sorted outputs

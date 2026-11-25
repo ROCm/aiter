@@ -3,9 +3,9 @@
 
 """The fused MoE routing kernel in front of fused_moe (DeepSeek-V4.1-Flash TP4, gfx950).
 
-`RouteA` keeps the kernel's persistent buffers (workspace, the sorted scale buffer zeroed once) and runs the
+`MoeRouteSortQuant` keeps the kernel's persistent buffers (workspace, the sorted scale buffer zeroed once) and runs the
 routing kernel for 257-2048 rows in two launches (`build_route_p1` / `build_route_p2`).
-`fused_moe_route_a(x, logits, bias, w1, w2, **fused_moe_kwargs)` runs it, then aiter.fused_moe with its decode
+`fused_moe_with_routing(x, logits, bias, w1, w2, **fused_moe_kwargs)` runs it, then aiter.fused_moe with its decode
 sort+quant hook (`_is_fused_decode_sort_quant_enabled` / `_fused_decode_sort_quant`) pointed at the kernel's
 outputs, so stage 1 takes the prequantized MXFP8 a1 and the sorted e8m0 scales and no sort or quant runs inside
 fused_moe. topk_ids / topk_weights passed to fused_moe are the kernel's own.
@@ -33,7 +33,7 @@ def block_m_for(m):
     return 64 if m > 1024 else 32
 
 
-class RouteA:
+class MoeRouteSortQuant:
     def __init__(self, device="cuda", max_tokens=rsq.MAX_TOKENS):
         self.dev = torch.device(device)
         self.exe1 = rsq.build_route_p1()
@@ -144,7 +144,7 @@ def _sort_quant(
         or num_local_tokens is not None
     ):
         raise ValueError(
-            f"route_a: block_m {block_m}, experts {global_experts}, compact_scale {compact_scale}"
+            f"moe_route_sort_quant: block_m {block_m}, experts {global_experts}, compact_scale {compact_scale}"
         )
     m = hidden_states.shape[0]
     # accumulate (atomic stage 2) needs a zeroed output; the FP8 route-out stage 2 overwrites it
@@ -181,8 +181,8 @@ def _hook(route):
         fm._is_fused_decode_sort_quant_enabled, fm._fused_decode_sort_quant = old
 
 
-def fused_moe_route_a(
-    router: RouteA, x, logits, bias_f32, w1, w2, rsf=1.0, shared_w=1.0, **kw
+def fused_moe_with_routing(
+    router: MoeRouteSortQuant, x, logits, bias_f32, w1, w2, rsf=1.0, shared_w=1.0, **kw
 ):
     import aiter.fused_moe as fm
 

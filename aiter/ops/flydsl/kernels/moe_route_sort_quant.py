@@ -109,7 +109,7 @@ def build_route_p1(waves: int = WAVES):
     """Launch 1: top-k, ids / weights, count atomics (slots), MXFP8 a1 and token-order e8m0 bytes."""
     WAVES_ = waves
     BLOCK_ = WAVE * waves
-    name = f"moe_route_a5b_p1_e385_k7_d{DIM}_w{waves}"
+    name = f"moe_route_sort_quant_p1_e385_k7_d{DIM}_w{waves}"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_, 1, 1])
     def p1_kernel(
@@ -334,7 +334,7 @@ def build_route_p2(block_m: int = BLOCK_M, waves: int = WAVES):
     BLOCK_ = WAVE * waves
     assert block_m in (32, 64)
     BM, BM_SHIFT = block_m, block_m.bit_length() - 1
-    name = f"moe_route_a5b_p2_e385_k7_d{DIM}_bm{block_m}_w{waves}"
+    name = f"moe_route_sort_quant_p2_e385_k7_d{DIM}_bm{block_m}_w{waves}"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_, 1, 1])
     def p2_kernel(
