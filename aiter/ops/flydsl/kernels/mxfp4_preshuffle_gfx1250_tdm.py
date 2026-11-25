@@ -366,7 +366,15 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # The fixed placement gives each of the two k128 prefetch slots 128 VGPRs
+    # (v256-v511) and the accumulators 512 (from v512). A warp tile that needs
+    # more, such as m_warp=1 or an a8w4 2x2 tile, keeps compiler allocation
+    # like every non-prefill tile instead of failing to build.
+    slot_vgprs = wmma_m_rep * (8 if a_is_fp4 else 16) + wmma_n_rep * (WMMA_N // 2)
+    fits_vgpr_partition = slot_vgprs <= 128 and n_acc * (WMMA_N // 2) <= 512
+    USE_EXPLICIT_VGPR_PARTITION = bool(
+        is_prefill and callable(sched_vgpr) and fits_vgpr_partition
+    )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}

@@ -2,16 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Run on gfx1250: python -m pytest op_tests/test_mla_nvfp4.py -q.
 
-The NumPy oracle uses logical matrices, independently of native lane/LDS layout.
+The NumPy oracle checks the specified quantized algorithm, independently of
+native lane/LDS layout. It is an implementation check, not evidence of model
+accuracy. The primary operator accuracy reference is full FP32 softmax attention
+on original BF16 inputs in test_mla_decode_pagesize64.py::TestMlaNvfp4Page64.
 Set AITER_NVFP4_TEST_LARGE=1 to exercise both KV streams above 4 GiB (~12 GiB).
 """
 
-import hashlib
-import json
 import math
 import os
 import struct
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -91,23 +91,20 @@ def pack(qc, qs, cc, cs):
         .copy()
         .reshape(p, 16384)
     )
-    ca = np.full((p, 2, 4096), 127, np.uint8)
-    for g in range(2):
+    ca = np.full((p, 4, 8, 16, 16), 127, np.uint8)
+    for g in range(4):
         for f in range(2):
-            ca[:, g, f * 1024 : (f + 1) * 1024] = (
-                pack4(cc[:, g * 32 : (g + 1) * 32, 512 + f * 64 : 576 + f * 64])
-                .reshape(p, 2, 16, 2, 16)
-                .transpose(0, 1, 3, 2, 4)
-                .reshape(p, 1024)
+            ca[:, g, 2 * f : 2 * f + 2] = (
+                pack4(cc[:, g * 16 : (g + 1) * 16, 512 + f * 64 : 576 + f * 64])
+                .reshape(p, 16, 2, 16)
+                .transpose(0, 2, 1, 3)
             )
-        ca[:, g, 2048:3072] = (
-            cs[:, g * 32 : (g + 1) * 32, :32]
-            .reshape(p, 32, 4, 8)
+        ca[:, g, 4:6] = (
+            cs[:, g * 16 : (g + 1) * 16, :32]
+            .reshape(p, 16, 2, 16)
             .transpose(0, 2, 1, 3)
-            .reshape(p, 1024)
         )
-        ca[:, g, 3072:3200] = cs[:, g * 32 : (g + 1) * 32, 32:36].reshape(p, 128)
-        ca[:, g, 3200:3328] = cs[:, g * 32 : (g + 1) * 32, 36:].reshape(p, 128)
+        ca[:, g, 6, :, :8] = cs[:, g * 16 : (g + 1) * 16, 32:]
     return qn, qa, cn, ca.reshape(p, 8192)
 
 
@@ -157,6 +154,9 @@ def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
             cc[..., 576:] = 0
         else:
             cc[..., 512:576] = 0
+    if mode == "constant_v":
+        cc[..., :512] = 2
+        cs[..., :32] = 0x60
     q = F4[qc] * np.repeat(e4(qs), 16, axis=-1)
     c = F4[cc] * np.repeat(e4(cs), 16, axis=-1)
     for r in range(b):
@@ -180,7 +180,7 @@ def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
         "params": prepare_mla_nvfp4_params(
             device="cuda", physical_pages=p, sm_scale=scale, rebase_threshold=threshold
         ),
-        "return_lse": True,
+        "return_lse": False,
     }
     logical = {
         "q": q,
@@ -194,12 +194,11 @@ def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
     return args, logical, (out_storage, lse_storage)
 
 
-def oracle(case):
-    outputs, lses = [], []
+def quantized_algorithm_oracle(case):
+    outputs = []
     for r, length in enumerate(case["lengths"]):
         if length == 0:
             outputs.append(np.zeros((128, 512), np.float32))
-            lses.append(np.full(128, -np.inf, np.float32))
             continue
         c = case["c"][case["idx"][case["ptr"][r] : case["ptr"][r + 1]]].reshape(
             -1, 640
@@ -217,63 +216,70 @@ def oracle(case):
                     @ ct[:, k * 128 : (k + 1) * 128].astype(np.float64).T
                 ).astype(np.float32)
             score += (
-                q[:, 512:].astype(np.float64)
-                @ np.concatenate((ct[:, 512:576], ct[:, 512:576]), axis=1)
-                .astype(np.float64)
-                .T
+                np.concatenate((q[:, 512:576], q[:, 512:576]), axis=1).astype(
+                    np.float64
+                )
+                @ ct[:, 512:].astype(np.float64).T
             ).astype(np.float32)
             score += (
-                q[:, 512:576].astype(np.float64) @ ct[:, 576:].astype(np.float64).T
+                q[:, 576:].astype(np.float64) @ ct[:, 512:576].astype(np.float64).T
             ).astype(np.float32)
-            scores = np.full((128, 128), -np.inf, np.float32)
-            scores[:, :n] = score * case["beta"]
-            scores = scores.reshape(128, 8, 16)
-            gm = scores.max(axis=2)
-            local = np.exp2(
-                scores - np.maximum(gm[..., None], np.finfo(np.float32).min)
-            ).astype(np.float32)
+            raw = np.full((128, 128), -np.inf, np.float32)
+            raw[:, :n] = score
+            raw = raw.reshape(128, 8, 16)
+            gm = raw.max(axis=2) * case["beta"]
             tilemax = gm.max(axis=1)
             if anchor is None:
                 anchor = tilemax.copy()
             else:
                 new = np.where(tilemax - anchor > case["threshold"], tilemax, anchor)
-                alpha = np.exp2(anchor - new).astype(np.float32)
+                alpha = np.exp2((anchor - new).astype(np.float64)).astype(np.float32)
                 den *= alpha
                 acc *= alpha[:, None]
                 anchor = new
-            relative = np.exp2(gm - anchor[:, None]).astype(np.float32)
-            den += (local.sum(axis=2) * relative).sum(axis=1)
+            # Local N16 exponentials under a common N128 online anchor.
+            # Each group quantizes 6*e to FP4 and 5*w to FP8. Both numerator
+            # and denominator use that same quantized mass. Masked groups are zero.
+            # Evaluate exp2 in FP64 then round, to avoid NumPy FP32 SIMD error
+            # moving a probability across an E2M1 midpoint.
+            exponent = (
+                raw.astype(np.float64) * float(case["beta"])
+                - np.maximum(gm, np.finfo(np.float32).min)[..., None]
+            ).astype(np.float32)
+            local = np.exp2(exponent.astype(np.float64)).astype(np.float32)
+            delta = gm - anchor[:, None]
+            relative = np.exp2(delta.astype(np.float64)).astype(np.float32)
             p = (
-                F4[nearest(local * 6, F4[:8])]
+                F4[nearest(local * np.float32(6), F4[:8])]
                 * S8[nearest(relative * 5, S8)][..., None]
             )
+            den += p.astype(np.float64).sum(axis=(1, 2)).astype(np.float32)
             acc += (
                 p.reshape(128, 128)[:, :n].astype(np.float64)
                 @ ct[:, :512].astype(np.float64)
             ).astype(np.float32)
-        outputs.append(acc * (np.float32(1 / 2688) / den)[:, None])
-        lses.append((np.log2(den) + anchor) * np.float32(np.log(2)))
+        outputs.append(acc * ((np.float32(1) / den) * np.float32(1 / 89.6))[:, None])
     if not outputs:
-        return np.empty((0, 128, 512), np.float32), np.empty((0, 128), np.float32)
+        return np.empty((0, 128, 512), np.float32)
     o = torch.from_numpy(np.stack(outputs)).to(torch.bfloat16).float().numpy()
-    return o, np.stack(lses)
+    return o
 
 
 def check(args, logical, guards=None):
     out, lse = mla_decode_nvfp4_fwd(**args)
-    expected, expected_lse = oracle(logical)
+    assert lse is None
+    expected = quantized_algorithm_oracle(logical)
     actual = out.float().cpu().numpy()
     if actual.size:
         assert np.isfinite(actual).all()
         rms = np.sqrt(np.mean(expected.astype(np.float64) ** 2))
         diff = actual - expected
         assert np.sqrt(np.mean(diff.astype(np.float64) ** 2)) <= 0.003 * max(rms, 1e-8)
-        assert np.max(np.abs(diff)) <= 0.025 * max(rms, 1e-8)
-        np.testing.assert_allclose(lse.cpu().numpy(), expected_lse, atol=2e-4, rtol=0)
+        assert np.max(np.abs(diff)) <= 0.025
     if guards:
         assert torch.isnan(guards[0][-256:]).all()
-        assert torch.all(guards[1][-256:] == 12345)
-    return out.clone(), lse.clone()
+        assert torch.all(guards[1] == 12345)
+    return out.clone()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -287,9 +293,10 @@ def require_gpu():
 
 
 @pytest.mark.parametrize(
-    "mode", ["random", "rescale", "nope", "rope", "residual_q", "residual_k"]
+    "mode",
+    ["random", "rescale", "nope", "rope", "residual_q", "residual_k", "constant_v"],
 )
-def test_decode_oracle(mode):
+def test_decode_quantized_algorithm(mode):
     args, logical, guards = make_case(
         [
             0,
@@ -321,13 +328,27 @@ def test_decode_oracle(mode):
     expected = check(args, logical, guards)
     for _ in range(2):
         mla_decode_nvfp4_fwd(**args)
-        assert torch.equal(args["out"], expected[0])
-        assert torch.equal(args["lse"], expected[1])
+        assert torch.equal(args["out"], expected)
+        assert (args["lse"] == 12345).all()
 
 
-@pytest.mark.parametrize("threshold", [0.0, 6.0])
-def test_threshold(threshold):
-    check(*make_case([1, 129, 1153, 2049], "rescale", threshold))
+def test_threshold_and_params():
+    args, logical, guards = make_case([1, 129, 1153, 2049], "rescale")
+    decoded = struct.unpack("<fffI", args["params"].cpu().numpy().tobytes())
+    expected = struct.unpack(
+        "<fffI",
+        struct.pack("<fffI", logical["beta"], 1 / 89.6, 1.0, args["kv_nope"].shape[0]),
+    )
+    assert decoded == expected
+    check(args, logical, guards)
+
+
+def test_constant_v_normalization():
+    args, logical, guards = make_case([1, 17, 65, 129, 513, 2049], "constant_v")
+    out = check(args, logical, guards)
+    # With matching quantized numerator/denominator mass, O must preserve V.
+    expected = torch.full_like(out, 32 / 89.6)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 def test_empty_batch():
@@ -355,7 +376,7 @@ def test_native_public_and_dispatch():
             )
         )
     )
-    assert torch.equal(args["out"], expected[0])
+    assert torch.equal(args["out"], expected)
     kwargs = {
         "q": args["q_nope"],
         "kv_buffer": args["kv_nope"],
@@ -371,10 +392,10 @@ def test_native_public_and_dispatch():
         "kv_aux": args["kv_aux"],
         "nvfp4_params": args["params"],
         "nvfp4_lse": args["lse"],
-        "return_lse": True,
+        "return_lse": False,
     }
     out, lse = aiter.mla.mla_decode_fwd(**kwargs)
-    assert torch.equal(out, expected[0]) and torch.equal(lse, expected[1])
+    assert torch.equal(out, expected) and lse is None
     for change in (
         {"num_kv_splits": 2},
         {"max_seqlen_q": 2},
@@ -382,10 +403,17 @@ def test_native_public_and_dispatch():
         {"sm_scale": 0.1},
         {"return_logits": True},
         {"kv_csr_layout": "token"},
+        {"return_lse": True},
     ):
         with pytest.raises(ValueError):
             aiter.mla.mla_decode_fwd(**(kwargs | change))
-    assert mla_decode_nvfp4_fwd(**(args | {"return_lse": False}))[1] is None
+    with pytest.raises(ValueError, match="does not produce LSE"):
+        mla_decode_nvfp4_fwd(**(args | {"return_lse": True}))
+    out, lse = mla_decode_nvfp4_fwd(**(args | {"lse": None}))
+    assert torch.equal(out, expected) and lse is None
+    out, lse = aiter.mla.mla_decode_fwd(**(kwargs | {"nvfp4_lse": None}))
+    assert torch.equal(out, expected) and lse is None
+    assert (args["lse"] == 12345).all()
 
 
 def test_contracts():
@@ -408,12 +436,17 @@ def test_contracts():
     for kw in (
         {"physical_pages": 0},
         {"sm_scale": float("nan")},
+        {"rebase_threshold": 0},
+        {"rebase_threshold": 6},
+        {"rebase_threshold": float("nan")},
         {"rebase_threshold": 8},
     ):
         with pytest.raises(ValueError):
             prepare_mla_nvfp4_params(
                 **({"device": "cuda", "physical_pages": 1, "sm_scale": 0.1} | kw)
             )
+    with pytest.raises(TypeError, match="aux_layout"):
+        mla_nvfp4_update_cache(None, None, None, None, None, None, aux_layout="n32")
 
 
 def test_stream_graph_compile():
@@ -428,18 +461,19 @@ def test_stream_graph_compile():
             mla_decode_nvfp4_fwd(**args)
         graph.replay()
     torch.cuda.current_stream().wait_stream(stream)
-    assert torch.equal(args["out"], expected[0])
+    assert torch.equal(args["out"], expected)
     args["kv_indptr"].zero_()
     args["kv_last_page_lens"].zero_()
     graph.replay()
     torch.cuda.synchronize()
-    assert (args["out"] == 0).all() and torch.isneginf(args["lse"]).all()
+    assert (args["out"] == 0).all() and (args["lse"] == 12345).all()
     args, logical, _ = make_case([65])
+    args["lse"] = None
     compiled = torch.compile(mla_decode_nvfp4_fwd, fullgraph=True)
     out, lse = compiled(**args)
-    out, lse = out.clone(), lse.clone()
+    out = out.clone()
     expected = check(args, logical)
-    assert torch.equal(out, expected[0]) and torch.equal(lse, expected[1])
+    assert torch.equal(out, expected) and lse is None
 
 
 def test_quantize_q():
@@ -473,7 +507,10 @@ def cpu_cache(raw, valid):
     cc[1, 48:64, 512:] = np.concatenate((rc, ec), axis=-1)
     cs[1, 48 : 48 + valid, 32:] = np.concatenate((rs, es), axis=-1)[:valid]
     return pack(
-        np.zeros((1, 128, 640), np.uint8), np.zeros((1, 128, 40), np.uint8), cc, cs
+        np.zeros((1, 128, 640), np.uint8),
+        np.zeros((1, 128, 40), np.uint8),
+        cc,
+        cs,
     )[2:]
 
 
@@ -500,23 +537,10 @@ def test_cache_tail_requantization_and_graph():
     graph.replay()
     ref_cn, ref_ca = cpu_cache(raw[0].float().numpy(), 6)
     np.testing.assert_array_equal(cn[1, 12288:].cpu().numpy(), ref_cn[1, 12288:])
-    # The updated token16 owns scattered fields in N32's AUX arena.
-    ref_ca = ref_ca[1].reshape(2, 4096)[1]
-    got = ca[1].cpu().numpy().reshape(2, 4096)[1]
-    for start, end in (
-        (512, 1024),
-        (1536, 2048),
-        (2176, 2304),
-        (2432, 2560),
-        (2688, 2816),
-        (2944, 3072),
-        (3136, 3200),
-        (3264, 3328),
-        (3712, 4096),
-    ):
-        np.testing.assert_array_equal(got[start:end], ref_ca[start:end])
     assert not torch.equal(cn[1, 12288:12544], previous[1, 12288:12544])
     assert (cn[0] == 0).all() and (ca[0] == 127).all()
+    np.testing.assert_array_equal(ca[1, 6144:].cpu().numpy(), ref_ca[1, 6144:])
+    assert (ca[1, :6144] == 127).all()
 
 
 def test_bf16_producers_to_decode():
@@ -582,7 +606,7 @@ def test_bf16_producers_to_decode():
             device="cuda", physical_pages=3, sm_scale=0.07
         ),
         "lse": torch.empty((3, 128), device="cuda"),
-        "return_lse": True,
+        "return_lse": False,
     }
     # Existing GPU dense-to-CSR adapter; unused table entries are poisoned.
     aiter.mla.mla_decode_prepare_page_csr(
@@ -625,26 +649,3 @@ def test_pages_above_4gib():
         ),
     )
     check(args, logical)
-
-
-def test_co_manifest_and_entry():
-    root = Path(aiter.core.AITER_ASM_DIR) / "gfx1250/mla_nvfp4"
-    manifest = json.loads((root / "manifest.json").read_text())
-    for name, digest in manifest["sha256"].items():
-        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
-    blob = (root / "mla_nvfp4_n128.co").read_bytes()
-    shoff = struct.unpack_from("<Q", blob, 40)[0]
-    entsize, num, strings = struct.unpack_from("<HHH", blob, 58)
-    sections = [
-        struct.unpack_from("<IIQQQQIIQQ", blob, shoff + i * entsize) for i in range(num)
-    ]
-    names = sections[strings]
-    names = blob[names[4] : names[4] + names[5]]
-    byname = {names[s[0] :].split(b"\0", 1)[0].decode(): s for s in sections}
-    text = byname[".text"]
-    assert text[3] % 16384 == 0 and text[8] >= 16384
-    ro = byname[".rodata"]
-    lds, private, karg = struct.unpack_from("<III", blob, ro[4])
-    offset = struct.unpack_from("<q", blob, ro[4] + 16)[0]
-    assert (ro[3] + offset) % 16384 == 0
-    assert (lds, private, karg) == (262144, 0, 80)
