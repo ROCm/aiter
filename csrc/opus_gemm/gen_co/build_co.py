@@ -1021,6 +1021,12 @@ def build_one_grouped(job, args, llvm_bin, workdir):
     }
 
 
+def _built_sort_key(record):
+    """build_info order: kid, then symbol (a grouped kid has one image per layout). A rejected
+    gfx950 record carries no symbol."""
+    return record["kid"], record.get("symbol", "")
+
+
 def _default_co_output_dir(arch, offload_arch, family=None):
     if arch == "gfx950":
         if family in GROUPED_FAMILIES:
@@ -1120,6 +1126,8 @@ def main():
         "gfx1250-strict",
     ):
         p.error("--offload-arch does not match --arch")
+    if args.family in GROUPED_FAMILIES and args.arch != "gfx950":
+        p.error(f"--family {args.family} requires --arch gfx950")
     if not args.out_dir:
         args.out_dir = _default_co_output_dir(args.arch, args.offload_arch, args.family)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -1180,7 +1188,7 @@ def main():
                 built = list(
                     pool.map(lambda k: build(k, args, llvm_bin, workdir), instances)
                 )
-            built.sort(key=lambda b: (b["kid"], b["symbol"]))
+            built.sort(key=_built_sort_key)
     finally:
         if args.keep_temps:
             print(f"[build_co] stub TUs kept in {workdir}")
