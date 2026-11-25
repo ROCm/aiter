@@ -517,7 +517,7 @@ def _byte_ranges(tensor: torch.Tensor) -> list[tuple[int, int]]:
 
 def _is_fake(tensor: torch.Tensor) -> bool:
     """A FakeTensor (AOT dry run), whose ``data_ptr`` is not an address."""
-    return type(tensor).__name__ == "FakeTensor"
+    return isinstance(tensor, torch._subclasses.FakeTensor)
 
 
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:

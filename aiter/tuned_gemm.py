@@ -799,6 +799,22 @@ def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
     return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_decode_layout_fallback(
+    kernel_name, a_stride, b_stride, bias_stride, out_stride
+):
+    """Log once per row and layout that a decode row fell back to torch."""
+    logger.warning(
+        "FlyDSL decode row %s does not take this layout (strides A %s, B %s, "
+        "bias %s, out %s); running torch_gemm instead",
+        kernel_name,
+        a_stride,
+        b_stride,
+        bias_stride,
+        out_stride,
+    )
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -820,6 +836,13 @@ def flydsl_gemm(
         # The row was picked from shape and dtype only; a layout the decode
         # kernels do not take goes to torch, as an untuned shape would.
         if not flydsl_gemm_kernels.decode_layout_supported(inp, weights, bias, out):
+            _warn_decode_layout_fallback(
+                config["kernelName"],
+                tuple(inp.stride()),
+                tuple(weights.stride()),
+                None if bias is None else tuple(bias.stride()),
+                None if out is None else tuple(out.stride()),
+            )
             return torch_gemm(inp, weights, solidx, bias, otype, config=config, out=out)
         return flydsl_gemm_kernels.flydsl_decode_gemm(
             inp, weights, config["kernelName"], bias=bias, out=out
