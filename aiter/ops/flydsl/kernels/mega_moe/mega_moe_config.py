@@ -61,6 +61,7 @@ V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
 KIMI_K26_EXPERTS_PER_RANK = 48
 K26_MODEL_DIM, K26_INTER_DIM = 7168, 2048
 K26_FUSED_LAYOUT = (8, K26_MODEL_DIM, K26_INTER_DIM, 8 * KIMI_K26_EXPERTS_PER_RANK, 8)
+K26_EP8_LAYOUT = (8, KIMI_K26_EXPERTS_PER_RANK, K26_MODEL_DIM, K26_INTER_DIM)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
 # serve: EP8 DeepSeek-V4-Pro, EP4 / EP2 / EP8 DeepSeek-V4.1-Flash and EP8 Kimi-K2.6.
 FUSED_LAYOUTS = frozenset(
@@ -203,7 +204,7 @@ class FusedStage1Knobs:
 
     All off is the EP8 DeepSeek-V4-Pro kernel; the V4.1-Flash tunes
     (_tune_v41_flash_ep4_small / _tune_v41_flash_ep4_large and the EP2 / EP8
-    tunes built on them) turn them on. The protocol knobs (dedup_rows,
+    tunes built on them) and the EP8 Kimi-K2.6 tunes turn them on. The protocol knobs (dedup_rows,
     plan_local, direct_done, tok_done) change what the ranks of a launch
     exchange, so every rank of a launch must agree on them; tok_counters and
     bf16_head_tokens are set per layout, never per token bucket.
@@ -1739,6 +1740,84 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+def _small_m_eight_waves(config: MegaMoEConfig) -> MegaMoEConfig:
+    """The 8-wave small-input kernel of the hidden-7168 EP8 layouts (from 256 tokens).
+
+    8 waves, one CTA a CU: each wave's GEMM1 tile is 64 x 64 (tile_n 512, A-major MFMA, which keeps the 8-wave body
+    free of VGPR spills) and GEMM2 splits block_n 256 over the 8 waves; 8 waves cost 1.08x at 128 tokens (K2.6). A hot
+    plan runs GEMM2 at block_n 512, as each GEMM2 tile ends in a P2P store drain and the hot ranks hold many tiles
+    (uniform loses 1-5% with it at every plan, so it follows the hot plan bit only). Reading each MFMA group's A
+    operand a group ahead: zipf:1 0.985-0.993x, uniform / spike within 0.3% (K2.6).
+    """
+    return replace(
+        config,
+        stage1=replace(config.stage1, num_waves=8, tile_n=512, mfma_amajor=True),
+        stage2=replace(config.stage2, block_n=256),
+        fused_stage1=replace(config.fused_stage1, g1_a_early=True),
+        fused_stage2=replace(config.fused_stage2, hot_block_n=512),
+    )
+
+
+def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP8 Kimi-K2.6 small-input kernel (48 experts per rank), measured on gfx950 (8 ranks, MTPR 512; uniform,
+    zipf:1 and one-hot-expert routes)."""
+    # The EP8 V4.1-Flash tune (same 8 x 48-expert layout and launch protocol): 0.89-0.98x the default config
+    # (uniform), 0.81-0.98x (zipf:1), 0.87-0.99x (spike).
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket >= 256:
+        # Against the 4-wave tune: 0.87-0.91x (uniform), 0.81-0.83x (zipf:1), 0.86-0.89x (spike).
+        return _small_m_eight_waves(config)
+    # No hot_block_m: at tile_n 256 its 64-row bodies spill 41-61 VGPRs, and at tile_n 128 the narrower n-tiles cost
+    # uniform / spike 1-6% for 2-5% on zipf:1.
+    knobs = config.fused_stage1
+    if bucket in (16, 64, 128):
+        # GEMM1 also reads A two K-steps ahead in its K-loop and runs two K-steps per iteration: 0.98x at 16 and
+        # 96-160 tokens, 0.99x at 64. Bucket 8 spills 4 VGPRs with it (1.02x) and bucket 32 loses 1%.
+        knobs = replace(knobs, g1_a_ahead=2, g1_k_unroll=2)
+    return replace(config, fused_stage1=knobs)
+
+
+def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoEConfig:
+    """EP8 Kimi-K2.6 large-input kernel (48 experts per rank, hidden 7168, top-8), measured on gfx950 at MTPR 8192
+    (8 ranks; uniform, zipf:1 and one-hot-expert routes)."""
+    # Half the payload producers leave their CTAs to GEMM1; a chunk's tile publication releases its stores
+    # system-wide once, and nothing reads payload_ready. One row per (token, destination), copied with every load of
+    # a batch ahead of its remote stores (gfx950's vmcnt counts loads and stores alike).
+    # On top of those, from the EP8 V4.1-Flash tune (whose tail-tile and GEMM2 knobs do not fit K2.6's LDS): the
+    # presend, the parallel / lean plan with bucketed pair order, and the payload / acquire / release / epilogue
+    # knobs: 0.890x (uniform), 0.844x (zipf:1), 0.758x (spike) the knobs above (presend alone 0.92x, the small knobs
+    # alone 0.90x).
+    return replace(
+        config,
+        stage1=replace(config.stage1, num_dispatch_cu=48 * expert_waves),
+        fused_stage1=replace(
+            config.fused_stage1,
+            merge_release=True,
+            skip_payload_ready=True,
+            dedup_rows=True,
+            batch_rows=True,
+            presend_experts=8,
+            presend_rows=16384,
+            parallel_plan=True,
+            lean_plan=True,
+            tag_counts=True,
+            bucket_pairs=True,
+            early_hist=True,
+            payload_min_blocks=8,
+            payload_small_blocks=12,
+            payload_small_tokens=640,
+            one_row_acquire=True,
+            no_chunk_release=True,
+            a_async_lds=True,
+            ascale_packed=True,
+            epi_evec=8,
+            epi_lean=3,
+            early_clear=True,
+            peer_hoist=True,
+        ),
+    )
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf and all-to-rank-0 routes). It serves 8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as
@@ -1785,6 +1864,8 @@ def _fused_config(
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
             return _tune_v41_flash_ep8_large(config)
+        if layout == K26_EP8_LAYOUT:
+            return _tune_ep8_h7168_large(config, expert_waves)
         return config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
@@ -1797,6 +1878,8 @@ def _fused_config(
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
+    if layout == K26_EP8_LAYOUT:
+        return _tune_kimi_k26_small(config, bucket)
     return config
 
 
