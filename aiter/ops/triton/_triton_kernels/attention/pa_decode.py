@@ -111,8 +111,8 @@ def _paged_attn_decode_v1_wo_dot_kernel(
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
-        kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_nums = tl.load(blk_tbl_start_ptr + b).to(tl.int64)
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -286,9 +286,9 @@ def _paged_attn_decode_v1_w_dot_kernel(
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
-        kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
-        page_off = kv_blk_nums * stride_k_b + kv_head_idx * stride_k_nh
+        kv_blk_nums = tl.load(blk_tbl_start_ptr + b).to(tl.int64)
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
+        page_off = kv_blk_nums.to(tl.int64) * stride_k_b + kv_head_idx.to(tl.int64) * stride_k_nh
         rows = tl.minimum(KV_BLK_SZ, seq_len - b * KV_BLK_SZ).to(tl.int32)
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
         kv_mask = (
@@ -450,9 +450,9 @@ def _paged_attn_decode_v2_wo_dot_kernel(
 
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx * stride_bt_nb)
+        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx * stride_bt_nb).to(tl.int64)
 
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -720,10 +720,10 @@ def _paged_attn_decode_v2_w_dot_kernel(
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx)
+        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx).to(tl.int64)
 
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
-        page_off = kv_blk_nums * stride_k_b + kv_head_idx * stride_k_nh
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
+        page_off = kv_blk_nums.to(tl.int64) * stride_k_b + kv_head_idx.to(tl.int64) * stride_k_nh
         rows = tl.minimum(KV_BLK_SZ, seq_len - kv_blk_idx * KV_BLK_SZ).to(tl.int32)
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         kv_mask = (
@@ -996,8 +996,8 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
-        kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_nums = tl.load(blk_tbl_start_ptr + b).to(tl.int64)
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -1151,8 +1151,8 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
-        kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_nums = tl.load(blk_tbl_start_ptr + b).to(tl.int64)
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -1318,9 +1318,9 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
 
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx * stride_bt_nb)
+        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx * stride_bt_nb).to(tl.int64)
 
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -1598,9 +1598,9 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx)
+        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx).to(tl.int64)
 
-        kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        kv_blk_offs = kv_blk_nums.to(tl.int64) * stride_k_b + kv_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
