@@ -474,3 +474,107 @@ def run_gemm_a8w8_mxfp8_8wave(
         w_scale_block=w_scale_block,
         n_split=cfg["n_split"],
     )
+
+
+@aot_factory("gemm_a8w8_mxfp8_8wave_swiglu_w4")
+@functools.lru_cache(maxsize=256)
+def compile_mxfp8_8wave_swiglu_w4(
+    *,
+    K: int,
+    waves_per_eu: int,
+    xcd_swizzle: int,
+    alpha: float,
+    beta: float,
+    limit: float,
+):
+    """Compile (and memoize) the 8-wave gate_up launcher whose epilogue is
+    SwiGLU-OAI + MXFP8 with shuffle_scale_w4 scales (see StoreSwigluMx8W4)."""
+    _lazy_import()
+    _validate(K=K, waves_per_eu=waves_per_eu, scale_preshuffled=True)
+    return _compile_mxfp8_gemm_8w(
+        K=K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        b_preshuffled=True,
+        scale_preshuffled=True,
+        waves_per_eu=int(waves_per_eu),
+        xcd_swizzle=int(xcd_swizzle),
+        epilogue="swiglu_mx8_w4",
+        swiglu=(float(alpha), float(beta), float(limit)),
+    )
+
+
+def flydsl_mxfp8_8wave_gemm_swiglu_w4(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    *,
+    alpha: float,
+    beta: float,
+    limit: float,
+    waves_per_eu: int = 2,
+    xcd_swizzle: int = 0,
+) -> tuple[Tensor, Tensor]:
+    """gate_up MXFP8 GEMM, SwiGLU-OAI and the MXFP8 quant of its output in one kernel.
+
+    XQ ``(M, K)`` e4m3, WQ ``(2I, K)`` the unpermuted ``[gate | up]`` weight in the
+    ``shuffle_weight`` ``(16, 16)`` layout, x_scale / w_scale the 1-D
+    ``shuffle_scale_w4`` e8m0 pair (rows padded to 256). Returns ``(y, s)``: y e4m3
+    ``(M, I)`` and s the 1-D shuffle_scale_w4 e8m0 scales of y over M padded to 256
+    (rows past M unset), the operand pair a preshuffled-scale down GEMM takes. The
+    bytes of the bf16 GEMM followed by SwiGLU-OAI (``min(gate, limit)``, the up clamp
+    to +-limit, ``(up + beta) * gate * sigmoid(alpha * gate)``, each rounded to bf16)
+    and an MXFP8 quant (``ceil_pow2(max(amax, 1e-10) / 448)``, saturating)."""
+    _lazy_import()
+    M, K = XQ.shape
+    N = WQ.shape[0]
+    if K != WQ.shape[1] or N % BLOCK_N or XQ.element_size() != 1:
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave swiglu] bad shapes {tuple(XQ.shape)} x {tuple(WQ.shape)}"
+        )
+    inter = N // 2
+    if inter % 256:
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave swiglu] I must be a multiple of 256, got {inter}"
+        )
+    rows_pad = -(-M // 256) * 256
+    if x_scale.dim() != 1 or x_scale.numel() != rows_pad * K // 32:
+        raise ValueError(
+            "[FlyDSL mxfp8 8wave swiglu] x_scale must be the 1-D w4 layout"
+        )
+    if w_scale.dim() != 1 or w_scale.numel() != -(-N // 256) * 256 * K // 32:
+        raise ValueError(
+            "[FlyDSL mxfp8 8wave swiglu] w_scale must be the 1-D w4 layout"
+        )
+    _validate(K=K, waves_per_eu=waves_per_eu, scale_preshuffled=True, M=M, N=N)
+    q_bytes = M * inter
+    buf = torch.empty(
+        q_bytes + rows_pad * (inter // 32), dtype=torch.uint8, device=XQ.device
+    )
+    if M:
+        compile_kwargs = {
+            "K": K,
+            "waves_per_eu": int(waves_per_eu),
+            "xcd_swizzle": int(xcd_swizzle),
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "limit": float(limit),
+        }
+        # (A, B_T, C, A_scale, B_scale, c_m, c_n, ldc, stream); C is the y + s bytes
+        _run_compiled(
+            compile_mxfp8_8wave_swiglu_w4.lazy(**compile_kwargs),
+            _as_u8(XQ.contiguous()).view(-1),
+            _as_u8(WQ.contiguous()).view(-1),
+            buf,
+            _as_u8(x_scale).view(-1),
+            _as_u8(w_scale).view(-1),
+            M,
+            N,
+            N,
+            _current_stream_arg(XQ.device),
+            specialization_key=XQ.device,
+        )
+    y = buf[:q_bytes].view(M, inter).view(torch.float8_e4m3fn)
+    s = buf[q_bytes:].view(torch.float8_e8m0fnu)
+    return y, s
