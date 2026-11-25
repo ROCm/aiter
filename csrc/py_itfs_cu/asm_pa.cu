@@ -4,6 +4,7 @@
 #include "asm_pa_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstddef>
 #include <memory>
 #include <unordered_map>
 
@@ -83,7 +84,8 @@ struct __attribute__((packed)) PsKernelArgs
     void *ptr_KVPtr;
     p2 _p21;
     void *ptr_WorkPtr;
-    p2 _p22;
+    uint32_t split_o_format;
+    uint32_t reserved22;
     void *ptr_WorkInfo;
     p2 _p23;
     void *ptr_SplitO;
@@ -96,6 +98,8 @@ struct __attribute__((packed)) PsKernelArgs
     p3 _p27;
 };
 
+static_assert(sizeof(PsKernelArgs) == 368 && offsetof(PsKernelArgs, split_o_format) == 0x118);
+static_assert(offsetof(PsKernelArgs, ptr_WorkInfo) == 0x120);
 
 std::string get_heuristic_kernel(std::string q_type,
                                  std::string kv_type,
@@ -362,7 +366,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
-    PsKernelArgs args;
+    PsKernelArgs args{};
     size_t arg_size = sizeof(args);
     args.ptr_O      = out_->data_ptr();
     args.ptr_Q      = Q->data_ptr();
@@ -471,6 +475,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     static SynchronizedCache<std::string, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     const bool compact = splitData && splitData->dtype() == AITER_DTYPE_bf16;
+    args.split_o_format = compact ? 1u : 0u;
     AITER_CHECK(!splitData || compact || splitData->dtype() == AITER_DTYPE_fp32,
                 __func__, ": split partial output must be FP32 or compact BF16");
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
@@ -488,14 +493,15 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     {
         const auto& cfg     = it->second;
         std::string name = cfg.knl_name;
-        std::string co_name = cfg.co_name;
+        const std::string co_name = cfg.co_name;
+        const bool has_split_format = arch_id == "gfx950" && cfg.ps &&
+            co_name == "pa/pa_" + q_type + "_pertokenFp8_gqa16_1tg_4w_mtp_msk" +
+                       std::to_string(msk) + "_ps.co";
 
         if(compact)
         {
             const auto num_cu = get_num_cu_func();
-            const std::string expected = "pa/pa_" + q_type + "_pertokenFp8_gqa16_1tg_4w_mtp_msk" +
-                                         std::to_string(msk) + "_ps.co";
-            AITER_CHECK(arch_id == "gfx950" && cfg.ps && co_name == expected &&
+            AITER_CHECK(has_split_format &&
                             num_heads == 16 && num_kv_heads == 1 && head_size == 128 &&
                             block_size == 16 && max_qlen >= 2 && max_qlen <= 4 &&
                             K->dtype() == AITER_DTYPE_fp8 && V->dtype() == AITER_DTYPE_fp8 &&
@@ -533,8 +539,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
                             splitData->dim() >= 3 && splitData->size(-1) == 128 &&
                             splitData->size(-2) == num_heads && splitData->numel() / 128 == splitLse->numel(),
                         __func__, ": compact SplitO and FP32 SplitLSE must have matching packed layouts");
-            co_name = "compact/" + co_name;
         }
+        if(has_split_format)
+            name += "_split_format";
         impl_ptr = &impl_ptr_map.get_or_create(arch_id + ":" + co_name + ":" + name, [&]() {
             return AiterAsmKernel(name.c_str(), co_name.c_str());
         });

@@ -23,7 +23,8 @@ struct __attribute__((packed)) AttentionPsReduceArgs
     void* partial_lse;
     p2 padding2;
     void* reduce_indptr;
-    p2 padding3;
+    uint32_t split_o_format;
+    uint32_t reserved3;
     void* reduce_final_map;
     p2 padding4;
     void* reduce_partial_map;
@@ -48,6 +49,7 @@ static_assert(sizeof(AttentionPsReduceArgs) == 208);
 static_assert(offsetof(AttentionPsReduceArgs, partial_output) == 0x10);
 static_assert(offsetof(AttentionPsReduceArgs, partial_lse) == 0x20);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_indptr) == 0x30);
+static_assert(offsetof(AttentionPsReduceArgs, split_o_format) == 0x38);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_final_map) == 0x40);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_partial_map) == 0x50);
 static_assert(offsetof(AttentionPsReduceArgs, final_lse) == 0x60);
@@ -155,6 +157,7 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     args.partial_output = partial_output->data_ptr();
     args.partial_lse = partial_lse->data_ptr();
     args.reduce_indptr = reduce_indptr->data_ptr();
+    args.split_o_format = compact ? 1u : 0u;
     args.reduce_final_map = reduce_final_map->data_ptr();
     args.reduce_partial_map = reduce_partial_map->data_ptr();
     args.final_lse = final_lse ? final_lse->data_ptr() : nullptr;
@@ -188,9 +191,9 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                 " adaptive:", adaptive, " waves:", selected_waves);
     const auto& config = *selected_config;
     static SynchronizedCache<std::string, AiterAsmKernel> implementations;
-    const auto co_name = compact ? "compact/" + config.co_name : config.co_name;
-    auto* kernel = &implementations.get_or_create(arch_id + ":" + co_name + ":" + config.knl_name, [&]() {
-        return AiterAsmKernel(config.knl_name.c_str(), co_name.c_str());
+    const auto name = config.knl_name + "_split_format";
+    auto* kernel = &implementations.get_or_create(arch_id + ":" + config.co_name + ":" + name, [&]() {
+        return AiterAsmKernel(name.c_str(), config.co_name.c_str());
     });
     size_t argument_size = sizeof(args);
     kernel->launch_kernel({&args, &argument_size, static_cast<int>(num_heads),
