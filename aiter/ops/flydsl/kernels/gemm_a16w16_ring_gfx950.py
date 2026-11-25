@@ -16,6 +16,9 @@ for every legal ``(mh, r)`` choice at the same ``mt``.
 
 ``shuffled=True`` reads the weight in the ``[N/16, K/64, 16, 64]`` tile layout (``shuffle_weight_ring``), which
 makes each fragment's stage one contiguous 2 KiB read; ``shuffled=False`` reads the row-major weight.
+``shuffled=2`` (``LAYOUT_AITER``) reads AITER's ``shuffle_weight(w, (16, 16))`` layout
+``[N/16, K/32, 4, 16, 8]`` in place, so a weight that is already preshuffled for the other bpreshuffle GEMMs
+needs no second copy: a stage is the same contiguous 2 KiB, only the 16-byte chunks sit at a different offset.
 """
 
 import functools
@@ -31,6 +34,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from . import buffer_ops
 
+LAYOUT_ROW, LAYOUT_RING, LAYOUT_AITER = 0, 1, 2  # weight layouts (``shuffled``)
 TILES = 256  # one workgroup column per CU of gfx950
 NWV = 4  # waves per M half
 W_CM = 2  # cache-policy aux of the weight DMA (streamed once)
@@ -95,7 +99,13 @@ def fits(n: int, k: int, mt: int, mh: int, r: int) -> bool:
 
 @functools.cache
 def compile_ring(
-    n: int, k: int, mt: int, mh: int, r: int, shuffled: bool = True, device: int = 0
+    n: int,
+    k: int,
+    mt: int,
+    mh: int,
+    r: int,
+    shuffled: int = LAYOUT_RING,
+    device: int = 0,
 ):
     """Launcher for N, K and ``mt`` 16-row fragments per wave, ``mh`` M halves, ring depth ``r``.
 
@@ -109,6 +119,7 @@ def compile_ring(
     NRW = (NR + NWV - 1) // NWV
     NB = k // 64
     MT, SHUF, MH = mt, int(shuffled), mh
+    assert SHUF in (LAYOUT_ROW, LAYOUT_RING, LAYOUT_AITER), shuffled
     NWT = NWV * MH
     MTT = MT * MH
     TM = 16 * MTT
@@ -168,8 +179,15 @@ def compile_ring(
             for jq in range_constexpr(2 // MH):
                 jj = mhalf + jq if MH == 2 else jq
                 pc = (lane % 8) ^ ((r8 // 2) + jj * 4)
-                if const_expr(SHUF):
+                if const_expr(SHUF == LAYOUT_RING):
                     off = (n0 // 16 + rn) * (k * 32) + (jj * 8 + r8) * 128 + pc * 16
+                elif const_expr(SHUF == LAYOUT_AITER):
+                    off = (
+                        (n0 // 16 + rn) * (k * 32)
+                        + (pc // 4) * 1024
+                        + (pc % 4) * 256
+                        + (jj * 8 + r8) * 16
+                    )
                 else:
                     off = (n0 + rn * 16 + jj * 8 + r8) * (k * 2) + pc * 16
                 w_src.append(ok.select(off, fx.Int32(0x70000000)))
@@ -208,7 +226,14 @@ def compile_ring(
 
         def dma(b):
             for q in range_constexpr(NRW * 2 // MH):
-                issue(wr, w_dst[q], w_src[q], b, b * (2048 if SHUF else 128), aux_w)
+                issue(
+                    wr,
+                    w_dst[q],
+                    w_src[q],
+                    b,
+                    b * (128 if SHUF == LAYOUT_ROW else 2048),
+                    aux_w,
+                )
             for q in range_constexpr(XPW):
                 issue(xr, x_dst[q], x_src[q], b, b * 128, aux_x)
 

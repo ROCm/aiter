@@ -18,6 +18,7 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .aot_launch import aot_factory
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
+from .gemm_a16w16_ring import gemm_a16w16_ring, ring_name_tiling
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -43,7 +44,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|rg|tdm|tdmi|tdma|tdmia)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -52,6 +53,9 @@ _HGEMM_KERNEL_RE = re.compile(
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
 # bias or fp32 output, and runs on gfx950 only.
 SKINNY_POLICY = "sk"
+# The ring policy (gemm_a16w16_ring.py) maps onto the same fields: t<M rows of a tile>x16x64x<ring depth>,
+# w<M halves>x4x1 (see ring_config). gfx950 with 256 CUs, bf16, no bias, split_k=1; K=64*n and N=16*n by shape.
+RING_POLICY = "rg"
 TDM_POLICIES = {
     "tdm": (False, False),
     "tdmi": (True, False),
@@ -89,7 +93,7 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") in (SKINNY_POLICY, "bs", *TDM_POLICIES):
+    if config.get("policy") in (SKINNY_POLICY, "bs", RING_POLICY, *TDM_POLICIES):
         policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
@@ -108,7 +112,10 @@ def flydsl_hgemm_kernel_name(
         f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
-    if policy in ("bs", *TDM_POLICIES) and get_flydsl_hgemm_kernel_params(name) is None:
+    if (
+        policy in ("bs", RING_POLICY, *TDM_POLICIES)
+        and get_flydsl_hgemm_kernel_params(name) is None
+    ):
         raise ValueError("unsupported FlyDSL kernel configuration")
     return name
 
@@ -128,7 +135,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     k_stagger = int(match.group("k_stagger") or 0)
     b_non_temporal = match.group("b_non_temporal") is not None
     if (k_stagger or b_non_temporal) and (
-        match.group("target_gfx") != "gfx950" or policy == SKINNY_POLICY
+        match.group("target_gfx") != "gfx950" or policy in (SKINNY_POLICY, RING_POLICY)
     ):
         return None
     if policy == SKINNY_POLICY and (
@@ -204,20 +211,22 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         params.update(interleave=interleave, split_k_atomic=atomic)
     if policy == "bs" and not band_stream_name_supported(params):
         return None
+    if policy == RING_POLICY and ring_name_tiling(params) is None:
+        return None
     return params
 
 
 def _validate_k_stagger(k_stagger, gfx, policy):
     if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
         raise ValueError("k_stagger must be a non-negative integer")
-    if k_stagger and (gfx != "gfx950" or policy == SKINNY_POLICY):
+    if k_stagger and (gfx != "gfx950" or policy in (SKINNY_POLICY, RING_POLICY)):
         raise ValueError("k_stagger supports gfx950 ft/ht/hti/bs policies only")
 
 
 def _validate_b_non_temporal(value, gfx, policy):
     if not isinstance(value, bool):
         raise TypeError("b_non_temporal must be a bool")
-    if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
+    if value and (gfx != "gfx950" or policy in (SKINNY_POLICY, RING_POLICY)):
         raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
 
 
@@ -264,9 +273,23 @@ def flydsl_hgemm(
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
     A/B are made contiguous before launch. Other unsupported inputs raise
     rather than silently selecting a different kernel.
+    ``policy="rg"`` selects the gfx950 small-M BF16 ring GEMM (``gemm_a16w16_ring``,
+    M <= block_m <= 128) with the name fields of ``ring_config``: ``block_m`` = 16 x
+    fragments x M halves, ``block_n=16``, ``block_k=64``, ``stages`` the ring depth
+    (2-4), ``m_waves`` the M halves (1-2), ``n_waves=4``. It needs 256 CUs, no bias,
+    split_k=1 and BF16 output. ``bpreshuffle=True`` reads AITER's
+    ``shuffle_weight(w, (16, 16))`` layout in place; otherwise B is row-major.
     """
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
+    if policy not in (
+        "ft",
+        "ht",
+        "hti",
+        SKINNY_POLICY,
+        "bs",
+        RING_POLICY,
+        *TDM_POLICIES,
+    ):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -277,7 +300,7 @@ def flydsl_hgemm(
     gfx = get_gfx_runtime()
     if bpreshuffle and (
         gfx != "gfx950"
-        or policy not in ("ft", "sk")
+        or policy not in ("ft", "sk", RING_POLICY)
         or a.dtype != torch.bfloat16
         or (policy == "ft" and (split_k != 1 or k_waves != 1))
     ):
@@ -351,6 +374,46 @@ def flydsl_hgemm(
                 "b_non_temporal": b_non_temporal,
             },
         )
+    if policy == RING_POLICY:
+        if gfx != "gfx950":
+            raise RuntimeError("The FlyDSL ring HGEMM policy supports gfx950 only")
+        if out_dtype not in (None, a.dtype):
+            raise ValueError("The FlyDSL ring HGEMM policy writes the input dtype")
+        params = get_flydsl_hgemm_kernel_params(
+            flydsl_hgemm_kernel_name(
+                dtype=a.dtype,
+                out_dtype=a.dtype,
+                has_bias=bias is not None,
+                target_gfx=gfx,
+                config={
+                    "block_m": block_m,
+                    "block_n": block_n,
+                    "block_k": block_k,
+                    "stages": stages,
+                    "split_k": split_k,
+                    "m_waves": m_waves,
+                    "n_waves": n_waves,
+                    "k_waves": k_waves,
+                    "group_m": group_m,
+                    "k_stagger": k_stagger,
+                    "b_non_temporal": b_non_temporal,
+                    "policy": RING_POLICY,
+                },
+            )
+        )
+        # Row-major A/B as for the legacy path; a bpreshuffled B is read in place.
+        with torch.cuda.stream(launch_stream):
+            if not a.is_contiguous():
+                a = a.contiguous()
+            if not b.is_contiguous():
+                b = b.contiguous()
+            return gemm_a16w16_ring(
+                a,
+                b,
+                out,
+                "aiter" if bpreshuffle else False,
+                ring_name_tiling(params),
+            )
     if policy == SKINNY_POLICY:
         if gfx != "gfx950":
             raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")

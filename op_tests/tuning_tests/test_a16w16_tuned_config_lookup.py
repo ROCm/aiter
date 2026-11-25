@@ -438,6 +438,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             ),
             mock.patch.object(policy, "skinny_config_error", return_value=None),
             mock.patch.object(policy, "band_stream_config", return_value=None),
+            mock.patch.object(policy, "get_flydsl_ring_configs", return_value=[]),
         ):
             configs = policy.get_flydsl_a16w16_configs(
                 112, 18432, 1536, torch.bfloat16, torch.bfloat16, False
@@ -651,6 +652,173 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     self.assertNotIn("k_stagger", args)
                     self.assertNotIn("b_non_temporal", args)
         self.assertGreater(len(seen), 0)
+
+
+class TestFlydslRingPolicyNames(unittest.TestCase):
+    """The ring GEMM is a FlyDSL HGEMM policy (``prg``): names, validation and the tuner search space."""
+
+    def _name(self, config, **kw):
+        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm_kernel_name
+
+        return flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            config=config,
+            has_bias=kw.get("has_bias", False),
+            target_gfx=kw.get("target_gfx", "gfx950"),
+        )
+
+    def test_every_tiling_round_trips(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import (
+            ring_config,
+            ring_name_tiling,
+            ring_tilings,
+        )
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        seen = set()
+        for m in (1, 16, 17, 64, 65, 96, 128):
+            for tiling in ring_tilings(m):
+                self.assertGreaterEqual(16 * tiling[0] * tiling[1], m)
+                config = ring_config(*tiling)
+                name = self._name(config)
+                self.assertTrue(name.endswith("_prg_gfx950"), name)
+                parsed = get_flydsl_hgemm_kernel_params(name)
+                self.assertEqual({key: parsed[key] for key in config}, config)
+                self.assertEqual(ring_name_tiling(parsed), tiling)
+                seen.add(name)
+        self.assertEqual(
+            len(seen),
+            len({t for m in (1, 16, 17, 64, 65, 96, 128) for t in ring_tilings(m)}),
+        )
+
+    def test_name_example(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        self.assertEqual(
+            self._name(ring_config(4, 1, 4)),
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x16x64x4_ks1_w1x4x1_bias0_ktail0_gm0_prg_gfx950",
+        )
+
+    def test_unsupported_names_are_rejected(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        name = self._name(ring_config(2, 2, 3))
+        self.assertIsNotNone(get_flydsl_hgemm_kernel_params(name))
+        for invalid in (
+            name.replace("_ks1_", "_ks2_"),
+            name.replace("_bias0_", "_bias1_"),
+            name.replace("gfx950", "gfx942"),
+            name.replace("_gm0_", "_gm4_"),
+            name.replace("_gm0_", "_gm0_stg1_"),
+            name.replace("_gm0_", "_gm0_bnt_"),
+            name.replace("w2x4x1", "w3x4x1"),
+            name.replace("w2x4x1", "w2x2x1"),
+            name.replace("w2x4x1", "w2x4x2"),
+            name.replace("t64x16x64x3", "t64x32x64x3"),
+            name.replace("t64x16x64x3", "t64x16x32x3"),
+            name.replace("t64x16x64x3", "t64x16x64x5"),
+            name.replace("t64x16x64x3", "t80x16x64x3"),
+            name.replace("t64x16x64x3", "t320x16x64x3"),
+            name.replace("abf16_wbf16_bf16", "afp16_wfp16_fp16"),
+            name.replace("_bf16_t", "_fp32_t"),
+        ):
+            self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid), invalid)
+        for bad in (
+            {**ring_config(1, 1, 4), "m_waves": 3},
+            {**ring_config(1, 1, 4), "stages": 9},
+        ):
+            with self.assertRaises(ValueError):
+                self._name(bad)
+        with self.assertRaises(ValueError):
+            self._name(ring_config(1, 1, 4), has_bias=True)
+
+    def test_shape_limits(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_ring_gfx950 import fits
+
+        self.assertTrue(fits(50016, 6144, 4, 1, 4))
+        self.assertFalse(
+            fits(50016, 6144, 8, 1, 4)
+        )  # 4 slots of an 8-fragment tile exceed the LDS
+        self.assertFalse(fits(50016 + 8, 6144, 4, 1, 4))  # N % 16
+        self.assertFalse(fits(50016, 6144 + 32, 4, 1, 4))  # K % 64
+        self.assertFalse(fits(16 * 255, 6144, 4, 1, 4))  # N / 16 < 256 tiles
+
+    def test_catalog_candidates_need_a_256_cu_gfx950_bf16_no_bias(self):
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        with mock.patch.object(policy, "ring_supported", return_value=True):
+            configs = policy.get_flydsl_ring_configs(
+                64, 50016, 6144, torch.bfloat16, torch.bfloat16, False
+            )
+            self.assertTrue(configs)
+            self.assertTrue(
+                all(c["policy"] == "rg" and c["block_m"] >= 64 for c in configs)
+            )
+            for args in (
+                (129, 50016, 6144, torch.bfloat16, torch.bfloat16, False),
+                (64, 50016, 6144, torch.float16, torch.float16, False),
+                (64, 50016, 6144, torch.bfloat16, torch.float32, False),
+                (64, 50016, 6144, torch.bfloat16, torch.bfloat16, True),
+            ):
+                self.assertEqual(policy.get_flydsl_ring_configs(*args), [])
+        with mock.patch.object(policy, "ring_supported", return_value=False):
+            self.assertEqual(
+                policy.get_flydsl_ring_configs(
+                    64, 50016, 6144, torch.bfloat16, torch.bfloat16, False
+                ),
+                [],
+            )
+
+    def test_tuned_lookup_accepts_ring_row_for_preshuffled_weight(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        name = self._name(ring_config(4, 1, 4))
+        key = ("gfx950", 256, 64, 50016, 6144, False, BF16, BF16, False, True)
+        row = {"libtype": "flydsl", "solidx": 0, "splitK": 1, "kernelName": name}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: "gfx950"),
+            mock.patch.object(tuned, "get_cu_num", lambda: 256),
+            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: gemm_kernels),
+        ):
+            got = tuned.get_GEMM_A16W16_tuned_config(
+                64, 50016, 6144, False, BF16, BF16, bpreshuffle=True
+            )
+        self.assertEqual(got, row)
+
+    def test_tuned_gemm_dispatch_passes_the_tiling_and_preshuffle(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        name = self._name(ring_config(2, 2, 3))
+        seen = {}
+        with (
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: gemm_kernels),
+            mock.patch.object(
+                gemm_kernels,
+                "flydsl_hgemm",
+                side_effect=lambda *a, **kw: seen.update(kw) or torch.empty(1),
+            ),
+        ):
+            tuned._flydsl_hgemm_kernel_params.cache_clear()
+            tuned.flydsl_gemm(
+                torch.empty(1),
+                torch.empty(1),
+                0,
+                otype=torch.bfloat16,
+                bpreshuffle=True,
+                config={"kernelName": name},
+            )
+        self.assertEqual(
+            (seen["policy"], seen["block_m"], seen["stages"], seen["m_waves"]),
+            ("rg", 64, 3, 2),
+        )
+        self.assertTrue(seen["bpreshuffle"])
+        self.assertIsNone(seen["out_dtype"])
 
 
 if __name__ == "__main__":

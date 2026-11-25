@@ -283,6 +283,7 @@ def run_flydsl_gemm_bf16(
     bias=None,
     otype=dtypes.bf16,
     config=None,
+    bpreshuffle=False,
 ):
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
@@ -313,6 +314,7 @@ def run_flydsl_gemm_bf16(
             "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
         ),
         out_dtype=otype,
+        bpreshuffle=bpreshuffle,
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -339,7 +341,10 @@ def _flydsl_b_non_temporal_configs(configs, mode, gfx):
         policy = config.get(
             "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
         )
-        if gfx == "gfx950" and policy in ("ft", "ht", "hti"):
+        if policy == "rg":
+            # The ring streams B once with its own cache policy; no BNT variants.
+            selected.append(config)
+        elif gfx == "gfx950" and policy in ("ft", "ht", "hti"):
             selected.extend(dict(config, b_non_temporal=nt) for nt in choices)
         elif config.get("b_non_temporal", False) in choices:
             # Skinny/TDM do not implement BNT; band-stream requires it.
@@ -357,6 +362,7 @@ def get_flydsl_bf16_catalog(
     has_bias: bool,
     in_dtype: torch.dtype = torch.bfloat16,
     b_non_temporal: str = "auto",
+    is_shuffle: bool = False,
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
@@ -370,6 +376,9 @@ def get_flydsl_bf16_catalog(
         fused_bias,
     )
     configs = _flydsl_b_non_temporal_configs(configs, b_non_temporal, get_gfx_runtime())
+    if is_shuffle:
+        # Only the ring policy reads AITER's preshuffled weight at small M among the tuned FlyDSL candidates.
+        configs = [c for c in configs if c.get("policy") == "rg"]
     kernels = {
         flydsl_hgemm_kernel_name(
             dtype=in_dtype,
@@ -794,12 +803,12 @@ class GemmA16W16Tuner(GemmCommonTuner):
         supported_dtype = indtype == dtypes.bf16 or (
             get_gfx_runtime() == "gfx1250" and indtype == dtypes.fp16
         )
-        if scaleAB or is_shuffle or not supported_dtype:
+        if scaleAB or not supported_dtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
         flydsl_catalog = get_flydsl_bf16_catalog(
-            M, N, K, outdtype, has_bias, indtype, b_non_temporal
+            M, N, K, outdtype, has_bias, indtype, b_non_temporal, bool(is_shuffle)
         )
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
@@ -817,7 +826,17 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", "weights", "out_asm", "bias"], outdtype, config),
+                    (
+                        [
+                            "inp",
+                            "shuffleweights" if is_shuffle else "weights",
+                            "out_asm",
+                            "bias",
+                        ],
+                        outdtype,
+                        config,
+                        bool(is_shuffle),
+                    ),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (

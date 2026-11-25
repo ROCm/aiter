@@ -11,6 +11,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
 from .gemm_a16w16_band import band_stream_config
+from .gemm_a16w16_ring import ring_config, ring_supported, ring_tilings
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
@@ -332,6 +333,19 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
     return valid_configs
 
 
+def get_flydsl_ring_configs(m, n, k, dtype, out_dtype, has_bias):
+    """Ring-GEMM candidates (policy ``rg``): every legal (M tile, M halves, ring depth) that runs ``m`` rows in one
+    tile. Layout-agnostic: the tuned row's bpreshuffle flag picks the row-major or AITER-preshuffled weight.
+    """
+    if dtype != torch.bfloat16 or out_dtype != dtype or has_bias or not 0 < m <= 128:
+        return []
+    return [
+        ring_config(*tiling)
+        for tiling in ring_tilings(m)
+        if ring_supported(m, n, k, tiling=tiling)
+    ]
+
+
 def get_flydsl_a16w16_configs(
     m: int,
     n: int,
@@ -471,4 +485,5 @@ def get_flydsl_a16w16_configs(
         config = band_stream_config(m, n, k)
         if config is not None and device_props.multi_processor_count == 256:
             band_configs.append(config)
-    return valid_configs + memory_configs + skinny_configs + band_configs
+    ring_configs = get_flydsl_ring_configs(m, n, k, dtype, out_dtype, has_bias)
+    return valid_configs + memory_configs + skinny_configs + band_configs + ring_configs
