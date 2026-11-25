@@ -859,7 +859,10 @@ def launch_mla_pagesize1_fp8_fp8(
             before_remote=None,
             after_first=None,
             anchor=None,
+            first_tile=None,
         ):
+            """first_tile: None decides at run time whether this is the item's first
+            tile (no pending PV); True / False when the caller knows."""
             tile_start = fx.Int32(tile_start)
             first_v = None
             v_bases = v_tile_bases(pending_raw_slot)
@@ -915,7 +918,8 @@ def launch_mla_pagesize1_fp8_fp8(
                 + list(pending_p)
                 + list(first_k)
             )
-            if tile_start > kv_start:
+
+            def pending_pv_result():
                 pv_softmax = []
                 outs, pv_next_k = accumulate_pending_pv(
                     v_bases,
@@ -926,19 +930,32 @@ def launch_mla_pagesize1_fp8_fp8(
                     next_first_k,
                     signal_next,
                 )
-                result = list(outs) + pv_softmax + list(pv_next_k)
+                pv_result = list(outs) + pv_softmax + list(pv_next_k)
                 if const_expr(anchor is not None):
                     anchor()
-            else:
+                return pv_result
+
+            def first_tile_result():
                 # An item's first tile has no pending PV, and its outputs are still
                 # zero: no rescale either.
                 first_softmax = []
                 _drain(softmax(first_softmax))
                 first_softmax[3 * G] = fx.Int32(0)
-                result = list(running_outs) + first_softmax + list(next_first_k())
+                first_result = list(running_outs) + first_softmax + list(next_first_k())
                 signal_next()
                 if const_expr(anchor is not None):
                     anchor()
+                return first_result
+
+            if const_expr(first_tile is None):
+                if tile_start > kv_start:
+                    result = pending_pv_result()
+                else:
+                    result = first_tile_result()
+            elif const_expr(first_tile):
+                result = first_tile_result()
+            else:
+                result = pending_pv_result()
             outs = [Vec(result[i]) for i in range_constexpr(n_outs)]
             maxes = [fx.Float32(result[n_outs + g]) for g in range_constexpr(G)]
             sums = [fx.Float32(result[n_outs + G + g]) for g in range_constexpr(G)]
@@ -972,6 +989,7 @@ def launch_mla_pagesize1_fp8_fp8(
             stream,
             mask_bounds=True,
             gather_only=False,
+            first_tile=None,
         ):
 
             next_in_flight, next_offset, next_kv_end = stream
@@ -1085,6 +1103,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     wait_tile_barrier,
                     issue_producer,
                     wait_next_page_indices,
+                    first_tile=first_tile,
                 )
             )
 
@@ -1101,18 +1120,39 @@ def launch_mla_pagesize1_fp8_fp8(
                 q_rope_operands,
                 stream,
             ) = tiles
-            for tile_start in range(kv_start, full_tile_end, fx.Int32(KV_TILE_TOKENS)):
-                state = process_tile(
-                    fx.Int32(tile_start),
+            # The item's first tile has no pending PV. Taking it out of the loop
+            # leaves the loop body (QK of tile i, PV of tile i - 1) one block with
+            # no branch between the two, so the schedule can interleave them.
+            peel = not gather_only
+
+            def tile(tile_state, tile_start, mask_bounds, first_tile):
+                return process_tile(
+                    tile_start,
                     kv_start,
                     kv_end,
                     attention_end,
                     q_nope_operands,
                     q_rope_operands,
-                    state,
+                    tile_state,
                     stream,
-                    mask_bounds=mask_every_tile,
+                    mask_bounds=mask_bounds,
                     gather_only=gather_only,
+                    first_tile=first_tile,
+                )
+
+            loop_start = kv_start
+            if const_expr(peel):
+                if full_tile_end > kv_start:
+                    state = tile(state, kv_start, mask_every_tile, True)
+                loop_start = kv_start + fx.Int32(KV_TILE_TOKENS)
+            for tile_start in range(
+                loop_start, full_tile_end, fx.Int32(KV_TILE_TOKENS)
+            ):
+                state = tile(
+                    state,
+                    fx.Int32(tile_start),
+                    mask_every_tile,
+                    False if peel else None,
                 )
             _wait_scalars(
                 [
@@ -1121,18 +1161,13 @@ def launch_mla_pagesize1_fp8_fp8(
                 ]
             )
             if has_tokens:
-                state = process_tile(
-                    last_tile_start,
-                    kv_start,
-                    kv_end,
-                    attention_end,
-                    q_nope_operands,
-                    q_rope_operands,
-                    state,
-                    stream,
-                    mask_bounds=True,
-                    gather_only=gather_only,
-                )
+                if const_expr(peel):
+                    if last_tile_start > kv_start:
+                        state = tile(state, last_tile_start, True, False)
+                    else:
+                        state = tile(state, last_tile_start, True, True)
+                else:
+                    state = tile(state, last_tile_start, True, None)
             return state
 
         work_start = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx]))
@@ -1308,6 +1343,17 @@ def launch_mla_pagesize1_fp8_fp8(
                 cut_end = local_kv_begin + visible
                 attention_end = (cut_end < kv_end).select(cut_end, kv_end)
             elif const_expr(causal):
+                if const_expr(q_tile_rows not in (1, max_seqlen_q)):
+                    # The query is cut into several multi-row qo tiles, and the
+                    # planner trims each tile's kv_end by the tiles after it, not
+                    # the rows: measure from the request's last row instead.
+                    batch = work_field(work_info, 0)
+                    request_qo_end = fx.Int32(
+                        rocdl.readfirstlane(T.i32, qo_indptr[batch + 1])
+                    )
+                    qpos_from_last = (
+                        request_qo_end - qo_start - fx.Int32(1) - safe_q_pos
+                    )
                 causal_offset = qpos_from_last - kv_offset
                 causal_offset = (causal_offset > fx.Int32(0)).select(
                     causal_offset, fx.Int32(0)
