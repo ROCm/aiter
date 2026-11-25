@@ -118,3 +118,52 @@ def test_flydsl_moe_xcd_swizzle_stage1_padded_tail(xcd_swizzle):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage1"], stage1_out, f"xcd{xcd_swizzle}_padded_tail")
+
+
+@pytest.mark.parametrize("xcd_swizzle", [1, 4])
+def test_flydsl_moe_xcd_swizzle_stage1_inter_pad(xcd_swizzle, monkeypatch):
+    """With an intermediate pad, stage 1 launches tile2_pad more N columns than
+    the unpadded width, and a v1 stage 2 reads them. The remap must cover the
+    launched grid, or those columns stay unwritten."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("gfx950 FlyDSL required")
+    import op_tests.flydsl_tests.test_flydsl_moe as moe_test
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    # DSv4.1 TP4: 640 wide, 576 real. tile_k 256 gives a 64-column tile2_pad.
+    monkeypatch.setattr(moe_test, "_inter_pad", lambda inter_dim: 64)
+    token, model_dim, inter_dim, E, topk, block_m = 64, 768, 640, 32, 4, 32
+    data = _generate_a8w4_gui_data(token, model_dim, inter_dim, E, topk, block_m)
+
+    def run(xcd):
+        out = torch.full(
+            (token, topk, inter_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        flydsl_moe_stage1(
+            a=data["a_q"],
+            w1=data["w1_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            out=out,
+            topk=topk,
+            tile_m=block_m,
+            tile_n=128,
+            tile_k=_stage1_tile_k(model_dim),
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            act="swiglu",
+            gate_mode="interleave",
+            w1_scale=data["w1_scale_shuf"],
+            a1_scale=data["a_scale_sort"],
+            inter_dim_pad=data["inter_pad"],
+            xcd_swizzle=xcd,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    ref = run(0)
+    out = run(xcd_swizzle)
+    _check_close(data["ref_stage1"], ref, "xcd0_inter_pad")
+    assert torch.equal(out, ref), f"xcd{xcd_swizzle}_inter_pad: differs from xcd0"
