@@ -19,7 +19,6 @@ struct CodecBase
           rank(rank),
           group_leader((threadIdx.x / kThreadGroupSize) * kThreadGroupSize)
     {
-        set_fp16_ovfl(true);
     }
 };
 
@@ -60,6 +59,16 @@ struct CodecFP : public CodecBase
             *recv_buffer += kAtomStride;
         }
     }
+};
+
+template <class Codec>
+struct is_codec_fp : std::false_type
+{
+};
+
+template <typename T, int world_size>
+struct is_codec_fp<CodecFP<T, world_size>> : std::true_type
+{
 };
 
 // Int4 symmetric quantization codec.
@@ -777,6 +786,12 @@ struct AllReduceTwoshot
 
     static constexpr int kWorldSize = Codec::kWorldSize;
 
+    // The FP codec sends bf16 as is and sums it in f32, rounding to bf16 once.
+    static constexpr bool kAccumulateInF32 =
+        std::is_same<T, __hip_bfloat16>::value && is_codec_fp<Codec>::value;
+    static_assert(!(kAccumulateInF32 && cast_bf2half),
+                  "the fp16 cast would make the f32 accumulation read fp16 bits as bf16");
+
     __device__ static void run(T const* __restrict__ input,
                                T* __restrict__ output,
                                uint32_t const N,                   // number of elements
@@ -808,6 +823,12 @@ struct AllReduceTwoshot
         {
             tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
             src_offset += kAtomStride * sizeof(int32x4_t);
+            if constexpr(kAccumulateInF32)
+            {
+                // Wait for each input load before issuing the next. That staggers the waves,
+                // whose Phase-1A sends would otherwise all start at rank 0 and queue on one link.
+                asm volatile("" : "+v"(tA[i]));
+            }
             if constexpr(cast_bf2half)
             {
                 const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
@@ -849,6 +870,7 @@ struct AllReduceTwoshot
         // --------------------------------------------------------
         // Phase-1B: Reduce the segment data from the communication buffers.
         int32x4_t tR[Codec::kRankAtoms] = {};
+        [[maybe_unused]] float acc[Codec::kRankAtoms][8] = {};
         {
             // Read the data from the communication buffer.
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
@@ -866,11 +888,22 @@ struct AllReduceTwoshot
                 // note: we reuse tA as temp buffer here
                 codec.recv(&recv_buffer, tA);
 
-                for(int i = 0; i < Codec::kRankAtoms; i++)
+                if constexpr(kAccumulateInF32)
                 {
-                    packed_assign_add<T>(&tR[i], &tA[i]);
+                    accumulate_bf16_in_f32(acc, tA);
+                }
+                else
+                {
+                    for(int i = 0; i < Codec::kRankAtoms; i++)
+                    {
+                        packed_assign_add<T>(&tR[i], &tA[i]);
+                    }
                 }
             }
+        }
+        if constexpr(kAccumulateInF32)
+        {
+            round_f32_to_bf16(tR, acc);
         }
 
         // Phase-2: Write the reduced segment to every other rank
@@ -985,6 +1018,10 @@ struct AllReduceTwoshotRMSNorm
     static constexpr int kWorldSize    = Codec::kWorldSize;
     static constexpr int kElemsPerAtom = sizeof(int32x4_t) / sizeof(T);
 
+    // The FP codec sends bf16 as is and sums it in f32, rounding to bf16 once.
+    static constexpr bool kAccumulateInF32 =
+        std::is_same<CommT, __hip_bfloat16>::value && is_codec_fp<Codec>::value;
+
     __device__ static void run(T const* __restrict__ input,
                                T const* __restrict__ residual_inp,
                                T* __restrict__ residual_out,
@@ -1018,6 +1055,12 @@ struct AllReduceTwoshotRMSNorm
         {
             tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
             src_offset += kAtomStride * sizeof(int32x4_t);
+            if constexpr(kAccumulateInF32)
+            {
+                // Wait for each input load before issuing the next. That staggers the waves,
+                // whose Phase-1A sends would otherwise all start at rank 0 and queue on one link.
+                asm volatile("" : "+v"(tA[i]));
+            }
             if constexpr(cast_bf2half)
             {
                 const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
@@ -1055,6 +1098,7 @@ struct AllReduceTwoshotRMSNorm
         }
 
         int32x4_t tR[Codec::kRankAtoms] = {};
+        [[maybe_unused]] float acc[Codec::kRankAtoms][8] = {};
         {
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
             uint32_t* flag_ptr     = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags0_offset);
@@ -1069,11 +1113,22 @@ struct AllReduceTwoshotRMSNorm
 
                 codec.recv(&recv_buffer, tA);
 
-                for(int i = 0; i < Codec::kRankAtoms; i++)
+                if constexpr(kAccumulateInF32)
                 {
-                    packed_assign_add<CommT>(&tR[i], &tA[i]);
+                    accumulate_bf16_in_f32(acc, tA);
+                }
+                else
+                {
+                    for(int i = 0; i < Codec::kRankAtoms; i++)
+                    {
+                        packed_assign_add<CommT>(&tR[i], &tA[i]);
+                    }
                 }
             }
+        }
+        if constexpr(kAccumulateInF32)
+        {
+            round_f32_to_bf16(tR, acc);
         }
 
         for(int r = 0; r < kWorldSize; r++)
@@ -1230,6 +1285,8 @@ allreduce_prototype_twoshot(T const* A,
                             uint32_t* d_flag_color,
                             int64_t data_size_per_phase)
 {
+    set_fp16_ovfl(true);
+
     int block = blockIdx.x;
     int grid  = gridDim.x;
 
@@ -1265,6 +1322,8 @@ allreduce_rmsnorm_prototype_twoshot(T const* A,
                                     uint32_t* d_flag_color,
                                     int64_t data_size_per_phase)
 {
+    set_fp16_ovfl(true);
+
     int block = blockIdx.x;
     int grid  = gridDim.x;
 
