@@ -567,8 +567,9 @@ def test_mha_with_sink_sliding_window(
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 64)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1)])
 @pytest.mark.parametrize("HEAD_SZ", [64])
-@pytest.mark.parametrize("CAUSAL", [True])
-@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+# A left window of 0 keeps only keys at or after the query (diagonal only if causal).
+@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [0, 4, 32])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_sliding_window_no_sink(
     SEQLEN_Q: int,
@@ -674,7 +675,8 @@ def test_mha_sliding_window_no_sink(
     )
 
 
-def test_mha_sliding_window_fused_backward_raises():
+@pytest.mark.parametrize("window_left", [0, 32])
+def test_mha_sliding_window_fused_backward_raises(window_left):
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
@@ -688,7 +690,7 @@ def test_mha_sliding_window_fused_backward_raises():
 
     mha_set_use_fused_bwd_kernel(True)
     try:
-        out = flash_attn_func(q, k, v, causal=True, window_size=(32, -1))
+        out = flash_attn_func(q, k, v, causal=True, window_size=(window_left, -1))
         with pytest.raises(
             ValueError, match="Fused backward doesn't support sliding window attention"
         ):
@@ -697,7 +699,8 @@ def test_mha_sliding_window_fused_backward_raises():
         mha_set_use_fused_bwd_kernel(False)
 
 
-def test_mha_varlen_sliding_window_fused_backward_raises():
+@pytest.mark.parametrize("window_left", [0, 32])
+def test_mha_varlen_sliding_window_fused_backward_raises(window_left):
     q = torch.randn(
         (1, 64, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
@@ -744,7 +747,7 @@ def test_mha_varlen_sliding_window_fused_backward_raises():
             max_seqlen_q,
             max_seqlen_k,
             causal=True,
-            window_size=(32, -1),
+            window_size=(window_left, -1),
         )
         with pytest.raises(
             ValueError, match="Fused backward doesn't support sliding window attention"

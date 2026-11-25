@@ -275,7 +275,7 @@ def _bwd_dkdv_inner(
                     tl.where(causal_mask, qkT * sm_scale, 0.0),
                 )
             pT = tl.where(mask, pT, 0.0)
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW >= 0:
             window_mask = offs_n[:, None] >= (
                 offs_m[None, :] - delta_qk - SLIDING_WINDOW
             )
@@ -490,7 +490,7 @@ def _bwd_dq_inner(
             # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
             # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
             p = tl.where(mask_n[None, :], p, 0.0)
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW >= 0:
             window_mask = offs_n[None, :] >= (
                 offs_m[:, None] - delta_qk - SLIDING_WINDOW
             )
@@ -950,7 +950,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             )
             start_m += num_steps * MASK_BLOCK_M1
             end_m = seqlen_q
-            if SLIDING_WINDOW > 0:
+            if SLIDING_WINDOW >= 0:
                 end_m = min(start_n + BLOCK_N1 + delta_qk + SLIDING_WINDOW, seqlen_q)
             num_steps = tl.cdiv(max(end_m - start_m, 0), BLOCK_M1)
             end_m = start_m + num_steps * BLOCK_M1
@@ -1170,7 +1170,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             )
             end_n -= num_steps * MASK_BLOCK_N2
             window_start_n = 0
-            if SLIDING_WINDOW > 0:
+            if SLIDING_WINDOW >= 0:
                 window_start_n = max(start_m - delta_qk - SLIDING_WINDOW, 0)
             start_n = window_start_n // BLOCK_N2 * BLOCK_N2
             num_steps = tl.cdiv(max(end_n - start_n, 0), BLOCK_N2)

@@ -243,7 +243,7 @@ def _effective_swizzle(
 
 
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
-    return max(int(window_size[0]), 0)
+    return max(int(window_size[0]), -1)
 
 
 def gluon_forward_unsupported_reason(
@@ -654,7 +654,8 @@ def _flash_attn_forward(
         raise ValueError("Bias is not supported yet in the Triton Backend")
     if implementation != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
-    sliding_window = max(window_size_left, 0)
+    # -1 disables the window. 0 is a real window: no keys to the left.
+    sliding_window = max(window_size_left, -1)
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)
@@ -1024,9 +1025,10 @@ def _flash_attn_backward(
             rng_state=rng_state,
         )[3]
 
-    sliding_window = max(window_size_left, 0)
+    # -1 disables the window. 0 is a real window: no keys to the left.
+    sliding_window = max(window_size_left, -1)
     if _USE_FUSED_BWD_KERNEL:
-        if sliding_window > 0:
+        if sliding_window >= 0:
             raise ValueError(
                 "Fused backward doesn't support sliding window attention. "
                 "Disable fused backward or use the one-kernel backward."

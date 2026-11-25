@@ -54,7 +54,7 @@ def flash_attn_onekernel_backward(
     sink: torch.Tensor | None = None,
     dsink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
-    sliding_window: int = 0,
+    sliding_window: int = -1,
 ):
     """
     Flash Attention one-kernel backward pass with positional encoding support.
