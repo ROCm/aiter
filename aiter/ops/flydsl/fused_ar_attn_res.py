@@ -1082,7 +1082,8 @@ class AllReduceAttnRes:
     """The decode all-reduce of a TP group followed by the attention-residual read, as one call.
 
     ``__call__(inp, residual, bank, nvb, cw, ow)`` takes this rank's partial ``inp`` [M, H] bf16, the running
-    residual [M, H] bf16, the blocks ``bank`` [M, NB, H] bf16 (rows ``0..nvb`` valid), and the fp32 [H] score
+    residual [M, H] bf16, the blocks ``bank`` [M, NB, H] bf16 (rows ``0..nvb`` valid; pass exactly the nvb
+    valid rows, packed, to keep the unfused path fast), and the fp32 [H] score
     weight ``cw`` (score projection times score-norm weight) and output-norm weight ``ow``. It returns
     ``(out, prefix)``: the normed read and the new residual ``residual + all_reduce(inp)``.
 
@@ -1126,9 +1127,12 @@ class AllReduceAttnRes:
     def __call__(self, inp, residual, bank, nvb, cw, ow, score_eps=1e-6, out_eps=1e-6):
         m = inp.shape[0]
         if not self.fuses(m, nvb):
+            # attn_res_gate reads packed candidate rows: a strided [:, :nvb] view of a larger buffer costs it about
+            # 5 us at M = 32 (H 7168), so the caller's nvb valid blocks are passed as they are when they fit
+            blocks = bank if bank.shape[1] == nvb else bank[:, :nvb]
             return attn_res_gate(
                 residual,
-                bank[:, :nvb],
+                blocks,
                 cw,
                 score_eps,
                 add_hidden=self.all_reduce(inp),
