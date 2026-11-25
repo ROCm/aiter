@@ -903,6 +903,8 @@ def gemm_queue(kc, n_mt):
     # CTA's first item is static (its block id); each later one comes
     # from one agent claim, issued before the current item's body and
     # resolved after it. All GEMM1 items are claimed before any GEMM2
+    # (g2_early relaxes this for its early CTAs only; progress then rests on
+    # the other CTAs of each XCC group, see G2E below)
     # item, so a GEMM2 item waits only on GEMM1 items already running.
     U1 = n_mt * fx.Int32(NT1)
     U = U1 + n_mt * fx.Int32(NT2)
@@ -1044,16 +1046,44 @@ def gemm_queue(kc, n_mt):
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
             u = _uniform(comm_ops.load_i32_lds(bc_next))
+    # G2E (g2_early=KE, XQ only): one CTA in KE of every XCC group leaves
+    # GEMM1 after G2E_AFTER items of it and claims GEMM2 from the shared head,
+    # so GEMM2's scatter uses the XGMI while the rest of GEMM1 still reads
+    # HBM (after ROCm/aiter#7788's early_k). Picked by the index INSIDE the
+    # group (bid >> log2 NXCC), never by bid % KE: KE | NXCC would make whole
+    # groups early and leave their GEMM1 items to nobody. Progress holds: the
+    # other CTAs of each group claim its GEMM1 items and never wait on GEMM2.
+    G2E = int(kc.G2E) if XQ else 0
+    if const_expr(G2E):
+        assert G2E >= 2, "g2_early needs >= 2 (a group must keep GEMM1 CTAs)"
+        early_cta = ((bid >> fx.Int32(kc.NXCC.bit_length() - 1)) % fx.Int32(G2E)) == (
+            fx.Int32(G2E - 1)
+        )
+    # This CTA's GEMM1 items so far (early CTAs; counted only with G2E, but a
+    # loop-carried value must exist either way).
+    n1_mine = fx.Int32(0)
     n2_done = fx.Int32(0)
     n_items = fx.Int32(0)
     while u < U:
         n_items = n_items + fx.Int32(1)
         stamp(TR_LAST_ITEM)
+        # go2 = 1: this GEMM1 item is the early CTA's last; its claim takes
+        # the next item from the GEMM2 head instead of the group's GEMM1 one.
+        go2 = fx.Int32(0)
+        if const_expr(G2E):
+            go2 = fx.Int32(
+                (
+                    (u < U1)
+                    & early_cta
+                    & (n1_mine + fx.Int32(1) >= fx.Int32(kc.G2E_AFTER))
+                ).select(fx.Int32(1), fx.Int32(0))
+            )
+        g1_next = (u < U1) & (go2 == fx.Int32(0))
         claim = _buffer_atomic_add_ret(
             rsrc_ctl,
             fx.Int32(
                 is_t0.select(
-                    fx.Int32((u < U1).select(x_head, q_head)) if XQ else q_head,
+                    fx.Int32(g1_next.select(x_head, q_head)) if XQ else q_head,
                     fx.Int32(_OOB),
                 )
             ),
@@ -1061,6 +1091,8 @@ def gemm_queue(kc, n_mt):
             SCOPE_DEV,
         )
         if u < U1:
+            if const_expr(G2E):
+                n1_mine = n1_mine + fx.Int32(1)
             i, n = order_x(u) if XQ else order(u, NT1, kc.GM1 if STREAM else 1)
             i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
@@ -1186,7 +1218,8 @@ def gemm_queue(kc, n_mt):
         if is_t0:
             if const_expr(XQ):
                 nxq = U1 + claim
-                if u < U1:
+                # go2: the claim was on the GEMM2 head already.
+                if g1_next:
                     nxq = xq_next(claim)
                 comm_ops.store_i32_lds(bc_next, nxq)
             else:

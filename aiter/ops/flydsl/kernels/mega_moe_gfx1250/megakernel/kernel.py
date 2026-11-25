@@ -104,6 +104,8 @@ def make_megakernel(
     loc_group1=1,
     b_placed2=0,
     loc_group2=1,
+    g2_early=0,
+    g2_early_after=1,
 ):
     """Build a megakernel; returns a ``@flyc.jit`` launcher.
 
@@ -122,6 +124,11 @@ def make_megakernel(
     ``i32_tok`` (this rank's tokens), ``i32_rows`` (rows the GEMMs may see),
     ``addr_route`` (compact: the route slots, i32 per route; STREAM: its
     scratch, config.stream_layout), ``f32_swiglu_limit``, ``stream``.
+
+    ``g2_early`` (compact STREAM with the XQ queue only; 0 = off): one CTA in
+    ``g2_early`` of each XCC group leaves GEMM1 for GEMM2 after
+    ``g2_early_after`` GEMM1 items (protocol.gemm_queue). config.compact_variants
+    sets it per step size from G2_EARLY_TILES.
 
     ``stream`` (compact only): the dispatch is S1F's producer pipeline
     (config.STREAM).
@@ -295,6 +302,16 @@ def make_megakernel(
     # its rows retire; CTA 0 plans from the counters then, and GEMM items start
     # and stream weights while their A owners wait for the rows-landed gate.
     EARLY = int(not COMPACT)
+    # Early GEMM2 CTAs (see the docstring). Only the XQ queue has a GEMM2
+    # head of its own; elsewhere it is off and stays out of the kernel name.
+    G2E = int(g2_early)
+    G2E_AFTER = max(1, int(g2_early_after))
+    if G2E == 1 or G2E < 0:
+        raise ValueError("g2_early must be 0 (off) or >= 2")
+    if G2E_AFTER >= 1000:
+        raise ValueError("g2_early_after must be < 1000")
+    if not (STREAM and st_kw["XQ"]):
+        G2E = 0
     # slots: while the plan is pending, a step of at least PREF_MIN_TOK tokens
     # has every CTA but 0 read the first 256 KB of the W1 slice its first item
     # most likely needs.
@@ -318,6 +335,7 @@ def make_megakernel(
             ("bp", b_placed1 * 10 + b_placed2, 0),
             ("lc", st_kw["LOC"] if STREAM else 0, 0),
             ("ds", DEFER_SC, 1),
+            ("ge", G2E * 1000 + G2E_AFTER if G2E else 0, 0),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
         )
@@ -330,6 +348,8 @@ def make_megakernel(
         CF_OFF=CF_OFF,
         COMPACT=COMPACT,
         DEFER_SC=DEFER_SC,
+        G2E=G2E,
+        G2E_AFTER=G2E_AFTER,
         DEST_STRIDE=DEST_STRIDE,
         E=E,
         EARLY=EARLY,

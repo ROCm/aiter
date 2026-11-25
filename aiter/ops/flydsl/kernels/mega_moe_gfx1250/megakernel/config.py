@@ -271,6 +271,54 @@ def compact_variants(config) -> list:
         for kv in env.split(","):
             k, v = kv.split("=")
             out[-1][2][k.strip()] = int(v)
+    return _split_g2_early(config, out)
+
+
+#: Early GEMM2 CTAs (the builder's ``g2_early``, after ROCm/aiter#7788's
+#: early_k) by (hidden, inter): ((tokens per rank up to which a step runs the
+#: setting, None for every larger step; one CTA in KE of each XCC group, 0 =
+#: off), ...). A kernel row of compact_variants whose range spans a boundary
+#: splits there into its own kernels. GEMM2 is XGMI-bound and the links idle
+#: while GEMM1 runs, so the early CTAs start the scatter sooner; the gain grows
+#: with the step. Measured EP4, MoE alone, KE 2 against off, three interleaved
+#: repeats of 100 iterations: DSR1 -1.3 us (-0.4%) at 1536 tokens per rank,
+#: -14 us (-2.1%) at 4096; DSV4.1 Flash none, so it stays off.
+G2_EARLY_TILES = {
+    (7168, 2048): ((None, 2),),  # DSR1
+    None: ((None, 0),),
+}
+#: GEMM1 items an early CTA runs before it switches.
+G2_EARLY_AFTER = 1
+
+
+def _split_g2_early(config, variants) -> list:
+    """compact_variants' rows cut at the G2_EARLY_TILES boundaries of this
+    instance's shape, each with its ``g2_early`` / ``g2_early_after``.
+    Splitting stops at COMPACT_MAX_KERNELS kernels; a row past it keeps the
+    setting of its upper bound."""
+    rows = G2_EARLY_TILES.get(
+        (config.hidden_dim, config.geometry.inter_dim), G2_EARLY_TILES[None]
+    )
+    bounds = [
+        (None if upto is None else config.world_size * int(upto), int(ke))
+        for upto, ke in rows
+    ]
+
+    def ke_at(recv):  # the setting of a step whose receive bound is recv
+        for hi, ke in bounds:
+            if hi is None or recv <= hi:
+                return ke
+        return 0
+
+    out = []
+    for lo, hi, tile, ctas in variants:
+        cuts = [b for b, _ in bounds if b is not None and lo < b < hi]
+        if len(out) + len(cuts) + 1 > COMPACT_MAX_KERNELS:
+            cuts = []
+        for edge in [*cuts, hi]:
+            t = dict(tile, g2_early=ke_at(edge), g2_early_after=G2_EARLY_AFTER)
+            out.append((lo, edge, t, ctas))
+            lo = edge
     return out
 
 
