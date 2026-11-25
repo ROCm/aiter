@@ -286,13 +286,6 @@ def compact_variants(config) -> list:
                 (config.hidden_dim, config.geometry.inter_dim), STREAM_TILES[None]
             )
         )
-    # Tuning: AITER_MEGAKERNEL_TILE="num_buffers=3,num_buffers2=3" overrides
-    # the largest steps' kernel.
-    env = os.environ.get("AITER_MEGAKERNEL_TILE", "")
-    if env and out:
-        for kv in env.split(","):
-            k, v = kv.split("=")
-            out[-1][2][k.strip()] = int(v)
     return _split_g2_early(config, out)
 
 
@@ -344,13 +337,13 @@ def _split_g2_early(config, variants) -> list:
     return out
 
 
-#: compact STREAM (AITER_MEGAKERNEL_STREAM, default on): the dispatch is the
+#: compact STREAM: the dispatch is the
 #: S1F producer pipeline inside the kernel. Every CTA quantizes its tokens
 #: into local wire rows, ``STREAM_PRODUCERS`` CTAs ship them a run (<= 8 rows
 #: of one destination flag tile) at a time and publish a flag per (flag tile,
 #: source), and each GEMM item waits only on its own m-tile's flags.
-STREAM = os.environ.get("AITER_MEGAKERNEL_STREAM", "1") == "1"
-STREAM_PRODUCERS = int(os.environ.get("AITER_MEGAKERNEL_PRODUCERS", "128"))
+STREAM = True
+STREAM_PRODUCERS = 128
 STREAM_RUN_ROWS = 8
 #: STREAM's large-tile stages by (hidden, inter): DSV4.1 Flash takes a third
 #: GEMM2 stage, DSR1 (and the rest) a third GEMM1 stage only.
@@ -378,7 +371,7 @@ def stream_reason(config, tile, ctas_per_cu) -> str | None:
     from ..s1f_stage1 import s1f_producer_lds
 
     if not STREAM:
-        return "AITER_MEGAKERNEL_STREAM is off"
+        return "STREAM is off"
     npes, tm = config.world_size, int(tile["tile_m"])
     fm = stream_flag_m(tm)
     if tm % fm or fm % STREAM_RUN_ROWS or (tm // fm) * npes > WAVE or npes > 16:

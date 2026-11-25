@@ -222,17 +222,12 @@ def make_megakernel(
         mb = s1f_producer_lds(run_rows=STREAM_RUN_ROWS, row_stride=ROW)
         TBL_OFF = (mb["end"] + 127) // 128 * 128
         NPOS2 = lay_s["npos"]
-        RBK = int(
-            os.environ.get(
-                "AITER_MEGAKERNEL_BLOCK_RUNS", str(s1f_block_runs(max_tok_per_rank))
-            )
-        )
+        RBK = s1f_block_runs(max_tok_per_rank)
         # GEMM1 claimed per XCC (protocol.gemm_queue): faster with two
         # n-tiles an XCC (DSR1 4096 tpr -12 us); three (Pro) read a little
-        # slower, so they keep the one queue unless asked.
+        # slower, so they keep the one queue.
         NXCC = 8
-        _xq = os.environ.get("AITER_MEGAKERNEL_XQ", "1" if NT1 == 2 * NXCC else "0")
-        XQ = int(_xq == "1" and NT1 % NXCC == 0)
+        XQ = int(NT1 == 2 * NXCC)
         # IOD-placed W1 and W2: n-tiles come in runs of R alternating IOD
         # domains (an odd last run split in halves). Under XQ, each CTA then
         # takes the n-tiles of its own domain (protocol.gemm_queue).
@@ -252,9 +247,9 @@ def make_megakernel(
             LOC=LOC,
             R1=R1 or 1,
             R2=R2 or 1,
-            GMX=int(os.environ.get("AITER_MEGAKERNEL_GMX", "32")),
-            GM1=int(os.environ.get("AITER_MEGAKERNEL_GM1", "32")),
-            GM2=int(os.environ.get("AITER_MEGAKERNEL_GM2", "32")),
+            GMX=32,
+            GM1=32,
+            GM2=32,
             FM=FM,
             FSH=FM.bit_length() - 1,
             SUB=SUB,
