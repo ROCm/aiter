@@ -139,6 +139,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
+          # sglang's own dependency script installs lmms-eval, which hard-pins
+          # numpy==1.26.4 and so downgrades the image's 2.x. Everything compiled
+          # into the image -- sglang's kernels among them -- was built against
+          # the NumPy 2 C-API, and the server then cannot import at all. Put the
+          # ABI back before anything tries to run on it.
+          bash scripts/ci/amd/amd_ci_exec.sh pip install --upgrade "numpy>=2,<3"
+          bash scripts/ci/amd/amd_ci_exec.sh python -c "import numpy; print('numpy', numpy.__version__)"
 
       - name: Install aiter under test
         id: install_aiter_under_test
