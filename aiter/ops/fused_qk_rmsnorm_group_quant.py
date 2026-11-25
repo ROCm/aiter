@@ -74,6 +74,13 @@ def fused_qk_rmsnorm_group_quant(
     transpose_scale: bool = False,
     gemma_norm: bool = False,
 ) -> None:
+    """RMSNorm (+ residual add) of q, with optional group quant of the result.
+
+    An fp8 ``q_out_quantized`` with a 1-byte (E8M0) ``q_out_scale`` of shape
+    ``(m, n // 32)`` and ``group_size=32`` is native MXFP8: bf16 ``q``, no ``k``,
+    row-major scale. It is bit for bit the no-quant mode's bf16 row followed by a
+    separate group-32 MXFP8 quant of it (scale ``ceil_pow2(max(amax, 1e-10) / fp8 max)``).
+    """
     # No-quant mode: when q_out_scale is None we only do RMSNorm and write to q_out_unquantized.
     no_quant = q_out_scale is None
     if no_quant:

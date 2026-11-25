@@ -9,6 +9,7 @@
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "fused_qk_rmsnorm_group_quant.h"
@@ -27,7 +28,8 @@ template <typename DTYPE_I,
           bool GEMMA_NORM = false,
           bool NO_QUANT = false,
           bool PER_TOKEN_QUANT = false,
-          bool interleave = false>
+          bool interleave = false,
+          bool MXFP8 = false>
 __global__ void fused_qk_rmsnorm_group_quant_kernel(
     DTYPE_O* __restrict__ q_out_quantized,
     void* __restrict__ q_out_scale,
@@ -248,7 +250,64 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             }
         }
 
-        if constexpr(!NO_QUANT)
+        if constexpr(MXFP8)
+        {
+            // Native MXFP8 (E4M3 + E8M0, group 32) of the bf16 row the no-quant mode writes.
+            static_assert(std::is_same_v<DTYPE_I, opus::bf16_t> && std::is_same_v<DTYPE_O, opus::fp8_t> &&
+                          !NO_QUANT && !PER_TOKEN_QUANT);
+            // A lane holds runs of contiguous columns: load_vec_size-wide chunks strided by
+            // WARP_SIZE chunks (interleave), else one run of thread_data_size.
+            constexpr bool chunked = interleave && (num_load_inst > 1);
+            constexpr int run = chunked ? load_vec_size : thread_data_size;
+            static_assert(32 % run == 0, "lanes must tile an MXFP8 group");
+            constexpr int lanes = 32 / run; // lanes sharing a group
+            constexpr aiter::MxDtype kHwFp8 =
+#if defined(__gfx942__)
+                aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+                aiter::MxDtype::FP8_E4M3;
+#endif
+            auto* scale_u8 = reinterpret_cast<uint8_t*>(out1_scale);
+            for(int r = 0; r < thread_data_size / run; ++r)
+            {
+                const int col = row_offset + (chunked ? r * interleave_size * load_vec_size : 0);
+                float amax = aiter::kAmaxFloor;
+                for(int i = r * run; i < (r + 1) * run; ++i)
+                {
+                    thread_data_f[i] = opus::bf16_to_fp32(opus::cast<DTYPE_I>(thread_data_f[i]));
+                    amax = fmaxf(amax, fabsf(thread_data_f[i]));
+                }
+                amax = multithread_reduce_max_dpp<lanes>(amax);
+                const aiter::E8m0BlockScale s =
+                    aiter::fp_f32_to_e8m0_block_scale<aiter::MxScaleRoundMode::RoundUp, kHwFp8>(amax);
+                const float inv = s.inv_scale();
+                for(int i = r * run; i < (r + 1) * run; ++i)
+                {
+                    thread_data_f[i] = thread_data_f[i] * inv;
+                }
+                if(row_active && (tid % lanes) == 0 && col < n1)
+                {
+                    scale_u8[static_cast<int64_t>(idx) * out1_scale_row_stride +
+                             static_cast<int64_t>(col / 32) * out1_scale_col_stride] = s.byte;
+                }
+            }
+            auto out_q_ptr = out1_q + idx * static_cast<int64_t>(out1_q_stride);
+            const int oob_o = (n1 + ooba_o - 1) / ooba_o * ooba_o;
+            auto out_q_buffer = opus::make_gmem<DTYPE_O_STORE>(
+                reinterpret_cast<DTYPE_O_STORE*>(out_q_ptr), oob_o * sizeof(DTYPE_O_STORE));
+            if(row_active)
+            {
+                store_vector<DTYPE_O_STORE,
+                             float,
+                             thread_data_size,
+                             RT,
+                             interleave,
+                             interleave_size,
+                             num_load_inst,
+                             DTYPE_O>(out_q_buffer, thread_data_f, row_offset, 1.0f);
+            }
+        }
+        else if constexpr(!NO_QUANT)
         {
             float thread_max = row_active ? 1e-10f : 0.0f;
             if(row_active)
@@ -469,8 +528,44 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             group_size);                                                                                                          \
     });
 
+// Native MXFP8 (fp8 + E8M0 group 32) launches: bf16 input only, launched with the block shape
+// of the no-quant mode so the normalized row is the same.
+#define FUSED_RMSNORM_MXFP8_KERNEL_IMPL_(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, interleave) \
+    do                                                                                                                  \
+    {                                                                                                                   \
+        using DTYPE_I = opus::bf16_t;                                                                                   \
+        dim3 grid(m, 1);                                                                                                \
+        dim3 block(BlockSize);                                                                                          \
+        fused_qk_rmsnorm_group_quant_kernel<DTYPE_I, opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL,         \
+                                            OUTPUT_UNQUANT, GEMMA_NORM_V, false, false, interleave, true>               \
+            <<<grid, block, 0, stream>>>(                                                                               \
+                reinterpret_cast<opus::fp8_t*>(out1_quantized.data_ptr()),                                              \
+                out1_scale.data_ptr(),                                                                                  \
+                reinterpret_cast<DTYPE_I*>(out1_unquantized.data_ptr()),                                                \
+                reinterpret_cast<DTYPE_I*>(out2.data_ptr()),                                                            \
+                reinterpret_cast<DTYPE_I*>(out_res1.data_ptr()),                                                        \
+                reinterpret_cast<const DTYPE_I*>(inp1.data_ptr()),                                                      \
+                reinterpret_cast<const DTYPE_I*>(x2.data_ptr()),                                                        \
+                reinterpret_cast<const DTYPE_I*>(res1_ptr),                                                             \
+                reinterpret_cast<const DTYPE_I*>(inp1_weight.data_ptr()),                                               \
+                reinterpret_cast<const DTYPE_I*>(x2_weight.data_ptr()),                                                 \
+                inp1_epsilon, x2_epsilon, m, n1, n2, inp1_stride, inp2_stride, res1_stride, out1_q_stride,             \
+                out1_scale_row_stride, out1_scale_col_stride, out1_u_stride, out2_stride, out_res1_stride,             \
+                group_size);                                                                                            \
+    } while(0)
+
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, interleave)
+    do                                                                                                                                                                   \
+    {                                                                                                                                                                    \
+        if(mxfp8)                                                                                                                                                        \
+        {                                                                                                                                                                \
+            FUSED_RMSNORM_MXFP8_KERNEL_IMPL_(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, interleave);                                      \
+        }                                                                                                                                                                \
+        else                                                                                                                                                             \
+        {                                                                                                                                                                \
+            FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, interleave) \
+        }                                                                                                                                                                \
+    } while(0)
 
 #define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false)
@@ -508,7 +603,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
 
-// gfx1250 no-quant rows use coalesced wave32 vector chunks.
+// gfx1250 no-quant (and native MXFP8) rows use coalesced wave32 vector chunks.
 #define FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, true)
 
@@ -719,6 +814,7 @@ void fused_qk_rmsnorm_group_quant(
     // In no-quant mode the placeholder DTYPE_O is fp8 (kernel won't dereference quant outputs/scale).
     bool quant_is_fp8 = true;
     bool quant_is_fp4 = false;
+    bool mxfp8 = false;
     int out1_scale_row_stride = 0;
     int out1_scale_col_stride = 0;
 
@@ -740,6 +836,8 @@ void fused_qk_rmsnorm_group_quant(
 
         quant_is_fp8 = (out1_quantized.dtype() == AITER_DTYPE_fp8);
         quant_is_fp4 = (out1_quantized.dtype() == AITER_DTYPE_fp4x2);
+        mxfp8 = quant_is_fp8 && !per_token_quant &&
+                (out1_scale.dtype() == AITER_DTYPE_fp8_e8m0 || out1_scale.dtype() == AITER_DTYPE_u8);
         AITER_CHECK(quant_is_fp8 || quant_is_fp4,
                     __func__,
                     " q_out_quantized dtype only supports fp8/fp4x2, got: ",
@@ -817,11 +915,21 @@ void fused_qk_rmsnorm_group_quant(
             out1_scale_row_stride = out1_scale.stride(0);
             out1_scale_col_stride = out1_scale.stride(1);
         }
-        if(quant_is_fp8)
+        if(quant_is_fp8 && !mxfp8)
         {
             AITER_CHECK(out1_scale.dtype() == AITER_DTYPE_fp32,
                         __func__,
                         " q_out_scale dtype must be float32 for fp8 path");
+        }
+        else if(mxfp8)
+        {
+            AITER_CHECK(group_size == 32 && !transpose_scale,
+                        __func__,
+                        " fp8 with an E8M0 q_out_scale (native MXFP8) needs group_size 32 and a "
+                        "row-major scale");
+            AITER_CHECK(inp1.dtype() == AITER_DTYPE_bf16 && !inp2.has_value(),
+                        __func__,
+                        " native MXFP8 takes a bf16 q and no k");
         }
         else
         {
@@ -996,10 +1104,11 @@ void fused_qk_rmsnorm_group_quant(
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
 
-    // No-quant dispatch is based on wave/vector capacity, not model widths.
+    // No-quant dispatch is based on wave/vector capacity, not model widths. Native MXFP8
+    // takes the same launches, so its normalized row is the no-quant one.
     // Keep quantized, dual-input and vector-tail dispatch on the existing paths.
-    // RTS=1 is sufficient because no-quant does not execute group-scale reduction.
-    if(no_quant && !has_second_input && n1 > 0 && n1 % 8 == 0 && get_gpu_arch() == "gfx1250")
+    // RTS=1 is sufficient: neither mode executes the group-scale reduction.
+    if((no_quant || mxfp8) && !has_second_input && n1 > 0 && n1 % 8 == 0 && get_gpu_arch() == "gfx1250")
     {
         constexpr int wave_threads = 32;
         constexpr int block_threads = 256;

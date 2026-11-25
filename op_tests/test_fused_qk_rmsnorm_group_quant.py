@@ -768,6 +768,123 @@ def test_fused_qk_rmsnorm_group_quant(
     }
 
 
+def _mxfp8_group32_ref(y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """A separate group-32 MXFP8 quant of the bf16 tensor y (ATOM quantize_fp8): fp8
+    values and E8M0 codes, amax floored at 1e-10, scale ceil_pow2(amax / fp8 max)."""
+    fp8_max = torch.finfo(dtypes.fp8).max
+    m, n = y.shape
+    x = y.float().view(m, n // 32, 32)
+    amax = x.abs().amax(-1).clamp_min(1e-10)
+    bits = (amax * (1.0 / fp8_max)).view(torch.int32)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    recip = ((254 - code).clamp_min(0) << 23).view(torch.float32)
+    q = (x * recip[..., None]).clamp(-fp8_max, fp8_max).to(dtypes.fp8)
+    return q.view(m, n), code.to(torch.uint8).view(dtypes.fp8_e8m0)
+
+
+def _filled(shape, dtype, like):
+    """A sentinel-filled output: bytes the kernel does not write stay 0x5a."""
+    out = torch.empty(shape, dtype=dtype, device=like.device)
+    out.view(torch.uint8).fill_(0x5A)
+    return out
+
+
+@perftest()
+def _run_no_quant_then_quant(x, w, eps, res, gemma_norm):
+    """The two launches the MXFP8 mode replaces: the no-quant norm, then aiter's
+    group-32 MXFP8 quant of its bf16 row."""
+    y = torch.empty_like(x)
+    res_out = torch.empty_like(x) if res is not None else None
+    aiter.fused_qk_rmsnorm_group_quant(
+        q=x,
+        q_weight=w,
+        q_epsilon=eps,
+        q_out_unquantized=y,
+        q_res_out=res_out,
+        q_residual=res,
+        gemma_norm=gemma_norm,
+    )
+    q, s = aiter.per_1x32_mx_quant_hip(
+        y, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    return y, res_out, q, s
+
+
+@perftest()
+def _run_mxfp8(q, s, y, res_out, x, w, eps, res, gemma_norm):
+    aiter.fused_qk_rmsnorm_group_quant(
+        q,
+        s,
+        x,
+        w,
+        eps,
+        q_out_unquantized=y,
+        q_res_out=res_out,
+        q_residual=res,
+        group_size=32,
+        gemma_norm=gemma_norm,
+    )
+    return q, s, y, res_out
+
+
+@benchmark()
+def test_mxfp8_matches_no_quant(
+    token: int, n: int, add_residual: bool, gemma_norm: bool, output_unquantized: bool
+):
+    """Native MXFP8 mode (fp8 q_out_quantized + E8M0 q_out_scale, group 32): bit for bit
+    the no-quant mode's bf16 row followed by a separate group-32 MXFP8 quant (a torch
+    reference and aiter's per_1x32_mx_quant_hip of that row)."""
+    x = torch.randn((token, n), dtype=dtypes.bf16, device="cuda") * 3
+    if token > 1:
+        x[-1] = 0  # an all-zero row: the amax floor
+    w = torch.randn((n,), dtype=dtypes.bf16, device="cuda") * 0.1
+    res = torch.randn_like(x) if add_residual else None
+    if res is not None and token > 1:
+        res[-1] = 0
+    (y_ref, res_ref, q_hip, s_hip), us_ref = _run_no_quant_then_quant(
+        x, w, 1e-6, res, gemma_norm
+    )
+    q_ref, s_ref = _mxfp8_group32_ref(y_ref)
+    assert torch.equal(q_hip.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s_hip.view(torch.uint8), s_ref.view(torch.uint8))
+    outs = (
+        _filled((token, n), dtypes.fp8, x),
+        _filled((token, n // 32), dtypes.fp8_e8m0, x),
+        _filled((token, n), x.dtype, x) if output_unquantized else None,
+        _filled((token, n), x.dtype, x) if add_residual else None,
+    )
+    (q, s, y, res_out), us = _run_mxfp8(*outs, x, w, 1e-6, res, gemma_norm)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "fp8 values"
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "e8m0 scales"
+    if output_unquantized:
+        assert torch.equal(y.view(torch.int16), y_ref.view(torch.int16)), "bf16 row"
+    if add_residual:
+        assert torch.equal(res_out.view(torch.int16), res_ref.view(torch.int16))
+    return {"us_norm_then_quant": us_ref, "us_mxfp8": us, "bitwise": True}
+
+
+def run_mxfp8_sweep(tokens=None):
+    """The MXFP8 mode against the no-quant mode + a group-32 quant: every gfx1250 launch
+    shape (n 128 / 256 wave32, 512 64x8, 6144 512x16 under the CU count and the
+    interleaved 256x24 from it, 5120 / 4736 the interleaved one with a tail, the latter
+    with a partly active wave); 255 / 256 rows
+    straddle the CU count of a 256-CU part, 32768 is MiniMax-M3.1's prefill chunk at its
+    hidden 6144."""
+    full = tokens is not None
+    rows = [
+        test_mxfp8_matches_no_quant(t, n, r, g, u)
+        for t in (tokens or [1, 255, 256, 32768])
+        for n in (128, 256, 512, 1024, 2048, 4096, 4736, 5120, 6144)
+        for r in (False, True)
+        for g in ((False, True) if full else (True,))
+        for u in (False, True)
+    ]
+    aiter.logger.info(
+        "fused_qk_rmsnorm_group_quant MXFP8 (vs no-quant + per_1x32_mx_quant_hip):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 if __name__ == "__main__":
     l_dtype = ["bf16"]
     l_quant_type = ["fp8"]
@@ -1006,3 +1123,5 @@ if __name__ == "__main__":
         "fused_qk_rmsnorm_group_quant summary (time/err/bw, markdown):\n%s",
         focus_df.to_markdown(index=False),
     )
+    if dtypes.bf16 in [dtypes.d_dtypes[k] for k in l_dtype] and "fp8" in l_quant_type:
+        run_mxfp8_sweep(token_override)
