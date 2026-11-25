@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     bwd_kernel_causal,
     bwd_kernel_noncausal,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
@@ -203,7 +204,7 @@ def flash_attn_onekernel_backward(
 
     # Configs
     if config is None:
-        config = _get_config()
+        config = _get_config(get_arch())
 
     # init delta
     delta = torch.zeros_like(softmax_lse)
