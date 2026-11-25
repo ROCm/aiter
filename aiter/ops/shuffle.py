@@ -4,7 +4,9 @@
 import torch
 import torch.nn.functional as F
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import is_gfx1250_family
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.moe_nvfp4_common import scale_gs
 
 
 def _moe_tile_shuffle(
@@ -63,6 +65,25 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
         s = F.pad(s, (0, 0, 0, pad), value=0x7F)
     out = _moe_tile_shuffle(s, tile_minor=32, tile_major=4)
     return out.view(x_type)
+
+
+def shuffle_mxfp8_bpreshuffle_scale(w_scale: torch.Tensor) -> torch.Tensor:
+    """1x32 e8m0 weight scale ``[N, K/32]`` as this arch's mxfp8 bpreshuffle GEMM reads it.
+
+    The w_scale of ``gemm_a8w8_mxfp8_bpreshuffle`` (and of group32
+    ``gemm_a8w8_blockscale(isBpreshuffled=True)``): 32x4 shuffled on the gfx1250
+    family (``shuffle_mxfp8fp4_scale`` bytes, same shape and dtype). On every
+    other arch (e.g. gfx950) it is row-major and the input is returned unchanged.
+    The arch is the running GPU's (``get_gfx_runtime()``), as in the GEMM dispatch.
+    """
+    if not is_gfx1250_family(get_gfx_runtime()):
+        return w_scale
+    if w_scale.dim() != 2 or w_scale.shape[0] % 32 or w_scale.shape[1] % 4:
+        raise ValueError(
+            "gfx1250 1x32 w_scale must be [N, K/32] with N % 32 == 0 and "
+            f"K % 128 == 0, got {tuple(w_scale.shape)}"
+        )
+    return shuffle_mxfp8fp4_scale(w_scale.contiguous())
 
 
 def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
@@ -137,7 +158,7 @@ def moe_shuffle_weight(
     use ``shuffle_weight``'s lane-level interleave. Mirror of ``moe_shuffle_scale``.
     ``is_guinterleave`` is ignored unless ``gate_up=True`` (stage2 has no gate/up).
     """
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         if is_guinterleave and gate_up:
             src = interleave_gate_up_rows(src)
         return shuffle_weight(src, layout=layout)
@@ -155,7 +176,10 @@ def shuffle_weight(
     pad_k_to: int = 0,
 ) -> torch.Tensor:
     x_type = x.dtype
-    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+    is_packed_fp4 = (
+        hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2
+    )
+    if is_packed_fp4:
         x = x.view(torch.uint8)
 
     original_k = x.shape[-1]
@@ -188,11 +212,18 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.aiter_shuffle_layout = tuple(layout)
+        x_.aiter_shuffle_is_guinterleave = True
         x_.gate_up_interleave = gate_up
         return x_
 
     IN, IK = layout
-    BK = IK * 2
+    # A packed FP4 byte already contains two logical K values. Its 16x16
+    # preshuffle tile is therefore IK bytes wide, not IK*2 bytes. Grouping two
+    # adjacent tiles was layout-equivalent for widths divisible by 32 bytes, but
+    # unnecessarily rejected valid 16-byte-aligned widths such as K=160
+    # (80 packed bytes), used by the FLAT 16x160 MoE kernel.
+    BK = IK if is_packed_fp4 else IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
@@ -205,6 +236,8 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    x_.aiter_shuffle_layout = tuple(layout)
+    x_.aiter_shuffle_is_guinterleave = False
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]
@@ -248,7 +281,8 @@ def shuffle_scale_n32k4(
     """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
 
     Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
-    Output: ``(E, N//32, (K//32)*32)`` uint8.
+    Output: ``(E, N//32, ceil(K/128)*128)`` uint8 (a K % 128 == 64 tail pads
+    its last k128 with e8m0 1.0).
 
     Within a 32-row super-row the column is ``remain_k*128 + row32*4 + r`` so each
     lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
@@ -284,10 +318,14 @@ def shuffle_scale_n32k4(
         s = s.view(E, 2, N // 2, k_scale).permute(0, 2, 1, 3).reshape(E, N, k_scale)
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
+    if k_scale % 2 != 0:
+        raise ValueError(f"B-scale K//32 must be even (K%64==0), got {k_scale}")
     if k_scale % 4 != 0:
-        raise ValueError(
-            f"B-scale K//32 must be divisible by 4 (K%128==0), got {k_scale}"
-        )
+        # K % 128 == 64: the weights keep their half-k128 tail unpadded, and only
+        # the scales round up to a whole k128 with a finite e8m0 (1.0) that the
+        # GEMM multiplies against zero-filled operand bytes.
+        s = F.pad(s, (0, 4 - k_scale % 4), value=0x7F)
+        k_scale = s.shape[-1]
     g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
     return g.reshape(E, N // 32, k_scale * 32)
 
@@ -428,7 +466,7 @@ def moe_shuffle_scale(
 ) -> torch.Tensor:
     """Arch-aware MoE weight (B) scale shuffle."""
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         # n32k4 grouped-MoE B-scale. GGUU (is_guinterleave=False) folds rows
         # as-is; GUGU (is_guinterleave=True) interleaves gate/up rows first.
         return shuffle_scale_n32k4(
@@ -449,6 +487,25 @@ def shuffle_scale_a16w4(
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
     )
+
+
+def shuffle_scale_nvfp4_moe(src: torch.Tensor) -> torch.Tensor:
+    """gfx950 NVFP4 MoE (aiter.ops.moe_nvfp4) E4M3 block-scale preshuffle.
+
+    [E, N, K/16] -> [E][N/16][K/128/GS][64][GS/2][4] bytes, GS =
+    scale_gs(K / 128): per 16-row N tile and K-tile pair the 64 lanes x
+    4 bytes of one scale load, GS/2 pairs per group. An odd K-tile count gets zero
+    scales for the missing K-tile.
+    """
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    if s.shape[2] % 16:
+        s = F.pad(s, (0, 16 - s.shape[2] % 16))
+    E, N, KS = s.shape
+    s = s.view(E, N // 16, 16, KS // 16, 2, 4, 2).permute(0, 1, 3, 5, 2, 4, 6)
+    gps = scale_gs(KS // 8) // 2
+    s = s.reshape(E, N // 16, -1, gps, 64, 4).permute(0, 1, 2, 4, 3, 5)
+    return s.contiguous().view(x_type)
 
 
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:

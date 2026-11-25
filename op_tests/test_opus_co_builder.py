@@ -47,7 +47,7 @@ class NamedRegisterEvidenceTests(unittest.TestCase):
     def test_strict_default_path_is_a_flat_sibling(self):
         a0 = Path(builder._default_co_output_dir("gfx1250", "gfx1250-strict"))
         normal = Path(builder._default_co_output_dir("gfx1250", "gfx1250"))
-        self.assertEqual(a0, _BUILDER_PATH.parent / "gfx1250-a0")
+        self.assertEqual(a0, _BUILDER_PATH.parent / "gfx1250-strict")
         self.assertEqual(normal, _BUILDER_PATH.parent / "named_reg" / "gfx1250")
 
     def test_strict_layout_guard_does_not_change_the_target(self):

@@ -10,10 +10,12 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
 from op_tests.triton_tests.attention.mha_test_utils import (
     pad_rearrange_dropout_mask,
@@ -220,6 +222,104 @@ def test_mha_varlen_with_pe(
 
     # Assertion
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+def _dequant(x_fp8, descale):
+    """[batch, seqlen, heads, dim] fp8 back to fp32, one scale per (batch, head)."""
+    return x_fp8.float() * descale[:, None, :, None]
+
+
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_gluon_with_pe(
+    SEQLEN_Q: int, SEQLEN_K: int, HEAD_SZ_QK: int, HEAD_SZ_V: int, CAUSAL: bool
+):
+    """fp8 Q/K with a PE slice (Q/K head wider than V), against fp32 attention on
+    the dequantized inputs."""
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(24)
+    q = torch.randn((2, SEQLEN_Q, 8, HEAD_SZ_QK), device="cuda", dtype=torch.float32)
+    k = torch.randn((2, SEQLEN_K, 2, HEAD_SZ_QK), device="cuda", dtype=torch.float32)
+    v = torch.randn((2, SEQLEN_K, 2, HEAD_SZ_V), device="cuda", dtype=torch.float32)
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype)
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype)
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
+
+    gluon_out, gluon_lse = flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        causal=CAUSAL,
+        return_lse=True,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+    torch_out, _, torch_lse = attention_ref(
+        _dequant(q_fp8, q_descale),
+        _dequant(k_fp8, k_descale),
+        _dequant(v_fp8, v_descale),
+        causal=CAUSAL,
+    )
+
+    torch.testing.assert_close(gluon_out.float(), torch_out, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(gluon_lse, torch_lse, atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp8_gluon_with_pe(HEAD_SZ_QK: int, HEAD_SZ_V: int, CAUSAL: bool):
+    """`test_mha_fp8_gluon_with_pe` on packed sequences of mixed lengths."""
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(25)
+    seqlens_q, seqlens_k = [300, 77, 129], [1100, 513, 129]
+    cu_seqlens_q = torch.tensor([0] + seqlens_q, device="cuda").cumsum(0).int()
+    cu_seqlens_k = torch.tensor([0] + seqlens_k, device="cuda").cumsum(0).int()
+    q = torch.randn((sum(seqlens_q), 8, HEAD_SZ_QK), device="cuda", dtype=torch.float32)
+    k = torch.randn((sum(seqlens_k), 2, HEAD_SZ_QK), device="cuda", dtype=torch.float32)
+    v = torch.randn((sum(seqlens_k), 2, HEAD_SZ_V), device="cuda", dtype=torch.float32)
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype, cu_seqlens_q)
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype, cu_seqlens_k)
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype, cu_seqlens_k)
+
+    gluon_out, gluon_lse = flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=CAUSAL,
+        return_lse=True,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+    for b in range(len(seqlens_q)):
+        rows = slice(cu_seqlens_q[b], cu_seqlens_q[b + 1])
+        keys = slice(cu_seqlens_k[b], cu_seqlens_k[b + 1])
+        torch_out, _, torch_lse = attention_ref(
+            _dequant(q_fp8[None, rows], q_descale[b : b + 1]),
+            _dequant(k_fp8[None, keys], k_descale[b : b + 1]),
+            _dequant(v_fp8[None, keys], v_descale[b : b + 1]),
+            causal=CAUSAL,
+        )
+
+        torch.testing.assert_close(
+            gluon_out[rows].float(), torch_out[0], atol=0.1, rtol=0.1
+        )
+        torch.testing.assert_close(
+            gluon_lse[rows], torch_lse[0].T, atol=1e-3, rtol=1e-4
+        )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])

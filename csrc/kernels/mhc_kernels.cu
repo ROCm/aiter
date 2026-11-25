@@ -12,6 +12,10 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <utility>
 
 
 namespace aiter {
@@ -20,12 +24,12 @@ namespace aiter {
     static void check_mhc_res_preshuffle_arch(bool shuffled) {
         if (shuffled) {
             const auto arch = get_gpu_arch();
-            AITER_CHECK(arch == "gfx1250",
+            AITER_CHECK((arch == "gfx1250" || arch == "gfx1250-strict"),
                         "res_preshuffle=1 is only supported on gfx1250, got ", arch,
                         "; use res_preshuffle=0");
         }
     }
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool mhc_async_load_oob_guard = true;
 #else
     static constexpr bool mhc_async_load_oob_guard = false;
@@ -42,7 +46,7 @@ namespace aiter {
 #else
 #define MHC_BF16_MFMA 0
 #endif
-#if MHC_BF16_MFMA || defined(__gfx1250__)
+#if MHC_BF16_MFMA || defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool mhc_bf16_mma_avail = true;
 #else
     static constexpr bool mhc_bf16_mma_avail = false;
@@ -53,7 +57,7 @@ namespace aiter {
     // TENSORcnt (separate from load/async/ds counters). KEEP1 leaves the next
     // prefetched stage in flight (<=2 inflight, within the <=3 budget); DRAIN
     // waits for all residual TDMs. No-ops off gfx1250 (residual uses async_load).
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
 // KEEP(N): drain this wave's TDMs down to N still in flight -- N = ring depth - 1,
 // i.e. every stage prefetched AFTER the one about to be consumed may stay
 // outstanding. DRAIN waits for all of them.
@@ -78,7 +82,7 @@ namespace aiter {
     //     which is what forced tile_k>=64 (and, before that, read the lo half past the
     //     end of the register tile). kb=8 makes tile_k=32 legal again.
     // Packer and consumer are compiled for the same arch, so they always agree.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr int mhc_fn_kb = 16;
 #else
     static constexpr int mhc_fn_kb = 8;
@@ -155,7 +159,7 @@ namespace aiter {
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_mfma_f32_16x16x4f32((a)[0], (b)[0], (c), 0, 0, 0)
-#elif defined(__gfx1250__)
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_wmma_f32_16x16x4_f32( \
         false, (a), false, (b), static_cast<short>(0), (c), false, false)
@@ -232,7 +236,7 @@ namespace aiter {
         static constexpr int x_lds_pitch = tile_k + x_pad_elems;
         static constexpr int x_tdm_lds_bytes =
             (int)sizeof(s_fn) + x_tdm_stages * tile_m * x_lds_pitch * (int)sizeof(DTYPE_I);
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // bf16-only by measurement, not by any data dependence: the fp32 fallback's live
         // set (v_af is vec_tile floats against x_bf's bf16 half) pays more for the LDS
         // round trip than it wins back (332.7 -> 337.1 us at 7168x8192).
@@ -385,7 +389,7 @@ namespace aiter {
         // rather than walked with move(): measured a wash, and move() would tie
         // correctness to the issue order staying exactly k order.
         [[maybe_unused]] auto lds_load_x_tile = [&](int k, int slot) {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
             if constexpr (x_tdm) {
                 if (warp_id == 0) {
                     // padding<T, tile_k, 0> is not "no padding": a nonzero interval reads
@@ -639,7 +643,7 @@ namespace aiter {
         } while (0)
 #endif // MHC_BF16_MFMA (wave64 bf16 path)
 
-#if defined(__gfx1250__)   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
         // 16 bf16/lane WMMA fragment. On wave32 x's v_a index == the WMMA fragment K
         // position, so x_bf[c][i] = v_a[c*16+i]; fn is read at kk=c*16+i with the same
         // wave32 K_wanted the fp32 path uses, so fn_frag[i] and x_frag[i] share K.
@@ -837,7 +841,7 @@ namespace aiter {
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
-#elif defined(__gfx1250__)
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
         if constexpr (w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);       \
@@ -1559,8 +1563,52 @@ namespace aiter {
 #undef MHC_POST_LOOP_BODY
     }
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int residual_block, bool store_nt>
-    __global__ 
+    // The bytes a tensor's elements can reach, [first, last) from data_ptr.
+    static inline std::pair<uintptr_t, uintptr_t> mhc_byte_span(const aiter_tensor_t& t)
+    {
+        const uintptr_t first = reinterpret_cast<uintptr_t>(t.data_ptr());
+        if(t.numel() == 0)
+            return {first, first};
+        int64_t last = 0;
+        for(int d = 0; d < t.dim(); d++)
+            last += (t.size(d) - 1) * t.stride(d);
+        return {first, first + static_cast<uintptr_t>(last + 1) * t.element_size()};
+    }
+
+    static inline bool mhc_bytes_overlap(const aiter_tensor_t& a, const aiter_tensor_t& b)
+    {
+        const auto sa = mhc_byte_span(a);
+        const auto sb = mhc_byte_span(b);
+        return sa.first < sb.second && sb.first < sa.second;
+    }
+
+    // FP32 -> DTYPE_I rounded to nearest even on every arch (opus::cast truncates
+    // BF16 on gfx942 by default).
+    template <typename T>
+    __device__ __forceinline__ T mhc_post_round_rne(float v)
+    {
+        if constexpr(std::is_same_v<T, opus::bf16_t>)
+            return opus::fp32_to_bf16(v, opus::number<0>{});
+        else
+            return opus::cast<T>(v);
+    }
+
+    // An optimization barrier: the value of `v`, opaque to the compiler, so a
+    // product passed through it is never contracted into the add consuming it.
+    __device__ __forceinline__ float mhc_post_reduce_opaque(float v)
+    {
+        asm volatile("" : "+v"(v));
+        return v;
+    }
+
+    // reduce_mode 0 is mhc_post: out (m, hc_mult, hidden_size). Otherwise the
+    // hc_mult streams each work-group computes are rounded to DTYPE_I exactly
+    // as mode 0 stores them, staged in LDS and reduced to out (m, hidden_size)
+    // in FP32 with h ascending from 0: mode 1 sums pre_mix[h] * stream[h]
+    // (products and sums rounded apart), mode 2 sums the streams and scales by
+    // 1 / hc_mult. That is mhc_post followed by either reduction, to the bit.
+    template <typename DTYPE_I, int num_warps, int hc_mult, int residual_block, bool store_nt, int reduce_mode = 0>
+    __global__
     void mhc_post_kernel(
         DTYPE_I* out,
         DTYPE_I* x,
@@ -1571,7 +1619,8 @@ namespace aiter {
         int hidden_size,
         int x_stride,
         int residual_stride,
-        int sub_hidden_size
+        int sub_hidden_size,
+        float* pre_mix = nullptr // (m, hc_mult), reduce_mode 1 only
     )
     {
         static constexpr int store_policy = store_nt ? GROUP_NT : RT;
@@ -1580,9 +1629,12 @@ namespace aiter {
         static constexpr int block_size = num_warps * warp_size;
         static constexpr int hc_mult2 = hc_mult * hc_mult;
         static_assert(block_size == hc_mult * warp_size, "block_size must be equal to hc_mult * warp_size");
+        static_assert(reduce_mode >= 0 && reduce_mode <= 2, "reduce_mode is 0 (none), 1 (pre_mix) or 2 (mean)");
+        static constexpr int out_streams = reduce_mode ? 1 : hc_mult;
 
         __shared__ DTYPE_I s_x[2 * residual_block];
         __shared__ DTYPE_I s_residual[2 * hc_mult * residual_block];
+        __shared__ DTYPE_I s_streams[reduce_mode ? hc_mult * residual_block : 1];
 
         int64_t idx = blockIdx.x;
         int k_offset = blockIdx.y * sub_hidden_size;
@@ -1592,8 +1644,8 @@ namespace aiter {
         auto g_x = opus::make_gmem<DTYPE_I>(x_ptr, (hidden_size - k_offset) * sizeof(DTYPE_I));
         DTYPE_I* residual_ptr = residual + idx * residual_stride + k_offset;
         auto g_residual = opus::make_gmem<DTYPE_I>(residual_ptr, (hc_mult * hidden_size - k_offset) * sizeof(DTYPE_I));
-        DTYPE_I* out_ptr = out + idx * hc_mult * hidden_size + k_offset;
-        auto g_out = opus::make_gmem<DTYPE_I>(out_ptr, (hc_mult * hidden_size - k_offset) * sizeof(DTYPE_I));
+        DTYPE_I* out_ptr = out + idx * out_streams * hidden_size + k_offset;
+        auto g_out = opus::make_gmem<DTYPE_I>(out_ptr, (out_streams * hidden_size - k_offset) * sizeof(DTYPE_I));
 
         const int residual_hc_stride = residual_stride / hc_mult;
 
@@ -1645,6 +1697,53 @@ namespace aiter {
         static_assert(residual_block % (warp_size * ds_read_vec) == 0, "residual_block must be divisible by warp_size * ds_read_vec");
         const int loop = sub_hidden_size / residual_block;
 
+        // reduce_mode != 0: every thread reduces reduce_vec columns of the
+        // tile's staged streams and stores them to the one output row.
+        static constexpr int reduce_vec = residual_block / block_size;
+        static_assert(reduce_mode == 0 || residual_block % block_size == 0,
+                      "residual_block must be divisible by block_size");
+        float_hc_mult pre_v;
+        if constexpr(reduce_mode == 1) {
+            for(int h = 0; h < hc_mult; h++) {
+                pre_v[h] = pre_mix[idx * hc_mult + h];
+            }
+        }
+        auto reduce_store_tile = [&](int i) {
+            using DTYPE_I_rvec = opus::vector_t<DTYPE_I, reduce_vec>;
+            s_wait_all_dscnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            const int col = threadIdx.x * reduce_vec;
+            opus::vector_t<float, reduce_vec> acc;
+            for(int k = 0; k < reduce_vec; k++) {
+                acc[k] = 0.0f;
+            }
+            opus::static_for<hc_mult>([&](auto h) {
+                DTYPE_I_rvec stream = *(reinterpret_cast<DTYPE_I_rvec*>(s_streams + h.value * residual_block + col));
+                for(int k = 0; k < reduce_vec; k++) {
+                    const float v = static_cast<float>(stream[k]);
+                    if constexpr(reduce_mode == 1) {
+                        acc[k] = acc[k] + mhc_post_reduce_opaque(pre_v[h.value] * v);
+                    }
+                    else {
+                        acc[k] = acc[k] + v;
+                    }
+                }
+            });
+            if constexpr(reduce_mode == 2) {
+                for(int k = 0; k < reduce_vec; k++) {
+                    acc[k] = acc[k] * (1.0f / hc_mult);
+                }
+            }
+            // Round the reduced value to nearest even, as a cast of the FP32
+            // reduction does. (The streams above keep mhc_post's own store
+            // rounding, which truncates BF16 on gfx942.)
+            opus::vector_t<DTYPE_I, reduce_vec> reduced;
+            for(int k = 0; k < reduce_vec; k++) {
+                reduced[k] = mhc_post_round_rne<DTYPE_I>(acc[k]);
+            }
+            store_vector<DTYPE_I, DTYPE_I, reduce_vec, store_policy>(g_out, reduced, i * residual_block + col);
+        };
+
         auto compute_store_tile = [&](int i) {
             DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * residual_block;
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * residual_block);
@@ -1666,7 +1765,20 @@ namespace aiter {
                         res[k] += static_cast<float>(residual_vec[h.value][k]) * comb_mix[h.value];
                     }
                 });
-                store_vector<DTYPE_I, float, ds_read_vec, store_policy>(g_out, res, warp_id * hidden_size + i * residual_block + s_offset);
+                if constexpr(reduce_mode == 0) {
+                    store_vector<DTYPE_I, float, ds_read_vec, store_policy>(g_out, res, warp_id * hidden_size + i * residual_block + s_offset);
+                }
+                else {
+                    // The stream as mode 0 would store it.
+                    DTYPE_I_vec stream;
+                    for(int k = 0; k < ds_read_vec; k++) {
+                        stream[k] = opus::cast<DTYPE_I>(res[k]);
+                    }
+                    *(reinterpret_cast<DTYPE_I_vec*>(s_streams + warp_id * residual_block + s_offset)) = stream;
+                }
+            }
+            if constexpr(reduce_mode != 0) {
+                reduce_store_tile(i);
             }
         };
 
@@ -1709,26 +1821,33 @@ namespace aiter {
     //   - search: it walked DOWN to the first exact divisor, which collapses to 1 on
     //     a coarse lattice (hidden 7168, residual_block 1024 => nblk 7 => k in
     //     {1, 7}, so m = 512 ran 512 work-groups on 256 CUs).
-    // Work-groups a CU can hold: thread-limited here, not LDS-limited (20 KB per
-    // work-group at residual_block 1024, against 320 KB per CU on gfx1250).
-    static inline int mhc_post_wgs_per_cu(int block_size)
+    // Work-groups a CU can hold. mhc_post (lds_bytes 0) aims by threads, as it
+    // always has: 20 KB of LDS per work-group at residual_block 1024 fits that
+    // count on gfx950 and gfx1250. The reduce epilogue stages the streams too
+    // (28 KB at residual_block 1024), which LDS limits below the thread count
+    // (5 work-groups per CU on gfx950's 160 KB), so it passes its LDS size and
+    // the smaller of the two counts is the target.
+    static inline int mhc_post_wgs_per_cu(int block_size, int lds_bytes = 0)
     {
-        static const int threads_per_cu = []() {
+        static const auto per_cu = []() {
             hipDevice_t dev;
             hipDeviceProp_t dev_prop;
             HIP_CALL(hipGetDevice(&dev));
             HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-            return (int)dev_prop.maxThreadsPerMultiProcessor;
+            return std::pair<int, int>((int)dev_prop.maxThreadsPerMultiProcessor,
+                                       (int)dev_prop.maxSharedMemoryPerMultiProcessor);
         }();
-        const int wgs = threads_per_cu / block_size;
+        int wgs = per_cu.first / block_size;
+        if(lds_bytes > 0 && per_cu.second > 0)
+            wgs = std::min(wgs, per_cu.second / lds_bytes);
         return wgs > 0 ? wgs : 1;
     }
 
     static inline int mhc_post_pick_kblocks(
-        int m, int hidden_size, int residual_block, int cu_num, int block_size)
+        int m, int hidden_size, int residual_block, int cu_num, int block_size, int lds_bytes = 0)
     {
         const int nblk        = hidden_size / residual_block;
-        const int grid_target = cu_num * mhc_post_wgs_per_cu(block_size);
+        const int grid_target = cu_num * mhc_post_wgs_per_cu(block_size, lds_bytes);
         const int target      = (m > 0 && grid_target / m > 0) ? grid_target / m : 1;
         int best              = 1;
         int64_t best_score    = -1;
@@ -1749,92 +1868,70 @@ namespace aiter {
         return best;
     }
 
-#define MHC_POST_KERNEL_IMPL_RAW_(kernel_name, hidden_size, residual_block, store_nt) \
-    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    int block_size = 4 * WARP_SIZE; \
-    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
-    int sub_hidden_size = hidden_size / k_blocks; \
-    dim3 grid(m, k_blocks); \
-    dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(dtype, "mhc_post_raw", [&] { \
-        using DTYPE_I = typename hip2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, 4, 4, residual_block, store_nt><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_I*>(out), \
-            reinterpret_cast<DTYPE_I*>(x), \
-            reinterpret_cast<DTYPE_I*>(residual), \
-            reinterpret_cast<float*>(post_layer_mix), \
-            reinterpret_cast<float*>(comb_res_mix), \
-            m, \
-            hidden_size, \
-            x_stride, \
-            residual_stride, \
-            sub_hidden_size \
-        ); \
-    });
-
-#define MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, store_nt) \
-    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    int block_size = 4 * WARP_SIZE; \
-    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
-    int sub_hidden_size = hidden_size / k_blocks; \
-    dim3 grid(m, k_blocks); \
-    dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_post", [&] { \
-        using DTYPE_I = typename hip2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, 4, 4, residual_block, store_nt><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
-            reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
-            reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
-            m, \
-            hidden_size, \
-            x_stride, \
-            residual_stride, \
-            sub_hidden_size \
-        ); \
-    });
-
-
-#define MHC_POST_KERNEL_IMPL(kernel_name, hidden_size, residual_block) \
-    if (m > 8 * cu_num) { \
-        MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, true); \
-    } else { \
-        MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, false); \
+    // The residual tile (columns per pipeline stage) mhc_post takes for hidden_size,
+    // or 0 where no body serves it: the widest of 1024 / 512 (mhc_post_kernel) and
+    // 256 (mhc_post_kernel_x2vgpr) that divides hidden_size and fits at least twice.
+    // That bound is kept from the AITER_CHECK the launch used to make; the kernels
+    // themselves also run a single tile per work-group (mhc_post_pick_kblocks can
+    // pick loop == 1), so it is a dispatch rule, not a pipeline limit. Keeping it
+    // leaves every shape that ran before on its old tile. gfx942 has no 1024-column tile, and the
+    // reduce epilogue (with_256 = false) only exists in mhc_post_kernel. Every
+    // mhc_post / mhc_post_reduce launch dispatches on this; mhc_post_supported and
+    // mhc_post_reduce_supported in aiter/ops/mhc.py MUST stay in lockstep with it.
+    static inline int mhc_post_tile(int hidden_size, bool gfx942, bool with_256)
+    {
+        for(const int tile : {1024, 512, 256})
+        {
+            if((tile == 1024 && gfx942) || (tile == 256 && !with_256))
+                continue;
+            if(hidden_size % tile == 0 && hidden_size >= 2 * tile)
+                return tile;
+        }
+        return 0;
     }
 
-#define MHC_POST_KERNEL_DISPATCH_NT(hidden_size, store_nt_val) \
-    if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
-    } else if (hidden_size % 512 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
-    } else if (hidden_size % 256 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
-    } else { \
-        AITER_CHECK(false, "hidden_size must be divisible by 256"); \
-    }
-
-#define MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, store_nt_val) \
+// One launch of kernel_name at residual_block columns. The optional trailing
+// argument is the reduce_mode; it also passes pre_ptr, which only the reduce
+// instantiations of mhc_post_kernel take.
+#define MHC_POST_LAUNCH_(kernel_name, residual_block, store_nt_val, ...) \
     do { \
-        if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
-        } else if (hidden_size % 512 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
-        } else if (hidden_size % 256 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
-        } else { \
-            AITER_CHECK(false, "hidden_size must be divisible by 256"); \
-        } \
+        int block_size = 4 * WARP_SIZE; \
+        /* the reduce modes also stage hc_mult streams: 2 + 2 * 4 + 4 tiles */         int lds_bytes = 0 __VA_OPT__(+ 14 * residual_block * 2);         int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size, lds_bytes); \
+        int sub_hidden_size = hidden_size / k_blocks; \
+        dim3 grid(m, k_blocks); \
+        dim3 block(block_size); \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(dtype, "mhc_post", [&] { \
+            using DTYPE_I = typename hip2opus<scalar_t>::type; \
+            kernel_name<DTYPE_I, 4, 4, residual_block, store_nt_val __VA_OPT__(, ) __VA_ARGS__> \
+                <<<grid, block, 0, stream>>>( \
+                reinterpret_cast<DTYPE_I*>(out), \
+                reinterpret_cast<DTYPE_I*>(x), \
+                reinterpret_cast<DTYPE_I*>(residual), \
+                reinterpret_cast<float*>(post_layer_mix), \
+                reinterpret_cast<float*>(comb_res_mix), \
+                m, \
+                hidden_size, \
+                x_stride, \
+                residual_stride, \
+                sub_hidden_size __VA_OPT__(, pre_ptr)); \
+        }); \
     } while (0)
 
-#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+// mhc_post (no trailing argument) or mhc_post_reduce (reduce_mode), at the tile
+// mhc_post_tile picks.
+#define MHC_POST_DISPATCH_(store_nt_val, ...) \
     do { \
-        if (m > 8 * cu_num) { \
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true); \
+        const int tile = mhc_post_tile(hidden_size, arch_id == "gfx942", __VA_OPT__(false &&) true); \
+        if (tile == 1024) { \
+            MHC_POST_LAUNCH_(mhc_post_kernel, 1024, store_nt_val __VA_OPT__(, ) __VA_ARGS__); \
+        } else if (tile == 512) { \
+            MHC_POST_LAUNCH_(mhc_post_kernel, 512, store_nt_val __VA_OPT__(, ) __VA_ARGS__); \
+        } else if (tile == 256) { \
+            __VA_OPT__(AITER_CHECK(false, "mhc_post_reduce has no 256-column body");) \
+            MHC_POST_LAUNCH_(mhc_post_kernel_x2vgpr, 256, store_nt_val); \
         } else { \
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false); \
+            AITER_CHECK(false, "mhc_post: hidden_size ", hidden_size, " has no tile on ", arch_id, \
+                        " (see mhc_post_supported / mhc_post_reduce_supported)"); \
         } \
     } while (0)
 
@@ -1853,24 +1950,14 @@ namespace aiter {
     {
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        if(store_nt < 0)
+        const bool use_nt = store_nt < 0 ? m > 8 * cu_num : store_nt != 0;
+        if(use_nt)
         {
-            if(m > 8 * cu_num)
-            {
-                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
-            }
-            else
-            {
-                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
-            }
-        }
-        else if(store_nt != 0)
-        {
-            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
+            MHC_POST_DISPATCH_(true);
         }
         else
         {
-            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
+            MHC_POST_DISPATCH_(false);
         }
     }
 
@@ -1882,6 +1969,8 @@ namespace aiter {
         aiter_tensor_t& comb_res_mix, // (m, hc_mult, hc_mult)
         int store_nt = -1)
     {
+        // A refused shape surfaces as a Python error rather than an abort.
+        aiter_detail::AiterThrowGuard throw_guard;
         int m = residual.size(0);
         int hc_mult = residual.size(1);
         int hidden_size = residual.size(2);
@@ -1903,6 +1992,109 @@ namespace aiter {
                             x_stride,
                             residual_stride,
                             store_nt);
+    }
+
+    void mhc_post_reduce(
+        aiter_tensor_t& out, // (m, hidden_size)
+        aiter_tensor_t& x, // (m, hidden_size)
+        aiter_tensor_t& residual, // (m, hc_mult, hidden_size), not pre-shuffled
+        aiter_tensor_t& post_layer_mix, // (m, hc_mult)
+        aiter_tensor_t& comb_res_mix, // (m, hc_mult, hc_mult)
+        std::optional<aiter_tensor_t> pre_mix, // (m, hc_mult) fp32, or none for the mean
+        int store_nt = -1)
+    {
+        // A refused shape surfaces as a Python error rather than an abort.
+        aiter_detail::AiterThrowGuard throw_guard;
+        const int m = residual.size(0);
+        const int hc_mult = residual.size(1);
+        const int hidden_size = residual.size(2);
+        const int x_stride = x.stride(0);
+        const int residual_stride = residual.stride(0);
+        AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        AITER_CHECK(out.dtype() == x.dtype() && residual.dtype() == x.dtype(),
+                    "mhc_post_reduce: out, x and residual must share one dtype");
+        AITER_CHECK(out.dim() == 2 && out.size(0) == m && out.size(1) == hidden_size && out.is_contiguous(),
+                    "mhc_post_reduce: out must be a contiguous (m, hidden_size) tensor");
+        AITER_CHECK(x.dim() == 2 && x.size(0) == m && x.size(1) == hidden_size && x.stride(1) == 1,
+                    "mhc_post_reduce: x must be (m, hidden_size) with unit-stride rows");
+        AITER_CHECK(residual.dim() == 3 && residual.stride(2) == 1 && residual.stride(1) == hidden_size,
+                    "mhc_post_reduce: residual must be (m, hc_mult, hidden_size) with contiguous streams");
+        AITER_CHECK(post_layer_mix.dtype() == AITER_DTYPE_fp32 && post_layer_mix.is_contiguous() &&
+                        post_layer_mix.size(0) == m && post_layer_mix.size(1) == hc_mult &&
+                        (post_layer_mix.dim() == 2 || (post_layer_mix.dim() == 3 && post_layer_mix.size(2) == 1)),
+                    "mhc_post_reduce: post_layer_mix must be a contiguous fp32 (m, hc_mult[, 1]) tensor");
+        AITER_CHECK(comb_res_mix.dtype() == AITER_DTYPE_fp32 && comb_res_mix.is_contiguous() &&
+                        comb_res_mix.dim() == 3 && comb_res_mix.size(0) == m &&
+                        comb_res_mix.size(1) == hc_mult && comb_res_mix.size(2) == hc_mult,
+                    "mhc_post_reduce: comb_res_mix must be a contiguous fp32 (m, hc_mult, hc_mult) tensor");
+        AITER_CHECK(residual.is_gpu() && out.device_id == residual.device_id &&
+                        x.device_id == residual.device_id &&
+                        post_layer_mix.device_id == residual.device_id &&
+                        comb_res_mix.device_id == residual.device_id,
+                    "mhc_post_reduce: out, x, residual, post_layer_mix and comb_res_mix must be "
+                    "on one GPU");
+        float* pre_ptr = nullptr;
+        if(pre_mix.has_value())
+        {
+            AITER_CHECK(pre_mix->dtype() == AITER_DTYPE_fp32 && pre_mix->dim() == 2 &&
+                            pre_mix->size(0) == m && pre_mix->size(1) == hc_mult &&
+                            pre_mix->is_contiguous() && pre_mix->device_id == residual.device_id,
+                        "mhc_post_reduce: pre_mix must be a contiguous fp32 (m, hc_mult) tensor "
+                        "on residual's device");
+            pre_ptr = reinterpret_cast<float*>(pre_mix->data_ptr());
+        }
+        // Work-groups read their rows' inputs while others write out, so out must
+        // not share storage with any input.
+        AITER_CHECK(!mhc_bytes_overlap(out, x) && !mhc_bytes_overlap(out, residual) &&
+                        !mhc_bytes_overlap(out, post_layer_mix) &&
+                        !mhc_bytes_overlap(out, comb_res_mix) &&
+                        !(pre_mix.has_value() && mhc_bytes_overlap(out, *pre_mix)),
+                    "mhc_post_reduce: out overlaps an input");
+
+        const HipDeviceGuard device_guard(residual.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+        const int cu_num = get_num_cu_func();
+        const std::string arch_id = get_gpu_arch();
+        AITER_CHECK(mhc_post_tile(hidden_size, arch_id == "gfx942", false) != 0,
+                    "mhc_post_reduce: hidden_size ", hidden_size, " has no tile on ", arch_id,
+                    " (see mhc_post_reduce_supported)");
+        // Before the m == 0 return, so an empty call refuses what a full one would.
+        AITER_CHECK(x.dtype() == AITER_DTYPE_bf16 || x.dtype() == AITER_DTYPE_fp16,
+                    "mhc_post_reduce: x, residual and out must be bf16 or fp16");
+        if(m == 0)
+        {
+            return;
+        }
+        const AiterDtype dtype = x.dtype();
+        void* out_ptr = out.data_ptr();
+        void* x_ptr = x.data_ptr();
+        void* residual_ptr = residual.data_ptr();
+        void* post_ptr = post_layer_mix.data_ptr();
+        void* comb_ptr = comb_res_mix.data_ptr();
+        const bool use_nt = store_nt < 0 ? m > 8 * cu_num : store_nt != 0;
+        // MHC_POST_LAUNCH_ reads these names.
+        auto launch = [&](auto store_nt_c, auto mode_c) {
+            constexpr bool store_nt_val = decltype(store_nt_c)::value;
+            constexpr int reduce_mode = decltype(mode_c)::value;
+            void* out = out_ptr;
+            void* x = x_ptr;
+            void* residual = residual_ptr;
+            void* post_layer_mix = post_ptr;
+            void* comb_res_mix = comb_ptr;
+            MHC_POST_DISPATCH_(store_nt_val, reduce_mode);
+        };
+        using nt_t = std::true_type;
+        using t_t = std::false_type;
+        using sum_t = std::integral_constant<int, 1>;
+        using mean_t = std::integral_constant<int, 2>;
+        if(use_nt)
+        {
+            pre_ptr ? launch(nt_t{}, sum_t{}) : launch(nt_t{}, mean_t{});
+        }
+        else
+        {
+            pre_ptr ? launch(t_t{}, sum_t{}) : launch(t_t{}, mean_t{});
+        }
     }
 
 
@@ -2572,7 +2764,7 @@ namespace aiter {
         static constexpr int n_stages = 2;
         __shared__ DTYPE_I s_x[n_stages * tile_m * tile_k];
         __shared__ DTYPE_I s_residual[n_stages * tile_m * hc_mult * tile_k];
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // num_warps > 2: the store must be issued by a warp that owns no TDM load
         // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
         // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
@@ -2581,7 +2773,7 @@ namespace aiter {
 #else
         static constexpr bool nres_tdm = false;
 #endif
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         static constexpr bool decode_pipeline = decode_direct_store && w_preshuffle_bf16 && res_preshuffle;
 #else
         static constexpr bool decode_pipeline = false;
@@ -2661,7 +2853,7 @@ namespace aiter {
 
         static constexpr int tile_mk = tile_m * tile_k;
         static_assert(tile_mk % warp_size == 0, "tile_mk must be divisible by block_size");
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // ---- gfx1250 x (layer_input) load via TDM: a plain 2D tile ----
         // x lands in LDS as row*tile_k + hidden (exactly what compute_store_tile
         // reads); in global x[row][h] = row*x_stride + h. So a 2D TDM tile
@@ -2722,7 +2914,7 @@ namespace aiter {
         };
 #endif
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // ---- gfx1250 residual load via TDM (Tensor Data Mover) ----
         // The residual tile is [head=hc_mult][row=tile_m][hidden=tile_k] and must
         // land in LDS as h*tile_mk + row*tile_k + hidden (exactly what
@@ -2865,7 +3057,7 @@ namespace aiter {
         using float_hc_mult = opus::vector_t<float, hc_mult>;
         float post_mix_v[m_repeat];
         float_hc_mult comb_mix[m_repeat];
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // Keep coefficient loads in a shared EXEC region instead of waiting
         // after every scalar read. Full decode tiles can batch all row bands;
         // the per-band path avoids the prefill regression from that fast path.
@@ -2996,7 +3188,7 @@ namespace aiter {
                         }
                     }
                     if constexpr (!batch_lds) s_wait_all_dscnt(opus::number<hc_mult>{});
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                     if constexpr (decode_pipeline) {
                         // OPSEL_HI broadcasts the coefficient's low DWORD to
                         // both FP32 results without a duplicated coefficient VGPR.
@@ -3117,7 +3309,7 @@ namespace aiter {
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
                         }
-#elif defined(__gfx1250__)
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
                         // wave32 WMMA bf16 (validated on gfx1250). One
                         // wmma_f32_16x16x32_bf16 needs 16 K-elems/lane = two band_j steps
                         // combined (2 x ds_read_vec). fn and res are placed at the same
@@ -3189,7 +3381,7 @@ namespace aiter {
         // MHC_TDM_KEEP(n_stages - 1) on the TDM side.
         [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * (x_load_waitcnt + residual_load_waitcnt);
         [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * residual_load_waitcnt;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         auto wait_load_cnt = [&]() {
             // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
             // issuing wave drains its current stage down to the single prefetch left in
@@ -3241,7 +3433,7 @@ namespace aiter {
         // -> issue; slot reuse is held behind the store by MHC_TDM_KEEP(n_stages-1)
         // in wait_load_cnt.
         auto nres_deposit_fence = [&](){ if constexpr (nres_tdm) { s_wait_all_dscnt(0_I); } };
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         auto tdm_store_nres_tile = [&](int k, int slot){
             if constexpr (nres_tdm) {
                 if (warp_id == 2) {
