@@ -523,6 +523,11 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
+def store_i32_global(addr_i64, val):
+    """Plain (non-atomic) global i32 store to ``addr_i64``."""
+    fx.ptr_store(fx.Int32(val), _to_ptr_global(addr_i64))
+
+
 def store_i64_global(addr_i64, val):
     """Plain (non-atomic) global i64 store to ``addr_i64``."""
     fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))
