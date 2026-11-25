@@ -118,6 +118,18 @@ def gemm_a8w8_qkv_front(
     from .quant import per_group_quant_hip
 
     m = x.shape[0]
+    if (
+        x.dim() != 2
+        or x.shape[1] != K
+        or x.dtype != dtypes.bf16
+        or tuple(weight.shape) != (N, K)
+    ):
+        raise ValueError(
+            f"gemm_a8w8_qkv_front serves only bf16 x [M, {K}] @ weight [{N}, {K}] (the MiniMax-M3.1 TP4 QKV "
+            f"projection), got x {tuple(x.shape)} {x.dtype}, weight {tuple(weight.shape)}"
+        )
+    if ks not in (1, 2, 3, 4, 6):
+        raise ValueError(f"gemm_a8w8_qkv_front: ks {ks} not in (1, 2, 3, 4, 6)")
     if getattr(_STATE, "deferred", None) is not None:
         stale, _STATE.deferred = _STATE.deferred, None
         raise RuntimeError(

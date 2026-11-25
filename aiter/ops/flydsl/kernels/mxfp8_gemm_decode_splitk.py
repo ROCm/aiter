@@ -65,7 +65,8 @@ def supported(m: int) -> bool:
 
 def row_config(m: int) -> tuple[int, int, bool, bool]:
     """(row tile RT, column tiles NI, non-temporal stores, interleave) of an ``m``-row decode batch."""
-    assert supported(m), m
+    if not (supported(m)):
+        raise ValueError(m)
     for upper, rt, ni, nt, il in _ROWS_TABLE:
         if m <= upper:
             return rt, ni, nt, il
@@ -85,9 +86,11 @@ def compile_mxfp8_gemm_decode_splitk(
 ):
     """Kernel of ``RT`` 16-row tiles x ``NI`` 16-column tiles per workgroup (one wave), K split in ``KS`` parts.
     Grid = ``KS * ceil(M / (16 * RT)) * (N / (16 * NI))`` workgroups of 64 threads."""
-    assert K % 256 == 0 and N % (16 * NI) == 0
+    if not (K % 256 == 0 and N % (16 * NI) == 0):
+        raise ValueError("qkv front: need K % 256 == 0 and N % (16 * NI) == 0")
     KSTEPS = K // 128  # 128-K steps
-    assert KSTEPS % KS == 0 and (KSTEPS // KS) % 2 == 0
+    if not (KSTEPS % KS == 0 and (KSTEPS // KS) % 2 == 0):
+        raise ValueError("qkv front: need KSTEPS % KS == 0 and (KSTEPS // KS) % 2 == 0")
     SW = KSTEPS // KS  # steps per workgroup (even: starts on a 256-K scale block)
     BM = 16 * RT  # rows per m-block
     NB = N // (16 * NI)
@@ -99,10 +102,12 @@ def compile_mxfp8_gemm_decode_splitk(
     # A scales are held raw: 4 dwords (two rows x two K steps) per packed dword
     LA_W, LA_A = _lookahead(SW, RT, NI, RP * 4, CP)
     NA = SW * RT  # A blocks per workgroup
-    assert 1 <= LA_W <= SW and 1 <= LA_A <= NA, (LA_W, LA_A)
+    if not (1 <= LA_W <= SW and 1 <= LA_A <= NA):
+        raise ValueError(f"{(LA_W, LA_A)}")
     out_cm = W_CACHE_MOD if OUT_NT else 0
     out_kw = {"cache_modifier": out_cm} if out_cm else {}
-    assert N * K <= 0xFFFFFFFF
+    if not (N * K <= 0xFFFFFFFF):
+        raise ValueError("qkv front: need N * K <= 0xFFFFFFFF")
 
     name = (
         f"mxfp8_gemm_decode_splitk_n{N}_k{K}_rt{RT}_ni{NI}_ks{KS}_la{LA_W}x{LA_A}"
@@ -344,35 +349,53 @@ def mxfp8_gemm_decode_splitk(
     caller sums ``out[0] + out[1] + ...`` in that order. N and K come from the operands (K a multiple of 768 so a part
     is a whole number of 256-K scale blocks for every ks in KS_CHOICES); with ``cfg`` None the row table needs
     65 <= m <= 128 and N % 64 == 0."""
+    if ks not in KS_CHOICES:
+        raise ValueError(f"mxfp8_gemm_decode_splitk: ks {ks} not in {KS_CHOICES}")
     m, k = activation.shape
     n = weight.shape[0]
-    assert tuple(weight.shape) == (n, k) and k % 768 == 0, (tuple(weight.shape), k)
-    assert activation.is_contiguous() and weight.is_contiguous()
-    assert activation_scale.is_contiguous()
-    assert activation_scale.numel() == m * (k // 32) and weight_scale.numel() == n * (
-        k // 32
-    )
+    if not (tuple(weight.shape) == (n, k) and k % 768 == 0):
+        raise ValueError(f"{(tuple(weight.shape), k)}")
+    if not (activation.is_contiguous() and weight.is_contiguous()):
+        raise ValueError(
+            "qkv front: need activation.is_contiguous() and weight.is_contiguous()"
+        )
+    if not (activation_scale.is_contiguous()):
+        raise ValueError("qkv front: need activation_scale.is_contiguous()")
+    if not (
+        activation_scale.numel() == m * (k // 32)
+        and weight_scale.numel() == n * (k // 32)
+    ):
+        raise ValueError(
+            "qkv front: need activation_scale.numel() == m * (k // 32) and weight_scale.numel() == n * ( k // 32 )"
+        )
     rt, ni, nt, il = row_config(m) if cfg is None else cfg
-    assert n % (16 * ni) == 0
+    if not (n % (16 * ni) == 0):
+        raise ValueError("qkv front: need n % (16 * ni) == 0")
     if out is None:
         out = torch.empty((ks, m, n), dtype=torch.float32, device=activation.device)
-    assert (
+    if not (
         out.dtype == torch.float32 and out.is_contiguous() and out.shape == (ks, m, n)
-    )
+    ):
+        raise ValueError(
+            "qkv front: need out.dtype == torch.float32 and out.is_contiguous() and out.shape == (ks, m, n)"
+        )
     n_mb = (m + 16 * rt - 1) // (16 * rt)
     grid = ks * n_mb * (n // (16 * ni))
-    _run_compiled(
-        compile_mxfp8_gemm_decode_splitk(
-            RT=rt, NI=ni, OUT_NT=nt, INTERLEAVE=il, N=n, K=k, KS=ks
-        ),
-        activation.data_ptr(),
-        weight.data_ptr(),
-        activation_scale.data_ptr(),
-        weight_scale.data_ptr(),
-        out.data_ptr(),
-        m,
-        n_mb,
-        grid,
-        torch.cuda.current_stream(),
-    )
+    dev = activation.device
+    with torch.cuda.device(dev):
+        _run_compiled(
+            compile_mxfp8_gemm_decode_splitk(
+                RT=rt, NI=ni, OUT_NT=nt, INTERLEAVE=il, N=n, K=k, KS=ks
+            ),
+            activation.data_ptr(),
+            weight.data_ptr(),
+            activation_scale.data_ptr(),
+            weight_scale.data_ptr(),
+            out.data_ptr(),
+            m,
+            n_mb,
+            grid,
+            torch.cuda.current_stream(dev),
+            specialization_key=("dev", dev.index),
+        )
     return out
