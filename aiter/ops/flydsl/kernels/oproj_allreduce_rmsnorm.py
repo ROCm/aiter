@@ -1,0 +1,966 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""o_proj + TP all-reduce + residual + Gemma RMSNorm in one persistent kernel
+(gfx942/gfx950): the back half of mega paged attention, fed by the unfused
+pa_decode (bf16, ``quantize``) or by it and the per-token FP8 quant.
+
+One launch per TP rank and layer, for decode batches of at most ``max_rows``
+rows. ``grid`` persistent CTAs, all co-resident, walk the phases in program
+order:
+
+0. x into ``xs``: 1 KB chunks of 16 rows x 64 K in the order the MFMA lanes
+   load them (mega paged attention's x layout). Either x is the quantizer's
+   row-major FP8 [rows, K] and a wave copies a chunk (relayout), or x is bf16
+   [rows, K] and a wave quantizes a row with one scale into ``x_scale``, as
+   ``dynamic_per_token_scaled_quant`` (and mega paged attention) would
+   (``quantize``). Each CTA counts its chunks or rows once their stores have
+   landed;
+1. o_proj: ``block_n``-column tiles of ``x @ W^T``, claimed by the CTAs as
+   they finish phase 0. A claimed tile's W slice is loaded into VGPRs before
+   the wait for every chunk; its bf16 partial tile goes to the rank owning
+   its columns (two-shot) or to every rank (one-shot);
+2. all-reduce + residual + Gemma RMSNorm, a row per CTA.
+
+Phases 1 and 2 are mega paged attention's phases 3 and 4, unchanged: the same
+tiles, reductions, inbox layout and rank-order bf16 rounding.
+
+``xs`` (and ``x_scale`` when quantizing) must be uncached memory
+(``IpcHeap`` uncached), like mega paged attention's hand-off buffers; rows of
+the last 16 past the batch keep whatever they hold, so ``xs`` starts zeroed.
+``sync`` (int32, zeroed once), a counter a 128 B line: x chunks or rows done
+(2 parities), o_proj tiles claimed (2 parities), then
+a word a CTA (epoch: launches each CTA has run, so every CTA agrees on the
+parity under graph replay).
+
+``trace`` (diagnostics): each CTA writes TRACE_STAMPS int64 100 MHz stamps
+into ``trace``: start, phase 0 done, x ready (0 if it ran no o_proj tile),
+phase 1 done, phase 2 done.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
+from flydsl.expr.typing import ReductionOp, T
+
+from .comm.one_shot_allreduce import _canonicalize, _has_sentinel
+from .comm.quick_allreduce_fusions import (
+    residual_add,
+    rms_local_sumsq,
+    rstd_from_total,
+    scale_by_weight,
+)
+from .comm.transport import (
+    _ST_NT,
+    _poll_v4i32,
+    _store_v4i32_peer,
+    atom_bf16_to_f32,
+    atom_f32_to_bf16,
+)
+from .communication_ops_utils import memrealtime
+from .mega_paged_attention import (
+    _BYPASS,
+    AMAX_FLOOR,
+    ATOM_COLS,
+    INBOX_BUFFERS,
+    MAX_ROWS,
+    PASS_ROWS,
+    SENTINEL_FILL_BYTE,
+    SYNC_LINE,
+    X_CHUNK,
+    _as_f32,
+    _bload,
+    _i32_ptr,
+    _load16,
+    _load_agent,
+    _rsrc,
+    _store16,
+    _uniform,
+    inbox_bytes,
+)
+from .pa_decode.traits import WAVE
+from .tensor_shim import buf_base_i64
+from .utils import rcp_f32
+
+__all__ = [
+    "SENTINEL_FILL_BYTE",
+    "TRACE_STAMPS",
+    "compile_oproj_allreduce_rmsnorm",
+    "inbox_bytes",
+]
+
+THREADS = 4 * WAVE
+TRACE_STAMPS = 8
+
+
+def compile_oproj_allreduce_rmsnorm(
+    *,
+    row_k: int,
+    max_rows: int,
+    num_compute_units: int,
+    hidden: int,
+    world_size: int = 1,
+    rank: int = 0,
+    block_n: int = 48,
+    prefetch: int | None = None,
+    occupancy: int = 2,
+    two_shot: bool = True,
+    grid: int | None = None,
+    quantize: bool = False,
+    fp8_max: float | None = None,
+    trace: bool = False,
+):
+    """Build the launcher for one rank of ``world_size``.
+
+    ``row_k`` is o_proj's K (x's row), ``hidden`` its N, ``block_n`` its tile
+    width and ``prefetch`` how many K steps of x a wave keeps in flight;
+    ``None`` takes every step when the registers allow and four otherwise.
+    ``grid`` CTAs (default ``occupancy`` a CU) must be resident together.
+    ``quantize`` takes bf16 x and quantizes it to the FP8 whose largest
+    value is ``fp8_max``. ``trace`` stamps each CTA's phases.
+    """
+    if max_rows > MAX_ROWS or max_rows % 16:
+        raise ValueError(
+            f"max_rows must be a multiple of 16 up to {MAX_ROWS}, got {max_rows}"
+        )
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank {rank} is outside world_size {world_size}")
+    two_shot = two_shot and world_size > 1
+    grid = occupancy * num_compute_units if grid is None else int(grid)
+    if grid > occupancy * num_compute_units:
+        raise ValueError(
+            f"grid {grid} exceeds the {occupancy * num_compute_units} CTAs that are "
+            "resident at once; the persistent schedule would deadlock"
+        )
+    threads = THREADS
+    waves = threads // WAVE
+    # The relayout chunks of K: 64 bytes (FP8) of 16 rows each.
+    k_chunks = row_k // 64
+    if k_chunks * 64 != row_k:
+        raise NotImplementedError(f"o_proj K {row_k} must be a multiple of 64")
+    # Quantizing, a lane takes q_groups 16-K groups of its wave's row.
+    q_groups = row_k // (16 * WAVE)
+    if quantize:
+        if fp8_max is None:
+            raise ValueError("quantize needs fp8_max")
+        if q_groups * 16 * WAVE != row_k:
+            raise NotImplementedError(
+                f"quantizing, o_proj K {row_k} must be a multiple of {16 * WAVE}"
+            )
+    m_sub = max_rows // 16
+    pass_subs = min(m_sub, PASS_ROWS // 16)
+    passes = [(m0, min(pass_subs, m_sub - m0)) for m0 in range(0, m_sub, pass_subs)]
+    if hidden % block_n or block_n % 16:
+        raise ValueError(
+            f"block_n {block_n} must be a multiple of 16 dividing {hidden}"
+        )
+    n_sub = block_n // 16
+    n_tiles = hidden // block_n
+    if row_k % (waves * 64):
+        raise NotImplementedError(
+            f"o_proj K {row_k} must split into 64-wide steps a wave"
+        )
+    k_steps = row_k // (waves * 64)
+    if prefetch is None:
+        all_x = 4 * (pass_subs * k_steps + n_sub * k_steps + pass_subs * n_sub)
+        prefetch = k_steps if all_x <= 240 else min(4, k_steps)
+        if len(passes) > 1:
+            prefetch = min(2, k_steps)
+    push_iters = -(-(16 * pass_subs * block_n // ATOM_COLS) // threads)
+    if hidden % (ATOM_COLS * threads):
+        raise NotImplementedError(
+            f"hidden {hidden} must split into {ATOM_COLS}-column atoms over {threads} threads"
+        )
+    row_iters = hidden // (ATOM_COLS * threads)
+    slice_cols = hidden // world_size
+    if two_shot and (n_tiles % world_size or slice_cols % ATOM_COLS):
+        raise ValueError(
+            f"two-shot needs {n_tiles} o_proj tiles to split evenly over {world_size} ranks"
+        )
+    tiles_per_rank = n_tiles // world_size
+    slice_atoms = slice_cols // ATOM_COLS
+    slice_iters = -(-slice_atoms // threads)
+    rs_bytes = INBOX_BUFFERS * world_size * max_rows * slice_cols * 2
+    rs_in_tile = two_shot and max_rows <= 16
+    gemm_stride = block_n + (4 - block_n) % 8
+    gemm_region = 16 * pass_subs * gemm_stride * 4
+    # ``sync`` words.
+    x_done_at = 0
+    tile_claim_at = x_done_at + 2 * SYNC_LINE
+    epoch_at = tile_claim_at + 2 * SYNC_LINE
+
+    @fx.struct
+    class OarStorage:
+        # The two o_proj partial tiles (waves 0+1, 2+3).
+        buf: fx.Array[fx.Int32, 2 * gemm_region // 4, 16]
+        w_scale: fx.Array[fx.Float32, block_n, 16]
+        red: fx.Array[fx.Float32, 16, 16]
+        word: fx.Array[fx.Int32, 4, 16]
+
+    def _lds(base, index, elem=fx.Int32):
+        ptr_ty = fx.PointerType.get(elem.ir_type, fx.AddressSpace.Shared, 4)
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, fx.make_int_tuple(index * 4)))
+
+    def _lds_shift(base, nbytes):
+        return fx.add_offset(base, fx.make_int_tuple(nbytes))
+
+    def _lds_i32(base, index):
+        return fx.Int32(fx.ptr_load(_lds(base, index)))
+
+    @flyc.jit
+    def _stamp(trace_ptr, bid, point, tid):
+        if const_expr(trace):  # noqa: SIM102
+            if tid == 0:
+                fx.ptr_store(
+                    memrealtime(),
+                    fx.add_offset(
+                        fx.recast_iter(fx.Int64, trace_ptr), bid * TRACE_STAMPS + point
+                    ),
+                )
+
+    # ---------------------------------------------------------------- phase 0
+    @flyc.jit
+    def _relayout(
+        x_rsrc,
+        xs_ptr,
+        num_rows,
+        bid,
+        nblk,
+        warp,
+        lane,
+        sync_ptr,
+        x_done,
+        word_base,
+        tid,
+    ):
+        """Copy the live rows' chunks of row-major x into ``xs`` (MFMA order), a
+        wave a chunk, and count this CTA's chunks once their stores landed.
+
+        Lane (n1, g) of a wave reads row n1, K [16 g, 16 g + 16) of the chunk and
+        stores it at ``lane * 16``: chunk bytes [K % 64 / 16][row % 16][16 K], the
+        order ``_gemm_tile``'s lanes load (mega paged attention's ``_x_offset``)."""
+        live_chunks = ((num_rows + 15) // 16) * k_chunks
+        n1 = lane % 16
+        g = lane // 16
+        mine = fx.Int32(0)
+        chunk = bid * waves + warp
+        while chunk < live_chunks:
+            m = chunk // k_chunks
+            kc = chunk - m * k_chunks
+            row = 16 * m + n1
+            # Rows past the batch (graph padding of the last 16) read the last
+            # row: their o_proj results are never pushed.
+            row = (row < num_rows).select(row, num_rows - 1)
+            atom = _bload(x_rsrc, row * row_k + kc * 64 + g * 16, 4)
+            fx.ptr_store(atom, _i32_ptr(xs_ptr, (chunk * X_CHUNK + lane * 16) // 4))
+            mine = mine + 1
+            chunk = chunk + nblk * waves
+        # xs is uncached: a retired store is visible device-wide.
+        rocdl.s_waitcnt(vmcnt=0)
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+        if lane == 0:
+            fx.ptr_store(fx.Int32(mine), _lds(word_base, warp))
+        gpu.barrier()
+        if tid == 0:
+            total = _lds_i32(word_base, 0)
+            for w in range_constexpr(1, waves):
+                total = total + _lds_i32(word_base, w)
+            if total > 0:
+                fx.atomic_add(_i32_ptr(sync_ptr, x_done), total, syncscope="agent")
+        # The claim reuses the broadcast words.
+        gpu.barrier()
+
+    @flyc.jit
+    def _quantize(
+        x_rsrc,
+        xs_ptr,
+        x_scale_ptr,
+        num_rows,
+        bid,
+        nblk,
+        warp,
+        lane,
+        sync_ptr,
+        x_done,
+        word_base,
+        tid,
+    ):
+        """Quantize the live rows of bf16 x into ``xs`` (MFMA order) and
+        ``x_scale``, a wave a row, and count this CTA's rows once their stores
+        landed.
+
+        Lane l takes K [16 q_groups l, 16 q_groups (l + 1)): each 16-K group
+        is 16 B of FP8 at its place in its chunk (``mega``'s ``_x_offset``)."""
+        mine = fx.Int32(0)
+        row = bid * waves + warp
+        while row < num_rows:
+            src = row * (row_k * 2) + lane * (q_groups * 32)
+            atoms = [
+                atom_bf16_to_f32(_bload(x_rsrc, src + 16 * i, 4))
+                for i in range_constexpr(2 * q_groups)
+            ]
+            amax = fmath.absf(atoms[0]).reduce(ReductionOp.MAX)
+            for atom in atoms[1:]:
+                amax = fx.maxnumf(amax, fmath.absf(atom).reduce(ReductionOp.MAX))
+            for off in range_constexpr(5, -1, -1):
+                amax = fx.maxnumf(amax, amax.shuffle_xor(fx.Int32(1 << off), WAVE))
+            scale = fx.maxnumf(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / fp8_max)
+            inv_scale = fx.full(ATOM_COLS, fx.Float32(rcp_f32(scale)), fx.Float32)
+            chunk0 = (row // 16) * k_chunks
+            for q in range_constexpr(q_groups):
+                words = []
+                for h in range_constexpr(2):
+                    scaled = atoms[2 * q + h] * inv_scale
+                    for i in range_constexpr(2):
+                        lo = rocdl.cvt_pk_fp8_f32(
+                            T.i32, scaled[4 * i], scaled[4 * i + 1], 0, False
+                        )
+                        words.append(
+                            rocdl.cvt_pk_fp8_f32(
+                                T.i32, scaled[4 * i + 2], scaled[4 * i + 3], lo, True
+                            )
+                        )
+                kg = lane * q_groups + q
+                dst = (chunk0 + kg // 4) * X_CHUNK + (kg % 4) * 256 + (row % 16) * 16
+                fx.ptr_store(
+                    fx.Vector.from_elements(words, dtype=fx.Int32),
+                    _i32_ptr(xs_ptr, dst // 4),
+                )
+            if lane == 0:
+                fx.ptr_store(
+                    scale, fx.add_offset(fx.recast_iter(fx.Float32, x_scale_ptr), row)
+                )
+            mine = mine + 1
+            row = row + nblk * waves
+        rocdl.s_waitcnt(vmcnt=0)
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+        if lane == 0:
+            fx.ptr_store(fx.Int32(mine), _lds(word_base, warp))
+        gpu.barrier()
+        if tid == 0:
+            total = _lds_i32(word_base, 0)
+            for w in range_constexpr(1, waves):
+                total = total + _lds_i32(word_base, w)
+            if total > 0:
+                fx.atomic_add(_i32_ptr(sync_ptr, x_done), total, syncscope="agent")
+        gpu.barrier()
+
+    @flyc.jit
+    def _wait_x(sync_ptr, x_done, num_rows, tid):
+        """Phase 1 entry: every live chunk (or row) of xs has landed."""
+        if const_expr(quantize):
+            live = num_rows
+        else:
+            live = ((num_rows + 15) // 16) * k_chunks
+        if tid == 0:
+            done = _load_agent(sync_ptr, x_done)
+            while done < live:
+                rocdl.s_sleep(1)
+                done = _load_agent(sync_ptr, x_done)
+        gpu.barrier()
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+
+    # ------------------------------------------------- phases 1-2 (mega 3-4)
+    def _k_step(tile, s):
+        return _uniform((tile + s) % k_steps)
+
+    def _load_w_slice(tile, w_rsrc, lane, warp):
+        n1 = lane % 16
+        g = lane // 16
+        lane_off = (g // 2) * 512 + (g % 2) * 256 + n1 * 16
+        base = _uniform(tile * (n_sub * (row_k // 32) * 512) + warp * (k_steps * 1024))
+        ws = []
+        for s in range_constexpr(k_steps):
+            step = _k_step(tile, s)
+            ws.append(
+                [
+                    _bload(
+                        w_rsrc,
+                        lane_off,
+                        4,
+                        soffset=base + (j * (row_k // 32) * 512 + step * 1024),
+                    )
+                    for j in range_constexpr(n_sub)
+                ]
+            )
+        rocdl.sched_barrier(0)
+        return ws
+
+    def _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count):
+        lane_off = lane * 16
+        base = _uniform(warp * (k_steps * X_CHUNK))
+
+        def issue_x(s):
+            return [
+                _bload(
+                    x_rsrc,
+                    lane_off,
+                    4,
+                    _BYPASS,
+                    soffset=base
+                    + ((m0 + m) * (row_k // 64) + _k_step(tile, s)) * X_CHUNK,
+                )
+                for m in range_constexpr(m_count)
+            ]
+
+        acc = [
+            [fx.full(4, 0.0, fx.Float32) for _j in range(n_sub)]
+            for _m in range(m_count)
+        ]
+        pending = [issue_x(s) for s in range(min(prefetch, k_steps))]
+        for s in range_constexpr(k_steps):
+            if s + prefetch < k_steps:
+                pending.append(issue_x(s + prefetch))
+                rocdl.sched_barrier(0)
+            xs = pending[s]
+            for m in range_constexpr(m_count):
+                a = xs[m].bitcast(fx.Int64)
+                for j in range_constexpr(n_sub):
+                    b = ws[s][j].bitcast(fx.Int64)
+                    v = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                        T.f32x4, [a[0], b[0], acc[m][j], 0, 0, 0]
+                    )
+                    v = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                        T.f32x4, [a[1], b[1], v, 0, 0, 0]
+                    )
+                    acc[m][j] = fx.Vector(v)
+        return [v for row in acc for v in row]
+
+    @flyc.jit
+    def _claim_tile(sync_ptr, claim, word_base, tid):
+        gpu.barrier()
+        if tid == 0:
+            tile = fx.atomic_add(
+                _i32_ptr(sync_ptr, claim), fx.Int32(1), syncscope="agent"
+            )
+            fx.ptr_store(fx.Int32(tile), _lds(word_base, 1))
+        gpu.barrier()
+        return _lds_i32(word_base, 1)
+
+    def _stage_partial(acc, lane, region, accumulate):
+        for m in range_constexpr(len(acc) // n_sub):
+            for j in range_constexpr(n_sub):
+                for i in range_constexpr(4):
+                    row = 16 * m + 4 * (lane // 16) + i
+                    col = 16 * j + lane % 16
+                    ptr = _lds(region, row * gemm_stride + col, fx.Float32)
+                    v = acc[m * n_sub + j][i]
+                    if const_expr(accumulate):
+                        v = fx.Float32(fx.ptr_load(ptr)) + v
+                    fx.ptr_store(v, ptr)
+
+    @flyc.jit
+    def _reduce_waves(acc, warp, lane, gemm_base):
+        region = gemm_base if warp < 2 else _lds_shift(gemm_base, gemm_region)
+        if (warp == 1) | (warp == 3):
+            _stage_partial(acc, lane, region, False)
+        gpu.barrier()
+        if (warp == 0) | (warp == 2):
+            _stage_partial(acc, lane, region, True)
+        gpu.barrier()
+
+    def _inbox_off(buf, src, row, col):
+        return fx.Int64(
+            (((buf * world_size + src) * max_rows + row) * hidden + col) * 2
+        )
+
+    def _rs_off(buf, src, row, col_local):
+        return fx.Int64(
+            (((buf * world_size + src) * max_rows + row) * slice_cols + col_local) * 2
+        )
+
+    def _ag_off(buf, row, col):
+        return fx.Int64(rs_bytes) + fx.Int64(
+            ((buf * max_rows + row) * hidden + col) * 2
+        )
+
+    def _peer(peers, rank_id):
+        addr = peers[0]
+        for d in range_constexpr(1, world_size):
+            addr = (rank_id == d).select(peers[d], addr)
+        return addr
+
+    def _pack(vecs):
+        return fx.Vector.from_elements(
+            [v[e] for v in vecs for e in range_constexpr(4)], fx.Int32
+        )
+
+    def _unpack(got, i):
+        return fx.Vector.from_elements([got[4 * i + e] for e in range(4)], fx.Int32)
+
+    def _push_atom(c, tid):
+        atom = tid + c * threads
+        row = atom // (block_n // ATOM_COLS)
+        return atom, row, atom - row * (block_n // ATOM_COLS)
+
+    def _load_col_scales(tile, tid, w_scale_ptr):
+        quad = tid % (block_n // 4)
+        return fx.Vector(
+            fx.ptr_load(
+                fx.add_offset(
+                    fx.recast_iter(fx.Float32, w_scale_ptr), tile * block_n + 4 * quad
+                ),
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+        )
+
+    @flyc.jit
+    def _stage_col_scales(scales, tid, w_scale_base):
+        if tid < block_n // 4:
+            fx.ptr_store(scales, _lds(w_scale_base, 4 * tid, fx.Float32))
+
+    def _col_scales(col, w_scale_base):
+        return fx.Vector(
+            fx.ptr_load(
+                _lds(w_scale_base, col * ATOM_COLS, fx.Float32),
+                result_type=fx.Vector.make_type(ATOM_COLS, fx.Float32),
+            )
+        )
+
+    def _row_scales(tid, x_scale_ptr, row0, num_rows):
+        """x's per-row scales of this thread's atoms of the pass at ``row0``,
+        [rows] (padding rows read the last live one): the quantizer's, or
+        phase 0's past the caches."""
+        x_scale_rsrc = _rsrc(x_scale_ptr)
+        scales = []
+        for c in range_constexpr(push_iters):
+            _atom, row, _col = _push_atom(c, tid)
+            row = row + row0
+            row = (row < num_rows).select(row, num_rows - 1)
+            scales.append(
+                _as_f32(_bload(x_scale_rsrc, row * 4, 1, _BYPASS if quantize else 0))
+            )
+        return scales
+
+    @flyc.jit
+    def _push_tile(
+        tile,
+        num_rows,
+        tid,
+        gemm_base,
+        x_scales,
+        w_scale_base,
+        peers,
+        buf,
+        row0,
+        m_count,
+    ):
+        tile_atoms = 16 * m_count * block_n // ATOM_COLS
+        for c in range_constexpr(-(-tile_atoms // threads)):
+            atom, local, col = _push_atom(c, tid)
+            row = local + row0
+            if (atom < tile_atoms) & (row < num_rows):
+                pair = [
+                    fx.Vector(
+                        fx.ptr_load(
+                            _lds(
+                                gemm_base,
+                                r * (gemm_region // 4)
+                                + local * gemm_stride
+                                + col * ATOM_COLS,
+                                fx.Float32,
+                            ),
+                            result_type=fx.Vector.make_type(ATOM_COLS, fx.Float32),
+                        )
+                    )
+                    for r in range_constexpr(2)
+                ]
+                acc = pair[0] + pair[1]
+                n = tile * block_n + col * ATOM_COLS
+                y = (
+                    acc
+                    * fx.full(ATOM_COLS, x_scales[c], fx.Float32)
+                    * _col_scales(col, w_scale_base)
+                )
+                payload = _canonicalize(atom_f32_to_bf16(y))
+                if const_expr(two_shot):
+                    owner = tile // tiles_per_rank
+                    col_local = n - owner * slice_cols
+                    if const_expr(rs_in_tile):
+                        if owner == rank:
+                            _reduce_atom(payload, peers, buf, row, n, col_local)
+                        else:
+                            _store_v4i32_peer(
+                                _peer(peers, owner)
+                                + _rs_off(buf, rank, row, col_local),
+                                payload,
+                                _ST_NT,
+                            )
+                    else:
+                        _store_v4i32_peer(
+                            _peer(peers, owner) + _rs_off(buf, rank, row, col_local),
+                            payload,
+                            _ST_NT,
+                        )
+                else:
+                    for dst in range_constexpr(world_size):
+                        _store_v4i32_peer(
+                            peers[dst] + _inbox_off(buf, rank, row, n), payload, _ST_NT
+                        )
+        gpu.barrier()
+
+    @flyc.jit
+    def _block_sum(value, red_base, tid):
+        for off in range_constexpr(5, -1, -1):
+            value = value + value.shuffle_xor(fx.Int32(1 << off), WAVE)
+        if tid % WAVE == 0:
+            fx.ptr_store(value, _lds(red_base, tid // WAVE, fx.Float32))
+        gpu.barrier()
+        result = fx.Float32(fx.ptr_load(_lds(red_base, 0, fx.Float32)))
+        for w in range_constexpr(1, waves):
+            result = result + fx.Float32(fx.ptr_load(_lds(red_base, w, fx.Float32)))
+        return result
+
+    @flyc.jit
+    def _reduce_row(
+        row,
+        buf,
+        inbox,
+        residual_ptr,
+        residual_out_ptr,
+        out_ptr,
+        norm_w_ptr,
+        eps,
+        red_base,
+        tid,
+    ):
+        cols = [(tid + c * threads) * ATOM_COLS for c in range_constexpr(row_iters)]
+        residual = buf_base_i64(residual_ptr) + fx.Int64(row * hidden * 2)
+        residual_out = buf_base_i64(residual_out_ptr) + fx.Int64(row * hidden * 2)
+        out = buf_base_i64(out_ptr) + fx.Int64(row * hidden * 2)
+        norm_w = buf_base_i64(norm_w_ptr)
+        res_atoms = [_load16(residual + fx.Int64(col * 2)) for col in cols]
+        w_atoms = [_load16(norm_w + fx.Int64(col * 2)) for col in cols]
+        if const_expr(two_shot):
+            addrs = [
+                inbox + _ag_off(buf, row, cols[c]) for c in range_constexpr(row_iters)
+            ]
+        else:
+            addrs = [
+                inbox + _inbox_off(buf, src, row, cols[c])
+                for src in range_constexpr(world_size)
+                for c in range_constexpr(row_iters)
+            ]
+        got = _pack([_poll_v4i32(addr) for addr in addrs])
+        while _has_sentinel(got):
+            got = _pack([_poll_v4i32(addr) for addr in addrs])
+        ar = []
+        for c in range_constexpr(row_iters):
+            if const_expr(two_shot):
+                ar.append(atom_bf16_to_f32(_unpack(got, c)))
+            else:
+                acc = None
+                for src in range_constexpr(world_size):
+                    v = atom_bf16_to_f32(_unpack(got, src * row_iters + c))
+                    acc = v if acc is None else acc + v
+                ar.append(acc)
+        vals = residual_add(ar, res_atoms)
+        for c in range_constexpr(row_iters):
+            _store16(residual_out + fx.Int64(cols[c] * 2), atom_f32_to_bf16(vals[c]))
+        total = _block_sum(rms_local_sumsq([vals])[0], red_base, tid)
+        rstd = rstd_from_total(total, eps, hidden)
+        for c, atom in enumerate(scale_by_weight(vals, rstd, w_atoms, w_bias=1.0)):
+            _store16(out + fx.Int64(cols[c] * 2), atom)
+        sentinel = fx.Vector.filled((4,), -1, fx.Int32)
+        for addr in addrs:
+            _store_v4i32_peer(addr, sentinel, _ST_NT)
+
+    @flyc.jit
+    def _reduce_atom(payload, peers, buf, row, col, col_local):
+        inbox = peers[rank]
+        addrs = [
+            inbox + _rs_off(buf, src, row, col_local)
+            for src in range_constexpr(world_size)
+            if src != rank
+        ]
+        got = _pack([_poll_v4i32(addr) for addr in addrs])
+        while _has_sentinel(got):
+            got = _pack([_poll_v4i32(addr) for addr in addrs])
+        acc = None
+        peer = 0
+        for src in range_constexpr(world_size):
+            if const_expr(src == rank):
+                v = atom_bf16_to_f32(payload)
+            else:
+                v = atom_bf16_to_f32(_unpack(got, peer))
+                peer += 1
+            acc = v if acc is None else acc + v
+        summed = _canonicalize(atom_f32_to_bf16(acc))
+        for dst in range_constexpr(world_size):
+            _store_v4i32_peer(peers[dst] + _ag_off(buf, row, col), summed, _ST_NT)
+        sentinel = fx.Vector.filled((4,), -1, fx.Int32)
+        for addr in addrs:
+            _store_v4i32_peer(addr, sentinel, _ST_NT)
+
+    @flyc.jit
+    def _reduce_slice(row, buf, peers, tid):
+        inbox = peers[rank]
+        sentinel = fx.Vector.filled((4,), -1, fx.Int32)
+        for c in range_constexpr(slice_iters):
+            atom = tid + c * threads
+            if atom < slice_atoms:
+                col = atom * ATOM_COLS
+                addrs = [
+                    inbox + _rs_off(buf, src, row, col)
+                    for src in range_constexpr(world_size)
+                ]
+                got = _pack([_poll_v4i32(addr) for addr in addrs])
+                while _has_sentinel(got):
+                    got = _pack([_poll_v4i32(addr) for addr in addrs])
+                acc = atom_bf16_to_f32(_unpack(got, 0))
+                for src in range_constexpr(1, world_size):
+                    acc = acc + atom_bf16_to_f32(_unpack(got, src))
+                payload = _canonicalize(atom_f32_to_bf16(acc))
+                for dst in range_constexpr(world_size):
+                    _store_v4i32_peer(
+                        peers[dst] + _ag_off(buf, row, rank * slice_cols + col),
+                        payload,
+                        _ST_NT,
+                    )
+                for addr in addrs:
+                    _store_v4i32_peer(addr, sentinel, _ST_NT)
+
+    @flyc.jit
+    def _tile_pass(
+        tile,
+        m0,
+        m_count,
+        ws,
+        col_scales,
+        w_scale_base,
+        x_rsrc,
+        x_scale_ptr,
+        num_rows,
+        gemm_base,
+        peers,
+        buf,
+        lane,
+        warp,
+        tid,
+    ):
+        row0 = 16 * m0
+        x_scales = _row_scales(tid, x_scale_ptr, row0, num_rows)
+        acc = _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count)
+        _stage_col_scales(col_scales, tid, w_scale_base)
+        _reduce_waves(acc, warp, lane, gemm_base)
+        _push_tile(
+            tile,
+            num_rows,
+            tid,
+            gemm_base,
+            x_scales,
+            w_scale_base,
+            peers,
+            buf,
+            row0,
+            m_count,
+        )
+
+    kernel_name = (
+        f"oproj_allreduce_rmsnorm_k{row_k}_r{max_rows}_n{hidden}_bn{block_n}"
+        f"_w{world_size}r{rank}_pf{prefetch}_o{occupancy}"
+        + ("_2s" if two_shot else "")
+        + (f"_q{fp8_max:g}" if quantize else "")
+        + ("_trace" if trace else "")
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=(threads, 1, 1))
+    def oproj_allreduce_rmsnorm_kernel(
+        x_ptr: fx.Pointer,
+        x_scale_ptr: fx.Pointer,
+        xs_ptr: fx.Pointer,
+        sync_ptr: fx.Pointer,
+        w_ptr: fx.Pointer,
+        w_scale_ptr: fx.Pointer,
+        residual_ptr: fx.Pointer,
+        residual_out_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        norm_w_ptr: fx.Pointer,
+        peers_ptr: fx.Pointer,
+        trace_ptr: fx.Pointer,
+        num_rows: fx.Int32,
+        eps: fx.Float32,
+    ):
+        tid = fx.Int32(gpu.thread_id("x"))
+        bid = fx.Int32(gpu.block_id("x"))
+        nblk = fx.Int32(gpu.grid_dim.x)
+        lds = fx.SharedAllocator().allocate(OarStorage).peek()
+        gemm_base = fx.recast_iter(fx.Uint8, lds.buf.ptr)
+        red_base = fx.recast_iter(fx.Uint8, lds.red.ptr)
+        w_scale_base = fx.recast_iter(fx.Uint8, lds.w_scale.ptr)
+        word_base = fx.recast_iter(fx.Uint8, lds.word.ptr)
+        lane = tid % WAVE
+        warp = tid // WAVE
+        _stamp(trace_ptr, bid, 0, tid)
+
+        epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, epoch_at + bid)))
+        parity = epoch & 1
+        x_done = x_done_at + parity * SYNC_LINE
+        claim = tile_claim_at + parity * SYNC_LINE
+        if (bid == 0) & (tid == 0):
+            other = (parity ^ 1) * SYNC_LINE
+            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, x_done_at + other))
+            fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, tile_claim_at + other))
+
+        # Phase 0: x into MFMA-order chunks.
+        x_rsrc = _rsrc(x_ptr)
+        xs_rsrc = _rsrc(xs_ptr)
+        if const_expr(quantize):
+            _quantize(
+                x_rsrc,
+                xs_ptr,
+                x_scale_ptr,
+                num_rows,
+                bid,
+                nblk,
+                warp,
+                lane,
+                sync_ptr,
+                x_done,
+                word_base,
+                tid,
+            )
+        else:
+            _relayout(
+                x_rsrc,
+                xs_ptr,
+                num_rows,
+                bid,
+                nblk,
+                warp,
+                lane,
+                sync_ptr,
+                x_done,
+                word_base,
+                tid,
+            )
+        _stamp(trace_ptr, bid, 1, tid)
+
+        # Phase 1: o_proj tiles once every chunk has landed.
+        peers = [
+            fx.Int64(fx.ptr_load(fx.add_offset(fx.recast_iter(fx.Int64, peers_ptr), d)))
+            for d in range_constexpr(world_size)
+        ]
+        w_rsrc = _rsrc(w_ptr)
+        tile = _claim_tile(sync_ptr, claim, word_base, tid)
+        while tile < n_tiles:
+            col_scales = _load_col_scales(tile, tid, w_scale_ptr)
+            ws = _load_w_slice(tile, w_rsrc, lane, warp)
+            _wait_x(sync_ptr, x_done, num_rows, tid)
+            _stamp(trace_ptr, bid, 2, tid)
+            for p in range_constexpr(len(passes)):
+                m0, m_count = passes[p]
+                if const_expr(p == 0):
+                    _tile_pass(
+                        tile,
+                        m0,
+                        m_count,
+                        ws,
+                        col_scales,
+                        w_scale_base,
+                        xs_rsrc,
+                        x_scale_ptr,
+                        num_rows,
+                        gemm_base,
+                        peers,
+                        parity,
+                        lane,
+                        warp,
+                        tid,
+                    )
+                else:
+                    if 16 * m0 < num_rows:
+                        _tile_pass(
+                            tile,
+                            m0,
+                            m_count,
+                            ws,
+                            col_scales,
+                            w_scale_base,
+                            xs_rsrc,
+                            x_scale_ptr,
+                            num_rows,
+                            gemm_base,
+                            peers,
+                            parity,
+                            lane,
+                            warp,
+                            tid,
+                        )
+            if const_expr(grid < n_tiles):
+                tile = _claim_tile(sync_ptr, claim, word_base, tid)
+            else:
+                tile = fx.Int32(n_tiles)
+
+        _stamp(trace_ptr, bid, 3, tid)
+
+        # Phase 2: a row's all-reduce, residual add and RMSNorm.
+        for row in range(bid, num_rows, nblk):
+            if const_expr(two_shot and not rs_in_tile):
+                _reduce_slice(row, parity, peers, tid)
+            _reduce_row(
+                row,
+                parity,
+                peers[rank],
+                residual_ptr,
+                residual_out_ptr,
+                out_ptr,
+                norm_w_ptr,
+                eps,
+                red_base,
+                tid,
+            )
+            gpu.barrier()
+
+        _stamp(trace_ptr, bid, 4, tid)
+        if tid == 0:
+            fx.ptr_store(epoch + 1, _i32_ptr(sync_ptr, epoch_at + bid))
+
+    @flyc.jit
+    def launch(
+        x: fx.Pointer,
+        x_scale: fx.Pointer,
+        xs: fx.Pointer,
+        sync: fx.Pointer,
+        w: fx.Pointer,
+        w_scale: fx.Pointer,
+        residual: fx.Pointer,
+        residual_out: fx.Pointer,
+        out: fx.Pointer,
+        norm_w: fx.Pointer,
+        peers: fx.Pointer,
+        trace: fx.Pointer,
+        num_rows: fx.Int32,
+        eps: fx.Float32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        oproj_allreduce_rmsnorm_kernel(
+            x,
+            x_scale,
+            xs,
+            sync,
+            w,
+            w_scale,
+            residual,
+            residual_out,
+            out,
+            norm_w,
+            peers,
+            trace,
+            num_rows,
+            eps,
+        ).launch(grid=(grid, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    waves_per_eu = max(occupancy * threads // (4 * WAVE), 1)
+    if waves_per_eu > 1:
+        launch.compile_hints["waves_per_eu"] = waves_per_eu
+    return {
+        "launch": launch,
+        "grid": grid,
+        "threads": threads,
+        "sync_words": epoch_at + grid,
+        "inbox_bytes": inbox_bytes(
+            world_size=world_size, max_rows=max_rows, hidden=hidden, two_shot=two_shot
+        ),
+    }
