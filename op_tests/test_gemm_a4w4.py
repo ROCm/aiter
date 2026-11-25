@@ -282,14 +282,8 @@ def test_gemm(dtype, M, N, K):
             )[:M]
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
-        # Only the tuned kernel is under test; the baseline is a perf reference and
-        # its err is reported, not asserted (the default ASM kernel is wrong on some
-        # large-M shapes the tuned table routes elsewhere, e.g. M=6528 N=7040 K=5632).
         err = checkAllclose(
-            a.float(),
-            result.float(),
-            msg=f"{name}: a4w4",
-            catastrophic_check=name == "tuned",
+            a.float(), result.float(), msg=f"{name}: a4w4", catastrophic_check=True
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = M * N * K * 2 / us / 1e6
@@ -534,6 +528,60 @@ def check_bpreshuffle_large_offset(kids=(0, 10, 30), M=65792, N=32768, K=256):
     del y
 
 
+def check_opus_fallback(dtype=dtypes.bf16):
+    """gfx950: a call an OPUS-tuned row cannot serve runs the row's CK/ASM fallback.
+
+    The OPUS adapter must decline (None, no exception) the inputs the triton_ /
+    flydsl_ adapter declines: non-contiguous operands, non-2D scales, short scales,
+    a non-bf16 output. A bias is not an OPUS argument, so gemm_a4w4 then launches
+    the row's fallbackKernelName; with beta 0 the bias adds nothing.
+    """
+    from aiter.ops.gemm_op_a4w4 import (
+        _a4w4_fallback_config,
+        _gemm_a4w4_preshuffle,
+        get_GEMM_config,
+    )
+
+    rows = []
+    for M, N, K in tuned_shapes():
+        config = get_GEMM_config(M, N, K)
+        name = str(config["kernelName"])
+        if not name.startswith("opus_") or M < 64 or M * N * K > 2**31:
+            continue
+        fallback = _a4w4_fallback_config(config)["kernelName"]
+        asm = fallback.startswith("_ZN")
+        if not fallback or any(asm == r["fallback"].startswith("_ZN") for r in rows):
+            continue  # one row with a named ASM fallback and one with a CK fallback
+        a, x, wshuffle, xs, ws = quantize(dtype, M, N, K)
+        out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+        declined = {
+            "non-contiguous A_scale": (x, wshuffle, xs.repeat(1, 2)[:, ::2], ws, out),
+            "non-contiguous A": (x.repeat(1, 2)[:, ::2], wshuffle, xs, ws, out),
+            "3D A_scale": (x, wshuffle, xs.unsqueeze(0), ws, out),
+            "3D B_scale": (x, wshuffle, xs, ws.unsqueeze(0), out),
+            "short A_scale": (x, wshuffle, xs[: M - 1], ws, out),
+            "short B_scale": (x, wshuffle, xs, ws[: N - 1], out),
+            "fp16 out": (x, wshuffle, xs, ws, out.to(dtypes.fp16)),
+        }
+        for what, call in declined.items():
+            assert (
+                _gemm_a4w4_preshuffle(*call, name) is None
+            ), f"OPUS adapter did not decline {what} (M={M} N={N} K={K})"
+        assert _gemm_a4w4_preshuffle(x, wshuffle, xs, ws, out, name) is not None
+        bias = torch.randn(M, N, dtype=dtypes.fp32)
+        d = gemm_a4w4(x, wshuffle, xs, ws, bias=bias, dtype=dtype)
+        err = checkAllclose(
+            a,
+            d,
+            msg=f"opus row fallback {fallback} M={M} N={N} K={K}",
+            catastrophic_check=True,
+        )
+        rows.append(
+            {"M": M, "N": N, "K": K, "tuned": name, "fallback": fallback, "err": err}
+        )
+    return rows
+
+
 def main():
     # Whole-op arch gate: gate here, not inside the @benchmark fn (that would emit an
     # args-only row).
@@ -717,6 +765,11 @@ def main():
         if not sweep.empty:
             aiter.logger.info(
                 "opus a4w4 kid sweep (markdown):\n%s", sweep.to_markdown(index=False)
+            )
+        fallback = pd.DataFrame(check_opus_fallback())
+        if not fallback.empty:
+            aiter.logger.info(
+                "opus a4w4 fallback (markdown):\n%s", fallback.to_markdown(index=False)
             )
 
     if gfx1250:

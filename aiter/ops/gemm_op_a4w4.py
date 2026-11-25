@@ -346,7 +346,7 @@ def gemm_a4w4_fake(
 
 
 # gfx950 OPUS MXFP4 kernels: tuned rows whose kernelName is an OPUS a4w4 instance
-# name launch through opus_gemm (shape/scale checks are in its C++ launcher).
+# name launch through opus_gemm (its C++ launcher checks shapes and scales again).
 _A4W4_PRESHUFFLE_PREFIXES = ("triton_", "flydsl_", "opus_")
 
 
@@ -361,9 +361,28 @@ def _opus_a4w4_kid(name, gfx, cu_num):
 
 
 def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name):
-    if out.dtype != dtypes.bf16:
+    m, n, k = A.numel() // A.shape[-1], B.shape[0], A.shape[-1] * 2
+    # Decline (-> CK/ASM fallback) what the OPUS launcher would reject, like the
+    # triton_/flydsl_ branch below: e8m0_shuffle scales are 2D, K/32 wide and
+    # padded to whole 32-row blocks.
+    if not (
+        out.dtype == dtypes.bf16
+        and n % 16 == 0
+        and k % 256 == 0
+        and all(
+            t.is_contiguous() and t.element_size() == 1
+            for t in (A, B, A_scale, B_scale)
+        )
+        and A_scale.ndim == 2
+        and B_scale.ndim == 2
+        and A_scale.shape[-1] == k // 32
+        and B_scale.shape[-1] == k // 32
+        and A_scale.shape[0] % 32 == 0
+        and B_scale.shape[0] % 32 == 0
+        and A_scale.shape[0] >= m
+        and B_scale.shape[0] >= n
+    ):
         return None
-    m, n = A.numel() // A.shape[-1], B.shape[0]
     gfx, cu_num = get_gfx(), get_cu_num()
     kid, inst = _opus_a4w4_kid(name, gfx, cu_num)
     # A row tuned at a padded M also serves the smaller M that pad up to it; a
