@@ -670,6 +670,8 @@ def gemm_afp8wfp8_preshuffle(
     residual / ssq (both or neither; the folded post-attention norm): y = bf16(bf16(X @ W^T) + residual) and
     ssq[m, j] = the fp32 sum of squares of row m of (bf16(X @ W^T) + residual) over output tile j's columns; ssq
     is (M, >= cdiv(N, BLOCK_SIZE_N)) fp32, the config is forced to one CTA a tile (see residual_ssq_tiles).
+    AITER_GEMM_RES_FAST=1 (default off, bitwise): that path loads the residual before the K loop and runs 8
+    consecutive N tiles on one XCD (narrow tiles share 256 B output / residual lines).
 
     gfx1250 (gluon) MXFP8 GEMM: Y = X @ W^T with fp8 e4m3 X and W and standard MX
     1x32 e8m0 block scales on both operands (one scale per 32 elements along K).
@@ -757,6 +759,9 @@ def gemm_afp8wfp8_preshuffle(
     if residual is not None:
         config = dict(config)
         config.update(residual_ssq_config(M))
+        if os.environ.get("AITER_GEMM_RES_FAST", "0") == "1":
+            # residual tile loaded before the K loop + 8 consecutive N tiles an XCD (bitwise; residual_ssq_config)
+            config.update(RES_EARLY=1, XCD_TILES=8)
     for key in ("SCALE_MODE", "A_DATA_PRESHUFFLE"):
         if key in config:
             raise ValueError(
