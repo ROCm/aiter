@@ -337,6 +337,7 @@ def start(kc):
     launch's counters."""
     COMPACT, EARLY, EPR_CH, EPR_PAD = kc.COMPACT, kc.EARLY, kc.EPR_CH, kc.EPR_PAD
     G, STREAM, addr_ctl = kc.G, kc.STREAM, kc.addr_ctl
+    SLOC = bool(kc.SLOC)
     bc, bid, is_t0, lane, rsrc_actl = kc.bc, kc.bid, kc.is_t0, kc.lane, kc.rsrc_actl
     rsrc_ctl, stamp, wave = kc.rsrc_ctl, kc.stamp, kc.wave
     stamp(0)
@@ -412,8 +413,8 @@ def start(kc):
                 )
         # Every STREAM kernel, not only LOC ones: an instance mixes them (a
         # layer whose weights stayed unplaced), and the next LOC launch of
-        # this parity claims from the head.
-        if const_expr(STREAM):  # noqa: SIM102 - preserve DSL staging
+        # this parity claims from the head. Slots by domain (SLOC) too.
+        if const_expr(STREAM or SLOC):  # noqa: SIM102 - preserve DSL staging
             if lane == fx.Int32(0):
                 buffer_store(
                     fx.Int32(0),
@@ -1062,9 +1063,72 @@ def gemm_queue(kc, n_mt):
     # This CTA's GEMM1 items so far (early CTAs; counted only with G2E, but a
     # loop-carried value must exist either way).
     n1_mine = fx.Int32(0)
+    # SLOC (slots on IOD-placed weights): one queue per IOD domain, each its
+    # domain's items in the unified order -- every GEMM1 item (m-major) of the
+    # n-tiles in its runs of R1S, then every GEMM2 item of those in its runs of
+    # R2S. A CTA's domain is ((bid + c) & 7) >> 2, c the launch's rotation; its
+    # first item is static (its rank in the domain), later ones come from its
+    # domain's head and, once that is spent, from the other's. Progress holds
+    # as before: a domain's CTAs claim every GEMM1 item of their queue before
+    # any GEMM2 one, so a GEMM2 item waits only on GEMM1 items already running
+    # or still ahead in the other domain's queue, whose CTAs never wait on
+    # GEMM2 before claiming them.
+    SLOC = bool(kc.SLOC) and not STREAM and not XQ
+    if const_expr(SLOC):
+        R1S, R2S = kc.R1S, kc.R2S
+        s_xr = (bid + _uniform(launch_rotation())) & fx.Int32(7)
+        s_dom = s_xr >> fx.Int32(2)
+        s_rank = (bid >> fx.Int32(3)) * fx.Int32(4) + (s_xr & fx.Int32(3))
+        GD = G // 2
+        s_L1 = n_mt * fx.Int32(NT1 // 2)
+        s_LL = s_L1 + n_mt * fx.Int32(NT2 // 2)
+        s_head0 = fx.Int32(CTL_QHEAD * 4) + par * fx.Int32(128)
+        s_dh = fx.Int32((CTL_QHEAD1 - CTL_QHEAD) * 4)
+        s_own = s_head0 + s_dom * s_dh
+        s_oth = s_head0 + (fx.Int32(1) - s_dom) * s_dh
+        U = s_LL * fx.Int32(2)
+        u = fx.Int32((s_rank < s_LL).select(s_dom * s_LL + s_rank, U))
+
+    def s_loc_n(d, k, R, NRUN):
+        # The k-th n-tile of domain d: runs of R alternating domains, an odd
+        # last run split in halves (iod_locality's domain groups).
+        run = d + fx.Int32(2) * (k // fx.Int32(R))
+        n = run * fx.Int32(R) + k % fx.Int32(R)
+        if const_expr(NRUN % 2):
+            full = (NRUN // 2) * R
+            n = fx.Int32(
+                (k < fx.Int32(full)).select(
+                    n,
+                    fx.Int32((NRUN - 1) * R)
+                    + d * fx.Int32(R // 2)
+                    + k
+                    - fx.Int32(full),
+                )
+            )
+        return n
+
     n2_done = fx.Int32(0)
     n_items = fx.Int32(0)
     while u < U:
+        # SLOC: the item's unified index ue (GEMM1 m * NT1 + n, GEMM2
+        # U1 + m * NT2 + n) from its domain code u; else ue = u.
+        ue = u
+        s_steal = fx.Int32(0)
+        if const_expr(SLOC):
+            s_d = fx.Int32((u >= s_LL).select(fx.Int32(1), fx.Int32(0)))
+            s_w = u - s_d * s_LL
+            s_g1 = s_w < s_L1
+            s_v = fx.Int32(s_g1.select(s_w, s_w - s_L1))
+            s_nt = fx.Int32(s_g1.select(fx.Int32(NT1 // 2), fx.Int32(NT2 // 2)))
+            s_m = s_v // s_nt
+            s_k = s_v - s_m * s_nt
+            ue = fx.Int32(
+                s_g1.select(
+                    s_m * fx.Int32(NT1) + s_loc_n(s_d, s_k, R1S, NT1 // R1S),
+                    U1 + s_m * fx.Int32(NT2) + s_loc_n(s_d, s_k, R2S, NT2 // R2S),
+                )
+            )
+            s_steal = fx.Int32((s_d != s_dom).select(fx.Int32(1), fx.Int32(0)))
         n_items = n_items + fx.Int32(1)
         stamp(TR_LAST_ITEM)
         # go2 = 1: this GEMM1 item is the early CTA's last; its claim takes
@@ -1083,17 +1147,25 @@ def gemm_queue(kc, n_mt):
             rsrc_ctl,
             fx.Int32(
                 is_t0.select(
-                    fx.Int32(g1_next.select(x_head, q_head)) if XQ else q_head,
+                    (
+                        fx.Int32(g1_next.select(x_head, q_head))
+                        if XQ
+                        else (
+                            fx.Int32((s_steal != fx.Int32(0)).select(s_oth, s_own))
+                            if SLOC
+                            else q_head
+                        )
+                    ),
                     fx.Int32(_OOB),
                 )
             ),
             1,
             SCOPE_DEV,
         )
-        if u < U1:
+        if ue < U1:
             if const_expr(G2E):
                 n1_mine = n1_mine + fx.Int32(1)
-            i, n = order_x(u) if XQ else order(u, NT1, kc.GM1 if STREAM else 1)
+            i, n = order_x(u) if XQ else order(ue, NT1, kc.GM1 if STREAM else 1)
             i = rot(i)
             e_, mt_idx, rows = decode_mtile(i)
             if const_expr(STREAM):
@@ -1161,7 +1233,7 @@ def gemm_queue(kc, n_mt):
                 if n2_done == fx.Int32(0):
                     stamp(TR_FIRST_G2)
             n2_done = n2_done + fx.Int32(1)
-            v = u - U1
+            v = ue - U1
             if const_expr(XQ and kc.LOC):
                 i, kk = order(v, NT2D, kc.GM2)
                 n = loc_n(dom, kk, kc.R2, NT2 // kc.R2)
@@ -1222,6 +1294,21 @@ def gemm_queue(kc, n_mt):
                 if g1_next:
                     nxq = xq_next(claim)
                 comm_ops.store_i32_lds(bc_next, nxq)
+            elif const_expr(SLOC):
+                # The claim's slot past the domain's static items; past its
+                # end, one claim on the other domain's head (once).
+                s_cd = fx.Int32(
+                    (s_steal != fx.Int32(0)).select(fx.Int32(1) - s_dom, s_dom)
+                )
+                s_wn = fx.Int32(GD) + claim
+                s_nx = fx.Int32((s_wn < s_LL).select(s_cd * s_LL + s_wn, U))
+                if (s_wn >= s_LL) & (s_steal == fx.Int32(0)):
+                    s_c2 = _buffer_atomic_add_ret(rsrc_ctl, s_oth, 1, SCOPE_DEV)
+                    s_w2 = fx.Int32(GD) + s_c2
+                    s_nx = fx.Int32(
+                        (s_w2 < s_LL).select((fx.Int32(1) - s_dom) * s_LL + s_w2, U)
+                    )
+                comm_ops.store_i32_lds(bc_next, s_nx)
             else:
                 comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + claim)
         rocdl.s_wait_dscnt(0)

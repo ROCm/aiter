@@ -27,6 +27,11 @@ from .protocol import (
 #: (``recv_token_bound``, else ``world * max_tokens_per_rank``), the same on
 #: every rank, so every rank picks the same path.
 SLOTS_TOKENS = 512
+#: With IOD-placed weights (AITER_MOE_LOC) slots runs steps of up to this many
+#: tokens per rank: placed, both claim by IOD domain, and compact's 128-row
+#: tile is faster past it (DSR1 EP4 MoE alone, us/layer, slots by domain /
+#: compact 128-row: 256 tokens 197.0 / 202.3, 512 tokens 258.3 / 243.1).
+SLOTS_TOKENS_PLACED = 256
 COMPACT_MAX_TOKENS = 8192
 
 #: slots' GEMM tiles: the a4w4 CSV's decode row for this shape family. The
@@ -65,6 +70,14 @@ def slots_tile(max_tokens_per_rank: int) -> dict:
         tile["tile_m"] = 32
     else:
         tile.update(SLOTS_TILE_M16)
+        from ..s1f_ctl import iod_placement_reason
+
+        if iod_placement_reason() is not None:
+            # A placed W2 (512 x 128 layout) is read by 512 x 128 tiles: the
+            # 16-row tile keeps the other tiles' GEMM2.
+            tile.update(
+                tile_k2=SLOTS_TILE["tile_k2"], num_buffers2=SLOTS_TILE["num_buffers2"]
+            )
     return tile
 
 
@@ -78,10 +91,16 @@ def slots_reason(config) -> str | None:
         return "AITER_MEGAKERNEL is off"
     from ..s1f_ctl import iod_placement_reason
 
+    tile = slots_tile(slots_tokens(config))
     why = iod_placement_reason()
     if why is not None:
-        return why
-    return _mega_reason(config, slots_tile(slots_tokens(config)))
+        # Placed weights stop slots only when its tiles cannot read them
+        # (GEMM1 256 x 256 and GEMM2 512 x 128 read the layouts as laid).
+        from .kernel import BUILDER_LOC
+
+        if not BUILDER_LOC or not _reads_placed(tile):
+            return why
+    return _mega_reason(config, tile)
 
 
 def compact_reason(config) -> str | None:
@@ -179,7 +198,10 @@ def _mega_reason(config, t) -> str | None:
 def slots_tokens(config) -> int:
     """Tokens per rank slots serves: SLOTS_TOKENS, at most the instance's
     ``max_tokens_per_rank``."""
-    return min(SLOTS_TOKENS, int(config.geometry.max_tokens_per_rank))
+    from ..s1f_ctl import iod_placement_reason
+
+    cap = SLOTS_TOKENS if iod_placement_reason() is None else SLOTS_TOKENS_PLACED
+    return min(cap, int(config.geometry.max_tokens_per_rank))
 
 
 def slots_recv_cap(config) -> int:

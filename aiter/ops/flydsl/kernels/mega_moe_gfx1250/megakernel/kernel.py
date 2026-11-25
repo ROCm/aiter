@@ -238,8 +238,7 @@ def make_megakernel(
         # takes the n-tiles of its own domain (protocol.gemm_queue).
         R1, R2 = loc_group1 * b_placed1, loc_group2 * b_placed2
         LOC = int(
-            os.environ.get("AITER_MEGAKERNEL_LOC", "1") == "1"
-            and XQ
+            XQ
             and b_placed1
             and b_placed2
             and R1 % 2 == 0
@@ -302,6 +301,20 @@ def make_megakernel(
     # its rows retire; CTA 0 plans from the counters then, and GEMM items start
     # and stream weights while their A owners wait for the rows-landed gate.
     EARLY = int(not COMPACT)
+    # slots on IOD-placed W1 / W2 claims its items by IOD domain
+    # (protocol.gemm_queue, SLOC): a domain's CTAs take the n-tiles in its
+    # runs of R alternating domains, then steal the other domain's.
+    R1S, R2S = loc_group1 * b_placed1, loc_group2 * b_placed2
+    SLOC = int(
+        not COMPACT
+        and b_placed1
+        and b_placed2
+        and R1S % 2 == 0
+        and R2S % 2 == 0
+        and NT1 % R1S == 0
+        and NT2 % R2S == 0
+        and G % 8 == 0
+    )
     # Early GEMM2 CTAs (see the docstring). Only the XQ queue has a GEMM2
     # head of its own; elsewhere it is off and stays out of the kernel name.
     G2E = int(g2_early)
@@ -315,7 +328,8 @@ def make_megakernel(
     # slots: while the plan is pending, a step of at least PREF_MIN_TOK tokens
     # has every CTA but 0 read the first 256 KB of the W1 slice its first item
     # most likely needs.
-    PREF_B = 0 if COMPACT else min(256 * 1024, int(tile_n) * (H // 2))
+    # (Off on a placed W1, whose slice is not at the unplaced address.)
+    PREF_B = 0 if (COMPACT or b_placed1) else min(256 * 1024, int(tile_n) * (H // 2))
     # Every CTA of the grid must be resident: a 4-wave CTA puts one wave on
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
     # the VGPRs.
@@ -336,6 +350,7 @@ def make_megakernel(
             ("lc", st_kw["LOC"] if STREAM else 0, 0),
             ("ds", DEFER_SC, 1),
             ("ge", G2E * 1000 + G2E_AFTER if G2E else 0, 0),
+            ("sl", SLOC, 0),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
         )
@@ -350,6 +365,9 @@ def make_megakernel(
         DEFER_SC=DEFER_SC,
         G2E=G2E,
         G2E_AFTER=G2E_AFTER,
+        SLOC=SLOC,
+        R1S=R1S or 1,
+        R2S=R2S or 1,
         DEST_STRIDE=DEST_STRIDE,
         E=E,
         EARLY=EARLY,
