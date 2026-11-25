@@ -1041,6 +1041,7 @@ import aiter.ops.mhc
 import aiter.ops.mla_sparse_prefill
 import aiter.ops.pa_sparse_prefill_opus
 import aiter.ops.quant
+import aiter.ops.sample
 import aiter.ops.topk
 import aiter.ops.triton.attention.kda
 import aiter.ops.triton.attention.pa_mqa_logits
@@ -1379,6 +1380,23 @@ def _route_cases():
             1e-6,
             _z(1, 2, 8),
         ),
+        "spec_verify_pick": (
+            lambda: aiter.spec_verify_pick(
+                _z(2, dtype=torch.int32),
+                _z(2, dtype=torch.int32),
+                _z(4, 8, dtype=torch.bfloat16),
+                _z(2, 8),
+                _z(2, 8),
+                _z(2),
+                torch.tensor([0, 2], dtype=torch.int64),
+                torch.tensor([1, 3], dtype=torch.int64),
+                torch.tensor([1, 2], dtype=torch.int32),
+                greedy_eps=0.5,
+            ),
+            "greedy_eps",
+            0.5,
+            None,
+        ),
     }
 
 
@@ -1403,6 +1421,7 @@ _ROUTE_CASES = [
     "causal_conv1d_split_qkv",
     "fused_recurrent_kda",
     "fused_recurrent_kda_packed_decode",
+    "spec_verify_pick",
 ]
 
 

@@ -826,4 +826,204 @@ void exponential(aiter_tensor_t& out,
     });
 }
 
+// topk_select's integer-ordered key (aiter/ops/flydsl/kernels/kernels_common.py
+// ord_signed_f32): an int32 that compares like the fp32 under `<`, with -0.0 and
+// 0.0 one key and NaN (either sign) above +inf.
+__device__ inline int32_t spec_verify_ord_key(float value)
+{
+    int32_t bits = __builtin_bit_cast(int32_t, value);
+    bits         = (bits == static_cast<int32_t>(0x80000000u)) ? 0 : bits;
+    const int32_t ordered = bits ^ ((bits >> 31) & 0x7FFFFFFF);
+    const bool is_nan     = (bits & 0x7FFFFFFF) > 0x7F800000;
+    return is_nan ? 0x7FFFFFFF : ordered;
+}
+
+// The row's largest ordered key, ties to the smallest column: the answer of
+// `topk_select(scores, 1, tie="low")`. A maximum under a total order with a
+// column tie-break, so it does not depend on how columns are spread over threads.
+template <typename DTYPE_I, int BlockSize = 256, int VecSize = 4>
+__device__ void spec_verify_ordered_argmax_impl(const DTYPE_I* input, int* output, int N)
+{
+    static constexpr int32_t vec_size_i = VecSize;
+    static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4);
+    using vec_i                         = opus::vector_t<DTYPE_I, vec_size_i>;
+    static constexpr int32_t ooba_i     = 4 / sizeof(DTYPE_I);
+    const int32_t oob_i                 = (N + ooba_i - 1) / ooba_i * ooba_i;
+    auto buffer_i = opus::make_gmem<DTYPE_I>(input, oob_i * sizeof(DTYPE_I));
+
+    // value = ordered key, key = column. INT32_MIN is below every key a score can
+    // take, so a thread that scanned nothing never wins.
+    using kvp = aiter::KeyValuePair<int, int>;
+    aiter::ArgMax arg_max;
+    kvp thread_kvp{0x7FFFFFFF, static_cast<int32_t>(0x80000000u)};
+    const int vec_stride = BlockSize * vec_size_i;
+    for(int k = threadIdx.x * vec_size_i; k < N; k += vec_stride)
+    {
+        vec_i vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
+        for(int i = 0; i < vec_size_i; i++)
+        {
+            // A lane past N reads whatever the bounded descriptor yields.
+            const int32_t key = spec_verify_ord_key(opus::cast<float>(vec_cur[i]));
+            // Columns ascend within a thread: a strict `>` keeps the earliest of a tie.
+            if((k + i) < N && key > thread_kvp.value)
+            {
+                thread_kvp.key   = k + i;
+                thread_kvp.value = key;
+            }
+        }
+    }
+    thread_kvp = block_reduce<kvp, aiter::ArgMax, BlockSize, true>(thread_kvp, arg_max);
+
+    if(threadIdx.x == 0)
+        output[0] = thread_kvp.key;
+}
+
+// One workgroup per picked row: the n_t verification rows first, then the n_req
+// bonus rows. Each reads its logits row where it lies in `input` and its own
+// noise row. A row at or below greedy_eps takes spec_verify_ordered_argmax_impl,
+// every other row the Gumbel-max race of mix_sample_outer_exponential_kernel
+// (random_sample_outer_exponential_impl, same block size, vector size and
+// NeedSum), so a sampled pick equals mixed_sample_outer_exponential's on the
+// same noise.
+template <typename DTYPE_I, int BlockSize = 1024, int VecSize = 4>
+__global__ void spec_verify_pick_kernel(const DTYPE_I* input,
+                                        const float* expo_t,
+                                        const float* expo_b,
+                                        const float* temps,
+                                        const int64_t* target_idx,
+                                        const int64_t* bonus_idx,
+                                        const int32_t* cu_draft,
+                                        int* out_t,
+                                        int* out_b,
+                                        int n_t,
+                                        int n_req,
+                                        int N,
+                                        int64_t stride_M,
+                                        int64_t es_t,
+                                        int64_t es_b,
+                                        float eps,
+                                        float greedy_eps)
+{
+    __shared__ int s_req;
+    const int b = blockIdx.x;
+    const DTYPE_I* row;
+    const float* ex;
+    int* out;
+    float temperature;
+    if(b < n_t)
+    {
+        // torch.searchsorted(cu_draft, b, right=True): the first request whose
+        // prefix sum is > b.
+        if(threadIdx.x == 0)
+        {
+            int lo = 0, hi = n_req;
+            while(lo < hi)
+            {
+                const int mid = (lo + hi) >> 1;
+                if(cu_draft[mid] <= b)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            s_req = lo < n_req ? lo : n_req - 1;
+        }
+        __syncthreads();
+        row         = input + target_idx[b] * stride_M;
+        ex          = expo_t + b * es_t;
+        out         = out_t + b;
+        temperature = temps[s_req];
+    }
+    else
+    {
+        const int j = b - n_t;
+        row         = input + bonus_idx[j] * stride_M;
+        ex          = expo_b + j * es_b;
+        out         = out_b + j;
+        temperature = temps[j];
+    }
+    if(temperature <= greedy_eps)
+    {
+        spec_verify_ordered_argmax_impl<DTYPE_I, BlockSize, VecSize>(row, out, N);
+    }
+    else
+    {
+        // m_idx 0 on a row pointer: the row offsets above are 64-bit.
+        random_sample_outer_exponential_impl<DTYPE_I, BlockSize, VecSize, true>(
+            row, ex, out, temperature, 0, N, 0, 0, eps);
+    }
+}
+
+void spec_verify_pick(aiter_tensor_t& out_t,
+                      aiter_tensor_t& out_b,
+                      aiter_tensor_t& input,
+                      aiter_tensor_t& expo_t,
+                      aiter_tensor_t& expo_b,
+                      aiter_tensor_t& temps,
+                      aiter_tensor_t& target_idx,
+                      aiter_tensor_t& bonus_idx,
+                      aiter_tensor_t& cu_draft,
+                      float eps,
+                      float greedy_eps)
+{
+    const int n_t   = static_cast<int>(target_idx.size(0));
+    const int n_req = static_cast<int>(bonus_idx.size(0));
+    if(n_t + n_req == 0)
+    {
+        return;
+    }
+    AITER_CHECK(input.dim() == 2 && input.stride(1) == 1 && input.size(1) > 0,
+                "spec_verify_pick: input must be [rows, V] with a contiguous last dim");
+    const HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const int N              = static_cast<int>(input.size(1));
+    AITER_CHECK(n_req > 0, "spec_verify_pick: verification rows need their requests");
+    AITER_CHECK(target_idx.dtype() == AITER_DTYPE_i64 && bonus_idx.dtype() == AITER_DTYPE_i64 &&
+                    cu_draft.dtype() == AITER_DTYPE_i32 && temps.dtype() == AITER_DTYPE_fp32 &&
+                    expo_t.dtype() == AITER_DTYPE_fp32 && expo_b.dtype() == AITER_DTYPE_fp32 &&
+                    out_t.dtype() == AITER_DTYPE_i32 && out_b.dtype() == AITER_DTYPE_i32,
+                "spec_verify_pick: index lists int64, prefix sums and outputs int32, "
+                "temperatures and noise fp32");
+    AITER_CHECK(target_idx.is_contiguous() && bonus_idx.is_contiguous() &&
+                    cu_draft.is_contiguous() && temps.is_contiguous() && out_t.is_contiguous() &&
+                    out_b.is_contiguous(),
+                "spec_verify_pick: index lists, temperatures and outputs must be contiguous");
+    AITER_CHECK(out_t.size(0) == n_t && out_b.size(0) == n_req && temps.size(0) == n_req &&
+                    cu_draft.size(0) == n_req,
+                "spec_verify_pick: outputs / temperatures / prefix sums do not match the index "
+                "lists");
+    AITER_CHECK(expo_b.size(0) == n_req && expo_b.size(1) == N && expo_b.stride(1) == 1 &&
+                    (n_t == 0 ||
+                     (expo_t.size(0) == n_t && expo_t.size(1) == N && expo_t.stride(1) == 1)),
+                "spec_verify_pick: a noise tensor is not [rows, V] with a contiguous last dim");
+    const int64_t stride_M    = input.stride(0);
+    const int64_t es_t        = n_t == 0 ? 0 : expo_t.stride(0);
+    const int64_t es_b        = expo_b.stride(0);
+    const int unroll_factor   = sizeof(float4) / sizeof(float);
+    const uint32_t block_size = 1024;
+    dim3 grid(static_cast<unsigned>(n_t + n_req));
+    dim3 block(block_size);
+
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "spec_verify_pick", [&] {
+        using input_dtype = typename hip2opus<scalar_t>::type;
+        spec_verify_pick_kernel<input_dtype, block_size, unroll_factor>
+            <<<grid, block, 0, stream>>>(reinterpret_cast<const input_dtype*>(input.data_ptr()),
+                                         reinterpret_cast<const float*>(expo_t.data_ptr()),
+                                         reinterpret_cast<const float*>(expo_b.data_ptr()),
+                                         reinterpret_cast<const float*>(temps.data_ptr()),
+                                         reinterpret_cast<const int64_t*>(target_idx.data_ptr()),
+                                         reinterpret_cast<const int64_t*>(bonus_idx.data_ptr()),
+                                         reinterpret_cast<const int32_t*>(cu_draft.data_ptr()),
+                                         reinterpret_cast<int*>(out_t.data_ptr()),
+                                         reinterpret_cast<int*>(out_b.data_ptr()),
+                                         n_t,
+                                         n_req,
+                                         N,
+                                         stride_M,
+                                         es_t,
+                                         es_b,
+                                         eps,
+                                         greedy_eps);
+    });
+}
+
 } // namespace aiter
