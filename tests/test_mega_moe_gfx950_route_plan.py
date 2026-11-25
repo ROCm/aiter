@@ -463,13 +463,16 @@ def test_ep4_fused_configs_unchanged():
     assert digest == _EP4_FUSED_DIGEST, table
 
 
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("mtpr", (256, 512))
-def test_ep4_small_m_buckets_share_one_protocol(mtpr):
+def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
     """The ranks of a launch may pick different buckets: the knobs that change what ranks and launches
     exchange are the same in every bucket (SmallMRuntime asserts it too)."""
     protocols = set()
     for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
-        k = select_fused_config(bucket, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1
+        k = select_fused_config(
+            bucket, mtpr, quant=quant, **V41_FLASH_EP4_SHAPE
+        ).fused_stage1
         protocols.add(
             (
                 k.dedup_rows,
@@ -487,15 +490,17 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
         assert not k.tok_counters or k.dedup_rows
     assert protocols == {(True, True, True, True, 4)}
     # A tok_done bucket (1 and 4 tokens) and one without it run on the same counters.
-    assert select_fused_config(1, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
+    assert select_fused_config(
+        1, mtpr, quant=quant, **V41_FLASH_EP4_SHAPE
+    ).fused_stage1.tok_done
     assert not select_fused_config(
-        16, mtpr, **V41_FLASH_EP4_SHAPE
+        16, mtpr, quant=quant, **V41_FLASH_EP4_SHAPE
     ).fused_stage1.tok_done
     # A tok_done reducer waits for valid routes x its own GEMM2 n-blocks, which every tok_done sender counts.
     tok_done_block_n = {
         config.stage2.block_n
         for config in (
-            select_fused_config(b, mtpr, **V41_FLASH_EP4_SHAPE)
+            select_fused_config(b, mtpr, quant=quant, **V41_FLASH_EP4_SHAPE)
             for b in FUSED_TOKEN_BUCKETS
             if b <= mtpr
         )
@@ -544,12 +549,13 @@ def test_v41ep8_large_m_capacities():
             ), (mtpr, tokens)
 
 
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("mtpr", (256, 512))
-def test_v41ep8_small_m_buckets_share_one_protocol(mtpr):
+def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
     """As at EP4: the knobs that change what ranks and launches exchange are the same in every bucket."""
     protocols = set()
     for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
-        config = select_fused_config(bucket, mtpr, **V41_FLASH_EP8_SHAPE)
+        config = select_fused_config(bucket, mtpr, quant=quant, **V41_FLASH_EP8_SHAPE)
         k = config.fused_stage1
         protocols.add(
             (
@@ -565,6 +571,26 @@ def test_v41ep8_small_m_buckets_share_one_protocol(mtpr):
         # The unrolled A-ahead GEMM1 hung at grid_mult 2 (8 tokens) on gfx950: only grids of one CTA a CU take it.
         assert k.g1_a_ahead == 1 or config.stage1.grid_mult == 1
     assert protocols == {(True, True, True, True, 4)}
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+def test_v41ep8_small_m_pairs_m_tiles(quant):
+    """EP8 V4.1-Flash, A8W4 and A4W4 alike: the small-input GEMM1 pairs an expert's interleaved 32-row m-tiles at
+    64 and 128 tokens (the A4W4 tune keeps the A8W4 one there), on the interleaved local plan it needs.
+    """
+    for mtpr in (256, 512):
+        for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+            config = select_fused_config(
+                bucket, mtpr, quant=quant, **V41_FLASH_EP8_SHAPE
+            )
+            k = config.fused_stage1
+            assert k.pair_tiles == (bucket in (64, 128)), (mtpr, bucket)
+            if k.pair_tiles:
+                assert (
+                    config.stage1.sort_block_m == 32 and k.dedup_rows and k.plan_local
+                )
+                assert k.g1_lookahead == 1 and k.g1_a_ahead == 1
+                assert not k.g1_split_tail
 
 
 def test_ep4_dispatch_cus_cover_two_expert_waves():
@@ -648,13 +674,14 @@ def test_route_payload_sharing():
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
 
 
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("mtpr", (256, 512))
-def test_ep2_small_m_buckets_share_one_protocol(mtpr):
+def test_ep2_small_m_buckets_share_one_protocol(mtpr, quant):
     """EP2 V4.1-Flash: one launch protocol over every bucket, 32-row expert tiles everywhere (8-16 rows an expert
     at 256-512 tokens), and one GEMM2 block_n over the tok_done buckets."""
     protocols, tok_done_block_n = set(), set()
     for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
-        config = select_fused_config(bucket, mtpr, **V41_FLASH_EP2_SHAPE)
+        config = select_fused_config(bucket, mtpr, quant=quant, **V41_FLASH_EP2_SHAPE)
         k = config.fused_stage1
         protocols.add(
             (
@@ -911,7 +938,7 @@ def test_routed_instance_routes(layout, quant, mtpr):
             assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
 
 
-@pytest.mark.parametrize("mtpr", (8192, 16384))
+@pytest.mark.parametrize("mtpr", LARGE_M_MTPRS)
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_large_m_a4w4_config_geometry(layout, mtpr):
     """The A4W4 large-input kernel's config (its layout's A8W4 config unless tuned for A4W4): a GEMM2 reading FP8,
@@ -927,9 +954,10 @@ def test_large_m_a4w4_config_geometry(layout, mtpr):
     shape = _ROUTED_LAYOUTS[layout]
     world, epr = shape["world_size"], shape["experts_per_rank"]
     model_dim, inter_dim = shape["model_dim"], shape["inter_dim"]
-    assert mtpr in large_m_mtprs_for(
+    if mtpr not in large_m_mtprs_for(
         world_size=world, model_dim=model_dim, inter_dim=inter_dim
-    )
+    ):
+        pytest.skip(f"{layout} serves capacity {mtpr} through the staged route")
     fused = {
         "world_size": world,
         "model_dim": model_dim,
@@ -1034,3 +1062,38 @@ def test_small_m_split_tail_reaches_the_kernel():
     assert _kernel_knobs(base)["g1_split_tail"] == 0
     config = replace(base, fused_stage1=replace(base.fused_stage1, g1_split_tail=24))
     assert _kernel_knobs(config)["g1_split_tail"] == 24
+
+
+# The A4W4 fused configs (_tune_a4w4_small / _tune_a4w4_large on each layout's A8W4 tune): every small-input bucket
+# at MTPR 256 and 512, and every large-input capacity of the layout at each of its token buckets. On a mismatch the
+# assertion shows the current table.
+_A4W4_FUSED_DIGESTS = {
+    "v4_pro_ep8": "8f1f921b1bccce23c0709b0682bbee047f5893bbceb0497ee8c517f6a3d82b04",
+    "v41_flash_ep8": "62c7a693275961daadcebb11b8bb06172e49d36dae29eb7b8bb0026f64d748a6",
+    "v41_flash_ep4": "edabac3b4dd3e9bf40a9c179427829b95c2eaf195f64b05d2ff37fc251e29498",
+    "v41_flash_ep2": "4dedfdc6d0b32d049fbe45590be738063657d4341ac83929c268f434cb7a3044",
+}
+
+
+@pytest.mark.parametrize("layout", sorted(_A4W4_FUSED_DIGESTS))
+def test_a4w4_fused_configs_unchanged(layout):
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_buckets
+
+    shape = _ROUTED_LAYOUTS[layout]
+    table = {}
+    for mtpr in (256, 512):
+        for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+            table[(mtpr, bucket)] = _knob_table(
+                select_fused_config(bucket, mtpr, quant="a4w4", **shape)
+            )
+    for mtpr in large_m_mtprs_for(
+        world_size=shape["world_size"],
+        model_dim=shape["model_dim"],
+        inter_dim=shape["inter_dim"],
+    ):
+        for bucket in large_m_buckets(mtpr):
+            table[(mtpr, bucket)] = _knob_table(
+                select_fused_config(bucket, mtpr, quant="a4w4", **shape)
+            )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _A4W4_FUSED_DIGESTS[layout], table
