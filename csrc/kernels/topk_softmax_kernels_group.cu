@@ -2731,9 +2731,10 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // four experts per lane, one vector load each from the BF16 logits and the
     // BF16 or FP32 bias at any alignment. The pitch must be whole quads, the
     // validated range; other pitches fall through to topk_reg_kernel or LDS
-    // below. A row that misses this gate with BF16 logits and an FP32 bias
-    // never reaches LDS: at E=768/896, or E=512/1024 with topk < 4 or 17, it
-    // fails the mixed-dtype AITER_CHECK in LAUNCH_KERNEL, as on main.
+    // below. A BF16-logit, FP32-bias row that fails only the pitch term goes to
+    // topk_reg_kernel at E=512/1024 with 4 <= topk <= 16; otherwise (E=768/896,
+    // or topk < 4 or 17) it fails the mixed-dtype AITER_CHECK in LAUNCH_KERNEL,
+    // as on main.
     // biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports,
     // the same topk_reg_mw_args_ok, and applies the same pitch term, so rows the
     // Triton kernel takes stay on it (test_exact_sigmoid_topk_matches_torch
