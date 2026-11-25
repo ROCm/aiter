@@ -247,9 +247,21 @@ def test_rmsnorm_non_contiguous(layout, in_dtype_str):
     else:
         x = torch.randn(64, 4, dtype=dtype, device="cuda").t()
     weight = torch.randn(x.shape[1], dtype=dtype, device="cuda")
-    y_torch = torch_rmsnorm(x, weight, dtype, 1e-5)
-    y_triton = rms_norm(x, weight, 1e-5)
+    dy = torch.randn(x.shape, dtype=dtype, device="cuda")
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    y_torch, *_ = run_torch(x, weight, 1e-5)
+    y_triton, *_ = run_triton(x, weight, 1e-5)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = x.grad.clone(), weight.grad.clone()
+    x.grad, weight.grad = None, None
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = x.grad.clone(), weight.grad.clone()
+
     torch.testing.assert_close(y_triton, y_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dx_triton, dx_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dg_triton, dg_torch, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])

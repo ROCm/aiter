@@ -178,11 +178,23 @@ def test_layernorm_non_contiguous(layout, dtype_str, eps=1e-5):
         x = torch.randn(4, 128, dtype=dtype, device="cuda")[:, ::2]
     else:
         x = torch.randn(64, 4, dtype=dtype, device="cuda").t()
-    w = torch.rand(x.shape[1], dtype=dtype, device="cuda")
-    b = torch.rand(x.shape[1], dtype=dtype, device="cuda")
+    w = torch.rand(x.shape[1], dtype=dtype, device="cuda", requires_grad=True)
+    b = torch.rand(x.shape[1], dtype=dtype, device="cuda", requires_grad=True)
+    dy = 0.1 * torch.randn(x.shape, dtype=dtype, device="cuda")
+    x.requires_grad_(True)
+
     y_torch, *_ = run_torch(x, w, b, eps)
     y_triton, *_ = run_triton(x, w, b, eps)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dw_triton, db_triton = [_.grad.clone() for _ in [x, w, b]]
+    x.grad, w.grad, b.grad = None, None, None
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dw_torch, db_torch = [_.grad.clone() for _ in [x, w, b]]
+
     torch.testing.assert_close(y_triton, y_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dx_triton, dx_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dw_triton, dw_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(db_triton, db_torch, atol=1e-2, rtol=1e-2)
 
 
 # pytest
