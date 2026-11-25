@@ -82,7 +82,7 @@ class CascadeWorkspace:
     max_b_rows: int  # max_items * members_per_item
     max_singles: int
     table_width: int  # max blocks per sequence
-    a_segments: int  # segments per item for shared-pass occupancy
+    a_segments: int  # segments per item per range (prefix and tails)
     kv_layout: str  # "vec5d" | "plain4d"
     b_partitions: int  # plain4d static partition cap per tail
     dtype: torch.dtype
@@ -96,6 +96,7 @@ class CascadeWorkspace:
     b_slot: torch.Tensor  # [max_b_rows] member slot within the item
     tail_lens: torch.Tensor  # [max_b_rows] private tail lengths
     tail_tables: torch.Tensor  # [max_b_rows, table_width] shifted block tables
+    bend_zeros: torch.Tensor  # [1] int32 zeros used to null B partition counts
     singles_rows: torch.Tensor  # [max_singles] request rows
     tok_of_s: torch.Tensor  # [max_singles] token/Q rows
     singles_lens: torch.Tensor  # [max_singles]
@@ -212,16 +213,19 @@ def plan_pa_decode_cascade(
         b_item=t((max_b_rows,), **int32).zero_(),
         b_slot=t((max_b_rows,), **int32).zero_(),
         tail_lens=b_lens,
+        bend_zeros=torch.zeros(max_b_rows, dtype=torch.int32, device=dev),
         tail_tables=t((max_b_rows, table_width), **int32),
         singles_rows=t((max_singles,), **int32).zero_(),
         tok_of_s=t((max_singles,), **int32).zero_(),
         singles_lens=s_lens,
         singles_tables=t((max_singles, table_width), **int32),
         counts=t((N_COUNTS,), **int32),
-        a_m=t((max_items, a_segments, members_per_item, num_q_heads), **f32),
-        a_l=t((max_items, a_segments, members_per_item, num_q_heads), **f32),
+        # Segment slots: [0, a_segments) cover the shared prefix and
+        # [a_segments, 2*a_segments) cover member tails.
+        a_m=t((max_items, 2 * a_segments, members_per_item, num_q_heads), **f32),
+        a_l=t((max_items, 2 * a_segments, members_per_item, num_q_heads), **f32),
         a_acc=t(
-            (max_items, a_segments, members_per_item, num_q_heads, head_dim), **f32
+            (max_items, 2 * a_segments, members_per_item, num_q_heads, head_dim), **f32
         ),
         p_max=t((num_kv_heads, cap, group), **f32) if vec else t(f32_empty, **f32),
         p_sum=t((num_kv_heads, cap, group), **f32) if vec else t(f32_empty, **f32),
@@ -299,6 +303,63 @@ def _launch_shared_pass(
         K_DIM_STRIDE=key_cache.stride(3) if plain else 0,
         V_TOK_STRIDE=value_cache.stride(2) if plain else 0,
         V_DIM_STRIDE=value_cache.stride(3) if plain else 0,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+def _launch_tail_pass(ws: CascadeWorkspace, key_cache, value_cache, block_tables, softmax_scale):
+    """Member-tail engine: the same packed segment kernel covering each
+    member row's private tail [shared prefix end, own context end), with
+    partials written to the alloc_extended segment slots."""
+    from aiter.ops.triton.attention.pa_decode_cascade import _cascade_tail_kernel
+
+    group = ws.num_q_heads // ws.num_kv_heads
+    block_mg = max(16, next_pow2(ws.members_per_item * group))
+    page = ws.block_size
+    plain = ws.kv_layout == "plain4d"
+    if plain:
+        k_strides = (key_cache.stride(0), key_cache.stride(1))
+        v_strides = (value_cache.stride(0), value_cache.stride(1))
+    else:
+        k_strides = (ws.num_kv_heads * ws.head_dim * page, ws.head_dim * page)
+        v_strides = k_strides
+    _cascade_tail_kernel[(ws.max_items, ws.a_segments, ws.num_kv_heads)](
+        ws.q_gather_b,
+        key_cache,
+        value_cache,
+        block_tables,
+        ws.items,
+        ws.b_of_item_slot,
+        ws.a_m,
+        ws.a_l,
+        ws.a_acc,
+        ws.tail_lens,
+        block_tables.stride(0),
+        ws.a_m.stride(0),
+        ws.a_m.stride(1),
+        ws.a_m.stride(2),
+        ws.a_acc.stride(0),
+        ws.a_acc.stride(1),
+        ws.a_acc.stride(2),
+        softmax_scale * 1.4426950408889634,
+        PAGE=page,
+        GQA=group,
+        HEAD_DIM=ws.head_dim,
+        MEMBERS=ws.members_per_item,
+        BLOCK_MG=block_mg,
+        Q_ROW_STRIDE=ws.num_q_heads * ws.head_dim,
+        Q_HEAD_STRIDE=ws.head_dim,
+        K_BLK_STRIDE=k_strides[0],
+        K_HEAD_STRIDE=k_strides[1],
+        V_BLK_STRIDE=v_strides[0],
+        V_HEAD_STRIDE=v_strides[1],
+        PLAIN_LAYOUT=plain,
+        K_TOK_STRIDE=key_cache.stride(2) if plain else 0,
+        K_DIM_STRIDE=key_cache.stride(3) if plain else 0,
+        V_TOK_STRIDE=value_cache.stride(2) if plain else 0,
+        V_DIM_STRIDE=value_cache.stride(3) if plain else 0,
+        SEG_BASE=ws.a_segments,
         num_warps=4,
         num_stages=1,
     )
@@ -458,7 +519,9 @@ def _launch_fold(ws: CascadeWorkspace, output, sinks):
         parts = ws.b_plan.max_partitions
     else:
         pmax, psum, pout = ws.p2_max, ws.p2_sum, ws.p2_out
-        info = ws.tail_lens
+        # Tail-side partials now come from the A engine, so every B row
+        # has zero v2 partitions (keeps the staging inert by contract).
+        info = ws.bend_zeros
         ps_seq, ps_head, ps_part = pmax.stride(0), pmax.stride(1), pmax.stride(2)
         po_seq, po_head, po_part = pout.stride(0), pout.stride(1), pout.stride(2)
         parts = ws.b_partitions
@@ -564,22 +627,8 @@ def pa_decode_cascade(
         prof["pre_tail"] = time.perf_counter()
     folded = False
     if vec:
-        # 2) Tail pass: production FlyDSL pa_decode over members' tails.
-        plan_pa_decode(ws.tail_lens, ws.num_kv_heads, max_partitions=2, plan=ws.b_plan)
-        pa_decode(
-            ws.out_b,
-            ws.q_gather_b,
-            key_cache,
-            value_cache,
-            ws.tail_lens,
-            ws.tail_tables,
-            softmax_scale,
-            1,
-            work_plan=ws.b_plan,
-            max_logits=ws.p_max,
-            exp_sums=ws.p_sum,
-            temporary_output=ws.p_out,
-        )
+        # 2) Tail pass: member-tail engine over each item's private tail.
+        _launch_tail_pass(ws, key_cache, value_cache, block_tables, softmax_scale)
         # 3) Singles: exactly the plain pa_decode call on their full rows.
         torch.index_select(query, 0, ws.tok_of_s.long(), out=ws.q_gather_s)
         plan_pa_decode(ws.singles_lens, ws.num_kv_heads, plan=ws.s_plan)
@@ -596,8 +645,11 @@ def pa_decode_cascade(
             work_plan=ws.s_plan,
         )
     else:
-        # 2) Tail pass: AITER Triton v2 tile kernel over members' tails.
-        _launch_v2_tails(ws, key_cache, value_cache, softmax_scale)
+        # 2) Tail pass: member-tail engine over each item's private tail.
+        _launch_tail_pass(ws, key_cache, value_cache, block_tables, softmax_scale)
+        if prof is not None:
+            torch.cuda.synchronize()
+            prof["tails_done"] = time.perf_counter()
         # Fold members now, before the singles kernels reuse the staging
         # buffers the tails wrote.
         if prof is not None:
@@ -605,6 +657,9 @@ def pa_decode_cascade(
             prof["pre_fold"] = time.perf_counter()
         _launch_fold(ws, output, sinks)
         folded = True
+        if prof is not None:
+            torch.cuda.synchronize()
+            prof["fold_done"] = time.perf_counter()
         # 3) Singles: full production Triton v2 decode call.
         from aiter.ops.triton.attention.pa_decode import paged_attn_decode_v2
 
@@ -650,8 +705,12 @@ def pa_decode_cascade(
         torch.cuda.synchronize()
         fill_end = time.perf_counter()
         t0 = prof
+        td = t0.get("tails_done", t0["pre_tail"])
+        fd = t0.get("fold_done", t0["pre_fold"])
+        td_pre = (td - t0['pre_tail']) * 1000
+        fd_pre = fd
         print(
-            f"[cascade-prof] fill={0:6.1f} shared={(t0['shared']-t0['fill_start'])*1000:6.2f} "
+            f"[cascade-prof] shared={(t0['shared']-t0['fill_start'])*1000:6.2f} "
             f"tail={(t0['pre_tail']-t0['shared'])*1000:6.2f} singles+scat={(t0['pre_fold']-t0['pre_tail'])*1000:6.2f} "
             f"fold={(fill_end-t0['pre_fold'])*1000:6.2f}"
         )

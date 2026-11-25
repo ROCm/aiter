@@ -160,8 +160,19 @@ def _cascade_plan_items_kernel(
     )
     sblk = tl.minimum(segmin_fwd, tl.flip(segmin_rev, 0))
 
-    # --- items: one start per run and per M members inside it. Every row
-    # belongs to the latest item start at or before it.
+    # --- items: one start per run and per M members inside it. Singleton
+    # runs (valid rows that joined no run) become items of one member with
+    # their own full-block context as the shared range, so they take the
+    # shared-pass engine too: the v2 tail engine sees only their partial
+    # tail block.
+    order = tl.load(order_ptr + row_idx, mask=inb, other=0)
+    rows = order.to(tl.int32)
+    lengths_all = tl.load(len_ptr + rows, mask=inb, other=0)
+    run_single = (~join_next) & (~join_prev) & (lengths_all >= PAGE)
+    member = (member != 0) | run_single
+    own_blocks = lengths_all // PAGE
+    sblk = tl.where(run_single, own_blocks, sblk)
+
     item_start = (member != 0) & ((local % M) == 0)
     item_id = tl.cumsum(item_start.to(tl.int32), 0) - 1
     ok1 = (member != 0) & (item_id < MAX_ITEMS)
@@ -169,9 +180,7 @@ def _cascade_plan_items_kernel(
     ok = ok1 & (rank_ok1 < MAX_B)
     single = inb & (~ok)
 
-    order = tl.load(order_ptr + row_idx, mask=inb, other=0)
-    rows = order.to(tl.int32)
-    lengths = tl.load(len_ptr + rows, mask=ok, other=0)
+    lengths = lengths_all
     slot = (local % M).to(tl.int32)
 
     # --- emit: items table, B metadata, singles metadata.

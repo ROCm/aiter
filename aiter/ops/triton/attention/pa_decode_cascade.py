@@ -115,17 +115,14 @@ def _cascade_shared_kernel(
     q = (q * softmax_scale_log2).to(tl.bfloat16)
 
     # Any member row serves the shared block range; use member 0.
-    bt_row = tl.load(meta0 + 2).to(tl.int64)
+    bt_row = tl.load(meta0 + 2)
 
     m_i = tl.full([BLOCK_MG], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_MG], tl.float32)
     acc = tl.zeros([BLOCK_MG, HEAD_DIM], tl.float32)
     tt = tl.arange(0, PAGE)
 
-    # Segment-local shared range [first_blk, last_blk). Segments are
-    # block-aligned, so every iteration covers one full 16-token block:
-    # a scalar i64 block base plus fully affine per-element offsets keeps
-    # address math in 32-bit registers and the loads vectorized.
+    # Segment-local shared range [first_blk, last_blk).
     first_blk = tl.minimum(sblk * seg // A_SEGMENTS, sblk)
     last_blk = tl.minimum(sblk * (seg + 1) // A_SEGMENTS, sblk)
     base_ptr = bt_ptr + bt_row * bt_row_stride
@@ -188,6 +185,166 @@ def _cascade_shared_kernel(
         aacc_ptr
         + item * aa_item_stride
         + seg * aa_seg_stride
+        + member[:, None] * aa_mem_stride
+        + head[:, None] * HEAD_DIM
+        + d[None, :],
+        acc,
+        mask=member_ok[:, None],
+    )
+
+
+@triton.jit
+def _cascade_tail_kernel(
+    # Same pack as _cascade_shared_kernel, but covering each member row's
+    # private tail [sblk, sblk + its own tail length) instead of the shared
+    # prefix. Items are the group items' rows; the segment grid covers the
+    # item's longest tail and output slots shift by SEG_BASE.
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    bt_ptr,
+    items_ptr,
+    bslot_ptr,
+    am_ptr,
+    al_ptr,
+    aacc_ptr,
+    t_lens_ptr,  # [max_b] int32 tail lengths of the members' B rows
+    bt_row_stride,
+    am_item_stride,
+    am_seg_stride,
+    am_mem_stride,
+    aa_item_stride,
+    aa_seg_stride,
+    aa_mem_stride,
+    softmax_scale_log2,  # softmax_scale * log2(e)
+    PAGE: tl.constexpr,  # tokens per KV block
+    GQA: tl.constexpr,  # query heads per KV head
+    HEAD_DIM: tl.constexpr,  # power of two
+    MEMBERS: tl.constexpr,  # members per item
+    BLOCK_MG: tl.constexpr,  # next_pow2(MEMBERS * GQA)
+    Q_ROW_STRIDE: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr,
+    K_BLK_STRIDE: tl.constexpr,
+    K_HEAD_STRIDE: tl.constexpr,
+    V_BLK_STRIDE: tl.constexpr,
+    V_HEAD_STRIDE: tl.constexpr,
+    PLAIN_LAYOUT: tl.constexpr,
+    K_TOK_STRIDE: tl.constexpr,
+    K_DIM_STRIDE: tl.constexpr,
+    V_TOK_STRIDE: tl.constexpr,
+    V_DIM_STRIDE: tl.constexpr,
+    SEG_BASE: tl.constexpr,
+):
+    item = tl.program_id(0)
+    seg = tl.program_id(1)
+    kvh = tl.program_id(2)
+    TAIL_SEGMENTS: tl.constexpr = tl.num_programs(1)
+
+    meta0 = items_ptr + item * (2 + MEMBERS)
+    sblk = tl.load(meta0 + 0)
+    count = tl.load(meta0 + 1)
+    if count <= 0:
+        return
+
+    member = tl.arange(0, BLOCK_MG) // GQA
+    g = tl.arange(0, BLOCK_MG) % GQA
+    member_ok = member < count
+    member_b = tl.load(
+        bslot_ptr + item * MEMBERS + member, mask=member_ok, other=0
+    ).to(tl.int64)
+    head = kvh * GQA + g
+    d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(
+        q_ptr
+        + member_b[:, None] * Q_ROW_STRIDE
+        + head[:, None] * Q_HEAD_STRIDE
+        + d[None, :],
+        mask=member_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    q = (q * softmax_scale_log2).to(tl.bfloat16)
+
+    bt_row = tl.load(meta0 + 2)
+
+    t_len = tl.load(t_lens_ptr + member_b, mask=member_ok, other=0)
+    t_max = tl.max(tl.where(member_ok, t_len, 0))
+    span_blocks = tl.maximum(-(-t_max // PAGE), 1)
+
+    m_i = tl.full([BLOCK_MG], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_MG], tl.float32)
+    acc = tl.zeros([BLOCK_MG, HEAD_DIM], tl.float32)
+    tt = tl.arange(0, PAGE)
+
+    # Tail range for this segment of the item's longest tail.
+    first_blk = sblk + seg * span_blocks // TAIL_SEGMENTS
+    last_blk = sblk + (seg + 1) * span_blocks // TAIL_SEGMENTS
+    base_ptr = bt_ptr + bt_row * bt_row_stride
+    for j in range(first_blk, last_blk):
+        bound = sblk * PAGE + t_len
+        bid = tl.load(base_ptr + j).to(tl.int64)
+        if PLAIN_LAYOUT:
+            k = tl.load(
+                k_ptr
+                + bid * K_BLK_STRIDE
+                + kvh * K_HEAD_STRIDE
+                + tt[:, None] * K_TOK_STRIDE
+                + d[None, :] * K_DIM_STRIDE
+            )
+        else:
+            k = tl.load(
+                k_ptr
+                + bid * K_BLK_STRIDE
+                + kvh * K_HEAD_STRIDE
+                + tt[:, None] * 8
+                + (d[None, :] // 8) * (PAGE * 8)
+                + (d[None, :] % 8)
+            )
+
+        s = tl.dot(q, tl.trans(k))  # fp32, log2 units
+        # Tokens at or past each member's context end are out of range and
+        # must not contribute to its statistics.
+        s = tl.where((j * PAGE + tt)[None, :] < bound[:, None], s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        alpha = tl.where(m_new == float("-inf"), 0.0, alpha)
+        alpha = tl.where(m_i == float("-inf"), 1.0, alpha)
+        p = tl.exp2(s - m_new[:, None])
+
+        if PLAIN_LAYOUT:
+            v = tl.load(
+                v_ptr
+                + bid * V_BLK_STRIDE
+                + kvh * V_HEAD_STRIDE
+                + tt[:, None] * V_TOK_STRIDE
+                + d[None, :] * V_DIM_STRIDE
+            )
+        else:
+            v = tl.load(
+                v_ptr
+                + bid * V_BLK_STRIDE
+                + kvh * V_HEAD_STRIDE
+                + (tt[:, None] // 8) * (HEAD_DIM * 8)
+                + d[None, :] * 8
+                + (tt[:, None] % 8)
+            )
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+
+    m_nat = m_i * _LN2
+    seg_out = seg + SEG_BASE
+    am_base = (
+        item * am_item_stride + seg_out * am_seg_stride + member * am_mem_stride
+    )
+    tl.store(am_ptr + am_base + head, m_nat, mask=member_ok)
+    tl.store(al_ptr + am_base + head, l_i, mask=member_ok)
+    tl.store(
+        aacc_ptr
+        + item * aa_item_stride
+        + seg_out * aa_seg_stride
         + member[:, None] * aa_mem_stride
         + head[:, None] * HEAD_DIM
         + d[None, :],
