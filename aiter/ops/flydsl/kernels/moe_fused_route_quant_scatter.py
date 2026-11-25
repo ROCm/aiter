@@ -2234,13 +2234,23 @@ def build_moe_token_multidest_quant_module(
         valid,
         lane,
         raw_rows,
-        **staging,
+        *,
+        hidden_chunks,
+        chunk_prefetch,
+        hidden_lds_load,
+        hidden_lds_idx,
+        hidden_lds_row_off,
+        hidden_slot_bytes,
+        mx_group_base,
     ):
         """``_emit_quant_block_loop`` context of one warp: quantize row
         ``token_eff`` of ``hidden`` once and store it to each live row of
         ``raw_rows``. A warp past the last token, or one whose routes are all
         dropped, gets zero-length destination descriptors, so the hardware
-        bounds check drops its stores. ``staging``: how the hidden row arrives.
+        bounds check drops its stores. The keyword-only parameters say how the
+        hidden row arrives. None has a default: ``_emit_quant_block_loop`` reads
+        optional fields with ``getattr`` defaults, so a missing or misspelled
+        name has to fail here, when the kernel is built.
         """
         c0_i32 = fx.Int32(0)
         c16_i32 = fx.Int32(16)
@@ -2312,7 +2322,13 @@ def build_moe_token_multidest_quant_module(
                 num_records_bytes=scale_records,
             ),
             scale_pack_dwords=scale_pack_dwords,
-            **staging,
+            hidden_chunks=hidden_chunks,
+            chunk_prefetch=chunk_prefetch,
+            hidden_lds_load=hidden_lds_load,
+            hidden_lds_idx=hidden_lds_idx,
+            hidden_lds_row_off=hidden_lds_row_off,
+            hidden_slot_bytes=hidden_slot_bytes,
+            mx_group_base=mx_group_base,
         )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
