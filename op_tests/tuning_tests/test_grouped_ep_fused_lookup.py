@@ -107,12 +107,15 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
             quant_type=QuantType.per_1x32,
             ep_fused=True,
         )
+        # DSR1 8192 has no ep_fused=2 row: the compact path keeps the
+        # ep_fused=1 row (tile 256), the same one mori resolves.
         compact = _find_grouped_config(**kw, compact=True)
         mori = _find_grouped_config(**kw)
-        self.assertIn(str(compact.get("ep_fused")), ("2", "2.0"))
-        self.assertEqual(str(compact.get("tile_m")), "128")
+        self.assertIn(str(compact.get("ep_fused")), ("1", "1.0"))
+        self.assertEqual(str(compact.get("tile_m")), "256")
         self.assertIn(str(mori.get("ep_fused")), ("1", "1.0"))
         self.assertEqual(str(mori.get("tile_m")), "256")
+        self.assertEqual(compact, mori)
         # Without its own row a bucket keeps the ep_fused=1 row on both paths.
         kw["token_num"] = 16384
         self.assertEqual(
