@@ -410,6 +410,8 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
         "kernels/gdr_common.py",
         "kernels/kernels_common.py",
     ],
+    # Read in this file; the BV override also reaches the key as BV.
+    env=["AITER_K5_OPT_CHECK", "FLYDSL_K5_OPT_BV"],
 )
 @functools.cache
 def _get_or_compile_opt(
