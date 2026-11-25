@@ -13,6 +13,15 @@ _BLOCK_ROWS = 32
 _LOG2E = 1.4426950408889634
 
 
+def _require_gfx1201(tensor: Tensor) -> None:
+    # The kernels trap or return garbage on other architectures in a multi-arch build.
+    if tensor.device.type != "cuda":
+        raise ValueError("gfx1201 SageAttention expects GPU tensors")
+    arch = torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0]
+    if arch != "gfx1201":
+        raise RuntimeError(f"gfx1201 SageAttention requires gfx1201, got {arch}")
+
+
 @compile_ops("module_gfx1201_sage_prepare", develop=True)
 def gfx1201_sage_prepare_hip(
     query: Tensor,
@@ -74,6 +83,7 @@ def gfx1201_sage_prepare(
             or tensor.device != query.device
         ):
             raise ValueError("Q/K/V must be contiguous BF16 tensors on the same device")
+    _require_gfx1201(query)
     batch, rows, heads, _ = query.shape
     padded = (rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS * _BLOCK_ROWS
     if batch * padded * heads * _HEAD_DIM >= 2**31:

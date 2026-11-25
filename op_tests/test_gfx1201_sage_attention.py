@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -194,6 +195,38 @@ def test_invalid_inputs():
     return ok
 
 
+def test_other_arch_rejected():
+    # A multi-arch build also compiles the kernels for other GPUs, where they would trap or return garbage.
+    import aiter
+
+    q, k, v = inputs(1, 64, 2)
+    prepared = aiter.gfx1201_sage_prepare(q, k, v)
+    entries = {
+        "gfx1201_sage_prepare": lambda: aiter.gfx1201_sage_prepare(q, k, v),
+        "gfx1201_sage_attention_fwd": lambda: aiter.gfx1201_sage_attention_fwd(
+            *prepared, q.shape[1]
+        ),
+        "gfx1201_sage_attention": lambda: torch.ops.aiter.gfx1201_sage_attention(
+            q, k, v
+        ),
+    }
+    ok = True
+    real = torch.cuda.get_device_properties
+    torch.cuda.get_device_properties = lambda device=None: SimpleNamespace(
+        gcnArchName="gfx1100"
+    )
+    try:
+        for name, call in entries.items():
+            try:
+                call()
+                ok &= report(f"{name} rejects gfx1100", {}, False)
+            except RuntimeError:
+                ok &= report(f"{name} rejects gfx1100", {}, True)
+    finally:
+        torch.cuda.get_device_properties = real
+    return ok
+
+
 def main():
     if get_gfx() != "gfx1201":
         print(f"skip: gfx1201_sage_attention requires gfx1201, got {get_gfx()}")
@@ -207,6 +240,7 @@ def main():
         test_fused_norm_rope,
         test_registration_and_streams,
         test_invalid_inputs,
+        test_other_arch_rejected,
     ):
         ok &= test()
     print("ALL PASS" if ok else "FAILED")

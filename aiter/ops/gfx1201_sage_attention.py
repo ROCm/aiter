@@ -7,7 +7,7 @@ from torch import Tensor
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops
-from .gfx1201_sage_prepare import gfx1201_sage_prepare
+from .gfx1201_sage_prepare import _require_gfx1201, gfx1201_sage_prepare
 
 
 @compile_ops("module_gfx1201_sage_attention", develop=True)
@@ -37,6 +37,7 @@ def gfx1201_sage_attention_fwd(
     Returns BF16 ``[B, S_pad, H, 128]``; rows at or beyond ``seq_len`` are left
     uninitialized.
     """
+    _require_gfx1201(q_int8)
     batch, padded, heads, dim = q_int8.shape
     if not 0 < seq_len <= padded or padded % 32:
         raise ValueError(f"seq_len {seq_len} does not fit padded length {padded}")
@@ -52,11 +53,7 @@ def gfx1201_sage_attention_fwd(
 def _check(query, key, value):
     if query.requires_grad or key.requires_grad or value.requires_grad:
         raise ValueError("gfx1201_sage_attention is inference-only")
-    if query.device.type != "cuda":
-        raise ValueError("gfx1201_sage_attention expects GPU tensors")
-    arch = torch.cuda.get_device_properties(query.device).gcnArchName.split(":")[0]
-    if arch != "gfx1201":
-        raise RuntimeError(f"gfx1201_sage_attention requires gfx1201, got {arch}")
+    _require_gfx1201(query)
 
 
 def gfx1201_sage_attention(
