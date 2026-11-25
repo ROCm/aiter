@@ -1673,11 +1673,15 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                 {
                     value = __hip_atomic_load(
                         counters + token_block * 32, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                    if((value >> 8) != (last >> 8))
+                    // Every split has arrived (or the finisher already bumped the
+                    // generation): this split can compute rstd itself.
+                    if((value & 255u) == static_cast<unsigned>(split_k) ||
+                       (value >> 8) != (last >> 8))
                         break;
                     __builtin_amdgcn_s_sleep(1);
                 }
-                ready = (value >> 8) != (last >> 8);
+                ready =
+                    (value & 255u) == static_cast<unsigned>(split_k) || (value >> 8) != (last >> 8);
             }
             __syncthreads();
             // The host guard limits the grid to one participant WG per CU.
@@ -1729,12 +1733,49 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                     return;
             }
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
-            if(tid < active_rows)
             {
-                auto g_ready = opus::make_gmem<float>(
+                // Reduce the collapse sqsums in the finisher's group order so
+                // both sides produce bitwise-identical rstd without waiting for
+                // the finisher's rstd store and generation bump.
+                constexpr int FG = C::decode_rows == 4   ? 8
+                                   : C::decode_rows == 8 ? 4
+                                                         : 2 * C::groups;
+                float* sq_buf    = &reduction[0][0][0];
+                auto g_ready     = opus::make_gmem<float>(
                     partials, static_cast<size_t>(split_k) * tokens * SLOTS * sizeof(float));
-                total[tid][25] =
-                    load_vector_nbytes<float, 1, 4, 3>(g_ready, token_block * BM * SLOTS + tid)[0];
+                for(int j = tid; j < split_k * active_rows; j += THREADS)
+                {
+                    const int s = j / active_rows, r = j % active_rows;
+                    const int off =
+                        r < tile_rows ? (s * tokens + tile_token + r) * SLOTS + 25 : (1 << 29);
+                    sq_buf[j] = load_vector_nbytes<float, 1, 4, 1>(g_ready, off)[0];
+                }
+                __syncthreads();
+                if(tid < active_rows)
+                {
+                    // Scalar adds: packed FP32 adds here would pair group sums and
+                    // read the high dword (the gfx950 lanes 48..63 MFMA hazard).
+                    auto add = [](float a, float b) {
+                        float r = a + b;
+                        asm("" : "+v"(r));
+                        return r;
+                    };
+                    float g[FG] = {};
+                    for(int s = 0; s < split_k; ++s)
+                        g[s % FG] = add(g[s % FG], sq_buf[s * active_rows + tid]);
+                    float sum = 0;
+                    if constexpr(FG == 4)
+                        sum = add(add(g[0], g[1]), add(g[2], g[FG - 1]));
+                    else if constexpr(FG == 2)
+                        sum = add(g[0], g[1]);
+                    else
+                    {
+#pragma unroll
+                        for(int k = 0; k < FG; ++k)
+                            sum = add(sum, g[k]);
+                    }
+                    total[tid][25] = rsqrtf(sum * (1.0f / hidden) + norm_eps);
+                }
             }
             __syncthreads();
             normalize_own_columns();
@@ -1793,19 +1834,16 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                 else
                     combined = a + b;
             }
-            // All partial reads completed before split 0 is reused for rstd.
             if(i % SLOTS == 24 && i / SLOTS < tile_rows)
             {
                 combined[0] = rsqrtf(combined[0] * (1.0f / (4 * hidden)) + rms_eps);
                 combined[1] = rsqrtf(combined[1] * (1.0f / hidden) + norm_eps);
-                partials[token_block * BM * SLOTS + i / SLOTS] = combined[1];
             }
             *reinterpret_cast<f32x4*>(&total[i / SLOTS][i % SLOTS]) = combined;
         }
     }
-    // Every publisher waits for its store before the workgroup barrier;
-    // thread 0 advances the generation only after all rstd stores complete.
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // Non-finishers compute rstd themselves, so publication only closes the
+    // handoff window and re-arms the counter; no store needs to drain first.
     __syncthreads();
     if(tid == 0)
     {
@@ -3082,7 +3120,7 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                     "no_post returns the original residual");
     }
     if constexpr(VARIANT == 25)
-        AITER_CHECK(t == 192, "post192 requires T=192");
+        AITER_CHECK(t <= 256, "post192 covers at most 16 token tiles (T <= 256)");
     const int blocks = (t + BM - 1) / BM;
     check_tensor(partials,
                  residual,

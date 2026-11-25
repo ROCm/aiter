@@ -58,8 +58,8 @@ _STREAM_VARIANTS = (
     "gfx1250_split10",
     "gfx1250_split14",
     "gfx1250_split3",
-    "mid768",  # gfx950, H=5120: five column splits over 48 token tiles.
-    "post192",  # gfx950, H=5120: register-local post-mix over ten waves.
+    "mid768",  # gfx950, H=5120, T=513..768: five column splits.
+    "post192",  # gfx950, H=5120, T=129..256: register-local post-mix, ten waves.
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -111,9 +111,12 @@ _GFX1250_SPLIT_TABLE = {
 def _select_stream_variant(tokens, hidden=5120):
     if tokens == 0:
         return "generic", 1
-    if tokens == 192 and hidden == 5120:
+    # H=5120 specializations: post192 replaces mid256 over 9..16 token tiles
+    # (no-post shares mid256's kernel), and mid768 replaces mid1024 over
+    # 33..48 tiles, where five splits keep the grid within 240 CUs.
+    if 128 < tokens <= 256 and hidden == 5120:
         return "post192", 16
-    if tokens == 768 and hidden == 5120:
+    if 512 < tokens <= 768 and hidden == 5120:
         return "mid768", 5
     if tokens == 4:
         return "decode4", 32
