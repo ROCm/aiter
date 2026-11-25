@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Aiter adapter for the rebased half-M, raw-DMA FP8 blockscale kernel."""
+"""Aiter adapter for the FlyDSL FP8 blockscale kernels.
+
+IDs 0/1: the gfx950 rebased half-M, raw-DMA kernel (BF16 or FP16 output).
+IDs 2/3: the gfx942 2x4-LDS pf1 kernel ported from PyHIP (BF16 output only).
+"""
 
 import functools
 
@@ -18,9 +22,36 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernels_by_name,
 )
 
+# The FP8 format each kernel's MFMAs read; int8/uint8 are raw storage of it.
+_FP8_DTYPE = {"gfx950": torch.float8_e4m3fn, "gfx942": torch.float8_e4m3fnuz}
 
-def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
-    """Whether this backend can honor the call; tuned dispatch asserts this."""
+
+def check_out_dtype(ki: kernelInstance, dtype: torch.dtype) -> None:
+    """Raise ValueError unless ``ki`` writes ``dtype``: gfx942 writes BF16 only."""
+    if dtype not in tuple(getattr(torch, name) for name in ki.out_dtypes):
+        raise ValueError(
+            f"FlyDSL blockscale kernel {ki.name} writes "
+            f"{' or '.join(ki.out_dtypes)} output, got {dtype}"
+        )
+
+
+def is_supported(
+    XQ: Tensor,
+    WQ: Tensor,
+    Out: Tensor,
+    preshuffle_b: bool,
+    kernel_name: str | None = None,
+) -> bool:
+    """Whether the named kernel can honor the call; tuned dispatch asserts this.
+
+    Without ``kernel_name`` it asks about the gfx950 kernel of this B layout.
+    """
+    if kernel_name is None:
+        ki = kernelInstance(preshuffle_b)
+    else:
+        ki = kernels_by_name.get(kernel_name)
+        if ki is None or ki.preshuffle_b != preshuffle_b:
+            return False
     if XQ.ndim != 2 or WQ.ndim != 2 or Out.ndim != 2:
         return False
     M, K = XQ.shape
@@ -29,13 +60,13 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
         return False
     if not XQ.is_cuda or WQ.device != XQ.device or Out.device != XQ.device:
         return False
-    fp8_storage = (torch.float8_e4m3fn, torch.int8, torch.uint8)
+    fp8_storage = (_FP8_DTYPE[ki.gfx], torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
-    if Out.dtype not in (torch.bfloat16, torch.float16):
+    if Out.dtype not in tuple(getattr(torch, name) for name in ki.out_dtypes):
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
+    return kernel_fits_shape(ki, M, N, K, gfx)
 
 
 def _prepare_scales(
@@ -93,13 +124,23 @@ def _compile_gemm(
     device: torch.device,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
+    ki = kernels_by_name[kernel_name]
+    if ki.gfx == "gfx942":
+        check_out_dtype(ki, out_dtype)
+        from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds_pf1 import (
+            compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1,
+        )
+
+        # PyHIP's own compile hints (no opt_level override), so the kernel
+        # compiles to PyHIP's ISA.
+        return compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, ki.preshuffle_b)
+
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
     # each caches the first typed CompiledFunction it compiles.
-    ki = kernels_by_name[kernel_name]
     launch = compile_gemm_fp8_8wave(
         TILE_M,
         TILE_N,
@@ -111,6 +152,50 @@ def _compile_gemm(
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
     return launch
+
+
+def _aligned(t: Tensor, alignment: int) -> Tensor:
+    return t if t.data_ptr() % alignment == 0 else t.clone()
+
+
+def _launch_gfx942(
+    XQ: Tensor,
+    WQ: Tensor,
+    sa: Tensor,
+    sb: Tensor,
+    out: Tensor,
+    kernel_name: str,
+) -> Tensor:
+    """Launch the gfx942 kernel into contiguous ``out``; returns what it wrote."""
+    import flydsl.expr as fx
+
+    from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+
+    M, K = XQ.shape
+    N = WQ.shape[0]
+    # The kernel takes i32 pointers, loads A and B with 16-byte
+    # buffer_load_dwordx4 at 16-byte offsets from their base and stores four
+    # BF16 per lane with one 8-byte buffer_store_dwordx2. An operand view whose
+    # base breaks that alignment (an offset into a larger buffer) is staged
+    # through a fresh, aligned copy, so every access stays naturally aligned;
+    # the caller copies a staged output back into Out.
+    a = _aligned(XQ.contiguous(), 16)
+    b = _aligned(WQ.contiguous(), 16)
+    if out.data_ptr() % 8:
+        out = torch.empty_like(out)
+    # Pointer ABI, as PyHIP's launcher: i32 elements for A, B and C (the kernel
+    # rebases them per tile in dwords), f32 for the scales.
+    _run_compiled(
+        _compile_gemm.lazy(N, K, kernel_name, XQ.device, out.dtype),
+        ptr_arg(a, fx.Int32),
+        ptr_arg(b, fx.Int32),
+        ptr_arg(out, fx.Int32),
+        ptr_arg(sa, fx.Float32),
+        ptr_arg(sb, fx.Float32),
+        M,
+        current_stream_arg(XQ.device),
+    )
+    return out
 
 
 def run_gemm_a8w8_blockscale(
@@ -126,14 +211,16 @@ def run_gemm_a8w8_blockscale(
 
     Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
-    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output on gfx950.
+    Both use w_scale[ceil(N/128),K/128]. IDs 0/1 write BF16/FP16 on gfx950;
+    IDs 2/3 write BF16 only on gfx942, and FP16 raises ValueError.
     """
     ki = kernels_by_name.get(kernel_name)
     if ki is None:
         raise ValueError(f"Unknown FlyDSL blockscale kernel: {kernel_name!r}")
     if ki.preshuffle_b != preshuffle_b:
         raise ValueError("FlyDSL blockscale kernelName does not match the B layout")
-    if not is_supported(XQ, WQ, Out, preshuffle_b):
+    check_out_dtype(ki, Out.dtype)
+    if not is_supported(XQ, WQ, Out, preshuffle_b, kernel_name):
         raise ValueError("Unsupported gfx, shape or dtype for FlyDSL blockscale")
     if x_scale.device != XQ.device or w_scale.device != XQ.device:
         raise ValueError("FlyDSL blockscale scales must be on the input device")
@@ -145,6 +232,11 @@ def run_gemm_a8w8_blockscale(
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
         out_contiguous = Out.contiguous()
+        if ki.gfx == "gfx942":
+            out_contiguous = _launch_gfx942(XQ, WQ, sa, sb, out_contiguous, kernel_name)
+            if out_contiguous is not Out:
+                Out.copy_(out_contiguous)
+            return Out
         # Every tensor is contiguous and only Out's dtype varies, so the
         # compile arguments determine the launcher's argument signature. The
         # device keeps one launcher per device on the JIT path; on disk the

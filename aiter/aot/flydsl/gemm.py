@@ -31,6 +31,13 @@ are replayed at the smallest M they serve and bisected between the two ends
 where they request different kernels. Either way that also reaches the FlyDSL
 heuristic kernels the runtime falls back to below a shape's smallest tuned M.
 
+FP32-scale blockscale rows (``a8w8_blockscale[_bpreshuffle]_tuned_gemm``)
+name a kernel of ``ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py``:
+``flydsl_blockscale_8w_*`` (gfx950, kernelId 0/1, BF16 or FP16 output, K % 256
+== 0) or ``flydsl_blockscale_gfx942_2x4_lds_pf1_*`` (gfx942, kernelId 2/3, BF16
+output only, N % 16 == 0, K % 128 == 0, any M). Each row is replayed for every
+output dtype its kernel writes.
+
 Rows are replayed for the arch their ``gfx`` column names (``cu_num`` for
 legacy rows); with ``GPU_ARCHS`` naming targets, only those archs. The
 runtime reads the tables the replay processes point it at: the ``--csv``
@@ -457,10 +464,11 @@ def _variants(table: Table, job: dict, flydsl: bool) -> list[dict]:
     blockscale GEMM, which pairs with the weight's (1x128 blockscale with
     128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones), the output
     dtype of an FP32-scale blockscale GEMM, whose rows serve bf16 and fp16
-    alike and whose FlyDSL kernels specialize on it, and the fused output
-    quant of a batched GEMM. That entry runs FlyDSL at every row, ``flydsl``
-    (one the table's own entry runs with FlyDSL) or not; any other row has
-    no variant."""
+    alike and whose FlyDSL kernels specialize on it -- except the gfx942
+    kernel's, which write bf16 only and whose fp16 calls the runtime refuses --
+    and the fused output quant of a batched GEMM. That entry runs FlyDSL at
+    every row, ``flydsl`` (one the table's own entry runs with FlyDSL) or not;
+    any other row has no variant."""
     if table.caller is _batched_a8w8_mxscale_bpreshuffle:
         return ([{}] if flydsl else []) + [{"fused_quant": True}]
     if not flydsl:
@@ -469,7 +477,13 @@ def _variants(table: Table, job: dict, flydsl: bool) -> list[dict]:
         _, cols = _blocks(job["w_scale_block"], "128x128")
         return [{"x_block": 128 if cols == 128 else 32}]
     if table.caller in (_a8w8_blockscale, _a8w8_blockscale_bpreshuffle):
-        return [{"outdtype": f"torch.{name}"} for name in ("bfloat16", "float16")]
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+            kernels_by_name,
+        )
+
+        kernel = kernels_by_name.get(job["kernel_name"])
+        names = kernel.out_dtypes if kernel else ("bfloat16", "float16")
+        return [{"outdtype": f"torch.{name}"} for name in names]
     return [{}]
 
 
