@@ -22,7 +22,11 @@ from .kernels.index_score_prefill_nvfp4_gfx1250 import (
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 
-def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
+def nvfp4_index_inputs_supported(idx_q, payload, scale) -> bool:
+    """What the gfx1250 index scorers (prefill and decode) share: a bf16 query
+    ``[rows, heads, 128]`` and the NVFP4 index cache as two byte views with
+    whole contiguous rows (the scales uint8 or an FP8 dtype), the payload pages
+    16 B apart."""
     return (
         get_gfx_runtime() == "gfx1250"
         and idx_q.dim() == 3
@@ -32,9 +36,16 @@ def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
         and payload.dtype == torch.uint8
         and payload.shape[1:] == (PAGE, HEAD_DIM // 2)
         and payload.stride()[1:] == (HEAD_DIM // 2, 1)
+        and scale.element_size() == 1
         and scale.shape[1:] == (PAGE, HEAD_DIM // 16)
         and scale.stride()[1:] == (HEAD_DIM // 16, 1)
         and payload.stride(0) % 16 == 0
+    )
+
+
+def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
+    return (
+        nvfp4_index_inputs_supported(idx_q, payload, scale)
         and scale.stride(0) % 16 == 0
     )
 
@@ -69,12 +80,19 @@ def index_score_prefill_nvfp4(
     assert score.shape[0] == heads and score.dtype == torch.float32
     if total_q == 0 or batch == 0:
         return
+    if waves < 2:
+        # Wave 0 copies a page's payload and wave 1 its scales: with one wave
+        # the scales never arrive.
+        raise ValueError(f"index_score_prefill_nvfp4 needs waves >= 2, got {waves}")
     if lds_scores:
         chunk_blocks = min(chunk_blocks, CHUNK_MAX)
     q_tiles = (max_query_len + block_q - 1) // block_q
     chunks = (max_block + chunk_blocks - 1) // chunk_blocks
     compiled = compile_index_score_prefill_nvfp4(
-        block_q=block_q, waves=waves, ring=ring, chunk_max=CHUNK_MAX if lds_scores else 0
+        block_q=block_q,
+        waves=waves,
+        ring=ring,
+        chunk_max=CHUNK_MAX if lds_scores else 0,
     )
     dev = idx_q.device
     _run_compiled(
