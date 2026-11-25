@@ -624,6 +624,46 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
     return selected_splitk, tile_m, tile_n, selected_tile_k
 
 
+# gfx950, 256 CUs: settings of the fused post+pre GEMM for the decode and mixed row
+# counts at which another setting than the computed one measured faster on MI350X,
+# with the inputs in cache and with rotating inputs. The computed setting is the one
+# of _mhc_fused_config_gfx950_256, for FP32 fn with the tile_m of
+# _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256. Keyed by (hidden_size, w_preshuffle_bf16);
+# a row is (first m, last m, split_k, tile_m, tile_k) and tile_n is 32. Row counts in
+# no row keep the computed setting. No row overlaps a row of
+# MHC_GRAM_CONFIG_GFX950_256: the default call with fused RMSNorm takes the Gram
+# route at those row counts and never asks for a setting of the fused GEMM.
+MHC_FUSED_DECODE_CONFIG_GFX950_256 = {
+    (4096, True): (
+        (625, 768, 32, 32, 64),
+        (769, 992, 16, 32, 64),
+    ),
+    (7168, False): (
+        (705, 768, 32, 32, 32),
+        (775, 864, 28, 32, 32),
+        (865, 1023, 16, 32, 32),
+    ),
+    (7168, True): (
+        (353, 416, 56, 32, 64),
+        (417, 464, 16, 32, 32),
+        (513, 576, 28, 32, 64),
+        (641, 864, 28, 32, 64),
+        (865, 1023, 16, 32, 64),
+    ),
+}
+
+
+def _mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16):
+    """(split_k, tile_m, tile_n, tile_k) of MHC_FUSED_DECODE_CONFIG_GFX950_256 for m
+    rows, or None where the computed setting is kept."""
+    key = (hidden_size, bool(w_preshuffle_bf16))
+    rows = MHC_FUSED_DECODE_CONFIG_GFX950_256.get(key, ())
+    for m_first, m_last, split_k, tile_m, tile_k in rows:
+        if m_first <= m <= m_last:
+            return split_k, tile_m, 32, tile_k
+    return None
+
+
 # Per-chip tuned config registry, keyed by (gfx_arch, cu_num).
 # Each entry: (m, hidden_size, num_cu) -> (splitk, tile_m, tile_n, tile_k).
 _MHC_FUSED_POST_PRE_CONFIG = {
@@ -655,8 +695,9 @@ def get_mhc_fused_post_pre_config(
     """Select (split_k, tile_m, tile_n, tile_k) for the fused post+pre GEMM.
 
     Looks up a per-chip tuned policy keyed by (gfx_arch, cu_num); falls back to a
-    conservative default for untuned chips. Packed BF16 with shuffled residuals
-    has separate GEMM + reduction tuning. K = hidden_size per stream.
+    conservative default for untuned chips. On gfx950 with 256 CUs the measured rows
+    of MHC_FUSED_DECODE_CONFIG_GFX950_256 come first. Packed BF16 with shuffled
+    residuals has separate GEMM + reduction tuning. K = hidden_size per stream.
     """
     num_cu = get_cu_num()
     try:
@@ -668,6 +709,10 @@ def get_mhc_fused_post_pre_config(
         prefill = _mhc_fused_prefill_config_gfx950_256(m, hidden_size)
         if prefill is not None:
             return prefill
+    if (arch, num_cu) == ("gfx950", 256) and not res_preshuffle:
+        decode = _mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+        if decode is not None:
+            return decode
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
     if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:

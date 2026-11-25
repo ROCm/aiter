@@ -662,7 +662,7 @@ def _check_large_m_edges(
     """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
+    from aiter.ops.flydsl.kernels.tensor_shim import torch_stream
 
     tokens = x.shape[0]
     # A zero-input call first, so a quant buffer reused on the current stream holds other data.
@@ -737,7 +737,7 @@ def _check_large_m_edges(
     slot_refusal = "PASS" if len(refusals) == 5 else "RANGE-ONLY"
     # A null stream handle is the default stream, not a new one the persistent kernel never waits on.
     if any(
-        _torch_stream(s) != torch.cuda.default_stream() for s in (0, fx.Stream(None))
+        torch_stream(s) != torch.cuda.default_stream() for s in (0, fx.Stream(None))
     ):
         raise AssertionError("a null stream handle did not map to the default stream")
     null_output = _fwd(moe, x, weights, ids, stream=fx.Stream(None))[:tokens]

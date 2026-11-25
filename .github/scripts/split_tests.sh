@@ -73,6 +73,12 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_tuner_infra.py" \
                 "tests/test_flydsl_aot_cache.py" \
                 "tests/test_flydsl_aot_launch.py"
+            # aiter.moev2's regression suite: legacy against v2 on simulated arches,
+            # needing the built package but no particular GPU (aiter_test.sh runs
+            # tests/ through pytest). aiter.moev2 is under development (not graduated):
+            # coordinate changes with its owners (@qli88), see aiter/moev2/README.md.
+            find tests -maxdepth 1 -type f \
+                \( -name 'test_moev2_*.py' -o -name 'test_moe_dispatch_snapshot.py' \)
         } | LC_ALL=C sort -u
     )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
