@@ -64,6 +64,59 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(config["libtype"], "torch")
 
 
+class TestBorrowedFlydslTdmRow(unittest.TestCase):
+    def _lookup(self, policy, gfx, m=128, row_arch="gfx1250", libtype="flydsl"):
+        row = {"libtype": libtype, "solidx": -1, "splitK": 1, "kernelName": "fixture"}
+        key = (row_arch, 256, 128, 163840, 7168, False, BF16, BF16, False, False)
+        catalog = mock.Mock()
+        catalog.TDM_POLICIES = ("tdm", "tdmi", "tdma", "tdmia")
+        catalog.get_flydsl_hgemm_kernel_params.return_value = {"policy": policy}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: catalog),
+            mock.patch.object(
+                tuned,
+                "get_padded_m",
+                lambda value, _n, _k, gl: (
+                    (value + 15) // 16 * 16
+                    if gl == 0
+                    else 1 << (value - 1).bit_length()
+                ),
+            ),
+        ):
+            actual = tuned.get_GEMM_A16W16_tuned_config(
+                m, 163840, 7168, False, BF16, BF16, False, False, gfx, 256
+            )
+        return actual, row
+
+    def test_borrowed_tdm_keeps_strict_fallback(self):
+        for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+            for m in (65, 112, 113, 127, 128):
+                with self.subTest(policy=policy, m=m):
+                    actual, _ = self._lookup(policy, "gfx1250-strict", m)
+                    self.assertIsNone(actual)
+
+    def test_exact_gfx1250_keeps_tdm_selection(self):
+        for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+            for m in (65, 112, 113, 127, 128):
+                with self.subTest(policy=policy, m=m):
+                    actual, row = self._lookup(policy, "gfx1250", m)
+                    self.assertEqual(actual, row)
+
+    def test_other_borrowed_rows_and_exact_strict_rows_are_preserved(self):
+        for policy, libtype, row_arch in (
+            ("ft", "flydsl", "gfx1250"),
+            ("ht", "flydsl", "gfx1250"),
+            (None, "triton", "gfx1250"),
+            (None, "triton", "gfx1250-strict"),
+        ):
+            with self.subTest(policy=policy, libtype=libtype, row_arch=row_arch):
+                actual, row = self._lookup(
+                    policy, "gfx1250-strict", row_arch=row_arch, libtype=libtype
+                )
+                self.assertEqual(actual, row)
+
+
 class TestGfx1250StrictOpusRow(unittest.TestCase):
     """A gfx1250-strict device reuses gfx1250 rows, but OPUS dispatch keeps
     the strict id, so a row is only usable if that dispatch accepts it."""
