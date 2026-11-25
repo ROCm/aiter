@@ -5736,9 +5736,11 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
-    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
-    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping runs only in CK stage 1 (in its non-split epilogue, or
+    # in silu_and_mul after a per_1x128 split-K reduction) and, for gfx942
+    # per-token FP8, in the FlyDSL backend. Apart from those FlyDSL rows, tuned
+    # rows are kept only for non-split CK SiLU kernels, so ASM 1-stage, split-K
+    # and other FlyDSL whole-graph rows are rejected before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
@@ -6079,8 +6081,10 @@ def get_2stage_cfgs(
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     if clamp_silu_limit:
-        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
-        ksplit = 0
+        # Only per_1x128 has a CK split-K stage 1 that clamps after the reduction
+        # (ck_moe_stage1); the other clamped types run non-split.
+        if q_type != QuantType.per_1x128:
+            ksplit = 0
         run_1stage = False
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
@@ -7309,6 +7313,14 @@ def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
         return torch_act(gate) * up
 
 
+def _silu_and_mul_limit(swiglu_limit):
+    # silu_and_mul takes a float32 limit, 0.0 = no clamp. Keep a positive limit
+    # from narrowing to 0 or inf, like the CK launcher does.
+    if not swiglu_limit:
+        return 0.0
+    return min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+
+
 def asm_stage1(
     input,
     w1,
@@ -7375,14 +7387,9 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            # silu_and_mul takes a float32 limit. Keep a positive limit from
-            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
-            limit = (
-                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
-                if swiglu_limit
-                else 0.0
+            aiter.silu_and_mul(
+                out, tmp_out.view(dtypes.fp32), _silu_and_mul_limit(swiglu_limit)
             )
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
@@ -7814,7 +7821,11 @@ def ck_moe_stage1(
                 raise ValueError(
                     "Runtime SiLU clamp requires a non-split CK SiLU kernel"
                 )
-            splitk = 0
+            # A named kernel runs non-split and clamps in its epilogue. An unnamed
+            # per_1x128 split-K launch writes raw fp32 gate|up, clamped by
+            # silu_and_mul after the reduction below.
+            if kernelName:
+                splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
@@ -7844,12 +7855,14 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        limit,
+        None if is_splitk else limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.silu_and_mul(
+                out, valid_out.view(dtypes.fp32), _silu_and_mul_limit(limit)
+            )
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
