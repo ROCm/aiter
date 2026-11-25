@@ -655,6 +655,32 @@ def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
         assert aot_cache._env_in_fingerprint(name), name
 
 
+def test_fingerprint_covers_the_lds_capacity_table(monkeypatch, tmp_path):
+    from aiter.jit.utils import lds_capacity
+    from aiter.ops.flydsl import aot_cache
+
+    # Kernels size their LDS tiles by this per-arch table, which is outside
+    # aiter/ops/flydsl: no cache declares it, so the fingerprint holds it.
+    before = aot_cache.fingerprint()
+    table = Path(lds_capacity.__file__).read_text()
+    edited = tmp_path / "lds_capacity.py"
+    edited.write_text(table + '\n_LDS_CAPACITY_BYTES["gfx950"] //= 2\n')
+    monkeypatch.setattr(lds_capacity, "__file__", str(edited))
+    assert aot_cache.fingerprint() != before
+
+
+def test_fingerprint_covers_the_cus_per_xcd(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import aot_cache
+
+    # compile_4wave_gemm derives its XCD count from the CU count with it.
+    before = aot_cache.fingerprint()
+    monkeypatch.setattr(
+        chip_info, "_CDNA4_CUS_PER_XCD", chip_info._CDNA4_CUS_PER_XCD * 2
+    )
+    assert aot_cache.fingerprint() != before
+
+
 @pytest.mark.skipif(
     os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
     reason="mode 0 returns the factory itself",

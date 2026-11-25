@@ -187,6 +187,11 @@ source:
 - the CU count, `chip_info.get_cu_num()`. It honours `CU_NUM`, which the AOT
   dry run sets from each tuned row's `cu_num`, so a prebuild for a CU count
   and a process on such a GPU use the same directory;
+- the per-arch hardware tables kernels size themselves by: the LDS capacity
+  table, `aiter/jit/utils/lds_capacity.py` (`chip_info.get_lds_capacity_bytes`),
+  and the CDNA4 CUs per XCD (`chip_info.get_cdna4_num_xcds`). They are
+  outside `aiter/ops/flydsl`, where the source check of a cache does not
+  look;
 - every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
   `HSA_OVERRIDE_GFX_VERSION`, `COMPILE_OPT_LEVEL` and the variables FlyDSL
   keys its own artifact cache on without that prefix
