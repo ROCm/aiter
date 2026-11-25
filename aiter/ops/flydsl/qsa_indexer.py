@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Derived from tingqli/pyhip QSA (MIT), revision 8027faad29415747707670db7776528c6b72db81.
 """Workspace planning and selection for the gfx942 QSA indexer."""
 
 import math

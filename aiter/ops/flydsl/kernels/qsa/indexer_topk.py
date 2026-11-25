@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Derived from tingqli/pyhip QSA (MIT), revision 8027faad29415747707670db7776528c6b72db81.
 
 """Exact per-row top-512 of QSA indexer logits for gfx942 (FlyDSL), expanded to request-local token ids.
 
