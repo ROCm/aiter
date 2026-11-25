@@ -103,7 +103,7 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 # HEAD generic path uses `barrier`; a16w4 uses `_barrier`.
 barrier = _barrier
 
-# Trace-time hooks for devb_fused_s12.py, which traces the stage-1 and stage-2
+# Trace-time hooks for moe_fused_s12.py, which traces the stage-1 and stage-2
 # bodies below into one kernel. All are empty for the normal launches:
 #   "bid", "grid": {"x": ..., "y": ...} used instead of gpu.block_id / grid_dim;
 #   "wt": stage-1 FP8 rows and sorted e8m0 scales are stored write-through at
@@ -111,28 +111,28 @@ barrier = _barrier
 #   "s1_done": fn(sort_block, blk_valid, exp_valid) after a stage-1 tile;
 #   "s2_wait" / "s2_done": the same, before / after a stage-2 tile's body;
 #   "alloc": the fused kernel's SharedAllocator (one per kernel).
-_DEVB = {}
+_FUSED_S12_HOOKS = {}
 # id(launcher) -> body, grid and build data of a stage-1 / stage-2 build
-_DEVB_BUILT = {}
+_FUSED_S12_BUILT = {}
 
 
 def _block_id(axis):
-    bid = _DEVB.get("bid")
+    bid = _FUSED_S12_HOOKS.get("bid")
     return gpu.block_id(axis) if bid is None else bid[axis]
 
 
 def _grid_dim(axis):
-    grid = _DEVB.get("grid")
+    grid = _FUSED_S12_HOOKS.get("grid")
     return getattr(gpu.grid_dim, axis) if grid is None else grid[axis]
 
 
 def _shared_allocator():
-    alloc = _DEVB.get("alloc")
+    alloc = _FUSED_S12_HOOKS.get("alloc")
     return fx.SharedAllocator() if alloc is None else alloc
 
 
 def _s1_fp8_store(ptr, value):
-    if _DEVB.get("wt"):
+    if _FUSED_S12_HOOKS.get("wt"):
         # agent-scope atomic store = global_store with sc1 on gfx950 (write-through)
         fx.generic_store(
             ptr, value, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
@@ -184,24 +184,24 @@ def compile_mixed_moe_gemm1_common(
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
 
-    fp8_exact (None: env AITER_DEVB_S1FP8_EXACT=1): the FP8 epilogue quantizes like
+    fp8_exact (None: env AITER_MOE_S1_FP8_EXACT=1): the FP8 epilogue quantizes like
     the bf16 output followed by fused_dynamic_mxfp8_quant_moe_sort (values rounded
     to bf16, amax floored at 1e-10, e8m0 = ceil_pow2(amax / 448)), so its MXFP8
     codes and scales equal the two-kernel path bit for bit.
     """
     if fp8_exact is None:
         # Builds with an xcd_swizzle get the exact rule only if listed in
-        # AITER_DEVB_S1FP8_EXACT_KEYS ("<tile_m>/<waves_per_eu>/<xcd_swizzle>,...").
+        # AITER_MOE_S1_FP8_EXACT_KEYS ("<tile_m>/<waves_per_eu>/<xcd_swizzle>,...").
         # No new local names here: the locals below are this build's arguments.
-        fp8_exact = os.environ.get("AITER_DEVB_S1FP8_EXACT", "0") == "1" and (
+        fp8_exact = os.environ.get("AITER_MOE_S1_FP8_EXACT", "0") == "1" and (
             xcd_swizzle == 0
             or f"{tile_m}/{waves_per_eu}/{xcd_swizzle}"
             in [
                 k.strip()
-                for k in os.environ.get("AITER_DEVB_S1FP8_EXACT_KEYS", "").split(",")
+                for k in os.environ.get("AITER_MOE_S1_FP8_EXACT_KEYS", "").split(",")
             ]
         )
-    _devb_kwargs = dict(locals())  # the build arguments, to rebuild the body
+    _fused_s12_kwargs = dict(locals())  # the build arguments, to rebuild the body
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -2425,7 +2425,9 @@ def compile_mixed_moe_gemm1_common(
                                     sorted_scale_rsrc,
                                     byte_off,
                                     offset_is_bytes=True,
-                                    cache_modifier=16 if _DEVB.get("wt") else 0,
+                                    cache_modifier=(
+                                        16 if _FUSED_S12_HOOKS.get("wt") else 0
+                                    ),
                                 )
 
                             @flyc.jit
@@ -2709,8 +2711,8 @@ def compile_mixed_moe_gemm1_common(
                     )
                 _gemm1_dispatch()
                 gpu.barrier()
-                if const_expr("s1_done" in _DEVB):
-                    _DEVB["s1_done"](bx, blk_valid, exp_valid)
+                if const_expr("s1_done" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s1_done"](bx, blk_valid, exp_valid)
 
             c0_p = fx.Index(0)
             c1_p = fx.Index(1)
@@ -3055,7 +3057,7 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
-    _DEVB_BUILT[id(launch_mixed_moe_gemm1)] = {
+    _FUSED_S12_BUILT[id(launch_mixed_moe_gemm1)] = {
         "emit": _emit_moe_gemm1,
         "grid": _grid1,
         "module_name": module_name,
@@ -3066,7 +3068,7 @@ def compile_mixed_moe_gemm1_common(
         "sort_block_m": sort_block_m,
         "need_fp8": need_fp8,
         "v2_output_layout": v2_output_layout,
-        "kwargs": _devb_kwargs,
+        "kwargs": _fused_s12_kwargs,
         "lds_bytes": pong_field_bytes + ping_field_bytes,
     }
     return launch_mixed_moe_gemm1
@@ -4938,8 +4940,8 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     guard = blk_valid & (exp_valid & tile_has_tokens)
 
-                if const_expr("s2_wait" in _DEVB):
-                    _DEVB["s2_wait"](sort_blk, blk_valid, exp_valid)
+                if const_expr("s2_wait" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s2_wait"](sort_blk, blk_valid, exp_valid)
 
                 @flyc.jit
                 def _gemm2_valid_dispatch():
@@ -4948,8 +4950,8 @@ def compile_mixed_moe_gemm2_common(
 
                 _gemm2_valid_dispatch()
                 gpu.barrier()
-                if const_expr("s2_done" in _DEVB):
-                    _DEVB["s2_done"](sort_blk, blk_valid, exp_valid)
+                if const_expr("s2_done" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s2_done"](sort_blk, blk_valid, exp_valid)
                 return [cur_active] if persistent else [expert_i32, expert_b_base]
 
             @flyc.jit
@@ -5210,7 +5212,7 @@ def compile_mixed_moe_gemm2_common(
                 stream,
             )
 
-    _DEVB_BUILT[id(launch_mixed_moe_gemm2)] = {
+    _FUSED_S12_BUILT[id(launch_mixed_moe_gemm2)] = {
         "emit": _emit_moe_gemm2,
         "module_name": module_name,
         "tile_m": tile_m,
@@ -5226,11 +5228,11 @@ def compile_mixed_moe_gemm2_common(
     return launch_mixed_moe_gemm2
 
 
-# AITER_DEVB_FUSED_S12=1: every fusable stage-1 + stage-2 pair of a fused_moe
-# call runs as one launch (devb_fused_s12.py).
-if os.environ.get("AITER_DEVB_FUSED_S12", "0") == "1":
-    from aiter.ops.flydsl.kernels import devb_fused_s12 as _devb_fused_s12
+# AITER_MOE_FUSED_S12=1: every fusable stage-1 + stage-2 pair of a fused_moe
+# call runs as one launch (moe_fused_s12.py).
+if os.environ.get("AITER_MOE_FUSED_S12", "0") == "1":
+    from aiter.ops.flydsl.kernels import moe_fused_s12 as _moe_fused_s12
 
-    # else devb_fused_s12 is being imported first and installs itself at its end
-    if hasattr(_devb_fused_s12, "install"):
-        _devb_fused_s12.install()
+    # else moe_fused_s12 is being imported first and installs itself at its end
+    if hasattr(_moe_fused_s12, "install"):
+        _moe_fused_s12.install()

@@ -12,7 +12,7 @@ the two-kernel path). Stage 2 is one of:
   * AITER's v2-layout stage-2 tile (`flydsl_moe2_layout_*`, emitted through
     `compile_gemm2_a4w4_port(_composition=)`; stage 1 writes the intermediate in
     sorted rows), kernel `fused_v2`.
-Uses the trace-time hooks `_DEVB`, `_DEVB_BUILT` of `mixed_moe_gemm_2stage_common.py`.
+Uses the trace-time hooks `_FUSED_S12_HOOKS`, `_FUSED_S12_BUILT` of `mixed_moe_gemm_2stage_common.py`.
 
 Grid (1-D): workgroups [0, N1) are stage-1 tiles in AITER's order (sort block =
 wg // gx1, N tile = wg % gx1); the rest are stage-2 tiles in the stage-2 kernel's
@@ -30,8 +30,8 @@ of a block before the block's counter is complete, and kernel start leaves no st
 copy in L2. A wait gives up after SPIN_MAX polls and counts the event in the
 workspace error word (`errors()`); that would be a bug, never expected.
 
-Use: `with devb_fused_s12.enabled(): aiter.fused_moe(...)` (op tests), or
-`install()` for a whole process (serving, env AITER_DEVB_FUSED_S12=1), with `_fp8`
+Use: `with moe_fused_s12.enabled(): aiter.fused_moe(...)` (op tests), or
+`install()` for a whole process (serving, env AITER_MOE_FUSED_S12=1), with `_fp8`
 stage-1 rows (mixed stage 2) or v2-layout stage-2 rows. The stage-1 launch of a
 fused_moe call is held back and launched together with the stage-2 launch of the
 same call; the reduction kernel after stage 2 is unchanged. Calls on one stream
@@ -69,9 +69,9 @@ ERR_OFF = MAX_BLOCKS * STRIDE  # byte offset of the error word
 WS_INTS = (ERR_OFF + STRIDE) // 4
 SPIN_MAX = 1 << 22
 # workgroups per CU the fused kernel's LDS allows
-OCC = int(os.environ.get("DEVB_FUSED_OCC", "3"))
+OCC = int(os.environ.get("AITER_MOE_FUSED_S12_OCC", "3"))
 # fuse calls of at most this many tokens
-MAX_ROWS = int(os.environ.get("DEVB_FUSED_MAX_ROWS", "512"))
+MAX_ROWS = int(os.environ.get("AITER_MOE_FUSED_S12_MAX_ROWS", "512"))
 G2_KEY = (
     "BM",
     "BN",
@@ -224,7 +224,7 @@ def _s1_candidate(m1):
 
 
 def fusable(exe1, exe2):
-    m1, m2 = C._DEVB_BUILT.get(id(exe1)), C._DEVB_BUILT.get(id(exe2))
+    m1, m2 = C._FUSED_S12_BUILT.get(id(exe1)), C._FUSED_S12_BUILT.get(id(exe2))
     return (
         _s1_candidate(m1)
         and not m1["v2_output_layout"]
@@ -246,7 +246,7 @@ def _g2_key(launch):
 
 
 def fusable_v2(exe1, launch2):
-    m1, key = C._DEVB_BUILT.get(id(exe1)), _g2_key(launch2)
+    m1, key = C._FUSED_S12_BUILT.get(id(exe1)), _g2_key(launch2)
     if not (_s1_candidate(m1) and m1["v2_output_layout"] and key is not None):
         return False
     k = dict(zip(G2_KEY, key))
@@ -267,13 +267,15 @@ def _stage1_body(m1, occ):
     Also returns the LDS size that allows `occ` workgroups per CU.
     """
     exe1 = C.compile_mixed_moe_gemm1_common(**{**m1["kwargs"], "waves_per_eu": None})
-    return C._DEVB_BUILT[id(exe1)], (160 * 1024 // (occ + 1) + 16 if occ > 0 else 0)
+    return C._FUSED_S12_BUILT[id(exe1)], (
+        160 * 1024 // (occ + 1) + 16 if occ > 0 else 0
+    )
 
 
 @functools.cache
 def _build(id1, id2, occ):
-    m1, lds_target = _stage1_body(C._DEVB_BUILT[id1], occ)
-    m2 = C._DEVB_BUILT[id2]
+    m1, lds_target = _stage1_body(C._FUSED_S12_BUILT[id1], occ)
+    m2 = C._FUSED_S12_BUILT[id2]
     emit1, grid1, emit2 = m1["emit"], m1["grid"], m2["emit"]
     tile_n2, pad2 = m2["tile_n"], m2["model_dim_pad"]
     # module names omit some build knobs (e.g. b_nt), so the tag carries the
@@ -286,7 +288,7 @@ def _build(id1, id2, occ):
         m2["module_name"],
         m2["lds_bytes"],
     )
-    name = "devb_fused_s12_" + hashlib.md5(repr(cache_tag).encode()).hexdigest()[:12]
+    name = "moe_fused_s12_" + hashlib.md5(repr(cache_tag).encode()).hexdigest()[:12]
 
     def grids(i1_inter, i1_nblk, i2_n, i2_nblk):
         gx1, gy1 = (fx.Index(g) for g in grid1(i1_inter, i1_nblk))
@@ -349,8 +351,8 @@ def _build(id1, id2, occ):
         alloc = fx.SharedAllocator(static=False)
         lds_hi = [0]
         if bid < n1:
-            C._DEVB.clear()
-            C._DEVB.update(
+            C._FUSED_S12_HOOKS.clear()
+            C._FUSED_S12_HOOKS.update(
                 bid={"x": bid % gx1, "y": bid // gx1},
                 grid={"x": gx1, "y": gy1},
                 wt=True,
@@ -381,12 +383,12 @@ def _build(id1, id2, occ):
                 f1_lbr,
                 f1_lim,
             )
-            C._DEVB.clear()
+            C._FUSED_S12_HOOKS.clear()
             _lds_rewind(alloc, lds_hi, False)
         else:
             r = bid - n1
-            C._DEVB.clear()
-            C._DEVB.update(
+            C._FUSED_S12_HOOKS.clear()
+            C._FUSED_S12_HOOKS.update(
                 bid={"x": r % gx2, "y": r // gx2},
                 s2_wait=s2_wait,
                 s2_done=s2_done,
@@ -411,7 +413,7 @@ def _build(id1, id2, occ):
                 i2_k,
                 i2_nblk,
             )
-            C._DEVB.clear()
+            C._FUSED_S12_HOOKS.clear()
             _lds_rewind(alloc, lds_hi, True, lds_target)
 
     @flyc.jit
@@ -516,7 +518,7 @@ class _Composed:
 
 @functools.cache
 def _build_v2(id1, key2, occ):
-    m1, lds_target = _stage1_body(C._DEVB_BUILT[id1], occ)
+    m1, lds_target = _stage1_body(C._FUSED_S12_BUILT[id1], occ)
     k = dict(zip(G2_KEY, key2))
     comp = mxd.compile_gemm2_a4w4_port(
         BM=k["BM"],
@@ -556,7 +558,7 @@ def _build_v2(id1, key2, occ):
         repr(sorted(m1["kwargs"].items())),
         comp.module_name,
     )
-    name = "devb_fused_s12v2_" + hashlib.md5(repr(cache_tag).encode()).hexdigest()[:12]
+    name = "moe_fused_s12v2_" + hashlib.md5(repr(cache_tag).encode()).hexdigest()[:12]
 
     def tile_of(r, total_m, num_n):
         if gnum > 0:  # the standalone kernel's spatially-local tile order
@@ -614,8 +616,8 @@ def _build_v2(id1, key2, occ):
         alloc = fx.SharedAllocator(static=False)
         lds_hi = [0]
         if bid < n1:
-            C._DEVB.clear()
-            C._DEVB.update(
+            C._FUSED_S12_HOOKS.clear()
+            C._FUSED_S12_HOOKS.update(
                 bid={"x": bid % gx1, "y": bid // gx1},
                 grid={"x": gx1, "y": gy1},
                 wt=True,
@@ -646,7 +648,7 @@ def _build_v2(id1, key2, occ):
                 f1_lbr,
                 f1_lim,
             )
-            C._DEVB.clear()
+            C._FUSED_S12_HOOKS.clear()
             _lds_rewind(alloc, lds_hi, False)
         else:
             lds = _allocate(alloc, storage2)
@@ -800,7 +802,7 @@ def _count(key, what=None):
     # one line per kernel and process: proof of use in server logs
     if what is not None and what not in _announced:
         _announced.add(what)
-        print(f"[devb_fused_s12] {key}: {what}", file=sys.stderr, flush=True)
+        print(f"[moe_fused_s12] {key}: {what}", file=sys.stderr, flush=True)
 
 
 def _flush():
@@ -820,7 +822,7 @@ def _mk_hook(exe, args):
     # args[11]: tokens
     if (
         pend is None
-        and _s1_candidate(C._DEVB_BUILT.get(id(exe)))
+        and _s1_candidate(C._FUSED_S12_BUILT.get(id(exe)))
         and args[11] <= MAX_ROWS
     ):
         _tls.pend = (exe, args)
@@ -834,7 +836,7 @@ def _mk_hook(exe, args):
             )
             _count(
                 "fused",
-                f"{C._DEVB_BUILT[id(pend[0])]['module_name']} + {C._DEVB_BUILT[id(exe)]['module_name']}"
+                f"{C._FUSED_S12_BUILT[id(pend[0])]['module_name']} + {C._FUSED_S12_BUILT[id(exe)]['module_name']}"
                 f" occ {OCC}",
             )
             return None
@@ -861,7 +863,7 @@ def _mxd_hook(launch, *args, **kw):
             )
             _count(
                 "fused_v2",
-                f"{C._DEVB_BUILT[id(pend[0])]['module_name']} + v2 {_g2_key(launch)} occ {OCC}",
+                f"{C._FUSED_S12_BUILT[id(pend[0])]['module_name']} + v2 {_g2_key(launch)} occ {OCC}",
             )
             return None
     _flush()
@@ -869,7 +871,7 @@ def _mxd_hook(launch, *args, **kw):
 
 
 def install():
-    """For serving (env AITER_DEVB_FUSED_S12=1): fuse for the whole process."""
+    """For serving (env AITER_MOE_FUSED_S12=1): fuse for the whole process."""
     first = mk._run_compiled is not _mk_hook
     mk._run_compiled = _mk_hook
     mxd.run_compiled = _mxd_hook
@@ -883,7 +885,7 @@ def install():
         workspace()
     if first:
         print(
-            f"[devb_fused_s12] installed: occ {OCC}, max rows {MAX_ROWS}",
+            f"[moe_fused_s12] installed: occ {OCC}, max rows {MAX_ROWS}",
             file=sys.stderr,
             flush=True,
         )
@@ -909,5 +911,5 @@ def stats():
     return {k: getattr(_tls, k, 0) for k in ("fused", "fused_v2", "unfused")}
 
 
-if os.environ.get("AITER_DEVB_FUSED_S12", "0") == "1":
+if os.environ.get("AITER_MOE_FUSED_S12", "0") == "1":
     install()
