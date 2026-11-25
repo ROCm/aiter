@@ -544,7 +544,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="comma-separated FlyDSL policies to keep in the candidate catalog "
-            "(ft,ht,hti,sk,bs,rk,...); default keeps all. Narrows the sweep, e.g. at "
+            "(ft,ht,hti,sk,bs,rg,rk,...); default keeps all. Narrows the sweep, e.g. at "
             "large K where the full ft/ht catalog has ~10^4 candidates per shape.",
         )
         self.parser.add_argument(
