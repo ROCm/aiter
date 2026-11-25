@@ -39,6 +39,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
     auto dtype_str = AiterDtype_to_str(topk_ids.dtype());
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
+    // the sorted ids keep the topk slot in 8 bits
+    AITER_CHECK(topk <= 256, "moe_sorting_opus: topk ", topk, " is not supported (max 256)");
 
     if(local_topk_ids.has_value())
     {
