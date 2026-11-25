@@ -354,6 +354,97 @@ def _launch_v2_tails(ws: CascadeWorkspace, key_cache, value_cache, softmax_scale
     )
 
 
+def _launch_v2_staging_kernels(
+    ws,
+    key_cache,
+    value_cache,
+    q_gather,
+    tables,
+    lens,
+    out_s,
+    p_max,
+    p_sum,
+    p_out,
+    softmax_scale,
+):
+    """v2 tile + reduce kernels into resident staging (no per-call scratch).
+
+    Bit-identical to ``paged_attn_decode_v2`` for the GQA shapes cascade
+    uses (verified by an equality test): only the wrapper's per-call
+    ``exp_sums``/``max_logits``/``tmp_output`` allocations are replaced
+    with resident workspace buffers.
+    """
+    from aiter.ops.triton._triton_kernels.attention.pa_decode import (
+        _paged_attn_decode_v2_w_dot_kernel,
+        _paged_attn_decode_v2_w_dot_reduce_kernel,
+    )
+    from aiter.ops.triton.attention.pa_decode import _get_launch_config
+    import triton.language as tl
+
+    group = ws.num_q_heads // ws.num_kv_heads
+    parts = ws.b_partitions
+    n_rows = q_gather.shape[0]
+    launch = _get_launch_config("v2_w_dot", key_cache.shape[2]) or {}
+    _paged_attn_decode_v2_w_dot_kernel[(n_rows, ws.num_kv_heads, parts)](
+        p_sum,
+        p_max,
+        p_out,
+        q_gather,
+        key_cache,
+        value_cache,
+        tables,
+        lens,
+        softmax_scale,
+        1.0,
+        1.0,
+        None,
+        p_sum.stride(0),
+        p_sum.stride(1),
+        p_sum.stride(2),
+        p_out.stride(0),
+        p_out.stride(1),
+        p_out.stride(2),
+        p_out.stride(3),
+        q_gather.stride(0),
+        q_gather.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        tables.stride(0),
+        compute_type=(tl.bfloat16 if key_cache.dtype == torch.bfloat16 else tl.float16),
+        HEAD_SZ=ws.head_dim,
+        HEAD_SZ_POW2=next_pow2(ws.head_dim),
+        QUERY_GRP_SZ=group,
+        QUERY_GRP_SZ_POW2=16 if group <= 16 else next_pow2(group),
+        KV_BLK_SZ=ws.block_size,
+        KV_BLK_SZ_POW2=next_pow2(ws.block_size),
+        SEQ_PARTITION_SZ=V2_PARTITION_SZ,
+        **launch,
+    )
+    _paged_attn_decode_v2_w_dot_reduce_kernel[(n_rows, ws.num_kv_heads, 1)](
+        out_s,
+        p_sum,
+        p_max,
+        p_out,
+        lens,
+        out_s.stride(0),
+        out_s.stride(1),
+        p_sum.stride(0),
+        p_sum.stride(1),
+        p_sum.stride(2),
+        p_out.stride(0),
+        p_out.stride(1),
+        p_out.stride(2),
+        p_out.stride(3),
+        HEAD_SZ=ws.head_dim,
+        HEAD_SZ_POW2=next_pow2(ws.head_dim),
+        QUERY_GRP_SZ=group,
+        QUERY_GRP_SZ_POW2=16 if group <= 16 else next_pow2(group),
+        SEQ_PARTITION_SZ=V2_PARTITION_SZ,
+        MAX_NUM_SEQ_PARTITIONS_POW2=max(1, 2 ** (parts - 1).bit_length()),
+    )
+
+
 def _launch_fold(ws: CascadeWorkspace, output, sinks):
     from aiter.ops.triton.attention.pa_decode_cascade import _cascade_fold_kernel
 
@@ -518,7 +609,22 @@ def pa_decode_cascade(
         from aiter.ops.triton.attention.pa_decode import paged_attn_decode_v2
 
         torch.index_select(query, 0, ws.tok_of_s.long(), out=ws.q_gather_s)
-        paged_attn_decode_v2(
+        if sinks is None and ws.max_b_rows >= ws.max_singles:
+            _launch_v2_staging_kernels(
+                ws,
+                key_cache,
+                value_cache,
+                ws.q_gather_s,
+                ws.singles_tables,
+                ws.singles_lens,
+                ws.out_s,
+                ws.p2_max,
+                ws.p2_sum,
+                ws.p2_out,
+                softmax_scale,
+            )
+        else:
+            paged_attn_decode_v2(
             ws.out_s,
             ws.q_gather_s,
             key_cache,
