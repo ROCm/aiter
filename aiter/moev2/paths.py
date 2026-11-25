@@ -135,7 +135,9 @@ def _load_builtin():
     module has run, so it returns with every built-in path registered. The modules'
     `register()` calls re-enter here on the importing thread and return at once.
     Loading counts as done only once each module's `PATH` is registered: a module
-    imported directly runs this from its own `register()`, before its path is in.
+    imported directly runs this from its own `register()`, before its path is in. A
+    failed import raises and leaves loading undone, so the next call imports again
+    instead of selecting without the path.
     """
     global _builtin_loaded
     if _builtin_loaded or getattr(_loading, "active", False):
@@ -144,9 +146,6 @@ def _load_builtin():
     try:
         for module in _BUILTIN_MODULES:
             importlib.import_module(module)
-    except BaseException:
-        _builtin_loaded = True
-        raise
     finally:
         _loading.active = False
     with _lock:
@@ -249,10 +248,11 @@ def _announce(selected):
 
 
 def _select() -> tuple:
-    registry = registered()
     selection = envs.moev2_selection()
+    # The rollback must work even when a path module fails to import.
     if selection == "off":
         return ()
+    registry = registered()
     if selection == "on":
         return tuple(registry.values())
     if selection == "default":

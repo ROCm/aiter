@@ -334,6 +334,48 @@ def test_importing_a_builtin_module_directly_during_a_first_call(
     assert _names(paths.active()) == ["a4w4"]
 
 
+def test_a_failed_builtin_import_is_retried_by_the_next_call(monkeypatch, tmp_path):
+    """The failure reaches the caller, and loading stays undone: a caller that catches
+    it and calls again gets the path, not a selection from an empty registry."""
+    failures = types.SimpleNamespace(left=1)
+    monkeypatch.setitem(sys.modules, "moev2_test_failures", failures)
+    (tmp_path / "moev2_flaky_builtin.py").write_text(
+        "import moev2_test_failures as failures\n"
+        "from aiter.moev2 import paths\n"
+        "if failures.left:\n"
+        "    failures.left -= 1\n"
+        "    raise ImportError('the first import fails')\n"
+        "PATH = paths.Path('a4w4', lambda call: True, lambda call: None)\n"
+        "paths.register(PATH)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(paths, "_BUILTIN_MODULES", ("moev2_flaky_builtin",))
+    monkeypatch.setattr(paths, "_builtin_loaded", False)
+    paths.reload()
+    _set(monkeypatch, "on")
+    try:
+        with pytest.raises(ImportError, match="the first import fails"):
+            paths.active()
+        assert not paths._builtin_loaded
+        assert _names(paths.active()) == ["a4w4"]
+        assert paths._builtin_loaded
+    finally:
+        sys.modules.pop("moev2_flaky_builtin", None)
+
+
+def test_off_selects_nothing_without_importing_the_path_modules(monkeypatch):
+    """The rollback works even when a path module cannot be imported."""
+    monkeypatch.setattr(paths, "_BUILTIN_MODULES", ("moev2_no_such_module",))
+    monkeypatch.setattr(paths, "_builtin_loaded", False)
+    _set(monkeypatch, "off")
+    paths.reload()
+    assert paths.active() == ()
+    _set(monkeypatch, "on")
+    paths.reload()
+    with pytest.raises(ModuleNotFoundError, match="moev2_no_such_module"):
+        paths.active()
+
+
 def test_graduation_can_be_scoped_to_archs(monkeypatch):
     _fake_path("a8w8_pt", graduated=frozenset({"gfx950"}))
     for arch, expected in (("gfx950", ["a8w8_pt"]), ("gfx942", [])):
