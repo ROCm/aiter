@@ -545,7 +545,8 @@ class UnifiedAttnKernelHandler(KernelHandler):
         shape = self._shape
         # vLLM's default KV cache block size (CacheConfig.DEFAULT_BLOCK_SIZE) is 64.
         # Override per shape with a "block_size" key in model_shapes.json.
-        block_size = int(shape.get("block_size", 64))
+        block_size = shape.get("block_size")
+        block_size = int(block_size if block_size is not None else 64)
         sliding_window = shape.get("sliding_window", None)
         args = (
             f"-b {self._batch_size} -hq {shape['hq']} -hk {shape['hkv']} "

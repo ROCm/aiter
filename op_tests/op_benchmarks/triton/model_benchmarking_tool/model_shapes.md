@@ -104,7 +104,7 @@ count reported by the benchmark against `hq`.
 | `hkv`            | int         | Number of key/value heads.                                               |
 | `dqk`            | int         | Query/key head dimension.                                                |
 | `dv`             | int         | Value head dimension.                                                    |
-| `block_size`     | int \| null | Optional. KV cache block size. Defaults to 64.                           |
+| `block_size`     | int \| null | Optional. KV cache block size. Defaults to 64 if null or omitted.        |
 | `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used. |
 
 ## Example
