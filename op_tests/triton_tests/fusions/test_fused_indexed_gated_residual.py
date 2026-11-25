@@ -173,3 +173,16 @@ def test_int32_indices_are_accepted():
     got = fused_indexed_gated_residual(residual, x, gate, indices.to(torch.int32))
     want = fused_indexed_gated_residual(residual, x, gate, indices)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def test_rejects_overlapping_output_rows():
+    dev = "cuda"
+    M, N = 32, 256
+    residual, x, gate, indices = make(M, N, 3, torch.bfloat16, dev)
+    broadcast = torch.empty((1, N), device=dev, dtype=torch.bfloat16).expand(M, N)
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(residual, x, gate, indices, out=broadcast)
+    buffer = torch.empty(M * N, device=dev, dtype=torch.bfloat16)
+    short_stride = buffer.as_strided((M, N), (N // 2, 1))
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(residual, x, gate, indices, out=short_stride)

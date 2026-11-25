@@ -78,6 +78,9 @@ def fused_indexed_gated_residual(
         assert t.device == residual.device, f"{name} must be on {residual.device}"
     for name, t in (("residual", residual), ("x", x), ("gate", gate), ("out", out)):
         assert N <= 1 or t.stride(1) == 1, f"{name} must have unit stride along N"
+    assert (
+        M <= 1 or N == 0 or out.stride(0) >= N
+    ), f"out rows must not overlap, got row stride {out.stride(0)} < {N}"
     if M == 0 or N == 0:
         return out
 
