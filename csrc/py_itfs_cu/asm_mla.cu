@@ -311,6 +311,12 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
         if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
             ps = 0; // not use ps
         }
+        // MI350 runtime-GQA SP3 consumes the head count at 0x80. MTP query
+        // tokens are tiled by grid.x.
+        if (q_type == "bf16" && kv_type == "bf16" &&
+            arch_id == "gfx950" && !persistent){
+            s_MQA = gqa_ratio;
+        }
     }
     else if(gqa_ratio == 16){
         sub_Q = 128;
