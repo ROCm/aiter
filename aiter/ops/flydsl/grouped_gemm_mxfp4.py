@@ -157,11 +157,16 @@ def flydsl_grouped_gemm_a8w4_masked(
     Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
     innermost 32 FP4 values packed into 16 bytes.
     """
-    if a_preshuffled and row_major_ascale:
+    # a_preshuffled 2: only the stage-1 quant output is packed (A row-major).
+    if a_preshuffled not in (0, 1, 2):
+        raise ValueError(f"a_preshuffled must be 0, 1 or 2, got {a_preshuffled}")
+    if a_preshuffled == 2 and not stage1_quant_out:
+        raise ValueError("a_preshuffled=2 packs only a stage-1 quant output")
+    if a_preshuffled == 1 and row_major_ascale:
         raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
     if a_preshuffled and not a_is_fp4:
         raise ValueError("preshuffled A requires MXFP4 activations")
-    if a_preshuffled and (
+    if a_preshuffled == 1 and (
         K % 128
         or contiguous_m % 16
         or tile_m % 16
@@ -172,6 +177,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled A requires M and tile_m divisible by 16, K and "
             "tile_k divisible by 128, and no padded A row stride"
         )
+    if a_preshuffled == 2 and (contiguous_m % 16 or tile_m % 16):
+        raise ValueError("a preshuffled output requires M and tile_m divisible by 16")
     if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
         raise ValueError(
             "preshuffled MXFP4 quant output requires N divisible by 256 "

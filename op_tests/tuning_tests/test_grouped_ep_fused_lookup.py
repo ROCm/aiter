@@ -92,6 +92,33 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
                 # The merged CSV stores the flag as "1.0"; lookup normalizes it.
                 self.assertIn(str(row.get("ep_fused")), ("1", "1.0"))
 
+    def test_compact_rows_override_only_compact(self):
+        # ep_fused=2 rows serve the compact dispatch alone; mori keeps ep_fused=1.
+        kw = dict(
+            token_num=8192,
+            model_dim=7168,
+            inter_dim=2048,
+            experts=65,
+            topk=-1,
+            activation=ActivationType.Silu,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            ep_fused=True,
+        )
+        compact = _find_grouped_config(**kw, compact=True)
+        mori = _find_grouped_config(**kw)
+        self.assertIn(str(compact.get("ep_fused")), ("2", "2.0"))
+        self.assertEqual(str(compact.get("tile_m")), "128")
+        self.assertIn(str(mori.get("ep_fused")), ("1", "1.0"))
+        self.assertEqual(str(mori.get("tile_m")), "256")
+        # Without its own row a bucket keeps the ep_fused=1 row on both paths.
+        kw["token_num"] = 16384
+        self.assertEqual(
+            _find_grouped_config(**kw, compact=True), _find_grouped_config(**kw)
+        )
+
     def test_plain_lookup_keeps_generic_rows(self):
         # Upstream rows leave ep_fused blank, so they match both paths and
         # the explicit fused rows must not be selected when ep_fused is false.

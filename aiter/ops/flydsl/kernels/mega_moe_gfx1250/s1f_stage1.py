@@ -531,8 +531,12 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    a2_preshuffled=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
+
+    ``a2_preshuffled`` writes ``arg_a2`` in the packed (M/16, K/128, 4, 16,
+    16-byte) layout an A-preshuffled GEMM2 reads.
 
     Launcher arguments (positional): ``arg_a2`` (GEMM1 fp4 output, tensor),
     ``arg_a1`` (disp_out rows, pointer), ``arg_w1`` (pointer),
@@ -783,7 +787,7 @@ def make_s1f_stage1(
             lds_soa_load_interleave=0,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=0,
+            a_preshuffled=2 if a2_preshuffled else 0,
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,

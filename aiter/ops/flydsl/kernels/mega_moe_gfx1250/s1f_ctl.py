@@ -84,6 +84,15 @@ _S1F_MAX_RECV_BY_SHAPE: dict = {
     (4, 7): 1 << 30,
     (4, 9): 1 << 30,
 }
+#: Receive caps under ``AITER_MEGA_S1F_FALLBACK=mori``, where a step past the
+#: cap runs mori's dispatch and its A-preshuffled GEMM1 instead of the compact
+#: S1F=0 path. The stage-1 kernel reads A at the wire's row-major pitch, which
+#: at tile 256 costs GEMM1 ~36% (DSR1 EP4 tpr 8192: 554 vs 408 us), more than
+#: the fusion saves: tpr 8192 runs 1457 vs 1406 us/layer, while tpr 4096 (the
+#: cap) still wins, 808 vs 821.
+_S1F_MORI_MAX_RECV_BY_SHAPE: dict = {
+    (4, 9): 16384,
+}
 
 
 def s1f_max_recv(world_size: int, topk: int) -> int:
@@ -95,7 +104,10 @@ def s1f_max_recv(world_size: int, topk: int) -> int:
     if env:
         cap = int(env)
         return cap if cap > 0 else 1 << 30
-    return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+    shape = (int(world_size), int(topk))
+    if shape in _S1F_MORI_MAX_RECV_BY_SHAPE and read_s1f_fallback() == "mori":
+        return _S1F_MORI_MAX_RECV_BY_SHAPE[shape]
+    return _S1F_MAX_RECV_BY_SHAPE.get(shape, _S1F_MAX_RECV)
 
 
 def read_s1f_mode() -> bool:
@@ -109,6 +121,22 @@ def read_s1f_mode() -> bool:
     if mode not in ("0", "1"):
         raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
     return mode == "1"
+
+
+def read_s1f_fallback() -> str:
+    """Where a compact-recipe step that cannot run the stage-1 kernel goes.
+
+    ``AITER_MEGA_S1F_FALLBACK``: ``compact`` (default) keeps the compact plan,
+    its TDM dispatch and a separate GEMM1; ``mori`` sends the step through
+    mori's token-major dispatch instead, built beside the compact one over the
+    same arena and combine.
+    """
+    mode = os.environ.get("AITER_MEGA_S1F_FALLBACK", "compact").strip() or "compact"
+    if mode not in ("compact", "mori"):
+        raise ValueError(
+            f"AITER_MEGA_S1F_FALLBACK must be compact or mori, got {mode!r}"
+        )
+    return mode
 
 
 def _s1f_cu_num() -> int:
@@ -206,7 +234,8 @@ class _Stage1Fusion:
         self.cu = 0
         self.tiles: set[int] = set()
         self.tile_cap = 0
-        # (align_m, quant_wmma_rep) of every step bound that runs the kernel.
+        # (align_m, quant_wmma_rep, a2_preshuffled) of every step bound that
+        # runs the kernel.
         self.launch_keys: set = set()
         self.step = None
         self.wire = None
@@ -460,16 +489,33 @@ class _Stage1Fusion:
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        a2_preshuffled=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            a2_preshuffled,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
             num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
             launch = make_s1f_stage1(
+                a2_preshuffled=a2_preshuffled,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
@@ -507,7 +553,16 @@ class _Stage1Fusion:
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self,
+        launch_args,
+        *,
+        tile_m,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        a2_preshuffled=0,
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -537,6 +592,7 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                a2_preshuffled=a2_preshuffled,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -586,6 +642,7 @@ class _Stage1Fusion:
         situ_linear_beta=1.0,
         persistent_workers=0,
         rolled_drain=0,
+        a_preshuffled=0,
         **_unused,
     ):
         """GEMM1 launch stand-in: runs this layer's dispatch and GEMM1."""
@@ -594,6 +651,7 @@ class _Stage1Fusion:
             raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
         self.step = None
         align_m = int(self.d._step.align_m)
+        a2_pre = int(self.d._step.a2_preshuffled)
         wire_row = int(self.d.compact.wire_row)
         got = {
             "tile": (tile_m, tile_n, tile_k),
@@ -604,6 +662,8 @@ class _Stage1Fusion:
             "row_major_ascale": int(row_major_ascale),
             "a_strides": (int(a_row_stride_bytes), int(a_scale_row_stride_bytes)),
             "variant": align_m,
+            # 2: GEMM2 reads A preshuffled; the wire rows stay row-major.
+            "a_preshuffled": int(a_preshuffled),
         }
         want = {
             "tile": (align_m, _S1F_TILE_N, _S1F_TILE_K),
@@ -614,6 +674,7 @@ class _Stage1Fusion:
             "row_major_ascale": 1,
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
+            "a_preshuffled": 2 if a2_pre else 0,
         }
         # The stage-1 kernel runs its own 256x256 n/k tiles.
         got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
@@ -658,19 +719,20 @@ class _Stage1Fusion:
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
         # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
+        keys = {(t, int(stage1_act), q, a2) for t, q, a2 in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), a2_pre))
         if not keys <= self.precompiled and (
             not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for t, act, q, a2 in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, a2))
                 self._precompile(
                     launch_args,
                     tile_m=t,
                     group_m=group_m,
                     stage1_act=act,
                     quant_wmma_rep=q,
+                    a2_preshuffled=a2,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -679,6 +741,7 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            a2_preshuffled=a2_pre,
         )
         self._run(
             launch,
