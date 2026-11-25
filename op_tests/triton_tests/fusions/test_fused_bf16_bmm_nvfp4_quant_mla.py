@@ -117,6 +117,18 @@ def test_allocates_outputs_and_empty_batch():
     assert codes.device == q_nope.device and aux.shape == (37, HEADS, 128)
     q_nope, w_uk, codes, aux = generate_inputs(0)
     fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux)
+    q_nope, w_uk, codes, aux = generate_inputs(37, heads=0)
+    fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_launches_on_the_input_device():
+    with torch.cuda.device(1):
+        q_nope, w_uk, codes, aux = generate_inputs(37)
+        want = reference(q_nope, w_uk)[0]
+    fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux)
+    torch.cuda.synchronize(1)
+    assert torch.equal(codes, want)
 
 
 def test_graph_replay():

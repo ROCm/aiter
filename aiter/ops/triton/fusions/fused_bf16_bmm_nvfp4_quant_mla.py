@@ -4,13 +4,6 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_bf16_bmm_nvfp4_quant_mla import (
-    _fused_bf16_bmm_nvfp4_quant_mla_kernel,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-    create_shared_layouts,
-    create_wmma_layouts,
-)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -110,46 +103,53 @@ def fused_bf16_bmm_nvfp4_quant_mla(
     assert (
         q_nope_fp4.data_ptr() % 16 == 0 and q_aux.data_ptr() % 16 == 0
     ), "q_nope_fp4 and q_aux must be 16-byte aligned"
-    if batch == 0:
+    if batch == 0 or heads == 0:
         return q_nope_fp4, q_aux
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_bf16_bmm_nvfp4_quant_mla import (
+        _fused_bf16_bmm_nvfp4_quant_mla_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
 
     config = _get_config()
     block_m, num_warps = config["BLOCK_M"], config["num_warps"]
     block_n = KV_LORA // 2
-    with torch.cuda.device(q_nope.device):
-        cus = get_num_sms()
-    splits = max(1, cus // heads)
-    tiles = triton.cdiv(triton.cdiv(batch, block_m), splits)
     warp_bases = tuple(tuple(base) for base in config["WARP_BASES"])
-    wmma, op_a, op_b = create_wmma_layouts(num_warps, warp_bases)
-    sh_a, sh_b = create_shared_layouts(block_m, block_n, D_NOPE, "TN", 16)
-    grid = (heads, triton.cdiv(triton.cdiv(batch, block_m), tiles))
-    _fused_bf16_bmm_nvfp4_quant_mla_kernel[grid](
-        q_nope,
-        w_uk,
-        q_nope_fp4,
-        q_aux[..., 64:],
-        batch,
-        KV_LORA,
-        D_NOPE,
-        tiles,
-        q_nope.stride(1),
-        q_nope.stride(0),
-        w_uk.stride(0),
-        w_uk.stride(1),
-        q_nope_fp4.stride(1),
-        q_nope_fp4.stride(0),
-        q_aux.stride(1),
-        q_aux.stride(0),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=D_NOPE,
-        SHARED_LAYOUT_A=sh_a,
-        SHARED_LAYOUT_B=sh_b,
-        WMMA_LAYOUT=wmma,
-        WARP_BASES=warp_bases,
-        OPERAND_LAYOUT_A=op_a,
-        OPERAND_LAYOUT_B=op_b,
-        num_warps=num_warps,
-    )
+    with torch.cuda.device(q_nope.device):
+        splits = max(1, get_num_sms() // heads)
+        tiles = triton.cdiv(triton.cdiv(batch, block_m), splits)
+        wmma, op_a, op_b = create_wmma_layouts(num_warps, warp_bases)
+        sh_a, sh_b = create_shared_layouts(block_m, block_n, D_NOPE, "TN", 16)
+        grid = (heads, triton.cdiv(triton.cdiv(batch, block_m), tiles))
+        _fused_bf16_bmm_nvfp4_quant_mla_kernel[grid](
+            q_nope,
+            w_uk,
+            q_nope_fp4,
+            q_aux[..., 64:],
+            batch,
+            KV_LORA,
+            D_NOPE,
+            tiles,
+            q_nope.stride(1),
+            q_nope.stride(0),
+            w_uk.stride(0),
+            w_uk.stride(1),
+            q_nope_fp4.stride(1),
+            q_nope_fp4.stride(0),
+            q_aux.stride(1),
+            q_aux.stride(0),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=D_NOPE,
+            SHARED_LAYOUT_A=sh_a,
+            SHARED_LAYOUT_B=sh_b,
+            WMMA_LAYOUT=wmma,
+            WARP_BASES=warp_bases,
+            OPERAND_LAYOUT_A=op_a,
+            OPERAND_LAYOUT_B=op_b,
+            num_warps=num_warps,
+        )
     return q_nope_fp4, q_aux
