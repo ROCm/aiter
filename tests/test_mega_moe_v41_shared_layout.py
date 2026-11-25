@@ -8,6 +8,8 @@ capacities and its own tunes, never another layout's by accident. The multi-GPU 
 op_tests/multigpu_tests/test_mega_moe_v2.py (--network v41_flash_shared).
 """
 
+from dataclasses import fields
+
 import pytest
 
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
@@ -235,17 +237,48 @@ def test_own_tunes_selected():
 
 @pytest.mark.parametrize(
     "mtpr,tokens",
-    [(256, t) for t in (0, 1, 4, 16, 64, 126, 128, 190, 255, 256)]
-    + [(512, t) for t in (1, 128, 300, 512)]
-    + [(1024, t) for t in (LARGE_M_MIN_TOKENS, 1024)]
+    [(1024, t) for t in (LARGE_M_MIN_TOKENS, 1024)]
     + [(8192, t) for t in (LARGE_M_MIN_TOKENS, 8192)]
     + [(16384, t) for t in (LARGE_M_MIN_TOKENS, 11000, 16384)],
 )
-def test_swept_tunes(mtpr, tokens):
-    """The sweep at this layout's decode and prefill rows kept the 48-expert EP8 knobs, with the
-    large-input per-token combine wait off (its own route-major payload costs too much memory).
-    """
+def test_large_m_tunes(mtpr, tokens):
+    """The large-input sweep kept the 48-expert EP8 knobs, with the per-token combine wait off (its own
+    route-major payload costs too much memory)."""
     shared = select_fused_config(tokens, mtpr, **SHAPE)
     assert shared == select_fused_config(tokens, mtpr, **ROUTED_SHAPE)
-    if mtpr >= LARGE_M_MIN_TOKENS:
-        assert not shared.fused_stage2.comb_tok_wait
+    assert not shared.fused_stage2.comb_tok_wait
+
+
+_GROUPS = ("stage1", "stage2", "fused_stage1", "fused_stage2")
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_small_m_tunes(mtpr):
+    """Each bucket is the 48-expert EP8 tune with exactly the knobs of its _V41_FLASH_EP8_SHARED_SMALL entry."""
+    import aiter.ops.flydsl.kernels.mega_moe.mega_moe_config as c
+
+    for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+        shared = select_fused_config(bucket, mtpr, **SHAPE)
+        routed = select_fused_config(bucket, mtpr, **ROUTED_SHAPE)
+        knobs = c._V41_FLASH_EP8_SHARED_SMALL.get(bucket, {})
+        assert shared.p2p_quant == routed.p2p_quant
+        assert shared.stage2.block_m == shared.stage1.sort_block_m
+        for group in _GROUPS:
+            want = knobs.get(group, {})
+            mine, base = getattr(shared, group), getattr(routed, group)
+            for f in fields(mine):
+                expected = want.get(f.name, getattr(base, f.name))
+                assert getattr(mine, f.name) == expected, (bucket, group, f.name)
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+@pytest.mark.parametrize("shape", (SHAPE, ROUTED_SHAPE), ids=("epr49", "epr48"))
+def test_small_m_en_order_is_buildable(mtpr, shape):
+    """en_order reads the local plan, and its GEMM1 order runs on m-tile units (not with pair_tiles)."""
+    for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+        k1 = select_fused_config(bucket, mtpr, **shape).fused_stage1
+        assert 0 <= k1.en_order < 8, bucket
+        if k1.en_order:
+            assert k1.plan_local, bucket
+        if k1.en_order & 1:
+            assert not k1.pair_tiles, bucket

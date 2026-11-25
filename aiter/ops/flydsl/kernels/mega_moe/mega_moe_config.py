@@ -336,6 +336,11 @@ class FusedStage1Knobs:
     # The pair reads W1 through the cache: with streamed W1 (b_nt) only a rank whose plan picks the cached-weight
     # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ.
     pair_tiles: bool = False
+    # Small-input kernel unit order (local plan): bit 1 the GEMM1 units (m-tile units: not with pair_tiles), bit 2
+    # the GEMM2 units of the run of one expert's m-tiles that lies wholly in an XCD's slice go in (expert, n)-major
+    # order, so the run's m-tiles read each weight tile at about the same time; bit 4: such grouped units read their
+    # weights through the cache. Only the order changes, not what a tile computes (0: m-major).
+    en_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1725,19 +1730,94 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+# Per-bucket small-input knobs of the EP8 V4.1-Flash shared-expert layout on top of the 48-expert EP8 tune. These
+# values were searched before the small-input route changes this branch builds on and are to be re-searched on it.
+# Group -> field -> value; the buckets not listed keep the 48-expert tune.
+_V41_FLASH_EP8_SHARED_SMALL = {
+    8: {
+        "stage1": {"grid_mult": 1, "num_dispatch_cu": 64},
+        "fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2},
+    },
+    16: {"fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2}},
+    32: {
+        "stage1": {"use_tile_resource": True, "num_dispatch_cu": 64, "b_nt": 1},
+        "stage2": {"block_n": 256},
+        "fused_stage1": {"en_order": 7, "epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 1},
+    },
+    64: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 128,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    128: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 160,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    256: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+    },
+    512: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+        "fused_stage2": {"early_k": 0},
+    },
+}
+
+
 def _tune_v41_flash_ep8_shared_small(
     config: MegaMoEConfig, bucket: int
 ) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash with the shared expert as each rank's 49th expert, small-input kernel.
 
-    Swept on gfx950 (8 ranks) at the decode rows a rank of this layout runs, with every token's
-    seventh slot on its own rank's shared expert: GEMM1 tile width, grid multiple, dispatch CUs,
-    waves a EU, streamed or cached W1 loads, the GEMM1 lookahead, the GEMM2 block width and the
-    early GEMM1-to-GEMM2 hand-off. None beat the 48-expert EP8 tune beyond run-to-run noise, and
-    64-row sort blocks, cached W1 loads or a deeper GEMM1 lookahead are slower: the shared expert's
-    extra rows are rank-local, so the tune that balances the routed rows still holds.
+    The 48-expert EP8 tune, then the per-bucket knobs of _V41_FLASH_EP8_SHARED_SMALL: the shared expert's rows are
+    rank-local, so every rank runs about one more expert's worth of rows than at 48 experts, and the knobs that pay
+    off are the ones that read each weight tile once for more rows (en_order, wider GEMM1 tiles at the larger
+    buckets) and the leaner GEMM1 / GEMM2 epilogues. None of them changes what ranks and launches exchange.
     """
-    return _tune_v41_flash_ep8_small(config, bucket)
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    knobs = _V41_FLASH_EP8_SHARED_SMALL.get(bucket)
+    if not knobs:
+        return config
+    stage1 = replace(config.stage1, **knobs.get("stage1", {}))
+    return replace(
+        config,
+        stage1=stage1,
+        stage2=replace(
+            config.stage2, block_m=stage1.sort_block_m, **knobs.get("stage2", {})
+        ),
+        fused_stage1=replace(config.fused_stage1, **knobs.get("fused_stage1", {})),
+        fused_stage2=replace(config.fused_stage2, **knobs.get("fused_stage2", {})),
+    )
 
 
 def _tune_v41_flash_ep8_shared_large(config: MegaMoEConfig) -> MegaMoEConfig:
