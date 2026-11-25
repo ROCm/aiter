@@ -580,45 +580,28 @@ def _attention_ps_reduce_asm(
 ) -> None:
     """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
 
-    Partial output is FP32 by default. The compact producer writes BF16 partials
-    and requires space for reduce_partial_map.numel() * max_seqlen_q rows.
-    Both layouts require contiguous inputs, FP32 partial LSE and int32 maps.
+    Partial output and partial LSE must be contiguous FP32 tensors, with
+    compatible int32 reduction maps on the output device.
     Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
-    merge_waves is 0 for the smallest 1/2/4/8-wave configuration whose output
-    rows times waves cover the CU count, capped at 8, or 1/2/4/8 explicitly.
-    Multi-wave variants use one active wave for at most eight splits while
-    retaining their configured workgroup size.
+    merge_waves is 0 for the existing heuristic, or 1/8 for an explicit choice.
     """
 
 
-def _pa_ps_reduce_waves(
-    batch_size: int, kv_pages: int, num_cu: int, *, compact_partials: bool = False
-) -> int:
-    """Estimate reducer waves from the page16 256-token split budget.
+def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
+    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
 
-    This is an average split count inferred from packed, used KV pages. It
-    avoids a device-to-host metadata read, so callers with padded ``kv_indices``
-    must pass an explicit ``reduce_waves`` value.
+    This is not a live split count. Callers with padded kv_indices should pass
+    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
     """
-    if batch_size < 1 or kv_pages < batch_size or num_cu < 1:
+    if num_cu != 256 or not 1 <= batch_size <= 8:
         return 0
-    average_pages = (kv_pages + batch_size - 1) // batch_size
-    average_splits = (average_pages + 15) // 16
-    split_budget = min((num_cu + batch_size - 1) // batch_size, 256)
-    estimated_splits = max(1, min(average_splits, split_budget))
-    if estimated_splits <= 8:
-        waves = 1
-        output_rows = batch_size * 64
-        while waves < 8 and output_rows * waves < num_cu:
-            waves *= 2
-        return max(4, waves) if compact_partials else waves
-    if estimated_splits <= 16 and not compact_partials:
-        return 2
-    if estimated_splits <= 32:
-        return 4
-    return 8
+    output_rows = batch_size * 4 * 16
+    if output_rows < num_cu:
+        return 0
+    context_threshold = 32768 if output_rows <= num_cu else 65536
+    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
 
 
 def pa_persistent_fwd(
@@ -645,7 +628,6 @@ def pa_persistent_fwd(
     high_precision: int = 1,
     reduce_waves: int = 0,
     return_lse: bool = True,
-    compact_partials: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run persistent attention and merge only materialized partial outputs.
 
@@ -654,21 +636,18 @@ def pa_persistent_fwd(
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
     reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
-    PA workload heuristic, while 1/2/4/8 explicitly overrides it. The Q4/GQA16
-    policy estimates average 256-token splits from packed, used kv_indices pages
-    and selects 1/2/4/8 waves without device-to-host readback. Other paths retain
-    the native output-row/CU fallback.
+    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    policy expects packed kv_indices containing only used pages. Other paths
+    retain the original heuristic. No tuning or device-to-host readback occurs.
     return_lse=False skips final LSE allocation and computation and returns None
     for the second result. The default preserves the existing LSE output.
-    Partial output is FP32 by default. compact_partials=True returns BF16
-    partial output on the supported gfx950 per-token FP8 MTP path; both use
-    FP32 LSE. Use the padded WorkInfo returned by get_pa_metadata_info_v1.
-    Metadata partial=-1 writes directly to output in Q's dtype.
+    Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
+    selects direct output in Q's dtype without materializing a partial or LSE.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
-    if reduce_waves not in (0, 1, 2, 4, 8):
-        raise ValueError("reduce_waves must be 0, 1, 2, 4, or 8")
+    if reduce_waves not in (0, 1, 8):
+        raise ValueError("reduce_waves must be 0, 1, or 8")
     use_asm_reduce = (
         K.shape[3] == 16
         and v_head_dim == 128
@@ -680,39 +659,11 @@ def pa_persistent_fwd(
         raise ValueError(
             "explicit reduce_waves requires the gfx950/page16/D128 ASM reducer"
         )
-    if compact_partials:
-        from aiter.ops.pa_decode import _default_asm_scale, _per_token_scales
-
-        if not (
-            use_asm_reduce
-            and 2 <= max_qlen <= 4
-            and Q.shape == output.shape
-            and nhead == 16
-            and Q.dtype == output.dtype
-            and Q.device == K.device == V.device == output.device
-            and Q.stride(-1) == 1
-            and Q.stride(1) == v_head_dim
-            and output.is_contiguous()
-            and K.shape[1:] == (1, 8, 16, 16)
-            and V.shape == (K.shape[0], 1, 1, 128, 16)
-            and K.dtype == V.dtype == dtypes.fp8
-            and K.is_contiguous()
-            and V.is_contiguous()
-            and _per_token_scales(K_QScale, V_QScale, K)
-            and _default_asm_scale(softmax_scale, v_head_dim)
-            and quant_type == QuantType.per_Token
-            and high_precision == 1
-            and mask in (0, 1)
-        ):
-            raise ValueError(
-                "compact_partials requires gfx950 page16/D128 GQA16 FP8 MTP "
-                "with packed buffers and the default softmax scale"
-            )
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
     logits = torch.empty(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
-        dtype=dtypes.bf16 if compact_partials else dtypes.fp32,
+        dtype=dtypes.fp32,
         device=device,
     )
     splitLse = torch.empty(
@@ -767,7 +718,6 @@ def pa_persistent_fwd(
             batch_size,
             kv_indices.numel(),
             torch.cuda.get_device_properties(device).multi_processor_count,
-            compact_partials=compact_partials,
         )
     reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
     reduce_args = (reduce_waves,) if use_asm_reduce else ()
