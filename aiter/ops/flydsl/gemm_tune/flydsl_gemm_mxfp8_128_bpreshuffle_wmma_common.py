@@ -18,6 +18,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
     fused_splitk_ok,
+    rank0_splitk_ok,
 )
 
 WMMA = 16  # WMMA M/N tile granularity
@@ -43,6 +44,8 @@ _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
 _SPLIT_K = (1, 2, 4, 8)
+# Fused split_k the row-stripe epilogue lacks: split 0 of a tile sums the splits.
+_RANK0_SPLIT_K = (3, 5, 6, 7, 10, 12, 14, 16)
 
 _COMPUTE_PROFILES = (
     (256, 256, 128, 2, 2, 4),
@@ -177,8 +180,8 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     return max(arena_bytes, total_d_bytes)
 
 
-def _generic_instances(clusters, fused):
-    for sk in _SPLIT_K:
+def _generic_instances(clusters, fused, split_ks=_SPLIT_K):
+    for sk in split_ks:
         for tm in _TILE_M_OPTS:
             for tn in _TILE_N_OPTS:
                 for tk in _TILE_K_OPTS:
@@ -307,18 +310,16 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
             no_loop_cbar=True,
         )
     )
+    # Rank-0 fused split-K of the generic kernel, appended after the opt-in ones.
+    extra += [
+        ki
+        for ki in _generic_instances(_CLUSTERS_POW2, True, _RANK0_SPLIT_K)
+        if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
+    ]
     return dict(enumerate([*base, *extra]))
 
 
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
-_N_BASE = len(_base_instances())
-
-
-def fallback_kernels() -> list[WmmaKernelInstance]:
-    """Candidates of the runtime fallback for shapes without a tuned row: the original
-    unfused kernels, not the widened tuner space (which is the tail of ``kernels_list``).
-    """
-    return [ki for i, ki in kernels_list.items() if i < _N_BASE]
 
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
@@ -328,6 +329,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     if ki.a_preshuffle and M % 2 != 0:
         return False
 
+    # Fused split-K: the row-stripe epilogue where it fits, else rank 0 (generic only).
+    rank0 = False
     if ki.fused_splitk and not fused_splitk_ok(
         ki.tile_m,
         ki.tile_n,
@@ -337,7 +340,11 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         ki.cluster_n,
         ki.split_k,
     ):
-        return False
+        rank0 = not is_compute_kernel(ki) and rank0_splitk_ok(
+            M, N, ki.tile_m, ki.cluster_m, ki.cluster_n, ki.split_k
+        )
+        if not rank0:
+            return False
 
     if is_compute_kernel(ki):
         profile = (
@@ -392,11 +399,11 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
         return False
-    if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
+    if N % ki.tile_n != 0 or K % (ki.tile_k * (1 if rank0 else ki.split_k)) != 0:
         return False
     # Generic K=128 with two buffers needs no steady-loop iteration.
     min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
-    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
+    if (K // ki.tile_k) // ki.split_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).
@@ -405,8 +412,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     n_blocks = N // ki.tile_n
     if ki.tile_m < _LARGE_M_TILE_MIN and m_blocks > _MAX_M_BLOCKS:
         return False
-    # A multicast cluster needs at least two tiles along each clustered axis.
-    if (ki.cluster_m > 1 or ki.cluster_n > 1) and M < 2 * ki.tile_m:
+    # A multicast cluster needs at least two tiles along each clustered axis (N below).
+    if ki.cluster_m > 1 and M < 2 * ki.tile_m:
         return False
     if ki.cluster_m > 1 and not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
         return False

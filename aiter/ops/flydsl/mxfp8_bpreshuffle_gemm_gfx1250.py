@@ -36,6 +36,7 @@ MX32_COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_compute_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
+MAX_GENERIC_SPLIT_K = 16  # the 16-workgroup cluster limit
 # UNROLL and MAX_PARTIAL_VECTORS of splitk_fused_epilogue_gfx1250, kept here so the
 # tuners can import this module without FlyDSL.
 _FUSED_UNROLL = 32
@@ -45,7 +46,7 @@ _FUSED_MAX_PARTIAL_VECTORS = 128
 def fused_splitk_ok(
     tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
 ) -> bool:
-    """Whether the K splits of a tile can reduce in one cluster (fused split-K).
+    """Whether the row-stripe epilogue fits the K splits of a tile (fused split-K).
 
     The epilogue wraps peer stripes with ``& (split_k - 1)``, so only 2/4/8 splits qualify,
     and it stores whole passes of ``rows_per_iter * unroll`` rows, so a stripe taller than
@@ -73,6 +74,20 @@ def fused_splitk_ok(
         and waves * 32 % lanes_per_row == 0
         and (reduce_m < rows_per_iter or reduce_m % (rows_per_iter * unroll) == 0)
         and all(rows % waves == 0 for rows in tdm_rows)
+    )
+
+
+def rank0_splitk_ok(M, N, tile_m, cluster_m, cluster_n, split_k) -> bool:
+    """Whether split 0 of a tile can sum the K splits of a generic launch.
+
+    The FP32 scratch (split_k padded outputs) is read through a buffer descriptor, so
+    it must stay under 4 GiB.
+    """
+    scratch_bytes = split_k * (-(-M // tile_m) * tile_m) * N * 4
+    return bool(
+        2 <= split_k <= MAX_GENERIC_SPLIT_K
+        and cluster_m * cluster_n * split_k <= 16
+        and scratch_bytes < 1 << 32
     )
 
 
@@ -342,11 +357,23 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             "expected bf16/fp16"
         )
 
-    if split_k > _MAX_SPLIT_K:
+    max_split_k = _MAX_SPLIT_K if compute_bound else MAX_GENERIC_SPLIT_K
+    if split_k > max_split_k:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] split_k={split_k} exceeds the "
-            f"supported maximum of {_MAX_SPLIT_K}"
+            f"supported maximum of {max_split_k}"
         )
+    # Fused split-K: row-stripe where it fits, else rank0 (generic kernel), else unfused.
+    row_stripe = fused_splitk and fused_splitk_ok(
+        tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
+    )
+    rank0 = bool(
+        fused_splitk
+        and not row_stripe
+        and not compute_bound
+        and rank0_splitk_ok(M, N, tile_m, cluster_m, cluster_n, split_k)
+    )
+    fused = row_stripe or rank0
 
     nb = int(num_buffers)
     if nb not in _SUPPORTED_NUM_BUFFERS:
@@ -354,12 +381,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] num_buffers must be one of "
             f"{_SUPPORTED_NUM_BUFFERS}, got {nb}"
         )
-    if K % (split_k * tile_k) != 0:
+    k_unit = tile_k if rank0 else split_k * tile_k
+    if K % k_unit != 0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8] K={K} must be divisible by "
-            f"split_k*tile_k={split_k}*{tile_k}={split_k * tile_k}"
+            f"[FlyDSL gfx1250 mxfp8] K={K} must be divisible by {k_unit} "
+            f"(tile_k={tile_k}, split_k={split_k})"
         )
-    num_k_tiles = (K // split_k) // tile_k
+    num_k_tiles = (K // tile_k) // split_k
     # Generic K=128 with two buffers uses only the prologue and drain.
     # Other configurations, including compute-bound kernels, keep their limits.
     min_k_tiles = 1 if not compute_bound and nb == 2 and K == tile_k == 128 else nb
@@ -449,10 +477,14 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     _lazy_import()
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
-    fused = fused_splitk and fused_splitk_ok(
-        tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
-    )
-    if fused:
+    if rank0:
+        partial_shape = (
+            ((M + tile_m - 1) // tile_m) * (N // tile_n),
+            split_k,
+            tile_m,
+            tile_n,
+        )
+    elif fused:
         partial_shape = fused_splitk_partial_shape(M, N, tile_m, tile_n, split_k)
     elif split_k > 1:
         partial_shape = (split_k, M, ldc)
@@ -543,6 +575,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             c_pad,
             quad_early,
             no_loop_cbar,
+            rank0,
             specialization_key=(specialization, c_pad, quad_early, no_loop_cbar),
         )
     if partials is not None and not fused:

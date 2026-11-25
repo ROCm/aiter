@@ -29,6 +29,9 @@ from aiter.ops.flydsl.kernels.splitk_fused_epilogue_gfx1250 import (
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
 )
 
 # Largest TDM pad interval the gfx1250 descriptor can encode for 1-byte
@@ -82,11 +85,13 @@ def launch_gemm_a8w8(
     c_pad: Constexpr[int] = -1,
     quad_early: Constexpr[bool] = False,
     no_loop_cbar: Constexpr[bool] = False,
+    rank0_splitk: Constexpr[bool] = False,
 ):
     # i32_cm: runtime cluster_m; use_cluster is False only for a one-workgroup launch.
     # fused_splitk: the K splits of a tile are one cluster along grid.z and reduce
-    # through arg_c (FP32 scratch) into arg_out; otherwise split_k > 1 writes
-    # FP32 planes to arg_c for gemm_a8w8_splitk_reduce.
+    # through arg_c (FP32 scratch) into arg_out, each split reducing a row stripe or,
+    # with rank0_splitk, split 0 the whole tile (any split_k, uneven K tiles);
+    # otherwise split_k > 1 writes FP32 planes to arg_c for gemm_a8w8_splitk_reduce.
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
     # output and arg_scale_out the row-major [M, (B*N)//32] e8m0 scale -- the
@@ -156,7 +161,13 @@ def launch_gemm_a8w8(
             f"use_cluster={use_cluster}"
         )
     cluster_k = split_k if fused_splitk else 1
-    if fused_splitk and not (split_k > 1 and tile_m % split_k == 0):
+    if rank0_splitk and not (fused_splitk and split_k > 1):
+        raise ValueError("[FlyDSL gfx1250] rank0_splitk needs fused_splitk")
+    if (
+        fused_splitk
+        and not rank0_splitk
+        and not (split_k > 1 and tile_m % split_k == 0)
+    ):
         raise ValueError(
             "[FlyDSL gfx1250] fused_splitk needs split_k > 1 dividing "
             f"tile_m, got split_k={split_k}, tile_m={tile_m}"
@@ -182,7 +193,7 @@ def launch_gemm_a8w8(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
-    if fused_splitk:
+    if fused_splitk and not rank0_splitk:
         # Geometry of splitk_fused_epilogue_gfx1250 (see fused_splitk_ok).
         if block < 128:
             raise ValueError(
@@ -330,6 +341,14 @@ def launch_gemm_a8w8(
         bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
         kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
+        if const_expr(rank0_splitk):
+            # Even K-tile split: the first kt_rem splits take one more tile.
+            kt_div = (i32_k // tile_k) // split_k
+            kt_rem = (i32_k // tile_k) % split_k
+            K_TILES = kt_div + (bid_z < kt_rem).select(fx.Int32(1), fx.Int32(0))
+            kt_start = bid_z * kt_div + fx.min(bid_z, kt_rem)
+            kt_base = fx.Int64(kt_start)
+            kt_base_i32 = fx.Int32(kt_start)
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -1080,6 +1099,79 @@ def launch_gemm_a8w8(
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
+        if const_expr(rank0_splitk):
+            # Splits publish FP32 fragments in accumulator order; split 0 sums them.
+            vec = 4
+            tile_elems = tile_m * tile_n
+            flat_tile = fx.Int64(bid_y) * fx.Int64(fx.grid_dim.x) + fx.Int64(bid_x)
+            workspace = ptr_buf_tensor(
+                arg_c,
+                fx.Float32,
+                unit_elems=vec,
+                num_records_bytes=fx.Int64(fx.grid_dim.x)
+                * fx.Int64(fx.grid_dim.y)
+                * fx.Int64(split_k * tile_elems * 4),
+            )
+            for ai in range_constexpr(n_acc):
+                value = Vec(accs[ai])
+                for half in range_constexpr(2):
+                    part = Vec.from_elements(
+                        [value[half * vec + j] for j in range_constexpr(vec)],
+                        fx.Float32,
+                    )
+                    buf_copy_store(
+                        workspace,
+                        (flat_tile * split_k + fx.Int64(bid_z)) * (tile_elems // vec)
+                        + (ai * block + tid) * 2
+                        + half,
+                        part,
+                        fx.Float32,
+                        vec,
+                        cache_modifier=16,
+                    )
+            # No stable FlyDSL call retires this wave's stores; the stores are device
+            # scope, so a retired store is visible to every workgroup.
+            rocdl.s_wait_storecnt(0)
+            cluster.cluster_barrier()
+            if bid_z == 0:
+                output = fx.inttoptr(
+                    fx.PointerType.get(
+                        out_elem.ir_type, arg_out_k.address_space, alignment=2
+                    ),
+                    fx.ptrtoint(arg_out_k),
+                )
+                for ai in range_constexpr(n_acc):
+                    values = []
+                    for half in range_constexpr(2):
+                        total = buf_copy_load(
+                            workspace,
+                            (flat_tile * split_k) * (tile_elems // vec)
+                            + (ai * block + tid) * 2
+                            + half,
+                            fx.Float32,
+                            vec,
+                            cache_modifier=16,
+                        )
+                        for part in range_constexpr(1, split_k):
+                            total = total + buf_copy_load(
+                                workspace,
+                                (flat_tile * split_k + part) * (tile_elems // vec)
+                                + (ai * block + tid) * 2
+                                + half,
+                                fx.Float32,
+                                vec,
+                                cache_modifier=16,
+                            )
+                        values.extend(total[j] for j in range_constexpr(vec))
+                    wm, wn = ai // wmma_n_rep, ai % wmma_n_rep
+                    row_rel = wmb + wm * 16 + lane16
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    if row_rel < mn_oob:
+                        fx.ptr_store(
+                            Vec.from_elements(values, fx.Float32).to(out_elem),
+                            output + (blk_m64 + row_rel) * ldc64 + blk_n64 + col_rel,
+                        )
+            return
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             if const_expr(fused_splitk):
