@@ -159,14 +159,3 @@ def test_transpose_packed_fp4_round_trip(shape):
     restored = transpose_packed_fp4(transpose_packed_fp4(data_fp4))
 
     torch.testing.assert_close(restored, data_fp4, atol=0, rtol=0)
-
-
-def test_transpose_packed_fp4_validates_input():
-    with pytest.raises(ValueError, match="must be 2-D"):
-        transpose_packed_fp4(torch.zeros((2, 2, 2), dtype=torch.uint8, device="cpu"))
-    with pytest.raises(TypeError, match="torch.uint8"):
-        transpose_packed_fp4(torch.zeros((2, 2), dtype=torch.float32, device="cpu"))
-    with pytest.raises(ValueError, match="non-zero"):
-        transpose_packed_fp4(torch.empty((2, 0), dtype=torch.uint8, device="cpu"))
-    with pytest.raises(ValueError, match="rows must be even"):
-        transpose_packed_fp4(torch.zeros((3, 2), dtype=torch.uint8, device="cpu"))

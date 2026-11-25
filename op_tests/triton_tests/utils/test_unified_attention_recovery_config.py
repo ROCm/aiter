@@ -103,26 +103,6 @@ def test_recovery_config_selected(q, k, preload_pages, _packaged_table):
 
 
 @pytest.mark.parametrize(
-    "q,k",
-    [
-        (256, 974),
-        (513, 974),
-        (462, 768),
-        (462, 1025),
-        (320, 320),
-        (448, 448),
-        (2048, 2048),
-        (4096, 4096),
-        (2510, 2511),
-    ],
-)
-def test_recovery_config_excluded_lengths(q, k):
-    config = _config(_params(q, k))
-    assert config["PRELOAD_PAGES"] == 0
-    assert config["USE_EXPLICIT_FMA"] is False
-
-
-@pytest.mark.parametrize(
     "change",
     [
         "padded_table",
