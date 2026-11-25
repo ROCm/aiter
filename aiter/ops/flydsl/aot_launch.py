@@ -223,13 +223,15 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
 def loaded_kernel(exe, specialization_key=None):
     """The function the cache loaded for a bound launcher's launches under
     ``specialization_key``, to call with the same arguments (an ``fx.Stream``,
-    not a torch stream); None if it took the JIT path, was compiled only, or
-    was invalidated. For a wrapper that keeps one launcher per call site and
+    not a torch stream); None if it has no entry (the JIT path), was compiled
+    only, or was invalidated. For a wrapper that keeps one launcher per call site and
     wants to skip ``_run_compiled``'s lookup."""
     binding = getattr(exe, _ATTR, None)
     if not binding or binding.epoch != binding.cache.epoch:
         return None
-    return binding.kernels.get(specialization_key)
+    kernel = binding.kernels.get(specialization_key)
+    # The JIT kernel of a key with no entry launches through _run_compiled.
+    return None if isinstance(kernel, _JitKernel) else kernel
 
 
 class _LazyLauncher:
