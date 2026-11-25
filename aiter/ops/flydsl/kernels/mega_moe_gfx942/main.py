@@ -45,7 +45,7 @@ from flydsl.expr.typing import Vector as Vec
 from ..act import gate_up_act, situ_params
 from . import comm, host
 from .atomic import _atomic_add_at, _atomic_load_at, _home_queue, _inv_l1
-from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
+from .cvt import _abs_bits, _amax_floor, _channel_factor, _fp8x4_pack
 from .hw import (
     CM_NT,
     CM_SC1,
@@ -800,9 +800,8 @@ def ep_mega_kernel(
                     am = fx.Int32(pv[0])
                     for j in range_constexpr(1, WPG):
                         am = fx.max(am, fx.Int32(pv[j]))
-                    am = am.bitcast(fx.Float32)
-                    s = (am == 0.0).select(
-                        fx.Float32(1.0), am * fx.Float32(1.0 / 240.0)
+                    s = (am == 0).select(
+                        fx.Float32(1.0), _amax_floor(am) * fx.Float32(1.0 / 240.0)
                     )
                     with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
                         inv = fx.Float32(1.0) / s
@@ -1253,6 +1252,21 @@ class MainRuntime:
     experts); ``qx``: 1 for x quantized per 1x128, 0 per token; ``xcds``: XCDs of the
     GPU. Construction is collective (MORI symmetric buffers)."""
 
+    @staticmethod
+    def check_capacity(*, world_size, model_dim, experts, topk, mtpr):
+        """-> the receive rows for up to ``mtpr`` tokens per rank: every route of every
+        rank (the real top-k; the padding slots take no row) plus one partial block per
+        local expert. Refuses an ``mtpr`` whose rows the kernels cannot address."""
+        tcap = 1 << max((int(mtpr) - 1).bit_length(), 1)
+        e_local, H = int(experts) // int(world_size), int(model_dim)
+        s_cap = -(-(NPES * tcap * int(topk) + e_local * BLOCK_M) // BLOCK_M) * BLOCK_M
+        if s_cap >= 1 << row_bits(int(experts)) or s_cap * H >= BUFFER_BYTES_MAX:
+            raise ValueError(
+                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
+                "the 2 GiB the kernels address with i32 offsets"
+            )
+        return s_cap
+
     def __init__(
         self,
         *,
@@ -1278,14 +1292,9 @@ class MainRuntime:
         _, _, _, arrived = ws_layout(e_local)
         self.token_shift = max((int(mtpr) - 1).bit_length(), 1)
         self.tcap = tcap = 1 << self.token_shift
-        # Every route of every rank (the real top-k; the padding slots take no row),
-        # plus one partial block per local expert.
-        s_cap = -(-(NPES * tcap * topk + e_local * BLOCK_M) // BLOCK_M) * BLOCK_M
-        if s_cap >= 1 << row_bits(int(experts)) or s_cap * H >= BUFFER_BYTES_MAX:
-            raise ValueError(
-                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
-                "the 2 GiB the kernels address with i32 offsets"
-            )
+        s_cap = self.check_capacity(
+            world_size=world_size, model_dim=H, experts=experts, topk=topk, mtpr=mtpr
+        )
         self.s_cap, self.nblk = s_cap, s_cap // BLOCK_M
         sym = host.symmetric
         bufs = {

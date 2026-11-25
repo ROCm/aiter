@@ -37,7 +37,10 @@ partial block per expert), so no route is dropped. The main path's buffers at
 max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
 (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory (top-6); the
 largest is 8192 at top-6 and 4096 at top-8 (the receive buffer stays below 2 GiB).
-large_M takes about the same, small_M at 128 tokens per rank 0.18 GiB of the heap.
+large_M takes about the same, small_M at 128 tokens per rank 0.18 GiB of the heap; its
+fixed slots (8 x small-input tokens per rank, per local expert) stay below 2 GiB up to
+2040 tokens per rank (1088 on DeepSeek-V4.1-Flash's layer). A capacity past these is
+refused before any symmetric allocation.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -56,6 +59,12 @@ fall more than about 2^99 below an earlier group's, or the accumulator overflows
 Activations after RMSNorm, and the gemm1 outputs (silu(gate) * up) that gemm2 rescales
 the same way, are far inside this; ``forward_prequant`` callers must keep ``x_scale``
 so. large_M scales each K block's partial products before adding them: no such bound.
+
+FP8 quantization in these kernels (x on the main path and small_M, the gemm1 output on
+every path): scale max(amax, 2^-117) / 240 per group. Below the floor, 240 / amax would
+overflow FP32 (2^-120.1) and amax / 240 be subnormal; a group under it still gets
+normal FP8 for its largest values. large_M's ``forward`` quantizes x with aiter's
+per_1x128 quant, which floors amax at 1e-10 instead.
 """
 
 from contextlib import nullcontext
@@ -183,8 +192,11 @@ class MegaMoEGfx942:
         if small_m_enabled is None:
             small_m_enabled = envs.AITER_MEGA_SMALL_M
         # large_M quantizes x per 1x128 only.
+        large_on = bool(large_m_enabled) and x_quant == "per_1x128"
+        small_mtpr = max(int(m) for m in small_m_mtprs) if small_m_enabled else 0
+        self._check_capacities(large_on, small_mtpr)
         self._large = None
-        if large_m_enabled and x_quant == "per_1x128":
+        if large_on:
             from .large_m.host import LargeMRuntime
 
             self._large = LargeMRuntime(
@@ -205,9 +217,8 @@ class MegaMoEGfx942:
             )
         self._large_on = self._large is not None
         self._main = None if self._large_on else self._main_runtime(self.mtpr)
-        self._small, self._small_mtpr = None, 0
+        self._small, self._small_mtpr = None, small_mtpr
         if small_m_enabled:
-            self._small_mtpr = max(int(m) for m in small_m_mtprs)
             if quant == "a8w4":
                 from .small_m import SmallMRuntime
 
@@ -227,6 +238,34 @@ class MegaMoEGfx942:
             else:
                 # The small kernel streams fd2 MXFP4 W only.
                 self._small = self._main_runtime(self._small_mtpr)
+
+    def _check_capacities(self, large_on, small_mtpr):
+        """Refuse a capacity whose buffers the kernels cannot address before the first
+        collective allocation: every rank raises, and none keeps symmetric buffers."""
+        shape = {
+            "world_size": self.world_size,
+            "model_dim": self.model_dim,
+            "experts": self.experts,
+            "topk": self.topk,
+        }
+        from .main import MainRuntime
+
+        if large_on:
+            from .large_m.host import LargeMRuntime
+
+            LargeMRuntime.check_capacity(**shape, max_tok_per_rank=self.mtpr)
+        else:
+            MainRuntime.check_capacity(**shape, mtpr=self.mtpr)
+        if not small_mtpr:
+            return
+        if self.quant == "a8w4":
+            from .small_m import SmallMRuntime
+
+            SmallMRuntime.check_capacity(
+                **shape, inter_dim=self.inter_dim, tmax=self.world_size * small_mtpr
+            )
+        else:
+            MainRuntime.check_capacity(**shape, mtpr=small_mtpr)
 
     def _main_runtime(self, mtpr):
         from .main import MainRuntime

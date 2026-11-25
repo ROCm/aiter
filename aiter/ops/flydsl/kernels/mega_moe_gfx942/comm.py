@@ -29,7 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .atomic import _latomic_add, _sys_load_at, _sys_store_at
-from .cvt import _abs_bits, _fp8x4_pack
+from .cvt import _abs_bits, _amax_floor, _fp8x4_pack
 from .hw import _sleep, _u
 from .mem import (
     _ld,
@@ -98,7 +98,8 @@ def _scan(v, lane, seg):
 
 def mega_quant_kernel(*, H, QX=1):
     """x bf16 [T, H] -> x8 fp8 [T, H] + xs f32 scales (QX 1: [T, H / 128], one per (token,
-    128 columns); QX 0: [T], one per token; amax / 240, 1 for an all-zero group / row), and
+    128 columns); QX 0: [T], one per token; max(amax, 2^-117) / 240, 1 for an all-zero
+    group / row), and
     out [T, H] bf16 (the combine target) zeroed; quant == 0: only the zeroing. QX 1: one
     wave per (token, 512 columns): a lane holds 8 columns, a 128-column group is 16 lanes;
     QX 0: one wave per token: a lane holds 8 columns of every 512."""
@@ -144,9 +145,8 @@ def mega_quant_kernel(*, H, QX=1):
                     am = fx.max(am, _abs_bits(f[i]))
                 for s in range_constexpr(4):
                     am = fx.max(am, am.shuffle_xor(1 << s, 64))
-                am = am.bitcast(fx.Float32)
-                scale = (am == fx.Float32(0.0)).select(
-                    fx.Float32(1.0), am / fx.Float32(240.0)
+                scale = (am == 0).select(
+                    fx.Float32(1.0), _amax_floor(am) / fx.Float32(240.0)
                 )
                 inv = fx.Float32(1.0) / scale
                 q = Vec.from_elements(
@@ -199,9 +199,8 @@ def mega_quant_kernel(*, H, QX=1):
                     fs.append(fc)
                 for s in range_constexpr(6):
                     am = fx.max(am, am.shuffle_xor(1 << s, 64))
-                am = am.bitcast(fx.Float32)
-                scale = (am == fx.Float32(0.0)).select(
-                    fx.Float32(1.0), am / fx.Float32(240.0)
+                scale = (am == 0).select(
+                    fx.Float32(1.0), _amax_floor(am) / fx.Float32(240.0)
                 )
                 inv = fx.Float32(1.0) / scale
                 x8_rs = _rsrc(x8, fx.Int64(tokens) * fx.Int64(H))

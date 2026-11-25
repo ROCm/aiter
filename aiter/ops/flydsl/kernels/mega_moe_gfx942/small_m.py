@@ -64,7 +64,7 @@ from .atomic import (
     _sys_load_at,
     _sys_store_at,
 )
-from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
+from .cvt import _abs_bits, _amax_floor, _channel_factor, _fp8x4_pack
 from .hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, _opaque_tx, _u
 from .kloop import _dispatch_rows, _make_core
 from .mem import (
@@ -83,6 +83,7 @@ from .mem import (
     lds_vec_load,
 )
 from .protocol import (
+    BUFFER_BYTES_MAX,
     NPES,
     SC_EPOCH,
     SC_HEAD,
@@ -373,8 +374,8 @@ def ep_mega_small_kernel(
 
         def quant_row(raw, lane):
             """``load_row``'s chunks -> per lane: CH x 16 fp8 (i32x4) and, in lanes
-            [0, H/128), the f32 scale of 128-col group ``lane`` (amax / 240, 1 for an all-zero
-            group; as mega_quant_kernel); QX 0: ``quant_row_xrow``."""
+            [0, H/128), the f32 scale of 128-col group ``lane`` (max(amax, 2^-117) / 240,
+            1 for an all-zero group; as mega_quant_kernel); QX 0: ``quant_row_xrow``."""
             if const_expr(not QX):
                 return quant_row_xrow(raw)
             qs, ss = [], []
@@ -388,9 +389,8 @@ def ep_mega_small_kernel(
                     am = fx.max(am, _abs_bits(v))
                 for s in (1, 2, 4):  # 8 lanes = one 128-col group
                     am = fx.max(am, am.shuffle_xor(s, 64))
-                am = am.bitcast(fx.Float32)
-                sc = (am == fx.Float32(0.0)).select(
-                    fx.Float32(1.0), am / fx.Float32(240.0)
+                sc = (am == 0).select(
+                    fx.Float32(1.0), _amax_floor(am) / fx.Float32(240.0)
                 )
                 inv = fx.Float32(1.0) / sc
                 qs.append(
@@ -415,7 +415,8 @@ def ep_mega_small_kernel(
 
         def quant_row_xrow(raw):
             """QX 0: ``load_row``'s chunks -> per lane: CH x 16 fp8 (i32x4) and the row's f32
-            scale (amax / 240 over the row, 1 for an all-zero row) in every lane."""
+            scale (max(amax, 2^-117) / 240 over the row, 1 for an all-zero row) in every
+            lane."""
             vals = []
             am = fx.Int32(0)
             for c in range_constexpr(CH):
@@ -428,8 +429,7 @@ def ep_mega_small_kernel(
                 vals.append(vc)
             for s in range_constexpr(6):
                 am = fx.max(am, am.shuffle_xor(1 << s, 64))
-            am = am.bitcast(fx.Float32)
-            sc = (am == fx.Float32(0.0)).select(fx.Float32(1.0), am / fx.Float32(240.0))
+            sc = (am == 0).select(fx.Float32(1.0), _amax_floor(am) / fx.Float32(240.0))
             inv = fx.Float32(1.0) / sc
             qs = [
                 Vec.from_elements(
@@ -746,9 +746,8 @@ def ep_mega_small_kernel(
                     am = fx.Int32(pv[0])
                     for j in range_constexpr(1, WPG):
                         am = fx.max(am, fx.Int32(pv[j]))
-                    am = am.bitcast(fx.Float32)
-                    s = (am == 0.0).select(
-                        fx.Float32(1.0), am * fx.Float32(1.0 / 240.0)
+                    s = (am == 0).select(
+                        fx.Float32(1.0), _amax_floor(am) * fx.Float32(1.0 / 240.0)
                     )
                     inv = fx.Float32(rocdl.rcp(T.f32, _raw(s)))
                     srow = arow + rows[mi]
@@ -1251,6 +1250,40 @@ class SmallMRuntime:
     Negative ids are no routes (their rows stay 0). ``num_cu`` / ``xcds``: CUs and XCDs
     of the GPU (the kernel's grid has ``WPC`` workgroups per CU)."""
 
+    @staticmethod
+    def check_capacity(*, world_size, model_dim, inter_dim, experts, topk, tmax):
+        """Refuses a ``tmax`` whose buffers the kernel cannot address: its fixed slots
+        (``rx``, gemm1's A through one buffer descriptor), the combine rows (``cin``) and
+        gemm2's A (``a2``) each stay below 2 GiB (i32 byte offsets, and a masked lane's
+        offset 0x7FFFFFFF must be out of range), and tmax <= 2^16."""
+        bm = SMALL_KEY["BM"]
+        H, I, topk = int(model_dim), int(inter_dim), int(topk)
+        e_local = int(experts) // int(world_size)
+
+        def too_big(tmax):
+            a2_rows = max(
+                small_max_tiles(topk, tmax, b, e_local) * b for b in (16, 32, 64)
+            )
+            sizes = {
+                "rx": e_local * tmax * H,
+                "cin": tmax * topk * H * 2,
+                "a2": a2_rows * I,
+            }
+            return {k: v for k, v in sizes.items() if v >= BUFFER_BYTES_MAX}
+
+        tmax = -(-int(tmax) // bm) * bm
+        big = too_big(tmax)
+        if big or tmax > 1 << 16:
+            fits = min(tmax, 1 << 16)
+            while fits and too_big(fits):
+                fits -= bm
+            raise ValueError(
+                f"small_M at {tmax // world_size} tokens per rank: "
+                + ", ".join(f"{k} {v / 2**30:.2f} GiB" for k, v in big.items())
+                + f"; the kernel addresses buffers below 2 GiB, at most "
+                f"{fits // world_size} tokens per rank here"
+            )
+
     def __init__(
         self,
         *,
@@ -1269,6 +1302,14 @@ class SmallMRuntime:
         from . import host
         from .protocol import SC_TILE, qx_of
 
+        self.check_capacity(
+            world_size=world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tmax=tmax,
+        )
         # An expert's fixed slots are whole m-tiles of BM rows: tmax rounds up to them
         # (the caller's limit on the tokens of a call stays tmax).
         bm = SMALL_KEY["BM"]

@@ -30,6 +30,11 @@ and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
   finite rows (large_M's stages of 64 rows).
 - test_small_m_below_one_m_tile: small_M with ``small_m_mtprs=(1,)``, fewer fixed slots
   than one m-tile.
+- test_tiny_activations: activations whose 128-column groups have an amax below
+  2^-120.1, where the FP8 factor 240 / amax overflows FP32, with the weights scaled the
+  other way so that the output is ordinary.
+- test_capacity_checked_before_allocation: a capacity whose buffers the kernels cannot
+  address is refused before any symmetric allocation.
 
 The test spawns its 8 processes:
 
@@ -280,8 +285,9 @@ def _gather(t, tokens):
 
 
 @torch.no_grad()
-def run_torch(x, wts, ids, tokens, rank, ref_weights):
+def run_torch(x, wts, ids, tokens, rank, ref_weights, gains=(0, 0)):
     """fp32 reference: this rank's experts on every rank's rows, summed over ranks.
+    ``gains``: w1 and w2 scaled by 2^gains[0] and 2^gains[1] (``_scaled_weights``).
     Returns this rank's rows and the number of routes of all ranks."""
     x_all, wts_all, ids_all = (_gather(t, tokens) for t in (x, wts, ids))
     w1, w2 = ref_weights
@@ -291,7 +297,8 @@ def run_torch(x, wts, ids, tokens, rank, ref_weights):
         if not rows.numel():
             continue
         inp = x_all[rows].float()
-        gate, up = inp @ w1[e, :I].T, inp @ w1[e, I:].T
+        gate = inp @ w1[e, :I].T * 2.0 ** gains[0]
+        up = inp @ w1[e, I:].T * 2.0 ** gains[0]
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
@@ -300,7 +307,7 @@ def run_torch(x, wts, ids, tokens, rank, ref_weights):
             act = act * SITU_LINEAR_BETA * torch.tanh(up / SITU_LINEAR_BETA)
         else:
             act = F.silu(gate) * up
-        down = act @ w2[e].T
+        down = act @ w2[e].T * 2.0 ** gains[1]
         out.index_add_(0, rows, down * wts_all[rows, slots, None])
     dist.all_reduce(out)
     start = sum(tokens[:rank])
@@ -373,15 +380,16 @@ def _prequant(x):
     return aiter.get_torch_quant(aiter.QuantType.per_1x128)(x, quant_dtype=dtypes.fp8)
 
 
-def _run_paths(tokens, paths, inputs, stale, graph, ret, layers=None):
+def _run_paths(tokens, paths, inputs, stale, graph, ret, layers=None, gains=(0, 0)):
     """Run each path on ``inputs`` (after one call on ``stale`` inputs, so a row the call
     does not write keeps a stale value) and check it; fills ``ret``. ``layers``: the
-    instances by name ("main", "large"; small_M runs on "large"), the test's by default.
+    instances by name ("main", "large"; small_M runs on "large"), the test's by default;
+    ``gains``: the weights' (``run_torch``).
     """
     rank = _STATE["rank"]
     layers = layers or _STATE["layers"]
     x, wts, ids = inputs
-    ref, routes = run_torch(x, wts, ids, tokens, rank, _STATE["ref_weights"])
+    ref, routes = run_torch(x, wts, ids, tokens, rank, _STATE["ref_weights"], gains)
     routed = ((ids >= 0) & (ids < E)).any(dim=-1)
     flops, nbytes = _perf(tokens, rank, routes)
     for path in paths:
@@ -518,6 +526,83 @@ def test_small_m_below_one_m_tile(weights):
     _run_paths(tokens, ["small"], inputs, stale, False, {}, layers={"large": mega})
 
 
+def _scaled_weights(weights, w1_gain, w2_gain):
+    """``weights`` (prepare_weights' output) with w1 and w2 scaled by 2^w1_gain and
+    2^w2_gain through their scales: a8w4 adds the gains to the per-channel exponents at
+    the tail of the fd2 scales, a8w8 multiplies the block scales (a block whose scale
+    would flush to 0 keeps it: the 2^-130 blocks of ``_make_weights_a8w8``, whose
+    contribution is below the reference's resolution either way)."""
+    w1, w1_scale, w2, w2_scale = weights
+    scales = []
+    for w, scale, gain in ((w1, w1_scale, w1_gain), (w2, w2_scale, w2_gain)):
+        scale = scale.clone()
+        if _STATE["quant"] == "a8w8":
+            scaled = scale * 2.0**gain
+            scale = torch.where(scaled > 0, scaled, scale)
+        else:
+            tail = w.shape[0] * w.shape[1] * 4
+            scale.view(torch.uint8)[-tail:].view(torch.int32).add_(gain)
+        scales.append(scale)
+    return w1, scales[0], w2, scales[1]
+
+
+def test_tiny_activations(weights):
+    """Activations far below 1, whose 128-column groups have an amax below 2^-120.1
+    (where the FP8 factor 240 / amax overflows FP32), with the weights scaled the other
+    way so that the output is ordinary: gemm1 outputs of about 2^-121 (w1 2^64 times
+    smaller, w2 2^120 times larger) on every path, and x 2^123 times smaller (w1 2^123
+    times larger) on the paths whose x quant is this layer's (main and small_M; large_M's
+    ``forward`` and the ``pq`` paths take aiter's per_1x128 quant)."""
+    rank, layers = _STATE["rank"], _STATE["layers"]
+    tokens = (37, 1, 128, 5, 0, 100, 7, 77)
+    every = ["main", "main pq", "large", "large pq", "small"]
+    cases = ((0, -64, 120, every), (-123, 123, 0, ["main", "small"]))
+    for x_gain, w1_gain, w2_gain, paths in cases:
+        scaled = _scaled_weights(weights, w1_gain, w2_gain)
+        for mega in layers.values():
+            mega.bind_weights(*scaled)
+        seed = _STATE["case"] = _STATE.get("case", 0) + 2
+        x, wts, ids = _make_inputs(tokens, rank, seed)
+        stale = list(_make_inputs(tokens, rank, seed + 1, padding=False))
+        x, stale[0] = x * 2.0**x_gain, stale[0] * 2.0**x_gain
+        gains = (w1_gain, w2_gain)
+        _run_paths(tokens, paths, (x, wts, ids), stale, False, {}, gains=gains)
+    for mega in layers.values():
+        mega.bind_weights(*weights)
+
+
+def test_capacity_checked_before_allocation(weights):
+    """A capacity whose buffers the kernels cannot address is refused before the first
+    symmetric allocation: small_M at 2048 tokens per rank (a8w4: its fixed slots, 8 x
+    2048 rows per local expert, reach 2 GiB; a8w8 runs the main path there, refused at
+    16384), and max_tok_per_rank 16384 (large_M's receive rows)."""
+    import mori.shmem as ms
+
+    rank = _STATE["rank"]
+    small = 2048 if _STATE["quant"] == "a8w4" else 16384
+    cases = {
+        f"small_m_mtprs=({small},)": {
+            "mtpr": MTPR,
+            "small": True,
+            "large": True,
+            "small_mtpr": small,
+        },
+        "max_tok_per_rank=16384": {"mtpr": 16384, "small": False, "large": True},
+    }
+    created, create = [], ms.mori_shmem_create_tensor
+    ms.mori_shmem_create_tensor = lambda *a: created.append(a) or create(*a)
+    try:
+        for name, kwargs in cases.items():
+            try:
+                _layer(rank, weights, **kwargs)
+            except ValueError:
+                continue
+            raise AssertionError(f"{name}: no ValueError")
+    finally:
+        ms.mori_shmem_create_tensor = create
+    assert not created, f"{len(created)} symmetric tensors allocated before refusing"
+
+
 def test_input_checks():
     """Calls the layer refuses before it launches anything: one row more than
     max_tok_per_rank on forward / forward_prequant, and x of another width or dtype on
@@ -609,6 +694,8 @@ def _worker(rank, port, args):
         test_input_checks()
         test_nan_rows_in_two_stage_block()
         test_small_m_below_one_m_tile(weights)
+        test_tiny_activations(weights)
+        test_capacity_checked_before_allocation(weights)
         rows = [
             test_mega_moe_gfx942(tokens, graph)
             for tokens, graph in itertools.product(args.tokens, args.graph)

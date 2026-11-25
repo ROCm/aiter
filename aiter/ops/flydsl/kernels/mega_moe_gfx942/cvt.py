@@ -19,6 +19,18 @@ def _abs_bits(x):
     return fx.absf(fx.Float32(x)).bitcast(fx.Int32)
 
 
+# The least amax an FP8 quantizer scales by, 2^-117 as f32 bits: 240 / amax overflows
+# FP32 below 2^-120.1 and amax / 240 is subnormal below 2^-118.1.
+AMAX_FLOOR_BITS = (127 - 117) << 23
+
+
+def _amax_floor(bits):
+    """An amax as ``_abs_bits``' integer max -> f32, at least 2^-117 (a NaN stays NaN).
+    A group below the floor is quantized on its scale: its largest values still land on
+    normal FP8 for any normal FP32 amax."""
+    return fx.max(bits, fx.Int32(AMAX_FLOOR_BITS)).bitcast(fx.Float32)
+
+
 def _fp8x4_pack(a, b, c, d):
     """Four f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, round to nearest even, and
     map a rounded-to-zero magnitude to +0 (FNUZ has no -0: 0x80 is NaN).

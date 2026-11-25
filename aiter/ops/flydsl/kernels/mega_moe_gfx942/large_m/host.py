@@ -63,6 +63,26 @@ class LargeMRuntime:
     """One rank's EP8 MoE layer on the LDS mega kernel; ``xcds``: XCDs of the GPU, 8 (MI300X)
     or 4 (MI308X)."""
 
+    @staticmethod
+    def check_capacity(*, world_size, model_dim, experts, topk, max_tok_per_rank):
+        """-> the worst-case receive rows: every route of every rank to this rank, plus one
+        partial block per local expert. Refuses a max_tok_per_rank whose rows overflow
+        send_info's row field or reach the buffer descriptors' OOB_OFFSET (a masked lane's
+        offset must stay out of range), or whose routes overflow an ep_plan slice."""
+        tcap = 1 << max(int(max_tok_per_rank - 1).bit_length(), 1)
+        rows = world_size * tcap * topk + experts // world_size * SORT_BLOCK_M
+        s_cap = -(-rows // SORT_BLOCK_M) * SORT_BLOCK_M
+        if s_cap > 1 << ROW_BITS or s_cap * model_dim >= OOB_OFFSET:
+            raise ValueError(
+                f"max_tok_per_rank={max_tok_per_rank}: the worst-case receive buffer of {s_cap} rows x "
+                f"{model_dim} B exceeds the kernels' 2 GiB / 2^{ROW_BITS}-row bound"
+            )
+        if tcap * topk > _PRODUCERS * 8 * 1024:
+            raise ValueError(
+                f"max_tok_per_rank={max_tok_per_rank}: too many routes per ep_plan slice"
+            )
+        return s_cap
+
     def __init__(
         self,
         *,
@@ -111,20 +131,14 @@ class LargeMRuntime:
         self.xcds = int(xcds)
         self.token_shift = max(int(max_tok_per_rank - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
-        # Every route of every rank to this rank, plus one partial block per local expert.
-        rows = world_size * self.tcap * topk + e_local * SORT_BLOCK_M
-        self.s_cap = -(-rows // SORT_BLOCK_M) * SORT_BLOCK_M
-        # send_info's row field, and the buffer descriptors: a masked lane's OOB_OFFSET must stay out of range.
-        if self.s_cap > 1 << ROW_BITS or self.s_cap * model_dim >= OOB_OFFSET:
-            raise ValueError(
-                f"max_tok_per_rank={max_tok_per_rank}: the worst-case receive buffer of {self.s_cap} rows x "
-                f"{model_dim} B exceeds the kernels' 2 GiB / 2^{ROW_BITS}-row bound"
-            )
+        self.s_cap = self.check_capacity(
+            world_size=world_size,
+            model_dim=model_dim,
+            experts=experts,
+            topk=topk,
+            max_tok_per_rank=max_tok_per_rank,
+        )
         self.slices = _PRODUCERS * 8
-        if self.tcap * topk > self.slices * 1024:
-            raise ValueError(
-                f"max_tok_per_rank={max_tok_per_rank}: too many routes per ep_plan slice"
-            )
         self.dev = torch.device("cuda", torch.cuda.current_device())
         H, I, S, dev = model_dim, inter_dim, self.s_cap, self.dev
         self.recv_a = symmetric((S, H), torch.uint8)

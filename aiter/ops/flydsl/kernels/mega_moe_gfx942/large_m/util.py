@@ -100,7 +100,7 @@ class BufferTensor(fx.Tensor):
         if not isinstance(aux, int):
             raise TypeError("aux: expected a compile-time int")
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
-        # Raw buffer load, for the soffset (see buffer_load).
+        # Raw buffer load (see buffer_load).
         result = rocdl.RawPtrBufferLoadOp(
             ir.VectorType.get([bits // 32], fx.Uint32.ir_type),
             resource,
@@ -133,9 +133,8 @@ def _rsrc_of(ptr, num_records_bytes):
 def buffer_load(ty, rsrc, voffset, soffset=0):
     """`ty` at byte offset voffset (per lane) + soffset (wave uniform) of the buffer resource `rsrc`; a lane whose
     offset is past the resource's range reads 0."""
-    # Raw buffer load: the offsets are found at run time (sorted ids, routes, masked lanes at OOB_OFFSET), which has
-    # no layout form for fx.copy, and FlyDSL 0.5.2's buffer copy atoms take no soffset (wave-uniform offsets in
-    # soffset keep them out of the VGPRs).
+    # Raw buffer load: FlyDSL 0.5.3's BufferCopy atoms take a run-time offset and a soffset (in elements), but in
+    # BufferTensor.load they cost the mega kernel 5 more SGPR spills (a8w4: 55 -> 60, gfx942 ISA).
     return fx.rocdl.raw_ptr_buffer_load(
         ty, rsrc, fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), None
     )
@@ -144,7 +143,7 @@ def buffer_load(ty, rsrc, voffset, soffset=0):
 def buffer_store(value, rsrc, voffset, soffset=0, aux=0):
     """Store the SSA `value` at byte offset voffset (per lane) + soffset (wave uniform) of `rsrc`; a lane whose
     offset is past the range stores nothing. aux: cache bits (sc0 1, nt 2, sc1 16)."""
-    # Raw buffer store: as buffer_load, and FlyDSL 0.5.2's buffer copy atoms set no cache bits but nt, while these
+    # Raw buffer store: FlyDSL 0.5.3's buffer copy atoms set no cache bits but nt, while these
     # stores write through (sc1: another XCD sees the data after a vmcnt wait) or to a peer (sc0 sc1 nt).
     rocdl.raw_ptr_buffer_store(
         value,
@@ -169,7 +168,7 @@ def readlane_f32(value, lane):
 
 def set_priority(level):
     """s_setprio `level` for the waves of this workgroup."""
-    # Raw: FlyDSL 0.5.2 has no stable s_setprio (not in fx.rocdl.__all__).
+    # Raw: FlyDSL 0.5.3 has no stable s_setprio (not in fx.rocdl.__all__).
     fx.rocdl.s_setprio(level)
 
 

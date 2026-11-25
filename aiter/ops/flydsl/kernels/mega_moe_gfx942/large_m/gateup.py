@@ -4,7 +4,8 @@
 """gfx942 FP8 block-scale MoE GateUp (BM256) on a 2x4 wave grid, A and B both staged through LDS: the mega
 kernel's GateUp task emitter, with a swiglu_limit clamp.
 
-Per route, SiLU(gate) * up from one FP8 GEMM, quantized to FP8 per (row, 128 columns) with FP32 scale amax / 240
+Per route, SiLU(gate) * up from one FP8 GEMM, quantized to FP8 per (row, 128 columns) with FP32 scale
+max(amax, 2^-117) / 240
 at sorted row block * 256 + row of [blocks * 256, I] (scales [I/128, blocks * 256]), Down's input. B is aiter
 shuffle_weight(16,16) of [E, 2I, K] (gate rows, then up rows); scales are FP32: A [K/128, rows], B
 [E, 2I/128, K/128]. Sorted IDs are (slot << 24) | token; padding rows use an invalid token or slot, and blocks past
@@ -29,7 +30,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..cvt import _abs_bits
+from ..cvt import _abs_bits, _amax_floor
 from ..hw import _sched_fence
 from ..hw import _u as _uniform
 from .util import (
@@ -620,12 +621,12 @@ def gateup_task_emitter(
                 return result
 
             def row_max(row):
-                """The row's amax from the column waves' partials (``_abs_bits`` maxima)."""
+                """The row's amax bits, the max of the column waves' partials (``_abs_bits`` maxima)."""
                 partial = Vec(lds_view(ROW_MAX_BASE + row * 4, col_waves).load())
                 peak = fx.Int32(partial[0])
                 for wave_col in range_constexpr(1, col_waves):
                     peak = fx.max(peak, fx.Int32(partial[wave_col]))
-                return peak.bitcast(fx.Float32)
+                return peak
 
             def fp8_epilogue(block, n_tile):
                 # Padding rows (zero A rows) are written too: FP8 zeros with scale 0.
@@ -661,11 +662,11 @@ def gateup_task_emitter(
                 barrier()
                 for m_slice in range_constexpr(m_slices):
                     row = slice_rows[m_slice] + lane % 16
-                    amax = row_max(row)
+                    amax_bits = row_max(row)
                     # |x| <= amax keeps x * 240 / amax within the FP8 range after rounding.
                     with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
-                        reciprocal = fx.Float32(1.0) / amax
-                    inverse = (amax > 0.0).select(
+                        reciprocal = fx.Float32(1.0) / _amax_floor(amax_bits)
+                    inverse = (amax_bits.bitcast(fx.Float32) > 0.0).select(
                         reciprocal * FP8_MAX,
                         fx.Float32(0.0),
                     )
@@ -701,11 +702,17 @@ def gateup_task_emitter(
                         aux=STORE_AUX,
                     )
                 scale_row = tid % SORT_BLOCK_M
+                scale_bits = row_max(scale_row)
                 scale_offset = (
                     (n_tile * num_blocks + block) * SORT_BLOCK_M + scale_row
                 ) * 4
                 buffer_store(
-                    (row_max(scale_row) * (1.0 / FP8_MAX)).ir_value(),
+                    (
+                        (scale_bits == 0).select(
+                            fx.Float32(0.0), _amax_floor(scale_bits)
+                        )
+                        * (1.0 / FP8_MAX)
+                    ).ir_value(),
                     fp8_scale_rsrc,
                     (tid < SORT_BLOCK_M).select(scale_offset, fx.Int32(OOB_OFFSET)),
                     aux=STORE_AUX,
