@@ -373,9 +373,13 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    # The pinned map (v256-v511 operands, v512-v767 accumulators) is two
-    # 128-dword slots. FP4 256x256 is 128 dwords at 2x2 (8*8 + 4*16) and 160
-    # at 1x4 (16*8 + 2*16); placing the wider slot asserts in make_rmem_slot.
+    # The fixed placement gives each of the two k128 prefetch slots 128 VGPRs
+    # (v256-v511) and the accumulators 512 (from v512). The pinned map
+    # (v256-v511 operands, v512-v767 accumulators) is two 128-dword slots.
+    # FP4 256x256 is 128 dwords at 2x2 (8*8 + 4*16) and 160 at 1x4
+    # (16*8 + 2*16); placing the wider slot asserts in make_rmem_slot, and an
+    # a8w4 2x2 tile does not fit either. Such tiles keep compiler allocation
+    # like every non-prefill tile instead of failing to build.
     # Same formula as that assert (ACT_NDW, WMMA_VECTOR_DWORDS = WMMA_N // 2).
     _pin_slot = wmma_m_rep * (8 if a_is_fp4 else 16) + wmma_n_rep * (WMMA_N // 2)
     USE_EXPLICIT_VGPR_PARTITION = bool(
@@ -383,6 +387,7 @@ def build_gemm_a8w4_tdm_task(
         and callable(sched_vgpr)
         and m_warp == n_warp == 2
         and _pin_slot <= 128
+        and n_acc * (WMMA_N // 2) <= 512
     )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
