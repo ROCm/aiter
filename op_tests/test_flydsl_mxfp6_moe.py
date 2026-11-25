@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL MXFP6 grouped MoE (aiter.ops.flydsl.mxfp6_moe), gfx950.
+"""FlyDSL MXFP6 grouped MoE (aiter.ops.flydsl.flydsl_mxfp6_moe), gfx950.
 
 Correctness against torch references and timing, one markdown table per test function:
   test_mfma_contract  the scaled-MFMA operand contract per format pair (packing, K
@@ -27,9 +27,13 @@ No GPU needed (aiter's dry run):
                       LLVM ignores them compiles a slow form with no error: fails
                       unless every 256x256 kernel has no v_accvgpr_* in its K loop and
                       no scratch
-  test_h_layout       the contract of the stage wrappers and of forward for the 6-bit
+  test_h_layout       the contract of the stage wrappers and of the op for the 6-bit
                       h between the stages (nothing compiled): the layout each stage
                       picks, and the ValueErrors raised before a kernel is picked
+  test_contract       the public entry: the calls it takes (casts of the routing
+                      tensors, no tokens) and the ones it refuses before a kernel is
+                      picked (dtype, shape, device, architecture, argument types);
+                      weight preparation on the CPU and its refusals
 
     python3 op_tests/test_flydsl_mxfp6_moe.py
     python3 op_tests/test_flydsl_mxfp6_moe.py -s 8192,4608,64,4 -t 4096 32768 \
@@ -61,7 +65,12 @@ import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.dry_run import dry_run
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-from aiter.ops.flydsl import mxfp6_moe
+from aiter.ops.flydsl import (
+    Mxfp6MoeWeights,
+    flydsl_mxfp6_moe,
+    mxfp6_moe,
+    prepare_mxfp6_moe_weights,
+)
 from aiter.ops.flydsl import mxfp6_moe_kernels as mk
 from aiter.ops.flydsl import mxfp6_moe_policy as policy
 from aiter.ops.flydsl import mxfp6_moe_quant as q
@@ -468,12 +477,12 @@ def _check_moe(out, ref, msg):
 @benchmark()
 def test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
     w1, w2, x, ids, w = _moe_inputs(tokens, hidden, inter, experts, topk)
-    st = mxfp6_moe.prepare(w1, w2, a_fmt=afmt, w_fmt=wfmt)
+    st = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt, w_fmt=wfmt)
 
     # a closure: run_perftest copies its tensor arguments to rotate them, and a
     # layer's weights are fixed between calls
     def run():
-        return mxfp6_moe.forward(x, ids, w, st)
+        return flydsl_mxfp6_moe(x, st, w, ids)
 
     out, us = run_perftest(run, num_iters=20, num_warmup=3, **TIMING)
     det = all(torch.equal(out, run()) for _ in range(3))
@@ -547,14 +556,14 @@ def _empty(*shape, dtype=torch.uint8):
 
 
 def _empty_layer(hidden, inter, experts, afmt, wfmt="e2m3"):
-    """A prepared layer on empty buffers of mxfp6_moe.prepare's shapes (FakeTensors
-    inside aiter's dry run)."""
+    """A prepared layer on empty buffers of prepare_mxfp6_moe_weights' shapes
+    (FakeTensors inside aiter's dry run)."""
     bn1, bn2 = policy.stage_bn(2 * inter, afmt), policy.stage_bn(hidden, afmt)
     b1 = _empty(experts, 2 * inter // bn1, hidden // 128, bn1 // 16, 1536)
     s1 = _empty(experts, 2 * inter // 16, q.kq(hidden), 64, dtype=torch.int32)
     b2 = _empty(experts, hidden // bn2, inter // 128, bn2 // 16, 1536)
     s2 = _empty(experts, hidden // 16, q.kq(inter), 64, dtype=torch.int32)
-    return mxfp6_moe.Mxfp6MoeWeights(
+    return Mxfp6MoeWeights(
         experts=experts,
         model_dim=hidden,
         inter_dim=inter,
@@ -572,7 +581,7 @@ def _empty_layer(hidden, inter, experts, afmt, wfmt="e2m3"):
 
 
 def _config(st, tokens, topk, **kw):
-    """The heuristic's kernels of a call on the prepared layer st, as forward picks
+    """The heuristic's kernels of a call on the prepared layer st, as the op picks
     them; kw: default_config's pad_rows / h_layout."""
     return policy.default_config(
         tokens=tokens,
@@ -591,7 +600,7 @@ def _config(st, tokens, topk, **kw):
 
 
 def _stage_calls(st, tokens, topk, config):
-    """Keyword arguments of the stage 1 and the stage 2 launch as forward makes them,
+    """Keyword arguments of the stage 1 and the stage 2 launch as the op makes them,
     on empty buffers of the op's shapes. h_layout is left out."""
     hidden, inter, afmt = st.model_dim, st.inter_dim, st.a_fmt
     bits = q.FORMATS[afmt][3]
@@ -693,12 +702,15 @@ def test_agpr_form(hidden, inter, experts, topk, tokens, afmt):
     }
 
 
-def _refused(fn, *args, **kwargs):
+def _raises(error, fn, *args, **kwargs):
     try:
         fn(*args, **kwargs)
-    except ValueError:
+    except error:
         return True
     return False
+
+
+_refused = functools.partial(_raises, ValueError)
 
 
 @benchmark()
@@ -720,16 +732,16 @@ def test_h_layout(hidden, inter, experts, topk, tokens, afmt):
         rows_config = _config(st, tokens, topk, h_layout="rows")
 
         def stages(**kw):
-            # fresh buffers per call, as forward allocates them
+            # fresh buffers per call, as the op allocates them
             stage1, stage2 = _stage_calls(st, tokens, topk, config)
             mk.flydsl_mxfp6_moe_stage1(**stage1, **kw)
             mk.flydsl_mxfp6_moe_stage2(**stage2, **kw)
 
-        def forward(cfg=None):
+        def op(cfg=None):
             x = _empty(tokens, hidden, dtype=dtypes.bf16)
             ids = _empty(tokens, topk, dtype=torch.int32)
             w = _empty(tokens, topk, dtype=dtypes.fp32)
-            mxfp6_moe.forward(x, ids, w, st, cfg)
+            flydsl_mxfp6_moe(x, st, w, ids, config=cfg)
 
         # 6-bit: stage 1 writes the h tile-step-major and stage 2 reads it so, unless
         # both are told rows (as the row quantizer writes them); 8-bit: one layout
@@ -737,12 +749,12 @@ def test_h_layout(hidden, inter, experts, topk, tokens, afmt):
         got["stages rows"] = picked(lambda: stages(h_layout="rows")) == (0, 0)
         tile_step = picked(lambda: stages(h_layout="tile_step"))
         got["stages tile_step"] = tile_step == (six, six)
-        # forward gives both stages the layout of its config
-        got["forward default tile_step"] = picked(forward) == (six, six)
-        got["forward rows"] = picked(lambda: forward(rows_config)) == (0, 0)
+        # the op gives both stages the layout of its config
+        got["op default tile_step"] = picked(op) == (six, six)
+        got["op rows"] = picked(lambda: op(rows_config)) == (0, 0)
         # tensors without a version counter, as a serving engine makes them
         with torch.inference_mode():
-            got["inference_mode"] = picked(forward) == (six, six)
+            got["inference_mode"] = picked(op) == (six, six)
 
         # every refusal comes before a kernel is picked
         del calls[:]
@@ -770,13 +782,127 @@ def test_h_layout(hidden, inter, experts, topk, tokens, afmt):
         got["rows of 4 GiB - 4 KiB + 1 refused"] = _refused(s1, **big)
         # both stages run on the routing tiles of the config
         other = dataclasses.replace(config, route_m=384 - m)
-        got["stages on other routing tiles refused"] = _refused(forward, other)
+        got["stages on other routing tiles refused"] = _refused(op, other)
         got["no kernel picked by a refused call"] = not calls
         # ... and the largest rows are taken
         big = {**stage1, "x_rows": _empty(2**32 - 4096)}
         got["rows of 4 GiB - 4 KiB taken"] = not _refused(s1, **big) and len(calls) == 1
     bad = [k for k, v in got.items() if not v]
     assert not bad, f"h layout contract, {afmt}: {bad}"
+    return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
+
+
+@benchmark()
+def test_contract(hidden, inter, experts, topk, tokens, afmt):
+    # host code only, as test_h_layout: no reference and no timing
+    calls, got = [], {}
+    with dry_run(SUPPORTED_GFX[0], DRY_RUN_CU), _host_only(calls):
+        st = _empty_layer(hidden, inter, experts, afmt)
+        good = {
+            "hidden_states": _empty(tokens, hidden, dtype=dtypes.bf16),
+            "weights": st,
+            "topk_weight": _empty(tokens, topk, dtype=dtypes.fp32),
+            "topk_ids": _empty(tokens, topk, dtype=torch.int32),
+        }
+
+        def call(**kw):
+            return flydsl_mxfp6_moe(**{**good, **kw})
+
+        def taken(**kw):
+            """The call ran both stages and returned bf16 [tokens, hidden]."""
+            del calls[:]
+            y = call(**kw)
+            return (
+                len(calls) == 2
+                and y.shape == (tokens, hidden)
+                and y.dtype == dtypes.bf16
+            )
+
+        got["taken"] = taken()
+        # int64 ids and any float weights are cast (bits: test_moe_modes)
+        got["int64 ids taken"] = taken(topk_ids=_empty(tokens, topk, dtype=torch.int64))
+        got["bf16 weights taken"] = taken(
+            topk_weight=_empty(tokens, topk, dtype=dtypes.bf16)
+        )
+        got["config taken"] = taken(config=_config(st, tokens, topk))
+        del calls[:]
+        none = call(
+            hidden_states=_empty(0, hidden, dtype=dtypes.bf16),
+            topk_weight=_empty(0, topk, dtype=dtypes.fp32),
+            topk_ids=_empty(0, topk, dtype=torch.int32),
+        )
+        got["no tokens: [0, H], nothing launched"] = (
+            none.shape == (0, hidden) and none.dtype == dtypes.bf16 and not calls
+        )
+
+        # the kernels read raw pointers: every tensor outside the contract is refused
+        refusals = {
+            "fp32 hidden_states": {
+                "hidden_states": _empty(tokens, hidden, dtype=dtypes.fp32)
+            },
+            "hidden_states of another width": {
+                "hidden_states": _empty(tokens, hidden + 128, dtype=dtypes.bf16)
+            },
+            "1-D hidden_states": {"hidden_states": _empty(hidden, dtype=dtypes.bf16)},
+            "strided hidden_states": {
+                "hidden_states": _empty(tokens, 2 * hidden, dtype=dtypes.bf16)[:, ::2]
+            },
+            "hidden_states on the CPU": {
+                "hidden_states": torch.empty(
+                    tokens, hidden, dtype=dtypes.bf16, device="cpu"
+                )
+            },
+            "swapped routing arguments": {
+                "topk_weight": good["topk_ids"],
+                "topk_ids": good["topk_weight"],
+            },
+            "int16 ids": {"topk_ids": _empty(tokens, topk, dtype=torch.int16)},
+            "ids of another token count": {
+                "topk_ids": _empty(tokens + 1, topk, dtype=torch.int32)
+            },
+            "1-D ids": {"topk_ids": _empty(tokens, dtype=torch.int32)},
+            "integer weights": {"topk_weight": good["topk_ids"]},
+            "weights of another top-k": {
+                "topk_weight": _empty(tokens, topk + 1, dtype=dtypes.fp32)
+            },
+            "ids on the CPU": {
+                "topk_ids": torch.empty(tokens, topk, dtype=torch.int32, device="cpu")
+            },
+        }
+        for name, kw in refusals.items():
+            got[f"{name} refused"] = _refused(call, **kw)
+        fields = dataclasses.astuple(st)
+        got["weights not a prepared layer refused"] = _raises(
+            TypeError, call, weights=fields
+        )
+        stage = _config(st, tokens, topk).stage1
+        got["config of one stage refused"] = _raises(TypeError, call, config=stage)
+        with mock.patch.object(mxfp6_moe, "get_gfx_runtime", lambda: "gfx942"):
+            got["gfx942 refused"] = _raises(RuntimeError, call)
+        got["no kernel picked by a refused call"] = not calls
+
+    # weight preparation is torch only: a layer of the smallest shape, on the CPU
+    E, H, I = 2, 256, 128
+    w1, w2 = torch.randn(E, 2 * I, H), torch.randn(E, H, I)
+    cpu = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt)
+    bn1, bn2 = cpu.slab_n1, cpu.slab_n2
+    got["prepared on the CPU"] = (
+        cpu.w1_frags.shape == (E, 2 * I // bn1, H // 128, bn1 // 16, 1536)
+        and cpu.w1_scales.shape == (E, 2 * I // 16, q.kq(H), 64)
+        and cpu.w2_frags.shape == (E, H // bn2, I // 128, bn2 // 16, 1536)
+        and cpu.w2_scales.shape == (E, H // 16, q.kq(I), 64)
+        and (cpu.experts, cpu.model_dim, cpu.inter_dim) == (E, H, I)
+    )
+    prep = prepare_mxfp6_moe_weights
+    got["2-D w1 refused"] = _refused(prep, w1[0], w2)
+    got["w1 without up rows refused"] = _refused(prep, w1[:, :I], w2)
+    got["w2 of another expert count refused"] = _refused(prep, w1, w2[:1])
+    got["hidden of 192 refused"] = _refused(prep, w1[:, :, :192], w2[:, :192])
+    got["integer w1 refused"] = _refused(prep, w1.int(), w2)
+    got["unknown a_fmt refused"] = _refused(prep, w1, w2, a_fmt="e2m1")
+    got["e4m3 weights refused"] = _refused(prep, w1, w2, w_fmt="e4m3")
+    bad = [k for k, v in got.items() if not v]
+    assert not bad, f"op contract, {afmt}: {bad}"
     return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
 
 
@@ -815,32 +941,35 @@ def test_moe_paths(hidden, inter, experts, topk, tokens, afmt, wfmt, reach):
 @benchmark()
 def test_moe_modes(tokens, hidden, inter, experts, topk, wfmt, afmt):
     w1, w2, x, ids, w = _moe_inputs(tokens, hidden, inter, experts, topk)
-    st = mxfp6_moe.prepare(w1, w2, a_fmt=afmt, w_fmt=wfmt)
+    st = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt, w_fmt=wfmt)
     ref = run_torch_mx(x, ids, w, w1, w2, wfmt, afmt)
     six = int(q.FORMATS[afmt][3] == 6)
-    forward = mxfp6_moe.forward
+    op = flydsl_mxfp6_moe
+    ids64, w64 = ids.long(), w.double()
 
     def layout(h_layout):  # the heuristic's kernels for this layout of the h
         config = _config(st, tokens, topk, h_layout=h_layout)
-        return lambda: forward(x, ids, w, st, config)
+        return lambda: op(x, st, w, ids, config=config)
 
     def inference_mode():
         # as a serving engine runs the model: no tensor made here has a version
         # counter
         with torch.inference_mode():
-            return forward(x.clone(), ids, w, st)
+            return op(x.clone(), st, w, ids)
 
     def no_grad():
         with torch.no_grad():
-            return forward(x, ids, w, st)
+            return op(x, st, w, ids)
 
     candidates = {
-        "default": lambda: forward(x, ids, w, st),
+        "default": lambda: op(x, st, w, ids),
         "rows": layout("rows"),
         "tile_step": layout("tile_step"),
         "inference_mode": inference_mode,
         "no_grad": no_grad,
-        "requires_grad": lambda: forward(x.clone().requires_grad_(), ids, w, st),
+        "requires_grad": lambda: op(x.clone().requires_grad_(), st, w, ids),
+        # int64 ids and fp64 routing weights, cast by the op
+        "cast": lambda: op(x, st, w64, ids64),
     }
     flops, nbytes = _moe_work(tokens, hidden, inter, experts, topk, afmt)
     ret, outs, calls = {"gfx": get_gfx_runtime()}, {}, []
@@ -952,8 +1081,8 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=[(2048, 1024, 8, 4, 4096), (1152, 640, 16, 8, 300)],
-        help="hidden,inter,experts,topk,tokens of the h layouts and autograd modes\n"
-        "(256-row and 128-row tiles)",
+        help="hidden,inter,experts,topk,tokens of the h layouts, the autograd modes\n"
+        "and the op contract (256-row and 128-row tiles)",
     )
     args = parser.parse_args()
 
@@ -968,6 +1097,10 @@ def main():
             test_h_layout(*c, af)
             for c, af in itertools.product(args.agpr + args.modes, args.afmt)
         ],
+    )
+    summarize(
+        "contract",
+        [test_contract(*c, af) for c, af in itertools.product(args.modes, args.afmt)],
     )
     gfx = get_gfx_runtime() if torch.cuda.is_available() else "no GPU"
     if gfx not in SUPPORTED_GFX:
