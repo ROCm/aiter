@@ -88,6 +88,7 @@ NONE_WRAPPED_OP = [
     # "hipb_create_extension",
     # "hipb_destroy_extension",
     "getHipblasltKernelName",
+    "_hipb_w4a16_kernel_name",
     # "rocb_create_extension",
     # "rocb_destroy_extension",
     "get_graph_buffer_ipc_meta",

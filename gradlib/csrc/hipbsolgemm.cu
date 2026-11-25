@@ -15,6 +15,8 @@
 #include <array>
 #include <atomic>
 #include <fcntl.h>
+#include <fstream>
+#include <sstream>
 #include <unordered_map>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -1778,6 +1780,8 @@ struct W4A16Plan
     hipblasLtMatrixLayout_t layout_b = nullptr;
     hipblasLtMatrixLayout_t layout_d = nullptr;
     hipblasLtMatmulAlgo_t algo{};
+    // The heuristic returned a kernel (algo). A plan without one keeps its descriptors when they
+    // were created: the kernel table can still pick a kernel the heuristic does not rank.
     bool found = false;
 };
 
@@ -1787,8 +1791,8 @@ using W4A16PlanKey = std::
     tuple<bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, bool, int64_t>;
 std::map<W4A16PlanKey, W4A16Plan> w4a16_plans;
 
-// The heuristic's choice depends on the batch size, so plans are keyed on it, bucketed to the next
-// power of two to bound the cache: decode (M = 1) and each prefill octave get their own query.
+// Next power of two of the batch: the batches hipb_w4a16_is_supported is usually asked about, and
+// the fallback plan when the heuristic has no kernel at an exact batch.
 int64_t w4a16_batch_bucket(int64_t m)
 {
     int64_t b = 1;
@@ -1802,6 +1806,8 @@ struct W4A16Launch
     W4A16Plan* plan        = nullptr;
     size_t workspace_bytes = 0;
     bool fuses_bias        = false;
+    // The plan's algo unless the kernel table picked another kernel for this exact batch.
+    hipblasLtMatmulAlgo_t algo{};
 };
 
 // Keyed like the plans, with the exact batch last.
@@ -1818,9 +1824,28 @@ void w4a16_release(W4A16Plan& plan)
     plan = W4A16Plan{};
 }
 
+// Optional kernel table (hipb_w4a16_set_table): for known layers, the kernel measured fastest at
+// each batch among every kernel hipBLASLt accepts for the problem, including those its heuristic
+// never ranks. Other problems keep the heuristic's pick.
+// (type, N, K, lda, ldb, ldd) -> (m_lo, m_hi, kernel config) batch intervals; type is
+// "<bf16|fp16>_zp<0|1>_g<group>_e<int4 encoding>".
+using W4A16TableKey = std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t>;
+using W4A16Table =
+    std::map<W4A16TableKey, std::vector<std::tuple<int64_t, int64_t, std::string>>>;
+std::optional<W4A16Table> w4a16_table;
+
+struct W4A16Candidate
+{
+    hipblasLtMatmulAlgo_t algo;
+    std::string cfg;
+};
+// Every W4A16 kernel of hipBLASLt for fp16 [0] and bf16 [1] activations.
+std::array<std::optional<std::vector<W4A16Candidate>>, 2> w4a16_candidates;
+
 void w4a16_destroy_plans()
 {
     w4a16_launches.clear();
+    w4a16_candidates = {};
     for(auto& [key, plan] : w4a16_plans)
         w4a16_release(plan);
     w4a16_plans.clear();
@@ -1828,7 +1853,8 @@ void w4a16_destroy_plans()
 
 // Builds (once) the descriptor for this problem at batch `query_m` and asks the heuristic for a
 // solution. A missing kernel is not an error: the plan records found=false, whether the heuristic
-// returns no result or rejects the problem (e.g. no solution library for this device). `scale`
+// returns no result or rejects the problem (e.g. no solution library for this device); only a
+// failed descriptor leaves the plan without handles. `scale`
 // only has to be non-null for the query (the heuristic offers no block-scale solution without
 // it); the real pointer is set per call, and so is the bias pointer of a `bias` plan, which adds
 // an [N] vector in the activation dtype to each output row.
@@ -1912,7 +1938,7 @@ W4A16Plan& w4a16_get_plan(bool bf16,
         plan.found = true;
         plan.algo  = result.algo;
     }
-    else
+    else if(status != HIPBLAS_STATUS_SUCCESS)
         w4a16_release(plan);
     return w4a16_plans.emplace(key, plan).first->second;
 }
@@ -2002,9 +2028,89 @@ hipblasStatus_t w4a16_set_batch(W4A16Plan& plan, int64_t m)
     return status;
 }
 
-// The plan and workspace size for an exact batch, resolved once and without launching: the
-// power-of-two bucket's plan when hipBLASLt accepts its kernel for this batch (hand-written
-// kernels can exclude batches through their problem predicates), else a plan queried at the batch.
+// Kernel identity the table is keyed on, shared across activation types: macro tile and Stream-K
+// flag (MT64x32x128_SK, MT2x3x512).
+std::string w4a16_cfg_of(const std::string& name)
+{
+    const auto mt = name.find("MT");
+    if(mt == std::string::npos)
+        return name;
+    const auto end = name.find('_', mt);
+    return name.substr(mt, end - mt) + (name.find("_SK") != std::string::npos ? "_SK" : "");
+}
+
+const std::vector<W4A16Candidate>& w4a16_candidates_for(bool bf16)
+{
+    auto& cached = w4a16_candidates[bf16];
+    if(cached)
+        return *cached;
+    const hipDataType act = bf16 ? HIP_R_16BF : HIP_R_16F;
+    std::vector<hipblasLtMatmulHeuristicResult_t> all;
+    std::vector<W4A16Candidate> cands;
+    if(hipblaslt_ext::getAllAlgos(hipblaslt_handle,
+                                  hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
+                                  HIPBLAS_OP_T,
+                                  HIPBLAS_OP_N,
+                                  HIP_R_4I,
+                                  act,
+                                  act,
+                                  act,
+                                  HIPBLAS_COMPUTE_32F,
+                                  all) == HIPBLAS_STATUS_SUCCESS)
+        for(auto& r : all)
+            cands.push_back(
+                {r.algo,
+                 w4a16_cfg_of(hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, r.algo))});
+    return *(cached = std::move(cands));
+}
+
+// The table's kernel for the plan's problem at its current batch; false when the layer or batch
+// is not in the table or hipBLASLt does not accept its kernel.
+bool w4a16_table_pick(const W4A16Problem& p,
+                  int64_t group_size,
+                  bool has_zp,
+                  int64_t int4_encoding,
+                  W4A16Plan& plan,
+                  hipblasLtMatmulAlgo_t& out,
+                  size_t& out_ws)
+{
+    const std::string type = std::string(p.bf16 ? "bf16" : "fp16") + "_zp" + (has_zp ? "1" : "0") +
+                             "_g" + std::to_string(group_size) + "_e" +
+                             std::to_string(int4_encoding);
+    const auto t = w4a16_table->find({type, p.n, p.k, p.lda, p.ldb, p.ldd});
+    if(t == w4a16_table->end())
+        return false;
+    const auto iv = std::find_if(t->second.begin(), t->second.end(), [&](const auto& x) {
+        return std::get<0>(x) <= p.m && p.m <= std::get<1>(x);
+    });
+    if(iv == t->second.end())
+        return false;
+    const float alpha = 1.0f, beta = 0.0f;
+    for(const auto& cand : w4a16_candidates_for(p.bf16))
+    {
+        if(cand.cfg != std::get<2>(*iv))
+            continue;
+        out = cand.algo;
+        if(hipblaslt_ext::matmulIsAlgoSupported(hipblaslt_handle,
+                                                plan.desc,
+                                                &alpha,
+                                                plan.layout_a,
+                                                plan.layout_b,
+                                                &beta,
+                                                plan.layout_d,
+                                                plan.layout_d,
+                                                out,
+                                                out_ws) == HIPBLAS_STATUS_SUCCESS)
+            return true;
+    }
+    return false;
+}
+
+// The plan and workspace size for an exact batch, resolved once and without launching. The
+// heuristic picks the macro tile for the batch it is given, so it is queried at the exact batch:
+// a kernel picked for the power-of-two bucket can quantize this batch badly (M = 412 queried as
+// 512). The bucket's plan is the fallback, which keeps hipb_w4a16_is_supported's answer for the
+// buckets valid at every batch they cover.
 // With `has_bias`, a kernel with the bias epilogue is preferred; without one the launch leaves the
 // bias to the caller (fuses_bias=false).
 W4A16Launch& w4a16_resolve(const W4A16Problem& p,
@@ -2020,11 +2126,33 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
         return it->second;
 
     W4A16Launch launch;
+    if(w4a16_table)
+    {
+        // The table's kernels have no bias epilogue: the caller adds the bias.
+        W4A16Plan& plan = w4a16_get_plan(p.bf16,
+                                         p.n,
+                                         p.k,
+                                         p.lda,
+                                         p.ldb,
+                                         p.ldd,
+                                         group_size,
+                                         has_zp,
+                                         int4_encoding,
+                                         false,
+                                         p.m,
+                                         scale);
+        hipblasLtMatmulAlgo_t algo{};
+        size_t workspace_bytes = 0;
+        if(plan.desc && w4a16_set_batch(plan, p.m) == HIPBLAS_STATUS_SUCCESS &&
+           w4a16_table_pick(p, group_size, has_zp, int4_encoding, plan, algo, workspace_bytes))
+            return w4a16_launches.emplace(key, W4A16Launch{&plan, workspace_bytes, false, algo})
+                .first->second;
+    }
     const float alpha = 1.0f, beta = 0.0f;
     const int64_t bucket = w4a16_batch_bucket(p.m);
-    // Epilogue kernels first, then the bucket before the exact batch.
+    // Epilogue kernels first, then exact batch before bucket.
     for(auto [bias, query_m] :
-        {std::pair<bool, int64_t>{true, bucket}, {true, p.m}, {false, bucket}, {false, p.m}})
+        {std::pair<bool, int64_t>{true, p.m}, {true, bucket}, {false, p.m}, {false, bucket}})
     {
         if(bias && !has_bias)
             continue;
@@ -2055,7 +2183,7 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
                                                 algo,
                                                 workspace_bytes) == HIPBLAS_STATUS_SUCCESS)
         {
-            launch = {&plan, workspace_bytes, bias};
+            launch = {&plan, workspace_bytes, bias, algo};
             break;
         }
     }
@@ -2087,6 +2215,57 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
 } // namespace
 #endif
 
+void hipb_w4a16_set_table(const std::string& path)
+{
+    aiter_detail::g_aiter_can_throw = true;
+#if AITER_HIPBLASLT_HAS_W4A16
+    w4a16_launches.clear();
+    if(path.empty())
+    {
+        w4a16_table.reset();
+        return;
+    }
+    std::ifstream in(path);
+    AITER_CHECK(in.good(), "hipb_w4a16_set_table: cannot read ", path);
+    W4A16Table table;
+    std::string line;
+    while(std::getline(in, line))
+    {
+        if(line.empty() || line[0] == '#')
+            continue;
+        std::vector<std::string> f;
+        std::stringstream ss(line);
+        for(std::string tok; std::getline(ss, tok, ',');)
+            f.push_back(tok);
+        // layer,type,N,K,lda,ldb,ldd,<m_hi>:<config> ...: consecutive batch intervals from 1.
+        AITER_CHECK(f.size() == 8 && f[0] == "layer",
+                    "hipb_w4a16_set_table: bad line in ",
+                    path,
+                    ": ",
+                    line);
+        auto& ivs = table[{f[1],
+                           std::stoll(f[2]),
+                           std::stoll(f[3]),
+                           std::stoll(f[4]),
+                           std::stoll(f[5]),
+                           std::stoll(f[6])}];
+        std::stringstream iv(f[7]);
+        int64_t lo = 1;
+        for(std::string tok; iv >> tok;)
+        {
+            const auto colon = tok.find(':');
+            AITER_CHECK(colon != std::string::npos,
+                        "hipb_w4a16_set_table: bad interval in ",
+                        path);
+            const int64_t hi = std::stoll(tok.substr(0, colon));
+            ivs.emplace_back(lo, hi, tok.substr(colon + 1));
+            lo = hi + 1;
+        }
+    }
+    w4a16_table = std::move(table);
+#endif
+}
+
 bool hipb_w4a16_is_supported(bool bf16,
                              int64_t n,
                              int64_t k,
@@ -2108,10 +2287,29 @@ bool hipb_w4a16_is_supported(bool bf16,
         return false;
     if(int4_encoding < 0 || int4_encoding >= HIPBLASLT_INT4_ENCODING_END_EXT)
         return false;
+    // With a table, a batch is supported when it finds a kernel, ranked by the heuristic or not.
     for(int64_t m : batch_sizes)
-        if(!w4a16_get_plan(
-                bf16, n, k, lda, ldb, ldd, group_size, has_zp, int4_encoding, false, m, d_workspace)
-                .found)
+        if(w4a16_table
+               ? !w4a16_resolve({bf16, m, n, k, lda, ldb, ldd},
+                                group_size,
+                                has_zp,
+                                int4_encoding,
+                                false,
+                                d_workspace)
+                      .plan
+               : !w4a16_get_plan(bf16,
+                                 n,
+                                 k,
+                                 lda,
+                                 ldb,
+                                 ldd,
+                                 group_size,
+                                 has_zp,
+                                 int4_encoding,
+                                 false,
+                                 m,
+                                 d_workspace)
+                      .found)
             return false;
     return true;
 #else
@@ -2143,6 +2341,31 @@ int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
                 "hipb_w4a16_workspace_size: aiter was built against hipBLASLt headers without the "
                 "w4a16 API");
     return 0;
+#endif
+}
+
+// Name of the kernel hipb_w4a16_mm launches for this problem (strides in elements, lda in int4
+// elements), resolved as a launch would; "" when hipBLASLt has none.
+std::string hipb_w4a16_kernel_name(bool bf16,
+                                   int64_t m,
+                                   int64_t n,
+                                   int64_t k,
+                                   int64_t lda,
+                                   int64_t ldb,
+                                   int64_t ldd,
+                                   int64_t group_size,
+                                   bool has_zp,
+                                   int64_t int4_encoding)
+{
+    aiter_detail::g_aiter_can_throw = true;
+#if AITER_HIPBLASLT_HAS_W4A16
+    w4a16_check_extension();
+    w4a16_check_current_device(extension_device);
+    const W4A16Problem p{bf16, m, n, k, lda, ldb, ldd};
+    W4A16Launch& launch = w4a16_resolve(p, group_size, has_zp, int4_encoding, false, d_workspace);
+    return launch.plan ? hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, launch.algo) : "";
+#else
+    return "";
 #endif
 }
 
@@ -2235,7 +2458,7 @@ bool hipb_w4a16_mm(const aiter_tensor_t& x,
                                  plan.layout_d,
                                  result.data_ptr(),
                                  plan.layout_d,
-                                 &plan.algo,
+                                 &launch.algo,
                                  workspace_ptr,
                                  workspace_bytes,
                                  aiter::getCurrentHIPStream());
@@ -2377,6 +2600,23 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("group_size"),
           py::arg("has_zp"),
           py::arg("int4_encoding"));
+    m.def("hipb_w4a16_kernel_name",
+          &hipb_w4a16_kernel_name,
+          "hipb_w4a16_kernel_name",
+          py::arg("bf16"),
+          py::arg("m"),
+          py::arg("n"),
+          py::arg("k"),
+          py::arg("lda"),
+          py::arg("ldb"),
+          py::arg("ldd"),
+          py::arg("group_size"),
+          py::arg("has_zp"),
+          py::arg("int4_encoding"));
+    m.def("hipb_w4a16_set_table",
+          &hipb_w4a16_set_table,
+          "hipb_w4a16_set_table",
+          py::arg("path"));
     m.def("hipb_w4a16_workspace_size",
           &hipb_w4a16_workspace_size,
           "hipb_w4a16_workspace_size",
