@@ -998,7 +998,9 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192)) and cap == required_cap
+    return (npes, experts_per_rank) in (
+        (8, 48), (8, 49), (4, 96), (2, 192)
+    ) and cap == required_cap
 
 
 # fmt: off

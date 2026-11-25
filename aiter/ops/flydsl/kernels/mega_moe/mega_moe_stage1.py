@@ -29,6 +29,7 @@ from .dispatch import (
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
+    FIXED_SLOT_EXPERTS_PER_RANK,
     INDEXED_PAYLOAD_MIN_MTPR,
     Stage1Config,
     fixed_stage1_epoch_slot,
@@ -54,8 +55,17 @@ def _validate_fixed_slot_geometry(
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         raise ValueError("fixed-slot requires positive tile and token capacities")
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    if npes != 8 or experts_per_rank != 48 or cap != required_cap:
-        raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+    if (
+        npes != 8
+        or experts_per_rank not in FIXED_SLOT_EXPERTS_PER_RANK
+        or cap != required_cap
+    ):
+        raise ValueError(
+            "fixed-slot dispatch requires the direct EP8 layout with "
+            f"{FIXED_SLOT_EXPERTS_PER_RANK} experts per rank "
+            f"(npes={npes}, experts_per_rank={experts_per_rank}, cap={cap}, "
+            f"required={required_cap})"
+        )
 
 
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
@@ -185,7 +195,7 @@ def compile_mega_moe_stage1(
     assert WORK_SHARDS in (1, 2, 4, 8)
     NARROW_FINAL_A = (
         compact_dispatch and model_dim == 5120 and inter_dim == 2304
-        and fuse_npes == 8 and experts_per_rank == 48 and fuse_topk == 6
+        and fuse_npes == 8 and (experts_per_rank, fuse_topk) in ((48, 6), (49, 7))
         and fuse_mtpr >= 8192 and sort_block_m == 128 and tile_n == 512
         and NUM_WAVES == 8 and pipe_weights and async_a_copy
         and a_dtype == "fp8" and out_dtype == "fp8"

@@ -86,6 +86,17 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    # EP8 DeepSeek-V4.1-Flash with each rank's shared expert as its 49th local
+    # expert: six routed slots among the 48 routed experts of the ranks, and the
+    # token's own rank's shared expert, weight 1, as the seventh
+    # (_shared_expert_routes).
+    "v41_flash_shared": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 392,
+        "topk": 7,
+        "swiglu_limit": 10.0,
+    },
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
@@ -265,11 +276,41 @@ def _make_inputs(
             else:
                 ids[:, -2] = destination[:, 0] * local_experts + local_experts - 2
                 ids[:, -1] = destination[:, 0] * local_experts + local_experts - 1
+    weights = values.softmax(dim=-1)
+    if (experts, topk) == SHARED_EXPERT_LAYOUT and not (
+        concentrate_experts
+        or force_fanout_boundary
+        or inject_invalid_route
+        or force_padding_boundary
+    ):
+        weights, ids = _shared_expert_routes(scores, rank)
     return (
         x.contiguous(),
-        values.softmax(dim=-1).contiguous(),
+        weights.contiguous(),
         ids.to(torch.int32).contiguous(),
     )
+
+
+# (experts, topk) of EP8 DeepSeek-V4.1-Flash with its shared expert fused.
+SHARED_EXPERT_LAYOUT = (392, 7)
+
+
+def _shared_expert_routes(scores, rank, world=8, routed_per_rank=48):
+    """Six routed slots over the ranks' routed experts (each rank's first 48
+    local experts), then the sender rank's shared expert (its 49th), weight 1:
+    the routes ATOM's local-replica shared expert produces."""
+    tokens = scores.shape[0]
+    local = routed_per_rank + 1
+    routed = scores.view(tokens, world, local)[:, :, :routed_per_rank]
+    values, flat = torch.topk(routed.reshape(tokens, -1), 6, dim=-1)
+    ids = (flat // routed_per_rank) * local + flat % routed_per_rank
+    shared = torch.full(
+        (tokens, 1), rank * local + routed_per_rank, dtype=ids.dtype, device=ids.device
+    )
+    weights = torch.cat(
+        (values.softmax(dim=-1), torch.ones_like(values[:, :1])), dim=-1
+    )
+    return weights, torch.cat((ids, shared), dim=-1)
 
 
 def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
@@ -1858,9 +1899,13 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if (
+            args.network not in ("v4_pro", "v41_flash", "v41_flash_shared")
+            or args.quant != "a8w4"
+        ):
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or "
+                "v41_flash_shared and --quant a8w4"
             )
         args.seed = 7 if args.seed is None else args.seed
         args.rtol = 0.08 if args.rtol is None else args.rtol

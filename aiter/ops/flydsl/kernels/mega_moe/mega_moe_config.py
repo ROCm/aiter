@@ -57,6 +57,18 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# EP8 DeepSeek-V4.1-Flash with the shared expert in each rank's expert table: the 48 routed experts and
+# the rank's own shared expert as its 49th, which every token of the rank takes as a seventh slot.
+V41_FLASH_EP8_SHARED_LAYOUT = (8, 49, 5120, 2304)
+V41_FLASH_SHARED_TOPK = 7
+# Experts a rank of the EP8 layouts whose small capacities dispatch into fixed slots: one receive row an
+# EP8 source token and slot, which holds for 48 and 49 experts a rank alike (V4's routed experts, and
+# V4.1-Flash's with the shared expert as the 49th). Callers outside aiter read it to size their decode
+# capacities the same way.
+FIXED_SLOT_EXPERTS_PER_RANK = (
+    REFERENCE_EXPERTS_PER_RANK,
+    V41_FLASH_EP8_SHARED_LAYOUT[1],
+)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
 # serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
@@ -69,6 +81,12 @@ FUSED_LAYOUTS = frozenset(
                 V41_FLASH_EP2_LAYOUT,
                 V41_FLASH_EP8_LAYOUT,
             )
+        ),
+        (
+            V41_FLASH_EP8_SHARED_LAYOUT[0],
+            *V41_FLASH_EP8_SHARED_LAYOUT[2:],
+            V41_FLASH_EP8_SHARED_LAYOUT[0] * V41_FLASH_EP8_SHARED_LAYOUT[1],
+            V41_FLASH_SHARED_TOPK,
         ),
     }
 )
@@ -111,6 +129,7 @@ _V41_FLASH_LARGE_M_MTPRS = {
         (V41_FLASH_EP4_LAYOUT, V41_FLASH_EP4_LARGE_M_MTPRS),
         (V41_FLASH_EP2_LAYOUT, V41_FLASH_EP2_LARGE_M_MTPRS),
         (V41_FLASH_EP8_LAYOUT, V41_FLASH_EP8_LARGE_M_MTPRS),
+        (V41_FLASH_EP8_SHARED_LAYOUT, V41_FLASH_EP8_LARGE_M_MTPRS),
     )
 }
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
@@ -1148,6 +1167,18 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     )
 
 
+def _tune_v41_flash_ep8_shared(
+    config: MegaMoEConfig, ctx: _TuningContext
+) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash with the shared expert as each rank's 49th expert (topk 7), staged route.
+
+    The staged route serves this layout only where the fused routes do not (no max_tokens hint, the
+    capacities without a large-input kernel); it takes the 48-expert EP8 tune, whose fixed-slot and
+    compact-dispatch choices depend on the rank count and token buckets, not on the expert count.
+    """
+    return _tune_v41_flash_ep8(config, ctx)
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -1201,6 +1232,7 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile("v41_flash_ep8_shared", 49, 5120, 2304, _tune_v41_flash_ep8_shared),
 )
 
 
@@ -1260,7 +1292,7 @@ def select_mega_moe_config(
     fixed_slot_dispatch = (
         mtpr_class <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
@@ -1394,7 +1426,7 @@ def build_mega_moe_bundle_plan(
     fixed_slot_dispatch = (
         mtpr <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []
@@ -1693,6 +1725,37 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+def _tune_v41_flash_ep8_shared_small(
+    config: MegaMoEConfig, bucket: int
+) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash with the shared expert as each rank's 49th expert, small-input kernel.
+
+    Swept on gfx950 (8 ranks) at the decode rows a rank of this layout runs, with every token's
+    seventh slot on its own rank's shared expert: GEMM1 tile width, grid multiple, dispatch CUs,
+    waves a EU, streamed or cached W1 loads, the GEMM1 lookahead, the GEMM2 block width and the
+    early GEMM1-to-GEMM2 hand-off. None beat the 48-expert EP8 tune beyond run-to-run noise, and
+    64-row sort blocks, cached W1 loads or a deeper GEMM1 lookahead are slower: the shared expert's
+    extra rows are rank-local, so the tune that balances the routed rows still holds.
+    """
+    return _tune_v41_flash_ep8_small(config, bucket)
+
+
+def _tune_v41_flash_ep8_shared_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash with the shared expert as each rank's 49th expert, large-input kernel.
+
+    Swept on gfx950 (8 ranks) at the prefill rows a rank of this layout runs (uniform routes, every
+    token's seventh slot on its own rank's shared expert): GEMM2 skew and persistent CUs, the early
+    GEMM1-to-GEMM2 hand-off, dispatch CUs, work shards, payload producers, the presend depth and
+    XCD-affine GEMM2 claims. The 48-expert EP8 tune stays best. The per-token combine wait
+    (comb_tok_wait) gains at the shorter prefill chunks, but, as for 48 experts, a runtime whose
+    ranks can end apart keeps its own route-major payload, gigabytes a GPU at MTPR 16384: it stays off.
+    """
+    config = _tune_v41_flash_ep8_large(config)
+    return replace(
+        config, fused_stage2=replace(config.fused_stage2, comb_tok_wait=False)
+    )
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity, 1024..16384
@@ -1739,6 +1802,8 @@ def _fused_config(
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
             return _tune_v41_flash_ep8_large(config)
+        if layout == V41_FLASH_EP8_SHARED_LAYOUT:
+            return _tune_v41_flash_ep8_shared_large(config)
         return config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
@@ -1751,6 +1816,8 @@ def _fused_config(
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
+    if layout == V41_FLASH_EP8_SHARED_LAYOUT:
+        return _tune_v41_flash_ep8_shared_small(config, bucket)
     return config
 
 
