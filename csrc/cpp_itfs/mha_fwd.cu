@@ -17,6 +17,14 @@ static_assert(offsetof(fmha_fwd_v3_args, ptr_qseq_padding) == 0x1E0,
               "THD rows read their KV split from the ptr_qseq_padding slot");
 static_assert(sizeof(fmha_fwd_v3_args) == 656, "fmha_fwd_v3_args must stay 656 bytes");
 
+// Values of the "mode" column in hsa/<arch>/fmha_v3_fwd/fmha_fwd.csv.
+enum class FmhaFwdV3Mode : int
+{
+    Batch = 0, // fixed seqlen_q / seqlen_k for every batch
+    Group = 1, // varlen: per-batch seqstart_q / seqstart_k, optionally padded
+    Thd   = 2, // varlen whole documents: one cu_seqlens for Q and K, no padding
+};
+
 int get_cfg_mask_type(const mha_fwd_args& a)
 {
     if(a.mask_type == 0)
@@ -37,8 +45,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
                                 int hdim_v,
                                 int mask_type,
                                 int bf16_cvt,
-                                bool mode,
-                                int thd,
+                                FmhaFwdV3Mode mode,
                                 const CFG* cfgs)
 {
     std::string kernel_name_key{};
@@ -51,7 +58,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
         }
 
         if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v &&
-           cfg.mask == mask_type && cfg.mode == mode && cfg.thd == thd)
+           cfg.mask == mask_type && cfg.mode == static_cast<int>(mode))
         {
             if(arch_id == "gfx950")
             {
@@ -307,14 +314,16 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     auto fwd_cfgs               = &cfg_fmha_fwd;
     int cfg_mask_type           = get_cfg_mask_type(a);
+    const FmhaFwdV3Mode mode    = thd               ? FmhaFwdV3Mode::Thd
+                                  : a.is_group_mode ? FmhaFwdV3Mode::Group
+                                                    : FmhaFwdV3Mode::Batch;
     std::string kernel_name_key = get_kernel_name_key(arch_id,
                                                       a.data_type,
                                                       a.hdim_q,
                                                       a.hdim_v,
                                                       cfg_mask_type,
                                                       a.how_v3_bf16_cvt,
-                                                      a.is_group_mode,
-                                                      thd ? 1 : 0,
+                                                      mode,
                                                       fwd_cfgs);
     auto it                     = fwd_cfgs->find(kernel_name_key);
     if(it == fwd_cfgs->end())
