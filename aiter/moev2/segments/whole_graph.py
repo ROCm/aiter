@@ -14,7 +14,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe_registry import FusedMoeImplResolutionError, resolve_fused_moe_impl
 from aiter.ops.flydsl.moe_common import GateMode
 
-from ..dispatch import kernel_names
+from ..dispatch import kernel_names, tuned
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec
@@ -77,7 +77,8 @@ class WholeGraph(Segment):
             if unsupported is not None:
                 return RowRejection(
                     f"[fused_moe] discarding FlyDSL whole-graph config for "
-                    f"{p.log_keys()}: unsupported {unsupported}; using default heuristics"
+                    f"{tuned.log_keys(p, row)}: unsupported {unsupported}; "
+                    "using default heuristics"
                 )
         if p.is_ep:
             return RowRejection(None)

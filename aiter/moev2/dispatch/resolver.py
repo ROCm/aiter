@@ -203,8 +203,8 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
 
     if not plans:
         return declined("no feasible plan")
-    keys = problem.log_keys()
     cfg = tuned.lookup(problem)
+    keys = tuned.log_keys(problem, cfg)
     if cfg is None:
         note(f"tuned lookup: miss (tier {problem.shape.m})")
         matched = None

@@ -4783,6 +4783,8 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    if cfg is not None and cfg is padded_cfg:
+        keys += (intermediate_pad,)
 
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()

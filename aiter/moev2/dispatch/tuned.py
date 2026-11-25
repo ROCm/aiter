@@ -252,6 +252,14 @@ def lookup_padded(problem, tables=None):
     return result
 
 
+def log_keys(problem, row):
+    """`problem.log_keys()`, plus the pad when `row` is the call's pad-keyed row."""
+    keys = problem.log_keys()
+    if row is not None and row is lookup_padded(problem):
+        keys += (problem.layout.intermediate_pad,)
+    return keys
+
+
 def lookup(problem, tables=None):
     """The tuned row for `problem` (the legacy `_lookup_cfg`), or None.
 

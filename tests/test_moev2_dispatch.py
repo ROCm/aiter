@@ -635,8 +635,10 @@ def test_v2_prefers_the_row_keyed_on_the_call_pad(monkeypatch):
     primary = {any_pad[:7] + act + any_pad[8:]: row}
     monkeypatch.setattr(legacy, "cfg_2stages", (primary, {}))
     assert tuned.lookup(p) is row
+    assert tuned.log_keys(p, row) == p.log_keys()
     primary[padded[:7] + act + padded[8:]] = padded_row
     assert tuned.lookup(p) is padded_row
+    assert tuned.log_keys(p, padded_row) == p.log_keys() + (32,)
 
 
 def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):

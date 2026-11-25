@@ -451,6 +451,19 @@ def test_intermediate_pad_dispatch(tmp_dir):
     # A wider one falls back to the default heuristics instead of raising.
     assert kernel(1024, 64) is None
 
+    def logged_key(token, pad):
+        lines = []
+        with patch(
+            "aiter.fused_moe.logger.info",
+            side_effect=lambda m, *a, **k: lines.append(m),
+        ):
+            kernel(token, pad)
+        return next(line for line in lines if line.startswith("[fused_moe] using"))
+
+    # The logged key carries the pad only when the padded row matched.
+    assert logged_key(16, 32).endswith(", True, False, 32)")
+    assert logged_key(16, 64).endswith(", True, False)")
+
 
 def test_shipped_intermediate_pad_rows():
     """The shipped Qwen3.8-Flash-Next TP4 rows for 1-256 tokens apply with its
