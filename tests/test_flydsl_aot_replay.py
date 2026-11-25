@@ -518,3 +518,37 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
     finally:
         gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
     assert launched == [job["kernel_name"] for job in jobs]
+
+
+@pytest.mark.parametrize("partitions", [4, 64])
+def test_pa_decode_reducer_reaches_compile_only_launch(monkeypatch, partitions):
+    """The reducer sizes its workgroups by the device's wave size, which the
+    dry run must report for the target arch, or it cannot be prebuilt."""
+    import importlib
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    launches = []
+    monkeypatch.setattr(pa, "_run_compiled", lambda *args: launches.append(args))
+    with dry_run("gfx1250", 256):
+        output = torch.empty((4, 1, 2, 4, 128), device="cuda", dtype=torch.bfloat16)
+        sums = torch.empty((2, 4 * partitions, 4), device="cuda", dtype=torch.float32)
+        logits = torch.empty(
+            (2, 4 * partitions, 4, 128), device="cuda", dtype=torch.bfloat16
+        )
+        pa.launch_pa_decode_ps_reduce(
+            output,
+            sums,
+            torch.empty_like(sums),
+            logits,
+            None,
+            *output.stride()[:4],
+            *sums.stride()[:2],
+            *logits.stride()[:3],
+            query_seq_len=1,
+            query_group_size=4,
+            head_size=128,
+            max_partitions=partitions,
+            stream=torch.cuda.current_stream(),
+            reduce_info=torch.empty((4, 2), device="cuda", dtype=torch.int32),
+        )
+    assert len(launches) == 1

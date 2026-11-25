@@ -60,6 +60,8 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 this module keeps the compilation API and launch wrappers.
 """
 
+import dataclasses
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -68,6 +70,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.op_merge import (
@@ -121,6 +125,18 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
+_GFX1250_PA_DECODE_AOT = FlyDSLAotCache(
+    "pa_decode_tile_gfx1250",
+    sources=[
+        "kernels/pa_decode",
+        "kernels/pa_decode_plan.py",
+        "kernels/act.py",
+        "kernels/dpp_utils.py",
+        "kernels/layout_utils.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/utils.py",
+    ],
+)
 
 
 def _dtype_tag(dtype):
@@ -996,8 +1012,17 @@ def compile_gfx1250_pa_decode(t):
         raise NotImplementedError(
             "gfx1250 PA decode query/KV tiles exceed LDS capacity"
         )
-    if t in _GFX1250_PA_DECODE_CACHE:
-        return _GFX1250_PA_DECODE_CACHE[t]
+    compiled = _GFX1250_PA_DECODE_CACHE.get(t)
+    if compiled is None:
+        compiled = _build_gfx1250_pa_decode(t)
+        # The traits are the launcher's constexprs, so they key its AOT entry.
+        bind_aot(compiled["launch"], _GFX1250_PA_DECODE_AOT, dataclasses.astuple(t))
+        compiled = _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
+    return compiled
+
+
+def _build_gfx1250_pa_decode(t):
+    """Define the tile kernel and launch wrapper of validated traits ``t``."""
 
     @fx.struct
     class SharedStorage:
@@ -1453,5 +1478,4 @@ def compile_gfx1250_pa_decode(t):
         )
     if llvm_options:
         launch.compile_hints["llvm_options"] = llvm_options
-    compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
-    return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
+    return {"launch": launch, "kernel": pa_decode_tile_kernel}

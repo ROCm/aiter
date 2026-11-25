@@ -2,7 +2,27 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Torch launch wrapper for the gfx1250 BF16/FP16 TDM GEMM."""
 
+import functools
+
 import torch
+
+from .aot_launch import aot_factory
+
+
+@aot_factory(
+    "gemm_a16w16_tdm_gfx1250",
+    sources=[
+        "kernels/gemm_a16w16_tdm_gfx1250.py",
+        "kernels/gemm_a16w16_gfx950_utils.py",
+    ],
+)
+@functools.lru_cache(maxsize=128)
+def _tdm_launcher(device: torch.device, *config):
+    """``build_gemm_gfx1250(*config)`` for ``device``. The device keeps one
+    launcher per device on the JIT path; an AOT entry serves every device."""
+    from .kernels.gemm_a16w16_tdm_gfx1250 import build_gemm_gfx1250
+
+    return build_gemm_gfx1250(*config, device_id=device.index)
 
 
 def gemm_a16w16_tdm(
@@ -57,7 +77,6 @@ def gemm_a16w16_tdm(
     from .kernels.gemm_a16w16_tdm_gfx1250 import (
         GEMM_DTYPE_BF16,
         GEMM_DTYPE_FP16,
-        build_gemm_gfx1250,
         validate_gemm_gfx1250_config,
     )
     from .kernels.tensor_shim import _run_compiled, ptr_arg
@@ -165,7 +184,8 @@ def gemm_a16w16_tdm(
         )
         has_bias = bias is not None
         b_k_contiguous = layout == "nt"
-        launch = build_gemm_gfx1250(
+        launch = _tdm_launcher.lazy(
+            a.device,
             dtype_id,
             block_m,
             block_n,
@@ -182,7 +202,6 @@ def gemm_a16w16_tdm(
             split_k,
             interleave,
             split_k_atomic,
-            device_id=torch.cuda.current_device(),
         )
         _run_compiled(
             launch,

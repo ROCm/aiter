@@ -10,6 +10,7 @@ K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
 (e2m1 data, e8m0 scale per 32 elements) run on gfx950, see ``pa_decode``.
 """
 
+import functools
 import math
 
 import flydsl.compiler as flyc
@@ -20,6 +21,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
+from .aot_launch import aot_factory
 from .kernels.pa_decode.traits import (
     d256_page64_pipe,
     nhd_max_query_length,
@@ -200,6 +202,20 @@ def _fuses_quant_output(
     )
 
 
+@aot_factory(
+    "pa_decode_ps_reduce_gfx1250",
+    sources=[
+        "kernels/pa_decode_reduce.py",
+        "kernels/dpp_utils.py",
+        "kernels/utils.py",
+    ],
+)
+@functools.lru_cache(maxsize=256)
+def _gfx1250_ps_reduce_launcher(**options):
+    """The gfx1250 reducer's launcher, launched through the AOT cache."""
+    return compile_pa_decode_ps_reduce(**options)["launch"]
+
+
 def launch_pa_decode_ps_reduce(
     output: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -303,20 +319,25 @@ def launch_pa_decode_ps_reduce(
         ):
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
-    compiled = compile_pa_decode_ps_reduce(
-        architecture=arch,
-        max_context_partition_num=partitions,
-        head_size=head_size,
-        output_dtype_str=get_dtype_str(output.dtype),
-        logits_dtype_str=get_dtype_str(logits.dtype),
-        sink_dtype_str=get_dtype_str(
+    reduce_options = {
+        "architecture": arch,
+        "max_context_partition_num": partitions,
+        "head_size": head_size,
+        "output_dtype_str": get_dtype_str(output.dtype),
+        "logits_dtype_str": get_dtype_str(logits.dtype),
+        "sink_dtype_str": get_dtype_str(
             output.dtype if sink_token is None else sink_token.dtype
         ),
-        use_sinks=sink_token is not None,
-        query_group_size=query_group_size,
-        pairs=pairs,
-        parallel_groups=groups,
-        num_xcds=num_xcds,
+        "use_sinks": sink_token is not None,
+        "query_group_size": query_group_size,
+        "pairs": pairs,
+        "parallel_groups": groups,
+        "num_xcds": num_xcds,
+    }
+    launch = (
+        _gfx1250_ps_reduce_launcher.lazy(**reduce_options)
+        if arch in ("gfx1250", "gfx1250-strict")
+        else compile_pa_decode_ps_reduce(**reduce_options)["launch"]
     )
     sink_ptr = (
         flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
@@ -324,7 +345,7 @@ def launch_pa_decode_ps_reduce(
         else ptr_arg(sink_token, torch_to_fx_dtype(sink_token.dtype))
     )
     _run_compiled(
-        compiled["launch"],
+        launch,
         ptr_arg(output, torch_to_fx_dtype(output.dtype)),
         ptr_arg(exp_sums, fx.Float32),
         ptr_arg(max_logits, fx.Float32),

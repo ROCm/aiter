@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -7,6 +9,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
+from .aot_launch import aot_factory
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 __all__ = [
@@ -118,6 +121,70 @@ def _validate_pagesize1_inputs(
         int(bool(causal)),
         int(final_lse is not None),
     )
+
+
+# The gfx1250 launchers take their Constexprs as launch arguments, so each
+# launch passes them in specialization_key. The factories take no argument and
+# import the kernel module only when the AOT cache has to build an entry.
+_PAGESIZE1_AOT_SOURCES = [
+    "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+    "kernels/mla_gfx1250/mla_common.py",
+]
+
+
+@aot_factory(
+    "mla_pagesize1_fp8_fp8",
+    sources=["kernels/mla_gfx1250/mla_pagesize1_fp8_fp8.py", *_PAGESIZE1_AOT_SOURCES],
+)
+@functools.cache
+def _pagesize1_fp8_launcher():
+    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
+        launch_mla_pagesize1_fp8_fp8,
+    )
+
+    return launch_mla_pagesize1_fp8_fp8
+
+
+@aot_factory(
+    "mla_pagesize1_bf16_bf16",
+    sources=["kernels/mla_gfx1250/mla_pagesize1_bf16_bf16.py", *_PAGESIZE1_AOT_SOURCES],
+)
+@functools.cache
+def _pagesize1_bf16_launcher():
+    from .kernels.mla_gfx1250.mla_pagesize1_bf16_bf16 import (
+        launch_mla_pagesize1_bf16_bf16,
+    )
+
+    return launch_mla_pagesize1_bf16_bf16
+
+
+@aot_factory(
+    "mla_pagesize64_fp8_fp8",
+    sources=[
+        "kernels/mla_gfx1250/mla_pagesize64_fp8_fp8.py",
+        "kernels/mla_gfx1250/mla_common.py",
+        "kernels/act.py",
+        "kernels/gemm_common_gfx1250.py",
+    ],
+)
+@functools.cache
+def _pagesize64_fp8_launcher():
+    from .kernels.mla_gfx1250.mla_pagesize64_fp8_fp8 import (
+        launch_mla_pagesize64_fp8_fp8,
+    )
+
+    return launch_mla_pagesize64_fp8_fp8
+
+
+@aot_factory(
+    "mla_decode_reduce",
+    sources=["kernels/mla_reduce.py"],
+)
+@functools.cache
+def _decode_reduce_launcher(H: int, Dv: int, out_dtype: str):
+    from .kernels.mla_reduce import compile_mla_decode_reduce
+
+    return compile_mla_decode_reduce(H=H, Dv=Dv, out_dtype=out_dtype)
 
 
 def _run_pagesize1(
@@ -277,12 +344,8 @@ def flydsl_mla_pagesize1_fp8_fp8(
     cp_rank=0,
     stream=None,
 ):
-    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
-        launch_mla_pagesize1_fp8_fp8,
-    )
-
     _run_pagesize1(
-        launch_mla_pagesize1_fp8_fp8,
+        _pagesize1_fp8_launcher.lazy(),
         torch.float8_e4m3fn,
         fx.Int8,
         split_data,
@@ -330,12 +393,8 @@ def flydsl_mla_pagesize1_bf16_bf16(
     stream=None,
 ):
     """BF16 Q/KV form of :func:`flydsl_mla_pagesize1_fp8_fp8`; no scales."""
-    from .kernels.mla_gfx1250.mla_pagesize1_bf16_bf16 import (
-        launch_mla_pagesize1_bf16_bf16,
-    )
-
     _run_pagesize1(
-        launch_mla_pagesize1_bf16_bf16,
+        _pagesize1_bf16_launcher.lazy(),
         torch.bfloat16,
         fx.BFloat16,
         split_data,
@@ -435,15 +494,11 @@ def flydsl_mla_pagesize64_fp8_fp8(
         num_splits,
         page_size,
     )
-    from .kernels.mla_gfx1250.mla_pagesize64_fp8_fp8 import (
-        launch_mla_pagesize64_fp8_fp8,
-    )
-
     if stream is None:
         stream = torch.cuda.current_stream(q.device)
     output_type = fx.BFloat16 if num_splits == 1 else fx.Float32
     _run_compiled(
-        launch_mla_pagesize64_fp8_fp8,
+        _pagesize64_fp8_launcher.lazy(),
         ptr_arg(split_data, output_type),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(q, fx.Int8),
@@ -479,16 +534,13 @@ def flydsl_mla_decode_reduce(
     ``skip_reduce`` can drive the merge itself, and so the two stages can be
     timed independently.
     """
-    from .kernels.mla_reduce import compile_mla_decode_reduce
-
     total_tokens, _, num_heads, v_head_dim = split_data.shape
     out_dtype = "bf16" if out.dtype == torch.bfloat16 else "fp16"
-    launch = compile_mla_decode_reduce(H=num_heads, Dv=v_head_dim, out_dtype=out_dtype)
     if stream is None:
         stream = torch.cuda.current_stream(out.device)
     out_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
     _run_compiled(
-        launch,
+        _decode_reduce_launcher.lazy(int(num_heads), int(v_head_dim), out_dtype),
         ptr_arg(split_data, fx.Float32),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(seqused_k, fx.Int32),

@@ -9,27 +9,23 @@ import functools
 
 import torch
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-_compile_gemm_a16w16 = None
 _run_compiled = None
 _ptr_arg = None
 _fx = None
 
 
 def _lazy_import():
-    global _compile_gemm_a16w16, _run_compiled, _ptr_arg, _fx
-    if _compile_gemm_a16w16 is not None:
+    global _run_compiled, _ptr_arg, _fx
+    if _run_compiled is not None:
         return
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
-        compile_gemm_a16w16,
-    )
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled as run_compiled
     from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-    _compile_gemm_a16w16 = compile_gemm_a16w16
     _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _fx = fx
@@ -75,9 +71,21 @@ _CFG_KEYS = (
 )
 
 
+@aot_factory(
+    "gemm_a16w16_gfx1250",
+    sources=[
+        "kernels/gemm_a16w16_kernel_gfx1250.py",
+        "kernels/communication_ops_utils.py",
+    ],
+)
 @functools.lru_cache(maxsize=1024)
 def _cached_launcher(*cfg):
-    return _compile_gemm_a16w16(**dict(zip(_CFG_KEYS, cfg)))
+    # Imported here: a launch the AOT cache serves does not build the kernel.
+    from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
+        compile_gemm_a16w16,
+    )
+
+    return compile_gemm_a16w16(**dict(zip(_CFG_KEYS, cfg)))
 
 
 _SPLIT_K_MAX_TILES = 4096
@@ -161,7 +169,7 @@ def gemm_a16w16(
     else:
         ws = y_buf
 
-    launch_fn = _cached_launcher(
+    launch_fn = _cached_launcher.lazy(
         N,
         K,
         tile_m,

@@ -213,8 +213,14 @@ def dry_run(
 
     _register_stream_stub()
     stream = _Stream(torch.device("cuda", 0))
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
     properties = SimpleNamespace(
-        name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
+        name=name or arch,
+        gcnArchName=arch,
+        multi_processor_count=cu_num,
+        # Host code sizes workgroups by it (the PA decode reducer).
+        warp_size=get_warp_size(arch),
     )
     real_data_ptr = torch.Tensor.data_ptr
     # The fake address range of each storage of this dry run, by storage
