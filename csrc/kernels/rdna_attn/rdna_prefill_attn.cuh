@@ -126,10 +126,6 @@ struct Prefill {
       kKeyTile > kPageSize ? kKeyTile / kPageSize : 1;
   static constexpr float kLog2e = 1.44269504088896340736f;
   static constexpr float kMaxSlack = 8.f;
-  // Buffer loads save the registers of 64-bit addresses: D=512, and the
-  // non-causal builds.
-  static constexpr bool kBufferLoads =
-      !kCausal || (kHeadDim >= 512 && kUnitElems == 8);
   // Raw buffer word 3: OOB_SELECT 3, format 4. Bit 24 is reserved on gfx11
   // and enables write compression on gfx12.
   static constexpr unsigned kRsrcWord3 = kGfx12 ? 0x30004000u : 0x31004000u;
@@ -279,6 +275,43 @@ struct Prefill {
 #else
   static constexpr int kTargetWavesPerSimd = kWavesPerSimd;
 #endif
+
+  // Each lane's VGPRs, and the granule a wave's are allocated in (wave32).
+#if defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
+    defined(__gfx1152__) || defined(__gfx1153__)
+  static constexpr int kLaneVgprs = kSmallLaneVgprs;
+  static constexpr int kVgprGranule = 16;
+#else
+  static constexpr int kLaneVgprs = kBigLaneVgprs;
+  static constexpr int kVgprGranule = 24;
+#endif
+  // The VGPRs a wave gets at `waves` waves a SIMD: 240 at 6 with 1536.
+  static constexpr int vgpr_budget(int waves) {
+    return std::min(256, kLaneVgprs / std::max(waves, 1) / kVgprGranule *
+                             kVgprGranule);
+  }
+  // The VGPRs a wave holds through a step, estimated: Q and O, a step's
+  // scores and P, and the next step's staged K and V units with a 64-bit
+  // address each. The compiler adds 20-110 (counters, masks, LDS addresses,
+  // operands read ahead): a build within 50 of its budget is one that spills.
+  static constexpr int kStagedUnits = kKLoads + kVIssue * kVPerUnit;
+  static constexpr int kVgprEstimate =
+      (kPartChunks * kOpWords + kLaneDims * 8 +
+       kWaveSubTiles * (8 + kOpWords)) *
+          kRowTiles +
+      kStagedUnits * (kUnitElems / 2 + 2);
+  static constexpr int kVgprMargin =
+      kVgprEstimate - vgpr_budget(kTargetWavesPerSimd);
+  // Buffer loads (32-bit offsets, the base in SGPRs) save the registers of
+  // 64-bit addresses: non-causal builds, D=512, and the causal builds near
+  // their budget at 4 or more waves a SIMD.
+  static constexpr bool kBufferLoads =
+      !kCausal ||
+      (kUnitElems == 8 &&
+       (kHeadDim >= 512 || (kTargetWavesPerSimd >= 4 && kVgprMargin >= -50)));
+  // D=512 and non-causal builds keep the offsets in registers; the others
+  // let the compiler recompute them.
+  static constexpr bool kPinOffsets = !kCausal || kHeadDim >= 512;
 
   // kBatch: a batch through the work list, apart so that the one-sequence
   // kernel keeps its registers.
@@ -546,7 +579,7 @@ struct Prefill {
         kOff[i] = ((unit / kRowChunks - waveKey) * kKvRowElems +
                    unit % kRowChunks * 8) *
                   (int)sizeof(elem_t);
-        asm volatile("" : "+v"(kOff[i]));
+        if constexpr (kPinOffsets) asm volatile("" : "+v"(kOff[i]));
       }
 #pragma unroll
       for (int i = 0; i < kVLoads; ++i) {
@@ -557,7 +590,7 @@ struct Prefill {
           vOff[i][x] = ((v_unit_key(unit) - waveKey) * kKvRowElems + kHeadDim +
                         v_unit_col(unit)) *
                        (int)sizeof(elem_t);
-          asm volatile("" : "+v"(vOff[i][x]));
+          if constexpr (kPinOffsets) asm volatile("" : "+v"(vOff[i][x]));
         }
       }
     }
