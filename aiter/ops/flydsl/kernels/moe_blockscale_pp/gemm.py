@@ -280,6 +280,14 @@ class StoreSlotBf16:
             words += [self._bperm(v) for v in (lo[0], hi[0], lo[1], hi[1])]
         return words
 
+    def store_dummy(self):
+        """``N_TILES_A`` 4-byte stores past the descriptor: ``store``'s vmcnt count with ~no TA data."""
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+        fx.memref_store_vec(fx.full(1, fx.Int32(0), fx.Int32), reg)
+        for _ in range_constexpr(N_TILES_A):
+            fx.copy(atom, reg, fx.slice(self.c_div, (None, self.oob)))
+
     def store(self, words, offs, col):
         """Store ``pack``'s words at ``quad_offsets`` + column ``col`` (wave-uniform: the soffset)."""
         for i in range_constexpr(N_TILES_A):
@@ -1220,6 +1228,12 @@ def compile_moe_bs_gemm_8w(
                 m = m | (pad << q)
             return _sgpr(m)
 
+        def store_or_dummy(skip, real, dummy):
+            if skip == 0:
+                real()
+            else:
+                dummy()
+
         def mfma_skip(skip, burst, c):
             """``burst()`` unless ``skip``: a wave-uniform branch around an MFMA burst."""
             out = c
@@ -1240,7 +1254,7 @@ def compile_moe_bs_gemm_8w(
             return c
 
         def run_tile_stream(
-            tile, expert, pmask, next_tile, parity, prev_tile, prev_acc
+            tile, expert, pmask, next_tile, parity, prev_tile, prev_acc, prev_mask
         ):
             """Stage 2: K-steps 0 .. K - 1 of ``tile``.
 
@@ -1265,7 +1279,18 @@ def compile_moe_bs_gemm_8w(
                     rows = store_c.rows_half(wave_m, prev_slot, g // 2)
                     prev_rows[g // 2] = (rows, store_c.quad_offsets(rows, valid))
                 rows, offs = prev_rows[g // 2]
-                store_c.store(store_c.pack(prev_acc[g], rows), offs, pcols[g % 2])
+                if const_expr(g < 2):
+                    store_c.store(store_c.pack(prev_acc[g], rows), offs, pcols[g % 2])
+                else:
+                    # This wave's row-half-1 rows of the previous tile are all
+                    # padding: the same count of stores, without the 1 KB each.
+                    store_or_dummy(
+                        prev_skip_h1,
+                        lambda: store_c.store(
+                            store_c.pack(prev_acc[g], rows), offs, pcols[g % 2]
+                        ),
+                        store_c.store_dummy,
+                    )
 
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
@@ -1273,6 +1298,7 @@ def compile_moe_bs_gemm_8w(
             cur = make_ctx(tile, expert, pmask)
             # This wave's rows of row half h: wave_m * 64 + 128 h + [0, 64).
             skip_h1 = (pmask >> (wave_m + 1)) & 1
+            prev_skip_h1 = (prev_mask >> (wave_m + 1)) & 1
             nxt = None
             nxt_expert = None
             nxt_mask = None
@@ -1408,14 +1434,18 @@ def compile_moe_bs_gemm_8w(
             wait_barrier(3 * N_LDS_STEPS)
 
             n_acc = N_TILES_A * N_TILES_B
-            init = [fx.Int32(0), fx.Int32(-1), first_expert, first_mask] + [
-                mfma.zero_value
-            ] * (4 * n_acc)
+            init = [
+                fx.Int32(0),
+                fx.Int32(-1),
+                first_expert,
+                first_mask,
+                fx.Int32(0),
+            ] + [mfma.zero_value] * (4 * n_acc)
             for tile, state in range(start, n_tiles, grid, init=init):
                 nt = fx.Int32(tile) + grid
                 # The last tile streams itself again; nothing reads those loads.
                 nt = (nt < n_tiles).select(nt, fx.Int32(tile))
-                acc = state[4:]
+                acc = state[5:]
                 acc, nxt_expert, nxt_mask = run_tile_stream(
                     fx.Int32(tile),
                     state[2],
@@ -1424,10 +1454,15 @@ def compile_moe_bs_gemm_8w(
                     state[0] & 1,
                     state[1],
                     [acc[g * n_acc : (g + 1) * n_acc] for g in range(4)],
+                    state[4],
                 )
-                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert, nxt_mask] + [
-                    v for g in acc for v in g
-                ]
+                final = yield [
+                    state[0] + 1,
+                    fx.Int32(tile),
+                    nxt_expert,
+                    nxt_mask,
+                    state[3],
+                ] + [v for g in acc for v in g]
             # The last tile's stores (a workgroup without a tile sends them
             # out of bounds).
             last_slot = (final[0] + 1) & 1
@@ -1436,7 +1471,7 @@ def compile_moe_bs_gemm_8w(
                 if const_expr(g % 2 == 0):
                     rows = store_c.rows_half(wave_m, last_slot, g // 2)
                     offs = store_c.quad_offsets(rows, final[1] >= 0)
-                acc = final[4 + g * n_acc : 4 + (g + 1) * n_acc]
+                acc = final[5 + g * n_acc : 5 + (g + 1) * n_acc]
                 store_c.store(store_c.pack(acc, rows), offs, last_cols[g % 2])
             # No LDS-DMA may land after the workgroup exits; the leading
             # group's barrier pairs the lagging group's prologue one.
