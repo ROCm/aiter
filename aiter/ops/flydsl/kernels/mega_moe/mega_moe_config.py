@@ -101,8 +101,8 @@ DEFAULT_SMALL_M_MTPRS = (256, 512)
 LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
-# Below this many rows per rank the staged (or small-input) path is faster than
-# the large-input kernel, whose geometry is fixed by its capacity.
+# Smallest max_tokens that launches the large-input config of its own token bucket: a call of fewer rows (one the
+# small-input route does not take) launches this one's.
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
@@ -443,7 +443,7 @@ class MegaMoEBundlePlan:
             for capacity in self.small_m_mtprs:
                 if max_tokens <= capacity:
                     return ROUTE_SMALL_M, capacity
-        if large_m and self.large_m and max_tokens >= LARGE_M_MIN_TOKENS:
+        if large_m and self.large_m:
             return ROUTE_LARGE_M, self.mtpr
         return ROUTE_STAGED, self.mtpr
 
@@ -492,7 +492,8 @@ def fused_layout_supported(
 
 def large_m_buckets(mtpr: int) -> tuple[int, ...]:
     """Token buckets whose configs a large-input runtime of capacity ``mtpr`` launches: those of the EP-wide
-    max_tokens it serves (LARGE_M_MIN_TOKENS up to mtpr; the capacity's own for a call without max_tokens).
+    max_tokens it serves (LARGE_M_MIN_TOKENS up to mtpr, fewer rows taking LARGE_M_MIN_TOKENS'; the capacity's own
+    for a call without max_tokens).
     """
     first = nearest_token_bucket(LARGE_M_MIN_TOKENS, FUSED_TOKEN_BUCKETS)
     return tuple(b for b in FUSED_TOKEN_BUCKETS if first <= b <= mtpr)
@@ -1966,8 +1967,9 @@ def select_fused_config(
     """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
     config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) and
     FUSED_QUANTS quant for ``tokens`` rows on a rank; an idle rank takes the 1-token
-    config. The large-input route passes the call's EP-wide max_tokens (or the
-    capacity), so every rank of a launch selects the same config."""
+    config. The large-input route passes the call's EP-wide max_tokens, at least
+    LARGE_M_MIN_TOKENS (or the capacity), so every rank of a launch selects the
+    same config."""
     if quant not in FUSED_QUANTS:
         raise ValueError(f"quant={quant!r} must be one of {FUSED_QUANTS}")
     if mtpr <= 0 or mtpr & (mtpr - 1):

@@ -59,6 +59,7 @@ from .gemm2 import (
 )
 from .mega_moe_config import (
     FUSED_QUANTS,
+    LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
     MegaMoEConfig,
     fused_layout_supported,
@@ -3594,8 +3595,9 @@ class LargeMRuntime:
         elif not run_tokens <= max_tokens <= self.mtpr:
             raise ValueError(f"max_tokens={max_tokens} must be in [{run_tokens}, {self.mtpr}]")
         # Launch geometry, tile_m and producer counts are part of the cross-rank wire protocol, so every rank
-        # selects the config of the call's EP-wide max_tokens (the MTPR config without it).
-        config = self._select_config(int(max_tokens))
+        # selects the config of the call's EP-wide max_tokens, at least LARGE_M_MIN_TOKENS (the MTPR config
+        # without it).
+        config = self._select_config(max(int(max_tokens), LARGE_M_MIN_TOKENS))
         self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok

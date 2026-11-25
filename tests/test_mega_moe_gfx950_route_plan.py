@@ -32,6 +32,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     build_mega_moe_bundle_plan,
     fused_layout_supported,
     large_m_buckets,
+    nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
     small_m_mtprs_for,
@@ -138,7 +139,7 @@ def test_route_for_every_max_tokens(mtpr):
         if small and max_tokens <= small[-1]:
             assert route == ROUTE_SMALL_M
             assert capacity == min(m for m in small if m >= max_tokens)
-        elif plan.large_m and max_tokens >= LARGE_M_MIN_TOKENS:
+        elif plan.large_m:
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr)
         else:
             assert (route, capacity) == (ROUTE_STAGED, mtpr)
@@ -151,7 +152,12 @@ def test_route_for_every_max_tokens(mtpr):
 def test_route_exclusions():
     plan = _plan(8192)
     assert plan.route_for(100) == (ROUTE_SMALL_M, 256)
-    assert plan.route_for(100, small_m=False) == (ROUTE_STAGED, 8192)
+    # A call the small-input route cannot take goes to the large-input route, whatever its rows.
+    assert plan.route_for(100, small_m=False) == (ROUTE_LARGE_M, 8192)
+    assert plan.route_for(0, small_m=False) == (ROUTE_LARGE_M, 8192)
+    assert plan.route_for(300, small_m=False, large_m=False) == (ROUTE_STAGED, 8192)
+    assert _plan(8192, small=(256,)).route_for(300) == (ROUTE_LARGE_M, 8192)
+    assert _plan(8192, small=()).route_for(1) == (ROUTE_LARGE_M, 8192)
     assert plan.route_for(4096) == (ROUTE_LARGE_M, 8192)
     assert plan.route_for(4096, large_m=False) == (ROUTE_STAGED, 8192)
     # MegaMoEV2 itself takes the staged route when a call passes no max_tokens.
@@ -181,6 +187,28 @@ def test_large_m_capacities_share_one_tune(layout, quant):
             )
     with pytest.raises(ValueError):
         select_fused_config(32768, 32768, quant=quant, **shape)
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+@pytest.mark.parametrize(
+    "layout", ("v4_pro_ep8", "v41_flash_ep8", "v41_flash_ep4", "v41_flash_ep2")
+)
+def test_large_m_small_calls_take_the_min_tokens_config(layout, quant):
+    """A large-input call of fewer than LARGE_M_MIN_TOKENS rows launches the config of LARGE_M_MIN_TOKENS, one the
+    runtime builds (large_m_buckets); every large-input tune keeps that config up to 1024 rows, so it is the one of
+    the call's own bucket too."""
+    shape = _ROUTED_LAYOUTS[layout]
+    for mtpr in LARGE_M_MTPRS:
+        floor = select_fused_config(LARGE_M_MIN_TOKENS, mtpr, quant=quant, **shape)
+        assert (
+            nearest_token_bucket(LARGE_M_MIN_TOKENS, FUSED_TOKEN_BUCKETS)
+            == large_m_buckets(mtpr)[0]
+        )
+        for tokens in (0, 1, 2, 3, 100, 256, 511, 512, 700, 1024):
+            if tokens <= mtpr:
+                assert (
+                    select_fused_config(tokens, mtpr, quant=quant, **shape) == floor
+                ), (mtpr, tokens)
 
 
 @pytest.mark.parametrize("mtpr", MTPRS)
@@ -785,7 +813,7 @@ _ROUTED_LAYOUTS = {
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_routed_instance_routes(layout, quant, mtpr):
     """A routed instance (built offline, as the AOT replay does) serves up to 512 rows a rank through the
-    small-input route and, at a large-input capacity, the larger calls through the large-input route, for both
+    small-input route and, at a large-input capacity, every other call through the large-input route, for both
     quants. The A4W4 fused routes send FP4 payload rows and write an FP8 GEMM1 output, which the shared
     GEMM1-output arena must hold (the staged A4W4 route writes FP4)."""
     import torch
@@ -892,6 +920,55 @@ def test_routed_instance_routes(layout, quant, mtpr):
             assert capacity == min(m for m in small if m >= max_tokens)
         else:
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
+        if large:
+            assert moe._route(min(max_tokens, 1), max_tokens, small_m=False) == (
+                ROUTE_LARGE_M,
+                mtpr,
+            )
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+@pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
+def test_routed_calls_never_stage(layout, quant):
+    """On a fused layout every call of a routed instance (both fused routes built) at a power-of-two capacity up to
+    16384 that passes max_tokens takes a fused route: the small-input route up to 512 rows a rank, the large-input
+    route for the rest, launching a config its runtime builds. Without the small-input route (prequantized input, or
+    a part without 256 CUs) the large-input route takes every call from capacity 1024; below it such a call stages.
+    """
+    shape = _ROUTED_LAYOUTS[layout]
+    for log2 in range(15):
+        mtpr = 1 << log2
+        plan = build_mega_moe_bundle_plan(
+            mtpr,
+            a_dtype="fp4" if quant == "a4w4" else "fp8",
+            small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
+            large_m=mtpr in LARGE_M_MTPRS,
+            **shape,
+        )
+        no_small = build_mega_moe_bundle_plan(
+            mtpr,
+            a_dtype="fp4" if quant == "a4w4" else "fp8",
+            large_m=mtpr in LARGE_M_MTPRS,
+            **shape,
+        )
+        built = large_m_buckets(mtpr)
+        for max_tokens in range(mtpr + 1):
+            route, _ = plan.route_for(max_tokens)
+            assert route != ROUTE_STAGED, (mtpr, max_tokens)
+            if route == ROUTE_LARGE_M:
+                bucket = nearest_token_bucket(
+                    max(max_tokens, LARGE_M_MIN_TOKENS), FUSED_TOKEN_BUCKETS
+                )
+                assert bucket in built, (mtpr, max_tokens)
+            for other in (
+                plan.route_for(max_tokens, small_m=False),
+                no_small.route_for(max_tokens),
+            ):
+                assert other == (
+                    (ROUTE_LARGE_M, mtpr)
+                    if mtpr in LARGE_M_MTPRS
+                    else (ROUTE_STAGED, mtpr)
+                ), (mtpr, max_tokens)
 
 
 @pytest.mark.parametrize("mtpr", LARGE_M_MTPRS)
