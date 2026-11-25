@@ -117,7 +117,8 @@ def test_fused_bf16_bmm_nvfp4_quant_mla(batch, q_width):
     assert torch.equal(got_aux[..., :64], stale[..., :64])
     assert torch.equal(got_aux[..., 96:], stale[..., 96:])
     # The block the zero W_UK slice leaves in every row: ideal scale 1, zero codes.
-    unit = torch.tensor(Q_GAIN).to(torch.float8_e4m3fn).view(torch.uint8).item()
+    unit = torch.tensor(Q_GAIN, dtype=torch.float32, device="cuda")
+    unit = unit.to(torch.float8_e4m3fn).view(torch.uint8).item()
     assert (got_aux[:, ::7, 64 + 2] == unit).all()
     assert (got_codes[:, ::7, 16:24] == 0).all()
 
@@ -170,10 +171,14 @@ def test_rejects_bad_inputs():
         fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, raw[1:].view(aux.shape))
     # Off q_nope's device.
     with pytest.raises(AssertionError, match="one GPU"):
-        fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk, codes, aux.cpu())
+        fused_bf16_bmm_nvfp4_quant_mla(
+            q_nope, w_uk, codes, torch.empty_like(aux, device="cpu")
+        )
     if torch.cuda.device_count() > 1:
         with pytest.raises(AssertionError, match="one GPU"):
-            fused_bf16_bmm_nvfp4_quant_mla(q_nope, w_uk.to("cuda:1"), codes, aux)
+            fused_bf16_bmm_nvfp4_quant_mla(
+                q_nope, torch.empty_like(w_uk, device="cuda:1"), codes, aux
+            )
 
 
 def test_codes_saturate_past_the_scale_range():
