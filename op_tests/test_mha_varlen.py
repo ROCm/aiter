@@ -679,7 +679,7 @@ PAGED_KV_HEAD_CONFIGS = [(64, 8, 2), (96, 8, 2), (128, 8, 2), (256, 8, 8)]
 def test_flash_attn_varlen_func_paged_kv(
     dtype, d, nheads, nheads_k, causal, return_lse, seqlens_q
 ):
-    """block_table path must match the same batch with contiguous K/V.
+    """block_table path must match the fp32 PyTorch reference.
 
     Cache slots that the block table does not reference hold +/-100, so a
     kernel that reads the wrong page or past a sequence end fails.
@@ -716,27 +716,43 @@ def test_flash_attn_varlen_func_paged_kv(
     )
     q = torch.randn(sum(seqlens_q), nheads, d, device="cuda", dtype=dtype)
 
-    def run(k, v, block_table):
-        return aiter.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max(seqlens_q),
-            max(seqlens_k),
-            causal=causal,
-            return_lse=return_lse,
-            block_table=block_table,
-        )
-
-    out = run(k_cache, v_cache, block_table)
-    out_ref = run(k, v, None)
+    out = aiter.flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=causal,
+        return_lse=return_lse,
+        block_table=block_table,
+    )
     if return_lse:
         out, lse = out
-        out_ref, lse_ref = out_ref
-        torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+    seqs = [
+        (q[cq : cq + sq][None], k[ck : ck + sk][None], v[ck : ck + sk][None])
+        for cq, sq, ck, sk in zip(
+            cu_seqlens_q.tolist(), seqlens_q, cu_seqlens_k.tolist(), seqlens_k
+        )
+    ]
+
+    def ref(**kwargs):
+        return torch.cat(
+            [run_torch(*s, None, None, causal=causal, **kwargs)[0] for s in seqs]
+        )
+
+    out_ref = ref()
+    out_pt = ref(upcast=False, reorder_ops=True)
+    out_diff = (out - out_ref).abs().max().item()
+    out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
+    assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
+    if return_lse:
+        lse_ref = torch.cat(
+            [opus_ref_lse(qi, ki, causal)[0] for qi, ki, _ in seqs], dim=1
+        )
+        opus_check_lse("paged_kv", lse, lse_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
