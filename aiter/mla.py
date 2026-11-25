@@ -992,7 +992,9 @@ def mla_decode_prepare_page_csr(
 # backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
 # contract is the whole signature, schedule metadata included: a provider with
 # its own schedule reads what it needs from it and ignores the rest.
-@_route(op="mla_decode_fwd", version=1)
+# v2 adds has_partials, a hint that only permits skipping work: a v1 provider
+# that ignores it still computes the v2 result, so v1 stays accepted.
+@_route(op="mla_decode_fwd", version=2, supersedes={1: "a later aiter release"})
 def mla_decode_fwd(
     q,
     kv_buffer,
