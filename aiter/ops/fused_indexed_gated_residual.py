@@ -38,7 +38,11 @@ def fused_indexed_gated_residual(
 
     - residual, x: [M, N] bf16, unit stride along N
     - gate: [G, N] gate table, same dtype
-    - indices: [M] int32/int64, contiguous
+    - indices: [M] int32/int64, contiguous; every value must be in [0, G).
+      This is the caller's contract and is not checked: a range check would
+      need a device-to-host sync on every call (and break graph capture).
+      Unlike eager ``gate[indices]``, an out-of-range index is not reported
+      and reads outside the table.
     - out: optional [M, N] destination; may be ``residual`` (in-place update)
     - round_intermediate: round ``gate * x`` to the output dtype before the add,
       as the eager expression does; the result then matches it bit for bit

@@ -101,29 +101,39 @@ def test_out_parameter_and_in_place_update():
     torch.testing.assert_close(residual, want, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("offset", [0, 1])
-def test_strided_and_unaligned_rows(offset):
-    """Rows may be views into wider buffers; an odd column offset breaks 16-byte
-    alignment and must fall back to the scalar path, not misread."""
+def view_in_wider_buffer(t, offset, extra):
+    """Copy of ``t`` as a column slice of a zeroed [rows, 2 * N + extra] buffer."""
+    rows, n = t.shape
+    wide = torch.zeros(rows, 2 * n + extra, device=t.device, dtype=t.dtype)
+    view = wide[:, offset : offset + n]
+    view.copy_(t)
+    return wide, view
+
+
+@pytest.mark.parametrize(
+    "offset,extra",
+    [
+        (0, 8),  # row stride 2N+8: a multiple of 8 but not N -> vectorized path
+        (8, 8),  # same, with a 16-byte-aligned column offset
+        (1, 1),  # odd stride and offset break 16-byte alignment -> scalar path
+    ],
+)
+def test_strided_rows(offset, extra):
+    """Every operand is a view into a wider buffer."""
     M, N, G = 96, 640, 4
     residual, x, gate, indices = make(M, N, G, torch.bfloat16, runs=False)
-    wide = torch.zeros(M, 3 * N + 1, device="cuda", dtype=torch.bfloat16)
-    wide[:, N + offset : 2 * N + offset] = x
-    gate_wide = torch.zeros(G, 2 * N, device="cuda", dtype=torch.bfloat16)
-    gate_wide[:, :N] = gate
-    out_wide = torch.zeros(M, 2 * N + 1, device="cuda", dtype=torch.bfloat16)
+    want = reference(residual, x, gate, indices, True)
+    _, residual_v = view_in_wider_buffer(residual, offset, extra)
+    _, x_v = view_in_wider_buffer(x, offset, extra)
+    _, gate_v = view_in_wider_buffer(gate, offset, extra)
+    out_wide, out_v = view_in_wider_buffer(torch.zeros_like(residual), offset, extra)
     got = fused_indexed_gated_residual(
-        residual,
-        wide[:, N + offset : 2 * N + offset],
-        gate_wide[:, :N],
-        indices,
-        out=out_wide[:, N + offset : 2 * N + offset],
-        round_intermediate=True,
+        residual_v, x_v, gate_v, indices, out=out_v, round_intermediate=True
     )
-    torch.testing.assert_close(
-        got, reference(residual, x, gate, indices, True), atol=0, rtol=0
-    )
-    assert torch.count_nonzero(out_wide[:, : N + offset]) == 0
+    assert got.data_ptr() == out_v.data_ptr()
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    assert torch.count_nonzero(out_wide[:, :offset]) == 0
+    assert torch.count_nonzero(out_wide[:, offset + N :]) == 0
 
 
 def test_int32_indices_are_accepted():
