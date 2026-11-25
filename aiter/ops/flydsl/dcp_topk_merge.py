@@ -38,7 +38,6 @@ def _validate(
     world_size,
     topk_tokens,
     page_size,
-    device_warp,
 ):
     if len(sc_shape) != 2 or sc_dtype != torch.float32:
         raise ValueError("gathered_scores must be a 2D float32 tensor")
@@ -83,10 +82,6 @@ def _validate(
         raise ValueError("out_kv_indices too small for the worst case")
     if page_size <= 0:
         raise ValueError("page_size must be positive")
-    if device_warp not in (32, 64):
-        raise ValueError(
-            f"the FlyDSL DCP merge kernel needs wave32 or wave64, got wave{device_warp}"
-        )
 
 
 def flydsl_dcp_topk_merge(
@@ -120,8 +115,6 @@ def flydsl_dcp_topk_merge(
     First call for a new (n_cand, k_loc, topk, page_size, world_size) JIT-compiles
     the kernels, so warm up each shape before capturing a CUDAGraph.
     """
-    # The kernel is built for the wave width of the GPU the scores are on.
-    wave_size = wave_size_of(gathered_scores.device.index)
     _validate(
         tuple(gathered_scores.shape),
         gathered_scores.dtype,
@@ -141,10 +134,11 @@ def flydsl_dcp_topk_merge(
         world_size,
         topk_tokens,
         page_size,
-        wave_size,
     )
     rows, n_cand = gathered_scores.shape
     k_loc = n_cand // world_size
+    # The kernel is built for the wave width of the GPU the scores are on.
+    wave_size = wave_size_of(gathered_scores.device.index)
     launcher = _get_launcher(
         n_cand, k_loc, topk_tokens, page_size, world_size, wave_size
     )

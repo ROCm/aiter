@@ -7,6 +7,7 @@ import argparse
 import itertools
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -334,14 +335,31 @@ def test_dcp_topk_merge(rows, world, k_loc, topk, page, mode):
     return ret
 
 
+# Edge shapes the perf sweep does not cover: (rows, world, page).
+CHECK_SHAPES = [(1, 8, 64), (17, 4, 16), (256, 2, 128)]
+
+
+def check_case(rows, world, page, mode):
+    k_loc = 64
+    # "overtake" is the topk >= n_cand degenerate case.
+    topk = world * k_loc if mode == "overtake" else 128
+    test_dcp_topk_merge(rows, world, k_loc, topk, page, mode)
+
+
 def check_modes():
     """Run every case mode over edge shapes the perf sweep does not cover."""
-    k_loc = 64
-    for rows, world, page in [(1, 8, 64), (17, 4, 16), (256, 2, 128)]:
+    for rows, world, page in CHECK_SHAPES:
         for mode in CASE_MODES:
-            # "overtake" is the topk >= n_cand degenerate case.
-            topk = world * k_loc if mode == "overtake" else 128
-            test_dcp_topk_merge(rows, world, k_loc, topk, page, mode)
+            check_case(rows, world, page, mode)
+
+
+@pytest.mark.parametrize("mode", CASE_MODES)
+@pytest.mark.parametrize("rows, world, page", CHECK_SHAPES)
+def test_dcp_topk_merge_modes(rows, world, page, mode):
+    """The check_modes grid as pytest nodes, for the gfx1250 test manifest."""
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        pytest.skip(f"FlyDSL DCP TopK merge unsupported on {get_gfx_runtime()}")
+    check_case(rows, world, page, mode)
 
 
 def check_nan_scores_never_win():

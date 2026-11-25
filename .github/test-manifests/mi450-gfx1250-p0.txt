@@ -1,4 +1,4 @@
-# MI450/gfx1250 P0 operator selectors: 23 nodes.
+# MI450/gfx1250 P0 operator selectors: 38 nodes.
 #
 # Selected by the AITER team against ROCm/aiter main @ 1834ee16974f and
 # collected on gfx1250 hardware. The routing
@@ -7,7 +7,7 @@
 # added, removed, or modified before editing a count; never edit a count to
 # restore a green result.
 #
-# The P0 selection is 27 nodes. Four are not gating yet:
+# The P0 selection is 42 nodes. Four are not gating yet:
 #   test_flydsl_grouped_gemm.py (3 nodes) fails until #7536 is fixed and is
 #     tracked in mi450-gfx1250-known-failures.txt; move it back here when that
 #     run reports it fixed.
@@ -39,3 +39,6 @@ op_tests/test_moe_sorting.py::test_moe_sorting_invalid_topk_ids 1
 
 # DeepSeek-V4 fused QK norm/RoPE input-layout contract.
 op_tests/test_flydsl_qk_norm_rope_quant.py::test_flydsl_qk_norm_rope_quant_cos_sin_4d 1
+
+# DCP decode top-k merge, wave32 build: every case mode on the edge shapes.
+op_tests/test_flydsl_dcp_topk_merge.py::test_dcp_topk_merge_modes 15
