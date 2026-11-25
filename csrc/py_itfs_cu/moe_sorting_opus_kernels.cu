@@ -33,6 +33,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices,
                           std::optional<aiter_tensor_t> reverse_sorted)
 {
+    aiter_detail::AiterThrowGuard throw_guard;
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
 
