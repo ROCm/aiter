@@ -1548,9 +1548,22 @@ class Gfx1250Memory:
         fx.rocdl.global_load_async_to_lds_b128(src, dst, 0)
 
     def tdm_copy(
-        self, ptr, offset, shared_offset, shape, strides, extents, width, row_stride
+        self,
+        ptr,
+        offset,
+        shared_offset,
+        shape,
+        strides,
+        extents,
+        width,
+        row_stride,
+        dtype=None,
     ):
-        """Gather a packed cache slice into padded LDS using one wave."""
+        """Gather a packed cache slice into padded LDS using one wave.
+
+        ``dtype`` is the element the copy counts in: the K/V dtype, or a wider
+        unit over byte planes."""
+        dtype = self.t.kv_dtype if dtype is None else dtype
         packed_strides = []
         stride = 1
         for size in reversed(shape):
@@ -1566,7 +1579,7 @@ class Gfx1250Memory:
         )
         src = fx.Tensor(
             fx.make_view(
-                fx.add_offset(fx.recast_iter(self.t.kv_dtype, ptr), offset),
+                fx.add_offset(fx.recast_iter(dtype, ptr), offset),
                 fx.make_layout(gshape, tuple(strides)),
             )
         )
@@ -1584,7 +1597,7 @@ class Gfx1250Memory:
         blk = fx.zipped_divide(coord, shape)[None, rest]
         dst = fx.Tensor(
             fx.make_view(
-                self.pointer(shared_offset, self.t.kv_dtype),
+                self.pointer(shared_offset, dtype),
                 fx.make_layout((shape, 1), (lds_strides, stride)),
             )
         )
