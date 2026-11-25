@@ -38,7 +38,8 @@ the last 16 past the batch keep whatever they hold, so ``xs`` starts zeroed.
 a word a CTA (epoch: launches each CTA has run, so every CTA agrees on the
 parity under graph replay). Quantizing on gfx942, x is counted a 16-row
 group (2 parities of ``max_rows / 16`` lines), and launch-time claims spread
-over CLAIM_LINES counters that never reset.
+over CLAIM_LINES counters that never reset; up to LAUNCH_ORDER_ROWS rows the
+x loads and those claims go out before the epoch is read.
 
 ``trace`` (diagnostics): each CTA writes TRACE_STAMPS int64 100 MHz stamps
 into ``trace``: start, phase 0 done, x ready (0 if it ran no o_proj tile),
@@ -105,6 +106,10 @@ CLAIM_LINES = 8
 # ... and the largest max_rows that claims at launch: at 96 and 128 rows the
 # launch-time claims cost more than they save.
 EARLY_CLAIM_ROWS = 80
+# ... and the largest max_rows that issues phase 0's x loads and the
+# launch-time claim before the epoch lands: from 48 rows on, the earlier W
+# loads cost phase 0 more than they save.
+LAUNCH_ORDER_ROWS = 32
 
 
 def compile_oproj_allreduce_rmsnorm(
@@ -229,6 +234,10 @@ def compile_oproj_allreduce_rmsnorm(
         and grid % CLAIM_LINES == 0
         and n_tiles % CLAIM_LINES == 0
     )
+    # The epoch is an uncached load. Up to LAUNCH_ORDER_ROWS rows nothing waits
+    # for it before phase 0's x loads and a launch-time claim go out: only the
+    # counts, the claim's k and the parity resets use it.
+    launch_order = staged_x and max_rows <= LAUNCH_ORDER_ROWS
     # ``sync`` words.
     x_done_at = 0
     tile_claim_at = x_done_at + 2 * x_groups * SYNC_LINE
@@ -418,6 +427,8 @@ def compile_oproj_allreduce_rmsnorm(
         row of its CTA's row group (``waves`` rows from ``waves * bid``, then a
         grid further) into the LDS stage, and the CTA stores each chunk's
         ``waves`` x 64 B as one contiguous run, whole lines no other CTA writes.
+        With ``launch_order``, ``x_done`` is the CTA's epoch, which only the
+        count reads (``_x_line``).
 
         Lane l takes the 16-K groups q WAVE + l of its wave's row, so a wave
         stages 1 KB a group without bank conflicts."""
@@ -506,8 +517,18 @@ def compile_oproj_allreduce_rmsnorm(
             for w in range_constexpr(1, waves):
                 total = total + _lds_i32(word_base, w)
             if total > 0:
-                fx.atomic_add(_i32_ptr(sync_ptr, x_done), total, syncscope="agent")
+                line = x_done
+                if const_expr(launch_order):
+                    line = _x_line(x_done, bid)
+                fx.atomic_add(_i32_ptr(sync_ptr, line), total, syncscope="agent")
         gpu.barrier()
+
+    def _x_line(epoch, bid):
+        """This launch's x_done line for CTA bid's phase-0 rows."""
+        line = x_done_at + (epoch & 1) * (x_groups * SYNC_LINE)
+        if grouped_x:
+            line = line + (bid * waves // 16) * SYNC_LINE
+        return line
 
     def _phase0(
         x_rsrc,
@@ -694,6 +715,34 @@ def compile_oproj_allreduce_rmsnorm(
         if early_claim:
             return _lds_i32(word_base, 1)
         return _claim_tile(sync_ptr, claim, word_base, tid)
+
+    def _counts(epoch, bid):
+        """This launch's parity, x_done line (group 0) and claim line."""
+        parity = epoch & 1
+        x_done = x_done_at + parity * (x_groups * SYNC_LINE)
+        if early_claim:
+            claim = tile_claim_at + (bid % CLAIM_LINES) * SYNC_LINE
+        else:
+            claim = tile_claim_at + parity * SYNC_LINE
+        return parity, x_done, claim
+
+    @flyc.jit
+    def _reset_counts(sync_ptr, parity, bid, tid):
+        """CTA 0 zeroes the other parity's counters for the next launch."""
+        if (bid == 0) & (tid == 0):
+            other = (parity ^ 1) * SYNC_LINE
+            if const_expr(grouped_x):
+                for g in range_constexpr(x_groups):
+                    fx.ptr_store(
+                        fx.Int32(0),
+                        _i32_ptr(
+                            sync_ptr, x_done_at + other * x_groups + g * SYNC_LINE
+                        ),
+                    )
+            else:
+                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, x_done_at + other))
+            if const_expr(not early_claim):
+                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, tile_claim_at + other))
 
     def _stage_partial(acc, lane, region, accumulate):
         for m in range_constexpr(len(acc) // n_sub):
@@ -1052,35 +1101,22 @@ def compile_oproj_allreduce_rmsnorm(
         _stamp(trace_ptr, bid, 0, tid)
 
         epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, epoch_at + bid)))
-        parity = epoch & 1
-        x_done = x_done_at + parity * (x_groups * SYNC_LINE)
-        if const_expr(early_claim):
-            claim = tile_claim_at + (bid % CLAIM_LINES) * SYNC_LINE
-        else:
-            claim = tile_claim_at + parity * SYNC_LINE
-        if (bid == 0) & (tid == 0):
-            other = (parity ^ 1) * SYNC_LINE
-            if const_expr(grouped_x):
-                for g in range_constexpr(x_groups):
-                    fx.ptr_store(
-                        fx.Int32(0),
-                        _i32_ptr(
-                            sync_ptr, x_done_at + other * x_groups + g * SYNC_LINE
-                        ),
-                    )
-            else:
-                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, x_done_at + other))
-            if const_expr(not early_claim):
-                fx.ptr_store(fx.Int32(0), _i32_ptr(sync_ptr, tile_claim_at + other))
+        if const_expr(not launch_order):
+            parity, x_done, claim = _counts(epoch, bid)
+            _reset_counts(sync_ptr, parity, bid, tid)
 
         # Phase 0: x into MFMA-order chunks.
         x_rsrc = _rsrc(x_ptr)
         xs_rsrc = _rsrc(xs_ptr)
-        if const_expr(grouped_x):
-            # This CTA's rows count on their group's line.
-            x_mine = x_done + (bid * waves // 16) * SYNC_LINE
+        if const_expr(launch_order):
+            # Its line is picked from the epoch after the x loads.
+            x_mine = epoch
         else:
-            x_mine = x_done
+            if const_expr(grouped_x):
+                # This CTA's rows count on their group's line.
+                x_mine = x_done + (bid * waves // 16) * SYNC_LINE
+            else:
+                x_mine = x_done
         if const_expr(early_claim):
             # A CTA without phase-0 rows claims at launch.
             if bid * waves < num_rows:
@@ -1099,6 +1135,8 @@ def compile_oproj_allreduce_rmsnorm(
                     gemm_base,
                     tid,
                 )
+            if const_expr(launch_order):
+                claim = tile_claim_at + (bid % CLAIM_LINES) * SYNC_LINE
             _claim_once(sync_ptr, claim, epoch, bid, word_base, tid)
         else:
             _phase0(
@@ -1116,6 +1154,9 @@ def compile_oproj_allreduce_rmsnorm(
                 gemm_base,
                 tid,
             )
+        if const_expr(launch_order):
+            parity, x_done, claim = _counts(epoch, bid)
+            _reset_counts(sync_ptr, parity, bid, tid)
         _stamp(trace_ptr, bid, 1, tid)
 
         # Phase 1: o_proj tiles once every chunk has landed.
