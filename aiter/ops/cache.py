@@ -131,9 +131,9 @@ def indexer_qk_rope_quant_and_cache(
     slot_mapping: Tensor,
     norm_weight: Tensor,
     norm_bias: Tensor,
-    positions: Tensor,
-    cos_cache: Tensor,
-    sin_cache: Tensor,
+    positions: Tensor | None,
+    cos_cache: Tensor | None,
+    sin_cache: Tensor | None,
     epsilon: float,
     quant_block_size: int,  # fp8: head_dim; fp4: 32
     scale_fmt: str,
@@ -147,7 +147,23 @@ def indexer_qk_rope_quant_and_cache(
     # layout that flydsl_pa_mqa_logits_fp4 consumes directly.
     q_scale_out: Tensor | None = None,  # u8 [T, k_tiles, 4, 16, round_up(H // 16, 4)]
     kv_cache_scale: Tensor | None = None,  # u8 [num_blocks, k_tiles, 4, kv_block_size]
-) -> None: ...
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
+) -> None:
+    """Normalize K, apply RoPE, quantize Q/K, and write the index cache.
+
+    Defaults preserve FP8 and FlyDSL FP4 output. ``scale_layout="opus"``
+    selects gfx950 BF16 inputs, D=128, H=32/64 and 64-row FP4 pages:
+    Q scales [T,2,32,H/16], K data [pages,4,64,16], K scales [pages,2,32,4].
+    OPUS supports rope_dim=0 (no position/tables needed) or 64, and clamps
+    positions to the table. Head weights are copied without scaling.
+    The no-RoPE path uses BF16-rounded LayerNorm affine parameters, matching
+    the DSA unfused path; RoPE64 retains FP32 affine parameters.
+    Slots must be unique when nonnegative and below the cache capacity.
+    Negative/missing OPUS slots skip K, and skip Q unless compute_all_q_rope
+    is True. K has T rows; slots may have fewer rows than Q for DCP padding.
+    """
 
 
 @compile_ops("module_cache", develop=True)
@@ -180,6 +196,24 @@ def fused_qk_rope_concat_and_cache_mla(
     # False (default, non-DCP): slot<0 tokens early-return (skip Q RoPE + q_out).
     # True (DCP): compute Q RoPE for every token (needed after head all-gather).
     compute_all_q_rope: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_concat_and_cache_mla(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_c: Tensor,  # Kimi MLA: [..., kv_lora_rank=512], one KV head
+    k_pe: Tensor,  # [..., pe_dim=64]
+    kv_cache: Tensor,
+    q_out: Tensor,
+    slot_mapping: Tensor,
+    k_scale: Tensor,
+    q_scale: Tensor,
+    is_nope_first: bool,
+    # False (default): slot<0 tokens early-return. True (DCP): compute Q for
+    # every token while guarding only the owner-specific K-cache write.
+    compute_all_q: bool = False,
 ) -> None: ...
 
 

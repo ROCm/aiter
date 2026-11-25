@@ -35,6 +35,9 @@ _PLUGIN = (
 def _load_plugin_standalone() -> None:
     package = types.ModuleType("aiter")
     package.__path__ = [str(_PLUGIN.parent.parent)]
+    # Marked so that tests which need the real package can tell. Without this
+    # they would see the stub, pass importorskip, and fail instead of skipping.
+    package.__aiter_stub__ = True
     sys.modules.setdefault("aiter", package)
 
     spec = importlib.util.spec_from_file_location("aiter.plugin", _PLUGIN)
@@ -48,3 +51,17 @@ try:  # pragma: no cover - which branch runs depends on the environment
     import aiter  # noqa: F401
 except Exception:  # noqa: BLE001 - any import failure means "not built here"
     _load_plugin_standalone()
+
+
+def requires_built_aiter() -> None:
+    """Skip the calling module where AITER is not built.
+
+    ``importorskip("aiter")`` is not enough on its own: this file may have put a
+    stub under that name so the interface can be tested without a build.
+    """
+
+    import pytest
+
+    package = sys.modules.get("aiter")
+    if package is None or getattr(package, "__aiter_stub__", False):
+        pytest.skip("needs a built AITER", allow_module_level=True)
