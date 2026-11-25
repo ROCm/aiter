@@ -20,10 +20,11 @@ NB = 64
 
 def test_front_tier_is_static(monkeypatch):
     monkeypatch.setattr(front, "get_gfx", lambda: "gfx950")
-    tiers = {m: front.front_tier(m) for m in (1, 16, 17, 40, 64, 65, 100, 128, 129)}
+    tiers = {m: front.front_tier(m) for m in (0, 1, 16, 17, 40, 64, 65, 100, 128, 129)}
     assert tiers == {
-        1: "plain",
-        16: "plain",
+        0: "plain",
+        1: "coop",
+        16: "coop",
         17: "coop",
         40: "coop",
         64: "coop",
@@ -85,7 +86,7 @@ def _inputs(m):
 
 
 @needs_gfx950
-@pytest.mark.parametrize("m", [17, 33, 64, 65, 97, 128])
+@pytest.mark.parametrize("m", [1, 4, 8, 12, 16, 17, 33, 64, 65, 97, 128])
 @pytest.mark.parametrize("ks", [3, 1, 2, 4, 6])
 def test_fused_tier_matches_plain_tier(m, ks):
     if ks != 3 and m <= 64:
@@ -187,7 +188,7 @@ def test_quantizer_buffers_not_overrun(m):
 
 
 @needs_gfx950
-@pytest.mark.parametrize("m", [17, 33, 64, 65, 97, 128])
+@pytest.mark.parametrize("m", [1, 4, 8, 12, 16, 17, 33, 64, 65, 97, 128])
 @pytest.mark.parametrize("ks", [3, 1, 2, 4, 6])
 def test_fused_front_is_bitwise_the_unfused_split_chain(m, ks):
     """The fused kernels (GEMM + insert) against the same GEMM's fp32 K-part slabs summed in order, rounded to bf16 and

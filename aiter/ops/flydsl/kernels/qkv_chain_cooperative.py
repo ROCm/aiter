@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Technique source: amd-kernels attention/mxfp8_qkv_norm_rope_nvfp4_insert_n2560_k6144_rot64_p128
 # (kernel_cooperative.py) and the decode MXFP8 GEMM primitives of gemm/mxfp8_common/mxfp8_gemm_decode.py.
-"""One-launch MiniMax-M3.1 QKV front chain at 17-64 rows, TP4 (hidden 6144 -> 2560 columns).
+"""One-launch MiniMax-M3.1 QKV front chain at 1-64 rows, TP4 (hidden 6144 -> 2560 columns).
 
 The deferred split-3 MXFP8 GEMM (``mxpsh``-layout preshuffled weight, (16, 16)-tile activation codes with
 AITER-shuffled E8M0 scales), q / k / index-q / index-k RMSNorm, partial RoPE and the NVFP4 K / V / index-K
@@ -279,14 +279,14 @@ def compile_qkv_cooperative(n_tokens: int, lookahead: tuple[int, int] | None = N
     row pair are gathered and packed in registers, rows past m read as zero through the buffer bound; scheme of
     ``mxfp8_gemm_decode_splitk``). ``lookahead`` = (W steps, A blocks) in flight, default the measured table.
     """
-    assert 17 <= n_tokens <= 64
+    assert 1 <= n_tokens <= 64
     RT = (n_tokens + 15) // 16
     OWNERS = 2 * RT
     ROWS_PER_OWNER = 8
     NWG, PW, pairs = 5, 1, 4
     PRE_WORDS = 12
     # Same-process cold graph sweeps. Per-step scheduling barriers keep all variants under 192 VGPRs.
-    law, laa = {2: (4, 6), 3: (4, 8), 4: (3, 8)}[RT]
+    law, laa = {1: (4, 4), 2: (4, 6), 3: (4, 8), 4: (3, 8)}[RT]
     KSTEPS = K // 128
     SW = KSTEPS // (KS * KW)  # 16 K steps per workgroup
     SCB = K // 256

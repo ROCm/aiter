@@ -4,7 +4,7 @@
 """Host side of the one-launch MiniMax-M3.1 QKV front chain (``qkv_chain_cooperative``).
 
 ``qkv_chain_cooperative_insert`` runs QKV MXFP8 GEMM + q / k / index norm + partial RoPE + NVFP4 K / V / index-K
-inserts for 17-64 decode rows in one launch. Epoch counters (each call adds 16 to every counter it uses, so a set
+inserts for 1-64 decode rows in one launch. Epoch counters (each call adds 16 to every counter it uses, so a set
 stays a multiple of 16 between calls and needs no re-arm) belong to a device and an eager stream, or to the HIP
 capture ID plus stream: separate graphs captured on one stream and replayed concurrently use different storage.
 """
@@ -24,7 +24,7 @@ from .qkv_reduce_insert import compile_qkv_reduce_insert
 
 N, K = 2560, 6144
 ROT = 64
-COOP_ROWS = (17, 64)
+COOP_ROWS = (1, 64)
 
 _COUNTER_SETS = 512  # eager streams and retained graph captures per device
 _COUNTER_WORDS = HEADS * CNT_STRIDE
@@ -45,7 +45,7 @@ def supported_split(m: int) -> bool:
 
 
 def chain_supported(m: int) -> bool:
-    """Rows 17-128 are served by ``qkv_chain_insert``."""
+    """Rows 1-128 are served by ``qkv_chain_insert``."""
     return supported(m) or supported_split(m)
 
 
@@ -352,7 +352,7 @@ def qkv_chain_split_insert(
 
 
 def qkv_chain_insert(*args, **kwargs) -> None:
-    """The QKV front chain at 17-128 decode rows: one launch up to 64 rows, two launches above."""
+    """The QKV front chain at 1-128 decode rows: one launch up to 64 rows, two launches above."""
     m = args[4]
     if supported(m):
         return qkv_chain_cooperative_insert(*args, **kwargs)

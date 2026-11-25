@@ -6,7 +6,7 @@ A decode layer runs ``QKV = A @ W^T`` (N 2560, K 6144, preshuffled (16, 16) MXFP
 index RMSNorm + partial RoPE + NVFP4 K / V / index-K insert (``aiter.fused_qknorm_idxrqknorm``). This module is ONE op with
 two row-range implementations, picked statically by the row count ``m``:
 
-* 17-64 rows: ``qkv_chain_cooperative_insert``, the QKV GEMM and the insert in ONE launch;
+* 1-64 rows: ``qkv_chain_cooperative_insert``, the QKV GEMM and the insert in ONE launch;
 * 65-128 rows: ``qkv_chain_split_insert``, a split-K GEMM (``ks`` K parts, default 3) and a reduce + insert launch;
 * anything else (fewer / more rows, another arch or shape): the plain path, ``per_group_quant_hip`` +
   ``gemm_a8w8_blockscale`` now and the unfused insert later.
@@ -45,7 +45,7 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
 
 N, K = 2560, 6144  # 16 q heads + K + V + index q / k of 128, hidden 6144
-MIN_ROWS, COOP_MAX_ROWS, MAX_ROWS = 17, 64, 128
+MIN_ROWS, COOP_MAX_ROWS, MAX_ROWS = 1, 64, 128
 TIER_PLAIN, TIER_COOP, TIER_SPLIT = "plain", "coop", "split"
 DEFAULT_KS = 3  # measured best split factor of the 65-128 row tier (ks 1 / 2 / 4 / 6 are within the repo tolerance)
 
@@ -220,8 +220,9 @@ def warm_qkv_front(weight: Tensor, chain_scale: Tensor) -> None:
     kv = torch.zeros((1, 2, 128, 72), dtype=torch.uint8, device=dev)
     idx = torch.zeros((1, 128, 72), dtype=torch.uint8, device=dev)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    # one row per compiled config: the one-launch chain's three row tiles, the split tier's row-table tiles
+    # one row per compiled config: the one-launch chain's four row tiles, the split tier's row-table tiles
     plans = {
+        1: TIER_COOP,
         17: TIER_COOP,
         33: TIER_COOP,
         49: TIER_COOP,
