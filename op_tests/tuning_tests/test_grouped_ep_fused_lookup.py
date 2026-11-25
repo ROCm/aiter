@@ -69,12 +69,11 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
 
     def test_ep_fused_rows_selected(self):
         cases = [
-            *(
-                (token, 65, "16", "16", "3", "3")
-                for token in (8, 32, 64, 128, 256, 512)
-            ),
-            (1024, 65, "128", "128", "2", "2"),
-            (2048, 65, "128", "128", "2", "2"),
+            *((token, 65, "16", "16", "3", "3") for token in (8, 32, 64, 128, 256)),
+            # Rows retuned on the fused-shared-expert key (88480c113c).
+            (512, 65, "32", "32", "3", "3"),
+            (1024, 65, "64", "64", "3", "3"),
+            (2048, 65, "128", "128", "3", "3"),
             (4096, 65, "128", "128", "3", "3"),
             (4096, 64, "128", "128", "3", "3"),
             (8192, 65, "256", "256", "4", "4"),
@@ -91,6 +90,36 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
                 self.assertEqual(str(row.get("num_buffer_stage2")), buffers2)
                 # The merged CSV stores the flag as "1.0"; lookup normalizes it.
                 self.assertIn(str(row.get("ep_fused")), ("1", "1.0"))
+
+    def test_compact_rows_override_only_compact(self):
+        # ep_fused=2 rows serve the compact dispatch alone; mori keeps ep_fused=1.
+        kw = {
+            "token_num": 8192,
+            "model_dim": 7168,
+            "inter_dim": 2048,
+            "experts": 65,
+            "topk": -1,
+            "activation": ActivationType.Silu,
+            "dtype": dtypes.bf16,
+            "q_dtype_a": dtypes.fp4x2,
+            "q_dtype_w": dtypes.fp4x2,
+            "quant_type": QuantType.per_1x32,
+            "ep_fused": True,
+        }
+        # DSR1 8192 has no ep_fused=2 row: the compact path keeps the
+        # ep_fused=1 row (tile 256), the same one mori resolves.
+        compact = _find_grouped_config(**kw, compact=True)
+        mori = _find_grouped_config(**kw)
+        self.assertIn(str(compact.get("ep_fused")), ("1", "1.0"))
+        self.assertEqual(str(compact.get("tile_m")), "256")
+        self.assertIn(str(mori.get("ep_fused")), ("1", "1.0"))
+        self.assertEqual(str(mori.get("tile_m")), "256")
+        self.assertEqual(compact, mori)
+        # Without its own row a bucket keeps the ep_fused=1 row on both paths.
+        kw["token_num"] = 16384
+        self.assertEqual(
+            _find_grouped_config(**kw, compact=True), _find_grouped_config(**kw)
+        )
 
     def test_plain_lookup_keeps_generic_rows(self):
         # Upstream rows leave ep_fused blank, so they match both paths and
@@ -110,6 +139,9 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
             max_recv=32768,
             hidden_dim=7168,
             experts_per_rank=65,
+            topk=9,
+            world_size=4,
+            stage1_fused=True,
             geometry=SimpleNamespace(inter_dim=2048),
             recipe=SimpleNamespace(
                 compute=SimpleNamespace(
@@ -121,7 +153,7 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("AITER_TDM_TILE_M", None)
             os.environ.pop("AITER_TDM_TILE_M2", None)
-            for token, expected in ((32768, 256), (512, 16)):
+            for token, expected in ((32768, 256), (512, 32)):
                 with self.subTest(token=token):
                     self.assertEqual(
                         _compact_gemm_align_m(config, recv_bound=token), expected

@@ -33,6 +33,7 @@ from ..types import Stage2ScatterContext, _from_gpu_ptr
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    topk_ids: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -59,6 +60,15 @@ class _EpResources:
         from aiter.ops.flydsl.grouped_moe_gfx1250 import route_counter_buffer
 
         self.route_counter = route_counter_buffer(config.experts_per_rank, device)
+        self.allocate_dispatch_state(config, device)
+        self.combine_output = torch.zeros(
+            config.max_tokens_per_rank * config.hidden_dim,
+            dtype=torch.int16,
+            device=device,
+        )
+
+    def allocate_dispatch_state(self, config: MegaMoEConfig, device) -> None:
+        """The per-step state a dispatch keeps outside the arena."""
         self.token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
             -1,
@@ -72,11 +82,6 @@ class _EpResources:
         )
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
-        self.combine_output = torch.zeros(
-            config.max_tokens_per_rank * config.hidden_dim,
-            dtype=torch.int16,
-            device=device,
-        )
 
     def output(self, token_count: int) -> torch.Tensor:
         """The combine's result for this step's ``token_count`` tokens."""
@@ -349,7 +354,11 @@ class _Dispatch:
         # it stages them, so there is no repack here.
         return payload, scale_rows.data_ptr()
 
-    def _routing(self, token_count: int) -> Routing:
+    def _routing(
+        self, token_count: int, topk_ids: torch.Tensor | None = None
+    ) -> Routing:
         return Routing(
-            token_count=token_count, reverse_source_view=self._reverse_source
+            token_count=token_count,
+            reverse_source_view=self._reverse_source,
+            topk_ids=topk_ids,
         )

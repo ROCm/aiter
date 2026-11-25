@@ -148,6 +148,48 @@ def _find_grouped_config(
     q_dtype_w,
     quant_type,
     ep_fused: bool = False,
+    compact: bool = False,
+):
+    """The tuned CSV row for one grouped MoE shape, or None.
+
+    ``compact``: the MegaMoE compact dispatch (expert-grouped wire rows, the
+    S1F stage-1 kernel) runs GEMM1 on a different A layout than the mori
+    dispatch, so a row with ``ep_fused`` 2 overrides the ``ep_fused`` 1 row
+    for it; without one the ``ep_fused`` 1 row serves both.
+    """
+    kw = {
+        "token_num": token_num,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "activation": activation,
+        "dtype": dtype,
+        "q_dtype_a": q_dtype_a,
+        "q_dtype_w": q_dtype_w,
+        "quant_type": quant_type,
+    }
+    if compact and ep_fused:
+        row = _lookup_grouped_config(**kw, ep_key="2", explicit_only=True)
+        if row is not None:
+            return row
+    return _lookup_grouped_config(**kw, ep_key="1" if ep_fused else "0")
+
+
+def _lookup_grouped_config(
+    *,
+    token_num: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_key: str,
+    explicit_only: bool = False,
 ):
     from aiter.jit.utils.chip_info import get_cu_num
 
@@ -166,7 +208,7 @@ def _find_grouped_config(
         "q_type": _enum_name(quant_type),
         # gemm2 also does the EP scatter, which shifts the stage2 tile optimum
         # away from the plain-GEMM one. Rows leaving this blank serve both paths.
-        "ep_fused": "1" if ep_fused else "0",
+        "ep_fused": ep_key,
     }
     rows = _load_grouped_config_rows()
     # A0 bring-up: reuse gfx1250 family rows when strict has none of its own.
@@ -232,8 +274,10 @@ def _find_grouped_config(
     # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
     # must use the multi-GPU benchmark.
     ep_specific = [row for row in matches if _cell(row, "ep_fused")]
-    if ep_specific:
+    if ep_specific or explicit_only:
         matches = ep_specific
+    if explicit_only and not matches:
+        return None
     if not matches:
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -893,6 +937,20 @@ def _grouped_a8w4_tdm_moe(
             contiguous_m = min(_compact_rows, contiguous_m)
         max_m = contiguous_m
 
+    # Compact GEMM1 reads the original pitched wire; only its quantized output
+    # adopts GEMM2's native M16/K32 payload layout. Keep unsupported shapes on
+    # the existing compact output layout.
+    a2_preshuffled = a_preshuffled or bool(
+        _compact
+        and _a_preshuffle_requested
+        and inter_dim % 128 == 0
+        and tile_n % 64 == 0
+        and tile_m % 16 == 0
+        and tile_m2 % 16 == 0
+        and tile_k2 % 128 == 0
+        and contiguous_m % 16 == 0
+    )
+
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
     # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
     # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
@@ -918,6 +976,9 @@ def _grouped_a8w4_tdm_moe(
     _fused_tp_route = (
         not herd_topk
         and not _compact
+        # APRE quantization consumes the inverse row_to_token map. This fused
+        # helper only builds topids_to_rows; the ordinary remapper fills both.
+        and not a_preshuffled
         and not _is_ep
         and not enable_ep_scatter
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
@@ -1403,6 +1464,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             stage1_quant_out=1,
+            quant_payload_preshuffled=int(a2_preshuffled),
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
@@ -1474,7 +1536,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
-            payload_preshuffled=a_preshuffled,
+            payload_preshuffled=a2_preshuffled,
             **_a2_activation_kw,
         )
 
@@ -1499,7 +1561,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
-        a_preshuffled=int(a_preshuffled),
+        a_preshuffled=int(a2_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1555,7 +1617,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
-                        payload_preshuffled=a_preshuffled,
+                        payload_preshuffled=a2_preshuffled,
                         **_a2_activation_kw,
                     ),
                 )
@@ -1589,6 +1651,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         stage1_quant_out=1,
+                        quant_payload_preshuffled=int(a2_preshuffled),
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
@@ -1672,7 +1735,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
-                    a_preshuffled=int(a_preshuffled),
+                    a_preshuffled=int(a2_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -1922,7 +1985,24 @@ def grouped_gemm_gfx1250_a8w4(
         q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
         ep_fused=stage2_scatter is not None,
+        compact=bool(_cctx is not None and getattr(_cctx, "compact_layout", False)),
     )
+    if _cctx is not None and _cctx.compact_layout:
+        from .kernels.mega_moe_gfx1250.s1f_ctl import s1f_prefill_config
+
+        tuned = s1f_prefill_config(
+            hidden_dim=model_dim,
+            inter_dim=inter_dim,
+            experts_per_rank=E,
+            topk=topk,
+            world_size=_cctx.world_size,
+            recv_bound=_csv_tokens,
+            dispatch_wire="fp4" if is_grouped_a4w4 else "fp8",
+            stage1_fused=_cctx.stage1_gemm1 is not None,
+            activation=activation,
+        )
+        if tuned is not None and dtype == dtypes.bf16:
+            cfg_row = tuned
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
