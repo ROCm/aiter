@@ -25,7 +25,13 @@ from aiter.ops.gemm_op_a8w8 import (
     gemm_a8w8_blockscale_cktile,
     gemm_a8w8_blockscale_flydsl,
 )
-from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_mxfp8fp4_scale, shuffle_weight
+from aiter.jit.utils.build_targets import is_gfx1250_family
+from aiter.ops.shuffle import (
+    shuffle_mxfp8fp4_a,
+    shuffle_mxfp8fp4_b,
+    shuffle_mxfp8fp4_scale,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -77,6 +83,15 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 @perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_mxfp8_1x32(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_mxfp8_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_asm_mxfp8_1x32(x, weight_b, x_scale, w_scale, dtype=dtypes.bf16):
+    # gfx1250 ASM MXFP8 GEMM (same op test_mxfp8fp4gemm.py times with --apre 0):
+    # A row-major, B and both e8m0 scales preshuffled.
+    return aiter.gemm_a8w8_mxfp8(
+        x, weight_b, x_scale, w_scale, dtype=dtype, a_preshuffle=False
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -197,6 +212,21 @@ def test_gemm(
     ret["ck err"] = err_ck
     if w_scale_block == "1x32":
         ret["kernelName"] = _get_mxfp8_bpreshuffle_config(m, n, k)[1]
+        if is_gfx1250_family(get_gfx()):
+            # ASM baseline on the same operands. "ck us" above is the FlyDSL
+            # MXFP8 GEMM here, so asm/ck < 1 means ASM is faster than FlyDSL.
+            c, avg_c = run_asm_mxfp8_1x32(
+                x,
+                shuffle_mxfp8fp4_b(weight),
+                shuffle_mxfp8fp4_scale(x_scale),
+                shuffle_mxfp8fp4_scale(w_scale),
+                dtype,
+            )
+            ret["asm us"] = avg_c
+            ret["asm TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+            ret["asm TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+            ret["asm err"] = checkAllclose(a, c, msg="asm", catastrophic_check=True)
+            ret["asm/ck"] = avg_c / avg_b
 
     if apre and use_flydsl_fp8_scale:
         # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
@@ -557,6 +587,15 @@ if mx_w_scale_block and (False in l_preshuffle or True in l_apre):
         f"--w-scale-block {args.w_scale_block} needs --ck_preshuffle True and no --apre"
     )
 
+def _emit_row(m, n, k, ret):
+    """Print one finished shape right away so a later crash/hang keeps it."""
+    if not ret:
+        return
+    keys = ("ck us", "ck TFLOPS", "asm us", "asm TFLOPS", "asm/ck", "kernelName")
+    fields = " ".join(f"{key}={ret[key]}" for key in keys if key in ret)
+    print(f"ROW m={m} n={n} k={k} {fields}", flush=True)
+
+
 df = []
 if args.csv is not None:
     if not os.path.exists(args.csv):
@@ -582,6 +621,7 @@ if args.csv is not None:
                             w_scale_block=args.w_scale_block,
                         )
                         df.append(ret)
+                        _emit_row(int(row["M"]), int(row["N"]), int(row["K"]), ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
@@ -603,6 +643,7 @@ else:
                                 w_scale_block=args.w_scale_block,
                             )
                             df.append(ret)
+                            _emit_row(m, n, k, ret)
 
 df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)
