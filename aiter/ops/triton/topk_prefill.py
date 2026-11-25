@@ -57,5 +57,8 @@ def top_k_per_row_prefill(
         HI_NUM=cfg["HI_NUM"],
         LO_NUM=cfg["LO_NUM"],
         num_warps=num_warps,
+        waves_per_eu=cfg.get("WAVES_PER_EU", 0),
+        # candidate refine width: half of CAP on shorter rows (fewer VGPRs, occupancy 9), all of CAP on long rows
+        SPAN_NC=cap // 2 if width <= cfg.get("SPAN_HALF_MAX_WIDTH", 24576) else cap,
     )
     return indices
