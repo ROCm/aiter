@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import flydsl_flash_attn_paged_prefill_func
 from aiter.ops.flydsl.kernels import flash_attn_paged_fp8_func_gfx950 as paged
 from aiter.test_common import checkAllclose
@@ -41,7 +41,7 @@ LAYOUT_CASES = [
     (1024, "vectorized", 192, 192, False),
 ]
 gfx950 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() != "gfx950",
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
     reason="native paged FP8 requires gfx950",
 )
 
