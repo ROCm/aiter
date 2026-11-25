@@ -28,7 +28,9 @@ order:
 2. all-reduce + residual + Gemma RMSNorm, a row per CTA.
 
 Phases 1 and 2 are mega paged attention's phases 3 and 4, unchanged: the same
-tiles, reductions, inbox layout and rank-order bf16 rounding.
+tiles, reductions, inbox layout and rank-order bf16 rounding. On gfx942 o_proj
+runs in 32-row passes and each wave stages its fp32 partial in its own LDS
+region; the push adds them in the same order (the same sums).
 
 ``xs`` (and ``x_scale`` when quantizing) must be uncached memory
 (``IpcHeap`` uncached), like mega paged attention's hand-off buffers; rows of
@@ -167,7 +169,10 @@ def compile_oproj_allreduce_rmsnorm(
                 f"quantizing, o_proj K {row_k} must be a multiple of {16 * WAVE}"
             )
     m_sub = max_rows // 16
-    pass_subs = min(m_sub, PASS_ROWS // 16)
+    # gfx942: 32-row o_proj passes, so a pass's partial tile fits an LDS
+    # region a wave (``wave_regions``) and every K step of x stays in flight.
+    gfx942 = get_rocm_arch().split(":")[0] == "gfx942"
+    pass_subs = min(m_sub, 2 if gfx942 else PASS_ROWS // 16)
     passes = [(m0, min(pass_subs, m_sub - m0)) for m0 in range(0, m_sub, pass_subs)]
     if hidden % block_n or block_n % 16:
         raise ValueError(
@@ -183,7 +188,7 @@ def compile_oproj_allreduce_rmsnorm(
     if prefetch is None:
         all_x = 4 * (pass_subs * k_steps + n_sub * k_steps + pass_subs * n_sub)
         prefetch = k_steps if all_x <= 240 else min(4, k_steps)
-        if len(passes) > 1:
+        if len(passes) > 1 and (all_x > 240 or not gfx942):
             prefetch = min(2, k_steps)
     push_iters = -(-(16 * pass_subs * block_n // ATOM_COLS) // threads)
     if hidden % (ATOM_COLS * threads):
@@ -203,6 +208,10 @@ def compile_oproj_allreduce_rmsnorm(
     rs_in_tile = two_shot and max_rows <= 16
     gemm_stride = block_n + (4 - block_n) % 8
     gemm_region = 16 * pass_subs * gemm_stride * 4
+    # A wave's partial tile in its own region (gfx942: 4 x 6.5 KB at 32 rows),
+    # or waves 1 and 3 stage theirs for waves 0 and 2 to add to.
+    wave_regions = gfx942
+    gemm_regions = waves if wave_regions else 2
     # gfx942, quantizing: phase 0 hands x over in whole lines. A chunk is
     # [row // 4][K % 64 / 16][row % 4][16 K] (``_x_lane``), so a CTA's
     # ``waves`` rows own 256 B of each chunk. They are staged in LDS (in
@@ -211,7 +220,7 @@ def compile_oproj_allreduce_rmsnorm(
     # rows 8 banks apart, so any 8 consecutive storing lanes (4 rows x 2 K
     # groups) read 32 distinct banks. The FP8 x (relayout) keeps the original
     # layout and hand-off.
-    staged_x = quantize and get_rocm_arch().split(":")[0] == "gfx942"
+    staged_x = quantize and gfx942
     stage_stride = row_k + 32
     stage_bytes = waves * stage_stride if staged_x else 0
     stage_stores = (k_chunks * waves * 64) // (threads * 16)
@@ -245,8 +254,8 @@ def compile_oproj_allreduce_rmsnorm(
 
     @fx.struct
     class OarStorage:
-        # The two o_proj partial tiles (waves 0+1, 2+3).
-        buf: fx.Array[fx.Int32, max(2 * gemm_region, stage_bytes) // 4, 16]
+        # The o_proj partial tiles (a wave each, or waves 0+1, 2+3).
+        buf: fx.Array[fx.Int32, max(gemm_regions * gemm_region, stage_bytes) // 4, 16]
         w_scale: fx.Array[fx.Float32, block_n, 16]
         red: fx.Array[fx.Float32, 16, 16]
         word: fx.Array[fx.Int32, 4, 16]
@@ -758,13 +767,19 @@ def compile_oproj_allreduce_rmsnorm(
 
     @flyc.jit
     def _reduce_waves(acc, warp, lane, gemm_base):
-        region = gemm_base if warp < 2 else _lds_shift(gemm_base, gemm_region)
-        if (warp == 1) | (warp == 3):
+        if const_expr(wave_regions):
+            # One write a wave, one barrier: _push_tile adds the 4 partials.
+            region = _lds_shift(gemm_base, warp * gemm_region)
             _stage_partial(acc, lane, region, False)
-        gpu.barrier()
-        if (warp == 0) | (warp == 2):
-            _stage_partial(acc, lane, region, True)
-        gpu.barrier()
+            gpu.barrier()
+        else:
+            region = gemm_base if warp < 2 else _lds_shift(gemm_base, gemm_region)
+            if (warp == 1) | (warp == 3):
+                _stage_partial(acc, lane, region, False)
+            gpu.barrier()
+            if (warp == 0) | (warp == 2):
+                _stage_partial(acc, lane, region, True)
+            gpu.barrier()
 
     def _inbox_off(buf, src, row, col):
         return fx.Int64(
@@ -870,9 +885,13 @@ def compile_oproj_allreduce_rmsnorm(
                             result_type=fx.Vector.make_type(ATOM_COLS, fx.Float32),
                         )
                     )
-                    for r in range_constexpr(2)
+                    for r in range_constexpr(gemm_regions)
                 ]
-                acc = pair[0] + pair[1]
+                if const_expr(wave_regions):
+                    # The pair regions' fp32 sums, in their order.
+                    acc = (pair[1] + pair[0]) + (pair[3] + pair[2])
+                else:
+                    acc = pair[0] + pair[1]
                 n = tile * block_n + col * ATOM_COLS
                 y = (
                     acc
