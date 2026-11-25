@@ -293,6 +293,33 @@ def plan_pa_decode(
     the window and query length when decoding or refreshing. Dense plans ignore
     query length.
     """
+    # A refresh of a plan this function already launched for the same lengths
+    # tensor, batch and window: the same compiled planner and arguments, so
+    # skip re-validating and re-deriving them (tens of us of host time a call
+    # in a serving process, once per decode step).
+    fast_key = None
+    if (
+        FAST_REFRESH
+        and plan is not None
+        and max_partitions is None
+        and max_batch_size is None
+        and workgroup_budget is None
+    ):
+        fast_key = (
+            id(plan),
+            plan.work_info.data_ptr(),
+            context_lengths.data_ptr(),
+            context_lengths.numel(),
+            context_lengths.dtype,
+            num_kv_heads,
+            sliding_window,
+            query_length,
+        )
+        hit = _FAST_REFRESH.get(fast_key)
+        if hit is not None and context_lengths.device.index == torch.cuda.current_device():
+            launch, args = hit
+            _run_compiled(launch, *args, torch.cuda.current_stream(context_lengths.device))
+            return plan
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
     sliding_window = max(sliding_window, 0)
@@ -380,8 +407,7 @@ def plan_pa_decode(
         launch = compile_pa_decode_plan(
             max_batch, _block_threads(plan.capacity), sliding_window > 0
         )
-        _run_compiled(
-            launch,
+        args = (
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(plan.work_info, fx.Int32),
             ptr_arg(plan.reduce_info, fx.Int32),
@@ -389,6 +415,17 @@ def plan_pa_decode(
             plan.capacity,
             plan.max_partitions,
             window,
-            torch.cuda.current_stream(dev),
         )
+        _run_compiled(launch, *args, torch.cuda.current_stream(dev))
+    if fast_key is not None:
+        if len(_FAST_REFRESH) >= 256:
+            _FAST_REFRESH.pop(next(iter(_FAST_REFRESH)))
+        _FAST_REFRESH[fast_key] = (launch, args)
     return plan
+
+
+# plan_pa_decode's refresh fast path: key -> (compiled planner, its arguments
+# but the stream). The key names the plan by identity and buffer address and
+# the lengths tensor by address, so a freed and reallocated one misses.
+_FAST_REFRESH: dict = {}
+FAST_REFRESH = True

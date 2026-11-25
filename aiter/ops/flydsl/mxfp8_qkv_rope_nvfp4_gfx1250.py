@@ -34,9 +34,12 @@ _CHAIN_ROWS = {
     # niq: [(max rows, cfg)]. Cold-weight graph replay on MI455X (24 weight
     # copies): non-temporal weight loads (wcpol 1) everywhere; one m-tile up to 96
     # rows (65-96: 6 K-waves, owner-kept rows), 64-row tiles past that; from 49
-    # rows the activation slab goes to LDS by TDM (astage 2).
+    # rows the activation slab goes to LDS by TDM (astage 2). Up to 16 rows a head
+    # is 4 column-split x 4 K-split workgroups (clusters of 16, 32 columns a
+    # workgroup): -0.6..-0.9 us a call against ns 2 at 1-16 rows (same K order, same
+    # bytes).
     1: [
-        (16, (16, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (16, (16, 4, 4, 6, 1, 2, 2, 1, 1, 0)),
         (32, (32, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
         (48, (48, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
         (64, (64, 2, 4, 6, 1, 2, 2, 2, 1, 0)),
@@ -47,7 +50,7 @@ _CHAIN_ROWS = {
     # indexer CP (4 index-q heads, 23 heads): past 128 rows the 69 clusters of the
     # 64-row tiles outrun the shader engines and the unfused chain is as fast.
     4: [
-        (16, (16, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
+        (16, (16, 4, 4, 6, 1, 2, 2, 1, 1, 0)),
         (32, (32, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
         (48, (48, 2, 4, 6, 1, 2, 2, 1, 1, 0)),
         (64, (64, 2, 4, 6, 1, 2, 2, 2, 1, 0)),

@@ -130,6 +130,30 @@ def _router_launcher(
     )
 
 
+@functools.lru_cache(maxsize=64)
+def _router8_launcher(k, topk, need_renorm, scale):
+    from aiter.ops.flydsl.kernels.moe_router8_gfx1250 import build_router8_module
+
+    return build_router8_module(K=k, topk=topk, need_renorm=need_renorm, routed_scaling_factor=scale)
+
+
+def _router8_takes(m, k, split_k, topk, has_bias, quant_mode, with_counts) -> bool:
+    """Whether the 8-row layout (``kernels/moe_router8_gfx1250.py``: the same bytes as the split_k 8 kernel with
+    MXFP4 rows) serves this call: 8 rows (one decode request with 7 draft tokens; measured there), split_k 8, top-k
+    <= 4, a bias, MXFP4 rows only, no group counts."""
+    from aiter.ops.flydsl.kernels.moe_router8_gfx1250 import ROWS
+
+    return (
+        m == ROWS
+        and split_k == 8
+        and 1 <= topk <= 4
+        and k % 256 == 0
+        and has_bias
+        and quant_mode == 1
+        and not with_counts
+    )
+
+
 def router_quant_rows_shapes(m: int, k: int) -> tuple:
     """Shapes of ``flydsl_moe_router_topk``'s ``quant_rows`` (MXFP4 payload,
     E8M0) and ``quant_rows8`` (MXFP8 payload, E8M0) uint8 rows; a buffer may
@@ -218,6 +242,23 @@ def flydsl_moe_router_topk(
         q_ptrs = tuple(ptr_arg(t) for t in bufs)
     elif quant_rows8 is not None:
         raise ValueError("quant_rows8 needs quant_rows")
+    if _router8_takes(m, k, split_k, topk, has_bias, quant_mode, with_counts):
+        _run_compiled(
+            _router8_launcher(k, topk, need_renorm, float(routed_scaling_factor)),
+            ptr_arg(x),
+            ptr_arg(w),
+            ptr_arg(correction_bias),
+            ptr_arg(num_valid_rows if num_valid_rows is not None else ws),
+            ptr_arg(ws),
+            ptr_arg(topk_weights),
+            ptr_arg(topk_ids),
+            m,
+            x.stride(0),
+            int(num_valid_rows is not None),
+            *q_ptrs[:2],
+            current_stream_arg(),
+        )
+        return topk_weights, topk_ids
     launch = _router_launcher(
         k,
         split_k,

@@ -309,6 +309,20 @@ def _router_rows_min_tokens() -> int | None:
     return int(raw) if raw else None
 
 
+# The tp_gather GEMM1's wave-level route (``tp_lite``) for decode batches of at
+# most 16 tokens; a module switch for A/B runs (read at call / capture time).
+TP_ROUTE_LITE = {"on": True, "gemm2": False}  # gemm2: one-trip tile map, unvalidated on GPU
+
+
+def _tp_route_lite(token_num: int, topk: int, experts: int, align: int, tile_m: int) -> int:
+    """Token bound of the GEMM1 wave-level route for this call, 0 = the derived route."""
+    if not TP_ROUTE_LITE["on"] or token_num > 16 or topk != 4 or experts > 256:
+        return 0
+    if align != 16 or tile_m != 16:
+        return 0
+    return 8 if token_num <= 8 else 16
+
+
 def _router_rows_eligible(token_num: int, topk: int) -> bool:
     """Whether a decode batch of ``token_num`` routes takes router rows (above)."""
     from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
@@ -387,6 +401,54 @@ def _take_router_rows(topk_ids, token_num, model_dim) -> MoeRouterQuantRows | No
     ):
         return None
     return rows
+
+
+class MoeRouterPlan:
+    """A decode step's routing plan written by the router (P2; layout in
+    ``offline/interface_p1_p2.md``): ``plan`` int32 ``[8 + 8 * m_tiles]``
+    (header + one 32-byte record per m-tile of 16 rows), and the route
+    outputs the router writes with it: ``psum`` / ``masked_m`` int32 ``[E]``,
+    ``topids_to_rows`` int32 ``[T, topk]``."""
+
+    __slots__ = ("plan", "psum", "masked_m", "topids_to_rows")
+
+    def __init__(self, plan, psum, masked_m, topids_to_rows):
+        self.plan, self.psum = plan, psum
+        self.masked_m, self.topids_to_rows = masked_m, topids_to_rows
+
+
+_ROUTER_PLAN_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_router_plan(topk_ids: torch.Tensor, plan: MoeRouterPlan):
+    """Hand the grouped MoE run inside the block the router's routing plan
+    for ``topk_ids`` (with ``moe_router_quant_rows``): the tp_gather GEMM1
+    reads it instead of re-deriving the route. Eager code only."""
+    prev = getattr(_ROUTER_PLAN_TLS, "value", None)
+    _ROUTER_PLAN_TLS.value = (topk_ids, plan)
+    try:
+        yield
+    finally:
+        _ROUTER_PLAN_TLS.value = prev
+
+
+def _take_router_plan(topk_ids, E: int, tile_m: int, contiguous_m: int) -> MoeRouterPlan | None:
+    held = getattr(_ROUTER_PLAN_TLS, "value", None)
+    if held is None or int(tile_m) != 16:
+        return None
+    ids, plan = held
+    if (
+        ids.data_ptr() != topk_ids.data_ptr()
+        or tuple(ids.shape) != tuple(topk_ids.shape)
+        or plan.plan.dtype != torch.int32
+        or plan.plan.numel() < 8 + 8 * (int(contiguous_m) // 16)
+        or plan.psum.numel() != int(E)
+        or plan.masked_m.numel() != int(E)
+        or tuple(plan.topids_to_rows.shape) != tuple(topk_ids.shape)
+    ):
+        return None
+    return plan
 
 
 def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
@@ -1054,6 +1116,9 @@ def _grouped_a8w4_tdm_moe(
     persistent_workers2=0,
     k_waves1=1,
     k_waves2=1,
+    tile_order1=0,
+    tile_order2=0,
+    g2_prefetch=0,
     tiles_configured=False,
     data_format="a8w4",
     expert_mask=None,
@@ -1670,7 +1735,7 @@ def _grouped_a8w4_tdm_moe(
         and _is_fp4
         and int(topk) == 4
         and mxfp8_copy_out is None
-        and int(k_waves1) == 1
+        and model_dim % (int(tile_k) * int(k_waves1)) == 0
         and not tdm_as_in_prologue
         and not _row_major_ascale
         and (int(tile_m) <= 32 or int(num_buffers) <= 2)
@@ -1769,8 +1834,30 @@ def _grouped_a8w4_tdm_moe(
             "masked_m": _masked_m,
             "align": int(_align_m),
         }
+        _lite = _tp_route_lite(int(token_num), int(topk), int(E), int(_align_m), int(tile_m))
+        if _lite and _fold is None:
+            _tp_gather["lite"] = _lite
         a1_payload = _tp_rows.xq
         a1_scale = _tp_rows.xs
+        # P2: the router also wrote a routing plan + psum / masked_m /
+        # topids_to_rows (moe_router_plan); GEMM1 reads its record instead of
+        # re-deriving the route. Taken only for tile_m 16 (one m-tile an
+        # expert at <= 16 rows, the plan's record shape).
+        _plan = _take_router_plan(topk_ids, int(E), int(tile_m), contiguous_m)
+        if _plan is not None:
+            psum, _masked_m, topids_to_rows = _plan.psum, _plan.masked_m, _plan.topids_to_rows
+            _tp_gather["topids_to_rows"] = topids_to_rows
+            _tp_gather["masked_m"] = _masked_m
+        _p1_kw1 = {"tile_order": int(tile_order1)}
+        if _plan is not None:
+            _p1_kw1["tp_plan"] = _plan.plan
+        if int(g2_prefetch) and two_inter % int(tile_n) == 0:
+            _p1_kw1["g2_prefetch"] = {
+                "w": _grouped_weight_uint8(w2),
+                "ws": w2_scale.reshape(-1).view(torch.int32),
+                "N": int(model_dim),
+                "K": int(inter_dim),
+            }
     elif _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
@@ -1913,7 +2000,7 @@ def _grouped_a8w4_tdm_moe(
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
             **_fold_kw1,
-            **({"tp_gather": _tp_gather} if _tp_gather is not None else {}),
+            **({"tp_gather": _tp_gather, **_p1_kw1} if _tp_gather is not None else {}),
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
@@ -2002,8 +2089,19 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
+        **(
+            {"tile_order": 1}
+            if int(tile_order2)
+            and not _fold_kw2
+            and int(persistent_workers2) == 0
+            and int(cluster_m2) in (-1, 1)
+            and int(cluster_n2 if cluster_n2 is not None else -1) in (-1, 1)
+            else {}
+        ),
         **_ep_gemm2_kwargs,
         **_fold_kw2,
+        # decode TP route: GEMM2 reads its tile map in one round trip
+        **({"psum_one_trip": 1} if _tp_gather is not None and TP_ROUTE_LITE["gemm2"] else {}),
     )
 
     if kernel_bench_callable is not None:
@@ -2539,6 +2637,12 @@ def grouped_gemm_gfx1250_a8w4(
             # 0) means unset, i.e. no split.
             _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
             _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
+            # P1 (decode MoE): m-major tile ids (XCD-balanced, same bytes) for
+            # GEMM1 / GEMM2, and GEMM2's weights prefetched by the tp_gather
+            # GEMM1. Blank / absent / 0: the production schedule.
+            _tdm_kw["tile_order1"] = max(0, _as_int(cfg_row.get("tile_order1"), 0) or 0)
+            _tdm_kw["tile_order2"] = max(0, _as_int(cfg_row.get("tile_order2"), 0) or 0)
+            _tdm_kw["g2_prefetch"] = max(0, _as_int(cfg_row.get("g2_prefetch"), 0) or 0)
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
