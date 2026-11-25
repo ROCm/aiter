@@ -20,7 +20,7 @@
 #   SHAPES             "M,N,K ..."                    (default: shapes below)
 #   MODES              "data:scale ..."               (default: "uniform:auto")
 #   ROUNDS             repeats per shape, median      (default: 1)
-#   IDLE_MAX_USE       rocm-smi GPU use (%) counted as idle (default: 0; some
+#   IDLE_MAX_USE       rocm-smi GPU use (%) counted as idle (default: 15; some
 #                      boards idle at a nonzero floor, e.g. 13)
 #   SHAPE_TIMEOUT      seconds per process            (default: 900)
 #   OUT_DIR            raw logs + tables              (default: /tmp/mxfp8_repro_2)
@@ -32,7 +32,7 @@ AITER_DIR=${AITER_DIR:-$(cd "$HERE/../../.." && pwd)}
 P=${FLYDSL_PYTHONPATH:+$FLYDSL_PYTHONPATH:}$AITER_DIR
 MODES=${MODES:-"uniform:auto"}
 ROUNDS=${ROUNDS:-1}
-IDLE_MAX_USE=${IDLE_MAX_USE:-0}
+IDLE_MAX_USE=${IDLE_MAX_USE:-15}
 SHAPE_TIMEOUT=${SHAPE_TIMEOUT:-900}
 mkdir -p "$OUT_DIR"
 cd "$AITER_DIR" || exit 1
