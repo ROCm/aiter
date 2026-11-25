@@ -4,13 +4,16 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value as _raw
 
 from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
 from ..kernels_common import LOG2E
+from ..mega_moe_tp.common import V4I, bld, rsrc
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
@@ -380,10 +383,16 @@ class AS2RLoader:
         )
 
 
+def _opaque_v(v):
+    """``v`` through a ``v_mov``: the backend no longer knows its high bits are zero, so ``v + C`` stays an add (not a
+    disjoint ``or``) whose constant folds into the buffer instruction's immediate offset."""
+    return fx.Int32(_llvm.InlineAsmOp(T.i32, [_raw(fx.Int32(v))], "v_mov_b32 $0, $1", "=v,v").result)
+
+
 class BWeightLoader:
     """Per-K-step fp4 gate&up weights VMEM->reg (i32x8, 128b widened). shuffle_weight_w4 N-major layout."""
 
-    def __init__(self, *, w_rsrc, num_acc_n, model_dim, cache_modifier=0):
+    def __init__(self, *, w_rsrc, num_acc_n, model_dim, cache_modifier=0, w_addr=None):
         self._w_rsrc = w_rsrc
         self._num_acc_n = num_acc_n
         self._cache_modifier = int(cache_modifier)
@@ -392,8 +401,21 @@ class BWeightLoader:
         self._stride_klane = 256
         self._stride_k0 = 1024
         self._stride_n0 = model_dim * 8
+        # w_addr: raw-buffer form. The lane term is one fixed VGPR, ksub goes to the immediate offset and every
+        # wave-uniform term (n-block, ni, K-step) to the SGPR soffset: no per-load VALU address math. The caller
+        # passes a wave-uniform (SGPR) row base.
+        self.sgpr_offsets = w_addr is not None
+        if self.sgpr_offsets:
+            self._rs = rsrc(w_addr)
+            lane = fx.Int32(self._lane)
+            self._wv = _opaque_v((lane // fx.Int32(16)) * fx.Int32(self._stride_klane)
+                + (lane % fx.Int32(16)) * fx.Int32(self._stride_nlane))
 
     def _load_pack(self, row_base_i32, ni, kstep_i32, ksub):
+        if const_expr(self.sgpr_offsets):
+            soff = ((row_base_i32 // fx.Int32(16)) + fx.Int32(ni)) * fx.Int32(self._stride_n0) + kstep_i32 * fx.Int32(
+                2 * self._stride_k0)
+            return Vec(bld(self._rs, self._wv + fx.Int32(ksub * self._stride_k0), soff, V4I, self._cache_modifier))
         lane_row = fx.Int32(self._lane % 16)
         lane_k = fx.Int32(self._lane // 16)
         n_blk = (row_base_i32 // fx.Int32(16)) + fx.Int32(ni)
@@ -430,17 +452,28 @@ class BWeightLoader:
 class BScaleLoader:
     """Preshuffled per-1x32 E8M0 B scales; one packed i32 (4 e8m0) per K-step per 32-row pack-group."""
 
-    def __init__(self, *, scale_rsrc, num_acc_n, model_dim):
+    def __init__(self, *, scale_rsrc, num_acc_n, model_dim, s_addr=None):
         assert num_acc_n % _PACK == 0
         self._rsrc = scale_rsrc
         self._n_groups = num_acc_n // _PACK
         self._row_stride = (model_dim // 256) * 64
         lane = fx.thread_idx.x % 64
         self._lane_off = lane
+        # s_addr: raw-buffer form with the wave-uniform terms in the SGPR soffset (see BWeightLoader).
+        self.sgpr_offsets = s_addr is not None
+        if self.sgpr_offsets:
+            self._rs = rsrc(s_addr)
+            self._sv = _opaque_v(fx.Int32(lane) * fx.Int32(4))
 
     def load_step(self, base_row_i32, kstep_i32, cache_modifier=0):
         base_group = base_row_i32 // fx.Int32(32)
         kterm = kstep_i32 * fx.Int32(64)
+        if const_expr(self.sgpr_offsets):
+            return [
+                fx.Int32(bld(self._rs, self._sv, ((base_group + fx.Int32(g)) * fx.Int32(self._row_stride) + kterm)
+                    * fx.Int32(4), T.i32, cache_modifier))
+                for g in range_constexpr(self._n_groups)
+            ]
         lane = fx.Int32(self._lane_off)
         out = []
         for g in range_constexpr(self._n_groups):
@@ -759,18 +792,28 @@ class MfmaScaleGU:
                     )
         return acc, b_next
 
-    def call_pipe_am(self, a_load, b_prev, acc, sa, sb, load_next):
-        """A-major pipe: lazy-A per (mi,ksub) overlaps next A ds_read with MFMA; next-B loads spread over groups."""
+    def call_pipe_am(self, a_load, b_prev, acc, sa, sb, load_next, a_early=False):
+        """A-major pipe: lazy-A per (mi,ksub) overlaps next A ds_read with MFMA; next-B loads spread over groups.
+
+        ``a_early``: each group's A operand is read before the previous group's MFMAs (one operand held ahead).
+        """
         nn = self._num_acc_n
         b_next = [None] * nn
         ngrp = self._m_repeat * _PACK
         g = 0
         nb = 0
+        order = [(mi, ks) for mi in range(self._m_repeat) for ks in range(_PACK)]
+        a_nx = a_load(*order[0]) if a_early else None
         for mi in range_constexpr(self._m_repeat):
             ia = mi % _PACK
             sa_v = sa[mi // _PACK]
             for ksub in range_constexpr(_PACK):
-                a_op = a_load(mi, ksub)
+                if const_expr(a_early):
+                    a_op = a_nx
+                    if g + 1 < ngrp:
+                        a_nx = a_load(*order[g + 1])
+                else:
+                    a_op = a_load(mi, ksub)
                 tgt = ((g + 1) * nn) // ngrp
                 while nb < tgt:
                     b_next[nb] = load_next(nb)

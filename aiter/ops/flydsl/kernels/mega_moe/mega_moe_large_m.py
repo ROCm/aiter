@@ -141,6 +141,7 @@ class DispatchSlot(IntEnum):
     TILE_EXPECTED_SHARED = 48
     ROW_ARRIVED = 49
     P2P_ROW_ARRIVED = 50
+    PAYLOAD_CLAIM = 51
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -1120,7 +1121,7 @@ def emit_dispatch_payload(
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
     dedup=False, addr_in_idx=None, merge_release=False, skip_payload_ready=False, chunk_release=True,
     batch_rows=False, lds_pool_ptr=None, presend_experts=0, bucket_pairs=False, presend_limit=None,
-    hoist_peer=False,
+    hoist_peer=False, claim=None,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
@@ -1146,6 +1147,11 @@ def emit_dispatch_payload(
     hoist_peer: the destination's rows per tile (set before its launch handshake) is read before the plan wait and its
     ready-order flag once after it, instead of after the wait and in every chunk publish (two XGMI reads off the
     first chunk's path).
+
+    claim = (counter address, LDS byte address of a free word): the CTA claims its destination's tasks one at a time
+    from that destination's counter (64-byte stride, zeroed before the launch gate) instead of taking every
+    producers_per_destination-th task, so the producers and helper CTAs of a destination share its tasks as they
+    finish them.
     """
     assert merge_release or chunk_release
     assert dedup == batch_rows
@@ -1251,7 +1257,8 @@ def emit_dispatch_payload(
             remote_ready_rows = load_at(AddrBuffer(p_payload_ready_rows), producer_destination, fx.Int64, 1)
             destination_ready_rows = load_at(AddrBuffer(remote_ready_rows), fx.Int32(0), fx.Int32, 1)
     fx.barrier()
-    for task_index in range(task0, task_limit, task_stride):
+
+    def _run_task(task_index):
         chunk_id = task_index // fx.Int32(fz_epr)
         rotated_expert = task_index - chunk_id * fx.Int32(fz_epr)
         rotation = (chunk_id * fx.Int32(17)) % fx.Int32(fz_epr)
@@ -1416,6 +1423,26 @@ def emit_dispatch_payload(
                 for i in range(tid, num_sent, fx.Int32(num_waves * 64)):
                     token_row = fx.Int32(fz_rank * fz_mtpr) + send_slots[i]
                     store_at(payload_epoch, row_arrived_rsrc, token_row)
+
+    if const_expr(claim is None):
+        for task_index in range(task0, task_limit, task_stride):
+            _run_task(task_index)
+    else:
+        claim_addr = fx.Int64(claim[0]) + fx.Int64(producer_destination) * fx.Int64(64)
+        # Word 2 of the LDS pool: the ticket holds words 0-1 and batch_rows' sent-row list starts at word 4.
+        claim_slot = fx.recast_iter(fx.Int32, claim[1]) + 2
+        claim_active = fx.Int32(1) == fx.Int32(1)
+        while claim_active:
+            # The previous task's readers of the slot are past this barrier before thread 0 overwrites it.
+            fx.barrier()
+            if tid == fx.Int32(0):
+                task = fx.Int32(comm_ops.atomic_add_agent(claim_addr, fx.Int32(1)))
+                fx.ptr_store((task < task_limit).select(task, fx.Int32(-1)), claim_slot)
+            fx.barrier()
+            claimed = fx.Int32(fx.rocdl.readfirstlane(T.i32, claim_slot[0]))
+            if claimed >= fx.Int32(0):
+                _run_task(claimed)
+            claim_active = claimed >= fx.Int32(0)
 
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
@@ -1798,6 +1825,9 @@ def large_m_kernel_specs(
         s2_spec += (("disp_peer_hoist", 1),)
     if k1.early_clear:
         s2_spec += (("disp_early_clear", 1),)
+    if k1.payload_helpers:
+        assert k1.payload_helpers % npes == 0
+        s2_spec += (("disp_helpers", int(k1.payload_helpers)),)
     if k1.epi_evec != 2:
         s2_spec += (("g1_epi_vec", int(k1.epi_evec)),)
     if k1.dedup_rows:
@@ -1926,6 +1956,12 @@ def compile_mega_moe_stage1(
     DISP_PEER_HOIST = bool(_s2.get("disp_peer_hoist", 0))
     # disp_early_clear: the owner clears its rank-local counters between sending and awaiting the launch handshake.
     DISP_EARLY_CLEAR = bool(_s2.get("disp_early_clear", 0))
+    # disp_helpers: payload helper CTAs (one destination each, right after the producers) that claim payload tasks
+    # with the producers from per-destination counters, then join GEMM1. The plan sizes the per-destination tasks
+    # only with more than 32 producers.
+    DISP_HELPERS = int(_s2.get("disp_helpers", 0))
+    assert not DISP_HELPERS or (DISP_HELPERS % fuse_npes == 0 and dispatch_blocks > 32
+        and dispatch_blocks + DISP_HELPERS < launch_grid_x - 1), (DISP_HELPERS, dispatch_blocks)
     n_scale_bytes = (sort_block_m + (int(_s2["g1_short_rows"]) if G1_FOLD else 0)) * (model_dim // 32)
     assert n_scale_bytes % 4 == 0, "the LDS control words follow the A-scale bytes word-aligned"
     S2_NW = int(_s2["NW"])
@@ -1966,7 +2002,7 @@ def compile_mega_moe_stage1(
             "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_async", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
             "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
-            "disp_early_clear")
+            "disp_early_clear", "disp_helpers")
     }
     # g1_short_rows > 0: a GEMM1 m-tile whose row g1_short_rows is padding (an expert's tail tile) runs a
     # g1_short_rows-row tile; padding sits at the end of an expert's rows, so so does every later row.
@@ -2200,6 +2236,7 @@ def compile_mega_moe_stage1(
         a_launch_ready = _disp_ptr(DispatchSlot.LAUNCH_READY)
         p_launch_ready = _disp_ptr(DispatchSlot.P2P_LAUNCH_READY)
         a_payload_ready_rows = _disp_ptr(DispatchSlot.PAYLOAD_READY_ROWS)
+        a_payload_claim = _disp_ptr(DispatchSlot.PAYLOAD_CLAIM) if const_expr(DISP_HELPERS) else None
 
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
@@ -2277,6 +2314,10 @@ def compile_mega_moe_stage1(
                     buf_copy_store(ptr_buf_tensor(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0))
                     if const_expr(not DISP_EARLY_HIST):
                         buf_copy_store(ptr_buf_tensor(a_group_done, fx.Int32), fx.Int32(0), fx.Int32(0))
+                if const_expr(DISP_HELPERS):
+                    # The payload claim counters, one 64-byte line per destination.
+                    if tid < fx.Int32(fz_npes):
+                        buf_copy_store(ptr_buf_tensor(a_payload_claim, fx.Int32), tid * fx.Int32(16), fx.Int32(0))
                 # Rank-local G1 completion entries and G2 claim heads restart every launch; they are
                 # cleared before the gate so no CTA of this launch can observe stale values.
                 ctr_rsrc = ptr_buf_tensor(addr_mtile_ctr, fx.Int32)
@@ -2378,7 +2419,9 @@ def compile_mega_moe_stage1(
                     producer_destination]
                 chunks_per_destination = ptr_buf_tensor(a_payload_chunks_per_destination, fx.Int32)[
                     producer_destination]
-                payload_active = producer_round < producers_per_destination
+                if const_expr(not DISP_HELPERS):
+                    # With helpers every producer claims its destination's tasks until they run out.
+                    payload_active = producer_round < producers_per_destination
             if payload_active:
                 emit_dispatch_payload(
                     num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
@@ -2393,6 +2436,34 @@ def compile_mega_moe_stage1(
                     batch_rows=DISP_BATCH, lds_pool_ptr=lds.pool.ptr,
                     presend_experts=DISP_PRESEND, bucket_pairs=DISP_BUCKET, presend_limit=presend_limit,
                     hoist_peer=DISP_PEER_HOIST,
+                    claim=(a_payload_claim, lds.pool.ptr) if const_expr(DISP_HELPERS) else None,
+                )
+        if const_expr(DISP_HELPERS):
+            helper = (ticket > fx.Int32(dispatch_blocks)) & (ticket <= fx.Int32(dispatch_blocks + DISP_HELPERS))
+            if helper:
+                helper_slot = ticket - fx.Int32(dispatch_blocks + 1)
+                # The producers' grouping completes the pair order (and the plan its per-destination geometry).
+                if tid == fx.Int32(0):
+                    comm_ops.wait_i32_until_equals(
+                        _disp_ptr(DispatchSlot.PAIR_ORDER_READY) + fx.Int64(payload_parity) * fx.Int64(4),
+                        payload_expected)
+                    comm_ops.fence_agent_acquire()
+                fx.barrier()
+                emit_dispatch_payload(
+                    num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                    fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
+                    fz_safe_end_i32=fz_safe_end_i32, fz_scale_n_i32=fz_scale_n_i32,
+                    fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
+                    addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc, dispatch_blocks=dispatch_blocks,
+                    producer_slot=helper_slot, parity=payload_parity, expected=payload_expected,
+                    producers_per_destination=fx.Int32(1), payload_chunk_rows=payload_chunk_rows,
+                    chunks_per_destination=ptr_buf_tensor(a_payload_chunks_per_destination, fx.Int32)[
+                        helper_slot % fx.Int32(fz_npes)],
+                    dedup=G1_DEDUP, addr_in_idx=addr_in_idx,
+                    merge_release=DISP_MERGE_REL, skip_payload_ready=DISP_NO_READY, chunk_release=not DISP_NO_REL,
+                    batch_rows=DISP_BATCH, lds_pool_ptr=lds.pool.ptr,
+                    presend_experts=DISP_PRESEND, bucket_pairs=DISP_BUCKET, presend_limit=presend_limit,
+                    hoist_peer=DISP_PEER_HOIST, claim=(a_payload_claim, lds.pool.ptr),
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
@@ -3267,6 +3338,8 @@ class LargeMRuntime:
             "payload_blocks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "group_done": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
+            # Payload claim counters (64-byte lines, one per destination; reset by the owner every launch).
+            "payload_claim": torch.zeros(self.world_size * 16, dtype=torch.int32, device=self.dev),
         }
         workspace["bigcnt"] = _zeroed_sym((self.world_size * self.epr,), torch.int32)
         workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
@@ -3360,6 +3433,7 @@ class LargeMRuntime:
         table[DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION] = workspace[
             "payload_chunks_per_destination"
         ].data_ptr()
+        table[DispatchSlot.PAYLOAD_CLAIM] = workspace["payload_claim"].data_ptr()
         return torch.tensor(table, dtype=torch.int64, device=self.dev)
 
     def select_layer_state(self, layer_slot: int) -> None:

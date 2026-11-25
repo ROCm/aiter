@@ -211,6 +211,11 @@ class FusedStage1Knobs:
 
     # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
     payload_min_blocks: int = 0
+    # Large-input dispatch: this many payload helper CTAs (a multiple of the world size, one destination each) that
+    # claim the payload tasks with the producers from per-destination counters and then join GEMM1; with them
+    # every producer claims its destination's tasks until they run out (0: static task split; needs more than
+    # 32 producers).
+    payload_helpers: int = 0
     # With payload_min_blocks: a rank with at most payload_small_tokens tokens gives each destination at least
     # payload_small_blocks producers instead (0: off).
     payload_small_blocks: int = 0
@@ -237,6 +242,17 @@ class FusedStage1Knobs:
     g1_lookahead: int = 1
     # Small-input GEMM1: K-steps its A rows are loaded ahead of their MFMAs (2: through registers, see do_tile_la).
     g1_a_ahead: int = 1
+    # Small-input GEMM1: K-steps per K-loop iteration (0: the lookahead; with g1_a_ahead 2 the K-loop stays, see
+    # do_tile_la's k_unroll).
+    g1_k_unroll: int = 0
+    # Small-input GEMM1: the W1 / W1-scale loads keep their wave-uniform address terms in SGPRs (BWeightLoader w_addr).
+    g1_sgpr_offsets: bool = False
+    # Small-input GEMM1 with mfma_amajor: each MFMA group's A operand is read a group ahead (do_tile_la a_early).
+    g1_a_early: bool = False
+    # Small-input fused kernel: a plan with a hot expert (mega_moe_small_m._HOT_EXPERT_MIN_ROWS rows) cuts the experts
+    # into m-tiles of this many rows (twice sort_block_m) when that saves at least a sixth of the tiles: the hot
+    # expert then spans half as many tiles, each costing about one W1 / W2 pass (0: off).
+    hot_block_m: int = 0
     # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
     # the source flag to every destination itself after its own drain, instead of the last of all producers storing
     # it behind a rank-local done counter (0: off; at most mega_moe_small_m._DIRECT_DONE_INC).
@@ -370,6 +386,9 @@ class FusedStage2Knobs:
     # Large-input fused kernel (with epi_lean): the P2P rows carry offset int8 (u8 = q + 128) with the same E8M0
     # scale per 32 values instead of E4M3: same bytes, about half the transport rounding error.
     route_i8: bool = False
+    # Small-input fused kernel: the GEMM2 block_n of a launch whose plan has a hot expert (fewer GEMM2 tiles, so
+    # fewer per-tile P2P store drains on the ranks that hold many rows; 0: always block_n).
+    hot_block_n: int = 0
 
 
 @dataclass(frozen=True, slots=True)
