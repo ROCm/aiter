@@ -2730,6 +2730,13 @@ def get_mla_decode_num_heads(
     has no kernel or could not be queried do not run. None when no head count
     up to 128 runs.
 
+    "Runs" means the shape rules accept the head count; nothing is launched.
+    The answer therefore has get_mla_decode_shape_support's limits (see
+    MlaDecodeShapeSupport): launch-size limits are not checked (the gfx950
+    non-persistent fp8 64-head kernel still raises at launch when
+    kv_split > 1 and total_q * kv_split > 32768), and only
+    kv_layout="token_major" is described.
+
     kwargs are get_mla_decode_shape_support's keywords and describe the call
     the caller will make, e.g. return_lse, cp_world_size and cp_round_robin
     for a DCP decode.
