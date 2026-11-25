@@ -1563,7 +1563,11 @@ def _fused_moe_shared_folded(
     """``fused_moe(shared_folded=True)``: the tuned whole-graph row of ``tuned_shared_fmoe.csv``."""
     from aiter.fused_moe_registry import FusedMoeRequest
 
-    bad = [k for k, v in unsupported.items() if v not in (None, False, 0)]
+    bad = [
+        k
+        for k, v in unsupported.items()
+        if v is not None and not (isinstance(v, (bool, int)) and not v)
+    ]
     if bad:
         raise NotImplementedError(f"shared_folded does not support {', '.join(bad)}")
     if shared_expert_id not in (-1, None) or any(t is None for t in shared):

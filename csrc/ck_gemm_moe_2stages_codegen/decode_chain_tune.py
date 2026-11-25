@@ -62,9 +62,15 @@ def row_key(n, gfx, cu_num):
     )
 
 
+_ROW_FILE = os.path.join(
+    tempfile.gettempdir(), f"aiter_decode_chain_rows_{os.getpid()}.csv"
+)
+
+
 class _TempRow:
     """A one-row ``tuned_shared_fmoe.csv`` selected through the environment, so a candidate is timed through the
-    public ``fused_moe`` dispatch exactly as a production row is."""
+    public ``fused_moe`` dispatch exactly as a production row is. One file per process, rewritten per candidate:
+    the config machinery remembers the path it first saw."""
 
     def __init__(self, key, kernel1, kernel2):
         row = dict(
@@ -79,8 +85,8 @@ class _TempRow:
             err2="",
             us="",
         )
-        fd, self.path = tempfile.mkstemp(suffix=".csv", prefix="aiter_decode_chain_")
-        with os.fdopen(fd, "w") as f:
+        self.path = _ROW_FILE
+        with open(self.path, "w") as f:
             f.write(",".join(SHARED_COLUMNS) + "\n")
             f.write(",".join(str(row[c]) for c in SHARED_COLUMNS) + "\n")
 
@@ -90,6 +96,7 @@ class _TempRow:
         self.old = os.environ.get("AITER_CONFIG_SHARED_FMOE")
         os.environ["AITER_CONFIG_SHARED_FMOE"] = self.path
         get_2stage_cfgs.cache_clear()
+        fm.cfg_2stages_by_file.clear()
         fm._decode_route_cfg_names.cache_clear()
         return self
 
@@ -101,8 +108,8 @@ class _TempRow:
         else:
             os.environ["AITER_CONFIG_SHARED_FMOE"] = self.old
         get_2stage_cfgs.cache_clear()
+        fm.cfg_2stages_by_file.clear()
         fm._decode_route_cfg_names.cache_clear()
-        os.unlink(self.path)
 
 
 def _prequant_call(xq, xs, q8, s8, w, ids):

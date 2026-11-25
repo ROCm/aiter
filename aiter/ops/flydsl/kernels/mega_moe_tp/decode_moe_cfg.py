@@ -92,6 +92,8 @@ class ExpertCfg:
             self.sh_bm in (16, 32, 64)
             and self.sh_kw in (2, 4)
             and 1 <= self.sh_pf <= 4
+            # measured: a 64-row shared tile with prefetch >= 3 is not bit-identical (n = 128)
+            and not (self.sh_bm == 64 and self.sh_pf >= 3)
             and self.sh_tn in (64, 128, 256)
             and 1 <= self.g1_pf <= 6
             and self.g2_tn in (128, 256)
@@ -248,6 +250,9 @@ class RouterCfg:
         # W_PIECES / X_PIECES of the tile: whole 16-byte pieces per lane
         w_dwords = self.nbw * 16 * self.block_k // 4
         if w_dwords % (64 * self.waves) or 16 * self.block_k // 8 // 64 < 1:
+            return False
+        # measured: nbw >= 4 at 65-128 rows faults the GPU (the weight tile outgrows the LDS next to the x tile)
+        if m > 64 and self.nbw > 2:
             return False
         if self.x_direct and not (33 <= m <= 57):
             return False

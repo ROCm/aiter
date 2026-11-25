@@ -97,7 +97,9 @@ def test_router_configs_pick_the_same_routes(n):
     lines = router_line_layout(gate)
     _, _, w0, ids0 = route_quant_small(x, gate, lines, bias, SCALE)
     for cfg in router_candidates(n):
+        print(f"router n={n} {cfg.name()}", flush=True)
         r = route_quant_small(x, gate, lines, bias, SCALE, cfg)
+        torch.cuda.synchronize()
         if r is None:
             continue
         (xq, _), (q8, _), w, ids = r
@@ -122,12 +124,11 @@ def test_scale_relayout_matches_logical():
 
 def test_fails_closed():
     L, (gate, bias), x = make_layer(), make_router(), make_x(4)
-    lines = router_line_layout(gate)
-    _, w, ids = chain_direct(x, L, gate, lines, bias)
+    _, _, w, ids = route_quant_small(x, gate, router_line_layout(gate), bias, SCALE)
     with pytest.raises(NotImplementedError):  # 4 rows: no row, no fallback
         integrated(x, L, w, ids)
     x = make_x(16)
-    _, w, ids = chain_direct(x, L, gate, lines, bias)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
     with pytest.raises(NotImplementedError):  # a bias is outside the kernels' contract
         fused_moe(
             x,
