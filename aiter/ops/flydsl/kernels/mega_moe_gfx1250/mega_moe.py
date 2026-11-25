@@ -977,7 +977,10 @@ class MegaMoEGfx1250:
         topk_ids: torch.Tensor,
         recv_token_bound: int | None = None,
     ) -> None:
-        """Launch ``tdm_compact_plan`` on a side stream into the current slot.
+        """Launch the compact plan on a side stream into the current slot.
+
+        The plan is three kernels (arrive, sync, finish); only ``sync`` waits on
+        peers.
 
         The plan only needs ``topk_ids``, so the caller can hide the first
         layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
