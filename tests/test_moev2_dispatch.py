@@ -624,6 +624,21 @@ def test_v2_reads_and_resets_with_the_legacy_table(monkeypatch):
     assert a8w8_pt._resolve.cache_info().currsize == 0
 
 
+def test_v2_prefers_the_row_keyed_on_the_call_pad(monkeypatch):
+    args, kw = _key()
+    p = MoeProblem.from_legacy_key(*args[:-1], 32, **kw, arch="gfx950", cu_num=256)
+    act = (str(p.activation.activation),)
+    any_pad, _ = tuned.lookup_keys(p)
+    padded, _ = tuned.lookup_keys(p, 32)
+    row = {"kernelName1": "", "kernelName2": "", "block_m": 64, "ksplit": 0}
+    padded_row = dict(row, block_m=32)
+    primary = {any_pad[:7] + act + any_pad[8:]: row}
+    monkeypatch.setattr(legacy, "cfg_2stages", (primary, {}))
+    assert tuned.lookup(p) is row
+    primary[padded[:7] + act + padded[8:]] = padded_row
+    assert tuned.lookup(p) is padded_row
+
+
 def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
     from aiter.moev2 import hooks
     from aiter.moev2.migration import a8w8_pt

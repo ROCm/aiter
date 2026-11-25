@@ -86,6 +86,29 @@ class Config:
         )
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
+        pad_reason = intermediate_pad_reason(
+            self.to_string(),
+            problem.inter_dim,
+            problem.intermediate_pad,
+            problem.quant_type == "no",
+        )
+        if pad_reason is not None:
+            return pad_reason
+        if not self.use_prefill:
+            gateup_valid = problem.gateup_dim
+            if intermediate_pad_skipped(
+                self.to_string(),
+                problem.inter_dim,
+                problem.intermediate_pad,
+                problem.quant_type == "no",
+            ):
+                gateup_valid -= 2 * problem.intermediate_pad
+            block_n = _gateup_block_n(self)
+            if -(-gateup_valid // block_n) * block_n > problem.gateup_dim:
+                return (
+                    f"Gate/Up blocks of {block_n} run past the "
+                    f"{problem.gateup_dim} weight rows"
+                )
         if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
             return "direct decoding requires 2 to 8 tokens"
         # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
@@ -149,6 +172,14 @@ class _Problem:
     inter_dim: int
     topk: int
     quant_type: str
+    # Zero-padded intermediate columns at the end of each Gate/Up half and of
+    # Down's K, as fused_moe's intermediate_pad.
+    intermediate_pad: int = 0
+
+    @property
+    def inter_valid(self) -> int | None:
+        """Kernel argument: None without padding, so those kernels are unchanged."""
+        return self.inter_dim - self.intermediate_pad if self.intermediate_pad else None
 
     @classmethod
     def from_inputs(
@@ -158,6 +189,7 @@ class _Problem:
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
         quant_type: QuantType,
+        intermediate_pad: int = 0,
     ):
         experts, gateup_dim, hidden_dim = w1.shape
         model_dim, inter_dim = w2.shape[1], w2.shape[2]
@@ -175,7 +207,51 @@ class _Problem:
                 QuantType.per_Token: "ptpc",
                 QuantType.per_Tensor: "per_tensor",
             }[quant_type],
+            intermediate_pad=intermediate_pad,
         )
+
+
+def _gateup_block_n(config: Config) -> int:
+    """N block of the decode Gate/Up kernel that a config launches."""
+    if config.use_batch1_algorithm:
+        return 32
+    return 64 if config.BLOCK_N == 16 else config.BLOCK_N
+
+
+def intermediate_pad_skipped(
+    config_string: str, inter_dim: int, intermediate_pad: int, is_bf16: bool
+) -> bool:
+    """Whether a config skips a zero-padded intermediate tail.
+
+    intermediate_pad counts the padded columns of each Gate/Up half (and the
+    padded K of Down), as in fused_moe. The BF16 split-K and batch-1 kernels
+    skip a tail that leaves a positive multiple of 32 valid columns.
+    """
+    inter_valid = inter_dim - intermediate_pad
+    return (
+        is_bf16
+        and not Config.from_string(config_string).use_prefill
+        and 0 < inter_valid < inter_dim
+        and inter_valid % 32 == 0
+    )
+
+
+def intermediate_pad_reason(
+    config_string: str, inter_dim: int, intermediate_pad: int, is_bf16: bool
+) -> str | None:
+    """Why a config cannot run with this intermediate_pad, or None.
+
+    A tail under 64 columns that the config cannot skip is computed instead,
+    as CK does; its zero weights leave the result unchanged.
+    """
+    if intermediate_pad < 64 or intermediate_pad_skipped(
+        config_string, inter_dim, intermediate_pad, is_bf16
+    ):
+        return None
+    return (
+        f"intermediate_pad={intermediate_pad} of inter_dim={inter_dim} needs the "
+        "BF16 split-K or batch-1 kernels and a valid width that is a multiple of 32"
+    )
 
 
 def default_config(token: int) -> str:
@@ -240,6 +316,7 @@ def _get_compiled_kernel(
     down_output_padding_bytes=0,
     fused_down_clear=False,
     has_num_local_tokens=False,
+    inter_valid=None,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -263,6 +340,7 @@ def _get_compiled_kernel(
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
         has_num_local_tokens=has_num_local_tokens,
+        inter_valid=inter_valid,
     )
 
 
@@ -538,6 +616,7 @@ def _run_batch1(
         swiglu_limit=swiglu_limit,
         fused_down_clear=fused_down_clear,
         has_num_local_tokens=has_num_local_tokens,
+        inter_valid=problem.inter_valid,
     )
     _launch(
         gateup_kernel,
@@ -563,6 +642,7 @@ def _run_batch1(
         alg="batch1",
         E=None,
         has_num_local_tokens=has_num_local_tokens,
+        inter_valid=problem.inter_valid,
     )
     _launch(
         down_kernel,
@@ -609,7 +689,7 @@ def _run_decode(
     if problem.batch * problem.topk <= problem.experts:
         grid = problem.batch * problem.topk
 
-    block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
+    block_n = _gateup_block_n(config)
     gemm1_out = _gateup_output(hidden_states, problem)
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     gateup_kernel = _get_compiled_kernel.lazy(
@@ -625,6 +705,7 @@ def _run_decode(
         E=problem.experts,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        inter_valid=problem.inter_valid,
     )
     _launch(
         gateup_kernel,
@@ -651,6 +732,7 @@ def _run_decode(
         stage="down",
         alg="splitk",
         E=problem.experts,
+        inter_valid=problem.inter_valid,
     )
     _launch(
         down_kernel,
@@ -683,6 +765,7 @@ def run_flydsl_moe_gfx942(
     moe_sorting_dispatch_policy: int,
     config_string: str,
     swiglu_limit: float | None = None,
+    intermediate_pad: int = 0,
 ) -> torch.Tensor:
     # num_local_tokens: rows at and past it (CUDA-graph padding) run no route
     # and their output rows are unspecified, as in fused_moe. The sorted paths
@@ -730,7 +813,13 @@ def run_flydsl_moe_gfx942(
         raise NotImplementedError("BF16 weights do not support weight scales")
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    if intermediate_pad < 64 and not intermediate_pad_skipped(
+        config_string, w2.shape[2], intermediate_pad, is_bf16
+    ):
+        intermediate_pad = 0
+    problem = _Problem.from_inputs(
+        hidden_states, w1, w2, topk_ids, quant_type, intermediate_pad
+    )
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(
@@ -813,9 +902,9 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support prequantized activations"
         )
-    if request.hidden_pad or request.intermediate_pad:
+    if request.hidden_pad:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support hidden/intermediate padding"
+            "gfx942 FlyDSL whole-graph backend does not support hidden padding"
         )
     if request.gate_mode not in (None, "separated"):
         raise NotImplementedError(
@@ -859,4 +948,5 @@ def run_flydsl_moe_gfx942_impl(
         request.moe_sorting_dispatch_policy,
         config.to_string(),
         request.swiglu_limit,
+        request.intermediate_pad,
     )

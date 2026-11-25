@@ -14,6 +14,7 @@ import dataclasses
 import functools
 import itertools
 import os
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +43,8 @@ from aiter.ops.flydsl.fused_moe_gfx942 import (
     _gateup_output,
     _Problem,
     get_tune_space,
+    intermediate_pad_reason,
+    intermediate_pad_skipped,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
@@ -335,6 +338,204 @@ def test_num_local_tokens_dispatch():
     assert kernel(qwen, 1, 10.0, True, is_ep=True) is None
     for limit in (None, 0.0):
         assert kernel(v41, 1, limit, True) is None
+
+
+def test_intermediate_pad_dispatch(tmp_dir):
+    """FlyDSL rows take intermediate padding where the kernels skip it, and
+    compute a tail under 64 columns that they cannot skip."""
+    shape = (2560, 192, 513, 11)
+    for config, pad, skipped, ok in (
+        ("16_16_16_False", 32, True, True),
+        ("16_128_64_False", 64, True, True),
+        ("16_16_16_False", 16, False, True),
+        ("64_128_128_True", 32, False, True),
+        ("64_128_128_True", 64, False, False),
+        ("16_16_16_False", 192, False, False),
+    ):
+        assert intermediate_pad_skipped(config, 192, pad, True) == skipped
+        reason = intermediate_pad_reason(config, 192, pad, True)
+        assert (reason is None) == ok, (config, pad, reason)
+        problem = _Problem(8, 513, 384, 2560, 2560, 192, 11, "no", pad)
+        assert (Config.from_string(config).unsupported_reason(problem) is None) == ok
+    assert not intermediate_pad_skipped("16_16_16_False", 192, 32, False)
+    assert intermediate_pad_reason("16_16_16_False", 192, 64, False)
+    # 160 stored columns: 128 valid fit two 128-wide Gate/Up blocks, while the
+    # unpadded width needs a third that runs past the weight rows.
+    assert intermediate_pad_skipped("16_128_64_False", 160, 32, True)
+    for config, pad, ok in (
+        ("16_16_16_False", 0, True),
+        ("16_16_16_False_True", 0, True),
+        ("16_128_64_False", 0, False),
+        ("16_128_64_False", 32, True),
+    ):
+        problem = _Problem(8, 513, 320, 2560, 2560, 160, 11, "no", pad)
+        reason = Config.from_string(config).unsupported_reason(problem)
+        assert (reason is None) == ok, (config, pad, reason)
+
+    # (token, intermediate_pad) -> config; a nonzero pad only matches that pad.
+    rows = {
+        (1, 0): "16_16_16_False:default:0",
+        (16, 0): "16_128_64_False:default:0",
+        (16, 32): "16_16_16_False:default:0",
+        (1024, 0): "64_128_128_True:default:0",
+    }
+    csv = Path(tmp_dir) / "fmoe_pad.csv"
+    table = pd.DataFrame(
+        {
+            "gfx": "gfx942",
+            "cu_num": 304,
+            "token": [token for token, _ in rows],
+            "model_dim": shape[0],
+            "inter_dim": shape[1],
+            "expert": shape[2],
+            "topk": shape[3],
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.bfloat16",
+            "q_dtype_w": "torch.bfloat16",
+            "q_type": "QuantType.No",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+            "block_m": 16,
+            "ksplit": 0,
+            "kernelName1": [
+                make_fused_moe_impl_kernel_name(IMPL, c) for c in rows.values()
+            ],
+            "kernelName2": "",
+            "run_1stage": 0,
+            "intermediate_pad": [pad for _, pad in rows],
+            "_tag": "",
+        }
+    )
+    # A second padded row for one shape, kept apart by its tag.
+    retune = table[(table.token == 16) & (table.intermediate_pad == 32)].assign(
+        kernelName1=make_fused_moe_impl_kernel_name(IMPL, "16_128_64_False:default:0"),
+        _tag="retune",
+    )
+    pd.concat([table, retune]).to_csv(csv, index=False)
+
+    def kernel(token, pad, activation=ActivationType.Silu):
+        with patch.dict(os.environ, {"AITER_CONFIG_FMOE": str(csv)}), patch(
+            "aiter.fused_moe.cfg_2stages", None
+        ), patch("aiter.fused_moe.get_cu_num", return_value=304), patch(
+            "aiter.fused_moe.resolve_fused_moe_impl",
+            lambda name: name if name.startswith("impl__") else None,
+        ):
+            AITER_CONFIGS.get_config_file.cache_clear()
+            get_2stage_cfgs.cache_clear()
+            try:
+                return get_2stage_cfgs(
+                    token, *shape, dtypes.bf16, dtypes.bf16, dtypes.bf16,
+                    QuantType.No, True, activation, False, 0, pad,
+                ).full_impl  # fmt: skip
+            finally:
+                get_2stage_cfgs.cache_clear()
+                AITER_CONFIGS.get_config_file.cache_clear()
+
+    def flydsl(token, pad):
+        return make_fused_moe_impl_kernel_name(IMPL, rows[(token, pad)])
+
+    assert kernel(1, 0) == flydsl(1, 0)
+    assert kernel(1, 32) == flydsl(1, 0)
+    assert kernel(16, 0) == flydsl(16, 0)
+    # The first of the duplicate padded rows.
+    assert kernel(16, 32) == flydsl(16, 32)
+    # Like the unpadded rows, padded Silu rows serve other activations.
+    assert kernel(16, 0, ActivationType.Swiglu) == flydsl(16, 0)
+    assert kernel(16, 32, ActivationType.Swiglu) == flydsl(16, 32)
+    # Another pad does not match the padded row.
+    assert kernel(16, 64) == flydsl(16, 0)
+    # A tail under 64 columns that the row cannot skip keeps the row.
+    assert kernel(1, 16) == flydsl(1, 0)
+    assert kernel(1024, 32) == flydsl(1024, 0)
+    # A wider one falls back to the default heuristics instead of raising.
+    assert kernel(1024, 64) is None
+
+
+def test_shipped_intermediate_pad_rows():
+    """The shipped Qwen3.8-Flash-Next TP4 rows for 1-256 tokens apply with its
+    32-column pad, and the rows for 1-8 tokens also without it. Each size has
+    a pad-32 row, so the AOT build compiles the kernels that pad runs."""
+    shape = (2560, 192, 513, 11)
+    pad_rows = pd.read_csv(
+        Path(aiter.__file__).parent
+        / "configs/model_configs/qwen38_flash_next_bf16_inter_pad_tuned_fmoe.csv"
+    )
+    assert sorted(pad_rows.token) == [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    assert (pad_rows.intermediate_pad == 32).all()
+
+    def lookup(token, pad):
+        return get_2stage_cfgs(
+            token, *shape, dtypes.bf16, dtypes.bf16, dtypes.bf16,
+            QuantType.No, True, ActivationType.Silu, False, 0, pad,
+        ).full_impl  # fmt: skip
+
+    env = {k: v for k, v in os.environ.items() if k != "AITER_CONFIG_FMOE"}
+    with patch.dict(os.environ, env, clear=True), patch(
+        "aiter.fused_moe.cfg_2stages", None
+    ), patch("aiter.fused_moe.get_cu_num", return_value=304), patch(
+        "aiter.fused_moe.get_gfx_runtime", return_value="gfx942"
+    ), patch(
+        "aiter.fused_moe.resolve_fused_moe_impl",
+        lambda name: name if name.startswith("impl__") else None,
+    ):
+        AITER_CONFIGS.get_config_file.cache_clear()
+        get_2stage_cfgs.cache_clear()
+        try:
+            row = make_fused_moe_impl_kernel_name(IMPL, "16_16_16_False:default:0")
+            batch1 = make_fused_moe_impl_kernel_name(
+                IMPL, "16_16_16_False_True:default:0"
+            )
+            for token, expected in ((1, row), (2, batch1), (4, batch1), (8, batch1)):
+                assert lookup(token, 32) == expected, token
+                assert lookup(token, 0) == expected, token
+            for token in (16, 32, 64, 128, 256):
+                assert lookup(token, 32) == row, token
+        finally:
+            get_2stage_cfgs.cache_clear()
+            AITER_CONFIGS.get_config_file.cache_clear()
+
+
+def check_intermediate_pad(
+    token, config, tail=float("nan"), inter_valid=160, inter_dim=192
+):
+    """A padded Down K and Gate/Up halves give the unpadded result. With a NaN
+    weight tail, neither that tail nor the Gate/Up output tail reaches the
+    result; a last Gate/Up block or a K prefetch may still read into them."""
+    torch.manual_seed(0)
+    model_dim, experts, topk = 2560, 513, 11
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16)
+    w1 = torch.randn((experts, 2 * inter_valid, model_dim), dtype=dtypes.bf16)
+    w2 = torch.randn((experts, model_dim, inter_valid), dtype=dtypes.bf16)
+    topk_weights, topk_ids = route(hidden, experts, topk, "random")
+    stage1 = torch_moe_stage1(
+        hidden, w1, w2, topk_weights, topk_ids, dtype=dtypes.bf16,
+        activation=ActivationType.Silu, quant_type=QuantType.No,
+    )  # fmt: skip
+    reference = torch_moe_stage2(
+        stage1.view(token, topk, -1), w1, w2, topk_weights, topk_ids,
+        dtype=dtypes.bf16, quant_type=QuantType.No,
+    )  # fmt: skip
+
+    pad = inter_dim - inter_valid
+    w1_padded = torch.full((experts, 2, inter_dim, model_dim), tail, dtype=dtypes.bf16)
+    w1_padded[:, :, :inter_valid] = w1.view(experts, 2, inter_valid, model_dim)
+    w2_padded = torch.full((experts, model_dim, inter_dim), tail, dtype=dtypes.bf16)
+    w2_padded[..., :inter_valid] = w2
+    request = FusedMoeRequest(
+        hidden_states=hidden,
+        w1=shuffle_weight(w1_padded.view(experts, 2 * inter_dim, model_dim), (16, 16)),
+        w2=shuffle_weight(w2_padded, layout=(16, 16)),
+        topk_weight=topk_weights,
+        topk_ids=topk_ids,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.No,
+        intermediate_pad=pad,
+    )
+    impl = resolve_fused_moe_impl(make_fused_moe_impl_kernel_name(IMPL, config))
+    with patch("aiter.ops.flydsl.fused_moe_gfx942._gateup_output", stale_gateup_output):
+        output = impl(request)
+    check_output(reference, output, f"{config} padded {inter_valid}/{inter_dim}")
 
 
 def route(hidden, experts, topk, routing):
@@ -641,6 +842,9 @@ def shipped_rows():
     df = df[df["kernelName1"].astype(str).str.startswith(f"impl__{IMPL}__")]
     if "_tag" in df:
         df = df[df["_tag"].fillna("").astype(str).str.strip() == ""]
+    # Padded rows run with their pad in check_intermediate_pad.
+    if "intermediate_pad" in df:
+        df = df[pd.to_numeric(df["intermediate_pad"], errors="coerce").fillna(0) == 0]
     quants = {"No": "no", "per_Tensor": "per_tensor", "per_Token": "ptpc"}
     rows = set()
     for _, row in df.iterrows():
@@ -812,6 +1016,23 @@ def main():
 
     test_config_strings()
     test_num_local_tokens_dispatch()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        test_intermediate_pad_dispatch(tmp_dir)
+    test_shipped_intermediate_pad_rows()
+    # Qwen3.8-Flash-Next TP4: 160 intermediate columns stored as 192, on the
+    # batch-1, direct-decoding and both split-K decode tiles, which skip the
+    # tail; the prefill tile computes its zero tail.
+    for token, config in (
+        (1, "16_16_16_False"),
+        (4, "16_16_16_False_True"),
+        (32, "16_16_16_False"),
+        (200, "16_128_64_False"),
+    ):
+        check_intermediate_pad(token, config)
+    check_intermediate_pad(1024, "64_128_128_True", tail=0.0)
+    # 128 valid of 160 stored: Down's K is not a multiple of 64.
+    for token, config in ((4, "16_16_16_False_True"), (200, "16_128_64_False")):
+        check_intermediate_pad(token, config, inter_valid=128, inter_dim=160)
     summarize(
         "Compact task table",
         [

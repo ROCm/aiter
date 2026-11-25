@@ -717,8 +717,15 @@ def _cvt_fp8_bf16(src_tensor: fx.Tensor, dst_tensor: fx.Tensor):
         dst_tensor[crd] = vec[i]
 
 
-def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
-    """Build the shared gather/scatter and split-K helpers without tracing IR."""
+def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK, K_VALID=None):
+    """Build the shared gather/scatter and split-K helpers without tracing IR.
+
+    K is the row length of A and B. The split-K loop stops at K_VALID, so a
+    padded K tail does not reach the result (an even iteration count still
+    prefetches one unused tail block).
+    """
+    if K_VALID is None:
+        K_VALID = K
 
     class TensorWithIndex:
         def __init__(
@@ -906,9 +913,9 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         tid = gpu.thread_idx.x
 
         tile_k_per_wg = TILE_K * splitk_waves
-        assert K % tile_k_per_wg == 0, (
-            f"split-K requires K to be divisible by TILE_K * splitk_waves, "
-            f"got K={K}, TILE_K={TILE_K}, splitk_waves={splitk_waves}"
+        assert K % tile_k_per_wg == 0 and K_VALID % tile_k_per_wg == 0, (
+            f"split-K requires K and K_VALID to be divisible by TILE_K * splitk_waves, "
+            f"got K={K}, K_VALID={K_VALID}, TILE_K={TILE_K}, splitk_waves={splitk_waves}"
         )
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
@@ -984,7 +991,7 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
         c_frag.fill(0)
 
-        num_k_iters = K // TILE_K // splitk_waves
+        num_k_iters = K_VALID // TILE_K // splitk_waves
 
         def _prefetch_a(k_idx, buf):
             if const_expr(a_with_index):

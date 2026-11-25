@@ -4614,6 +4614,10 @@ def get_2stage_cfgs(
         _INDEX_COLS.extend(
             ["shared_expert_id", "hidden_pad", "intermediate_pad", "gate_mode"]
         )
+    else:
+        # A row with a nonzero intermediate_pad only matches calls with that
+        # pad; rows with 0 match any pad.
+        _INDEX_COLS.append("intermediate_pad")
 
     # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
     # Please do not modify this code without coordinating with the moev2 owners
@@ -4676,6 +4680,8 @@ def get_2stage_cfgs(
         fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
         keys += fhmoe_keys
         keys_disabled += fhmoe_keys
+    # The default and SiLU-limit tables also key on intermediate_pad (0 = any pad).
+    pad_key = () if config_file is not None else (0,)
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -4698,14 +4704,24 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
+    def _lookup_padded_cfg(c2s):
+        if not c2s or not intermediate_pad or config_file is not None:
+            return None
+        primary, fallback = c2s
+        padded = keys[:7] + (str(activation),) + keys[8:] + (intermediate_pad,)
+        result = primary.get(padded, None)
+        if result is None:
+            result = fallback.get(keys_disabled + (intermediate_pad,), None)
+        return result
+
     def _lookup_cfg(c2s):
         if not c2s:
             return None
         primary, fallback = c2s
-        lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        lookup_keys = keys[:7] + (str(activation),) + keys[8:] + pad_key
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
-            result = fallback.get(keys_disabled, None)
+            result = fallback.get(keys_disabled + pad_key, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
         if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
@@ -4713,7 +4729,7 @@ def get_2stage_cfgs(
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
-                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:] + pad_key
                 )
                 result = primary.get(keys_fb, None)
                 if result is None:
@@ -4722,7 +4738,8 @@ def get_2stage_cfgs(
                     break
         return result
 
-    cfg = _lookup_cfg(active_cfg_2stages)
+    padded_cfg = _lookup_padded_cfg(active_cfg_2stages)
+    cfg = padded_cfg if padded_cfg is not None else _lookup_cfg(active_cfg_2stages)
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
@@ -5083,12 +5100,23 @@ def get_2stage_cfgs(
             unsupported = "prequantized activations"
         elif has_num_local_tokens and not clamped_silu:
             unsupported = "num_local_tokens"
-        elif hidden_pad or intermediate_pad:
+        elif hidden_pad or (
+            intermediate_pad and not kernel_name1.startswith("impl__flydsl_gfx942__")
+        ):
             unsupported = "hidden/intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:
             unsupported = f"gate mode {gate_mode.value!r}"
         elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
             unsupported = f"activation {activation}"
+        if unsupported is None and intermediate_pad:
+            from aiter.ops.flydsl.fused_moe_gfx942 import intermediate_pad_reason
+
+            unsupported = intermediate_pad_reason(
+                kernel_name1.removeprefix("impl__flydsl_gfx942__"),
+                inter_dim,
+                intermediate_pad,
+                q_type == QuantType.No and q_dtype_w == dtypes.bf16,
+            )
         if unsupported is not None:
             cfg = None
             full_impl = None
