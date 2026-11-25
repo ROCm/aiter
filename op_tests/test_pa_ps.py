@@ -319,6 +319,7 @@ def run_aiter_asm_ps(
     mask,
     quant_type: QuantType = QuantType.per_Token,
     high_precision: int = 1,
+    compact_partials: bool = False,
 ):
     return aiter.pa_persistent_fwd(
         Q=Q,
@@ -341,6 +342,7 @@ def run_aiter_asm_ps(
         mask=mask,
         quant_type=quant_type,
         high_precision=high_precision,
+        compact_partials=compact_partials,
     )
 
 
@@ -448,6 +450,7 @@ def test_pa_ps(
     kv_dtype: torch.dtype = dtypes.fp8,
     is_causal: bool = True,
     high_precision: int = 1,
+    compact_partials: bool = False,
 ) -> dict:
     ret = {}
     seed = 0
@@ -691,6 +694,7 @@ def test_pa_ps(
         "mask": int(is_causal),
         "quant_type": quant_type,
         "high_precision": high_precision,
+        "compact_partials": compact_partials,
     }
     _, us_pa_ps = run_aiter_asm_ps(**ps_kwargs)
     err = checkAllclose(out_ref, output, msg="[torch vs pa_persistent_fwd]")
@@ -856,6 +860,11 @@ parser.add_argument(
     --dump_metadata # True""",
 )
 parser.add_argument(
+    "--compact-partials",
+    action="store_true",
+    help="Use the gfx950 GQA16 MTP BF16 split-output path (qlen 2, 3, or 4).",
+)
+parser.add_argument(
     "--profile",
     action="store_true",
     help="""Enable performance profiling. Default: False (single run).
@@ -929,6 +938,7 @@ for dtype in args.dtype:
             kv_dtype=kv_dtype,
             is_causal=is_causal,
             high_precision=high_precision,
+            compact_partials=args.compact_partials,
         )
         df.append(ret)
 df = pd.DataFrame(df)

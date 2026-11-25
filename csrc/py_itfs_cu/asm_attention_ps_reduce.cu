@@ -92,12 +92,13 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     AITER_CHECK(final_output->dtype() == AITER_DTYPE_bf16 ||
                     final_output->dtype() == AITER_DTYPE_fp16,
                 __func__, ": output must be BF16 or FP16");
+    const bool compact = partial_output->dtype() == AITER_DTYPE_bf16;
     AITER_CHECK(partial_output->dim() >= 3 && partial_output->size(-1) == 128 &&
                     partial_output->size(-2) == final_output->size(1) &&
-                    partial_output->dtype() == AITER_DTYPE_fp32 &&
+                    (partial_output->dtype() == AITER_DTYPE_fp32 || compact) &&
                     partial_lse->dtype() == AITER_DTYPE_fp32 &&
                     partial_output->numel() / 128 == partial_lse->numel(),
-                __func__, ": partial output/LSE must have matching packed FP32 layouts");
+                __func__, ": partial output and FP32 LSE must have matching packed layouts");
     AITER_CHECK(reduce_indptr->dtype() == AITER_DTYPE_i32 && reduce_indptr->dim() == 1 &&
                     reduce_indptr->size(0) >= 1 &&
                     reduce_final_map->dtype() == AITER_DTYPE_i32 &&
@@ -129,6 +130,12 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                     partial_output->numel() / (num_heads * 128) <= size_t(max_i32) &&
                     reduce_partial_map->numel() <= size_t(max_u32 / 4),
                 __func__, ": shape exceeds the reducer's 32-bit index range");
+    if(compact)
+    {
+        const size_t rows = partial_lse->numel() / num_heads;
+        AITER_CHECK(max_seqlen_q <= 4 && rows / max_seqlen_q >= reduce_partial_map->numel(),
+                    __func__, ": compact partial buffers must cover map capacity times max_seqlen_q");
+    }
     const int64_t head_stride = final_output->stride(1);
     const int64_t query_stride = final_output->stride(0);
     AITER_CHECK(head_stride >= 128 && head_stride <= max_u32 / 2 &&
@@ -181,8 +188,9 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                 " adaptive:", adaptive, " waves:", selected_waves);
     const auto& config = *selected_config;
     static SynchronizedCache<std::string, AiterAsmKernel> implementations;
-    auto* kernel = &implementations.get_or_create(arch_id + config.knl_name, [&]() {
-        return AiterAsmKernel(config.knl_name.c_str(), config.co_name.c_str());
+    const auto co_name = compact ? "compact/" + config.co_name : config.co_name;
+    auto* kernel = &implementations.get_or_create(arch_id + ":" + co_name + ":" + config.knl_name, [&]() {
+        return AiterAsmKernel(config.knl_name.c_str(), co_name.c_str());
     });
     size_t argument_size = sizeof(args);
     kernel->launch_kernel({&args, &argument_size, static_cast<int>(num_heads),

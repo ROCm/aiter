@@ -549,7 +549,7 @@ def prepare_pa_decode_plan(
         plan.scratch = (
             torch.empty(
                 (partial_rows, 1, query.shape[1], query.shape[2]),
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device=query.device,
             ),
             torch.empty(
@@ -560,7 +560,7 @@ def prepare_pa_decode_plan(
         )
         if stats is not None:
             plan.merge_waves = attention._pa_ps_reduce_waves(
-                batch, stats.used_pages, compute_units
+                batch, stats.used_pages, compute_units, compact_partials=True
             )
         plan._metadata_addresses = tuple(
             t.data_ptr() for t in (plan.kv_indptr, plan.kv_indices)
@@ -694,8 +694,8 @@ def pa_decode(
 ):
     """Write output using a prepared/refreshed plan, without host synchronization.
 
-    Return the same output tensor. ASM uses FP32 split outputs and its native
-    reducer with final_lse=None, matching pa_persistent_fwd(return_lse=False).
+    Return the same output tensor. The ASM plan owns BF16 split outputs and
+    FP32 partial LSE. Its reducer does not materialize a final LSE.
     This call never silently switches backend after validation or launch errors.
     """
     if not isinstance(plan, PADecodePlan) or not plan.refreshed:
