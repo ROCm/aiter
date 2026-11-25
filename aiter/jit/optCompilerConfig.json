@@ -131,7 +131,7 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_mla_nvfp4": {
+    "module_mla_nvfp4_v7": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_nvfp4.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/quantize.cuh'"
