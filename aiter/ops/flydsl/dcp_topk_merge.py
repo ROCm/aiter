@@ -8,8 +8,7 @@ import functools
 import torch
 
 from .kernels.dcp_topk_merge import build_dcp_topk_merge_module
-from .kernels.kernels_common import get_warp_size
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, wave_size_of
 
 
 @functools.cache
@@ -121,7 +120,8 @@ def flydsl_dcp_topk_merge(
     First call for a new (n_cand, k_loc, topk, page_size, world_size) JIT-compiles
     the kernels, so warm up each shape before capturing a CUDAGraph.
     """
-    wave_size = get_warp_size()
+    # The kernel is built for the wave width of the GPU the scores are on.
+    wave_size = wave_size_of(gathered_scores.device.index)
     _validate(
         tuple(gathered_scores.shape),
         gathered_scores.dtype,

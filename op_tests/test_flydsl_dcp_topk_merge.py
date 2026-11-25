@@ -11,7 +11,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -260,7 +260,7 @@ def test_dcp_topk_merge(rows, world, k_loc, topk, page, mode):
     )
     flops = 0  # selection + address arithmetic; no useful FLOPs to count
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         _, us = run_perftest(fn)
         torch.cuda.synchronize()
@@ -418,9 +418,9 @@ def check_deterministic_across_runs(rows, world, k_loc, topk, page, tie_heavy, s
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "FlyDSL DCP TopK merge unsupported on %s; skipping", get_gfx()
+            "FlyDSL DCP TopK merge unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 
