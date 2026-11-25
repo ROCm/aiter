@@ -104,3 +104,19 @@ documented with owner, fallback, and delivery date.
 The infra PR can merge before hardware validation because it is conservative:
 it separates identities and blocks known-incompatible prebuilt binaries. Kernel
 enablement remains gated on component validation.
+
+## Grouped FP4 MoE (aiter #8527)
+
+`mxfp4_preshuffle_gfx1250_tdm` uses scaled 16x16x128 F8F6F4 WMMA with
+FP4 operands on A0, rather than the disabled 32x16x128 F4 instruction. In
+this transposed GEMM the hardware M axis is the output N axis: A0 loads
+one N16 weight fragment per accumulator and selects the corresponding half
+of the N32 scale block. FP4 input, weight, and quantized output layouts stay
+the same. The B0 N32 path is unchanged.
+
+The compatible kernels use `mxfp4_tdm_strict_fp4` symbols, distinct from the
+old errata-family symbols. Grouped FP4 rows are included in strict AOT
+replay; other FP4 kernel families remain excluded until separately enabled.
+Offline codegen must contain the supported WMMA, not a hollow object. Device
+validation must cover gate/up (K=4096), down (K=512), nonconstant E8M0 scales,
+partial tiles, eager execution, and CUDA-graph replay through `fused_moe`.

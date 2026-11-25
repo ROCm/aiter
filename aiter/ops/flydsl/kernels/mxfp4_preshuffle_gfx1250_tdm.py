@@ -14,6 +14,7 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
@@ -325,8 +326,13 @@ def build_gemm_a8w4_tdm_task(
         if INTERLEAVED_LDS_LOAD is None
         else INTERLEAVED_LDS_LOAD
     )
+    # The GEMM is transposed: the hardware WMMA M axis is our N axis.
+    # A0 disables 32x16x128 F4 WMMA, but supports scaled 16x16x128 F8F6F4
+    # with both operands in FP4. Keep its packed inputs and use N16 fragments.
+    strict_fp4 = bool(a_is_fp4 and get_gfx() == "gfx1250-strict")
+    fp4_wmma32 = bool(a_is_fp4 and not strict_fp4)
     WMMA_M = 16
-    WMMA_N = 32 if a_is_fp4 else 16
+    WMMA_N = 32 if fp4_wmma32 else 16
     WMMA_K = 128
     WAVE = 32
     PACK_TK = tile_k // 2
@@ -419,7 +425,7 @@ def build_gemm_a8w4_tdm_task(
     # Group two N fragments and four M fragments into a 64x64 output block.
     wmma_2x4 = bool(
         hyper_params["wmma_2x4"]
-        and a_is_fp4
+        and fp4_wmma32
         and tile_m == tile_n == tile_k == 256
         and m_warp == n_warp == 2
     )
@@ -547,8 +553,8 @@ def build_gemm_a8w4_tdm_task(
     # accumulators (one f32 dword4 per lane per chunk) for the final reduction.
     K_PARTIAL_B = (
         ((tile_m // m_warp) // 16)
-        * ((tile_n // n_warp) // (32 if a_is_fp4 else 16))
-        * ((32 if a_is_fp4 else 16) // 2)
+        * ((tile_n // n_warp) // WMMA_N)
+        * (WMMA_N // 2)
         * 4
         * num_waves
         * WAVE
@@ -580,7 +586,9 @@ def build_gemm_a8w4_tdm_task(
             output_n_rep % WN_PER_MX_BLOCK == 0
         ), "stage1 quant requires complete four-WMMA N groups"
 
-    _afp = "fp4" if a_is_fp4 else "fp8"
+    # A distinct symbol keeps A0's valid N16 variant separate from the F4
+    # errata kernels that AOT prunes, as well as from B0's cached N32 variant.
+    _afp = "strict_fp4" if strict_fp4 else ("fp4" if a_is_fp4 else "fp8")
     _a_layout = "_apre" if a_preshuffled else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
@@ -1383,7 +1391,7 @@ def build_gemm_a8w4_tdm_task(
             )
 
         def load_b(base, wn, ksl):
-            if const_expr(a_is_fp4):
+            if const_expr(fp4_wmma32):
                 return load_b_half(base, wn * 2, ksl).shuffle(
                     load_b_half(base, wn * 2 + 1, ksl), list(range(16))
                 )
@@ -1411,7 +1419,7 @@ def build_gemm_a8w4_tdm_task(
 
         wmma_atoms = (
             []
-            if a_is_fp4
+            if fp4_wmma32
             else [
                 [
                     fx.make_mma_atom(
@@ -1511,9 +1519,9 @@ def build_gemm_a8w4_tdm_task(
                 i, wn = mma_order[mma_index]
                 wm = wm_list[i]
                 idx = wm * wmma_n_rep + wn
-                scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                scale_a = sb_k[wn if fp4_wmma32 else wn // 2]
                 scale_b = sa_k[wm // 2]
-                if const_expr(a_is_fp4):
+                if const_expr(fp4_wmma32):
                     wt_value = wt[wn].load()
                     act_value = act[i].load()
                     mma_result = rocdl.wmma_scale_f32_32x16x128_f4(
@@ -1542,8 +1550,8 @@ def build_gemm_a8w4_tdm_task(
                     )
 
         DS_A = 2 if a_is_fp4 else 4
-        # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
-        DS_B = 4 if a_is_fp4 else 2
+        # Only B0's F4 WMMA spans N32 and joins two N16 halves.
+        DS_B = 4 if fp4_wmma32 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
         # Packed scale b32 reads merge pairwise into native ds_load_2addr.
@@ -1620,7 +1628,7 @@ def build_gemm_a8w4_tdm_task(
                 ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            if const_expr(a_is_fp4 and interleaved_lds_load):
+            if const_expr(fp4_wmma32 and interleaved_lds_load):
                 # Alternate equal 32-byte A/B chunks. DS_GROUP controls only
                 # scheduling hints; it must not select the load order.
                 a_parts, b_parts = [], []
