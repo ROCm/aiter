@@ -513,16 +513,18 @@ def test_v41ep8_fused_configs_unchanged():
 
 
 def test_v41ep8_large_m_capacities():
-    """EP8 V4.1-Flash: 8192 and 16384 (as EP4, it faults at 1024), both with the tune measured at 16384."""
+    """EP8 V4.1-Flash: every large-input capacity, each with the tune measured at 16384."""
     assert large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304) == (
+        1024,
+        2048,
+        4096,
         8192,
         16384,
     )
     tuned = _knob_table(select_fused_config(16384, 16384, **V41_FLASH_EP8_SHAPE))
-    for mtpr in (1024, 2048, 4096, 32768):
-        with pytest.raises(ValueError):
-            select_fused_config(mtpr, mtpr, **V41_FLASH_EP8_SHAPE)
-    for mtpr in (8192, 16384):
+    with pytest.raises(ValueError):
+        select_fused_config(32768, 32768, **V41_FLASH_EP8_SHAPE)
+    for mtpr in (1024, 2048, 4096, 8192, 16384):
         for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
             assert (
                 _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP8_SHAPE))

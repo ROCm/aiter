@@ -100,9 +100,10 @@ LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
 # EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
 V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
-# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
-# (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
-V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
+# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, serves every large-input capacity: the fault once
+# seen at 1024 came from another process's kernels sharing the GPUs (the persistent kernels need the whole grid
+# resident); on exclusive GPUs 1024, 2048 and 4096 run clean.
+V41_FLASH_EP8_LARGE_M_MTPRS = LARGE_M_MTPRS
 # (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
 _V41_FLASH_LARGE_M_MTPRS = {
     (world, model_dim, inter_dim): mtprs
@@ -1694,8 +1695,8 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
-    uniform, zipf and all-to-rank-0 routes). It serves 8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as
-    the EP4 tune.
+    uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity, 1024..16384
+    (V41_FLASH_EP8_LARGE_M_MTPRS), unchanged.
 
     The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
     per-token combine wait; the measurements are in the PR.
