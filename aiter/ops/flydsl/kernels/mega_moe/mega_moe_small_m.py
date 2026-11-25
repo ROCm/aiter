@@ -468,11 +468,13 @@ def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
     return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
 
 
-def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False):
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False, cached_w_rows=0):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
-    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does)."""
+    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does;
+    ``cached_w_rows``: the routed rows that pick them, 0 for _CACHED_W_MIN_ROWS)."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-    cached_w = hot_expert if stream_w else hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))
+    min_rows = cached_w_rows or _CACHED_W_MIN_ROWS
+    cached_w = hot_expert if stream_w else hot_expert | (routed_rows >= fx.Int32(min_rows))
     nv_flag = nv_flag | cached_w.select(fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0))
     return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
         fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
@@ -482,7 +484,7 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, str
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, cached_w_rows=0,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -552,7 +554,7 @@ def emit_direct_fixed_slot_finalize(
         if const_expr(not plan_wt):
             comm_ops.fence_system_release()
         if lane == fx.Int32(0):
-            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w, cached_w_rows)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -845,7 +847,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192)) and cap == required_cap
+    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192), (4, 32)) and cap == required_cap
 
 
 # fmt: off
@@ -858,11 +860,11 @@ def compile_mega_moe_stage1(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_wt: bool = False,
+    swiglu_limit: float = 0.0, act: str = "silu", dedup_rows: bool = False, plan_wt: bool = False,
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False,
+    ascale_packed: bool = False, stream_w: bool = False, bf16_wire: bool = False, cached_w_rows: int = 0,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -912,7 +914,7 @@ def compile_mega_moe_stage1(
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
-        raise ValueError("small-input stage1 needs the EP8/48-, EP4/96- or EP2/192-expert fixed-slot layout")
+        raise ValueError("small-input stage1 needs the EP8/48-, EP4/96-, EP2/192- or EP4/32-expert fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
     # Producers load their route (expert, remote pointers, row, scales, weight) before the epoch gate and
     # quantize the bf16 input row to MXFP8. A producer wave sends pre_rounds routes (one per round) so
@@ -1028,7 +1030,7 @@ def compile_mega_moe_stage1(
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
         f"aa{int(async_a_copy)}"
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}"
-        f"{swiglu_suffix}"
+        f"{swiglu_suffix}{'' if act == 'silu' else '_' + act}"
         f"_fused{'_'.join(str(v) for v in fused)}"
         f"{'_dd' if dedup_rows else ''}"
         f"{'_pw' if plan_wt else ''}"
@@ -1040,7 +1042,7 @@ def compile_mega_moe_stage1(
         f"{f'_ev{epi_evec}' if epi_evec != 2 else ''}{f'_el{epi_lean}' if epi_lean else ''}"
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
-        f"{'_stw' if stream_w else ''}"
+        f"{'_stw' if stream_w else ''}{'_bw' if bf16_wire else ''}{f'_cw{cached_w_rows}' if cached_w_rows else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1178,7 +1180,7 @@ def compile_mega_moe_stage1(
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w,
+                stream_w=stream_w, cached_w_rows=cached_w_rows,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1243,7 +1245,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False, evec=epi_evec,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=swiglu_limit, act=act,
             rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
             fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
@@ -1263,7 +1265,7 @@ def compile_mega_moe_stage1(
                 n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=0,
                 swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False, evec=epi_evec,
-                swiglu_limit=swiglu_limit,
+                swiglu_limit=swiglu_limit, act=act,
                 rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
                 fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
@@ -1313,7 +1315,7 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(metadata_base + num_expert_tiles, plan_ptr(incl_base, slot))
                 fx.ptr_store(safe_count, plan_ptr(count_base, slot))
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w, cached_w_rows)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
@@ -1470,7 +1472,7 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
-        if const_expr(tok_done):
+        if const_expr(tok_done or bf16_wire):
             fp8_rows = fx.Int32(0)
         tok_off = tok_reset = fx.Int64(0)
         if const_expr(tok_counters):
@@ -1582,7 +1584,8 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w,
+        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, bf16_wire=k1.bf16_wire,
+        cached_w_rows=k1.cached_w_rows,
     )
     # fmt: on
 
@@ -1657,7 +1660,7 @@ class SmallMRuntime:
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, swiglu_limit: float = 0.0, payload_arena=None, s1_output_arena=None,
+        max_tok_per_rank: int, swiglu_limit: float = 0.0, act: str = "silu", payload_arena=None, s1_output_arena=None,
         combine_input=None):
     # fmt: on
         """``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
@@ -1682,6 +1685,7 @@ class SmallMRuntime:
         self.swiglu_limit = float(swiglu_limit)
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
+        self.act = act
         self.dev = torch.device("cuda", rank)
         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
         # work over 8 XCDs and bakes in the FUSED_LAYOUTS shapes), instead of failing at compile.
@@ -1689,7 +1693,7 @@ class SmallMRuntime:
             fused_layout_supported(
                 arch=get_gfx_runtime(), world_size=self.world_size, model_dim=self.model_dim,
                 inter_dim=self.inter_dim, experts=self.experts, topk=self.topk, quant=quant,
-                swiglu_limit=self.swiglu_limit,
+                swiglu_limit=self.swiglu_limit, act=self.act,
             )
             and small_m_cu_supported(torch.cuda.get_device_properties(self.dev).multi_processor_count)
         ):
@@ -1955,6 +1959,7 @@ class SmallMRuntime:
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
+            act=self.act,
             **_kernel_knobs(config))
         # fmt: on
         self._launchers[config] = launch

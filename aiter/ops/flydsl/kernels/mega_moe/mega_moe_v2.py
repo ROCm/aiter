@@ -235,6 +235,7 @@ class MegaMoEV2:
                     w2_scale=self.w2_scale,
                     max_tok_per_rank=m,
                     swiglu_limit=self.swiglu_limit,
+                    act=self.act,
                     payload_arena=self._payload_arena if m in self._small_m_shared else None,
                     s1_output_arena=self._s1_output_arena,
                     combine_input=self._combine_input if m in self._small_m_shared else None,
