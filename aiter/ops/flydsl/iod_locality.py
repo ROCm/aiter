@@ -239,6 +239,16 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k, group):
 # holds a cluster_n 2 GEMM1 cluster and a cluster_n 4 GEMM2 one at 256 x 256.
 W13_TILE, W13_GROUP = (256, 256), 2
 W2_TILE, W2_GROUP = (512, 128), 2
+#: W2 layouts by (N, K) where the tuned GEMM2 rows are 256 x 256 above decode.
+#: DeepSeek-R1 EP4 (N 7168, K 2048): on the 512 x 128 layout those rows run
+#: b_placed 2, 5-7% slower than unplaced at tpr 512-2048, while 256 x 256 is
+#: ~1-3% faster than unplaced there and ~3% slower than 512 x 128 at tpr 64.
+_W2_TILE_BY_SHAPE = {(7168, 2048): (256, 256)}
+
+
+def w2_tile(N: int, K: int) -> tuple:
+    """Layout tiling ``place_w2`` uses for an N x K GEMM2 weight."""
+    return _W2_TILE_BY_SHAPE.get((int(N), int(K)), W2_TILE)
 
 
 def mode() -> int:
@@ -313,9 +323,11 @@ def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None) -> b
 
 
 def place_w2(w2: torch.Tensor, w2_scale: torch.Tensor, experts_cnt=None) -> bool:
-    """``place_w13`` for the shuffled GEMM2 weight, laid out for 512 x 128 tiles
-    (served to 256 x 256 as well)."""
-    return _register(w2, w2_scale, experts_cnt, W2_TILE, W2_GROUP)
+    """``place_w13`` for the shuffled GEMM2 weight, laid out for ``w2_tile``:
+    512 x 128 tiles (served to 256 x 256 as well) unless its shape has its
+    own entry."""
+    tile = w2_tile(w2.shape[-2], int(w2.shape[-1]) * 2)
+    return _register(w2, w2_scale, experts_cnt, tile, W2_GROUP)
 
 
 def placed_tile(w):
