@@ -495,7 +495,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table.
 _V41EP8_FUSED_DIGEST = (
-    "947797b9716d90a9387f6489c9558eaa24d002f63f104c4be9354cda0bc8d5f3"
+    "da6de72f6e9e99dfb154e051c34213ca88e28065a650ab842d71775a0e95191c"
 )
 
 
