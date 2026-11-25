@@ -269,7 +269,9 @@ def prefetch_direct_fixed_slot_token(
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
     spread = _spread_token(i32_cur_tok, dispatch_blocks)
-    token = spread.select(producer_slot, producer_slot + fx.Int32(dispatch_blocks) * warp) + fx.Int32(token_offset)
+    token = spread.select(
+        producer_slot, producer_slot + fx.Int32(dispatch_blocks) * warp
+    ) + fx.Int32(token_offset)
     source_token = (token < i32_cur_tok).select(token, fx.Int32(0))
     route = source_token * fx.Int32(fz_k) + (lane < fx.Int32(fz_k)).select(
         lane, fx.Int32(0)
@@ -970,6 +972,9 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     assert clamp_a or not row_mask
     assert not row_stride or (clamp_a and BM == SBM)
     lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
+    # BF16 launches store their rows with every lane (p2p_scatter_epilog wide_bf16); the lean / tok_done epilogues
+    # keep their per-wave rows.
+    wide_bf16 = p2p_quant_type == "dynamic" and not epi_lean and not tok_done
     is_f8 = a_dtype == "fp8"
     aStages = kStages + 1
     KH_TILE_A = BK // (1 if is_f8 else 2)
@@ -1029,7 +1034,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             comb_inp_nbytes=comb_inp_nbytes, meta=Stage2Meta(lds_base_i32, lay["packed"], lay["weight"], lay["peer"]),
             g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, store_cm=store_cm,
             fp8_store_cm=2, fp8_rows=i32_fp8_rows, elem_view_stores=True, lean=epi_lean,
-            tok_off=i64_tok_off if const_expr(tok_done) else None, bf16_head_tokens=bf16_head_tokens)
+            tok_off=i64_tok_off if const_expr(tok_done) else None, bf16_head_tokens=bf16_head_tokens,
+            wide_bf16=wide_bf16)
         # fmt: on
 
     return g2_tile, lay
