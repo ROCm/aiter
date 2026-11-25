@@ -10,7 +10,9 @@
         a [R, M], b [R, N], d [G, M, N]
 
 M-grouped grouped_layout: int32 [M], group of each row (-1 padding, groups 128-aligned).
-K-grouped grouped_layout: int32 [G], rows of each group. d is written in place.
+K-grouped grouped_layout: int32 [G], rows of each group; group g starts at the row where the
+groups before it end, each rounded up to 128 rows (the last one needs no padding). d is written
+in place.
 """
 
 import functools
@@ -211,6 +213,26 @@ def _k_grouped_plan(
     return seg, 4 * (rows // seg + groups) + groups * tiles
 
 
+def _check_k_grouped_layout(grouped_layout: torch.Tensor, rows: int) -> None:
+    """Reject a K-grouped layout whose groups, placed as the plan kernel places them (group g at
+    the sum of the groups before it, each rounded up to _GROUP_ALIGN rows), run past the rows of
+    a / b: the kernel would cut such a group short. Reads grouped_layout on the host."""
+    if grouped_layout.dim() != 1 or grouped_layout.is_floating_point():
+        return  # the launcher rejects it
+    # the kernel reads < 0 as 0
+    sizes = grouped_layout.to("cpu", torch.int64).clamp(min=0)
+    padded = (sizes + _GROUP_ALIGN - 1) // _GROUP_ALIGN * _GROUP_ALIGN
+    ends = padded.cumsum(0) - padded + sizes
+    bad = ((sizes > 0) & (ends > rows)).nonzero()
+    if bad.numel():
+        g = int(bad[0])
+        raise ValueError(
+            f"k_grouped grouped_layout: group {g} ({int(sizes[g])} rows) ends at row "
+            f"{int(ends[g])} of {rows}; every group must start at a multiple of "
+            f"{_GROUP_ALIGN} rows (pad the groups before it to {_GROUP_ALIGN} rows)"
+        )
+
+
 def k_grouped_bf16_gemm_tn_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -219,12 +241,21 @@ def k_grouped_bf16_gemm_tn_contiguous(
     c: torch.Tensor | None = None,
     kid: int | None = None,
     seg_len: int | None = None,
+    check_layout: bool = False,
 ) -> None:
     """d[g] = (c[g] +) a[rows of g].T @ b[rows of g]; a [R, M], b [R, N], d [G, M, N].
 
-    grouped_layout: int32 [G], rows of each group. c (fp32 d): source, or d itself (in-place +=).
+    grouped_layout: int32 [G], rows of each group. The groups are not packed: group g starts at
+    the row where the groups before it end, each rounded up to
+    get_mk_alignment_for_contiguous_layout() (128) rows; the last group needs no padding.
+    c (fp32 d): source, or d itself (in-place +=).
     seg_len: split long groups (default from the shape); segments add in order (deterministic).
+    check_layout: True raises ValueError for a layout that runs past the rows of a / b (e.g.
+    packed groups). It reads grouped_layout on the host, which waits for the device, so it is off
+    by default.
     """
+    if check_layout:
+        _check_k_grouped_layout(grouped_layout, a.shape[0])
     f32 = d.dtype == torch.float32
     if kid is None:
         kid = _k_kid_for(d.shape[1], d.shape[2])

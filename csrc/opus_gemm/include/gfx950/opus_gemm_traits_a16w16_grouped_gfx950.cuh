@@ -123,6 +123,7 @@ struct opus_gemm_a16w16_m_grouped_plan_kargs_gfx950 {
     int m;
     int groups;
 };
+static_assert(sizeof(opus_gemm_a16w16_m_grouped_plan_kargs_gfx950) == 32);
 constexpr int OPUS_M_GROUPED_PLAN_THREADS = 1024;
 constexpr int OPUS_M_GROUPED_PLAN_MAX_GROUPS = 4096;
 
@@ -157,4 +158,5 @@ struct opus_gemm_a16w16_k_grouped_plan_kargs_gfx950 {
     int turn_count;
     int max_rows;                       // the most rows a segment may have (32-bit offsets); more: trap
 };
+static_assert(sizeof(opus_gemm_a16w16_k_grouped_plan_kargs_gfx950) == 48);
 constexpr int OPUS_K_GROUPED_PLAN_THREADS = 1024;

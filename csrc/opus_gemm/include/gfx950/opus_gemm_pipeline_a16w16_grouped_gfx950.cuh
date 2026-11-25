@@ -314,6 +314,7 @@ __device__ inline tile_t k_grouped_tile(const K& kargs, int slot) {
 
 // K-grouped plan (one workgroup): table = full seg_len segments [0, full_items), then the remainder of each group
 // (full_items + g), so segment s launches before s + 1; zeroes the turn counters.
+// opus::sync_threads() is a bare s_barrier: every LDS write / read waits (lgkmcnt) before it.
 __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan_kargs_gfx950& k) {
     constexpr int NT = OPUS_K_GROUPED_PLAN_THREADS;
     constexpr int ALIGN = OPUS_A16W16_GROUP_ALIGN;
@@ -338,11 +339,13 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
         for (int d = 1; d < NT; d <<= 1) {
             s_rows[tid] = sum_rows;
             s_full[tid] = sum_full;
+            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             opus::sync_threads();
             if (tid >= d) {
                 sum_rows += s_rows[tid - d];
                 sum_full += s_full[tid - d];
             }
+            opus::s_waitcnt_lgkmcnt(opus::number<0>{});
             opus::sync_threads();
         }
         if (g < k.groups) {
@@ -357,9 +360,11 @@ __device__ inline void k_grouped_plan_body(const opus_gemm_a16w16_k_grouped_plan
             s_rows[0] = sum_rows;
             s_full[0] = sum_full;
         }
+        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
         opus::sync_threads();
         off += s_rows[0];
         full += s_full[0];
+        opus::s_waitcnt_lgkmcnt(opus::number<0>{});
         opus::sync_threads();
     }
     for (int i = full + tid; i < k.full_items; i += NT)

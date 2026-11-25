@@ -238,7 +238,8 @@ void opus_gemm_a16w16_k_grouped_launch(
   const int64_t full_items = R / seg;
   const int64_t turn_count = full_items > 0 ? G * tiles : 0;
   const int64_t items = full_items + G;
-  AITER_CHECK(items * tiles <= INT_MAX && G * tiles <= INT_MAX && full_items < 65536, entry,
+  // full_items < 32767: a group's segment count (<= full_items + 1) is packed as nseg << 16 in an int.
+  AITER_CHECK(items * tiles <= INT_MAX && G * tiles <= INT_MAX && full_items < 32767, entry,
               ": grid too large");
   AITER_CHECK(workspace.size(0) >= 4 * items + turn_count, entry, ": workspace needs ",
               4 * items + turn_count, " int32 entries, got ", workspace.size(0));
