@@ -1204,9 +1204,9 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
     for base in (2**31 - 2, 2**32 - 2):
         _barrier()
         for runtime in moe._small_m_runtimes:
-            # generation = entry_count // (2 * CUs); the next launches cross the wrap.
-            runtime._s1_dispatch_workspace["entry_count"].fill_(
-                base * 2 * runtime._s1_num_cu
+            # The last launch's epoch (i32); the next launches cross the wrap.
+            runtime._s1_dispatch_workspace["launch_epoch"].fill_(
+                (base + 2**31) % 2**32 - 2**31
             )
         if moe._large_m is not None:
             large = moe._large_m
