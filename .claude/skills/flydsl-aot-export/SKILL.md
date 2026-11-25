@@ -62,9 +62,11 @@ So, for each launch, list what the trace depends on and tick each item off:
    ```python
    @aot_factory(                        # above functools.cache
        "my_kernel",                     # the cache name
-       # Every file the kernel's code comes from, besides this one; relative
+       # Every file the kernel's code comes from, besides this one and the
+       # common sources (aot_cache._COMMON_SOURCES: kernels_common.py,
+       # tensor_shim.py, buffer_ops.py, the jit hardware tables); relative
        # to aiter/ops/flydsl. A directory stands for its .py files.
-       sources=["kernels/my_kernel.py", "kernels/kernels_common.py"],
+       sources=["kernels/my_kernel.py"],
    )
    @functools.cache
    def _my_launcher(N, K, tile_m, out_dtype):

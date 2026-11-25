@@ -229,7 +229,8 @@ def aot_factory(name: str, *, sources=(), env=()):
     through a ``FlyDSLAotCache`` named ``name``, keyed by its arguments.
 
     ``sources`` are the files those launchers are built from, besides the one
-    of the factory, and ``env`` the environment variables their code reads
+    of the factory and the common ones, and ``env`` the environment variables
+    their code reads
     (see ``FlyDSLAotCache``).
 
     Place it above ``functools.cache``. Under ``AITER_FLYDSL_AOT_CACHE=0`` it

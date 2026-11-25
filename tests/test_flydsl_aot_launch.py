@@ -655,30 +655,31 @@ def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
         assert aot_cache._env_in_fingerprint(name), name
 
 
-def test_fingerprint_covers_the_lds_capacity_table(monkeypatch, tmp_path):
-    from aiter.jit.utils import lds_capacity
+def test_common_sources_are_sources_of_every_cache(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
-    # Kernels size their LDS tiles by this per-arch table, which is outside
-    # aiter/ops/flydsl: no cache declares it, so the fingerprint holds it.
-    before = aot_cache.fingerprint()
-    table = Path(lds_capacity.__file__).read_text()
-    edited = tmp_path / "lds_capacity.py"
-    edited.write_text(table + '\n_LDS_CAPACITY_BYTES["gfx950"] //= 2\n')
-    monkeypatch.setattr(lds_capacity, "__file__", str(edited))
-    assert aot_cache.fingerprint() != before
+    # The helpers nearly every kernel is built with, and the per-arch hardware
+    # constants in aiter/jit/utils: no cache lists them.
+    base = Path(aot_cache.__file__).resolve().parent
+    common = {str((base / src).resolve()) for src in aot_cache._COMMON_SOURCES}
+    assert {Path(f).name for f in common} >= {
+        "kernels_common.py",
+        "tensor_shim.py",
+        "buffer_ops.py",
+        "chip_info.py",
+        "lds_capacity.py",
+    }
+    assert common <= set(aot_cache.FlyDSLAotCache("test_common_sources")._files)
 
-
-def test_fingerprint_covers_the_cus_per_xcd(monkeypatch):
-    from aiter.jit.utils import chip_info
-    from aiter.ops.flydsl import aot_cache
-
-    # compile_4wave_gemm derives its XCD count from the CU count with it.
-    before = aot_cache.fingerprint()
-    monkeypatch.setattr(
-        chip_info, "_CDNA4_CUS_PER_XCD", chip_info._CDNA4_CUS_PER_XCD * 2
-    )
-    assert aot_cache.fingerprint() != before
+    # An edit to one selects other entries in a cache that declares nothing.
+    digests = []
+    for value in (1, 2):
+        (tmp_path / str(value)).mkdir()
+        table = _old_file(tmp_path / str(value) / "lds_capacity.py", f"X = {value}\n")
+        monkeypatch.setattr(aot_cache, "_COMMON_SOURCES", (str(table),))
+        cache = aot_cache.FlyDSLAotCache(f"test_common_table_{value}")
+        digests.append(cache._sources())
+    assert digests[0] != digests[1]
 
 
 @pytest.mark.skipif(

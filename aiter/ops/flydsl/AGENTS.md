@@ -33,8 +33,9 @@ version below.
   factory is an `aot_factory` (or its launcher is bound with `bind_aot`) and the
   wrapper launches `factory.lazy(...)`. Every constexpr is a factory argument or
   in `_run_compiled`'s `specialization_key`, and the cache declares in
-  `sources=` every file the kernel's code comes from (an edit to a file that is
-  not declared leaves stale entries). Follow
+  `sources=` every file the kernel's code comes from, besides the common
+  sources every cache has (`aot_cache._COMMON_SOURCES`); an edit to a file
+  that is not declared leaves stale entries. Follow
   `.claude/skills/flydsl-aot-export/SKILL.md` to convert or review one;
   `docs/flydsl_aot_cache.md` has the design.
 - **Legacy `buffer_ops`.** `aiter/ops/flydsl/kernels/buffer_ops.py` exists for

@@ -35,12 +35,11 @@ does not support), ``launch`` logs a warning once and runs that key through
 way.
 
 Invalidation has two levels. The directory is named by a fingerprint of the
-toolchain (FlyDSL, HIP, Python), the target (arch, CU count, hardware
-tables) and the
+toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
 ``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each cache also declares the
 source files its launchers are built from and the other environment
-variables their code reads (the file creating the cache is always one of its
-sources)::
+variables their code reads (the file creating the cache and
+``_COMMON_SOURCES`` are always among its sources)::
 
     FlyDSLAotCache("preshuffle_gemm_a8",
                    sources=["kernels/preshuffle_gemm.py", ...],
@@ -241,22 +240,6 @@ def _cu_num() -> int:
         return 0
 
 
-def _hardware_tables() -> tuple:
-    """aiter's per-arch hardware constants that kernels size themselves by:
-    the LDS capacity table (``lds_capacity.py``, behind
-    ``chip_info.get_lds_capacity_bytes``) and the CDNA4 CUs per XCD (behind
-    ``chip_info.get_cdna4_num_xcds``). They describe the target, like the CU
-    count, and live outside ``aiter/ops/flydsl``, where the source check of a
-    cache does not look."""
-    from aiter.jit.utils import chip_info, lds_capacity
-
-    return (
-        _file_digest(os.path.realpath(lds_capacity.__file__)),
-        getattr(chip_info, "_CDNA4_CUS_PER_XCD", None),
-        getattr(chip_info, "_CDNA4_MAX_XCDS", None),
-    )
-
-
 def _env_in_fingerprint(name: str) -> bool:
     """Whether ``fingerprint`` owns ``name``: hashes it or, if in ``_ENV_IGNORED``,
     knows it changes no code."""
@@ -297,13 +280,11 @@ def fingerprint() -> str:
     """Hash of the toolchain and environment every entry depends on.
 
     It covers FlyDSL (version, Python sources, native libraries), the ROCm
-    device bitcode, torch HIP, Python, the target arch, CU count and hardware
-    tables (LDS capacity, CUs per XCD), and the ``AITER_FLYDSL_*`` /
-    ``FLYDSL_*`` environment variables. Changing any of them selects a new
+    device bitcode, torch HIP, Python, the target arch and CU count, and the
+    ``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment variables. Changing any of them selects a new
     cache directory. Kernel sources and the other variables they read are
-    declared per cache instead (``FlyDSLAotCache``). Only the hashes
-    of files are cached (FlyDSL, the LDS table): an AOT build switches arch
-    and environment within one process.
+    declared per cache instead (``FlyDSLAotCache``). Only the FlyDSL hash is
+    cached: an AOT build switches arch and environment within one process.
     """
     env_items = sorted(
         (k, v)
@@ -318,7 +299,6 @@ def fingerprint() -> str:
         torch.version.hip,
         _target_arch(),
         _cu_num(),
-        _hardware_tables(),
         _toolchain_digest(),
         _device_bitcode_digest(),
         env_items,
@@ -388,6 +368,20 @@ _DERIVED = {"get_gfx()": _get_gfx}
 def _input(name: str):
     """The current value of a declared input: a variable or a ``_DERIVED`` one."""
     return _DERIVED[name]() if name in _DERIVED else os.environ.get(name)
+
+
+# Sources of every cache, so that no cache has to list them: the helpers
+# nearly every kernel is built with, and the per-arch hardware constants
+# kernels size themselves by (LDS capacity, CUs per XCD), which are outside
+# ``aiter/ops/flydsl/kernels``, the only place the import check looks. A
+# cache declares only the files specific to it.
+_COMMON_SOURCES = (
+    "kernels/kernels_common.py",
+    "kernels/tensor_shim.py",
+    "kernels/buffer_ops.py",
+    "../../jit/utils/chip_info.py",
+    "../../jit/utils/lds_capacity.py",
+)
 
 
 def _source_files(sources) -> list:
@@ -761,7 +755,7 @@ class FlyDSLAotCache:
 
     def __init__(self, name: str, sources=(), env=()):
         """``sources``: the files the launchers of this cache are built from,
-        besides the one creating it: each relative to ``aiter/ops/flydsl`` or
+        besides the one creating it and ``_COMMON_SOURCES``: each relative to ``aiter/ops/flydsl`` or
         absolute; a directory stands for every ``.py`` below it. ``env``: the environment variables their
         code reads, other than ``AITER_FLYDSL_*`` / ``FLYDSL_*``, and
         ``"get_gfx()"`` if it picks code by ``chip_info.get_gfx()``. An edit
@@ -781,7 +775,7 @@ class FlyDSLAotCache:
         self.name = name
         if os.path.isfile(site):  # not an interactive session
             sources = (site, *sources)
-        self._files = _source_files(sources)
+        self._files = _source_files((*_COMMON_SOURCES, *sources))
         self._env = tuple(sorted({env} if isinstance(env, str) else set(env)))
         # [(source, sha256)] and its hash, once the files were read (_sources),
         # and the same hashes by path (_check_unchanged).

@@ -213,9 +213,6 @@ def get_tune_space():
     "moe_gfx942_gemm",
     sources=[
         "kernels/moe_gemm_2stage/gfx9_fp8",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
-        "kernels/tensor_shim.py",
     ],
 )
 @cache

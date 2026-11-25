@@ -130,7 +130,6 @@ def _validate_compile_config(
     sources=[
         "kernels/gemm_a8w8_8wave.py",
         "kernels/mfma_preshuffle_pipeline.py",
-        "kernels/kernels_common.py",
         "kernels/gemm_a8w8_int8_4wave.py",
     ],
 )

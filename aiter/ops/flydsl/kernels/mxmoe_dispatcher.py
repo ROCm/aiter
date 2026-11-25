@@ -726,12 +726,9 @@ _G2_AOT_CACHE = FlyDSLAotCache(
     sources=[
         "kernels/mxmoe_gemm_v2.py",
         "kernels/mxfp4_gemm_common.py",
-        "kernels/buffer_ops.py",
         "kernels/dpp_utils.py",
         "kernels/act.py",
         "kernels/layout_utils.py",
-        "kernels/kernels_common.py",
-        "kernels/tensor_shim.py",
     ],
 )
 

@@ -17,11 +17,8 @@ from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
         "kernels/mxfp4_gemm1.py",
         "kernels/mxfp4_gemm_common.py",
         "kernels/act.py",
-        "kernels/buffer_ops.py",
         "kernels/dpp_utils.py",
-        "kernels/kernels_common.py",
         "kernels/layout_utils.py",
-        "kernels/tensor_shim.py",
     ],
 )
 @functools.cache

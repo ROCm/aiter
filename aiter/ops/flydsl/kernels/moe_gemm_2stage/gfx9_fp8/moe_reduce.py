@@ -20,9 +20,6 @@ _SORTED_SUM_AOT_CACHE = FlyDSLAotCache(
     "moe_gfx942_sorted_sum",
     sources=[
         "kernels/moe_gemm_2stage/gfx9_fp8",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
-        "kernels/tensor_shim.py",
     ],
 )
 

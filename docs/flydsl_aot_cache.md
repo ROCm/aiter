@@ -187,11 +187,6 @@ source:
 - the CU count, `chip_info.get_cu_num()`. It honours `CU_NUM`, which the AOT
   dry run sets from each tuned row's `cu_num`, so a prebuild for a CU count
   and a process on such a GPU use the same directory;
-- the per-arch hardware tables kernels size themselves by: the LDS capacity
-  table, `aiter/jit/utils/lds_capacity.py` (`chip_info.get_lds_capacity_bytes`),
-  and the CDNA4 CUs per XCD (`chip_info.get_cdna4_num_xcds`). They are
-  outside `aiter/ops/flydsl`, where the source check of a cache does not
-  look;
 - every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
   `HSA_OVERRIDE_GFX_VERSION`, `COMPILE_OPT_LEVEL` and the variables FlyDSL
   keys its own artifact cache on without that prefix
@@ -215,8 +210,6 @@ does:
     sources=[
         "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
         "kernels/gemm_a8w8_blockscale_8wave.py",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
     ],
 )
 ```
@@ -224,6 +217,13 @@ does:
 - A path is relative to `aiter/ops/flydsl`, or absolute. A directory stands
   for every `.py` below it.
 - The file that creates the cache is always one of its sources.
+- So are the common sources, `_COMMON_SOURCES` in `aot_cache.py`, which no
+  cache lists: the helpers nearly every kernel is built with
+  (`kernels/kernels_common.py`, `kernels/tensor_shim.py`,
+  `kernels/buffer_ops.py`) and the per-arch hardware constants kernels size
+  themselves by (`aiter/jit/utils/chip_info.py`, `lds_capacity.py`), which are
+  outside `aiter/ops/flydsl/kernels`, the only place the import check looks. An edit
+  to one of them makes new entries in every cache.
 - `env=[...]` names the environment variables the kernel code reads, other
   than `AITER_FLYDSL_*` / `FLYDSL_*` (level 1). `"get_gfx()"` stands for
   `chip_info.get_gfx()`, for code that picks instructions by it.
@@ -616,7 +616,8 @@ module global), which an entry on disk would not reflect.
    variable the kernel's files read in `env`. Tensor rank and unit-stride axis are covered by the
    disk digest.
 3. **Declare the sources.** List in `sources=` every file the launcher's
-   code is generated from: the kernel module, the helpers it imports, a
+   code is generated from, besides the common sources (§ level 2): the
+   kernel module, the helpers it imports, a
    tuning table the wrapper reads its tiles from, linked bitcode (§4.2). The
    first build, and `tests/test_flydsl_aot_launch.py`, raise for a kernel
    file or bitcode that is missing.

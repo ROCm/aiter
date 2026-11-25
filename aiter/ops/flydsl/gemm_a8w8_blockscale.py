@@ -83,8 +83,6 @@ def _prepare_scales(
     sources=[
         "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
         "kernels/gemm_a8w8_blockscale_8wave.py",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
     ],
 )
 @functools.lru_cache(maxsize=1024)

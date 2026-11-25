@@ -136,9 +136,6 @@ _AOT_SOURCES = [
     "gemm_a8w8_mxfp8_8wave.py",
     "gemm_tune/flydsl_gemm_mxscale_preshuffle_common.py",
     "kernels/gemm",
-    "kernels/buffer_ops.py",
-    "kernels/kernels_common.py",
-    "kernels/tensor_shim.py",
     "kernels/mfma_preshuffle_pipeline.py",
     "kernels/communication_ops_utils.py",
 ]

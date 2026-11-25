@@ -249,10 +249,7 @@ def _pick_reduce_block(model_dim: int, V: int) -> int:
     "moe_reduction",
     sources=[
         "kernels/mxfp4_gemm_common.py",
-        "kernels/kernels_common.py",
-        "kernels/tensor_shim.py",
         "kernels/act.py",
-        "kernels/buffer_ops.py",
         "kernels/dpp_utils.py",
         "kernels/layout_utils.py",
     ],

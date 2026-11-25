@@ -107,7 +107,6 @@ def _validate(
         "kernels/mxfp8_gemm_8wave.py",
         "kernels/gemm_a8w8_8wave.py",
         "kernels/mfma_preshuffle_pipeline.py",
-        "kernels/kernels_common.py",
     ],
 )
 @functools.lru_cache(maxsize=1024)

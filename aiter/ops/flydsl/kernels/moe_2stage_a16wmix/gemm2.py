@@ -473,12 +473,9 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, shared_t
     sources=[
         "kernels/moe_2stage_a16wmix",
         "kernels/act.py",
-        "kernels/buffer_ops.py",
         "kernels/dpp_utils.py",
-        "kernels/kernels_common.py",
         "kernels/layout_utils.py",
         "kernels/mxfp4_gemm_common.py",
-        "kernels/tensor_shim.py",
     ],
 )
 @functools.cache

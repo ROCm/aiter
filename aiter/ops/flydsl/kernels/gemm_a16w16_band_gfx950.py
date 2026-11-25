@@ -74,14 +74,7 @@ def _gep(base_ptr, byte_offset):
     return llvm.GEPOp(base_ptr.type, base_ptr, dyn, raw, T.i8, None).result
 
 
-@aot_factory(
-    "gemm_a16w16_band_gfx950",
-    sources=[
-        "kernels/tensor_shim.py",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
-    ],
-)
+@aot_factory("gemm_a16w16_band_gfx950")
 @functools.lru_cache(maxsize=512)
 def build_band_stream(
     m,

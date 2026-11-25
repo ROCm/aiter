@@ -31,12 +31,9 @@ __all__ = [
 _AOT_SOURCES = [
     "kernels/mixed_moe_gemm_2stage_common.py",
     "kernels/act.py",
-    "kernels/buffer_ops.py",
-    "kernels/kernels_common.py",
     "kernels/layout_utils.py",
     "kernels/mfma_epilogues.py",
     "kernels/mfma_preshuffle_pipeline.py",
-    "kernels/tensor_shim.py",
     "moe_common.py",
 ]
 

@@ -1485,9 +1485,6 @@ bind_aot(
         "gemm_a16w16_gfx950",
         sources=[
             "kernels/gemm_a16w16_gfx950_utils.py",
-            "kernels/kernels_common.py",
-            "kernels/tensor_shim.py",
-            "kernels/buffer_ops.py",
         ],
     ),
     (),
