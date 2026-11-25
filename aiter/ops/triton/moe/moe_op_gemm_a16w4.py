@@ -7,15 +7,6 @@ from functools import lru_cache
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4_swizzle_pipelined as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
-)
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_triton,
 )
@@ -29,6 +20,25 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
+
+
+@lru_cache(maxsize=1)
+def _get_gluon_kernels():
+    from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
+        _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
+        _moe_gemm_a16w4_swizzle_pipelined as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
+        _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
+    )
+
+    return (
+        _moe_gemm_a16w4_gluon,
+        _moe_gemm_a16w4_gluon_gfx950_swizzle,
+        _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -82,7 +92,10 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
+    # Keep split-K partial sums in float32 until reduce_grouped finishes the
+    # reduction (and deferred SwiGLU) to avoid bf16 cancellation error.
+    matmul_dtype = torch.float32 if split_k > 1 else out_dtype
+    matmul_output = torch.empty(matmul_shape, device=device, dtype=matmul_dtype)
     if scatter_indx is not None or split_k > 1:
         final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
     else:
@@ -91,7 +104,7 @@ def allocate_output(
 
 
 # TODO Refactor config logic and use JSON files
-def get_kernel_config_triton(m, n, k, routing_data):
+def get_kernel_config_triton(m, n, k, routing_data, allow_split_k: bool = False):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = get_num_xcds()
@@ -102,19 +115,41 @@ def get_kernel_config_triton(m, n, k, routing_data):
     # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
     # tunable, because routing fixes it for the layer.
     arch = get_arch()
+    dispatch = get_moe_dispatch("A16W4", arch, "triton")
     key = f"bm{block_m}_n{n}_k{k}"
-    tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
+    tuned = dispatch.get(key)
+    if tuned is None and k >= 2048 and k % 1024 == 0 and (block_m == 16 or k >= 4096):
+        tuned = dispatch.get(f"bm{block_m}_k1024")
+    if tuned is None:
+        tuned = dispatch.get(f"bm{block_m}_any")
     if tuned is not None:
+        block_n = tuned["BLOCK_SIZE_N"]
+        block_k = tuned["BLOCK_SIZE_K"]
+        k_rotate_stride = tuned.get("k_rotate_stride", 0)
+        k_rotate = bool(
+            k_rotate_stride and k >= k_rotate_stride and k % k_rotate_stride == 0
+        )
+        cfg_split_k = tuned.get("split_k", 1)
+        split_k_max_grid = tuned.get("split_k_max_grid", 0)
+        if allow_split_k and cfg_split_k > 1 and split_k_max_grid > 0:
+            grid_mn = routing_data.n_blocks(m, block_m) * triton.cdiv(n, block_n)
+            if (k >= 1024 and grid_mn <= split_k_max_grid) or (
+                k >= 512 and grid_mn <= split_k_max_grid // 4 and k % 512 == 0
+            ):
+                split_k = cfg_split_k
+            elif k >= 512 and grid_mn <= split_k_max_grid // 4 and k % 256 == 0:
+                split_k = min(cfg_split_k, 2)
         config = {
             "block_m": block_m,
-            "block_n": tuned["BLOCK_SIZE_N"],
-            "block_k": tuned["BLOCK_SIZE_K"],
+            "block_n": block_n,
+            "block_k": block_k,
             "num_warps": tuned["num_warps"],
             "num_stages": tuned["num_stages"],
             "group_m": group_m,
             "xcd_swizzle": xcd_swizzle,
-            "w_cache_modifier": w_cache_modifier,
+            "w_cache_modifier": tuned.get("cache_modifier", w_cache_modifier),
             "split_k": split_k,
+            "k_rotate": k_rotate,
             "waves_per_eu": tuned.get("waves_per_eu", 0),
             "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
             "kpack": tuned.get("kpack", 1),
@@ -462,7 +497,13 @@ def moe_gemm_a16w4(
                     config = get_kernel_config_gluon_gfx950(M, N, K, routing_data)
 
     else:
-        config = get_kernel_config_triton(M, N, K, routing_data)
+        # Split-K defers SwiGLU to reduce_grouped, which would apply gammas
+        # inside the matmul before SwiGLU; disable split-K when both are active,
+        # and on EP where non-local expert rows are unwritten.
+        allow_split_k = not (apply_swiglu and gammas is not None) and expert_map is None
+        config = get_kernel_config_triton(
+            M, N, K, routing_data, allow_split_k=allow_split_k
+        )
 
     if backend == "gluon":
         w_scales_kernel = w_scales.transpose(1, 2)
@@ -530,6 +571,11 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon":
+        (
+            _moe_gemm_a16w4_gluon,
+            _moe_gemm_a16w4_gluon_gfx950_swizzle,
+            _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
+        ) = _get_gluon_kernels()
         if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
@@ -740,12 +786,13 @@ def moe_gemm_a16w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
+            EVEN_K=K % (config["block_k"] * config["split_k"]) == 0,
+            MASK_K_LIMIT=K % (config["block_k"] * config["split_k"]),
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            K_ROTATE=config.get("k_rotate", False),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],

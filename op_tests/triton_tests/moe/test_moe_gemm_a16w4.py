@@ -184,7 +184,7 @@ def test_op(
     ):
         pytest.skip("Test will take too long on FFM")
 
-    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
+    if not (arch_info.is_any_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if hbm_swizzling:
@@ -337,7 +337,7 @@ def test_op_expert_parallel(
 ):
     """Rank-local weights + global routing reproduce the local experts' output;
     non-local gates contribute exactly 0 to the top-k combine."""
-    if not arch_info.is_fp4_avail():
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
 
     x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
@@ -386,7 +386,7 @@ def test_op_expert_parallel(
 
 
 def test_op_expert_parallel_rejects_bad_inputs():
-    if not arch_info.is_fp4_avail():
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
     x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
         _ep_setup(16, 256, 256, 8, 2, 4, 1, True, True)
@@ -412,3 +412,63 @@ def test_op_expert_parallel_rejects_bad_inputs():
             expert_map=expert_map[:-1].contiguous(),
             gate_valid=gate_valid,
         )
+
+
+@pytest.mark.parametrize("k", [768, 1408, 2048, 2880])
+@pytest.mark.parametrize(
+    "do_gather, do_scatter, apply_swiglu, has_y_gammas",
+    [
+        (True, False, True, False),
+        (False, True, False, True),
+    ],
+)
+def test_op_splitk_and_k_rotate(k, do_gather, do_scatter, apply_swiglu, has_y_gammas):
+    if not arch_info.is_any_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    torch.manual_seed(0)
+    m, n, n_expts_tot, n_expts_act = 4, 256, 8, 2
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, do_scatter
+    )
+    x, w, bias, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        has_y_gammas,
+    )
+    w_tri, w_scale_tri = downcast_to_mxfp(w, str_to_torch_dtype["mxfp4_e2m1"], axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    ref_y = moe_gemm_torch(
+        x,
+        w_ref,
+        bias,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        apply_swiglu,
+    )
+    tri_y = moe_gemm_a16w4(
+        x,
+        w_tri,
+        None,
+        w_scale_tri,
+        None,
+        None,
+        bias,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        None,
+        torch.bfloat16,
+        apply_swiglu,
+        backend="triton",
+    )
+    assert_close(ref_y, tri_y, maxtol=4e-1, rmstol=4e-2)
