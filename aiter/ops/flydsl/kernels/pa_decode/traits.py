@@ -48,6 +48,10 @@ _NHD_V_BUF_BYTES = 4 * 64 * 256
 # bytes are MXFP4 too.
 FP8_KV_DTYPES = (fx.Float8E4M3FN, fx.Float8E4M3FNUZ)
 MXFP4_KV_DTYPE = fx.Float4E2M1FNx2
+# NVFP4 K/V (gfx1250): the same packed e2m1 bytes with one E4M3 scale per 16 values
+# (``kv_scale_dtype=torch.float8_e4m3fn``). Per (page, kv head) the caches are
+# token-major: [128, D // 2] payload bytes and [128, D // 16] scale bytes.
+NVFP4_GROUP = 16
 PA_KV_DTYPES = (*FP8_KV_DTYPES, fx.BFloat16, MXFP4_KV_DTYPE)
 PA_QUERY_DTYPES = (fx.Float16, fx.BFloat16, fx.Float8E4M3FN)
 
@@ -1499,11 +1503,34 @@ class Gfx1250Traits:
     quant_output: bool = False
     # With quant_output, False drops the BF16/FP16 store of the final output.
     store_output: bool = True
+    # NVFP4 wave pipeline (compute_dtype "nvfp4w"): page slots in each wave's
+    # DMA ring; 0 elsewhere.
+    nvfp4_buffers: int = 0
+    # With quant_output, MXFP8 (E8M0 scale per 32 elements, group-local, no
+    # LDS) instead of one FP32 descale per token.
+    quant_mx: bool = False
+    # NVFP4 wave pipeline: groups of NWARP waves that split a task's pages
+    # (group g takes pages g, g + G, ...) and merge in LDS after the loop, so
+    # one CTA holds a whole top-k window with G x more pages in flight.
+    page_groups: int = 1
+    # Direct and cluster modes: dispatch xcd_rows consecutive sequences (one
+    # request's MTP rows) on one of the xcds XCDs; 0 keeps the identity order.
+    xcd_rows: int = 0
+    xcds: int = 0
+    # NVFP4 wave tile without plan lookups (``pa_decode(plan_free=True)``):
+    # the direct output runs one CTA a sequence and a cluster merge splits a
+    # sequence's tiles over min(P, tiles) CTAs, both from the context lengths
+    # in the launch's work pointer; every wave keeps the sequence's page ids
+    # (<= 32) in a VGPR and the CTA splits the query once.
+    plan_free: bool = False
 
     WAVE = 32
     NWARP = 4
-    BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
+
+    @property
+    def BLOCK_THREADS(self):
+        return self.NWARP * self.WAVE * self.page_groups
 
     @property
     def merged_output(self):
@@ -1651,8 +1678,14 @@ class Gfx1250Traits:
         )
 
     @property
+    def nvfp4_wave(self):
+        # NVFP4 K/V on the wave pipeline (one query tile, scaled WMMA); its
+        # QK/PV operands are BF16, so ``bf16`` holds too.
+        return self.compute_dtype == "nvfp4w"
+
+    @property
     def bf16(self):
-        return self.compute_dtype == "bf16"
+        return self.compute_dtype in ("bf16", "nvfp4w")
 
     @property
     def elem_bytes(self):
@@ -1804,6 +1837,9 @@ class Gfx1250Traits:
 
     @property
     def stats_offset(self):
+        if self.nvfp4_wave:
+            # Past the wave rings; only the merge's arrival flag lives here.
+            return self.nvfp4_buffers * self.NWARP * self.page_groups * 4608
         return self.p_offset + self.p_bytes
 
     @property
@@ -1811,6 +1847,10 @@ class Gfx1250Traits:
         # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
         # No loop stage uses them, so a wave can publish its maxima while
         # others still read P.
+        if self.nvfp4_wave:
+            # Past the merge's arrival flag: the post-loop wave merge aliases
+            # the rings, which other waves may still read.
+            return self.stats_offset + 16
         return self.stats_offset + 576
 
     @property
@@ -1821,9 +1861,32 @@ class Gfx1250Traits:
         return math.gcd(self.query_group_size, 16)
 
     @property
+    def quant_bytes(self):
+        if not self.quant_output or self.quant_mx:
+            return 0
+        return self.m_tiles * 16 // self.quant_unit * self.NWARP * 4
+
+    @property
+    def query_terms(self):
+        # FP8 terms of the NVFP4 wave tile's query split (two reproduce BF16).
+        return 3 if self.query_dtype == "f16" else 2
+
+    @property
+    def q_share_offset(self):
+        # Plan-free NVFP4 wave tiles split the query once a CTA: per term four
+        # blocks x WAVE lanes x 16 operand bytes, then a scale dword a lane.
+        return (self.quant_offset + self.quant_bytes + 15) // 16 * 16
+
+    @property
+    def page_ids_offset(self):
+        # Plan-free NVFP4 wave tiles: each wave's 32 page ids (async-loaded).
+        return self.q_share_offset + self.query_terms * self.WAVE * (4 * 16 + 4)
+
+    @property
     def total_bytes(self):
-        units = self.m_tiles * 16 // self.quant_unit
-        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
+        if self.nvfp4_wave and self.plan_free:
+            return self.page_ids_offset + self.BLOCK_THREADS * 4
+        return self.quant_offset + self.quant_bytes
 
     @property
     def use_tdm(self):

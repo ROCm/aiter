@@ -1492,6 +1492,10 @@ class Gfx1250Memory:
         self.t = ctx.traits
 
     def allocate(self):
+        # Plan-free tiles take the allocation in the kernel prologue.
+        if getattr(self.ctx, "lds_base", None) is not None:
+            self.base = self.ctx.lds_base
+            return
         storage = fx.SharedAllocator().allocate(self.ctx.shared_storage).peek()
         self.base = fx.recast_iter(fx.Uint8, storage.buf.ptr)
 
