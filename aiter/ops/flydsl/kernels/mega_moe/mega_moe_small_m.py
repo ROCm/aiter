@@ -978,6 +978,9 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     is_f8 = a_dtype == "fp8"
     aStages = kStages + 1
     KH_TILE_A = BK // (1 if is_f8 else 2)
+    # gemm2_compute_v2's 1-stage B path: each K-step's B loads go ahead of the barrier and an unconditional A copy,
+    # so the MFMAs' wait for them leaves that copy in flight.
+    one_stage = BM == 64 and BN == 256
     log2_max_tok = max_tok.bit_length() - 1
 
     # fmt: off
@@ -1028,7 +1031,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows)
+            expert_offset=expert_offset, valid_rows=vrows, early_b_load=one_stage, a_dma_uniform=one_stage)
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, meta=Stage2Meta(lds_base_i32, lay["packed"], lay["weight"], lay["peer"]),
