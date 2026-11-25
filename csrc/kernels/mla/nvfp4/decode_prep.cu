@@ -695,6 +695,27 @@ void check_rows16(const aiter_tensor_t& t, const char* name)
     for(int d = 0; d + 1 < t.dim(); ++d)
         AITER_CHECK(t.stride(d) % 8 == 0, name, " needs 16-byte aligned rows");
 }
+// Whether the rows of a [R,16,W] unit-last-stride tensor are disjoint: taken
+// by stride, each axis longer than 1 must step past everything below it.
+bool rows_disjoint(const aiter_tensor_t& t)
+{
+    int64_t size[2] = {t.size(0), t.size(1)}, stride[2] = {t.stride(0), t.stride(1)};
+    if(stride[0] > stride[1])
+    {
+        std::swap(size[0], size[1]);
+        std::swap(stride[0], stride[1]);
+    }
+    int64_t span = t.size(2);
+    for(int d = 0; d < 2; ++d)
+    {
+        if(size[d] == 1)
+            continue;
+        if(stride[d] < span)
+            return false;
+        span += (size[d] - 1) * stride[d];
+    }
+    return true;
+}
 } // namespace
 
 void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
@@ -736,8 +757,7 @@ void mla_nvfp4_decode_prep(aiter_tensor_t& q_rope,
     check_shape(ring, "ring", {ring.size(0), 16, 576});
     check_rows16(ring, "ring");
     // Each request's tile rows are written, so no two may share memory.
-    AITER_CHECK(ring.stride(1) >= 576 && ring.stride(0) >= 16 * ring.stride(1),
-                "ring rows must not overlap");
+    AITER_CHECK(rows_disjoint(ring), "ring rows must not overlap");
     check_tensor(req_ids, "req_ids", AITER_DTYPE_i32, dev, 4);
     AITER_CHECK(req_ids.is_contiguous(), "req_ids must be contiguous");
     check_shape(req_ids, "req_ids", {b});

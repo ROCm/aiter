@@ -293,6 +293,51 @@ def test_contracts(rope):
             call(ring=ring)
 
 
+@pytest.mark.parametrize("b", [37, 1100])
+def test_strided_rings(rope, b):
+    """A ring with padded rows at the narrowest disjoint request stride
+    (15 * 608 + 576) and one with the request and row axes swapped in memory
+    take the same bytes as a contiguous ring."""
+    case = Case(b, b - 5, 13)
+    q = values(case.gen, b, H, 576, s=2.0)
+    k = values(case.gen, b, 576, s=0.5)
+
+    def padded(ring):
+        rows = ring.shape[0]
+        buf = torch.zeros(rows * 9696, dtype=ring.dtype, device=ring.device)
+        view = buf.as_strided(ring.shape, (9696, 608, 1))
+        view.copy_(ring)
+        return view
+
+    def swapped(ring):
+        return ring.transpose(0, 1).contiguous().transpose(0, 1)
+
+    def run(ring):
+        qa = torch.zeros((b, H, 128), dtype=torch.uint8, device="cuda")
+        cn, ca = case.cn.clone(), case.ca.clone()
+        mla_nvfp4_decode_prep(
+            q[..., 512:],
+            qa,
+            ring,
+            case.req,
+            k[:, :512],
+            k[:, 512:],
+            case.pos,
+            case.slots(),
+            cn,
+            ca,
+            rope.cos_cache,
+            rope.sin_cache,
+        )
+        torch.cuda.synchronize()
+        return qa, ring, cn, ca
+
+    want = run(case.ring.clone())
+    for layout in (padded, swapped):
+        for got, ref in zip(run(layout(case.ring)), want):
+            assert torch.equal(got, ref), layout.__name__
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_launches_on_the_input_device(rope):
     """Inputs on cuda:1 while cuda:0 is current: the same bytes as with cuda:1
