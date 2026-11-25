@@ -1199,3 +1199,4 @@ gfx1250,256,896,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,opus,5
 gfx1250,256,928,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,opus,597,0,28.796,opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1,0.0,1655.81,2477.28
 gfx1250,256,960,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,opus,597,0,29.9061,opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1,0.0,1649.33,2408.34
 gfx1250,256,992,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,opus,597,0,29.3098,opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1,0.0,1738.98,2480.81
+gfx1250,256,128,163840,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,-1,1,,flydsl_hgemm_abf16_wbf16_bf16_t128x256x128x2_ks1_w4x4x1_bias0_ktail0_gm0_i0_ptdm_gfx1250,,,
