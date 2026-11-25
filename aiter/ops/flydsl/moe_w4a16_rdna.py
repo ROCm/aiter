@@ -9,6 +9,8 @@ float16.
 """
 
 import torch
+import triton
+import triton.language as tl
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.moe_w4a16_rdna import (
@@ -40,6 +42,7 @@ __all__ = [
     "moe_align_block_size_rows",
     "pack_w4a16_weights",
     "pad_expert_stride",
+    "topk_weighted_sum",
 ]
 
 
@@ -175,6 +178,53 @@ def flydsl_rdna_moe_gemm(
     )
 
 
+@triton.jit
+def _topk_weighted_sum_kernel(
+    out_ptr,
+    rows_ptr,
+    weights_ptr,
+    K,
+    out_stride,
+    rows_stride,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Column blocks vary fastest: concurrent programs then read different
+    # 256 B DRAM channels instead of the same offset of 4 KB-strided rows.
+    t = tl.program_id(1)
+    cols = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = cols < K
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        w = tl.load(weights_ptr + t * TOP_K + k)
+        row = tl.load(rows_ptr + (t * TOP_K + k) * rows_stride + cols, mask=mask)
+        acc += w * row.to(tl.float32)
+    tl.store(
+        out_ptr + t * out_stride + cols, acc.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def topk_weighted_sum(
+    out: torch.Tensor, rows: torch.Tensor, topk_weights: torch.Tensor
+) -> None:
+    """``out[t] = sum_k topk_weights[t, k] * rows[t * top_k + k]``, in f32."""
+    M, top_k = topk_weights.shape
+    K = out.size(1)
+    assert rows.stride(1) == 1 and out.stride(1) == 1
+    block_k = 256
+    _topk_weighted_sum_kernel[(triton.cdiv(K, block_k), M)](
+        out,
+        rows,
+        topk_weights.contiguous(),
+        K,
+        out.stride(0),
+        rows.stride(0),
+        TOP_K=top_k,
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+
+
 def flydsl_rdna_moe(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -252,5 +302,4 @@ def flydsl_rdna_moe(
         down_out, act_out, w2, coef2, *route, 1, group_size, coef_pairs=w2_pairs
     )
     # Rows are in routing order, so the top-k sum needs no permutation.
-    weighted = down_out.view(M, top_k, K) * topk_weights.view(M, top_k, 1)
-    output.copy_(weighted.sum(dim=1))
+    topk_weighted_sum(output, down_out, topk_weights)
