@@ -14,6 +14,13 @@ and the shipped tuned tables.
 
 Probe stubs are a documented approximation: they answer from the shape alone, so a
 snapshot records dispatch logic, not the contents of each arch's kernel tables.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import contextlib

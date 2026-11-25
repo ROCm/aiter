@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""AITER_MOEV2 switch and the legacy fused_moe hook."""
+"""AITER_MOEV2 switch and the legacy fused_moe hook.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
+"""
 
 import importlib
 import inspect
@@ -97,6 +105,59 @@ def test_planned_but_unimplemented_path_warns(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="aiter"):
         assert not paths.any_active()
     assert "not implemented yet" in caplog.text
+
+
+def test_the_selection_is_logged_once_when_set(monkeypatch, caplog):
+    _fake_path("a4w4")
+    # caplog listens on the root logger; aiter's logger does not propagate.
+    monkeypatch.setattr(logging.getLogger("aiter"), "propagate", True)
+    with caplog.at_level(logging.INFO, logger="aiter"):
+        paths.active()
+        assert caplog.text == ""
+        _set(monkeypatch, "a4w4")
+        paths.active()
+        paths.active()
+    assert caplog.text.count("'a4w4': a4w4 on aiter.moev2") == 1
+    assert "AITER_MOEV2=off runs every call on the legacy code" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="aiter"):
+        _set(monkeypatch, "off")
+        paths.active()
+    assert "AITER_MOEV2='off': every call on the legacy code" in caplog.text
+
+
+def test_the_differential_harness_leaves_out_the_selection_line(monkeypatch):
+    from moe_dispatch.differential import captured_logs
+
+    _fake_path("a4w4")
+    _set(monkeypatch, "a4w4")
+    with captured_logs() as logs:
+        paths.active()
+        logging.getLogger("aiter").info("a dispatch line")
+    assert logs == [(logging.INFO, "a dispatch line")]
+
+
+def test_explain_logs_why_an_active_path_does_not_claim_a_call(monkeypatch, caplog):
+    paths.register(
+        paths.Path(
+            "a8w8_pt",
+            lambda call: call["ok"],
+            lambda call: None,
+            why_not=lambda call: None if call["ok"] else "quant_type No",
+        )
+    )
+    _set(monkeypatch, "a8w8_pt")
+    paths.active()
+    monkeypatch.setattr(logging.getLogger("aiter"), "propagate", True)
+    line = "path a8w8_pt does not claim a call (quant_type No)"
+    with caplog.at_level(logging.INFO, logger="aiter"):
+        assert paths.route_to_v2({"ok": False}) is None
+        assert line not in caplog.text
+        monkeypatch.setenv("AITER_MOE_EXPLAIN", "1")
+        for _ in range(2):
+            assert paths.route_to_v2({"ok": False}) is None
+        assert paths.route_to_v2({"ok": True}) is not None
+    assert caplog.text.count(line) == 1
 
 
 def test_register_rejects_unplanned_and_duplicate_names():
@@ -404,6 +465,77 @@ def test_gpu_suite_runner_skips_suites_the_machine_cannot_run(monkeypatch, capsy
     seen.clear()
     assert gpu_suites.main(["--path", "b", "--run"]) == 1
     assert seen == []
+
+
+def test_gpu_suite_compare_fails_only_where_v2_fails_and_legacy_passes(
+    monkeypatch, tmp_path, capsys
+):
+    from moe_dispatch import gpu_suites
+
+    check = "[checkAllclose atol=0.01 rtol=0.01 "
+    # (exit status, checkAllclose lines) per (suite, AITER_MOEV2).
+    results = {
+        ("both_pass.py", "off"): (0, [f"m 1.5 us, 3 tflops{check}\x1b[32mpassed~"]),
+        ("both_pass.py", "a8w8_pt"): (
+            0,
+            [f"m 9.9 us, 7 tflops{check}\x1b[33mwarning!"],
+        ),
+        ("v2_fails.py", "off"): (0, []),
+        ("v2_fails.py", "a8w8_pt"): (1, []),
+        ("legacy_fails.py", "off"): (1, [f"m{check}\x1b[32mpassed~"]),
+        ("legacy_fails.py", "a8w8_pt"): (1, []),
+    }
+    seen = []
+
+    def run(cmd, *, check, env, cwd, stdout, stderr):
+        mode = env[envs.AITER_MOEV2]
+        seen.append((cmd[1], mode, env["PYTHONPATH"].split(os.pathsep)[0], cwd))
+        status, lines = results[(cmd[1], mode)]
+        stdout.write("".join(f"[aiter] {ln}\x1b[0m]\n" for ln in lines))
+        return type("Result", (), {"returncode": status})()
+
+    suites = tuple(
+        gpu_suites.Suite(("python3", name))
+        for name in ("both_pass.py", "v2_fails.py", "legacy_fails.py")
+    )
+    monkeypatch.setattr(gpu_suites, "PATHS", {**gpu_suites.PATHS, "a8w8_pt": suites})
+    monkeypatch.setattr(gpu_suites, "SHARED", ())
+    monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    monkeypatch.setattr(paths, "registered", lambda: {"a8w8_pt": None})
+    monkeypatch.setenv(envs.AITER_MOEV2, "off")
+    argv = ["--path", "a8w8_pt", "--compare", "--log-dir", str(tmp_path)]
+    assert gpu_suites.main(argv) == 1
+    repo = str(gpu_suites._REPO)
+    assert seen == [
+        (name, mode, repo, gpu_suites._REPO)
+        for name in ("both_pass.py", "v2_fails.py", "legacy_fails.py")
+        for mode in ("off", "a8w8_pt")
+    ]
+    out = capsys.readouterr().out
+    assert "FAILED: [a8w8_pt] python3 v2_fails.py  # passes with off" in out
+    assert out.count("FAILED:") == 1
+    # The timings differ between the runs; only the outcome counts as a difference.
+    assert "checkAllclose: off 1 passed; v2 1 warning" in out
+    assert "off passed, v2 warning: m [atol=0.01 rtol=0.01]" in out
+    assert "the runs made 1 and 0 checks; compare the logs" in out
+    assert (tmp_path / "a8w8_pt.0.off.log").exists()
+    assert (tmp_path / "a8w8_pt.0.a8w8_pt.log").exists()
+
+
+def test_gpu_suite_compare_needs_an_implemented_path(monkeypatch, capsys):
+    from moe_dispatch import gpu_suites
+
+    def run(*args, **kwargs):
+        raise AssertionError("nothing may run")
+
+    monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    monkeypatch.setattr(gpu_suites, "_device", lambda: ("gfx942", 1))
+    missing = sorted(set(paths.PLANNED) - set(paths.registered()))
+    assert gpu_suites.main(["--path", missing[0], "--compare"]) == 1
+    assert "is not implemented: nothing to compare" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        gpu_suites.main(["--compare"])
 
 
 def test_legacy_fused_moe_is_a_plain_function():

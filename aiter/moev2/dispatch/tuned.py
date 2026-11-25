@@ -10,6 +10,13 @@ arch is declared with `@cached` (the default-parameter helpers in `segments/defa
 are cleared by name), so `clear_cache()` resets all of them at once; tests call it after
 changing AITER_CONFIG_FMOE or patching the arch, and the CK tuner after it rewrites a
 table.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+The legacy MoE path calls `read_table` and `index_columns` (factored out of its
+`get_cfg_2stages`), `share_default_table` and `clear_cache` through `moev2_tuned`:
+changes to them must keep legacy behavior
+(`python tests/moe_dispatch/snapshot.py --check`). Please coordinate any change in this
+module with the moev2 owners (@qli88). See aiter/moev2/README.md.
 """
 
 import functools

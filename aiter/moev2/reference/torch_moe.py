@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""PyTorch reference MoE used by the tests to check every backend."""
+"""PyTorch reference MoE used by the tests to check every backend.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+This module moved here from aiter/fused_moe.py, which re-exports it for the tests
+(`from aiter.fused_moe import torch_moe`, ...). Changes must keep the results those
+tests check against and should loop in the moev2 owners (@qli88). See
+aiter/moev2/README.md.
+"""
 
 import torch
 

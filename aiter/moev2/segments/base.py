@@ -6,6 +6,10 @@ A segment is a thin adapter over one kernel family that covers a span of the op 
 It declares what it can run as `Cap`s; anything a problem has that no `Cap` declares
 (a feature, a shared expert, a tail, padding, an extra) rejects the segment, so a new
 input never reaches a kernel that would silently ignore it.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 from dataclasses import dataclass

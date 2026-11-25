@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""aiter.moev2 test hooks."""
+"""aiter.moev2 test hooks.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
+"""
 
 import pytest
 

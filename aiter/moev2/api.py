@@ -7,6 +7,10 @@ registered path takes the call. The legacy `aiter.fused_moe.fused_moe` is the en
 point that honours the switch.
 
 `build_problem` turns a `fused_moe_` call into the `MoeProblem` dispatch resolves.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 from __future__ import annotations

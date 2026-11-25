@@ -2,9 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Explicit test and benchmark hooks for aiter.moev2.
 
-The legacy code is driven by assigning module globals (`kernel_bench_callable`,
-`_moe_sorting_impl`, `cfg_2stages`). These context managers replace that: they restore
+The legacy code is driven by assigning module globals (`kernel_bench_callable` and
+`cfg_2stages` in aiter.fused_moe, `_moe_sorting_impl` in aiter.moev2.segments.sort,
+which legacy and v2 share). These context managers replace that: they restore
 the previous state on exit, so a failing test cannot leak its override into the next.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 import contextlib

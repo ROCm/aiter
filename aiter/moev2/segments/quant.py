@@ -5,6 +5,10 @@
 Covers the quant types whose activations are quantized by a standalone kernel and the
 intermediate is quantized after GEMM1 (the generic branches of the legacy
 `fused_moe_2stages`).
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 from aiter import QuantType

@@ -4,6 +4,10 @@
 
 The implementation is looked up in `aiter.fused_moe_registry` (e.g. `flydsl_gfx942`,
 registered by aiter.ops.flydsl) and runs the whole MoE from a `FusedMoeRequest`.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 from aiter import ActivationType, dtypes

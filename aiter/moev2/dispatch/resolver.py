@@ -10,6 +10,10 @@ logged, and the caller hands the call back to the legacy code.
 
 Log lines are collected, not emitted, so a declined resolution prints nothing; the caller
 emits them (`Resolution.emit`) once per problem, where the legacy cache would have logged.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 import logging

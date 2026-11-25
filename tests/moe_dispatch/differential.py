@@ -13,6 +13,13 @@ fix lands in the legacy code first, with the snapshot regenerated.
 GPU: `run_differential(path_name, call)` runs one call through AITER_MOEV2=off and
 AITER_MOEV2=<path> and compares the kernel launches and outputs (see
 tests/moe_dispatch/gpu_differential.py).
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import argparse
@@ -28,15 +35,32 @@ _HERE = pathlib.Path(__file__).resolve().parent
 
 @contextlib.contextmanager
 def captured_logs():
-    """Collect `(level, message)` of the aiter logger at INFO, printing nothing."""
+    """Collect `(level, message)` of the aiter logger at INFO, printing nothing.
+
+    Every record is kept except one: the AITER_MOEV2 selection line that
+    `aiter.moev2.paths` logs once per selection (after start-up or a reload), e.g.
+    "AITER_MOEV2='a8w8_pt': a8w8_pt on aiter.moev2, every other call on the legacy
+    code ...". `paths` tags that record with the attribute `SELECTION_RECORD`.
+
+    The differential compares the lines of a legacy run (AITER_MOEV2=off) with those of
+    a v2 run (AITER_MOEV2=<path>). The selection line names the AITER_MOEV2 value, so it
+    can never match between the two, and it says nothing about how a call was
+    dispatched. Compared, it fails every case. Dispatch lines ("using 2stage ...",
+    "run_1stage = ...", warnings) are still compared exactly. Lines logged under
+    AITER_MOE_EXPLAIN=1 are not tagged and are kept; the harness does not set it.
+    """
     import logging
+
+    from aiter.moev2.paths import SELECTION_RECORD
 
     logger = logging.getLogger("aiter")
     records = []
 
     class _Collect(logging.Handler):
         def emit(self, record):
-            records.append((record.levelno, record.getMessage()))
+            # The selection line, not a dispatch line; see the docstring.
+            if not getattr(record, SELECTION_RECORD, False):
+                records.append((record.levelno, record.getMessage()))
 
     handler = _Collect(logging.DEBUG)
     saved = logger.handlers[:], logger.level, logger.propagate
@@ -167,18 +191,85 @@ def moev2_mode(value):
 
 
 def _bits(t):
+    """`t` with floating-point values as integers of the same width: equal NaNs compare
+    equal, and -0.0 differs from 0.0."""
     import torch
 
+    if t.is_floating_point():
+        width = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+        return t.view(width[t.element_size()])
     return t.view(torch.uint8) if t.element_size() == 1 else t
 
 
-def compare_launches(legacy, v2, call, out_legacy, out_v2):
+def _expand(launch):
+    """`{where: value}` of a recorded launch, dataclass arguments by field."""
+    pairs = [(i, x) for i, x in enumerate(launch.args)]
+    pairs += list(launch.keywords.items())
+    expanded = []
+    for where, x in pairs:
+        if dataclasses.is_dataclass(x) and not isinstance(x, type):
+            expanded.extend(
+                (f"{where}.{field.name}", getattr(x, field.name))
+                for field in dataclasses.fields(x)
+            )
+        else:
+            expanded.append((where, x))
+    return dict(expanded)
+
+
+def _float_gap(x, y, noise, z=None):
+    """Why floating-point `x` (legacy) and `y` (v2) are not close, or None.
+
+    Close: where either value is non-finite, `y` has the bits of `x` or of `z` (legacy's
+    second run, if any); elsewhere within 1 ulp of their own dtype at their magnitude (a
+    rounding flip) or within twice `noise` (how far legacy's two runs differ on the same
+    argument).
+    """
+    import torch
+
+    xf, yf = x.float(), y.float()
+    finite = xf.isfinite() & yf.isfinite()
+    odd = ~finite
+    if odd.any():
+        match = _bits(x)[odd] == _bits(y)[odd]
+        if z is not None:
+            match |= _bits(z)[odd] == _bits(y)[odd]
+        if not bool(match.all()):
+            return "non-finite values differ"
+    if not finite.any():
+        return None
+    gap = (xf - yf).abs()[finite]
+    info = torch.finfo(x.dtype)
+    peak = torch.maximum(xf.abs(), yf.abs())[finite].clamp_min(info.tiny)
+    mantissa = {
+        torch.float32: 23,
+        torch.float16: 10,
+        torch.bfloat16: 7,
+        torch.float8_e5m2: 2,
+    }.get(x.dtype, 3)
+    ulp = torch.exp2(peak.log2().floor() - mantissa)
+    allowed = torch.maximum(ulp, torch.full_like(ulp, 2 * noise))
+    if bool((gap <= allowed).all()):
+        return None
+    worst = int((gap - allowed).argmax())
+    return (
+        f"differ beyond 1 ulp and twice legacy's own spread ({noise:.3g}): "
+        f"{int((gap > allowed).sum())} of {gap.numel()} values, worst "
+        f"{gap[worst].item():.3g} at magnitude {peak[worst].item():.3g}"
+    )
+
+
+def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
     """`{(stage, argument): problem}` between two `kernel_bench_callable` recordings.
 
-    Same stages, same functions, equal non-tensor arguments, and bitwise-equal tensors
-    over what the kernels define: the sort buffers up to `num_valid_ids` (the rest is
-    `torch.empty`), `[token, topk, inter]` buffers at the routed slots that are local
-    (stage 1 skips the others), and nothing for the output buffer.
+    Same stages, same functions, equal non-tensor arguments, and tensors over what the
+    kernels define: the sort buffers up to `num_valid_ids` (the rest is `torch.empty`),
+    `[token, topk, inter]` buffers at the routed slots that are local (stage 1 skips the
+    others), and nothing for the output buffer. The sort buffers and every integer
+    tensor must be bitwise equal. Floating-point tensors (activations, intermediates and
+    their scales) may differ by 1 ulp of their dtype, or by twice what the same
+    argument differs between `legacy` and `legacy2`, a second legacy run: some stage-1
+    kernels are not repeatable. A non-finite value must equal one of legacy's runs.
     """
     import torch
 
@@ -186,6 +277,8 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
         return {
             ("", ""): f"stages differ: {[n for n, _ in legacy]} vs {[n for n, _ in v2]}"
         }
+    if legacy2 is not None and [n for n, _ in legacy2] != [n for n, _ in legacy]:
+        legacy2 = None
     roles = {}
     block_m = num_valid = None
     if "stage1" in dict(legacy):
@@ -203,8 +296,24 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
     slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
     skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
+
+    def routed(t):
+        """`t` at the local routed slots if it is a `[token, topk, ...]` buffer."""
+        if t.dim() == 3 and t.shape[:2] == topk_ids.shape and slots is not None:
+            return _bits(t)[slots].view(t.dtype)
+        return t
+
+    def spread(x, z):
+        """How much legacy's two runs differ in one floating-point argument, over the
+        values finite in both (`_float_gap` checks the others)."""
+        xf, zf = x.float(), z.float()
+        finite = xf.isfinite() & zf.isfinite()
+        return (xf - zf).abs()[finite].max().item() if finite.any() else 0.0
+
     problems = {}
-    for (name, a), (_, b) in zip(legacy, v2):
+    seconds = [None] * len(legacy) if legacy2 is None else [l for _, l in legacy2]
+    for (name, a), (_, b), second in zip(legacy, v2, seconds):
+        second = {} if second is None else _expand(second)
         if a.func != b.func:
             problems[name, ""] = f"{name}: {a.func} vs {b.func}"
             continue
@@ -245,12 +354,25 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
                 )
                 continue
             role = roles.get(x.data_ptr())
+            if role is None and x.is_floating_point():
+                reason = None
+                if not torch.equal(_bits(routed(x)), _bits(routed(y))):
+                    z = second.get(where)
+                    like_x = isinstance(z, torch.Tensor) and z.dtype == x.dtype
+                    z = routed(z) if like_x and z.shape == x.shape else None
+                    noise = 0.0 if z is None else spread(routed(x), z)
+                    reason = _float_gap(routed(x), routed(y), noise, z)
+                if reason is not None:
+                    problems[name, where] = (
+                        f"{name}[{where}]: {x.dtype}{tuple(x.shape)} {reason}"
+                    )
+                continue
             if role == "ids":
                 x, y = x[:num_valid], y[:num_valid]
             elif role == "blocks":
                 x, y = x[: num_valid // block_m], y[: num_valid // block_m]
-            elif x.dim() == 3 and x.shape[:2] == topk_ids.shape and slots is not None:
-                x, y = (_bits(t)[slots] for t in (x, y))
+            else:
+                x, y = routed(x), routed(y)
             if not torch.equal(_bits(x), _bits(y)):
                 problems[name, where] = (
                     f"{name}[{where}]: {x.dtype}{tuple(x.shape)} values differ"
@@ -272,8 +394,9 @@ def _ulp(t):
 def run_differential(path_name, call, *, bitwise=False):
     """Run `call` (legacy fused_moe arguments by name) on legacy and on `path_name`.
 
-    The path must claim and run the call (not decline it), launch the same kernels on the
-    same inputs (`compare_launches`), and produce the same output: bitwise with
+    The path must claim and run the call (not decline it), launch the same kernels with
+    the same arguments (`compare_launches`, against both legacy runs: exact but for
+    floating-point tensors), and produce the same output: bitwise with
     `bitwise=True`, else within the larger of 4 ulps of the output's peak and twice the
     difference between two legacy runs (atomic accumulation in GEMM2 is not
     deterministic).
@@ -297,17 +420,23 @@ def run_differential(path_name, call, *, bitwise=False):
     def launch(mode):
         bench = []
         fm.kernel_bench_callable = bench
+        if call.get("output") is not None:
+            # Legacy and v2 share the caller's buffer: what one leaves unwritten must
+            # not pass as the other's result.
+            call["output"].fill_(float("nan"))
         try:
             with moev2_mode(mode):
                 out = fm.fused_moe(**call)
         finally:
             fm.kernel_bench_callable = None
         torch.cuda.synchronize()
+        if call.get("output") is not None and out is not call["output"]:
+            raise AssertionError(f"{mode}: the result is not the caller's output=")
         return out, bench
 
     ref_raw, legacy_launches = launch("off")
     ref = ref_raw.clone()
-    ref2_raw, _ = launch("off")
+    ref2_raw, legacy2_launches = launch("off")
     ref2 = ref2_raw.clone()
     results = []
 
@@ -330,7 +459,9 @@ def run_differential(path_name, call, *, bitwise=False):
     if len(results) != 1 or results[0] is paths.DECLINED:
         raise AssertionError(f"path {path_name} did not run this call: {results}")
     problems = list(
-        compare_launches(legacy_launches, v2_launches, call, ref_raw, out_raw).values()
+        compare_launches(
+            legacy_launches, v2_launches, call, ref_raw, out_raw, legacy2_launches
+        ).values()
     )
     if problems:
         raise AssertionError(

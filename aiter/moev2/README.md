@@ -1,5 +1,33 @@
 # aiter/moev2
 
+## Status / ownership
+
+`aiter.moev2` is under active development (the MoE v2 migration) and no path has
+graduated. Owners: @qli88. Please coordinate with them before changing:
+
+- any file under `aiter/moev2/`. The legacy MoE path runs helpers that live here:
+  `policy.py`, `shapes.py`, `segments/defaults.py`, `segments/sort.py`, `ck_moe_stage1`
+  and `_require_shuffled_gfx950_fp8` in `segments/ck.py`, `asm_stage1` in
+  `segments/asm.py`, `execute/metadata.py`, `execute/output.py` (moved from
+  `aiter/fused_moe.py`, which re-exports them) and the table helpers in
+  `dispatch/tuned.py`. `aiter.fused_moe` also re-exports `routing/topk.py` and
+  `reference/torch_moe.py` for its callers and tests. Changes must keep legacy behavior;
+- the hook sites in `aiter/fused_moe.py` (comments starting `NOTE: aiter.moev2`);
+- legacy code that `aiter.moev2` copies instead of calling, where a fix must be mirrored:
+  `_fused_moe_impl` and `fused_moe_2stages` (`execute/executor.py`, `api.dispatch_key`),
+  `get_2stage_cfgs` (`dispatch/resolver.py`, `dispatch/ranking.py`), and the arguments
+  `fused_moe` passes to `fused_moe_` (`api.op_call`).
+
+Checks after a change on either side (`tests/moe_dispatch/`):
+
+    python tests/moe_dispatch/snapshot.py --check        # legacy dispatch unchanged
+    python tests/moe_dispatch/snapshot.py --update       # after an intended change; paste its output into the PR
+    python tests/moe_dispatch/differential.py --check    # v2 plans equal legacy's (CPU)
+    AITER_MOEV2_GPU_DIFFERENTIAL=1 python -m pytest tests/test_moev2_differential.py  # outputs (GPU)
+    python tests/moe_dispatch/gpu_suites.py --path a8w8_pt --compare                   # GPU suites, off vs v2
+
+## Overview
+
 MoE v2 rebuilds `fused_moe` dispatch and execution from small parts: a problem
 description, segments (one per kernel family) and a plan that chains them. It lives
 next to the legacy code (`aiter/fused_moe.py`, `aiter/fhmoe.py`,
@@ -36,7 +64,7 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 |---|---|---|
 | `__init__.py` | permanent | Package docstring: coexistence with the legacy code and the import rule. |
 | `envs.py` | permanent; the `AITER_MOEV2` accessor is removed | `AITER_MOEV2` parsing, read once and cached (tests call `reload()`). |
-| `paths.py` | to be removed | Path registry: `route_to_v2(call, entry)` picks the path for a call, `DECLINED` hands it back to legacy. Graduation can be scoped to archs. |
+| `paths.py` | to be removed | Path registry: `route_to_v2(call, entry)` picks the path for a call, `DECLINED` hands it back to legacy. Graduation can be scoped to archs. Logs the selection once; with `AITER_MOE_EXPLAIN=1`, why an active path does not claim a call. |
 | `api.py` | permanent; `op_call` and `dispatch_key` are removed | `aiter.moev2.fused_moe` with the legacy signature (always v2; raises when no path takes the call; like legacy, clears a registered presort when the call returns or raises); `build_problem` and `dispatch_key` (a call to its `MoeProblem` and legacy key); `op_call` (the `fused_moe_` arguments legacy passes). |
 | `problem.py` | permanent | `MoeProblem`: what one call must compute (formats, shapes, flags, never tensors). Round-trips the legacy `get_2stage_cfgs` key, so v2 can be compared with legacy key by key. |
 | `hooks.py` | permanent; `legacy_kernel_bench` is removed | Context managers for tests and benchmarks (kernel bench callable, sort implementation) that replace assigning legacy module globals. `legacy_kernel_bench` forwards legacy's `kernel_bench_callable` global to v2 runs. |
@@ -54,7 +82,7 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `dispatch/overrides.py` | permanent | Debug overrides of dispatch decisions (`AITER_BYPASS_TUNE_CONFIG`, `AITER_USE_NT`, `AITER_ONLINE_TUNE`, ...), read where legacy reads them. |
 | `dispatch/profile.py` | permanent | Measured runners-up per tuned key; empty for now. |
 | `segments/base.py` | permanent | The `Segment` interface. A segment declares what it can run (`Cap`); anything a problem has that no `Cap` declares rejects the segment. |
-| `segments/sort.py` | permanent | Token sorting (Opus, CK or FlyDSL backend, chosen like legacy `moe_sorting`). |
+| `segments/sort.py` | permanent | Token sorting: `moe_sorting` and its helpers, moved from `fused_moe.py`, which imports them (Opus, CK or FlyDSL backend; local topk ids, the adaptive auxiliary sort, FLAT's unsorted input), and segment `sort`, which runs the plain sort through it. |
 | `segments/quant.py` | permanent | Activation quantization before GEMM1 and between the GEMMs. |
 | `segments/ck.py` | permanent | CK 2-stage GEMM kernels; `ck_moe_stage1` and `_require_shuffled_gfx950_fp8` moved from `fused_moe.py`. |
 | `segments/asm.py` | permanent | ASM stage-1 kernels; `asm_stage1` moved from `fused_moe.py`. |
@@ -74,7 +102,7 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `tests/test_moev2_imports.py` | permanent | `aiter/moev2` imports no legacy MoE module. |
 | `tests/test_moev2_switch.py` | to be removed | `AITER_MOEV2` parsing and routing; the v2 entry point keeps the legacy signature. |
 | `tests/test_moev2_hooks.py` | permanent | The hooks restore the previous state. |
-| `tests/test_moev2_differential.py` | to be removed | Runs the differential harness: dispatch on the CPU, outputs on the GPU. |
+| `tests/test_moev2_differential.py` | to be removed | Runs the differential harness: dispatch on the CPU, outputs on the GPU (with `AITER_MOEV2_GPU_DIFFERENTIAL=1`; CI runs the rest). |
 | `tests/test_moev2_dispatch.py` | permanent; the tests against legacy are removed | Unit tests of the problem, plans and capabilities, kernel names, resolver and overrides, the executor, and `a8w8_pt`; the snapshot's feature variants are valid legacy calls. |
 | `tests/test_moev2_ranking.py` | permanent | Unit tests of the ranking table and its checks. |
 | `tests/test_moe_dispatch_snapshot.py` | permanent | Legacy dispatch matches the golden snapshot. |
@@ -86,5 +114,5 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `tests/moe_dispatch/ranking_checks.py` | permanent | Every rankable snapshot key lands in one ranking entry and region, and every region is reached. |
 | `tests/moe_dispatch/gpu_differential.py` | to be removed | On a GPU, a path launches the same kernels on the same inputs as legacy and gives the same output. |
 | `tests/moe_dispatch/inventory.py` | to be removed | Every name used from the legacy MoE modules, and every monkeypatch of them. |
-| `tests/moe_dispatch/gpu_suites.py` | to be removed | The GPU test suites each path must pass with `AITER_MOEV2=<path>`. |
+| `tests/moe_dispatch/gpu_suites.py` | to be removed | The GPU test suites each path must pass with `AITER_MOEV2=<path>`; `--compare` runs them with `off` and with the path. |
 | `tests/moe_dispatch/perf_baseline.py` | permanent | End-to-end MoE performance baseline (`golden/perf_gfx950.json`). |

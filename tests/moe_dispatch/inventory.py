@@ -12,6 +12,13 @@ starting point for review:
 - public:    used by the vLLM library;
 - internal:  used only by other modules of the aiter package;
 - test-only: used only by tests, benchmarks or tuners (aiter or vLLM).
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import argparse

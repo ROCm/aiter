@@ -15,6 +15,13 @@ The `base` tuned and grid keys of the quant types in `FEATURE_QUANT_TYPES` also 
 feature variants (`feature_keys`): the same call with one more `get_2stage_cfgs` feature
 (`num_local_tokens`, activation scales, bias, padding, ...), so a changed decision for
 it shows up as its own key.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 from dataclasses import dataclass, field

@@ -5,6 +5,10 @@
 Statement for statement this is the part of the legacy `_fused_moe_impl` and
 `fused_moe_2stages` that the plan's segments reach, in the same order: the same
 validation, buffers, kernel launches and benchmark hooks.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 import functools

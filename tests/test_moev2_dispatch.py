@@ -4,6 +4,13 @@
 
 Per-key equality with the legacy code over the whole snapshot runs in a subprocess
 (tests/moe_dispatch/key_checks.py, differential.py); the rest are unit tests.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import importlib
@@ -526,7 +533,10 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
 
     monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
     call = _per_tensor_op_call()
-    assert a8w8_pt.claims(call)
+    assert a8w8_pt.claims(call) and a8w8_pt.why_not(call) is None
+    for limit in (0, 0.0, float("inf")):
+        assert a8w8_pt.claims({**call, "swiglu_limit": limit}), limit
+    assert a8w8_pt.why_not({**call, "swiglu_limit": 7.0}) == "swiglu_limit=7.0 clamps"
     for change in (
         {"quant_type": QuantType.per_Token.value},
         {"activation": ActivationType.Swiglu.value},
@@ -541,6 +551,7 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
         {"w2_global_scale": torch.empty(4)},
     ):
         assert not a8w8_pt.claims({**call, **change}), change
+        assert a8w8_pt.why_not({**call, **change}), change
     register_presorted_moe({"M": 2})
     try:
         assert not a8w8_pt.claims(call)

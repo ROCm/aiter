@@ -3,9 +3,12 @@
 """GPU differential of one migration path against the legacy MoE code.
 
 Each case runs on the same inputs with AITER_MOEV2=off and AITER_MOEV2=<path>: the path
-must run the call (not decline it), launch the same kernels on bitwise-equal inputs, give
-the same output up to the GEMM2 atomics, and log the same dispatch lines on a first call
-(see `differential.run_differential`).
+must run the call (not decline it), launch the same kernels on equal inputs (exact, but
+floating-point tensors within 1 ulp or legacy's own spread), give the same output up to
+the GEMM2 atomics, and log the same dispatch lines on a first call (see
+`differential.run_differential`). Besides plain calls, the cases cover the inputs
+`claims` accepts (`_VARIANTS`); where legacy raises on one (`_RAISES`), v2 must run the
+call and raise the same error.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
@@ -14,6 +17,13 @@ Shipped tables have per-tensor rows for gfx942 only. `--synth-table` copies thei
 to the running arch in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs on a
 gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
 gfx950 (legacy and v2 alike), so those branches need a gfx942 for this check.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import argparse
@@ -27,13 +37,26 @@ import tempfile
 _HERE = pathlib.Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
-# (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype, ep)
+# (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype,
+#  ep [, variant]): a variant names one of `_VARIANTS` (or "g1u0"), an input `claims`
+# accepts beyond the plain call.
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16, 512)),
+    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", ep, v)
+      for m, ep in ((16, False), (512, True))
+      for v in ("num_local_tokens", "num_local_tokens_fp8_input")),
+    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", False, v)
+      for v in ("a1_scale", "a1_a2_scales", "fp8_input", "output", "noncontiguous",
+                "block_m_32", "block_m_128", "g1u0", "swiglu_limit_0", "swiglu_limit_inf")
+      for m in (16, 512)),
+    # Mixtral-8x7B (TP1) as vLLM calls it: swiglu_limit=0.0 on every call.
+    *((m, 4096, 14336, 8, 2, "Silu", False, "bf16", False, "swiglu_limit_0") for m in (4, 256)),
+    # vLLM passes swiglu_limit=0.0 with Gelu too; legacy leaves it unnormalized there.
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "swiglu_limit_0") for m in (32, 512)),
 )  # fmt: skip
 
 _A8W8_PT_GFX942_CU80 = (
@@ -42,9 +65,11 @@ _A8W8_PT_GFX942_CU80 = (
 )  # fmt: skip
 
 
-def _make_a8w8_pt_call(token, model_dim, inter_dim, E, topk, act, doweight, out, ep):
+def _make_a8w8_pt_call(
+    token, model_dim, inter_dim, E, topk, act, doweight, out, ep, variant=None
+):
     """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8),
-    except that the weights are scaled by 1/sqrt(K)."""
+    except that the weights are scaled by 1/sqrt(K); then `variant` applied."""
     import torch
 
     import aiter
@@ -59,7 +84,8 @@ def _make_a8w8_pt_call(token, model_dim, inter_dim, E, topk, act, doweight, out,
     # Scaled so each GEMM keeps values near 1: unscaled, the fp16 outputs reach the
     # fp16 limit, and whether a sum overflows then depends on the order of the GEMM2
     # atomics.
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device=device)
+    gate_up = 1 if variant == "g1u0" else 2
+    w1 = torch.randn((E, inter_dim * gate_up, model_dim), dtype=dtype, device=device)
     w1 /= model_dim**0.5
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device=device)
     w2 /= inter_dim**0.5
@@ -74,7 +100,7 @@ def _make_a8w8_pt_call(token, model_dim, inter_dim, E, topk, act, doweight, out,
     if ep:
         expert_mask = torch.zeros(global_E, dtype=dtypes.i32, device=device)
         expert_mask[:E] = 1
-    return {
+    call = {
         "hidden_states": hidden,
         "w1": w1_qt,
         "w2": w2_qt,
@@ -87,6 +113,89 @@ def _make_a8w8_pt_call(token, model_dim, inter_dim, E, topk, act, doweight, out,
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
     }
+    if variant not in (None, "g1u0"):
+        _VARIANTS[variant](call)
+    return call
+
+
+def _a1_scale(call):
+    import aiter
+    from aiter import QuantType, dtypes
+
+    quant = aiter.get_torch_quant(QuantType.per_Tensor)
+    return quant(call["hidden_states"], quant_dtype=dtypes.fp8)
+
+
+def _set_a1_scale(call):
+    call["a1_scale"] = _a1_scale(call)[1]
+
+
+def _set_a1_a2_scales(call):
+    import torch
+
+    _set_a1_scale(call)
+    # The GEMM1 outputs stay near 1 (the weights are scaled by 1/sqrt(K)); a fixed
+    # scale that keeps them inside the fp8 range.
+    call["a2_scale"] = torch.full((1,), 8 / 224, dtype=torch.float32, device="cuda")
+
+
+def _set_fp8_input(call):
+    hidden = call["hidden_states"]
+    call["dtype"] = hidden.dtype
+    call["hidden_states"], call["a1_scale"] = _a1_scale(call)
+
+
+def _set_num_local_tokens(call):
+    import torch
+
+    token = call["hidden_states"].shape[0]
+    call["num_local_tokens"] = torch.tensor(
+        [token - token // 4], dtype=torch.int32, device="cuda"
+    )
+
+
+def _set_output(call):
+    import torch
+
+    call["output"] = torch.empty_like(call["hidden_states"])
+
+
+def _set_noncontiguous(call):
+    import torch
+
+    hidden = call["hidden_states"]
+    wide = torch.zeros(
+        (hidden.shape[0], 2 * hidden.shape[1]), dtype=hidden.dtype, device="cuda"
+    )
+    wide[:, : hidden.shape[1]] = hidden
+    call["hidden_states"] = wide[:, : hidden.shape[1]]
+
+
+def _set_num_local_tokens_fp8_input(call):
+    _set_fp8_input(call)
+    _set_num_local_tokens(call)
+
+
+_VARIANTS = {
+    "a1_scale": _set_a1_scale,
+    "a1_a2_scales": _set_a1_a2_scales,
+    "fp8_input": _set_fp8_input,
+    "num_local_tokens": _set_num_local_tokens,
+    "num_local_tokens_fp8_input": _set_num_local_tokens_fp8_input,
+    "output": _set_output,
+    "noncontiguous": _set_noncontiguous,
+    "block_m_32": lambda call: call.update(block_size_M=32),
+    "block_m_128": lambda call: call.update(block_size_M=128),
+    "swiglu_limit_0": lambda call: call.update(swiglu_limit=0.0),
+    "swiglu_limit_inf": lambda call: call.update(swiglu_limit=float("inf")),
+}
+# Variants legacy raises on: v2 must run them and raise the same error. The 2-stage
+# path quantizes per tensor before GEMM2 (and before GEMM1 from bf16) with
+# `per_tensor_quant_hip`, which takes no row count.
+_RAISES = {
+    "num_local_tokens": "num_rows is not supported for per_tensor_quant_hip",
+    "num_local_tokens_fp8_input": "num_rows is not supported for per_tensor_quant_hip",
+}
 
 
 def _synth_rows(table_file, gfx, cu_num, limit):
@@ -153,6 +262,33 @@ def _raised(fn):
     return None
 
 
+def _v2_outcome(path_name, call):
+    """What the path did with `call`: "not claimed", "declined", "raised" or "ran"."""
+    import dataclasses
+
+    import aiter.fused_moe as fm
+    from aiter.moev2 import paths
+    from moe_dispatch.differential import moev2_mode
+
+    path = paths.registered()[path_name]
+    outcome = ["not claimed"]
+
+    def run(c):
+        outcome[0] = "raised"
+        out = path.run(c)
+        outcome[0] = "declined" if out is paths.DECLINED else "ran"
+        return out
+
+    paths._REGISTRY[path_name] = dataclasses.replace(path, run=run)
+    try:
+        with moev2_mode(path_name):
+            _raised(lambda: fm.fused_moe(**call))
+    finally:
+        paths._REGISTRY[path_name] = path
+        paths.reload()
+    return outcome[0]
+
+
 def run_case(path_name, case):
     """Return a problem string, or None when legacy and v2 agree."""
     import torch
@@ -172,6 +308,16 @@ def run_case(path_name, case):
         v2_error = _raised(lambda: fm.fused_moe(**call))
     if legacy_logs != v2_logs:
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
+    expected = _RAISES.get(case[9] if len(case) > 9 else None)
+    if expected is not None:
+        if not (legacy_error and legacy_error == v2_error and expected in v2_error):
+            return (
+                f"{case}: expected both to raise {expected!r}; "
+                f"legacy raises {legacy_error}; v2 raises {v2_error}"
+            )
+        _clear_dispatch_caches()
+        outcome = _v2_outcome(path_name, call)
+        return None if outcome == "raised" else f"{case}: v2 {outcome}, not raised"
     if legacy_error or v2_error:
         return (
             f"{case}: expected successful execution; "

@@ -42,6 +42,14 @@ from aiter.jit.utils.chip_info import (  # noqa: F401
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
+# NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+# Please do not modify this code without coordinating with the moev2 owners
+# (@qli88). See aiter/moev2/README.md.
+# Besides the moev2 hooks, paths and tuned-table modules, the names below moved from
+# here to aiter.moev2 and are re-exported under their old names; the legacy code below
+# runs most of them. Changes must keep legacy behavior
+# (python tests/moe_dispatch/snapshot.py --check).
 from aiter.moev2 import hooks as moev2_hooks
 from aiter.moev2 import paths as moev2_paths
 from aiter.moev2.dispatch import tuned as moev2_tuned
@@ -71,6 +79,7 @@ from aiter.moev2.reference.torch_moe import (  # noqa: F401
     torch_moe_stage2,
 )
 from aiter.moev2.routing.topk import fused_topk  # noqa: F401
+from aiter.moev2.segments import sort as moev2_sort
 from aiter.moev2.segments.asm import asm_stage1
 from aiter.moev2.segments.ck import _require_shuffled_gfx950_fp8, ck_moe_stage1
 from aiter.moev2.segments.defaults import (
@@ -78,6 +87,24 @@ from aiter.moev2.segments.defaults import (
     get_block_size_M,
     get_ksplit,
     use_nt,
+)
+
+# Re-exported for existing imports. Tests and benchmarks that override the sort flags or
+# helpers must patch aiter.moev2.segments.sort, which every caller below reads.
+from aiter.moev2.segments.sort import (  # noqa: F401
+    _MOE_SORT_BACKEND,
+    _USE_CK_MOE_SORTING,
+    _USE_FLYDSL_MOE_SORTING,
+    AUX_SORT_OPUS,
+    _adaptive_moe_sort,
+    _adaptive_output_usable,
+    _aux_uses_opus,
+    _empty_bf16,
+    _flydsl_moe_sorting,
+    _moe_prepare_unsorted_input,
+    _moe_sorting_impl,
+    _mxfp4_aux_instance_supported,
+    moe_sorting,
 )
 from aiter.moev2.shapes import (  # noqa: F401
     _PADDED_M_TIERS,
@@ -106,7 +133,6 @@ from aiter.ops.flydsl.mxfp4_kname import (
 from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
 from aiter.ops.moe_mxfp4_aux import (
     _MissingMxfp4MoeAuxInstances,
-    _mxfp4_moe_sort_internal_is_supported,
     is_mxfp4_moe_scatter_supported,
 )
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
@@ -140,41 +166,6 @@ def swiglu_limit_tag(swiglu_limit):
     """`_tag` value of tuned fmoe rows that were tuned with this swiglu_limit."""
     swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     return f"swiglu_limit={float(swiglu_limit):g}" if swiglu_limit else ""
-
-
-_USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
-# Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
-_MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
-
-AUX_SORT_OPUS = "opus"
-
-
-def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
-    """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
-
-    block_size 16 has no three-stage sort instance -- codegen emits `aux_sort3s_*`
-    only for MB in {32, 64, 128}, so it falls back to sort_quant_kernel_impl,
-    whose whole sort runs under `blockIdx.x == 0`. That single CTA costs
-    O(routed_rows); Opus spends one CTA per expert. So the fused sort wins while
-    the routed rows are few relative to the experts and loses linearly after,
-    which is why block_size 16 was originally pinned away from Opus wholesale.
-
-    Switch on which side of that crossover we are: routed_rows >= num_experts is
-    "at least one routed row per expert on average". Measured on kimi-k3 a4w4
-    (NE=896, topk=16, gfx950) the prologue crosses between token 32 and 64 --
-    fused is 2.2us faster at 32, Opus 0.9us faster at 64 and 10.6us faster at
-    512 -- and the rule puts the boundary at token 56.
-
-    Callers that cannot supply the shape keep the old conservative answer.
-    """
-    if output_aux != AUX_SORT_OPUS:
-        return False
-    if block_size != 16:
-        return True
-    if routed_rows is None or num_experts is None:
-        return False
-    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
 
 
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -339,138 +330,6 @@ kernel_bench_callable = None
 # (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
-def _moe_prepare_unsorted_input(
-    topk_ids, topk_weights, model_dim, moebuf_dtype, num_local_tokens=None
-):
-    device = topk_ids.device
-    M = topk_ids.shape[0]
-    # FLAT kernels zero their own output rows on-device and need an
-    # extra M*8-byte per-token coordination region appended to moe_buf.
-    # We over-allocate as a flat byte buffer and expose only the row part.
-    #
-    # The trailing region does not need initialisation; the kernel
-    # tolerates arbitrary contents on the first reference per dispatch.
-    elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
-    row_bytes = M * model_dim * elem_size
-    flag_bytes = 8
-    flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
-    moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
-    topk_ids_i32 = (
-        topk_ids
-        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
-        else topk_ids.to(dtypes.i32).contiguous()
-    )
-    topk_weights_f32 = (
-        topk_weights
-        if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
-        else topk_weights.to(dtypes.fp32).contiguous()
-    )
-    # sorted_expert_ids is unread; alias topk_ids so the pointer is valid.
-    # XC is one dword. A CUDA num_local_tokens is that storage. Otherwise the
-    # pointer is null (no allocation, no store) and the kernel keeps kernarg
-    # token_cnt, which is M.
-    if isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda:
-        num_valid_ids = num_local_tokens
-    else:
-        num_valid_ids = torch.empty(0, dtype=dtypes.i32, device=device)
-    return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
-
-
-def _adaptive_output_usable(output, M, model_dim, dtype, device):
-    """Whether a caller ``output`` can be the adaptive sort's atomic moe_buf.
-
-    The BM16 sort zeroes moe_buf with 4-byte stores, so the buffer has to be
-    4-byte aligned on top of matching what fused_moe would have allocated.
-    """
-    return (
-        output is not None
-        and tuple(output.shape) == (M, model_dim)
-        and output.dtype == dtype
-        and output.device == device
-        and output.is_contiguous()
-        and output.data_ptr() % 4 == 0
-    )
-
-
-def _adaptive_moe_sort(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    topk,
-    block_size,
-    model_dim,
-    *,
-    atomic=False,
-    emit_aux=False,
-    skip_quant=False,
-    moebuf_dtype=dtypes.bf16,
-    num_local_tokens=None,
-    output=None,
-):
-    device = topk_ids.device
-    M = topk_ids.shape[0]
-    BM = block_size
-    max_sorted = aux_sort_capacity(M, topk, num_experts, BM)
-
-    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    if atomic and _adaptive_output_usable(output, M, model_dim, moebuf_dtype, device):
-        # The sort kernel zeroes (BM16) or we zero below (other BM) whatever buffer
-        # it is handed, so a caller output can stand in for moe_buf: stage2
-        # accumulates straight into it and _return_output skips the copy.
-        moe_buf = output
-    elif atomic:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    # BM16 sort fuses output zeroing; three-stage sort only sorts.
-    # Atomic GEMM2 needs a zeroed destination on every invocation.
-    if atomic and BM != 16:
-        moe_buf.zero_()
-    empty_bf16 = _empty_bf16(device)
-    bf16_zero = moe_buf if (atomic and (BM == 16 or skip_quant)) else empty_bf16
-
-    # threestage-sort scratch (prologue==1). Previously allocated via
-    # torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
-    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
-    # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
-    sort3stage_ws = (
-        torch.empty(0, dtype=dtypes.i32, device=device)
-        if BM == 16 or skip_quant
-        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
-    )
-
-    aiter.mxfp4_moe_sort(
-        topk_ids=topk_ids,
-        topk_weight=topk_weights,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=num_valid_ids,
-        reverse_sorted=reverse_sorted,
-        sorted_weights=sorted_weights,
-        m_indices=m_indices,
-        bf16_zero_out=bf16_zero,
-        bf16_zero_workspace=empty_bf16,
-        sort3stage_ws=sort3stage_ws,
-        M_logical=M,
-        NE=num_experts,
-        TOPK=topk,
-        D_HIDDEN=model_dim,
-        D_INTER=1,  # (void)D_INTER in the sort path; unused
-        MB=BM,
-        prologue=0 if BM == 16 or skip_quant else 1,
-        num_local_tokens=num_local_tokens,
-    )
-    std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
-    if emit_aux:
-        return (*std, m_indices, reverse_sorted)
-    return std
-
-
 def _padded_scale_cols(size, group_size=32):
     """Scale columns per row, padded the way ``e8m0_shuffle`` pads them."""
     return (((size + group_size - 1) // group_size + 7) // 8) * 8
@@ -519,13 +378,6 @@ def _is_mxfp4_inline_sort(metadata):
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
-
-
-@functools.cache
-def _mxfp4_aux_instance_supported(experts, topk, hidden, block_m, zero_init):
-    return _mxfp4_moe_sort_internal_is_supported(
-        experts, topk, hidden, block_m, zero_init
-    )
 
 
 def _mxfp4_inline_sort_unsupported(
@@ -603,7 +455,7 @@ def _mxfp4_inline_sort_unsupported(
 
     p2 = parse_flydsl_v2_gemm2_kernel(metadata.stage2.keywords["kernelName2"])
     # EP sorts with the masked Opus kernel instead of this generated one.
-    if expert_mask is None and not _mxfp4_aux_instance_supported(
+    if expert_mask is None and not moev2_sort._mxfp4_aux_instance_supported(
         experts,
         topk_ids.shape[1],
         hidden,
@@ -612,300 +464,6 @@ def _mxfp4_inline_sort_unsupported(
     ):
         return "aux instance is not code-generated"
     return ""
-
-
-def _moe_sorting_impl(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size,
-    expert_mask,
-    num_local_tokens,
-    dispatch_policy,
-    use_opus,
-    return_local_topk_ids=False,
-    accumulate=True,
-    output_aux=False,
-    output=None,
-):
-    device = topk_ids.device
-    M, topk = topk_ids.shape
-
-    if (
-        output_aux
-        and expert_mask is None
-        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
-        and _mxfp4_aux_instance_supported(
-            num_experts, topk, model_dim, block_size, accumulate
-        )
-        and _MOE_SORT_BACKEND not in ("opus", "ck")
-        # only the BM16 (prologue 0) sort reads num_local_tokens
-        and (num_local_tokens is None or block_size == 16)
-    ):
-        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
-        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # A suitable caller `output` becomes moe_buf (stage2 accumulates in place);
-        # otherwise the sort allocates its own and _return_output copies.
-        return _adaptive_moe_sort(
-            topk_ids,
-            topk_weights,
-            num_experts,
-            topk,
-            block_size,
-            model_dim,
-            atomic=accumulate,
-            emit_aux=True,
-            moebuf_dtype=moebuf_dtype,
-            num_local_tokens=num_local_tokens,
-            output=output,
-        )
-
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
-    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    max_num_tokens_padded = max_num_m_blocks * block_size
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    # moe_buf shape depends on the downstream stage2 path:
-    #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
-    #  - else (FlyDSL stage2 reduce mode without mask, or the non-atomic
-    #    output_aux scatter, which writes every output row itself): caller owns
-    #    the intermediate; allocate a placeholder here.
-    # A caller buffer can stand in: the sort kernel zeroes what it is handed.
-    if accumulate or (expert_mask is not None and not output_aux):
-        moe_buf = (
-            output
-            if output is not None
-            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        )
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
-    if return_local_topk_ids:
-        # CK sorting does not emit local ids; use Opus so callers do not need a slow
-        # Python-side remap or a hard failure when local expert ids are required.
-        use_opus = True
-
-    aux_m_indices = None
-    aux_reverse_sorted = None
-    if output_aux:
-        use_opus = True
-        dispatch_policy = (
-            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
-        )
-        aux_m_indices = torch.empty(
-            max_num_tokens_padded, dtype=dtypes.i32, device=device
-        )
-        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-
-    if use_opus:
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, dispatch_policy, topk_ids.get_device()
-        )
-        workspace = (
-            torch.empty(ws_size, dtype=torch.uint8, device=device)
-            if ws_size > 0
-            else None
-        )
-        aiter.moe_sorting_opus_fwd(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            num_experts,
-            int(block_size),
-            expert_mask,
-            num_local_tokens,
-            workspace,
-            dispatch_policy,
-            local_topk_ids,
-            aux_m_indices,
-            aux_reverse_sorted,
-        )
-    else:
-        aiter.moe_sorting_fwd(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            num_experts,
-            int(block_size),
-            expert_mask,
-            num_local_tokens,
-            dispatch_policy,
-        )
-    ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
-    if output_aux:
-        ret = (*ret, aux_m_indices, aux_reverse_sorted)
-    if return_local_topk_ids:
-        return (*ret, local_topk_ids)
-    return ret
-
-
-def _flydsl_moe_sorting(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size,
-    expert_mask,
-    num_local_tokens,
-    accumulate=True,
-    output=None,
-    herd_topk=0,
-    herd_routed_scaling_factor=1.0,
-):
-    """FlyDSL sorting dispatch -- called outside torch_compile_guard."""
-    from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
-
-    device = topk_ids.device
-    M, topk = topk_ids.shape
-    topk = herd_topk or topk
-    max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
-    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    max_num_tokens_padded = max_num_m_blocks * block_size
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    # moe_buf shape mirrors _moe_sorting_impl: full [M, model_dim] when stage2
-    # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
-    # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
-    # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
-    # As in _moe_sorting_impl, a caller buffer can stand in.
-    if (expert_mask is not None) or accumulate:
-        moe_buf = (
-            output
-            if output is not None
-            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        )
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-
-    ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
-    if herd_topk:
-        from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_herd
-
-        kept_ids, kept_weights = flydsl_moe_sorting_herd(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            num_experts,
-            int(block_size),
-            herd_routed_scaling_factor,
-        )
-        return (*ret, kept_ids, kept_weights)
-    flydsl_moe_sorting_fwd(
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts,
-        int(block_size),
-        expert_mask,
-        num_local_tokens,
-    )
-    return ret
-
-
-def moe_sorting(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size=BLOCK_SIZE_M,
-    expert_mask=None,
-    num_local_tokens=None,
-    dispatch_policy=0,
-    return_local_topk_ids=False,
-    accumulate=True,
-    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
-    output_aux=False,
-    output=None,
-):
-    asm_mode = AsmMoeMode(flat)
-    if (
-        not _USE_CK_MOE_SORTING
-        and _USE_FLYDSL_MOE_SORTING
-        and not return_local_topk_ids
-        and asm_mode.requires_host_sort
-        and not output_aux
-        and dispatch_policy == 0
-    ):
-        return _flydsl_moe_sorting(
-            topk_ids,
-            topk_weights,
-            num_experts,
-            model_dim,
-            moebuf_dtype,
-            block_size,
-            expert_mask,
-            num_local_tokens,
-            accumulate=accumulate,
-            output=output,
-        )
-    # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
-    # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
-    if not asm_mode.requires_host_sort:
-        assert output is None, "FLAT over-allocates moe_buf; the caller copies"
-        return _moe_prepare_unsorted_input(
-            topk_ids,
-            topk_weights,
-            model_dim,
-            moebuf_dtype,
-            num_local_tokens,
-        )
-    try:
-        return _moe_sorting_impl(
-            topk_ids,
-            topk_weights,
-            num_experts,
-            model_dim,
-            moebuf_dtype,
-            block_size,
-            expert_mask,
-            num_local_tokens,
-            dispatch_policy,
-            use_opus=not _USE_CK_MOE_SORTING,
-            return_local_topk_ids=return_local_topk_ids,
-            accumulate=accumulate,
-            output_aux=output_aux,
-            output=output,
-        )
-    except Exception as e:
-        logger.error(f"Error in moe_sorting: {e}")
-        max_num_tokens_padded = int(
-            topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
-        )
-        topk = topk_ids.shape[1]
-        logger.error(
-            f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
-        )
-        raise
 
 
 def get_topk_valid_mask(
@@ -1141,6 +699,12 @@ def fused_moe(
     """
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
+    # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+    # Please do not modify this code without coordinating with the moev2 owners
+    # (@qli88). See aiter/moev2/README.md.
+    # Entry "api": an enabled path may run this call on aiter.moev2.
+    # aiter.moev2.api.op_call copies how this function calls fused_moe_; mirror
+    # changes to those arguments there.
     if not torch.compiler.is_compiling() and moev2_paths.any_active():
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "api")
@@ -1612,6 +1176,11 @@ def fused_moe_(
     ends, so a call that a provider serves leaves none behind. A provider may
     ignore it. A caller of this layer directly gets no such clean-up.
     """
+    # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+    # Please do not modify this code without coordinating with the moev2 owners
+    # (@qli88). See aiter/moev2/README.md.
+    # Entry "op": an enabled path may run this call on aiter.moev2 instead of
+    # _fused_moe_impl; DECLINED hands it back.
     if moev2_paths.any_active():
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "op")
@@ -1671,6 +1240,11 @@ def fused_moe_(
     )
 
 
+# NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic: the
+# validation and derived values, the get_2stage_cfgs key and the launches, in
+# aiter/moev2/execute/executor.py (prologue, run_two_stage, run_whole_graph) and
+# aiter/moev2/api.py (dispatch_key). Mirror changes there or coordinate with the moev2
+# owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -2237,6 +1811,10 @@ def _fused_moe_impl(
             w2_global_scale=w2_global_scale,
         )
         full_call = functools.partial(metadata.full_impl, request)
+        # NOTE: aiter.moev2 is under active development (MoE v2 migration, not
+        # graduated). Please do not modify this code without coordinating with the moev2
+        # owners (@qli88). See aiter/moev2/README.md.
+        # The parity harness (tests/moe_dispatch) compares this launch with v2's.
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("whole_graph", full_call))
         full_output = full_call()
@@ -2317,7 +1895,7 @@ def _fused_moe_impl(
             moe_buf,
             topk_ids,
             topk_weight,
-        ) = _flydsl_moe_sorting(
+        ) = moev2_sort._flydsl_moe_sorting(
             herd_candidate_ids,
             herd_candidate_weights,
             global_E,
@@ -3433,10 +3011,6 @@ def _flydsl_stage2_wrapper(
     )
 
 
-def _empty_bf16(device):
-    return torch.empty((0,), dtype=dtypes.bf16, device=device)
-
-
 def _empty_u8(device):
     return torch.empty((0,), dtype=torch.uint8, device=device)
 
@@ -4485,10 +4059,10 @@ def _mxmoe_opus_call_unsupported(
                 "MXFP8 activation scales must be contiguous and on the input device"
             )
     M, topk = topk_ids.shape
-    generated_sort = not _aux_uses_opus(
+    generated_sort = not moev2_sort._aux_uses_opus(
         metadata.output_aux, metadata.block_m, M * topk, w1.shape[0]
-    ) and _MOE_SORT_BACKEND not in ("opus", "ck")
-    if generated_sort and not _mxfp4_aux_instance_supported(
+    ) and moev2_sort._MOE_SORT_BACKEND not in ("opus", "ck")
+    if generated_sort and not moev2_sort._mxfp4_aux_instance_supported(
         w1.shape[0],
         topk,
         w2.shape[1],
@@ -4886,6 +4460,11 @@ def _can_reroute_bf16_to_a16wmix(
     return _swiglu_limit_is_active(swiglu_limit)
 
 
+# NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic for
+# the kernel families its paths cover (per-tensor fp8 today): the tuned lookup, row
+# checks and log lines in aiter/moev2/dispatch/resolver.py, each default branch in
+# aiter/moev2/dispatch/ranking.py. Mirror changes there or coordinate with the moev2
+# owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -4997,6 +4576,10 @@ def get_2stage_cfgs(
             ["shared_expert_id", "hidden_pad", "intermediate_pad", "gate_mode"]
         )
 
+    # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+    # Please do not modify this code without coordinating with the moev2 owners
+    # (@qli88). See aiter/moev2/README.md.
+    # Tuned tables are read by aiter.moev2.dispatch.tuned, shared with aiter.moev2.
     def get_cfg_2stages(tune_file, tag=None):
         return moev2_tuned.read_table(
             tune_file, _INDEX_COLS, config_file is not None, tag
@@ -6425,6 +6008,11 @@ def get_2stage_cfgs(
     )
 
 
+# NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+# Please do not modify this code without coordinating with the moev2 owners
+# (@qli88). See aiter/moev2/README.md.
+# aiter.moev2 reads the same default tuned table (share_default_table) and caches the
+# same decisions, so get_2stage_cfgs.cache_clear clears both.
 def _default_cfg_2stages():
     global cfg_2stages
     if cfg_2stages is None:
@@ -6449,6 +6037,10 @@ def _clear_dispatch_caches():
 get_2stage_cfgs.cache_clear = _clear_dispatch_caches
 
 
+# NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic in
+# aiter/moev2/execute/executor.py (run_two_stage). Mirror changes there or coordinate
+# with the moev2 owners (@qli88), then run the tests/moe_dispatch checks in
+# aiter/moev2/README.md.
 def fused_moe_2stages(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K

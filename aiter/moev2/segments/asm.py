@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ASM stage-1 kernels (`_ZN5aiter...fmoe_stage1...E`)."""
+"""ASM stage-1 kernels (`_ZN5aiter...fmoe_stage1...E`).
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+`asm_stage1` moved here from aiter/fused_moe.py and is shared with the legacy MoE path
+(re-exported from aiter.fused_moe, run by legacy MoE calls): changes to it must keep
+legacy behavior (`python tests/moe_dispatch/snapshot.py --check`). Please coordinate any
+change in this module with the moev2 owners (@qli88). See aiter/moev2/README.md.
+"""
 
 import functools
 

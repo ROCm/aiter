@@ -6,6 +6,10 @@ A problem is hashable and cheap: it holds formats, shapes and flags, never tenso
 tuning knobs. `MoeProblem.from_legacy_key` builds one from the arguments of the legacy
 `get_2stage_cfgs`, and `legacy_key` gives them back, so v2 dispatch can be compared key
 by key with the legacy code and can reproduce its log lines.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 from collections.abc import Iterator, Mapping

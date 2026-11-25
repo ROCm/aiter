@@ -10,6 +10,13 @@ For every `get_2stage_cfgs` key of the snapshot, on every simulated arch:
   tables (or both None), and an equal row from v2's own read of the table.
 
     python tests/moe_dispatch/key_checks.py --check [--arch gfx950]
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import argparse

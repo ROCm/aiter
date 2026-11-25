@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Default kernel parameters used when no tuned row applies."""
+"""Default kernel parameters used when no tuned row applies.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+This module moved here from aiter/fused_moe.py and is shared with the legacy MoE path:
+aiter.fused_moe re-exports it and legacy MoE calls run it. Changes must keep legacy
+behavior (`python tests/moe_dispatch/snapshot.py --check`) and should loop in the moev2
+owners (@qli88). See aiter/moev2/README.md.
+"""
 
 import functools
 import os

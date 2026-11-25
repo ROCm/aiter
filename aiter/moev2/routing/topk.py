@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Top-k routing: softmax over router logits, then top-k experts per token."""
+"""Top-k routing: softmax over router logits, then top-k experts per token.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+This module moved here from aiter/fused_moe.py, which re-exports it for its callers
+(`from aiter.fused_moe import fused_topk`). Changes must keep the behavior those callers
+see and should loop in the moev2 owners (@qli88). See aiter/moev2/README.md.
+"""
 
 import torch
 

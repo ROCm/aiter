@@ -14,6 +14,18 @@ Re-freeze the inputs when new kinds of tuned rows should be covered, in a PR of 
 
 One gzip-compressed JSON-lines file per simulated arch, sorted by key. A call variant
 whose result equals the `base` variant is stored as "=base".
+
+Reviewing a change: uncompressed the files are 7-9 MB per arch (26-33k lines, ~33 MB
+in all), more than GitHub shows as a diff, so the files stay compressed and the review
+reads the key-level diff this script prints: `--check` against the golden files,
+`--update` against the files it replaces, every changed, new and missing key with the
+golden and the new record. A PR that changes dispatch pastes the `--update` output into
+its description. `git diff` shows the files decompressed (`.gitattributes` marks them
+`diff=gzip`) once `git config diff.gzip.textconv "gzip -dc"` is set. On a merge
+conflict, take either side and rerun `--update`.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
 """
 
 import argparse
@@ -124,6 +136,15 @@ def golden_path(arch, directory=GOLDEN_DIR):
     return pathlib.Path(directory) / f"{arch}.jsonl.gz"
 
 
+def _write_gz(path, data):
+    # No file name or mtime in the gzip header, so the bytes depend on `data` only and
+    # not on the path written through.
+    with open(path, "wb") as raw, gzip.GzipFile(
+        filename="", fileobj=raw, mode="wb", mtime=0
+    ) as f:
+        f.write(data)
+
+
 def write(arch, records, directory=GOLDEN_DIR):
     path = golden_path(arch, directory)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,8 +154,7 @@ def write(arch, records, directory=GOLDEN_DIR):
         text.write(
             json.dumps({"key": label, "rec": records[label]}, sort_keys=True) + "\n"
         )
-    with open(path, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:
-        f.write(text.getvalue().encode())
+    _write_gz(path, text.getvalue().encode())
     return path
 
 
@@ -149,22 +169,27 @@ def read(arch, directory=GOLDEN_DIR):
         return {(line := json.loads(raw))["key"]: line["rec"] for raw in f}
 
 
-def diff(expected, actual, limit=40):
-    """Human-readable differences; empty list when identical."""
+def diff(expected, actual):
+    """Human-readable differences, every key; empty list when identical."""
     lines = []
+    counts = {"changed": 0, "new": 0, "missing": 0}
     for label in sorted(set(expected) | set(actual)):
         if label not in actual:
+            counts["missing"] += 1
             lines.append(f"- missing: {label}")
+            lines.append(f"    golden: {json.dumps(expected[label], sort_keys=True)}")
         elif label not in expected:
+            counts["new"] += 1
             lines.append(
                 f"+ new:     {label}  {json.dumps(actual[label], sort_keys=True)}"
             )
         elif expected[label] != actual[label]:
+            counts["changed"] += 1
             lines.append(f"~ changed: {label}")
             lines.append(f"    golden: {json.dumps(expected[label], sort_keys=True)}")
             lines.append(f"    now:    {json.dumps(actual[label], sort_keys=True)}")
-    if len(lines) > limit:
-        lines = lines[:limit] + [f"... {len(lines) - limit} more lines"]
+    if lines:
+        lines.insert(0, ", ".join(f"{n} {kind}" for kind, n in counts.items()))
     return lines
 
 
@@ -180,10 +205,7 @@ def refresh_inputs():
     for env_name, file_name in FROZEN_TABLES.items():
         data = pathlib.Path(sources[env_name]).read_bytes()
         target = INPUTS_DIR / f"{file_name}.gz"
-        with open(target, "wb") as raw, gzip.GzipFile(
-            fileobj=raw, mode="wb", mtime=0
-        ) as f:
-            f.write(data)
+        _write_gz(target, data)
         print(f"{env_name}: {sources[env_name]} -> {target}")
 
 
@@ -213,15 +235,25 @@ def main(argv=None):
         records = generate(arch)
         if args.check:
             lines = diff(read(arch), records)
-            status = "identical" if not lines else "DIFFERENT"
+            status = f"DIFFERENT: {lines[0]}" if lines else "identical"
             print(f"{arch}: {len(records)} keys, {status}")
-            for line in lines:
+            for line in lines[1:]:
                 print("  " + line)
             failed |= bool(lines)
         else:
             directory = args.out or GOLDEN_DIR
+            previous, status = None, "new file"
+            if golden_path(arch, directory).exists():
+                try:
+                    previous, status = read(arch, directory), "unchanged"
+                except (ValueError, KeyError, TypeError, OSError, EOFError) as error:
+                    status = f"replaced an unreadable file ({error})"
             path = write(arch, records, directory)
-            print(f"{arch}: {len(records)} keys -> {path}")
+            lines = diff(previous, records) if previous is not None else []
+            status = lines[0] if lines else status
+            print(f"{arch}: {len(records)} keys -> {path}, {status}")
+            for line in lines[1:]:
+                print("  " + line)
     return 1 if failed else 0
 
 

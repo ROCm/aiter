@@ -16,6 +16,10 @@ structure is feasible, and that every region is reached.
 
 Each entry is a branch of the legacy `get_2stage_cfgs` default path, translated 1:1 with
 its full condition.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 import itertools

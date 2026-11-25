@@ -4,6 +4,10 @@
 
 Values are read once and cached, because they are consulted on every MoE call (including
 during graph capture). Tests that change them call `reload()`.
+
+NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
+Please do not modify this code without coordinating with the moev2 owners (@qli88). See
+aiter/moev2/README.md.
 """
 
 import functools

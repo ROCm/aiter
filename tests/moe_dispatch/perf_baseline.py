@@ -13,6 +13,13 @@ Each case runs `op_tests/test_moe_2stage.py` in a subprocess (one per quant and 
 so an OOM or a crash only loses that case) and reads its result table, so inputs, weight
 layouts and timing are exactly those of the existing accuracy suite. Run on an idle GPU:
 the numbers are compared across runs, and contention makes them meaningless.
+
+NOTE: part of the aiter.moev2 migration (under active development, not graduated).
+Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
+
+Golden snapshots: after an intended change to legacy MoE dispatch, run
+`python tests/moe_dispatch/snapshot.py --update` and paste the changes it prints into
+the PR.
 """
 
 import argparse
