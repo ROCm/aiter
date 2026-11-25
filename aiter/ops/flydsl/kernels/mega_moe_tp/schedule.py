@@ -211,10 +211,12 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(not ar and not MLL):
             ag_wait_meta(a, tid, a["epoch"])
             cbar(L, tid)  # (wave 0 polled the routing flags)
+        # (the first launch: the XCD's stale L2 lines dropped before any cached read of the
+        # routing -- route_regs reads it with aux 0)
+        _stale_dropped(tid, a)
         if const_expr(not lb):
             # the dynamic schedule's routes in registers (MLL: the meta wait)
             a["rregs"] = route_regs(tid, a)
-        _stale_dropped(tid, a)
         if const_expr(ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)

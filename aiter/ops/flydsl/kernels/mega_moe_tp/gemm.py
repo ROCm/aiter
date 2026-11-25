@@ -92,9 +92,6 @@ def build_gemm(kc: KernelCtx) -> dict:
     (TMAX_,) = kc.get("TMAX")
     # (small-M GEMM1) the k-step pair's scale dwords loaded once (with the even step)
     SDD = kc.SM
-    # (experiment) GEMM1 B prefetch into L2, BPF k-steps ahead of the ring (0: off)
-    BPF = kc.BPF
-    (L_BPF,) = kc.get("L_BPF")
     # (HB) half block: 64 columns of GEMM1, wave w: columns 32 (w % 2), K half w // 2
     KH = KS1 // 2
     NCH, NCK, NSC_BLK, RG, SI_STRIDE = kc.get("NCH NCK NSC_BLK RG SI_STRIDE")
@@ -231,16 +228,6 @@ def build_gemm(kc: KernelCtx) -> dict:
         su0 = uni((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
         return lane, w, rw, rws, (vg0, vg1, vu0, vu1), vsl, sg0, su0
 
-    def _bpf_voff(lane, vs):
-        """(BPF) lane's 64 B of the four 1 KB B regions of a k-step: region lane // 16"""
-        t = lane // i32(16)
-        base = [v - lane * i32(16) for v in vs]
-        b = (t == i32(0)).select(
-            base[0],
-            (t == i32(1)).select(base[1], (t == i32(2)).select(base[2], base[3])),
-        )
-        return b + (lane % i32(16)) * i32(64)
-
     def _g1_so(pas, kk, W8=False):
         if W8:
             return pas * i32(128 * H) + kk * i32(2048)
@@ -358,11 +345,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         NSKW = nsk // 2 if W8 else nsk
         SLOTW = 2 * SLOT if W8 else SLOT
         OPSW = OPS + 4 if W8 else OPS
-        BPFW = 0 if W8 else BPF
-        BPFOW = 1 if BPFW > 0 else 0
         BSO = 8192 if W8 else 4096  # the scale words' offset in a slot
-        if const_expr(BPFW > 0):
-            bpf_dst, bpf_v = L + i32(L_BPF) + w * i32(256), _bpf_voff(lane, vs)
         IL = NSKW * (P * KCS) // math.gcd(NSKW, P * KCS)
         assert KS1 * P % IL == 0
         if const_expr(kr is None):
@@ -391,20 +374,12 @@ def build_gemm(kc: KernelCtx) -> dict:
                 sso = _g1_sso(pas, kk)
                 dma4(slot + i32(BSO), rws, vsl, sg0 + sso)
                 dma4(slot + i32(BSO + 256), rws, vsl, su0 + sso)
-            if const_expr(BPFW > 0):
-                # (into L2 BPF k-steps ahead of the ring: its loads then hit)
-                gp = fx.min(g + i32(BPF), total - i32(1))
-                grp = gp // GS
-                r = gp - grp * GS
-                kp = r // i32(P)
-                pp = grp * i32(P) + (r - kp * i32(P))
-                dma4(bpf_dst, rw, bpf_v, _g1_so(pp, kp + k0))
 
         def ops_newer(s_):
             # VMEM ops issued after step s_'s (the NSKW - 1 later slots)
             if not sdd:
-                return (NSKW - 1) * (OPSW + BPFOW)
-            return sum(OPSW + BPFOW - 2 * ((s_ + j) % 2) for j in range(1, NSKW))
+                return (NSKW - 1) * OPSW
+            return sum(OPSW - 2 * ((s_ + j) % 2) for j in range(1, NSKW))
 
         for kk in range_constexpr(NSKW):
             issue_b(i32(kk), kk, kk % 2 == 1)
@@ -465,11 +440,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         NSKW = nsk // 2 if W8 else nsk
         SLOTW = 2 * SLOT if W8 else SLOT
         OPSW = OPS + 4 if W8 else OPS
-        BPFW = 0 if W8 else BPF
-        BPFOW = 1 if BPFW > 0 else 0
         BSO = 8192 if W8 else 4096
-        if const_expr(BPFW > 0):
-            bpf_dst, bpf_v = L + i32(L_BPF) + w * i32(256), _bpf_voff(lane, vs)
         kh = w // i32(2)
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         IL = NSKW * KCS // math.gcd(NSKW, KCS)
@@ -485,14 +456,11 @@ def build_gemm(kc: KernelCtx) -> dict:
                 sso = _g1_sso(i32(0), kk)
                 dma4(slot + i32(BSO), rws, vsl, sg0 + sso)
                 dma4(slot + i32(BSO + 256), rws, vsl, su0 + sso)
-            if const_expr(BPFW > 0):
-                kp = fx.min(g + i32(BPFW), i32(KH - 1)) + k0
-                dma4(bpf_dst, rw, bpf_v, _g1_so(i32(0), kp))
 
         def ops_newer(s_):
             if not SDD:
-                return (NSKW - 1) * (OPSW + BPFOW)
-            return sum(OPSW + BPFOW - 2 * ((s_ + j) % 2) for j in range(1, NSKW))
+                return (NSKW - 1) * OPSW
+            return sum(OPSW - 2 * ((s_ + j) % 2) for j in range(1, NSKW))
 
         for kk in range_constexpr(NSKW):
             issue_b(i32(kk), kk, kk % 2 == 1)

@@ -345,7 +345,7 @@ class MegaMoeTPBigM:
 
     def clear_errors(self) -> None:
         # (the watchdog word only: the words after it persist across launches, e.g. the
-        # YDS / YDB launch number at C_ERR + 20 -- every rank's must stay in step)
+        # YDS launch number at C_ERR + 20 -- every rank's must stay in step)
         self.ctrl[C_ERR].zero_()
 
     def error_flag(self):
@@ -369,6 +369,9 @@ class MegaMoeTPBigM:
         )
         self.sd.consumed[self._cpar].copy_(got)
         self.ctrl.zero_()
+        # (ctrl holds the YDS launch count too: it restarts, so the y gather's flags of the
+        # earlier launches -- the "qs" region, compared with that count -- must go as well)
+        self.sd.view("qs", (self.Tmax,), torch.int32).zero_()
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.sd.group)
 
@@ -420,6 +423,15 @@ class MegaMoeTPBigM:
                 w = [int(x) for x in tu["chunks"].split(",")]
                 opts = (kv.split("=", 1) for kv in tu.get("opts", "").split(";") if kv)
                 o = {**dict(opts), **o}
+                # (the options the host sized / picked its buffers by -- the reduce-scatter
+                # row format, the y gather's format and destination -- are the host's alone:
+                # a tuned row cannot switch them under it)
+                host = dict(self.opts)
+                for k in ("AITER_BIGM_EB", "AITER_BIGM_YG8", "AITER_BIGM_YDC"):
+                    if k in host:
+                        o[k] = host[k]
+                    else:
+                        o.pop(k, None)
             else:
                 w = [1, 1] if T <= 16384 else [1, 2, 2, 1]
             if not 0 < len(w) <= CMAX or min(w) <= 0:

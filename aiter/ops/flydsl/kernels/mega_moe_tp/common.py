@@ -13,7 +13,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -483,7 +483,7 @@ def tuned_rows(path: str, key: dict, tokens_col: str) -> dict:
     return {
         int(r[tokens_col]): r
         for r in _read(path, mtime)
-        if all(r.get(k) == v for k, v in want.items())
+        if all((r.get(k) or "") == v for k, v in want.items())
     }
 
 
@@ -507,3 +507,30 @@ def device_key(device=None) -> dict:
 
     props = torch.cuda.get_device_properties(device or torch.cuda.current_device())
     return {"gfx": get_gfx(), "cu_num": int(props.multi_processor_count)}
+
+
+# (debug) AITER_MEGAMOE_TP_TRACE_PTR: the address of a device int32 [grid, TRACE_SLOTS]
+# buffer (0: off, nothing compiled in); the small-engine kernel stores the low 32 bits of
+# s_memrealtime (100 MHz) at its phase points. The kernel name carries "_trace".
+TRACE_SLOTS = 32
+
+
+def trace_ptr() -> int:
+    return int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+
+
+def make_trace(who: int = 0):
+    """tr(tid, slot, who=who): thread who of every CTA stores now() into its trace slot"""
+    ptr = trace_ptr()
+
+    @flyc.jit
+    def _tr(tid, slot, w):
+        if tid == i32(w):
+            i = i32(gpu.block_id("x")) * i32(TRACE_SLOTS) + i32(slot)
+            g_st_sys(fx.Int64(ptr) + fx.Int64(i * i32(4)), fx.Int32(now()))
+
+    def tr(tid, slot, w=who):
+        if ptr:
+            _tr(tid, slot, w)
+
+    return tr

@@ -25,7 +25,6 @@ bytes per CTA even:
 from __future__ import annotations
 
 import math
-import os
 import types
 
 import flydsl.compiler as flyc
@@ -33,6 +32,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
 from .common import (
+    make_trace,
     ACQ,
     AUX_SYS,
     REL,
@@ -40,12 +40,10 @@ from .common import (
     bld,
     bst,
     g_add_agent,
-    g_st_sys,
     i32,
     lds_ld_i32,
     lds_st,
     lds_st_rel,
-    now,
     rsrc,
     spin0,
     spin_lds_ge,
@@ -65,6 +63,7 @@ from .mega_moe_tp_config import (
     NCHLB_MAX,
     NCTA_MAX,
     NW,
+    SM_MT_MAX,
     UL_MAX,
     KernelCtx,
     _nsk2_for,
@@ -97,6 +96,8 @@ def build_smallm(kc: KernelCtx) -> dict:
     RAW, raw_flags = kc.get("RAW raw_flags")
 
     KS1, MT, TMAX, _g1_out, nsk = kc.get("KS1 MT TMAX _g1_out nsk")
+    # (the split-K partial slots after xg's export area: SM_PART_BYTES)
+    assert MT <= SM_MT_MAX, f"small-M: row tile {MT} > {SM_MT_MAX}"
     (HB,) = kc.get("HB")
     # half blocks after a full round while r <= C / HBF
     HBF = 3
@@ -106,16 +107,8 @@ def build_smallm(kc: KernelCtx) -> dict:
     # (a16: no half blocks, the LDS) one round of more than C / 2 blocks: the first C - r
     # blocks in 2 K pieces on the first 2 (C - r) CTAs instead of halves (split-K partials)
     KP = kc.a16 and not HB and 2 in SKS
-    # split-K launches: G2 inter pieces per share (NKS = KS2 / QF k-steps a whole number of
-    # GEMM2 iterations per share of GPC groups)
-    QF = 1
-    for q_ in (2, 3, 6):
-        if KS2 % q_ == 0:
-            n2 = KS2 // q_
-            s2 = _nsk2_for(n2, GPC, nsk)
-            if GPC % (s2 * n2 // math.gcd(s2, n2) // n2) == 0:
-                QF = q_
-                break
+    # split-K launches: G2 inter pieces per share (kernel_config SMQF)
+    (QF,) = kc.get("SMQF")
     # the partial slots after the export area of xg (MegaMoeTPEngine.xg)
     XIB, SIB = kc.get("XIB SIB")
     XG_PART = TMAX * TOPK * (XIB + SIB + 8)
@@ -129,18 +122,8 @@ def build_smallm(kc: KernelCtx) -> dict:
     # the rest run in single groups (GPC per share)
     RGU = GPC
 
-    # (debug) the kernel trace's small-M slots (mega_moe_tp_kernel: AITER_MEGAMOE_TP_TRACE_PTR)
-    TRACE = int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
-
-    def tr(tid, slot):
-        if TRACE:
-            _tr(tid, slot)
-
-    @flyc.jit
-    def _tr(tid, slot):
-        if tid == i32(0):
-            i = i32(gpu.block_id("x")) * i32(32) + i32(slot)
-            g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
+    # (debug) the phase trace's small-M slots (common.make_trace)
+    tr = make_trace()
 
     def _rot(L, j):
         """the plan's chunk order starts at the last expert's chunks when it has several

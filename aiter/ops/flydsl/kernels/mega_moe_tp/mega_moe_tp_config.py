@@ -98,7 +98,8 @@ ALOAD_DEPTH = 3
 POLL_SLEEP = 4
 # small-M split-K GEMM1 partial sums (fp32, the MFMA register layout) after the export area
 # of xg: one slot of NW waves x 4 * MT accumulators x 64 lanes x 16 B per unit, MT <= 3
-SM_PART_BYTES = NCTA_MAX * NW * 4 * 3 * 1024
+SM_MT_MAX = 3
+SM_PART_BYTES = NCTA_MAX * NW * 4 * SM_MT_MAX * 1024
 
 
 def _src_key(*fnames: str) -> str:
@@ -170,7 +171,6 @@ def mega_moe_tp_consts(
     rl: int = 0,
     a16: bool = False,
     nsk: int = NSK,
-    bpf: int = 0,
     xd: bool = False,
 ) -> dict:
     """hb: the A chunk buffers hold two chunks (small-M half blocks: the K halves of a
@@ -268,7 +268,6 @@ def mega_moe_tp_consts(
     c["L_ROFF"] = take(dyn_e * 4) if rl else 0
     c["L_RLI"] = take(rl * 4) if rl else 0
     c["L_RLW"] = take(rl * 4) if rl else 0
-    c["L_BPF"] = take(NW * 256) if bpf else 0
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     assert H // 256 <= NCHA_MAX
     assert KS1 % nsk == 0 and nsk % KCS == 0
@@ -281,7 +280,8 @@ def mega_moe_tp_consts(
 # LDS control slots (ints at L_CTL); NW-wide ones: C_DONE, C_ASEQ, C_AFREE, C_QBASE (one
 # per compute wave), C_MBOX (one per wave), C_UNIT (6: unit range + first record), C_CLAIM.
 # C_GEXP: routes key (expert + 1, plus the row chunk) held by L_RIX / L_WT / C_CNT.
-C_CNT, C_BARCNT, C_BARGEN, C_LRED, C_PULL, C_EPOCH, C_USEQ, C_UROWS = range(8)
+# (slot 2 unused)
+C_CNT, C_BARCNT, _, C_LRED, C_PULL, C_EPOCH, C_USEQ, C_UROWS = range(8)
 C_NSIG, C_LQ, C_LPUB, C_GEXP, C_DONE = range(8, 13)
 C_ASEQ, C_AFREE, C_QBASE, C_MBOX = 16, 20, 24, 28
 C_FBITS, C_YAGM, C_NCH, C_AGFREE, C_PLAN, C_NACT = 36, 39, 40, 41, 42, 43
@@ -364,8 +364,6 @@ def kernel_config(
     nsk = nsk or NSK  # the B ring's k-steps per wave
     # (small-M a16) GEMM1's intermediate straight to xg (mega_moe_tp_consts xd)
     XD = bool(sm and a16 and xd)
-    # (experiment) GEMM1 B prefetch distance (k-steps, into L2)
-    BPF = int(os.environ.get("AITER_MEGAMOE_TP_BPF", "0")) if sm else 0
     # small-M half blocks (smallm.py): 64-column GEMM1 blocks, the K halves on the two wave
     # pairs (both A chunks in one buffer), when the LDS takes the second A chunk
     HB = (
@@ -380,11 +378,11 @@ def kernel_config(
     RL = min(TMAX, DYN_MAX) * TOPK if sm and not lb else 0
     if HB:
         c_ = mega_moe_tp_consts(
-            H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL, a16, nsk, BPF, XD
+            H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL, a16, nsk, XD
         )
         HB = c_["LDS_BYTES"] <= 160 * 1024 and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
     c = mega_moe_tp_consts(
-        H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL, a16, nsk, BPF, XD
+        H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL, a16, nsk, XD
     )
     ABS, ASS = c["ABS"], c["ASS"]
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
@@ -400,7 +398,6 @@ def kernel_config(
     L_DCNT, L_DCH = c["L_DCNT"], c["L_DCH"]
     L_EOFF, L_DPRE = c["L_EOFF"], c["L_DPRE"]
     L_ROFF, L_RLI, L_RLW = c["L_ROFF"], c["L_RLI"], c["L_RLW"]
-    L_BPF = c["L_BPF"]
     L_WSUM = L_DCH + nch * 4
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
@@ -490,19 +487,9 @@ def kernel_config(
         + ("_hb" if HB else "")
         + ("_ar2" if ar and ar2 else "")
         + (f"_nsk{nsk}" if nsk != NSK else "")
-        + (f"_bpf{BPF}" if BPF else "")
         + ("_xd" if XD else "")
         + ("_alq" if sm and ar and alq else "")
         + ("_sh8" if sh8 else "")
-        + (
-            "_llb"
-            if sm
-            and ar
-            and comm_bf16
-            and not ar2
-            and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
-            else ""
-        )
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
@@ -510,21 +497,18 @@ def kernel_config(
     # (small-M a16) the route rows bf16 (not two-term LL packets: half the bytes), each
     # (piece, route, column group) then an epoch flag (the lo plane's space of routes)
     # (small-M bf16 comm: always RAW, the bf16 rows the wire carries)
-    RAW = bool(
-        SM
-        and (comm_bf16 or (a16 and os.environ.get("AITER_MEGAMOE_TP_RAW", "1") == "1"))
-    )
-    # (RAW one-shot all-reduce, bf16 comm) the partials as bf16 LL packets (16 B: 4 bf16 in
-    # two words + the epoch twice, ll_pkt): the data is its own flag -- no store
-    # acknowledgement + separate flag per item (one xGMI round trip less). 4 B per value
-    # (2x the bf16 rows), in the recv region's two planes. Measured slower (n=1 +2 us, n=64
-    # +70 us: the bytes and the 16 polled packets per lane): opt-in, AITER_MEGAMOE_TP_LLB=1
-    LLB = bool(
-        RAW
-        and ARLL
-        and comm_bf16
-        and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
-    )
+    RAW = bool(SM and (comm_bf16 or a16))
+    # (small-M split-K launches) G2 inter pieces per share: NKS = KS2 / SMQF k-steps, a whole
+    # number of GEMM2 iterations per share of GPC groups (1: the whole inter dim). The live
+    # pieces of such a launch's route rows (the push polls their flags)
+    SMQF = 1
+    for q_ in (2, 3, 6):
+        if SM and KS2 % q_ == 0:
+            n2 = KS2 // q_
+            s2 = _nsk2_for(n2, GPC, nsk)
+            if GPC % (s2 * n2 // math.gcd(s2, n2) // n2) == 0:
+                SMQF = q_
+                break
     # the shared expert (the last one, E - 1) with MXFP8 weights (their own tensors: w1h /
     # w2h + e8m0 scales), the routed ones MXFP4: its GEMM1 / GEMM2 take the W8 loaders
     SH8 = bool(sh8)

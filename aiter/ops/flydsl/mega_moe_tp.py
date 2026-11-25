@@ -51,16 +51,43 @@ chunks per GEMM2 unit. Fields set explicitly take precedence; unset ones use the
 tuned configs (configs/mega_moe_tp_tuned.csv, ``AITER_CONFIG_MEGA_MOE_TP``; inside its tuned
 range), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
 
-Small-M (fp8 comm, fp4 activations, up to 256 global tokens): the small-M kernel
+Small-M (fp8 or bf16 comm, any activation format, up to 256 global tokens; the only small
+schedule of bf16 activations and of the MXFP8 shared expert): the small-M kernel
 (kernels/mega_moe_tp/smallm.py) splits GEMM1 (inter blocks, evenly over the CTAs, the
 intermediate exported) from GEMM2 (output column shares over the full inter dim: contiguous
 w2 rows, one partial row per route) and evens the bytes per CTA. Its per-batch launch
 configs (row tile, CTAs, ar two-shot all-reduce) come from configs/mega_moe_tp_sm_tuned.csv
 (``AITER_CONFIG_MEGA_MOE_TP_SM``); ar batches from 64 tokens all-reduce in two shots
-(reduce-scatter, then the owners' rows to every rank). AITER_MEGAMOE_TP_SMALLM=0 disables
-it, "all" runs it from 1 token; batches from an explicit lb_min on stay on the LB schedule.
-A fused-tail forward of a small-M batch the LB schedule takes runs it there (as before; its
-y then differs in rounding from the plain forward's).
+(reduce-scatter, then the owners' rows to every rank). Batches from an explicit lb_min on
+stay on the LB schedule. A fused-tail forward of a small-M batch the LB schedule takes runs
+it there (as before; its y then differs in rounding from the plain forward's).
+
+The MXFP8 shared expert (w1_shared ...): small-M up to 256 global tokens, the big-M kernel
+beyond (from 256 / tp + 1 local tokens, rows padded to 64; bigm_min_tokens above that is
+lowered to it); no fused tail on the small engine, no big-M path -> at most 256 global
+tokens. act_dtype "bf16" (a16w4) is small-M only (<= 256 global tokens); "auto" runs it
+below min(a16_max_tokens, 257) global tokens and a4w4 above.
+
+Environment switches (read when a layer is built / a kernel is compiled):
+  AITER_MEGAMOE_TP_SMALLM=0     fp4 / fp8 activations without a shared expert: the dynamic
+                                schedule instead of small-M (ignored by the formats only
+                                small-M runs)
+  AITER_MEGAMOE_TP_SM_BF16=0    the same, for bf16 comm only
+  AITER_MEGAMOE_TP_ALQ=0|1      (ar small-M) every rank quantizes all rows itself
+  AITER_MEGAMOE_TP_CHECK=1      host checks of the collective contract + errors per forward
+  AITER_CONFIG_MEGA_MOE_TP[_SM|_BIGM]  tuned tables (aiter.jit.core AITER_CONFIGS: read once
+                                per process, "a.csv:b.csv" merges)
+  AITER_BIGM_YDC=0              (ar big-M, bf16 y rows) copy the gathered rows to out after
+                                the launch instead of inside the kernel
+  AITER_BIGM_YQ                 (big-M tail) the q gather variant (default 2)
+  AITER_MEGAMOE_TP_TRACE_PTR / AITER_BIGM_TRACE_PTR  (debug) phase timestamps into a
+                                device buffer at this address
+The other AITER_BIGM_* names are the big-M tuned rows' options (the csv's opts column), not
+environment switches.
+
+comm_dtype / ar_gather on the small engine: "int8" runs as "fp8" there (only the big-M
+kernel has the int8 wire), and with bf16 comm ar_gather="fp8" applies to the two-shot
+all-reduce only (ar, from 64 tokens; fewer tokens all-reduce in one shot, bf16).
 """
 
 from __future__ import annotations
@@ -78,7 +105,7 @@ from .kernels.mega_moe_tp.mega_moe_tp import (
     MegaMoeTPEngine,
     MegaMoeTPLDSError,
 )
-from .kernels.mega_moe_tp.mega_moe_tp_config import PAD
+from .kernels.mega_moe_tp.mega_moe_tp_config import DYN_MAX, PAD, ZQ
 
 # MegaMoeTP.error_flag(): a big-M wait timed out (the small engine's bits are below it)
 ERR_BIGM = 32
@@ -147,9 +174,11 @@ class MegaMoeTPConfig:
     linear_beta: float | None = None
     swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
-    # "bf16" (default: lossless collectives), "fp8" / "int8" (quantized wire: the big-M path's
-    # int8 / int4 reduce-scatter and int8 y gather per its tuned rows)
-    comm_dtype: str = "bf16"
+    # "fp8" (default: quantized wire, what the tuned tables were measured with), "bf16"
+    # (lossless collectives: twice the wire bytes; ar_gather "auto" then stays bf16) or
+    # "int8" (the big-M path's int8 reduce-scatter and y gather per its tuned rows; the
+    # small engine has no int8 wire: its batches run "fp8")
+    comm_dtype: str = "fp8"
     ar_gather: str = "auto"
     schedule: str = "dynamic"
     # "fp4" (a4w4), "fp8", "bf16" (a16w4: two MXFP8 terms, the small-M schedule only), or
@@ -210,12 +239,13 @@ class MegaMoeTP:
         if bmin is not None and bmin < 0:
             raise ValueError(f"MegaMoeTP: bigm_min_tokens {bmin} < 0")
         # the shapes the big-M kernel takes: H % 256, < 1024 routed experts (+ the last one,
-        # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
+        # counted apart), ZQ * topk <= 64 (topk <= 16: one wave ballot per topk-sum item),
+        # inter % 128 (else the small engine)
         big_ok = (
             cfg.act_dtype in ("fp4", "auto")
             and cfg.model_dim % 256 == 0
             and 0 < cfg.experts - 1 < 1024
-            and cfg.topk - 1 <= 64
+            and ZQ * cfg.topk <= 64
             and cfg.inter_dim % 128 == 0
         )
         # local tokens from which forward runs the big-M kernel (0: never; set below for
@@ -226,6 +256,20 @@ class MegaMoeTP:
                 f"MegaMoeTP: bigm_min_tokens {bmin} < {PAD * cfg.world_size} (the big-M "
                 f"kernel runs at least {PAD} local rows)"
             )
+        # the MXFP8 shared expert: of the small engine's schedules only small-M runs it (up
+        # to DYN_MAX global tokens); the big-M kernel takes every batch beyond (its rows
+        # padded to PAD), whatever bigm_min_tokens above that says
+        sm_cap = DYN_MAX // cfg.world_size if shared is not None else 0
+        if sm_cap and cfg.max_local_tokens > sm_cap:
+            if big_ok and bmin != 0:
+                self.bigm_m = min(self.bigm_m or sm_cap + 1, sm_cap + 1)
+            elif not cfg.fit_max_local:
+                raise ValueError(
+                    f"MegaMoeTP: the MXFP8 shared expert without the big-M path "
+                    f"(bigm_min_tokens=0, or a shape it does not take) runs up to {sm_cap} "
+                    f"local tokens ({DYN_MAX} global, the small-M schedule): "
+                    f"max_local_tokens={cfg.max_local_tokens}"
+                )
         self._bigm = None
         self._bigm_args = {
             "w1": w1,
@@ -238,6 +282,8 @@ class MegaMoeTP:
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
+        if sm_cap:
+            small_max = min(small_max, sm_cap)
         # the small engine holds what it can, big-M takes the rest (an explicit
         # bigm_min_tokens above the small engine's capacity: lowered to it, below)
         fit = (big_ok and bmin != 0) or cfg.fit_max_local
@@ -290,7 +336,10 @@ class MegaMoeTP:
         self.engine16 = None
         self.a16_local = 0  # local token counts below this run engine16
         if cfg.act_dtype == "auto":
-            self.a16_local = -(-cfg.a16_max_tokens // cfg.world_size)
+            # (a16w4 is small-M only: at most DYN_MAX global tokens, whatever a16_max_tokens)
+            self.a16_local = min(
+                -(-cfg.a16_max_tokens // cfg.world_size), DYN_MAX // cfg.world_size + 1
+            )
             m16 = min(small_max, self.a16_local - 1)
             if m16 >= 1:
                 self.engine16 = MegaMoeTPEngine(
@@ -301,6 +350,18 @@ class MegaMoeTP:
                         "fit_max_local": True,
                     }
                 )
+                # (what it runs -- its capacity, small-M kernels that fit: the batches from
+                # the first it does not on run a4w4)
+                e16 = self.engine16
+                self.a16_local = min(
+                    self.a16_local,
+                    next(
+                        (m for m in range(1, e16.mmax + 1) if not e16.sm_ok(m)),
+                        e16.mmax + 1,
+                    ),
+                )
+            else:
+                self.a16_local = 0
 
     def _eng(self, local_tokens: int):
         """the small engine of this local token count (act_dtype "auto": a16w4 below

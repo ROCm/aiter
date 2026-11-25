@@ -25,6 +25,8 @@ from ..communication_ops_utils import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _e8m0_from_amax
 from .common import (
+    trace_ptr,
+    make_trace,
     AUX_SYS,
     MAX_TP,
     V4I,
@@ -183,7 +185,10 @@ def compile_mega_moe_tp(
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
     sm: (ll_rs, ll_route, not lb) the small-M schedule (smallm.py). ar2: (ar, LL route rows)
         the two-shot all-reduce (reduce-scatter, then the owners' y rows to every rank)
-        instead of the one-shot one.
+        instead of the one-shot one. nsk: the B ring's k-steps per wave (0: NSK); xd (a16):
+        GEMM1's intermediate straight to xg; alq (ar): every rank quantizes all rows itself
+        (no activation all-gather).
+    sh8: (sm) the last expert's weights are MXFP8 (the w1h / w1hs / w2h / w2hs arguments).
     """
     kc = kernel_config(**locals())
     kc.add(build_communication(kc))
@@ -211,22 +216,10 @@ def compile_mega_moe_tp(
     TN_IT = ceildiv(TN_V, NTT)
     (ag_ready_all,) = kc.get("ag_ready_all")
 
-    # (debug) AITER_MEGAMOE_TP_TRACE_PTR: a device int32 [grid, TRS] buffer; the kernel
-    # stores the low 32 bits of s_memrealtime (100 MHz) at its phase points (0: off)
-    TRACE = int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
-    TRS = 32
-    if TRACE:
+    # (debug) the phase trace (common.make_trace: AITER_MEGAMOE_TP_TRACE_PTR)
+    if trace_ptr():
         name = name + "_trace"
-
-    def tr(tid, slot, who=0):
-        if TRACE:
-            _tr(tid, slot, who)
-
-    @flyc.jit
-    def _tr(tid, slot, who):
-        if tid == i32(who):
-            i = i32(gpu.block_id("x")) * i32(TRS) + i32(slot)
-            g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
+    tr = make_trace()
 
     @flyc.jit
     def blk_red(L, tid, v, op, slot):
@@ -634,7 +627,7 @@ def compile_mega_moe_tp(
 #       -> SDMA gather (G); or the y gather of the ar mode)
 #   GW  wait every G; advance the persistent signal base
 #
-# Communication is MORI SDMA (puts with remote signals; the YDS / YDB y gather: shader stores
+# Communication is MORI SDMA (puts with remote signals; the YDS y gather: shader stores
 # + flags) issued and awaited inside the kernel; the GEMM1 -> GEMM2 intermediate stays in
 # LDS. CTAs (one per CU, 4 waves) claim items with a per-XCD atomic ticket in a fixed phase
 # order; an item only waits on items before it (and on peers' puts of earlier items), so
@@ -676,12 +669,12 @@ def compile_bigm_kernel(
     MoE output (y), and with tailq res_out = y + res_in, the next-layer norm + FP8 rows of every
     rank (q gather).
     """
-    assert H % 256 == 0 and 0 < E < 1024 and K <= 64
+    assert H % 256 == 0 and 0 < E < 1024, f"big-M: H {H} / {E} routed experts"
     assert act in ("swiglu", "silu", "situv2")
     assert not xl or tailq == 3
-    assert (
-        ZQ * (K + 1) <= 64
-    )  # (the topk sums' route validity: one wave ballot an item)
+    # (the topk sums' route validity: one wave ballot per item of ZQ rows; MegaMoeTP's
+    # big_ok keeps such shapes on the small engine)
+    assert ZQ * (K + 1) <= 64, f"big-M: topk {K + 1} > {64 // ZQ}"
     RG = UNIT_ROWS  # (one CTA of NW waves per CU)
     K1, NE = K + 1, E + 1
     HV = H // 8  # 16 B (8 bf16) columns of a row
@@ -746,15 +739,6 @@ def compile_bigm_kernel(
     # reduce item makes them (no SDMA puts per sub-block); a flag per (source rank, chunk,
     # sub-block) in the peer's qs region (unused with YG8), the launch count its value
     YDS = int(_opt("AITER_BIGM_YDS", "0")) and YG8
-    # (ar, bf16 y rows) YDS's scheme for the bf16 rows: every rank's y rows stored by the CUs
-    # into every peer's q rows as the reduce items make them, a flag per (source rank, chunk,
-    # sub-block); the GW item waits for the peers' flags. The y gather then rides xGMI by the
-    # CUs alongside the SDMA reduce-scatter instead of sharing the SDMA engines with it
-    YDB = (
-        int(_opt("AITER_BIGM_YDB", os.environ.get("AITER_BIGM_YDB", "0")))
-        if tailq == 3 and not YG8
-        else 0
-    )
     # (ar, bf16 y rows, the replicated batch) the YD items copy every rank's gathered y rows
     # (once landed) into yout, the caller's output: no copy after the launch (set by the host)
     YDC = int(_opt("AITER_BIGM_YDC", "0")) if tailq == 3 and not YG8 and xl else 0
@@ -774,7 +758,7 @@ def compile_bigm_kernel(
         PPC[QQ] = PPC[QS] = 0
     if tailq == 3:
         PPC[QS] = 0
-    if YDS or YDB:
+    if YDS:
         PPC[QQ] = 0
     # (ar) XL: the host passes the replicated batch (x / ids / tw of every rank's rows, rank
     # r's at r * m): every rank quantizes every row itself -- no input / routing gather, the
@@ -946,7 +930,6 @@ def compile_bigm_kernel(
         + ("_xl" if XL else "")
         + ("_yg8" if YG8 else "")
         + ("_yds" if YDS else "")
-        + ("_ydb" if YDB else "")
         + ("_ydc" if YDC else "")
         + ("_trace" if BTRACE else "")
         + ("_sh8" if sh8 else "")
@@ -1201,8 +1184,8 @@ def compile_bigm_kernel(
         def ca(i):
             return ctrl + fx.Int64(i * i32(4))
 
-        if const_expr(YDS or YDB):
-            # (YDS / YDB) this launch's number: the persistent count (read before any item; the GW
+        if const_expr(YDS):
+            # (YDS) this launch's number: the persistent count (read before any item; the GW
             # item stores it + 1 at the end) + 1
             a["yl"] = g_ld_sys(ca(i32(C_ERR + 20))) + i32(1)
 
@@ -2324,7 +2307,7 @@ def compile_bigm_kernel(
             # put to every peer
             tid, o, s, B, sb, i0, b, rv = rf_head(k, j)
             ryg = rsrc(wp("q"))
-            if const_expr(YDS or YDB):
+            if const_expr(YDS):
                 rpeer = [
                     rsrc(fx.Int64(bld(rpb, i32(p_ * 8), 0, T.i64)) + a["off_q"])
                     for p_ in range(tp)
@@ -2345,12 +2328,6 @@ def compile_bigm_kernel(
                         i8_row_store_multi(
                             f, rpeer, rank * m + o + i, col(tid, kk), tid % i32(64)
                         )
-                    elif const_expr(YDB):
-                        # every rank's q rows (this one's included: rpeer[rank] is ours)
-                        yv = pack_bf16x8(f)
-                        yo = (rank * m + o + i) * i32(H * 2) + col(tid, kk) * i32(16)
-                        for p_ in range_constexpr(tp):
-                            bst(yv, rpeer[p_], yo, 0, AUX_SYS)
                     elif const_expr(tailq == 3 and YG8):
                         i8_row_store(
                             f, ryg, rank * m + o + i, col(tid, kk), tid % i32(64)
@@ -2365,10 +2342,8 @@ def compile_bigm_kernel(
                         )
                     else:
                         bst(pack_bf16x8(f), r_yout, off, 0)
-            if const_expr(YDB):
-                wait_vm(0)  # (the item's peer stores landed before it counts as done)
             done_last(k, P_RF, cnt(P_RF, s))
-            if const_expr(YDS or YDB):
+            if const_expr(YDS):
                 if done_at(sbc(k, 1, b), sb // i32(ZQ)):  # noqa: SIM102
                     # every item of the sub-block stored (each item's stores waited): its
                     # flag to every peer, after a system release
@@ -2510,23 +2485,9 @@ def compile_bigm_kernel(
         def item_gw():
             for k in range_constexpr(C):
                 wait_ph(i32(k), P_RF, cnt(P_RF, chunk(i32(k))[1]))
-            if const_expr(tailq in (1, 3) and not (YDS or YDB)):
+            if const_expr(tailq in (1, 3) and not (YDS)):
                 wait_puts(QY, NSB, i32(C - 1))
-            if const_expr(YDB):
-                # every peer's flag of every (chunk, sub-block): flag index (p * C + k) * NSB + b
-                want = yflag_v()
-                for f_ in range(tid, i32(tp * C * NSB), i32(NT)):
-                    fi = i32(f_)
-                    if fi // i32(C * NSB) != rank:
-                        fa = wp("qs") + fx.Int64(fi * i32(4))
-                        t0 = now()
-                        cur = g_ld_sys(fa)
-                        while (cur != want) & alive(t0):
-                            rocdl.s_sleep(2)
-                            cur = g_ld_sys(fa)
-                        if cur != want:
-                            g_st_sys(ca(i32(C_ERR)), i32(1))
-            if const_expr(YDS or YDB):  # noqa: SIM102 - preserve FlyDSL branches
+            if const_expr(YDS):  # noqa: SIM102 - preserve FlyDSL branches
                 if tid == i32(0):
                     g_st_sys(ca(i32(C_ERR + 20)), a["yl"])
             if const_expr(tailq == 1):

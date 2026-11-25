@@ -30,7 +30,11 @@ from aiter import dtypes
 from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
-from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
+from aiter.ops.flydsl.mega_moe_tp import (
+    MegaMoeTP,
+    MegaMoeTPConfig,
+    shuffle_weight_mega_fp8,
+)
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -157,6 +161,45 @@ def build_weights(shape: ModelShape, ctx: Ctx, seed: int) -> Weights:
     )
 
 
+def _quant_mxfp8(w):
+    """MXFP8 (e4m3 + an e8m0 scale per 32) of w [N, K] -> (q fp8 [N, K], scale e8m0 [N, K / 32])"""
+    N, K = w.shape
+    blk = w.float().view(N, K // 32, 32)
+    e = torch.ceil(torch.log2(blk.abs().amax(-1).clamp_min(1e-30) / 448.0)).clamp(
+        -127, 127
+    )
+    q = (blk / torch.exp2(e)[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q.view(N, K), (e + 127).to(torch.uint8).view(dtypes.fp8_e8m0)
+
+
+def build_shared(shape: ModelShape, wt: Weights, ctx: Ctx, seed: int) -> Weights:
+    """The shared expert (the last one) as MXFP8, this rank's inter slice: the layer's
+    tensors (shuffle_weight_mega_fp8 + e8m0_shuffle) and the torch reference's [1, ...]
+    """
+    H, inter = shape.model_dim, wt.inter
+    gen = torch.Generator(device=ctx.device).manual_seed(
+        seed + 31 + 1_000_000 * ctx.rank
+    )
+
+    def one(rows, cols, magnitude):
+        w = torch.randn((rows, cols), device=ctx.device, generator=gen) * magnitude
+        return _quant_mxfp8(w)
+
+    w1, w1s = one(2 * inter, H, H**-0.25)
+    w2, w2s = one(H, inter, inter**-0.25)
+    return Weights(
+        inter,
+        shuffle_weight_mega_fp8(w1),
+        fp4_utils.e8m0_shuffle(w1s),
+        shuffle_weight_mega_fp8(w2),
+        fp4_utils.e8m0_shuffle(w2s),
+        w1[None],
+        w1s,
+        w2[None],
+        w2s,
+    )
+
+
 def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
     E, K = shape.experts, shape.topk
     if kind == "balanced":
@@ -166,8 +209,9 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
         score.scatter_(1, ids.view(rows, K), 0.0)
         score += 1e-3 * torch.randn((rows, E), device=device, generator=gen)
     elif kind == "shared":
-        # the last expert in every token's topk (a shared expert fused as a routed one), the
-        # others random over the routed experts: its row chunks pile up
+        # the last expert in every token's topk, the others random over the routed experts:
+        # its row chunks pile up. (The routing only: the expert is MXFP4 like the others
+        # unless the layer is built with the MXFP8 shared expert's weights, case_shared)
         score = torch.randn((rows, E - 1), device=device, generator=gen)
         w, ids = torch.softmax(score, dim=-1).topk(K - 1, dim=-1)
         ids = torch.cat([ids, torch.full((rows, 1), E - 1, device=device)], 1)
@@ -187,10 +231,11 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
 
 
 @torch.no_grad()
-def torch_partial(shape, wt: Weights, x, w, ids):
+def torch_partial(shape, wt: Weights, x, w, ids, a16=False):
+    """a16: bf16 activations (a16w4) instead of MXFP4 ones"""
     beta = situ(shape) or (1.0, 1.0)
     quant = aiter.get_torch_quant(QUANT_TYPE)
-    a1, a1s = quant(x, quant_dtype=FP4)
+    a1, a1s = (x, None) if a16 else quant(x, quant_dtype=FP4)
     out1 = torch_moe_stage1(
         a1,
         wt.w1_ref,
@@ -208,9 +253,9 @@ def torch_partial(shape, wt: Weights, x, w, ids):
         situ_beta=beta[0],
         situ_linear_beta=beta[1],
     )
-    a2, a2s = quant(out1, quant_dtype=FP4)
+    a2, a2s = (out1, None) if a16 else quant(out1, quant_dtype=FP4)
     return torch_moe_stage2(
-        a2.view(x.shape[0], shape.topk, -1),
+        a2.view(x.shape[0], w.shape[1], -1),
         wt.w1_ref,
         wt.w2_ref,
         w,
@@ -233,7 +278,11 @@ class Case:
     ids_all: torch.Tensor | None = None
 
 
-def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
+def make_case(
+    shape, wt, ctx, mode, tokens, kind, seed, mask=0.0, a16=False, shared=None
+) -> Case:
+    """a16: the reference on bf16 activations; shared: the last expert's MXFP8 weights
+    (build_shared), its routes' reference on them"""
     m = tokens // ctx.world
     if mode == "ag_rs":
         gen = torch.Generator(device=ctx.device).manual_seed(seed + 7919 * ctx.rank)
@@ -268,15 +317,27 @@ def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
             g = [torch.empty_like(t) for _ in range(ctx.world)]
             dist.all_gather(g, t)
             parts.append(torch.cat(g))
-        full = torch_partial(shape, wt, *parts)
+        full = _ref(shape, wt, *parts, a16, shared)
         dist.all_reduce(full)
         ref = full[ctx.rank * m : (ctx.rank + 1) * m]
         ids_all = parts[2]
     else:
-        ref = torch_partial(shape, wt, x, w_ref, ids_ref)
+        ref = _ref(shape, wt, x, w_ref, ids_ref, a16, shared)
         dist.all_reduce(ref)
         ids_all = ids_ref
     return Case(x.contiguous(), w, ids, ref, ids_all)
+
+
+def _ref(shape, wt, x, w, ids, a16=False, shared=None):
+    if shared is None:
+        return torch_partial(shape, wt, x, w, ids, a16)
+    # the routed experts' routes on the MXFP4 weights + the shared expert's on its MXFP8 ones
+    sh = ids == shape.experts - 1
+    y = torch_partial(
+        shape, wt, x, torch.where(sh, 0.0, w), torch.where(sh, 0, ids), a16
+    )
+    w_sh = torch.where(sh, w, 0.0).sum(1, keepdim=True)
+    return y + torch_partial(shape, shared, x, w_sh, torch.zeros_like(ids[:, :1]), a16)
 
 
 class CaseFailure(AssertionError):
@@ -306,7 +367,15 @@ def max_local(mode: str, shape, wt) -> int:
 
 
 def new_layer(
-    shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8", ar_gather="bf16", **kw
+    shape,
+    wt,
+    ctx,
+    mode,
+    max_local_tokens,
+    comm_dtype="fp8",
+    ar_gather="bf16",
+    shared=None,
+    **kw,
 ):
     beta = situ(shape)
     cfg = MegaMoeTPConfig(
@@ -325,13 +394,27 @@ def new_layer(
         ar_gather=ar_gather,
         **kw,
     )
+    if shared is None:
+        return MegaMoeTP(
+            cfg,
+            w1=wt.w1,
+            w1_scale=wt.w1_scale,
+            w2=wt.w2,
+            w2_scale=wt.w2_scale,
+            device=ctx.device,
+        )
+    n, I, H = shape.experts - 1, wt.inter, shape.model_dim  # (the routed experts)
     return MegaMoeTP(
         cfg,
-        w1=wt.w1,
-        w1_scale=wt.w1_scale,
-        w2=wt.w2,
-        w2_scale=wt.w2_scale,
+        w1=wt.w1[:n],
+        w1_scale=wt.w1_scale[: n * 2 * I],
+        w2=wt.w2[:n],
+        w2_scale=wt.w2_scale[: n * H],
         device=ctx.device,
+        w1_shared=shared.w1,
+        w1_shared_scale=shared.w1_scale,
+        w2_shared=shared.w2,
+        w2_shared_scale=shared.w2_scale,
     )
 
 
@@ -400,7 +483,7 @@ def case_out(shape, wt, ctx, S, mode):
     return check(keep, c1, RTOL)
 
 
-def case_bigm(shape, wt, ctx, S, mode):
+def case_bigm(shape, wt, ctx, S, mode, comm="fp8"):
     pad = 64
     if max_local(mode, shape, wt) < pad:
         return "skipped (max_local_tokens < 64)"
@@ -410,6 +493,7 @@ def case_bigm(shape, wt, ctx, S, mode):
         ctx,
         mode,
         max_local(mode, shape, wt),
+        comm,
         bigm_min_tokens=pad * ctx.world,
     )
     if not layer.bigm_m:
@@ -448,6 +532,76 @@ def case_bigm(shape, wt, ctx, S, mode):
         ):
             expect_raise(lambda bad=bad: layer(x, w, ids, tail=bad), f"big-M {what}")
     layer.close()
+    layer.close()
+    return worst
+
+
+def case_shared(shape, wt, ctx, S, mode):
+    """The MXFP8 shared expert (the last one; the routed ones MXFP4): small-M up to 256
+    tokens, the big-M kernel right above (no bigm_min_tokens needed), no fused tail on the
+    small engine."""
+    tp = ctx.world
+    sh = build_shared(shape, wt, ctx, SEED)
+    cap = max_local(mode, shape, wt)
+    layer = new_layer(shape, wt, ctx, mode, cap, shared=sh)
+    tokens = [tp, 8 * tp, 256 // tp * tp]
+    if layer.bigm_m:
+        tokens += [t for t in (256 // tp * tp + tp, 512) if t // tp <= cap]
+    elif cap * tp > 256:
+        raise CaseFailure("no big-M path above the small-M batches")
+    if layer.tail_ok(256 // tp) and not layer._big(256 // tp):
+        raise CaseFailure("tail_ok on the small engine with the MXFP8 shared expert")
+    worst = 0.0
+    for t in tokens:
+        for kind in ("shared", "random"):
+            c = make_case(shape, wt, ctx, mode, t, kind, SEED + t, shared=sh)
+            worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"M={t} {kind}"))
+    layer.close()
+    return worst
+
+
+def case_a16(shape, wt, ctx, S, mode):
+    """bf16 activations (a16w4, small-M): act_dtype "bf16", and "auto" (a16w4 below
+    a16_max_tokens -- capped at the small-M limit --, a4w4 from there on)"""
+    tp = ctx.world
+    cap = max_local(mode, shape, wt)
+    worst = 0.0
+    layer = new_layer(shape, wt, ctx, mode, 256 // tp, act_dtype="bf16")
+    for t in (tp, 8 * tp, 64 // tp * tp):
+        for kind in ("random", "hot"):
+            c = make_case(shape, wt, ctx, mode, t, kind, SEED + t, a16=True)
+            worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"a16 M={t}"))
+    layer.close()
+    layer = new_layer(shape, wt, ctx, mode, cap, act_dtype="auto", a16_max_tokens=1024)
+    for t in (8 * tp, 256 // tp * tp, 256 // tp * tp + tp, 512):
+        if t // tp > cap:
+            continue
+        a16 = layer._eng(t // tp) is layer.engine16
+        # (a16w4 at most up to the small-M limit, whatever a16_max_tokens; few tokens: a16w4)
+        if a16 == (t > 256) and (a16 or t == 8 * tp):
+            raise CaseFailure(f"auto M={t}: a16w4 {a16}")
+        c = make_case(shape, wt, ctx, mode, t, "random", SEED + t, a16=a16)
+        worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"auto M={t}"))
+    layer.close()
+    return worst
+
+
+def case_bf16comm(shape, wt, ctx, S, mode):
+    """bf16 comm on the few-token small-M launches the sweep's token counts do not reach:
+    concentrated routings (few row chunks: the split-K launches, every (route, column group,
+    piece) flag of the bf16 route rows polled), repeated: each call equal to the first.
+    """
+    tp = ctx.world
+    layer = new_layer(shape, wt, ctx, mode, max_local(mode, shape, wt), "bf16")
+    worst = 0.0
+    for t in (tp, 2 * tp, 4 * tp, 16 * tp, 64 // tp * tp):
+        for kind in ("hot", "subset"):
+            c = make_case(shape, wt, ctx, mode, t, kind, SEED + t)
+            y0 = call(layer, c).clone()
+            worst = max(worst, check(y0, c, RTOL, f"M={t} {kind}"))
+            same = all(torch.equal(call(layer, c), y0) for _ in range(20))
+            if not ctx.all_ok(same):
+                raise CaseFailure(f"M={t} {kind}: repeated calls differ")
     layer.close()
     return worst
 
@@ -852,6 +1006,11 @@ CASES = {
     "new / freed layers": case_layers,
     "out=": case_out,
     "big-M": case_bigm,
+    "big-M bf16 comm": lambda *a: case_bigm(*a, comm="bf16"),
+    "big-M int8 comm": lambda *a: case_bigm(*a, comm="int8"),
+    "MXFP8 shared expert": case_shared,
+    "a16w4 / auto": case_a16,
+    "bf16 comm few tokens": case_bf16comm,
     "cuda graph": case_graph,
     "dynamic": lambda *a: case_dynamic(*a, lb=False),
     "dynamic LB": lambda *a: case_dynamic(*a, lb=True),

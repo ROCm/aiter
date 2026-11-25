@@ -35,6 +35,7 @@ from .mega_moe_tp_config import (
     NCTA_MAX,
     NMETA_CAP,
     NSK,
+    SM_MT_MAX,
     SM_PART_BYTES,
     TN_MAX,
     UL_MAX,
@@ -59,7 +60,7 @@ AR2_MIN = 64
 # (small-M, no tuned row) the persistent grid for <= 8 / 16 / 32 tokens (0: every CU)
 SMNC = (224, 232, 240)
 # global tokens from which the small-M kernel runs
-SM_MIN = {"ag_rs": 1, "ar": 1}
+SM_MIN = 1
 COMM_MODES = ("ag_rs", "ar")
 _ERR_NAMES = (
     (ERR_FLAG, "flag"),
@@ -300,7 +301,7 @@ class MegaMoeTPEngine:
         situ_linear_beta: float = 1.0,
         swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
-        comm_dtype: str = "bf16",
+        comm_dtype: str = "fp8",
         ar_gather: str = "auto",
         schedule: str = "dynamic",
         act_dtype: str = "fp4",
@@ -343,13 +344,7 @@ class MegaMoeTPEngine:
         # up to the dynamic schedule's limit; AITER_MEGAMOE_TP_SMALLM: 0 off, "all" every
         # dynamic-schedule batch
         sm_env = os.environ.get("AITER_MEGAMOE_TP_SMALLM", "1")
-        self.sm_min = (
-            DYN_MAX + 1
-            if sm_env == "0"
-            else (
-                1 if sm_env == "all" else SM_MIN["ar" if comm_mode == "ar" else "ag_rs"]
-            )
-        )
+        self.sm_min = DYN_MAX + 1 if sm_env == "0" else SM_MIN
         if schedule != "dynamic":
             raise ValueError(f'unknown schedule {schedule!r} (only "dynamic")')
         if act_dtype not in ("fp4", "fp8", "bf16"):
@@ -425,12 +420,14 @@ class MegaMoeTPEngine:
         self._xs = arena.reserve("xs", (tot, H // 32 * self.apl), torch.uint8)
         self._ids = arena.reserve("ids", (2, tot, 4 * K), torch.int32)
         self._w = arena.reserve("w", (2, tot, K), torch.float32)
-        self._recv = arena.reserve(
-            # (a16: the LL packets' lo plane after the hi one)
-            "recv",
-            (self.tp * self.rawp, tot if self.ar else self.mmax, H),
-            torch.bfloat16,
-        )
+        rrows = self.tp * (tot if self.ar else self.mmax)
+        # after the rows: (a16) the LL packets' lo plane, else (RAW, bf16 comm) only the
+        # partial rows' flags (an int per row and RS column chunk)
+        if self.a16:
+            rlo = rrows * (self.rawp - 1)
+        else:
+            rlo = ceildiv(rrows * nck * 4, H * 2) * (self.rawp - 1)
+        self._recv = arena.reserve("recv", (rrows + rlo, H), torch.bfloat16)
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         self._yall = arena.reserve(
             "yall", (tot, H) if self.ar else (1,), torch.bfloat16
@@ -450,8 +447,11 @@ class MegaMoeTPEngine:
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        # (the second plane: only small-M batches use it, at the batch's region size)
         self.routes = torch.zeros(
-            (tot * topk * self.rawp + 1, H), dtype=torch.bfloat16, device=self.device
+            (tot * topk + min(tot, DYN_MAX) * topk * (self.rawp - 1) + 1, H),
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.y = torch.empty(
             (tot if self.ar else self.mmax, H), dtype=torch.bfloat16, device=self.device
@@ -479,6 +479,8 @@ class MegaMoeTPEngine:
             device=self.device,
         )
         self._cfgs: dict = {}
+        self._smt: dict = {}  # _sm_tuned per batch
+        self._smg: dict = {}  # _sm_geo per batch
         self._tail_cfgs: dict = {}
         self._launchers: dict = {}
         self._armed: set = set()
@@ -524,8 +526,8 @@ class MegaMoeTPEngine:
             if self.E + ceildiv(tot * K, 16 * mt) + 1 > NCHLB_MAX:
                 bad.append(f"LB row chunks <= {NCHLB_MAX} (larger LB row tiles)")
         for what, n in (
-            ("route rows", tot * K * 2 * H),
-            ("gathered rows", self.tp * tot * H * 2),
+            ("route rows", (tot + min(tot, DYN_MAX) * (self.rawp - 1)) * K * 2 * H),
+            ("gathered rows", self.tp * tot * H * 2 * self.rawp),
             ("tail rows", tot * H * 3),
             (
                 "intermediate rows",
@@ -703,6 +705,12 @@ class MegaMoeTPEngine:
         """(small-M) the tuned launch fields (mt, nc, ar2, nsk, xd; sm 0: the dynamic
         schedule) of the nearest tuned batch <= tot (AITER_CONFIG_MEGA_MOE_TP_SM), else {}
         (the defaults)"""
+        tu = self._smt.get(tot)
+        if tu is None:
+            tu = self._smt[tot] = self._sm_tuned_row(tot)
+        return tu
+
+    def _sm_tuned_row(self, tot: int) -> dict:
         key = {
             **device_key(self.device),
             "model_dim": self.H,
@@ -713,10 +721,7 @@ class MegaMoeTPEngine:
             "comm_mode": self.mode,
             "act": "bf16" if self.a16 else "fp8" if self.a8 else "fp4",
         }
-        # (an explicit env path read live: AITER_CONFIGS caches its first lookup)
-        path = os.environ.get("AITER_CONFIG_MEGA_MOE_TP_SM") or (
-            AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_SM_FILE
-        )
+        path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_SM_FILE
         row = None
         if self.comm_bf16:
             # (bf16 comm: the RAW bf16 rows, twice the fp8 LL bytes) its own rows first
@@ -731,7 +736,7 @@ class MegaMoeTPEngine:
             return {}
         return {k: int(row[k]) for k in _SM_TUNED_FIELDS if row.get(k, "") != ""}
 
-    def _sm_nsk(self, tot: int) -> int:
+    def _sm_nsk0(self, tot: int) -> int:
         # (a16: 2 below 64 tokens, its LDS then takes the half blocks; 0: NSK)
         nsk = self._sm_tuned(tot).get("nsk")
         if nsk is None:
@@ -742,16 +747,48 @@ class MegaMoeTPEngine:
             nsk = 0
         return 0 if nsk == NSK else nsk
 
-    def _sm_xd(self, tot: int) -> bool:
+    def _sm_xd0(self, tot: int) -> bool:
         # (a16: measured faster up to 64 tokens, its half blocks; slower from 128)
         xd = self._sm_tuned(tot).get("xd")
         return self.a16 and bool(tot <= 64 if xd is None else xd)
 
+    def _sm_geo(self, tot: int):
+        """(small-M) the kernel geometry (mt, nsk, xd) of a batch whose LDS fits: the tuned /
+        default one, else (a16: the two terms' A buffers) with the intermediate straight to
+        xg and / or a B ring of 2; None: no small-M kernel of this engine fits"""
+        if tot not in self._smg:
+            mt = self._sm_tuned(tot).get("mt")
+            if mt is None:
+                mt = 1 if tot <= 32 else 2 if tot <= 128 else 3
+            mt = min(mt, SM_MT_MAX)  # (the split-K partial slots of xg, SM_PART_BYTES)
+            nsk, xd = self._sm_nsk0(tot), self._sm_xd0(tot)
+            cands = [(nsk, xd)]
+            if self.a16:
+                cands.append((nsk, True))
+                if not self.sh8:  # (its loaders take the ring's slots in pairs)
+                    cands += [(2, xd), (2, True)]
+            geo = None
+            for nsk_, xd_ in dict.fromkeys(cands):
+                mt_ = self._fit_mt(mt, sm=True, nsk=nsk_, xd=xd_)
+                if self._lds(mt_, sm=True, nsk=nsk_, xd=xd_) <= LDS_LIMIT:
+                    geo = (mt_, nsk_, xd_)
+                    break
+            self._smg[tot] = geo
+        return self._smg[tot]
+
     def _sm_mt(self, tot: int) -> int:
-        mt = self._sm_tuned(tot).get("mt")
-        if mt is None:
-            mt = 1 if tot <= 32 else 2 if tot <= 128 else 3
-        return self._fit_mt(mt, sm=True, nsk=self._sm_nsk(tot), xd=self._sm_xd(tot))
+        return self._sm_geo(tot)[0]
+
+    def _sm_nsk(self, tot: int) -> int:
+        return self._sm_geo(tot)[1]
+
+    def _sm_xd(self, tot: int) -> bool:
+        return self._sm_geo(tot)[2]
+
+    def sm_ok(self, m: int) -> bool:
+        """a small-M kernel runs m local tokens (its LDS and unit lists fit)"""
+        tot = m * self.tp
+        return 0 < m <= self.mmax and tot <= self.dyn_max and self._sm_fits(tot)
 
     def _sm_nc(self, tot: int) -> int:
         # few tokens: a smaller persistent grid (measured faster: the HBM stays saturated
@@ -785,7 +822,10 @@ class MegaMoeTPEngine:
         # small-M: every CTA's G1 unit records fit its unit list (UL_MAX). The row chunks
         # of tot tokens: at most one partial chunk per routed expert plus the full ones;
         # q = blocks // CTAs: from SM_QC on q contiguous blocks per CTA, one record per
-        # row chunk they span (+ the remainder block), else rounds (q + 1 records)
+        # row chunk they span (+ the remainder block), else rounds (q + 1 records). And
+        # the kernel's LDS (_sm_geo: the smallest row tile's too, e.g. many routes' lists)
+        if self._sm_geo(tot) is None:
+            return False
         routes = tot * self.K
         nch = min(self.E, routes) + ceildiv(routes, 16 * self._sm_mt(tot)) + 1
         ks2 = self.I // 128
@@ -801,16 +841,23 @@ class MegaMoeTPEngine:
         if cfg is None:
             tot = m * self.tp
             fp8 = not self.comm_bf16
+            # (the MXFP8 shared expert / bf16 activations: only small-M runs them, whatever
+            # AITER_MEGAMOE_TP_SMALLM / _SM_BF16, lb_min or a tuned row's sm 0 say)
+            only = self.sh8 or self.a16
             sm = (
-                tot >= self.sm_min
-                # (an explicit lb_min keeps its batches on the LB schedule)
-                and not ("min" in self._lb_set and self._lb_ok(tot))
-                and (fp8 or self.sm_b16)
-                and tot <= self.dyn_max
+                tot <= self.dyn_max
                 and self._sm_fits(tot)
-                # (a tuned batch measured faster on the dynamic schedule: sm 0 -- not for
-                # the MXFP8 shared expert / bf16 activations, which only small-M runs)
-                and (self.sh8 or self.a16 or bool(self._sm_tuned(tot).get("sm", 1)))
+                and (
+                    only
+                    or (
+                        tot >= self.sm_min
+                        # (an explicit lb_min keeps its batches on the LB schedule)
+                        and not ("min" in self._lb_set and self._lb_ok(tot))
+                        and (fp8 or self.sm_b16)
+                        # (a tuned batch measured faster on the dynamic schedule: sm 0)
+                        and bool(self._sm_tuned(tot).get("sm", 1))
+                    )
+                )
             )
             if sm:
                 cfg = LaunchCfg(
@@ -826,17 +873,23 @@ class MegaMoeTPEngine:
                     xd=self._sm_xd(tot),
                     alq=self._sm_alq(tot),
                 )
+                # (two-shot all-reduce: CTA b waits for the y flags of local row b; a grid
+                # smaller than the local rows would leave rows unwaited: every CU then)
+                if cfg.ar2 and m > (cfg.nc or self.n_cta):
+                    cfg = dataclasses.replace(cfg, nc=0, ar2=m <= self.n_cta)
                 # (ar small-M: every row quantized by this rank's CTAs, agr rows each)
                 assert not cfg.alq or tot <= self.agr * (cfg.nc or self.n_cta)
             elif self.sh8:
                 # (the MXFP8 shared expert's loaders: the small-M and big-M schedules)
                 raise ValueError(
                     f"MXFP8 shared expert: {tot} tokens are beyond the small-M schedule "
-                    "(fp4 activations, <= 256 tokens; larger batches: big-M)"
+                    f"(<= {DYN_MAX} tokens); larger batches run the big-M kernel "
+                    "(MegaMoeTP with bigm_min_tokens unset or <= the small-M limit)"
                 )
             elif self.a16:
                 raise ValueError(
-                    f'act_dtype="bf16": {tot} tokens are beyond the small-M schedule'
+                    f'act_dtype="bf16": {tot} tokens are beyond the small-M schedule '
+                    f"(<= {DYN_MAX} tokens, its kernel within the LDS)"
                 )
             elif self._lb_ok(tot):
                 cfg = self._lb_config(tot)
@@ -862,7 +915,8 @@ class MegaMoeTPEngine:
         """The launch config of a fused-tail forward (the tail runs on the LB schedule: a
         small-M batch the LB schedule takes runs it there)"""
         cfg = self.config(m)
-        if cfg.sm and self._lb_ok(m * self.tp):
+        # (not the MXFP8 shared expert: the LB schedule has no W8 loaders -> tail_ok False)
+        if cfg.sm and self._lb_ok(m * self.tp) and not self.sh8:
             cfg = self._tail_cfgs.get(m)
             if cfg is None:
                 cfg = self._tail_cfgs[m] = self._lb_config(m * self.tp)
@@ -1162,6 +1216,11 @@ class MegaMoeTPEngine:
             if not self.tail_ok(m):
                 raise ValueError(
                     "tail: ag_rs, the LB schedule, at most TN_MAX local tokens"
+                    + (
+                        " (no fused tail with the MXFP8 shared expert)"
+                        if self.sh8
+                        else ""
+                    )
                 )
             self._check_tail(tail, m)
             cfg = dataclasses.replace(self.tail_config(m), tn=2 if bf16 else 1)
