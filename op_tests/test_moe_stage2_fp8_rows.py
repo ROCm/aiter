@@ -7,15 +7,19 @@ Qwen3.8 MXFP4 TP8, E 513: the main rows at 8192 to 32768 tokens are one-stage
 post-reduce kernels; the stage2 FP8 rows are FlyDSL `reduce` rows.
 """
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import AsmMoeMode, get_2stage_cfgs
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950" or get_cu_num() != 256,
+    get_gfx_runtime() != "gfx950" or get_cu_num() != 256,
     reason="the Qwen3.8 MXFP4 rows are tuned for gfx950 with 256 CUs",
 )
 
@@ -97,3 +101,25 @@ def test_stage2_fp8_row_of_smaller_tier_keeps_main_row(monkeypatch):
     )
     # The main table has a 131072 row; the stage2 FP8 row is for 32768.
     assert _dispatch(monkeypatch, 131072, fp8=True).run_1stage
+
+
+def test_aot_replays_stage2_fp8_rows_only_with_switch():
+    # A fresh process: aiter.aot.flydsl.moe reads the switch at import.
+    check = """
+import importlib, os
+import aiter.aot.flydsl.moe as aot_moe
+from aiter.jit.core import AITER_CONFIGS
+fp8_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE
+assert fp8_csv not in aot_moe.DEFAULT_CSVS
+os.environ["AITER_FLYDSL_STAGE2_FP8"] = "1"
+aot_moe = importlib.reload(aot_moe)
+assert fp8_csv in aot_moe.DEFAULT_CSVS
+jobs = {(int(j["expert"]), int(j["token"])) for j in aot_moe.parse_csv(fp8_csv)}
+assert {(513, 8192), (513, 16384), (513, 32768)} <= jobs, jobs
+"""
+    env = {**os.environ, "AITER_FLYDSL_STAGE2_FP8": "0"}
+    subprocess.run([sys.executable, "-c", check], env=env, check=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

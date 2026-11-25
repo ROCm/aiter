@@ -91,6 +91,11 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE,
 ]
+# The runtime serves the shapes of this table with its rows only under the switch
+# (get_2stage_cfgs). The test of _flydsl_stage2_fp8_enabled, without importing
+# aiter.ops.flydsl in this process.
+if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1":
+    DEFAULT_CSVS.append(AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE)
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 _ROW_FIELDS = (
