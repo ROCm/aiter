@@ -128,18 +128,28 @@ op wrapper ──► _run_compiled(launcher, *launcher_args)
                     ├─ some <digest>-<variant>.json that bakes the constexpr
                     │  values of this call, and its .o exists
                     │    ──► flyc.load_module(.o)   ~2-3 ms, no trace, make_exe not called
-                    └─ miss (flock <digest>.lock, re-check)
+                    ├─ miss, launching ──► error log, trace on the JIT path;
+                    │                      nothing is built or written
+                    └─ miss under COMPILE_ONLY, i.e. a prebuild
+                       (flock <digest>.lock, re-check)
                          check the declared sources for a forgotten kernel file
                          exe = make_exe()
                          flyc.compile(exe, *CPU placeholders, compile_only=True)
                          check that linked bitcode is declared
+                         check that the sources still have the hashed contents
                          export_to_c into a temp dir
                          os.replace(.json), then os.replace(.o) last
-                         ──► flyc.load_module(.o)
 ```
 
-The process that builds an entry loads it like every other process, so the
-exported object is what runs everywhere.
+**Who writes the cache.** Only a prebuild: a launch under `COMPILE_ONLY`,
+which is what the replays in `aiter/aot/flydsl` run in their worker
+processes (§4.4). A process that launches kernels loads entries and never
+builds one; with no entry on disk it logs an error and traces on the JIT
+path, as it did before this cache, and FlyDSL's own cache still saves the
+LLVM compile. The reason is that Python code is imported once: a process
+that has run for a while traces what it imported, which may no longer be
+what its source files say, and nothing reliable tells the two apart. A
+prebuild worker imports its sources, hashes them and builds within seconds.
 
 ### 4.1 Keys
 
@@ -152,7 +162,7 @@ exported object is what runs everywhere.
   scalar. A key that forgets something the signature covers can then at
   worst miss on disk; it cannot load another process's mismatched `.o`.
 - **Key elements** are ints, floats, bools, strings, `None`, torch dtypes
-  and devices, and tuples, lists and dicts of those. The disk digest uses a
+  and devices, and tuples of those (hashable: the key also looks the kernel up in memory). The disk digest uses a
   normalized form (`_normalize_key`): dtypes become strings, a device becomes
   only its type, since one `.o` serves every GPU. A device in `key` thus
   separates entries in memory only, which the JIT path needs (§4.3). Anything
@@ -261,14 +271,12 @@ instead of rebuilding it. Old variants are never
 read once their sources change; delete them, or old fingerprint directories,
 to reclaim space.
 
-A process runs the code it imported, so a declared `.py` edited after the
-process imported aiter's FlyDSL code (`git checkout` during a test run) no
-longer matches what it would trace. That cache then takes the JIT path in
-this process, with a warning, and the next process builds or loads the
-entries of the new code. The contents are compared again whenever an entry is
-built, since a factory may import its kernel module only on its first miss,
-after the digest was read: a source that changed since is found then, and
-that build is not stored.
+The declared sources are hashed once per process, on a cache's first use.
+A launch only looks entries up by that digest. A prebuild compares the
+contents again before and after each build, since a factory may import its
+kernel module only when it builds: a source that changed since it was hashed
+is found then, and that build is not stored. A declared source that cannot
+be read keeps that cache on the JIT path.
 
 A cache name is unique: creating a cache of one name from two files raises,
 since the two would share a directory.
@@ -283,15 +291,15 @@ Known holes, and how they are handled:
 | An incomplete hand-written `key` | a value the factory closes over but does not take as an argument | The disk digest still covers the argument types. `verify` mode re-exports and compares |
 | A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Stored per entry and compared on lookup (§6); two values under one key raise |
 | Compile hints set by the caller | `with CompilationContext.compile_hints(...)` around the launch | Hashed into the disk digest. In memory a key keeps the function of its first launch in the process, as on the JIT path, so one key must launch under one set of hints |
-| A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A load failure rebuilds the entry once |
+| A partially written or corrupt entry | crash during a build | `.o` is published last with `os.replace`. A launch that cannot load an entry logs an error and takes the JIT path; it never deletes or rebuilds one. A prebuild rebuilds an object that does not start like an ELF file |
 
 Declared sources give per-family granularity with an explicit list; the
 checks above and `verify` mode cover what a list can miss.
 
 Modes, set with `AITER_FLYDSL_AOT_CACHE`:
 
-- `1` (default): on. Edits during kernel development rebuild only the caches that declare
-  the edited file.
+- `1` (default): on. An edit to a kernel file makes the entries of the caches
+  that declare it miss, until a prebuild adds them.
 - `0`: off. The op uses the existing `_run_compiled` path.
 - `verify`: like `1`, but on every disk hit it re-traces, re-exports, and
   byte-compares the `.o`. A mismatch raises and names the stale entry.
@@ -317,7 +325,7 @@ alignment: a non-null pointer counts as a live device argument and
 `_run_compiled` takes its JIT path unchanged. Keys that cannot be exported
 or loaded (an argument type `export_to_c` does not support) use
 `_JitKernel`, which calls `_run_compiled(exe, *args,
-specialization_key=key)`. A fallback logs one warning per key. Caller bugs
+specialization_key=key)`. Every launch sent to the JIT path, whatever the reason (no entry, a failed load or export, a key the cache cannot store, a launcher it cannot bind, a factory that was reset), logs one error per key with `logger.error`; nothing raises and the launch runs. Caller bugs
 (`_UsageError`: an unsupported element in a key passed to `launch` directly;
 a bound launcher with such a `specialization_key` takes the JIT path, §6) and
 `verify` failures
@@ -359,6 +367,12 @@ and the fallback, like before this cache.
 Cost, gfx950 mxfp8 and a4w4 CSVs above, run one after the other on fresh
 directories: 155 s at HEAD, 164 s with the cache (62 GPU binaries, the same
 set). A replay whose entries all exist still traces every request.
+
+A preload (`tensor_shim._preload_compiled`) also turns `COMPILE_ONLY` on for
+the process, to warm one launcher up in a serving or tuning process. That is
+not a prebuild: launches of other threads meanwhile build nothing. (They do
+not run either, as on the JIT path: `COMPILE_ONLY` is read for the whole
+process. Preload before serving, not beside it.)
 
 Parallel replays share both caches safely. FlyDSL's own disk cache takes a
 per-artifact file lock, so one process runs LLVM and the others load its
@@ -428,14 +442,16 @@ the process.
 
 - The JIT column is measured with FlyDSL's own disk cache already warm, so
   it is the trace alone.
-- The miss pays the trace and the export, once per entry per machine. A hit costs about 2-3 ms.
+- These numbers are from when a launch built a missing entry: the "aot miss"
+  column is the trace plus the export, which a prebuild pays now; a launch
+  that misses costs what the JIT column shows. A hit costs about 2-3 ms.
 - Kernel time is unchanged. Host time of the whole wrapper is 36.4 µs on a
   hit against 37.7 µs through JIT (m=1, n=1024, k=512, 2000 calls).
 
 Also verified (`AITER_FLYDSL_AOT_CACHE_DIR` fresh each time):
 
-- Two processes missing the same entries concurrently build each entry once,
-  leave no `.tmp-*`, and a third process only hits.
+- Two prebuilds started together on one empty cache build each entry once,
+  leave no `.tmp-*`, and a third only hits.
 - CUDA graph capture and replay match eager, also when the first call of
   an entry (and so its `load_module`) happens inside the capture, and when
   the capture is on a second GPU of the process.
@@ -597,7 +613,7 @@ module global), which an entry on disk would not reflect.
    `Constexpr[T]` launch argument must pass it in `specialization_key`, as on
    the JIT path. The object ignores such an argument, so each entry stores
    the values it was built with in its sidecar (`baked`) and serves only calls
-   that pass them: another process with another value builds its own variant.
+   that pass them: a prebuild with another value builds its own variant.
    Within a process, one key launched with two values raises, where the JIT
    path would silently run the first. This holds for ints, floats, bools,
    strings, `None` and tuples of those, and so does a launch with more
@@ -625,10 +641,11 @@ module global), which an entry on disk would not reflect.
    fallback and compile-only.
 5. **Test it.** CI runs every op test under `AITER_FLYDSL_AOT_CACHE=verify`
    (`.github/scripts/aiter_test.sh`): an entry a test loads from disk, built by
-   an earlier test or a prebuild, is re-traced and compared. `verify` checks
-   disk hits only, so locally run the op's test twice on one cache directory,
-   the second time with another value of anything the kernel may depend on,
-   and add a bitwise check against the JIT path.
+   the wheel's prebuild, is re-traced and compared. `verify` checks
+   disk hits only, and a launch never builds, so locally prebuild first (run
+   the op's replay, or its test once under `COMPILE_ONLY=1`, on a cache
+   directory), then run the test under `verify` on that directory, and add a
+   bitwise check against the JIT path.
 
 ## 7. Limitations and next steps
 
@@ -661,8 +678,13 @@ path's). Issue 4 is in the JIT path and remains.
   yet. Build directories (`.tmp-*`) left by a crashed process are removed
   after an hour.
 - The prebuild replays tuned CSV rows only. A shape with no tuned row, such
-  as a batched mxfp8 GEMM that falls back to its heuristic config, is built
-  at its first call; tuning the shape adds it to the prebuild.
+  as a batched mxfp8 GEMM that falls back to its heuristic config, has no
+  entry: it traces on the JIT path in every process, with one error per key;
+  tuning the shape adds it to the prebuild.
+- No replay prebuilds the gfx942 whole-MoE launchers (`moe_gfx942_gemm`,
+  `moe_gfx942_sorted_sum`, `moe_gfx942_absmax`, `moe_gfx942_quant_per_tensor`):
+  `aiter.aot.flydsl.moe` builds only the 2-stage ones for gfx942. Until one
+  does, they take the JIT path.
 - Only the launchers in §5 are converted: the GEMMs and the 2-stage MoE of
   gfx942 and gfx950. Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
   the attention kernels, MegaMoE and the a8w4 `comm_fused_moe`, still trace

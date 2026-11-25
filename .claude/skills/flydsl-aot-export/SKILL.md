@@ -157,17 +157,60 @@ Behaviour kept:
 - [ ] A kernel file shared with another arch keeps that arch's path as it
       was, unless you validate it too.
 
+## What leaves a stale entry
+
+An entry is looked up by four things, and by nothing else: the **key**
+(factory arguments, `specialization_key`, `Constexpr` launch arguments), the
+**contents of the declared source files** (`sources=`, the creating file and
+`aot_cache._COMMON_SOURCES`), the **declared variables** (`env=`), and the
+**fingerprint** (FlyDSL, arch, CU count, `AITER_FLYDSL_*` / `FLYDSL_*`).
+Whatever else the generated code depends on is invisible: change it, and a
+later process loads the old kernel without an error. When you convert or
+review a launcher, look for each of these.
+
+| What the kernel depends on | Example | Detected? | Do this |
+|---|---|---|---|
+| A value the factory or kernel closes over that is not a factory argument | `tile = _pick_tile(device)` inside the factory, then used in the kernel | No | Make it a factory argument, or pass it in `specialization_key` |
+| A module global changed at run time | `kernels_common.FAST_MATH = True` set by a caller or a test | No | Pass the value through the key; do not patch module state |
+| A constant in a file that is not declared | a helper the wrapper (outside `kernels/`) imports; `importlib.import_module(name)`; another installed package | Only an import between two files under `kernels/` (prebuild and unit test raise) | Add the file to `sources=` |
+| A non-Python input read while building | a tuning CSV or JSON the factory reads its tiles from | No | Read it in the wrapper and pass the values as factory arguments, or declare the file in `sources=` |
+| An environment variable that is not `AITER_FLYDSL_*` / `FLYDSL_*` | `os.environ.get("MY_SWITCH")` in a kernel file | No | Add it to `env=`, or read it in the wrapper and pass it in the key |
+| A variable read under a computed name | `os.environ.get(f"AITER_X_{stage}")` | No | Do not do this in kernel code; read it by a literal name |
+| A device property other than arch and CU count | memory size, device name, a driver version | No | Pass it in the key |
+| A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Yes: stored per entry and compared; two values under one key raise | Still put it in `specialization_key` |
+| Tensor dtype, rank or unit-stride axis that varies for one launcher | the same launcher called with fp8 and bf16 | On disk yes (the digest holds them); in memory no | Put it in `specialization_key` |
+| Linked bitcode | `link_extern(..., bitcode_path=...)` | Yes: a prebuild raises if it is not declared | Add its path to `sources=` |
+| `True`, `1` and `1.0` as one key | a flag passed as `1` by one caller and `True` by another | No (they hash alike in memory) | Coerce to one type at the call site |
+
+Two more rules that are not about the key:
+
+- **Only a prebuild writes the cache.** A launch with no entry logs an error
+  and traces on the JIT path. So a launcher no replay under
+  `aiter/aot/flydsl/` covers never hits: add its shapes to a replay.
+- **Every `AITER_FLYDSL_*` / `FLYDSL_*` variable is in the fingerprint.**
+  Setting one that the prebuild did not have set selects another directory,
+  and every cache misses. Deploy with the variables the wheel was built with.
+
+`AITER_FLYDSL_AOT_CACHE=verify` re-traces every entry a process loads and
+compares it byte for byte, so it finds a stale entry of any kind above, but
+only when the process loads that entry with a value that differs from the
+build's. Run the op's test under it after a prebuild, with another value of
+anything the kernel may depend on.
+
 ## Validating
 
 Use a fresh `AITER_FLYDSL_AOT_CACHE_DIR` and `FLYDSL_RUNTIME_CACHE_DIR` for
 each round. The log line `[FlyDSL AOT] built <path>.o` marks a build. A
-`[FlyDSL AOT]` line that ends in `through the JIT path` or `using the JIT path
-for it` marks a fallback and is a failure of the conversion.
+`[FlyDSL AOT]` error line that mentions `the JIT path` marks a launch the
+cache did not serve: after a prebuild of the same shapes it is a failure of
+the conversion.
 
-1. **Build.** Run the op once. Expect one `built` line per specialization and
-   no fallback.
-2. **Hit.** Run it again on the same directory in a new process. Expect no
-   `built` line.
+1. **Build.** Prebuild: run the op's replay (`python -m aiter.aot.flydsl.<op>`)
+   or the op once under `COMPILE_ONLY=1`. Expect one `built` line per
+   specialization and no fallback. A launch never builds: without an entry it
+   logs an error (`no prebuilt entry`) and traces on the JIT path.
+2. **Hit.** Run the op on the same directory in a new process. Expect no
+   `built` line and no `no prebuilt entry` error.
 3. **Verify.** Run it again with `AITER_FLYDSL_AOT_CACHE=verify`: every entry
    loaded from disk is re-traced and byte-compared. A mismatch means the key
    misses an input.
@@ -179,7 +222,8 @@ for it` marks a fallback and is a failure of the conversion.
    that is not declared invalidates nothing (§4.2 of the doc). Declare
    variables the kernel code reads in `env=`.
 6. **Result.** On the target GPU, compare the op's output bitwise against
-   mode `0`, and run its op test twice on one cache directory.
+   mode `0`: prebuild the entries (the op's replay, or its test once under
+   `COMPILE_ONLY=1`), then run its op test on that cache directory.
 
 Without the target GPU, steps 1-5 run compile-only on any host:
 
@@ -220,10 +264,11 @@ or `tensor_shim.py`, and after a FlyDSL pin bump.
 | `one launcher bound to keys ... and ...` | Two factories or keys return one launcher object | One factory per launcher; for shared launchers use `bind_aot` at the build |
 | `cannot bind a dict` / `tuple` | The factory returns several launchers | `bind_aot` each launcher where it is built |
 | `... launching through the JIT path` at bind time | A key element the cache cannot store | Convert it to a plain value at the call site |
-| `changed after this process imported it` | A declared source was edited while the process ran | Rerun in a new process |
+| `no prebuilt entry in ...; tracing it on the JIT path` | A launch found no entry: only a prebuild (`COMPILE_ONLY`) builds one | Run the op's replay in `aiter/aot/flydsl`, or add the shape to its list |
+| `changed after this process hashed it` | A declared source was edited while a prebuild ran | Rerun the prebuild |
 | `does not declare [...], which its sources import` | A declared kernel file imports a kernel file missing from `sources=` | Add it to `sources=` |
 | `links [...], which it does not declare` | The kernel links bitcode missing from `sources=` | Add its path to `sources=` |
-| A second run builds again | The key, a declared source or a declared variable differs between runs | Diff the two sidecars |
+| A second prebuild builds again | The key, a declared source or a declared variable differs between runs | Diff the two sidecars |
 | `verify` mismatch | The trace reads something the key does not hold | Find it (a global, a config, a device property) and put it in the key |
 | The preload/tuner precompile does not speed up the first launch | It compiles the raw launcher | Step 5 above |
 
@@ -236,5 +281,6 @@ or `tensor_shim.py`, and after a FlyDSL pin bump.
 - `COMPILE_ONLY` is read for the whole process, so a launch on another thread
   during a preload compiles and does not run. Preload in tuner and prebuild
   workers, not beside inference.
-- Entries are built at the first call on a machine unless a replay under
-  `aiter/aot/flydsl/` prebuilds them.
+- Entries are built only by a prebuild: a replay under `aiter/aot/flydsl/`,
+  or the op run once under `COMPILE_ONLY=1`. A launcher no replay covers
+  never hits; add its shapes to a replay when converting it.

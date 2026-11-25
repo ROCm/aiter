@@ -122,7 +122,16 @@ class _AotBinding:
             and self.epoch == cache.epoch
             and "COMPILE_ONLY" not in os.environ
         ):
-            kernel(*args)
+            if kernel.__class__ is _JitKernel:
+                # No entry for this key: it calls _run_compiled on the
+                # launcher, which comes back here.
+                _inside.active = True
+                try:
+                    kernel(*args)
+                finally:
+                    _inside.active = False
+            else:
+                kernel(*args)
             return True
         if specialization_key is None:
             key = self.key
@@ -144,7 +153,7 @@ class _AotBinding:
             # launch. self.key was checked when it was bound.
             if specialization_key is None:
                 raise
-            logger.warning(
+            logger.error(
                 f"[FlyDSL AOT] {self.cache.name}: {e} in specialization_key; "
                 f"launching it through the JIT path"
             )
@@ -153,13 +162,9 @@ class _AotBinding:
         finally:
             _inside.active = False
         kernel = cache._mem.get(key)
-        # A loaded object launches without coming back here; the JIT fallback
-        # does (_inside), and compile-only leaves nothing to keep.
-        if (
-            kernel is not None
-            and not isinstance(kernel, _JitKernel)
-            and self.epoch == epoch == cache.epoch
-        ):
+        # Also the JIT kernel of a key with no entry, so that its launches
+        # skip the lookup too; compile-only leaves nothing to keep.
+        if kernel is not None and self.epoch == epoch == cache.epoch:
             self.kernels[specialization_key] = kernel
         return True
 
@@ -171,7 +176,7 @@ def _storable(cache: FlyDSLAotCache, key) -> bool:
     try:
         _normalize_key(key)
     except _UsageError as e:
-        logger.info(f"[FlyDSL AOT] {cache.name}: {e}; launching through the JIT path")
+        logger.error(f"[FlyDSL AOT] {cache.name}: {e}; launching through the JIT path")
         return False
     return True
 
@@ -193,7 +198,7 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
             # Not one launcher (a factory returning a tuple or a dict of them):
             # nothing to bind, so its launchers take the JIT path. Bind each
             # with bind_aot where it is built.
-            logger.info(
+            logger.error(
                 f"[FlyDSL AOT] {cache.name}: cannot bind a "
                 f"{type(exe).__name__}; launching through the JIT path"
             )
@@ -207,7 +212,7 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
         setattr(exe, _ATTR, _AotBinding(cache, key, make_exe or launcher, launcher))
     elif current is not False and (current.cache is not cache or current.key != key):
         # One launcher object under two keys: the key does not determine it.
-        logger.warning(
+        logger.error(
             f"[FlyDSL AOT] {cache.name}: one launcher bound to keys "
             f"{current.key!r} and {key!r}; launching it through the JIT path"
         )

@@ -5,10 +5,15 @@
 
 FlyDSL 0.5.0 keys its artifacts by the traced IR, so every first call of a
 specialization traces the Python kernel again in each new process, even when
-its disk cache hits. This module skips that trace on later runs. On a miss it
-compiles the specialization once with CPU placeholders and exports it with
-``CompiledFunction.export_to_c``. Every process, including the one that built
-it, loads the object with ``flyc.load_module``, so a hit never traces.
+its disk cache hits. This module skips that trace. A prebuild (a launch under
+``COMPILE_ONLY``, as the replays in ``aiter/aot/flydsl`` make) compiles the
+specialization once with CPU placeholders and exports it with
+``CompiledFunction.export_to_c``. A process that launches kernels loads the
+object with ``flyc.load_module``, so a hit never traces. It never builds one:
+a launch with no entry on disk logs an error and traces on the JIT path, as
+it did before this cache. Only a prebuild, a process that imports its sources
+and builds within seconds, writes the cache, so the code a long-running
+process imported earlier cannot end up in an entry.
 
 See ``docs/flydsl_aot_cache.md`` for the design and how cache entries are
 invalidated.
@@ -22,16 +27,16 @@ Usage::
 covers every mode, including ``0``. Within one cache ``name``, ``key`` must
 determine the specialization: the launcher and every constexpr it is built
 with. It is made of ints, floats, bools, strings, ``None``, torch dtypes and
-devices, and tuples, lists and dicts of those. The disk key also hashes the
+devices, and tuples of those (hashable: it also keys the kernels in memory). The disk key also hashes the
 ``cache_signature`` of each runtime argument (dtype, rank, unit-stride axis),
 so another process cannot load an object compiled for other argument types.
 In memory, entries are looked up by ``key`` alone, so ``key`` must also hold
 every tensor dtype and layout that can vary, as for ``_run_compiled``'s
 ``specialization_key``.
 
-If an entry cannot be exported or loaded (an argument type ``export_to_c``
-does not support), ``launch`` logs a warning once and runs that key through
-``_run_compiled``. A FlyDSL without ``flyc.load_module`` runs every key that
+If an entry is missing, or cannot be exported or loaded (an argument type
+``export_to_c`` does not support), ``launch`` logs an error once and runs
+that key through ``_run_compiled``. A FlyDSL without ``flyc.load_module`` runs every key that
 way.
 
 Invalidation has two levels. The directory is named by a fingerprint of the
@@ -57,8 +62,12 @@ include the files under ``aiter/ops/flydsl`` those import.
 * ``1`` (default): on.
 * ``0``: off. ``launch`` uses ``_run_compiled``.
 * ``verify``: like ``1``, but each disk hit is re-traced and re-exported, and
-  the new object must match the cached ``.o`` byte for byte. Export and load
-  failures raise instead of falling back.
+  the new object must match the cached ``.o`` byte for byte. A failure to
+  load an entry, or to export one in a prebuild, raises instead of falling
+  back. A launch with no entry still takes the JIT path.
+
+Every launch a bound launcher sends to the JIT path, for whatever reason, is
+logged once per key with ``logger.error`` (not under ``0``); nothing raises.
 
 ``AITER_FLYDSL_AOT_CACHE_DIR`` sets the cache root. The default is
 ``flydsl_aot`` in aiter's JIT directory (``get_user_jit_dir``), so entries a
@@ -321,25 +330,6 @@ def _portable(path: str) -> str:
     return path.removeprefix(root) if path.startswith(root) else os.path.basename(path)
 
 
-# When this module was imported: before any FlyDSL kernel module of this
-# process (their wrappers import it). A forked worker inherits it.
-_IMPORTED_NS = time.time_ns()
-
-
-def _changed_since_import(files) -> list:
-    """Sources modified after this process imported aiter's FlyDSL code. The
-    process runs what it imported, so what it would trace may no longer be what
-    such a file says."""
-    changed = []
-    for f in files:
-        if not f.endswith(".py"):
-            continue  # read by the compile (bitcode), not imported
-        with contextlib.suppress(OSError):
-            if os.stat(f).st_mtime_ns > _IMPORTED_NS:
-                changed.append(f)
-    return changed
-
-
 @functools.cache
 def _file_digest(path: str) -> str | None:
     """Content hash of a source file, once per process; None if it is gone."""
@@ -394,12 +384,12 @@ def _source_files(sources) -> list:
         if os.path.isdir(path):
             found = [str(f) for f in Path(path).rglob("*.py")]
             if not found:
-                raise _UsageError(f"[FlyDSL AOT] no .py file under source {src!r}")
+                raise _SourceListError(f"no .py file under declared source {src!r}")
             files.update(os.path.realpath(f) for f in found)
         elif os.path.isfile(path):
             files.add(path)
         else:
-            raise _UsageError(f"[FlyDSL AOT] source {src!r} ({path}) does not exist")
+            raise _SourceListError(f"declared source {src!r} ({path}) does not exist")
     return sorted(files)
 
 
@@ -628,16 +618,17 @@ def _export(exe, args, out_dir: Path, sym: str, link_libs: set | None = None) ->
 
 
 class _JitKernel:
-    """The in-process FlyDSL path, for mode ``0`` and entries that cannot export."""
+    """The in-process FlyDSL path, for mode ``0`` and launches with no entry."""
 
     def __init__(self, exe, key):
+        from .kernels.tensor_shim import _run_compiled  # imports this module
+
         self._exe = exe
         self._key = key
+        self._run = _run_compiled
 
     def __call__(self, *args) -> None:
-        from .kernels.tensor_shim import _run_compiled
-
-        _run_compiled(self._exe, *args, specialization_key=self._key)
+        self._run(self._exe, *args, specialization_key=self._key)
 
 
 class _BakedKernel:
@@ -726,6 +717,35 @@ class _UndeclaredSourceError(RuntimeError):
     falls back."""
 
 
+# Set (under tensor_shim's preload lock) while a preload has COMPILE_ONLY on
+# for the whole process to warm one launcher up: that is not a prebuild, and
+# a launch of another thread must not build an entry in a long-lived process.
+_preloading = False
+
+
+def _prebuilding() -> bool:
+    """Whether this launch is a prebuild's, which alone builds entries."""
+    return fly_env.compile.compile_only and not _preloading
+
+
+def _is_object(path: Path) -> bool:
+    """Whether ``path`` starts like an ELF object; cheap, for a prebuild."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+class _SourceListError(RuntimeError):
+    """A cache's ``sources=`` names a file that is not there. A launch takes
+    the JIT path; a prebuild fails."""
+
+
+class _Miss(RuntimeError):
+    """No entry on disk for a launch; only a prebuild builds one."""
+
+
 class _NoExport(RuntimeError):
     """A hook stopped the compile, so there is nothing to export: not a failure."""
 
@@ -775,7 +795,10 @@ class FlyDSLAotCache:
         self.name = name
         if os.path.isfile(site):  # not an interactive session
             sources = (site, *sources)
-        self._files = _source_files((*_COMMON_SOURCES, *sources))
+        # Resolved on first use (_files), not here: a module that creates a
+        # cache must import whatever its sources list says, in every mode.
+        self._declared = (*_COMMON_SOURCES, *sources)
+        self._resolved = None
         self._env = tuple(sorted({env} if isinstance(env, str) else set(env)))
         # [(source, sha256)] and its hash, once the files were read (_sources),
         # and the same hashes by path (_check_unchanged).
@@ -790,6 +813,7 @@ class FlyDSLAotCache:
         self._builds = 0
         # Set by invalidate(): this process then runs every key through the JIT.
         self._jit_only = False
+        self._jit_logged = False
         # Bumped by invalidate(), for those who keep a kernel from _mem.
         self.epoch = 0
         # Reentrant: a factory may reset itself (invalidate) while it is built.
@@ -798,20 +822,23 @@ class FlyDSLAotCache:
     def directory(self) -> Path:
         return cache_root() / fingerprint() / self.name
 
+    @property
+    def _files(self) -> list:
+        """The declared source files, as absolute paths."""
+        if self._resolved is None:
+            self._resolved = _source_files(self._declared)
+        return self._resolved
+
     def _sources(self) -> str:
-        """Hash of the declared sources, read once per process: this process
-        runs the code it imported, so what it traces is those files as they
-        were, whatever is edited later."""
+        """Hash of the declared sources, read once per process. An entry is
+        looked up by it, and built under it only by a prebuild (``_resolve``),
+        which checks before and after the build that the files still have
+        these contents (``_check_unchanged``)."""
         if self._digest is None:
-            changed = _changed_since_import(self._files)
-            if changed:
-                # Imported before the edit: what this process would trace is
-                # no longer what the file says.
-                raise RuntimeError(
-                    f"{changed[0]} changed after this process imported it; "
-                    f"not using the AOT cache for it"
-                )
             self._read = {f: _file_digest(f) for f in self._files}
+            gone = [f for f, d in self._read.items() if d is None]
+            if gone:
+                raise _SourceListError(f"declared source {gone[0]} cannot be read")
             self._hashes = sorted((_portable(f), d) for f, d in self._read.items())
             blob = json.dumps(self._hashes, sort_keys=True).encode()
             self._digest = hashlib.sha256(blob).hexdigest()
@@ -876,7 +903,8 @@ class FlyDSLAotCache:
         """Launch the specialization ``key`` (built by ``make_exe()``) on ``args``.
 
         Under ``COMPILE_ONLY`` the entry is built but nothing is launched,
-        even for a key this process already launched.
+        even for a key this process already launched. Otherwise an entry is
+        loaded if there is one and never built.
         """
         kernel = self._mem.get(key)
         # Reading the FlyDSL option costs about 0.8 us; the membership test 0.1 us.
@@ -918,7 +946,20 @@ class FlyDSLAotCache:
         jit(*args)
 
     def _kernel(self, key, make_exe, args):
-        if _MODE == "0" or _load_module is None or self._jit_only:
+        if _MODE == "0":
+            return _JitKernel(make_exe(), key)
+        if _load_module is None or self._jit_only:
+            if not self._jit_logged:
+                self._jit_logged = True
+                why = (
+                    "this FlyDSL has no flyc.load_module"
+                    if _load_module is None
+                    else "its factory was reset (cache_clear)"
+                )
+                logger.error(
+                    f"[FlyDSL AOT] {self.name}: {why}; launching through the "
+                    f"JIT path in this process"
+                )
             return _JitKernel(make_exe(), key)
         try:
             return self._resolve(key, make_exe, args)
@@ -926,47 +967,66 @@ class FlyDSLAotCache:
             # e.g. an AOT replay that only identifies the kernels a call
             # requests: the JIT path's compile-only launch is what it watches.
             return _JitKernel(make_exe(), key)
+        except _Miss as e:
+            # Not a failure, in any mode: the prebuild did not cover this key
+            # (another shape, CU count or environment).
+            logger.error(
+                f"[FlyDSL AOT] {self.name}: {e} for {key!r}; tracing it on "
+                f"the JIT path. Run the AOT prebuild to add it."
+            )
+            return _JitKernel(make_exe(), key)
         except (TypeError, ValueError, NotImplementedError, RuntimeError, OSError) as e:
-            if _MODE == "verify" or isinstance(
-                e, (_StaleEntryError, _UsageError, _UndeclaredSourceError)
+            if (
+                _MODE == "verify"
+                or isinstance(
+                    e, (_StaleEntryError, _UsageError, _UndeclaredSourceError)
+                )
+                or (isinstance(e, _SourceListError) and _prebuilding())
             ):
                 raise
-            logger.warning(
+            logger.error(
                 f"[FlyDSL AOT] {self.name}: no exported entry for {key!r} ({e}); "
                 f"using the JIT path for it"
             )
             return _JitKernel(make_exe(), key)
 
     def _resolve(self, key, make_exe, args):
-        """Load the entry for ``key`` from disk, building it first on a miss.
+        """Load the entry for ``key`` from disk.
 
         A hit reads only the object, its sidecar and the declared sources; it
         never calls ``make_exe``, whose factory runs FlyDSL's AST rewrite.
+        An entry is built only under ``COMPILE_ONLY``, i.e. by a prebuild: a
+        process that launches kernels never writes the cache, so what it
+        imported long ago cannot end up in an entry (``_Miss``).
         """
         digest = self._disk_key(key, args)
         sym = f"fly_{self.name}_{digest[:16]}"
         out_dir = self.directory()
+        prebuild = _prebuilding()
         found = self._find(out_dir, digest, args)
+        if found is not None and prebuild and not _is_object(found.with_suffix(".o")):
+            found = None  # truncated or foreign: built again below
         if found is None:
+            if not prebuild:
+                raise _Miss(f"no prebuilt entry in {out_dir}")
             with _file_lock(out_dir / f"{digest}.lock"):
                 found = self._find(out_dir, digest, args)
-                if found is None:
+                if found is None or not _is_object(found.with_suffix(".o")):
                     found = self._build(make_exe, args, out_dir, sym, digest)
         elif _MODE == "verify":
             self._verify(make_exe(), args, sym, found.with_suffix(".o"))
         if fly_env.compile.compile_only:
             return None
+        obj = found.with_suffix(".o")
         try:
-            kernel = _load_module(found.with_suffix(".o"))
-        except (OSError, ValueError) as e:
-            # A truncated or foreign object: rebuild once.
-            logger.warning(f"[FlyDSL AOT] loading {found}.o failed ({e}); rebuilding")
-            with _file_lock(out_dir / f"{digest}.lock"):
-                found.with_suffix(".o").unlink(missing_ok=True)
-                found = self._build(make_exe, args, out_dir, sym, digest)
-            kernel = _load_module(found.with_suffix(".o"))
-        meta = json.loads(found.with_suffix(".json").read_text())
-        baked = meta["baked"]
+            kernel = _load_module(obj)
+            meta = json.loads(found.with_suffix(".json").read_text())
+            baked = meta["baked"]
+        except Exception as e:  # whatever a bad object makes the loader raise
+            # Not removed here: the error may not be the file's (no file
+            # handles left, a missing runtime library), and a launch never
+            # writes the cache. A prebuild replaces an object that is not one.
+            raise RuntimeError(f"loading {obj} failed ({type(e).__name__}: {e})") from e
         # Also for a launcher whose constexprs were all left to their defaults:
         # a later launch that passes one must not run this object.
         if baked or meta.get("constexpr"):
@@ -1031,7 +1091,8 @@ class FlyDSLAotCache:
         """Raise if this cache is built from something it does not declare: a
         kernel file its declared kernel files import, or bitcode its kernel
         links. Run when an entry is built, so a hit pays nothing; the AOT
-        replays and CI build every cache."""
+        replays build every cache, and a unit test runs the import check
+        over every cache without building."""
         if not self._imports_checked:
             missing = _undeclared_imports(self._files)
             if missing:

@@ -9,7 +9,8 @@ in a fresh process on the prefill rows (decode accumulates with atomics, so its
 output is not bitwise reproducible):
 
 * ``jit``: ``AITER_FLYDSL_AOT_CACHE=0``. Nothing is bound or written.
-* ``aot miss``: ``=1`` on an empty directory. Every launch exports.
+* ``aot miss``: ``=1`` on an empty directory. Every launch traces, as ``jit``
+  does, and writes nothing; a ``COMPILE_ONLY`` run then prebuilds the entries.
 * ``aot hit``: ``=1`` again. Every launch loads its object, nothing builds.
 
 All modes must produce bitwise identical outputs.
@@ -182,7 +183,9 @@ def test_binding_keeps_the_loaded_kernel_until_the_cache_is_invalidated(monkeypa
     monkeypatch.setattr(aot_cache._JitKernel, "__call__", lambda self, *a: None)
     n = len(ran)
     assert binding((1,), None) is True
-    assert made == [1] and len(ran) == n and not binding.kernels
+    assert made == [1] and len(ran) == n
+    # What it keeps now is the JIT kernel of that key.
+    assert isinstance(binding.kernels[None], aot_cache._JitKernel)
 
 
 @pytest.mark.skipif(
@@ -346,7 +349,7 @@ def test_linked_bitcode_must_be_declared(monkeypatch, tmp_path):
         _keepalive = Artifact()
 
         def export_to_c(self, out_dir, sym):
-            Path(out_dir, f"{sym}.o").write_bytes(b"object")
+            Path(out_dir, f"{sym}.o").write_bytes(b"\x7fELF object")
 
     monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: Compiled())
 
@@ -358,12 +361,14 @@ def test_linked_bitcode_must_be_declared(monkeypatch, tmp_path):
     with pytest.raises(aot_cache._UndeclaredSourceError, match=r"device\.bc"):
         cache._build(make_exe, (), out_dir, "sym", "digest")
     assert not list(out_dir.glob("*.o")), "an entry was written"
-    # Never a silent fall back to the JIT path, in any mode.
+    # A prebuild never falls back silently to the JIT path, in any mode.
     monkeypatch.setattr(aot_cache, "_MODE", "1")
     monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
     monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "root"))
+    monkeypatch.setenv("COMPILE_ONLY", "1")
     with pytest.raises(aot_cache._UndeclaredSourceError):
         cache._kernel(("k",), make_exe, ())
+    monkeypatch.delenv("COMPILE_ONLY")
 
     def disk_key():
         aot_cache._file_digest.cache_clear()
@@ -415,11 +420,11 @@ class _FakeCompiled:
         _link_libs = ()
 
     def export_to_c(self, out_dir, sym):
-        Path(out_dir, f"{sym}.o").write_bytes(b"object")
+        Path(out_dir, f"{sym}.o").write_bytes(b"\x7fELF object")
 
 
 def _old_file(path, text):
-    """A source written before this process started, as an installed file."""
+    """A source file with an old mtime, as an installed one has."""
     path.write_text(text)
     old = time.time() - 3600
     os.utime(path, (old, old))
@@ -470,22 +475,189 @@ def test_directory_source_is_every_file_below_it(tmp_path):
     # Relative paths are under aiter/ops/flydsl.
     cache = aot_cache.FlyDSLAotCache("test_rel_source", sources="kernels/act.py")
     assert any(f.endswith("aiter/ops/flydsl/kernels/act.py") for f in cache._files)
-    with pytest.raises(aot_cache._UsageError, match="does not exist"):
-        aot_cache.FlyDSLAotCache("test_missing_source", sources=["kernels/nope.py"])
+    # A list naming a missing file does not break the import of the module
+    # that creates the cache; its launches take the JIT path.
+    cache = aot_cache.FlyDSLAotCache("test_missing_source", sources=["kernels/nope.py"])
+    with pytest.raises(RuntimeError, match="does not exist"):
+        cache._disk_key(("k",), ())
 
 
-def test_source_edited_after_this_process_imported_it_is_not_cached(
-    monkeypatch, tmp_path
-):
+def test_launch_without_an_entry_traces_and_writes_nothing(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    cache = aot_cache.FlyDSLAotCache("test_runtime_miss")
+
+    def make_exe():
+        return lambda: None
+
+    # Only a prebuild builds: this process may have imported its sources long
+    # before they were hashed, so it must not store what it would trace.
+    with pytest.raises(aot_cache._Miss):
+        cache._resolve(("k",), make_exe, ())
+    for mode in ("1", "verify"):  # a miss is not a failure, under verify either
+        monkeypatch.setattr(aot_cache, "_MODE", mode)
+        kernel = cache._kernel(("k",), make_exe, ())
+        assert isinstance(kernel, aot_cache._JitKernel)
+    assert not list(tmp_path.iterdir()), "a launch wrote the cache"
+    # The same call under COMPILE_ONLY is the prebuild.
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    assert cache._kernel(("k",), make_exe, ()) is None
+    assert len(list(tmp_path.glob("*.o"))) == 1
+
+
+def _errors(monkeypatch, *modules):
+    """The messages ``modules`` log with ``logger.error`` from here on."""
+    seen = []
+    for module in modules:
+        monkeypatch.setattr(module.logger, "error", seen.append)
+    return seen
+
+
+def test_every_launch_sent_to_the_jit_path_logs_one_error(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache, aot_launch
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    ran = []
+    monkeypatch.setattr(
+        tensor_shim,
+        "_run_compiled",
+        lambda exe, *args, specialization_key=None: ran.append(args),
+    )
+    errors = _errors(monkeypatch, aot_cache)
+    exe, cache = _Launcher(), aot_cache.FlyDSLAotCache("test_jit_error")
+    bind_aot(exe, cache, ("k",))
+    binding = getattr(exe, _ATTR)
+    for n in (1, 2, 3):
+        assert binding((n,), None)
+    # Launched each time, logged once, and nothing was written.
+    assert ran == [(1,), (2,), (3,)]
+    assert len(errors) == 1 and "no prebuilt entry" in errors[0], errors
+    assert not list(tmp_path.iterdir())
+    # The key's later launches skip the cache lookup.
+    assert isinstance(binding.kernels[None], aot_cache._JitKernel)
+    # Another key of the launcher is another error.
+    assert binding((4,), "spec")
+    assert len(errors) == 2
+    # A key the cache cannot store.
+    errors2 = _errors(monkeypatch, aot_launch)
+    bind_aot(_Launcher(), cache, (object(),))
+    assert len(errors2) == 1 and "JIT path" in errors2[0]
+
+
+def test_entry_that_does_not_load_is_kept_and_the_launch_traces(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
     monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
-    # Written now: after this process imported aiter's FlyDSL code, so what it
-    # would trace is not what the file says.
-    src = tmp_path / "edited.py"
-    src.write_text("X = 2\n")
-    cache = aot_cache.FlyDSLAotCache("test_edited", sources=[src])
-    with pytest.raises(RuntimeError, match="changed after"):
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    cache = aot_cache.FlyDSLAotCache("test_load_failure")
+
+    def make_exe():
+        return lambda: None
+
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    assert cache._kernel(("k",), make_exe, ()) is None
+    monkeypatch.delenv("COMPILE_ONLY")
+    (obj,) = tmp_path.glob("*.o")
+
+    def no_handles(path):
+        raise OSError(24, "Too many open files")
+
+    # Not the file's fault: a launch must not delete a good entry.
+    monkeypatch.setattr(aot_cache, "_load_module", no_handles)
+    errors = _errors(monkeypatch, aot_cache)
+    assert isinstance(cache._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
+    assert obj.exists() and len(errors) == 1 and "failed" in errors[0]
+    # Whatever a bad object makes the loader raise.
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: {}["abi"])
+    assert isinstance(cache._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
+    assert obj.exists() and len(errors) == 2
+    monkeypatch.setattr(aot_cache, "_MODE", "verify")
+    with pytest.raises(RuntimeError, match="loading"):
+        cache._kernel(("k",), make_exe, ())
+    assert obj.exists()
+    # A prebuild replaces an object that is not one.
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    obj.write_bytes(b"")
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    builds = cache._builds
+    assert cache._kernel(("k",), make_exe, ()) is None
+    assert cache._builds == builds + 1 and obj.read_bytes().startswith(b"\x7fELF")
+
+
+def test_preload_and_bad_source_list_under_compile_only(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+
+    def make_exe():
+        return lambda: None
+
+    # A preload turns COMPILE_ONLY on to warm one launcher up in a process
+    # that serves: launches of other threads meanwhile build nothing.
+    cache = aot_cache.FlyDSLAotCache("test_preload")
+    monkeypatch.setattr(aot_cache, "_preloading", True)
+    assert isinstance(cache._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
+    assert not list(tmp_path.glob("*.o"))
+    monkeypatch.setattr(aot_cache, "_preloading", False)
+    assert cache._kernel(("k",), make_exe, ()) is None
+    assert len(list(tmp_path.glob("*.o"))) == 1
+
+    # The preload itself: the flag is on for as long as COMPILE_ONLY is, also
+    # when preloads nest and when the compile raises.
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    monkeypatch.delenv("COMPILE_ONLY")
+    seen = []
+
+    def compile(exe, *args):
+        seen.append((os.environ.get("COMPILE_ONLY"), aot_cache._prebuilding()))
+        if exe == "outer":
+            tensor_shim._preload_compiled("inner")
+            seen.append((os.environ.get("COMPILE_ONLY"), aot_cache._prebuilding()))
+        if exe == "raises":
+            raise ValueError("no")
+
+    monkeypatch.setattr(tensor_shim.flyc, "compile", compile)
+    tensor_shim._preload_compiled("outer")
+    with pytest.raises(ValueError):
+        tensor_shim._preload_compiled("raises")
+    assert seen == [("1", False)] * 4
+    assert "COMPILE_ONLY" not in os.environ and aot_cache._preloading is False
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+
+    # A sources= list naming a missing file fails a prebuild; a launch only
+    # logs it and traces.
+    bad = aot_cache.FlyDSLAotCache("test_bad_sources", sources=["kernels/nope.py"])
+    with pytest.raises(aot_cache._SourceListError, match="does not exist"):
+        bad._kernel(("k",), make_exe, ())
+    monkeypatch.delenv("COMPILE_ONLY")
+    assert isinstance(bad._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
+
+
+def test_deleted_source_is_not_hashed(tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    src = _old_file(tmp_path / "gone.py", "X = 1\n")
+    cache = aot_cache.FlyDSLAotCache("test_deleted_source", sources=[src])
+    assert str(src) in cache._files
+    src.unlink()
+    aot_cache._file_digest.cache_clear()
+    with pytest.raises(RuntimeError, match="cannot be read"):
         cache._disk_key(("k",), ())
 
 
@@ -612,6 +784,9 @@ def test_launcher_with_a_defaulted_constexpr_is_guarded(monkeypatch, tmp_path):
     monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
     cache = aot_cache.FlyDSLAotCache("test_default_constexpr")
     # The first launch leaves the constexpr to its default: nothing is baked.
+    monkeypatch.setenv("COMPILE_ONLY", "1")  # the prebuild
+    assert cache._resolve(("k",), lambda: exe, (4,)) is None
+    monkeypatch.delenv("COMPILE_ONLY")
     kernel = cache._resolve(("k",), lambda: exe, (4,))
     kernel(4)
     kernel(8)
@@ -637,7 +812,7 @@ def test_sidecar_of_another_shape_is_skipped(tmp_path):
 
     for i, text in enumerate(('{"sources": {}}', "[]", "{}", '{"baked": 3}')):
         (tmp_path / f"d-{i}.json").write_text(text)
-        (tmp_path / f"d-{i}.o").write_bytes(b"object")
+        (tmp_path / f"d-{i}.o").write_bytes(b"\x7fELF object")
     assert FlyDSLAotCache._find(tmp_path, "d", ()) is None
 
 
@@ -737,10 +912,16 @@ def child():
     for row in t.shipped_rows():
         if row[5] in QUANTS and Config.from_string(row[-1]).use_prefill:
             picked.setdefault(row[5], row)
+    prebuild = "COMPILE_ONLY" in os.environ
     for token, md, inter, e, topk, quant, act, config in picked.values():
-        impl, request, _, _ = t.check_moe(
-            token, md, inter, e, topk, quant, act, "random", config
-        )
+        try:
+            impl, request, _, _ = t.check_moe(
+                token, md, inter, e, topk, quant, act, "random", config
+            )
+        except AssertionError:
+            if not prebuild:
+                raise
+            continue  # nothing was launched, so there is no output to check
         out = impl(request)
         torch.cuda.synchronize()
         digest = hashlib.sha256(out.float().cpu().numpy().tobytes()).hexdigest()
@@ -761,11 +942,12 @@ def child():
     print("STATE " + json.dumps(state), flush=True)
 
 
-def run_mode(mode, cache_dir):
+def run_mode(mode, cache_dir, extra_env=None):
     env = {
         **os.environ,
         "AITER_FLYDSL_AOT_CACHE": mode,
         "AITER_FLYDSL_AOT_CACHE_DIR": cache_dir,
+        **(extra_env or {}),
     }
     proc = subprocess.run(
         [sys.executable, __file__, "--child"],
@@ -783,7 +965,7 @@ def run_mode(mode, cache_dir):
             outs[name] = digest
         elif line.startswith("STATE "):
             state = json.loads(line[len("STATE ") :])
-    assert outs, f"mode {mode} ran no prefill row"
+    assert outs or "COMPILE_ONLY" in env, f"mode {mode} ran no prefill row"
     return outs, state
 
 
@@ -801,21 +983,30 @@ def test_moe_gfx942_through_aot_cache():
         assert all(s["entries"] == 0 for s in state.values()), state
         assert not any(Path(cache_dir).rglob("*.o")), "mode 0 wrote the AOT cache"
 
+        # A launch never builds: with no entry it traces, as mode 0 does.
         miss, state = run_mode("1", cache_dir)
         state.pop("gemm factories")
         entries = {name: s["entries"] for name, s in state.items()}
         for name, s in state.items():
             assert s["entries"] > 0, f"{name} launched nothing through the cache"
-            assert s["jit"] == 0, f"{name} fell back to the JIT: {s}"
-            assert s["builds"] == s["entries"], f"{name} did not export: {s}"
+            assert s["jit"] == s["entries"], f"{name} did not trace a miss: {s}"
+            assert s["builds"] == 0, f"{name} built at a launch: {s}"
+        assert not any(Path(cache_dir).rglob("*.o")), "a launch wrote the AOT cache"
+
+        # The prebuild: the same calls under COMPILE_ONLY export every entry.
+        _, state = run_mode("1", cache_dir, {"COMPILE_ONLY": "1"})
+        state.pop("gemm factories")
+        for name, s in state.items():
+            assert s["builds"] == entries[name], f"{name} prebuild: {s}"
         built = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
+        assert len(built) == sum(entries.values())
 
         hit, state = run_mode("1", cache_dir)
         assert state.pop("gemm factories") == 0, "a hit built a GEMM launcher"
         for name, s in state.items():
             # Every launcher still goes through the cache, and loads.
             assert s["entries"] == entries[name], f"{name} skipped the cache: {s}"
-            assert s["jit"] == 0 and s["builds"] == 0, f"{name} rebuilt: {s}"
+            assert s["jit"] == 0 and s["builds"] == 0, f"{name} traced: {s}"
         after = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
         assert after == built, "aot hit rewrote the AOT cache"
 

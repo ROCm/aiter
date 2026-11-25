@@ -7,20 +7,21 @@ Each mode runs in a fresh process, because trace cost only shows there:
 
 * ``jit``: ``AITER_FLYDSL_AOT_CACHE=0``. FlyDSL traces every config, even
   when its own disk cache is warm.
-* ``aot miss``: ``=1`` with an empty cache directory. Traces and exports.
+* ``aot miss``: ``=1`` with an empty cache directory. Traces, as ``jit``
+  does, and writes nothing. A ``COMPILE_ONLY`` run then prebuilds the entries.
 * ``aot hit``: ``=1`` again on the same directory. Loads the ``.o`` with
   ``flyc.load_module``, no trace.
 * ``aot verify``: ``=verify`` on the same directory. Re-traces each hit and
   requires the re-exported object to match the cached one byte for byte.
 
 Each mode records the first-call time and the error against torch. All modes must also produce bitwise identical outputs, and each
-must have taken the path it names: a miss exports an ``.o``/``.json`` pair per
-entry, a hit neither traces nor writes, and no mode falls back to the JIT. The
+must have taken the path it names: the prebuild exports an ``.o``/``.json``
+pair per entry, a miss and a hit write nothing, and a hit does not trace. The
 test skips with a FlyDSL that has no ``flyc.load_module``, where every mode
 would run the JIT.
 
-It also checks invalidation by what an entry was built under: setting a
-variable the build read selects another build.
+It also checks that another value of a declared variable selects other
+entries.
 """
 
 import argparse
@@ -194,11 +195,18 @@ def check_paths(cache_dir, cases):
     assert state["traces"] == n, f"mode 0 did not trace every case: {state}"
     assert not cache_files(cache_dir), "mode 0 wrote the AOT cache"
 
+    # A process that launches never builds: a miss traces, as mode 0 does.
     RESULTS["aot miss"], state = run_mode("1", cache_dir, cases)
-    entries = state["entries"]
-    assert 0 < entries <= n, f"aot miss: {state}"
-    assert state["jit"] == 0, f"aot miss fell back to the JIT: {state}"
-    assert state["builds"] == entries, f"aot miss did not export every entry: {state}"
+    assert state["jit"] == state["entries"] > 0, f"aot miss: {state}"
+    assert state["builds"] == 0, f"aot miss built an entry: {state}"
+    assert not cache_files(cache_dir), "a launch wrote the AOT cache"
+
+    # The prebuild: the same calls under COMPILE_ONLY export every entry and
+    # launch nothing.
+    _, state = run_mode("1", cache_dir, cases, {"COMPILE_ONLY": "1"})
+    entries = state["builds"]
+    assert 0 < entries <= n, f"prebuild: {state}"
+    assert state["entries"] == 0, f"prebuild launched: {state}"
     built = cache_files(cache_dir)
     objects = {p[: -len(".o")] for p in built if p.endswith(".o")}
     sidecars = {p[: -len(".json")] for p in built if p.endswith(".json")}
@@ -210,16 +218,17 @@ def check_paths(cache_dir, cases):
 
     RESULTS["aot hit"], state = run_mode("1", cache_dir, cases)
     expected = {"entries": entries, "jit": 0, "builds": 0, "traces": 0, "factories": 0}
-    assert state == expected, f"aot hit traced or rebuilt: {state}"
+    assert state == expected, f"aot hit traced or built: {state}"
     assert cache_files(cache_dir) == built, "aot hit rewrote the AOT cache"
 
     RESULTS["aot verify"], state = run_mode("verify", cache_dir, cases)
     assert state["jit"] == 0 and state["builds"] == 0, f"aot verify: {state}"
     assert cache_files(cache_dir) == built, "aot verify rewrote the AOT cache"
 
-    rebuilt = {**expected, "builds": entries, "traces": entries, "factories": entries}
+    # Another value of a declared variable selects other entries: none here.
     _, state = run_mode("1", cache_dir, cases, {TEST_ENV: "1"})
-    assert state == rebuilt, f"a declared variable did not rebuild: {state}"
+    assert state["jit"] == state["entries"] > 0, f"a declared variable hit: {state}"
+    assert cache_files(cache_dir) == built, "a miss rewrote the AOT cache"
 
 
 def test_aot_cache():
