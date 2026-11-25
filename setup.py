@@ -24,7 +24,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.4.1"
+FLYDSL_VERSION = "flydsl==0.5.3"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -134,6 +134,11 @@ if _torch_version_below("2.9.1"):
     print(
         "[aiter] To use aiter-compatible triton, please upgrade torch to 2.9.1 or later."
     )
+elif sys.version_info < (3, 11):
+    print(
+        "[aiter] aiter's triton (3.9) needs Python 3.11 or newer; skipping the triton install"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
+    )
 elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
@@ -191,11 +196,11 @@ def prepare_packaging():
 
 
 if is_develop_mode():
-    packages = ["aiter"]
+    packages = ["aiter", "aiter.plugin"]
     write_install_mode()
 else:
     prepare_packaging()
-    packages = ["aiter_meta", "aiter"]
+    packages = ["aiter_meta", "aiter", "aiter.plugin"]
 
 
 def _is_metadata_only():
@@ -391,6 +396,9 @@ if PREBUILD_KERNELS != 0:
                 srcs=one_opt_args["srcs"],
                 flags_extra_cc=flags_cc,
                 flags_extra_hip=flags_hip,
+                flags_extra_hip_per_source=one_opt_args.get(
+                    "flags_extra_hip_per_source", {}
+                ),
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
                 extra_ldflags=one_opt_args.get("extra_ldflags"),

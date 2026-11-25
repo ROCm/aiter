@@ -167,7 +167,7 @@ struct mha_bwd_args
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
 {
-    void* ptr_dq; // 0x00: dq or dq_acc
+    void* ptr_dq; // 0x00: dq or dq_acc; the gfx942 hdim_q 192 kernels write dq with q's strides
     p2 _p0;
     void* ptr_dk; // 0x10
     p2 _p1;
@@ -190,6 +190,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     float log2e; // 0xa0
     p3 _p10;
     unsigned int seqlen_q; // 0xb0: s_seq_len_q
+                           //       group mode, gfx942 hdim_q 192 kernels: max_seqlen_q
     p3 _p11;
     unsigned int Ts; // 0xc0: s_Seqs_k*sub_K
     p3 _p12;
@@ -210,6 +211,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     unsigned int Seqs_dk; // 0x140: s_Seqs_dk
     p3 _p20;
     unsigned int seqlen_k; // 0x150: batch mode
+                           //        group mode, gfx942 hdim_q 192 kernels: max_seqlen_k
     p3 _p21;
     unsigned int head_dim_q; // 0x160: batch&group mode for headdim padding
     p3 _p22;
@@ -268,6 +270,8 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p44;
     unsigned int split_stride; // 0x2d0: deterministic only, bytes between dq_acc planes
     p3 _p45;
+    unsigned int gqa_ratio_magic_const; // 0x2e0: gqa ratio multiplicative inverse
+    p3 _p46;
 };
 
 struct __attribute__((packed)) fmha_bwd_odo_args
@@ -307,8 +311,8 @@ struct __attribute__((packed)) fmha_bwd_odo_args
 };
 
 // dq_shuffle & dq_convert post process kernel args
-// The head/batch strides are 64-bit because gfx1250 loads them as such; the other archs read the
-// low 32 bits.
+// The head/batch strides are 64-bit because gfx1250 loads them as such, and gfx950 the dq_acc
+// ones; the other archs read the low 32 bits.
 struct __attribute__((packed)) fmha_bwd_post_kernel_args
 {
     void* ptr_dq_acc;
