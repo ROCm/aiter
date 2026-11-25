@@ -32,10 +32,8 @@ _CUSTOM_ARGS = {
     "bench_fav3_sage_mxfp4.py": ["-b", "1", "-hq", "8", "-sq", "256", "-d", "128"],
     "bench_mla_decode.py": ["--model", "deepseek-V3", "--seqlen", "1024"],
     "bench_moe_gemm_a16w4.py": _MOE_SHAPE_ARGS,
-    "bench_moe_gemm_a4w4_cudagraph.py": _MOE_SHAPE_ARGS,
-    "bench_moe_gemm_a4w4_proton.py": _MOE_SHAPE_ARGS,
-    "bench_moe_gemm_a8w4_cudagraph.py": _MOE_SHAPE_ARGS,
-    "bench_moe_gemm_a8w4_proton.py": _MOE_SHAPE_ARGS,
+    "bench_moe_gemm_a4w4.py": _MOE_SHAPE_ARGS,
+    "bench_moe_gemm_a8w4.py": _MOE_SHAPE_ARGS,
     "bench_moe_gemm_a8w8.py": _MOE_SHAPE_ARGS,
     "bench_moe_gemm_a8w8_blockscale.py": _MOE_SHAPE_ARGS,
     "bench_moe_gemm_int8_smoothquant.py": [
