@@ -13,6 +13,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.utility import dtypes
+
 from ..tensor_shim import fx_to_torch_dtype, torch_to_fx_dtype
 
 MFMA_MNK = 16  # M=N=16; query rows are padded to M-tiles.
@@ -48,6 +50,15 @@ _NHD_V_BUF_BYTES = 4 * 64 * 256
 # bytes are MXFP4 too.
 FP8_KV_DTYPES = (fx.Float8E4M3FN, fx.Float8E4M3FNUZ)
 MXFP4_KV_DTYPE = fx.Float4E2M1FNx2
+# NVFP4 K/V (gfx1250, see ``nvfp4_kv``): the same packed e2m1 bytes with one E4M3
+# scale per 16 values. Per (page, kv head) the caches are token-major:
+# [128, D // 2] payload bytes and [128, D // 16] scale bytes. The
+# wave pipeline keeps NVFP4_RING pages in flight per wave, NVFP4_SLOT_BYTES each
+# (K and V payload [32, 64], K and V scales [32, 8] padded to 256 B). Rings of
+# 2/3/4 pages measured 75.3/74.9/74.3 us at 512 rows; 4 costs 18 KB more LDS
+# and over 256 VGPRs.
+NVFP4_RING = 3
+NVFP4_SLOT_BYTES = 4608
 PA_KV_DTYPES = (*FP8_KV_DTYPES, fx.BFloat16, MXFP4_KV_DTYPE)
 PA_QUERY_DTYPES = (fx.Float16, fx.BFloat16, fx.Float8E4M3FN)
 
@@ -76,6 +87,19 @@ def pa_fx_dtypes(kv_dtype, query_dtype):
     else:
         kv_fx = _pa_fx_dtype("KV", kv_dtype, PA_KV_DTYPES)
     return kv_fx, _pa_fx_dtype("query", query_dtype, PA_QUERY_DTYPES)
+
+
+def nvfp4_kv(kv_dtype, kv_scale_dtype):
+    """Whether K/V of ``kv_dtype`` with block scales of ``kv_scale_dtype`` are NVFP4.
+
+    NVFP4 and MXFP4 store the same packed e2m1 bytes (``dtypes.fp4x2``, or uint8);
+    NVFP4 scales each 16 values by an E4M3, MXFP4 each 32 by an E8M0, so the scale
+    dtype tells them apart.
+    """
+    return (
+        kv_dtype in (torch.uint8, dtypes.fp4x2)
+        and kv_scale_dtype == torch.float8_e4m3fn
+    )
 
 
 def d256_pipe(
@@ -1495,9 +1519,11 @@ class Gfx1250Traits:
     # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
     # partials at slot sequence * cluster_merge + part.
     cluster_runs: bool = False
-    # Emit OCP FP8 plus one FP32 descale per logical query token.
-    quant_output: bool = False
-    # With quant_output, False drops the BF16/FP16 store of the final output.
+    # Quantized final output: "fp8" emits OCP FP8 with one FP32 descale per
+    # logical query token, "mxfp8" with one E8M0 scale per 32 elements
+    # (group-local, no LDS).
+    quant_dtype: str | None = None
+    # With quant_dtype, False drops the BF16/FP16 store of the final output.
     store_output: bool = True
 
     WAVE = 32
@@ -1649,6 +1675,18 @@ class Gfx1250Traits:
             )
             else 64
         )
+
+    @property
+    def quant_output(self):
+        return self.quant_dtype is not None
+
+    @property
+    def quant_mx(self):
+        return self.quant_dtype == "mxfp8"
+
+    @property
+    def nvfp4(self):
+        return self.compute_dtype == "nvfp4"
 
     @property
     def bf16(self):
@@ -1804,6 +1842,9 @@ class Gfx1250Traits:
 
     @property
     def stats_offset(self):
+        if self.nvfp4:
+            # Past the wave rings; only the merge's arrival flag lives here.
+            return NVFP4_RING * self.NWARP * NVFP4_SLOT_BYTES
         return self.p_offset + self.p_bytes
 
     @property
@@ -1811,6 +1852,10 @@ class Gfx1250Traits:
         # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
         # No loop stage uses them, so a wave can publish its maxima while
         # others still read P.
+        if self.nvfp4:
+            # Past the merge's arrival flag: the post-loop wave merge aliases
+            # the rings, which other waves may still read.
+            return self.stats_offset + 16
         return self.stats_offset + 576
 
     @property
@@ -1823,7 +1868,9 @@ class Gfx1250Traits:
     @property
     def total_bytes(self):
         units = self.m_tiles * 16 // self.quant_unit
-        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
+        # MXFP8 groups are lane-local: no maxima in LDS.
+        per_token = self.quant_output and not self.quant_mx
+        return self.quant_offset + (units * self.NWARP * 4 if per_token else 0)
 
     @property
     def use_tdm(self):

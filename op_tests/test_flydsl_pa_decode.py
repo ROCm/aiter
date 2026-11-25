@@ -238,7 +238,8 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     split groups; sequences above 32 partitions take the LDS branch and match
     a float64 reference. Slots past the live tasks hold NaN. gfx950 splits only
     dual-mode CTAs (bounds above 64), and its single 32-partition dual rung
-    must match the register-only ladder bit for bit.
+    must match the register-only ladder bit for bit. On gfx1250 the same
+    kernels with the MXFP8 output store the same rows and their group-32 quant.
     """
     arch = get_gfx_runtime()
     if arch not in ("gfx950", "gfx1250"):
@@ -281,7 +282,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     def pairs_for(partitions):
         return head_size % 128 == 0 if partitions > 32 else head_size in (128, 256)
 
-    def run(partitions, groups):
+    def run(partitions, groups, mxfp8=None):
         pairs = pairs_for(partitions)
         compiled = compile_pa_decode_ps_reduce(
             architecture=arch,
@@ -294,6 +295,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             query_group_size=rows,
             pairs=pairs,
             parallel_groups=groups,
+            **({"quant_dtype": "mxfp8"} if mxfp8 else {}),
         )
         out = torch.full(
             (len(counts), 1, kv_heads, rows, head_size),
@@ -322,6 +324,11 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             ptr_arg(reduce_info, fx.Int32),
             -(-(1 << 30) // rows),
             -(-(1 << 30) // (rows * kv_heads)),
+            *(
+                [ptr_arg(tensor, fx.Uint8) for tensor in mxfp8]
+                if mxfp8
+                else [flyc.from_c_void_p(fx.Uint8, 0)] * 2
+            ),
             torch.cuda.current_stream(),
         )
         return out
@@ -380,6 +387,28 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             f"split_groups partitions={partitions} split={split}: "
             f"mismatch ratio={err}"
         )
+        if arch != "gfx1250":
+            continue
+        # The same kernels with the MXFP8 output store the same rows and their
+        # quant. The FP8 and scale buffers have the output's size, which bounds
+        # every offset the kernel forms, and are poisoned: unwritten bytes show.
+        for groups, plain in ((1, single), (split, grouped)):
+            fp8 = torch.empty_like(plain, dtype=dtypes.fp8)
+            scale = torch.empty(
+                len(counts),
+                plain[0].numel() // 32,
+                dtype=dtypes.fp8_e8m0,
+                device=device,
+            )
+            fp8.view(torch.uint8).fill_(0x7F)
+            scale.view(torch.uint8).fill_(0xFF)
+            out = run(partitions, groups, (fp8, scale))[bounded]
+            ref_fp8, ref_scale = _mxfp8_quant(out)
+            assert torch.equal(out.view(torch.int16), plain[bounded].view(torch.int16))
+            assert torch.equal(
+                fp8.view(torch.uint8)[bounded], ref_fp8.view(torch.uint8)
+            )
+            assert torch.equal(scale.view(torch.uint8)[bounded], ref_scale)
 
 
 @pytest.mark.parametrize(
@@ -1874,6 +1903,8 @@ _INVALID_CASES = [
     ("bf16-quantized-output", TypeError, "quantized_output must use OCP FP8"),
     ("rows-output-scale", ValueError, "output_scale shape"),
     ("fp16-output-scale", TypeError, "output_scale must be float32"),
+    # An E8M0 scale holds one byte per 32 elements of a row, not one per row.
+    ("e8m0-row-output-scale", ValueError, r"output_scale shape .* must be \(\d+, 32\)"),
 ]
 # FP8-output arguments pa_decode refuses before any kernel compiles.
 _QUANT_ARG_ERRORS = {
@@ -1888,6 +1919,7 @@ _QUANT_OPERAND_ERRORS = {
     "bf16-quantized-output": {"fp8": torch.bfloat16},
     "rows-output-scale": {"scale_tail": ()},
     "fp16-output-scale": {"scale": torch.float16},
+    "e8m0-row-output-scale": {"scale": dtypes.fp8_e8m0},
 }
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
@@ -2671,6 +2703,28 @@ def _run_pa_decode_case(case, device, monkeypatch):
         _check_nhd_contracts(pa, output, arguments, options, plan, check)
     if case["quant"] and arch == "gfx1250":
         _check_quant_output(launch, query, output, compile_kwargs, case)
+        # FP8 and BF16 tiles leave the MXFP8 output to the reducer, whatever
+        # the V layout and the K/V scales: one of each checks it. Its plan may
+        # round differently from the plain call's, so the reference calls take
+        # it too, with an MXFP8 output of their own.
+        if case["trans_v"] and case["scale_mode"] != "per-token":
+            scratch = {
+                "quantized_output": torch.empty_like(output, dtype=dtypes.fp8),
+                "output_scale": torch.empty(
+                    output.shape[0],
+                    output[0].numel() // 32,
+                    dtype=dtypes.fp8_e8m0,
+                    device=device,
+                ),
+            }
+            _check_quant_output(
+                lambda **quant: launch(**{**scratch, **quant}),
+                query,
+                output,
+                compile_kwargs,
+                {**case, "quant": "fallback", "mx": True},
+            )
+            check()
     elif case["quant"]:
         with pytest.raises(NotImplementedError, match="requires gfx1250"):
             launch(
@@ -2782,24 +2836,43 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
             )
 
 
+def _mxfp8_quant(x):
+    """Group-32 MXFP8 of the rows of ``x`` as o_proj's split quant: E8M0 scale
+    ceil_pow2(max(amax, 1e-10) / 448), values clamped to +-448, RNE."""
+    groups = x.float().flatten(1).unflatten(-1, (-1, 32))
+    amax = groups.abs().amax(-1).clamp_min(1e-10)
+    bits = (amax * torch.tensor(1.0 / 448.0, device=x.device)).view(torch.int32)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).int()
+    scaled = groups * ((254 - code).clamp_min(0) << 23).view(torch.float32)[..., None]
+    return scaled.clamp(-448.0, 448.0).to(dtypes.fp8).view(x.shape), code.byte()
+
+
 def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
-    """The FP8 output equals PA's output and the standalone per-token quant bit
-    for bit, eagerly and in graph replays; poisoned outputs show every row is
-    written, padded rows included. ``case["quant"]`` pins the path: "fused"
-    quantizes in the tile epilogue, "fallback" runs the standalone quant after
-    the BF16 output, so a plan that silently stops fusing fails here.
+    """The FP8 output equals a separate quant of PA's output bit for bit (the
+    standalone per-token quant, or with ``case["mx"]`` the group-32 MXFP8 one),
+    eagerly and in graph replays; poisoned outputs show every row is written,
+    padded rows included. ``case["quant"]`` pins the path: "fused" quantizes in
+    the tile epilogue; "fallback" runs the standalone quant after the BF16
+    output, or leaves the MXFP8 output to the reducer, so a plan that silently
+    stops fusing fails here.
     """
-    fused = case["quant"] == "fused"
+    fused, mx = case["quant"] == "fused", case.get("mx", False)
+    tile_quant = ("mxfp8" if mx else "fp8") if fused else None
     rows = output.shape[0]
     fp8 = torch.empty(
         (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device
     )
-    scale = torch.empty(rows + pad, 1, device=output.device)
+    scale = torch.empty(
+        rows + pad,
+        output[0].numel() // 32 if mx else 1,
+        dtype=dtypes.fp8_e8m0 if mx else torch.float32,
+        device=output.device,
+    )
 
     def run(store_output):
         output.fill_(float("nan"))
         fp8.view(torch.uint8).fill_(0x7F)
-        scale.fill_(float("nan"))
+        scale.view(torch.uint8).fill_(0xFF)
         launch(
             quantized_output=fp8,
             output_scale=scale,
@@ -2810,20 +2883,25 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
     def check(store_output):
         stored = output.clone()
         launch()
-        ref_fp8, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(
-            scale[:rows]
-        )
-        dynamic_per_token_scaled_quant(
-            ref_fp8.view(rows, -1), output.view(rows, -1), ref_scale
-        )
+        if mx:
+            ref_fp8, ref_scale = _mxfp8_quant(output)
+        else:
+            ref_fp8, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(
+                scale[:rows]
+            )
+            dynamic_per_token_scaled_quant(
+                ref_fp8.view(rows, -1), output.view(rows, -1), ref_scale
+            )
         assert torch.equal(stored, output) if store_output else stored.isnan().all()
         assert torch.equal(fp8[:rows].view(torch.uint8), ref_fp8.view(torch.uint8))
-        assert torch.equal(scale[:rows], ref_scale)
-        assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
+        assert torch.equal(scale[:rows].view(torch.uint8), ref_scale.view(torch.uint8))
+        # Padded rows: FP8 zeros with a unit scale (E8M0 127).
+        ones = scale[rows:].view(torch.uint8) == 127 if mx else scale[rows:] == 1
+        assert (fp8[rows:].view(torch.uint8) == 0).all() and ones.all()
 
     for store_output in (True, False):
         run(store_output)
-        assert compile_kwargs[-1].get("quant_output", False) == fused
+        assert compile_kwargs[-1].get("quant_dtype") == tile_quant
         check(store_output)
     if case["capture"]:
         stream = torch.cuda.Stream()
@@ -3038,3 +3116,234 @@ def test_pa_decode_nhd_partial_tile_zero_logits(device):
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+# NVFP4 K/V (gfx1250 wave tile), the MiniMax-M3 sparse KV pool layout: per (page,
+# KV head) [128, D / 2] e2m1 bytes (element 2j in the low nibble) and [128, D / 16]
+# E4M3 scales. Every row is its own sequence over a compacted table of its top-16
+# pages, the partial tail page last, as ATOM builds it.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _nvfp4_dequant(payload, scales):
+    codes = torch.stack([payload & 15, payload >> 4], -1).flatten(-2).long()
+    values = torch.tensor(_E2M1, device=payload.device)[codes & 7]
+    values = values * (1 - 2 * (codes >> 3)).float()
+    return (values.unflatten(-1, (-1, 16)) * scales.float()[..., None]).flatten(-2)
+
+
+def _nvfp4_inputs(
+    rows,
+    device,
+    dtype,
+    kv_heads=1,
+    group=16,
+    max_len=2048,
+    query_length=1,
+    window=0,
+    sinks=False,
+    interleave=False,
+):
+    """Query, (K, K scales, V, V scales), table, lengths, sinks and the fp32
+    reference over the dequantized cache. ``interleave`` stores a page's K and V
+    scales side by side, so both planes are strided views."""
+    g = torch.Generator(device=device).manual_seed(0)
+    seqs, pages = rows // query_length, rows // query_length * 16 + 8
+    shape = (2, pages, kv_heads, 128)
+    payload = torch.randint(0, 256, (*shape, 64), generator=g, device=device)
+    # K head rows spread over E4M3's range, as real activations are.
+    spread = torch.randint(-6, 4, (*shape, 1), generator=g, device=device)
+    spread[1] = -1
+    scales = torch.rand(*shape, 8, generator=g, device=device) * torch.exp2(spread)
+    payload, scales = payload.to(torch.uint8), scales.to(torch.float8_e4m3fn)
+    perm = torch.randperm(pages, generator=g, device=device)
+    table = perm[: seqs * 16].view(seqs, 16).int()
+    lengths = torch.randint(1, max_len + 1, (seqs,), generator=g, device=device)
+    lengths[::7], lengths[3::11] = max_len, 0
+    lengths[5::13] = lengths[5::13] % 128 + 1
+    # Nonempty MTP sequences hold their own query tokens.
+    lengths = torch.where(lengths > 0, lengths.clamp(min=query_length), lengths).int()
+    query = torch.randn(rows, kv_heads * group, 128, generator=g, device=device)
+    query[:, ::5] *= 8  # o_proj inputs of very different magnitude per head
+    query = query.to(dtype)
+    # Sinks as large as the scores' log-sum-exp, so that dropping them shows.
+    sink = torch.linspace(0, 40, kv_heads * group, device=device) if sinks else None
+    k, v = _nvfp4_dequant(payload, scales).unbind(0)
+    expected = _reference(query, k, v, table, lengths, query_length, window, sink)
+    if interleave:
+        ks, vs = scales.transpose(0, 1).contiguous().unbind(1)
+    else:
+        ks, vs = scales.unbind(0)
+    for seq, n in enumerate(lengths.tolist()):
+        if n % 128:  # never-written tail bytes must not be read
+            for plane in (ks, vs):
+                plane[table[seq, (n - 1) // 128], :, n % 128 :] = float("nan")
+    k, v = payload.unbind(0)
+    return query, (k, ks, v, vs), table, lengths, sink, expected
+
+
+def _nvfp4_mode(kwargs):
+    if kwargs.get("cluster_merge"):
+        shared = kwargs.get("cluster_seqs", 1)
+        return f"cluster{kwargs['cluster_merge']}" + (
+            f"x{shared}" if shared > 1 else ""
+        )
+    if kwargs.get("direct_output"):
+        return "direct" if kwargs["num_partitions"] == 1 else "merge"
+    return "reduce"
+
+
+# name: (rows, plan kwargs, input kwargs, output mode). M3.1 TP4 shapes (GQA 16,
+# D128, top-16 pages); MTP rows are flattened to one row each. Sequences of more
+# than 16 rows (query_length x GQA) split their query positions over CTAs.
+_NVFP4_CASES = {
+    "decode-c4": (4, {}, {}, "cluster8"),
+    "decode-c64": (64, {}, {}, "cluster8"),
+    "mtp8-c4": (32, {}, {}, "cluster8"),
+    "mtp8-c64": (512, {}, {}, "merge"),
+    "direct": (32, {"max_partitions": 1}, {}, "direct"),
+    "direct-prefill": (1024, {"max_partitions": 1}, {"max_len": 1024}, "direct"),
+    "cluster8-c64": (64, {"max_partitions": 8, "workgroup_budget": 512}, {}, "cluster8"),
+    "cluster4-short": (64, {"max_partitions": 8, "workgroup_budget": 512}, {"max_len": 1024}, "cluster4"),
+    "last-arriver-merge": (8, {"max_partitions": 8, "workgroup_budget": 1}, {}, "merge"),
+    "shared-cluster2": (512, {"max_partitions": 2, "workgroup_budget": 1024}, {}, "cluster2x4"),
+    "shared-cluster3": (512, {"max_partitions": 3, "workgroup_budget": 1536}, {}, "cluster3x4"),
+    "shared-cluster8": (300, {"max_partitions": 8, "workgroup_budget": 4096}, {}, "cluster8x2"),
+    "reducer": (600, {"max_partitions": 8, "workgroup_budget": 4800}, {}, "reduce"),
+    "short-rows": (96, {}, {"max_len": 200}, "reduce"),
+    "f16-query": (32, {"max_partitions": 1}, {"dtype": torch.float16}, "direct"),
+    "fp4x2-view": (16, {}, {"view": dtypes.fp4x2}, "cluster8"),
+    "gqa8-two-kv-heads": (32, {}, {"kv_heads": 2, "group": 8}, "cluster8"),
+    "mtp2-gqa8": (16, {}, {"group": 8, "query_length": 2}, "cluster8"),
+    "mtp2-two-kv-heads-reducer": (600, {"max_partitions": 8, "workgroup_budget": 4800}, {"kv_heads": 2, "group": 8, "query_length": 2}, "reduce"),
+    "mtp2-split2": (16, {}, {"query_length": 2}, "cluster8"),
+    "mtp2-split2-direct": (32, {"max_partitions": 1}, {"query_length": 2}, "direct"),
+    "mtp4-split4-merge": (32, {"max_partitions": 8, "workgroup_budget": 1}, {"query_length": 4}, "merge"),
+    "mtp4-gqa8-two-kv-heads-split2": (64, {}, {"kv_heads": 2, "group": 8, "query_length": 4}, "cluster8"),
+    "mtp3-split3": (12, {}, {"query_length": 3}, "cluster8"),
+    "mtp3-gqa8-split3-merge": (24, {"max_partitions": 8, "workgroup_budget": 1}, {"group": 8, "query_length": 3}, "merge"),
+    "mtp8-split8-direct": (64, {"max_partitions": 1}, {"query_length": 8}, "direct"),
+    "sinks": (32, {}, {"sinks": True}, "reduce"),
+    "mtp2-split2-sinks": (32, {}, {"query_length": 2, "sinks": True}, "reduce"),
+    "mtp5-gqa4-split5-sinks": (20, {}, {"group": 4, "query_length": 5, "sinks": True}, "reduce"),
+    "window-direct": (32, {"max_partitions": 1}, {"window": 300}, "direct"),
+    "window-mtp2-merge": (16, {"max_partitions": 8, "workgroup_budget": 1}, {"group": 8, "query_length": 2, "window": 300}, "merge"),
+    "window-mtp2-split2": (16, {}, {"query_length": 2, "window": 300}, "cluster3"),
+    "window-sinks": (32, {}, {"window": 77, "sinks": True}, "reduce"),
+    "interleaved-scales": (32, {}, {"interleave": True}, "cluster8"),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", list(_NVFP4_CASES))
+def test_pa_decode_nvfp4(case, device, monkeypatch):
+    """NVFP4 K/V against an fp32 reference over the dequantized cache, then the
+    per-token FP8 and the MXFP8 outputs bit for bit against separate quants of
+    the same call's output."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("NVFP4 pa_decode runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    rows, plan_kwargs, kwargs, mode = _NVFP4_CASES[case]
+    kwargs = dict(kwargs)
+    dtype, view = kwargs.pop("dtype", torch.bfloat16), kwargs.pop("view", torch.uint8)
+    query, (k, ks, v, vs), table, lengths, sinks, expected = _nvfp4_inputs(
+        rows, device, dtype, **kwargs
+    )
+    query_length, window = kwargs.get("query_length", 1), kwargs.get("window", 0)
+    plan = pa.plan_pa_decode(
+        lengths,
+        k.shape[1],
+        query_length=query_length,
+        sliding_window=window,
+        **plan_kwargs,
+    )
+    compiled = []
+    compile_tile = pa.compile_pa_decode_tile
+    monkeypatch.setattr(
+        pa,
+        "compile_pa_decode_tile",
+        lambda **kw: compiled.append(kw) or compile_tile(**kw),
+    )
+    output = torch.empty_like(query)
+    launch = partial(
+        pa.pa_decode, output, query, k.view(view), v.view(view), lengths, table,
+        128**-0.5, query_length, key_scale=ks, value_scale=vs, work_plan=plan,
+        max_context_length=kwargs.get("max_len", 2048), sinks=sinks,
+        sliding_window=window,
+    )  # fmt: skip
+    for _ in range(2):  # the second call takes the recorded-launch path
+        output.fill_(float("nan"))
+        launch()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    assert compiled[-1]["kv_scale_dtype"] == torch.float8_e4m3fn
+    assert _nvfp4_mode(compiled[-1]) == mode
+    # Empty rows free slots, so merge plans split some row over several tasks.
+    assert mode != "merge" or (plan.reduce_info[:, 1] > 1).any()
+    # One KV head a CTA, or a cluster merging one sequence (a shared cluster's
+    # mode ends in its sequence count), holds whole tokens; query-split tiles
+    # do not.
+    fused = (
+        k.shape[1] == 1
+        and (mode == "direct" or (mode.startswith("cluster") and "x" not in mode))
+        and query_length * kwargs.get("group", 16) <= 16
+    )
+    quant = {"quant": "fused" if fused else "fallback", "capture": True}
+    _check_quant_output(launch, query, output, compiled, quant)
+    # MXFP8 groups lie in one head row: the tile writes them in every mode that
+    # writes final rows, query-split tiles included.
+    mx = {"quant": "fallback" if mode == "reduce" else "fused", "mx": True}
+    _check_quant_output(launch, query, output, compiled, {**mx, "capture": True})
+
+
+def test_pa_decode_nvfp4_rejects(device):
+    """Partial or unaligned scale planes, pages other than 128 tokens and more
+    than 16 query heads a KV head raise."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("NVFP4 pa_decode runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query, (k, ks, v, vs), table, lengths, _, _ = _nvfp4_inputs(
+        6, device, torch.bfloat16
+    )
+    plan = pa.plan_pa_decode(lengths, 1)
+    call = partial(
+        pa.pa_decode, torch.empty_like(query), query, k, v, lengths, table, 0.1, 1,
+        work_plan=plan,
+    )  # fmt: skip
+    with pytest.raises(ValueError, match="key_scale/value_scale must be"):
+        call(key_scale=ks[..., :4], value_scale=vs[..., :4])
+    shifted = torch.empty(ks.numel() + 16, dtype=ks.dtype, device=device)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        call(key_scale=shifted[8 : 8 + ks.numel()].view(ks.shape), value_scale=vs)
+    # The same storage as 64-token pages: every page id stays in bounds even
+    # for the page-128 tile this call must not reach.
+    short = lengths.clamp(max=16 * 64)
+    k64, v64, ks64, vs64 = (x.view(2 * x.shape[0], 1, 64, -1) for x in (k, v, ks, vs))
+    with pytest.raises(NotImplementedError, match="page 128"):
+        pa.pa_decode(
+            torch.empty_like(query),
+            query,
+            k64,
+            v64,
+            short,
+            table,
+            0.1,
+            1,
+            key_scale=ks64,
+            value_scale=vs64,
+            work_plan=pa.plan_pa_decode(short, 1),
+        )
+    wide = torch.cat([query, query], 1)  # 32 query heads over the one KV head
+    with pytest.raises(NotImplementedError, match="16 query rows"):
+        pa.pa_decode(
+            torch.empty_like(wide),
+            wide,
+            k,
+            v,
+            lengths,
+            table,
+            0.1,
+            1,
+            key_scale=ks,
+            value_scale=vs,
+            work_plan=plan,
+        )
