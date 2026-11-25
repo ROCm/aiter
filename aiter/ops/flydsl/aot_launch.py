@@ -7,7 +7,7 @@ changing their call sites.
 A launcher factory opts in once, and every ``_run_compiled(exe, ...)`` of the
 launcher it returns then goes through the cache::
 
-    @aot_factory("moe_gfx942_gemm")
+    @aot_factory("moe_gfx942_gemm", sources=["kernels/moe_gemm_2stage/gfx9_fp8"])
     @functools.cache
     def _get_compiled_kernel(N, K, ...):
         return compile_gemm(...)
@@ -29,7 +29,17 @@ The cache key is the factory's arguments, so the factory's arguments must
 determine the launcher, which ``functools.cache`` on the factory already
 requires. The in-memory key is that key and ``_run_compiled``'s
 ``specialization_key``, as on the JIT path, which keeps one compiled function
-per launcher.
+per launcher. A ``specialization_key`` the cache cannot key on disk (an
+Enum, a numpy scalar) launches through the JIT path.
+
+A launcher's ``Constexpr`` launch arguments are compiled into the object, so
+each must be in ``specialization_key``, as on the JIT path. An entry on disk
+records their values and serves only calls that pass them; one key launched
+with two values raises.
+
+``factory.cache_clear()`` also drops the launchers the cache loaded and keeps
+the factory on the JIT path for the rest of the process: a caller that resets
+its factory wants a new trace, of state the cache may not track.
 
 Under ``AITER_FLYDSL_AOT_CACHE=0`` the launch takes ``_run_compiled``'s JIT
 path unchanged, and calling the launcher directly is unaffected.
@@ -39,6 +49,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import threading
 
 import flydsl.expr as fx
@@ -46,7 +57,13 @@ import torch
 
 from aiter import logger
 
-from .aot_cache import FlyDSLAotCache, _normalize_key, _UsageError, aot_cache_mode
+from .aot_cache import (
+    FlyDSLAotCache,
+    _JitKernel,
+    _normalize_key,
+    _UsageError,
+    aot_cache_mode,
+)
 
 __all__ = ["aot_factory", "bind_aot"]
 
@@ -63,7 +80,15 @@ _inside = _Inside()
 
 
 class _AotBinding:
-    __slots__ = ("cache", "key", "launcher", "make_exe")
+    __slots__ = (
+        "cache",
+        "epoch",
+        "kernels",
+        "key",
+        "launcher",
+        "make_exe",
+        "unkeyable",
+    )
 
     def __init__(self, cache: FlyDSLAotCache, key, make_exe, launcher):
         self.cache = cache
@@ -72,22 +97,75 @@ class _AotBinding:
         self.make_exe = make_exe
         # The launcher _run_compiled's JIT path runs when this returns False.
         self.launcher = launcher
+        # Specialization keys the cache cannot key on disk; they launch
+        # through the JIT path, like a factory argument it cannot key.
+        self.unkeyable = set()
+        # The objects the cache loaded for this launcher, by specialization
+        # key, while the cache's epoch is the one they were loaded in: a
+        # launch then hashes the specialization key, not the whole key.
+        self.kernels = {}
+        self.epoch = cache.epoch
 
     def __call__(self, args, specialization_key) -> bool:
         """Launch through the cache. False leaves the launch to the JIT path."""
         if _inside.active:
             return False
-        key = self.key if specialization_key is None else (self.key, specialization_key)
         # FlyDSLAotCache keys launch arguments by their FlyDSL type; a torch
         # stream has none. aiter launchers take the stream last, so only that
         # argument is checked (a stream elsewhere falls back to the JIT).
         if args and isinstance(args[-1], torch.cuda.Stream):
             args = (*args[:-1], fx.Stream(args[-1]))
+        cache = self.cache
+        kernel = self.kernels.get(specialization_key)
+        if (
+            kernel is not None
+            and self.epoch == cache.epoch
+            and "COMPILE_ONLY" not in os.environ
+        ):
+            if kernel.__class__ is _JitKernel:
+                # No entry for this key: it calls _run_compiled on the
+                # launcher, which comes back here.
+                _inside.active = True
+                try:
+                    kernel(*args)
+                finally:
+                    _inside.active = False
+            else:
+                kernel(*args)
+            return True
+        if specialization_key is None:
+            key = self.key
+        elif self.unkeyable and specialization_key in self.unkeyable:
+            return False
+        else:
+            key = (self.key, specialization_key)
+        # Read before the launch: what is kept below belongs to this epoch
+        # even if another thread invalidates the cache meanwhile.
+        epoch = cache.epoch
+        if self.epoch != epoch:
+            self.kernels.clear()
+            self.epoch = epoch
         _inside.active = True
         try:
-            self.cache.launch(key, self.make_exe, *args)
+            cache.launch(key, self.make_exe, *args)
+        except _UsageError as e:
+            # Raised when the key is hashed for the disk, before any build or
+            # launch. self.key was checked when it was bound.
+            if specialization_key is None:
+                raise
+            logger.error(
+                f"[FlyDSL AOT] {self.cache.name}: {e} in specialization_key; "
+                f"launching it through the JIT path"
+            )
+            self.unkeyable.add(specialization_key)
+            return False
         finally:
             _inside.active = False
+        kernel = cache._mem.get(key)
+        # Also the JIT kernel of a key with no entry, so that its launches
+        # skip the lookup too; compile-only leaves nothing to keep.
+        if kernel is not None and self.epoch == epoch == cache.epoch:
+            self.kernels[specialization_key] = kernel
         return True
 
 
@@ -98,7 +176,7 @@ def _storable(cache: FlyDSLAotCache, key) -> bool:
     try:
         _normalize_key(key)
     except _UsageError as e:
-        logger.info(f"[FlyDSL AOT] {cache.name}: {e}; launching through the JIT path")
+        logger.error(f"[FlyDSL AOT] {cache.name}: {e}; launching through the JIT path")
         return False
     return True
 
@@ -114,8 +192,18 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
         return exe
     current = getattr(exe, _ATTR, None)
     if current is None:
-        if not _storable(cache, key):
+        try:
             setattr(exe, _ATTR, False)
+        except (AttributeError, TypeError):
+            # Not one launcher (a factory returning a tuple or a dict of them):
+            # nothing to bind, so its launchers take the JIT path. Bind each
+            # with bind_aot where it is built.
+            logger.error(
+                f"[FlyDSL AOT] {cache.name}: cannot bind a "
+                f"{type(exe).__name__}; launching through the JIT path"
+            )
+            return exe
+        if not _storable(cache, key):
             return exe
 
         def launcher():
@@ -124,7 +212,7 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
         setattr(exe, _ATTR, _AotBinding(cache, key, make_exe or launcher, launcher))
     elif current is not False and (current.cache is not cache or current.key != key):
         # One launcher object under two keys: the key does not determine it.
-        logger.warning(
+        logger.error(
             f"[FlyDSL AOT] {cache.name}: one launcher bound to keys "
             f"{current.key!r} and {key!r}; launching it through the JIT path"
         )
@@ -141,14 +229,19 @@ class _LazyLauncher:
         setattr(self, _ATTR, binding)
 
 
-def aot_factory(name: str, *, extra_sources=()):
+def aot_factory(name: str, *, sources=(), env=()):
     """Decorate a launcher factory so that the launchers it returns launch
     through a ``FlyDSLAotCache`` named ``name``, keyed by its arguments.
+
+    ``sources`` are the files those launchers are built from, besides the one
+    of the factory and the common ones, and ``env`` the environment variables
+    their code reads
+    (see ``FlyDSLAotCache``).
 
     Place it above ``functools.cache``. Under ``AITER_FLYDSL_AOT_CACHE=0`` it
     returns the factory itself, with ``lazy`` the factory.
     """
-    cache = FlyDSLAotCache(name, extra_sources)
+    cache = FlyDSLAotCache(name, sources, env)
 
     def decorate(factory):
         if aot_cache_mode() == "0":
@@ -161,55 +254,45 @@ def aot_factory(name: str, *, extra_sources=()):
             for name, p in signature.parameters.items()
             if p.kind is inspect.Parameter.VAR_KEYWORD
         }
-        # Calls whose key is checked, and lazy handles, by call: the factory
-        # runs on every launch of some callers, so a key is built once per
-        # call. Calls with and without keyword arguments are kept apart.
-        seen, seen_kw = set(), set()
-        handles, handles_kw = {}, {}
+        # Calls whose result cannot be bound (not one launcher).
+        unbound = set()
 
-        def key_of(bound):
+        def key_of(args, kwargs):
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
             return tuple(
                 (name, tuple(sorted(value.items())) if name in var_keyword else value)
                 for name, value in bound.arguments.items()
             )
 
+        def bind(exe, args, kwargs):
+            call = (args, tuple(kwargs.items()))
+            if call not in unbound:
+                bind_aot(exe, cache, key_of(args, kwargs))
+                if getattr(exe, _ATTR, None) is None:
+                    unbound.add(call)
+
         @functools.wraps(factory)
         def wrapper(*args, **kwargs):
             exe = factory(*args, **kwargs)
-            if kwargs:
-                calls, call = seen_kw, (args, tuple(kwargs.items()))
-            else:
-                calls, call = seen, args
-            # A bounded factory cache may hand out a new launcher for a call
-            # already seen: bind every launcher not yet bound.
-            if call not in calls or getattr(exe, _ATTR, None) is None:
-                calls.add(call)
-                bound = signature.bind(*args, **kwargs)
-                bound.apply_defaults()
-                bind_aot(exe, cache, key_of(bound))
+            # Some callers run the factory on every launch: a launcher already
+            # bound costs one attribute read. A launcher is what it is under
+            # any arguments that return it, so its first key stands.
+            if getattr(exe, _ATTR, None) is None:
+                bind(exe, args, kwargs)
             return exe
 
+        # Handles by call, built as the factory's own cache keys its calls.
+        @functools.cache
         def lazy(*args, **kwargs):
-            if kwargs:
-                calls, call = handles_kw, (args, tuple(kwargs.items()))
-            else:
-                calls, call = handles, args
-            handle = calls.get(call)
-            if handle is None:
-                bound = signature.bind(*args, **kwargs)
-                bound.apply_defaults()
-                key = key_of(bound)
-                if not _storable(cache, key):
-                    handle = calls[call] = wrapper(*args, **kwargs)
-                    return handle
-                # The cached factory, as the JIT path would call it: an AOT
-                # replay that only identifies kernels relies on one launcher
-                # per key to skip repeated traces.
-                make_exe = functools.partial(factory, *args, **kwargs)
-                handle = calls[call] = _LazyLauncher(
-                    _AotBinding(cache, key, make_exe, make_exe)
-                )
-            return handle
+            key = key_of(args, kwargs)
+            if not _storable(cache, key):
+                return wrapper(*args, **kwargs)
+            # The cached factory, as the JIT path would call it: an AOT
+            # replay that only identifies kernels relies on one launcher
+            # per key to skip repeated traces.
+            make_exe = functools.partial(factory, *args, **kwargs)
+            return _LazyLauncher(_AotBinding(cache, key, make_exe, make_exe))
 
         wrapper.aot_cache = cache
         wrapper.lazy = lazy
@@ -218,12 +301,13 @@ def aot_factory(name: str, *, extra_sources=()):
         if hasattr(factory, "cache_clear"):
 
             def cache_clear():
-                # Resets the factory only: an entry already launched, like one
-                # on disk, stays keyed by the factory's arguments, so state a
-                # launcher bakes in beyond them must be part of the key.
-                for calls in (seen, seen_kw, handles, handles_kw):
-                    calls.clear()
+                # The caller wants its launchers traced again, so state the
+                # cache does not track may have changed: drop the launchers
+                # it loaded and keep this factory on the JIT path.
+                unbound.clear()
+                lazy.cache_clear()
                 factory.cache_clear()
+                cache.invalidate()
 
             wrapper.cache_clear = cache_clear
         return wrapper

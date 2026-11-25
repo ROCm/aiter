@@ -1,4 +1,5 @@
 import argparse
+import itertools
 from collections.abc import Iterable
 from typing import TypeVar
 
@@ -182,6 +183,33 @@ def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
         # target_rot_pool_sz_mb might blow up the pool_len. This is not ideal
         # for capturing graph
         "max_pool_len": args.graph_kernels_per_graph,
+    }
+
+
+def add_sweep_argument(parser: argparse.ArgumentParser) -> None:
+    """Adds --sweep KEY=V1,V2 (repeat it for more keys): integer config values to
+    time, for a kernel that the tuning scripts cannot time."""
+    parser.add_argument(
+        "--sweep",
+        action="append",
+        metavar="KEY=V1,V2",
+        help="config values to time (repeat for more keys), for example BLOCKS=128,256",
+    )
+
+
+def get_sweep_configs(args: argparse.Namespace, default: str = "gluon") -> dict:
+    """The configs of --sweep as {line name: config values}: each combination of the
+    values. Without --sweep: {default: None}, the tuned config."""
+    if not args.sweep:
+        return {default: None}
+    keys, values = [], []
+    for item in args.sweep:
+        key, vals = item.split("=")
+        keys.append(key)
+        values.append([int(v) for v in vals.split(",")])
+    return {
+        ",".join(f"{k}={v}" for k, v in zip(keys, combo)): dict(zip(keys, combo))
+        for combo in itertools.product(*values)
     }
 
 

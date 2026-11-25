@@ -1914,8 +1914,8 @@ def test_presorted_moe_wrapper_error():
 def _presorted_aux_stub(ids, weights, E, block_m=16):
     """A registration whose sort tensors have the BM=16 aux-sort layout.
 
-    Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
-    matcher only checks the layout and no kernel reads them.
+    Sized like aiter.moev2.segments.sort._adaptive_moe_sort; contents are left unset,
+    since the matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
     BM = presorted_moe.PRESORTED_MOE_BLOCK_M
@@ -2307,7 +2307,11 @@ def test_output_buffer_contract():
         # whatever the fake said the op returned.
         return out.sum(), buf.sum()
 
-    sort = aiter.fused_moe._moe_sorting_impl
+    # moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+    # see aiter/moev2/README.md); its implementation is patched there.
+    import aiter.moev2.segments.sort as sorting
+
+    sort = sorting._moe_sorting_impl
 
     def sort_without_output(*a, **kw):
         kw["output"] = None
@@ -2318,7 +2322,7 @@ def test_output_buffer_contract():
     for in_place in (True, False):
         try:
             if not in_place:
-                aiter.fused_moe._moe_sorting_impl = sort_without_output
+                sorting._moe_sorting_impl = sort_without_output
             buf = fresh_buffer()
             assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
             assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
@@ -2330,7 +2334,7 @@ def test_output_buffer_contract():
             ], f"{in_place=}: eager {eager} != compiled {compiled}"
             assert eager[0] == eager[1] == ref.sum()
         finally:
-            aiter.fused_moe._moe_sorting_impl = sort
+            sorting._moe_sorting_impl = sort
 
     def expect_raise(described, **kwargs):
         try:
@@ -2915,7 +2919,13 @@ def test_plain_fp8_swiglu_limit_dispatch():
 
     for q in quant_types:
         # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        # per_Token still has the gfx942 whole-graph backend for that shape.
+        # per_Tensor does not, so it raises.
+        if q == aiter.QuantType.per_Token and get_gfx_runtime() == "gfx942":
+            md = dispatch(64, q, 7.0, inter=192)
+            assert md.full_impl is not None and md.stage1 is None, md
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
         raises(
             NotImplementedError,
             "swiglu_limit",
