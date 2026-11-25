@@ -332,14 +332,11 @@ def test_a16w4_flydsl_tuned_row_is_discarded_for_bias_or_interleave(
     [
         (A16W4_ROW, ActivationType.Situv2, dtypes.bf16, {"has_stage1_bias": True}),
         (A4W4_ROW, ActivationType.Swiglu, dtypes.fp4x2, {"has_stage1_bias": True}),
-        # An override that differs from the row's block_m (16 vs 32 here).
-        (A16W4_ROW, ActivationType.Situv2, dtypes.bf16, {"block_size_M": 32}),
         (A4W4_ROW, ActivationType.Swiglu, dtypes.fp4x2, {"block_size_M": 16}),
     ],
     ids=[
         "situv2-a16w4-bias",
         "swiglu-a4w4-bias",
-        "situv2-a16w4-block",
         "swiglu-a4w4-block",
     ],
 )
@@ -357,13 +354,22 @@ def test_flydsl_tuned_row_outside_swiglu_a16w4_is_kept(
 # A caller's block_size_M sizes moe_sorting and both gemms, but the row key does not
 # carry it: the a16w4 FlyDSL stage 1 would run 16-row tiles on a 32-row layout.
 @_SKIP
-def test_a16w4_flydsl_tuned_row_is_discarded_for_other_block_size(monkeypatch):
-    meta, discarded = _dispatch_tuned(monkeypatch, A16W4_ROW, block_size_M=32)
-    assert len(discarded) == 1 and "block_size_M=32" in discarded[0]
-    assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == (
-        "cktile",
-        "cktile",
+@pytest.mark.parametrize(
+    ("activation", "want_backend"),
+    [
+        (ActivationType.Swiglu, ("cktile", "cktile")),
+        (ActivationType.Situv2, ("flydsl", "flydsl")),
+    ],
+    ids=["swiglu", "situv2"],
+)
+def test_a16w4_flydsl_tuned_row_is_discarded_for_other_block_size(
+    monkeypatch, activation, want_backend
+):
+    meta, discarded = _dispatch_tuned(
+        monkeypatch, A16W4_ROW, activation=activation, block_size_M=32
     )
+    assert len(discarded) == 1 and "block_size_M=32" in discarded[0]
+    assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == want_backend
 
 
 class _Lookup(Exception):
@@ -541,6 +547,129 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert padded[0, 0].item() == src_value
     padded[0, 0] = pad_value
     assert torch.all(padded == pad_value)
+
+
+def _load_fallback_tables(monkeypatch, csv_name):
+    """Load primary/fallback dicts from one model CSV via the merged-config path.
+
+    AITER_CONFIGS.get_config_file() is LRU-cached with the env var read inside
+    the body (aiter/jit/core.py), so an AITER_CONFIG_FMOE env override is
+    ignored once another test resolved the path first. Replace the module's
+    AITER_CONFIGS with a stub pointing at the target CSV instead.
+    """
+    import os
+    import types
+
+    tune_file = os.path.join(
+        os.path.dirname(aiter.__file__), "configs", "model_configs", csv_name
+    )
+    if not os.path.exists(tune_file):
+        pytest.skip(f"{tune_file} not found")
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "AITER_CONFIGS",
+        types.SimpleNamespace(AITER_CONFIG_FMOE_FILE=tune_file),
+    )
+    monkeypatch.setattr(fused_moe_module, "cfg_2stages", None)
+    get_2stage_cfgs.cache_clear()
+
+    try:
+        # Trigger global config loading with config_file=None
+        get_2stage_cfgs(
+            16,
+            6144,
+            1536,
+            129,
+            5,
+            dtypes.bf16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Swiglu,
+            False,
+            0,
+            0,
+            config_file=None,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+    assert fused_moe_module.cfg_2stages is not None
+    return fused_moe_module.cfg_2stages
+
+
+def _fallback_rows_with_kn1_prefix(fallback, *prefixes):
+    return [
+        (k, cfg.get("kernelName1"), cfg.get("kernelName2"))
+        for k, cfg in fallback.items()
+        if isinstance(cfg.get("kernelName1"), str)
+        and cfg["kernelName1"].startswith(prefixes)
+    ]
+
+
+# _flydsl_stage1_wrapper parses tile parameters from the kernel name and compiles
+# with the caller's activation, so tuned FlyDSL rows legitimately serve
+# cross-activation fallback matches — the only row property a caller can violate
+# is the sorting layout (block_size_M vs the row's block_m).
+@_SKIP
+@pytest.mark.parametrize(
+    ("block_size_M", "want_discards"),
+    [(16, 0), (32, 1)],
+    ids=["matching-block", "mismatched-block"],
+)
+def test_fallback_cross_activation_match_validates_block_size(
+    monkeypatch, block_size_M, want_discards
+):
+    # The tuned CSV only has gfx950/cu_num=256 rows; pin the runtime to match.
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+
+    _, fallback = _load_fallback_tables(
+        monkeypatch, "minimax_m3_a16w4_tuned_fmoe.csv"
+    )
+    assert _fallback_rows_with_kn1_prefix(
+        fallback, "flydsl_moe1_abf16_wfp4_"
+    ), "expected FlyDSL a16w4 rows in the activation-disabled fallback map"
+
+    # A SiTUv2 call at the tuned Swiglu key (token=16, H=6144, I=1536, E=129,
+    # topk=5, block_m=16) matches only through the fallback map.
+    warnings = _collect_warnings(monkeypatch)
+    get_2stage_cfgs.cache_clear()
+    try:
+        meta = get_2stage_cfgs(
+            16,
+            6144,
+            1536,
+            129,
+            5,
+            dtypes.bf16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Situv2,
+            False,
+            0,
+            0,
+            is_shuffled=True,
+            opus_weights_shuffled=True,
+            block_size_M=block_size_M,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+    discarded = _a16w4_discards(warnings)
+    assert len(discarded) == want_discards, f"warnings: {warnings}"
+    if want_discards:
+        assert "block_size_M=32" in discarded[0]
+    else:
+        assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == (
+            "flydsl",
+            "flydsl",
+        )
+        assert meta.block_m == 16
 
 
 if __name__ == "__main__":

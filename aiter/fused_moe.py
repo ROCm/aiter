@@ -4908,7 +4908,6 @@ def get_2stage_cfgs(
             )
         elif (
             kn1.startswith("flydsl_moe1_abf16_wfp4_")
-            and activation == ActivationType.Swiglu
             and block_size_M is not None
             and int(block_size_M) != int(cfg["block_m"])
         ):
@@ -4917,8 +4916,6 @@ def get_2stage_cfgs(
             # nothing; stage 2 then raises "sorting layout mismatch". CK-Tile gets
             # block_m at call time, so these calls keep the route they had without
             # a row. The a16w4 prefix leaves a16w16 rows to their ValueError guard.
-            # Restricted to Swiglu to keep existing SiLU/SiTUv2 model dispatch
-            # selections unchanged within this PR's compatibility scope.
             logger.warning(
                 f"[fused_moe] discarding a16w4 FlyDSL tuned config: block_size_M="
                 f"{block_size_M} differs from the row's block_m={cfg['block_m']}; "
