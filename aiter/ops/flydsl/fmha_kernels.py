@@ -396,9 +396,11 @@ def _flydsl_flash_attn_func_bf16(
                 lds_vec_width=(
                     lds_vec_width
                     if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16") is None
-                    else 16
-                    if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16") == "1"
-                    else 8
+                    else (
+                        16
+                        if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16") == "1"
+                        else 8
+                    )
                 ),
                 token_strides=tuple(tok for tok, _ in strides),
                 return_lse=return_lse,
@@ -500,9 +502,7 @@ def flydsl_flash_attn_func(
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     # BF16/F16 also takes fewer K/V heads than query heads (GQA / MQA).
     heads_ok = q.shape[2] == k.shape[2] or (
-        q.dtype not in _FP8_DTYPES
-        and k.shape[2] > 0
-        and q.shape[2] % k.shape[2] == 0
+        q.dtype not in _FP8_DTYPES and k.shape[2] > 0 and q.shape[2] % k.shape[2] == 0
     )
     if q.shape[0] != k.shape[0] or q.shape[3] != k.shape[3] or not heads_ok:
         raise ValueError(
