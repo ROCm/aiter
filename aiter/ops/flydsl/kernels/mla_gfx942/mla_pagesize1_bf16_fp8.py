@@ -44,11 +44,11 @@ LN2 = 0.6931471805599453
 VECTOR_BYTES = 16
 BF16_VECTOR_SIZE = VECTOR_BYTES // 2
 
-# Coordinates are (element, lane_group, half, column_group). Each lane group
-# reads 16 contiguous columns per group; one 16-byte LDS load feeds two MFMAs.
-# The permuted reduction order cancels in the dot product only if Q follows the
-# same layout; the Q loads spell it out as offsets.
-QK_COLUMN_LAYOUT = ((8, 4, 2, 9), (1, 16, 8, 64))
+# QK's K permutation within one 64-column group, as (element, lane_group,
+# k_step): each lane group reads 16 contiguous columns, so one 16-byte load
+# feeds two MFMAs. Q and K are partitioned by the same tiled MMA, so the
+# permuted reduction order cancels in the dot product.
+QK_K_PERMUTATION = ((4, 4, 4), (1, 16, 4))
 
 
 def _buffer(ptr, dtype, layout):
@@ -67,18 +67,6 @@ def _round_to_bf16_finite(value):
     retained_lsb = (bits >> fx.Uint32(16)) & fx.Uint32(1)
     rounded = bits + fx.Uint32(0x7FFF) + retained_lsb
     return (rounded >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
-
-
-def _mfma(a, b, acc):
-    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    operand_a = fx.make_rmem_tensor(4, fx.BFloat16)
-    operand_b = fx.make_rmem_tensor(4, fx.BFloat16)
-    accumulator = fx.make_rmem_tensor(4, fx.Float32)
-    operand_a.store(a)
-    operand_b.store(b)
-    accumulator.store(acc)
-    fx.gemm(mma, accumulator, operand_a, operand_b, accumulator)
-    return accumulator.load()
 
 
 def _pack_fp8_as_bf16(v):
@@ -110,13 +98,18 @@ def _defer_to_use(value):
     )
 
 
+def _defer_view_to_use(view):
+    # _defer_to_use for a partitioned LDS view: its per-lane address is opaque.
+    address = fx.get_iter(view)
+    return fx.make_view(
+        fx.inttoptr(address.type, _defer_to_use(fx.ptrtoint(address))),
+        fx.get_layout(view),
+    )
+
+
 def _wave_uniform(value):
     # Scheduling metadata and wave ids are identical in all lanes of a wave.
     return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(value)))
-
-
-def _mfma_fragment(v, start):
-    return v.shuffle(v, [start, start + 1, start + 2, start + 3])
 
 
 @cache
@@ -131,7 +124,6 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
     # row tile prefetch the next KV tile. PV gives each wave 64 output columns
     # (four 16-column MFMA tiles) across all rows.
     ROW_TILES = (num_heads * max_seqlen_q + MFMA_SIZE - 1) // MFMA_SIZE
-    PV_COL_TILES = V_DIM // (WAVES * MFMA_SIZE)
     PREFETCH_NEXT_TILE = ROW_TILES < WAVES
 
     # LDS row pitches. The extra 16 bytes shift each row by four banks.
@@ -149,8 +141,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
     QK_COLUMN_GROUPS = QK_DIM // WAVE_SIZE
     QK_STEPS = QK_COLUMN_GROUPS * 2
 
-    # Output columns are (wave, column_tile, lane_group, element).
-    OUTPUT_COLUMN_LAYOUT = ((WAVES, PV_COL_TILES, 4, 4), (V_DIM // WAVES, 16, 4, 1))
+    WAVE_COLUMNS = V_DIM // WAVES
     STAT_ALPHA, STAT_MAX, STAT_SUM = range(3)
 
     # LDS: the BF16 KV tile (read as K and as V), softmax probabilities, the
@@ -195,12 +186,11 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         wave = _wave_uniform(tid // WAVE_SIZE)
         workgroup_id = fx.block_idx.x
 
-        # Global buffers. Q rows are token * num_heads + head; Q is viewed as
-        # 16-byte chunks so each load is one dwordx4.
+        # Global buffers. Q rows are token * num_heads + head.
         q_rows = total_q * num_heads
         p_rows = num_partial * num_heads
         q_global = _buffer(
-            q, fx.BFloat16, fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1))
+            q, fx.BFloat16, fx.make_layout((q_rows, QK_DIM), (QK_DIM, 1))
         )
         page_indices = _buffer(pages, fx.Int32, fx.make_layout(num_indices, 1))
 
@@ -215,19 +205,11 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         # Outputs: FP32 split partials + LSE for mla_reduce_v1, or the final
         # BF16 output (+ optional LSE) when a request is not split.
         partial_output = _buffer(
-            partial,
-            fx.Float32,
-            fx.make_layout(
-                (p_rows, OUTPUT_COLUMN_LAYOUT[0]), (V_DIM, OUTPUT_COLUMN_LAYOUT[1])
-            ),
+            partial, fx.Float32, fx.make_layout((p_rows, V_DIM), (V_DIM, 1))
         )
         partial_lse_output = _buffer(partial_lse, fx.Float32, fx.make_layout(p_rows, 1))
         final_output = _buffer(
-            output,
-            fx.BFloat16,
-            fx.make_layout(
-                (q_rows, OUTPUT_COLUMN_LAYOUT[0]), (V_DIM, OUTPUT_COLUMN_LAYOUT[1])
-            ),
+            output, fx.BFloat16, fx.make_layout((q_rows, V_DIM), (V_DIM, 1))
         )
         final_lse_output = _buffer(output_lse, fx.Float32, fx.make_layout(q_rows, 1))
 
@@ -237,20 +219,31 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         kv_descale = fx.Float32(fx.rocdl.readfirstlane(T.f32, kv_scale_global[0]))
         score_scale = scale * kv_descale * fx.Float32(LOG2E)
 
-        shared = fx.SharedAllocator().allocate(Shared).peek()
-        # One padded KV slab, viewed per access pattern: K operand rows, the
-        # gather's (8 BF16, part, chunk, gather lane) stores, and V^T columns.
-        keys_lds = fx.Tensor(
-            shared.kv.view(
-                fx.make_layout(
-                    (KV_TILE_SIZE, QK_COLUMN_LAYOUT[0]),
-                    (KV_ROW_STRIDE, QK_COLUMN_LAYOUT[1]),
-                )
-            )
+        # Both GEMMs run one 16x16x16 BF16 MFMA atom within a single wave.
+        # QK is K @ Q^T: M is tokens, N query rows, and K the permuted columns.
+        # PV is V^T @ P^T: M is this wave's output columns, N query rows, and
+        # K tokens.
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        wave_atoms = fx.make_layout((1, 1, 1), (0, 0, 0))
+        qk_mma = fx.make_tiled_mma(
+            mma_atom,
+            wave_atoms,
+            fx.make_tile(None, None, fx.make_layout(*QK_K_PERMUTATION)),
         )
+        pv_mma = fx.make_tiled_mma(mma_atom, wave_atoms)
+        lds_copy_128 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+        lds_copy_64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        lds_copy_16 = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
+        q_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        partial_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        final_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
 
-        # Write side of the same slab: the gather stores (8 BF16, gather lane,
-        # chunk, part) per token.
+        shared = fx.SharedAllocator().allocate(Shared).peek()
+        # One padded KV slab, viewed per access pattern: K rows, the gather's
+        # (8 BF16, gather lane, chunk, part) stores, and this wave's V^T columns.
+        keys_lds = shared.kv.view(
+            fx.make_layout((KV_TILE_SIZE, QK_DIM), (KV_ROW_STRIDE, 1))
+        )
         gathered_kv_lds = fx.Tensor(
             shared.kv.view(
                 fx.make_layout(
@@ -259,35 +252,101 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 )
             )
         )
-
-        # PV is V^T @ P^T. The MFMA atom partitions V into its A operand. V is
-        # gathered element by element below: a vector load of the partition
-        # lowers to the same ds_read_u16s but schedules ~0.4% slower cold.
-        pv_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-            fx.make_layout((1, 1, 1), (0, 0, 0)),
-        ).get_slice(lane)
-        values_lds = pv_mma.partition_A(
-            fx.make_view(
-                shared.kv.ptr + wave * (V_DIM // WAVES),
-                fx.make_layout((V_DIM // WAVES, KV_TILE_SIZE), (1, KV_ROW_STRIDE)),
-            )
+        values_lds = fx.make_view(
+            shared.kv.ptr + wave * WAVE_COLUMNS,
+            fx.make_layout((WAVE_COLUMNS, KV_TILE_SIZE), (1, KV_ROW_STRIDE)),
         )
 
-        # QK owns a different row tile in each wave. Its eight scores per lane
-        # are (element, lane_group, token_tile) = element + 4*group + 16*tile.
-        # Keep this view explicit: the 0.5.0 partition_C store path hits a
-        # nested-coordinate rank assertion. PV reads its B operand through the
-        # same view; for this 16x16x16 atom the B lane map equals QK's C map,
-        # and reusing it keeps the LLVM schedule of the base kernel (~0.4%).
-        qk_probs_lds = fx.Tensor(
-            shared.p.view(
-                fx.make_layout(
-                    (ROW_TILES * MFMA_SIZE, (4, 4, KV_TILE_SIZE // MFMA_SIZE)),
-                    (PROB_ROW_STRIDE, (1, 4, MFMA_SIZE)),
+        # Softmax probabilities P, row-major. Each QK wave stores its C tile
+        # into its row tile through the transposed (token, row) view; PV reads
+        # all rows back as its B operand.
+        probs_lds = shared.p.view(
+            fx.make_layout((ROW_TILES * MFMA_SIZE, KV_TILE_SIZE), (PROB_ROW_STRIDE, 1))
+        )
+        wave_probs_lds = fx.make_view(
+            shared.p.ptr + wave * MFMA_SIZE * PROB_ROW_STRIDE,
+            fx.make_layout((KV_TILE_SIZE, MFMA_SIZE), (1, PROB_ROW_STRIDE)),
+        )
+
+        # Per-lane partitions. QK's A operand is ((8 BF16, half), token_tile,
+        # column_group): one ds_read_b128 per (half, token_tile, column_group).
+        # PV's A operand is V^T, strided by a KV row per element: one
+        # ds_read_u16 each. P moves as 4 BF16 (ds_write_b64/ds_read_b64).
+        query_copy = fx.make_tiled_copy_B(q_copy_atom, qk_mma).get_slice(lane)
+        keys_copy = fx.make_tiled_copy_A(lds_copy_128, qk_mma).get_slice(lane)
+        keys_src = keys_copy.partition_S(keys_lds)
+        probs_store = fx.make_tiled_copy_C(lds_copy_64, qk_mma).get_slice(lane)
+        probs_dst = probs_store.partition_D(wave_probs_lds)
+        values_copy = fx.make_tiled_copy_A(lds_copy_16, pv_mma).get_slice(lane)
+        values_src = values_copy.partition_S(values_lds)
+        probs_load = fx.make_tiled_copy_B(lds_copy_64, pv_mma).get_slice(lane)
+        probs_src = probs_load.partition_S(probs_lds)
+
+        # Register fragments. Method calls on these outer objects stay out of
+        # the runtime loop bodies: FlyDSL's implicit loop carry would try to
+        # carry the objects themselves.
+        def load_query(rows):
+            fragment = qk_mma.make_fragment_B(rows)
+            fx.copy(
+                q_copy_atom, query_copy.partition_S(rows), query_copy.retile(fragment)
+            )
+            return fragment
+
+        def make_key_fragment():
+            fragment = qk_mma.make_fragment_A(keys_lds)
+            return fragment, keys_copy.retile(fragment)
+
+        # One QK step is a (half, column_group): a 16-byte load per token tile,
+        # then two K slices of MFMAs.
+        def load_keys(src, key_dst, half, column_group):
+            fx.copy(lds_copy_128, src, key_dst[(None, half), None, column_group])
+
+        def multiply_keys(scores, keys, query, half, column_group):
+            for sub in range_constexpr(2):
+                k = (half * 2 + sub, column_group)
+                fx.gemm(
+                    qk_mma, scores, keys[None, None, k], query[None, None, k], scores
                 )
+
+        def make_score_fragment():
+            # Scores are (element, token_tile): token element + 4*lane_group
+            # + 16*token_tile of row lane_row.
+            fragment = qk_mma.make_fragment_C(wave_probs_lds)
+            fragment.fill(0.0)
+            return fragment
+
+        def store_probs(scores, probabilities):
+            fragment = fx.make_fragment_like(scores, fx.BFloat16)
+            fragment.store(fx.Vector.from_elements(probabilities, dtype=fx.BFloat16))
+            fx.copy(lds_copy_64, probs_store.retile(fragment), probs_dst)
+
+        def load_pv_operands():
+            values = pv_mma.make_fragment_A(values_lds)
+            fx.copy(lds_copy_16, values_src, values_copy.retile(values))
+            probs = pv_mma.make_fragment_B(probs_lds)
+            fx.copy(lds_copy_64, probs_src, probs_load.retile(probs))
+            return values, probs
+
+        def make_output_fragment():
+            # PV accumulators: (4 values, column_tile, row_tile) per lane.
+            return fx.make_rmem_tensor(
+                fx.tiled_mma_partition_shape(
+                    fx.MmaOperand.C, pv_mma, (WAVE_COLUMNS, ROW_TILES * MFMA_SIZE)
+                ),
+                fx.Float32,
             )
-        )
+
+        def zero_output():
+            fragment = make_output_fragment()
+            fragment.fill(0.0)
+            return fragment.load()
+
+        def output_columns(buffer, first_row, store_wave):
+            # A work's rows are contiguous in either output buffer.
+            return fx.make_view(
+                fx.get_iter(buffer) + first_row * V_DIM + store_wave * WAVE_COLUMNS,
+                fx.make_layout((WAVE_COLUMNS, ROW_TILES * MFMA_SIZE), (1, V_DIM)),
+            )
 
         # Per-row (alpha, max, sum): written by the row's QK wave, read by every
         # PV wave (alpha) and by the epilogue (max, sum).
@@ -298,7 +357,6 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
         page_addresses_lds = fx.Tensor(
             shared.pages.view(fx.make_layout(KV_TILE_SIZE, 1))
         )
-        kv_lds_ptr = shared.kv.ptr
 
         # Persistent loop: one workgroup per CU runs its planner-assigned work
         # items. Each item is one request's query rows over one KV range.
@@ -317,38 +375,29 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
             qlen = q_end - q_begin
             active_rows = qlen * num_heads
 
-            # Q stays in registers for the whole KV range: each lane loads its
-            # row's 576 columns (18 x 16 bytes across the four lane groups).
-            query_fragments = []
+            # Q stays in registers for the whole KV range as QK's B operand:
+            # each lane loads 18 x 16 bytes of its row. Masked rows start one
+            # past the Q descriptor, so their bounded buffer loads return zero.
             row = wave * MFMA_SIZE + lane_row
-            for column_group in range_constexpr(QK_COLUMN_GROUPS):
-                for half in range_constexpr(2):
-                    # Match QK_COLUMN_LAYOUT in eight-element load units.
-                    # Masked rows address exactly one past the Q descriptor,
-                    # so the bounded buffer load returns zero. Retain this
-                    # flat load view: row-view masking changes register allocation.
-                    query_offset = (
-                        (fx.Int64(q_begin) * num_heads + row) * QK_DIM
-                        + column_group * 64
-                        + lane_group * 16
-                        + half * 8
-                    ) // 8
-                    query_offset = (row < active_rows).select(
-                        query_offset, fx.Int64(total_q) * num_heads * (QK_DIM // 8)
-                    )
-                    query_fragments.append(q_global[(query_offset, None)].load())
+            query_start = (row < active_rows).select(
+                (q_begin * num_heads + wave * MFMA_SIZE) * QK_DIM,
+                (q_rows - lane_row) * QK_DIM,
+            )
+            query_fragment = load_query(
+                fx.make_view(
+                    fx.get_iter(q_global) + query_start,
+                    fx.make_layout((MFMA_SIZE, QK_DIM), (QK_DIM, 1)),
+                )
+            )
 
             # Online-softmax state carried across KV tiles: running max and sum
-            # of this lane's QK row, the unnormalized PV accumulators, and the
-            # raw FP8 bytes of the next tile when spare waves prefetch.
-            # FlyDSL's implicit loop carry preserves this nested state.
+            # of this lane's QK row, the unnormalized PV accumulator fragment's
+            # values, and the raw FP8 bytes of the next tile when spare waves
+            # prefetch. FlyDSL's implicit loop carry preserves this nested state.
             loop_state = {
                 "row_max": fx.Float32(float("-inf")),
                 "row_sum": fx.Float32(0.0),
-                "output": [
-                    [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(PV_COL_TILES)]
-                    for _ in range_constexpr(ROW_TILES)
-                ],
+                "output": zero_output(),
                 "prefetch": [],
             }
 
@@ -452,91 +501,56 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 row_max = loop_state["row_max"]
                 row_sum = loop_state["row_sum"]
                 if wave < ROW_TILES:
-                    score_fragments = [
-                        fx.full(4, 0.0, fx.Float32)
-                        for _ in range_constexpr(TOKEN_TILES)
-                    ]
+                    score_fragment = make_score_fragment()
+                    key_fragment, key_dst = make_key_fragment()
                     if const_expr(ROW_TILES <= 4):
                         # Small-row path (<= 64 rows): load the next K pair
                         # while the current pair feeds the MFMAs.
                         # Scheduler fences keep just two operand sets live.
-                        key_values = [
-                            keys_lds[
-                                (token_tile * 16 + lane_row, (None, lane_group, 0, 0))
-                            ].load()
-                            for token_tile in range_constexpr(TOKEN_TILES)
-                        ]
+                        load_keys(keys_src[(None, 0), None, 0], key_dst, 0, 0)
                         fx.rocdl.sched_barrier(0)
                         for step in range_constexpr(QK_STEPS):
+                            column_group, half = divmod(step, 2)
                             if const_expr(step + 1 < QK_STEPS):
-                                next_step = step + 1
-                                next_keys = [
-                                    keys_lds[
-                                        (
-                                            token_tile * 16 + lane_row,
-                                            (
-                                                None,
-                                                lane_group,
-                                                next_step % 2,
-                                                next_step // 2,
-                                            ),
-                                        )
-                                    ].load()
-                                    for token_tile in range_constexpr(TOKEN_TILES)
-                                ]
+                                next_group, next_half = divmod(step + 1, 2)
+                                load_keys(
+                                    keys_src[(None, next_half), None, next_group],
+                                    key_dst,
+                                    next_half,
+                                    next_group,
+                                )
                             fx.rocdl.sched_barrier(0)
-                            query_values = query_fragments[step]
-                            for sub in range_constexpr(2):
-                                for token_tile in range_constexpr(TOKEN_TILES):
-                                    score_fragments[token_tile] = _mfma(
-                                        _mfma_fragment(key_values[token_tile], sub * 4),
-                                        _mfma_fragment(query_values, sub * 4),
-                                        score_fragments[token_tile],
-                                    )
+                            multiply_keys(
+                                score_fragment,
+                                key_fragment,
+                                query_fragment,
+                                half,
+                                column_group,
+                            )
                             fx.rocdl.sched_barrier(0)
-                            if const_expr(step + 1 < QK_STEPS):
-                                key_values = next_keys
                     else:
                         # Large-row path: one K step live at a time, through
-                        # opaque LDS offsets, to fit beside Q and the outputs.
+                        # opaque LDS addresses, to fit beside Q and the outputs.
                         for column_group in range_constexpr(QK_COLUMN_GROUPS):
                             for half in range_constexpr(2):
                                 # Prevent full-K CSE/hoisting across row tiles:
                                 # retaining the full slab alongside Q/O spills.
-                                key_offset = _defer_to_use(
-                                    fx.get_scalar(
-                                        fx.crd2idx(
-                                            (
-                                                lane_row,
-                                                (0, lane_group, half, column_group),
-                                            ),
-                                            keys_lds.layout,
-                                        )
-                                    )
+                                load_keys(
+                                    _defer_view_to_use(
+                                        keys_src[(None, half), None, column_group]
+                                    ),
+                                    key_dst,
+                                    half,
+                                    column_group,
                                 )
-                                key_step = fx.Tensor(
-                                    fx.make_view(
-                                        kv_lds_ptr + key_offset,
-                                        fx.make_layout(
-                                            (TOKEN_TILES, 8),
-                                            (MFMA_SIZE * KV_ROW_STRIDE, 1),
-                                        ),
-                                    )
+                                multiply_keys(
+                                    score_fragment,
+                                    key_fragment,
+                                    query_fragment,
+                                    half,
+                                    column_group,
                                 )
-                                key_values = [
-                                    key_step[(token_tile, None)].load()
-                                    for token_tile in range_constexpr(TOKEN_TILES)
-                                ]
-                                query_values = query_fragments[column_group * 2 + half]
-                                for sub in range_constexpr(2):
-                                    for token_tile in range_constexpr(TOKEN_TILES):
-                                        score_fragments[token_tile] = _mfma(
-                                            _mfma_fragment(
-                                                key_values[token_tile], sub * 4
-                                            ),
-                                            _mfma_fragment(query_values, sub * 4),
-                                            score_fragments[token_tile],
-                                        )
+                    score_values = score_fragment.load()
 
                     # Mask: rows past active_rows, tokens past kv_end (the last
                     # partial tile), and the causal tail.
@@ -557,7 +571,7 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                             valid.append(is_visible)
                             scores.append(
                                 is_visible.select(
-                                    score_fragments[token_tile][i] * score_scale,
+                                    score_values[token_tile * 4 + i] * score_scale,
                                     fx.Float32(float("-inf")),
                                 )
                             )
@@ -594,15 +608,10 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
 
                     # Publish BF16 P and the row statistics for the PV phase,
                     # where every wave needs every row.
-                    for token_tile in range_constexpr(TOKEN_TILES):
-                        for i in range_constexpr(4):
-                            fx.memref_store(
-                                _round_to_bf16_finite(
-                                    probabilities[token_tile * 4 + i]
-                                ),
-                                qk_probs_lds,
-                                (row, (i, lane_group, token_tile)),
-                            )
+                    store_probs(
+                        score_fragment,
+                        [_round_to_bf16_finite(p) for p in probabilities],
+                    )
                     if lane_group == 0:
                         fx.memref_store(alpha, stats, (row, STAT_ALPHA))
                         fx.memref_store(row_max, stats, (row, STAT_MAX))
@@ -637,37 +646,28 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                 fx.barrier()
 
                 # PV: A=V^T, B=P^T. All rows, disjoint column slices per wave.
-                # Each accumulator is first rescaled by its row's alpha.
-                next_output = []
+                # Each row tile's accumulators are first rescaled by its alpha.
+                accumulators = make_output_fragment()
+                accumulators.store(loop_state["output"])
                 for row_tile in range_constexpr(ROW_TILES):
-                    row = row_tile * MFMA_SIZE + lane_row
-                    alpha = stats[(row, STAT_ALPHA)]
-                    row_output = []
-                    for column_tile in range_constexpr(PV_COL_TILES):
-                        old = loop_state["output"][row_tile][column_tile]
-                        acc = old * alpha
-                        for token_tile in range_constexpr(TOKEN_TILES):
-                            prob_values = qk_probs_lds[
-                                (
-                                    row_tile * MFMA_SIZE + lane_row,
-                                    (None, lane_group, token_tile),
-                                )
-                            ].load()
-                            value_values = fx.Vector.from_elements(
-                                [
-                                    values_lds[(i, column_tile, token_tile)]
-                                    for i in range_constexpr(4)
-                                ],
-                                dtype=fx.BFloat16,
-                            )
-                            acc = _mfma(value_values, prob_values, acc)
-                        row_output.append(acc)
-                    next_output.append(row_output)
+                    alpha = stats[(row_tile * MFMA_SIZE + lane_row, STAT_ALPHA)]
+                    rescaled = accumulators[None, None, row_tile]
+                    rescaled.store(rescaled.load() * alpha)
+                value_fragment, prob_fragment = load_pv_operands()
+                # Tokens innermost, then column tiles, then row tiles.
+                fx.gemm(
+                    pv_mma,
+                    accumulators,
+                    value_fragment,
+                    prob_fragment,
+                    accumulators,
+                    traversal_order=fx.GemmTraversalOrder.KMN,
+                )
 
                 loop_state = {
                     "row_max": row_max,
                     "row_sum": row_sum,
-                    "output": next_output,
+                    "output": accumulators.load(),
                     "prefetch": next_kv_bytes,
                 }
 
@@ -679,9 +679,24 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
             # Keep epilogue-only div/mod and addresses out of the KV loop's
             # live set. One opaque move per work item avoids spilling them.
             store_tid = _defer_to_use(tid)
-            store_lane_row = store_tid % 16
-            store_lane_group = (store_tid % 64) // 16
-            store_wave = store_tid // 64
+            store_lane = store_tid % WAVE_SIZE
+            store_lane_row = store_lane % MFMA_SIZE
+            store_lane_group = store_lane // MFMA_SIZE
+            store_wave = store_tid // WAVE_SIZE
+            partial_store = fx.make_tiled_copy_C(partial_copy_atom, pv_mma).get_slice(
+                store_lane
+            )
+            partial_dst = partial_store.partition_D(
+                output_columns(partial_output, partial_row * num_heads, store_wave)
+            )
+            final_store = fx.make_tiled_copy_C(final_copy_atom, pv_mma).get_slice(
+                store_lane
+            )
+            final_dst = final_store.partition_D(
+                output_columns(final_output, q_begin * num_heads, store_wave)
+            )
+            accumulators = make_output_fragment()
+            accumulators.store(loop_state["output"])
 
             for row_tile in range_constexpr(ROW_TILES):
                 row = row_tile * MFMA_SIZE + store_lane_row
@@ -700,38 +715,33 @@ def _build(num_heads, max_seqlen_q, causal, write_final_lse):
                     )
                     query_position = row // num_heads
                     head = row % num_heads
+                    row_output = accumulators[None, None, row_tile]
+                    normalized = row_output.load() * factor
 
                     if partial_row >= 0:
                         # Split request: FP32 slot in the reduce's partial buffer.
                         out_row = (
                             fx.Int64(partial_row + query_position) * num_heads + head
                         )
-                        for column_tile in range_constexpr(PV_COL_TILES):
-                            acc = loop_state["output"][row_tile][column_tile]
-                            output_columns = (
-                                store_wave,
-                                column_tile,
-                                store_lane_group,
-                                None,
-                            )
-                            partial_output[(out_row, output_columns)].store(
-                                acc * factor
-                            )
+                        partial_values = fx.make_fragment_like(row_output)
+                        partial_values.store(normalized)
+                        fx.copy(
+                            partial_copy_atom,
+                            partial_values,
+                            partial_dst[None, None, row_tile],
+                        )
                         if (store_wave == 0) & (store_lane_group == 0):
                             fx.memref_store(lse, partial_lse_output, out_row)
                     else:
                         # Whole request: write the final BF16 output directly.
                         out_row = fx.Int64(q_begin + query_position) * num_heads + head
-                        for column_tile in range_constexpr(PV_COL_TILES):
-                            acc = loop_state["output"][row_tile][column_tile]
-                            output_columns = (
-                                store_wave,
-                                column_tile,
-                                store_lane_group,
-                                None,
-                            )
-                            value = _round_to_bf16_finite(acc * factor)
-                            final_output[(out_row, output_columns)].store(value)
+                        final_values = fx.make_fragment_like(row_output, fx.BFloat16)
+                        final_values.store(_round_to_bf16_finite(normalized))
+                        fx.copy(
+                            final_copy_atom,
+                            final_values,
+                            final_dst[None, None, row_tile],
+                        )
                         # Trace-time flag around a device test: they must not be merged.
                         if write_final_lse:  # noqa: SIM102
                             if (store_wave == 0) & (store_lane_group == 0):
