@@ -224,6 +224,17 @@ def _readlane_i64(v, lane):
     return fx.Int64((fx.Uint64(hi) << 32) | fx.Uint64(lo))
 
 
+# dedup_rows: a launch of at most this many tokens a rank spreads each token over every wave of its producer CTA
+# (_spread_token): the waves send to the destinations of their own top-k slots, so a token's rows leave from all of
+# them instead of one wave.
+_SPREAD_MAX_TOKENS = 4
+
+
+def _spread_token(i32_cur_tok, dispatch_blocks):
+    """dedup_rows: whether the producers spread each token over their waves (few tokens: one a producer CTA)."""
+    return i32_cur_tok <= fx.Int32(min(_SPREAD_MAX_TOKENS, dispatch_blocks))
+
+
 def prefetch_direct_fixed_slot_token(
     *,
     fz_k,
@@ -245,9 +256,10 @@ def prefetch_direct_fixed_slot_token(
     """dedup_rows: load what the token of this wave needs ahead of the payload loop, its row quantized once
     (MXFP8, or MXFP4 with fz_fp4: as prefetch_direct_fixed_slot_route's).
 
-    The wave's token is producer_slot + dispatch_blocks * warp + token_offset (one wave a CTA first); lane j < fz_k
-    holds the token's route j: its expert, the destination's remote pointers and its weight. ``send``: the lane is
-    the token's first route to its destination, which sends the row to the destination's token-row region.
+    The wave's token is producer_slot + dispatch_blocks * warp + token_offset (one wave a CTA first), or with few
+    tokens (_spread_token) producer_slot + token_offset on every wave of the CTA; lane j < fz_k holds the token's
+    route j: its expert, the destination's remote pointers and its weight. ``send``: the lane is the token's first
+    route to its destination, which sends the row to the destination's token-row region.
     Straight-line, with the token clamped as in prefetch_direct_fixed_slot_route.
     """
     assert fz_k <= 64, "one lane a route"
@@ -256,7 +268,8 @@ def prefetch_direct_fixed_slot_token(
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
-    token = producer_slot + fx.Int32(dispatch_blocks) * warp + fx.Int32(token_offset)
+    spread = _spread_token(i32_cur_tok, dispatch_blocks)
+    token = spread.select(producer_slot, producer_slot + fx.Int32(dispatch_blocks) * warp) + fx.Int32(token_offset)
     source_token = (token < i32_cur_tok).select(token, fx.Int32(0))
     route = source_token * fx.Int32(fz_k) + (lane < fx.Int32(fz_k)).select(
         lane, fx.Int32(0)
@@ -429,8 +442,15 @@ def emit_direct_fixed_slot_payload(
     # A wave owns routes route + r * route_stride for r < route_rounds (dedup: tokens, see
     # prefetch_direct_fixed_slot_token); each round is a loop of at most one trip, and rounds past the prefetched
     # ones load their route in the loop.
+    if const_expr(dedup):
+        # Few tokens (_spread_token): every wave of the producer takes its token and sends, counts and publishes
+        # the routes of its own top-k slots (slot j: wave j % num_waves).
+        spread = _spread_token(i32_cur_tok, dispatch_blocks)
+        warp_u = fx.Int32(fx.rocdl.readfirstlane(T.i32, warp))
+        own_lane = ~spread | ((lane % fx.Int32(num_waves)) == warp)
     for rr in range_constexpr(route_rounds if dedup else 0):
-        token = producer_slot + fx.Int32(dispatch_blocks) * (warp + fx.Int32(rr * num_waves))
+        token = spread.select(producer_slot, producer_slot + fx.Int32(dispatch_blocks) * warp) + fx.Int32(
+            rr * dispatch_blocks * num_waves)
         for source_token in range(token, i32_cur_tok, fx.Int32(fz_mtpr)):
             if const_expr(rr < len(prefetched)):
                 rpf = prefetched[rr]
@@ -443,7 +463,8 @@ def emit_direct_fixed_slot_payload(
             lane_i32 = len(rpf["row_values"][0])
             for j in range_constexpr(fz_k):
                 # Raw v_readlane (scalar result, a uniform branch), as _readlane_i64.
-                if fx.Int32(fx.rocdl.readlane(T.i32, rpf["send"], j)) != fx.Int32(0):
+                send_j = fx.Int32(fx.rocdl.readlane(T.i32, rpf["send"], j)) != fx.Int32(0)
+                if send_j & (~spread | (warp_u == fx.Int32(j % num_waves))):
                     destination_row = ptr_buf_tensor(
                         _readlane_i64(rpf["remote"]["rx"], j) + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes),
                         fx.Int32, unit_elems=lane_i32)
@@ -463,7 +484,7 @@ def emit_direct_fixed_slot_payload(
             if const_expr(running_half is not None):
                 running_slot = running_slot + running_half * fx.Int32(fz_epr)
             expert_offset = fx.Int32(0)
-            if valid_expert:
+            if valid_expert & own_lane:
                 expert_offset = fx.Int32(
                     comm_ops.atomic_add_system(
                         rpf["remote"]["running"] + fx.Int64(running_slot) * fx.Int64(4), fx.Int32(1)
@@ -472,7 +493,7 @@ def emit_direct_fixed_slot_payload(
             meta_row = local_expert * fx.Int32(fz_cap) + expert_offset
             if const_expr(running_half is not None):
                 meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
-            if valid_expert & (expert_offset < fx.Int32(fz_cap)):
+            if valid_expert & own_lane & (expert_offset < fx.Int32(fz_cap)):
                 weight_bits = fx.Vector.from_elements([rpf["weight"]], fx.Float32).bitcast(fx.Int32)[0]
                 source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (lane << fx.Int32(24))
                 comm_ops.store_i32_global(rpf["remote"]["wts"] + fx.Int64(meta_row) * fx.Int64(4), weight_bits)
