@@ -87,7 +87,11 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    use_valid_token_count=False,
 ):
+    # use_valid_token_count (atomic only): bound scatter rows by min(cumsum[1], M);
+    # a LocalToken sort's pad token id is the real count, still < a padded M.
+    use_valid_token_count = bool(use_valid_token_count and epilog == "atomic")
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
     _K = D_INTER
@@ -123,6 +127,8 @@ def compile_gemm2_a4w4_port(
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
+    if use_valid_token_count:
+        _tag += "_valid_tokens"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     @fx.struct
@@ -156,6 +162,10 @@ def compile_gemm2_a4w4_port(
         aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+        row_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = global_typed_ptr(arg_cumsum, T.i32)[1]
+            row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
 
         def _issue_all_a_loads(m_row0):
             for slot in range_constexpr(kStages):
@@ -184,7 +194,7 @@ def compile_gemm2_a4w4_port(
                 arg_eids,
                 arg_stids,
                 arg_sweights,
-                i32_M,
+                row_limit,
                 i32_max_m_blocks,
                 arg_out,
                 arg_out_scale,

@@ -5,6 +5,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_ceil_scale_from_amax
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _gluon_dynamic_mxfp4_quant_kernel_gfx1250_repr = make_kernel_repr(
@@ -27,12 +28,18 @@ def _mxfp4_downcast_op(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
+    SCALING_MODE: gl.constexpr,
 ):
-    """x (fp32) -> packed mxfp4 via scaled_downcast, plus its e8m0 scale."""
+    """x (fp32) -> packed mxfp4 via scaled_downcast, plus its e8m0 scale.
+    SCALING_MODE: 0 is "even" (mx_e8m0_scale), 1 is "ceil"
+    (_mxfp4_ceil_scale_from_amax)."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
-    bs_e8m0 = mx_e8m0_scale(amax, 2)
+    if SCALING_MODE == 0:
+        bs_e8m0 = mx_e8m0_scale(amax, 2)
+    else:
+        bs_e8m0, _ = _mxfp4_ceil_scale_from_amax(amax)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     x_fp4 = gl.amd.cdna5.scaled_downcast(x, bs_e8m0, "e2m1", axis=1)
@@ -77,7 +84,7 @@ def _mxfp4_quant_tile(
         ) < N
         x_reg = gl.where(col_valid[None, :], x_reg, 0.0)
     out_fp4, bs_e8m0 = _mxfp4_downcast_op(
-        x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+        x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE, SCALING_MODE=0
     )
 
     out_buf = out_smem.index(compute_idx % NUM_BUFFERS)
@@ -348,6 +355,16 @@ def _mxfp8_quant_tile(
     )
 
 
+@gluon.constexpr_function
+def _mxfp8_scale_smem_layout(BLOCK_SIZE_M, NUM_QUANT_BLOCKS):
+    # Pad only when NUM_QUANT_BLOCKS is 8 to 1024 and a multiple of 4; otherwise use a plain layout.
+    if NUM_QUANT_BLOCKS % 4 == 0 and 8 <= NUM_QUANT_BLOCKS <= 1024:
+        return gl.PaddedSharedLayout.with_identity_for(
+            [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+        )
+    return gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+
+
 @gluon.jit(repr=_gluon_dynamic_mxfp8_quant_kernel_gfx1250_repr)
 def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     x_ptr,
@@ -413,8 +430,8 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_OUT,
     )
-    SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+    SHARED_LAYOUT_BS: gl.constexpr = _mxfp8_scale_smem_layout(
+        BLOCK_SIZE_M, NUM_QUANT_BLOCKS
     )
     bs_smem = gl.allocate_shared_memory(
         bs_ptr.type.element_ty,

@@ -1,1 +1,2 @@
 *.csv text eol=lf
+tests/moe_dispatch/golden/*.jsonl.gz diff=gzip

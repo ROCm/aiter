@@ -6,12 +6,16 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
     fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     fused_gemm_a8w8_blockscale_split_cat,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -46,52 +50,6 @@ def run_triton(impl, x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
-
-
-def get_shapes():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        (2048, 2048, 2049),
-        (159, 17389, 597),
-        (16, 576, 7168),
-    ]
-    x_vals += [
-        (256, 8192, 1024),
-        (256, 1024, 8192),
-        (256, 32768, 8192),
-        (256, 8192, 32768),
-    ]
-    x_vals = [
-        (4096, 256, 512),
-    ]
-    return x_vals
 
 
 def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
@@ -158,7 +116,7 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     [
         (dtype, *shape, d, s3, layout, impl)
         for dtype in ["bf16"]
-        for shape in get_shapes()
+        for shape in get_shapes(min_k=128)
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]
@@ -214,6 +172,41 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
     c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
     c1_triton, c2_triton = run_triton(
         impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype
+    )
+
+    torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_ksplit", [3, 6])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_fused_gemm_a8w8_blockscale_split_cat_uneven_splitk(num_ksplit, shuffle):
+    # K=1792 has 14 K blocks. compute_splitk_params rounds 3 splits to 5 blocks
+    # each and 6 splits to 5 splits of 3 blocks, so the last split runs past K.
+    M, N, K, D, S3 = 32, 1280, 1792, 16, 64
+    S1 = S2 = N // D // 2
+    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = (
+        generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
+            M, N, K, S3, *block_shape, shuffle=shuffle
+        )
+    )
+    config = {**_get_config(M, N, K, shuffle)[0], "NUM_KSPLIT": num_ksplit}
+    impl = (
+        fused_gemm_a8w8_blockscale_preshuffle_split_cat
+        if shuffle
+        else fused_gemm_a8w8_blockscale_split_cat
+    )
+
+    c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D)
+    c1_triton, c2_triton = impl(
+        x,
+        w_triton,
+        y.expand(M, D, -1),
+        x_scale_triton,
+        w_scale,
+        S1,
+        S2,
+        config=config,
     )
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)

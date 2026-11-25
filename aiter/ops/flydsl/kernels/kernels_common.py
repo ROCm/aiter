@@ -4,10 +4,6 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
-from collections.abc import Callable
-from threading import Lock
-from typing import Any
-
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import builtin
@@ -109,6 +105,22 @@ def atomic_max_i32(memref, val, offset, syncscope):
     return _atomic_rmw_i32(fx.atomic_max, memref, val, offset, syncscope)
 
 
+def pin_i32(value, *deps):
+    """`value`, out of an empty asm that also reads each of `deps`.
+
+    Pinned FlyDSL 0.5.0 has no public opaque identity with dependency operands:
+    ``llvm.fake.use`` returns no value and the experimental scheduling hints
+    only choose registers. Keep the raw dialect access localized here. Behind
+    the asm, `value` and what is derived from it cannot be hoisted above the
+    `deps`' definitions, so loop-local values do not stay live and spill across
+    every iteration.
+    """
+    from flydsl._mlir.dialects import llvm
+
+    operands = [fx.Int32(v).ir_value() for v in (value, *deps)]
+    return fx.Int32(llvm.inline_asm(T.i32, operands, "", "=v,0" + ",v" * len(deps)))
+
+
 def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 
@@ -200,39 +212,28 @@ def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
     return cast_op.results[0]
 
 
-_compiled_cache_lock = Lock()
+_SLP_VECTORIZE_ONCE_USED = "slp-vectorize-once-used"
+_slp_once_used_available = None
 
 
-def run_cached(
-    jit_func: Any,
-    *compile_args: Any,
-    constexpr_param: Any,
-    compiler: Callable[..., Any],
-    dispatch_args: tuple[Any, ...],
-) -> Any:
-    """Cache a layout-dynamic FlyDSL dispatcher by constexpr param."""
-    cache_key = constexpr_param.__cache_signature__()
-    compiled_cache = getattr(jit_func, "_compiled_cache", None)
-    if compiled_cache is not None:
-        compiled = compiled_cache.get(cache_key)
-        if compiled is not None:
-            compiled(*dispatch_args)
-            return compiled
+def set_slp_vectorize_once_used(jit_fn, enabled):
+    """Set LLVM slp-vectorize-once-used on this JIT.
 
-    dispatch_after_wait = False
-    with _compiled_cache_lock:
-        compiled_cache = getattr(jit_func, "_compiled_cache", None)
-        if compiled_cache is None:
-            compiled_cache = {}
-            jit_func._compiled_cache = compiled_cache
+    ``enabled`` is the value the kernel wants. flydsl 0.4.1 defaults the flag
+    on. flydsl 0.4.0 has no such option, and passing it would fail compilation,
+    so the hint is attached only when the cl::opt exists.
+    """
+    global _slp_once_used_available
+    if _slp_once_used_available is None:
+        try:
+            from flydsl._mlir._mlir_libs import _mlirDialectsFly as fly
 
-        compiled = compiled_cache.get(cache_key)
-        if compiled is None:
-            compiled = compiler(jit_func, *compile_args)
-            compiled_cache[cache_key] = compiled
-        else:
-            dispatch_after_wait = True
-
-    if dispatch_after_wait:
-        compiled(*dispatch_args)
-    return compiled
+            previous = fly.set_llvm_option_bool(_SLP_VECTORIZE_ONCE_USED, False)
+            fly.set_llvm_option_bool(_SLP_VECTORIZE_ONCE_USED, previous)
+            _slp_once_used_available = True
+        except RuntimeError:
+            _slp_once_used_available = False
+    if _slp_once_used_available:
+        options = jit_fn.compile_hints.setdefault("llvm_options", {})
+        options[_SLP_VECTORIZE_ONCE_USED] = bool(enabled)
+    return jit_fn
