@@ -12,7 +12,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _q_rope_mxfp4_quant_repr = make_kernel_repr(
     "_q_rope_mxfp4_quant_kernel",
-    ["HEAD_SIZE", "ROPE_DIM", "BLOCK_H", "HAS_WEIGHTS"],
+    ["HEAD_SIZE", "ROPE_DIM", "BLOCK_H", "HAS_WEIGHTS", "PROJECT"],
 )
 
 
@@ -33,13 +33,20 @@ def _q_rope_mxfp4_quant_kernel(
     weights_ptr,  # [T, H]
     weights_stride,
     weights_scale,
-    weights_out_ptr,  # f32 [T, H]
+    weights_out_ptr,  # f32/bf16/f16 [T, H]
     weights_out_stride,
+    hidden_ptr,  # [T, PROJ_IN] bf16/fp16, PROJECT input
+    hidden_stride,
+    wproj_ptr,  # [H, PROJ_IN] bf16/fp16, head-major
+    wproj_stride_h,
     num_heads,
     HEAD_SIZE: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
     HAS_WEIGHTS: tl.constexpr,
+    PROJECT: tl.constexpr,
+    PROJ_IN: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """One program per (token, BLOCK_H heads)."""
     NUM_PAIRS: tl.constexpr = HEAD_SIZE // 2
@@ -94,10 +101,30 @@ def _q_rope_mxfp4_quant_kernel(
         mask=head_mask[:, None],
     )
 
-    if HAS_WEIGHTS:
+    if PROJECT:
+        # Head weights projected here (hidden @ wproj.T) so the per-layer
+        # weights_proj GEMM is not its own launch. Summed in fp32, then rounded
+        # through bf16 like a standalone bf16 GEMM's accumulation.
+        acc = tl.zeros((BLOCK_H,), tl.float32)
+        for k0 in range(0, PROJ_IN, BLOCK_K):
+            ks = k0 + tl.arange(0, BLOCK_K)
+            hvec = tl.load(hidden_ptr + tok * hidden_stride + ks).to(tl.float32)
+            wmat = tl.load(
+                wproj_ptr + heads[:, None] * wproj_stride_h + ks[None, :],
+                mask=head_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            acc += tl.sum(wmat * hvec[None, :], axis=1)
+        w = acc.to(tl.bfloat16).to(tl.float32)
+        tl.store(
+            weights_out_ptr + tok * weights_out_stride + heads,
+            (w * weights_scale).to(weights_out_ptr.dtype.element_ty),
+            mask=head_mask,
+        )
+    elif HAS_WEIGHTS:
         w = tl.load(weights_ptr + tok * weights_stride + heads, mask=head_mask)
         tl.store(
             weights_out_ptr + tok * weights_out_stride + heads,
-            w.to(tl.float32) * weights_scale,
+            (w.to(tl.float32) * weights_scale).to(weights_out_ptr.dtype.element_ty),
             mask=head_mask,
         )
