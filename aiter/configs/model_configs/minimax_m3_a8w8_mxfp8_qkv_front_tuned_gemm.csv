@@ -1,0 +1,16 @@
+gfx,cu_num,M,N,K,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx950,256,17,2560,6144,1x32,flydsl,qkvfront,1,10.9876,flydsl_qkvfront_coop,48.67,1431.49,0.00e+00
+gfx950,256,24,2560,6144,1x32,flydsl,qkvfront,1,11.0626,flydsl_qkvfront_coop,68.25,1421.78,0.00e+00
+gfx950,256,32,2560,6144,1x32,flydsl,qkvfront,1,11.2376,flydsl_qkvfront_coop,89.58,1399.64,0.00e+00
+gfx950,256,40,2560,6144,1x32,flydsl,qkvfront,1,11.9751,flydsl_qkvfront_coop,105.08,1313.44,0.00e+00
+gfx950,256,48,2560,6144,1x32,flydsl,qkvfront,1,12.2201,flydsl_qkvfront_coop,123.56,1287.11,0.00e+00
+gfx950,256,56,2560,6144,1x32,flydsl,qkvfront,1,12.6901,flydsl_qkvfront_coop,138.82,1239.44,0.00e+00
+gfx950,256,64,2560,6144,1x32,flydsl,qkvfront,1,13.0076,flydsl_qkvfront_coop,154.78,1209.19,0.00e+00
+gfx950,256,72,2560,6144,1x32,flydsl,qkvfront,1,13.9328,flydsl_qkvfront_split3,162.56,1128.90,0.00e+00
+gfx950,256,80,2560,6144,1x32,flydsl,qkvfront,1,14.0951,flydsl_qkvfront_split3,178.54,1115.89,1.78e-07
+gfx950,256,88,2560,6144,1x32,flydsl,qkvfront,1,14.4326,flydsl_qkvfront_split3,191.80,1089.80,7.49e-08
+gfx950,256,96,2560,6144,1x32,flydsl,qkvfront,1,14.6101,flydsl_qkvfront_split3,206.70,1076.56,4.35e-07
+gfx950,256,104,2560,6144,1x32,flydsl,qkvfront,1,15.6651,flydsl_qkvfront_split3,208.84,1004.05,0.00e+00
+gfx950,256,112,2560,6144,1x32,flydsl,qkvfront,1,15.9177,flydsl_qkvfront_split3,221.34,988.12,0.00e+00
+gfx950,256,120,2560,6144,1x32,flydsl,qkvfront,1,15.9176,flydsl_qkvfront_split3,237.15,988.13,0.00e+00
+gfx950,256,128,2560,6144,1x32,flydsl,qkvfront,1,15.9352,flydsl_qkvfront_split3,252.68,987.04,4.08e-08

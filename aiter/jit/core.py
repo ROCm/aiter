@@ -158,6 +158,13 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv",
 )
 
+# Tier of the MXFP8 QKV-projection front (plain GEMM + separate insert, or a fused chain): one row per
+# (gfx, cu_num, M, N, K, w_scale_block), the winner of whole-front timing (see aiter/ops/gemm_a8w8_qkv_front.py).
+AITER_CONFIG_GEMM_A8W8_QKV_FRONT = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_QKV_FRONT",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_qkv_front_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -386,6 +393,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
             "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_QKV_FRONT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_QKV_FRONT",
+            AITER_CONFIG_GEMM_A8W8_QKV_FRONT,
+            "a8w8_mxfp8_qkv_front_tuned_gemm",
         )
 
     @property
