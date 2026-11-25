@@ -23,5 +23,7 @@ try:
             raise RuntimeError(
                 f"aiter gluon kernels require triton>=3.6.0, found {triton.__version__}"
             )
+
+    from aiter.ops.triton._gluon_kernels.common import utils  # noqa: F401
 except ImportError:
     pass
