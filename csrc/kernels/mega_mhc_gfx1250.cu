@@ -78,15 +78,40 @@ struct Config
     // with the per-lane fn loads. This is measurable only for the shuffled
     // tile; plain tiles keep one pad per 128-byte row.
     static constexpr int PAD_ROWS = RES_SHUF ? 256 / (KC * 2) : 1;
+    // RAGGED: SPLIT does not divide H into KC multiples. The splits then take
+    // whole 128-column units, the first H / 128 % SPLIT splits one more, so
+    // MXFP8 groups keep their 128-column alignment. HP is the widest split.
+    static constexpr bool RAGGED = H && SPLIT > 1 && H % (SPLIT * KC) != 0;
+    static constexpr int HP      = !H || !SPLIT ? 0
+                                   : RAGGED     ? (H / 128 + SPLIT - 1) / SPLIT * 128
+                                                : H / SPLIT;
+    static_assert(!RAGGED || (H % 128 == 0 && PROTO == DISTRIBUTED && !RES_SHUF));
     static_assert(KC == 32 || KC == 64);
     static_assert(!RES_SHUF || KC == 32);
     static_assert(STAGES >= 1 && WAVES >= 1 && THREADS <= 1024);
     static_assert(PROTO != ONE_SPLIT || SPLIT == 1);
-    static_assert(PROTO != DISTRIBUTED || (H && SPLIT > 1 && STAGE_COLS == H / SPLIT));
+    static_assert(PROTO != DISTRIBUTED || (H && SPLIT > 1 && STAGE_COLS == HP));
     static_assert(STAGE_COLS == 0 ||
-                  (SPLIT && STAGE_COLS % KC == 0 && (!H || STAGE_COLS <= H / SPLIT)));
-    static_assert(!H || !SPLIT || (H / SPLIT) % KC == 0);
+                  (SPLIT && STAGE_COLS % KC == 0 && (!H || STAGE_COLS <= HP)));
+    static_assert(!H || !SPLIT || HP % KC == 0);
 };
+
+// First column and width of split s. Ragged configs deal 128-column units.
+template <class C>
+__device__ __forceinline__ void split_cols(int s, int split_k, int hidden, int& begin, int& hp)
+{
+    if constexpr(C::RAGGED)
+    {
+        constexpr int units = C::H / 128, base = units / C::SPLIT, extra = units % C::SPLIT;
+        begin = (s * base + (s < extra ? s : extra)) * 128;
+        hp    = (base + (s < extra ? 1 : 0)) * 128;
+    }
+    else
+    {
+        hp    = hidden / split_k;
+        begin = s * hp;
+    }
+}
 
 // Variant IDs continue _STREAM_VARIANTS in aiter/ops/mega_mhc.py after
 // "generic" (13). SHUF selects the shuffled-residual kernels, which stream one
@@ -178,8 +203,14 @@ using Tail =
     std::conditional_t<SHUF,
                        Config<H, S, SHUF_WAVES, 32, 1, H / S, DISTRIBUTED, true>,
                        Config<H, S, 8, (H / S) % 64 ? 32 : 64, S == 2 ? 2 : 1, H / S, DISTRIBUTED>>;
+// Three splits of whole 128-column units (ragged for H = 5120): up to 80
+// tiles on 240 CUs, where split 4 no longer fits and split 2 leaves a third of
+// the CUs idle. No cluster: clusters of 3 would leave 64-tile steps; the
+// splits are dealt XCD-major instead.
+template <int H>
+using Split3 = Config<H, 3, 8, 64, 2, (H / 128 + 2) / 3 * 128, DISTRIBUTED>;
 constexpr int GENERIC_VARIANT = 13, LARGE_VARIANT = 19, SPLIT5_VARIANT = 20,
-              SPLIT10_VARIANT = 21, SPLIT14_VARIANT = 22;
+              SPLIT10_VARIANT = 21, SPLIT14_VARIANT = 22, SPLIT3_VARIANT = 23;
 
 __device__ __forceinline__ bf16x16 concat(bf16x8 a, bf16x8 b)
 {
@@ -471,8 +502,8 @@ __device__ __forceinline__ void tiles(char* smem,
     // (lane / 16) * 8 + [0, 8) and 16 + (lane / 16) * 8 + [0, 8) of a K block.
     const int tok           = lane % 16;
     const int kq            = (lane / 16) * 8;
-    const int hp            = hidden / split_k;
-    const int begin         = split * hp;
+    int begin, hp;
+    split_cols<C>(split, split_k, hidden, begin, hp);
     const int nstage        = hp / KC;
     const int my_stages     = nstage > wave ? (nstage - wave + WAVES - 1) / WAVES : 0;
     const int nblocks       = (tokens + BM - 1) / BM;
@@ -1576,7 +1607,9 @@ __device__ __forceinline__ void tiles(char* smem,
                 if(handed_mask & (1u << s))
                 {
                     gates(s, split_k);
-                    normalize.template operator()<false>(s * hp, hp, 0, 0, THREADS);
+                    int s_begin, s_hp;
+                    split_cols<C>(s, split_k, hidden, s_begin, s_hp);
+                    normalize.template operator()<false>(s_begin, s_hp, 0, 0, THREADS);
                 }
         }
     }
@@ -1875,6 +1908,14 @@ void launch(int body_blocks,
             const int padded = (static_cast<int>(grid.x) + unit - 1) / unit * unit;
             if(padded <= cu)
                 grid.x = padded;
+            else if constexpr(C::RAGGED)
+            {
+                // Whole tiles per XCD do not fit; idle workgroups up to a
+                // multiple of xcds still keep most tiles on one XCD.
+                const int even = (static_cast<int>(grid.x) + xcds - 1) / xcds * xcds;
+                if(even <= cu)
+                    grid.x = even;
+            }
             if(grid.x % xcds == 0)
                 map_xcds = xcds;
         }
@@ -2061,6 +2102,15 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                     run.template operator()<OddSplit<H, 14, SHUF>>();
                     return;
                 }
+                break;
+            case SPLIT3_VARIANT:
+                if constexpr(H % 128 == 0 && !SHUF)
+                {
+                    run.template operator()<Split3<H>>();
+                    return;
+                }
+                // The shuffled residual has no ragged path; mega_mhc selects
+                // split 2 for it.
                 break;
             case LARGE_VARIANT: {
                 // A partial final round of token tiles runs as split tiles.

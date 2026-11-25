@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 
@@ -9,15 +11,38 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
 )
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     per_custom_dims_cast_to_fp8,
 )
+
+
+def generate_fp8_mqa_logits_inputs(
+    batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim
+):
+    s_q = batch_size * seq_q_l
+    s_k = batch_size * seq_kv_l
+
+    q = torch.randn(s_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales[:, None]).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads_q, device="cuda", dtype=torch.float32)
+
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    arange_q = torch.arange(seq_q_l, dtype=torch.int, device="cuda")
+    for b in range(batch_size):
+        qs = b * seq_q_l
+        kvs = b * seq_kv_l
+        ks[qs : qs + seq_q_l] = kvs
+        ke[qs : qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
+
+    q_fp8 = q.to(e4m3_dtype)
+    return q_fp8, kv_fp8, scales, weights, ks, ke
 
 
 def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
@@ -38,6 +63,9 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
 def run_benchmark(args):
     if not 0 < args.seq_q_l <= args.seq_kv_l:
         raise ValueError("query length must be positive and no larger than key length")
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     x_names = [
         "batch_size",
         "seq_q_l",
@@ -91,61 +119,24 @@ def run_benchmark(args):
         metric,
         **kwargs,
     ):
-        s_q = batch_size * seq_q_l
-        s_k = batch_size * seq_kv_l
+        _p_gen = functools.partial(
+            generate_fp8_mqa_logits_inputs,
+            batch_size,
+            seq_q_l,
+            seq_kv_l,
+            num_heads_q,
+            head_dim,
+        )
+        _out_val_keys = ["q_fp8", "kv_fp8", "scales", "weights", "ks", "ke"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
-        def inputs():
-            q = torch.randn(
-                s_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16
-            ).to(e4m3_dtype)
-            kv, scales = per_custom_dims_cast_to_fp8(
-                torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16),
-                (0,),
-                False,
-            )
-            weights = torch.randn(s_q, num_heads_q, device="cuda", dtype=torch.float32)
-            row = torch.arange(s_q, device="cuda", dtype=torch.int32)
-            starts = row // seq_q_l * seq_kv_l
-            visible = seq_kv_l - seq_q_l + row % seq_q_l + 1
-            ends = starts + visible
-            logits, offsets = None, None
-            if layout == "packed":
-                spans = (visible + 63) // 64 * 64
-                offsets = spans.cumsum(0, dtype=torch.int64) - spans
-                capacity = batch_size * sum(
-                    (length + 63) // 64 * 64
-                    for length in range(seq_kv_l - seq_q_l + 1, seq_kv_l + 1)
-                )
-                logits = torch.empty(capacity, device="cuda", dtype=torch.float32)
-            elif layout == "dense":
-                logits = torch.empty(
-                    s_q, triton.cdiv(s_k, 256) * 256, device="cuda", dtype=torch.float32
-                )[:, :s_k]
-            return q, kv, scales, weights, starts, ends, logits, offsets
+        def _run(q_fp8, kv_fp8, scales, weights, ks, ke):
+            fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
 
-        bencher = RotatingBufferBench.from_dict(
-            get_rot_bufs_kwargs(args) | get_do_bench_graph_kwargs(args)
-        )
-        pool = bencher.build_pool(
-            [inputs],
-            [
-                [
-                    "Q",
-                    "KV",
-                    "kv_scales",
-                    "weights",
-                    "cu_starts",
-                    "cu_ends",
-                    "out",
-                    "out_offsets",
-                ]
-            ],
-        )
-        time_ms = bencher.bench(
-            lambda **kwargs: fp8_mqa_logits(**kwargs, clean_logits=clean_logits)
-        )
+        time_ms = bencher.bench(_run)
+        sample = rot_bufs[0]
         tflops = calculate_tflops(
-            pool[0]["cu_starts"], pool[0]["cu_ends"], num_heads_q, head_dim, time_ms
+            sample["ks"], sample["ke"], num_heads_q, head_dim, time_ms
         )
 
         # Return exactly one scalar depending on which metric is active
