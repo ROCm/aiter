@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: B008
+# The FlyDSL body uses a typed Stream default for its tracing semantics.
 
 """gfx942 FP8 blockscale GEMM: 2x4 wave grid, A and B staged through LDS, pf1.
 
@@ -26,9 +28,16 @@ PyHIP's. Only the helpers are inlined and the kernel symbol is named:
 PyHIP's BufferTensor.load is _buffer_load_dwordx4 below, the same
 buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
 below are kept for that reason; each names the stable API it stands in for.
-PyHIP's ISA audit of this kernel flags one SGPR WAW at K = 128 (one K block):
-the two inline-asm s_buffer_load_dword of the next block's (unused) B scales
-are in flight to the same SGPR; nothing reads it (PyHIP design note F3).
+
+The interface is the gfx950 8-wave kernel's (gemm_a8w8_blockscale_8wave.py):
+compile_gemm_fp8_gfx942_2x4_lds_pf1(TILE_M, TILE_N, TILE_K, N, K, preshuffle_b)
+returns launch_gemm(A, B, C, scaleA, scaleB, M, stream), which takes tensors
+and rebases A, B and C per tile in i64; C's dtype selects the epilogue.
+
+At K = 128 (one K block) the two inline-asm s_buffer_load_dword of the next
+block's B scales still load values nothing reads (PyHIP design note F3).
+PyHIP's build loads both into one SGPR, which its ISA audit flags as a WAW;
+here FlyDSL 0.5.3 gives them separate SGPRs and the audit passes.
 
 The epilogue is aiter's: it rounds the FP32 results to BF16 or FP16 to
 nearest even, as the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave.py)
@@ -43,6 +52,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
 TILE = 256
 TILE_K = 128
@@ -109,21 +120,23 @@ def _s_buffer_load_f32(rsrc, offset_bytes):
     return fx.Float32(value)
 
 
-def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
-    N, K, preshuffle_b, out_dtype="bf16"
+def compile_gemm_fp8_gfx942_2x4_lds_pf1(
+    TILE_M,
+    TILE_N,
+    TILE_K,
+    N,
+    K,
+    preshuffle_b=False,
 ):
-    """The launcher of one (N, K, B layout, output dtype).
+    """Compile the 2x4-LDS pf1 blockscale kernel for one (N, K, B layout).
 
-    ``launch(pA, pB, pC, pScaleA, pScaleB, M, stream)`` takes fx.Int32
-    pointers to A[M, K], B (plain [N, K] or shuffle_weight(B, (16, 16))) and
-    C[M, N] (BF16 for out_dtype "bf16", FP16 for "fp16"), and fx.Float32
-    pointers to ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128], all
-    contiguous. Not cached: the caller keeps one launcher per device.
+    ``launch_gemm(A, B, C, scaleA, scaleB, M, stream)`` takes A[M, K] and B
+    (plain [N, K] or shuffle_weight(B, (16, 16))) as FP8 bytes, C[M, N] in BF16
+    or FP16, and FP32 ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128], all
+    contiguous.
     """
+    assert (TILE_M, TILE_N, TILE_K) == (256, 256, 128)
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
-    assert out_dtype in ("bf16", "fp16"), out_dtype
-    out_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
-    symbol_suffix = "_f16" if out_dtype == "fp16" else ""
     KB = K // TILE_K
     scale_rows_b = (N + 127) // 128
     b_k_bytes = TILE_K * 16 if preshuffle_b else TILE_K
@@ -134,15 +147,15 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
         b: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
 
     @flyc.kernel(
-        name=f"gemm_a8w8_blockscale_gfx942_2x4_lds_pf1_ps{int(preshuffle_b)}{symbol_suffix}",
+        name=f"gemm_a8w8_blockscale_gfx942_2x4_lds_pf1_ps{int(preshuffle_b)}",
         known_block_size=[512, 1, 1],
     )
     def gemm_kernel(
-        pA: fx.Pointer,
-        pB: fx.Pointer,
-        pC: fx.Pointer,
-        pScaleA: fx.Pointer,
-        pScaleB: fx.Pointer,
+        argA: fx.Tensor,
+        argB: fx.Tensor,
+        argC: fx.Tensor,
+        argScaleA: fx.Tensor,
+        argScaleB: fx.Tensor,
         M: fx.Int32,
     ):
         tid = fx.thread_idx.x
@@ -160,34 +173,40 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
         cols_left = N - col_base
         cols = (cols_left < TILE).select(cols_left, TILE)
 
+        # Rebase A, B and C in i64 per tile, in their own element types (no
+        # recast claims more alignment than a view has); all descriptor
+        # offsets below are tile-local bytes.
         a_tensor = fx.rocdl.make_buffer_tensor(
             fx.make_view(
-                pA + fx.Int64(row_base) * (K // 4), fx.make_layout(TILE * K // 4, 1)
+                fx.add_offset(fx.get_iter(argA), fx.Int64(row_base) * K),
+                fx.make_layout(TILE * K, 1),
             ),
             max_size=False,
             num_records_bytes=rows * K,
         )
         b_tensor = fx.rocdl.make_buffer_tensor(
             fx.make_view(
-                pB + fx.Int64(col_base) * (K // 4), fx.make_layout(TILE * K // 4, 1)
+                fx.add_offset(fx.get_iter(argB), fx.Int64(col_base) * K),
+                fx.make_layout(TILE * K, 1),
             ),
             max_size=False,
             num_records_bytes=cols * K,
         )
         c_tensor = fx.rocdl.make_buffer_tensor(
             fx.make_view(
-                pC + fx.Int64(row_base) * (N // 2), fx.make_layout(TILE * N // 2, 1)
+                fx.add_offset(fx.get_iter(argC), fx.Int64(row_base) * N),
+                fx.make_layout(TILE * N, 1),
             ),
             max_size=False,
             num_records_bytes=rows * (N * 2),
         )
         scale_a_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(pScaleA, fx.make_layout(M * KB, 1)),
+            fx.make_view(fx.get_iter(argScaleA), fx.make_layout(M * KB, 1)),
             max_size=False,
             num_records_bytes=M * (KB * 4),
         )
         scale_b_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(pScaleB, fx.make_layout(scale_rows_b * KB, 1)),
+            fx.make_view(fx.get_iter(argScaleB), fx.make_layout(scale_rows_b * KB, 1)),
             max_size=False,
             num_records_bytes=scale_rows_b * KB * 4,
         )
@@ -498,6 +517,9 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
         if wave_m == 0:
             barrier()
 
+        # ---- epilogue store ----
+        out_dtype = argC.dtype
+        assert out_dtype in (fx.BFloat16, fx.Float16)
         output_col = col_base + wave_n * 16 + lane // 16 * 4
         for packet in range_constexpr(4):
             for side in range_constexpr(2):
@@ -517,7 +539,7 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
                         # Round to nearest even, as the gfx950 8-wave kernel's
                         # epilogue does; gfx942 has no v_cvt_pk_bf16_f32, so
                         # LLVM expands the BF16 conversion.
-                        packed = values.to(out_type).bitcast(fx.Int32)
+                        packed = values.to(out_dtype).bitcast(fx.Int32)
                         # Raw store, not fx.copy(BufferCopy64b): columns past N
                         # need the explicit out-of-range voffset 0x7FFFFFFF.
                         rocdl.raw_ptr_buffer_store(
@@ -529,30 +551,22 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
                         )
 
     @flyc.jit
-    def launch(
-        pA: fx.Pointer,
-        pB: fx.Pointer,
-        pC: fx.Pointer,
-        pScaleA: fx.Pointer,
-        pScaleB: fx.Pointer,
+    def launch_gemm(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        scaleA: fx.Tensor,
+        scaleB: fx.Tensor,
         M: fx.Int32,
-        stream: fx.Stream,
+        stream: fx.Stream = fx.Stream(None),
     ):
         # Keep the dequant FMAs scalar: v_pk_fma_f32 pairs would break the
         # one-FMA-per-MFMA interleave.
-        gemm_kernel(
-            pA,
-            pB,
-            pC,
-            pScaleA,
-            pScaleB,
-            M,
-            value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
-        ).launch(
-            grid=((M + TILE - 1) // TILE * ((N + TILE - 1) // TILE), 1, 1),
+        value_attrs = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
+        gemm_kernel(A, B, C, scaleA, scaleB, M, value_attrs=value_attrs).launch(
+            grid=(ceildiv(M, TILE_M) * ceildiv(N, TILE_N), 1, 1),
             block=(512, 1, 1),
             stream=stream,
         )
 
-    launch.compile_hints["target_features"] = "-packed-fp32-ops"
-    return launch
+    return launch_gemm

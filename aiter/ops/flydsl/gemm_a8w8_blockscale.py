@@ -116,25 +116,20 @@ def _compile_gemm(
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     ki = kernels_by_name[kernel_name]
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     if ki.gfx == "gfx942":
         from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds_pf1 import (
-            compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1,
+            compile_gemm_fp8_gfx942_2x4_lds_pf1 as compile_gemm_fp8,
+        )
+    else:
+        from .kernels.gemm_a8w8_blockscale_8wave import (
+            compile_gemm_fp8_8wave as compile_gemm_fp8,
         )
 
-        # PyHIP's own compile hints (no opt_level override), which its
-        # pipeline was scheduled with. The output dtype selects the epilogue's
-        # conversion.
-        return compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
-            N, K, ki.preshuffle_b, "fp16" if out_dtype == torch.float16 else "bf16"
-        )
-
-    from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
-
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
     # each caches the first typed CompiledFunction it compiles.
-    launch = compile_gemm_fp8_8wave(
+    launch = compile_gemm_fp8(
         TILE_M,
         TILE_N,
         TILE_K,
@@ -145,50 +140,6 @@ def _compile_gemm(
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
     return launch
-
-
-def _aligned(t: Tensor, alignment: int) -> Tensor:
-    return t if t.data_ptr() % alignment == 0 else t.clone()
-
-
-def _launch_gfx942(
-    XQ: Tensor,
-    WQ: Tensor,
-    sa: Tensor,
-    sb: Tensor,
-    out: Tensor,
-    kernel_name: str,
-) -> Tensor:
-    """Launch the gfx942 kernel into contiguous ``out``; returns what it wrote."""
-    import flydsl.expr as fx
-
-    from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
-
-    M, K = XQ.shape
-    N = WQ.shape[0]
-    # The kernel takes i32 pointers, loads A and B with 16-byte
-    # buffer_load_dwordx4 at 16-byte offsets from their base and stores four
-    # BF16 or FP16 per lane with one 8-byte buffer_store_dwordx2. An operand
-    # view whose base breaks that alignment (an offset into a larger buffer) is
-    # staged through a fresh, aligned copy, so every access stays naturally
-    # aligned; the caller copies a staged output back into Out.
-    a = _aligned(XQ.contiguous(), 16)
-    b = _aligned(WQ.contiguous(), 16)
-    if out.data_ptr() % 8:
-        out = torch.empty_like(out)
-    # Pointer ABI, as PyHIP's launcher: i32 elements for A, B and C (the kernel
-    # rebases them per tile in dwords), f32 for the scales.
-    _run_compiled(
-        _compile_gemm.lazy(N, K, kernel_name, XQ.device, out.dtype),
-        ptr_arg(a, fx.Int32),
-        ptr_arg(b, fx.Int32),
-        ptr_arg(out, fx.Int32),
-        ptr_arg(sa, fx.Float32),
-        ptr_arg(sb, fx.Float32),
-        M,
-        current_stream_arg(XQ.device),
-    )
-    return out
 
 
 def run_gemm_a8w8_blockscale(
@@ -224,11 +175,6 @@ def run_gemm_a8w8_blockscale(
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
         out_contiguous = Out.contiguous()
-        if ki.gfx == "gfx942":
-            out_contiguous = _launch_gfx942(XQ, WQ, sa, sb, out_contiguous, kernel_name)
-            if out_contiguous is not Out:
-                Out.copy_(out_contiguous)
-            return Out
         # Every tensor is contiguous and only Out's dtype varies, so the
         # compile arguments determine the launcher's argument signature. The
         # device keeps one launcher per device on the JIT path; on disk the

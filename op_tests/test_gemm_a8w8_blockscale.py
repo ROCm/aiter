@@ -302,8 +302,8 @@ def test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset):
     gemm_a8w8_blockscale_flydsl and through the public op, with the tuned-config
     lookup injected. The caller's output is NaN-filled between guard elements,
     so an unwritten element or a store outside it fails. ``out_offset`` elements
-    put its base off an 8-byte boundary, which the launcher stages through an
-    aligned buffer. ``dtype`` is the output dtype, BF16 or FP16.
+    put its base off an 8-byte boundary; the kernel stores into it directly, as
+    on gfx950. ``dtype`` is the output dtype, BF16 or FP16.
     """
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
         kernels_list,
