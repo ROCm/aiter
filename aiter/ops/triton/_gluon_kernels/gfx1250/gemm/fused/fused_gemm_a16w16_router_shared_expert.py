@@ -20,6 +20,10 @@
 # The polls time out and count the timeout in ws[0] instead of hanging.
 # Every tile runs the K chain of the a16w16 GEMM in K order with one fp32
 # accumulator, so all three outputs are bitwise those of the separate GEMMs.
+# Opt-in schedule (bitwise): PREFETCH spreads an L2 prefetch of the gate /
+# up and router weights over all programs of each XCD at the start (the
+# gate / up tiles of an XCD all read the same weight slice); LATE_USE issues
+# a down tile's h loads before its counting atomic.
 
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
@@ -185,6 +189,7 @@ def _down_tile(
     NUM_WARPS: gl.constexpr,
     H_CACHE: gl.constexpr,
     TIMEOUT_NS: gl.constexpr,
+    LATE_USE: gl.constexpr = 0,
 ):
     """Tile (mb, nb) of h @ Wd^T with the whole K (= I) resident in LDS: the
     Wd loads go out before the poll for h, the h loads right after it. The
@@ -217,9 +222,10 @@ def _down_tile(
     waves = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, L))
     lead = (waves[:, None] + lanes[None, :]) == 0
     zero = waves[:, None] * 0 + lanes[None, :] * 0
-    used = gl.atomic_add(
-        use_ptr + mb + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu"
-    )
+    if not LATE_USE:
+        used = gl.atomic_add(
+            use_ptr + mb + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu"
+        )
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=h_ptr + mb * BLOCK_M * stride_hm,
         shape=(M - mb * BLOCK_M, KD),
@@ -230,6 +236,12 @@ def _down_tile(
     for k in gl.static_range(NK):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, k * BLOCK_K], a_buffer.index(k), cache_modifier=H_CACHE
+        )
+    if LATE_USE:
+        # The compiler waits for the add's return at once: issue it after
+        # the h loads, so that the wait overlaps them.
+        used = gl.atomic_add(
+            use_ptr + mb + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu"
         )
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA)
     for k in gl.static_range(NK):
@@ -243,6 +255,60 @@ def _down_tile(
     last = lead & (used == N_D - 1)
     gl.atomic_xchg(cnt_ptr + mb + zero, zero, mask=last, sem="relaxed", scope="gpu")
     gl.atomic_xchg(use_ptr + mb + zero, zero, mask=last, sem="relaxed", scope="gpu")
+
+
+@gluon.jit
+def _prefetch_weights(
+    wr_ptr,
+    wgu_ptr,
+    pid,
+    num_mb,
+    K: gl.constexpr,
+    NR_ROWS: gl.constexpr,
+    NGU: gl.constexpr,
+    N_GU: gl.constexpr,
+    N_R: gl.constexpr,
+    BLOCK_N1: gl.constexpr,
+    BLOCK_K1: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+    SHARED_B1: gl.constexpr,
+):
+    """L2 prefetch of the gate / up and router weight slices that the tiles
+    of this program's XCD (pid % 8, programs go to XCDs round robin) read,
+    spread over all programs of the XCD, BLOCK_K1 columns an item. The gate
+    / up tiles of slice nb run on XCD nb % 8 (N_GU is a multiple of 8); the
+    router tile u = mb * N_R + nb runs on XCD u % 8, and its first 8 M
+    blocks cover every slice an XCD reads."""
+    KC: gl.constexpr = K // BLOCK_K1
+    xcd = pid % 8
+    lid = pid // 8
+    nprog = (NUM_PROGRAMS - xcd + 7) // 8
+    n_g = (N_GU - xcd + 7) // 8
+    n_u = gl.minimum(num_mb, 8) * N_R
+    n_r = (n_u - xcd + 7) // 8
+    for j in range(lid, (n_g + n_r) * KC, nprog):
+        s = j // KC
+        c = j % KC
+        if s < n_g:
+            nb = xcd + 8 * s
+            d = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=wgu_ptr + nb * BLOCK_N1 * K,
+                shape=(NGU - nb * BLOCK_N1, K),
+                strides=(K, 1),
+                block_shape=(BLOCK_N1, BLOCK_K1),
+                layout=SHARED_B1,
+            )
+            gl.amd.gfx1250.tdm.prefetch(d, [0, c * BLOCK_K1])
+        else:
+            nb = (xcd + 8 * (s - n_g)) % N_R
+            d = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=wr_ptr + nb * BLOCK_N1 * K,
+                shape=(NR_ROWS - nb * BLOCK_N1, K),
+                strides=(K, 1),
+                block_shape=(BLOCK_N1, BLOCK_K1),
+                layout=SHARED_B1,
+            )
+            gl.amd.gfx1250.tdm.prefetch(d, [0, c * BLOCK_K1])
 
 
 @gluon.jit(repr=_router_shared_expert_repr)
@@ -287,6 +353,8 @@ def _gemm_a16w16_router_shared_expert_kernel(
     STORE1: gl.constexpr,
     TIMEOUT_NS: gl.constexpr,
     H_CACHE: gl.constexpr,
+    LATE_USE: gl.constexpr = 0,
+    PREFETCH: gl.constexpr = 0,
 ):
     KD: gl.constexpr = NGU // 2
     N_GU: gl.constexpr = NGU // BLOCK_N1
@@ -299,6 +367,22 @@ def _gemm_a16w16_router_shared_expert_kernel(
     t_1 = t_gu + num_mb * N_R
     t_all = t_1 + num_mb * N_D
     cnt_ptr = ws_ptr + WS_HEADER
+    if PREFETCH:
+        _prefetch_weights(
+            wr_ptr,
+            wgu_ptr,
+            pid,
+            num_mb,
+            K,
+            NR_ROWS,
+            NGU,
+            N_GU,
+            N_R,
+            BLOCK_N1,
+            BLOCK_K1,
+            NUM_PROGRAMS,
+            SHARED_B1,
+        )
 
     for t in range(pid, t_all, NUM_PROGRAMS):
         if t < t_gu:
@@ -396,6 +480,7 @@ def _gemm_a16w16_router_shared_expert_kernel(
                 NUM_WARPS,
                 H_CACHE,
                 TIMEOUT_NS,
+                LATE_USE,
             )
 
 
