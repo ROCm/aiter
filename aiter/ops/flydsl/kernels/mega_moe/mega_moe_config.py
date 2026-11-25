@@ -1663,14 +1663,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
                 config.fused_stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2
             ),
         )
-    if bucket == 16:
-        # EP4's 256-wide GEMM1 / GEMM2 tiles lose under skewed routing here; keep the 128-wide ones.
+    if bucket in (16, 32):
+        # 256-wide GEMM1 / GEMM2 n-tiles: half the GEMM1 tiles and GEMM2 blocks, each streaming a longer weight slab.
         return replace(
             config,
-            stage1=replace(config.stage1, tile_n=128),
-            stage2=replace(config.stage2, block_n=128),
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
         )
-    if bucket in (32, 64):
+    if bucket == 64:
         # Wider GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab.
         return replace(config, stage1=replace(config.stage1, tile_n=256))
     if bucket == 512:
