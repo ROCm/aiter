@@ -23,6 +23,7 @@ import traceback
 import types
 import unittest
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 from unittest import mock
 
@@ -916,6 +917,10 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "shutil": shutil,
             "sys": sys,
             "time": time,
+            "contextmanager": contextlib.contextmanager,
+            "_jit_build_observer": ContextVar(
+                "test_jit_build_observer", default=contextlib.nullcontext
+            ),
             "multiprocessing": multiprocessing,
             "re": re,
             "traceback": traceback,
@@ -957,7 +962,13 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         }
         self.core = _load_functions(
             JIT_CACHE_PATH.parents[1] / "core.py",
-            ["build_module", "_stage_blob_sources", "rename_cpp_to_cu"],
+            [
+                "observe_jit_build",
+                "_jit_build_scope",
+                "build_module",
+                "_stage_blob_sources",
+                "rename_cpp_to_cu",
+            ],
             namespace,
         )
 
@@ -977,6 +988,43 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             torch_exclude=True,
             third_party=[],
         )
+
+    def test_build_observer_covers_compilation_and_peer_wait_and_cleans_up(self):
+        active = []
+        events = []
+
+        @contextlib.contextmanager
+        def observe():
+            active.append(True)
+            events.append("enter")
+            try:
+                yield
+            finally:
+                active.pop()
+                events.append("exit")
+
+        compile_module = self.core["_jit_compile"]
+
+        def checked_compile(*args, **kwargs):
+            self.assertTrue(active, "the actual build must notify the tuner")
+            return compile_module(*args, **kwargs)
+
+        self.core["_jit_compile"] = checked_compile
+        with self.core["observe_jit_build"](observe):
+            self.build(7)
+            self.assertFalse(active, "kernel launches must run outside the scope")
+
+            def peer_wait(**kwargs):
+                self.assertTrue(active, "waiting on a peer is also build time")
+                raise RuntimeError("peer build failed")
+
+            self.core["mp_lock"] = peer_wait
+            with self.assertRaisesRegex(RuntimeError, "peer build failed"):
+                self.build(9)
+            self.assertFalse(active)
+        with self.core["_jit_build_scope"]():
+            self.assertFalse(active, "the observer must be restored")
+        self.assertEqual(events, ["enter", "exit", "enter", "exit"])
 
     def test_successful_sidecar_survives_clear_build_and_seeds_next_build(self):
         self.build(7)

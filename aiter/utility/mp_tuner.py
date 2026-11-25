@@ -5,6 +5,8 @@ import math
 import multiprocessing as mp
 import os
 import time
+from contextlib import contextmanager
+from functools import partial
 from multiprocessing import TimeoutError as MPTimeoutError
 from queue import Empty
 from typing import Any, NamedTuple
@@ -12,6 +14,7 @@ from typing import Any, NamedTuple
 import torch
 
 from aiter import dtypes, logger
+from aiter.jit.core import observe_jit_build
 from aiter.test_common import checkAllclose
 from aiter.utility.tune_result import TuneResult
 from aiter_worker_limits import configure_worker_subprocesses
@@ -76,13 +79,36 @@ def _init_task_start_times(task_start_times, task_pids=None):
     _TASK_PIDS = task_pids
 
 
+@contextmanager
+def _pause_timeout_for_build(task_index):
+    started_at = _TASK_START_TIMES[task_index]
+    if started_at <= 0:
+        # A nested build is already covered by the outer build's interval.
+        yield
+        return
+    build_started_at = time.monotonic()
+    # One shared slot publishes the phase to the parent: zero is
+    # queued, negative is building, positive is the execution clock's origin.
+    # Do not hold an interprocess lock that a killed worker could abandon.
+    _TASK_START_TIMES[task_index] = -build_started_at
+    try:
+        yield
+    finally:
+        # Shift the origin instead of resetting it: execution before this
+        # build still counts, including across multiple builds in a group.
+        _TASK_START_TIMES[task_index] = started_at + (
+            time.monotonic() - build_started_at
+        )
+
+
 def _run_with_start_tracking(task_index, func, args):
     if _TASK_START_TIMES is None:
         raise RuntimeError("Task start-time storage is not initialized")
     if _TASK_PIDS is not None:
         _TASK_PIDS[task_index] = os.getpid()
     _TASK_START_TIMES[task_index] = time.monotonic()
-    return func(*args)
+    with observe_jit_build(partial(_pause_timeout_for_build, task_index)):
+        return func(*args)
 
 
 def _task_worker_exited(task_pids, task_index):
@@ -103,7 +129,7 @@ def _task_worker_exited(task_pids, task_index):
 
 def _elapsed_since_task_start(task_start_times, task_index, now=None):
     started_at = task_start_times[task_index]
-    if started_at == 0:
+    if started_at <= 0:
         return None
     current_time = time.monotonic() if now is None else now
     return current_time - started_at
@@ -600,7 +626,9 @@ def mp_tuner(
         fast_mode: Skip result comparison if True
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
-        timeout: Timeout in seconds for each task group (None = no timeout)
+        timeout: Execution timeout in seconds for each task group (None = no
+            timeout). Native AITER JIT builds, including build-lock waits, do
+            not consume this budget. Kernel warmup and execution still do.
         verbose: Print per-task progress and pool restarts
         policy: SelectionPolicy for the run; None uses the one the tuner activated
         final_timing: whether these times pick the winner (default: not fast_mode).
@@ -811,11 +839,16 @@ def mp_tuner(
             try:
                 elapsed = _elapsed_since_task_start(task_start_times, k)
                 if elapsed is None:
-                    # The task is still queued, so it has no execution timeout yet.
-                    if not async_result.ready():
+                    if task_start_times[k] < 0:
+                        # Poll builds too: a worker that dies while building
+                        # must still take the normal worker-exit recovery path.
+                        actual_timeout = check_interval
+                    elif not async_result.ready():
+                        # Queued tasks have no execution timeout yet.
                         consecutive_timeouts = 0
                         continue
-                    actual_timeout = 0
+                    else:
+                        actual_timeout = 0
                 elif timeout is not None:
                     remaining_time = timeout - elapsed
                     # Use the smaller of check_interval and remaining_time, but at least 1 second

@@ -64,6 +64,20 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 
 ## Running
 
+The tuners' `--timeout` is an execution budget for each task group. Native
+AITER JIT source generation, compilation and waits for another process's
+build do not consume it (#5264). Execution before and after a build counts
+toward the same budget; kernel warmup, timing and validation are still bounded.
+This does not add a deadline to the JIT builder itself or exclude compilation
+performed outside AITER's `build_module` (for example Triton compilation).
+Dead workers are detected and recovered even if they died during a build.
+
+`test_mp_tuner_logic.py` checks budget accounting and observer cleanup.
+`test_jit_cache_transaction.py` checks the actual native build boundary with a
+stub compiler. `test_mp_tuner_fault.py` runs real spawned workers and GPU tensor
+operations with an injected slow build, post-build hang and builder death; its
+build delay is a control-flow regression test, not a CKTile compilation benchmark.
+
 ```bash
 # Level 0+1 only (no GPU, <10s)
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
