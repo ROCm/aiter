@@ -245,11 +245,13 @@ class GemmKernelHandler(KernelHandler):
 # "<name> <us>us <TF/s> TF/s <TB/s> TB/s", optionally followed by " [kernel]".
 # a4w4 omits that bracket and prints the kernel name once after the groups.
 # `total` is both GEMMs back to back, the whole MLP.
+# The bench prints a fixed number of significant digits, so a large value can end
+# in a bare decimal point ("1071.") and the fraction digits are optional.
 _MOE_TOTAL_RE = re.compile(
     r"total\s+"
-    r"(?P<us>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)us\s+"
-    r"(?P<tflops>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+TF/s\s+"
-    r"(?P<tbps>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+TB/s"
+    r"(?P<us>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)us\s+"
+    r"(?P<tflops>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)\s+TF/s\s+"
+    r"(?P<tbps>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)\s+TB/s"
 )
 
 
