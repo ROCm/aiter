@@ -40,8 +40,6 @@ one workgroup reads one sequential stream per strip. Register contents, K groupi
 same as with the column-major layout, so the output is bit-identical.
 """
 
-import torch
-
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -175,49 +173,13 @@ v_cvt_pkrtz_f16_f32 $0, $1, $2
 _ASM_BF16_TO_F16_CONSTRAINTS = tl.constexpr("=v,=&v,=&v,v")
 
 
-# ---- W_STRIP16 record layout (see gfx942_strip16_pack)
+# ---- W_STRIP16 record layout. The host-side pack / unpack helpers are in
+# aiter/ops/triton/utils/shuffle.py (gfx942_strip16_pack, gfx942_strip16_unpack).
 STRIP16_COLS = 16  # columns per strip = one quarter-wave
 STRIP16_K = 128  # K per record = 4 e8m0 groups = 64 B of fp4 per column
 STRIP16_W_BYTES = 1024  # 4 groups x 16 columns x 16 B
 STRIP16_REC_BYTES = 1088  # + 16 columns x 4 e8m0 = 17 cache lines
 W_LAYOUT_STRIP16 = "GFX942_STRIP16"
-
-
-def gfx942_strip16_pack(w, w_scales, experts_per_chunk=16):
-    """Re-lay MXFP4 expert weights for the W_STRIP16 path of the gfx942 kernel. Done once at weight load.
-
-    w:        (E, K/2, N) uint8, 2 fp4 per byte along K (any strides; vLLM passes a stride(-2) == 1 view)
-    w_scales: (E, K/32, N) uint8 e8m0
-    Returns a contiguous (E, N/16, K/128, 1088) uint8 tensor. Record (e, strip, rec):
-      bytes [0, 1024)    weights  [j = 0..3][n16 = 0..15][16 B]: K group 4*rec + j (32 K) of column 16*strip + n16
-      bytes [1024, 1088) scales   [n16 = 0..15][j = 0..3]:       e8m0 of the same (group, column)
-    Byte and nibble order inside each 16-byte run are unchanged. Needs K % 128 == 0 and N % 16 == 0.
-    """
-    E, K2, N = w.shape
-    assert w.dtype == torch.uint8 and w_scales.dtype == torch.uint8
-    assert K2 % (STRIP16_K // 2) == 0 and N % STRIP16_COLS == 0, (K2, N)
-    assert tuple(w_scales.shape) == (E, K2 // 16, N), (tuple(w_scales.shape), tuple(w.shape))
-    R, S = K2 // 64, N // 16
-    out = torch.empty((E, S, R, STRIP16_REC_BYTES), dtype=torch.uint8, device=w.device)
-    for e0 in range(0, E, experts_per_chunk):  # bounded transient memory
-        wc = w[e0 : e0 + experts_per_chunk]
-        sc = w_scales[e0 : e0 + experts_per_chunk]
-        n = wc.shape[0]
-        # (e, rec, j, r, strip, n16) -> (e, strip, rec, j, n16, r)
-        ww = wc.reshape(n, R, 4, 16, S, 16).permute(0, 4, 1, 2, 5, 3)
-        out[e0 : e0 + n, :, :, :STRIP16_W_BYTES] = ww.reshape(n, S, R, STRIP16_W_BYTES)
-        # (e, rec, j, strip, n16) -> (e, strip, rec, n16, j)
-        ss = sc.reshape(n, R, 4, S, 16).permute(0, 3, 1, 4, 2)
-        out[e0 : e0 + n, :, :, STRIP16_W_BYTES:] = ss.reshape(n, S, R, STRIP16_REC_BYTES - STRIP16_W_BYTES)
-    return out
-
-
-def gfx942_strip16_unpack(rec):
-    """Inverse of gfx942_strip16_pack: (E, N/16, K/128, 1088) -> (w (E, K/2, N), w_scales (E, K/32, N)), contiguous."""
-    E, S, R, _ = rec.shape
-    ww = rec[..., :STRIP16_W_BYTES].reshape(E, S, R, 4, 16, 16).permute(0, 2, 3, 5, 1, 4)
-    ss = rec[..., STRIP16_W_BYTES:].reshape(E, S, R, 16, 4).permute(0, 2, 4, 1, 3)
-    return ww.reshape(E, R * 64, S * 16), ss.reshape(E, R * 4, S * 16)
 
 
 def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
@@ -430,6 +392,7 @@ def _moe_gemm_a16w4_gfx942(
     UPCAST_INDICES: gl.constexpr = False,
     FP16_OPERAND: gl.constexpr = False,
     W_STRIP16: gl.constexpr = False,
+    EVEN_K: gl.constexpr = True,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -606,9 +569,20 @@ def _moe_gemm_a16w4_gfx942(
         thi1 = _const_u16_pairs((PK2, BLOCK_N), THI1, DOT_W16)
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA_LAYOUT)
-    num_k_iter = K // (BLOCK_K * SPLIT_K)
+    # K = reduction length. EVEN_K: K % (BLOCK_K * SPLIT_K) == 0. Otherwise the last tiles are partial: the
+    # activation loads are masked to K (zeros past it), while the weight loads still cover whole tiles: W must hold
+    # ceil(K / (BLOCK_K * SPLIT_K)) * BLOCK_K * SPLIT_K values along K, and the ones past K only meet zero
+    # activations, so they add nothing as long as they dequantise to finite values (zero padding does). The wrapper
+    # uses this only for W_STRIP16 records, whose packed K is a multiple of BLOCK_K * SPLIT_K.
+    if EVEN_K:
+        num_k_iter = K // (BLOCK_K * SPLIT_K)
+    else:
+        num_k_iter = (K + BLOCK_K * SPLIT_K - 1) // (BLOCK_K * SPLIT_K)
     for k in range(num_k_iter):
-        x = gl.load(XPtrs)
+        if EVEN_K:
+            x = gl.load(XPtrs)
+        else:
+            x = gl.load(XPtrs, mask=(offs_x_k < K - k * (BLOCK_K * SPLIT_K))[None, :], other=0.0)
         wq = gl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
         sc = gl.load(SPtrs, cache_modifier=W_CACHE_MODIFIER)
 

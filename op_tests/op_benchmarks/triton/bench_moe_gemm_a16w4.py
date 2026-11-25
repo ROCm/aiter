@@ -54,7 +54,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import gfx942_strip16_pack, shuffle_scale_moe
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
     get_parser,
@@ -66,6 +66,8 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
+# expert weight layouts: column-major, or the gfx942 Gluon STRIP16 records (gfx942_strip16_pack)
+W_LAYOUTS = ("column_major", "strip16")
 # activation formats --act-dtype accepts; both unquantized, the weights are
 # always mxfp4
 ACT_DTYPES = ("bf16", "fp16")
@@ -249,6 +251,7 @@ def _generate_pool_inputs(
     w_dtype,
     TP,
     backend,
+    w_layout="column_major",
 ):
     """One full weight-init draw: weights, routing, and the layer-1 swiglu
     output layer 2 reads. Regenerated per pool entry, so replaying through the
@@ -280,6 +283,14 @@ def _generate_pool_inputs(
     w2_scales, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scales, dim1, dim2 // TP // 2
     )
+    # STRIP16: re-lay the expert weights once here, outside the timed region; the
+    # original (E, K/32, N) scales stay the scale argument (the op reads its shape)
+    layout_kw = _layout_kwargs(w_layout)
+    if layout_kw:
+        assert get_arch() == "gfx942", "--w-layout strip16 is gfx942 (Gluon) only"
+        assert swizzle_mx_scale1 is None and swizzle_mx_scale2 is None
+        w1 = gfx942_strip16_pack(w1.view(torch.uint8), w1_scales.view(torch.uint8))
+        w2 = gfx942_strip16_pack(w2.view(torch.uint8), w2_scales.view(torch.uint8))
 
     # -- routing + layer-1 activations --
     x1 = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
@@ -301,6 +312,7 @@ def _generate_pool_inputs(
             out_dtype=out_dtype,
             apply_swiglu=True,
             backend=backend,
+            **layout_kw,
         )
 
     # layer 2 reads layer 1's swiglu output as-is -- a16w4 never quantizes
@@ -329,7 +341,14 @@ def _generate_pool_inputs(
     )
 
 
-def _layer1_fn(out_dtype, backend):
+def _layout_kwargs(w_layout):
+    assert w_layout in W_LAYOUTS, f"{w_layout=} must be one of {W_LAYOUTS}"
+    return {"w_layout": "GFX942_STRIP16"} if w_layout == "strip16" else {}
+
+
+def _layer1_fn(out_dtype, backend, w_layout="column_major"):
+    layout_kw = _layout_kwargs(w_layout)
+
     def _fn(x1, w1, w1_scales, b1, rdata, gather_indx, swizzle_mx_scale1, **_):
         return moe_gemm_a16w4(
             x1,
@@ -345,12 +364,15 @@ def _layer1_fn(out_dtype, backend):
             out_dtype=out_dtype,
             apply_swiglu=True,
             backend=backend,
+            **layout_kw,
         )
 
     return _fn
 
 
-def _layer2_fn(out_dtype, backend):
+def _layer2_fn(out_dtype, backend, w_layout="column_major"):
+    layout_kw = _layout_kwargs(w_layout)
+
     def _fn(x2, w2, w2_scales, b2, rdata, scatter_indx, swizzle_mx_scale2, **_):
         return moe_gemm_a16w4(
             x2,
@@ -366,6 +388,7 @@ def _layer2_fn(out_dtype, backend):
             out_dtype=out_dtype,
             apply_swiglu=False,
             backend=backend,
+            **layout_kw,
         )
 
     return _fn
@@ -392,6 +415,7 @@ def bench_mlp(
     backend,
     layers=LAYERS,
     num_weight_inits=1,
+    w_layout="column_major",
 ):
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype in ACT_DTYPES, f"{x_dtype=} must be one of {ACT_DTYPES}"
@@ -412,6 +436,7 @@ def bench_mlp(
         w_dtype,
         TP,
         backend,
+        w_layout=w_layout,
     )
     # pool_len == num_weight_inits: each captured call in the graph replays a
     # distinct weight/routing draw, the same role the old averaging loop played.
@@ -420,8 +445,8 @@ def bench_mlp(
         [_POOL_FIELDS],
     )
 
-    layer1_fn = _layer1_fn(x_dtype_torch, backend)
-    layer2_fn = _layer2_fn(x_dtype_torch, backend)
+    layer1_fn = _layer1_fn(x_dtype_torch, backend, w_layout)
+    layer2_fn = _layer2_fn(x_dtype_torch, backend, w_layout)
     both_fn = _both_fn(layer1_fn, layer2_fn)
 
     # -- analytic FLOPs / bytes, matching the proton metadata the original
@@ -435,11 +460,16 @@ def bench_mlp(
     n_tokens = sample["gather_indx"].shape[0]  # routed rows == batch * n_expts_act
     routed = int((sample["rdata"].expt_data.hist > 0).sum())  # experts w/ >= 1 token
 
+    def fp4_bytes(w):
+        # STRIP16 records (E, N/16, K/128, 1088) hold 1024 B of fp4 + 64 B of scales each
+        n = w.numel() * w.element_size()
+        return n * 1024 // 1088 if w.ndim == 4 else n
+
     def w_bytes(w):
-        return (w.numel() * w.element_size() // n_expts_tot) * routed
+        return (fp4_bytes(w) // n_expts_tot) * routed
 
     def w_scale_bytes(w):
-        return (w.numel() * w.element_size() * 2 // 32 // n_expts_tot) * routed
+        return (fp4_bytes(w) * 2 // 32 // n_expts_tot) * routed
 
     x1, w1, x2, w2 = sample["x1"], sample["w1"], sample["x2"], sample["w2"]
     b1, b2 = sample["b1"], sample["b2"]
@@ -470,6 +500,8 @@ def bench_mlp(
     # backend variants on gfx950 (see kernel_variant's docstring)
     kernel1 = kernel_variant(dim1, sample["swizzle_mx_scale1"], backend)
     kernel2 = kernel_variant(dim2 // TP // 2, sample["swizzle_mx_scale2"], backend)
+    if w_layout != "column_major":
+        kernel1, kernel2 = f"{kernel1}[{w_layout}]", f"{kernel2}[{w_layout}]"
     kernels = {
         "moe1": kernel1,
         "moe2": kernel2,
@@ -517,6 +549,7 @@ def roofline_mlp(
     layers=LAYERS,
     num_weight_inits=1,
     name="",
+    w_layout="column_major",
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
@@ -531,6 +564,8 @@ def roofline_mlp(
     if tuple(layers) != LAYERS:
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
+    if w_layout != "column_major":
+        stem += f"-{w_layout}"
     out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
@@ -545,6 +580,7 @@ def roofline_mlp(
         backend,  # fixed args
         layers,
         num_weight_inits,
+        w_layout=w_layout,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -613,6 +649,15 @@ def parse_args(args: list[str] | None = None):
         "alone. Default: all three.",
     )
     parser.add_argument(
+        "--w-layout",
+        choices=[*W_LAYOUTS, "both"],
+        default="column_major",
+        help="Expert weight layout: column_major (default), strip16 (gfx942 "
+        "Gluon only: weights re-laid once by gfx942_strip16_pack outside the "
+        "timed region, w_layout='GFX942_STRIP16'), or both (one CSV per layout, "
+        "same shapes; each layout draws its own random weights).",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
@@ -645,22 +690,25 @@ def main(args: list[str] | None = None) -> None:
         {**get_rot_bufs_kwargs(parsed_args), **get_do_bench_graph_kwargs(parsed_args)}
     )
 
-    roofline_mlp(
-        bencher,
-        batch_sizes_moe,
-        dim1,
-        dim2,
-        total_experts,
-        active_experts,
-        parsed_args.act_dtype,
-        "mx4",
-        TP=parsed_args.TP,
-        backend=parsed_args.backend,
-        # dedupe, keeping the canonical report order rather than argv order
-        layers=tuple(n for n in LAYERS if n in parsed_args.layers),
-        num_weight_inits=parsed_args.num_weight_inits,
-        name="moe_gemm_a16w4",
-    )
+    w_layouts = W_LAYOUTS if parsed_args.w_layout == "both" else (parsed_args.w_layout,)
+    for w_layout in w_layouts:
+        roofline_mlp(
+            bencher,
+            batch_sizes_moe,
+            dim1,
+            dim2,
+            total_experts,
+            active_experts,
+            parsed_args.act_dtype,
+            "mx4",
+            TP=parsed_args.TP,
+            backend=parsed_args.backend,
+            # dedupe, keeping the canonical report order rather than argv order
+            layers=tuple(n for n in LAYERS if n in parsed_args.layers),
+            num_weight_inits=parsed_args.num_weight_inits,
+            name="moe_gemm_a16w4",
+            w_layout=w_layout,
+        )
 
 
 if __name__ == "__main__":

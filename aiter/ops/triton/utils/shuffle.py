@@ -176,6 +176,64 @@ def awq_to_gemm_a16w4(
     return pack_gemm_a16w4_weight(q.t()), scales.t().contiguous(), w_zeros
 
 
+def _strip16_rec_bytes():
+    # imported on use: the record layout constants live next to the gfx942 Gluon kernel that reads them
+    from aiter.ops.triton._gluon_kernels.gfx942.moe import moe_op_gemm_a16w4 as k
+
+    assert (k.STRIP16_COLS, k.STRIP16_K) == (
+        16,
+        128,
+    )  # the reshapes below spell these out
+    return k.STRIP16_W_BYTES, k.STRIP16_REC_BYTES
+
+
+def gfx942_strip16_pack(
+    w: torch.Tensor, w_scales: torch.Tensor, experts_per_chunk: int = 16
+) -> torch.Tensor:
+    """Re-lay MXFP4 expert weights for moe_gemm_a16w4(..., w_layout="GFX942_STRIP16") on gfx942 (Gluon).
+    Done once at weight load.
+
+    w:        (E, K/2, N) uint8, 2 fp4 per byte along K (any strides, e.g. the stride(-2) == 1 view the
+              column-major path takes)
+    w_scales: (E, K/32, N) uint8 e8m0
+    Returns a contiguous (E, N/16, K/128, 1088) uint8 tensor. Record (e, strip, rec):
+      bytes [0, 1024)    weights  [j = 0..3][n16 = 0..15][16 B]: K group 4*rec + j (32 K) of column 16*strip + n16
+      bytes [1024, 1088) scales   [n16 = 0..15][j = 0..3]:       e8m0 of the same (group, column)
+    Byte and nibble order inside each 16-byte run are unchanged. Needs K % 128 == 0 and N % 16 == 0
+    (zero-pad first; the GEMM may still reduce over a shorter K, see moe_gemm_a16w4).
+    """
+    w_bytes, rec_bytes = _strip16_rec_bytes()
+    E, K2, N = w.shape
+    assert w.dtype == torch.uint8 and w_scales.dtype == torch.uint8
+    assert K2 % 64 == 0 and N % 16 == 0, (K2, N)
+    assert tuple(w_scales.shape) == (E, K2 // 16, N), (
+        tuple(w_scales.shape),
+        tuple(w.shape),
+    )
+    R, S = K2 // 64, N // 16
+    out = torch.empty((E, S, R, rec_bytes), dtype=torch.uint8, device=w.device)
+    for e0 in range(0, E, experts_per_chunk):  # bounded transient memory
+        wc = w[e0 : e0 + experts_per_chunk]
+        sc = w_scales[e0 : e0 + experts_per_chunk]
+        n = wc.shape[0]
+        # (e, rec, j, r, strip, n16) -> (e, strip, rec, j, n16, r)
+        ww = wc.reshape(n, R, 4, 16, S, 16).permute(0, 4, 1, 2, 5, 3)
+        out[e0 : e0 + n, :, :, :w_bytes] = ww.reshape(n, S, R, w_bytes)
+        # (e, rec, j, strip, n16) -> (e, strip, rec, n16, j)
+        ss = sc.reshape(n, R, 4, S, 16).permute(0, 3, 1, 4, 2)
+        out[e0 : e0 + n, :, :, w_bytes:] = ss.reshape(n, S, R, rec_bytes - w_bytes)
+    return out
+
+
+def gfx942_strip16_unpack(rec: torch.Tensor):
+    """Inverse of gfx942_strip16_pack: (E, N/16, K/128, 1088) -> (w (E, K/2, N), w_scales (E, K/32, N)), contiguous."""
+    w_bytes, _ = _strip16_rec_bytes()
+    E, S, R, _ = rec.shape
+    ww = rec[..., :w_bytes].reshape(E, S, R, 4, 16, 16).permute(0, 2, 3, 5, 1, 4)
+    ss = rec[..., w_bytes:].reshape(E, S, R, 16, 4).permute(0, 2, 4, 1, 3)
+    return ww.reshape(E, R * 64, S * 16), ss.reshape(E, R * 4, S * 16)
+
+
 # =============================================================================
 # SCALES
 # =============================================================================

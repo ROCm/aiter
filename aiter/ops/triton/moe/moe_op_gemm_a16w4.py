@@ -18,7 +18,6 @@ from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
     STRIP16_REC_BYTES,
     W_LAYOUT_STRIP16,
     gfx942_a16w4_layouts,
-    gfx942_strip16_pack,  # noqa: F401  (re-exported for the weight loader)
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
@@ -521,11 +520,14 @@ def moe_gemm_a16w4(
         swiglu_add_residual(bool): Whether to add swiglu residual
         backend(Optional[str]): "triton", "gluon" or None(auto-detect).
         w_layout(Optional[str]): None = column-major `w` as described above. "GFX942_STRIP16" (gfx942 gluon
-            only): `w` is the (E, N/16, K/128, 1088) record tensor from gfx942_strip16_pack (weights and
-            scales of one 16-column x 128-K block in 17 contiguous cache lines); `w_scales` must still be
-            the original (E, K/32, N) tensor (shapes and the fp16-operand range check come from it, the
-            kernel reads the scales from the records). Bit-identical output to the column-major layout.
-            There is no Triton fallback for this layout: unsupported shapes raise.
+            only): `w` is the (E, N/16, K_packed/128, 1088) record tensor from
+            aiter.ops.triton.utils.shuffle.gfx942_strip16_pack (weights and scales of one 16-column x 128-K
+            block in 17 contiguous cache lines); `w_scales` must still be the original (E, K_packed/32, N)
+            tensor (shapes and the fp16-operand range check come from it, the kernel reads the scales from
+            the records). The reduction length is x.shape[-1], or unpadded_K when given (at every block_m),
+            and may be shorter than the packed K: activations past it are not read. unpadded_N works as
+            for column-major weights. Bit-identical output to the column-major layout on the same tile
+            config. There is no Triton fallback for this layout: unsupported shapes raise.
 
     Returns:
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
@@ -579,15 +581,20 @@ def moe_gemm_a16w4(
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     block_m = routing_data.block_m
     if strip16:
-        # records are addressed by the physical (padded) K, so unpadded_K is ignored: the padding
-        # weights are zero and add nothing to the accumulator
-        K, N = x.shape[-1], w_scales.shape[-1]
+        # The records fix the packed (padded) K and N. The reduction length K is separate from it: x.shape[-1],
+        # or unpadded_K when given (at every block_m: activations past it are never read), and may be shorter
+        # than the packed K, e.g. when the previous GEMM was cut to unpadded_N. The kernel masks the activation
+        # loads to K; tiles and record strides follow the packed K.
         assert backend == "gluon" and get_arch() == "gfx942", "w_layout GFX942_STRIP16 needs the gfx942 gluon kernel"
         assert swizzle_mx_scale is None and expert_map is None
         assert w.is_contiguous() and w.ndim == 4 and w.shape[-1] == STRIP16_REC_BYTES, tuple(w.shape)
-        assert K % STRIP16_K == 0 and N % STRIP16_COLS == 0, (K, N)
-        assert w.shape[1] * STRIP16_COLS == N and w.shape[2] * STRIP16_K == K, (tuple(w.shape), N, K)
-        assert tuple(w_scales.shape[-2:]) == (K // 32, N), tuple(w_scales.shape)
+        K_packed, N = w.shape[2] * STRIP16_K, w.shape[1] * STRIP16_COLS
+        assert tuple(w_scales.shape) == (w.shape[0], K_packed // 32, N), (tuple(w_scales.shape), tuple(w.shape))
+        K = x.shape[-1]
+        if unpadded_K:
+            assert unpadded_K <= K, (unpadded_K, K)
+            K = unpadded_K
+        assert K <= K_packed, f"w_layout GFX942_STRIP16: reduction length {K} > packed K {K_packed}"
         if unpadded_N and block_m == 16:
             assert unpadded_N % STRIP16_COLS == 0, unpadded_N
             N = unpadded_N
@@ -609,18 +616,24 @@ def moe_gemm_a16w4(
             # K a multiple of the tile, vector-load-aligned strides; everything else
             # goes to the Triton kernel.
             config = None
-            if (
+            if strip16:
+                # whole K tiles must stay inside the records: BLOCK_K * SPLIT_K divides the packed K. Take the
+                # config of the reduction length (that of column-major weights) when it fits, else the packed K's.
+                for k_cfg in dict.fromkeys((K, K_packed)):
+                    config = get_kernel_config_gluon_gfx942(M, N, k_cfg, routing_data)
+                    if config is not None and K_packed % (config["block_k"] * config["split_k"]) == 0:
+                        break
+                    config = None
+                assert config is not None, "w_layout GFX942_STRIP16: no gluon config for this shape"
+            elif (
                 swizzle_mx_scale is None
                 and K % 128 == 0
-                and (
-                    strip16
-                    or (w.stride(-2) == 1 and _gfx942_gluon_weight_layout_ok(w, w_scales))
-                )
+                and w.stride(-2) == 1
+                and _gfx942_gluon_weight_layout_ok(w, w_scales)
             ):
                 config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
                 if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
                     config = None
-            assert config is not None or not strip16, "w_layout GFX942_STRIP16: no gluon config for this shape"
             if config is None:
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
@@ -767,6 +780,8 @@ def moe_gemm_a16w4(
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             FP16_OPERAND=fp16_operand,
             W_STRIP16=strip16,
+            # only a STRIP16 reduction shorter than the packed K can leave a partial tile (column-major checks above)
+            EVEN_K=K % (config["block_k"] * config["split_k"]) == 0,
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             waves_per_eu=config["waves_per_eu"],

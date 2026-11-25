@@ -379,6 +379,8 @@ def test_gfx942_gluon_strip16_matches_column_major(m, n, k, fp16_mode, monkeypat
     import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
     from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
         W_LAYOUT_STRIP16,
+    )
+    from aiter.ops.triton.utils.shuffle import (
         gfx942_strip16_pack,
         gfx942_strip16_unpack,
     )
@@ -405,6 +407,71 @@ def test_gfx942_gluon_strip16_matches_column_major(m, n, k, fp16_mode, monkeypat
         backend="gluon", w_layout=W_LAYOUT_STRIP16,
     )
     assert torch.equal(y_rec, y_col)
+
+
+@pytest.mark.parametrize("m", [24, 256, 4096])
+@pytest.mark.parametrize("case", ["gateup_unpadded_n", "x_short_576", "x_padding_inf_unpadded_k"])
+@pytest.mark.parametrize("fp16_mode", ["0", "auto"])
+def test_gfx942_gluon_strip16_padded_k(m, case, fp16_mode, monkeypatch):
+    """STRIP16 records packed at a padded K, reduced over a shorter K (the packed K and the reduction length are
+    separate):
+      gateup_unpadded_n         gate-up (N 768, unpadded_N 512, swiglu) feeds a down projection packed at K 384;
+                                at block_m 16 its output is 256 wide, else 384 (unpadded_N applies at block_m 16)
+      x_short_576               x is 576 wide, the records 640 (a partial last K tile, masked activation loads)
+      x_padding_inf_unpadded_k  x has the padded width 384 with Inf / NaN past unpadded_K = 256
+    The STRIP16 output must equal the column-major GEMM on zero-padded activations bit for bit (same tile config;
+    the padding weights are random, they only ever meet zero activations) and must not read the padding."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+    from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+        W_LAYOUT_STRIP16,
+    )
+    from aiter.ops.triton.utils.shuffle import gfx942_strip16_pack
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", fp16_mode)
+    device = "cuda"
+    torch.manual_seed(0)
+    n_expts_tot, n_expts_act, hidden = 64, 6, 1024
+    m, rdata, gindx, _ = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+
+    def weights(n, k):  # column-major (E, K/2, N) fp4 + (E, K/32, N) e8m0, random over the whole (padded) K
+        w = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device).transpose(1, 2)
+        s = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device).transpose(1, 2)
+        return w, s
+
+    def gemm(x, w, s, strip16, gather=None, **kw):
+        return moe_gemm_a16w4(
+            x, gfx942_strip16_pack(w, s) if strip16 else w, None, s, None, None, None, rdata, gather, None, None,
+            None, torch.bfloat16, backend="gluon", **({"w_layout": W_LAYOUT_STRIP16} if strip16 else {}), **kw,
+        )
+
+    unpadded_k = None
+    if case == "gateup_unpadded_n":
+        k_pad = 384
+        w_gu, s_gu = weights(768, hidden)
+        x0 = (torch.randn((m, hidden), device=device) * 0.5).to(torch.bfloat16)
+        x = gemm(x0, w_gu, s_gu, True, gindx, apply_swiglu=True, unpadded_N=512)
+        x_col = gemm(x0, w_gu, s_gu, False, gindx, apply_swiglu=True, unpadded_N=512)
+        assert torch.equal(x, x_col)
+        assert x.shape[-1] == (256 if rdata.block_m == 16 else 384), (rdata.block_m, tuple(x.shape))
+    elif case == "x_short_576":
+        k_pad = 640
+        x = (torch.randn((m * n_expts_act, 576), device=device) * 0.5).to(torch.bfloat16)
+    else:
+        k_pad, unpadded_k = 384, 256
+        x = (torch.randn((m * n_expts_act, k_pad), device=device) * 0.5).to(torch.bfloat16)
+        x[:, unpadded_k:] = float("inf")
+        x[::3, unpadded_k + 1] = float("nan")
+    k = unpadded_k or x.shape[-1]
+
+    w_dn, s_dn = weights(hidden, k_pad)
+    x_ref = torch.zeros((x.shape[0], k_pad), dtype=x.dtype, device=device)
+    x_ref[:, :k] = x[:, :k]
+    y_ref = gemm(x_ref, w_dn, s_dn, False)
+    y_rec = gemm(x, w_dn, s_dn, True, unpadded_K=unpadded_k)
+    assert torch.isfinite(y_rec).all()
+    assert torch.equal(y_rec, y_ref)
 
 
 def _ep_setup(
