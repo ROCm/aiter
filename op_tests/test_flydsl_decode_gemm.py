@@ -418,6 +418,11 @@ def check_tuned_row_other_layouts() -> None:
     with and without ``out=``.
     """
     rows = [key for key in _shipped_decode_rows() if key[2] > 1 and not key[5]]
+    if not rows:
+        aiter.logger.warning(
+            "no decode rows with M > 1 for %s/cu_num=%s; skipping", ARCH, get_cu_num()
+        )
+        return
     m, n, k = rows[0][2], rows[0][3], rows[0][4]
     a, b = _inputs(m, n, k)
     ref = run_torch(a, b)
@@ -464,6 +469,11 @@ def check_decode_aot_run_only() -> None:
     import tempfile
 
     rows = [key for key in _shipped_decode_rows() if key[2] > 1 and not key[5]]
+    if not rows:
+        aiter.logger.warning(
+            "no decode rows with M > 1 for %s/cu_num=%s; skipping", ARCH, get_cu_num()
+        )
+        return
     key = rows[0]
     row = get_GEMM_A16W16_config_()[key]
     columns = ("gfx", "cu_num", "M", "N", "K", "bias", "dtype", "outdtype")
