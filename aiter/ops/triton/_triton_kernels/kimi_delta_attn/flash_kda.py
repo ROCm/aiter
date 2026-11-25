@@ -409,6 +409,36 @@ def _seg_occupancy_class(num_segs: int) -> int:
     return max(1, num_segs).bit_length()
 
 
+@triton.jit
+def _store_state(
+    dst,
+    row_off,
+    b_h1,
+    b_h2,
+    o_k1,
+    o_k2,
+    o_w,
+    m_w,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    V_FIRST: tl.constexpr,
+):
+    """Store one state tile, cast to the dtype of ``dst``.
+
+    ``row_off`` is the element offset of the state in ``dst``. The state is
+    ``[V, K]`` when ``V_FIRST``, else ``[K, V]``.
+    """
+    e_ty = dst.dtype.element_ty
+    if V_FIRST:
+        off = row_off + o_w[None, :] * K
+        tl.store(dst + off + o_k1[:, None], b_h1.to(e_ty), mask=m_w[None, :])
+        tl.store(dst + off + o_k2[:, None], b_h2.to(e_ty), mask=m_w[None, :])
+    else:
+        off = row_off + o_w[None, :]
+        tl.store(dst + off + o_k1[:, None] * V, b_h1.to(e_ty), mask=m_w[None, :])
+        tl.store(dst + off + o_k2[:, None] * V, b_h2.to(e_ty), mask=m_w[None, :])
+
+
 @triton.autotune(
     configs=autotune_configs(
         "CHUNK_DELTA_ATTN", _K2_CONFIGS, default_config=_K2_DEFAULT_CONFIG
@@ -567,31 +597,19 @@ def _flash_kda_segment_kernel(
         if HAS_SNAP:
             snap_i = tl.load(chunk_snap_row + chunk_base + j).to(tl.int64)
             if snap_i >= 0:
-                e_sn = snap_out.dtype.element_ty
-                if STATE_V_FIRST:
-                    n_off = (snap_i * H + i_h) * V * K + o_w[None, :] * K
-                    tl.store(
-                        snap_out + n_off + o_k1[:, None],
-                        b_h1.to(e_sn),
-                        mask=m_w[None, :],
-                    )
-                    tl.store(
-                        snap_out + n_off + o_k2[:, None],
-                        b_h2.to(e_sn),
-                        mask=m_w[None, :],
-                    )
-                else:
-                    n_off = (snap_i * H + i_h) * K * V + o_w[None, :]
-                    tl.store(
-                        snap_out + n_off + o_k1[:, None] * V,
-                        b_h1.to(e_sn),
-                        mask=m_w[None, :],
-                    )
-                    tl.store(
-                        snap_out + n_off + o_k2[:, None] * V,
-                        b_h2.to(e_sn),
-                        mask=m_w[None, :],
-                    )
+                _store_state(
+                    snap_out,
+                    (snap_i * H + i_h) * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    STATE_V_FIRST,
+                )
 
         ws_idx = i_h * TOTAL_TILES + chunk_base + j
         ck = ws_idx * C * K
@@ -661,43 +679,35 @@ def _flash_kda_segment_kernel(
     if STORE_FINAL:  # noqa: SIM102
         if tl.load(seg_is_last + i_seg) == 1:
             i_n = tl.load(seg_seq + i_seg).to(tl.int64)
-            dt_s = tl.float32 if PAGED_CACHE else final_state.dtype.element_ty
             if PAGED_CACHE:
+                # A cache slot is fp32 `[H, V, K]`, at its own stride.
                 slot = tl.load(state_indices + i_n).to(tl.int64)
-                f_off = slot * cache_stride + i_h * V * K + o_w[None, :] * K
-                tl.store(
-                    state_cache + f_off + o_k1[:, None],
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    state_cache + f_off + o_k2[:, None],
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
-                )
-            elif STATE_V_FIRST:
-                f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
-                tl.store(
-                    final_state + f_off + o_k1[:, None],
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    final_state + f_off + o_k2[:, None],
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
+                _store_state(
+                    state_cache,
+                    slot * cache_stride + i_h * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    True,
                 )
             else:
-                f_off = (i_n * H + i_h) * K * V + o_w[None, :]
-                tl.store(
-                    final_state + f_off + o_k1[:, None] * V,
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    final_state + f_off + o_k2[:, None] * V,
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
+                _store_state(
+                    final_state,
+                    (i_n * H + i_h) * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    STATE_V_FIRST,
                 )
 
 
