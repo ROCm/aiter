@@ -1154,7 +1154,8 @@ _NONCAUSAL_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
-    # Full and partial page-128 tiles at G16; this small plan splits the rows.
+    # Full and partial page-128 tiles at G16. FP8 per-token splits the rows
+    # across CTAs; gfx950 BF16 runs the fused BF16 multi-query tile.
     (
         "noncausal-q4-g16-tile-edge",
         {
@@ -1827,6 +1828,27 @@ _PIPE_CASES = [
             "pattern": "one_hot_token",
         },
     ),
+    # NHD caches. Window 3 is narrower than the block, so each older row's
+    # window ends W - 1 keys past it, before the newest key.
+    *[
+        (
+            name,
+            {
+                **_NHD_BASE,
+                "causal": False,
+                "query_length": 4,
+                "window": window,
+                "lengths": (0, 1, 3, 5, 65, 66, 257, 2049),
+                "max_partitions": 8,
+                "pattern": "one_hot_token",
+                "nhd_bufs": 2,
+            },
+        )
+        for name, window in (
+            ("nhd-d256-page64-q4-noncausal", 0),
+            ("nhd-d256-page64-q4-noncausal-window3", 3),
+        )
+    ],
     # A head-major pool of 2**15 + 1 blocks puts KV head 2 past 2**31 bytes, so
     # the host must select wide addressing and widen the head term. 288 CTAs
     # exceed the CU count, which selects one V buffer. The long sequence gives
