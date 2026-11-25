@@ -1043,8 +1043,9 @@ def main():
     parser.add_argument(
         "--num-tokens",
         type=str2tuple,
-        default=[16384, 4096, 1024, 256, 64, 1],
-        help="Comma-separated list of number of tokens (default: 16384,4096,1024,256,64,1)",
+        default=[16384, 4096, 2048, 1024, 256, 64, 1],
+        help="Comma-separated list of number of tokens "
+        "(default: 16384,4096,2048,1024,256,64,1)",
     )
     parser.add_argument(
         "--topk",
@@ -1332,14 +1333,13 @@ def main():
             failed_sections.append("pad-rows")
 
     # -- unaligned logits / bias: scalar loads route as the vector loads -----
-    unaligned_tokens = [t for t in num_tokens_list if t <= 1024]
-    if "unaligned" in sections and not unaligned_tokens:
-        print(f"SKIP: unaligned needs num_tokens <= 1024, none of {num_tokens_list}")
-    elif "unaligned" in sections:
+    # Every T: the gfx1250 single-wave kernels (vector loads at E=384) take any
+    # token count, so the section runs the whole --num-tokens list.
+    if "unaligned" in sections:
         unaligned_configs = list(
             itertools.product(
                 num_experts_list,
-                unaligned_tokens,
+                num_tokens_list,
                 topk_list,
                 ["sqrtsoftplus", "sigmoid", "softmax"],
                 dtype_list,

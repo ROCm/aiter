@@ -8,9 +8,9 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import fast_sigmoid
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 _SH_1D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
