@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""With AITER_FLYDSL_STAGE2_FP8=1, a row of the stage2 FP8 table
+(tuned_stage2_fp8_fmoe) replaces the main row of its shape.
+
+Qwen3.8 MXFP4 TP8, E 513: the main rows at 8192 to 32768 tokens are one-stage
+post-reduce kernels; the stage2 FP8 rows are FlyDSL `reduce` rows.
+"""
+
+import pytest
+
+import aiter.fused_moe as fused_moe_module
+from aiter import ActivationType, QuantType, dtypes
+from aiter.fused_moe import AsmMoeMode, get_2stage_cfgs
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+pytestmark = pytest.mark.skipif(
+    get_gfx() != "gfx950" or get_cu_num() != 256,
+    reason="the Qwen3.8 MXFP4 rows are tuned for gfx950 with 256 CUs",
+)
+
+
+def _key(token):
+    return (
+        fused_moe_module.get_gfx_runtime(),
+        fused_moe_module.get_cu_num(),
+        token,
+        8192,
+        256,
+        513,
+        11,
+        str(ActivationType.Silu),
+        str(dtypes.bf16),
+        str(dtypes.fp4x2),
+        str(dtypes.fp4x2),
+        str(QuantType.per_1x32),
+        True,
+        False,
+    )
+
+
+def _dispatch(monkeypatch, token, fp8):
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1" if fp8 else "0")
+    get_2stage_cfgs.cache_clear()
+    try:
+        return get_2stage_cfgs(
+            fused_moe_module.get_padded_M(token),
+            8192,
+            256,
+            513,
+            11,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Silu,
+            False,
+            0,
+            0,
+            is_shuffled=True,
+            opus_weights_shuffled=True,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+
+@pytest.mark.parametrize(("token", "block_m"), [(8192, 64), (16384, 128), (32768, 64)])
+def test_stage2_fp8_row_replaces_post_reduce_row(monkeypatch, token, block_m):
+    off = _dispatch(monkeypatch, token, fp8=False)
+    assert off.run_1stage and off.flat == AsmMoeMode.POST_REDUCE
+
+    on = _dispatch(monkeypatch, token, fp8=True)
+    assert not on.run_1stage and on.flat == AsmMoeMode.SORTED
+    assert on.block_m == block_m
+
+
+def test_shape_without_stage2_fp8_row_keeps_main_row(monkeypatch):
+    off = _dispatch(monkeypatch, 4096, fp8=False)
+    on = _dispatch(monkeypatch, 4096, fp8=True)
+    assert (on.run_1stage, on.block_m) == (off.run_1stage, off.block_m)
+
+
+def test_tier_fallback_uses_stage2_fp8_row_of_same_tier(monkeypatch):
+    # Both tables fall back from 131072 to their 32768 rows.
+    assert not _dispatch(monkeypatch, 131072, fp8=True).run_1stage
+
+
+def test_stage2_fp8_row_of_smaller_tier_keeps_main_row(monkeypatch):
+    _dispatch(monkeypatch, 16384, fp8=False)
+    primary, fallback = fused_moe_module.cfg_2stages
+    row_32768 = primary[_key(32768)]
+    monkeypatch.setattr(
+        fused_moe_module,
+        "cfg_2stages",
+        ({**primary, _key(131072): row_32768}, fallback),
+    )
+    # The main table has a 131072 row; the stage2 FP8 row is for 32768.
+    assert _dispatch(monkeypatch, 131072, fp8=True).run_1stage
