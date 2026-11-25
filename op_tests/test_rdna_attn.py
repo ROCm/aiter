@@ -1169,6 +1169,20 @@ def check_refusals():
             ),
         )
 
+    # A block table without pages: the kernel would index before its start.
+    _refused(
+        "block table must be int32 rows of at least one page",
+        lambda: module.decode_attn(
+            q,
+            kv,
+            block_table.view(1, -1)[:, :0],
+            torch.empty_like(q),
+            *hip.make_scratch(v, dev),
+            seq_lens,
+            scale,
+        ),
+    )
+
     # The kernels read lengths and scratch as packed buffers: a strided view
     # would be read as its neighbours.
     acc, m_, l_, cnt = hip.make_scratch(v, dev)

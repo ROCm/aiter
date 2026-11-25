@@ -315,8 +315,10 @@ void rdna_decode_attn(aiter_tensor_t& q,
              "q and out must be contiguous");
   AITER_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
-                 block_table.stride(-1) == 1,
-             "block table must be int32 rows, contiguous within a row");
+                 block_table.stride(-1) == 1 && block_table.size(-1) > 0,
+             "block table must be int32 rows of at least one page, contiguous "
+             "within a row, got ", AiterDtype_to_str(block_table.dtype()), " ",
+             sizes(block_table));
   check_lengths(seq_lens, "seq_lens");
   // nseq sequences; sequence s reads row s of the block table and scratch.
   AITER_CHECK(q.dim() == 3 && q.size(0) % maxm == 0 && q.size(0) > 0, "q has ",
@@ -454,8 +456,10 @@ void rdna_prefill_attn(aiter_tensor_t& q,
              "q and out must be contiguous (tokens, heads, head dim)");
   AITER_CHECK(block_table.dtype() == AITER_DTYPE_i32 &&
                  (block_table.dim() == 1 || block_table.dim() == 2) &&
-                 block_table.stride(-1) == 1,
-             "block table must be an int32 row, contiguous");
+                 block_table.stride(-1) == 1 && block_table.size(-1) > 0,
+             "block table must be int32 rows of at least one page, contiguous "
+             "within a row, got ", AiterDtype_to_str(block_table.dtype()), " ",
+             sizes(block_table));
   check_lengths(seq_lens, "seq_lens");
   AITER_CHECK(plan.has_value() == query_start_loc.has_value(),
              "a batch takes both a plan and query_start_loc");

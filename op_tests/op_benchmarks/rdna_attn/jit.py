@@ -23,6 +23,7 @@ from pathlib import Path
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.cpp_extension import ROCM_HOME
 from aiter.ops import rdna_attn as R
 
@@ -38,9 +39,8 @@ _PREFILL_SOURCES = (_CSRC / "rdna_prefill_attn.cuh", *_COMMON)
 
 @functools.cache
 def _arch() -> str:
-    """The target: RDNA_JIT_ARCH, else the current device's."""
-    arch = os.environ.get("RDNA_JIT_ARCH")
-    return arch or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    """The target: RDNA_JIT_ARCH, else the GPU's."""
+    return os.environ.get("RDNA_JIT_ARCH") or get_gfx_runtime()
 
 
 _WRAPPER = """#include "rdna_decode_attn.cuh"

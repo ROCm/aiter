@@ -23,10 +23,10 @@ def _arch() -> str:
     if arch:
         return arch
     try:
-        import torch
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception:  # noqa: BLE001 - no GPU here
+        return get_gfx_runtime()
+    except Exception:  # noqa: BLE001 - no GPU here, or aiter is not built
         return "gfx1151"
 
 

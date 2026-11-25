@@ -161,6 +161,16 @@ def _segments(spec: str) -> list[int]:
     return [int(x) for x in spec.split(",")]
 
 
+def graph_timed(requests) -> bool:
+    """Whether a batch is timed under a CUDA graph: decodes of one query
+    length, which run on the decode kernel. Anything else runs on the prefill
+    kernel, which does not launch under capture."""
+    from aiter.ops import rdna_attn as R
+
+    lens = {r.q_len for r in requests}
+    return len(lens) == 1 and lens.pop() <= R.MAX_M
+
+
 def encoder_layers(inputs, segs, scale) -> None:
     """Encoder attention of each layer's (Q, K, V) over the segments."""
     from aiter.ops import rdna_attn as R
@@ -338,7 +348,11 @@ def main() -> None:
         print(f"<!-- no shapes match {describe(args) or 'the filters'} -->")
         return
 
-    names = utils.PREFILL_KNOBS if args.prefill else utils.KNOBS
+    # A batch may run both kernels; jit.py gives each build the knobs it has.
+    if args.batch:
+        names = tuple(dict.fromkeys(utils.KNOBS + utils.PREFILL_KNOBS))
+    else:
+        names = utils.PREFILL_KNOBS if args.prefill else utils.KNOBS
     forced = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
     kernels = R
     if forced or args.ablate or args.jit:
@@ -375,7 +389,7 @@ def main() -> None:
                 dtype=dtype,
                 block_size=args.block_size,
                 window=window,
-                use_cuda_graphs=all(r.q_len <= 8 for r in parsed[spec]),
+                use_cuda_graphs=graph_timed(parsed[spec]),
                 max_model_len=max_len,
                 spec_tokens=args.spec_tokens,
                 kernels=kernels,
