@@ -105,6 +105,12 @@ def fp8_mqa_topk(
 
     Workspace (allocated per call): about M * (N / 8 + 32 KiB * SplitN) + 512 * N bytes.
     """
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(
+            f"fp8_mqa_topk (HIP) supports {SUPPORTED_GFX} only, got {gfx}; "
+            "check is_supported() and route other archs to the unfused path"
+        )
     M = q_fp8.shape[0] if q_fp8.dim() else 0
     N = k_fp8.shape[0] if k_fp8.dim() else 0
     workspace = torch.empty(

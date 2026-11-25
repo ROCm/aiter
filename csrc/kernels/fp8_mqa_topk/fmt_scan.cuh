@@ -38,6 +38,7 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
                  const float* __restrict__ tau_ptr, unsigned long long* __restrict__ cand_ptr, int* __restrict__ cnt_ptr,
                  int CAP)
 {
+#if defined(__gfx950__)
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
     constexpr int TILE_N     = 32;
@@ -464,6 +465,11 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
             for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) cnt_ptr[(int64_t)pid_split * M + m0 + r] = cnt_row[r];
         }
     }
+#else
+    // gfx950-only (mfma_scale f8f6f4, v_permlane32_swap): compiled out for the other archs of a
+    // multi-arch build; the host wrapper never launches it there.
+    __builtin_trap();
+#endif
 }
 
 }  // namespace mqa_topk

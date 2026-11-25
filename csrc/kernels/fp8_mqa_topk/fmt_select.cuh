@@ -438,6 +438,7 @@ __device__ __forceinline__ QW load_qw(int m, const fp8* __restrict__ Q, const fl
     return r;
 }
 __device__ __forceinline__ float recompute_wes(const QW& qw, int tok, const fp8* __restrict__ Kc, const float* __restrict__ kv_scale) {
+#if defined(__gfx950__)
     const int l = threadIdx.x % WARP, dhalf = l / 32;
     const int64_t kb = (int64_t)tok * HEAD_SIZE;
     const f8x32 b0 = pack(*reinterpret_cast<const f8x16*>(&Kc[kb + dhalf * 16]), *reinterpret_cast<const f8x16*>(&Kc[kb + (2 + dhalf) * 16]));
@@ -456,6 +457,9 @@ __device__ __forceinline__ float recompute_wes(const QW& qw, int tok, const fp8*
     float p0 = ae + ao, p1 = p0;
     swap32_reduce2<2>(p0, p1);      // lanes 0-31: (own hset-0 half, hset-1 half of lane + 32)
     return (p0 + p1) * scale;
+#else
+    __builtin_trap(); // gfx950-only instructions; only the guarded kernels call this
+#endif
 }
 
 // exact select of one row from a dense fp32 scratch row srow[ks, ke) (one wave)
@@ -480,6 +484,7 @@ constexpr int FBR = 64;
 __global__ __launch_bounds__(256) void fb_compute(const int* __restrict__ flag, const int* __restrict__ fbc, const int* __restrict__ ks_p, const int* __restrict__ ke_p,
                                                   int M, int N, float* __restrict__ scratch, const fp8* __restrict__ Q, const fp8* __restrict__ Kc,
                                                   const float* __restrict__ kv_scale, const float* __restrict__ W) {
+#if defined(__gfx950__)
     const int lane = threadIdx.x % WARP, gw = blockIdx.x * 4 + threadIdx.x / WARP, G = gridDim.x * 4;
     const int nf = min(*fbc, FBR);
     for (int ord = 0; ord < nf; ++ord) {
@@ -494,6 +499,9 @@ __global__ __launch_bounds__(256) void fb_compute(const int* __restrict__ flag, 
             if (lane < 32 && c0 + lane < ke) scratch[(int64_t)ord * N + c0 + lane] = v;
         }
     }
+#else
+    __builtin_trap(); // gfx950-only (recompute_wes); never launched on other archs
+#endif
 }
 __global__ __launch_bounds__(256) void fb_select(const int* __restrict__ flag, const int* __restrict__ fbc, const int* __restrict__ ks_p, const int* __restrict__ ke_p,
                                                  int M, int N, int K, int* __restrict__ out, const float* __restrict__ scratch, int* __restrict__ nfb) {
@@ -510,6 +518,7 @@ __global__ __launch_bounds__(256) void fallback_kernel(const int* __restrict__ f
                                                        const int* __restrict__ ke_p, int M, int N, int K, int* __restrict__ out, float* __restrict__ scratch,
                                                        const fp8* __restrict__ Q, const fp8* __restrict__ Kc, const float* __restrict__ kv_scale,
                                                        const float* __restrict__ W, int* __restrict__ nfb) {
+#if defined(__gfx950__)
     __shared__ uint32_t hist_all[4][256];
     const int lane = threadIdx.x % WARP, w = threadIdx.x / WARP, gw = blockIdx.x * 4 + w;
     uint32_t* hist = hist_all[w];
@@ -528,6 +537,9 @@ __global__ __launch_bounds__(256) void fallback_kernel(const int* __restrict__ f
         __threadfence_block();
         wave_select_dense<true>(srow, ks, ke, K, out + (int64_t)m * K, hist, lane);
     }
+#else
+    __builtin_trap(); // gfx950-only (recompute_wes); never launched on other archs
+#endif
 }
 
 }  // namespace mqa_topk
