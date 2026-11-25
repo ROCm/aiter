@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
     setenv("OPUS_GEN_CO_DIR", root.c_str(), 1);
     auto* first = &opus_gfx1250_co::co_kernel(symbol, device);
     assert(&opus_gfx1250_co::co_kernel(symbol, device) == first);
-    const std::string alternate = root + (info.asic_revision == 0 ? "/gfx1250-a0" : "/named_reg");
+    const std::string alternate = root + (info.asic_revision == 0 ? "/gfx1250-strict" : "/named_reg");
     setenv("OPUS_GEN_CO_DIR", alternate.c_str(), 1);
     auto* second = &opus_gfx1250_co::co_kernel(symbol, device);
     if(info.asic_revision == 0)

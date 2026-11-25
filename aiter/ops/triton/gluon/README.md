@@ -173,6 +173,8 @@ The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time reg
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
 - **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
+**Split rebalance (bh16 decode, opt-in):** the bh16 regimes give each sequence the same number of KV splits, so with mixed KV lengths a call waits on its longest sequence. `mla_gluon_split_metadata(seq_info, nhead, kv_dtype, qlen=1, use_2d_view=True, out=None)` cuts the batch's KV into BLOCK_N-aligned segments of one length that fit in one wave of work items, so a long sequence gets more splits than a short one. Build it once for each decode step and give the result to each call as `mla_gluon(..., kv_split_info=...)`. It returns `None` when the rebalance does not apply (bh64, or not more work items than sequences). `mla_gluon_split_metadata_info(max_batch_size, nhead, kv_dtype, qlen=1)` gives the shapes and dtypes of the `out=` buffers, for example for CUDA graphs. A call with `kv_split_info` does not go through the `mla_paged_decode` plugin route.
+
 All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
@@ -257,7 +259,7 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 
 **Function:** `pa_decode_gluon(output, query, key_cache, value_cache, context_lengths, block_tables, softmax_scale, query_length, max_context_partition_num, context_partition_size, compute_type, query_scale, key_scale, value_scale, ...)`
 
-**Description:** Paged attention decode with partitioned KV (first pass + reduction). Supports MTP (multi-token prefill, query_length &le; 4), sliding window, ALiBi, causal masking. Three inner kernel variants for different KV block sizes.
+**Description:** Paged attention decode with partitioned KV (first pass + reduction). Supports MTP (multi-token prefill; see the query limits below), sliding window, ALiBi, causal masking. Three inner kernel variants for different KV block sizes.
 
 | Parameter | Details |
 |-----------|---------|
@@ -267,7 +269,8 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | Output | bf16 (fp8 mode), or matches compute_type |
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
-| Constraint | `query_length * query_group_size` &le; 64 |
+| Single-KV-head PS path | One KV head, with `ps=True` or one context partition. `sliding_window` &gt; 0 with 1024-token blocks does not use this path. |
+| Constraint | `query_length` &le; 4 and `query_length * query_group_size` &le; 64. On the single-KV-head PS path, `query_length` can be more than 4: `query_group_size` &le; 64, and `query_length` &lt; `sliding_window` when `sliding_window` &gt; 0. |
 ### `paged_attention_output_gate.py` — Paged Attention Decode + Output Gate + Group-FP8
 
 **Function:** `paged_attention_output_gate_group_fp8_quant(query, key_cache, value_cache, kv_indptr, kv_indices, gate, *, scale, max_context=None, k_scale=None, v_scale=None, quant_dtype=None)`

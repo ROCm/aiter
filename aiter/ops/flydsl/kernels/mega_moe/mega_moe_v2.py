@@ -2,28 +2,48 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import os
 from dataclasses import replace
 
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
 
+from aiter import logger
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.utility import dtypes
+
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
+    GroupMajorPayloadArena,
+    _zeroed_sym,
+    group_major_capacity,
 )
-from . import envs
+from ..tensor_shim import torch_stream
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
+    ROUTE_LARGE_M,
+    ROUTE_SMALL_M,
+    ROUTE_STAGED,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
+    fused_layout_supported,
+    large_m_mtprs_for,
+    small_m_cu_supported,
 )
+from .mega_moe_stage1 import stage1_output_nbytes
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
+from .weights import (
+    check_bindable,
+    check_forward_inputs,
+    contiguous_weights,
+    weight_spec,
+)
 
 __all__ = ["MegaMoEV2"]
 
@@ -39,7 +59,9 @@ class MegaMoEV2:
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", stage2_p2p_quant: str = "auto",
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
-        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+        large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
+        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
@@ -64,6 +86,9 @@ class MegaMoEV2:
             else torch.float8_e4m3fn
         )
         self._a_view_dim = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
+        self.large_m_state_slots = int(large_m_state_slots)
+        if self.large_m_state_slots <= 0:
+            raise ValueError("large_m_state_slots must be positive")
         self.swiglu_limit = float(swiglu_limit)
         self.act = act
         self.situ_beta = float(situ_beta)
@@ -72,6 +97,33 @@ class MegaMoEV2:
             raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
         if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
             raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
+        self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
+        if self._initial_fanout_masks and len(self._initial_fanout_masks) != self.world_size:
+            raise ValueError("fanout_masks must contain one mask per destination")
+        if self.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be non-negative")
+        self.dev = torch.device("cuda", rank)
+        # routed=True: the caller passes forward(max_tokens=...), so the fused routes this layout supports are
+        # built and the plan picks one route per call (see MegaMoEBundlePlan.route_for). Without it the instance
+        # holds the staged route only, the memory of a caller that never routes. small_m_mtprs and
+        # large_m_enabled pin a route in or out either way.
+        if small_m_mtprs is None:
+            small_m_mtprs = DEFAULT_SMALL_M_MTPRS if routed else ()
+        if large_m_enabled is None:
+            large_m_enabled = routed
+        fused = fused_layout_supported(
+            arch=get_gfx_runtime(),
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            experts=self.experts,
+            topk=self.topk,
+            quant=quant,
+            swiglu_limit=self.swiglu_limit,
+            act=self.act,
+            fanout_masks=self._initial_fanout_masks,
+        )
+        num_cu = torch.cuda.get_device_properties(self.dev).multi_processor_count
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
             a_dtype=self._a_dtype,
@@ -80,14 +132,21 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
             world_size=self.world_size,
+            small_m_mtprs=(
+                tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
+            ),
+            large_m=(
+                fused
+                and large_m_enabled
+                and self.mtpr
+                in large_m_mtprs_for(
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                )
+            ),
         )
         self._active_bundle_entry = None
-        self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
-        if self._initial_fanout_masks and len(self._initial_fanout_masks) != self.world_size:
-            raise ValueError("fanout_masks must contain one mask per destination")
-        if self.swiglu_limit < 0:
-            raise ValueError("swiglu_limit must be non-negative")
-        self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
         compact = not self._bundle_plan.fixed_slot_dispatch
         # Compact Stage1 always uses the deterministic runtime fanout protocol.
@@ -106,20 +165,330 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
-        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
+        self._build_route_arenas()
+        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
+            self.comb_cfg,
+            gm_payload_arena=self._payload_arena,
+            combine_input=self._combine_input,
+        )
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        # Contiguous copies of strided weights live as long as the instance: a graph captured with
+        # them keeps their pointers even after another bind_weights() call.
+        self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
+        w1, w1_scale, w2, w2_scale = self._construction_weights
+        self._weight_spec = weight_spec(self._construction_weights)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        if envs.AITER_MEGA_MOE_PRELOAD:
-            self.preload_aot_bundles()
+        self._large_m = None
+        if self._bundle_plan.large_m:
+            from .mega_moe_large_m import LargeMRuntime
+
+            self._large_m = LargeMRuntime(
+                rank=self.rank,
+                world_size=self.world_size,
+                model_dim=self.model_dim,
+                inter_dim=self.inter_dim,
+                experts=self.experts,
+                topk=self.topk,
+                quant=quant,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=self.w2,
+                w2_scale=self.w2_scale,
+                max_tok_per_rank=self.mtpr,
+                mega_scheme=mega_scheme,
+                swiglu_limit=self.swiglu_limit,
+                state_slots=self.large_m_state_slots,
+                payload_arena=self._payload_arena if self._large_m_shares_payload else None,
+                s1_output_arena=self._s1_output_arena,
+                combine_input=self._combine_input,
+                # The large-input route quantizes its bf16 input into the staged quant buffers.
+                quant_buffers=(self._s1_quant_x, self._s1_quant_scale),
+            )
+        # set_large_m_enabled(): None until called (calls without max_tokens stay
+        # staged), True sends such calls to the large-input route, False never uses it.
+        self._large_m_choice = None
+        self._small_m_runtimes = []
+        if self._bundle_plan.small_m_mtprs:
+            from .mega_moe_small_m import SmallMRuntime
+
+            # Own protocol state and combine output; GEMM1-output storage, and the payload and
+            # combine input of a runtime in _small_m_shared, come from the shared arenas;
+            # weights are shared by pointer.
+            self._small_m_runtimes = [
+                SmallMRuntime(
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    experts=self.experts,
+                    topk=self.topk,
+                    quant=quant,
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=self.w2,
+                    w2_scale=self.w2_scale,
+                    max_tok_per_rank=m,
+                    swiglu_limit=self.swiglu_limit,
+                    payload_arena=self._payload_arena if m in self._small_m_shared else None,
+                    s1_output_arena=self._s1_output_arena,
+                    combine_input=self._combine_input if m in self._small_m_shared else None,
+                )
+                for m in self._bundle_plan.small_m_mtprs
+            ]
+        if self.rank == 0:
+            plan = self._bundle_plan
+            logger.info(
+                "MegaMoEV2 mtpr=%d experts=%d topk=%d: staged route (%s)%s%s",
+                self.mtpr, self.experts, self.topk,
+                "fixed-slot" if self._s1_fixed_slot else "compact",
+                f", small-input capacities {plan.small_m_mtprs}" if plan.small_m_mtprs else "",
+                ", large-input route" if plan.large_m else "",
+            )
+
+    @property
+    def small_m_mtpr(self) -> int:
+        """Largest max_tokens the small-input route serves (0 when not built)."""
+        return self._bundle_plan.small_m_mtprs[-1] if self._small_m_runtimes else 0
+
+    def forward_small_m(self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True):
+        """forward() for a call the small-input route must serve; kept for existing callers.
+
+        ``topk_ids`` may contain -1 (skipped, contributing zero).
+        """
+        if not self._small_m_runtimes:
+            raise RuntimeError("this instance has no small-input route")
+        if int(max_tokens) > self.small_m_mtpr:
+            raise ValueError(f"{max_tokens} tokens exceed the largest small-input mtpr {self.small_m_mtpr}")
+        return self.forward(
+            x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
+            mask_invalid_slots=True, max_tokens=max_tokens,
+        )
+
+    @property
+    def large_m_available(self) -> bool:
+        """Whether this instance built the large-input route."""
+        return self._large_m is not None
+
+    def set_large_m_enabled(self, enabled: bool) -> None:
+        """Send the following calls without max_tokens to the large-input route (True)
+        or keep the large-input route out of every call (False).
+
+        For callers of main's interface (e.g. SGLang): they choose the large-input
+        route per call from EP-wide counts, so every rank makes the same choice.
+        """
+        if enabled and self._large_m is None:
+            raise RuntimeError("this instance has no large-input route")
+        self._large_m_choice = bool(enabled)
+
+    def _route(self, run_tokens, max_tokens, *, small_m=True):
+        """(route, capacity) of this call; see MegaMoEBundlePlan.route_for.
+
+        ``max_tokens`` is the call's row count on its largest EP rank (counting
+        graph padding), identical on every rank. Without it the route depends on
+        the instance capacity alone, never on this rank's own row count.
+        """
+        if max_tokens is None:
+            # Without the row bound a call keeps main's staged route (fixed-slot or
+            # compact), or the large-input route a caller turned on for such calls.
+            if self._large_m_choice and self._bundle_plan.large_m:
+                return ROUTE_LARGE_M, self.mtpr
+            return ROUTE_STAGED, self.mtpr
+        max_tokens = int(max_tokens)
+        if not run_tokens <= max_tokens <= self.mtpr:
+            raise ValueError(
+                f"max_tokens={max_tokens} must be in [{run_tokens} (this rank's rows), {self.mtpr}]"
+            )
+        return self._bundle_plan.route_for(
+            max_tokens, small_m=small_m, large_m=self._large_m_choice is not False
+        )
+
+    def _fused_runtimes(self):
+        # Weights are first bound while __init__ is still building the routes.
+        large_m = getattr(self, "_large_m", None)
+        if large_m is not None:
+            yield large_m
+        yield from getattr(self, "_small_m_runtimes", ())
+
+    # Weight attributes: assigning one rebinds it on every route. Callers may set
+    # these directly between calls (ATOM does, per layer); bind_weights() checks
+    # the binding first.
+    @property
+    def _s1_w1(self):
+        return self._bound_w1
+
+    @_s1_w1.setter
+    def _s1_w1(self, value):
+        self._bound_w1 = value
+        for runtime in self._fused_runtimes():
+            runtime._s1_w1 = value
+
+    @property
+    def _s1_w1_scale(self):
+        return self._bound_w1_scale
+
+    @_s1_w1_scale.setter
+    def _s1_w1_scale(self, value):
+        self._bound_w1_scale = value
+        for runtime in self._fused_runtimes():
+            runtime._s1_w1_scale = value
+
+    @property
+    def w2(self):
+        return self._bound_w2
+
+    @w2.setter
+    def w2(self, value):
+        self._bound_w2 = value
+        for runtime in self._fused_runtimes():
+            runtime.w2 = value
+
+    @property
+    def w2_scale(self):
+        return self._bound_w2_scale
+
+    @w2_scale.setter
+    def w2_scale(self, value):
+        self._bound_w2_scale = value
+        for runtime in self._fused_runtimes():
+            runtime.w2_scale = value
+        # Build the small-input W2 dispatch table now, outside a graph capture, so
+        # a capture that follows a direct assignment finds it.
+        if not torch.cuda.is_current_stream_capturing():
+            for runtime in getattr(self, "_small_m_runtimes", ()):
+                runtime.w2_dispatch_table(self.w2, value)
+
+    def select_layer_state(self, layer_slot: int) -> None:
+        """Select the large-input protocol state for a shared operator layer."""
+        if self._large_m is not None:
+            self._large_m.select_layer_state(layer_slot)
+
+    def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        """Bind weights for the main path and the optional small- and large-input runtimes."""
+        weights = (w1, w1_scale, w2, w2_scale)
+        # Everything that can refuse runs before any binding changes, so a refusal leaves the main,
+        # small- and large-input paths on the previous weights together.
+        check_bindable(weights, self._weight_spec)
+        for runtime in self._small_m_runtimes:
+            runtime.w2_dispatch_table(w2, w2_scale)
+        # The setters bind the small- and large-input routes too.
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
+
+    def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
+        """Bind a stable layer slot and its weights without resetting state; a refused
+        slot or weight binding changes neither."""
+        if self._large_m is not None and not 0 <= int(layer_slot) < self._large_m.state_slots:
+            raise ValueError(f"layer_slot={layer_slot} outside [0, {self._large_m.state_slots})")
+        self.bind_weights(w1, w1_scale, w2, w2_scale)
+        self.select_layer_state(layer_slot)
 
     def preload_aot_bundles(self):
-        """Load the paired Stage1 and Stage2 production bundles."""
+        """Load the paired Stage1 and Stage2 production bundles, and the small- and
+        large-input kernels when this instance built them.
+
+        Building an instance never preloads; without this call each kernel loads
+        at its first launch."""
         self.preload_stage1_bundle()
         self.preload_stage2_bundle()
+        for runtime in self._small_m_runtimes:
+            runtime.preload_aot_bundle()
+        if self._large_m is not None:
+            self._large_m.preload_aot_bundle()
+
+    def _build_route_arenas(self):
+        """One payload arena and one GEMM1-output arena for every route of the plan.
+
+        An instance has one call in flight, and every route rewrites or masks
+        this data before it reads it and finishes reading it before the closing
+        all-rank barrier of its call, so routes reuse one copy; each keeps its
+        own counters, epochs and flags. Sized for the largest route.
+
+        A fused runtime whose launch can end before its peers finished reading
+        their payload (EP4 V4.1-Flash: comb_tok_wait, tok_done) keeps its own
+        payload: a rank that left it early may already dispatch its next call,
+        of any route, into its peers. The small-input runtimes also keep their
+        own combine input, whose rows their combine leaves poisoned
+        (bf16_head_tokens). The GEMM1 output is rank-local, so it stays shared.
+        """
+        self._payload_arena = None
+        self._s1_output_arena = None
+        self._combine_input = None
+        self._large_m_shares_payload = False
+        self._small_m_shared = ()
+        plan = self._bundle_plan
+        if not plan.small_m_mtprs and not plan.large_m:
+            return
+        cfg = self.comb_cfg
+        capacities = [
+            group_major_capacity(
+                world_size=self.world_size,
+                hidden_dim=self.model_dim,
+                max_tok_per_rank=self.mtpr,
+                experts_per_rank=self.epr,
+                topk=self.topk,
+                data_type=cfg.dispatch_dtype,
+                unit_size=cfg.gm_unit_size,
+                scale_dim=cfg.scale_dim,
+                scale_type_size=cfg.scale_type_size,
+                compact=cfg.gm_compact,
+                indexed_payload=cfg.gm_indexed_payload,
+            )
+        ]
+        fused = {
+            "world_size": self.world_size,
+            "model_dim": self.model_dim,
+            "inter_dim": self.inter_dim,
+            "experts": self.experts,
+            "topk": self.topk,
+        }
+        # Capacities of the routes sharing the payload arena, and of every route.
+        route_capacities = list(capacities)
+        if plan.large_m:
+            from .mega_moe_large_m import LargeMRuntime
+
+            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
+            route_capacities.append(capacity)
+            self._large_m_shares_payload = LargeMRuntime.ends_all_ranks(
+                max_tok_per_rank=self.mtpr, **fused
+            )
+            if self._large_m_shares_payload:
+                capacities.append(capacity)
+        if plan.small_m_mtprs:
+            from .mega_moe_small_m import SmallMRuntime
+
+            self._small_m_shared = tuple(
+                m
+                for m in plan.small_m_mtprs
+                if SmallMRuntime.ends_all_ranks(max_tok_per_rank=m, **fused)
+            )
+            for m in plan.small_m_mtprs:
+                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
+                route_capacities.append(capacity)
+                if m in self._small_m_shared:
+                    capacities.append(capacity)
+        self._payload_arena = GroupMajorPayloadArena(capacities)
+        out_bytes, osd_bytes = stage1_output_nbytes(
+            max(nvm for nvm, _, _, _ in route_capacities), self.inter_dim, self._a_dtype
+        )
+        self._s1_output_arena = (
+            torch.zeros(out_bytes, dtype=torch.uint8, device=self.dev),
+            torch.zeros(osd_bytes, dtype=torch.uint8, device=self.dev),
+        )
+        # Every route writes a peer's combine input only after that peer has
+        # entered the same call and reads its own before the call ends, so one
+        # copy sized for the route of largest capacity serves all of them.
+        self._combine_input = FlyDSLDispatchCombineIntraNodeOp.allocate_combine_input(
+            [
+                replace(cfg, max_num_inp_token_per_rank=m)
+                for m in (self.mtpr, *self._small_m_shared)
+            ]
+        )
 
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_prepare import (
@@ -130,16 +499,10 @@ class MegaMoEV2:
             preload_mega_moe_stage1_bundle,
             run_mega_moe_stage1,
             run_mega_moe_stage1_bundle,
+            stage1_output_buffers,
         )
 
         self.sort_block_m = 32
-        # Opt-in hardware bounds checking for the Stage1 control buffers.  Off
-        # by default so production keeps today's descriptors; turn it on while
-        # sweeping configurations, where an indexing mistake would otherwise
-        # page-fault and can leave a GPU needing a privileged reset.
-        self._s1_bounds_check = (
-            os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
-        )
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -197,21 +560,12 @@ class MegaMoEV2:
             else self._s1_scale_i32
         )
 
-        inter_dim = self.inter_dim
-        a2rows = self._s1_nvm
-        if self._a_dtype == "fp4":
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
-            ).view(torch.float4_e2m1fn_x2)
-            self._s1_out_kernel = self._s1_out.view(torch.uint8)
-        else:
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
-            )
-            self._s1_out_kernel = self._s1_out
-        prows = ((a2rows + 255) // 256) * 256
-        pcols = (((inter_dim // 32) + 7) // 8) * 8
-        self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
+        self._s1_out, self._s1_osd = stage1_output_buffers(
+            self._s1_nvm, self.inter_dim, self.dev, self._a_dtype, self._s1_output_arena
+        )
+        self._s1_out_kernel = (
+            self._s1_out.view(torch.uint8) if self._a_dtype == "fp4" else self._s1_out
+        )
         if self._a_dtype == "fp4":
             self._s1_quant_x = torch.empty(
                 self.mtpr,
@@ -318,20 +672,20 @@ class MegaMoEV2:
         # The full source histogram is small (392 int32 values for V4-Pro) and
         # lets every rank derive every destination offset without a base
         # push-back round trip.  The legacy compact matrix uses only the prefix.
-        workspace["bigcnt"] = op._sym(
+        workspace["bigcnt"] = _zeroed_sym(
             (self.world_size * total_segments,), torch.int32
         )
-        workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["my_base"] = op._sym((total_experts,), torch.int32)
-        workspace["group_base"] = op._sym((total_experts,), torch.int32)
-        workspace["plan_ready"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["launch_ready"] = op._sym((self.world_size,), torch.int32)
-        workspace["tile_ready"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["tile_expected"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_queue"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_epoch"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
-        workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
+        workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["my_base"] = _zeroed_sym((total_experts,), torch.int32)
+        workspace["group_base"] = _zeroed_sym((total_experts,), torch.int32)
+        workspace["plan_ready"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["launch_ready"] = _zeroed_sym((self.world_size,), torch.int32)
+        workspace["tile_ready"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["tile_expected"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_queue"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_epoch"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_tail"] = _zeroed_sym((2,), torch.int32)
+        workspace["payload_ready_rows"] = _zeroed_sym((1,), torch.int32)
         ms.shmem_barrier_all()
         for name in (
             "bigcnt",
@@ -601,8 +955,16 @@ class MegaMoEV2:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        if not scales.is_contiguous():
-            raise ValueError("scales must be contiguous")
+        # Other 1-byte dtypes would be read as E8M0 exponents without error.
+        if scales.dtype not in (torch.uint8, dtypes.fp8_e8m0):
+            raise ValueError(f"scales must be E8M0 (uint8 or {dtypes.fp8_e8m0}), got {scales.dtype}")
+        if not scales.is_contiguous() or scales.device != self.dev:
+            raise ValueError(f"scales must be contiguous on {self.dev}")
+        if any(t.device != self.dev for t in (x, wts, topk_ids)):
+            raise ValueError(f"x, wts and topk_ids must be on {self.dev}")
+        if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
+            # The kernel reads a full row of scales per token.
+            raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
         if config is None:
             config = self._select_config(cur_tok).stage1
         # Every rank at the indexed-capable MTPR class uses the indexed payload
@@ -650,7 +1012,6 @@ class MegaMoEV2:
             "situ_linear_beta": self.situ_linear_beta,
             "a_dtype": self._a_dtype,
             "out_dtype": self._a_dtype,
-            "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
         use_bundle = (
@@ -729,9 +1090,7 @@ class MegaMoEV2:
             config = self._select_config(run_tokens)
         # Combine skips top-k slots with id -1 (never dispatched, so their partial
         # is stale). The check costs prefill time, so it runs only when the
-        # caller says ids may be -1.
-        if mask_invalid_slots is None:
-            mask_invalid_slots = self._combine_mask
+        # caller says ids may be -1 (None or False: off).
         self._run_fused_stage1(
             x,
             wts,
@@ -762,46 +1121,94 @@ class MegaMoEV2:
         ret = result
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
         if out_tok is None:
-            cfg = self.comb_cfg
-            out_tok = (
-                self.comb_op.shmem_comb_out_tok.view(torch.int8)[: self.mtpr * cfg.combine_token_bytes]
-                .view(cfg.combine_dtype)
-                .view(self.mtpr, cfg.combine_token_view_dim)
-            )
+            out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(
-        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
+        max_tokens=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
-        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
-        run_tokens = int(x_bf16.shape[0])
-        if run_tokens > self.mtpr:
-            raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
-            raise ValueError("x_bf16 must be contiguous bfloat16")
-        if wts.dtype != torch.float32 or not wts.is_contiguous():
-            raise ValueError("wts must be contiguous float32")
-        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-            raise ValueError("topk_ids must be contiguous int32")
+        None or False leaves the check off (it costs prefill time); the small-
+        and large-input routes always skip -1 slots.
+
+        ``max_tokens``: rows of this call on its largest EP rank, counting graph
+        padding, passed identically on every rank; it selects the route among
+        those built (routed=True builds them). None takes the staged route
+        (fixed-slot or compact), or the large-input route when
+        set_large_m_enabled(True) was called.
+
+        The output is a view of the route's combine buffer, valid until the next
+        call. ``slice_output=False`` returns the whole buffer: as many rows as
+        the route's capacity (the instance MTPR, or the small-input capacity the
+        route took), of which rows past this rank's own are undefined.
+        """
+        route = self._route(int(x_bf16.shape[0]), max_tokens)
+        return self._forward_route(
+            route, x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
+
+    def _forward_route(
+        self, route, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """forward() on a given (route, capacity); tests pin a route through this,
+        identically on every rank."""
+        # Every launch of the call -- quantization, prepare, Stage1, Stage2 and
+        # combine -- runs on the caller's stream, resolved once here.
+        if stream is None:
+            return self._launch_route(
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots,
+                torch.cuda.current_stream(),
+            )
+        launch_stream = torch_stream(stream)
+        with torch.cuda.stream(launch_stream):
+            return self._launch_route(
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, launch_stream
+            )
+
+    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, stream):
+        """``stream``: the current torch stream. The fused routes take stream None
+        (the current stream) and check their inputs themselves."""
+        route, capacity = route
+        if route == ROUTE_LARGE_M:
+            return self._large_m.forward(
+                x_bf16, wts, topk_ids, slice_output=slice_output
+            )
+        if route == ROUTE_SMALL_M:
+            runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(capacity)]
+            return runtime.forward(
+                x_bf16, wts, topk_ids, slice_output=slice_output
+            )
+        run_tokens = check_forward_inputs(
+            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+            topk=self.topk, device=self.dev,
+        )
         if self._s1_fixed_slot:
-            x_q, scales = self.quantize(x_bf16)
+            # Into the instance's own buffers (compact prepare quantizes in place):
+            # a forward allocates nothing.
+            x_q = self._s1_quant_x[:run_tokens]
+            scales = self._s1_quant_scale[:run_tokens]
+            if run_tokens:
+                per_1x32_mx_quant(
+                    x_bf16,
+                    quant_mode=self._a_dtype,
+                    out=(
+                        x_q.view(torch.uint8) if self._a_dtype == "fp4" else x_q,
+                        scales,
+                    ),
+                )
             return self._run_joint(
                 x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
                 mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
-        prepare_stream = stream
-        if prepare_stream is None:
-            prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
-        elif hasattr(prepare_stream, "cuda_stream"):
-            prepare_stream = fx.Stream(prepare_stream.cuda_stream)
         self._run_compact_prepare(
             topk_ids,
             run_tokens,
             config.stage1,
-            prepare_stream,
+            fx.Stream(stream.cuda_stream),
             quant_input=x_bf16,
         )
         x_q = self._s1_quant_x[:run_tokens]
@@ -820,15 +1227,40 @@ class MegaMoEV2:
         )
 
     def forward_prequant(
-        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
+        max_tokens=None,
     ):
+        """forward() on input quantized by quantize().
+
+        The small-input route takes bf16 input only, so this entry plans among the
+        staged and large-input routes: for a max_tokens the small-input route would
+        serve, forward() and forward_prequant() take different routes (and every
+        rank must use the same entry for a call).
+        """
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(
-            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
-            mask_invalid_slots=mask_invalid_slots,
-        )
+        route, _ = self._route(run_tokens, max_tokens, small_m=False)
+        if route == ROUTE_LARGE_M:
+            return self._large_m.forward_prequant(
+                x_q,
+                scales,
+                wts,
+                topk_ids,
+                stream=stream,
+                slice_output=slice_output,
+            )
+        launch_stream = torch_stream(stream)
+        if stream is None:
+            return self._run_joint(
+                x_q, scales, wts, topk_ids, run_tokens, launch_stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
+            )
+        with torch.cuda.stream(launch_stream):
+            return self._run_joint(
+                x_q, scales, wts, topk_ids, run_tokens, launch_stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
+            )
 
     forward_bf16 = forward
     __call__ = forward
@@ -837,6 +1269,7 @@ class MegaMoEV2:
         from .mega_moe_stage2 import (
             preload_mega_moe_stage2,
             run_mega_moe_stage2,
+            stage2_p2p_row_nbytes,
         )
         from .mega_moe_stage2_aligned_pair import (
             preload_mega_moe_stage2_aligned_pair,
@@ -844,8 +1277,6 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
-        # Default of forward(mask_invalid_slots=...).
-        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token
@@ -861,11 +1292,7 @@ class MegaMoEV2:
         self._g2_residual_done = torch.cuda.Event()
         self._g2_invariants_by_quant = {}
         for p2p_quant in ("none", "fp8_blockwise_1x32"):
-            p2p_row_nbytes = (
-                int(comb_cfg.hidden_dim) + int(comb_cfg.hidden_dim) // 32
-                if p2p_quant == "fp8_blockwise_1x32"
-                else int(comb_cfg.hidden_dim) * 2
-            )
+            p2p_row_nbytes = stage2_p2p_row_nbytes(comb_cfg.hidden_dim, p2p_quant)
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),
                 "experts": int(comb_cfg.num_experts_per_rank), "topk": int(k), "rank": int(comb_cfg.rank),
