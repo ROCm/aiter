@@ -695,6 +695,107 @@ def test_preload_and_bad_source_list_under_compile_only(monkeypatch, tmp_path):
     assert isinstance(bad._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
 
 
+def _bound_preload_setup(monkeypatch, tmp_path, name):
+    """A cached factory bound to a cache in ``tmp_path``, a FlyDSL whose
+    compile and load record what they do, and the error log."""
+    import functools
+
+    from aiter.ops.flydsl import aot_cache
+    from aiter.ops.flydsl.aot_launch import aot_factory
+
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    events = []
+
+    def launch(a, b):
+        pass
+
+    def compile(exe, *args, compile_only=False):
+        assert exe is launch, exe  # the launcher, never a lazy handle
+        if compile_only:  # the export's compile
+            events.append("export")
+            return _FakeCompiled()
+        if "COMPILE_ONLY" in os.environ:
+            events.append("jit compile-only")
+            return None
+        events.append("jit launch")
+        return lambda *a: events.append("jit function")
+
+    def load_module(path):
+        events.append("load")
+        return lambda *a: events.append(("loaded function", a))
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", compile)
+    monkeypatch.setattr(aot_cache, "_load_module", load_module)
+
+    @aot_factory(name)
+    @functools.cache
+    def factory(n):
+        return launch
+
+    return factory, events, _errors(monkeypatch, aot_cache)
+
+
+def test_preload_of_a_bound_launcher(monkeypatch, tmp_path):
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound"
+    )
+    # A prebuild builds the entry, as a launch does, and dispatches nothing.
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    assert tensor_shim._preload_compiled(factory.lazy(4), 1, 2) is None
+    assert events == ["export"] and len(list(tmp_path.glob("*.o"))) == 1
+    # Its entry on disk: FlyDSL's own compile-only launch, which an AOT replay
+    # watches, and no second build.
+    events.clear()
+    assert tensor_shim._preload_compiled(factory.lazy(4), 1, 2) is None
+    assert events == ["jit compile-only"] and len(list(tmp_path.glob("*.o"))) == 1
+
+    # A process that serves (another cache state: the factory of a new
+    # process) loads the entry and launches nothing; the function it returns
+    # takes the launcher's arguments, and so do later launches of the key.
+    monkeypatch.delenv("COMPILE_ONLY")
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound"
+    )
+    loaded = tensor_shim._preload_compiled(factory.lazy(4), 1, 2)
+    assert events == ["load"]
+    loaded(3, 4)
+    tensor_shim._run_compiled(factory.lazy(4), 5, 6)
+    assert events == ["load", ("loaded function", (3, 4)), ("loaded function", (5, 6))]
+    # A caller that keeps the function gets the loaded one, launched.
+    events.clear()
+    kept = tensor_shim._compile_and_keep(factory.lazy(4), 7, 8)
+    assert events == [("loaded function", (7, 8))] and kept is not None
+    assert not errors
+
+
+def test_preload_of_a_bound_launcher_without_an_entry(monkeypatch, tmp_path):
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound_miss"
+    )
+    # No entry: one error, and the launcher (not the handle) is preloaded on
+    # the JIT path; nothing is written.
+    assert tensor_shim._preload_compiled(factory.lazy(5), 1, 2) is None
+    assert events == ["jit compile-only"]
+    assert len(errors) == 1 and "no prebuilt entry" in errors[0], errors
+    assert not list(tmp_path.iterdir())
+    # The key's launches take the JIT path, without another error.
+    tensor_shim._run_compiled(factory.lazy(5), 3, 4)
+    assert events == ["jit compile-only", "jit launch"] and len(errors) == 1
+    # A caller that keeps the function gets the JIT one, launched.
+    events.clear()
+    kept = tensor_shim._compile_and_keep(factory.lazy(6), 7, 8)
+    assert events == ["jit launch"] and len(errors) == 2
+    kept()
+    assert events == ["jit launch", "jit function"]
+    assert not list(tmp_path.iterdir())
+
+
 def test_deleted_source_is_not_hashed(tmp_path):
     from aiter.ops.flydsl import aot_cache
 
@@ -762,14 +863,25 @@ def test_cache_names_are_unique_per_file(monkeypatch, tmp_path):
     os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
     reason="mode 0 binds nothing",
 )
-def test_every_cache_declares_the_kernel_files_its_sources_import():
+def test_every_cache_declares_the_kernel_files_its_sources_import(monkeypatch):
     """Sources are declared by hand. A forgotten one is found here, and by the
     cache when it builds an entry: a declared file under ``kernels/`` imports
     a file under ``kernels/`` that is not declared."""
     import importlib
+    import importlib.util
     import re
+    import types
 
     from aiter.ops.flydsl import aot_cache
+
+    if "mori" not in sys.modules and importlib.util.find_spec("mori") is None:
+        # The MegaMoE modules import mori at module level, and only use it
+        # at run time: a stand-in, as the MegaMoE AOT replay has.
+        package, shmem = types.ModuleType("mori"), types.ModuleType("mori.shmem")
+        package.shmem = shmem
+        shmem.mori_shmem_create_tensor = None
+        monkeypatch.setitem(sys.modules, "mori", package)
+        monkeypatch.setitem(sys.modules, "mori.shmem", shmem)
 
     base = Path(aot_cache.__file__).resolve().parent
     creates = re.compile(r"^(@aot_factory\(|.*\bFlyDSLAotCache\()", re.MULTILINE)

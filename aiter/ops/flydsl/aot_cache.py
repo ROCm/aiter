@@ -1028,6 +1028,24 @@ class FlyDSLAotCache:
                         self._mem[key] = kernel
         kernel(*args)
 
+    def preload(self, key, make_exe, *args):
+        """Load the entry for ``key`` into this process without launching it,
+        and return the loaded function; None if there is none to load (no
+        entry, mode ``0``, a prebuild). For a caller that warms a launcher up
+        before serving."""
+        if _MODE == "0" or _prebuilding():
+            return None
+        kernel = self._mem.get(key)
+        if kernel is None:
+            with self._lock:
+                kernel = self._mem.get(key)
+                if kernel is None:
+                    kernel = self._kernel(key, make_exe, args)
+                    if kernel is None:  # COMPILE_ONLY was set meanwhile
+                        return None
+                    self._mem[key] = kernel
+        return None if isinstance(kernel, _JitKernel) else kernel
+
     def _prebuild(self, key, make_exe, args) -> None:
         """Build the entry for ``key`` without launching, e.g. in an AOT replay.
 
