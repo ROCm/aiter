@@ -52,14 +52,15 @@ static int dyn_gq_resident_per_cu(Kernel kernel, int block_size)
 
 // dynamic_per_token_scaled_quant_multirow_kernel is used only where it was measured (gfx942);
 // AITER_PER_TOKEN_QUANT_DISABLE_MULTIROW=1 keeps every shape on the one-row-per-block kernel
-// (op_tests/test_quant.py compares the two through it).
+// (op_tests/test_quant.py compares the two through it). The arch is read per device: the
+// caller holds a HipDeviceGuard for the input's device.
 static inline bool per_token_multirow_enabled()
 {
-    static const bool enabled = [] {
+    static const bool disabled = [] {
         const char* e = std::getenv("AITER_PER_TOKEN_QUANT_DISABLE_MULTIROW");
-        return !(e != nullptr && std::atoi(e) != 0) && get_gpu_arch() == "gfx942";
+        return e != nullptr && std::atoi(e) != 0;
     }();
-    return enabled;
+    return !disabled && get_device_gfx() == "gfx942";
 }
 
 // gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
@@ -1992,7 +1993,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // one round of 8 blocks per CU.
             const bool half_wave    = num_vecs <= 32 && cols % 8 == 0;
             const int rows_per_step = BlockSize / (half_wave ? 32 : 64);
-            const int64_t round     = 8 * static_cast<int64_t>(get_num_cu_func());
+            const int64_t round     = 8 * static_cast<int64_t>(get_device_cu_num());
             int rows_per_thread     = 4 / vecs_per_lane;
             while(rows_per_thread > 1 &&
                   (rows + rows_per_step * rows_per_thread - 1) / (rows_per_step * rows_per_thread) < round)
