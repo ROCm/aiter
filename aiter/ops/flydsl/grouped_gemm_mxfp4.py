@@ -276,6 +276,31 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"tdm_as_in_prologue={tdm_as_in_prologue}"
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    next_stage_prefetch = _select_bool_env(
+        "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+    )
+    enable_ep_scatter = stage2_scatter is not None
+    # Use this step's source-token count, not the padded receive capacity, so
+    # a small step in a prefill-sized arena keeps its existing specialization.
+    fixed_n_ep_shape = (
+        enable_ep_scatter
+        and stage2_scatter.source_token_count >= 4096
+        and SUPPORT_EXPLICIT_VGPR_PARTITION
+        and not stage2_scatter.combine_quant_bits
+        and stage2_scatter.world_size == 4
+        and (N, K, n_experts, stage2_scatter.slot_stride_bytes)
+        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
+        and a_is_fp4
+        and a_preshuffled
+        and not stage1_act
+        and not stage1_quant_out
+        and not has_bias
+        and not row_major_ascale
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (256, 256, 256, 2, 2, 4)
+        and cluster_m == cluster_n == k_waves == 1
+        and next_stage_prefetch == 1
+    )
     loc_sched = 0
     if loc_phase is not None:
         if not (waves_per_tensor_tdm == 2 and m_warp * n_warp == 4):
@@ -285,8 +310,13 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"waves {m_warp} x {n_warp}"
             )
         # The schedule is persistent, which the EP scatter serves only unquantized.
-        if iod_loc in (1, 2) and not (
-            stage2_scatter is not None and stage2_scatter.combine_quant_bits
+        # The pinned EP4 prefill GEMM2 keeps its live-route grid and reads the
+        # placed B there: the domain schedule (1024 workers) ran it 2-5% slower
+        # (DSR1 EP4 tpr 8192: 527 vs 504 us).
+        if (
+            iod_loc in (1, 2)
+            and not (stage2_scatter is not None and stage2_scatter.combine_quant_bits)
+            and not (fixed_n_ep_shape and not persistent_workers)
         ):
             loc_sched = iod_loc
             # Workgroups in all, four per CU by default: fewer leave the tail
@@ -308,7 +338,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    enable_ep_scatter = stage2_scatter is not None
     if enable_ep_scatter and stage2_scatter.combine_quant_bits:
         # N is the payload plane's length and so the scale plane's base, which
         # has to land on a cache line; fp4 packs two elements to the byte and
@@ -338,7 +367,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     tdm_spec = (
         cluster_n,
         cluster_m,
-        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
+        next_stage_prefetch,
         waves_per_tensor_tdm,
         _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
         _select_tdm_b_th(tdm_b_th),
@@ -352,28 +381,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
-    # Use this step's source-token count, not the padded receive capacity, so
-    # a small step in a prefill-sized arena keeps its existing specialization.
-    fixed_n_ep = (
-        enable_ep_scatter
-        and stage2_scatter.source_token_count >= 4096
-        and SUPPORT_EXPLICIT_VGPR_PARTITION
-        and not stage2_scatter.combine_quant_bits
-        and stage2_scatter.world_size == 4
-        and (N, K, n_experts, stage2_scatter.slot_stride_bytes)
-        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
-        and a_is_fp4
-        and a_preshuffled
-        and not persistent_workers
-        and not stage1_act
-        and not stage1_quant_out
-        and not has_bias
-        and not row_major_ascale
-        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-        == (256, 256, 256, 2, 2, 4)
-        and cluster_m == cluster_n == k_waves == 1
-        and tdm_spec[2] == 1
-    )
+    fixed_n_ep = fixed_n_ep_shape and not persistent_workers
     # Pinned EP4 prefill steps use a live-route grid from T4096 per rank.
     # Explicit worker overrides keep their requested dispatch.
     if (

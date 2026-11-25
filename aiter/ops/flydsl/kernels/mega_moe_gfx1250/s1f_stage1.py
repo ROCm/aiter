@@ -621,6 +621,7 @@ def make_s1f_stage1(
     ``pair_cluster_n=2`` pairs two eligible EP4 prefill CTAs on adjacent
     N panels. A shared atomic ticket and cluster rendezvous keep their A
     multicast matched; producer roles and all completion waits are retained.
+    With ``loc_queues`` the pairs claim from their IOD domain's queue.
     """
     if WAVE != 32:
         raise ValueError("S1F requires gfx1250 wave32")
@@ -732,9 +733,16 @@ def make_s1f_stage1(
     assert NT % CN == 0 and G % (CN * N_XCC) == 0
     assert CN == 1 or G // CN <= PAIR_CAP
     N_TASKS = NT // CN
-    # The paired prefill keeps the global queue; the IOD queues are per CTA.
-    XQ, LOCQ = (XQ, LOCQ) if CN == 1 else (0, 0)
+    # The paired prefill keeps the global queue, or with loc_queues one per IOD
+    # domain when both n-tiles of a pair share a domain group.
+    XQ = XQ if CN == 1 else 0
+    LOCQ = LOCQ if CN == 1 else int(LOCQ and LOC_GROUP % CN == 0 and LOC_NG % 2 == 0)
     assert ((compact_cap + tile_m - 1) // tile_m) * N_TASKS + G < (1 << 31)
+    # A paired ticket's bit 30 marks a claim on the other domain's queue.
+    PAIR_STOLEN = 1 << 30
+    assert not (CN == 2 and LOCQ) or (
+        ((compact_cap + tile_m - 1) // tile_m) * N_TASKS + G < PAIR_STOLEN
+    )
     B1 = GM * N_TASKS
     # Runs per W1 claim. A piece has at most FM / R runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
@@ -1776,8 +1784,8 @@ def make_s1f_stage1(
             # pair rank). XQ: queue x per XCC, its consumer l starts on item l
             # of queue x; each queue's first SQ items are static.
             # loc_queues without XQ: queue d per IOD domain, the global order over
-            # the n-tiles of parity d; the domain's 4 * CB consumers start on
-            # its first items.
+            # the n-tiles (paired: the pairs) of domain d; the domain's 4 * CB
+            # consumers start on its first items.
             SQ = CB if XQ else (4 * CB if LOCQ else (G - P) // CN)
             loc_c = launch_rotation() if const_expr(LOCQ) else None
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
@@ -1785,7 +1793,7 @@ def make_s1f_stage1(
 
             def q_items(xq):
                 if const_expr(LOCQ and not XQ):
-                    return m_tiles * fx.Int32(NT // 2)
+                    return m_tiles * fx.Int32(N_TASKS // 2)
                 if const_expr(LOCQ):
                     # Queue xq: the m-tiles of its rank r among the 4 queues of
                     # its domain d, the n-tiles of domain d.
@@ -1833,7 +1841,7 @@ def make_s1f_stage1(
                     rq = r // gsz
                     return (
                         (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
-                    ) | loc_n(rq, xq)
+                    ) | loc_n(rq * fx.Int32(CN) if CN > 1 else rq, xq)
                 if const_expr(LOCQ):
                     xr = (xq + loc_c) & fx.Int32(N_XCC - 1)
                     j = w // fx.Int32(NT // 2)
@@ -2012,10 +2020,37 @@ def make_s1f_stage1(
                     _trap()
                 return q
 
-            def pair_code(q):
-                return (q < q_items(fx.Int32(0))).select(
-                    q_code(fx.Int32(0), q), fx.Int32(-1)
-                )
+            # loc_queues: a pair claims on its domain's queue, then on the other's.
+            pair_d = (
+                ((xcc + loc_c) & fx.Int32(N_XCC - 1)) >> fx.Int32(2)
+                if const_expr(CN == 2 and LOCQ)
+                else None
+            )
+
+            def pair_queue(ticket):
+                if const_expr(CN == 2 and LOCQ):
+                    return pair_d ^ (ticket >> fx.Int32(PAIR_STOLEN.bit_length() - 1))
+                return fx.Int32(0)
+
+            def pair_code(ticket):
+                xq = pair_queue(ticket)
+                q = ticket
+                if const_expr(CN == 2 and LOCQ):
+                    q = ticket & fx.Int32(PAIR_STOLEN - 1)
+                return (q < q_items(xq)).select(q_code(xq, q), fx.Int32(-1))
+
+            def pair_claim(previous_ticket, got_v):
+                """Peer 0: the ticket of claim got_v, issued on the queue of
+                previous_ticket; past the end of its own domain's queue, a
+                blocking claim on the other domain's instead."""
+                ticket = fx.Int32(SQ) + _uniform(got_v)
+                if const_expr(CN == 2 and LOCQ):
+                    ticket = ticket | (previous_ticket & fx.Int32(PAIR_STOLEN))
+                    if (ticket < fx.Int32(PAIR_STOLEN)) & (ticket >= q_items(pair_d)):
+                        ticket = fx.Int32(PAIR_STOLEN + SQ) + _uniform(
+                            claim_issue(fx.Int32(1) - pair_d)
+                        )
+                return ticket
 
             def ready_bits(fv, tinfo_n):
                 """Bit s: source s is not needed or has published this gen."""
@@ -2121,8 +2156,12 @@ def make_s1f_stage1(
             if const_expr(CN == 2):
                 # The two physical peers have the same producer/consumer role.
                 q0 = role_pair - fx.Int32(P // CN)
+                if const_expr(LOCQ):
+                    # The XCC's rank in its domain: 4 * CB static items per queue.
+                    xr = (xcc + loc_c) & fx.Int32(N_XCC - 1)
+                    q0 = q0 + ((xr & fx.Int32(3)) - xcc) * fx.Int32(CB)
                 static_ok = (role_pair >= fx.Int32(P // CN)) & (
-                    q0 < q_items(fx.Int32(0))
+                    q0 < q_items(pair_queue(fx.Int32(0)))
                 )
                 code = static_ok.select(pair_code(q0), fx.Int32(-1))
                 tinfo = fx.Int32(0)
@@ -2132,7 +2171,9 @@ def make_s1f_stage1(
                     if is_w0:
                         ticket = fx.Int32(0)
                         if peer == 0:
-                            ticket = fx.Int32(SQ) + _uniform(claim_issue(fx.Int32(0)))
+                            ticket = pair_claim(
+                                fx.Int32(0), claim_issue(pair_queue(fx.Int32(0)))
+                            )
                             send_pair_ticket(ticket)
                         else:
                             ticket = receive_pair_ticket(fx.Int32(-1))
@@ -2272,14 +2313,14 @@ def make_s1f_stage1(
 
                 if const_expr(CN == 2):
 
-                    def drain_start(nxt=nxt):
-                        nxt["claim"] = claim_issue(fx.Int32(0))
+                    def drain_start(queue=queue, nxt=nxt):
+                        nxt["claim"] = claim_issue(pair_queue(queue))
 
                     def epi_start(previous_q=queue, nxt=nxt):
                         ticket = fx.Int32(0)
                         if is_w0:
                             if peer == 0:
-                                ticket = fx.Int32(SQ) + _uniform(nxt["claim"])
+                                ticket = pair_claim(previous_q, nxt["claim"])
                                 send_pair_ticket(ticket)
                             else:
                                 ticket = receive_pair_ticket(previous_q)
