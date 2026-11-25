@@ -483,7 +483,9 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="fused_qknorm_idxrqknorm nvfp4 pages vs the torch reference, byte for byte",
 )
-parser.add_argument("-t", "--tokens", type=int, nargs="*", default=[1, 7, 64, 300])
+parser.add_argument(
+    "-t", "--tokens", type=int, nargs="*", default=[1, 7, 64, 300, 1031, 6150]
+)
 parser.add_argument("-n", "--nkv", type=int, nargs="*", default=[1, 2, 4])
 parser.add_argument("--gs", type=float, nargs="*", default=[1.0, 0.37, 3.0])
 parser.add_argument(

@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -65,6 +67,165 @@ def _fused_qknorm_idxrqknorm_hip(
     pass
 
 
+# ---- NVFP4 prefill front ----------------------------------------------------------------------
+# The MiniMax-M3 TP4 NVFP4 insert (16 q / 1 kv / 1 index heads, head_dim 128, rotary 64, bf16) at
+# prefill sizes runs a kernel that takes ~10 us of device time per 1K tokens less than the generic
+# one, and a call at those sizes is launched eagerly: the generic entry marshals 16 tensors through
+# aiter_tensor_t (about 20 us of host time per call). This front checks the operands of that one call
+# shape in Python and hands raw device pointers and the stream to a second entry of the same
+# module; any other call (and any call it declines) takes the generic path unchanged. The token
+# floor is the C++ one (AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS, default 2).
+_NV_PF_MIN_TOKENS = int(
+    os.environ.get("AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS", "2")
+)
+_NV_PF_ROW = (16 + 2 * 1 + 1 + 1) * 128  # qkv row, elements
+_NV_PF_PAGE = 9216  # bytes of one K (or V) side of a 128-token NVFP4 page
+_nv_pf_mod = None
+_nv_pf_gfx950 = None
+
+
+def _nvfp4_prefill_front(
+    qkv,
+    q_norm_weight,
+    k_norm_weight,
+    cos_sin_cache,
+    positions,
+    eps,
+    index_q_norm_weight,
+    index_k_norm_weight,
+    slot_mapping,
+    kv_cache_k,
+    kv_cache_v,
+    index_cache,
+    q_out,
+    index_q_out,
+    index_slot_mapping,
+    k_scale,
+    v_scale,
+):
+    """True when the call was handed to the raw prefill entry."""
+    global _nv_pf_mod, _nv_pf_gfx950
+    n = qkv.shape[0]
+    if n < _NV_PF_MIN_TOKENS or n < 2:
+        return False
+    bf16 = torch.bfloat16
+    if (
+        qkv.dtype is not bf16
+        or qkv.shape[1] != _NV_PF_ROW
+        or not qkv.is_contiguous()
+        or cos_sin_cache.dtype is not bf16
+        or cos_sin_cache.dim() != 2
+        or cos_sin_cache.shape[1] != 64
+        or not cos_sin_cache.is_contiguous()
+        or positions.dtype is not torch.int64
+        or positions.numel() != n
+        or not positions.is_contiguous()
+        or q_out is None
+        or q_out.dtype is not bf16
+        or q_out.numel() != n * 2048
+        or not q_out.is_contiguous()
+        or index_q_out is None
+        or index_q_out.dtype not in _FP8_E4M3_DTYPES
+        or index_q_out.numel() != n * 128
+        or not index_q_out.is_contiguous()
+    ):
+        return False
+    for w in (q_norm_weight, k_norm_weight, index_q_norm_weight, index_k_norm_weight):
+        if (
+            w is None
+            or w.dtype is not bf16
+            or w.numel() != 128
+            or not w.is_contiguous()
+        ):
+            return False
+    for sl in (slot_mapping, index_slot_mapping):
+        if (
+            sl is None
+            or sl.dtype is not torch.int64
+            or sl.numel() != n
+            or not sl.is_contiguous()
+        ):
+            return False
+    if (
+        kv_cache_k is None
+        or kv_cache_v is None
+        or kv_cache_k.data_ptr() != kv_cache_v.data_ptr()
+        or kv_cache_k.dtype is not torch.uint8
+        or kv_cache_k.dim() != 2
+        or kv_cache_k.shape[1] != 2 * _NV_PF_PAGE
+        or kv_cache_k.stride(1) != 1
+        or kv_cache_k.stride(0) < 2 * _NV_PF_PAGE
+        or kv_cache_k.stride(0) % 4
+        or kv_cache_k.data_ptr() % 4
+        or index_cache is None
+        or index_cache.dtype is not torch.uint8
+        or not index_cache.is_contiguous()
+        or index_cache.numel() % _NV_PF_PAGE
+        or index_cache.numel() // _NV_PF_PAGE < kv_cache_k.shape[0]
+        or k_scale is None
+        or v_scale is None
+        or k_scale.dtype is not torch.float32
+        or v_scale.dtype is not torch.float32
+        or k_scale.numel() != 1
+        or v_scale.numel() != 1
+    ):
+        return False
+    dev = qkv.get_device()
+    if dev < 0 or dev != torch.cuda.current_device():
+        return False
+    for t in (
+        kv_cache_k,
+        index_cache,
+        k_scale,
+        v_scale,
+        q_out,
+        index_q_out,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        index_slot_mapping,
+        q_norm_weight,
+        k_norm_weight,
+        index_q_norm_weight,
+        index_k_norm_weight,
+    ):
+        if t.get_device() != dev:
+            return False
+    if _nv_pf_gfx950 is None:
+        _nv_pf_gfx950 = get_gfx_runtime() == "gfx950"
+    if not _nv_pf_gfx950:
+        return False
+    if _nv_pf_mod is None:
+        try:
+            from ..jit.core import get_module
+
+            _nv_pf_mod = get_module("module_fused_qknorm_idxrqknorm")
+        except ModuleNotFoundError:
+            return False  # not built yet: the generic call below builds it
+    _nv_pf_mod.fused_qknorm_nvfp4_prefill_raw(
+        qkv.data_ptr(),
+        q_out.data_ptr(),
+        index_q_out.data_ptr(),
+        q_norm_weight.data_ptr(),
+        k_norm_weight.data_ptr(),
+        index_q_norm_weight.data_ptr(),
+        index_k_norm_weight.data_ptr(),
+        cos_sin_cache.data_ptr(),
+        positions.data_ptr(),
+        slot_mapping.data_ptr(),
+        index_slot_mapping.data_ptr(),
+        kv_cache_k.data_ptr(),
+        index_cache.data_ptr(),
+        k_scale.data_ptr(),
+        v_scale.data_ptr(),
+        n,
+        kv_cache_k.stride(0),
+        eps,
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    return True
+
+
 def fused_qknorm_idxrqknorm(
     qkv: Tensor,
     q_norm_weight: Tensor,
@@ -123,6 +284,38 @@ def fused_qknorm_idxrqknorm(
             if _is_fp8_e4m3_tensor(index_cache) or _is_fp8_e4m3_tensor(index_q_out)
             else "auto"
         )
+
+    if (
+        kv_cache_dtype == "nvfp4"
+        and index_cache_dtype == "nvfp4"
+        and not skip_index_branch
+        and not asm_layout
+        and num_heads == 16
+        and num_kv_heads == 1
+        and num_index_heads == 1
+        and rotary_dim == 64
+        and block_size == 128
+        and _nvfp4_prefill_front(
+            qkv,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
+            positions,
+            eps,
+            index_q_norm_weight,
+            index_k_norm_weight,
+            slot_mapping,
+            kv_cache_k,
+            kv_cache_v,
+            index_cache,
+            q_out,
+            index_q_out,
+            index_slot_mapping,
+            k_scale,
+            v_scale,
+        )
+    ):
+        return
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
     # stores would silently write zeros.

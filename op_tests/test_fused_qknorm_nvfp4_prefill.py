@@ -1,0 +1,298 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The NVFP4 prefill insert of fused_qknorm_idxrqknorm (MiniMax-M3 TP4 head set, gfx950) against the generic kernel.
+
+The prefill path takes a call of at least AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS (512) tokens; any slot
+pattern with distinct slots must give the bytes of the generic kernel in every buffer (pages that already hold data
+included: a V octet shares nibbles and scales between tokens). The parent runs this file twice, once with the
+prefill path forced on from 2 tokens and once with it off, and compares the SHA-256 of every output buffer.
+
+    python op_tests/test_fused_qknorm_nvfp4_prefill.py [-n N ...] [--kinds ...] [--seeds S]
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import torch
+
+NQ, NKV, NIQ, ROT, D = 16, 1, 1, 64, 128
+ROW = (NQ + 2 * NKV + NIQ + 1) * D
+PAGE = 9216
+EPS = 1e-6
+dev = "cuda"
+
+
+def distinct_from(g, total, k):
+    return torch.randperm(total, generator=g, device="cpu")[:k]
+
+
+def make_slots(kind, n, g):
+    """returns (slot int64 [n] cpu, islot, nb)"""
+    gi = lambda hi, k=1: torch.randint(0, hi, (k,), generator=g).tolist()
+    if kind == "contig":
+        st = gi(128)[0]
+        slot = torch.arange(st, st + n)
+        nb = (st + n + 127) // 128 + 1
+    elif kind == "aligned":
+        slot = torch.arange(0, n)
+        nb = (n + 127) // 128 + 1
+    elif kind == "multi":
+        k = min(5, n - 1)
+        cuts = (
+            sorted(set(torch.randint(1, max(n, 2), (k,), generator=g).tolist()))
+            if n > 1
+            else []
+        )
+        lens = [b - a for a, b in zip([0] + cuts, cuts + [n])]
+        s, base = [], 0
+        for ln in lens:
+            off = gi(128)[0]
+            s += list(range(base * 128 + off, base * 128 + off + ln))
+            base += (off + ln + 127) // 128
+        slot = torch.tensor(s)
+        nb = base + 1
+    elif kind == "pad":
+        st = gi(128)[0]
+        slot = torch.arange(st, st + n)
+        nb = (st + n + 127) // 128 + 1
+        slot[n - n // 4 :] = -1
+    elif kind == "padmid":
+        st = gi(128)[0]
+        slot = torch.arange(st, st + n)
+        nb = (st + n + 127) // 128 + 1
+        m = torch.rand(n, generator=g) < 0.1
+        slot[m] = -1
+    elif kind == "sparse":
+        nb = (n + 15) // 16 + 1
+        oi = distinct_from(g, nb * 16, n)
+        slot = oi * 8 + torch.randint(0, 8, (n,), generator=g)
+    elif kind == "scatter":
+        nb = (n + 63) // 64 + 2
+        slot = distinct_from(g, nb * 128, n)
+    elif (
+        kind == "mtp"
+    ):  # requests of 1..4 tokens, each in its own 16-slot stretch at a random offset
+        lens, tot = [], 0
+        while tot < n:
+            k = int(torch.randint(1, 5, (1,), generator=g))
+            k = min(k, n - tot)
+            lens.append(k)
+            tot += k
+        order = torch.randperm(len(lens), generator=g).tolist()
+        s = []
+        for r, k in zip(order, lens):
+            off = int(torch.randint(0, 16 - k + 1, (1,), generator=g))
+            s += list(range(16 * r + off, 16 * r + off + k))
+        slot = torch.tensor(s)
+        nb = (16 * len(lens)) // 128 + 2
+    elif (
+        kind == "shared"
+    ):  # octets split between runs that sit far apart in token order
+        no = (n + 3) // 3 + 4
+        runs = []
+        for o in range(no):
+            a = int(torch.randint(1, 8, (1,), generator=g))
+            b = int(torch.randint(a, 9, (1,), generator=g))
+            for lo, hi in ((0, a), (a, b), (b, 8)):
+                if hi > lo:
+                    runs.append(list(range(o * 8 + lo, o * 8 + hi)))
+        perm = torch.randperm(len(runs), generator=g).tolist()
+        s = []
+        for i in perm:
+            s += runs[i]
+            if len(s) >= n:
+                break
+        slot = torch.tensor(s[:n])
+        nb = no // 16 + 2
+        if slot.numel() < n:
+            raise RuntimeError("shared: too few slots")
+    elif kind == "rev":
+        st = gi(128)[0]
+        slot = torch.arange(st + n - 1, st - 1, -1)
+        nb = (st + n + 127) // 128 + 1
+    elif kind == "gap2":
+        st = gi(128)[0]
+        slot = st + 2 * torch.arange(n)
+        nb = (st + 2 * n + 127) // 128 + 1
+    elif (
+        kind == "chunks"
+    ):  # runs of random length 1..40 with random jumps, ascending slots
+        s, cur = [], gi(60)[0]
+        while len(s) < n:
+            ln = int(torch.randint(1, 41, (1,), generator=g))
+            s += list(range(cur, cur + ln))
+            cur += ln + int(torch.randint(1, 30, (1,), generator=g))
+        slot = torch.tensor(s[:n])
+        nb = (cur + 127) // 128 + 1
+    else:
+        raise ValueError(kind)
+    nb = max(nb, int(slot.max()) // 128 + 2)
+    islot = slot.clone()
+    if kind in ("multi", "chunks"):
+        islot[torch.rand(n, generator=g) < 0.2] = -1
+    return slot.to(torch.int64), islot.to(torch.int64), nb
+
+
+KINDS = [
+    "contig",
+    "aligned",
+    "multi",
+    "pad",
+    "padmid",
+    "sparse",
+    "scatter",
+    "mtp",
+    "shared",
+    "rev",
+    "gap2",
+    "chunks",
+]
+
+
+def make(n, kind, seed):
+    g = torch.Generator().manual_seed(seed * 1000 + n)
+    gd = torch.Generator(device=dev).manual_seed(seed * 1000 + n)
+    qkv = (torch.randn(n, ROW, generator=gd, device=dev) * 2).bfloat16()
+    if seed % 3 == 1:
+        qkv = (
+            qkv.float() * torch.exp(torch.randn(n, 1, generator=gd, device=dev) * 2)
+        ).bfloat16()
+    w = [(torch.randn(D, generator=gd, device=dev) * 0.2).bfloat16() for _ in range(4)]
+    ang = torch.rand(max(2 * n, 4096), ROT // 2, generator=gd, device=dev) * 6.28
+    cs = torch.cat([ang.cos(), ang.sin()], -1).bfloat16().contiguous()
+    pos = torch.randint(0, cs.shape[0], (n,), generator=gd, device=dev)
+    slot, islot, nb = make_slots(kind, n, g)
+    kv = torch.randint(
+        0, 255, (nb, 2 * NKV * PAGE), generator=gd, dtype=torch.uint8, device=dev
+    )
+    idx = torch.randint(0, 255, (nb, PAGE), generator=gd, dtype=torch.uint8, device=dev)
+    ks = torch.tensor([0.05 + 0.01 * (seed % 5)], device=dev)
+    vs = torch.tensor([0.03 + 0.01 * (seed % 7)], device=dev)
+    return dict(
+        qkv=qkv,
+        w=w,
+        cs=cs,
+        pos=pos,
+        slot=slot.to(dev),
+        islot=islot.to(dev),
+        kv=kv,
+        idx=idx,
+        ks=ks,
+        vs=vs,
+    )
+
+
+def run(c, n):
+    from aiter.ops import fused_qknorm_idxrqknorm as op
+
+    kv, idx = c["kv"].clone(), c["idx"].clone()
+    q = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
+    iq = torch.zeros(n, NIQ * D, dtype=torch.float8_e4m3fn, device=dev)
+    op.fused_qknorm_idxrqknorm(
+        c["qkv"], c["w"][0], c["w"][1], c["cs"], c["pos"], NQ, NKV, ROT, EPS, c["w"][2], c["w"][3], NIQ,
+        c["slot"], kv, kv, idx, 128, q, iq, c["islot"], kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4",
+        k_scale=c["ks"], v_scale=c["vs"], asm_layout=False, skip_index_branch=False,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    return dict(kv=kv, idx=idx, q=q, iq=iq.view(torch.uint8))
+
+
+def dig(t):
+    return hashlib.sha256(
+        t.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    ).hexdigest()[:16]
+
+
+def child(args):
+    res = {}
+    for n in args.n:
+        for kind in args.kinds:
+            for seed in range(args.seeds):
+                try:
+                    c = make(n, kind, seed)
+                except (
+                    RuntimeError
+                ):  # the pattern needs more slots than it can make for this n
+                    continue
+                res[f"{n}/{kind}/{seed}"] = {k: dig(v) for k, v in run(c, n).items()}
+    json.dump(res, open(args.child, "w"))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--child", default=None, help="(internal) write the digests to this file"
+    )
+    ap.add_argument(
+        "-n",
+        type=int,
+        nargs="*",
+        default=[
+            2,
+            7,
+            9,
+            300,
+            489,
+            512,
+            1023,
+            1025,
+            1537,
+            2048,
+            6143,
+            6145,
+            8192,
+            24577,
+            32768,
+        ],
+    )
+    ap.add_argument("--kinds", nargs="*", default=KINDS)
+    ap.add_argument("--seeds", type=int, default=2)
+    args = ap.parse_args()
+    if args.child:
+        child(args)
+        return
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        print("the NVFP4 prefill insert is gfx950 only: skipping")
+        return
+    out = {}
+    for tag, floor in (("generic", "999999999"), ("prefill", "2")):
+        path = os.path.join(tempfile.mkdtemp(), tag + ".json")
+        env = dict(os.environ, AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS=floor)
+        cmd = [
+            sys.executable,
+            __file__,
+            "--child",
+            path,
+            "-n",
+            *map(str, args.n),
+            "--kinds",
+            *args.kinds,
+            "--seeds",
+            str(args.seeds),
+        ]
+        subprocess.run(cmd, env=env, check=True)
+        out[tag] = json.load(open(path))
+    bad = [k for k in out["generic"] if out["generic"][k] != out["prefill"][k]]
+    for k in bad:
+        print(
+            "DIFF",
+            k,
+            {
+                b: out["generic"][k][b] == out["prefill"][k][b]
+                for b in out["generic"][k]
+            },
+        )
+    print(f"compared {len(out['generic'])} cases, {len(bad)} differ")
+    assert not bad, "the prefill insert differs from the generic kernel"
+
+
+if __name__ == "__main__":
+    main()
