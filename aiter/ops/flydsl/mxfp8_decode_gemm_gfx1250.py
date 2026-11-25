@@ -24,8 +24,11 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 # validate_k3.py). 16 K-waves of one K step each put every weight load of a
 # workgroup in flight at once; non-temporal weight loads (wcpol 1); the activation
 # by TDM (atdm 1). Past 128 rows the tuned GEMM is as fast and keeps the call.
+# Up to 16 rows: 16-row tiles of 32 columns (192 workgroups): -0.3..-0.55 us a
+# call against the 32-row x 48-column tiles (same K order, same bytes).
 _TABLE = {
     (6144, 2048): [
+        (16, (16, 2, 1, 16, 1, 1, 1, 1)),
         (64, (32, 3, 1, 16, 1, 1, 1, 1)),
         (128, (32, 6, 1, 16, 1, 1, 1, 1)),
     ],
