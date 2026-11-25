@@ -68,13 +68,13 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     upload_ints,
     wait_for_upload,
 )
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     chunk_index_pairs,
     seq_bounds,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
@@ -1151,10 +1151,14 @@ def _build_metadata(
     )
 
 
-_prepare_fast = fast_launch(_flash_kda_prepare_kernel)
-_segment_fast = fast_launch(_flash_kda_segment_kernel)
-_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel)
-_seg_scan_prefetch_fast = fast_launch(_flash_kda_seg_scan_prefetch_kernel)
+# key_shapes=False: the heuristics of these kernels only test arguments for
+# None, and their autotune keys hold ints, bools and dtypes, not shapes.
+_prepare_fast = fast_launch(_flash_kda_prepare_kernel, key_shapes=False)
+_segment_fast = fast_launch(_flash_kda_segment_kernel, key_shapes=False)
+_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel, key_shapes=False)
+_seg_scan_prefetch_fast = fast_launch(
+    _flash_kda_seg_scan_prefetch_kernel, key_shapes=False
+)
 
 
 def _check_paged_state_cache(

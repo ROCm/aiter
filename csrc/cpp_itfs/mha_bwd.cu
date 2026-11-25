@@ -386,8 +386,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
-    // gfx950 hd256: non-causal only, no GQA/MQA
-    if(arch_id == "gfx950" && a.hdim_q == 256 && (mt != 0 || a.nhead_q != a.nhead_k))
+    // gfx950 hd256: non-causal and bottom-right causal only
+    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0 && mt != 2)
     {
         return -1;
     }
@@ -622,6 +622,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dq_acc_ptr = a.workspace_alloc(dq_acc_bytes, /*zero_init=*/true);
     }
 
+    uint32_t gqa_ratio = a.nhead_q/a.nhead_k;
+    uint32_t gqa_ratio_magic_const = gqa_ratio > 1 ? (uint32_t)(((1ULL << 32) + gqa_ratio - 1) / gqa_ratio) : 0;
+
     fmha_bwd_dqdkdv_args dqdkdv_args{};
     dqdkdv_args.ptr_dq     = need_post_processing ? dq_acc_ptr : a.dq_ptr;
     dqdkdv_args.ptr_dk     = a.dk_ptr;
@@ -634,7 +637,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.ptr_d      = a.d_ptr;
     dqdkdv_args.scalar     = a.scale;
     dqdkdv_args.log2e      = ck_tile::log2e_v<float>;
-    dqdkdv_args.ratio      = a.nhead_q / a.nhead_k;
+    dqdkdv_args.ratio      = gqa_ratio;
     dqdkdv_args.seqlen_q   = a.seqlen_q;
     dqdkdv_args.seqlen_k   = a.is_group_mode ? a.max_seqlen_k : a.seqlen_k;
     dqdkdv_args.head_dim_q = a.hdim_q;
@@ -660,6 +663,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.BAs_dv     = a.batch_stride_dv * 2;
     dqdkdv_args.Seqs_dv    = a.stride_dv * 2;
     dqdkdv_args.Hs_lsed    = a.nhead_stride_lsed * 4;
+    dqdkdv_args.gqa_ratio_magic_const = gqa_ratio_magic_const;
 
     if(a.cu_seqlen_k_ptr && a.seqstart_k_ptr)
     {
@@ -743,7 +747,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         { // each workgroup walks its own share of the kv blocks
             gdx = nsplit;
         }
-        else if((mt == 1) || (mt == 2))
+        else if(((mt == 1) || (mt == 2)) && !(arch_id == "gfx950" && a.hdim_q == 256))
         { // mask kb
             gdx = (gdx + 1) / 2;
         }
