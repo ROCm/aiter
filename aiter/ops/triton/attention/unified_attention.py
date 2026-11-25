@@ -220,7 +220,9 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
     # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
     force_fp8_pv_on_fp4_kv_cache: bool = False
-    # keys a KV segment covers at least, from each sequence's live length (0: no floor)
+    # host-side split cap: no more segments than max_seqlen_k fills at this many
+    # keys (0: no cap). Under CUDA graphs max_seqlen_k is the capture bound, so
+    # the cap does not follow the live length at replay
     min_segment_keys: int = 0
 
 
@@ -312,6 +314,24 @@ def _gfx950_one_block_segment_keys(config: dict, prgms: int, num_sms: int) -> in
     keys = min_keys * min(prgms, full) // full
     keys = 1 << max(keys, 1).bit_length() - 1
     return max(min(lo_keys, min_keys), keys)
+
+
+def _gfx950_one_block_num_segments(
+    num_segments: int, max_seqlen_k: int, min_keys: int, tile_size: int
+) -> int:
+    """The most of num_segments, halving, that keeps every segment of a
+    max_seqlen_k sequence at min_keys or more.
+
+    The kernel cuts a sequence into segments of cdiv(seq_len, n * tile_size) tiles,
+    and the last segment takes the rest, so that one is checked.
+    """
+    n = min(num_segments, 1 << max(1, max_seqlen_k // min_keys).bit_length() - 1)
+    while n > 1:
+        segment = triton.cdiv(max_seqlen_k, n * tile_size) * tile_size
+        if max_seqlen_k - (n - 1) * segment >= min_keys:
+            break
+        n //= 2
+    return n
 
 
 def _gfx950_split_params(params: _UAParams):
@@ -805,11 +825,11 @@ def unified_attention(
         # reduce_segments' epilogue: both keep the split as is
         if split_params.min_segment_keys and not skip_reduce and output_rows is None:
             # no more segments than the longest sequence fills at the floor
-            NUM_SEGMENTS = min(
+            NUM_SEGMENTS = _gfx950_one_block_num_segments(
                 NUM_SEGMENTS,
-                triton.next_power_of_2(
-                    triton.cdiv(int(params.max_seqlen_k), split_params.min_segment_keys)
-                ),
+                int(params.max_seqlen_k),
+                split_params.min_segment_keys,
+                TILE_SIZE,
             )
 
         if NUM_SEGMENTS > 1:

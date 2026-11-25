@@ -2897,6 +2897,10 @@ def test_triton_unified_attn_one_q_block(
         (64, 8192, 4),
         # at 2048 keys one segment holds the whole sequence: no split
         (64, 2048, 1),
+        # at 2049 keys two segments would be 1088 and 961 keys, under the floor
+        (64, 2049, 1),
+        # at 8191 keys four segments would leave the last 2047 keys, so two
+        (64, 8191, 2),
         # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
         # so it is kept. Counting the one-block grid (16 programs) as well would give
         # 32 segments instead of 8.
@@ -2964,6 +2968,35 @@ def test_triton_unified_attn_one_q_block_split_grid_gate(
     grid, one_q_block, launched_splits = launches[0]
     assert one_q_block, "short batch did not take the one-query-block launch"
     assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+
+
+@pytest.mark.parametrize(
+    "num_segments, max_seqlen_k, min_keys, tile_size, want",
+    [
+        (4, 8192, 2048, 64, 4),
+        (4, 2048, 2048, 64, 1),
+        # 1088 + 961 keys
+        (4, 2049, 2048, 64, 1),
+        # four segments leave 2047 keys in the last; two leave 4095
+        (4, 8191, 2048, 64, 2),
+        # 6144 keys fill three segments, rounded down to two
+        (8, 6144, 2048, 64, 2),
+        # the table's count still bounds it
+        (2, 65536, 512, 64, 2),
+        (4, 100, 4096, 64, 1),
+    ],
+)
+def test_gfx950_one_block_num_segments(
+    num_segments, max_seqlen_k, min_keys, tile_size, want
+):
+    """Every tile-aligned segment of the longest sequence keeps the floor."""
+    module = sys.modules[unified_attention.__module__]
+    n = module._gfx950_one_block_num_segments(
+        num_segments, max_seqlen_k, min_keys, tile_size
+    )
+    assert n == want
+    segment = -(-max_seqlen_k // (n * tile_size)) * tile_size
+    assert n == 1 or max_seqlen_k - (n - 1) * segment >= min_keys
 
 
 class _TritonLaunchSpy:
