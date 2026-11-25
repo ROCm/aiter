@@ -415,8 +415,12 @@ def _compile_and_keep(exe, *args):
     return _compile_and_run(exe, *args)
 
 
-def _preload_compiled(exe, *args):
+def _preload_compiled(exe, *args, specialization_key=None):
     """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    ``specialization_key``: the one the launcher is launched with
+    (``_run_compiled``), so that a launcher bound to the AOT cache is
+    preloaded under the key its launches look up.
 
     Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
     Older supported versions provide the same no-dispatch behavior through the
@@ -433,11 +437,11 @@ def _preload_compiled(exe, *args):
         if _aot_prebuilding():
             # Builds the entry and runs FlyDSL's compile-only launch, which
             # returns None, as flyc.compile does under COMPILE_ONLY.
-            _run_compiled(exe, *args)
+            _run_compiled(exe, *args, specialization_key=specialization_key)
             return None
         from ..aot_launch import preload_bound
 
-        loaded = preload_bound(exe, args)
+        loaded = preload_bound(exe, args, specialization_key)
         if loaded is not None:
             return loaded
         # A factory.lazy() handle is no launcher: build it.

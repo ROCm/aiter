@@ -229,10 +229,11 @@ def preload_bound(exe, args, specialization_key=None):
 
     Returns the loaded function, which takes the launcher's arguments (a
     torch stream too); later launches of the key through ``_run_compiled``
-    use it as well. None if ``exe`` is not bound, under ``COMPILE_ONLY`` (a
-    prebuild builds entries by launching: ``_run_compiled``), or when the
-    key has no entry: the cache then logs one error and the key takes the
-    JIT path, where the caller preloads or compiles it.
+    use it as well. None if ``exe`` is not bound, in a prebuild (which builds
+    entries by launching: ``_run_compiled``), while ``COMPILE_ONLY`` is on
+    for another reason (a preload of another thread: nothing is loaded
+    then), or when the key has no entry: the cache then logs one error and
+    the key takes the JIT path, where the caller preloads or compiles it.
     """
     binding = getattr(exe, _ATTR, None)
     if not binding or _prebuilding():
