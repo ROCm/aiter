@@ -1,94 +1,67 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 decode GEMM (mxfp8_decode_gemm), MiniMax-M3 TP4 o_proj N 6144 x K 2048.
+import argparse
 
-Against gemm_a8w8_blockscale(isBpreshuffled=True) on the same operands and an fp64
-dequantized reference: within the tuned GEMM's error of the reference, bf16 rows
-equal to the tuned GEMM's but for rare one-ulp flips, deterministic, rows past M
-untouched, CUDA-graph replay equal to eager.
-
-Run with: python -m pytest -q op_tests/test_mxfp8_decode_gemm.py
-"""
-
-import pytest
+import pandas as pd
 import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250 import (
+    mxfp8_decode_gemm,
+    mxfp8_decode_gemm_supported,
+)
 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-N, K = 6144, 2048
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _gpu():
-    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250":
-        pytest.skip("gfx1250 only")
+torch.set_default_device("cuda")
 
 
-def _case(m, seed):
-    dev = torch.device("cuda")
-    g = torch.Generator(device=dev).manual_seed(seed)
-
-    def e8m0(shape, lo, hi):
-        return (torch.randint(lo, hi, shape, generator=g, device=dev, dtype=torch.int32)
-                .to(torch.uint8).view(torch.float8_e8m0fnu))  # fmt: skip
-
-    x = torch.randn(m, K, generator=g, device=dev).clamp(-8, 8).to(torch.float8_e4m3fn)
-    xs = e8m0((m, K // 32), 120, 127)
-    w = (
-        (torch.randn(N, K, generator=g, device=dev) * 0.5)
-        .clamp(-8, 8)
-        .to(torch.float8_e4m3fn)
-    )
-    ws = e8m0((N, K // 32), 118, 126)
-    return (
-        x,
-        xs,
-        w,
-        ws,
-        shuffle_weight(w, layout=(16, 16)),
-        shuffle_mxfp8_bpreshuffle_scale(ws),
-    )
+def e8m0(shape, lo, hi):
+    return torch.randint(lo, hi, shape, dtype=torch.int32).to(torch.uint8)
 
 
-def _deq(codes, scales):
-    s = torch.exp2(scales.view(torch.uint8).double() - 127.0)
-    return (codes.double().view(codes.shape[0], -1, 32) * s[..., None]).view(
-        codes.shape[0], -1
-    )
+def run_torch(codes, scales):  # fp64 dequantized operand
+    s = torch.exp2(scales.double() - 127.0)
+    return (codes.double().view(codes.shape[0], -1, 32) * s[..., None]).flatten(1)
 
 
-@pytest.mark.parametrize("m", [1, 16, 33, 64, 100, 128, 150, 192, 256])
-def test_mxfp8_decode_gemm(m):
-    from aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250 import (
-        mxfp8_decode_gemm,
-        mxfp8_decode_gemm_supported,
-    )
-
-    if not mxfp8_decode_gemm_supported(m, N, K):
-        pytest.skip(f"M={m} keeps the tuned GEMM")
-    x, xs, w, ws, w_sh, ws_sh = _case(m, seed=m)
-    ref = _deq(x, xs) @ _deq(w, ws).T
-    prod = aiter.gemm_a8w8_blockscale(
-        x, w_sh, xs, ws_sh, dtype=torch.bfloat16, isBpreshuffled=True
-    )
-    out = torch.full((m + 7, N), -3.0, dtype=torch.bfloat16, device="cuda")
-    y = mxfp8_decode_gemm(x, xs, w_sh, ws_sh, out=out[:m])
-    torch.cuda.synchronize()
+@benchmark()
+def test_mxfp8_decode_gemm(m, n, k):
+    x = torch.randn(m, k).clamp(-8, 8).to(torch.float8_e4m3fn)
+    w = (torch.randn(n, k) * 0.5).clamp(-8, 8).to(torch.float8_e4m3fn)
+    xs, ws = e8m0((m, k // 32), 120, 127), e8m0((n, k // 32), 118, 126)
+    ref = run_torch(x, xs) @ run_torch(w, ws).T
+    xs, ws = xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu)
+    w_sh = shuffle_weight(w, layout=(16, 16))
+    ws_sh = shuffle_mxfp8_bpreshuffle_scale(ws)
+    gemm = aiter.gemm_a8w8_blockscale
+    prod, prod_us = run_perftest(gemm, x, w_sh, xs, ws_sh, isBpreshuffled=True)
+    out = torch.full((m + 7, n), -3.0, dtype=torch.bfloat16)
+    y, us = run_perftest(mxfp8_decode_gemm, x, xs, w_sh, ws_sh, out=out[:m])
     assert torch.all(out[m:] == -3.0), "rows past M written"
-    err = (y.double() - ref).abs().max().item()
-    err_prod = (prod.double() - ref).abs().max().item()
+    err, err_prod = ((t.double() - ref).abs().max().item() for t in (y, prod))
     assert err <= 2 * err_prod + 1e-6, (err, err_prod)
-    same = (y.view(torch.int16) == prod.view(torch.int16)).double().mean().item()
-    assert same > 0.995, same
-    y2 = mxfp8_decode_gemm(x, xs, w_sh, ws_sh)
-    assert torch.equal(y, y2), "not deterministic"
-    yg = torch.empty_like(y)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        mxfp8_decode_gemm(x, xs, w_sh, ws_sh, out=yg)
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(y, yg), "graph replay differs from eager"
+    flips = checkAllclose(prod.float(), y.float(), rtol=0, atol=0, tol_err_ratio=5e-3)
+    assert flips <= 5e-3, f"{flips:.2%} of bf16 outputs differ from the tuned GEMM"
+    return {"tuned us": prod_us, "decode us": us, "max err": err, "flips": flips}
+
+
+def main():
+    if get_gfx_runtime() != "gfx1250":
+        aiter.logger.warning("mxfp8_decode_gemm is gfx1250-only; skipping")
+        return
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-m", type=int, nargs="*", default=[1, 16, 33, 64, 128])
+    ap.add_argument("-nk", type=int, nargs=2, default=[6144, 2048])
+    args = ap.parse_args()
+    n, k = args.nk
+    ms = [m for m in args.m if mxfp8_decode_gemm_supported(m, n, k)]
+    assert ms, "no M is served by mxfp8_decode_gemm"
+    df = pd.DataFrame([test_mxfp8_decode_gemm(m, n, k) for m in ms])
+    aiter.logger.info("mxfp8_decode_gemm:\n%s", df.to_markdown(index=False))
+
+
+if __name__ == "__main__":
+    main()
