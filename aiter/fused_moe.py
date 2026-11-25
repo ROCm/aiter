@@ -3875,6 +3875,7 @@ def _mxfp4_a4w4_stage1(
         num_waves=num_waves,
         k_wave=k_wave,
         ep32=_p1.get("ep32", False),
+        occ2=_p1.get("occ2", False),
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 

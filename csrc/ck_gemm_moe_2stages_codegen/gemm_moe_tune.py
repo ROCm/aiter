@@ -7837,9 +7837,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         num_waves=4,
         a_dtype="fp4",
         out_dtype="fp4",
+        occ2=False,
     ):
         # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
-        #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
+        #   [_situv2|_swiglu][_occ2][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
         if prefetch_hidden and not inline_quant:
             raise ValueError("hidden prefetch requires inline quantization")
@@ -7857,6 +7858,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             name += "_situv2"
         elif act == "swiglu":
             name += "_swiglu"
+        if occ2:
+            name += "_occ2"
         if k_wave > 1:
             name += f"_kw{int(k_wave)}"
         if xcd_swizzle:
@@ -7929,7 +7932,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     for k_wave in self._G1_K_WAVE:
                         # Hidden prefetch hoists the next K-tile's hidden_states
                         # load, which only the inline-quant path performs.
-                        for hpf in (False, True) if inline_quant else (False,):
+                        # occ2 (two workgroups per CU) exists for BM128 FP8 only;
+                        # _assert_supported rejects the shapes it cannot serve.
+                        hpf_occ2 = [
+                            (hpf, False)
+                            for hpf in ((False, True) if inline_quant else (False,))
+                        ]
+                        if bm == 128 and a_dtype == "fp8":
+                            hpf_occ2.append((False, True))
+                        for hpf, occ2 in hpf_occ2:
                             for xcd in self._G1_XCD_SWIZZLE:
                                 try:
                                     _assert_supported(
@@ -7949,6 +7960,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         num_waves=num_waves,
                                         k_wave=k_wave,
                                         native_scale_layout=bm == 16,
+                                        occ2=occ2,
                                     )
                                 except NotImplementedError:
                                     continue
@@ -7966,6 +7978,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         "num_waves": num_waves,
                                         "a_dtype": a_dtype,
                                         "out_dtype": a_dtype,
+                                        "occ2": occ2,
                                     }
                                 )
         # The M_est rules hand M_est < 4 to BM16 only, which A8W4 skips above.
@@ -8668,6 +8681,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             xcd_swizzle=cfg["xcd_swizzle"],
             num_waves=cfg["num_waves"],
             k_wave=cfg["k_wave"],
+            occ2=cfg.get("occ2", False),
             interleave=cfg["a_dtype"] == "fp8",
             a_dtype=cfg["a_dtype"],
             out_dtype=cfg["out_dtype"],

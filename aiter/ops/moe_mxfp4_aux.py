@@ -77,6 +77,8 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (256, 6144, 3072, 6),
         (384, 6144, 2048, 8),
         (288, 4096, 2048, 8),
+        (576, 2048, 2048, 16),
+        (576, 2048, 256, 16),
     }
 )
 _MXFP4_MOE_SCATTER_KEYS = frozenset(

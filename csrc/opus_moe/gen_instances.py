@@ -238,11 +238,16 @@ def _emit_stage2_a8w4_meta_header() -> str:
     lines.append(
         "\n#define GENERATE_OPUS_MOE_STAGE2_A8W4_ROUTE_REDUCE_DISPATCH_CASES(TOPK) \\\n"
     )
-    for idx, inst in enumerate(OPUS_A8W4_ROUTE_REDUCE_INSTANCES):
+    # 2048 and 4096 already have fixed cases in the block_n switch (same
+    # 256-thread launch); a second case label would not compile.
+    dispatch_insts = [
+        inst
+        for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES
+        if (int(inst.block_n), int(inst.threads)) not in ((2048, 256), (4096, 256))
+    ]
+    for idx, inst in enumerate(dispatch_insts):
         suffix = _cpp_name_suffix(inst.name)
-        line_suffix = (
-            " \\\n" if idx != len(OPUS_A8W4_ROUTE_REDUCE_INSTANCES) - 1 else "\n"
-        )
+        line_suffix = " \\\n" if idx != len(dispatch_insts) - 1 else "\n"
         lines.append(
             f"    case opus_moe::kStage2A8W4RouteReduce{suffix}BlockN: "
             "opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<"

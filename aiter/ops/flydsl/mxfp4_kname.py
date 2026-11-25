@@ -19,6 +19,7 @@ _MXMOE_G1_FLAG_TOKENS = {
     "W2",
     "W12",
     "EP32",
+    "OCC2",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -37,7 +38,9 @@ MXFP4_G1_VARIANTS = {
     "fp8": {
         (32, True, False),
         (32, False, False),
+        (64, True, False),
         (64, False, False),
+        (128, True, False),
         (128, False, False),
         (16, True, True),
     },
@@ -132,6 +135,8 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "k_wave": nums.get("k_wave", 1),
         # Dedicated EP32 A8W4 GEMM1 (kernels/mxfp4_gemm1_ep32.py).
         "ep32": "EP32" in flags,
+        # Two-workgroups-per-CU BM128 FP8 pipeline (kernels/mxfp4_gemm1.py).
+        "occ2": "OCC2" in flags,
     }
 
 
