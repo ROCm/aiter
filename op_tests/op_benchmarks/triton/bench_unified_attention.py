@@ -380,10 +380,7 @@ def _make_unified_attention_fn(
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
-    Argument names match a rotating-buffer pool entry's keys (``**_``
-    absorbs the ones the kernel call does not need). A nonzero max_sk raises
-    max_seqlen_k to that bound, as a CUDA-graph caller passes it (vLLM captures
-    with max_model_len); the real lengths stay in seqused_k.
+    A nonzero max_sk raises max_seqlen_k to that bound, as a CUDA-graph caller passes it.
     """
 
     def kernel_fn(
