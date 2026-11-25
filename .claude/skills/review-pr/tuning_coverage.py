@@ -315,11 +315,15 @@ class Scan:
             "UNTUNED_REMOVED_TUNED_KEPT", f"{pair}: {len(removed_untuned)} removed "
             "untuned workloads still have tuned rows", removed_untuned, cols, "untuned", own)
         if not n:
-            counts = (len(tk_head - tk_base), len(tk_base - tk_head),
-                     len(uk_head - uk_base), len(uk_base - uk_head))
+            # Rows count per GPU (a new gfx942 row for a shape tuned on gfx950 is a
+            # new row but not a new workload), so a per-arch PR does not read as +0.
+            head_ids = keys(head_t, ident)
+            counts = (len(head_ids - base_ids), len(base_ids - head_ids),
+                      len(tk_head - tk_base), len(tk_base - tk_head),
+                      len(uk_head - uk_base), len(uk_base - uk_head))
             self.out.append(
-                f"CHECKED {pair}: "
-                "tuned +{}/-{}, untuned +{}/-{} workloads, all matched".format(*counts)
+                f"CHECKED {pair}: tuned +{{}}/-{{}} rows (+{{}}/-{{}} workloads), "
+                "untuned +{}/-{} workloads, all matched".format(*counts)
             )
 
     def tuned_rows_changed(self, base_path, head_path):

@@ -138,7 +138,7 @@ class TuningCoverageTest(unittest.TestCase):
         )
         out = self.scan(base, self.commit("swap a workload"))
         self.assertIn("CHECKED", out)
-        self.assertIn("tuned +1/-1, untuned +1/-1", out)
+        self.assertIn("tuned +1/-1 rows (+1/-1 workloads), untuned +1/-1 workloads", out)
         self.assertIn("[key: M, N, K, bias]", out)
 
     # -- hints, pairing and what is deliberately not checked ---------------------
@@ -261,6 +261,15 @@ class TuningCoverageTest(unittest.TestCase):
         self.assertNotIn("UNTUNED_NOT_IN_TUNED", out)
         self.assertNotIn('"M": "5"', out)
         self.assertIn(f"<-> {CFG}/untuned_bf16_gemm.csv", out)
+
+    def test_per_gpu_rows_for_existing_shapes_are_counted(self):
+        self.gemm_pair(["1,2,3,False" + chr(10)], ["gfx950,256,1,2,3,False,k,4" + chr(10)])
+        base = self.commit("gfx950 only")
+        self.gemm_pair(["1,2,3,False" + chr(10)],
+                       ["gfx950,256,1,2,3,False,k,4" + chr(10),
+                        "gfx942,304,1,2,3,False,k,5" + chr(10)])
+        out = self.scan(base, self.commit("add gfx942 row"))
+        self.assertIn("tuned +1/-0 rows (+0/-0 workloads), untuned +0/-0 workloads", out)
 
     def test_new_hardware_column_does_not_make_legacy_rows_new(self):
         self.write(f"{CFG}/bf16_untuned_gemm.csv", GEMM_IN + "1,2,3,False\n")
