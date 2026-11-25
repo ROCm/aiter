@@ -8,6 +8,29 @@ import functools
 import os
 import re
 
+# Legacy CSVs without gfx were historically tuned on these architectures.
+_LEGACY_CU_NUM_TO_GFX = {256: "gfx950", 80: "gfx942", 228: "gfx942", 304: "gfx942"}
+
+
+def gfx_from_cu_num(cu_num, runtime_gfx=None) -> str:
+    """Backfill legacy gfx; runtime callers may supply their device fallback."""
+    try:
+        cu_num = int(cu_num)
+    except (TypeError, ValueError):
+        if runtime_gfx is not None:
+            return runtime_gfx()
+        raise ValueError("legacy row needs an explicit gfx column") from None
+    gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
+    if gfx is not None:
+        return gfx
+    if runtime_gfx is None:
+        raise ValueError("legacy row needs an explicit gfx column")
+    try:
+        return runtime_gfx()
+    except Exception:  # noqa: BLE001
+        return "gfx942"
+
+
 GFX_MAP = {
     0: "native",
     1: "gfx90a",

@@ -1,5 +1,35 @@
 # MXFP4 tuning selection validation
 
+## Current merge-target compatibility (2026-11-25)
+
+The current baseline is the merged main revision
+`162173e89c8b058901625bc7dd518fb9cf6f1438`. Its default has 3,011 keys,
+including 184 Qwen3-235B gfx950/128-CU keys added since the historical audit
+below. The default manifest now includes that table. Tests derive the expected
+sources from the checkout's model tree, excluding the opt-in profile tables.
+
+`audit_merge_target.py` compares every key and executes the production
+`get_GEMM_config` function with pandas and substituted gfx/CU metadata: all
+3,011 exact queries match, including all 375 gfx950/128-CU queries. Two legacy
+256-CU-only checks retain their old selection on gfx950 and gfx1250 metadata.
+This audit does not execute GPU kernels or revalidate padded-M selection.
+See `merge_target_results.json` for the source list and counts.
+
+```bash
+python docs/mxfp4_tuning_validation/audit_merge_target.py --baseline-ref 162173e89 --output docs/mxfp4_tuning_validation/merge_target_results.json
+```
+
+The historical GPU and padded-M results below refer to their recorded baseline,
+not the newer merge target. Pure legacy source lists retain a CSV without gfx;
+mixed schemas use the shared stdlib CU-to-gfx backfill also used by chip_info.
+
+This revision passed 25 stdlib configuration tests and 19 CSV tests (44 total,
+53 subtests); 35 collision tests were skipped because PyTorch is unavailable
+in the local environment. Six existing offline build-target tests also passed
+with the stdlib module loaded independently (13 subtests). The broader
+core-dependent architecture suite could not run in this environment. Ruff and
+Black passed for all 10 Python files changed by the PR.
+
 This report compares the default configuration before PR #7538 with the corrected
 default and the opt-in Qwen3 FSDP profile. No kernel code or source CSV was changed.
 

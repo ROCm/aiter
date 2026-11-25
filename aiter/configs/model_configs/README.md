@@ -61,8 +61,8 @@ is consumed by `aiter.utility.mxfp4_tuning`:
 | qwen3_fsdp | qwen3_8b + qwen3_small, in that order | 21 |
 
 The default source list is `aiter/configs/mxfp4_default_sources.json`: the stock
-table plus the seven existing DeepSeek V3, Gemma4 31B, Kimi K3, narrow-N,
-Qwen3 VL, Qwen3.8 27B and Qwen3.8 2.4T tables. It preserves their tuned coverage
+table plus the eight existing DeepSeek V3, Gemma4 31B, Kimi K3, narrow-N,
+Qwen3 VL, Qwen3.8 27B, Qwen3.8 2.4T and Qwen3-235B tables. It preserves their tuned coverage
 without scanning the directory. New model tables must be selected by profile
 or added to this default list after checking key conflicts.
 

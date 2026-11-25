@@ -52,21 +52,20 @@ class TestMXFP4TuningConfig(unittest.TestCase):
             return list(csv.DictReader(stream))
 
     def default_rows(self):
-        names = (
-            "dsv3",
-            "gemma4_31b",
-            "kimik3",
-            "narrow_n",
-            "q3vl",
-            "qwen38_27b",
-            "qwen38_2p4t",
-        )
+        profile_paths = {
+            Path(path)
+            for profile in self.api.available_mxfp4_profiles()
+            for path in self.api._profile_sources(profile)
+        }
         paths = [self.api._CONFIG_DIR / "a4w4_blockscale_tuned_gemm.csv"]
         paths.extend(
-            self.api._CONFIG_DIR
-            / "model_configs"
-            / f"{name}_a4w4_blockscale_tuned_gemm.csv"
-            for name in names
+            sorted(
+                path
+                for path in (self.api._CONFIG_DIR / "model_configs").glob(
+                    "*a4w4_blockscale_tuned_gemm*.csv"
+                )
+                if path not in profile_paths and "untuned" not in path.name
+            )
         )
         rows = {}
         for path in paths:
@@ -268,8 +267,31 @@ class TestMXFP4TuningConfig(unittest.TestCase):
         source.write_text("cu_num,M,N,K,kernelName,splitK\n256,32,64,128,legacy,0\n")
         before = source.read_bytes()
         self.api.configure_mxfp4_tuning(tuned_config=source, merge_default=False)
-        self.assertEqual(self.rows()[0]["gfx"], "gfx950")
+        self.assertNotIn("gfx", self.rows()[0])
         self.assertEqual(source.read_bytes(), before)
+
+    def test_mixed_legacy_228_cu_uses_shared_arch_backfill(self):
+        source = self.root / "legacy.csv"
+        source.write_text("cu_num,M,N,K,kernelName,splitK\n228,32,64,128,legacy,0\n")
+        tagged = self.table("tagged.csv", "gfx950,256,32,64,128,new,0,1\n")
+        self.api.configure_mxfp4_tuning(
+            tuned_config=[source, tagged], merge_default=False
+        )
+        self.assertEqual(self.rows()[0]["gfx"], "gfx942")
+
+    def test_shared_legacy_backfill_preserves_runtime_fallback(self):
+        infer = self.api._arch_helpers().gfx_from_cu_num
+        for cu, gfx in (
+            (256, "gfx950"),
+            (80, "gfx942"),
+            (228, "gfx942"),
+            (304, "gfx942"),
+        ):
+            self.assertEqual(infer(cu), gfx)
+        self.assertEqual(infer(128, lambda: "gfx950"), "gfx950")
+        self.assertEqual(infer("invalid", lambda: "gfx1250"), "gfx1250")
+        with self.assertRaisesRegex(ValueError, "explicit gfx"):
+            infer(128)
 
     def test_frozen_sources_report_actual_selection_after_environment_changes(self):
         self.api.configure_mxfp4_tuning(profile="qwen3_8b")

@@ -50,6 +50,17 @@ def _power_helpers():
     return module
 
 
+@functools.lru_cache(maxsize=1)
+def _arch_helpers():
+    # Reuse chip_info's stdlib backfill without importing the AITER package.
+    spec = importlib.util.spec_from_file_location(
+        "_mxfp4_build_targets", Path(__file__).parents[1] / "jit/utils/build_targets.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _power_sources():
     if os.environ.get(_ENV) or not _power_helpers().power_selection_enabled():
         return ()
@@ -202,13 +213,17 @@ def _merged_csv(sources, contents=None):
     power_rows = {}
     if contents is None:
         contents = tuple(Path(source).read_bytes() for source in sources)
+    has_gfx = any(
+        "gfx" in next(csv.reader(io.StringIO(content.decode("utf-8-sig"))), [])
+        for content in contents
+    )
     for source, content in zip(sources, contents):
         with io.StringIO(content.decode("utf-8-sig"), newline="") as stream:
             reader = csv.DictReader(stream)
             missing = set(_REQUIRED) - set(reader.fieldnames or ())
             if missing:
                 raise ValueError(f"{source}: missing tuning columns {sorted(missing)}")
-            for column in ["gfx", *(reader.fieldnames or ())]:
+            for column in (["gfx"] if has_gfx else []) + (reader.fieldnames or []):
                 if column not in columns:
                     columns.append(column)
             local = {}
@@ -223,17 +238,9 @@ def _merged_csv(sources, contents=None):
                     continue
                 if None in row:
                     raise ValueError(f"{source}: malformed tuning row")
-                if not row.get("gfx"):
-                    # These historical CU counts have unambiguous legacy owners.
-                    arch = {256: "gfx950", 80: "gfx942", 304: "gfx942"}.get(
-                        int(row["cu_num"])
-                    )
-                    if arch is None:
-                        raise ValueError(
-                            f"{source}: legacy row needs an explicit gfx column"
-                        )
-                    row["gfx"] = arch
-                key = (row["gfx"], *(int(row[column]) for column in _KEYS[1:]))
+                if has_gfx and not row.get("gfx"):
+                    row["gfx"] = _arch_helpers().gfx_from_cu_num(row["cu_num"])
+                key = (row.get("gfx", ""), *(int(row[column]) for column in _KEYS[1:]))
                 if any(value <= 0 for value in key[1:]):
                     raise ValueError(f"{source}: non-positive tuning dimensions {key}")
                 if not row["kernelName"] or int(row["splitK"]) < 0:

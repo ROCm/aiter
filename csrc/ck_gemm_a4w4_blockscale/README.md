@@ -22,7 +22,7 @@ You can find the results of the tuning in `aiter/configs/a4w4_blockscale_tuned_g
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_gemm_a4w4_blockscale.py` and run it, please wait a few minutes as it will build gemm_a4w4_blockscale tuned kernels in `aiter/configs/a4w4_blockscale_tuned_gemm.csv` via jit:
 `GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH=/work/llvm-project/build/bin/ python3 op_tests/test_gemm_a4w4_blockscale.py`
-If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a4w4_blockscale.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A4W4`, the default one will be results merged from `aiter/configs/a4w4_blockscale_tuned_gemm.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_a4w4_blockscale_tuned_gemm_xx.csv`, the merged result is store in `/tmp/aiter_configs/a4w4_blockscale_tuned_gemm.csv`
+If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a4w4_blockscale.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A4W4`, the default sources are listed in `aiter/configs/mxfp4_default_sources.json`. The read-only merged CSV is stored at `<tempdir>/aiter_configs/mxfp4/<sha256>.csv` (`/tmp/aiter_configs/mxfp4/<sha256>.csv` on Linux). Use `python -m aiter.utility.mxfp4_tuning --emit path` to obtain the actual path; named model profiles are opt-in
 
 ## More Options
 
