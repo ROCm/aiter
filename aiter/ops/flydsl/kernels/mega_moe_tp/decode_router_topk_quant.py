@@ -112,7 +112,7 @@ def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
         wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         t = pid * NW + wave
         top_m = fx.Int32(0) if const_expr(quant_only) else i32_m
-        if const_expr(not quant_only):
+        if const_expr(not quant_only):  # noqa: SIM102 -- DSL trace-time region
             if t < i32_m:
                 pr = buffer_ops.create_buffer_resource_from_addr(
                     arg_part, num_records_bytes=i64_part_bytes
