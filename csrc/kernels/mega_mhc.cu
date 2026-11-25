@@ -217,8 +217,10 @@ using bf16x8        = opus::vector_t<bf16, 8>;
 using f32x4         = opus::vector_t<float, 4>;
 
 // On gfx950, a packed FP32 op whose low half reads src1's high dword sees zero
-// there in lanes 48..63 while another wave on the same SIMD runs MFMA. Without
-// post, split-tail and body blocks share CUs, so keep their collapse scalar.
+// there in lanes 48..63 while another wave on the same SIMD runs MFMA. That wave
+// can belong to this kernel or to any other kernel or process sharing the GPU,
+// so every collapse stays scalar: vectorizing x * pre[h] pairs the pre-mix
+// coefficients and reads the odd one from the high dword.
 template <bool SCALAR>
 __device__ __forceinline__ float collapse_fma(float x, float w, float acc)
 {
@@ -1494,7 +1496,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = fmaf(static_cast<float>(new_regs[h][e]), pre[c % ROW_GROUPS][h], v);
+                            v = collapse_fma<true>(
+                                static_cast<float>(new_regs[h][e]), pre[c % ROW_GROUPS][h], v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -2202,10 +2205,9 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
-                                static_cast<float>(new_regs[h][e]),
-                                pre[c % 2 + (c / NC) * 2][h],
-                                v);
+                            v = collapse_fma<true>(static_cast<float>(new_regs[h][e]),
+                                                   pre[c % 2 + (c / NC) * 2][h],
+                                                   v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -2639,8 +2641,7 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
-                                static_cast<float>(new_regs[h][e]), pre[h], v);
+                            v = collapse_fma<true>(static_cast<float>(new_regs[h][e]), pre[h], v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
