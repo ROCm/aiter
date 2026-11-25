@@ -48,7 +48,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -93,7 +93,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -138,7 +138,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -183,7 +183,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -228,7 +228,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -273,7 +273,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -318,7 +318,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -363,7 +363,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -408,7 +408,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -453,7 +453,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -498,7 +498,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -543,7 +543,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -588,7 +588,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -633,7 +633,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -678,7 +678,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -723,7 +723,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -768,7 +768,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -813,7 +813,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -858,7 +858,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -903,7 +903,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -948,7 +948,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -993,7 +993,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1038,7 +1038,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1083,7 +1083,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1128,7 +1128,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1173,7 +1173,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1218,7 +1218,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1263,7 +1263,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1308,7 +1308,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1353,7 +1353,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1398,7 +1398,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1443,7 +1443,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1488,7 +1488,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1533,7 +1533,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1578,7 +1578,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1623,7 +1623,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1668,7 +1668,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1713,7 +1713,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1758,7 +1758,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     },
     {
@@ -1803,7 +1803,7 @@
       "build_provenance": {
         "llvm_bin": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
         "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-        "kind": "built by build_co.py --arch gfx950 --kids 56-95"
+        "kind": "built by build_co.py --arch gfx950 --kids 56-95 (kid numbering at build time); metadata-only renumber to --family a8w8_blockscale_mxfp8 --kids 0-39, no rebuild"
       }
     }
   ],

@@ -9,6 +9,7 @@
 # overhead on short BMM kernels.
 
 import re
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -505,6 +506,9 @@ def _mxfp8_direction(XQ: Tensor, WQ: Tensor) -> str | None:
     return a + b
 
 
+# Scalar-only key, as _get_cached_a16w16_launch_plan: the pick filters the registry
+# (one CO image stat per kid), which costs more than a small GEMM if redone per call.
+@lru_cache(maxsize=256)
 def _select_mxfp8_direction_kid(
     direction: str, M: int, N: int, K: int, arch: str, cu_num: int
 ) -> int | None:

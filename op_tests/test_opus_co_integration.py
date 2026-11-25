@@ -243,7 +243,9 @@ def test_gfx950_mxscale_co_accepts_supported_shape(kid, shape, _gfx950_device):
 # shipped kid: NT 0-9, NN 10-19, TT 20-29, TN 30-39.
 # 256x256 crosses the 64-column scale panel (K / 128 = 65), PadM takes
 # M % 16 == 0, 256x128 takes N an odd multiple of 128, and GroupM 4 / 8 / 16
-# runs a partial last group (17 M tiles).
+# runs a partial last group (17 M tiles). K = 256 is two K tiles, which only the
+# prologue copies, so the PadM / GroupM kids also run K = 1024: the main loop
+# then copies K tile i + 2 (PadM: through the bounds-checked offset).
 _MXFP8_DIRECTION_SHAPES = (
     ((0, 10, 20, 30), (512, 512, 8320)),  # 256x256
     ((1, 11, 21, 31), (272, 512, 256)),  # 256x256 PadM
@@ -255,6 +257,14 @@ _MXFP8_DIRECTION_SHAPES = (
     ((7, 17, 27, 37), (4352, 768, 256)),  # 256x128 GroupM 4
     ((8, 18, 28, 38), (4352, 768, 256)),  # 256x128 GroupM 8
     ((9, 19, 29, 39), (4352, 768, 256)),  # 256x128 GroupM 16
+    ((1, 11, 21, 31), (272, 512, 1024)),  # 256x256 PadM, main-loop copies
+    ((3, 13, 23, 33), (272, 384, 1024)),  # 256x128 PadM, main-loop copies
+    ((4, 14, 24, 34), (4352, 768, 1024)),  # 256x256 GroupM 4, main-loop copies
+    ((5, 15, 25, 35), (4352, 768, 1024)),  # 256x256 GroupM 8, main-loop copies
+    ((6, 16, 26, 36), (4352, 768, 1024)),  # 256x256 GroupM 16, main-loop copies
+    ((7, 17, 27, 37), (4352, 768, 1024)),  # 256x128 GroupM 4, main-loop copies
+    ((8, 18, 28, 38), (4352, 768, 1024)),  # 256x128 GroupM 8, main-loop copies
+    ((9, 19, 29, 39), (4352, 768, 1024)),  # 256x128 GroupM 16, main-loop copies
 )
 _MXFP8_DIRECTION_CASES = tuple(
     (direction, kid, shape)
@@ -372,6 +382,27 @@ def test_gfx950_mxfp8_direction_api_explicit_kid_and_out(_gfx950_device):
     # Another direction's kid rejects these strides in its launcher.
     with pytest.raises(RuntimeError, match="CO expects XQ strides"):
         gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=12)
+
+
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT", "TN"))
+def test_gfx950_mxfp8_direction_api_contiguous_column_major_x_scale(
+    direction, _gfx950_device
+):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    # x_scale as per_group_quant_hip(transpose_scale=True) emits it: column-major
+    # bytes ([K/128, M] row-major) in a contiguous [M, K/128] tensor. K / 128 = 4
+    # columns of distinct scales, so reading them row-major fails the reference.
+    M, N, K = 512, 384, 512
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        direction, M, N, K, _gfx950_device
+    )
+    x_scale = x_scale.t().contiguous().view(M, K // 128)
+    assert x_scale.is_contiguous() and x_scale.stride() == (K // 128, 1)
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    err = (Y.float() - ref).abs().max().item()
+    assert err <= 2e-2 * ref.abs().max().item(), f"{direction}: max err {err}"
 
 
 def test_gfx950_mxfp8_direction_api_rejects_bad_layouts_and_shapes(_gfx950_device):
