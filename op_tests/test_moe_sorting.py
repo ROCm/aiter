@@ -493,6 +493,145 @@ def test_moe_sorting_opus_contract():
         ), f"reverse_sorted at {where}"
 
 
+def test_moe_sorting_opus_repeated_experts():
+    """A token that names one expert twice keeps one route on both sides of 2048 tokens.
+
+    Bucket padding writes rows of expert 0 (comm_fused_moe_runtime), and a repeat may
+    hit an expert outside the rank's mask. Which of the repeated routes is kept is
+    not fixed, so the checks hold for any choice: one route per (token, expert), the
+    others with reverse slot -1, and the sorted tokens of a sort without the repeats.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(0)
+    # token capacity, experts, topk, tile height, zero rows at the end, masked
+    shapes = (
+        (4096, 256, 8, 32, 1000, False),
+        (4096, 256, 8, 32, 1000, True),
+        (1024, 256, 8, 32, 200, False),
+    )
+    for m, E, topk, unit, pad, masked in shapes:
+        topk_ids = (
+            torch.rand((m, E), generator=gen, device=device, dtype=torch.float64)
+            .topk(topk, dim=1)
+            .indices.to(dtypes.i32)
+            .contiguous()
+        )
+        topk_ids[5::97, 3] = topk_ids[5::97, 1]
+        topk_ids[m - pad :] = 0
+        topk_weights = torch.rand(
+            (m, topk), generator=gen, device=device, dtype=dtypes.fp32
+        )
+        expert_mask = None
+        if masked:
+            expert_mask = (torch.arange(E, device=device) % 2).to(dtypes.i32)
+
+        padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
+        sorted_ids = torch.empty((padded,), dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty((padded,), dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.empty(
+            (padded // unit,), dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty((2,), dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((m, 256), dtype=dtypes.bf16, device=device)
+        reverse_sorted = torch.empty((m * topk,), dtype=dtypes.i32, device=device)
+        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+            m, E, topk, 0, topk_ids.get_device()
+        )
+        workspace = (
+            torch.empty(ws_size, dtype=torch.uint8, device=device)
+            if ws_size > 0
+            else None
+        )
+        aiter.moe_sorting_opus_fwd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            E,
+            unit,
+            expert_mask,
+            None,
+            workspace,
+            0,
+            None,
+            None,
+            reverse_sorted,
+        )
+        torch.cuda.synchronize()
+        where = f"M={m}, E={E}, topk={topk}, masked={masked}"
+
+        first = torch.ones_like(topk_ids, dtype=torch.bool)
+        for k in range(1, topk):
+            first[:, k] = (topk_ids[:, :k] != topk_ids[:, k : k + 1]).all(dim=1)
+        ref_ids, _, ref_expert_ids, ref_valid = run_torch_moe_sorting(
+            torch.where(first, topk_ids, -1), topk_weights, E, unit, expert_mask
+        )
+        n = int(ref_valid[0])
+        assert num_valid_ids.tolist() == [n, m], f"num_valid_ids at {where}"
+        assert torch.equal(
+            sorted_ids[:n] & 0x00FFFFFF, ref_ids[:n] & 0x00FFFFFF
+        ), f"sorted tokens at {where}"
+        assert torch.equal(
+            sorted_expert_ids[: n // unit], ref_expert_ids[: n // unit]
+        ), f"sorted_expert_ids at {where}"
+
+        routed = (topk_ids >= 0) & (topk_ids < E)
+        if expert_mask is not None:
+            routed &= expert_mask[topk_ids.clamp(0, E - 1).long()] != 0
+        rev = reverse_sorted.view(m, topk)
+        assert bool((rev[~routed] == -1).all()), f"unrouted reverse at {where}"
+        kept = rev >= 0
+        kept_ids = torch.where(kept, topk_ids, -1).sort(dim=1).values
+        distinct = (kept_ids >= 0) & torch.cat(
+            [
+                torch.ones_like(kept_ids[:, :1], dtype=torch.bool),
+                kept_ids[:, 1:] != kept_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        assert torch.equal(
+            kept.sum(dim=1), (first & routed).sum(dim=1)
+        ), f"kept routes per token at {where}"
+        assert torch.equal(
+            distinct.sum(dim=1), kept.sum(dim=1)
+        ), f"one route per (token, expert) at {where}"
+        route = torch.arange(m * topk, device=device)[kept.flatten()]
+        pos = reverse_sorted[kept.flatten()].long()
+        assert torch.equal(
+            sorted_ids[pos], ((route % topk) << 24 | (route // topk)).to(dtypes.i32)
+        ), f"kept slots at {where}"
+        assert torch.equal(
+            sorted_weights[pos], topk_weights.flatten()[route]
+        ), f"kept weights at {where}"
+
+
+def test_moe_sorting_opus_topk_limit():
+    """Top-k above 256 does not fit the sorted ids' 8-bit slot field: the binding raises."""
+    m, E, topk, unit = 2048, 512, 257, 32
+    topk_ids = torch.rand((m, E)).topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
+    topk_weights = torch.rand((m, topk), dtype=dtypes.fp32)
+    padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
+    try:
+        aiter.moe_sorting_opus_fwd(
+            topk_ids,
+            topk_weights,
+            torch.empty((padded,), dtype=dtypes.i32),
+            torch.empty((padded,), dtype=dtypes.fp32),
+            torch.empty((padded // unit,), dtype=dtypes.i32),
+            torch.empty((2,), dtype=dtypes.i32),
+            torch.empty((m, 256), dtype=dtypes.bf16),
+            E,
+            unit,
+        )
+    except RuntimeError as e:
+        assert "topk 257" in str(e), f"unexpected error: {e}"
+    else:
+        raise AssertionError("moe_sorting_opus_fwd accepted topk 257")
+
+
 def _build_moe_sorting_inputs(
     token,
     model_dim,
@@ -1077,6 +1216,8 @@ def main():
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
     test_moe_sorting_opus_contract()
+    test_moe_sorting_opus_repeated_experts()
+    test_moe_sorting_opus_topk_limit()
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)

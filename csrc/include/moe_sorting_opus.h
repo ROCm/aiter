@@ -3098,7 +3098,8 @@ struct MoeSortingMultiPhaseKernel_P23
 // padded start and the number of the expert's routes in earlier groups, then
 // places its own routes behind those, chunk by chunk. Inside a chunk a
 // per-expert bitmask of the chunk's tokens (in LDS) orders an expert's routes
-// by token. A token that names one expert twice is not supported: Count traps.
+// by token. A token that names one expert twice keeps one route, the first to set
+// its bit; the others get reverse_sorted -1, as in the mesh path.
 //
 // What costs time here is loads of lines no kernel has touched yet, about a
 // microsecond per dependent round of them, not the arithmetic: hence one load a
@@ -3220,7 +3221,6 @@ struct MoeSortingChunkCountKernel
             p_mask[i] = 0;
         __syncthreads();
 
-        bool dup = false;
         for(opus::index_t q = 0; q < kargs.rounds; q++)
         {
             const opus::index_t t_begin = (group * kargs.rounds + q) * kChunkTokens;
@@ -3232,7 +3232,7 @@ struct MoeSortingChunkCountKernel
                 const IndexType eid         = p_topk_ids[r];
                 const opus::index_t i_token = kargs.topk_mdiv.div(r);
                 if(eid >= 0 && eid < kargs.num_experts && i_token < tokens)
-                    dup |= !impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin);
+                    impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin);
             }
             __syncthreads();
             if(kargs.rounds > 1)
@@ -3246,10 +3246,6 @@ struct MoeSortingChunkCountKernel
                 __syncthreads();
             }
         }
-
-        // a token naming one expert twice is not supported
-        if(dup)
-            __builtin_trap();
 
         char* p_group_cnt = reinterpret_cast<char*>(kargs.p_group_cnt);
         const bool last   = group + 1 == static_cast<opus::index_t>(gridDim.x);
@@ -3605,16 +3601,20 @@ struct MoeSortingChunkPlaceKernel
                 __syncthreads();
             }
 
-            for(opus::index_t r = r_begin + threadIdx.x; r < r_end; r += kBlockSize)
+            // bit j: the thread's j-th route here is the first of its token to name the
+            // expert (at most ceil(topk / 16) <= 16 routes per thread for topk <= 256)
+            uint32_t owner = 0;
+            for(opus::index_t r = r_begin + threadIdx.x, j = 0; r < r_end; r += kBlockSize, j++)
             {
                 const IndexType eid         = p_topk_ids[r];
                 const opus::index_t i_token = kargs.topk_mdiv.div(r);
-                if(is_routed(eid, i_token))
-                    impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin);
+                if(is_routed(eid, i_token) &&
+                   impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin))
+                    owner |= 1u << j;
             }
             __syncthreads();
 
-            for(opus::index_t r = r_begin + threadIdx.x; r < r_end; r += kBlockSize)
+            for(opus::index_t r = r_begin + threadIdx.x, j = 0; r < r_end; r += kBlockSize, j++)
             {
                 const IndexType eid = p_topk_ids[r];
                 uint32_t i_token_u, i_topk;
@@ -3625,7 +3625,7 @@ struct MoeSortingChunkPlaceKernel
                     p_local_topk_ids[r] =
                         (eid >= 0 && eid < kargs.num_experts) ? p_lid_smem[eid] : -1;
                 }
-                if(is_routed(eid, i_token))
+                if(owner >> j & 1u)
                 {
                     // slot = the expert's routes in earlier chunks + in earlier tokens
                     // of this one
@@ -3903,6 +3903,12 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
 
         if(aiter::moe_sorting_mp_uses_chunk(a.tokens, a.num_experts))
         {
+            // the sorted ids keep the topk slot in 8 bits
+            if(a.topk > 256)
+            {
+                printf("opus moe_sorting: do not support large topk %d\n", a.topk);
+                return -1;
+            }
             if(t.local_expert_masking)
                 return is_local_token ? moe_sorting_opus_chunk_launch<true, true>(a, s)
                                       : moe_sorting_opus_chunk_launch<true, false>(a, s);

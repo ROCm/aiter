@@ -6496,7 +6496,7 @@ class FmoeTuner(TunerCommon):
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
 
-                # the sort rejects a token naming one expert twice
+                # as router output: no token names one expert twice
                 _topk_ids = (
                     torch.rand((token, expert), device="cuda")
                     .topk(topk, dim=1)
