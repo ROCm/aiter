@@ -348,6 +348,119 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
+def _decode_bound(ref, x, weight, x_scale, w_scale, dtype):
+    """The calibrated element-wise bound: one output-dtype ulp of |ref| plus
+    3.5e-4 of each element's RMS scale, as the bench task's fp64 oracle."""
+    n = weight.shape[0]
+    block_n, block_k = block_shape
+    xs = x_scale.to(torch.float64).repeat_interleave(block_k, dim=1)
+    ws = (
+        w_scale.to(torch.float64)
+        .repeat_interleave(block_n, dim=0)[:n]
+        .repeat_interleave(block_k, dim=1)
+    )
+    a = x.to(torch.float64) * xs
+    w = weight.to(torch.float64) * ws
+    rms = ((a * a) @ (w * w).T).sqrt()
+    finfo = torch.finfo(dtype)
+    return finfo.eps * ref.abs() + 3.5e-4 * rms + finfo.tiny * finfo.eps
+
+
+def test_decode_gemm(m, n, k, dtype=dtypes.bf16, seed=0):
+    """Small-M plain calls must run the FlyDSL decode kernel and be correct.
+
+    The public op routes untuned plain FP32-blockscale BF16 calls with
+    M <= 32, K <= 4096 on gfx950 to the decode kernel; the direct call pins
+    the same result, so a silent fallback to another backend fails here.  The
+    error bound is the calibrated one (one bf16 ulp plus 3.5e-4 of the
+    element's RMS), not the default 1e-2 print-only check.
+    """
+    if get_gfx() != "gfx950":
+        print(f"skip: FlyDSL decode is gfx950-only, got {get_gfx()}")
+        return
+
+    from aiter.ops.flydsl.gemm_a8w8_blockscale import (
+        decode_supported,
+        run_gemm_a8w8_blockscale_decode,
+    )
+
+    scale_n = (n + block_shape[0] - 1) // block_shape[0]
+    scale_k = k // block_shape[1]
+    generator = bench_init.make_generator(seed)
+    x = bench_init.fill_fp8((m, k), "uniform", generator, dtype=dtypes.fp8)
+    weight = bench_init.fill_fp8((n, k), "uniform", generator, dtype=dtypes.fp8)
+    x_scale = fp4_utils.e8m0_to_f32(
+        bench_init.fill_scale_e8m0((m, scale_k), "auto", generator)
+    )
+    w_scale = fp4_utils.e8m0_to_f32(
+        bench_init.fill_scale_e8m0((scale_n, scale_k), "auto", generator)
+    )
+
+    ref, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    # Pin the route even where CK splitK=0 and the decode kernel happen to be
+    # bitwise equal: count the launcher's calls around the public op.
+    from aiter.ops.flydsl import gemm_a8w8_blockscale as decode_mod
+
+    calls = []
+    orig_run = decode_mod.run_gemm_a8w8_blockscale_decode
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return orig_run(*args, **kwargs)
+
+    decode_mod.run_gemm_a8w8_blockscale_decode = counted
+    try:
+        out = aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+    finally:
+        decode_mod.run_gemm_a8w8_blockscale_decode = orig_run
+    assert calls, f"public op did not call the decode launcher at {(m, n, k)}"
+    bound = _decode_bound(ref, x, weight, x_scale, w_scale, dtype)
+    delta = (out.float() - ref.float()).abs()
+    assert torch.isfinite(out).all(), f"decode m={m} n={n} k={k} produced non-finite"
+    bad = int((delta > bound).sum())
+    ratio = float((delta / bound).max())
+    assert bad == 0, (
+        f"decode m={m} n={n} k={k} outside the calibrated bound: "
+        f"{bad}/{delta.numel()} elements, max ratio {ratio:.3f}"
+    )
+    direct = torch.empty_like(out)
+    assert decode_supported(x, weight, direct, False), (m, n, k)
+    run_gemm_a8w8_blockscale_decode(x, weight, x_scale, w_scale, direct)
+    assert torch.equal(
+        out, direct
+    ), f"public op and direct decode disagree at {(m, n, k)}"
+    print(f"test_decode_gemm(m={m}, n={n}, k={k}): ok")
+
+
+def test_decode_gate_boundaries():
+    """The decode route's gate: accept its edges and reject each neighbour."""
+    if get_gfx() != "gfx950":
+        print(f"skip: FlyDSL decode is gfx950-only, got {get_gfx()}")
+        return
+
+    from aiter.ops.flydsl.gemm_a8w8_blockscale import decode_supported
+
+    # (M, N, K, preshuffle_b, expected).  M=32 and N=16/K=1024 are the gate's
+    # own edges; every rejection is one step over exactly one gate.
+    cases = [
+        (32, 512, 4096, False, True),
+        (24, 320, 4096, False, True),
+        (17, 16, 1024, False, True),
+        (33, 512, 4096, False, False),
+        (8, 320, 4224, False, False),
+        (8, 328, 2560, False, False),
+        (8, 320, 512, False, False),
+        (8, 320, 2560, True, False),
+    ]
+    for m, n, k, ps, expected in cases:
+        x = torch.empty((m, k), dtype=dtypes.fp8, device="cuda")
+        weight = torch.empty((n, k), dtype=dtypes.fp8, device="cuda")
+        out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+        got = decode_supported(x, weight, out, ps)
+        assert got == expected, f"decode_supported({m}, {n}, {k}, {ps})={got}"
+    print(f"test_decode_gate_boundaries(): ok ({len(cases)} cases)")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -596,6 +709,27 @@ for splitK in [1, 2]:
 # Two K loops per split for the default CK-Tile tile, the shortest split it runs.
 for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
     test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+
+print("\nRunning small-M decode checks ...")
+for m, n, k in [
+    (1, 3584, 2560),
+    (8, 4096, 2560),
+    (16, 3584, 2560),
+    (17, 320, 2560),
+    (32, 320, 4096),
+    (8, 320, 2560),
+    (2, 2560, 1536),
+    # A's occupancy cases: the heuristic asks for 8 K-waves of a 32-row tile
+    # (512 threads x 142 VGPRs), more than the CU register file can hold on
+    # paper.  The wave cap builds 4-wave (256-thread) specializations; these
+    # assert they launch and still compute the right result.  All three are
+    # untuned, so the configuration-first gate routes them.
+    (24, 320, 4096),
+    (24, 288, 4096),
+    (32, 512, 3584),
+]:
+    test_decode_gemm(m=m, n=n, k=k)
+test_decode_gate_boundaries()
 
 # Save results from benchmarks
 if args.output:
