@@ -59,7 +59,16 @@ def bench_fn_impl(bencher, M, N, provider, metric, args):
     rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
     mem = _ARRAYS[provider] * M * N * rot_bufs[0]["residual"].element_size()
 
-    kernel_fn = fused_indexed_gated_residual if provider == "fused" else _eager_fn
+    kernel_fn = (
+        functools.partial(fused_indexed_gated_residual, round_intermediate=True)
+        if provider == "fused"
+        else _eager_fn
+    )
+    if provider == "fused":
+        bufs = rot_bufs[0]
+        kernel_fn(**bufs)
+        if not torch.equal(bufs["out"], _eager_fn(**bufs)):
+            raise RuntimeError(f"fused output differs from eager at M={M}, N={N}")
     ms = bencher.bench(kernel_fn)
     if metric == "time":
         return ms * 1000  # us
