@@ -237,6 +237,14 @@ def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
     return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
 
 
+@lru_cache(maxsize=256)
+def _get_cached_a16w16_instance(
+    arch: str, cu_num: int, kid: int
+) -> OpusGemmInstance | None:
+    """Registry record of an exact kid (None if absent), looked up once per kid."""
+    return get_kernel_instance(arch, "a16w16", kid, cu_num=cu_num)
+
+
 def _require_layout_kid(
     layout, XQ, *, kid, instance=None, route_arch=None, route_cu_num=None, **_
 ):
@@ -244,7 +252,7 @@ def _require_layout_kid(
         arch, cu_num = route_arch, route_cu_num
         if arch is None or cu_num is None:
             arch, cu_num = _device_arch_and_cu(XQ.device)
-        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
+        instance = _get_cached_a16w16_instance(arch, cu_num, int(kid))
     if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
         raise NotImplementedError(
             f"opus_gemm_a16w16_launch: {layout} operands need a gfx950 a16w16 4-wave kid "
@@ -276,6 +284,14 @@ def _execute_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
     return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
+def _a16w16_layout_executor(XQ: torch.Tensor, WQ: torch.Tensor):
+    """The _execute_a16w16_<layout> of the operand strides."""
+    return (
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
+    )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
+
+
 def _launch_a16w16_gemm(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -295,11 +311,7 @@ def _launch_a16w16_gemm(
             "opus_gemm A16W16 expects 2D XQ/WQ/Y; use opus_bmm for "
             "batch-first 3D tensors"
         )
-    execute = (
-        (_execute_a16w16_nt, _execute_a16w16_nn),
-        (_execute_a16w16_tt, _execute_a16w16_tn),
-    )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
-    execute(
+    _a16w16_layout_executor(XQ, WQ)(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
@@ -333,11 +345,7 @@ def _launch_a16w16_bmm(
             "opus_bmm A16W16 expects batch-first 3D XQ/WQ/Y; use "
             "opus_gemm for logical 2D tensors"
         )
-    execute = (
-        (_execute_a16w16_nt, _execute_a16w16_nn),
-        (_execute_a16w16_tt, _execute_a16w16_tn),
-    )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
-    return execute(
+    return _a16w16_layout_executor(XQ, WQ)(
         XQ,
         WQ,
         Y,
@@ -359,7 +367,7 @@ def opus_gemm_a16w16_tune(
     splitK: int = 0,
 ) -> torch.Tensor:
     """Launch the legacy A16W16 GEMM interface by exact kernel id."""
-    return _execute_a16w16(
+    return _a16w16_layout_executor(XQ, WQ)(
         XQ,
         WQ,
         Y,
@@ -565,22 +573,32 @@ def _a16w16_direction(XQ: torch.Tensor, WQ: torch.Tensor) -> str | None:
 
     First letter A, second B. A "N" is stored [M, K] (strides (K, 1)), A "T"
     [K, M] (strides (1, M)); B "T" is stored [N, K] (strides (K, 1)), B "N"
-    [K, N] (strides (1, N)). Returns "NN", "TT", "TN", "NT" or None.
+    [K, N] (strides (1, N)). A single row is K-contiguous whatever its row
+    stride (as the launcher reads it): M == 1 is "N", N == 1 is "T". Returns
+    "NN", "TT", "TN", "NT" or None.
     """
     (M, K), N = XQ.shape, WQ.shape[0]
-    if XQ.stride() == (K, 1):
+    if XQ.stride() == (K, 1) or (M == 1 and XQ.stride(1) == 1):
         a = "N"
     elif XQ.stride() == (1, M):
         a = "T"
     else:
         return None
-    if WQ.stride() == (K, 1):
+    if WQ.stride() == (K, 1) or (N == 1 and WQ.stride(1) == 1):
         b = "T"
     elif WQ.stride() == (1, N):
         b = "N"
     else:
         return None
     return a + b
+
+
+def _a16w16_single_row_view(tensor: torch.Tensor) -> torch.Tensor:
+    """A K-contiguous [1, K] operand with the canonical (K, 1) strides (no copy)."""
+    rows, K = tensor.shape
+    if rows == 1 and tensor.stride(1) == 1 and tensor.stride(0) != K:
+        return tensor[0].unsqueeze(0)
+    return tensor
 
 
 def _a16w16_4wave_split(instance, M: int, N: int, K: int, cu_num: int) -> int:
@@ -621,6 +639,7 @@ def a16w16_4wave_kid_runs(
     return K // _GFX950_4WAVE_B_K >= 2 * split and split * padded * 4 <= (1 << 32) - 1
 
 
+@lru_cache(maxsize=256)
 def _select_a16w16_4wave_kid(
     direction: str,
     M: int,
@@ -639,7 +658,8 @@ def _select_a16w16_4wave_kid(
     whose blocks (tiles * split) reach 0.55 of the CUs the largest wins, else
     the one with the most blocks; ties go to less padding, the squarer tile,
     then the long side on the smaller of M / N. A split above 1 runs the
-    a16w16_4wave_ws kid of that tile, as does a bias.
+    a16w16_4wave_ws kid of that tile, as does a bias. Cached per shape: the
+    registry is filtered (and its images checked) once per distinct call.
     """
     kids = {
         kid: instance
@@ -727,6 +747,7 @@ def gemm_a16w16_layout_opus(
         )
     if dtype != torch.bfloat16:
         raise ValueError("gemm_a16w16_layout_opus writes BF16 only")
+    XQ, WQ = _a16w16_single_row_view(XQ), _a16w16_single_row_view(WQ)
     direction = _a16w16_direction(XQ, WQ)
     if direction is None:
         raise ValueError(
@@ -763,7 +784,7 @@ def gemm_a16w16_layout_opus(
                 f"{arch} (K % 64 == 0 and K >= 128; A stored [K, M] needs M % 8, "
                 "B stored [K, N] N % 8)"
             )
-    instance = get_kernel_instance(arch, "a16w16", int(kernelId), cu_num=cu_num)
+    instance = _get_cached_a16w16_instance(arch, cu_num, int(kernelId))
     if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
         raise ValueError(
             f"gemm_a16w16_layout_opus runs the gfx950 4-wave kids, got {kernelId}"
