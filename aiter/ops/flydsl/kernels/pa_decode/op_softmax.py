@@ -82,7 +82,7 @@ class PaDecodeSoftmax:
         return self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
 
     def row_thresholds(self, tile_valid, window_left, m):
-        n_valid_tile = (tile_valid - self.ctx.causal_offset[m]).to(fx.Float32)
+        n_valid_tile = (tile_valid - self.ctx.upper_offset[m]).to(fx.Float32)
         base_tok_f = fx.Int32(
             self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
         ).to(fx.Float32)
@@ -128,7 +128,9 @@ class PaDecodeSoftmax:
                 ],
                 dtype=fx.Float32,
             )
-            needs_mask = tile_valid < KV_COMPUTE_BLOCK + self.traits.query_length - 1
+            needs_mask = tile_valid < KV_COMPUTE_BLOCK + (
+                self.traits.query_length - 1 if self.traits.causal else 0
+            )
             if const_expr(self.traits.sliding_window > 0):
                 needs_mask = needs_mask | (window_left > 0)
             if needs_mask:
@@ -491,11 +493,11 @@ class PaDecodeSoftmax:
 
     @flyc.jit
     def fused_scores(self, frags, tile_valid):
-        """Raw scores, -inf past each row's causal bound.
+        """Raw scores, -inf past each row's bound.
 
-        With KV_COMPUTE_BLOCK + query_length - 1 or more valid tokens every row sees
-        the whole tile, so one uniform branch skips the selects on all such
-        tiles, including most tasks' last tile.
+        With KV_COMPUTE_BLOCK valid tokens, plus query_length - 1 when causal,
+        every row sees the whole tile, so one uniform branch skips the selects
+        on all such tiles, including most tasks' last tile.
         """
         t = self.traits
         flat = fx.Vector.from_elements(
@@ -507,7 +509,7 @@ class PaDecodeSoftmax:
             ],
             dtype=fx.Float32,
         )
-        if tile_valid < KV_COMPUTE_BLOCK + t.query_length - 1:
+        if tile_valid < KV_COMPUTE_BLOCK + (t.query_length - 1 if t.causal else 0):
             flat = fx.Vector.from_elements(
                 self._fused_mask_all(frags, tile_valid), dtype=fx.Float32
             )

@@ -24,6 +24,7 @@ from .kernels.pa_decode.traits import (
     d256_page64_pipe,
     nhd_max_query_length,
     require_nhd_pipe,
+    resolve_causal,
 )
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
@@ -594,6 +595,7 @@ def pa_decode(
     mask_unowned_kv: bool = True,
     store_output: bool = True,
     quantized_pad_rows: int = 0,
+    causal: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -657,10 +659,15 @@ def pa_decode(
     writes them in the PA launch; the fallback fills them with ``zero_()`` and
     ``fill_(1.0)`` after the standalone quant.
 
-    MTP lengths include the query tokens and use dense causal masking.
+    MTP lengths include the query tokens and use dense causal masking by default.
     Independently selected sparse queries need separate table rows and
     query_length=1. Positive ``sliding_window`` includes each query's own
     position; nonpositive values disable it.
+    ``causal=False`` drops the causal mask: all query_length rows of a sequence
+    attend to all ``context_lengths[i]`` keys, e.g. a bidirectional draft block
+    whose own keys are already cached. Its sliding window is two-sided: the row
+    at position p sees key k when |p - k| < sliding_window, the definition of
+    FlashAttention's ``window_size=(W - 1, W - 1)``.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
@@ -781,6 +788,7 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
+    resolve_causal(causal, query_length)
 
     required_tensors = (
         ("output", output),
@@ -1377,6 +1385,7 @@ def pa_decode(
         "max_context_length": schedule_context_length,
         "sliding_window": sliding_window,
         "direct_output": direct_output,
+        "causal": causal,
     }
     # The runs and preloaded page ids assume the tile's 128-token steps. Tiles
     # that select 64-token steps (two query tiles, plain BF16 V, wider grids)

@@ -19,6 +19,7 @@ from flydsl.autotune import Config, autotune
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
+from aiter.ops.flydsl.kernels.pa_decode.traits import resolve_causal
 from aiter.ops.flydsl.kernels.pa_decode_plan import (
     DEFAULT_MAX_BATCH_SIZE,
     PADecodePlan,
@@ -202,6 +203,7 @@ def _validate_pa_decode_config(arguments):
         "trans_v",
         "sink_dtype",
         "sliding_window",
+        "causal",
         "max_partitions",
         "num_cu",
         "implementation",
@@ -223,6 +225,7 @@ def _pa_decode_autotuner(
     trans_v,
     sink_dtype,
     sliding_window,
+    causal,
     max_partitions,
     num_cu,
     implementation,
@@ -266,6 +269,7 @@ def prepare_pa_decode_plan(
     max_partitions: int | None = None,
     max_batch_size: int | None = None,
     max_context_length: int | None = None,
+    causal: bool = True,
     tune: bool = False,
     config_dir: str | Path | None = None,
 ) -> PADecodePlan:
@@ -289,9 +293,10 @@ def prepare_pa_decode_plan(
 
     A 4D NHD ``key_cache`` takes its KV heads and page size from its
     [num_blocks, page, heads, dim] shape and is cached separately from packed
-    layouts. Cache by attention geometry and execution modes. Tensor strides,
-    total KV cache pages, block-table padding, and max_context_length do not partition
-    the tuning cache; max_context_length still bounds kernel scheduling.
+    layouts. Cache by attention geometry and execution modes, including
+    ``causal``. Tensor strides, total KV cache pages, block-table padding, and
+    max_context_length do not partition the tuning cache; max_context_length
+    still bounds kernel scheduling.
 
     Retain the returned plan for decode/graph replay. Refresh it with
     plan_pa_decode(..., plan=plan) when context lengths change; decode never
@@ -300,6 +305,7 @@ def prepare_pa_decode_plan(
     with torch.cuda.device(query.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
+        kernel_causal = resolve_causal(causal, query_length)
         properties = torch.cuda.get_device_properties(query.device)
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
@@ -341,6 +347,7 @@ def prepare_pa_decode_plan(
             "sinks": sinks,
             "sliding_window": default_plan.sliding_window,
             "max_context_length": max_context_length,
+            "causal": causal,
         }
         resources = _PADecodeAutotuneResources(
             query,
@@ -376,6 +383,7 @@ def prepare_pa_decode_plan(
             "trans_v": value_cache.ndim == 5,
             "sink_dtype": None if sinks is None else str(sinks.dtype),
             "sliding_window": default_plan.sliding_window,
+            "causal": kernel_causal,
             "max_partitions": limit,
             "num_cu": num_cu,
             "implementation": _tuning_cache_tag(),
@@ -461,6 +469,11 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--trans-v", type=int, choices=(0, 1))
     parser.add_argument("--sliding-window", type=int, default=0)
+    parser.add_argument(
+        "--non-causal",
+        action="store_true",
+        help="Every query row sees the whole context (pa_decode causal=False).",
+    )
     parser.add_argument(
         "--sink-dtype", choices=("none", "bf16", "fp16", "fp32"), default="none"
     )
@@ -592,6 +605,7 @@ def _make_tuning_inputs(args, device, kv_dtype):
         "max_partitions": args.max_partitions,
         "max_batch_size": args.max_batch_size,
         "max_context_length": max_length,
+        "causal": not args.non_causal,
     }
 
 
@@ -632,6 +646,7 @@ def main(argv=None):
         f"KV heads={args.num_kv_heads}, dim={args.head_dim}, layout={args.layout}, "
         f"query length={args.query_length}, max context={max(args.context_length)}, "
         f"page={args.block_size}, KV={args.kv_dtype}"
+        + (", non-causal" if args.non_causal else "")
     )
     arguments, options = _make_tuning_inputs(args, device, kv_dtype)
     plan = prepare_pa_decode_plan(

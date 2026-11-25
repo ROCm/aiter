@@ -90,7 +90,7 @@ def d256_pipe(
 
     Uniform query length; rows = query_length * query_group_size fit two
     16-row M-tiles that share one K/V stream. Packed caches support both V
-    layouts, per-tensor/per-token scales and causal sliding windows.
+    layouts, per-tensor/per-token scales and sliding windows.
     """
     return (
         "gfx95" in arch
@@ -206,6 +206,13 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
+def resolve_causal(causal, query_length):
+    """Validate ``causal``; one query row sees the same keys either way."""
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
+    return causal and query_length > 1
+
+
 class PaDecodeCacheKey(NamedTuple):
     """Tile specialization key. ``select`` builds it by keyword and ``create``
     reads it by name, so a field one change adds and another misses fails
@@ -227,6 +234,7 @@ class PaDecodeCacheKey(NamedTuple):
     query_splits: int
     single_tile_plan: bool
     sliding_window: int
+    causal: bool
     kv_dtype: object
     mask_unowned_kv: bool
     direct_output: bool
@@ -274,6 +282,7 @@ class PaDecodeSchedule:
         sliding_window: int = 0,
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
+        causal: bool = True,
         direct_output: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds.
@@ -290,6 +299,7 @@ class PaDecodeSchedule:
                 "Non-transposed key cache requires a non-transposed value cache"
             )
         nhd_layout = not trans_k
+        causal = resolve_causal(causal, query_length)
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         is_gfx942 = arch == "gfx942"
@@ -666,6 +676,7 @@ class PaDecodeSchedule:
             query_splits=query_splits,
             single_tile_plan=single_tile_plan,
             sliding_window=sliding_window,
+            causal=causal,
             kv_dtype=kv_dtype,
             mask_unowned_kv=bool(mask_unowned_kv),
             direct_output=direct_output,
@@ -704,6 +715,7 @@ class PaDecodeTraits:
     softmax_scale: float
     per_token_kv: bool
     query_length: int
+    causal: bool
     trans_v: bool
     wide_kv_addressing: bool
     mask_unowned_kv: bool
@@ -846,6 +858,7 @@ class PaDecodeTraits:
         query_splits = cache_key.query_splits
         single_tile_plan = cache_key.single_tile_plan
         sliding_window = cache_key.sliding_window
+        causal = cache_key.causal
         kv_dtype = cache_key.kv_dtype
         mask_unowned_kv = cache_key.mask_unowned_kv
         DIRECT = cache_key.direct_output
@@ -1331,6 +1344,7 @@ class PaDecodeTraits:
             softmax_scale=softmax_scale,
             per_token_kv=per_token_kv,
             query_length=query_length,
+            causal=causal,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             mask_unowned_kv=mask_unowned_kv,
@@ -1499,6 +1513,7 @@ class Gfx1250Traits:
     quant_output: bool = False
     # With quant_output, False drops the BF16/FP16 store of the final output.
     store_output: bool = True
+    causal: bool = True
 
     WAVE = 32
     NWARP = 4
@@ -1755,18 +1770,32 @@ class Gfx1250Traits:
         return 16 * self.v_stride
 
     @property
+    def causal_rows(self):
+        # One query token sees the same keys either way, so it keeps the causal
+        # row bound. The wave-pair tiles bound every row causally; longer
+        # non-causal blocks keep the shared tiles.
+        return self.causal or self.query_length == 1
+
+    @property
     def wave_query_tiles(self):
         # Wave pairs share two query tiles and keep scores, P and output in
         # registers: softmax needs no cross-wave exchange until the pair merge.
         # fp8_multi_tile bounds four query tiles to D128.
-        return self.fp8_multi_tile and self.m_tiles == self.NWARP and self.async_page
+        return (
+            self.fp8_multi_tile
+            and self.m_tiles == self.NWARP
+            and self.async_page
+            and self.causal_rows
+        )
 
     @property
     def bf16_wave_query_tiles(self):
         # Four query tiles over BF16 page128 caches: wave pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
         # Packed page128 limits D256 to 32 rows, so this selects D64 and D128.
-        return self.bf16_page128_packed and self.m_tiles == self.NWARP
+        return (
+            self.bf16_page128_packed and self.m_tiles == self.NWARP and self.causal_rows
+        )
 
     @property
     def async_page(self):

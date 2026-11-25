@@ -17,8 +17,9 @@ gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
 FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
-caches run in wave pairs that each cover half a page and keep P in registers. Supported layouts
-use TDM K/V transfers, with two LDS buffers where capacity permits.
+caches run in wave pairs that each cover half a page and keep P in registers,
+except in non-causal blocks of more than one token. Supported layouts use TDM
+K/V transfers, with two LDS buffers where capacity permits.
 One-partition plans can write final output directly. Plans with one task slot
 per sequence merge a sequence's few partitions in its last-arriving CTA, and
 plans whose sequences each fit one workgroup cluster merge within that
@@ -96,6 +97,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
     pa_fx_dtypes,
+    resolve_causal,
 )
 from .pa_decode_plan import CLUSTER_PARTITIONS, CLUSTER_STEP_TOKENS
 from .tensor_shim import (
@@ -206,6 +208,7 @@ def compile_pa_decode_tile(
     cluster_runs: bool = False,
     quant_output: bool = False,
     store_output: bool = True,
+    causal: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -247,6 +250,8 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    ``causal=False`` lets every query row see the whole context; its window is
+    two-sided, with the causal left edge, and so covers the same union.
     ``trans_k=False`` requires ``trans_v=False`` and selects NHD caches
     (gfx950 only).
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
@@ -311,6 +316,7 @@ def compile_pa_decode_tile(
                 cluster_runs=cluster_runs,
                 quant_output=quant_output,
                 store_output=store_output,
+                causal=causal,
             )
         )
     if architecture not in ("gfx942", "gfx950"):
@@ -341,6 +347,7 @@ def compile_pa_decode_tile(
         sliding_window=sliding_window,
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
+        causal=causal,
         direct_output=direct_output,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
@@ -852,6 +859,7 @@ def gfx1250_tile_traits(
     cluster_runs: bool = False,
     quant_output: bool = False,
     store_output: bool = True,
+    causal: bool = True,
 ) -> Gfx1250Traits:
     """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
@@ -925,6 +933,7 @@ def gfx1250_tile_traits(
         cluster_runs=cluster_runs,
         quant_output=quant_output,
         store_output=store_output,
+        causal=resolve_causal(causal, query_length),
     )
 
 
