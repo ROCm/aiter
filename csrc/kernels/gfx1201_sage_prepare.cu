@@ -295,9 +295,13 @@ __global__ __launch_bounds__(THREADS) void v_quant_kernel(const uint16_t* __rest
                                       ? __fdiv_rn(bf16_bits_to_float(tile[local][dim]), scale)
                                       : 0.f;
             }
-            int bits     = 0;
-            bits         = __builtin_amdgcn_cvt_pk_fp8_f32(x[0], x[1], bits, false);
-            bits         = __builtin_amdgcn_cvt_pk_fp8_f32(x[2], x[3], bits, true);
+            int bits = 0;
+#if defined(__gfx1201__) || defined(__gfx12__)
+            bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[0], x[1], bits, false);
+            bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[2], x[3], bits, true);
+#else
+            __builtin_trap();
+#endif
             packed[word] = (uint32_t)bits;
         }
         *reinterpret_cast<uint4*>(value_out + ((size_t)head * DIM + dim) * padded_rows +
