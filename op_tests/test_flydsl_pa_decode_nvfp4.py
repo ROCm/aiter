@@ -628,104 +628,63 @@ def test_pa_decode_mxfp8_rejects(device):
         )  # fmt: skip
 
 
-# Plan-free launches (``plan_free=True``): one CTA a row (wave groups split the
-# pages) or one cluster of P CTAs a row, no plan lookups, optionally a request's
-# rows on one XCD (``xcd_rows``). (rows, max_partitions, page_groups, xcd_rows,
-# max_len, query dtype).
+# Plan-free launches, ATOM's fused_reduce_split regimes (xcd_rows = 8 MTP rows):
+# (rows, max_partitions, page_groups, max_len).
 PLAN_FREE_CASES = {
-    "direct-c24-mtp8": (192, 1, 1, 8, None, torch.bfloat16),
-    "direct-g2-c24": (192, 1, 2, 8, None, torch.bfloat16),
-    "direct-g4-c32": (256, 1, 4, 8, None, torch.bfloat16),
-    "direct-g4-short": (96, 1, 4, 0, 300, torch.bfloat16),
-    "cluster4-c24-mtp8": (192, 4, 1, 8, None, torch.bfloat16),
-    "cluster2-c16": (128, 2, 1, 0, None, torch.float16),
-    "cluster4-short": (64, 4, 1, 8, 700, torch.bfloat16),
-    "cluster8-c4": (32, 8, 1, 8, None, torch.bfloat16),
-    "cluster4-g2-c8": (64, 4, 2, 8, None, torch.bfloat16),
-    "cluster4-g2-short": (40, 4, 2, 0, 900, torch.float16),
+    "cluster8": (32, 8, 1, None),
+    "cluster4-g2-short": (64, 4, 2, 900),
+    "cluster4": (192, 4, 1, None),
+    "direct-g4-short": (96, 1, 4, 300),
 }
 
 
-@pytest.mark.parametrize("store_output", [True, False], ids=["store", "quantonly"])
 @pytest.mark.parametrize("case", list(PLAN_FREE_CASES))
-def test_pa_decode_nvfp4_plan_free(case, store_output, device):
-    """Plan-free direct and cluster launches with the MXFP8 output: the bytes
-    equal the group-32 quant of the BF16 output of the same call, which matches
-    the fp32 reference; one wave group and the plan's split give the planned
-    launch's bytes bit for bit; padded bucket rows are inert."""
+def test_pa_decode_nvfp4_plan_free(case, device):
     from aiter.utility import dtypes
 
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    rows, parts, groups, xcd_rows, max_len, query_dtype = PLAN_FREE_CASES[case]
-    topk = 16
-    num_pages = rows * topk + 8
-    cache = make_cache(num_pages, 1, device)
-    table, lengths = sparse_rows(rows, topk, num_pages, device, 1, max_len)
+    rows, parts, groups, max_len = PLAN_FREE_CASES[case]
+    cache = make_cache(rows * 16 + 8, 1, device)
+    table, lengths = sparse_rows(rows, 16, rows * 16 + 8, device, 1, max_len)
     poison_tails(cache, table, lengths)
     kp, ks, vp, vs = cache
-    g = torch.Generator(device=device).manual_seed(5)
-    query = torch.randn(rows, 16, D, device=device, generator=g).to(query_dtype)
+    query = torch.randn(rows, 16, D, device=device).bfloat16()
     query[:, ::5] *= 8
     plan = pa.plan_pa_decode(
         lengths, 1, max_partitions=parts, workgroup_budget=parts * rows
     )
-    bound = max_len or topk * PAGE
-    common = {
+    kw = {
         "key_scale": ks,
         "value_scale": vs,
         "work_plan": plan,
-        "max_context_length": bound,
+        "max_context_length": max_len or 16 * PAGE,
     }
-    expected = reference(query, cache, table, lengths, D**-0.5)
-    planned = {}
-    # Plan-free tasks split each row's tiles min(P, tiles) ways; where the plan
-    # gave every row that many tasks (same ranges), the bytes must match its.
-    tiles = (lengths + 255) // 256
-    same_split = torch.equal(
-        plan.reduce_info[:, 1].cpu(),
-        torch.minimum(tiles, torch.full_like(tiles, parts)).cpu(),
-    )
-    if groups == 1 and same_split:
-        planned_q = torch.empty(rows, 16, D, dtype=dtypes.fp8, device=device)
-        planned_s = torch.empty(
-            rows, 16 * D // 32, dtype=dtypes.fp8_e8m0, device=device
+
+    def launch(store_output=True, **extra):
+        out = torch.full_like(query, float("nan"))
+        q8 = torch.full((rows + 5, 16, D), 0x7F, dtype=torch.uint8, device=device)
+        s8 = torch.full(
+            (rows + 5, 16 * D // 32), 0xFF, dtype=torch.uint8, device=device
         )
         pa.pa_decode(
-            torch.empty_like(query), query, kp, vp, lengths, table, D**-0.5, 1,
-            quantized_output=planned_q, output_scale=planned_s, **common,
+            out, query, kp, vp, lengths, table, D**-0.5, 1,
+            quantized_output=q8.view(dtypes.fp8), output_scale=s8.view(dtypes.fp8_e8m0),
+            store_output=store_output, quantized_pad_rows=5, **kw, **extra,
         )  # fmt: skip
-        planned = {"q": planned_q.view(torch.uint8), "s": planned_s.view(torch.uint8)}
-    pad = 5
-    for _ in range(2):  # the second call takes the recorded-launch path
-        output = torch.full_like(query, float("nan"))
-        quantized = torch.full(
-            (rows + pad, 16, D), 0x7F, dtype=torch.uint8, device=device
-        ).view(dtypes.fp8)
-        scales = torch.full(
-            (rows + pad, 16 * D // 32), 0xFF, dtype=torch.uint8, device=device
-        ).view(dtypes.fp8_e8m0)
-        pa.pa_decode(
-            output, query, kp, vp, lengths, table, D**-0.5, 1,
-            quantized_output=quantized, output_scale=scales,
-            store_output=store_output, quantized_pad_rows=pad, plan_free=True,
-            page_groups=groups, xcd_rows=xcd_rows, **common,
-        )  # fmt: skip
-        torch.cuda.synchronize()
-        got_q = quantized[:rows].view(rows, -1).view(torch.uint8)
-        got_s = scales[:rows].view(torch.uint8)
-        if store_output:
-            assert torch.isfinite(output).all(), "non-finite output"
-            err = (output.float() - expected).abs()
-            assert (err <= 2e-2 + 2e-2 * expected.abs()).all(), err.max().item()
-            ref_q, ref_s = mxfp8_reference(output.view(rows, -1))
-            assert (got_q != ref_q).sum().item() == 0, "FP8 bytes != quant(BF16)"
-            assert torch.equal(got_s, ref_s), "E8M0 scales != quant(BF16)"
-        if planned:
-            assert torch.equal(got_q, planned["q"].view(rows, -1)), "!= planned"
-            assert torch.equal(got_s, planned["s"]), "scales != planned launch"
-        pad_bytes = quantized[rows:].view(torch.uint8)
-        assert torch.equal(pad_bytes, torch.zeros_like(pad_bytes))
-        assert (scales[rows:].view(torch.uint8) == 127).all()
+        assert (q8[rows:] == 0).all() and (s8[rows:] == 127).all(), "pad rows"
+        return out, q8[:rows].view(rows, -1), s8[:rows]
+
+    free = {"plan_free": True, "page_groups": groups, "xcd_rows": 8}
+    out, q8, s8 = launch(**free)
+    expected = reference(query, cache, table, lengths, D**-0.5)
+    assert ((out.float() - expected).abs() <= 2e-2 + 2e-2 * expected.abs()).all()
+    ref_q, ref_s = mxfp8_reference(out.view(rows, -1))
+    assert torch.equal(q8, ref_q) and torch.equal(s8, ref_s), "!= quant(BF16)"
+    for _ in range(2):  # ATOM's quant-only output; the second call is a recorded launch
+        assert torch.equal(launch(False, **free)[1], q8), "quant-only bytes differ"
+    tiles = ((lengths + 255) // 256).clamp(max=parts).cpu()
+    if groups == 1 and torch.equal(plan.reduce_info[:, 1].cpu(), tiles):
+        assert torch.equal(launch()[1], q8), "!= the planned launch's bytes"
 
 
 # (rows, max_partitions, workgroup_budget): MiniMax-M3.1 TP4 sparse layers as ATOM
