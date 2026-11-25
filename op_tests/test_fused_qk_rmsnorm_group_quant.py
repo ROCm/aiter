@@ -867,13 +867,13 @@ def run_mxfp8_sweep(tokens=None):
     """The MXFP8 mode against the no-quant mode + a group-32 quant: every gfx1250 launch
     shape (n 128 / 256 wave32, 512 64x8, 6144 512x16 under the CU count and the
     interleaved 256x24 from it, 5120 / 4736 the interleaved one with a tail, the latter
-    with a partly active wave); 255 / 256 rows
-    straddle the CU count of a 256-CU part, 32768 is MiniMax-M3.1's prefill chunk at its
-    hidden 6144."""
+    with a partly active wave); 255 / 256 rows straddle the CU count of a 256-CU
+    part, 4096 is past it, 32768 is MiniMax-M3.1's prefill chunk at its hidden
+    6144."""
     full = tokens is not None
     rows = [
         test_mxfp8_matches_no_quant(t, n, r, g, u)
-        for t in (tokens or [1, 255, 256, 32768])
+        for t in (tokens or [1, 255, 256, 4096, 32768])
         for n in (128, 256, 512, 1024, 2048, 4096, 4736, 5120, 6144)
         for r in (False, True)
         for g in ((False, True) if full else (True,))
