@@ -3,11 +3,15 @@
 
 """The recipe's dispatch and combine stages over one shared arena."""
 
+import copy
+import dataclasses
+
 import torch
 
 from .arena import SymmetricArena, _ArenaLayout
 from .mori_caps import _mori_capabilities, _MoriCapabilities
-from .recipe import MegaMoEConfig, MegaMoERecipe, _stage_classes
+from .recipe import DispatchKind, MegaMoEConfig, MegaMoERecipe, _stage_classes
+from .s1f_ctl import read_s1f_fallback
 from .stages.base import (
     CombineStage,
     DispatchStage,
@@ -26,13 +30,30 @@ def _capabilities_for(recipe: MegaMoERecipe) -> _MoriCapabilities | None:
     return None
 
 
+def _fallback_config(config: MegaMoEConfig) -> MegaMoEConfig | None:
+    """The mori-dispatch config a compact recipe's non-fused steps run on
+    (``AITER_MEGA_S1F_FALLBACK=mori``), else None."""
+    if config.recipe.dispatch is not DispatchKind.COMPACT:
+        return None
+    if read_s1f_fallback() != "mori":
+        return None
+    recipe = dataclasses.replace(config.recipe, dispatch=DispatchKind.MORI)
+    return MegaMoEConfig(recipe=recipe, geometry=config.geometry)
+
+
 def _arena_layout(config: MegaMoEConfig, caps) -> _ArenaLayout:
     """The one arena formula: what the runtime allocates and what
     ``required_vmm_bytes`` reports."""
     dispatch, combine = _stage_classes(config.recipe)
-    return _ArenaLayout.merge(
-        dispatch.regions(config, caps), combine.regions(config, caps)
-    )
+    requests = [dispatch.regions(config, caps), combine.regions(config, caps)]
+    fallback = _fallback_config(config)
+    if fallback is not None:
+        from .stages.dispatch_mori import _MoriDispatch
+
+        mori_caps = _mori_capabilities()
+        requests.append(_MoriDispatch.regions(fallback, mori_caps))
+        requests.append(combine.regions(fallback, mori_caps))
+    return _ArenaLayout.merge(*requests)
 
 
 class _EpDispatcher:
@@ -62,15 +83,47 @@ class _EpDispatcher:
                 "reservation, which this dispatch does not make "
                 "(MORI_EP_TOKOFF_EXT=1 turns it off)"
             )
+        # The compact recipe's non-fused steps, when they go through mori.
+        self._fallback: DispatchStage | None = None
+        fallback = _fallback_config(config)
+        if fallback is not None:
+            from .stages.dispatch_mori import _MoriDispatch
+
+            self._fallback = _MoriDispatch(fallback, _mori_capabilities())
         self.layout = _arena_layout(config, caps)
         self.res = _EpResources(SymmetricArena(communicator, self.layout))
         try:
             self.res.allocate(config, self.device)
             self._dispatch.build(self.res)
             self._combine.build(self.res)
+            if self._fallback is not None:
+                self._build_fallback()
         except BaseException:
             self.close()
             raise
+
+    def _build_fallback(self) -> None:
+        """mori over the shared arena, with its own slot counters, grid
+        barrier and received count: both dispatches leave theirs in states
+        only they expect."""
+        res = copy.copy(self.res)
+        res.allocate_dispatch_state(self._fallback.config, self.device)
+        self._fallback.build(res)
+        # Closed with the arena (see _EpResources.close).
+        self.res.tokoff_ext = res.tokoff_ext
+
+    @property
+    def fallback(self) -> DispatchStage | None:
+        """The mori dispatch the non-fused steps of a compact recipe take, or
+        None."""
+        return self._fallback
+
+    def dispatch_fallback(
+        self, hidden_states, topk_weights, topk_ids, *, recv_token_bound=None
+    ) -> _DispatchBatch:
+        return self._fallback.dispatch(
+            hidden_states, topk_weights, topk_ids, recv_token_bound=recv_token_bound
+        )
 
     @property
     def arena(self) -> SymmetricArena:
@@ -92,7 +145,11 @@ class _EpDispatcher:
     def dispatch(self, hidden_states, topk_weights, topk_ids, **step) -> _DispatchBatch:
         """``step`` is recv_token_bound, next_topk_ids, next_recv_token_bound
         and begin_step, as the dispatch stage takes them."""
-        return self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
+        batch = self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
+        # The fused reduce must not consume a stale slot for a route the
+        # compact plan rejected, including graph padding with expert ID -1.
+        batch.routing.topk_ids = topk_ids
+        return batch
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         return self._combine.prepare(batch, quant_bits)
@@ -128,4 +185,7 @@ class _EpDispatcher:
         finally:
             # The plans hold the window and their kernels dereference it, so
             # they go before the arena does.
-            _close_all((self._combine, self._dispatch, self.res))
+            stages = [self._combine, self._dispatch]
+            if self._fallback is not None:
+                stages.append(self._fallback)
+            _close_all((*stages, self.res))

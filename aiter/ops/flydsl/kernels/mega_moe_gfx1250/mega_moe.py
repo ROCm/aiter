@@ -368,6 +368,7 @@ class MegaMoEGfx1250:
         step_kw = {}
         s1f = False
         hook = None
+        on_mori = False
         disp = ep._dispatch
         if isinstance(disp, _CompactDispatch):
             # The tile is fixed before the stage-1 verdict, which is per tile.
@@ -379,16 +380,34 @@ class MegaMoEGfx1250:
                 # reduce. The next forward launches its plan in stream order.
                 next_topk_ids = None
                 hook = disp.fusion.gemm1
+            elif ep.fallback is not None:
+                # A plan started for this step would stay pending into the
+                # next compact one.
+                if disp._plan_pending:
+                    raise RuntimeError(
+                        "AITER_MEGA_S1F_FALLBACK=mori: a compact plan was "
+                        "started for a step that does not run the stage-1 "
+                        "kernel and so goes through mori"
+                    )
+                on_mori = True
             step_kw = {"begin_step": False, "s1f": s1f}
-        batch = ep.dispatch(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            recv_token_bound=recv_token_bound,
-            next_topk_ids=next_topk_ids,
-            next_recv_token_bound=next_recv_token_bound,
-            **step_kw,
-        )
+        if on_mori:
+            batch = ep.dispatch_fallback(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                recv_token_bound=recv_token_bound,
+            )
+        else:
+            batch = ep.dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                recv_token_bound=recv_token_bound,
+                next_topk_ids=next_topk_ids,
+                next_recv_token_bound=next_recv_token_bound,
+                **step_kw,
+            )
         target = ep.prepare(batch, quant_bits)
         if hook is not None and target.scatter is not None:
             # The grouped GEMM reads the hook off dispatch_context (the same
@@ -608,9 +627,17 @@ class MegaMoEGfx1250:
         """Launch ``tdm_compact_plan`` into the current slot, in stream order.
 
         The plan only needs ``topk_ids``, so the caller may issue it before the
-        first layer's RMSNorm. A no-op off the compact path.
+        first layer's RMSNorm. A no-op off the compact path, and with
+        ``AITER_MEGA_S1F_FALLBACK=mori`` for a step that will not run the
+        stage-1 kernel.
         """
-        self._ep.prefetch(topk_ids, recv_token_bound)
+        ep = self._ep
+        if ep.fallback is not None:
+            disp = ep._dispatch
+            disp.prepare_step(recv_token_bound)
+            if not disp.fusion.step_will_run():
+                return
+        ep.prefetch(topk_ids, recv_token_bound)
 
     # -- for callers that drive the transport themselves (ATOM's Triton experts)
     @property

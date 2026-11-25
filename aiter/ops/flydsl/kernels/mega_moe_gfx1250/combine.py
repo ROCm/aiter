@@ -128,10 +128,29 @@ DIRECT_ELEMS_PER_LANE = 8
 DIRECT_BLOCK_THREADS = 512
 
 
-def combine_direct_reduce_blocks(hidden_dim, token_count):
+def _combine_direct_threads(hidden_dim, block_threads=0):
+    """Keep whole waves inside one token when its row admits that geometry."""
+    lanes_per_tok = hidden_dim // DIRECT_ELEMS_PER_LANE
+    if block_threads:
+        if not (WAVE <= block_threads <= 1024 and block_threads % WAVE == 0
+                and lanes_per_tok % block_threads == 0):
+            raise ValueError("explicit combine threads must divide one token's lanes")
+        return block_threads
+    if lanes_per_tok % DIRECT_BLOCK_THREADS == 0:
+        return DIRECT_BLOCK_THREADS
+    # A block inside one token reads its route IDs at a uniform address
+    # (7168 -> 448 threads); per-lane ID loads cost DSR1 ~35% of the reduce.
+    for threads in range(DIRECT_BLOCK_THREADS, WAVE * 4 - 1, -WAVE):
+        if lanes_per_tok % threads == 0:
+            return threads
+    return DIRECT_BLOCK_THREADS
+
+
+def combine_direct_reduce_blocks(hidden_dim, token_count, block_threads=0):
     """Grid of ``_make_combine_direct_reduce`` for ``token_count`` tokens (>= 1)."""
     lanes = max(int(token_count), 1) * (hidden_dim // DIRECT_ELEMS_PER_LANE)
-    return (lanes + DIRECT_BLOCK_THREADS - 1) // DIRECT_BLOCK_THREADS
+    threads = _combine_direct_threads(hidden_dim, block_threads)
+    return (lanes + threads - 1) // threads
 
 
 def _make_combine_direct_reduce(
@@ -140,6 +159,7 @@ def _make_combine_direct_reduce(
     hidden_dim,
     slot_stride_nbytes,
     add_shared=False,
+    block_threads=0,
 ):
     """Stage B for the bf16 wire without the LDS round trip.
 
@@ -147,7 +167,8 @@ def _make_combine_direct_reduce(
     wire (and, with ``add_shared``, the same shared-expert add), element for
     element in the same order: an f32 zero, plus each slot k = 0..topk-1 in
     turn, rounded to bf16, then ``bf16(f32(that) + f32(shared))``. So the two
-    are bit-identical.
+    are bit-identical. Source IDs optionally mask dropped routes, including
+    stale arena slots, as on the quantized wire.
 
     Each lane owns 8 consecutive elements of one token: it loads them from all
     topk slots and the shared row straight into registers, sums, and stores
@@ -158,7 +179,7 @@ def _make_combine_direct_reduce(
     """
     topk = experts_per_token
     EPL = DIRECT_ELEMS_PER_LANE
-    lanes = DIRECT_BLOCK_THREADS
+    lanes = _combine_direct_threads(hidden_dim, block_threads)
     lanes_per_tok = hidden_dim // EPL
     if hidden_dim % EPL:
         raise ValueError(f"hidden_dim must be a multiple of {EPL}")
@@ -172,6 +193,7 @@ def _make_combine_direct_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         addr_shared: Int64,
+        addr_topk_ids: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -183,10 +205,23 @@ def _make_combine_direct_reduce(
         inp_iter = fx.inttoptr(i16_global, addr_comb_inp)
         out_iter = fx.inttoptr(i16_global, addr_out)
         sh_iter = fx.inttoptr(i16_global, addr_shared) if add_shared else None
+        ids_iter = fx.inttoptr(
+            fx.PointerType.get(
+                fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+            ),
+            addr_topk_ids,
+        )
         g = bid * lanes + tid
         tok = g // lanes_per_tok
         e0 = (g % lanes_per_tok) * EPL
         if tok < cur_rank_num_token:
+            route_tok = tok
+            if const_expr(lanes_per_tok % lanes == 0):
+                # An aligned block belongs to one token. Make its route address
+                # uniform so the same IDs are not loaded per output lane.
+                route_tok = fx.Int32(
+                    fx.rocdl.readfirstlane(fx.Int32.ir_type, tok.ir_value())
+                )
             in_off = fx.Int64(tok) * fx.Int64(topk * stride_e) + fx.Int64(e0)
             row_off = fx.Int64(tok) * fx.Int64(hidden_dim) + fx.Int64(e0)
             # All loads first, so a lane has topk (+1) b128 in flight at once.
@@ -208,7 +243,15 @@ def _make_combine_direct_reduce(
                 )
             acc = fx.full(8, 0.0, fx.Float32)
             for k in range_constexpr(topk):
-                acc = acc + raws[k].bitcast(fx.BFloat16).to(fx.Float32)
+                values = raws[k].bitcast(fx.BFloat16).to(fx.Float32)
+                if addr_topk_ids != 0:
+                    route = fx.Int32(
+                        fx.generic_load(
+                            fx.add_offset(ids_iter, fx.Int64(route_tok) * topk + k)
+                        )
+                    )
+                    values = (route >= 0).select(values, fx.full(8, 0.0, fx.Float32))
+                acc = acc + values
             res = acc.to(fx.BFloat16)
             if const_expr(add_shared):
                 res = (res.to(fx.Float32) + sh.bitcast(fx.BFloat16).to(fx.Float32)).to(
@@ -226,12 +269,14 @@ def _make_combine_direct_reduce(
         addr_shared: Int64,
         n_blocks: Int32,
         stream=fx.Stream(None),  # noqa: B008
+        addr_topk_ids: Int64 = 0,
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
             addr_shared,
+            addr_topk_ids,
         ).launch(
             grid=(n_blocks, 1, 1),
             block=[lanes, 1, 1],
@@ -287,9 +332,11 @@ def _make_combine_fused_reduce(
     gemm2 has already P2P-written each token's WEIGHTED per-expert result into
     this rank's comb_inp[origin_lid*topk + k] (one contiguous topk-block per
     token), so this is an unweighted sum: out[t] = sum_{k<topk} comb_inp[t*topk
-    + k]. The dropless full-topk pipeline overwrites every active (token, k) slot
-    each call. ``_make_combine_fused_sync`` must have run first to make the
-    peers' writes visible.
+    + k]. Source topk IDs mask dropped routes, whose slots are not overwritten
+    by gemm2; an all-dropped token therefore sums to zero without clearing the
+    arena. Callers that omit source IDs retain the dropless full-topk contract.
+    ``_make_combine_fused_sync`` must have run first to make the peers' writes
+    visible.
 
     Both sides move by TDM, staging through LDS. A token's topk slots are
     ``tok*topk + k``, i.e. consecutive row indices a fixed ``slot_stride`` apart,
@@ -409,6 +456,7 @@ def _make_combine_fused_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         addr_shared: Int64,
+        addr_topk_ids: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -461,6 +509,9 @@ def _make_combine_fused_reduce(
         inp_iter = fx.inttoptr(i8_global, addr_comb_inp)
         out_iter = fx.inttoptr(i16_global, addr_out)
         sh_iter = fx.inttoptr(i16_global, addr_shared) if add_shared else None
+        rsrc_topk_ids = create_buffer_resource_from_addr(
+            addr_topk_ids, num_records_bytes=cur_rank_num_token * topk * 4
+        )
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -552,6 +603,7 @@ def _make_combine_fused_reduce(
 
         def reduce_tile(buf, work):
             """-- dequantize and sum the topk slots out of LDS --"""
+            tok0, _ = tile_origin(work)
             in_idx = ptr_to_idx(in_buf_ptr(buf))
             out_idx = ptr_to_idx(out_buf_ptr(buf))
             if const_expr(add_shared):
@@ -579,6 +631,20 @@ def _make_combine_fused_reduce(
                         .to(fx.Float32)
                         for j in range_constexpr(2)
                     ]
+                tok = tok0 + lane_tok[r]
+                route_valid = []
+                for k_slot in range_constexpr(topk):
+                    valid = fx.Boolean(True)
+                    if addr_topk_ids != 0:
+                        route_id = buffer_load(
+                            rsrc_topk_ids,
+                            tok * topk + k_slot,
+                            vec_width=1,
+                            dtype=T.i32,
+                            mask=tok < cur_rank_num_token,
+                        )
+                        valid = (tok < cur_rank_num_token) & (route_id >= 0)
+                    route_valid.append(valid)
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
                 accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
@@ -602,13 +668,16 @@ def _make_combine_fused_reduce(
                         dw = lds_load_b32(in_idx, sc_dw + k_slot * P_ROW_BYTES)[0]
                         e8m0 = (dw >> sc_sh) & 0xFF
                         for j in range_constexpr(2):
-                            accs[j] = accs[j] + _dequant_pk8(
+                            values = _dequant_pk8(
                                 (
                                     [payload[j * 2], payload[j * 2 + 1]]
                                     if quant_bits == 8
                                     else payload[j]
                                 ),
                                 e8m0,
+                            )
+                            accs[j] = accs[j] + route_valid[k_slot].select(
+                                values, fx.full(8, 0.0, fx.Float32)
                             )
                 else:
                     # No scales, so the lane's 16 elements are a plain 32-byte
@@ -618,7 +687,10 @@ def _make_combine_fused_reduce(
                         row_b = k_slot * P_ROW_BYTES
                         for j in range_constexpr(2):
                             raw = lds_load_b128(in_idx, base_in + row_b + j * 16)
-                            accs[j] = accs[j] + raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            values = raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            accs[j] = accs[j] + route_valid[k_slot].select(
+                                values, fx.full(8, 0.0, fx.Float32)
+                            )
 
                 out_b = (
                     lane_tok[r] * OUT_ROW_BYTES
@@ -703,12 +775,14 @@ def _make_combine_fused_reduce(
         cur_rank_num_token: Int32,
         addr_shared: Int64,
         stream=fx.Stream(None),  # noqa: B008
+        addr_topk_ids: Int64 = 0,
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
             addr_shared,
+            addr_topk_ids,
         ).launch(
             grid=(block_num, 1, 1),
             block=[lanes, 1, 1],

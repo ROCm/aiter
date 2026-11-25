@@ -509,8 +509,11 @@ class MegaMoEConfig:
         return self.hidden_dim // 32 if self.is_quant_dispatch_wire else 0
 
     def combine_slot_stride_for(self, quant_bits: int) -> int:
-        """Slot pitch on the ``quant_bits`` wire: the payload rounded up to a
-        power of two, so one row index addresses both peer and slot.
+        """Slot pitch on the ``quant_bits`` wire, covering the whole payload.
+
+        Pinned Flash and DSR1 EP4 S1F instances use a dense BF16 pitch and a 2-KiB
+        TDM address unit. Other instances round to a power of two so one row
+        index addresses both peer and slot directly.
 
         Tight per wire, not shared across them. The scatter writes and the
         reduce reads one payload per slot at this pitch, so padding a quantized
@@ -519,6 +522,26 @@ class MegaMoEConfig:
         just won. The arena is what absorbs the difference instead: it is cut to
         the widest pitch (below) and a quantized wire packs into its front.
         """
+        if (
+            quant_bits == 0
+            and self.max_tokens_per_rank >= 4096
+            and self.recipe.combine == CombineKind.FUSED_SCATTER
+        ):
+            from .s1f_ctl import s1f_prefill_config
+
+            tuned = s1f_prefill_config(
+                hidden_dim=self.hidden_dim,
+                inter_dim=self.geometry.inter_dim,
+                experts_per_rank=self.experts_per_rank,
+                topk=self.topk,
+                world_size=self.world_size,
+                recv_bound=self.max_recv,
+                dispatch_wire=self.dispatch_wire,
+                stage1_fused=self.stage1_fused,
+                activation=self.recipe.compute.activation,
+            )
+            if tuned is not None:
+                return self.combine_wire_nbytes(0)
         stride = 1
         while stride < self.combine_wire_nbytes(quant_bits):
             stride <<= 1

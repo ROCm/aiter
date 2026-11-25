@@ -33,11 +33,10 @@ fails on most pages. Writing more does not drain them, reading does, so the
 probe first streams ``EVICT_BYTES`` of reads.
 """
 
-import numpy as np
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import numpy as np
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import range_constexpr

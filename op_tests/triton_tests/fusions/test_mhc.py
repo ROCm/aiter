@@ -26,9 +26,6 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post, mhc_post_pre
-from aiter.ops.triton.utils.mhc_config_utils import (
-    hip_post_dispatch_block as _hip_post_dispatch_block,
-)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
@@ -833,8 +830,8 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
       - CUDA is unavailable
       - ``aiter.mhc_post`` is not built in this environment
       - ``n != 4`` (HIP kernel hardcodes ``hc_mult == 4``)
-      - The HIP dispatcher cannot pick a residual_block satisfying
-        ``C >= residual_block * 2`` (e.g. C=512 picks block=512 -> needs 1024).
+      - ``aiter.mhc_post`` does not run this C on this arch
+        (``mhc_post_supported``).
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required for mHC kernels")
@@ -844,16 +841,11 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
         pytest.skip("aiter.mhc_post hardcodes hc_mult == 4")
 
     from aiter.jit.utils import chip_info
+    from aiter.ops.mhc import mhc_post_supported
 
     arch_id = chip_info.get_gfx()
-    block = _hip_post_dispatch_block(C, arch_id)
-    if block is None:
-        pytest.skip(f"aiter.mhc_post requires C divisible by 256 (got C={C})")
-    if C < 2 * block:
-        pytest.skip(
-            f"aiter.mhc_post on {arch_id} picks residual_block={block} for C={C}; "
-            f"needs C >= {2 * block}"
-        )
+    if not mhc_post_supported(C, n, dtype, arch_id):
+        pytest.skip(f"aiter.mhc_post does not run C={C}, {dtype} on {arch_id}")
 
     torch.cuda.empty_cache()
     torch.manual_seed(0)

@@ -38,7 +38,7 @@ except Exception as e:  # noqa: BLE001
     _IMPORT_ERR = e
 
 try:
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import (
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.dispatch_compact import (
         _compact_gemm_align_m,
     )
 except Exception:  # noqa: BLE001
@@ -69,22 +69,55 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
 
     def test_ep_fused_rows_selected(self):
         cases = [
-            (1024, 65, "2", "2"),
-            (2048, 65, "2", "2"),
-            (4096, 65, "3", "3"),
-            (4096, 64, "3", "3"),
-            (32768, 65, "2", "2"),
+            *(
+                (token, 65, "16", "16", "3", "3")
+                for token in (8, 32, 64, 128, 256, 512)
+            ),
+            (1024, 65, "128", "128", "2", "2"),
+            (2048, 65, "128", "128", "2", "2"),
+            (4096, 65, "128", "128", "3", "3"),
+            (4096, 64, "128", "128", "3", "3"),
+            (8192, 65, "256", "256", "4", "4"),
+            (16384, 65, "256", "256", "4", "4"),
+            (32768, 65, "256", "256", "4", "4"),
         ]
-        for token, experts, buffers, buffers2 in cases:
+        for token, experts, tile_m, tile_m2, buffers, buffers2 in cases:
             with self.subTest(token=token, experts=experts):
                 row = _row(token, experts, True)
                 self.assertIsNotNone(row)
-                self.assertEqual(str(row.get("tile_m")), "128")
-                self.assertEqual(str(row.get("tile_m2")), "128")
+                self.assertEqual(str(row.get("tile_m")), tile_m)
+                self.assertEqual(str(row.get("tile_m2")), tile_m2)
                 self.assertEqual(str(row.get("num_buffers")), buffers)
                 self.assertEqual(str(row.get("num_buffer_stage2")), buffers2)
                 # The merged CSV stores the flag as "1.0"; lookup normalizes it.
                 self.assertIn(str(row.get("ep_fused")), ("1", "1.0"))
+
+    def test_compact_rows_override_only_compact(self):
+        # ep_fused=2 rows serve the compact dispatch alone; mori keeps ep_fused=1.
+        kw = dict(
+            token_num=8192,
+            model_dim=7168,
+            inter_dim=2048,
+            experts=65,
+            topk=-1,
+            activation=ActivationType.Silu,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            ep_fused=True,
+        )
+        compact = _find_grouped_config(**kw, compact=True)
+        mori = _find_grouped_config(**kw)
+        self.assertIn(str(compact.get("ep_fused")), ("2", "2.0"))
+        self.assertEqual(str(compact.get("tile_m")), "128")
+        self.assertIn(str(mori.get("ep_fused")), ("1", "1.0"))
+        self.assertEqual(str(mori.get("tile_m")), "256")
+        # Without its own row a bucket keeps the ep_fused=1 row on both paths.
+        kw["token_num"] = 16384
+        self.assertEqual(
+            _find_grouped_config(**kw, compact=True), _find_grouped_config(**kw)
+        )
 
     def test_plain_lookup_keeps_generic_rows(self):
         # Upstream rows leave ep_fused blank, so they match both paths and
@@ -96,36 +129,33 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
                 self.assertNotEqual(str(row.get("tile_m")), "128")
                 self.assertNotIn(str(row.get("ep_fused")), ("1", "1.0"))
 
-    def test_token_512_stays_default(self):
-        self.assertIsNone(_row(512, 65, True))
-
     def test_compact_plan_uses_ep_fused_tile(self):
         if _compact_gemm_align_m is None:
             self.skipTest("compact align import failed")
-        os.environ.pop("AITER_TDM_TILE_M", None)
-        os.environ.pop("AITER_TDM_TILE_M2", None)
         config = SimpleNamespace(
             dispatch_wire="fp4",
             max_recv=32768,
             hidden_dim=7168,
             experts_per_rank=65,
+            topk=9,
+            world_size=4,
+            stage1_fused=True,
+            geometry=SimpleNamespace(inter_dim=2048),
+            recipe=SimpleNamespace(
+                compute=SimpleNamespace(
+                    activation=ActivationType.Silu,
+                    quant_type=QuantType.per_1x32,
+                )
+            ),
         )
-        align = _compact_gemm_align_m(
-            config,
-            activation=ActivationType.Silu,
-            quant_type=QuantType.per_1x32,
-            inter_dim=2048,
-            recv_bound=32768,
-        )
-        self.assertEqual(align, 128)
-        align_512 = _compact_gemm_align_m(
-            config,
-            activation=ActivationType.Silu,
-            quant_type=QuantType.per_1x32,
-            inter_dim=2048,
-            recv_bound=512,
-        )
-        self.assertEqual(align_512, 64)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AITER_TDM_TILE_M", None)
+            os.environ.pop("AITER_TDM_TILE_M2", None)
+            for token, expected in ((32768, 256), (512, 16)):
+                with self.subTest(token=token):
+                    self.assertEqual(
+                        _compact_gemm_align_m(config, recv_bound=token), expected
+                    )
 
 
 class GroupedNonEpTokenFallbackTest(unittest.TestCase):
