@@ -88,6 +88,18 @@ def _sgpr(v):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(v).ir_value()))
 
 
+def _pow2_div(x, d):
+    """``x // d`` for ``x >= 0`` and a power-of-two ``d``: a shift (``//`` adds signed floor fixups, ISA)."""
+    assert d & (d - 1) == 0
+    return fx.Int32(x) >> (d.bit_length() - 1)
+
+
+def _pow2_mod(x, d):
+    """``x % d`` for a power-of-two ``d`` as a mask (floor-mod for negative ``x`` too)."""
+    assert d & (d - 1) == 0
+    return fx.Int32(x) & (d - 1)
+
+
 def _load_i32_lane(div, idx):
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
@@ -170,14 +182,18 @@ class StoreBf16Rows:
 
 
 class StoreSlotBf16:
-    """Stage-2 epilogue: routing-weighted bf16 rows scattered to ``[T * topk, D]``.
+    """Stage-2 epilogue: bf16 rows scattered to ``[T * topk, D]``.
 
     Sorted row r goes to row ``token * topk + slot`` (both from
-    ``sorted_ids[r]``) after an fp32 multiply by ``sorted_weights[r]``, so a
-    plain top-k sum finishes the layer. Padding rows name token T, which lands
-    past the descriptor: their stores are dropped without a branch.
+    ``sorted_ids[r]``). With ``w_div`` (``sorted_weights``) the row is first
+    multiplied by its routing weight in fp32, so a plain top-k sum finishes
+    the layer; without, the reduction applies the weights (HK's stage-2
+    split), and the pack loses a v_pk_mul_f32 per two values: the store
+    phases of a tile's first K-step are VALU-issue bound (ATT). Padding rows
+    name token T, which lands past the descriptor: their stores are dropped
+    without a branch.
 
-    The tile's 256 routes are loaded in its first K-step (``fetch``, two
+    The tile's 256 routes are loaded in its first K-step (``fetch``, one or two
     loads a lane, 32 rows a wave), parked in ``route`` LDS once that step's
     waits have passed (``stash``) and read back when the next tile stores
     this one (``rows_half``). Loaded at the epilogue instead, their latency
@@ -191,6 +207,8 @@ class StoreSlotBf16:
         self.topk = topk
         self.ids_div = ids_div
         self.w_div = w_div
+        self.weighted = w_div is not None
+        self.n_fetch = 2 if self.weighted else 1
         self.route = route
         self.wave_row = _sgpr(fx.thread_idx.x // 64) * 32 + fx.thread_idx.x % 32
         self.lane_row = fx.thread_idx.x % 16
@@ -232,13 +250,18 @@ class StoreSlotBf16:
     def fetch(self, row0):
         """Issue this lane's share of the tile's route loads (row ``wave_row``)."""
         r = row0 + self.wave_row
+        if const_expr(not self.weighted):
+            return (_load_i32_lane(self.ids_div, r),)
         return _load_i32_lane(self.ids_div, r), _load_i32_lane(self.w_div, r)
 
     def stash(self, fetched, slot):
         # Lanes l and l + 32 hold the same row and store the same values.
         base = slot * 512 + self.wave_row
         fx.memref_store_vec(fx.full(1, fetched[0], fx.Int32), self._at(base))
-        fx.memref_store_vec(fx.full(1, fetched[1], fx.Int32), self._at(base + 256))
+        if const_expr(self.weighted):
+            fx.memref_store_vec(
+                fx.full(1, fetched[1], fx.Int32), self._at(base + 256)
+            )
 
     def rows_half(self, wave_m, slot, h):
         """(output row, routing weight) of this lane's row in each row tile of row half ``h``.
@@ -254,7 +277,9 @@ class StoreSlotBf16:
         for i in range_constexpr(N_TILES_A):
             r = base + (h * LDS_BLOCK_M + i * 16)
             sid = Vec(self._at(r).load())[0]
-            w = Vec(self._at(r + 256).load())[0].bitcast(fx.Float32)
+            w = None
+            if const_expr(self.weighted):
+                w = Vec(self._at(r + 256).load())[0].bitcast(fx.Float32)
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
         return out
 
@@ -268,12 +293,14 @@ class StoreSlotBf16:
         return offs
 
     def pack(self, c_frag, rows):
-        """Weighted bf16 words of ``c_frag`` (``[j * N_TILES_A + i]``) in quad order: 4 per row tile."""
+        """(Weighted) bf16 words of ``c_frag`` (``[j * N_TILES_A + i]``) in quad order: 4 per row tile."""
         words = []
         for i in range_constexpr(N_TILES_A):
-            w = rows[i][1]
-            x = (Vec(c_frag[i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
-            y = (Vec(c_frag[N_TILES_A + i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
+            x, y = Vec(c_frag[i]), Vec(c_frag[N_TILES_A + i])
+            if const_expr(self.weighted):
+                x, y = x * rows[i][1], y * rows[i][1]
+            x = x.to(fx.BFloat16).bitcast(fx.Int32)
+            y = y.to(fx.BFloat16).bitcast(fx.Int32)
             # After the swap lane 16q + r holds 8 consecutive columns of row r.
             lo = _swap_pair(x[0], y[0])
             hi = _swap_pair(x[1], y[1])
@@ -299,7 +326,7 @@ class StoreSlotBf16:
                 self.reg,
                 fx.slice(self.c_div, (None, offs[i])),
                 # In elements of the view (i32 words), like the offset.
-                soffset=fx.Int32(col) // 2,
+                soffset=_pow2_div(col, 2),
             )
 
 
@@ -716,7 +743,7 @@ class TileScaleLds:
         base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
         slot_off = slot * self.slot_bytes + self.wave_id * 256
         dst = fx.inttoptr(self.LdsPtr_t, base_i32 + slot_off)
-        blk = (self.wave_id + rot) % self.k128
+        blk = _pow2_mod(self.wave_id + rot, self.k128)
         rocdl.buffer_load_to_lds(
             self.a_rsrc,
             fx.to_llvm_ptr(dst),
@@ -768,6 +795,7 @@ def compile_moe_bs_gemm_8w(
     gate_up_inter: int = 0,
     epilogue: str = "bf16",
     topk: int = 0,
+    weighted: bool = True,
 ):
     """Build the persistent grouped GEMM launcher.
 
@@ -781,8 +809,9 @@ def compile_moe_bs_gemm_8w(
     * ``"swiglu_fp8"`` (stage 1, needs ``gate_up_inter``): ``C`` fp8
       ``[M_pad, I]`` = requantized SwiGLU, ``C_scale`` its E8M0 1x128 scales
       column-major ``[I // 128, M_pad]`` (stage 2's A operand as is).
-    * ``"slot_bf16"`` (stage 2): ``C`` bf16 ``[T * topk, N]``, the routing
-      weighted expert output of route (token, slot) in row ``token * topk + slot``.
+    * ``"slot_bf16"`` (stage 2): ``C`` bf16 ``[T * topk, N]``, the expert
+      output of route (token, slot) in row ``token * topk + slot``, multiplied
+      by its routing weight if ``weighted``.
     """
     assert epilogue in ("bf16", "swiglu_fp8", "slot_bf16"), epilogue
     assert epilogue != "swiglu_fp8" or gate_up_inter
@@ -811,6 +840,7 @@ def compile_moe_bs_gemm_8w(
     _kname = (
         f"flydsl_moe_bs_8w_{'gather' if gather else 'sorted'}_n{N}_k{K}"
         f"{'_gu' if gate_up_inter else ''}_{epilogue}{topk or ''}"
+        f"{'_uw' if epilogue == 'slot_bf16' and not weighted else ''}"
     )
 
     @fx.struct
@@ -914,10 +944,12 @@ def compile_moe_bs_gemm_8w(
                 C, C_scale, m_pad, gate_up_inter, limit, lds.R_lds, wave_m, wave_n
             )
         else:
-            w_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(sorted_weights, max_size=False),
-                fx.make_layout(1, 1),
-            )
+            w_div = None
+            if const_expr(weighted):
+                w_div = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(sorted_weights, max_size=False),
+                    fx.make_layout(1, 1),
+                )
             n_tokens = _load_i32(nv_div, 1)
             store_c = StoreSlotBf16(C, n_tokens, topk, N, ids_div, w_div, lds.T_lds)
 
@@ -1192,8 +1224,8 @@ def compile_moe_bs_gemm_8w(
 
         def make_ctx(tile, expert, pmask):
             """Stage 2's loaders of one tile (contiguous A rows), from its index and expert."""
-            m_blk = tile // NB
-            nb = tile % NB
+            m_blk = _pow2_div(tile, NB)
+            nb = _pow2_mod(tile, NB)
             row0 = m_blk * BLOCK_M
             # K-order rotation: the 16 tiles of an m-block (one A panel, one
             # XCD round) and the m-blocks of an expert (one B panel) start at
@@ -1201,7 +1233,7 @@ def compile_moe_bs_gemm_8w(
             # instead of all waiting on the same miss. Stage 2 alone, T = 4096
             # / 8192 / 16384: 327 / 383 / 662 -> 316 / 376 / 620 us with the
             # per-tile scales that make it possible (ABAB).
-            rot = (m_blk + nb) % K_ITERS
+            rot = _pow2_mod(m_blk + nb, K_ITERS)
             a_g2s = G2SRounds(a_div, gl_off_a[0], N_LDS_STEPS, F8_IR_t, wave_id, 64 * K)
             a_base = [(row0 + h * LDS_BLOCK_M) * K for h in range_constexpr(2)]
             b_buf = fx.rocdl.make_buffer_tensor(
@@ -1229,7 +1261,7 @@ def compile_moe_bs_gemm_8w(
             )
             b_off = [half_row0(nb, h) * K for h in range_constexpr(2)]
             b_rows = [
-                expert * (N // 128) + half_row0(nb, h) // 128
+                expert * (N // 128) + _pow2_div(half_row0(nb, h), 128)
                 for h in range_constexpr(2)
             ]
 
@@ -1242,10 +1274,12 @@ def compile_moe_bs_gemm_8w(
             ]
 
             def a_load(h, dst, k):
-                a_g2s.load(dst, a_base[h] + (rot + k) % K_ITERS * BLOCK_K, a_skip[h])
+                a_g2s.load(
+                    dst, a_base[h] + _pow2_mod(rot + k, K_ITERS) * BLOCK_K, a_skip[h]
+                )
 
             def b_load(h, dst, k):
-                off = b_off[h] + (rot + k) % K_ITERS * B_K_STEP
+                off = b_off[h] + _pow2_mod(rot + k, K_ITERS) * B_K_STEP
                 # A weight panel no other m-block of the expert reads streams
                 # through L2 nontemporally (leaving it to A panels and output
                 # lines): stage 2 alone, T = 4096 / 8192 / 16384: 295 / 375 /
@@ -1264,11 +1298,11 @@ def compile_moe_bs_gemm_8w(
 
         def pad_rows(tile):
             """Issue ``pad_mask``'s loads: rows 64 / 128 / 192 of ``tile``'s m-block, the neighbours' experts."""
-            m_blk = tile // NB
+            m_blk = _pow2_div(tile, NB)
             row0 = m_blk * BLOCK_M
             vals = [_load_i32_lane(ids_div, row0 + 64 * q) for q in range(1, 4)]
             prev_m = (m_blk > 0).select(m_blk - 1, m_blk)
-            next_m = (m_blk + 1 < n_tiles // NB).select(m_blk + 1, m_blk)
+            next_m = (m_blk + 1 < _pow2_div(n_tiles, NB)).select(m_blk + 1, m_blk)
             for m in (prev_m, m_blk, next_m):
                 vals.append(_load_i32_lane(eids_div, m))
             return vals
@@ -1333,7 +1367,7 @@ def compile_moe_bs_gemm_8w(
             group's MFMAs do. Returns (accumulators, next expert, next skip).
             """
             valid = prev_tile >= 0
-            pcols = slot_cols(fx.Int32(prev_tile) % NB)
+            pcols = slot_cols(_pow2_mod(prev_tile, NB))
             prev_slot = 1 - parity
             prev_rows = {}
 
@@ -1392,7 +1426,7 @@ def compile_moe_bs_gemm_8w(
                 if const_expr(k == 0):
                     # Older than this step's A1 load: its end wait drains them.
                     routes = store_c.fetch(cur["row0"])
-                    nxt_eid = _load_i32_lane(eids_div, next_tile // NB)
+                    nxt_eid = _load_i32_lane(eids_div, _pow2_div(next_tile, NB))
                     nxt_pad = pad_rows(next_tile)
                 ctx, kk = src(k + 1)
                 ctx["a"](1, a_next1, kk)
@@ -1430,7 +1464,7 @@ def compile_moe_bs_gemm_8w(
                 wait_barrier(
                     4 * N_LDS_STEPS
                     + n_sc
-                    + (9 + 3 * QUAD_STORES if k == 0 else 0)
+                    + (7 + store_c.n_fetch + 3 * QUAD_STORES if k == 0 else 0)
                     + (2 * QUAD_STORES if k == 1 else 0)
                 )
 
@@ -1477,7 +1511,7 @@ def compile_moe_bs_gemm_8w(
             has_tile = start < n_tiles
             first_tile = has_tile.select(start, fx.Int32(0))
             first_expert = has_tile.select(
-                _load_i32(eids_div, first_tile // NB), fx.Int32(0)
+                _load_i32(eids_div, _pow2_div(first_tile, NB)), fx.Int32(0)
             )
             first_mask = pad_mask(pad_rows(first_tile))
             first = make_ctx(first_tile, first_expert, first_mask)
@@ -1530,7 +1564,7 @@ def compile_moe_bs_gemm_8w(
             # The last tile's stores (a workgroup without a tile sends them
             # out of bounds).
             last_slot = (final[0] + 1) & 1
-            last_cols = slot_cols(fx.Int32(final[1]) % NB)
+            last_cols = slot_cols(_pow2_mod(final[1], NB))
             for g in range_constexpr(4):
                 if const_expr(g % 2 == 0):
                     rows = store_c.rows_half(wave_m, last_slot, g // 2)

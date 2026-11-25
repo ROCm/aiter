@@ -30,7 +30,7 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
 
 
 @functools.lru_cache(maxsize=64)
-def _compile(K, N, gather, gate_up_inter, epilogue, topk):
+def _compile(K, N, gather, gate_up_inter, epilogue, topk, weighted=True):
     from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
 
     return compile_moe_bs_gemm_8w(
@@ -40,6 +40,7 @@ def _compile(K, N, gather, gate_up_inter, epilogue, topk):
         gate_up_inter=gate_up_inter,
         epilogue=epilogue,
         topk=topk,
+        weighted=weighted,
     )
 
 
@@ -83,7 +84,8 @@ def moe_bs_gemm(
     * ``"bf16"``: out bf16 ``[M_pad, N]``.
     * ``"swiglu_fp8"``: out fp8 ``[M_pad, N // 2]``, out_scale e8m0
       ``[N // 256, M_pad]``; needs ``gate_up_inter = N // 2``.
-    * ``"slot_bf16"``: out bf16 ``[T * topk, N]``, weighted by ``sorted_weights``.
+    * ``"slot_bf16"``: out bf16 ``[T * topk, N]``, weighted by ``sorted_weights``
+      when given (else unweighted: the top-k reduction applies the weights).
     """
     from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
@@ -104,7 +106,7 @@ def moe_bs_gemm(
         assert out.element_size() == 1 and out_scale is not None
         assert tuple(out_scale.shape) == (gate_up_inter // 128, m_pad)
     else:
-        assert epilogue == "slot_bf16" and topk > 0 and sorted_weights is not None
+        assert epilogue == "slot_bf16" and topk > 0
         assert out.dtype == torch.bfloat16 and out.shape[1] == N
         assert out.shape[0] % topk == 0
     if grid is None:
@@ -119,6 +121,7 @@ def moe_bs_gemm(
         int(gate_up_inter),
         epilogue,
         int(topk) if epilogue == "slot_bf16" else 0,
+        sorted_weights is not None,
     )
     _run_compiled(
         exe,
@@ -186,7 +189,7 @@ def moe_bs_forward(
     # The sort drops ids outside [0, E) itself; the reduction skips only
     # negative ones, so ids >= E become -1 (their slot rows are never written).
     ids = torch.where(topk_ids < E, topk_ids.to(torch.int32), -1)
-    sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sorting(
+    sorted_ids, _, sorted_eids, num_valid, _ = moe_sorting(
         ids, topk_weights.float(), E, D, x.dtype, BLOCK_M, accumulate=False
     )
     m_pad = sorted_ids.numel()
@@ -222,9 +225,10 @@ def moe_bs_forward(
         num_valid,
         gather=False,
         epilogue="slot_bf16",
-        sorted_weights=sorted_w,
         topk=topk,
     )
+    # The routing weights are applied here, not in stage 2 (HK's split): the
+    # weight multiply was VALU issue in stage 2's store phases (ATT).
     # Nontemporal loads pay once the slot rows outgrow the 256 MB MALL
     # (T=16384: 239 -> 204 us); at 268 MB (T=4096, top-k 8) they cost 5 us.
     _run_moe_reduction(
@@ -234,6 +238,7 @@ def moe_bs_forward(
         topk,
         D,
         topk_ids=ids,
+        topk_weights=topk_weights,
         skip_dropped=True,
         streaming_loads=slots.numel() * slots.element_size() > (280 << 20),
     )
