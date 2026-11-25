@@ -48,6 +48,8 @@ sliding window, ALiBi, MTP/verify queries.
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 import triton.language as tl
 
@@ -454,10 +456,22 @@ def pa_decode_cascade(
             raise NotImplementedError("vec5d cascade needs contiguous K/V caches")
     elif key_cache.dim() < 4:
         raise NotImplementedError("plain4d cascade needs 4D K/V caches")
+    prof = None
+    if os.environ.get("AITER_CASCADE_PROF"):
+        import time
+
+        prof = {"fill_start": time.perf_counter()}
     # Query gathers first: every later pass reads q_gather rows.
     torch.index_select(query, 0, ws.tok_of_b.long(), out=ws.q_gather_b)
     # 1) Shared pass over all items (padded items are no-ops).
     _launch_shared_pass(ws, key_cache, value_cache, block_tables, softmax_scale)
+    if prof is not None:
+        torch.cuda.synchronize()
+        prof["shared"] = time.perf_counter()
+    if prof is not None:
+        torch.cuda.synchronize()
+        prof["pre_tail"] = time.perf_counter()
+    folded = False
     if vec:
         # 2) Tail pass: production FlyDSL pa_decode over members' tails.
         plan_pa_decode(ws.tail_lens, ws.num_kv_heads, max_partitions=2, plan=ws.b_plan)
@@ -493,6 +507,13 @@ def pa_decode_cascade(
     else:
         # 2) Tail pass: AITER Triton v2 tile kernel over members' tails.
         _launch_v2_tails(ws, key_cache, value_cache, softmax_scale)
+        # Fold members now, before the singles kernels reuse the staging
+        # buffers the tails wrote.
+        if prof is not None:
+            torch.cuda.synchronize()
+            prof["pre_fold"] = time.perf_counter()
+        _launch_fold(ws, output, sinks)
+        folded = True
         # 3) Singles: full production Triton v2 decode call.
         from aiter.ops.triton.attention.pa_decode import paged_attn_decode_v2
 
@@ -516,5 +537,15 @@ def pa_decode_cascade(
             ),
         )
     # 4) Fold members (shared + tail partials, sinks once), 5) scatter singles.
-    _launch_fold(ws, output, sinks)
+    if not folded:
+        _launch_fold(ws, output, sinks)
     _launch_scatter(ws, output)
+    if prof is not None:
+        torch.cuda.synchronize()
+        fill_end = time.perf_counter()
+        t0 = prof
+        print(
+            f"[cascade-prof] fill={0:6.1f} shared={(t0['shared']-t0['fill_start'])*1000:6.2f} "
+            f"tail={(t0['pre_tail']-t0['shared'])*1000:6.2f} singles+scat={(t0['pre_fold']-t0['pre_tail'])*1000:6.2f} "
+            f"fold={(fill_end-t0['pre_fold'])*1000:6.2f}"
+        )
