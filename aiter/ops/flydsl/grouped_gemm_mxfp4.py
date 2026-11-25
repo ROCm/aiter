@@ -147,6 +147,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     gemm_stage=None,
+    quant_payload_preshuffled=None,
     m_align=0,
     k_waves=1,
 ):
@@ -157,16 +158,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
     innermost 32 FP4 values packed into 16 bytes.
     """
-    # a_preshuffled 2: only the stage-1 quant output is packed (A row-major).
-    if a_preshuffled not in (0, 1, 2):
-        raise ValueError(f"a_preshuffled must be 0, 1 or 2, got {a_preshuffled}")
-    if a_preshuffled == 2 and not stage1_quant_out:
-        raise ValueError("a_preshuffled=2 packs only a stage-1 quant output")
-    if a_preshuffled == 1 and row_major_ascale:
+    if a_preshuffled and row_major_ascale:
         raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
     if a_preshuffled and not a_is_fp4:
         raise ValueError("preshuffled A requires MXFP4 activations")
-    if a_preshuffled == 1 and (
+    if a_preshuffled and (
         K % 128
         or contiguous_m % 16
         or tile_m % 16
@@ -177,14 +173,23 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled A requires M and tile_m divisible by 16, K and "
             "tile_k divisible by 128, and no padded A row stride"
         )
-    if a_preshuffled == 2 and (contiguous_m % 16 or tile_m % 16):
-        raise ValueError("a preshuffled output requires M and tile_m divisible by 16")
-    if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
+    if quant_payload_preshuffled is None:
+        quant_payload_preshuffled = bool(
+            a_preshuffled and stage1_quant_out and stage1_act
+        )
+    if quant_payload_preshuffled and not (a_is_fp4 and stage1_quant_out and stage1_act):
+        raise ValueError("preshuffled quant output requires fused MXFP4 activation")
+    if quant_payload_preshuffled and (
+        N % 256 or tile_n % 64 or contiguous_m % 16 or tile_m % 16
+    ):
         raise ValueError(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
-            "and tile_n divisible by 64"
+            "and tile_n divisible by 64, with M and tile_m divisible by 16"
         )
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        SUPPORT_EXPLICIT_VGPR_PARTITION,
+        launch_gemm_a8w4_tdm,
+    )
 
     if stream is None:
         stream = current_stream_arg()
@@ -215,18 +220,17 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # These arguments only supply base addresses. Pass pointers below so large
-    # buffers do not cross the C ABI with signed 32-bit tensor dimensions.
+    # Optional arguments may reuse the output as an unused address placeholder.
     quant_scale_tensor = out if quant_scale is None else quant_scale
     out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
     if stage1_quant_out:
         out_dtype = fx.Uint8
     n_tiles = (N + tile_n - 1) // tile_n
-    cluster_n = _select_cluster_n(n_tiles, cluster_n)
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
-    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
+    cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     if m_align:
         # A tile skipped for starting in an expert's padding never reaches the
         # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
@@ -241,13 +245,14 @@ def flydsl_grouped_gemm_a8w4_masked(
         raise ValueError("persistent_workers must be nonnegative")
     if persistent_workers:
         if cluster_m != 1:
-            raise ValueError("persistent workers require cluster_m=1")
+            raise ValueError("persistent workers require cluster_m == 1")
         if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
             )
+        cluster_size = cluster_n * cluster_m
         persistent_workers = (
-            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+            (persistent_workers + cluster_size - 1) // cluster_size * cluster_size
         )
     # k_waves owns the grid: no clusters, no persistent workers, no As prologue.
     # Reject a config that asks for them rather than dropping them.
@@ -312,6 +317,42 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
+    # Use this step's source-token count, not the padded receive capacity, so
+    # a small step in a prefill-sized arena keeps its existing specialization.
+    fixed_n_ep = (
+        enable_ep_scatter
+        and stage2_scatter.source_token_count >= 4096
+        and SUPPORT_EXPLICIT_VGPR_PARTITION
+        and not stage2_scatter.combine_quant_bits
+        and stage2_scatter.world_size == 4
+        and (N, K, n_experts, stage2_scatter.slot_stride_bytes)
+        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
+        and a_is_fp4
+        and a_preshuffled
+        and not persistent_workers
+        and not stage1_act
+        and not stage1_quant_out
+        and not has_bias
+        and not row_major_ascale
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (256, 256, 256, 2, 2, 4)
+        and cluster_m == cluster_n == k_waves == 1
+        and tdm_spec[2] == 1
+    )
+    # Pinned EP4 prefill steps use a live-route grid from T4096 per rank.
+    # Explicit worker overrides keep their requested dispatch.
+    if (
+        fixed_n_ep
+        and stage == 2
+        and not any(
+            name in os.environ
+            for name in (
+                "AITER_FLYDSL_PERSISTENT_WORKERS",
+                "AITER_FLYDSL_PERSISTENT_WORKERS2",
+            )
+        )
+    ):
+        persistent_workers = 4096
     layout_spec = (
         int(row_major_ascale),
         int(a_row_stride_bytes),
@@ -323,6 +364,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
+    launch_spec = (
+        int(quant_payload_preshuffled),
+        int(N) if fixed_n_ep else 0,
+    )
+    explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
     _run_compiled(
         launch_gemm_a8w4_tdm,
         ptr_arg(out, out_dtype),
@@ -346,6 +392,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        *launch_spec,
+        explicit_vgpr_partition,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -353,6 +401,9 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            launch_spec,
+            explicit_vgpr_partition,
+            out.device,
         ),
     )
     return out

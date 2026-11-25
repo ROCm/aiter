@@ -89,14 +89,15 @@ def _compact_gemm_tiles(
 
     ``a2_preshuffled``: the row's ``a_preshuffle`` (or
     ``AITER_GROUPED_A4W4_A_PRESHUFFLE``) on the fp4 wire, which on the compact
-    dispatch packs GEMM1's quant output for GEMM2 (``AITER_COMPACT_A2_PRESHUFFLE``,
-    default 1).
+    dispatch packs GEMM1's quant output for GEMM2.
     """
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
         _find_grouped_config,
         _get_padded_m,
     )
+
+    from ..s1f_ctl import s1f_prefill_config
 
     row = None
     if config.dispatch_wire in ("fp4", "fp8"):
@@ -116,6 +117,19 @@ def _compact_gemm_tiles(
             ep_fused=True,
             compact=True,
         )
+    tuned = s1f_prefill_config(
+        hidden_dim=config.hidden_dim,
+        inter_dim=config.geometry.inter_dim,
+        experts_per_rank=config.experts_per_rank,
+        topk=config.topk,
+        world_size=config.world_size,
+        recv_bound=config.max_recv if recv_bound is None else int(recv_bound),
+        dispatch_wire=config.dispatch_wire,
+        stage1_fused=config.stage1_fused,
+        activation=config.recipe.compute.activation,
+    )
+    if tuned is not None:
+        row = tuned
     tile_m, m_warp = 64, 1
     tile_m2 = m_warp2 = None
     a_pre = 0
@@ -128,11 +142,7 @@ def _compact_gemm_tiles(
     ov_apre = _env_int("AITER_GROUPED_A4W4_A_PRESHUFFLE")
     if ov_apre is not None:
         a_pre = ov_apre
-    a2_pre = int(
-        config.dispatch_wire == "fp4"
-        and bool(a_pre)
-        and os.environ.get("AITER_COMPACT_A2_PRESHUFFLE", "1") == "1"
-    )
+    a2_pre = int(config.dispatch_wire == "fp4" and bool(a_pre))
     ov_m, ov_m2 = _env_int("AITER_TDM_TILE_M"), _env_int("AITER_TDM_TILE_M2")
     if ov_m is not None or ov_m2 is not None:
         tile_m = tile_m if ov_m is None else ov_m
@@ -215,7 +225,7 @@ class _CompactStep:
     # align_m; 0 when not resolved (the arena-capacity placeholder step).
     g1_tile_m: int = 0
     quant_wmma_rep: int = 0
-    # GEMM1 writes GEMM2's A preshuffled (``a_preshuffled=2``).
+    # GEMM1 writes GEMM2's A preshuffled (``quant_payload_preshuffled``).
     a2_preshuffled: int = 0
 
 
@@ -611,7 +621,7 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count),
+            routing=self._routing(token_count, topk_ids),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],
@@ -726,7 +736,7 @@ class _CompactDispatch(_Dispatch):
         )
 
     def _precompile_s1f_plans(self) -> None:
-        """Compile every stage-1 plan variant before serving.
+        """Compile every automatic stage-1 plan variant before serving.
 
         With S1F on (the default) the plan is keyed by (align_m, slot, waves,
         blocks, tok_map, fused quant), and waves/blocks follow the step's token
@@ -736,6 +746,8 @@ class _CompactDispatch(_Dispatch):
         fused step can have (<= the S1F max recv), takes the
         alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
+        Explicit wide APRE configurations are warmed eagerly at the token
+        widths used for capture, rather than compiling every prefill width.
         """
         if not self.fusion.enabled:
             return

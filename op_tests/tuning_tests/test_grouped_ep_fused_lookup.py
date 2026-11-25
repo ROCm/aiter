@@ -137,6 +137,9 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
             max_recv=32768,
             hidden_dim=7168,
             experts_per_rank=65,
+            topk=9,
+            world_size=4,
+            stage1_fused=True,
             geometry=SimpleNamespace(inter_dim=2048),
             recipe=SimpleNamespace(
                 compute=SimpleNamespace(

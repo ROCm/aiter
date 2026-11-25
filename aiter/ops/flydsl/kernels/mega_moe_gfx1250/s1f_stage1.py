@@ -67,6 +67,8 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -122,7 +124,12 @@ CTL_XHEAD = 128  # + 32 * (8 * parity + xcc), words 128..639
 #: the GEMM work heads, which every CTA hits at kernel start: an atomic queued
 #: behind ~1000 of theirs measured 25-60 us.
 CTL_PHEAD = 16384
-CTL_END = CTL_PHEAD + 64
+CTL_PAIR_Q = CTL_PHEAD + 64
+PAIR_CAP = 128
+PAIR_Q_WORDS = 32
+# Reserve both parity's naturally aligned tickets once. This lets one control
+# block serve CN1 decode and CN2 prefill without changing graph-owned storage.
+CTL_END = CTL_PAIR_Q + 2 * PAIR_CAP * PAIR_Q_WORDS
 #: XCCs per device: block b runs on XCC b % 8 (mb/v4_a2_xccmap.log).
 N_XCC = 8
 #: Buffer offset past any resource: the lane issues no memory access.
@@ -157,15 +164,13 @@ def s1f_flag_m(tile_m: int) -> int:
 #: a piece start; the claimer owns the pieces that START in its block and
 #: reads up to 31 - block_runs runs past it to find where the last one ends.
 MB_RB = 8
-#: TDM ops in flight: per storer wave (2 storers over the S-slot ring) and for
-#: the loader wave (the per-wave hardware cap is 3).
+#: TDM ops in flight per storer and loader wave.
 MB_ST_INFL = 2
 MB_LD_INFL = 3
 #: Mailbox spins (s_sleep 1 each) before a wait traps.
 MB_SPIN = 1 << 26
 
-#: Producer ring: R = 8 rows x 3840 B per 2-D TDM store, 3 runs in flight
-#: over a 4-slot ring (the ring fits inside the GEMM1 LDS arena).
+#: Producer ring: four slots; pinned EP4 prefill uses eight below.
 S1F_SLOTS = 4
 S1F_DEPTH = 3
 _MD_STRIDE = 128
@@ -526,17 +531,17 @@ def make_s1f_stage1(
     tile_n=256,
     tile_k=256,
     num_buffers=3,
+    m_warp=1,
+    n_warp=4,
+    a_preshuffled=0,
     run_rows=PLAN_RUN_ROWS,
     depth=S1F_DEPTH,
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
-    a2_preshuffled=0,
+    pair_cluster_n=1,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
-
-    ``a2_preshuffled`` writes ``arg_a2`` in the packed (M/16, K/128, 4, 16,
-    16-byte) layout an A-preshuffled GEMM2 reads.
 
     Launcher arguments (positional): ``arg_a2`` (GEMM1 fp4 output, tensor),
     ``arg_a1`` (disp_out rows, pointer), ``arg_w1`` (pointer),
@@ -586,10 +591,26 @@ def make_s1f_stage1(
     ``ticket_span`` (default ``workers``): entry tickets per launch, the same
     for every variant sharing one control block. ``ctas_per_cu``: how many
     CTAs of this grid share a CU, for the LDS residency check.
+
+    ``pair_cluster_n=2`` pairs two eligible EP4 prefill CTAs on adjacent
+    N panels. A shared atomic ticket and cluster rendezvous keep their A
+    multicast matched; producer roles and all completion waits are retained.
     """
     if WAVE != 32:
         raise ValueError("S1F requires gfx1250 wave32")
-    R, S, D = int(run_rows), S1F_SLOTS, int(depth)
+    if pair_cluster_n not in (1, 2):
+        raise ValueError("pair_cluster_n must be 1 or 2")
+    # Pinned EP4 prefill consumes row-major wire and writes APRE A2. Keep its
+    # accepted eight-slot, three-store pipeline and smaller variants' defaults.
+    pinned_prefill = bool(
+        a_preshuffled
+        and (tile_m, tile_n, tile_k, m_warp, n_warp) == (256, 256, 256, 2, 2)
+        and (model_dim, inter_dim, experts_per_rank, topk, npes)
+        in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4))
+        and num_buffers == 3
+        and os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "1") == "1"
+    )
+    R, S, D = int(run_rows), (8 if pinned_prefill else S1F_SLOTS), int(depth)
     if not 1 <= R <= 15:
         raise ValueError(f"run_rows={R} must fit the plan's 4-bit run field")
     if not (1 <= D and S >= D + 1):
@@ -650,16 +671,37 @@ def make_s1f_stage1(
         raise ValueError(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
         )
-    B1 = GM * NT
+    CN = (
+        2
+        if all(
+            (
+                pair_cluster_n == 2,
+                G == 256,
+                P % (2 * N_XCC) == 0,
+                tile_m == tile_n == tile_k == 256,
+                num_buffers == 3,
+                m_warp == n_warp == 2,
+                a_preshuffled == 1,
+                (model_dim, inter_dim, epr, topk, npes)
+                in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4)),
+            )
+        )
+        else 1
+    )
+    assert NT % CN == 0 and G % (CN * N_XCC) == 0
+    assert CN == 1 or G // CN <= PAIR_CAP
+    N_TASKS = NT // CN
+    assert ((compact_cap + tile_m - 1) // tile_m) * N_TASKS + G < (1 << 31)
+    B1 = GM * N_TASKS
     # Runs per W1 claim. A piece has at most FM / R runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
     RBK = int(block_runs)
     assert 1 <= RBK and RBK + FM // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
-    # Storer w owns the ring slots s % 2 == w and blocks on its oldest
-    # store only with all of them in flight (at most 3 TDM ops per wave):
-    # its next op's slot is then held by its own oldest op, never by one
-    # it would wait for. Fewer in flight, it only polls FULL.
+    # Storer w owns ring slots s % 2 == w. At the completion cap it
+    # retires its oldest store; the cap never exceeds its owned slots.
+    # At a full ring this frees its own next slot, so forward progress
+    # never depends on the other storer. Below cap it only polls FULL.
     ST_CAP = (min(3, (S + 1) // 2), min(3, S // 2))
     # Live pieces never exceed (records W1 may run ahead) + (ring slots) +
     # (pieces one block starts), so a counter slot is always free again by
@@ -688,7 +730,8 @@ def make_s1f_stage1(
     MB_FREE = MB_CTL + 32
     MB_RSEQ = MB_CTL + 64
     MB_RCONS = MB_CTL + 68
-    MB_WSEQ = MB_CTL + 48  # records whose rowmap pairs are in
+    # FREE[4:8] occupies offsets 48-63 in an eight-slot ring.
+    MB_WSEQ = MB_CTL + (48 if S == 4 else 80)  # rowmap records ready
     MB_RTOT = MB_CTL + 72
     MB_NBLK = MB_CTL + 76
     MB_PC = MB_CTL + 128
@@ -768,7 +811,7 @@ def make_s1f_stage1(
             has_bias=0,
             stage1_quant_out=1,
             quant_wmma_rep=quant_wmma_rep,
-            cluster_n=1,
+            cluster_n=CN,
             cluster_m=1,
             next_stage_prefetch=0,
             num_waves_per_tensor_tdm=2,
@@ -787,7 +830,8 @@ def make_s1f_stage1(
             lds_soa_load_interleave=0,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=2 if a2_preshuffled else 0,
+            a_preshuffled=0,
+            quant_payload_preshuffled=a_preshuffled,
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,
@@ -802,10 +846,11 @@ def make_s1f_stage1(
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
         ARENA = int(lay["arena"])
-        # The ring lives inside the GEMM arena, so a producer CTA's LDS
-        # footprint is the GEMM1 arena and residency is unchanged.
+        # Producer and GEMM phases alias the arena. DSR1's eight-slot ring
+        # needs 251520 B (8 * 8 * 3840 + metadata), above GEMM1's 221184 B.
+        # Pinned M256 uses one CTA per CU; retain the residency check below.
         prod_lds = MB_END
-        ARENA_LDS = ARENA
+        ARENA_LDS = max(ARENA, prod_lds) if pinned_prefill else ARENA
         if prod_lds > ARENA_LDS:
             raise ValueError(
                 f"producer LDS {prod_lds} B exceeds the GEMM arena {ARENA} B"
@@ -816,12 +861,15 @@ def make_s1f_stage1(
             )
         kname = (
             f"s1f_stage1_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
-            + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
+            + f"_mb{RBK}i{max(ST_CAP)}l{MB_LD_INFL}"
             + f"_poll{POLL}"
             + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
+            + (f"_pairq{CN}_raw" if CN == 2 else "")
             + f"_{g1_name}"
         )
+
+        kname += "_llvmsched_maxilp"
 
         @flyc.kernel(name=kname, known_block_size=[block, 1, 1])
         def kernel(
@@ -895,20 +943,23 @@ def make_s1f_stage1(
             gen = _uniform(comm_ops.load_i32_lds(fx.Int64(bc)))
             tword = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(4))))
             bid = fx.Int32(fx.block_idx.x)
-            xcc = bid & fx.Int32(N_XCC - 1)
+            peer = bid % fx.Int32(CN)
+            pair = bid // fx.Int32(CN)
+            xcc = pair & fx.Int32(N_XCC - 1)
             # Block-id roles: the P / 8 lowest block ids of every XCC
             # produce, so dispatch order makes the producers resident
             # first. slot_id is x-major inside each role: producers
             # [0, P), consumers [P, G).
-            PB = P // N_XCC
-            CB = G // N_XCC - PB
-            kq = bid >> fx.Int32(3)
-            slot_id = fx.Int32(
+            PB = P // (CN * N_XCC)
+            CB = G // (CN * N_XCC) - PB
+            kq = pair // fx.Int32(N_XCC)
+            role_pair = fx.Int32(
                 (kq < fx.Int32(PB)).select(
                     xcc * fx.Int32(PB) + kq,
-                    fx.Int32(P) + xcc * fx.Int32(CB) + kq - fx.Int32(PB),
+                    fx.Int32(P // CN) + xcc * fx.Int32(CB) + kq - fx.Int32(PB),
                 )
             )
+            slot_id = role_pair * fx.Int32(CN) + peer
             par = tword & fx.Int32(1)
             other = fx.Int32(1) - par
             # ---- zero the other parity's counters for the next launch ----
@@ -1654,12 +1705,12 @@ def make_s1f_stage1(
             # ---- the GEMM1 work queue ----
             # One global queue; consumer c = slot_id - P starts on item c
             # without a claim.
-            SQ = G - P
+            SQ = (G - P) // CN
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
-                return m_tiles * fx.Int32(NT)
+                return m_tiles * fx.Int32(N_TASKS)
 
             def q_code(xq, w):
                 # m-major in groups of GM m-tiles, m fastest.
@@ -1674,7 +1725,7 @@ def make_s1f_stage1(
                     # Rotated to start at the shared experts' m-tiles.
                     m_q = m_q + m_sh
                     m_q = fx.Int32((m_q >= m_tiles).select(m_q - m_tiles, m_q))
-                return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
+                return (m_q << fx.Int32(_ITEM_N_BITS)) | (rq * fx.Int32(CN))
 
             def q_head_bytes(xq):
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
@@ -1684,7 +1735,9 @@ def make_s1f_stage1(
                 memory; the old value stays in flight until read."""
                 return _buffer_atomic_add_ret(
                     rsrc_ctl_b,
-                    fx.Int32(is_t0.select(q_head_bytes(xq), fx.Int32(_OOB))),
+                    fx.Int32(
+                        (is_t0 & (peer == 0)).select(q_head_bytes(xq), fx.Int32(_OOB))
+                    ),
                     1,
                     SCOPE_DEV,
                 )
@@ -1747,6 +1800,52 @@ def make_s1f_stage1(
                     _uniform(v[1]),
                     _uniform(v[2]),
                     _uniform(v[3]),
+                )
+
+            def pair_cluster_sync():
+                # The caller has completed the DS/WG handoff. The public
+                # cluster_barrier helper adds another gpu.barrier and drains
+                # loadcnt/storecnt; retain the verified deferred C pipeline
+                # while one wave/WG signals and all waves wait instead.
+                # Shader Programming Guide section 4.3.6.6, pages 83-84.
+                if is_w0:
+                    fx.rocdl.s_barrier_signal(-3)
+                fx.rocdl.s_barrier_wait(-3)
+
+            def pair_message_address():
+                word = fx.Int32(CTL_PAIR_Q) + (
+                    par * fx.Int32(PAIR_CAP) + pair
+                ) * fx.Int32(PAIR_Q_WORDS)
+                return addr_ctl + fx.Int64(word) * 4
+
+            def send_pair_ticket(q):
+                # One naturally aligned atomic i64 contains all shared data.
+                # There is no separate flag/payload ordering dependency.
+                if is_t0:
+                    message = fx.Int64(gen) * fx.Int64(1 << 32) + fx.Int64(q)
+                    _store_i64_sys(pair_message_address(), message)
+
+            def receive_pair_ticket(previous_q):
+                q = fx.Int32(-1)
+                message_gen = fx.Int32(0)
+                spins = fx.Int32(0)
+                while ((message_gen != gen) | (q <= previous_q)) & (
+                    spins < fx.Int32(SPIN_LIMIT)
+                ):
+                    message = fx.Int64(
+                        comm_ops.load_i64_acquire(pair_message_address())
+                    )
+                    message_gen = _uniform(_i32_hi(message))
+                    q = _uniform(_i32_lo(message))
+                    fx.rocdl.s_sleep(4)
+                    spins = spins + 1
+                if spins >= fx.Int32(SPIN_LIMIT):
+                    _trap()
+                return q
+
+            def pair_code(q):
+                return (q < q_items(fx.Int32(0))).select(
+                    q_code(fx.Int32(0), q), fx.Int32(-1)
                 )
 
             def ready_bits(fv, tinfo_n):
@@ -1846,38 +1945,78 @@ def make_s1f_stage1(
                     return ready_of(fv, ts[0])
                 return ready_sub(fv, ts)
 
-            # ---- the first item ----
             code = fx.Int32(-1)
             tinfo = fx.Int32(0)
             ready = fx.Int32(0)
             queue = fx.Int32(0)
-            static_ok = fx.Int32(0)
-            # Consumers only: a producer's first item would wait for its own
-            # runs, and those cover the earliest tiles.
-            q0 = slot_id - fx.Int32(P)
-            static_ok = fx.Int32(
-                ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(
-                    fx.Int32(1), fx.Int32(0)
+            if const_expr(CN == 2):
+                # The two physical peers have the same producer/consumer role.
+                q0 = role_pair - fx.Int32(P // CN)
+                static_ok = (role_pair >= fx.Int32(P // CN)) & (
+                    q0 < q_items(fx.Int32(0))
                 )
-            )
-            code = fx.Int32(
-                (static_ok != fx.Int32(0)).select(q_code(queue, q0), fx.Int32(-1))
-            )
-            if static_ok == fx.Int32(0):
-                # Producers after their runs, and consumers past the queue's
-                # static range: claim (blocking) and broadcast.
-                if is_w0:
-                    c0, x0 = claim_now(queue)
-                    publish_slot(
-                        c0,
-                        tinfo_m(c0 >> fx.Int32(_ITEM_N_BITS)),
-                        fx.Int32(0),
-                        x0,
-                    )
+                code = static_ok.select(pair_code(q0), fx.Int32(-1))
+                tinfo = fx.Int32(0)
+                ready = fx.Int32(0)
+                queue = q0
+                if static_ok == fx.Boolean(False):
+                    if is_w0:
+                        ticket = fx.Int32(0)
+                        if peer == 0:
+                            ticket = fx.Int32(SQ) + _uniform(claim_issue(fx.Int32(0)))
+                            send_pair_ticket(ticket)
+                        else:
+                            ticket = receive_pair_ticket(fx.Int32(-1))
+                        c0 = pair_code(ticket)
+                        publish_slot(
+                            c0,
+                            tinfo_m(c0 >> fx.Int32(_ITEM_N_BITS)),
+                            fx.Int32(0),
+                            ticket,
+                        )
+                    _rawbar()
+                    code, tinfo, ready, queue = read_slot()
+                if code >= 0:
+                    tinfo = tinfo_m(code >> fx.Int32(_ITEM_N_BITS))
+                    code = code + peer
+                # Producer peers finish independently. This rendezvous starts the
+                # pair only after both mailboxes have drained and both know its task.
                 _rawbar()
-                code, tinfo, ready, queue = read_slot()
-            if code >= fx.Int32(0):
-                tinfo = tinfo_m(code >> fx.Int32(_ITEM_N_BITS))
+                pair_cluster_sync()
+
+            else:
+                # ---- the first item ----
+                code = fx.Int32(-1)
+                tinfo = fx.Int32(0)
+                ready = fx.Int32(0)
+                queue = fx.Int32(0)
+                static_ok = fx.Int32(0)
+                # Consumers only: a producer's first item would wait for its own
+                # runs, and those cover the earliest tiles.
+                q0 = slot_id - fx.Int32(P)
+                static_ok = fx.Int32(
+                    ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                )
+                code = fx.Int32(
+                    (static_ok != fx.Int32(0)).select(q_code(queue, q0), fx.Int32(-1))
+                )
+                if static_ok == fx.Int32(0):
+                    # Producers after their runs, and consumers past the queue's
+                    # static range: claim (blocking) and broadcast.
+                    if is_w0:
+                        c0, x0 = claim_now(queue)
+                        publish_slot(
+                            c0,
+                            tinfo_m(c0 >> fx.Int32(_ITEM_N_BITS)),
+                            fx.Int32(0),
+                            x0,
+                        )
+                    _rawbar()
+                    code, tinfo, ready, queue = read_slot()
+                if code >= fx.Int32(0):
+                    tinfo = tinfo_m(code >> fx.Int32(_ITEM_N_BITS))
 
             def set_holders(meta, ready_fn, hooks):
                 # The GEMM body reads these when it is inlined below; a
@@ -1954,32 +2093,66 @@ def make_s1f_stage1(
                 # item's hooks see their own iteration's values.
                 nxt = {}
 
-                def drain_start(queue=queue, nxt=nxt):
-                    nxt["claim"] = claim_issue(queue)
+                if const_expr(CN == 2):
 
-                def epi_start(queue=queue, nxt=nxt):
-                    c = claim_resolve(queue, nxt["claim"])
-                    live = c >= fx.Int32(0)
-                    m_n = fx.Int32(
-                        live.select(c >> fx.Int32(_ITEM_N_BITS), fx.Int32(0))
-                    )
-                    ts_n, ti_n, fl_n = pre_load(m_n, live)
-                    nxt["code"] = c
-                    nxt["tsub"] = ts_n
-                    nxt["tinfo"] = ti_n
-                    nxt["flags"] = fl_n
+                    def drain_start(nxt=nxt):
+                        nxt["claim"] = claim_issue(fx.Int32(0))
 
-                def epi_end(queue=queue, nxt=nxt):
-                    if is_w0:
-                        c = nxt["code"]
-                        ti = nxt["tinfo"]
-                        rdy = pre_ready(nxt["flags"], nxt["tsub"])
-                        xq_n = queue
-                        if c == fx.Int32(-2):
-                            c, xq_n = steal(queue)
-                            ti = tinfo_m(c >> fx.Int32(_ITEM_N_BITS))
-                            rdy = fx.Int32(0)
-                        publish_slot(c, ti, rdy, xq_n)
+                    def epi_start(previous_q=queue, nxt=nxt):
+                        ticket = fx.Int32(0)
+                        if is_w0:
+                            if peer == 0:
+                                ticket = fx.Int32(SQ) + _uniform(nxt["claim"])
+                                send_pair_ticket(ticket)
+                            else:
+                                ticket = receive_pair_ticket(previous_q)
+                        c = pair_code(ticket)
+                        live = c >= 0
+                        m_n = live.select(c >> fx.Int32(_ITEM_N_BITS), fx.Int32(0))
+                        ts_n, ti_n, fl_n = pre_load(m_n, live)
+                        nxt["code"] = c
+                        nxt["ticket"] = ticket
+                        nxt["tsub"] = ts_n
+                        nxt["tinfo"] = ti_n
+                        nxt["flags"] = fl_n
+
+                    def epi_end(nxt=nxt):
+                        if is_w0:
+                            publish_slot(
+                                nxt["code"],
+                                nxt["tinfo"],
+                                pre_ready(nxt["flags"], nxt["tsub"]),
+                                nxt["ticket"],
+                            )
+
+                else:
+
+                    def drain_start(queue=queue, nxt=nxt):
+                        nxt["claim"] = claim_issue(queue)
+
+                    def epi_start(queue=queue, nxt=nxt):
+                        c = claim_resolve(queue, nxt["claim"])
+                        live = c >= fx.Int32(0)
+                        m_n = fx.Int32(
+                            live.select(c >> fx.Int32(_ITEM_N_BITS), fx.Int32(0))
+                        )
+                        ts_n, ti_n, fl_n = pre_load(m_n, live)
+                        nxt["code"] = c
+                        nxt["tsub"] = ts_n
+                        nxt["tinfo"] = ti_n
+                        nxt["flags"] = fl_n
+
+                    def epi_end(queue=queue, nxt=nxt):
+                        if is_w0:
+                            c = nxt["code"]
+                            ti = nxt["tinfo"]
+                            rdy = pre_ready(nxt["flags"], nxt["tsub"])
+                            xq_n = queue
+                            if c == fx.Int32(-2):
+                                c, xq_n = steal(queue)
+                                ti = tinfo_m(c >> fx.Int32(_ITEM_N_BITS))
+                                rdy = fx.Int32(0)
+                            publish_slot(c, ti, rdy, xq_n)
 
                 set_holders(
                     (
@@ -2011,7 +2184,15 @@ def make_s1f_stage1(
                     m,
                     n,
                 )
+                if const_expr(CN == 2):
+                    # The builder already completed its DS/WG handoff. Every
+                    # peer receives this iteration's ticket before either may
+                    # publish another, so a single message slot cannot be lapped.
+                    pair_cluster_sync()
                 code, tinfo, ready, queue = read_slot()
+                # CN1 has peer zero, so the same assignment also retains its
+                # original code without a conditional loop-carried SSA update.
+                code = (code >= 0).select(code + peer, code)
                 seq = seq + fx.Int32(1)
             # Retire the last item's deferred C / e8m0 stores before exit.
             TDM.tdm_wait(0)
@@ -2036,7 +2217,13 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            value_attrs={"rocdl.cluster_dims": f"{CN},1,1"} if CN == 2 else {},
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
+    # LLVM exposes this scheduler as a string cl::opt; preserve memory waits.
+    launch.compile_hints["llvm_options"] = dict(
+        launch.compile_hints.get("llvm_options", {})
+    )
+    launch.compile_hints["llvm_options"]["amdgpu-sched-strategy"] = "max-ilp"
     return launch
