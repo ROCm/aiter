@@ -1278,51 +1278,19 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 }
 
-// A thread's |x| max over its 8 inputs as data_to_per_row_scale<DTYPE_I, DTYPE_O, 8> computes it
-// on gfx9. The compiler keeps that max in DTYPE_I: bf16 is v_max_f32 on the widened values one
-// element at a time, rounded back to bf16 after each step (an identity: both operands are widened
-// bf16 and the result is one of them or a quiet NaN, so its low half is zero too), fp16 is a
-// v_max3_f16 chain. Both pass a signaling NaN on as a quiet one. With several rows per thread the
-// compiler may instead widen fp16 first or pack rows into v_pk_max_f16 with a canonicalize, and
-// both quiet a signaling NaN before the max drops it, so the sequence is spelled out here.
+// A thread's |x| max over its 8 inputs, the loop data_to_per_row_scale<DTYPE_I, DTYPE_O, 8> runs.
+// Its result for a signaling NaN input depends on how the compiler lowers that loop: ROCm 7.2
+// widens fp16 with v_cvt_f32_f16, which quiets it so the max drops it, while ROCm 7.14 keeps a
+// v_max3_f16 chain that passes it on as a quiet NaN. The multi-row kernel therefore runs the same
+// source per vector rather than a fixed instruction sequence.
 template <typename DTYPE_I, int vec_size>
 __device__ __forceinline__ float per_token_thread_absmax(const opus::vector_t<DTYPE_I, vec_size>& v)
 {
-    static_assert(vec_size % 2 == 0);
-    struct Words
-    {
-        uint32_t w[vec_size / 2];
-    };
-    const Words d = __builtin_bit_cast(Words, v);
-    float acc;
-    if constexpr(std::is_same_v<DTYPE_I, opus::bf16_t>)
-    {
-        // |x| as an input modifier: the same sign-bit clear the integer and does there.
+    float absMax = 0.f;
 #pragma unroll
-        for(int k = 0; k < vec_size / 2; k++)
-        {
-            const float lo = __builtin_bit_cast(float, d.w[k] << 16);
-            const float hi = __builtin_bit_cast(float, d.w[k] & 0xffff0000u);
-            if(k == 0)
-                asm("v_max_f32 %0, 0, |%1|" : "=v"(acc) : "v"(lo));
-            else
-                asm("v_max_f32 %0, %1, |%2|" : "=v"(acc) : "v"(acc), "v"(lo));
-            asm("v_max_f32 %0, %1, |%2|" : "=v"(acc) : "v"(acc), "v"(hi));
-        }
-    }
-    else
-    {
-        static_assert(std::is_same_v<DTYPE_I, opus::fp16_t>);
-        uint32_t m;
-        asm("v_max3_f16 %0, |%1|, 0, |%2|" : "=v"(m) : "v"(d.w[0]), "v"(d.w[0] >> 16));
-#pragma unroll
-        for(int k = 1; k < vec_size / 2; k++)
-            asm("v_max3_f16 %0, %1, |%2|, |%3|" : "=v"(m) : "v"(m), "v"(d.w[k]), "v"(d.w[k] >> 16));
-        asm("v_cvt_f32_f16 %0, %1" : "=v"(acc) : "v"(m));
-    }
-    // The result feeds a DPP move next; the hazard recognizer does not see into asm.
-    asm volatile("s_nop 1" : "+v"(acc));
-    return acc;
+    for(size_t j = 0; j < vec_size; j++)
+        absMax = max(absMax, abs(static_cast<float>(v[j])));
+    return absMax;
 }
 
 // Several rows per block for the thread_data_size = 8 shapes (cols <= 8 * BlockSize). One block
@@ -1392,6 +1360,7 @@ dynamic_per_token_scaled_quant_multirow_kernel(DTYPE_O* __restrict__ out,
     vec_i vec_cur[kRowsPerThread][kVecsPerLane];
     float partial[kRowsPerThread][kVecsPerLane];
     bool nan_partial = false;
+    float prev       = 0.f;
 #pragma unroll
     for(int r = 0; r < kRowsPerThread; r++)
     {
@@ -1407,7 +1376,13 @@ dynamic_per_token_scaled_quant_multirow_kernel(DTYPE_O* __restrict__ out,
 #pragma unroll
         for(int v = 0; v < kVecsPerLane; v++)
         {
+            // Each vector's max waits on the previous one, so the compiler cannot pack the maxes
+            // of two vectors into v_pk_max_f16, which handles a signaling NaN differently from
+            // the one-row kernel's single loop.
+            if(r + v > 0)
+                asm("" : "+v"(vec_cur[r][v]) : "v"(prev));
             partial[r][v] = per_token_thread_absmax<DTYPE_I, vec_size>(vec_cur[r][v]);
+            prev          = partial[r][v];
             nan_partial |= __builtin_isnan(partial[r][v]);
         }
 
@@ -1485,7 +1460,7 @@ dynamic_per_token_scaled_quant_multirow_kernel(DTYPE_O* __restrict__ out,
         }
     }
 #else
-    // Wave64 layout and gfx9 asm; the host launches it on gfx942 only (per_token_multirow_enabled).
+    // Wave64 layout; the host launches it on gfx942 only (per_token_multirow_enabled).
     __builtin_trap();
 #endif
 }
