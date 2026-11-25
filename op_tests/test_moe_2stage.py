@@ -2915,7 +2915,13 @@ def test_plain_fp8_swiglu_limit_dispatch():
 
     for q in quant_types:
         # The runtime-limit CK instances are FP8 only, with inter_dim % 128 == 0.
-        raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
+        # per_Token still has the gfx942 whole-graph backend for that shape.
+        # per_Tensor does not, so it raises.
+        if q == aiter.QuantType.per_Token and get_gfx_runtime() == "gfx942":
+            md = dispatch(64, q, 7.0, inter=192)
+            assert md.full_impl is not None and md.stage1 is None, md
+        else:
+            raises(NotImplementedError, "swiglu_limit", dispatch, 64, q, 7.0, inter=192)
         raises(
             NotImplementedError,
             "swiglu_limit",

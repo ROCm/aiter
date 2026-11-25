@@ -47,7 +47,8 @@ def _wmma_compat(a, b, acc):
 
 
 gl.amd.gfx1250.wmma = _wmma_compat
-gl.amd.cdna5.wmma = _wmma_compat
+if hasattr(gl.amd, "cdna5"):
+    gl.amd.cdna5.wmma = _wmma_compat
 
 
 @gluon.jit
