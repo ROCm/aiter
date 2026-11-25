@@ -4,7 +4,6 @@ import argparse
 import glob
 import json
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +17,7 @@ from codegen.common import (
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
+    add_aiter_utils_to_sys_path,
     get_arch_map,
     open_if_changed,
     prune_unwritten,
@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -59,6 +60,29 @@ def _registry_arch(gfx: str) -> str:
     return base_gfx_arch(gfx)
 
 
+def _gfx950_num_xcd(targets: list[tuple[str, int]], targets_from_cli: bool) -> int:
+    """Choose one gfx950 XCD count for all kernels emitted by this generator."""
+    if add_aiter_utils_to_sys_path() is None:
+        return 8  # Standalone codegen without aiter.
+    import build_targets
+
+    if not targets_from_cli:
+        # Automatic targets include extra registry CU counts. Resolve the build
+        # target again to preserve CU_NUM overrides and native GPU detection.
+        return build_targets.build_num_xcds("gfx950")
+
+    target_cus = {cu for gfx, cu in targets if gfx == "gfx950"}
+
+    # Prefer supported targets in table order, with the full GPU first.
+    for cu in build_targets.GFX_CU_NUMS_MAP["gfx950"]:
+        if cu in target_cus:
+            return build_targets.target_num_xcds("gfx950", cu)
+
+    # For unlisted targets use the largest CU count; without gfx950 use 256 CUs.
+    cu = max(target_cus, default=256)
+    return build_targets.target_num_xcds("gfx950", cu)
+
+
 def _build_targets_standalone(explicit_targets=()):
     if explicit_targets:
         targets = []
@@ -84,14 +108,9 @@ def _build_targets_standalone(explicit_targets=()):
         )
     import importlib.util
 
-    spec = importlib.util.find_spec("aiter")  # locates, does not execute
-    if spec is None or not spec.submodule_search_locations:
+    utils_dir = add_aiter_utils_to_sys_path()
+    if utils_dir is None:
         raise ImportError("aiter package not found")
-    utils_dir = os.path.join(
-        next(iter(spec.submodule_search_locations)), "jit", "utils"
-    )
-    if utils_dir not in sys.path:
-        sys.path.insert(0, utils_dir)
     mod_spec = importlib.util.spec_from_file_location(
         "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
     )
@@ -270,12 +289,28 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # A16W16 uses separate direct-output and workspace launcher tables.
 A16W16_KID_DISPATCH_TAGS = set(_A16W16_TAGS)
-A8W8_BPRESHUFFLE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
+A8W8_BPRESHUFFLE_TAGS = {
+    "a8w8_blockscale_bpreshuffle_singlebuf",
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+}
+
+
+def _is_bpreshuffle_workspace_instance(k):
+    return (
+        k.arch_prefix == "gfx950"
+        and k.kernel_tag in A8W8_BPRESHUFFLE_TAGS
+        and k.bpreshuffle_entry is not None
+        and k.splitk_workspace_dtype is not None
+        and not k.direct_only
+    )
+
+
 # Three-tensor launchers: A16W16 and A8W8 no-scale.
 NOSCALE_TAGS = A16W16_KID_DISPATCH_TAGS | {"a8w8"}
 
@@ -420,8 +455,8 @@ _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE = """#ifdef OPUS_FUSED_HOST_TU
 #include "{traits_header}"
 template<typename Traits{fwd_decl_kargs_tpl}>
 __global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);
-#else
-#include "{pipeline_header}"
+{extra_forward_decls}#else
+{pipeline_includes}
 #endif"""
 
 
@@ -431,13 +466,18 @@ def instance_impl_host_tu_split(
     fwd_decl_kargs_tpl,
     kernel_func,
     fwd_decl_kargs_fnarg,
+    extra_forward_decls="",
 ):
+    headers = (
+        (pipeline_header,) if isinstance(pipeline_header, str) else pipeline_header
+    )
     return _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE.format(
         traits_header=traits_header,
-        pipeline_header=pipeline_header,
+        pipeline_includes="\n".join(f'#include "{header}"' for header in headers),
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         kernel_func=kernel_func,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+        extra_forward_decls=extra_forward_decls + "\n" if extra_forward_decls else "",
     )
 
 
@@ -461,8 +501,11 @@ def _make_host_decl(kid_name, dtype, host_extra_params):
     )
 
 
-def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, _host_extra_params):
-    """Emit the ``XQ,WQ,x_scale,w_scale,Y`` host declaration."""
+def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, host_extra_params):
+    """Emit the bpreshuffle host declaration with an optional workspace tail."""
+    # gfx942 already includes the scale tensors below.
+    if host_extra_params == A8W8_BLOCKSCALE_HOST_EXTRA:
+        host_extra_params = ""
     return (
         f"template void\n"
         f"{kid_name}<{dtype}>(\n"
@@ -470,7 +513,7 @@ def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, _host_extra_params):
         f"    aiter_tensor_t &WQ,\n"
         f"    aiter_tensor_t &x_scale,\n"
         f"    aiter_tensor_t &w_scale,\n"
-        f"    aiter_tensor_t &Y);\n"
+        f"    aiter_tensor_t &Y{host_extra_params});\n"
     )
 
 
@@ -513,8 +556,9 @@ def _record_one_instantiation(
 
 
 class opus_gemm_codegen:
-    def __init__(self, working_path, istune=False):
+    def __init__(self, working_path, istune=False, *, num_xcd):
         self.working_path = working_path
+        self.num_xcd = num_xcd
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
@@ -779,12 +823,17 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<{ctype}> }},  \\
 """
 
-        def _rows(arch, tags, ctype):
+        def _rows(arch, tags, ctype, workspace=None):
             rows = []
             for kid, k in kernels_dict.items():
                 if not isinstance(kid, KernelKey) or k.kernel_tag not in tags:
                     continue
                 if kid.gfx != arch or ctype not in k.output_dtypes:
+                    continue
+                if workspace is not None and (
+                    kid.family != "a8w8_blockscale_bpreshuffle"
+                    or _is_bpreshuffle_workspace_instance(k) != workspace
+                ):
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
@@ -833,9 +882,20 @@ class opus_gemm_codegen:
                     _emit_map(
                         f,
                         macro_name,
-                        _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
+                        _rows(
+                            arch,
+                            A8W8_BPRESHUFFLE_TAGS,
+                            ctype,
+                            workspace=False if arch == "gfx950" else None,
+                        ),
                         ctype,
                     )
+            _emit_map(
+                f,
+                "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_WORKSPACE_KID_DISPATCH_GFX950_BF16",
+                _rows("gfx950", A8W8_BPRESHUFFLE_TAGS, "bf16_t", workspace=True),
+                "bf16_t",
+            )
 
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
@@ -923,7 +983,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y);
+    aiter_tensor_t &Y{workspace_param});
 """
         # a8w8 noscale (3 args, no splitK) has its own exact-kid table.
         MANIFEST_NOSCALE_3ARG = """
@@ -984,7 +1044,16 @@ void
             elif k.kernel_tag == "a8w8_scale":
                 parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
+                workspace_param = (
+                    ",\n    aiter_tensor_t &workspace"
+                    if _is_bpreshuffle_workspace_instance(k)
+                    else ""
+                )
+                parts.append(
+                    MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(
+                        kernel_name=k.name, workspace_param=workspace_param
+                    )
+                )
             else:
                 raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
         # Every TU includes this header, so rewriting it unconditionally would
@@ -1137,7 +1206,11 @@ void
         is the preferred fast path when its constraints hold.
         """
         # Bucket present archs from splitk kids.
-        present_archs = set()
+        present_archs = {
+            row["splitk_reduce_arch"]
+            for row in self._device_instantiations
+            if row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+        }
         for row in self._device_instantiations:
             name = row["kid_name"]
             for arch_prefix in SPLITK_REDUCE_ARCHES:
@@ -1241,7 +1314,9 @@ void
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
         needs_reduce_tu = any(
-            ("flatmm_splitk" in row["kid_name"]) or ("_splitk_" in row["kid_name"])
+            row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+            or ("flatmm_splitk" in row["kid_name"])
+            or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
         )
         if needs_reduce_tu:
@@ -1290,9 +1365,9 @@ if __name__ == "__main__":
         default=None,
         required=False,
         help=(
-            "Colon-separated list of glob patterns pointing at tuned BF16 "
-            "GEMM CSVs (e.g. aiter/configs/bf16_tuned_gemm.csv and "
-            "aiter/configs/model_configs/*_bf16_tuned_gemm.csv). Each "
+            "Colon-separated paths or glob patterns for tuned GEMM CSVs, "
+            "including BF16 and MXFP8 bpreshuffle tables. Explicit files "
+            "must exist; unmatched model glob patterns are optional. Each "
             "file is filtered by `libtype == 'opus'`; surviving rows "
             "contribute their `solidx`/`kernelId` only to the subset-compile "
             "set S. Runtime callers provide the final kid explicitly. "
@@ -1346,6 +1421,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
 
     TAG_TO_LIST = {
+        "a8w8_blockscale_mxscale_gemm_bpreshuffle": a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
@@ -1384,7 +1460,10 @@ if __name__ == "__main__":
             pat = pat.strip()
             if not pat:
                 continue
-            for path in sorted(glob.glob(pat)):
+            matches = sorted(glob.glob(pat))
+            if not matches and not glob.has_magic(pat):
+                parser.error(f"tuned file not found: {pat}")
+            for path in matches:
                 if path in seen:
                     continue
                 seen.add(path)
@@ -1447,7 +1526,14 @@ if __name__ == "__main__":
     defaults = {
         key for gfx, cu in targets for key in default_compiled_keys(gfx, cu)
     } & available.keys()
-    mandatory = {key for key in available if key.family != "a16w16"}
+    # Select the gfx950 MXFP8 sweep from tuned rows, successful sidecars and
+    # explicit requests. Full sweep generation remains available via --tune.
+    mandatory = {
+        key
+        for key in available
+        if key.family != "a16w16"
+        and not (key.gfx == "gfx950" and key.family == "a8w8_blockscale_bpreshuffle")
+    }
     selected = (
         csv_keys | sidecar_keys | requested_keys | defaults | mandatory
     ) & available.keys()
@@ -1484,7 +1570,11 @@ if __name__ == "__main__":
         f"[opus gen_instances] targets={targets}, routes={len(selected)}, "
         f"symbols={len({available[key].name for key in selected})}"
     )
-    codegen = opus_gemm_codegen(args.working_path, args.tune)
+    codegen = opus_gemm_codegen(
+        args.working_path,
+        args.tune,
+        num_xcd=_gfx950_num_xcd(targets, targets_from_cli=bool(args.targets)),
+    )
     codegen.gen_instances({key: available[key] for key in sorted(selected)})
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
     Path(sidecar_path).write_text(
