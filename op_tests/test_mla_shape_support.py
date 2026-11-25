@@ -256,6 +256,15 @@ def test_decode_num_heads(monkeypatch):
         # It pads only onto a kernel head count, the list callers import.
         assert h == n or h in MLA_DECODE_KERNEL_HEAD_COUNTS, (n, q, h)
 
+    # gfx950's experimental HK route reports supported=None (no availability
+    # table) but ignores q_scale and kv_scale, so it never counts as running:
+    # 128 heads route there and are the last candidate, leaving no answer.
+    fp8 = torch.float8_e4m3fn
+    hk = {"arch": "gfx950", "enable_experimental": True}
+    s = get_mla_decode_shape_support(128, 1, fp8, fp8, **hk)
+    assert (s.backend, s.supported) == (MlaBackend.HK, None), s.reasons
+    assert get_mla_decode_num_heads(128, 1, fp8, fp8, **hk) is None
+
 
 def test_ps1_asm_cprr_kernel(monkeypatch):
     monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)

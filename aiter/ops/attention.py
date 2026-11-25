@@ -2709,8 +2709,15 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
 # counts the MLA decode kernels are built for. It only ever answers one of
 # these or the count it was asked for; narrower counts some architectures also
 # run (gfx950 fp8: 8 heads at qlen 4, 12 heads up to 128 rows) are not tried.
-# Callers that pick a padded width themselves read the list here.
+# Callers that pick a padded width themselves read the list here. Source of
+# truth: the head counts the decode backends are built for, i.e. the per-arch
+# asm tables (hsa/<arch>/mla/*.csv) and the FlyDSL / OPUS kernels; update this
+# list when a backend gains or drops a width.
 MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
+
+# JIT routes whose supported=None get_mla_decode_num_heads counts as running.
+# HK also reports None, but hk_mla_v32_decode_fwd ignores q_scale and kv_scale.
+_MLA_DECODE_JIT_BACKENDS_THAT_RUN = (MlaBackend.FLYDSL_PS1, MlaBackend.OPUS)
 
 
 def get_mla_decode_num_heads(
@@ -2726,11 +2733,12 @@ def get_mla_decode_num_heads(
     num_heads itself and each MLA_DECODE_KERNEL_HEAD_COUNTS entry above it are
     tried in order, each through get_mla_decode_shape_support with the same
     arguments, and the first that runs is returned. A head count runs when its
-    kernel is known to exist (supported is True), or when it takes a JIT route
-    that has no availability table and no asm (supported is None). A folded
-    PS1 route, a head count the planner or reducer rejects, and an asm route
-    whose table has no kernel or could not be queried do not run. None when no
-    head count up to 128 runs.
+    kernel is known to exist (supported is True), or when it takes a FlyDSL PS1
+    or OPUS JIT route, which has no availability table (supported is None). A
+    folded PS1 route, a head count the planner or reducer rejects, an asm route
+    whose table has no kernel or could not be queried, and gfx950's
+    experimental HK route (supported is None, but it ignores q_scale and
+    kv_scale) do not run. None when no head count up to 128 runs.
 
     Only those candidates are tried, so the answer is the fewest heads among
     them, not among every count the shape rules accept: gfx950 fp8 also runs
@@ -2756,7 +2764,9 @@ def get_mla_decode_num_heads(
             heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs
         )
         if s.supported or (
-            s.supported is None and s.asm_status is MlaAsmStatus.NOT_ASM
+            s.supported is None
+            and s.asm_status is MlaAsmStatus.NOT_ASM
+            and s.backend in _MLA_DECODE_JIT_BACKENDS_THAT_RUN
         ):
             return heads
     return None
