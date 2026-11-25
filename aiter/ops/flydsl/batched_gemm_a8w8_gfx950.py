@@ -482,6 +482,13 @@ def run_bmm_a8w8_mxfp8_gfx950(
     if fuse:
         name = _fused_quant_name(name, b, m, n, k, scale_args)
     cfg = _require_config(name)
+    # Each tile reads XQ from its first row with 32-bit offsets.
+    tile_span = (min(m, cfg["tile_m"]) - 1) * b * k + k
+    if tile_span >= 1 << 32:
+        raise RuntimeError(
+            f"[FlyDSL gfx950 bmm] {name}: one tile of XQ spans {tile_span} bytes "
+            f"for M={m}, B={b}, K={k}; must be below 4 GiB"
+        )
     stream = current_raw_stream(XQ.device)
     partials = counters = Out
     if fuse:

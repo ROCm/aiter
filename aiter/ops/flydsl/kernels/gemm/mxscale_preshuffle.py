@@ -106,12 +106,14 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
     packed into i32[8] by load_b). K0 blocks (256 i32 each) run contiguously along K as
     ((kt*k_halves + kh)*pair + p); the fp4 case keeps a size-1 `p` dim (byte-identical view).
     """
-    col_base = rocdl.readfirstlane(T.i32, row_elems * KH4)
+    # The N row is widened before scaling by its K bytes: past 8 GiB of B an i32
+    # dword offset would wrap.
+    col_base = rocdl.readfirstlane(T.i32, row_elems)
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=16
     )
-    off_i64 = fx.Int64(col_base)
-    base_iter = fx.inttoptr(i32_ptr_ty, arg_bq_addr + off_i64 * 4)
+    off_i64 = fx.Int64(col_base) * fx.Int64(KH4 * 4)
+    base_iter = fx.inttoptr(i32_ptr_ty, arg_bq_addr + off_i64)
     shape = (4, 16, k_tiles, k_halves, pair, 4)
     strides = (64, 4, k_halves * pair * 256, pair * 256, 256, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, strides)))
@@ -531,20 +533,25 @@ def _launch_gemm_impl(
             a_rstride = fx.Int32(a_row_bytes)
             sca_rstride = fx.Int32(_scale_chunk_dw_a)
 
-        # A source view, bound to the last valid M row (ragged M OOB -> 0).
+        # A source view of this WG's rows, as for C below: the i64 base moves to
+        # row bx_m, so every offset stays i32 for any A size, and num_records
+        # ends at the WG's last valid row (ragged M OOB -> 0).
         _i8g = fx.PointerType.get(
             T.i8, address_space=fx.AddressSpace.Global, alignment=16
         )
+        a_tile_addr = arg_a + fx.Int64(bx_m) * fx.Int64(a_rstride)
+        _a_rows_rem = i32_m - bx_m
+        _a_rows = (_a_rows_rem < BM).select(_a_rows_rem, fx.Int32(BM))
         if const_expr(batch > 1 and a_row_stride >= 0):
-            a_nrec = fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(a_rstride) + fx.Int64(
+            a_nrec = fx.Int64(_a_rows - fx.Int32(1)) * fx.Int64(a_rstride) + fx.Int64(
                 a_row_bytes
             )
         else:
-            a_nrec = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
+            a_nrec = fx.Int64(_a_rows) * fx.Int64(a_row_bytes)
         a_flat = fx.rocdl.make_buffer_tensor(
             fx.Tensor(
                 fx.make_view(
-                    fx.inttoptr(_i8g, arg_a),
+                    fx.inttoptr(_i8g, a_tile_addr),
                     fx.make_layout(65536 * a_row_bytes, 1),
                 )
             ),
@@ -588,7 +595,7 @@ def _launch_gemm_impl(
             )
             dma_blocks_per_row = A_ROW_B // 16
             dma_lane = lane % dma_blocks_per_row, lane // dma_blocks_per_row
-            dma_a_base = fx.add_offset(fx.get_iter(a_flat), bx_m * a_rstride)
+            dma_a_base = fx.get_iter(a_flat)
 
             # (dword, row lane, K lane, M tile, K half, register half).
             a_read_layout = fx.make_layout(
@@ -661,7 +668,7 @@ def _launch_gemm_impl(
                     col = lin % A_ROW_B
                     if const_expr(swz_lds):
                         col = col ^ ((row % k_blk16) * 16)
-                    gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
+                    gmem_byte = row * a_rstride + base_k_byte + col
                     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                     src = fx.slice(a_flat_div, (None, gmem_byte))
                     fx.copy(dma_atom, src, dst)

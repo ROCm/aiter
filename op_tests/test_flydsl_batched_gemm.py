@@ -630,6 +630,66 @@ def _run_fused_quant(shapes):
     print("fused quant epilogue ALL BIT-EXACT")
 
 
+def check_large_a():
+    """gfx950 past 4 GiB of XQ [M, B, K] (and of Out) stays exact.
+
+    Each tile reads XQ from its own first row through a 64-bit base; unfixed,
+    the rows past a 4 GiB span came back wrong. Inputs in {-1, 0, 1} with unit
+    scales make every fp32 sum exact, so the bf16 output must equal the rounded
+    reference bit for bit; M leaves a partial last tile. What one tile spans,
+    (min(M, tile_m) - 1) * B * K + K bytes, must still be below 4 GiB.
+    """
+    limit, b, n, k = 1 << 32, 16, 128, 512
+    free, _ = torch.cuda.mem_get_info()
+    if free < 3 * limit:
+        aiter.logger.info(
+            "skipping the past-4 GiB XQ check: %.1f GiB free", free / 2**30
+        )
+        return
+    m = limit // (b * k) + 100
+
+    def e8m0_ones(*shape):
+        return torch.full(shape, 127, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+
+    def ints(*shape):
+        return torch.randint(-1, 2, shape, dtype=torch.int8).to(dtypes.bf16)
+
+    torch.manual_seed(0)
+    step = 1 << 16
+    x8 = torch.empty((m, b, k), dtype=dtypes.fp8)
+    for i in range(0, m, step):
+        x8[i : i + step] = ints(min(step, m - i), b, k).to(dtypes.fp8)
+    w8 = ints(b, n, k).to(dtypes.fp8)
+    xs, ws = e8m0_ones(m, b, k // 128), e8m0_ones(b, n // 128, k // 128)
+    for name in (None, "flydsl_bmm_mxfp8_mfma_t128x128x128_w4x2_nb4_sk1_xcd"):
+        out = torch.empty((m, b, n), dtype=dtypes.bf16)
+        run_bmm_a8w8_mxfp8(x8, shuffle_weight(w8), xs, ws, out, kernel_name=name)
+        for i in range(0, m, step):
+            ref = torch.einsum("mbk,bnk->mbn", x8[i : i + step].float(), w8.float())
+            assert torch.equal(
+                out[i : i + step], ref.to(dtypes.bf16)
+            ), f"{name}: rows {i}+ differ"
+        del out
+    del x8, xs
+    torch.cuda.empty_cache()
+
+    m, b, n, k = 256, 4096, 256, 4224
+    try:
+        run_bmm_a8w8_mxfp8(
+            torch.empty((m, b, k), dtype=dtypes.fp8),
+            torch.empty((b, n, k), dtype=dtypes.fp8),
+            e8m0_ones(m, b, k // 128),
+            e8m0_ones(b, n // 128, k // 128),
+            torch.empty((m, b, n), dtype=dtypes.bf16),
+            kernel_name="flydsl_bmm_mxfp8_mfma_t256x256x128_w1x4_nb2_sk1_bd1_xcd",
+        )
+    except RuntimeError as e:
+        assert "below 4 GiB" in str(e), e
+    else:
+        raise AssertionError("an XQ tile spanning 4 GiB was launched")
+    aiter.logger.info("check_large_a: XQ and Out past 4 GiB exact; tile limit kept")
+
+
 @benchmark()
 def test_compute_switch_penalty(
     b, m, n, k, kernel_name, other_kernel_name, dtype=dtypes.bf16
@@ -777,6 +837,8 @@ def main():
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
+    if arch == "gfx950":
+        check_large_a()
     if arch in ("gfx1250", "gfx950"):
         _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
 

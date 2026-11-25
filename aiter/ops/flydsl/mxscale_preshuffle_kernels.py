@@ -261,6 +261,7 @@ def flydsl_mxscale_preshuffle_gemm(
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+        _SPLITK_MAX_TMP_BYTES,
         SCALE_BLOCKS_A,
         SCALE_BLOCKS_B,
         SCALE_LAYOUTS,
@@ -377,6 +378,13 @@ def flydsl_mxscale_preshuffle_gemm(
             raise ValueError(
                 f"illegal split_k={split_k} for K={K}, tile_k={tile_k}: "
                 f"K/split_k ({k_per_split}) must be a multiple of tile_k and 256"
+            )
+        # The split-K reduce reads the whole fp32 workspace through one
+        # 32-bit-offset buffer descriptor (fits_shape keeps tuned rows below it).
+        if split_k * M * N * 4 >= _SPLITK_MAX_TMP_BYTES:
+            raise ValueError(
+                f"split_k={split_k} needs a {split_k * M * N * 4}-byte fp32 "
+                f"workspace for M={M}, N={N}; it must be below 4 GiB"
             )
 
     # Constexpr tail of launch_gemm -- the same for the direct and the split-K launch
