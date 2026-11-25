@@ -58,6 +58,8 @@ _STREAM_VARIANTS = (
     "gfx1250_split10",
     "gfx1250_split14",
     "gfx1250_split3",
+    "mid768",  # gfx950, H=5120: five column splits over 48 token tiles.
+    "post192",  # gfx950, H=5120: register-local post-mix over ten waves.
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -73,6 +75,8 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "mid512",
         "mid1024",
         "mid2048",
+        "mid768",
+        "post192",
         "gfx1250_split32",
         "gfx1250_split16",
         "gfx1250_split8",
@@ -107,6 +111,10 @@ _GFX1250_SPLIT_TABLE = {
 def _select_stream_variant(tokens, hidden=5120):
     if tokens == 0:
         return "generic", 1
+    if tokens == 192 and hidden == 5120:
+        return "post192", 16
+    if tokens == 768 and hidden == 5120:
+        return "mid768", 5
     if tokens == 4:
         return "decode4", 32
     if tokens < 4:
