@@ -1423,8 +1423,7 @@ def test_mla(
 
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        kv_buffer_fp8, kv_scale = aiter.per_tensor_quant(kv_buffer, quant_dtype=kvtype)
 
         out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q,
@@ -1605,11 +1604,15 @@ def test_mla(
         # for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        q_fp8 = q.to(dtypes.fp8)
-        q_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
-        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        # Q and KV are both bf16 randn, so amax quantization gives them the same
+        # scale. Quantizing KV against a smaller bound keeps kv_scale distinct, so
+        # a kernel that applies q_scale to V fails.
+        kv_buffer_fp8, kv_scale = aiter.per_tensor_quant(
+            kv_buffer,
+            quant_dtype=dtypes.fp8,
+            dtypeMax=0.75 * torch.finfo(dtypes.fp8).max,
+        )
 
         out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
@@ -1623,7 +1626,7 @@ def test_mla(
             qk_rope_head_dim,
             dtype=out_dtype,
             is_causal=causal,
-            q_scale=None,
+            q_scale=q_scale,
             kv_scale=kv_scale,
         )
 
