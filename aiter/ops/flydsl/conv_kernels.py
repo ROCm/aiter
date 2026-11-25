@@ -16,6 +16,8 @@ import weakref
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 
+from .aot_cache import aot_cache_mode
+from .aot_launch import loaded_kernel
 from .kernels.conv.conv3d_gfx950_utils import (
     BF16_BYTES,
     CONV_COMPILE_HINTS,
@@ -613,13 +615,24 @@ def _pick_wgm(npq, k, groups, tile, device):
 
 
 def _dispatch(exe, *args, stream=None):
-    """Run a builder's launcher through ``_run_compiled`` (the AOT cache).
+    """Run a builder's launcher, through the AOT cache on first use.
 
     ``extra_args`` are the trailing scalars a variable-resolution conv3d takes
     on top of its tensors (the transpose's ``s``); empty for every other kernel.
+    The steady state calls the compiled function directly, as before the
+    cache: ``_run_compiled``'s lookup is paid once per launcher.
     """
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*args, *exe.extra_args, _as_stream(stream))
+        return
+    if aot_cache_mode() == "0":
+        exe._cf = exe.compile(*args, stream=stream)
+        return
     with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
         _run_compiled(exe.launcher, *args, *exe.extra_args, _as_stream(stream))
+    # None under COMPILE_ONLY or on the JIT fallback: those keep coming here.
+    exe._cf = loaded_kernel(exe.launcher)
 
 
 def _ncdhw_to_ndhwc(x, stream):

@@ -662,11 +662,12 @@ same argument shape run on gfx942):
 A loaded object fills each tensor slot with FlyDSL's generic fill (§7, issue
 3), about 0.25 us per tensor more than the JIT path's generated fills, so
 the launchers with 11 or 12 tensors pay 2 to 3.5 us; they run for tens of
-microseconds or more. The conv `_dispatch` costs about 3.5 us more than it
-did before on either path (8.4 us fixed-resolution, 10.2 us variable,
-7.1 us transpose): it called the `CompiledFunction` it kept on the launcher
-directly, and now pays `_run_compiled` and the `compile_hints` context
-(1.3 us) on every launch.
+microseconds or more. The conv `_dispatch` keeps the function the cache
+loaded and calls it directly, as it did with its own `CompiledFunction`
+before, so only its first launch goes through `_run_compiled`; the conv rows
+above predate that. With an empty four-tensor kernel a steady-state
+`_dispatch` takes 11.9 us on the JIT path and 12.6 us on a loaded object,
+the difference being the generic fill.
 
 ## 6. Adopting it for another op
 

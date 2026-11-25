@@ -65,7 +65,7 @@ from .aot_cache import (
     aot_cache_mode,
 )
 
-__all__ = ["aot_factory", "bind_aot"]
+__all__ = ["aot_factory", "bind_aot", "loaded_kernel"]
 
 _ATTR = "_aiter_aot"
 
@@ -218,6 +218,18 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
         )
         setattr(exe, _ATTR, False)
     return exe
+
+
+def loaded_kernel(exe, specialization_key=None):
+    """The function the cache loaded for a bound launcher's launches under
+    ``specialization_key``, to call with the same arguments (an ``fx.Stream``,
+    not a torch stream); None if it took the JIT path, was compiled only, or
+    was invalidated. For a wrapper that keeps one launcher per call site and
+    wants to skip ``_run_compiled``'s lookup."""
+    binding = getattr(exe, _ATTR, None)
+    if not binding or binding.epoch != binding.cache.epoch:
+        return None
+    return binding.kernels.get(specialization_key)
 
 
 class _LazyLauncher:
