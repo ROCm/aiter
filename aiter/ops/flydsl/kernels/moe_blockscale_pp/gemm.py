@@ -194,11 +194,35 @@ class StoreSlotBf16:
         self.route = route
         self.wave_row = _sgpr(fx.thread_idx.x // 64) * 32 + fx.thread_idx.x % 32
         self.lane_row = fx.thread_idx.x % 16
-        self.lane_col = _lane_col8()
         n_rows = n_tokens * topk
         self.c_div = _i32_view(C, n_rows * D * 2, n_rows * (D // 2), 16)
+        # One past the last word: a dropped store's offset (2**30 words, as
+        # before, wrapped to byte 0 in the 32-bit offset and wrote row 0).
+        self.oob = n_rows * (D // 2)
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+        # Quad order: lane 4a + b stores 8-column chunk b of row a, so every 4
+        # consecutive lanes write one contiguous 64 bytes. The TA splits a
+        # store by lane quads: in the MFMA order (lane 16q + r holds row r)
+        # each quad touches 4 rows, and 16 rows x 64 B moved ~17 B/clk a CU
+        # against ~47 B/clk in quad order (microbenchmark, random rows either
+        # way). Lane 4a + b takes the words of lane 16q + a, q the lane group
+        # holding chunk b (_lane_col8: q = 0, 2, 1, 3 for chunks 0..3); every
+        # q of lane group a holds row a, so the row index comes from the same
+        # lane.
+        lane = fx.thread_idx.x % 64
+        b = lane % 4
+        cinv = (b == 1).select(2, (b == 2).select(1, b))
+        self.perm = (cinv * 16 + lane // 4) * 4
+        self.quad_col = b * 8
+
+    def _bperm(self, v):
+        """``v`` of lane ``perm`` (no fx-level cross-lane gather: ds_bpermute)."""
+        return fx.Int32(
+            rocdl.ds_bpermute(
+                fx.Int32.ir_type, fx.Int32(self.perm).ir_value(), fx.Int32(v).ir_value()
+            )
+        )
 
     def _at(self, idx):
         return fx.make_view(
@@ -234,28 +258,41 @@ class StoreSlotBf16:
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
         return out
 
+    def quad_offsets(self, rows, valid):
+        """Per row tile: this lane's quad-order i32-word offset at column 0 (``oob`` if not ``valid``)."""
+        offs = []
+        for i in range_constexpr(N_TILES_A):
+            row = self._bperm(rows[i][0])
+            off = row * (self.D // 2) + self.quad_col // 2
+            offs.append(valid.select(off, self.oob))
+        return offs
+
     def pack(self, c_frag, rows):
-        """The 16-byte row pieces of ``c_frag`` (``[j * N_TILES_A + i]``), weighted: 4 words per row tile."""
+        """Weighted bf16 words of ``c_frag`` (``[j * N_TILES_A + i]``) in quad order: 4 per row tile."""
         words = []
         for i in range_constexpr(N_TILES_A):
             w = rows[i][1]
             x = (Vec(c_frag[i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
             y = (Vec(c_frag[N_TILES_A + i]) * w).to(fx.BFloat16).bitcast(fx.Int32)
+            # After the swap lane 16q + r holds 8 consecutive columns of row r.
             lo = _swap_pair(x[0], y[0])
             hi = _swap_pair(x[1], y[1])
-            words += [lo[0], hi[0], lo[1], hi[1]]
+            words += [self._bperm(v) for v in (lo[0], hi[0], lo[1], hi[1])]
         return words
 
-    def store_words(self, words, rows, base_col, valid=None):
-        """Store ``pack``'s words; ``valid`` False sends them past the descriptor (still issued)."""
+    def store(self, words, offs, col):
+        """Store ``pack``'s words at ``quad_offsets`` + column ``col`` (wave-uniform: the soffset)."""
         for i in range_constexpr(N_TILES_A):
             fx.memref_store_vec(
                 Vec.from_elements(words[4 * i : 4 * i + 4], fx.Int32), self.reg
             )
-            idx = (rows[i][0] * self.D + base_col + self.lane_col) // 2
-            if const_expr(valid is not None):
-                idx = valid.select(idx, fx.Int32(1 << 30))
-            fx.copy(self.atom, self.reg, fx.slice(self.c_div, (None, idx)))
+            fx.copy(
+                self.atom,
+                self.reg,
+                fx.slice(self.c_div, (None, offs[i])),
+                # In elements of the view (i32 words), like the offset.
+                soffset=fx.Int32(col) // 2,
+            )
 
 
 class SwigluFp8Epilogue:
@@ -602,6 +639,85 @@ class MoeScaleLds:
         ]
 
 
+class TileScaleLds:
+    """Stage 2: a tile's E8M0 A / B scales for every K block, one LDS slot per tile parity.
+
+    A (column-major ``[K // 128, M_pad]``): wave ``w`` loads the 256 bytes of K
+    block ``(w + rot) % k128`` of the tile's rows, a dword per lane, into
+    position ``w``, so step ``k`` of a K-rotated tile reads position ``k``. B:
+    every wave loads both weight row blocks' ``k128`` bytes twice over into
+    its own 256 bytes (lanes 8..63 repeat lanes 0..7), so the read at byte
+    ``rot + k`` needs no wrap. Two DMA instructions a wave a tile, where
+    ``MoeScaleLds`` issues four a 4-step chunk (most of them redundant B
+    copies); the TA was the stage's bottleneck (PMC: TA busy 75%).
+    """
+
+    def __init__(self, a_rsrc, b_div, k128, m_pad, lds, wave_id, a_row):
+        assert k128 == N_WAVES, "one A scale block per wave"
+        self.a_rsrc = a_rsrc
+        self.b_div = b_div
+        self.k128 = k128
+        self.m_pad = m_pad
+        self.lds = lds
+        self.wave_id = wave_id
+        self.a_area = k128 * 256
+        self.slot_bytes = self.a_area + N_WAVES * 256
+        self.lane = fx.thread_idx.x % 64
+        self.a_lane = a_row + self.lane % 16
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+        self.LdsPtr_t = fx.PointerType.get(fx.Float8E4M3FN.ir_type, 2, 512)
+
+    BYTES = 2 * (8 * 256 + N_WAVES * 256)
+
+    def dma(self, slot, row0, rot, b_rows):
+        """Stage a tile's scales into ``slot``; ``b_rows`` = its two weight row blocks."""
+        base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
+        slot_off = slot * self.slot_bytes + self.wave_id * 256
+        dst = fx.inttoptr(self.LdsPtr_t, base_i32 + slot_off)
+        blk = (self.wave_id + rot) % self.k128
+        rocdl.buffer_load_to_lds(
+            self.a_rsrc,
+            fx.to_llvm_ptr(dst),
+            fx.Int32(self.lane * 4).ir_value(),
+            size_bytes=4,
+            soffset=(blk * self.m_pad + row0).ir_value(),
+        )
+        j = self.lane % 8
+        off = (j < 4).select(b_rows[0], b_rows[1]) * self.k128 + j % 2 * 4
+        bdst = fx.inttoptr(self.LdsPtr_t, base_i32 + slot_off + self.a_area)
+        fx.copy(
+            self.atom,
+            fx.slice(self.b_div, (None, off)),
+            fx.make_view(bdst, fx.make_layout(1, 1)),
+        )
+
+    def bases(self, slot, rot):
+        """This tile's read bases: opaque offsets off the field, which keep the reads' alias scope."""
+        bias = fx.Int32(fx.ptrtoint(self.lds.ptr))
+        slot_off = slot * self.slot_bytes
+        a = _opaque_vgpr(slot_off + self.a_lane + bias) - bias
+        b_off = slot_off + self.a_area + self.wave_id * 256 + rot
+        return a, _opaque_vgpr(b_off + bias) - bias
+
+    def _byte(self, base, off):
+        v = fx.make_view(
+            fx.recast_iter(
+                fx.Uint8, fx.add_offset(self.lds.ptr, fx.make_int_tuple(base + off))
+            ),
+            fx.make_layout(1, 1),
+        )
+        return fx.Int32(v.load()[0])
+
+    def read_a(self, base, k, half_row, n_tiles):
+        return [
+            self._byte(base, k * 256 + half_row + t * 16)
+            for t in range_constexpr(n_tiles)
+        ]
+
+    def read_b(self, base, k, h, n_tiles):
+        return [self._byte(base, h * 16 + k)] * n_tiles
+
+
 def compile_moe_bs_gemm_8w(
     *,
     K: int,
@@ -657,7 +773,10 @@ def compile_moe_bs_gemm_8w(
 
     @fx.struct
     class SharedStorage:
-        S_lds: fx.Array[fx.Float8E4M3FN, 2 * MoeScaleLds.BYTES, 16]
+        if epilogue == "slot_bf16":
+            S_lds: fx.Array[fx.Float8E4M3FN, TileScaleLds.BYTES, 16]
+        else:
+            S_lds: fx.Array[fx.Float8E4M3FN, 2 * MoeScaleLds.BYTES, 16]
         if epilogue == "swiglu_fp8":
             R_lds: fx.Array[fx.Float32, 2 * 4 * 128, 16]
         if epilogue == "slot_bf16":
@@ -1018,11 +1137,29 @@ def compile_moe_bs_gemm_8w(
             lds.B_lds_next_1,
         )
 
+        if const_expr(deferred):
+            tsc = TileScaleLds(
+                a_scale_rsrc,
+                b_scale_div,
+                k128,
+                m_pad,
+                lds.S_lds,
+                wave_id,
+                wave_m * A_GRP_ROWS,
+            )
+
         def make_ctx(tile, expert):
             """Stage 2's loaders of one tile (contiguous A rows), from its index and expert."""
             m_blk = tile // NB
             nb = tile % NB
             row0 = m_blk * BLOCK_M
+            # K-order rotation: the 16 tiles of an m-block (one A panel, one
+            # XCD round) and the m-blocks of an expert (one B panel) start at
+            # different K steps, so most of them find a K slice already in L2
+            # instead of all waiting on the same miss. Stage 2 alone, T = 4096
+            # / 8192 / 16384: 327 / 383 / 662 -> 316 / 376 / 620 us with the
+            # per-tile scales that make it possible (ABAB).
+            rot = (m_blk + nb) % K_ITERS
             a_g2s = G2SRounds(a_div, gl_off_a[0], N_LDS_STEPS, F8_IR_t, wave_id, 64 * K)
             a_base = [(row0 + h * LDS_BLOCK_M) * K for h in range_constexpr(2)]
             b_buf = fx.rocdl.make_buffer_tensor(
@@ -1041,30 +1178,53 @@ def compile_moe_bs_gemm_8w(
                 64 * K,
             )
             b_off = [half_row0(nb, h) * K for h in range_constexpr(2)]
-            b_sc_row = expert * (N // 128) + (
-                (lane_id % 2 == 0).select(half_row0(nb, 0), half_row0(nb, 1)) // 128
-            )
-            raw_sc = MoeScaleLds(
-                a_scale_rsrc,
-                [sc_col[s] * m_pad + row0 + sc_row for s in range_constexpr(2)],
-                m_pad,
-                b_scale_div,
-                b_sc_row * k128,
-                k128,
-                wave_id,
-                wave_m * A_GRP_ROWS,
-                lds.S_lds,
-            )
+            b_rows = [
+                expert * (N // 128) + half_row0(nb, h) // 128
+                for h in range_constexpr(2)
+            ]
 
             def a_load(h, dst, k):
-                a_g2s.load(dst, a_base[h] + k * BLOCK_K)
+                a_g2s.load(dst, a_base[h] + (rot + k) % K_ITERS * BLOCK_K)
 
             def b_load(h, dst, k):
-                b_g2s.load(dst, b_off[h] + k * B_K_STEP)
+                b_g2s.load(dst, b_off[h] + (rot + k) % K_ITERS * B_K_STEP)
 
-            return {"a": a_load, "b": b_load, "sc": raw_sc, "row0": row0}
+            def sc_dma(slot):
+                tsc.dma(slot, row0, rot, b_rows)
 
-        def run_tile_stream(tile, expert, next_tile, parity, prev_tile, prev_acc):
+            return {"a": a_load, "b": b_load, "sc": sc_dma, "row0": row0, "rot": rot}
+
+        def h1_pad_row(tile):
+            """The sorted row whose padding means this wave's row-half-1 rows are all padding."""
+            return tile // NB * BLOCK_M + LDS_BLOCK_M + wave_m * A_GRP_ROWS
+
+        def is_pad(sid):
+            # Padding rows name token T (moe_sorting) and sit at the end of an
+            # expert's block: past the first one, every row is padding.
+            return ((sid & 0xFFFFFF) >= n_tokens).select(fx.Int32(1), fx.Int32(0))
+
+        def mfma_skip(skip, burst, c):
+            """``burst()`` unless ``skip``: a wave-uniform branch around an MFMA burst."""
+            out = c
+            if skip == 0:
+                out = burst()
+            return out
+
+        def mfma_h1(b, a, c, sb, sa, skip):
+            """``mfma.call`` of a row-half-1 quadrant, dropped when this wave's rows there are padding."""
+            rocdl.s_setprio(1)
+            c = mfma_skip(
+                skip,
+                lambda: mfma.call(b, a, c, sb, sa, k_pack=0, set_prio=False),
+                c,
+            )
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+            return c
+
+        def run_tile_stream(
+            tile, expert, skip_h1, next_tile, parity, prev_tile, prev_acc
+        ):
             """Stage 2: K-steps 0 .. K - 1 of ``tile``.
 
             One K-step stream runs across tiles: step k loads A half 1 of step
@@ -1075,16 +1235,20 @@ def compile_moe_bs_gemm_8w(
             converts and stores the previous tile's accumulators ``prev_acc``,
             each just before its registers start accumulating again (HK's
             stage-2 epilogue): the conversion then runs while the other
-            group's MFMAs do. Returns (accumulators, next expert).
+            group's MFMAs do. Returns (accumulators, next expert, next skip).
             """
             valid = prev_tile >= 0
             pcols = slot_cols(fx.Int32(prev_tile) % NB)
             prev_slot = 1 - parity
+            prev_rows = {}
 
-            def store_prev(g, rows):
+            def store_prev(g):
                 """Accumulator group g = (row half, column half) g // 2, g % 2."""
-                words = store_c.pack(prev_acc[g], rows)
-                store_c.store_words(words, rows, pcols[g % 2], valid)
+                if const_expr(g % 2 == 0):
+                    rows = store_c.rows_half(wave_m, prev_slot, g // 2)
+                    prev_rows[g // 2] = (rows, store_c.quad_offsets(rows, valid))
+                rows, offs = prev_rows[g // 2]
+                store_c.store(store_c.pack(prev_acc[g], rows), offs, pcols[g % 2])
 
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
@@ -1092,6 +1256,7 @@ def compile_moe_bs_gemm_8w(
             cur = make_ctx(tile, expert)
             nxt = None
             nxt_expert = None
+            nxt_skip = None
             c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
             c01 = list(c00)
             c10 = list(c00)
@@ -1100,10 +1265,13 @@ def compile_moe_bs_gemm_8w(
             def src(kk):
                 return (cur, kk) if kk < K_ITERS else (nxt, kk - K_ITERS)
 
+            sc_a, sc_b = tsc.bases(parity, cur["rot"])
+
             def sc_read(k, which):
                 op, h = int(which[0] == "b"), int(which[1])
-                half_row = h * (LDS_BLOCK_N if op else LDS_BLOCK_M)
-                return cur["sc"].read(op, half_row, N_TILES_B if op else N_TILES_A, k)
+                if const_expr(op == 1):
+                    return tsc.read_b(sc_b, k, h, N_TILES_B)
+                return tsc.read_a(sc_a, k, h * LDS_BLOCK_M, N_TILES_A)
 
             for k in range_constexpr(K_ITERS):
                 if const_expr(k == K_ITERS - 4):
@@ -1116,21 +1284,17 @@ def compile_moe_bs_gemm_8w(
                     # Older than this step's A1 load: its end wait drains them.
                     routes = store_c.fetch(cur["row0"])
                     nxt_eid = _load_i32_lane(eids_div, next_tile // NB)
+                    nxt_pad = _load_i32_lane(ids_div, h1_pad_row(next_tile))
                 ctx, kk = src(k + 1)
                 ctx["a"](1, a_next1, kk)
                 if const_expr(k == 0):
-                    prev_rows = store_c.rows_half(wave_m, prev_slot, 0)
-                    store_prev(0, prev_rows)
+                    store_prev(0)
                 rocdl.s_barrier()
-                # Chunk k / 4 + 1 lands in the slot chunk k / 4 - 1 held, which
-                # both groups have finished reading once past this barrier.
-                sc_dma = k % MoeScaleLds.CHUNK == 0
+                # The next tile's scales go to the other parity's slot, which
+                # the previous tile finished reading tiles ago.
+                sc_dma = k == K_ITERS - 4
                 if const_expr(sc_dma):
-                    chunk = k // MoeScaleLds.CHUNK + 1
-                    if const_expr(chunk < n_chunks):
-                        cur["sc"].dma(chunk)
-                    else:
-                        nxt["sc"].dma(0)
+                    nxt["sc"](1 - parity)
 
                 c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
@@ -1139,7 +1303,7 @@ def compile_moe_bs_gemm_8w(
                 ctx, kk = src(k + 2)
                 ctx["b"](0, b_cur0, kk)
                 if const_expr(k == 0):
-                    store_prev(1, prev_rows)
+                    store_prev(1)
                 rocdl.s_barrier()
 
                 c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
@@ -1148,9 +1312,8 @@ def compile_moe_bs_gemm_8w(
                 a1_frag = a_s2r.load(a_cur1)
                 ctx["a"](0, a_cur0, kk)
                 if const_expr(k == 0):
-                    prev_rows = store_c.rows_half(wave_m, prev_slot, 1)
-                    store_prev(2, prev_rows)
-                n_sc = 4 if sc_dma else 0
+                    store_prev(2)
+                n_sc = 2 if sc_dma else 0
                 # vmcnt is in order: a store is drained by the first wait for a
                 # load issued after it, so step 0's stores stay in flight
                 # through its own waits; step 1's middle wait drains the
@@ -1158,30 +1321,31 @@ def compile_moe_bs_gemm_8w(
                 wait_barrier(
                     4 * N_LDS_STEPS
                     + n_sc
-                    + (3 + 3 * QUAD_STORES if k == 0 else 0)
+                    + (4 + 3 * QUAD_STORES if k == 0 else 0)
                     + (2 * QUAD_STORES if k == 1 else 0)
                 )
 
-                c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
+                c10 = mfma_h1(b0_frag, a1_frag, c10, sb0, sa1, skip_h1)
 
                 ctx["b"](1, b_cur1, kk)
                 if const_expr(k == 0):
-                    store_prev(3, prev_rows)
+                    store_prev(3)
                 wait_barrier(
                     3 * N_LDS_STEPS + n_sc + (4 * QUAD_STORES if k == 0 else 0)
                 )
                 if const_expr(k == 0):
                     store_c.stash(routes, parity)
                     nxt_expert = _sgpr(nxt_eid)
+                    nxt_skip = _sgpr(is_pad(nxt_pad))
 
-                c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
+                c11 = mfma_h1(b1_frag, a1_frag, c11, sb1, sa1, skip_h1)
 
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
                 b_cur1, b_next1 = b_next1, b_cur1
 
-            return [c00, c01, c10, c11], nxt_expert
+            return [c00, c01, c10, c11], nxt_expert, nxt_skip
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -1207,7 +1371,7 @@ def compile_moe_bs_gemm_8w(
                 _load_i32(eids_div, first_tile // NB), fx.Int32(0)
             )
             first = make_ctx(first_tile, first_expert)
-            first["sc"].dma(0)
+            first["sc"](0)
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
             )
@@ -1223,24 +1387,26 @@ def compile_moe_bs_gemm_8w(
             first["b"](1, b_next1, 1)
             wait_barrier(3 * N_LDS_STEPS)
 
+            first_skip = _sgpr(is_pad(_load_i32_lane(ids_div, h1_pad_row(first_tile))))
             n_acc = N_TILES_A * N_TILES_B
-            init = [fx.Int32(0), fx.Int32(-1), first_expert] + [mfma.zero_value] * (
-                4 * n_acc
-            )
+            init = [fx.Int32(0), fx.Int32(-1), first_expert, first_skip] + [
+                mfma.zero_value
+            ] * (4 * n_acc)
             for tile, state in range(start, n_tiles, grid, init=init):
                 nt = fx.Int32(tile) + grid
                 # The last tile streams itself again; nothing reads those loads.
                 nt = (nt < n_tiles).select(nt, fx.Int32(tile))
-                acc = state[3:]
-                acc, nxt_expert = run_tile_stream(
+                acc = state[4:]
+                acc, nxt_expert, nxt_skip = run_tile_stream(
                     fx.Int32(tile),
                     state[2],
+                    state[3],
                     nt,
                     state[0] & 1,
                     state[1],
                     [acc[g * n_acc : (g + 1) * n_acc] for g in range(4)],
                 )
-                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert] + [
+                final = yield [state[0] + 1, fx.Int32(tile), nxt_expert, nxt_skip] + [
                     v for g in acc for v in g
                 ]
             # The last tile's stores (a workgroup without a tile sends them
@@ -1248,13 +1414,11 @@ def compile_moe_bs_gemm_8w(
             last_slot = (final[0] + 1) & 1
             last_cols = slot_cols(fx.Int32(final[1]) % NB)
             for g in range_constexpr(4):
-                rows = store_c.rows_half(wave_m, last_slot, g // 2)
-                store_c.store_words(
-                    store_c.pack(final[3 + g * n_acc : 3 + (g + 1) * n_acc], rows),
-                    rows,
-                    last_cols[g % 2],
-                    final[1] >= 0,
-                )
+                if const_expr(g % 2 == 0):
+                    rows = store_c.rows_half(wave_m, last_slot, g // 2)
+                    offs = store_c.quad_offsets(rows, final[1] >= 0)
+                acc = final[4 + g * n_acc : 4 + (g + 1) * n_acc]
+                store_c.store(store_c.pack(acc, rows), offs, last_cols[g % 2])
             # No LDS-DMA may land after the workgroup exits; the leading
             # group's barrier pairs the lagging group's prologue one.
             fx.rocdl.s_waitcnt(vmcnt=0)
