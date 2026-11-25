@@ -1,0 +1,4156 @@
+{
+  "gfx950": [
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp16_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "16",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 0
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp16_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "16",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 1
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp32_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "32",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 2
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp32_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "32",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 3
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp64_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 4
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp64_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 5
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp16_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "16",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 6
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp16_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "16",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 7
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp32_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "32",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 8
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp32_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "32",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 9
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm0_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 10
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm0_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 11
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm16_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 12,
+      "supported_shapes": [
+        [
+          1280,
+          6144,
+          7168
+        ],
+        [
+          1280,
+          7168,
+          7168
+        ],
+        [
+          1280,
+          7168,
+          16384
+        ],
+        [
+          1536,
+          6144,
+          7168
+        ],
+        [
+          1536,
+          7168,
+          7168
+        ],
+        [
+          1536,
+          7168,
+          16384
+        ],
+        [
+          1792,
+          6144,
+          7168
+        ],
+        [
+          1792,
+          7168,
+          7168
+        ],
+        [
+          1792,
+          7168,
+          16384
+        ],
+        [
+          2048,
+          6144,
+          7168
+        ],
+        [
+          2048,
+          7168,
+          7168
+        ],
+        [
+          2048,
+          7168,
+          16384
+        ],
+        [
+          4096,
+          6144,
+          7168
+        ],
+        [
+          4096,
+          7168,
+          7168
+        ],
+        [
+          4096,
+          7168,
+          16384
+        ],
+        [
+          6144,
+          7168,
+          7168
+        ],
+        [
+          6144,
+          7168,
+          16384
+        ],
+        [
+          8192,
+          6144,
+          7168
+        ],
+        [
+          8192,
+          7168,
+          7168
+        ],
+        [
+          8192,
+          7168,
+          16384
+        ],
+        [
+          10240,
+          6144,
+          7168
+        ],
+        [
+          10240,
+          7168,
+          7168
+        ],
+        [
+          10240,
+          7168,
+          16384
+        ],
+        [
+          12288,
+          6144,
+          7168
+        ],
+        [
+          12288,
+          7168,
+          7168
+        ],
+        [
+          12288,
+          7168,
+          16384
+        ],
+        [
+          14336,
+          6144,
+          7168
+        ],
+        [
+          14336,
+          7168,
+          7168
+        ],
+        [
+          14336,
+          7168,
+          16384
+        ],
+        [
+          16384,
+          6144,
+          7168
+        ],
+        [
+          16384,
+          7168,
+          7168
+        ],
+        [
+          16384,
+          7168,
+          16384
+        ],
+        [
+          20480,
+          6144,
+          7168
+        ],
+        [
+          20480,
+          7168,
+          7168
+        ],
+        [
+          20480,
+          7168,
+          16384
+        ],
+        [
+          24576,
+          6144,
+          7168
+        ],
+        [
+          24576,
+          7168,
+          7168
+        ],
+        [
+          24576,
+          7168,
+          16384
+        ],
+        [
+          28672,
+          6144,
+          7168
+        ],
+        [
+          28672,
+          7168,
+          7168
+        ],
+        [
+          28672,
+          7168,
+          16384
+        ],
+        [
+          32768,
+          6144,
+          7168
+        ],
+        [
+          32768,
+          7168,
+          7168
+        ],
+        [
+          40960,
+          6144,
+          7168
+        ],
+        [
+          40960,
+          7168,
+          7168
+        ],
+        [
+          40960,
+          7168,
+          16384
+        ],
+        [
+          49152,
+          6144,
+          7168
+        ],
+        [
+          49152,
+          7168,
+          7168
+        ],
+        [
+          49152,
+          7168,
+          16384
+        ],
+        [
+          57344,
+          6144,
+          7168
+        ],
+        [
+          57344,
+          7168,
+          7168
+        ],
+        [
+          57344,
+          7168,
+          16384
+        ],
+        [
+          65536,
+          6144,
+          7168
+        ],
+        [
+          65536,
+          7168,
+          7168
+        ],
+        [
+          65536,
+          7168,
+          16384
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm16_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 16>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 13,
+      "supported_shapes": [
+        [
+          1280,
+          6144,
+          7168
+        ],
+        [
+          1280,
+          7168,
+          7168
+        ],
+        [
+          1280,
+          7168,
+          16384
+        ],
+        [
+          1536,
+          6144,
+          7168
+        ],
+        [
+          1536,
+          7168,
+          7168
+        ],
+        [
+          1536,
+          7168,
+          16384
+        ],
+        [
+          1792,
+          6144,
+          7168
+        ],
+        [
+          1792,
+          7168,
+          7168
+        ],
+        [
+          1792,
+          7168,
+          16384
+        ],
+        [
+          2048,
+          6144,
+          7168
+        ],
+        [
+          2048,
+          7168,
+          7168
+        ],
+        [
+          2048,
+          7168,
+          16384
+        ],
+        [
+          4096,
+          6144,
+          7168
+        ],
+        [
+          4096,
+          7168,
+          7168
+        ],
+        [
+          4096,
+          7168,
+          16384
+        ],
+        [
+          6144,
+          7168,
+          7168
+        ],
+        [
+          6144,
+          7168,
+          16384
+        ],
+        [
+          8192,
+          6144,
+          7168
+        ],
+        [
+          8192,
+          7168,
+          7168
+        ],
+        [
+          8192,
+          7168,
+          16384
+        ],
+        [
+          10240,
+          6144,
+          7168
+        ],
+        [
+          10240,
+          7168,
+          7168
+        ],
+        [
+          10240,
+          7168,
+          16384
+        ],
+        [
+          12288,
+          6144,
+          7168
+        ],
+        [
+          12288,
+          7168,
+          7168
+        ],
+        [
+          12288,
+          7168,
+          16384
+        ],
+        [
+          14336,
+          6144,
+          7168
+        ],
+        [
+          14336,
+          7168,
+          7168
+        ],
+        [
+          14336,
+          7168,
+          16384
+        ],
+        [
+          16384,
+          6144,
+          7168
+        ],
+        [
+          16384,
+          7168,
+          7168
+        ],
+        [
+          16384,
+          7168,
+          16384
+        ],
+        [
+          20480,
+          6144,
+          7168
+        ],
+        [
+          20480,
+          7168,
+          7168
+        ],
+        [
+          20480,
+          7168,
+          16384
+        ],
+        [
+          24576,
+          6144,
+          7168
+        ],
+        [
+          24576,
+          7168,
+          7168
+        ],
+        [
+          24576,
+          7168,
+          16384
+        ],
+        [
+          28672,
+          6144,
+          7168
+        ],
+        [
+          28672,
+          7168,
+          7168
+        ],
+        [
+          28672,
+          7168,
+          16384
+        ],
+        [
+          32768,
+          6144,
+          7168
+        ],
+        [
+          32768,
+          7168,
+          7168
+        ],
+        [
+          40960,
+          6144,
+          7168
+        ],
+        [
+          40960,
+          7168,
+          7168
+        ],
+        [
+          40960,
+          7168,
+          16384
+        ],
+        [
+          49152,
+          6144,
+          7168
+        ],
+        [
+          49152,
+          7168,
+          7168
+        ],
+        [
+          49152,
+          7168,
+          16384
+        ],
+        [
+          57344,
+          6144,
+          7168
+        ],
+        [
+          57344,
+          7168,
+          7168
+        ],
+        [
+          57344,
+          7168,
+          16384
+        ],
+        [
+          65536,
+          6144,
+          7168
+        ],
+        [
+          65536,
+          7168,
+          7168
+        ],
+        [
+          65536,
+          7168,
+          16384
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm4_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 4>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 14,
+      "supported_shapes": [
+        [
+          14336,
+          2048,
+          7168
+        ],
+        [
+          16384,
+          2048,
+          7168
+        ],
+        [
+          40960,
+          1536,
+          7168
+        ],
+        [
+          49152,
+          1536,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm4_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 4>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 15,
+      "supported_shapes": [
+        [
+          3072,
+          7168,
+          21504
+        ],
+        [
+          10240,
+          1536,
+          7168
+        ],
+        [
+          28672,
+          1536,
+          7168
+        ],
+        [
+          65536,
+          1536,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm16_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 16,
+      "supported_shapes": [
+        [
+          6144,
+          7168,
+          3072
+        ],
+        [
+          8192,
+          7168,
+          4096
+        ],
+        [
+          10240,
+          7168,
+          3072
+        ],
+        [
+          32768,
+          7168,
+          16384
+        ],
+        [
+          57344,
+          1536,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm16_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 16>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 17,
+      "supported_shapes": [
+        [
+          8192,
+          7168,
+          2048
+        ],
+        [
+          8192,
+          7168,
+          3072
+        ],
+        [
+          16384,
+          7168,
+          4096
+        ],
+        [
+          28672,
+          7168,
+          3072
+        ],
+        [
+          32768,
+          7168,
+          4096
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp32_u2_gm4_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "32",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 4>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 18,
+      "supported_shapes": [
+        [
+          1088,
+          7168,
+          4096
+        ],
+        [
+          1152,
+          7168,
+          4096
+        ],
+        [
+          1216,
+          7168,
+          4096
+        ],
+        [
+          1280,
+          7168,
+          4096
+        ],
+        [
+          1344,
+          7168,
+          4096
+        ],
+        [
+          1408,
+          7168,
+          4096
+        ],
+        [
+          1472,
+          7168,
+          4096
+        ],
+        [
+          1536,
+          7168,
+          4096
+        ],
+        [
+          1600,
+          7168,
+          4096
+        ],
+        [
+          1664,
+          7168,
+          4096
+        ],
+        [
+          1728,
+          7168,
+          4096
+        ],
+        [
+          1792,
+          7168,
+          4096
+        ],
+        [
+          1856,
+          7168,
+          4096
+        ],
+        [
+          1920,
+          7168,
+          4096
+        ],
+        [
+          1984,
+          7168,
+          4096
+        ],
+        [
+          2048,
+          7168,
+          4096
+        ],
+        [
+          4096,
+          7168,
+          4096
+        ],
+        [
+          6144,
+          7168,
+          4096
+        ],
+        [
+          8192,
+          7168,
+          4096
+        ],
+        [
+          10240,
+          7168,
+          4096
+        ],
+        [
+          12288,
+          7168,
+          4096
+        ],
+        [
+          14336,
+          7168,
+          4096
+        ],
+        [
+          16384,
+          7168,
+          4096
+        ],
+        [
+          20480,
+          7168,
+          4096
+        ],
+        [
+          24576,
+          7168,
+          4096
+        ],
+        [
+          28672,
+          7168,
+          4096
+        ],
+        [
+          40960,
+          7168,
+          4096
+        ],
+        [
+          49152,
+          7168,
+          4096
+        ],
+        [
+          57344,
+          7168,
+          4096
+        ],
+        [
+          65536,
+          7168,
+          4096
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp64_u4_gm4_wide0_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 4>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 19,
+      "supported_shapes": [
+        [
+          1984,
+          7168,
+          16384
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm4_wide1_sn1536_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_static_shape_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 4>, 0, 1536>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 20,
+      "supported_shapes": [
+        [
+          10240,
+          1536,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm4_wide1_sn2048_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_static_shape_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 4>, 0, 2048>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 21,
+      "supported_shapes": [
+        [
+          14336,
+          2048,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u4_gm4_wide0_sn1536_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "4",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_static_shape_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, false, 4>, 0, 1536>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 22,
+      "supported_shapes": [
+        [
+          20480,
+          1536,
+          7168
+        ],
+        [
+          32768,
+          1536,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm0_wide0_sn7168_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_static_shape_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>, 0, 7168>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 23,
+      "supported_shapes": [
+        [
+          1792,
+          7168,
+          3072
+        ],
+        [
+          2048,
+          7168,
+          2048
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u2_gm16_wide1_sn0_sl0_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 24,
+      "supported_shapes": [
+        [
+          6144,
+          7168,
+          2048
+        ],
+        [
+          6144,
+          7168,
+          3072
+        ],
+        [
+          6144,
+          7168,
+          4096
+        ],
+        [
+          8192,
+          7168,
+          4096
+        ],
+        [
+          10240,
+          7168,
+          3072
+        ],
+        [
+          10240,
+          7168,
+          4096
+        ],
+        [
+          16384,
+          7168,
+          3072
+        ],
+        [
+          20480,
+          7168,
+          4096
+        ],
+        [
+          24576,
+          1536,
+          7168
+        ],
+        [
+          24576,
+          7168,
+          4096
+        ],
+        [
+          28672,
+          7168,
+          4096
+        ],
+        [
+          32768,
+          7168,
+          3072
+        ],
+        [
+          32768,
+          7168,
+          4096
+        ],
+        [
+          40960,
+          7168,
+          4096
+        ],
+        [
+          49152,
+          7168,
+          4096
+        ],
+        [
+          57344,
+          1536,
+          7168
+        ],
+        [
+          57344,
+          7168,
+          4096
+        ],
+        [
+          65536,
+          7168,
+          4096
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp64_u2_gm0_wide0_sn0_sl0_sched2_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>, 2, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 0,
+      "m_align": 16,
+      "kid": 25,
+      "supported_shapes": [
+        [
+          1920,
+          7168,
+          16384
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u8_gm16_wide1_sn0_sl0_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 26,
+      "supported_shapes": [
+        [
+          16384,
+          6144,
+          7168
+        ],
+        [
+          65536,
+          7168,
+          3072
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u8_gm16_wide1_sn0_sl0_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 27,
+      "supported_shapes": [
+        [
+          20480,
+          7168,
+          3072
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp32_u8_gm16_wide1_sn0_sl1_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>, 32, 1>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 28,
+      "supported_shapes": [
+        [
+          32768,
+          6144,
+          7168
+        ],
+        [
+          40960,
+          7168,
+          3072
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp32_u8_gm16_wide1_sn0_sl2_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>, 32, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 29,
+      "supported_shapes": [
+        [
+          16384,
+          7168,
+          4096
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u8_gm16_wide1_sn0_sl2_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>, 64, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 30,
+      "supported_shapes": [
+        [
+          10240,
+          7168,
+          4096
+        ],
+        [
+          40960,
+          6144,
+          7168
+        ],
+        [
+          57344,
+          6144,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp64_u8_gm16_wide1_sn0_sl2_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>, 64, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 31,
+      "supported_shapes": [
+        [
+          32768,
+          6144,
+          7168
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm1_sp64_u2_gm0_wide0_sn0_sl2_sched0_vf1",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits>, 64, 2, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 16,
+      "kid": 32,
+      "supported_shapes": [
+        [
+          1920,
+          7168,
+          3072
+        ]
+      ]
+    },
+    {
+      "pipeline": "pin_agpr",
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "variant": "pm0_sp32_u2_gm16_wide1_sn0_sl2_sched0_vf0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "pad_m": false,
+      "wide_output": true,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_panel_traits",
+        "args": [
+          "64",
+          "2",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr",
+      "body_args": [
+        "opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_scale_traits<opus_gemm_bpreshuffle_pin_schedule_traits<opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits<CoTraits, opus_gemm_blockscale_mxscale_bpreshuffle_pin_matrix_view::tile, opus_gemm_blockscale_mxscale_bpreshuffle_pin_output::lds, false, true, 16>, 8, 0>, 64, 2>, 32, 2, 2>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
+      "pin_variant": true,
+      "pin_mask": 3,
+      "m_align": 256,
+      "kid": 33,
+      "supported_shapes": [
+        [
+          12288,
+          7168,
+          4096
+        ]
+      ]
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd2_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "128",
+          "128",
+          "4",
+          "2",
+          "0",
+          "true",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "true",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 34
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "64",
+          "128",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 35
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=1"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "96",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 36
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "96",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "false",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 4,
+      "kid": 37
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 38
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "false",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 4,
+      "kid": 39
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 5,
+      "kid": 40
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "96",
+          "128",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 41
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "96",
+          "128",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "true"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 5,
+      "kid": 42
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "128",
+          "128",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "kid": 43
+    },
+    {
+      "pipeline": "prefetch_b_vgpr",
+      "tile": [
+        96,
+        128,
+        256
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p2_bd1_pinA0C0_xcd1_contig0_ca17cb1_wg1_pub0_sa1_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "args": [
+          "96",
+          "128",
+          "2",
+          "1",
+          "1",
+          "true",
+          "64",
+          "4",
+          "1",
+          "17",
+          "0",
+          "256",
+          "false",
+          "false",
+          "false"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "opus_gemm_bpreshuffle_b_pipeline_traits<CoTraits, true, false, false>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 0,
+      "kid": 44
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd2_pinA0C1_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "96",
+          "256",
+          "4",
+          "2",
+          "0",
+          "true",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "true",
+          "false",
+          "true",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 4,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 45
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd2_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "128",
+          "128",
+          "4",
+          "2",
+          "0",
+          "true",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "true",
+          "true",
+          "false",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 46
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "64",
+          "128",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 47
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "96",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 48
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "96",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "false",
+          "true",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 4,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 49
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "false",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 50
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "false",
+          "true",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 4,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 51
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p4_bd1_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "128",
+          "256",
+          "4",
+          "1",
+          "0",
+          "false",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "false",
+          "true",
+          "true",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_args": [
+        "CoTraits",
+        "CoTraits::PUBLISH_M"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "linear",
+      "pin_variant": true,
+      "pin_mask": 5,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 52
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        1,
+        4
+      ],
+      "variant": "p3_bd2_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "128",
+          "128",
+          "3",
+          "2",
+          "0",
+          "true",
+          "64",
+          "4",
+          "1",
+          "0",
+          "0",
+          "128",
+          "true",
+          "true",
+          "false",
+          "0"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_args": [
+        "CoTraits"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 1,
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "kid": 53
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        64,
+        128,
+        256
+      ],
+      "wave_layout": [
+        1,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        2
+      ],
+      "variant": "p4_bd2_pinA0C0_xcd1_contig0_ca1cb17_wg2_pub1_sa0_sb1_compact0_aheadauto_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "64",
+          "128",
+          "4",
+          "2",
+          "17",
+          "true",
+          "64",
+          "2",
+          "2",
+          "1",
+          "0",
+          "256",
+          "false",
+          "false",
+          "false",
+          "1"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_args": [
+        "opus_gemm_bpreshuffle_b_pipeline_traits<CoTraits, false, true, false>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 0,
+      "kid": 54
+    },
+    {
+      "pipeline": "prefetch_b_vgpr_overlap",
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "wave_layout": [
+        1,
+        2
+      ],
+      "variant": "p4_bd2_pinA0C0_xcd1_contig0_ca17cb1_wg1_pub2_sa1_sb1_compact1_ahead7_out0",
+      "device_flags": [
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-fno-gpu-rdc",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-mllvm",
+        "--amdgpu-kernarg-preload-count=32",
+        "-mllvm",
+        "--amdgpu-mfma-vgpr-form",
+        "-mllvm",
+        "--lsr-drop-solution=1",
+        "-mllvm",
+        "-amdgpu-early-inline-all=true",
+        "-mllvm",
+        "-amdgpu-function-calls=false",
+        "-mllvm",
+        "-enable-post-misched=0"
+      ],
+      "wide_output": true,
+      "max_k": null,
+      "traits": {
+        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "args": [
+          "64",
+          "64",
+          "4",
+          "2",
+          "1",
+          "true",
+          "64",
+          "2",
+          "1",
+          "17",
+          "0",
+          "256",
+          "false",
+          "false",
+          "false",
+          "2"
+        ]
+      },
+      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_args": [
+        "opus_gemm_bpreshuffle_b_pipeline_traits<opus_gemm_bpreshuffle_b_queue_traits<CoTraits, 7>, true, true, true>"
+      ],
+      "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
+      "grid_layout": "xcd",
+      "pin_variant": true,
+      "pin_mask": 0,
+      "kid": 55
+    }
+  ]
+}

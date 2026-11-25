@@ -16,7 +16,7 @@ operand      shape                        notes
 ``WQ``       ``[B, N, K]`` fp8            shuffle_weight(., (16, 16))
 ``x_scale``  ``[M, B, K // XK]`` e8m0     row-major, XK = x_scale_k
 ``w_scale``  ``[B, N // WN, K // WK]``    e8m0, WN x WK = w_scale_n x w_scale_k
-``Out``      ``[M, B, N]`` bf16
+``Out``      ``[M, B, N]`` bf16             e4m3 with fuse_quant_out
 ===========  ===========================  ==================================
 
 Every block edge is 32 or 128. Scales sit in LDS panels, one row per A row or
@@ -25,6 +25,7 @@ first stage (scale_preload); otherwise every stage carries its own tile's. The
 32-K group g of MFMA step ks in K tile t reads panel column
 (t * tile_k + ks * 128 + g * 32) // block, t counted from the panel's first
 tile, so a 128-wide block is four groups reading the same byte.
+A w_scale block may also be a single row, 1x32 only.
 
 K is a multiple of 64. A K of 64 mod 128 is split as if padded to whole MFMA
 steps; its last half step zeroes A's upper 64 K (see half_step). N is a multiple of tile_n, itself a
@@ -43,13 +44,21 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.buffer_ops import create_buffer_resource_from_addr
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv, format_kernel_name
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    format_kernel_name,
+    set_slp_vectorize_once_used,
+)
+from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import group_m_major
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 WAVE = 64
 MFMA_M = MFMA_N = 16
 MFMA_K = 128
 SCALE_GROUP = 32  # K per MFMA scale operand
 SCALE_BLOCKS = (32, 128)
+W_SCALE_ROWS = (1, *SCALE_BLOCKS)  # w_scale_n: a 1x32 block scales every B row
 _LDS_BYTES = get_lds_capacity_bytes("gfx950")
 
 
@@ -65,7 +74,7 @@ class _LdsLayout(NamedTuple):
     off_pa: int  # A-scale panel: past the stages, or past B within a stage
     c_rows: int  # C rows staged at a time in the epilogue
     flag_off: int  # split-K last-arrival flag, past everything else
-    arena: int  # bytes allocated, the flag included
+    arena: int  # bytes allocated: flag_off, plus the flag with split K
 
 
 def _lds_layout(
@@ -76,6 +85,7 @@ def _lds_layout(
     threads,
     K,
     k_span,
+    splits,
     b_direct,
     x_scale_k,
     w_scale_n,
@@ -83,10 +93,10 @@ def _lds_layout(
     scale_preload,
     x_scale_transposed,
 ):
-    """Stages, then the scale panels of one split's k_span when preloaded;
-    per-stage panels (one K tile of scales) follow each stage's B instead. The
-    epilogue reuses the arena for C, c_rows rows at a time; the split-K flag
-    takes the last 16 bytes."""
+    """Stages, then the scale panels of one split's K range (k_span) when
+    preloaded; per-stage panels (one K tile of scales) follow each stage's B
+    instead. The epilogue reuses the arena for C, c_rows rows at a time; with
+    split K, the flag takes 16 bytes at flag_off, past both."""
     panel_a, panel_b = _scale_panels(
         tile_m,
         tile_n,
@@ -123,7 +133,7 @@ def _lds_layout(
         num_buffers * pitch if scale_preload else stage_a + stage_b,
         c_rows,
         flag_off,
-        flag_off + 16,
+        flag_off + (16 if splits > 1 else 0),
     )
 
 
@@ -131,6 +141,41 @@ def _padded_k(K):
     """K rounded up to whole MFMA steps. A K of 64 mod 128 ends in a half step
     whose upper 64 K the kernel zeroes in A."""
     return ceildiv(K, MFMA_K) * MFMA_K
+
+
+def bmm_config_name(
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    num_buffers,
+    splits=1,
+    b_direct=False,
+    xcd_order=False,
+    b_ahead=1,
+    scale_preload=True,
+    b_nt=False,
+    xcd_swizzle=0,
+):
+    """The tile, waves, stages and K split of a config, then its options:
+    ``_bd<n>`` B read straight into registers ``n`` K tiles ahead, ``_nt`` B
+    loaded non-temporal, ``_xcd<g>`` the XCD tile order with an xcd_swizzle of
+    ``g``, ``_sps`` scales loaded per stage instead of preloaded."""
+    xcd = f"_xcd{xcd_swizzle or ''}" if xcd_order else ""
+    return (
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}"
+        f"_sk{splits}{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
+        f"{xcd}{'' if scale_preload else '_sps'}"
+    )
+
+
+def xcd_swizzle_runs(xcd_swizzle, xcd_order, splits):
+    """Whether an xcd_swizzle runs: none, or a group of 2+ M tiles of the
+    xcd_order run without split K, which keeps its own tile order (a tuner
+    moving a config to split K drops the swizzle, see bmm_candidate_names).
+    It depends on the name alone, so the name parser rejects it too."""
+    return not xcd_swizzle or (xcd_swizzle >= 2 and xcd_order and splits == 1)
 
 
 def check_bmm_config(
@@ -153,10 +198,12 @@ def check_bmm_config(
     scale_preload=True,
     b_nt=False,
     x_scale_transposed=False,
+    xcd_swizzle=0,
 ):
     """Raise ValueError unless launch_bmm_a8w8_mxscale can run this config on
-    an [*, N, K] x batch problem. Tuners and heuristics call it to rule configs
-    out up front; the launcher calls it before building the kernel."""
+    an [*, N, K] x batch problem, else return its LDS layout. Tuners and
+    heuristics call it to rule configs out up front; the launcher calls it
+    before building the kernel."""
     k_span = _padded_k(K) // splits
     threads = m_warp * n_warp * WAVE
     layout = _lds_layout(
@@ -167,6 +214,7 @@ def check_bmm_config(
         threads,
         K,
         k_span,
+        splits,
         b_direct,
         x_scale_k,
         w_scale_n,
@@ -189,13 +237,15 @@ def check_bmm_config(
             f"{m_warp}x{n_warp} waves, {num_buffers} stages and K={K}"
         )
     if (
-        {x_scale_k, w_scale_n, w_scale_k} - set(SCALE_BLOCKS)
+        {x_scale_k, w_scale_k} - set(SCALE_BLOCKS)
+        or w_scale_n not in W_SCALE_ROWS
+        or (w_scale_n == 1 and w_scale_k != SCALE_GROUP)
         or K % x_scale_k
         or K % w_scale_k
     ):
         raise ValueError(
             f"[FlyDSL gfx950] scale blocks 1x{x_scale_k} / {w_scale_n}x{w_scale_k} "
-            f"must be 32 or 128 wide and divide K={K}"
+            f"must be 32 or 128 wide (a 1-row w_scale 1x32) and divide K={K}"
         )
     if (
         N % tile_n
@@ -216,12 +266,18 @@ def check_bmm_config(
         raise ValueError(
             "[FlyDSL gfx950] a column-major x_scale is 1x128 blocks at batch 1"
         )
+    if not xcd_swizzle_runs(xcd_swizzle, xcd_order, splits):
+        raise ValueError(
+            f"[FlyDSL gfx950] xcd_swizzle={xcd_swizzle} needs xcd_order, no "
+            f"split K and a group of 2+ M tiles"
+        )
     if b_direct and not 1 <= b_ahead <= num_buffers - 1:
         raise ValueError("[FlyDSL gfx950] b_ahead must be in [1, num_buffers - 1]")
     if layout.stage_a % (threads * 16) or layout.stage_b % (threads * 16):
         raise ValueError("[FlyDSL gfx950] A/B stages must split evenly over threads")
     if layout.arena > _LDS_BYTES:
         raise ValueError(f"[FlyDSL gfx950] LDS overflow: {layout.arena} > {_LDS_BYTES}")
+    return layout
 
 
 def _byte_slots(row_bytes, cols):
@@ -293,6 +349,8 @@ def launch_bmm_a8w8_mxscale(
     scale_preload: Constexpr[bool] = True,
     b_nt: Constexpr[bool] = False,
     x_scale_transposed: Constexpr[bool] = False,
+    xcd_swizzle: Constexpr[int] = 0,
+    fuse_quant_out: Constexpr[bool] = False,
 ):
     """splits > 1 splits K over that many workgroups per output tile. A tile's
     splits run on one XCD; each writes an FP32 partial, and the last to arrive
@@ -305,13 +363,25 @@ def launch_bmm_a8w8_mxscale(
     tiles ahead, instead of staging it in LDS. xcd_order gives each XCD a
     contiguous run of tiles so neighbours share its L2. x_scale_k and
     w_scale_n x w_scale_k are the e8m0 block edges, each 32 or 128.
+    w_scale_n may also be 1 with w_scale_k 32 (1x32), a scale per B row.
+    xcd_swizzle >= 2 re-tiles the xcd_order run M-major in groups of
+    xcd_swizzle M tiles, as xcd_remap_bx_by does.
     scale_preload loads a split's scales once instead of with every stage: no
     per-stage scale copies, but the panels take LDS for the whole K range.
     b_nt marks B's loads non-temporal, direct or into LDS: a weight read once
     (small M) streams past the caches, where a reused one (large M) should
     stay. x_scale_transposed reads a column-major [K // 128, M] x_scale of
     1x128 blocks (batch 1), the blockscale convention; its LDS panel is then
-    column-major too."""
+    column-major too.
+    fuse_quant_out group-32 MXFP8-quantizes the output in the epilogue (see
+    store_quant): arg_c receives e4m3 [M, B, N] and arg_partials, which one
+    split leaves unused, the row-major [M, B * N // 32] e8m0 scale. It needs
+    splits == 1 and tile_n % 32 == 0."""
+    if fuse_quant_out and (splits != 1 or tile_n % 32):
+        raise ValueError(
+            f"[FlyDSL gfx950] fuse_quant_out needs splits == 1 and tile_n % 32 == 0, "
+            f"got splits={splits}, tile_n={tile_n}"
+        )
     k_steps = tile_k // MFMA_K
     k_span = _padded_k(K) // splits  # the K range of one split
     half_step = K % MFMA_K != 0  # the last MFMA step holds 64 K
@@ -325,42 +395,28 @@ def launch_bmm_a8w8_mxscale(
     n_rep = warp_tile_n // MFMA_N
     threads = m_warp * n_warp * WAVE
     scale_span = k_span if scale_preload else tile_k  # the K a scale panel covers
-    check_bmm_config(
-        N,
-        K,
-        batch,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        num_buffers,
-        splits,
-        b_direct,
-        xcd_order,
-        b_ahead,
-        x_scale_k,
-        w_scale_n,
-        w_scale_k,
-        scale_preload,
-        b_nt,
-        x_scale_transposed,
-    )
     stage_a, stage_b, pitch, panel_a, panel_b, off_pa, c_rows, flag_off, arena = (
-        _lds_layout(
+        check_bmm_config(
+            N,
+            K,
+            batch,
             tile_m,
             tile_n,
             tile_k,
+            m_warp,
+            n_warp,
             num_buffers,
-            threads,
-            K,
-            k_span,
+            splits,
             b_direct,
+            xcd_order,
+            b_ahead,
             x_scale_k,
             w_scale_n,
             w_scale_k,
             scale_preload,
+            b_nt,
             x_scale_transposed,
+            xcd_swizzle,
         )
     )
     x_cols = scale_span // x_scale_k  # A scales per panel row
@@ -382,13 +438,24 @@ def launch_bmm_a8w8_mxscale(
     lda_scale = batch * K // x_scale_k
     ldc = batch * N
 
+    config = bmm_config_name(
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        num_buffers,
+        splits,
+        b_direct,
+        xcd_order,
+        b_ahead,
+        scale_preload,
+        b_nt,
+        xcd_swizzle,
+    )
     kernel_name = format_kernel_name(
-        f"bmm_a8w8_mxscale_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}_b{batch}"
-        f"_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
-        f"{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
-        f"{'_xcd' if xcd_order else ''}{'' if scale_preload else '_sps'}"
-        f"{'_xt' if x_scale_transposed else ''}"
+        f"bmm_a8w8_mxscale{config}_b{batch}_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
+        f"{'_xt' if x_scale_transposed else ''}{'_fq' if fuse_quant_out else ''}"
     )
 
     @fx.struct
@@ -422,13 +489,27 @@ def launch_bmm_a8w8_mxscale(
             )
             kt0 = split * k_tiles
         elif const_expr(xcd_order):
-            # pid % 8 is the XCD. Give each XCD a contiguous run of tiles with N
-            # fastest, so the N tiles sharing an A row block, and the M tiles
-            # sharing a B column block, meet in that XCD's L2.
+            # pid % 8 is the XCD. Give each XCD a contiguous run of tiles, so the
+            # N tiles sharing an A row block, and the M tiles sharing a B column
+            # block, meet in that XCD's L2.
             per_xcd = ceildiv(tiles, 8) if padded else tiles // 8
             tile = bid_x % 8 * per_xcd + bid_x // 8
-            rest = tile // (N // tile_n)
-            bid_x, bid_y, bid_z = rest % m_tiles, tile % (N // tile_n), rest // m_tiles
+            if const_expr(xcd_swizzle > 1):
+                # M-major groups of xcd_swizzle M tiles: fewer B column blocks
+                # live at once.
+                batch_tiles = m_tiles * (N // tile_n)
+                bid_x, bid_y = group_m_major(
+                    tile % batch_tiles, m_tiles, N // tile_n, fx.Int32(xcd_swizzle)
+                )
+                bid_z = tile // batch_tiles
+            else:
+                # N fastest.
+                rest = tile // (N // tile_n)
+                bid_x, bid_y, bid_z = (
+                    rest % m_tiles,
+                    tile % (N // tile_n),
+                    rest // m_tiles,
+                )
             kt0 = 0
         else:
             kt0 = 0
@@ -885,18 +966,25 @@ def launch_bmm_a8w8_mxscale(
                             )
                             for mi in range_constexpr(m_rep)
                         ]
-                    # A tile narrower than a scale block sits inside one panel row.
+                    # A 1-row w_scale has a panel row per B row, read like A's:
+                    # lane16 is the MFMA's N column. Otherwise a tile narrower
+                    # than a scale block sits inside one panel row.
                     sb = [
                         load_scale(
                             scale_base + off_pb,
                             (
-                                (wnb + ni * MFMA_N) // w_scale_n
-                                if tile_n >= w_scale_n
-                                else 0
+                                wnb + lane16
+                                if w_scale_n == 1
+                                else (
+                                    (wnb + ni * MFMA_N) // w_scale_n
+                                    if tile_n >= w_scale_n
+                                    else 0
+                                )
                             ),
                             w_cols,
                             w_slots,
                             w_col,
+                            ni * MFMA_N if w_scale_n == 1 else 0,
                         )
                         for ni in range_constexpr(n_rep)
                     ]
@@ -967,6 +1055,24 @@ def launch_bmm_a8w8_mxscale(
                 lds.data.ptr,
             )
 
+            def stage_part(vals, part):
+                """Write the accumulators of rows [part * c_rows, +c_rows) to LDS
+                as bf16, c_row elements a row, between two barriers."""
+                gpu.barrier()
+                for mi in range_constexpr(m_rep):
+                    mrow = wmb + mi * MFMA_M
+                    if mrow // c_rows == part:
+                        for ni in range_constexpr(n_rep):
+                            tile_vals = vals[mi * n_rep + ni].to(BFloat16)
+                            col = wnb + ni * MFMA_N + lane16
+                            for ii in range_constexpr(4):
+                                row = mrow % c_rows + kgrp * 4 + ii
+                                fx.ptr_store(
+                                    tile_vals[ii],
+                                    fx.add_offset(lds_bf16, row * c_row + col),
+                                )
+                gpu.barrier()
+
             def store_tile(vals):
                 """Stage the bf16 tile in LDS c_rows rows at a time, and store whole
                 16-byte rows of each chunk."""
@@ -976,20 +1082,7 @@ def launch_bmm_a8w8_mxscale(
                 c_dst = _buffer(c_tile, T.i32, 16, fx.Int64(rows_left) * (ldc * 2))
                 chunks = tile_n // 8  # 16-byte chunks per C row
                 for part in range_constexpr(tile_m // c_rows):
-                    gpu.barrier()
-                    for mi in range_constexpr(m_rep):
-                        mrow = wmb + mi * MFMA_M
-                        if mrow // c_rows == part:
-                            for ni in range_constexpr(n_rep):
-                                tile_vals = vals[mi * n_rep + ni].to(BFloat16)
-                                col = wnb + ni * MFMA_N + lane16
-                                for ii in range_constexpr(4):
-                                    row = mrow % c_rows + kgrp * 4 + ii
-                                    fx.ptr_store(
-                                        tile_vals[ii],
-                                        fx.add_offset(lds_bf16, row * c_row + col),
-                                    )
-                    gpu.barrier()
+                    stage_part(vals, part)
                     for i in range_constexpr(ceildiv(c_rows * chunks, threads)):
                         idx = i * threads + tid
                         row = idx // chunks
@@ -1030,8 +1123,111 @@ def launch_bmm_a8w8_mxscale(
                                     fx.add_offset(c_ptr, fx.Int64(row) * ldc + col),
                                 )
 
+            def store_quant(vals):
+                """fuse_quant_out: group-32 MXFP8 quant of the bf16 tile. Stage
+                c_rows rows in LDS as store_tile does, then give each thread one
+                row's 32 contiguous columns, so the group amax needs no cross-lane
+                reduction (tile_n % 32 == 0 keeps a group inside the tile). Writes
+                e4m3 codes to arg_c ([M, B, N]) and the e8m0 byte to arg_partials
+                (row-major [M, B * N // 32]), bit-matching quantize_fp8 of this
+                tile's bf16 values: amax floored at 1e-10, scale ceil_pow2(amax / 448),
+                each bf16 divided by it and rounded to nearest even e4m3."""
+                rows_left = i32_m - blk_m
+                rows_left = (rows_left < tile_m).select(rows_left, fx.Int32(tile_m))
+                q_tile = arg_c + fx.Int64(blk_m) * ldc + bz * N + fx.Int64(blk_n)
+                q_dst = _buffer(q_tile, T.i32, 16, fx.Int64(rows_left) * ldc)
+                s_ptr = fx.recast_iter(
+                    Int8,
+                    fx.inttoptr(
+                        fx.PointerType.get(T.i8, fx.AddressSpace.Global, 1),
+                        arg_partials
+                        + fx.Int64(blk_m) * (ldc // 32)
+                        + (bz * N + fx.Int64(blk_n)) // 32,
+                    ),
+                )
+                groups = tile_n // 32  # quant groups per C row
+                for part in range_constexpr(tile_m // c_rows):
+                    stage_part(vals, part)
+                    for i in range_constexpr(ceildiv(c_rows * groups, threads)):
+                        idx = i * threads + tid
+                        row = idx // groups
+                        grp = idx % groups
+                        grow = part * c_rows + row
+                        if (row < c_rows) and (grow < rows_left):
+                            # 32 bf16 = 16 dwords, two values a dword.
+                            words = []
+                            for q in range_constexpr(4):
+                                frag = fx.make_rmem_tensor(4, Int32)
+                                src = fx.make_view(
+                                    fx.add_offset(
+                                        lds_i32,
+                                        (row * c_row + grp * 32 + q * 8) // 2,
+                                    ),
+                                    fx.make_layout(4, 1),
+                                )
+                                fx.copy(read16, src, frag)
+                                w = Vec(frag.load())
+                                words += [w[e] for e in range_constexpr(4)]
+                            # A bf16's f32 value: low half << 16, high half
+                            # masked in place; exact, so no re-rounding.
+                            amax = Float32(0.0)
+                            for w in words:
+                                lo = (w << Int32(16)).bitcast(Float32)
+                                hi = (w & Int32(-65536)).bitcast(Float32)
+                                amax = fx.maxnumf(amax, abs(lo))
+                                amax = fx.maxnumf(amax, abs(hi))
+                            amax = fx.maxnumf(amax, Float32(1e-10))
+                            e8 = emit_mx_e8m0_scale(
+                                amax,
+                                mode=MxScaleRoundModeInt.RoundUp,
+                                dtype=MxDtypeInt.FP8_E4M3,
+                            )
+                            scale = (Int32(e8) << Int32(23)).bitcast(Float32)
+                            # gfx950 v_cvt_scalef32_pk_fp8_bf16 divides a bf16
+                            # pair by the power-of-two scale and RNE-packs two
+                            # e4m3 bytes into one half of the dword.
+                            codes = []
+                            for d in range_constexpr(8):
+                                pk = fx.full(2, 0, fx.Int16).ir_value()
+                                for half in range_constexpr(2):
+                                    pair = Vec.from_elements(
+                                        [words[2 * d + half]], Int32
+                                    ).bitcast(BFloat16)
+                                    pk = rocdl.cvt_scalef32_pk_fp8_bf16(
+                                        T.vec(2, T.i16),
+                                        pk,
+                                        pair.ir_value(),
+                                        scale.ir_value(),
+                                        half,
+                                    )
+                                codes.append(Vec(pk).bitcast(Int32)[0])
+                            for h in range_constexpr(2):
+                                frag = fx.make_rmem_tensor(4, Int32)
+                                frag.store(
+                                    Vec.from_elements(codes[h * 4 : h * 4 + 4], Int32)
+                                )
+                                fx.copy(
+                                    global16,
+                                    frag,
+                                    fx.slice(
+                                        q_dst,
+                                        (
+                                            None,
+                                            (grow * ldc + grp * 32 + h * 16) // 4,
+                                        ),
+                                    ),
+                                )
+                            fx.ptr_store(
+                                Vec.from_elements([fx.Uint8(e8)], Int8),
+                                fx.add_offset(
+                                    s_ptr, fx.Int64(grow) * (ldc // 32) + grp
+                                ),
+                            )
+
             vals = [Vec(acc.load()) for acc in accs]
-            if const_expr(splits == 1):
+            if const_expr(fuse_quant_out):
+                store_quant(vals)
+            elif const_expr(splits == 1):
                 store_tile(vals)
             else:
                 # Publish this split's partial in the lanes' own fragment order,
@@ -1121,3 +1317,6 @@ def launch_bmm_a8w8_mxscale(
         block=(threads, 1, 1),
         stream=stream,
     )
+
+
+set_slp_vectorize_once_used(launch_bmm_a8w8_mxscale, False)

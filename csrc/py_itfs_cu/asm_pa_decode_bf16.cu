@@ -243,7 +243,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- arch + dtype validation ------------------------------------------
     const std::string arch_id = get_gpu_arch();
-    AITER_CHECK(arch_id == "gfx1250",
+    AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"),
                 "pa_decode_bf16_asm: only supported on gfx1250, got ", arch_id);
 
     AITER_CHECK(Q->dtype() == AITER_DTYPE_fp8, "pa_decode_bf16_asm: Q must be fp8");

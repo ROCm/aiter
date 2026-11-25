@@ -53,8 +53,14 @@ def _make_inputs(rows, ctx_len, heads, dtype, device="cuda", seed=0):
     )
     # 0.25 keeps the fp8 cast away from saturation. A saturated fixture makes
     # every implementation agree trivially and hides real divergence.
-    kc = (torch.randn(pages, 1, HEAD_DIM, generator=g, device=device) * 0.25).to(dtype)
-    vc = (torch.randn(pages, 1, HEAD_DIM, generator=g, device=device) * 0.25).to(dtype)
+    kc = (
+        torch.randn(pages, 1, HEAD_DIM, generator=g, dtype=torch.float32, device=device)
+        * 0.25
+    ).to(dtype)
+    vc = (
+        torch.randn(pages, 1, HEAD_DIM, generator=g, dtype=torch.float32, device=device)
+        * 0.25
+    ).to(dtype)
     indptr = torch.arange(0, rows + 1, dtype=torch.int32, device=device) * ctx_len
     indices = torch.randperm(pages, generator=g, device=device).to(torch.int32)
     gate = torch.randn(

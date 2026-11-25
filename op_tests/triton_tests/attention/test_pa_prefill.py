@@ -18,16 +18,6 @@ SLIDING_WINDOW = [128, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
 
 
-@pytest.fixture(autouse=True)
-def restore_torch_devices():
-    default_device = torch.get_default_device()
-    cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
-    yield
-    torch.set_default_device(default_device)
-    if cuda_device is not None:
-        torch.cuda.set_device(cuda_device)
-
-
 def context_attention_fwd_torch(
     query,  # [num_tokens, H, D]
     k,  # [num_tokens, Hkv, D]
@@ -201,13 +191,6 @@ def input_helper(
     use_alibi_slope: bool,
 ):
     seed_everything(0)
-    torch.set_default_device(device)
-
-    # Need this, otherwise when we capture the graph the process
-    # for GPU 1 would run on both GPU0 and GPU1 and things would hang
-    #
-    # see also similar issue: https://github.com/Dao-AILab/flash-attention/issues/523
-    torch.cuda.set_device(device)
 
     if use_alibi_slope:
         alibi_slopes = _get_alibi_slopes(num_heads, device)
@@ -218,11 +201,13 @@ def input_helper(
     num_kv_heads = num_heads // num_queries_per_kv
 
     num_tokens = sum(query_lens)
-    query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+    query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
     query.uniform_(-1e-3, 1e-3)
-    output = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+    output = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
 
-    kv = torch.empty(sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype)
+    kv = torch.empty(
+        sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype, device=device
+    )
     kv.uniform_(-1e-3, 1e-3)
     key, value = kv.unbind(dim=1)
 
@@ -231,23 +216,39 @@ def input_helper(
     else:
         cache_dtype = str_to_torch_dtype[kv_cache_dtype]
     k_cache = torch.zeros(
-        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+        cache_size,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=cache_dtype,
+        device=device,
     )
     v_cache = torch.zeros(
-        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+        cache_size,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=cache_dtype,
+        device=device,
     )
-    k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    values = torch.arange(0, cache_size, dtype=torch.long)
-    values = values[torch.randperm(cache_size)]
+    k = torch.zeros(
+        sum(query_lens), num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    v = torch.zeros(
+        sum(query_lens), num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    values = torch.arange(0, cache_size, dtype=torch.long, device=device)
+    values = values[torch.randperm(cache_size, device=device)]
     block_table = values[: BS * max_block_per_request].view(BS, max_block_per_request)
-    b_seq_len = torch.tensor(seq_lens, dtype=torch.long)
-    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
-    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0)
+    b_seq_len = torch.tensor(seq_lens, dtype=torch.long, device=device)
+    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long, device=device)
+    b_start_loc = torch.cumsum(
+        torch.tensor([0] + query_lens, dtype=torch.long, device=device), dim=0
+    )
     max_input_len = MAX_SEQ_LEN
     # copy kv to cache
     b_seq_start_loc = torch.cumsum(
-        torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0
+        torch.tensor([0] + seq_lens[:-1], dtype=torch.long, device=device), dim=0
     )
     for i in range(BS):
         for j in range(query_lens[i]):
