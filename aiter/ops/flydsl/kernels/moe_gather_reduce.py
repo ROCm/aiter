@@ -1,50 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One-pass MoE gather-reduce (weighted) epilogue kernel (FlyDSL).
+"""One-pass deterministic MoE weighted gather-reduce epilogue.
 
-Background
-----------
-After the per-expert stage2 GEMM, MoE output lives in a grouped layout
-``grouped_out (E, max_m, model_dim)``: expert ``e`` holds its routed tokens in
-rows ``[0, counts[e])``.  The final epilogue scatters those rows back to the
-flat per-token output, multiplying by the route weight and summing the ``topk``
-contributions of each token::
+Inputs are grouped BF16/FP16 rows, an int32 token/top-k-to-row map, and
+FP32/BF16/FP16 route weights. Each CTA owns a token and an output-column tile.
+It sums split-K slices first, then weighted routes in their original order,
+rounding only the final result to the output dtype. There are no atomics.
 
-    moe_out[t] = sum_k  w(t,k) * grouped_out[expert(t,k), pos(t,k)]
-
-The Python reference does this as a per-expert loop of ``index_add_`` (scatter).
-This kernel reformulates it as a **gather-reduce**: one thread-block per output
-token gathers that token's ``topk`` source rows (via a precomputed inverse index
-map), weights them, and sums them in registers in a single pass.  No atomics, so
-the result is deterministic and order-independent like ``index_add_``.
-
-Layout / grid
--------------
-Inputs (all on device):
-  grouped_out_flat : (E*max_m, model_dim)  bf16/f16   -- grouped_out viewed flat
-  topids_to_rows         : (token_num, topk)     i32        -- flat source row per (t,k)
-  gather_w         : (token_num, topk)     f32        -- weight per (t,k)
-  out              : (token_num, model_dim) bf16/f16
-
-Grid  : (token_num, 1, 1)   -- one block per output token
-Block : (BLOCK_THREADS, 1, 1)
-
-Each thread owns 4 consecutive dwords (16 B = 8 elements) and moves them with a
-single 128-bit buffer copy atom.  Wider transactions raise
-per-request bytes and cut the in-flight loads needed to saturate HBM.  When the
-row's dword count is not a multiple of 4 the trailing group falls back to a
-per-lane scalar tail (mirroring ``compile_moe_reduction`` in
-``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
-slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
-nothing and need no branch; EP routes that own no grouped row instead carry
-``moe_route_maps.DROPPED_ROUTE_ROW``, which is steered past the end of the flat
-tensor so the resource's own bounds check returns 0.
-
-The ``topk`` route rows and weights are block-uniform, so they are read once
-into LDS by the first ``topk`` lanes instead of by every thread, and the reads
-of ``grouped_out`` go through one flat descriptor at a dword offset rather than
-a freshly built per-row descriptor.
+The opt-in gfx1250 specialization caches route metadata in wave registers: coalesced lane loads followed
+by readlane broadcasts before any output-tail divergence. Other targets keep
+the existing CTA-wide LDS cache. DROPPED_ROUTE_ROW uses a zero-length source
+descriptor, so even NaNs in an unmapped row are never read. Source descriptors
+include the row in a 64-bit base address; their offsets stay within one row.
 """
 
 import flydsl.compiler as flyc
@@ -104,6 +72,7 @@ def build_moe_gather_reduce_module(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    wave_routes: bool = False,
 ):
     assert model_dim % 2 == 0
     assert out_dtype in ("bf16", "f16")
@@ -112,6 +81,8 @@ def build_moe_gather_reduce_module(
     if vec_dwords not in (2, 4, 8):
         raise ValueError(f"vec_dwords must be 2, 4, or 8, got {vec_dwords}")
 
+    if wave_routes and not 0 < topk <= 32:
+        raise ValueError("wave route cache requires 1..32 routes")
     VEC = int(vec_dwords)
     out_dwords = model_dim // 2  # dwords per output row (also the source row width)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
@@ -119,7 +90,7 @@ def build_moe_gather_reduce_module(
 
     module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
-        f"_w{w_dtype}_frlds"
+        f"_w{w_dtype}_{'frwave_coalesced' if wave_routes else 'frlds'}"
     )
 
     @flyc.kernel(name=module_name)
@@ -166,33 +137,65 @@ def build_moe_gather_reduce_module(
             map_base = bid_i32 * topk_i32
             out_row_dw_base = bid_i32 * out_dwords_i32
 
-            route_lds = fx.SharedAllocator().allocate(_GatherRouteLds).peek()
-            rows_lds = route_lds.rows.ptr
-            wbits_lds = route_lds.w_bits.ptr
-            tid_u32 = fx.Uint32(tid)
-            if tid_u32 < topk_i32:
-                map_off = map_base + tid_u32
-                # DROPPED_ROUTE_ROW (-1) is kept as-is: it owns no grouped row,
-                # and the zero-length descriptor below is what switches its
-                # loads off. Clamping it to a real row instead would read bytes
-                # stage2 need never have written, and a stale NaN there survives
-                # the multiply by the route's (zero) weight.
-                row_i32 = fx.Int32(rows_t[map_off])
-                _lds_si32(rows_lds, row_i32, tid)
-                # .to(Float32) is a no-op when the route weights are already f32.
-                w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)
-                _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
-            gpu.barrier()
+            if fx.const_expr(not wave_routes):
+                route_lds = fx.SharedAllocator().allocate(_GatherRouteLds).peek()
+                rows_lds = route_lds.rows.ptr
+                wbits_lds = route_lds.w_bits.ptr
+                tid_u32 = fx.Uint32(tid)
+                if tid_u32 < topk_i32:
+                    map_off = map_base + tid_u32
+                    # DROPPED_ROUTE_ROW (-1) is kept as-is: it owns no grouped row,
+                    # and the zero-length descriptor below is what switches its
+                    # loads off. Clamping it to a real row instead would read bytes
+                    # stage2 need never have written, and a stale NaN there survives
+                    # the multiply by the route's (zero) weight.
+                    row_i32 = fx.Int32(rows_t[map_off])
+                    _lds_si32(rows_lds, row_i32, tid)
+                    # .to(Float32) is a no-op when the route weights are already f32.
+                    w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)
+                    _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
+                gpu.barrier()
 
             thread_id = fx.Uint32(tid)
             iter_idx_i32 = fx.Uint32(fx.block_idx.y)
 
             row_bytes_i32 = fx.Int32(out_dwords * 4)
 
+            def _wave_route_cache():
+                # One coalesced row/weight load per wave. Clamp the unused
+                # lanes to an in-range route; no out-of-bounds metadata read.
+                lane_route = fx.Uint32(tid) % fx.Uint32(32)
+                lane_route = (lane_route < topk_i32).select(
+                    lane_route, topk_i32 - fx.Uint32(1)
+                )
+                map_off = map_base + lane_route
+                lane_row = fx.Int32(rows_t[map_off])
+                lane_weight = w_dt_fx(w_t[map_off]).to(fx.Float32).bitcast(fx.Int32)
+                # Broadcast while every lane is active, before the output-tail
+                # branch, including routes held by lanes past a partial tail.
+                rows = [
+                    fx.Int32(fx.rocdl.readlane(T.i32, lane_row, k))
+                    for k in range_constexpr(topk)
+                ]
+                weights = [
+                    fx.Int32(fx.rocdl.readlane(T.i32, lane_weight, k)).bitcast(
+                        fx.Float32
+                    )
+                    for k in range_constexpr(topk)
+                ]
+                return rows, weights
+
+            wave_cache = _wave_route_cache() if wave_routes else None
+
             def _row_weight(k):
-                row_i32 = _lds_li32(rows_lds, k)
-                w_f32 = _lds_li32(wbits_lds, k).bitcast(fx.Float32)
-                return row_i32, w_f32
+                return (
+                    (wave_cache[0][k], wave_cache[1][k])
+                    if wave_routes
+                    else (
+                        _lds_li32(rows_lds, k),
+                        _lds_li32(wbits_lds, k).bitcast(fx.Float32),
+                    )
+                )
 
             # A descriptor per route rather than one for the whole tensor: the
             # buffer offset is 32-bit, so a flat descriptor stops addressing
