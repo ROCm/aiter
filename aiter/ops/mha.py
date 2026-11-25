@@ -3475,6 +3475,24 @@ def _flash_attn_varlen_forward(
         )
         return ret
 
+    def is_fmha_v3_thd_bf16_hd256():
+        # gfx950 BF16 hd256 THD rows (whole documents, one cu_seqlens for Q and K), which take
+        # GQA. Mirrors is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu: the check is on the
+        # cu_seqlens pointer, so pass the same tensor for Q and K to reach these rows.
+        return (
+            get_gfx() == "gfx950"
+            and q.dtype == dtypes.bf16
+            and hdim_q == 256
+            and hdim_v == 256
+            and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
+            and cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+            and cu_seqlens_q_padded is None
+            and cu_seqlens_k_padded is None
+            and block_table is None
+            and q.shape[0] == k.shape[0]
+            and max_seqlen_q == max_seqlen_k
+        )
+
     def can_impl_fmha_v3_fwd():
         # basic
         # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
@@ -3492,7 +3510,7 @@ def _flash_attn_varlen_forward(
                 and hdim_v == 256
                 and q.dtype == dtypes.bf16
                 and get_gfx() == "gfx950"
-                and nhead_q == nhead_k
+                and (nhead_q == nhead_k or is_fmha_v3_thd_bf16_hd256())
                 and sink_size == 0
                 and sink_ptr is None
             )

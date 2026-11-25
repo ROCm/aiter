@@ -3,11 +3,19 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 
 namespace aiter {
 #if FAV3_ON
+
+// THD rows reuse the v1 kernarg layout but read ptr_qseq_padding's slot as a KV-split descriptor.
+static_assert(offsetof(fmha_fwd_v3_args, ptr_qseq_padding) == 0x1E0,
+              "THD rows read their KV split from the ptr_qseq_padding slot");
+static_assert(sizeof(fmha_fwd_v3_args) == 656, "fmha_fwd_v3_args must stay 656 bytes");
 
 int get_cfg_mask_type(const mha_fwd_args& a)
 {
@@ -30,6 +38,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
                                 int mask_type,
                                 int bf16_cvt,
                                 bool mode,
+                                int thd,
                                 const CFG* cfgs)
 {
     std::string kernel_name_key{};
@@ -42,7 +51,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
         }
 
         if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v &&
-           cfg.mask == mask_type && cfg.mode == mode)
+           cfg.mask == mask_type && cfg.mode == mode && cfg.thd == thd)
         {
             if(arch_id == "gfx950")
             {
@@ -76,6 +85,67 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
         }
     }
     return co_name;
+}
+
+// gfx950 BF16 hd256 THD rows: whole documents concatenated along the token axis, one cu_seqlens
+// for Q and K (the fmha_v4 THD objects). The check is on pointers only, so it never synchronizes:
+// Q and K must share the seqstart array, carry no padding, and have the same token count.
+// AITER_FMHA_V3_FWD_THD=0 keeps these calls on the hd256 group rows (MHA only).
+bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
+{
+    if(arch_id != "gfx950" || !a.is_group_mode || a.data_type != "bf16" || a.hdim_q != 256 ||
+       a.hdim_v != 256)
+        return false;
+    if(const char* env = std::getenv("AITER_FMHA_V3_FWD_THD"); env && std::strcmp(env, "0") == 0)
+        return false;
+    if(a.seqstart_q_ptr == nullptr || a.seqstart_q_ptr != a.seqstart_k_ptr)
+        return false;
+    if(a.cu_seqlen_q_ptr || a.cu_seqlen_k_ptr || a.seqlen_q_ptr || a.seqlen_k_ptr)
+        return false;
+    if(a.seqlen_q != a.seqlen_k || a.max_seqlen_q <= 0)
+        return false;
+    if(a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
+        return false;
+    if(a.bias_type != 0 || a.p_drop > 0.f || a.logits_soft_cap > 0.f || a.has_sink ||
+       a.qscale_type != 0)
+        return false;
+    return true;
+}
+
+// Mirrors fmha_v4_fwd_thd with one KV slice: unused slots stay zero, in particular the KV-split
+// descriptor at 0x1E0, so the kernel walks its keys once and writes O and LSE in place.
+void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a)
+{
+    std::memset(&args, 0, sizeof(args));
+    constexpr int bpe = 2;
+    args.ptr_o         = a.o_ptr;
+    args.ptr_q         = a.q_ptr;
+    args.ptr_k         = a.k_ptr;
+    args.ptr_v         = a.v_ptr;
+    args.scalar        = a.scale_s;
+    args.s_seq_len     = a.max_seqlen_q;
+    args.s_kv_seq_len  = a.max_seqlen_q;
+    args.s_Seqs        = a.stride_q * bpe;
+    args.s_Hs          = a.nhead_stride_q * bpe;
+    args.s_gqa         = a.nhead_q / a.nhead_k;
+    args.s_k_Seqs      = a.stride_k * bpe;
+    args.s_k_Hs        = a.nhead_stride_k * bpe;
+    args.s_qk_head_dim = a.hdim_q;
+    args.s_v_head_dim  = a.hdim_v;
+    args.s_q_head_num  = a.nhead_q;
+    args.s_v_Seqs      = a.stride_v * bpe;
+    args.s_v_Hs        = a.nhead_stride_v * bpe;
+    args.s_o_Seqs      = a.stride_o * bpe;
+    args.s_o_Hs        = a.nhead_stride_o * bpe;
+    args.ptr_qseq      = a.seqstart_q_ptr;
+    args.ptr_kseq      = a.seqstart_k_ptr;
+    if(a.has_lse)
+    {
+        // [nhead_q, total_tokens] float32; head h's rows start at ptr_lse + h * s_lse_Hs.
+        args.ptr_lse  = a.lse_ptr;
+        args.s_lse    = 1;
+        args.s_lse_Hs = a.nhead_stride_lse * 4;
+    }
 }
 
 void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
@@ -226,8 +296,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
     }
-    // gfx950 bf16 hd256: no GQA/MQA (kernel indexes K/V by h_q directly)
-    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.nhead_q != a.nhead_k)
+    const bool thd = is_fmha_fwd_v3_thd(a, arch_id);
+    // gfx950 bf16 hd256 group rows: no GQA/MQA (kernel indexes K/V by h_q directly). The THD
+    // rows take any nhead_q % nhead_k == 0.
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" &&
+       a.nhead_q != a.nhead_k && !thd)
     {
         return -1;
     }
@@ -241,6 +314,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
                                                       cfg_mask_type,
                                                       a.how_v3_bf16_cvt,
                                                       a.is_group_mode,
+                                                      thd ? 1 : 0,
                                                       fwd_cfgs);
     auto it                     = fwd_cfgs->find(kernel_name_key);
     if(it == fwd_cfgs->end())
@@ -265,14 +339,29 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
-    init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
     int bdx = 512;
-    if(a.hdim_q == 192 && a.hdim_v == 128)
-        bdx = 256;
-    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.is_group_mode)
-        bdx = 256;
-    auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+    int gdx = 0, gdy = 0, gdz = 0;
+    if(thd)
+    {
+        init_fmha_fwd_v3_thd_args(args, a);
+        // 32 query rows per wave. The grid is (Q tile groups of the longest document, nhead_q,
+        // documents); a causal work-group owns Q tile i and its mirror n - 1 - i.
+        bdx                = cfg.ts_qo / 32 * 64;
+        const int q_tiles  = (a.max_seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+        gdx                = cfg_mask_type != 0 ? (q_tiles + 1) / 2 : q_tiles;
+        gdy                = a.nhead_q;
+        gdz                = a.batch;
+    }
+    else
+    {
+        init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
+        if(a.hdim_q == 192 && a.hdim_v == 128)
+            bdx = 256;
+        if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.is_group_mode)
+            bdx = 256;
+        std::tie(gdx, gdy, gdz) = get_grid_dim(a, cfg.ts_qo, arch_id);
+    }
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from
