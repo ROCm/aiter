@@ -25,7 +25,7 @@ from aiter import (
 from aiter import (
     fused_norm_rope_attn_rope_cast_bf16 as public_bf16,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime_for_device
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
     _fused_norm_rope_attn_rope_cast_bf16_fwd as fused_norm_rope_attn_rope_cast_fwd,
 )
@@ -2033,7 +2033,7 @@ def test_fused_norm_rope_attn_rope_cast(
         tensor = args[key]
         if tensor is not None:
             nbytes += tensor.numel() * tensor.element_size()
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime_for_device()}
     for name, fn in candidates.items():
         out, us = run_perftest(fn, testGraph=True, num_rotate_args=1)
         actual = dequantize(*out[:2]).to(dtypes.fp32)
@@ -2525,8 +2525,30 @@ def check_raw_q_dtype_contract(direct):
         (fused_v41_fwd if direct else fused_v41)(**kwargs)
 
 
+def check_public_support_query():
+    kwargs, _ = two_source_inputs()
+    q = kwargs["q"]
+    supports = public_v41.__globals__["is_fused_norm_rope_attn_rope_cast_supported"]
+    assert supports(
+        q.shape[1],
+        q.shape[2],
+        q_dtype=q.dtype,
+        cos_dtype=kwargs["cos"].dtype,
+        sin_dtype=kwargs["sin"].dtype,
+        rope_dim=kwargs["cos"].shape[-1] * 2,
+        device=q.device,
+    )
+    # The public entry must consult the exported query before launching.
+    with patch.dict(
+        public_v41.__globals__,
+        {"is_fused_norm_rope_attn_rope_cast_supported": lambda *a, **kw: False},
+    ), _raises(ValueError, match="two-source FP8 attention requires"):
+        public_v41(**kwargs)
+
+
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
+    check_public_support_query()
     bf16_outputs = ("out", "out_scale", "max_logits", "lse")
     bf16_inputs = (
         "q",
@@ -3131,7 +3153,10 @@ def run_contract_checks():
 
 
 def main():
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+    if (
+        not torch.cuda.is_available()
+        or get_gfx_runtime_for_device() not in SUPPORTED_GFX
+    ):
         aiter.logger.warning("fused_norm_rope_attn_rope_cast requires gfx950; skipping")
         return
     parser = argparse.ArgumentParser(
