@@ -87,11 +87,12 @@ _S1F_MAX_RECV_BY_SHAPE: dict = {
 #: Receive caps under ``AITER_MEGA_S1F_FALLBACK=mori``, where a step past the
 #: cap runs mori's dispatch and its A-preshuffled GEMM1 instead of the compact
 #: S1F=0 path. The stage-1 kernel reads A at the wire's row-major pitch, which
-#: at tile 256 costs GEMM1 ~36% (DSR1 EP4 tpr 8192: 554 vs 408 us), more than
-#: the fusion saves: tpr 8192 runs 1457 vs 1406 us/layer, while tpr 4096 (the
-#: cap) still wins, 808 vs 821.
+#: at tile 256 costs GEMM1 ~36% (DSR1 EP4 tpr 8192: 554 vs 408 us), but the
+#: fusion still pays at tpr 8192 (recv 32768), 1507 vs 1514 us/layer. Tpr 16384
+#: (recv 65536) runs mori: its S1F run hit a memory fault intermittently and
+#: did not beat mori (2930 vs 2944 us/layer).
 _S1F_MORI_MAX_RECV_BY_SHAPE: dict = {
-    (4, 9): 16384,
+    (4, 9): 32768,
 }
 
 
