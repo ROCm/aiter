@@ -188,6 +188,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     scale_block: int = BLOCK_K,
     w_scale_32x32: bool = False,
     batch: int = 1,
+    c_pad: int = -1,
+    quad_early: bool = False,
+    no_loop_cbar: bool = False,
     y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
@@ -215,6 +218,17 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     e8m0 scale.
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
+    if compute_bound and c_pad >= 0:
+        raise ValueError("c_pad applies to the generic kernel only")
+    if compute_bound and quad_early:
+        raise ValueError(
+            "quad_early applies to the generic mxscale quadrant kernel only"
+        )
+    # Without the loop barrier, multicast loads could overwrite a peer's live buffer.
+    if no_loop_cbar and (compute_bound or cluster_m * cluster_n > 1):
+        raise ValueError(
+            "no_loop_cbar applies to the generic kernel with a 1x1 cluster"
+        )
     fuse_quant = y_scale_out is not None
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
@@ -483,9 +497,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
     constexpr_args = (*constexpr_args[:7], use_cluster, *constexpr_args[8:])
     if compute_bound:
-        # A launch of one workgroup is no cluster: it runs the plain kernel.
-        use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
-        specialization = (*constexpr_args[:7], use_cluster, *constexpr_args[8:]) + (
+        specialization = constexpr_args + (
             scale_block,
             split_k,
             a_preshuffle,
@@ -527,7 +539,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             *specialization[15:],  # a_preshuffle, a_scale_preshuffled, b_scale_32x32
             False,  # k_tail
             _ptr_arg(Out),  # arg_scale_out
-            specialization_key=specialization,
+            False,  # fuse_quant_out
+            c_pad,
+            quad_early,
+            no_loop_cbar,
+            specialization_key=(specialization, c_pad, quad_early, no_loop_cbar),
         )
     if partials is not None and not fused:
         dense = ldc == N
@@ -553,7 +569,10 @@ BASE_NAME_SUFFIX_RE = (
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
 )
 NAME_SUFFIX_RE = (
-    BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
+    BASE_NAME_SUFFIX_RE + r"(?:_cp(?P<c_pad>\d+))?"
+    r"(?P<quad_early>_qe)?"
+    r"(?P<no_loop_cbar>_nlb)?"
+    r"(?P<fused_splitk>_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
 )
@@ -576,6 +595,9 @@ def _parse_name(match):
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
+    c_pad = groups.pop("c_pad", None)
+    quad_early = groups.pop("quad_early", None) is not None
+    no_loop_cbar = groups.pop("no_loop_cbar", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
@@ -583,6 +605,9 @@ def _parse_name(match):
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["c_pad"] = int(c_pad) if c_pad is not None else -1
+    cfg["quad_early"] = quad_early
+    cfg["no_loop_cbar"] = no_loop_cbar
     return cfg
 
 
@@ -702,6 +727,9 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        c_pad=cfg["c_pad"],
+        quad_early=cfg["quad_early"],
+        no_loop_cbar=cfg["no_loop_cbar"],
     )
 
 
@@ -750,6 +778,9 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        c_pad=cfg["c_pad"],
+        quad_early=cfg["quad_early"],
+        no_loop_cbar=cfg["no_loop_cbar"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,
