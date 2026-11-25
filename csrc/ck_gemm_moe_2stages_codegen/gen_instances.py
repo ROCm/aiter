@@ -877,6 +877,33 @@ def generate_instance_and_lookUpTable_end(working_path):
         f_h.write(heuristic_dispatch_end)
 
 
+# The only two targets whose CK MoE instance lists differ.
+MOE_INSTANCE_ARCHES = ("gfx942", "gfx950")
+
+# The gfx950 device pass cannot compile a gfx942-only tile. The host pass
+# still instantiates it, which is how a tuned gfx942 row takes its address.
+GFX942_ONLY_BEGIN = (
+    "// gfx942-only instance. The gfx950 device pass does not compile this tile.\n"
+    "#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx942__)"
+    " || defined(__gfx9_4_generic__)\n"
+)
+GFX942_ONLY_END = "#endif\n"
+
+
+def _instance_arches():
+    """get_gfx() first, then any other MoE target in GPU_ARCHS.
+
+    get_gfx() is the last GPU_ARCHS entry, so a gfx942;gfx950 build would
+    otherwise drop the gfx942 instances tuned rows name.
+    """
+    from chip_info import get_gfx, get_gfx_list  # jit utils are on sys.path
+
+    primary = get_gfx()
+    return [primary] + [
+        a for a in get_gfx_list() if a in MOE_INSTANCE_ARCHES and a != primary
+    ]
+
+
 class ck_moe_2stage_gemm_codegen:
     def __init__(
         self,
@@ -903,7 +930,8 @@ class ck_moe_2stage_gemm_codegen:
         self.splitk = splitk
         self.runtime_swiglu_limit = runtime_swiglu_limit
 
-    def generate_instance_and_lookUpTable(self):
+    def _kernels_for_arch(self, arch):
+        """One target's tag and its stage-1 then stage-2 kernels."""
         _, gemm1_kernel_list = get_gemm1_kernels_list(
             self.a_dtype,
             self.b_dtype,
@@ -914,6 +942,7 @@ class ck_moe_2stage_gemm_codegen:
             self.mul_routed_weight_stage == 1,
             self.preshuffle,
             self.splitk,
+            arch=arch,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             self.a_dtype,
@@ -923,10 +952,24 @@ class ck_moe_2stage_gemm_codegen:
             self.quant_type,
             self.mul_routed_weight_stage == 2,
             self.preshuffle,
+            arch=arch,
         )
-        kernel_list = list(gemm1_kernel_list.values()) + list(
-            gemm2_kernel_list.values()
+        return tag, list(gemm1_kernel_list.values()) + list(gemm2_kernel_list.values())
+
+    def generate_instance_and_lookUpTable(self):
+        # get_gfx() is first: its lists still pick the tag and element ops.
+        arches = _instance_arches()
+        by_arch = {arch: self._kernels_for_arch(arch) for arch in arches}
+        tag, primary_kernels = by_arch[arches[0]]
+        kernel_list = list(
+            {k.name: k for arch in arches for k in by_arch[arch][1]}.values()
         )
+        if set(MOE_INSTANCE_ARCHES) <= set(arches):
+            gfx942_only = {k.name for k in by_arch["gfx942"][1]} - {
+                k.name for k in by_arch["gfx950"][1]
+            }
+        else:
+            gfx942_only = set()
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
 
@@ -984,6 +1027,10 @@ class ck_moe_2stage_gemm_codegen:
                             stage_instance = (
                                 "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
                             )
+                        if kernel.name in gfx942_only:
+                            stage_instance = (
+                                GFX942_ONLY_BEGIN + stage_instance + GFX942_ONLY_END
+                            )
                         f_ins.write(stage_instance)
 
                 ## generate lookUpTable
@@ -1029,7 +1076,7 @@ class ck_moe_2stage_gemm_codegen:
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                CDEElementOp=kernel_list[0].CDEElementOp,
+                CDEElementOp=primary_kernels[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=str(ACT_OP_MAP[self.activation]),
@@ -1048,7 +1095,7 @@ class ck_moe_2stage_gemm_codegen:
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType=self.c_dtype,
-                CDEElementOp=kernel_list[-1].CDEElementOp,
+                CDEElementOp=primary_kernels[-1].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=0,
