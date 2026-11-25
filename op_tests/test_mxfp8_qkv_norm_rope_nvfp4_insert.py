@@ -108,9 +108,15 @@ def test_mxfp8_qkv_chain(m, niq):
 
 
 def test_chain_gate():
+    from aiter.ops.flydsl.kernels.mxfp8_qkv_rope_nvfp4_gfx1250 import chain_config_error
+    from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import _CHAIN_ROWS
     from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import (
         mxfp8_qkv_chain_supported as ok,
     )
+
+    for rows in _CHAIN_ROWS.values():  # every table row is a valid kernel config
+        for _, cfg in rows:
+            assert chain_config_error(*cfg[:8]) is None, cfg
 
     m3 = (NQ, NKV, D, ROT, K)
     with mock.patch(
@@ -127,7 +133,7 @@ def main():
     parser = argparse.ArgumentParser(description="fused MXFP8 QKV chain (gfx1250)")
     parser.add_argument(
         "-s", "--shape", type=dtypes.str2tuple, nargs="*",
-        default=[(1, 1), (96, 1), (150, 1), (128, 4)], help="m,num_index_heads",
+        default=[(1, 1), (8, 1), (8, 4), (96, 1), (150, 1), (128, 4)], help="m,num_index_heads",
     )  # fmt: skip
     args = parser.parse_args()
     test_chain_gate()
