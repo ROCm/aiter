@@ -493,11 +493,11 @@ class PaDecodeSoftmax:
 
     @flyc.jit
     def fused_scores(self, frags, tile_valid):
-        """Raw scores, -inf past each row's causal bound.
+        """Raw scores, -inf past each row's bound.
 
-        With KV_COMPUTE_BLOCK + query_length - 1 or more valid tokens every row sees
-        the whole tile, so one uniform branch skips the selects on all such
-        tiles, including most tasks' last tile.
+        With KV_COMPUTE_BLOCK valid tokens, plus query_length - 1 when causal,
+        every row sees the whole tile, so one uniform branch skips the selects
+        on all such tiles, including most tasks' last tile.
         """
         t = self.traits
         flat = fx.Vector.from_elements(
@@ -509,7 +509,7 @@ class PaDecodeSoftmax:
             ],
             dtype=fx.Float32,
         )
-        if tile_valid < KV_COMPUTE_BLOCK + t.query_length - 1:
+        if tile_valid < KV_COMPUTE_BLOCK + (t.query_length - 1 if t.causal else 0):
             flat = fx.Vector.from_elements(
                 self._fused_mask_all(frags, tile_valid), dtype=fx.Float32
             )
