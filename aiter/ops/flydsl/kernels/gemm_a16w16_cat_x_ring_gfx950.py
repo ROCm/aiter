@@ -19,7 +19,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as _rocdl_ods
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -29,15 +29,26 @@ from .gemm_a16w16_ring_gfx950 import _barrier, _lds_ptr, _sb
 NWV = 4
 W_CM = 2
 NSEG = 5
+# Weight layouts (same ids as the ring kernel's): row-major [N, K], ring tiles [N/16, K/64, 16, 64] and AITER's
+# shuffle_weight(w, (16, 16)) layout [N/16, K/32, 4, 16, 8], read in place (no second weight copy).
+LAYOUT_ROW, LAYOUT_RING, LAYOUT_AITER = 0, 1, 2
 
 
 @functools.cache
 def compile_cat_ring(
-    n: int, seg_k: int, mt: int, ks: int, r: int, device: int = 0, nr: int = 4
+    n: int,
+    seg_k: int,
+    mt: int,
+    ks: int,
+    r: int,
+    device: int = 0,
+    nr: int = 4,
+    layout: int = LAYOUT_RING,
 ):
     """``device`` only keys the cache: a compiled handle must not be shared across GPUs."""
     K = NSEG * seg_k
     NB_TOTAL = K // 64
+    assert layout in (LAYOUT_ROW, LAYOUT_RING, LAYOUT_AITER), layout
     assert ks % NSEG == 0 and NB_TOTAL % ks == 0 and 1 <= mt <= 8
     STG = NB_TOTAL // ks
     KSPS = ks // NSEG
@@ -57,7 +68,7 @@ def compile_cat_ring(
     class Shared:
         buf: fx.Array[fx.Uint8, LDS, 16]
 
-    name = f"aiter_cat_ring_n{n}_k{K}_mt{MT}_ks{ks}_r{r}"
+    name = f"aiter_cat_ring_n{n}_k{K}_mt{MT}_ks{ks}_r{r}_l{layout}"
 
     @flyc.kernel(name=name, known_block_size=[64 * NWT, 1, 1])
     def kernel(
@@ -104,7 +115,18 @@ def compile_cat_ring(
         rn = wave
         for jj in range_constexpr(2):
             pc = (lane % 8) ^ ((r8 // 2) + jj * 4)
-            w_src.append((n0 // 16 + rn) * (K * 32) + (jj * 8 + r8) * 128 + pc * 16)
+            if const_expr(layout == LAYOUT_RING):
+                off = (n0 // 16 + rn) * (K * 32) + (jj * 8 + r8) * 128 + pc * 16
+            elif const_expr(layout == LAYOUT_AITER):
+                off = (
+                    (n0 // 16 + rn) * (K * 32)
+                    + (pc // 4) * 1024
+                    + (pc % 4) * 256
+                    + (jj * 8 + r8) * 16
+                )
+            else:
+                off = (n0 + rn * 16 + jj * 8 + r8) * (K * 2) + pc * 16
+            w_src.append(off)
             w_dst.append((rn * 2 + jj) * 1024)
         x_src, x_dst = [], []
         for i in range_constexpr(XPW):
@@ -138,7 +160,14 @@ def compile_cat_ring(
 
         def dma(b):
             for q in range_constexpr(2):
-                issue(wr, w_dst[q], w_src[q], b, (wb0 + b) * 2048, aux_w)
+                issue(
+                    wr,
+                    w_dst[q],
+                    w_src[q],
+                    b,
+                    (wb0 + b) * (128 if layout == LAYOUT_ROW else 2048),
+                    aux_w,
+                )
             for q in range_constexpr(XPW):
                 issue(xr, x_dst[q], x_src[q], b, (kb0 + b) * 128, aux_x)
 

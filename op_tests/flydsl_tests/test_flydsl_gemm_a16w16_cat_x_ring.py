@@ -21,9 +21,19 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_cat_x_ring import (
     cat_x_ring_supported,
     gemm_a16w16_cat_x_ring,
+    gemm_a16w16_ring_splitk,
+    ring_splitk_config,
+    ring_splitk_name_tiling,
+    ring_splitk_tilings,
     warmup_cat_x_ring,
 )
 from aiter.ops.flydsl.gemm_a16w16_ring import shuffle_weight_ring
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm,
+    flydsl_hgemm_kernel_name,
+    get_flydsl_hgemm_kernel_params,
+)
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import tgemm
 
@@ -100,6 +110,105 @@ def test_cat_x_ring_rejects_unsupported():
     assert not cat_x_ring_supported(129, N, SEG_K)
     # i32 byte offsets: a weight of 2 GiB or more is refused, not wrapped
     assert not cat_x_ring_supported(8, 2**20, SEG_K)
+
+
+@_SKIP
+@pytest.mark.parametrize("layout", ["row", "aiter", "ring"])
+@pytest.mark.parametrize("m", (1, 17, 64, 128))
+def test_ring_splitk_plain_matches_torch(m, layout):
+    """The K-concatenated form: ``x [M, 5 * seg_k]`` read as five chunks, any of the three weight layouts."""
+    xs, w = _inputs(m)
+    x = torch.cat(xs, dim=-1)
+    ref = run_torch(xs, w).float()
+    wl, shuffled = {
+        "row": (w, False),
+        "aiter": (shuffle_weight(w, layout=(16, 16)), "aiter"),
+        "ring": (shuffle_weight_ring(w), True),
+    }[layout]
+    out = gemm_a16w16_ring_splitk(x, wl, shuffled=shuffled)
+    torch.testing.assert_close(out.float(), ref, atol=0.05, rtol=1e-2)
+    # the same split order as the five-pointer op, so the two are bit-identical
+    assert torch.equal(out, gemm_a16w16_cat_x_ring(xs, shuffle_weight_ring(w), ks=10))
+
+
+def _tuned_name(m, mt_ks_r):
+    return flydsl_hgemm_kernel_name(
+        dtype=dtypes.bf16,
+        out_dtype=dtypes.bf16,
+        config=ring_splitk_config(*mt_ks_r),
+        has_bias=False,
+    )
+
+
+@_SKIP
+def test_ring_splitk_name_round_trip():
+    tilings = ring_splitk_tilings(32, NSEG * SEG_K, N)
+    assert (2, 10, 4) in tilings and all(t[0] == 2 for t in tilings)
+    for t in tilings:
+        params = get_flydsl_hgemm_kernel_params(_tuned_name(32, t))
+        assert params is not None and params["policy"] == "rk"
+        assert ring_splitk_name_tiling(params) == t
+    # a bias, a non-bf16 output or a stray field is not a split-K ring name
+    bad = _tuned_name(32, (2, 10, 4)).replace("_gm0_", "_gm1_")
+    assert get_flydsl_hgemm_kernel_params(bad) is None
+
+
+@_SKIP
+@pytest.mark.parametrize("bpreshuffle", [False, True])
+def test_ring_splitk_through_flydsl_hgemm(bpreshuffle):
+    """The tuned-row path: ``flydsl_hgemm(policy="rk")`` on the plain weight or AITER's preshuffled one."""
+    xs, w = _inputs(32)
+    x = torch.cat(xs, dim=-1)
+    cfg = ring_splitk_config(2, 10, 4)
+    wl = shuffle_weight(w, layout=(16, 16)) if bpreshuffle else w
+    out = flydsl_hgemm(
+        x,
+        wl,
+        block_m=cfg["block_m"],
+        block_n=cfg["block_n"],
+        block_k=cfg["block_k"],
+        split_k=cfg["split_k"],
+        m_waves=cfg["m_waves"],
+        n_waves=cfg["n_waves"],
+        k_waves=cfg["k_waves"],
+        stages=cfg["stages"],
+        policy="rk",
+        bpreshuffle=bpreshuffle,
+    )
+    torch.testing.assert_close(
+        out.float(), run_torch(xs, w).float(), atol=0.05, rtol=1e-2
+    )
+
+
+@_SKIP
+def test_ring_splitk_plain_graph_replay():
+    """Through the workspace cache of ``flydsl_hgemm``: capture, then replay."""
+    xs, w = _inputs(16)
+    x = torch.cat(xs, dim=-1)
+    cfg = ring_splitk_config(1, 10, 4)
+
+    def call():
+        return flydsl_hgemm(
+            x,
+            w,
+            block_m=cfg["block_m"],
+            block_n=cfg["block_n"],
+            block_k=cfg["block_k"],
+            split_k=cfg["split_k"],
+            m_waves=1,
+            n_waves=4,
+            k_waves=1,
+            stages=cfg["stages"],
+            policy="rk",
+        )
+
+    eager = call()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = call()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
 
 
 @benchmark()

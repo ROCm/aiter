@@ -173,7 +173,7 @@ def get_GEMM_A16W16_tuned_config(
                 if flydsl_config is None or (
                     bpreshuffle
                     and (
-                        flydsl_config["policy"] not in ("ft", "sk", "rg")
+                        flydsl_config["policy"] not in ("ft", "sk", "rg", "rk")
                         or (
                             flydsl_config["policy"] == "ft"
                             and (
@@ -769,6 +769,7 @@ def flydsl_gemm(
     skinny = flydsl_config["policy"] in (
         flydsl_gemm_kernels.SKINNY_POLICY,
         flydsl_gemm_kernels.RING_POLICY,
+        flydsl_gemm_kernels.RING_SPLITK_POLICY,
     )  # no bias fusion, input-dtype output
     fused_bias = None
     if (

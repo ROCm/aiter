@@ -21,9 +21,16 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 
 from .gemm_a16w16_ring import MAX_ROWS, _device_ok
-from .kernels.gemm_a16w16_cat_x_ring_gfx950 import NSEG, compile_cat_ring
+from .kernels.gemm_a16w16_cat_x_ring_gfx950 import (
+    LAYOUT_AITER,
+    LAYOUT_RING,
+    LAYOUT_ROW,
+    NSEG,
+    compile_cat_ring,
+)
 from .kernels.tensor_shim import _run_compiled
 
+MAX_SPLIT_K = 40  # tuner bound on ks: the fp32 partials are [ks, M, N]
 NWAVE_FRAGS = 4  # 16-row weight fragments per workgroup column tile (one per wave)
 
 
@@ -31,8 +38,27 @@ def _ring_depth(stages: int) -> int:
     return 6 if stages >= 6 else 4
 
 
-def cat_x_ring_supported(m: int, n: int, seg_k: int, device=None, ks: int = 10) -> bool:
-    """Whether ``gemm_a16w16_cat_x_ring`` takes M rows of five ``seg_k``-wide taps and an ``[n, 5 * seg_k]`` weight."""
+def _layout(shuffled) -> int:
+    """``shuffled``: True (ring tiles), False (row-major) or ``"aiter"`` (``shuffle_weight(w, (16, 16))``)."""
+    if shuffled == "aiter":
+        return LAYOUT_AITER
+    if isinstance(shuffled, bool):
+        return LAYOUT_RING if shuffled else LAYOUT_ROW
+    raise ValueError(f"unknown weight layout {shuffled!r}")
+
+
+def cat_x_ring_supported(
+    m: int,
+    n: int,
+    seg_k: int,
+    device=None,
+    ks: int = 10,
+    r: int | None = None,
+    mt: int | None = None,
+) -> bool:
+    """Whether ``gemm_a16w16_cat_x_ring`` takes M rows of five ``seg_k``-wide taps and an ``[n, 5 * seg_k]`` weight
+    with ``ks`` K splits, ring depth ``r`` (default: ``_ring_depth``) and ``mt`` 16-row M fragments per tile (default
+    ``ceil(m / 16)``)."""
     if not 1 <= m <= MAX_ROWS or not torch.cuda.is_available():
         return False
     index = (
@@ -41,59 +67,90 @@ def cat_x_ring_supported(m: int, n: int, seg_k: int, device=None, ks: int = 10) 
     if index is None:
         index = torch.cuda.current_device()
     stages = NSEG * seg_k // 64
+    if ks < 1 or ks % NSEG or stages % ks:
+        return False
+    r = r or _ring_depth(stages // ks)
+    mt = mt or (m + 15) // 16
     return (
-        _device_ok(index)
+        mt <= 8
+        and (m + 15) // 16 <= mt
+        and _device_ok(index)
         and n % (16 * NWAVE_FRAGS) == 0
         and seg_k % 64 == 0
-        and ks % NSEG == 0
-        and stages % ks == 0
-        and stages // ks >= 4
+        and 2 <= r
+        and stages // ks >= r
+        # LDS ring: r slots of (weight fragments + M fragments) 2 KiB tiles; <= 160 KiB
+        and r * (NWAVE_FRAGS + 1 + mt) * 2048 <= 160 * 1024
         # byte offsets into the weight and the fp32 partials are i32 inside the kernel
         and n * NSEG * seg_k * 2 < 2**31
         and ks * m * n * 4 < 2**31
     )
 
 
-def gemm_a16w16_cat_x_ring(
-    xs: list[torch.Tensor],
-    w: torch.Tensor,
-    out: torch.Tensor | None = None,
-    ks: int = 10,
-    workspace: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """``out [M, N] bf16 = concat(xs, -1) @ w^T``; ``xs`` are five bf16 ``[M, seg_k]`` taps (unit column stride, one
-    common 16-byte-aligned row stride) and ``w`` is ``shuffle_weight_ring(weight [N, 5 * seg_k])``. ``workspace`` is an
-    optional fp32 ``[ks, M, N]`` buffer."""
-    if len(xs) != NSEG:
-        raise ValueError(f"expected {NSEG} taps, got {len(xs)}")
-    m, seg_k = xs[0].shape
-    n = w.shape[0]
+def ring_splitk_config(mt: int, ks: int, r: int) -> dict:
+    """The HGEMM-name config of a split-K ring tiling (policy ``rk``): ``block_m`` is the rows of one M tile,
+    ``block_n=64`` the four 16-column weight fragments of a workgroup, ``stages`` the ring depth, ``split_k`` the K
+    splits (a multiple of 5: the K chunks of ``gemm_a16w16_ring_splitk``)."""
+    return {
+        "block_m": 16 * mt,
+        "block_n": 16 * NWAVE_FRAGS,
+        "block_k": 64,
+        "stages": r,
+        "split_k": ks,
+        "m_waves": 1,
+        "n_waves": NWAVE_FRAGS,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+        "policy": "rk",
+    }
+
+
+def ring_splitk_name_tiling(params: dict) -> tuple[int, int, int] | None:
+    """``(mt, ks, r)`` of a parsed ``prk`` kernel name, or None when the fields are not a split-K ring config."""
     if (
-        not cat_x_ring_supported(m, n, seg_k, xs[0].device, ks)
-        or w.shape[1] != NSEG * seg_k
+        params["dtype"] != "bf16"
+        or params["out_dtype"] != "bf16"
+        or params["target_gfx"] != "gfx950"
+        or params["has_bias"]
+        or params["k_waves"] != 1
+        or params["m_waves"] != 1
+        or params["n_waves"] != NWAVE_FRAGS
+        or params["block_n"] != 16 * NWAVE_FRAGS
+        or params["block_k"] != 64
+        or params["group_m"] != 0
+        or params["k_stagger"]
+        or params["b_non_temporal"]
+        or params["block_m"] % 16
+        or not 1 <= params["block_m"] // 16 <= 8
+        or params["split_k"] % NSEG
+        or not 2 <= params["stages"] <= 6
     ):
-        raise ValueError(
-            f"cat-x ring GEMM does not take M={m} N={n} seg_k={seg_k} ks={ks} on this device"
-        )
-    stride = xs[0].stride(0)
-    if w.device.type != "cuda" or any(x.device != w.device for x in xs):
-        raise ValueError("taps and weight must be on one CUDA device")
-    for x in xs:
-        if (
-            x.dtype != torch.bfloat16
-            or x.shape != (m, seg_k)
-            or x.stride(1) != 1
-            or x.stride(0) != stride
-            or (stride * 2) % 16
-            or x.data_ptr() % 16
-        ):
-            raise ValueError(
-                "taps must be bf16 [M, seg_k] with unit column stride, one aligned row stride"
-            )
-    if w.dtype != torch.bfloat16 or not w.is_contiguous() or w.data_ptr() % 16:
-        raise ValueError(
-            "w must be a contiguous aligned bf16 shuffle_weight_ring layout"
-        )
+        return None
+    return params["block_m"] // 16, params["split_k"], params["stages"]
+
+
+def ring_splitk_tilings(m: int, k: int, n: int, device=None):
+    """Every supported ``(mt, ks, r)`` for ``M x N x K``: the search space of the tuner. ``mt`` is the smallest M
+    tile that holds ``m`` rows; the ring depth is 3..6 and ``ks`` every K split that keeps >= ``r`` stages per split
+    and gives at least 64 workgroups (``ks`` <= ``MAX_SPLIT_K``)."""
+    if k % NSEG:
+        return []
+    mt = (m + 15) // 16
+    out = []
+    for ks in range(NSEG, min(k // 64, MAX_SPLIT_K) + 1, NSEG):
+        for r in (3, 4, 5, 6):
+            if n // (16 * NWAVE_FRAGS) * ks >= 64 and cat_x_ring_supported(
+                m, n, k // NSEG, device, ks, r, mt
+            ):
+                out.append((mt, ks, r))
+    return out
+
+
+def _launch(
+    ptrs, m, seg_k, stride_bytes, w, out, ks, r, layout, workspace, tune_mt=None
+):
+    n = w.shape[0]
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=w.device)
     elif (
@@ -116,18 +173,19 @@ def gemm_a16w16_cat_x_ring(
         exe = compile_cat_ring(
             n,
             seg_k,
-            (m + 15) // 16,
+            tune_mt or (m + 15) // 16,
             ks,
-            _ring_depth(NSEG * seg_k // 64 // ks),
+            r or _ring_depth(NSEG * seg_k // 64 // ks),
             w.device.index,
+            layout=layout,
         )
         _run_compiled(
             exe,
-            *[x.data_ptr() for x in xs],
+            *ptrs,
             w.data_ptr(),
             workspace.data_ptr(),
             m,
-            stride * 2,
+            stride_bytes,
             torch.cuda.current_stream(),
         )
         _gemm_splitk_reduce_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 32))](
@@ -150,6 +208,116 @@ def gemm_a16w16_cat_x_ring(
             use_activation=False,
         )
     return out
+
+
+def gemm_a16w16_cat_x_ring(
+    xs: list[torch.Tensor],
+    w: torch.Tensor,
+    out: torch.Tensor | None = None,
+    ks: int = 10,
+    workspace: torch.Tensor | None = None,
+    shuffled: bool | str = True,
+    ring_depth: int | None = None,
+) -> torch.Tensor:
+    """``out [M, N] bf16 = concat(xs, -1) @ w^T``; ``xs`` are five bf16 ``[M, seg_k]`` taps (unit column stride, one
+    common 16-byte-aligned row stride) and ``w`` is ``shuffle_weight_ring(weight [N, 5 * seg_k])`` (``shuffled=True``),
+    AITER's ``shuffle_weight(w, (16, 16))`` read in place (``"aiter"``) or the row-major weight (``False``).
+    ``workspace`` is an optional fp32 ``[ks, M, N]`` buffer."""
+    if len(xs) != NSEG:
+        raise ValueError(f"expected {NSEG} taps, got {len(xs)}")
+    m, seg_k = xs[0].shape
+    n = w.shape[0]
+    if (
+        not cat_x_ring_supported(m, n, seg_k, xs[0].device, ks, ring_depth)
+        or w.shape[1] != NSEG * seg_k
+    ):
+        raise ValueError(
+            f"cat-x ring GEMM does not take M={m} N={n} seg_k={seg_k} ks={ks} on this device"
+        )
+    stride = xs[0].stride(0)
+    if w.device.type != "cuda" or any(x.device != w.device for x in xs):
+        raise ValueError("taps and weight must be on one CUDA device")
+    for x in xs:
+        if (
+            x.dtype != torch.bfloat16
+            or x.shape != (m, seg_k)
+            or x.stride(1) != 1
+            or x.stride(0) != stride
+            or (stride * 2) % 16
+            or x.data_ptr() % 16
+        ):
+            raise ValueError(
+                "taps must be bf16 [M, seg_k] with unit column stride, one aligned row stride"
+            )
+    layout = _layout(shuffled)
+    if w.dtype != torch.bfloat16 or not w.is_contiguous() or w.data_ptr() % 16:
+        raise ValueError("w must be a contiguous aligned bf16 weight")
+    return _launch(
+        [x.data_ptr() for x in xs],
+        m,
+        seg_k,
+        stride * 2,
+        w,
+        out,
+        ks,
+        ring_depth,
+        layout,
+        workspace,
+    )
+
+
+def gemm_a16w16_ring_splitk(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor | None = None,
+    ks: int = 10,
+    ring_depth: int | None = None,
+    shuffled: bool | str = False,
+    workspace: torch.Tensor | None = None,
+    mt: int | None = None,
+) -> torch.Tensor:
+    """``out [M, N] bf16 = x [M, K] @ w^T`` with the split-K ring: the plain (K-contiguous) form of
+    ``gemm_a16w16_cat_x_ring``. ``x`` is read as five ``K / 5`` chunks whose base pointers are ``x`` plus a chunk
+    offset (``K`` a multiple of 320), so a caller that stores the five taps side by side in one ``[M, 5 * seg_k]``
+    buffer (or ``torch.cat``s them) needs no tap list. ``mt`` is the 16-row M fragments of a tile (default
+    ``ceil(M / 16)``)."""
+    m, k = x.shape
+    n = w.shape[0]
+    if k % NSEG or w.shape[1] != k:
+        raise ValueError(
+            f"ring split-K GEMM does not take K={k} for w {tuple(w.shape)}"
+        )
+    seg_k = k // NSEG
+    if not cat_x_ring_supported(m, n, seg_k, x.device, ks, ring_depth, mt):
+        raise ValueError(
+            f"ring split-K GEMM does not take M={m} N={n} K={k} ks={ks} on this device"
+        )
+    if x.device.type != "cuda" or w.device != x.device:
+        raise ValueError("x and w must be on one CUDA device")
+    if (
+        x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+        or (x.stride(0) * 2) % 16
+        or x.data_ptr() % 16
+    ):
+        raise ValueError("x must be bf16 [M, K] with unit column stride, aligned rows")
+    layout = _layout(shuffled)
+    if w.dtype != torch.bfloat16 or not w.is_contiguous() or w.data_ptr() % 16:
+        raise ValueError("w must be a contiguous aligned bf16 weight")
+    base = x.data_ptr()
+    return _launch(
+        [base + i * seg_k * 2 for i in range(NSEG)],
+        m,
+        seg_k,
+        x.stride(0) * 2,
+        w,
+        out,
+        ks,
+        ring_depth,
+        layout,
+        workspace,
+        mt,
+    )
 
 
 def warmup_cat_x_ring(
