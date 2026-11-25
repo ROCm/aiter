@@ -213,8 +213,8 @@ def fused_qknorm_idxrqknorm(
             else "auto"
         )
 
-    # A QKV projection parked by gemm_a8w8_qkv_front (its tuned tier is a fused one): the GEMM runs here, in the
-    # same launch as the insert (17-64 rows) or ahead of the reduce-insert (65-128 rows). ``qkv`` is uncomputed.
+    # A QKV projection parked by gemm_a8w8_qkv_front (its static tier is a fused one): the GEMM runs here, in the
+    # same launch as the insert (1-64 rows) or ahead of the reduce-insert (65-128 rows). ``qkv`` is uncomputed.
     deferred = _take_deferred_front(qkv)
     if deferred is not None:
         _run_deferred_front(

@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""``gemm_a8w8_qkv_front`` + ``fused_qknorm_idxrqknorm``: the tuned-tier lookup (no GPU work) and the deferred fused tiers
+"""``gemm_a8w8_qkv_front`` + ``fused_qknorm_idxrqknorm``: the static tier lookup (no GPU work) and the deferred fused tiers
 against the plain tier through the same public calls (see test_flydsl_qkv_chain.py for the kernel-level checks).
 """
-
-import inspect
 
 import pytest
 import torch
@@ -91,11 +89,6 @@ def _inputs(m):
 def test_fused_tier_matches_plain_tier(m, ks):
     if ks != 3 and m <= 64:
         pytest.skip("the one-launch tier has a fixed K split")
-    if m > 64:
-        from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
-
-        if "cfg" not in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
-            pytest.skip("split-3 row-major activation entry (A_ROW) not in this tree")
     weight, w_scale, chain_scale, aux, cs = _setup()
     x, pos, slot = _inputs(m)
     kscale, vscale = torch.tensor([0.5], device="cuda"), torch.tensor(
@@ -199,8 +192,6 @@ def test_fused_front_is_bitwise_the_unfused_split_chain(m, ks):
 
     if ks != 3 and m <= 64:
         pytest.skip("the one-launch tier has a fixed K split")
-    if "cfg" not in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
-        pytest.skip("row-major split-K GEMM not in this tree")
     weight, w_scale, chain_scale, aux, cs = _setup()
     x, pos, slot = _inputs(m)
     kscale, vscale = torch.tensor([0.5], device="cuda"), torch.tensor(
