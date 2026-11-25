@@ -311,6 +311,11 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input GEMM1 (interleaved local plan): a unit of an expert with more than one m-tile runs a pair of its
+    # m-tiles as one tile of twice the rows, which reads each W1 slab once for both (GEMM2 keeps its m-tile units).
+    # The pair reads W1 through the cache: with streamed W1 (b_nt) only a rank whose plan picks the cached-weight
+    # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ.
+    pair_tiles: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1654,6 +1659,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     small-input runtime keeps its own payload and combine buffers, as at EP4); the measurements are in the PR.
     """
     config = _tune_v41_flash_ep4_small(config, bucket)
+    if bucket in (64, 128):
+        # 32-row m-tiles and 256-wide GEMM1 n-tiles: on a rank that reads W1 through the cache (a hot expert or
+        # many routed rows) the experts with more than 32 rows read their W1 slabs once per m-tile pair; the other
+        # ranks keep streaming W1 per m-tile. (Up to 32 tokens no rank of these routes reads W1 cached, and at 16
+        # tokens, whose epilogue stores through per-tile resources, the pair body spills SGPRs.)
+        config = replace(
+            config, fused_stage1=replace(config.fused_stage1, pair_tiles=True)
+        )
     if bucket == 4:
         # The 1-token GEMM1 schedule at 4 tokens too, whose grid is one CTA a CU as well.
         return replace(

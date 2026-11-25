@@ -33,6 +33,19 @@ def wait_lds_barrier(vmcnt=63):
     fx.barrier()
 
 
+def _paired_slot(row, row_stride_i32, half_rows):
+    """Srcmap slot offset of row ``row`` of a paired tile: two half_rows-row interleaved m-tiles of one expert, whose
+    rows are row_stride_i32 slots apart and the second's slots one past the first's."""
+    shift = half_rows.bit_length() - 1
+    return (row >> fx.Int32(shift)) + (row & fx.Int32(half_rows - 1)) * row_stride_i32
+
+
+def _paired_real(row, valid_rows, half_rows):
+    """Whether row ``row`` of a paired tile is real: ``valid_rows`` is its m-tiles' (rows0, rows1)."""
+    first = row < fx.Int32(half_rows)
+    return (row & fx.Int32(half_rows - 1)) < first.select(valid_rows[0], valid_rows[1])
+
+
 def _token_offset(srcmap_word, row_units, token_base):
     """Offset (row_units per row) of a tile row's token row (srcmap source token slot) in the region at token_base."""
     return token_base + (srcmap_word & fx.Int32(0xFFFFFF)) * fx.Int32(row_units)
@@ -75,13 +88,20 @@ class ATileLoader:
         row_map_rsrc=None,
         source_rows=0,
         a_dtype="fp8",
+        paired=False,
+        tx=None,
     ):
         self._sort_block_m = sort_block_m
+        # paired: the tile is two sort_block_m // 2-row interleaved m-tiles of one expert (row_map only): row r reads
+        # srcmap slot tile_row_base + _paired_slot(r), and valid_rows_i32 is the m-tiles' (rows0, rows1).
+        self._half_rows = sort_block_m // 2 if paired else 0
+        assert not paired or (sort_block_m // 2) & (sort_block_m // 2 - 1) == 0
+        # tx: the thread index the per-thread offsets derive from (default thread_idx.x).
         self._k_step_bytes = k_step_bytes
         self._total_threads = total_threads
         self._swizzle = swizzle
         self._row_bytes = row_bytes
-        self._tx = fx.thread_idx.x
+        self._tx = fx.thread_idx.x if tx is None else tx
         self._wave = self._tx // 64
         self._x_tensor = x_tensor
         self._async_copy = bool(async_copy)
@@ -149,6 +169,7 @@ class ATileLoader:
         if const_expr(row_map is not None):
             num_records = row_map["x_bytes"]
         else:
+            assert not self._half_rows
             num_records = input_bytes
             if valid_rows_i32 is not None:
                 assert not self._indexed_input
@@ -184,6 +205,8 @@ class ATileLoader:
                 mapped_byte = _token_offset(src, self._row_bytes, row_map["x_token"])
                 if const_expr(valid_rows_i32 is None):
                     real = (src & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
+                elif const_expr(self._half_rows):
+                    real = _paired_real(row, valid_rows_i32, self._half_rows)
                 else:
                     real = row < valid_rows_i32
                 mapped_byte = real.select(mapped_byte, num_records)
@@ -229,7 +252,9 @@ class ATileLoader:
             0, self._sort_block_m * chunks_per_row, self._total_threads
         ):
             row = (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
-            if const_expr(row_stride_i32 is not None):
+            if const_expr(self._half_rows):
+                row = _paired_slot(row, row_stride_i32, self._half_rows)
+            elif const_expr(row_stride_i32 is not None):
                 row = row * row_stride_i32
             out.append(srcmap_rsrc[tile_row_base_i32 + row])
         return out
@@ -334,10 +359,11 @@ class ATileLoader:
 class AS2RLoader:
     """Load one FP8/FP4 scaled-MFMA A operand from row-major LDS."""
 
-    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8"):
+    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8", tx=None):
+        # tx: as ATileLoader's.
         self._k_step_bytes = k_step_bytes
         self._swizzle = swizzle
-        self._lane = fx.thread_idx.x % 64
+        self._lane = (fx.thread_idx.x if tx is None else tx) % 64
         self._is_fp4 = a_dtype == "fp4"
         assert self._is_fp4 or a_dtype == "fp8"
 
@@ -474,17 +500,21 @@ class AScaleLoader:
         indexed_input=False,
         row_map_rsrc=None,
         packed=False,
+        paired=False,
+        tx=None,
     ):
+        # paired / tx: as ATileLoader's.
+        self._half_rows = sort_block_m // 2 if paired else 0
         # packed: LDS dword (s * n_groups + g) * 64 + lane is that lane's load_step word of group g at K-step s.
         self._packed = packed
         assert not (packed and indexed_input)
         self._rsrc = scale_rsrc
         self._n_scale = model_dim // 32
-        self._lane = fx.thread_idx.x % 64
+        self._lane = (fx.thread_idx.x if tx is None else tx) % 64
         self._n_groups = m_repeat // _PACK
         self._sort_block_m = sort_block_m
         self._total_threads = total_threads
-        self._tx = fx.thread_idx.x
+        self._tx = fx.thread_idx.x if tx is None else tx
         self._indexed_input = bool(indexed_input)
         self._row_map_rsrc = row_map_rsrc
         if self._indexed_input:
@@ -506,6 +536,7 @@ class AScaleLoader:
         """
         total = self._sort_block_m * self._n_scale
         assert total % 16 == 0, "A-scale tile must contain whole 16-byte copy chunks"
+        assert not self._half_rows or row_map is not None
         base = tile_row_base_i32 * fx.Int32(self._n_scale)
         n16 = total // 16
         row_chunks = self._n_scale // 16
@@ -566,6 +597,8 @@ class AScaleLoader:
                 row_group = _token_offset(srcs[i], row_chunks, row_map["scale_token"])
                 if const_expr(valid_rows_i32 is None):
                     real = (srcs[i] & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
+                elif const_expr(self._half_rows):
+                    real = _paired_real(row, valid_rows_i32, self._half_rows)
                 else:
                     real = row < valid_rows_i32
                 copy_mapped(
@@ -634,7 +667,9 @@ class AScaleLoader:
             row = (row < fx.Int32(self._sort_block_m)).select(
                 row, fx.Int32(self._sort_block_m - 1)
             )
-            if const_expr(row_stride_i32 is not None):
+            if const_expr(self._half_rows):
+                row = _paired_slot(row, row_stride_i32, self._half_rows)
+            elif const_expr(row_stride_i32 is not None):
                 row = row * row_stride_i32
             out.append(srcmap_rsrc[tile_row_base_i32 + row])
         return out

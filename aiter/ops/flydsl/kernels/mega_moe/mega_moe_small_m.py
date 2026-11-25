@@ -1016,7 +1016,7 @@ def compile_mega_moe_stage1(
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False,
+    ascale_packed: bool = False, stream_w: bool = False, pair_tiles: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1054,8 +1054,10 @@ def compile_mega_moe_stage1(
     a_lds_i32 = a_lds_size // 4
     cs_tile_n = tile_n // 2
     cs_size = sort_block_m * cs_tile_n
-    lds_pool_bytes = max(2 * a_lds_size, cs_size * 4)
-    n_scale_bytes = sort_block_m * (model_dim // 32)
+    # pair_tiles: a unit may run two m-tiles as one tile of twice the rows (A and its scales staged for both).
+    tile_rows_max = sort_block_m * (2 if pair_tiles else 1)
+    lds_pool_bytes = max(2 * tile_rows_max * A_K_STEP_BYTES, cs_size * 4)
+    n_scale_bytes = tile_rows_max * (model_dim // 32)
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
@@ -1116,6 +1118,13 @@ def compile_mega_moe_stage1(
     # through the srcmap (dedup_rows) and the m-tile's rows from the local plan / the finalize's rows word.
     interleave = dedup_rows and plan_local
     assert not interleave or fz_cap // fz_tile_m < 1 << 15, "the rows word keeps the m-tile count in its high half"
+    # pair_tiles: the GEMM1 units of an expert with more m-tiles than one each run a pair of them (2j, 2j + 1), one
+    # 2 x sort_block_m row tile that reads each W1 slab once for both (the last of an odd count runs alone). The
+    # GEMM1 unit space is then N_TILES units per pair or lone m-tile; GEMM2 keeps its m-tile units. The paired body
+    # is register-checked with the default lookahead. A pair reads W1 through the cache, so with streamed W1 only the
+    # ranks whose plan already picks the cached-weight bodies (_PLAN_CACHED_W_BIT) pair; the others keep their
+    # streamed m-tile units (cached pairs among streamed tiles crowd the L2 and lose to them under skewed routing).
+    assert not pair_tiles or (interleave and g1_lookahead == 1 and g1_a_ahead == 1)
     g2_tile, g2_lay = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
@@ -1140,7 +1149,8 @@ def compile_mega_moe_stage1(
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
         n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
-    g2_scratch_off = g2_lay["bytes"]
+    # The GEMM2 scratch words (the claim result, the plan word) are written while GEMM1 runs: past its A buffers.
+    g2_scratch_off = max(g2_lay["bytes"], 2 * tile_rows_max * A_K_STEP_BYTES)
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
     # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
@@ -1178,6 +1188,9 @@ def compile_mega_moe_stage1(
             # Per expert slot (64-expert chunks): its inclusive tile count and its row count.
             plan_incl: fx.Array[fx.Int32, plan_chunks * 64, 16]
             plan_count: fx.Array[fx.Int32, plan_chunks * 64, 16]
+        if pair_tiles:
+            # Per expert slot: its inclusive GEMM1 unit-group count (m-tile pairs and lone m-tiles).
+            plan_gincl: fx.Array[fx.Int32, plan_chunks * 64, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -1199,6 +1212,7 @@ def compile_mega_moe_stage1(
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
+        f"{'_pt' if pair_tiles else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1340,15 +1354,20 @@ def compile_mega_moe_stage1(
             def plan_ptr(base, i):
                 return lds_typed_ptr(base + i * fx.Int32(4), T.i32, align=4)
 
-            def plan_lookup(m_tile):
-                # The tile's expert = the experts whose inclusive tile count is <= m_tile.
+            def expert_ballot(base, index):
+                # The number of experts whose inclusive count (the LDS table at base) is <= index: one lane an
+                # expert slot, a ballot per 64 slots. Raw ballot / readfirstlane: FlyDSL has no wave vote API.
                 lane = tid & fx.Int32(63)
                 expert = fx.Int32(0)
                 for chunk in range_constexpr(plan_chunks):
-                    incl = fx.ptr_load(plan_ptr(incl_base, fx.Int32(chunk * 64) + lane))
-                    mask = rocdl.ballot(T.i64, incl <= m_tile)
+                    incl = fx.ptr_load(plan_ptr(base, fx.Int32(chunk * 64) + lane))
+                    mask = rocdl.ballot(T.i64, incl <= index)
                     expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
-                expert = fx.Int32(rocdl.readfirstlane(T.i32, expert))
+                return fx.Int32(rocdl.readfirstlane(T.i32, expert))
+
+            def plan_lookup(m_tile):
+                # The tile's expert = the experts whose inclusive tile count is <= m_tile.
+                expert = expert_ballot(incl_base, m_tile)
                 incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
                 count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
                 tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
@@ -1364,7 +1383,38 @@ def compile_mega_moe_stage1(
                     rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
                     plan = (expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows)
                 return plan
-        _, _do_scheduled_tile = build_fused_gemm1(
+        group_lookup = None
+        if const_expr(pair_tiles):
+            gincl_base = fx.Int32(fx.ptrtoint(lds.plan_gincl.ptr))
+
+            def _expert_at(base, index):
+                # The expert whose inclusive count (table at base) passes index; past the last: the last expert.
+                expert = expert_ballot(base, index)
+                return (expert < fx.Int32(fz_epr)).select(expert, fx.Int32(fz_epr - 1))
+
+            def _expert_groups(expert):
+                # The expert's inclusive m-tile and unit-group counts, rows, m-tiles and unit groups (pair_shift:
+                # whether this rank pairs, as its plan grouped the m-tiles).
+                gincl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(gincl_base, expert))))
+                incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
+                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
+                tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+                return incl_e, gincl_e, count_e, tiles_e, (tiles_e + pair_shift) >> pair_shift
+
+            def group_lookup(group):
+                # The unit group's plan (build_fused_gemm1 pair_tiles): an expert's m-tile pair (2j, 2j + 1), or its
+                # last m-tile when alone. Its expert = the experts whose inclusive group count is <= group; a group
+                # past the last gets the last expert's (meaningless) plan.
+                expert = _expert_at(gincl_base, group)
+                incl_e, gincl_e, count_e, tiles_e, groups_e = _expert_groups(expert)
+                # The group's first m-tile in the expert, and the rows of its m-tiles as the finalize interleaves them.
+                tile = (group - gincl_e + groups_e) << pair_shift
+                rows_q, rows_r = _interleaved_rows(count_e, tiles_e)
+                rows = tuple(rows_q + (tile + fx.Int32(h) < rows_r).select(fx.Int32(1), fx.Int32(0)) for h in range(2))
+                paired = tile + fx.Int32(1) < tiles_e * pair_shift
+                return (expert, incl_e - tiles_e + tile, paired, expert * fx.Int32(fz_cap) + tile, rows, tiles_e)
+        # pair_tiles: each build also returns its pair runner.
+        _, _do_scheduled_tile, *pair_runner = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
             trb_rsrc=trb_rsrc, tib_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
@@ -1379,12 +1429,12 @@ def compile_mega_moe_stage1(
             swiglu_limit=swiglu_limit,
             rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, pair_tiles=pair_tiles,
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
         if const_expr(b_cache_modifier != 0):
-            _, _do_cached_tile = build_fused_gemm1(
+            _, _do_cached_tile, *pair_runner = build_fused_gemm1(
                 x_tensor=x, w_rsrc=w_rsrc,
                 sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
                 trb_rsrc=trb_rsrc, tib_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
@@ -1399,8 +1449,11 @@ def compile_mega_moe_stage1(
                 swiglu_limit=swiglu_limit,
                 rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, pair_tiles=pair_tiles,
             )
+        # pair_tiles: a pair reads W1 through the cache (the cached build's pair runner), as its expert has more than
+        # one m-tile reading each slab; a streamed pair body as well would make four GEMM1 bodies, which spill.
+        _do_paired_tile = pair_runner[0] if const_expr(pair_tiles) else None
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
         a_g2_ready = _disp_ptr(DispatchSlot.G2_READY)
@@ -1425,6 +1478,13 @@ def compile_mega_moe_stage1(
         first_local = fx.Int32(0)
         nv_ptr = lds_typed_ptr(fx.Int32(g2_scratch_off + 4), T.i32, align=4)
 
+        def _pair_shift(plan_low):
+            # pair_tiles: 1 when the rank pairs its experts' m-tiles, 0 when it runs them as m-tile units. With
+            # streamed W1 only the cached-weight ranks pair; with cached W1 every rank does.
+            if const_expr(b_cache_modifier != 0):
+                return (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
+            return fx.Int32(1)
+
         def _local_plan():
             # Wave 0: wait for every source as the plan CTA does, then build this CTA's plan table in LDS. The
             # counts are final once the sources are done; they are read past L2 (the last WG of the launch
@@ -1440,13 +1500,24 @@ def compile_mega_moe_stage1(
                 a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
             chunks, total_tiles, routed_rows, max_count, _overflow, no_overflow = _plan_counts(
                 a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=_SC0_SC1_CACHE)
+            hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
+            plan_low = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            group_total = fx.Int32(0)
             for chunk in range_constexpr(plan_chunks):
                 _valid, _expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
                 slot = fx.Int32(chunk * 64) + lane
                 fx.ptr_store(metadata_base + num_expert_tiles, plan_ptr(incl_base, slot))
                 fx.ptr_store(safe_count, plan_ptr(count_base, slot))
-            hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+                if const_expr(pair_tiles):
+                    # The expert's unit groups: its m-tile pairs and a lone last m-tile, or its m-tiles when the rank
+                    # does not pair.
+                    shift = _pair_shift(plan_low)
+                    groups = _wave_inclusive_scan_i32((num_expert_tiles + shift) >> shift, lane)
+                    groups = groups + group_total
+                    fx.ptr_store(groups, plan_ptr(gincl_base, slot))
+                    # Raw v_readlane: the scan total in an SGPR (no FlyDSL lane-read API with a scalar result).
+                    group_total = fx.Int32(fx.rocdl.readlane(T.i32, groups, 63))
+            return plan_low
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The previous launch left the counters zeroed: the first work fetch overlaps the plan wait.
@@ -1477,8 +1548,18 @@ def compile_mega_moe_stage1(
             row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0])))
             row_map["scale_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16))))
         cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
+        # pair_tiles: 1 when this rank pairs its m-tiles (group_lookup), as _local_plan grouped them.
+        pair_shift = _pair_shift(plan_low)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
-        total_work = num_m_tiles * fx.Int32(N_TILES)
+        num_groups = num_m_tiles
+        if const_expr(pair_tiles):
+            # A pairing rank's unit groups (no groups without a plan: an overflow leaves num_valid 0 with the other
+            # experts' counts in the table); the other ranks' are their m-tiles.
+            if (pair_shift != fx.Int32(0)) & (num_m_tiles > fx.Int32(0)):
+                num_groups = fx.Int32(rocdl.readfirstlane(
+                    T.i32, fx.ptr_load(plan_ptr(gincl_base, fx.Int32(fz_epr - 1)))))
+        # The GEMM1 unit space: N_TILES units per m-tile, or with pair_tiles per unit group.
+        total_work = num_groups * fx.Int32(N_TILES)
 
         # Control CTAs join the work pool after dispatch.
         consumer_active = fx.Int32(1) == fx.Int32(1)
@@ -1492,11 +1573,32 @@ def compile_mega_moe_stage1(
         # (2 n-tiles of tile_n 256 cover the same 256 output columns when N_TILES is not a multiple of 4.)
         cut_tiles = 4 if const_expr(N_TILES % 4 == 0) else 2
         assert N_TILES % cut_tiles == 0 and tile_n * cut_tiles >= 512
-        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-cut_tiles)
-        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-cut_tiles)) - shard_base
+        # pair_tiles: the slices are equal in the m-tile unit space (a pair's units weigh two m-tiles' units), so an XCD
+        # holding a paired expert does not get more rows than the others.
+        tile_work = num_m_tiles * fx.Int32(N_TILES)
+        pos_lo = ((work_shard * tile_work) // fx.Int32(8)) & fx.Int32(-cut_tiles)
+        pos_hi = ((work_shard + fx.Int32(1)) * tile_work) // fx.Int32(8) & fx.Int32(-cut_tiles)
+        shard_base, shard_end = pos_lo, pos_hi
+        if const_expr(pair_tiles):
+
+            def group_unit_pos(pos):
+                # The GEMM1 unit position at m-tile unit position pos (past the plan: the end): a pair's N_TILES units
+                # stand for its two m-tiles' 2 * N_TILES, rounded down to cut_tiles.
+                m_tile = pos // fx.Int32(N_TILES)
+                n_off = pos - m_tile * fx.Int32(N_TILES)
+                incl_e, gincl_e, _count_e, tiles_e, groups_e = _expert_groups(_expert_at(incl_base, m_tile))
+                tile = m_tile - incl_e + tiles_e
+                group = gincl_e - groups_e + (tile >> pair_shift)
+                paired = (tile | fx.Int32(1)) < tiles_e * pair_shift
+                pair_off = (((tile & fx.Int32(1)) * fx.Int32(N_TILES) + n_off) >> fx.Int32(1)) & fx.Int32(-cut_tiles)
+                unit = group * fx.Int32(N_TILES) + paired.select(pair_off, n_off)
+                return (m_tile < num_m_tiles).select(unit, total_work)
+
+            if pair_shift != fx.Int32(0):
+                shard_base, shard_end = group_unit_pos(pos_lo), group_unit_pos(pos_hi)
+        shard_work = shard_end - shard_base
 
         # The m-tiles at this XCD slice's ends that the slice cuts (-1: the end is on an m-tile boundary).
-        shard_end = shard_base + shard_work
         cut_lo = (shard_base % fx.Int32(N_TILES) != fx.Int32(0)).select(
             shard_base // fx.Int32(N_TILES), fx.Int32(-1))
         cut_hi = (shard_end % fx.Int32(N_TILES) != fx.Int32(0)).select(
@@ -1505,7 +1607,10 @@ def compile_mega_moe_stage1(
         def _cut_own(m):
             return (m == cut_lo) | (m == cut_hi)
 
+        # The pending unit's m-tile (pair_tiles: its unit group), its first m-tile and whether it is a pair.
         pend_m = fx.Int32(-1)
+        pend_ready = fx.Int32(0)
+        pend_paired = fx.Int32(0)
         g1_fetch = fx.Int32(0)
         g1_leave = fx.Int32(0)
         early_thr = shard_work
@@ -1513,10 +1618,11 @@ def compile_mega_moe_stage1(
             early_cta = ((fx.block_idx.x >> fx.Int32(3)) % fx.Int32(G2_EARLY_K)) == fx.Int32(0)
             early_thr = early_cta.select(shard_work * fx.Int32(G2_EARLY_P) // fx.Int32(16), shard_work)
 
-        def _count_tile(m):
+        def _count_tile(m, ready_m=None, paired=None):
             # Count a finished tile of m-tile m (its stores completed before the loop-end barrier); the last of
             # the m-tile's N_TILES tiles raises its GEMM2 ready epoch. A cut m-tile runs on two XCDs: each counts
             # its part once, by its last own unit, after writing its L2 back for the other XCD's GEMM2 tiles.
+            # pair_tiles: m is a unit group, whose last unit raises m-tile ready_m and, if paired, the next one.
             inc = fx.Int32(1)
             if _cut_own(m):
                 side = (m == cut_lo).select(fx.Int32(4), fx.Int32(8))
@@ -1534,10 +1640,27 @@ def compile_mega_moe_stage1(
                 if old_cnt + inc == fx.Int32(N_TILES):
                     # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
                     # (a max would stick at 0xffffffff).
-                    comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), launch_epoch)
+                    ready_tile = m if const_expr(ready_m is None) else ready_m
+                    comm_ops.store_i32_global_agent_release(
+                        a_g2_ready + fx.Int64(ready_tile) * fx.Int64(4), launch_epoch)
+                    if const_expr(paired is not None):
+                        if paired != fx.Int32(0):
+                            comm_ops.store_i32_global_agent_release(
+                                a_g2_ready + fx.Int64(ready_tile + fx.Int32(1)) * fx.Int64(4), launch_epoch)
                     # All counts of this launch are in: rewind to 0, since the next launch's config may use another
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
+
+        def _run_tile(unit):
+            # A GEMM1 unit of one m-tile, through the streamed or (cached_w) the cached-weight body.
+            if const_expr(b_cache_modifier != 0):
+                if cached_w != fx.Int32(0):
+                    _do_cached_tile(*unit)
+                else:
+                    _do_scheduled_tile(*unit)
+            else:
+                _do_scheduled_tile(*unit)
+
         while consumer_active:
             if tid == fx.Int32(0):
                 local_work = first_local
@@ -1556,7 +1679,10 @@ def compile_mega_moe_stage1(
                 # Count the previous tile of this CTA (its stores completed before the loop-end barrier)
                 # next to the work fetch, so the two atomics share one round trip.
                 if pend_m >= fx.Int32(0):
-                    _count_tile(pend_m)
+                    if const_expr(pair_tiles):
+                        _count_tile(pend_m, pend_ready, pend_paired)
+                    else:
+                        _count_tile(pend_m)
                 work = (local_work < shard_work).select(shard_base + local_work, total_work)
                 # The shard's GEMM2 units follow its GEMM1 units on the same counter: the fetch that ends
                 # GEMM1 is this CTA's first GEMM2 unit.
@@ -1565,19 +1691,24 @@ def compile_mega_moe_stage1(
             fx.barrier()
             work = Vec(work_scratch_view.load())[0]
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
+            # pair_tiles: the unit's plan (every lane: the lookup ballots), which its GEMM1 body and count take.
+            unit = (work, group_lookup(work // fx.Int32(N_TILES))) if const_expr(pair_tiles) else (work,)
             if has_work != fx.Int32(0):
-                if const_expr(b_cache_modifier != 0):
-                    if cached_w != fx.Int32(0):
-                        _do_cached_tile(work)
+                if const_expr(pair_tiles):
+                    if unit[1][2]:
+                        _do_paired_tile(*unit)
                     else:
-                        _do_scheduled_tile(work)
+                        _run_tile(unit)
                 else:
-                    _do_scheduled_tile(work)
+                    _run_tile(unit)
                 # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
                 # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 fx.barrier()
             pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
+            if const_expr(pair_tiles):
+                pend_ready = unit[1][1]
+                pend_paired = unit[1][2].select(fx.Int32(1), fx.Int32(0))
             consumer_active = has_work != fx.Int32(0)
             g1_fetch = fx.Int32(1)
             if const_expr(G2_EARLY_K > 0):
@@ -1590,8 +1721,8 @@ def compile_mega_moe_stage1(
         # that GEMM1 did not cut keeps its GEMM2 on the XCD whose L2 holds its GEMM1 output (an independent
         # equal split could move the first units of such an m-tile to the previous XCD when the GEMM1 slice end
         # was rounded down to an m-tile boundary).
-        g2_base = (shard_base * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES)
-        g2_units = (shard_end * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES) - g2_base
+        g2_base = (pos_lo * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES)
+        g2_units = (pos_hi * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES) - g2_base
         g2_head = a_work_head + fx.Int64(work_shard) * fx.Int64(64)
         g2_active = fx.Int32(1) == fx.Int32(1)
         g2_fetch = fx.Int32(0)
@@ -1715,7 +1846,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w,
+        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, pair_tiles=k1.pair_tiles,
     )
     # fmt: on
 

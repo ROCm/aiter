@@ -411,9 +411,9 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
-# them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w",)
+# Fused knobs added with the EP2 V4.1-Flash tune and after it: they enter the table only when set, so a digest
+# pinned before them changes only where a config sets one.
+_EP2_KNOBS = ("stream_w", "pair_tiles")
 
 
 def _knob_table(config):
@@ -493,9 +493,10 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 
 
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
-# current table.
+# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and pair_tiles at 64 and 128
+# tokens.
 _V41EP8_FUSED_DIGEST = (
-    "da6de72f6e9e99dfb154e051c34213ca88e28065a650ab842d71775a0e95191c"
+    "66f44ffe68a7668c3d75c54543796e00df694daec7f8795f12ec778cd75a5127"
 )
 
 
