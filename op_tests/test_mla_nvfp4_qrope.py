@@ -3,6 +3,7 @@
 """gfx1250 Q RoPE/quantization fusion: python -m pytest -q this_file.py."""
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -366,7 +367,14 @@ def _guard_case(ctx_len):
 def test_guarded_compact_inputs(ctx_len):
     env = os.environ | {"PYTORCH_NO_HIP_MEMORY_CACHING": "1"}
     result = subprocess.run(
-        [sys.executable, __file__, "--guard-case", str(ctx_len)],
+        [
+            sys.executable,
+            "-m",
+            "op_tests.test_mla_nvfp4_qrope",
+            "--guard-case",
+            str(ctx_len),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
         env=env,
         capture_output=True,
         text=True,
