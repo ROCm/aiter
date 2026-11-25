@@ -65,7 +65,7 @@ def _inv_l1():
 
 
 def _xcc_id():
-    """The XCD (0..7) this wave runs on."""
+    """The XCD this wave runs on: 0..7 on MI300X, 0..3 on MI308X."""
     # Raw asm: FlyDSL 0.5.0 has no stable hardware-register read (s_getreg).
     return fx.Int32(
         llvm.inline_asm(
@@ -76,3 +76,17 @@ def _xcc_id():
             has_side_effects=True,
         )
     ) & fx.Int32(7)
+
+
+def _home_queue(xcds):
+    """The one of the kernels' 8 per-XCD task queues this workgroup serves first, on
+    a GPU of ``xcds`` XCDs: its XCD's on 8 (MI300X). On 4 (MI308X) each XCD serves two
+    queues: workgroup b runs on XCD b % 4 (round-robin dispatch), and every other
+    round of that dispatch starts on the XCD's second queue, so every queue has
+    workgroups of its own."""
+    assert xcds in (4, 8), xcds
+    xcc = _xcc_id()
+    if xcds == 8:
+        return xcc
+    rounds = fx.Int32(fx.block_idx.x) // fx.Int32(xcds)
+    return xcc + fx.Int32(xcds) * (rounds % fx.Int32(8 // xcds))

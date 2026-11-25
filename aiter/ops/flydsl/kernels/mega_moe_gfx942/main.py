@@ -13,9 +13,9 @@ Producers write a route's fp8 x row + its 1x128 scales (QX 0: its row scale), (s
 token, slot) and weight straight into the destination's row (symmetric MORI heap), then add
 1 to the destination's ``arrived[block]``.
 
-Workgroups (one per CU, 512 threads, 64 KB LDS) take tickets from 8 per-XCD queues (a
-contiguous share of the blocks each; an empty queue sends a workgroup to the next ones)
-until all are empty. Each queue holds:
+Workgroups (one per CU, 512 threads, 64 KB LDS) take tickets from 8 per-XCD queues (two
+per XCD on MI308X's 4, see ``atomic._home_queue``; a contiguous share of the blocks each;
+an empty queue sends a workgroup to the next ones) until all are empty. Each queue holds:
   [0, producers / 8)  producers (send this rank's routes in the order the destinations'
                       queues need them, as the plan kernel sorted them);
   then                groups of 2 blocks (both read each W tile at about the same time):
@@ -44,7 +44,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from ..act import gate_up_act, situ_params
 from . import comm, host
-from .atomic import _atomic_add_at, _atomic_load_at, _inv_l1, _xcc_id
+from .atomic import _atomic_add_at, _atomic_load_at, _home_queue, _inv_l1
 from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
 from .hw import (
     CM_NT,
@@ -99,6 +99,7 @@ def ep_mega_kernel(
     TOPK,
     E_LOCAL,
     token_shift,
+    XCDS,
     producers=16,
     lag=2,
     ROWV=(32, 64, 128),
@@ -114,7 +115,8 @@ def ep_mega_kernel(
 ):
     """The mega kernel for (H, I, top-k) and ``E_LOCAL`` experts per rank;
     ``token_shift``: bits of the source
-    token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
+    token in a row's down id (max tokens per rank <= 1 << token_shift). ``XCDS``: XCDs of
+    the GPU, 8 (MI300X) or 4 (MI308X). ``QX``: x scales
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``WQ``: "fp4" fd2 mxfp4 W
     (a8w4), "fp8" fp8 W in aiter's (16, 16) preshuffle with f32 128x128 block scales
@@ -174,6 +176,7 @@ def ep_mega_kernel(
         + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
+        + ("" if XCDS == 8 else f"_x{XCDS}")
     )
 
     @fx.struct
@@ -315,7 +318,7 @@ def ep_mega_kernel(
             if const_expr(after_task):
                 gpu.barrier()  # the previous task's LDS reads are done
             if wave0 == fx.Int32(0):
-                home = _xcc_id()
+                home = _home_queue(XCDS)
                 open_mask = fx.Int32(0)
                 prod_mask = fx.Int32(0)
                 for q in range_constexpr(QUEUES):
@@ -1247,8 +1250,8 @@ class MainRuntime:
     call (``comm.py``'s quant, prep and plan, the mega kernel, ``comm.py``'s finish).
 
     ``wq``: "fp4" (a8w4's fd2 MXFP4 experts) or "fp8" (a8w8's FP8 128x128 block-scale
-    experts); ``qx``: 1 for x quantized per 1x128, 0 per token. Construction is
-    collective (MORI symmetric buffers)."""
+    experts); ``qx``: 1 for x quantized per 1x128, 0 per token; ``xcds``: XCDs of the
+    GPU. Construction is collective (MORI symmetric buffers)."""
 
     def __init__(
         self,
@@ -1263,6 +1266,7 @@ class MainRuntime:
         wq,
         act,
         qx,
+        xcds,
     ):
         import mori.shmem as ms
 
@@ -1331,6 +1335,7 @@ class MainRuntime:
             "TOPK": kt,
             "E_LOCAL": e_local,
             "token_shift": self.token_shift,
+            "XCDS": xcds,
             "producers": _PRODUCERS,
             "lag": _LAG,
             "ACT": act,

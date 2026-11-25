@@ -60,7 +60,8 @@ def _on(stream):
 
 
 class LargeMRuntime:
-    """One rank's EP8 MoE layer on the LDS mega kernel."""
+    """One rank's EP8 MoE layer on the LDS mega kernel; ``xcds``: XCDs of the GPU, 8 (MI300X)
+    or 4 (MI308X)."""
 
     def __init__(
         self,
@@ -72,6 +73,7 @@ class LargeMRuntime:
         experts,
         topk,
         max_tok_per_rank,
+        xcds,
         swiglu_limit=0.0,
         wq="fp8",
         w1=None,
@@ -106,6 +108,7 @@ class LargeMRuntime:
         self.hidden, self.inter = model_dim, inter_dim
         self.swiglu_limit = float(swiglu_limit)
         self.wq = wq
+        self.xcds = int(xcds)
         self.token_shift = max(int(max_tok_per_rank - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
         # Every route of every rank to this rank, plus one partial block per local expert.

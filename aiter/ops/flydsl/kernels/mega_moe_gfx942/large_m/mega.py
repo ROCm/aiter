@@ -29,7 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ...tensor_shim import _run_compiled, current_stream_arg, ptr_arg
-from ..atomic import _atomic_add_at, _atomic_load_at, _latomic_add, _xcc_id
+from ..atomic import _atomic_add_at, _atomic_load_at, _home_queue, _latomic_add
 from ..host import launcher
 from ..hw import _readlane
 from ..hw import _u as _uniform
@@ -53,7 +53,7 @@ from .util import (
 CHUNK = 8
 # sc0 nt sc1: written through to the destination, so a vmcnt wait covers visibility before the signal.
 P2P_AUX = 19
-# Task queues: one per XCD.
+# Task queues: one per XCD (two per XCD on MI308X's 4, see atomic._home_queue).
 QUEUES = 8
 
 
@@ -67,13 +67,16 @@ def compile_ep_mega(
     lag,
     swiglu_limit=0.0,
     wq="fp8",
+    *,
+    xcds,
 ):
-    """The mega kernel's launcher. lag counts units (block pairs) of one queue; e_local: experts per rank.
+    """The mega kernel's launcher. lag counts units (block pairs) of one queue; e_local: experts per rank; xcds: XCDs of
+    the GPU, 8 (MI300X) or 4 (MI308X).
 
-    One task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a workgroup whose
-    queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks, block pairs' tasks
-    alternating tile by tile so both read each B tile together. Workgroups loop over tickets (launch about one per
-    CU) and take the next ticket during the current task's epilogue.
+    One task queue per XCD (producers split evenly; two queues per XCD on 4 XCDs), so the tiles of a block share that
+    XCD's L2; a workgroup whose queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks,
+    block pairs' tasks alternating tile by tile so both read each B tile together. Workgroups loop over tickets (launch
+    about one per CU) and take the next ticket during the current task's epilogue.
     GateUp writes a2 through to memory (sc1) and both waits invalidate only the L1: all data a task waits for is in
     local memory, whose L2 lines are kept coherent by probes, and nothing reads it before it is written within a
     launch. GateUp tile 0 of a block copies the block's A scales from the token-major recv_scale [rows, K/128] into
@@ -205,7 +208,7 @@ def compile_ep_mega(
                 # loads find the queues that may still hold tasks: once all are handed out, the leftover workgroups
                 # of the (over-sized) grid exit after one round of loads instead of contending atomics (an atomic
                 # per leftover workgroup, even on the home queue only, slows the tasks still running).
-                home = _xcc_id()
+                home = _home_queue(xcds)
                 cand = home
                 got = fx.Int32(-1)
                 if const_expr(prefetched is not None):
@@ -402,7 +405,7 @@ def compile_ep_mega(
             holder = []
 
             def hook():
-                queue_addr = sched + fx.Int64(_xcc_id() * 4)
+                queue_addr = sched + fx.Int64(_home_queue(xcds) * 4)
                 taken = fx.Int32(-1)
                 if wave == 0:
                     # Read back only at the next take_ticket: the epilogue's own loads retire it on the way.
@@ -812,6 +815,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         lag=lag,
         swiglu_limit=op.swiglu_limit,
         wq=op.wq,
+        xcds=op.xcds,
     )
     # Persistent: about one workgroup per CU.
     grid = min(

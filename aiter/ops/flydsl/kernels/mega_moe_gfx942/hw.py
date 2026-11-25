@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MI300X (gfx942) facts the kernels rely on, and helpers tied to the wave / XCD structure.
+"""gfx942 (MI300X, MI308X) facts the kernels rely on, and helpers tied to the wave / XCD
+structure.
 
-Grids sized from ``NUM_CU`` (persistent kernels, grid barriers) need the whole GPU: with
-fewer free CUs they deadlock instead of slowing down.
+Grids sized from the GPU's CU count (persistent kernels, grid barriers) need the whole
+GPU: with fewer free CUs they deadlock instead of slowing down.
 """
 
 import flydsl.expr as fx
@@ -13,7 +14,6 @@ from flydsl.expr.typing import T
 
 from .mem import _raw
 
-NUM_CU = 304
 LDS_BYTES_MAX = 65536  # per WG; a kernel over it fails at launch without raising
 
 # cache policy bits of buffer / global loads and stores (the aux operand)

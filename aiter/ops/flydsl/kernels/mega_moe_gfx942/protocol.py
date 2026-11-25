@@ -81,7 +81,8 @@ def small_max_tiles(TOPK, TMAX, BM, E_LOCAL):
 
 # control block (local, int32; one 64 B line per counter): [SC_EPOCH] the calls completed
 # (the epoch of a call is it + 1), the combine count (top, then one per block id % 8), the
-# unit counter of each XCD, then the gemm1 units done of each m-tile
+# unit counter of each of the 8 unit slices (one per XCD, two per XCD on MI308X), then
+# the gemm1 units done of each m-tile
 SC_EPOCH, SC_TOP = 0, 32
 SC_SUB = 48
 SC_HEAD = SC_SUB + 8 * 16

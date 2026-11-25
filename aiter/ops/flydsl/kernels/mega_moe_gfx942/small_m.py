@@ -24,7 +24,8 @@ streamed into VGPRs, fp8 A through LDS):
   inter cols, m-major) and then its eighth of the gemm2 units (m-tile x NO out cols): the
   same m-tiles, so gemm2 mostly reads a2 rows its own XCD wrote (a2 is written through:
   at the slice ends, and for units taken from another XCD's counter once the own one is
-  empty, another XCD reads them). gemm1 = the main kernel's (TR epilogue: act, fp8 a2 + one scale
+  empty, another XCD reads them). On MI308X's 4 XCDs each XCD takes two of the eight
+  slices (``atomic._home_queue``). gemm1 = the main kernel's (TR epilogue: act, fp8 a2 + one scale
   per (row, 128 cols); QX 1 rescales the accumulator at every 128-K group, QX 0 applies
   the row scale in the epilogue); a gemm2 unit waits for the I/128 gemm1 units of its
   m-tile (W prefetch already in flight), then writes every row (times the route weight,
@@ -41,8 +42,8 @@ reading its slots and reset its ``run`` counts. Everything a peer reads lives in
 uncached MORI heap and is written with system-scope stores; a flag is stored only after
 the data stores completed (``s_waitcnt vmcnt(0)``): no L2 write-back or invalidation.
 
-Needs the whole GPU: the grid (``NUM_CU`` x ``WPC`` workgroups) must be resident at once
-(the plan wait and the combine wait spin).
+Needs the whole GPU: the grid (``NUM_CU`` x ``WPC`` workgroups, ``NUM_CU`` the GPU's CUs)
+must be resident at once (the plan wait and the combine wait spin).
 """
 
 import flydsl.compiler as flyc
@@ -58,13 +59,13 @@ from ..act import gate_up_act, situ_params
 from .atomic import (
     _atomic_add_at,
     _atomic_load_at,
+    _home_queue,
     _inv_l1,
     _sys_load_at,
     _sys_store_at,
-    _xcc_id,
 )
 from .cvt import _abs_bits, _channel_factor, _fp8x4_pack
-from .hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, NUM_CU, _opaque_tx, _u
+from .hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, _opaque_tx, _u
 from .kloop import _dispatch_rows, _make_core
 from .mem import (
     _buffer_i32_scalar_read,
@@ -121,6 +122,8 @@ def ep_mega_small_kernel(
     TOPK,
     E_LOCAL,
     TMAX,
+    NUM_CU,
+    XCDS,
     BM=64,
     NO=256,
     ARB=256,
@@ -134,7 +137,8 @@ def ep_mega_small_kernel(
 ):
     """The small megamoe kernel for (H, I, top-k), ``E_LOCAL`` experts per rank and
     batches of <= TMAX tokens over all
-    ranks (fixed slots of TMAX rows per expert). ``BM``: rows of an m-tile (row variants
+    ranks (fixed slots of TMAX rows per expert). ``NUM_CU`` / ``XCDS``: CUs and XCDs of
+    the GPU, 304 / 8 (MI300X) or 80 / 4 (MI308X). ``BM``: rows of an m-tile (row variants
     16 .. BM); ``NO``: gemm2 output cols per unit; ``ARB`` / ``PF``: K bytes per A tile /
     W prefetch distance of both GEMMs; ``P``: producer workgroups; ``WPC``: workgroups per
     CU; ``QX``: x scales, 1 one per (row, 128 cols), 0 one per row; ``BCM1`` / ``BCM2``:
@@ -195,6 +199,7 @@ def ep_mega_small_kernel(
         + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
+        + ("" if (NUM_CU, XCDS) == (304, 8) else f"_cu{NUM_CU}_x{XCDS}")
     )
 
     @fx.struct
@@ -1131,16 +1136,16 @@ def ep_mega_small_kernel(
         wait_flags(sym0 + fx.Int64(O_DONE), epoch * fx.Int32(DONE_UNIT))
         plan()
         tiles = _u(lds[fx.Int32(L_TB + E_LOCAL)])
-        xcd = _u(_xcc_id())
+        home = _u(_home_queue(XCDS))
         u1 = tiles * fx.Int32(NG)
         u2 = tiles * fx.Int32(ND)
-        # XCD c's slice: gemm1 units [c u1 / 8, (c + 1) u1 / 8), then gemm2 units [c u2 / 8,
-        # (c + 1) u2 / 8) on its counter; the own slice first, then the others' leftovers
-        # (a plain load first: an atomic per leftover workgroup slows the units still
-        # running)
+        # slice c (XCD c's on 8 XCDs): gemm1 units [c u1 / 8, (c + 1) u1 / 8), then gemm2
+        # units [c u2 / 8, (c + 1) u2 / 8) on its counter; the own slice first, then the
+        # others' leftovers (a plain load first: an atomic per leftover workgroup slows the
+        # units still running)
         q = fx.Int32(0)
         while q < fx.Int32(8):
-            cand = (xcd + q) & fx.Int32(7)
+            cand = (home + q) & fx.Int32(7)
             b1 = cand * u1 // fx.Int32(8)
             n1 = (cand + fx.Int32(1)) * u1 // fx.Int32(8) - b1
             b2 = cand * u2 // fx.Int32(8)
@@ -1243,7 +1248,8 @@ class SmallMRuntime:
     """The small path of one rank: ONE kernel per call for batches of at most ``tmax``
     tokens over all ranks (``tmax`` rows of fixed slots per local expert, the combine
     ``tmax`` x ``topk`` rows: ~196 MB of the MORI heap at tmax 1024, H 4096, top-8).
-    Negative ids are no routes (their rows stay 0)."""
+    Negative ids are no routes (their rows stay 0). ``num_cu`` / ``xcds``: CUs and XCDs
+    of the GPU (the kernel's grid has ``WPC`` workgroups per CU)."""
 
     def __init__(
         self,
@@ -1257,6 +1263,8 @@ class SmallMRuntime:
         tmax,
         act,
         x_quant,
+        num_cu,
+        xcds,
     ):
         from . import host
         from .protocol import SC_TILE, qx_of
@@ -1292,6 +1300,8 @@ class SmallMRuntime:
             TOPK=self.topk,
             E_LOCAL=e_local,
             TMAX=self.tmax,
+            NUM_CU=int(num_cu),
+            XCDS=int(xcds),
             ACT=act,
             QX=qx_of(x_quant),
             **SMALL_KEY,

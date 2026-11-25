@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X), shaped like
-MegaMoEV2, with its three paths:
+"""MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X / MI325X, MI308X),
+shaped like MegaMoEV2, with its three paths:
 
 - main (``forward`` / ``forward_prequant`` while large_M is off; ``main.py``, ``comm.py``):
   five kernels per call. ``comm.py`` quantizes x, exchanges the route counts and plans
@@ -65,7 +65,11 @@ import torch
 from ..mega_moe import envs
 from . import weights as _weights
 
-_EP, _NUM_CU = 8, 304
+_EP = 8
+# The gfx942 GPUs this build runs, CUs -> XCDs: MI300X / MI325X (8 XCDs of 38 CUs) and
+# MI308X (4 XCDs of 20 CUs). The kernels size their persistent grids by the CUs and map
+# their 8 per-XCD task queues onto the XCDs (atomic._home_queue).
+_XCDS = {304: 8, 80: 4}
 # The layers this build runs, (H, I, experts) -> top-k values: DeepSeek-V4-Flash (top-6)
 # and MiMo-V2.6-Flash (top-8), DeepSeek-V4.1-Flash.
 _LAYERS = {(4096, 2048, 256): (6, 8), (5120, 2304, 384): (6,)}
@@ -77,15 +81,15 @@ _WQ = {"a8w4": "fp4", "a8w8": "fp8"}
 def eligible(
     *, world_size, model_dim, inter_dim, experts, topk, quant="a8w4", act="silu"
 ):
-    """Whether this build runs the layer: gfx942 with 304 CUs, EP8 and the MoE layer of
-    DeepSeek-V4-Flash (H 4096, I 2048, 256 experts, top-6), MiMo-V2.6-Flash (the same
-    with top-8) or DeepSeek-V4.1-Flash (H 5120, I 2304, 384 experts, top-6), a8w4 or
-    a8w8."""
+    """Whether this build runs the layer: gfx942 with 304 CUs (MI300X / MI325X) or 80
+    (MI308X), EP8 and the MoE layer of DeepSeek-V4-Flash (H 4096, I 2048, 256 experts,
+    top-6), MiMo-V2.6-Flash (the same with top-8) or DeepSeek-V4.1-Flash (H 5120, I 2304,
+    384 experts, top-6), a8w4 or a8w8."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     return (
         get_gfx_runtime() == "gfx942"
-        and get_cu_num() == _NUM_CU
+        and get_cu_num() in _XCDS
         and world_size == _EP
         and topk in _LAYERS.get((model_dim, inter_dim, experts), ())
         and quant in _WQ
@@ -138,9 +142,9 @@ class MegaMoEGfx942:
             act=act,
         ):
             raise ValueError(
-                "MegaMoEGfx942 runs gfx942 (304 CUs), EP8, a8w4 or a8w8 silu, H 4096, "
-                "I 2048, 256 experts, top-6 or top-8, or H 5120, I 2304, 384 experts, "
-                f"top-6; got world_size={world_size} "
+                "MegaMoEGfx942 runs gfx942 (304 or 80 CUs), EP8, a8w4 or a8w8 silu, H "
+                "4096, I 2048, 256 experts, top-6 or top-8, or H 5120, I 2304, 384 "
+                f"experts, top-6; got world_size={world_size} "
                 f"model_dim={model_dim} inter_dim={inter_dim} experts={experts} "
                 f"topk={topk} quant={quant} act={act}"
             )
@@ -150,8 +154,12 @@ class MegaMoEGfx942:
             raise ValueError(f"x_quant={x_quant!r}: 'per_1x128' or 'per_token'")
         if swiglu_limit < 0:
             raise ValueError(f"swiglu_limit={swiglu_limit} must be non-negative")
+        from aiter.jit.utils.chip_info import get_cu_num
+
         from .protocol import qx_of
 
+        self._cus = get_cu_num()
+        self._xcds = _XCDS[self._cus]
         self.rank, self.world_size = int(rank), int(world_size)
         self.model_dim, self.inter_dim = int(model_dim), int(inter_dim)
         self.experts, self.topk = int(experts), int(topk)
@@ -187,6 +195,7 @@ class MegaMoEGfx942:
                 experts=experts,
                 topk=topk,
                 max_tok_per_rank=self.mtpr,
+                xcds=self._xcds,
                 swiglu_limit=limit,
                 wq=_WQ[quant],
                 w1=w1,
@@ -212,6 +221,8 @@ class MegaMoEGfx942:
                     tmax=self.world_size * self._small_mtpr,
                     act=self._act,
                     x_quant=x_quant,
+                    num_cu=self._cus,
+                    xcds=self._xcds,
                 )
             else:
                 # The small kernel streams fd2 MXFP4 W only.
@@ -231,6 +242,7 @@ class MegaMoEGfx942:
             wq=_WQ[self.quant],
             act=self._act,
             qx=self._qx,
+            xcds=self._xcds,
         )
 
     # ---- weights ---------------------------------------------------------------
