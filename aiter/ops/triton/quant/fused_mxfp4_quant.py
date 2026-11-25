@@ -132,9 +132,9 @@ def fused_rms_mxfp4_quant(
 
     # checks args for either gluon, triton, or auto. auto will check for gfx1250 hardware and set to gluon if it exists, otherwise defaults to triton
     if inargs == "auto":
-        use_gluon = get_arch() == "gfx1250"
+        use_gluon = get_arch() in ("gfx1250", "gfx1250-strict")
     elif inargs == "gluon":
-        if get_arch() != "gfx1250":
+        if get_arch() not in ("gfx1250", "gfx1250-strict"):
             raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
         use_gluon = True
     elif inargs == "triton":
@@ -216,6 +216,7 @@ def fused_rms_gated_mxfp4_quant(
     activation: str = "silu",
     group_size: int | None = None,
     transpose_scale: bool = False,
+    hadamard_rotate: bool = False,
 ):
     """
     Gated RMSNorm followed by MXFP4 quantization, the RMSNormGated + per-1x32
@@ -239,6 +240,11 @@ def fused_rms_gated_mxfp4_quant(
     - transpose_scale: If True, store out_bs column-major (strides (1, M)),
       the layout dynamic_mxfp4_quant returns. gemm_afp4wfp4 reads it
       faster than the row-major default once M reaches about 1024.
+    - hadamard_rotate: If True, quantize
+      y.view(M, N // 32, 32) @ (scipy.linalg.hadamard(32) / sqrt(32)),
+      rotated in fp32 and rounded to x.dtype, with the per_1x32_f4_quant_hip
+      scale ceil_pow2(amax / 6). The caller rotates the weight the same way.
+      gfx950 only.
 
     Returns:
     - out_fp4: The output matrix with shape (M, N // 2).
@@ -257,6 +263,10 @@ def fused_rms_gated_mxfp4_quant(
     if activation not in ("silu", "swish", "sigmoid"):
         raise ValueError(
             f"activation must be 'silu', 'swish' or 'sigmoid', got {activation!r}"
+        )
+    if hadamard_rotate and get_arch() != "gfx950":
+        raise ValueError(
+            f"hadamard_rotate requires gfx950 hardware FP4 conversion, got {get_arch()}"
         )
     M, N = x.shape
     G = N if group_size is None else int(group_size)
@@ -308,6 +318,7 @@ def fused_rms_gated_mxfp4_quant(
         ACTIVATION=_get_activation_from_str(
             "silu" if activation == "swish" else activation
         ),
+        HADAMARD_ROTATE=hadamard_rotate,
         num_warps=num_warps,
     )
 
@@ -714,7 +725,7 @@ def fused_reduce_rms_mxfp4_quant(
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
 
     # check if args is gluon and arch is not gfx1250
-    if args == "gluon" and get_arch() != "gfx1250":
+    if args == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         _LOGGER.warning(
             "Gluon kernel is not supported on this arch, defaulting to triton kernel"
         )
@@ -722,7 +733,7 @@ def fused_reduce_rms_mxfp4_quant(
     # select kernel based on args and arch
     kernel = (
         _gluon_fused_reduce_rms_mxfp4_quant_kernel
-        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        if (args in ["gluon", "auto"]) and get_arch() in ("gfx1250", "gfx1250-strict")
         else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
@@ -851,12 +862,12 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
 
-    if args == "gluon" and get_arch() != "gfx1250":
+    if args == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         raise ValueError("Gluon is only supported on gfx1250")
 
     kernel = (
         _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
-        if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
+        if (args in ["gluon", "auto"] and get_arch() in ("gfx1250", "gfx1250-strict"))
         else _fused_dynamic_mxfp4_quant_moe_sort_kernel
     )
 

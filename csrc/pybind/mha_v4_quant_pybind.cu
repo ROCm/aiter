@@ -29,6 +29,12 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("input"),
           py::arg("multiplier"),
           py::arg("mean"));
+    m.def("rotate_activation_mxfp8_quant_k_hd256",
+          &aiter::torch_itfs::rotate_activation_mxfp8_quant_k_hd256,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"),
+          py::arg("mean"));
     m.def("rotate_activation_mxfp6_quant",
           &aiter::torch_itfs::rotate_activation_mxfp6_quant,
           py::arg("out"),
@@ -40,12 +46,14 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"),
-          py::arg("mean"));
+          py::arg("mean"),
+          py::arg("head_split") = 1);
     m.def("_quantize_v_mxfp6_fp6_p_hip",
           &aiter::torch_itfs::quantize_v_mxfp6_fp6_p,
           py::arg("out"),
           py::arg("scale"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("head_split") = 1);
     m.def("rotate_activation_mxfp4_quant",
           &aiter::torch_itfs::rotate_activation_mxfp4_quant,
           py::arg("out"),
@@ -57,15 +65,25 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"),
-          py::arg("mean"));
+          py::arg("mean"),
+          py::arg("head_split") = 1);
     m.def("_quantize_v_mxfp4_fp6_p_hip",
           &aiter::torch_itfs::quantize_v_mxfp4_fp6_p,
           py::arg("out"),
           py::arg("scale"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("head_split") = 1);
     m.def("_quantize_v_mxfp4_hip",
           &aiter::torch_itfs::quantize_v_mxfp4,
           py::arg("out"),
           py::arg("scale"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("head_split") = 1);
+    m.def("_k_smooth_mean_hip",
+          &aiter::torch_itfs::k_smooth_mean,
+          py::arg("out"),
+          py::arg("partial"),
+          py::arg("input"),
+          py::arg("sample_rows"),
+          py::arg("min_common"));
 }
