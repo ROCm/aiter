@@ -642,13 +642,8 @@ def prepare_weights(shape, rank, device, *, seed):
     """Random FP4 w1/w2 with E8M0 scales, in the operator's packed layouts."""
     import torch
 
+    from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
     from aiter.ops.quant import per_1x32_f4_quant
-    from aiter.ops.shuffle import (
-        shuffle_scale_a16w4,
-        shuffle_weight,
-        shuffle_weight_a16w4,
-    )
-    from aiter.utility.fp4_utils import e8m0_shuffle
 
     generator = torch.Generator(device=device).manual_seed(90_000 + rank + seed - 1234)
     # One BF16 source at a time: holding both while FP4 quantization builds its
@@ -662,7 +657,6 @@ def prepare_weights(shape, rank, device, *, seed):
     w1.mul_(shape.hidden**-0.25)
     w1q, w1s = per_1x32_f4_quant(w1, shuffle=False)
     del w1
-    w1q, w1s = shuffle_weight(w1q, layout=(16, 16)), e8m0_shuffle(w1s)
     torch.cuda.empty_cache()
     w2 = torch.randn(
         (shape.local_experts, shape.hidden, shape.inter),
@@ -673,10 +667,8 @@ def prepare_weights(shape, rank, device, *, seed):
     w2.mul_(shape.inter**-0.25)
     w2q, w2s = per_1x32_f4_quant(w2, shuffle=False)
     del w2
-    w2q = shuffle_weight_a16w4(w2q, 16, False)
-    w2s = shuffle_scale_a16w4(w2s, shape.local_experts, False)
     torch.cuda.empty_cache()
-    return Weights(w1q, w1s, w2q, w2s)
+    return Weights(*MegaMoEInternode.prepare_weights(w1q, w1s, w2q, w2s))
 
 
 def coalesce_reference_routes(ids, weights, *, experts_per_rank, num_experts):
