@@ -604,10 +604,17 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, str
     )
 
 
+def _interleaved_rows(count, num_tiles):
+    """Interleaved m-tiles of an expert with ``count`` rows in ``num_tiles`` m-tiles: m-tile t holds slots t,
+    t + num_tiles, ... below count, i.e. q + (t < r) rows for ``(q, r)`` returned here."""
+    q = count // (num_tiles > fx.Int32(0)).select(num_tiles, fx.Int32(1))
+    return q, count - q * num_tiles
+
+
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, interleave=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -615,6 +622,8 @@ def emit_direct_fixed_slot_finalize(
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
     ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
+    ``interleave``: m-tile t of an expert with nt m-tiles takes its slots t, t + nt, ... (_interleaved_rows);
+    the tile's rows word carries nt in its high half.
     """
     assert 0 < fz_epr <= 256, "direct fixed-slot finalize requires 1..256 experts per rank"
     disp = ptr_buf_tensor(addr_disp, fx.Int64)
@@ -656,13 +665,20 @@ def emit_direct_fixed_slot_finalize(
                 if no_overflow:
                     global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
                     payload_base = safe_expert * fx.Int32(fz_cap)
+                    if const_expr(interleave):
+                        rows_q, rows_r = _interleaved_rows(safe_count, num_expert_tiles)
                     for tile in range(fx.Int32(0), num_expert_tiles, 1):
                         metadata_index = metadata_base + tile
                         buf_copy_store(se_t, metadata_index, global_expert, cache_modifier=wt_cm)
-                        buf_copy_store(trb_t, metadata_index, payload_base + tile * fx.Int32(fz_tile_m),
-                            cache_modifier=wt_cm)
-                        rows = safe_count - tile * fx.Int32(fz_tile_m)
-                        rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
+                        if const_expr(interleave):
+                            buf_copy_store(trb_t, metadata_index, payload_base + tile, cache_modifier=wt_cm)
+                            rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
+                            rows = rows | (num_expert_tiles << fx.Int32(16))
+                        else:
+                            buf_copy_store(trb_t, metadata_index, payload_base + tile * fx.Int32(fz_tile_m),
+                                cache_modifier=wt_cm)
+                            rows = safe_count - tile * fx.Int32(fz_tile_m)
+                            rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
                         buf_copy_store(tile_rows_t, metadata_index, rows, cache_modifier=wt_cm)
                 if const_expr(not keep_running):
                     buf_copy_store(running_t, safe_expert, fx.Int32(0), cache_modifier=wt_cm)
@@ -895,7 +911,7 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0):
+    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, row_stride=False):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
 
@@ -905,8 +921,11 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     ``uniform``: the pointer arguments move to SGPRs (no waterfall loops around the tile's buffer loads).
     ``epi_lean`` / ``tok_done`` (with the tile's ``i64_tok_off``) / ``bf16_head_tokens``: p2p_scatter_epilog's
     ``lean`` / ``tok_off`` / ``bf16_head_tokens``.
+    ``row_stride``: the tile's rows word carries in its high half the stride of its srcmap slots (interleaved
+    m-tiles of emit_direct_fixed_slot_finalize).
     """
     assert clamp_a or not row_mask
+    assert not row_stride or (clamp_a and BM == SBM)
     lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
     is_f8 = a_dtype == "fp8"
     aStages = kStages + 1
@@ -933,15 +952,22 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
         vrows = None
         if const_expr(clamp_a):
             vrows = rocdl.readfirstlane(T.i32, load_at(AddrBuffer(arg_tile_rows), m_block, fx.Int32, 1))
+            if const_expr(row_stride):
+                slot_stride = fx.Int32(vrows) >> fx.Int32(16)
+                vrows = fx.Int32(vrows) & fx.Int32(0xFFFF)
         m_row0 = m_block * fx.Int32(BM)
         for slot in range_constexpr(kStages):
             issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A, k_bytes,
                 BM=BM, valid_rows=vrows)
         rocdl.sched_barrier(0)
-        sort_block_idx = m_row0 // fx.Int32(SBM)
-        srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (m_row0 - sort_block_idx * fx.Int32(SBM))
+        if const_expr(row_stride):
+            srcmap_row_base = load_at(AddrBuffer(arg_trb), m_block, fx.Int32, 1)
+        else:
+            sort_block_idx = m_row0 // fx.Int32(SBM)
+            srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (
+                m_row0 - sort_block_idx * fx.Int32(SBM))
         if tx_i32 < fx.Int32(BM):
-            sorted_pos = srcmap_row_base + tx_i32
+            sorted_pos = srcmap_row_base + (tx_i32 * slot_stride if const_expr(row_stride) else tx_i32)
             packed = load_at(AddrBuffer(arg_stids), sorted_pos, fx.Int32, 1)
             if const_expr(row_mask):
                 packed = (tx_i32 < vrows).select(packed, fx.Int32(npes * max_tok))
@@ -1082,13 +1108,18 @@ def compile_mega_moe_stage1(
     g2_n_blocks = model_dim // g2_bn
     # The P2P row stores go to the uncached shmem heap; non-temporal stores there are slower (store_cm=0).
     # GEMM2 masks the padding rows of each tile itself, so the plan leaves their srcmap unwritten.
+    # interleave: an expert's slots go round-robin over its m-tiles (slots arrive grouped by source rank, so
+    # contiguous m-tiles would send each GEMM2 tile's rows to one or two ranks). GEMM1 and GEMM2 reach every slot
+    # through the srcmap (dedup_rows) and the m-tile's rows from the local plan / the finalize's rows word.
+    interleave = dedup_rows and plan_local
+    assert not interleave or fz_cap // fz_tile_m < 1 << 15, "the rows word keeps the m-tile count in its high half"
     g2_tile, g2_lay = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, row_stride=interleave,
     )
     g2_tile_cached, _ = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
@@ -1096,7 +1127,7 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, row_stride=interleave,
     )
     # The combine's last WG zeroes the expert counters one per thread.
     assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
@@ -1304,7 +1335,7 @@ def compile_mega_moe_stage1(
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w,
+                stream_w=stream_w, interleave=interleave,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1353,10 +1384,18 @@ def compile_mega_moe_stage1(
                 incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
                 count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
                 tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-                tile_rows_base = (m_tile - incl_e + tiles_e) * fx.Int32(fz_tile_m)
-                rows = count_e - tile_rows_base
-                rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
-                return expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows
+                if const_expr(interleave):
+                    # The finalize's interleaved m-tile: its first slot, rows and slot stride.
+                    tile = m_tile - incl_e + tiles_e
+                    rows_q, rows_r = _interleaved_rows(count_e, tiles_e)
+                    rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
+                    plan = (expert, expert * fx.Int32(fz_cap) + tile, rows, tiles_e)
+                else:
+                    tile_rows_base = (m_tile - incl_e + tiles_e) * fx.Int32(fz_tile_m)
+                    rows = count_e - tile_rows_base
+                    rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
+                    plan = (expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows)
+                return plan
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,

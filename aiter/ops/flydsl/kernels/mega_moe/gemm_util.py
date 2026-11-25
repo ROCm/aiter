@@ -218,17 +218,21 @@ class ATileLoader:
                 self._chunks.append((lds_byte, row_byte + chunk * 16))
         self._group_chunks = row_map is not None
 
-    def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
-        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``)."""
+    def load_row_map(self, tile_row_base_i32, srcmap_rsrc, row_stride_i32=None):
+        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``).
+
+        ``row_stride_i32``: tile row r sits in slot ``tile_row_base + r * row_stride`` (default 1).
+        """
         chunks_per_row = self._k_step_bytes // 16
-        return [
-            srcmap_rsrc[
-                tile_row_base_i32 + (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
-            ]
-            for c in range_constexpr(
-                0, self._sort_block_m * chunks_per_row, self._total_threads
-            )
-        ]
+        out = []
+        for c in range_constexpr(
+            0, self._sort_block_m * chunks_per_row, self._total_threads
+        ):
+            row = (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
+            if const_expr(row_stride_i32 is not None):
+                row = row * row_stride_i32
+            out.append(srcmap_rsrc[tile_row_base_i32 + row])
+        return out
 
     def load_regs(self, k_step_byte_off):
         """Read this K-step's 16-B chunks gmem->reg (VMEM); only the K-step offset varies. Returns (lds_off, vec4)."""
@@ -615,8 +619,11 @@ class AScaleLoader:
                 # 256/512-thread CTA.
                 copy_chunk(lin)
 
-    def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
-        """The srcmap words of this thread's chunk rows (``stage`` row_map); rows past the tile read its last row."""
+    def load_row_map(self, tile_row_base_i32, srcmap_rsrc, row_stride_i32=None):
+        """The srcmap words of this thread's chunk rows (``stage`` row_map); rows past the tile read its last row.
+
+        ``row_stride_i32`` as ``ATileLoader.load_row_map``.
+        """
         row_chunks = self._n_scale // 16
         assert self._n_scale % 16 == 0
         out = []
@@ -627,6 +634,8 @@ class AScaleLoader:
             row = (row < fx.Int32(self._sort_block_m)).select(
                 row, fx.Int32(self._sort_block_m - 1)
             )
+            if const_expr(row_stride_i32 is not None):
+                row = row * row_stride_i32
             out.append(srcmap_rsrc[tile_row_base_i32 + row])
         return out
 
