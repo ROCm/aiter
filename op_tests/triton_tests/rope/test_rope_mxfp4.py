@@ -250,6 +250,44 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
         assert w_out is None
 
 
+@pytest.mark.parametrize("project", [False, True])
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens, num_heads", [(6, 32), (128, 32), (1000, 64)])
+def test_q_quant_weights_dtype(num_tokens, num_heads, weights_dtype, project):
+    """A narrower `weights_dtype` is the f32 result rounded once, and leaves
+    the quantized query untouched."""
+    torch.manual_seed(0)
+    t, h, k = num_tokens, num_heads, 5120
+    q = (torch.randn(t, h, HEAD_SIZE, device="cuda") * 3).bfloat16()
+    positions = torch.randint(0, 4096, (t,), device="cuda")
+    cos_sin = _cos_sin(4096)
+    kwargs = {"weights_scale": 0.25 * 0.125}
+    if project:
+        kwargs["hidden"] = torch.randn(t, k, device="cuda").bfloat16()
+        kwargs["weights_proj"] = (torch.randn(h, k, device="cuda") * 0.02).bfloat16()
+        args = (q, positions, cos_sin)
+    else:
+        args = (q, positions, cos_sin, torch.randn(t, h, device="cuda").bfloat16())
+    q_ref, s_ref, w_ref = q_rope_mxfp4_quant(*args, **kwargs)
+    q_out, s_out, w_out = q_rope_mxfp4_quant(
+        *args, **kwargs, weights_dtype=weights_dtype
+    )
+    assert w_ref.dtype == torch.float32 and w_out.dtype == weights_dtype
+    assert (q_out == q_ref).all() and (s_out == s_ref).all()
+    torch.testing.assert_close(w_out, w_ref.to(weights_dtype), rtol=0, atol=0)
+
+
+def test_q_quant_rejects_an_unsupported_weights_dtype():
+    q = torch.zeros(1, 4, HEAD_SIZE, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="weights_dtype"):
+        q_rope_mxfp4_quant(
+            q,
+            torch.zeros(1, dtype=torch.long, device="cuda"),
+            _cos_sin(8),
+            weights_dtype=torch.int32,
+        )
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.skipif(
     arch_info.get_arch() != "gfx950",

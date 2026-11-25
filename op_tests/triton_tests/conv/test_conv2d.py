@@ -42,7 +42,7 @@ from op_tests.triton_tests.conv._helpers import (
     TestSuite,
     _winograd_tolerances,
     assert_weight_pack_cache_clear_is_scoped,
-    conv2d_padding_reference,
+    conv_padding_reference,
     dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
@@ -244,13 +244,14 @@ def test_conv2d_rejects_invalid_devices_before_preparation(
             f"{api}: CPU {cpu_argument} must be rejected before padding or packing"
         )
 
-    monkeypatch.setattr(
-        conv2d_module, "_prepare_conv2d_padding", unexpected_preparation
-    )
+    monkeypatch.setattr(conv2d_module, "_prepare_conv_padding", unexpected_preparation)
     message = (
         "conv2d input must be a CUDA/ROCm tensor"
         if cpu_argument == "input"
         else "conv2d input, weight, and bias must be on the same device"
+    )
+    message += (
+        f", got input={source.device}, weight={weight.device}, bias={bias.device}"
     )
     with pytest.raises(ValueError, match=message):
         getattr(conv2d_module, api)(
@@ -421,7 +422,7 @@ def test_prepared_padding_delegates_to_pytorch(
 
     monkeypatch.setattr(padding_ops.F, "pad", recording_pad)
     monkeypatch.setattr(conv_config_utils, "_get_conv_config_file", unexpected_config)
-    actual, conv_padding = padding_ops._prepare_conv2d_padding(
+    actual, conv_padding = padding_ops._prepare_conv_padding(
         source, (1, 2), padding_mode, layout=layout
     )
 
@@ -450,8 +451,8 @@ def test_prepared_padding_accepts_boundary_amounts(
     padding_mode, height, width, padding
 ):
     source = torch.ones(2, 3, height, width, device="cuda", dtype=torch.float16)
-    actual, conv_padding = padding_ops._prepare_conv2d_padding(
-        source, padding, padding_mode
+    actual, conv_padding = padding_ops._prepare_conv_padding(
+        source, padding, padding_mode, layout="nchw"
     )
     pad_height, pad_width = (padding, padding) if isinstance(padding, int) else padding
     assert actual.shape == (2, 3, height + 2 * pad_height, width + 2 * pad_width)
@@ -477,7 +478,7 @@ def test_prepared_padding_noop_does_not_materialize(
 
     monkeypatch.setattr(padding_ops.F, "pad", unexpected_materialization)
     monkeypatch.setattr(padding_ops, "_ensure_layout", unexpected_materialization)
-    actual, conv_padding = padding_ops._prepare_conv2d_padding(
+    actual, conv_padding = padding_ops._prepare_conv_padding(
         source, padding, padding_mode, layout=layout
     )
     expected_padding = (padding, padding) if isinstance(padding, int) else padding
@@ -503,7 +504,6 @@ def test_prepared_padding_noop_does_not_materialize(
         ("cuda", (2, 3, 5, 7), (1, 2, 3), "replicate", "nchw", "length-2 sequence"),
         ("cuda", (2, 3, 5, 7), (5, 0), "reflect", "nchw", "reflect padding"),
         ("cuda", (2, 3, 5, 7), (0, 8), "circular", "nchw", "circular padding"),
-        ("cpu", (2, 3, 5, 7), 1, "replicate", "nchw", "requires a CUDA/ROCm tensor"),
     ],
     ids=[
         "rank",
@@ -514,7 +514,6 @@ def test_prepared_padding_noop_does_not_materialize(
         "padding-length",
         "reflect-limit",
         "circular-limit",
-        "cpu-materialization",
     ],
 )
 def test_prepared_padding_validates_before_materialization(
@@ -527,14 +526,12 @@ def test_prepared_padding_validates_before_materialization(
 
     monkeypatch.setattr(padding_ops.F, "pad", unexpected_padding)
     with pytest.raises(ValueError, match=message):
-        padding_ops._prepare_conv2d_padding(
-            source, padding, padding_mode, layout=layout
-        )
+        padding_ops._prepare_conv_padding(source, padding, padding_mode, layout=layout)
 
 
 def test_prepared_padding_handles_empty_batch():
     source = torch.empty(0, 3, 5, 7, device="cuda", dtype=torch.float16)
-    actual, conv_padding = padding_ops._prepare_conv2d_padding(
+    actual, conv_padding = padding_ops._prepare_conv_padding(
         source, (1, 2), "replicate", layout="nhwc"
     )
     assert actual.shape == (0, 3, 7, 11)
@@ -635,7 +632,7 @@ def test_padding_matches_reference(
     weight = torch.randn(17, channels, *filter_shape, device="cuda", dtype=dtype)
     bias = torch.randn(17, device="cuda", dtype=dtype)
     padding = (1, 2)
-    expected = conv2d_padding_reference(
+    expected = conv_padding_reference(
         source.float(),
         weight.float(),
         bias.float(),
@@ -750,7 +747,7 @@ def test_specialized_padding_prepacked_input(api):
             padding_mode=padding_mode,
             x_blocked=x_blocked,
         )
-        expected = conv2d_padding_reference(
+        expected = conv_padding_reference(
             source.float(), weight.float(), padding=padding, padding_mode=padding_mode
         )
         torch.testing.assert_close(
