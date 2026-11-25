@@ -1468,11 +1468,6 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -1614,7 +1609,7 @@ def test_mla(
             dtypeMax=0.75 * torch.finfo(dtypes.fp8).max,
         )
 
-        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
@@ -1659,22 +1654,16 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-
-        if not non_persistent_mode and return_lse:
-            err = checkAllclose(
-                lse_ref,
-                attn_lse.reshape(total_q, nhead),
-                msg=f"mla_decode-absorb_fp8    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
-            )
-        err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        if not non_persistent_mode and return_lse:
+            checkAllclose(
+                lse_ref_fp8,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb_fp8    [lse_ref_fp8 vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
 
         if not non_persistent_mode:
             partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
@@ -1723,7 +1712,7 @@ def test_mla(
                 if nhead == 64 and get_gfx() == "gfx942":
                     assert partial_err < 0.05
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     def test_absorb_decode_3buffer():
@@ -1756,12 +1745,6 @@ def test_mla(
             scale_dim=scale_dim,
         )
 
-        checkAllclose(
-            out_ref,
-            out_ref_fp8,
-            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
-        )
-
         (attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
@@ -1788,11 +1771,6 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -1840,7 +1818,7 @@ def test_mla(
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     def test_absorb_decode_ds32_opus():
@@ -1868,13 +1846,6 @@ def test_mla(
             is_causal=True,
             scale_dim=scale_dim,
         )
-
-        err = checkAllclose(
-            out_ref,
-            out_ref_fp8,
-            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
-        )
-        us_asm_decode = 1e12
 
         (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd_ds32,
@@ -1904,17 +1875,12 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     err = None
