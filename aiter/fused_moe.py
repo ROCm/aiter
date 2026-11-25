@@ -1392,6 +1392,11 @@ def fused_moe(
                 "stage2_scatter": stage2_scatter,
                 "herd_topk": herd_topk,
                 "deterministic": deterministic,
+                "a2_scale": a2_scale,
+                "w1_global_scale": w1_global_scale,
+                "w2_global_scale": w2_global_scale,
+                "linear_beta": linear_beta,
+                "splitk": splitk,
             },
         )
     has_shared_expert = (

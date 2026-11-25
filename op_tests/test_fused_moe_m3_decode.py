@@ -158,6 +158,36 @@ def test_fails_closed():
         )
 
 
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"a2_scale": torch.ones(1)},
+        {"w1_global_scale": torch.ones(1)},
+        {"w2_global_scale": torch.ones(1)},
+        {"linear_beta": 1.0},
+        {"splitk": 2},
+    ],
+)
+def test_ignored_arguments_fail_closed(kw):
+    """An argument the decode chain does not implement is refused, not silently dropped."""
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
+    with pytest.raises(NotImplementedError):
+        fused_moe(
+            x,
+            L["w1"],
+            L["w2"],
+            w,
+            ids,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=L["w1_scale"],
+            w2_scale=L["w2_scale"],
+            **kw,
+            **shared_kw(L),
+        )
+
+
 # ---------------------------------------------------------------- timing
 
 
