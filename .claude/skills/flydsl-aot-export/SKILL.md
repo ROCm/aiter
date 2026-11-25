@@ -28,6 +28,8 @@ Converted wrappers to copy from:
 | Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`) |
 | Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
 | Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`) |
+| Factory argument the cache cannot key (a tuple of dataclasses) | `kernels/mega_moe/mega_moe_stage1.py` (`_stage1_bundle_launcher`: the configs as tuples of their fields) |
+| Caller keeps the function `flyc.compile` returned, or preloads it | `kernels/flydsl_dispatch_combine_intranode_op.py` (`_compile_and_keep`, `_preload_compiled` of a `lazy` handle) |
 
 ## The one rule
 
@@ -109,9 +111,13 @@ So, for each launch, list what the trace depends on and tick each item off:
    the JIT path.
 5. **Update what else compiles the kernel.** A preload or warm-up helper must
    go through the same launch path under compile-only
-   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set),
-   or it warms FlyDSL's cache and not the entry the launch loads. An AOT replay
-   under `aiter/aot/flydsl/` needs no change if it enters at the public op.
+   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set, or
+   `_preload_compiled(factory.lazy(), ...)`, which builds the entry in a
+   prebuild and loads it elsewhere), or it warms FlyDSL's cache and not the
+   entry the launch loads. A call site that keeps what `flyc.compile`
+   returned and calls it directly uses `_compile_and_keep(handle, ...)`. An
+   AOT replay under `aiter/aot/flydsl/` needs no change if it enters at the
+   public op.
 6. **Document it.** Add the cache name, wrapper and key to
    `docs/flydsl_aot_cache.md` §5, and remove the op from the "not converted"
    list in §7.

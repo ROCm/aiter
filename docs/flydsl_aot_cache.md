@@ -376,6 +376,16 @@ not a prebuild: launches of other threads meanwhile build nothing. (They do
 not run either, as on the JIT path: `COMPILE_ONLY` is read for the whole
 process. Preload before serving, not beside it.)
 
+A preload of a bound launcher (a `factory.lazy(...)` handle or a `bind_aot`
+launcher) goes through the cache instead. In a prebuild it builds the entry,
+as a launch does. In another process it loads the entry without launching
+(`aot_launch.preload_bound`, `FlyDSLAotCache.preload`) and returns the loaded
+function, which takes the launcher's arguments; later `_run_compiled`
+launches of the key use it too. A key with no entry logs the usual error and
+is preloaded on the JIT path, as before. A caller that keeps the function
+`flyc.compile` returned and calls it directly (the MegaMoE combine) gets the
+same from `tensor_shim._compile_and_keep`, which launches it.
+
 Parallel replays share both caches safely. FlyDSL's own disk cache takes a
 per-artifact file lock, so one process runs LLVM and the others load its
 result; the export takes `flock <digest>.lock`. Measured on the mxfp8 CSV,
@@ -662,12 +672,70 @@ same argument shape run on gfx942):
 A loaded object fills each tensor slot with FlyDSL's generic fill (§7, issue
 3), about 0.25 us per tensor more than the JIT path's generated fills, so
 the launchers with 11 or 12 tensors pay 2 to 3.5 us; they run for tens of
-microseconds or more. The conv `_dispatch` keeps the function the cache
-loaded and calls it directly, as it did with its own `CompiledFunction`
-before, so only its first launch goes through `_run_compiled`; the conv rows
-above predate that. With an empty four-tensor kernel a steady-state
-`_dispatch` takes 11.9 us on the JIT path and 12.6 us on a loaded object,
-the difference being the generic fill.
+microseconds or more. The conv `_dispatch` keeps the function its first
+launch got (`tensor_shim._compile_and_keep`: the entry the cache loaded, or
+the JIT's when there is none) and calls it directly, as it did with its own
+`CompiledFunction` before; the conv rows above predate that. With an empty
+four-tensor kernel a steady-state `_dispatch` takes about 11 us with or
+without an entry.
+
+`python -m aiter.aot.flydsl.mega_moe` builds a `MegaMoEV2` per rank of each
+profile under `dry_run` and calls its `preload_aot_bundles()` and
+`quantize()`. Every launcher it compiles now launches and preloads through
+this cache:
+
+| Cache | Launcher | How |
+|---|---|---|
+| `mega_moe_prepare` | `mega_moe_prepare.compile_mega_moe_prepare` (also the fast EP8 prepare it returns) | `aot_factory` |
+| `mega_moe_stage1_bundle` | `mega_moe_stage1.compile_mega_moe_stage1_bundle` | `aot_factory` on `_stage1_bundle_launcher`, which takes the `Stage1Config` variants as tuples of their fields: a dataclass is no key element |
+| `mega_moe_small_m_stage1`, `mega_moe_large_m_stage1` | `compile_mega_moe_stage1` of `mega_moe_small_m.py` and `mega_moe_large_m.py` | `aot_factory` |
+| `mega_moe_stage2`, `mega_moe_stage2_aligned_pair` | `compile_mega_moe_stage2`, `compile_mega_moe_stage2_aligned_pair` (were cached in module dicts) | `aot_factory` |
+| `mega_moe_mx_quant` | `quant.build_per_1x32_mx_quant_module` (`per_1x32_mx_quant`) | `aot_factory` |
+| `mega_moe_combine` | `make_combine_jit` of a combine after the fused GEMM2 (`combine_no_stage1`) | `aot_factory`; the op keeps the function it gets (`_compile_and_keep`, `_preload_compiled`) |
+
+The runtime keeps the `lazy` handles where it kept launchers, and
+`preload_aot_bundles()` preloads through the cache (§4.4): in a serving
+process it loads every entry without launching. The dispatch and the
+regular `combine()` of the intranode op, which `aiter.dist` uses beyond
+MegaMoE and no replay builds, keep their JIT path; so do the fixed-slot
+Stage1 (`mega_moe_stage1.compile_mega_moe_stage1`) and `compile_gemm1`,
+which the replay does not compile. The combine's launch geometry comes from a
+tuning CSV and the device name; both reach the kernel only as `block_num`
+and `warp_num_per_block`, which are in its key. `per_1x32_mx_quant` is also
+the internode MegaMoE's quant, which so launches through `mega_moe_mx_quant`
+too; an `n` the intranode replay does not build logs one error and traces.
+
+Host cost of the lookups that changed, per launch (CPU only, measured
+before/after): Stage2 2.7 to 1.6 us, Stage1 bundle 1.7 to 2.5 us (the
+variants are turned into tuples, cached), prepare 0.32 to 0.36 us, quant
+0.11 to 0.18 us; `_run_compiled` of a kept handle adds 0.2 us to the JIT
+path's, before the slot fills of §5.4. The combine keeps calling the
+function it kept.
+
+Validated compile-only on gfx942 (FlyDSL 0.5.3, no MORI) with `GPU_ARCHS=gfx950
+python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192` (16
+jobs), recording every `flyc.compile`:
+
+| | Result |
+|---|---|
+| Entries after the first run | 674: prepare 352, small-input Stage1 112, Stage2 96, combine 80, Stage1 bundle 16, large-input Stage1 8, aligned-pair Stage2 8, quant 2 |
+| Second run on the same directory | 0 builds, no `JIT path` error; 58 s against 167 s |
+| `flyc.compile` calls outside the cache | 0 of 1176 |
+| `verify` replay on that directory | passes: every entry re-traced to the IR it was built from |
+| Key probe (each of the 1176 launches re-exported) | 674 digests, none with two objects |
+
+The default build (`python -m aiter.aot.flydsl.mega_moe`, every production
+profile, 234 jobs on 179 workers) writes 7655 entries, 634 MB, in 444 s; a
+second run on the same directory builds none in 148 s, and no launch of
+either takes the JIT path.
+
+With `AITER_FLYDSL_AOT_CACHE=0` and `=1` the replay leaves the same 594 +
+80 FlyDSL artifacts (the same traced-IR names; the 80 combine ones byte for
+byte). The GPU binary in 34 to 43 of the 594 differs between any two runs,
+two `=0` runs as much as `=0` and `=1`, with identical input IR: LLVM does not
+make the same bytes of some prepare kernels twice, so compare these
+artifacts by name and IR, not bytes. Runtime on gfx950 with MORI is still to
+be checked.
 
 ## 6. Adopting it for another op
 
@@ -778,11 +846,11 @@ path's). Issue 4 is in the JIT path and remains.
   does, they take the JIT path.
 - Only the launchers in §5 are converted: those of the AOT replays on gfx942
   and gfx950 (GEMMs, 2-stage MoE, the paged-attention planner, the GDN
-  prefill kernels, conv3d and the gfx950 FP8 attention), except MegaMoE,
-  whose replay still compiles every launcher on the JIT path. Other FlyDSL
-  kernels, e.g. the gfx1250 GEMMs and MoE, the other attention kernels
-  and the a8w4 `comm_fused_moe`, still trace and compile on their
-  first call in each process. (`moe_reduction` is not
+  prefill kernels, conv3d, the gfx950 FP8 attention and the gfx950
+  intranode MegaMoE). Other FlyDSL kernels, e.g. the gfx1250 GEMMs and MoE,
+  the gfx1250, TP and internode MegaMoE, the other attention kernels and
+  the a8w4 `comm_fused_moe`, still trace and compile on their first call in
+  each process. (`moe_reduction` is not
   specific to an arch, so a gfx1250 MoE that calls it launches it through the
   cache, and so does `plan_pa_decode` on gfx1250; neither is validated.)
 - A full gfx950 prebuild (`GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.gemm`,

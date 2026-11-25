@@ -16,7 +16,8 @@ launcher it returns then goes through the cache::
 it returns a handle that ``_run_compiled`` launches from the cache, so a hit
 never runs the factory (whose ``@flyc.kernel`` definitions alone take a few
 hundred ms in a fresh process). The factory runs only to build an entry or to
-fall back to the JIT. Pass the handle to ``_run_compiled`` only.
+fall back to the JIT. Pass the handle to ``tensor_shim``'s ``_run_compiled``,
+``_preload_compiled`` or ``_compile_and_keep`` only.
 
 A factory whose launcher is built inside a wrapper binds it where it is built::
 
@@ -61,11 +62,12 @@ from .aot_cache import (
     FlyDSLAotCache,
     _JitKernel,
     _normalize_key,
+    _prebuilding,
     _UsageError,
     aot_cache_mode,
 )
 
-__all__ = ["aot_factory", "bind_aot", "loaded_kernel"]
+__all__ = ["aot_factory", "bind_aot", "preload_bound"]
 
 _ATTR = "_aiter_aot"
 
@@ -220,18 +222,43 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
     return exe
 
 
-def loaded_kernel(exe, specialization_key=None):
-    """The function the cache loaded for a bound launcher's launches under
-    ``specialization_key``, to call with the same arguments (an ``fx.Stream``,
-    not a torch stream); None if it has no entry (the JIT path), was compiled
-    only, or was invalidated. For a wrapper that keeps one launcher per call site and
-    wants to skip ``_run_compiled``'s lookup."""
+def preload_bound(exe, args, specialization_key=None):
+    """Load the entry of a bound launcher into this process without launching
+    it, for ``tensor_shim._preload_compiled`` and a caller that keeps the
+    function it gets and calls it directly.
+
+    Returns the loaded function, which takes the launcher's arguments (a
+    torch stream too); later launches of the key through ``_run_compiled``
+    use it as well. None if ``exe`` is not bound, in a prebuild (which builds
+    entries by launching: ``_run_compiled``), while ``COMPILE_ONLY`` is on
+    for another reason (a preload of another thread: nothing is loaded
+    then), or when the key has no entry: the cache then logs one error and
+    the key takes the JIT path, where the caller preloads or compiles it.
+    """
     binding = getattr(exe, _ATTR, None)
-    if not binding or binding.epoch != binding.cache.epoch:
+    if not binding or _prebuilding():
         return None
-    kernel = binding.kernels.get(specialization_key)
-    # The JIT kernel of a key with no entry launches through _run_compiled.
-    return None if isinstance(kernel, _JitKernel) else kernel
+    # FlyDSLAotCache keys launch arguments by their FlyDSL type (see
+    # _AotBinding); the function it returns takes a torch stream as is.
+    if args and isinstance(args[-1], torch.cuda.Stream):
+        args = (*args[:-1], fx.Stream(args[-1]))
+    if specialization_key is None:
+        key = binding.key
+    elif specialization_key in binding.unkeyable:
+        return None
+    else:
+        key = (binding.key, specialization_key)
+    try:
+        return binding.cache.preload(key, binding.make_exe, *args)
+    except _UsageError as e:
+        if specialization_key is None:
+            raise
+        logger.error(
+            f"[FlyDSL AOT] {binding.cache.name}: {e} in specialization_key; "
+            f"launching it through the JIT path"
+        )
+        binding.unkeyable.add(specialization_key)
+        return None
 
 
 class _LazyLauncher:
