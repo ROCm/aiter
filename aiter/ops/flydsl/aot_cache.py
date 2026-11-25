@@ -41,10 +41,11 @@ way.
 
 Invalidation has two levels. The directory is named by a fingerprint of the
 toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
-``AITER_FLYDSL_*`` / ``FLYDSL_*`` environment. Each cache also declares the
-source files its launchers are built from and the other environment
-variables their code reads (the file creating the cache and
-``_COMMON_SOURCES`` are always among its sources)::
+variables that change what the toolchain makes of any kernel (FlyDSL's own
+list). Each cache also declares the source files its launchers are built
+from and the environment variables those files read, ``AITER_FLYDSL_*``
+included: setting one makes that cache miss and no other (the file creating
+the cache, ``_COMMON_SOURCES`` and ``_COMMON_ENV`` are always among them)::
 
     FlyDSLAotCache("preshuffle_gemm_a8",
                    sources=["kernels/preshuffle_gemm.py", ...],
@@ -61,8 +62,9 @@ include the files under ``aiter/ops/flydsl`` those import.
 
 * ``1`` (default): on.
 * ``0``: off. ``launch`` uses ``_run_compiled``.
-* ``verify``: like ``1``, but each disk hit is re-traced and re-exported, and
-  the new object must match the cached ``.o`` byte for byte. A failure to
+* ``verify``: like ``1``, but each disk hit is re-traced, and the traced IR
+  must be what the entry was built from (FlyDSL's key of it; the exported
+  objects are compared byte for byte when an entry has none). A failure to
   load an entry, or to export one in a prebuild, raises instead of falling
   back. A launch with no entry still takes the JIT path.
 
@@ -112,37 +114,10 @@ _MODE = os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip().lower()
 if _MODE not in ("0", "1", "verify"):
     raise ValueError(f"AITER_FLYDSL_AOT_CACHE must be 0, 1 or verify, got {_MODE!r}")
 
-# Environment variables that do not change generated code. Every other
-# AITER_FLYDSL_* / FLYDSL_* variable goes into the fingerprint, because kernels
-# and FlyDSL read them while tracing.
-_ENV_IGNORED = {
-    "AITER_FLYDSL_AOT_CACHE",
-    "AITER_FLYDSL_AOT_CACHE_DIR",
-    "FLYDSL_DUMP_IR",
-    "FLYDSL_DUMP_DIR",
-    "FLYDSL_RUNTIME_CACHE_DIR",
-    "FLYDSL_RUNTIME_ENABLE_CACHE",
-    # The replay's --check sets it; it must look up the entries a build made.
-    "FLYDSL_RUNTIME_RUN_ONLY",
-    "AITER_FLYDSL_AOT_MAX_RETRIES",
-    "AITER_FLYDSL_AOT_TIMEOUT",
-    "AITER_FLYDSL_AOT_TRACEBACK",
-    # Hashed as the arch it selects (_target_arch), so that an AOT build, which
-    # sets it, and the runtime, which reads the device, share a directory.
-    "FLYDSL_GPU_ARCH",
-}
-_ENV_EXTRA = (
-    "HSA_OVERRIDE_GFX_VERSION",
-    "COMPILE_OPT_LEVEL",
-    # Changes gfx1250 codegen; FlyDSL keys its own cache on it for that arch.
-    "LLVM_GFX1250_ANY_XNACK_CODEGEN",
-)
 
-
-def _flydsl_cache_env() -> tuple:
-    """The variables FlyDSL's own artifact cache is keyed on that the
-    ``FLYDSL_`` prefix does not already cover, for every arch: one a later
-    FlyDSL adds is then fingerprinted without a change here."""
+def _flydsl_cache_env() -> tuple | None:
+    """The variables FlyDSL keys its own artifact cache on, for every arch;
+    None if this FlyDSL does not list them."""
     try:
         from flydsl.compiler import jit_function as jf
 
@@ -150,11 +125,68 @@ def _flydsl_cache_env() -> tuple:
         for arch_names in jf._TARGET_CACHE_INVALIDATING_ENV_VARS.values():
             names.update(arch_names)
     except (ImportError, AttributeError):  # FlyDSL internals moved
-        return ()
+        return None
     return tuple(sorted(names))
 
 
-_ENV_EXTRA = tuple(sorted({*_ENV_EXTRA, *_flydsl_cache_env()}))
+# The fingerprint holds the variables that change what the toolchain makes of
+# any kernel: FlyDSL's own list, and these. A variable that kernel code reads
+# is not here: the cache of that kernel declares it (``env=``), so setting it
+# makes that cache miss and no other.
+_FLYDSL_ENV = _flydsl_cache_env()
+_ENV_FINGERPRINT = frozenset(
+    {
+        "HSA_OVERRIDE_GFX_VERSION",
+        "COMPILE_OPT_LEVEL",
+        # Changes gfx1250 codegen; FlyDSL keys its own cache on it for that arch.
+        "LLVM_GFX1250_ANY_XNACK_CODEGEN",
+        *(_FLYDSL_ENV or ()),
+    }
+)
+# With a FlyDSL that does not list its variables, every FLYDSL_ one but these.
+_ENV_IGNORED = frozenset(
+    {
+        "FLYDSL_DUMP_IR",
+        "FLYDSL_DUMP_DIR",
+        "FLYDSL_RUNTIME_CACHE_DIR",
+        "FLYDSL_RUNTIME_ENABLE_CACHE",
+        "FLYDSL_RUNTIME_RUN_ONLY",
+        "FLYDSL_GPU_ARCH",
+    }
+)
+
+# Variables aiter's FlyDSL code reads that cannot change generated code, or
+# that reach an entry's identity another way. The check of a cache's sources
+# (``_undeclared_env``) accepts them without a declaration.
+_ENV_NOT_CODE = frozenset(
+    {
+        # Whether to launch; the cache's own switches.
+        "COMPILE_ONLY",
+        "AITER_FLYDSL_AOT_CACHE",
+        "AITER_FLYDSL_AOT_CACHE_DIR",
+        "AITER_FLYDSL_AOT_MAX_RETRIES",
+        "AITER_FLYDSL_AOT_TIMEOUT",
+        "AITER_FLYDSL_AOT_TRACEBACK",
+        # The target: hashed as the arch and CU count they select.
+        "FLYDSL_GPU_ARCH",
+        "GPU_ARCHS",
+        "AITER_GPU_ARCHS",
+        "CU_NUM",
+        "AITER_AOT_REPLAY",
+        # FlyDSL's own cache.
+        "FLYDSL_RUNTIME_CACHE_DIR",
+        "FLYDSL_RUNTIME_ENABLE_CACHE",
+        "FLYDSL_RUNTIME_RUN_ONLY",
+    }
+)
+
+# Variables the common sources read (``_COMMON_SOURCES``): inputs of every
+# cache, like those files.
+_COMMON_ENV = (
+    "AITER_FLYDSL_KERNARG_PRELOAD",
+    "AITER_FLYDSL_KERNARG_PRELOAD_COUNT",
+    "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE",
+)
 
 
 def aot_cache_mode() -> str:
@@ -250,9 +282,12 @@ def _cu_num() -> int:
 
 
 def _env_in_fingerprint(name: str) -> bool:
-    """Whether ``fingerprint`` owns ``name``: hashes it or, if in ``_ENV_IGNORED``,
-    knows it changes no code."""
-    return name.startswith(("AITER_FLYDSL_", "FLYDSL_")) or name in _ENV_EXTRA
+    """Whether ``fingerprint`` hashes the variable ``name``."""
+    if name in _ENV_FINGERPRINT:
+        return True
+    return (
+        _FLYDSL_ENV is None and name.startswith("FLYDSL_") and name not in _ENV_IGNORED
+    )
 
 
 @functools.cache
@@ -295,11 +330,7 @@ def fingerprint() -> str:
     declared per cache instead (``FlyDSLAotCache``). Only the FlyDSL hash is
     cached: an AOT build switches arch and environment within one process.
     """
-    env_items = sorted(
-        (k, v)
-        for k, v in os.environ.items()
-        if _env_in_fingerprint(k) and k not in _ENV_IGNORED
-    )
+    env_items = sorted((k, v) for k, v in os.environ.items() if _env_in_fingerprint(k))
     parts = [
         _SCHEMA,
         sys.version_info[:2],
@@ -436,6 +467,44 @@ def _undeclared_imports(files) -> list:
         if f.startswith(kernels) and f.endswith(".py"):
             missing |= _kernel_imports(f) - declared
     return sorted(missing)
+
+
+@functools.cache
+def _env_reads(path: str) -> frozenset:
+    """The environment variables ``path`` reads by a literal name, anywhere
+    in it (from its text). A name that is computed is not seen."""
+
+    def is_environ(node) -> bool:
+        return ast.unparse(node).endswith("environ")
+
+    names = set()
+    for node in ast.walk(ast.parse(Path(path).read_bytes())):
+        arg = None
+        if isinstance(node, ast.Call) and node.args:
+            func = ast.unparse(node.func)
+            if func.endswith(("environ.get", "environ.setdefault", "getenv")):
+                arg = node.args[0]
+        elif isinstance(node, ast.Subscript) and is_environ(node.value):
+            arg = node.slice
+        elif isinstance(node, ast.Compare) and any(map(is_environ, node.comparators)):
+            arg = node.left
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            names.add(arg.value)
+    return frozenset(names)
+
+
+def _undeclared_env(files, declared) -> list:
+    """Variables the declared sources read that are neither declared nor in
+    the fingerprint nor known not to change code: inputs someone forgot."""
+    missing = set()
+    for f in files:
+        if f.endswith(".py"):
+            missing |= _env_reads(f)
+    return sorted(
+        name
+        for name in missing - set(declared) - _ENV_NOT_CODE
+        if not _env_in_fingerprint(name)
+    )
 
 
 def _launcher_signature(exe):
@@ -593,17 +662,51 @@ def _placeholder(v):
     return v
 
 
-def _export(exe, args, out_dir: Path, sym: str, link_libs: set | None = None) -> Path:
-    """Compile ``exe`` for ``args`` without launching and export ``<sym>.o``.
-
-    ``link_libs`` collects the bitcode files the kernel links (``link_extern``).
-    """
+def _compile(exe, args):
+    """Trace and compile ``exe`` for ``args`` without launching."""
     placeholders = [_placeholder(v) for v in args]
     cf = flyc.compile(exe, *placeholders, compile_only=True)
     if cf is None:
         # A hook stopped the compile, such as an AOT replay that only
         # identifies kernels.
         raise _NoExport("flyc.compile returned no function to export")
+    return cf
+
+
+def _ir_key(exe, cf) -> str | None:
+    """FlyDSL's key of the compile that made ``cf``: a hash of the traced IR
+    and of what lowers it (target, pipeline, options). Two compiles with one
+    key had the same input, whatever bytes the code generator made of it.
+
+    Private to FlyDSL (``JitFunction._last_compiled``); None if it is not
+    there, and ``verify`` then compares objects.
+    """
+    jit = (
+        getattr(exe.func, "__self__", None)
+        if isinstance(exe, functools.partial)
+        else exe
+    )
+    last = getattr(jit, "_last_compiled", None)
+    try:
+        key, artifact = last
+    except (TypeError, ValueError):
+        return None
+    if isinstance(key, str) and artifact is getattr(cf, "_keepalive", None):
+        return key
+    return None
+
+
+def _export(
+    exe, args, out_dir: Path, sym: str, link_libs: set | None = None, info=None
+) -> Path:
+    """Compile ``exe`` for ``args`` without launching and export ``<sym>.o``.
+
+    ``link_libs`` collects the bitcode files the kernel links (``link_extern``)
+    and ``info`` (a dict) the compile's ``"ir"`` key.
+    """
+    cf = _compile(exe, args)
+    if info is not None:
+        info["ir"] = _ir_key(exe, cf)
     if link_libs is not None:
         # Private to FlyDSL (the CompiledArtifact a CompiledFunction keeps):
         # without it a linked library could not be checked against the
@@ -776,9 +879,9 @@ class FlyDSLAotCache:
     def __init__(self, name: str, sources=(), env=()):
         """``sources``: the files the launchers of this cache are built from,
         besides the one creating it and ``_COMMON_SOURCES``: each relative to ``aiter/ops/flydsl`` or
-        absolute; a directory stands for every ``.py`` below it. ``env``: the environment variables their
-        code reads, other than ``AITER_FLYDSL_*`` / ``FLYDSL_*``, and
-        ``"get_gfx()"`` if it picks code by ``chip_info.get_gfx()``. An edit
+        absolute; a directory stands for every ``.py`` below it. ``env``: the environment variables those
+        files read, besides ``_COMMON_ENV`` and what the fingerprint holds,
+        and ``"get_gfx()"`` if their code picks by ``chip_info.get_gfx()``. An edit
         to a source, or another value of an input, makes new entries."""
         if not re.fullmatch(r"[A-Za-z0-9_]+", name):
             raise ValueError(f"cache name must be a C identifier fragment: {name!r}")
@@ -799,7 +902,8 @@ class FlyDSLAotCache:
         # cache must import whatever its sources list says, in every mode.
         self._declared = (*_COMMON_SOURCES, *sources)
         self._resolved = None
-        self._env = tuple(sorted({env} if isinstance(env, str) else set(env)))
+        env = {env} if isinstance(env, str) else set(env)
+        self._env = tuple(sorted(env | set(_COMMON_ENV)))
         # [(source, sha256)] and its hash, once the files were read (_sources),
         # and the same hashes by path (_check_unchanged).
         self._hashes = None
@@ -1014,7 +1118,7 @@ class FlyDSLAotCache:
                 if found is None or not _is_object(found.with_suffix(".o")):
                     found = self._build(make_exe, args, out_dir, sym, digest)
         elif _MODE == "verify":
-            self._verify(make_exe(), args, sym, found.with_suffix(".o"))
+            self._verify(make_exe(), args, sym, found)
         if fly_env.compile.compile_only:
             return None
         obj = found.with_suffix(".o")
@@ -1063,14 +1167,17 @@ class FlyDSLAotCache:
             # after it: the trace is what imports the kernel's modules.
             self._check_unchanged()
             libs = set()
+            info = {}
             exe = make_exe()
-            tmp_obj = _export(exe, args, tmp, sym, libs)
+            tmp_obj = _export(exe, args, tmp, sym, libs, info)
             self._check_declared(libs)
             self._check_unchanged()
             meta = {
                 # In the digest already; kept here to say what an entry is.
                 "sources": dict(self._hashes),
                 "env": self._inputs(),
+                # What the code generator was given; verify compares it.
+                "ir": info.get("ir"),
                 "baked": _baked_args(exe, args),
                 "constexpr": _constexpr_count(exe),
             }
@@ -1101,6 +1208,14 @@ class FlyDSLAotCache:
                     f"{[_portable(f) for f in missing]}, which its sources import: "
                     f"add them to its sources="
                 )
+            unread = _undeclared_env(self._files, self._env)
+            if unread:
+                raise _UndeclaredSourceError(
+                    f"[FlyDSL AOT] cache {self.name!r} does not declare the "
+                    f"variables {unread}, which its sources read: add them to "
+                    f"its env= (or, if one cannot change generated code, to "
+                    f"aot_cache._ENV_NOT_CODE)"
+                )
             self._imports_checked = True
         missing = sorted(set(libs) - set(self._files))
         if missing:
@@ -1109,7 +1224,27 @@ class FlyDSLAotCache:
                 f"does not declare: add the bitcode to its sources="
             )
 
-    def _verify(self, exe, args, sym, obj) -> None:
+    def _verify(self, exe, args, sym, stem) -> None:
+        """Raise if the entry at ``stem`` is not what ``exe`` compiles to now.
+
+        Compared by FlyDSL's key of the traced IR when the entry has one: the
+        code generator can make different bytes of one input (seen: one
+        gfx950 GEMM in about seven compiles), so comparing objects would call
+        a current entry stale. Without it, the objects are compared.
+        """
+        obj = stem.with_suffix(".o")
+        built = json.loads(stem.with_suffix(".json").read_text()).get("ir")
+        if built is not None:
+            now = _ir_key(exe, _compile(exe, args))
+            if now is not None:
+                if now == built and obj.exists():
+                    return
+                raise _StaleEntryError(
+                    f"[FlyDSL AOT] stale cache entry {obj}: the kernel traces "
+                    f"to other IR now ({now[:16]}, built from {built[:16]}). "
+                    f"Something the key does not cover changed the kernel; "
+                    f"delete {obj.parent} or add the input to the cache key."
+                )
         with tempfile.TemporaryDirectory() as tmp:
             fresh = _export(exe, args, Path(tmp), sym).read_bytes()
         if not obj.exists() or obj.read_bytes() != fresh:

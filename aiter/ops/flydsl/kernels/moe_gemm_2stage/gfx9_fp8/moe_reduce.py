@@ -21,6 +21,11 @@ _SORTED_SUM_AOT_CACHE = FlyDSLAotCache(
     sources=[
         "kernels/moe_gemm_2stage/gfx9_fp8",
     ],
+    # Read by common.py.
+    env=[
+        "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+        "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+    ],
 )
 
 

@@ -24,8 +24,18 @@ _AOT_SOURCES = [
     "kernels/moe_gemm_2stage/gfx9_fp8",
 ]
 
-_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax", sources=_AOT_SOURCES)
-_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor", sources=_AOT_SOURCES)
+# The variables common.py reads.
+_AOT_ENV = [
+    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+    "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+]
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_absmax", sources=_AOT_SOURCES, env=_AOT_ENV
+)
+_QUANT_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_quant_per_tensor", sources=_AOT_SOURCES, env=_AOT_ENV
+)
 
 
 @functools.cache

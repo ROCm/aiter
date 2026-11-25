@@ -730,6 +730,14 @@ _G2_AOT_CACHE = FlyDSLAotCache(
         "kernels/act.py",
         "kernels/layout_utils.py",
     ],
+    # Read below; their values are also in get_g2's key.
+    env=[
+        "MXFP4_G2_ASCALE_PF",
+        "MXFP4_G2_BF16_LDS",
+        "MXFP4_G2_BHOIST",
+        "MXFP4_G2_PREFETCH_IDS",
+        "MXFP4_G2_SPART",
+    ],
 )
 
 

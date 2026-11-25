@@ -197,17 +197,13 @@ source:
 - the CU count, `chip_info.get_cu_num()`. It honours `CU_NUM`, which the AOT
   dry run sets from each tuned row's `cu_num`, so a prebuild for a CU count
   and a process on such a GPU use the same directory;
-- every `AITER_FLYDSL_*` / `FLYDSL_*` env var, plus
-  `HSA_OVERRIDE_GFX_VERSION`, `COMPILE_OPT_LEVEL` and the variables FlyDSL
-  keys its own artifact cache on without that prefix
-  (`LLVM_GFX1250_ANY_XNACK_CODEGEN`; the list is read from FlyDSL). Variables that cannot
-  change code are excluded: dump dirs, the cache's own variables, the
-  FlyDSL runtime-cache switches (`FLYDSL_RUNTIME_ENABLE_CACHE`, and
-  `FLYDSL_RUNTIME_RUN_ONLY`, which the replay's `--check` sets, so it checks
-  the entries the build made), the replay's `AITER_FLYDSL_AOT_TIMEOUT` /
-  `_MAX_RETRIES` / `_TRACEBACK`, and `FLYDSL_GPU_ARCH`, which is hashed as the arch it selects. Otherwise an AOT
-  build, which sets it, and the runtime, which reads the device, would use
-  different directories.
+- the variables that change what the toolchain makes of any kernel:
+  `HSA_OVERRIDE_GFX_VERSION`, `COMPILE_OPT_LEVEL` and the ones FlyDSL keys
+  its own artifact cache on (`FLYDSL_COMPILE_OPT_LEVEL`,
+  `FLYDSL_DEBUG_ENABLE_DEBUG_INFO`, `LLVM_GFX1250_ANY_XNACK_CODEGEN`, …; the
+  list is read from FlyDSL). A variable that kernel code reads, an
+  `AITER_FLYDSL_*` one included, is not here: the cache of that kernel
+  declares it (level 2), so setting it makes that cache miss and no other.
 
 **Level 2: the sources a cache declares.** aiter sources are not hashed as a
 directory, and nothing is detected at run time. Each cache lists the files
@@ -234,8 +230,14 @@ does:
   themselves by (`aiter/jit/utils/chip_info.py`, `lds_capacity.py`), which are
   outside `aiter/ops/flydsl/kernels`, the only place the import check looks. An edit
   to one of them makes new entries in every cache.
-- `env=[...]` names the environment variables the kernel code reads, other
-  than `AITER_FLYDSL_*` / `FLYDSL_*` (level 1). `"get_gfx()"` stands for
+- `env=[...]` names the environment variables the declared files read,
+  `AITER_FLYDSL_*` ones included. The variables the common sources read
+  (`aot_cache._COMMON_ENV`, the kernel-argument preload switches) are
+  inputs of every cache. A prebuild, and the unit test, raise for a variable
+  a declared file reads by a literal name that is neither declared, nor in
+  the fingerprint, nor listed in `aot_cache._ENV_NOT_CODE` (the target
+  selectors, `COMPILE_ONLY`, the cache's own switches). A name that is
+  computed (`os.environ.get(f"X_{stage}")`) is not seen. `"get_gfx()"` stands for
   `chip_info.get_gfx()`, for code that picks instructions by it.
 - Bitcode a kernel links with `link_extern(..., bitcode_path=...)` is a
   source too, by its absolute path.

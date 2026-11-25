@@ -104,7 +104,8 @@ def child(cases):
     # A hit never calls the launcher factory: count those calls. The factory
     # also reads a variable, as a kernel reads a tuning switch, which the
     # cache declares.
-    gemm_kernels._preshuffle_launcher.aot_cache._env = (TEST_ENV,)
+    cache = gemm_kernels._preshuffle_launcher.aot_cache
+    cache._env = (*cache._env, TEST_ENV)
     factories = 0
     compile_fn = gemm_kernels._get_compile_fn
 
@@ -214,7 +215,7 @@ def check_paths(cache_dir, cases):
     assert objects == sidecars, f"unpaired entries: {sorted(objects ^ sidecars)}"
     for p in sidecars:
         env = json.loads(Path(p + ".json").read_text())["env"]
-        assert env == {TEST_ENV: None}, f"{p}.json records {sorted(env)}"
+        assert TEST_ENV in env and env[TEST_ENV] is None, f"{p}.json: {env}"
 
     RESULTS["aot hit"], state = run_mode("1", cache_dir, cases)
     expected = {"entries": entries, "jit": 0, "builds": 0, "traces": 0, "factories": 0}

@@ -595,6 +595,52 @@ def test_entry_that_does_not_load_is_kept_and_the_launch_traces(monkeypatch, tmp
     assert cache._builds == builds + 1 and obj.read_bytes().startswith(b"\x7fELF")
 
 
+def test_verify_compares_the_traced_ir_not_the_object_bytes(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache, "_load_module", lambda path: None)
+    state = {"ir": "ir-one", "bytes": b"\x7fELF as the code generator made it"}
+
+    def export(exe, args, out_dir, sym, libs=None, info=None):
+        if info is not None:
+            info["ir"] = state["ir"]
+        obj = out_dir / f"{sym}.o"
+        obj.write_bytes(state["bytes"])
+        return obj
+
+    monkeypatch.setattr(aot_cache, "_export", export)
+    monkeypatch.setattr(aot_cache, "_compile", lambda exe, args: None)
+    monkeypatch.setattr(aot_cache, "_ir_key", lambda exe, cf: state["ir"])
+    cache = aot_cache.FlyDSLAotCache("test_verify_ir")
+
+    def make_exe():
+        return lambda: None
+
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    assert cache._kernel(("k",), make_exe, ()) is None
+    monkeypatch.delenv("COMPILE_ONLY")
+    monkeypatch.setattr(aot_cache, "_MODE", "verify")
+    # The code generator may make other bytes of the same IR: not stale.
+    state["bytes"] = b"\x7fELF with two instructions swapped"
+    cache._kernel(("k",), make_exe, ())
+    # Other IR under the same key is.
+    state["ir"] = "ir-two"
+    with pytest.raises(aot_cache._StaleEntryError, match="other IR"):
+        cache._kernel(("k",), make_exe, ())
+    # An entry with no IR key is compared by its bytes.
+    state["ir"] = None
+    (sidecar,) = tmp_path.glob("*.json")
+    meta = json.loads(sidecar.read_text())
+    meta["ir"] = None
+    sidecar.write_text(json.dumps(meta))
+    with pytest.raises(aot_cache._StaleEntryError, match="object differs"):
+        cache._kernel(("k",), make_exe, ())
+    state["bytes"] = b"\x7fELF as the code generator made it"
+    cache._kernel(("k",), make_exe, ())
+
+
 def test_preload_and_bad_source_list_under_compile_only(monkeypatch, tmp_path):
     from aiter.ops.flydsl import aot_cache
 
@@ -686,7 +732,7 @@ def test_source_edited_while_its_entry_is_built_is_not_stored(monkeypatch, tmp_p
     cache = aot_cache.FlyDSLAotCache("test_edited_in_build", sources=[src])
     cache._disk_key(("k",), ())
 
-    def export(exe, args, out_dir, sym, libs=None):
+    def export(exe, args, out_dir, sym, libs=None, info=None):
         # The trace imports the kernel's modules; one was edited before that.
         src.write_text("X = 2\n")
         obj = out_dir / f"{sym}.o"
@@ -748,6 +794,16 @@ def test_every_cache_declares_the_kernel_files_its_sources_import():
     assert not missing, "\n".join(
         f"cache {name!r} must also declare sources={files}"
         for name, files in sorted(missing.items())
+    )
+    # And the variables its sources read.
+    unread = {
+        name: names
+        for name, cache in real.items()
+        if (names := aot_cache._undeclared_env(cache._files, cache._env))
+    }
+    assert not unread, "\n".join(
+        f"cache {name!r} must also declare env={names}"
+        for name, names in sorted(unread.items())
     )
 
 
@@ -828,6 +884,44 @@ def test_fingerprint_covers_what_flydsl_keys_its_cache_on():
     assert "LLVM_GFX1250_ANY_XNACK_CODEGEN" in names
     for name in names:
         assert aot_cache._env_in_fingerprint(name), name
+
+
+def test_variable_is_an_input_of_the_caches_that_declare_it(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", lambda *a, **k: _FakeCompiled())
+    for name in ("AITER_FLYDSL_TEST_SWITCH", "AITER_FLYDSL_KERNARG_PRELOAD"):
+        monkeypatch.delenv(name, raising=False)
+    reads = _old_file(
+        tmp_path / "reads.py",
+        'import os\nX = os.environ.get("AITER_FLYDSL_TEST_SWITCH")\n',
+    )
+    declares = aot_cache.FlyDSLAotCache(
+        "test_env_declared", sources=[reads], env=["AITER_FLYDSL_TEST_SWITCH"]
+    )
+    other = aot_cache.FlyDSLAotCache("test_env_other")
+    before = (
+        aot_cache.fingerprint(),
+        declares._disk_key(("k",), ()),
+        other._disk_key(("k",), ()),
+    )
+    # An AITER_FLYDSL_ variable of one kernel is not in the fingerprint: the
+    # cache that declares it misses, no other does.
+    monkeypatch.setenv("AITER_FLYDSL_TEST_SWITCH", "1")
+    assert aot_cache.fingerprint() == before[0]
+    assert declares._disk_key(("k",), ()) != before[1]
+    assert other._disk_key(("k",), ()) == before[2]
+    # A variable the common sources read is an input of every cache.
+    monkeypatch.setenv("AITER_FLYDSL_KERNARG_PRELOAD", "0")
+    assert other._disk_key(("k",), ()) != before[2]
+    # A prebuild of a cache whose sources read a variable it does not declare
+    # fails, and names it.
+    forgets = aot_cache.FlyDSLAotCache("test_env_forgotten", sources=[reads])
+    with pytest.raises(
+        aot_cache._UndeclaredSourceError, match="AITER_FLYDSL_TEST_SWITCH"
+    ):
+        forgets._build(lambda: (lambda: None), (), tmp_path / "c", "s", "d")
+    assert not list((tmp_path / "c").glob("*.o"))
 
 
 def test_common_sources_are_sources_of_every_cache(monkeypatch, tmp_path):

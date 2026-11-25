@@ -163,7 +163,7 @@ An entry is looked up by four things, and by nothing else: the **key**
 (factory arguments, `specialization_key`, `Constexpr` launch arguments), the
 **contents of the declared source files** (`sources=`, the creating file and
 `aot_cache._COMMON_SOURCES`), the **declared variables** (`env=`), and the
-**fingerprint** (FlyDSL, arch, CU count, `AITER_FLYDSL_*` / `FLYDSL_*`).
+**fingerprint** (FlyDSL and its own compile variables, arch, CU count).
 Whatever else the generated code depends on is invisible: change it, and a
 later process loads the old kernel without an error. When you convert or
 review a launcher, look for each of these.
@@ -174,7 +174,8 @@ review a launcher, look for each of these.
 | A module global changed at run time | `kernels_common.FAST_MATH = True` set by a caller or a test | No | Pass the value through the key; do not patch module state |
 | A constant in a file that is not declared | a helper the wrapper (outside `kernels/`) imports; `importlib.import_module(name)`; another installed package | Only an import between two files under `kernels/` (prebuild and unit test raise) | Add the file to `sources=` |
 | A non-Python input read while building | a tuning CSV or JSON the factory reads its tiles from | No | Read it in the wrapper and pass the values as factory arguments, or declare the file in `sources=` |
-| An environment variable that is not `AITER_FLYDSL_*` / `FLYDSL_*` | `os.environ.get("MY_SWITCH")` in a kernel file | No | Add it to `env=`, or read it in the wrapper and pass it in the key |
+| An environment variable a declared file reads | `os.environ.get("AITER_FLYDSL_MY_SWITCH")` in a kernel file | Yes, by a literal name: a prebuild and the unit test raise if it is not in `env=` | Add it to `env=`; if it cannot change generated code, to `aot_cache._ENV_NOT_CODE` |
+| An environment variable read in a file that is not declared, or passed in from a caller | the wrapper reads `MY_SWITCH` and branches in the factory | No | Read it in the wrapper and pass its value as a factory argument |
 | A variable read under a computed name | `os.environ.get(f"AITER_X_{stage}")` | No | Do not do this in kernel code; read it by a literal name |
 | A device property other than arch and CU count | memory size, device name, a driver version | No | Pass it in the key |
 | A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Yes: stored per entry and compared; two values under one key raise | Still put it in `specialization_key` |
@@ -187,9 +188,11 @@ Two more rules that are not about the key:
 - **Only a prebuild writes the cache.** A launch with no entry logs an error
   and traces on the JIT path. So a launcher no replay under
   `aiter/aot/flydsl/` covers never hits: add its shapes to a replay.
-- **Every `AITER_FLYDSL_*` / `FLYDSL_*` variable is in the fingerprint.**
-  Setting one that the prebuild did not have set selects another directory,
-  and every cache misses. Deploy with the variables the wheel was built with.
+- **A variable is an input of the caches that declare it, and of no other.**
+  Setting a variable a kernel's files read (an `AITER_FLYDSL_*` one too) to
+  a value the prebuild did not have makes that kernel's entries miss. The
+  variables the common sources read (`aot_cache._COMMON_ENV`) and FlyDSL's
+  own compile variables apply to every cache.
 
 `AITER_FLYDSL_AOT_CACHE=verify` re-traces every entry a process loads and
 compares it byte for byte, so it finds a stale entry of any kind above, but

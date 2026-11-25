@@ -214,6 +214,11 @@ def get_tune_space():
     sources=[
         "kernels/moe_gemm_2stage/gfx9_fp8",
     ],
+    # Read by gfx9_fp8/common.py.
+    env=[
+        "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+        "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+    ],
 )
 @cache
 def _get_compiled_kernel(
