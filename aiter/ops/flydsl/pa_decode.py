@@ -335,7 +335,7 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
-        **({"quant_mx": True, "store_output": store_output} if quant_mx else {}),
+        **({"quant_dtype": "mxfp8", "store_output": store_output} if quant_mx else {}),
     )
     sink_ptr = (
         flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
@@ -1588,11 +1588,13 @@ def pa_decode(
             cluster_steps=cluster_steps,
             cluster_runs=cluster_runs,
             **(
-                {"quant_output": True, "store_output": store_output}
+                {
+                    "quant_dtype": "mxfp8" if quant_mx else "fp8",
+                    "store_output": store_output,
+                }
                 if quant_output
                 else {}
             ),
-            **({"quant_mx": True} if quant_output and quant_mx else {}),
         )
 
     total_rows = query_length * query_group_size

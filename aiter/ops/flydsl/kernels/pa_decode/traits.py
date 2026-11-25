@@ -1519,13 +1519,12 @@ class Gfx1250Traits:
     # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
     # partials at slot sequence * cluster_merge + part.
     cluster_runs: bool = False
-    # Emit OCP FP8 plus one FP32 descale per logical query token.
-    quant_output: bool = False
-    # With quant_output, False drops the BF16/FP16 store of the final output.
+    # Quantized final output: "fp8" emits OCP FP8 with one FP32 descale per
+    # logical query token, "mxfp8" with one E8M0 scale per 32 elements
+    # (group-local, no LDS).
+    quant_dtype: str | None = None
+    # With quant_dtype, False drops the BF16/FP16 store of the final output.
     store_output: bool = True
-    # With quant_output, MXFP8 (E8M0 scale per 32 elements, group-local, no
-    # LDS) instead of one FP32 descale per token.
-    quant_mx: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1676,6 +1675,14 @@ class Gfx1250Traits:
             )
             else 64
         )
+
+    @property
+    def quant_output(self):
+        return self.quant_dtype is not None
+
+    @property
+    def quant_mx(self):
+        return self.quant_dtype == "mxfp8"
 
     @property
     def nvfp4(self):

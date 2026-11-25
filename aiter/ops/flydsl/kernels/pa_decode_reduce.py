@@ -59,7 +59,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
-    quant_mx: bool = False,
+    quant_dtype: str | None = None,
     store_output: bool = True,
 ):
     """Build PA decode's partitioned-softmax reducer.
@@ -94,10 +94,10 @@ def compile_pa_decode_ps_reduce(
     Sinks are per-head zero-value logits: include them in the shared maximum
     and add their denominator mass once.
 
-    ``quant_mx`` (gfx1250) also writes the MXFP8 output (``pa_decode.op_mxfp8``)
-    of the rows it reduces, from the values it stores, to the launch's
-    ``quantized`` and ``scales`` (output, FP8 output and scales contiguous).
-    ``store_output=False`` skips the BF16/FP16 store.
+    ``quant_dtype="mxfp8"`` (gfx1250) also writes the MXFP8 output
+    (``pa_decode.op_mxfp8``) of the rows it reduces, from the values it stores,
+    to the launch's ``quantized`` and ``scales`` (output, FP8 output and scales
+    contiguous); ``store_output=False`` then skips the BF16/FP16 store.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
@@ -133,10 +133,16 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
     if num_xcds < 0:
         raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
-    if quant_mx and architecture not in ("gfx1250", "gfx1250-strict"):
+    quant_mx = quant_dtype == "mxfp8"
+    if quant_dtype is not None and not (
+        quant_mx and architecture in ("gfx1250", "gfx1250-strict")
+    ):
         raise NotImplementedError(
-            f"The reducer's MXFP8 output requires gfx1250, not {architecture}"
+            "The reducer's only quantized output is mxfp8, on gfx1250: got "
+            f"{quant_dtype!r} on {architecture}"
         )
+    if not (store_output or quant_mx):
+        raise ValueError("store_output=False requires quant_dtype")
 
     output_dtype = _FX_ELEM[output_dtype_str]
     logits_dtype = _FX_ELEM[logits_dtype_str]

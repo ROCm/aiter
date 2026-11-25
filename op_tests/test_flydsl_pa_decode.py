@@ -295,7 +295,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             query_group_size=rows,
             pairs=pairs,
             parallel_groups=groups,
-            **({"quant_mx": True} if mxfp8 else {}),
+            **({"quant_dtype": "mxfp8"} if mxfp8 else {}),
         )
         out = torch.full(
             (len(counts), 1, kv_heads, rows, head_size),
@@ -2857,6 +2857,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
     stops fusing fails here.
     """
     fused, mx = case["quant"] == "fused", case.get("mx", False)
+    tile_quant = ("mxfp8" if mx else "fp8") if fused else None
     rows = output.shape[0]
     fp8 = torch.empty(
         (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device
@@ -2900,8 +2901,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
 
     for store_output in (True, False):
         run(store_output)
-        assert compile_kwargs[-1].get("quant_output", False) == fused
-        assert compile_kwargs[-1].get("quant_mx", False) == (fused and mx)
+        assert compile_kwargs[-1].get("quant_dtype") == tile_quant
         check(store_output)
     if case["capture"]:
         stream = torch.cuda.Stream()

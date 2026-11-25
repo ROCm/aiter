@@ -158,9 +158,8 @@ def _pa_decode_tile_kernel_name(
     stage_pages=0,
     merge_partitions=False,
     cluster_merge=0,
-    quant_output=False,
+    quant_dtype=None,
     store_output=True,
-    quant_mx=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -183,8 +182,8 @@ def _pa_decode_tile_kernel_name(
         name += "_merge"
     if cluster_merge:
         name += f"_cluster{cluster_merge}"
-    if quant_output:
-        tag = "_mxfp8" if quant_mx else "_quant"
+    if quant_dtype:
+        tag = "_mxfp8" if quant_dtype == "mxfp8" else "_quant"
         name += tag if store_output else f"{tag}only"
     return name
 
@@ -218,10 +217,9 @@ def compile_pa_decode_tile(
     cluster_seqs: int = 1,
     cluster_steps: bool = False,
     cluster_runs: bool = False,
-    quant_output: bool = False,
+    quant_dtype: str | None = None,
     store_output: bool = True,
     kv_scale_dtype: torch.dtype | None = None,
-    quant_mx: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -233,12 +231,15 @@ def compile_pa_decode_tile(
     ``kv_scale_dtype=torch.float8_e4m3fn`` with an fp4x2/uint8 ``kv_dtype`` selects
     NVFP4 (gfx1250 only): E4M3 block scales of 16 values instead of MXFP4's E8M0
     of 32.
-    ``quant_mx`` (with ``quant_output``) writes the MXFP8 output (``op_mxfp8``)
-    instead of the per-token FP8 one. Only the NVFP4 wave tile has it, in every
-    output mode that writes final rows: direct, last-arriver and cluster
-    merges, clusters shared by several sequences and query-split tiles included.
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
+
+    ``quant_dtype`` (gfx1250) is a format tag, not a torch dtype: it adds a
+    quantized final output, ``"fp8"`` the per-token one and ``"mxfp8"`` the
+    MXFP8 one (``op_mxfp8``). Only the NVFP4 wave tile has the latter, in every
+    output mode that writes final rows: direct, last-arriver and cluster
+    merges, clusters shared by several sequences and query-split tiles
+    included. ``store_output=False`` then drops the BF16/FP16 store.
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
@@ -339,9 +340,8 @@ def compile_pa_decode_tile(
                 cluster_seqs=cluster_seqs,
                 cluster_steps=cluster_steps,
                 cluster_runs=cluster_runs,
-                quant_output=quant_output,
+                quant_dtype=quant_dtype,
                 store_output=store_output,
-                quant_mx=quant_mx,
             )
         )
     if nvfp4:
@@ -350,9 +350,9 @@ def compile_pa_decode_tile(
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
-    if cluster_merge or quant_output or not store_output:
+    if cluster_merge or quant_dtype is not None or not store_output:
         raise NotImplementedError(
-            "cluster_merge, quant_output and a skipped store require gfx1250"
+            "cluster_merge, quant_dtype and a skipped store require gfx1250"
         )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -904,9 +904,8 @@ def gfx1250_tile_traits(
     cluster_seqs: int = 1,
     cluster_steps: bool = False,
     cluster_runs: bool = False,
-    quant_output: bool = False,
+    quant_dtype: str | None = None,
     store_output: bool = True,
-    quant_mx: bool = False,
 ) -> Gfx1250Traits:
     """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
@@ -981,9 +980,8 @@ def gfx1250_tile_traits(
         latency_grid=one_cta_grid and compute_dtype != "nvfp4",
         cluster_steps=cluster_steps,
         cluster_runs=cluster_runs,
-        quant_output=quant_output,
+        quant_dtype=quant_dtype,
         store_output=store_output,
-        quant_mx=quant_mx,
     )
 
 
@@ -1056,13 +1054,15 @@ def compile_gfx1250_pa_decode(t):
             f"{CLUSTER_PARTITIONS} CTAs over page16 decode rows without a "
             f"sliding window and {CLUSTER_STEP_TOKENS}-token steps"
         )
+    if t.quant_dtype not in (None, "fp8", "mxfp8"):
+        raise ValueError(f"Unsupported gfx1250 PA quant dtype: {t.quant_dtype!r}")
     if t.quant_mx:
         # A sequence of one task stores from its pipeline's registers, and only
         # the NVFP4 wave tile holds whole 32-dim groups a wave there.
-        if not (t.quant_output and t.nvfp4 and (t.direct_output or t.merged_output)):
+        if not (t.nvfp4 and (t.direct_output or t.merged_output)):
             raise ValueError(
-                "quant_mx requires quant_output, NVFP4 K/V and an output mode "
-                "that writes final rows"
+                'quant_dtype "mxfp8" requires NVFP4 K/V and an output mode that '
+                "writes final rows"
             )
     elif t.quant_output and (
         not (t.direct_output or t.cluster_merge)
@@ -1071,11 +1071,11 @@ def compile_gfx1250_pa_decode(t):
         or t.cluster_seqs != 1
     ):
         raise ValueError(
-            "quant_output requires the direct or cluster_merge output, one "
+            'quant_dtype "fp8" requires the direct or cluster_merge output, one '
             "query split and one sequence per cluster"
         )
     if not (t.store_output or t.quant_output):
-        raise ValueError("store_output=False requires quant_output")
+        raise ValueError("store_output=False requires quant_dtype")
     if t.total_bytes > 327680:
         raise NotImplementedError(
             "gfx1250 PA decode query/KV tiles exceed LDS capacity"
@@ -1101,9 +1101,8 @@ def compile_gfx1250_pa_decode(t):
         direct_output=t.direct_output,
         merge_partitions=t.merge_partitions,
         cluster_merge=t.cluster_merge,
-        quant_output=t.quant_output,
+        quant_dtype=t.quant_dtype,
         store_output=t.store_output,
-        quant_mx=t.quant_mx,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
