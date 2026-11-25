@@ -11,6 +11,7 @@ import flydsl.expr as fx
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .dpp_utils import dpp_xor_f32
+from .pa_decode.op_mxfp8 import GROUP, MxFp8Groups, lane_masks
 from .tensor_shim import (
     _FX_ELEM,
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -58,6 +59,8 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    quant_mx: bool = False,
+    store_output: bool = True,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -90,6 +93,11 @@ def compile_pa_decode_ps_reduce(
     batch * (rows * KV heads)**2 <= 2**30.
     Sinks are per-head zero-value logits: include them in the shared maximum
     and add their denominator mass once.
+
+    ``quant_mx`` (gfx1250) also writes the MXFP8 output (``pa_decode.op_mxfp8``)
+    of the rows it reduces, from the values it stores; the kernel then takes the
+    FP8 and E8M0 scale pointers in place of the sink pointer (output, FP8 output
+    and scales contiguous). ``store_output=False`` skips the BF16/FP16 store.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
@@ -125,6 +133,15 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
     if num_xcds < 0:
         raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
+    if not (store_output or quant_mx):
+        raise ValueError("store_output=False requires quant_mx")
+    if quant_mx and (
+        architecture not in ("gfx1250", "gfx1250-strict")
+        or use_sinks
+        or GROUP % elems
+        or head_size % GROUP
+    ):
+        raise ValueError("quant_mx takes gfx1250, no sinks and whole 32-element groups")
 
     output_dtype = _FX_ELEM[output_dtype_str]
     logits_dtype = _FX_ELEM[logits_dtype_str]
@@ -196,6 +213,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if quant_mx:
+        kernel_name += "_mxfp8" if store_output else "_mxfp8only"
 
     @flyc.jit
     def _pa_decode_reduce_body(
@@ -219,6 +238,8 @@ def compile_pa_decode_ps_reduce(
         num_ctas: fx.Int32,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        quantized_ptr,
+        scale_ptr,
     ):
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
@@ -327,11 +348,18 @@ def compile_pa_decode_ps_reduce(
         def _store(acc, unit):
             # Output rows need only element alignment, so pairs store scalars.
             offset = output_base + unit * fx.Int32(elems)
-            if fx.const_expr(pairs):
-                output[offset] = acc[0].to(output_dtype)
-                output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
-            else:
-                output[offset] = acc.to(output_dtype)
+            if fx.const_expr(store_output):
+                if fx.const_expr(pairs):
+                    output[offset] = acc[0].to(output_dtype)
+                    output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
+                else:
+                    output[offset] = acc.to(output_dtype)
+            if fx.const_expr(quant_mx):
+                # A group is GROUP / elems adjacent lanes of one wave; callers
+                # store whole waves.
+                MxFp8Groups(quantized_ptr, scale_ptr).store(
+                    [acc.to(output_dtype)], [offset], lane_masks(GROUP // elems), wave
+                )
 
         def _lane_stats(chunk):
             # Lane l owns partition l + wave * chunk; part_count <= NP.
@@ -677,6 +705,8 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                None,
+                None,
             )
 
         def _reduce_args(
@@ -724,6 +754,63 @@ def compile_pa_decode_ps_reduce(
                 seq_magic,
             )
 
+    elif quant_mx:
+        # Without sinks (refused above) the sink pointer's slot takes the FP8
+        # and scale pointers, so every argument still preloads (a scale
+        # pointer past 120 bytes cost an s_load before the last store).
+
+        @flyc.kernel(name=kernel_name, known_block_size=block)
+        def pa_decode_reduce_kernel(
+            output_ptr: fx.Pointer,
+            exp_sums_ptr: fx.Pointer,
+            max_logits_ptr: fx.Pointer,
+            logits_ptr: fx.Pointer,
+            quantized_ptr: fx.Pointer,
+            scale_ptr: fx.Pointer,
+            stride_output_bs: fx.Int32,
+            stride_output_len: fx.Int32,
+            stride_output_kv_head: fx.Int32,
+            stride_output_group_size: fx.Int32,
+            stride_exp_sums_head: fx.Int32,
+            stride_exp_sums_part: fx.Int32,
+            stride_logits_head: fx.Int32,
+            stride_logits_part: fx.Int32,
+            stride_logits_group: fx.Int32,
+            reduce_info_ptr: fx.Pointer,
+            query_rows: fx.Int32,
+            num_kv_heads: fx.Int32,
+            num_ctas: fx.Int32,
+            rows_magic: fx.Int32,
+            seq_magic: fx.Int32,
+        ):
+            _pa_decode_reduce_body(
+                output_ptr,
+                exp_sums_ptr,
+                max_logits_ptr,
+                logits_ptr,
+                None,
+                stride_output_bs,
+                stride_output_len,
+                stride_output_kv_head,
+                stride_output_group_size,
+                stride_exp_sums_head,
+                stride_exp_sums_part,
+                stride_logits_head,
+                stride_logits_part,
+                stride_logits_group,
+                reduce_info_ptr,
+                query_rows,
+                num_kv_heads,
+                num_ctas,
+                rows_magic,
+                seq_magic,
+                quantized_ptr,
+                scale_ptr,
+            )
+
+        def _reduce_args(output, exp_sums, max_logits, logits, sink, *rest):
+            return (output, exp_sums, max_logits, logits, sink, *rest)
+
     else:
 
         @flyc.kernel(name=kernel_name, known_block_size=block)
@@ -770,6 +857,8 @@ def compile_pa_decode_ps_reduce(
                 num_ctas,
                 rows_magic,
                 seq_magic,
+                None,
+                None,
             )
 
         def _reduce_args(*args):
@@ -797,34 +886,38 @@ def compile_pa_decode_ps_reduce(
         reduce_info: fx.Pointer,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        quantized: fx.Pointer,
+        scales: fx.Pointer,
         stream: fx.Stream,
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
-        pa_decode_reduce_kernel(
-            *_reduce_args(
-                output,
-                exp_sums,
-                max_logits,
-                logits,
-                sink_token,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                reduce_info,
-                query_rows,
-                num_kv_heads,
-                num_ctas,
-                rows_magic,
-                seq_magic,
-            )
-        ).launch(
+        args = _reduce_args(
+            output,
+            exp_sums,
+            max_logits,
+            logits,
+            sink_token,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            reduce_info,
+            query_rows,
+            num_kv_heads,
+            num_ctas,
+            rows_magic,
+            seq_magic,
+        )
+        if fx.const_expr(quant_mx):
+            # The MXFP8 kernel's pointers take the sink slot.
+            args = (*args[:4], quantized, scales, *args[5:])
+        pa_decode_reduce_kernel(*args).launch(
             grid=(
                 (num_ctas, 1, 1)
                 if num_xcds > 0
