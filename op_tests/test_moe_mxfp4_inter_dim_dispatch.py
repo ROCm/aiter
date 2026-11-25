@@ -293,17 +293,37 @@ def test_a16w4_flydsl_tuned_row_is_kept_for_plain_calls(monkeypatch, block_size_
 
 @_SKIP
 @pytest.mark.parametrize(
-    ("call", "want_bias"),
+    ("call", "want_bias", "want_backend"),
     [
-        ({"has_stage1_bias": True}, (True, False)),
-        ({"has_stage2_bias": True}, (False, True)),
+        ({"has_stage1_bias": True}, (True, False), ("cktile", "cktile")),
+        ({"has_stage2_bias": True}, (False, True), ("cktile", "cktile")),
         (
             {"gate_mode": GateMode.INTERLEAVE, "gate_up_interleave": True},
             (False, False),
+            ("cktile", "cktile"),
         ),
-        ({"gate_mode": GateMode.INTERLEAVE}, (False, False)),
-        ({"gate_up_interleave": True}, (False, False)),
-        ({"has_stage1_bias": True, "block_size_M": 32}, (True, False)),
+        ({"gate_mode": GateMode.INTERLEAVE}, (False, False), ("cktile", "cktile")),
+        ({"gate_up_interleave": True}, (False, False), ("cktile", "cktile")),
+        (
+            {"has_stage1_bias": True, "block_size_M": 32},
+            (True, False),
+            ("cktile", "cktile"),
+        ),
+        # The a16w4 stage 1 launches with w_layout="standard" and no bias
+        # argument for every activation, so non-Swiglu callers discard too.
+        # Each keeps the default route it had without a row (the SiTUv2
+        # default is FlyDSL with default block_m and no bias in the metadata;
+        # the kernel-name assertion distinguishes the discard from a kept row).
+        (
+            {"activation": ActivationType.Situv2, "has_stage1_bias": True},
+            (False, False),
+            ("flydsl", "flydsl"),
+        ),
+        (
+            {"activation": ActivationType.Silu, "gate_up_interleave": True},
+            (False, False),
+            ("ck_moe_stage1", "ck_moe_stage2_fwd"),
+        ),
     ],
     ids=[
         "bias1",
@@ -312,17 +332,18 @@ def test_a16w4_flydsl_tuned_row_is_kept_for_plain_calls(monkeypatch, block_size_
         "interleave-mode-only",
         "interleave-tag-only",
         "bias1-and-override",
+        "situv2-bias1",
+        "silu-interleave",
     ],
 )
 def test_a16w4_flydsl_tuned_row_is_discarded_for_bias_or_interleave(
-    monkeypatch, call, want_bias
+    monkeypatch, call, want_bias, want_backend
 ):
     meta, discarded = _dispatch_tuned(monkeypatch, A16W4_ROW, **call)
     assert len(discarded) == 1
-    assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == (
-        "cktile",
-        "cktile",
-    )
+    assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == want_backend
+    stage1_kn = getattr(meta.stage1, "keywords", {}).get("kernelName", "")
+    assert stage1_kn != A16W4_ROW["kernelName1"]
     assert (meta.has_bias, meta.stage2_has_bias) == want_bias
 
 
@@ -330,17 +351,15 @@ def test_a16w4_flydsl_tuned_row_is_discarded_for_bias_or_interleave(
 @pytest.mark.parametrize(
     ("row", "activation", "q_dtype_a", "call"),
     [
-        (A16W4_ROW, ActivationType.Situv2, dtypes.bf16, {"has_stage1_bias": True}),
         (A4W4_ROW, ActivationType.Swiglu, dtypes.fp4x2, {"has_stage1_bias": True}),
         (A4W4_ROW, ActivationType.Swiglu, dtypes.fp4x2, {"block_size_M": 16}),
     ],
     ids=[
-        "situv2-a16w4-bias",
         "swiglu-a4w4-bias",
         "swiglu-a4w4-block",
     ],
 )
-def test_flydsl_tuned_row_outside_swiglu_a16w4_is_kept(
+def test_flydsl_tuned_row_outside_guarded_a16w4_prefix_is_kept(
     monkeypatch, row, activation, q_dtype_a, call
 ):
     meta, discarded = _dispatch_tuned(
@@ -635,11 +654,27 @@ def test_fallback_cross_activation_match_validates_block_size(
 
     # A SiTUv2 call at the tuned Swiglu key (token=16, H=6144, I=1536, E=129,
     # topk=5, block_m=16) matches only through the fallback map.
+    meta, discarded = _fallback_lookup(
+        monkeypatch, 16, ActivationType.Situv2, block_size_M=block_size_M
+    )
+    assert len(discarded) == want_discards, f"discards: {discarded}"
+    if want_discards:
+        assert "block_size_M=32" in discarded[0]
+    else:
+        assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == (
+            "flydsl",
+            "flydsl",
+        )
+        assert meta.block_m == 16
+
+
+def _fallback_lookup(monkeypatch, token, activation, **kwargs):
+    """Look up the tuned a16w4 key for `token` after the tables are loaded."""
     warnings = _collect_warnings(monkeypatch)
     get_2stage_cfgs.cache_clear()
     try:
         meta = get_2stage_cfgs(
-            16,
+            token,
             6144,
             1536,
             129,
@@ -649,21 +684,41 @@ def test_fallback_cross_activation_match_validates_block_size(
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
-            ActivationType.Situv2,
+            activation,
             False,
             0,
             0,
             is_shuffled=True,
             opus_weights_shuffled=True,
-            block_size_M=block_size_M,
+            **kwargs,
         )
     finally:
         get_2stage_cfgs.cache_clear()
+    return meta, _a16w4_discards(warnings)
 
-    discarded = _a16w4_discards(warnings)
-    assert len(discarded) == want_discards, f"warnings: {warnings}"
+
+# The a16w4 stage 1 launches with w_layout="standard" and no bias argument for
+# every activation, so a cross-activation fallback match must be rejected when
+# the caller's weights are interleaved -- and kept when the layout matches.
+@_SKIP
+@pytest.mark.parametrize(
+    ("call", "want_discards"),
+    [({}, 0), ({"gate_up_interleave": True, "gate_mode": GateMode.INTERLEAVE}, 1)],
+    ids=["plain-kept", "interleave-discarded"],
+)
+def test_fallback_cross_activation_match_validates_layout(
+    monkeypatch, call, want_discards
+):
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    _load_fallback_tables(monkeypatch, "minimax_m3_a16w4_tuned_fmoe.csv")
+
+    # A SiLU call at the tuned Swiglu token-1 key (H=6144, I=1536, E=129,
+    # topk=5) matches only through the fallback map.
+    meta, discarded = _fallback_lookup(monkeypatch, 1, ActivationType.Silu, **call)
+    assert len(discarded) == want_discards, f"discards: {discarded}"
     if want_discards:
-        assert "block_size_M=32" in discarded[0]
+        assert "bias or interleaved" in discarded[0]
     else:
         assert (_stage_backend(meta.stage1), _stage_backend(meta.stage2)) == (
             "flydsl",

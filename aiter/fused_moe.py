@@ -4885,21 +4885,18 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif (
-            kn1.startswith("flydsl_moe1_abf16_")
-            and activation == ActivationType.Swiglu
-            and (
-                has_stage1_bias
-                or has_stage2_bias
-                or gate_mode == GateMode.INTERLEAVE
-                or gate_up_interleave is True
-            )
+        elif kn1.startswith("flydsl_moe1_abf16_") and (
+            has_stage1_bias
+            or has_stage2_bias
+            or gate_mode == GateMode.INTERLEAVE
+            or gate_up_interleave is True
         ):
-            # The a16w4 FlyDSL port ignores per-expert bias and reads W1 in the
-            # standard gate/up layout; neither is part of the row key. CK-Tile
-            # handles both, so these calls keep the route they had without a row.
-            # Restricted to Swiglu to keep existing SiLU/SiTUv2 model dispatch
-            # selections unchanged within this PR's compatibility scope.
+            # The a16w4 FlyDSL stage 1 launches with w_layout="standard" and no
+            # bias argument for every activation (moe_kernels.py), and neither
+            # property is part of the row key, so the check covers every caller
+            # -- including non-Swiglu matches through the activation-disabled
+            # fallback. CK-Tile handles both, so these calls keep the route
+            # they had without a row.
             cfg = None
             logger.warning(
                 "[fused_moe] discarding a16w4 FlyDSL tuned config for a call with "
