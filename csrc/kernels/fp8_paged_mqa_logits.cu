@@ -72,9 +72,13 @@ using u32x4 = __attribute__((__vector_size__(16))) unsigned int;
 __device__ __forceinline__ float relu_fast(float x) { return fmaxf(x, 0.0f); }
 
 __device__ __forceinline__ float swap32_hi(float x) {
+#if defined(__gfx950__)
     float hi;
     asm("s_nop 1\n\tv_permlane32_swap_b32 %0, %1" : "+v"(x), "=&v"(hi));
     return hi;
+#else
+    __builtin_trap(); // v_permlane32_swap_b32 is gfx950-only; only the guarded kernel calls this
+#endif
 }
 
 // K and scale loads from the paged cache. With NT the load is non-temporal: the caches do
@@ -144,6 +148,7 @@ __launch_bounds__(NUM_WARPS* WAVE_SIZE,
                                                             int index_dim,
                                                             int SplitKV)
 {
+#if defined(__gfx950__)
     constexpr int TILE_N = 32;                 // tokens per tile
     constexpr int NACC   = 16;                 // C accumulator floats/lane
     using VecOutMFMA = __attribute__((__vector_size__(NACC * sizeof(float)))) float;
@@ -652,6 +657,12 @@ __launch_bounds__(NUM_WARPS* WAVE_SIZE,
             compute_tile(token_base, vB0, vB1, kv_scale);
         }
     }
+#else
+    // gfx950-only (mfma_scale f8f6f4, v_permlane32_swap, 16-byte buffer-to-LDS loads):
+    // compiled out for the other archs of a multi-arch build; the host wrapper never
+    // launches it there.
+    __builtin_trap();
+#endif
 }
 
 }  // namespace mqa_paged

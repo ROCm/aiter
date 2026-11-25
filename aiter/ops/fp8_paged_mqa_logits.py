@@ -97,6 +97,12 @@ def fp8_paged_mqa_logits(
     context_lens[b, n] for [batch, next_n] ones. The -inf outside it is the
     caller's, exactly as for `deepgemm_fp8_paged_mqa_logits`.
     """
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(
+            f"fp8_paged_mqa_logits (HIP) supports {SUPPORTED_GFX} only, got {gfx}; "
+            "check is_supported() and route other archs to the Triton kernel"
+        )
     if out is None:
         out = torch.empty(
             (q_fp8.shape[0] * q_fp8.shape[1], max_model_len),

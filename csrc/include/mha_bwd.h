@@ -270,6 +270,8 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p44;
     unsigned int split_stride; // 0x2d0: deterministic only, bytes between dq_acc planes
     p3 _p45;
+    unsigned int gqa_ratio_magic_const; // 0x2e0: gqa ratio multiplicative inverse
+    p3 _p46;
 };
 
 struct __attribute__((packed)) fmha_bwd_odo_args
