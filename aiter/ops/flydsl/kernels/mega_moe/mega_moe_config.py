@@ -96,28 +96,9 @@ ROUTE_LARGE_M = "large_m"
 # Single-kernel small-input runtimes: power-of-two capacities up to this bound.
 SMALL_M_MAX_MTPR = 512
 DEFAULT_SMALL_M_MTPRS = (256, 512)
-# Instance capacities the large-input persistent kernel is built for. At 32768
-# the staged path stays: it is faster there, and its source-indexed payload is
-# a fraction of the large-input route-major payload.
+# Instance capacities the large-input persistent kernel is built for, on every fused layout. At 32768 the staged
+# path stays: it is faster there, and its source-indexed payload is a fraction of the large-input route-major payload.
 LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
-# EP4 DeepSeek-V4.1-Flash takes its large-input tune at 8192 and 16384 only: on gfx950 the kernel faults
-# (illegal memory access) at 1024, 2048 and 4096.
-V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
-# EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
-V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
-# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, serves every large-input capacity: the fault once
-# seen at 1024 came from another process's kernels sharing the GPUs (the persistent kernels need the whole grid
-# resident); on exclusive GPUs 1024, 2048 and 4096 run clean.
-V41_FLASH_EP8_LARGE_M_MTPRS = LARGE_M_MTPRS
-# (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
-_V41_FLASH_LARGE_M_MTPRS = {
-    (world, model_dim, inter_dim): mtprs
-    for (world, _, model_dim, inter_dim), mtprs in (
-        (V41_FLASH_EP4_LAYOUT, V41_FLASH_EP4_LARGE_M_MTPRS),
-        (V41_FLASH_EP2_LAYOUT, V41_FLASH_EP2_LARGE_M_MTPRS),
-        (V41_FLASH_EP8_LAYOUT, V41_FLASH_EP8_LARGE_M_MTPRS),
-    )
-}
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
@@ -496,8 +477,8 @@ def fused_layout_supported(
 ) -> bool:
     """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a FUSED_QUANTS quant on gfx950.
 
-    The small-input kernel serves every such layout; the large-input kernel the
-    capacities large_m_mtprs_for() gives it.
+    The small-input kernel serves every such layout up to SMALL_M_MAX_MTPR rows a
+    rank on 256-CU parts, the large-input kernel the capacities in LARGE_M_MTPRS.
     """
     return (
         arch.split(":", 1)[0] == "gfx950"
@@ -506,20 +487,6 @@ def fused_layout_supported(
         and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
-    )
-
-
-def large_m_mtprs_for(
-    *, world_size: int, model_dim: int, inter_dim: int
-) -> tuple[int, ...]:
-    """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
-
-    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
-    capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
-    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
-    """
-    return _V41_FLASH_LARGE_M_MTPRS.get(
-        (world_size, model_dim, inter_dim), LARGE_M_MTPRS
     )
 
 
@@ -1602,11 +1569,10 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP4 DeepSeek-V4.1-Flash large-input kernel (96 experts per rank), measured on gfx950 at MTPR 8192.
 
-    It serves 8192 and 16384 (V41_FLASH_EP4_LARGE_M_MTPRS) unchanged: the thresholds below are rows a rank of the launch
-    (payload_small_tokens, presend_rows, the early_p_mid bound) and the payload geometry is sized by the plan, so a
-    launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
+    It serves every large-input capacity (LARGE_M_MTPRS) unchanged: the thresholds below are rows a rank of the
+    launch (payload_small_tokens, presend_rows, the early_p_mid bound) and the payload geometry is sized by the plan,
+    so a launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
     buckets, row stamps, P2P rows), all inside the 32-bit buffer offsets up to 16384 (LargeMRuntime checks them).
-    At 1024, 2048 and 4096 the kernel faults with an illegal memory access on gfx950, so those stay staged.
 
     Knob meanings: FusedStage1Knobs / FusedStage2Knobs; the measurements behind each choice are in the PR.
     """
@@ -1687,7 +1653,9 @@ def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 
 
 def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
-    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384."""
+    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384;
+    it serves every large-input capacity (LARGE_M_MTPRS) unchanged, as the EP4 tune does.
+    """
     # The EP4 tune with 96 producer CTAs (the EP4 rule's 3 64-expert waves are more than the CUs); its schedule
     # knobs stay, as the uniform-routing alternatives lose under skewed routing.
     config = _tune_v41_flash_ep4_large(config)
@@ -1737,8 +1705,7 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
-    uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity, 1024..16384
-    (V41_FLASH_EP8_LARGE_M_MTPRS), unchanged.
+    uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity (LARGE_M_MTPRS) unchanged.
 
     The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
     per-token combine wait; the measurements are in the PR.
@@ -2005,10 +1972,7 @@ def select_fused_config(
         raise ValueError(f"quant={quant!r} must be one of {FUSED_QUANTS}")
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    large_mtprs = large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
-    )
-    if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:
+    if mtpr > SMALL_M_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if not 0 <= tokens <= mtpr:
         raise ValueError(f"tokens={tokens} must be in [0, {mtpr}]")

@@ -31,7 +31,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     FusedStage2Knobs,
     build_mega_moe_bundle_plan,
     fused_layout_supported,
-    large_m_mtprs_for,
+    large_m_buckets,
     select_fused_config,
     small_m_cu_supported,
     small_m_mtprs_for,
@@ -162,43 +162,30 @@ def test_route_exclusions():
     )
 
 
-def test_large_m_capacities_per_layout():
-    shape = {"world_size": 8, "model_dim": 7168, "inter_dim": 3072}
-    assert large_m_mtprs_for(**shape) == LARGE_M_MTPRS
-    # EP4 V4.1-Flash: 8192 and 16384 (it faults at 1024..4096), both with the tune measured at 8192.
-    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == (
-        8192,
-        16384,
-    )
-    tuned = _knob_table(select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE))
-    for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
-        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
-            assert (
-                _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP4_SHAPE))
-                == tuned
-            ), (mtpr, tokens)
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+@pytest.mark.parametrize(
+    "layout", ("v4_pro_ep8", "v41_flash_ep8", "v41_flash_ep4", "v41_flash_ep2")
+)
+def test_large_m_capacities_share_one_tune(layout, quant):
+    """Every layout builds the large-input kernel at every LARGE_M_MTPRS capacity, each launching at a token bucket
+    the config the capacity of 16384 launches there (its tunes measured at 8192 / 16384 carry over unchanged).
+    """
+    shape = _ROUTED_LAYOUTS[layout]
+    for mtpr in LARGE_M_MTPRS:
+        for bucket in large_m_buckets(mtpr):
+            assert select_fused_config(
+                bucket, mtpr, quant=quant, **shape
+            ) == select_fused_config(bucket, 16384, quant=quant, **shape), (
+                mtpr,
+                bucket,
+            )
     with pytest.raises(ValueError):
-        select_fused_config(32768, 32768, **V41_FLASH_EP4_SHAPE)
-    # EP2 V4.1-Flash: 8192 and 16384, one tune.
-    assert large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304) == (
-        8192,
-        16384,
-    )
-    tuned = _knob_table(select_fused_config(8192, 8192, **V41_FLASH_EP2_SHAPE))
-    for mtpr in (8192, 16384):
-        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
-            assert (
-                _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP2_SHAPE))
-                == tuned
-            ), (mtpr, tokens)
-    for mtpr in (1024, 2048, 4096, 32768):
-        with pytest.raises(ValueError):
-            select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
+        select_fused_config(32768, 32768, quant=quant, **shape)
 
 
 @pytest.mark.parametrize("mtpr", MTPRS)
 def test_ep4_route_for_every_max_tokens(mtpr):
-    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at its large capacities."""
+    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input beyond at every large capacity."""
     plan = build_mega_moe_bundle_plan(
         mtpr,
         experts_per_rank=96,
@@ -206,9 +193,8 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         inter_dim=2304,
         world_size=4,
         small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
-        large_m=mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304),
+        large_m=mtpr in LARGE_M_MTPRS,
     )
-    assert plan.large_m == (mtpr in (8192, 16384))
     for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
         if not 0 <= max_tokens <= mtpr:
             continue
@@ -242,9 +228,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout, quant):
     a_dtype = "fp4" if quant == "a4w4" else "fp8"
     # Packed FP4 payload rows hold two values a byte.
     row_bytes = model_dim // 2 if a_dtype == "fp4" else model_dim
-    for mtpr in large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
-    ):
+    for mtpr in LARGE_M_MTPRS:
         config = select_fused_config(
             mtpr,
             mtpr,
@@ -300,8 +284,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout, quant):
 
 @pytest.mark.parametrize("mtpr", MTPRS)
 def test_v41ep8_route_for_every_max_tokens(mtpr):
-    """EP8 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at its large capacities."""
-    large = large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304)
+    """EP8 V4.1-Flash: small-input up to 512 rows a rank, large-input beyond at every large capacity."""
     plan = build_mega_moe_bundle_plan(
         mtpr,
         experts_per_rank=48,
@@ -309,9 +292,8 @@ def test_v41ep8_route_for_every_max_tokens(mtpr):
         inter_dim=2304,
         world_size=8,
         small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
-        large_m=mtpr in large,
+        large_m=mtpr in LARGE_M_MTPRS,
     )
-    assert plan.large_m == (mtpr in large)
     for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
         if not 0 <= max_tokens <= mtpr:
             continue
@@ -529,26 +511,6 @@ def test_v41ep8_fused_configs_unchanged():
     assert digest == _V41EP8_FUSED_DIGEST, table
 
 
-def test_v41ep8_large_m_capacities():
-    """EP8 V4.1-Flash: every large-input capacity, each with the tune measured at 16384."""
-    assert large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304) == (
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-    )
-    tuned = _knob_table(select_fused_config(16384, 16384, **V41_FLASH_EP8_SHAPE))
-    with pytest.raises(ValueError):
-        select_fused_config(32768, 32768, **V41_FLASH_EP8_SHAPE)
-    for mtpr in (1024, 2048, 4096, 8192, 16384):
-        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
-            assert (
-                _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP8_SHAPE))
-                == tuned
-            ), (mtpr, tokens)
-
-
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("mtpr", (256, 512))
 def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
@@ -661,16 +623,15 @@ def test_route_payload_sharing():
     for mtpr in DEFAULT_SMALL_M_MTPRS:
         assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
-    for mtpr in large_m_mtprs_for(world_size=8, model_dim=7168, inter_dim=3072):
+    for mtpr in LARGE_M_MTPRS:
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
-    for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
     # EP8 V4.1-Flash takes EP4's tok_done (its small-input runtime keeps its own payload) but not its
     # comb_tok_wait (the large-input runtime shares the instance's payload arena).
     ep8f = dict(ep8, model_dim=5120, inter_dim=2304)
     for mtpr in DEFAULT_SMALL_M_MTPRS:
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
-    for mtpr in large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304):
+    for mtpr in LARGE_M_MTPRS:
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
 
 
@@ -708,7 +669,7 @@ def test_ep2_large_m_config():
     """EP2 V4.1-Flash large-input kernel: producers below the CU count and split over the 2 destinations, and a
     batched dispatch, whose token-scale reads are bounded by the scale buffer (they fault otherwise).
     """
-    for mtpr in (8192, 16384):
+    for mtpr in LARGE_M_MTPRS:
         config = select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
         assert 0 < config.stage1.num_dispatch_cu < 256
         assert config.stage1.num_dispatch_cu % 2 == 0
@@ -716,7 +677,7 @@ def test_ep2_large_m_config():
     # EP4 and EP8 V4.1-Flash (whose tune builds on EP4's) batch their rows too, so their reads are bounded as well
     # (batched reads always are); EP8 V4-Pro does not batch them.
     for shape in (V41_FLASH_EP4_SHAPE, V41_FLASH_EP8_SHAPE):
-        for mtpr in (8192, 16384):
+        for mtpr in LARGE_M_MTPRS:
             knobs = select_fused_config(mtpr, mtpr, **shape).fused_stage1
             assert knobs.batch_rows
     assert not select_fused_config(8192, 8192).fused_stage1.batch_rows
@@ -755,13 +716,13 @@ def test_ep2_routes_keep_their_own_payload():
     }
     for mtpr in DEFAULT_SMALL_M_MTPRS:
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep2)
-    for mtpr in large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304):
+    for mtpr in LARGE_M_MTPRS:
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep2)
 
 
 @pytest.mark.parametrize("mtpr", MTPRS)
 def test_ep2_route_for_every_max_tokens(mtpr):
-    """EP2 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at 8192 and 16384."""
+    """EP2 V4.1-Flash: small-input up to 512 rows a rank, large-input beyond at every large capacity."""
     plan = build_mega_moe_bundle_plan(
         mtpr,
         experts_per_rank=192,
@@ -769,9 +730,8 @@ def test_ep2_route_for_every_max_tokens(mtpr):
         inter_dim=2304,
         world_size=2,
         small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
-        large_m=mtpr in large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304),
+        large_m=mtpr in LARGE_M_MTPRS,
     )
-    assert plan.large_m == (mtpr in (8192, 16384))
     for max_tokens in sorted({0, 1, 256, 257, 512, 513, 1024, mtpr - 1, mtpr}):
         if not 0 <= max_tokens <= mtpr:
             continue
@@ -820,13 +780,13 @@ _ROUTED_LAYOUTS = {
 }
 
 
-@pytest.mark.parametrize("mtpr", (128, 8192, 16384))
+@pytest.mark.parametrize("mtpr", (128, 1024, 4096, 8192, 16384))
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_routed_instance_routes(layout, quant, mtpr):
     """A routed instance (built offline, as the AOT replay does) serves up to 512 rows a rank through the
-    small-input route and, at a large-input capacity of its layout, the larger calls through the large-input route,
-    for both quants. The A4W4 fused routes send FP4 payload rows and write an FP8 GEMM1 output, which the shared
+    small-input route and, at a large-input capacity, the larger calls through the large-input route, for both
+    quants. The A4W4 fused routes send FP4 payload rows and write an FP8 GEMM1 output, which the shared
     GEMM1-output arena must hold (the staged A4W4 route writes FP4)."""
     import torch
 
@@ -863,9 +823,7 @@ def test_routed_instance_routes(layout, quant, mtpr):
     plan = moe._bundle_plan
     small = small_m_mtprs_for(mtpr)
     assert plan.small_m_mtprs == small
-    large = mtpr in large_m_mtprs_for(
-        world_size=world, model_dim=model_dim, inter_dim=inter_dim
-    )
+    large = mtpr in LARGE_M_MTPRS
     assert plan.large_m == large == (moe._large_m is not None)
     assert large == (mtpr != 128)
     row_bytes = model_dim // 2 if quant == "a4w4" else model_dim
@@ -932,10 +890,8 @@ def test_routed_instance_routes(layout, quant, mtpr):
         if max_tokens <= small[-1]:
             assert route == ROUTE_SMALL_M, max_tokens
             assert capacity == min(m for m in small if m >= max_tokens)
-        elif large:
-            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
         else:
-            assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
+            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
 
 
 @pytest.mark.parametrize("mtpr", LARGE_M_MTPRS)
@@ -954,10 +910,6 @@ def test_large_m_a4w4_config_geometry(layout, mtpr):
     shape = _ROUTED_LAYOUTS[layout]
     world, epr = shape["world_size"], shape["experts_per_rank"]
     model_dim, inter_dim = shape["model_dim"], shape["inter_dim"]
-    if mtpr not in large_m_mtprs_for(
-        world_size=world, model_dim=model_dim, inter_dim=inter_dim
-    ):
-        pytest.skip(f"{layout} serves capacity {mtpr} through the staged route")
     fused = {
         "world_size": world,
         "model_dim": model_dim,
@@ -1020,8 +972,6 @@ _FUSED_SHAPES = ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE, V41_FLASH_EP8_SHA
 
 
 def test_large_m_buckets():
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_buckets
-
     assert large_m_buckets(1024) == (512, 1024)
     assert large_m_buckets(16384) == (512, 1024, 2048, 4096, 8192, 16384)
 
@@ -1032,18 +982,9 @@ def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
     """A large-input call launches the config of its EP-wide max_tokens; the runtime's buffers and the routes'
     shared storage follow the capacity's config, so every bucket keeps its runtime knobs. A8W4 runs one config
     per capacity."""
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-        large_m_buckets,
-        large_m_mtprs_for,
-        large_m_runtime_knobs,
-    )
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_runtime_knobs
 
-    dims = {
-        "world_size": shape.get("world_size", 8),
-        "model_dim": shape.get("model_dim", 7168),
-        "inter_dim": shape.get("inter_dim", 3072),
-    }
-    for mtpr in large_m_mtprs_for(**dims):
+    for mtpr in LARGE_M_MTPRS:
         capacity = select_fused_config(mtpr, mtpr, quant=quant, **shape)
         for bucket in large_m_buckets(mtpr):
             config = select_fused_config(bucket, mtpr, quant=quant, **shape)
@@ -1065,8 +1006,15 @@ def test_small_m_split_tail_reaches_the_kernel():
 
 
 # The A4W4 fused configs (_tune_a4w4_small / _tune_a4w4_large on each layout's A8W4 tune): every small-input bucket
-# at MTPR 256 and 512, and every large-input capacity of the layout at each of its token buckets. On a mismatch the
+# at MTPR 256 and 512, and every large-input capacity pinned with them (_A4W4_DIGEST_LARGE_MTPRS; the others launch
+# the configs of 16384, test_large_m_capacities_share_one_tune) at each of its token buckets. On a mismatch the
 # assertion shows the current table.
+_A4W4_DIGEST_LARGE_MTPRS = {
+    "v4_pro_ep8": LARGE_M_MTPRS,
+    "v41_flash_ep8": LARGE_M_MTPRS,
+    "v41_flash_ep4": (8192, 16384),
+    "v41_flash_ep2": (8192, 16384),
+}
 _A4W4_FUSED_DIGESTS = {
     "v4_pro_ep8": "8f1f921b1bccce23c0709b0682bbee047f5893bbceb0497ee8c517f6a3d82b04",
     "v41_flash_ep8": "62c7a693275961daadcebb11b8bb06172e49d36dae29eb7b8bb0026f64d748a6",
@@ -1077,8 +1025,6 @@ _A4W4_FUSED_DIGESTS = {
 
 @pytest.mark.parametrize("layout", sorted(_A4W4_FUSED_DIGESTS))
 def test_a4w4_fused_configs_unchanged(layout):
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_buckets
-
     shape = _ROUTED_LAYOUTS[layout]
     table = {}
     for mtpr in (256, 512):
@@ -1086,11 +1032,7 @@ def test_a4w4_fused_configs_unchanged(layout):
             table[(mtpr, bucket)] = _knob_table(
                 select_fused_config(bucket, mtpr, quant="a4w4", **shape)
             )
-    for mtpr in large_m_mtprs_for(
-        world_size=shape["world_size"],
-        model_dim=shape["model_dim"],
-        inter_dim=shape["inter_dim"],
-    ):
+    for mtpr in _A4W4_DIGEST_LARGE_MTPRS[layout]:
         for bucket in large_m_buckets(mtpr):
             table[(mtpr, bucket)] = _knob_table(
                 select_fused_config(bucket, mtpr, quant="a4w4", **shape)

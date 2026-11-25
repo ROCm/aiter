@@ -168,19 +168,16 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             )
         self.assertEqual(len({job["kernel_name"] for job in jobs}), len(jobs))
         # The prefill instances (8192, 16384) build the large-input kernel too, for both quants.
-        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-            large_m_mtprs_for,
-        )
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import LARGE_M_MTPRS
 
-        large = large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304)
         self.assertEqual(
-            {job["mtpr"] for job in ep4 if job["mtpr"] in large}, {8192, 16384}
+            {job["mtpr"] for job in ep4 if job["mtpr"] in LARGE_M_MTPRS}, {8192, 16384}
         )
         self.assertEqual(
             {
                 job["mtpr"]
                 for job in ep4
-                if job["quant"] == "a4w4" and job["mtpr"] in large
+                if job["quant"] == "a4w4" and job["mtpr"] in LARGE_M_MTPRS
             },
             {8192, 16384},
         )
@@ -198,9 +195,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
 
     def test_v41_flash_ep2_profile(self):
         from aiter.aot.flydsl import mega_moe
-        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-            large_m_mtprs_for,
-        )
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import LARGE_M_MTPRS
 
         ep2 = [job for job in mega_moe.production_jobs() if job["world_size"] == 2]
         self.assertEqual(
@@ -222,15 +217,14 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 ),
                 (192, 5120, 2304, 6),
             )
-        large = large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304)
         self.assertEqual(
-            {job["mtpr"] for job in ep2 if job["mtpr"] in large}, {8192, 16384}
+            {job["mtpr"] for job in ep2 if job["mtpr"] in LARGE_M_MTPRS}, {8192, 16384}
         )
         self.assertEqual(
             {
                 job["mtpr"]
                 for job in ep2
-                if job["quant"] == "a4w4" and job["mtpr"] in large
+                if job["quant"] == "a4w4" and job["mtpr"] in LARGE_M_MTPRS
             },
             {8192, 16384},
         )
@@ -266,18 +260,15 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 (job["experts_per_rank"], job["inter_dim"], job["topk"]),
                 (48, 2304, 6),
             )
-        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-            large_m_mtprs_for,
-        )
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import LARGE_M_MTPRS
 
         # Both quants build the large-input kernel at the prefill MTPRs.
-        large = large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304)
         for quant in ("a8w4", "a4w4"):
             self.assertEqual(
                 {
                     job["mtpr"]
                     for job in ep8
-                    if job["quant"] == quant and job["mtpr"] in large
+                    if job["quant"] == quant and job["mtpr"] in LARGE_M_MTPRS
                 },
                 {8192, 16384},
             )

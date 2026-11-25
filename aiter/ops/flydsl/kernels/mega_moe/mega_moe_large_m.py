@@ -5,7 +5,7 @@
 
 Quant runs as a separate kernel. Dispatch plans each destination's rows and publishes them per tile;
 GEMM2 work waits only for the GEMM1 tile that feeds it. Used on instances whose capacity is in
-mega_moe_config.large_m_mtprs_for() of their layout.
+mega_moe_config.LARGE_M_MTPRS.
 """
 
 import functools
@@ -59,11 +59,11 @@ from .gemm2 import (
 )
 from .mega_moe_config import (
     FUSED_QUANTS,
+    LARGE_M_MTPRS,
     MegaMoEConfig,
     fused_layout_supported,
     fused_quant,
     large_m_buckets,
-    large_m_mtprs_for,
     large_m_runtime_knobs,
     select_fused_config,
 )
@@ -3169,15 +3169,13 @@ class LargeMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim)
         if not fused_layout_supported(
             arch=get_gfx_runtime(), world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
-        ) or max_tok_per_rank not in large_mtprs:
+        ) or max_tok_per_rank not in LARGE_M_MTPRS:
             raise ValueError(
                 "the large-input path requires a fused layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 / EP8 "
-                "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
-                f"({large_mtprs or 'none'})"
+                f"DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank in {LARGE_M_MTPRS}"
             )
         self.rank = int(rank)
         self.world_size = int(world_size)
