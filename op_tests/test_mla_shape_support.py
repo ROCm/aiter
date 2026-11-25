@@ -265,6 +265,25 @@ def test_decode_num_heads(monkeypatch):
     assert (s.backend, s.supported) == (MlaBackend.HK, None), s.reasons
     assert get_mla_decode_num_heads(128, 1, fp8, fp8, **hk) is None
 
+    # OPUS (AITER_MLA_USE_OPUS=1, as in test_opus_cp) has no availability table
+    # either: a call its rules accept counts as running (supported is None), and
+    # one they reject (CP without round-robin KV, bf16 CP) is never answered.
+    monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
+    get_mla_decode_shape_support.cache_clear()
+    opus = {"cp_world_size": 4, "arch": "gfx950", "enable_experimental": False}
+    try:
+        s = get_mla_decode_shape_support(16, 1, fp8, fp8, cp_round_robin=True, **opus)
+        assert (s.backend, s.supported) == (MlaBackend.OPUS, None), s.reasons
+        assert (
+            get_mla_decode_num_heads(16, 1, fp8, fp8, cp_round_robin=True, **opus) == 16
+        )
+        for dtype, rr in ((fp8, False), (bf16, True)):
+            h = get_mla_decode_num_heads(16, 1, dtype, dtype, cp_round_robin=rr, **opus)
+            assert h is None or h > 16, (dtype, rr, h)
+    finally:
+        monkeypatch.delenv("AITER_MLA_USE_OPUS")
+        get_mla_decode_shape_support.cache_clear()
+
 
 def test_ps1_asm_cprr_kernel(monkeypatch):
     monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)

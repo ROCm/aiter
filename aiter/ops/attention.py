@@ -2716,7 +2716,11 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
 MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
 # JIT routes whose supported=None get_mla_decode_num_heads counts as running.
-# HK also reports None, but hk_mla_v32_decode_fwd ignores q_scale and kv_scale.
+# Neither FlyDSL PS1 nor OPUS has an availability table, and the shape rules
+# already return False for the calls each cannot take (e.g. a folded PS1 route;
+# OPUS CP without round-robin KV, or bf16 CP), so None there means "accepted by
+# the rules". HK also reports None, but hk_mla_v32_decode_fwd ignores q_scale
+# and kv_scale.
 _MLA_DECODE_JIT_BACKENDS_THAT_RUN = (MlaBackend.FLYDSL_PS1, MlaBackend.OPUS)
 
 
