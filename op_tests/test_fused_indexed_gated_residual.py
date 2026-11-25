@@ -187,5 +187,17 @@ def test_rejects_unsupported_dtypes_and_devices():
         fused_indexed_gated_residual(residual, x, gate, indices.cpu())
 
 
+def test_rejects_overlapping_output_rows():
+    M, N = 32, 256
+    residual, x, gate, indices = make(M, N, 3, torch.bfloat16)
+    broadcast = torch.empty((1, N), device="cuda", dtype=torch.bfloat16).expand(M, N)
+    with pytest.raises(ValueError):
+        fused_indexed_gated_residual(residual, x, gate, indices, out=broadcast)
+    buffer = torch.empty(M * N, device="cuda", dtype=torch.bfloat16)
+    short_stride = buffer.as_strided((M, N), (N // 2, 1))
+    with pytest.raises(ValueError):
+        fused_indexed_gated_residual(residual, x, gate, indices, out=short_stride)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

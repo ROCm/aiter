@@ -5,6 +5,7 @@
 expression, which materialises the gathered gate and the product at [M, N]."""
 
 import argparse
+import functools
 
 import torch
 
@@ -29,6 +30,10 @@ def _event_time_us(fn, warmup, iters):
     end.record()
     end.synchronize()
     return start.elapsed_time(end) * 1000.0 / iters
+
+
+def _eager(residual, x, gate, indices):
+    return residual + gate[indices] * x
 
 
 def make(M, N, G, scattered, seed=0):
@@ -63,14 +68,22 @@ def main():
     for M in args.M:
         residual, x, gate, indices = make(M, args.N, args.G, args.scattered)
         out = torch.empty_like(residual)
-        fused = _event_time_us(
-            lambda: fused_indexed_gated_residual(residual, x, gate, indices, out=out),
-            args.warmup,
-            args.iters,
+        run_fused = functools.partial(
+            fused_indexed_gated_residual,
+            residual,
+            x,
+            gate,
+            indices,
+            out=out,
+            round_intermediate=True,
         )
-        eager = _event_time_us(
-            lambda: residual + gate[indices] * x, args.warmup, args.iters
-        )
+        run_eager = functools.partial(_eager, residual, x, gate, indices)
+
+        run_fused()
+        if not torch.equal(out, run_eager()):
+            raise SystemExit(f"fused output differs from eager at M={M}")
+        fused = _event_time_us(run_fused, args.warmup, args.iters)
+        eager = _event_time_us(run_eager, args.warmup, args.iters)
         gbps = _ARRAYS["fused"] * M * args.N * residual.element_size() / fused * 1e-3
         print(
             f"{M:>8} {args.N:>6} {fused:>10.1f} {eager:>10.1f} {eager / fused:>7.2f}x {gbps:>11.1f}"

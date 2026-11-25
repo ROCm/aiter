@@ -75,6 +75,10 @@ def fused_indexed_gated_residual(
             raise ValueError(f"{name} must be {residual.dtype}, got {t.dtype}")
         if N > 1 and t.stride(1) != 1:
             raise ValueError(f"{name} must have unit stride along N")
+    if M > 1 and N > 0 and out.stride(0) < N:
+        raise ValueError(
+            f"out rows must not overlap, got row stride {out.stride(0)} < {N}"
+        )
     fused_indexed_gated_residual_hip(
         residual, x, gate, indices, out, round_intermediate
     )
