@@ -321,8 +321,8 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     iteration, so the yielded sets coalesce with the loop arguments and loads stay in flight across the back-edge.
     Per-accumulator MFMA order (ksub 0 then 1, K-steps ascending) is unchanged -> bit-identical output.
     B-scale loads and epilogue stores use sc0|nt (_LA_CM); the epilogue stores are clamped to the tile's valid rows.
-    ``meta = (tile_row_base, valid_rows)`` replaces their loads (the caller's own plan); ``row_map`` as
-    :func:`do_tile`, without the arrival wait.
+    ``meta = (tile_row_base, valid_rows[, row_stride])`` replaces their loads (the caller's own plan; tile row r
+    reads srcmap slot tile_row_base + r * row_stride); ``row_map`` as :func:`do_tile`, without the arrival wait.
     a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
     k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
     """
@@ -330,17 +330,19 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B = NUM_ACC_N * _PACK
     NUM_SB = NUM_ACC_N // _PACK
-    valid_rows = None
+    valid_rows = row_stride = None
     if const_expr(meta is not None):
-        tile_row_base, valid_rows = meta
+        tile_row_base, valid_rows = meta[0], meta[1]
+        if const_expr(len(meta) > 2):
+            row_stride = meta[2]
     else:
         tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, trb_rsrc[m_tile]))
     b_row = sched.gate_base_row(expert) + n_tile_base
     if const_expr(meta is None and rows_rsrc is not None):
         valid_rows = fx.Int32(rocdl.readfirstlane(T.i32, rows_rsrc[m_tile]))
     if const_expr(row_map is not None):
-        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"])
-        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"])
+        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
+        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
         a_gather.for_tile(tile_row_base, valid_rows, row_map, a_srcs)
         a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
         a_scale.stage(a_scale_lds, tile_row_base, row_map, valid_rows, s_srcs)
@@ -448,8 +450,9 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     ``_LA_CM``) and ``tile_zero`` is forwarded to :func:`do_tile`.
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
-    ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
-    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s.
+    ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows[,
+    row_stride])`` takes the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is
+    :func:`do_tile_la`'s.
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
@@ -518,9 +521,9 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
         meta = None
         if const_expr(plan_lookup is not None):
-            # (local expert, tile row base, valid rows) from the CTA's own plan.
-            expert, trb, rows = plan_lookup(m_tile)
-            meta = (trb, rows)
+            # (local expert, tile row base, valid rows[, row stride]) from the CTA's own plan.
+            plan = plan_lookup(m_tile)
+            expert, meta = plan[0], plan[1:]
         else:
             expert = sched.expert_of(m_tile)
         # fmt: off
