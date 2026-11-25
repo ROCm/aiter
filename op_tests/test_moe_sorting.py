@@ -9,6 +9,10 @@ import torch
 
 import aiter
 import aiter.fused_moe as fm
+
+# moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+# see aiter/moev2/README.md); its backend flags are patched there.
+import aiter.moev2.segments.sort as sorting
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
@@ -101,14 +105,14 @@ def _device_arch(device_id: int) -> str:
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = True
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = True
     elif backend == "opus":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "ck":
-        fm._USE_CK_MOE_SORTING = True
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = True
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "auto":
         pass
     else:
@@ -194,7 +198,7 @@ def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     return flops, nbytes
 
 
-def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
+def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     (
         sorted_ids_a,
         sorted_weights_a,
@@ -231,10 +235,14 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
     )
     weight_mask = sorted_ids_a != (topk << 24 | num_rows)
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
+    # Exact: ids are packed (topk << 24 | token), so a relative tolerance would
+    # pass a pad id holding the wrong token.
+    exact = {"rtol": 0, "atol": 0} if exact_ids else {}
     errs["sorted_ids"] = checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
+        **exact,
     )
     errs["sorted_weights"] = checkAllclose(
         sorted_weights_a[weight_mask],
@@ -485,7 +493,14 @@ def test_moe_sorting(
             num_warmup=1,
             num_iters=2,
         )
-        errs = _compare_moe_sorting_outputs(ref, out, topk, topk_ids.shape[0])
+        # CK-tile's sorter still pads with the device-side count, so its ids
+        # keep the loose comparison: in composable_kernel's
+        # moe_sorting_kernel.hpp, moe_align_block_size_kernel_ex and
+        # MoeSortingMultiPhaseKernel_P3 / _P23 write `tokens`, which under
+        # LocalToken is p_local_tokens[0].
+        errs = _compare_moe_sorting_outputs(
+            ref, out, topk, topk_ids.shape[0], exact_ids=name != "ck"
+        )
         err = max(errs.values()) if errs else 0.0
         bad = {k: v for k, v in errs.items() if v}
         if bad:

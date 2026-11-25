@@ -1,0 +1,10 @@
+{
+    "N_LEQ_4096": {
+        "BLOCKS": 256,
+        "num_warps": 4
+    },
+    "any": {
+        "BLOCKS": 256,
+        "num_warps": 8
+    }
+}

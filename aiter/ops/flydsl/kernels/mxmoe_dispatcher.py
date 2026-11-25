@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
+import functools
 import os
 
 import flydsl.compiler as flyc
@@ -10,6 +11,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 
 from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
@@ -181,9 +184,11 @@ def compile_gemm2_a4w4_port(
     route_out_fp8 = out_dtype == "fp8"
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
-    scatter_out_fp4 = out_dtype == "fp4"
-    if scatter_out_fp4 and not use_scatter:
-        raise AssertionError("out_dtype='fp4' is supported only with epilog='scatter'")
+    scatter_out_fp4 = out_dtype == "fp4" and use_scatter
+    # MXFP4 route rows: the fp8 route-out epilogue with packed e2m1 values.
+    route_out_fp4 = out_dtype == "fp4" and use_reduce
+    if out_dtype == "fp4" and not (use_scatter or use_reduce):
+        raise AssertionError("out_dtype='fp4' requires epilog='scatter' or 'reduce'")
     if scatter_out_fp4 and BN not in (128, 256):
         # fp32 C staging is BM*BN*4 bytes of LDS; BN=512 would need 256KB.
         raise AssertionError(
@@ -196,7 +201,7 @@ def compile_gemm2_a4w4_port(
         g2_defer_weight = False
         g2_out_pitch_align = 0
         g2_scale_blk = 8
-    elif route_out_fp8:
+    elif route_out_fp8 or route_out_fp4:
         from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
         g2_defer_weight = True
@@ -317,17 +322,23 @@ def compile_gemm2_a4w4_port(
     noil_tag = "_noil" if g2_bf16_lds and compact_route else ""
     dw_tag = "_dw" if g2_defer_weight else ""
     pitch_tag = (
-        f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
+        f"_pa{g2_out_pitch_align}"
+        if ((route_out_fp8 or route_out_fp4) and g2_out_pitch_align)
+        else ""
     )
-    sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
-    out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if scatter_out_fp4 else "")
+    sblk_tag = (
+        f"_sblk{g2_scale_blk}"
+        if ((route_out_fp8 or route_out_fp4) and g2_scale_blk != 8)
+        else ""
+    )
+    out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if out_dtype == "fp4" else "")
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
     valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     ldspa_tag = "_ldspa" if g2_scatter_lds_pairs else ""
-    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
+    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8 or route_out_fp4, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}{ldspa_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
         "_idpf" if g2_prefetch_ids else ""
@@ -456,6 +467,7 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                route_out_fp4=route_out_fp4,
                 g2_epi_lanes=g2_epi_lanes,
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
@@ -709,6 +721,24 @@ def compile_gemm2_a4w4_port(
 
 # ---- launcher cache + dispatch (compile once per config, fast-dispatch after) ----
 G2_CACHE = {}
+_G2_AOT_CACHE = FlyDSLAotCache(
+    "mxmoe_gemm2",
+    sources=[
+        "kernels/mxmoe_gemm_v2.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/dpp_utils.py",
+        "kernels/act.py",
+        "kernels/layout_utils.py",
+    ],
+    # Read below; their values are also in get_g2's key.
+    env=[
+        "MXFP4_G2_ASCALE_PF",
+        "MXFP4_G2_BF16_LDS",
+        "MXFP4_G2_BHOIST",
+        "MXFP4_G2_PREFETCH_IDS",
+        "MXFP4_G2_SPART",
+    ],
+)
 
 
 def get_g2(
@@ -776,7 +806,8 @@ def get_g2(
     )
     launch = G2_CACHE.get(key)
     if launch is None:
-        launch = compile_gemm2_a4w4_port(
+        compile_g2 = functools.partial(
+            compile_gemm2_a4w4_port,
             BM=BM,
             BN=BN,
             BK=BK,
@@ -800,6 +831,10 @@ def get_g2(
             use_valid_token_count=use_valid_token_count,
             g2_scatter_lds_pairs=g2_scatter_lds_pairs,
         )
+        # The key holds every compile argument, the env knobs resolved above
+        # included. The cache builds an entry from a launcher it compiles
+        # itself, so that the files the compile runs are recorded with it.
+        launch = bind_aot(compile_g2(), _G2_AOT_CACHE, key, compile_g2)
         G2_CACHE[key] = launch
     return launch
 
@@ -875,7 +910,8 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
         )
-    if str(out_dtype).strip().lower() == "fp4":
+    # fp4 reduce writes fp8-style route rows (scales inline), like out_dtype='fp8'.
+    if str(out_dtype).strip().lower() == "fp4" and epilog != "reduce":
         if epilog != "scatter":
             raise AssertionError(
                 "out_dtype='fp4' is supported only with epilog='scatter'"
