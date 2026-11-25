@@ -1,0 +1,66 @@
+{
+    "bm16_any": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024,
+        "split_k_max_grid": 4096,
+        "split_k": 4
+    },
+    "bm16_k1024": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024,
+        "split_k_max_grid": 4096,
+        "split_k": 4
+    },
+    "bm32_any": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024
+    },
+    "bm32_k1024": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024
+    },
+    "bm64_any": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024
+    },
+    "bm128_any": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "k_rotate_stride": 1024
+    }
+}

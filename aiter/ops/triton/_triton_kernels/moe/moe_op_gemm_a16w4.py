@@ -156,6 +156,7 @@ def _moe_gemm_a16w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    K_ROTATE: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -301,28 +302,55 @@ def _moe_gemm_a16w4(
 
     # compute output
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if K_ROTATE:
+        # Stagger starting K-tile per workgroup to avoid column-stride channel camping.
+        k0 = (pid_n + pid_m.to(index_type) * 7) % tl.maximum(
+            num_k_iter.to(index_type), 1
+        )
     for k in range(num_k_iter):
-        x = tl.load(XPtrs)
-        w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        if K_ROTATE:
+            k_idx = k.to(index_type) + k0
+            k_idx = tl.where(
+                k_idx >= num_k_iter.to(index_type),
+                k_idx - num_k_iter.to(index_type),
+                k_idx,
+            )
+            x_ptrs = XPtrs + k_idx * (BLOCK_K * SPLIT_K) * stride_x_k
+            w_ptrs = WPtrs + k_idx * (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+            s_ptrs = WMxScalePtrs + k_idx * (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+        else:
+            x_ptrs = XPtrs
+            w_ptrs = WPtrs
+            s_ptrs = WMxScalePtrs
+
+        x = tl.load(x_ptrs)
+        w = tl.load(w_ptrs, cache_modifier=W_CACHE_MODIFIER)
 
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(
-                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                tl.load(s_ptrs, cache_modifier=W_CACHE_MODIFIER),
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
         else:
-            w_scales = tl.load(WMxScalePtrs)
+            w_scales = tl.load(s_ptrs)
 
         acc = tl.dot_scaled(
             x, x_scales, "bf16", w, w_scales, "e2m1", acc=acc, fast_math=True
         )
 
-        WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+        if not K_ROTATE:
+            WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+            XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
+            WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
-        XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+    if K_ROTATE:
+        WMxScalePtrs += (
+            num_k_iter.to(index_type) * (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+        )
+        XPtrs += num_k_iter.to(index_type) * (BLOCK_K * SPLIT_K) * stride_x_k
+        WPtrs += num_k_iter.to(index_type) * (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
         mask_x_k = offs_x_k < MASK_K_LIMIT
@@ -343,7 +371,7 @@ def _moe_gemm_a16w4(
                 MX_SCALE_BLOCK_K,
             )
         else:
-            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :], other=0)
 
         acc = tl.dot_scaled(
             x, x_scales, "bf16", w, w_scales, "e2m1", acc=acc, fast_math=True
