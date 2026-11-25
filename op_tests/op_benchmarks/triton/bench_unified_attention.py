@@ -531,7 +531,9 @@ def run_benchmark(custom, args):
         # (N_CTX_K), not any one entry's random draw, so block_tables stays a
         # consistent shape across the whole rotating pool.
         n_ctx_k_max = max(N_CTX_K) if isinstance(N_CTX_K, list) else N_CTX_K
-        block_size = args.block_size if args.block_size else 512
+        # vLLM's default KV cache block size (CacheConfig.DEFAULT_BLOCK_SIZE) is 64.
+        # Override with -block_size.
+        block_size = args.block_size if args.block_size else 64
         max_num_blocks_per_seq = (n_ctx_k_max + block_size - 1) // block_size
         num_blocks = max(BATCH * max_num_blocks_per_seq, 2048)
 
