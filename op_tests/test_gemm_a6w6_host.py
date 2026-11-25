@@ -84,13 +84,16 @@ def _launch(case, spec=None, *, bias=False, amax=False, num_cu=0):
     (m, k), n = x.shape, w.shape[0]
     a, a_scale = aiter.quant_mxfp6_gemm(x)
     b, b_scale = aiter.quant_mxfp6_gemm(w[host_weight_order(n).to(w.device)])
-    ones = torch.ones(n, device="cuda")
     tables = None
+    # The host applies no column scales, so its column operand starts with the bias; a
+    # plain projection reads none of it.
     if spec is not None:
-        columns = spec.pack_columns(ones, case["bias"], [case["params"]], n // HEAD)
+        columns = spec.pack_columns(
+            None, case["bias"], [case["params"]], n // HEAD, n=n
+        )
         tables = spec.pack_tables(case["tables"])
     else:
-        columns = torch.cat([ones, case["bias"]] if bias else [ones])
+        columns = case["bias"] if bias else torch.zeros(1, device="cuda")
     out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
     partials = torch.full((2, m, n // HEAD), float("nan"), device="cuda")
     kernel = compile_a6w6_host_4w(
@@ -188,6 +191,100 @@ def test_bias_and_maxima_match_pytorch(bias, amax):
     _close(stored, out, 2**-7, "output", outliers=1e-3)
     if amax:
         _close(maxima, partials[1], 2**-7, "head maxima", outliers=1e-3)
+
+
+@torch.no_grad()
+def test_roles_under_a_skewed_block_order():
+    """Two roles at M % 256 != 0 on 16 workgroups. The tile hook holds workgroups 0-3 in
+    role 0 until 12 blocks of role 1 are counted, so they store role 0's last blocks after
+    role 1's first: a row of role 0 past M must not land in role 1's plane."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.expr import const_expr
+
+    from aiter.ops.flydsl.kernels.communication_ops_utils import (
+        spin_until_ge_i32_agent,
+    )
+    from aiter.ops.flydsl.kernels.gemm_a6w6_4wave_host import (
+        compile_a6w6_host_4w,
+        host_weight_order,
+    )
+    from aiter.ops.flydsl.kernels.gemm_hooks import GemmHooks
+    from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    m, k, roles, role_cols, num_cu = 257, 512, 2, 2560, 16
+    n = roles * role_cols
+    held, released = 4, 12
+
+    @flyc.jit
+    def hold(role, aux, args, c_m, row_base, col_base):
+        # A trace-time branch around a runtime one; they do not merge.
+        if const_expr(role == 0):  # noqa: SIM102
+            if fx.Int32(fx.block_idx.x) < held:
+                if fx.thread_idx.x == 0:
+                    spin_until_ge_i32_agent(aux + 4, released)
+                fx.barrier()
+
+    spec = PrepSpec("rms_across_heads", "interleaved", True, False, eps=EPS)
+    case = _case(m, n, k, True, seed=17)
+    params = {"weight": case["params"]["weight"][:role_cols]}
+    columns = spec.pack_columns(None, case["bias"], [params], role_cols // HEAD, n=n)
+    tables = spec.pack_tables(case["tables"])
+    a, a_scale = aiter.quant_mxfp6_gemm(case["x"])
+    b, b_scale = aiter.quant_mxfp6_gemm(case["w"][host_weight_order(n).to("cuda")])
+    out = torch.full(
+        (roles, m, role_cols), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    partials = torch.full((2, m, n // HEAD), float("nan"), device="cuda")
+    # aux: the block counters, then from byte 64 the last role's per-column maxima.
+    row_blocks = -(-m // 128)
+    aux = torch.full((16 + row_blocks * role_cols,), float("nan"), device="cuda")
+    aux.view(torch.int32)[:16] = 0
+    kernel = compile_a6w6_host_4w(
+        K=_ceil(k, 128),
+        num_cu=num_cu,
+        prep=spec,
+        roles=roles,
+        role_cols=role_cols,
+        hooks=GemmHooks(tile=hold, key="hold"),
+        col_amax_offset=64,
+    )
+    _run_compiled(
+        kernel,
+        a.view(-1),
+        b.view(-1),
+        out.view(-1),
+        a_scale.view(-1),
+        b_scale.view(-1),
+        columns,
+        tables.view(-1),
+        partials.view(-1),
+        aux.data_ptr(),
+        *([0] * 6),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    torch.cuda.synchronize()
+
+    acc = F.linear(_dequantized(case["x"]), _dequantized(case["w"])) + case["bias"]
+    heads = role_cols // HEAD
+    q = acc[:, :role_cols].reshape(m, heads, HEAD)
+    q, sums = spec.reference(q, params, case["tables"])
+    stored_q = q.reshape(m, role_cols).to(torch.bfloat16)
+    stored_v = acc[:, role_cols:].to(torch.bfloat16)
+    _close(stored_q, out[0], 2**-7, "role 0", outliers=1e-3)
+    _close(stored_v, out[1], 2**-7, "role 1", outliers=1e-3)
+    _close(sums, partials[0, :, :heads], 1e-3, "role 0 row partials", outliers=1e-3)
+    for role, stored in enumerate((out[0], out[1])):
+        maxima = stored.float().abs().view(m, heads, HEAD).amax(-1)
+        assert torch.equal(partials[1, :, role * heads : (role + 1) * heads], maxima)
+    blocks = -(-m // 256) * (role_cols // 256)
+    assert aux.view(torch.int32)[:roles].tolist() == [blocks] * roles
+    padded = F.pad(out[1].float().abs(), (0, 0, 0, row_blocks * 128 - m))
+    expected = padded.view(row_blocks, 128, role_cols).amax(1)
+    assert torch.equal(aux[16:].view(row_blocks, role_cols), expected)
 
 
 @torch.no_grad()

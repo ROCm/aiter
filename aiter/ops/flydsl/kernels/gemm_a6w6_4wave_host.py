@@ -11,11 +11,11 @@ The weights come in the host layout (``host_weight_order``): B tile ``j`` of a 1
 group holds the group's rows ``8 k + j``, so lane ``l`` holds column ``8 (l % 16) + j``
 and the eight tiles give it eight adjacent columns. The shared epilogue (``StoreCRows``:
 bias, Q/K prep, maxima) then applies as it is, to FP32 accumulators the scaled MFMA has
-already scaled.
+already scaled (``Fp32Source``).
 
-``Columns`` (FP32) is ``StoreCRows``' B_scale: N column scales, which are not applied
-here, then N biases with a bias, then the prep's column vectors
-(``PrepSpec.pack_columns``).
+``Columns`` (FP32) is ``StoreCRows``' column operand, which holds no column scales here:
+with a bias the N biases, then the prep's column vectors (``PrepSpec.pack_columns`` with
+no scales).
 
 Modes: one projection (``roles == 1``), plain or with the bias, prep or maxima epilogue,
 persistent over ``num_cu`` workgroups or one block per workgroup; or ``roles`` column
@@ -24,13 +24,14 @@ contract. A workgroup runs its blocks one after another: a block's prologue star
 the previous block's epilogue.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
-from aiter.ops.flydsl.kernels.communication_ops_utils import _to_ptr_global
 from aiter.ops.flydsl.kernels.gemm_a6w6_4wave import (
     B_OFFSET,
     BLOCK_K,
@@ -54,13 +55,24 @@ from aiter.ops.flydsl.kernels.gemm_a6w6_4wave import (
     _read_operand,
 )
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import _xcd_swizzle_any
-from aiter.ops.flydsl.kernels.gemm_hooks import GemmHooks
+from aiter.ops.flydsl.kernels.gemm_hooks import (
+    GemmHooks,
+    make_host_steps,
+    name_suffix,
+    role_block_coords,
+    validate_roles,
+)
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
+    format_kernel_name,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
-from aiter.ops.flydsl.kernels.qk_prep_epilogue import StoreCRows, mfma_drain
+from aiter.ops.flydsl.kernels.qk_prep_epilogue import (
+    Fp32Source,
+    StoreCRows,
+    mfma_drain,
+)
 
 
 def host_weight_order(n):
@@ -78,6 +90,7 @@ def host_weight_order(n):
     return (p // 128) * 128 + 8 * (p % 16) + (p % 128) // 16
 
 
+@functools.cache
 def compile_a6w6_host_4w(
     *,
     K: int,
@@ -94,65 +107,68 @@ def compile_a6w6_host_4w(
     hooks: GemmHooks | None = None,
     col_amax_offset: int | None = None,
 ):
-    """``K`` is the padded contraction dimension, a positive multiple of 128.
+    """Compile, once per configuration, the launcher of one A6W6 host kernel.
+
+    ``K`` is the padded contraction dimension, a positive multiple of 128.
 
     ``prep`` (a ``PrepSpec``, whose ``bias`` replaces ``bias``) applies the Q/K prep in
     the epilogue, from its FP32 tables (``PrepSpec.pack_tables``), and writes FP32
     ``[2, M, N // 128]`` partials: the row-factor op's per-head partials, then per-head
-    maxima of the stored output. ``amax`` (without ``prep``) writes only the
-    maxima half. ``roles > 1`` needs ``prep``, ``hooks`` and ``num_cu``: the prep applies
-    to every role but the last, C is planar ``[roles, M, role_cols]`` and ``aux`` starts
-    with a tile counter per role. ``col_amax_offset`` makes the last role also write FP32
-    per-column maxima of its stored output to ``aux`` plus that many bytes,
-    ``[M / 128, role_cols]``.
+    maxima of the stored output. ``amax`` (without ``prep``) writes the same buffer but
+    only its maxima half. N is a multiple of 128, one head per 128 columns.
+    ``roles > 1`` needs ``prep``, ``hooks`` and ``num_cu``: the prep applies to every role
+    but the last, C is planar ``[roles, M, role_cols]`` and ``aux`` starts with the block
+    counters. ``col_amax_offset`` makes the last role also write FP32 per-column maxima of
+    its stored output to ``aux`` plus that many bytes, ``[ceil(M / 128), role_cols]``.
     """
-    assert K % BLOCK_K == 0 and K >= BLOCK_K
+    if K % BLOCK_K or K < BLOCK_K:
+        raise ValueError(f"K must be a positive multiple of {BLOCK_K}, got {K}")
+    if prep is not None and not isinstance(prep, PrepSpec):
+        raise TypeError(f"prep must be a PrepSpec or None, got {prep!r}")
+    if prep is not None and bias and not prep.bias:
+        raise ValueError("bias=True conflicts with a PrepSpec without bias")
+    if prep is not None and amax:
+        raise ValueError("amax is for an output without a prep, which writes its own")
     if prep is not None:
-        if not isinstance(prep, PrepSpec):
-            raise TypeError(f"prep must be a PrepSpec or None, got {prep!r}")
         bias = prep.bias
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
     num_xcds = int(num_xcds)
-    persistent = num_cu > 0
-    if roles > 1 and (
-        prep is None
-        or hooks is None
-        or not persistent
-        or role_cols % BLOCK_N
-        or num_cu % num_xcds
-        or xcd_swizzle <= 0
-    ):
-        raise ValueError(
-            "roles needs prep, hooks, a persistent grid of a multiple of the XCDs, a "
-            "swizzled tile order and role_cols % 256 == 0"
-        )
-    if col_amax_offset is not None and roles < 2:
-        raise ValueError("col_amax_offset needs roles > 1")
-    role_hook, first_block_hook, tile_hook = (
-        (hooks.role, hooks.first_block, hooks.tile) if hooks else (None, None, None)
+    validate_roles(
+        roles=roles,
+        role_cols=role_cols,
+        block_n=BLOCK_N,
+        hooks=hooks,
+        prep=prep,
+        num_cu=num_cu,
+        num_xcds=num_xcds,
+        xcd_swizzle=xcd_swizzle,
+        col_amax_offset=col_amax_offset,
     )
+    persistent = num_cu > 0
+    if roles > 1:
+        after_block, end_role = make_host_steps(hooks)
     sched = Schedule(mblk_n, bar)
     K_TILES = K // BLOCK_K
     NK_PAD = K_TILES + PADK
     LOADING = K_TILES - STAGES
     TRIPS = max(0, (LOADING - 1) // STAGES)
     STATIC_FROM = 1 + TRIPS * STAGES
-    FIRST_BLOCK = first_block_hook is not None
 
-    _kname = (
+    _kname = format_kernel_name(
         f"flydsl_a6w6_host_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_{sched.tag}"
         f"_1x{xcd_swizzle}_k{K}"
         + (f"_p{num_cu}" if persistent else "")
         + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
         + ("_bias" if bias else "")
         + ("_prep" + prep.suffix if prep is not None else "")
-        + ("_amax" if amax and prep is None else "")
-        + (f"_roles{roles}x{role_cols}" if roles > 1 else "")
-        + (f"_hook{hooks.key}" if hooks else "")
-        + ("_fb" if FIRST_BLOCK else "")
-        + ("_th" if tile_hook is not None else "")
-        + (f"_cmax{col_amax_offset}" if col_amax_offset is not None else "")
+        + ("_amax" if amax else "")
+        + name_suffix(
+            roles=roles,
+            role_cols=role_cols,
+            hooks=hooks,
+            col_amax_offset=col_amax_offset,
+        )
     )
 
     @fx.struct
@@ -194,28 +210,30 @@ def compile_a6w6_host_4w(
         wave_n = wave_id % 2
 
         store_c = StoreCRows(
-            Columns,
+            Fp32Source(),
             Columns,
             C,
             c_m,
             c_n,
-            None,
-            WAVE_TILES,
-            WAVE_TILES,
-            has_bias=bias,
-            prep=(Tables, Partials) if prep is not None else None,
-            prep_spec=prep,
-            amax_partials=Partials if amax and prep is None else None,
+            bias=bias,
+            prep=prep,
+            tables=Tables,
+            partials=Partials,
+            amax=amax,
             planar_cols=role_cols if roles > 1 else 0,
-            fp32_acc=True,
         )
 
         def block_coords(block, role):
             if const_expr(roles > 1):
-                m, n = _xcd_swizzle_any(
-                    m_blocks, role_cols // BLOCK_N, xcd_swizzle, block, num_xcds
+                return role_block_coords(
+                    block,
+                    role,
+                    m_blocks=m_blocks,
+                    role_cols=role_cols,
+                    block_n=BLOCK_N,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                return m, n + role * (role_cols // BLOCK_N)
             if const_expr(xcd_swizzle > 0):
                 return _xcd_swizzle_any(
                     m_blocks, n_blocks, xcd_swizzle, block, num_xcds
@@ -292,8 +310,14 @@ def compile_a6w6_host_4w(
                 g2s_scales = G2SScales(
                     A_scale, B_scale, wave_id, stage_ptrs, a_row, b_row, lane_id, True
                 )
-                row_base = fx.Int32(block_m) * BLOCK_M + wave_m * WAVE_ROWS
-                col_base = fx.Int32(block_n) * BLOCK_N + wave_n * WAVE_ROWS
+                # The wave's tile of the block; WaveTile maps its lanes.
+                tile = store_c.tile(
+                    fx.Int32(block_m) * BLOCK_M + wave_m * WAVE_ROWS,
+                    fx.Int32(block_n) * BLOCK_N + wave_n * WAVE_ROWS,
+                )
+                # In a roles kernel the last role applies no prep and loads none of its
+                # column vectors.
+                apply_prep = role < roles - 1 if roles > 1 else None
 
                 def tile_vmem(t, stage, g2s=g2s, g2s_scales=g2s_scales):
                     return (
@@ -368,9 +392,9 @@ def compile_a6w6_host_4w(
                         (t + STAGES, t % STAGES) if t < LOADING else None,
                     )
 
-                def epilogue_loads(row_base=row_base, col_base=col_base):
+                def epilogue_loads(tile=tile, apply_prep=apply_prep):
                     # The bias and norm-weight loads land under the last tile's MFMAs.
-                    values = [op() for op in store_c.scale_load_ops(row_base, col_base)]
+                    values = [op() for op in store_c.load_ops(tile, apply_prep)]
                     fx.rocdl.sched_barrier(0)
                     return values
 
@@ -419,34 +443,27 @@ def compile_a6w6_host_4w(
                 if const_expr(col_amax_offset is not None and role == roles - 1):
                     col_max = aux + col_amax_offset
                 store_c.store_tiles(
-                    mfma_drain(accs),
-                    row_base,
-                    col_base,
-                    epilogue_values,
-                    prep=(role < roles - 1) if roles > 1 else None,
-                    col_max=col_max,
+                    mfma_drain(accs), tile, epilogue_values, apply_prep, col_max=col_max
                 )
                 # Every wave's stores land, and every wave is done with LDS, before the
-                # tile is counted and the next block's loads refill the stages.
-                fx.rocdl.s_waitcnt(vmcnt=0)
-                fx.barrier()
+                # block is counted and the next block's loads refill the stages.
                 if const_expr(roles > 1):
-                    if const_expr(tile_hook is not None):
-                        tile_hook(role, aux, hook_args, c_m, row_base, col_base)
-                    if fx.thread_idx.x == 0:
-                        fx.atomic_add(
-                            _to_ptr_global(aux + role * 4, fx.Int32),
-                            fx.Int32(1),
-                            syncscope=fx.rocdl.SyncScope.Agent,
-                            ordering=fx.AtomicOrdering.Release,
-                        )
-                    # A trace-time branch around a runtime one; they do not merge.
-                    if const_expr(FIRST_BLOCK and role > 0):  # noqa: SIM102
-                        if block == block0:
-                            first_block_hook(role, aux, hook_args, c_m)
+                    after_block(
+                        role,
+                        aux,
+                        hook_args,
+                        c_m,
+                        tile.row_base,
+                        tile.col_base,
+                        block,
+                        block0,
+                    )
+                else:
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    fx.barrier()
                 _ = yield [bstate[0]]
-            if const_expr(role_hook is not None):
-                role_hook(role, aux, hook_args, c_m)
+            if const_expr(roles > 1):
+                end_role(role, aux, hook_args, c_m)
 
     value_attrs = {
         "rocdl.waves_per_eu": 1,
@@ -533,4 +550,8 @@ def compile_a6w6_host_4w(
         ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
     launcher = launch_gemm_roles if roles > 1 else launch_gemm
+    # LLVM otherwise aligns a loop only when that takes at most 4 bytes of padding, which
+    # leaves the K loop's alignment to the code before it; this kernel's time moves by up
+    # to 2 % with it.
+    launcher.compile_hints.setdefault("llvm_options", {})["max-bytes-for-alignment"] = 32
     return set_slp_vectorize_once_used(launcher, False)
