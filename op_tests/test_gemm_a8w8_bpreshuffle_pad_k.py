@@ -92,7 +92,9 @@ def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(
     monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
 
-    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(
+        xq, wq, x_scale, w_scale, out, row, None
+    )
 
     assert gemm_kernels.PRESHUFFLE_M_MAX == 65536
     assert seen == [backend]
@@ -144,7 +146,9 @@ def test_flydsl_bpreshuffle_split_k_falls_back_to_ck_when_k_not_divisible(
     )
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
 
-    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(
+        xq, wq, x_scale, w_scale, out, row, None
+    )
 
     assert seen == [backend]
     assert got is out

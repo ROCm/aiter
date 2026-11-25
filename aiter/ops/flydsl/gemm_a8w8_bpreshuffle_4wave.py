@@ -46,6 +46,14 @@ def _lazy_import() -> None:
     _fx = fx_mod
 
 
+_NAME_PREFIX = "flydsl_bpreshuffle_4w_"
+
+
+def is_4wave_kernel_name(name: str) -> bool:
+    """Whether a tuned-table ``kernelName`` names a 4-wave INT8 kernel."""
+    return name.startswith(_NAME_PREFIX)
+
+
 def make_4wave_kernel_name(
     *,
     K: int,
@@ -53,9 +61,13 @@ def make_4wave_kernel_name(
     num_cu: int = 0,
     num_xcds: int = 8,
 ) -> str:
-    """Return the canonical tuned-table name for one 4-wave specialization."""
+    """Return the canonical tuned-table name for one 4-wave specialization.
+
+    The kernel's symbol is this name with its epilogue's parts after it
+    (``compile_int8_gemm_4w``).
+    """
     name = (
-        f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
+        f"{_NAME_PREFIX}{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
         f"I8_I8_B16_1x{int(xcd_swizzle)}_k{int(K)}"
     )
     if num_cu > 0:
@@ -95,9 +107,15 @@ def parse_4wave_kernel_name(name: str) -> dict[str, int | str] | None:
     }
 
 
-def _validate_compile_config(
+def validate_4wave_config(
     *, K: int, xcd_swizzle: int, num_cu: int, num_xcds: int
 ) -> None:
+    """Raise for a 4-wave configuration the kernel cannot run; every compile checks it.
+
+    A persistent grid (``num_cu > 0``) is a multiple of ``num_xcds`` workgroups, so each
+    block stays on its workgroup's XCD. The op path also requires a tuned row's
+    ``num_cu`` to be the device's (``run_gemm_a8w8_bpreshuffle_4wave``).
+    """
     if K < MIN_K or K > MAX_K or K % BLOCK_K:
         raise ValueError(
             f"[FlyDSL INT8 4wave] K must be in [{MIN_K}, {MAX_K}] and divisible "
@@ -112,10 +130,10 @@ def _validate_compile_config(
         raise ValueError(
             f"[FlyDSL INT8 4wave] num_xcds must be in [1, 8], got {num_xcds}"
         )
-    if num_cu < 0 or (num_cu and num_cu != num_xcds * 32):
+    if num_cu < 0 or num_cu % num_xcds:
         raise ValueError(
-            "[FlyDSL INT8 4wave] persistent num_cu must be zero or 32 per XCD, "
-            f"got num_cu={num_cu}, num_xcds={num_xcds}"
+            "[FlyDSL INT8 4wave] persistent num_cu must be zero or a multiple of "
+            f"num_xcds, got num_cu={num_cu}, num_xcds={num_xcds}"
         )
     if num_cu and (K // BLOCK_K) % 2:
         raise ValueError(
@@ -133,21 +151,15 @@ def compile_4wave_gemm(
     num_xcds: int | None = None,
     bias: bool = False,
 ):
-    """Compile and memoize one 4-wave launcher.
+    """One 4-wave launcher of the op path (``compile_int8_gemm_4w``, which compiles each
+    configuration once); this cache keeps the op's per-call lookup short.
 
     With ``bias`` the epilogue adds a per-column FP32 bias before the BF16 rounding, and
-    the launcher's column-scale operand holds the N column scales followed by the N
-    biases.
+    the launcher's column operand holds the N column scales followed by the N biases.
     """
     _lazy_import()
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if int(xcd_swizzle) > 0 else 8
-    _validate_compile_config(
-        K=int(K),
-        xcd_swizzle=int(xcd_swizzle),
-        num_cu=int(num_cu),
-        num_xcds=int(num_xcds),
-    )
     return _compile_int8_gemm_4w(
         K=int(K),
         xcd_swizzle=int(xcd_swizzle),
@@ -209,23 +221,27 @@ def _as_scale(scale: Tensor, length: int, name: str) -> Tensor:
     return flat.contiguous()
 
 
-def _as_bias(bias: Tensor, length: int, device: torch.device) -> Tensor:
-    """The bias as FP32 ``[N]``; BF16 and FP16 biases are converted."""
-    flat = bias.reshape(-1)
-    if flat.numel() != length:
+def check_bias(bias: Tensor, length: int, device: torch.device) -> None:
+    """Raise unless ``bias`` is an FP32, BF16 or FP16 ``[N]`` or ``[1, N]`` on ``device``."""
+    if tuple(bias.shape) not in ((length,), (1, length)):
         raise ValueError(
-            f"[FlyDSL INT8 4wave] bias must have {length} elements, got "
+            f"[FlyDSL INT8 4wave] bias must be [{length}] or [1, {length}], got "
             f"{tuple(bias.shape)}"
         )
-    if flat.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+    if bias.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise ValueError(
-            f"[FlyDSL INT8 4wave] bias must be FP32, BF16 or FP16, got {flat.dtype}"
+            f"[FlyDSL INT8 4wave] bias must be FP32, BF16 or FP16, got {bias.dtype}"
         )
-    if flat.device != device:
+    if bias.device != device:
         raise ValueError(
-            f"[FlyDSL INT8 4wave] bias must be on {device}, got {flat.device}"
+            f"[FlyDSL INT8 4wave] bias must be on {device}, got {bias.device}"
         )
-    return flat.to(torch.float32).contiguous()
+
+
+def _as_bias(bias: Tensor, length: int, device: torch.device) -> Tensor:
+    """The bias as FP32 ``[N]``; BF16 and FP16 biases are converted."""
+    check_bias(bias, length, device)
+    return bias.reshape(-1).to(torch.float32).contiguous()
 
 
 def _validate_runtime(
@@ -266,7 +282,7 @@ def _validate_runtime(
         raise ValueError(
             f"[FlyDSL INT8 4wave] N must be a positive multiple of 16, got {N}"
         )
-    _validate_compile_config(
+    validate_4wave_config(
         K=K,
         xcd_swizzle=DEFAULT_XCD_SWIZZLE,
         num_cu=0,
@@ -293,12 +309,12 @@ def run_gemm_a8w8_bpreshuffle_4wave(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
-    bias: Tensor | None = None,
+    bias: Tensor | None,
 ) -> Tensor:
     """Decode ``kernel_name`` and execute the matching cached specialization.
 
-    ``bias`` (``N`` elements, FP32, BF16 or FP16) is added in FP32 to each column
-    before the BF16 rounding: ``Out = bf16(acc * x_scale * w_scale + bias)``.
+    ``bias`` (``[N]`` or ``[1, N]``, FP32, BF16 or FP16), or None, is added in FP32 to
+    each column before the BF16 rounding: ``Out = bf16(acc * x_scale * w_scale + bias)``.
     """
     config = parse_4wave_kernel_name(kernel_name)
     if config is None:
@@ -337,9 +353,10 @@ def run_gemm_a8w8_bpreshuffle_4wave(
         return Out
 
     sa = _as_scale(x_scale, M, "x_scale")
-    sb = _as_scale(w_scale, N, "w_scale")
+    # The column operand: the N column scales, then with a bias the N biases.
+    columns = _as_scale(w_scale, N, "w_scale")
     if bias is not None:
-        sb = torch.cat((sb, _as_bias(bias, N, XQ.device)))
+        columns = torch.cat((columns, _as_bias(bias, N, XQ.device)))
     executable = compile_4wave_gemm(
         K=K,
         xcd_swizzle=int(config["xcd_swizzle"]),
@@ -353,7 +370,7 @@ def run_gemm_a8w8_bpreshuffle_4wave(
         WQ.view(-1),
         Out.view(-1),
         sa,
-        sb,
+        columns,
         M,
         N,
         _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
@@ -366,10 +383,13 @@ __all__ = [
     "BLOCK_M",
     "BLOCK_N",
     "MIN_K",
+    "check_bias",
     "compile_4wave_gemm",
     "default_4wave_kernel_name",
+    "is_4wave_kernel_name",
     "make_4wave_kernel_name",
     "parse_4wave_kernel_name",
     "run_gemm_a8w8_bpreshuffle_4wave",
     "supports_4wave_int8_shape",
+    "validate_4wave_config",
 ]

@@ -177,7 +177,7 @@ def run_gemm_flydsl_int8_4wave(
     ensure_int8_4wave_candidates(get_cu_num(), x.shape[-1])
     ki = kernels_list_flydsl_int8_4wave[kernel_id]
     return run_gemm_a8w8_bpreshuffle_4wave(
-        x, weight_shuffle, x_scale, w_scale, out, ki.name
+        x, weight_shuffle, x_scale, w_scale, out, ki.name, None
     )
 
 

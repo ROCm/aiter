@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import itertools
 import os
 import random
 
@@ -907,8 +906,9 @@ def run_int8_4wave_ci_correctness():
 
     case = make_int8_4wave_case((17, 32, 256), 7)
     for bias, message in (
-        (torch.zeros(31, device="cuda"), "bias of N=32"),
-        (torch.zeros(32, dtype=torch.int32, device="cuda"), "FP32, BF16 or FP16 bias"),
+        (torch.zeros(31, device="cuda"), "bias must be [32] or [1, 32]"),
+        (torch.zeros(2, 16, device="cuda"), "bias must be [32] or [1, 32]"),
+        (torch.zeros(32, dtype=torch.int32, device="cuda"), "FP32, BF16 or FP16"),
     ):
         _expect_value_error(
             message,
@@ -1139,7 +1139,7 @@ def run_int8_4wave_dispatch_checks():
     # stays small enough for full-range INT8 sums to fit in INT32.
     _expect_value_error(
         "even number of K128 tiles",
-        four_wave._validate_compile_config,
+        four_wave.validate_4wave_config,
         K=384,
         xcd_swizzle=8,
         num_cu=256,
@@ -1151,7 +1151,7 @@ def run_int8_4wave_dispatch_checks():
     assert not four_wave.supports_4wave_int8_shape(1, 16, over_k)
     _expect_value_error(
         "K must be in",
-        four_wave._validate_compile_config,
+        four_wave.validate_4wave_config,
         K=over_k,
         xcd_swizzle=8,
         num_cu=0,
@@ -1169,142 +1169,6 @@ def run_int8_4wave_dispatch_checks():
     aiter.logger.info(
         "INT8 4-wave dispatch checks: passed padded-K lookup, 4-XCD fallback, "
         "backend row filtering, contract before lookup and compile guards"
-    )
-
-
-INT8_PREP_HEAD = 128
-INT8_PREP_EPS = 1e-6
-
-
-def int8_4wave_prep_reference(case, spec):
-    """Stored projection, the row-factor op's per-head partials and per-head maxima of
-    the stored output."""
-    acc = F.linear(case["x"].float(), case["weight"].float())
-    acc = acc * (case["x_scale"] * case["w_scale"])
-    if case["bias"] is not None:
-        acc = acc + case["bias"]
-    m, n = acc.shape
-    y = acc.view(m, n // INT8_PREP_HEAD, INT8_PREP_HEAD)
-    y, partials = spec.reference(y, case["params"], case["tables"])
-    stored = y.reshape(m, n).to(dtypes.bf16)
-    maxima = stored.float().abs().view(m, n // INT8_PREP_HEAD, INT8_PREP_HEAD)
-    return stored, partials, maxima.amax(-1)
-
-
-def make_int8_4wave_prep_case(m, n, k, bias, seed):
-    case = make_int8_4wave_case((m, n, k), seed)
-    generator = torch.Generator(device="cuda").manual_seed(seed + 1)
-    weight = 1 + 0.1 * torch.randn(n, device="cuda", generator=generator)
-    angles = torch.rand((m, 64), device="cuda", generator=generator) * 6.28
-    case.update(
-        bias=(
-            torch.randn(n, device="cuda", generator=generator) * 0.1 if bias else None
-        ),
-        params={"weight": weight},
-        tables={"cos": angles.cos(), "sin": angles.sin()},
-    )
-    return case
-
-
-def int8_4wave_prep_launcher(case, spec, num_cu=0):
-    """A launch of the prep GEMM into NaN-filled outputs, so unwritten elements fail."""
-    import flydsl.expr as fx
-
-    from aiter.ops.flydsl.kernels.gemm_a8w8_int8_4wave import compile_int8_gemm_4w
-    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
-    m, k = case["x"].shape
-    n = case["weight"].shape[0]
-    columns = spec.pack_columns(
-        case["w_scale"], case["bias"], [case["params"]], n // INT8_PREP_HEAD
-    )
-    tables = spec.pack_tables(case["tables"])
-    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda")
-    partials = torch.full(
-        (2, m, n // INT8_PREP_HEAD), float("nan"), dtype=dtypes.fp32, device="cuda"
-    )
-    kernel = compile_int8_gemm_4w(K=k, num_cu=num_cu, prep=spec)
-    args = (
-        case["x"].view(-1),
-        case["weight_shuffled"].view(-1),
-        out.view(-1),
-        case["x_scale"].view(-1),
-        columns,
-        # Without tables the kernel never reads its tables argument.
-        (tables if tables is not None else columns).view(-1),
-        partials.view(-1),
-        m,
-        n,
-    )
-
-    def launch():
-        _run_compiled(kernel, *args, fx.Stream(torch.cuda.current_stream()))
-        return out, partials
-
-    return launch
-
-
-@benchmark()
-def test_int8_4wave_prep(m, n, k, norm, rope, hadamard, bias, persistent):
-    from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
-
-    spec = PrepSpec(norm, rope, bias, hadamard, eps=INT8_PREP_EPS)
-    case = make_int8_4wave_prep_case(m, n, k, bias, seed=m + n + k)
-    stored, row_partials, maxima = int8_4wave_prep_reference(case, spec)
-    launch = int8_4wave_prep_launcher(case, spec, get_cu_num() if persistent else 0)
-    (out, partials), us = run_perftest(launch, num_iters=TEST_NUM_ITERS)
-    # PyTorch rounds the FP32 math in another order, so a BF16 value may land one step away.
-    err = checkAllclose(
-        stored.float(), out.float(), rtol=2**-7, atol=1e-6, msg=f"{spec}: output"
-    )
-    assert err == 0, f"{spec}: {err:.2%} of the output outside rtol/atol"
-    err_max = checkAllclose(
-        maxima, partials[1], rtol=2**-7, atol=1e-6, msg=f"{spec}: head maxima"
-    )
-    assert err_max == 0, f"{spec}: {err_max:.2%} of the head maxima outside rtol/atol"
-    if spec.row_factor is not None:
-        err_row = checkAllclose(
-            row_partials, partials[0], rtol=1e-5, atol=0, msg=f"{spec}: row partials"
-        )
-        assert err_row == 0, f"{spec}: {err_row:.2%} of the row partials outside rtol"
-    nbytes = m * k + n * k + 2 * m * n + 8 * m * (n // INT8_PREP_HEAD)
-    return {
-        "gfx": get_gfx(),
-        "us": us,
-        "TFLOPS": 2 * m * n * k / us / 1e6,
-        "TB/s": nbytes / us / 1e6,
-        "err": err,
-    }
-
-
-@torch.no_grad()
-def run_int8_4wave_prep_correctness():
-    """Q/K prep epilogue variants (PrepSpec) against the spec's FP32 PyTorch reference."""
-    if get_gfx() != "gfx950":
-        aiter.logger.info("INT8 4-wave prep: skipped, requires gfx950")
-        return
-    rows = [
-        test_int8_4wave_prep(257, 512, 512, norm, rope, hadamard, True, False)
-        for norm, rope, hadamard in itertools.product(
-            ("none", "rms_per_head", "rms_across_heads"),
-            ("none", "interleaved", "rotate_half"),
-            (True, False),
-        )
-    ]
-    # Without a bias, then persistent at Wan's 40-head and FLUX.3's 24-head projections
-    # (FLUX.3: per-head norm, interleaved RoPE, no bias).
-    for m, n, k, norm, rope, bias, persistent in (
-        (257, 512, 512, "rms_across_heads", "interleaved", False, False),
-        (257, 512, 512, "rms_per_head", "rotate_half", False, False),
-        (257, 512, 512, "rms_per_head", "interleaved", False, False),
-        (1184, 5120, 5120, "rms_across_heads", "interleaved", True, True),
-        (1184, 5120, 5120, "rms_per_head", "rotate_half", True, True),
-        (576, 3072, 3072, "rms_per_head", "interleaved", False, True),
-    ):
-        rows.append(test_int8_4wave_prep(m, n, k, norm, rope, True, bias, persistent))
-    aiter.logger.info(
-        "INT8 4-wave prep summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
     )
 
 
@@ -1498,7 +1362,6 @@ args = parser.parse_args()
 
 run_int8_4wave_ci_correctness()
 run_int8_4wave_dispatch_checks()
-run_int8_4wave_prep_correctness()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")

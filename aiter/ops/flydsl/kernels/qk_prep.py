@@ -30,6 +30,7 @@ Adding a capability is one ``PrepOp`` subclass, with its kernel math (``setup``,
 ``reference``, and one entry in ``NORMS`` or ``ROPES``.
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
 from typing import ClassVar
@@ -38,9 +39,10 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
-from flydsl.expr.rocdl import update_dpp
 from flydsl.expr.typing import ReductionOp
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 
 HEAD_DIM = 128  # channels per head: 8 in each of 16 lanes
 ROPE_PAIRS = HEAD_DIM // 2  # rotation pairs per head, one cos and sin each
@@ -55,13 +57,16 @@ _ROW_ROR8 = 0x128  # lane i of a 16-lane row reads lane i ^ 8
 
 
 def _row_move(value, ctrl):
-    # Every lane of the row has a source under these controls, so zero fill never
-    # shows; it lets LLVM fold the move into the instruction that consumes it.
-    return fx.Float32(
-        update_dpp(
-            fx.Float32.ir_type, value.ir_value(), value.ir_value(), ctrl, 0xF, 0xF, True
-        )
-    )
+    # FlyDSL 0.5 has no stable DPP move: rocdl.update_dpp is outside rocdl.__all__.
+    # The stable cross-lane read, shuffle_xor with the same lane pairs, lowers to
+    # ds_swizzle_b32, an LDS-unit permute that each consumer waits for (lgkmcnt): at
+    # Wan's and FLUX.3's projections (1184x5120x5120, 576x3072x3072, persistent) the
+    # prep epilogue then ran 4.6-13.6 % slower. Every lane of the row has a source under
+    # these controls, so the zero fill (bound_ctrl) never shows; it lets LLVM fold the
+    # move into the instruction that consumes it.
+    bits = fx.Float32(value).bitcast(fx.Int32)
+    moved = update_dpp_i32(bits, bits, ctrl, 0xF, 0xF, True)
+    return fx.Int32(moved).bitcast(fx.Float32)
 
 
 def _butterfly_signs(lane):
@@ -87,11 +92,11 @@ def _row_max(value):
 
 
 def _max_abs(values):
-    """Largest magnitude among the 8 values of a vector."""
-    result = fx.Float32(0.0)
-    for k in range(8):
-        result = result.maximumf(values[k].maximumf(-values[k]))
-    return result
+    """Largest magnitude among the 8 values of a vector, as a tree."""
+    level = [values[k].maximumf(-values[k]) for k in range(8)]
+    while len(level) > 1:
+        level = [level[k].maximumf(level[k + 1]) for k in range(0, len(level), 2)]
+    return level[0]
 
 
 def _hadamard128(values, signs):
@@ -126,7 +131,7 @@ def _vector(x):
     return Vec.from_elements(x, fx.Float32) if isinstance(x, list) else x
 
 
-class PrepOp:
+class PrepOp(ABC):
     """One capability of the Q/K prep; subclasses are frozen dataclasses.
 
     Traced into the epilogue, with ``ctx`` the epilogue's context (module docstring):
@@ -143,8 +148,9 @@ class PrepOp:
     ``[rows, width]`` tables in ``tables``, and returns the result and, for a ``row_factor``
     op, the per-head partials. ``reference_finish`` is ``finish`` in PyTorch.
 
-    ``tag`` names the op in the kernel name, which keys the compiled kernel, so it spells
-    out every parameter the kernel math depends on.
+    ``tag`` names the op in the kernel name. Names are for attribution in profiles and
+    disassembly (FlyDSL keys compiled kernels on the traced code), so a tag spells out
+    every parameter the kernel math depends on, in letters, digits and underscores.
     """
 
     columns: ClassVar[tuple] = ()
@@ -159,21 +165,24 @@ class PrepOp:
     def load(self, ctx, row):
         return None
 
+    @abstractmethod
     def apply(self, x, ctx, state, data):
-        raise NotImplementedError
+        pass
 
     def finish(self, total, count):
-        raise NotImplementedError
+        raise NotImplementedError(f"{type(self).__name__} leaves no row factor")
 
+    @abstractmethod
     def reference(self, y, params, tables):
-        raise NotImplementedError
+        pass
 
     def reference_finish(self, total, count):
-        raise NotImplementedError
+        raise NotImplementedError(f"{type(self).__name__} leaves no row factor")
 
     @property
+    @abstractmethod
     def tag(self):
-        raise NotImplementedError
+        pass
 
 
 @dataclass(frozen=True)
@@ -193,8 +202,12 @@ class RMSNorm(PrepOp):
 
     @property
     def tag(self):
-        eps = "" if self.eps == 1e-6 else f"_eps{self.eps:g}"
-        return ("nacross" if self.across_heads else "nhead") + eps
+        name = "nacross" if self.across_heads else "nhead"
+        if self.eps == 1e-6:
+            return name
+        # 1e-05 is written 1em05 and 0.0001 0p0001.
+        eps = f"{self.eps:g}".replace("-", "m").replace("+", "").replace(".", "p")
+        return f"{name}_eps{eps}"
 
     def apply(self, x, ctx, state, data):
         x = _vector(x)
@@ -279,9 +292,14 @@ class RoPE(PrepOp):
 
 @dataclass(frozen=True)
 class Hadamard(PrepOp):
-    """The unnormalized Hadamard of each head (``_hadamard128``). Its gain, 128 ** -0.5,
-    folds into the columns of the ops before it (the norm weight); without such a column
-    the output stays unnormalized."""
+    """The unnormalized Hadamard of each head (``_hadamard128``): ``y = x H`` with
+    ``H H^T = 128 I``. H is Sylvester's matrix with its rows permuted and 32 of them
+    negated, the order the DPP butterflies give (``_ROW_BUTTERFLY``), so it is not
+    interchangeable with a Sylvester-order transform such as ``rot_quant``'s or
+    ``rope_rotate_activation``: attention scores are preserved only when Q and K both
+    pass this one, as the prepped roles of one epilogue do. Its gain, 128 ** -0.5, folds
+    into the columns of the ops before it (the norm weight); without such a column the
+    output stays unnormalized."""
 
     linear: ClassVar[bool] = True
     gain: ClassVar[float] = HEAD_DIM**-0.5
@@ -413,24 +431,27 @@ class PrepSpec:
         value = value.float().reshape(-1)
         return value.repeat(heads) if value.numel() == HEAD_DIM else value
 
-    def pack_columns(self, scales, bias, roles, heads):
+    def pack_columns(self, scales, bias, roles, heads, n=None):
         """The FP32 column operand of a projection with ``heads`` heads per role.
 
-        ``scales``: the N column scales (ones for a host that applies none). ``bias``: the
-        N biases with ``self.bias``. ``roles``: per prepped role (one for a single
-        projection; Q and K of a fused Q/K/V weight), a dict of the column vectors by name,
-        ``[heads * 128]`` or one head's ``[128]``; the roles after them (V) take ones. Each
-        vector is multiplied by its gain (``gains``).
+        ``scales``: the N column scales, or None for a host that applies none, which then
+        passes N as ``n``. ``bias``: the N biases with ``self.bias``. ``roles``: per prepped
+        role (one for a single projection; Q and K of a fused Q/K/V weight), a dict of the
+        column vectors by name, ``[heads * 128]`` or one head's ``[128]``; the roles after
+        them (V) take ones. Each vector is multiplied by its gain (``gains``).
         """
-        parts = [scales.float().reshape(-1)]
+        parts = [] if scales is None else [scales.float().reshape(-1)]
+        n = n if scales is None else scales.numel()
         if self.bias:
             parts.append(bias.float().reshape(-1))
-        rest = parts[0].numel() // (heads * HEAD_DIM) - len(roles)
+        rest = n // (heads * HEAD_DIM) - len(roles)
         gains = self.gains()
         for name in self.columns:
-            parts += [self._vector(role[name], heads) * gains[name] for role in roles]
+            vectors = [self._vector(role[name], heads) * gains[name] for role in roles]
+            parts += vectors
             if rest:
-                parts.append(torch.ones(rest * heads * HEAD_DIM, device=scales.device))
+                device = vectors[0].device
+                parts.append(torch.ones(rest * heads * HEAD_DIM, device=device))
         return torch.cat(parts).contiguous()
 
     def pack_tables(self, tables):

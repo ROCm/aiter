@@ -23,6 +23,8 @@ gfx950 serves a ds_read_b128 in four phases of 16 lanes: lane groups
 layouts give each phase 16 distinct 16-byte bank groups.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -34,16 +36,30 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
-from aiter.ops.flydsl.kernels.communication_ops_utils import _to_ptr_global
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+    make_4wave_kernel_name,
+    validate_4wave_config,
+)
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import S2RLoader, _xcd_swizzle_any
-from aiter.ops.flydsl.kernels.gemm_hooks import GemmHooks
+from aiter.ops.flydsl.kernels.gemm_hooks import (
+    GemmHooks,
+    make_host_steps,
+    name_suffix,
+    role_block_coords,
+    validate_roles,
+)
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
+    format_kernel_name,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
-from aiter.ops.flydsl.kernels.qk_prep_epilogue import StoreCRows, mfma_drain
+from aiter.ops.flydsl.kernels.qk_prep_epilogue import (
+    Int32Source,
+    StoreCRows,
+    mfma_drain,
+)
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -235,6 +251,7 @@ def _mfma_i8(a, b, c):
     )
 
 
+@functools.cache
 def compile_int8_gemm_4w(
     *,
     K: int,
@@ -249,73 +266,77 @@ def compile_int8_gemm_4w(
     hooks: GemmHooks | None = None,
     col_amax_offset: int | None = None,
 ):
-    """``num_cu > 0`` makes the kernel persistent over that many workgroups.
+    """Compile, once per configuration, the launcher of one 4-wave INT8 kernel.
 
-    ``bias`` adds a per-column FP32 bias in the epilogue. B_scale then holds the
-    N column scales followed by the N biases.
+    ``num_cu > 0`` makes the kernel persistent over that many workgroups.
+
+    ``bias`` adds a per-column FP32 bias in the epilogue. The column operand then holds
+    the N column scales followed by the N biases.
 
     ``prep``, a ``PrepSpec``, applies a Q/K prep in the epilogue; its ``bias`` replaces
-    ``bias``. B_scale then also holds the spec's column vectors after the scales and
-    biases (``PrepSpec.pack_columns``). The launcher takes the spec's FP32 tables
-    (``PrepSpec.pack_tables``) and writes FP32 ``[2, M, N // 128]``: the row-factor op's
-    per-head partials, then per-head maxima of the stored output. With a row-factor op
-    the caller scales each row by the op's factor of the sum of the row's partials. All
-    three are flat: FlyDSL indexes a 2-D tensor argument column-major.
+    ``bias``. The column operand then also holds the spec's column vectors after the
+    scales and biases (``PrepSpec.pack_columns``). The launcher takes the spec's FP32
+    tables (``PrepSpec.pack_tables``) and writes FP32 ``[2, M, N // 128]``: the row-factor
+    op's per-head partials, then per-head maxima of the stored output. With a row-factor
+    op the caller scales each row by the op's factor of the sum of the row's partials. All
+    three are flat: FlyDSL indexes a 2-D tensor argument column-major. N is a multiple of
+    128, one head per 128 columns.
 
-    ``amax`` (without ``prep``) writes only the maxima half of that buffer, for a
-    projection the consumer quantizes as it is, such as V.
+    ``amax`` (without ``prep``) writes the same ``[2, M, N // 128]`` buffer but only its
+    maxima half, for a projection the consumer quantizes as it is, such as V.
 
     ``roles > 1`` (with ``prep``, ``hooks`` and ``num_cu``) runs a fused weight of ``roles``
     blocks of ``role_cols`` columns, Q/K/V for 3, and stores C planar,
-    ``[roles, M, role_cols]``. The prep applies to every role but the last. ``aux`` starts
-    with an Int32 tile counter per role.
-
-    ``hooks`` are ``GemmHooks``, code run inside the GEMM under the contract in
-    ``gemm_hooks``. ``col_amax_offset`` (with ``roles > 1``) makes the last role's epilogue also write FP32
-    ``[M / 128, role_cols]`` per-column maxima of its stored output to ``aux`` plus that many
-    bytes, one row per 128 rows of C; they land before the tile is counted.
+    ``[roles, M, role_cols]``. The prep applies to every role but the last. ``hooks`` are
+    ``GemmHooks``, code run inside the GEMM under the contract in ``gemm_hooks``, and
+    ``aux`` starts with the block counters. ``col_amax_offset`` makes the last role's
+    epilogue also write FP32 ``[ceil(M / 128), role_cols]`` per-column maxima of its stored
+    output to ``aux`` plus that many bytes, one row per 128 rows of C; they land before
+    the block is counted.
 
     A persistent workgroup loads the first two K tiles of its next output
     block during the last two of the current one, so the next block's K loop
     starts while the epilogue runs. That needs an even number of K tiles, so
     the next block's first tile lands in LDS buffer 0; otherwise each
     workgroup takes one block.
+
+    The launcher takes ``(A, B_T, C, A_scale, Columns, c_m, c_n, stream)``; with a prep
+    or ``amax`` also ``Tables`` and ``Partials`` after ``Columns`` (any tensor serves as
+    tables without them), and with ``roles > 1`` also ``aux`` and the hooks' six Int64
+    values after ``Partials``. The plain launcher takes no placeholders for them: every
+    tensor argument adds host time to each op call.
     """
-    role_hook, first_block_hook, tile_hook, hook_key = (
-        (hooks.role, hooks.first_block, hooks.tile, hooks.key)
-        if hooks is not None
-        else (None, None, None, "")
-    )
     if prep is not None and not isinstance(prep, PrepSpec):
         raise TypeError(f"prep must be a PrepSpec or None, got {prep!r}")
     if prep is not None and bias and not prep.bias:
         raise ValueError("bias=True conflicts with a PrepSpec without bias")
-    prep_spec = prep
-    prep = prep_spec is not None
-    if prep:
-        bias = prep_spec.bias
-    assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
+    if prep is not None and amax:
+        raise ValueError("amax is for an output without a prep, which writes its own")
+    if prep is not None:
+        bias = prep.bias
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
     num_xcds = int(num_xcds)
-    if num_xcds <= 0 or num_xcds > 8:
-        raise ValueError(f"num_xcds must be in [1, 8], got {num_xcds}")
+    validate_4wave_config(
+        K=K, xcd_swizzle=xcd_swizzle, num_cu=num_cu, num_xcds=num_xcds
+    )
+    validate_roles(
+        roles=roles,
+        role_cols=role_cols,
+        block_n=BLOCK_N,
+        hooks=hooks,
+        prep=prep,
+        num_cu=num_cu,
+        num_xcds=num_xcds,
+        xcd_swizzle=xcd_swizzle,
+        col_amax_offset=col_amax_offset,
+    )
     K_ITERS = K // BLOCK_K
     B_K_STEP = 16 * BLOCK_K  # bytes per K128 tile inside a preshuffled 16-row strip
     HALF = WAVE_TILES // 2
-    if num_cu > 0 and K_ITERS % 2:
-        raise ValueError(f"persistent mode requires an even K128 tile count, got K={K}")
     persistent = num_cu > 0
-    assert not persistent or num_cu % num_xcds == 0
-    if roles > 1 and (
-        not (prep and persistent)
-        or role_cols % BLOCK_N
-        or role_hook is None
-        or xcd_swizzle <= 0
-    ):
-        raise ValueError(
-            "roles needs prep, hooks, a persistent swizzled grid and role_cols % 256 == 0"
-        )
+    if roles > 1:
+        after_block, end_role = make_host_steps(hooks)
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -356,31 +377,27 @@ def compile_int8_gemm_4w(
     # the next block's LDS-DMA loads, and add to that tile's phase 3 wait.
     # Tile K_ITERS - 1's phase 3 wait, or with no next block tile
     # K_ITERS - 2's wait for everything, then covers them.
-    SCALE_LOADS = StoreCRows.load_count(bias, prep_spec)
-    FIRST_BLOCK = first_block_hook is not None
-    assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
+    assert P3_VMCNT_TILE0 + StoreCRows.load_count(Int32Source, bias, prep) <= 63
     # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
     # before the phase's barrier. Phase 2's A loads do not count against that
     # wait and run to the end of the phase.
     P1_READS_END = len(PHASE_MFMAS[0]) - 6
     P2_READS_END = len(PHASE_MFMAS[1]) - 6
 
-    _kname = (
-        f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_I8_I8_B16_"
-        f"1x{xcd_swizzle}_k{K}"
-        + (f"_p{num_cu}" if persistent else "")
-        + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
+    _kname = format_kernel_name(
+        make_4wave_kernel_name(
+            K=K, xcd_swizzle=xcd_swizzle, num_cu=num_cu, num_xcds=num_xcds
+        )
         + ("_bias" if bias else "")
-        + ("_prep" + prep_spec.suffix if prep else "")
-        + ("_amax" if amax and not prep else "")
-        + (f"_roles{roles}x{role_cols}" if roles > 1 else "")
-        + (f"_hook{hook_key}" if role_hook is not None else "")
-        + ("_fb" if first_block_hook is not None else "")
-        + ("_th" if tile_hook is not None else "")
-        + (f"_cmax{col_amax_offset}" if col_amax_offset is not None else "")
+        + ("_prep" + prep.suffix if prep is not None else "")
+        + ("_amax" if amax else "")
+        + name_suffix(
+            roles=roles,
+            role_cols=role_cols,
+            hooks=hooks,
+            col_amax_offset=col_amax_offset,
+        )
     )
-    if col_amax_offset is not None and roles < 2:
-        raise ValueError("col_amax_offset needs roles > 1")
 
     @fx.struct
     class SharedStorage:
@@ -395,7 +412,7 @@ def compile_int8_gemm_4w(
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
         Tables: fx.Tensor,
         Partials: fx.Tensor,
         c_m: fx.Int32,
@@ -422,14 +439,18 @@ def compile_int8_gemm_4w(
         wave_n = wave_id % 2
 
         def block_coords(block, role=0):
+            if const_expr(roles > 1):
+                return role_block_coords(
+                    block,
+                    role,
+                    m_blocks=m_blocks,
+                    role_cols=role_cols,
+                    block_n=BLOCK_N,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
+                )
             # A persistent grid is a multiple of num_xcds workgroups or
             # covers all blocks, so block b stays on its workgroup's XCD.
-            if const_expr(roles > 1):
-                # ``block`` counts within the role, so it keeps that property.
-                m, n = _xcd_swizzle_any(
-                    m_blocks, role_cols // BLOCK_N, xcd_swizzle, block, num_xcds
-                )
-                return m, n + role * (role_cols // BLOCK_N)
             if const_expr(xcd_swizzle > 0):
                 return _xcd_swizzle_any(
                     m_blocks,
@@ -839,18 +860,16 @@ def compile_int8_gemm_4w(
             return acc_values, a_values, b_values
 
         store_c = StoreCRows(
-            A_scale,
-            B_scale,
+            Int32Source(A_scale, c_m),
+            Columns,
             C,
             c_m,
             c_n,
-            None,
-            WAVE_TILES,
-            WAVE_TILES,
-            has_bias=bias,
-            prep=(Tables, Partials) if prep else None,
-            prep_spec=prep_spec,
-            amax_partials=Partials if amax and not prep else None,
+            bias=bias,
+            prep=prep,
+            tables=Tables,
+            partials=Partials,
+            amax=amax,
             planar_cols=role_cols if roles > 1 else 0,
         )
 
@@ -927,7 +946,7 @@ def compile_int8_gemm_4w(
                 p1_ops = []
                 if const_expr(t == K_ITERS - 2):
                     p1_ops = scale_ops
-                    p3_vmcnt += SCALE_LOADS
+                    p3_vmcnt += len(scale_ops)
                 has_next = t + 1 < K_ITERS or persistent
                 p3_ops = next_ops if t == 0 else ()
                 return k_tile(
@@ -995,11 +1014,15 @@ def compile_int8_gemm_4w(
                             )
                         next_ops = []
 
-                row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
-                col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
-                scale_ops = [
-                    ("scale", op) for op in store_c.scale_load_ops(row_base, col_base)
-                ]
+                # The wave's tile of the block; WaveTile maps its lanes.
+                tile = store_c.tile(
+                    coords[0] * BLOCK_M + wave_m * WAVE_ROWS,
+                    coords[1] * BLOCK_N + wave_n * WAVE_ROWS,
+                )
+                # In a roles kernel the last role applies no prep and loads none of its
+                # column vectors.
+                apply_prep = role < roles - 1 if roles > 1 else None
+                scale_ops = [("scale", op) for op in store_c.load_ops(tile, apply_prep)]
                 # Tiles 0 and 1 start the accumulators. A runtime loop then takes
                 # the tiles that refill from this block, two per trip so the
                 # buffer parity is static; a fully unrolled K loop overflows the
@@ -1112,33 +1135,20 @@ def compile_int8_gemm_4w(
                     if const_expr(col_amax_offset is not None and role == roles - 1):
                         col_max = aux + col_amax_offset
                     store_c.store_tiles(
-                        mfma_drain(accs),
-                        row_base,
-                        col_base,
-                        scales,
-                        prep=role < roles - 1,
-                        col_max=col_max,
+                        mfma_drain(accs), tile, scales, apply_prep, col_max=col_max
                     )
-                    # Every wave's stores of the tile land before the tile is counted.
-                    fx.rocdl.s_waitcnt(vmcnt=0)
-                    fx.barrier()
-                    if const_expr(tile_hook is not None):
-                        tile_hook(
-                            role, aux, (h0, h1, h2, h3, h4, h5), c_m, row_base, col_base
-                        )
-                    if fx.thread_idx.x == 0:
-                        fx.atomic_add(
-                            _to_ptr_global(aux + role * 4, fx.Int32),
-                            fx.Int32(1),
-                            syncscope=fx.rocdl.SyncScope.Agent,
-                            ordering=fx.AtomicOrdering.Release,
-                        )
-                    # A trace-time branch around a runtime one; they do not merge.
-                    if const_expr(FIRST_BLOCK and role > 0):  # noqa: SIM102
-                        if fx.Int32(block) == block0:
-                            first_block_hook(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
+                    after_block(
+                        role,
+                        aux,
+                        (h0, h1, h2, h3, h4, h5),
+                        c_m,
+                        tile.row_base,
+                        tile.col_base,
+                        block,
+                        block0,
+                    )
                 else:
-                    store_c.store_tiles(mfma_drain(accs), row_base, col_base, scales)
+                    store_c.store_tiles(mfma_drain(accs), tile, scales)
                 if const_expr(persistent):
                     coords = list(next_coords)
                     voffsets = (
@@ -1150,13 +1160,19 @@ def compile_int8_gemm_4w(
             if const_expr(persistent):
                 # LDS-DMA must not land in LDS that a later workgroup owns.
                 fx.rocdl.s_waitcnt(vmcnt=0)
-            if const_expr(role_hook is not None):
-                role_hook(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
+            if const_expr(roles > 1):
+                end_role(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
 
     value_attrs = {
         "rocdl.waves_per_eu": 1,
         "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
     }
+
+    def grid_size(c_m, c_n):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        if const_expr(persistent):
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        return grid_x
 
     @flyc.jit
     def launch_gemm(
@@ -1164,21 +1180,19 @@ def compile_int8_gemm_4w(
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
-        if const_expr(persistent):
-            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
-        # Without prep the kernel never reads its tables and partials arguments.
+        grid_x = grid_size(c_m, c_n)
+        # Without a prep or maxima the kernel reads neither tables nor partials.
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
-            B_scale,
+            Columns,
             A_scale,
             A_scale,
             c_m,
@@ -1194,27 +1208,25 @@ def compile_int8_gemm_4w(
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
     @flyc.jit
-    def launch_gemm_prep(
+    def launch_gemm_epilogue(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
         Tables: fx.Tensor,
         Partials: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
-        if const_expr(persistent):
-            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        grid_x = grid_size(c_m, c_n)
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
-            B_scale,
+            Columns,
             Tables,
             Partials,
             c_m,
@@ -1230,48 +1242,12 @@ def compile_int8_gemm_4w(
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
     @flyc.jit
-    def launch_gemm_amax(
+    def launch_gemm_roles(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        Partials: fx.Tensor,
-        c_m: fx.Int32,
-        c_n: fx.Int32,
-        stream: fx.Stream,
-    ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
-        if const_expr(persistent):
-            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
-        # Without prep the kernel never reads its tables argument.
-        kernel_gemm(
-            A,
-            B_T,
-            C,
-            A_scale,
-            B_scale,
-            A_scale,
-            Partials,
-            c_m,
-            c_n,
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            fx.Int64(0),
-            value_attrs=value_attrs,
-        ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
-
-    @flyc.jit
-    def launch_gemm_roles_hook(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
         Tables: fx.Tensor,
         Partials: fx.Tensor,
         aux: fx.Int64,
@@ -1290,7 +1266,7 @@ def compile_int8_gemm_4w(
             B_T,
             C,
             A_scale,
-            B_scale,
+            Columns,
             Tables,
             Partials,
             c_m,
@@ -1306,11 +1282,9 @@ def compile_int8_gemm_4w(
         ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
     if roles > 1:
-        launcher = launch_gemm_roles_hook
-    elif prep:
-        launcher = launch_gemm_prep
-    elif amax:
-        launcher = launch_gemm_amax
+        launcher = launch_gemm_roles
+    elif prep is not None or amax:
+        launcher = launch_gemm_epilogue
     else:
         launcher = launch_gemm
     return set_slp_vectorize_once_used(launcher, False)

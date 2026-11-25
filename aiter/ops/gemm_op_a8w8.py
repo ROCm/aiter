@@ -177,6 +177,18 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
 
 
+@functools.cache
+def _four_wave():
+    from .flydsl import gemm_a8w8_bpreshuffle_4wave
+
+    return gemm_a8w8_bpreshuffle_4wave
+
+
+@functools.cache
+def _is_4wave_kernel_name(name: str) -> bool:
+    return _four_wave().is_4wave_kernel_name(name)
+
+
 def gemm_a8w8_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -184,12 +196,12 @@ def gemm_a8w8_bpreshuffle_flydsl(
     w_scale: Tensor,
     Out: Tensor,
     config: dict,
-    bias: Tensor | None = None,
+    bias: Tensor | None,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
     # Only the 4-wave INT8 epilogue adds a bias; the INT8 dispatch routes every biased
     # call to it.
-    if bias is not None and not kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+    if bias is not None and not _is_4wave_kernel_name(kernel_name):
         raise ValueError(
             f"gemm_a8w8_bpreshuffle: bias needs a 4-wave INT8 kernel, got {kernel_name!r}"
         )
@@ -201,7 +213,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
-    if kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+    if _is_4wave_kernel_name(kernel_name):
         from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
             run_gemm_a8w8_bpreshuffle_4wave,
         )
@@ -939,18 +951,7 @@ def _check_int8_bpreshuffle_contract(
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("gemm_a8w8_bpreshuffle INT8 operands must share one device")
     if bias is not None:
-        if bias.numel() != N:
-            raise ValueError(
-                f"gemm_a8w8_bpreshuffle INT8 requires a bias of N={N} elements, got "
-                f"{tuple(bias.shape)}"
-            )
-        if bias.dtype not in (torch.float32, torch.bfloat16, torch.float16):
-            raise ValueError(
-                "gemm_a8w8_bpreshuffle INT8 requires an FP32, BF16 or FP16 bias, got "
-                f"{bias.dtype}"
-            )
-        if bias.device != XQ.device:
-            raise ValueError("gemm_a8w8_bpreshuffle INT8 bias must be on XQ's device")
+        _four_wave().check_bias(bias, N, XQ.device)
 
 
 def _int8_row_runs_on_flydsl(config: dict, m: int, k: int) -> bool:
@@ -963,7 +964,7 @@ def _int8_row_runs_on_flydsl(config: dict, m: int, k: int) -> bool:
     if str(config["libtype"]) != "flydsl":
         return False
     kernel_name = str(config.get("kernelName", ""))
-    if kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+    if _is_4wave_kernel_name(kernel_name):
         return True
     from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX
 
@@ -981,6 +982,17 @@ def _warn_untuned_int8_fallback(
     logger.warning(
         f"[{gfx}] gemm_a8w8_bpreshuffle INT8 untuned M={m}, N={n}, K={k}; "
         f"falling back to '{kernel_name}' (correct, not tuned). "
+        "(logged once per shape)"
+    )
+
+
+@functools.cache
+def _warn_bias_overrides_tuned_row(
+    gfx: str, m: int, n: int, k: int, tuned: str, kernel_name: str
+) -> None:
+    logger.warning(
+        f"[{gfx}] gemm_a8w8_bpreshuffle INT8 M={m}, N={n}, K={k} with a bias: the "
+        f"tuned '{tuned}' fuses no bias, so the call runs '{kernel_name}'. "
         "(logged once per shape)"
     )
 
@@ -1053,7 +1065,11 @@ def gemm_a8w8_bpreshuffle(
         ], f"Output {dtype=} is currently not supported in gemm_a8w8"
         assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only supports fp8"
         assert XQ.dtype == WQ.dtype, "activation and weight dtypes must match"
-        assert bias is None, "gemm_a8w8_bpreshuffle does not support FP8 bias"
+        if bias is not None:
+            raise ValueError(
+                "gemm_a8w8_bpreshuffle fuses a bias only for INT8; add an FP8 GEMM's "
+                "bias after it"
+            )
 
     m = XQ.shape[0]
     n = WQ.shape[0]
@@ -1074,9 +1090,7 @@ def gemm_a8w8_bpreshuffle(
     #     if res is not None:
     #         return res
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return _gemm_a8w8_bpreshuffle_into(
-        XQ, WQ, x_scale, w_scale, Y, bias if is_int8 else None
-    )
+    return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y, bias)
 
 
 def _gemm_a8w8_bpreshuffle_into(
@@ -1085,11 +1099,11 @@ def _gemm_a8w8_bpreshuffle_into(
     x_scale: Tensor,
     w_scale: Tensor,
     Y: Tensor,
-    bias: Tensor | None = None,
+    bias: Tensor | None,
 ) -> Tensor:
     """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
     Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
-    the same kernel."""
+    the same kernel. Only an INT8 call takes a ``bias``, and the _out op is FP8."""
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -1119,12 +1133,12 @@ def _gemm_a8w8_bpreshuffle_into(
         )
     if is_int8 and config is not None and not _int8_row_runs_on_flydsl(config, m, w_k):
         config = None
-    if (
-        bias is not None
-        and config is not None
-        and not str(config.get("kernelName", "")).startswith("flydsl_bpreshuffle_4w_")
-    ):
-        config = None
+    # A tuned row that is not a 4-wave kernel cannot fuse the bias.
+    overridden = None
+    if bias is not None and config is not None:
+        tuned = str(config.get("kernelName", ""))
+        if not _is_4wave_kernel_name(tuned):
+            overridden, config = tuned, None
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w
     # with XQ zero-padded to match.
@@ -1148,7 +1162,12 @@ def _gemm_a8w8_bpreshuffle_into(
         )
 
         kernel_name = default_4wave_kernel_name(m, n, w_k)
-        _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, kernel_name)
+        if overridden is not None:
+            _warn_bias_overrides_tuned_row(
+                get_gfx(), m, n, w_k, overridden, kernel_name
+            )
+        else:
+            _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, kernel_name)
         return gemm_a8w8_bpreshuffle_flydsl(
             XQ,
             WQ,
@@ -1176,7 +1195,7 @@ def _gemm_a8w8_bpreshuffle_into(
                 f"falling back to flydsl kernel '{ki.name}'."
             )
             return gemm_a8w8_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}, None
             )
     try:
         if w_k > k:
@@ -1297,10 +1316,10 @@ def gemm_a8w8_bpreshuffle_out(
             raise ValueError(f"out must not overlap {name}")
     # The launchers use the current device's stream.
     if XQ.device.index == torch.cuda.current_device():
-        _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
+        _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out, None)
     else:
         with torch.cuda.device(XQ.device):
-            _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
+            _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out, None)
 
 
 # M at or above which the triton kernel beats the untuned CK fallback, which
