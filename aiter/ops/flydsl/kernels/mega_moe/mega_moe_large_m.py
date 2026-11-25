@@ -2180,7 +2180,13 @@ def compile_mega_moe_stage1(
                     c_hi = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=c_word, word_sel=True)
                     c_acc = c_acc + c_lo.shuffle(c_hi, [0, 1, 2, 3]) * c_sc
             if const_expr(C_ROUTE_I8):
-                c_acc = c_acc - Vec.filled(4, 128.0, fx.Float32) * c_sc_sum
+                # The offset as one scalar product per unit, subtracted value by value: each unit's offset then
+                # sits in the low dword of its own register, which the packed subtract broadcasts (op_sel_hi). The
+                # vector product packed two units' offsets into one register pair and read the second one's high
+                # dword into the low half (op_sel), the v_pk_*_f32 pattern that reads 0 in lanes 48-63 on gfx950
+                # while another wave of the SIMD runs MFMA (ROCm/aiter#7818). Same operations, same bits.
+                c_off = fx.Float32(128.0) * c_sc_sum
+                c_acc = Vec.from_elements([fx.Float32(c_acc[e]) - c_off for e in range_constexpr(4)], fx.Float32)
             skw = {"soffset_bytes": u * 512} if u > 0 else {}
             buffer_store(c_acc.to(fx.BFloat16).bitcast(fx.Int32), c_out_rsrc, c_ec * fx.Int32(2),
                 cache_modifier=C_STORE_CACHE, **skw)
