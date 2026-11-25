@@ -150,9 +150,7 @@ def _issue_chunk(
     stride_v,
     o_c_v,
     o_t,
-    H: gl.constexpr,
     K: gl.constexpr,
-    V: gl.constexpr,
     C: gl.constexpr,
     WITH_OUTPUT: gl.constexpr,
 ):
@@ -276,6 +274,7 @@ def k2_ab_fused_gluon(
 
     ws_off = (o_c_s[:, None] * K + o_k_s[None, :]).to(gl.int32)
     cc_off = (o_r_cc[:, None] * C + o_c_cc[None, :]).to(gl.int32)
+    # int32: rows past the step's end can wrap, but their loads are masked.
     v_off = (i_h * V + o_c_v[:, None] * stride_v + o_w_v[None, :]).to(gl.int32)
 
     inv_ty: gl.constexpr = ws_inv_mqk.dtype.element_ty
@@ -294,8 +293,8 @@ def k2_ab_fused_gluon(
         _issue_chunk(ws_kd, ws_kr, ws_gt, ws_beta, ws_inv_mqk, v_input, None,
                      s_kd.index(0), s_kr.index(0), s_inv.index(0), s_v.index(0),
                      s_gt.index(0), s_beta.index(0), None, None, ws0, tok_base,
-                     tok_end, ws_off, cc_off, v_off, stride_v, o_c_v, o_t, H, K,
-                     V, C, False)  # fmt: skip
+                     tok_end, ws_off, cc_off, v_off, stride_v, o_c_v, o_t, K,
+                     C, False)  # fmt: skip
 
     for j in range(n_chunks):
         cur = j % 2
@@ -307,7 +306,7 @@ def k2_ab_fused_gluon(
                          s_inv.index(1 - cur), s_v.index(1 - cur),
                          s_gt.index(1 - cur), s_beta.index(1 - cur), None, None,
                          ws0 + j + 1, tok_base + (j + 1) * C, tok_end, ws_off,
-                         cc_off, v_off, stride_v, o_c_v, o_t, H, K, V, C,
+                         cc_off, v_off, stride_v, o_c_v, o_t, K, C,
                          False)  # fmt: skip
 
         kd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_kd.index(cur), A_OP_B)
@@ -413,7 +412,8 @@ def k2_c_gluon(
     """Pass C: one segment's recurrence from its incoming state, writing outputs.
 
     Same contract as ``_flash_kda_segment_kernel`` with ``COMPUTE_OUTPUT`` and
-    ``HAS_V`` and without ``STORE_H_OUT``, paged ``state_cache`` included.
+    ``HAS_V`` and without ``STORE_H_OUT``, paged ``state_cache`` included, except
+    that v is read at ``stride_v``.
     Prefetches like pass A. The output is stored from the MFMA layout.
     """
     n_w = gl.num_programs(0)
@@ -498,7 +498,7 @@ def k2_c_gluon(
                      s_kd.index(0), s_kr.index(0), s_inv.index(0), s_v.index(0),
                      s_gt.index(0), s_beta.index(0), s_qd.index(0),
                      s_mqk.index(0), ws0, tok_base, tok_end, ws_off, cc_off,
-                     v_off, stride_v, o_c_v, o_t, H, K, V, C, True)  # fmt: skip
+                     v_off, stride_v, o_c_v, o_t, K, C, True)  # fmt: skip
 
     for j in range(n_chunks):
         cur = j % 2
@@ -511,7 +511,7 @@ def k2_c_gluon(
                          s_gt.index(1 - cur), s_beta.index(1 - cur),
                          s_qd.index(1 - cur), s_mqk.index(1 - cur), ws0 + j + 1,
                          tok_base + (j + 1) * C, tok_end, ws_off, cc_off, v_off,
-                         stride_v, o_c_v, o_t, H, K, V, C, True)  # fmt: skip
+                         stride_v, o_c_v, o_t, K, C, True)  # fmt: skip
 
         t0 = tok_base + j * C
         kd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_kd.index(cur), A_OP_B)

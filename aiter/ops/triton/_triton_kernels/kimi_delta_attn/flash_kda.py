@@ -914,13 +914,13 @@ def _strided_operand(x: torch.Tensor, in_place: bool) -> tuple[torch.Tensor, int
     and the Gluon kernels can read it at its own token stride, else a packed copy."""
     B, T, H, D = x.shape
     readable = B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D)
-    # The gfx950 kernels use 32-bit element offsets and 16-byte vector loads,
-    # so the rows must be 16-byte aligned.
+    # The gfx950 kernels take byte offsets below 2 GiB. Their 16-byte loads need a
+    # base and a token stride that Triton specializes as multiples of 16.
     if readable and DEVICE_ARCH == "gfx950":
         readable = (
-            (T - 1) * x.stride(1) + H * D < 2**31
+            ((T - 1) * x.stride(1) + H * D) * x.element_size() < 2**31
             and x.data_ptr() % 16 == 0
-            and x.stride(1) * x.element_size() % 16 == 0
+            and x.stride(1) % 16 == 0
         )
     if in_place and readable:
         return x, x.stride(1)
@@ -1386,7 +1386,7 @@ def flash_kda_fwd(
         and g.is_contiguous()
         and v.is_contiguous()
     ):
-        v_in_place = use_gluon_k2c and (use_gluon_k2a or not segmented)
+        v_in_place = use_gluon_k2c
         q, stride_q = _strided_operand(q, use_gluon_k1)
         k, stride_k = _strided_operand(k, use_gluon_k1)
         g, stride_g = _strided_operand(g, use_gluon_k1)
