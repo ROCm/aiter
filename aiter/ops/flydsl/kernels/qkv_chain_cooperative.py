@@ -271,15 +271,14 @@ def _lds_wait(addr, target):
 
 
 @functools.cache
-def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
+def compile_qkv_cooperative(n_tokens: int, lookahead: tuple[int, int] | None = None):
     """The measured 32 / 48 / 64-row GEMM tiles; the tail assigns eight rows per owner.
 
-    ``a_row``: the activation is the public GEMM's operand, row-major codes ``[m, K]`` and row-major E8M0 scales
-    ``[m, K / 32]`` (no padding, no (16, 16) relayout; same A_ROW scheme as ``mxfp8_gemm_decode_splitk``): a lane's 16 B
-    of a 64-K block come from its own row, the scale bytes of a row pair are gathered and packed in registers, rows
-    past m read as zero through the buffer bound. Otherwise the codes / scales are the ``mxfp8_quantize_shuffled``
-    layouts. Same results bit for bit."""
-    A_ROW = a_row
+    The activation is the public quantizer's row-major operand: e4m3 codes ``[m, K]`` and row-major E8M0 scales
+    ``[m, K / 32]``, no padding and no relayout (a lane's 16 B of a 64-K block come from its own row, the scale bytes of a
+    row pair are gathered and packed in registers, rows past m read as zero through the buffer bound; scheme of
+    ``mxfp8_gemm_decode_splitk``). ``lookahead`` = (W steps, A blocks) in flight, default the measured table.
+    """
     assert 17 <= n_tokens <= 64
     RT = (n_tokens + 15) // 16
     OWNERS = 2 * RT
@@ -287,11 +286,13 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
     NWG, PW, pairs = 5, 1, 4
     PRE_WORDS = 12
     # Same-process cold graph sweeps. Per-step scheduling barriers keep all variants under 192 VGPRs.
-    law, laa = {2: (4, 6), 3: (3, 6), 4: (2, 8)}[RT]
+    law, laa = {2: (4, 6), 3: (4, 8), 4: (3, 8)}[RT]
     KSTEPS = K // 128
     SW = KSTEPS // (KS * KW)  # 16 K steps per workgroup
     SCB = K // 256
     LA_W, LA_A = _lookahead(SW, RT, NI, 1, 1)
+    if lookahead is not None:
+        law, laa = lookahead
     if law:
         LA_W, LA_A = law, laa
     NA = SW * RT
@@ -302,8 +303,7 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
     name += "_vexpand_weighted_halo"
 
     name += "_satomic"
-    if A_ROW:
-        name += "_arow"
+    name += "_arow"
 
     @fx.struct
     class Shared:
@@ -363,7 +363,7 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
 
         def gemm():
             a_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                arg_a, num_records_bytes=(i32_m * K) if A_ROW else RT * 16 * K
+                arg_a, num_records_bytes=i32_m * K
             )
             w_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 arg_w, num_records_bytes=N * K
@@ -379,27 +379,20 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
                 (n16[ni] * (16 * K) + k_base + lane_off) // 4
                 for ni in range_constexpr(NI)
             ]
-            if const_expr(A_ROW):
-                # row-major codes: lane (q16, l16) -> row 16 * tile + l16, K bytes [16 * q16, +16) of a 64-K block
-                a_dw = [
-                    ((mi * 16 + l16) * K + kz * (SW * 128) + q16 * 16) // 4
-                    for mi in range_constexpr(RT)
-                ]
-                # raw row-major scales of 32-row pair rp (tiles 2 rp, 2 rp + 1): the rows' 8 K-group bytes of a 256-K
-                # block (an 8-byte read: step 0's four groups, then step 1's)
-                as_row_dw = [
-                    ((32 * rp + l16) * (K // 32) + kz * (SW * 4)) // 4
-                    for rp in range_constexpr((RT + 1) // 2)
-                ]
-            else:
-                a_dw = [
-                    (mi * (16 * K) + k_base + lane_off) // 4
-                    for mi in range_constexpr(RT)
-                ]
+            # row-major codes: lane (q16, l16) -> row 16 * tile + l16, K bytes [16 * q16, +16) of a 64-K block
+            a_dw = [
+                ((mi * 16 + l16) * K + kz * (SW * 128) + q16 * 16) // 4
+                for mi in range_constexpr(RT)
+            ]
+            # raw row-major scales of 32-row pair rp (tiles 2 rp, 2 rp + 1): the rows' 8 K-group bytes of a 256-K
+            # block (an 8-byte read: step 0's four groups, then step 1's)
+            as_row_dw = [
+                ((32 * rp + l16) * (K // 32) + kz * (SW * 4)) // 4
+                for rp in range_constexpr((RT + 1) // 2)
+            ]
             sc_lane = q16 * 16 + l16
             sc_k = kz * (SW // 2 * 64)
             ws_dw = ((n16[0] // 2) * SCB) * 64 + sc_k + sc_lane
-            as_dw = sc_k + sc_lane
 
             # A rows past m are the producer's padding: an output row reads only its own A row and rows past m are
             # never stored, so their loads are masked off (half of A's bytes at 8 rows)
@@ -431,9 +424,7 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
 
             def load_a(p):
                 mi, s = p % RT, p // RT
-                if const_expr(A_ROW):
-                    return load_pair(a_rsrc, a_dw[mi], s, False, mi, 128, 64)
-                return load_pair(a_rsrc, a_dw[mi], s, False, mi)
+                return load_pair(a_rsrc, a_dw[mi], s, False, mi, 128, 64)
 
             def load_scales_row(s):
                 out = []
@@ -473,14 +464,7 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
                 if const_expr(s % 2 == 0):
                     return bb, (
                         load_scale(ws_rsrc, ws_dw, s),
-                        (
-                            load_scales_row(s)
-                            if const_expr(A_ROW)
-                            else [
-                                load_scale(as_rsrc, as_dw + rp * SCB * 64, s)
-                                for rp in range_constexpr((RT + 1) // 2)
-                            ]
-                        ),
+                        load_scales_row(s),
                     )
                 return bb, None
 
@@ -499,14 +483,13 @@ def compile_qkv_cooperative(n_tokens: int, a_row: bool = False):
                 bb, sc = w_q[s]
                 if const_expr(s % 2 == 0):
                     sw, sa = sc
-                    if const_expr(A_ROW):
-                        sa_raw, sa = sa, [None] * ((RT + 1) // 2)  # packed at first use
+                    sa_raw, sa = sa, [None] * ((RT + 1) // 2)  # packed at first use
                 for mi in range_constexpr(RT):
                     t = s * RT + mi
                     if const_expr(t + LA_A < NA):
                         p = t + LA_A
                         a_q[p] = load_a(p)
-                    if const_expr(A_ROW and sa[mi // 2] is None):
+                    if const_expr(sa[mi // 2] is None):
                         sa[mi // 2] = pack_a_scale_row(sa_raw, mi // 2)
                     a_op = a_q[t]
                     a_q[t] = None

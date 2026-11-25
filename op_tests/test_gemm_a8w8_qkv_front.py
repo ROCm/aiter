@@ -4,6 +4,8 @@
 against the plain tier through the same public calls (see test_flydsl_qkv_chain.py for the kernel-level checks).
 """
 
+import inspect
+
 import pytest
 import torch
 
@@ -111,14 +113,15 @@ def _inputs(m):
 
 
 @needs_gfx950
-@pytest.mark.parametrize("a_row", [False, True])
 @pytest.mark.parametrize("m", [17, 33, 64, 65, 97, 128])
-def test_fused_tier_matches_plain_tier(m, a_row):
-    if a_row and m > 64:
+def test_fused_tier_matches_plain_tier(m):
+    if m > 64:
         from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
 
-        if not hasattr(sk, "mxfp8_gemm_decode_splitk_rowmajor"):
-            pytest.skip("split-3 row-major activation entry (A_ROW) not in this tree")
+        if not "cfg" in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
+            pytest.skip(
+                "split-3 row-major activation entry (A_ROW) not in this tree (#8610)"
+            )
     weight, w_scale, chain_scale, aux, cs = _setup()
     x, pos, slot = _inputs(m)
     ks, vs = torch.tensor([0.5], device="cuda"), torch.tensor([0.7], device="cuda")
@@ -128,7 +131,7 @@ def test_fused_tier_matches_plain_tier(m, a_row):
         kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8, device="cuda")
         ix = torch.zeros(NB, 128, 72, dtype=torch.uint8, device="cuda")
         qkv = front.gemm_a8w8_qkv_front(
-            x, weight, w_scale, chain_scale, defer_ok=t != "plain", tier=t, a_row=a_row
+            x, weight, w_scale, chain_scale, defer_ok=t != "plain", tier=t
         )
         assert (getattr(front._STATE, "deferred", None) is not None) == (t != "plain")
         q, iq = _insert(qkv, aux, cs, pos, slot, kv, ix, m, ks, vs)

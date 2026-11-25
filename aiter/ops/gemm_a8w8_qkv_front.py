@@ -106,7 +106,6 @@ class _Deferred(NamedTuple):
     scales: Tensor
     weight: Tensor
     chain_scale: Tensor
-    a_row: bool = False
 
 
 # One parked front per thread (TBO decode runs its two micro-batches on two threads, each projection -> insert in turn).
@@ -136,15 +135,11 @@ def gemm_a8w8_qkv_front(
     *,
     defer_ok: bool,
     tier: str | None = None,
-    a_row: bool = False,
 ) -> Tensor:
     """bf16 ``x [M, 6144]`` @ the preshuffled (16, 16) MXFP8 ``weight [2560, 6144]`` (row-major E8M0 ``weight_scale``,
     ``chain_scale`` = :func:`chain_weight_scale` of it) -> bf16 ``[M, 2560]``, or an uncomputed tensor of that shape
     when the tuned tier is a fused one and ``defer_ok`` (see the module docstring). ``tier`` overrides the table (tuner).
-    ``a_row``: a fused tier takes the plain quantizer's row-major codes / scales instead of the (16, 16) layout.
     """
-    from .flydsl.kernels import qkv_chain as _chain
-    from .flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
     from .gemm_op_a8w8 import gemm_a8w8_blockscale
     from .quant import per_group_quant_hip
 
@@ -152,23 +147,18 @@ def gemm_a8w8_qkv_front(
     _STATE.deferred = None
     if tier is None:
         tier = front_tier(m) if defer_ok else TIER_PLAIN
-    if tier != TIER_PLAIN:
-        if not tier_applies(tier, m):
-            raise ValueError(f"qkv front tier {tier} does not serve {m} rows")
-        if a_row:
-            codes, scales = per_group_quant_hip(
-                x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
-            )
-        else:
-            codes, scales = mxfp8_quantize_shuffled(x, _chain.code_rows(m))
-        qkv = torch.empty((m, N), dtype=dtypes.bf16, device=x.device)
-        _STATE.deferred = _Deferred(
-            m, qkv.data_ptr(), tier, codes, scales, weight, chain_scale, a_row
-        )
-        return qkv
+    # the plain quantizer's row-major codes / E8M0 scales feed every tier (no relayout)
     xq, xs = per_group_quant_hip(
         x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
     )
+    if tier != TIER_PLAIN:
+        if not tier_applies(tier, m):
+            raise ValueError(f"qkv front tier {tier} does not serve {m} rows")
+        qkv = torch.empty((m, N), dtype=dtypes.bf16, device=x.device)
+        _STATE.deferred = _Deferred(
+            m, qkv.data_ptr(), tier, xq, xs, weight, chain_scale
+        )
+        return qkv
     return gemm_a8w8_blockscale(
         xq,
         weight,
@@ -232,7 +222,6 @@ def run_deferred(
         num_kv_heads=num_kv_heads,
         num_index_heads=num_index_heads,
         eps=eps,
-        a_row=d.a_row,
     )
 
 

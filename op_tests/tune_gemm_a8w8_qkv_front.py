@@ -41,7 +41,7 @@ class _Set:
         self.ix = torch.zeros(NB, 128, 72, dtype=torch.uint8, device="cuda")
 
 
-def _front_call(s, x, tier, aux, m, a_row=False):
+def _front_call(s, x, tier, aux, m):
     qkv = front.gemm_a8w8_qkv_front(
         x,
         s.weight,
@@ -49,7 +49,6 @@ def _front_call(s, x, tier, aux, m, a_row=False):
         s.chain_scale,
         defer_ok=tier != "plain",
         tier=tier,
-        a_row=a_row,
     )
     q = torch.empty(m, 2048, dtype=torch.bfloat16, device="cuda")
     iq = torch.empty(m, 128, dtype=dtypes.fp8, device="cuda")
@@ -89,16 +88,16 @@ def _aux(m, seed=1):
     )
 
 
-def time_tier(sets, x, tier, reps=30, a_row=False):
+def time_tier(sets, x, tier, reps=30):
     m = x.shape[0]
     aux = _aux(m)
     for s in sets:  # eager warm-up (compile, counter pools)
-        _front_call(s, x, tier, aux, m, a_row)
+        _front_call(s, x, tier, aux, m)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for s in sets:
-            _front_call(s, x, tier, aux, m, a_row)
+            _front_call(s, x, tier, aux, m)
     ts = []
     for _ in range(reps):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
@@ -109,7 +108,7 @@ def time_tier(sets, x, tier, reps=30, a_row=False):
         b.record()
         b.synchronize()
         ts.append(a.elapsed_time(b) * 1000.0 / len(sets))
-    q, _ = _front_call(sets[0], x, tier, aux, m, a_row)
+    q, _ = _front_call(sets[0], x, tier, aux, m)
     torch.cuda.synchronize()
     return statistics.median(ts), q
 

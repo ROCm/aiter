@@ -49,17 +49,6 @@ def chain_supported(m: int) -> bool:
     return supported(m) or supported_split(m)
 
 
-def code_rows(m: int) -> int:
-    """Rows of (16, 16)-layout activation codes ``qkv_chain_insert`` reads at ``m`` rows: pass this as the quantizer's
-    block (``mxfp8_quantize_shuffled(x, code_rows(m))``)."""
-    return (m + 15) // 16 * 16 if supported(m) else _splitk.code_rows(m)
-
-
-def tile_rows(m: int) -> int:
-    """Row tile of the (16, 16)-layout activation codes this chain reads (rows are padded to it)."""
-    return 16
-
-
 @functools.cache
 def _capture_info_api():
     lib = ctypes.CDLL("libamdhip64.so")
@@ -119,8 +108,8 @@ def _counters(device: torch.device) -> torch.Tensor:
 
 
 def qkv_chain_cooperative_insert(
-    activation: torch.Tensor,  # e4m3 codes, (16, 16) layout, rows padded to 16
-    activation_scale: torch.Tensor,  # AITER-shuffled E8M0 scales [ceil(rows / 32) * 32, K / 32]
+    activation: torch.Tensor,  # e4m3 codes [m, K], row-major (per_group_quant_hip)
+    activation_scale: torch.Tensor,  # E8M0 scales [m, K / 32], row-major, unshuffled
     weight: torch.Tensor,  # [2560, 6144] preshuffled (16, 16) e4m3 codes
     weight_scale: torch.Tensor,  # its AITER-shuffled E8M0 scales
     m: int,
@@ -143,17 +132,10 @@ def qkv_chain_cooperative_insert(
     num_kv_heads: int = 1,
     num_index_heads: int = 1,
     eps: float,
-    a_row: bool = False,
 ) -> None:
-    """Writes ``q_out``, ``index_q_out`` and the KV / index pages; bitwise the unfused split-3 chain.
-
-    ``a_row``: ``activation`` / ``activation_scale`` are the plain quantizer's row-major ``[m, K]`` codes and
-    ``[m, K / 32]`` E8M0 scales (``per_group_quant_hip``) instead of the (16, 16)-layout / shuffled-scale pair.
-    """
+    """Writes ``q_out``, ``index_q_out`` and the KV / index pages; bitwise the unfused split-3 chain. The activation is
+    the plain quantizer's output (``per_group_quant_hip``, 1x32 E8M0), no relayout."""
     assert supported(m), f"qkv chain: {m} rows outside {COOP_ROWS}"
-    a_row_scale_ok = not a_row or (
-        activation.shape[0] >= m and activation_scale.numel() >= m * (K // 32)
-    )
     assert (num_heads, num_kv_heads, num_index_heads) == (16, 1, 1)
     assert (
         tuple(weight.shape) == (N, K)
@@ -161,19 +143,10 @@ def qkv_chain_cooperative_insert(
         and cos_sin_cache.shape[1] == ROT
     )
     assert eps >= 2.0**-126  # the kernel's rsqrt skips ocml's denormal scaling
-    rows = (
-        (m + 15) // 16 * 16
-    )  # the kernel reads whole 16-row tiles of codes and 32-row groups of scales
     assert activation.is_contiguous() and weight.is_contiguous()
-    if a_row:
-        assert a_row_scale_ok, "row-major activation / scales shorter than m rows"
-    else:
-        assert (
-            activation.shape[0] >= rows
-        ), f"activation has {activation.shape[0]} rows, the {m}-row tile needs {rows}"
-        assert activation_scale.numel() >= (rows + 31) // 32 * 32 * (
-            K // 32
-        ), "activation scales too short"
+    assert activation.shape[0] >= m and activation_scale.numel() >= m * (
+        K // 32
+    ), "row-major activation / scales shorter than m rows"
     assert weight_scale.numel() == N * (
         K // 32
     ), "weight scales must be the AITER-shuffled [2560, 192] bytes"
@@ -246,7 +219,7 @@ def qkv_chain_cooperative_insert(
             dev, m, activation, weight, activation_scale, weight_scale, q_out,
             index_q_out, q_norm_weight, k_norm_weight, index_q_norm_weight,
             index_k_norm_weight, cos_sin_cache, positions, slot_mapping,
-            index_slot_mapping, kv_cache, index_cache, k_scale, v_scale, eps, a_row,
+            index_slot_mapping, kv_cache, index_cache, k_scale, v_scale, eps,
         )  # fmt: skip
 
 
@@ -254,11 +227,11 @@ def _launch(
     dev, m, activation, weight, activation_scale, weight_scale, q_out, index_q_out,
     q_norm_weight, k_norm_weight, index_q_norm_weight, index_k_norm_weight,
     cos_sin_cache, positions, slot_mapping, index_slot_mapping, kv_cache,
-    index_cache, k_scale, v_scale, eps, a_row=False,
+    index_cache, k_scale, v_scale, eps,
 ):  # fmt: skip
     slab = torch.empty((KS, m, N), dtype=torch.float32, device=dev)
     _run_compiled(
-        compile_qkv_cooperative((m + 15) // 16 * 16, a_row),
+        compile_qkv_cooperative((m + 15) // 16 * 16),
         activation.data_ptr(),
         weight.data_ptr(),
         activation_scale.data_ptr(),
@@ -280,11 +253,7 @@ def _launch(
         k_scale.data_ptr(),
         v_scale.data_ptr(),
         m,
-        (
-            (m * (K // 32))
-            if a_row
-            else activation_scale.numel() * activation_scale.element_size()
-        ),
+        m * (K // 32),
         index_q_out.stride(0),
         kv_cache.stride(0),
         index_cache.stride(0),
@@ -296,8 +265,8 @@ def _launch(
 
 
 def qkv_chain_split_insert(
-    activation: torch.Tensor,  # e4m3 codes, (16, 16) layout, ``code_rows(m)`` rows
-    activation_scale: torch.Tensor,  # AITER-shuffled E8M0 scales [ceil(rows / 32) * 32, K / 32]
+    activation: torch.Tensor,  # e4m3 codes [m, K], row-major (per_group_quant_hip)
+    activation_scale: torch.Tensor,  # E8M0 scales [m, K / 32], row-major, unshuffled
     weight: torch.Tensor,  # [2560, 6144] preshuffled (16, 16) e4m3 codes
     weight_scale: torch.Tensor,  # its AITER-shuffled E8M0 scales
     m: int,
@@ -320,7 +289,6 @@ def qkv_chain_split_insert(
     num_kv_heads: int = 1,
     num_index_heads: int = 1,
     eps: float,
-    a_row: bool = False,
 ) -> None:
     """65-128 rows in two launches: the split-3 decode GEMM (fp32 K-third slabs) and ``qkv_reduce_insert`` (sum, bf16
     round, norm, RoPE, NVFP4 K / V / index-K inserts). Bitwise the unfused split-3 chain.
@@ -350,15 +318,10 @@ def qkv_chain_split_insert(
         and index_cache.stride(1) == 72
         and index_cache.stride(2) == 1
     )
-    if a_row:
-        # the split-3 GEMM's row-major-activation entry (same results; needs the A_ROW split-3 kernel, #8610)
-        slab = _splitk.mxfp8_gemm_decode_splitk_rowmajor(
-            activation, activation_scale, weight, weight_scale
-        )
-    else:
-        slab = _splitk.mxfp8_gemm_decode_splitk(
-            activation, activation_scale, weight, weight_scale, m
-        )
+    # the split-3 GEMM on row-major activation codes / scales (#8610: ``mxfp8_gemm_decode_splitk`` takes row-major A only)
+    slab = _splitk.mxfp8_gemm_decode_splitk(
+        activation, activation_scale, weight, weight_scale
+    )
     _run_compiled(
         compile_qkv_reduce_insert(),
         slab.data_ptr(),

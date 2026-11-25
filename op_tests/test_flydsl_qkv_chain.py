@@ -74,8 +74,7 @@ needs_gfx950 = pytest.mark.skipif(get_gfx_runtime() != "gfx950", reason="gfx950 
     "m", [17, 24, 32, 40, 48, 56, 64, 65, 72, 80, 81, 96, 97, 112, 128]
 )
 def test_chain_matches_public_path(m, skip):
-    from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
-    from aiter.ops.flydsl.kernels.qkv_chain import code_rows, qkv_chain_insert
+    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_insert
 
     wsh, w_scale, chain_scale, qw, kw, iqw, ikw, cs, ks, vs = _weights()
     x, pos, slot = make_inputs(m, m + skip, skip)
@@ -131,7 +130,9 @@ def test_chain_matches_public_path(m, skip):
                 skip_index_branch=False,
             )
         else:
-            codes, sc = mxfp8_quantize_shuffled(x, code_rows(m))
+            codes, sc = per_group_quant_hip(
+                x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+            )
             qkv_chain_insert(
                 codes,
                 sc,
@@ -183,8 +184,7 @@ def test_chain_matches_public_path(m, skip):
 @needs_gfx950
 @pytest.mark.parametrize("m", [40, 72, 112])
 def test_chain_graph_replay_matches_eager(m):
-    from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
-    from aiter.ops.flydsl.kernels.qkv_chain import code_rows, qkv_chain_insert
+    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_insert
 
     wsh, _, chain_scale, qw, kw, iqw, ikw, cs, ks, vs = _weights()
     x, pos, slot = make_inputs(m, 123)
@@ -196,7 +196,9 @@ def test_chain_graph_replay_matches_eager(m):
     xin = x.clone()
 
     def call():
-        codes, sc = mxfp8_quantize_shuffled(xin, code_rows(m))
+        codes, sc = per_group_quant_hip(
+            xin, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+        )
         qkv_chain_insert(
             codes,
             sc,
