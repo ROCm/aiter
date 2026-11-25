@@ -321,7 +321,7 @@ def test_topk_per_row_small_k_exact(
     live_lens = row_lens.clamp(max=width)
     out = torch.full((rows, k), -7, dtype=dtypes.i32)
     gfx950 = get_gfx_runtime() == "gfx950"
-    wave = gfx950 and bool(_wave_tile(k, width, 64, _wave_width_limit(rows)))
+    wave = gfx950 and bool(_wave_tile(k, width, 64, _wave_width_limit(rows, False)))
     ret = {"gfx": get_gfx(), "one-wave": wave, "err": 0}
 
     def check(got, exact, msg):
@@ -411,7 +411,7 @@ def test_topk_per_row_small_k_prefill(
     ref = exact_ids(scores, row_lens, 16, init_blocks, local_blocks)
     out = torch.empty(rows, 16, dtype=dtypes.i32)
     wave = get_gfx_runtime() == "gfx950" and bool(
-        _wave_tile(16, width, 64, _wave_width_limit(rows))
+        _wave_tile(16, width, 64, _wave_width_limit(rows, False))
     )
     ret = {"width": width, "one-wave": wave}
     got, ret["us"] = run_perftest(

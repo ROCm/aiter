@@ -38,18 +38,30 @@ def _row_bucket(width: int) -> int:
 
 
 _WAVE_K = 16
-# One wave a row cannot fill the part with few rows, and a wide row is its latency. Measured on gfx950, k=16,
-# the one-wave build against the chunked one (graph replay, us per call, 6 rotating buffers):
-#   rows     width 1024-1408   1700-3072       4096            6144           8192
-#   1-1024   0.5-0.9x (wins)   1.1-1.3x slower 1.2-2.0x slower 1.6x slower    1.5-2.0x slower
-#   2048     0.7-0.9x          0.8-0.9x        parity (1.0x)   parity         -
-#   3072+    0.5-0.8x          0.6-0.8x        0.75-0.9x       0.87-0.9x      1.0-1.07x (parity)
-# so it takes a row up to the width listed for the row count: parity at one row of 1408 columns, a win above.
-_WAVE_WIDTH_BY_ROWS = ((3072, 6144), (2048, 3072), (0, 1408))
+# One wave a row cannot fill the part with few rows, and a wide row is its latency; against that it reads only a
+# row's live columns, which the chunked build does not skip. Measured on gfx950, k=16, fp32 (graph replay, 6
+# rotating buffers, 12 row counts x 14 widths 64..8192, gaussian and tie-heavy scores, forced blocks on and off),
+# wave time / chunked time, geometric mean over those variants:
+#
+#   row_lens a tensor (lengths uniform in 1..width)    row_lens None (every row full width)
+#   rows     1408   2048  3072  4096  6144  8192      rows     1408  2048  3072  4096  6144  8192
+#   1-512    .87-.98 1.1+  1.1+  1.2+  1.3+  1.5+     1-64     .97   1.3   1.2   1.6   1.8   2.0
+#   1024     .79    .99   .94   1.13  1.16  1.27      1024     .91   1.17  1.06  1.26  1.31  1.34
+#   2048     .62    .81   .75   .91   .89   1.00      4096     .56   .84   .72   .95   1.02  1.10
+#   3072+    <=.54  <=.74 <=.67 <=.78 <=.81 <=.92     32768    .35   .62   .59   .83   .97   1.04
+#
+# So the one-wave build takes a row up to the width listed for its row count, in two tables: the chunked build
+# has a specialisation for full-width rows that drops its masks (`fixed_row_len`), which narrows the wave
+# build's lead there; a `row_lens` tensor is taken to be ragged (a prefill's rows are). A tensor that happens to
+# hold only full lengths is a few percent slower than it could be. Between measured row counts the lower one's
+# width applies.
+_WAVE_WIDTH_RAGGED = ((2048, 8192), (1024, 3072), (0, 1408))
+_WAVE_WIDTH_FULL_ROWS = ((32768, 6144), (4096, 4096), (0, 1408))
 
 
-def _wave_width_limit(rows: int) -> int:
-    return next(w for r, w in _WAVE_WIDTH_BY_ROWS if rows >= r)
+def _wave_width_limit(rows: int, full_rows: bool) -> int:
+    table = _WAVE_WIDTH_FULL_ROWS if full_rows else _WAVE_WIDTH_RAGGED
+    return next(w for r, w in table if rows >= r)
 
 
 @lru_cache(maxsize=64)
@@ -57,7 +69,7 @@ def _wave_tile(k: int, width: int, wave_size: int, width_limit: int) -> int:
     """The window tile of the one-wave-per-row build if it serves and wins this geometry, else 0.
 
     It serves k=16 rows of 16 to 8192 columns (the 13 index bits of its tie-break) on gfx950, where a wave is 64
-    lanes, and wins up to `width_limit` columns (`_wave_width_limit` of the row count, table above). The tensor
+    lanes, and wins up to `width_limit` columns (`_wave_width_limit` of the row count, tables above). The tensor
     half of its contract (fp32, inner stride 1) is the one `_unsupported_reason` already enforces for both
     builds. A pure function of its arguments, like `topk_per_row_small_k_serves`, so the hot path asks it once
     per shape through `_plan`.
@@ -223,7 +235,7 @@ def topk_per_row_small_k(
         wave_size_of(scores.device.index),
         bool(init_blocks or local_blocks),
         row_lens is None,
-        _wave_width_limit(rows),
+        _wave_width_limit(rows, row_lens is None),
     )
     stream = torch.cuda.current_stream(scores.device)
     if wave:
