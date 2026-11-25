@@ -71,10 +71,12 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
         cases = [
             *(
                 (token, 65, "16", "16", "3", "3")
-                for token in (8, 32, 64, 128, 256, 512)
+                for token in (8, 32, 64, 128, 256)
             ),
-            (1024, 65, "128", "128", "2", "2"),
-            (2048, 65, "128", "128", "2", "2"),
+            # Rows retuned on the fused-shared-expert key (88480c113c).
+            (512, 65, "32", "32", "3", "3"),
+            (1024, 65, "64", "64", "3", "3"),
+            (2048, 65, "128", "128", "3", "3"),
             (4096, 65, "128", "128", "3", "3"),
             (4096, 64, "128", "128", "3", "3"),
             (8192, 65, "256", "256", "4", "4"),
@@ -154,7 +156,7 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("AITER_TDM_TILE_M", None)
             os.environ.pop("AITER_TDM_TILE_M2", None)
-            for token, expected in ((32768, 256), (512, 16)):
+            for token, expected in ((32768, 256), (512, 32)):
                 with self.subTest(token=token):
                     self.assertEqual(
                         _compact_gemm_align_m(config, recv_bound=token), expected
