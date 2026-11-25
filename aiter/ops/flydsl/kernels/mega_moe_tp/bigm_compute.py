@@ -411,6 +411,13 @@ class MegaMoeTPBigM:
                     T,
                     clamp=True,
                 )
+            if tu is None and self.sh8 and not sfx:
+                # (the MXFP8 shared expert: its own rows, mode "<mode>_sh8", first)
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode + "_sh8"}, "tokens"),
+                    T,
+                    clamp=True,
+                )
             if tu is None:
                 tu = nearest(
                     tuned_rows(path, {**key, "mode": mode}, "tokens"), T, clamp=True

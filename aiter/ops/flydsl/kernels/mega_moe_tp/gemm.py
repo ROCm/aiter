@@ -193,6 +193,12 @@ def build_gemm(kc: KernelCtx) -> dict:
                 _gemm1h(L, tid, a, expert, i0, bnt=False, W8=True)
             else:
                 _gemm1(L, tid, a, expert, i0, nnb, 1, None, kr, out, bnt=False, W8=True)
+        elif const_expr(npp > 1 and kr is None):
+            # (LB: npp column blocks per A pass, as the A loader's groups: g1_group)
+            if (nnb % i32(npp)) == i32(0):
+                _gemm1(L, tid, a, expert, i0, nnb, npp, None, bnt=False, W8=True)
+            else:
+                _gemm1(L, tid, a, expert, i0, nnb, 1, None, bnt=False, W8=True)
         else:
             _gemm1(L, tid, a, expert, i0, nnb, 1, None, kr, out, bnt=False, W8=True)
 

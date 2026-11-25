@@ -178,11 +178,10 @@ class MegaMoeTPConfig:
     linear_beta: float | None = None
     swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
-    # "fp8" (default: quantized wire, what the tuned tables were measured with), "bf16"
-    # (lossless collectives: twice the wire bytes; ar_gather "auto" then stays bf16) or
-    # "int8" (the big-M path's int8 reduce-scatter and y gather per its tuned rows; the
-    # small engine has no int8 wire: its batches run "fp8")
-    comm_dtype: str = "fp8"
+    # "bf16" (default: lossless collectives; ar_gather "auto" then stays bf16), "fp8"
+    # (quantized wire: half the bytes) or "int8" (the big-M path's int8 reduce-scatter and
+    # y gather per its tuned rows; the small engine has no int8 wire: its batches run "fp8")
+    comm_dtype: str = "bf16"
     ar_gather: str = "auto"
     schedule: str = "dynamic"
     # "fp4" (a4w4), "fp8", "bf16" (a16w4: two MXFP8 terms, the small-M schedule only), or
@@ -260,7 +259,15 @@ class MegaMoeTP:
                 f"MegaMoeTP: bigm_min_tokens {bmin} < {PAD * cfg.world_size} (the big-M "
                 f"kernel runs at least {PAD} local rows)"
             )
-        if bmin is None and big_ok:
+        # (ar with the MXFP8 second hop -- ar_gather "auto", quantized comm -- : the LB
+        # schedule measured faster than big-M up to what the small engine holds, e.g. M3.1
+        # tp4 8192 tokens 1498 vs 1549 us)
+        ag8 = (
+            cfg.comm_mode == "ar"
+            and cfg.ar_gather == "auto"
+            and cfg.comm_dtype != "bf16"
+        )
+        if bmin is None and big_ok and not ag8:
             # (default threshold) the smallest batch the big-M table holds a tuned row of,
             # for this shape and mode: tuned there because big-M measured faster from it on
             # (else, below: the batches the small engine cannot hold)

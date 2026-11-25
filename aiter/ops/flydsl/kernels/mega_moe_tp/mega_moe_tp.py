@@ -301,7 +301,7 @@ class MegaMoeTPEngine:
         situ_linear_beta: float = 1.0,
         swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
-        comm_dtype: str = "fp8",
+        comm_dtype: str = "bf16",
         ar_gather: str = "auto",
         schedule: str = "dynamic",
         act_dtype: str = "fp4",
@@ -947,15 +947,10 @@ class MegaMoeTPEngine:
                 self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
                 lb=True,
             ),
-            # (the MXFP8 shared expert's GEMM1 runs one column block per A pass and its
-            # GEMM2 without the cross-unit prefetch: npp 1, pf off)
-            npp=(
-                1
-                if self.sh8
-                else self._fit_npp(tu.get("npp", 2 if small else self.lb_npp))
-            ),
+            npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
             ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
             lb=True,
+            # (the MXFP8 shared expert's GEMM2 has no cross-unit prefetch)
             pf=not self.sh8 and bool(tu.get("pf", tot <= LB_PF_MAX)),
             lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
             q=q if q in self._lb_q_valid else 0,
