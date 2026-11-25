@@ -11,7 +11,7 @@ import torch
 import torch.profiler as tpf
 
 from aiter import logger
-from aiter.utility.measure import flush_llc, llc_flush_buffer
+from aiter.utility.measure import flush_llc, llc_bytes, llc_flush_buffer
 
 pd.set_option("display.max_rows", 200)
 ## debug ##
@@ -73,12 +73,12 @@ def perftest(
                     func, *args, **kwargs
                 )
 
-                properties = torch.cuda.get_device_properties(gpu_id)
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
                 if pristine is not None:
                     free_memory += _device_tensor_bytes(*pristine)
+                # The flush colds the first pass; a 2 x LLC ring keeps later passes cold.
                 cache_size = min(
-                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
+                    2 * llc_bytes(gpu_id),
                     (free_memory - iter_used_memory + inputSize) * 0.9,
                 )
                 cache_size = max(cache_size, 0)

@@ -219,6 +219,23 @@ class TestPerftestWarmupAndFlush(unittest.TestCase):
                 self.assertEqual(len(trace), warmup_calls + 6)
                 self.assertEqual(len(set(trace[:warmup_calls])), num)
 
+    def test_copies_stop_at_twice_the_llc(self):
+        trace = []
+        x = torch.ones(16384, device="cuda")
+        out = torch.empty_like(x)
+
+        def func(x, out):
+            trace.append(out.data_ptr())
+            return out.copy_(x)
+
+        with (
+            patch.object(test_common, "flush_llc"),
+            patch.object(test_common, "llc_bytes", return_value=1 << 20),
+        ):
+            perftest(num_iters=40, num_warmup=2)(func)(x, out)
+        # 128 KiB of inputs against a 1 MiB LLC: 16 copies make the 2 MiB ring.
+        self.assertEqual(len(set(trace[-40:])), 16)
+
     def test_flush_buffer_is_twice_the_llc_and_kept(self):
         device = torch.cuda.current_device()
         buf = measure.llc_flush_buffer(device)
