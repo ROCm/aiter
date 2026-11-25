@@ -11,9 +11,10 @@ one expert come out in atomic order, not token order).
 
 import argparse
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -45,7 +46,15 @@ def run_chain(x, logits, bias, block_m, shared_w=1.0):
         sorted_weights=sw,
         num_experts_upper_bound=rsq.E_ALL,
     )
-    return dict(ids=ids, w=w, sid=sid, seid=seid, nv=nv, a1=a1, a1s=a1s)
+    return {
+        "ids": ids,
+        "w": w,
+        "sid": sid,
+        "seid": seid,
+        "nv": nv,
+        "a1": a1,
+        "a1s": a1s,
+    }
 
 
 def _bytes(t):

@@ -69,17 +69,17 @@ class MoeRouteSortQuant:
         s = _max_sorted(m, bm)
         b = (s + bm - 1) // bm
         dev = x.device
-        out = dict(
-            topk_ids=torch.empty((m, rsq.TOPK), dtype=torch.int32, device=dev),
-            topk_w=torch.empty((m, rsq.TOPK), dtype=torch.float32, device=dev),
-            sorted_ids=torch.empty((s,), dtype=torch.int32, device=dev),
-            sorted_w=torch.empty((s,), dtype=torch.float32, device=dev),
-            sorted_eids=torch.empty((b,), dtype=torch.int32, device=dev),
-            num_valid=torch.empty((2,), dtype=torch.int32, device=dev),
-            a1=torch.empty((m, rsq.DIM), dtype=torch.float8_e4m3fn, device=dev),
-            a1_scale=self.a1_scale[:s].view(torch.float8_e8m0fnu),
-            block_m=bm,
-        )
+        out = {
+            "topk_ids": torch.empty((m, rsq.TOPK), dtype=torch.int32, device=dev),
+            "topk_w": torch.empty((m, rsq.TOPK), dtype=torch.float32, device=dev),
+            "sorted_ids": torch.empty((s,), dtype=torch.int32, device=dev),
+            "sorted_w": torch.empty((s,), dtype=torch.float32, device=dev),
+            "sorted_eids": torch.empty((b,), dtype=torch.int32, device=dev),
+            "num_valid": torch.empty((2,), dtype=torch.int32, device=dev),
+            "a1": torch.empty((m, rsq.DIM), dtype=torch.float8_e4m3fn, device=dev),
+            "a1_scale": self.a1_scale[:s].view(torch.float8_e8m0fnu),
+            "block_m": bm,
+        }
         stream = torch.cuda.current_stream()
         _run_compiled(
             self.exe1,

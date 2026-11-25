@@ -184,7 +184,8 @@ def build_route_p1(waves: int = WAVES):
         for i in range_constexpr(EPT):
             e = lane + fx.Int32(WAVE * i)
             s = score_of(fx.Float32(logits_t[tc * fx.Int32(E_ROUTED) + e]))
-            origs.append((s == s).select(s, fx.Float32(0.0)))
+            # `s == s` is false only for NaN: a NaN score becomes 0.
+            origs.append((s == s).select(s, fx.Float32(0.0)))  # noqa: PLR0124
             vals.append(
                 fx.maxnumf(s + fx.Float32(bias_t[e]), fx.Float32(-float("inf")))
             )
@@ -300,8 +301,8 @@ def build_route_p1(waves: int = WAVES):
         rsf: fx.Float32,
         shared_w: fx.Float32,
         n_workers: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):  # noqa: B008
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
@@ -494,8 +495,8 @@ def build_route_p2(block_m: int = BLOCK_M, waves: int = WAVES):
         n_valid: fx.Pointer,
         m_tokens: fx.Int32,
         n_workers: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):  # noqa: B008
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
