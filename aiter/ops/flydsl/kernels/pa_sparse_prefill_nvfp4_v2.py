@@ -39,6 +39,16 @@ still be in flight under QK; ``prefetch`` k adds L2 prefetch hints k pages
 ahead of the DMA ring. Both leave the arithmetic and its order alone: the
 output is bit for bit the default kernel's.
 
+Occupancy (4 SIMDs and 320 KB of LDS a CU): k waves a SIMD need at most
+1024 / k VGPRs a wave and 320 / k KB of LDS a CTA. The default walk (336 VGPRs,
+67 KB) runs 3; a tile of 4 rows keeps 4 x 66 VGPRs of row state a wave and runs
+2, of 6 or 8 rows 1. Two opt-in walks fit 256 VGPRs and 80 KB, 4 waves a SIMD:
+``lean`` (two rows a tile, bit for bit the default) reads the query terms from
+LDS and keeps the page step's operands out of the loop's invariants; ``rsplit``
+(4 or 8 rows a tile) gives each wave whole rows instead of a token slice of
+every row, so a row's partial output exists once a CTA, not once a wave, and a
+page is staged once for all the tile's rows (see the compile options).
+
 ``dbg`` (benchmark decomposition only): 1 DMA walk without math, 2 prologue and
 epilogue only, 3 math without DMA, 4/5 fewer DMA planes, 6 every DMA the first
 union page.
@@ -113,12 +123,16 @@ def _wmma_scale16_32x16(a, b, scale_a, scale_b):
 
 def kernel_name(tq, nb, waves_per_eu, rebase_log2, v_hoist, fence, quant_mx, all_rows=False, v_wide=False,
                 v_valu=0, q_regs=False, dbg=0, async_dma=False, cta_dma=False,
-                pipe=False, prefetch=0):
+                pipe=False, prefetch=0, lean=False, rsplit=False):
     name = f"pa_sparse_prefill_nvfp4_v2_d128_bs128_gqa16_top16_tq{tq}_rb{rebase_log2}"
     if pipe:
         name += "_pipe"
     if prefetch:
         name += f"_pf{prefetch}"
+    if lean:
+        name += "_lean"
+    if rsplit:
+        name += "_rs"
     if cta_dma:
         name += "_cdma"
     if async_dma:
@@ -165,6 +179,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     cta_dma=False,
     pipe=False,
     prefetch=0,
+    lean=False,
+    rsplit=False,
 ):
     """Compile (cached) the pair-batched reuse kernel; ``launch`` takes the same
     arguments as ``compile_pa_sparse_prefill_nvfp4``'s.
@@ -200,15 +216,35 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     for the V planes anyway).
     ``prefetch`` k: L2 prefetch hints for this wave's slice of the union page k
     pages past the newest one in the DMA ring (0: none).
+    ``lean``: the page step in at most 256 VGPRs, so that 4 waves fit a SIMD
+    (default ``waves_per_eu`` 4 with two rows a tile): the query terms are read
+    from LDS (default ``q_regs`` off), the raw V rows are loaded after QK, the
+    V selector operand is rebuilt a block and the tail page's mask compares
+    against inline constants. Same arithmetic in the same order: bit for bit
+    the default's output.
+    ``rsplit`` (``tile_rows`` 4 or 8; implies ``lean`` and ``cta_dma``): the
+    waves split the tile's rows instead of a page's tokens. Wave w owns rows
+    ``tile_rows // 4 * w ..`` and runs them over the page's four 32-token
+    quarters, so a row's partial output sits in one wave's VGPRs (not in four)
+    and a page is staged once for all the tile's rows; the waves meet at a
+    barrier a page. A row's tokens fold into one softmax reference in page
+    order instead of four merged at the end: equal to rounding, not bit for bit.
+    The price: a page is one wave's work for the rows that selected it, so the
+    waves whose rows did not select it idle at the barrier (the default walk
+    spreads every page over the four waves); it pays when the tile's rows
+    share most of their pages. With ``tile_rows`` 8 take ``nvfp4_buffers`` 2:
+    the LDS of a ring of 3 (over 320 KB / 4) leaves room for 3 waves a SIMD only.
     """
     tq, nb = int(tile_rows), int(nvfp4_buffers)
-    pipe, prefetch = bool(pipe), int(prefetch)
+    pipe, prefetch, rsplit = bool(pipe), int(prefetch), bool(rsplit)
+    lean = bool(lean) or rsplit
+    cta_dma = bool(cta_dma) or rsplit
+    # ``rsplit``: rows a wave.
+    rpw = tq // NWARP
     # Defaults measured on real MiniMax-M3.1 picks (MI455X, 14336 new on 99968
     # cached): two rows a tile, the query terms in VGPRs, 3 waves a SIMD.
     if q_regs is None:
-        q_regs = tq == 2
-    if waves_per_eu is None:
-        waves_per_eu = 3 if tq == 2 else 0
+        q_regs = tq == 4 if rsplit else tq == 2 and not lean
     if tq not in TILE_ROWS:
         raise ValueError(f"tile_rows must be one of {TILE_ROWS}")
     if nb not in (2, 3, 4):
@@ -217,7 +253,32 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         raise ValueError("prefetch must be 0..8 pages")
     pairs = tq // 2
     all_rows = bool(all_rows)
-    v_hoist = (pairs > 1 and not all_rows) if v_hoist is None else bool(v_hoist)
+    if v_hoist is None:
+        v_hoist = pairs > 1 and not (all_rows or rsplit)
+    v_hoist = bool(v_hoist)
+    if rsplit and (
+        tq not in (4, 8)
+        or all_rows
+        or v_hoist
+        or v_valu
+        or async_dma
+        or pipe
+        or dbg in (4, 5, 6)
+    ):
+        raise ValueError(
+            "rsplit needs tile_rows 4 or 8 and its own walk (no all_rows, "
+            "v_hoist, v_valu, async_dma, pipe; dbg 0..3)"
+        )
+    if waves_per_eu is None:
+        # 4 where the walk was measured to fit 256 VGPRs: two rows a wave with
+        # the query terms in LDS, or (rsplit, tile_rows 4) one row with them
+        # in VGPRs.
+        fits = lean and v_wide and not (v_hoist or v_valu or async_dma)
+        q_fits = not q_regs or (rsplit and tq == 4)
+        if fits and (rsplit or tq == 2) and q_fits:
+            waves_per_eu = 4
+        else:
+            waves_per_eu = 3 if tq == 2 else 0
     if pipe and (async_dma or cta_dma or v_valu or v_hoist or nb == 4 or dbg in (4, 5)):
         raise ValueError(
             "pipe needs tile_rows 2 (or v_hoist=0 / all_rows=1), nvfp4_buffers 2 "
@@ -225,7 +286,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         )
     scale = float(softmax_scale)
     rb = int(rebase_log2)
-    key = (tq, nb, scale, int(waves_per_eu), rb, v_hoist, int(fence), bool(quant_mx), all_rows, bool(v_wide), int(v_valu), bool(q_regs), int(dbg), bool(async_dma), bool(cta_dma), pipe, prefetch)
+    key = (tq, nb, scale, int(waves_per_eu), rb, v_hoist, int(fence), bool(quant_mx), all_rows, bool(v_wide), int(v_valu), bool(q_regs), int(dbg), bool(async_dma), bool(cta_dma), pipe, prefetch, lean, rsplit)
     if key in _CACHE:
         return _CACHE[key]
     lay = dict(_layout(tq, nb))
@@ -318,14 +379,29 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         sc = load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
         return fx.Vector.from_elements(words, dtype=fx.Int32), sc
 
-    def selector_operand(lane16):
+    def selector_operand(lane16, zero=None):
         one = fx.Int32(2) << ((lane16 % 8) * 4)
         even = (lane16 < 8).select(one, fx.Int32(0))
         odd = (lane16 >= 8).select(one, fx.Int32(0))
+        if const_expr(zero is not None):
+            # ``lean``: a runtime zero keeps the operand out of the loop's
+            # invariants (8 VGPRs live across QK otherwise).
+            even, odd = even | zero, odd | zero
         return fx.Vector.from_elements([even, odd] * 4, dtype=fx.Int32)
 
     def bound_mask(bound, warp, half):
         out = []
+        if const_expr(lean):
+            # The same mask against inline constants: no 16 loop-invariant
+            # token vectors held in VGPRs for this rare path.
+            left = bound - warp * _TOKENS - half * 8
+            for i in range_constexpr(16):
+                out.append(
+                    (left > fx.Int32(i // 8 * 16 + i % 8)).select(
+                        fx.Float32(0.0), fx.Float32(float("-inf"))
+                    )
+                )
+            return fx.Vector.from_elements(out, dtype=fx.Float32)
         for i in range_constexpr(16):
             n, r = i // 8, i % 8
             token = warp * _TOKENS + n * 16 + half * 8 + r
@@ -383,7 +459,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         return p.to(fx.BFloat16), total
 
     @flyc.kernel(
-        name=kernel_name(tq, nb, waves_per_eu, rb, v_hoist, fence, quant_mx, all_rows, v_wide, v_valu, q_regs, dbg, async_dma, cta_dma, pipe, prefetch), known_block_size=(THREADS, 1, 1)
+        name=kernel_name(tq, nb, waves_per_eu, rb, v_hoist, fence, quant_mx, all_rows, v_wide, v_valu, q_regs, dbg, async_dma, cta_dma, pipe, prefetch, lean, rsplit), known_block_size=(THREADS, 1, 1)
     )
     def kernel(
         query: fx.Pointer,
@@ -510,7 +586,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         # The union's page ids and bound words in VGPRs (lane i: union entry i,
         # i + 32, ...): the page loop reads them with v_readlane, no LDS round
         # trip on its critical path.
-        meta_regs = (entries + WAVE - 1) // WAVE
+        # (``rsplit`` reads them from LDS a page instead: see below.)
+        meta_regs = 0 if rsplit else (entries + WAVE - 1) // WAVE
         page_regs = [lds_load(lay["upage"] + (k * WAVE + lane) * 4, fx.Int32, 1)[0] for k in range_constexpr(meta_regs)]
         bound_regs = [
             [lds_load(lay["ubound"] + (k * WAVE + lane) * ub + 4 * w, fx.Int32, 1)[0] for w in range_constexpr(ub // 4)]
@@ -534,12 +611,49 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         def page_of(u):
             return meta_lane(page_regs, u)
 
+        def lds_scalar(offset):
+            return fx.Int32(
+                fx.rocdl.readfirstlane(T.i32, lds_load(offset, fx.Int32, 1)[0])
+            )
+
+        def page_of_lds(u):
+            return lds_scalar(lay["upage"] + u * 4)
+
+        def bounds_of_lds(u):
+            words = [
+                lds_scalar(lay["ubound"] + u * ub + 4 * w)
+                for w in range_constexpr(ub // 4)
+            ]
+            return [
+                (words[t // 4] >> (8 * (t % 4))) & 0xFF for t in range_constexpr(tq)
+            ]
+
+        if const_expr(rsplit):
+            # A page step is four quarters long: the page's id and bounds are
+            # read from LDS, not held in VGPRs.
+            page_of = page_of_lds
+            bounds_of = bounds_of_lds
+
+        def own_row(values, j):
+            """``rsplit``: this wave's row j of the tile's per-row scalars."""
+            v = values[j]
+            for w in range_constexpr(1, NWARP):
+                v = (warp == w).select(values[w * rpw + j], v)
+            return v
+
+        def page_planes(part):
+            """K, V, K scale and V scale offsets of the 32 tokens from
+            ``32 * part`` in a slot of page-wide planes."""
+            return (
+                part * (_TOKENS * _ROW),
+                PAGE * _ROW + part * (_TOKENS * _ROW),
+                2 * PAGE * _ROW + part * (_TOKENS * _SROW),
+                2 * PAGE * _ROW + PAGE * _SROW + part * (_TOKENS * _SROW),
+            )
+
         if const_expr(cta_dma):
             # Page-wide planes in a slot; this wave's 32 tokens start at warp * 32.
-            P_K = warp * (_TOKENS * _ROW)
-            P_V = PAGE * _ROW + warp * (_TOKENS * _ROW)
-            P_KS = 2 * PAGE * _ROW + warp * (_TOKENS * _SROW)
-            P_VS = 2 * PAGE * _ROW + PAGE * _SROW + warp * (_TOKENS * _SROW)
+            P_K, P_V, P_KS, P_VS = page_planes(warp)
         else:
             P_K, P_V, P_KS, P_VS = _PLANE_K, _PLANE_V, _PLANE_KS, _PLANE_VS
 
@@ -691,10 +805,15 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     lds_store(at + 64, fx.Vector.from_elements([qscale], dtype=fx.Int64), fx.Int64)
         gpu.barrier()
 
+        # ``rsplit``: row t below is this wave's t-th row.
+        q_own = warp * (rpw * QUERY_TERMS * WAVE * Q_LANE_BYTES) if rsplit else 0
+
         def q_row(t):
             out = []
             for i in range_constexpr(QUERY_TERMS):
                 at = lay["qterms"] + ((t * QUERY_TERMS + i) * WAVE + lane) * Q_LANE_BYTES
+                if const_expr(rsplit):
+                    at = at + q_own
                 parts = [lds_load(at + 16 * c, fx.Int32, 4) for c in range_constexpr(4)]
                 words = fx.Vector.from_elements(
                     [parts[c][e] for c in range_constexpr(4) for e in range_constexpr(4)], dtype=fx.Int32
@@ -705,18 +824,26 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         selector = selector_operand(lane16)
         zeros = fx.Vector.filled(8, 0.0, fx.Float32)
         zero_v = fx.Vector.filled(16, 0.0, fx.Float32).to(fx.BFloat16)
+        # The rows whose state a wave carries: the tile's, ``rsplit``: its own.
+        carried = rpw if rsplit else tq
         initial = []
-        for t in range_constexpr(tq):
+        for t in range_constexpr(carried):
             initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
             initial.extend([fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)])
         lo = warp * _TOKENS
         hi = lo + _TOKENS
-        q_resident = [q_row(t) for t in range_constexpr(tq)] if q_regs else None
+        q_resident = None
+        if const_expr(q_regs):
+            q_resident = [q_row(t) for t in range_constexpr(carried)]
 
-        def tail_mask(raw, bound):
-            """-inf past the row's in-page bound (its tail page: rare)."""
-            if (bound < hi) & (bound > lo):
-                raw = raw + bound_mask(bound, warp, half)
+        def tail_mask(raw, bound, quarter=None):
+            """-inf past the row's in-page bound (its tail page: rare) among
+            this wave's 32 tokens (``rsplit``: the page's ``quarter``)."""
+            start, end, part = lo, hi, warp
+            if const_expr(quarter is not None):
+                start, end, part = quarter * _TOKENS, (quarter + 1) * _TOKENS, quarter
+            if (bound < end) & (bound > start):
+                raw = raw + bound_mask(bound, part, half)
             return raw
 
         def rebase(ref, l, acc, m):
@@ -790,7 +917,16 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     prefetch_page(u + (nb - 1) + prefetch)
             base = slot_base(slot)
             bounds = bounds_of(u)
-            k_tiles = [rows_operand(lds_load, base, P_K, P_KS, n, lane16, half) for n in range_constexpr(2)]
+            if const_expr(rsplit):
+                bounds = [own_row(bounds, j) for j in range_constexpr(rpw)]
+
+            def k_operands(pk=P_K, pks=P_KS):
+                return [
+                    rows_operand(lds_load, base, pk, pks, n, lane16, half)
+                    for n in range_constexpr(2)
+                ]
+
+            k_page = None if rsplit else k_operands()
             # VGPR block scales of the selector (see pa_sparse_prefill_nvfp4), built per page.
             lane_zero = fx.Int64((lane + u) >> 31)
 
@@ -843,7 +979,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 )
                 return v16 * s16
 
-            def v_tile(v_raw, b):
+            def v_tile(v_raw, b, selector=selector):
                 """PV A operand of dims 16 b..: V^T dequantized by the selector WMMA."""
                 if const_expr(b < v_valu):
                     return v_tile_valu(b)
@@ -863,16 +999,16 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     dtype=fx.Float32,
                 ).to(fx.BFloat16)
 
-            def v_operands():
+            def v_operands(pv=P_V, pvs=P_VS):
                 """The page's raw V rows; ``pipe``: once its V planes landed."""
                 if const_expr(pipe and dbg != 3):
                     wait_later(u, nb - 1, 0)
                 v_raw = [
-                    rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
+                    rows_operand(lds_load, base, pv, pvs, n, lane16, half)
                     for n in range_constexpr(2)
                 ]
                 if const_expr(v_wide):
-                    v_raw.append(lds_load(base + P_VS + lane * _SROW, fx.Int64, 1)[0])
+                    v_raw.append(lds_load(base + pvs + lane * _SROW, fx.Int64, 1)[0])
                 return v_raw
 
             v_hoisted = None
@@ -885,21 +1021,32 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     v_raw_h = v_operands()
                     v_hoisted = [v_tile(v_raw_h, b) for b in range_constexpr(8)]
 
-            def run_rows(rows_state, ts):
+            def run_rows(rows_state, ts, quarter=None):
                 """One step of rows ``ts`` (all selected the page for this wave):
                 [QK, maxima] | per row a rare rebase branch | [V dequant, P, PV].
-                rows_state: per row [ref, l, acc x 8]."""
-                if const_expr(not (v_hoist or pipe)):
+                rows_state: per row [ref, l, acc x 8]. ``rsplit``: over the
+                page's ``quarter``, ``ts`` counting the wave's rows."""
+                pk, pv, pks, pvs = P_K, P_V, P_KS, P_VS
+                if const_expr(quarter is not None):
+                    pk, pv, pks, pvs = page_planes(quarter)
+                if const_expr(not (v_hoist or pipe or lean)):
                     # Issued first: the LDS latency hides under QK.
                     v_raw = v_operands()
+                # ``rsplit``: a block loads the K rows of its quarter.
+                k_tiles = k_operands(pk, pks) if rsplit else k_page
                 raws, maxes = [], []
                 for t in ts:
-                    raw = tail_mask(qk(q_resident[t] if q_regs else q_row(t), k_tiles), bounds[t])
+                    raw = tail_mask(
+                        qk(q_resident[t] if q_regs else q_row(t), k_tiles),
+                        bounds[t],
+                        quarter,
+                    )
                     raws.append(raw)
                     maxes.append(head_max(raw))
-                if const_expr(pipe):
-                    # After QK: the LDS latency hides under the rebase and P.
-                    v_raw = v_operands()
+                if const_expr((pipe or lean) and not v_hoist):
+                    # After QK: the LDS latency hides under the rebase and P
+                    # (``lean``: the raw V rows are not live under QK).
+                    v_raw = v_operands(pv, pvs)
                 cur, refs_p = [], []
                 for i, t in enumerate(ts):
                     ref, l = rows_state[i * 10], rows_state[i * 10 + 1]
@@ -922,8 +1069,11 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     ps.append(p)
                     totals.append(total)
                 accs = [cur[i][2] for i in range_constexpr(len(ts))]
+                sel_b = selector
+                if const_expr(lean):
+                    sel_b = selector_operand(lane16, fx.Int32(lane_zero))
                 for b in range_constexpr(8):
-                    vt = v_hoisted[b] if v_hoist else v_tile(v_raw, b)
+                    vt = v_hoisted[b] if v_hoist else v_tile(v_raw, b, sel_b)
                     for i in range_constexpr(len(ts)):
                         accs[i][b] = Gfx1250Gemm.mma(vt, ps[i], accs[i][b], 32, True)
                     if const_expr(b in fence_after):
@@ -946,7 +1096,31 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 next_state = list(state)
                 if top > lo:
                     next_state = run_rows(next_state, tuple(range(tq)))
-            for g in range_constexpr(0 if (all_rows or dbg in (1, 4, 5)) else pairs):
+            elif const_expr(rsplit):
+                # This wave's rows over the page's four quarters (the default
+                # walk's blocks, a quarter in place of the wave's token slice).
+                next_state = list(state)
+                for quarter in range_constexpr(PAGE // _TOKENS):
+                    start = quarter * _TOKENS
+                    if const_expr(rpw == 1):
+                        if bounds[0] > start:
+                            next_state = run_rows(next_state, (0,), quarter)
+                    else:
+                        b0, b1 = bounds[0], bounds[1]
+                        if (b0 > start) & (b1 > start):
+                            next_state = run_rows(next_state, (0, 1), quarter)
+                        if (b0 > start) & (b1 <= start):
+                            next_state = (
+                                run_rows(next_state[:10], (0,), quarter)
+                                + next_state[10:]
+                            )
+                        if (b0 <= start) & (b1 > start):
+                            next_state = next_state[:10] + run_rows(
+                                next_state[10:], (1,), quarter
+                            )
+            for g in range_constexpr(
+                0 if (all_rows or rsplit or dbg in (1, 4, 5)) else pairs
+            ):
                 r0, r1 = 2 * g, 2 * g + 1
                 grp = list(state[g * 20 : (g + 1) * 20])
                 b0, b1 = bounds[r0], bounds[r1]
@@ -982,16 +1156,34 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 sc[fx.Int64(row) * (GROUP * HEAD_DIM // 32) + tid] = fx.Int32(E8M0_ONE).to(fx.Int8)
 
         stats = NWARP * _MERGE_OUT
-        for t in range_constexpr(tq):
-            gpu.barrier()
+
+        def store_partial(row_state):
+            """This wave's [ref, l, acc x 8] of a row into the merge area."""
             for b in range_constexpr(8):
-                lds_store(warp * _MERGE_OUT + (b * 32 + lane) * 32, final[t * 10 + 2 + b], fx.Float32)
+                lds_store(
+                    warp * _MERGE_OUT + (b * 32 + lane) * 32,
+                    row_state[2 + b],
+                    fx.Float32,
+                )
             if half == 0:
                 lds_store(
                     stats + (warp * 16 + lane16) * 8,
-                    fx.Vector.from_elements([final[t * 10], final[t * 10 + 1]], dtype=fx.Float32),
+                    fx.Vector.from_elements(row_state[:2], dtype=fx.Float32),
                     fx.Float32,
                 )
+
+        for t in range_constexpr(tq):
+            gpu.barrier()
+            if const_expr(rsplit):
+                # The row's wave has all of it; the others an empty partial
+                # (reference -inf: weight 0 in the merge below).
+                mine = (t % rpw) * 10
+                if warp == t // rpw:
+                    store_partial(final[mine : mine + 10])
+                else:
+                    store_partial(initial[:10])
+            else:
+                store_partial(final[t * 10 : t * 10 + 10])
             gpu.barrier()
             wave_stats = [lds_load(stats + (w * 16 + lane16) * 8, fx.Float32, 2) for w in range_constexpr(NWARP)]
             row_max = wave_stats[0][0]
