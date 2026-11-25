@@ -14,6 +14,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_op_gemm_a16w16 import (
     build_routing_from_topk,
     get_topk_align_config,
+    is_triton_a16w16_available,
     moe_gemm_a16w16,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -26,11 +27,12 @@ _RTOL = 1e-2
 _ATOL = 128
 
 
-def _on_gfx1201() -> bool:
+def _on_triton_a16w16_configured_arch() -> bool:
     if not torch.cuda.is_available() or torch.version.hip is None:
         return False
     try:
-        return get_gfx() == "gfx1201"
+        get_gfx()
+        return is_triton_a16w16_available() and bool(get_topk_align_config())
     except Exception:  # noqa: BLE001
         return False
 
@@ -66,7 +68,7 @@ def init_compute_data(
     return x, w, bias, gammas
 
 
-def _make_case_gfx1201(tokens: int):
+def _make_large_m_a16w16_case(tokens: int):
     torch.manual_seed(2026 + tokens)
     model_dim = 2048
     inter_dim = 128
@@ -185,9 +187,12 @@ def test_op(
     )
 
 
-@pytest.mark.skipif(not _on_gfx1201(), reason="gfx1201 selected large-M backend")
-def test_moe_gemm_a16w16_gfx1201_backend_direct():
-    hidden, w1, w2, weights, ids = _make_case_gfx1201(1152)
+@pytest.mark.skipif(
+    not _on_triton_a16w16_configured_arch(),
+    reason="configured Triton A16W16 large-M backend",
+)
+def test_moe_gemm_a16w16_triton_backend_direct():
+    hidden, w1, w2, weights, ids = _make_large_m_a16w16_case(1152)
     route_cfg = get_topk_align_config()
     routing_data, gather_idx, scatter_idx, sorted_weights = build_routing_from_topk(
         ids, weights, num_experts=w1.shape[0], block_m=route_cfg["block_m"]

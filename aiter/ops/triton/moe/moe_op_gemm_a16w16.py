@@ -4,15 +4,15 @@
 """MoE GEMM with 16-bit activations and weights.
 
 This module owns the existing public ``moe_gemm_a16w16`` wrapper and extends
-it with a gfx1201 Triton backend for the validated BF16 G1U1 large-M path used
-by ``aiter.fused_moe``.
+it with a config-driven Triton backend surface. The validated public large-M
+enablement still lives in the gfx1201-specific fused-MoE follow-up path.
 """
 
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w16 import (
-    _moe_gemm_a16w16 as _moe_gemm_a16w16_kernel_gfx1201,
+    _moe_gemm_a16w16 as _moe_gemm_a16w16_kernel_triton,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.moe_routing.topk_align import (
@@ -27,7 +27,6 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
-_GFX1201_TRITON_SUPPORTED_ARCHS = ("gfx1201",)
 
 
 def is_gluon_available():
@@ -42,10 +41,10 @@ def is_gluon_available():
         return False
 
 
-def is_gfx1201_triton_available():
-    """True when the gfx1201 Triton backend supports the current GPU arch."""
+def is_triton_a16w16_available():
+    """True when the current GPU arch ships Triton A16W16 MoE configs."""
     try:
-        return get_arch() in _GFX1201_TRITON_SUPPORTED_ARCHS
+        return bool(get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton"))
     except Exception:  # noqa: BLE001
         return False
 
@@ -140,7 +139,7 @@ def get_kernel_config_gluon(m, n, k, routing_data, apply_swiglu=False):
     return config
 
 
-def _get_kernel_config_gfx1201(block_m: int, n: int, k: int):
+def _get_kernel_config_triton(block_m: int, n: int, k: int):
     key = f"bm{block_m}_n{n}_k{k}"
     dispatch = get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton")
     if key not in dispatch:
@@ -176,7 +175,7 @@ def build_routing_from_topk(
     )
 
 
-def _moe_gemm_a16w16_triton_gfx1201(
+def _moe_gemm_a16w16_triton(
     x: torch.Tensor,
     w: torch.Tensor,
     *,
@@ -191,17 +190,17 @@ def _moe_gemm_a16w16_triton_gfx1201(
     swiglu_add_residual=True,
     bias=None,
 ):
-    assert is_gfx1201_triton_available(), (
-        f"gfx1201 Triton backend is only implemented for "
-        f"{_GFX1201_TRITON_SUPPORTED_ARCHS}, got {get_arch()}"
+    assert is_triton_a16w16_available(), (
+        "Triton moe_gemm_a16w16 requires a MOE-GEMM-A16W16 config for the "
+        f"running arch, got {get_arch()!r}"
     )
-    assert bias is None, "gfx1201 Triton moe_gemm_a16w16 does not support bias"
+    assert bias is None, "Triton moe_gemm_a16w16 does not support bias"
     if apply_swiglu:
-        assert alpha == 1.0, "gfx1201 Triton a16w16 only supports alpha=1.0"
-        assert limit == 1.0, "gfx1201 Triton a16w16 only supports limit=1.0"
+        assert alpha == 1.0, "Triton a16w16 only supports alpha=1.0"
+        assert limit == 1.0, "Triton a16w16 only supports limit=1.0"
         assert (
             swiglu_add_residual
-        ), "gfx1201 Triton a16w16 requires swiglu_add_residual=True"
+        ), "Triton a16w16 requires swiglu_add_residual=True"
 
     assert x.dtype in (torch.bfloat16, torch.float16)
     assert w.dtype in (torch.bfloat16, torch.float16)
@@ -212,7 +211,7 @@ def _moe_gemm_a16w16_triton_gfx1201(
     num_experts, n, k = w.shape
     assert num_experts == routing_data.n_expts_tot
     assert x.shape[-1] == k
-    cfg = _get_kernel_config_gfx1201(routing_data.block_m, n, k)
+    cfg = _get_kernel_config_triton(routing_data.block_m, n, k)
 
     reduction_n_matmul = 2 if apply_swiglu else 1
     reduction_n_reduction = 1
@@ -239,7 +238,7 @@ def _moe_gemm_a16w16_triton_gfx1201(
     grid_n = triton.cdiv(out_n, cfg["block_n"])
     grid = grid_m * grid_n
 
-    _moe_gemm_a16w16_kernel_gfx1201[(grid,)](
+    _moe_gemm_a16w16_kernel_triton[(grid,)](
         y,
         y.stride(0),
         y.stride(1),
@@ -325,13 +324,11 @@ def moe_gemm_a16w16(
     arch = get_arch()
     backend_name = None if backend is None else backend.lower()
     use_gluon = backend_name in (None, "gluon") and is_gluon_available()
-    use_gfx1201_triton = (
-        backend_name in (None, "triton") and is_gfx1201_triton_available()
-    )
+    use_triton_a16w16 = backend_name in (None, "triton") and is_triton_a16w16_available()
 
-    assert use_gluon or use_gfx1201_triton, (
+    assert use_gluon or use_triton_a16w16, (
         "moe_gemm_a16w16 is implemented only for gfx1250/gluon or "
-        f"gfx1201/triton, got arch={arch!r}, backend={backend!r}"
+        f"config-backed Triton, got arch={arch!r}, backend={backend!r}"
     )
 
     assert x_scales is None, "x_scales must be none"
@@ -351,10 +348,10 @@ def moe_gemm_a16w16(
         apply_swiglu,
     )
 
-    if use_gfx1201_triton:
-        assert unpadded_N is None, "gfx1201 Triton moe_gemm_a16w16 has no unpadded_N"
-        assert unpadded_K is None, "gfx1201 Triton moe_gemm_a16w16 has no unpadded_K"
-        return _moe_gemm_a16w16_triton_gfx1201(
+    if use_triton_a16w16:
+        assert unpadded_N is None, "Triton moe_gemm_a16w16 has no unpadded_N"
+        assert unpadded_K is None, "Triton moe_gemm_a16w16 has no unpadded_K"
+        return _moe_gemm_a16w16_triton(
             x,
             w,
             routing_data=routing_data,
