@@ -310,12 +310,19 @@ def fused_gdn_verify_qkvz(
         # default). The q|k side runs in each program of the group.
         split = int(os.environ.get("AITER_GDN_VERIFY_SPLIT", "1"))
         split_warps = config.get("split_num_warps", num_warps)
+        split_max = config.get("split_max_seqs", 0)
+        # AITER_GDN_VERIFY_TICKET_RELAXED=1: the split form's ticket as a relaxed
+        # atomic (every conv input is read before it; the same bits; an experiment,
+        # off by default), up to the config's ticket_relaxed_split_max_seqs.
+        ticket_relaxed = os.environ.get("AITER_GDN_VERIFY_TICKET_RELAXED", "0") == "1"
+        if ticket_relaxed:
+            split_max = config.get("ticket_relaxed_split_max_seqs", split_max)
         if (
             kernel is _fused_gdn_verify_chunk_mat
             and split > 1
             and ratio % split == 0
             and split & (split - 1) == 0
-            and seqs <= config.get("split_max_seqs", 0)
+            and seqs <= split_max
             and _chunk_kernel_fits(
                 head_k_dim, head_v_dim, ratio // split, max_query_len, cap, split_warps
             )
@@ -325,6 +332,8 @@ def fused_gdn_verify_qkvz(
             )
             if tickets is not None:
                 tile_args = {**tile_args, "SPLIT": split, "Tickets": tickets}
+                if ticket_relaxed:
+                    tile_args["TICKET_SEM"] = "relaxed"
                 grid_split, num_warps = split, split_warps
     if mx32:
         if kernel not in (_fused_gdn_verify_chunk, _fused_gdn_verify_chunk_mat):
@@ -353,6 +362,15 @@ def fused_gdn_verify_qkvz(
         ):
             num_warps = 4
             tile_args.update(FLUSH_BF16=True, REGISTER_REPLAY=True)
+        elif (
+            num_warps == 8
+            and bf16_flush is None
+            and os.environ.get("AITER_GDN_VERIFY_LDS_OPT", "0") == "2"
+        ):
+            # AITER_GDN_VERIFY_LDS_OPT=2: the register replay at four waves with the
+            # FP32 flush (the default's bits).
+            num_warps = 4
+            tile_args["REGISTER_REPLAY"] = True
     kernel[(seqs * k_heads * grid_split,)](
         query_start_loc,
         slot_idx,

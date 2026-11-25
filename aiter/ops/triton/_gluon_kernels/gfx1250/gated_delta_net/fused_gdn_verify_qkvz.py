@@ -1570,7 +1570,7 @@ def _fused_gdn_verify_chunk_mat(
             kr_heads.index(0),
         )
     if REGISTER_REPLAY:
-        gl.static_assert(GROUPED_REPLAY and UNROLL_HEADS and FLUSH_BF16)
+        gl.static_assert(GROUPED_REPLAY and UNROLL_HEADS)
         gl.static_assert((CAP_P2, K, V, T_P2, RATIO, NW) == (16, 128, 128, 4, 2, 4))
         replay_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [NW, 1], [1, 0])
         residual_heads = ()
@@ -1816,6 +1816,27 @@ def _fused_gdn_verify_chunk_mat(
                     _verify_fold_residual(
                         uw, kr_heads.index(0 if GROUPED_REPLAY else h), d_lds.index(h),
                         ckpt_blocks, uw2_lds, kr2_lds, h, CAP_P2, NB, RB, NW, uw_layout, one_layout, b16,
+                    )
+        elif REGISTER_REPLAY:
+            # The FP32 flush on the residuals held in registers (the bits of the
+            # LDS form below).
+            uw_lds = gl.allocate_shared_memory(gl.float32, [CAP_P2, V], rows_shared)
+            for h in gl.static_range(RATIO):
+                gl.barrier()
+                w_h = w_lds.index(h).load(gl.SliceLayout(1, uw_layout))
+                u_h = gl.convert_layout(residual_heads[h], uw_layout)
+                uw_lds.store(u_h.to(gl.float32) * w_h[:, None])
+                decay_h = gl.max(d_lds.index(h).load(one_layout), 0)
+                gl.barrier()
+                uw_b = uw_lds.load(b32)
+                k_h = kr_heads.index(0)
+                for rb in gl.static_range(NB):
+                    _flush_block(
+                        k_h.slice(rb * RB, RB, dim=1).permute([1, 0]),
+                        uw_b,
+                        ckpt_blocks.index(h * NB + rb),
+                        decay_h,
+                        NW,
                     )
         else:
             uw_lds = gl.allocate_shared_memory(gl.float32, [CAP_P2, V], rows_shared)
