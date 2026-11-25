@@ -668,6 +668,10 @@ def flash_attn_varlen_func_benchmark(
     )
 
 
+# Query heads of test_varlen_flash_attn_seq_padding, which takes no head count of its own.
+SEQ_PADDING_NHEADS = 8
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -723,7 +727,7 @@ def test_varlen_flash_attn_seq_padding(
     """End-to-end check that CK group-mode varlen path respects padded tokens."""
     torch.random.manual_seed(0)
 
-    nheads = 8
+    nheads = SEQ_PADDING_NHEADS
     device = "cuda"
 
     assert nheads % gqa_ratio == 0
@@ -1109,6 +1113,9 @@ if __name__ == "__main__":
         ["mixed", "q_only", "k_only", "no_padding"],
         args.local,
     ):
+        # Its fixed head count cannot be grouped by every ratio -gr takes (6 does not divide 8).
+        if SEQ_PADDING_NHEADS % gqa_ratio:
+            continue
         ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
             gqa_ratio,

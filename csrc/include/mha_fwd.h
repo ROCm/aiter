@@ -243,6 +243,15 @@ struct mha_fwd_args
 
     ck_tile::index_t block_scale_size_q;
     ck_tile::index_t block_scale_size_kv;
+
+    // fmha_fwd_v3 THD rows only (gfx950 BF16 hd256): KV slices each work-group cuts its key walk
+    // into. With more than one, o_ptr and lse_ptr are FP32 partials [kv_splits, total, nhead_q,
+    // hdim_v] and [kv_splits, nhead_q, total], stride_o / nhead_stride_o / nhead_stride_lse are
+    // theirs, and the strides below step from one slice to the next, in elements. The caller
+    // merges the slices by their LSE.
+    int kv_splits               = 1;
+    int64_t kv_split_stride_o   = 0;
+    int64_t kv_split_stride_lse = 0;
 };
 
 #if ENABLE_CK
@@ -361,4 +370,10 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& s);
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s);
+
+// KV slices fmha_fwd_v3 runs this call's THD row with: 1 when the call does not take a THD row
+// or one slice suffices. AITER_FMHA_V3_FWD_THD_KV_SPLITS picks the count: unset or "auto" takes
+// the most slices, up to 4, whose work-groups still fit the CUs once; an integer asks for that
+// many, clamped to one Q tile of keys per slice.
+int fmha_fwd_v3_thd_kv_splits(const mha_fwd_args& a);
 } // namespace aiter

@@ -3,7 +3,9 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -16,6 +18,28 @@ namespace aiter {
 static_assert(offsetof(fmha_fwd_v3_args, ptr_qseq_padding) == 0x1E0,
               "THD rows read their KV split from the ptr_qseq_padding slot");
 static_assert(sizeof(fmha_fwd_v3_args) == 656, "fmha_fwd_v3_args must stay 656 bytes");
+
+// The THD rows' KV-split descriptor, in ptr_qseq_padding's 16-byte slot (pointer and padding).
+// Slice i writes its normalized FP32 O at ptr_o + i * o_stride and its LSE at
+// ptr_lse + i * lse_stride, both in bytes; count 0 walks the keys once and writes in place.
+// cu_budget is read by the causal row only: the CUs a pair's kv_splits + 1 work-groups must fit,
+// 0 to run every pair on kv_splits work-groups.
+struct FmhaFwdV3ThdKvSplit
+{
+    uint32_t count;
+    uint32_t o_stride;
+    uint32_t lse_stride;
+    uint32_t cu_budget;
+};
+static_assert(sizeof(FmhaFwdV3ThdKvSplit) == 16, "THD KV-split descriptor is 16 bytes");
+static_assert(offsetof(fmha_fwd_v3_args, ptr_kseq_padding) - offsetof(fmha_fwd_v3_args,
+                                                                       ptr_qseq_padding) ==
+                  sizeof(FmhaFwdV3ThdKvSplit),
+              "THD KV-split descriptor fills ptr_qseq_padding's slot");
+
+// mha_v4(kv_splits="auto") takes at most this many slices: past it the merge outweighs the
+// work-groups it adds.
+constexpr int64_t kMaxThdKvSplits = 4;
 
 // Values of the "mode" column in hsa/<arch>/fmha_v3_fwd/fmha_fwd.csv.
 enum class FmhaFwdV3Mode : int
@@ -121,12 +145,65 @@ bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
     return true;
 }
 
-// Mirrors fmha_v4_fwd_thd with one KV slice: unused slots stay zero, in particular the KV-split
-// descriptor at 0x1E0, so the kernel walks its keys once and writes O and LSE in place.
-void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a)
+int fmha_fwd_v3_thd_kv_splits(const mha_fwd_args& a)
+{
+    const std::string arch_id = get_gpu_arch();
+    if(!a.use_asm_v3 || !is_fmha_fwd_v3_thd(a, arch_id))
+        return 1;
+    const int mask_type = get_cfg_mask_type(a);
+    if(mask_type < 0)
+        return 1;
+    const auto it = cfg_fmha_fwd.find(get_kernel_name_key(arch_id,
+                                                          a.data_type,
+                                                          a.hdim_q,
+                                                          a.hdim_v,
+                                                          mask_type,
+                                                          a.how_v3_bf16_cvt,
+                                                          FmhaFwdV3Mode::Thd,
+                                                          &cfg_fmha_fwd));
+    if(it == cfg_fmha_fwd.end())
+        return 1;
+
+    // A causal work-group owns Q tile i and its mirror n - 1 - i, which together walk n + 1 tiles
+    // of keys; a non-causal one owns one Q tile and walks all n. A slice keeps at least one Q tile
+    // of that walk.
+    const bool causal      = mask_type != 0;
+    const int64_t ts_qo    = it->second.ts_qo;
+    const int64_t q_tiles  = (a.max_seqlen_q + ts_qo - 1) / ts_qo;
+    const int64_t q_groups = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const int64_t most     = causal ? q_tiles + 1 : q_tiles;
+
+    int64_t splits  = 1;
+    const char* env = std::getenv("AITER_FMHA_V3_FWD_THD_KV_SPLITS");
+    if(env == nullptr || *env == '\0' || std::strcmp(env, "auto") == 0)
+    {
+        // mha_v4's rule: the most slices whose work-groups still fit the CUs once, since a second
+        // slice on a CU reloads Q.
+        const int64_t work_groups =
+            std::max<int64_t>(static_cast<int64_t>(a.batch) * a.nhead_q * q_groups, 1);
+        splits = std::min<int64_t>(
+            {kMaxThdKvSplits, static_cast<int64_t>(get_num_cu_func()) / work_groups, most});
+    }
+    else
+    {
+        splits = std::min<int64_t>(std::atoll(env), most);
+    }
+    if(splits <= 1)
+        return 1;
+    // The kernel steps between slices through 32-bit byte strides.
+    const int64_t slice_bytes = static_cast<int64_t>(a.seqlen_q) * a.nhead_q * a.hdim_v * 4;
+    if(slice_bytes > static_cast<int64_t>(UINT32_MAX))
+        return 1;
+    return static_cast<int>(splits);
+}
+
+// Mirrors fmha_v4_fwd_thd. With one KV slice the descriptor at 0x1E0 stays zero and the kernel
+// writes BF16 O and the LSE in place; with more, a.o_ptr and a.lse_ptr are FP32 partials.
+void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a, uint32_t cu_budget)
 {
     std::memset(&args, 0, sizeof(args));
-    constexpr int bpe = 2;
+    constexpr int bpe     = 2;
+    const int out_bpe     = a.kv_splits > 1 ? 4 : 2;
     args.ptr_o         = a.o_ptr;
     args.ptr_q         = a.q_ptr;
     args.ptr_k         = a.k_ptr;
@@ -144,16 +221,26 @@ void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a)
     args.s_q_head_num  = a.nhead_q;
     args.s_v_Seqs      = a.stride_v * bpe;
     args.s_v_Hs        = a.nhead_stride_v * bpe;
-    args.s_o_Seqs      = a.stride_o * bpe;
-    args.s_o_Hs        = a.nhead_stride_o * bpe;
+    args.s_o_Seqs      = a.stride_o * out_bpe;
+    args.s_o_Hs        = a.nhead_stride_o * out_bpe;
     args.ptr_qseq      = a.seqstart_q_ptr;
     args.ptr_kseq      = a.seqstart_k_ptr;
     if(a.has_lse)
     {
-        // [nhead_q, total_tokens] float32; head h's rows start at ptr_lse + h * s_lse_Hs.
+        // [nhead_q, total_tokens] float32 per slice; head h's rows start at ptr_lse + h * s_lse_Hs.
         args.ptr_lse  = a.lse_ptr;
         args.s_lse    = 1;
         args.s_lse_Hs = a.nhead_stride_lse * 4;
+    }
+    if(a.kv_splits > 1)
+    {
+        const FmhaFwdV3ThdKvSplit split{static_cast<uint32_t>(a.kv_splits),
+                                        static_cast<uint32_t>(a.kv_split_stride_o * 4),
+                                        static_cast<uint32_t>(a.kv_split_stride_lse * 4),
+                                        cu_budget};
+        std::memcpy(reinterpret_cast<char*>(&args) + offsetof(fmha_fwd_v3_args, ptr_qseq_padding),
+                    &split,
+                    sizeof(split));
     }
 }
 
@@ -313,6 +400,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+    // FP32 KV-slice partials exist only on the THD rows.
+    if(a.kv_splits > 1 && (!thd || !a.has_lse))
+    {
+        return -1;
+    }
 
     auto fwd_cfgs               = &cfg_fmha_fwd;
     int cfg_mask_type           = get_cfg_mask_type(a);
@@ -355,14 +447,26 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     int gdx = 0, gdy = 0, gdz = 0;
     if(thd)
     {
-        init_fmha_fwd_v3_thd_args(args, a);
-        // 32 query rows per wave. The grid is (Q tile groups of the longest document, nhead_q,
-        // documents); a causal work-group owns Q tile i and its mirror n - 1 - i.
-        bdx                = cfg.ts_qo / 32 * 64;
-        const int q_tiles  = (a.max_seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
-        gdx                = cfg_mask_type != 0 ? (q_tiles + 1) / 2 : q_tiles;
-        gdy                = a.nhead_q;
-        gdz                = a.batch;
+        // The causal object (pair_split in hsa/gfx950/fmha_v4_fwd) runs a pair's 2-5 slices on
+        // kv_splits + 1 work-groups when its document has 4+ Q tiles and
+        // nhead_q * pairs * (kv_splits + 1) <= cu_budget; it decides this per document. Work-groups
+        // past a document's need exit at once, so x is sized by max_seqlen whenever any document,
+        // down to the smallest such pair count, 2, could qualify.
+        const bool causal         = cfg_mask_type != 0;
+        const int64_t splits      = a.kv_splits;
+        const uint32_t cu_budget  = causal && splits > 1 ? get_num_cu_func() : 0;
+        init_fmha_fwd_v3_thd_args(args, a, cu_budget);
+        // 32 query rows per wave. The grid is (Q tile groups of the longest document times the
+        // work-groups per group, nhead_q, documents); a causal work-group owns Q tile i and its
+        // mirror n - 1 - i.
+        bdx                     = cfg.ts_qo / 32 * 64;
+        const int64_t q_tiles   = (a.max_seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+        const int64_t q_groups  = causal ? (q_tiles + 1) / 2 : q_tiles;
+        const bool pair_extra   = cu_budget != 0 && splits <= 5 && q_tiles >= 4 &&
+                                int64_t(a.nhead_q) * 2 * (splits + 1) <= cu_budget;
+        gdx = static_cast<int>(q_groups * (pair_extra ? splits + 1 : splits));
+        gdy = a.nhead_q;
+        gdz = a.batch;
     }
     else
     {
@@ -486,7 +590,8 @@ float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 #endif
 
 #if FAV2_ON
-    if(ret == -1 && !args.v3_api_check)
+    // KV-slice partials are FP32 buffers only the v3 THD rows write; CK must not get them.
+    if(ret == -1 && !args.v3_api_check && args.kv_splits <= 1)
     {
         ret = fmha_fwd_ck(args, s);
     }
