@@ -1177,7 +1177,7 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     // double load core loop end
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16, bool check_tail = false>
 __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
                                        DTYPE_I* __restrict__ input,
                                        const float* __restrict__ scale,
@@ -1210,6 +1210,23 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
 
     if(threadIdx.x < num_vecs)
     {
+        // Only the per-token non-dword-aligned path needs scalar row-tail stores.
+        if constexpr(check_tail)
+        {
+            static_assert(std::is_same_v<DTYPE_O, opus::fp8_t> ||
+                          std::is_same_v<DTYPE_O, opus::i8_t>);
+            const int32_t offset = threadIdx.x * vec_size_i;
+            if(offset + vec_size_i > cols)
+            {
+                // Keep the same FP8 saturation and int8 conversion as store_vector.
+                const auto converted = scaled_cast<DTYPE_O>(*input_vecs, inverted_scale);
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < cols)
+                        ptr_o[offset + j] = converted[j];
+                return;
+            }
+        }
         store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, *input_vecs, threadIdx.x * vec_size_o, inverted_scale);
     }
 }
@@ -1275,6 +1292,47 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         const int64_t row_offset = blockIdx.x * cols;
         scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols, row_offset);
+    }
+}
+
+// cols % 4 != 0. The kernel above rounds each row up to whole dwords, so its last vector store
+// also writes the first bytes of the next row (past `out` for the last row), and for odd bf16 /
+// fp16 widths the row's scale takes one input element past the row. Here the row's last vector
+// loads only the row's elements, zero elsewhere, and stores only the row's bytes.
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+__global__ void
+dynamic_per_token_scaled_quant_tail_kernel(DTYPE_O* __restrict__ out,
+                                           float* __restrict__ scale,
+                                           DTYPE_I* __restrict__ input,
+                                           float const* __restrict__ scale_ub,
+                                           const int32_t cols,
+                                           int32_t const* __restrict__ num_rows = nullptr,
+                                           const int32_t num_rows_factor        = 1)
+{
+    static_assert(std::is_same_v<DTYPE_O, opus::fp8_t> || std::is_same_v<DTYPE_O, opus::i8_t>);
+    const int token_idx = blockIdx.x;
+    if(num_rows != nullptr)
+    {
+        int32_t rows = *num_rows * num_rows_factor;
+        if(token_idx >= rows)
+            return;
+    }
+    auto res         = data_to_per_row_scale<DTYPE_I, DTYPE_O, thread_data_size, true>(input, cols);
+    float row_scale  = std::get<0>(res);
+    DTYPE_I* vec_ptr = reinterpret_cast<DTYPE_I*>(&std::get<1>(res));
+
+    if(threadIdx.x == 0)
+        scale[token_idx] = row_scale;
+
+    if constexpr(thread_data_size == 0)
+    {
+        scaled_quant_impl<DTYPE_I, DTYPE_O, true>(out, input, &row_scale, cols);
+    }
+    else
+    {
+        const int64_t row_offset = blockIdx.x * cols;
+        scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size, true>(
+            out, vec_ptr, &row_scale, cols, row_offset);
     }
 }
 
@@ -1949,8 +2007,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
         dim3 const block(BlockSize);
         // The multi-row kernel reproduces the thread_data_size = 8 instantiation (cols <= 8 *
         // BlockSize) of the one-row kernel, which keeps:
-        //  - cols % 4 != 0: there its last vector store of a row also writes the start of the next
-        //    row, a race between blocks, so its result is not unique;
+        //  - cols % 4 != 0: dynamic_per_token_scaled_quant_tail_kernel bounds the row's last vector;
         //  - rows * cols > 2^32: its row offsets are 32-bit;
         //  - rows < 256 with more than 64 vectors a row: its four waves a row finish sooner there.
         const int num_vecs      = (cols + 7) / 8;
@@ -2030,13 +2087,29 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
         }
         else if(out.dtype() == AITER_DTYPE_fp8)
         {
-            DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-                dynamic_per_token_scaled_quant_kernel, opus::fp8_t, cols);
+            if(cols % 4 == 0)
+            {
+                DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+                    dynamic_per_token_scaled_quant_kernel, opus::fp8_t, cols);
+            }
+            else
+            {
+                DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+                    dynamic_per_token_scaled_quant_tail_kernel, opus::fp8_t, cols);
+            }
         }
         else if(out.dtype() == AITER_DTYPE_i8)
         {
-            DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-                dynamic_per_token_scaled_quant_kernel, opus::i8_t, cols);
+            if(cols % 4 == 0)
+            {
+                DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+                    dynamic_per_token_scaled_quant_kernel, opus::i8_t, cols);
+            }
+            else
+            {
+                DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+                    dynamic_per_token_scaled_quant_tail_kernel, opus::i8_t, cols);
+            }
         }
 #if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == AITER_DTYPE_fp4x2)
