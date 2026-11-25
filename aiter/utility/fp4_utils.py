@@ -171,6 +171,21 @@ def f32_to_fused_moe_mxfp8_scale(amax: Tensor) -> Tensor:
     return exponent.view(dtypes.fp8_e8m0)
 
 
+def gfx942_mxfp8_block_exponent(amax: Tensor) -> Tensor:
+    """Shared-exponent rule: the smallest e with amax / 2**e <= 240 (E4M3FNUZ max).
+
+    With amax = (1 + f) * 2**E this is E - 7, or E - 6 when 1 + f > 1.875, i.e.
+    ceil(log2(amax / 240)) computed on the float bits. Bitwise equal to aiter's
+    gfx942 ``fused_dynamic_mxfp8_quant_moe_sort`` (checked incl. amax = 1.875 * 2**E,
+    zero and -0 blocks), the in-kernel quant of the ``_qi`` kernels and the vLLM
+    accuracy plugin.
+    Clamped to the E8M0 range.
+    """
+    bits = amax.float().view(torch.int32)
+    e = ((bits >> 23) & 0xFF) - 127 - 7 + ((bits & 0x7FFFFF) > 0x700000).to(torch.int32)
+    return e.clamp(-127, 127)
+
+
 def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     """Default MXFP4 E8M0 block scale: NV ROUND_UP / RCEIL with FP4 E2M1.
 
