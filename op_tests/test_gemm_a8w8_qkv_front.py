@@ -22,17 +22,19 @@ def _row(m, tier):
     return {
         "libtype": "flydsl",
         "kernelId": front.KERNEL_ID,
-        "kernelName": front.tier_kernel_name(tier),
+        "kernelName": tier,
         "us": 1.0,
     }
 
 
 def test_front_tier_lookup(monkeypatch):
     rows = {
-        ("gfx950", 256, 32, 2560, 6144, "1x32"): _row(32, "coop"),
-        ("gfx950", 256, 64, 2560, 6144, "1x32"): _row(64, "coop"),
-        ("gfx950", 256, 96, 2560, 6144, "1x32"): _row(96, "split3"),
-        ("gfx950", 256, 128, 2560, 6144, "1x32"): _row(128, "plain"),
+        ("gfx950", 256, 32, 2560, 6144, "1x32"): _row(32, "flydsl_qkvfront_coop"),
+        ("gfx950", 256, 64, 2560, 6144, "1x32"): _row(64, "flydsl_qkvfront_coop"),
+        ("gfx950", 256, 96, 2560, 6144, "1x32"): _row(
+            96, "flydsl_qkvfront_split_ks2_48x64_nt"
+        ),
+        ("gfx950", 256, 128, 2560, 6144, "1x32"): _row(128, "flydsl_qkvfront_plain"),
         ("gfx950", 256, 80, 2560, 6144, "1x32"): _row(
             80, "coop"
         ),  # a tier that cannot serve 80 rows
@@ -40,28 +42,30 @@ def test_front_tier_lookup(monkeypatch):
     monkeypatch.setattr(front, "_load_tuned", lambda: rows)
     monkeypatch.setattr(front, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(front, "get_cu_num", lambda: 256)
-    front.front_tier.cache_clear()
+    front.front_plan.cache_clear()
     try:
         assert front.front_tier(32) == "coop"
         assert front.front_tier(64) == "coop"
-        assert front.front_tier(96) == "split3"
+        assert front.front_tier(96) == "split"
+        assert front.front_plan(96) == front.Plan("split", 2, (3, 4, True, False))
+        assert front.parse_kernel_name(
+            front.plan_kernel_name(front.front_plan(96))
+        ) == front.front_plan(96)
         assert front.front_tier(128) == "plain"
         assert front.front_tier(80) == "plain"  # the row's tier does not serve this m
         assert front.front_tier(16) == "plain"  # below the window
         assert front.front_tier(129) == "plain"  # above it
         assert front.front_tier(32, 2560, 4096) == "plain"  # another projection
     finally:
-        front.front_tier.cache_clear()
+        front.front_plan.cache_clear()
 
 
 def test_tier_applies():
     assert front.tier_applies("plain", 5)
     assert front.tier_applies("coop", 17) and front.tier_applies("coop", 64)
     assert not front.tier_applies("coop", 16) and not front.tier_applies("coop", 65)
-    assert front.tier_applies("split3", 65) and front.tier_applies("split3", 128)
-    assert not front.tier_applies("split3", 64) and not front.tier_applies(
-        "split3", 129
-    )
+    assert front.tier_applies("split", 65) and front.tier_applies("split", 128)
+    assert not front.tier_applies("split", 64) and not front.tier_applies("split", 129)
 
 
 def _setup(seed=0):
@@ -114,18 +118,27 @@ def _inputs(m):
 
 @needs_gfx950
 @pytest.mark.parametrize("m", [17, 33, 64, 65, 97, 128])
-def test_fused_tier_matches_plain_tier(m):
+@pytest.mark.parametrize("ks", [3, 1, 2, 4, 6])
+def test_fused_tier_matches_plain_tier(m, ks):
+    if ks != 3 and m <= 64:
+        pytest.skip("the one-launch tier has a fixed K split")
     if m > 64:
         from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
 
-        if not "cfg" in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
+        if "cfg" not in inspect.signature(sk.mxfp8_gemm_decode_splitk).parameters:
             pytest.skip(
                 "split-3 row-major activation entry (A_ROW) not in this tree (#8610)"
             )
     weight, w_scale, chain_scale, aux, cs = _setup()
     x, pos, slot = _inputs(m)
-    ks, vs = torch.tensor([0.5], device="cuda"), torch.tensor([0.7], device="cuda")
-    tier = "coop" if m <= 64 else "split3"
+    kscale, vscale = torch.tensor([0.5], device="cuda"), torch.tensor(
+        [0.7], device="cuda"
+    )
+    tier = (
+        front.Plan("coop")
+        if m <= 64
+        else front.Plan("split", ks, front.DEFAULT_SPLIT[1])
+    )
     out = {}
     for t in ("plain", tier):
         kv = torch.zeros(NB, 2, 128, 72, dtype=torch.uint8, device="cuda")
@@ -134,7 +147,7 @@ def test_fused_tier_matches_plain_tier(m):
             x, weight, w_scale, chain_scale, defer_ok=t != "plain", tier=t
         )
         assert (getattr(front._STATE, "deferred", None) is not None) == (t != "plain")
-        q, iq = _insert(qkv, aux, cs, pos, slot, kv, ix, m, ks, vs)
+        q, iq = _insert(qkv, aux, cs, pos, slot, kv, ix, m, kscale, vscale)
         assert getattr(front._STATE, "deferred", None) is None  # consumed
         torch.cuda.synchronize()
         out[t] = (q, iq, kv, ix)

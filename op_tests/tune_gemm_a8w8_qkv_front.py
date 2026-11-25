@@ -13,6 +13,7 @@ front, which this script measures. Timing: R calls on R different weight / cache
 """
 
 import argparse
+import itertools
 import statistics
 
 import torch
@@ -41,13 +42,13 @@ class _Set:
         self.ix = torch.zeros(NB, 128, 72, dtype=torch.uint8, device="cuda")
 
 
-def _front_call(s, x, tier, aux, m):
+def _front_call(s, x, tier, aux, m):  # tier: a str or a front.Plan
     qkv = front.gemm_a8w8_qkv_front(
         x,
         s.weight,
         s.w_scale,
         s.chain_scale,
-        defer_ok=tier != "plain",
+        defer_ok=True,
         tier=tier,
     )
     q = torch.empty(m, 2048, dtype=torch.bfloat16, device="cuda")
@@ -113,6 +114,60 @@ def time_tier(sets, x, tier, reps=30):
     return statistics.median(ts), q
 
 
+def split_candidates(m, sets, x):
+    """The split plans worth a whole-front timing: per K-split factor the GEMM tile with the fastest slab kernel (kernel-only
+    graph timing over every (RT, NI, nt, il) that compiles and fits), so no split factor is skipped.
+    """
+    from aiter import dtypes
+    from aiter.ops.flydsl.kernels import mxfp8_gemm_decode_splitk as sk
+    from aiter.ops.quant import per_group_quant_hip
+
+    xq, xs = per_group_quant_hip(
+        x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+    )
+    best = {}
+    for ks in sk.KS_CHOICES:
+        for rt, ni, nt, il in itertools.product(
+            (2, 3, 4, 5), (2, 4, 5), (False, True), (False, True)
+        ):
+            cfg = (rt, ni, nt, il)
+            try:
+                us = _graph_us(
+                    sets,
+                    lambda s: sk.mxfp8_gemm_decode_splitk(
+                        xq, xs, s.weight, s.chain_scale, cfg=cfg, ks=ks
+                    ),
+                )
+            except (
+                Exception
+            ):
+                continue
+            if ks not in best or us < best[ks][0]:
+                best[ks] = (us, cfg)
+    return [front.Plan(front.TIER_SPLIT, ks, cfg) for ks, (_, cfg) in best.items()]
+
+
+def _graph_us(sets, fn, reps=20):
+    for s in sets:
+        fn(s)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for s in sets:
+            fn(s)
+    ts = []
+    for _ in range(reps):
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
+        a.record()
+        graph.replay()
+        b.record()
+        b.synchronize()
+        ts.append(a.elapsed_time(b) * 1000.0 / len(sets))
+    return statistics.median(ts)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--m", default="17,24,32,40,48,56,64,72,80,88,96,104,112,120,128")
@@ -123,36 +178,41 @@ def main():
 
     sets = [_Set(i) for i in range(args.sets)]
     rows = []
-    print("M, " + ", ".join(front.TIERS) + ", winner (us per front, cold weights)")
+    print("M, winner, us per front (cold weights); other candidates")
     for m in [int(v) for v in args.m.split(",")]:
-        res, qref = {}, None
         x = (torch.randn(m, K, device="cuda") * 2).to(
             torch.bfloat16
-        )  # the same activation for every tier
-        for tier in front.TIERS:
-            if not front.tier_applies(tier, m):
-                continue
-            us, q = time_tier(sets, x, tier)
-            qref = q if tier == "plain" else qref
+        )  # the same activation for every candidate
+        plans = [front.Plan(front.TIER_PLAIN)]
+        if front.tier_applies(front.TIER_COOP, m):
+            plans.append(front.Plan(front.TIER_COOP))
+        elif front.tier_applies(front.TIER_SPLIT, m):
+            plans += split_candidates(m, sets, x)
+        res, qref = {}, None
+        for plan in plans:
+            us, q = time_tier(sets, x, plan)
+            qref = q if plan.tier == front.TIER_PLAIN else qref
             err = (
                 0.0
-                if qref is None or tier == "plain"
+                if plan.tier == front.TIER_PLAIN
                 else (
                     (q.float() - qref.float()).abs().mean() / qref.float().abs().mean()
                 ).item()
             )
-            res[tier] = (us, err)
-        win = min(res, key=lambda t: res[t][0])
+            res[plan] = (us, err)
+        win = min(res, key=lambda p: res[p][0])
         print(
-            f"{m}, "
-            + ", ".join(f"{res[t][0]:.2f}" if t in res else "-" for t in front.TIERS)
-            + f", {win}",
+            f"{m}, {front.plan_kernel_name(win)}, {res[win][0]:.2f}; "
+            + ", ".join(
+                f"{front.plan_kernel_name(p)}={u:.2f}" for p, (u, _) in res.items()
+            ),
             flush=True,
         )
         us, err = res[win]
+        ks = win.ks if win.tier != front.TIER_PLAIN else 1
         rows.append(
-            f"{get_gfx_runtime()},{get_cu_num()},{m},{N},{K},1x32,flydsl,{front.KERNEL_ID},1,{us:.4f},"
-            f"{front.tier_kernel_name(win)},{2 * m * N * K / us / 1e6:.2f},{N * K / us / 1e3:.2f},{err:.2e}"
+            f"{get_gfx_runtime()},{get_cu_num()},{m},{N},{K},1x32,flydsl,{front.KERNEL_ID},{ks},{us:.4f},"
+            f"{front.plan_kernel_name(win)},{2 * m * N * K / us / 1e6:.2f},{N * K / us / 1e3:.2f},{err:.2e}"
         )
     if args.out:
         with open(args.out, "w") as f:

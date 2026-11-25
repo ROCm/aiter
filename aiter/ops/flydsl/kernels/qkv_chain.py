@@ -289,6 +289,8 @@ def qkv_chain_split_insert(
     num_kv_heads: int = 1,
     num_index_heads: int = 1,
     eps: float,
+    ks: int = _splitk.KS,
+    cfg: tuple[int, int, bool, bool] | None = None,
 ) -> None:
     """65-128 rows in two launches: the split-3 decode GEMM (fp32 K-third slabs) and ``qkv_reduce_insert`` (sum, bf16
     round, norm, RoPE, NVFP4 K / V / index-K inserts). Bitwise the unfused split-3 chain.
@@ -320,10 +322,10 @@ def qkv_chain_split_insert(
     )
     # the split-3 GEMM on row-major activation codes / scales (#8610: ``mxfp8_gemm_decode_splitk`` takes row-major A only)
     slab = _splitk.mxfp8_gemm_decode_splitk(
-        activation, activation_scale, weight, weight_scale
+        activation, activation_scale, weight, weight_scale, cfg=cfg, ks=ks
     )
     _run_compiled(
-        compile_qkv_reduce_insert(),
+        compile_qkv_reduce_insert(ks),
         slab.data_ptr(),
         q_out.data_ptr(),
         index_q_out.data_ptr(),

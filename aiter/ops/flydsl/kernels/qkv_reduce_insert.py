@@ -48,7 +48,7 @@ from aiter.ops.flydsl.kernels.fused_qknorm_idxr_nvfp4_insert import (
 from aiter.ops.flydsl.kernels.qkv_chain_cooperative import _lds_ptr
 
 NW = 4  # slots (waves) per workgroup
-SK = 3  # K-third slabs
+SK = 3  # default number of K-part slabs (``ks`` of compile_qkv_reduce_insert)
 NQ, NKV, NIQ, ROT = 16, 1, 1, 64
 NR = NQ + NKV + 1 + NIQ  # slots that norm + rope (19)
 SN = 20  # wave slots per token pair: whole four-head workgroups, the last slot is padding (``s < NR`` guards it)
@@ -89,7 +89,8 @@ def _v_words(nibbles):
 
 
 @functools.cache
-def compile_qkv_reduce_insert():
+def compile_qkv_reduce_insert(ks: int = SK):
+    SK = ks  # K-part slabs summed in order 0 + s0 + s1 + ...
     name = (
         f"qkv_reduce_insert_d128_p128_q{NQ}_kv{NKV}_iq{NIQ}_rot{ROT}_s{SK}"
         "_vlds_vfirst_vhalo_cta_heads20"

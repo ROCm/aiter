@@ -10,7 +10,9 @@ keyed ``gfx, cu_num, M, N, K, w_scale_block``, ``kernelId`` = ``qkvfront``):
 * ``plain``  - activation quantize + ``gemm_a8w8_blockscale`` (its own tuned row) now, the insert later;
 * ``coop``   - 17-64 rows: the activation is only quantized now; the QKV GEMM and the insert are ONE launch
   (``qkv_chain_cooperative_insert``) run by the insert call;
-* ``split3`` - 65-128 rows: quantize now; split-3 GEMM and reduce + insert (two launches) run by the insert call.
+* ``split``  - 65-128 rows: quantize now; the split-K GEMM and reduce + insert (two launches) run by the insert call.
+  The split factor ``ks`` (K parts summed in order by the reduce) and the GEMM tile ``(RT, NI, nt, il)`` are part of the
+  row: ``kernelName`` = ``flydsl_qkvfront_split_ks<ks>_<16*RT>x<16*NI>[_nt][_il]`` (``splitK`` column = ks).
 
 ``gemm_a8w8_qkv_front`` is the entry of the projection. It returns the ``[M, N]`` bf16 QKV; for a fused tier it returns
 an UNCOMPUTED tensor and parks the quantized activation, and ``fused_qknorm_idxrqknorm`` -- called next on that same tensor,
@@ -23,6 +25,7 @@ The tier kernels and their numerics are in ``aiter.ops.flydsl.kernels.qkv_chain`
 """
 
 import functools
+import re
 import threading
 from typing import NamedTuple
 
@@ -42,12 +45,47 @@ N, K = (
 )  # the MiniMax-M3.1 TP4 QKV projection (16 q heads + K + V + index q / k, 128 wide)
 MIN_ROWS, COOP_MAX_ROWS, MAX_ROWS = 17, 64, 128
 KERNEL_ID = "qkvfront"
-TIER_PLAIN, TIER_COOP, TIER_SPLIT3 = "plain", "coop", "split3"
-TIERS = (TIER_PLAIN, TIER_COOP, TIER_SPLIT3)
+TIER_PLAIN, TIER_COOP, TIER_SPLIT = "plain", "coop", "split"
+TIERS = (TIER_PLAIN, TIER_COOP, TIER_SPLIT)
+DEFAULT_SPLIT = (
+    3,
+    (5, 2, False, False),
+)  # (ks, cfg) when a split plan names no parameters
 
 
-def tier_kernel_name(tier: str) -> str:
-    return f"flydsl_qkvfront_{tier}"
+class Plan(NamedTuple):
+    """A front's tier and, for ``split``, the K-split factor and the GEMM tile (RT, NI, non-temporal, interleave)."""
+
+    tier: str
+    ks: int = 3
+    cfg: "tuple[int, int, bool, bool] | None" = None
+
+
+def plan_kernel_name(plan: Plan) -> str:
+    if plan.tier != TIER_SPLIT:
+        return f"flydsl_qkvfront_{plan.tier}"
+    rt, ni, nt, il = plan.cfg
+    return (
+        f"flydsl_qkvfront_split_ks{plan.ks}_{16 * rt}x{16 * ni}"
+        f"{'_nt' if nt else ''}{'_il' if il else ''}"
+    )
+
+
+_SPLIT_NAME = re.compile(r"^flydsl_qkvfront_split_ks(\d+)_(\d+)x(\d+)(_nt)?(_il)?$")
+
+
+def parse_kernel_name(name: str) -> "Plan | None":
+    for tier in (TIER_PLAIN, TIER_COOP):
+        if name == f"flydsl_qkvfront_{tier}":
+            return Plan(tier)
+    m = _SPLIT_NAME.match(name)
+    if m is None or int(m[2]) % 16 or int(m[3]) % 16:
+        return None
+    return Plan(
+        TIER_SPLIT,
+        int(m[1]),
+        (int(m[2]) // 16, int(m[3]) // 16, bool(m[4]), bool(m[5])),
+    )
 
 
 _KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
@@ -68,25 +106,28 @@ def tier_applies(tier: str, m: int) -> bool:
         return True
     if tier == TIER_COOP:
         return MIN_ROWS <= m <= COOP_MAX_ROWS
-    return tier == TIER_SPLIT3 and COOP_MAX_ROWS < m <= MAX_ROWS
+    return tier == TIER_SPLIT and COOP_MAX_ROWS < m <= MAX_ROWS
 
 
 @functools.lru_cache(maxsize=1024)
-def front_tier(m: int, n: int = N, k: int = K, w_scale_block: str = "1x32") -> str:
-    """The tuned tier of an ``m``-row front (``plain`` when untuned, off gfx950, or not this projection)."""
+def front_plan(m: int, n: int = N, k: int = K, w_scale_block: str = "1x32") -> Plan:
+    """The tuned plan of an ``m``-row front (``plain`` when untuned, off gfx950, or not this projection)."""
+    plain = Plan(TIER_PLAIN)
     if (n, k) != (N, K) or not (MIN_ROWS <= m <= MAX_ROWS) or get_gfx() != "gfx950":
-        return TIER_PLAIN
+        return plain
     gfx, cu = get_gfx(), get_cu_num()
     row, _ = find_padded_m_row(
         _load_tuned(), lambda pm: (gfx, cu, pm, n, k, w_scale_block), m, n, k
     )
     if row is None or row["libtype"] != "flydsl" or str(row["kernelId"]) != KERNEL_ID:
-        return TIER_PLAIN
-    for tier in TIERS:
-        if row["kernelName"] == tier_kernel_name(tier):
-            # a row padded across the 64 / 65 boundary must still be a tier that serves this m
-            return tier if tier_applies(tier, m) else TIER_PLAIN
-    return TIER_PLAIN
+        return plain
+    plan = parse_kernel_name(str(row["kernelName"]))
+    # a row padded across the 64 / 65 boundary must still be a tier that serves this m
+    return plan if plan is not None and tier_applies(plan.tier, m) else plain
+
+
+def front_tier(m: int, *args, **kwargs) -> str:
+    return front_plan(m, *args, **kwargs).tier
 
 
 def chain_weight_scale(weight_scale: Tensor) -> Tensor:
@@ -101,7 +142,7 @@ def chain_weight_scale(weight_scale: Tensor) -> Tensor:
 class _Deferred(NamedTuple):
     m: int
     ptr: int  # data_ptr of the uncomputed QKV tensor handed out
-    tier: str
+    plan: Plan
     codes: Tensor
     scales: Tensor
     weight: Tensor
@@ -134,7 +175,7 @@ def gemm_a8w8_qkv_front(
     chain_scale: Tensor,
     *,
     defer_ok: bool,
-    tier: str | None = None,
+    tier: "str | Plan | None" = None,
 ) -> Tensor:
     """bf16 ``x [M, 6144]`` @ the preshuffled (16, 16) MXFP8 ``weight [2560, 6144]`` (row-major E8M0 ``weight_scale``,
     ``chain_scale`` = :func:`chain_weight_scale` of it) -> bf16 ``[M, 2560]``, or an uncomputed tensor of that shape
@@ -146,7 +187,14 @@ def gemm_a8w8_qkv_front(
     m = x.shape[0]
     _STATE.deferred = None
     if tier is None:
-        tier = front_tier(m) if defer_ok else TIER_PLAIN
+        plan = front_plan(m) if defer_ok else Plan(TIER_PLAIN)
+    elif isinstance(tier, str):
+        plan = Plan(tier)
+        if tier == TIER_SPLIT:
+            plan = Plan(tier, *DEFAULT_SPLIT)
+    else:
+        plan = tier
+    tier = plan.tier
     # the plain quantizer's row-major codes / E8M0 scales feed every tier (no relayout)
     xq, xs = per_group_quant_hip(
         x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
@@ -156,7 +204,7 @@ def gemm_a8w8_qkv_front(
             raise ValueError(f"qkv front tier {tier} does not serve {m} rows")
         qkv = torch.empty((m, N), dtype=dtypes.bf16, device=x.device)
         _STATE.deferred = _Deferred(
-            m, qkv.data_ptr(), tier, xq, xs, weight, chain_scale
+            m, qkv.data_ptr(), plan, xq, xs, weight, chain_scale
         )
         return qkv
     return gemm_a8w8_blockscale(
@@ -193,11 +241,11 @@ def run_deferred(
     """The fused kernel of a parked front: GEMM + norm + RoPE + NVFP4 inserts (called by ``fused_qknorm_idxrqknorm``)."""
     from .flydsl.kernels import qkv_chain as _chain
 
-    entry = (
-        _chain.qkv_chain_cooperative_insert
-        if d.tier == TIER_COOP
-        else _chain.qkv_chain_split_insert
-    )
+    if d.plan.tier == TIER_COOP:
+        entry, extra = _chain.qkv_chain_cooperative_insert, {}
+    else:
+        entry = _chain.qkv_chain_split_insert
+        extra = {"ks": d.plan.ks, "cfg": d.plan.cfg}
     entry(
         d.codes.view(dtypes.fp8),
         d.scales,
@@ -222,6 +270,7 @@ def run_deferred(
         num_kv_heads=num_kv_heads,
         num_index_heads=num_index_heads,
         eps=eps,
+        **extra,
     )
 
 
@@ -234,12 +283,18 @@ def warm_qkv_front(weight: Tensor, chain_scale: Tensor) -> None:
     kv = torch.zeros((1, 2, 128, 72), dtype=torch.uint8, device=dev)
     idx = torch.zeros((1, 128, 72), dtype=torch.uint8, device=dev)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    # one row per config: the one-launch chain (17-64) and the three 65-128 row configs (80 / 96 / 128 rows of codes)
-    for m in (17, 33, 49, 65, 81, 97):
-        tier = TIER_COOP if m <= COOP_MAX_ROWS else TIER_SPLIT3
+    # one row per compiled config: the one-launch chain's three row tiles and every split plan the table names
+    plans = {m: Plan(TIER_COOP) for m in (17, 33, 49)}
+    seen = set()
+    for m in range(COOP_MAX_ROWS + 1, MAX_ROWS + 1):
+        plan = front_plan(m)
+        if plan.tier == TIER_SPLIT and plan not in seen:
+            seen.add(plan)
+            plans[m] = plan
+    for m, plan in plans.items():
         x = torch.zeros((m, K), dtype=dtypes.bf16, device=dev)
         qkv = gemm_a8w8_qkv_front(
-            x, weight, weight, chain_scale, defer_ok=True, tier=tier
+            x, weight, weight, chain_scale, defer_ok=True, tier=plan
         )
         d = take_deferred(qkv)
         skip = torch.full((m,), -1, dtype=torch.int64, device=dev)
