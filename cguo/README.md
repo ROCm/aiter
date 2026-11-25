@@ -112,6 +112,108 @@ step3 用的是 naive 自己扫出来的 tile，和线上不可比，所以表�
   后果：最后一个专家有行且后面的内存未映射时会 GPU fault；专家有 ≥2 行时误差 1.4–2.9%。把 A 的 pitch 补大后误差恢复到 0.2%，由此确认原因。这是 #7655（6850fe1773）引入的回退；fused_moe 的 verify 仍能通过（rel_l2 2.6e-3 → 4.2e-3）。
   - `bench_vs_prod.py` 里用 `a_row_stride_bytes` 和权重尾部补零绕开了这个问题；线上代码没有改。
 
+## Epilogue 分析
+
+### 输出布局和 topk 归约
+- GEMM 不做 topk 求和：每个路由在 `grouped_out` 里占一行，`grouped_out` 和 GEMM 输入一样用 contiguous-M 布局。
+- 以 T=16、topk=6、E=384、均衡路由为例：
+  - 96 个路由，专家 e 唯一的那一行在第 16e 行；
+  - `contiguous_m = min(96 + 384·16 − 6, 96 + 96·15) = 1536` 行，`grouped_out` 是 1536 × 5120 × 2 B = 15.7 MB，有效的只有 96 行（6.25%）。
+- padding 行只占地址空间，不产生读写：GEMM 写回时丢掉它们，后面的 reduce 也只读有效行。真正的浪费在计算上：每个 16 行的 M tile 只有 1 行有效。
+- TP 路径：gemm2 之后单独跑 `flydsl_moe_gather_reduce`（`kernels/moe_gather_reduce.py`）。
+  - 每个 workgroup 负责一个 token：`out[t] = Σ_k w[t,k] · grouped_out[topids_to_rows[t,k]]`，fp32 累加，不用 atomic，结果确定。
+  - 开 `doweight_stage1` 时权重改在 gemm1 里乘，gather 权重全为 1。
+- EP 路径：gemm2 的 epilogue 先乘路由权重再截断成 bf16，再用 TDM gather-store 直接写进目标 rank 的 combine buffer；combine 只做不加权求和。
+- 为什么不在 GEMM 里求和：同一个 token 的 6 个结果来自 6 个专家、6 个不同的 workgroup，只能靠 atomic 或跨 WG 同步。
+- 两个 benchmark 都只测 grouped GEMM，不含 reduce。
+
+### 为什么先写 LDS 再用 TDM 写回
+LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每个 lane 一次拿 8 列）换成行主序。主要收益在写回粒度。
+以 T=32768 gemm2（128×256，w2×2）为例，每个 WG 输出 64 KB：
+
+| | 每个 lane 直接 `buffer_store_b128` | LDS + TDM |
+|---|---|---|
+| 写全局的指令 | 4 wave × 32 条 | 4 条（每个 wave 1 条） |
+| 内存系统看到的写段 | 2048 段 × 32 B（每条指令写 16 行各 32 B，行距 10 KB） | 128 行 × 512 B |
+| 128 B cache line | 由 4 条不同指令拼满 | 一次写满 |
+
+次要收益：
+- 向量内存指令和地址计算少了，逐行边界分支（exec mask）也没有了；
+- padding 行和 pad 列由 TDM 越界裁剪；
+- TDM 是异步 DMA。
+
+多走一步 LDS 代价小：
+- 每个 CU 的 LDS 带宽远高于它能分到的 HBM 带宽；
+- 行距补 16 列，`ds_store_b128` 达到 b128 写入的下限（不补是 16 路冲突）；
+- C 复用输入 stage，只有 C 比 stage 大时 LDS 才变大（128×128：34 → 36 KB）。
+
+实测：T=32768 gemm2 写回 2.01 GB，kernel 929 → 366 us，按写回量算的带宽下限 2.17 → 5.5 TB/s。
+收益和"输出字节 / 计算量"成正比：
+
+| 场景 | 效果 |
+|---|---|
+| gemm2（N=5120，K=576） | 受益最大 |
+| gemm1（N=1152，K=5120） | 次之 |
+| decode | 基本不变 |
+
+### 代码分段（`naive_grouped_gemm_mxfp4.py` 第 349–391 行）
+例子：128×256×128，w2×2，`WM_REP = WN_REP = 4`，`ACC_LEN = 16`，`C_PITCH = 272`。
+
+1. **第 350–353 行，`sched_barrier(0)` + 第一次 barrier。**
+   - 累加器布局：lane l 是第 l%16 行；值 v 是第 `(v//8)*16 + (l//16)*8 + v%8` 列。
+   - `sched_barrier` 只约束编译器的调度，不生成指令。
+   - barrier 保证所有 wave 读完输入 stage 后，C 才覆盖它：C 占 128×272×2 = 68 KB，落在 102 KB 的 stage 区开头。
+2. **第 354–361 行，寄存器 → LDS。**
+   - 每个 WMMA 块：fp32 → bf16（8 条 `v_cvt_pk_bf16_f32`）；按 f=0/1 各取 8 个值，`ds_store_b128` 写到 `(row*C_PITCH + col)*2`。
+   - 例：wave 3、lane 21，`wm=1, wn=2, f=1` → row 85，col 216，字节偏移 46672。
+   - 每个 wave 32 条 `ds_store_b128`。padding 行也照写，没有分支。
+3. **第 362 行，第二次 barrier。** TDM 按行分给各 wave（wave w 负责第 32w–32w+31 行、全部 256 列），和计算时的 2×2 分块不同，所以必须等所有 wave 写完。
+4. **第 364–374 行，全局 view。**
+   - `bf16_ptr`：`ptr_arg` 传进来的指针只按 1 B 对齐，所以显式造一个 16 B 对齐的 bf16 指针。
+   - view 形状是 `(rows_end - blk_m, tile_n)`，行数是运行时值：decode 时为 1，prefill 时 ≥128。
+   - 列数 256 小于 LDS 行宽 272，所以 pad 列会被丢弃。
+5. **第 375–379 行，TDM store atom。** box 为 `(tile_m, C_PITCH)`；LDS 布局是紧密的，不需要 TDM pad 字段；`num_warps=NUM_WAVES` 让每个 wave 负责 32 行。
+6. **第 380–385 行，LDS view。** 从 LDS 偏移 0 开始，带一个长度为 1 的 stage 维，形状和读取路径的 `(box, NB)` 一致。
+7. **第 386–389 行，`tdm_partition`。** 用 `wave` 选出本 wave 的 32 行：全局地址和 LDS 地址都按 32 行偏移，每个 wave 的有效行上限是 `max(0, rows_end − blk_m − 32·wave)`。
+8. **第 390–391 行，发 store + 等待。**
+   - 每个 wave 1 条 `tensor_store_from_lds`。
+   - `s_wait_tensorcnt(0)`：TDM 读完 LDS 前 wave 不能退出。这条等待紧跟在 TDM 后面，也顺带满足了"TDM 后不能紧跟分支"的 hazard。
+
+### 编译后的 TDM store 描述符（128×256 w2×2，从 LLVM IR 解出）
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| data_size | `1<<16` | 元素 2 B（bf16） |
+| tensor_dim0 | 256 | 全局每行有效列数，第 256–271 列丢弃 |
+| tensor_dim1 | `max(0, rows_end − blk_m − 32·wave)`（运行时） | 越过专家有效行的行丢弃 |
+| tile_dim0 | 272 | 每行从 LDS 读 `C_PITCH` 个元素 |
+| tile_dim1 | 32 | 每个 wave 32 行 |
+| stride | 5120 | 全局行距 N |
+| LDS 地址 | `lds + wave × 8704` 个元素 | 32 行 × 272 |
+| 全局地址 | `c + (blk_m·N + blk_n)·2 + wave·32·10240` B | |
+
+每个 wave 的 epilogue：128 条 cvt、32 条 `ds_store_b128`、2 次 barrier、1 条 `tensor_store_from_lds`、1 条 `s_wait_tensorcnt`。
+
+### epilogue 能否和最后的 WMMA 重叠
+不需要等所有 WMMA 算完，硬约束只有两条：
+1. 块 (wm, wn) 的 cvt 只依赖这一块最后一条 WMMA 的结果，由硬件按寄存器依赖等待；
+2. 写 LDS 前所有 wave 的 `ds_load` 都要完成（第一次 barrier）。WMMA 只读寄存器，barrier 等的是 `ds_load`，不是 WMMA。
+
+现在已有的重叠：
+- `sched_barrier` 只决定发射顺序。WMMA 流水执行，barrier 不等它的结果。
+- epilogue 处理块的顺序和 `mma_step` 一样，最早用到的 `acc[0][0]` 是最后一个 K step 里最早发出的 WMMA，`acc[3][3]` 留到最后。
+- 这个配置每个 SIMD 有 2 个 wave，一个做 epilogue 时矩阵单元可以给另一个用。
+- 真正串行的是两次 barrier（等 WG 内最慢的 wave）和最后的 `s_wait_tensorcnt`。
+
+证据：不加 `sched_barrier` 时，编译器把最后的 WMMA 挪到 barrier 之后，和 epilogue 交错（ISA 里第一条 `ds_store` 在第 918 行，WMMA 排到第 1076 行），说明这样做是合法的。但它同时把最后一个 tile 的 `ds_load` 整批提前，VGPR 418 → 550，所以加了 `sched_barrier`。
+
+更深的重叠，按改动从小到大：
+1. **第一次 barrier 提前到最后一个 K step 之前。** 有寄存器双缓冲，最后一个 K step 的数据上一步已经读进寄存器，这一步没有 `ds_load`。再用 `sched_group_barrier` 控制交错，比如 WMMA(0,0)、WMMA(0,1)、块 (0,0) 的 cvt+store、WMMA(0,2)……既藏住 cvt/store，又控住 VGPR。收益上限约是每个 wave 128 条 cvt 加 32 条 `ds_store` 的时间。
+2. **C 用独立的 LDS 区域，去掉第一次 barrier。** 128×256 会从 102 KB 涨到 170 KB，每个 CU 从 2 个 WG 降到 1 个，得不偿失；小 tile 几乎免费（16×64 的 C 只有 2.5 KB）。
+3. **persistent kernel + 延迟等待（线上 `defer_c_wait`）。** C 放在最后一个 pipeline stage，TDM store 发出后不等，直接进入下一个 tile 的 prologue（线上第 543–545 行、第 2830 行，用于 persistent stage1 的量化输出）。
+
+线上普通的非 persistent 路径和 naive 一样：主循环结束 → `stage_fence(0)`（第 2232–2234 行）→ 写 LDS → TDM store，也没做第 1 条那种交错。
+
 ## 后续优化方案
 
 按预期收益和依据排序：
@@ -133,4 +235,5 @@ step3 用的是 naive 自己扫出来的 tile，和线上不可比，所以表�
 5. **A / A scale 预排布。** 线上 `a_preshuffled`：gemm1 的 epilogue 直接按 K32/M16 块写出 fp4，A scale 用 m16k4 布局。这样 A 的 TDM 行变长，LDS 也不需要 padding。
 6. **cluster + B multicast。** 同一专家的多个 M tile 共享同一块 W，prefill 阶段可以减少 L2/HBM 流量。
 7. **融合 epilogue。** bias、SwiGLU / SiTUv2、gemm1 输出的 MX 量化（`stage1_quant_out`，可直接写成 gemm2 要的预排布 A）、gemm2 的 EP scatter。
-8. **persistent kernel / tile 调度。** 解决小 M 填不满 GPU、大 M 尾轮不均的问题。
+8. **epilogue 和最后一个 K step 交错。** 把第一次 barrier 提前，用 `sched_group_barrier` 让 cvt/`ds_store` 和最后的 WMMA 交错（见上面「epilogue 能否和最后的 WMMA 重叠」）。收益有限，先测 T=8192 / 32768 的 gemm2。
+9. **persistent kernel / tile 调度。** 解决小 M 填不满 GPU、大 M 尾轮不均的问题；顺带可以让 TDM store 和下一个 tile 的主循环重叠（线上 `defer_c_wait`）。
