@@ -11,8 +11,8 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
 from .gemm_a16w16_band import band_stream_config
-from .gemm_a16w16_ring import ring_config, ring_supported, ring_tilings
 from .gemm_a16w16_cat_x_ring import ring_splitk_config, ring_splitk_tilings
+from .gemm_a16w16_ring import ring_config, ring_supported, ring_tilings
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
