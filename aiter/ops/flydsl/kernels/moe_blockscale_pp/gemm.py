@@ -226,8 +226,8 @@ class StoreSlotBf16:
         # against ~47 B/clk in quad order (microbenchmark, random rows either
         # way). Lane 4a + b takes the words of lane 16q + a, q the lane group
         # holding chunk b (_lane_col8: q = 0, 2, 1, 3 for chunks 0..3); every
-        # q of lane group a holds row a, so the row index comes from the same
-        # lane.
+        # q of lane group a holds row a, so lane 4a + b reads row a's route
+        # itself (``rows_half``) instead of permuting lane a's.
         lane = fx.thread_idx.x % 64
         b = lane % 4
         cinv = (b == 1).select(2, (b == 2).select(1, b))
@@ -264,7 +264,7 @@ class StoreSlotBf16:
             )
 
     def rows_half(self, wave_m, slot, h):
-        """(output row, routing weight) of this lane's row in each row tile of row half ``h``.
+        """Per row tile of row half ``h``: (output row in quad order, routing weight in MFMA order).
 
         Every read is a constant offset from one opaque base. Formed as
         ``slot * 512 + h * 128 + ...`` per read, the row half 1 reads lost the
@@ -272,14 +272,17 @@ class StoreSlotBf16:
         deeper GEP chain), so the first drew an s_waitcnt vmcnt(0) behind the
         streamed next-tile LDS-DMA (ISA).
         """
-        base = _opaque_vgpr(slot * 512 + wave_m * A_GRP_ROWS + self.lane_row)
+        tile0 = slot * 512 + wave_m * A_GRP_ROWS
+        base = _opaque_vgpr(tile0 + fx.thread_idx.x % 64 // 4)
+        if const_expr(self.weighted):
+            w_base = _opaque_vgpr(tile0 + self.lane_row + 256)
         out = []
         for i in range_constexpr(N_TILES_A):
-            r = base + (h * LDS_BLOCK_M + i * 16)
-            sid = Vec(self._at(r).load())[0]
+            off = h * LDS_BLOCK_M + i * 16
+            sid = Vec(self._at(base + off).load())[0]
             w = None
             if const_expr(self.weighted):
-                w = Vec(self._at(r + 256).load())[0].bitcast(fx.Float32)
+                w = Vec(self._at(w_base + off).load())[0].bitcast(fx.Float32)
             out.append(((sid & 0xFFFFFF) * self.topk + (sid >> 24), w))
         return out
 
@@ -287,8 +290,7 @@ class StoreSlotBf16:
         """Per row tile: this lane's quad-order i32-word offset at column 0 (``oob`` if not ``valid``)."""
         offs = []
         for i in range_constexpr(N_TILES_A):
-            row = self._bperm(rows[i][0])
-            off = row * (self.D // 2) + self.quad_col // 2
+            off = rows[i][0] * (self.D // 2) + self.quad_col // 2
             offs.append(valid.select(off, self.oob))
         return offs
 
