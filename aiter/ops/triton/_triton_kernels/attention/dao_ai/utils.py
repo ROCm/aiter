@@ -25,7 +25,6 @@ AutotuneMode = Literal["off", "on", "sweep"]
 
 __all__ = [
     "AUTOTUNE",
-    "BWD_MODE",
     "DEBUG",
     "PHILOX_OFFSET",
     "PHILOX_SEED",
@@ -173,7 +172,6 @@ if DEBUG > 0:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 if DEBUG >= 2:
     os.environ["TRITON_INTERPRET"] = "1"
-BWD_MODE: Literal["fused", "fused_atomic", "split"] = "fused"
 USE_EXP2 = True
 PHILOX_SEED = 0x1BF58
 PHILOX_OFFSET = 0x1D4B49
