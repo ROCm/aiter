@@ -32,7 +32,6 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
 from .common import (
-    make_trace,
     ACQ,
     AUX_SYS,
     REL,
@@ -44,6 +43,7 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
+    make_trace,
     rsrc,
     spin0,
     spin_lds_ge,

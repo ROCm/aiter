@@ -12,8 +12,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import math as fmath
 from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -488,15 +488,15 @@ def tuned_rows(path: str, key: dict, tokens_col: str) -> dict:
 
 
 def nearest(rows: dict, tokens: int, clamp: bool = False):
-    """The row of the nearest tuned count <= tokens inside [min, max] of rows; outside it
-    None, or (clamp) the row of the nearer end."""
+    """The row of tokens, else of the nearest tuned count above it (a batch between two tuned
+    ones takes the larger one's config); beyond the largest: None, or (clamp) its row.
+    """
     if not rows:
         return None
-    if not min(rows) <= tokens <= max(rows):
-        if not clamp:
-            return None
-        tokens = min(max(tokens, min(rows)), max(rows))
-    return rows[max(t for t in rows if t <= tokens)]
+    above = [t for t in rows if t >= tokens]
+    if above:
+        return rows[min(above)]
+    return rows[max(rows)] if clamp else None
 
 
 def device_key(device=None) -> dict:

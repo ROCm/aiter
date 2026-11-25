@@ -25,8 +25,6 @@ from ..communication_ops_utils import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _e8m0_from_amax
 from .common import (
-    trace_ptr,
-    make_trace,
     AUX_SYS,
     MAX_TP,
     V4I,
@@ -53,10 +51,12 @@ from .common import (
     lds_ld_acq,
     lds_ld_i32,
     lds_st,
+    make_trace,
     now,
     pack_bf16x8,
     rsrc,
     sum_live,
+    trace_ptr,
     uni,
     wait_vm,
     wave_red,

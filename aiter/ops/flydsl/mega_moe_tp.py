@@ -62,10 +62,12 @@ configs (row tile, CTAs, ar two-shot all-reduce) come from configs/mega_moe_tp_s
 stay on the LB schedule. A fused-tail forward of a small-M batch the LB schedule takes runs
 it there (as before; its y then differs in rounding from the plain forward's).
 
-The MXFP8 shared expert (w1_shared ...): small-M up to 256 global tokens, the big-M kernel
-beyond (from 256 / tp + 1 local tokens, rows padded to 64; bigm_min_tokens above that is
-lowered to it); no fused tail on the small engine, no big-M path -> at most 256 global
-tokens. act_dtype "bf16" (a16w4) is small-M only (<= 256 global tokens); "auto" runs it
+The MXFP8 shared expert (w1_shared ...): small-M up to 256 global tokens, the LB schedule
+above (one GEMM1 column block per A pass, no GEMM2 prefetch), the big-M kernel from its
+threshold; no fused tail on the small engine. bigm_min_tokens unset: big-M from the
+smallest batch the big-M table has a tuned row of for the shape and mode (else the batches
+the small engine cannot hold).
+act_dtype "bf16" (a16w4) is small-M only (<= 256 global tokens); "auto" runs it
 below min(a16_max_tokens, 257) global tokens and a4w4 above.
 
 Environment switches (read when a layer is built / a kernel is compiled):
@@ -97,8 +99,10 @@ from dataclasses import dataclass
 import torch
 
 from aiter import ActivationType
+from aiter.jit.core import AITER_CONFIGS
 
 from .kernels.mega_moe_tp.bigm_compute import MegaMoeTPBigM, _kcopy
+from .kernels.mega_moe_tp.common import device_key, tuned_rows
 from .kernels.mega_moe_tp.mega_moe_tp import (
     COMM_MODES,
     LaunchCfg,
@@ -256,20 +260,14 @@ class MegaMoeTP:
                 f"MegaMoeTP: bigm_min_tokens {bmin} < {PAD * cfg.world_size} (the big-M "
                 f"kernel runs at least {PAD} local rows)"
             )
-        # the MXFP8 shared expert: of the small engine's schedules only small-M runs it (up
-        # to DYN_MAX global tokens); the big-M kernel takes every batch beyond (its rows
-        # padded to PAD), whatever bigm_min_tokens above that says
-        sm_cap = DYN_MAX // cfg.world_size if shared is not None else 0
-        if sm_cap and cfg.max_local_tokens > sm_cap:
-            if big_ok and bmin != 0:
-                self.bigm_m = min(self.bigm_m or sm_cap + 1, sm_cap + 1)
-            elif not cfg.fit_max_local:
-                raise ValueError(
-                    f"MegaMoeTP: the MXFP8 shared expert without the big-M path "
-                    f"(bigm_min_tokens=0, or a shape it does not take) runs up to {sm_cap} "
-                    f"local tokens ({DYN_MAX} global, the small-M schedule): "
-                    f"max_local_tokens={cfg.max_local_tokens}"
-                )
+        if bmin is None and big_ok:
+            # (default threshold) the smallest batch the big-M table holds a tuned row of,
+            # for this shape and mode: tuned there because big-M measured faster from it on
+            # (else, below: the batches the small engine cannot hold)
+            t0 = self._bigm_tuned_min(device)
+            if t0 and -(-t0 // cfg.world_size) >= PAD:
+                self.bigm_m = -(-t0 // cfg.world_size)
+        self._pads: dict = {}  # _ar_pad buffers per batch size
         self._bigm = None
         self._bigm_args = {
             "w1": w1,
@@ -282,8 +280,6 @@ class MegaMoeTP:
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
-        if sm_cap:
-            small_max = min(small_max, sm_cap)
         # the small engine holds what it can, big-M takes the rest (an explicit
         # bigm_min_tokens above the small engine's capacity: lowered to it, below)
         fit = (big_ok and bmin != 0) or cfg.fit_max_local
@@ -363,6 +359,42 @@ class MegaMoeTP:
             else:
                 self.a16_local = 0
 
+    def _ar_pad(self, x, tw, ids):
+        """(ar, a batch that is not a multiple of tp) the batch in buffers padded to one
+        (kept per batch size: the pad rows written once, the launch arguments stable)"""
+        M, tp = x.shape[0], self.cfg.world_size
+        key = (M, tw.dtype, ids.dtype)
+        buf = self._pads.get(key)
+        if buf is None:
+            n = tp - M % tp
+            buf = self._pads[key] = (
+                x.new_zeros((M + n, x.shape[1])),
+                tw.new_zeros((M + n, *tw.shape[1:])),
+                ids.new_full((M + n, *ids.shape[1:]), -1),
+            )
+        for dst, src in zip(buf, (x, tw, ids)):
+            dst[:M].copy_(src)
+        return buf
+
+    def _bigm_tuned_min(self, device) -> int:
+        """the smallest tuned batch (global tokens) of this shape and comm mode in the big-M
+        table (0: none)"""
+        cfg = self.cfg
+        key = {
+            **device_key(device),
+            "model_dim": cfg.model_dim,
+            "inter_dim": cfg.inter_dim,
+            "experts": cfg.experts,
+            "topk": cfg.topk,
+            "tp": cfg.world_size,
+        }
+        path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE
+        for mode in (cfg.comm_mode, ""):
+            rows = tuned_rows(path, {**key, "mode": mode}, "tokens")
+            if rows:
+                return min(rows)
+        return 0
+
     def _eng(self, local_tokens: int):
         """the small engine of this local token count (act_dtype "auto": a16w4 below
         a16_max_tokens global tokens)"""
@@ -414,6 +446,14 @@ class MegaMoeTP:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
         eng = self._eng(self._local(x_local.shape[0]))
+        M, tp = x_local.shape[0], self.cfg.world_size
+        if self.cfg.comm_mode == "ar" and M % tp and x_local.dim() == 2:
+            # (ar: the replicated batch in equal parts per rank) the rows up to a multiple
+            # of tp: zero, no route; their outputs dropped
+            x, tw, ids = self._ar_pad(x_local, topk_weights, topk_ids)
+            eng._check_out(out, M)
+            y = eng(x, tw, ids)[:M]
+            return y if out is None else out.copy_(y)
         return eng(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     def _local(self, rows: int) -> int:

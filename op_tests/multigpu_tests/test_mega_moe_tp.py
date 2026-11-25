@@ -446,6 +446,11 @@ def case_varying_m(shape, wt, ctx, S, mode):
     for m in (8, 1, 32, 1, min(64, S.max_local), 8):
         c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", SEED + m)
         worst = max(worst, check(call(layer, c).clone(), c, RTOL, f"m={m}"))
+    if mode == "ar":  # replicated batches that are not a multiple of tp (padded rows)
+        for t in (1, ctx.world + 1):
+            c = make_case(shape, wt, ctx, mode, t, "random", SEED + t)
+            out = torch.empty_like(c.ref, dtype=dtypes.bf16)
+            worst = max(worst, check(call(layer, c, out=out), c, RTOL, f"M={t}"))
     return worst
 
 
@@ -538,17 +543,17 @@ def case_bigm(shape, wt, ctx, S, mode, comm="fp8"):
 
 def case_shared(shape, wt, ctx, S, mode):
     """The MXFP8 shared expert (the last one; the routed ones MXFP4): small-M up to 256
-    tokens, the big-M kernel right above (no bigm_min_tokens needed), no fused tail on the
-    small engine."""
+    tokens, the LB schedule above, then the big-M kernel; no fused tail on the small
+    engine."""
     tp = ctx.world
     sh = build_shared(shape, wt, ctx, SEED)
     cap = max_local(mode, shape, wt)
     layer = new_layer(shape, wt, ctx, mode, cap, shared=sh)
+    # small-M, the LB schedule right above it, and the first big-M batch (if it is set up)
     tokens = [tp, 8 * tp, 256 // tp * tp]
-    if layer.bigm_m:
-        tokens += [t for t in (256 // tp * tp + tp, 512) if t // tp <= cap]
-    elif cap * tp > 256:
-        raise CaseFailure("no big-M path above the small-M batches")
+    tokens += [t for t in (256 // tp * tp + tp, 512) if t // tp <= cap]
+    if layer.bigm_m and layer.bigm_m <= cap:
+        tokens.append(layer.bigm_m * tp)
     if layer.tail_ok(256 // tp) and not layer._big(256 // tp):
         raise CaseFailure("tail_ok on the small engine with the MXFP8 shared expert")
     worst = 0.0

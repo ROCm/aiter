@@ -7,7 +7,6 @@ final sums, LL packets, comm wave roles and the per-launch init / finish."""
 
 from __future__ import annotations
 
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -16,7 +15,6 @@ from flydsl.expr.typing import T
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
 from .common import (
-    make_trace,
     ACQ,
     ACQ_REL,
     AUX_SC1,
@@ -52,6 +50,7 @@ from .common import (
     lds_ld_acq,
     lds_ld_i32,
     lds_st,
+    make_trace,
     mxfp8x8,
     now,
     pack_bf16x8,

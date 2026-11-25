@@ -674,8 +674,8 @@ class MegaMoeTPEngine:
         return npp if ok else 1
 
     def _tuned(self, lb: bool, tot: int) -> dict:
-        """The tuned fields of the nearest tuned batch (same schedule, <= tot, inside the
-        tuned range: common.nearest), else {} (the defaults)."""
+        """The tuned fields of the batch's row (same schedule), else of the nearest tuned
+        batch above it (common.nearest), else {} (the defaults)."""
         key = {
             **device_key(self.device),
             "model_dim": self.H,
@@ -687,9 +687,15 @@ class MegaMoeTPEngine:
             "act": "bf16" if self.a16 else "fp8" if self.a8 else "fp4",
             "lb": int(lb),
         }
-        row = nearest(
-            tuned_rows(AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_FILE, key, "tot"), tot
-        )
+        path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_FILE
+        row = None
+        if self.sh8:
+            # (the MXFP8 shared expert: its own rows, comm_mode "<mode>_sh8", first)
+            row = nearest(
+                tuned_rows(path, {**key, "comm_mode": self.mode + "_sh8"}, "tot"), tot
+            )
+        if row is None:
+            row = nearest(tuned_rows(path, key, "tot"), tot)
         if row is None:
             return {}
         return {k: int(row[k]) for k in _TUNED_FIELDS if row.get(k, "") != ""}
@@ -703,7 +709,8 @@ class MegaMoeTPEngine:
 
     def _sm_tuned(self, tot: int) -> dict:
         """(small-M) the tuned launch fields (mt, nc, ar2, nsk, xd; sm 0: the dynamic
-        schedule) of the nearest tuned batch <= tot (AITER_CONFIG_MEGA_MOE_TP_SM), else {}
+        schedule) of the batch, else of the nearest tuned one above it (the largest beyond
+        them; AITER_CONFIG_MEGA_MOE_TP_SM), else {}
         (the defaults)"""
         tu = self._smt.get(tot)
         if tu is None:
@@ -879,8 +886,8 @@ class MegaMoeTPEngine:
                     cfg = dataclasses.replace(cfg, nc=0, ar2=m <= self.n_cta)
                 # (ar small-M: every row quantized by this rank's CTAs, agr rows each)
                 assert not cfg.alq or tot <= self.agr * (cfg.nc or self.n_cta)
-            elif self.sh8:
-                # (the MXFP8 shared expert's loaders: the small-M and big-M schedules)
+            elif self.sh8 and not self._lb_ok(tot):
+                # (the MXFP8 shared expert's loaders: small-M, LB and big-M)
                 raise ValueError(
                     f"MXFP8 shared expert: {tot} tokens are beyond the small-M schedule "
                     f"(<= {DYN_MAX} tokens); larger batches run the big-M kernel "
@@ -940,10 +947,16 @@ class MegaMoeTPEngine:
                 self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
                 lb=True,
             ),
-            npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
+            # (the MXFP8 shared expert's GEMM1 runs one column block per A pass and its
+            # GEMM2 without the cross-unit prefetch: npp 1, pf off)
+            npp=(
+                1
+                if self.sh8
+                else self._fit_npp(tu.get("npp", 2 if small else self.lb_npp))
+            ),
             ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
             lb=True,
-            pf=bool(tu.get("pf", tot <= LB_PF_MAX)),
+            pf=not self.sh8 and bool(tu.get("pf", tot <= LB_PF_MAX)),
             lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
             q=q if q in self._lb_q_valid else 0,
         )
