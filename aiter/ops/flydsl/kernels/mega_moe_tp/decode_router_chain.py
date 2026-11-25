@@ -11,34 +11,27 @@ import struct
 
 import torch
 
+from .decode_moe_cfg import RouterCfg
 from .decode_router_common import on_supported_device, run_on_device
-from .decode_router_gemm import (
-    MAX_ROWS,
-    nblocks_config,
-    router_gemm_partials,
-)
+from .decode_router_gemm import MAX_ROWS, router_gemm_partials
 from .decode_router_gemm_nblocks import _get_kernel as _get_router
 from .decode_router_topk_quant import splitk_biased_topk_mxfp4_mxfp8_quant
 from .decode_router_topk_sorted import _get_kernel as _get_topk
 
 H, E, TOPK = 6144, 128, 4
-# (first row, last row, quant placement: 1 appended / 2 prepended to the router launch)
-QUANT_TIERS = ((58, 64, 1), (65, MAX_ROWS, 2))
 
 
 def router_quant_placement(m: int) -> int:
-    """0 (the quant stays in the top-k launch), 1 appended, 2 prepended."""
-    for lo, hi, placement in QUANT_TIERS:
-        if lo <= m <= hi:
-            return placement
-    return 0
+    """0 (the quant stays in the top-k launch), 1 appended, 2 prepended to the router launch: the default config."""
+    return RouterCfg.default(m).quant
 
 
-def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_factor):
+def _router_gemm_topk_quant(
+    x, router_weight, correction_bias, routed_scaling_factor, cfg
+):
+    """``cfg.quant`` != 0: the router launch also quantizes x; the sorted top-k launch then only picks."""
     m = x.shape[0]
-    config = nblocks_config(m)
-    split = config[0]
-    token_major = True  # split-48 (<= 64 rows) and the 65-128 row split-16 tier both write token-major
+    split = cfg.split_k
     dev = x.device
     partials = torch.empty((split, m, E), dtype=torch.float32, device=dev)
     ids = torch.empty((m, TOPK), dtype=torch.int32, device=dev)
@@ -48,7 +41,9 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
     q8 = torch.empty((m, H), dtype=torch.uint8, device=dev)
     s8 = torch.empty((m, H // 32), dtype=torch.uint8, device=dev)
     run_on_device(
-        _get_router(*config, router_quant_placement(m), False, token_major),
+        _get_router(
+            split, cfg.block_k, cfg.waves, cfg.nbw, cfg.quant, cfg.x_direct, True
+        ),
         dev,
         x.data_ptr(),
         router_weight.data_ptr(),
@@ -61,7 +56,7 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
         s8.data_ptr(),
     )
     run_on_device(
-        _get_topk(E, TOPK, split, True) if token_major else _get_topk(E, TOPK, split),
+        _get_topk(E, TOPK, split, True),
         dev,
         partials.data_ptr(),
         correction_bias.data_ptr(),
@@ -69,8 +64,8 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
         ids.data_ptr(),
         partials.numel() * 4,
         m,
-        split * E if token_major else E,
-        E if token_major else m * E,
+        split * E,
+        E,
         TOPK,
         struct.unpack("<i", struct.pack("<f", routed_scaling_factor))[0],
     )
@@ -78,7 +73,12 @@ def _router_gemm_topk_quant(x, router_weight, correction_bias, routed_scaling_fa
 
 
 def route_quant_small(
-    x, router_weight, router_weight_lines, correction_bias, routed_scaling_factor=2.0
+    x,
+    router_weight,
+    router_weight_lines,
+    correction_bias,
+    routed_scaling_factor=2.0,
+    cfg=None,
 ):
     """1-128 rows: router GEMM -> top-4 + MXFP4 / MXFP8 input quant ->
     ((q4, s4), (q8, s8), topk weights, topk ids); None outside the covered inputs, so the caller falls back.
@@ -87,6 +87,8 @@ def route_quant_small(
         x: bf16 [m, 6144], contiguous, on a gfx950 device.
         router_weight: fp32 [128, 6144]; router_weight_lines: ``router_line_layout(router_weight)`` or None.
         correction_bias: fp32 [128]. All three on x's device.
+        cfg: a ``decode_moe_cfg.RouterCfg`` (tuning config: split-K, kernel, tile, quant placement), default
+            ``RouterCfg.default(rows)``; None is returned for a cfg that does not fit the rows.
     """
     n = x.shape[0]
     if not (
@@ -104,11 +106,15 @@ def route_quant_small(
         and on_supported_device(x, router_weight, correction_bias)
     ):
         return None
-    if router_quant_placement(n):
+    if cfg is None:
+        cfg = RouterCfg.default(n)
+    elif not cfg.fits(n):
+        return None
+    if cfg.quant:
         return _router_gemm_topk_quant(
-            x, router_weight, correction_bias, routed_scaling_factor
+            x, router_weight, correction_bias, routed_scaling_factor, cfg
         )
-    parts = router_gemm_partials(x, router_weight, router_weight_lines)
+    parts = router_gemm_partials(x, router_weight, router_weight_lines, cfg)
     if (
         parts is None
     ):  # e.g. a router_weight_lines that is not usable: not an error of the covered inputs

@@ -179,6 +179,12 @@ AITER_CONFIG_FHMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
 )
 
+# fused_moe(shared_folded=True) rows: a shared expert folded into the routed MoE (aiter/ops/flydsl/fused_moe_m3_decode.py)
+AITER_CONFIG_SHARED_FMOE = os.getenv(
+    "AITER_CONFIG_SHARED_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_shared_fmoe.csv",
+)
+
 AITER_CONFIG_GROUPED_FMOE = os.getenv(
     "AITER_CONFIG_GROUPED_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
@@ -406,6 +412,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
+        )
+
+    @property
+    def AITER_CONFIG_SHARED_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_SHARED_FMOE",
+            AITER_CONFIG_SHARED_FMOE,
+            "tuned_shared_fmoe",
         )
 
     @property

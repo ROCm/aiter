@@ -63,7 +63,11 @@ def _maxf_nn(a, b):
 
 
 def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
-    num_experts: int, topk: int, split_k: int, token_major: bool = False
+    num_experts: int,
+    topk: int,
+    split_k: int,
+    token_major: bool = False,
+    quant_only: bool = False,
 ):
     """Each lane sorts its four choices once; the winning lane pops its head after each pick.
 
@@ -72,14 +76,17 @@ def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
 
     Args:
         token_major: contiguous [m, S, 128] partials, read at constant split offsets.
+        quant_only: only the quant workgroups (no top-k, no partials / bias / outputs read or written): the input
+            quant of a caller whose top-k comes from elsewhere (``quant_mxfp4_mxfp8``).
     """
     assert num_experts == 128 and topk == 4
     E, K, S = num_experts, topk, split_k
-    assert not token_major or S == 48
+    assert S % 8 == 0 and 8 <= S <= 96
     name = (
         f"router_splitk_biased_top{K}_mxfp4_mxfp8_quant_sorted_tasks_h{H}_e{E}_s{S}"
         + "_half_tree_maxnum_direct_weight"
         + ("_token_partials" if token_major else "")
+        + ("_quant_only" if quant_only else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
@@ -104,113 +111,119 @@ def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
         lane = tx % 64
         wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         t = pid * NW + wave
-        if t < i32_m:
-            pr = buffer_ops.create_buffer_resource_from_addr(
-                arg_part, num_records_bytes=i64_part_bytes
-            )
-            br = buffer_ops.create_buffer_resource_from_addr(
-                arg_bias, num_records_bytes=E * 4
-            )
-            out_bytes = fx.Int64(i32_m) * fx.Int64(i32_stk) * 4
-            wr = buffer_ops.create_buffer_resource_from_addr(
-                arg_w, num_records_bytes=out_bytes
-            )
-            ir = buffer_ops.create_buffer_resource_from_addr(
-                arg_ids, num_records_bytes=out_bytes
-            )
-            has = lane < E // 4
-            el = lane % 32 * 4 + lane // 32 * 2
-            base = t * (S * E if const_expr(token_major) else i32_sm) + el
-            parts = [
-                Vec(
+        top_m = fx.Int32(0) if const_expr(quant_only) else i32_m
+        if const_expr(not quant_only):
+            if t < i32_m:
+                pr = buffer_ops.create_buffer_resource_from_addr(
+                    arg_part, num_records_bytes=i64_part_bytes
+                )
+                br = buffer_ops.create_buffer_resource_from_addr(
+                    arg_bias, num_records_bytes=E * 4
+                )
+                out_bytes = fx.Int64(i32_m) * fx.Int64(i32_stk) * 4
+                wr = buffer_ops.create_buffer_resource_from_addr(
+                    arg_w, num_records_bytes=out_bytes
+                )
+                ir = buffer_ops.create_buffer_resource_from_addr(
+                    arg_ids, num_records_bytes=out_bytes
+                )
+                has = lane < E // 4
+                el = lane % 32 * 4 + lane // 32 * 2
+                base = t * (S * E if const_expr(token_major) else i32_sm) + el
+                parts = [
+                    Vec(
+                        buffer_ops.buffer_load(
+                            pr,
+                            base + k * (E if const_expr(token_major) else i32_sk),
+                            vec_width=2,
+                            dtype=fx.Float32,
+                        )
+                    )
+                    for k in range_constexpr(S)
+                ]
+                bias = Vec(
                     buffer_ops.buffer_load(
-                        pr,
-                        base + k * (E if const_expr(token_major) else i32_sk),
-                        vec_width=2,
-                        dtype=fx.Float32,
+                        br, lane * 4, vec_width=4, dtype=fx.Float32, mask=has
                     )
                 )
-                for k in range_constexpr(S)
-            ]
-            bias = Vec(
-                buffer_ops.buffer_load(
-                    br, lane * 4, vec_width=4, dtype=fx.Float32, mask=has
-                )
-            )
-            neg_inf = fx.Float32(float("-inf"))
-            ss = []
-            for i in range_constexpr(2):
-                x = fx.Float32(0.0)
-                for k in range_constexpr(S):
-                    x = x + fx.Float32(parts[k][i])
-                y = (x.to(fx.Float64) * fx.Float64(NEG_LOG2E)).to(fx.Float32)
-                ss.append(fx.Float32(fx.rocdl.rcp(T.f32, fx.Float32(1.0) + y.exp2())))
-            # components 2 / 3 back to the quartet's lower lane, for the same argmax tree and ties
-            sig = [
-                ss[0],
-                ss[1],
-                fx.Int32(
-                    fx.rocdl.ds_bpermute(
-                        T.i32, (lane ^ 32) * 4, ss[0].bitcast(fx.Int32)
+                neg_inf = fx.Float32(float("-inf"))
+                ss = []
+                for i in range_constexpr(2):
+                    x = fx.Float32(0.0)
+                    for k in range_constexpr(S):
+                        x = x + fx.Float32(parts[k][i])
+                    y = (x.to(fx.Float64) * fx.Float64(NEG_LOG2E)).to(fx.Float32)
+                    ss.append(
+                        fx.Float32(fx.rocdl.rcp(T.f32, fx.Float32(1.0) + y.exp2()))
                     )
-                ).bitcast(fx.Float32),
-                fx.Int32(
-                    fx.rocdl.ds_bpermute(
-                        T.i32, (lane ^ 32) * 4, ss[1].bitcast(fx.Int32)
+                # components 2 / 3 back to the quartet's lower lane, for the same argmax tree and ties
+                sig = [
+                    ss[0],
+                    ss[1],
+                    fx.Int32(
+                        fx.rocdl.ds_bpermute(
+                            T.i32, (lane ^ 32) * 4, ss[0].bitcast(fx.Int32)
+                        )
+                    ).bitcast(fx.Float32),
+                    fx.Int32(
+                        fx.rocdl.ds_bpermute(
+                            T.i32, (lane ^ 32) * 4, ss[1].bitcast(fx.Int32)
+                        )
+                    ).bitcast(fx.Float32),
+                ]
+                choice = [
+                    has.select(sig[i] + fx.Float32(bias[i]), neg_inf)
+                    for i in range_constexpr(4)
+                ]
+                # Strict argmax ignores NaNs and -inf; keep that behavior in the queue.
+                choice = [(v > neg_inf).select(v, neg_inf) for v in choice]
+                local_ids = [lane * 4 + i for i in range_constexpr(4)]
+                # stable insertion network: ties keep the component order
+                for a, b in ((0, 1), (1, 2), (0, 1), (2, 3), (1, 2), (0, 1)):
+                    take = choice[b] > choice[a]
+                    va, vb = choice[a], choice[b]
+                    ia, ib = local_ids[a], local_ids[b]
+                    choice[a], choice[b] = take.select(vb, va), take.select(va, vb)
+                    local_ids[a], local_ids[b] = take.select(ib, ia), take.select(
+                        ia, ib
                     )
-                ).bitcast(fx.Float32),
-            ]
-            choice = [
-                has.select(sig[i] + fx.Float32(bias[i]), neg_inf)
-                for i in range_constexpr(4)
-            ]
-            # Strict argmax ignores NaNs and -inf; keep that behavior in the queue.
-            choice = [(v > neg_inf).select(v, neg_inf) for v in choice]
-            local_ids = [lane * 4 + i for i in range_constexpr(4)]
-            # stable insertion network: ties keep the component order
-            for a, b in ((0, 1), (1, 2), (0, 1), (2, 3), (1, 2), (0, 1)):
-                take = choice[b] > choice[a]
-                va, vb = choice[a], choice[b]
-                ia, ib = local_ids[a], local_ids[b]
-                choice[a], choice[b] = take.select(vb, va), take.select(va, vb)
-                local_ids[a], local_ids[b] = take.select(ib, ia), take.select(ia, ib)
-            total = fx.Float32(0.0)
-            out_id = fx.Int32(0)
-            out_val = fx.Float32(0.0)
-            for k in range_constexpr(K):
-                mv = choice[0]
-                mi = (mv > neg_inf).select(local_ids[0], fx.Int32(k))
-                for ctrl in DPP_TREE[:-1]:
-                    dpp = _dpp_full if ctrl in FULL_DPP else _dpp
-                    rv = dpp(mv.bitcast(fx.Int32), ctrl).bitcast(fx.Float32)
-                    ri = dpp(mi, ctrl)
-                    take = rv > mv
-                    mv = _maxf_nn(rv, mv)
-                    mi = take.select(ri, mi)
-                idx = fx.Int32(fx.rocdl.readlane(T.i32, mi, fx.Int32(31)))
-                owner, comp = idx >> 2, idx & 3
-                # expert idx: element comp % 2 of lane owner + 32 (comp // 2), also the strict argmax's fallback index
-                source_lane = owner + ((comp & 2) << 4)
-                local_w = ((comp & 1) == 1).select(ss[1], ss[0])
-                w = fx.Int32(
-                    fx.rocdl.readlane(T.i32, local_w.bitcast(fx.Int32), source_lane)
-                ).bitcast(fx.Float32)
-                # Only the lane that supplied the global pick advances its queue.
-                pick = lane == owner
-                for i in range_constexpr(3):
-                    choice[i] = pick.select(choice[i + 1], choice[i])
-                    local_ids[i] = pick.select(local_ids[i + 1], local_ids[i])
-                choice[3] = pick.select(neg_inf, choice[3])
-                total = total + w
-                out_id = (lane == k).select(idx, out_id)
-                out_val = (lane == k).select(w, out_val)
-            scale = i32_scale.bitcast(fx.Float32)
-            factor = scale / total
-            off = t * i32_stk + lane
-            buffer_ops.buffer_store(out_val * factor, wr, off, mask=lane < K)
-            buffer_ops.buffer_store(out_id, ir, off, mask=lane < K)
-        if pid >= i32_m:
-            blk_base = (pid - i32_m) * 64
+                total = fx.Float32(0.0)
+                out_id = fx.Int32(0)
+                out_val = fx.Float32(0.0)
+                for k in range_constexpr(K):
+                    mv = choice[0]
+                    mi = (mv > neg_inf).select(local_ids[0], fx.Int32(k))
+                    for ctrl in DPP_TREE[:-1]:
+                        dpp = _dpp_full if ctrl in FULL_DPP else _dpp
+                        rv = dpp(mv.bitcast(fx.Int32), ctrl).bitcast(fx.Float32)
+                        ri = dpp(mi, ctrl)
+                        take = rv > mv
+                        mv = _maxf_nn(rv, mv)
+                        mi = take.select(ri, mi)
+                    idx = fx.Int32(fx.rocdl.readlane(T.i32, mi, fx.Int32(31)))
+                    owner, comp = idx >> 2, idx & 3
+                    # expert idx: element comp % 2 of lane owner + 32 (comp // 2), also the strict argmax's fallback index
+                    source_lane = owner + ((comp & 2) << 4)
+                    local_w = ((comp & 1) == 1).select(ss[1], ss[0])
+                    w = fx.Int32(
+                        fx.rocdl.readlane(T.i32, local_w.bitcast(fx.Int32), source_lane)
+                    ).bitcast(fx.Float32)
+                    # Only the lane that supplied the global pick advances its queue.
+                    pick = lane == owner
+                    for i in range_constexpr(3):
+                        choice[i] = pick.select(choice[i + 1], choice[i])
+                        local_ids[i] = pick.select(local_ids[i + 1], local_ids[i])
+                    choice[3] = pick.select(neg_inf, choice[3])
+                    total = total + w
+                    out_id = (lane == k).select(idx, out_id)
+                    out_val = (lane == k).select(w, out_val)
+                scale = i32_scale.bitcast(fx.Float32)
+                factor = scale / total
+                off = t * i32_stk + lane
+                buffer_ops.buffer_store(out_val * factor, wr, off, mask=lane < K)
+                buffer_ops.buffer_store(out_id, ir, off, mask=lane < K)
+        if pid >= top_m:
+            blk_base = (pid - top_m) * 64
             if blk_base < i32_m * BLOCKS:
                 # one 32-value group per lane
                 row_bytes = fx.Int64(i32_m) * (H * 2)
@@ -324,7 +337,14 @@ def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
             arg_q8,
             arg_s8,
         ).launch(
-            grid=(fx.Int64(i32_m + (i32_m * BLOCKS + 63) // 64), 1, 1),
+            grid=(
+                fx.Int64(
+                    (0 if const_expr(quant_only) else i32_m)
+                    + (i32_m * BLOCKS + 63) // 64
+                ),
+                1,
+                1,
+            ),
             block=(64 * NW, 1, 1),
             stream=stream,
         )
@@ -335,10 +355,61 @@ def compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
 
 
 @functools.cache
-def _get_kernel(num_experts: int, topk: int, split_k: int, token_major: bool = False):
+def _get_kernel(
+    num_experts: int,
+    topk: int,
+    split_k: int,
+    token_major: bool = False,
+    quant_only: bool = False,
+):
     return compile_router_topk_mxfp4_mxfp8_quant_sorted_tasks(
-        num_experts, topk, split_k, token_major
+        num_experts, topk, split_k, token_major, quant_only
     )
+
+
+def quant_mxfp4_mxfp8(x: torch.Tensor):
+    """MXFP4 and MXFP8 input quant of bf16 [m, 6144] rows (1-256, contiguous) in one launch, the arithmetic of
+    ``splitk_biased_topk_mxfp4_mxfp8_quant`` without its top-k: ((FP4 codes, e8m0), (FP8 codes, e8m0)).
+    """
+    m = x.shape[0]
+    if not (
+        x.dim() == 2
+        and 0 < m <= 256
+        and x.shape[1] == H
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and on_supported_device(x)
+    ):
+        raise ValueError(
+            f"quant_mxfp4_mxfp8: needs contiguous bf16 [1-256, {H}] rows on a gfx950 device, got "
+            f"{tuple(x.shape)} {x.dtype}"
+        )
+    dev = x.device
+    q = torch.empty((m, H // 2), dtype=torch.uint8, device=dev)
+    s = torch.empty((m, H // 32), dtype=torch.uint8, device=dev)
+    q8 = torch.empty((m, H), dtype=torch.uint8, device=dev)
+    s8 = torch.empty((m, H // 32), dtype=torch.uint8, device=dev)
+    z = 0  # the top-k operands are unused: no top-k workgroup runs
+    run_on_device(
+        _get_kernel(E, TOPK, 8, False, True),
+        dev,
+        z,
+        z,
+        z,
+        z,
+        0,
+        m,
+        0,
+        0,
+        0,
+        0,
+        x.data_ptr(),
+        q.data_ptr(),
+        s.data_ptr(),
+        q8.data_ptr(),
+        s8.data_ptr(),
+    )
+    return (q, s), (q8, s8)
 
 
 def splitk_biased_topk_mxfp4_mxfp8_quant(
@@ -388,8 +459,7 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
         (m - 1) * partials.stride(0) + (split_k - 1) * partials.stride(1) + num_experts
     )
     token_major = (
-        split_k == 48
-        and partials.stride(0) == split_k * num_experts
+        partials.stride(0) == split_k * num_experts
         and partials.stride(1) == num_experts
     )
     launch = (

@@ -76,7 +76,11 @@ class DecodeExpertPlan:
         self.n, self.bm = n, bm
         self.rows = max_sorted_rows(n, E, TOPK, bm)
         sh_bm, sh_kw, sh_pf = shared_fold_tile_for(n)
-        sh_bm, sh_pf = cfg.get("sh_bm", sh_bm), cfg.get("sh_pf", sh_pf)
+        sh_bm, sh_kw, sh_pf = (
+            cfg.get("sh_bm", sh_bm),
+            cfg.get("sh_kw", sh_kw),
+            cfg.get("sh_pf", sh_pf),
+        )
         self.nsh1 = (n + sh_bm - 1) // sh_bm * (24 // (4 // sh_kw))
         sh_tn = cfg.get("sh_tn", shared_g2_columns_for(n))
         g2_bm = shared_fold_down_rows_for(sh_bm, bm)
@@ -105,15 +109,19 @@ class DecodeExpertPlan:
 _plans: dict = {}
 
 
-def get_plan(n: int, asm: bool = True, w13_split: bool = False) -> DecodeExpertPlan:
-    """``w13_split``: the routed ``w13`` operand is in the preshuffled ``[E, 2, I/16, block]`` layout (gate
+def get_plan(
+    n: int, asm: bool = True, w13_split: bool = False, tiles: dict | None = None
+) -> DecodeExpertPlan:
+    """``tiles``: a tuning config (``decode_moe_cfg.ExpertCfg.to_tiles()``) replacing ``tiles_for(n, asm)``; every
+    field a tile knob of ``tiles_for`` plus ``sh_kw`` (shared gate/up K-waves), all bit-identical to the default
+    tiling. ``w13_split``: the routed ``w13`` operand is in the preshuffled ``[E, 2, I/16, block]`` layout (gate
     blocks, then up blocks, as ``shuffle_weight`` leaves it) instead of the gate / up interleaved
     ``[E, I/16, 2, block]``; same outputs. The scales ``s13`` stay in the interleaved layout.
     """
-    key = (n, asm, w13_split)
+    key = (n, asm, w13_split, None if tiles is None else tuple(sorted(tiles.items())))
     p = _plans.get(key)
     if p is None:
-        p = _plans[key] = DecodeExpertPlan(n, asm, w13_split=w13_split)
+        p = _plans[key] = DecodeExpertPlan(n, asm, tiles=tiles, w13_split=w13_split)
     return p
 
 

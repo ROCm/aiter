@@ -41,6 +41,13 @@ class FusedMoeRequest:
     q_dtype_w: torch.dtype | None = None
     w1_global_scale: torch.Tensor | None = None
     w2_global_scale: torch.Tensor | None = None
+    # a shared expert folded into the call (``fused_moe(shared_folded=True)``): weights and scales as the caller
+    # holds them, and, when the router already quantized the input, the shared expert's quantized input
+    shared_w1: torch.Tensor | None = None
+    shared_w2: torch.Tensor | None = None
+    shared_w1_scale: torch.Tensor | None = None
+    shared_w2_scale: torch.Tensor | None = None
+    shared_a1: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 FusedMoeImpl = Callable[[FusedMoeRequest, str], torch.Tensor]

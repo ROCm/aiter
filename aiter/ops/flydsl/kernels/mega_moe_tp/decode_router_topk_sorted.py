@@ -62,9 +62,8 @@ def compile_router_topk_sorted(
     Args:
         token_major: contiguous [m, S, 128] partials, read at constant split offsets.
     """
-    assert num_experts == 128 and topk == 4 and split_k in (16, 48)
+    assert num_experts == 128 and topk == 4 and split_k % 8 == 0 and 8 <= split_k <= 96
     E, K, S = num_experts, topk, split_k
-    assert not token_major or S in (16, 48)
     name = (
         f"router_splitk_biased_top{K}_sorted_h{H}_e{E}_s{S}"
         + "_half_tree_maxnum_direct_weight"

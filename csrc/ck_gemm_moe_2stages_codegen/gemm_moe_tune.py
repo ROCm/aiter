@@ -56,6 +56,7 @@ from aiter.int4_utils import (
 from aiter.jit.core import (
     AITER_CONFIG_FMOE,
     AITER_CONFIG_GROUPED_FMOE,
+    AITER_CONFIG_SHARED_FMOE,
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
     get_asm_dir,
@@ -993,6 +994,20 @@ class FmoeTuner(TunerCommon):
             action="store_true",
             required=False,
             help="On gfx1250, tune the FlyDSL grouped-GEMM MoE path instead of the normal fmoe tuner.",
+        )
+        self.parser.add_argument(
+            "--decode-chain",
+            action="store_true",
+            required=False,
+            help="Tune the MiniMax-M3.1 decode MoE chain (whole-graph flydsl_m3decode expert row + flydsl_m3route "
+            "router config, tuned_shared_fmoe.csv) against the public path of the layer; gfx950 only.",
+        )
+        self.parser.add_argument(
+            "--decode-chain-full",
+            action="store_true",
+            required=False,
+            help="With --decode-chain: the full cross product of the tile / split-K axes instead of the staged "
+            "one-knob neighbours of the default (hundreds of compiles per shape).",
         )
         self.parser.add_argument(
             "--mxfp4-flydsl",
@@ -7510,6 +7525,81 @@ class GroupedFmoeTuner(FmoeTuner):
         pd.DataFrame(rows, columns=columns).to_csv(file, index=False)
 
 
+class DecodeChainTuner(FmoeTuner):
+    """``--decode-chain``: rows of ``tuned_shared_fmoe.csv`` for ``fused_moe(shared_folded=True)`` (the decode MoE of
+    MiniMax-M3.1 at TP4). ``kernelName1`` is the whole-graph ``impl__flydsl_m3decode__<tiles>`` and ``kernelName2``
+    the router front ``flydsl_m3route_<split-K / tile / quant placement>``; the search is
+    ``decode_chain_tune.tune_shape``."""
+
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **FmoeTuner.ARG_DEFAULTS,
+        "tune_file": f"{AITER_CONFIG_SHARED_FMOE}",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_shared_fmoe.csv",
+        "config_env_name": "AITER_CONFIG_SHARED_FMOE",
+    }
+
+    def _clear_op_caches(self):
+        super()._clear_op_caches()
+        import aiter.fused_moe as fmoe_module
+
+        fmoe_module._decode_route_cfg_names.cache_clear()
+
+    def tune(self, untunedf, tunedf, args):
+        from csrc.ck_gemm_moe_2stages_codegen.decode_chain_tune import tune_shape
+
+        del tunedf
+        if get_gfx() != "gfx950":
+            raise SystemExit("--decode-chain is only supported on gfx950")
+        rows = []
+        for _, row in untunedf.iterrows():
+            shape = tuple(
+                int(row[k]) for k in ("model_dim", "inter_dim", "expert", "topk")
+            )
+            if shape != (6144, 768, 128, 4) or not 8 <= int(row["token"]) <= 128:
+                print(
+                    f"[decode-chain] skip {dict(row)}: only E128 top-4 H6144 I768, 8-128 tokens",
+                    flush=True,
+                )
+                continue
+            result = tune_shape(
+                int(row["token"]),
+                str(row["gfx"]),
+                int(row["cu_num"]),
+                reps=max(int(args.iters), 10),
+                full=args.decode_chain_full,
+                log=lambda m: print(m, flush=True),
+            )
+            if result is None:
+                print(
+                    f"[decode-chain] token={row['token']}: the public path wins or no candidate ran; no row",
+                    flush=True,
+                )
+                continue
+            rows.append(result)
+        return rows
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        del args, topk, fast_mode
+        return pd.DataFrame(results, columns=self.columns)
+
+    def result_to_csv(self, results, file, concat=False):
+        from csrc.ck_gemm_moe_2stages_codegen.decode_chain_tune import SHARED_COLUMNS
+
+        del concat
+        old = (
+            pd.read_csv(file, dtype=str, keep_default_na=False)
+            if os.path.exists(file) and os.path.getsize(file) > 0
+            else pd.DataFrame(columns=SHARED_COLUMNS)
+        )
+        new = results.astype(str)[SHARED_COLUMNS]
+        keys = [k for k in self.keys if k in SHARED_COLUMNS]
+        merged = pd.concat([old, new], ignore_index=True).drop_duplicates(
+            subset=keys, keep="last"
+        )
+        merged.to_csv(file, index=False)
+        self.success = pd.concat([self.success, results], ignore_index=True)
+
+
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune FlyDSL A4W4/A8W4 as one coupled GEMM1/GEMM2 pipeline.
 
@@ -9784,7 +9874,27 @@ if __name__ == "__main__":
     ]
     use_grouped = "--grouped-gemm" in sys.argv
     use_mxfp4_flydsl = "--mxfp4-flydsl" in sys.argv
-    if use_grouped:
+    use_decode_chain = "--decode-chain" in sys.argv
+    if use_decode_chain:
+        shared_key = key[:7] + ["shared_expert_id"] + key[7:]
+        shared_key += ["hidden_pad", "intermediate_pad", "gate_mode"]
+        tuner = DecodeChainTuner(
+            "decodeChainTuner",
+            shared_key,
+            [
+                "block_m",
+                "ksplit",
+                "us1",
+                "kernelName1",
+                "err1",
+                "us2",
+                "kernelName2",
+                "err2",
+                "us",
+            ],
+            "decode MoE chain tuner",
+        )
+    elif use_grouped:
         if get_gfx() != "gfx1250":
             raise SystemExit("--grouped-gemm is only supported on gfx1250")
         tuner = GroupedFmoeTuner(

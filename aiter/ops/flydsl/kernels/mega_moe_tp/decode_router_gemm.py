@@ -11,6 +11,7 @@ choice are the ones amd-kernels measured; the partials are bit-identical.
 
 import torch
 
+from .decode_moe_cfg import RouterCfg, router_partials_default
 from .decode_router_common import MAX_BUFFER_BYTES, on_supported_device, run_on_device
 
 H, E = 6144, 128
@@ -57,14 +58,20 @@ def nblocks_config(num_rows: int):
     return split_k, block_k, waves, 1
 
 
-def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None):
+def router_gemm_partials(
+    hidden_states, router_weight, router_weight_lines=None, cfg=None
+):
     """FP32 partials [m, split_k, 128]: contiguous (token-major) to 64 rows, a permuted view of [split_k, m, 128]
     above. None outside the covered shapes (1-128 rows, bf16 [m, 6144] with non-overlapping rows, fp32 [128, 6144]
     gate, all on one gfx950 device), so the caller falls back.
 
     Args:
-        router_weight_lines: ``router_line_layout(router_weight)``, read by the 1-32 row tiers when given (the
-            larger tiers read ``router_weight``). The two must hold the same gate: the kernels cannot check that.
+        router_weight_lines: ``router_line_layout(router_weight)``, read by the ``direct`` / ``lines`` kernels when
+            given (the ``nblocks`` kernel reads ``router_weight``). The two must hold the same gate: the kernels
+            cannot check that.
+        cfg: a ``decode_moe_cfg.RouterCfg`` (quant == 0), default ``router_partials_default(m)``: the split-K,
+            kernel and tile of the router launch. None is returned for a ``direct`` / ``lines`` cfg without
+            ``router_weight_lines``.
     """
     m = hidden_states.shape[0]
     if (
@@ -85,12 +92,6 @@ def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None)
         or not on_supported_device(hidden_states, router_weight)
     ):
         return None
-    split_k, block_k = split_config(m)
-    token_major = m <= TOKEN_MAJOR_MAX
-    partials = torch.empty(
-        (split_k, m, E), dtype=torch.float32, device=hidden_states.device
-    )
-    result = partials.view(m, split_k, E) if token_major else partials.permute(1, 0, 2)
     lines_ok = (
         router_weight_lines is not None
         and router_weight_lines.dtype == torch.float32
@@ -98,13 +99,36 @@ def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None)
         and router_weight_lines.numel() == E * H
         and on_supported_device(hidden_states, router_weight_lines)
     )
+    if cfg is None:
+        cfg = router_partials_default(m)
+        if (
+            cfg.uses_lines and not lines_ok
+        ):  # the default tier falls back to the generic tile
+            split_k, block_k = split_config(m)
+            cfg = RouterCfg(
+                "nblocks",
+                split_k,
+                block_k,
+                nblocks_config(m)[2],
+                1,
+                0,
+                X_DIRECT_FROM <= m <= X_DIRECT_MAX,
+            )
+    if cfg.quant != 0 or not cfg.fits(m) or (cfg.uses_lines and not lines_ok):
+        return None
+    split_k, block_k = cfg.split_k, cfg.block_k
+    token_major = cfg.token_major(m)
+    partials = torch.empty(
+        (split_k, m, E), dtype=torch.float32, device=hidden_states.device
+    )
+    result = partials.view(m, split_k, E) if token_major else partials.permute(1, 0, 2)
     x, p, sx = hidden_states.data_ptr(), partials.data_ptr(), hidden_states.stride(0)
-    if lines_ok and m <= DIRECT_LINES_MAX:
+    if cfg.kind == "direct":
         from .decode_router_gemm_direct import _get_kernel
 
         exe = _get_kernel(split_k, block_k, (m + 15) // 16, 2, True, token_major)
         args = (x, router_weight_lines.data_ptr(), p, m, sx)
-    elif lines_ok and NBLOCKS_LINES_FROM <= m <= NBLOCKS_LINES_MAX:
+    elif cfg.kind == "lines":
         from .decode_router_gemm_lines import _get_kernel
 
         exe = _get_kernel(token_major)
@@ -112,8 +136,9 @@ def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None)
     else:
         from .decode_router_gemm_nblocks import _get_kernel
 
-        x_direct = X_DIRECT_FROM <= m <= X_DIRECT_MAX
-        exe = _get_kernel(*nblocks_config(m), 0, x_direct, token_major)
+        exe = _get_kernel(
+            split_k, block_k, cfg.waves, cfg.nbw, 0, cfg.x_direct, token_major
+        )
         args = (x, router_weight.data_ptr(), p, m, sx, 0, 0, 0, 0)  # no quant outputs
     run_on_device(exe, hidden_states.device, *args)
     return result

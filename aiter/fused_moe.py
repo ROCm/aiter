@@ -1318,8 +1318,19 @@ def fused_moe(
     # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    shared_folded: bool = False,
+    shared_a1: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
+
+    ``shared_folded=True`` (with the four ``shared_*`` tensors, no ``shared_expert_id``) is a shared expert that is
+    a separate MLP, not a dummy routed row: the result is ``sum_k topk_weight[k] * expert_k(x) + shared(x)`` (the
+    caller folds any routed scale into ``topk_weight``; padding rows are the caller's, ``num_local_tokens`` is
+    ignored and ids outside [0, E) route nowhere). It needs a tuned ``tuned_shared_fmoe.csv`` row for the
+    shape (``kernelName1`` an ``impl__...`` whole-graph implementation, e.g. the MiniMax-M3.1 decode chain
+    ``flydsl_m3decode``) and raises ``NotImplementedError`` without one. ``shared_a1`` is the shared expert's
+    quantized input ``(codes, e8m0 scales)`` when ``hidden_states`` / ``a1_scale`` are the routed expert's already
+    quantized input (a router entry such as ``moe_route_quant`` produces both).
 
     ``deterministic=True`` gives bitwise the same output for a token whatever the
     batch, and from run to run: the FlyDSL kernels with one K structure for
@@ -1351,6 +1362,38 @@ def fused_moe(
     """
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
+    if shared_folded:
+        return _fused_moe_shared_folded(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation=activation,
+            quant_type=quant_type,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            dtype=dtype,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            gate_mode=gate_mode,
+            shared=(shared_w1, shared_w2, shared_w1_scale, shared_w2_scale),
+            shared_a1=shared_a1,
+            shared_expert_id=shared_expert_id,
+            output=output,
+            unsupported=dict(
+                expert_mask=expert_mask,
+                doweight_stage1=doweight_stage1,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                stage2_scatter=stage2_scatter,
+                herd_topk=herd_topk,
+                deterministic=deterministic,
+            ),
+        )
     has_shared_expert = (
         any(
             tensor is not None
@@ -1492,6 +1535,175 @@ def fused_moe(
         deterministic=deterministic,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+    )
+
+
+def _fused_moe_shared_folded(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    activation,
+    quant_type,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    dtype,
+    swiglu_limit,
+    beta,
+    gate_mode,
+    shared,
+    shared_a1,
+    shared_expert_id,
+    output,
+    unsupported,
+):
+    """``fused_moe(shared_folded=True)``: the tuned whole-graph row of ``tuned_shared_fmoe.csv``."""
+    from aiter.fused_moe_registry import FusedMoeRequest
+
+    bad = [k for k, v in unsupported.items() if v not in (None, False, 0)]
+    if bad:
+        raise NotImplementedError(f"shared_folded does not support {', '.join(bad)}")
+    if shared_expert_id not in (-1, None) or any(t is None for t in shared):
+        raise ValueError(
+            "shared_folded needs shared_w1, shared_w2, shared_w1_scale and shared_w2_scale and no shared_expert_id"
+        )
+    gate_mode = GateMode(gate_mode)
+    if (
+        activation != ActivationType.Swiglu
+        or quant_type != QuantType.per_1x32
+        or gate_mode != GateMode.SEPARATED
+    ):
+        raise NotImplementedError(
+            "shared_folded: needs ActivationType.Swiglu, QuantType.per_1x32 and separated (GGUU) weights"
+        )
+    M, topk = topk_ids.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    dtype = torch.bfloat16 if dtype is None else dtype
+    metadata = get_2stage_cfgs(
+        get_padded_M(M),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        w1.dtype,  # the row's activation dtype: the implementation quantizes to the weights' dtype
+        w1.dtype,
+        quant_type,
+        True,
+        activation,
+        False,
+        0,
+        0,
+        is_shuffled=bool(getattr(w1, "is_shuffled", False)),
+        gate_mode=gate_mode.value,
+        config_file=AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE,
+        shared_expert_id=-1,
+    )
+    if metadata.full_impl is None:
+        raise NotImplementedError(
+            "shared_folded: the tuned row is not a whole-graph implementation"
+        )
+    out = metadata.full_impl(
+        FusedMoeRequest(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            activation=activation,
+            quant_type=quant_type,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            dtype=dtype,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            gate_mode=gate_mode,
+            q_dtype_a=w1.dtype,
+            q_dtype_w=w1.dtype,
+            shared_w1=shared[0],
+            shared_w2=shared[1],
+            shared_w1_scale=shared[2],
+            shared_w2_scale=shared[3],
+            shared_a1=shared_a1,
+        )
+    )
+    return _return_output(out, output)
+
+
+@functools.lru_cache(maxsize=8)
+def _decode_route_cfg_names(path: str) -> dict:
+    """{(gfx, cu_num, token, model_dim, inter_dim, expert, topk): router config name} of a shared-folded table:
+    ``kernelName2`` of its decode-chain rows."""
+    import pandas as pd
+
+    from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import ROUTE_PREFIX
+
+    df = pd.read_csv(path)
+    out = {}
+    for r in df.to_dict("records"):
+        name = str(r.get("kernelName2", "") or "")
+        if name.startswith(ROUTE_PREFIX):
+            out[
+                tuple(
+                    r[k]
+                    for k in (
+                        "gfx",
+                        "cu_num",
+                        "token",
+                        "model_dim",
+                        "inter_dim",
+                        "expert",
+                        "topk",
+                    )
+                )
+            ] = name
+    return out
+
+
+def moe_route_quant(
+    hidden_states,
+    router_weight,
+    correction_bias,
+    routed_scaling_factor=2.0,
+    router_weight_lines=None,
+):
+    """Router entry in front of ``fused_moe(shared_folded=True)`` for the MiniMax-M3.1 decode shape (E128 top-4,
+    H6144, 1-128 rows): router GEMM (fp32 gate, bf16x3), biased sigmoid top-4 with the routed scale folded into the
+    weights, and the MXFP4 (routed) / MXFP8 (shared expert) input quant, in one or two launches, with the split-K
+    and tile of the tuned ``kernelName2`` row (the default tiers without one).
+
+    Returns ``((fp4 codes, e8m0), (fp8 codes, e8m0), topk_weight, topk_ids)``, or None outside the covered inputs.
+    Pass the first as ``hidden_states`` / ``a1_scale`` and the second as ``shared_a1`` of ``fused_moe``.
+    ``router_weight_lines`` (``router_line_layout``) is built and cached from ``router_weight`` when omitted.
+    """
+    from aiter.ops.flydsl.fused_moe_m3_decode import router_lines
+    from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import RouterCfg
+    from aiter.ops.flydsl.kernels.mega_moe_tp.decode_router_chain import (
+        route_quant_small,
+    )
+
+    m = hidden_states.shape[0]
+    cfg = None
+    name = _decode_route_cfg_names(AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE).get(
+        (get_gfx_runtime(), get_cu_num(), get_padded_M(m), 6144, 768, 128, 4)
+    )
+    if name is not None:
+        cfg = RouterCfg.parse(name)
+        if not cfg.fits(m):
+            cfg = None
+    if router_weight_lines is None and router_weight.is_contiguous():
+        router_weight_lines = router_lines(router_weight)
+    return route_quant_small(
+        hidden_states,
+        router_weight,
+        router_weight_lines,
+        correction_bias,
+        routed_scaling_factor,
+        cfg,
     )
 
 
@@ -5271,6 +5483,7 @@ def get_2stage_cfgs(
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
     has_global_scale=False,
+    shared_expert_id=None,
 ):
     gate_mode = GateMode(gate_mode)
     if q_dtype_w == dtypes.fp4x2 and has_global_scale:
@@ -5463,7 +5676,14 @@ def get_2stage_cfgs(
         doweight_stage1,
     )
     if config_file is not None:
-        fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
+        # shared_expert_id: FHMoE's dummy final routed row (expert - 1) unless the caller names it (-1: a shared
+        # expert folded into the call, no row of its own)
+        fhmoe_keys = (
+            expert - 1 if shared_expert_id is None else shared_expert_id,
+            hidden_pad,
+            intermediate_pad,
+            str(gate_mode),
+        )
         keys += fhmoe_keys
         keys_disabled += fhmoe_keys
 
