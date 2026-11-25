@@ -53,7 +53,9 @@ def _check_all_gather(comm, rank, world, device, rows):
         comm.buffer((rows, H // 32), torch.uint8, byte_offset=n).copy_(b)
         out_a = torch.empty((world * rows, H), dtype=torch.uint8, device=device)
         out_b = torch.empty((world * rows, H // 32), dtype=torch.uint8, device=device)
-        comm.all_gather([(0, n, out_a), (n, n // 32, out_b)])
+        comm.all_gather(
+            [(0, n, out_a), (n, n // 32, out_b)], programs=16 if it % 2 else None
+        )
         ref_a = torch.empty_like(out_a)
         ref_b = torch.empty_like(out_b)
         dist.all_gather_into_tensor(ref_a, a)

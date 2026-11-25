@@ -68,6 +68,8 @@ def _pull_copy_kernel(
     src_off64,
     n64,
     rank,
+    nprog,
+    ntiles,
     total,
     W: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -75,16 +77,22 @@ def _pull_copy_kernel(
 ):
     # all-gather: out[r] = peer r's n64 int64s at src_off64
     # all-to-all: out[r] = peer r's block `rank` (its n64-element block number rank)
+    # Program p serves peer p % W and loops over tiles, nprog / W programs per
+    # peer. A few such programs reach the link rate on 16-32 CUs and leave the
+    # others to concurrent compute.
     pid = tl.program_id(0)
-    r = tl.program_id(1)
     e = tl.load(epoch_ptr)
+    r = pid % W
+    wpp = nprog // W
     src = tl.load(dptrs + r).to(tl.pointer_type(tl.int64)) + src_off64
     if ALL_TO_ALL:
         src += rank * n64.to(tl.int64)
-    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = offs < n64
-    v = tl.load(src + offs, mask=m)
-    tl.store(out.to(tl.pointer_type(tl.int64)) + r.to(tl.int64) * n64 + offs, v, mask=m)
+    dst = out.to(tl.pointer_type(tl.int64)) + r.to(tl.int64) * n64
+    for t in range(pid // W, ntiles, wpp):
+        offs = t.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n64
+        v = tl.load(src + offs, mask=m)
+        tl.store(dst + offs, v, mask=m)
     _finish(base_ptrs, epoch_ptr, cnt_ptr, e, rank, total)
 
 

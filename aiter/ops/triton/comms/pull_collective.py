@@ -56,10 +56,10 @@ from aiter.ops.triton._triton_kernels.comms.pull_collective import (
 __all__ = ["PullCollective"]
 
 _FLAG_BYTES = 4096  # int64 flags: [0] ready, [1] done
-_AG_WARPS = 16
-_AG_PROGRAMS = (
-    192  # programs per copy kernel: more than the CU count loses to a second wave
-)
+_AG_WARPS = 8
+_AG_BLOCK = 1024  # int64 elements per tile
+_AG_PROGRAMS = 32  # programs of a copy kernel: 32 CUs, the others stay free for compute
+_RS_PROGRAMS = 192
 _RS_BLOCK, _RS_WARPS = 4096, 16  # bf16 elements per tile
 _RS_PERSISTENT_TILES = 3072  # from here (8192 tokens at H 6144) the loop wins
 _A2A_WARPS = 16
@@ -168,7 +168,7 @@ class PullCollective:
 
     # ---- collectives -----------------------------------------------------
     def _plan(self, fields):
-        plan, total = [], 0
+        plan = []
         for off, nbytes, out in fields:
             if off % 8 or nbytes % 8 or nbytes <= 0 or off + nbytes > self.max_bytes:
                 raise ValueError(
@@ -178,21 +178,17 @@ class PullCollective:
                 raise ValueError("outputs must be contiguous")
             if out.numel() * out.element_size() != self.world * nbytes:
                 raise ValueError("output must hold world_size times the field bytes")
-            n64 = nbytes // 8
-            block = min(
-                max(_pow2_ceil(triton.cdiv(n64 * self.world, _AG_PROGRAMS)), 8192),
-                1 << 18,
-            )
-            nb = triton.cdiv(n64, block)
-            plan.append((off // 8, n64, nb, block, out))
-            total += nb * self.world
-        return plan, total
+            plan.append((off // 8, nbytes // 8, out))
+        return plan
 
-    def _pull_copy(self, fields, all_to_all: bool) -> None:
-        plan, total = self._plan(fields)
+    def _pull_copy(self, fields, all_to_all: bool, programs: int | None) -> None:
+        plan = self._plan(fields)
+        # nprog / world programs serve each peer
+        per_peer = max(1, (programs or _AG_PROGRAMS) // self.world)
+        nprog = per_peer * self.world
         self._publish()
-        for off64, n64, nb, block, out in plan:
-            _pull_copy_kernel[(nb, self.world)](
+        for off64, n64, out in plan:
+            _pull_copy_kernel[(nprog,)](
                 out,
                 self._flag_ptrs,
                 self._data_ptrs,
@@ -201,24 +197,28 @@ class PullCollective:
                 off64,
                 n64,
                 self.rank,
-                total,
+                nprog,
+                triton.cdiv(n64, _AG_BLOCK),
+                nprog * len(plan),
                 W=self.world,
-                BLOCK=block,
+                BLOCK=_AG_BLOCK,
                 ALL_TO_ALL=all_to_all,
                 num_warps=_AG_WARPS,
             )
 
-    def all_gather(self, fields) -> None:
+    def all_gather(self, fields, programs: int | None = None) -> None:
         """Gather fields from all ranks.
 
         ``fields`` has one ``(byte_offset, nbytes, out)`` entry for each field. The
         producer staged ``nbytes`` bytes at ``byte_offset`` of its buffer. ``out``
         receives the bytes of rank 0 to W-1, in rank order. All fields share one
-        publish and one wait.
+        publish and one wait. ``programs`` is the number of programs, so of CUs, the
+        copy uses (default 32, a multiple of the world size): a smaller number leaves
+        more CUs to compute that runs at the same time.
         """
-        self._pull_copy(fields, False)
+        self._pull_copy(fields, False, programs)
 
-    def all_to_all(self, fields) -> None:
+    def all_to_all(self, fields, programs: int | None = None) -> None:
         """Exchange blocks between ranks.
 
         Like ``all_gather``, but each staged field has W equal blocks. Block j goes
@@ -230,7 +230,7 @@ class PullCollective:
             if nbytes % (8 * self.world):
                 raise ValueError("field bytes must be a multiple of 8 x world_size")
             blocks.append((off, nbytes // self.world, out))
-        self._pull_copy(blocks, True)
+        self._pull_copy(blocks, True, programs)
 
     def reduce_scatter(self, out: torch.Tensor, numel: int) -> None:
         """bf16 reduce-scatter of the first ``numel`` elements of my buffer: ``out``
@@ -261,7 +261,7 @@ class PullCollective:
             )
             return
         # long payload: a persistent loop of 192 programs reaches a higher link rate
-        nprog = _AG_PROGRAMS
+        nprog = _RS_PROGRAMS
         _pull_rs_persistent_kernel[(nprog,)](
             out,
             self._flag_ptrs,
