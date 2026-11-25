@@ -164,7 +164,6 @@ def fused_pipeline_kernel(
         eps,
         BLOCK_SIZE=RMS_BLOCK_SIZE,
         USE_BLOCKED=USE_BLOCKED,
-        NUM_PRGMS=NUM_WORKERS,
     )
 
     # Stage 3 & 4: Quantization + All-gather (if requested)

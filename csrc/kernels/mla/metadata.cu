@@ -227,6 +227,7 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                                                      static_cast<int32_t>(uni_seqlen_qo),
                                                      q_dtype,
                                                      kv_dtype,
+                                                     static_cast<int32_t>(page_size),
                                                      fast_mode,
                                                      intra_batch_mode,
                                                      flags);
@@ -313,6 +314,7 @@ void get_pa_metadata_v1(
 
     AITER_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
                 __func__, ": kv_granularity Must be power of 2!");
+    const int32_t effective_kv_granularity = block_size == 16 ? 256 : kv_granularity;
     AITER_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
     AITER_CHECK(seqlens_qo_indptr.dtype() == AITER_DTYPE_i32,
@@ -329,10 +331,11 @@ void get_pa_metadata_v1(
         num_heads_per_head_k,
         num_heads_k,
         is_causal,
-        kv_granularity,
+        effective_kv_granularity,
         block_size,
         max_seqlen_qo,
         uni_seqlen_qo,
+        fast_mode,
         topk,
         max_split_per_batch,
         work_metadata_ptrs,

@@ -12,7 +12,8 @@
 // clang-format off
 #define _AITER_MLA_REDUCE_FOR_EACH_ROW(F, ...) \
     F(1, 128, __VA_ARGS__) F(2, 128, __VA_ARGS__) F(4, 128, __VA_ARGS__)                    \
-    F(8, 128, __VA_ARGS__) F(10, 128, __VA_ARGS__) F(16, 128, __VA_ARGS__)                  \
+    F(8, 128, __VA_ARGS__) F(10, 128, __VA_ARGS__) F(12, 128, __VA_ARGS__)                  \
+    F(16, 128, __VA_ARGS__)                                                                 \
     F(16, 512, __VA_ARGS__) F(24, 512, __VA_ARGS__) F(32, 128, __VA_ARGS__)                 \
     F(32, 512, __VA_ARGS__) F(40, 128, __VA_ARGS__) F(48, 128, __VA_ARGS__)                 \
     F(64, 64, __VA_ARGS__) F(64, 128, __VA_ARGS__) F(64, 512, __VA_ARGS__)                  \
