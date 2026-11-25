@@ -27,7 +27,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark
 
 EPS = 1e-10
 
@@ -261,18 +261,48 @@ def check_graph(replays=20):
     aiter.logger.info("spec_verify_pick graph replay passed (%d sampled flips)", flips)
 
 
+def graph_us(func, args, calls=100, replays=20):
+    """Median us per call of ``func(*args)`` replayed from one CUDA graph of
+    ``calls`` calls. The chains are 2 to 15 launches each, which the
+    profiler-based ``run_perftest`` cannot split into iterations reliably."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            func(*args)
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        for _ in range(calls):
+            func(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True
+    )
+    times = []
+    for _ in range(replays):
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1000 / calls)
+    return float(torch.tensor(times).median())
+
+
 @benchmark()
 def test_spec_verify_pick_perf(conc, V, dtype, draft=5):
     args = build(conc, draft, V, dtype, greedy_frac=0.0, seed=conc, ragged=False)
-    _, us_triton = run_perftest(run_triton_chain, *args, testGraph=True)
-    _, us_hip = run_perftest(run_chain, *args, testGraph=True)
-    _, us_fused = run_perftest(run_fused, *args, testGraph=True)
+    us_triton = graph_us(run_triton_chain, args)
+    us_hip = graph_us(run_chain, args)
+    us_fused = graph_us(run_fused, args)
     return {
         "M": int(args[4].numel() + conc),
         "triton_chain_us": us_triton,
         "hip_chain_us": us_hip,
         "fused_us": us_fused,
         "speedup_vs_triton": us_triton / us_fused,
+        "speedup_vs_hip": us_hip / us_fused,
     }
 
 
@@ -301,6 +331,6 @@ if args.perf:
         for conc in (1, 8, 16, 32, 64, 128)
     ]
     aiter.logger.info(
-        "spec_verify_pick perf (graph replay, noise excluded):\n%s",
+        "spec_verify_pick perf (median us per call, CUDA graph replay, noise excluded):\n%s",
         pd.DataFrame(df).to_markdown(index=False),
     )
