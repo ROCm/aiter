@@ -1912,13 +1912,13 @@ def test_presorted_moe_wrapper_error():
 
 
 def _presorted_aux_stub(ids, weights, E, block_m=16):
-    """A registration whose sort tensors have the BM=16 aux-sort layout.
+    """A registration whose sort tensors have the block_m aux-sort layout.
 
     Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
     matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
-    BM = presorted_moe.PRESORTED_MOE_BLOCK_M
+    BM = block_m
     max_sorted = presorted_moe.aux_sort_capacity(M, topk, E, BM)
     i32 = dtypes.i32
     return {
@@ -2065,7 +2065,7 @@ def test_presorted_moe_output_overlap():
 
 
 def test_presorted_moe_block_m():
-    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+    """A BM=16 or BM=128 presort is accepted; another block_m falls back to fused_moe's sort.
 
     kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
     so a registration labelled block_m=32 that matches the call must still be
@@ -2082,6 +2082,7 @@ def test_presorted_moe_block_m():
         )
 
     assert match(16) is not None, "a matching BM=16 presort was rejected"
+    assert match(128) is not None, "a matching BM=128 presort was rejected"
     assert match(32) is None, "a BM=32 presort was accepted"
     # BM=16 kernels, but a caller's block_size_M hands the stages another size.
     aux = _presorted_aux_stub(ids, weights, E)
@@ -2100,10 +2101,11 @@ def test_presorted_moe_block_m():
 
 
 def test_presorted_moe_masked_call():
-    """A presort is ignored when the call passes expert_mask or num_local_tokens.
+    """A presort is ignored when the call passes expert_mask, or num_local_tokens
+    other than the tensor the presort names.
 
-    The presort covers every row of topk_ids with no expert mask, while
-    moe_sorting honors both, so such calls must fall back to moe_sorting.
+    The presort has no expert mask and covers every row of topk_ids, or the rows
+    of the num_local_tokens it was computed for; other calls fall back to moe_sorting.
     Checks the matcher fused_moe uses; no MoE kernel launches.
     """
     M, E, topk = 4, 8, 2
@@ -2119,6 +2121,12 @@ def test_presorted_moe_masked_call():
     assert match() is not None, "a matching unmasked presort was rejected"
     limit = torch.tensor([M - 1], dtype=torch.int32)
     assert match(num_local_tokens=limit) is None, "presort used with num_local_tokens"
+    aux["num_local_tokens_ptr"] = limit.data_ptr()
+    assert match(num_local_tokens=limit) is not None, "row-limited presort rejected"
+    assert match() is None, "row-limited presort used for every row"
+    other = torch.tensor([M - 1], dtype=torch.int32)
+    assert match(num_local_tokens=other) is None, "presort used for other local rows"
+    del aux["num_local_tokens_ptr"]
     mask = torch.ones((E,), dtype=torch.int32)
     assert match(expert_mask=mask) is None, "presort used with expert_mask"
     aiter.logger.info("moe_2stage: presorted MoE masked-call contract passed")

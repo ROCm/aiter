@@ -2782,7 +2782,35 @@ namespace py = pybind11;
           py::arg("ctl"),                                                               \
           py::arg("out"),                                                               \
           py::arg("m"),                                                                 \
-          py::arg("topk"));
+          py::arg("topk"));                                                             \
+    m.def("m3_tp1_moe_g2_w8_tiles",                                                     \
+          &aiter::m3_tp1_moe_g2_w8_tiles,                                               \
+          "MiniMax-M3.1 TP1 8-wave MoE GEMM2 on a given tile list (gfx950)",            \
+          py::arg("a2"),                                                                \
+          py::arg("a2_scale"),                                                          \
+          py::arg("w2_b"),                                                              \
+          py::arg("w2_bs"),                                                             \
+          py::arg("sorted_ids"),                                                        \
+          py::arg("sorted_weights"),                                                    \
+          py::arg("tiles"),                                                             \
+          py::arg("ctl"),                                                               \
+          py::arg("out"),                                                               \
+          py::arg("m"),                                                                 \
+          py::arg("topk"));                                                             \
+    m.def("m3_tp1_moe_sort",                                                            \
+          &aiter::m3_tp1_moe_sort,                                                      \
+          "MiniMax-M3.1 TP1 one-launch MoE sort with the GEMM2 tile list (gfx950)",     \
+          py::arg("topk_ids"),                                                          \
+          py::arg("topk_weights"),                                                      \
+          py::arg("num_local_tokens"),                                                  \
+          py::arg("sorted_ids"),                                                        \
+          py::arg("sorted_weights"),                                                    \
+          py::arg("sorted_expert_ids"),                                                 \
+          py::arg("num_valid_ids"),                                                     \
+          py::arg("m_indices"),                                                         \
+          py::arg("reverse_sorted"),                                                    \
+          py::arg("tiles"),                                                             \
+          py::arg("ctl"));
 
 #define MHC_PYBIND                                \
     AITER_SET_STREAM_PYBIND;                      \
