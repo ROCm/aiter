@@ -458,3 +458,58 @@ def test_fp8_mqa_logits_rejects_malformed_packed_output(bad, message):
         fp8_mqa_logits(
             q, kv, scales, weights, bounds, bounds, out=packed, out_offsets=offsets
         )
+
+
+def _modes_case(rows, keys, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(rows, 32, 128, device="cuda", generator=g).to(e4m3_type)
+    kv = torch.randn(keys, 128, device="cuda", generator=g).to(e4m3_type)
+    scales = torch.rand(keys, device="cuda", generator=g) + 0.5
+    weights = torch.randn(rows, 32, device="cuda", generator=g)
+    starts = torch.randint(0, keys // 2 + 1, (rows,), device="cuda", generator=g)
+    span = torch.randint(0, keys + 1, (rows,), device="cuda", generator=g)
+    ends = torch.minimum(starts + span, torch.full_like(starts, keys))
+    return q, kv, scales, weights, starts.int(), ends.int()
+
+
+def _modes_reference(q, kv, scales, weights, starts, ends):
+    s = torch.einsum("rhd,kd->rhk", q.float(), kv.float()).relu()
+    out = (s * weights[:, :, None]).sum(1) * scales[None, :]
+    cols = torch.arange(kv.shape[0], device="cuda")
+    inside = (cols[None, :] >= starts[:, None]) & (cols[None, :] < ends[:, None])
+    return out, inside
+
+
+@pytest.mark.parametrize("rows,keys", [(2048, 1025), (2051, 3001), (4097, 777)])
+@torch.inference_mode()
+def test_fp8_mqa_logits_modes_bit_identical(rows, keys):
+    q, kv, scales, weights, starts, ends = _modes_case(rows, keys, rows + keys)
+    ref, inside = _modes_reference(q, kv, scales, weights, starts, ends)
+
+    dense = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False)
+    err = (dense[inside] - ref[inside]).abs().max() / ref[inside].abs().max()
+    assert err < 1e-3, f"max-abs relative error {err:.2e}"
+
+    clean = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=True)
+    assert torch.equal(clean[inside], dense[inside])
+    assert torch.isneginf(clean[~inside]).all()
+
+    out = torch.full((rows, keys), float("nan"), device="cuda")
+    fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False, out=out)
+    assert torch.equal(out[inside], dense[inside])
+
+    lens = (ends - starts).clamp(min=0).long()
+    offsets = torch.zeros_like(lens)
+    offsets[1:] = lens.cumsum(0)[:-1]
+    packed = torch.full((int(lens.sum()) + 8,), float("nan"), device="cuda")
+    fp8_mqa_logits(
+        q, kv, scales, weights, starts, ends, out=packed[4:-4], out_offsets=offsets
+    )
+    row_ids = torch.repeat_interleave(torch.arange(rows, device="cuda"), lens)
+    first = lens.cumsum(0) - lens
+    columns = torch.arange(int(lens.sum()), device="cuda") - first[row_ids]
+    assert torch.equal(
+        packed[4:-4][offsets[row_ids] + columns],
+        dense[row_ids, starts[row_ids] + columns],
+    )
+    assert torch.isnan(packed[:4]).all() and torch.isnan(packed[-4:]).all()

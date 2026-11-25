@@ -37,6 +37,7 @@ def relu_f32(x):
     return _relu_f32_dual_gfx1250(x)
 
 
+
 @gluon.jit
 def _load_kv_scales_block(
     base_ptr,
@@ -566,6 +567,7 @@ def mqa_logits_loop_pipelined(
     _store_logits_block(
         logits_ptr, store_offsets, scores_next, USE_BUFFER_STORE, mask=mask
     )
+    kv_loader.wait(0)
 
 
 _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
@@ -594,7 +596,7 @@ def _gluon_fp8_mqa_logits_kernel(
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
     logits_ptr,  # fp32   [seq_len, seq_len_kv]; flat when PACKED
-    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
+    out_offsets_ptr,
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -754,3 +756,296 @@ def _gluon_fp8_mqa_logits_kernel(
             USE_BUFFER_LOAD,
             USE_BUFFER_STORE,
         )
+
+
+_gluon_fp8_mqa_logits_rowgroup_kernel_repr = make_kernel_repr(
+    "_gluon_fp8_mqa_logits_rowgroup_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_M",
+        "BLOCK_KV",
+        "NUM_WARPS",
+        "WARPS_M",
+        "USE_BUFFER_LOAD",
+        "USE_BUFFER_STORE",
+        "EXACT_ROWS",
+        "PACKED",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_fp8_mqa_logits_rowgroup_kernel_repr)
+def _gluon_fp8_mqa_logits_rowgroup_kernel(
+    Q_ptr,
+    KV_ptr,
+    kv_scales_ptr,
+    weights_ptr,
+    cu_start_ptr,
+    cu_end_ptr,
+    logits_ptr,
+    out_offsets_ptr,
+    seq_len: gl.int32,
+    seq_len_kv: gl.int32,
+    NUM_HEADS: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    stride_q_s: gl.int32,
+    stride_q_h: gl.constexpr,
+    stride_q_d: gl.constexpr,
+    stride_kv_s: gl.int32,
+    stride_kv_d: gl.constexpr,
+    stride_w_s: gl.int32,
+    stride_w_h: gl.constexpr,
+    stride_logits_s: gl.int32,
+    stride_logits_k: gl.int32,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+    EXACT_ROWS: gl.constexpr = False,
+    PACKED: gl.constexpr = False,
+    NUM_KV_BUFFERS: gl.constexpr = 2,
+    HEADSUM_WMMA: gl.constexpr = False,  # weighted head sum as a second (fp16) WMMA against block-diagonal weights
+    KV_PIPE: gl.constexpr = False,  # refill the slot read one tile ago before the wait (NUM_KV_BUFFERS >= 3)
+    KVS_PREFETCH: gl.constexpr = False,  # load the next tile's kv scales one iteration ahead
+):
+    block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
+    row0 = gl.minimum(block_id * BLOCK_M, seq_len - BLOCK_M)
+    if not USE_BUFFER_STORE:
+        stride_logits_s = stride_logits_s.to(gl.int64)
+
+    WARP_SIZE: gl.constexpr = 32
+    WARPS_N: gl.constexpr = NUM_WARPS // WARPS_M
+    BM_ROWS: gl.constexpr = BLOCK_M * NUM_HEADS
+    WB_N: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+    WB_M: gl.constexpr = [
+        [NUM_HEADS // 16, 0],
+        [2 * (NUM_HEADS // 16), 0],
+        [4 * (NUM_HEADS // 16), 0],
+    ]
+    if WARPS_N == 1:
+        if WARPS_M == 1:
+            warp_bases: gl.constexpr = []
+        elif WARPS_M == 2:
+            warp_bases: gl.constexpr = [WB_M[0]]
+        elif WARPS_M == 4:
+            warp_bases: gl.constexpr = [WB_M[0], WB_M[1]]
+        else:
+            warp_bases: gl.constexpr = [WB_M[0], WB_M[1], WB_M[2]]
+    elif WARPS_N == 2:
+        if WARPS_M == 1:
+            warp_bases: gl.constexpr = [WB_N[0]]
+        elif WARPS_M == 2:
+            warp_bases: gl.constexpr = [WB_N[0], WB_M[0]]
+        else:
+            warp_bases: gl.constexpr = [WB_N[0], WB_M[0], WB_M[1]]
+    elif WARPS_N == 4:
+        if WARPS_M == 1:
+            warp_bases: gl.constexpr = [WB_N[0], WB_N[1]]
+        else:
+            warp_bases: gl.constexpr = [WB_N[0], WB_N[1], WB_M[0]]
+    else:
+        gl.static_assert(WARPS_N == 8 and WARPS_M == 1, "WARPS_N 8 needs WARPS_M 1")
+        warp_bases: gl.constexpr = [WB_N[0], WB_N[1], WB_N[2]]
+    if NUM_HEADS == 32:
+        reg_bases: gl.constexpr = [[1, 0]]
+    elif NUM_HEADS == 64:
+        reg_bases: gl.constexpr = [[1, 0], [2, 0]]
+    else:
+        reg_bases: gl.constexpr = []
+    mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=False,
+        instr_shape=[16, 16, 128],
+        warp_bases=warp_bases,
+        reg_bases=reg_bases,
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    Q_INNER: gl.constexpr = HEAD_SIZE // 16
+    layout_q: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 16],
+        threads_per_warp=[WARP_SIZE // Q_INNER, Q_INNER],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
+    )
+    SPT_N: gl.constexpr = max(1, BLOCK_KV // (WARP_SIZE * NUM_WARPS))
+    store_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, SPT_N],
+        threads_per_warp=[1, WARP_SIZE],
+        warps_per_cta=[1, NUM_WARPS],
+        order=[1, 0],
+    )
+
+    m_q = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(1, layout_q))
+    d_q = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, layout_q))
+    q = gl.amd.cdna4.buffer_load(
+        ptr=Q_ptr,
+        offsets=(row0 + m_q // NUM_HEADS)[:, None] * stride_q_s
+        + (m_q % NUM_HEADS)[:, None] * stride_q_h
+        + d_q[None, :] * stride_q_d,
+        cache=".cg",
+    )
+    mfma_q = gl.convert_layout(q, dot_a_layout)
+    m_w = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(1, mfma_layout))
+    w = gl.amd.cdna4.buffer_load(
+        ptr=weights_ptr,
+        offsets=(
+            (row0 + m_w // NUM_HEADS) * stride_w_s + (m_w % NUM_HEADS) * stride_w_h
+        )[:, None],
+        cache=".cg",
+    )
+
+    if HEADSUM_WMMA:
+        gl.static_assert(WARPS_M == 1, "HEADSUM_WMMA: the head sum runs over the rows of S, which must stay in one warp")
+        gl.static_assert(2 * BLOCK_M <= 16, "HEADSUM_WMMA: rows [0, BLOCK_M) hold w_hi, [BLOCK_M, 2 BLOCK_M) w_lo")
+        hs_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3, transposed=False, instr_shape=[16, 16, 32], warp_bases=warp_bases
+        )
+        dot_w_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=hs_layout, k_width=8)
+        dot_p_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=hs_layout, k_width=8)
+        wbd_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8], threads_per_warp=[2, 16], warps_per_cta=[NUM_WARPS, 1], order=[1, 0]
+        )
+        i_w = gl.arange(0, 16, layout=gl.SliceLayout(1, wbd_layout))[:, None]
+        j_w = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(0, wbd_layout))[None, :]
+        r_w = j_w // NUM_HEADS
+        w_full = gl.load(weights_ptr + (row0 + r_w) * stride_w_s + (j_w % NUM_HEADS) * stride_w_h + i_w * 0)
+        # fp16 range: S = q.k of e4m3 values is at most 128 * 448^2 = 2.6e7, so the Q.K WMMA runs scaled by 2^-9
+        # (max 50176 < 65504), and the weights are normalized by the power of two of their max; the output gets the
+        # exact power of two 2^(e + 9) back. The weights are split into fp16 hi + lo rows, so they stay ~fp32.
+        w_bits = gl.max(gl.max(gl.abs(w_full), 1), 0).to(gl.int32, bitcast=True)
+        w_exp = (w_bits >> 23) & 255
+        w_full = w_full * ((254 - w_exp) << 23).to(gl.float32, bitcast=True)
+        hs_out_scale = ((w_exp + 9) << 23).to(gl.float32, bitcast=True)
+        q_sc_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+            dot_a_layout, [BM_ROWS, HEAD_SIZE // 32], 32
+        )
+        q_sc = gl.full([BM_ROWS, HEAD_SIZE // 32], 118, gl.uint8, layout=q_sc_layout)
+        w_hi = w_full.to(gl.float16)
+        w_lo = (w_full - w_hi.to(gl.float32)).to(gl.float16)
+        w_bd = gl.where(i_w == r_w, w_hi, gl.where(i_w == r_w + BLOCK_M, w_lo, gl.zeros_like(w_hi)))
+        w_bd = gl.convert_layout(w_bd, dot_w_layout)
+    union_start = seq_len_kv
+    union_end = 0
+    for r in gl.static_range(0, BLOCK_M):
+        s = gl.maximum(gl.load(cu_start_ptr + row0 + r), 0)
+        e = gl.minimum(gl.load(cu_end_ptr + row0 + r), seq_len_kv)
+        union_start = gl.where(e > s, gl.minimum(union_start, s), union_start)
+        union_end = gl.where(e > s, gl.maximum(union_end, e), union_end)
+    union_start = gl.minimum(union_start, union_end)
+
+    kv_loader = MQATDMKVLoader.initialize(
+        KV_ptr,
+        union_start,
+        seq_len_kv,
+        stride_kv_s,
+        stride_kv_d,
+        BLOCK_KV,
+        HEAD_SIZE,
+        NUM_WARPS,
+        WARP_SIZE,
+        NUM_KV_BUFFERS,
+    )
+    rows_st = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, store_layout))
+    keys_st = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, store_layout))
+    store_offsets = (
+        rows_st[:, None] * stride_logits_s + keys_st[None, :] * stride_logits_k
+    )
+    if EXACT_ROWS:
+        row_start = gl.maximum(gl.load(cu_start_ptr + row0 + rows_st), 0)
+        row_end = gl.minimum(gl.load(cu_end_ptr + row0 + rows_st), seq_len_kv)
+    if PACKED:
+        packed_base = gl.load(out_offsets_ptr + row0 + rows_st)
+        if USE_BUFFER_STORE:
+            packed_base = packed_base.to(gl.int32) - row_start
+        else:
+            packed_base = packed_base.to(gl.int64) - row_start
+    kv_scales_ptr = kv_scales_ptr + union_start
+    out_base = logits_ptr
+    logits_ptr = logits_ptr + row0 * stride_logits_s + union_start * stride_logits_k
+    span = union_end - union_start
+    num_full_tiles = span // BLOCK_KV
+
+    gl.static_assert(not KV_PIPE or NUM_KV_BUFFERS >= 3, "KV_PIPE needs NUM_KV_BUFFERS >= 3")
+    # KV_PIPE: the loop issues tile i + NUM_KV_BUFFERS - 1, so the prologue issues one tile fewer
+    for b in gl.static_range(NUM_KV_BUFFERS - (1 if KV_PIPE else 0)):
+        kv_loader.load_to_shared(b * BLOCK_KV, buffer_id=b, USE_BUFFER_LOAD=USE_BUFFER_LOAD)
+    buf_cur: gl.int32 = 0
+    kv_off: gl.int32 = 0
+    if KVS_PREFETCH:
+        kvs_next = gl.load(kv_scales_ptr + keys_st, mask=keys_st < span, other=0.0)
+    for i in tl.range(0, num_full_tiles + 1):
+        if KV_PIPE:  # refill the slot read one tile ago; the previous tile's store barrier covers the WAR
+            kv_loader.load_to_shared(
+                kv_off + (NUM_KV_BUFFERS - 1) * BLOCK_KV,
+                buffer_id=(buf_cur + NUM_KV_BUFFERS - 1) % NUM_KV_BUFFERS,
+                USE_BUFFER_LOAD=USE_BUFFER_LOAD,
+            )
+        mfma_k = kv_loader.load_from_shared(
+            wait_count=NUM_KV_BUFFERS - 1, target_layout=dot_b_layout, buffer_id=buf_cur
+        )
+        if not KV_PIPE:
+            kv_loader.load_to_shared(
+                kv_off + NUM_KV_BUFFERS * BLOCK_KV, buffer_id=buf_cur, USE_BUFFER_LOAD=USE_BUFFER_LOAD
+            )
+        if KVS_PREFETCH:
+            kvs_cur = kvs_next
+            nxt = kv_off + BLOCK_KV + keys_st
+            kvs_next = gl.load(kv_scales_ptr + nxt, mask=nxt < span, other=0.0)
+        acc = gl.zeros([BM_ROWS, BLOCK_KV], dtype=gl.float32, layout=mfma_layout)
+        if HEADSUM_WMMA:
+            sc = gl.amd.gfx1250.wmma_scaled(mfma_q, q_sc, "e4m3", mfma_k, None, "e4m3", acc)
+            p = sc.to(gl.float16)
+            p = gl.maximum(p, gl.zeros_like(p))
+            p_dot = gl.convert_layout(p, dot_p_layout)
+            hs = gl.amd.gfx1250.wmma(w_bd, p_dot, gl.zeros([16, BLOCK_KV], dtype=gl.float32, layout=hs_layout))
+            # rows [0, BLOCK_M) hold the w_hi sums, [BLOCK_M, 2 BLOCK_M) the w_lo sums, the rest are 0
+            red = gl.sum(gl.reshape(hs, [16 // BLOCK_M, BLOCK_M, BLOCK_KV]), 0)
+            red = red * hs_out_scale
+        else:
+            sc = gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
+            sc = relu_f32(sc) * w
+            red = gl.sum(gl.reshape(sc, [BLOCK_M, NUM_HEADS, BLOCK_KV]), 1)
+        red = gl.convert_layout(red, store_layout)
+        keymask = keys_st < (span - kv_off)
+        if KVS_PREFETCH:
+            kvs = kvs_cur
+        else:
+            kvs = gl.load(kv_scales_ptr + kv_off + keys_st, mask=keymask, other=0.0)
+        red = red * kvs[None, :]
+        if EXACT_ROWS:
+            col = union_start + kv_off + keys_st
+            inrow = (col[None, :] >= row_start[:, None]) & (
+                col[None, :] < row_end[:, None]
+            )
+            if PACKED:
+                _store_logits_block(
+                    out_base,
+                    packed_base[:, None] + col[None, :],
+                    red,
+                    USE_BUFFER_STORE,
+                    mask=inrow,
+                )
+            else:
+                _store_logits_block(
+                    logits_ptr, store_offsets, red, USE_BUFFER_STORE, mask=inrow
+                )
+        else:
+            _store_logits_block(
+                logits_ptr,
+                store_offsets,
+                red,
+                USE_BUFFER_STORE,
+                mask=(keymask[None, :] & (rows_st[:, None] >= 0)),
+            )
+        kv_off += BLOCK_KV
+        logits_ptr += BLOCK_KV * stride_logits_k
+        buf_cur = (buf_cur + 1) % NUM_KV_BUFFERS
+    kv_loader.wait(0)

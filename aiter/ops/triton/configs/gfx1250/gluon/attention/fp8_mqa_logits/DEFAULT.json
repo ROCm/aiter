@@ -1,0 +1,173 @@
+{
+    "H32_D128": {
+        "KV_LEQ_1024": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 4,
+            "waves_per_eu": 0,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 8,
+                "WARPS_M": 2,
+                "waves_per_eu": 0,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 0,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
+            }
+        },
+        "KV_LEQ_2048": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 4,
+            "waves_per_eu": 1,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 8,
+                "WARPS_M": 2,
+                "waves_per_eu": 0,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 0,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
+            }
+        },
+        "KV_LEQ_4096": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 4,
+            "waves_per_eu": 1,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 2,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
+            }
+        },
+        "KV_LEQ_8192": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 2,
+            "waves_per_eu": 0,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
+            }
+        },
+        "KV_LEQ_16384": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 0,
+            "waves_per_eu": 0,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
+            }
+        },
+        "KV_LEQ_32768": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 0,
+            "waves_per_eu": 0,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
+            }
+        },
+        "KV_LEQ_65536": {
+            "BLOCK_KV": 256,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 0,
+            "NUM_CHAINS": 0,
+            "waves_per_eu": 0,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 3,
+                "HEADSUM_WMMA": 1,
+                "NUM_KV_BUFFERS": 3,
+                "KV_PIPE": 1,
+                "KVS_PREFETCH": 1
+            }
+        },
+        "any": {
+            "BLOCK_KV": 128,
+            "NUM_WARPS": 8,
+            "LOOP_VARIANT": 1,
+            "NUM_CHAINS": 8,
+            "waves_per_eu": 1,
+            "rowgroup": {
+                "BLOCK_M": 4,
+                "BLOCK_KV": 256,
+                "NUM_WARPS": 4,
+                "WARPS_M": 1,
+                "waves_per_eu": 3,
+                "MIN_ROWS": 2048,
+                "waves_per_eu_exact": 2,
+                "HEADSUM_WMMA": 0,
+                "NUM_KV_BUFFERS": 2,
+                "KV_PIPE": 0,
+                "KVS_PREFETCH": 0
+            }
+        }
+    },
+    "any": {
+        "any": {
+            "BLOCK_KV": 128,
+            "NUM_WARPS": 4,
+            "LOOP_VARIANT": 1,
+            "NUM_CHAINS": 8,
+            "waves_per_eu": 1
+        }
+    }
+}
