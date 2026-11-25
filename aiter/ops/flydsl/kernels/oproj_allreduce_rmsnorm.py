@@ -21,8 +21,9 @@ order:
    landed;
 1. o_proj: ``block_n``-column tiles of ``x @ W^T``, claimed by the CTAs as
    they finish phase 0 (quantizing on gfx942 up to EARLY_CLAIM_ROWS rows, at
-   launch by CTAs with no phase-0 rows when each CTA claims once). A claimed
-   tile's W slice is loaded into VGPRs before the wait for every chunk; its
+   launch by CTAs with no phase-0 rows when each CTA claims once; up to
+   STATIC_TILE_ROWS rows a tile is a function of the CTA, ``static_tiles``).
+   A tile's W slice is loaded into VGPRs before the wait for every chunk; its
    bf16 partial tile goes to the rank owning its columns (two-shot) or to
    every rank (one-shot);
 2. all-reduce + residual + Gemma RMSNorm, a row per CTA.
@@ -45,7 +46,8 @@ a word a CTA (epoch: launches each CTA has run, so every CTA agrees on the
 parity under graph replay). Quantizing on gfx942, x is counted a 16-row
 group (2 parities of ``max_rows / 16`` lines), and launch-time claims spread
 over CLAIM_LINES counters that never reset; up to LAUNCH_ORDER_ROWS rows the
-x loads and those claims go out before the epoch is read.
+x loads and those claims go out before the epoch is read, as do the x loads
+and static tiles' W slices in every static-tile build.
 
 ``trace`` (diagnostics): each CTA writes TRACE_STAMPS int64 100 MHz stamps
 into ``trace``: start, phase 0 done, x ready (0 if it ran no o_proj tile),
@@ -120,6 +122,9 @@ LAUNCH_ORDER_ROWS = 32
 # 16-row passes (32-row passes above): the first rows' push overlaps the next
 # pass's gemm.
 PASS16_ROWS = 48
+# ... and the largest max_rows whose o_proj tiles are static (no claim): at
+# 64 and 128 rows static tiles lose.
+STATIC_TILE_ROWS = 48
 
 
 def compile_oproj_allreduce_rmsnorm(
@@ -287,6 +292,20 @@ def compile_oproj_allreduce_rmsnorm(
     ):
         early_rows = 16 * passes[-2][0]
     early_per = -(-early_rows // max(free_ctas, 1))
+    # Static tiles, up to STATIC_TILE_ROWS rows (in the build's passes): CTA
+    # bid's tile is bid - static_q, or bid - 2 static_q from grid / 2 on. The
+    # phase-0 CTAs [0, static_q) take none, nor, when the grid has room, their
+    # CU siblings [grid / 2, grid / 2 + static_q) (CTA b and b + grid / 2 share
+    # a CU), so a quantizing CU loads no W. No claim: a tile CTA issues its W
+    # slice first, then reads the epoch and waits for x.
+    static_q = max_rows // waves
+    static_tiles = (
+        grouped_x and max_rows <= STATIC_TILE_ROWS and grid - static_q >= n_tiles
+    )
+    static_sib = static_tiles and grid % 2 == 0 and grid - 2 * static_q >= n_tiles
+    # The epoch is first waited for after phase 0's x loads and a static
+    # tile's W slice: by the counts and the parity resets.
+    late_counts = launch_order or static_tiles
     # ``sync`` words.
     x_done_at = 0
     tile_claim_at = x_done_at + 2 * x_groups * SYNC_LINE
@@ -476,7 +495,7 @@ def compile_oproj_allreduce_rmsnorm(
         row of its CTA's row group (``waves`` rows from ``waves * bid``, then a
         grid further) into the LDS stage, and the CTA stores each chunk's
         ``waves`` x 64 B as one contiguous run, whole lines no other CTA writes.
-        With ``launch_order``, ``x_done`` is the CTA's epoch, which only the
+        With ``late_counts``, ``x_done`` is the CTA's epoch, which only the
         count reads (``_x_line``).
 
         Lane l takes the 16-K groups q WAVE + l of its wave's row, so a wave
@@ -567,7 +586,7 @@ def compile_oproj_allreduce_rmsnorm(
                 total = total + _lds_i32(word_base, w)
             if total > 0:
                 line = x_done
-                if const_expr(launch_order):
+                if const_expr(late_counts):
                     line = _x_line(x_done, bid)
                 fx.atomic_add(_i32_ptr(sync_ptr, line), total, syncscope="agent")
         gpu.barrier()
@@ -773,8 +792,22 @@ def compile_oproj_allreduce_rmsnorm(
             fx.ptr_store(tile, _lds(word_base, 1))
         gpu.barrier()
 
+    def _static_tile(bid):
+        """``static_tiles``: CTA bid's tile, or ``n_tiles`` if it has none."""
+        if static_sib:
+            half = grid // 2
+            tile = (bid < half).select(bid - static_q, bid - 2 * static_q)
+            own = (bid >= static_q) & ((bid < half) | (bid >= half + static_q))
+        else:
+            tile = bid - static_q
+            own = bid >= static_q
+        return (own & (tile < n_tiles)).select(tile, fx.Int32(n_tiles))
+
     def _first_tile(sync_ptr, claim, word_base, tid):
-        """The CTA's first tile: ``_claim_once``'s, or claimed now."""
+        """The CTA's first claimed tile: ``_claim_once``'s, or claimed now
+        (``static_tiles``: none, the static tile has run)."""
+        if static_tiles:
+            return fx.Int32(n_tiles)
         if early_claim:
             return _lds_i32(word_base, 1)
         return _claim_tile(sync_ptr, claim, word_base, tid)
@@ -1201,6 +1234,83 @@ def compile_oproj_allreduce_rmsnorm(
                     tid,
                 )
 
+    @flyc.jit
+    def _tile_passes(
+        tile,
+        ws,
+        col_scales,
+        w_scale_base,
+        x_rsrc,
+        x_scale_ptr,
+        num_rows,
+        gemm_base,
+        peers,
+        buf,
+        lane,
+        warp,
+        tid,
+    ):
+        """The tile's o_proj passes (``_pass_chain`` with ``cross_x``); a pass
+        past the batch is skipped."""
+        if const_expr(cross_x):
+            _pass_chain(
+                0,
+                (),
+                tile,
+                ws,
+                col_scales,
+                w_scale_base,
+                x_rsrc,
+                x_scale_ptr,
+                num_rows,
+                gemm_base,
+                peers,
+                buf,
+                lane,
+                warp,
+                tid,
+            )
+        else:
+            for p in range_constexpr(len(passes)):
+                m0, m_count = passes[p]
+                if const_expr(p == 0):
+                    _tile_pass(
+                        tile,
+                        m0,
+                        m_count,
+                        ws,
+                        col_scales,
+                        w_scale_base,
+                        x_rsrc,
+                        x_scale_ptr,
+                        num_rows,
+                        gemm_base,
+                        peers,
+                        buf,
+                        lane,
+                        warp,
+                        tid,
+                    )
+                else:
+                    if 16 * m0 < num_rows:
+                        _tile_pass(
+                            tile,
+                            m0,
+                            m_count,
+                            ws,
+                            col_scales,
+                            w_scale_base,
+                            x_rsrc,
+                            x_scale_ptr,
+                            num_rows,
+                            gemm_base,
+                            peers,
+                            buf,
+                            lane,
+                            warp,
+                            tid,
+                        )
+
     kernel_name = (
         f"oproj_allreduce_rmsnorm_k{row_k}_r{max_rows}_n{hidden}_bn{block_n}"
         f"_w{world_size}r{rank}_pf{prefetch}_o{occupancy}"
@@ -1239,14 +1349,14 @@ def compile_oproj_allreduce_rmsnorm(
         _stamp(trace_ptr, bid, 0, tid)
 
         epoch = fx.Int32(fx.ptr_load(_i32_ptr(sync_ptr, epoch_at + bid)))
-        if const_expr(not launch_order):
+        if const_expr(not late_counts):
             parity, x_done, claim = _counts(epoch, bid)
             _reset_counts(sync_ptr, parity, bid, tid)
 
         # Phase 0: x into MFMA-order chunks.
         x_rsrc = _rsrc(x_ptr)
         xs_rsrc = _rsrc(xs_ptr)
-        if const_expr(launch_order):
+        if const_expr(late_counts):
             # Its line is picked from the epoch after the x loads.
             x_mine = epoch
         else:
@@ -1255,7 +1365,55 @@ def compile_oproj_allreduce_rmsnorm(
                 x_mine = x_done + (bid * waves // 16) * SYNC_LINE
             else:
                 x_mine = x_done
-        if const_expr(early_claim):
+        if const_expr(static_tiles):
+            # A tile CTA runs its tile (phase 1) here, the rest phase 0.
+            fixed_tile = _static_tile(bid)
+            if fixed_tile < n_tiles:
+                col_scales = _load_col_scales(fixed_tile, tid, w_scale_ptr)
+                ws = _load_w_slice(fixed_tile, _rsrc(w_ptr), lane, warp)
+                tile_parity, tile_x_done, _claim = _counts(epoch, bid)
+                tile_peers = [
+                    fx.Int64(
+                        fx.ptr_load(
+                            fx.add_offset(fx.recast_iter(fx.Int64, peers_ptr), d)
+                        )
+                    )
+                    for d in range_constexpr(world_size)
+                ]
+                _wait_x(sync_ptr, tile_x_done, num_rows, tid)
+                _stamp(trace_ptr, bid, 2, tid)
+                _tile_passes(
+                    fixed_tile,
+                    ws,
+                    col_scales,
+                    w_scale_base,
+                    xs_rsrc,
+                    x_scale_ptr,
+                    num_rows,
+                    gemm_base,
+                    tile_peers,
+                    tile_parity,
+                    lane,
+                    warp,
+                    tid,
+                )
+            elif bid * waves < num_rows:
+                _phase0(
+                    x_rsrc,
+                    xs_ptr,
+                    x_scale_ptr,
+                    num_rows,
+                    bid,
+                    nblk,
+                    warp,
+                    lane,
+                    sync_ptr,
+                    x_mine,
+                    word_base,
+                    gemm_base,
+                    tid,
+                )
+        elif const_expr(early_claim):
             # A CTA without phase-0 rows claims at launch.
             if bid * waves < num_rows:
                 _phase0(
@@ -1292,7 +1450,7 @@ def compile_oproj_allreduce_rmsnorm(
                 gemm_base,
                 tid,
             )
-        if const_expr(launch_order):
+        if const_expr(late_counts):
             parity, x_done, claim = _counts(epoch, bid)
             _reset_counts(sync_ptr, parity, bid, tid)
         _stamp(trace_ptr, bid, 1, tid)
@@ -1312,64 +1470,21 @@ def compile_oproj_allreduce_rmsnorm(
             ws = _load_w_slice(tile, w_rsrc, lane, warp)
             _wait_x(sync_ptr, x_done, num_rows, tid)
             _stamp(trace_ptr, bid, 2, tid)
-            if const_expr(cross_x):
-                _pass_chain(
-                    0,
-                    (),
-                    tile,
-                    ws,
-                    col_scales,
-                    w_scale_base,
-                    xs_rsrc,
-                    x_scale_ptr,
-                    num_rows,
-                    gemm_base,
-                    peers,
-                    parity,
-                    lane,
-                    warp,
-                    tid,
-                )
-            else:
-                for p in range_constexpr(len(passes)):
-                    m0, m_count = passes[p]
-                    if const_expr(p == 0):
-                        _tile_pass(
-                            tile,
-                            m0,
-                            m_count,
-                            ws,
-                            col_scales,
-                            w_scale_base,
-                            xs_rsrc,
-                            x_scale_ptr,
-                            num_rows,
-                            gemm_base,
-                            peers,
-                            parity,
-                            lane,
-                            warp,
-                            tid,
-                        )
-                    else:
-                        if 16 * m0 < num_rows:
-                            _tile_pass(
-                                tile,
-                                m0,
-                                m_count,
-                                ws,
-                                col_scales,
-                                w_scale_base,
-                                xs_rsrc,
-                                x_scale_ptr,
-                                num_rows,
-                                gemm_base,
-                                peers,
-                                parity,
-                                lane,
-                                warp,
-                                tid,
-                            )
+            _tile_passes(
+                tile,
+                ws,
+                col_scales,
+                w_scale_base,
+                xs_rsrc,
+                x_scale_ptr,
+                num_rows,
+                gemm_base,
+                peers,
+                parity,
+                lane,
+                warp,
+                tid,
+            )
             if const_expr(grid < n_tiles):
                 tile = _claim_tile(sync_ptr, claim, word_base, tid)
             else:
