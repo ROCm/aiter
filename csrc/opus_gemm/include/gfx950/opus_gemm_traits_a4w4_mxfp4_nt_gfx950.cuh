@@ -148,7 +148,7 @@ struct opus_gemm_a4w4_mxfp4_nt_traits_gfx950 {
     static_assert(LDS_BYTES <= 163840);
 };
 
-// Shorthand used by gen_co/co_kernels_gfx950.json: opus_mxfp4_nt_traits<B_M, B_N, MODE, BOUNDARY>.
+// Shorthand used by gen_co/co_kernels_gfx950_a4w4.json: opus_mxfp4_nt_traits<B_M, B_N, MODE, BOUNDARY>.
 template<int BM, int BN, int MODE = 0, bool BOUNDARY = true>
 using opus_mxfp4_nt_traits = opus_gemm_a4w4_mxfp4_nt_traits_gfx950<256, opus::seq<BM, BN, 256>,
     opus::tuple<opus::fp4_t, opus::fp4_t, opus::bf16_t, opus::fp32_t, opus::e8m0_t>, opus::seq<16, 16, 4>, opus::seq<1, 1, 32>, MODE, BOUNDARY>;

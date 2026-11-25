@@ -67,7 +67,7 @@ compiled with that toolchain's ``clang++ --cuda-device-only`` (``-cuid`` pinned,
 so rebuilds are byte-reproducible); ``--opus-include`` selects the opus headers
 it builds against (default: this tree's ``csrc/include``)::
 
-    python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 \\
+    python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 --family a4w4 \\
         --llvm-bin /path/to/pin-toolchain/bin --opus-include /path/to/csrc/include
 """
 

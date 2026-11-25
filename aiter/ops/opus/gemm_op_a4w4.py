@@ -9,9 +9,11 @@
 
 ``layout="plain"`` (NT) operands:
 
-* ``XQ``: [M, K/2] (or [batch, M, K/2]) fp4x2 (or uint8), row-major.
-* ``WQ``: [N, K/2] (or [batch, N, K/2]) fp4x2 (or uint8), row-major (no
+* ``XQ``: [M, K/2] (or [batch, M, K/2]) fp4x2, row-major.
+* ``WQ``: [N, K/2] (or [batch, N, K/2]) fp4x2, row-major (no
   ``shuffle_weight``).
+  ``opus_gemm`` / ``opus_bmm`` reject any other XQ / WQ dtype; only
+  :func:`gemm_afp4wfp4_opus` also takes uint8 (viewed as fp4x2).
 * ``x_scale`` / ``w_scale``: 1x32 e8m0 (or uint8), row-major (no
   ``e8m0_shuffle``), 2D [batch * rows, K/32] or 3D [batch, rows, K/32] with
   rows >= M / N (no padding needed).

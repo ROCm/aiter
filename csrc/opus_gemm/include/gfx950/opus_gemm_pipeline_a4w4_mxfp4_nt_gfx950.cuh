@@ -323,7 +323,7 @@ __device__ __forceinline__ void mma_quadrant(MMA& mma, const fp4x32_t (&v_a)[2][
 // 20-25% slower).
 constexpr int C_AUX = 2;
 // Kernel body as a device function: it backs the template __global__ below and the extern "C" entry points of the
-// pre-compiled .co images (gen_co/build_co_gfx950.py).
+// pre-compiled .co images (gen_co/build_co.py --arch gfx950 --family a4w4).
 template<class Traits>
 __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_kargs_gfx950 kargs) {
 #if defined(__gfx950__)

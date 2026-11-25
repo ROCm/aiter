@@ -3,6 +3,8 @@
 
 import argparse
 import functools
+import hashlib
+import json
 import os
 
 import pandas as pd
@@ -407,6 +409,27 @@ PLAIN_KID_CASES = [
     ("opus_bmm", 2, 40, 520, 1024, 501, 2),
     ("gemm_afp4wfp4_opus", 2, 300, 264, 512, 112, 0),
     ("gemm_afp4wfp4_opus", 3, 17, 72, 1024, 504, 3),
+    # Odd K-tile counts >= 3 (K / 256 = 3, 5): the 2x2 pipeline's extra even step and
+    # its last, half-used scale panel; the small-tile ring's half-filled last step.
+    *(
+        ("opus_gemm", 1, 1000, 1032, k, kid, 0)
+        for k in (768, 1280)
+        for kid in (*range(100, 106), *range(110, 116))
+    ),
+    *(("opus_gemm", 1, 512, 512, k, 130, 0) for k in (768, 1280)),
+    # More tiles than CUs (256): a persistent block runs several tiles, so the next
+    # tile's K tile 0 / scale panel 0 are prefetched behind an odd K-tile count.
+    ("opus_gemm", 1, 4200, 4104, 768, 100, 0),
+    ("opus_gemm", 1, 2200, 2056, 1280, 103, 0),
+    ("opus_gemm", 1, 4352, 4352, 768, 130, 0),
+    *(
+        ("opus_gemm", 1, 33, 264, k, kid, 0)
+        for k in (768, 1280)
+        for kid in range(500, 505)
+    ),
+    ("opus_gemm", 1, 7, 264, 1280, 500, 2),
+    ("opus_bmm", 3, 200, 136, 768, 102, 0),
+    ("gemm_afp4wfp4_opus", 2, 300, 264, 1280, 112, 0),
 ]
 PLAIN_SCALE_PAD = 3  # extra scale rows per batch for the 2D batched scales
 
@@ -433,7 +456,8 @@ def _check_plain(name, ref, out):
     err = checkAllclose(
         ref.float(), out.float(), msg=f"{name}: a4w4 plain", catastrophic_check=True
     )
-    assert err <= 0.01, f"{name}: {err:.2%} of elements outside rtol/atol"
+    # No allowance: the M / N tails these cases exist for are under 1% of the elements.
+    assert err == 0, f"{name}: {err:.2%} of elements outside rtol/atol"
     return err
 
 
@@ -521,6 +545,31 @@ def check_plain_large_offset(kid=100, M=65792, N=32768, K=256):
         ref = run_torch(xq[0][rows], wq[0], xs[0][rows], ws[0], dtype)
         _check_plain(f"kid {kid} rows {rows.start}:{rows.stop} of M={M}", ref, y[rows])
     del y
+
+
+def check_plain_co_images():
+    """The committed a4w4 .co images are the ones gen_co/gfx950/a4w4/build_info.json
+    records: same kids and entry symbols as co_kernels_gfx950_a4w4.json, same sha256."""
+    from csrc.opus_gemm.opus_gemm_common import (
+        A4W4_CO_DIR,
+        A4W4_CO_JSON,
+        a4w4_co_kernels_declared,
+        a4w4_co_kernels_list,
+    )
+
+    image_dir = os.path.join(os.path.dirname(A4W4_CO_JSON), A4W4_CO_DIR)
+    with open(os.path.join(image_dir, "build_info.json")) as f:
+        built = {entry["kid"]: entry for entry in json.load(f)["kernels"]}
+    declared = {kid: k.name for kid, k in a4w4_co_kernels_declared.items()}
+    assert {kid: entry["symbol"] for kid, entry in built.items()} == declared
+    assert set(a4w4_co_kernels_list) == set(declared), "a declared .co image is missing"
+    for kid, entry in built.items():
+        with open(os.path.join(image_dir, f"{entry['symbol']}.co"), "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+        assert sha256 == entry["co_sha256"], (
+            f"kid {kid}: {entry['symbol']}.co does not match build_info.json; "
+            "rebuild with gen_co/build_co.py --arch gfx950 --family a4w4"
+        )
 
 
 def tuned_shapes():
@@ -741,6 +790,7 @@ def main():
     aiter.logger.info("gemm_a4w4 split K summary (markdown):\n%s", df_md)
 
     if get_gfx() == "gfx950":  # the OPUS a4w4 plain family is gfx950-only
+        check_plain_co_images()
         df = pd.DataFrame([test_gemm_plain_kid(*case) for case in PLAIN_KID_CASES])
         aiter.logger.info(
             "gemm_a4w4 plain kids summary (markdown):\n%s", df.to_markdown(index=False)
