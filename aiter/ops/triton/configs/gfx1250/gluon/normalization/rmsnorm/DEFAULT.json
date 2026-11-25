@@ -1,0 +1,4 @@
+{
+    "N_LEQ_4096": { "num_warps": 4, "NUM_BUFFERS": 3, "PROGRAMS_PER_CU": 4 },
+    "any": { "num_warps": 8, "NUM_BUFFERS": 2, "PROGRAMS_PER_CU": 2 }
+}
