@@ -17,6 +17,7 @@ import contextlib
 import importlib
 import inspect
 import math
+import types
 
 import pytest
 import torch
@@ -33,6 +34,9 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
     flash_kda_supported,
+)
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
+    prepare_chunk_indices,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from aiter.ops.triton.utils import fast_launch as _fast_launch
@@ -134,10 +138,10 @@ def _count_launches(module, names):
             setattr(module, name, saved[name])
 
 
-def _gluon_k2_module():
+def _gluon_module(name):
     return importlib.import_module(
         "aiter.ops.triton._gluon_kernels."
-        f"{base_gfx_arch(_flash_kda.DEVICE_ARCH)}.kimi_delta_attn.flash_kda_k2"
+        f"{base_gfx_arch(_flash_kda.DEVICE_ARCH)}.kimi_delta_attn.{name}"
     )
 
 
@@ -653,7 +657,7 @@ def test_cases_reach_the_gluon_k2():
     if _flash_kda._GLUON_K2C_ARCH_OK:
         launchers.append("k2_c_fast")
     reached = {name: set() for name in launchers}
-    with _count_launches(_gluon_k2_module(), launchers) as calls:
+    with _count_launches(_gluon_module("flash_kda_k2"), launchers) as calls:
         for current, make in _CASES.items():
             args, kw = make()
             before = dict(calls)
@@ -692,7 +696,7 @@ def test_pass_c_route_follows_size(monkeypatch, B, H, chunks_per_seg, gluon):
     monkeypatch.setattr(_flash_kda, "_K2C_ROUTE_BY_SIZE", True)
     args = make_inputs(B, 1024 if chunks_per_seg else 64, H)
     with (
-        _count_launches(_gluon_k2_module(), ["k2_c_fast"]) as gluon_calls,
+        _count_launches(_gluon_module("flash_kda_k2"), ["k2_c_fast"]) as gluon_calls,
         _count_launches(_flash_kda, ["_segment_fast"]) as triton_calls,
     ):
         run_flash(*args, chunks_per_seg=chunks_per_seg)
@@ -1160,13 +1164,183 @@ def test_paged_cache_rejected_on_default_pipeline():
         )
 
 
-def _bands(*xs, skew=0):
+def _cu_seqlens_pair(lens):
+    """``cu_seqlens`` on the device and the same values on the host."""
+    host = torch.tensor([0, *lens], dtype=torch.int32).cumsum(0).int()
+    return host.to(device), host
+
+
+def test_cu_seqlens_cpu_issues_no_sync():
+    """With host bounds nothing synchronizes, cache miss included, and the
+    result equals the device-bounds call's.
+
+    The same call with only device bounds must trip the check, or the check
+    proves nothing.
+    """
+    lens, H = [100, 0, 257, 33], 4
+    args = make_inputs(1, sum(lens), H)
+    h0 = torch.randn(len(lens), H, K_DIM, K_DIM, device=device) * 0.1
+
+    def fresh(with_host):
+        # New tensors each time, so no identity cache can answer.
+        cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
+        cache, indices, _ = _paged_pool(len(lens), H, h0)
+        extra = {"cu_seqlens_cpu": cu_seqlens_cpu} if with_host else {}
+        return _kimi_kwargs(
+            *args,
+            cu_seqlens=cu_seqlens,
+            out=torch.full_like(args[2], float("nan")),
+            state_cache=cache,
+            state_indices=indices,
+            # Alternating, so both the load and the zero start are in the result.
+            has_initial_state=torch.arange(len(lens), device=device) % 2 == 0,
+            **extra,
+        )
+
+    chunk_kimi_delta_attn(**fresh(True))  # compile, autotune, pinned pool
+    host_kw, dev_kw = fresh(True), fresh(False)
+    torch.cuda.synchronize()
+    saved = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _flash_kda._build_metadata.cache_clear()  # take the upload path
+        chunk_kimi_delta_attn(**host_kw)
+        _flash_kda._build_metadata.cache_clear()
+        with pytest.raises(RuntimeError, match="synchronizing CUDA operation"):
+            chunk_kimi_delta_attn(**dev_kw)
+    finally:
+        torch.cuda.set_sync_debug_mode(saved)
+    # The read-back raised before any kernel ran, so dev_kw is still fresh.
+    _flash_kda._build_metadata.cache_clear()
+    chunk_kimi_delta_attn(**dev_kw)
+    assert torch.equal(host_kw["out"], dev_kw["out"])
+    assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
+
+
+def _flash_kda_launchers():
+    """The fast launcher of each FlashKDA kernel that this arch can route to."""
+    modules = [_flash_kda]
+    if _flash_kda._GLUON_ARCH_OK:
+        modules += [_gluon_module(name) for name in ("flash_kda_k1", "flash_kda_k2")]
+    return [
+        obj
+        for module in modules
+        for obj in vars(module).values()
+        if isinstance(obj, _fast_launch._FastLaunch)
+    ]
+
+
+@contextlib.contextmanager
+def _record_compiles():
+    """Collect ``(kernel, constexprs)`` for each FlashKDA variant built in the block.
+
+    Triton makes an integer argument of 1 a constant. Such an argument is left
+    out, so a step value of 1 and any other value count as one variant.
+    """
+    launchers = _flash_kda_launchers()
+    jits = {id(launcher._jit): launcher._jit for launcher in launchers}.values()
+    device_id = torch.cuda.current_device()
+    for launcher in launchers:
+        # A variant that an earlier test built would hide a second one built here.
+        launcher.clear()
+        launcher._jit.device_caches[device_id][0].clear()
+    seen = []
+    yield seen
+    for jit in jits:
+        params = jit.params
+        for kernel in jit.device_caches[device_id][0].values():
+            constexprs = sorted(
+                (params[path[0]].name, repr(value))
+                for path, value in kernel.src.constants.items()
+                if params[path[0]].is_constexpr or value is None
+            )
+            seen.append((jit.__name__, tuple(constexprs)))
+
+
+# Prefill lengths, in tokens, of serving steps. With segments of two 32-token
+# chunks: 1 to 9 segments, one-tile steps, token and tile counts (non-)divisible by 16.
+_SERVING_STEPS = (
+    [20],
+    [64],
+    [40, 17],
+    [100, 28],
+    [128],
+    [130, 70],
+    [256],
+    [250, 6],
+    [200, 120, 16],
+    [256, 200],
+    [256, 256],
+    [500, 12],
+)
+# Token counts of steps without cu_seqlens, where K1 gets the tile count as NT:
+# 1, 2, 16 and 17 tiles.
+_BATCHED_STEPS = (32, 64, 512, 544)
+
+
+@pytest.mark.parametrize("gluon", [False, True])
+def test_serving_steps_compile_each_variant_once(gluon, monkeypatch):
+    """The token counts, segment count and state-index offset of a step must not
+    compile a kernel again with the same constexprs. A compile during serving
+    stalls the server."""
+    if gluon and not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    monkeypatch.setenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", "2")
+    H = 4
+    steps = [(lens, True) for lens in _SERVING_STEPS]
+    steps += [([tokens], False) for tokens in _BATCHED_STEPS]
+    with _route(k1=gluon, k2=gluon), _record_compiles() as seen:
+        for step, (lens, varlen) in enumerate(steps):
+            n = len(lens)
+            args = make_inputs(1, sum(lens), H, seed=step)
+            zeros = torch.zeros(n, H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+            cache, indices, _storage = _paged_pool(n, H, zeros)
+            # The prefill rows of a step that also has decodes start past a
+            # 16-byte boundary.
+            skew = step % 4
+            slots = torch.empty(skew + n, device=device, dtype=torch.int32)[skew:]
+            slots.copy_(indices)
+            has_initial = torch.zeros(skew + n, device=device, dtype=torch.bool)[skew:]
+            has_initial[::2] = True
+            bounds = {"cu_seqlens": _cu_seqlens_pair(lens)[0]} if varlen else {}
+            chunk_kimi_delta_attn(
+                **_kimi_kwargs(
+                    *args,
+                    **bounds,
+                    out=torch.empty_like(args[2]),
+                    state_cache=cache,
+                    state_indices=slots,
+                    has_initial_state=has_initial,
+                )
+            )
+    names = {name for name, _ in seen}
+    k2 = {"k2_ab_fused_gluon", "k2_c_gluon"} if gluon else {"_flash_kda_segment_kernel"}
+    assert k2 <= names, f"the steps did not reach {sorted(k2 - names)}"
+    repeats = sorted({name for name, consts in seen if seen.count((name, consts)) > 1})
+    assert not repeats, f"compiled again with the same constexprs: {repeats}"
+
+
+def test_prepare_chunk_indices_numbers_empty_sequences():
+    """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
+    lens, chunk_size = [0, 100, 0, 0, 257, 33], 64
+    counts = torch.tensor([-(-n // chunk_size) for n in lens])
+    seq = torch.repeat_interleave(torch.arange(len(lens)), counts)
+    chunk = torch.arange(seq.numel()) - (torch.cumsum(counts, 0) - counts)[seq]
+    cu_seqlens, _ = _cu_seqlens_pair(lens)
+    got = prepare_chunk_indices(cu_seqlens, chunk_size)
+    assert got.dtype == cu_seqlens.dtype and got.device == cu_seqlens.device
+    assert torch.equal(got.cpu(), torch.stack([seq, chunk], 1).int())
+
+
+def _bands(*xs, skew=0, pad=0):
     """``xs`` as the bands of one fused tensor, as a fused input projection
-    gives them. ``skew`` leading pad elements break the 16-byte alignment."""
+    gives them. ``skew`` leading pad elements break the 16-byte alignment, and
+    ``pad`` trailing ones only widen the token stride."""
     shape = xs[0].shape[-2:]
-    pad = [xs[0].new_zeros(*xs[0].shape[:2], skew)] if skew else []
-    fused = torch.cat(pad + [x.flatten(-2) for x in xs], dim=-1)[..., skew:]
-    return tuple(b.unflatten(-1, shape) for b in fused.split(shape.numel(), dim=-1))
+    lead, tail = (xs[0].new_zeros(*xs[0].shape[:2], n) for n in (skew, pad))
+    fused = torch.cat([lead, *(x.flatten(-2) for x in xs), tail], dim=-1)
+    bands = fused[..., skew : fused.shape[-1] - pad].split(shape.numel(), dim=-1)
+    return tuple(b.unflatten(-1, shape) for b in bands)
 
 
 def _head_major(*xs):
@@ -1174,15 +1348,11 @@ def _head_major(*xs):
     return tuple(x.transpose(1, 2).contiguous().transpose(1, 2) for x in xs)
 
 
-def _record_tdm_operands(monkeypatch):
-    """Have the gfx1250 Gluon launchers note the storage they are handed for
-    each operand they read by TDM, as ``{(launcher, argument): {data_ptr}}``."""
-    g1, g2 = (
-        importlib.import_module(
-            f"aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.{name}"
-        )
-        for name in ("flash_kda_k1", "flash_kda_k2")
-    )
+def _record_in_place_operands(monkeypatch):
+    """Have this arch's Gluon launchers note the storage they are handed for
+    each operand they read at its own stride, as
+    ``{(launcher, argument): {data_ptr}}``."""
+    g1, g2 = (_gluon_module(name) for name in ("flash_kda_k1", "flash_kda_k2"))
     seen = {}
 
     class _Recording:
@@ -1209,9 +1379,34 @@ def _record_tdm_operands(monkeypatch):
     return seen
 
 
+def test_gluon_launchers_resolve_strict_arch(monkeypatch):
+    """A strict DEVICE_ARCH loads the Gluon kernels of its base arch package."""
+    monkeypatch.setattr(_flash_kda, "DEVICE_ARCH", "gfx1250-strict")
+    monkeypatch.setattr(_flash_kda, "_GLUON_ARCH_OK", True)
+    requested = []
+
+    def fake_import(name, *args, **kwargs):
+        requested.append(name)
+        return types.SimpleNamespace(
+            _k1_fast=None, k2_ab_fused_fast=None, k2_c_fast=None
+        )
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    _flash_kda_launchers()
+    _record_in_place_operands(monkeypatch)
+    gluon = [name for name in requested if "_gluon_kernels" in name]
+    assert gluon
+    assert all(".gfx1250.kimi_delta_attn." in name for name in gluon), gluon
+    assert not any("strict" in name for name in gluon), gluon
+
+
 _LAYOUTS = {
     "bands": _bands,
     "skewed bands": lambda *xs: _bands(*xs, skew=1),
+    # 16-byte aligned rows at a token stride that is not a multiple of 16 elements.
+    "padded bands": lambda *xs: _bands(*xs, pad=8),
+    # A token stride that is a multiple of 16 elements, at a base 2 bytes off.
+    "skewed aligned-stride bands": lambda *xs: _bands(*xs, skew=1, pad=15),
     "batched bands": _bands,
     "head-major": _head_major,
 }
@@ -1231,14 +1426,14 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     views = _LAYOUTS[layout](*args[:4])
     assert not any(x.is_contiguous() for x in views)
 
-    on_tdm = _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+    reads_strided = _flash_kda.DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
     with _route(k1=True, k2=True):
         o_ref, ht_ref = run_flash(*args, **kw)
-        seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+        seen = _record_in_place_operands(monkeypatch) if reads_strided else None
         o, ht = run_flash(*views, *args[4:], **kw)
     assert torch.equal(o, o_ref)
     assert torch.equal(ht, ht_ref)
-    if not on_tdm:
+    if not reads_strided:
         return
 
     q, k, v, g = views
@@ -1250,10 +1445,115 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     }
     if chunks_per_seg:
         handed[("k2_ab_fused_fast", "v_input")] = v
+    # gfx950 packs a view whose base or token stride is not a multiple of 16.
+    if _flash_kda.DEVICE_ARCH == "gfx950":
+        in_place_layouts = ("bands",)
+    else:
+        in_place_layouts = (
+            "bands",
+            "skewed bands",
+            "padded bands",
+            "skewed aligned-stride bands",
+        )
     assert seen.keys() == handed.keys()
     for key, view in handed.items():
         in_place = seen[key] == {view.data_ptr()}
-        assert in_place == (layout in ("bands", "skewed bands")), key
+        assert in_place == (layout in in_place_layouts), key
+
+
+@pytest.mark.parametrize("chunks_per_seg", [0, 4])
+def test_misaligned_contiguous_operands_match_packed(chunks_per_seg, monkeypatch):
+    """Contiguous q, k, v and g at a base that is not 16-byte aligned give the
+    aligned answer, to the bit: gfx950 hands its Gluon kernels aligned copies."""
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("the alignment copy is for the gfx950 Gluon kernels")
+    args = make_inputs(1, 1024, 4)
+    kw = {
+        "cu_seqlens": _varlen([300, 200, 524]),
+        "output_final_state": True,
+        "state_v_first": True,
+        "chunks_per_seg": chunks_per_seg,
+    }
+    views = []
+    for x in args[:4]:
+        store = torch.empty(x.numel() + 1, device=device, dtype=x.dtype)
+        views.append(store[1:].view(x.shape).copy_(x))
+    assert all(x.is_contiguous() and x.data_ptr() % 16 for x in views)
+
+    with _route(k1=True, k2=True):
+        o_ref, ht_ref = run_flash(*args, **kw)
+        seen = _record_in_place_operands(monkeypatch)
+        o, ht = run_flash(*views, *args[4:], **kw)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    assert seen
+    for key, ptrs in seen.items():
+        assert all(ptr % 16 == 0 for ptr in ptrs), key
+
+
+def test_contiguous_operands_past_2gib_take_triton(monkeypatch):
+    """gfx950 runs the Triton kernels when a packed operand is 2 GiB or more,
+    which the Gluon kernels' byte offsets cannot reach."""
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("the 2 GiB offset limit is the gfx950 Gluon kernels'")
+    # One head: q, k, v and g are 2 GiB each.
+    args = make_inputs(1, 2**31 // (K_DIM * 2), 1)
+    assert args[0].numel() * args[0].element_size() == 2**31
+    kw = {"output_final_state": True, "state_v_first": True, "chunks_per_seg": 64}
+    with (
+        _route(k1=True, k2=True),
+        _count_launches(_gluon_module("flash_kda_k1"), ["_k1_fast"]) as k1_calls,
+        _count_launches(
+            _gluon_module("flash_kda_k2"), ["k2_ab_fused_fast", "k2_c_fast"]
+        ) as k2_calls,
+        _count_launches(_flash_kda, ["_prepare_fast", "_segment_fast"]) as calls,
+    ):
+        run_flash(*args, **kw)
+    assert not any(k1_calls.values()) and not any(k2_calls.values())
+    assert calls["_prepare_fast"] and calls["_segment_fast"]
+
+
+@pytest.mark.parametrize("past", [False, True])
+@pytest.mark.parametrize(
+    "operand,T,chunks_per_seg",
+    [("q", 2, 0), ("k", 2, 0), ("g", 2, 0), ("v", 2, 0), ("v", 64, 1)],
+)
+def test_strided_operand_at_2gib_matches_packed(
+    operand, T, chunks_per_seg, past, monkeypatch
+):
+    """On gfx950 a view is read in place while its rows end below 2 GiB from its
+    base, which is as far as the kernels' offsets reach. Past that it is packed.
+    Both give the packed answer."""
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("the 2 GiB offset limit is the gfx950 Gluon kernels'")
+    H = 4
+    args = make_inputs(1, T, H)
+    kw = {
+        "output_final_state": True,
+        "state_v_first": True,
+        "chunks_per_seg": chunks_per_seg,
+    }
+    index = "qkvg".index(operand)
+    x = args[index]
+    row = H * K_DIM
+    # The largest token stride whose rows end below 2 GiB, or the next one.
+    limit = 2**31 // x.element_size()
+    stride = (limit - 1 - row) // (T - 1) // 16 * 16 + 16 * past
+    store = torch.empty((T - 1) * stride + row, device=device, dtype=x.dtype)
+    view = store.as_strided(x.shape, (T * stride, stride, K_DIM, 1))
+    view.copy_(x)
+    with _route(k1=True, k2=True):
+        o_ref, ht_ref = run_flash(*args, **kw)
+        seen = _record_in_place_operands(monkeypatch)
+        o, ht = run_flash(*args[:index], view, *args[index + 1 :], **kw)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    argument = {"q": "q", "k": "k", "g": "g_raw", "v": "v_input"}[operand]
+    storage = [ptrs for (_, name), ptrs in seen.items() if name == argument]
+    # v goes to pass C and, when segmented, to pass A too.
+    assert len(storage) == (2 if operand == "v" and chunks_per_seg else 1)
+    for ptrs in storage:
+        assert (ptrs == {view.data_ptr()}) == (not past)
 
 
 @pytest.mark.parametrize("pipeline", ["flash_kda", "default"])
@@ -1329,12 +1629,15 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "state_cache": cache,
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+        "cu_seqlens_cpu": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
 
+    # On gfx950 this small shape can take the Triton pass C, which reads a
+    # packed v.
     on_tdm = _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
-    seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+    seen = _record_in_place_operands(monkeypatch) if on_tdm else None
     o, ht = flash_kda_fwd(*(by_name[name] for name in params))
     assert ht is None
     assert o.data_ptr() == out.data_ptr()

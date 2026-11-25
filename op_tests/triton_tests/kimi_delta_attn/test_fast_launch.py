@@ -220,8 +220,10 @@ def test_a_second_device_does_not_reuse_the_first_entry():
         assert torch.equal(got_s, want_s)
 
 
-def test_alignment_is_part_of_the_key():
+def test_alignment_is_part_of_the_key(monkeypatch):
     """A tensor off a 16-byte boundary must not reach a kernel told otherwise."""
+    # The Triton K1 takes q as it is; gfx950's Gluon K1 would get an aligned copy.
+    monkeypatch.setattr(flash_kda, "AITER_FDA_USE_GLUON_K1", False)
     B, T, H = 1, 512, 12
     args = make_inputs(B, T, H)
     run(args)

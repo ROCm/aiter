@@ -441,7 +441,11 @@ _k2_c_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_k2_c_repr, do_not_specialize=["TOTAL_TILES"])
+@gluon.jit(
+    repr=_k2_c_repr,
+    do_not_specialize=["TOTAL_TILES"],
+    do_not_specialize_on_alignment=["state_indices", "has_initial_state"],
+)
 def k2_c_gluon(
     ws_kd,
     ws_qd,
