@@ -259,8 +259,12 @@ def _keepalive(vals):
     operands stay live (VGPRs reserved) until this point. Load-bearing for the ring — a
     slot holding no in-flight value looks dead to regalloc, which then reclaims the pair
     the wmma just read, collapsing the WAR distance to 0 (LLVM falls back to
-    ``s_wait_alu depctr_va_vdst(0)`` and the VGPR saving evaporates)."""
-    ops = [_ir(v) for v in vals]
+    ``s_wait_alu depctr_va_vdst(0)`` and the VGPR saving evaporates).
+
+    An LDS pointer goes through ``ptrtoint`` first: inline asm takes only LLVM-compatible
+    types and a ``!fly.ptr`` is not one. The cast emits no instruction -- the USE is the
+    whole point."""
+    ops = [_ir(fx.ptrtoint(v) if hasattr(v, "address_space") else v) for v in vals]
     llvm_dialect.inline_asm(
         None, ops, "", ",".join("v" for _ in ops), has_side_effects=True
     )

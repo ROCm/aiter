@@ -1796,6 +1796,10 @@ def _attention_core_multi_kv_tiles(
             for _mask, _count in _hi_tdm_pipeline(prefetch_desc.tensorcnt):
                 rocdl.sched_group_barrier(_mask, _count, 0)
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
+            # Pin the LDS addresses here: they are v_add results feeding a ds_load, so
+            # the `s_wait_alu va_vdst(0)` they force must not sink into the wmma stream,
+            # where it waits on the wmma. A USE anchors; sched_barrier does not.
+            _keepalive(v_curr + k_curr)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
             pvqk_head = _pvqk_head()
@@ -1828,6 +1832,10 @@ def _attention_core_multi_kv_tiles(
             _keepalive([v for pt in carry_prev for v in pt])
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
+            # Pin the LDS addresses here: they are v_add results feeding a ds_load, so
+            # the `s_wait_alu va_vdst(0)` they force must not sink into the wmma stream,
+            # where it waits on the wmma. A USE anchors; sched_barrier does not.
+            _keepalive(v_curr + k_curr)
             pvqk_head = _pvqk_head()
             _tap, _tap_data = _tdm_tap(prefetch_desc)
             if _tap is None:
