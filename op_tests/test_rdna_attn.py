@@ -1200,6 +1200,25 @@ def check_refusals():
             bv.head_size**-0.5,
         ),
     )
+    # A batch advances each buffer by its own rows per sequence: twice the
+    # sequences of half the rows hold the same elements, and would overlap.
+    halves = [
+        torch.empty(2 * x.shape[0], x.shape[1] // 2, device=dev) for x in (bm, bl)
+    ]
+    _refused(
+        "scratch too small",
+        lambda: bmodule.decode_attn(
+            bq,
+            bkv,
+            btable,
+            torch.empty_like(bq),
+            bacc,
+            *halves,
+            bcnt,
+            torch.tensor([64, 48], device=dev, dtype=torch.int32),
+            bv.head_size**-0.5,
+        ),
+    )
     wide_l = torch.empty(2, 2 * bl.shape[1], device=dev)
     _refused(
         "m and l must hold the same rows",
@@ -1285,6 +1304,42 @@ def check_refusals():
             head_group=head_group,
         ),
     )
+
+    # A plan may split the tiles of a build that never splits one sequence's
+    # KV, so its scratch is checked too.
+    unsplit = next(
+        (x for x in _prefill_rows() if x.causal and x.max_segments == 1), None
+    )
+    if unsplit is not None:
+        uq, ukv, utable, ustarts, ulens = _prefill_batch(unsplit, [(64, 64), (32, 32)])
+        uplan, ugroup = hip.plan_prefill(
+            ustarts.numpy(),
+            ulens.numpy(),
+            unsplit,
+            unsplit.window,
+            hip.prefill_target_workgroups(dev),
+        )
+        empty = (
+            torch.empty(1, device=dev),
+            torch.empty(1, device=dev),
+            torch.zeros(1, dtype=torch.int32, device=dev),
+        )
+        _refused(
+            "scratch too small",
+            lambda: hip.load_prefill(unsplit).prefill_attn(
+                uq,
+                ukv,
+                utable,
+                torch.empty_like(uq),
+                *empty,
+                ulens.to(dev),
+                64,
+                unsplit.head_size**-0.5,
+                plan=torch.from_numpy(uplan).to(dev),
+                query_start_loc=ustarts.to(dev),
+                head_group=ugroup,
+            ),
+        )
 
     # Non-causal builds run only through encoder_attn, causal ones only
     # through prefill_attn.

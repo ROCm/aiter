@@ -158,6 +158,16 @@ def rdna_encoder_attn(
 ) -> None: ...
 
 
+def _launch(op, q: torch.Tensor, *args) -> None:
+    """Run a launch with q's device current: a launch goes to the current
+    device's stream, which is another GPU's when q is not on the current one."""
+    if q.get_device() == torch.cuda.current_device():
+        op(q, *args)
+        return
+    with torch.cuda.device(q.device):
+        op(q, *args)
+
+
 def _device_id(device: torch.device | None = None) -> int:
     """The index of a CUDA device; of the current one by default."""
     if device is None:
@@ -375,7 +385,8 @@ class _Builtin:
     ) -> None:
         """Launch the build: q and out (sequences * max_query_len, Hq, D),
         the scratch of make_scratch, int32 block_table and seq_lens."""
-        rdna_decode_attn(
+        _launch(
+            rdna_decode_attn,
             q,
             kv_cache,
             block_table,
@@ -847,7 +858,8 @@ class _BuiltinPrefill:
     ) -> None:
         """Launch the causal build over one sequence, or over a batch with
         plan_prefill's plan and its query starts."""
-        rdna_prefill_attn(
+        _launch(
+            rdna_prefill_attn,
             q,
             kv_cache,
             block_table,
@@ -882,7 +894,8 @@ class _BuiltinPrefill:
         head_group: int = 0,
     ) -> None:
         """Launch the non-causal build over Q, K and V read in place."""
-        rdna_encoder_attn(
+        _launch(
+            rdna_encoder_attn,
             q,
             k,
             v,

@@ -213,11 +213,13 @@ std::vector<int64_t> decode_configs(const DecodeConfig* configs, int64_t n) {
 void check_prefill_scratch(const PrefillConfig& c, const aiter_tensor_t& q,
                            const aiter_tensor_t& partial_o,
                            const aiter_tensor_t& partial_ml,
-                           const aiter_tensor_t& counters) {
+                           const aiter_tensor_t& counters, bool planned) {
   AITER_CHECK(partial_o.is_contiguous() && partial_ml.is_contiguous() &&
                  counters.is_contiguous(),
              "scratch must be contiguous (make_prefill_scratch)");
-  if (c.max_segments <= 1) return;
+  // One sequence splits its KV only if the build does; a plan may split any
+  // build's tiles.
+  if (!planned && c.max_segments <= 1) return;
   const int64_t d = static_cast<int>(c.head_dim);
   const int64_t target =
       4 * device_properties(q.device_id).multiProcessorCount;
@@ -374,13 +376,16 @@ void rdna_decode_attn(aiter_tensor_t& q,
   AITER_CHECK(!batched || m.stride(0) == l.stride(0),
              "m and l must hold the same rows per sequence, got strides ",
              m.stride(0), " and ", l.stride(0));
-  const int64_t seqs = batched ? acc.size(0) : 1;
-  AITER_CHECK((int64_t)acc.numel() / seqs >= rows * d &&
-                 (int64_t)m.numel() / seqs >= rows &&
-                 (int64_t)l.numel() / seqs >= rows &&
-                 (int64_t)cnt.numel() / seqs >= counters,
+  // What a sequence has of each buffer: a batch advances every buffer by its
+  // own leading dimension.
+  const auto per_sequence = [&](const aiter_tensor_t& t) {
+    return (int64_t)t.numel() / (batched ? t.size(0) : 1);
+  };
+  AITER_CHECK(per_sequence(acc) >= rows * d && per_sequence(m) >= rows &&
+                 per_sequence(l) >= rows && per_sequence(cnt) >= counters,
              "scratch too small for this build: needs ", rows * d, ", ", rows,
-             ", ", rows, ", ", counters, " elements");
+             ", ", rows, ", ", counters, " elements",
+             batched ? " per sequence" : "");
   // Per sequence, [count, start0, end0, ...] in device memory: CUDA graphs
   // read the counts at replay. One row, or a row per sequence.
   const int* ranges = nullptr;
@@ -513,7 +518,8 @@ void rdna_prefill_attn(aiter_tensor_t& q,
     ranges = ints(*mm_ranges);
     num_ranges = static_cast<int>(mm_ranges->size(-2));
   }
-  check_prefill_scratch(c, q, partial_o, partial_ml, counters);
+  check_prefill_scratch(c, q, partial_o, partial_ml, counters,
+                        plan.has_value());
   const HipDeviceGuard device_guard(q.device_id);
   PrefillArgs args{};
   args.q = q.data_ptr();
@@ -601,7 +607,8 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
   check_device(q,
                {&k, &v, &out, &partial_o, &partial_ml, &counters, &seq_lens});
   if (plan) check_device(q, {&*plan, &*query_start_loc});
-  check_prefill_scratch(c, q, partial_o, partial_ml, counters);
+  check_prefill_scratch(c, q, partial_o, partial_ml, counters,
+                        plan.has_value());
   const HipDeviceGuard device_guard(q.device_id);
   PrefillArgs args{};
   args.q = q.data_ptr();
