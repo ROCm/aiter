@@ -227,6 +227,42 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_ar_2shot_rms_gfx1250": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/ar_2shot_rms_gfx1250_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/ar_2shot_rms_gfx1250.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_ar_k5_gfx1250": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/ar_k5_gfx1250_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/ar_k5_gfx1250.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/ar_k5_gluon_gfx1250.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "flags_extra_hip_per_source": {
+            "*ar_k5_gluon_gfx1250.cu": [
+                "-fno-gpu-flush-denormals-to-zero"
+            ]
+        },
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_custom_all_reduce_gfx1250": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_gfx1250_pybind.cu'",
