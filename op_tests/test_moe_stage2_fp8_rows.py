@@ -43,7 +43,7 @@ def _key(token):
     )
 
 
-def _dispatch(monkeypatch, token, fp8):
+def _dispatch(monkeypatch, token, fp8, activation=ActivationType.Silu):
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1" if fp8 else "0")
     get_2stage_cfgs.cache_clear()
     try:
@@ -58,7 +58,7 @@ def _dispatch(monkeypatch, token, fp8):
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
-            ActivationType.Silu,
+            activation,
             False,
             0,
             0,
@@ -101,6 +101,20 @@ def test_stage2_fp8_row_of_smaller_tier_keeps_main_row(monkeypatch):
     )
     # The main table has a 131072 row; the stage2 FP8 row is for 32768.
     assert _dispatch(monkeypatch, 131072, fp8=True).run_1stage
+
+
+def test_stage2_fp8_row_keeps_main_row_of_other_activation(monkeypatch):
+    _dispatch(monkeypatch, 8192, fp8=False)
+    primary, fallback = fused_moe_module.cfg_2stages
+    situv2_key = _key(8192)[:7] + (str(ActivationType.Situv2),) + _key(8192)[8:]
+    monkeypatch.setattr(
+        fused_moe_module,
+        "cfg_2stages",
+        ({**primary, situv2_key: primary[_key(8192)]}, fallback),
+    )
+    # The main table has a SiTUv2 row; the stage2 FP8 row is for Silu.
+    on = _dispatch(monkeypatch, 8192, fp8=True, activation=ActivationType.Situv2)
+    assert on.run_1stage and on.flat == AsmMoeMode.POST_REDUCE
 
 
 def test_aot_replays_stage2_fp8_rows_only_with_switch():

@@ -4723,8 +4723,11 @@ def get_2stage_cfgs(
         # Rows that are fastest when stage 2 writes FP8 route rows, e.g. a
         # FlyDSL `reduce` row for a shape whose main row is a one-stage kernel.
         if cfg_2stages_stage2_fp8 is None:
-            cfg_2stages_stage2_fp8 = get_cfg_2stages(
-                AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE
+            # Exact act_type only: through the act_type-agnostic dict, a Silu row
+            # would replace the main row of another activation.
+            cfg_2stages_stage2_fp8 = (
+                get_cfg_2stages(AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE)[0],
+                {},
             )
         fp8_cfg, fp8_tier = _lookup_cfg(cfg_2stages_stage2_fp8)
         # A row of a smaller token tier does not replace a row of this tier.
