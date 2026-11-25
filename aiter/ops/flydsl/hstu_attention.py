@@ -39,9 +39,6 @@ __all__ = [
 ]
 
 
-_GPU_ARCH = get_rocm_arch()
-
-
 def _str2bool(v: bool | str) -> bool:
     # Local copy to avoid importing aiter.utility.dtypes at module load: that
     # pulls in aiter.ops.enum, which triggers a JIT get_module() during the AOT
@@ -185,7 +182,7 @@ def _get_tuned_config(
     """
 
     problem_key = _problem_key(
-        _GPU_ARCH,
+        get_rocm_arch(),
         dtype_str,
         num_heads,
         head_dim,
@@ -624,7 +621,7 @@ def _get_bwd_tuned_config(
     """Returns the tuned config for one backward kernel ("dvdk" | "dq"), if the
     CSV has an entry for this (problem, kernel)."""
     problem_key = _problem_key(
-        _GPU_ARCH,
+        get_rocm_arch(),
         dtype_str,
         num_heads,
         head_dim,
