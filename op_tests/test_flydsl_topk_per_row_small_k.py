@@ -10,9 +10,8 @@ since it may keep a different tied column at the k-th place.
 
 Shapes come from a block-sparse indexer, which is what this selector is for: the
 row is one score per KV block, so `width = ceil(context / block_size)` and `k` is
-a block count, not a token count. The MiniMax-M3 sparse config (4 index heads,
-`sparse_topk_blocks` 16, `sparse_block_size` 128, `sparse_local_block` 1) puts a
-1M-token context at width 8192, k 16, and one row per (index head, query token).
+a block count, not a token count. A sparse config of 4 index heads, 16 selected
+blocks, 128-token blocks and 1 local block puts a 1M-token context at width 8192, k 16, and one row per (index head, query token).
 
 The distributions are not decoration. `ascending` is the adversarial case for any
 threshold-narrowing selector and `clustered` is what an fp8 index cache actually
