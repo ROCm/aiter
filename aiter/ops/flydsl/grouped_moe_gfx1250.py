@@ -157,18 +157,18 @@ def _find_grouped_config(
     dispatch, so a row with ``ep_fused`` 2 overrides the ``ep_fused`` 1 row
     for it; without one the ``ep_fused`` 1 row serves both.
     """
-    kw = dict(
-        token_num=token_num,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        activation=activation,
-        dtype=dtype,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        quant_type=quant_type,
-    )
+    kw = {
+        "token_num": token_num,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "activation": activation,
+        "dtype": dtype,
+        "q_dtype_a": q_dtype_a,
+        "q_dtype_w": q_dtype_w,
+        "quant_type": quant_type,
+    }
     if compact and ep_fused:
         row = _lookup_grouped_config(**kw, ep_key="2", explicit_only=True)
         if row is not None:

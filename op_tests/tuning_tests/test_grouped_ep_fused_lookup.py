@@ -69,10 +69,7 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
 
     def test_ep_fused_rows_selected(self):
         cases = [
-            *(
-                (token, 65, "16", "16", "3", "3")
-                for token in (8, 32, 64, 128, 256)
-            ),
+            *((token, 65, "16", "16", "3", "3") for token in (8, 32, 64, 128, 256)),
             # Rows retuned on the fused-shared-expert key (88480c113c).
             (512, 65, "32", "32", "3", "3"),
             (1024, 65, "64", "64", "3", "3"),
@@ -96,19 +93,19 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
 
     def test_compact_rows_override_only_compact(self):
         # ep_fused=2 rows serve the compact dispatch alone; mori keeps ep_fused=1.
-        kw = dict(
-            token_num=8192,
-            model_dim=7168,
-            inter_dim=2048,
-            experts=65,
-            topk=-1,
-            activation=ActivationType.Silu,
-            dtype=dtypes.bf16,
-            q_dtype_a=dtypes.fp4x2,
-            q_dtype_w=dtypes.fp4x2,
-            quant_type=QuantType.per_1x32,
-            ep_fused=True,
-        )
+        kw = {
+            "token_num": 8192,
+            "model_dim": 7168,
+            "inter_dim": 2048,
+            "experts": 65,
+            "topk": -1,
+            "activation": ActivationType.Silu,
+            "dtype": dtypes.bf16,
+            "q_dtype_a": dtypes.fp4x2,
+            "q_dtype_w": dtypes.fp4x2,
+            "quant_type": QuantType.per_1x32,
+            "ep_fused": True,
+        }
         # DSR1 8192 has no ep_fused=2 row: the compact path keeps the
         # ep_fused=1 row (tile 256), the same one mori resolves.
         compact = _find_grouped_config(**kw, compact=True)
