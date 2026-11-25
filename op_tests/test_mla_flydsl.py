@@ -41,6 +41,8 @@ Examples:
   python3 op_tests/test_mla_flydsl.py --mode ps1 -b 1 -c 1 63 64 65
   python3 op_tests/test_mla_flydsl.py --mode ps1 --varlen --varlen-min-ratio 0.1
   python3 op_tests/test_mla_flydsl.py --mode ps1 --dtype bf16 -c 1 64 65 2048
+  python3 op_tests/test_mla_flydsl.py --mode ps1 --num-heads 32 64 \\
+      --q-seq-len 3 4 6 8 --causal 0 1 -c 1 64 65 2048 --varlen
   python3 op_tests/test_mla_flydsl.py --mode cp --num-heads 16 96 \\
       --q-seq-len 2 4 --cp-world-size 2 4 8 -c 3 64 1200 --varlen
   python3 op_tests/test_mla_flydsl.py --mode ps1-asm -c 65 2048 8192 --varlen
@@ -80,8 +82,9 @@ SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
 # Query lengths PS1 serves per head count.
 PS1_Q_SEQ_LENS = {
     16: (1, 2, 3, 4),
-    32: (1, 2, 3, 4),
-    64: (1, 2),
+    # Past 128 / nhead rows the planner cuts the query into several qo tiles.
+    32: (1, 2, 3, 4, 5, 6, 7, 8),
+    64: (1, 2, 3, 4, 5, 6, 7, 8),
     96: (1, 2, 3, 4, 6, 8),
     128: (1,),
 }
@@ -99,8 +102,18 @@ JIT_MISMATCH_RATIO = 1e-3
 # Head counts ASM PS64 runs padded up to.
 ASM_PADDED_HEADS = {96: 128}
 # The PS1 metadata planner packs nhead * q_seq query rows per work item up to
-# this many; beyond it every work item holds one query position.
+# this many: above budget / 2 heads every work item holds one query position,
+# below it a longer query is cut into several qo tiles.
 PLANNER_PACKED_Q_BUDGET = 128
+
+
+def _planner_q_tile_rows(nhead, q_seq_len):
+    """Query rows per work item, as mla_v12_num_qo_tiles cuts them."""
+    if nhead * 2 > PLANNER_PACKED_Q_BUDGET:
+        return 1
+    tiles = -(-(nhead * q_seq_len) // PLANNER_PACKED_Q_BUDGET)
+    return -(-q_seq_len // tiles)
+
 
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
@@ -340,11 +353,13 @@ def _build_ps1_metadata(
 
     num_works = int(work_indptr[-1].item())
     work_info = work_info_set[:num_works]
-    qo_tile_size = 1 if nhead * 2 > PLANNER_PACKED_Q_BUDGET else q_seq_len
-    if bool((work_info[:, 3] - work_info[:, 2] != qo_tile_size).any()):
+    # The last tile of a request may be shorter (64 heads x q_seq 3 -> 2 + 1).
+    qo_tile_size = _planner_q_tile_rows(nhead, q_seq_len)
+    tile_rows = work_info[:, 3] - work_info[:, 2]
+    if num_works and (int(tile_rows.max()) != qo_tile_size or int(tile_rows.min()) < 1):
         raise RuntimeError(
-            f"PS1 nhead={nhead} expects qo tiles of {qo_tile_size}, "
-            f"got {sorted(set((work_info[:, 3] - work_info[:, 2]).tolist()))}"
+            f"PS1 nhead={nhead} q_seq={q_seq_len} expects qo tiles of up to "
+            f"{qo_tile_size}, got {sorted(set(tile_rows.tolist()))}"
         )
 
     return {
@@ -806,16 +821,17 @@ def _test_ps1(
     varlen=False,
     min_ratio=0.5,
     dtype="fp8",
+    causal=True,
 ):
     case = _prepare_case(
         batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales, dtype
     )
-    _add_ps1_layout(case)
-    reference = _torch_reference(case, SOFTMAX_SCALE)
+    _add_ps1_layout(case, causal=causal)
+    reference = _torch_reference(case, SOFTMAX_SCALE, causal=causal)
     output = _decode_output(case)
 
     def run():
-        _run_ps1(case, SOFTMAX_SCALE, output)
+        _run_ps1(case, SOFTMAX_SCALE, output, causal=causal)
 
     _, us = run_perftest(run, num_iters=num_iters, num_warmup=num_warmup)
     return _row(
@@ -823,6 +839,7 @@ def _test_ps1(
         case,
         nhead,
         q_seq_len,
+        causal=int(causal),
         us=us,
         err=_check_output("ps1", reference, output),
     )
@@ -1437,7 +1454,7 @@ def _parse_args():
         "--q-seq-len",
         type=int,
         nargs="+",
-        choices=(1, 2, 3, 4, 6, 8),
+        choices=sorted({q for lens in PS1_Q_SEQ_LENS.values() for q in lens}),
         default=[1, 2, 3, 4],
         help="Query lengths; each head count runs the ones it supports.",
     )
@@ -1471,6 +1488,14 @@ def _parse_args():
         choices=tuple(DTYPES),
         default="fp8",
         help=f"Q/KV type; bf16 runs in {', '.join(BF16_MODES)} (scales unused).",
+    )
+    parser.add_argument(
+        "--causal",
+        type=int,
+        nargs="+",
+        choices=(0, 1),
+        default=[1],
+        help="ps1: causal and/or non-causal (a bidirectional draft block) decode.",
     )
     parser.add_argument("--scales", choices=SCALE_MODES, default="unit")
     parser.add_argument("--num-iters", type=int, default=_PERF_NUM_ITERS)
@@ -1507,9 +1532,12 @@ def _cases(args):
             continue
         shape = (batch, ctx_len, nhead, q_seq_len)
         if args.mode == "ps1":
-            cases.append(
-                lambda s=shape: _test_ps1(*s, *timing, *lengths, dtype=args.dtype)
-            )
+            for causal in args.causal:
+                cases.append(
+                    lambda s=shape, c=bool(causal): _test_ps1(
+                        *s, *timing, *lengths, dtype=args.dtype, causal=c
+                    )
+                )
         elif args.mode == "ps1-asm":
             for causal, return_lse in itertools.product((True, False), (False, True)):
                 cases.append(
