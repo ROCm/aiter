@@ -2425,7 +2425,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-fno-honor-nans -mno-amdgpu-ieee'"
+            "'-fno-honor-nans -mno-amdgpu-ieee'",
+            "'-fno-slp-vectorize'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
