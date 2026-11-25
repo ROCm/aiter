@@ -12,6 +12,7 @@ mode: AITER has no kernel that does only the RoPE and the cache write.
 
 Inputs rotate through a pool so each call reads its W_UK^T from HBM, as each
 decode layer does with its own weight.
+Select fused_nope_only to write only the NoPE prefix of a preallocated output.
 """
 
 import json
@@ -20,6 +21,7 @@ from collections import Counter
 import torch
 import triton
 
+from aiter import logger
 from aiter.ops.cache import fused_qk_rope_concat_and_cache_mla
 from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
     _get_config,
@@ -35,10 +37,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     positive_int,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
-    run_input_generator,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+    _run_input_generator,
 )
 from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
     D_NOPE,
@@ -65,7 +68,9 @@ ROPE_CACHE_FIELDS = FIELDS + (
 )
 
 
-def fields(args):
+def fields(args, provider):
+    if provider == "fused_nope_only":
+        return ("q_nope", "w_uk_t", "q_scale", "buf")
     return ROPE_CACHE_FIELDS if args.rope_cache else FIELDS
 
 
@@ -79,6 +84,8 @@ def make_input_gen(M, provider, args):
             buf = q_nope.new_empty((M, args.qh, w_uk_t.shape[-1]))
         else:
             buf = torch.empty((M, args.padded_heads, q_dim), dtype=fp8, device="cuda")
+        if provider == "fused_nope_only":
+            return q_nope, w_uk_t, q_scale, buf
         if not args.rope_cache:
             return q_nope, w_uk_t, q_pe, q_scale, buf
         rope_cache = generate_rope_cache_inputs(M)
@@ -100,7 +107,7 @@ def make_fn(M, provider, args, cat_quant):
             _get_rope_cache_config if provider == "fused_rope_cache" else _get_config
         )
         config, _ = get_config(M, KV_LORA, D_NOPE, args.qh)
-        config.update(args.config)
+        config = config | args.config
 
     cache_dtype = get_fp8_e4m3_dtype()
     if provider == "unfused" and args.rope_cache:
@@ -147,9 +154,9 @@ def make_fn(M, provider, args, cat_quant):
             q = cat_quant(buf, q_pe, q_scale, fp8_max)
             return q.repeat_interleave(dup, dim=1)
 
-    elif provider == "fused":
+    elif provider in ("fused", "fused_nope_only"):
 
-        def fn(q_nope, w_uk_t, q_pe, q_scale, buf):
+        def fn(q_nope, w_uk_t, q_scale, buf, q_pe=None):
             return fused_bf16_bmm_cat_quant_pad_mla(
                 q_nope,
                 w_uk_t,
@@ -204,7 +211,9 @@ def print_kernels(M, args, cat_quant, calls=4):
     """Kernels each provider launches over a few calls, to compare with the
     kernel names in a model trace. Every kernel should show up once per call."""
     for provider in args.providers:
-        inputs = run_input_generator(make_input_gen(M, provider, args), fields(args))
+        inputs = _run_input_generator(
+            make_input_gen(M, provider, args), fields(args, provider)
+        )
         fn = make_fn(M, provider, args, cat_quant)
         fn(**inputs)
         torch.cuda.synchronize()
@@ -219,25 +228,23 @@ def print_kernels(M, args, cat_quant, calls=4):
             for evt in prof.events()
             if evt.device_type == torch.autograd.DeviceType.CUDA
         )
-        print(f"{provider} (M={M}, {calls} calls):")
+        logger.info("%s (M=%s, %s calls):", provider, M, calls)
         if not names:
-            print("    no GPU kernels recorded")
+            logger.info("    no GPU kernels recorded")
         for name, count in names.items():
-            print(f"    {count:3d}x {name[:160]}")
+            logger.info("    %sx %s", count, name[:160])
 
 
 def bench_fn(M, provider, args, cat_quant):
     torch.manual_seed(0)
-    rot_bufs = generate_rotating_buffers_pool(
+    bencher = RotatingBufferBench.from_dict(
+        get_rot_bufs_kwargs(args) | get_do_bench_graph_kwargs(args)
+    )
+    bencher.build_pool(
         [make_input_gen(M, provider, args)],
-        [fields(args)],
-        **get_rot_bufs_kwargs(args),
+        [fields(args, provider)],
     )
-    ms = do_bench_aiter_triton(
-        make_fn(M, provider, args, cat_quant),
-        rot_bufs,
-        **get_do_bench_graph_kwargs(args),
-    )
+    ms = bencher.bench(make_fn(M, provider, args, cat_quant))
     return ms * 1e3
 
 
@@ -289,7 +296,7 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--providers",
         nargs="+",
-        choices=sorted(set(PROVIDERS + ROPE_CACHE_PROVIDERS)),
+        choices=sorted(set(PROVIDERS + ROPE_CACHE_PROVIDERS + ["fused_nope_only"])),
         default=None,
         help=f"Providers to time or list (default {PROVIDERS}, "
         f"{ROPE_CACHE_PROVIDERS} with --rope-cache)",
@@ -334,9 +341,10 @@ def parse_args(args: list[str] | None = None):
     parsed = parser.parse_args(args=args)
     if parsed.padded_heads % parsed.qh:
         parser.error("--padded-heads must be a multiple of --qh")
-    allowed = ROPE_CACHE_PROVIDERS if parsed.rope_cache else PROVIDERS
+    defaults = ROPE_CACHE_PROVIDERS if parsed.rope_cache else PROVIDERS
+    allowed = defaults if parsed.rope_cache else defaults + ["fused_nope_only"]
     if parsed.providers is None:
-        parsed.providers = allowed
+        parsed.providers = defaults
     elif not set(parsed.providers) <= set(allowed):
         parser.error(
             f"providers {allowed} only {'with' if parsed.rope_cache else 'without'} "

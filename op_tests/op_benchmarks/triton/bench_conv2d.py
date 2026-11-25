@@ -53,11 +53,11 @@ from aiter.ops.triton.conv._prepack import (
 )
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
-    _conv2d_padding_geometry,
     _is_1x1_conv,
     _is_3x3_conv,
     _out_hw,
-    _validate_conv2d_padding_mode,
+    _padding_geometry,
+    _validate_padding_mode,
 )
 from aiter.ops.triton.conv.conv2d import (
     _resolve_route,
@@ -98,8 +98,8 @@ def which_kernel(
     """
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
-    _validate_conv2d_padding_mode(padding_mode, H, W_in, padding)
-    H, W_in, padding = _conv2d_padding_geometry(H, W_in, padding, padding_mode)
+    _validate_padding_mode(padding_mode, (H, W_in), padding)
+    (H, W_in), padding = _padding_geometry((H, W_in), padding, padding_mode)
     route = _resolve_route(
         R,
         S,
@@ -362,7 +362,7 @@ def bench_one_shape(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available; conv2d bench requires a GPU.")
 
-    _validate_conv2d_padding_mode(padding_mode, H, W, padding)
+    _validate_padding_mode(padding_mode, (H, W), padding)
     end_to_end = end_to_end or padding_mode != "zeros"
     P, Q = _out_hw(H, W, R, S, stride, padding, dilation)
     if P < 1 or Q < 1:
