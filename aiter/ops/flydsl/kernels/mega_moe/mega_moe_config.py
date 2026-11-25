@@ -1704,6 +1704,21 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+def _tune_v41_flash_ep8_small_both(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash small-input changes both quants share, applied after their tunes (the V4-Pro A4W4
+    tune, which starts from _tune_v41_flash_ep8_small, does not take them)."""
+    if bucket >= 16:
+        # The 8-column GEMM1 quantize/store pass (per-tile output resource) without serial waits, as at 1-4 tokens
+        # but with the IEEE SiLU (epi_lean bit 0 only: bitwise-identical outputs). ATT on the hot rank at 128 zipf
+        # tokens: the 2-column pass costs 49k cycles a wave (16k of them on its 2-byte stores).
+        config = replace(
+            config,
+            stage1=replace(config.stage1, use_tile_resource=True),
+            fused_stage1=replace(config.fused_stage1, epi_evec=8, epi_lean=1),
+        )
+    return config
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity (LARGE_M_MTPRS) unchanged.
@@ -1951,7 +1966,11 @@ def _fused_config(
         config = _tune_v41_flash_ep2_small(config, bucket)
     elif layout == V41_FLASH_EP8_LAYOUT:
         config = _tune_v41_flash_ep8_small(config, bucket)
-    return _tune_a4w4_small(config, layout, bucket) if quant == "a4w4" else config
+    if quant == "a4w4":
+        config = _tune_a4w4_small(config, layout, bucket)
+    if layout == V41_FLASH_EP8_LAYOUT:
+        config = _tune_v41_flash_ep8_small_both(config, bucket)
+    return config
 
 
 def select_fused_config(

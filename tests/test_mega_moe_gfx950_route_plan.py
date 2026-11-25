@@ -523,7 +523,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 # current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and pair_tiles at 64 and 128
 # tokens.
 _V41EP8_FUSED_DIGEST = (
-    "66f44ffe68a7668c3d75c54543796e00df694daec7f8795f12ec778cd75a5127"
+    "f20f206479a3a34490dcd14c869c7c321f9933e29c50b1d4204149a019475f4a"
 )
 
 
@@ -1094,7 +1094,7 @@ _A4W4_DIGEST_LARGE_MTPRS = {
 }
 _A4W4_FUSED_DIGESTS = {
     "v4_pro_ep8": "8f1f921b1bccce23c0709b0682bbee047f5893bbceb0497ee8c517f6a3d82b04",
-    "v41_flash_ep8": "62c7a693275961daadcebb11b8bb06172e49d36dae29eb7b8bb0026f64d748a6",
+    "v41_flash_ep8": "d513fe824c500f5f1b5b4f8f8d050c492702875f57e859d59e19a52c11f42da3",
     "v41_flash_ep4": "edabac3b4dd3e9bf40a9c179427829b95c2eaf195f64b05d2ff37fc251e29498",
     "v41_flash_ep2": "4dedfdc6d0b32d049fbe45590be738063657d4341ac83929c268f434cb7a3044",
 }
