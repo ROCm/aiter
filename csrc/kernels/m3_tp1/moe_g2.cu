@@ -5,6 +5,7 @@
 // bf16(sum_k A * W2 * route weight), fp32 accumulation in K order, as aiter's v2 "reduce" GEMM2.
 // Tile = up to 256 sorted rows of one expert (two sort blocks) x 256 columns; 4 waves along N,
 // 16-row MFMA groups past the tile's valid rows skipped. B comes from relayout_w2's preshuffle.
+// moe_g2_gemm_w8 runs the same tiles on 8 waves per WG (2 per SIMD), from per-XCD work queues.
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "m3_tp1_prefill.h"
@@ -67,7 +68,7 @@ __device__ __forceinline__ int bload4(rsrc_t r, int voff, int soff)
 }
 
 // Tile list: valid rows per sort block, then consecutive blocks of one expert paired.
-// tiles[t] = {first sorted row, valid rows (a prefix of the tile), expert, 0}; ntiles[0] = count.
+// tiles[t] = {first row, valid rows (a prefix), expert, 0}; ntiles = {count, nq zeroed counters}.
 __global__ void moe_g2_count(const int* __restrict__ sids,
                              const int* __restrict__ nvalid_ids,
                              int M,
@@ -91,7 +92,8 @@ __global__ void __launch_bounds__(1024) moe_g2_tiles(const int* __restrict__ eid
                                                      const int* __restrict__ nvalid_ids,
                                                      const int* __restrict__ cnt,
                                                      int4* __restrict__ tiles,
-                                                     int* __restrict__ ntiles)
+                                                     int* __restrict__ ntiles,
+                                                     int nq)
 {
     __shared__ int se[4096];
     __shared__ int wsum[16];
@@ -137,6 +139,8 @@ __global__ void __launch_bounds__(1024) moe_g2_tiles(const int* __restrict__ eid
     }
     if(threadIdx.x == 0)
         ntiles[0] = base;
+    else if(threadIdx.x <= nq)
+        ntiles[threadIdx.x] = 0;
 }
 
 struct TileOff
@@ -422,6 +426,336 @@ __global__ void __launch_bounds__(256, 1) moe_g2_gemm(const uint8_t* __restrict_
 #endif
 }
 
+// w8: moe_g2_gemm's tiles on 8 waves, wave w on rows (w >> 2) * 128 and columns (w & 3) * 64.
+// Every accumulator gets moe_g2_gemm's MFMA sequence and epilogue: the same bytes.
+constexpr int W8_NG       = 8;           // 16-row MFMA groups per wave (128 rows)
+constexpr uint32_t W8_OOB = 0xFFFF0000u; // store offset of padding rows: the buffer store drops it
+constexpr int W8_PUBCNT   = 36; // VMEM ops between a slot's last A DMA and its publish: 38 - 2
+
+struct W8Off
+{
+    uint32_t b, bs, as, a;     // byte offsets into Bw, Bs, As, A
+    int row0, nb, nch, nrow16; // nch: this wave's 16-row groups holding routes (0..8)
+};
+
+__device__ __forceinline__ W8Off w8_tile(int t, const int4* __restrict__ tiles, int wave)
+{
+    W8Off o;
+    const int mt   = t / NBLK;
+    const int4 ti  = tiles[mt];
+    o.nb           = t - mt * NBLK;
+    o.row0         = RFL(ti.x);
+    const int nval = RFL(ti.y), e = RFL(ti.z);
+    const int nch_t   = (nval + 15) >> 4;
+    const int half    = wave >> 2;
+    o.nrow16          = nch_t * 16;
+    o.nch             = min(max(nch_t - half * 8, 0), 8);
+    const uint32_t wb = (uint32_t)(e * NWB + o.nb * 4 + (wave & 3));
+    o.b               = wb * (uint32_t)(KT * 8192);
+    o.bs              = wb * (uint32_t)(KT * 512);
+    o.as              = (uint32_t)((o.row0 >> 5) + half * 4) * (uint32_t)(KT * 256);
+    o.a               = (uint32_t)o.row0 * (uint32_t)KB;
+    return o;
+}
+
+// Work: 8 queues; queue x holds n-blocks x, x + 8, x + 16 of every tile. A WG drains its XCD's
+// queue first, then steals, so any grid computes every item. -1 once every queue is drained.
+__device__ __forceinline__ int w8_fetch(int* __restrict__ queues, int nitems, int& q)
+{
+    for(int n = 0; n < 8; ++n)
+    {
+        const int k = atomicAdd(&queues[q], 1);
+        if(k < nitems)
+            return (k / 3) * NBLK + q + 8 * (k % 3);
+        q = (q + 1) & 7;
+    }
+    return -1;
+}
+
+// B goes to VGPRs in half-steps 1.5 K-steps ahead, the scales one step ahead, A to LDS by DMA 3
+// steps ahead; slot kt + 1 is published by a barrier two group-halves before step kt ends.
+__global__ void __launch_bounds__(512, 1) moe_g2_gemm_w8(const uint8_t* __restrict__ A,
+                                                         const uint8_t* __restrict__ As,
+                                                         const uint8_t* __restrict__ Bw,
+                                                         const uint8_t* __restrict__ Bs,
+                                                         const int4* __restrict__ tiles,
+                                                         int* __restrict__ ctl,
+                                                         const int* __restrict__ sids,
+                                                         const float* __restrict__ sw,
+                                                         uint16_t* __restrict__ out,
+                                                         int M,
+                                                         int topk)
+{
+#if defined(__gfx950__)
+    __shared__ int w8_first[2];
+    __shared__ int w8_next[2];
+    const int nt      = RFL(ctl[0]);
+    const int nitems  = nt * 3;
+    int* const queues = ctl + 1;
+    // only thread 0 fetches; q is its current queue, its XCD's first (L2 reuse of A and B)
+    int q = (int)__builtin_amdgcn_s_getreg((3 << 11) | (0 << 6) | 20) & 7; // XCC_ID
+    if(threadIdx.x == 0)
+    {
+        w8_first[0] = w8_fetch(queues, nitems, q);
+        w8_first[1] = w8_fetch(queues, nitems, q);
+    }
+    __syncthreads();
+    int t      = RFL(w8_first[0]);
+    int t_next = RFL(w8_first[1]);
+    if(t < 0)
+        return;
+    const int tid = threadIdx.x, lane = tid & 63;
+    const int wave    = RFL(tid >> 6);
+    const rsrc_t rB   = mk_rsrc(Bw, 0xFFFFFFFFu);
+    const rsrc_t rBs  = mk_rsrc(Bs, 0xFFFFFFFFu);
+    const rsrc_t rAs  = mk_rsrc(As, 0xFFFFFFFFu);
+    const rsrc_t rA   = mk_rsrc(A, 0xFFFFFFFFu);
+    const rsrc_t rId  = mk_rsrc(sids, 0xFFFFFFFFu);
+    const rsrc_t rW   = mk_rsrc(sw, 0xFFFFFFFFu);
+    const rsrc_t rOut = mk_rsrc(out, (uint32_t)M * (uint32_t)topk * (uint32_t)(NH * 2));
+    W8Off cur         = w8_tile(t, tiles, wave);
+
+    // A DMA: lane l of wave w writes LDS row (j * 64 + w * 8 + l / 8), physical chunk l % 8, which
+    // holds logical chunk (l % 8) ^ ((row >> 1) & 7) of the (clamped) source row.
+    const int drow = wave * 8 + (lane >> 3);
+    const int half = wave >> 2;
+    const int hro  = half * 8 * 2048; // this wave's 128 rows in an A slot
+    const int dchk = ((lane & 7) ^ ((drow >> 1) & 7)) << 4;
+    const int rl = lane & 15, kq = lane >> 4;
+    const int ar0 = rl * 128 + (((0 + kq) ^ (rl >> 1)) << 4);
+    const int ar1 = rl * 128 + (((4 + kq) ^ (rl >> 1)) << 4);
+
+    v4f acc[W8_NG][4];
+#pragma unroll
+    for(int i = 0; i < W8_NG; ++i)
+#pragma unroll
+        for(int J = 0; J < 4; ++J)
+            acc[i][J] = v4f{0.f, 0.f, 0.f, 0.f};
+
+    v4i bq[4][4]; // B half-buffers: [(2 * kt + h) % 4][J]
+    int sa[2][4]; // A scales per 32-row chunk, [kt % 2]
+    v2i sb[2];    // B scales, [kt % 2]
+
+#define W8_B(hb, ob, kts, h)                                 \
+    _Pragma("unroll") for(int J = 0; J < 4; ++J) bq[hb][J] = \
+        bload16(rB, lane * 16 + (J * 2 + (h)) * 1024, (ob) + (kts) * 8192);
+#define W8_A(S, oa, nr16, kts, j)                                 \
+    {                                                             \
+        const int row = (j) * 64 + drow;                          \
+        __builtin_amdgcn_raw_ptr_buffer_load_lds(                 \
+            rA,                                                   \
+            (lds_ptr_t)(a_slot(S) + ((j) * 64 + wave * 8) * 128), \
+            16,                                                   \
+            (row < (nr16) ? row : 0) * KB + dchk,                 \
+            (oa) + (kts) * 128,                                   \
+            0,                                                    \
+            0);                                                   \
+    }
+#define W8_AS(buf, oas, nr16, kts, cc) \
+    sa[buf][cc] = bload4(              \
+        rAs, lane * 4, (oas) + ((half * 128 + (cc) * 32 < (nr16) ? (cc) : 0) * KT + (kts)) * 256)
+
+    int my_id = 0, my_w = 0;
+    if(tid < 256)
+    {
+        my_id = bload4(rId, (tid < cur.nrow16 ? tid : 0) * 4, cur.row0 * 4);
+        my_w  = bload4(rW, (tid < cur.nrow16 ? tid : 0) * 4, cur.row0 * 4);
+    }
+    // prologue: A for steps 0..2, B halves (0, 0) (0, 1) (1, 0), scales for step 0
+#pragma unroll
+    for(int s = 0; s < 3; ++s)
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            W8_A(s, cur.a, cur.nrow16, s, j);
+    W8_B(0, cur.b, 0, 0);
+    W8_B(1, cur.b, 0, 1);
+    W8_B(2, cur.b, 1, 0);
+    sb[0] = bload8(rBs, lane * 8, cur.bs);
+#pragma unroll
+    for(int cc = 0; cc < 4; ++cc)
+        W8_AS(0, cur.as, cur.nrow16, 0, cc);
+    __builtin_amdgcn_s_waitcnt(0); // everything (gfx9 encoding: vmcnt 0, lgkmcnt 0)
+    lds_barrier();
+    v4i a_c = *(const v4i*)(g2_a_slot0 + hro + 0 * 2048 + ar0);
+    v4i a_n = *(const v4i*)(g2_a_slot0 + hro + 1 * 2048 + ar0);
+
+    int par = 0;
+    while(true)
+    {
+        const bool has_next = t_next >= 0;
+        // the item after next: its atomic's result is first used after the K loop
+        int nn = 0;
+        if(has_next && tid == 0)
+            nn = w8_fetch(queues, nitems, q);
+        const W8Off nxt = w8_tile(has_next ? t_next : t, tiles, wave);
+        if(tid < 256)
+        {
+            const int tok = my_id & 0xFFFFFF, sl = my_id >> 24;
+            g2_row_id[par][tid] = (tok < M && sl < topk)
+                                      ? (int)((uint32_t)(tok * topk + sl) * (uint32_t)(NH * 2))
+                                      : (int)W8_OOB;
+            g2_row_w[par][tid]  = __int_as_float(my_w);
+        }
+        __builtin_amdgcn_s_waitcnt(0xc07f); // lgkmcnt(0): staged before the K-loop barriers
+        if(tid < 256)
+        {
+            my_id = bload4(rId, (tid < nxt.nrow16 ? tid : 0) * 4, nxt.row0 * 4);
+            my_w  = bload4(rW, (tid < nxt.nrow16 ? tid : 0) * 4, nxt.row0 * 4);
+        }
+#pragma unroll 1
+        for(int kk = 0; kk < KT; kk += 4)
+        {
+#pragma unroll
+            for(int u = 0; u < 4; ++u)
+            {
+                const int kt = kk + u;
+                // prefetch: scales for kt + 1, B halves (kt + 1, 1) and (kt + 2, 0), A for kt + 3
+                const bool h1 = kt + 1 < KT, h2 = kt + 2 < KT, h3 = kt + 3 < KT;
+                const uint32_t ob1 = h1 ? cur.b : nxt.b, ob2 = h2 ? cur.b : nxt.b;
+                const uint32_t obs1 = h1 ? cur.bs : nxt.bs, oas1 = h1 ? cur.as : nxt.as;
+                const int nr1 = h1 ? cur.nrow16 : nxt.nrow16, nr3 = h3 ? cur.nrow16 : nxt.nrow16;
+                const uint32_t oa3 = h3 ? cur.a : nxt.a;
+                const int k1       = h1 ? kt + 1 : kt + 1 - KT;
+                const int k2       = h2 ? kt + 2 : kt + 2 - KT;
+                const int k3       = h3 ? kt + 3 : kt + 3 - KT;
+                int nch_s          = cur.nch;
+                asm volatile("" : "+s"(nch_s));
+#pragma unroll
+                for(int g = 0; g < 2 * W8_NG; ++g)
+                {
+                    const int h = g / W8_NG, i = g % W8_NG;
+                    // issue: 17 VMEM ops per K-step
+                    if(g == 0)
+                    {
+                        sb[(u + 1) & 1] = bload8(rBs, lane * 8, obs1 + k1 * 512);
+                        W8_AS((u + 1) & 1, oas1, nr1, k1, 0);
+                        W8_AS((u + 1) & 1, oas1, nr1, k1, 1);
+                    }
+                    else if(g == 1)
+                    {
+                        W8_AS((u + 1) & 1, oas1, nr1, k1, 2);
+                        W8_AS((u + 1) & 1, oas1, nr1, k1, 3);
+                    }
+                    else if(g >= 2 && g < 6)
+                    {
+                        // B half (kt + 1, 1) -> half-buffer (2u + 3) % 4
+                        const int J = g - 2;
+                        bq[(2 * u + 3) & 3][J] =
+                            bload16(rB, lane * 16 + (J * 2 + 1) * 1024, ob1 + k1 * 8192);
+                    }
+                    else if(g == 6 || g == 7)
+                    {
+                        // A for kt + 3 -> slot (u + 3) % 4, kept in program order (W8_PUBCNT)
+                        __builtin_amdgcn_sched_barrier(0);
+                        W8_A(u + 3, oa3, nr3, k3, 2 * (g - 6));
+                        W8_A(u + 3, oa3, nr3, k3, 2 * (g - 6) + 1);
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                    else if(g >= 8 && g < 12)
+                    {
+                        // B half (kt + 2, 0) -> half-buffer (2u) % 4 (half (kt, 0) is done)
+                        const int J = g - 8;
+                        bq[(2 * u) & 3][J] =
+                            bload16(rB, lane * 16 + (J * 2 + 0) * 1024, ob2 + k2 * 8192);
+                    }
+                    // A operand two group-halves ahead
+                    v4i a_p;
+                    if(g + 2 < 2 * W8_NG)
+                    {
+                        const int hp = (g + 2) / W8_NG, ip = (g + 2) % W8_NG;
+                        a_p = *(const v4i*)(a_slot(u) + hro + ip * 2048 + (hp ? ar1 : ar0));
+                    }
+                    else
+                        a_p = *(const v4i*)(a_slot(u + 1) + hro + (g + 2 - 2 * W8_NG) * 2048 + ar0);
+                    if(__builtin_expect(i < nch_s, 1))
+                    {
+                        const int hb  = (2 * u + h) & 3;
+                        const int sA  = sa[u & 1][i >> 1];
+                        const int sB0 = sb[u & 1].x, sB1 = sb[u & 1].y;
+                        const int opa = (i & 1) + 2 * h;
+                        if(opa == 0)
+                        {
+                            MFMA(acc[i][0], a_c, bq[hb][0], sA, 0, sB0, 0);
+                            MFMA(acc[i][1], a_c, bq[hb][1], sA, 0, sB0, 1);
+                            MFMA(acc[i][2], a_c, bq[hb][2], sA, 0, sB1, 0);
+                            MFMA(acc[i][3], a_c, bq[hb][3], sA, 0, sB1, 1);
+                        }
+                        else if(opa == 1)
+                        {
+                            MFMA(acc[i][0], a_c, bq[hb][0], sA, 1, sB0, 0);
+                            MFMA(acc[i][1], a_c, bq[hb][1], sA, 1, sB0, 1);
+                            MFMA(acc[i][2], a_c, bq[hb][2], sA, 1, sB1, 0);
+                            MFMA(acc[i][3], a_c, bq[hb][3], sA, 1, sB1, 1);
+                        }
+                        else if(opa == 2)
+                        {
+                            MFMA(acc[i][0], a_c, bq[hb][0], sA, 2, sB0, 2);
+                            MFMA(acc[i][1], a_c, bq[hb][1], sA, 2, sB0, 3);
+                            MFMA(acc[i][2], a_c, bq[hb][2], sA, 2, sB1, 2);
+                            MFMA(acc[i][3], a_c, bq[hb][3], sA, 2, sB1, 3);
+                        }
+                        else
+                        {
+                            MFMA(acc[i][0], a_c, bq[hb][0], sA, 3, sB0, 2);
+                            MFMA(acc[i][1], a_c, bq[hb][1], sA, 3, sB0, 3);
+                            MFMA(acc[i][2], a_c, bq[hb][2], sA, 3, sB1, 2);
+                            MFMA(acc[i][3], a_c, bq[hb][3], sA, 3, sB1, 3);
+                        }
+                    }
+                    a_c = a_n;
+                    a_n = a_p;
+                    if(g == 2 * W8_NG - 3)
+                    {
+                        // publish slot kt + 1 (DMA'd at step kt - 2) after this wave's reads of
+                        // slot kt; a bare barrier, as a fence would also wait for this step's DMA
+                        __builtin_amdgcn_s_waitcnt((W8_PUBCNT & 15) | ((W8_PUBCNT >> 4) << 14) |
+                                                   (7 << 4) | (0 << 8));
+                        asm volatile("s_barrier" ::: "memory");
+                    }
+                }
+            }
+        }
+        if(tid == 0)
+            w8_next[par ^ 1] = has_next ? nn : -1;
+        __syncthreads();
+        // epilogue: bf16(acc * w) per route row; padding rows carry W8_OOB, which the store drops
+        const uint32_t col = (uint32_t)(cur.nb * 512 + (wave & 3) * 128);
+#pragma unroll
+        for(int i = 0; i < W8_NG; ++i)
+        {
+            if(i < cur.nch)
+            {
+                const v4i off4 = *(const v4i*)(&g2_row_id[par][half * 128 + i * 16 + kq * 4]);
+                const v4f w4   = *(const v4f*)(&g2_row_w[par][half * 128 + i * 16 + kq * 4]);
+#pragma unroll
+                for(int v = 0; v < 4; ++v)
+                {
+                    const float wv    = w4[v];
+                    const uint32_t lo = pk_bf16(acc[i][0][v] * wv, acc[i][1][v] * wv);
+                    const uint32_t hi = pk_bf16(acc[i][2][v] * wv, acc[i][3][v] * wv);
+                    __builtin_amdgcn_raw_buffer_store_b64(
+                        v2i{(int)lo, (int)hi}, rOut, off4[v] + rl * 8, col, 0);
+                }
+            }
+#pragma unroll
+            for(int J = 0; J < 4; ++J)
+                acc[i][J] = v4f{0.f, 0.f, 0.f, 0.f};
+        }
+        if(!has_next)
+            break;
+        cur    = nxt;
+        t      = t_next;
+        t_next = RFL(w8_next[par ^ 1]);
+        par ^= 1;
+    }
+#undef W8_B
+#undef W8_A
+#undef W8_AS
+#else
+    __builtin_trap(); // gfx950 only, as moe_g2_gemm
+#endif
+}
+
 constexpr int kSortBlock     = 128;
 constexpr int kMaxSortBlocks = 4096; // moe_g2_tiles stages the block experts in LDS
 
@@ -445,22 +779,21 @@ void check_bytes(const aiter_tensor_t& t, size_t numel, const char* name)
                 " elements");
 }
 
-} // namespace
-
-void m3_tp1_moe_g2(const aiter_tensor_t& a2,
-                   const aiter_tensor_t& a2_scale,
-                   const aiter_tensor_t& w2_b,
-                   const aiter_tensor_t& w2_bs,
-                   const aiter_tensor_t& sorted_ids,
-                   const aiter_tensor_t& sorted_weights,
-                   const aiter_tensor_t& sorted_expert_ids,
-                   const aiter_tensor_t& num_valid_ids,
-                   aiter_tensor_t& cnt,
-                   aiter_tensor_t& tiles,
-                   aiter_tensor_t& ntiles,
-                   aiter_tensor_t& out,
-                   int64_t m,
-                   int64_t topk)
+void run_g2(const aiter_tensor_t& a2,
+            const aiter_tensor_t& a2_scale,
+            const aiter_tensor_t& w2_b,
+            const aiter_tensor_t& w2_bs,
+            const aiter_tensor_t& sorted_ids,
+            const aiter_tensor_t& sorted_weights,
+            const aiter_tensor_t& sorted_expert_ids,
+            const aiter_tensor_t& num_valid_ids,
+            aiter_tensor_t& cnt,
+            aiter_tensor_t& tiles,
+            aiter_tensor_t& ntiles,
+            aiter_tensor_t& out,
+            int64_t m,
+            int64_t topk,
+            bool w8)
 {
     aiter_detail::AiterThrowGuard throw_guard;
 
@@ -498,7 +831,11 @@ void m3_tp1_moe_g2(const aiter_tensor_t& a2,
     check_i32(num_valid_ids, 1, "num_valid_ids");
     check_i32(cnt, max_blocks, "cnt");
     check_i32(tiles, max_blocks * 4, "tiles");
-    check_i32(ntiles, 1, "ntiles");
+    check_i32(ntiles, w8 ? 9 : 1, w8 ? "ctl" : "ntiles");
+    AITER_CHECK(!w8 || m * topk * NH * 2 <= static_cast<int64_t>(W8_OOB),
+                "m3_tp1_moe_g2_w8: ",
+                m * topk,
+                " route rows exceed its 32-bit store offsets");
     if(max_blocks == 0 || m == 0)
         return;
 
@@ -515,7 +852,25 @@ void m3_tp1_moe_g2(const aiter_tensor_t& a2,
         static_cast<const int*>(num_valid_ids.data_ptr()),
         static_cast<const int*>(cnt.data_ptr()),
         static_cast<int4*>(tiles.data_ptr()),
-        static_cast<int*>(ntiles.data_ptr()));
+        static_cast<int*>(ntiles.data_ptr()),
+        w8 ? 8 : 0);
+    if(w8)
+    {
+        moe_g2_gemm_w8<<<dim3(get_num_cu_func()), dim3(512), 0, stream>>>(
+            static_cast<const uint8_t*>(a2.data_ptr()),
+            static_cast<const uint8_t*>(a2_scale.data_ptr()),
+            static_cast<const uint8_t*>(w2_b.data_ptr()),
+            static_cast<const uint8_t*>(w2_bs.data_ptr()),
+            static_cast<const int4*>(tiles.data_ptr()),
+            static_cast<int*>(ntiles.data_ptr()),
+            static_cast<const int*>(sorted_ids.data_ptr()),
+            static_cast<const float*>(sorted_weights.data_ptr()),
+            static_cast<uint16_t*>(out.data_ptr()),
+            static_cast<int>(m),
+            static_cast<int>(topk));
+        HIP_CALL(hipGetLastError());
+        return;
+    }
     // one persistent WG per CU of an MI355X
     moe_g2_gemm<<<dim3(256), dim3(256), 0, stream>>>(
         static_cast<const uint8_t*>(a2.data_ptr()),
@@ -530,6 +885,72 @@ void m3_tp1_moe_g2(const aiter_tensor_t& a2,
         static_cast<int>(m),
         static_cast<int>(topk));
     HIP_CALL(hipGetLastError());
+}
+
+} // namespace
+
+void m3_tp1_moe_g2(const aiter_tensor_t& a2,
+                   const aiter_tensor_t& a2_scale,
+                   const aiter_tensor_t& w2_b,
+                   const aiter_tensor_t& w2_bs,
+                   const aiter_tensor_t& sorted_ids,
+                   const aiter_tensor_t& sorted_weights,
+                   const aiter_tensor_t& sorted_expert_ids,
+                   const aiter_tensor_t& num_valid_ids,
+                   aiter_tensor_t& cnt,
+                   aiter_tensor_t& tiles,
+                   aiter_tensor_t& ntiles,
+                   aiter_tensor_t& out,
+                   int64_t m,
+                   int64_t topk)
+{
+    run_g2(a2,
+           a2_scale,
+           w2_b,
+           w2_bs,
+           sorted_ids,
+           sorted_weights,
+           sorted_expert_ids,
+           num_valid_ids,
+           cnt,
+           tiles,
+           ntiles,
+           out,
+           m,
+           topk,
+           false);
+}
+
+void m3_tp1_moe_g2_w8(const aiter_tensor_t& a2,
+                      const aiter_tensor_t& a2_scale,
+                      const aiter_tensor_t& w2_b,
+                      const aiter_tensor_t& w2_bs,
+                      const aiter_tensor_t& sorted_ids,
+                      const aiter_tensor_t& sorted_weights,
+                      const aiter_tensor_t& sorted_expert_ids,
+                      const aiter_tensor_t& num_valid_ids,
+                      aiter_tensor_t& cnt,
+                      aiter_tensor_t& tiles,
+                      aiter_tensor_t& ctl,
+                      aiter_tensor_t& out,
+                      int64_t m,
+                      int64_t topk)
+{
+    run_g2(a2,
+           a2_scale,
+           w2_b,
+           w2_bs,
+           sorted_ids,
+           sorted_weights,
+           sorted_expert_ids,
+           num_valid_ids,
+           cnt,
+           tiles,
+           ctl,
+           out,
+           m,
+           topk,
+           true);
 }
 
 } // namespace aiter

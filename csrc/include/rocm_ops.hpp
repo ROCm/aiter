@@ -2765,6 +2765,23 @@ namespace py = pybind11;
           py::arg("ntiles"),                                                            \
           py::arg("out"),                                                               \
           py::arg("m"),                                                                 \
+          py::arg("topk"));                                                             \
+    m.def("m3_tp1_moe_g2_w8",                                                           \
+          &aiter::m3_tp1_moe_g2_w8,                                                     \
+          "MiniMax-M3.1 TP1 ragged-tile MXFP4 MoE GEMM2 on 8 waves per CU (gfx950)",    \
+          py::arg("a2"),                                                                \
+          py::arg("a2_scale"),                                                          \
+          py::arg("w2_b"),                                                              \
+          py::arg("w2_bs"),                                                             \
+          py::arg("sorted_ids"),                                                        \
+          py::arg("sorted_weights"),                                                    \
+          py::arg("sorted_expert_ids"),                                                 \
+          py::arg("num_valid_ids"),                                                     \
+          py::arg("cnt"),                                                               \
+          py::arg("tiles"),                                                             \
+          py::arg("ctl"),                                                               \
+          py::arg("out"),                                                               \
+          py::arg("m"),                                                                 \
           py::arg("topk"));
 
 #define MHC_PYBIND                                \
