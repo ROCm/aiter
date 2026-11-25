@@ -340,6 +340,21 @@ def emit_direct_fixed_slot_payload(
             running_slot = local_expert
             if const_expr(running_half is not None):
                 running_slot = running_slot + running_half * fx.Int32(fz_epr)
+            # dedup: the token row's place does not depend on the expert offset, so it is sent before the counter
+            # atomic and overlaps its round trip.
+            if const_expr(dedup):
+                if valid_expert & ~rpf["duplicate"]:
+                    token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+                    destination_row = ptr_buf_tensor(
+                        rpf["remote"]["rx"] + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes), fx.Int32,
+                        unit_elems=4)
+                    for i in range_constexpr(len(row_values)):
+                        buf_copy_store(destination_row, lane + fx.Int32(i * 64), row_values[i], fx.Int32,
+                            unit_elems=4)
+                    if const_expr(fz_enable_scales):
+                        if lane < fx.Int32(fz_scale_n_i32):
+                            ptr_buf_tensor(rpf["remote"]["sc"] + rpf["token_scales"]
+                                + token_row * fx.Int64(fz_scale_n_i32 * 4), fx.Int32)[lane] = rpf["scale"]
             offset_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 if valid_expert:
@@ -355,19 +370,6 @@ def emit_direct_fixed_slot_payload(
             if const_expr(running_half is not None):
                 meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
 
-            if const_expr(dedup):
-                if publish & ~rpf["duplicate"]:
-                    token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
-                    destination_row = ptr_buf_tensor(
-                        rpf["remote"]["rx"] + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes), fx.Int32,
-                        unit_elems=4)
-                    for i in range_constexpr(len(row_values)):
-                        buf_copy_store(destination_row, lane + fx.Int32(i * 64), row_values[i], fx.Int32,
-                            unit_elems=4)
-                    if const_expr(fz_enable_scales):
-                        if lane < fx.Int32(fz_scale_n_i32):
-                            ptr_buf_tensor(rpf["remote"]["sc"] + rpf["token_scales"]
-                                + token_row * fx.Int64(fz_scale_n_i32 * 4), fx.Int32)[lane] = rpf["scale"]
             if publish:
                 if const_expr(not dedup):
                     destination_row = ptr_buf_tensor(
