@@ -4,7 +4,8 @@
 """Standalone builds of the RDNA attention kernels, called through ctypes.
 
 One shared object per build, of any knobs, compiled straight from
-csrc/kernels/rdna_attn: the points tune.py searches are not in the tables.
+csrc/kernels/rdna_attn with the HIP flags of module_rdna_attn: the points
+tune.py searches are not in the tables.
 After `install()`, this module picks and loads builds as
 `aiter.ops.rdna_attn` does (it is a `kernels` of harness.py), with the knobs
 of `override()` on top of the tables' entry.
@@ -16,6 +17,7 @@ import dataclasses
 import functools
 import hashlib
 import os
+import shlex
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +25,7 @@ from pathlib import Path
 
 import torch
 
+from aiter.jit import core
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.cpp_extension import ROCM_HOME
 from aiter.ops import rdna_attn as R
@@ -168,6 +171,20 @@ def _toolchain() -> tuple[list[str], str]:
     return [str(clang), f"--rocm-path={rocm}"], str(rocm / "lib")
 
 
+@functools.cache
+def _module_flags() -> list[str]:
+    """The HIP flags module_rdna_attn's kernels are built with, so a build
+    here is the code a module would hold: aiter's defaults less the ones the
+    module leaves out, those this compiler takes."""
+    left_out = core.get_args_of_build(R.MD_NAME)["flags_hip_exclude"]
+    flags = [
+        f
+        for f in sorted(set(core.default_hip_flags()))
+        if f not in left_out and core.hip_flag_checker(f)
+    ]
+    return [word for f in flags for word in shlex.split(f)]
+
+
 def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
     """Compile one variant, cached by a hash of the sources and command."""
     prefill = isinstance(v, R.PrefillVariant)
@@ -195,6 +212,7 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
         "-fPIC",
         "-shared",
         "-Wno-unused-variable",
+        *_module_flags(),
         # Builds loaded together need distinct kernel names.
         f"-D{kernel}={kernel}_{hashlib.sha256(tag.encode()).hexdigest()[:16]}",
         f"-DABLATE={_ablate}",

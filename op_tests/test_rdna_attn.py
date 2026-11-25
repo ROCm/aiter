@@ -29,15 +29,17 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import rdna_attn as hip
-from aiter.ops.torch_ref.rdna_attn import full_attention, paged_attention
+from aiter.ops.torch_ref.rdna_attn import full_attention, paged_attention, row_scale
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201"]
 
 # Relative error bound per dtype, for decode.
 TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
-# Absolute error bound per dtype, for prefill.
-PREFILL_TOL = {torch.float16: 4e-3, torch.bfloat16: 2e-2}
+# Error bound per dtype for prefill, relative to row_scale: the builds measure
+# at most 1.5e-3 (fp16) and 1.3e-2 (bf16) of it on gfx1151, with or without a
+# prefix.
+PREFILL_TOL = {torch.float16: 4e-3, torch.bfloat16: 3e-2}
 DTYPES = list(TOL)
 # Launches timed per row: a full run times every build of the tables.
 ITERS = 20
@@ -115,19 +117,25 @@ def _assert_decode_close(got, ref, v, what) -> float:
 
 
 def _assert_prefill_close(got, ref, dtype, what) -> float:
-    """Every element within the prefill bound of its reference; the mismatch
-    fraction (0)."""
+    """Every element within the prefill bound of its reference, relative to
+    its row's scale; the mismatch fraction (0)."""
     tol = PREFILL_TOL[dtype]
+    scale = row_scale(ref)
     err = checkAllclose(
-        ref,
-        got.float().nan_to_num(1e9),
+        ref / scale,
+        got.float().nan_to_num(1e9) / scale,
         rtol=0,
         atol=tol,
         msg=f"{what}: ",
         printLog=False,
     )
-    assert err == 0, f"{what}: {err:.2%} of elements outside {tol}"
+    assert err == 0, f"{what}: {err:.2%} of elements outside {tol} of their row"
     return err
+
+
+def _row_rel(a, b) -> float:
+    """Largest difference of two references, relative to b's row scale."""
+    return ((a - b).abs() / row_scale(b)).max().item()
 
 
 def _visible_keys(m: int, s: int, window: int) -> int:
@@ -465,9 +473,9 @@ def _launch_prefill_batch(v, q, kv, block_table, starts, seq_lens, out, mm_range
 
 
 @benchmark()
-def test_prefill_batch(hq, hkv, d, window, dtype, batch):
+def test_prefill_batch(hq, hkv, d, window, page, dtype, batch):
     """A batch in one planned launch, each sequence against its reference."""
-    v = hip.prefill_variants(hq, hkv, d, 16, window, dtype)[0]
+    v = hip.prefill_variants(hq, hkv, d, page, window, dtype)[0]
     # A prefix has to outgrow the window to be cut by it.
     lens = [(m, s + window if m != s else s) for m, s in BATCHES[batch]]
     q, kv, block_table, starts, seq_lens = _prefill_batch(v, lens)
@@ -598,9 +606,16 @@ def test_encoder(hq, hkv, d, dtype, segments):
         (torch.randn(n, h, d, device="cuda") * 0.5).to(dtype) for h in (hq, hkv, hkv)
     )
     assert hip.encoder_unsupported(q, hkv) is None
-    out, us = run_perftest(
+    _, us = run_perftest(
         hip.encoder_forward, q, k, v, lens, d**-0.5, num_iters=ITERS, num_rotate_args=1
     )
+    # encoder_forward allocates its output, and the allocator hands back the
+    # block a correct output just left: rows it did not write would still hold
+    # the right values. A NaN-filled block of that size, freed, takes its place.
+    poison = torch.full(q.shape, float("nan"), dtype=dtype, device=q.device)
+    del poison
+    out = hip.encoder_forward(q, k, v, lens, d**-0.5)
+    torch.cuda.synchronize()
     assert out.shape == q.shape and out.dtype == dtype
     err, start = 0, 0
     for i, s in enumerate(lens):
@@ -653,7 +668,7 @@ def check_prefill_batch_lookup():
         (32, 8, 128, 16, 0, 1): [(1, 0, 16, 8), (1, 2048, 128, 1), (256, 512, 512, 4)]
     }
     real = hip._prefill_batch_table
-    hip._prefill_batch_table = lambda: table
+    hip._prefill_batch_table = lambda device=None: table
     try:
         cell = functools.partial(hip.prefill_batch_cell, 32, 8, 128, 16, 0)
         assert cell(4, 100) == (16, 8)
@@ -1057,6 +1072,9 @@ def check_prefill_mm_prefix(shape, m, prefix, mm_ranges):
     torch.cuda.synchronize()
     ref = paged_attention(q, kv, seq_len, window, mm_ranges, block_table)
     _assert_prefill_close(out, ref, dtype, f"{v}, M={m}, ranges={mm_ranges}")
+    # The ranges must show: a kernel that ignored them would match this.
+    causal = paged_attention(q, kv, seq_len, window, block_table=block_table)
+    assert _row_rel(causal, ref) > 10 * PREFILL_TOL[dtype], "the ranges changed nothing"
 
 
 def check_prefill_batch_mm_prefix(shape):
@@ -1078,6 +1096,11 @@ def check_prefill_batch_mm_prefix(shape):
         pages = block_table[i, : -(-s // v.page_size)]
         ref = paged_attention(q[rows], kv, s, window, ranges[i], pages)
         _assert_prefill_close(out[rows], ref, dtype, f"sequence {i} (M={m}, S={s})")
+        if ranges[i]:
+            causal = paged_attention(q[rows], kv, s, window, block_table=pages)
+            assert (
+                _row_rel(causal, ref) > 10 * PREFILL_TOL[dtype]
+            ), f"sequence {i}: its ranges changed nothing"
 
 
 def check_encoder_segments():
@@ -1147,6 +1170,7 @@ def check_refusals():
             *hip.make_scratch(v, dev),
             seq_lens,
             hip._builds(0).index(other),
+            hip._fingerprint(hip.config_fields(other)),
             scale,
         ),
     )
@@ -1168,6 +1192,61 @@ def check_refusals():
                 bad,
             ),
         )
+
+    # The index of a build travels with the fingerprint of its fields: a
+    # module whose tables hold another entry there refuses it.
+    _refused(
+        "is not the entry that was looked up",
+        lambda: hip.rdna_decode_attn(
+            q,
+            kv,
+            block_table,
+            torch.empty_like(q),
+            *hip.make_scratch(v, dev),
+            seq_lens,
+            module.index,
+            module.fingerprint ^ 1,
+            scale,
+        ),
+    )
+
+    # The kernels address the cache as packed HND pages of the build's page
+    # size and kv heads, and Q and the output as contiguous rows of its heads.
+    def decode(**changed):
+        args = {
+            "q": q,
+            "kv": kv,
+            "table": block_table,
+            "out": torch.empty_like(q),
+            "scratch": hip.make_scratch(v, dev),
+            "lens": seq_lens,
+        }
+        args.update(changed)
+        return lambda: module.decode_attn(
+            args["q"],
+            args["kv"],
+            args["table"],
+            args["out"],
+            *args["scratch"],
+            args["lens"],
+            scale,
+        )
+
+    nhd = kv.transpose(1, 2).contiguous().transpose(1, 2)
+    _refused("kv_cache must be packed HND", decode(kv=nhd))
+    _refused("kv_cache must be packed HND", decode(kv=kv[:, :, : v.page_size // 2]))
+    _refused("kv_cache must be packed HND", decode(kv=kv[:, :1]))
+    _refused("q shape does not match the build", decode(q=q[:, :1].contiguous()))
+    strided_out = torch.empty(
+        q.shape[0], q.shape[1], 2 * q.shape[2], dtype=q.dtype, device=dev
+    )[..., ::2]
+    _refused("q and out must be contiguous", decode(out=strided_out))
+    _refused("block table must be int32", decode(table=block_table.long()))
+    _refused("seq_lens must be a contiguous int32", decode(lens=seq_lens.long()))
+    acc, m_, l_, cnt = hip.make_scratch(v, dev)
+    _refused("scratch must be float32", decode(scratch=(acc, m_, l_, cnt.float())))
+    _refused("scratch too small", decode(scratch=(acc[:1], m_, l_, cnt)))
+    _refused("every tensor must be on GPU", decode(lens=seq_lens.cpu()))
 
     # A block table without pages: the kernel would index before its start.
     _refused(
@@ -1456,6 +1535,9 @@ def summarize(name, rows):
 
 
 def main():
+    if not torch.cuda.is_available():
+        aiter.logger.warning("rdna_attn needs a GPU; skipping")
+        return
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning("rdna_attn unsupported on %s; skipping", get_gfx_runtime())
         return
@@ -1508,9 +1590,6 @@ def main():
     decode_shapes = shapes_of(hip.variants())
     causal_shapes = shapes_of(v for v in _prefill_rows() if v.causal)
     non_causal_shapes = shapes_of(v for v in _prefill_rows() if not v.causal)
-    # Batches run on the page size a server's cache has by default.
-    batch_shapes = [s[:4] for s in causal_shapes if s[4] == 16]
-
     for dtype in args.dtype:
         name = _dtype_name(dtype)
         summarize(
@@ -1538,9 +1617,9 @@ def main():
         summarize(
             f"rdna prefill batch {name}",
             [
-                test_prefill_batch(hq, hkv, d, window, dtype, batch)
-                for (hq, hkv, d, window), batch in itertools.product(
-                    batch_shapes, BATCHES
+                test_prefill_batch(hq, hkv, d, window, page, dtype, batch)
+                for (hq, hkv, d, window, page), batch in itertools.product(
+                    causal_shapes, BATCHES
                 )
             ],
         )

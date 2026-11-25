@@ -7,9 +7,30 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+
 #include "rdna_attn_types.h"
 
 namespace rdna {
+
+// What a launch needs to know of its GPU (WGPs, resident workgroups), computed
+// once per device: a launch goes to the current device, and a process may
+// hold GPUs of one family and different sizes. `cache` is one zeroed slot per
+// device; `compute(device)` returns a value >= 0.
+inline constexpr int kMaxDevices = 64;
+
+template <typename Compute>
+int per_device(std::atomic<int>* cache, Compute&& compute) {
+  int device = 0;
+  (void)hipGetDevice(&device);
+  if (device < 0 || device >= kMaxDevices) return compute(device);
+  int known = cache[device].load(std::memory_order_relaxed);
+  if (known == 0) {
+    known = compute(device) + 1;
+    cache[device].store(known, std::memory_order_relaxed);
+  }
+  return known - 1;
+}
 
 // Raw pointers keep the tensor types out of the kernels. Mirrored by
 // op_tests/op_benchmarks/rdna_attn/jit.py.

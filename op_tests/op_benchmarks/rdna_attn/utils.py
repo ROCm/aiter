@@ -10,7 +10,8 @@ import os
 # per-kernel dispatch overhead under a HIP graph (us), DRAM round trip (us)
 # and cycles of one 16x16x16 f16 WMMA; gfx1201's on an RX 9070 XT. The GPU is
 # the current device's (RDNA_ROOFLINE_ARCH overrides it, e.g. to analyse
-# results elsewhere); any other GPU gets gfx1151's.
+# results elsewhere). A GPU without peaks of its own gets those of the GPU
+# whose tables it uses, which are not its own: PEAKS_MEASURED tells.
 PEAKS = {
     "gfx1151": (230.0, 43.0, 80, 1.48, 0.545, 32),
     "gfx1150": (81.0, 17.2, 32, 1.48, 0.545, 32),
@@ -30,9 +31,15 @@ def _arch() -> str:
         return "gfx1151"
 
 
-PEAK_GIBS, PEAK_TFLOPS, SIMDS, DISPATCH_US, DRAM_LATENCY_US, WMMA_CYCLES = PEAKS.get(
-    _arch(), PEAKS["gfx1151"]
-)
+# The GPU whose tables, and here whose peaks, an arch without its own uses.
+_TABLES_OF = {"gfx1152": "gfx1150", "gfx1153": "gfx1150", "gfx1200": "gfx1201"}
+ARCH = _arch()
+# Whether the roofline is of this GPU, not of the one whose tables it uses.
+PEAKS_MEASURED = ARCH in PEAKS
+PEAKS_ARCH = ARCH if PEAKS_MEASURED else _TABLES_OF.get(ARCH, "gfx1151")
+PEAK_GIBS, PEAK_TFLOPS, SIMDS, DISPATCH_US, DRAM_LATENCY_US, WMMA_CYCLES = PEAKS[
+    PEAKS_ARCH
+]
 
 # Prefill model (roofline(realistic=True)): whole 16x16 score tiles, plus
 # SOFTMAX_CYCLES of VALU work per tile that does not overlap the WMMAs.

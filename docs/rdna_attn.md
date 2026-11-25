@@ -43,6 +43,13 @@ compiled at once:
 A module is built for the GPU families of `GPU_ARCHS` (by default, of the GPUs
 of the machine). Each family's kernels are compiled for its archs only.
 
+A build is looked up in `module_rdna_attn` and launched by its index in a
+kernel module, which holds its own copy of the tables. Each launch carries a
+fingerprint of the entry's fields, and a module whose tables hold another
+entry at that index refuses it: after changing the table headers by hand,
+remove the built `module_rdna_attn*` (`tune.py --apply` does). Lookups take
+the `device` they are for; a process may hold GPUs of several families.
+
 The tables were tuned on kernels compiled without two of the HIP flags aiter
 adds to every module, `-mllvm --lsr-drop-solution=1` and
 `-mllvm -enable-post-misched=0`. With them the 128-dim prefill kernels run 10
@@ -81,7 +88,7 @@ if rdna_attn.encoder_unsupported(q, hkv) is None:
 
 A batch of sequences takes `variant_for(..., batch=True)` for decode, and
 `prefill_batch_variant_for` with `plan_prefill` for prefill; see
-`_serve_batch` in `op_tests/test_rdna_attn.py`.
+`_launch_prefill_batch` in `op_tests/test_rdna_attn.py`.
 
 `block_table` and `seq_lens` are int32. `layout` is 1 (HND), the only one
 built.

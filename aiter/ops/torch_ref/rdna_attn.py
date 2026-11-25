@@ -93,3 +93,16 @@ def full_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
         ],
         dim=1,
     )
+
+
+def row_scale(ref: torch.Tensor) -> torch.Tensor:
+    """What an output element's error is judged against: its own magnitude,
+    or its row's RMS if larger.
+
+    A kernel that takes P or V in 16 bits errs in proportion to what a row
+    (one token and head) adds up, not to each element: an element near zero is
+    as far off as its neighbours. And a row over many keys is small, about
+    1 / sqrt(keys) of one over few, so a bound that is absolute, or scaled by
+    the largest output, lets a wrong row through.
+    """
+    return torch.maximum(ref.abs(), ref.pow(2).mean(-1, keepdim=True).sqrt())

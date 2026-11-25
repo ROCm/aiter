@@ -27,7 +27,9 @@ Decodes of up to ``MAX_M`` query tokens per sequence run on the decode builds
 (``prefill_variant_for``, ``load_prefill``; a batch through
 ``prefill_batch_variant_for`` and ``plan_prefill``), and an encoder's
 non-causal attention on ``encoder_forward``. A lookup returns None for a shape
-without a build.
+without a build. The tables are a GPU family's: lookups take the ``device``
+they are for (the current one by default), and a launch on a device of another
+family than the one a build was looked up for is refused.
 """
 
 import functools
@@ -113,6 +115,7 @@ def rdna_decode_attn(
     cnt: torch.Tensor,
     seq_lens: torch.Tensor,
     config: int,
+    fingerprint: int,
     scale: float,
     mm_ranges: torch.Tensor | None = None,
     batched: bool = False,
@@ -130,6 +133,7 @@ def rdna_prefill_attn(
     counters: torch.Tensor,
     seq_lens: torch.Tensor,
     config: int,
+    fingerprint: int,
     max_seq_len: int,
     scale: float,
     mm_ranges: torch.Tensor | None = None,
@@ -150,6 +154,7 @@ def rdna_encoder_attn(
     counters: torch.Tensor,
     seq_lens: torch.Tensor,
     config: int,
+    fingerprint: int,
     max_seq_len: int,
     scale: float,
     plan: torch.Tensor | None = None,
@@ -181,7 +186,30 @@ def device_family(device: torch.device | None = None) -> str | None:
     default): "GFX1151", "GFX1150" or "GFX1201", or None on other GPUs."""
     if not torch.cuda.is_available():
         return None
-    return _FAMILY_OF_ARCH.get(get_gfx_runtime_for_device(_device_id(device)))
+    return _family_of(_device_id(device))
+
+
+@functools.cache
+def _family_of(device_id: int) -> str | None:
+    return _FAMILY_OF_ARCH.get(get_gfx_runtime_for_device(device_id))
+
+
+@functools.cache
+def _device_of(family: str) -> int:
+    """A device of a GPU family, to list its tables."""
+    return next(i for i in range(torch.cuda.device_count()) if _family_of(i) == family)
+
+
+def _fingerprint(fields: list[int]) -> int:
+    """A digest of a table entry's fields (FNV-1a over them as 64-bit
+    little-endian ints), as csrc/py_itfs_cu/rdna_attn.cu computes it: a launch
+    carries it, and a module whose tables hold another entry at that index
+    refuses the launch."""
+    h = 14695981039346656037
+    for field in fields:
+        for byte in field.to_bytes(8, "little", signed=True):
+            h = ((h ^ byte) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h & 0x7FFFFFFFFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -294,44 +322,58 @@ def _lookup_key(v: KernelVariant) -> tuple:
     )
 
 
-def _built_fields(op, fields: tuple[str, ...]) -> list[dict[str, int]]:
-    """The entries of a table of the current device as fields, by index; none
-    on a GPU without tables."""
-    if device_family() is None:
+def _built_fields(
+    op, fields: tuple[str, ...], family: str | None
+) -> list[dict[str, int]]:
+    """The entries of a table of a GPU family as fields, by index; none
+    without a family."""
+    if family is None:
         return []
-    flat = op(_device_id())
+    flat = op(_device_of(family))
     n = len(fields)
     return [
         dict(zip(fields, flat[i : i + n], strict=True)) for i in range(0, len(flat), n)
     ]
 
 
-def _built_configs(op, fields: tuple[str, ...]) -> list[dict]:
+def _built_configs(op, fields: tuple[str, ...], family: str | None) -> list[dict]:
     """_built_fields with the dtype as a torch dtype."""
-    configs = _built_fields(op, fields)
+    configs = _built_fields(op, fields, family)
     for f in configs:
         f["dtype"] = torch.bfloat16 if f["dtype"] else torch.float16
     return configs
 
 
+# The tables are a GPU family's, so every lookup is of a device's family (the
+# current device's by default) and every cache is per family: a process may
+# hold GPUs of several.
+
+
 @functools.cache
-def _builds(batched: int = 0) -> list[KernelVariant]:
-    """The decode builds of the current device's tables, by index."""
+def _family_builds(batched: int, family: str | None) -> list[KernelVariant]:
     op = rdna_decode_batch_configs if batched else rdna_decode_configs
     return [
         KernelVariant(**f, layout=_HND, batched=batched)
-        for f in _built_configs(op, DECODE_CONFIG_FIELDS)
+        for f in _built_configs(op, DECODE_CONFIG_FIELDS, family)
     ]
 
 
+def _builds(
+    batched: int = 0, device: torch.device | None = None
+) -> list[KernelVariant]:
+    """The decode builds of a device's tables, by index."""
+    return _family_builds(batched, device_family(device))
+
+
 @functools.cache
-def _by_key() -> dict[tuple, KernelVariant]:
-    return {_lookup_key(v): v for v in variants()}
+def _by_key(family: str | None) -> dict[tuple, KernelVariant]:
+    builds = _family_builds(0, family) + _family_builds(1, family)
+    return {_lookup_key(v): v for v in builds}
 
 
-def variants() -> list[KernelVariant]:
-    """Every decode build of the current device's tables."""
-    return _builds(0) + _builds(1)
+def variants(device: torch.device | None = None) -> list[KernelVariant]:
+    """Every decode build of a device's tables."""
+    return _builds(0, device) + _builds(1, device)
 
 
 def variant_for(
@@ -344,11 +386,12 @@ def variant_for(
     window: int,
     dtype: torch.dtype,
     batch: bool = False,
+    device: torch.device | None = None,
 ) -> KernelVariant | None:
-    """The build for one call, or None."""
+    """The build of a device's tables for one call, or None."""
     if layout != _HND:
         return None
-    return _by_key().get(
+    return _by_key(device_family(device)).get(
         (
             num_q_heads,
             num_kv_heads,
@@ -365,9 +408,10 @@ def variant_for(
 class _Builtin:
     """A decode build, by its index in its table."""
 
-    def __init__(self, index: int, batched: int):
+    def __init__(self, index: int, variant: KernelVariant):
         self.index = index
-        self.batched = bool(batched)
+        self.batched = bool(variant.batched)
+        self.fingerprint = _fingerprint(config_fields(variant))
 
     def decode_attn(
         self,
@@ -397,26 +441,26 @@ class _Builtin:
             cnt,
             seq_lens,
             self.index,
+            self.fingerprint,
             scale,
             mm_ranges,
             self.batched,
         )
 
 
-_loaded: dict[KernelVariant, _Builtin | None] = {}
+_loaded: dict[tuple[KernelVariant, str | None], _Builtin | None] = {}
 
 
-def load(variant: KernelVariant) -> _Builtin | None:
-    """The variant's launcher, or None if the device's tables lack it. Its
-    module is built at the first launch."""
-    if variant not in _loaded:
-        builds = _builds(variant.batched)
-        _loaded[variant] = (
-            _Builtin(builds.index(variant), variant.batched)
-            if variant in builds
-            else None
+def load(variant: KernelVariant, device: torch.device | None = None) -> _Builtin | None:
+    """The variant's launcher on a device, or None if the device's tables lack
+    it. Its module is built at the first launch."""
+    family = device_family(device)
+    if (variant, family) not in _loaded:
+        builds = _family_builds(variant.batched, family)
+        _loaded[variant, family] = (
+            _Builtin(builds.index(variant), variant) if variant in builds else None
         )
-    return _loaded[variant]
+    return _loaded[variant, family]
 
 
 def make_scratch(
@@ -546,19 +590,22 @@ def prefill_config_fields(variant: PrefillVariant) -> list[int]:
 
 
 @functools.cache
-def _prefill_builds() -> list[PrefillVariant]:
-    """The prefill builds of the current device's tables, by index."""
+def _family_prefill_builds(family: str | None) -> list[PrefillVariant]:
     return [
         PrefillVariant(**f)
-        for f in _built_configs(rdna_prefill_configs, PREFILL_CONFIG_FIELDS)
+        for f in _built_configs(rdna_prefill_configs, PREFILL_CONFIG_FIELDS, family)
     ]
 
 
+def _prefill_builds(device: torch.device | None = None) -> list[PrefillVariant]:
+    """The prefill builds of a device's tables, by index."""
+    return _family_prefill_builds(device_family(device))
+
+
 @functools.cache
-def _prefill_table() -> dict[tuple, list[PrefillVariant]]:
-    """The builds by M per (Hq, Hkv, D, page, window, dtype, causal)."""
+def _family_prefill_table(family: str | None) -> dict[tuple, list[PrefillVariant]]:
     table: dict[tuple, list[PrefillVariant]] = {}
-    for v in _prefill_builds():
+    for v in _family_prefill_builds(family):
         key = (
             v.num_q_heads,
             v.num_kv_heads,
@@ -574,6 +621,13 @@ def _prefill_table() -> dict[tuple, list[PrefillVariant]]:
     return table
 
 
+def _prefill_table(
+    device: torch.device | None = None,
+) -> dict[tuple, list[PrefillVariant]]:
+    """The builds by M per (Hq, Hkv, D, page, window, dtype, causal)."""
+    return _family_prefill_table(device_family(device))
+
+
 def prefill_variants(
     num_q_heads: int,
     num_kv_heads: int,
@@ -582,9 +636,10 @@ def prefill_variants(
     window: int,
     dtype: torch.dtype,
     causal: bool = True,
+    device: torch.device | None = None,
 ) -> list[PrefillVariant]:
-    """Every row of one shape, sorted by M."""
-    return _prefill_table().get(
+    """Every row of one shape in a device's tables, sorted by M."""
+    return _prefill_table(device).get(
         (num_q_heads, num_kv_heads, head_size, page_size, window, dtype, int(causal)),
         [],
     )
@@ -600,12 +655,13 @@ def prefill_variant_for(
     dtype: torch.dtype,
     num_tokens: int,
     causal: bool = True,
+    device: torch.device | None = None,
 ) -> PrefillVariant | None:
     """The row for num_tokens query tokens, or None."""
     if layout != _HND or num_tokens < PREFILL_MIN_M:
         return None
     rows = prefill_variants(
-        num_q_heads, num_kv_heads, head_size, page_size, window, dtype, causal
+        num_q_heads, num_kv_heads, head_size, page_size, window, dtype, causal, device
     )
     served = [v for v in rows if v.min_query_len <= num_tokens]
     return served[-1] if served else (rows[0] if rows else None)
@@ -655,11 +711,13 @@ def prefill_batch_features(
 
 
 @functools.cache
-def _prefill_batch_table() -> dict[tuple, list[tuple[int, int, int, int]]]:
-    """Per (Hq, Hkv, D, page, window, causal), its cells (min mean M, min keys,
-    min_query_len, head group)."""
+def _family_prefill_batch_table(
+    family: str | None,
+) -> dict[tuple, list[tuple[int, int, int, int]]]:
     table: dict[tuple, list[tuple[int, int, int, int]]] = {}
-    for f in _built_fields(rdna_prefill_batch_configs, PREFILL_BATCH_CONFIG_FIELDS):
+    for f in _built_fields(
+        rdna_prefill_batch_configs, PREFILL_BATCH_CONFIG_FIELDS, family
+    ):
         key = (
             f["num_q_heads"],
             f["num_kv_heads"],
@@ -674,6 +732,14 @@ def _prefill_batch_table() -> dict[tuple, list[tuple[int, int, int, int]]]:
     return table
 
 
+def _prefill_batch_table(
+    device: torch.device | None = None,
+) -> dict[tuple, list[tuple[int, int, int, int]]]:
+    """Per (Hq, Hkv, D, page, window, causal), its cells (min mean M, min keys,
+    min_query_len, head group) in a device's tables."""
+    return _family_prefill_batch_table(device_family(device))
+
+
 def prefill_batch_cell(
     num_q_heads: int,
     num_kv_heads: int,
@@ -683,9 +749,10 @@ def prefill_batch_cell(
     mean_m: float,
     keys: float,
     causal: bool = True,
+    device: torch.device | None = None,
 ) -> tuple[int, int] | None:
     """(min_query_len, head group) of the cell a batch falls in, or None."""
-    cells = _prefill_batch_table().get(
+    cells = _prefill_batch_table(device).get(
         (num_q_heads, num_kv_heads, head_size, page_size, window, int(causal))
     )
     if not cells:
@@ -709,16 +776,14 @@ def prefill_batch_variant_for(
     query_start_loc: np.ndarray,
     seq_lens: np.ndarray,
     causal: bool = True,
+    device: torch.device | None = None,
 ) -> tuple[PrefillVariant | None, int]:
     """The build and head group for a prefill batch: its cell's, else the
     build of its tokens."""
     mean_m, keys = prefill_batch_features(query_start_loc, seq_lens, window, causal)
-    cell = prefill_batch_cell(
-        num_q_heads, num_kv_heads, head_size, page_size, window, mean_m, keys, causal
-    )
-    rows = prefill_variants(
-        num_q_heads, num_kv_heads, head_size, page_size, window, dtype, causal
-    )
+    shape = (num_q_heads, num_kv_heads, head_size, page_size, window)
+    cell = prefill_batch_cell(*shape, mean_m, keys, causal, device)
+    rows = prefill_variants(*shape, dtype, causal, device)
     if cell is not None and layout == _HND:
         row = next((v for v in rows if v.min_query_len == cell[0]), None)
         if row is not None:
@@ -734,6 +799,7 @@ def prefill_batch_variant_for(
         dtype,
         max(tokens, PREFILL_MIN_M),
         causal,
+        device,
     )
     return v, 0
 
@@ -836,8 +902,9 @@ def plan_prefill(
 class _BuiltinPrefill:
     """A prefill build, by its index in its table."""
 
-    def __init__(self, index: int):
+    def __init__(self, index: int, variant: PrefillVariant):
         self.index = index
+        self.fingerprint = _fingerprint(prefill_config_fields(variant))
 
     def prefill_attn(
         self,
@@ -869,6 +936,7 @@ class _BuiltinPrefill:
             counters,
             seq_lens,
             self.index,
+            self.fingerprint,
             max_seq_len,
             scale,
             mm_ranges,
@@ -905,6 +973,7 @@ class _BuiltinPrefill:
             counters,
             seq_lens,
             self.index,
+            self.fingerprint,
             max_seq_len,
             scale,
             plan,
@@ -913,18 +982,23 @@ class _BuiltinPrefill:
         )
 
 
-_prefill_loaded: dict[PrefillVariant, _BuiltinPrefill | None] = {}
+_prefill_loaded: dict[tuple[PrefillVariant, str | None], _BuiltinPrefill | None] = {}
 
 
-def load_prefill(variant: PrefillVariant) -> _BuiltinPrefill | None:
-    """The variant's launcher, or None if the device's tables lack it. Its
-    module is built at the first launch."""
-    if variant not in _prefill_loaded:
-        builds = _prefill_builds()
-        _prefill_loaded[variant] = (
-            _BuiltinPrefill(builds.index(variant)) if variant in builds else None
+def load_prefill(
+    variant: PrefillVariant, device: torch.device | None = None
+) -> _BuiltinPrefill | None:
+    """The variant's launcher on a device, or None if the device's tables lack
+    it. Its module is built at the first launch."""
+    family = device_family(device)
+    if (variant, family) not in _prefill_loaded:
+        builds = _family_prefill_builds(family)
+        _prefill_loaded[variant, family] = (
+            _BuiltinPrefill(builds.index(variant), variant)
+            if variant in builds
+            else None
         )
-    return _prefill_loaded[variant]
+    return _prefill_loaded[variant, family]
 
 
 def make_prefill_scratch(
@@ -964,7 +1038,9 @@ def encoder_unsupported(q: torch.Tensor, num_kv_heads: int) -> str | None:
         return f"head size {d}"
     if hq % num_kv_heads:
         return "q heads must divide evenly over kv heads"
-    if not prefill_variants(hq, num_kv_heads, d, ENCODER_PAGE_SIZE, 0, q.dtype, False):
+    if not prefill_variants(
+        hq, num_kv_heads, d, ENCODER_PAGE_SIZE, 0, q.dtype, False, q.device
+    ):
         return f"no non-causal build for {hq}/{num_kv_heads}/{d} {q.dtype}"
     return None
 
@@ -999,13 +1075,13 @@ def _encoder_layout(
     if len(lens) == 1:
         # The first row also serves fewer than PREFILL_MIN_M tokens.
         variant = prefill_variant_for(
-            *shape, _HND, 0, dtype, max(int(lens[0]), PREFILL_MIN_M), causal=False
+            *shape, _HND, 0, dtype, max(int(lens[0]), PREFILL_MIN_M), False, dev
         )
         assert variant is not None, "encoder_unsupported checks the builds"
         return _EncoderLayout(variant, to_dev(lens), None, None, 0, int(lens[0]))
     starts = np.concatenate([[0], np.cumsum(lens)])
     variant, head_group = prefill_batch_variant_for(
-        *shape, _HND, 0, dtype, starts, lens, causal=False
+        *shape, _HND, 0, dtype, starts, lens, False, dev
     )
     assert variant is not None, "encoder_unsupported checks the builds"
     plan, head_group = plan_prefill(
@@ -1069,7 +1145,7 @@ def encoder_forward(
     hq, d, hkv = q.shape[1], q.shape[2], k.shape[1]
     lay = _encoder_layout(tuple(seg_lens), hq, hkv, d, dtype, dev)
     q, k, v = _heads_contiguous(q), _heads_contiguous(k), _heads_contiguous(v)
-    prefill = load_prefill(lay.variant)
+    prefill = load_prefill(lay.variant, dev)
     assert prefill is not None
     shape = (hq, hkv, d, ENCODER_PAGE_SIZE, 0, dtype)
     # A launch's partials and counters are its own until it ends: launches of
@@ -1078,7 +1154,7 @@ def encoder_forward(
     scratch = _ENCODER_SCRATCH.get(key)
     if scratch is None or scratch[1].numel() < 2 * lay.variant.scratch_rows(dev):
         scratch = make_prefill_scratch(
-            [*prefill_variants(*shape, causal=False), lay.variant], dev
+            [*prefill_variants(*shape, causal=False, device=dev), lay.variant], dev
         )
         _ENCODER_SCRATCH[key] = scratch
     if lay.plan is None or lay.plan.shape[0]:

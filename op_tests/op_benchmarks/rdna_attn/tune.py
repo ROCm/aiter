@@ -51,8 +51,9 @@ LONG_S, LONG_TARGET = 16384, 0.90
 KNOBS = utils.KNOBS
 # Relative error bound per dtype, for decode.
 RTOL = {"fp16": 1e-3, "bf16": 8e-3}
-# Absolute error bound per dtype against the float reference, for prefill.
-PREFILL_ATOL = {"fp16": 5e-3, "bf16": 3e-2}
+# Error bound per dtype against the float reference for prefill, relative to
+# row_scale (aiter/ops/torch_ref/rdna_attn.py).
+PREFILL_RTOL = {"fp16": 4e-3, "bf16": 3e-2}
 
 # Search space; Hkv * row_groups * max_segments is capped at MAX_WG.
 GRID = {
@@ -787,7 +788,7 @@ def tune_prefill(a) -> None:
     import torch
 
     from aiter.ops import rdna_attn as R
-    from aiter.ops.torch_ref.rdna_attn import paged_attention
+    from aiter.ops.torch_ref.rdna_attn import paged_attention, row_scale
 
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
@@ -801,7 +802,7 @@ def tune_prefill(a) -> None:
         (m, p): utils.roofline(hq, hkv, d, m, m + p, itemsize, bs, win, True)[0]
         for m, p in cells
     }
-    tol = PREFILL_ATOL[a.dtype]
+    tol = PREFILL_RTOL[a.dtype]
     fixed = {
         "kind": "prefill",
         "hq": hq,
@@ -905,7 +906,9 @@ def tune_prefill(a) -> None:
                     run = op(module, v, q, kv, table, sl, out)
                     run()
                     torch.cuda.synchronize()
-                    err = (out.float().nan_to_num(1e9) - ref).abs().max()
+                    err = (
+                        (out.float().nan_to_num(1e9) - ref).abs() / row_scale(ref)
+                    ).max()
                     if not err.item() <= tol:
                         rec.update(status="wrong", cell=[m, p], err=err.item())
                         break
@@ -1123,7 +1126,7 @@ def tune_prefill_non_causal(a) -> None:
     import torch
 
     from aiter.ops import rdna_attn as R
-    from aiter.ops.torch_ref.rdna_attn import full_attention
+    from aiter.ops.torch_ref.rdna_attn import full_attention, row_scale
 
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
@@ -1135,7 +1138,7 @@ def tune_prefill_non_causal(a) -> None:
     flops = [4.0 * hq * d * m * m for m in cells]
     weight = {c: math.sqrt(f / sum(flops)) for c, f in zip(cells, flops)}
     roof = {m: utils.roofline_noncausal(hq, hkv, d, [m])[0] for m in cells}
-    tol = PREFILL_ATOL[a.dtype]
+    tol = PREFILL_RTOL[a.dtype]
     fixed = {
         "kind": "prefill",
         "causal": 0,
@@ -1238,7 +1241,10 @@ def tune_prefill_non_causal(a) -> None:
                     run = op(module, v, m, out)
                     run()
                     torch.cuda.synchronize()
-                    err = (out.float().nan_to_num(1e9) - inputs(m)[4]).abs().max()
+                    ref = inputs(m)[4]
+                    err = (
+                        (out.float().nan_to_num(1e9) - ref).abs() / row_scale(ref)
+                    ).max()
                     if not err.item() <= tol:
                         rec.update(status="wrong", cell=m, err=err.item())
                         break
@@ -1781,6 +1787,10 @@ def _trailing_defaults(names: tuple[str, ...]) -> list[int]:
     return tail
 
 
+# The headers written by this run.
+_WRITTEN: list[Path] = []
+
+
 def write_configs(
     path: Path,
     lines: list[str],
@@ -1809,10 +1819,22 @@ def write_configs(
     ]
     text = lines[: at.start] + entries + lines[at.stop :]
     path.write_text("\n".join(text) + "\n")
+    _WRITTEN.append(path)
 
 
 def apply(path: str, block_sizes: list[int]) -> None:
-    """Write the accepted decisions of `path` into the configs headers."""
+    """Write the accepted decisions of `path` into the configs headers, and
+    remove the modules built from the headers as they were."""
+    try:
+        _apply(path, block_sizes)
+    finally:
+        # Also when a decision fails after others were written: a header that
+        # changed must not meet modules built from the old one.
+        if _WRITTEN:
+            rebuild_modules()
+
+
+def _apply(path: str, block_sizes: list[int]) -> None:
     import jit
     import torch
 
@@ -1899,22 +1921,21 @@ def apply(path: str, block_sizes: list[int]) -> None:
             headers[batched], lines, list(rows.values()), R.DECODE_CONFIG_FIELDS, family
         )
     print(f"# {written} rows written")
-    if written:
-        rebuild_modules()
 
 
 def rebuild_modules() -> None:
-    """Remove the built module_rdna_attn*: they hold the tables as they were,
-    and are rebuilt from the headers at their next use."""
+    """Remove every built module_rdna_attn* and its build directory: they hold
+    the tables as they were, objects of an interrupted build included (ninja
+    does not see a header change), and are rebuilt at their next use."""
     from aiter.jit import core
 
     jit_dir = Path(core.get_user_jit_dir())
-    removed = 0
-    for so in jit_dir.glob("module_rdna_attn*.so"):
-        core.clear_build(so.stem)
-        so.unlink()
-        removed += 1
-    print(f"# {removed} built module_rdna_attn* removed, to rebuild from the tables")
+    names = {so.stem for so in jit_dir.glob("module_rdna_attn*.so")}
+    names |= {d.name for d in (jit_dir / "build").glob("module_rdna_attn*")}
+    for name in sorted(names):
+        core.clear_build(name)
+        core.rm_module(name)
+    print(f"# {len(names)} built module_rdna_attn* removed, to rebuild from the tables")
 
 
 def main() -> None:

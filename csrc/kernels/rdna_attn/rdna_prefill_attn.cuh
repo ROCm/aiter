@@ -1327,9 +1327,10 @@ void launch_prefill(const PrefillArgs& a) {
   // The WGPs, and the workgroups resident in each: as many as its LDS and its
   // SIMDs' waves allow, with the waves the kernel was built for. A WGP with
   // fewer VGPRs than 4 SIMDs x 32 lanes x 1536 is a 1024-VGPR one.
-  static const auto [numWgps, wgpWorkgroups] = [] {
-    int device, n = 0, regs = 0;
-    (void)hipGetDevice(&device);
+  static std::atomic<int> wgpsCache[kMaxDevices];
+  // The WGPs in the high half, the workgroups resident in each in the low one.
+  const int wgps = per_device(wgpsCache, [](int device) {
+    int n = 0, regs = 0;
     (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount,
                                 device);
     (void)hipDeviceGetAttribute(
@@ -1339,8 +1340,9 @@ void launch_prefill(const PrefillArgs& a) {
     const int waves = smallVgprs ? P::kSmallVgprWavesPerSimd : P::kWavesPerSimd;
     const int resident = std::min(kWgpLdsBytes / P::kLdsBudget,
                                   waves * kSimdsPerWgp / P::kWaves);
-    return std::pair{std::max(1, n), std::max(1, resident)};
-  }();
+    return (std::max(1, n) << 16) | std::max(1, resident);
+  });
+  const int numWgps = wgps >> 16, wgpWorkgroups = wgps & 0xFFFF;
   if (a.plan) {
     const int headGroup = a.head_group ? a.head_group : P::kHeadGroup;
     hipLaunchKernelGGL(

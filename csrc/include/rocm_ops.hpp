@@ -1674,6 +1674,7 @@ namespace py = pybind11;
           py::arg("cnt"),                                                         \
           py::arg("seq_lens"),                                                    \
           py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
           py::arg("scale"),                                                       \
           py::arg("mm_ranges") = std::nullopt,                                    \
           py::arg("batched")   = false);                                          \
@@ -1692,6 +1693,7 @@ namespace py = pybind11;
           py::arg("counters"),                                                    \
           py::arg("seq_lens"),                                                    \
           py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
           py::arg("max_seq_len"),                                                 \
           py::arg("scale"),                                                       \
           py::arg("mm_ranges")       = std::nullopt,                              \
@@ -1709,6 +1711,7 @@ namespace py = pybind11;
           py::arg("counters"),                                                    \
           py::arg("seq_lens"),                                                    \
           py::arg("config"),                                                      \
+          py::arg("fingerprint"),                                                 \
           py::arg("max_seq_len"),                                                 \
           py::arg("scale"),                                                       \
           py::arg("plan")            = std::nullopt,                              \

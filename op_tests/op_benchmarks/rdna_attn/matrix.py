@@ -308,6 +308,11 @@ def main() -> None:
     )
     args = p.parse_args()
     dtype = utils.torch_dtype(args.dtype)
+    if not utils.PEAKS_MEASURED:
+        print(
+            f"<!-- no peaks measured on {utils.ARCH}: the roofline and %roof are "
+            f"{utils.PEAKS_ARCH}'s -->"
+        )
 
     import harness
     import jit

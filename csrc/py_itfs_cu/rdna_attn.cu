@@ -193,17 +193,51 @@ int* ints(aiter_tensor_t& t) { return static_cast<int*>(t.data_ptr()); }
 
 float* floats(aiter_tensor_t& t) { return static_cast<float*>(t.data_ptr()); }
 
+// An entry's fields in order, as the listings give them.
+std::vector<int64_t> fields_of(const DecodeConfig& c) {
+  return {static_cast<int>(c.head_dim), c.num_q_heads, c.num_kv_heads, c.window,
+          c.max_query_len, static_cast<int>(c.dtype), c.page_size,
+          c.max_segments, c.row_groups, c.min_segment_blocks, c.waves,
+          c.head_dim_split, c.prefetch, c.v_in_lds, c.dot_product};
+}
+
+std::vector<int64_t> fields_of(const PrefillConfig& c) {
+  return {static_cast<int>(c.head_dim), c.num_q_heads, c.num_kv_heads, c.window,
+          static_cast<int>(c.dtype), c.page_size, c.min_query_len, c.waves,
+          c.key_tile, c.head_dim_split, c.v_t, c.double_buffer, c.key_waves,
+          c.max_segments, c.head_group, c.causal, c.row_tiles};
+}
+
+// A digest of an entry's fields (FNV-1a over them as 64-bit little-endian
+// ints), as aiter/ops/rdna_attn.py computes it from a listing.
+int64_t fingerprint(const std::vector<int64_t>& fields) {
+  uint64_t h = 14695981039346656037ull;
+  for (const int64_t field : fields)
+    for (int byte = 0; byte < 8; ++byte) {
+      h ^= (static_cast<uint64_t>(field) >> (8 * byte)) & 0xFF;
+      h *= 1099511628211ull;
+    }
+  return static_cast<int64_t>(h & 0x7FFFFFFFFFFFFFFFull);
+}
+
+// The caller looked `config` up in the tables of a module that lists them
+// (module_rdna_attn) and of the device it expected; this module resolves the
+// index in its own copy of the tables, of q's device. They must be one entry.
+template <typename Config>
+void check_entry(const Config& c, int64_t config, int64_t expected) {
+  AITER_CHECK(fingerprint(fields_of(c)) == expected, "build ", config,
+             " is not the entry that was looked up: the tables of this module "
+             "differ from those of the module or device it was looked up in. "
+             "Remove the built module_rdna_attn* to rebuild them from one "
+             "source, and look builds up for the device they launch on");
+}
+
 // Every entry of a decode table, its DecodeConfig fields in order.
 std::vector<int64_t> decode_configs(const DecodeConfig* configs, int64_t n) {
   std::vector<int64_t> fields;
   for (int64_t i = 0; i < n; ++i) {
-    const DecodeConfig& c = configs[i];
-    fields.insert(
-        fields.end(),
-        {static_cast<int>(c.head_dim), c.num_q_heads, c.num_kv_heads, c.window,
-         c.max_query_len, static_cast<int>(c.dtype), c.page_size,
-         c.max_segments, c.row_groups, c.min_segment_blocks, c.waves,
-         c.head_dim_split, c.prefetch, c.v_in_lds, c.dot_product});
+    const std::vector<int64_t> entry = fields_of(configs[i]);
+    fields.insert(fields.end(), entry.begin(), entry.end());
   }
   return fields;
 }
@@ -252,13 +286,8 @@ std::vector<int64_t> rdna_prefill_configs(int64_t device_id) {
   std::vector<int64_t> fields;
   const Table t = device_table(device_id);
   for (int64_t i = 0; i < t.num_prefill; ++i) {
-    const PrefillConfig& c = t.prefill[i];
-    fields.insert(
-        fields.end(),
-        {static_cast<int>(c.head_dim), c.num_q_heads, c.num_kv_heads, c.window,
-         static_cast<int>(c.dtype), c.page_size, c.min_query_len, c.waves,
-         c.key_tile, c.head_dim_split, c.v_t, c.double_buffer, c.key_waves,
-         c.max_segments, c.head_group, c.causal, c.row_tiles});
+    const std::vector<int64_t> entry = fields_of(t.prefill[i]);
+    fields.insert(fields.end(), entry.begin(), entry.end());
   }
   return fields;
 }
@@ -298,7 +327,8 @@ void rdna_decode_attn(aiter_tensor_t& q,
                       aiter_tensor_t& kv_cache, aiter_tensor_t& block_table,
                       aiter_tensor_t& out, aiter_tensor_t& acc,
                       aiter_tensor_t& m, aiter_tensor_t& l, aiter_tensor_t& cnt,
-                      aiter_tensor_t& seq_lens, int64_t config, float scale,
+                      aiter_tensor_t& seq_lens, int64_t config,
+                      int64_t fingerprint, float scale,
                       std::optional<aiter_tensor_t> mm_ranges, bool batched) {
   const aiter_detail::AiterThrowGuard throw_guard;
   using namespace rdna;
@@ -310,6 +340,7 @@ void rdna_decode_attn(aiter_tensor_t& q,
   AITER_CHECK(launchers[config], batched ? "batched " : "", "decode build ",
              config, kNoUnit);
   const DecodeConfig& c = batched ? t.decode_batch[config] : t.decode[config];
+  check_entry(c, config, fingerprint);
   const int maxm = c.max_query_len;
   AITER_CHECK(q.is_contiguous() && out.is_contiguous(),
              "q and out must be contiguous");
@@ -439,7 +470,8 @@ void rdna_prefill_attn(aiter_tensor_t& q,
                        aiter_tensor_t& kv_cache, aiter_tensor_t& block_table,
                        aiter_tensor_t& out, aiter_tensor_t& partial_o,
                        aiter_tensor_t& partial_ml, aiter_tensor_t& counters,
-                       aiter_tensor_t& seq_lens, int64_t config, int64_t max_seq_len,
+                       aiter_tensor_t& seq_lens, int64_t config,
+                       int64_t fingerprint, int64_t max_seq_len,
                        float scale, std::optional<aiter_tensor_t> mm_ranges,
                        std::optional<aiter_tensor_t> plan,
                        std::optional<aiter_tensor_t> query_start_loc,
@@ -451,6 +483,7 @@ void rdna_prefill_attn(aiter_tensor_t& q,
              config);
   AITER_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
   const PrefillConfig& c = t.prefill[config];
+  check_entry(c, config, fingerprint);
   AITER_CHECK(c.causal, "a non-causal build runs through rdna_encoder_attn");
   AITER_CHECK(q.dim() == 3 && q.is_contiguous() && out.is_contiguous(),
              "q and out must be contiguous (tokens, heads, head dim)");
@@ -552,7 +585,7 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
                        aiter_tensor_t& v, aiter_tensor_t& out,
                        aiter_tensor_t& partial_o, aiter_tensor_t& partial_ml,
                        aiter_tensor_t& counters, aiter_tensor_t& seq_lens,
-                       int64_t config,
+                       int64_t config, int64_t fingerprint,
                        int64_t max_seq_len, float scale,
                        std::optional<aiter_tensor_t> plan,
                        std::optional<aiter_tensor_t> query_start_loc,
@@ -564,6 +597,7 @@ void rdna_encoder_attn(aiter_tensor_t& q, aiter_tensor_t& k,
              config);
   AITER_CHECK(t.prefill_launchers[config], "prefill build ", config, kNoUnit);
   const PrefillConfig& c = t.prefill[config];
+  check_entry(c, config, fingerprint);
   AITER_CHECK(!c.causal, "a causal build runs through rdna_prefill_attn");
   const int d = static_cast<int>(c.head_dim);
   AITER_CHECK(q.dim() == 3, "q must be (tokens, heads, head dim)");

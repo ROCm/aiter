@@ -9,7 +9,8 @@
 // build of a kernel, its shape and launch knobs compile-time constants. The
 // rdna_*_configs functions list the entries of the tables of a device's
 // family, in every module; rdna_{decode,prefill,encoder}_attn launch one by
-// its index, in the module built for its head dim and dtype
+// its index, in the module built for its head dim and dtype, and refuse it
+// unless its fields have the fingerprint of the entry the caller looked up
 // (csrc/kernels/rdna_attn/rdna_attn_unit.cuh). aiter/ops/rdna_attn.py picks
 // the entry and the module.
 #pragma once
@@ -42,6 +43,7 @@ void rdna_decode_attn(aiter_tensor_t& q,
                       aiter_tensor_t& cnt,
                       aiter_tensor_t& seq_lens,
                       int64_t config,
+                      int64_t fingerprint,
                       float scale,
                       std::optional<aiter_tensor_t> mm_ranges,
                       bool batched);
@@ -63,6 +65,7 @@ void rdna_prefill_attn(aiter_tensor_t& q,
                        aiter_tensor_t& counters,
                        aiter_tensor_t& seq_lens,
                        int64_t config,
+                       int64_t fingerprint,
                        int64_t max_seq_len,
                        float scale,
                        std::optional<aiter_tensor_t> mm_ranges,
@@ -81,6 +84,7 @@ void rdna_encoder_attn(aiter_tensor_t& q,
                        aiter_tensor_t& counters,
                        aiter_tensor_t& seq_lens,
                        int64_t config,
+                       int64_t fingerprint,
                        int64_t max_seq_len,
                        float scale,
                        std::optional<aiter_tensor_t> plan,

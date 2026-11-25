@@ -1398,10 +1398,10 @@ void launch_decode(const LaunchArgs& a) {
                 "a batched build runs the WMMA decomposition");
   // Row group fastest, then kv head, then segment.
   dim3 grid(K::kGrid, a.nseq), threads(K::kThreads);
-  static const int residentWorkgroups = [&] {
+  static std::atomic<int> residentCache[kMaxDevices];
+  const int residentWorkgroups = per_device(residentCache, [](int device) {
     if (!K::kSharedMerge) return 0;
-    int device, numWgps, perWgp = 0;
-    (void)hipGetDevice(&device);
+    int numWgps = 0, perWgp = 0;
     (void)hipDeviceGetAttribute(&numWgps, hipDeviceAttributeMultiprocessorCount,
                                 device);
     (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -1429,19 +1429,19 @@ void launch_decode(const LaunchArgs& a) {
       perWgp = std::max(perWgp, std::min(byWaves, byLds));
     }
     return perWgp * numWgps;
-  }();
+  });
   // The shared merge needs the whole grid resident.
   int cooperative = (int)(residentWorkgroups >= (int)(grid.x * grid.y));
   DecodeBatch batch{};
   if constexpr (kBatched) {
     // Cap the segments per sequence near kBatchWorkgroupsPerWgp per WGP.
-    static const int batchTarget = [] {
-      int device, numWgps = 1;
-      (void)hipGetDevice(&device);
+    static std::atomic<int> batchTargetCache[kMaxDevices];
+    const int batchTarget = per_device(batchTargetCache, [](int device) {
+      int numWgps = 1;
       (void)hipDeviceGetAttribute(
           &numWgps, hipDeviceAttributeMultiprocessorCount, device);
       return K::kBatchWorkgroupsPerWgp * std::max(1, numWgps);
-    }();
+    });
     const int groups = K::kGrid / K::kMaxSegments;
     cooperative |=
         std::max(1, (batchTarget + a.nseq * groups - 1) / (a.nseq * groups))
