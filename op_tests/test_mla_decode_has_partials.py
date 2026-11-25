@@ -5,8 +5,8 @@ split rows.
 
 A sparse plan built with ``kv_granularity`` >= the row width puts each row in
 one work item, so ``reduce_indptr[-1] == 0``. Passing ``has_partials=False``
-leaves the split buffers empty and skips the reduce launch. The output and the
-final LSE must be bitwise equal to the default call, and the reduce dispatch
+leaves the split buffers empty and skips the reduce launch. The output (and
+the final LSE when requested) must be bitwise equal to the default call, and the reduce dispatch
 must not be reached.
 
 CI runs this via ``python3 op_tests/test_mla_decode_has_partials.py`` (also
@@ -85,7 +85,6 @@ def _case(rows, heads):
             page_size=1,
             num_kv_splits=16,
             sm_scale=D**-0.5,
-            return_lse=True,
             **work,
             **kw,
         )
@@ -95,25 +94,27 @@ def _case(rows, heads):
     return call
 
 
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("rows", [64, 256])
-def test_has_partials_false_matches_default(rows, heads):
-    if (
-        get_mla_decode_shape_support(heads, 1, bf16, bf16, return_lse=True).supported
-        is not True
-    ):
+def test_has_partials_false_matches_default(rows, heads, return_lse):
+    support = get_mla_decode_shape_support(heads, 1, bf16, bf16, return_lse=return_lse)
+    if support.supported is not True:
         pytest.skip(f"no persistent bf16 kernel for {heads} heads")
     call = _case(rows, heads)
-    o_ref, lse_ref = call()
+    o_ref, lse_ref = call(return_lse=return_lse)
     with patch.object(
         aiter.mla,
         "_mla_decode_reduce_v1_dispatch",
         side_effect=AssertionError("reduce launched"),
     ):
-        o, lse = call(has_partials=False)
+        o, lse = call(return_lse=return_lse, has_partials=False)
     assert not o.isnan().any()
     assert torch.equal(o.view(torch.int16), o_ref.view(torch.int16))
-    assert torch.equal(lse.view(torch.int32), lse_ref.view(torch.int32))
+    if return_lse:
+        assert torch.equal(lse.view(torch.int32), lse_ref.view(torch.int32))
+    else:
+        assert lse is None and lse_ref is None
 
 
 if __name__ == "__main__":
