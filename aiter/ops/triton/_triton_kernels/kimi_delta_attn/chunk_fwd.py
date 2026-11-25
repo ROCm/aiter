@@ -13,6 +13,8 @@ Pipeline:
   4. Output:       compute final output via chunk_gla_fwd_o (gated q * h + A * v).
 """
 
+import functools
+
 import torch
 
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
@@ -186,7 +188,13 @@ def chunk_delta_attn_fwd(
         )
 
     if use_flash_kda:
-        o, final_state = flash_kda_fwd(
+        fwd = flash_kda_fwd
+        if snapshot_targets is not None or snapshot_out is not None:
+            # Named only when set: `input_guard` rebuilds every name it is passed.
+            fwd = functools.partial(
+                fwd, snapshot_targets=snapshot_targets, snapshot_out=snapshot_out
+            )
+        o, final_state = fwd(
             q=q,
             k=k,
             v=v,
@@ -205,8 +213,6 @@ def chunk_delta_attn_fwd(
             state_cache=state_cache,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            snapshot_targets=snapshot_targets,
-            snapshot_out=snapshot_out,
         )
         return o, final_state, None, None, None, None, None, None, None
 

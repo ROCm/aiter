@@ -34,6 +34,8 @@ Notes on the fla-compatible surface:
       tensor.
 """
 
+import functools
+
 import torch
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
@@ -292,7 +294,13 @@ def chunk_kimi_delta_attn(
     # state_cache is not packed: stride(0) may be padded. Packing it would
     # copy the pool and write a clone.
 
-    o, final_state, *_ = chunk_delta_attn_fwd(
+    fwd = chunk_delta_attn_fwd
+    if snapshot_targets is not None or snapshot_out is not None:
+        # Named only when set: each name passed costs host time at every hop.
+        fwd = functools.partial(
+            fwd, snapshot_targets=snapshot_targets, snapshot_out=snapshot_out
+        )
+    o, final_state, *_ = fwd(
         q=q,
         k=k,
         v=v,
@@ -318,7 +326,5 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
-        snapshot_targets=snapshot_targets,
-        snapshot_out=snapshot_out,
     )
     return o.to(q.dtype), final_state

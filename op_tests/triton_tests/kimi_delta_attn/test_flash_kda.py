@@ -884,6 +884,64 @@ def test_public_wrapper_routes_to_flash_kda(monkeypatch):
     assert rel_err(ht_fkda, ht_ref) < 2e-2
 
 
+def test_public_wrapper_names_snapshot_arguments_only_when_set(monkeypatch):
+    """A call without snapshot arguments passes neither name at either hop.
+
+    Each name passed costs host time in the callee and in ``input_guard``, so
+    a call without them must look as it did before they existed.
+    """
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, 256, 4)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "scale": scale,
+        "chunk_size": FLASH_KDA_CHUNK,
+        "safe_gate": True,
+        "lower_bound": LOWER_BOUND,
+        "use_gate_in_kernel": True,
+        "use_qk_l2norm_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "output_final_state": True,
+    }
+    names = {"snapshot_targets", "snapshot_out"}
+    seen = {}
+
+    def spy(hop, real):
+        def call(**kw):
+            seen[hop] = kw.keys() & names
+            return real(**kw)
+
+        return call
+
+    public = importlib.import_module(chunk_kimi_delta_attn.__module__)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", True)
+    monkeypatch.setattr(
+        public, "chunk_delta_attn_fwd", spy("fwd", public.chunk_delta_attn_fwd)
+    )
+    monkeypatch.setattr(
+        _chunk_fwd, "flash_kda_fwd", spy("flash", _chunk_fwd.flash_kda_fwd)
+    )
+
+    chunk_kimi_delta_attn(**kwargs)
+    assert seen == {"fwd": set(), "flash": set()}
+
+    off = 2 * FLASH_KDA_CHUNK
+    snaps = torch.full(
+        (1, 4, K_DIM, K_DIM), float("nan"), device=device, dtype=torch.float32
+    )
+    chunk_kimi_delta_attn(**kwargs, snapshot_targets=((0, off),), snapshot_out=snaps)
+    assert seen == {"fwd": names, "flash": names}
+
+    head = {n: kwargs[n][:, :off] for n in ("q", "k", "v", "g", "beta")}
+    _, ht = chunk_kimi_delta_attn(**{**kwargs, **head})
+    assert rel_err(snaps[0], ht[0]) < 2e-2
+
+
 def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
     """``chunk_size=None`` has to resolve the way the dispatch goes.
 
