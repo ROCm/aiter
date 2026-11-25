@@ -50,6 +50,44 @@ from aiter.ops.triton._gluon_kernels.gfx1250.gemm.fused.fused_gemm_a16w16_router
 
 
 @gluon.jit
+def _vzero(x):
+    """0 in every lane, opaque and divergent (a VGPR inline asm): an atomic on ptr + _vzero(..) is not turned into one
+    lane's atomic + readfirstlane, so its return is waited for only where it is used."""
+    return gl.inline_asm_elementwise("v_mov_b32 $0, 0", "=v,v", [x], dtype=gl.int32, is_pure=False, pack=1)
+
+
+@gluon.jit
+def _vkeep(x):
+    """x through an opaque move: the uses of x below it (and the wait for x) stay below it."""
+    return gl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [x], dtype=gl.int32, is_pure=False, pack=1)
+
+
+@gluon.jit
+def _xcd_pid(pid, P: gl.constexpr, XCD_RANKS: gl.constexpr):
+    """The program's logical id under XCD_RANKS (4 bits a XCD: its rank in dispatch-start order): the grid has
+    P8 = 8 * ceil(P / 8) programs, program pid runs on XCD pid % 8, and logical ids fill the XCDs by rank, so the
+    low ids (router units, route tiles: the critical chain) start first. -1: a padding program."""
+    P8: gl.constexpr = (P + 7) // 8 * 8
+    lid = ((XCD_RANKS >> ((pid % 8) * 4)) & 0xF) * (P8 // 8) + pid // 8
+    return gl.where(lid < P, lid, -1)
+
+
+@gluon.jit
+def _split_poll(cnt_ptr, target, ws_ptr, CNT_SPLIT: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """Wait until the CNT_SPLIT arrival counters (128 B apart) sum to target: one volatile load of them a poll."""
+    L: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    lane = gl.arange(0, 32, layout=L)
+    ptrs = cnt_ptr + gl.where(lane < CNT_SPLIT, lane, 0) * 32
+    c = gl.sum(gl.where(lane < CNT_SPLIT, gl.load(ptrs, volatile=True), 0), axis=0)
+    n = 0
+    while (c < target) & (n < SPIN_MAX):
+        c = gl.sum(gl.where(lane < CNT_SPLIT, gl.load(ptrs, volatile=True), 0), axis=0)
+        n += 1
+    if n >= SPIN_MAX:
+        gl.atomic_add(ws_ptr, 1, sem="relaxed", scope="gpu")
+
+
+@gluon.jit
 def _ce(x, y):
     return gl.maximum(x, y), gl.minimum(x, y)
 
@@ -127,6 +165,42 @@ def _unit_acc(x_ptr, w_ptr, M, N, K: gl.constexpr, stride_xm, nb,
 
 
 @gluon.jit
+def _unit_issue(x_ptr, w_ptr, M, N, K: gl.constexpr, stride_xm, nb,
+                BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BKT: gl.constexpr,
+                SHARED_A: gl.constexpr, SHARED_B: gl.constexpr, ROWS: gl.constexpr):
+    """`_unit_acc`'s TDM loads (all of K in flight); returns the LDS buffers for `_unit_mma`."""
+    NKT: gl.constexpr = K // BKT
+    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=x_ptr, shape=(M, K), strides=(stride_xm, 1), block_shape=(BLOCK_M, BKT), layout=SHARED_A)
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=w_ptr + nb * ROWS * K, shape=(gl.minimum(N - nb * ROWS, ROWS), K), strides=(K, 1),
+        block_shape=(BLOCK_N, BKT), layout=SHARED_B)
+    a_buf = gl.allocate_shared_memory(x_ptr.type.element_ty, shape=[NKT, BLOCK_M, BKT], layout=SHARED_A)
+    b_buf = gl.allocate_shared_memory(w_ptr.type.element_ty, shape=[NKT, BLOCK_N, BKT], layout=SHARED_B)
+    for k in gl.static_range(NKT):
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, k * BKT], b_buf.index(k))
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, k * BKT], a_buf.index(k))
+    return a_buf, b_buf
+
+
+@gluon.jit
+def _unit_mma(a_buf, b_buf, K: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BKT: gl.constexpr,
+              BKC: gl.constexpr, WMMA: gl.constexpr, OP_A: gl.constexpr, OP_B: gl.constexpr):
+    """`_unit_acc`'s K chain on the buffers `_unit_issue` filled (the same WMMA sequence: bitwise)."""
+    NKT: gl.constexpr = K // BKT
+    NC: gl.constexpr = BKT // BKC
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA)
+    for k in gl.static_range(NKT):
+        gl.amd.gfx1250.tdm.async_wait((NKT - 1 - k) * 2)
+        for c in gl.static_range(NC):
+            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_buf.index(k).slice(c * BKC, BKC, 1), OP_A)
+            cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                b_buf.index(k).slice(c * BKC, BKC, 1).permute([1, 0]), OP_B)
+            acc = gl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+    return acc
+
+
+@gluon.jit
 def _rstd_rows(ssq_ptr, stride_sm, M, eps, K: gl.constexpr, BLOCK_M: gl.constexpr, NSSQ: gl.constexpr,
                NUM_WARPS: gl.constexpr, OUT: gl.constexpr):
     """ATOM_FOLD_POSTNORM: the post-attention RMSNorm's 1 / rms of rows [0, BLOCK_M) from the producer GEMM's
@@ -145,6 +219,7 @@ def _route_tile_v2(
     ws_ptr, lsc_ptr, M: gl.constexpr, stride_xm, LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr,
     WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr, NUM_WARPS: gl.constexpr, RPT: gl.constexpr,
     ssq_ptr=None, nw_ptr=None, stride_sm=0, eps=0.0, NSSQ: gl.constexpr = 1, PRENORM: gl.constexpr = 0,
+    LATE_WAIT: gl.constexpr = 0,
 ):
     """fold 1's route tile (topkGatingSoftmax<renorm> top-8, routing tables, MXFP4 activation quant to the
     grouped rows), bit for bit, with the handoffs above."""
@@ -262,7 +337,10 @@ def _route_tile_v2(
     c_waves = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, CL))
     c_lead = (c_waves[:, None] + c_lanes[None, :]) == 0
     c_zero = c_waves[:, None] * 0 + c_lanes[None, :] * 0
-    c_used = gl.atomic_add(fws_ptr + 3 + c_zero, c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
+    if LATE_WAIT:
+        c_used = gl.atomic_add(fws_ptr + 3 + _vzero(c_zero), c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
+    else:
+        c_used = gl.atomic_add(fws_ptr + 3 + c_zero, c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
 
     # ---- 5. routing ---------------------------------------------------------------------------------
     cnt = _bcnt(tm)
@@ -289,6 +367,8 @@ def _route_tile_v2(
             gl.amd.gfx1250.buffer_store(sdw, scale_ptr, base + sdi * (WMMA_REP * 16))
 
     # ---- 7. the last tile out restores the shared state for the next launch ---------------------------
+    if LATE_WAIT:
+        c_used = _vkeep(c_used)
     c_last = c_lead & (c_used == NT - 1)
     gl.atomic_xchg(fws_ptr + 3 + c_zero, c_zero, mask=c_last, sem="relaxed", scope="gpu")
     if gl.sum(c_last.to(gl.int32), axis=None) > 0:
@@ -316,7 +396,16 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
     LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr, WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr,
     RPT: gl.constexpr,
     ssq_ptr=None, nw_ptr=None, stride_sm=0, eps=0.0, NSSQ: gl.constexpr = 1, PRENORM: gl.constexpr = 0,
+    LATE_WAIT: gl.constexpr = 0, XCD_RANKS: gl.constexpr = 0, CNT_SPLIT: gl.constexpr = 1,
+    EARLY_RSTD: gl.constexpr = 0,
 ):
+    # EARLY_RSTD (AITER_ROUTER_SHARED_V2_EARLY_RSTD, with PRENORM): the post-norm rstd's loads go out after the units'
+    # weight loads, not after their GEMM. Bitwise.
+    # CNT_SPLIT (AITER_ROUTER_SHARED_V2_CNT_SPLIT): the gate/up arrivals go to CNT_SPLIT counters 128 B apart (not
+    # all to one L2 line); the down tiles poll them with one load. Bitwise.
+    # LATE_WAIT (AITER_ROUTER_SHARED_V2_LATE_WAIT): the count-out atomics' returns are waited for where they are used
+    # (the route tiles' at the end, the down tiles count out right after their poll), not right after the atomic.
+    # XCD_RANKS (AITER_ROUTER_SHARED_V2_XCD_ORDER): logical program ids by XCD start order (_xcd_pid). Both bitwise.
     # PRENORM (ATOM_FOLD_POSTNORM): x is the residual sum h + r, not its post-attention RMSNorm; ssq holds its
     # rows' per-tile sums of squares (the producer GEMM's epilogue) and nw the norm weight. The router and gate/up
     # weights come pre-scaled by (1 + nw) (the caller's), so x_norm @ W^T = rstd * (x @ W'^T): the units scale
@@ -331,6 +420,10 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
     NKT2: gl.constexpr = KD // BKT2
     NC2: gl.constexpr = BKT2 // BLOCK_K2
     pid = gl.program_id(axis=0)
+    if XCD_RANKS != 0:
+        pid = _xcd_pid(pid, P, XCD_RANKS)
+        if pid < 0:
+            return
     cnt_ptr = ws_ptr + WS_HEADER
     use_ptr = cnt_ptr + WS_MAX_MB
     zi = pid * 0
@@ -349,42 +442,66 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
 
     # router unit: logits of ROWS_R router rows -> output and the flag scratch
     if pid < N_R:
-        acc = _unit_acc(x_ptr, wr_ptr, M, NR_ROWS, K, stride_xm, pid, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
-                        SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_R)
-        if PRENORM:
-            acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
+        if EARLY_RSTD and PRENORM:
+            # the rstd's loads under the weight loads (the same values and multiply)
+            a_b, b_b = _unit_issue(x_ptr, wr_ptr, M, NR_ROWS, K, stride_xm, pid, BLOCK_M, BLOCK_N1, BKT1,
+                                   SHARED_A1, SHARED_B1, ROWS_R)
+            rs_r = _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)
+            acc = _unit_mma(a_b, b_b, K, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1, WMMA1, OP_A1, OP_B1)
+            acc = acc * rs_r[:, None]
+        else:
+            acc = _unit_acc(x_ptr, wr_ptr, M, NR_ROWS, K, stride_xm, pid, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
+                            SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_R)
+            if PRENORM:
+                acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
         _store_tile(acc, lsc_ptr, M, pid * ROWS_R + ROWS_R, LSC_STRIDE, zi, pid * ROWS_R, WMMA1, ".cg")
         _store_tile(acc, logits_ptr, M, gl.minimum(pid * ROWS_R + ROWS_R, NR), stride_lm, zi, pid * ROWS_R,
                     WMMA1, "")
     if pid < NQ:
         _route_tile_v2(pid, x_ptr, logits_ptr, nvr_ptr, tw_ptr, tid_ptr, rows_ptr, mm_ptr, psum_ptr, pay_ptr,
                        scale_ptr, fws_ptr, ws_ptr, lsc_ptr, M, stride_xm, LSC_STRIDE, ALIGN_M, WMMA_REP, HAS_NVR,
-                       NUM_WARPS, RPT, ssq_ptr, nw_ptr, stride_sm, eps, NSSQ, PRENORM)
+                       NUM_WARPS, RPT, ssq_ptr, nw_ptr, stride_sm, eps, NSSQ, PRENORM, LATE_WAIT)
     # gate/up unit: h[:, g*HG : g*HG+HG] = silu(gate) * up (gate, up rounded to bf16 first, as
     # gemm_a16w16_gated), device-scope stores, then one arrival a wave
     g = pid - PQ0
     if (g >= 0) & (g < N_GU):
-        acc = _unit_acc(x_ptr, wgu_ptr, M, NGU, K, stride_xm, g, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
-                        SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_G)
-        if PRENORM:
-            acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
+        if EARLY_RSTD and PRENORM:
+            a_b, b_b = _unit_issue(x_ptr, wgu_ptr, M, NGU, K, stride_xm, g, BLOCK_M, BLOCK_N1, BKT1,
+                                   SHARED_A1, SHARED_B1, ROWS_G)
+            rs_g = _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)
+            acc = _unit_mma(a_b, b_b, K, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1, WMMA1, OP_A1, OP_B1)
+            acc = acc * rs_g[:, None]
+        else:
+            acc = _unit_acc(x_ptr, wgu_ptr, M, NGU, K, stride_xm, g, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
+                            SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_G)
+            if PRENORM:
+                acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
         gate, up = gl.split(gl.reshape(acc, [BLOCK_M, HALF, 2]))
         gate = gate.to(h_ptr.type.element_ty).to(gl.float32)
         up = up.to(h_ptr.type.element_ty).to(gl.float32)
         hv = gate / (1.0 + gl.exp(-gate)) * up
         hv = gl.convert_layout(hv, STORE1)
         _store_tile(hv, h_ptr, M, g * HG + HG, stride_hm, zi, g * HG, STORE1, H_CACHE)
-        _wave_arrive(cnt_ptr, NUM_WARPS)
+        if CNT_SPLIT > 1:
+            _wave_arrive(cnt_ptr + (g % CNT_SPLIT) * 32, NUM_WARPS)
+        else:
+            _wave_arrive(cnt_ptr, NUM_WARPS)
     # down tile: wait for every gate/up unit, h -> LDS, WMMA over K = I in order, store
     if is_down:
-        ok = gl.atomic_poll(cnt_ptr, N_GU * NUM_WARPS, sem="relaxed", scope="gpu", timeout_ns=TIMEOUT_NS)
-        if not ok:
-            gl.atomic_add(ws_ptr, 1, sem="relaxed", scope="gpu")
+        if CNT_SPLIT > 1:
+            _split_poll(cnt_ptr, N_GU * NUM_WARPS, ws_ptr, CNT_SPLIT, NUM_WARPS)
+        else:
+            ok = gl.atomic_poll(cnt_ptr, N_GU * NUM_WARPS, sem="relaxed", scope="gpu", timeout_ns=TIMEOUT_NS)
+            if not ok:
+                gl.atomic_add(ws_ptr, 1, sem="relaxed", scope="gpu")
         L: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [NUM_WARPS, 1], [1, 0])
         lanes = gl.arange(0, 32, layout=gl.SliceLayout(0, L))
         waves = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, L))
         lead = (waves[:, None] + lanes[None, :]) == 0
         zero = waves[:, None] * 0 + lanes[None, :] * 0
+        if LATE_WAIT:
+            # the poll above was this tile's last read of the counter: count it out now, use the value at the end
+            used = gl.atomic_add(use_ptr + _vzero(zero), zero + 1, mask=lead, sem="relaxed", scope="gpu")
         a2_buf = gl.allocate_shared_memory(h_ptr.type.element_ty, shape=[NKT2, BLOCK_M, BKT2], layout=SHARED_A2)
         a2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=h_ptr, shape=(M, KD), strides=(stride_hm, 1), block_shape=(BLOCK_M, BKT2), layout=SHARED_A2)
@@ -401,9 +518,14 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
                 acc2 = gl.amd.gfx1250.wmma(cur_a, cur_b, acc2)
         _store_tile(acc2, out_ptr, M, ND, stride_om, zi, d * BLOCK_N2, WMMA2, "")
         # count this consumer; the last one clears the counters for the next launch
-        used = gl.atomic_add(use_ptr + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu")
+        if LATE_WAIT:
+            used = _vkeep(used)
+        else:
+            used = gl.atomic_add(use_ptr + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu")
         last = lead & (used == N_D - 1)
         gl.atomic_xchg(cnt_ptr + zero, zero, mask=last, sem="relaxed", scope="gpu")
+        for j in gl.static_range(1, CNT_SPLIT):
+            gl.atomic_xchg(cnt_ptr + j * 32 + zero, zero, mask=last, sem="relaxed", scope="gpu")
         gl.atomic_xchg(use_ptr + zero, zero, mask=last, sem="relaxed", scope="gpu")
 
 
@@ -488,6 +610,7 @@ def _route_tile_wide(
     u, x_ptr, nvr_ptr, tw_ptr, tid_ptr, rows_ptr, mm_ptr, psum_ptr, pay_ptr, scale_ptr, fws_ptr,
     ws_ptr, lsc_ptr, M: gl.constexpr, stride_xm, LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr,
     WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr, NUM_WARPS: gl.constexpr, RPT: gl.constexpr, WPE: gl.constexpr,
+    LATE_WAIT: gl.constexpr = 0,
 ):
     """`_route_tile_v2` for 17 .. 64 rows (token mask planes, any power-of-two align_m)."""
     G: gl.constexpr = TOPK // RPT  # route tiles a row
@@ -602,7 +725,10 @@ def _route_tile_wide(
     c_waves = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, CL))
     c_lead = (c_waves[:, None] + c_lanes[None, :]) == 0
     c_zero = c_waves[:, None] * 0 + c_lanes[None, :] * 0
-    c_used = gl.atomic_add(fws_ptr + 3 + c_zero, c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
+    if LATE_WAIT:
+        c_used = gl.atomic_add(fws_ptr + 3 + _vzero(c_zero), c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
+    else:
+        c_used = gl.atomic_add(fws_ptr + 3 + c_zero, c_zero + 1, mask=c_lead, sem="relaxed", scope="gpu")
 
     # ---- 5. routing ---------------------------------------------------------------------------------
     low = (1 << (t & 31)) - 1
@@ -636,6 +762,8 @@ def _route_tile_wide(
             gl.amd.gfx1250.buffer_store(sdw, scale_ptr, base + sdi * (WMMA_REP * 16))
 
     # ---- 7. the last tile out restores the shared state for the next launch ---------------------------
+    if LATE_WAIT:
+        c_used = _vkeep(c_used)
     c_last = c_lead & (c_used == NT - 1)
     gl.atomic_xchg(fws_ptr + 3 + c_zero, c_zero, mask=c_last, sem="relaxed", scope="gpu")
     if gl.sum(c_last.to(gl.int32), axis=None) > 0:
@@ -665,6 +793,7 @@ def _gemm_a16w16_router_shared_expert_topk_v2w_kernel(
     OP_B2: gl.constexpr, STORE1: gl.constexpr, TIMEOUT_NS: gl.constexpr, H_CACHE: gl.constexpr,
     LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr, WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr,
     RPT: gl.constexpr, MB: gl.constexpr, WPE: gl.constexpr,
+    LATE_WAIT: gl.constexpr = 0, XCD_RANKS: gl.constexpr = 0, CNT_SPLIT: gl.constexpr = 1,
 ):
     KD: gl.constexpr = NGU // 2
     N_GU: gl.constexpr = NGU // ROWS_G
@@ -675,6 +804,10 @@ def _gemm_a16w16_router_shared_expert_topk_v2w_kernel(
     NKT2: gl.constexpr = KD // BKT2
     NC2: gl.constexpr = BKT2 // BLOCK_K2
     pid = gl.program_id(axis=0)
+    if XCD_RANKS != 0:
+        pid = _xcd_pid(pid, P, XCD_RANKS)
+        if pid < 0:
+            return
     cnt_ptr = ws_ptr + WS_HEADER
     use_ptr = cnt_ptr + WS_MAX_MB
     zi = pid * 0
@@ -702,7 +835,7 @@ def _gemm_a16w16_router_shared_expert_topk_v2w_kernel(
     if pid < NQ:
         _route_tile_wide(pid, x_ptr, nvr_ptr, tw_ptr, tid_ptr, rows_ptr, mm_ptr, psum_ptr, pay_ptr, scale_ptr,
                          fws_ptr, ws_ptr, lsc_ptr, M, stride_xm, LSC_STRIDE, ALIGN_M, WMMA_REP, HAS_NVR, NUM_WARPS,
-                         RPT, WPE)
+                         RPT, WPE, LATE_WAIT)
     # gate/up unit (weight rows gu * ROWS_G .., M blocks gh * GB ..): h = silu(gate) * up, then one arrival a wave
     GB: gl.constexpr = (MB + 1) // 2
     g = pid - PQ0
@@ -713,17 +846,26 @@ def _gemm_a16w16_router_shared_expert_topk_v2w_kernel(
                  gu * HG + HG, gu * HG + HG, gu * HG,
                  BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1, SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_G, GB, True,
                  STORE1, H_CACHE, gh * (GB * BLOCK_M))
-        _wave_arrive(cnt_ptr, NUM_WARPS)
+        if CNT_SPLIT > 1:
+            _wave_arrive(cnt_ptr + (g % CNT_SPLIT) * 32, NUM_WARPS)
+        else:
+            _wave_arrive(cnt_ptr, NUM_WARPS)
     # down tile: wait for every gate/up unit, every M block of h -> LDS, a K chain a block, store
     if is_down:
-        ok = gl.atomic_poll(cnt_ptr, N_GU * 2 * NUM_WARPS, sem="relaxed", scope="gpu", timeout_ns=TIMEOUT_NS)
-        if not ok:
-            gl.atomic_add(ws_ptr, 1, sem="relaxed", scope="gpu")
+        if CNT_SPLIT > 1:
+            _split_poll(cnt_ptr, N_GU * 2 * NUM_WARPS, ws_ptr, CNT_SPLIT, NUM_WARPS)
+        else:
+            ok = gl.atomic_poll(cnt_ptr, N_GU * 2 * NUM_WARPS, sem="relaxed", scope="gpu", timeout_ns=TIMEOUT_NS)
+            if not ok:
+                gl.atomic_add(ws_ptr, 1, sem="relaxed", scope="gpu")
         L: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [NUM_WARPS, 1], [1, 0])
         lanes = gl.arange(0, 32, layout=gl.SliceLayout(0, L))
         waves = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, L))
         lead = (waves[:, None] + lanes[None, :]) == 0
         zero = waves[:, None] * 0 + lanes[None, :] * 0
+        if LATE_WAIT:
+            # the poll above was this tile's last read of the counter: count it out now, use the value at the end
+            used = gl.atomic_add(use_ptr + _vzero(zero), zero + 1, mask=lead, sem="relaxed", scope="gpu")
         a2_buf = gl.allocate_shared_memory(h_ptr.type.element_ty, shape=[MB * NKT2, BLOCK_M, BKT2],
                                            layout=SHARED_A2)
         a2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -743,7 +885,12 @@ def _gemm_a16w16_router_shared_expert_topk_v2w_kernel(
                         b2_buf.index(k).slice(c * BLOCK_K2, BLOCK_K2, 1).permute([1, 0]), OP_B2)
                     acc2 = gl.amd.gfx1250.wmma(cur_a, cur_b, acc2)
             _store_tile(acc2, out_ptr, M, ND, stride_om, zi + mb * BLOCK_M, d * BLOCK_N2, WMMA2, "")
-        used = gl.atomic_add(use_ptr + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu")
+        if LATE_WAIT:
+            used = _vkeep(used)
+        else:
+            used = gl.atomic_add(use_ptr + zero, zero + 1, mask=lead, sem="relaxed", scope="gpu")
         last = lead & (used == N_D - 1)
         gl.atomic_xchg(cnt_ptr + zero, zero, mask=last, sem="relaxed", scope="gpu")
+        for j in gl.static_range(1, CNT_SPLIT):
+            gl.atomic_xchg(cnt_ptr + j * 32 + zero, zero, mask=last, sem="relaxed", scope="gpu")
         gl.atomic_xchg(use_ptr + zero, zero, mask=last, sem="relaxed", scope="gpu")

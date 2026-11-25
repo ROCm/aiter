@@ -40,6 +40,22 @@ LSC_STRIDE = 272
 _RPT = {4: 1}
 _DEFAULT_RPT = 4
 _RPT_WIDE = 4  # routes a route tile above 16 rows (measured: 2 and 8 slower at 20 .. 48 rows)
+# Opt-in schedule changes, all bitwise (the same outputs; only when / where the programs run changes):
+# AITER_ROUTER_SHARED_V2_LATE_WAIT=1: the route tiles' and down tiles' count-out atomics are not waited for right after
+#   they are issued (the compiler did: one round trip on each chain's critical path), only where their value is used.
+# AITER_ROUTER_SHARED_V2_XCD_ORDER=x0,x1,..,x7: the XCDs in the order their workgroups start (measured on MI455X after
+#   a short kernel: 1,3,2,4,6,5,0,7, up to ~1 us apart); the router units and route tiles go to the first ones.
+# AITER_ROUTER_SHARED_V2_ROWS=R,G (narrow variant): router / gate-up unit rows (default 8,8). 4,4 doubles the units
+#   (321 programs at 4..16 rows, two a CU: the kernel's 150 KB of LDS and 1 wave let two be resident).
+_LATE_WAIT = os.environ.get("AITER_ROUTER_SHARED_V2_LATE_WAIT", "0") == "1"
+_XCD_ORDER = [int(v) for v in os.environ.get("AITER_ROUTER_SHARED_V2_XCD_ORDER", "").split(",") if v.strip()]
+assert not _XCD_ORDER or sorted(_XCD_ORDER) == list(range(8)), "AITER_ROUTER_SHARED_V2_XCD_ORDER: a permutation of 0..7"
+_XCD_RANKS = sum(r << (4 * x) for r, x in enumerate(_XCD_ORDER)) if _XCD_ORDER else 0
+# AITER_ROUTER_SHARED_V2_CNT_SPLIT=n: the gate/up arrivals over n counters 128 B apart (not one L2 line).
+# AITER_ROUTER_SHARED_V2_EARLY_RSTD=1 (narrow, ATOM_FOLD_POSTNORM): the rstd's loads under the units' weight loads.
+_EARLY_RSTD = os.environ.get("AITER_ROUTER_SHARED_V2_EARLY_RSTD", "0") == "1"
+_CNT_SPLIT = int(os.environ.get("AITER_ROUTER_SHARED_V2_CNT_SPLIT", "1"))
+_ROWS = tuple(int(v) for v in os.environ.get("AITER_ROUTER_SHARED_V2_ROWS", "8,8").split(","))
 _FWS: dict = {}
 _LSC: dict = {}
 _PLANS: dict = {}
@@ -61,6 +77,8 @@ def _plan(M, nr, ngu, nd, num_cus):
     mb = -(-M // 16)  # M blocks (wide variant)
     # wide: gate/up units of 16 weight rows, each on half of the M blocks
     bm, bn1, bk1, bkt1, rows_r, rows_g = 16, 16, 256, 512, 8, (16 if wide else 8)
+    if not wide:
+        rows_r, rows_g = _ROWS
     bn2, bk2, bkt2 = 16, 128, 512
     if ngu % (2 * rows_g) or (ngu // 2) % bkt2 or nd % bn2 or FEAT % bkt1:
         return None
@@ -80,7 +98,8 @@ def _plan(M, nr, ngu, nd, num_cus):
         nq = M * (TOPK // rpt)
         pq0 = max(n_ru, nq)
         P = max(pq0 + n_gu, n_d + nq)
-        if P <= num_cus:
+        # every program resident: one a CU, or two (narrow, smaller units: 150 KB of LDS, one wave each)
+        if P <= num_cus * (2 if not wide and _ROWS != (8, 8) else 1):
             break
     else:
         return None
@@ -91,6 +110,15 @@ def _plan(M, nr, ngu, nd, num_cus):
         STORE1=store1, TIMEOUT_NS=_TIMEOUT_NS, H_CACHE=".cg", LSC_STRIDE=LSC_STRIDE, RPT=rpt, num_warps=1,
         waves_per_eu=0,
     )
+    if _LATE_WAIT:
+        meta["LATE_WAIT"] = 1
+    if _CNT_SPLIT > 1:
+        meta["CNT_SPLIT"] = _CNT_SPLIT
+    if _EARLY_RSTD and not wide:
+        meta["EARLY_RSTD"] = 1
+    if _XCD_RANKS and not wide:
+        # (narrow only: the wide variant with the remap lost masked_m entries at 32 rows, cause not found)
+        meta["XCD_RANKS"] = _XCD_RANKS
     if wide:
         meta.update(MB=mb, WPE=1 if M <= 32 else 2)
     return P, meta
@@ -193,7 +221,8 @@ def fused_gemm_a16w16_router_shared_expert_topk_v2(
             "ssq_ptr": ssq, "nw_ptr": nw, "stride_sm": ssq.stride(0), "eps": float(eps), "NSSQ": nssq,
             "PRENORM": 1,
         }
-    kernel[(P, 1, 1)](
+    grid = (P + 7) // 8 * 8 if meta.get("XCD_RANKS", 0) else P
+    kernel[(grid, 1, 1)](
         x, w_router, w_gate_up, w_down, logits, h, shared, ws, fws, lsc, nvr, tw, tid, rows, mm, ps,
         payload.view(torch.int32), scale.view(torch.int32), M, x.stride(0), logits.stride(0), h.stride(0),
         shared.stride(0), K=K, NR=n_router, NR_ROWS=nr_rows, NGU=ngu, ND=nd, ALIGN_M=align_m,
