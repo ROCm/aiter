@@ -238,7 +238,9 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
 def test_mxscale_launch_plan_cache_is_bounded(monkeypatch):
     calls = []
 
-    def resolve(g, m, n, k, *, w_scale_block="128x128", gfx=None, cu_num=None):
+    def resolve(
+        g, m, n, k, *, w_scale_block="128x128", gfx=None, cu_num=None, device=None
+    ):
         calls.append((g, m, n, k, w_scale_block))
         return 0, 1
 
@@ -267,6 +269,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     monkeypatch,
     tmp_path,
 ):
+    from aiter.ops import gemm_op_common
     from aiter.ops.opus import policy
 
     config_path = tmp_path / "mxscale.csv"
@@ -284,7 +287,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
         ),
     )
     monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(policy, "get_padded_m", lambda m, _n, _k, _gl: m)
+    monkeypatch.setattr(gemm_op_common, "get_padded_m", lambda m, _n, _k, _gl: m)
     monkeypatch.setattr(
         policy.logger,
         "warning",

@@ -5,7 +5,7 @@
 import pytest
 
 from aiter.jit.utils import chip_info
-from aiter.ops import gemm_op_common
+from aiter.ops import batched_gemm_op_a8w8, gemm_op_common
 from aiter.ops.opus import policy
 
 TABLE = {
@@ -44,7 +44,7 @@ def node(monkeypatch):
     ],
 )
 def test_mxscale_bmm_lookup(m, cu_num, device, expected):
-    row = policy.lookup_mxscale_bmm_config(
+    row = batched_gemm_op_a8w8.lookup_mxscale_bmm_config(
         8, m, 512, 7168, gfx="gfx950", cu_num=cu_num, device=device
     )
     assert row["kernelId"] == expected
