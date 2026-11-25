@@ -752,3 +752,44 @@ def test_mha_varlen_sliding_window_fused_backward_raises():
             torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), do)
     finally:
         mha_set_use_fused_bwd_kernel(False)
+
+
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize("CAUSAL", [False, True])
+def test_mha_sink_backward_deterministic(VARLEN: bool, CAUSAL: bool):
+    """dsink is reduced in a fixed order, not with atomics: repeated backwards give the same bits.
+    Shapes with many dq programs per head, so an atomic sum would see varying orders."""
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 1024, 64, 8, 64
+    device = "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN, NUM_Q_HEADS, HEAD_SZ), device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    sink = torch.randn((NUM_Q_HEADS,), device=device, dtype=torch.float32)
+    do = torch.randn_like(q)
+    if VARLEN:
+        cu = torch.arange(
+            0, (BATCH + 1) * SEQLEN, SEQLEN, dtype=torch.int32, device=device
+        )
+        flat = lambda t: t.reshape(-1, *t.shape[2:])  # noqa: E731
+        q, k, v, do = flat(q), flat(k), flat(v), flat(do)
+
+    def grads():
+        leaves = [t.clone().requires_grad_() for t in (q, k, v, sink)]
+        if VARLEN:
+            out = flash_attn_varlen_func(
+                *leaves[:3], cu, cu, SEQLEN, SEQLEN, causal=CAUSAL, sink=leaves[3]
+            )
+        else:
+            out = flash_attn_func(*leaves[:3], causal=CAUSAL, sink=leaves[3])
+        return torch.autograd.grad(out, leaves, do)
+
+    mha_set_use_fused_bwd_kernel(False)
+    first = grads()
+    for _ in range(3):
+        for name, a, b in zip(("dq", "dk", "dv", "dsink"), first, grads()):
+            assert torch.equal(a, b), f"{name} differs between runs"

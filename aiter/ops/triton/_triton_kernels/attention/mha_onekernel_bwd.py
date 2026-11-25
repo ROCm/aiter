@@ -1226,15 +1226,12 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 ENABLE_SINK=ENABLE_SINK,
             )
             if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
+                # Each row's fp32 do . o, in delta's layout; the launcher reduces dsink from it
+                # in a fixed order (an atomic sum here would change bits from run to run).
                 delta_recomp = delta_recomp_masked + delta_recomp_unmasked
-                dsink = tl.sum(-psink * delta_recomp[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+                tl.store(
+                    DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m
+                )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1750,14 +1747,11 @@ def bwd_kernel_noncausal(
                 ENABLE_SINK=ENABLE_SINK,
             )
             if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta_recomp[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+                # Each row's fp32 do . o, in delta's layout; the launcher reduces dsink from it
+                # in a fixed order (an atomic sum here would change bits from run to run).
+                tl.store(
+                    DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m
+                )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd

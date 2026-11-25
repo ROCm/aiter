@@ -213,6 +213,9 @@ def flash_attn_onekernel_backward(
     else:
         # [batch, num_q_heads, seqlen_q]
         delta_strides = delta.stride()
+    # With a sink, the dq pass stores each row's do . o (recomputed in fp32 as sum(p * dp)) here,
+    # and dsink is reduced from it below in a fixed order.
+    sink_delta = torch.zeros_like(softmax_lse) if sink is not None else None
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
@@ -279,7 +282,7 @@ def flash_attn_onekernel_backward(
             dq,
             dk,
             dv,
-            dsink,
+            sink_delta,
             softmax_lse,
             delta,
             *q_strides,
@@ -337,7 +340,7 @@ def flash_attn_onekernel_backward(
             dq,
             dk,
             dv,
-            dsink,
+            sink_delta,
             softmax_lse,
             delta,
             *q_strides,
@@ -384,5 +387,16 @@ def flash_attn_onekernel_backward(
             **config_onekernel,
             enable_fp_fusion=True,
         )
+
+    if sink is not None:
+        # A sink is a key with value 0: dsink_h = -sum_t exp(sink_h - lse_th) * (do . o)_th, as one
+        # fixed-shape reduction added into dsink (as the kernels did), so the result is deterministic.
+        sink_f = sink.float()
+        if IS_VARLEN:
+            p_sink = torch.exp(sink_f[None, :] - softmax_lse)
+            dsink.sub_((p_sink * sink_delta).sum(0))
+        else:
+            p_sink = torch.exp(sink_f[None, :, None] - softmax_lse)
+            dsink.sub_((p_sink * sink_delta).sum((0, 2)))
 
     return delta
