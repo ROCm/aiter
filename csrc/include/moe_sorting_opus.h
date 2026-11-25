@@ -3098,17 +3098,18 @@ struct MoeSortingMultiPhaseKernel_P23
 // padded start and the number of the expert's routes in earlier groups, then
 // places its own routes behind those, chunk by chunk. Inside a chunk a
 // per-expert bitmask of the chunk's tokens (in LDS) orders an expert's routes
-// by token, and counts a token once however often it names the expert.
+// by token. A token that names one expert twice is not supported: Count traps.
 //
 // What costs time here is loads of lines no kernel has touched yet, about a
 // microsecond per dependent round of them, not the arithmetic: hence one load a
 // line ahead of the loops that need the ids and the weights.
 
 namespace impl {
-// set bit `tw` of one expert in the chunk's token bitmasks
-OPUS_D void moe_sorting_chunk_mark(uint32_t* p_mask, opus::index_t eid, opus::index_t tw)
+// set bit `tw` of one expert in the chunk's token bitmasks; false if it was set already
+OPUS_D bool moe_sorting_chunk_mark(uint32_t* p_mask, opus::index_t eid, opus::index_t tw)
 {
-    __atomic_fetch_or(p_mask + 2 * eid + (tw >> 5), 1u << (tw & 31), __ATOMIC_RELAXED);
+    const uint32_t bit = 1u << (tw & 31);
+    return (__atomic_fetch_or(p_mask + 2 * eid + (tw >> 5), bit, __ATOMIC_RELAXED) & bit) == 0;
 }
 
 // tokens of the chunk routed to one expert
@@ -3219,6 +3220,7 @@ struct MoeSortingChunkCountKernel
             p_mask[i] = 0;
         __syncthreads();
 
+        bool dup = false;
         for(opus::index_t q = 0; q < kargs.rounds; q++)
         {
             const opus::index_t t_begin = (group * kargs.rounds + q) * kChunkTokens;
@@ -3230,7 +3232,7 @@ struct MoeSortingChunkCountKernel
                 const IndexType eid         = p_topk_ids[r];
                 const opus::index_t i_token = kargs.topk_mdiv.div(r);
                 if(eid >= 0 && eid < kargs.num_experts && i_token < tokens)
-                    impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin);
+                    dup |= !impl::moe_sorting_chunk_mark(p_mask, eid, i_token - t_begin);
             }
             __syncthreads();
             if(kargs.rounds > 1)
@@ -3244,6 +3246,10 @@ struct MoeSortingChunkCountKernel
                 __syncthreads();
             }
         }
+
+        // a token naming one expert twice is not supported
+        if(dup)
+            __builtin_trap();
 
         char* p_group_cnt = reinterpret_cast<char*>(kargs.p_group_cnt);
         const bool last   = group + 1 == static_cast<opus::index_t>(gridDim.x);
