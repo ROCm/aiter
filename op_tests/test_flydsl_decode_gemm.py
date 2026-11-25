@@ -442,8 +442,12 @@ def check_tuned_row_other_layouts() -> None:
 
 _RUN_ONLY_PROBE = """
 import sys, torch
-from aiter.tuned_gemm import tgemm
+from aiter.tuned_gemm import get_GEMM_A16W16_config, is_flydsl_decode_config, tgemm
 m, n, k = (int(v) for v in sys.argv[1:4])
+# Without the decode row tgemm.mm falls through to torch and the probe would
+# pass without touching the AOT cache.
+config = get_GEMM_A16W16_config(m, n, k, False, "torch.bfloat16", "torch.bfloat16")
+assert is_flydsl_decode_config(config), f"decode row not selected: {config}"
 w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
 x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
 wide = torch.zeros(m, k + 64, dtype=torch.bfloat16, device="cuda")
