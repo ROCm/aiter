@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """gfx1250 R1 NVFP4 MLA: fixed gains, page64, one query, 128 heads.
 
-All decode inputs are already quantized. The producers below write the native
-NoPE/AUX layout directly; callers own the BF16 active tail and CSR publication.
+The Q RoPE entry rotates and quantizes BF16 Q RoPE inside the decoder. NoPE
+and KV inputs use the native packed layout; callers own CSR publication.
 """
 
 import math
@@ -18,8 +18,8 @@ G_Q = 6.72
 G_KV = 89.6
 
 
-# v7 loads the N128 CO name; do not reuse v6 wrappers with the old CO path.
-@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
+# v8 adds the 120-byte Q RoPE entry; cached v7 modules do not export it.
+@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -34,13 +34,32 @@ def mla_nvfp4_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
+# cos/sin can alias one cache; only out is mutated, including under compile.
+@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes", mutates_args=["out"])
+def mla_nvfp4_qrope_asm_fwd(
+    q_nope: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    out: torch.Tensor,
+    params: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v7", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v8", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,
@@ -136,6 +155,63 @@ def mla_decode_nvfp4_fwd(
     return out, None
 
 
+def mla_decode_nvfp4_qrope_fwd(
+    q_nope: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    out: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    *,
+    params: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, None]:
+    """Rotate/quantize Q RoPE and decode page64 NVFP4 attention on gfx1250 B0+.
+
+    q_nope is packed uint8[B,128,256]. q_scale is uint8[B,128,32] E4M3
+    NoPE scale bits with gain 6.72, e.g. q_aux[...,64:96]. q_rope is
+    pre-rotation BF16[B,128,64]. Its adjacent pairs use GPT-J RoPE:
+    BF16_FMA(x, cos, BF16_MUL(rotate_pairs(x), sin)), followed by block16
+    QR and residual QE quantization. No Q AUX output or scratch is needed.
+
+    q_scale/q_rope require contiguous last dimensions, 16-byte aligned bases,
+    and positive, 16-byte aligned uint32 byte strides. Each wave's 32 head
+    span must fit uint32. cos/sin are BF16[N,32] views with element strides
+    (64,1), e.g. the two halves of BF16[N,64]. positions is GPU int64[B];
+    callers guarantee 0 <= positions[i] < N for nonempty requests.
+
+    KV, CSR, params, output and stream contracts match mla_decode_nvfp4_fwd.
+    Empty requests produce zero and do not read Q/cos/sin. All live inputs
+    must be finite. Only BF16 out is written; LSE is unsupported. Warm up
+    before graph capture and manage input lifetimes across streams.
+    """
+    if return_lse:
+        raise ValueError("O34a NVFP4 MLA does not produce LSE; use return_lse=False")
+    require_gfx1250_asm("mla_decode_nvfp4_qrope_fwd")
+    mla_nvfp4_qrope_asm_fwd(
+        q_nope,
+        q_scale,
+        q_rope,
+        kv_nope,
+        kv_aux,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        out,
+        params,
+        positions,
+        cos,
+        sin,
+    )
+    return out, None
+
+
 def mla_nvfp4_quantize_q(
     q: torch.Tensor,
     q_nope: torch.Tensor | None = None,
@@ -180,6 +256,7 @@ def mla_nvfp4_update_cache(
 
 __all__ = [
     "mla_decode_nvfp4_fwd",
+    "mla_decode_nvfp4_qrope_fwd",
     "mla_nvfp4_quantize_q",
     "mla_nvfp4_update_cache",
     "prepare_mla_nvfp4_params",

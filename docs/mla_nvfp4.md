@@ -126,8 +126,9 @@ The cache writer only emits N16 AUX. Its `aux_layout` keyword and native layout
 flag have been removed. Existing calls should omit the keyword, and old N32 AUX
 caches must be rebuilt from original BF16 data. The layouts are incompatible
 despite having the same tensor shape. Q and NoPE layouts are unchanged.
-The ctypes module is `module_mla_nvfp4_v7`. This version loads the N128-named CO
-and prevents reuse of cached v6 wrappers that load the old N64-named file.
+The ctypes module is `module_mla_nvfp4_v8`. This version adds the fused Q RoPE
+entry and prevents reuse of cached wrappers without that entry. Both decoders
+load N128-named COs; v6 wrappers use an older N64-named file.
 Older argument lists and wrappers that require an LSE buffer also cannot be
 reused. No manual cache deletion is needed.
 
@@ -136,6 +137,74 @@ capture. The current stream is selected from the input tensor's device.
 Capture can include producers, metadata conversion and decode. Update the
 contents of caller-owned buffers before replay; preserve their addresses and
 lifetimes. Recreate params if physical cache capacity or softmax scale changes.
+
+## Fused Q RoPE and quantization
+
+`aiter.mla_decode_nvfp4_qrope_fwd` performs Q RoPE rotation, block16 QR/QE
+quantization and MLA in one kernel on gfx1250 B0+. It consumes pre-rotation
+BF16 Q RoPE and packed NoPE Q with gain-6.72 E4M3 scale bytes. The KV cache,
+CSR, params and BF16 output use the same contracts as the pure decoder.
+Only the output is written; the operation does not materialize Q AUX or LSE.
+
+| Input | Shape and layout |
+|---|---|
+| `q_nope` | Contiguous uint8 `[B,128,256]`, packed NoPE FP4 |
+| `q_scale` | uint8 `[B,128,32]`, NoPE E4M3 scale bits; compact or `q_aux[...,64:96]` |
+| `q_rope` | Pre-rotation BF16 `[B,128,64]`; compact or a view into a projection |
+| `positions` | Contiguous GPU int64 `[B]` |
+| `cos`, `sin` | BF16 `[N,32]`, each with element strides `(64,1)` |
+
+Q RoPE uses adjacent even/odd pairs (GPT-J), not split halves. It rounds
+`rotate_pairs(q_rope) * sin` to BF16, then computes a BF16 fused multiply-add
+with `q_rope * cos`. QR and its residual QE use the existing gain and block16
+quantization rules. Inputs must be finite for nonempty requests.
+
+`q_scale` and `q_rope` have contiguous last dimensions. Their bases and outer
+byte strides must be 16-byte aligned; outer strides must be positive and fit
+uint32. The per-wave span (`31 * head_stride_bytes + row_bytes`) must fit uint32,
+where row_bytes is 32 for scales and 128 for Q RoPE. Request-base arithmetic
+uses 64 bits. cos/sin have 16-byte aligned bases and fixed 128-byte rows.
+The caller guarantees `0 <= positions[i] < N` for every nonempty request.
+Empty requests produce zero without reading Q or the cos/sin rows.
+
+For example, a model can pass the NoPE producer's existing packed output and
+scale buffer directly, without an external Q RoPE quantization dispatch:
+
+```python
+# q_projection: BF16 [B,128,192], with raw Q RoPE in its last 64 elements.
+# cos_sin_cache: BF16 [N,64], laid out as [cos(32), sin(32)].
+# q_nope/q_scale: the NoPE producer's gain-6.72 packed output and scale bytes.
+out, _ = aiter.mla_decode_nvfp4_qrope_fwd(
+    q_nope=q_nope,
+    q_scale=q_scale,
+    q_rope=q_projection[..., 128:],
+    kv_nope=kv_nope,
+    kv_aux=kv_aux,
+    out=out,
+    kv_indptr=indptr,
+    kv_indices=indices,
+    kv_last_page_lens=last,
+    params=params,
+    positions=positions,
+    cos=cos_sin_cache[:, :32],
+    sin=cos_sin_cache[:, 32:],
+)
+```
+
+Warm up the operation before HIP graph capture. It supports the query device's
+current stream and `torch.compile`; metadata checks do not copy GPU contents
+to the host. `return_lse=True` is rejected. The existing `mla_decode_nvfp4_fwd`
+and `mla_decode_fwd(kv_layout="nvfp4_n128")` remain the prequantized entry points.
+
+The fused CO uses a 120-byte argument block, 1024 VGPRs, 106 SGPRs and 256 KiB
+LDS per TG. The entry is aligned to 16 KiB. Its executable segment is 66048 B
+(64.5 KiB), including padding. Regression tests cover independent BF16 RoPE,
+the separate quantizer/decoder, full BF16 attention, Q/scale views, partial and
+empty pages, output guards, streams, graph replay, compile and >4 GiB KV offsets:
+
+```bash
+AITER_NVFP4_TEST_LARGE=1 python3 -m pytest op_tests/test_mla_nvfp4_qrope.py -q
+```
 
 Dense lengths/page tables can use the existing GPU adapter:
 
