@@ -2705,9 +2705,11 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
     _get_mla_decode_shape_support_cached.cache_clear
 )
 
-# Q head counts the MLA decode kernels are built for; a query can be padded up
-# to one of them. get_mla_decode_num_heads only ever answers one of these (or
-# the count it was asked for); callers that pick a padded width read it here.
+# Q head counts get_mla_decode_num_heads pads a query to: 16 and the wider
+# counts the MLA decode kernels are built for. It only ever answers one of
+# these or the count it was asked for; narrower counts some architectures also
+# run (gfx950 fp8: 8 heads at qlen 4, 12 heads up to 128 rows) are not tried.
+# Callers that pick a padded width themselves read the list here.
 MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
 
@@ -2718,17 +2720,23 @@ def get_mla_decode_num_heads(
     kv_dtype: torch.dtype,
     **kwargs,
 ) -> int | None:
-    """The fewest Q heads, at least num_heads, that mla_decode_fwd runs for a decode.
+    """The first of num_heads and the kernel head counts above it that runs.
 
     For a caller that can pad its query heads (a DCP gather pads with zeros):
-    num_heads itself and each kernel head count above it are tried in order,
-    each through get_mla_decode_shape_support with the same arguments, and the
-    first that runs is returned. A head count runs when its kernel is known to
-    exist (supported is True), or when it takes a JIT route that has no
-    availability table and no asm (supported is None). A folded PS1 route, a
-    head count the planner or reducer rejects, and an asm route whose table
-    has no kernel or could not be queried do not run. None when no head count
-    up to 128 runs.
+    num_heads itself and each MLA_DECODE_KERNEL_HEAD_COUNTS entry above it are
+    tried in order, each through get_mla_decode_shape_support with the same
+    arguments, and the first that runs is returned. A head count runs when its
+    kernel is known to exist (supported is True), or when it takes a JIT route
+    that has no availability table and no asm (supported is None). A folded
+    PS1 route, a head count the planner or reducer rejects, and an asm route
+    whose table has no kernel or could not be queried do not run. None when no
+    head count up to 128 runs.
+
+    Only those candidates are tried, so the answer is the fewest heads among
+    them, not among every count the shape rules accept: gfx950 fp8 also runs
+    8 heads (qlen 4) and 12 heads (up to 128 rows), which are never answered
+    (9 heads give 16 there, not 12). Fewer heads are not always faster, so
+    padding to such a narrower width is the caller's choice, by measurement.
 
     "Runs" means the shape rules accept the head count; nothing is launched.
     The answer therefore has get_mla_decode_shape_support's limits (see
