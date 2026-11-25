@@ -165,6 +165,10 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         hipLaunchKernelGGL(
         aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream,
         philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        // Without dropout the kernels never read the seed/offset, but drop_seed_offset below
+        // takes rng_state.data_ptr() unconditionally, so it must not stay undefined.
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
     if (seqlen_q > 0) {
