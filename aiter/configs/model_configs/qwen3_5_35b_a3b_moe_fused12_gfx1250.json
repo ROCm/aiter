@@ -1,0 +1,20 @@
+{
+ "8": {
+  "tile_n2": 128,
+  "tile_k2": 256,
+  "n_warp2": 2,
+  "num_buffers2": 2,
+  "waves_per_tensor_tdm2": 1
+ },
+ "16": {
+  "tile_n": 128,
+  "tile_k": 256,
+  "n_warp": 2,
+  "num_buffers": 4,
+  "tile_n2": 256,
+  "tile_k2": 256,
+  "n_warp2": 2,
+  "num_buffers2": 2,
+  "waves_per_tensor_tdm2": 1
+ }
+}
