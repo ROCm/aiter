@@ -279,7 +279,6 @@ def gemm_a8w8_blockscale_flydsl(
     kernel_name = str(config.get("kernelName", ""))
     try:
         from .flydsl.gemm_a8w8_blockscale import (
-            check_out_dtype,
             is_supported,
             run_gemm_a8w8_blockscale,
         )
@@ -302,8 +301,6 @@ def gemm_a8w8_blockscale_flydsl(
             dtypes.bf16,
             dtypes.fp16,
         ), f"FlyDSL blockscale only supports BF16/FP16 output, got {Out.dtype}"
-        # The gfx942 kernel writes BF16 only: FP16 raises, never falls back.
-        check_out_dtype(ki, Out.dtype)
         assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
             "FlyDSL blockscale requires FP32 scales, "
             f"got x_scale={x_scale.dtype}, w_scale={w_scale.dtype}"

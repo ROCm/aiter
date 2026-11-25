@@ -5,9 +5,9 @@
 
 C[M, N] = A[M, K] @ B[N, K]^T with FP8 E4M3FNUZ A and B, FP32 block scales
 ScaleA[K/128, M] (x_scale transposed) and ScaleB[ceil(N/128), K/128], and BF16
-output. B is plain [N, K] or aiter shuffle_weight(B, layout=(16, 16)). Needs
-N % 16 == 0, K % 128 == 0 and K >= 128; any M >= 1 works: the raw-buffer range
-checks zero rows and columns past M/N, rows past M are outside the C
+or FP16 output. B is plain [N, K] or aiter shuffle_weight(B, layout=(16, 16)).
+Needs N % 16 == 0, K % 128 == 0 and K >= 128; any M >= 1 works: the raw-buffer
+range checks zero rows and columns past M/N, rows past M are outside the C
 descriptor and columns past N store at voffset 0x7FFFFFFF, which is dropped.
 
 One 256x256 tile per workgroup of 512 threads, 64 KiB LDS. wave_m = wave // 4
@@ -17,20 +17,23 @@ read once per K block; A packet p is read in stage p. Each packet of the next
 K block is loaded during this block and written to LDS one stage later
 (one-stage load lead, "pf1"). Waves 4-7 trail waves 0-3 by one barrier.
 
-Ported unchanged from PyHIP
+The main loop is ported unchanged from PyHIP
 src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py, the FlyDSL form
 of PyHIP's gemm_fp8_gfx942_4x2_lds.py (which names the grid in gfx950's (N, M)
 order): tile order, LDS layout and swizzle, load/ds_write/ds_read order, every
-wait, barrier, sched_barrier and s_setprio, MFMA/dequant order and the BF16
-packing are PyHIP's, so both produce bitwise identical output, and compiled
-with the same FlyDSL (0.5.3) the final ISA is PyHIP's instruction for
-instruction. Only the helpers are inlined and the kernel symbol is named:
+wait, barrier, sched_barrier and s_setprio, and the MFMA/dequant order are
+PyHIP's. Only the helpers are inlined and the kernel symbol is named:
 PyHIP's BufferTensor.load is _buffer_load_dwordx4 below, the same
 buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
 below are kept for that reason; each names the stable API it stands in for.
 PyHIP's ISA audit of this kernel flags one SGPR WAW at K = 128 (one K block):
 the two inline-asm s_buffer_load_dword of the next block's (unused) B scales
 are in flight to the same SGPR; nothing reads it (PyHIP design note F3).
+
+The epilogue is aiter's: it rounds the FP32 results to BF16 or FP16 to
+nearest even, as the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave.py)
+does. PyHIP instead truncates to BF16 and has no FP16 output, so BF16 results
+differ from PyHIP's in the last bit wherever rounding goes up.
 """
 
 import flydsl.compiler as flyc
@@ -106,27 +109,21 @@ def _s_buffer_load_f32(rsrc, offset_bytes):
     return fx.Float32(value)
 
 
-def _pack_bf16x2(values):
-    """Four FP32 -> two BF16x2 dwords, as PyHIP uni_cvt_pk_bf16_f32 on gfx942."""
-    # PyHIP adds the 0x8000 bit pattern as an FP32 denormal, then v_perm keeps the
-    # high halves: normal values are truncated, not rounded to nearest even.
-    bias = fx.Int32(0x8000).bitcast(fx.Float32)
-    bits = [(fx.Float32(values[index]) + bias).bitcast(fx.Int32) for index in range(4)]
-    return [
-        bits[pair * 2] >> 16 & 0xFFFF | bits[pair * 2 + 1] & -65536 for pair in range(2)
-    ]
-
-
-def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, preshuffle_b):
-    """The launcher of one (N, K, B layout).
+def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
+    N, K, preshuffle_b, out_dtype="bf16"
+):
+    """The launcher of one (N, K, B layout, output dtype).
 
     ``launch(pA, pB, pC, pScaleA, pScaleB, M, stream)`` takes fx.Int32
     pointers to A[M, K], B (plain [N, K] or shuffle_weight(B, (16, 16))) and
-    C[M, N] BF16, and fx.Float32 pointers to ScaleA[K/128, M] and
-    ScaleB[ceil(N/128), K/128], all contiguous. Not cached: the caller keeps
-    one launcher per device.
+    C[M, N] (BF16 for out_dtype "bf16", FP16 for "fp16"), and fx.Float32
+    pointers to ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128], all
+    contiguous. Not cached: the caller keeps one launcher per device.
     """
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
+    assert out_dtype in ("bf16", "fp16"), out_dtype
+    out_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
+    symbol_suffix = "_f16" if out_dtype == "fp16" else ""
     KB = K // TILE_K
     scale_rows_b = (N + 127) // 128
     b_k_bytes = TILE_K * 16 if preshuffle_b else TILE_K
@@ -137,7 +134,7 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, preshuffle_b):
         b: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
 
     @flyc.kernel(
-        name=f"gemm_a8w8_blockscale_gfx942_2x4_lds_pf1_ps{int(preshuffle_b)}",
+        name=f"gemm_a8w8_blockscale_gfx942_2x4_lds_pf1_ps{int(preshuffle_b)}{symbol_suffix}",
         known_block_size=[512, 1, 1],
     )
     def gemm_kernel(
@@ -511,17 +508,16 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, preshuffle_b):
                         offset = (column < N).select(
                             row * (N * 2) + column * 2, fx.Int32(0x7FFFFFFF)
                         )
-                        packed = Vec.from_elements(
-                            _pack_bf16x2(
-                                Vec(
-                                    accum[
-                                        None,
-                                        (packet * 2 + side) * 4 + rep_m * 2 + rep_n,
-                                    ].load()
-                                )
-                            ),
-                            fx.Int32,
+                        values = Vec(
+                            accum[
+                                None,
+                                (packet * 2 + side) * 4 + rep_m * 2 + rep_n,
+                            ].load()
                         )
+                        # Round to nearest even, as the gfx950 8-wave kernel's
+                        # epilogue does; gfx942 has no v_cvt_pk_bf16_f32, so
+                        # LLVM expands the BF16 conversion.
+                        packed = values.to(out_type).bitcast(fx.Int32)
                         # Raw store, not fx.copy(BufferCopy64b): columns past N
                         # need the explicit out-of-range voffset 0x7FFFFFFF.
                         rocdl.raw_ptr_buffer_store(

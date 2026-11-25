@@ -10,11 +10,12 @@ names omit the fixed pipeline and DMA flags. The historical B16 names also
 serve FP16 calls; the output tensor specializes the epilogue, with separate
 runtime/AOT cache entries for the two dtypes.
 
-IDs 2 and 3 are the gfx942 kernel ported unchanged from PyHIP's 2x4-LDS pf1
-(kernels/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py): a 256x256 tile, eight
-waves on a 2x4 (M x N) grid, A and B staged through 64 KiB of LDS with a
-one-stage load lead. ID 2 is plain B and ID 3 preshuffled B. It reads FP8
-E4M3FNUZ and writes BF16 only, truncated as PyHIP does. It needs
+IDs 2 and 3 are the gfx942 kernel ported from PyHIP's 2x4-LDS pf1
+(kernels/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py), main loop unchanged: a
+256x256 tile, eight waves on a 2x4 (M x N) grid, A and B staged through
+64 KiB of LDS with a one-stage load lead. ID 2 is plain B and ID 3
+preshuffled B. It reads FP8 E4M3FNUZ and writes BF16 or FP16, rounded to
+nearest even as IDs 0/1 do; like theirs, its B16 names serve both. It needs
 N % 16 == 0, K % 128 == 0 and K >= 128, and takes any M >= 1: partial M/N
 tiles are range checked.
 
@@ -44,13 +45,6 @@ class kernelInstance:
             f"{prefix}{TILE_M}x{TILE_N}x{TILE_K}_F8_F8_B16_"
             f"ps{int(self.preshuffle_b)}"
         )
-
-    @property
-    def out_dtypes(self) -> tuple[str, ...]:
-        """torch dtype names of the outputs the kernel writes."""
-        if self.gfx == "gfx942":
-            return ("bfloat16",)
-        return ("bfloat16", "float16")
 
 
 # Candidate IDs are consecutive; --preshuffle selects the B layout. IDs 0/1 are

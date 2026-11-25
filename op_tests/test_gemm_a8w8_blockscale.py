@@ -226,8 +226,8 @@ def test_gemm(
             ret["triton/ck"] = avg_d / avg_b
 
         # FlyDSL blockscale runs with FP32 scales, on shapes its tile fits: IDs 0/1
-        # on gfx950, IDs 2/3 on gfx942, whose kernel writes BF16 output only.
-        if get_gfx() == "gfx950" or (get_gfx() == "gfx942" and dtype == dtypes.bf16):
+        # on gfx950, IDs 2/3 on gfx942.
+        if get_gfx() in ("gfx942", "gfx950"):
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
                 kernel_fits_shape,
                 kernelInstance,
@@ -303,7 +303,7 @@ def test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset):
     lookup injected. The caller's output is NaN-filled between guard elements,
     so an unwritten element or a store outside it fails. ``out_offset`` elements
     put its base off an 8-byte boundary, which the launcher stages through an
-    aligned buffer. FP16 output, which this kernel does not write, must raise.
+    aligned buffer. ``dtype`` is the output dtype, BF16 or FP16.
     """
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
         kernels_list,
@@ -364,12 +364,6 @@ def test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset):
         check(result, "flydsl public op")
         # Bitwise the tuned-row result: the public op ran this row's kernel.
         assert torch.equal(result.view(torch.int16), tuned.view(torch.int16))
-        try:
-            public(dtypes.fp16)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("gfx942 FlyDSL blockscale row served FP16 output")
 
     _, us = run_perftest(
         gemm_a8w8_blockscale_flydsl,
@@ -704,15 +698,15 @@ if args.table and not df.empty:
     print(df.to_string(index=False))
     print("=" * 150)
 
-# The gfx942 FlyDSL kernel (kernelId 2/3, BF16 only) takes any M, N % 16 and
-# K % 128: tuned rows on tile tails, through the tuned-row entry and the public
-# op, into an aligned and a misaligned (2-byte offset) caller buffer.
-if get_gfx() == "gfx942" and dtypes.bf16 in args.dtype:
+# The gfx942 FlyDSL kernel (kernelId 2/3) takes any M, N % 16 and K % 128 and
+# writes BF16 or FP16: tuned rows on tile tails, through the tuned-row entry and
+# the public op, into an aligned and a misaligned (2-byte offset) caller buffer.
+if get_gfx() == "gfx942":
     df_flydsl = pd.DataFrame(
         [
-            test_flydsl_tuned_row(dtypes.bf16, m, n, k, preshuffle, out_offset)
-            for (m, n, k), preshuffle, out_offset in itertools.product(
-                args.flydsl_mnk, l_preshuffle, (0, 1)
+            test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset)
+            for dtype, (m, n, k), preshuffle, out_offset in itertools.product(
+                (dtypes.bf16, dtypes.fp16), args.flydsl_mnk, l_preshuffle, (0, 1)
             )
         ]
     )
@@ -720,7 +714,7 @@ if get_gfx() == "gfx942" and dtypes.bf16 in args.dtype:
     if args.table and not df_flydsl.empty:
         print(df_flydsl.to_string(index=False))
 else:
-    print(f"skip: FlyDSL gfx942 tuned-row checks need gfx942 and bf16, got {get_gfx()}")
+    print(f"skip: FlyDSL gfx942 tuned-row checks need gfx942, got {get_gfx()}")
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")

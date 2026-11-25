@@ -4,7 +4,7 @@
 """Aiter adapter for the FlyDSL FP8 blockscale kernels.
 
 IDs 0/1: the gfx950 rebased half-M, raw-DMA kernel (BF16 or FP16 output).
-IDs 2/3: the gfx942 2x4-LDS pf1 kernel ported from PyHIP (BF16 output only).
+IDs 2/3: the gfx942 2x4-LDS pf1 kernel ported from PyHIP (BF16 or FP16 output).
 """
 
 import functools
@@ -24,15 +24,6 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
 
 # The FP8 format each kernel's MFMAs read; int8/uint8 are raw storage of it.
 _FP8_DTYPE = {"gfx950": torch.float8_e4m3fn, "gfx942": torch.float8_e4m3fnuz}
-
-
-def check_out_dtype(ki: kernelInstance, dtype: torch.dtype) -> None:
-    """Raise ValueError unless ``ki`` writes ``dtype``: gfx942 writes BF16 only."""
-    if dtype not in tuple(getattr(torch, name) for name in ki.out_dtypes):
-        raise ValueError(
-            f"FlyDSL blockscale kernel {ki.name} writes "
-            f"{' or '.join(ki.out_dtypes)} output, got {dtype}"
-        )
 
 
 def is_supported(
@@ -63,7 +54,7 @@ def is_supported(
     fp8_storage = (_FP8_DTYPE[ki.gfx], torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
-    if Out.dtype not in tuple(getattr(torch, name) for name in ki.out_dtypes):
+    if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
     return kernel_fits_shape(ki, M, N, K, gfx)
@@ -125,20 +116,22 @@ def _compile_gemm(
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     ki = kernels_by_name[kernel_name]
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     if ki.gfx == "gfx942":
-        check_out_dtype(ki, out_dtype)
         from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds_pf1 import (
             compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1,
         )
 
-        # PyHIP's own compile hints (no opt_level override), so the kernel
-        # compiles to PyHIP's ISA.
-        return compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, ki.preshuffle_b)
+        # PyHIP's own compile hints (no opt_level override), which its
+        # pipeline was scheduled with. The output dtype selects the epilogue's
+        # conversion.
+        return compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(
+            N, K, ki.preshuffle_b, "fp16" if out_dtype == torch.float16 else "bf16"
+        )
 
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
 
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
     # each caches the first typed CompiledFunction it compiles.
     launch = compile_gemm_fp8_8wave(
@@ -175,10 +168,10 @@ def _launch_gfx942(
     N = WQ.shape[0]
     # The kernel takes i32 pointers, loads A and B with 16-byte
     # buffer_load_dwordx4 at 16-byte offsets from their base and stores four
-    # BF16 per lane with one 8-byte buffer_store_dwordx2. An operand view whose
-    # base breaks that alignment (an offset into a larger buffer) is staged
-    # through a fresh, aligned copy, so every access stays naturally aligned;
-    # the caller copies a staged output back into Out.
+    # BF16 or FP16 per lane with one 8-byte buffer_store_dwordx2. An operand
+    # view whose base breaks that alignment (an offset into a larger buffer) is
+    # staged through a fresh, aligned copy, so every access stays naturally
+    # aligned; the caller copies a staged output back into Out.
     a = _aligned(XQ.contiguous(), 16)
     b = _aligned(WQ.contiguous(), 16)
     if out.data_ptr() % 8:
@@ -211,15 +204,14 @@ def run_gemm_a8w8_blockscale(
 
     Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
-    Both use w_scale[ceil(N/128),K/128]. IDs 0/1 write BF16/FP16 on gfx950;
-    IDs 2/3 write BF16 only on gfx942, and FP16 raises ValueError.
+    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output; IDs 0/1 run on
+    gfx950, IDs 2/3 on gfx942.
     """
     ki = kernels_by_name.get(kernel_name)
     if ki is None:
         raise ValueError(f"Unknown FlyDSL blockscale kernel: {kernel_name!r}")
     if ki.preshuffle_b != preshuffle_b:
         raise ValueError("FlyDSL blockscale kernelName does not match the B layout")
-    check_out_dtype(ki, Out.dtype)
     if not is_supported(XQ, WQ, Out, preshuffle_b, kernel_name):
         raise ValueError("Unsupported gfx, shape or dtype for FlyDSL blockscale")
     if x_scale.device != XQ.device or w_scale.device != XQ.device:
