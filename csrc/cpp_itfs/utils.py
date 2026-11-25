@@ -183,7 +183,10 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
-    from aiter.jit.utils.file_baton import FileBaton
+    # csrc/cpp_itfs adds aiter/jit/utils to sys.path at import time. Import the
+    # helper directly so template JIT builds do not depend on top-level
+    # `import aiter`, which eagerly imports optional op stacks.
+    from file_baton import FileBaton
 
     baton = FileBaton(lock_path)
     if baton.try_acquire():
