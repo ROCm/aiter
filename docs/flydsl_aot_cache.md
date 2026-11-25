@@ -679,6 +679,8 @@ the JIT's when there is none) and calls it directly, as it did with its own
 four-tensor kernel a steady-state `_dispatch` takes about 11 us with or
 without an entry.
 
+### 5.6 gfx950: intranode MegaMoE
+
 `python -m aiter.aot.flydsl.mega_moe` builds a `MegaMoEV2` per rank of each
 profile under `dry_run` and calls its `preload_aot_bundles()` and
 `quantize()`. Every launcher it compiles now launches and preloads through
