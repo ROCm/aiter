@@ -1230,7 +1230,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 # in a fixed order (an atomic sum here would change bits from run to run).
                 delta_recomp = delta_recomp_masked + delta_recomp_unmasked
                 tl.store(
-                    DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m
+                    DSink + adj_delta + offs_m * stride_deltam,
+                    delta_recomp,
+                    mask=mask_m,
                 )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
@@ -1750,7 +1752,9 @@ def bwd_kernel_noncausal(
                 # Each row's fp32 do . o, in delta's layout; the launcher reduces dsink from it
                 # in a fixed order (an atomic sum here would change bits from run to run).
                 tl.store(
-                    DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m
+                    DSink + adj_delta + offs_m * stride_deltam,
+                    delta_recomp,
+                    mask=mask_m,
                 )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm

@@ -775,8 +775,7 @@ def test_mha_sink_backward_deterministic(VARLEN: bool, CAUSAL: bool):
         cu = torch.arange(
             0, (BATCH + 1) * SEQLEN, SEQLEN, dtype=torch.int32, device=device
         )
-        flat = lambda t: t.reshape(-1, *t.shape[2:])  # noqa: E731
-        q, k, v, do = flat(q), flat(k), flat(v), flat(do)
+        q, k, v, do = (t.reshape(-1, *t.shape[2:]) for t in (q, k, v, do))
 
     def grads():
         leaves = [t.clone().requires_grad_() for t in (q, k, v, sink)]
