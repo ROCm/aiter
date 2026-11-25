@@ -220,6 +220,8 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
     # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
     force_fp8_pv_on_fp4_kv_cache: bool = False
+    # keys a KV segment covers at least, from each sequence's live length (0: no floor)
+    min_segment_keys: int = 0
 
 
 def gfx950_gluon_supported(
@@ -292,6 +294,26 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def _gfx950_one_block_segment_keys(config: dict, prgms: int, num_sms: int) -> int:
+    """The one-block split's segment floor in keys, for a grid of prgms programs.
+
+    From the kv_split leaf: a segment shorter than ONE_BLOCK_SEGMENT_MIN_KEYS costs
+    more in its query block and partials than its keys save. That full floor holds
+    from ONE_BLOCK_FLOOR_FULL_FILL programs (num_seqs * num_kv_heads) per CU; a
+    smaller grid needs its segments for occupancy, so its floor drops in proportion,
+    by powers of two, down to ONE_BLOCK_SEGMENT_LO_KEYS.
+    A leaf without ONE_BLOCK_SEGMENT_MIN_KEYS sets no floor (0).
+    """
+    min_keys = config.get("ONE_BLOCK_SEGMENT_MIN_KEYS")
+    if min_keys is None:
+        return 0
+    lo_keys = config["ONE_BLOCK_SEGMENT_LO_KEYS"]
+    full = max(1, int(num_sms * config["ONE_BLOCK_FLOOR_FULL_FILL"]))
+    keys = min_keys * min(prgms, full) // full
+    keys = 1 << max(keys, 1).bit_length() - 1
+    return max(min(lo_keys, min_keys), keys)
+
+
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
@@ -309,7 +331,12 @@ def _gfx950_split_params(params: _UAParams):
         max_fill = config.get("ONE_BLOCK_SPLIT_MAX_FILL")
         if max_fill is not None and one_block_prgms >= max_fill * params.num_sms:
             return params
-        return params._replace(num_2d_prgms=one_block_prgms)
+        return params._replace(
+            num_2d_prgms=one_block_prgms,
+            min_segment_keys=_gfx950_one_block_segment_keys(
+                config, one_block_prgms, params.num_sms
+            ),
+        )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:
@@ -774,6 +801,16 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
+        # skip_reduce hands the caller the partials, and output_rows is
+        # reduce_segments' epilogue: both keep the split as is
+        if split_params.min_segment_keys and not skip_reduce and output_rows is None:
+            # no more segments than the longest sequence fills at the floor
+            NUM_SEGMENTS = min(
+                NUM_SEGMENTS,
+                triton.next_power_of_2(
+                    triton.cdiv(int(params.max_seqlen_k), split_params.min_segment_keys)
+                ),
+            )
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(

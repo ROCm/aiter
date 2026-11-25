@@ -2892,8 +2892,11 @@ def test_triton_unified_attn_one_q_block(
         # so the padded count is 256 tokens // 1 + 64 seqs = 320 per KV head, 640
         # programs for 2 KV heads: more than the 256 CUs, so the launch stays unsplit.
         # The one-block grid is 64 * 2 = 128 programs, half the CUs. Counting it is
-        # what makes this launch split.
+        # what makes this launch split: 4 segments, the 4 that 8192 keys fill at
+        # the segment floor (2048 keys for 128 programs on 256 CUs).
         (64, 8192, 4),
+        # at 2048 keys one segment holds the whole sequence: no split
+        (64, 2048, 1),
         # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
         # so it is kept. Counting the one-block grid (16 programs) as well would give
         # 32 segments instead of 8.
@@ -2936,7 +2939,8 @@ def test_triton_unified_attn_one_q_block_split_transition(
 @pytest.mark.parametrize(
     "num_seqs, num_splits",
     [
-        # one-block grid 256 * 2 = 512 programs, two CU waves: still split
+        # one-block grid 256 * 2 = 512 programs, two CU waves: still split, in the
+        # 2 segments 8192 keys fill at the segment floor (4096 keys)
         (256, 2),
         # 320 * 2 = 640 programs, 2.5 CU waves: the grid fills the CUs, kept unsplit
         (320, 1),
@@ -2947,14 +2951,14 @@ def test_triton_unified_attn_one_q_block_split_grid_gate(
     num_seqs, num_splits, monkeypatch
 ):
     """The transition split stays off once the one-block grid fills the CUs
-    (fp8 -hq 16 -hk 2 -d 64 -sq 8 -sk 2048).
+    (fp8 -hq 16 -hk 2 -d 64 -sq 8 -sk 8192).
     """
     if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
         pytest.skip("gfx950 gluon one-query-block launch")
     if torch.cuda.get_device_properties(0).multi_processor_count != 256:
         pytest.skip("the split counts are for 256 CUs")
     launches = _run_one_q_block(
-        [(8, 2048)] * num_seqs, (16, 2), 64, 16, e4m3_dtype, True, monkeypatch
+        [(8, 8192)] * num_seqs, (16, 2), 64, 16, e4m3_dtype, True, monkeypatch
     )
     assert len(launches) == 1, f"want one launch, got {launches}"
     grid, one_q_block, launched_splits = launches[0]
