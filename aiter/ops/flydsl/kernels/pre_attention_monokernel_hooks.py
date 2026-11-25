@@ -6,13 +6,13 @@
 """Hooks of the pre-attention monokernel (``gemm_hooks`` contract) and its memory plan.
 
 The fused Q/K/V roles GEMM runs these hooks:
-  - after each role's tiles: the role's row factors (Q/K, the prep's row-factor op) and, for
-    per-tensor scales, its amax per destination; the coordinator (last workgroup)
-    exchanges amax with every peer;
-  - after each workgroup's first block of the next role, when every workgroup has a tile
+  - after each role's blocks (role-end hook): the role's row factors (Q/K, the prep's
+    row-factor op) and, for per-tensor scales, its amax per destination; the coordinator
+    (last workgroup) exchanges amax with every peer;
+  - after each workgroup's first block of the next role, when every workgroup has a block
     of every role: the previous role's quantize into the cached staging and its puts;
-  - after every V tile: V's amax per destination (per-tensor V);
-  - after V's tiles: V's quantize and puts, the drain, and the arrival flags.
+  - after every V tile (tile hook): V's amax per destination (per-tensor V);
+  - after V's blocks: V's quantize and puts, the drain, and the arrival flags.
 Each role's receive buffers are the A2A op's packed buffers for the profile, and each codec
 (``pre_attention_monokernel_quant``) reproduces its transport bytes. Per-tensor and
 per-channel scales come from cross-rank exchanges; MX scales are local to each 32-value
@@ -52,7 +52,7 @@ MAX_WORLD = 8
 # Counters per role: workgroups' amax in, workgroups' rows quantized, XCDs written back,
 # scales ready.
 AMAXED, DONE, FLUSHED, READY = 0, 4, 8, 12
-# aux (ordinary memory): the GEMM's tile counters per role at 0, row factors [2][M] FP32
+# aux (ordinary memory): the GEMM's block counters per role at 0, row factors [2][M] FP32
 # from FACTORS, a scratch word, then per-channel V maxima per 128 rows
 # [M / 128][heads * 128] and the per-channel V scales [heads * 128] (Plan.vpc,
 # Plan.scale_pc).
@@ -136,7 +136,7 @@ def make_hooks(
     role_cols,
     layouts,
     plan,
-    tiles_per_role,
+    blocks_per_role,
     workgroups,
     xcds,
     row_factor=None,
@@ -144,7 +144,7 @@ def make_hooks(
 ):
     """The role, first-block and tile hooks for ``layouts`` (``role_layouts``).
 
-    ``tiles_per_role`` is the host GEMM's tile count per role, over ``workgroups``
+    ``blocks_per_role`` is the host GEMM's block count per role, over ``workgroups``
     persistent workgroups on ``xcds`` XCDs. ``row_factor``, the prep's row-factor op
     (``PrepSpec.row_factor``), computes Q's and K's row factors from the epilogue's
     per-head partials and folds them into the quantization. Returns the three hooks; the
@@ -163,8 +163,8 @@ def make_hooks(
     # Lane l of a workgroup takes rows bid + (l + 64 * chunk) * workgroups.
     row_chunks = ((rows + workgroups - 1) // workgroups + 63) // 64
     # The deferred quantize runs in the first-block hook of the next role, which needs a
-    # tile of every role in every workgroup.
-    defer = tiles_per_role >= workgroups
+    # block of every role in every workgroup.
+    defer = blocks_per_role >= workgroups
     kinds = [layout.scale for layout in layouts]
     v_tile_amax = kinds[2] == "tensor"
     quantizers = [
@@ -253,7 +253,7 @@ def make_hooks(
 
     @flyc.jit
     def amax_step(role, aux, args):
-        """1. This rank's tiles of the role; then wave 0 of each workgroup takes its rows'
+        """1. This rank's blocks of the role; then wave 0 of each workgroup takes its rows'
         factors (Q/K) and, for per-tensor scales, their amax per destination from the
         epilogue's tables."""
         (
@@ -271,7 +271,7 @@ def make_hooks(
             counters,
         ) = unpack(role, args)
         if tid == 0:
-            spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
+            spin_until_ge_i32_agent(aux + role * 4, gen * blocks_per_role)
         fx.barrier()
         fx.memory_fence(
             ordering=fx.AtomicOrdering.Acquire, syncscope=fx.rocdl.SyncScope.Agent
@@ -350,9 +350,9 @@ def make_hooks(
         tile_amax = v_tile_amax and role == 2
         if bid == coord:
             if const_expr(tile_amax):
-                # The tiles' atomics land before each tile is counted.
+                # The tile hooks' atomics land before each block is counted.
                 if tid == 0:
-                    spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
+                    spin_until_ge_i32_agent(aux + role * 4, gen * blocks_per_role)
                 fx.barrier()
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
@@ -481,7 +481,7 @@ def make_hooks(
             counters,
         ) = unpack(role, args)
         if tid == 0:
-            spin_until_ge_i32_agent(aux + role * 4, gen * tiles_per_role)
+            spin_until_ge_i32_agent(aux + role * 4, gen * blocks_per_role)
         fx.barrier()
         fx.memory_fence(
             ordering=fx.AtomicOrdering.Acquire, syncscope=fx.rocdl.SyncScope.Agent
@@ -757,7 +757,8 @@ def make_hooks(
                     is_positive=True,
                     syncscope=fx.rocdl.SyncScope.Agent,
                 )
-            # Thread 0 counts the tile right after this hook: every wave's atomics land first.
+            # Thread 0 counts the block right after this hook: every wave's atomics land
+            # first.
             fx.rocdl.s_waitcnt(vmcnt=0)
             fx.barrier()
 

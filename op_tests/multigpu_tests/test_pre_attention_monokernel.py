@@ -127,8 +127,8 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
     cu = get_cu_num()
     if gemm == "a6w6":
         # MXFP6 operands; the weights' rows in the host layout. The A6W6 host applies
-        # no column scales: they stay as ones in their place.
-        scales = [torch.ones(R, device=device) for _ in range(3)]
+        # no column scales, so its column operands hold none.
+        scales = [None] * 3
         x_op, x_scale = aiter.quant_mxfp6_gemm(x)
         order = host_weight_order(3 * R).to(device)
         fused, fused_scale = aiter.quant_mxfp6_gemm(torch.cat(raw)[order].contiguous())
@@ -150,8 +150,9 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         amax_gemm = compile_int8_gemm_4w(
             K=K, xcd_swizzle=8, num_cu=cu, bias=prep.bias, amax=True
         )
-    # B_scale per column: the scales, the biases with a bias, then the prep's columns.
-    columns = prep.pack_columns(torch.cat(scales), torch.cat(biases), params, heads)
+    # Per column: the INT8 host's scales, the biases with a bias, then the prep's columns.
+    fused_scales = None if gemm == "a6w6" else torch.cat(scales)
+    columns = prep.pack_columns(fused_scales, torch.cat(biases), params, heads, n=3 * R)
 
     mono = PreAttentionMonokernel(
         rank=rank,
@@ -175,18 +176,20 @@ def _build(profile_name, rows, heads, K, prep_name, gemm):
         torch.full((2, rows, heads), float("nan"), device=device) for _ in range(3)
     ]
     role_columns = [
-        prep.pack_columns(scales[r], biases[r], [params[r]], heads) for r in range(2)
+        prep.pack_columns(scales[r], biases[r], [params[r]], heads, n=R)
+        for r in range(2)
     ]
-    role_columns.append(torch.cat([scales[2], biases[2]] if prep.bias else [scales[2]]))
+    v_columns = [
+        s for s in (scales[2], biases[2] if prep.bias else None) if s is not None
+    ]
+    role_columns.append(
+        torch.cat(v_columns) if v_columns else torch.zeros(1, device=device)
+    )
     stream = fx.Stream(torch.cuda.current_stream())
     for role in range(3):
         w_op, w_scale = role_ops[role]
-        # The INT8 maxima GEMM takes no tables; the others read them only with a prep.
-        table_args = (
-            ((tables if tables is not None else role_columns[role]).view(-1),)
-            if role < 2 or gemm == "a6w6"
-            else ()
-        )
+        # The GEMMs read the tables only with a prep.
+        table_args = ((tables if tables is not None else role_columns[role]).view(-1),)
         _run_compiled(
             prep_gemm if role < 2 else amax_gemm,
             x_op.view(-1),

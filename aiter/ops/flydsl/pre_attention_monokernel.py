@@ -39,7 +39,7 @@ from .kernels.qk_prep import HEAD_DIM, PrepSpec
 from .kernels.tensor_shim import _run_compiled
 from .pre_attention_monokernel_layout import role_layouts
 
-# The host GEMMs by name; each host's own block sizes set the session's tile counts.
+# The host GEMMs by name; each host's own block sizes set the session's block counts.
 HOSTS = {"int8": gemm_a8w8_int8_4wave, "a6w6": gemm_a6w6_4wave_host}
 GEMMS = tuple(HOSTS)
 
@@ -296,7 +296,7 @@ class PreAttentionMonokernel:
         )
 
         kernels = HOSTS[gemm]
-        tiles_per_role = -(-rows // kernels.BLOCK_M) * (
+        blocks_per_role = -(-rows // kernels.BLOCK_M) * (
             self.role_cols // kernels.BLOCK_N
         )
         role_hook, first_block_hook, tile_hook = make_hooks(
@@ -306,7 +306,7 @@ class PreAttentionMonokernel:
             self.role_cols,
             self.layouts,
             plan,
-            tiles_per_role,
+            blocks_per_role,
             workgroups,
             xcds,
             row_factor=self.prep.row_factor,
@@ -326,7 +326,12 @@ class PreAttentionMonokernel:
             "prep": self.prep,
             "roles": 3,
             "role_cols": self.role_cols,
-            "hooks": GemmHooks(role_hook, first_block_hook, tile_hook, key),
+            "hooks": GemmHooks(
+                tile=tile_hook,
+                first_block=first_block_hook,
+                role_end=role_hook,
+                key=key,
+            ),
             "col_amax_offset": (
                 plan.vpc if self.layouts[2].scale == "channel" else None
             ),
@@ -352,16 +357,17 @@ class PreAttentionMonokernel:
         layout (``w[host_weight_order(3 * heads * 128)]``), packed the same way.
 
         ``columns``: FP32 per column of the fused weight, as ``prep.pack_columns`` packs
-        them: the scales (unused by the A6W6 host), then the biases (``prep.bias``), then
-        the prep's column vectors (V's are unused). ``tables``: the prep's FP32 tables,
-        ``[rows, prep.table_width]``, as ``prep.pack_tables`` packs them (with tables).
+        them: the INT8 host's column scales (the A6W6 host takes none: ``scales=None``),
+        then the biases (``prep.bias``), then the prep's column vectors (V's are unused).
+        ``tables``: the prep's FP32 tables, ``[rows, prep.table_width]``, as
+        ``prep.pack_tables`` packs them (with tables).
 
         The results alias this call's half of the receive buffers, which a peer refills two
         calls later; consumers run on this stream before then.
         """
         rows, n = self.rows, 3 * self.role_cols
         prep = self.prep
-        column_sets = 1 + prep.bias + len(prep.columns)
+        column_sets = (self.gemm != "a6w6") + prep.bias + len(prep.columns)
         if self.gemm == "a6w6":
             from aiter.ops.gemm_op_a6w6 import mxfp6_gemm_pack_size
 
@@ -380,11 +386,17 @@ class PreAttentionMonokernel:
                 ("weight", weight, torch.int8, n * self.K),
             )
         for name, tensor, dtype, numel in (
-            operands + (("columns", columns, torch.float32, column_sets * n),)
-        ) + (
-            (("tables", tables, torch.float32, rows * prep.table_width),)
-            if prep.tables
-            else ()
+            operands
+            + (
+                (("columns", columns, torch.float32, column_sets * n),)
+                if column_sets
+                else ()
+            )
+            + (
+                (("tables", tables, torch.float32, rows * prep.table_width),)
+                if prep.tables
+                else ()
+            )
         ):
             if (
                 tensor is None
@@ -397,6 +409,9 @@ class PreAttentionMonokernel:
                     f"{name} must be a contiguous {dtype} tensor of {numel} elements on "
                     f"{self.device}"
                 )
+        # The kernel reads no operand it has nothing for; any tensor serves.
+        if not column_sets:
+            columns = self.partials
         if not prep.tables:
             tables = columns
         self.generation += 1
