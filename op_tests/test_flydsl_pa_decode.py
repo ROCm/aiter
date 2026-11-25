@@ -35,6 +35,15 @@ def device(monkeypatch):
     return torch.device("cuda")
 
 
+@pytest.fixture(autouse=True)
+def _no_recorded_launches(monkeypatch):
+    """Every test starts with an empty launch table: a launch recorded by
+    another test would skip the dispatch that ``compile_kwargs`` pins."""
+    if importlib.util.find_spec("flydsl") is not None:
+        pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+        monkeypatch.setattr(pa, "_VALIDATED_LAUNCHES", {})
+
+
 @pytest.mark.parametrize(
     "batch,max_parts,budget,window,query_length,max_batch_size,bucket",
     [
@@ -2782,6 +2791,128 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
             )
 
 
+def test_pa_decode_recorded_launch_refusals(device, monkeypatch):
+    """A recorded launch does not serve a call that the checks refuse: an option
+    of another type that compares equal to the recorded one (1 for True, 0.0
+    for 0), or an operand that is never recorded."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    gfx1250 = get_gfx_runtime() == "gfx1250"
+    # The geometry of the small_query-page16-g8 case: one sequence, one
+    # partition. Each refused call below differs from this valid one in one
+    # argument, so a refusal that regressed would launch the valid call again.
+    dim, page, group, length = 128, 16, 8, 1024
+    query, key, value, table, context = _make_inputs(
+        1, 1, group, dim, page, torch.bfloat16, "random", device, (length,)
+    )
+    key_cache = (
+        key.reshape(-1, 1, page, dim // 8, 8).permute(0, 1, 3, 2, 4).contiguous()
+    )
+    value_cache = (
+        value.reshape(-1, 1, page // 8, 8, dim).permute(0, 1, 2, 4, 3).contiguous()
+    )
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    scalar_shape = (1, plan.capacity, group)
+    workspace = {
+        "exp_sums": torch.empty(scalar_shape, device=device),
+        "max_logits": torch.empty(scalar_shape, device=device),
+        "temporary_output": torch.empty(
+            (*scalar_shape, dim), dtype=query.dtype, device=device
+        ),
+    }
+    output = torch.empty_like(query)
+    reference = _reference(
+        query, key.float(), value.float(), table, context, 1, 0, None
+    )
+    compile_kwargs = []
+    compile_tile = pa.compile_pa_decode_tile
+
+    def spy_tile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
+
+    def run(**options):
+        options = {
+            "query_length": 1,
+            "work_plan": plan,
+            "max_context_length": length,
+            **options,
+        }
+        output.fill_(float("nan"))
+        pa.pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            dim**-0.5,
+            **options,
+            **workspace,
+        )
+        _check_output(output, reference)
+
+    # gfx1250 records the checked call and repeats its launch; the other
+    # architectures record nothing.
+    run()
+    run()
+    assert len(compile_kwargs) == (1 if gfx1250 else 2)
+    float_batch = dataclasses.replace(plan, max_batch_size=float(plan.max_batch_size))
+    for error, match, options in (
+        (TypeError, "store_output must be a bool", {"store_output": 1}),
+        (ValueError, "quantized_pad_rows must be", {"quantized_pad_rows": False}),
+        (TypeError, "sliding_window must be an int", {"sliding_window": 0.0}),
+        (TypeError, "query_length must be an int", {"query_length": 1.0}),
+        (
+            ValueError,
+            "max_context_length must be",
+            {"max_context_length": float(length)},
+        ),
+        (ValueError, "plan max_batch_size must be", {"work_plan": float_batch}),
+        (NotImplementedError, "ALiBi", {"alibi_slopes": query}),
+        (NotImplementedError, "externally quantized", {"query_scale": query}),
+        (ValueError, "sinks must have shape", {"sinks": query}),
+    ):
+        with pytest.raises(error, match=match):
+            run(**options)
+    # No CI lane runs gfx1250: pin on every architecture that the keys tell
+    # apart such values, a plan of another capacity and partials at another
+    # alignment.
+    assert pa._launch_options(plan, True, 0) != pa._launch_options(plan, 1, 0.0)
+    assert pa._launch_options(float_batch) != pa._launch_options(plan)
+    longer = dataclasses.replace(
+        plan, work_info=torch.cat([plan.work_info, plan.work_info[:1]])
+    )
+    assert pa._launch_options(longer) != pa._launch_options(plan)
+    partials = workspace["temporary_output"]
+    flat = torch.empty(partials.numel() + 1, dtype=partials.dtype, device=device)
+    shifted = flat[1:].view(partials.shape)
+    assert pa._launch_operands((shifted, output, query)) != pa._launch_operands(
+        (partials, output, query)
+    )
+    # A launch reads the plan it is called with: a plan of the same fields in
+    # other tensors serves while the recorded call's plan holds no task.
+    moved = dataclasses.replace(
+        plan, work_info=plan.work_info.clone(), reduce_info=plan.reduce_info.clone()
+    )
+    plan.work_info.zero_()
+    plan.reduce_info.zero_()
+    run(work_plan=moved)
+    assert len(compile_kwargs) == (1 if gfx1250 else 3)
+    plan.work_info.copy_(moved.work_info)
+    plan.reduce_info.copy_(moved.reduce_info)
+    # A process starts without the table. gfx1250 opens it by itself and
+    # repeats the launch by the third call.
+    monkeypatch.setattr(pa, "_VALIDATED_LAUNCHES", None)
+    del compile_kwargs[:]
+    run()
+    run()
+    checked = len(compile_kwargs)
+    run()
+    assert len(compile_kwargs) == (checked if gfx1250 else 3)
+
+
 def _check_quant_output(launch, query, output, compile_kwargs, case, plan, pad=3):
     """The FP8 output equals PA's output and the standalone per-token quant bit
     for bit, eagerly and in graph replays; poisoned outputs show every row is
@@ -2822,8 +2953,6 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, plan, pad=3
         assert torch.equal(scale[:rows], ref_scale)
         assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
 
-    # Launches recorded by other cases must not skip the dispatch checked here.
-    importlib.import_module("aiter.ops.flydsl.pa_decode")._VALIDATED_LAUNCHES.clear()
     for store_output in (True, False):
         run(store_output)
         assert compile_kwargs[-1].get("quant_output", False) == fused
@@ -2839,6 +2968,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, plan, pad=3
         assert len(compile_kwargs) == calls
         check(False)
     if case["capture"]:
+        calls = len(compile_kwargs)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -2847,6 +2977,9 @@ def _check_quant_output(launch, query, output, compile_kwargs, case, plan, pad=3
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             run(False)
+        # Capture takes the recorded launch of a fused plan and the checks of
+        # a fallback plan, which is never recorded.
+        assert (len(compile_kwargs) == calls) == fused
         query.neg_()
         graph.replay()
         check(False)
