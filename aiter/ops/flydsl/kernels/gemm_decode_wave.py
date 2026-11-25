@@ -146,8 +146,18 @@ def compile_gemm_decode_wave_bf16(
             for _ in range_constexpr(mp)
         ]
 
-        if config.prefetch_depth == 0:
-            for tile in range_constexpr(full_tiles):
+        # prefetch_depth 0 and 1 build the same kernel: load one tile, then
+        # accumulate it. Shipped rows keep both names, so 0 runs as 1.
+        depth = max(config.prefetch_depth, 1)
+        for batch in range_constexpr((full_tiles + depth - 1) // depth):
+            batch_tiles = min(
+                depth,
+                full_tiles - batch * depth,
+            )
+            prefetched_a = []
+            prefetched_b = []
+            for stage in range_constexpr(batch_tiles):
+                tile = batch * depth + stage
                 k_base = k_element(
                     fx.Int32(tile),
                     lane,
@@ -155,84 +165,38 @@ def compile_gemm_decode_wave_bf16(
                     full_tiles,
                     kvec,
                 )
-                a_vectors = [
-                    load_vector(
-                        a_global,
-                        row_base + fx.Int32(row),
-                        k_base,
-                        a_row_stride,
-                        kvec,
-                    )
-                    for row in range_constexpr(mp)
-                ]
-                b_vectors = [
-                    load_vector(
-                        b_global,
-                        columns[column],
-                        k_base,
-                        k,
-                        kvec,
-                        config.b_cache_modifier,
-                    )
-                    for column in range_constexpr(np)
-                ]
+                prefetched_a.append(
+                    [
+                        load_vector(
+                            a_global,
+                            row_base + fx.Int32(row),
+                            k_base,
+                            a_row_stride,
+                            kvec,
+                        )
+                        for row in range_constexpr(mp)
+                    ]
+                )
+                prefetched_b.append(
+                    [
+                        load_vector(
+                            b_global,
+                            columns[column],
+                            k_base,
+                            k,
+                            kvec,
+                            config.b_cache_modifier,
+                        )
+                        for column in range_constexpr(np)
+                    ]
+                )
+            for stage in range_constexpr(batch_tiles):
                 accumulators = _accumulate_vectors(
                     accumulators,
-                    a_vectors,
-                    b_vectors,
+                    prefetched_a[stage],
+                    prefetched_b[stage],
                     config,
                 )
-        else:
-            for batch in range_constexpr(
-                (full_tiles + config.prefetch_depth - 1) // config.prefetch_depth
-            ):
-                batch_tiles = min(
-                    config.prefetch_depth,
-                    full_tiles - batch * config.prefetch_depth,
-                )
-                prefetched_a = []
-                prefetched_b = []
-                for stage in range_constexpr(batch_tiles):
-                    tile = batch * config.prefetch_depth + stage
-                    k_base = k_element(
-                        fx.Int32(tile),
-                        lane,
-                        fx.Int32(0),
-                        full_tiles,
-                        kvec,
-                    )
-                    prefetched_a.append(
-                        [
-                            load_vector(
-                                a_global,
-                                row_base + fx.Int32(row),
-                                k_base,
-                                a_row_stride,
-                                kvec,
-                            )
-                            for row in range_constexpr(mp)
-                        ]
-                    )
-                    prefetched_b.append(
-                        [
-                            load_vector(
-                                b_global,
-                                columns[column],
-                                k_base,
-                                k,
-                                kvec,
-                                config.b_cache_modifier,
-                            )
-                            for column in range_constexpr(np)
-                        ]
-                    )
-                for stage in range_constexpr(batch_tiles):
-                    accumulators = _accumulate_vectors(
-                        accumulators,
-                        prefetched_a[stage],
-                        prefetched_b[stage],
-                        config,
-                    )
 
         if has_tail:
             tail_start = full_tiles * k_tile

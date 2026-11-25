@@ -244,9 +244,9 @@ def _decode_cache_options(n: int, k: int) -> tuple[int, ...]:
 
 
 def _wave_prefetch_options(k: int, arch: str) -> tuple[int, ...]:
+    # Depth 1 builds the same kernel as depth 0 (one tile loaded, then
+    # accumulated), so the tuner times it once, as 0.
     options = [0]
-    if k >= WAVE_SIZE * 4:
-        options.append(1)
     if arch == "gfx950" and k >= WAVE_SIZE * 8:
         options.append(2)
     return tuple(options)
