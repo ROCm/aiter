@@ -426,7 +426,6 @@ def compile_mixed_moe_gemm1_common(
     pp_b_loads = [p["b_loads"] for p in pipe_phases]
     pp_has_scale = [p["has_scale"] for p in pipe_phases]
 
-    fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
 
     if True:
@@ -665,9 +664,7 @@ def compile_mixed_moe_gemm1_common(
                 # A LDS-DMA can retire on vmcnt before its LDS write is visible to
                 # other waves' ds_read; also waiting for the scale loads issued
                 # after it closes that window (vmcnt one higher still races).
-                body_vmcnt_before_barrier = (
-                    tile_n // 32 * gui_ratio * body_b_load_mult
-                )
+                body_vmcnt_before_barrier = tile_n // 32 * gui_ratio * body_b_load_mult
                 expert_off_idx = expert_idx * (2 * inter_dim)
                 if const_expr(shared_b):
                     weight_expert_off_idx = fx.Index(0)
