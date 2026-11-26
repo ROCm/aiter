@@ -1506,6 +1506,15 @@ DINLINE void lamport_lds_barrier()
 // peers' data sooner when its first poll waits for this load: TP4 bf16 row of
 // 6144, one block a row, 10.4 -> 7.6 us. An s_sleep of any length does not
 // give the same gain (the load seems to return after the sends left).
+//
+// ATTENTION: offset 128 is hard-coded against the argument list of
+// lamport_ar_rmsnorm_gfx1250 (152 bytes; the 30 preloaded dwords end at byte
+// 120 with send_packs, p5 sits at 128). Adding, removing or reordering its
+// arguments can move offset 128 back into the preloaded dwords (or past the
+// arguments): the wait then costs nothing and the gain above is lost, with no
+// error. Check this first if that kernel slows down after such a change.
+// TODO: derive the offset from the argument layout (a struct mirroring the
+// signature and a static_assert on offsetof(..., p5) == 128).
 DINLINE void lamport_kernarg_wait()
 {
     const __attribute__((address_space(4))) volatile int* args =
