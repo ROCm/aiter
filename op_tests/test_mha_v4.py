@@ -1603,7 +1603,7 @@ def test_mha_v4_kv_splits_match_the_unsplit_call(
         output = (out.float() - reference).norm() / reference.norm()
         return output.item(), (lse - reference_lse).abs().max().item()
 
-    if key_length % splits and not mha_v4_module._varlen_capable(
+    if key_length % splits and not mha_v4_module._key_lengths_capable(
         formats[0], formats[2]
     ):
         with expect_raises(ValueError, match="divide the key length"):
@@ -1841,7 +1841,7 @@ def test_mha_v4_kv_splits_need_a_divisor_without_per_batch_key_lengths():
     """
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
     formats = (native_fp8_format(),) * 3
-    with patched_attr(mha_v4_module, "_varlen_capable", lambda *formats: False):
+    with patched_attr(mha_v4_module, "_key_lengths_capable", lambda *formats: False):
         with expect_raises(ValueError, match="divide the key length"):
             mha_v4(q, q, q, *formats, kv_splits=3)
         assert mha_v4(q, q, q, *formats, kv_splits=4).shape == q.shape
@@ -3476,7 +3476,7 @@ def benchmark_mha_v4(
                 sequence_q,
                 heads,
                 sequence_k,
-                ragged=mha_v4_module._varlen_capable(q_format, v_format),
+                ragged=mha_v4_module._key_lengths_capable(q_format, v_format),
                 q_format=q_format,
             )
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
@@ -3668,7 +3668,7 @@ def test_mha_v4_mx_hd256_seqlens_k_matches_truncated_kv(recipe, lengths, padded)
     # one peak in every batch's first key pins that amax for every slice.
     v[:, 0, 0, 0] = 8.0
 
-    varlen = mha_v4(
+    per_batch = mha_v4(
         q,
         k,
         v,
@@ -3688,7 +3688,7 @@ def test_mha_v4_mx_hd256_seqlens_k_matches_truncated_kv(recipe, lengths, padded)
         )
         torch.cuda.synchronize()
         assert torch.equal(
-            varlen[b : b + 1], truncated
+            per_batch[b : b + 1], truncated
         ), f"batch {b} of {lengths} differs from its truncated control"
 
 
@@ -3758,19 +3758,19 @@ def _i8fp8_sparse_kv_tile():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
-def test_mha_v4_varlen_gate_follows_the_live_gpu_not_gpu_archs():
+def test_mha_v4_key_lengths_gate_follows_the_live_gpu_not_gpu_archs():
     """GPU_ARCHS can name another build target, but the launcher dispatches on the live GPU."""
     formats = (AttentionFormat.BF16, AttentionFormat.BF16)
     with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
-        assert mha_v4_module._varlen_capable(*formats)
+        assert mha_v4_module._key_lengths_capable(*formats)
         torch._dynamo.reset()
         gate = torch.compile(
-            lambda x: x + mha_v4_module._varlen_capable(*formats), fullgraph=True
+            lambda x: x + mha_v4_module._key_lengths_capable(*formats), fullgraph=True
         )
         assert gate(torch.zeros(1, device="cuda")).item() == 1
 
 
-@skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
+@skipif(get_gfx() != "gfx950", reason="dense key lengths are a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
     """Off gfx950 the capability gate preempts these, so the dtype and shape messages
     are only reachable here. The sparse rejection below is covered arch-independently
@@ -3847,8 +3847,8 @@ def test_mha_v4_launch_rejects_off_device_lse():
         _launch_bf16_dense(q, out, lse=torch.empty((2, 4, 256), dtype=torch.float32))
 
 
-def check_varlen_capable_objects(arch="gfx950"):
-    """Every dense row _VARLEN_CAPABLE_QV claims must really read the per-batch length.
+def check_key_lengths_capable_objects(arch="gfx950"):
+    """Every dense row _KEY_LENGTHS_CAPABLE_QV claims must really read the per-batch length.
 
     The gate is keyed on (q_format, v_format) alone, so a pair that gains a second object -- a
     different head dim, say -- would inherit the claim without being rebuilt. Nothing numeric
@@ -3875,10 +3875,10 @@ def check_varlen_capable_objects(arch="gfx950"):
             for row in rows
             if row[mode_at] == "0"
             and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
-            in mha_v4_module._VARLEN_CAPABLE_QV
+            in mha_v4_module._KEY_LENGTHS_CAPABLE_QV
         }
     )
-    assert claimed, f"no dense {arch} rows are claimed varlen-capable"
+    assert claimed, f"no dense {arch} rows are claimed to take key lengths"
 
     silent = []
     for name in claimed:
@@ -3896,18 +3896,18 @@ def check_varlen_capable_objects(arch="gfx950"):
         ):
             silent.append(name)
     assert not silent, (
-        f"{arch} rows claimed in _VARLEN_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
+        f"{arch} rows claimed in _KEY_LENGTHS_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
         "they would ignore seqlens_k and silently attend over the full padded key length"
     )
     aiter.logger.info(
-        "varlen gate: all %d claimed %s rows load kernarg 0x1C0", len(claimed), arch
+        "key-length gate: all %d claimed %s rows load kernarg 0x1C0", len(claimed), arch
     )
 
 
 @skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
 @parametrize("arch", ["gfx942", "gfx950"])
-def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
-    check_varlen_capable_objects(arch)
+def test_mha_v4_key_lengths_capable_rows_load_the_seqlens_k_kernarg(arch):
+    check_key_lengths_capable_objects(arch)
 
 
 def check_lse_capable_objects(arch="gfx950"):
