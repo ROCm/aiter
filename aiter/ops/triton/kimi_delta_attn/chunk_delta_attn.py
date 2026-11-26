@@ -148,8 +148,8 @@ def chunk_kimi_delta_attn(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     bwd_backend: str = "triton",
-    fwd_backend: str = "triton",
     save_fwd: bool = False,
+    fwd_backend: str = "triton",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention using Triton.
@@ -254,6 +254,12 @@ def chunk_kimi_delta_attn(
             chunk 64, no GVA, dense or varlen; other calls stay on Triton). The
             forward intermediates are recomputed by the Triton forward
             prologue either way. Default: `"triton"`.
+        save_fwd (bool):
+            Opt-in with `bwd_backend="flydsl"`: the forward keeps its
+            intermediates (`g_cumsum`, `Aqk`, `Akk`, `w`, `u`, `qg`, `kg`) for
+            the backward, which then skips the recompute (memory for time;
+            the analogue of Megatron's `recompute_gdn`, #8739's `save_fwd`).
+            Ignored by the Triton backward. Default: `False` (recompute).
         fwd_backend (str):
             Backend of the inference forward: `"triton"`, or `"flydsl"` for
             the FlyDSL chunk forward (`aiter.ops.flydsl.kda_chunk_fwd`):
@@ -261,12 +267,6 @@ def chunk_kimi_delta_attn(
             `out` / `state_cache`; other calls raise. Its final state is fp32.
             When an input requires grad the forward stays on Triton.
             Default: `"triton"`.
-        save_fwd (bool):
-            Opt-in with `bwd_backend="flydsl"`: the forward keeps its
-            intermediates (`g_cumsum`, `Aqk`, `Akk`, `w`, `u`, `qg`, `kg`) for
-            the backward, which then skips the recompute (memory for time;
-            the analogue of Megatron's `recompute_gdn`, #8739's `save_fwd`).
-            Ignored by the Triton backward. Default: `False` (recompute).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
