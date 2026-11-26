@@ -30,6 +30,11 @@ Failure modes of this hand-off, and what is checked (everything else is the call
   replayed from a CUDA graph without Python (the quantizer replays, the hand-off does not): the tensor holds garbage and
   nothing can notice. A caller whose consumer is not that insert, or whose step runs inside such a graph, MUST pass
   ``defer_ok=False``: the result is then always the computed plain QKV;
+* ``slot_mapping`` / ``index_slot_mapping`` rows that share one 8-slot octet are packed as ONE run into consecutive
+  slots starting at the first row's slot (the decode layout: one request's tokens take consecutive slots). A gapped
+  mapping inside an octet (rows to slots 0 and 2) or one octet reached by two separate runs is NOT supported: the
+  packed run lands in consecutive slots, so the gapped row goes to the wrong slot. Slot ``-1`` (skip) is supported. A
+  caller that cannot guarantee this must pass ``defer_ok=False`` (checking it needs a device sync, so it is not done);
 * two threads (TBO micro-batches) each have their own slot, so each must run projection -> insert in turn.
 
 Technique source of the fused kernels: amd-kernels ``mxfp8_qkv_norm_rope_nvfp4_insert`` (credit only, no import).
