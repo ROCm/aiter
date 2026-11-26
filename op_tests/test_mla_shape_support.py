@@ -227,17 +227,14 @@ def test_decode_num_heads(monkeypatch):
             **kw,
         )
 
-    # A head count that runs is kept; one that does not pads to the next that
-    # does: PS1 takes a multi-token query at 16/32/64 heads only while it fits
-    # one qo tile (16 and 32 heads up to qlen 4, 64 heads up to qlen 2), and
-    # 96 heads at any qlen.
+    # Kept if it runs, else padded to the next that does (PS1: 16/32 heads up
+    # to qlen 4, 64 up to qlen 2, 96 at any qlen).
     assert [heads(16, q) for q in (1, 4, 5)] == [16, 16, 96]
     assert [heads(64, q) for q in (2, 3, 9)] == [64, 96, 96]
     assert heads(65, 1) == 96
-    # A folded PS1 route does not run: fast_mode=False folds 64 heads by 4 and
-    # 96 by 6, so the first unfolded count is 128.
+    # A folded PS1 route does not count (fast_mode=False folds 64 and 96).
     assert heads(64, 1, fast_mode=False) == 128
-    # Every count it returns is one the shape query says runs.
+    # Every answer is one the shape query says runs.
     for n, q in itertools.product((1, 16, 33, 64, 96), (1, 3, 8)):
         h = heads(n, q)
         s = get_mla_decode_shape_support(
@@ -253,21 +250,16 @@ def test_decode_num_heads(monkeypatch):
             cp_round_robin=True,
         )
         assert h >= n and s.supported is not False, (n, q, h, s.reasons)
-        # It pads only onto a kernel head count, the list callers import.
         assert h == n or h in MLA_DECODE_KERNEL_HEAD_COUNTS, (n, q, h)
 
-    # gfx950's experimental HK route reports supported=None (no availability
-    # table) but ignores q_scale and kv_scale, so it never counts as running:
-    # 128 heads route there and are the last candidate, leaving no answer.
+    # HK (gfx950, experimental) ignores q/kv scales: never counted.
     fp8 = torch.float8_e4m3fn
     hk = {"arch": "gfx950", "enable_experimental": True}
     s = get_mla_decode_shape_support(128, 1, fp8, fp8, **hk)
     assert (s.backend, s.supported) == (MlaBackend.HK, None), s.reasons
     assert get_mla_decode_num_heads(128, 1, fp8, fp8, **hk) is None
 
-    # OPUS (AITER_MLA_USE_OPUS=1, as in test_opus_cp) has no availability table
-    # either: a call its rules accept counts as running (supported is None), and
-    # one they reject (CP without round-robin KV, bf16 CP) is never answered.
+    # OPUS (as in test_opus_cp): counted only where its rules accept the call.
     monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
     get_mla_decode_shape_support.cache_clear()
     opus = {"cp_world_size": 4, "arch": "gfx950", "enable_experimental": False}

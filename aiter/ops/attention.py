@@ -2705,22 +2705,12 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
     _get_mla_decode_shape_support_cached.cache_clear
 )
 
-# Q head counts get_mla_decode_num_heads pads a query to: 16 and the wider
-# counts the MLA decode kernels are built for. It only ever answers one of
-# these or the count it was asked for; narrower counts some architectures also
-# run (gfx950 fp8: 8 heads at qlen 4, 12 heads up to 128 rows) are not tried.
-# Callers that pick a padded width themselves read the list here. Source of
-# truth: the head counts the decode backends are built for, i.e. the per-arch
-# asm tables (hsa/<arch>/mla/*.csv) and the FlyDSL / OPUS kernels; update this
-# list when a backend gains or drops a width.
+# Head counts get_mla_decode_num_heads pads to. Source of truth: the widths the
+# decode backends are built for (per-arch asm tables, FlyDSL / OPUS kernels).
 MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
-# JIT routes whose supported=None get_mla_decode_num_heads counts as running.
-# Neither FlyDSL PS1 nor OPUS has an availability table, and the shape rules
-# already return False for the calls each cannot take (e.g. a folded PS1 route;
-# OPUS CP without round-robin KV, or bf16 CP), so None there means "accepted by
-# the rules". HK also reports None, but hk_mla_v32_decode_fwd ignores q_scale
-# and kv_scale.
+# JIT routes (no availability table) whose supported=None counts as running.
+# HK is left out: it ignores q_scale and kv_scale.
 _MLA_DECODE_JIT_BACKENDS_THAT_RUN = (MlaBackend.FLYDSL_PS1, MlaBackend.OPUS)
 
 
@@ -2731,35 +2721,17 @@ def get_mla_decode_num_heads(
     kv_dtype: torch.dtype,
     **kwargs,
 ) -> int | None:
-    """The first of num_heads and the kernel head counts above it that runs.
+    """The first of num_heads and the wider MLA_DECODE_KERNEL_HEAD_COUNTS that runs.
 
-    For a caller that can pad its query heads (a DCP gather pads with zeros):
-    num_heads itself and each MLA_DECODE_KERNEL_HEAD_COUNTS entry above it are
-    tried in order, each through get_mla_decode_shape_support with the same
-    arguments, and the first that runs is returned. A head count runs when its
-    kernel is known to exist (supported is True), or when it takes a FlyDSL PS1
-    or OPUS JIT route, which has no availability table (supported is None). A
-    folded PS1 route, a head count the planner or reducer rejects, an asm route
-    whose table has no kernel or could not be queried, and gfx950's
-    experimental HK route (supported is None, but it ignores q_scale and
-    kv_scale) do not run. None when no head count up to 128 runs.
+    For a caller that pads its query heads (e.g. a DCP gather). Each candidate
+    goes through get_mla_decode_shape_support with kwargs, which must describe
+    the call the caller will make (return_lse, cp_world_size, ...). It runs if
+    supported is True, or None on a FlyDSL PS1 / OPUS route. None if no
+    candidate up to 128 runs.
 
-    Only those candidates are tried, so the answer is the fewest heads among
-    them, not among every count the shape rules accept: gfx950 fp8 also runs
-    8 heads (qlen 4) and 12 heads (up to 128 rows), which are never answered
-    (9 heads give 16 there, not 12). Fewer heads are not always faster, so
-    padding to such a narrower width is the caller's choice, by measurement.
-
-    "Runs" means the shape rules accept the head count; nothing is launched.
-    The answer therefore has get_mla_decode_shape_support's limits (see
-    MlaDecodeShapeSupport): launch-size limits are not checked (the gfx950
-    non-persistent fp8 64-head kernel still raises at launch when
-    kv_split > 1 and total_q * kv_split > 32768), and only
-    kv_layout="token_major" is described.
-
-    kwargs are get_mla_decode_shape_support's keywords and describe the call
-    the caller will make, e.g. return_lse, cp_world_size and cp_round_robin
-    for a DCP decode.
+    "Runs" is the shape rules' answer with their limits (MlaDecodeShapeSupport);
+    nothing is launched. Narrower counts some arches accept (gfx950 fp8: 8 and
+    12 heads) are not tried, and fewer heads are not always faster.
     """
     for heads in sorted(
         {num_heads, *(n for n in MLA_DECODE_KERNEL_HEAD_COUNTS if n > num_heads)}
