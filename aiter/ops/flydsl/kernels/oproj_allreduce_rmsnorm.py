@@ -29,9 +29,12 @@ order:
 
 Phases 1 and 2 are mega paged attention's phases 3 and 4, unchanged: the same
 tiles, reductions, inbox layout and rank-order bf16 rounding. On gfx942 o_proj
-runs in 32-row passes and each wave stages its fp32 partial in its own LDS
-region; the push adds them in the same order (the same sums). A pass's first
-K steps of x go out before the previous pass's wave reduce and push.
+runs in 32-row passes (16-row passes up to PASS16_ROWS rows when quantizing
+two-shot) and each wave stages its fp32 partial in its own LDS region; the
+push adds them in the same order (the same sums). A pass's first K steps of x
+go out before the previous pass's wave reduce and push. With 4+ passes, the
+CTAs left without a tile reduce-scatter the rows of all but the last two
+passes while those compute.
 
 ``xs`` (and ``x_scale`` when quantizing) must be uncached memory
 (``IpcHeap`` uncached), like mega paged attention's hand-off buffers; rows of
@@ -113,6 +116,10 @@ EARLY_CLAIM_ROWS = 80
 # launch-time claim before the epoch lands: from 48 rows on, the earlier W
 # loads cost phase 0 more than they save.
 LAUNCH_ORDER_ROWS = 32
+# gfx942, quantizing, two-shot: the largest max_rows that runs o_proj in
+# 16-row passes (32-row passes above): the first rows' push overlaps the next
+# pass's gemm.
+PASS16_ROWS = 48
 
 
 def compile_oproj_allreduce_rmsnorm(
@@ -171,9 +178,14 @@ def compile_oproj_allreduce_rmsnorm(
             )
     m_sub = max_rows // 16
     # gfx942: 32-row o_proj passes, so a pass's partial tile fits an LDS
-    # region a wave (``wave_regions``) and every K step of x stays in flight.
+    # region a wave (``wave_regions``) and every K step of x stays in flight;
+    # 16-row passes up to PASS16_ROWS rows when quantizing two-shot.
     gfx942 = get_rocm_arch().split(":")[0] == "gfx942"
-    pass_subs = min(m_sub, 2 if gfx942 else PASS_ROWS // 16)
+    if gfx942:
+        pass16 = quantize and two_shot and max_rows <= PASS16_ROWS
+        pass_subs = min(m_sub, 1 if pass16 else 2)
+    else:
+        pass_subs = min(m_sub, PASS_ROWS // 16)
     passes = [(m0, min(pass_subs, m_sub - m0)) for m0 in range(0, m_sub, pass_subs)]
     if hidden % block_n or block_n % 16:
         raise ValueError(
@@ -255,6 +267,26 @@ def compile_oproj_allreduce_rmsnorm(
     # when every tile starts at launch (early_claim), where all of them lose.
     cross_x = gfx942 and len(passes) > 1
     x_ahead = prefetch if world_size >= 4 and not early_claim else min(2, prefetch)
+    # gfx942 two-shot, 4+ passes of 32 rows (112 and 128 rows): the rows of
+    # the passes before the last two (``early_rows``) reach the reduce-scatter
+    # inboxes two passes before the tile CTAs reach phase 2. The
+    # ``free_ctas`` CTAs left without a tile (one claim each) reduce-scatter
+    # them and push their all-gather meanwhile, the j-th to claim past the
+    # tiles rows j + free_ctas e in pass order; CTA ``row`` still gathers,
+    # adds the residual and normalizes. (Rows of the pass before the last
+    # cost more than they save: their all-gather meets the last pass's push.)
+    free_ctas = grid - n_tiles
+    early_rows = 0
+    if (
+        gfx942
+        and two_shot
+        and pass_subs == 2
+        and len(passes) >= 4
+        and free_ctas > 0
+        and not early_claim
+    ):
+        early_rows = 16 * passes[-2][0]
+    early_per = -(-early_rows // max(free_ctas, 1))
     # ``sync`` words.
     x_done_at = 0
     tile_claim_at = x_done_at + 2 * x_groups * SYNC_LINE
@@ -1272,6 +1304,9 @@ def compile_oproj_allreduce_rmsnorm(
         ]
         w_rsrc = _rsrc(w_ptr)
         tile = _first_tile(sync_ptr, claim, word_base, tid)
+        if const_expr(early_rows):
+            # j for the j-th CTA to claim past the tiles; negative with a tile.
+            free = tile - n_tiles
         while tile < n_tiles:
             col_scales = _load_col_scales(tile, tid, w_scale_ptr)
             ws = _load_w_slice(tile, w_rsrc, lane, warp)
@@ -1343,8 +1378,18 @@ def compile_oproj_allreduce_rmsnorm(
         _stamp(trace_ptr, bid, 3, tid)
 
         # Phase 2: a row's all-reduce, residual add and RMSNorm.
+        if const_expr(early_rows):
+            early_live = (num_rows < early_rows).select(num_rows, fx.Int32(early_rows))
+            if free >= 0:
+                for e in range_constexpr(early_per):
+                    early = free + e * free_ctas
+                    if early < early_live:
+                        _reduce_slice(early, parity, peers, tid)
         for row in range(bid, num_rows, nblk):
-            if const_expr(two_shot and not rs_in_tile):
+            if const_expr(early_rows):
+                if row >= early_live:
+                    _reduce_slice(row, parity, peers, tid)
+            elif const_expr(two_shot and not rs_in_tile):
                 _reduce_slice(row, parity, peers, tid)
             _reduce_row(
                 row,
