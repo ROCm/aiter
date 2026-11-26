@@ -172,9 +172,10 @@ class GroupedNonEpTokenFallbackTest(unittest.TestCase):
         self.rows.append(row)
         return row
 
-    def lookup(self, token, *, topk=6, ep_fused=False):
+    def lookup(self, token, *, topk=6, ep_fused=False, split_m=None):
         return _find_grouped_config(
             token_num=token,
+            split_m=split_m,
             model_dim=5120,
             inter_dim=2304,
             experts=96,
@@ -282,6 +283,68 @@ class GroupedNonEpTokenFallbackTest(unittest.TestCase):
         self.add_row(32768, topk="-1")
         expected = self.add_row(65536, topk="-1")
         self.assertIs(self.lookup(_get_padded_m(65536), topk=-1), expected)
+
+    def test_split_row_serves_the_lower_part_of_its_bucket(self):
+        self.add_row(2048)
+        split = self.add_row(3072)
+        bucket = self.add_row(4096)
+        for m, expected in (
+            (2049, split),
+            (2560, split),
+            (3072, split),
+            (3073, bucket),
+            (4096, bucket),
+        ):
+            with self.subTest(m=m):
+                self.assertIs(self.lookup(_get_padded_m(m), split_m=m), expected)
+        self.assertIs(self.lookup(4096), bucket)
+
+    def test_smallest_split_row_wins(self):
+        self.add_row(4096)
+        self.add_row(3584)
+        expected = self.add_row(3072)
+        self.assertIs(self.lookup(4096, split_m=2560), expected)
+
+    def test_split_row_of_another_shape_is_ignored(self):
+        bucket = self.add_row(4096)
+        self.add_row(3072, model_dim="7168")
+        self.add_row(3072, topk="-1")
+        self.assertIs(self.lookup(4096, split_m=2560), bucket)
+
+    def test_split_row_keeps_ep_specificity(self):
+        self.add_row(3072)
+        fused = self.add_row(3072, ep_fused="1")
+        self.add_row(4096, ep_fused="1")
+        self.assertIs(self.lookup(4096, ep_fused=True, split_m=2560), fused)
+
+    def test_kimi_k3_bucket_4096_splits_at_3072(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "aiter/configs/model_configs/kimik3_gfx1250_tuned_grouped_fmoe.csv"
+        )
+        with path.open() as stream:
+            self.rows.extend(csv.DictReader(stream))
+
+        def k3(m):
+            return _find_grouped_config(
+                token_num=_get_padded_m(m),
+                split_m=m,
+                model_dim=3584,
+                inter_dim=3072,
+                experts=112,
+                topk=-1,
+                activation=ActivationType.Situv2,
+                dtype=dtypes.bf16,
+                q_dtype_a=dtypes.fp4x2,
+                q_dtype_w=dtypes.fp4x2,
+                quant_type=QuantType.per_1x32,
+                ep_fused=True,
+            )
+
+        for m, token, tile_m in ((2560, "3072", "64"), (3584, "4096", "128")):
+            with self.subTest(m=m):
+                row = k3(m)
+                self.assertEqual((row["token"], row["tile_m"]), (token, tile_m))
 
 
 if __name__ == "__main__":

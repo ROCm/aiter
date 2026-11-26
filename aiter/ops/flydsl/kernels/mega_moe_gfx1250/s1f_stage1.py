@@ -149,11 +149,20 @@ MB_SM_B = 128
 #: multiple of it; a smaller tile_m is its own flag tile, see s1f_flag_m).
 #: A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+#: Flag tile of a GEMM1 tile_m that FLAG_M does not divide (96 = 3 x 32).
+FLAG_M_SMALL = 32
 
 
 def s1f_flag_m(tile_m: int) -> int:
-    """Flag tile rows for a GEMM1 tile: FLAG_M, or the whole tile below it."""
-    return min(int(tile_m), FLAG_M)
+    """Flag-tile rows for a GEMM1 ``tile_m``: an m-tile is whole flag tiles,
+    each of one expert. FLAG_M when it divides the tile, the whole tile below
+    it (16 / 32, aiter#5899), else FLAG_M_SMALL (96 = 3 x 32)."""
+    t = int(tile_m)
+    if t % FLAG_M == 0:
+        return FLAG_M
+    if t < FLAG_M:
+        return t
+    return FLAG_M_SMALL
 
 
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
@@ -572,13 +581,23 @@ def make_s1f_stage1(
         raise ValueError("run metadata does not fit its LDS slot")
     if not 1 <= int(producers) < int(workers):
         raise ValueError(f"producers={producers} must be in [1, workers={workers})")
-    if npes > 8:
-        raise ValueError("tile_src is an 8-bit source mask")
+    if npes > 16:
+        raise ValueError("tile_src is a 16-bit source mask")
+    # npes>8 moves rows into bits [31:24]. Those stay signed-positive only
+    # through 127, and a tile that wide is also more than one flag tile.
+    if npes > 8 and int(tile_m) > 127:
+        raise ValueError(f"npes={npes} packs a tile's rows in 8 bits, tile_m={tile_m}")
     if 4 * npes > FLAG_STRIDE:
         raise ValueError("a tile's flag slot holds one i32 per source")
-    # One b128 load covers up to 4 sources' flags; above that, wave 0 polls
-    # them with one lane per source.
+    # One b128 covers 4 sources. npes>4 polls with one lane per source, and
+    # the epilogue pre-check loads one b128 per 4 sources (up to 16).
     POLL = 1 if npes <= 4 else 0
+    # npes<=8: srcmask[7:0] | expert[15:8] | rows[31:16].
+    # npes>8:  srcmask[15:0] | expert[23:16] | rows[31:24].
+    _SRC_MASK = 0xFFFF if int(npes) > 8 else 0xFF
+    _EXP_SHIFT = 16 if int(npes) > 8 else 8
+    _ROW_SHIFT = 24 if int(npes) > 8 else 16
+    _ROW_MASK = 0xFF if int(npes) > 8 else 0xFFFF
     if int(producers) % N_XCC or int(workers) % N_XCC:
         raise ValueError(
             f"block-id roles need producers={producers} and workers={workers} "
@@ -639,10 +658,10 @@ def make_s1f_stage1(
         raise ValueError(
             f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
-    if SUB > 1 and not POLL:
+    if SUB > 1 and npes > 8:
         raise ValueError(
-            "an m-tile of several flag tiles reads one b128 of flags per flag "
-            f"tile, which holds 4 sources, not npes={npes}"
+            "an m-tile of several flag tiles joins tile_info's 8-bit source "
+            f"masks, not npes={npes}"
         )
     if row_stride > 0xFFFF:
         raise ValueError("TDM row width is 16-bit")
@@ -1840,23 +1859,45 @@ def make_s1f_stage1(
                 return ok
 
             def flag_load(m, live=None, spin=True):
-                """Lane 0: the tile's 16 B of per-source flags, SCOPE_SYS.
-                ``spin``: volatile, so a poll loop re-issues it (the memory
-                legalizer then also waits right after it); the pre-check
-                load is not volatile and stays in flight until its use."""
+                """Lane 0 loads this tile's per-source flags, SCOPE_SYS.
+                npes<=4: one b128. npes<=8: two b128s. npes<=16: four.
+                MUBUF is dwordx4, so a wider flag vector is several b128s.
+                ``spin``: volatile, so a poll loop re-issues it; the pre-check
+                load stays in flight until its use."""
                 on = lane == fx.Int32(0)
                 if const_expr(live is not None):
                     on = on & live
-                return fx.Vector(
-                    buffer_load(
-                        rsrc_flag,
-                        m * fx.Int32(FLAG_STRIDE // 4),
-                        vec_width=4,
-                        dtype=T.i32,
-                        mask=on,
-                        cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                mod = POLL_SCOPE | (_VOLATILE if spin else 0)
+                base = m * fx.Int32(FLAG_STRIDE // 4)
+
+                def _b128(off):
+                    return fx.Vector(
+                        buffer_load(
+                            rsrc_flag,
+                            off,
+                            vec_width=4,
+                            dtype=T.i32,
+                            mask=on,
+                            cache_modifier=mod,
+                        )
                     )
-                )
+
+                if const_expr(POLL):
+                    return _b128(base)
+                if const_expr(int(npes) <= 8):
+                    lo = _b128(base)
+                    hi = _b128(base + fx.Int32(4))
+                    return fx.Vector.from_elements(
+                        [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]],
+                        dtype=fx.Int32,
+                    )
+                chunks = [
+                    _b128(base + fx.Int32(4 * i)) for i in range((int(npes) + 3) // 4)
+                ]
+                elems = []
+                for ch in chunks:
+                    elems.extend((ch[0], ch[1], ch[2], ch[3]))
+                return fx.Vector.from_elements(elems[: int(npes)], dtype=fx.Int32)
 
             def flag_load_sub(m, live=None, spin=True):
                 """Lane j < SUB: flag tile m * SUB + j's 16 B of flags, one
@@ -1864,15 +1905,30 @@ def make_s1f_stage1(
                 on = lane < fx.Int32(SUB)
                 if const_expr(live is not None):
                     on = on & live
-                return fx.Vector(
-                    buffer_load(
-                        rsrc_flag,
-                        (m * fx.Int32(SUB) + lane) * fx.Int32(FLAG_STRIDE // 4),
-                        vec_width=4,
-                        dtype=T.i32,
-                        mask=on,
-                        cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                fbase = (m * fx.Int32(SUB) + lane) * fx.Int32(FLAG_STRIDE // 4)
+
+                def _chunk(i):
+                    return fx.Vector(
+                        buffer_load(
+                            rsrc_flag,
+                            fbase + fx.Int32(4 * i),
+                            vec_width=4,
+                            dtype=T.i32,
+                            mask=on,
+                            cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                        )
                     )
+
+                if const_expr(int(npes) <= 4):
+                    return _chunk(0)
+                # npes <= 8: two b128s per lane (one per 4 sources).
+                lo = _chunk(0)
+                hi = _chunk(1)
+                return fx.Vector.from_elements(
+                    [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]][
+                        : int(npes)
+                    ],
+                    dtype=fx.Int32,
                 )
 
             def ready_sub(fv, ts):
@@ -1955,7 +2011,7 @@ def make_s1f_stage1(
             while code >= fx.Int32(0):
                 m = code >> fx.Int32(_ITEM_N_BITS)
                 n = code & fx.Int32(_ITEM_N_MASK)
-                mask = tinfo & fx.Int32(0xFF)
+                mask = tinfo & fx.Int32(_SRC_MASK)
 
                 def a_ready(m=m, mask=mask, ready=ready, seq=seq):
                     # A / A-scale owner waves only (0 and 1): wave 0 polls the
@@ -2047,8 +2103,8 @@ def make_s1f_stage1(
 
                 set_holders(
                     (
-                        (tinfo >> fx.Int32(8)) & fx.Int32(0xFF),
-                        (tinfo >> fx.Int32(16)) & fx.Int32(0xFFFF),
+                        (tinfo >> fx.Int32(_EXP_SHIFT)) & fx.Int32(0xFF),
+                        (tinfo >> fx.Int32(_ROW_SHIFT)) & fx.Int32(_ROW_MASK),
                     ),
                     a_ready,
                     {

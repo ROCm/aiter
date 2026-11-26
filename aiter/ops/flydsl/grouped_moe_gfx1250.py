@@ -206,7 +206,14 @@ def _find_grouped_config(
     q_dtype_w,
     quant_type,
     ep_fused: bool = False,
+    split_m: int | None = None,
 ):
+    """The tuned row for ``token_num`` (a ``_get_padded_m`` bucket).
+
+    ``split_m`` is the M before padding. A compatible row tuned at a token in
+    ``[split_m, token_num)`` splits that power-of-two bucket and serves M
+    instead of the bucket's row; the smallest such token wins.
+    """
     from aiter.jit.utils.chip_info import get_cu_num
 
     keys = {
@@ -261,14 +268,19 @@ def _find_grouped_config(
 
     max_token = 0
 
-    def _matches(row, *, require_cu_num: bool):
-        nonlocal max_token
+    def _compatible(row, *, require_cu_num: bool):
         for k, v in keys.items():
             if k == "token" or (k == "cu_num" and not require_cu_num):
                 continue
             cell = _cell(row, k)
             if cell and cell != v:
                 return False
+        return True
+
+    def _matches(row, *, require_cu_num: bool):
+        nonlocal max_token
+        if not _compatible(row, require_cu_num=require_cu_num):
+            return False
         token = _cell(row, "token")
         if token.isdigit():
             max_token = max(max_token, int(token))
@@ -279,6 +291,21 @@ def _find_grouped_config(
         if not matches:
             matches = [row for row in rows if _matches(row, require_cu_num=False)]
         return matches
+
+    if split_m is not None and 0 < int(split_m) < int(token_num):
+        # Same cu_num preference as _find_matches: relaxed only when the
+        # shape has no row for this cu_num at all.
+        shape_rows = [r for r in rows if _compatible(r, require_cu_num=True)]
+        if not shape_rows:
+            shape_rows = [r for r in rows if _compatible(r, require_cu_num=False)]
+        splits = sorted(
+            int(t)
+            for r in shape_rows
+            if (t := _cell(r, "token")).isdigit()
+            and int(split_m) <= int(t) < int(token_num)
+        )
+        if splits:
+            keys["token"] = str(splits[0])
 
     matches = _find_matches()
     if not matches and 0 < max_token < token_num:
@@ -1988,6 +2015,9 @@ def grouped_gemm_gfx1250_a8w4(
             raise ValueError("herd_topk does not support a MegaMoE dispatch context")
         topk = herd_topk
     _csv_tokens = token_num
+    # Only the compact recv bound splits a bucket: it takes a few values per
+    # run, while a per-call token count would key the lookup cache on every M.
+    _split_m = None
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
         # as the token count. CSV still keys off the recv-token bucket -- this
@@ -1997,6 +2027,7 @@ def grouped_gemm_gfx1250_a8w4(
         _csv_tokens = int(getattr(_cctx, "compact_recv_bound", 0) or 0) or (
             int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
         )
+        _split_m = _csv_tokens
     if token_num == 0:
         # No tokens to compute (common in EP when a rank receives 0 dispatched
         # tokens). The grouped route/GEMM kernels would launch with a zero-sized
@@ -2008,6 +2039,7 @@ def grouped_gemm_gfx1250_a8w4(
     num_buffers = 2
     cfg_row = _find_grouped_config(
         token_num=_get_padded_m(_csv_tokens),
+        split_m=_split_m,
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,

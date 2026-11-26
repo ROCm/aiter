@@ -85,13 +85,17 @@ _S1F_GROUP_M = 8
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
 _S1F_MAX_RECV = 4096
 #: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
-#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
+#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 to EP16. At
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+#: EP8 and EP16 run fused 8-16% faster than unfused from 1024 tokens/rank up
+#: to a 131072 bound (EP8 1014 vs 1207 us/layer at 8192, EP16 1174 vs 1405).
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
+    (8, 6): 1 << 30,
+    (16, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
 }
@@ -184,8 +188,8 @@ def blocking_reasons(config) -> list:
     reasons = []
     if config.dispatch_wire != "fp4":
         reasons.append(f"needs the fp4 dispatch wire, got {config.dispatch_wire}")
-    if config.world_size > 8:
-        reasons.append(f"world_size {config.world_size} > 8 (8-bit source mask)")
+    if config.world_size > 16:
+        reasons.append(f"world_size {config.world_size} > 16 (16-bit source mask)")
     if config.experts_per_rank > 255:
         reasons.append(f"{config.experts_per_rank} experts per rank > 255")
     if config.max_tokens_per_rank > 0xFFFF:
@@ -344,9 +348,12 @@ class _Stage1Fusion:
                 f"stage-1 tile {align_m} does not fit model_dim "
                 f"{self.d.config.hidden_dim} on {self.cu} CUs"
             )
-        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4:
+        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 8:
+            # An m-tile of several flag tiles keeps its flags in one lane per
+            # flag tile, up to two b128s (8 sources); tile_info's 16-bit mask
+            # (npes > 8) is not joined across flag tiles.
             reasons.append(
-                f"step tile_m {align_m} with {self.d.config.world_size} ranks > 4"
+                f"step tile_m {align_m} with {self.d.config.world_size} ranks > 8"
             )
         if int(self.d.config.experts_per_rank) > 255:
             reasons.append(f"{self.d.config.experts_per_rank} experts per rank > 255")

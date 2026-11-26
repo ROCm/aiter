@@ -130,6 +130,13 @@ _DEFAULT_SCALE_INIT = "constant"
 _PASS_ENV = "_BENCH_MEGA_MOE_PASS"
 _PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
 
+# On HIP's classic graph path the ROCm torch profiler segfaults in stopTrace
+# (kineto RoctracerActivityApi::processActivities) once one graph holds a few
+# dozen stage1_fused layers, and already drops kernel records at 16. The
+# profiling pass only builds the kernel table, and a kernel's per-call time does
+# not depend on how long the chain is, so it captures at most this many layers.
+_PROFILE_PASS_MAX_LAYERS = int(os.environ.get("AITER_BENCH_PROFILE_LAYERS", "8"))
+
 
 def _import_mori_comm():
     """Import Mori's communicator (needed by every configuration)."""
@@ -1270,6 +1277,13 @@ def main():
                 "path in a fresh process",
                 flush=True,
             )
+            if n_layers > _PROFILE_PASS_MAX_LAYERS:
+                print(
+                    f"# note: the profiling pass captures {_PROFILE_PASS_MAX_LAYERS} "
+                    f"of the {n_layers} layers (AITER_BENCH_PROFILE_LAYERS); the "
+                    "timing pass runs all of them",
+                    flush=True,
+                )
         elif classic_graph:
             print(
                 "# note: HIP classic graph path (DEBUG_HIP_GRAPH_CLASSIC_PATH=1) "
@@ -1384,6 +1398,9 @@ def main():
                 f"{args.combine_quant} wire -- running it on bf16",
                 flush=True,
             )
+        pipe_layers = (
+            min(n_layers, _PROFILE_PASS_MAX_LAYERS) if profile_pass else n_layers
+        )
         pipe = DeviceMoEPipeline(
             dist_ctx,
             E,
@@ -1391,7 +1408,7 @@ def main():
             idim,
             topk,
             spec,
-            n_layers,
+            pipe_layers,
             w1_bf,
             w2_bf,
             sw1,
@@ -1422,12 +1439,15 @@ def main():
                 warmup=args.warmup if profile_pass else 0,
                 prof_replays=args.prof_replays,
             )
-            prof_us_by_mode[mode] = dist_ctx.allreduce_avg_float(prof_us)
+            # Scaled to the full chain when the profiling pass captured fewer layers.
+            prof_us_by_mode[mode] = dist_ctx.allreduce_avg_float(
+                prof_us * n_layers / pipe_layers
+            )
             # Collective, so every rank calls it; only rank 0 gets the table.
             tbl = _aggregate_prof_table(
                 pipe._prof,
                 dist_ctx,
-                per_layer_denom=args.prof_replays * n_layers,
+                per_layer_denom=args.prof_replays * pipe_layers,
             )
             if dist_ctx.rank == 0 and tbl is not None:
                 kernel_rows[mode] = tbl["rows"]
