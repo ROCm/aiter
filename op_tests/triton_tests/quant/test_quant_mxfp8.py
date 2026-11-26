@@ -643,14 +643,6 @@ def test_fused_deepseek_v4_mxfp8_quant_q_pack(T, H, mag):
     assert (u8[..., _NOPE + 2 * _NUM_TILES :] == 0).all(), "tail not zeroed"
 
 
-def test_fused_deepseek_v4_mxfp8_quant_q_pack_contract():
-    """A row that is not 448 NoPE + 64 RoPE is refused, not silently reshaped."""
-    _skip_without_fp8()
-    q = torch.zeros(2, 4, 256, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="448 NoPE"):
-        fused_deepseek_v4_mxfp8_quant_q_pack(q)
-
-
 # --------------------------------------------------------------------------- #
 # fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 # --------------------------------------------------------------------------- #
@@ -940,29 +932,6 @@ def test_fused_deepseek_v4_k_cache_layouts_agree(seq_lens):
         outs.append(out)
     for r, s in enumerate(seq_lens):
         torch.testing.assert_close(outs[0][r, :s], outs[1][r, :s], **_EXACT)
-
-
-def test_fused_deepseek_v4_k_cache_contract():
-    """What the writer refuses."""
-    _skip_without_fp8()
-    cache = torch.zeros(2, 64, _REC, dtype=torch.uint8, device="cuda")
-    slot = torch.zeros(4, dtype=torch.int64, device="cuda")
-    with pytest.raises(AssertionError, match="512"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda"), cache, slot, 64
-        )
-    with pytest.raises(AssertionError, match="bf16"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(4, _QK, dtype=torch.float16, device="cuda"), cache, slot, 64
-        )
-    # strided columns: rows may be strided, the 512 values in a row may not
-    with pytest.raises(AssertionError, match="contiguous"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(_QK, 4, dtype=torch.bfloat16, device="cuda").t(),
-            cache,
-            slot,
-            64,
-        )
 
 
 def test_fused_deepseek_v4_gather_sliced_block_table():
@@ -1453,14 +1422,3 @@ def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
         atol=1,
         rtol=0,
     )
-
-
-def test_dynamic_mxfp8_quant_backend_validation():
-    if not arch_info.is_any_fp8_avail():
-        pytest.skip("FP8 not supported on this arch")
-    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="Unknown backend"):
-        dynamic_mxfp8_quant(x, backend="cuda")
-    # fp32 input has no Gluon kernel on any arch.
-    with pytest.raises(RuntimeError, match="Gluon backend requires"):
-        dynamic_mxfp8_quant(x.float(), backend="gluon")

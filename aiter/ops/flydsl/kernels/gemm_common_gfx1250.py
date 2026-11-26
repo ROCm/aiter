@@ -1,5 +1,6 @@
 """Shared utilities for gfx1250 GEMM kernels (fp16 / mxfp4 / mxfp8)."""
 
+import os
 from collections import namedtuple
 
 import flydsl.expr as fx
@@ -92,6 +93,8 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
+#: Kernels call prefetch_kernel_code at entry and add ``_ipf`` to their name.
+INST_PREFETCH = os.environ.get("AITER_FLYDSL_INST_PREFETCH", "1") == "1"
 # One s_prefetch_inst covers at most 32 lines of 128 B. The instruction cache is 64 KB, so only the head of a
 # kernel larger than the cap is prefetched.
 KERNEL_PREFETCH_MAX_BYTES = 56 * 1024
