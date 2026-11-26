@@ -1551,7 +1551,8 @@ def test_paged_snapshots_match_dense(chunks_per_seg):
 def test_snapshot_table_survives_graph_replay():
     """A graph captured after the table is cached stores the eager call's
     snapshots on every replay, though the capture frees and rewrites scratch
-    first, and the cached table is not in the graph's pool."""
+    first: the table was built before the capture, so it is not in the
+    graph's pool."""
     args = make_inputs(1, 512, 4)
     targets = ((0, 128), (0, 320), (0, 480))
     for _ in range(2):  # the first call of a new specialization autotunes
