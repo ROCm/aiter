@@ -95,7 +95,7 @@
         "kernel_type": "compute_bound",
         "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
