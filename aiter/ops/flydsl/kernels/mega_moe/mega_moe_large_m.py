@@ -1502,6 +1502,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
     ``g2_fold`` (16; BM64 with g2_as_lds and scale staging): a unit whose ``fold`` flag is set also computes, scatters,
     stages and (as the closer) publishes the first 16 rows of the next m-block, its expert's tail of at most 16 rows,
     whose own units are skipped.
+    The body's ``claim_ahead`` (publish only) is called before the unit's drain.
     """
     SBM = BM if SBM is None else int(SBM)
     FOLD = int(g2_fold)
@@ -1575,7 +1576,10 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
 
     @flyc.jit
     def _publish_tok_ready(lds_base_i32, tx_i32, m_block_idx, num_n_blocks, addr_close_ctr, addr_p2p_tok_ready, lane, wave,
-                           addr_scale_stage, fold=None, rows_rt=None):
+                           addr_scale_stage, fold=None, rows_rt=None, claim_ahead=None):
+        # The caller's next claim goes out ahead of the drain: its RMW returns while the peer stores retire.
+        if const_expr(claim_ahead is not None):
+            claim_ahead()
         # The peer payload/scale stores are cache-19 write-through (system coherent), so each
         # wave only has to drain them and order them at workgroup scope before the barrier; an
         # agent-scope release here would write back the whole L2 once per (m, n) unit.
@@ -1621,7 +1625,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
     def _emit_stage2_body(lds_base_i32, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_stids,
         arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad,
         i32_npad, unit_bx, m_block_idx, tx_i32, lane, wave, addr_close_ctr, addr_p2p_tok_ready, addr_scale_stage,
-        fold=None):
+        fold=None, claim_ahead=None):
     # fmt: on
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
         m_row = m_block_idx * fx.Int32(BM)
@@ -1686,7 +1690,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
         if const_expr(publish):
             num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
             _publish_tok_ready(lds_base_i32, tx_i32, m_block_idx, num_n_blocks, addr_close_ctr, addr_p2p_tok_ready, lane, wave,
-                addr_scale_stage, fold=fold, rows_rt=rows_rt)
+                addr_scale_stage, fold=fold, rows_rt=rows_rt, claim_ahead=claim_ahead)
 
     return _emit_stage2_body, c
 
@@ -2027,6 +2031,10 @@ def compile_mega_moe_stage1(
     G2_FOLD = int(_s2.get("g2_fold", 0))
     # g2_nt_single (with g2_fold): a GEMM2 unit whose m-block is its expert's only one streams W2 (second body).
     G2_NT_SINGLE = bool(_s2.get("g2_nt_single", 0))
+    # With g2_skip_pad, one byte an m-block past the GEMM2 claim words holds its claim outcome, in the A-scale LDS
+    # bytes GEMM2 leaves unused.
+    G2_CLASS_BYTE = 32
+    assert not G2_SKIP_PAD or G2_CLASS_BYTE + MAX_G2_M_BLOCKS <= n_scale_bytes
     # g2_scale_stage: GEMM2 row scales go through a rank-local staging buffer (16 bytes per row and n-block,
     # s2_scale_stage) and leave once per row from the m-block's closing unit.
     if _s2.get("g2_scale_stage", 0):
@@ -2750,97 +2758,129 @@ def compile_mega_moe_stage1(
                 fx.Int32(1), fx.Int32(0)
             )
             g2_chunk_len = g2_skewed.select(fx.Int32(G2_SKEWED_CHUNK), fx.Int32(G2_CHUNK))
+        # Thread-0-private claim-ahead words: the claim a unit's publish took for the next unit (has -1: none taken).
+        g2_ahead_unit = g2_scratch + 3
+        g2_ahead_has = g2_scratch + 4
+        if tid == fx.Int32(0):
+            fx.ptr_store(fx.Int32(-1), g2_ahead_has)
+
+        def _g2_claim():
+            # Thread 0: the next unit of this CTA's claim order and whether it exists.
+            g2_unit = fx.Int32(0)
+            g2_has = fx.Int32(0)
+            if const_expr(G2_XCD_CHUNK > 0):
+                g2_xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
+                for g2_i in range_constexpr(8):
+                    if g2_has == fx.Int32(0):
+                        g2_sh = (g2_xcd + fx.Int32(g2_i)) & fx.Int32(7)
+                        g2_j = fx.Int32(comm_ops.atomic_add_agent(
+                            addr_mtile_ctr + fx.Int64(G2_HEAD_BYTE_OFF) + fx.Int64(g2_sh) * fx.Int64(64),
+                            fx.Int32(1)))
+                        g2_q = g2_j // fx.Int32(G2_XCD_CHUNK)
+                        g2_u = (g2_q * fx.Int32(8) + g2_sh) * fx.Int32(G2_XCD_CHUNK) + (
+                            g2_j - g2_q * fx.Int32(G2_XCD_CHUNK))
+                        if g2_u < g2_total:
+                            g2_unit = g2_u
+                            g2_has = fx.Int32(1)
+            else:
+                if g2_chunked != fx.Int32(0):
+                    # Continue the claimed chunk; claim the next contiguous chunk only when it is spent.
+                    g2_cur0 = fx.ptr_load(g2_cur_slot)
+                    g2_end0 = fx.ptr_load(g2_end_slot)
+                    if g2_cur0 >= g2_end0:
+                        g2_local = fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1)))
+                        g2_cbase = (g2_shard + g2_local * fx.Int32(G2_SHARDS)) * g2_chunk_len
+                        g2_cend = g2_cbase + g2_chunk_len
+                        # The last chunk is clamped to the dependent extent.
+                        g2_cend = (g2_cend < g2_total).select(g2_cend, g2_total)
+                        fx.ptr_store(g2_cbase, g2_cur_slot)
+                        fx.ptr_store(g2_cend, g2_end_slot)
+                    g2_unit = fx.ptr_load(g2_cur_slot)
+                    g2_uend = fx.ptr_load(g2_end_slot)
+                    g2_has = (g2_unit < g2_uend).select(fx.Int32(1), fx.Int32(0))
+                    fx.ptr_store(g2_unit + fx.Int32(1), g2_cur_slot)
+                else:
+                    g2_local = fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1)))
+                    g2_unit = g2_shard + g2_local * fx.Int32(G2_SHARDS)
+                    g2_has = (g2_unit < g2_total).select(fx.Int32(1), fx.Int32(0))
+            return g2_unit, g2_has
+
+        def _g2_claim_ahead():
+            if tid == fx.Int32(0):
+                g2_next = _g2_claim()
+                fx.ptr_store(g2_next[0], g2_ahead_unit)
+                fx.ptr_store(g2_next[1], g2_ahead_has)
+
+        if const_expr(G2_SKIP_PAD):
+            # Each m-block's claim outcome depends on plan-final srcmap rows only (row 0 and row G2_FOLD of every real
+            # m-block are marked real): one pass over the m-blocks here leaves each claim an LDS byte, bit 0 skipped,
+            # bit 1 folding its expert's tail, bit 2 its expert's only m-block. The loop head's barrier orders it.
+            g2_class = fx.recast_iter(fx.Int8, a_scale_lds.ptr) + G2_CLASS_BYTE
+            g2_sm = AddrBuffer(_disp_ptr(DispatchSlot.SRCMAP))
+            for g2_cm in range(tid, g2_total_m, fx.Int32(TOTAL_THREADS)):
+                pc_pad_tile = g2_cm * fx.Int32(S2_BM) // fx.Int32(S2_SBM)
+                pc_pad_row = trb_rsrc[pc_pad_tile] + (g2_cm * fx.Int32(S2_BM) - pc_pad_tile * fx.Int32(S2_SBM))
+                pc_pad_src = load_at(g2_sm, pc_pad_row, fx.Int32, 1)
+                pc_cls = ((pc_pad_src & fx.Int32(0xFFFFFF)) >= fx.Int32(fz_npes * fz_mtpr)).select(fx.Int32(1), fx.Int32(0))
+                if const_expr(G2_FOLD):  # noqa: SIM102
+                    if pc_cls == fx.Int32(0):
+                        # m-block m is a tail iff its row G2_FOLD is padding and it follows an m-block of its expert
+                        # (the second half of its m-tile, or the first half of an m-tile GEMM1 folded).
+                        if _g2_is_tail(g2_sm, trb_rsrc, expert_rsrc, g2_cm):
+                            pc_cls = fx.Int32(1)
+                        else:
+                            pc_next = g2_cm + fx.Int32(1)
+                            pc_shared = fx.Int32(0)
+                            if pc_next < g2_total_m:
+                                pc_row0 = load_at(g2_sm, trb_rsrc[pc_next // fx.Int32(2)]
+                                    + (pc_next & fx.Int32(1)) * fx.Int32(S2_BM), fx.Int32, 1)
+                                if (pc_row0 & fx.Int32(0xFFFFFF)) < fx.Int32(fz_npes * fz_mtpr):
+                                    if _g2_is_tail(g2_sm, trb_rsrc, expert_rsrc, pc_next):
+                                        pc_cls = fx.Int32(2)
+                                    else:
+                                        pc_shared = fx.Int32(1)
+                            if const_expr(G2_NT_SINGLE):
+                                # The expert's only m-block: the first of its m-tile, after another expert's
+                                # m-tile, and followed by padding or its folded tail.
+                                pc_t = g2_cm // fx.Int32(2)
+                                pc_prev = (pc_t > fx.Int32(0)).select(pc_t - fx.Int32(1), pc_t)
+                                pc_first = ((g2_cm & fx.Int32(1)) == fx.Int32(0)) & (
+                                    (pc_t == fx.Int32(0))
+                                    | (expert_rsrc[pc_t]
+                                       != expert_rsrc[pc_prev]))
+                                if pc_first & (pc_shared == fx.Int32(0)):
+                                    pc_cls = pc_cls | fx.Int32(4)
+                fx.ptr_store(pc_cls.to(fx.Int8), g2_class + g2_cm)
+
         g2_active = fx.Int32(1) == fx.Int32(1)
         while g2_active:
             fx.barrier()
             if tid == fx.Int32(0):
-                g2_unit = fx.Int32(0)
-                g2_has = fx.Int32(0)
-                g2_wait_m = fx.Int32(0)
-                if const_expr(G2_XCD_CHUNK > 0):
-                    g2_xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
-                    for g2_i in range_constexpr(8):
-                        if g2_has == fx.Int32(0):
-                            g2_sh = (g2_xcd + fx.Int32(g2_i)) & fx.Int32(7)
-                            g2_j = fx.Int32(comm_ops.atomic_add_agent(
-                                addr_mtile_ctr + fx.Int64(G2_HEAD_BYTE_OFF) + fx.Int64(g2_sh) * fx.Int64(64),
-                                fx.Int32(1)))
-                            g2_q = g2_j // fx.Int32(G2_XCD_CHUNK)
-                            g2_u = (g2_q * fx.Int32(8) + g2_sh) * fx.Int32(G2_XCD_CHUNK) + (
-                                g2_j - g2_q * fx.Int32(G2_XCD_CHUNK))
-                            if g2_u < g2_total:
-                                g2_unit = g2_u
-                                g2_has = fx.Int32(1)
-                    if const_expr(G2_M_GROUP > 0):
-                        g2_wait_m = _g2_group_decode(g2_unit, g2_total_m)[0]
-                    else:
-                        g2_wait_m = g2_unit - (g2_unit // g2_total_m) * g2_total_m
+                g2_unit = fx.ptr_load(g2_ahead_unit)
+                g2_has = fx.ptr_load(g2_ahead_has)
+                if g2_has < fx.Int32(0):
+                    g2_now = _g2_claim()
+                    g2_unit = g2_now[0]
+                    g2_has = g2_now[1]
+                fx.ptr_store(fx.Int32(-1), g2_ahead_has)
+                if const_expr(G2_M_GROUP > 0):
+                    g2_wait_m = _g2_group_decode(g2_unit, g2_total_m)[0]
+                elif const_expr(G2_XCD_CHUNK > 0):
+                    g2_wait_m = g2_unit - (g2_unit // g2_total_m) * g2_total_m
                 else:
+                    g2_wait_m = g2_unit // fx.Int32(g2_num_n_blocks)
                     if g2_chunked != fx.Int32(0):
-                        # Continue the claimed chunk; claim the next contiguous chunk only when it is spent.
-                        g2_cur0 = fx.ptr_load(g2_cur_slot)
-                        g2_end0 = fx.ptr_load(g2_end_slot)
-                        if g2_cur0 >= g2_end0:
-                            g2_local = fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1)))
-                            g2_cbase = (g2_shard + g2_local * fx.Int32(G2_SHARDS)) * g2_chunk_len
-                            g2_cend = g2_cbase + g2_chunk_len
-                            # The last chunk is clamped to the dependent extent.
-                            g2_cend = (g2_cend < g2_total).select(g2_cend, g2_total)
-                            fx.ptr_store(g2_cbase, g2_cur_slot)
-                            fx.ptr_store(g2_cend, g2_end_slot)
-                        g2_unit = fx.ptr_load(g2_cur_slot)
-                        g2_uend = fx.ptr_load(g2_end_slot)
-                        g2_has = (g2_unit < g2_uend).select(fx.Int32(1), fx.Int32(0))
-                        fx.ptr_store(g2_unit + fx.Int32(1), g2_cur_slot)
-                        g2_wait_m, _g2_wait_n = _g2_decode(g2_unit, g2_total_m)
-                    else:
-                        g2_local = fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1)))
-                        g2_unit = g2_shard + g2_local * fx.Int32(G2_SHARDS)
-                        g2_has = (g2_unit < g2_total).select(fx.Int32(1), fx.Int32(0))
-                        g2_wait_m = g2_unit // fx.Int32(g2_num_n_blocks)
+                        g2_wait_m = _g2_decode(g2_unit, g2_total_m)[0]
                 if const_expr(G2_SKIP_PAD):
+                    # 2: claimed but skipped. All of an m-block's units skip, so none touches its close counter.
+                    g2_cls = fx.Int32(0)
                     if g2_has != fx.Int32(0):
-                        # 2: claimed but skipped. All of an m-block's units skip, so none touches its close counter.
-                        pad_tile = g2_wait_m * fx.Int32(S2_BM) // fx.Int32(S2_SBM)
-                        pad_row = trb_rsrc[pad_tile] + (
-                            g2_wait_m * fx.Int32(S2_BM) - pad_tile * fx.Int32(S2_SBM))
-                        pad_src = load_at(AddrBuffer(_disp_ptr(DispatchSlot.SRCMAP)), pad_row, fx.Int32, 1)
-                        if (pad_src & fx.Int32(0xFFFFFF)) >= fx.Int32(fz_npes * fz_mtpr):
+                        g2_cls = fx.ptr_load(g2_class + g2_wait_m).to(fx.Int32)
+                        if (g2_cls & fx.Int32(1)) != fx.Int32(0):
                             g2_has = fx.Int32(2)
-                    g2_fold_bit = fx.Int32(0)
-                    g2_nt_bit = fx.Int32(0)
-                    if const_expr(G2_FOLD):  # noqa: SIM102
-                        if g2_has == fx.Int32(1):
-                            # Plan-final rows (row 0 and row G2_FOLD of every real m-block are marked real): m-block m
-                            # is a tail iff its row G2_FOLD is padding and it follows an m-block of its expert (the
-                            # second half of its m-tile, or the first half of an m-tile GEMM1 folded).
-                            f_sm = AddrBuffer(_disp_ptr(DispatchSlot.SRCMAP))
-                            if _g2_is_tail(f_sm, trb_rsrc, expert_rsrc, g2_wait_m):
-                                g2_has = fx.Int32(2)
-                            else:
-                                f_next = g2_wait_m + fx.Int32(1)
-                                f_shared = fx.Int32(0)
-                                if f_next < g2_total_m:
-                                    f_row0 = load_at(f_sm, trb_rsrc[f_next // fx.Int32(2)]
-                                        + (f_next & fx.Int32(1)) * fx.Int32(S2_BM), fx.Int32, 1)
-                                    if (f_row0 & fx.Int32(0xFFFFFF)) < fx.Int32(fz_npes * fz_mtpr):
-                                        if _g2_is_tail(f_sm, trb_rsrc, expert_rsrc, f_next):
-                                            g2_fold_bit = fx.Int32(1 << 30)
-                                        else:
-                                            f_shared = fx.Int32(1)
-                                if const_expr(G2_NT_SINGLE):
-                                    # The expert's only m-block: the first of its m-tile, after another expert's
-                                    # m-tile, and followed by padding or its folded tail.
-                                    f_t = g2_wait_m // fx.Int32(2)
-                                    f_prev = (f_t > fx.Int32(0)).select(f_t - fx.Int32(1), f_t)
-                                    f_first = ((g2_wait_m & fx.Int32(1)) == fx.Int32(0)) & (
-                                        (f_t == fx.Int32(0))
-                                        | (expert_rsrc[f_t]
-                                           != expert_rsrc[f_prev]))
-                                    if f_first & (f_shared == fx.Int32(0)):
-                                        g2_nt_bit = fx.Int32(1 << 29)
                     g2_go = g2_has == fx.Int32(1)
-                    g2_claimed = g2_go.select(g2_unit | g2_fold_bit | g2_nt_bit,
+                    g2_claimed = g2_go.select(
+                        g2_unit | ((g2_cls & fx.Int32(2)) << fx.Int32(29)) | ((g2_cls & fx.Int32(4)) << fx.Int32(27)),
                         (g2_has == fx.Int32(2)).select(fx.Int32(-2), fx.Int32(-1)))
                 else:
                     g2_go = g2_has != fx.Int32(0)
@@ -2886,7 +2926,7 @@ def compile_mega_moe_stage1(
                         s2_sweights, s2_trb, s2_p2p_comb_inp, fx.Int32(MAX_G2_M_BLOCKS), fx.Int32(inter_dim),
                         fx.Int32(model_dim), fx.Int32(0), fx.Int32(0),
                         g2_m_b * fx.Int32(g2_num_n_blocks) + g2_n_b, g2_m_b, tid, s2_lane, s2_wave,
-                        s2_close_ctr, s2_p2p_tok_ready, s2_scale_stage, fold=g2_fold_b)
+                        s2_close_ctr, s2_p2p_tok_ready, s2_scale_stage, fold=g2_fold_b, claim_ahead=_g2_claim_ahead)
                     # fmt: on
 
                 if const_expr(G2_NT_SINGLE):
