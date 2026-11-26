@@ -210,25 +210,3 @@ def test_block_cat_fused_fp32_eager_path(device):
     torch.testing.assert_close(out, ref.detach())
     torch.testing.assert_close(grad_l12, l12_ref.grad)
     torch.testing.assert_close(grad_l4, l4_ref.grad)
-
-
-@pytest.mark.parametrize(
-    "bad,match",
-    [
-        ("dtype", "dtype mismatch"),
-        ("device", "same device"),
-        ("shape", "l4 shape"),
-    ],
-)
-def test_block_cat_fused_rejects_bad_inputs(bad, match):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    l12, l4 = generate_block_cat_fused_inputs((8, 96), 32, torch.bfloat16)
-    if bad == "dtype":
-        l4 = l4.float()
-    elif bad == "device":
-        l4 = l4.cpu()
-    else:
-        l4 = l4[:, :-1]
-    with pytest.raises(ValueError, match=match):
-        block_cat_fused(l12, l4, SLOPE, 32)

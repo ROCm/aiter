@@ -237,7 +237,8 @@ def build_moe_apre_scatter_module(
 
     Returns:
         A JIT launcher accepting compact and output payload/scale buffers,
-        a row-to-token map, token/row/workgroup counts, and an optional stream.
+        a row-to-token map, token/row/workgroup counts, a counter to zero
+        (null with length 0 for none), and an optional stream.
         Negative map entries are padding; fully empty M16 tiles are untouched.
 
     Raises:
@@ -297,6 +298,8 @@ def build_moe_apre_scatter_module(
         num_tokens: Int32,
         num_output_rows: Int32,
         num_workgroups: Int32,
+        clear_counter: fx.Pointer,
+        clear_counter_len: Int32,
     ):
         lds_load_b128, _ = gemm_common.make_lds_copy_ops(128)
 
@@ -304,6 +307,10 @@ def build_moe_apre_scatter_module(
         block_id = fx.Uint32(fx.block_idx.x)
         wave_id = thread_id // fx.Uint32(wave_size)
         lane_id = thread_id - wave_id * fx.Uint32(wave_size)
+        # The route counter has no reader once the psum remap ran, so clearing
+        # it here leaves it zeroed for the next route launch.
+        if (block_id == fx.Uint32(0)) & (thread_id < fx.Uint32(clear_counter_len)):
+            tensor_shim.ptr_buf_tensor(clear_counter)[thread_id] = fx.Int32(0)
 
         shared_allocator = fx.SharedAllocator()
         storage = shared_allocator.allocate(ScatterLds).peek()
@@ -527,6 +534,8 @@ def build_moe_apre_scatter_module(
         num_tokens: fx.Int32,
         num_output_rows: fx.Int32,
         num_workgroups: fx.Int32,
+        clear_counter: fx.Pointer,
+        clear_counter_len: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         scatter_kernel(
@@ -538,6 +547,8 @@ def build_moe_apre_scatter_module(
             num_tokens,
             num_output_rows,
             num_workgroups,
+            clear_counter,
+            clear_counter_len,
         ).launch(
             grid=(
                 arith.index_cast(T.index, num_output_rows) // _M_TILE_ROWS,
