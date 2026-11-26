@@ -31,4 +31,4 @@ gfx950,256,2048,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_
 gfx950,256,4096,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,1004.9,impl__flydsl_bspp__default,0.0%,0.0,,0.0%,1004.9,0,0,0,923.19,3685.51
 gfx950,256,8192,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,1312.5,impl__flydsl_bspp__default,0.0%,0.0,,0.0%,1312.5,0,0,0,1413.66,2872.90
 gfx950,256,16384,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,2319.4,impl__flydsl_bspp__default,0.0%,0.0,,0.0%,2319.4,0,0,0,1599.92,1683.58
-gfx950,256,32768,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,64,0,,_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E,,,,,9601,1,0,0,,
+gfx950,256,32768,4096,1024,289,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,4190.1,impl__flydsl_bspp__default,0.0%,0.0,,0.0%,4190.1,0,0,0,1771.25,996.00
