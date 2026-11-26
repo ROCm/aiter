@@ -1244,6 +1244,20 @@ LDT = BT + 4  # rows of 64 (token) columns
 LDC = 64 + 4  # fp32 [64, 64] accumulator staging
 
 
+def _tcoord(i, rows, cv):
+    """(row, 16-byte column group) of vector ``i`` of a transposed stage.
+
+    Each 64-vector block covers 8 rows x 8 column groups: per row, 8 lanes read
+    128 contiguous bytes (one cache line), and per column the lanes write 8
+    consecutive LDS elements, so neither the global loads nor the transposed
+    LDS writes collapse onto a few lines / banks. Needs rows % 8 == cv % 8 == 0.
+    """
+    blk = i // 64
+    lane = i % 64
+    rb = rows // 8
+    return (blk % rb) * 8 + lane % 8, (blk // rb) * 8 + lane // 8
+
+
 def _src(tensor, base):
     """A global tile for ``_stage``'s 128-bit loads: ``tensor`` from element ``base``."""
     return tensor, base
@@ -1264,10 +1278,10 @@ def _stage(
     With ``view = _src(tensor, base)`` each thread loads 16 contiguous bytes
     per instruction (8 bf16 or 4 fp32); row starts must be 16-byte aligned.
 
-    A transposed stage gives consecutive lanes consecutive source rows, so their
-    LDS writes land on consecutive addresses; walking the source row-major
-    instead would put lanes ``vec * ld_dst`` elements apart, a few banks for a
-    whole wave.
+    A transposed stage walks the tile in 8 x 8 blocks (``_tcoord``): row-major
+    order would put neighbouring lanes' LDS writes ``vec * ld_dst`` elements
+    apart (a few banks per wave), row-fastest order would scatter the global
+    loads over 64 rows.
     """
     if isinstance(view, tuple):
         tensor, base = view
@@ -1287,9 +1301,8 @@ def _stage(
             atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
             for e in range_constexpr(rows * cv // NUM_THREADS):
                 i = tid + e * NUM_THREADS
-                if const_expr(transpose):
-                    t = i % rows
-                    cvi = i // rows
+                if const_expr(transpose and rows % 8 == 0 and cv % 8 == 0):
+                    t, cvi = _tcoord(i, rows, cv)
                 else:
                     t = i // cv
                     cvi = i % cv
@@ -1307,9 +1320,8 @@ def _stage(
             return
     for e in range_constexpr(rows * cols // NUM_THREADS):
         i = tid + e * NUM_THREADS
-        if const_expr(transpose):
-            t = i % rows
-            c = i // rows
+        if const_expr(transpose and rows % 8 == 0 and cols % 8 == 0):
+            t, c = _tcoord(i, rows, cols)
         else:
             t = i // cols
             c = i % cols
@@ -2045,10 +2057,10 @@ def compile_dhu_mfma(
 
         def tile_coord(e, transpose):
             """(row, 8-column group) of this thread's e-th vector of a tile; a
-            transposed tile walks rows fastest so its LDS writes are contiguous."""
+            transposed tile uses ``_tcoord``'s 8 x 8 blocks."""
             i_ = tid + e * NUM_THREADS
             if const_expr(transpose):
-                return i_ % BT, i_ // BT
+                return _tcoord(i_, BT, K // 8)
             return i_ // (K // 8), i_ % (K // 8)
 
         def tile_regs(tensor, it_, transpose):
