@@ -180,6 +180,9 @@ def main():
     args = parser.parse_args()
     if not args.bench:
         raise SystemExit(pytest.main([__file__, "-q", "-x"]))
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        print("skipped: the persistent 4-wave MXFP8 kernel needs a gfx950 GPU")
+        return
     shapes = [(2048, 6144, 8192), (3072, 6144, 8192), (4096, 6144, 8192)]
     df = pd.DataFrame([bench_4wave(*s) for s in shapes])
     print(df.to_markdown(index=False))
