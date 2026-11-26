@@ -134,36 +134,68 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, dtype):
     return ret
 
 
-def run_torch_block(dy, x, w, num_heads, eps=1e-6):
-    """Reference block: recurrent forward output and all gradients, fp32."""
+# Longer blocks are graded against the torch_chunk path: the token-by-token
+# oracle is too slow there.
+ORACLE_MAX_TOKENS = 512
+
+
+def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, eps=1e-6):
+    """Reference block: recurrent forward output and all gradients, fp32.
+
+    With ``cu_seqlens`` each packed sequence is run on its own.
+    """
     xs = x.detach().float().requires_grad_(True)
     ws = [t.detach().float().requires_grad_(True) for t in w.tensors()]
     wr = KDALayerWeights.from_tensors(ws)
-    q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps)
-    o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
-    y = kda_layer_postprocess(o, xs, wr, eps)
+    bounds = [0, x.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+    ys = []
+    for s, e in itertools.pairwise(bounds):
+        xseg = xs[:, s:e]
+        q, k, v, g, beta = kda_layer_preprocess(xseg, wr, num_heads, eps)
+        o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
+        ys.append(kda_layer_postprocess(o, xseg, wr, eps))
+    y = torch.cat(ys, 1)
     grads = torch.autograd.grad(y, [xs, *ws], dy.float())
     return y.detach(), grads
 
 
 @benchmark()
-def test_kda_block(b, t, d, h, k, w, r, chunk, dtype):
-    """End to end: kda_layer_fwd + autograd backward of the whole layer."""
+def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, dtype):
+    """End to end: kda_layer_fwd + autograd backward of the whole layer.
+
+    ``nseq > 1`` packs ``nseq`` equal sequences into one row (b must be 1) and
+    passes ``cu_seqlens`` through the layer.
+    """
     x = torch.randn(b, t, d).to(dtype)
     dy = torch.randn(b, t, d).to(dtype)
     wt = make_weights(d, h, k, w, r, dtype)
-    ref_y, ref_g = run_torch_block(dy, x, wt, h)
+    cu = None
+    if nseq > 1:
+        assert b == 1 and t % nseq == 0, "varlen rows pack equal sequences into b=1"
+        cu = torch.arange(nseq + 1, dtype=torch.int32) * (t // nseq)
 
     def block(backend):
         def run():
             xs = x.detach().requires_grad_(True)
             ws = [p.detach().requires_grad_(True) for p in wt.tensors()]
             y = kda_layer_fwd(
-                xs, KDALayerWeights.from_tensors(ws), h, chunk, backend=backend
+                xs,
+                KDALayerWeights.from_tensors(ws),
+                h,
+                chunk,
+                backend=backend,
+                cu_seqlens=cu,
             )
             return y, torch.autograd.grad(y, [xs, *ws], dy)
 
         return run
+
+    if b * t <= ORACLE_MAX_TOKENS:
+        ref_name = "recurrent"
+        ref_y, ref_g = run_torch_block(dy, x, wt, h, cu)
+    else:
+        ref_name = "torch_chunk"
+        ref_y, ref_g = block("torch")()
 
     flops = layer_flops(b, t, d, h, k, w, r, chunk) * 4 // 3  # fwd + recompute + bwd
     nbytes = sum(p.numel() for p in wt.tensors()) * 2 * x.element_size()
@@ -172,7 +204,7 @@ def test_kda_block(b, t, d, h, k, w, r, chunk, dtype):
     names = ["y", "dx"] + [
         f.name for f in KDALayerWeights.__dataclass_fields__.values()
     ]
-    ret = {"gfx": get_gfx_runtime()}
+    ret = {"gfx": get_gfx_runtime(), "ref": ref_name}
     for name in ("torch", "fused"):
         (y, grads), us = run_perftest(block(name), num_iters=3, num_warmup=1)
         worst = 0.0
@@ -310,6 +342,23 @@ def main():
         help="hidden,heads,head_dim,conv_width,gate_rank, e.g. -s 7168,96,128,4,128",
     )
     parser.add_argument("-c", "--chunk", type=int, nargs="*", default=[64])
+    parser.add_argument(
+        "-l",
+        "--block",
+        type=dtypes.str2tuple,
+        nargs="*",
+        # Lumen#35 long sequences: T=8192, 2x4096, varlen 8x2048 (packed, b=1)
+        default=[
+            (1, 100, 1),
+            (1, 256, 1),
+            (1, 256, 2),
+            (1, 8192, 1),
+            (2, 4096, 1),
+            (1, 16384, 8),
+        ],
+        help="block fwd+bwd rows: batch,tokens,num_seqs; num_seqs > 1 packs\n"
+        "equal sequences into one row and passes cu_seqlens, e.g. -l 1,16384,8",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
@@ -323,10 +372,10 @@ def main():
             "kda fused layer bwd summary (markdown):\n%s", df.to_markdown(index=False)
         )
         df = []
-        for b, t, (d, h, k, w, r), c in itertools.product(
-            args.batch, args.seqlen, args.shape, args.chunk
+        for (b, t, nseq), (d, h, k, w, r), c in itertools.product(
+            args.block, args.shape, args.chunk
         ):
-            df.append(test_kda_block(b, t, d, h, k, w, r, c, dtype))
+            df.append(test_kda_block(b, t, nseq, d, h, k, w, r, c, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda block fwd+bwd summary (markdown):\n%s", df.to_markdown(index=False)

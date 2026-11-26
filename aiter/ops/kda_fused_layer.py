@@ -29,12 +29,14 @@ One KDA layer, token-major (packed varlen is not supported yet):
   gate stages). Unregistered or unsupported stages fall back to PyTorch.
 """
 
+import itertools
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 KDA_BACKENDS = ("torch", "fused")
 
@@ -102,9 +104,37 @@ def kda_layer_postprocess(o, x, w: KDALayerWeights, eps=1e-6):
     return (o.reshape(B, T, H * V) @ w.w_o.float().t()).to(x.dtype)
 
 
+def _chunk_step(S, q, k, v, g, beta):
+    """One chunk of the gated delta rule. S: [B,H,K,V]; q,k,g: [B,H,C,K];
+    v: [B,H,C,V]; beta: [B,H,C]. Returns (o_unscaled [B,H,C,V], S_next)."""
+    C = q.shape[-2]
+    G = g.cumsum(-2)
+    strict = torch.ones(C, C, dtype=torch.bool, device=q.device).tril(-1)
+    incl = torch.ones(C, C, dtype=torch.bool, device=q.device).tril()
+    # pairwise decay exp(G_i - G_j), masked to j <= i before exp for stability
+    dG = (G.unsqueeze(-2) - G.unsqueeze(-3)).masked_fill(
+        ~incl[..., None], float("-inf")
+    )
+    decay = dG.exp()  # [B,H,C(i),C(j),K]
+    A_kk = torch.einsum("bhik,bhjk,bhijk->bhij", k, k, decay) * strict
+    A_qk = torch.einsum("bhik,bhjk,bhijk->bhij", q, k, decay)
+    L = torch.eye(C, device=q.device, dtype=q.dtype) + beta.unsqueeze(-1) * A_kk
+    eg = G.exp()
+    rhs = beta.unsqueeze(-1) * (v - (k * eg) @ S)
+    u = torch.linalg.solve_triangular(L, rhs, upper=False, unitriangular=True)
+    o = (q * eg) @ S + A_qk @ u
+    k_end = k * (G[..., -1:, :] - G).exp()  # decay to chunk end
+    S = G[..., -1, :, None].exp() * S + k_end.transpose(-1, -2) @ u
+    return o, S
+
+
 def chunk_kda_torch(q, k, v, g, beta, scale, chunk_size=64):
     """Chunked gated delta rule with per-channel decay (differentiable).
-    q,k,g: [B,T,H,K]; v: [B,T,H,V]; beta: [B,T,H]. Returns o [B,T,H,V] fp32."""
+    q,k,g: [B,T,H,K]; v: [B,T,H,V]; beta: [B,T,H]. Returns o [B,T,H,V] fp32.
+
+    Each chunk is a separate step, checkpointed under autograd, so memory grows
+    with one state per chunk rather than with the [C, C, K] decay of every chunk.
+    """
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
@@ -119,30 +149,18 @@ def chunk_kda_torch(q, k, v, g, beta, scale, chunk_size=64):
         return t.reshape(B, N, C, H, *t.shape[3:]).transpose(1, 3).transpose(2, 3)
 
     q, k, v, g, beta = map(chunks, (q, k, v, g, beta))
-    G = g.cumsum(-2)  # [B,H,N,C,K]
-    strict = torch.ones(C, C, dtype=torch.bool, device=q.device).tril(-1)
-    incl = torch.ones(C, C, dtype=torch.bool, device=q.device).tril()
-    # pairwise decay exp(G_i - G_j), masked to j <= i before exp for stability
-    dG = G.unsqueeze(-2) - G.unsqueeze(-3)  # [B,H,N,C(i),C(j),K]
-    dG = dG.masked_fill(~incl[..., None], float("-inf"))
-    decay = dG.exp()
-    A_kk = torch.einsum("bhnik,bhnjk,bhnijk->bhnij", k, k, decay) * strict
-    A_qk = torch.einsum("bhnik,bhnjk,bhnijk->bhnij", q, k, decay)
-    eye = torch.eye(C, device=q.device, dtype=q.dtype)
-    L = eye + beta.unsqueeze(-1) * A_kk  # unit lower triangular
-    k_end = k * (G[..., -1:, :] - G).exp()  # decay to chunk end
-    q_g = q * G.exp()
-    k_g = k * G.exp()
-
+    ckpt = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g, beta))
     S = q.new_zeros(B, H, K, V)
     out = []
     for n in range(N):
-        rhs = beta[:, :, n, :, None] * (v[:, :, n] - k_g[:, :, n] @ S)
-        u = torch.linalg.solve_triangular(
-            L[:, :, n], rhs, upper=False, unitriangular=True
-        )
-        out.append(q_g[:, :, n] @ S + A_qk[:, :, n] @ u)
-        S = G[:, :, n, -1, :, None].exp() * S + k_end[:, :, n].transpose(-1, -2) @ u
+        args = (S, q[:, :, n], k[:, :, n], v[:, :, n], g[:, :, n], beta[:, :, n])
+        if ckpt:
+            o, S = torch.utils.checkpoint.checkpoint(
+                _chunk_step, *args, use_reentrant=False
+            )
+        else:
+            o, S = _chunk_step(*args)
+        out.append(o)
     o = torch.stack(out, 2) * scale  # [B,H,N,C,V]
     o = o.permute(0, 2, 3, 1, 4).reshape(B, N * C, H, V)
     return o[:, :T]
@@ -759,30 +777,82 @@ class _KDALayerFused(torch.autograd.Function):
         return (dx, None, None, None, *dw.tensors())
 
 
+def _segments(x, cu_seqlens):
+    """[(start, end), ...] token ranges; ``cu_seqlens`` needs B == 1."""
+    if cu_seqlens is None:
+        return None
+    if x.shape[0] != 1:
+        raise ValueError(f"cu_seqlens needs a packed batch of 1, got B={x.shape[0]}")
+    bounds = [int(b) for b in cu_seqlens.tolist()]
+    if bounds[0] != 0 or bounds[-1] != x.shape[1] or bounds != sorted(bounds):
+        raise ValueError(f"cu_seqlens {bounds} does not cover T={x.shape[1]}")
+    return [(s, e) for s, e in itertools.pairwise(bounds) if e > s]
+
+
 def kda_layer_fwd(
-    x, w: KDALayerWeights, num_heads, chunk_size=64, eps=1e-6, backend="torch"
+    x,
+    w: KDALayerWeights,
+    num_heads,
+    chunk_size=64,
+    eps=1e-6,
+    backend="torch",
+    cu_seqlens=None,
 ):
-    """x: [B,T,D] -> y: [B,T,D]. Differentiable for both backends."""
+    """x: [B,T,D] -> y: [B,T,D]. Differentiable for both backends.
+
+    ``cu_seqlens`` ([N + 1] cumulative lengths, x packed as [1, total, D]) runs
+    each sequence independently: the conv and the recurrence restart at every
+    boundary.
+    """
+    if backend not in KDA_BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
+    segments = _segments(x, cu_seqlens)
+    if segments is not None:
+        return torch.cat(
+            [
+                kda_layer_fwd(x[:, s:e], w, num_heads, chunk_size, eps, backend)
+                for s, e in segments
+            ],
+            1,
+        )
     if backend == "torch":
         return _kda_layer_torch(x, w, num_heads, chunk_size, eps)
-    if backend == "fused":
-        return _KDALayerFused.apply(x, num_heads, chunk_size, eps, *w.tensors())
-    raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
+    return _KDALayerFused.apply(x, num_heads, chunk_size, eps, *w.tensors())
 
 
 def kda_layer_bwd(
-    dy, x, w: KDALayerWeights, num_heads, chunk_size=64, eps=1e-6, backend="torch"
+    dy,
+    x,
+    w: KDALayerWeights,
+    num_heads,
+    chunk_size=64,
+    eps=1e-6,
+    backend="torch",
+    cu_seqlens=None,
 ):
     """Backward of one KDA layer.
 
     Returns (dx, dw) where dw is a KDALayerWeights holding the gradient of every
     weight (q/k/v proj, short conv, F-decay low-rank gate + A_log/dt_bias, beta
     proj, output gate proj, norm weight, output proj). The forward is recomputed.
+    ``cu_seqlens`` as in ``kda_layer_fwd``; weight gradients sum over sequences.
     """
+    if backend not in KDA_BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
+    segments = _segments(x, cu_seqlens)
+    if segments is not None:
+        dxs, dw = [], None
+        for s, e in segments:
+            dx_s, dw_s = kda_layer_bwd(
+                dy[:, s:e], x[:, s:e], w, num_heads, chunk_size, eps, backend
+            )
+            dxs.append(dx_s)
+            parts = [t.float() for t in dw_s.tensors()]
+            dw = parts if dw is None else [a + b for a, b in zip(dw, parts)]
+        dw = [d.to(p.dtype) for d, p in zip(dw, w.tensors())]
+        return torch.cat(dxs, 1), KDALayerWeights.from_tensors(dw)
     if backend == "fused":
         return _kda_layer_fused_bwd(dy, x, w, num_heads, chunk_size, eps, _row_ops(x))
-    if backend != "torch":
-        raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     with torch.enable_grad():
         xs = x.detach().requires_grad_(True)
         ws = [t.detach().requires_grad_(True) for t in w.tensors()]
