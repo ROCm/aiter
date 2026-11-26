@@ -129,7 +129,18 @@ def make_inputs(b, t, h, d, dtype, mode, seed=0):
 
 
 @benchmark()
-def test_kda_chunk_fwd(b, t, h, d, dtype, mode, varlen):
+def _channel_major(x):
+    """Same values as ``x`` (``[B, T, ...]``) as a dense view with token stride 1.
+
+    The layout a fused layer hands over when its projection is ``[C, tokens]``
+    (``a.reshape(B * T, C).t()``).
+    """
+    perm = (0, *range(2, x.dim()), 1)
+    inv = (0, x.dim() - 1, *range(1, x.dim() - 1))
+    return x.permute(perm).contiguous().permute(inv)
+
+
+def test_kda_chunk_fwd(b, t, h, d, dtype, mode, varlen, layout):
     """``varlen``: the ``b`` sequences of ``t`` tokens are packed into one
     ``[1, b * t]`` batch with ``cu_seqlens``; the fp32 reference still runs
     them as independent batch rows."""
@@ -138,10 +149,14 @@ def test_kda_chunk_fwd(b, t, h, d, dtype, mode, varlen):
     o_ref, s_ref = run_torch(**x, **kw, scale=scale)
     want_state = "initial_state" in x
     call_x = dict(x)
+    if layout == "channel":
+        for n in ("q", "k", "v", "g", "beta"):
+            call_x[n] = _channel_major(x[n])
+            assert not call_x[n].is_contiguous()
     cu_seqlens = None
     if varlen:
         for n in ("q", "k", "v", "g", "beta"):
-            call_x[n] = x[n].reshape(1, b * t, *x[n].shape[2:])
+            call_x[n] = call_x[n].reshape(1, b * t, *x[n].shape[2:])
         cu_seqlens = torch.arange(0, b * t + 1, t, dtype=torch.int64)
 
     def fwd(backend):
@@ -281,6 +296,16 @@ def main():
         default=["kimi", "kimi_state", "plain"],
         choices=["kimi", "kimi_state", "plain"],
     )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        type=str,
+        nargs="*",
+        default=["token", "channel"],
+        choices=["token", "channel"],
+        help="token: contiguous [B, T, H, D]; channel: dense views with token\n"
+        "stride 1, as a fused layer's channel-major projections",
+    )
     args = parser.parse_args()
 
     shapes = []
@@ -291,9 +316,9 @@ def main():
 
     for dtype in args.dtype:
         df = [
-            test_kda_chunk_fwd(b, t, h, d, dtype, m, varlen)
-            for m, (b, t, varlen), h, d in itertools.product(
-                args.mode, shapes, args.heads, args.head_dim
+            test_kda_chunk_fwd(b, t, h, d, dtype, m, varlen, lay)
+            for m, (b, t, varlen), h, d, lay in itertools.product(
+                args.mode, shapes, args.heads, args.head_dim, args.layout
             )
         ]
         df = pd.DataFrame(df)

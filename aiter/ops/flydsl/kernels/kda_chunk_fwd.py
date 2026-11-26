@@ -7,24 +7,23 @@ Stage ports of ``chunk_delta_attn_fwd`` in
 ``aiter/ops/triton/_triton_kernels/kimi_delta_attn/chunk_fwd.py``; the
 inter-chunk recurrence between ``intra`` and ``output`` is the GDN K5 kernel.
 
-* ``gate_cumsum``: chunk-local cumsum of the gate in log2 space, optionally
-  through ``-exp(A_log) * softplus(g + dt_bias)`` or
-  ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``.
-* ``intra``: optional q/k l2norm and beta sigmoid, then per chunk
+* ``intra``: the gate's chunk-local log2 cumsum, optionally through
+  ``-exp(A_log) * softplus(g + dt_bias)`` or
+  ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``; optional q/k l2norm
+  and beta sigmoid; then per chunk
   ``Aqk = tril(q k^T * decay) * scale``,
   ``Akk^-1 = (I + strict_tril(beta k k^T * decay))^-1``,
   ``w = Akk^-1 (beta k exp2(g))``, ``u = Akk^-1 (beta v)``,
   ``qg = q exp2(g)`` and ``kg = k exp2(g_last - g)``.
 * ``output``: ``o = scale * qg h + Aqk v_new``.
 
-The intra off-diagonal ``Aqk`` / ``Akk`` tiles, ``w`` / ``u`` and both
-``output`` GEMMs run on the 16x16x16 bf16 MFMA, one 16-row tile per wave.
-
-Every program owns one 64-token chunk of one head with 256 threads (the gate
-kernel: 128). Operand tiles are staged in LDS and the contractions run as fp32
-FMAs: thread ``tid`` owns row ``tid // 4`` and the columns ``tid % 4 + 4 * e``
-of each ``[64, *]`` tile, so a row reduction is two lane shuffles. ``intra``
-stages ~128 KB of LDS, which needs gfx950.
+Every program owns one 64-token chunk of one head with 256 threads; wave
+``w`` owns the 16-row tile ``16w .. 16w + 15``. The ``Aqk`` / ``Akk`` tiles
+(the diagonal ones only for the ``lower_bound`` gate, else exact fp32),
+``w`` / ``u`` and both ``output`` GEMMs run on the 16x16x16 bf16 MFMA, the
+``(I + Akk)^-1`` block rows on the fp32 16x16x4 one. Row-wise work gives
+thread ``tid`` row ``tid // 4`` and 32 contiguous columns, so a row reduction
+is two lane shuffles. ``intra`` stages ~135 KB of LDS, which needs gfx950.
 
 Layouts are token-major ``[B, T, H, *]`` except ``h`` (the K5 snapshot,
 ``[B, NT, H, V, K]``) and ``v_new`` (head-major ``[B, H, T, V]``), which are
@@ -257,6 +256,30 @@ def _mfma_f32(a, b, acc):
     return fx.Vector(fc.load())
 
 
+def _lds_n(arr, size, n):
+    return arr.view(fx.make_layout((size // n, n), (n, 1)))
+
+
+def lds_st_n(view_n, i, vals, num):
+    """Store ``len(vals)`` contiguous elements at element ``i`` (a multiple)."""
+    n = len(vals)
+    frag = fx.make_rmem_tensor(n, num)
+    frag.store(
+        fx.Vector.from_elements(
+            [
+                fx.Float32(x) if num is fx.Float32 else fx.Float32(x).to(num)
+                for x in vals
+            ],
+            dtype=num,
+        )
+    )
+    fx.copy(
+        fx.make_copy_atom(fx.UniversalCopy(n * _bits(num)), num),
+        frag,
+        fx.slice(view_n, (i // n, None)),
+    )
+
+
 def lds_st4(view4, i, vals):
     frag = fx.make_rmem_tensor(4, fx.Float32)
     frag.store(fx.Vector.from_elements([fx.Float32(x) for x in vals], dtype=fx.Float32))
@@ -318,88 +341,6 @@ def _chunk_of(i_t, T, varlen, cbos, clen):
 
 
 # ---------------------------------------------------------------------------
-# gate_cumsum
-# ---------------------------------------------------------------------------
-@functools.cache
-def compile_gate_cumsum(
-    H: int,
-    g_dtype: torch.dtype,
-    use_gate: bool,
-    has_bias: bool,
-    use_lower_bound: bool,
-    varlen: bool = False,
-):
-    GN = _num(g_dtype)
-
-    @flyc.kernel(name="kda_fwd_gate_cumsum_flydsl")
-    def kernel(
-        g: fx.Tensor,
-        A_log: fx.Tensor,
-        dt_bias: fx.Tensor,
-        gc: fx.Tensor,
-        cbos: fx.Tensor,
-        clen: fx.Tensor,
-        T: fx.Int32,
-        lower_bound: fx.Float32,
-    ):
-        i_t = fx.block_idx.x
-        i_bh = fx.block_idx.y
-        b = i_bh // H
-        h = i_bh % H
-        kk = fx.thread_idx.x
-        t0, nvalid = _chunk_of(i_t, T, varlen, cbos, clen)
-        hk = (fx.Int64(b * T + t0) * H + fx.Int64(h)) * K
-        g_v = _flat(g, hk)
-        o_v = _flat(gc, hk)
-        a = _zero()
-        bias = _zero()
-        if const_expr(use_gate):
-            a = fx.exp(ldg(_flat(A_log, None), h, fx.Float32))
-            if const_expr(has_bias):
-                bias = ldg(_flat(dt_bias, None), h * K + kk, fx.Float32)
-
-        for i, st in range(0, BT, 1, init=[_zero()]):
-            t = fx.Int32(i)
-            ok = t < nvalid
-            x = ldg(g_v, _sel(ok, t, 0) * (H * K) + kk, GN)
-            if const_expr(use_gate):
-                z = x + bias
-                if const_expr(use_lower_bound):
-                    x = lower_bound * _sigmoid(a * z)
-                else:
-                    sp = _sel(
-                        z > fx.Float32(20.0),
-                        z,
-                        fx.log(fx.Float32(1.0) + fx.exp(z)),
-                    )
-                    x = -a * sp
-            run = st[0] + _sel(ok, x, _zero())
-            if ok:
-                stg(o_v, t * (H * K) + kk, run * _RCP_LN2, fx.Float32)
-            res = yield [run]  # noqa: F841 (loop-carried form)
-
-    @flyc.jit
-    def launch(
-        g: fx.Tensor,
-        A_log: fx.Tensor,
-        dt_bias: fx.Tensor,
-        gc: fx.Tensor,
-        cbos: fx.Tensor,
-        clen: fx.Tensor,
-        T: fx.Int32,
-        lower_bound: fx.Float32,
-        NT: fx.Int32,
-        NBH: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel(g, A_log, dt_bias, gc, cbos, clen, T, lower_bound).launch(
-            grid=(NT, NBH, 1), block=(K, 1, 1), stream=stream
-        )
-
-    return launch
-
-
-# ---------------------------------------------------------------------------
 # intra
 # ---------------------------------------------------------------------------
 @functools.cache
@@ -413,13 +354,22 @@ def compile_intra(
     store_qkb: bool,
     varlen: bool = False,
     diag_mfma: bool = False,
+    g_dtype: torch.dtype = torch.float32,
+    use_gate: bool = False,
+    has_bias: bool = False,
+    use_lower_bound: bool = False,
 ):
-    """``diag_mfma``: the diagonal tiles also run on MFMA, with the decay split
+    """``g`` is the raw gate: the chunk cumsum (and, with ``use_gate``, the
+    ``A_log`` / ``dt_bias`` activation) runs here and ``gc`` gets the log2
+    cumsum for the K5 recurrence.
+
+    ``diag_mfma``: the diagonal tiles also run on MFMA, with the decay split
     at the block's middle row. Needs a per-token log2 decay bounded well under
     127 / 8 (the ``lower_bound`` gate: at most 5 / ln 2), else fp32."""
     QN = _num(qk_dtype)
     VN = _num(v_dtype)
     BN = _num(beta_dtype)
+    GN = _num(g_dtype)
     BF = fx.BFloat16
 
     @fx.struct
@@ -438,6 +388,9 @@ def compile_intra(
         k: fx.Tensor,
         v: fx.Tensor,
         g: fx.Tensor,
+        A_log: fx.Tensor,
+        dt_bias: fx.Tensor,
+        gc: fx.Tensor,
         beta: fx.Tensor,
         qn: fx.Tensor,
         kn: fx.Tensor,
@@ -452,6 +405,7 @@ def compile_intra(
         clen: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
+        lower_bound: fx.Float32,
     ):
         i_t = fx.block_idx.x
         i_bh = fx.block_idx.y
@@ -480,7 +434,26 @@ def compile_intra(
         cols = [c0 + e for e in range_constexpr(NE)]
         q_r = _row_ld(_vflat(q, hk, 128 // _bits(QN)), row, c0, rv, QN)
         k_r = _row_ld(_vflat(k, hk, 128 // _bits(QN)), row, c0, rv, QN)
-        g_r = _row_ld(_vflat(g, hk, 4), row, c0, rv, fx.Float32)
+        g_r = _row_ld(_vflat(g, hk, 128 // _bits(GN)), row, c0, rv, GN)
+        if const_expr(use_gate):
+            a = fx.exp(ldg(_flat(A_log, None), h, fx.Float32))
+            bias = [_zero()] * NE
+            if const_expr(has_bias):
+                bias = _row_ld(
+                    _vflat(dt_bias, fx.Int64(0), 4), h * K, c0, rv, fx.Float32
+                )
+            act = []
+            for e in range_constexpr(NE):
+                z = g_r[e] + bias[e]
+                if const_expr(use_lower_bound):
+                    x = lower_bound * _sigmoid(a * z)
+                else:
+                    sp = _sel(
+                        z > fx.Float32(20.0), z, fx.log(fx.Float32(1.0) + fx.exp(z))
+                    )
+                    x = -a * sp
+                act.append(_sel(rv, x, _zero()))
+            g_r = act
         if const_expr(l2norm_qk):
             q_r = _l2norm(q_r)
             k_r = _l2norm(k_r)
@@ -506,6 +479,21 @@ def compile_intra(
                 if seg == 0:
                     stg(_flat(bn, hb), r * H, beta_r, fx.Float32)
         gpu.barrier()
+
+        # Chunk-local cumsum down each column, in log2, then gc for K5.
+        if tid < K:
+            for t, st in range(0, BT, 1, init=[_zero()]):
+                tq = fx.Int32(t)
+                run = st[0] + lds_ld(s_g, tq * K + tid)
+                lds_st(s_g, tq * K + tid, _sel(tq < nvalid, run * _RCP_LN2, _zero()))
+                res = yield [run]
+        gpu.barrier()
+        g_r = []
+        for m in range_constexpr(NE // 4):
+            g4 = lds_ld4(s_g4, r * K + c0 + 4 * m)
+            g_r += [g4[vi] for vi in range_constexpr(4)]
+        if rv:
+            _row_st(_vflat(gc, hk, 4), r * (H * K), c0, g_r, fx.Float32)
 
         lane = tid % 64
         wave = tid // 64
@@ -754,6 +742,9 @@ def compile_intra(
         k: fx.Tensor,
         v: fx.Tensor,
         g: fx.Tensor,
+        A_log: fx.Tensor,
+        dt_bias: fx.Tensor,
+        gc: fx.Tensor,
         beta: fx.Tensor,
         qn: fx.Tensor,
         kn: fx.Tensor,
@@ -768,12 +759,34 @@ def compile_intra(
         clen: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
+        lower_bound: fx.Float32,
         NT: fx.Int32,
         NBH: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
-            q, k, v, g, beta, qn, kn, bn, qg, kg, w, u, Aqk, Akk, cbos, clen, T, scale
+            q,
+            k,
+            v,
+            g,
+            A_log,
+            dt_bias,
+            gc,
+            beta,
+            qn,
+            kn,
+            bn,
+            qg,
+            kg,
+            w,
+            u,
+            Aqk,
+            Akk,
+            cbos,
+            clen,
+            T,
+            scale,
+            lower_bound,
         ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
 
     return launch
@@ -826,26 +839,37 @@ def compile_output(
         state = (fx.Int64(b * NT + i_t) * H + fx.Int64(h)) * (K * V)
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
-        s_h = _lds(lds.h, V * K)
-        s_qg = _lds(lds.qg, BT * K)
         s_vn = _lds(lds.vn, V * BT)
-        s_a = _lds(lds.a, BT * BT)
-        h_v = _flat(hs, state)
-        for e in range_constexpr(V * K // NUM_THREADS):
-            i = tid + e * NUM_THREADS
-            lds_st(s_h, i, ldg(h_v, i, HN), BF)
-        _load_tile(_flat(qg, hb * K), H * K, s_qg, BT, K, nvalid, tid, BF, BF)
-        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
-        for e in range_constexpr(BT * V // NUM_THREADS):
-            i = tid + e * NUM_THREADS
-            t = i // V
-            c = i % V
+        # 128-bit staging; rows past nvalid read row 0 and are zeroed.
+        s_h8 = _lds_n(lds.h, V * K, 8)
+        h_v = _vflat(hs, state, 8)
+        for e in range_constexpr(V * K // 8 // NUM_THREADS):
+            i8 = (tid + e * NUM_THREADS) * 8
+            lds_st_n(s_h8, i8, ldg_n(h_v, i8, 8, HN), BF)
+        s_qg8 = _lds_n(lds.qg, BT * K, 8)
+        qg_v = _vflat(qg, hb * K, 8)
+        for e in range_constexpr(BT * K // 8 // NUM_THREADS):
+            i8 = (tid + e * NUM_THREADS) * 8
+            t = i8 // K
             ok = t < nvalid
-            x = ldg(vn_v, _sel(ok, t, 0) * V + c, VN)
-            lds_st(s_vn, c * BT + t, _sel(ok, x, _zero()), BF)
-        _load_tile(
-            _flat(Aqk, hb * BT), H * BT, s_a, BT, BT, nvalid, tid, fx.Float32, BF
-        )
+            x = ldg_n(qg_v, _sel(ok, t, 0) * (H * K) + i8 % K, 8, BF)
+            lds_st_n(s_qg8, i8, [_sel(ok, y, _zero()) for y in x], BF)
+        s_a4b = _lds_n(lds.a, BT * BT, 4)
+        a_v = _vflat(Aqk, hb * BT, 4)
+        for e in range_constexpr(BT * BT // 4 // NUM_THREADS):
+            i4 = (tid + e * NUM_THREADS) * 4
+            t = i4 // BT
+            ok = t < nvalid
+            x = ldg_n(a_v, _sel(ok, t, 0) * (H * BT) + i4 % BT, 4, fx.Float32)
+            lds_st_n(s_a4b, i4, [_sel(ok, y, _zero()) for y in x], BF)
+        vn_v = _vflat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V, 8)
+        for e in range_constexpr(BT * V // 8 // NUM_THREADS):
+            i8 = (tid + e * NUM_THREADS) * 8
+            t = i8 // V
+            ok = t < nvalid
+            x = ldg_n(vn_v, _sel(ok, t, 0) * V + i8 % V, 8, VN)
+            for m in range_constexpr(8):
+                lds_st(s_vn, (i8 % V + m) * BT + t, _sel(ok, x[m], _zero()), BF)
         gpu.barrier()
 
         # o = scale * qg h + Aqk v_new on MFMA; wave I owns rows 16I..16I+15.
