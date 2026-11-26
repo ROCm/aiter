@@ -558,6 +558,15 @@ def test_bf16_ring_csv_rows_reach_flydsl_through_public_replay(tmp_path):
         "        with replay.identified_kernels() as kernels:\n"
         "            gemm.replay(job)\n"
         "        assert kernels, job\n"
+        # The wheel build also replays the sizes below each row that it serves
+        # (m_low): a shuffled lm_head shape tuned from M=8 has no solution at M=1
+        # and must be reported as a refusal, not fail the build.
+        "for job in jobs:\n"
+        "    if job['m_low'] < job['m']:\n"
+        "        probe, _ = replay.replay_job(\n"
+        "            gemm, {**job, 'm': job['m_low']}, probe=True\n"
+        "        )\n"
+        "        assert probe['compile_time'] is not None, (job, probe)\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", code, str(path)],
