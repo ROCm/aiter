@@ -1842,7 +1842,7 @@ def chunk_delta_attn_bwd(
         takes them. ``chunk_size`` is the default pipeline's (32 or 64), whatever
         the forward ran with. ``backend="flydsl"`` runs every backward stage
         on FlyDSL (``aiter.ops.flydsl.kda_chunk_bwd``) where the call allows
-        it (gfx950, bf16, K = V = 128, chunk 64, no GVA, not varlen), and
+        it (gfx950, bf16, K = V = 128, chunk 64, no GVA), and
         this Triton path otherwise.
 
     Returns:
@@ -1875,7 +1875,14 @@ def chunk_delta_attn_bwd(
         )
 
         if kda_bwd_flydsl_supported(
-            H=H, HV=HV, K=K, V=V, chunk_size=BT, is_varlen=is_varlen, dtype=q.dtype
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            chunk_size=BT,
+            is_varlen=is_varlen,
+            dtype=q.dtype,
+            B=B,
         ):
             return chunk_kda_bwd_flydsl_full(
                 do,
@@ -1887,6 +1894,8 @@ def chunk_delta_attn_bwd(
                 beta,
                 scale,
                 initial_state=initial_state,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
                 chunk_size=BT,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,

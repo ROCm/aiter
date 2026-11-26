@@ -226,7 +226,7 @@ def chunk_kimi_delta_attn(
         bwd_backend (str):
             Backend of the backward pass: `"triton"`, or `"flydsl"` to run
             every backward stage on FlyDSL (gfx950, bf16, `K = V = 128`,
-            chunk 64, no GVA, not varlen; other calls stay on Triton). The
+            chunk 64, no GVA, dense or varlen; other calls stay on Triton). The
             forward intermediates are recomputed by the Triton forward
             prologue either way. Default: `"triton"`.
 

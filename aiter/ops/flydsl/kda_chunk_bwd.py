@@ -67,7 +67,15 @@ def _check(stage, **tensors):
 
 
 def kda_bwd_flydsl_supported(
-    *, H: int, HV: int, K: int, V: int, chunk_size: int, is_varlen: bool, dtype
+    *,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    chunk_size: int,
+    is_varlen: bool,
+    dtype,
+    B: int = 1,
 ) -> bool:
     """Calls the FlyDSL backward takes; everything else stays on Triton."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -80,21 +88,62 @@ def kda_bwd_flydsl_supported(
         and V == 128
         and chunk_size == BT
         and H == HV
-        and not is_varlen
+        and (B == 1 or not is_varlen)
         and dtype == torch.bfloat16
     )
 
 
-def kda_bwd_fwd_h_flydsl(kg, w, u, g_cumsum, initial_state, state_v_first):
+class _Varlen:
+    """Chunk schedule of a varlen call: int32 ``cu_seqlens``, ``chunk_indices``
+    (``[NT, 2]`` ``(sequence, chunk)``) and ``chunk_offsets`` (``[N + 1]``)."""
+
+    def __init__(self, cu_seqlens, chunk_indices):
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils.index import (
+            prepare_chunk_offsets,
+        )
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
+            prepare_chunk_indices,
+        )
+
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        self.chunk_indices = chunk_indices
+        self.cu = cu_seqlens.to(torch.int32).contiguous()
+        self.ci = chunk_indices.to(torch.int32).contiguous()
+        self.co = prepare_chunk_offsets(cu_seqlens, BT).to(torch.int32).contiguous()
+        self.N = cu_seqlens.numel() - 1
+        self.NT = chunk_indices.shape[0]
+
+
+def kda_bwd_fwd_h_flydsl(
+    kg, w, u, g_cumsum, initial_state, state_v_first, cu_seqlens=None
+):
     """Per-chunk states and ``v_new = u - w @ h`` on the K5 kernel.
 
     kg, w, u: token-major ``[B, T, H, *]`` bf16 (kg decayed to its chunk end);
     g_cumsum: ``[B, T, H, K]`` log2 chunk cumsum. Returns ``h`` as
-    ``[B, NT, H, V, K]`` and ``v_new`` as ``[B, H, T, V]``.
+    ``[B, NT, H, V, K]`` and ``v_new`` as ``[B, H, T, V]``. With
+    ``cu_seqlens`` (``B = 1``) each sequence starts from its own state and
+    ``NT`` counts the chunks of all sequences.
     """
+    from .linear_attention_prefill_kernels import (
+        _hipeq_varlen_host_metadata,
+        _resolve_prologue,
+    )
+
     B, T, H, K = kg.shape
     V = u.shape[-1]
-    NT = (T + BT - 1) // BT
+    is_varlen = cu_seqlens is not None
+    dummy, int32_dummy = _placeholder_pair(kg.device)
+    if is_varlen:
+        NT, chunk_offsets, kernel_cu, N, _ = _resolve_prologue(cu_seqlens, BT, 0, 0, T)
+        total_chunks, max_seq_chunks = _hipeq_varlen_host_metadata(chunk_offsets)
+        cu_arg = kernel_cu.to(torch.int32).contiguous()
+        co_arg = chunk_offsets.to(torch.int32).contiguous()
+    else:
+        NT = (T + BT - 1) // BT
+        N, total_chunks, max_seq_chunks = B, B * NT, NT
+        cu_arg = co_arg = int32_dummy
     gk = g_cumsum.to(torch.float32).contiguous()
     h0 = None
     if initial_state is not None:
@@ -102,7 +151,7 @@ def kda_bwd_fwd_h_flydsl(kg, w, u, g_cumsum, initial_state, state_v_first):
         if not state_v_first:
             h0 = h0.transpose(-1, -2)
         h0 = h0.contiguous()
-    BV = _hipeq_select_bv(kg.device, H, B * NT, NT)
+    BV = _hipeq_select_bv(kg.device, H, total_chunks, max_seq_chunks)
     launch_fn = _get_or_compile_opt(
         K,
         V,
@@ -115,7 +164,7 @@ def kda_bwd_fwd_h_flydsl(kg, w, u, g_cumsum, initial_state, state_v_first):
         h0 is not None,
         False,  # store_fs
         True,  # save_vn
-        False,  # is_varlen
+        is_varlen,
         False,  # wu_contig: w/u are token-major
         state_bf16=False,
         g_log2_scaled=True,
@@ -123,7 +172,6 @@ def kda_bwd_fwd_h_flydsl(kg, w, u, g_cumsum, initial_state, state_v_first):
         bf16_convert_trunc=False,
         snapshot_bf16=True,
     )
-    dummy, int32_dummy = _placeholder_pair(kg.device)
     h = kg.new_empty(B, NT, H, V, K)
     v_new = kg.new_empty(B, H, T, V)
     _run_compiled(
@@ -137,14 +185,14 @@ def kda_bwd_fwd_h_flydsl(kg, w, u, g_cumsum, initial_state, state_v_first):
         h,
         h0 if h0 is not None else dummy,
         dummy,
-        int32_dummy,
-        int32_dummy,
+        cu_arg,
+        co_arg,
         int32_dummy,
         T,
         T,
-        B,
+        N,
         V // BV,
-        B * H,
+        N * H,
         torch.cuda.current_stream(),
     )
     return h, v_new
@@ -160,6 +208,8 @@ def chunk_kda_bwd_flydsl_full(
     beta,
     scale,
     initial_state=None,
+    cu_seqlens=None,
+    chunk_indices=None,
     chunk_size=BT,
     safe_gate=False,
     lower_bound=None,
@@ -172,8 +222,11 @@ def chunk_kda_bwd_flydsl_full(
 ):
     """FlyDSL ``chunk_delta_attn_bwd``: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``.
 
-    Same arguments as the Triton ``chunk_delta_attn_bwd`` without varlen;
-    the caller checks ``kda_bwd_flydsl_supported`` first.
+    Same arguments as the Triton ``chunk_delta_attn_bwd``; the caller checks
+    ``kda_bwd_flydsl_supported`` first. With ``cu_seqlens`` (``B = 1``), chunks
+    stop at sequence edges, every sequence has its own state (``initial_state``
+    / ``dht`` / ``dh0`` are ``[N, H, *, *]``), and tokens past
+    ``cu_seqlens[-1]`` get zero gradients, as in the Triton backward.
     """
     from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
         chunk_delta_attn_fwd_prepare,
@@ -181,11 +234,23 @@ def chunk_kda_bwd_flydsl_full(
 
     B, T, H, K = q.shape
     V = v.shape[-1]
-    NT = (T + BT - 1) // BT
     dev = q.device
     stream = torch.cuda.current_stream()
-    dummy, _ = _placeholder_pair(dev)
+    dummy, int32_dummy = _placeholder_pair(dev)
     f32 = {"device": dev, "dtype": torch.float32}
+    varlen = cu_seqlens is not None
+    if varlen:
+        if B != 1:
+            raise ValueError(f"varlen inputs must be flattened to B = 1, got B = {B}.")
+        sched = _Varlen(cu_seqlens, chunk_indices)
+        chunk_indices, NT, N = sched.chunk_indices, sched.NT, sched.N
+        cu, ci, co = sched.cu, sched.ci, sched.co
+    else:
+        NT, N = (T + BT - 1) // BT, B
+        cu = ci = co = int32_dummy
+    NBH = B * H
+    # Varlen tokens past cu_seqlens[-1] are never written: zero those outputs.
+    alloc = torch.zeros if varlen else torch.empty
 
     qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
         q=q,
@@ -194,8 +259,8 @@ def chunk_kda_bwd_flydsl_full(
         g=g,
         beta=beta,
         scale=scale,
-        cu_seqlens=None,
-        chunk_indices=None,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         chunk_size=BT,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
@@ -207,23 +272,27 @@ def chunk_kda_bwd_flydsl_full(
         disable_recompute=True,
     )
     _check("fwd_prepare (Triton)", q=qn, k=kn, g=gc, w=w, u=u, qg=qg, kg=kg, Akk=Akk)
-    h, v_new = kda_bwd_fwd_h_flydsl(kg, w, u, gc, initial_state, state_v_first)
+    h, v_new = kda_bwd_fwd_h_flydsl(
+        kg, w, u, gc, initial_state, state_v_first, cu_seqlens
+    )
     _check("fwd_h", h=h, v_new=v_new)
     do = do.contiguous()
 
-    dAqk = torch.empty(B, T, H, BT, **f32)
-    dv = torch.empty_like(v)
+    dAqk = alloc(B, T, H, BT, **f32)
+    dv = alloc(v.shape, device=dev, dtype=v.dtype)
     _run_compiled(
-        compile_dav(H, v.dtype, Aqk.dtype),
+        compile_dav(H, v.dtype, Aqk.dtype, varlen),
         v_new,
         Aqk,
         do,
         dAqk,
         dv,
+        cu,
+        ci,
         T,
         float(scale),
         NT,
-        B * H,
+        NBH,
         stream,
     )
     _check("dav", dAqk=dAqk, dv=dv)
@@ -234,7 +303,7 @@ def chunk_kda_bwd_flydsl_full(
         if initial_state is not None
         else None
     )
-    dv2 = torch.empty_like(dv)
+    dv2 = alloc(dv.shape, device=dev, dtype=dv.dtype)
     _run_compiled(
         compile_dhu(
             H,
@@ -243,6 +312,7 @@ def chunk_kda_bwd_flydsl_full(
             initial_state is not None,
             dht is not None,
             state_v_first,
+            varlen,
         ),
         qg,
         kg,
@@ -254,21 +324,23 @@ def chunk_kda_bwd_flydsl_full(
         dh,
         dh0 if dh0 is not None else dummy,
         dv2,
+        cu,
+        co,
         T,
         float(scale),
-        B * H,
+        N * H,
         stream,
     )
     _check("dhu", dh=dh, dh0=dh0, dv2=dv2)
 
-    dq = torch.empty(B, T, H, K, **f32)
-    dk = torch.empty_like(dq)
-    dg = torch.empty_like(dq)
-    dv = torch.empty_like(v)
-    db = torch.empty(B, T, H, **f32)
-    dAkk = torch.empty_like(dAqk)
+    dq = alloc(B, T, H, K, **f32)
+    dk = alloc(B, T, H, K, **f32)
+    dg = alloc(B, T, H, K, **f32)
+    dv = alloc(v.shape, device=dev, dtype=v.dtype)
+    db = alloc(B, T, H, **f32)
+    dAkk = alloc(B, T, H, BT, **f32)
     _run_compiled(
-        compile_wy_dqkg(H, qn.dtype, v.dtype, bn.dtype, Akk.dtype, h.dtype),
+        compile_wy_dqkg(H, qn.dtype, v.dtype, bn.dtype, Akk.dtype, h.dtype, varlen),
         qn,
         kn,
         v,
@@ -286,18 +358,20 @@ def chunk_kda_bwd_flydsl_full(
         dg,
         db,
         dAkk,
+        cu,
+        ci,
         T,
         float(scale),
         NT,
-        B * H,
+        NBH,
         stream,
     )
     _check("wy_dqkg", dq=dq, dk=dk, dv=dv, dg=dg, db=db, dAkk=dAkk)
 
-    dq2 = torch.empty_like(q)
-    dk2 = torch.empty_like(k)
-    dg2 = torch.empty(B, T, H, K, **f32)
-    db2 = torch.empty_like(beta)
+    dq2 = alloc(q.shape, device=dev, dtype=q.dtype)
+    dk2 = alloc(k.shape, device=dev, dtype=k.dtype)
+    dg2 = alloc(B, T, H, K, **f32)
+    db2 = alloc(beta.shape, device=dev, dtype=beta.dtype)
     _run_compiled(
         compile_intra(
             H,
@@ -309,6 +383,7 @@ def chunk_kda_bwd_flydsl_full(
             beta.dtype,
             use_qk_l2norm_in_kernel,
             use_beta_sigmoid_in_kernel,
+            varlen,
         ),
         qn,
         kn,
@@ -327,9 +402,11 @@ def chunk_kda_bwd_flydsl_full(
         dk2,
         dg2,
         db2,
+        cu,
+        ci,
         T,
         NT,
-        B * H,
+        NBH,
         stream,
     )
     _check("intra", dq=dq2, dk=dk2, dg=dg2, db=db2)
@@ -337,10 +414,16 @@ def chunk_kda_bwd_flydsl_full(
     use_bias = use_gate_in_kernel and dt_bias is not None
     dA_part = torch.empty(NT, B, H, K, **f32) if use_gate_in_kernel else None
     db_part = torch.empty(NT, B, H, K, **f32) if use_bias else None
-    dg_out = torch.empty_like(g)
+    dg_out = alloc(g.shape, device=dev, dtype=g.dtype)
     _run_compiled(
         compile_gate_cumsum(
-            H, g.dtype, g.dtype, use_gate_in_kernel, use_bias, lower_bound is not None
+            H,
+            g.dtype,
+            g.dtype,
+            use_gate_in_kernel,
+            use_bias,
+            lower_bound is not None,
+            varlen,
         ),
         dg2,
         g,
@@ -349,10 +432,12 @@ def chunk_kda_bwd_flydsl_full(
         dg_out,
         dA_part if dA_part is not None else dummy,
         db_part if db_part is not None else dummy,
+        cu,
+        ci,
         T,
         0.0 if lower_bound is None else float(lower_bound),
         NT,
-        B * H,
+        NBH,
         stream,
     )
     _check("gate_cumsum", dg=dg_out, dA_part=dA_part, db_part=db_part)
@@ -385,20 +470,23 @@ def chunk_kda_bwd_flydsl(
     A_log=None,
     dt_bias=None,
     use_beta_sigmoid_in_kernel=False,
+    cu_seqlens=None,
 ):
     """#8739 ``register_chunk_bwd`` contract: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias)``.
 
     q, k, g ``[B, T, H, K]``, v and do ``[B, T, H, V]``, beta ``[B, T, H]``,
-    no initial or final state. q/k/v/do are computed in bf16; each gradient
+    no initial or final state; ``cu_seqlens`` (optional, ``B = 1``) packs
+    variable-length sequences. q/k/v/do are computed in bf16; each gradient
     comes back in its input's dtype. Falls back to the Triton backward when
-    the shape is outside ``kda_bwd_flydsl_supported``.
+    the call is outside ``kda_bwd_flydsl_supported``.
     """
     in_dtypes = (q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype)
     bf = torch.bfloat16
     q, k, v, do = (t.to(bf).contiguous() for t in (q, k, v, do))
     g, beta = g.contiguous(), beta.contiguous()
-    H, K = q.shape[2:]
+    B, _, H, K = q.shape
     kw = {
+        "cu_seqlens": cu_seqlens,
         "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
         "use_gate_in_kernel": use_gate_in_kernel,
         "A_log": A_log,
@@ -411,8 +499,9 @@ def chunk_kda_bwd_flydsl(
         K=K,
         V=v.shape[-1],
         chunk_size=chunk_size,
-        is_varlen=False,
+        is_varlen=cu_seqlens is not None,
         dtype=q.dtype,
+        B=B,
     ):
         out = chunk_kda_bwd_flydsl_full(
             do, None, q, k, v, g, beta, scale, chunk_size=chunk_size, **kw

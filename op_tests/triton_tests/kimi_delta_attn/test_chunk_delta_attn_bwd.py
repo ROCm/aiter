@@ -213,23 +213,76 @@ def test_backward_matches_fla():
         assert _err_ratio(grads[1][n], grads[0][n]) < _ERR_RATIO, n
 
 
-@pytest.mark.parametrize("T", [100, 1000])
-@pytest.mark.parametrize("state", ["none", "h0", "h0_vfirst"])
-def test_backward_flydsl_matches_triton(state, T):
-    """bwd_backend="flydsl" (FlyDSL state recurrence) agrees with the Triton backward."""
-    pytest.importorskip("flydsl")
-    # T=100 is one full chunk and a 36-token tail, as in #8739's layer test.
-    x, _ = _inputs(2, T, 96, 96, 128, 128, False, state, precomputed_gate=False)
-    opts = dict(_FLASH, chunk_size=64, state_v_first=state == "h0_vfirst")
+def _flydsl_vs_triton(x, cu, opts, final_state=True):
+    """Gradients of every input from the Triton and FlyDSL backwards, same call."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
     grads = []
     for backend in ("triton", "flydsl"):
         leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
-        o, _ = chunk_kimi_delta_attn(**leaves, bwd_backend=backend, **opts)
-        o.float().square().sum().backward()
+        o, s = chunk_kimi_delta_attn(
+            **leaves,
+            cu_seqlens=cu,
+            output_final_state=final_state,
+            bwd_backend=backend,
+            **opts,
+        )
+        if not grads:
+            do = torch.randn(o.shape, device="cuda", generator=gen)
+            ds = (
+                torch.randn(s.shape, device="cuda", generator=gen)
+                if final_state
+                else None
+            )
+        loss = (o.float() * do).sum()
+        if final_state:
+            loss = loss + (s.float() * ds).sum()
+        loss.backward()
         grads.append({n: t.grad for n, t in leaves.items()})
     for n in x:
         assert torch.isfinite(grads[1][n]).all(), n
         assert _err_ratio(grads[0][n], grads[1][n]) < _ERR_RATIO, n
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("T", [100, 1000])
+@pytest.mark.parametrize("state", ["none", "h0", "h0_vfirst"])
+def test_backward_flydsl_matches_triton(state, T, varlen):
+    """bwd_backend="flydsl" agrees with the Triton backward, dh0 and dht included.
+
+    T=100 is one full chunk and a 36-token tail, as in #8739's layer test;
+    varlen packs 3 sequences of random lengths, so sequence edges fall inside
+    chunks and every sequence carries its own state.
+    """
+    pytest.importorskip("flydsl")
+    x, cu = _inputs(3, T, 96, 96, 128, 128, varlen, state, precomputed_gate=False)
+    opts = dict(_FLASH, chunk_size=64, state_v_first=state == "h0_vfirst")
+    _flydsl_vs_triton(x, cu, opts)
+
+
+# Lumen#35 timing shapes (all safe_gate), at the issue's heads and at K3's 96:
+# (sequences, tokens per sequence, heads, varlen).
+_LUMEN_SHAPES = [
+    (1, 8192, 32, False),
+    (1, 8192, 96, False),
+    (2, 4096, 16, False),
+    (2, 4096, 96, False),
+    (1, 32768, 16, False),
+    (1, 32768, 96, False),
+    (8, 2048, 16, True),
+    (8, 2048, 96, True),
+]
+
+
+@pytest.mark.parametrize("B,T,H,varlen", _LUMEN_SHAPES)
+def test_backward_flydsl_lumen_shapes(B, T, H, varlen):
+    """FlyDSL agrees with Triton on the Lumen#35 shapes, varlen 8x2048 included."""
+    pytest.importorskip("flydsl")
+    if varlen:
+        x, _ = _inputs(1, B * T, H, H, 128, 128, False, "none", precomputed_gate=False)
+        cu = torch.arange(0, B * T + 1, T, dtype=torch.int32, device="cuda")
+    else:
+        x, cu = _inputs(B, T, H, H, 128, 128, False, "none", precomputed_gate=False)
+    _flydsl_vs_triton(x, cu, dict(_FLASH, chunk_size=64), final_state=False)
 
 
 @pytest.mark.parametrize("l2norm", [False, True])

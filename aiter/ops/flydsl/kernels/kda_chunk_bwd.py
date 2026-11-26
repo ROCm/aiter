@@ -155,16 +155,43 @@ def _load_tile(view, ld_stride, lds_view, rows, cols, nvalid, tid, num, lds_num)
         lds_st(lds_view, i, _sel(ok, x, _zero()), lds_num)
 
 
+def ldi(view, i):
+    frag = fx.make_rmem_tensor(1, fx.Int32)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    fx.copy(atom, fx.slice(view, (i, None)), frag)
+    return frag.load()[0]
+
+
 def _chunk(i_t, T):
     t0 = i_t * BT
     return t0, _min(T - t0, fx.Int32(BT))
+
+
+def _chunk_pos(i_t, T, cu, ci, varlen):
+    """Start ``pos`` of program chunk ``i_t`` within its batch row and its valid rows.
+
+    Dense: chunk ``i_t`` of a length-``T`` row. Varlen (``B = 1``): ``ci`` is
+    ``chunk_indices`` (``[NT, 2]`` int32 ``(sequence, chunk)``), ``cu`` the int32
+    ``cu_seqlens``; the chunk stops at its sequence's end.
+    """
+    if const_expr(varlen):
+        ci_v = _flat(ci, None)
+        cu_v = _flat(cu, None)
+        i_n = ldi(ci_v, i_t * 2)
+        t0 = ldi(ci_v, i_t * 2 + 1) * BT
+        bos = ldi(cu_v, i_n)
+        eos = ldi(cu_v, i_n + 1)
+        return bos + t0, _min(eos - bos - t0, fx.Int32(BT))
+    return _chunk(i_t, T)
 
 
 # ---------------------------------------------------------------------------
 # dav
 # ---------------------------------------------------------------------------
 @functools.cache
-def compile_dav(H: int, v_dtype: torch.dtype, a_dtype: torch.dtype):
+def compile_dav(
+    H: int, v_dtype: torch.dtype, a_dtype: torch.dtype, varlen: bool = False
+):
     VN = _num(v_dtype)
     AN = _num(a_dtype)
 
@@ -181,6 +208,8 @@ def compile_dav(H: int, v_dtype: torch.dtype, a_dtype: torch.dtype):
         do: fx.Tensor,
         dA: fx.Tensor,
         dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
     ):
@@ -191,7 +220,7 @@ def compile_dav(H: int, v_dtype: torch.dtype, a_dtype: torch.dtype):
         tid = fx.thread_idx.x
         r = tid // 4
         seg = tid % 4
-        t0, nvalid = _chunk(i_t, T)
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
         tok = fx.Int64(b * T + t0)
         do_v = _flat(do, (tok * H + fx.Int64(h)) * V)
         dv_v = _flat(dv, (tok * H + fx.Int64(h)) * V)
@@ -247,13 +276,15 @@ def compile_dav(H: int, v_dtype: torch.dtype, a_dtype: torch.dtype):
         do: fx.Tensor,
         dA: fx.Tensor,
         dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
         NT: fx.Int32,
         NBH: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(vnew, A, do, dA, dv, T, scale).launch(
+        kernel(vnew, A, do, dA, dv, cu, ci, T, scale).launch(
             grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
         )
 
@@ -271,6 +302,7 @@ def compile_dhu(
     use_initial_state: bool,
     use_final_state_gradient: bool,
     transpose_state: bool,
+    varlen: bool = False,
 ):
     KN = _num(k_dtype)
     VN = _num(v_dtype)
@@ -299,6 +331,8 @@ def compile_dhu(
         dh: fx.Tensor,
         dh0: fx.Tensor,
         dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
     ):
@@ -311,7 +345,19 @@ def compile_dhu(
         sc = tid % 2
         r = tid // 4  # chunk row for dv2
         seg = tid % 4
-        NT = (T + (BT - 1)) // BT
+        # Varlen (B = 1): state i_bh is sequence b's, which spans tokens
+        # [bos, eos) and global chunks from chunk_offsets[b].
+        if const_expr(varlen):
+            cu_v = _flat(cu, None)
+            bos = ldi(cu_v, b)
+            T_loc = ldi(cu_v, b + 1) - bos
+            boh = ldi(_flat(co, None), b)
+            row0 = bos
+        else:
+            T_loc = T
+            boh = b * ((T + (BT - 1)) // BT)
+            row0 = b * T
+        NT = (T_loc + (BT - 1)) // BT
         v0 = i_v * BV
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
@@ -339,12 +385,12 @@ def compile_dhu(
 
         for i, st in range(0, NT, 1, init=init):
             it = NT - 1 - fx.Int32(i)
-            t0, nvalid = _chunk(it, T)
-            tok = fx.Int64(b * T + t0)
+            t0, nvalid = _chunk(it, T_loc)
+            tok = fx.Int64(row0 + t0)
             hk = (tok * H + fx.Int64(h)) * K
             hv = (tok * H + fx.Int64(h)) * V
             gpu.barrier()
-            dh_v = _flat(dh, ((fx.Int64(b * NT + it)) * H + fx.Int64(h)) * (K * V))
+            dh_v = _flat(dh, ((fx.Int64(boh + it)) * H + fx.Int64(h)) * (K * V))
             for e in range_constexpr(NE):
                 c = sc + 2 * e
                 stg(dh_v, kr * V + v0 + c, st[e], KN)
@@ -430,12 +476,14 @@ def compile_dhu(
         dh: fx.Tensor,
         dh0: fx.Tensor,
         dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
         NBH: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(qg, kg, w, g, do, dv, dht, dh, dh0, dv2, T, scale).launch(
+        kernel(qg, kg, w, g, do, dv, dht, dh, dh0, dv2, cu, co, T, scale).launch(
             grid=(V // BV, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
         )
 
@@ -453,6 +501,7 @@ def compile_wy_dqkg(
     beta_dtype: torch.dtype,
     a_dtype: torch.dtype,
     h_dtype: torch.dtype,
+    varlen: bool = False,
 ):
     KN = _num(k_dtype)
     VN = _num(v_dtype)
@@ -494,6 +543,8 @@ def compile_wy_dqkg(
         dg: fx.Tensor,
         db: fx.Tensor,
         dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
     ):
@@ -506,14 +557,18 @@ def compile_wy_dqkg(
         seg = tid % 4
         lane = tid % 64
         wave = tid // 64
-        NT = (T + (BT - 1)) // BT
-        t0, nvalid = _chunk(i_t, T)
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
         last = nvalid - 1
         rv = r < nvalid
         tok = fx.Int64(b * T + t0)
         hk = (tok * H + fx.Int64(h)) * K
         hv = (tok * H + fx.Int64(h)) * V
-        state = (fx.Int64(b * NT + i_t) * H + fx.Int64(h)) * (K * V)
+        # Global chunk of this program: chunk_indices enumerates them in order.
+        if const_expr(varlen):
+            i_c = i_t
+        else:
+            i_c = b * ((T + (BT - 1)) // BT) + i_t
+        state = (fx.Int64(i_c) * H + fx.Int64(h)) * (K * V)
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
         s_h = _lds(lds.h, K * V)
@@ -758,6 +813,8 @@ def compile_wy_dqkg(
         dg: fx.Tensor,
         db: fx.Tensor,
         dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         scale: fx.Float32,
         NT: fx.Int32,
@@ -782,6 +839,8 @@ def compile_wy_dqkg(
             dg,
             db,
             dA,
+            cu,
+            ci,
             T,
             scale,
         ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
@@ -803,6 +862,7 @@ def compile_intra(
     out_beta_dtype: torch.dtype,
     l2norm_qk: bool,
     beta_sigmoid: bool,
+    varlen: bool = False,
 ):
     KN = _num(k_dtype)
     BN = _num(beta_dtype)
@@ -853,6 +913,8 @@ def compile_intra(
         dk2: fx.Tensor,
         dg2: fx.Tensor,
         db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
     ):
         i_t = fx.block_idx.x
@@ -862,7 +924,7 @@ def compile_intra(
         tid = fx.thread_idx.x
         r = tid // 4
         seg = tid % 4
-        t0, nvalid = _chunk(i_t, T)
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
         rv = r < nvalid
         rc = _sel(rv, r, 0)
         tok = fx.Int64(b * T + t0)
@@ -1023,6 +1085,8 @@ def compile_intra(
         dk2: fx.Tensor,
         dg2: fx.Tensor,
         db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         NT: fx.Int32,
         NBH: fx.Int32,
@@ -1046,6 +1110,8 @@ def compile_intra(
             dk2,
             dg2,
             db2,
+            cu,
+            ci,
             T,
         ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
 
@@ -1063,6 +1129,7 @@ def compile_gate_cumsum(
     use_gate: bool,
     has_bias: bool,
     use_lower_bound: bool,
+    varlen: bool = False,
 ):
     GN = _num(g_dtype)
     ON = _num(out_dtype)
@@ -1076,6 +1143,8 @@ def compile_gate_cumsum(
         o: fx.Tensor,
         dA_part: fx.Tensor,
         db_part: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         lower_bound: fx.Float32,
         NBH: fx.Int32,
@@ -1085,7 +1154,7 @@ def compile_gate_cumsum(
         b = i_bh // H
         h = i_bh % H
         kk = fx.thread_idx.x
-        t0, nvalid = _chunk(i_t, T)
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
         tok = fx.Int64(b * T + t0)
         hk = (tok * H + fx.Int64(h)) * K
         s_v = _flat(s, hk)
@@ -1142,14 +1211,16 @@ def compile_gate_cumsum(
         o: fx.Tensor,
         dA_part: fx.Tensor,
         db_part: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
         T: fx.Int32,
         lower_bound: fx.Float32,
         NT: fx.Int32,
         NBH: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(s, g, A_log, dt_bias, o, dA_part, db_part, T, lower_bound, NBH).launch(
-            grid=(NT, NBH, 1), block=(K, 1, 1), stream=stream
-        )
+        kernel(
+            s, g, A_log, dt_bias, o, dA_part, db_part, cu, ci, T, lower_bound, NBH
+        ).launch(grid=(NT, NBH, 1), block=(K, 1, 1), stream=stream)
 
     return launch
