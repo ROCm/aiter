@@ -305,9 +305,9 @@ def flydsl_hgemm(
         raise ValueError("BF16 preshuffle requires gfx950 sk or unsplit ft policy")
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    if not flydsl_hgemm_policy_runs_on(policy, gfx):
+        raise RuntimeError(f"FlyDSL HGEMM policy {policy!r} has no kernel for {gfx}")
     if policy in TDM_POLICIES:
-        if not flydsl_hgemm_policy_runs_on(policy, gfx):
-            raise RuntimeError("TDM HGEMM policies require gfx1250")
         if k_waves != 1 or out_dtype not in (None, a.dtype):
             raise ValueError(
                 "TDM HGEMM requires k_waves=1 and matching input/output dtype"
@@ -371,8 +371,6 @@ def flydsl_hgemm(
             },
         )
     if policy == SKINNY_POLICY:
-        if gfx != "gfx950":
-            raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
         if bias is not None or split_k != 1 or m_waves != 1 or n_waves != 1 or group_m:
             raise ValueError(
                 "The FlyDSL skinny HGEMM policy requires split_k=1, m_waves=1, "
@@ -411,10 +409,6 @@ def flydsl_hgemm(
                 split_k=split_k,
                 main_loop_unroll=policy in ("ht", "hti"),
             )
-    if gfx != "gfx950":
-        raise RuntimeError(
-            "The FlyDSL A16W16 kernel currently supports gfx950 and gfx1250 only"
-        )
 
     if not a.is_contiguous():
         a = a.contiguous()

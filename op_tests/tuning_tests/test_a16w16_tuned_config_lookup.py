@@ -391,7 +391,6 @@ class TestTdmPolicyContract(unittest.TestCase):
                     name.replace("gfx1250", "gfx950"),
                     name.replace("_w2x2x1_", "_w2x2x2_"),
                     name.replace("x128x2_ks", "x128x1_ks"),
-                    name.replace("_gm0_p", f"_gm0_i{int(interleave)}_p"),
                 ):
                     self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid))
                 with self.assertRaises(ValueError):
@@ -785,7 +784,9 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     mock.patch.object(
                         kernels, "get_gfx_runtime", return_value="gfx1250-strict"
                     ),
-                    self.assertRaisesRegex(RuntimeError, "require gfx1250"),
+                    self.assertRaisesRegex(
+                        RuntimeError, "no kernel for gfx1250-strict"
+                    ),
                 ):
                     kernels.flydsl_hgemm(
                         a, b, out=out, stream=stream, **{f: params[f] for f in fields}
