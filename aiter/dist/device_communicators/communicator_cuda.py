@@ -626,20 +626,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "mxfp8":
-            if group_size != 32:
-                raise ValueError("mxfp8 requires group_size=32")
-            if emit_bf16 or transpose_scale or hadamard_rotate:
-                raise ValueError(
-                    "mxfp8 does not support emit_bf16, transpose_scale, "
-                    "or hadamard_rotate"
-                )
             return self.fused_allreduce_rmsnorm_mxfp8_quant(
-                input_,
-                res_inp_,
-                weight_,
-                eps,
-                prefill_support=prefill_support,
-                gemma_norm=gemma_norm,
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm
             )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
@@ -778,68 +766,39 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps: float,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return E4M3 values with row-major group-32 E8M0 scales."""
+    ):
+        """(out, residual_out, scale): E4M3 out with row-major group-32 E8M0
+        scales. One Gluon launch where the per-token Gluon kernel would run, else
+        fused_allreduce_rmsnorm and then per_1x32_mx_quant_hip (the same bytes)."""
         if input_.dim() != 2 or input_.shape[-1] % 32:
-            raise ValueError(
-                "mxfp8 requires a 2-D input with hidden size divisible by 32"
-            )
-
-        tokens, hidden = input_.shape
-        if tokens == 0:
-            return (
-                torch.empty_like(input_, dtype=fp8),
-                torch.empty_like(res_inp_),
-                torch.empty(
-                    (0, hidden // 32),
-                    dtype=fp8_e8m0,
-                    device=input_.device,
-                ),
-            )
-
-        # The Gluon AR + RMSNorm + MXFP8 one-shot takes up to
-        # _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot can take the
-        # call: above that the Lamport fused AR + RMSNorm and a separate MXFP8
-        # quant are faster (hidden 6144, TP4, CUDA graphs, 4x MI455X: 18.4 /
-        # 19.5 / 25.9 / 26.2 us against 25.7 / 26.1 / 28.4 / 28.7 us at 192 /
-        # 256 / 320 / 341 rows; level at 128-160 rows). Without the Lamport
-        # path it keeps the plain Gluon all-reduce's 4 MiB bound.
+            raise ValueError("mxfp8 takes a 2-D input with hidden divisible by 32")
+        if input_.shape[0] == 0:
+            scale = input_.new_empty((0, input_.shape[1] // 32), dtype=fp8_e8m0)
+            return input_.to(fp8), torch.empty_like(res_inp_), scale
         ca_comm = self.ca_comm
         lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
-            input_, res_inp_, weight_, hidden
+            input_, res_inp_, weight_, input_.shape[-1]
         )
-        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=lamport):
+        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport):
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,
             )
 
-            inboxes, calls = self.gluon_ar_plain
             return all_reduce_rmsnorm_mxfp8_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 gemma_norm,
-                group=self.cpu_group,
-                inboxes=inboxes,
-                calls=calls,
+                self.cpu_group,
+                *self.gluon_ar_plain,
             )
-
-        normed, res_out = self.fused_allreduce_rmsnorm(
-            input_,
-            res_inp_,
-            weight_,
-            eps,
-            prefill_support,
-            gemma_norm=gemma_norm,
-        )
         from aiter.ops.quant import per_1x32_mx_quant_hip
 
-        out, scale = per_1x32_mx_quant_hip(
-            normed,
-            quant_dtype=fp8,
-            scale_type=fp8_e8m0,
+        out, res_out = self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
         )
+        out, scale = per_1x32_mx_quant_hip(out, quant_dtype=fp8, scale_type=fp8_e8m0)
         return out, res_out, scale
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -1079,7 +1038,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if hadamard_rotate:
                 from aiter.ops.quant import per_1x32_f4_quant_hip
 
-                out_fp4, scale_out = per_1x32_f4_quant_hip(normed, hadamard_rotate=True)
+                out_fp4, scale_out = per_1x32_f4_quant_hip(
+                    normed, hadamard_rotate=True
+                )
             else:
                 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 

@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
-from aiter import logger
+from aiter import dtypes, logger
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
@@ -19,6 +19,7 @@ from aiter.dist.communication_op import (
 )
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.triton.comms import all_reduce as plain
 from aiter.ops.triton.comms.all_reduce import (
     all_reduce,
@@ -361,6 +362,38 @@ def _dispatch_worker(rank, init_method):
                     )
             name = f"rank {rank} per-token dispatch tokens {tokens} quant {quant}"
             if not op.called or _pt_wrong(outs, xs, res, w, quant, rank, ar):
+                failures.append(f"{name}: another path or wrong")
+
+        # MXFP8: the bytes of fused_allreduce_rmsnorm and then per_1x32_mx_quant_hip.
+        # One Gluon launch up to 128 rows (2880 and 7168 end in a partial chunk);
+        # 512 rows of 6144 are past its 4 MiB.
+        for tokens, hidden in (
+            (1, 2880),
+            (64, 7168),
+            (128, PT_HIDDEN),
+            (512, PT_HIDDEN),
+        ):
+            xs, res, w = _pt_inputs(tokens, hidden, 600 + tokens, device)
+            with patch.object(
+                plain,
+                "all_reduce_rmsnorm_mxfp8_quant",
+                wraps=plain.all_reduce_rmsnorm_mxfp8_quant,
+            ) as op:
+                outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                    xs[rank], res, w, EPS, quant_type="mxfp8", gemma_norm=True
+                )
+            y, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                xs[rank], res, w, EPS, gemma_norm=True
+            )
+            q, scale = per_1x32_mx_quant_hip(
+                y, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+            same = all(
+                torch.equal(o.view(torch.uint8), r.view(torch.uint8))
+                for o, r in zip(outs, (q, res_out, scale))
+            )
+            if op.called != (tokens <= 128) or not same:
+                name = f"rank {rank} mxfp8 tokens {tokens} hidden {hidden}"
                 failures.append(f"{name}: another path or wrong")
     finally:
         aiter.destroy_dist_env()

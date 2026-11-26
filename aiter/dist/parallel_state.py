@@ -247,27 +247,19 @@ def fused_allreduce_rmsnorm_mxfp8_quant_fake(
     prefill_support: bool = False,
     gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Declare native MXFP8 values and row-major group-32 E8M0 scales."""
     from aiter.utility.dtypes import fp8, fp8_e8m0
 
-    del w, eps, group_name, prefill_support, gemma_norm
+    scale_shape = inp.shape[:-1] + (inp.shape[-1] // 32,)
     return (
         torch.empty_like(inp, dtype=fp8),
         torch.empty_like(res_inp),
-        torch.empty(
-            inp.shape[:-1] + (inp.shape[-1] // 32,),
-            dtype=fp8_e8m0,
-            device=inp.device,
-        ),
+        torch.empty(scale_shape, dtype=fp8_e8m0, device=inp.device),
     )
 
 
-# mutates_args=[]: the op writes no argument, and Inductor does not decompose an
-# auto_functionalized_v2 that returns E8M0 ("auto_functionalized_v2 was not
-# removed" at the first compile of a graph that holds it).
-@torch_compile_guard(
-    gen_fake=fused_allreduce_rmsnorm_mxfp8_quant_fake, mutates_args=[]
-)
+# mutates_args=[]: Inductor does not remove an auto_functionalized_v2 that
+# returns E8M0 ("auto_functionalized_v2 was not removed").
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_mxfp8_quant_fake, mutates_args=[])
 def fused_allreduce_rmsnorm_mxfp8_quant_(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -282,12 +274,7 @@ def fused_allreduce_rmsnorm_mxfp8_quant_(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_mxfp8_quant_out_place(
-        inp,
-        res_inp,
-        w,
-        eps,
-        prefill_support,
-        gemma_norm=gemma_norm,
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
     )
 
 
@@ -981,17 +968,12 @@ class GroupCoordinator:
         hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
-        # "mxfp8"/"per_group"/"mxfp4") from the public API and helpers.
+        # "mxfp8"/"per_group"/"mxfp4") from the public API and its helpers.
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "mxfp8":
-            if group_size != 32:
-                raise ValueError("mxfp8 requires group_size=32")
-            if emit_bf16 or transpose_scale or hadamard_rotate:
-                raise ValueError(
-                    "mxfp8 does not support emit_bf16, transpose_scale, "
-                    "or hadamard_rotate"
-                )
+            if emit_bf16:
+                raise ValueError("emit_bf16 is not supported with mxfp8")
             return fused_allreduce_rmsnorm_mxfp8_quant_(
                 input_,
                 residual_inp_,
@@ -1203,7 +1185,7 @@ class GroupCoordinator:
         eps: float,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_mxfp8_quant(
