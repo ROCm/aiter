@@ -307,10 +307,11 @@ def _hipb_w4a16_mm(
     scale: torch.Tensor,
     result: torch.Tensor,
     workspace: torch.Tensor | None,
+    bias: torch.Tensor | None,
     group_size: int,
     has_zp: bool,
     int4_encoding: int,
-) -> None: ...
+) -> bool: ...
 
 
 @compile_ops("module_hipbsolgemm", fc_name="hipb_w4a16_workspace_size", develop=True)
@@ -321,6 +322,7 @@ def _hipb_w4a16_workspace_size(
     group_size: int,
     has_zp: bool,
     int4_encoding: int,
+    has_bias: bool,
 ) -> int: ...
 
 
@@ -329,6 +331,7 @@ def _hipb_w4a16_mm_out(
     w_q: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
+    bias: torch.Tensor | None,
     group_size: int,
     has_zp: bool,
     int4_encoding: int,
@@ -336,11 +339,18 @@ def _hipb_w4a16_mm_out(
     # Stream-K kernels keep partial sums in the workspace. Taking it from torch's
     # allocator per call ties it to the current stream, so launches on different
     # streams never share scratch memory.
-    nbytes = _hipb_w4a16_workspace_size(x, w_q, out, group_size, has_zp, int4_encoding)
+    nbytes = _hipb_w4a16_workspace_size(
+        x, w_q, out, group_size, has_zp, int4_encoding, bias is not None
+    )
     workspace = (
         torch.empty(nbytes, dtype=torch.uint8, device=x.device) if nbytes else None
     )
-    _hipb_w4a16_mm(x, w_q, scale, out, workspace, group_size, has_zp, int4_encoding)
+    # The bias goes to hipBLASLt's epilogue when it has a kernel with one.
+    fused = _hipb_w4a16_mm(
+        x, w_q, scale, out, workspace, bias, group_size, has_zp, int4_encoding
+    )
+    if bias is not None and not fused:
+        out.add_(bias)
 
 
 def _hipb_w4a16_mm_out_fake(
@@ -348,6 +358,7 @@ def _hipb_w4a16_mm_out_fake(
     w_q: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
+    bias: torch.Tensor | None,
     group_size: int,
     has_zp: bool,
     int4_encoding: int,
@@ -382,8 +393,9 @@ def hipb_w4a16_mm(
     ``x``, ``w_q`` and ``out`` may be padded (row stride above the row size).
     ``scale`` comes from ``hipb_w4a16_scale_buffer``, and ``has_zp`` says
     whether it carries zero-points. The dequantized weight is
-    ``(q - zero) * scale``. ``out``: the ``[M, N]`` tensor to write instead of
-    allocating; returned. Check ``hipb_w4a16_is_supported`` first. Call with
+    ``(q - zero) * scale``. ``bias``: an ``[N]`` tensor in ``x``'s dtype, added
+    by hipBLASLt's epilogue when it has a kernel with one. ``out``: the
+    ``[M, N]`` tensor to write instead of allocating; returned. Check ``hipb_w4a16_is_supported`` first. Call with
     ``x``'s device current: the launch stream is that device's current stream.
     """
     result = (
@@ -392,10 +404,8 @@ def hipb_w4a16_mm(
         else out
     )
     torch.ops.aiter.hipb_w4a16_mm_out(
-        x, w_q, scale, result, group_size, has_zp, int(int4_encoding)
+        x, w_q, scale, result, bias, group_size, has_zp, int(int4_encoding)
     )
-    if bias is not None:
-        result.add_(bias)
     return result
 
 

@@ -387,7 +387,9 @@ def _rms_norm_fwd_fake(
     return torch.empty_like(input)
 
 
-def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
+def _use_hip_common(
+    input: Tensor, use_model_sensitive_rmsnorm: int, out_itemsize: int = 2
+) -> bool:
     # main routed the bf16/fp16, hidden<=8192, non-T5, 2-D case to the hand-tuned HIP
     # module_rmsnorm_quant (add_rmsnorm_quant_kernel); opus handles the rest (fp32, T5,
     # hidden>8192, non-2-D) that the CK module_rmsnorm used to cover. Keeping the hot path
@@ -395,15 +397,21 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
     # The HIP kernel moves each row in 16-byte vectors and relies on the buffer bounds
     # check to drop the part of the last vector that lies past the row. On gfx1250 that
     # check drops the whole vector, so the last N % 8 elements are never read or written.
+    # Elsewhere the check works on 4-byte words and the kernel rounds the row bound up
+    # to a whole word, so a row that is not a whole number of words has its last word
+    # reach into the next row: element N is read and written with the 16-bit input when
+    # N is odd, and up to 3 bytes are written past the row of an 8-bit output when
+    # N % 4 != 0. Those widths stay off the HIP kernel too. ``out_itemsize`` is the
+    # element size of the kernel's output (2 without quant, 1 for fp8 / int8).
+    n = input.shape[-1]
     return (
         use_model_sensitive_rmsnorm == 0
         and input.dim() == 2
         and input.element_size() == 2
-        and input.shape[-1] <= 8192
-        and (
-            input.shape[-1] % 8 == 0
-            or get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
-        )
+        and n <= 8192
+        and n % 2 == 0
+        and n * out_itemsize % 4 == 0
+        and (n % 8 == 0 or get_gfx_runtime() not in ("gfx1250", "gfx1250-strict"))
     )
 
 
@@ -588,7 +596,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     # e8m0 scale must be routed to rmsnorm_quant regardless of group_size.
     is_e8m0 = yscale.element_size() == 1
     if group_size == 0 and not shuffle_scale and not is_e8m0:
-        if _use_hip_common(input, use_model_sensitive_rmsnorm):
+        if _use_hip_common(input, use_model_sensitive_rmsnorm, out.element_size()):
             rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast HIP
         else:
             rmsnorm2d_fwd_with_dynamicquant_opus(
@@ -619,7 +627,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     # e8m0 scale must be routed to add_rmsnorm_quant regardless of group_size.
     is_e8m0 = yscale.element_size() == 1
     if group_size == 0 and not shuffle_scale and not is_e8m0:
-        if _use_hip_common(input, use_model_sensitive_rmsnorm):
+        if _use_hip_common(input, use_model_sensitive_rmsnorm, out.element_size()):
             add_rmsnorm_quant(  # fast HIP
                 out, input, residual_in, residual_out, yscale, weight, epsilon
             )
@@ -736,3 +744,16 @@ def qkv_a_rmsnorm_fp4(
     bf16 tensors of the matching width. Row pointers and bf16 weights must be
     16-byte aligned, and row strides must fit int32. wave64 GPUs are rejected.
     """
+
+
+def qkv_a_rmsnorm_fp4_supported(q_dim: int, kv_dim: int) -> bool:
+    """Whether ``qkv_a_rmsnorm_fp4`` serves a q width of ``q_dim`` and a kv width
+    of ``kv_dim`` (0 for no kv) on this device: the widths its launch accepts
+    on the gfx1250 family, the wave32 arch it is built and checked for. Callers
+    use this instead of repeating the launch's checks."""
+    return (
+        get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+        and 1024 < q_dim <= 1536
+        and q_dim % 128 == 0
+        and (kv_dim == 0 or (0 < kv_dim <= 512 and kv_dim % 8 == 0))
+    )

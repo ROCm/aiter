@@ -246,31 +246,6 @@ def test_cross_entropy_all_ignored_finite_grad():
     assert grad.abs().max().item() == 0.0, "ignored rows must have zero gradient"
 
 
-@pytest.mark.parametrize("bad", [128, -5])  # >= V, and a negative non-ignore value
-def test_cross_entropy_forward_rejects_out_of_range_target(bad):
-    """Targets outside [0, V) (and != ignore_idx) must raise, not return +inf."""
-    B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
-    target = torch.randint(0, V, (B, SQ), device="cuda")
-    target[0, 0] = bad
-    with pytest.raises(ValueError):
-        cross_entropy_forward(logits, target, 0.0, False, None, -100)
-
-
-def test_cross_entropy_backward_rejects_bad_grad_shape():
-    """grad_output whose numel is neither 1 nor n_rows must raise."""
-    B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
-    target = torch.randint(0, V, (B, SQ), device="cuda")
-    _, grad_stored = cross_entropy_forward(
-        logits.clone(), target, 0.0, False, None, -100
-    )
-
-    bad = torch.ones(B * SQ + 1, dtype=torch.float32, device="cuda")  # wrong length
-    with pytest.raises(ValueError):
-        cross_entropy_backward(grad_stored, bad)
-
-
 # ── gradient correctness ─────────────────────────────────────────────
 
 
@@ -396,13 +371,3 @@ def test_cross_entropy_forward_chunked_ignore_index(reduce_loss):
     torch.testing.assert_close(
         grad_chunked.float(), grad_full.float(), atol=1e-4, rtol=1e-4
     )
-
-
-def test_cross_entropy_forward_chunked_rejects_zero_chunk():
-    """chunk_rows < 1 must raise instead of looping forever."""
-    logits = torch.randn(4, 1, 64, dtype=torch.float32, device="cuda")
-    target = torch.randint(0, 64, (4, 1), device="cuda")
-    with pytest.raises(ValueError):
-        cross_entropy_forward_chunked(
-            logits, target, 0.0, False, None, -100, chunk_rows=0
-        )

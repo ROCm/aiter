@@ -746,7 +746,7 @@ def unified_attention(
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         segm_tiles = None
-        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+        if use_gluon_3d and IS_DEVICE_ARCH_GFX12:
             NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
@@ -1448,6 +1448,12 @@ def _unified_attention_3d_gfx1250(
         else ""
     )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    if config.get("num_stages", 2) != 2:
+        raise ValueError(
+            f"_unified_attention_gluon_kernel_3d requires num_stages==2 "
+            f"(the pipeline is hard-wired for exactly one tile of prefetch); "
+            f"got num_stages={config['num_stages']} from the attn_3d config"
+        )
     for key in _GFX12_ROUTING_KEYS:
         config.pop(key, None)
     config["BLOCK_M"] = max(

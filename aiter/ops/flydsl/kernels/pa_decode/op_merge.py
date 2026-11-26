@@ -269,6 +269,9 @@ class Gfx1250ClusterMerge:
         self.share = -(-t.rows // t.cluster_merge)
         self.per_wave = -(-self.share // t.NWARP)
         self.quant = quant
+        # Partials a sequence can have: one a CTA, or one a wave (MXFP4
+        # ``wave_partials``: each wave of CTA p stores slot NWARP p + wave).
+        self.partitions = t.cluster_merge * (t.NWARP if t.wave_partials else 1)
 
     @flyc.jit
     def run(self, seq, part, first, count, capacity):
@@ -296,7 +299,7 @@ class Gfx1250ClusterMerge:
         t, share, per_wave = self.t, self.share, self.per_wave
         elems = t.head_dim // t.WAVE
         # Rows whose partition loads are in flight together (64 VGPRs).
-        group = max(1, 128 // (t.cluster_merge * elems))
+        group = max(1, 128 // (self.partitions * elems))
         lane = fx.Int32(gpu.thread_id("x")) % t.WAVE
         kv_query = fx.Int32(gpu.block_id("y"))
         kv_h = kv_query // t.query_splits
@@ -321,7 +324,7 @@ class Gfx1250ClusterMerge:
         # VGPR offset, so the loads share one SGPR base and issue back to back.
         parts = [
             fx.min(fx.Int32(p), count - 1) * (rows * t.head_dim) + lane_elem
-            for p in range_constexpr(t.cluster_merge)
+            for p in range_constexpr(self.partitions)
         ]
         # Contiguous scratch can start at an offset, and final output heads
         # can have odd strides. Both buffers guarantee only element alignment.
