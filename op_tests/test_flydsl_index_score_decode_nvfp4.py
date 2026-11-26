@@ -307,7 +307,17 @@ def select_scores(heads, rows, max_block, kind, seed):
 
 @benchmark()
 def test_index_select_decode(
-    batch, context, query_len, heads, topk, init_blocks, local_blocks, kind, emit, lens
+    batch,
+    context,
+    query_len,
+    heads,
+    topk,
+    init_blocks,
+    local_blocks,
+    kind,
+    emit,
+    waves,
+    lens,
 ):
     from aiter.ops.flydsl.index_score_decode import (
         index_select_decode,
@@ -347,7 +357,14 @@ def test_index_select_decode(
 
     def flydsl():
         index_select_decode(
-            score, seq_lens, ids, query_len, init_blocks, local_blocks, **kw
+            score,
+            seq_lens,
+            ids,
+            query_len,
+            init_blocks,
+            local_blocks,
+            waves=waves,
+            **kw,
         )
         return ids
 
@@ -521,14 +538,16 @@ def main():
         # emit off / page-128 / page-16.
         edges = [n * PAGE + 7 for n in (0, 1, 15, 16, 17, 31, 32, 33)]
         df = []
-        for batch, context in (
+        shapes = (
             (16, 88000),
             (16, 600000),
             (3, 1000),
             (5, 300),
             (8, 34 * PAGE),
             (2, 8192 * PAGE),
-        ):
+        )
+        # every one-wave cell first: a four-wave fault cannot hide them
+        for waves, (batch, context) in itertools.product((1, 4), shapes):
             lens = request_lens(batch, context, 1)
             if batch == 8:
                 lens = edges
@@ -540,7 +559,7 @@ def main():
             ):
                 df.append(
                     test_index_select_decode(
-                        batch, context, 8, 4, topk, init, local, kind, emit, lens
+                        batch, context, 8, 4, topk, init, local, kind, emit, waves, lens
                     )
                 )
         df = pd.DataFrame(df).drop(columns=["lens"], errors="ignore")

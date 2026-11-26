@@ -60,6 +60,10 @@ def index_score_decode_nvfp4_supported(idx_q, payload, scale, max_query_len) -> 
 
 # The flat scorer's ring a wave (LDS slots; blocks in flight + 1).
 FLAT_RING = 4
+# Waves a row's selection takes by default. Four cut a 4688-block row from
+# ~147 blocks a lane to ~37 for four barriers and a looser cut (~3x the
+# survivors); unmeasured, so one until the bench's Sk1 / Sk4 say otherwise.
+SELECT_WAVES = 1
 
 
 def flat_workgroups_per_cu(ring: int) -> int:
@@ -227,7 +231,8 @@ def index_select_decode_supported(score, topk: int) -> bool:
         and score.stride(2) == 1
         and 1 <= topk <= WAVE
         and 1 <= score.shape[2] < 0xFFFF
-        and lds_bytes(topk, cols) <= get_lds_capacity_bytes("gfx1250") // 2
+        and max(lds_bytes(topk, cols, w) for w in (1, 4))
+        <= get_lds_capacity_bytes("gfx1250") // 2
         and score.stride(1) % 4 == 0
         and score.stride(0) % 4 == 0
         and score.data_ptr() % 16 == 0
@@ -250,6 +255,7 @@ def index_select_decode(
     sparse_ctx: torch.Tensor | None = None,  # [rows * heads] int32
     pages_per_block: int = 1,
     block_page_stride: int = 1,
+    waves: int | None = None,
 ) -> None:
     """ATOM's decode block selection (``_topk_index_packed_kernel`` with
     ``DECODE_MAX_Q = max_query_len``, ``NUM_KV_HEADS = heads``) over ``score``:
@@ -261,7 +267,9 @@ def index_select_decode(
     also the attention's table row ``r * heads + h`` and its context length
     (``_emit_sparse_block_table_row``; the row is zero-filled to its
     ``topk * pages_per_block`` columns). Only the first
-    ``batch * max_query_len`` rows are written; graph-safe."""
+    ``batch * max_query_len`` rows are written; graph-safe. ``waves``: 1 or 4
+    a row (default :data:`SELECT_WAVES`);
+    the same result either way."""
     emit = sparse_bt is not None
     heads, rows_cap, max_block = score.shape
     batch = seq_lens.shape[0]
@@ -330,6 +338,7 @@ def index_select_decode(
         emit=emit,
         pages_per_block=pages_per_block if emit else 1,
         block_page_stride=block_page_stride if emit else 1,
+        waves=waves or SELECT_WAVES,
     )
     dev = score.device
     _run_compiled(
