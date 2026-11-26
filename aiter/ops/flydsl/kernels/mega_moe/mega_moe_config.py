@@ -433,13 +433,11 @@ class MegaMoEBundlePlan:
     small_m_mtprs: tuple[int, ...] = ()
     large_m: bool = False
 
-    def route_for(
-        self, max_tokens: int, *, small_m: bool = True, large_m: bool = True
-    ) -> tuple[str, int]:
+    def route_for(self, max_tokens: int, *, small_m: bool = True) -> tuple[str, int]:
         """(route, capacity) of a call whose largest EP rank has ``max_tokens`` rows.
 
         Every rank passes the same ``max_tokens``, so every rank takes the same
-        route. ``small_m`` / ``large_m`` exclude a route the caller cannot use.
+        route. ``small_m=False`` excludes the small-input route.
         """
         if not 0 <= max_tokens <= self.mtpr:
             raise ValueError(f"max_tokens={max_tokens} must be in [0, {self.mtpr}]")
@@ -447,7 +445,7 @@ class MegaMoEBundlePlan:
             for capacity in self.small_m_mtprs:
                 if max_tokens <= capacity:
                     return ROUTE_SMALL_M, capacity
-        if large_m and self.large_m:
+        if self.large_m:
             return ROUTE_LARGE_M, self.mtpr
         return ROUTE_STAGED, self.mtpr
 

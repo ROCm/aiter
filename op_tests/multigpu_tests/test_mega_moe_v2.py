@@ -475,11 +475,8 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     if args.compare_main:
         if not args.expect_large_m:
             raise ValueError("--compare-main requires --expect-large-m")
-        moe.set_large_m_enabled(False)
-        try:
-            main_output = _fwd(moe, x, weights, ids)[:tokens].clone()
-        finally:
-            moe.set_large_m_enabled(True)
+        # Without max_tokens the call takes main's staged route.
+        main_output = moe.forward(x, weights, ids)[:tokens].clone()
         _barrier()
     output = _fwd(moe, x, weights, ids)[:tokens]
     if args.expect_large_m:
@@ -920,11 +917,7 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
             if slot not in checked_slots:
                 continue
             output = output.clone()
-            moe.set_large_m_enabled(False)
-            try:
-                reference = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
-            finally:
-                moe.set_large_m_enabled(True)
+            reference = moe.forward(x, route_weights, route_ids)[:tokens].clone()
             finite = torch.isfinite(output).all().to(torch.int64)
             dist.all_reduce(finite, op=dist.ReduceOp.MIN)
             if exact:
@@ -1053,11 +1046,7 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
         dist.all_reduce(hazard)
         if not int(hazard.item()):
             raise AssertionError("skewed route did not exceed four payload producers")
-        moe.set_large_m_enabled(False)
-        try:
-            main_output = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
-        finally:
-            moe.set_large_m_enabled(True)
+        main_output = moe.forward(x, route_weights, route_ids)[:tokens].clone()
         _barrier()
         output = _fwd(moe, x, route_weights, route_ids)[:tokens].float()
         diff = output - main_output.float()
@@ -1749,7 +1738,7 @@ def _run_sizes(args, rank, world, device):
                 stage2_p2p_quant=args.stage2_p2p_quant,
                 large_m_state_slots=args.large_m_state_slots,
                 # Pin the plan: the staged route unless --expect-large-m.
-                large_m_enabled=args.expect_large_m,
+                routed=args.expect_large_m,
                 small_m_mtprs=(),
                 **network,
             )

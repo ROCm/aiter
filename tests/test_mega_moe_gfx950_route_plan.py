@@ -155,11 +155,9 @@ def test_route_exclusions():
     # A call the small-input route cannot take goes to the large-input route, whatever its rows.
     assert plan.route_for(100, small_m=False) == (ROUTE_LARGE_M, 8192)
     assert plan.route_for(0, small_m=False) == (ROUTE_LARGE_M, 8192)
-    assert plan.route_for(300, small_m=False, large_m=False) == (ROUTE_STAGED, 8192)
     assert _plan(8192, small=(256,)).route_for(300) == (ROUTE_LARGE_M, 8192)
     assert _plan(8192, small=()).route_for(1) == (ROUTE_LARGE_M, 8192)
     assert plan.route_for(4096) == (ROUTE_LARGE_M, 8192)
-    assert plan.route_for(4096, large_m=False) == (ROUTE_STAGED, 8192)
     # MegaMoEV2 itself takes the staged route when a call passes no max_tokens.
     assert plan.route_for(plan.mtpr) == (ROUTE_LARGE_M, 8192)
     staged_only = _plan(8192, small=(), large=False)
@@ -233,7 +231,6 @@ def test_ep4_route_for_every_max_tokens(mtpr):
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
         else:
             assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
-        assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
@@ -401,27 +398,23 @@ def test_no_hint_takes_staged(mtpr):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
     moe = object.__new__(MegaMoEV2)  # _route needs only the plan and the capacity
-    moe.mtpr, moe._bundle_plan, moe._large_m_choice = mtpr, _plan(mtpr), None
+    moe.mtpr, moe._bundle_plan = mtpr, _plan(mtpr)
     for rows in sorted({0, 1, min(128, mtpr), mtpr}):
         assert moe._route(rows, None) == (ROUTE_STAGED, mtpr)
         assert moe._route(rows, None, small_m=False) == (ROUTE_STAGED, mtpr)
 
 
-def test_set_large_m_enabled_keeps_mains_interface():
-    """Callers of main's interface (SGLang) switch the large-input route per call."""
+def test_max_tokens_is_the_route_switch():
+    """A call of a routed instance without max_tokens keeps main's staged route; with it, the fused route of route_for."""
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
     moe = object.__new__(MegaMoEV2)
-    moe.mtpr, moe._bundle_plan, moe._large_m_choice = 8192, _plan(8192), None
-    moe._large_m = object()
+    moe.mtpr, moe._bundle_plan = 8192, _plan(8192)
     assert moe._route(7, None) == (ROUTE_STAGED, 8192)
-    moe.set_large_m_enabled(True)
-    assert moe._route(7, None) == (ROUTE_LARGE_M, 8192)
-    assert moe._route(7, None, small_m=False) == (ROUTE_LARGE_M, 8192)
+    assert moe._route(7, None, small_m=False) == (ROUTE_STAGED, 8192)
     assert moe._route(7, 300) == (ROUTE_SMALL_M, 512)
-    moe.set_large_m_enabled(False)
-    assert moe._route(7, None) == (ROUTE_STAGED, 8192)
-    assert moe._route(4096, 4096) == (ROUTE_STAGED, 8192)
+    assert moe._route(7, 300, small_m=False) == (ROUTE_LARGE_M, 8192)
+    assert moe._route(4096, 4096) == (ROUTE_LARGE_M, 8192)
 
 
 def test_ep8_fused_configs_keep_fused_knobs_off():
