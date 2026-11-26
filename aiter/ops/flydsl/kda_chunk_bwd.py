@@ -27,6 +27,7 @@ contract; ``CHUNK_BWD_FUSES`` names the prologues it handles in kernel.
 
 from __future__ import annotations
 
+import csv
 import os
 
 import torch
@@ -84,8 +85,59 @@ def register_fwd_prepare(name: str, fn) -> None:
     _PREPARE_IMPLS[name] = fn
 
 
-def _fwd_prepare_fn(prepare):
-    name = prepare or os.environ.get("AITER_KDA_BWD_PREPARE", "triton")
+# Tuned configs (AITER_CONFIG_KDA_CHUNK_BWD): key (gfx, cu_num, N, T, H, varlen),
+# N sequences of T tokens (varlen: T = total tokens // N).
+DEFAULT_DHU_BV = 32
+_TUNED = None
+
+
+def _tuned_table():
+    global _TUNED
+    if _TUNED is None:
+        table = {}
+        try:
+            from aiter.jit.core import AITER_CONFIGS
+
+            with open(
+                AITER_CONFIGS.AITER_CONFIG_KDA_CHUNK_BWD_FILE, encoding="utf-8"
+            ) as f:
+                for row in csv.DictReader(f):
+                    key = (
+                        row["gfx"].strip(),
+                        int(row["cu_num"]),
+                        int(row["N"]),
+                        int(row["T"]),
+                        int(row["H"]),
+                        int(row["varlen"]),
+                    )
+                    table[key] = {
+                        "dhu_bv": int(row["dhu_bv"]),
+                        "fwd_h_bv": int(row["fwd_h_bv"] or 0) or None,
+                        "prepare": (row.get("prepare") or "").strip() or "triton",
+                    }
+        except (OSError, KeyError, ValueError, ImportError) as exc:
+            import logging
+
+            logging.getLogger("aiter").warning(
+                "KDA chunk bwd tuned configs unavailable (%s); using defaults", exc
+            )
+        _TUNED = table
+    return _TUNED
+
+
+def tuned_config(N: int, T: int, H: int, varlen: bool) -> dict:
+    """The tuned row for this shape on this GPU, or ``{}`` (defaults apply)."""
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+    key = (get_gfx_runtime(), get_cu_num(), N, T, H, int(varlen))
+    return _tuned_table().get(key, {})
+
+
+def _fwd_prepare_fn(prepare, tuned=None):
+    name = prepare or os.environ.get("AITER_KDA_BWD_PREPARE")
+    if not name:
+        # A tuned prepare applies only if its backend is registered here.
+        name = tuned if tuned in _PREPARE_IMPLS else "triton"
     if name == "triton":
         from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
             chunk_delta_attn_fwd_prepare,
@@ -185,7 +237,7 @@ class _Varlen:
 
 
 def kda_bwd_fwd_h_flydsl(
-    kg, w, u, g_cumsum, initial_state, state_v_first, cu_seqlens=None
+    kg, w, u, g_cumsum, initial_state, state_v_first, cu_seqlens=None, bv=None
 ):
     """Per-chunk states and ``v_new = u - w @ h`` on the K5 kernel.
 
@@ -220,7 +272,7 @@ def kda_bwd_fwd_h_flydsl(
         if not state_v_first:
             h0 = h0.transpose(-1, -2)
         h0 = h0.contiguous()
-    BV = _hipeq_select_bv(kg.device, H, total_chunks, max_seq_chunks)
+    BV = bv or _hipeq_select_bv(kg.device, H, total_chunks, max_seq_chunks)
     launch_fn = _get_or_compile_opt(
         K,
         V,
@@ -289,6 +341,8 @@ def chunk_kda_bwd_flydsl_full(
     use_beta_sigmoid_in_kernel=False,
     state_v_first=False,
     prepare=None,
+    dhu_bv=None,
+    fwd_h_bv=None,
 ):
     """FlyDSL ``chunk_delta_attn_bwd``: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``.
 
@@ -299,9 +353,10 @@ def chunk_kda_bwd_flydsl_full(
     ``cu_seqlens[-1]`` get zero gradients, as in the Triton backward.
     ``prepare`` names the forward-recompute backend (see
     ``register_fwd_prepare``); None reads ``AITER_KDA_BWD_PREPARE``, default
-    ``"triton"``.
+    ``"triton"``. ``dhu_bv`` / ``fwd_h_bv`` override the V-block widths of
+    ``dhu`` and the K5 recurrence. Unset tunables come from the tuned configs
+    (``AITER_CONFIG_KDA_CHUNK_BWD``, see ``tuned_config``), then defaults.
     """
-    chunk_delta_attn_fwd_prepare = _fwd_prepare_fn(prepare)
 
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -320,6 +375,10 @@ def chunk_kda_bwd_flydsl_full(
         NT, N = (T + BT - 1) // BT, B
         cu = ci = co = int32_dummy
     NBH = B * H
+    cfg = tuned_config(N, T // N if varlen else T, H, varlen)
+    dhu_bv = dhu_bv or cfg.get("dhu_bv") or DEFAULT_DHU_BV
+    fwd_h_bv = fwd_h_bv or cfg.get("fwd_h_bv")
+    chunk_delta_attn_fwd_prepare = _fwd_prepare_fn(prepare, cfg.get("prepare"))
     # Varlen tokens past cu_seqlens[-1] are never written: zero those outputs.
     alloc = torch.zeros if varlen else torch.empty
 
@@ -346,7 +405,7 @@ def chunk_kda_bwd_flydsl_full(
     timer.mark("fwd_prepare")
     _check("fwd_prepare (Triton)", q=qn, k=kn, g=gc, w=w, u=u, qg=qg, kg=kg, Akk=Akk)
     h, v_new = kda_bwd_fwd_h_flydsl(
-        kg, w, u, gc, initial_state, state_v_first, cu_seqlens
+        kg, w, u, gc, initial_state, state_v_first, cu_seqlens, bv=fwd_h_bv
     )
     _check("fwd_h", h=h, v_new=v_new)
     timer.mark("fwd_h")
@@ -380,14 +439,27 @@ def chunk_kda_bwd_flydsl_full(
     )
     dv2 = alloc(dv.shape, device=dev, dtype=dv.dtype)
     _run_compiled(
-        (compile_dhu_mfma if _MFMA else compile_dhu)(
-            H,
-            kg.dtype,
-            v.dtype,
-            initial_state is not None,
-            dht is not None,
-            state_v_first,
-            varlen,
+        (
+            compile_dhu_mfma(
+                H,
+                kg.dtype,
+                v.dtype,
+                initial_state is not None,
+                dht is not None,
+                state_v_first,
+                varlen,
+                dhu_bv,
+            )
+            if _MFMA
+            else compile_dhu(
+                H,
+                kg.dtype,
+                v.dtype,
+                initial_state is not None,
+                dht is not None,
+                state_v_first,
+                varlen,
+            )
         ),
         qg,
         kg,

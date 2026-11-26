@@ -99,6 +99,7 @@ FAMILIES = [
     ("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+    ("AITER_CONFIG_KDA_CHUNK_BWD", "kda_chunk_bwd_tuned"),
     ("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned"),
 ]
 
@@ -557,6 +558,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
+
+    def test_kda_chunk_bwd(self):
+        self._check_family("AITER_CONFIG_KDA_CHUNK_BWD", "kda_chunk_bwd_tuned")
 
     def test_paged_mqa_logits(self):
         self._check_family("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned")

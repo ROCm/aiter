@@ -262,6 +262,14 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+# FlyDSL KDA chunk-backward tunables (dhu V block, K5 recurrence V block,
+# forward-prepare backend). Per-model rows live under model_configs/
+# (kda_chunk_bwd_tuned_kimi_k3*.csv); the canonical file ships header-only.
+AITER_CONFIG_KDA_CHUNK_BWD = os.getenv(
+    "AITER_CONFIG_KDA_CHUNK_BWD",
+    f"{AITER_ROOT_DIR}/aiter/configs/kda_chunk_bwd_tuned.csv",
+)
+
 AITER_CONFIG_IQ2R_GLM53 = os.getenv(
     "AITER_CONFIG_IQ2R_GLM53",
     f"{AITER_ROOT_DIR}/aiter/configs/iq2r_glm53_tuned.csv",
@@ -496,6 +504,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_KDA_CHUNK_BWD_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_KDA_CHUNK_BWD",
+            AITER_CONFIG_KDA_CHUNK_BWD,
+            "kda_chunk_bwd_tuned",
         )
 
     @property

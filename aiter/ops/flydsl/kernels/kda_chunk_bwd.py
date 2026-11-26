@@ -1260,7 +1260,7 @@ def _stage(
         tensor, base = view
         vec = 8 if num is fx.BFloat16 else 4
         cv = cols // vec
-        assert (rows * cv) % NUM_THREADS == 0
+        n_vec = rows * cv
         it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
         if base is not None:
             it = fx.add_offset(it, base)
@@ -1268,11 +1268,14 @@ def _stage(
             fx.make_view(it, fx.make_layout((rows, cv, vec), (ld_stride, vec, 1)))
         )
         atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
-        for e in range_constexpr(rows * cv // NUM_THREADS):
+        for e in range_constexpr((n_vec + NUM_THREADS - 1) // NUM_THREADS):
             i = tid + e * NUM_THREADS
             t = i // cv
             c0 = (i % cv) * vec
-            ok = t < nvalid
+            # A tail iteration past n_vec redirects to a padded row: t >= rows
+            # also fails ok, and its LDS stores are skipped below.
+            in_tile = i < n_vec
+            ok = (t < nvalid) & in_tile
             vals = _load_vec(
                 atom, fx.slice(v3, (_sel(ok, t, 0), i % cv, None)), vec, num
             )
@@ -1280,7 +1283,13 @@ def _stage(
                 x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
                 x = _sel(ok, x, _zero())
                 c = c0 + p
-                lds_st(dst, c * ld_dst + t if transpose else t * ld_dst + c, x, dst_num)
+                idx = c * ld_dst + t if transpose else t * ld_dst + c
+                if const_expr(n_vec % NUM_THREADS == 0):
+                    lds_st(dst, idx, x, dst_num)
+                else:
+                    # Only a ragged last iteration needs the runtime guard.
+                    if in_tile:
+                        lds_st(dst, idx, x, dst_num)
         return
     for e in range_constexpr(rows * cols // NUM_THREADS):
         i = tid + e * NUM_THREADS
@@ -1837,6 +1846,7 @@ def compile_dhu_mfma(
     use_final_state_gradient: bool,
     transpose_state: bool,
     varlen: bool = False,
+    bv: int = BV,
 ):
     """``compile_dhu`` with the per-chunk contractions on 16x16x16 bf16 MFMA.
 
@@ -1844,23 +1854,26 @@ def compile_dhu_mfma(
     bf16, as Triton's ``b_dh.to(b_k.dtype)``), then the state update
     ``dh * exp2(g_last) + scale * qg^T do - w^T dv2`` as two 64-row halves of K,
     each from two products so ``scale`` applies after the dot as in Triton.
-    The state itself stays fp32 in registers.
+    The state itself stays fp32 in registers. ``bv`` (16, 32 or 64) is the
+    V-block width per workgroup, a tunable (``AITER_CONFIG_KDA_CHUNK_BWD``).
     """
+    assert bv in (16, 32, 64), bv
+    ldb = bv + 4
     KN = _num(k_dtype)
     VN = _num(v_dtype)
     BF = fx.BFloat16
-    NE = BV * K // NUM_THREADS  # 16 state cells per thread
+    NE = bv * K // NUM_THREADS  # 16 state cells per thread
 
     @fx.struct
     class Smem:
         kg: fx.Array[fx.BFloat16, BT * LDK, 16]  # kg[t][k]
         qgT: fx.Array[fx.BFloat16, K * LDT, 16]  # qg^T[k][t]
         wT: fx.Array[fx.BFloat16, K * LDT, 16]  # w^T[k][t]
-        doT: fx.Array[fx.BFloat16, BV * LDT, 16]  # do^T[c][t]
-        dv2T: fx.Array[fx.BFloat16, BV * LDT, 16]  # dv2^T[c][t]
-        dhT: fx.Array[fx.BFloat16, BV * LDK, 16]  # dh^T[c][k]
-        c_q: fx.Array[fx.Float32, BT * LDB, 16]
-        c_w: fx.Array[fx.Float32, BT * LDB, 16]
+        doT: fx.Array[fx.BFloat16, bv * LDT, 16]  # do^T[c][t]
+        dv2T: fx.Array[fx.BFloat16, bv * LDT, 16]  # dv2^T[c][t]
+        dhT: fx.Array[fx.BFloat16, bv * LDK, 16]  # dh^T[c][k]
+        c_q: fx.Array[fx.Float32, BT * ldb, 16]
+        c_w: fx.Array[fx.Float32, BT * ldb, 16]
         gl: fx.Array[fx.Float32, K, 16]
 
     @flyc.kernel(name="kda_bwd_dhu_mfma_flydsl")
@@ -1900,20 +1913,20 @@ def compile_dhu_mfma(
             boh = b * ((T + (BT - 1)) // BT)
             row0 = b * T
         NT = (T_loc + (BT - 1)) // BT
-        v0 = i_v * BV
+        v0 = i_v * bv
 
         lds = fx.SharedAllocator().allocate(Smem)
         s_kg = _lds(lds.kg.peek(), BT * LDK)
         s_qgT = _lds(lds.qgT.peek(), K * LDT)
         s_wT = _lds(lds.wT.peek(), K * LDT)
-        s_doT = _lds(lds.doT.peek(), BV * LDT)
-        s_dv2T = _lds(lds.dv2T.peek(), BV * LDT)
-        s_dhT = _lds(lds.dhT.peek(), BV * LDK)
-        s_cq = _lds(lds.c_q.peek(), BT * LDB)
-        s_cw = _lds(lds.c_w.peek(), BT * LDB)
+        s_doT = _lds(lds.doT.peek(), bv * LDT)
+        s_dv2T = _lds(lds.dv2T.peek(), bv * LDT)
+        s_dhT = _lds(lds.dhT.peek(), bv * LDK)
+        s_cq = _lds(lds.c_q.peek(), BT * ldb)
+        s_cw = _lds(lds.c_w.peek(), BT * ldb)
         s_gl = _lds(lds.gl.peek(), K)
-        cq_tile = fx.make_view(fx.get_iter(s_cq), fx.make_layout((BT, BV), (LDB, 1)))
-        cw_tile = fx.make_view(fx.get_iter(s_cw), fx.make_layout((BT, BV), (LDB, 1)))
+        cq_tile = fx.make_view(fx.get_iter(s_cq), fx.make_layout((BT, bv), (ldb, 1)))
+        cw_tile = fx.make_view(fx.get_iter(s_cw), fx.make_layout((BT, bv), (ldb, 1)))
         mma = _Mma(tid)
 
         state_v = _flat(dht, fx.Int64(i_bh) * (K * V))
@@ -1969,7 +1982,7 @@ def compile_dhu_mfma(
                 transpose=True,
             )
             dov = _src(do, hv + fx.Int64(v0))
-            _stage(dov, H * V, s_doT, LDT, BT, BV, nvalid, tid, VN, BF, transpose=True)
+            _stage(dov, H * V, s_doT, LDT, BT, bv, nvalid, tid, VN, BF, transpose=True)
             if tid < K:
                 gl = ldg(_flat(g, hk), (nvalid - 1) * (H * K) + tid, fx.Float32)
                 lds_st(s_gl, tid, gl)
@@ -1977,15 +1990,15 @@ def compile_dhu_mfma(
 
             # dv2 = dv + kg @ dh
             acc = mma.acc(cq_tile)
-            mma.gemm(acc, s_kg, LDK, s_dhT, LDK, BV, K)
+            mma.gemm(acc, s_kg, LDK, s_dhT, LDK, bv, K)
             mma.store(acc, cq_tile)
             gpu.barrier()
             dvv = _flat(dv, hv + fx.Int64(v0))
             dv2_v = _flat(dv2, hv + fx.Int64(v0))
             rc = _sel(r < nvalid, r, 0)
-            for e in range_constexpr(8):
+            for e in range_constexpr(bv // 4):
                 c = seg + 4 * e
-                val = lds_ld(s_cq, r * LDB + c) + _sel(
+                val = lds_ld(s_cq, r * ldb + c) + _sel(
                     r < nvalid, ldg(dvv, rc * (H * V) + c, VN), _zero()
                 )
                 val = _sel(r < nvalid, val, _zero())
@@ -2005,7 +2018,7 @@ def compile_dhu_mfma(
                     LDT,
                     s_doT,
                     LDT,
-                    BV,
+                    bv,
                     BT,
                 )
                 acc_w = mma.acc(cw_tile)
@@ -2015,7 +2028,7 @@ def compile_dhu_mfma(
                     LDT,
                     s_dv2T,
                     LDT,
-                    BV,
+                    bv,
                     BT,
                 )
                 mma.store(acc_q, cq_tile)
@@ -2026,8 +2039,8 @@ def compile_dhu_mfma(
                 klc = _sel(mine, kl, 0)
                 for e in range_constexpr(NE):
                     c = sc + 2 * e
-                    u = lds_ld(s_cq, klc * LDB + c) * scale - lds_ld(
-                        s_cw, klc * LDB + c
+                    u = lds_ld(s_cq, klc * ldb + c) * scale - lds_ld(
+                        s_cw, klc * ldb + c
                     )
                     upd[e] = _sel(mine, u, upd[e])
                 gpu.barrier()
@@ -2057,7 +2070,7 @@ def compile_dhu_mfma(
         stream: fx.Stream,
     ):
         kernel(qg, kg, w, g, do, dv, dht, dh, dh0, dv2, cu, co, T, scale).launch(
-            grid=(V // BV, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+            grid=(V // bv, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
         )
 
     return launch
