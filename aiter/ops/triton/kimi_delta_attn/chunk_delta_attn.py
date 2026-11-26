@@ -94,7 +94,7 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, dht):
-        (q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, *inter) = (
+        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, *inter = (
             ctx.saved_tensors
         )
         fwd_intermediates = None
