@@ -471,12 +471,17 @@ def chunk_kda_bwd_flydsl(
     dt_bias=None,
     use_beta_sigmoid_in_kernel=False,
     cu_seqlens=None,
+    lower_bound=None,
+    safe_gate=None,
 ):
     """#8739 ``register_chunk_bwd`` contract: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias)``.
 
     q, k, g ``[B, T, H, K]``, v and do ``[B, T, H, V]``, beta ``[B, T, H]``,
     no initial or final state; ``cu_seqlens`` (optional, ``B = 1``) packs
-    variable-length sequences. q/k/v/do are computed in bf16; each gradient
+    variable-length sequences. With ``use_gate_in_kernel``, ``lower_bound``
+    selects K3's safe gate ``g = lower_bound * sigmoid(exp(A_log) * (g +
+    dt_bias))`` (``[-5, 0)``) instead of ``-exp(A_log) * softplus(g +
+    dt_bias)``; ``safe_gate`` defaults to ``lower_bound is not None``. q/k/v/do are computed in bf16; each gradient
     comes back in its input's dtype. Falls back to the Triton backward when
     the call is outside ``kda_bwd_flydsl_supported``.
     """
@@ -492,6 +497,8 @@ def chunk_kda_bwd_flydsl(
         "A_log": A_log,
         "dt_bias": dt_bias,
         "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
+        "lower_bound": lower_bound,
+        "safe_gate": lower_bound is not None if safe_gate is None else safe_gate,
     }
     if kda_bwd_flydsl_supported(
         H=H,

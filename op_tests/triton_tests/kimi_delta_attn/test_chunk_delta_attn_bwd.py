@@ -286,7 +286,7 @@ def test_backward_flydsl_lumen_shapes(B, T, H, varlen):
 
 
 @pytest.mark.parametrize("l2norm", [False, True])
-@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("gate", [False, "softplus", "safe"])
 @pytest.mark.parametrize("sigmoid", [False, True])
 def test_chunk_bwd_contract_flydsl(l2norm, gate, sigmoid):
     """The #8739 7-tuple adapter matches the Triton backward for every prologue fusion."""
@@ -306,11 +306,14 @@ def test_chunk_bwd_contract_flydsl(l2norm, gate, sigmoid):
     do = torch.randn(x["v"].shape, device="cuda", generator=gen).to(torch.bfloat16)
     kw = {
         "use_qk_l2norm_in_kernel": l2norm,
-        "use_gate_in_kernel": gate,
+        "use_gate_in_kernel": bool(gate),
         "A_log": x.get("A_log"),
         "dt_bias": x.get("dt_bias"),
         "use_beta_sigmoid_in_kernel": sigmoid,
     }
+    if gate == "safe":
+        # K3's safe gate: g = -5 * sigmoid(exp(A_log) * (g + dt_bias)).
+        kw.update(lower_bound=-5.0, safe_gate=True)
     args = (x["q"], x["k"], x["v"], x["g"], x["beta"], 128**-0.5)
     got = chunk_kda_bwd_flydsl(do, *args, 64, **kw)
     ref = chunk_delta_attn_bwd(do, None, *args, chunk_size=64, **kw)[:7]
