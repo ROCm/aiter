@@ -132,11 +132,40 @@ def run_case(
     return ids_ok and out_ok
 
 
+def check_overlap_rejected():
+    """topk_idx is written when index_score is given: an expanded / overlapping layout is refused,
+    while the same broadcast view stays valid for the read-only call (no index_score).
+    """
+    seq_lens, ql, width = [1000, 700], 1, 64
+    c = make_case(seq_lens, [ql] * 2, 1, 16, seed=3)
+    rows = c["q"].shape[0]
+    scores = torch.randn(1, rows, width, device="cuda")
+    call = lambda topk, **kw: sparse_pa_nvfp4_decode(
+        c["q"], c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None,
+        c["k_scale"], c["v_scale"], query_len=ql, splits=1, **kw,
+    )  # fmt: skip
+    ids = torch.zeros(1, 1, TOPK, dtype=torch.int32, device="cuda")
+    select_kw = {"index_score": scores, "index_max_seq_len": max(seq_lens)}
+    ok = True
+    for name, topk in (
+        ("rows expanded", ids.expand(1, rows, TOPK)),
+        ("heads expanded", torch.zeros(1, rows, TOPK, dtype=torch.int32, device="cuda").expand(2, rows, TOPK)),
+    ):  # fmt: skip
+        try:
+            call(topk, **select_kw)
+            refused = False
+        except ValueError:
+            refused = True
+        print(f"{'PASS' if refused else 'FAIL'}  overlap refused: {name}")
+        ok &= refused
+    return ok
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         print("SKIP: gfx950 only")
         return 0
-    ok = True
+    ok = check_overlap_rejected()
     # (name, seq_lens, query_len, width)
     shapes = [
         ("short_ctx", [1, 100, 1500, 2047, 2048, 2049], 1, 64),

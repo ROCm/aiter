@@ -1036,6 +1036,20 @@ def sparse_pa_nvfp4_decode(
             "index_score must cover every live block and keep its offsets below 2**31",
         )
         require(init_blocks >= 0 and local_blocks >= 0, "pins must be >= 0")
+        # topk_idx is written here: an expanded (stride 0) or otherwise overlapping layout would make
+        # distinct rows / heads store into the same 16 ids (without index_score it is only read, and a
+        # broadcast view is fine)
+        n_rows = topk_idx.shape[1]
+        require(
+            topk_idx.stride(2) == 1
+            and (n_rows <= 1 or topk_idx.stride(1) >= topk)
+            and (
+                hkv <= 1
+                or topk_idx.stride(0) >= (n_rows - 1) * topk_idx.stride(1) + topk
+            ),
+            "with index_score, topk_idx is written and must not overlap: "
+            "unit last stride, row stride >= 16, head stride past a head's rows",
+        )
     else:
         require(
             index_max_seq_len is None and not init_blocks and not local_blocks,

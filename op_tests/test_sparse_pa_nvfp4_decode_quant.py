@@ -40,7 +40,10 @@ def run_case(name, seq_lens, ql, splits, select, scale_up=1.0, hkv=1):
     group = 16
     c = make_case(seq_lens, [ql] * len(seq_lens), hkv, group, seed=len(name) + splits)
     rows = c["q"].shape[0]
-    q = (c["q"].float() * scale_up).bfloat16() if scale_up != 1.0 else c["q"]
+    q = c["q"]
+    # scale_up multiplies the attention output (through the post-cache v_scale), so the quantizer sees
+    # tiny / large magnitudes; scaling q would change the softmax instead
+    v_scale = c["v_scale"] * scale_up
     h = q.shape[1]
     kw = {"query_len": ql, "splits": splits}
     topk = c["topk"]
@@ -66,13 +69,13 @@ def run_case(name, seq_lens, ql, splits, select, scale_up=1.0, hkv=1):
         SM_SCALE,
         out,
         c["k_scale"],
-        c["v_scale"],
+        v_scale,
         **kw,
     )
     codes = torch.full((rows, h * 128), 0x55, dtype=torch.uint8, device=q.device)
     scales = torch.full((rows, h * 4), 0xAA, dtype=torch.uint8, device=q.device)
     r = sparse_pa_nvfp4_decode(
-        q, c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None, c["k_scale"], c["v_scale"],
+        q, c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None, c["k_scale"], v_scale,
         quant_out=(codes, scales), **kw,
     )  # fmt: skip
     torch.cuda.synchronize()
