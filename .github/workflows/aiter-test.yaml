@@ -1307,6 +1307,7 @@ jobs:
         run: |
           set -euo pipefail
           if docker exec \
+            -e AITER_GPU_VISIBILITY_CHECK_XGMI=1 \
             -w /workspace \
             aiter_test \
             bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then

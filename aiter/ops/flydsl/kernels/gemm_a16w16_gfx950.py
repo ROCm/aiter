@@ -12,6 +12,8 @@ from flydsl._mlir import ir
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
@@ -27,10 +29,11 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
-from .kernels_common import run_cached, set_slp_vectorize_once_used
+from .kernels_common import set_slp_vectorize_once_used
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    _run_compiled,
 )
 
 GEMM_A16W16_DTYPE_FP32 = 1
@@ -1472,6 +1475,16 @@ gemm_a16w16_gfx950.compile_hints = {
     },
 }
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
+# One launcher for every config: each launch passes its config, the sorted
+# items its constexpr param is made from, and its device as the
+# specialization key. The device keeps the JIT path's handles apart (a handle
+# launches only on the device it was compiled on); entries on disk are shared.
+bind_aot(
+    gemm_a16w16_gfx950,
+    FlyDSLAotCache("gemm_a16w16_gfx950"),
+    (),
+)
+_PARAM_ITEMS = {}
 
 
 @functools.cache
@@ -1479,7 +1492,10 @@ def _gemm_a16w16_gfx950_param_for(items):
     # Building the param struct coerces every field through FlyDSL's typing
     # layer, which costs more host time than the launch itself; it depends
     # only on the config, so one struct per config serves every M.
-    return make_gemm_a16w16_gfx950_param(**dict(items))
+    param = make_gemm_a16w16_gfx950_param(**dict(items))
+    # Kept alive by this cache, so its id stays its own.
+    _PARAM_ITEMS[id(param)] = items
+    return param
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
@@ -1583,9 +1599,14 @@ def get_split_k_buffers(stream, device, split_k):
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
-        leading_dim=leading_dim
-    )
+    tensor = tensor.detach()
+    arg = flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
+    # The launch-argument fills of an object loaded by flyc.load_module read
+    # the address, shape and strides from this attribute when it is there, as
+    # for FlyDSL's TorchTensorJitArg. Without it each fill makes a DLPack view
+    # of the tensor again, about 6 us per tensor (MI308X, FlyDSL 0.5.3).
+    arg.torch_tensor = tensor
+    return arg
 
 
 def gemm_a16w16(
@@ -1731,7 +1752,8 @@ def gemm_a16w16(
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
-    dispatch_args = (
+    _run_compiled(
+        gemm_a16w16_gfx950,
         out_arg,
         a_arg,
         b_arg,
@@ -1741,12 +1763,6 @@ def gemm_a16w16(
         split_k,
         param,
         stream,
-    )
-    run_cached(
-        gemm_a16w16_gfx950,
-        *dispatch_args,
-        constexpr_param=param,
-        compiler=flyc.compile,
-        dispatch_args=dispatch_args,
+        specialization_key=(_PARAM_ITEMS[id(param)], device),
     )
     return out
