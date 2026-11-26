@@ -899,6 +899,12 @@ def test_every_cache_declares_the_kernel_files_its_sources_import(monkeypatch):
         if not name.startswith("test_")
     }
     assert len(real) >= 20, sorted(real)
+    # What each one is built from is declared in one table, and nowhere else.
+    from aiter.aot.flydsl.sources import AOT_CACHES
+
+    assert set(real) == set(AOT_CACHES), sorted(set(real) ^ set(AOT_CACHES))
+    with pytest.raises(ValueError, match="declared in"):
+        aot_cache.FlyDSLAotCache(next(iter(real)), sources=["kernels/act.py"])
     missing = {
         name: [os.path.relpath(f, base) for f in undeclared]
         for name, cache in real.items()

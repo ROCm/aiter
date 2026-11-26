@@ -3096,15 +3096,7 @@ def _m64_qdpp_for(i32_cur_tok, kwargs):
     return cur >= _QDPP_M64_MIN_TOK
 
 
-@aot_factory(
-    "mega_moe_prepare",
-    sources=[
-        "kernels/communication_ops_utils.py",
-        "kernels/dpp_utils.py",
-        "kernels/mega_moe/dispatch.py",
-        "kernels/mega_moe/quant.py",
-    ],
-)
+@aot_factory("mega_moe_prepare")
 @functools.cache
 def compile_mega_moe_prepare(
     *,

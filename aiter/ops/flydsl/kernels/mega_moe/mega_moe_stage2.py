@@ -569,18 +569,7 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 
 
 # fmt: off
-@aot_factory(
-    "mega_moe_stage2",
-    sources=[
-        "kernels/act.py",
-        "kernels/communication_ops_utils.py",
-        "kernels/dpp_utils.py",
-        "kernels/layout_utils.py",
-        "kernels/mxfp4_gemm_common.py",
-        "kernels/mega_moe/gemm2.py",
-        "kernels/mega_moe/gemm_util.py",
-    ],
-)
+@aot_factory("mega_moe_stage2")
 @functools.cache
 def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
     max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,

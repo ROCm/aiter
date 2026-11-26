@@ -403,15 +403,7 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
-@aot_factory(
-    "chunk_gated_delta_h",
-    sources=[
-        "kernels/gdr_prefill/chunk_gated_delta_h.py",
-        "kernels/gdr_common.py",
-    ],
-    # Read in this file (its value also reaches the key, as BV).
-    env=["FLYDSL_K5_OPT_BV"],
-)
+@aot_factory("chunk_gated_delta_h")
 @functools.cache
 def _get_or_compile_opt(
     K,

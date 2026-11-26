@@ -7,7 +7,7 @@ changing their call sites.
 A launcher factory opts in once, and every ``_run_compiled(exe, ...)`` of the
 launcher it returns then goes through the cache::
 
-    @aot_factory("moe_gfx942_gemm", sources=["kernels/moe_gemm_2stage/gfx9_fp8"])
+    @aot_factory("moe_gfx942_gemm")
     @functools.cache
     def _get_compiled_kernel(N, K, ...):
         return compile_gemm(...)
@@ -270,14 +270,14 @@ class _LazyLauncher:
         setattr(self, _ATTR, binding)
 
 
-def aot_factory(name: str, *, sources=(), env=()):
+def aot_factory(name: str, *, sources=None, env=None):
     """Decorate a launcher factory so that the launchers it returns launch
     through a ``FlyDSLAotCache`` named ``name``, keyed by its arguments.
 
-    ``sources`` are the files those launchers are built from, besides the one
-    of the factory and the common ones, and ``env`` the environment variables
-    their code reads
-    (see ``FlyDSLAotCache``).
+    What the cache is built from (source files, environment variables) is
+    declared under ``name`` in ``aiter/aot/flydsl/sources.py``; ``sources``
+    and ``env`` are for a cache that is not in that table (see
+    ``FlyDSLAotCache``).
 
     Place it above ``functools.cache``. Under ``AITER_FLYDSL_AOT_CACHE=0`` it
     returns the factory itself, with ``lazy`` the factory.

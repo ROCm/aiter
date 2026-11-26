@@ -162,19 +162,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
 
 
 # fmt: off
-@aot_factory(
-    "mega_moe_stage2_aligned_pair",
-    sources=[
-        "kernels/act.py",
-        "kernels/communication_ops_utils.py",
-        "kernels/dpp_utils.py",
-        "kernels/layout_utils.py",
-        "kernels/mxfp4_gemm_common.py",
-        "kernels/mega_moe/gemm2.py",
-        "kernels/mega_moe/gemm_util.py",
-        "kernels/mega_moe/mega_moe_stage2.py",
-    ],
-)
+@aot_factory("mega_moe_stage2_aligned_pair")
 @functools.cache
 def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     experts: int, topk: int, rank: int, npes: int, max_tok: int,

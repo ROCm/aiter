@@ -27,9 +27,7 @@ _TR_LDS_S = TR_TILE + _TR_PAD
 TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
 
 
-_TRANSPOSE_AOT_CACHE = FlyDSLAotCache(
-    "conv3d_transpose_ncdhw_ndhwc", sources=["kernels/conv/conv3d_gfx950_utils.py"]
-)
+_TRANSPOSE_AOT_CACHE = FlyDSLAotCache("conv3d_transpose_ncdhw_ndhwc")
 
 
 @functools.lru_cache(maxsize=64)

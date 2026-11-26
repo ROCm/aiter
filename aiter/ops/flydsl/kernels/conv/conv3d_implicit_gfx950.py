@@ -243,10 +243,7 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
     )
 
 
-_CONV3D_AOT_CACHE = FlyDSLAotCache(
-    "conv3d_implicit_gfx950",
-    sources=["kernels/conv/conv3d_gfx950_utils.py", "kernels/conv/conv3d_im2col.py"],
-)
+_CONV3D_AOT_CACHE = FlyDSLAotCache("conv3d_implicit_gfx950")
 
 
 def _aot_key(param, dyn_closure=None):

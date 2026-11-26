@@ -101,14 +101,7 @@ def _validate(
             )
 
 
-@aot_factory(
-    "gemm_a8w8_mxfp8_8wave",
-    sources=[
-        "kernels/mxfp8_gemm_8wave.py",
-        "kernels/gemm_a8w8_8wave.py",
-        "kernels/mfma_preshuffle_pipeline.py",
-    ],
-)
+@aot_factory("gemm_a8w8_mxfp8_8wave")
 @functools.lru_cache(maxsize=1024)
 def compile_mxfp8_8wave_gemm(
     *,

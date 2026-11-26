@@ -849,28 +849,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
 
 
 # fmt: off
-@aot_factory(
-    "mega_moe_small_m_stage1",
-    sources=[
-        "kernels/act.py",
-        "kernels/communication_ops_utils.py",
-        "kernels/dpp_utils.py",
-        "kernels/flydsl_dispatch_combine_intranode_kernel.py",
-        "kernels/flydsl_dispatch_combine_intranode_op.py",
-        "kernels/layout_utils.py",
-        "kernels/mxfp4_gemm_common.py",
-        "kernels/mega_moe/dispatch.py",
-        "kernels/mega_moe/gemm1.py",
-        "kernels/mega_moe/gemm2.py",
-        "kernels/mega_moe/gemm_util.py",
-        "kernels/mega_moe/mega_moe_config.py",
-        "kernels/mega_moe/mega_moe_fused_gemm.py",
-        "kernels/mega_moe/mega_moe_stage1.py",
-        "kernels/mega_moe/mega_moe_stage2.py",
-        "kernels/mega_moe/weights.py",
-    ],
-    env=["AITER_MEGA_FIXED_SLOT_MAX_MTPR"],
-)
+@aot_factory("mega_moe_small_m_stage1")
 @functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,

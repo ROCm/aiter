@@ -486,16 +486,7 @@ def a16w4_default_shared_tile_n(tile_n, N, *, step):
     return tn
 
 
-@aot_factory(
-    "moe_a16wmix_gemm1",
-    sources=[
-        "kernels/moe_2stage_a16wmix",
-        "kernels/act.py",
-        "kernels/dpp_utils.py",
-        "kernels/layout_utils.py",
-        "kernels/mxfp4_gemm_common.py",
-    ],
-)
+@aot_factory("moe_a16wmix_gemm1")
 @functools.cache
 def compile_gemm1_a16w4_port(
     BM=32,

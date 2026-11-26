@@ -63,13 +63,7 @@ def _zeroed_sym(shape, dtype):
     return t
 
 
-@aot_factory(
-    "mega_moe_combine",
-    sources=[
-        "kernels/communication_ops_utils.py",
-        "kernels/flydsl_dispatch_combine_intranode_kernel.py",
-    ],
-)
+@aot_factory("mega_moe_combine")
 @functools.cache
 def _fused_combine_launcher(**kwargs):
     return make_combine_jit(**kwargs)

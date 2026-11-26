@@ -206,36 +206,49 @@ source:
   declares it (level 2), so setting it makes that cache miss and no other.
 
 **Level 2: the sources a cache declares.** aiter sources are not hashed as a
-directory, and nothing is detected at run time. Each cache lists the files
+directory, and nothing is detected at run time. Each cache declares the files
 its launchers are built from, as FlashInfer's `gen_jit_spec(name, sources)`
-does:
+does. The declarations of every cache are in one table,
+`aiter/aot/flydsl/sources.py`, by cache name; a launcher only names its cache
+(`@aot_factory("gemm_a8w8_blockscale")`):
 
 ```python
-@aot_factory(
-    "gemm_a8w8_blockscale",
-    sources=[
-        "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
-        "kernels/gemm_a8w8_blockscale_8wave.py",
-    ],
-)
+AOT_CACHES = {
+    "gemm_a8w8_blockscale": {
+        "sources": [
+            "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
+            "kernels/gemm_a8w8_blockscale_8wave.py",
+        ],
+    },
+    "moe_gfx942_gemm": {
+        "sources": ["kernels/moe_gemm_2stage/gfx9_fp8"],
+        "env": ["AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", ...],
+    },
+}
 ```
+
+So a list is not part of a kernel file: changing one does not touch the
+kernel, and the lists of all caches read as one page, with the lists that
+several caches share written once. (`sources=` and `env=` of `aot_factory`
+and `FlyDSLAotCache` remain for a cache outside that table, a test's say; a
+name that is in the table must not pass them.)
 
 - A path is relative to `aiter/ops/flydsl`, or absolute. A directory stands
   for every `.py` below it.
 - The file that creates the cache is always one of its sources.
-- So are the common sources, `_COMMON_SOURCES` in `aot_cache.py`, which no
+- So are the common sources, `COMMON_SOURCES` of that module, which no
   cache lists: the helpers nearly every kernel is built with
   (`kernels/kernels_common.py`, `kernels/tensor_shim.py`,
   `kernels/buffer_ops.py`) and the per-arch hardware constants kernels size
   themselves by (`aiter/jit/utils/chip_info.py`, `lds_capacity.py`), which are
   outside `aiter/ops/flydsl/kernels`, the only place the import check looks. An edit
   to one of them makes new entries in every cache.
-- `env=[...]` names the environment variables the declared files read,
+- `"env"` names the environment variables the declared files read,
   `AITER_FLYDSL_*` ones included. The variables the common sources read
-  (`aot_cache._COMMON_ENV`, the kernel-argument preload switches) are
+  (`COMMON_ENV` there, the kernel-argument preload switches) are
   inputs of every cache. A prebuild, and the unit test, raise for a variable
   a declared file reads by a literal name that is neither declared, nor in
-  the fingerprint, nor listed in `aot_cache._ENV_NOT_CODE` (the target
+  the fingerprint, nor listed in `ENV_NOT_CODE` there (the target
   selectors, `COMPILE_ONLY`, the cache's own switches). A name that is
   computed (`os.environ.get(f"X_{stage}")`) is not seen. `"get_gfx()"` stands for
   `chip_info.get_gfx()`, for code that picks instructions by it.
@@ -744,7 +757,7 @@ be checked.
 Opt in at the launcher factory, not at the call site:
 
 ```python
-@aot_factory("my_kernel", sources=["kernels/my_kernel.py", ...])
+@aot_factory("my_kernel")   # declared in aiter/aot/flydsl/sources.py
 @functools.cache
 def my_launcher(N, K, tile_m, ...):  # its arguments are the key
     return compile_my_kernel(N, K, tile_m, ...)
@@ -753,7 +766,7 @@ _run_compiled(my_launcher.lazy(N, K, tile_m, ...), *args, stream)
 ```
 
 A launcher built inside a wrapper (no factory returning it) binds where it is
-built: `bind_aot(launch, FlyDSLAotCache("my_kernel", sources=[...]), (TOPK, N))`.
+built: `bind_aot(launch, FlyDSLAotCache("my_kernel"), (TOPK, N))`.
 
 A factory argument the cache cannot key (e.g. a numpy scalar) leaves that
 launcher on the JIT path, and so does such a `specialization_key` (an Enum),
@@ -792,7 +805,8 @@ module global), which an entry on disk would not reflect.
    on the JIT path. Arch and CU count are in the fingerprint; declare any other
    variable the kernel's files read in `env`. Tensor rank and unit-stride axis are covered by the
    disk digest.
-3. **Declare the sources.** List in `sources=` every file the launcher's
+3. **Declare the sources.** Add the cache to `AOT_CACHES` in
+   `aiter/aot/flydsl/sources.py` and list under `"sources"` every file the launcher's
    code is generated from, besides the common sources (§ level 2): the
    kernel module, the helpers it imports, a
    tuning table the wrapper reads its tiles from, linked bitcode (§4.2). The

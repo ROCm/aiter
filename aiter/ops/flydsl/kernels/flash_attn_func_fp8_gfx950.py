@@ -225,12 +225,7 @@ def _fp8_auto_kv_splits(
     return best if makespan(best) <= _FP8_AUTOSPLIT_DENSE_MARGIN * makespan(1) else 1
 
 
-_FP8_AOT_CACHE = FlyDSLAotCache(
-    "flash_attn_fp8_gfx950",
-    sources=[
-        "kernels/fmha_gfx950",
-    ],
-)
+_FP8_AOT_CACHE = FlyDSLAotCache("flash_attn_fp8_gfx950")
 
 
 @functools.lru_cache(maxsize=128)

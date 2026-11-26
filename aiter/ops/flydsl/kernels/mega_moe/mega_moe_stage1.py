@@ -862,19 +862,7 @@ def compile_mega_moe_stage1_bundle(
     return launch
 
 
-@aot_factory(
-    "mega_moe_stage1_bundle",
-    sources=[
-        "kernels/act.py",
-        "kernels/communication_ops_utils.py",
-        "kernels/dpp_utils.py",
-        "kernels/mega_moe/dispatch.py",
-        "kernels/mega_moe/gemm1.py",
-        "kernels/mega_moe/gemm_util.py",
-        "kernels/mega_moe/mega_moe_config.py",
-    ],
-    env=["AITER_MEGA_FIXED_SLOT_MAX_MTPR"],
-)
+@aot_factory("mega_moe_stage1_bundle")
 @functools.cache
 def _stage1_bundle_launcher(*, variants: tuple, **compile_kw):
     """compile_mega_moe_stage1_bundle's launcher, with ``variants`` given as
