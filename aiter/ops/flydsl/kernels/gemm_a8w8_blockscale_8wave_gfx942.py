@@ -29,7 +29,7 @@ PyHIP's BufferTensor.load is _buffer_load_dwordx4 below, the same
 buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
 below are kept for that reason; each names the stable API it stands in for.
 
-The interface is the gfx950 8-wave kernel's (gemm_a8w8_blockscale_8wave.py):
+The interface is the gfx950 8-wave kernel's (gemm_a8w8_blockscale_8wave_gfx950.py):
 compile_gemm_fp8_blockscale_gfx942(TILE_M, TILE_N, TILE_K, N, K, preshuffle_b)
 returns launch_gemm(A, B, C, scaleA, scaleB, M, stream), which takes tensors
 and rebases A, B and C per tile in i64; C's dtype selects the epilogue.
@@ -40,7 +40,7 @@ PyHIP's build loads both into one SGPR, which its ISA audit flags as a WAW;
 here FlyDSL 0.5.3 gives them separate SGPRs and the audit passes.
 
 The epilogue is aiter's: it rounds the FP32 results to BF16 or FP16 to
-nearest even, as the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave.py)
+nearest even, as the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave_gfx950.py)
 does. PyHIP instead truncates to BF16 and has no FP16 output, so BF16 results
 differ from PyHIP's in the last bit wherever rounding goes up.
 """
@@ -147,7 +147,7 @@ def compile_gemm_fp8_blockscale_gfx942(
         b: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
 
     @flyc.kernel(
-        name=f"gemm_a8w8_blockscale_gfx942_ps{int(preshuffle_b)}",
+        name=f"gemm_a8w8_blockscale_8wave_gfx942_ps{int(preshuffle_b)}_BM{TILE_M}_BN{TILE_N}_BK{TILE_K}",
         known_block_size=[512, 1, 1],
     )
     def gemm_kernel(

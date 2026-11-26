@@ -14,7 +14,7 @@ serve FP16 calls; the output tensor specializes the epilogue, with separate
 runtime/AOT cache entries for the two dtypes.
 
 IDs 2 and 3 are the gfx942 8-wave kernel ported from PyHIP's 2x4-LDS pf1
-(kernels/gemm_a8w8_blockscale_gfx942.py), main loop unchanged: a
+(kernels/gemm_a8w8_blockscale_8wave_gfx942.py), main loop unchanged: a
 256x256 tile, eight waves on a 2x4 (M x N) grid, A and B staged through
 64 KiB of LDS with a one-stage load lead. ID 2 is plain B and ID 3
 preshuffled B. It reads FP8 E4M3FNUZ and writes BF16 or FP16, rounded to
@@ -58,7 +58,7 @@ kernels_list = {
     2: kernelInstance(False, "gfx942"),
     3: kernelInstance(True, "gfx942"),
 }
-kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
+kernels_by_name = {ker_obj.name: ker_obj for ker_obj in kernels_list.values()}
 
 
 def lds_bytes(K: int) -> int:
@@ -86,12 +86,14 @@ def _gfx942_fits_shape(M: int, N: int, K: int, gfx: str) -> bool:
     )
 
 
-def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
-    if ki.gfx == "gfx942":
+def kernel_fits_shape(
+    ker_obj: kernelInstance, M: int, N: int, K: int, gfx: str
+) -> bool:
+    if ker_obj.gfx == "gfx942":
         return _gfx942_fits_shape(M, N, K, gfx)
     if gfx != "gfx950" or M <= 0 or N <= 0 or K < 256 or K % 256:
         return False
-    if N % (16 if ki.preshuffle_b else 8):
+    if N % (16 if ker_obj.preshuffle_b else 8):
         return False
     if lds_bytes(K) > 160 * 1024:
         return False

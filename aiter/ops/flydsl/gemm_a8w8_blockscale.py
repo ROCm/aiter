@@ -38,10 +38,10 @@ def is_supported(
     Without ``kernel_name`` it asks about the gfx950 kernel of this B layout.
     """
     if kernel_name is None:
-        ki = kernelInstance(preshuffle_b, "gfx950")
+        ker_obj = kernelInstance(preshuffle_b, "gfx950")
     else:
-        ki = kernels_by_name.get(kernel_name)
-        if ki is None or ki.preshuffle_b != preshuffle_b:
+        ker_obj = kernels_by_name.get(kernel_name)
+        if ker_obj is None or ker_obj.preshuffle_b != preshuffle_b:
             return False
     if XQ.ndim != 2 or WQ.ndim != 2 or Out.ndim != 2:
         return False
@@ -51,13 +51,13 @@ def is_supported(
         return False
     if not XQ.is_cuda or WQ.device != XQ.device or Out.device != XQ.device:
         return False
-    fp8_storage = (_FP8_DTYPE[ki.gfx], torch.int8, torch.uint8)
+    fp8_storage = (_FP8_DTYPE[ker_obj.gfx], torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
     if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(ki, M, N, K, gfx)
+    return kernel_fits_shape(ker_obj, M, N, K, gfx)
 
 
 def _prepare_scales(
@@ -115,14 +115,14 @@ def _compile_gemm(
     device: torch.device,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    ki = kernels_by_name[kernel_name]
-    if ki.gfx == "gfx942":
-        from .kernels.gemm_a8w8_blockscale_gfx942 import (
+    ker_obj = kernels_by_name[kernel_name]
+    if ker_obj.gfx == "gfx942":
+        from .kernels.gemm_a8w8_blockscale_8wave_gfx942 import (
             compile_gemm_fp8_blockscale_gfx942 as compile_gemm_fp8_blockscale,
         )
     else:
-        from .kernels.gemm_a8w8_blockscale_8wave import (
-            compile_gemm_fp8_8wave as compile_gemm_fp8_blockscale,
+        from .kernels.gemm_a8w8_blockscale_8wave_gfx950 import (
+            compile_gemm_fp8_blockscale_gfx950 as compile_gemm_fp8_blockscale,
         )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
@@ -135,7 +135,7 @@ def _compile_gemm(
         TILE_K,
         N,
         K,
-        preshuffle_b=ki.preshuffle_b,
+        preshuffle_b=ker_obj.preshuffle_b,
     )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
@@ -158,10 +158,10 @@ def run_gemm_a8w8_blockscale(
     Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output; IDs 0/1 run on
     gfx950, IDs 2/3 on gfx942.
     """
-    ki = kernels_by_name.get(kernel_name)
-    if ki is None:
+    ker_obj = kernels_by_name.get(kernel_name)
+    if ker_obj is None:
         raise ValueError(f"Unknown FlyDSL blockscale kernel: {kernel_name!r}")
-    if ki.preshuffle_b != preshuffle_b:
+    if ker_obj.preshuffle_b != preshuffle_b:
         raise ValueError("FlyDSL blockscale kernelName does not match the B layout")
     if not is_supported(XQ, WQ, Out, preshuffle_b, kernel_name):
         raise ValueError("Unsupported gfx, shape or dtype for FlyDSL blockscale")

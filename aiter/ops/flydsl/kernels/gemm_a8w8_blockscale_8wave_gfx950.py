@@ -39,7 +39,7 @@ def _lds_byte_ptr(ptr, byte_offset):
     )
 
 
-def compile_gemm_fp8_8wave(
+def compile_gemm_fp8_blockscale_gfx950(
     TILE_M,
     TILE_N,
     TILE_K,
@@ -131,7 +131,10 @@ def compile_gemm_fp8_8wave(
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(
+        name=f"gemm_a8w8_blockscale_8wave_gfx950_ps{int(preshuffle_b)}_BM{TILE_M}_BN{TILE_N}_BK{TILE_K}",
+        known_block_size=[512, 1, 1],
+    )
     def gemm_kernel(
         argA: fx.Tensor,
         argB: fx.Tensor,
