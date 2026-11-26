@@ -81,7 +81,7 @@ def _validate_pagesize1_inputs(
     # queries longer than 128 / num_q_heads rows as several tiles.
     from .kernels.mla_gfx1250.mla_common import wave_layout
 
-    wave_layout(num_q_heads, max_seqlen_q)
+    wave_layout(num_q_heads, max_seqlen_q, fp8=qkv_dtype == torch.float8_e4m3fn)
     _require_layout("q", q, qkv_dtype, (total_q, num_q_heads, 576))
     _require_layout("kv_buffer", kv_buffer, qkv_dtype, (None, 1, 1, 576))
     _require_layout("split_data", split_data, torch.float32, (None, num_q_heads, 512))
@@ -187,7 +187,7 @@ def _run_pagesize1(
     from .kernels.mla_gfx1250.mla_common import planner_q_tile_rows
 
     tiled_causal = bool(causal) and planner_q_tile_rows(
-        num_q_heads, max_seqlen_q
+        num_q_heads, max_seqlen_q, fp8=qkv_dtype == torch.float8_e4m3fn
     ) not in (
         1,
         max_seqlen_q,

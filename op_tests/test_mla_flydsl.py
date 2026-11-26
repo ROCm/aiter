@@ -85,7 +85,7 @@ PS1_Q_SEQ_LENS = {
     # Past 128 / nhead rows the planner cuts the query into several qo tiles.
     32: (1, 2, 3, 4, 5, 6, 7, 8),
     64: (1, 2, 3, 4, 5, 6, 7, 8),
-    96: (1, 2, 3, 4, 6, 8),
+    96: (1, 2, 3, 4, 5, 6, 8),
     128: (1,),
 }
 # Query lengths ps1-vs-asm compares at (those ASM PS64 has kernels for).
@@ -105,10 +105,36 @@ ASM_PADDED_HEADS = {96: 128}
 # this many: above budget / 2 heads every work item holds one query position,
 # below it a longer query is cut into several qo tiles.
 PLANNER_PACKED_Q_BUDGET = 128
+# FP8 shapes eligible for row packing.
+ROW_PACKED_SHAPES = ((96, 5),)
+ROW_PACK_MIN_BATCHES = 16
 
 
-def _planner_q_tile_rows(nhead, q_seq_len):
-    """Query rows per work item, as mla_v12_num_qo_tiles cuts them."""
+def _planner_q_tile_rows(
+    nhead,
+    q_seq_len,
+    qkv_dtype=dtypes.fp8,
+    batch=1,
+    is_cp_round_robin=False,
+):
+    """Return planned rows per item, or None when packing is data dependent."""
+    if (
+        not is_cp_round_robin
+        and qkv_dtype == dtypes.fp8
+        and (nhead, q_seq_len) in ROW_PACKED_SHAPES
+        and batch >= ROW_PACK_MIN_BATCHES
+    ):
+        pack = os.environ.get("AITER_MLA_PS1_PACK_ROWS")
+        if pack is None:
+            return None
+        try:
+            pack = int(pack)
+        except ValueError:
+            pack = 0
+        if pack == 1:
+            return q_seq_len
+        if pack != 0:
+            return None
     if nhead * 2 > PLANNER_PACKED_Q_BUDGET:
         return 1
     tiles = -(-(nhead * q_seq_len) // PLANNER_PACKED_Q_BUDGET)
@@ -354,12 +380,19 @@ def _build_ps1_metadata(
     num_works = int(work_indptr[-1].item())
     work_info = work_info_set[:num_works]
     # The last tile of a request may be shorter (64 heads x q_seq 3 -> 2 + 1).
-    qo_tile_size = _planner_q_tile_rows(nhead, q_seq_len)
+    qo_tile_size = _planner_q_tile_rows(
+        nhead,
+        q_seq_len,
+        qkv_dtype,
+        len(seq_lens),
+        is_cp_round_robin,
+    )
+    expected = (1, q_seq_len) if qo_tile_size is None else (qo_tile_size,)
     tile_rows = work_info[:, 3] - work_info[:, 2]
-    if num_works and (int(tile_rows.max()) != qo_tile_size or int(tile_rows.min()) < 1):
+    if num_works and (int(tile_rows.max()) not in expected or int(tile_rows.min()) < 1):
         raise RuntimeError(
             f"PS1 nhead={nhead} q_seq={q_seq_len} expects qo tiles of up to "
-            f"{qo_tile_size}, got {sorted(set(tile_rows.tolist()))}"
+            f"{' or '.join(map(str, expected))}, got {sorted(set(tile_rows.tolist()))}"
         )
 
     return {

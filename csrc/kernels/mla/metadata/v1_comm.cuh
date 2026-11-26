@@ -105,6 +105,12 @@ struct MlaMetadataV1KernelParameter
     bool xcd_lane_works;
     int32_t fixed_over_head_num_blocks;
     int32_t tail_done_threshold;
+    // Query-head rows covered by one packed KV pass; 0 disables row packing.
+    int32_t qo_pass_rows;
+    // Maximum KV passes per work item.
+    int32_t max_tile_passes;
+    // Apply the row-packing profitability heuristic.
+    bool pack_rows_auto;
 };
 
 struct PaMetadataV1KernelParameter : MlaMetadataV1KernelParameter

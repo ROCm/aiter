@@ -8,6 +8,7 @@ namespace mla_dsl {
 #include "asm_mla_dsl_configs.hpp"
 } // namespace mla_dsl
 #include "aiter_ctypes_error.h"
+#include "mla_decode_shape.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -626,21 +627,26 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
     return c;
 }
 
+// Prefer an exact query-length match unless any_first requests the generic object.
 static const mla_dsl::CFG::value_type* mla_ps1_fp8_asm_config(const std::string& arch_id,
                                                               int num_heads,
                                                               int max_seqlen_q,
                                                               int causal_flag,
                                                               int lse_flag,
-                                                              int cprr)
+                                                              int cprr,
+                                                              bool any_first)
 {
-    for(const auto& el : mla_dsl::cfg_mla_dsl)
+    for(const int q_seq : {any_first ? 0 : max_seqlen_q, any_first ? max_seqlen_q : 0})
     {
-        const auto& c = el.second;
-        if(el.first.find(arch_id) == 0 && c.qType == "fp8" && c.kvType == "fp8" &&
-           c.Gqa == num_heads && (c.qSeqLen == 0 || c.qSeqLen == max_seqlen_q) &&
-           c.causal == causal_flag && c.lse == lse_flag && c.cprr == cprr)
+        for(const auto& el : mla_dsl::cfg_mla_dsl)
         {
-            return &el;
+            const auto& c = el.second;
+            if(el.first.find(arch_id) == 0 && c.qType == "fp8" && c.kvType == "fp8" &&
+               c.Gqa == num_heads && c.qSeqLen == q_seq && c.causal == causal_flag &&
+               c.lse == lse_flag && c.cprr == cprr)
+            {
+                return &el;
+            }
         }
     }
     return nullptr;
@@ -719,7 +725,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
     const int causal_flag     = causal != 0 ? 1 : 0;
     const int cprr            = (has_cprr != 0 && causal_flag) ? 1 : 0;
     const auto* cfg_entry     = mla_ps1_fp8_asm_config(
-        arch_id, num_heads, max_seqlen_q, causal_flag, has_lse != 0 ? 1 : 0, cprr);
+        arch_id, num_heads, max_seqlen_q, causal_flag, has_lse != 0 ? 1 : 0, cprr, false);
     bool arch_built = cfg_entry != nullptr;
     for(const auto& el : mla_dsl::cfg_mla_dsl)
         arch_built = arch_built || el.first.find(arch_id) == 0;
@@ -1887,7 +1893,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     aiter_tensor_t* kv_scale,         //   [1] fp32
     int max_seqlen_q,
     int causal,
-    aiter_tensor_t* qo_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* qo_indptr,        //   [batch + 1] int32, CP/tiled causal (nullable)
     aiter_tensor_t* kv_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
     aiter_tensor_t* g_kv_indptr,      //   [batch + 1] int32, round-robin CP only (nullable)
     int cp_world_size,
@@ -1941,13 +1947,47 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         require_i32(kv_indptr, "kv_indptr");
         require_i32(g_kv_indptr, "g_kv_indptr");
     }
+    // Multi-row causal tiles need the request boundary from qo_indptr.
+    const int qo_tiles  = (num_heads * max_seqlen_q + 127) / 128;
+    const int tile_rows = num_heads * 2 > 128 ? 1 : (max_seqlen_q + qo_tiles - 1) / qo_tiles;
+    const bool tiled_causal = causal_flag && tile_rows != 1 && tile_rows != max_seqlen_q;
+    if(tiled_causal)
+        require_i32(qo_indptr, "qo_indptr");
 
-    const auto* cfg_entry =
-        mla_ps1_fp8_asm_config(arch_id, num_heads, max_seqlen_q, causal_flag, lse_flag, cprr);
+    // Packable shapes require an exact-length object; generic objects assume one row per item.
+    const int num_batches        = kv_indptr != nullptr   ? static_cast<int>(kv_indptr->size(0)) - 1
+                                   : qo_indptr != nullptr ? static_cast<int>(qo_indptr->size(0)) - 1
+                                                          : INT32_MAX;
+    const bool rows_packed_shape = mla_ps1_rows_packed_shape(
+        arch_id, num_heads, max_seqlen_q, AITER_DTYPE_fp8, AITER_DTYPE_fp8, true);
+    const int32_t pass_rows = mla_ps1_qo_pass_rows(
+        arch_id, num_heads, max_seqlen_q, AITER_DTYPE_fp8, AITER_DTYPE_fp8, true, num_batches);
+    // CP metadata keeps one query row per work item.
+    const bool rows_packable = (pass_rows > 0) && !cprr;
+
+    const auto* cfg_entry = mla_ps1_fp8_asm_config(arch_id,
+                                                   num_heads,
+                                                   max_seqlen_q,
+                                                   causal_flag,
+                                                   lse_flag,
+                                                   cprr,
+                                                   rows_packed_shape && !rows_packable);
     const mla_dsl::mla_dslConfig* cfg = cfg_entry != nullptr ? &cfg_entry->second : nullptr;
-    AITER_CHECK(cfg != nullptr, __func__, ": no mla_ps1 code object for num_heads=", num_heads,
-                " max_seqlen_q=", max_seqlen_q, " causal=", causal_flag, " lse=", lse_flag,
-                " cprr=", cprr);
+    AITER_CHECK(cfg != nullptr,
+                __func__,
+                ": no mla_ps1 code object for num_heads=",
+                num_heads,
+                " max_seqlen_q=",
+                max_seqlen_q,
+                " causal=",
+                causal_flag,
+                " lse=",
+                lse_flag,
+                " cprr=",
+                cprr);
+    AITER_CHECK(!rows_packable || cfg->qSeqLen == max_seqlen_q,
+                __func__,
+                ": this shape needs the code object of its own max_seqlen_q");
 
     // Compiler output, not shipped hand-written asm: the gfx1250 B0-only gate
     // does not apply.
@@ -1973,7 +2013,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.softmax_scale    = softmax_scale;
     args.num_pages        = static_cast<int>(kv_buffer->size(0));
     args.num_page_indices = static_cast<int>(kv_page_indices->numel());
-    args.qo_indptr        = cprr ? qo_indptr->data_ptr() : nullptr;
+    args.qo_indptr        = (cprr || tiled_causal) ? qo_indptr->data_ptr() : nullptr;
     args.kv_indptr        = cprr ? kv_indptr->data_ptr() : nullptr;
     args.g_kv_indptr      = cprr ? g_kv_indptr->data_ptr() : nullptr;
     args.cp_world_size    = cprr ? cp_world_size : 1;
