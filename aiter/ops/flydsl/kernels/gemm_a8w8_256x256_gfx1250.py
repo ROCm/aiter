@@ -32,6 +32,27 @@ from .tensor_shim import (
 )
 
 
+def _sa_panel_stages(num_buffers, kpair, persistent_n_tiles, k_tiles_class):
+    """Super K-steps per A-scale TDM load (the 1x32 scale panel).
+
+    Four slots with tile_n 256 hold one K-tile a slot (SUPER_K 128), where a
+    one-step panel is a 4-byte row per load: those take 4-step panels, 8-step
+    ones from k_tiles_class 1 (8 measured 4% slower than 4 at 16 K-tiles). At
+    SUPER_K 256 only long K loops (k_tiles_class 2) take 4-step panels; shorter
+    ones measured 2-3% slower. Persistent tiles keep 1, which their C
+    relocation needs.
+    """
+    if num_buffers == 2:
+        return 8
+    if num_buffers == 3:
+        return 4
+    if persistent_n_tiles > 1:
+        return 1
+    if kpair == 1:
+        return 8 if k_tiles_class >= 1 else 4
+    return 4 if k_tiles_class >= 2 else 1
+
+
 @flyc.jit
 def launch_gemm_a8w8_256x256(
     arg_c: fx.Pointer,
@@ -181,7 +202,7 @@ def launch_gemm_a8w8_256x256(
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
     SA_PANEL_STAGES = (
-        (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+        _sa_panel_stages(num_buffers, KPAIR, persistent_n_tiles, k_tiles_class)
         if mx32 and not a_scale_preshuffled
         else 1
     )
