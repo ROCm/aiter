@@ -896,10 +896,19 @@ class MXFP8ProjGemm:
     def gemm(self, a, w, kind):
         from aiter.ops.mxfp8_linear import mxfp8_mm
 
+        # quantized-operand cache: the layer input X is reused, rowwise by every
+        # fprop and columnwise by every wgrad; weights only when asked to
+        # (AITER_MXFP8_WEIGHT_CACHE=1 keeps one fp8 copy per weight and layout)
+        weights = os.environ.get("AITER_MXFP8_WEIGHT_CACHE", "0") == "1"
+        anchors = {
+            "fwd": (a, 1, w if weights else None, 1, True),
+            "dgrad": (None, 1, w if weights else None, 0, True),
+            "wgrad": (None, 0, w, 0, False),
+        }[kind]
         a, w = a.to(self.cd), w.to(self.cd)
         lhs = a.t() if kind == "wgrad" else a
         rhs = w.t() if kind == "fwd" else w
-        return mxfp8_mm(lhs, rhs, out16=kind != "wgrad").float()
+        return mxfp8_mm(lhs, rhs, out16=kind != "wgrad", anchors=anchors).float()
 
     def __call__(self, a, w, *, kind, cd, epilogue=None, name=None, ops=None, **epi):
         if epilogue is None:
@@ -952,15 +961,19 @@ class _GemmPrecisionScope:
         global _active_gemm_precision, _proj_gemm_hook
         self.saved = _active_gemm_precision, _proj_gemm_hook
         _active_gemm_precision = self.precision
+        self.cache = None
         if self.hook is not None:
-            from aiter.ops.mxfp8_linear import LAST_IMPLS
+            from aiter.ops.mxfp8_linear import LAST_IMPLS, mxfp8_quant_cache
 
             LAST_IMPLS.clear()
             _proj_gemm_hook = self.hook
+            self.cache = mxfp8_quant_cache().__enter__()
         return self
 
     def __exit__(self, *exc):
         global _active_gemm_precision, _proj_gemm_hook
+        if self.cache is not None:
+            self.cache.__exit__(*exc)
         _active_gemm_precision, _proj_gemm_hook = self.saved
 
 

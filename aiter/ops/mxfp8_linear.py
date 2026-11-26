@@ -45,6 +45,7 @@ restores the plain path, which the tests compare with it bit for bit.
 """
 
 import os
+import weakref
 from collections import Counter
 
 import torch
@@ -83,6 +84,61 @@ def mxfp8_fastpath():
     if _fastpath_override is not None:
         return _fastpath_override
     return os.environ.get("AITER_MXFP8_FASTPATH", "1") not in ("0", "off", "false")
+
+
+# Quantized operands keyed by (id(tensor), axis, op), each entry validated by a
+# weakref, the tensor's version counter and data pointer: the per-call cache is
+# live inside ``mxfp8_quant_cache()``; ``AITER_MXFP8_WEIGHT_CACHE=1`` keeps
+# weight operands across calls too (one fp8 copy per weight and layout).
+_call_cache = None
+_weight_cache: dict = {}
+
+
+class mxfp8_quant_cache:
+    """Context in which a tensor's quantized operand (per axis and use) is
+    computed once and reused; nested scopes share the outer cache."""
+
+    def __enter__(self):
+        global _call_cache
+        self.outer = _call_cache
+        if _call_cache is None:
+            _call_cache = {}
+        return self
+
+    def __exit__(self, *exc):
+        global _call_cache
+        _call_cache = self.outer
+
+
+def _cache_lookup(cache, key, anchor):
+    hit = cache.get(key)
+    if hit is None:
+        return None
+    ref, version, ptr, val = hit
+    if ref() is anchor and anchor._version == version and anchor.data_ptr() == ptr:
+        return val
+    return None
+
+
+def _cached(anchor, key, fn, weight=False):
+    """``fn()``, reused for the same ``anchor`` tensor (unchanged) and ``key``."""
+    if anchor is None or not mxfp8_fastpath():
+        return fn()
+    cache = _call_cache
+    if weight and os.environ.get("AITER_MXFP8_WEIGHT_CACHE", "0") == "1":
+        cache = _weight_cache
+        for k in [k for k, v in cache.items() if v[0]() is None]:
+            del cache[k]
+    if cache is None:
+        return fn()
+    key = (id(anchor), *key)
+    val = _cache_lookup(cache, key, anchor)
+    if val is not None:
+        LAST_IMPLS["quant_cache_hit"] += 1
+        return val
+    val = fn()
+    cache[key] = (weakref.ref(anchor), anchor._version, anchor.data_ptr(), val)
+    return val
 
 
 def mxfp8_wgrad_impl():
@@ -284,11 +340,27 @@ def _mm_f32(a, b):
     return a.float() @ b.float()
 
 
-def _native_mm(a, b):
+def _quant_rows(x2):
+    """(fp8, scale) of a 2-D tensor along its last dim, contiguous. The fast
+    path reads strided views (no transpose copy); the values are the same."""
+    if mxfp8_fastpath() and x2.is_cuda and x2.dtype in (torch.float32, torch.bfloat16):
+        try:
+            q, s = _rows_triton(x2)
+            LAST_IMPLS["quant:triton_te"] += 1
+            return q.contiguous(), s.contiguous()
+        except _TRITON_ERRORS as err:
+            LAST_IMPLS[f"quant:torch({type(err).__name__})"] += 1
+    q, s = mxfp8_quantize(x2.contiguous(), -1)
+    return q, s.contiguous()
+
+
+def _native_mm(a, b, anchors=None):
     """aiter FP8 MFMA GEMM (1x32 E8M0 scales, bf16 out) on ``a [M, K] @ b [K, N]``.
 
     K is padded to 128 and N to 16 with zeros, which leaves every block's scale
-    and the product unchanged.
+    and the product unchanged. ``anchors`` = (tensor_a, axis_a, tensor_b,
+    axis_b, b_is_weight) names the tensors the operands are views of, for the
+    quantized-operand cache.
     """
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -297,18 +369,21 @@ def _native_mm(a, b):
 
     if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("the native MXFP8 GEMM path is gfx950-only")
+    ta, xa, tb, xb, b_weight = anchors or (None,) * 5
     M, N = a.shape[0], b.shape[1]
-    a = _pad_to(a, 1, 128)
-    bt = _pad_to(_pad_to(b.t(), 1, 128), 0, 16)
-    aq, a_s = mxfp8_quantize(a.contiguous(), -1)
-    bq, b_s = mxfp8_quantize(bt.contiguous(), -1)
-    out = gemm_a8w8_mxfp8_bpreshuffle(
-        aq.view(dtypes.fp8),
-        shuffle_weight(bq.view(dtypes.fp8), layout=(16, 16)),
-        a_s.contiguous().view(dtypes.fp8_e8m0),
-        b_s.contiguous().view(dtypes.fp8_e8m0),
-        dtypes.bf16,
-    )
+
+    def quant_a():
+        aq, a_s = _quant_rows(_pad_to(a, 1, 128))
+        return aq.view(dtypes.fp8), a_s.view(dtypes.fp8_e8m0)
+
+    def quant_b():
+        bq, b_s = _quant_rows(_pad_to(_pad_to(b.t(), 1, 128), 0, 16))
+        bq = shuffle_weight(bq.view(dtypes.fp8), layout=(16, 16))
+        return bq, b_s.view(dtypes.fp8_e8m0)
+
+    aq, a_s = _cached(ta, (xa, "native_a"), quant_a)
+    bq, b_s = _cached(tb, (xb, "native_b"), quant_b, weight=b_weight)
+    out = gemm_a8w8_mxfp8_bpreshuffle(aq, bq, a_s, b_s, dtypes.bf16)
     return out[:M, :N]
 
 
@@ -352,7 +427,7 @@ def _hipb_mm_fp32(a, b):
     return out[:M, :N]
 
 
-def mxfp8_mm(a, b, out16=False, impl=None):
+def mxfp8_mm(a, b, out16=False, impl=None, anchors=None):
     """``a @ b`` (2-D) as an MXFP8 GEMM: ``a`` quantized along its columns and
     ``b`` along its rows, in blocks of 32 of the shared K axis.
 
@@ -361,7 +436,10 @@ def mxfp8_mm(a, b, out16=False, impl=None):
     K is zero-padded to a multiple of 32 (zeros change no block's amax and add
     nothing to the sum). ``out16=True`` returns the product rounded to the
     inputs' 16-bit dtype (fprop / dgrad), else fp32 (wgrad). ``impl``
-    overrides ``mxfp8_gemm_impl()``.
+    overrides ``mxfp8_gemm_impl()``. ``anchors`` = (tensor_a, axis_a,
+    tensor_b, axis_b, b_is_weight): the tensors ``a`` / ``b`` are views of and
+    the axis their blocks run along, for the quantized-operand cache (None for
+    either tensor: not cached).
     """
     impl = impl or mxfp8_gemm_impl()
     bf16 = a.dtype == b.dtype == torch.bfloat16
@@ -371,7 +449,7 @@ def mxfp8_mm(a, b, out16=False, impl=None):
     a, b = _pad_to(a, 1, MXFP8_BLOCK), _pad_to(b, 0, MXFP8_BLOCK)
     if impl == "auto" and od is not None:
         try:
-            out = _native_mm(a, b)
+            out = _native_mm(a, b, anchors)
             LAST_IMPLS["native"] += 1
             return out
         except _NATIVE_ERRORS as err:
@@ -386,7 +464,10 @@ def mxfp8_mm(a, b, out16=False, impl=None):
     impl = "emulate" if impl == "emulate" else "qdq"
     LAST_IMPLS[impl] += 1
     dt = mxfp8_qdq_dtype(a.dtype) if impl == "qdq" else torch.float32
-    out = _mm_f32(mxfp8_qdq(a, 1, dt), mxfp8_qdq(b, 0, dt))
+    ta, xa, tb, xb, b_weight = anchors or (None,) * 5
+    aq = _cached(ta, (xa, "qdq", dt), lambda: mxfp8_qdq(a, 1, dt))
+    bq = _cached(tb, (xb, "qdq", dt), lambda: mxfp8_qdq(b, 0, dt), weight=b_weight)
+    out = _mm_f32(aq, bq)
     return out if od is None else out.to(od)
 
 
