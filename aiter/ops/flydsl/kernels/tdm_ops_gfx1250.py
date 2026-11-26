@@ -100,6 +100,19 @@ def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
     )
 
 
+def grow_tensor_descriptor_2d_inner_extent(
+    desc: TDMDescriptor2D, extra
+) -> TDMDescriptor2D:
+    """Add ``extra`` to ``tensor_dim0``; the sum must stay below 65536."""
+    g1 = Vec(desc.dgroup1)
+    lanes = [fx.Uint32(g1[i]) for i in range(8)]
+    lanes[_DIM0_LO_SGPR] = lanes[_DIM0_LO_SGPR] + (fx.Uint32(extra) << 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=Vec.from_elements(lanes, fx.Uint32).ir_value(),
+    )
+
+
 def clamp_tensor_descriptor_2d_inner_extent(
     desc: TDMDescriptor2D, bound, predicate=None
 ) -> TDMDescriptor2D:

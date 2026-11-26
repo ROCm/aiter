@@ -137,7 +137,7 @@ def test_mxscale_config_precheck_matches_padded_walk(mxscale_table):
 
 @pytest.mark.parametrize("tile_m", [128, 256])
 @pytest.mark.parametrize("offset", [-1, 0, 1])
-def test_mxscale_compute_row_requires_full_m_tile(mxscale_table, tile_m, offset):
+def test_mxscale_compute_row_serves_underfilled_m_tile(mxscale_table, tile_m, offset):
     row = {
         "libtype": "flydsl",
         "kernelName": (
@@ -148,39 +148,9 @@ def test_mxscale_compute_row_requires_full_m_tile(mxscale_table, tile_m, offset)
     mxscale_table.clear()
     for tuned_m in (tile_m, 2 * tile_m):
         mxscale_table[("gfx1250", 256, tuned_m, 7168, 8192, "128x128")] = row
+    # Below the tile, one full tile and a partial second tile all keep the row.
     m = tile_m + offset
-    # All three cases really hit a row: below the tile must be rejected,
-    # exactly one tile and a legal partial second tile must retain the hit.
-    found, _ = find_padded_m_row(
-        mxscale_table,
-        lambda pm: ("gfx1250", 256, pm, 7168, 8192, "128x128"),
-        m,
-        7168,
-        8192,
-    )
-    assert found is row
-    expected = None if offset < 0 else row
-    assert (
-        gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, 7168, 8192, "128x128")
-        is expected
-    )
-
-
-@pytest.mark.parametrize("libtype", [None, "opus", "triton"])
-def test_mxscale_compute_guard_only_applies_to_flydsl_rows(mxscale_table, libtype):
-    # A lookup-only row need not describe a backend. Even a compute-looking
-    # name must not apply a FlyDSL safety rule to another backend's row.
-    row = {
-        "kernelName": (
-            "flydsl_mxfp8_128_bpreshuffle_compute_wmma_"
-            "t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4"
-        )
-    }
-    if libtype is not None:
-        row["libtype"] = libtype
-    mxscale_table.clear()
-    mxscale_table[("gfx1250", 256, 128, 7168, 8192, "128x128")] = row
-    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(65, 7168, 8192, "128x128") is row
+    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, 7168, 8192, "128x128") is row
 
 
 @pytest.mark.parametrize(

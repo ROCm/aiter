@@ -17,6 +17,7 @@ from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
 from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks_runtime
@@ -42,6 +43,8 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 # kernels. This null pointer is only a signature placeholder; the bf16 path
 # launches with arg_c and never loads it.
 _NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
+# One prefetch per wave: 86% of these kernels are no larger.
+_PREFETCH_BYTES = 16 * 1024
 
 
 @flyc.jit
@@ -1070,6 +1073,8 @@ def launch_gemm_a8w8(
             cluster.cluster_barrier()
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
+        # Code another kernel evicted is refetched while the first loads land.
+        prefetch_kernel_code(num_waves, max_bytes=_PREFETCH_BYTES)
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers

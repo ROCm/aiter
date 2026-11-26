@@ -321,15 +321,20 @@ def current_stream_arg(device=None):
     return fx.Stream(current_raw_stream(device))
 
 
+def data_ptr(t: torch.Tensor) -> int:
+    """Address of a tensor's first element; 0 for a FakeTensor."""
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return 0
+    return t.data_ptr()
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
         dtype = fx.Uint8
-    type_name = type(t).__name__
-    module_name = type(t).__module__
-    if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_c_void_p(dtype, 0)
-    return flyc.from_c_void_p(dtype, t.data_ptr())
+    return flyc.from_c_void_p(dtype, data_ptr(t))
 
 
 def _compile_and_run(exe, *args):

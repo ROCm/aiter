@@ -1437,22 +1437,6 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
             n,
             k,
         )
-    if row is not None and row.get("libtype") == "flydsl":
-        from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
-            is_compute_wmma_kernel_name,
-            parse_wmma_kernel_name,
-        )
-
-        kernel_name = str(row["kernelName"])
-        wmma_config = parse_wmma_kernel_name(kernel_name)
-        # A padded row must not send a decode M below a compute kernel's
-        # full M tile; kernel_fits_shape rejects that cluster-barrier case.
-        if (
-            wmma_config is not None
-            and is_compute_wmma_kernel_name(kernel_name)
-            and m < wmma_config["tile_m"]
-        ):
-            row = None
     if row is None:
         report_key = (gfx, n, k, w_scale_block)
         if report_key not in _MXSCALE_UNTUNED_REPORTED:
@@ -1743,6 +1727,8 @@ def _flydsl_mxfp8_fallback_kernel(
         and not ki.fused_splitk
         and ki.tile_n <= 256  # wider tiles measured slower
         and is_pow2_geometry(ki)
+        # Underfilled compute tiles are tuned rows only: the pick here is unmeasured.
+        and not (is_compute_kernel(ki) and m < ki.tile_m)
         and kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
     ]

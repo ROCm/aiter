@@ -24,6 +24,7 @@ _launch_gemm_a8w8_compute_bound = None
 _compile_splitk_reduce = None
 _run_compiled = None
 _ptr_arg = None
+_data_ptr = None
 _fx = None
 
 BLOCK_K = 128
@@ -106,7 +107,7 @@ def fused_splitk_partial_shape(M, N, tile_m, tile_n, split_k):
 
 def _lazy_import():
     global _launch_gemm_a8w8, _launch_gemm_a8w8_compute_bound
-    global _compile_splitk_reduce, _run_compiled, _ptr_arg, _fx
+    global _compile_splitk_reduce, _run_compiled, _ptr_arg, _data_ptr, _fx
     if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
@@ -119,13 +120,14 @@ def _lazy_import():
         compile_gemm_a8w8_splitk_reduce,
     )
     from .kernels.tensor_shim import _run_compiled as run_compiled
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import data_ptr, ptr_arg
 
     _launch_gemm_a8w8 = launch_gemm_a8w8
     _launch_gemm_a8w8_compute_bound = launch_gemm_a8w8_256x256
     _compile_splitk_reduce = compile_gemm_a8w8_splitk_reduce
     _run_compiled = run_compiled
     _ptr_arg = ptr_arg
+    _data_ptr = data_ptr
     _fx = fx_mod
 
 
@@ -530,6 +532,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
     constexpr_args = (*constexpr_args[:7], use_cluster, *constexpr_args[8:])
     if compute_bound:
+        # A block128 A-scale row off a 4-byte boundary (16 when a K step loads one
+        # row) stalls its load: take the variant that loads from aligned addresses.
+        a_scale_unaligned = not mx32 and bool(
+            (_data_ptr(a_scale) | stride_ascale_k) & (15 if k_pair == 1 else 3)
+        )
         specialization = constexpr_args + (
             scale_block,
             split_k,
@@ -550,7 +557,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             batch,
             fuse_quant,
             bounded_n,
-            specialization_key=specialization + (fuse_quant, bounded_n),
+            a_scale_unaligned,
+            specialization_key=specialization
+            + (fuse_quant, bounded_n, a_scale_unaligned),
         )
     else:
         specialization = constexpr_args + (

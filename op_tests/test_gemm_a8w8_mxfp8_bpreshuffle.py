@@ -306,8 +306,9 @@ def test_fused_splitk(block, kernel_name, m, n, k):
 
 
 # (kernelName, N, K, M list): compute kernels whose last group of N tiles is partial
-# (bounded_n; ps2 at nb2 / nb4 stores C per wave), clusters of 3 / 5 M tiles, and
-# generic tiles of 160 / 192 rows.
+# (bounded_n; ps2 at nb2 / nb4 stores C per wave), clusters of 3 / 5 M tiles, M below
+# the tile, A scale rows off a 16-byte boundary (M 77, 253, 301, 777), and generic
+# tiles of 160 / 192 rows.
 BOUNDED_CASES = (
     (
         "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn2",
@@ -325,19 +326,19 @@ BOUNDED_CASES = (
         "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm1_cn1_ps2",
         1152,
         1536,
-        (128, 300),
+        (77, 128, 300),
     ),
     (
         "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn4",
         2176,
         7168,
-        (256, 1000),
+        (100, 253, 256, 1000),
     ),
     (
         "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm3_cn1",
         2176,
         7168,
-        (300, 384),
+        (300, 301, 384),
     ),
     (
         "flydsl_mxfp8_128_bpreshuffle_wmma_t32x128x128_mw2_nw2_nb2_sk1_cm5_cn1",
@@ -444,8 +445,9 @@ def tuned_shapes():
 
 def test_untuned_fallback_pick():
     """The pick for a shape without a tuned row is unfused, unsplit, at most 256 wide, of
-    power-of-two geometry and fits the shape."""
+    power-of-two geometry, fits the shape and underfills no compute tile."""
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        is_compute_kernel,
         is_pow2_geometry,
         kernel_fits_shape,
     )
@@ -454,6 +456,7 @@ def test_untuned_fallback_pick():
     for m, n, k in (
         (1, 1536, 7168),
         (48, 6400, 7168),
+        (100, 7168, 8192),
         (333, 4096, 1536),
         (4097, 7168, 4224),
     ):
@@ -461,6 +464,7 @@ def test_untuned_fallback_pick():
         assert ki is not None and kernel_fits_shape(ki, m, n, k), (m, n, k)
         assert ki.split_k == 1 and not ki.fused_splitk and ki.tile_n <= 256, ki.name
         assert is_pow2_geometry(ki), ki.name
+        assert not (is_compute_kernel(ki) and m < ki.tile_m), ki.name
         # mx32 needs 32-aligned tiles and plain A; an odd M has no A-preshuffle pairing.
         k32 = pick(m, n, k, mx32=True)
         assert k32 is None or (not k32.a_preshuffle and k32.tile_n % 32 == 0), (m, n, k)
@@ -488,8 +492,14 @@ def test_tuner_catalog():
     m_cluster = kernel[prefix + "t16x64x256_mw1_nw4_nb4_sk4_cm2_cn1_fsk"]
     assert catalog.kernel_fits_shape(n_cluster, 1, 7168, 4224)
     assert not catalog.kernel_fits_shape(m_cluster, 16, 7168, 4224)
-    # A partial last group of N tiles fits a split_k=1 compute kernel for the tuner only.
     compute = prefix.replace("wmma", "compute_wmma")
+    # M below the tile fits a compute kernel that clusters no M rows.
+    under = kernel[compute + "t256x256x128_mw2_nw2_nb4_sk1_cm1_cn4"]
+    assert catalog.kernel_fits_shape(under, 100, 12288, 7168)
+    assert not catalog.kernel_fits_shape(
+        kernel[compute + "t256x256x128_mw2_nw2_nb4_sk1_cm2_cn4"], 100, 12288, 7168
+    )
+    # A partial last group of N tiles fits a split_k=1 compute kernel for the tuner only.
     tail = kernel[compute + "t256x256x128_mw2_nw2_nb4_sk1_cm4_cn4"]
     assert catalog.kernel_fits_shape(tail, 4096, 49408, 7168, n_tail=True)
     assert not catalog.kernel_fits_shape(tail, 4096, 49408, 7168)

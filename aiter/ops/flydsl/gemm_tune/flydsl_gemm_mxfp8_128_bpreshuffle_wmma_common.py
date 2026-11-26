@@ -388,10 +388,7 @@ def kernel_fits_shape(
             return False
         if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS_ALL:
             return False
-        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
-        # must not launch when M < tile_m (cluster barrier hang on decode M).
-        if M < ki.tile_m:
-            return False
+        # M below tile_m is one partial tile (M OOB), so it clusters no M rows.
         if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False
         if ki.persistent_n_tiles > 1 and ki.split_k != 1:
