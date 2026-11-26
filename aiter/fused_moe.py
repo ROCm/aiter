@@ -879,6 +879,8 @@ def _flydsl_moe_sorting_onewg(topk_ids, topk_weights, num_experts, block_size):
     if not (
         topk_ids.dtype == dtypes.i32
         and topk_weights.dtype == dtypes.fp32
+        and topk_ids.is_cuda
+        and topk_weights.device == topk_ids.device
         and topk_ids.is_contiguous()
         and topk_weights.is_contiguous()
         and onewg_supported(M, num_experts, topk, block_size)
