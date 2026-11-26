@@ -41,6 +41,22 @@ M31_PREFILL_CALL = {"impl": "v3", "tile_rows": 8}
 # head and for the MXFP8 output.
 V3_MIN_CTAS = 4096
 
+# A tensor DMA's row stride: a 48-bit count of (BF16) elements.
+_TDM_STRIDE_LIMIT = 1 << 48
+
+
+def _tdm_fold_order(key_cache, value_cache, key_scale, value_scale):
+    """v3's ``tdm_fold`` for these planes: per K/V pair (codes, scales) the
+    lower-addressed plane ("k"/"v"), or "-" (two DMAs) for a pair at distance
+    zero or past a stride. Host pointers only (no device sync); every plane is
+    16 B aligned, so the BF16 stride is exact."""
+    order = ""
+    for near, far in ((key_cache, value_cache), (key_scale, value_scale)):
+        gap = far.data_ptr() - near.data_ptr()
+        fits = gap != 0 and abs(gap) // 2 < _TDM_STRIDE_LIMIT
+        order += ("k" if gap > 0 else "v") if fits else "-"
+    return order
+
 
 def pa_sparse_prefill_nvfp4_supported(query, key_cache, table) -> bool:
     """Whether the reuse kernel serves these shapes (gfx1250, 16 query heads a
@@ -101,9 +117,11 @@ def pa_sparse_prefill_nvfp4(
     scales. One KV head.
 
     ``impl``: "v1", "v2" (``v2``: its compile options) or "v3" (the tile's rows
-    split over waves, ``tile_rows`` 4 or 8; ``v3``: its compile options and
-    ``min_ctas``, default ``V3_MIN_CTAS``). "v3" runs "v2" at ``tile_rows`` 2 on
-    one KV head, for the MXFP8 output and on grids under ``min_ctas`` v3 CTAs.
+    split over waves, ``tile_rows`` 4 or 8; ``v3``: its compile options,
+    ``min_ctas``, default ``V3_MIN_CTAS``, and ``tdm_fold``, default True: the
+    order of a K/V pair's planes is read off the pointers; False: no fold). "v3"
+    runs "v2" at ``tile_rows`` 2 on one KV head, for the MXFP8 output and on
+    grids under ``min_ctas`` v3 CTAs.
     """
     served = {"v2": TILE_ROWS_V2, "v3": TILE_ROWS_V3}.get(impl, TILE_ROWS)
     if tile_rows not in served:
@@ -192,6 +210,16 @@ def pa_sparse_prefill_nvfp4(
     ):
         impl, tile_rows, v2 = "v2", 2, None
     if impl == "v3":
+        # A phase-B quarter stages each K/V pair of planes (codes, scales) with
+        # one 2-D tensor DMA in the pointers' order (tdm_fold False: four DMAs).
+        fold = v3.get("tdm_fold", True)
+        if not isinstance(fold, bool):
+            raise ValueError("v3 tdm_fold must be a bool")
+        v3["tdm_fold"] = (
+            _tdm_fold_order(key_cache, value_cache, key_scale, value_scale)
+            if fold
+            else ""
+        )
         compiled = compile_pa_sparse_prefill_nvfp4_v3(
             tile_rows=tile_rows,
             softmax_scale=softmax_scale,

@@ -162,6 +162,10 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
     plan = plan_pa_decode(ctx, 1, max_partitions=1)
     args = (q, kp, vp, ks, vs, table, ctx, SCALE)
     kv = {"kv_heads": kv_heads}
+    # the same K/V planes in the other address order (v3 folds a K/V pair of
+    # planes into one 2-D tensor DMA, the lower-addressed plane leading)
+    vk, sk = torch.stack([vp, kp]), torch.stack([vs, ks])
+    args_rev = (q, vk[1], vk[0], sk[1], sk[0], table, ctx, SCALE)
     pa_args = (q, kp, vp, ctx, table, SCALE, 1)
     pa_kw = {"key_scale": ks, "value_scale": vs, "work_plan": plan}
     candidates = {  # pa_decode: the per-token path the reuse kernel replaces
@@ -178,6 +182,17 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
         # a CTA ring of 2: the B rings get their own LDS frames
         "reuse_v3_nb2": lambda o: reuse(
             o, *args, tile_rows=8, impl="v3", nvfp4_buffers=2, v3={"min_ctas": 0}, **kv
+        ),
+        "reuse_v3_kvrev": lambda o: reuse(
+            o, *args_rev, tile_rows=8, impl="v3", v3={"min_ctas": 0}, **kv
+        ),
+        "reuse_v3_nofold": lambda o: reuse(
+            o,
+            *args,
+            tile_rows=8,
+            impl="v3",
+            v3={"min_ctas": 0, "tdm_fold": False},
+            **kv,
         ),
     }
     ref, ret = run_torch(*host), {}

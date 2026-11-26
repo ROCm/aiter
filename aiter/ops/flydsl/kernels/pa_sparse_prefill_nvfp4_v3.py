@@ -22,8 +22,10 @@ goes to one of two phases, by how many waves select it:
   it computes only the 32-token quarters its rows reach, its PV operands read
   from the shared V (V_AHEAD blocks in flight).
 * phase B, the rest: each wave alone, over the 32-token quarters of its own
-  pages, through a wave-private ring of v2's quarter slots (v2's four DMAs a
-  quarter, no barrier, V dequantized by the wave). With room, the B rings take
+  pages, through a wave-private ring of v2's quarter slots (no barrier, V
+  dequantized by the wave). A quarter's K/V pair of planes (the codes, then
+  the scales) stages with one 2-D tensor DMA, its row stride the distance
+  between the two pointers (``tdm_fold``), or two. With room, the B rings take
   A ring frames the A walk has freed.
 
 Each wave walks a list of (page, quarter) items from LDS, A's in one loop and
@@ -50,6 +52,10 @@ from .pa_decode.op_lds import _gptr
 from .pa_sparse_prefill_nvfp4 import _bound_stride, _Lds
 from .pa_sparse_prefill_nvfp4_v2 import (
     _E4M3_ONE,
+    _PLANE_K,
+    _PLANE_KS,
+    _PLANE_V,
+    _PLANE_VS,
     _ROW,
     _SROW,
     _TOKENS,
@@ -76,7 +82,8 @@ from .utils import rcp_f32
 TILE_ROWS = (4, 8)
 QUARTERS = PAGE // _TOKENS
 # A ring frame: one page's planes, each over all 128 tokens (an A ring slot), or
-# four quarter slots of the B rings at the same plane offsets.
+# four quarter slots of the B rings (v2's slot layout: a quarter's K, V, K
+# scales and V scales back to back, so a K/V pair is one 2-D tensor DMA).
 A_SLOT = NWARP * WAVE_SLOT_BYTES
 A_PLANE_V = PAGE * _ROW
 A_PLANE_KS = 2 * PAGE * _ROW
@@ -136,11 +143,13 @@ def _layout_v3(tq, nb_a, nb_b):
     }
 
 
-def kernel_name(tq, share_min, nb_a, nb_b, waves_per_eu, dbg):
+def kernel_name(tq, share_min, nb_a, nb_b, waves_per_eu, dbg, tdm_fold=""):
     name = (
         f"pa_sparse_prefill_nvfp4_v3_d128_bs128_gqa16_top16_tq{tq}"
         f"_sm{share_min}_a{nb_a}b{nb_b}"
     )
+    if tdm_fold:
+        name += f"_tf{tdm_fold.replace('-', 'x')}"
     if dbg:
         name += f"_dbg{dbg}"
     if waves_per_eu:
@@ -158,6 +167,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     waves_per_eu=3,
     quant_mx=False,
     dbg=0,
+    tdm_fold="",
 ):
     """Compile (cached) the row-split reuse kernel; ``launch`` takes the same
     arguments as ``compile_pa_sparse_prefill_nvfp4``'s (the MXFP8 ones unused).
@@ -166,7 +176,11 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     select a page for the CTA ring (phase A); 1 runs every page there, 5 none.
     ``nvfp4_buffers`` / ``nb_b``: depth of the CTA ring / of each wave's quarter
     ring (``nb_b < nvfp4_buffers``: the B rings take A frames the A walk has
-    freed). ``waves_per_eu``: the occupancy hint (0: none).
+    freed). ``waves_per_eu``: the occupancy hint (0: none). ``tdm_fold``: per
+    K/V pair of a B quarter's planes (the codes, then the scales) "k" or "v",
+    the lower-addressed plane, which leads one 2-D tensor DMA and takes the
+    pair's first slot plane, or "-" (two DMAs); the wrapper reads it off the
+    pointers. "" (or "--"): four DMAs a quarter.
     """
     tq, nb_a, nb_b = int(tile_rows), int(nvfp4_buffers), int(nb_b)
     share_min, dbg = int(share_min), int(dbg)
@@ -178,8 +192,11 @@ def compile_pa_sparse_prefill_nvfp4_v3(
         raise ValueError("share_min must be 1 to 5")
     if quant_mx:
         raise ValueError("v3 stores BF16 only; the MXFP8 output runs on v2")
+    tdm_fold = "" if tdm_fold in ("", "--") else tdm_fold
+    if tdm_fold and (len(tdm_fold) != 2 or set(tdm_fold) - set("kv-")):
+        raise ValueError("tdm_fold must be two of 'k'/'v'/'-'")
     scale = float(softmax_scale)
-    key = (tq, nb_a, nb_b, share_min, scale, int(waves_per_eu), dbg)
+    key = (tq, nb_a, nb_b, share_min, scale, int(waves_per_eu), dbg, tdm_fold)
     if key in _CACHE:
         return _CACHE[key]
     lay = _layout_v3(tq, nb_a, nb_b)
@@ -188,6 +205,14 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     ub = _bound_stride(tq)
     per_wave = lay["per_wave"]
     assert entries <= THREADS and lay["total"] <= 327680
+    # A folded pair's second plane lands one packed row after its first.
+    assert _PLANE_V - _PLANE_K == _TOKENS * _ROW
+    assert _PLANE_VS - _PLANE_KS == _TOKENS * _SROW
+    # B slot plane offsets: a folded pair's lower-addressed plane takes the
+    # pair's first plane.
+    fold = tdm_fold or "--"
+    b_k, b_v = (_PLANE_V, _PLANE_K) if fold[0] == "v" else (_PLANE_K, _PLANE_V)
+    b_ks, b_vs = (_PLANE_VS, _PLANE_KS) if fold[1] == "v" else (_PLANE_KS, _PLANE_VS)
     # A name, not lay["total"]: linters read a string in an annotation as a
     # forward reference.
     lds_words = lay["total"] // 4
@@ -199,7 +224,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     unit = scale * LOG2E
 
     @flyc.kernel(
-        name=kernel_name(tq, share_min, nb_a, nb_b, waves_per_eu, dbg),
+        name=kernel_name(tq, share_min, nb_a, nb_b, waves_per_eu, dbg, tdm_fold),
         known_block_size=(THREADS, 1, 1),
     )
     def kernel(
@@ -468,14 +493,36 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             n_items = fx.Int32(0) * n_items
 
         def planes(info):
-            """LDS offsets of an item's K, V, K-scale and V-scale rows."""
+            """LDS offsets of an A item's K, V, K-scale and V-scale rows."""
             frame = ((info >> _FRAME_SHIFT) & 7) * A_SLOT
             slot = (info >> _SLOT_SHIFT) & (QUARTERS - 1)
             p_k = frame + slot * (_TOKENS * _ROW)
             p_ks = frame + A_PLANE_KS + slot * (_TOKENS * _SROW)
             return p_k, p_k + A_PLANE_V, p_ks, p_ks + PAGE * _SROW
 
+        def b_base(info):
+            """LDS offset of a B item's quarter slot."""
+            frame = ((info >> _FRAME_SHIFT) & 7) * A_SLOT
+            return frame + ((info >> _SLOT_SHIFT) & (QUARTERS - 1)) * WAVE_SLOT_BYTES
+
+        def planes_b(info):
+            """LDS offsets of a B item's K, V, K-scale and V-scale rows."""
+            base = b_base(info)
+            return base + b_k, base + b_v, base + b_ks, base + b_vs
+
         # ---- page DMA ----
+        # A page of a scale plane in BF16 elements (the DMA's unit). The wrapper
+        # keeps the stride a multiple of 16 B, so halving it first is exact and
+        # spares the page DMAs a 64-bit signed division.
+        scale_page = fx.Int64(sk_block >> 1)
+        # A folded pair's lower-addressed plane leads its 2-D DMA: (leading
+        # pointer, row stride in BF16 elements), once a CTA in SALU.
+        pairs = []
+        for lead, pair in zip(fold, ((key, value), (ks, vs))):
+            near, far = pair[::-1] if lead == "v" else pair
+            gap = fx.Int64(fx.ptrtoint(far)) - fx.Int64(fx.ptrtoint(near))
+            pairs.append((near, far, gap >> 1))
+
         def stage_a(i):
             """Wave w DMAs plane w of A page ``i`` (tokens past the page's
             largest bound zero-filled)."""
@@ -493,7 +540,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 src = (
                     fx.Int64(page) * (PAGE * _ROW // 2)
                     if row == _ROW
-                    else fx.Int64(page) * fx.Int64(sk_block) // 2
+                    else fx.Int64(page) * scale_page
                 )
                 if warp == w:
                     tdm(
@@ -508,44 +555,51 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                     )
 
         def stage_b(page, info):
-            """This wave's four DMAs of B item (page, info) into its quarter
-            slot (v2's ``stage`` with the item's quarter for the wave's)."""
+            """This wave's DMAs of B item (page, info) into its quarter slot
+            (v2's ``stage`` with the item's quarter for the wave's): per K/V
+            pair of planes one 2-D DMA when folded, else two."""
             quarter = (info >> _Q_SHIFT) & (QUARTERS - 1)
             top = info & 0xFF
             for r in range_constexpr(1, rpw):
                 top = fx.max(top, (info >> (8 * r)) & 0xFF)
-            valid = fx.max(
-                fx.Int32(0), fx.min(fx.Int32(_TOKENS), top - quarter * _TOKENS)
-            )
-            p_k, p_v, p_ks, p_vs = planes(info)
+            # The quarter's tokens to fetch (the rest zero-fill). No upper clamp:
+            # an extent past the tile reads the same tile, and a min/max pair of
+            # this uniform value becomes v_med3_i32 (no SALU form), which drags
+            # every descriptor word through VGPRs and back with v_readfirstlane.
+            valid = fx.max(fx.Int32(0), top - quarter * _TOKENS)
+            base = b_base(info)
             payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(
                 quarter * (_TOKENS * _ROW // 2)
             )
-            scales = fx.Int64(page) * fx.Int64(sk_block) // 2 + fx.Int64(
+            scales = fx.Int64(page) * scale_page + fx.Int64(
                 quarter * (_TOKENS * _SROW // 2)
             )
-            for ptr, at in ((key, p_k), (value, p_v)):
-                tdm(
-                    _gptr(ptr, fx.BFloat16, 16),
-                    payload,
-                    at,
-                    (_TOKENS * _ROW // 2,),
-                    (1,),
-                    (valid * (_ROW // 2),),
-                    8,
-                    8,
-                )
-            for ptr, at in ((ks, p_ks), (vs, p_vs)):
-                tdm(
-                    _gptr(ptr, fx.BFloat16, 16),
-                    scales,
-                    at,
-                    (_TOKENS * _SROW // 2,),
-                    (1,),
-                    (valid * (_SROW // 2),),
-                    8,
-                    8,
-                )
+            for (near, far, stride), lead, plane, row, src in zip(
+                pairs, fold, (_PLANE_K, _PLANE_KS), (_ROW, _SROW), (payload, scales)
+            ):
+                if const_expr(lead == "-"):
+                    for ptr, at in ((near, plane), (far, plane + _TOKENS * row)):
+                        tdm(
+                            _gptr(ptr, fx.BFloat16, 16),
+                            src,
+                            base + at,
+                            (_TOKENS * row // 2,),
+                            (1,),
+                            (valid * (row // 2),),
+                            8,
+                            8,
+                        )
+                else:
+                    tdm(
+                        _gptr(near, fx.BFloat16, 16),
+                        src,
+                        base + plane,
+                        (2, _TOKENS * row // 2),
+                        (stride, 1),
+                        (None, valid * (row // 2)),
+                        8,
+                        8,
+                    )
 
         def stage_b_head():
             for ahead in range_constexpr(nb_b - 1):
@@ -699,7 +753,10 @@ def compile_pa_sparse_prefill_nvfp4_v3(
         def run_item(grp, info, k, shared):
             """The rows of this wave that reach item (info)'s quarter."""
             quarter = (info >> _Q_SHIFT) & (QUARTERS - 1)
-            p_k, p_v, p_ks, p_vs = planes(info)
+            if const_expr(shared):
+                p_k, p_v, p_ks, p_vs = planes(info)
+            else:
+                p_k, p_v, p_ks, p_vs = planes_b(info)
             bounds = [(info >> (8 * r)) & 0xFF for r in range_constexpr(rpw)]
             lo = quarter * _TOKENS
             k_tiles = [
