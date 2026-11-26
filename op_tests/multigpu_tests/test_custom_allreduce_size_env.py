@@ -193,29 +193,38 @@ def test_gfx1250_plain_ar_default_only_when_env_unset():
     assert plain_max(ws=8, max_size=4 * MiB) == 4 * MiB
 
 
-def test_gfx1250_plain_ar_gate():
-    def u8(n):
-        return torch.empty(n, dtype=torch.uint8)
+def bf16(nbytes):
+    return torch.empty(nbytes // 2, dtype=torch.bfloat16)
 
+
+def test_gfx1250_plain_ar_gate():
     for ws, cut in ((2, 4 * MiB), (4, 4 * MiB), (8, 8 * MiB)):
         ca = _stub(ws=ws)
-        assert ca.should_custom_plain_ar(u8(cut)), ws
-        assert not ca.should_custom_plain_ar(u8(cut + 16)), ws
+        assert ca.should_custom_plain_ar(bf16(cut)), ws
+        assert not ca.should_custom_plain_ar(bf16(cut + 16)), ws
         # The fused paths keep should_custom_ar and its 64 MiB default.
-        assert ca.should_custom_ar(u8(cut + 16)) and ca.should_custom_ar(u8(64 * MiB))
+        assert ca.should_custom_ar(bf16(cut + 16))
+        assert ca.should_custom_ar(bf16(64 * MiB))
         ca = _stub(ws=ws, AR_MAX=64 * MiB)
-        assert ca.should_custom_plain_ar(u8(64 * MiB)), ws
+        assert ca.should_custom_plain_ar(bf16(64 * MiB)), ws
     ca = _stub(ws=6)
-    assert ca.should_custom_plain_ar(u8(64 * MiB))
+    assert ca.should_custom_plain_ar(bf16(64 * MiB))
+
+
+def test_ar_gate_rejects_non_float():
+    # vLLM all-reduces FP8 rows as raw int8 bytes; the kernels would raise.
+    ca = _stub()
+    for dtype in (torch.int8, torch.uint8, torch.int32):
+        assert not ca.should_custom_ar(torch.empty(4096, dtype=dtype)), dtype
+        assert not ca.should_custom_plain_ar(torch.empty(4096, dtype=dtype)), dtype
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        assert ca.should_custom_ar(torch.empty(4096, dtype=dtype)), dtype
 
 
 def test_gfx1250_plain_ar_gate_lamport():
     # Above the plain all-reduce cutoff, fp16/bf16 inputs the Lamport
     # all-reduce takes (up to world_size x its cap) stay on the custom path;
     # everything else still goes to RCCL there.
-    def bf16(n):
-        return torch.empty(n // 2, dtype=torch.bfloat16)
-
     for ws, cap in ((2, 16 * MiB), (4, 8 * MiB)):
         ca = _stub(ws=ws, lamport_max_bytes=cap)
         cut = ca._plain_ar_max_size
@@ -264,20 +273,16 @@ def _t(nbytes):
 
 def test_gates_use_their_own_cutoff():
     ca = _stub(AR_MAX=32 * MiB, AG_MAX=16 * MiB, RS_MAX=128 * MiB)
-
-    def u8(n):
-        return torch.empty(n, dtype=torch.uint8)
-
-    assert ca.should_custom_ar(u8(32 * MiB))
-    assert not ca.should_custom_ar(u8(32 * MiB + 16))
-    assert ca.should_custom_rs(u8(128 * MiB), 0)
-    assert not ca.should_custom_rs(u8(128 * MiB + 64), 0)
-    assert ca.should_custom_ag(u8(16 * MiB))
-    assert not ca.should_custom_ag(u8(16 * MiB + 16))
+    assert ca.should_custom_ar(bf16(32 * MiB))
+    assert not ca.should_custom_ar(bf16(32 * MiB + 16))
+    assert ca.should_custom_rs(bf16(128 * MiB), 0)
+    assert not ca.should_custom_rs(bf16(128 * MiB + 64), 0)
+    assert ca.should_custom_ag(bf16(16 * MiB))
+    assert not ca.should_custom_ag(bf16(16 * MiB + 16))
 
 
 def test_zero_disables_only_that_op():
-    small = torch.empty(4 * MiB, dtype=torch.uint8)
+    small = bf16(4 * MiB)
     ca = _stub(AR_MAX=0)
     assert not ca.should_custom_ar(small)
     assert ca.should_custom_rs(small, 0) and ca.should_custom_ag(small)
@@ -290,7 +295,7 @@ def test_zero_disables_only_that_op():
 
 
 def test_ar_min_applies_to_ar_only():
-    small = torch.empty(1 * MiB, dtype=torch.uint8)
+    small = bf16(1 * MiB)
     ca = _stub(min_size=2 * MiB)
     assert not ca.should_custom_ar(small)
     assert ca.should_custom_rs(small, 0) and ca.should_custom_ag(small)

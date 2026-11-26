@@ -2365,8 +2365,11 @@ class CustomAllreduce:
         return self._fly_window.contains(nbytes)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
-        return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
-            inp
+        # The all-reduce kernels raise on any other dtype.
+        return (
+            inp.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and self._fits_custom_ar_size(inp, prefill_support)
+            and is_weak_contiguous(inp)
         )
 
     def should_custom_plain_ar(
