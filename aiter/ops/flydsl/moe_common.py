@@ -13,6 +13,76 @@ DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
 
+#: ``(model_dim, inter_dim)`` gate/up widths whose interleaved a8w4 prefill
+#: launches the wide-tile, XCD-grouping and CShuffle-budget rules were measured
+#: on (DeepSeek-V4.1-Flash and DeepSeek-V4-Pro on MI355X).  Other widths keep
+#: the stock launch and the stock CShuffle budget: the token boundaries are
+#: tuning results, not arithmetic, so they are not extrapolated to models the
+#: evidence did not time.
+FLYDSL_PREFILL_SHAPES = frozenset(
+    {
+        (5120, 384),
+        (5120, 640),
+        (5120, 1152),
+        (7168, 384),
+    }
+)
+
+#: Architectures the rules were measured on.  Other archs (gfx942, gfx1250)
+#: keep the stock launch and the stock CShuffle budget until timed.
+FLYDSL_PREFILL_ARCHS = frozenset({"gfx950"})
+
+
+def flydsl_stage1_measured_prefill(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    act: str,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    k_batch: int,
+    gate_up_interleave: bool,
+    tile_m: int,
+    inter_dim_pad: int,
+    model_dim_pad: int,
+    gpu_arch: str,
+    has_bias: bool = False,
+    has_sorted_weights: bool = False,
+) -> bool:
+    """Whether this call is one of the interleaved a8w4 prefill shapes measured
+    for the wide-tile, XCD-grouping and CShuffle-budget rules.  Keep this in one
+    place so the three rules cannot drift apart; every other call keeps the
+    stock launch and the stock LDS budget.  The rules are MI355X/gfx950
+    measurements; gfx942/gfx1250 are not extrapolated.
+
+    The predicate names exactly the dimensions the timing evidence covers:
+    the four measured ``(model_dim, inter_dim)`` pairs at E 384/385, topk 6/7,
+    a 64/128-row sorted block, and the bf16 or fp8 epilogue.  Other experts,
+    topk, block sizes, epilogues and widths keep the stock launch and the stock
+    LDS budget until they are timed."""
+    out_s = str(out_dtype).strip().lower()
+    return (
+        bool(gate_up_interleave)
+        and a_dtype == "fp8"
+        and b_dtype == "fp4"
+        and out_s in ("bf16", "bfloat16", "fp8")
+        and int(k_batch) == 1
+        and int(topk) in (6, 7)
+        and str(act) == "silu"
+        and int(experts) in (384, 385)
+        and int(tile_m) in (64, 128)
+        and (int(model_dim), int(inter_dim)) in FLYDSL_PREFILL_SHAPES
+        and int(model_dim_pad) == 0
+        and int(inter_dim_pad) == 0
+        and str(gpu_arch) in FLYDSL_PREFILL_ARCHS
+        and not has_bias
+        and not has_sorted_weights
+    )
+
+
 def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
