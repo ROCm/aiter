@@ -269,41 +269,49 @@ def _pad_to(x, dim, mult):
     return F.pad(x, widths)
 
 
-def _rows_triton(x2, dequant=None):
+def _rows_triton(x2, dequant=None, round_bf16=False):
     """TE-mode Triton cast of a 2-D tensor (any strides) along its last dim.
 
     Returns ``(y, scale)`` sliced from the kernel's 64x64-padded outputs:
     ``y`` fp8, or the dequantized values in ``dequant``; ``scale`` uint8 with
-    one column per (zero-padded) block of 32.
+    one column per (zero-padded) block of 32. ``round_bf16`` quantizes the
+    bf16 rounding of an fp32 ``x2``.
     """
     from aiter.ops.triton.quant.quant_mxfp8 import convert_to_mxfp8
 
     rows, n = x2.shape
     xp = _pad_to(_pad_to(x2, 0, 64), 1, 64)
     y, s = convert_to_mxfp8(
-        xp, torch.float8_e4m3fn, scale_mode="te", dequant_dtype=dequant
+        xp,
+        torch.float8_e4m3fn,
+        scale_mode="te",
+        dequant_dtype=dequant,
+        round_input_bf16=round_bf16 and xp.dtype == torch.float32,
     )
     return y[:rows, :n], s[:rows, : -(-n // MXFP8_BLOCK)]
 
 
-def _qdq_triton(x, dim, dtype):
+def _qdq_triton(x, dim, dtype, round_bf16=False):
     """One-pass Triton ``mxfp8_qdq`` of a 2-D tensor, in the memory layout the
     plain path produces (row-major along ``dim``, rows of the length padded to
     32), so a GEMM on it sees the same operand."""
     xt = x.movedim(dim, -1)
     n = xt.shape[-1]
     n32 = -(-n // MXFP8_BLOCK) * MXFP8_BLOCK
-    y, _ = _rows_triton(_pad_to(xt, 1, MXFP8_BLOCK), dequant=dtype)
+    y, _ = _rows_triton(
+        _pad_to(xt, 1, MXFP8_BLOCK), dequant=dtype, round_bf16=round_bf16
+    )
     if y.stride(0) != n32:
         y = y.contiguous()
     return y[:, :n].movedim(-1, dim)
 
 
-def mxfp8_qdq(x, dim=-1, dtype=torch.float32):
+def mxfp8_qdq(x, dim=-1, dtype=torch.float32, round_bf16=False):
     """``x`` quantized to MXFP8 along ``dim`` and dequantized (in ``dtype``).
 
     A ragged ``dim`` is zero-padded to a multiple of 32 for the quantization
     and cut back: the zeros leave the last block's amax unchanged.
+    ``round_bf16`` quantizes ``x.bfloat16()`` (in-kernel on the fast path).
     """
     if (
         mxfp8_fastpath()
@@ -313,11 +321,13 @@ def mxfp8_qdq(x, dim=-1, dtype=torch.float32):
         and x.dtype in (torch.float32, torch.bfloat16)
     ):
         try:
-            out = _qdq_triton(x, dim, dtype)
+            out = _qdq_triton(x, dim, dtype, round_bf16)
             LAST_IMPLS["qdq:triton_te"] += 1
             return out
         except _TRITON_ERRORS as err:
             LAST_IMPLS[f"qdq:torch({type(err).__name__})"] += 1
+    if round_bf16:
+        x = x.to(torch.bfloat16)
     n = x.shape[dim]
     xp = _pad_to(x, dim, MXFP8_BLOCK)
     out = mxfp8_dequantize(*mxfp8_quantize(xp, dim), dim=dim, dtype=dtype)
@@ -340,21 +350,24 @@ def _mm_f32(a, b):
     return a.float() @ b.float()
 
 
-def _quant_rows(x2):
+def _quant_rows(x2, round_bf16=False):
     """(fp8, scale) of a 2-D tensor along its last dim, contiguous. The fast
-    path reads strided views (no transpose copy); the values are the same."""
+    path reads strided views (no transpose copy); the values are the same.
+    ``round_bf16``: quantize ``x2.bfloat16()``."""
     if mxfp8_fastpath() and x2.is_cuda and x2.dtype in (torch.float32, torch.bfloat16):
         try:
-            q, s = _rows_triton(x2)
+            q, s = _rows_triton(x2, round_bf16=round_bf16)
             LAST_IMPLS["quant:triton_te"] += 1
             return q.contiguous(), s.contiguous()
         except _TRITON_ERRORS as err:
             LAST_IMPLS[f"quant:torch({type(err).__name__})"] += 1
+    if round_bf16:
+        x2 = x2.to(torch.bfloat16)
     q, s = mxfp8_quantize(x2.contiguous(), -1)
     return q, s.contiguous()
 
 
-def _native_mm(a, b, anchors=None):
+def _native_mm(a, b, anchors=None, round_bf16=False):
     """aiter FP8 MFMA GEMM (1x32 E8M0 scales, bf16 out) on ``a [M, K] @ b [K, N]``.
 
     K is padded to 128 and N to 16 with zeros, which leaves every block's scale
@@ -373,16 +386,16 @@ def _native_mm(a, b, anchors=None):
     M, N = a.shape[0], b.shape[1]
 
     def quant_a():
-        aq, a_s = _quant_rows(_pad_to(a, 1, 128))
+        aq, a_s = _quant_rows(_pad_to(a, 1, 128), round_bf16)
         return aq.view(dtypes.fp8), a_s.view(dtypes.fp8_e8m0)
 
     def quant_b():
-        bq, b_s = _quant_rows(_pad_to(_pad_to(b.t(), 1, 128), 0, 16))
+        bq, b_s = _quant_rows(_pad_to(_pad_to(b.t(), 1, 128), 0, 16), round_bf16)
         bq = shuffle_weight(bq.view(dtypes.fp8), layout=(16, 16))
         return bq, b_s.view(dtypes.fp8_e8m0)
 
-    aq, a_s = _cached(ta, (xa, "native_a"), quant_a)
-    bq, b_s = _cached(tb, (xb, "native_b"), quant_b, weight=b_weight)
+    aq, a_s = _cached(ta, (xa, "native_a", round_bf16), quant_a)
+    bq, b_s = _cached(tb, (xb, "native_b", round_bf16), quant_b, weight=b_weight)
     out = gemm_a8w8_mxfp8_bpreshuffle(aq, bq, a_s, b_s, dtypes.bf16)
     return out[:M, :N]
 
@@ -397,7 +410,7 @@ _NATIVE_ERRORS = (
 _HIPB_READY = False
 
 
-def _hipb_mm_fp32(a, b):
+def _hipb_mm_fp32(a, b, round_bf16=False):
     """``a [M, K] @ b [K, N]`` on hipBLASLt with 1x32 E8M0 scales on both
     operands along K (VEC32_UE8M0) and an fp32 output. K is padded to 128 and
     M, N to 32 with zeros (no block's scale or the product changes)."""
@@ -412,8 +425,8 @@ def _hipb_mm_fp32(a, b):
     M, N = a.shape[0], b.shape[1]
     a = _pad_to(_pad_to(a, 1, 128), 0, MXFP8_BLOCK)
     bt = _pad_to(_pad_to(b.t(), 1, 128), 0, MXFP8_BLOCK)
-    aq, a_s = (t.contiguous() for t in _rows_triton(a))
-    bq, b_s = (t.contiguous() for t in _rows_triton(bt))
+    aq, a_s = (t.contiguous() for t in _rows_triton(a, round_bf16=round_bf16))
+    bq, b_s = (t.contiguous() for t in _rows_triton(bt, round_bf16=round_bf16))
     out = aiter.hipb_mm(
         aq.view(dtypes.fp8),
         bq.view(dtypes.fp8).t(),
@@ -427,7 +440,7 @@ def _hipb_mm_fp32(a, b):
     return out[:M, :N]
 
 
-def mxfp8_mm(a, b, out16=False, impl=None, anchors=None):
+def mxfp8_mm(a, b, out16=False, impl=None, anchors=None, round_to=None):
     """``a @ b`` (2-D) as an MXFP8 GEMM: ``a`` quantized along its columns and
     ``b`` along its rows, in blocks of 32 of the shared K axis.
 
@@ -439,34 +452,51 @@ def mxfp8_mm(a, b, out16=False, impl=None, anchors=None):
     overrides ``mxfp8_gemm_impl()``. ``anchors`` = (tensor_a, axis_a,
     tensor_b, axis_b, b_is_weight): the tensors ``a`` / ``b`` are views of and
     the axis their blocks run along, for the quantized-operand cache (None for
-    either tensor: not cached).
+    either tensor: not cached). ``round_to`` (e.g. bf16): the operands are
+    rounded to it first, as ``a.to(round_to)``; the fast path does it inside the
+    quantization kernels instead of materializing the copies.
     """
     impl = impl or mxfp8_gemm_impl()
-    bf16 = a.dtype == b.dtype == torch.bfloat16
-    od = a.dtype if out16 and a.dtype in (torch.bfloat16, torch.float16) else None
+    in_kernel = (
+        round_to == torch.bfloat16
+        and mxfp8_fastpath()
+        and a.is_cuda
+        and impl != "emulate"
+    )
+    if round_to is not None and not in_kernel:
+        a, b = a.to(round_to), b.to(round_to)
+    da = torch.bfloat16 if in_kernel else a.dtype
+    db = torch.bfloat16 if in_kernel else b.dtype
+    bf16 = da == db == torch.bfloat16
+    od = da if out16 and da in (torch.bfloat16, torch.float16) else None
     if impl != "emulate" and not (a.is_cuda and bf16):
         impl = "emulate"
     a, b = _pad_to(a, 1, MXFP8_BLOCK), _pad_to(b, 0, MXFP8_BLOCK)
     if impl == "auto" and od is not None:
         try:
-            out = _native_mm(a, b, anchors)
+            out = _native_mm(a, b, anchors, in_kernel)
             LAST_IMPLS["native"] += 1
             return out
         except _NATIVE_ERRORS as err:
             LAST_IMPLS[f"native_skipped:{type(err).__name__}"] += 1
     if impl == "auto" and od is None and mxfp8_wgrad_impl() == "hipblaslt":
         try:
-            out = _hipb_mm_fp32(a, b)
+            out = _hipb_mm_fp32(a, b, in_kernel)
             LAST_IMPLS["hipblaslt_fp32"] += 1
             return out
         except _NATIVE_ERRORS as err:
             LAST_IMPLS[f"hipblaslt_skipped:{type(err).__name__}"] += 1
     impl = "emulate" if impl == "emulate" else "qdq"
     LAST_IMPLS[impl] += 1
-    dt = mxfp8_qdq_dtype(a.dtype) if impl == "qdq" else torch.float32
+    dt = mxfp8_qdq_dtype(da) if impl == "qdq" else torch.float32
     ta, xa, tb, xb, b_weight = anchors or (None,) * 5
-    aq = _cached(ta, (xa, "qdq", dt), lambda: mxfp8_qdq(a, 1, dt))
-    bq = _cached(tb, (xb, "qdq", dt), lambda: mxfp8_qdq(b, 0, dt), weight=b_weight)
+    aq = _cached(ta, (xa, "qdq", dt, in_kernel), lambda: mxfp8_qdq(a, 1, dt, in_kernel))
+    bq = _cached(
+        tb,
+        (xb, "qdq", dt, in_kernel),
+        lambda: mxfp8_qdq(b, 0, dt, in_kernel),
+        weight=b_weight,
+    )
     out = _mm_f32(aq, bq)
     return out if od is None else out.to(od)
 

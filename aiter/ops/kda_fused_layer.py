@@ -788,7 +788,10 @@ def register_proj_gemm(fn: ProjGemmHook | None):
     concatenated projection and the epilogue-fused ones (see ``_proj_gemm`` for
     the operand convention). It returns the fp32 result, or ``NotImplemented``
     to leave that call to the default path; a hook that only transforms the
-    operands can finish with ``_proj_gemm_default``. ``None`` uninstalls it.
+    operands can finish with ``_proj_gemm_default``. Call sites that only add
+    the result to an fp32 tensor or feed it to another projection pass
+    ``out16_ok=True``; the hook may then return the 16-bit result whose values
+    it would otherwise widen to fp32. ``None`` uninstalls it.
     ``kda_layer_fwd(..., gemm_precision="mxfp8")`` installs ``MXFP8ProjGemm``
     for the duration of the call.
     """
@@ -796,7 +799,9 @@ def register_proj_gemm(fn: ProjGemmHook | None):
     _proj_gemm_hook = fn
 
 
-def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
+def _proj_gemm(
+    a, w, kind, cd, epilogue=None, ops=None, name=None, out16_ok=False, **epi
+):
     """The single entry point for every projection GEMM of the fused path.
 
     kind  "fwd":   a [M, K] @ w[N, K]^T   (w a weight)
@@ -809,6 +814,8 @@ def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
     w_o, ...) for an installed hook.
     """
     if _proj_gemm_hook is not None:
+        if out16_ok:
+            epi["out16_ok"] = True
         out = _proj_gemm_hook(
             a, w, kind=kind, cd=cd, epilogue=epilogue, name=name, ops=ops, **epi
         )
@@ -894,26 +901,35 @@ class MXFP8ProjGemm:
     def __init__(self, cd):
         self.cd = cd
 
-    def gemm(self, a, w, kind):
-        from aiter.ops.mxfp8_linear import mxfp8_mm
+    def gemm(self, a, w, kind, out16_ok=False):
+        """The MXFP8 product; fp32, or with ``out16_ok`` (and the fast path) the
+        bf16 fprop / dgrad result itself, whose values are the same."""
+        from aiter.ops.mxfp8_linear import mxfp8_fastpath, mxfp8_mm
 
         # quantized-operand cache: the layer input X is reused, rowwise by every
         # fprop and columnwise by every wgrad; weights only when asked to
         # (AITER_MXFP8_WEIGHT_CACHE=1 keeps one fp8 copy per weight and layout)
         weights = os.environ.get("AITER_MXFP8_WEIGHT_CACHE", "0") == "1"
+        wa = _weight_anchor(w) if weights and kind != "wgrad" else None
         anchors = {
-            "fwd": (a, 1, w if weights else None, 1, True),
-            "dgrad": (None, 1, w if weights else None, 0, True),
+            "fwd": (a, 1, wa, 1, True),
+            "dgrad": (None, 1, wa, 0, True),
             "wgrad": (None, 0, w, 0, False),
         }[kind]
-        a, w = a.to(self.cd), w.to(self.cd)
+        # bf16 rounding of fp32 operands happens inside the quantization
+        round_to = self.cd if self.cd == torch.bfloat16 else None
+        if round_to is None:
+            a, w = a.to(self.cd), w.to(self.cd)
         lhs = a.t() if kind == "wgrad" else a
         rhs = w.t() if kind == "fwd" else w
-        return mxfp8_mm(lhs, rhs, out16=kind != "wgrad", anchors=anchors).float()
+        out16 = kind != "wgrad"
+        out = mxfp8_mm(lhs, rhs, out16=out16, anchors=anchors, round_to=round_to)
+        return out if out16 and out16_ok and mxfp8_fastpath() else out.float()
 
     def __call__(self, a, w, *, kind, cd, epilogue=None, name=None, ops=None, **epi):
+        out16_ok = epi.pop("out16_ok", False)
         if epilogue is None:
-            return self.gemm(a, w, kind)
+            return self.gemm(a, w, kind, out16_ok)
         if _fusion_on("mxfp8_epilogue"):
             return self._fused_epilogue(a, w, kind, epilogue, ops, epi)
         raw = self.gemm(a, w, kind)
@@ -1196,6 +1212,21 @@ def cached_weight_cat(srcs, dtype):
     return cat
 
 
+def _weight_anchor(t):
+    """The ``cached_weight_cat`` tensor ``t`` aliases (under grad mode the cat
+    comes back as a new alias of the cached tensor), else ``t``: a stable
+    identity for caches keyed by weight tensors."""
+    for _, cat in _WEIGHT_CAT_CACHE.values():
+        if (
+            cat.data_ptr() == t.data_ptr()
+            and cat.shape == t.shape
+            and cat.stride() == t.stride()
+            and cat.dtype == t.dtype
+        ):
+            return cat
+    return t
+
+
 def _kda_layer_fused_fwd(
     x,
     w,
@@ -1251,7 +1282,7 @@ def _kda_layer_fused_fwd(
     if side:
         lr = side[0].contiguous()
     else:
-        lr = _rb(_proj_gemm(xc, w.f_a, "fwd", cd, name="f_a"))
+        lr = _rb(_proj_gemm(xc, w.f_a, "fwd", cd, name="f_a", out16_ok=True))
     raw_g = None
     if megatron:
         # bf16 raw_g, then the gate in fp32 (no GEMM epilogue)
@@ -1550,8 +1581,9 @@ def _kda_layer_fused_bwd(
     d_fb = _proj_gemm(dz, lr, "wgrad", torch.float32, name="f_b")
     dlr = _proj_gemm(dz, w.f_b, "dgrad", torch.float32, name="f_b")
     d_fa = _proj_gemm(dlr, xc, "wgrad", cd, name="f_a")
-    dx = dx + _proj_gemm(dlr, w.f_a, "dgrad", cd, name="f_a")
-    dx = dx + _proj_gemm(db, w.w_beta, "dgrad", cd, name="w_beta")
+    # dx is fp32: adding a 16-bit dgrad promotes exactly
+    dx = dx + _proj_gemm(dlr, w.f_a, "dgrad", cd, name="f_a", out16_ok=True)
+    dx = dx + _proj_gemm(db, w.w_beta, "dgrad", cd, name="w_beta", out16_ok=True)
     d_wbeta = _proj_gemm(db, xc, "wgrad", cd, name="w_beta")
 
     if "qk_l2norm" not in fuses:
@@ -1567,7 +1599,7 @@ def _kda_layer_fused_bwd(
         )
     da = da.reshape(B * T, -1)
     d_wqkv = _proj_gemm(da, xc, "wgrad", cd, name="qkv")
-    dx = dx + _proj_gemm(da, s["w_qkv"], "dgrad", cd, name="qkv")
+    dx = dx + _proj_gemm(da, s["w_qkv"], "dgrad", cd, name="qkv", out16_ok=True)
 
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
     dwq, dwk, dwv = d_wqkv.split([hk, hk, hv])

@@ -30,6 +30,7 @@ def convert_to_mxfp8(
     block_n: int = 64,
     scale_mode: str = "torchao",
     dequant_dtype: torch.dtype | None = None,
+    round_input_bf16: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MXFP8 format.
@@ -55,6 +56,9 @@ def convert_to_mxfp8(
             values ``fp8 * 2^(s-127)`` in this dtype (e.g. bfloat16, which holds
             them exactly) instead of the fp8 data, in one pass. ``x`` may be a
             strided view (e.g. a transpose) in every mode.
+        round_input_bf16: quantize the round-to-nearest-even bf16 value of each
+            fp32 input element, bit-identical to quantizing ``x.bfloat16()``
+            without materializing it.
 
     Returns:
         Tuple of (quantized_tensor, scales) where quantized_tensor has fp8_dtype
@@ -83,6 +87,8 @@ def convert_to_mxfp8(
         te_scale and fp8_dtype == torch.float8_e4m3fn
     ):
         raise ValueError("dequant_dtype needs scale_mode='te' and float8_e4m3fn")
+    if round_input_bf16 and x.dtype != torch.float32:
+        raise ValueError("round_input_bf16 needs an fp32 input")
     if te_scale and (use_asm or use_sr):
         raise ValueError("scale_mode='te' supports neither use_asm nor use_sr")
     # The ASM path (v_cvt_scalef32_*) is gfx950-only and _pack_fp8 only accepts
@@ -144,6 +150,7 @@ def convert_to_mxfp8(
         USE_ASM=use_asm,
         TE_SCALE=te_scale,
         DEQUANT_OUT=dequant_dtype is not None,
+        ROUND_BF16=round_input_bf16,
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,

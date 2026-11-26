@@ -37,6 +37,7 @@ _convert_to_mxfp8_kernel_repr = make_kernel_repr(
         "USE_ASM",
         "TE_SCALE",
         "DEQUANT_OUT",
+        "ROUND_BF16",
     ],
 )
 _convert_from_mxfp8_kernel_repr = make_kernel_repr(
@@ -430,6 +431,7 @@ def _convert_to_mxfp8_kernel(
     USE_ASM: tl.constexpr,
     TE_SCALE: tl.constexpr = False,
     DEQUANT_OUT: tl.constexpr = False,
+    ROUND_BF16: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -460,6 +462,9 @@ def _convert_to_mxfp8_kernel(
     tl.static_assert(float8_dtype == tl.float8e4nv or float8_dtype == tl.float8e5)
 
     x = tl.load(x_ptr + offs_x)
+    if ROUND_BF16:
+        # quantize the bf16 rounding of an fp32 input (as a bf16 copy would be)
+        x = x.to(tl.bfloat16, fp_downcast_rounding="rtne")
 
     scales = _calculate_scales(
         x,
