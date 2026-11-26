@@ -225,14 +225,20 @@ def launch_gemm_a8w8_256x256(
         if mx32
         else SC_K * (((tile_m + 15) // 16) * 16)
     )
-    SB_ROW = SUPER_K // 32 if b_scale_32x32 else SUPER_K
+    # The row-major 32x32 B scale ([N/32, K/32]) is laid out like the A scale and
+    # rides its panel: per K-step it is an 8-row x 4-byte TDM that alone costs ~6%.
+    SB_PANEL = b_scale_32x32 and SA_PANEL_STAGES > 1
+    SB_ROW = (
+        SA_PANEL_WIDTH if SB_PANEL else (SUPER_K // 32 if b_scale_32x32 else SUPER_K)
+    )
+    SB_SLOTS = SA_RING if SB_PANEL else num_buffers
     STAGE_SB = SB_SUPERS * SB_ROW if mx32 else ((N_BLOCKS + 15) // 16) * 16
     # B first so it keeps a 64-KiB-aligned base; the rest packs behind it.
     PLANAR_B_BASE = 0
     PLANAR_A_BASE = PLANAR_B_BASE + num_buffers * STAGE_B
     PLANAR_SA_BASE = PLANAR_A_BASE + num_buffers * STAGE_A
     PLANAR_SB_BASE = PLANAR_SA_BASE + SA_RING * STAGE_SA
-    PLANAR_END = PLANAR_SB_BASE + num_buffers * STAGE_SB
+    PLANAR_END = PLANAR_SB_BASE + SB_SLOTS * STAGE_SB
 
     partial_elem = (
         fx.Float32 if split_k > 1 else (fx.Float16 if out_is_f16 else fx.BFloat16)
@@ -630,8 +636,9 @@ def launch_gemm_a8w8_256x256(
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):
             if const_expr(SA_PANEL_STAGES > 1):
-                slot = (wave == 2).select(sa_panel % SA_RING, fx.Int32(slot))
-                tile_delta = (wave == 2).select(sa_panel * SA_PANEL_WIDTH, tile_delta)
+                panel_wave = (wave >= 2) if const_expr(SB_PANEL) else (wave == 2)
+                slot = panel_wave.select(sa_panel % SA_RING, fx.Int32(slot))
+                tile_delta = panel_wave.select(sa_panel * SA_PANEL_WIDTH, tile_delta)
             desc = tdm_ops.update_tensor_descriptor_2d_lds_addr(
                 tdm_desc,
                 tdm_base_lds + tdm_lds_step * fx.Int32(slot),
@@ -646,11 +653,11 @@ def launch_gemm_a8w8_256x256(
                 desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
                     desc,
                     i32_k // 32 - fx.Int32(k_elem0 // 32) - sa_panel * SA_PANEL_WIDTH,
-                    wave == 2,
+                    panel_wave,
                 )
                 desc = tdm_ops.update_tensor_descriptor_2d_pred(
                     desc,
-                    (wave == 2).select(fx.Int32(sa_refill), fx.Int32(1)),
+                    panel_wave.select(fx.Int32(sa_refill), fx.Int32(1)),
                 )
             return desc
 
@@ -934,7 +941,22 @@ def launch_gemm_a8w8_256x256(
                 return lds_load_b32(stage_sa_addr[stage], sm * SUPER_K)[0]
             return lds_load_b32(stage_sa_addr[stage], sm * 32)[0]
 
-        def _stage_load_sb_raw(stage, sn):
+        def _stage_load_sb_raw(stage, sn, sa_super):
+            if const_expr(SB_PANEL):
+                panel = sa_super // SA_PANEL_STAGES
+                addr = (
+                    _planar_base(
+                        PLANAR_SB_BASE,
+                        STAGE_SB,
+                        fx.index_cast(T.index, panel % SA_RING),
+                    )
+                    + sb_byte
+                    + fx.index_cast(
+                        T.index, (sa_super % SA_PANEL_STAGES) * (SUPER_K // 32)
+                    )
+                    + (stage % KPAIR) * (tile_k // 32)
+                )
+                return lds_load_b32(addr, sn * SB_ROW)[0]
             if const_expr(mx32):
                 return lds_load_b32(stage_sb_addr[stage], sn * SB_ROW)[0]
             return lds_load_b32(stage_sb_addr[stage], 0)[0]
@@ -969,7 +991,7 @@ def launch_gemm_a8w8_256x256(
             for sn in range_constexpr(N_SB):
 
                 def _go_sb(sn=sn):
-                    w = _stage_load_sb_raw(stage, sn)
+                    w = _stage_load_sb_raw(stage, sn, sa_super)
                     if const_expr(PIN_SCALE_ACTIVE):
                         w = _pin_scale_word(w, N_SA + sn)
                     seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
@@ -1254,7 +1276,7 @@ def launch_gemm_a8w8_256x256(
                             w = _pin_scale_word(w, sm)
                         seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
                     for sn in range_constexpr(N_SB):
-                        w = _stage_load_sb_raw(next_stage, sn)
+                        w = _stage_load_sb_raw(next_stage, sn, sa_next)
                         if const_expr(PIN_SCALE_ACTIVE):
                             w = _pin_scale_word(w, N_SA + sn)
                         seed_sb[sn].store(Vec.from_elements([w], fx.Int32))

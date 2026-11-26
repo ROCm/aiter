@@ -1848,7 +1848,7 @@ gfx1250,256,608,4608,5120,32x32,flydsl,bmm,1,12.297,flydsl_mxfp8_32_bpreshuffle_
 gfx1250,256,704,4608,5120,32x32,flydsl,bmm,1,12.628,flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1,2630.57,2.67,0.0
 gfx1250,256,3456,4608,5120,32x32,flydsl,bmm,1,36.174,flydsl_bmm_mxfp8_32_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1,4545.76,,0.005735
 gfx1250,256,8192,4608,5120,32x32,flydsl,bmm,1,73.1,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1,5287.92,1.93,0.0
-gfx1250,256,16384,4608,5120,32x32,flydsl,bmm,1,120.20,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2,6431.7,2150.4,0.0
+gfx1250,256,16384,4608,5120,32x32,flydsl,bmm,1,115.2,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm4_cn2,6710.9,2243.7,0.0
 gfx1250,256,128,5120,2304,32x32,flydsl,bmm,1,6.93,flydsl_bmm_mxfp8_32_wmma_t32x128x256_mw1_nw4_nb3_sk1_cm1_cn1,465.32,,0.003714
 gfx1250,256,352,5120,2304,32x32,flydsl,bmm,1,6.428,flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw1_nw4_nb4_sk1_cm1_cn1,1291.86,2.52,0.0
 gfx1250,256,512,5120,2304,32x32,flydsl,bmm,1,7.45,flydsl_bmm_mxfp8_32_wmma_t96x128x256_mw2_nw2_nb4_sk1_cm1_cn1,1621.42,2.45,0.0
