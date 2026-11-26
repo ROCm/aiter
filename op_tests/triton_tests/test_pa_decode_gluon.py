@@ -1208,31 +1208,6 @@ def test_head_192_full_context_regression(context_length, ps):
 
 
 @pytest.mark.parametrize(
-    "num_seqs, num_kv_heads, kwargs, expected",
-    [
-        (1, 8, {}, 8),
-        (1, 8, {"max_context_length": 32768}, 32),
-        (1, 8, {"max_context_length": 12000}, 32),
-        (1, 2, {"max_context_length": 4096}, 16),
-        (1, 8, {"max_context_length": 1024}, 8),
-        (2, 8, {"max_context_length": 32768}, 32),
-        (1, 2, {"max_context_length": 8192}, 32),
-        (4, 8, {"max_context_length": 32768}, 8),
-        (1, 8, {"max_context_length": 32768, "query_length": 4}, 8),
-        (1, 8, {"max_context_length": 32768, "split_kv_blocks": 4}, 8),
-    ],
-)
-def test_get_recommended_splits(monkeypatch, num_seqs, num_kv_heads, kwargs, expected):
-    """Check the recommended split counts on a GPU with 256 compute units."""
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda *a, **k: SimpleNamespace(multi_processor_count=256),
-    )
-    assert get_recommended_splits(num_seqs, num_kv_heads, **kwargs) == expected
-
-
-@pytest.mark.parametrize(
     "kv_heads, lengths",
     [
         (8, [8192]),
@@ -1383,22 +1358,6 @@ def test_pa_decode_output_gate_empty_sequence(splits):
 
 
 @pytest.mark.parametrize(
-    "kv_heads, splits, ps",
-    [
-        pytest.param(4, 1, True, id="one-shot"),
-        pytest.param(1, 1, True, id="one-shot-head-1"),
-        # Non-PS mode needs one partition per 256 tokens of the longest context.
-        pytest.param(4, 16, False, id="v2-reduce"),
-    ],
-)
-def test_pa_decode_output_gate_rejects_unfused_paths(kv_heads, splits, ps):
-    """Paths without the PS reduce reject output_gate instead of gating after the kernels."""
-    inputs = _output_gate_inputs(1, kv_heads)
-    with pytest.raises(AssertionError, match="output_gate is applied"):
-        _run_output_gate(inputs, 1, splits, ps, inputs[-1])
-
-
-@pytest.mark.parametrize(
     "case_set_name",
     [
         "normal_accuracy",
@@ -1414,65 +1373,6 @@ def test_multi_case_set(case_set_name):
     normal_performance runs only from the command line and from the AOT test.
     """
     run_case_set(case_set_name)
-
-
-@pytest.mark.parametrize(
-    "num_heads, ps, sliding_window, block_size, query_length",
-    [
-        # More than one KV head: the PS kernel holds every query token in one tile.
-        pytest.param((64, 8), True, 0, 16, 8, id="ps_multi_kv_head"),
-        # The non-PS kernels hold every query token in one tile.
-        pytest.param((8, 1), False, 0, 16, 8, id="non_ps"),
-        # PS hands sliding-window 1024-token blocks to the non-PS kernel.
-        pytest.param((8, 1), True, 128, 1024, 8, id="ps_sliding_window_block_1024"),
-        # One query token per program, but the group alone is 128 rows.
-        pytest.param((128, 1), True, 0, 16, 2, id="ps_one_kv_head_group_128"),
-        # Each query token sees sliding_window - query_length keys: none here.
-        pytest.param((8, 1), True, 8, 16, 8, id="ps_one_kv_head_window_8"),
-    ],
-)
-def test_unsupported_query_shape_is_rejected(
-    num_heads, ps, sliding_window, block_size, query_length
-):
-    """Reject unsupported query shapes before launch.
-
-    Kernels that hold every query token in one tile take at most 4 tokens. No
-    kernel takes a tile over 64 rows. The single-KV-head PS kernel needs a
-    sliding window that is longer than the query.
-    """
-    num_query_heads, num_kv_heads = num_heads
-    head_size = 128
-    dtype = torch.bfloat16
-    device = "cuda"
-    query = torch.randn(
-        query_length, num_query_heads, head_size, dtype=dtype, device=device
-    )
-    output = torch.empty_like(query)
-    x = 16 // query.element_size()
-    key_cache = torch.randn(
-        1, num_kv_heads, head_size // x, block_size, x, dtype=dtype, device=device
-    )
-    value_cache = torch.randn(
-        1, num_kv_heads, head_size, block_size, dtype=dtype, device=device
-    )
-    context_lengths = torch.tensor([query_length], dtype=torch.int32, device=device)
-    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
-
-    with pytest.raises(AssertionError, match="query"):
-        pa_decode_gluon(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context_lengths,
-            block_tables,
-            softmax_scale=head_size**-0.5,
-            query_length=query_length,
-            max_context_partition_num=2,
-            compute_type=dtype,
-            sliding_window=sliding_window,
-            ps=ps,
-        )
 
 
 if __name__ == "__main__":

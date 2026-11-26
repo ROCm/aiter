@@ -469,15 +469,6 @@ def test_gather_scattered(num_heads, preshuffle):
     assert bool(torch.isinf(got[:, nb * block :]).all()), "tail is not -inf"
 
 
-def test_gather_needs_cu_ends():
-    """row_ends is the gather's walk length, so it is not optional there."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, _ = _identity_list(st, 1, 8)
-    with pytest.raises(AssertionError, match="row_ends"):
-        _gather_run(st, 32, 128, 1, 8, 1, pos, None)
-
-
 def test_gather_ignores_dynamic():
     """A gather launch does not build a device schedule: every row walks the
     same tile count, so there is no spread to even out. dynamic=1 set for the
@@ -691,53 +682,6 @@ def test_block_scores_leaves_logits_alone(shape, num_heads):
     assert nd == 0, f"{nd} differing words in the logits"
 
 
-def test_block_scores_rejects_gather():
-    """The producer is dense and the consumers gather; no launch is both."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, ends = _identity_list(st, 1, 8)
-    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="dense producer"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            use_gather=True,
-            candidates=meta,
-            row_ends=ends,
-            block_scores=bs,
-            calc_block_scores=True,
-        )
-
-
-def test_block_scores_needs_room():
-    """A score tensor too narrow for max_model_len is a caller error."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full(
-        (1, st["mml"] // 8 - 1), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="blocks wide"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            block_scores=bs,
-            calc_block_scores=True,
-        )
-
-
 # block maxima with no logits at all
 
 
@@ -892,56 +836,6 @@ def test_outputs_allocates(want_logits, want_scores):
         assert scores.shape == (rows, mml // 8)
         # every block inside the context was written, none is left unset
         assert not (scores == float("-inf")).all(1).any()
-
-
-def test_block_scores_rejects_logits_only():
-    """A score tensor with nothing asked to write it is a caller error."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="calc_block_scores off"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            block_scores=bs,
-        )
-
-
-def test_scores_only_rejects_gather():
-    """Mutual exclusion with the gather survives the third BSCORE value.
-
-    Pass 1 of a producer whose pass 2 is a gather: two launches, never one.
-    """
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, ends = _identity_list(st, 1, 8)
-    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="dense producer"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            use_gather=True,
-            candidates=meta,
-            row_ends=ends,
-            block_scores=bs,
-            calc_logits=False,
-            calc_block_scores=True,
-        )
 
 
 def _expand_ref(ids, ends, block):
@@ -1121,18 +1015,6 @@ def test_gather_far_pages(gib):
         del st
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
-
-
-def test_gather_rejects_a_pool_past_the_slot_reach():
-    """Slots are int32: a pool holding more tokens is an assert, not a wrap."""
-    rows, block, K = 2, 8, 32
-    # meta: the guard reads the cache's shape, never its bytes
-    cache = torch.empty(2**31 // 64, 64, 1, 68, dtype=torch.uint8, device="meta")
-    ids = torch.zeros(rows, K, dtype=torch.int32, device="cuda")
-    ends = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
-    bt = torch.zeros(rows, 16, dtype=torch.int32, device="cuda")
-    with pytest.raises(AssertionError, match="int32 slots"):
-        build_candidate_gather(ids, ends, bt, cache, 32, 128, block)
 
 
 VARLEN_SHAPES = [

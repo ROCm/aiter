@@ -2,7 +2,9 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm_blockscale.hpp"
+#include "ck/tensor_operation/gpu/element/moe_silu.hpp"
 #include "gemm_moe_ck2stages.h"
+#include <cmath>
 #include <iostream>
 
 template <typename A0DataType,
