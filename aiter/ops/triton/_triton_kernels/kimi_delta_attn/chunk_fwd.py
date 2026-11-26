@@ -47,6 +47,82 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm
 _DEFAULT_CHUNK_SIZE = 64
 
 
+def chunk_delta_attn_fwd_prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None,
+    chunk_indices: torch.Tensor | None,
+    chunk_size: int,
+    safe_gate: bool,
+    lower_bound: float | None,
+    use_gate_in_kernel: bool,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    use_beta_sigmoid_in_kernel: bool,
+    disable_recompute: bool,
+):
+    """The chunked pipeline up to the inter-chunk recurrence.
+
+    Shared by the forward and the backward's recompute. Applies the optional
+    q/k L2 norm and beta sigmoid, scans the gate and runs the intra-chunk step.
+
+    Returns:
+        ``(q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)``, with ``q``, ``k``
+        and ``beta`` after their activations.
+    """
+    if use_qk_l2norm_in_kernel:
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    if use_beta_sigmoid_in_kernel:
+        beta = beta_sigmoid_fwd(beta)
+
+    if use_gate_in_kernel:
+        assert A_log is not None, "A_log required when use_gate_in_kernel=True"
+        g_cumsum = chunk_gate_cumsum(
+            g=g,
+            A_log=A_log,
+            chunk_size=chunk_size,
+            scale=RCP_LN2,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            lower_bound=lower_bound,
+        )
+    else:
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
+            chunk_local_cumsum,
+        )
+
+        g_cumsum = chunk_local_cumsum(
+            g=g,
+            chunk_size=chunk_size,
+            scale=RCP_LN2,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+    w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_intra(
+        q=q,
+        k=k,
+        v=v,
+        gk=g_cumsum,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        safe_gate=safe_gate,
+        disable_recompute=disable_recompute,
+    )
+    return q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk
+
+
 def chunk_delta_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -196,57 +272,25 @@ def chunk_delta_attn_fwd(
     q, k, v, g = (t.contiguous() for t in (q, k, v, g))
 
     # ------------------------------------------------------------------
-    # Step 0 — Optional QK L2 normalization (matches FLA API)
+    # Steps 0-2 — Activations, gate cumsum and intra-chunk
     # ------------------------------------------------------------------
-    if use_qk_l2norm_in_kernel:
-        q, _ = l2norm_fwd(q)
-        k, _ = l2norm_fwd(k)
-
-    if use_beta_sigmoid_in_kernel:
-        beta = beta_sigmoid_fwd(beta)
-
-    # ------------------------------------------------------------------
-    # Step 1 — Gate cumsum
-    # ------------------------------------------------------------------
-    if use_gate_in_kernel:
-        assert A_log is not None, "A_log required when use_gate_in_kernel=True"
-        g_cumsum = chunk_gate_cumsum(
-            g=g,
-            A_log=A_log,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-            dt_bias=dt_bias,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            lower_bound=lower_bound,
-        )
-    else:
-        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
-            chunk_local_cumsum,
-        )
-
-        g_cumsum = chunk_local_cumsum(
-            g=g,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-
-    # ------------------------------------------------------------------
-    # Step 2 — Intra-chunk (sub_chunk + inter_solve + recompute_w_u)
-    # ------------------------------------------------------------------
-    w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_intra(
+    q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
         q=q,
         k=k,
         v=v,
-        gk=g_cumsum,
+        g=g,
         beta=beta,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
         safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         disable_recompute=disable_recompute,
     )
 
