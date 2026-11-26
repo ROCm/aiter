@@ -59,6 +59,10 @@ ENV_NOT_CODE = frozenset(
         "AITER_GPU_ARCHS",
         "CU_NUM",
         "AITER_AOT_REPLAY",
+        # Which GPU chip_info describes; its arch and CU count are hashed.
+        "HIP_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
         # Read by dispatch helpers of moe_common.py (which kernels import
         # for GateMode): what they choose reaches a kernel as a factory
         # argument (the output dtype, the SwiGLU limit), which is its key.
