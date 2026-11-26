@@ -205,7 +205,8 @@ def run_m3_decode(req: FusedMoeRequest, cfg: ExpertCfg) -> torch.Tensor:
         req.topk_ids,
         req.topk_weight,
     )
-    return moe_slots_shared_reduce(slots, shared)
+    # dropped routes (ids outside [0, E)) leave their GEMM2 slot rows unwritten: the reduction masks them
+    return moe_slots_shared_reduce(slots, shared, topk_ids=req.topk_ids, num_experts=E)
 
 
 def run_flydsl_m3decode_impl(req: FusedMoeRequest, config: str) -> torch.Tensor:

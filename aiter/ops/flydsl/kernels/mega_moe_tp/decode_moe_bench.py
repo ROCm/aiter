@@ -97,7 +97,7 @@ def chain_direct(x, L, gate, lines, bias, ecfg=None, rcfg=None):
         ids,
         w,
     )
-    return moe_slots_shared_reduce(slots, shared), w, ids
+    return moe_slots_shared_reduce(slots, shared, topk_ids=ids, num_experts=E), w, ids
 
 
 def shared_kw(L):
