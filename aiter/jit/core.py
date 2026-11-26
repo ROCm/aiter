@@ -10,10 +10,12 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import traceback
 import types
 import typing
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -2401,6 +2403,47 @@ def _develop_arg(a, convert, tensor_cls):
     return a
 
 
+class _TensorDescriptorCache:
+    """Private metadata-only handles for explicitly opted-in const arguments.
+
+    The pybind descriptor has writable fields, so it must not escape to callers
+    or a native argument that mutates it. Neither keys nor values own a tensor.
+    """
+
+    def __init__(self, tensor_types, maxsize=1024):
+        self._tensor_types = tensor_types
+        self._maxsize = maxsize
+        self._handles = OrderedDict()
+        self._lock = threading.Lock()
+
+    def convert(self, tensor, convert, tensor_cls):
+        if type(tensor) not in self._tensor_types:
+            return _develop_arg(tensor, convert, tensor_cls)
+        key = (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tensor.stride(),
+            tensor.dtype,
+            tensor.get_device(),
+        )
+        with self._lock:
+            handle = self._handles.get(key)
+            if handle is not None:
+                self._handles.move_to_end(key)
+                return handle
+        # Conversion can load a module; do not hold the cache lock around it.
+        handle = convert(tensor)
+        with self._lock:
+            existing = self._handles.get(key)
+            if existing is not None:
+                self._handles.move_to_end(key)
+                return existing
+            self._handles[key] = handle
+            if len(self._handles) > self._maxsize:
+                self._handles.popitem(last=False)
+        return handle
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2408,9 +2451,25 @@ def compile_ops(
     gen_fake: Callable[..., Any] | None = None,
     ffi_type: str = "pybind",
     develop: bool = False,
+    tensor_cache_args: tuple[str, ...] = (),
 ):
+    if tensor_cache_args and (ffi_type != "pybind" or not develop):
+        raise ValueError("tensor_cache_args requires develop=True with pybind")
+
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
+        if tensor_cache_args:
+            import inspect
+
+            import torch
+
+            parameters = tuple(inspect.signature(func).parameters)
+            unknown = set(tensor_cache_args) - set(parameters)
+            if unknown:
+                raise ValueError(f"Unknown cached tensor arguments: {sorted(unknown)}")
+            cached_positions = frozenset(parameters.index(n) for n in tensor_cache_args)
+            cached_names = frozenset(tensor_cache_args)
+            tensor_cache = _TensorDescriptorCache((torch.Tensor, torch.nn.Parameter))
 
         if ffi_type == "ctypes":
             ctypes_caller = _ctypes_call(func, loadName, _md_name)
@@ -2706,12 +2765,31 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
-                    if kwargs:
-                        kwargs = {
-                            k: _develop_arg(v, convert, tensor_cls)
-                            for k, v in kwargs.items()
-                        }
+                    if tensor_cache_args:
+                        args = tuple(
+                            (
+                                tensor_cache.convert(a, convert, tensor_cls)
+                                if i in cached_positions
+                                else _develop_arg(a, convert, tensor_cls)
+                            )
+                            for i, a in enumerate(args)
+                        )
+                        if kwargs:
+                            kwargs = {
+                                k: (
+                                    tensor_cache.convert(v, convert, tensor_cls)
+                                    if k in cached_names
+                                    else _develop_arg(v, convert, tensor_cls)
+                                )
+                                for k, v in kwargs.items()
+                            }
+                    else:
+                        args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
+                        if kwargs:
+                            kwargs = {
+                                k: _develop_arg(v, convert, tensor_cls)
+                                for k, v in kwargs.items()
+                            }
 
                     module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)

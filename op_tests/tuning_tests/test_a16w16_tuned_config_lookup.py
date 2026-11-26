@@ -49,6 +49,21 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(tuned_config, row)
         self.assertEqual(config, row)
 
+    def test_dtype_object_keys_keep_string_callers_and_cache_hits(self):
+        row = {"libtype": "hipblaslt", "solidx": 3}
+        self._lookup({KEY: row})
+        before = tuned.get_GEMM_A16W16_config.cache_info()
+        for _ in range(2):
+            self.assertEqual(
+                tuned.get_GEMM_A16W16_config(
+                    M, N, K, False, torch.bfloat16, torch.bfloat16
+                ),
+                row,
+            )
+        after = tuned.get_GEMM_A16W16_config.cache_info()
+        self.assertEqual(after.misses - before.misses, 1)
+        self.assertEqual(after.hits - before.hits, 1)
+
     def test_missing_row_returns_none_and_keeps_default(self):
         tuned_config, config = self._lookup({})
         self.assertIsNone(tuned_config)
@@ -135,6 +150,10 @@ class TestOpusRowOperandLayout(unittest.TestCase):
 
     M, N, K = 16, 4096, 512
 
+    def setUp(self):
+        tuned._gemm_gfx_cu_cached.cache_clear()
+        self.addCleanup(tuned._gemm_gfx_cu_cached.cache_clear)
+
     def _backend_for(self, A, B):
         opus_row = {"libtype": "opus", "solidx": 710, "splitK": 0, "kernelName": ""}
         calls = []
@@ -183,6 +202,38 @@ class TestOpusRowOperandLayout(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self._launcher_accepts(a, b), expected == "opus")
                 self.assertEqual(self._backend_for(a, b), [expected])
+
+
+class TestGemmDeviceCache(unittest.TestCase):
+    def setUp(self):
+        tuned._gemm_gfx_cu_cached.cache_clear()
+        self.addCleanup(tuned._gemm_gfx_cu_cached.cache_clear)
+
+    def test_explicit_device_and_current_device_changes(self):
+        def info(device):
+            return ("gfx942", 304) if device.index == 0 else ("gfx950", 256)
+
+        with (
+            mock.patch(
+                "aiter.ops.opus._arch._device_arch_and_cu", side_effect=info
+            ) as read,
+            mock.patch.object(torch.cuda, "current_device", side_effect=[0, 1]),
+        ):
+            self.assertEqual(tuned._gemm_gfx_cu(torch.device("cuda")), ("gfx942", 304))
+            self.assertEqual(tuned._gemm_gfx_cu(torch.device("cuda")), ("gfx950", 256))
+            self.assertEqual(
+                tuned._gemm_gfx_cu(torch.device("cuda", 0)), ("gfx942", 304)
+            )
+        self.assertEqual(read.call_count, 2)
+
+    def test_cpu_rejection_is_not_cached(self):
+        with mock.patch(
+            "aiter.ops.opus._arch._device_arch_and_cu", side_effect=RuntimeError("CPU")
+        ) as read:
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "CPU"):
+                    tuned._gemm_gfx_cu(torch.device("cpu"))
+        self.assertEqual(read.call_count, 2)
 
 
 class TestGfx1250FlydslCandidates(unittest.TestCase):
