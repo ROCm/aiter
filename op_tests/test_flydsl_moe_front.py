@@ -57,12 +57,14 @@ def test_moe_router_topk(m, k, case):
 
 
 def check_tuned_rows():
-    """Each fused row of this GPU resolves (a router GEMM retune can kill one)."""
+    """Each row of this GPU resolves: a fused row to its config (a router GEMM
+    retune can kill one), an unfused row to None (tgemm.mm + topk_gating)."""
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_MOE_ROUTER_TOPK_FILE)
-    df = df[(df.gfx == get_gfx_runtime()) & (df.cu_num == get_cu_num()) & df.fused]
+    df = df[(df.gfx == get_gfx_runtime()) & (df.cu_num == get_cu_num())]
     for r in df.itertuples():
         cfg = router_topk_config(r.M, r.N, r.K, r.topk)
-        assert cfg == {"split_k": r.split_k, "prefetch": r.prefetch}, f"dead row {r}"
+        want = {"split_k": r.split_k, "prefetch": r.prefetch} if r.fused else None
+        assert cfg == want, f"row {r} resolves to {cfg}"
 
 
 def main():
