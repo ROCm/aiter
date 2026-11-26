@@ -1534,8 +1534,9 @@ def compile_wy_dqkg_mfma(
                 mma.store(run(a, lda, b_half(half), ldb, kd), c_tile)
                 gpu.barrier()
                 mine = (seg // 2) == half
+                row = _lds_row(s_c, r * LDC + cbase, 32, fx.Float32)
                 for e in range_constexpr(32):
-                    out[e] = _sel(mine, lds_ld(s_c, r * LDC + cbase + e), out[e])
+                    out[e] = _sel(mine, row[e], out[e])
                 gpu.barrier()
             return out
 
@@ -1678,15 +1679,11 @@ def compile_wy_dqkg_mfma(
 
         is_last = r == last
         o_dk, o_dg = [], []
+        cols = [_lds_row(s_col, w_ * K + c0, 32, fx.Float32) for w_ in range(4)]
+        dgk_raw = _lds_row(s_dgk, c0, 32, fx.Float32)
         for e in range_constexpr(32):
-            kk = c0 + e
-            col = (
-                lds_ld(s_col, kk)
-                + lds_ld(s_col, K + kk)
-                + lds_ld(s_col, 2 * K + kk)
-                + lds_ld(s_col, 3 * K + kk)
-            )
-            dgk = lds_ld(s_dgk, kk) * _decay(gn[e]) + col
+            col = cols[0][e] + cols[1][e] + cols[2][e] + cols[3][e]
+            dgk = dgk_raw[e] * _decay(gn[e]) + col
             qx = _sel(rv, q_row[e], _zero())
             dgv = (
                 qx * b_dq[e]
