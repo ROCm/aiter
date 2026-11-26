@@ -413,7 +413,7 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 
 # Fused knobs added with the EP2 V4.1-Flash tune and after it: they enter the table only when set, so a digest
 # pinned before them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w", "pair_tiles", "en_order")
+_EP2_KNOBS = ("stream_w", "pair_tiles", "en_order", "bf16_rows_always")
 
 
 def _knob_table(config):
