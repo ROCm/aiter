@@ -1099,9 +1099,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                     testGraph=(self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK),
-                    use_cuda_event=(
-                        self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK
-                    ),
                     num_rotate_args=1,
                 )
                 if not math.isfinite(us) or us <= 0:
@@ -1192,9 +1189,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 runs = gfx1250_1x32_runs(M, N, K)
                 data_generator = generate_data_gfx1250_1x32
                 data_args = (M, N, K, seed)
-                candidate_run_kwargs.update(
-                    testGraph=True, use_cuda_event=True, num_rotate_args=1
-                )
+                candidate_run_kwargs.update(testGraph=True, num_rotate_args=1)
             elif gfx == "gfx1250":
                 cands = gfx1250_candidates(M, N, K)
                 runs = [
