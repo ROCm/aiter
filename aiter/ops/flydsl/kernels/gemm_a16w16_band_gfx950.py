@@ -27,6 +27,7 @@ from flydsl._mlir.dialects import rocdl as rocdl_d
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels.tensor_shim import AITER_FLYDSL_KERNARG_PRELOAD
 
 
@@ -73,6 +74,7 @@ def _gep(base_ptr, byte_offset):
     return llvm.GEPOp(base_ptr.type, base_ptr, dyn, raw, T.i8, None).result
 
 
+@aot_factory("gemm_a16w16_band_gfx950")
 @functools.lru_cache(maxsize=512)
 def build_band_stream(
     m,
