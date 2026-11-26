@@ -39,10 +39,10 @@ has the exact limits):
 
 | kernelId | kernelName | gfx | B | Shapes | Output |
 |---|---|---|---|---|---|
-| 0 | `flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps0` | gfx950 | plain | K % 256 == 0, N % 8 == 0 | BF16, FP16 |
-| 1 | `flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1` | gfx950 | preshuffled | K % 256 == 0, N % 16 == 0 | BF16, FP16 |
-| 2 | `flydsl_blockscale_gfx942_2x4_lds_pf1_256x256x128_F8_F8_B16_ps0` | gfx942 | plain | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
-| 3 | `flydsl_blockscale_gfx942_2x4_lds_pf1_256x256x128_F8_F8_B16_ps1` | gfx942 | preshuffled | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
+| 0 | `flydsl_blockscale_8w_gfx950_256x256x128_F8_F8_B16_ps0` | gfx950 | plain | K % 256 == 0, N % 8 == 0 | BF16, FP16 |
+| 1 | `flydsl_blockscale_8w_gfx950_256x256x128_F8_F8_B16_ps1` | gfx950 | preshuffled | K % 256 == 0, N % 16 == 0 | BF16, FP16 |
+| 2 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps0` | gfx942 | plain | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
+| 3 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps1` | gfx942 | preshuffled | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
 
 IDs 2/3 are PyHIP's gfx942 2x4-LDS pf1 kernel: a 256x256 tile on eight waves
 with A and B staged through 64 KiB of LDS, its main loop ported unchanged.

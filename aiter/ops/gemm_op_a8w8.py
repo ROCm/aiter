@@ -259,10 +259,10 @@ def gemm_a8w8_bpreshuffle_flydsl(
 
 # Name prefixes of the FP32-scale FlyDSL blockscale kernels
 # (flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py): the gfx950 8-wave
-# kernel (IDs 0/1) and the gfx942 2x4-LDS pf1 kernel (IDs 2/3).
+# kernel (IDs 0/1) and the gfx942 8-wave kernel (IDs 2/3).
 _FLYDSL_BLOCKSCALE_PREFIXES = (
-    "flydsl_blockscale_8w_",
-    "flydsl_blockscale_gfx942_2x4_lds_pf1_",
+    "flydsl_blockscale_8w_gfx950_",
+    "flydsl_blockscale_8w_gfx942_",
 )
 
 

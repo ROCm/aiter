@@ -30,7 +30,7 @@ buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
 below are kept for that reason; each names the stable API it stands in for.
 
 The interface is the gfx950 8-wave kernel's (gemm_a8w8_blockscale_8wave.py):
-compile_gemm_fp8_gfx942_2x4_lds_pf1(TILE_M, TILE_N, TILE_K, N, K, preshuffle_b)
+compile_gemm_fp8_blockscale_gfx942(TILE_M, TILE_N, TILE_K, N, K, preshuffle_b)
 returns launch_gemm(A, B, C, scaleA, scaleB, M, stream), which takes tensors
 and rebases A, B and C per tile in i64; C's dtype selects the epilogue.
 
@@ -120,7 +120,7 @@ def _s_buffer_load_f32(rsrc, offset_bytes):
     return fx.Float32(value)
 
 
-def compile_gemm_fp8_gfx942_2x4_lds_pf1(
+def compile_gemm_fp8_blockscale_gfx942(
     TILE_M,
     TILE_N,
     TILE_K,
@@ -147,7 +147,7 @@ def compile_gemm_fp8_gfx942_2x4_lds_pf1(
         b: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
 
     @flyc.kernel(
-        name=f"gemm_a8w8_blockscale_gfx942_2x4_lds_pf1_ps{int(preshuffle_b)}",
+        name=f"gemm_a8w8_blockscale_gfx942_ps{int(preshuffle_b)}",
         known_block_size=[512, 1, 1],
     )
     def gemm_kernel(

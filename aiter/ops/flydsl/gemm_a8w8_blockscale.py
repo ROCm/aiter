@@ -38,7 +38,7 @@ def is_supported(
     Without ``kernel_name`` it asks about the gfx950 kernel of this B layout.
     """
     if kernel_name is None:
-        ki = kernelInstance(preshuffle_b)
+        ki = kernelInstance(preshuffle_b, "gfx950")
     else:
         ki = kernels_by_name.get(kernel_name)
         if ki is None or ki.preshuffle_b != preshuffle_b:
@@ -117,19 +117,19 @@ def _compile_gemm(
 ):
     ki = kernels_by_name[kernel_name]
     if ki.gfx == "gfx942":
-        from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds_pf1 import (
-            compile_gemm_fp8_gfx942_2x4_lds_pf1 as compile_gemm_fp8,
+        from .kernels.gemm_a8w8_blockscale_gfx942 import (
+            compile_gemm_fp8_blockscale_gfx942 as compile_gemm_fp8_blockscale,
         )
     else:
         from .kernels.gemm_a8w8_blockscale_8wave import (
-            compile_gemm_fp8_8wave as compile_gemm_fp8,
+            compile_gemm_fp8_8wave as compile_gemm_fp8_blockscale,
         )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
     # each caches the first typed CompiledFunction it compiles.
-    launch = compile_gemm_fp8(
+    launch = compile_gemm_fp8_blockscale(
         TILE_M,
         TILE_N,
         TILE_K,
