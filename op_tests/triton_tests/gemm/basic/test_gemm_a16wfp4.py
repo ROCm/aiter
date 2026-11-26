@@ -207,3 +207,50 @@ def test_gemm_a16wfp4(
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     torch.testing.assert_close(torch_out, y)
+
+
+def test_gemm_a16wfp4_scale_tail_mask():
+    """Regression for the b_scales K-tail mask.
+
+    A ragged-K tile loads scale groups past the end of ``w_scales``. The
+    kernel must mask that tail (``other=127``), else an out-of-bounds ``0xFF``
+    e8m0 scale is NaN and ``tl.dot_scaled`` turns the whole output tile NaN,
+    even though the masked data is zero (``0 * NaN = NaN``). The ordinary test
+    generator lays scale rows back to back, so an unmasked tail reads the next
+    row's valid scales and the bug stays hidden. Here ``w_scales`` sits at the
+    head of a buffer whose per-row K tail is ``0xFF``, so a missing mask fails
+    deterministically instead of reading whatever memory follows.
+    """
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    # The CI flake shape. 2 * K / 32 = 344 real scale columns, which is not a
+    # multiple of the scale-tile width, so the last K iteration reads past them.
+    M, N, K = 16, 4096, 11008
+    dtype = torch.bfloat16
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    x, w, w_triton, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
+        M, N, K, output=True, atomic_add=True, dtype=dtype, layout="TN", shuffle=False
+    )
+
+    # Put the real scales at the head of a buffer whose K tail is 0xFF (NaN in
+    # e8m0). The kernel reads the tail along the contiguous K axis, so every
+    # out-of-bounds scale group lands in this row's poisoned tail.
+    num_scale_k = K // SCALE_GROUP_SIZE
+    pad = 64  # covers one scale tile (BLOCK_SIZE_K // 32) of over-read
+    poisoned = torch.full(
+        (N, num_scale_k + pad), 0xFF, dtype=torch.uint8, device="cuda"
+    )
+    w_scales_poisoned = poisoned[:, :num_scale_k]
+    w_scales_poisoned.copy_(w_scales)
+
+    y = gemm_a16wfp4(
+        x, w_triton, w_scales_poisoned, atomic_add=True, dtype=torch.float32, y=y
+    ).to(dtype)
+
+    assert torch.isfinite(y).all(), "output has NaN/Inf: b_scales K-tail not masked"
+
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+    torch.testing.assert_close(torch_out, y)
