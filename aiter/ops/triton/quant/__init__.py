@@ -13,6 +13,7 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_rms_fp8_group_quant,
     fused_rms_fp8_per_tensor_static_quant,
     fused_rms_gated_fp8_group_quant,
+    fused_silu_mul_fp8_per_token_quant,
     get_fp8_min_max_bounds,
 )
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
@@ -94,6 +95,7 @@ __all__ = [
     "fused_rms_mxfp4_quant",
     # fused_mxfp8_quant.py exports
     "fused_rms_mxfp8_quant",
+    "fused_silu_mul_fp8_per_token_quant",
     "get_fp8_min_max_bounds",
     # quant_fp8_blockwise.py exports
     "quant_fp8_blockwise",

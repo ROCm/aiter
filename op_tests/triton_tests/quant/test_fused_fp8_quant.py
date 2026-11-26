@@ -16,6 +16,7 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
 from aiter.test_common import (
     assertAllclose,
 )
+from op_tests.triton_tests.utils.per_token_fp8_ref import per_token_fp8_ref
 from op_tests.triton_tests.utils.types import with_default_dtype
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
@@ -844,9 +845,7 @@ def test_silu_mul_fp8_per_token_quant(m, n, dtype):
     # silu-and-mul as stored by an unfused op: activation and product rounded.
     act = F.silu(gate.float()).to(dtype).float()
     y = (act * up.float()).to(dtype).float()
-    fp8_max = torch.finfo(rocm_aiter_fp8_dtype).max
-    s_ref = (y.abs().amax(-1, keepdim=True) / fp8_max).clamp_min(1.0 / (fp8_max * 512))
-    q_ref = (y / s_ref).clamp(-fp8_max, fp8_max).to(rocm_aiter_fp8_dtype)
+    q_ref, s_ref = per_token_fp8_ref(y, rocm_aiter_fp8_dtype)
 
     q, s = fused_silu_mul_fp8_per_token_quant(x)
 

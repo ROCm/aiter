@@ -126,6 +126,7 @@ def _check_modulation(weight, shift, scale, indices, M, N, device):
         shift.ndim == 2 and shift.shape[1] == N
     ), f"modulation table must be [G, {N}], got {tuple(shift.shape)}"
     assert indices.shape == (M,), f"indices must be [{M}], got {tuple(indices.shape)}"
+    assert indices.dtype in (torch.int32, torch.int64), "indices must be int32/int64"
     assert weight.is_contiguous() and indices.is_contiguous()
     assert shift.stride(1) == 1 and scale.stride(1) == 1
     for name, t in (("weight", weight), ("shift", shift), ("scale", scale)):
@@ -201,7 +202,7 @@ def fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
         BLOCK_N=triton.next_power_of_2(N),
         FP8_MAX=fp8_max,
         MIN_SCALE=min_scale,
-        num_warps=8,
+        num_warps=4,
     )
     return out, out_scale
 
@@ -255,9 +256,10 @@ def fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
         M,
         N,
     ), f"branch must be [{M}, {N}], got {tuple(branch.shape)}"
+    # indices are bounded by the modulation table, so the gate table must match it.
     assert (
-        gate.ndim == 2 and gate.shape[1] == N
-    ), f"gate table must be [G, {N}], got {tuple(gate.shape)}"
+        gate.shape == shift.shape
+    ), f"gate table must match shift/scale {tuple(shift.shape)}, got {tuple(gate.shape)}"
     assert residual.stride(1) == 1 and branch.stride(1) == 1 and gate.stride(1) == 1
     assert branch.device == residual.device and gate.device == residual.device
     _check_modulation(weight, shift, scale, indices, M, N, residual.device)
@@ -290,6 +292,8 @@ def fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
         BLOCK_N=triton.next_power_of_2(N),
         FP8_MAX=fp8_max,
         MIN_SCALE=min_scale,
-        num_warps=8,
+        num_warps=16,
+        # An fma would skip rounding the gate * branch product, unlike eager fp32.
+        enable_fp_fusion=False,
     )
     return residual_out, out, out_scale
