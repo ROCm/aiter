@@ -232,7 +232,14 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] a gfx1250 cluster holds at most 16 "
             f"workgroups, got {cluster_m}x{cluster_n}"
         )
-    if N % (tile_n * cluster_n) != 0:
+    if N % (tile_n * cluster_n) != 0 and not cluster_n_pads(
+        N,
+        tile_n,
+        cluster_n,
+        split_k,
+        persistent_n_tiles,
+        compute_bound and w_scale_32x32,
+    ):
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] N={N} must be a multiple of "
             f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
@@ -563,6 +570,25 @@ def cluster_m_pads(
         and split_k == 1
         and cluster_m > 1
         and m_tiles >= _PAD_MIN_M_TILES_PER_CLUSTER_M * cluster_m
+    )
+
+
+def cluster_n_pads(
+    N: int,
+    tile_n: int,
+    cluster_n: int,
+    split_k: int,
+    persistent_n_tiles: int,
+    can_pad: bool,
+) -> bool:
+    """Whether grid.y is padded to whole cluster columns; padded workgroups
+    multicast their A, load zero B and store nothing (TDM clamps)."""
+    return (
+        can_pad
+        and split_k == 1
+        and persistent_n_tiles == 1
+        and cluster_n > 1
+        and N % tile_n == 0
     )
 
 

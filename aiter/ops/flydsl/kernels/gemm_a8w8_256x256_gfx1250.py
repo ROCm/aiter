@@ -111,7 +111,9 @@ def launch_gemm_a8w8_256x256(
     m_run_cap: Constexpr[int] = 32,
     batch: fx.Int32 = 1,
 ):
-    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
+    """N must be a multiple of ``tile_n`` (of ``tile_n * cluster_n`` when
+    ``persistent_n_tiles > 1``; otherwise grid.y is padded to whole cluster
+    columns); M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
     least 512 per split. ``k_tiles_class`` buckets the K-tiles per split:
     0 for <= 16, 1 for <= 64, 2 above; long K loops keep the early merge
@@ -392,6 +394,12 @@ def launch_gemm_a8w8_256x256(
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
+        # Workgroups past N pad the last cluster column: they still multicast
+        # their real A to the column's peers, but read zero B and store nothing.
+        n_oob = i32_n - blk_n
+        b_oob = n_oob // 16
+        sb_oob = n_oob // (32 if const_expr(mx32) else 128)
+        c_rows = (n_oob > 0).select(mn_oob, fx.Int32(0))
         sa_oob = (
             (
                 (i32_m + 31) // 32 - blk_m // 32
@@ -531,7 +539,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    b_oob,
                     0,
                     True,
                 )
@@ -559,7 +567,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    sb_oob,
                     0,
                     True,
                 )
@@ -1793,7 +1801,7 @@ def launch_gemm_a8w8_256x256(
                     )
             rocdl.s_wait_dscnt(0)
             rocdl.sched_barrier(0)
-            q_rows = mn_oob - wmb
+            q_rows = c_rows - wmb
             q_rows = (q_rows < warp_tile_m).select(q_rows, fx.Int32(warp_tile_m))
             q_rows = (q_rows > 0).select(q_rows, fx.Int32(0))
             for part, row0, n_rows in (
@@ -1873,13 +1881,13 @@ def launch_gemm_a8w8_256x256(
                     c_lds_row=C_LDS_ROW,
                     split_k=split_k,
                     split_idx=split_idx,
-                    mn_oob=mn_oob,
+                    mn_oob=c_rows,
                     flat_tile=_flat_tile,
                     bounded_m=bounded_m,
                 )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
-                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                gtC = _gv(gC_base, c_off_rt, (c_rows, tile_n), (ldc64, 1))
                 atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
                     fx.rocdl.TensorStore(),
                     gtC,
@@ -1940,6 +1948,8 @@ def launch_gemm_a8w8_256x256(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
+    if const_expr(persistent_n_tiles == 1):
+        gy = ((gy + (cluster_n - 1)) // cluster_n) * cluster_n
     gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx
