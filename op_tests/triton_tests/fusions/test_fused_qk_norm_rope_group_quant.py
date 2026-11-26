@@ -11,7 +11,8 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 pytestmark = pytest.mark.skipif(
-    arch_info.get_arch() != "gfx1250", reason="gfx1250 Gluon kernel"
+    arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"),
+    reason="gfx1250 Gluon kernel",
 )
 
 NUM_HEADS = 128

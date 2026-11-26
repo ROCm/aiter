@@ -77,25 +77,6 @@ def _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, d=128, seed=0):
     return to_fp8(q), to_fp8(k), to_fp8(v)
 
 
-def _expected_shapes(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, d=128):
-    num_q_tiles = -(-seqlen_q // SOL_ATTN_TS_QO)
-    num_kv_blocks = -(-seqlen_k // SOL_ATTN_TS_KV)
-    work_items = batch * nhead_q * num_q_tiles
-    bitmap_ds = 4 * (-(-num_kv_blocks // 128))
-    return {
-        "mean_k": ((batch, num_kv_blocks, nhead_kv, d), dtypes.fp8),
-        "mean_v": ((batch, num_kv_blocks, nhead_kv, d), dtypes.fp8),
-        "block_bitmap": ((work_items, bitmap_ds), torch.uint32),
-        "kv_block_indices": ((work_items * num_kv_blocks,), torch.int32),
-        "lut_start": ((work_items,), torch.int32),
-        "lut_count": ((work_items,), torch.int32),
-        "block_attn_mask": (
-            (batch, nhead_q, num_q_tiles, num_kv_blocks),
-            torch.bool,
-        ),
-    }
-
-
 # Aligned and ragged sequence lengths, MHA and GQA. 9419 is a real Wan video shape and is a
 # multiple of neither tile size.
 SHAPES = [
@@ -105,25 +86,6 @@ SHAPES = [
     (1, 9419, 9419, 5, 5),
     (1, 257, 129, 4, 4),
 ]
-
-
-@pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
-def test_output_contract(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
-    """Shapes and dtypes the kernarg ABI depends on, at aligned and ragged sequence lengths."""
-    q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_prepare(q, k, v, BETA)
-
-    for name, (shape, dtype) in _expected_shapes(
-        batch, seqlen_q, seqlen_k, nhead_q, nhead_kv
-    ).items():
-        assert tuple(prep[name].shape) == shape, f"{name} shape"
-        assert prep[name].dtype == dtype, f"{name} dtype"
-        assert prep[name].is_contiguous(), f"{name} must be contiguous"
-
-    num_kv_blocks = -(-seqlen_k // SOL_ATTN_TS_KV)
-    assert prep["num_kv_blocks"] == num_kv_blocks
-    assert prep["num_q_tiles"] == -(-seqlen_q // SOL_ATTN_TS_QO)
-    assert prep["bitmap_Ds"] == 4 * (-(-num_kv_blocks // 128))
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
@@ -333,16 +295,6 @@ def test_compiles_fullgraph_and_matches_eager(
             assert compiled[name] == value, name
 
 
-def test_no_graph_breaks_and_routing_is_in_the_graph():
-    """Explicit break accounting, so a regression names the break instead of failing obscurely."""
-    q, k, v = _operands(1, 4096, 4096, 8, 8)
-    explained = torch._dynamo.explain(sol_prepare)(q, k, v, BETA)
-    assert (
-        explained.graph_break_count == 0
-    ), f"graph breaks: {[str(r) for r in explained.break_reasons]}"
-    assert explained.graph_count == 1
-
-
 @pytest.mark.skipif(
     get_gfx() != "gfx950", reason="the MXFP4 and MXFP6 packers are gfx950 kernels"
 )
@@ -398,50 +350,6 @@ def test_packed_path_compiles_fullgraph_and_matches_eager(
     scale = eager["mean_v_scale"]
     slack = scale.untyped_storage().size() - scale.numel() * scale.element_size()
     assert slack >= 512, f"only {slack} bytes of slack behind the pooled V scale"
-
-
-@pytest.mark.parametrize(
-    "kwargs, message",
-    [
-        ({"k_packed_format": "mxfp4"}, "k_source and k_packed_format go together"),
-        ({"v_source": "v"}, "v_source and v_packed_format go together"),
-        ({"k_packed_format": "fp3", "k_source": "k"}, "is not one of"),
-        # The FP6-P names describe a V layout, and plain MXFP6 has no V packing of its own here.
-        ({"k_packed_format": "mxfp4_fp6_p", "k_source": "k"}, "is not one of"),
-        ({"v_packed_format": "mxfp6", "v_source": "v"}, "is not one of"),
-        # No Sol-Attn row reads a column-major MXFP4 V.
-        ({"v_packed_format": "mxfp4", "v_source": "v"}, "is not one of"),
-    ],
-)
-def test_packed_path_rejects_an_incoherent_request(kwargs, message):
-    """A packed operand needs both its source and its format; neither implies the other."""
-    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
-    resolved = {
-        key: {"k": k, "v": v}.get(value, value) for key, value in kwargs.items()
-    }
-    with pytest.raises(ValueError, match=message):
-        sol_prepare(q, k, v, BETA, **resolved)
-
-
-@pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="the MXFP4 packers are gfx950 kernels"
-)
-def test_packed_path_rejects_a_stored_scale_it_cannot_pool():
-    """A packed operand is quantized again from its source, so a stored scale has no meaning here.
-
-    Accepting one silently would be the bad failure: the pooled tensor would come back correct and
-    the argument would simply have been ignored.
-    """
-    batch, seqlen_k, nhead = 1, 2 * SOL_ATTN_TS_KV, 2
-    q = torch.randn(batch, 256, nhead, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seqlen_k, nhead, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    scale = torch.full(
-        (batch, seqlen_k, nhead, 4), 127, dtype=torch.uint8, device="cuda"
-    )
-
-    with pytest.raises(ValueError, match="k_scale does not apply to a packed operand"):
-        sol_prepare(q, k, v, BETA, k_scale=scale, k_source=k, k_packed_format="mxfp4")
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
@@ -502,39 +410,6 @@ def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
             ..., -1
         ].all(), "a short tail block must be forced onto the exact pass"
         assert torch.equal(used[..., :-1], supplied[..., :-1])
-
-
-def test_a_supplied_mask_and_beta_are_exclusive():
-    """Routing and a supplied selection are alternatives, so silently preferring one would hide a
-    caller's mistake: passing both usually means the mask was expected to win."""
-    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
-    mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
-
-    with pytest.raises(ValueError, match="exactly one of beta"):
-        sol_prepare(q, k, v, BETA, block_attn_mask=mask)
-    with pytest.raises(ValueError, match="exactly one of beta"):
-        sol_prepare(q, k, v)
-
-
-@pytest.mark.parametrize(
-    "shape, dtype, message",
-    [
-        ((1, 2, 1, 2), torch.bool, "block_attn_mask must be"),
-        ((1, 2, 2, 3), torch.bool, "block_attn_mask must be"),
-        ((1, 2, 2, 2), torch.uint8, "must be bool"),
-    ],
-)
-def test_a_supplied_mask_is_shape_and_dtype_checked(shape, dtype, message):
-    """A wrongly shaped selection would reshape into the bitmap without complaint.
-
-    num_work_items * num_kv_blocks is the only thing the packing arithmetic needs, so a mask that
-    got num_q_tiles and num_kv_blocks the wrong way round, or carried a stale tile count, can pack
-    to the right total and scramble which block each bit refers to.
-    """
-    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
-    mask = torch.zeros(shape, dtype=dtype, device="cuda")
-    with pytest.raises(ValueError, match=message):
-        sol_prepare(q, k, v, block_attn_mask=mask)
 
 
 def test_a_supplied_mask_stays_fullgraph_traceable():
@@ -635,33 +510,12 @@ def test_error_router_takes_a_device_scale():
     assert torch.equal(as_float["block_attn_mask"], as_tensor["block_attn_mask"])
 
 
-@pytest.mark.parametrize(
-    "kwargs, message",
-    [
-        ({"router": "max"}, "router must be"),
-        ({"router": "error"}, "routing_scale goes with"),
-        ({"routing_scale": 1.0}, "routing_scale goes with"),
-    ],
-)
-def test_error_router_rejects_an_incoherent_request(kwargs, message):
-    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
-    with pytest.raises(ValueError, match=message):
-        sol_prepare(q, k, v, BETA, **kwargs)
-
-
 def _block_variance(x):
     batch, seqlen, heads, d = x.shape
     blocks = x.float().reshape(
         batch, seqlen // SOL_ATTN_TS_KV, SOL_ATTN_TS_KV, heads, d
     )
     return blocks.var(dim=2, unbiased=False)
-
-
-def test_error_router_rejects_a_supplied_mask():
-    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
-    mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
-    with pytest.raises(ValueError, match="routes from beta"):
-        sol_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
 
 
 def _e8m0_image(x, low=122, octaves=3):

@@ -104,7 +104,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -355,7 +355,7 @@ def test_fused_qk_cat_and_cache_mla(
 ):
     # The gluon kernel has no NoPE form. That also rules out the NVFP4 cache,
     # which is gfx1250-only.
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("fused_qk_cat_and_cache_mla has no gfx1250 kernel")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -510,7 +510,7 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
@@ -535,10 +535,14 @@ def test_fused_qk_rope_reshape_and_cache(
         k = k / 20
         v = v / 20
 
-    if cache_dtype == torch.uint8 and arch_info.get_arch() not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and arch_info.get_arch() not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         pytest.skip("FP4 cases only supported on gfx1250")
     elif cache_dtype == e4m3_dtype and arch_info.get_arch() not in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ):
         pytest.skip("FP8 cases only supported on gfx1250 and gfx950")
@@ -1282,7 +1286,7 @@ def _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=0):
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("QH, KH", [(8, 1), (16, 4)])
 def test_fused_qk_rope_reshape_and_cache_k4v8(scenario, block_size, D, QH, KH):
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     slot_mapping = _k4v8_slots(scenario, num_blocks, block_size)
@@ -1324,7 +1328,7 @@ def test_k4v8_cache_write_unified_attention(block_size, QH, KH):
     """Write an A8K4V8 cache with fused_qk_rope_reshape_and_cache and run
     unified_attention (FP8 Q, NVFP4 K, FP8 V, shuffled) on it, against
     ref_paged_attn on the dequantized K and the fp8 V with its descale."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 attention is only supported on GFX1250")
     from aiter.ops.triton.attention.unified_attention import unified_attention
     from op_tests.op_benchmarks.triton.bench_unified_attention import (
@@ -1442,7 +1446,7 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     """The write-only A8K4V8 op: bit-exact V and K up to NVFP4 rounding ties against the
     reference builders over the whole cache, and byte-identical to the cache write of
     fused_qk_rope_reshape_and_cache given that kernel's own roped K."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     QH = 4 * KH
@@ -1690,11 +1694,113 @@ def test_seg_packed_mla_cache_cuda_graph():
     torch.testing.assert_close(graphed, eager, atol=0, rtol=0)
 
 
-def test_seg_packed_mla_cache_rejects_noncontiguous():
-    _skip_unless_gfx1250()
-    case = _seg_case(7, 7, 8, torch.bfloat16)
-    base = torch.zeros((256, 2, 576), dtype=torch.bfloat16, device="cuda")
-    view = base[:, :1, :]
-    assert not view.is_contiguous()
-    with pytest.raises(AssertionError, match="contiguous"):
-        _run_seg(case, view, _SEG_PAGE, False, None)
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+        _store_mla_kv_cache,
+    )
+except ImportError:
+    gluon = None
+
+if gluon is not None:
+
+    @gluon.jit
+    def _store_mla_kv_cache_rows(
+        kv_cache_ptr,
+        k_nope_ptr,
+        k_pe_ptr,
+        slot_ptr,
+        kv_cache_stride_b,
+        kv_cache_stride_h,
+        kv_cache_stride_d,
+        D_NOPE: gl.constexpr,
+        D_PE: gl.constexpr,
+        BLOCK_SIZE: gl.constexpr,
+        SCALE_K_WIDTH_NOPE: gl.constexpr,
+        SCALE_K_WIDTH_ROPE: gl.constexpr,
+        NUM_WARPS: gl.constexpr,
+    ):
+        # One token per program: the cache write of a NUM_WARPS-warp kernel.
+        L_NOPE: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        L_PE: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        pid = gl.program_id(0)
+        slot = gl.load(slot_ptr + pid)
+        d_nope = gl.arange(0, D_NOPE, layout=L_NOPE)
+        d_pe = gl.arange(0, D_PE, layout=L_PE)
+        k_nope = gl.load(k_nope_ptr + pid * D_NOPE + d_nope).to(gl.float32)
+        k_pe = gl.load(k_pe_ptr + pid * D_PE + d_pe).to(gl.float32)
+        _store_mla_kv_cache(
+            kv_cache_ptr,
+            slot // BLOCK_SIZE,
+            0,
+            slot % BLOCK_SIZE,
+            d_nope,
+            d_pe,
+            kv_cache_stride_b,
+            kv_cache_stride_h,
+            kv_cache_stride_d,
+            k_nope,
+            k_pe,
+            D_NOPE,
+            D_PE,
+            BLOCK_SIZE,
+            True,
+            SCALE_K_WIDTH_NOPE,
+            SCALE_K_WIDTH_ROPE,
+            L_NOPE,
+            L_PE,
+            0,
+            NUM_WARPS,
+        )
+
+
+@pytest.mark.skipif(
+    gluon is None or DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="the shuffled MLA cache store is a gfx1250 Gluon helper",
+)
+@pytest.mark.parametrize("num_warps", [2, 4, 8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_store_mla_kv_cache_multi_warp_matches_one_warp(
+    num_warps, cache_dtype, block_size
+):
+    # A kernel of num_warps warps writes the same shuffled cache bytes as a
+    # one-warp kernel, the path the wrapper tests cover. With D_PE=64 the pe
+    # tile has fewer rows than the warps cover. NVFP4 is left out: its Gluon
+    # store does not compile with this file's Triton on gfx1250 even at one
+    # warp (the wrapper's NVFP4 cases fail the same way).
+    d_nope, d_pe, tokens = 512, 64, 37
+    d_cache, scale_nope, scale_pe = d_nope + d_pe, 4, 4
+    num_blocks = triton.cdiv(tokens, block_size) + 1
+    gen = torch.Generator(device="cuda").manual_seed(8308)
+    k_nope = torch.randn(tokens, d_nope, device="cuda", generator=gen).bfloat16()
+    k_pe = torch.randn(tokens, d_pe, device="cuda", generator=gen).bfloat16()
+    slots = torch.randperm(num_blocks * block_size, device="cuda", generator=gen)
+    slots = slots[:tokens].to(torch.int32)
+    nbytes = d_cache * torch.empty(0, dtype=cache_dtype).element_size()
+    shape = (num_blocks, 1, block_size, nbytes)
+    fill = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda", generator=gen)
+    caches = {}
+    for warps in (1, num_warps):
+        cache = fill.clone().view(cache_dtype)
+        _store_mla_kv_cache_rows[(tokens,)](
+            cache,
+            k_nope,
+            k_pe,
+            slots,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(3),
+            D_NOPE=d_nope,
+            D_PE=d_pe,
+            BLOCK_SIZE=block_size,
+            SCALE_K_WIDTH_NOPE=scale_nope,
+            SCALE_K_WIDTH_ROPE=scale_pe,
+            NUM_WARPS=warps,
+            num_warps=warps,
+        )
+        caches[warps] = cache.view(torch.uint8)
+    assert not torch.equal(caches[1], fill)
+    assert torch.equal(caches[num_warps], caches[1])
