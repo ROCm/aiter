@@ -9,6 +9,7 @@ import os
 import pytest
 
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import (
+    ROUTE_PREFIX,
     ROWS,
     ExpertCfg,
     RouterCfg,
@@ -99,3 +100,21 @@ def test_tuned_rows_name_valid_configs():
         seen.add(key)
         parse_impl_kernel_name(r["kernelName1"]).legal()
         assert RouterCfg.parse(r["kernelName2"]).fits(n)
+
+
+def test_direct_router_needs_the_kernels_split_k():
+    """The ``direct`` kernel asserts split_k == 48 at compile time: a name with another split-K does not fit."""
+    assert RouterCfg("direct", 48, 64).fits(8)
+    for split_k in (8, 16, 24, 32, 96):
+        assert not RouterCfg("direct", split_k, 64).fits(8), split_k
+
+
+def test_zero_valued_names_do_not_divide_by_zero():
+    for name in (
+        "nblocks_s0_bk64_w2_nb1_q0",
+        "nblocks_s48_bk0_w2_nb1_q0",
+        "direct_s0_bk0",
+    ):
+        cfg = RouterCfg.parse(ROUTE_PREFIX + name)
+        for m in (8, 16, 32, 100):
+            assert not cfg.fits(m), (name, m)

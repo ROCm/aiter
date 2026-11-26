@@ -233,14 +233,22 @@ class RouterCfg:
         ``_direct`` / ``_lines`` and the row coverage."""
         if not (1 <= m <= ROUTER_MAX_ROWS):
             return False
-        if self.split_k % 8 or self.split_k > 96 or H % self.split_k:
+        # positive bounds first: names parse to zero split / block values, which must not reach a modulo
+        if not (0 < self.split_k <= 96 and self.block_k > 0):
+            return False
+        if self.split_k % 8 or H % self.split_k:
             return False
         kc = H // self.split_k
         if self.block_k % 32 or kc % self.block_k or not 32 <= self.block_k <= 128:
             return False
         if self.kind == "direct":
-            # 16-row tiles, no LDS; the verified (split_k, block_k) pairs of the kernel
-            return m <= 16 and self.waves == 0 and self.block_k <= 64
+            # 16-row tiles, no LDS; the kernel's fixed split-K (compile-time assert) and its verified block_k
+            return (
+                m <= 16
+                and self.split_k == 48
+                and self.waves == 0
+                and self.block_k <= 64
+            )
         if self.kind == "lines":
             return 17 <= m <= 32 and self.split_k == 48 and self.block_k == 64
         if self.nbw not in (1, 2, 4, 8) or self.quant not in (0, 1, 2):

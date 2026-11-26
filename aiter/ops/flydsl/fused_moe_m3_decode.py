@@ -22,6 +22,7 @@ call).
 
 import torch
 
+from aiter import dtypes
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import (
     ROWS,
@@ -50,12 +51,20 @@ def routed_w13_scale_layout(w13_scale: torch.Tensor) -> torch.Tensor:
     ).view(torch.uint8)
 
 
+def _shared_s13_layout(s13: torch.Tensor) -> torch.Tensor:
+    b13 = s13.view(torch.uint8).reshape(48, 2, 16, 24, 2, 4).permute(0, 3, 5, 2, 4, 1)
+    return b13.contiguous()
+
+
+def _shared_s2_layout(s2: torch.Tensor) -> torch.Tensor:
+    b2 = s2.view(torch.uint8).reshape(192, 2, 16, 3, 2, 4).permute(0, 3, 5, 2, 4, 1)
+    return b2.contiguous()
+
+
 def shared_scale_layouts(s13: torch.Tensor, s2: torch.Tensor):
     """Row-major e8m0 scales of the shared gate_up [2I, H / 32] and down [H, I / 32] -> the tile layouts (pure
     permutations)."""
-    b13 = s13.view(torch.uint8).reshape(48, 2, 16, 24, 2, 4).permute(0, 3, 5, 2, 4, 1)
-    b2 = s2.view(torch.uint8).reshape(192, 2, 16, 3, 2, 4).permute(0, 3, 5, 2, 4, 1)
-    return b13.contiguous(), b2.contiguous()
+    return _shared_s13_layout(s13), _shared_s2_layout(s2)
 
 
 def _derived(kind: str, src: torch.Tensor, build):
@@ -91,12 +100,16 @@ def prepare_decode_weights(w1_scale, shared_w1_scale, shared_w2_scale):
         w1_scale.view(torch.uint8).view(E, 2 * I, H // 32),
         routed_w13_scale_layout,
     )
-    ss13, ss2 = _derived(
-        "ss",
+    # the two shared layouts depend on different source tensors: cache them independently
+    ss13 = _derived(
+        "ss13",
         shared_w1_scale.view(torch.uint8).reshape(2 * I, H // 32),
-        lambda a: shared_scale_layouts(
-            a, shared_w2_scale.view(torch.uint8).reshape(H, I // 32)
-        ),
+        _shared_s13_layout,
+    )
+    ss2 = _derived(
+        "ss2",
+        shared_w2_scale.view(torch.uint8).reshape(H, I // 32),
+        _shared_s2_layout,
     )
     return s13, ss13, ss2
 
@@ -133,6 +146,10 @@ def check_request(req: FusedMoeRequest) -> str | None:
         return "shared expert weights and scales are required"
     if sw1.numel() != 2 * I * H or sw2.numel() != H * I:
         return "shared expert is not MXFP8 [1536, 6144] / [6144, 768]"
+    if sw1.dtype != dtypes.fp8 or sw2.dtype != dtypes.fp8:
+        return "shared expert weights must be float8_e4m3fn (MXFP8)"
+    if not (getattr(sw1, "is_shuffled", False) and getattr(sw2, "is_shuffled", False)):
+        return "shared expert weights must be preshuffled (is_shuffled=True)"
     if req.shared_w1_scale.numel() != 2 * I * H // 32:
         return "shared_w1_scale shape"
     if req.shared_w2_scale.numel() != H * I // 32:

@@ -745,6 +745,12 @@ def fused_moe(
                 "w2_global_scale": w2_global_scale,
                 "linear_beta": linear_beta,
                 "splitk": splitk,
+                "quant_type_a": None if quant_type_a is None else str(quant_type_a),
+                "quant_dtype_a2": quant_dtype_a2,
+                # the row quantizes the input to the weights' dtype: only that (or no override) is served
+                "quant_dtype_a": (
+                    None if quant_dtype_a in (None, w1.dtype) else quant_dtype_a
+                ),
             },
         )
     # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
@@ -1065,7 +1071,12 @@ def moe_route_quant(
         cfg = RouterCfg.parse(name)
         if not cfg.fits(m):
             cfg = None
-    if router_weight_lines is None and router_weight.is_contiguous():
+    if (
+        router_weight_lines is None
+        and router_weight.is_contiguous()
+        and tuple(router_weight.shape) == (128, 6144)
+        and router_weight.dtype == torch.float32
+    ):  # route_quant_small returns None for any other gate: do not build the line layout for it
         router_weight_lines = router_lines(router_weight)
     return route_quant_small(
         hidden_states,

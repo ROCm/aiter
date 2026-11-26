@@ -114,14 +114,23 @@ class _TempRow:
             f.write(",".join(SHARED_COLUMNS) + "\n")
             f.write(",".join(str(row[c]) for c in SHARED_COLUMNS) + "\n")
 
+    @staticmethod
+    def _clear(fm):
+        # get_config_file is lru-cached on (env name, default, tuned name), not on the env value: without
+        # clearing it the table resolved first (production CSV on entry, the temporary one on exit) stays selected
+        from aiter.jit.core import AITER_CONFIGS
+
+        AITER_CONFIGS.get_config_file.cache_clear()
+        get_2stage_cfgs.cache_clear()
+        fm.cfg_2stages_by_file.clear()
+        fm._decode_route_cfg_names.cache_clear()
+
     def __enter__(self):
         import aiter.fused_moe as fm
 
         self.old = os.environ.get("AITER_CONFIG_SHARED_FMOE")
         os.environ["AITER_CONFIG_SHARED_FMOE"] = self.path
-        get_2stage_cfgs.cache_clear()
-        fm.cfg_2stages_by_file.clear()
-        fm._decode_route_cfg_names.cache_clear()
+        self._clear(fm)
         return self
 
     def __exit__(self, *exc):
@@ -131,9 +140,7 @@ class _TempRow:
             os.environ.pop("AITER_CONFIG_SHARED_FMOE", None)
         else:
             os.environ["AITER_CONFIG_SHARED_FMOE"] = self.old
-        get_2stage_cfgs.cache_clear()
-        fm.cfg_2stages_by_file.clear()
-        fm._decode_route_cfg_names.cache_clear()
+        self._clear(fm)
 
 
 def _prequant_call(xq, xs, q8, s8, w, ids):

@@ -25,7 +25,7 @@ if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
     pytest.skip("needs a gfx950 GPU", allow_module_level=True)
 
 from aiter import ActivationType, QuantType
-from aiter.fused_moe import fused_moe
+from aiter.fused_moe import fused_moe, moe_route_quant
 from aiter.ops.flydsl import fused_moe_m3_decode as m3
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_bench import (
     DEV as dev,
@@ -90,16 +90,14 @@ def test_expert_configs_are_bit_identical(n):
     L, (gate, bias), x = make_layer(), make_router(), make_x(n)
     lines = router_line_layout(gate)
     ref, _, _ = chain_direct(x, L, gate, lines, bias)
-    bad = []
+    bad, checked = [], 0
     for cfg in expert_candidates(n):
-        try:
-            out, _, _ = chain_direct(x, L, gate, lines, bias, ecfg=cfg)
-        except Exception as exc:  # noqa: BLE001
-            print(f"n={n} {cfg.name()}: {type(exc).__name__}")
-            continue
+        # every candidate is a legal tiling: an exception is a failure, not a skipped iteration
+        out, _, _ = chain_direct(x, L, gate, lines, bias, ecfg=cfg)
         if not torch.equal(out, ref):
             bad.append(cfg.name())
-    assert not bad, bad
+        checked += 1
+    assert checked == len(expert_candidates(n)) and not bad, bad
 
 
 @pytest.mark.parametrize("n", ROWS)
@@ -186,6 +184,125 @@ def test_ignored_arguments_fail_closed(kw):
             **kw,
             **shared_kw(L),
         )
+
+
+def _fmoe16(L, w, ids, x, **kw):
+    return fused_moe(
+        x,
+        L["w1"],
+        L["w2"],
+        w,
+        ids,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=L["w1_scale"],
+        w2_scale=L["w2_scale"],
+        **{**shared_kw(L), **kw},
+    )
+
+
+def test_activation_overrides_fail_closed():
+    """The row quantizes to the weights' dtype: another activation dtype / quant type is refused, the weights'
+    own dtype is the same request as no override."""
+    from aiter import dtypes
+
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
+    for kw in (
+        {"quant_dtype_a": dtypes.fp8},
+        {"quant_dtype_a2": dtypes.fp4x2},
+        {"quant_type_a": QuantType.per_Token.value},
+    ):
+        with pytest.raises(NotImplementedError):
+            _fmoe16(L, w, ids, x, **kw)
+    assert torch.equal(
+        _fmoe16(L, w, ids, x, quant_dtype_a=L["w1"].dtype), _fmoe16(L, w, ids, x)
+    )
+
+
+def test_shared_weights_must_be_preshuffled_e4m3():
+    """The kernels hard-code the preshuffled E4M3FN operand layout: a row-major or E5M2 shared weight of the right
+    size is refused, not reinterpreted."""
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
+    plain = dict(L, shared_w1=L["shared_w1"].clone())  # no is_shuffled marker
+    plain["shared_w1"].is_shuffled = False
+    e5m2 = dict(L, shared_w2=L["shared_w2"].view(torch.uint8).view(torch.float8_e5m2))
+    e5m2["shared_w2"].is_shuffled = True
+    for bad in (plain, e5m2):
+        with pytest.raises(NotImplementedError):
+            _fmoe16(bad, w, ids, x)
+
+
+def test_shared_scale_layouts_are_cached_independently():
+    """Replacing only the down scales re-lays only ``ss2``; the gate / up layout stays the cached one."""
+    L = make_layer()
+    _, ss13, ss2 = m3.prepare_decode_weights(
+        L["w1_scale"], L["shared_w1_scale"], L["shared_w2_scale"]
+    )
+    new_down = L["shared_w2_scale"].view(torch.uint8).clone()
+    new_down[0, 0] ^= 1
+    _, ss13b, ss2b = m3.prepare_decode_weights(
+        L["w1_scale"], L["shared_w1_scale"], new_down
+    )
+    assert ss13b is ss13
+    assert not torch.equal(ss2b, ss2)
+    want = m3.shared_scale_layouts(L["shared_w1_scale"], new_down)[1]
+    assert torch.equal(ss2b, want)
+
+
+@pytest.mark.parametrize("case", ["all_dropped", "mixed"])
+def test_dropped_routes_contribute_nothing(case):
+    """An id outside [0, E) is a dropped route: its slot adds zero (the same output as that slot's weight being 0),
+    not uninitialized GEMM2 buffer contents."""
+    n = 16
+    L, x = make_layer(), make_x(n)
+    ids = torch.randint(0, E, (n, 4), dtype=torch.int32, device=dev)
+    w = torch.rand((n, 4), device=dev)
+    dropped = ids.clone()
+    zeroed = w.clone()
+    if case == "all_dropped":
+        dropped.fill_(-1)
+        zeroed.zero_()
+    else:
+        dropped[:, 1] = -1
+        dropped[2, :] = E
+        zeroed[:, 1] = 0
+        zeroed[2, :] = 0
+    # poison the allocator so an uninitialized slot buffer would read NaN
+    junk = torch.full((n, 4, H), float("nan"), dtype=torch.bfloat16, device=dev)
+    del junk
+    got = integrated(x, L, w, dropped)
+    want = integrated(x, L, zeroed, ids)
+    assert torch.isfinite(got.float()).all()
+    assert torch.equal(got, want)
+
+
+def test_route_quant_rejects_other_gates_without_building_layouts():
+    gate, bias = make_router()
+    x = make_x(16)
+    n0 = len(m3._DERIVED)
+    assert moe_route_quant(x, gate.half(), bias) is None  # fp16 gate
+    assert moe_route_quant(x, gate[:64].contiguous(), bias) is None  # wrong shape
+    assert len(m3._DERIVED) == n0
+
+
+def test_tuner_row_selection_follows_the_environment():
+    """``_TempRow`` really switches the shared table (``get_config_file`` is lru-cached on the env *name*) and
+    restores the previous one."""
+    import aiter.fused_moe as fm
+    from aiter.jit.core import AITER_CONFIGS
+    from csrc.ck_gemm_moe_2stages_codegen.decode_chain_tune import (
+        _TempRow,
+        row_key,
+    )
+
+    before = AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE  # primes the cache
+    row = _TempRow(row_key(16, "gfx950", 256), "k1", "k2")
+    with row:
+        assert AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE == row.path
+    assert AITER_CONFIGS.AITER_CONFIG_SHARED_FMOE_FILE == before
+    assert fm.cfg_2stages_by_file == {} or row.path not in fm.cfg_2stages_by_file
 
 
 # ---------------------------------------------------------------- timing

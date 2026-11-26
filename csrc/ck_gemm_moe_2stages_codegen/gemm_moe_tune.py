@@ -7545,6 +7545,7 @@ class DecodeChainTuner(FmoeTuner):
         fmoe_module._decode_route_cfg_names.cache_clear()
 
     def tune(self, untunedf, tunedf, args):
+        from aiter.fused_moe import get_padded_M
         from csrc.ck_gemm_moe_2stages_codegen.decode_chain_tune import tune_shape
 
         del tunedf
@@ -7558,6 +7559,15 @@ class DecodeChainTuner(FmoeTuner):
             if shape != (6144, 768, 128, 4) or not 8 <= int(row["token"]) <= 128:
                 print(
                     f"[decode-chain] skip {dict(row)}: only E128 top-4 H6144 I768, 8-128 tokens",
+                    flush=True,
+                )
+                continue
+            if int(row["token"]) != get_padded_M(int(row["token"])):
+                # shared-folded dispatch looks the row up under get_padded_M(rows): a row of another token count
+                # would never be selected
+                print(
+                    f"[decode-chain] skip {dict(row)}: token must be a dispatch bucket "
+                    f"({get_padded_M(int(row['token']))} for {int(row['token'])})",
                     flush=True,
                 )
                 continue
