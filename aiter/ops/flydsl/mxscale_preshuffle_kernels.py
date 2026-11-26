@@ -584,8 +584,8 @@ def run_gemm_a8w8_mxfp8_gfx950(
     row's mxpsh, 8-wave or 4-wave kernelName, else the heuristic picks an mxpsh tile.
     """
     from ..gemm_op_common import mxscale_w_scale_block
-    from .gemm_a8w8_mxfp8_8wave import NAME_PREFIX as MXFP8_8WAVE_PREFIX
     from .gemm_a8w8_mxfp8_4wave import NAME_PREFIX as MXFP8_4WAVE_PREFIX
+    from .gemm_a8w8_mxfp8_8wave import NAME_PREFIX as MXFP8_8WAVE_PREFIX
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
 
     if w_scale_block is None:
@@ -601,14 +601,23 @@ def run_gemm_a8w8_mxfp8_gfx950(
 
     warn_untuned = False
     if kernel_name is not None and kernel_name.startswith(f"{MXFP8_4WAVE_PREFIX}_"):
-        if Out.dtype == torch.bfloat16 and w_scale_block == "1x32":
+        from .gemm_a8w8_mxfp8_4wave import fits_shape as fits_4wave
+
+        # A padded-M lookup can hand a row to an M the kernel does not take (32-bit
+        # buffer sizes): that call runs the heuristic tile like any other non-4-wave call.
+        if (
+            Out.dtype == torch.bfloat16
+            and w_scale_block == "1x32"
+            and fits_4wave(int(XQ.shape[0]), int(WQ.shape[0]), int(XQ.shape[1]))
+        ):
             from .gemm_a8w8_mxfp8_4wave import run_gemm_a8w8_mxfp8_4wave
 
             return run_gemm_a8w8_mxfp8_4wave(
                 XQ, WQ, x_scale, w_scale, Out, kernel_name, w_scale_block
             )
-        # The 4-wave kernel writes bf16 and reads 1x32 w_scales only; any other
-        # call runs the mxpsh heuristic tile for this (tuned) shape instead.
+        # The 4-wave kernel writes bf16, reads 1x32 w_scales only and takes the shapes of
+        # ``fits_shape``; any other call runs the mxpsh heuristic tile for this (tuned)
+        # shape instead.
         kernel_name = None
     elif kernel_name is not None and kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
         if Out.dtype == torch.bfloat16:

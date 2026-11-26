@@ -16,11 +16,8 @@ from __future__ import annotations
 
 import functools
 import re
-from collections import OrderedDict
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K step, a 256x256 parent
@@ -119,45 +116,33 @@ def launch_plan(
 
 # W-scale shuffles, one per scale tensor: (device, ptr, shape, stride, version) -> (the
 # tensor, its shuffle). The entry holds the tensor, so its storage cannot be freed and
-# reused under the key; an in-place update changes the version and misses.
-_W_SCALE_CACHE: "OrderedDict[tuple, tuple[Tensor, Tensor]]" = OrderedDict()
+# reused under the key; an in-place update changes the version and misses. Entries are
+# never evicted (a captured graph reads them by raw pointer): at the cap a new scale is
+# shuffled on every call instead of cached.
+_W_SCALE_CACHE: dict[tuple, tuple[Tensor, Tensor]] = {}
 _W_SCALE_CACHE_MAX = 512
-
-
-@triton.jit
-def _shuffle_scale_kernel(src_ptr, dst_ptr, rows, cols, k1, tiles, TILES: tl.constexpr):
-    """dst[N1, K1, 4 (k lane), 16 (n lane), 2 (k pack), 2 (n pack)] = src[N1, 2, 16, K1, 2, 4]
-    over 32-row groups (``shuffle_scale_a16w4``'s order for one expert, not gate/up); rows
-    >= ``rows`` read as 127 (2^0), the padding of the last 32-row group. One program moves
-    TILES tiles of 32 rows x 8 columns (256 contiguous output bytes each)."""
-    e = tl.arange(0, 256)
-    # the element's place in the tile: (k_l, n_l, k_p, n_p) are the output's fastest 4 digits
-    n_p = e % 2
-    k_p = (e // 2) % 2
-    n_l = (e // 4) % 16
-    k_l = e // 64
-    r = n_p * 16 + n_l
-    c = k_p * 4 + k_l
-    for t in range(TILES):
-        tile = (tl.program_id(0) * TILES + t).to(tl.int64)
-        n1 = tile // k1
-        kk = tile % k1
-        row = n1 * 32 + r
-        live = tile < tiles
-        v = tl.load(
-            src_ptr + row * cols + kk * 8 + c, mask=live & (row < rows), other=127
-        )
-        tl.store(dst_ptr + tile * 256 + e, v, mask=live)
 
 
 def _shuffled_scale(scale: Tensor) -> Tensor:
     """Row-major e8m0 [rows, K / 32] -> the kernel's ``shuffle_scale_a16w4`` order, the rows
     padded to 32 with 127 (2^0), flattened to bytes. One Triton kernel (the torch version is
-    a padded 7-D permute copy, 5-13 us at M 1024-16384, about 3x slower)."""
+    a padded 7-D permute copy, 5-13 us at M 1024-16384, about 3x slower). Triton is imported
+    here, so importing this module (and the tuner catalog that holds it) does not load it.
+    """
+    from .kernels.tensor_shim import env
+
     rows, cols = scale.shape
     padded = -(-rows // 32) * 32
     assert cols % 8 == 0, cols  # K % 256 == 0
     out = torch.empty(padded * cols, dtype=torch.uint8, device=scale.device)
+    if env.compile.compile_only:
+        # An AOT replay compiles FlyDSL kernels on FakeTensors and launches nothing; a Triton
+        # launch is another backend's and the dry run's driver stand-in rejects it.
+        return out
+    import triton
+
+    from .kernels.mxfp8_scale_shuffle_triton import _shuffle_scale_kernel
+
     tiles = out.numel() // 256
     _shuffle_scale_kernel[(triton.cdiv(tiles, 4),)](
         scale.view(torch.uint8), out, rows, cols, cols // 8, tiles, TILES=4
@@ -166,25 +151,69 @@ def _shuffled_scale(scale: Tensor) -> Tensor:
 
 
 def _w_scale_shuffled(w_scale: Tensor) -> Tensor:
+    """The shuffled form of ``w_scale``, cached per scale tensor. Safe to call from any
+    stream: an entry is published only after its shuffle has finished. A miss inside a CUDA
+    graph capture is not published (the shuffle is then only recorded, and the buffer
+    belongs to that graph's private pool): that graph shuffles on every replay. Warm the
+    cache eagerly before capture for the fast path."""
+    from aiter.utility.graph_alloc import persistent_alloc
+
+    from .kernels.tensor_shim import env
+
     key = (
         w_scale.device,
         w_scale.data_ptr(),
         tuple(w_scale.shape),
         tuple(w_scale.stride()),
         # inference tensors (created under torch.inference_mode(), e.g. weights loaded there)
-        # have no version counter; they cannot be updated in place outside inference mode
-        # either, so the pointer + the held tensor identify the content
+        # have no version counter, so an in-place update of one is not detected: the scales
+        # of a loaded weight are read-only by contract
         -1 if w_scale.is_inference() else w_scale._version,
     )
     hit = _W_SCALE_CACHE.get(key)
     if hit is not None:
-        _W_SCALE_CACHE.move_to_end(key)
         return hit[1]
-    shuffled = _shuffled_scale(w_scale)
+    if (
+        env.compile.compile_only  # an AOT replay: no GPU runtime to allocate / synchronize on
+        or torch.cuda.is_current_stream_capturing()
+        or len(_W_SCALE_CACHE) >= _W_SCALE_CACHE_MAX
+    ):
+        return _shuffled_scale(w_scale)
+    with persistent_alloc(w_scale.device):
+        shuffled = _shuffled_scale(w_scale)
+    # the shuffle runs on the current stream: finish it before another stream can find the entry
+    torch.cuda.current_stream(w_scale.device).synchronize()
     _W_SCALE_CACHE[key] = (w_scale, shuffled)
-    if len(_W_SCALE_CACHE) > _W_SCALE_CACHE_MAX:
-        _W_SCALE_CACHE.popitem(last=False)
     return shuffled
+
+
+def _check_operands(XQ: Tensor, WQ: Tensor, Out: Tensor) -> tuple[int, int, int]:
+    """The operand contract shared by the raw-scale wrapper and the shuffled-scale launch;
+    returns (M, N, K). M == 0 is allowed (nothing to launch), any other M needs
+    ``fits_shape``."""
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError(
+            f"[FlyDSL mxfp8 4wave] A/B must be 2-D, got {tuple(XQ.shape)}, {tuple(WQ.shape)}"
+        )
+    if XQ.element_size() != 1 or WQ.element_size() != 1:
+        raise ValueError("[FlyDSL mxfp8 4wave] A/B must be 1-byte fp8 storage")
+    if Out.dtype != torch.bfloat16 or not Out.is_contiguous():
+        raise ValueError("[FlyDSL mxfp8 4wave] Out must be a contiguous bf16 tensor")
+    if XQ.device.type != "cuda" or WQ.device != XQ.device or Out.device != XQ.device:
+        raise ValueError("[FlyDSL mxfp8 4wave] A, B and Out must be on one CUDA device")
+    M, K = XQ.shape
+    N = WQ.shape[0]
+    if K != WQ.shape[1] or tuple(Out.shape) != (M, N):
+        raise ValueError(
+            f"[FlyDSL mxfp8 4wave] shapes A {tuple(XQ.shape)}, B {tuple(WQ.shape)}, "
+            f"Out {tuple(Out.shape)} do not agree"
+        )
+    if M > 0 and not fits_shape(M, N, K):
+        raise ValueError(
+            f"[FlyDSL mxfp8 4wave] needs N % {BLOCK_N} == 0, K % {K_ALIGN} == 0, "
+            f"K >= {K_MIN}, 32-bit buffer sizes; got M={M} N={N} K={K}"
+        )
+    return M, N, K
 
 
 def flydsl_mxfp8_4wave_gemm(
@@ -205,26 +234,7 @@ def flydsl_mxfp8_4wave_gemm(
     K a multiple of 256 and >= 512, M any. The first call with a given w_scale tensor
     shuffles it (a few kernels): warm it before a CUDA-graph capture.
     """
-    if XQ.dim() != 2 or WQ.dim() != 2:
-        raise ValueError(
-            f"[FlyDSL mxfp8 4wave] A/B must be 2-D, got {tuple(XQ.shape)}, {tuple(WQ.shape)}"
-        )
-    if XQ.element_size() != 1 or WQ.element_size() != 1:
-        raise ValueError("[FlyDSL mxfp8 4wave] A/B must be 1-byte fp8 storage")
-    if Out.dtype != torch.bfloat16 or not Out.is_contiguous():
-        raise ValueError("[FlyDSL mxfp8 4wave] Out must be a contiguous bf16 tensor")
-    M, K = XQ.shape
-    N = WQ.shape[0]
-    if K != WQ.shape[1] or tuple(Out.shape) != (M, N):
-        raise ValueError(
-            f"[FlyDSL mxfp8 4wave] shapes A {tuple(XQ.shape)}, B {tuple(WQ.shape)}, "
-            f"Out {tuple(Out.shape)} do not agree"
-        )
-    if not fits_shape(M, N, K):
-        raise ValueError(
-            f"[FlyDSL mxfp8 4wave] needs N % {BLOCK_N} == 0, K % {K_ALIGN} == 0, "
-            f"K >= {K_MIN}, 32-bit buffer sizes; got M={M} N={N} K={K}"
-        )
+    M, N, K = _check_operands(XQ, WQ, Out)
     for name, t, rows in (("x_scale", x_scale, M), ("w_scale", w_scale, N)):
         if tuple(t.shape) != (rows, K // SCALE_GROUP):
             raise ValueError(
@@ -235,8 +245,8 @@ def flydsl_mxfp8_4wave_gemm(
             raise ValueError(
                 f"[FlyDSL mxfp8 4wave] {name} must be contiguous 1-byte e8m0"
             )
-    if any(t.device != XQ.device for t in (WQ, x_scale, w_scale, Out)):
-        raise ValueError("[FlyDSL mxfp8 4wave] every operand must be on A's device")
+        if t.device != XQ.device:
+            raise ValueError("[FlyDSL mxfp8 4wave] every operand must be on A's device")
     if M == 0:
         return Out
 
@@ -264,13 +274,30 @@ def launch_mxfp8_4wave_shuffled(
 ) -> Tensor:
     """The launches of one GEMM on scales already in the kernel's order (flat uint8, rows
     padded to 32): for a producer that emits them (a quantizer) and for the wrappers above.
-    Operands are not re-validated beyond ``fits_shape``."""
+    Operands get the contract of the raw-scale wrapper (shapes, dtypes, device, bf16 ``Out``,
+    ``fits_shape``) and the scales must hold the padded rows."""
     from aiter.jit.utils.chip_info import get_cu_num
 
     from .kernels.tensor_shim import _run_compiled, current_stream_arg
 
-    M, K = XQ.shape
-    N = WQ.shape[0]
+    M, N, K = _check_operands(XQ, WQ, Out)
+    if M == 0:
+        return Out
+    for name, t, rows in (
+        ("x_scale_shuffled", x_scale_shuffled, -(-M // 32) * 32),
+        ("w_scale_shuffled", w_scale_shuffled, -(-N // 32) * 32),
+    ):
+        if (
+            t.device != XQ.device
+            or t.element_size() != 1
+            or not t.is_contiguous()
+            or t.numel() < rows * (K // SCALE_GROUP)
+        ):
+            raise ValueError(
+                f"[FlyDSL mxfp8 4wave] {name} must be contiguous 1-byte scales on A's device "
+                f"holding {rows * (K // SCALE_GROUP)} bytes (rows padded to 32); got "
+                f"{t.numel()} on {t.device}"
+            )
     cus = get_cu_num()
     a = XQ.contiguous().view(torch.int8).view(-1)
     w = WQ.contiguous().view(torch.int8).view(-1)

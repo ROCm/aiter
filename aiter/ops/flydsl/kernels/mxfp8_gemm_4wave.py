@@ -4,6 +4,9 @@
 # Ported from amd-kernels ``gemm/mxfp8_common/mxfp8_gemm_4wave.py`` (the persistent 4-wave
 # kernel the MiniMax-M3.1 prefill runs for N 6144 x K 8192 and the other large-M MXFP8 shapes),
 # itself built on FlyDSL's ``fp4_gemm_4wave``; imports adapted to aiter's own buffer helpers.
+# ruff: noqa: B023
+# (B023: the ``extra=`` closures over loop variables are called inside the same iteration's
+# ``_one_step``, at trace time, so no late-binding value can reach them.)
 """4-wave MXFP8 GEMM for gfx950: C[M, N] = A[M, K] @ W[N, K]^T with per-32 e8m0 scales on
 both operands (the scaled MFMA applies them), bf16 out.
 
@@ -22,7 +25,8 @@ a 256-K scale block; the scales of a block (AITER's shuffled layout, one dword p
 and the MFMA picks its byte with op_sel = (tile parity in the 32-row / 32-column group)
 and op_sel_hi = (K-step parity). A: row-major fp8 [M, K]; W: ``shuffle_weight(.., (16, 16))``;
 scales: ``shuffle_scale_a16w4(.., 1, False)`` (the branch's ``preshuffle_mxfp8_weight`` /
-``mxfp8_e4m3_quantize_flydsl`` outputs). M and N must be multiples of 256.
+``mxfp8_e4m3_quantize_flydsl`` outputs). N must be a multiple of 256; M is ragged (rows past M
+read zero through the buffer bounds and their stores are dropped).
 
 Persistent: min(tiles, 256) workgroups, each walking the tiles w, w + grid, ...; the next
 tile's first loads and scale gather go out in the last two steps of the current tile, and
@@ -33,13 +37,14 @@ per-wave LDS transpose so every store writes whole 128-byte rows (``StoreCLds``)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
 _N_WAVES = 4
 PARENT_M = 256  # the tile of the 4x4 layout; the 4x2 / 2x2 layouts run sub-tiles of it
@@ -105,6 +110,9 @@ _gep = _buffer_ops.get_element_ptr
 
 
 def _lds_ptr_t():
+    # Raw LDS pointer type (D10b of the PR description): kept instead of the backend-resolved
+    # ``fx.to_llvm_ptr(fx.inttoptr(PointerType(.., Shared), addr))`` so that the instruction
+    # stream measured and validated for this kernel does not change under this port.
     return _ir.Type.parse("!llvm.ptr<3>")
 
 
@@ -244,7 +252,7 @@ def _riffle(glb, lds):
     li = 0
     for gi, t in enumerate(glb):
         out.append(t)
-        upto = int(round((gi + 1) * step))
+        upto = round((gi + 1) * step)
         out += lds[li:upto]
         li = upto
     return out + lds[li:]
@@ -379,7 +387,6 @@ _SCALE_QUARTER_BYTES = 1024  # one wave's gather: 4 groups x 256 B of one 256-K 
 _SCALE_REGION_BYTES = 2 * _SCALE_QUARTER_BYTES  # all of A (or all of W) for one block
 _SCALE_SLOT_BYTES = _N_WAVES * _SCALE_QUARTER_BYTES  # 4 KB
 _SCALE_SLOTS = 2  # the block in use (VGPR carry) and the next one
-_SCALE_LDS_BYTES = _SCALE_SLOTS * _SCALE_SLOT_BYTES  # 16 KB
 _SCALE_A_REGION = 0
 _SCALE_B_REGION = _SCALE_REGION_BYTES
 
@@ -655,16 +662,14 @@ def compile_mxfp8_gemm_4w(
     *,
     K: int,
     use_xcd_remap: bool = True,
-    MN: tuple | None = None,
     store_nt: bool = False,
     tiles: tuple = (4, 4),
     grid_max: int = 256,
 ):
-    """``MN=(M, N)`` bakes the shape in (every divide folds); the launch checks it;
-    ``store_nt`` = non-temporal output stores (pays when the output is larger than the
+    """``store_nt`` = non-temporal output stores (pays when the output is larger than the
     256 MB infinity cache: o_proj at M 32768 -2.5%, nothing at qkv); ``tiles`` = (n_a, n_b)
-    16-row / 16-column MFMA tiles per wave quadrant: (4, 4) is the 256x256 tile, (4, 2) a
-    256x128 and (2, 2) a 128x128 sub-tile of it -- the launch takes a range of work items
+    16-row / 16-column MFMA tiles per wave quadrant: (4, 4) is the 256x256 tile, (2, 4) a
+    128x256 and (2, 2) a 128x128 sub-tile of it -- the launch takes a range of work items
     ``(tile_off, n_work)`` over the 256x256 parent tiles' index space (each parent = 1 / 2 / 4
     items), so a remainder round of parent tiles can run as one full round of sub-tiles.
 
@@ -680,7 +685,7 @@ def compile_mxfp8_gemm_4w(
     and the new accumulators share the 256 AGPRs half and half). Scale blocks are
     gathered one block ahead (at even steps) and read at the following odd step."""
     N_TILES_A, N_TILES_B = tiles
-    assert N_TILES_A in (2, 4) and N_TILES_B in (2, 4)
+    assert tiles in ((4, 4), (2, 4), (2, 2)), tiles  # the layouts ``launch_plan`` runs
     BLOCK_M = 64 * N_TILES_A
     BLOCK_N = 64 * N_TILES_B
     LDS_BLOCK_M = BLOCK_M // 2
@@ -701,7 +706,7 @@ def compile_mxfp8_gemm_4w(
     # every work item its own workgroup (a plain grid), which no co-resident kernel holds back
     GRID_MAX = grid_max
     # v5: the row-stationary MFMA order with the scale-gather address accumulators
-    name = (f"flydsl_mxfp8_4wave_v5_k{K}" + (f"_m{MN[0]}_n{MN[1]}" if MN else "") + ("_nt" if store_nt else "") + ("" if grid_max == 256 else f"_g{grid_max}")
+    name = (f"flydsl_mxfp8_4wave_v5_k{K}_xcd{int(bool(use_xcd_remap))}" + ("_nt" if store_nt else "") + ("" if grid_max == 256 else f"_g{grid_max}")
             + (f"_t{N_TILES_A}x{N_TILES_B}" if tiles != (4, 4) else ""))  # fmt: skip
     SCALE_SLOTS = _SCALE_SLOTS
     OUT_LDS_BYTES = _N_WAVES * 2 * 16 * 32 * N_TILES_B
@@ -735,8 +740,6 @@ def compile_mxfp8_gemm_4w(
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
-        if const_expr(MN is not None):
-            c_m, c_n = const_expr(MN[0]), const_expr(MN[1])
         n_pid_m = _ceildiv(c_m, PARENT_M)  # the parent tiles' grid
         n_blocks = _ceildiv(c_n, PARENT_N)
         grid = _min(fx.Int32(n_work), fx.Int32(GRID_MAX))
@@ -949,10 +952,6 @@ def compile_mxfp8_gemm_4w(
             return a0nf, b0nf, b1nf, sc_next, (c00f, c01f, c10f, c11f), new_bufs
 
         bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
-
-        def _swap_bufs(bufs):
-            ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
-            return (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)
 
         n_a = N_TILES_A
         n_b = N_TILES_B

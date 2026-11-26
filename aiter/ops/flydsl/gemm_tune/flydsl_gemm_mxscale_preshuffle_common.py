@@ -604,8 +604,10 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_4wave import (
 )
 
 # Ids past the 8-wave ones; dispatch is by kernelName prefix, the base only keeps the
-# CSV rows unambiguous.
-KERNEL_ID_BASE_4WAVE = 2_000_000
+# CSV rows unambiguous. Disjoint from the other pipelines' ranges (1M 8-wave, 2M
+# ``_fsk``, 3M bmm, 4M / 5M ``_pf`` / ``_pf_nt``): the tuner names a result by the first
+# pipeline that holds its id.
+KERNEL_ID_BASE_4WAVE = 6_000_000
 
 
 @dataclass
