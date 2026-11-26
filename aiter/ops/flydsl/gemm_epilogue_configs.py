@@ -18,7 +18,10 @@ Bisection switches, each a comma list of paths (``gate``, ``gate_bwd``,
 applied after the lookup:
 
 * ``AITER_KDA_GEMM_NO_SPLITK``: split_k = 1.
-* ``AITER_KDA_GEMM_NO_HTI``: the full-tile kernel (128x256) instead of HTI.
+* ``AITER_KDA_GEMM_ALLOW_HTI``: let these paths run a tuned HTI row. Off by
+  default: HTI 256x256 gave wrong dW_g (tn) and dg_proj elements on MI350X
+  (#8754), so every HTI row runs on the full-tile kernel (128x256) instead.
+  ``AITER_KDA_GEMM_NO_HTI`` still forces the full-tile kernel.
 * ``AITER_KDA_GEMM_NO_KTAIL``: a K tail raises ``ValueError``, so
   ``kda_layer_bwd.proj_gemm`` takes its torch fallback.
 """
@@ -66,6 +69,7 @@ def _ceil(a, b):
 
 ENV_NO_SPLITK = "AITER_KDA_GEMM_NO_SPLITK"
 ENV_NO_HTI = "AITER_KDA_GEMM_NO_HTI"
+ENV_ALLOW_HTI = "AITER_KDA_GEMM_ALLOW_HTI"
 ENV_NO_KTAIL = "AITER_KDA_GEMM_NO_KTAIL"
 
 
@@ -95,7 +99,8 @@ def apply_switches(kw, layout, epilogue):
     kw = dict(kw)
     if disabled(ENV_NO_SPLITK, path):
         kw["split_k"] = 1
-    if kw["use_half_tile_interleaved"] and disabled(ENV_NO_HTI, path):
+    hti_ok = disabled(ENV_ALLOW_HTI, path) and not disabled(ENV_NO_HTI, path)
+    if kw["use_half_tile_interleaved"] and not hti_ok:
         kw.update(use_half_tile_interleaved=False, block_m=128, block_n=256)
         kw.update(m_waves=2, n_waves=4, k_waves=1)
     return kw
@@ -133,10 +138,8 @@ def _cfg(bm, bn, m_waves, n_waves, stages=2, split_k=1, group_m=0, hti=False):
 def default_config(m, n, k, layout, epilogue, cu_num):
     """Untuned fallback, from the bf16 FlyDSL hgemm rows tuned on MI350X."""
     if layout == "tn":
-        # weight gradient: K = tokens; HTI needs an even count of 64-wide K tiles
-        if k % 128 == 0:
-            return _cfg(256, 256, 2, 4, hti=True, group_m=4)
-        return _cfg(128, 256, 2, 4)
+        # weight gradient: K = tokens
+        return _cfg(128, 256, 2, 4, group_m=4)
     if k <= 256:
         # skinny K (the f_b decay gate): bound by the fp32 store, so enough
         # workgroups to cover every CU; the backward modes need full tiles
@@ -144,7 +147,7 @@ def default_config(m, n, k, layout, epilogue, cu_num):
             return _cfg(64, 128, 1, 4)
         return _cfg(128, 128, 2, 4)
     if m >= 1024:
-        return _cfg(256, 256, 2, 4, hti=True, group_m=4 if m >= 2048 else 0)
+        return _cfg(128, 256, 2, 4, group_m=4 if m >= 2048 else 0)
     # small M, large K: split K until the grid covers the CUs once
     tiles = _ceil(m, 128) * _ceil(n, 128)
     split_k = 1
@@ -300,7 +303,10 @@ def candidate_configs(m, n, k, layout, epilogue):
                 splits = (1, 2, 3, 4, 6, 8)
             for split_k in splits:
                 add(_cfg(bm, bn, mw, nw, stages=stages, split_k=split_k))
-    if not bwd and (layout == "tn" or k > 256):
+    for gm in (4, 8):
+        add(_cfg(128, 256, 2, 4, group_m=gm))
+        add(_cfg(256, 128, 2, 4, group_m=gm))
+    if not bwd and disabled(ENV_ALLOW_HTI, gemm_path(layout, epilogue)):
         for gm in (0, 4, 8):
             add(_cfg(256, 256, 2, 4, hti=True, group_m=gm))
             add(_cfg(128, 128, 2, 2, hti=True, group_m=gm))

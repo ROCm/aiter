@@ -728,12 +728,14 @@ def test_kda_wgrad_split(m, hk, d, dtype):
     """dW_g = dgp^T @ x (tn, K = m tokens) on every split_k and kernel.
 
     Integer inputs in [-2, 2] keep every partial sum exact in fp32, so every
-    split, the HTI kernel and the dispatcher's pick must equal the reference
-    and each other bit for bit; the output is NaN-filled, so a tile left
-    unwritten fails. m = 300 runs the K tail.
+    split, kernel and the dispatcher's pick must equal the exact result bit
+    for bit; the output is NaN-filled, so a tile left unwritten fails.
+    m = 300 runs the K tail. The HTI rows show whether the HTI kernel takes
+    the tn layout; the KDA dispatcher no longer picks it.
     """
     from aiter.ops.flydsl import kda_layer_bwd as fk
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        GEMM_A16W16_DTYPE_BF16,
         GEMM_A16W16_DTYPE_FP32,
         gemm_a16w16,
     )
@@ -757,9 +759,7 @@ def test_kda_wgrad_split(m, hk, d, dtype):
             "use_half_tile_interleaved": False,
         }
 
-    configs = {f"selected_{source}": selected}
-    configs.update({f"ft_sk{sk}": ft(sk) for sk in WGRAD_SPLITS})
-    configs["hti256"] = {
+    hti256 = {
         **ft(1),
         "block_m": 256,
         "block_n": 256,
@@ -767,43 +767,65 @@ def test_kda_wgrad_split(m, hk, d, dtype):
         "group_m": 4,
         "use_half_tile_interleaved": True,
     }
-    legal = fk._validate(
-        hk,
-        d,
-        m,
-        "tn",
-        {"out_dtype_id": GEMM_A16W16_DTYPE_FP32, "epilogue": 0, "epi_group": 1},
-    )
+    # (config, output dtype); the bf16 rows round the exact sums once, so
+    # they are bit-exact too. hti256 bf16 is #8739's HTI path as it was (its
+    # fp32-C variant is rejected: C does not fit next to the A/B stages).
+    configs = {f"selected_{source}": (selected, torch.float32)}
+    configs.update({f"ft_sk{sk}": (ft(sk), torch.float32) for sk in WGRAD_SPLITS})
+    configs["hti256"] = (hti256, torch.float32)
+    configs["ft_sk1_bf16"] = (ft(1), dtype)
+    configs["hti256_bf16"] = (hti256, dtype)
     ret = {"gfx": get_gfx_runtime(), "selected": config_name_of(selected)}
     flops = 2 * m * hk * d
-    nbytes = (m * hk + m * d) * dgp.element_size() + hk * d * 4
-    for name, cfg in configs.items():
-        # split-K takes at most 2048 output tiles and HTI an even count of K
-        # tiles (no K tail): such a config is not launchable, not wrong
+    failed = []
+    for name, (cfg, out_dtype) in configs.items():
+        legal = fk._validate(
+            hk,
+            d,
+            m,
+            "tn",
+            {
+                "out_dtype_id": (
+                    GEMM_A16W16_DTYPE_FP32
+                    if out_dtype == torch.float32
+                    else GEMM_A16W16_DTYPE_BF16
+                ),
+                "epilogue": 0,
+                "epi_group": 1,
+            },
+        )
+        # split-K takes at most 2048 output tiles, HTI an even count of K
+        # tiles and a C that fits next to the A/B stages: such a config is not
+        # launchable, not wrong
         if not legal(cfg):
             continue
-        out = torch.full((hk, d), float("nan"))
+        out = torch.full((hk, d), float("nan"), dtype=out_dtype)
 
-        def run(cfg=cfg, out=out):
+        def run(cfg=cfg, out=out, out_dtype=out_dtype):
             return gemm_a16w16(
                 dgp.t(),
                 x,
                 out=out,
                 user_kwargs=dict(cfg),
                 layout="tn",
-                out_dtype=torch.float32,
+                out_dtype=out_dtype,
             )
 
         _, us = run_perftest(run, num_iters=10, num_warmup=1)
-        bad = (out != ref).float().mean().item()
-        assert torch.equal(out, ref), (
-            f"dW_g {name} ({config_name_of(cfg)}): {bad:.2%} of elements differ "
-            f"from the exact result, {out.isnan().float().mean().item():.2%} NaN"
-        )
+        exact = ref.to(out_dtype)
+        bad = (out != exact).float().mean().item()
+        if not torch.equal(out, exact):
+            failed.append(
+                f"{name} ({config_name_of(cfg)}, {out_dtype}): {bad:.2%} differ, "
+                f"{out.isnan().float().mean().item():.2%} NaN"
+            )
+        nbytes = (m * hk + m * d) * dgp.element_size() + hk * d * out.element_size()
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = bad
+    # after the loop, so every config's row is in the table
+    assert not failed, "dW_g not bit-exact: " + "; ".join(failed)
     return ret
 
 
