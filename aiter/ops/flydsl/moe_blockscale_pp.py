@@ -34,7 +34,17 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
 
 
 @functools.lru_cache(maxsize=64)
-def _compile(K, N, gather, gate_up_inter, epilogue, topk, weighted=True):
+def _compile(
+    K,
+    N,
+    gather,
+    gate_up_inter,
+    epilogue,
+    topk,
+    weighted=True,
+    swiglu_clamp=True,
+    half_skip=False,
+):
     from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
 
     return compile_moe_bs_gemm_8w(
@@ -45,6 +55,8 @@ def _compile(K, N, gather, gate_up_inter, epilogue, topk, weighted=True):
         epilogue=epilogue,
         topk=topk,
         weighted=weighted,
+        swiglu_clamp=swiglu_clamp,
+        half_skip=half_skip,
     )
 
 
@@ -74,6 +86,7 @@ def moe_bs_gemm(
     sorted_weights: Tensor | None = None,
     topk: int = 0,
     swiglu_limit: float = 0.0,
+    half_skip: bool = False,
     grid: int | None = None,
 ) -> Tensor:
     """Grouped GEMM ``a[row(r)] @ w[expert(r)].T`` over ``moe_sorting``'s 256-row tiles.
@@ -90,6 +103,10 @@ def moe_bs_gemm(
       ``[N // 256, M_pad]``; needs ``gate_up_inter = N // 2``.
     * ``"slot_bf16"``: out bf16 ``[T * topk, N]``, weighted by ``sorted_weights``
       when given (else unweighted: the top-k reduction applies the weights).
+
+    ``half_skip`` (``"swiglu_fp8"``): skip a wave's row-half-1 MFMAs when its
+    64 rows are all padding; worth its branches only when most 256-row tiles
+    are less than half full.
     """
     from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
@@ -118,6 +135,7 @@ def moe_bs_gemm(
     assert grid % 8 == 0
     # The kernel reads "no clamp" as an infinite limit.
     limit = float(swiglu_limit) if swiglu_limit > 0 else 3.0e38
+    swiglu = epilogue == "swiglu_fp8"
     exe = _compile(
         K,
         N,
@@ -126,6 +144,9 @@ def moe_bs_gemm(
         epilogue,
         int(topk) if epilogue == "slot_bf16" else 0,
         sorted_weights is not None,
+        # The no-limit SwiGLU drops three clamp ops a value.
+        swiglu_clamp=not swiglu or swiglu_limit > 0,
+        half_skip=swiglu and bool(half_skip),
     )
     _run_compiled(
         exe,
@@ -233,6 +254,10 @@ def moe_bs_forward(
         epilogue="swiglu_fp8",
         out_scale=a2s,
         swiglu_limit=swiglu_limit,
+        # HK's HALF_SKIP rule: experts average at most 144 of a tile's 256
+        # rows (stage 1 at T = 4096 by top-k 8 / 9: -7%; at T = 16384, where
+        # few tiles skip, the branches cost +4%).
+        half_skip=T * topk <= 144 * E,
     )
     slots = torch.empty(T * topk, D, dtype=torch.bfloat16, device=x.device)
     moe_bs_gemm(

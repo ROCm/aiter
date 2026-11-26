@@ -43,6 +43,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.act import clamp_gate_up, sigmoid_f32
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
     compute_global_swizzle,
@@ -366,10 +367,14 @@ class SwigluFp8Epilogue:
     wave_n waves through LDS (``amax`` holds [wave_m][wave_n][128 rows]); the
     one barrier this takes pairs between the two groups like any other.
     ``limit`` > 0 clamps as ``silu(min(g, L)) * clamp(u, -L, L)``; the host
-    passes float max for "no clamp".
+    passes float max for "no clamp". ``clamp=False`` builds the no-limit
+    variant, which drops the clamps' three VALU ops a value.
     """
 
-    def __init__(self, C, C_scale, m_pad, inter, limit, amax_lds, wave_m, wave_n):
+    def __init__(
+        self, C, C_scale, m_pad, inter, limit, amax_lds, wave_m, wave_n, clamp=True
+    ):
+        self.clamp = clamp
         self.inter = inter
         self.m_pad = m_pad
         self.neg_limit = -limit
@@ -417,6 +422,43 @@ class SwigluFp8Epilogue:
             v = o[0].bitcast(fx.Float32).maximumf(o[1].bitcast(fx.Float32))
         return v
 
+    def _act(self, g4, u4):
+        """SwiGLU of one accumulator's four (gate, up) pairs."""
+        if const_expr(self.clamp):
+            out = []
+            for v in range_constexpr(4):
+                g, u = clamp_gate_up(g4[v], u4[v], self.neg_limit)
+                out.append(g * sigmoid_f32(g) * u)
+            return out
+        # silu(g) * u = g u / (1 + 2^(-g log2 e)): products and sums as
+        # two-wide packed ops, exponentials and reciprocals one at a time.
+        e = g4 * fx.Float32(-LOG2E)
+        e = Vec.from_elements(
+            [fx.exp2(e[v], fastmath="afn") for v in range_constexpr(4)], fx.Float32
+        )
+        e = e + fx.Float32(1.0)
+        r = Vec.from_elements(
+            [
+                fx.Float32(rocdl.rcp(fx.Float32.ir_type, fx.Float32(e[v]).ir_value()))
+                for v in range_constexpr(4)
+            ],
+            fx.Float32,
+        )
+        a = g4 * u4 * r
+        return [a[v] for v in range_constexpr(4)]
+
+    def _q448(self, x):
+        """``x`` clamped to +-448 as one v_med3_f32 (num min / max).
+
+        A value can exceed 448 by an ulp: the scale's ``amax / 448`` is a
+        product with a rounded reciprocal.
+        """
+        if const_expr(self.clamp):
+            return x.maximumf(fx.Float32(-448.0)).minimumf(fx.Float32(448.0))
+        return fx.Float32(
+            fx.arith.minnumf(fx.arith.maxnumf(x, fx.Float32(-448.0)), fx.Float32(448.0))
+        )
+
     def store(self, gate_up, row0, nb):
         """``gate_up[h] = (gate accs, up accs)`` of row half h; acc ``j * N_TILES_A + i``."""
         lane = _fresh_lane()
@@ -431,12 +473,9 @@ class SwigluFp8Epilogue:
                 for j in range_constexpr(2):
                     g4 = Vec(g_frag[j * N_TILES_A + i])
                     u4 = Vec(u_frag[j * N_TILES_A + i])
-                    vals = []
+                    vals = self._act(g4, u4)
                     for v in range_constexpr(4):
-                        g, u = clamp_gate_up(g4[v], u4[v], self.neg_limit)
-                        a = g * sigmoid_f32(g) * u
-                        vals.append(a)
-                        m = m.maximumf(fx.math.absf(a))
+                        m = m.maximumf(fx.math.absf(vals[v]))
                     acts[(h, i, j)] = vals
                 m = self._rmax(m)
                 # The four q lanes of a row hold the same maximum; all store it.
@@ -467,17 +506,8 @@ class SwigluFp8Epilogue:
                     vals = acts[(h, i, j)]
                     q8 = []
                     for p in range_constexpr(2):
-                        # The scaled value can exceed 448 by one ulp of the division.
-                        lo = (
-                            (vals[2 * p] * inv)
-                            .maximumf(fx.Float32(-448.0))
-                            .minimumf(fx.Float32(448.0))
-                        )
-                        hi = (
-                            (vals[2 * p + 1] * inv)
-                            .maximumf(fx.Float32(-448.0))
-                            .minimumf(fx.Float32(448.0))
-                        )
+                        lo = self._q448(vals[2 * p] * inv)
+                        hi = self._q448(vals[2 * p + 1] * inv)
                         q8.append((lo, hi))
                     w = fx.Int32(
                         rocdl.cvt_pk_fp8_f32(
@@ -972,6 +1002,8 @@ def compile_moe_bs_gemm_8w(
     epilogue: str = "bf16",
     topk: int = 0,
     weighted: bool = True,
+    swiglu_clamp: bool = True,
+    half_skip: bool = False,
 ):
     """Build the persistent grouped GEMM launcher.
 
@@ -1136,7 +1168,15 @@ def compile_moe_bs_gemm_8w(
             store_c = StoreBf16Rows(C, m_pad, N)
         elif const_expr(epilogue == "swiglu_fp8"):
             store_c = SwigluFp8Epilogue(
-                C, C_scale, m_pad, gate_up_inter, limit, lds.R_lds, wave_m, wave_n
+                C,
+                C_scale,
+                m_pad,
+                gate_up_inter,
+                limit,
+                lds.R_lds,
+                wave_m,
+                wave_n,
+                clamp=swiglu_clamp,
             )
         else:
             w_div = None
@@ -1754,6 +1794,7 @@ def compile_moe_bs_gemm_8w(
             return [c00, c01, c10, c11], nxt_expert, nxt_mask
 
         if const_expr(stream_s1):
+            n_tokens_s1 = _sgpr(_load_i32(nv_div, 1))
             ids8_div = fx.logical_divide(
                 make_fp8_buffer_tensor(sorted_ids, F8_IR_t), fx.make_layout(1, 1)
             )
@@ -1844,7 +1885,21 @@ def compile_moe_bs_gemm_8w(
         # Epilogue VMEM per wave: an 8-byte act store and a 1-byte scale store per row tile.
         EPI_STORES = 2 * 2 * N_TILES_A
 
-        def run_tile_stream_s1(tile, expert, next_tile, parity):
+        def s1_pad_mask(slot):
+            """Bit q - 1 (q = 1..3): rows 64 q .. 255 of the tile are padding (``half_skip``).
+
+            Reads the tile's ids in ``I_lds`` slot ``slot``, which other waves
+            DMA'd: only many barriers after that DMA (a load can be scheduled
+            above an ``s_barrier``, which has no memory semantics).
+            """
+            msk = fx.Int32(0)
+            base = _opaque_vgpr(slot * BLOCK_M)
+            for q in range_constexpr(1, 4):
+                pad = (ids_at(base + 64 * q) & 0xFFFFFF) >= n_tokens_s1
+                msk = msk | pad.select(fx.Int32(1 << (q - 1)), fx.Int32(0))
+            return _sgpr(msk)
+
+        def run_tile_stream_s1(tile, expert, pmask, next_tile, parity):
             """Stage 1: K-steps 0 .. K - 1 of ``tile``, then its SwiGLU epilogue.
 
             One K-step stream runs across tiles, as stage 2's: the last two
@@ -1852,14 +1907,18 @@ def compile_moe_bs_gemm_8w(
             (into the other parity's slot) and step 0 its expert id and
             sorted_ids (into the other parity's ``I_lds`` slot). Only the loads
             move: the accumulators are converted and stored at the tile's end
-            (SwiGLU needs all of them). Returns the next tile's expert.
+            (SwiGLU needs all of them). ``pmask``: ``s1_pad_mask``'s bits.
+            Returns the next tile's expert and mask.
             """
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
                 LDS_BUFS
             )
             cur = make_ctx_s1(tile, expert, parity, False)
+            # This wave's rows of row half 1: 128 + wave_m * 64 + [0, 64).
+            skip_h1 = (pmask >> (wave_m + 1)) & 1 if half_skip else None
             nxt = None
             nxt_expert = None
+            nxt_mask = pmask
             c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
             c01 = list(c00)
             c10 = list(c00)
@@ -1878,6 +1937,8 @@ def compile_moe_bs_gemm_8w(
 
             for k in range_constexpr(K_ITERS):
                 if const_expr(k == K_ITERS - 4):
+                    if const_expr(half_skip):
+                        nxt_mask = s1_pad_mask(1 - parity)
                     nxt = make_ctx_s1(next_tile, nxt_expert, 1 - parity, True)
                 sa0 = sc_read(k, "a0")
                 sb0 = sc_read(k, "b0")
@@ -1917,14 +1978,21 @@ def compile_moe_bs_gemm_8w(
                     4 * N_LDS_STEPS + n_sc + (EPI_STORES + 2 if k == 0 else 0)
                 )
 
-                c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
+                if const_expr(half_skip):
+                    # Its burst's closing barrier stays outside the branch.
+                    c10 = mfma_q(b0_frag, a1_frag, c10, sb0, sa1, skip_h1)
+                else:
+                    c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
 
                 ctx["b"](1, b_cur1, kk)
                 _wait_barrier_seen(3 * N_LDS_STEPS + n_sc)
                 if const_expr(k == 0):
                     nxt_expert = _sgpr(nxt_eid)
 
-                c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
+                if const_expr(half_skip):
+                    c11 = mfma_q(b1_frag, a1_frag, c11, sb1, sa1, skip_h1)
+                else:
+                    c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
 
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
@@ -1932,7 +2000,7 @@ def compile_moe_bs_gemm_8w(
                 b_cur1, b_next1 = b_next1, b_cur1
 
             store_c.store([(c00, c01), (c10, c11)], cur["m_blk"] * BLOCK_M, cur["nb"])
-            return nxt_expert
+            return nxt_expert, nxt_mask
 
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
@@ -2029,7 +2097,11 @@ def compile_moe_bs_gemm_8w(
                 _load_i32(eids_div, _pow2_div(first_tile, NB)), fx.Int32(0)
             )
             ids_dma(first_tile, 0)
-            _wait_barrier_seen(0)
+            # A barrier with memory semantics: the mask's ids reads must not
+            # move above it (the other waves' DMA wrote them).
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
+            first_mask = s1_pad_mask(fx.Int32(0)) if half_skip else fx.Int32(0)
             first = make_ctx_s1(first_tile, first_expert, fx.Int32(0), False)
             first["sc"]()
             a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
@@ -2054,12 +2126,13 @@ def compile_moe_bs_gemm_8w(
             # drained the epilogue stores and the streamed next-tile loads.
             tile = start
             expert = first_expert
+            pmask = first_mask
             count = fx.Int32(0)
             while tile < n_tiles:
                 nt = tile + grid
                 # The last tile streams itself again; nothing reads those loads.
                 nt = (nt < n_tiles).select(nt, tile)
-                expert = run_tile_stream_s1(tile, expert, nt, count & 1)
+                expert, pmask = run_tile_stream_s1(tile, expert, pmask, nt, count & 1)
                 count = count + 1
                 tile = tile + grid
             # No LDS-DMA may land after the workgroup exits; the leading
