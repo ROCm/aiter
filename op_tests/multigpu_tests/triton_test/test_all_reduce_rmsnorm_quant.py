@@ -343,10 +343,11 @@ def _dispatch_worker(rank, init_method):
                 failures.append(f"rank {rank} plain dispatch tokens {tokens}: wrong")
 
         # all_reduce_rmsnorm_per_token_quant: up to 128 rows where the Lamport
-        # one-shot could take the call, up to 4 MiB where it cannot (6152).
+        # one-shot could take the call, up to 4 MiB where it cannot (6152); the bf16
+        # route of power-of-2 hidden past 2048 too (4096), not the power-of-2 kernel.
         ar = (tp.cpu_group, *tp.device_communicator.gluon_ar_plain)
         for (tokens, hidden), quant in itertools.product(
-            ((1, PT_HIDDEN), (128, PT_HIDDEN), (340, 6152)), (True, False)
+            ((1, PT_HIDDEN), (128, PT_HIDDEN), (340, 6152), (16, 4096)), (True, False)
         ):
             xs, res, w = _pt_inputs(tokens, hidden, 500 + tokens, device)
             with patch.object(

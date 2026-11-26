@@ -59,7 +59,9 @@ def test_gluon_ar_norm_gates(case, m, n, lamport, expected):
         (False, CAP, 6144, False, True, "gluon_norm"),
         (False, CAP + 1, 6144, False, True, "lamport"),
         (False, 16, 6144, False, False, "lamport"),
-        (False, 16, 4096, False, True, "gluon_fused"),  # power-of-2 hidden
+        (False, 16, 2048, False, True, "gluon_fused"),  # power-of-2 hidden
+        (False, 16, 4096, False, True, "gluon_norm"),  # past 2048 where Lamport runs
+        (False, CAP + 1, 4096, False, True, "lamport"),
         (False, 340, 6152, False, True, "gluon_norm"),  # not a Lamport hidden
         (False, 341, 6152, False, True, "custom_fused"),  # past 4 MiB
         (True, 1, 6144, False, True, "gluon_norm"),
