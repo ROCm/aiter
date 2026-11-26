@@ -14,10 +14,9 @@ of replay time / ``--reps``.
   main    fused_moe on the GLM-5.3-Flash tuned tables at --main-ref (default: the
           merge-base with origin/main); dropped when those tables run FlyDSL too
 
-Every output is checked against the FP32 reference (relative L2 < 0.06).
-``flydsl speedup`` is a candidate's time over FlyDSL's for the same case (above
-1: FlyDSL is faster). For stable numbers, run one case per process on an idle
-GPU:
+Every output is checked against the FP32 reference (relative L2 < 0.06). The
+table has one row per case; ``speedup`` is main's time over FlyDSL's (above 1:
+FlyDSL is faster). For stable numbers, run one case per process on an idle GPU:
 
   python op_tests/op_benchmarks/flydsl/bench_moe_blockscale_pp.py -t 8192 -k 8
 """
@@ -147,7 +146,6 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
 
     routed = int((ids >= 0).logical_and(ids < E).sum())
     flops = routed * 2 * (4096 * 2 * 1024 + 1024 * 4096)
-    fly_us = statistics.median(samples["flydsl"])
     result = []
     for name, v in samples.items():
         err = info[name]["err"]
@@ -158,7 +156,6 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
                 "topk": topk,
                 "candidate": name,
                 "us": statistics.median(v),
-                "flydsl speedup": statistics.median(v) / fly_us,
                 "min us": min(v),
                 "TFLOPS": flops / statistics.median(v) / 1e6,
                 "err": err,
@@ -196,7 +193,18 @@ def main():
             result += bench_case(tokens, topk, main_ref, args.reps, args.rounds)
     if args.json:
         args.json.write_text(json.dumps(result, indent=1) + "\n")
-    df = pd.DataFrame(result).drop(columns=["samples", "kernels"])
+    rows = {}
+    for r in result:
+        row = rows.setdefault((r["tokens"], r["topk"]), {"tokens": r["tokens"]})
+        row["topk"] = r["topk"]
+        for key in ("us", "TFLOPS", "err"):
+            row[f"{r['candidate']} {key}"] = r[key]
+    df = pd.DataFrame(rows.values())
+    if "main us" in df:
+        df["speedup"] = df["main us"] / df["flydsl us"]
+    cols = ["tokens", "topk", "flydsl us", "main us", "speedup"]
+    cols += [f"{n} {k}" for k in ("TFLOPS", "err") for n in ("flydsl", "main")]
+    df = df[[c for c in cols if c in df]]
     aiter.logger.info(
         "moe_blockscale_pp whole forward (markdown):\n%s",
         df.to_markdown(index=False, floatfmt=".4g"),
