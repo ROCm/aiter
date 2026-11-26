@@ -6,6 +6,9 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
     kernel_unified_attention_2d,
@@ -13,7 +16,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -220,26 +222,73 @@ class _UAParams(NamedTuple):
     force_fp8_pv_on_fp4_kv_cache: bool = False
 
 
-def _gfx950_gluon_supported(params: _UAParams):
-    """GFX950 Gluon supported configs."""
-    if params.shuffled_kv_cache and (
-        params.block_size & (params.block_size - 1)
-        or params.block_size < params.k_width
-    ):
-        return False
+def gfx950_gluon_supported(
+    *,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    head_size_v: int | None = None,
+    shuffled_kv_cache: bool = False,
+    k_width: int | None = None,
+    softcap: float = 0.0,
+    use_alibi_slopes: bool = False,
+    use_qq_bias: bool = False,
+) -> bool:
+    """Return True if `unified_attention` runs these arguments on the gfx950 Gluon kernel.
+
+    Args:
+        q_dtype (torch.dtype): Dtype of q.
+        kv_cache_dtype (torch.dtype): Dtype of the K cache.
+        head_size (int): Head size of q and k. Double it for an fp4-packed q.
+        block_size (int): Page size of the KV cache.
+        head_size_v (int | None): Head size of v. Default: head_size.
+        shuffled_kv_cache (bool): True if the KV cache uses the shuffled layout.
+        k_width (int | None): Last dimension of the shuffled K cache. Required if
+            shuffled_kv_cache is True.
+        softcap (float): Softcap of the call. The Gluon kernel supports only 0.
+        use_alibi_slopes (bool): True if the call gives alibi_slopes.
+        use_qq_bias (bool): True if the call gives qq_bias.
+
+    Returns:
+        bool: True if the gfx950 Gluon kernel supports the call.
+    """
+    if head_size_v is None:
+        head_size_v = head_size
+    if shuffled_kv_cache:
+        if k_width is None:
+            raise ValueError("gfx950_gluon_supported: shuffled_kv_cache needs k_width")
+        if block_size & (block_size - 1) or block_size < k_width:
+            return False
 
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
-        and not params.softcap
-        and not params.use_qq_bias
-        and not params.use_alibi_slopes
-        and params.head_size <= 256
-        and triton.next_power_of_2(params.head_size) == params.head_size
-        and params.head_size_v == params.head_size
-        and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and head_size <= 256
+        and triton.next_power_of_2(head_size) == head_size
+        and head_size_v == head_size
+        and q_dtype in (e4m3_dtype, torch.bfloat16)
+        and q_dtype == kv_cache_dtype
+    )
+
+
+def _gfx950_gluon_supported(params: _UAParams):
+    """GFX950 Gluon supported configs."""
+    return gfx950_gluon_supported(
+        q_dtype=params.q_dtype,
+        kv_cache_dtype=params.kv_cache_dtype,
+        head_size=params.head_size,
+        block_size=params.block_size,
+        head_size_v=params.head_size_v,
+        shuffled_kv_cache=params.shuffled_kv_cache,
+        k_width=params.k_width,
+        softcap=params.softcap,
+        use_alibi_slopes=params.use_alibi_slopes,
+        use_qq_bias=params.use_qq_bias,
     )
 
 
@@ -697,7 +746,7 @@ def unified_attention(
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         segm_tiles = None
-        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+        if use_gluon_3d and IS_DEVICE_ARCH_GFX12:
             NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
@@ -1227,6 +1276,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    # TDM stores of LDS-staged output can corrupt some gfx1250 decode rows.
+    # Those shapes set USE_TDM_STORE false; every other shape keeps TDM stores.
+    USE_TDM_STORE = config.pop("USE_TDM_STORE", True)
     override = config.pop("FILL_OVERRIDE", None)
     if override and not (params.all_decode or params.spec_decode):
         # Over a long context, a batch the hint shows unevenly loaded runs faster on
@@ -1302,6 +1354,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+    if not USE_TDM_STORE:
+        USE_STORE_BUFFER_OP = False  # gl.store, not the CDNA4 buffer_store, on gfx1250
     _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
         key_cache_ptr=params.k,
@@ -1354,6 +1408,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
+        USE_TDM_STORE=USE_TDM_STORE,
         Q_NVFP4=params.q_dtype == torch.uint8,
         KV_NVFP4=kv_nvfp4,
         V_NVFP4=params.v_cache_dtype == torch.uint8,
@@ -1393,6 +1448,12 @@ def _unified_attention_3d_gfx1250(
         else ""
     )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    if config.get("num_stages", 2) != 2:
+        raise ValueError(
+            f"_unified_attention_gluon_kernel_3d requires num_stages==2 "
+            f"(the pipeline is hard-wired for exactly one tile of prefetch); "
+            f"got num_stages={config['num_stages']} from the attn_3d config"
+        )
     for key in _GFX12_ROUTING_KEYS:
         config.pop(key, None)
     config["BLOCK_M"] = max(
@@ -1675,6 +1736,11 @@ def _unified_attention_gfx950(
         stride_v_cache_2=params.v.stride(2),
         stride_v_cache_3=params.v.stride(3),
         block_table_stride=params.block_table.stride(0),
+        PRELOAD_PAGES=config.get("PRELOAD_PAGES", 0),
+        PRELOAD_TABLE_STRIDE=(
+            int(params.block_table.stride(0)) if config.get("PRELOAD_PAGES", 0) else 0
+        ),
+        USE_EXPLICIT_FMA=config.get("USE_EXPLICIT_FMA", False),
         num_seqs=params.num_seqs,
         SCALE=params.softmax_scale,
         SOFTCAP=params.softcap,

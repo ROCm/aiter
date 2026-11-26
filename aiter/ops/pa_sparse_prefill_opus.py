@@ -11,8 +11,10 @@ import torch
 
 from ..jit.utils.torch_guard import torch_compile_guard
 from .mla_sparse_prefill import (
-    _opus_sparse_prefill,
+    _mla_sparse_prefill_routed,
+    _mla_sparse_prefill_v4_routed,
     _opus_sparse_prefill_v4,
+    _v4_auto_tries_asm,
     fp8_kv_dma_layout_enabled,
 )
 from .opus.mla import (
@@ -94,8 +96,15 @@ def pa_sparse_prefill_opus(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
-    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill` on the opus backend."""
-    return _opus_sparse_prefill(
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill` on the opus backend.
+
+    Writes ``out`` when given and returns it either way. Both this spelling and
+    ``mla_sparse_prefill`` enter the op at the same routed layer, so a provider
+    serving the ``mla_sparse_prefill`` contract serves callers of either name --
+    which is why this delegates there rather than to the opus binding beneath
+    it. Behaviour is unchanged: opus is the only backend this contract has.
+    """
+    return _mla_sparse_prefill_routed(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -149,9 +158,17 @@ def pa_sparse_prefill_fp8_opus(
     out: torch.Tensor | None = None,
     kv_dma_layout: bool = False,
 ) -> torch.Tensor:
-    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend,
-    ``kv_dma_layout`` included."""
-    return _opus_sparse_prefill_v4(
+    """ :func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend,
+    ``kv_dma_layout`` included.
+
+    Writes ``out`` when given and returns it either way. Where the default
+    backend choice is opus anyway -- off gfx1250, without a sink, or with a head
+    count the asm kernel does not take -- and ``kv_dma_layout`` is False, this
+    enters the routed ``mla_sparse_prefill_v4`` layer, so a provider serving
+    that contract serves callers of this name. Where the default would try asm
+    first, or when ``kv_dma_layout=True`` is requested, it runs opus directly.
+    """
+    args = (
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -165,8 +182,10 @@ def pa_sparse_prefill_fp8_opus(
         attn_sink,
         softmax_scale,
         out,
-        kv_dma_layout=kv_dma_layout,
     )
+    if not kv_dma_layout and not _v4_auto_tries_asm(q_nope, attn_sink, None):
+        return _mla_sparse_prefill_v4_routed(*args)
+    return _opus_sparse_prefill_v4(*args, kv_dma_layout=kv_dma_layout)
 
 
 __all__ = [

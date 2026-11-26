@@ -11,7 +11,7 @@ from aiter.ops import topk as topk_ops
 def _is_gfx1250() -> bool:
     if not torch.cuda.is_available() or torch.version.hip is None:
         return False
-    return get_gfx() == "gfx1250"
+    return get_gfx() in ("gfx1250", "gfx1250-strict")
 
 
 pytestmark = pytest.mark.skipif(not _is_gfx1250(), reason="requires gfx1250")

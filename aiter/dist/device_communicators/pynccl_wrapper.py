@@ -68,26 +68,26 @@ class ncclDataTypeEnum:
     ncclDouble = 8
     ncclBfloat16 = 9
     ncclNumTypes = 10
+    _from_torch: ClassVar[dict[torch.dtype, int]] = {
+        torch.int8: ncclInt8,
+        torch.uint8: ncclUint8,
+        torch.int32: ncclInt32,
+        torch.int64: ncclInt64,
+        torch.float16: ncclFloat16,
+        torch.float32: ncclFloat32,
+        torch.float64: ncclFloat64,
+        torch.bfloat16: ncclBfloat16,
+    }
 
     @classmethod
     def from_torch(cls, dtype: torch.dtype) -> int:
-        if dtype == torch.int8:
-            return cls.ncclInt8
-        if dtype == torch.uint8:
-            return cls.ncclUint8
-        if dtype == torch.int32:
-            return cls.ncclInt32
-        if dtype == torch.int64:
-            return cls.ncclInt64
-        if dtype == torch.float16:
-            return cls.ncclFloat16
-        if dtype == torch.float32:
-            return cls.ncclFloat32
-        if dtype == torch.float64:
-            return cls.ncclFloat64
-        if dtype == torch.bfloat16:
-            return cls.ncclBfloat16
-        raise ValueError(f"Unsupported dtype: {dtype}")
+        if dtype not in cls._from_torch:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+        return cls._from_torch[dtype]
+
+    @classmethod
+    def supports(cls, dtype: torch.dtype) -> bool:
+        return dtype in cls._from_torch
 
 
 ncclRedOp_t = ctypes.c_int

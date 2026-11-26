@@ -528,6 +528,10 @@ def make_b_loader(
       ``"int4"`` OLD-kernel packed int4 W + (E, G//2, N, 2) bf16 groupwise scale
       ``"bf16"`` raw bf16 W (no scale, no upconvert; ``load_scale`` yields all-None and
                  ``upconvert`` returns the loaded fragment unchanged)
+      ``"fp8"``  MXFP8: fp8 e4m3 W in the ``shuffle_weight`` (16, 16) layout + the
+                 mxfp4 e8m0 per-1x32 scale layout (``shuffle_scale``); gfx950 only.
+                 ``upconvert`` scales the codes to bf16 exactly (e4m3 x 2^k fits bf16),
+                 so the MMA operand equals the bf16 upcast of the weight.
 
     ``expert_off``/``inter``-style N arithmetic stays with the caller: it hands ``col``
     the 16-wide N block base and gets back everything the loaders need.
@@ -542,7 +546,12 @@ def make_b_loader(
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
+    _is_fp8 = w_dtype == "fp8"
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
+    assert not (_is_fp8 and _is_gfx942), "fp8 (MXFP8) W needs gfx950 cvt_scalef32"
+    assert not _is_fp8 or TILE_K % 128 == 0, "fp8 W needs TILE_K % 128 == 0"
+    # W tensors whose per-expert base is folded into the buffer resource address.
+    _w_per_expert_base = _is_bf16 or _is_fp8
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -585,6 +594,16 @@ def make_b_loader(
         (N_OUT // 16, bfl_k0, 4, 16, 8),
         (bfl_stride_n0, bfl_stride_k0, bfl_stride_klane, 8, 1),
     )
+    # W (fp8 e4m3) preshuffle layout (N-major == shuffle_weight (16,16) on 1-byte
+    # elements), byte units: shape (N_OUT/16, K/32, 2, 16, 16). A 32-K group of a
+    # 16-row block is [K half][row][16 codes], so a lane's 32 codes of the group are
+    # two dwordx4 loads 256 B apart, and every load instruction of a wave reads four
+    # contiguous 256 B runs (whole cache lines), as the bf16 layout does.
+    if const_expr(_is_fp8):
+        f8l_k0 = K // 32
+        layout_b_fp8 = fx.make_layout(
+            (N_OUT // 16, f8l_k0, 2, 16, 16), (f8l_k0 * 512, 512, 256, 16, 1)
+        )
     # B-scale preshuffle layout (make_preshuffle_scale_layout, e8m0 u8, per-1x32):
     #   K padded to 256 mult. shape (N_OUT/32, c_k1, 4, 16), strides below.
     scale_k_padded = ((K + 255) // 256) * 256
@@ -598,9 +617,10 @@ def make_b_loader(
     # ---- buffer resources -----------------------------------------------------
     # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
     # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
+    # resource addr and index within the expert (fp8 W too). mxfp4/int4 keep the
+    # whole-tensor path.
+    if const_expr(_w_per_expert_base):
+        _w_per_expert_bytes = N_OUT * (K * (2 if _is_bf16 else 1))
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(
             w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
@@ -670,8 +690,8 @@ def make_b_loader(
     def col(*n_terms):
         """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        # bf16/fp8 W fold the expert into the resource base (above); mxfp4/int4 index it.
+        _row_expert_off = fx.Int32(0) if const_expr(_w_per_expert_base) else expert_off
         row = _row_expert_off + col_g
         n_blk = row // fx.Int32(16)
         n_intra = row % fx.Int32(16)
@@ -681,7 +701,7 @@ def make_b_loader(
     def col_pair(*n_terms, shift):
         """Address a gate|up pair: one block, and the one ``shift`` further along N."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = fx.Int32(0) if const_expr(_w_per_expert_base) else expert_off
         row_g = _row_expert_off + col_g
         row_u = row_g + shift
         blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)
@@ -780,6 +800,35 @@ def make_b_loader(
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
         return raw
 
+    def load_b_raw_fp8(base_k, n_blk, n_intra):
+        # fp8 W: raw[k0][2*j + {0, 1}] = the 8 codes (2 i32, K order) of K micro-step
+        # k0*4 + j. This lane's 32 codes of 128-K block k0 sit in 32-K group
+        # base_k//32 + k0*4 + lane_div_16 (the bf16 K map), K halves h = 0, 1.
+        raw = []
+        for k0i in range_constexpr(_k0_count):
+            kb32 = (base_k + fx.Int32(k0i * 128)) // fx.Int32(32) + lane_div_16
+            codes = []
+            for h in range_constexpr(2):
+                idx = fx.Int32(
+                    crd2idx(
+                        [
+                            fx.Int64(n_blk),
+                            fx.Int64(kb32),
+                            fx.Int64(h),
+                            fx.Int64(n_intra),
+                            fx.Int64(0),
+                        ],
+                        layout_b_fp8,
+                    )
+                )
+                # idx is a byte offset; dwordx4 tile index = idx/16.
+                r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
+                fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx // 16)), r)
+                v4 = fx.Vector(fx.memref_load_vec(r))
+                codes.extend(v4[j] for j in range(4))
+            raw.append(codes)
+        return raw
+
     def load_b_scale(base_k, mni, n_pack):
         # aiter _get_scale_f32: adj_ku = base_k//32 + (ku//4)*4 + lane_div_16. Per-lane
         # scalar e8m0 load on buffer_ops (no layout form, dict-cached across ku).
@@ -829,6 +878,20 @@ def make_b_loader(
         if const_expr(_is_bf16):
             # raw[ku] is already the v8bf16 MMA operand (no scale, no upconvert).
             return raw[ku]
+        if const_expr(_is_fp8):
+            # 8 e4m3 codes (2 i32, low byte = lowest K) -> 4 scaled pk converts (low /
+            # high code pair of each i32) -> v8bf16. Raw rocdl: FlyDSL has no typed
+            # scaled fp8 -> bf16 convert. A power-of-two scale makes it exact.
+            j = ku % 4
+            s_raw = _raw(scale_f32)
+            i32s = []
+            for w in range_constexpr(2):
+                src = _raw(raw[ku // 4][2 * j + w])
+                for hi in (False, True):
+                    p = rocdl.cvt_scalef32_pk_bf16_fp8(vec2_bf16, src, s_raw, hi)
+                    i32s.append(fx.Vector(p).bitcast(fx.Int32)[0])
+            v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+            return v4i32.bitcast(fx.BFloat16)  # v8bf16
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
             return _int4_nibble_to_bf16x8(
@@ -849,6 +912,8 @@ def make_b_loader(
     # ---- dtype-selected surface: the stages only ever see these ----------------
     if const_expr(_is_bf16):
         _load_raw = load_b_raw_bf16
+    elif const_expr(_is_fp8):
+        _load_raw = load_b_raw_fp8
     elif const_expr(_is_int4):
         _load_raw = load_b_raw_int4
     else:
