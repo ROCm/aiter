@@ -149,6 +149,7 @@ def chunk_kimi_delta_attn(
     has_initial_state: torch.Tensor | None = None,
     bwd_backend: str = "triton",
     save_fwd: bool = False,
+    fwd_backend: str = "triton",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention using Triton.
@@ -259,6 +260,13 @@ def chunk_kimi_delta_attn(
             the backward, which then skips the recompute (memory for time;
             the analogue of Megatron's `recompute_gdn`, #8739's `save_fwd`).
             Ignored by the Triton backward. Default: `False` (recompute).
+        fwd_backend (str):
+            Backend of the inference forward: `"triton"`, or `"flydsl"` for
+            the FlyDSL chunk forward (`aiter.ops.flydsl.kda_chunk_fwd`):
+            gfx950, bf16, `K = V = 128`, chunk 64, no GVA, dense or varlen, no
+            `out` / `state_cache`; other calls raise. Its final state is fp32.
+            When an input requires grad the forward stays on Triton.
+            Default: `"triton"`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -402,6 +410,37 @@ def chunk_kimi_delta_attn(
             },
         )
         return o.to(q.dtype), final_state
+
+    if fwd_backend not in ("triton", "flydsl"):
+        raise ValueError(
+            f"`fwd_backend` must be 'triton' or 'flydsl', got {fwd_backend!r}."
+        )
+    if fwd_backend == "flydsl":
+        if out is not None or state_cache is not None:
+            raise ValueError(
+                "fwd_backend='flydsl' does not support out or state_cache."
+            )
+        from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
+
+        return chunk_kda_fwd_flydsl(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            chunk_size=chunk_size,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            lower_bound=lower_bound,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+        )
 
     o, final_state, *_ = chunk_delta_attn_fwd(
         q=q,
