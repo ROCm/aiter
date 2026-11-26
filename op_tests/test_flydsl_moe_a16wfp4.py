@@ -986,6 +986,9 @@ def _call_fused(case, gate_mode):
         w1_scale=case["w1_scale"],
         w2_scale=case["w2_scale"],
         quant_type=QuantType.per_1x32,
+        # SiTUv2's activation dtype follows AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4.
+        # Pin bf16 so these tests reach the A16W4 guard in any environment.
+        quant_dtype_a=dtypes.bf16,
         activation=ActivationType.Situv2,
         doweight_stage1=False,
         gate_mode=gate_mode,
