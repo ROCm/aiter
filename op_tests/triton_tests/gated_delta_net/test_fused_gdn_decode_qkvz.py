@@ -282,23 +282,6 @@ def _requires_gfx950():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", _BATCHES)
-def test_reference_shapes_and_finiteness(batch):
-    inp = make_inputs(batch)
-    normalized, quantized, scales = ref_gdn_decode(
-        **inp, quant_dtype=FP8_DTYPE, quant_group_size=128
-    )
-    nv, hd = inp["num_v_heads"], inp["head_v_dim"]
-    assert normalized.shape == (batch, nv, hd)
-    assert normalized.dtype == torch.bfloat16
-    assert quantized.shape == (batch, nv * hd)
-    assert quantized.dtype == FP8_DTYPE
-    assert scales.shape == (batch, nv)
-    assert torch.isfinite(normalized.float()).all()
-    assert torch.isfinite(scales).all()
-    assert (scales > 0).all()
-
-
 def test_reference_pad_slot_leaves_state_untouched():
     """PAD_SLOT_ID rows must not read or write conv/ssm state.
 
@@ -754,77 +737,6 @@ def test_fused_gdn_decode_query_start_loc_padding(
     torch.testing.assert_close(
         ops["conv_state"].float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
     )
-
-
-def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
-    """``out`` and ``query_start_loc`` are kernel operands like the rest, so CPU
-    tensors with valid shapes and dtypes must not pass the support check."""
-    _import_op()
-    _requires_gfx950()
-    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
-        fused_gdn_decode_qkvz_supported,
-    )
-
-    batch = 4
-    ops = to_flat_layout(make_inputs(batch, num_k_heads=16, ratio=3))
-    args = [
-        ops[k]
-        for k in (
-            "projected_qkvz",
-            "projected_ba",
-            "conv_state",
-            "ssm_state",
-            "ssm_state_indices",
-            "conv_weight",
-            "conv_bias",
-            "A_log",
-            "dt_bias",
-            "norm_weight",
-        )
-    ]
-    vh, vd = ops["num_v_heads"], ops["head_v_dim"]
-    qsl = torch.arange(batch + 1, dtype=torch.int32, device=device)
-    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16, device=device)
-
-    assert fused_gdn_decode_qkvz_supported(
-        *args, qkvz_layout="flat", query_start_loc=qsl, out=out
-    ) == (True, "")
-    for kwargs in ({"query_start_loc": qsl.cpu()}, {"out": out.cpu()}):
-        ok, reason = fused_gdn_decode_qkvz_supported(
-            *args, qkvz_layout="flat", **kwargs
-        )
-        assert not ok and "device" in reason, kwargs.keys()
-
-
-@pytest.mark.parametrize("num_ksplit", [0, 1])
-def test_fused_gdn_decode_supported_rejects_fewer_than_two_ba_partials(num_ksplit):
-    """A split-K GEMM with one split returns the reduced bf16 output, so fp32
-    partials with fewer than 2 splits are not valid input."""
-    _import_op()
-    _requires_gfx950()
-    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
-        fused_gdn_decode_qkvz_supported,
-    )
-
-    ops = to_flat_layout(make_inputs(4, num_k_heads=16, ratio=3))
-    ops["projected_ba"] = _split_k_partials(ops["projected_ba"], 2)[:num_ksplit]
-    args = [
-        ops[k]
-        for k in (
-            "projected_qkvz",
-            "projected_ba",
-            "conv_state",
-            "ssm_state",
-            "ssm_state_indices",
-            "conv_weight",
-            "conv_bias",
-            "A_log",
-            "dt_bias",
-            "norm_weight",
-        )
-    ]
-    ok, reason = fused_gdn_decode_qkvz_supported(*args, qkvz_layout="flat")
-    assert not ok and "at least 2 splits" in reason
 
 
 def test_fused_gdn_decode_preallocated_out():

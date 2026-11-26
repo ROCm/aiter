@@ -25,6 +25,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.aot_launch import aot_factory
+
 from .kernels_common import ceildiv
 from .mxfp4_gemm_common import (
     FP8OUT_PITCH_ALIGN,
@@ -243,6 +245,15 @@ def _pick_reduce_block(model_dim: int, V: int) -> int:
     return block
 
 
+@aot_factory(
+    "moe_reduction",
+    sources=[
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/act.py",
+        "kernels/dpp_utils.py",
+        "kernels/layout_utils.py",
+    ],
+)
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
     *,
