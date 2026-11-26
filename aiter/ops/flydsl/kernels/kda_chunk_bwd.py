@@ -1263,6 +1263,11 @@ def _stage(
     ``transpose`` writes it as ``[cols, rows]``. Rows ``>= nvalid`` are zeroed.
     With ``view = _src(tensor, base)`` each thread loads 16 contiguous bytes
     per instruction (8 bf16 or 4 fp32); row starts must be 16-byte aligned.
+
+    A transposed stage gives consecutive lanes consecutive source rows, so their
+    LDS writes land on consecutive addresses; walking the source row-major
+    instead would put lanes ``vec * ld_dst`` elements apart, a few banks for a
+    whole wave.
     """
     if isinstance(view, tuple):
         tensor, base = view
@@ -1282,11 +1287,16 @@ def _stage(
             atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
             for e in range_constexpr(rows * cv // NUM_THREADS):
                 i = tid + e * NUM_THREADS
-                t = i // cv
-                c0 = (i % cv) * vec
+                if const_expr(transpose):
+                    t = i % rows
+                    cvi = i // rows
+                else:
+                    t = i // cv
+                    cvi = i % cv
+                c0 = cvi * vec
                 ok = t < nvalid
                 vals = _load_vec(
-                    atom, fx.slice(v3, (_sel(ok, t, 0), i % cv, None)), vec, num
+                    atom, fx.slice(v3, (_sel(ok, t, 0), cvi, None)), vec, num
                 )
                 for p in range_constexpr(vec):
                     x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
@@ -1297,8 +1307,12 @@ def _stage(
             return
     for e in range_constexpr(rows * cols // NUM_THREADS):
         i = tid + e * NUM_THREADS
-        t = i // cols
-        c = i % cols
+        if const_expr(transpose):
+            t = i % rows
+            c = i // rows
+        else:
+            t = i // cols
+            c = i % cols
         ok = t < nvalid
         x = _sel(ok, ldg(view, _sel(ok, t, 0) * ld_stride + c, num), _zero())
         lds_st(dst, c * ld_dst + t if transpose else t * ld_dst + c, x, dst_num)
@@ -1911,6 +1925,12 @@ def compile_dav_mfma(
 # dhu on MFMA
 # ---------------------------------------------------------------------------
 LDB = BV + 4  # fp32 [64, BV] staging
+# intra's padded rows: fp32 g [*, 128], bf16 q/k [*, 128], fp32 dA [*, 64]. The
+# off-diagonal gathers read 4 rows apart per lane group; 16-byte padding moves
+# those groups 16 banks apart and keeps rows 16-byte aligned for b128 reads.
+LDG = K + 4
+LDQ = K + 8
+LDA = BT + 4
 
 
 @functools.cache
@@ -2023,7 +2043,15 @@ def compile_dhu_mfma(
         NVT = BT * (K // 8) // NUM_THREADS  # 128-bit loads per thread per tile
         cp8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
-        def tile_regs(tensor, it_):
+        def tile_coord(e, transpose):
+            """(row, 8-column group) of this thread's e-th vector of a tile; a
+            transposed tile walks rows fastest so its LDS writes are contiguous."""
+            i_ = tid + e * NUM_THREADS
+            if const_expr(transpose):
+                return i_ % BT, i_ // BT
+            return i_ // (K // 8), i_ % (K // 8)
+
+        def tile_regs(tensor, it_, transpose):
             t0_, nv_ = _chunk(it_, T_loc)
             v3 = _view3(
                 tensor,
@@ -2035,12 +2063,11 @@ def compile_dhu_mfma(
             )
             out = []
             for e in range_constexpr(NVT):
-                i_ = tid + e * NUM_THREADS
-                t_ = i_ // (K // 8)
+                t_, cv_ = tile_coord(e, transpose)
                 out.append(
                     _load_vec(
                         cp8,
-                        fx.slice(v3, (_sel(t_ < nv_, t_, 0), i_ % (K // 8), None)),
+                        fx.slice(v3, (_sel(t_ < nv_, t_, 0), cv_, None)),
                         8,
                         fx.BFloat16,
                     )
@@ -2050,19 +2077,22 @@ def compile_dhu_mfma(
         def tile_store(vecs, it_, dst, ld_dst, transpose):
             _, nv_ = _chunk(it_, T_loc)
             for e in range_constexpr(NVT):
-                i_ = tid + e * NUM_THREADS
-                t_ = i_ // (K // 8)
+                t_, cv_ = tile_coord(e, transpose)
                 ok = t_ < nv_
                 vals = fx.Vector(vecs[e])
                 for p in range_constexpr(8):
-                    c_ = (i_ % (K // 8)) * 8 + p
+                    c_ = cv_ * 8 + p
                     x = _sel(ok, vals[p].to(fx.Float32), _zero())
                     lds_st(
                         dst, c_ * ld_dst + t_ if transpose else t_ * ld_dst + c_, x, BF
                     )
 
         def prefetch(it_):
-            return tile_regs(kg, it_) + tile_regs(qg, it_) + tile_regs(w, it_)
+            return (
+                tile_regs(kg, it_, False)
+                + tile_regs(qg, it_, True)
+                + tile_regs(w, it_, True)
+            )
 
         for i, st in range(0, NT, 1, init=init + prefetch(NT - 1)):
             it = NT - 1 - fx.Int32(i)
@@ -2231,11 +2261,11 @@ def compile_intra_mfma(
 
     @fx.struct
     class Smem:
-        q: fx.Array[fx.BFloat16, BT * K, 16]
-        k: fx.Array[fx.BFloat16, BT * K, 16]
-        g: fx.Array[fx.Float32, BT * K, 16]
-        aq: fx.Array[fx.Float32, BT * BT, 16]
-        ak: fx.Array[fx.Float32, BT * BT, 16]
+        q: fx.Array[fx.BFloat16, BT * LDQ, 16]
+        k: fx.Array[fx.BFloat16, BT * LDQ, 16]
+        g: fx.Array[fx.Float32, BT * LDG, 16]
+        aq: fx.Array[fx.Float32, BT * LDA, 16]
+        ak: fx.Array[fx.Float32, BT * LDA, 16]
         beta: fx.Array[fx.Float32, BT, 16]
         s: fx.Array[fx.Float32, BT * LDK, 16]
 
@@ -2290,21 +2320,21 @@ def compile_intra_mfma(
         hb = tok * H + fx.Int64(h)
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
-        s_q = _lds(lds.q, BT * K)
-        s_k = _lds(lds.k, BT * K)
-        s_g = _lds(lds.g, BT * K)
-        s_aq = _lds(lds.aq, BT * BT)
-        s_ak = _lds(lds.ak, BT * BT)
+        s_q = _lds(lds.q, BT * LDQ)
+        s_k = _lds(lds.k, BT * LDQ)
+        s_g = _lds(lds.g, BT * LDG)
+        s_aq = _lds(lds.aq, BT * LDA)
+        s_ak = _lds(lds.ak, BT * LDA)
         s_b = _lds(lds.beta, BT)
         s_s = _lds(lds.s, BT * LDK)
-        _stage(_src(q, hk), H * K, s_q, K, BT, K, nvalid, tid, KN, fx.BFloat16)
-        _stage(_src(k, hk), H * K, s_k, K, BT, K, nvalid, tid, KN, fx.BFloat16)
-        _stage(_src(g, hk), H * K, s_g, K, BT, K, nvalid, tid, fx.Float32, fx.Float32)
+        _stage(_src(q, hk), H * K, s_q, LDQ, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(k, hk), H * K, s_k, LDQ, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(g, hk), H * K, s_g, LDG, BT, K, nvalid, tid, fx.Float32, fx.Float32)
         _stage(
             _src(dAqk, hb * BT),
             H * BT,
             s_aq,
-            BT,
+            LDA,
             BT,
             BT,
             nvalid,
@@ -2316,7 +2346,7 @@ def compile_intra_mfma(
             _src(dAkk, hb * BT),
             H * BT,
             s_ak,
-            BT,
+            LDA,
             BT,
             BT,
             nvalid,
@@ -2330,7 +2360,7 @@ def compile_intra_mfma(
         gpu.barrier()
 
         # Rows are read as b128: each thread owns 32 contiguous columns.
-        g_r = _lds_row(s_g, r * K + seg * 32, 32, fx.Float32)
+        g_r = _lds_row(s_g, r * LDG + seg * 32, 32, fx.Float32)
 
         # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j]), sub-chunks apart
         lane = tid % 64
@@ -2343,24 +2373,26 @@ def compile_intra_mfma(
             """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])."""
             for kt in range_constexpr(K // 16):
                 c = kt * 16 + n16
-                gn = lds_ld(s_g, m0 * K + c)  # pivot: first row of the sub-chunk
+                gn = lds_ld(s_g, m0 * LDG + c)  # pivot: first row of the sub-chunk
                 acc = fx.Float32x4(0.0)
                 for J in range_constexpr(BT // 16 - 1):
                     # Only sub-chunks before this wave's; the branch is wave-uniform.
                     if wave > J:
-                        a = _lds_row(s_a, (m0 + n16) * BT + J * 16 + kq4, 4, fx.Float32)
+                        a = _lds_row(
+                            s_a, (m0 + n16) * LDA + J * 16 + kq4, 4, fx.Float32
+                        )
                         bv = []
                         for p in range_constexpr(4):
                             j = J * 16 + kq4 + p
                             bv.append(
-                                lds_ld(s_k, j * K + c, fx.BFloat16)
-                                * _decay(gn - lds_ld(s_g, j * K + c))
+                                lds_ld(s_k, j * LDQ + c, fx.BFloat16)
+                                * _decay(gn - lds_ld(s_g, j * LDG + c))
                             )
                         acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
                 for p in range_constexpr(4):
                     m = m0 + kq4 + p
                     lds_st(
-                        s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * K + c) - gn)
+                        s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * LDG + c) - gn)
                     )
             gpu.barrier()
             out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
@@ -2372,7 +2404,7 @@ def compile_intra_mfma(
             g_row = _min(m0 + 15, nvalid - 1)  # pivot: last valid row of the sub-chunk
             for kt in range_constexpr(K // 16):
                 c = kt * 16 + n16
-                gn = lds_ld(s_g, g_row * K + c)
+                gn = lds_ld(s_g, g_row * LDG + c)
                 acc = fx.Float32x4(0.0)
                 for J in range_constexpr(1, BT // 16):
                     # Only sub-chunks after this wave's; the branch is wave-uniform.
@@ -2380,17 +2412,17 @@ def compile_intra_mfma(
                         aq, ak, bq, bk = [], [], [], []
                         for p in range_constexpr(4):
                             j = J * 16 + kq4 + p
-                            aq.append(lds_ld(s_aq, j * BT + m0 + n16))
-                            ak.append(lds_ld(s_ak, j * BT + m0 + n16) * lds_ld(s_b, j))
-                            dec = _decay(lds_ld(s_g, j * K + c) - gn)
-                            bq.append(lds_ld(s_q, j * K + c, fx.BFloat16) * dec)
-                            bk.append(lds_ld(s_k, j * K + c, fx.BFloat16) * dec)
+                            aq.append(lds_ld(s_aq, j * LDA + m0 + n16))
+                            ak.append(lds_ld(s_ak, j * LDA + m0 + n16) * lds_ld(s_b, j))
+                            dec = _decay(lds_ld(s_g, j * LDG + c) - gn)
+                            bq.append(lds_ld(s_q, j * LDQ + c, fx.BFloat16) * dec)
+                            bk.append(lds_ld(s_k, j * LDQ + c, fx.BFloat16) * dec)
                         acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
                         acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
                 for p in range_constexpr(4):
                     m = m0 + kq4 + p
                     lds_st(
-                        s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * K + c))
+                        s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * LDG + c))
                     )
             gpu.barrier()
             out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
@@ -2403,11 +2435,11 @@ def compile_intra_mfma(
         for jj, st in range(0, 16, 1, init=init):
             jq = jb + fx.Int32(jj)
             ok = (jq <= r) & (jq < nvalid)
-            aq = _sel(ok, lds_ld(s_aq, r * BT + jq), _zero())
-            ak = _sel(ok, lds_ld(s_ak, r * BT + jq), _zero())
+            aq = _sel(ok, lds_ld(s_aq, r * LDA + jq), _zero())
+            ak = _sel(ok, lds_ld(s_ak, r * LDA + jq), _zero())
             acc_q, acc_k = [], []
-            g_j = _lds_row(s_g, jq * K + seg * 32, 32, fx.Float32)
-            k_j = _lds_row(s_k, jq * K + seg * 32, 32, fx.BFloat16)
+            g_j = _lds_row(s_g, jq * LDG + seg * 32, 32, fx.Float32)
+            k_j = _lds_row(s_k, jq * LDQ + seg * 32, 32, fx.BFloat16)
             for e in range_constexpr(32):
                 ex = _decay(_sel(ok, g_r[e] - g_j[e], _zero()))
                 kx = k_j[e] * ex
@@ -2417,8 +2449,8 @@ def compile_intra_mfma(
         acc = _results(res, 64)
         b_dq2, b_dk2 = acc[:32], acc[32:]
 
-        k_r = _lds_row(s_k, r * K + seg * 32, 32, fx.BFloat16)
-        q_r = _lds_row(s_q, r * K + seg * 32, 32, fx.BFloat16)
+        k_r = _lds_row(s_k, r * LDQ + seg * 32, 32, fx.BFloat16)
+        q_r = _lds_row(s_q, r * LDQ + seg * 32, 32, fx.BFloat16)
         beta_r = lds_ld(s_b, r)
         db_r = _zero()
         for e in range_constexpr(32):
@@ -2456,12 +2488,12 @@ def compile_intra_mfma(
             jq = jb + fx.Int32(jj)
             # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
             ok = (jq >= r) & (jq < nvalid)
-            aq = _sel(ok, lds_ld(s_aq, jq * BT + r), _zero())
-            ak = _sel(ok, lds_ld(s_ak, jq * BT + r) * lds_ld(s_b, jq), _zero())
+            aq = _sel(ok, lds_ld(s_aq, jq * LDA + r), _zero())
+            ak = _sel(ok, lds_ld(s_ak, jq * LDA + r) * lds_ld(s_b, jq), _zero())
             acc = []
-            g_j = _lds_row(s_g, jq * K + seg * 32, 32, fx.Float32)
-            q_j = _lds_row(s_q, jq * K + seg * 32, 32, fx.BFloat16)
-            k_j = _lds_row(s_k, jq * K + seg * 32, 32, fx.BFloat16)
+            g_j = _lds_row(s_g, jq * LDG + seg * 32, 32, fx.Float32)
+            q_j = _lds_row(s_q, jq * LDQ + seg * 32, 32, fx.BFloat16)
+            k_j = _lds_row(s_k, jq * LDQ + seg * 32, 32, fx.BFloat16)
             for e in range_constexpr(32):
                 ex = _decay(_sel(ok, g_j[e] - g_r[e], _zero()))
                 acc.append(st[e] + (aq * q_j[e] + ak * k_j[e]) * ex)
