@@ -39,6 +39,7 @@ from .kernels.kda_chunk_bwd import (
     compile_dhu_mfma,
     compile_gate_cumsum,
     compile_intra,
+    compile_intra_mfma,
     compile_wy_dqkg,
     compile_wy_dqkg_mfma,
 )
@@ -412,7 +413,7 @@ def chunk_kda_bwd_flydsl_full(
     dg2 = alloc(B, T, H, K, **f32)
     db2 = alloc(beta.shape, device=dev, dtype=beta.dtype)
     _run_compiled(
-        compile_intra(
+        (compile_intra_mfma if _MFMA else compile_intra)(
             H,
             qn.dtype,
             bn.dtype,

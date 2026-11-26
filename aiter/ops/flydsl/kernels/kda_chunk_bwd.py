@@ -2020,3 +2020,380 @@ def compile_dhu_mfma(
         )
 
     return launch
+
+
+def _mfma16_f32(a_f32x4, b_f32x4, c_f32x4):
+    """``C += A @ B`` for one 16x16 fp32 tile as four 16x16x4 fp32 MFMAs.
+
+    Lane ``l`` holds ``A[l % 16][(l // 16) * 4 + p]``, ``B[(l // 16) * 4 + p][l % 16]``
+    and ``C[(l // 16) * 4 + p][l % 16]`` (``p`` < 4), as in ``gdn_prepare``.
+    """
+    frag_a = fx.make_rmem_tensor(1, fx.Float32)
+    frag_b = fx.make_rmem_tensor(1, fx.Float32)
+    frag_c = fx.make_rmem_tensor(4, fx.Float32)
+    frag_c.store(fx.Float32x4(c_f32x4))
+    a = fx.Float32x4(a_f32x4)
+    b = fx.Float32x4(b_f32x4)
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    for p in range_constexpr(4):
+        frag_a[0] = a[p]
+        frag_b[0] = b[p]
+        fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    return fx.Float32x4(frag_c.load())
+
+
+@functools.cache
+def compile_intra_mfma(
+    H: int,
+    k_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    raw_k_dtype: torch.dtype,
+    raw_beta_dtype: torch.dtype,
+    out_k_dtype: torch.dtype,
+    out_beta_dtype: torch.dtype,
+    l2norm_qk: bool,
+    beta_sigmoid: bool,
+    varlen: bool = False,
+):
+    """``compile_intra`` with the off-diagonal sub-chunk products on MFMA.
+
+    Same arguments and launch. Rows split into four 16-row sub-chunks, one per
+    wave. Between sub-chunks the decay factors through the sub-chunk pivot,
+    ``exp2(g[m] - g[j]) = exp2(g[m] - g_n) * exp2(g_n - g[j])`` with both
+    exponents <= 0, which makes those terms fp32 16x16x4 MFMA products (fp32
+    operands, as Triton keeps them). Pairs inside a sub-chunk stay elementwise,
+    16 per row instead of 64.
+    """
+    KN = _num(k_dtype)
+    BN = _num(beta_dtype)
+    RKN = _num(raw_k_dtype)
+    RBN = _num(raw_beta_dtype)
+    OKN = _num(out_k_dtype)
+    OBN = _num(out_beta_dtype)
+    EPS = 1e-6
+
+    @fx.struct
+    class Smem:
+        q: fx.Array[fx.BFloat16, BT * K, 16]
+        k: fx.Array[fx.BFloat16, BT * K, 16]
+        g: fx.Array[fx.Float32, BT * K, 16]
+        aq: fx.Array[fx.Float32, BT * BT, 16]
+        ak: fx.Array[fx.Float32, BT * BT, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+        s: fx.Array[fx.Float32, BT * LDK, 16]
+
+    def l2norm_bwd(x, dy):
+        """``dx`` for ``y = x / sqrt(sum(x^2) + eps)`` along this thread's row."""
+        ss = _zero()
+        for e in range_constexpr(32):
+            ss = ss + x[e] * x[e]
+        rstd = fx.rsqrt(_row_sum(ss) + EPS)
+        y = [x[e] * rstd for e in range_constexpr(32)]
+        sdy = _zero()
+        for e in range_constexpr(32):
+            sdy = sdy + dy[e] * y[e]
+        sdy = _row_sum(sdy)
+        return [dy[e] * rstd - sdy * y[e] * rstd for e in range_constexpr(32)]
+
+    @flyc.kernel(name="kda_bwd_intra_mfma_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        rv = r < nvalid
+        rc = _sel(rv, r, 0)
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hb = tok * H + fx.Int64(h)
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_q = _lds(lds.q, BT * K)
+        s_k = _lds(lds.k, BT * K)
+        s_g = _lds(lds.g, BT * K)
+        s_aq = _lds(lds.aq, BT * BT)
+        s_ak = _lds(lds.ak, BT * BT)
+        s_b = _lds(lds.beta, BT)
+        s_s = _lds(lds.s, BT * LDK)
+        _load_tile(_flat(q, hk), H * K, s_q, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _load_tile(_flat(k, hk), H * K, s_k, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _load_tile(_flat(g, hk), H * K, s_g, BT, K, nvalid, tid, fx.Float32, fx.Float32)
+        _load_tile(
+            _flat(dAqk, hb * BT),
+            H * BT,
+            s_aq,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        _load_tile(
+            _flat(dAkk, hb * BT),
+            H * BT,
+            s_ak,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        if tid < BT:
+            bb = ldg(_flat(beta, hb), _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        g_r = [lds_ld(s_g, r * K + seg + 4 * e) for e in range_constexpr(32)]
+
+        # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j]), sub-chunks apart
+        lane = tid % 64
+        wave = tid // 64
+        m0 = wave * 16
+        n16 = lane % 16
+        kq4 = (lane // 16) * 4
+
+        def off_lower(s_a):
+            """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])."""
+            for kt in range_constexpr(K // 16):
+                c = kt * 16 + n16
+                gn = lds_ld(s_g, m0 * K + c)  # pivot: first row of the sub-chunk
+                acc = fx.Float32x4(0.0)
+                for J in range_constexpr(BT // 16):
+                    use = wave > J
+                    a = []
+                    bv = []
+                    for p in range_constexpr(4):
+                        j = J * 16 + kq4 + p
+                        a.append(_sel(use, lds_ld(s_a, (m0 + n16) * BT + j), _zero()))
+                        bv.append(
+                            lds_ld(s_k, j * K + c, fx.BFloat16)
+                            * _decay(gn - lds_ld(s_g, j * K + c))
+                        )
+                    acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
+                for p in range_constexpr(4):
+                    m = m0 + kq4 + p
+                    lds_st(
+                        s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * K + c) - gn)
+                    )
+            gpu.barrier()
+            out = [lds_ld(s_s, r * LDK + seg + 4 * e) for e in range_constexpr(32)]
+            gpu.barrier()
+            return out
+
+        def off_upper():
+            """s_s[m] = sum over later sub-chunks of (dAqk[j, m] q[j] + dAkk[j, m] beta[j] k[j]) exp2(g[j] - g[m])."""
+            g_row = _min(m0 + 15, nvalid - 1)  # pivot: last valid row of the sub-chunk
+            for kt in range_constexpr(K // 16):
+                c = kt * 16 + n16
+                gn = lds_ld(s_g, g_row * K + c)
+                acc = fx.Float32x4(0.0)
+                for J in range_constexpr(BT // 16):
+                    use = J > wave
+                    aq, ak, bq, bk = [], [], [], []
+                    for p in range_constexpr(4):
+                        j = J * 16 + kq4 + p
+                        aq.append(_sel(use, lds_ld(s_aq, j * BT + m0 + n16), _zero()))
+                        ak.append(
+                            _sel(
+                                use,
+                                lds_ld(s_ak, j * BT + m0 + n16) * lds_ld(s_b, j),
+                                _zero(),
+                            )
+                        )
+                        dec = _decay(lds_ld(s_g, j * K + c) - gn)
+                        bq.append(lds_ld(s_q, j * K + c, fx.BFloat16) * dec)
+                        bk.append(lds_ld(s_k, j * K + c, fx.BFloat16) * dec)
+                    acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
+                    acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
+                for p in range_constexpr(4):
+                    m = m0 + kq4 + p
+                    lds_st(
+                        s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * K + c))
+                    )
+            gpu.barrier()
+            out = [lds_ld(s_s, r * LDK + seg + 4 * e) for e in range_constexpr(32)]
+            gpu.barrier()
+            return out
+
+        jb = (r // 16) * 16
+        init = off_lower(s_aq) + off_lower(s_ak)
+        # Pairs inside the row's own sub-chunk.
+        for jj, st in range(0, 16, 1, init=init):
+            jq = jb + fx.Int32(jj)
+            ok = (jq <= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, r * BT + jq), _zero())
+            ak = _sel(ok, lds_ld(s_ak, r * BT + jq), _zero())
+            acc_q, acc_k = [], []
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                ex = _decay(_sel(ok, g_r[e] - lds_ld(s_g, jq * K + kk), _zero()))
+                kx = lds_ld(s_k, jq * K + kk, fx.BFloat16) * ex
+                acc_q.append(st[e] + aq * kx)
+                acc_k.append(st[32 + e] + ak * kx)
+            res = yield acc_q + acc_k
+        acc = _results(res, 64)
+        b_dq2, b_dk2 = acc[:32], acc[32:]
+
+        k_r = [
+            lds_ld(s_k, r * K + seg + 4 * e, fx.BFloat16) for e in range_constexpr(32)
+        ]
+        q_r = [
+            lds_ld(s_q, r * K + seg + 4 * e, fx.BFloat16) for e in range_constexpr(32)
+        ]
+        beta_r = lds_ld(s_b, r)
+        db_r = _zero()
+        for e in range_constexpr(32):
+            db_r = db_r + b_dk2[e] * k_r[e]
+        db_r = _row_sum(db_r)
+        b_dk2 = [b_dk2[e] * beta_r for e in range_constexpr(32)]
+
+        dq_v = _flat(dq, hk)
+        dk_v = _flat(dk, hk)
+        dg_v = _flat(dg, hk)
+        b_dg2 = [q_r[e] * b_dq2[e] for e in range_constexpr(32)]
+        b_dq2 = [
+            b_dq2[e] + ldg(dq_v, rc * (H * K) + seg + 4 * e, fx.Float32)
+            for e in range_constexpr(32)
+        ]
+        if const_expr(l2norm_qk):
+            qraw_v = _flat(q_raw, hk)
+            xr = [
+                ldg(qraw_v, rc * (H * K) + seg + 4 * e, RKN)
+                for e in range_constexpr(32)
+            ]
+            b_dq2 = l2norm_bwd(xr, b_dq2)
+        dq2_v = _flat(dq2, hk)
+        if rv:
+            for e in range_constexpr(32):
+                stg(dq2_v, r * (H * K) + seg + 4 * e, b_dq2[e], OKN)
+
+        db_r = db_r + ldg(_flat(db, hb), rc * H, fx.Float32)
+        if const_expr(beta_sigmoid):
+            sgm = _sigmoid(ldg(_flat(beta_raw, hb), rc * H, RBN))
+            db_r = db_r * sgm * (fx.Float32(1.0) - sgm)
+        if rv & (seg == 0):
+            stg(_flat(db2, hb), r * H, db_r, OBN)
+
+        # dkt = sum_{j >= r} (dAqk[j, r] q[j] + dAkk[j, r] beta[j] k[j]) exp2(g[j] - g[r])
+        for jj, st in range(0, 16, 1, init=off_upper()):
+            jq = jb + fx.Int32(jj)
+            # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
+            ok = (jq >= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, jq * BT + r), _zero())
+            ak = _sel(ok, lds_ld(s_ak, jq * BT + r) * lds_ld(s_b, jq), _zero())
+            acc = []
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                ex = _decay(_sel(ok, lds_ld(s_g, jq * K + kk) - g_r[e], _zero()))
+                acc.append(
+                    st[e]
+                    + (
+                        aq * lds_ld(s_q, jq * K + kk, fx.BFloat16)
+                        + ak * lds_ld(s_k, jq * K + kk, fx.BFloat16)
+                    )
+                    * ex
+                )
+            res = yield acc
+        dkt = _results(res, 32)
+
+        dk_out = []
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            b_dg2[e] = (
+                b_dg2[e]
+                + (b_dk2[e] - dkt[e]) * k_r[e]
+                + ldg(dg_v, rc * (H * K) + kk, fx.Float32)
+            )
+            dk_out.append(b_dk2[e] + ldg(dk_v, rc * (H * K) + kk, fx.Float32) + dkt[e])
+        if const_expr(l2norm_qk):
+            kraw_v = _flat(k_raw, hk)
+            xr = [
+                ldg(kraw_v, rc * (H * K) + seg + 4 * e, RKN)
+                for e in range_constexpr(32)
+            ]
+            dk_out = l2norm_bwd(xr, dk_out)
+        dk2_v = _flat(dk2, hk)
+        dg2_v = _flat(dg2, hk)
+        if rv:
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                stg(dk2_v, r * (H * K) + kk, dk_out[e], OKN)
+                stg(dg2_v, r * (H * K) + kk, b_dg2[e], fx.Float32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            dg,
+            db,
+            q_raw,
+            k_raw,
+            beta_raw,
+            dq2,
+            dk2,
+            dg2,
+            db2,
+            cu,
+            ci,
+            T,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
