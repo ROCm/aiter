@@ -1736,6 +1736,8 @@ def _flydsl_mxfp8_fallback_kernel(
         for ki in kernels_list.values()
         if kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
+        # L2-prefetch variants are a tuned-row strategy, never the fallback.
+        and not ki.l2_prefetch
     ]
     if not fits:
         return None

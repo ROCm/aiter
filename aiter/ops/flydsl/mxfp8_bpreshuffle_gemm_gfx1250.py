@@ -188,6 +188,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     w_scale_32x32: bool = False,
     batch: int = 1,
     y_scale_out: Tensor | None = None,
+    l2_prefetch: int = 0,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -228,6 +229,16 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         raise RuntimeError(
             "[FlyDSL gfx1250 mxfp8] early A/B merge requires a compute kernel "
             "with split_k=1"
+        )
+    if l2_prefetch and (
+        not compute_bound
+        or int(split_k) != 1
+        or int(persistent_n_tiles) != 1
+        or batch > 1
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] L2 prefetch (_pf) needs a compute kernel with "
+            "split_k=1, no persistent tiles and batch 1"
         )
     if w_scale_32x32 and not mx32:
         raise RuntimeError("w_scale_32x32 is supported only for mxfp8_32")
@@ -550,7 +561,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             batch,
             fuse_quant,
             ragged_n,
-            specialization_key=specialization + (fuse_quant, ragged_n),
+            int(l2_prefetch),
+            specialization_key=specialization + (fuse_quant, ragged_n, int(l2_prefetch)),
         )
     else:
         rank0_splitk = fused and not small_native
@@ -612,6 +624,7 @@ NAME_SUFFIX_RE = (
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
     r"(?P<early_merge>_eab|_ea|_eb)?"
+    r"(?:_pf(?P<l2_prefetch>[12]))?"
 )
 MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -638,6 +651,7 @@ def _parse_name(match):
     fused_splitk = groups.pop("fused_splitk", None) is not None
     early_merge = groups.pop("early_merge", None)
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    l2_prefetch = groups.pop("l2_prefetch", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
@@ -645,6 +659,7 @@ def _parse_name(match):
     cfg["early_a"] = early_merge in ("_ea", "_eab")
     cfg["early_b"] = early_merge in ("_eb", "_eab")
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["l2_prefetch"] = int(l2_prefetch) if l2_prefetch else 0
     return cfg
 
 
@@ -822,6 +837,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         persistent_n_tiles=cfg["persistent_n_tiles"],
         early_a=cfg["early_a"],
         early_b=cfg["early_b"],
+        l2_prefetch=cfg["l2_prefetch"],
     )
 
 
@@ -872,6 +888,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         persistent_n_tiles=cfg["persistent_n_tiles"],
         early_a=cfg["early_a"],
         early_b=cfg["early_b"],
+        l2_prefetch=cfg["l2_prefetch"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,

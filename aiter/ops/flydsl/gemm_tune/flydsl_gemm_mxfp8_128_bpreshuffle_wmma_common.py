@@ -90,6 +90,7 @@ class WmmaKernelInstance:
     early_a: bool = False
     early_b: bool = False
     fused_splitk: bool = False
+    l2_prefetch: int = 0
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
@@ -104,6 +105,7 @@ class WmmaKernelInstance:
                 if self.early_a and self.early_b
                 else ("_ea" if self.early_a else ("_eb" if self.early_b else ""))
             )
+            + (f"_pf{self.l2_prefetch}" if self.l2_prefetch else "")
         )
 
     @property
@@ -368,6 +370,37 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                     name_prefix=COMPUTE_NAME_PREFIX,
                     early_a=early_a,
                     early_b=early_b,
+                )
+                idx += 1
+    # After every established ID: two-slot clustered compute kernels that also
+    # hint the A rows and B groups of the next-but-one K rev into L2 (_pf1). A
+    # two-slot pipeline refills one stage ahead, too short for weights that are
+    # not cache-resident; four slots hide that by themselves, so they get no
+    # _pf variant.
+    for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+        if nb != 2:
+            continue
+        for cm, cn in _COMPUTE_CLUSTERS:
+            for early_a, early_b in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=1,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    early_a=early_a,
+                    early_b=early_b,
+                    l2_prefetch=1,
                 )
                 idx += 1
     return kl
