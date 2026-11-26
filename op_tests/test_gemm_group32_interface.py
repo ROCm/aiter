@@ -1050,6 +1050,41 @@ def test_mxscale_table_tuner_times_bmm(block):
         )
 
 
+def test_gfx1250_mxfp8_bmm_row_dispatch(monkeypatch):
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+
+    m, n, k = 16, 32, 128
+    name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    x, w = (torch.empty((r, k), dtype=torch.uint8) for r in (m, n))
+    xs, ws = (torch.empty((r, k // 32), dtype=torch.uint8) for r in (m, n))
+    calls = []
+
+    def run_bmm(xq, wq, x_scale, w_scale, out, kernel_name=None, **_kwargs):
+        calls.append(("bmm", tuple(xq.shape), kernel_name))
+        return out
+
+    def run_direct(*args, **kwargs):
+        calls.append(("direct", kwargs["a_scale_preshuffled"], args[5]))
+        return args[4]
+
+    monkeypatch.setattr(op, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(
+        op, "_get_mxfp8_bpreshuffle_config", lambda *_args: ("flydsl", name, 1)
+    )
+    monkeypatch.setattr(op, "_mxfp8_32_fallback_kernel_name", lambda *_: "direct")
+    monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", run_bmm)
+    monkeypatch.setattr(
+        direct, "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250", run_direct
+    )
+    gemm = op.gemm_a8w8_mxfp8_bpreshuffle.__wrapped__
+    assert gemm(x, w, xs, ws, dtype=torch.bfloat16).shape == (m, n)
+    # preshuffled A scales cannot take a B=1 BMM row: the direct kernel runs
+    gemm(x, w, xs, ws, dtype=torch.bfloat16, a_scale_preshuffled=True)
+    assert calls == [("bmm", (m, 1, k), name), ("direct", True, "direct_aspre")]
+
+
 @pytest.mark.parametrize("w_scale_n", [1, 32, 128])
 def test_bmm_heuristic_swizzles_1x32_only(w_scale_n):
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (

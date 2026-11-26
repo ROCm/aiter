@@ -62,6 +62,8 @@ def launch_gemm_a8w8_256x256(
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
+    early_a: Constexpr[bool] = False,
+    early_b: Constexpr[bool] = False,
     fused_splitk: Constexpr[bool] = False,
     a_scale_preshuffled: Constexpr[bool] = False,
     k_tiles_class: Constexpr[int] = 2,
@@ -69,6 +71,7 @@ def launch_gemm_a8w8_256x256(
     batched: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
     fuse_quant_out: Constexpr[bool] = False,
+    ragged_n: Constexpr[bool] = False,
 ):
     """A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
     compiled in; ``use_cluster`` is False only for a launch of one workgroup.
@@ -89,11 +92,30 @@ def launch_gemm_a8w8_256x256(
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
         (256, 256, 128, 2, 2, 2),
+        (256, 192, 128, 2, 2, 2),
+        (192, 256, 128, 2, 2, 4),
+        (192, 256, 128, 2, 2, 2),
+        (192, 192, 128, 2, 2, 2),
         (128, 128, 128, 2, 2, 4),
+        (128, 128, 128, 2, 2, 2),
         (128, 256, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 3),
+        (256, 128, 128, 2, 2, 2),
     ), "only the tuned 2x2-wave profiles are supported"
     assert 1 <= cluster_n < 16, f"cluster_n must be 1..15, got {cluster_n}"
+    # ragged_n: N need not be a multiple of tile_n. The last N tile's B and B-scale
+    # rows past N load as zeros (TDM OOB bound, as the A M-tail does) and its C
+    # store is clipped to N. B is never multicast then (cluster_m == 1), and the
+    # tile body, sync and per-element sums are unchanged.
+    assert not ragged_n or (
+        split_k == 1
+        and persistent_n_tiles == 1
+        and not fuse_quant_out
+        and not batched
+        and not fused_splitk
+        and block_size == 32
+        and not b_scale_32x32
+    ), "ragged_n needs split_k 1, no persistent tiles, batch or fused quant, mxfp8_32"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -101,10 +123,19 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
+    assert (
+        not (early_a or early_b) or split_k == 1
+    ), "early A/B merge currently requires split_k=1"
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
+    assert (
+        not fused_splitk or tile_m & (tile_m - 1) == 0
+    ), "the fused split-K row rotation needs a power-of-two tile_m"
+    assert (
+        not fused_splitk or (m_warp * n_warp * 32) % (tile_n // 4) == 0
+    ), "the fused split-K row schedule needs whole rows per wavegroup"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         use_cluster or cluster_n * cluster_k == 1
@@ -270,11 +301,17 @@ def launch_gemm_a8w8_256x256(
         + ("" if use_cluster else "_plain")
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
+        + (
+            "_eab"
+            if early_a and early_b
+            else ("_ea" if early_a else ("_eb" if early_b else ""))
+        )
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
         + ("_fq" if fuse_quant_out else "")
+        + ("_rn" if ragged_n else "")
     )
 
     def _run_tile(
@@ -339,6 +376,7 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
+        n_oob = i32_n - blk_n  # valid N columns of this tile (ragged_n)
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (
             (
@@ -479,7 +517,8 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    # B rows are 16-column groups: zero-fill the groups past N.
+                    (n_oob // 16) if const_expr(ragged_n) else None,
                     0,
                     True,
                 )
@@ -507,7 +546,8 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    # n32k4 scale super-rows are 32-column groups.
+                    (n_oob // 32) if const_expr(ragged_n) else None,
                     0,
                     True,
                 )
@@ -531,7 +571,13 @@ def launch_gemm_a8w8_256x256(
                 pad_amount=pad,
                 num_warps=1,
                 workgroup_mask=mask,
-                early_timeout=early and (owner > 1 or k_tiles_class > 1),
+                early_timeout=early
+                and (
+                    owner > 1
+                    or k_tiles_class > 1
+                    or (owner == 0 and early_a)
+                    or (owner == 1 and early_b)
+                ),
                 oob_outer_bound=bound,
                 oob_inner_bound=inner_bound,
             )
@@ -853,8 +899,11 @@ def launch_gemm_a8w8_256x256(
         def _sb_of(word):
             return word if const_expr(mx32) else _bcast_byte(word, sb_sel)
 
-        N_SA = half_m // 2 * 2
-        N_SB = half_n // 2 * 2 if const_expr(mx32) else 1
+        # MX32 has one scale word for each pair of 16-row/column WMMAs.
+        # half_m/half_n are exactly those pair counts, including odd counts
+        # for 192-wide tile dimensions.
+        N_SA = half_m
+        N_SB = half_n if const_expr(mx32) else 1
 
         seed_a = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_m)]
         seed_b = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_n)]
@@ -1790,7 +1839,12 @@ def launch_gemm_a8w8_256x256(
                 )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
-                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                c_cols = (
+                    (n_oob < tile_n).select(n_oob, fx.Int32(tile_n))
+                    if const_expr(ragged_n)
+                    else tile_n
+                )
+                gtC = _gv(gC_base, c_off_rt, (mn_oob, c_cols), (ldc64, 1))
                 atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
                     fx.rocdl.TensorStore(),
                     gtC,
