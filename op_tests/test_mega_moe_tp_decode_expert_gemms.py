@@ -25,8 +25,12 @@ import torch
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-if not torch.cuda.is_available() or not get_gfx_runtime().startswith("gfx95"):
-    pytest.skip("needs a gfx950 GPU", allow_module_level=True)
+# a module-wide mark (not a module-level skip) keeps the tests collected on other GPUs, so the
+# per-file pytest run reports skips instead of "no tests collected" (exit code 5)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    reason="needs a gfx950 GPU",
+)
 
 from aiter.ops.flydsl.kernels.mega_moe_tp import decode_expert_gemms as D
 
