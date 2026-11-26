@@ -74,15 +74,17 @@ def _moe_prepare_unsorted_input(
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
-    # FLAT kernels zero their own output rows on-device and need an
-    # extra M*8-byte per-token coordination region appended to moe_buf.
-    # We over-allocate as a flat byte buffer and expose only the row part.
+    # FLAT/EMSORT kernels zero their own output rows on-device and publish a
+    # dispatch stamp just past the rows. The EMSORT stack zeroes O from 8 leader
+    # TGs (idy 504..511) and each leader writes its own 8-byte stamp slot, so the
+    # region is 8 slots x 8 bytes = 64 bytes. We over-allocate as a flat byte
+    # buffer and expose only the row part.
     #
-    # The trailing region does not need initialisation; the kernel
-    # tolerates arbitrary contents on the first reference per dispatch.
+    # The trailing region does not need initialisation: every slot is rewritten
+    # by a leader each dispatch before a waiter accepts it.
     elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
     row_bytes = M * model_dim * elem_size
-    flag_bytes = 8
+    flag_bytes = 64
     flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
     moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
     topk_ids_i32 = (

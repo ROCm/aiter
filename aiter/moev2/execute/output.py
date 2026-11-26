@@ -17,7 +17,7 @@ from aiter.presorted_moe import bytes_overlap
 #     path                                      in-place?  why?
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
-#     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
+#     FLAT 1stage (tuned flat=1/2)              no         kernel needs 64 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          yes        if 4-byte aligned (BM16 zeroes in 4B)
 #     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
