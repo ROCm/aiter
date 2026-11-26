@@ -247,9 +247,7 @@ def _sol_jensen_cap_kernel(
         if STORE_SCALE:
             tl.store(
                 out_scale_ptr + scale_off,
-                tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(
-                    tl.uint8
-                ),
+                tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(tl.uint8),
             )
     else:
         tl.store(out_var_ptr + var_off, (var * gain).to(out_var_ptr.dtype.element_ty))
