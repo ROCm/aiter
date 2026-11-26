@@ -152,6 +152,37 @@ def _fwd_prepare_fn(prepare, tuned=None):
     return _PREPARE_IMPLS[name]
 
 
+def _reuse_fwd_intermediates(saved, q, k, beta, l2norm, beta_sigmoid):
+    """The prepare 10-tuple from a ``save_fwd`` forward, re-activating q/k/beta if absent."""
+    if len(saved) != 10:
+        raise ValueError(
+            "fwd_intermediates must be (q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk), "
+            f"got {len(saved)} entries."
+        )
+    qn, kn, bn, *rest = saved
+    if qn is None or kn is None:
+        if l2norm:
+            from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import (
+                l2norm_fwd,
+            )
+
+            qn = l2norm_fwd(q)[0] if qn is None else qn
+            kn = l2norm_fwd(k)[0] if kn is None else kn
+        else:
+            qn = q if qn is None else qn
+            kn = k if kn is None else kn
+    if bn is None:
+        if beta_sigmoid:
+            from aiter.ops.triton._triton_kernels.kimi_delta_attn.gate import (
+                beta_sigmoid_fwd,
+            )
+
+            bn = beta_sigmoid_fwd(beta)
+        else:
+            bn = beta
+    return (qn, kn, bn, *(t.contiguous() for t in rest))
+
+
 class _Timer:
     def __init__(self):
         self.marks = []
@@ -343,6 +374,7 @@ def chunk_kda_bwd_flydsl_full(
     prepare=None,
     dhu_bv=None,
     fwd_h_bv=None,
+    fwd_intermediates=None,
 ):
     """FlyDSL ``chunk_delta_attn_bwd``: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``.
 
@@ -356,6 +388,14 @@ def chunk_kda_bwd_flydsl_full(
     ``"triton"``. ``dhu_bv`` / ``fwd_h_bv`` override the V-block widths of
     ``dhu`` and the K5 recurrence. Unset tunables come from the tuned configs
     (``AITER_CONFIG_KDA_CHUNK_BWD``, see ``tuned_config``), then defaults.
+
+    ``fwd_intermediates`` (opt-in, the ``save_fwd`` mode) skips the forward
+    recompute: the 10-tuple ``(q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)``
+    a prepare returns (``chunk_delta_attn_fwd_prepare`` layouts; Aqk/Akk bf16
+    or fp32), as kept by the training forward. ``q`` / ``k`` / ``beta`` may be
+    None: they are then re-activated from the raw inputs (l2norm / sigmoid,
+    cheap elementwise passes), since ``chunk_delta_attn_fwd`` does not return
+    them. Default None: recompute.
     """
 
     B, T, H, K = q.shape
@@ -383,25 +423,35 @@ def chunk_kda_bwd_flydsl_full(
     alloc = torch.zeros if varlen else torch.empty
 
     timer = _Timer()
-    qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=BT,
-        safe_gate=safe_gate,
-        lower_bound=lower_bound,
-        use_gate_in_kernel=use_gate_in_kernel,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-        disable_recompute=True,
-    )
+    if fwd_intermediates is not None:
+        qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = _reuse_fwd_intermediates(
+            fwd_intermediates,
+            q,
+            k,
+            beta,
+            use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel,
+        )
+    else:
+        qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=BT,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            disable_recompute=True,
+        )
     timer.mark("fwd_prepare")
     _check("fwd_prepare (Triton)", q=qn, k=kn, g=gc, w=w, u=u, qg=qg, kg=kg, Akk=Akk)
     h, v_new = kda_bwd_fwd_h_flydsl(
@@ -628,6 +678,7 @@ def chunk_kda_bwd_flydsl(
     lower_bound=None,
     safe_gate=None,
     prepare=None,
+    fwd_intermediates=None,
 ):
     """#8739 ``register_chunk_bwd`` contract: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias)``.
 
@@ -638,7 +689,10 @@ def chunk_kda_bwd_flydsl(
     dt_bias))`` (``[-5, 0)``) instead of ``-exp(A_log) * softplus(g +
     dt_bias)``; ``safe_gate`` defaults to ``lower_bound is not None``.
     ``prepare`` selects a registered forward-recompute backend
-    (``register_fwd_prepare``). q/k/v/do are computed in bf16; each gradient
+    (``register_fwd_prepare``). ``fwd_intermediates`` (opt-in, #8739's
+    ``save_fwd``) passes the forward's prepare 10-tuple and skips the
+    recompute; see ``chunk_kda_bwd_flydsl_full``. The Triton fallback ignores it
+    and recomputes. q/k/v/do are computed in bf16; each gradient
     comes back in its input's dtype. Falls back to the Triton backward when
     the call is outside ``kda_bwd_flydsl_supported``.
     """
@@ -678,6 +732,7 @@ def chunk_kda_bwd_flydsl(
             scale,
             chunk_size=chunk_size,
             prepare=prepare,
+            fwd_intermediates=fwd_intermediates,
             **kw,
         )
     else:

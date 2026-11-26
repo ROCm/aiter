@@ -21,6 +21,8 @@ Triton ``chunk_delta_attn_fwd_prepare`` so the backward's recompute can use it.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels.kda_chunk_fwd import (
@@ -38,10 +40,39 @@ from .linear_attention_prefill_kernels import (
     _resolve_prologue,
 )
 
+# Same switch as the FlyDSL chunk backward: print per-stage times of each call.
+_PROFILE = os.environ.get("AITER_KDA_FLYDSL_PROFILE", "0") == "1"
+
+
+class _Timer:
+    def __init__(self):
+        self.marks = []
+        self.mark("start")
+
+    def mark(self, name):
+        if _PROFILE:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self.marks.append((name, ev))
+
+    def report(self, shape):
+        if not _PROFILE:
+            return
+        torch.cuda.synchronize()
+        parts = [
+            f"{n}={a.elapsed_time(b) * 1e3:.0f}us"
+            for (_, a), (n, b) in zip(self.marks, self.marks[1:])
+        ]
+        total = self.marks[0][1].elapsed_time(self.marks[-1][1]) * 1e3
+        print(f"[kda flydsl fwd {shape}] {' '.join(parts)} total={total:.0f}us")
+
+
 # Tunables, by name: ``k5_bv`` -- the K5 recurrence's V block (16 / 32 / 64);
 # ``diag_mfma`` -- the intra diagonal tiles on MFMA (only honoured for the
 # ``lower_bound`` gate, whose bounded decay it needs).
-TUNABLES = {"k5_bv": (16, 32, 64), "diag_mfma": (False, True)}
+# ``out_bv`` -- V columns per output program (64 doubles the program count;
+# measured slower from T = 2048 at H = 96, so 128 is the default).
+TUNABLES = {"k5_bv": (16, 32, 64), "diag_mfma": (False, True), "out_bv": (64, 128)}
 _TUNED_TABLE = None
 
 
@@ -76,6 +107,7 @@ def _load_tuned_table() -> dict:
             table[key] = {
                 "k5_bv": int(row["k5_bv"]),
                 "diag_mfma": _truthy(row["diag_mfma"]),
+                "out_bv": int(row["out_bv"]),
             }
     except (OSError, KeyError, ValueError, RuntimeError):
         return {}
@@ -92,6 +124,7 @@ def default_config(*, H, total_chunks, max_seq_chunks, lower_bound_gate, device)
     return {
         "k5_bv": _hipeq_select_bv(device, H, total_chunks, max_seq_chunks),
         "diag_mfma": bool(lower_bound_gate),
+        "out_bv": 128,
     }
 
 
@@ -440,6 +473,7 @@ def chunk_kda_fwd_flydsl(
             device=q.device,
         )
 
+    timer = _Timer()
     *_, gc, w, u, qg, kg, Aqk, _ = chunk_kda_fwd_prepare_flydsl(
         q,
         k,
@@ -457,6 +491,7 @@ def chunk_kda_fwd_flydsl(
         chunks=chunks,
         diag_mfma=config.get("diag_mfma"),
     )
+    timer.mark("intra")
     h, v_new, fs = kda_fwd_h_flydsl(
         kg,
         w,
@@ -469,9 +504,12 @@ def chunk_kda_fwd_flydsl(
         bv=config.get("k5_bv"),
     )
     # Not empty_like(v): a permuted v view would hand the kernel its strides.
+    timer.mark("k5")
     o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
     _run_compiled(
-        compile_output(H, h.dtype, v_new.dtype, o.dtype, chunks.varlen),
+        compile_output(
+            H, h.dtype, v_new.dtype, o.dtype, chunks.varlen, config.get("out_bv", 128)
+        ),
         qg,
         h,
         v_new,
@@ -485,6 +523,8 @@ def chunk_kda_fwd_flydsl(
         B * H,
         torch.cuda.current_stream(),
     )
+    timer.mark("output")
+    timer.report(f"B={B} T={T} H={H} N={chunks.N}")
     return o, fs
 
 

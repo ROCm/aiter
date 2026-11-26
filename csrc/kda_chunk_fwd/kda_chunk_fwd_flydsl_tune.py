@@ -97,10 +97,12 @@ def make_call(H, T, N, is_varlen, lower_bound_gate, seed=0):
 
 
 def configs(lower_bound_gate):
-    for bv, dm in itertools.product(*kf.TUNABLES.values()):
-        if dm and not lower_bound_gate:
+    names = list(kf.TUNABLES)
+    for vals in itertools.product(*kf.TUNABLES.values()):
+        cfg = dict(zip(names, vals))
+        if cfg["diag_mfma"] and not lower_bound_gate:
             continue  # diag_mfma is only honoured for the lower_bound gate
-        yield {"k5_bv": bv, "diag_mfma": dm}
+        yield cfg
 
 
 def tune_shape(H, T, N, is_varlen, lower_bound_gate, args):
@@ -182,7 +184,7 @@ def main():
         old = (
             pd.read_csv(out_path)
             if os.path.exists(out_path)
-            else pd.DataFrame(columns=KEY + ["k5_bv", "diag_mfma", "us"])
+            else pd.DataFrame(columns=KEY + list(kf.TUNABLES) + ["us"])
         )
         rows = []
         for s in shapes.to_dict("records"):
@@ -198,7 +200,8 @@ def main():
             cfg, us = tune_shape(*shape, args)
             rows.append(
                 dict(zip(KEY, (gfx, cu_num, *shape)))
-                | {"k5_bv": cfg["k5_bv"], "diag_mfma": cfg["diag_mfma"], "us": us}
+                | {n: cfg[n] for n in kf.TUNABLES}
+                | {"us": us}
             )
         if not rows:
             logger.warning("%s: no shapes for %s / cu_num %d", path, gfx, cu_num)
