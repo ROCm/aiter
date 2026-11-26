@@ -18,7 +18,7 @@ tokens with ``cu_seqlens``. Usage, from the repo root:
 
     python -m op_tests.op_benchmarks.flydsl.bench_kda_chunk_bwd
     python -m op_tests.op_benchmarks.flydsl.bench_kda_chunk_bwd \\
-        -s 1,32768,96,0 8,2048,96,1 --prepare triton flydsl
+        -s 1,32768,96,0 8,2048,96,1 --prepare triton flydsl --save-fwd
 """
 
 from __future__ import annotations
@@ -65,7 +65,34 @@ def make_inputs(b, t, h, varlen, seed=0):
     return x, cu
 
 
-def call(backend, x, cu, prepare):
+def fwd_intermediates(x, cu):
+    """The prepare 10-tuple a ``save_fwd`` forward keeps (Triton prepare)."""
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+        chunk_delta_attn_fwd_prepare,
+    )
+
+    return chunk_delta_attn_fwd_prepare(
+        q=x["q"],
+        k=x["k"],
+        v=x["v"],
+        g=x["g"],
+        beta=x["beta"],
+        scale=D**-0.5,
+        cu_seqlens=cu,
+        chunk_indices=None,
+        chunk_size=BT,
+        safe_gate=True,
+        lower_bound=-5.0,
+        use_gate_in_kernel=True,
+        A_log=x["A_log"],
+        dt_bias=x["dt_bias"],
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        disable_recompute=True,
+    )
+
+
+def call(backend, x, cu, prepare, saved=None):
     kw = {
         "cu_seqlens": cu,
         "chunk_size": BT,
@@ -80,7 +107,9 @@ def call(backend, x, cu, prepare):
     args = (x["do"], None, x["q"], x["k"], x["v"], x["g"], x["beta"], D**-0.5)
     if backend == "triton":
         return chunk_delta_attn_bwd(*args, **kw)
-    return fb.chunk_kda_bwd_flydsl_full(*args, prepare=prepare, **kw)
+    return fb.chunk_kda_bwd_flydsl_full(
+        *args, prepare=prepare, fwd_intermediates=saved, **kw
+    )
 
 
 def time_us(fn, args, warmup, iters):
@@ -112,6 +141,11 @@ def main():
         nargs="*",
         default=[],
         help="modules to import first; they call register_fwd_prepare",
+    )
+    parser.add_argument(
+        "--save-fwd",
+        action="store_true",
+        help="also time FlyDSL with the forward intermediates passed in (save_fwd)",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -145,6 +179,12 @@ def main():
                     call("flydsl", x, cu, prep)
                 finally:
                     fb._PROFILE = False
+        if args.save_fwd:
+            saved = fwd_intermediates(x, cu)
+            us = time_us(call, ("flydsl", x, cu, None, saved), args.warmup, args.iters)
+            row["flydsl save_fwd us"] = round(us, 1)
+            row["triton/flydsl save_fwd"] = round(tri / us, 3)
+            del saved
         rows.append(row)
         del x, cu
         torch.cuda.empty_cache()

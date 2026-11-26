@@ -444,3 +444,67 @@ def test_backward_flydsl_prepare_flydsl(varlen):
     )[:7]
     got = fb.chunk_kda_bwd_flydsl(*args, prepare="flydsl", **kw)
     _assert_grads_close(ref, got)
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+def test_backward_flydsl_save_fwd(varlen):
+    """save_fwd=True (forward intermediates reused) matches the recomputing backward."""
+    pytest.importorskip("flydsl")
+    x, cu = _inputs(3, 1000, 96, 96, 128, 128, varlen, "h0", precomputed_gate=False)
+    opts = dict(_FLASH, chunk_size=64)
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    grads = []
+    for save in (False, True):
+        leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+        o, s = chunk_kimi_delta_attn(
+            **leaves,
+            cu_seqlens=cu,
+            output_final_state=True,
+            bwd_backend="flydsl",
+            save_fwd=save,
+            **opts,
+        )
+        if not grads:
+            do = torch.randn(o.shape, device="cuda", generator=gen)
+            ds = torch.randn(s.shape, device="cuda", generator=gen) * 0.1
+        ((o.float() * do).sum() + (s.float() * ds).sum()).backward()
+        grads.append({n: t.grad for n, t in leaves.items()})
+    for n in x:
+        assert torch.isfinite(grads[1][n]).all(), n
+        assert _err_ratio(grads[0][n], grads[1][n]) < 1e-3, n
+
+
+def test_chunk_bwd_contract_fwd_intermediates():
+    """The contract's fwd_intermediates (save_fwd) skip the recompute, same gradients."""
+    pytest.importorskip("flydsl")
+    from aiter.ops.flydsl import kda_chunk_bwd as fb
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+        chunk_delta_attn_fwd_prepare,
+    )
+
+    args, kw = _contract_args(False)
+    _, q, k, v, g, beta, scale, bt = args
+    inter = chunk_delta_attn_fwd_prepare(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=None,
+        chunk_indices=None,
+        chunk_size=bt,
+        safe_gate=True,
+        lower_bound=kw["lower_bound"],
+        use_gate_in_kernel=True,
+        A_log=kw["A_log"],
+        dt_bias=kw["dt_bias"],
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        disable_recompute=True,
+    )
+    ref = fb.chunk_kda_bwd_flydsl(*args, **kw)
+    # Full tuple, and with q/k/beta left for the backward to re-activate.
+    for saved in (inter, (None, None, None, *inter[3:])):
+        got = fb.chunk_kda_bwd_flydsl(*args, fwd_intermediates=saved, **kw)
+        _assert_grads_close(ref, got)
