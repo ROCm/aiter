@@ -24,6 +24,7 @@ CASES = [
     (5, 8, 2, 2, 128, 4096),  # GQA, full rotary (default config)
     (64, 8, 2, 2, 128, 4096),
     (33, 4, 4, 1, 96, 2560),  # 4 kv heads, rotary 96 (no xor partner lane)
+    (40, 2, 3, 2, 120, 1152),  # K not a multiple of 512: one K split
 ]
 
 
@@ -142,7 +143,7 @@ def test_chain_gate():
         assert ok(1, *m3) and ok(192, *m3) and ok(128, *m3, num_index_heads=4)
         assert not ok(193, *m3) and not ok(129, *m3, num_index_heads=4)
         assert ok(1, *gqa) and ok(64, *gqa) and not ok(65, *gqa)
-        assert ok(33, 4, 4, D, 96, 2560) and ok(16, 1, 1, D, 8, 128)
+        assert ok(33, 4, 4, D, 96, 2560) and ok(40, 2, 3, D, 120, 1152)
         assert not ok(8, 16, 1, 64, 64, 6144)  # head_dim 64
         assert not ok(8, 16, 1, D, 60, 6144)  # rotary_dim not a multiple of 8
         assert not ok(8, 16, 1, D, 136, 6144)  # rotary_dim > head_dim
