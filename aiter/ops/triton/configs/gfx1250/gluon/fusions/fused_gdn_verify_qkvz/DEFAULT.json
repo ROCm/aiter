@@ -5,6 +5,7 @@
         "KS": 8,
         "chunk_num_warps": 4,
         "split_num_warps": 4,
-        "split_max_seqs": 8
+        "split_max_seqs": 8,
+        "ticket_relaxed_split_max_seqs": 24
     }
 }
