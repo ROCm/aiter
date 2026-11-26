@@ -171,6 +171,11 @@ def _launch(
         raise ValueError(
             "out must be a bf16 [M, N] with unit column stride, a non-overlapping even row stride and 4-byte alignment"
         )
+    elif m > 1 and ((m - 1) * out.stride(0) + n) * 2 >= 2**31:
+        # the reduce kernel counts the output's dwords in 32-bit arithmetic: bound the physical byte span
+        raise ValueError(
+            f"out spans {((m - 1) * out.stride(0) + n) * 2} B, past the kernel's 32-bit address range"
+        )
     if workspace is None:
         workspace = torch.empty(ks, m, n, dtype=torch.float32, device=w.device)
     elif (

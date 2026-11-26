@@ -133,6 +133,14 @@ def test_cat_x_ring_expanded_taps_and_output_rows():
     overlap = torch.empty(1, N, dtype=dtypes.bf16, device="cuda").expand(8, N)
     with pytest.raises(ValueError):
         gemm_a16w16_cat_x_ring(xs, ws, out=overlap)
+    # a row stride whose span passes the reduce kernel's 32-bit dword count is refused before any launch
+    stride = (
+        2**28
+    )  # 7 * 2**28 + N bf16 = 3.5 GiB of address space, never written (refused before any launch)
+    big = torch.empty(7 * stride + N, dtype=dtypes.bf16, device="cuda")
+    huge = torch.as_strided(big, (8, N), (stride, 1))
+    with pytest.raises(ValueError, match="32-bit"):
+        gemm_a16w16_cat_x_ring(xs, ws, out=huge)
 
 
 @_SKIP
