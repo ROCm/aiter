@@ -253,14 +253,72 @@ def register_gated_rmsnorm_bwd(fn: GatedRMSNormBwdFn | None):
     _gated_rmsnorm_bwd_impl = fn
 
 
+class _Guarded:
+    """A kernel module whose calls fall back to torch instead of raising.
+
+    ``checks[name](*args)`` returns why the kernel cannot take the call (a
+    shape, dtype or arch constraint) or None; a kernel that still rejects the
+    call at runtime falls back the same way. Either way the reason is recorded
+    in ``LAST_PIECES['<name>_skipped']``.
+    """
+
+    _ERRORS = (ValueError, AssertionError, NotImplementedError, RuntimeError, TypeError)
+
+    def __init__(self, primary, fallback, checks=None):
+        self._primary, self._fallback, self._checks = primary, fallback, checks or {}
+        self._label = _piece(primary)
+
+    def __getattr__(self, name):
+        kernel = getattr(self._primary, name)  # AttributeError if the kernel lacks it
+        backup = getattr(self._fallback, name, None)
+        if backup is None or not callable(kernel):
+            return kernel
+        check = self._checks.get(name)
+
+        def call(*args, **kwargs):
+            reason = check(*args, **kwargs) if check else None
+            if reason is None:
+                try:
+                    return kernel(*args, **kwargs)
+                except self._ERRORS as err:
+                    reason = f"{type(err).__name__}: {err}"
+            LAST_PIECES[f"{name}_skipped"] = reason
+            return backup(*args, **kwargs)
+
+        call._label = self._label
+        return call
+
+
+def _last_dim_multiple(n):
+    def check(x, *_, **__):
+        d = x.shape[-1]
+        return None if d % n == 0 else f"last dim {d} is not a multiple of {n}"
+
+    return check
+
+
+def _gemm_epilogue_check(a, w, *_, **__):
+    # gfx950 GEMM: 16-byte DMA rows and the store vector along N
+    if w.dtype not in (torch.bfloat16, torch.float16):
+        return f"weight dtype {w.dtype}"
+    for name, n in (("K", a.shape[-1]), ("N", w.shape[0]), ("D", w.shape[-1])):
+        if n % 8:
+            return f"{name}={n} is not a multiple of 8"
+    return None
+
+
 def _default_gated_rmsnorm_bwd(on_gpu):
     if on_gpu:
         try:
-            from aiter.ops.flydsl.gated_rmsnorm_bwd import gated_rmsnorm_bwd
-
-            return gated_rmsnorm_bwd
+            from aiter.ops.flydsl import gated_rmsnorm_bwd as rms_mod
         except ImportError:
-            pass
+            return _TorchOps.gated_rmsnorm_bwd
+        # #8741 needs V % 64 == 0
+        return _Guarded(
+            rms_mod,
+            _TorchOps,
+            {"gated_rmsnorm_bwd": _last_dim_multiple(64)},
+        ).gated_rmsnorm_bwd
     return _TorchOps.gated_rmsnorm_bwd
 
 
@@ -581,6 +639,8 @@ def _conv_bwd_kernel(on_gpu, dtype=None):
 
 def _piece(impl):
     """Short label of where an optional stage implementation comes from."""
+    if isinstance(getattr(impl, "__dict__", {}).get("_label"), str):
+        return impl._label
     module = getattr(impl, "__module__", None) or getattr(impl, "__name__", "")
     if impl is None or module == __name__:
         return "torch"
@@ -769,7 +829,10 @@ def _flydsl_ops():
 
 
 def _row_ops(x):
-    return _flydsl_ops() if x.is_cuda else _TorchOps
+    if not x.is_cuda:
+        return _TorchOps
+    # the FlyDSL L2-norm kernel needs rows of a multiple of 64
+    return _Guarded(_flydsl_ops(), _TorchOps, {"l2norm_bwd": _last_dim_multiple(64)})
 
 
 class _TorchOps:
@@ -842,7 +905,19 @@ def _proj_ops(x, w):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         if get_gfx_runtime() == "gfx950":
-            return _flydsl_ops()
+            return _Guarded(
+                _flydsl_ops(),
+                _TorchProj,
+                {
+                    name: _gemm_epilogue_check
+                    for name in (
+                        "kda_gate_proj",
+                        "kda_gate_proj_bwd",
+                        "sigmoid_gate_proj",
+                        "proj_gemm",
+                    )
+                },
+            )
     return _TorchProj
 
 

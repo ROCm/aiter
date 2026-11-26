@@ -356,6 +356,8 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
     if stage in ("gate_proj", "gate_proj_bwd", "sigmoid_gate_proj"):
         if dtype not in (dtypes.bf16, dtypes.fp16) or get_gfx_runtime() != "gfx950":
             return "FlyDSL GEMM epilogues need gfx950 and bf16/fp16"
+        if any(n % 8 for n in (k, r, d)):
+            return f"GEMM rows need multiples of 8 (k={k}, r={r}, d={d})"
         from aiter.ops.flydsl import kda_layer_bwd as fk
 
         lr = torch.randn(m, r)  # fp32, as the layer passes it
@@ -389,6 +391,8 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
             lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
             lambda: P.sigmoid_gate_proj(x, g_proj, aux),
         )
+    if stage in ("l2norm_bwd", "rmsnorm_bwd") and k % 64:
+        return f"FlyDSL row kernels need a head dim multiple of 64 (k={k})"
     if stage == "l2norm_bwd":
         from aiter.ops.flydsl import kda_layer_bwd as fk
 
