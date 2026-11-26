@@ -200,11 +200,23 @@ def register_gated_rmsnorm_bwd(fn: GatedRMSNormBwdFn | None):
 
     Contract: ``fn(o, gp, w, dy, eps) -> (do, dgp, dw)`` for
     ``out = o * rsqrt(mean(o^2, -1) + eps) * w * sigmoid(gp)`` with o, gp, dy
-    ``[B, T, H, V]`` and w ``[V]``; outputs fp32. ``None`` restores the PyTorch
-    fallback.
+    ``[B, T, H, V]`` and w ``[V]``; outputs fp32. ``None`` restores the default:
+    the FlyDSL ``aiter.ops.flydsl.gated_rmsnorm_bwd`` (ROCm/aiter#8741) on GPU
+    when it is installed, else PyTorch.
     """
     global _gated_rmsnorm_bwd_impl
     _gated_rmsnorm_bwd_impl = fn
+
+
+def _default_gated_rmsnorm_bwd(on_gpu):
+    if on_gpu:
+        try:
+            from aiter.ops.flydsl.gated_rmsnorm_bwd import gated_rmsnorm_bwd
+
+            return gated_rmsnorm_bwd
+        except ImportError:
+            pass
+    return _TorchOps.gated_rmsnorm_bwd
 
 
 def chunk_kda_bwd_torch(
@@ -374,7 +386,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
 
     d_wo = dy.t() @ s["on"].reshape(B * T, -1)
     d_on = (dy @ w.w_o.float()).view_as(s["o"])
-    rms_bwd = _gated_rmsnorm_bwd_impl or _TorchOps.gated_rmsnorm_bwd
+    rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
     ga = s["ga"].reshape(B * T, -1)
