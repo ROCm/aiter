@@ -288,6 +288,7 @@ AOT_CACHES = {
             "kernels/mega_moe/dispatch.py",
             "kernels/mega_moe/gemm1.py",
             "kernels/mega_moe/gemm2.py",
+            "kernels/mega_moe/gemm_ring.py",
             "kernels/mega_moe/gemm_util.py",
             "kernels/mega_moe/mega_moe_config.py",
             "kernels/mega_moe/mega_moe_fused_gemm.py",

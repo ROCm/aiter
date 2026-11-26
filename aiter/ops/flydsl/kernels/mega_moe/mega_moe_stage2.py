@@ -267,7 +267,7 @@ class Stage2Meta:
 
 # fmt: off
 def _scatter_bf16_rows_wide(lds_acc_base, n_block_idx, wave, lane, *, BM, BN, NW, npes, topk, log2_max_tok,
-    mask_max_tok, recv_cap, token_nbytes, meta):
+    mask_max_tok, recv_cap, token_nbytes, meta, c_pitch):
 # fmt: on
     """Store the FP32 tile staged in LDS as weighted BF16 rows to their peers with every lane of the workgroup.
 
@@ -309,7 +309,7 @@ def _scatter_bf16_rows_wide(lds_acc_base, n_block_idx, wave, lane, *, BM, BN, NW
         v8 = fx.Vector(
             lds_vec_load(
                 lds_acc_base,
-                (row * fx.Int32(BN) + col) * fx.Int32(4),
+                (row * fx.Int32(c_pitch) + col) * fx.Int32(4),
                 fx.Vector.make_type(vec, fx.Float32),
                 fx.Float32,
                 align=16,
@@ -335,7 +335,7 @@ def _scatter_bf16_rows_wide(lds_acc_base, n_block_idx, wave, lane, *, BM, BN, NW
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, meta, g2_bf16_lds=False, p2p_quant_type="none",
     scatter_vec=8, NW=4, store_cm=2, fp8_store_cm=None, fp8_rows=None, elem_view_stores=False, lean=0, tok_off=None, bf16_head_tokens=0,
-    row_nbytes=None, scale_stage=None, epi_lean=False, route_i8=False, wide_bf16=False):
+    row_nbytes=None, scale_stage=None, epi_lean=False, route_i8=False, wide_bf16=False, acc_t=False):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
@@ -366,6 +366,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     ``route_i8`` (epi_lean): offset int8 row values instead of E4M3.
     ``wide_bf16`` (dynamic, no lean / tok_off): when ``fp8_rows`` is 0 the BF16 rows are stored by
     _scatter_bf16_rows_wide (every lane, several rows per store) instead of one row per wave store.
+    ``acc_t``: ``accm[i][J]`` holds row ``16 i + lane % 16``, columns ``16 J + 4 (lane // 16)`` .. + 3 of the
+    wave's (the MFMA with the weights as operand A); the LDS tile rows are then ``BN + 4`` floats apart.
     """
     kMChunks = BM // 16
     numAccN = (BN // NW) // 16
@@ -423,7 +425,14 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
     fx.barrier()
 
-    for i in range_constexpr(kMChunks):
+    c_pitch = BN + 4 if acc_t else BN
+    assert not acc_t or not g2_bf16_lds
+    for i in range_constexpr(kMChunks if acc_t else 0):
+        for J in range_constexpr(numAccN):
+            col = wave * fx.Int32(wave_n) + J * 16 + lane_div_16 * 4
+            fx.ptr_store(fx.Vector(accm[i][J]), lds_typed_ptr(lds_acc_base, T.f32, align=16,
+                byte_offset=((fx.Int32(i * 16) + lane_mod_16) * fx.Int32(c_pitch) + col) * fx.Int32(4)))
+    for i in range_constexpr(0 if acc_t else kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * 4
         if const_expr(g2_bf16_lds):
             w_row = [meta.weight[row_base + v] for v in range_constexpr(4)]
@@ -494,7 +503,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             # Inactive lanes read safe LDS and issue a bounded OOB store.
             active = lane < fx.Int32(BN // scatter_vec)
             col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
-            idx0 = row * fx.Int32(BN) + col
+            idx0 = row * fx.Int32(c_pitch) + col
             if const_expr(g2_bf16_lds):
                 pk = fx.Vector(
                     lds_vec_load(
@@ -617,7 +626,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             else:
                 _scatter_bf16_rows_wide(lds_acc_base, n_block_idx, wave, lane, BM=BM, BN=BN, NW=NW, npes=npes,
                     topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=recv_cap,
-                    token_nbytes=token_nbytes, meta=meta)
+                    token_nbytes=token_nbytes, meta=meta, c_pitch=c_pitch)
 
         scatter_rows()
     else:

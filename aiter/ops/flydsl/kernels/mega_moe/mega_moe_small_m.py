@@ -44,8 +44,14 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
-from .gemm1 import _LdsF32View, build_fused_gemm1
+from .gemm1 import _LA_CM, _LdsF32View, build_fused_gemm1
 from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
+from .gemm_ring import (
+    gemm1_ring_lds_bytes,
+    gemm2_ring_lds_bytes,
+    make_ring_gemm1,
+    make_ring_gemm2,
+)
 from .mega_moe_config import (
     FUSED_QUANTS,
     FUSED_TOKEN_BUCKETS,
@@ -942,9 +948,12 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     return fused_combine_tail
 
 
-def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
-    """Absolute LDS offsets of the stage2 tile (compute slab, packed srcmap, weights, peer table, fc scratch)."""
+def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False, compute_bytes=None):
+    """Absolute LDS offsets of the stage2 tile (compute slab, packed srcmap, weights, peer table, fc scratch);
+    ``compute_bytes`` overrides the compute slab."""
     compute = _stage2_lds_bytes(BM, BN, BK, a_dtype, kStages + 1, g2_bf16_lds)
+    if compute_bytes is not None:
+        compute = compute_bytes
     packed = compute
     weight = packed + BM * 4
     peer = weight + BM * 4
@@ -1066,7 +1075,7 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, a_dtype: str = "fp8", g1_split_tail: int = 0,
-    pair_tiles: bool = False,
+    pair_tiles: bool = False, ring_core: tuple = (),
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1191,6 +1200,23 @@ def compile_mega_moe_stage1(
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
         epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, row_stride=interleave,
     )
+    # ring_core = (pf1, nbuf1, pf2, nbuf2): GEMM1 units and GEMM2 tiles run the gemm_ring cores, their weights pf
+    # 128-K steps ahead and their activation rows through an nbuf-stage LDS DMA ring; each wave owns 64 rows x 32
+    # intermediate (GEMM1) or 64 hidden (GEMM2) columns. GEMM2 reads the m-tile's rows from the CTA's own plan.
+    RING = bool(ring_core)
+    if RING:
+        ring_pf1, ring_nb1, ring_pf2, ring_nb2 = (int(v) for v in ring_core)
+        assert sort_block_m == 64 and tile_n == 64 * NUM_WAVES and g2_bn == 256 and interleave
+        assert not pair_tiles and not g1_split_tail and g1_lookahead == 1 and g1_a_ahead == 1
+        g1_a_bytes = gemm1_ring_lds_bytes(a_fp4=a_fp4, model_dim=model_dim, bm=sort_block_m, nw=NUM_WAVES,
+            nbuf=ring_nb1)
+        g2_lay = g2_lds_layout(BM=sort_block_m, BN=g2_bn, BK=g2_bk, a_dtype="fp8", npes=int(fuse_npes),
+            compute_bytes=max(sort_block_m * (g2_bn + 4) * 4, gemm2_ring_lds_bytes(inter_dim=inter_dim,
+            bm=sort_block_m, nw=NUM_WAVES, nbuf=ring_nb2)))
+        lds_pool_bytes = g1_a_bytes
+        n_scale_bytes = 16
+    else:
+        g1_a_bytes = 2 * tile_rows_max * A_K_STEP_BYTES
     # The combine's last WG zeroes the expert counters one per thread.
     assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
@@ -1200,7 +1226,7 @@ def compile_mega_moe_stage1(
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
         n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
     # The GEMM2 scratch words (the claim result, the plan word) are written while GEMM1 runs: past its A buffers.
-    g2_scratch_off = max(g2_lay["bytes"], 2 * tile_rows_max * A_K_STEP_BYTES)
+    g2_scratch_off = max(g2_lay["bytes"], g1_a_bytes)
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
     # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
@@ -1272,6 +1298,7 @@ def compile_mega_moe_stage1(
         f"{f'_spt{g1_split_tail}' if g1_split_tail else ''}"
         f"{'_afp4' if a_fp4 else ''}"
         f"{'_pt' if pair_tiles else ''}"
+        f"{'_rc' + ''.join(str(v) for v in ring_core) if RING else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1494,15 +1521,26 @@ def compile_mega_moe_stage1(
             kwargs.update(overrides)
             return build_fused_gemm1(**kwargs)
 
-        # pair_tiles: each build also returns its pair runner.
-        _, _do_scheduled_tile, *pair_runner = _build_gemm1(pair_tiles=pair_tiles)
-        # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
-        # reuse it, while the other ranks keep streaming W1 once per tile.
-        if const_expr(b_cache_modifier != 0):
-            _, _do_cached_tile, *pair_runner = _build_gemm1(b_cache_modifier=0, pair_tiles=pair_tiles)
-        # pair_tiles: a pair reads W1 through the cache (the cached build's pair runner), as its expert has more than
-        # one m-tile reading each slab; a streamed pair body as well would make four GEMM1 bodies, which spill.
-        _do_paired_tile = pair_runner[0] if const_expr(pair_tiles) else None
+        if const_expr(RING):
+            ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
+                nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, sw_cm=_LA_CM, q_cm=_LA_CM,
+                swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
+            ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m, bn=g2_bn,
+                nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
+            ring_srcmap = ptr_buf_tensor(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(DispatchSlot.G2_STIDS))),
+                fx.Int32)
+            lds_i8 = fx.recast_iter(fx.Int8, lds.pool.ptr)
+        else:
+            # pair_tiles: each build also returns its pair runner.
+            _, _do_scheduled_tile, *pair_runner = _build_gemm1(pair_tiles=pair_tiles)
+            # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
+            # reuse it, while the other ranks keep streaming W1 once per tile.
+            if const_expr(b_cache_modifier != 0):
+                _, _do_cached_tile, *pair_runner = _build_gemm1(b_cache_modifier=0, pair_tiles=pair_tiles)
+            # pair_tiles: a pair reads W1 through the cache (the cached build's pair runner), as its expert has more
+            # than one m-tile reading each slab; a streamed pair body as well would make four GEMM1 bodies, which
+            # spill.
+            _do_paired_tile = pair_runner[0] if const_expr(pair_tiles) else None
 
         def _run_half_tile(flat):
             # g1_split_tail: a half-width unit (flat index over 2 * N_TILES n-tiles of tile_n // 2), streaming W1.
@@ -1733,9 +1771,25 @@ def compile_mega_moe_stage1(
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-M_TILE_COUNT))
 
+        def _run_ring_tile(work, w_cm):
+            m_tile = fx.Int32(rocdl.readfirstlane(T.i32, work // fx.Int32(N_TILES)))
+            n_tile = fx.Int32(rocdl.readfirstlane(T.i32, work)) - m_tile * fx.Int32(N_TILES)
+            expert, tile_row_base, rows, row_stride = plan_lookup(m_tile)
+            ring_g1[w_cm](lds_base=lds_base_i32, lds_i8=lds_i8, x=x, sx=scale_x, w=w, sw=scale_w, q=out,
+                qs=out_scale, srcmap=ring_srcmap, x_token=row_map["x_token"], scale_token=row_map["scale_token"],
+                x_bytes=row_map["x_bytes"], expert=expert, m_tile=m_tile, n_tile=n_tile,
+                tile_row_base=tile_row_base, rows=rows, row_stride=row_stride)
+
         def _run_tile(unit):
             # A GEMM1 unit of one m-tile, through the streamed or (cached_w) the cached-weight body.
-            if const_expr(b_cache_modifier != 0):
+            if const_expr(RING and b_cache_modifier != 0):
+                if cached_w != fx.Int32(0):
+                    _run_ring_tile(unit[0], 0)
+                else:
+                    _run_ring_tile(unit[0], b_cache_modifier)
+            elif const_expr(RING):
+                _run_ring_tile(unit[0], 0)
+            elif const_expr(b_cache_modifier != 0):
                 if cached_w != fx.Int32(0):
                     _do_cached_tile(*unit)
                 else:
@@ -1855,6 +1909,56 @@ def compile_mega_moe_stage1(
             tok_par = fx.Int64(launch_epoch & fx.Int32(1))
             tok_off = tok_base + tok_par * fx.Int64(fz_mtpr * 4)
             tok_reset = tok_base + (fx.Int64(1) - tok_par) * fx.Int64(fz_mtpr * 4)
+        if const_expr(RING):
+            g2_ring_args = tuple(fx.Int64(comm_ops.wave_uniform_i64(a))
+                for a in (g2_aq, g2_ascale, g2_bq, g2_bscale, g2_stids, g2_sweights, a_g2_ready))
+
+            def _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm):
+                aq_u, ascale_u = g2_ring_args[:2]
+                acc = ring_g2_run(ctx, w_ring, lds_base=lds_base_i32, lds_i8=lds_i8, m_tile=g2_m, aq=aq_u,
+                    ascale=ascale_u, w_cm=w_cm)
+                if tid < fx.Int32(sort_block_m):
+                    packed = (tid < rows).select(packed, fx.Int32(fz_npes * fz_mtpr))
+                    fx.ptr_store(packed, lds_typed_ptr(fx.Int32(g2_lay["packed"]) + tid * fx.Int32(4), T.i32, align=4))
+                    fx.ptr_store(weight, lds_typed_ptr(fx.Int32(g2_lay["weight"]) + tid * fx.Int32(4), T.f32, align=4))
+                # fmt: off
+                p2p_scatter_epilog(lds_base_i32, acc, g2_n, g2_wave, g2_lane, N_OUT=model_dim, BM=sort_block_m,
+                    BN=g2_bn, npes=fz_npes, topk=fz_k, log2_max_tok=fz_mtpr.bit_length() - 1,
+                    mask_max_tok=fz_mtpr - 1, recv_cap=int(g2_recv_cap),
+                    comb_inp_nbytes=fz_mtpr * fz_k * model_dim * 2,
+                    meta=Stage2Meta(lds_base_i32, g2_lay["packed"], g2_lay["weight"], g2_lay["peer"]),
+                    p2p_quant_type="dynamic", store_cm=0, fp8_store_cm=2, fp8_rows=fp8_rows, elem_view_stores=True,
+                    lean=g2_epi_lean, tok_off=tok_off if const_expr(tok_done) else None,
+                    bf16_head_tokens=bf16_head_tokens, wide_bf16=not g2_epi_lean and not tok_done, acc_t=True)
+                # fmt: on
+
+            def _run_ring_g2(g2_m, g2_n):
+                g2_m = fx.Int32(rocdl.readfirstlane(T.i32, g2_m))
+                g2_n = fx.Int32(rocdl.readfirstlane(T.i32, g2_n))
+                expert, tile_row_base, rows, row_stride = plan_lookup(g2_m)
+                # The m-tile's GEMM1 output is complete at its ready epoch. Thread 0's first read of it goes ahead of
+                # the first weight steps (streamed in both bodies), which do not depend on it: a plain load past the
+                # caches whose value differs per lane (the other lanes read out of bounds), so neither a volatile /
+                # atomic access nor a scalar copy waits for it at once. The rows' route ids and weights are loaded
+                # ahead too and reach LDS after the K loop.
+                _aq, _ascale, bq_u, bscale_u, stids_u, sweights_u, ready_u = g2_ring_args
+                got = buf_copy_load(ptr_buf_tensor(ready_u, fx.Int32, num_records_bytes=1 << 30),
+                    (tid == fx.Int32(0)).select(g2_m, fx.Int32(1 << 28)), cache_modifier=_SC0_SC1_CACHE)
+                pos = tile_row_base + (tid & fx.Int32(sort_block_m - 1)) * row_stride
+                packed = ptr_buf_tensor(stids_u, fx.Int32)[pos]
+                weight = ptr_buf_tensor(sweights_u, fx.Float32)[pos]
+                ctx, w_ring = ring_g2_start(expert=expert, n_block=g2_n,
+                    unit_zero=(g2_m < fx.Int32(0)).select(g2_m, fx.Int32(0)), w=bq_u, sw=bscale_u, w_cm=2)
+                # The wait's first compare (and so the wait for the first read) stays below the weight loads.
+                rocdl.sched_barrier(0)
+                if (tid == fx.Int32(0)) & (got != launch_epoch):
+                    comm_ops.spin_from_until_eq_i32(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch, got)
+                fx.barrier()
+                if cached_w != fx.Int32(0):
+                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
+                else:
+                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)
+
         if const_expr(plan_local):
             # GEMM2 reads the plan CTA's metadata (its first unit drops the L1 after its ready wait).
             if tid == fx.Int32(0):
@@ -1865,9 +1969,19 @@ def compile_mega_moe_stage1(
                 if g2_fetch != fx.Int32(0):
                     fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - g2_claim_base,
                         g2_scratch)
+                if const_expr(RING):
+                    # GEMM1 wrote the unit's m-tile through this XCD's L2 (a cut m-tile: the other XCD wrote it back
+                    # to memory): only the CU's L1 can be stale, and no load of this CU reaches the m-tile before its
+                    # ready epoch, so the L1 is dropped here, before the unit's loads.
+                    comm_ops.invalidate_l1()
             fx.barrier()
             g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
-            if g2_local < g2_units:
+            if const_expr(RING):
+                if g2_local < g2_units:
+                    g2_u = g2_base + g2_local
+                    g2_m = g2_u // fx.Int32(g2_n_blocks)
+                    _run_ring_g2(g2_m, g2_u - g2_m * fx.Int32(g2_n_blocks))
+            elif g2_local < g2_units:
                 g2_u = g2_base + g2_local
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
@@ -1959,7 +2073,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
         ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, g1_split_tail=k1.g1_split_tail,
-        pair_tiles=k1.pair_tiles,
+        pair_tiles=k1.pair_tiles, ring_core=k1.ring_core,
     )
     # fmt: on
 

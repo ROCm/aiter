@@ -317,6 +317,10 @@ class FusedStage1Knobs:
     # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ. Not with
     # g1_split_tail.
     pair_tiles: bool = False
+    # Small-input fused kernel: GEMM1 units and GEMM2 tiles run the gemm_ring cores, (pf1, nbuf1, pf2, nbuf2): each
+    # GEMM's weights are loaded pf 128-K steps ahead of their MFMAs and its activation rows go through an nbuf-stage
+    # LDS DMA ring (needs 64-row m-tiles, 64 GEMM1 columns a wave and 256-wide GEMM2 tiles; () = off).
+    ring_core: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)

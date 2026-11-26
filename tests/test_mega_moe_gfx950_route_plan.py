@@ -433,9 +433,9 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 
 
 # Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune, pair_tiles with
-# the EP8 V4.1-Flash GEMM1 pairing, g1_split_tail with the A4W4 tunes): they enter the table only when set, so a
-# pinned digest changes only where a config sets one.
-_LATE_KNOBS = ("stream_w", "pair_tiles", "g1_split_tail")
+# the EP8 V4.1-Flash GEMM1 pairing, g1_split_tail with the A4W4 tunes, ring_core with the EP8 V4.1-Flash ring GEMM
+# cores): they enter the table only when set, so a pinned digest changes only where a config sets one.
+_LATE_KNOBS = ("stream_w", "pair_tiles", "g1_split_tail", "ring_core")
 
 
 def _knob_table(config):

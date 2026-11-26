@@ -474,6 +474,14 @@ def spin_until_eq_i32(addr_i64, val):
 
 
 @flyc.jit
+def spin_from_until_eq_i32(addr_i64, val, cur):
+    """spin_until_eq_i32 from a first read ``cur`` of the flag issued earlier."""
+    while cur != fx.Int32(val):
+        cur = fx.Int32(load_i32_acquire(addr_i64))
+    return cur
+
+
+@flyc.jit
 def spin_until_gt_i32(addr_i64, val):
     """Spin until an i32 flag exceeds ``val`` and return the observed value."""
     cur = fx.Int32(load_i32_acquire(addr_i64))
