@@ -13,6 +13,12 @@
 # use cases and intentionally produce different bits for the same input:
 #   * This file  — OCP FP8 (e4m3fn / e5m2), gfx950, nearest-even, training accuracy
 #   * quant_moe  — fnuz, gfx942, configurable direction, MoE inference throughput
+#
+# TE_SCALE=True instead follows Transformer Engine's MXFP8BlockScaling (Megatron-LM
+# --fp8-recipe mxfp8): biased exponent = ceil(log2(amax / max_pos)) in TE's bit form
+# (float_to_e8m0 of amax * fp32(1 / max_pos)), then a saturating RNE cast of
+# x * 2^(127 - byte). torchao's floor(log2(rne_3bit(amax))) - 8 can come out one
+# binade lower (amax 460 or 230 on e4m3), which clips the block max at max_pos.
 
 import triton
 import triton.language as tl
@@ -22,7 +28,19 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 # repr keys are the int/bool constexprs that select the compiled variant.
 _convert_to_mxfp8_kernel_repr = make_kernel_repr(
     "_convert_to_mxfp8_kernel",
-    ["BLOCK_M", "BLOCK_N", "QUANT_BLOCK_SIZE", "IS_2D_BLOCK", "USE_SR", "USE_ASM"],
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "QUANT_BLOCK_SIZE",
+        "IS_2D_BLOCK",
+        "USE_SR",
+        "USE_ASM",
+        "TE_SCALE",
+        "DEQUANT_OUT",
+        "ROUND_BF16",
+        "PRESHUFFLE",
+        "MASKED",
+    ],
 )
 _convert_from_mxfp8_kernel_repr = make_kernel_repr(
     "_convert_from_mxfp8_kernel",
@@ -38,6 +56,7 @@ def _calculate_scales(
     QUANT_BLOCK_SIZE: tl.constexpr,
     IS_2D_BLOCK: tl.constexpr = False,
     float8_dtype: tl.constexpr = tl.float8e4nv,
+    TE_SCALE: tl.constexpr = False,
 ):
     E8M0_EXPONENT_BIAS: tl.constexpr = 127
 
@@ -83,6 +102,23 @@ def _calculate_scales(
     else:
         x = x.reshape(BLOCK_M, NEW_BLOCK_N, QUANT_BLOCK_SIZE)
         max_abs = tl.max(tl.abs(x), axis=-1)
+
+    if TE_SCALE:
+        # Transformer Engine MXFP8BlockScaling: float_to_e8m0(amax * fp32(1 / max_pos)),
+        # the biased exponent rounded toward +inf and saturating at 254 (a subnormal
+        # at or below 2^-127 stays 0); NaN amax -> 255, inf -> 254.
+        if float8_dtype == tl.float8e4nv:
+            inv_max_pos: tl.constexpr = 1.0 / 448.0
+        else:
+            inv_max_pos: tl.constexpr = 1.0 / 57344.0
+        bits = (max_abs.to(tl.float32) * inv_max_pos).to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        man = bits & 0x7FFFFF
+        up = (man > 0) & (exp != 0xFE) & ((exp != 0) | (man > 0x400000))
+        biased = exp + up.to(tl.int32)
+        biased = tl.where(exp == 0xFF, tl.where(man == 0, 0xFE, 0xFF), biased)
+        return biased.to(tl.uint8)
+
     max_abs = max_abs.to(x.type.element_ty)
 
     # Round-to-nearest-even (adaptive to input mantissa width), per torchao:
@@ -117,6 +153,32 @@ def _generate_randval(m, n, philox_seed, philox_offset):
 
 
 @triton.jit
+def _per_element(
+    v,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    IS_2D_BLOCK: tl.constexpr,
+):
+    """A per-block value broadcast to the [BLOCK_M, BLOCK_N] elements of its block."""
+    SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    if IS_2D_BLOCK:
+        return (
+            v.expand_dims(axis=(1, 3))
+            .broadcast_to(
+                SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, QUANT_BLOCK_SIZE
+            )
+            .reshape(BLOCK_M, BLOCK_N)
+        )
+    return (
+        v.expand_dims(axis=2)
+        .broadcast_to(BLOCK_M, SCALE_BLOCK_N, QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_M, BLOCK_N)
+    )
+
+
+@triton.jit
 def _pack_fp8(
     x,
     scales,
@@ -129,6 +191,7 @@ def _pack_fp8(
     USE_SR: tl.constexpr = False,
     USE_ASM: tl.constexpr = False,
     float8_dtype: tl.constexpr = tl.float8e4nv,
+    TE_SCALE: tl.constexpr = False,
 ):
     if float8_dtype == tl.float8e4nv:
         max_pos: tl.constexpr = 448.0
@@ -139,6 +202,24 @@ def _pack_fp8(
     HALF_QUANT_BLOCK_SIZE: tl.constexpr = QUANT_BLOCK_SIZE // 2
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+
+    if TE_SCALE:
+        # TE: x * exp2f_rcp(byte) (2^(127 - byte); 2^-127 as a subnormal for byte 254),
+        # then a saturating round-to-nearest-even cast
+        tl.static_assert(not USE_ASM and not USE_SR, "TE scaling is portable, no SR")
+        e = scales.to(tl.int32)
+        rcp_bits = tl.where(e == 254, 0x00400000, (254 - e) << 23)
+        rcp_bits = tl.where(e == 255, 0x7FC00000, rcp_bits)
+        rcp = _per_element(
+            rcp_bits.to(tl.float32, bitcast=True),
+            BLOCK_M,
+            BLOCK_N,
+            QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK,
+        )
+        y = tl.clamp(x.to(tl.float32) * rcp, -max_pos, max_pos)
+        return y.to(float8_dtype, fp_downcast_rounding="rtne")
+
     x0, x1 = tl.split(x.reshape(BLOCK_M, HALF_BLOCK_N, 2))
 
     scales = tl.where(scales < 1, 1, scales)
@@ -344,13 +425,23 @@ def _convert_to_mxfp8_kernel(
     stride_sn,
     philox_seed,
     philox_offset,
+    M,
+    N_IN,
+    N_OUT,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
     IS_2D_BLOCK: tl.constexpr,
     USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
+    TE_SCALE: tl.constexpr = False,
+    DEQUANT_OUT: tl.constexpr = False,
+    ROUND_BF16: tl.constexpr = False,
+    PRESHUFFLE: tl.constexpr = False,
+    MASKED: tl.constexpr = False,
 ):
+    # MASKED: x is [M, N_IN] and y [M, N_OUT] (N_OUT >= N_IN) with no tile
+    # alignment; elements past them read as 0, as zero padding would
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
@@ -371,10 +462,22 @@ def _convert_to_mxfp8_kernel(
         x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16
     )
 
-    float8_dtype = y_ptr.type.element_ty
+    if DEQUANT_OUT:
+        # y receives the dequantized values (TE scaling, e4m3)
+        tl.static_assert(TE_SCALE)
+        float8_dtype: tl.constexpr = tl.float8e4nv
+    else:
+        float8_dtype: tl.constexpr = y_ptr.type.element_ty
     tl.static_assert(float8_dtype == tl.float8e4nv or float8_dtype == tl.float8e5)
 
-    x = tl.load(x_ptr + offs_x)
+    if MASKED:
+        x_mask = (offs_m[:, None] < M) & (offs_xn[None, :] < N_IN)
+        x = tl.load(x_ptr + offs_x, mask=x_mask, other=0.0)
+    else:
+        x = tl.load(x_ptr + offs_x)
+    if ROUND_BF16:
+        # quantize the bf16 rounding of an fp32 input (as a bf16 copy would be)
+        x = x.to(tl.bfloat16, fp_downcast_rounding="rtne")
 
     scales = _calculate_scales(
         x,
@@ -383,6 +486,7 @@ def _convert_to_mxfp8_kernel(
         QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
         IS_2D_BLOCK=IS_2D_BLOCK,
         float8_dtype=float8_dtype,
+        TE_SCALE=TE_SCALE,
     )
     y = _pack_fp8(
         x,
@@ -396,11 +500,45 @@ def _convert_to_mxfp8_kernel(
         USE_SR=USE_SR,
         USE_ASM=USE_ASM,
         float8_dtype=float8_dtype,
+        TE_SCALE=TE_SCALE,
     )
+    if DEQUANT_OUT:
+        # TE exp2f(byte): 2^(byte - 127), 2^-127 as a subnormal, 255 -> NaN
+        e = scales.to(tl.int32)
+        sc_bits = tl.where(e == 0, 0x00400000, e << 23)
+        sc_bits = tl.where(e == 255, 0x7FC00000, sc_bits)
+        sc = _per_element(
+            sc_bits.to(tl.float32, bitcast=True),
+            BLOCK_M,
+            BLOCK_N,
+            QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK,
+        )
+        y = y.to(tl.float32) * sc
 
-    offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
-    tl.store(s_ptr + offs_s, scales)
+    if PRESHUFFLE:
+        # the bytes aiter's shuffle_weight(y, layout=(16, 16)) would produce for
+        # a contiguous fp8 [M, N] (row stride stride_ym): 16-row blocks of
+        # [N / 32, 2, 16 rows, 16] tiles
+        offs_y = (
+            (offs_m[:, None] // 16) * (16 * stride_ym)
+            + (offs_yn[None, :] // 32) * 512
+            + ((offs_yn[None, :] % 32) // 16) * 256
+            + (offs_m[:, None] % 16) * 16
+            + offs_yn[None, :] % 16
+        )
+    else:
+        offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
+    if MASKED:
+        y_mask = (offs_m[:, None] < M) & (offs_yn[None, :] < N_OUT)
+        s_mask = (offs_sm[:, None] < M) & (
+            offs_sn[None, :] < (N_OUT + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+        )
+        tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty), mask=y_mask)
+        tl.store(s_ptr + offs_s, scales, mask=s_mask)
+    else:
+        tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
+        tl.store(s_ptr + offs_s, scales)
 
 
 @triton.jit(repr=_convert_from_mxfp8_kernel_repr)
