@@ -291,9 +291,20 @@ def sol_jensen_cap(
     else:
         mask, mask_strides = q_tile_max, (0, 0, 0, 0)
 
+    bits = mean_k_var.shape[-1] * mean_k_var.element_size() * 8
+    # The hd256 MXFP6 and MXFP8 records hold their scales inline, so their capped variance is
+    # packed again from mean_k_var_pooled and the kernel only finds the gain.
+    repack = block_scaled and d == 256 and bits in (6 * d, 8 * d)
+    if repack and mean_k_var_pooled is None:
+        raise ValueError(
+            "an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled"
+        )
     if block_scaled:
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
-        var, var_scale = mean_k_var, _backed_scale_copy(mean_k_var_scale)
+        var = mean_k_var
+        var_scale = (
+            mean_k_var_scale if repack else _backed_scale_copy(mean_k_var_scale)
+        )
     else:
         per_nat = (
             0.5
@@ -332,17 +343,13 @@ def sol_jensen_cap(
             HAS_DESCALE=q_descale is not None,
             HAS_VAR_SCALE=block_scaled and mean_k_var_pooled is None,
             EXPONENT_GAIN=block_scaled,
+            STORE_SCALE=block_scaled and not repack,
             TILE_CHUNK=32,
             HEAD_DIM=d,
         )
-    bits = mean_k_var.shape[-1] * mean_k_var.element_size() * 8
-    if block_scaled and d == 256 and bits in (6 * d, 8 * d):
+    if repack:
         from aiter.ops.triton.attention.utils import _sol_attn_pack_k_variance
 
-        if mean_k_var_pooled is None:
-            raise ValueError(
-                "an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled"
-            )
         var, var_scale = _sol_attn_pack_k_variance(
             mean_k_var_pooled.float() * gain.unsqueeze(-1),
             "mxfp6" if bits == 6 * d else "mxfp8",
