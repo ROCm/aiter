@@ -10,6 +10,17 @@ from flydsl.expr.typing import T
 _XOR16_SEL_LO = 0x76543210
 _XOR16_SEL_HI = 0xFEDCBA98 - (1 << 32)
 
+# FlyDSL 0.5 moved the register-placement API into rocdl.experimental. Older
+# pins are a no-op, so a kernel that asks for one still builds and runs.
+sched_vgpr = getattr(getattr(rocdl, "experimental", rocdl), "sched_vgpr", None)
+
+
+def pin_vgpr(value, reg, soft=True):
+    """Request a VGPR placement, or return *value* when pinning is unavailable."""
+    if sched_vgpr is None:
+        return value
+    return sched_vgpr(value, reg, soft=soft)
+
 
 def _instruction_prefetch(num_pages):
     from flydsl._mlir.dialects import llvm
@@ -129,28 +140,39 @@ MAX_Q_TILE_ROWS = 4
 # exercised, not what the layout can hold.
 MAX_TILED_SEQLEN_Q = 8
 
+# FP8 shapes the planner may pack into one work item per request.
+ROW_PACKED_SHAPES = ((96, 5),)
+PASS_GROUPS = NUM_WAVES * MAX_GROUPS_PER_WAVE
 
-def planner_q_tile_rows(num_q_heads, max_seqlen_q):
-    """Query rows of one work item, as the metadata planner cuts them.
 
-    Mirrors mla_v12_num_qo_tiles (csrc/kernels/mla/metadata/v1_2_device.cuh):
-    above PLANNER_PACKED_Q_BUDGET // 2 heads every work item holds one query
-    position; below it a request's num_q_heads * max_seqlen_q rows are split
-    into ceil(rows / budget) tiles of ceil(max_seqlen_q / tiles) positions.
-    """
+def rows_packed(num_q_heads, max_seqlen_q, fp8):
+    return fp8 and (num_q_heads, max_seqlen_q) in ROW_PACKED_SHAPES
+
+
+def planner_q_tile_rows(num_q_heads, max_seqlen_q, fp8=False):
+    """Return the maximum query rows in one metadata-planner work item."""
+    if rows_packed(num_q_heads, max_seqlen_q, fp8):
+        return max_seqlen_q
     if num_q_heads * 2 > PLANNER_PACKED_Q_BUDGET:
         return 1
     tiles = -(-(num_q_heads * max_seqlen_q) // PLANNER_PACKED_Q_BUDGET)
     return -(-max_seqlen_q // tiles)
 
 
-def wave_layout(num_q_heads, max_seqlen_q):
-    """(q_tile_rows, head_groups, groups_per_wave, m_waves, dv_waves)."""
+def wave_layout(num_q_heads, max_seqlen_q, fp8=False):
+    """(q_tile_rows, head_groups, groups_per_wave, m_waves, dv_waves).
+
+    Row-packed shapes return the layout of one pass.
+    """
     if num_q_heads not in SUPPORTED_NUM_Q_HEADS:
         raise ValueError(
             f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
             f"got {num_q_heads}"
         )
+    if rows_packed(num_q_heads, max_seqlen_q, fp8):
+        head_groups = num_q_heads // HEADS_PER_GROUP
+        assert head_groups % MAX_GROUPS_PER_WAVE == 0
+        return max_seqlen_q, head_groups, MAX_GROUPS_PER_WAVE, NUM_WAVES, 1
     # A work item holds one planner tile, not the whole query: 64 heads take
     # max_seqlen_q 4 as two 2-row tiles (each 128 rows, and the two share
     # nothing but the request's KV), instead of being padded to 96 heads.
