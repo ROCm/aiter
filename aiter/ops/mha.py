@@ -4379,6 +4379,14 @@ def flash_attn_varlen_func(
     will only attend to keys between
     [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
 
+    Self-attention fast path (gfx950, BF16, headdim 256): packed documents whose Q and K lengths
+    are equal run a faster forward kernel for MHA and GQA, causal or not, without a window. It
+    engages only when cu_seqlens_q and cu_seqlens_k are the same tensor object (pass one tensor
+    for both), with no cu_seqlens_*_padded and no block_table. Separate tensors with equal
+    contents are not detected, since comparing them would synchronize with the device; such
+    calls take the previous path (v3 group kernels for MHA, CK for GQA). Set
+    AITER_FMHA_V3_FWD_THD=0 to disable this path.
+
     Arguments:
         q: (total_q, nheads, headdim_q), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim_q), where total_k = total number of key tokens in the batch.
@@ -4386,7 +4394,8 @@ def flash_attn_varlen_func(
         cu_seqlens_q: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
+           of the sequences in the batch, used to index into kv. For self-attention, pass the
+           cu_seqlens_q tensor itself to enable the fast path described above.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
         min_seqlen_q: int. Minimum query sequence length for chunked prefill.
