@@ -840,7 +840,7 @@ def flydsl_gemm(
                 config["kernelName"],
                 tuple(inp.stride()),
                 tuple(weights.stride()),
-                None if bias is None else tuple(bias.stride()),
+                None if bias is None else f"{tuple(bias.stride())} {bias.dtype}",
                 None if out is None else tuple(out.stride()),
             )
             return torch_gemm(inp, weights, solidx, bias, otype, config=config, out=out)

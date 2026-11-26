@@ -726,7 +726,8 @@ def decode_layout_supported(
     """True when the operands' layouts are ones the decode kernels accept.
 
     The one copy of the decode layout rule: A row-major with a unit column
-    stride (any row stride ``>= K``), B and ``out`` packed, bias contiguous.
+    stride (any row stride ``>= K``), B and ``out`` packed, bias contiguous and
+    of A's dtype (the launch fuses it; other paths add it after the GEMM).
     ``validate_gemm_decode_tensors`` raises when it is False. A tuned decode
     row is chosen from shape and dtype alone, so a caller uses this to fall
     back instead of raising on other layouts.
@@ -738,7 +739,7 @@ def decode_layout_supported(
         return False
     if weights.stride() != (k, 1):
         return False
-    if bias is not None and not bias.is_contiguous():
+    if bias is not None and (not bias.is_contiguous() or bias.dtype != inp.dtype):
         return False
     return out is None or out.stride() == (weights.shape[0], 1)
 

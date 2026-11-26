@@ -432,6 +432,11 @@ def check_tuned_row_other_layouts() -> None:
         "A with column stride 2": (wide[:, ::2], b),
         "column-major B": (a, b.T.contiguous().T),
     }
+    # The decode launch fuses only a bias of A's dtype; any other goes to torch,
+    # which adds it after the GEMM.
+    supported = flydsl_gemm_kernels.decode_layout_supported
+    assert supported(a, b, torch.zeros(n, device="cuda", dtype=a.dtype))
+    assert not supported(a, b, torch.zeros(n, device="cuda", dtype=torch.float32))
     for name, (inp, weights) in layouts.items():
         assert not flydsl_gemm_kernels.decode_layout_supported(inp, weights), name
         _assert_output(tgemm.mm(inp, weights), ref)
