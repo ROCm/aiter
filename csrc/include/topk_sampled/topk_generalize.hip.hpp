@@ -426,7 +426,13 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #endif
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false, bool NAN_HIGH = false>
+// TIE_LOW: of the K-th key's copies, those of the smallest columns, the set a
+// stable select keeps (block_gather_topk_low, block_gather_stream_low).
+template <bool RAGGED,
+          bool WRITE_VALUES,
+          bool REUSE_WIDE = false,
+          bool NAN_HIGH   = false,
+          bool TIE_LOW    = false>
 __global__ PHASE_C_OCCUPANCY void
 phase_c_select_contig(const float* __restrict__ input,
                       int pitch,
@@ -562,7 +568,7 @@ phase_c_select_contig(const float* __restrict__ input,
         // multiple of FP32_EPT is read bounds-checked, or its last columns are lost.
         int got;
         if(!RAGGED && (len % FP32_EPT) != 0)
-            got = radix_fallback_row<true, WRITE_VALUES, NAN_HIGH>(rif0,
+            got = radix_fallback_row<true, WRITE_VALUES, NAN_HIGH, TIE_LOW>(rif0,
                                                                    n4_cover(len),
                                                                    len,
                                                                    row_start,
@@ -579,7 +585,7 @@ phase_c_select_contig(const float* __restrict__ input,
                                                                    &s_wgt,
                                                                    &s_weq);
         else
-            got = radix_fallback_row<RAGGED, WRITE_VALUES, NAN_HIGH>(rif0,
+            got = radix_fallback_row<RAGGED, WRITE_VALUES, NAN_HIGH, TIE_LOW>(rif0,
                                                                      RAGGED ? n4_cover(len)
                                                                             : pitch / FP32_EPT,
                                                                      len,
@@ -628,7 +634,39 @@ phase_c_select_contig(const float* __restrict__ input,
     }
     __syncthreads();
 
-    if(keys_only)
+    if constexpr(TIE_LOW)
+    {
+        if(keys_only)
+            block_gather_topk_low<WRITE_VALUES>(
+                c,
+                pivot,
+                k_out - eq_needed,
+                eq_needed,
+                out,
+                val,
+                &s_wgt,
+                &s_weq,
+                s_keys_ext,
+                s_hist,
+                s_scan,
+                s_mm,
+                [&](int i) { return row_start + (int)(uint32_t)(base[i] & 0xFFFFFFFFull); });
+        else
+            block_gather_topk_low<WRITE_VALUES>(c,
+                                                pivot,
+                                                k_out - eq_needed,
+                                                eq_needed,
+                                                out,
+                                                val,
+                                                &s_wgt,
+                                                &s_weq,
+                                                s_keys_ext,
+                                                s_hist,
+                                                s_scan,
+                                                s_mm,
+                                                [&](int i) { return row_start + s_idx[i]; });
+    }
+    else if(keys_only)
     {
         block_gather_topk<WRITE_VALUES>(
             c,

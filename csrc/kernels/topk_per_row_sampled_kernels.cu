@@ -493,6 +493,99 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
     }
 }
 
+// block_gather_stream for a tie-low select: the copies of the pivot go out in
+// column order, so the eq_needed of them taken are the smallest columns -- the
+// set a stable select keeps. One vector a thread a step, so a step's columns run
+// in thread order, and a block-ordered count of the copies each step. Only the
+// tie-dense rows phase_c emits from the row come here. s_wsum: one word a wave.
+template <bool WRITE_VALUES, bool NAN_HIGH>
+__device__ __forceinline__ void block_gather_stream_low(const float* __restrict__ row,
+                                                        int len,
+                                                        int idx_base,
+                                                        uint32_t pivot,
+                                                        int ngt,
+                                                        int eq_needed,
+                                                        int* __restrict__ out,
+                                                        float* __restrict__ out_val,
+                                                        unsigned* __restrict__ s_wgt,
+                                                        uint32_t* __restrict__ s_wsum)
+{
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const int wv      = threadIdx.x / WAVE_SIZE;
+    const int nwaves  = blockDim.x / WAVE_SIZE;
+    const uint64_t lt = (1ull << lane) - 1ull;
+    const int n4      = n4_cover(len);
+    int eq_base       = 0; // block-uniform: copies met so far, in column order
+    for(int i0 = 0; i0 < n4; i0 += (int)blockDim.x)
+    {
+        const int i     = i0 + (int)threadIdx.x;
+        const bool live = i < n4;
+        const vfloat4 v = live ? load_row_f4<true>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+        uint32_t ce     = 0;
+        bool eqe[FP32_EPT];
+#pragma unroll
+        for(int e = 0; e < FP32_EPT; e++)
+        {
+            const int col     = i * FP32_EPT + e;
+            const bool has    = live && col < len;
+            const uint32_t k  = sortable_key<NAN_HIGH>(v[e]);
+            const bool gt     = has && (k > pivot);
+            eqe[e]            = has && (k == pivot);
+            ce += eqe[e] ? 1u : 0u;
+            const uint64_t bg = __ballot(gt);
+            if(bg == 0ull)
+                continue;
+            unsigned baseg = 0;
+            if(lane == 0)
+                baseg = atomicAdd(s_wgt, (unsigned)__popcll(bg));
+            baseg = __shfl(baseg, 0);
+            if(gt)
+            {
+                const unsigned p = baseg + (unsigned)__popcll(bg & lt);
+                if(p < (unsigned)ngt)
+                {
+                    out[p] = idx_base + col;
+                    if(WRITE_VALUES)
+                        out_val[p] = key_to_fp32<NAN_HIGH>(k);
+                }
+            }
+        }
+        const uint32_t x = aiter::wave_inclusive_sum_dpp(ce);
+        if(lane == WAVE_SIZE - 1)
+            s_wsum[wv] = x;
+        __syncthreads();
+        int before = 0, total = 0;
+        for(int w = 0; w < nwaves; w++)
+        {
+            const int s = (int)s_wsum[w];
+            total += s;
+            before += w < wv ? s : 0;
+        }
+        // Read between the barriers: every wave's atomics of this step are in,
+        // none of the next step's, so the exit below is block-uniform.
+        const unsigned rg = *(volatile unsigned*)s_wgt;
+        int p             = eq_base + before + (int)(x - ce);
+#pragma unroll
+        for(int e = 0; e < FP32_EPT; e++)
+        {
+            if(eqe[e])
+            {
+                if(p < eq_needed)
+                {
+                    out[ngt + p] = idx_base + i * FP32_EPT + e;
+                    if(WRITE_VALUES)
+                        out_val[ngt + p] = key_to_fp32<NAN_HIGH>(pivot);
+                }
+                p++;
+            }
+        }
+        eq_base += total;
+        __syncthreads(); // s_wsum is rewritten next step
+        if(rg >= (unsigned)ngt && eq_base >= eq_needed)
+            break;
+    }
+}
+
 // Fallback-row LDS scratch, in words: phase_c lends its candidate area.
 constexpr int FB_SCRATCH_WORDS = 4096;
 
@@ -745,8 +838,9 @@ band_clear(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_x, uint32_t* 
 // finishes the row (returns their count); if the crossing bucket is one value,
 // or level 3 has pinned the k-th key, block_gather_stream emits the row
 // (returns -1). Every level drops only keys that cannot be among the top k_out,
-// so the row is exact on every exit; at most four reads of the row.
-template <bool LR, bool WRITE_VALUES, bool NAN_HIGH>
+// so the row is exact on every exit; at most four reads of the row. TIE_LOW
+// emits the pivot's copies of the smallest columns (block_gather_stream_low).
+template <bool LR, bool WRITE_VALUES, bool NAN_HIGH, bool TIE_LOW = false>
 __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
                                                   int n4,
                                                   int len,
@@ -872,8 +966,12 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             *s_weq = 0u;
         }
         __syncthreads();
-        block_gather_stream<WRITE_VALUES, NAN_HIGH>(
-            row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
+        if constexpr(TIE_LOW)
+            block_gather_stream_low<WRITE_VALUES, NAN_HIGH>(
+                row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_amm);
+        else
+            block_gather_stream<WRITE_VALUES, NAN_HIGH>(
+                row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
         return -1;
     }
 
@@ -931,6 +1029,105 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
     if(got < k_out || got > cap)
         __builtin_trap();
     return got;
+}
+
+// block_gather_topk for a tie-low select over the c keys in s_keys: when the
+// pivot has more copies than places, the eq_needed of the smallest columns.
+// Those are found by an exact select over the copies' columns, reversed into
+// keys in place (every column is distinct, and a non-copy's 0 is below them
+// all), after the keys above the pivot have gone out. s_wgt and s_weq must
+// read 0.
+template <bool WRITE_VALUES, typename IdxFn>
+__device__ __forceinline__ void block_gather_topk_low(int c,
+                                                      uint32_t pivot,
+                                                      int ngt,
+                                                      int eq_needed,
+                                                      int* __restrict__ out,
+                                                      float* __restrict__ out_val,
+                                                      unsigned* __restrict__ s_wgt,
+                                                      unsigned* __restrict__ s_weq,
+                                                      uint32_t* __restrict__ s_keys,
+                                                      uint32_t* __restrict__ s_hist,
+                                                      uint32_t* __restrict__ s_scan,
+                                                      uint32_t* __restrict__ s_mm,
+                                                      IdxFn idx_at)
+{
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const uint64_t lt = (1ull << lane) - 1ull;
+    unsigned n_eq     = 0;
+    for(int i = threadIdx.x; i < c; i += blockDim.x)
+        n_eq += s_keys[i] == pivot ? 1u : 0u;
+    if(n_eq)
+        atomicAdd(s_weq, n_eq);
+    __syncthreads();
+    const bool ties = (int)*(volatile unsigned*)s_weq > eq_needed;
+    __syncthreads();
+    if(threadIdx.x == 0)
+        *s_weq = 0u;
+    __syncthreads();
+    if(!ties)
+    {
+        block_gather_topk<WRITE_VALUES>(
+            c,
+            pivot,
+            ngt,
+            eq_needed,
+            out,
+            out_val,
+            s_wgt,
+            s_weq,
+            [&](int i) { return s_keys[i]; },
+            idx_at);
+        return;
+    }
+    for(int i0 = 0; i0 < c; i0 += blockDim.x)
+    {
+        const int i       = i0 + threadIdx.x;
+        const bool has    = i < c;
+        const uint32_t k  = has ? s_keys[i] : 0u;
+        const bool gt     = has && (k > pivot);
+        const uint64_t bg = __ballot(gt);
+        unsigned baseg    = 0;
+        if(lane == 0 && bg)
+            baseg = atomicAdd(s_wgt, (unsigned)__popcll(bg));
+        baseg = wave_bcast(baseg, 0);
+        if(gt)
+        {
+            const unsigned p = baseg + (unsigned)__popcll(bg & lt);
+            if(p < (unsigned)ngt)
+            {
+                out[p] = idx_at(i);
+                if(WRITE_VALUES)
+                    out_val[p] = sortable_to_fp32(k);
+            }
+        }
+        if(has)
+            s_keys[i] = k == pivot ? 0xFFFFFFFFu - (uint32_t)idx_at(i) : 0u;
+    }
+    __syncthreads();
+    uint32_t cut;
+    int one;
+    block_select_lds(s_keys, c, eq_needed, s_hist, s_scan, s_mm, cut, one);
+    for(int i0 = 0; i0 < c; i0 += blockDim.x)
+    {
+        const int i       = i0 + threadIdx.x;
+        const bool take   = i < c && s_keys[i] >= cut;
+        const uint64_t be = __ballot(take);
+        unsigned basee    = 0;
+        if(lane == 0 && be)
+            basee = atomicAdd(s_weq, (unsigned)__popcll(be));
+        basee = wave_bcast(basee, 0);
+        if(take)
+        {
+            const unsigned p = basee + (unsigned)__popcll(be & lt);
+            if(p < (unsigned)eq_needed)
+            {
+                out[ngt + p] = 0xFFFFFFFFu - s_keys[i];
+                if(WRITE_VALUES)
+                    out_val[ngt + p] = sortable_to_fp32(pivot);
+            }
+        }
+    }
 }
 
 #include "topk_sampled/topk_generalize.hip.hpp"
@@ -1357,7 +1554,7 @@ static void launch_phase_b(const float* d_in,
                                                           lp.cap);
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false, bool TIE_LOW = false>
 static void topk_fused_impl(const float* d_in,
                             int M,
                             int pitch,
@@ -1416,7 +1613,7 @@ static void topk_fused_impl(const float* d_in,
 
     auto launch_phase_c = [&](auto reuse_tag) {
         constexpr bool REUSE = decltype(reuse_tag)::value;
-        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH>
+        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH, TIE_LOW>
             <<<M, lp.c_block, lp.c_dyn_bytes, s>>>(d_in,
                                                    pitch,
                                                    ext,
@@ -1623,7 +1820,11 @@ void top_k_per_row_prefill_sampled(
     // top_k_per_row_prefill's radix paths do; true ranks every NaN above
     // +inf, topk_select's contract. Indices only: topk_select gathers its
     // values itself.
-    bool nan_high = false)
+    bool nan_high = false,
+    // Ties at the K-th key go to the smallest columns: the set
+    // top_k_per_row_decode's stable select keeps, in no promised order.
+    // Indices only, NaN by sign, and not on the small-N path.
+    bool tie_low = false)
 {
     if(numRows <= 0)
         return;
@@ -1648,6 +1849,8 @@ void top_k_per_row_prefill_sampled(
     }
     AITER_CHECK(!(nan_high && values.has_value()),
                 "top_k_per_row_prefill_sampled: nan_high selects indices only");
+    AITER_CHECK(!(tie_low && (nan_high || values.has_value())),
+                "top_k_per_row_prefill_sampled: tie_low selects indices only, NaN by sign");
     AITER_CHECK(rowStarts.numel() >= static_cast<size_t>(numRows) &&
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_sampled: rowStarts/rowEnds must have numRows entries");
@@ -1688,6 +1891,9 @@ void top_k_per_row_prefill_sampled(
     int* idx                = static_cast<int*>(indices.data_ptr());
     float* val = values.has_value() ? static_cast<float*>(values.value().data_ptr()) : nullptr;
 
+    AITER_CHECK(!(tie_low && sp.path == PATH_SMALL_N),
+                "top_k_per_row_prefill_sampled: tie_low is not served at stride0=",
+                stride0);
     if(sp.path == PATH_SMALL_N)
     {
         if(nan_high)
@@ -1726,7 +1932,16 @@ void top_k_per_row_prefill_sampled(
                 " B");
     Bufs b              = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
     const LaunchPlan lp = plan_launch(M, N, sp);
-    if(nan_high)
+    if(tie_low)
+    {
+        if(ragged)
+            topk_fused_impl<true, false, false, true>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+        else
+            topk_fused_impl<false, false, false, true>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+    }
+    else if(nan_high)
     {
         if(ragged)
             topk_fused_impl<true, false, true>(
