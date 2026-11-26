@@ -1867,7 +1867,10 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash", "kimi_k26") or args.quant != "a8w4":
+        if (
+            args.network not in ("v4_pro", "v41_flash", "kimi_k26")
+            or args.quant != "a8w4"
+        ):
             raise ValueError(
                 "--suite routes needs --network v4_pro, v41_flash or kimi_k26 and --quant a8w4"
             )

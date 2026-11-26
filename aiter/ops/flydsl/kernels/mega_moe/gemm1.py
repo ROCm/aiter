@@ -11,7 +11,6 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..mega_moe_tp.common import uni
 from ..tensor_shim import _run_compiled, ptr_buf_tensor
 from .gemm_util import (
     _PACK,
@@ -349,8 +348,6 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     else:
         tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, trb_rsrc[m_tile]))
     b_row = sched.gate_base_row(expert) + n_tile_base
-    if const_expr(b_loader.sgpr_offsets):
-        b_row = uni(b_row)
     if const_expr(meta is None and rows_rsrc is not None):
         valid_rows = fx.Int32(rocdl.readfirstlane(T.i32, rows_rsrc[m_tile]))
     if const_expr(row_map is not None):
@@ -473,8 +470,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, k_unroll=0, a_early=False, w_addr=None,
-    sw_addr=None):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, k_unroll=0, a_early=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -484,9 +480,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
     ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
-    the lookahead tiles' metadata from the CTA's own plan, ``a_ahead`` / ``k_unroll`` / ``a_early`` are
-    :func:`do_tile_la`'s and ``w_addr`` / ``sw_addr`` (W1 / W1-scale base addresses) put the wave-uniform terms of
-    the W1 and W1-scale loads in SGPRs (BWeightLoader / BScaleLoader).
+    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` / ``k_unroll`` / ``a_early`` are
+    :func:`do_tile_la`'s.
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
@@ -515,9 +510,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         num_acc_n=num_acc_n,
         model_dim=model_dim,
         cache_modifier=b_cache_modifier,
-        w_addr=w_addr,
     )
-    b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=num_acc_n, model_dim=model_dim, s_addr=sw_addr)
+    b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=num_acc_n, model_dim=model_dim)
     a_scale = AScaleLoader(
         scale_rsrc=sx_rsrc,
         m_repeat=m_repeat,

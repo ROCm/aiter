@@ -216,11 +216,6 @@ class FusedStage1Knobs:
 
     # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
     payload_min_blocks: int = 0
-    # Large-input dispatch: this many payload helper CTAs (a multiple of the world size, one destination each) that
-    # claim the payload tasks with the producers from per-destination counters and then join GEMM1; with them
-    # every producer claims its destination's tasks until they run out (0: static task split; needs more than
-    # 32 producers).
-    payload_helpers: int = 0
     # With payload_min_blocks: a rank with at most payload_small_tokens tokens gives each destination at least
     # payload_small_blocks producers instead (0: off).
     payload_small_blocks: int = 0
@@ -250,14 +245,8 @@ class FusedStage1Knobs:
     # Small-input GEMM1: K-steps per K-loop iteration (0: the lookahead; with g1_a_ahead 2 the K-loop stays, see
     # do_tile_la's k_unroll).
     g1_k_unroll: int = 0
-    # Small-input GEMM1: the W1 / W1-scale loads keep their wave-uniform address terms in SGPRs (BWeightLoader w_addr).
-    g1_sgpr_offsets: bool = False
     # Small-input GEMM1 with mfma_amajor: each MFMA group's A operand is read a group ahead (do_tile_la a_early).
     g1_a_early: bool = False
-    # Small-input fused kernel: a plan with a hot expert (mega_moe_small_m._HOT_EXPERT_MIN_ROWS rows) cuts the experts
-    # into m-tiles of this many rows (twice sort_block_m) when that saves at least a sixth of the tiles: the hot
-    # expert then spans half as many tiles, each costing about one W1 / W2 pass (0: off).
-    hot_block_m: int = 0
     # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
     # the source flag to every destination itself after its own drain, instead of the last of all producers storing
     # it behind a rank-local done counter (0: off; at most mega_moe_small_m._DIRECT_DONE_INC).
@@ -512,7 +501,9 @@ def fused_layout_supported(
         and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
         and swiglu_limit
-        == _FUSED_SWIGLU_LIMITS.get((world_size, model_dim, inter_dim, experts, topk), 10.0)
+        == _FUSED_SWIGLU_LIMITS.get(
+            (world_size, model_dim, inter_dim, experts, topk), 10.0
+        )
         and act == "silu"
         and not fanout_masks
     )
@@ -1771,8 +1762,6 @@ def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     if bucket >= 256:
         # Against the 4-wave tune: 0.87-0.91x (uniform), 0.81-0.83x (zipf:1), 0.86-0.89x (spike).
         return _small_m_eight_waves(config)
-    # No hot_block_m: at tile_n 256 its 64-row bodies spill 41-61 VGPRs, and at tile_n 128 the narrower n-tiles cost
-    # uniform / spike 1-6% for 2-5% on zipf:1.
     knobs = config.fused_stage1
     if bucket in (16, 64, 128):
         # GEMM1 also reads A two K-steps ahead in its K-loop and runs two K-steps per iteration: 0.98x at 16 and
@@ -1783,17 +1772,18 @@ def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
 
 def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoEConfig:
     """EP8 Kimi-K2.6 (top-8) and DeepSeek-V4-Pro (top-6) large-input kernel (48 experts per rank, hidden 7168),
-    measured on gfx950 at MTPR 8192 (8 ranks; uniform, zipf:1 and one-hot-expert routes)."""
+    measured on gfx950 at MTPR 8192 (8 ranks; uniform, zipf:1 and one-hot-expert routes).
+    """
     # Half the payload producers leave their CTAs to GEMM1; a chunk's tile publication releases its stores
     # system-wide once, and nothing reads payload_ready. One row per (token, destination), copied with every load of
     # a batch ahead of its remote stores (gfx950's vmcnt counts loads and stores alike).
-    # On top of those, from the EP8 V4.1-Flash tune (whose tail-tile and GEMM2 knobs do not fit K2.6's LDS): the
-    # presend, the parallel / lean plan with bucketed pair order, and the payload / acquire / release / epilogue
-    # knobs. K2.6: 0.890x (uniform), 0.844x (zipf:1), 0.758x (spike) the knobs above (presend alone 0.92x, the small
-    # knobs alone 0.90x). V4-Pro, against the default: 0.865x / 0.930x / 0.880x, while the knobs above alone lose
-    # 1.09x (zipf:1) / 1.17x (spike).
+    # On top of those, from the EP8 V4.1-Flash tune (whose tail-tile knobs and part of whose GEMM2 knobs do not fit
+    # K2.6's LDS): the presend, the parallel / lean plan with bucketed pair order, and the payload / acquire /
+    # release / epilogue knobs. K2.6: 0.890x (uniform), 0.844x (zipf:1), 0.758x (spike) the knobs above (presend
+    # alone 0.92x, the small knobs alone 0.90x). V4-Pro, against the default: 0.865x / 0.930x / 0.880x, while the
+    # knobs above alone lose 1.09x (zipf:1) / 1.17x (spike).
     # The GEMM2 knobs of the V4.1-Flash tune that fit (row-aligned, staged, lean GEMM2) and 32-row short tails:
-    # K2.6 0.92x-0.99x, V4-Pro 0.85x-0.99x the knobs above (MTPR 8192, 768-8192 tokens a rank).
+    # K2.6 0.90x-0.99x, V4-Pro 0.85x-0.99x the knobs above (MTPR 8192, 768-8192 tokens a rank).
     return replace(
         config,
         stage1=replace(config.stage1, num_dispatch_cu=48 * expert_waves),
@@ -1882,7 +1872,9 @@ def _fused_config(
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
             return _tune_v41_flash_ep8_large(config)
-        if layout == K26_EP8_LAYOUT or (layout == V4_PRO_EP8_LAYOUT and mtpr in V4_PRO_TUNED_LARGE_M_MTPRS):
+        if layout == K26_EP8_LAYOUT or (
+            layout == V4_PRO_EP8_LAYOUT and mtpr in V4_PRO_TUNED_LARGE_M_MTPRS
+        ):
             return _tune_ep8_h7168_large(config, expert_waves)
         return config
     config = MegaMoEConfig(
