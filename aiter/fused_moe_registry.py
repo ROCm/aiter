@@ -44,7 +44,20 @@ class FusedMoeRequest:
 
 
 FusedMoeImpl = Callable[[FusedMoeRequest, str], torch.Tensor]
-BoundFusedMoeImpl = Callable[[FusedMoeRequest], torch.Tensor]
+
+
+@dataclass(frozen=True)
+class ResolvedFusedMoeImpl:
+    """An implementation together with the tuned configuration it was resolved for."""
+
+    implementation: FusedMoeImpl
+    config: str
+
+    def __call__(self, request: FusedMoeRequest) -> torch.Tensor:
+        return self.implementation(request, self.config)
+
+
+BoundFusedMoeImpl = Callable[[FusedMoeRequest], torch.Tensor] | ResolvedFusedMoeImpl
 _IMPLEMENTATIONS: dict[str, FusedMoeImpl | str] = {}
 
 _KERNEL_NAME_PREFIX = "impl__"
@@ -94,4 +107,4 @@ def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
                 f"Failed to load fused MoE implementation {name!r}: {error}"
             ) from error
 
-    return lambda request: implementation(request, config)
+    return ResolvedFusedMoeImpl(implementation, config)

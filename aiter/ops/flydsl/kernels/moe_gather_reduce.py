@@ -47,6 +47,8 @@ of ``grouped_out`` go through one flat descriptor at a dword offset rather than
 a freshly built per-row descriptor.
 """
 
+import struct
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, ptrtoint, range_constexpr
@@ -104,7 +106,12 @@ def build_moe_gather_reduce_module(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    addend_scale: float | None = None,
 ):
+    """``addend_scale`` set: the kernel takes an ``addend`` row tensor shaped
+    like ``out`` and writes ``bf16(bf16(bf16(acc) * addend_scale) + addend)``,
+    the bytes of ``(moe_out * addend_scale) + addend`` run as separate torch
+    ops on the bf16/f16 result (the multiply is skipped at 1.0)."""
     assert model_dim % 2 == 0
     assert out_dtype in ("bf16", "f16")
     assert w_dtype in ("f32", "bf16", "f16")
@@ -117,10 +124,52 @@ def build_moe_gather_reduce_module(
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
+    has_addend = addend_scale is not None
+    scale_addend = has_addend and float(addend_scale) != 1.0
+    addend_tag = ""
+    if has_addend:
+        # The scale's f32 bits keep the name an identifier.
+        scale_bits = struct.unpack("<I", struct.pack("<f", float(addend_scale)))[0]
+        addend_tag = f"_adds{scale_bits:08x}" if scale_addend else "_add"
     module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
-        f"_w{w_dtype}_frlds"
+        f"_w{w_dtype}_frlds{addend_tag}"
     )
+
+    def _epilogue_pair(acc_lo, acc_hi, add_dw):
+        """The packed output dword: the rounded reduce, its rounded scale, and
+        the addend, each step rounded to the output dtype as torch would."""
+        packed = _pack_pair_from_f32(acc_lo, acc_hi, out_dtype)
+        if not has_addend:
+            return packed
+        r_lo, r_hi = _unpack_pair_to_f32(packed, out_dtype)
+        if scale_addend:
+            sc = fx.Float32(float(addend_scale))
+            r_lo, r_hi = _unpack_pair_to_f32(
+                _pack_pair_from_f32(r_lo * sc, r_hi * sc, out_dtype), out_dtype
+            )
+        a_lo, a_hi = _unpack_pair_to_f32(add_dw, out_dtype)
+        return _pack_pair_from_f32(r_lo + a_lo, r_hi + a_hi, out_dtype)
+
+    def _load_addend_vec(addend, row_dw_base, dw_base, row_bytes_i32):
+        """The addend's VEC dwords at ``dw_base`` of its row, or None."""
+        if not has_addend:
+            return None
+        rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Uint64(ptrtoint(addend)) + fx.Uint64(row_dw_base) * fx.Uint64(4),
+            num_records_bytes=row_bytes_i32,
+        )
+        return fx.Vector(
+            buffer_ops.buffer_load(rsrc, dw_base, vec_width=VEC, dtype=T.i32)
+        )
+
+    def _addend_lane(add_vec, lane):
+        return None if add_vec is None else fx.Uint32(add_vec[lane])
+
+    def _load_addend_dw(addend, dw_idx):
+        if not has_addend:
+            return None
+        return fx.Uint32(ptr_buf_tensor(addend)[dw_idx])
 
     @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
@@ -131,6 +180,7 @@ def build_moe_gather_reduce_module(
         num_tokens: Int32,
         slice_stride_dw: Int32,
         num_valid_tokens: fx.Pointer,
+        addend: fx.Pointer,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -241,8 +291,15 @@ def build_moe_gather_reduce_module(
                             acc[2 * lane + 1] = (
                                 acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
                             )
+                    add_vec = _load_addend_vec(
+                        addend, out_row_dw_base, dw_base, row_bytes_i32
+                    )
                     packed = [
-                        _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
+                        _epilogue_pair(
+                            acc[2 * lane],
+                            acc[2 * lane + 1],
+                            _addend_lane(add_vec, lane),
+                        )
                         for lane in range(VEC)
                     ]
                     fx.memref_store_vec(
@@ -276,8 +333,10 @@ def build_moe_gather_reduce_module(
                                     red_hi = red_hi + hi_f32
                                 acc_lo = acc_lo + w_f32 * red_lo
                                 acc_hi = acc_hi + w_f32 * red_hi
-                            out_t[out_row_dw_base + dw_idx] = _pack_pair_from_f32(
-                                acc_lo, acc_hi, out_dtype
+                            out_t[out_row_dw_base + dw_idx] = _epilogue_pair(
+                                acc_lo,
+                                acc_hi,
+                                _load_addend_dw(addend, out_row_dw_base + dw_idx),
                             )
 
     @flyc.jit
@@ -289,6 +348,7 @@ def build_moe_gather_reduce_module(
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
         num_valid_tokens: fx.Pointer,
+        addend: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         launcher = moe_gather_reduce_kernel(
@@ -299,6 +359,7 @@ def build_moe_gather_reduce_module(
             num_tokens,
             slice_stride_dw,
             num_valid_tokens,
+            addend,
         )
         launcher.launch(
             grid=(fx.Int64(num_tokens), n_iters, 1),

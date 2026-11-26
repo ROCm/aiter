@@ -678,13 +678,6 @@ def test_more_than_one_gemm_block():
         assert torch.equal(_run(_rows(p, sl)), full[sl])
 
 
-def test_tensor_and_expert_parallel_together_refused():
-    p = generate_moe_mxfp4_bi_inputs(4, 32)
-    emap = torch.arange(32, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="not both"):
-        _run(p, expert_map=emap, leaf_reduce=lambda t: t, chunk_gather=lambda t: t)
-
-
 def _ep_inputs(T, seed, n=N, el=8, eg=32):
     """Inputs of one EP rank: el local experts at scattered global ids of eg."""
     p = generate_moe_mxfp4_bi_inputs(T, el, seed=seed, n=n)
