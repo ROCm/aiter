@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from contextlib import ExitStack, nullcontext
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -2587,6 +2588,10 @@ def test_gfx942_asm_1stage_4gib_guard():
     # caller would turn the per_1x128 case into the xbf16 kernel.
     env_stack = ExitStack()
     env_stack.enter_context(override_env("AITER_XBFLOAT16", "0"))
+    # get_2stage_cfgs reads the 1-stage table by get_gfx(), which follows the last
+    # GPU_ARCHS entry; pin it to the live device so a multi-target build agrees
+    # with the host-chosen cases below.
+    env_stack.enter_context(mock.patch.object(fm, "get_gfx", lambda: host))
     try:
         for token, qtype in cases:
             # Previous dispatch: the guard turned off for every arch.
