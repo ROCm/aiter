@@ -386,8 +386,8 @@ def plan_pa_decode(
     """
     # A refresh of a plan this function already launched for the same lengths
     # tensor, batch, heads, window and query length: the same compiled planner
-    # and arguments, so skip re-validating and re-deriving them (tens of us of
-    # host time a call in a serving process, once per decode step).
+    # and arguments, so skip re-validating and re-deriving them (about 6 us of
+    # host time a call on gfx1250, once per decode step).
     fast_key = None
     if (
         plan is not None
