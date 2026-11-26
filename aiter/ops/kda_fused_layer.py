@@ -939,8 +939,11 @@ class MXFP8ProjGemm:
     ``emulate`` in fp32 torch (the reference).
     """
 
-    def __init__(self, cd):
+    def __init__(self, cd, outer=None):
         self.cd = cd
+        # a hook registered before the mxfp8 call; it is asked first, and its
+        # NotImplemented leaves the call to this recipe (the default path here)
+        self.outer = None if isinstance(outer, MXFP8ProjGemm) else outer
 
     def gemm(self, a, w, kind, out16_ok=False):
         """The MXFP8 product; fp32, or with ``out16_ok`` (and the fast path) the
@@ -974,6 +977,12 @@ class MXFP8ProjGemm:
         return out if out16 and out16_ok and mxfp8_fastpath() else out.float()
 
     def __call__(self, a, w, *, kind, cd, epilogue=None, name=None, ops=None, **epi):
+        if self.outer is not None:
+            out = self.outer(
+                a, w, kind=kind, cd=cd, epilogue=epilogue, name=name, ops=ops, **epi
+            )
+            if out is not NotImplemented:
+                return out
         out16_ok = epi.pop("out16_ok", False)
         if epilogue is None:
             return self.gemm(a, w, kind, out16_ok)
@@ -1014,7 +1023,8 @@ class MXFP8ProjGemm:
 
 class _GemmPrecisionScope:
     """Runs a layer call at ``precision``; "mxfp8" installs ``MXFP8ProjGemm``
-    as the projection-GEMM hook for its duration."""
+    as the projection-GEMM hook for its duration, in front of which a hook
+    registered with ``register_proj_gemm`` keeps being asked first."""
 
     def __init__(self, precision, x):
         self.precision = kda_gemm_precision(precision)
@@ -1031,6 +1041,9 @@ class _GemmPrecisionScope:
             from aiter.ops.mxfp8_linear import LAST_IMPLS, mxfp8_quant_cache
 
             LAST_IMPLS.clear()
+            self.hook.outer = (
+                None if isinstance(self.saved[1], MXFP8ProjGemm) else self.saved[1]
+            )
             _proj_gemm_hook = self.hook
             self.cache = mxfp8_quant_cache().__enter__()
         return self
