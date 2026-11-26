@@ -76,6 +76,38 @@ class KDALayerWeights:
         return cls(*ts)
 
 
+# Precision mode: "default" keeps every element-wise activation in fp32;
+# "megatron" reproduces Megatron-LM #6872's KDA (docs/megatron-kda-precision-map
+# in the project store): projection outputs, the conv pre-activation, SiLU
+# output, L2-normed q/k, the chunk output, the normed value and the gated-norm
+# output are rounded to bf16; beta, the gate, rstd and accumulations stay fp32;
+# conv and norm weights are bf16 at runtime, A_log / dt_bias fp32.
+KDA_PRECISIONS = ("default", "megatron")
+_precision_override = None
+
+
+def set_kda_precision(mode):
+    """``"default"`` or ``"megatron"``; ``None`` falls back to ``AITER_KDA_PRECISION``."""
+    global _precision_override
+    if mode is not None and mode not in KDA_PRECISIONS:
+        raise ValueError(f"precision {mode!r}, expected one of {KDA_PRECISIONS}")
+    _precision_override = mode
+
+
+def kda_precision():
+    mode = _precision_override or os.environ.get("AITER_KDA_PRECISION", "default")
+    return mode if mode in KDA_PRECISIONS else "default"
+
+
+def _rb(t):
+    """bf16 rounding in "megatron" mode (gradient passes straight through, as
+    for a dtype cast); identity otherwise."""
+    if kda_precision() != "megatron":
+        return t
+    r = t.to(torch.bfloat16).float()
+    return t + (r - t).detach() if t.requires_grad else r
+
+
 def kda_gate(z, A_log, lower_bound=None):
     """Decay gate (log space) from z = f_b(f_a(x)) + dt_bias, [..., H, K].
 
@@ -92,11 +124,14 @@ def kda_gate(z, A_log, lower_bound=None):
 
 def _short_conv(x, w):
     # x: [B, T, C], w: [C, W]; causal depthwise conv, no bias, then silu.
+    # megatron: bf16 weights, fp32 accumulation rounded to bf16 before the SiLU,
+    # bf16 output
     T = x.shape[1]
+    w = _rb(w)
     y = F.conv1d(
         x.transpose(1, 2), w.unsqueeze(1), padding=w.shape[1] - 1, groups=w.shape[0]
     )
-    return F.silu(y[..., :T]).transpose(1, 2)
+    return _rb(F.silu(_rb(y[..., :T]))).transpose(1, 2)
 
 
 def kda_layer_preprocess(x, w: KDALayerWeights, num_heads, eps=1e-6, lower_bound=None):
@@ -105,14 +140,14 @@ def kda_layer_preprocess(x, w: KDALayerWeights, num_heads, eps=1e-6, lower_bound
     B, T, _ = x.shape
     H = num_heads
     xf = x.float()
-    q = _short_conv(xf @ w.w_q.float().t(), w.conv_q.float()).view(B, T, H, -1)
-    k = _short_conv(xf @ w.w_k.float().t(), w.conv_k.float()).view(B, T, H, -1)
-    v = _short_conv(xf @ w.w_v.float().t(), w.conv_v.float()).view(B, T, H, -1)
-    q = F.normalize(q, dim=-1, eps=L2NORM_EPS)
-    k = F.normalize(k, dim=-1, eps=L2NORM_EPS)
-    gl = (xf @ w.f_a.float().t()) @ w.f_b.float().t() + w.dt_bias.float()
-    g = kda_gate(gl.view(B, T, H, -1), w.A_log, lower_bound)
-    beta = torch.sigmoid(xf @ w.w_beta.float().t())
+    q = _short_conv(_rb(xf @ w.w_q.float().t()), w.conv_q.float()).view(B, T, H, -1)
+    k = _short_conv(_rb(xf @ w.w_k.float().t()), w.conv_k.float()).view(B, T, H, -1)
+    v = _short_conv(_rb(xf @ w.w_v.float().t()), w.conv_v.float()).view(B, T, H, -1)
+    q = _rb(F.normalize(q, dim=-1, eps=L2NORM_EPS))
+    k = _rb(F.normalize(k, dim=-1, eps=L2NORM_EPS))
+    raw = _rb(_rb(xf @ w.f_a.float().t()) @ w.f_b.float().t())
+    g = kda_gate((raw + w.dt_bias.float()).view(B, T, H, -1), w.A_log, lower_bound)
+    beta = torch.sigmoid(_rb(xf @ w.w_beta.float().t()))
     return q, k, v, g, beta
 
 
@@ -120,9 +155,12 @@ def kda_layer_postprocess(o, x, w: KDALayerWeights, eps=1e-6):
     """Gated RMSNorm + output projection. o: [B,T,H,V] fp32."""
     B, T, H, V = o.shape
     xf = x.float()
-    gate = torch.sigmoid(xf @ w.g_proj.float().t()).view(B, T, H, V)
-    o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float() * gate
-    return (o.reshape(B, T, H * V) @ w.w_o.float().t()).to(x.dtype)
+    o = _rb(o)
+    gate = torch.sigmoid(_rb(xf @ w.g_proj.float().t())).view(B, T, H, V)
+    rstd = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
+    normed = _rb(o * rstd * _rb(w.norm_w.float()))
+    o = _rb(normed * gate)
+    return _rb(o.reshape(B, T, H * V) @ w.w_o.float().t()).to(x.dtype)
 
 
 def _chunk_step(S, q, k, v, g, beta):
@@ -847,6 +885,23 @@ class _TorchOps:
             ]
 
     @staticmethod
+    def gated_rmsnorm_bwd_megatron(o, gp, w, dy, eps=1e-6):
+        """Megatron ``gated_norm_bwd``: grad·sigmoid(g) rounded to bf16 before the
+        norm gradient; dgate = (grad·normed)·σ(1−σ) in fp32; normed rounded to
+        bf16 as in the forward; bf16 weight."""
+        o, gp, dy = o.float(), gp.float(), dy.float()
+        w = _rb(w.float())
+        sg = torch.sigmoid(gp)
+        rstd = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
+        normed = _rb(o * rstd * w)
+        dgp = dy * normed * sg * (1 - sg)
+        dn = _rb(dy * sg)
+        dxhat = dn * w
+        do = rstd * (dxhat - o * rstd.pow(2) * (dxhat * o).mean(-1, keepdim=True))
+        dw = (dn * o * rstd).reshape(-1, o.shape[-1]).sum(0)
+        return do, dgp, dw
+
+    @staticmethod
     def gated_rmsnorm_bwd(o, gp, w, dy, eps=1e-6):
         with torch.enable_grad():
             o, gp, w = (t.detach().float().requires_grad_(True) for t in (o, gp, w))
@@ -875,6 +930,11 @@ class _TorchProj:
         z = (lr.float() @ f_b.float().t() + dt_bias.float()).unflatten(
             -1, (num_heads, -1)
         )
+        return _TorchProj.gate_bwd_from_z(z, A_log, num_heads, dg, lower_bound)
+
+    @staticmethod
+    def gate_bwd_from_z(z, A_log, num_heads, dg, lower_bound=None):
+        """Gate backward from the pre-activation z [M, H, K] (dt_bias included)."""
         a = A_log[:num_heads].float().exp().view(num_heads, 1)
         dg = dg.float().view_as(z)
         if lower_bound is None:
@@ -947,8 +1007,9 @@ def _kda_layer_fused_fwd(
     cd = _compute_dtype(x)
     xc = x.to(cd).reshape(B * T, D)
     w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).to(cd)
-    conv_qkv = torch.cat([w.conv_q, w.conv_k, w.conv_v]).float()
+    conv_qkv = _rb(torch.cat([w.conv_q, w.conv_k, w.conv_v]).float())
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
+    megatron = kda_precision() == "megatron"
     side = None
     if _fusion_on("concat_proj"):
         # one pass over x for every projection that has no epilogue of its own
@@ -956,9 +1017,10 @@ def _kda_layer_fused_fwd(
         w_all = torch.cat([w_qkv, *(t.to(cd) for t in extra)])
         full = _proj_gemm(xc, w_all, "fwd", cd, name="concat")
         a, *side = full.split([w_qkv.shape[0], *(t.shape[0] for t in extra)], -1)
-        a = a.contiguous().view(B, T, -1)
+        side = [_rb(t) for t in side]
+        a = _rb(a.contiguous()).view(B, T, -1)
     else:
-        a = _proj_gemm(xc, w_qkv, "fwd", cd, name="qkv").view(B, T, -1)
+        a = _rb(_proj_gemm(xc, w_qkv, "fwd", cd, name="qkv")).view(B, T, -1)
     conv_in = None
     with torch.set_grad_enabled(conv_graph):
         if conv_graph:
@@ -968,25 +1030,37 @@ def _kda_layer_fused_fwd(
         a, conv_qkv = a.detach(), conv_qkv.detach()
     q_pre, k_pre, v = c.split([hk, hk, hv], -1)
     q_pre, k_pre, v = (t.reshape(B, T, H, -1) for t in (q_pre, k_pre, v))
-    q = F.normalize(q_pre, dim=-1, eps=L2NORM_EPS)
-    k = F.normalize(k_pre, dim=-1, eps=L2NORM_EPS)
+    q = _rb(F.normalize(q_pre, dim=-1, eps=L2NORM_EPS))
+    k = _rb(F.normalize(k_pre, dim=-1, eps=L2NORM_EPS))
     proj = _proj_ops(x, w)
-    lr = side[0].contiguous() if side else _proj_gemm(xc, w.f_a, "fwd", cd, name="f_a")
-    g = _proj_gemm(
-        lr,
-        w.f_b,
-        "fwd",
-        cd,
-        epilogue="kda_gate",
-        ops=proj,
-        name="f_b",
-        dt_bias=w.dt_bias,
-        A_log=w.A_log,
-        num_heads=H,
-        lower_bound=lower_bound,
-    )
+    if side:
+        lr = side[0].contiguous()
+    else:
+        lr = _rb(_proj_gemm(xc, w.f_a, "fwd", cd, name="f_a"))
+    raw_g = None
+    if megatron:
+        # bf16 raw_g, then the gate in fp32 (no GEMM epilogue)
+        raw_g = _rb(_proj_gemm(lr, w.f_b, "fwd", cd, name="f_b")).view(B, T, H, -1)
+        g = kda_gate(raw_g + w.dt_bias.float().view(H, -1), w.A_log, lower_bound)
+    else:
+        g = _proj_gemm(
+            lr,
+            w.f_b,
+            "fwd",
+            cd,
+            epilogue="kda_gate",
+            ops=proj,
+            name="f_b",
+            dt_bias=w.dt_bias,
+            A_log=w.A_log,
+            num_heads=H,
+            lower_bound=lower_bound,
+        )
     g = g.view(B, T, H, -1)
-    braw = side[1] if side else _proj_gemm(xc, w.w_beta, "fwd", cd, name="w_beta")
+    if side:
+        braw = side[1]
+    else:
+        braw = _rb(_proj_gemm(xc, w.w_beta, "fwd", cd, name="w_beta"))
     braw = braw.reshape(B, T, H)
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
@@ -1001,13 +1075,19 @@ def _kda_layer_fused_fwd(
                 q, k, v, g, beta, scale, chunk_size, x.dtype, cu_seqlens, lower_bound
             )
     o_graph = o if chunk_graph else None
-    o = o.detach()
-    normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
+    o = _rb(o.detach())
+    rstd = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
+    normed = _rb(o * rstd * _rb(w.norm_w.float()))
     gp, y = None, None
-    if for_backward:
-        gp = side[2] if side else _proj_gemm(xc, w.g_proj, "fwd", cd, name="g_proj")
+    if for_backward or megatron:
+        gp = side[2] if side and for_backward else None
+        if gp is None:
+            gp = _rb(_proj_gemm(xc, w.g_proj, "fwd", cd, name="g_proj"))
         gp = gp.reshape(o.shape)
-        on = (normed * torch.sigmoid(gp)).reshape(B * T, -1)
+        on = _rb(normed * torch.sigmoid(gp)).reshape(B * T, -1)
+        if not for_backward:
+            y = _rb(_proj_gemm(on, w.w_o, "fwd", cd, name="w_o"))
+            y = y.view(B, T, D).to(x.dtype)
     else:
         on = _proj_gemm(
             xc,
@@ -1043,6 +1123,7 @@ def _kda_layer_fused_fwd(
         "conv_in": conv_in,
         "o_graph": o_graph,
         "chunk_in": chunk_in,
+        "raw_g": raw_g,
     }
     return y, saved
 
@@ -1114,6 +1195,7 @@ def _fused_plan(x, w, ops, lower_bound):
         chunk_bwd_fuses=",".join(sorted(fuses)) or "-",
         l2norm_bwd="fused" if "qk_l2norm" in fuses else _piece(ops),
         fusions=",".join(f"{k}={v}" for k, v in sorted(kda_fusion_choices().items())),
+        precision=kda_precision(),
     )
     return chunk_impl, frozenset(fuses), conv_kernel, rms_bwd
 
@@ -1160,6 +1242,9 @@ def _kda_layer_fused_bwd(
 
     d_wo = _proj_gemm(dyc, s["on"], "wgrad", cd, name="w_o")
     d_on = _proj_gemm(dyc, w.w_o, "dgrad", cd, name="w_o").view_as(s["o"])
+    if kda_precision() == "megatron":
+        rms_bwd = _TorchOps.gated_rmsnorm_bwd_megatron
+        LAST_PIECES["rmsnorm_bwd"] = "torch(megatron rounding)"
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
     proj = _proj_ops(x, w)
@@ -1185,7 +1270,10 @@ def _kda_layer_fused_bwd(
         q_in, k_in = s["q_pre"], s["k_pre"]
         kw["use_qk_l2norm_in_kernel"] = True
     if "gate" in fuses:
-        g_in = _proj_gemm(lr, w.f_b, "fwd", torch.float32, name="f_b").view_as(s["g"])
+        g_in = s["raw_g"]
+        if g_in is None:
+            g_in = _proj_gemm(lr, w.f_b, "fwd", torch.float32, name="f_b")
+            g_in = g_in.view_as(s["g"])
         kw.update(use_gate_in_kernel=True, A_log=w.A_log[:H], dt_bias=w.dt_bias)
         if lower_bound is not None:
             kw["lower_bound"] = lower_bound
@@ -1214,7 +1302,12 @@ def _kda_layer_fused_bwd(
         **kw,
     )
     dz = dg.float().reshape(B * T, -1)
-    if "gate" not in fuses:
+    if "gate" not in fuses and s["raw_g"] is not None:
+        z = s["raw_g"] + w.dt_bias.float().view(H, -1)
+        dz, dterm = _TorchProj.gate_bwd_from_z(z, w.A_log, H, dz, lower_bound)
+        dz, dterm = dz.reshape(B * T, -1), dterm.reshape(B * T, -1)
+        dA_log = dterm.view(-1, *s["g"].shape[-2:]).sum((0, 2))
+    elif "gate" not in fuses:
         dz, dterm = _proj_gemm(
             lr,
             w.f_b,
