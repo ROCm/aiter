@@ -185,12 +185,29 @@ def _paged_gqa_coverage_reason(
     return None
 
 
+def _token_major_gather(split_kv_lds: bool, block_n: int, block_threads: int) -> bool:
+    """Whether the K/V gather gives consecutive lanes one token row.
+
+    The TCP merges a dwordx4 load only across neighbouring lanes, so the
+    column-major map (lane n and n + block_n on one row) costs about one
+    vL1D access per lane. Token-major puts ``col_owners`` neighbours on one
+    contiguous row segment. A wave then holds ``64 // col_owners`` tokens,
+    and the live mask reaches the other waves' scores through LDS; that
+    needs every 16-token score subtile inside one wave. Only the split
+    K/V LDS layout is mapped: its images are addressed by (token, D), and
+    only their owner swizzle changes.
+    """
+    tokens_per_wave = 64 * block_n // block_threads
+    return split_kv_lds and tokens_per_wave % 16 == 0
+
+
 def _paged_gqa_lds_bytes(
     head_dim: int, block_n: int, block_threads: int, use_k32: bool
 ) -> int:
     """Bytes of the split kernel's ``SharedStorage``, including tail alignment.
 
-    The fields are KV, the score tile, and one partial per wave. gfx950
+    The fields are KV, the score tile, one partial per wave and, with the
+    token-major gather, one live mask per wave. gfx950
     prefill keeps K and V in separate regions; gfx942 and gfx950 decode
     overlay them, and gfx942 pads each K row by 8. ``dsl_size_of`` rounds
     the struct up to 16. The compiler's ``group_segment`` size leaves that
@@ -204,6 +221,7 @@ def _paged_gqa_lds_bytes(
     split_kv_lds = use_k32 and not token_major_v
     qk_split = not token_major_v and num_waves > 1 and n_subtiles % num_waves == 0
     qk_score_slots = n_subtiles * 64 * 4 if qk_split else 1
+    token_major_gather = _token_major_gather(split_kv_lds, block_n, block_threads)
     if use_k32:
         kv_elems = block_n * head_dim * (2 if split_kv_lds else 1)
     else:
@@ -214,6 +232,8 @@ def _paged_gqa_lds_bytes(
         (qk_score_slots * 4, 16),
         (num_waves * 4, 4),
     )
+    if token_major_gather:
+        fields += ((num_waves * 8, 8),)
     offset = 0
     align = 1
     for size, field_align in fields:
@@ -341,6 +361,8 @@ def build_qsa_sparse_gqa_module(
     # leaves enough LDS to just pay for the second region. Decode keeps the
     # overlay: its tile is a quarter the size and it uses a different V map.
     split_kv_lds = use_k32 and not token_major_v
+    token_major_gather = _token_major_gather(split_kv_lds, block_n, block_threads)
+    tokens_per_wave = 64 // col_owners
     v_elem_off = block_n * head_dim if split_kv_lds else 0
     v_pf_rounds = gather_rounds if split_kv_lds else gather_chunk
     v_pf_chunks = v_pf_rounds // gather_chunk
@@ -366,7 +388,16 @@ def build_qsa_sparse_gqa_module(
             fx.make_layout(shape, (k_stride, 1)),
         )
 
-    if use_k32:
+    if token_major_gather:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
+            scores: fx.Array[Float32, qk_score_slots, 16]
+            partial: fx.Array[Int32, num_waves, 4]
+            live_masks: fx.Array[Int64, num_waves, 8]
+
+    elif use_k32:
 
         @fx.struct
         class SharedStorage:
@@ -501,6 +532,8 @@ def build_qsa_sparse_gqa_module(
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_arr = storage.kv
         score_arr = storage.scores
+        if const_expr(token_major_gather):
+            live_masks = storage.live_masks.view(fx.make_layout(num_waves, 1))
         score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
         score_layout = fx.make_layout(4, 1)
         v_lds = storage.kv.view(
@@ -548,10 +581,26 @@ def build_qsa_sparse_gqa_module(
             fx.gemm(pv_mma, pv_c, pv_a, pv_b, pv_c)
             return fx.Vector(fx.memref_load_vec(pv_c))
 
+        def owner_spread(owner):
+            # Under the token-major gather the owners of one token store in
+            # one LDS pass, while each QK and PV read pass sees one or two
+            # owners. Spread over three address bits, owners 0..3 differ in
+            # both the low and the high pair, so the store stays spread at
+            # 8 and at 16 lanes per pass.
+            return owner ^ (owner * Int32(2))
+
+        def v_token_slot(tok32, owner):
+            return (
+                tok32 ^ (owner_spread(owner) * Int32(4))
+                if const_expr(token_major_gather)
+                else tok32
+            )
+
         def amd_k_elem(n_tok, d0):
             # Prefill K LDS address. Each lane owns one
             # token and one 8xbf16 vector; D chunks are permuted in 4x4
-            # groups while bits 5:6 of tid XOR the 128-bit bank address.
+            # groups while the owner XORs the 128-bit bank address: bits 5:6
+            # of tid, or ``owner_spread`` under the token-major gather.
             d_chunk = div_nonneg(d0, Int32(8))
             owner = d_chunk % Int32(col_owners)
             store_tid = n_tok + owner * Int32(block_n)
@@ -559,7 +608,10 @@ def build_qsa_sparse_gqa_module(
             group = div_nonneg(rest, Int32(k_quarter_radix))
             quarter = rest % Int32(k_quarter_radix)
             base_bytes = store_tid * Int32(16)
-            base_bytes = base_bytes ^ div_nonneg(store_tid & Int32(0x60), Int32(2))
+            if const_expr(token_major_gather):
+                base_bytes = base_bytes ^ (owner_spread(owner) * Int32(32))
+            else:
+                base_bytes = base_bytes ^ div_nonneg(store_tid & Int32(0x60), Int32(2))
             base_bytes = base_bytes ^ (group * Int32(64))
             byte_offset = (
                 base_bytes
@@ -669,8 +721,12 @@ def build_qsa_sparse_gqa_module(
         col_start = tile_start * Int32(block_n)
         col_end_unclamped = tile_end * Int32(block_n)
         col_end = fx.min(col_end_unclamped, row_cols)
-        col = tid % Int32(block_n)
-        chunk_owner = div_nonneg(tid, Int32(block_n))
+        if const_expr(token_major_gather):
+            col = div_nonneg(tid, Int32(col_owners))
+            chunk_owner = tid % Int32(col_owners)
+        else:
+            col = tid % Int32(block_n)
+            chunk_owner = div_nonneg(tid, Int32(block_n))
 
         def tile_column(tile_i32):
             """This lane's column in ``tile_i32``, clamped to stay in bounds.
@@ -856,6 +912,13 @@ def build_qsa_sparse_gqa_module(
                         k_store_frag = fx.make_fragment_like(k_dst)
                         fx.memref_store_vec(k_vec, k_store_frag)
                         fx.copy(lds_copy, k_store_frag, k_dst)
+            if const_expr(token_major_gather):
+                # Every wave scores all block_n tokens but holds only its
+                # own, so the masks cross waves here. The read sits after
+                # the V-store barrier and before the next tile's opening
+                # one, so the slot needs no barrier of its own. ballot has
+                # no stable export. The i64 result is the wave64 mask.
+                live_masks[wave] = Int64(fx.rocdl.ballot(Int64.ir_type, live))
             gpu.barrier()
 
             # V rounds issued ahead of QK, so their latency lands under the
@@ -966,7 +1029,7 @@ def build_qsa_sparse_gqa_module(
                 gpu.barrier()
             elif const_expr(use_k32):
                 store_elem = (
-                    (col % Int32(32)) * Int32(4)
+                    v_token_slot(col % Int32(32), chunk_owner) * Int32(4)
                     + chunk_owner * Int32(128)
                     + div_nonneg(col, Int32(32)) * Int32(32 * head_dim)
                 )
@@ -1081,10 +1144,22 @@ def build_qsa_sparse_gqa_module(
             for ng in range_constexpr(n_subtiles):
                 sc = []
                 lives = []
+                if const_expr(token_major_gather):
+                    # Token n is live in lane (n % tokens_per_wave) *
+                    # col_owners of wave n // tokens_per_wave.
+                    sub_bits = Int64(live_masks[Int32(ng * 16 // tokens_per_wave)])
+                else:
+                    sub_bits = live_bits
+                sub_base = ng * 16 % tokens_per_wave
                 for i in range_constexpr(4):
                     n = Int32(ng * 16) + lane_kg * Int32(4) + Int32(i)
                     if const_expr(decode_tr_pv):
                         score_live = ((live_bits >> Int64(n)) & Int64(1)) != Int64(0)
+                    elif const_expr(token_major_gather):
+                        bit = (Int32(sub_base) + lane_kg * Int32(4) + Int32(i)) * Int32(
+                            col_owners
+                        )
+                        score_live = ((sub_bits >> Int64(bit)) & Int64(1)) != Int64(0)
                     else:
                         score_live = (
                             gpu.shuffle_idx(live.select(one, zero), n, Int32(64))
@@ -1193,10 +1268,11 @@ def build_qsa_sparse_gqa_module(
                                 + div_nonneg(lane_m, Int32(4))
                             )
                             src_d = d_base + (lane_m % Int32(4)) * Int32(4)
+                            src_owner = div_nonneg(src_d, Int32(8)) % Int32(col_owners)
                             src_off = (
                                 Int32(v_elem_off)
                                 + src_d % Int32(4)
-                                + (src_n % Int32(32)) * Int32(4)
+                                + v_token_slot(src_n % Int32(32), src_owner) * Int32(4)
                                 + div_nonneg(src_d, Int32(8)) * Int32(128)
                                 + (div_nonneg(src_d, Int32(4)) % Int32(2))
                                 * Int32(16 * head_dim)
