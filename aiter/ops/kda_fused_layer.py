@@ -1647,25 +1647,50 @@ def _chunk_bwd_args(s, w, H, fuses, lower_bound, chunk_impl, dtype):
     return q_in, k_in, v_in, g_in, b_in, kw
 
 
+def _load_save_fwds(want_flydsl):
+    """(FlyDSL forward with ``return_intermediates`` or None, Triton
+    ``chunk_delta_attn_fwd`` or None) for a save_fwd forward; the reason for a
+    missing one goes to LAST_PIECES. Tests replace this function."""
+    flydsl_fwd = triton_fwd = None
+    if want_flydsl:
+        try:
+            from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
+
+            if _accepts(chunk_kda_fwd_flydsl, "return_intermediates"):
+                flydsl_fwd = chunk_kda_fwd_flydsl
+            else:
+                LAST_PIECES["chunk_fwd_save_flydsl_skipped"] = "no return_intermediates"
+        except ImportError as err:
+            LAST_PIECES["chunk_fwd_save_flydsl_missing"] = f"ImportError: {err}"
+    try:
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+            chunk_delta_attn_fwd as triton_fwd,
+        )
+    except ImportError as err:
+        LAST_PIECES["chunk_fwd_save_triton_missing"] = f"ImportError: {err}"
+    return flydsl_fwd, triton_fwd
+
+
 def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens):
     """``chunk_override`` for a ``save_fwd`` forward whose chunk backward takes
-    ``fwd_intermediates`` (#8740 FlyDSL): the Triton chunk forward with
-    ``disable_recompute=True`` on the backward's own inputs, keeping
-    (g_cumsum, w, u, qg, kg, Aqk, Akk). None when that does not apply."""
+    ``fwd_intermediates`` (#8740 FlyDSL): a chunk forward on the backward's own
+    inputs that also returns the prepare 10-tuple. The FlyDSL forward
+    (``return_intermediates``, #8744; fp32 Aqk/Akk, o bit-identical to the
+    plain call) when it is selected and serves the shape, else the Triton
+    forward with ``disable_recompute=True`` (bf16 Aqk/Akk). None when neither
+    applies."""
     chunk_impl, fuses = plan[0], plan[1]
     on_device = x.is_cuda or _chunk_bwd_impl is not None
     if not (on_device and _accepts(chunk_impl, "fwd_intermediates")):
         return None
     if cu_seqlens is not None and not _accepts(chunk_impl, "cu_seqlens"):
         return None
-    try:
-        from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
-            chunk_delta_attn_fwd,
-        )
-    except ImportError as err:
-        LAST_PIECES["chunk_fwd_save_intermediates_missing"] = f"ImportError: {err}"
-        return None
     cd = _compute_dtype_of(x.dtype)
+    flydsl_fwd, triton_fwd = _load_save_fwds(
+        "flydsl" in _fallback_order(kda_piece_choices()["chunk_fwd"])
+    )
+    if flydsl_fwd is None and triton_fwd is None:
+        return None
 
     def run(pre):
         q, k, v, g, beta, kw = _chunk_bwd_args(
@@ -1673,7 +1698,35 @@ def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens
         )
         kw.pop("compute_dtype", None)
         q, k, v = _token_major(q, k, v, dtype=cd)
-        o, _, gc, Aqk, Akk, wt, u, qg, kg = chunk_delta_attn_fwd(
+        if cu_seqlens is not None:
+            kw["cu_seqlens"] = cu_seqlens
+        if flydsl_fwd is not None:
+            try:
+                o, _, inter = flydsl_fwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    pre["scale"],
+                    chunk_size,
+                    return_intermediates=True,
+                    **kw,
+                )
+                inter = tuple(inter)
+                # #8744 13275a2c2 can return NaN in Aqk; keep the Triton
+                # fallback until that is fixed
+                if any(t is not None and t.isnan().any() for t in inter[8:]):
+                    raise RuntimeError("NaN in the FlyDSL Aqk/Akk intermediates")
+                LAST_PIECES["chunk_fwd"] = "flydsl(save intermediates)"
+                return o.float(), inter
+            except (ValueError, NotImplementedError, RuntimeError) as err:
+                reason = f"{type(err).__name__}: {err}"
+                LAST_PIECES["chunk_fwd_save_flydsl_skipped"] = reason
+                _log_fallback("chunk_fwd(save intermediates)", "flydsl", reason)
+                if triton_fwd is None:
+                    raise
+        o, _, gc, Aqk, Akk, wt, u, qg, kg = triton_fwd(
             q,
             k,
             v,
@@ -1682,7 +1735,6 @@ def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens
             pre["scale"],
             None,
             False,
-            cu_seqlens=cu_seqlens,
             chunk_size=chunk_size,
             safe_gate=lower_bound is not None,
             disable_recompute=True,
@@ -1692,8 +1744,8 @@ def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens
         LAST_PIECES["chunk_fwd_note"] = (
             "save_fwd=1 with a chunk backward taking fwd_intermediates: the "
             "forward runs the Triton disable_recompute path for its "
-            "intermediates (the FlyDSL forward returns only (o, final_state)), "
-            f"overriding chunk_fwd={kda_piece_choices()['chunk_fwd']}"
+            "intermediates (bf16 Aqk/Akk), since the FlyDSL forward with "
+            "return_intermediates is not selected or does not serve this call"
         )
         return o.float(), (None, None, None, gc, wt, u, qg, kg, Aqk, Akk)
 
