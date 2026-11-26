@@ -80,6 +80,7 @@ def launch_gemm_a8w8(
     arg_out: fx.Pointer = _NULL_SCALE_PTR,
     fused_splitk: Constexpr[bool] = False,
     rank0_splitk: Constexpr[bool] = False,
+    k_pipe: Constexpr[int] = 0,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -254,6 +255,13 @@ def launch_gemm_a8w8(
             f"limit is {lds_cap} bytes"
         )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
+    # k_pipe: the row path issues every K step's LDS loads k_pipe steps ahead and
+    # waits only for the oldest; the WMMA order (and the output) is unchanged.
+    if k_pipe and (use_quadrant or not is_mxscale or k_pipe > K_WS):
+        raise ValueError(
+            f"[FlyDSL gfx1250] k_pipe={k_pipe} needs the mxscale row path and "
+            f"at most tile_k/128={K_WS} K steps"
+        )
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
     kernel_name = format_kernel_name(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
@@ -267,6 +275,7 @@ def launch_gemm_a8w8(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
         + ("_fsk" if cluster_splitk else "")
+        + (f"_pd{k_pipe}" if k_pipe else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -795,7 +804,41 @@ def launch_gemm_a8w8(
                 else None
             )
 
+        L_STEP = DS_A * wmma_m_rep + DS_B * wmma_n_rep + sb_loads + sa_loads
+
+        def _load_step_all(buf, sbuf, ks):
+            act = [_rmem(16, load_a(buf, wm, ks)) for wm in range_constexpr(wmma_m_rep)]
+            wt = [_rmem(16, load_b(buf, wn, ks)) for wn in range_constexpr(wmma_n_rep)]
+            sb_k = [load_sb(buf, sbuf, wn, ks) for wn in range_constexpr(sb_loads)]
+            sa_k = [load_sa(buf, sbuf, wm, ks) for wm in range_constexpr(sa_loads)]
+            return act, wt, sb_k, sa_k
+
+        def compute_ktile_row_pipelined(buf, sbuf, prefetch_kt):
+            # Every K step's A, B and scale loads go out k_pipe steps ahead; step
+            # ks waits only until the later steps' loads may still be in flight
+            # (one wave a SIMD has nothing else to hide the LDS latency with).
+            q = []
+            for j in range_constexpr(k_pipe):
+                q.append(_load_step_all(buf, sbuf, j))
+                rocdl.sched_barrier(0)
+            for ks in range_constexpr(K_WS):
+                n_after = min(ks + k_pipe, K_WS) - (ks + 1)
+                rocdl.s_wait_dscnt(n_after * L_STEP)
+                rocdl.sched_barrier(0)
+                act, wt, sb_k, sa_k = q.pop(0)
+                _mma_rows(list(range(wmma_m_rep)), act, wt, sa_k, sb_k)
+                rocdl.sched_barrier(0)
+                if const_expr(ks == 0 and prefetch_kt is not None):
+                    issue(prefetch_kt % num_buffers, prefetch_kt)
+                    rocdl.sched_barrier(0)
+                if const_expr(ks + k_pipe < K_WS):
+                    q.append(_load_step_all(buf, sbuf, ks + k_pipe))
+                    rocdl.sched_barrier(0)
+
         def compute_ktile_row(buf, sbuf, prefetch_kt):
+            if const_expr(k_pipe):
+                compute_ktile_row_pipelined(buf, sbuf, prefetch_kt)
+                return
             state = _load_state(buf, sbuf, 0)
             for ks in range_constexpr(K_WS):
                 nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None

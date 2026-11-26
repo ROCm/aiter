@@ -75,8 +75,8 @@ def decode_gemm_config_error(N, K, tile_m, nb, ks, kw, wn, wdepth, atdm=0, kint=
         return f"ks={ks}: a 2..16 cluster dividing tile_m"
     if kw * wn * WAVE > 1024:
         return "more than 32 waves"
-    if atdm and ((K // ks) % A_KC or kw * wn < (K // ks) // A_KC):
-        return f"TDM activation: whole {A_KC}-byte K chunks, one wave a chunk"
+    if atdm and (K // ks) % A_KC:
+        return f"TDM activation: whole {A_KC}-byte K chunks"
     if decode_gemm_lds_bytes(tile_m, nb, kw, K, ks, atdm) > 320 * 1024:
         return "LDS over 320 KB"
     if wdepth < 1:
@@ -136,6 +136,7 @@ def launch_mxfp8_decode_gemm(
     A_ROW = A_KC + A_PAD
     A_STAGE = tile_m * A_ROW
     n_chunks = (K // ks) // A_KC
+    n_waves = kw * wn
     P_ROW = cols * 4 + P_PAD
     P_PLANE = tile_m * P_ROW
     U_ROW = cols // 4  # float4s of a tile row
@@ -184,39 +185,41 @@ def launch_mxfp8_decode_gemm(
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
 
         if const_expr(atdm):
-            # Wave c < n_chunks moves activation chunk c ([tile_m, 512 B] of the
-            # workgroup's K range) into LDS rows of 512 + 16 B; rows past M are
-            # zero-filled, not fetched.
+            # Wave w moves activation chunks w, w + n_waves, ... ([tile_m, 512 B]
+            # of the workgroup's K range) into LDS rows of 512 + 16 B; rows past M
+            # are zero-filled, not fetched.
             gA_base = fx.recast_iter(fx.Int8, arg_a)
-            if wave < n_chunks:
-                c_off = fx.Int64(m0) * fx.Int64(i32_lda) + fx.Int64(
-                    kpart * (K // ks) + wave * A_KC
-                )
-                desc = tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=fx.Tensor(
-                        fx.make_view(
-                            fx.add_offset(gA_base, c_off),
-                            fx.make_layout((tile_m, A_KC), (A_KC, 1)),
-                        )
-                    ),
-                    lds_memref=fx.Tensor(
-                        fx.make_view(
-                            fx.add_offset(base_ptr, PLANES + wave * A_STAGE),
-                            fx.make_layout((tile_m, A_KC), (A_ROW, 1)),
-                        )
-                    ),
-                    global_offset=(0, 0),
-                    tensor_shape=(tile_m, A_KC),
-                    strides=(i32_lda, 1),
-                    tile_shape=(tile_m, A_KC),
-                    elem_bytes=1,
-                    pad_interval=A_KC,
-                    pad_amount=A_PAD,
-                    num_warps=1,
-                    workgroup_mask=0,
-                    oob_outer_bound=i32_m - m0,
-                )
-                tdm_ops.tensor_load_2d(desc)
+            for rnd in range_constexpr((n_chunks + n_waves - 1) // n_waves):
+                chunk = wave + rnd * n_waves
+                if chunk < n_chunks:
+                    c_off = fx.Int64(m0) * fx.Int64(i32_lda) + fx.Int64(
+                        kpart * (K // ks) + chunk * A_KC
+                    )
+                    desc = tdm_ops.make_tensor_descriptor_2d(
+                        global_ptr=fx.Tensor(
+                            fx.make_view(
+                                fx.add_offset(gA_base, c_off),
+                                fx.make_layout((tile_m, A_KC), (A_KC, 1)),
+                            )
+                        ),
+                        lds_memref=fx.Tensor(
+                            fx.make_view(
+                                fx.add_offset(base_ptr, PLANES + chunk * A_STAGE),
+                                fx.make_layout((tile_m, A_KC), (A_ROW, 1)),
+                            )
+                        ),
+                        global_offset=(0, 0),
+                        tensor_shape=(tile_m, A_KC),
+                        strides=(i32_lda, 1),
+                        tile_shape=(tile_m, A_KC),
+                        elem_bytes=1,
+                        pad_interval=A_KC,
+                        pad_amount=A_PAD,
+                        num_warps=1,
+                        workgroup_mask=0,
+                        oob_outer_bound=i32_m - m0,
+                    )
+                    tdm_ops.tensor_load_2d(desc)
 
         # Activation rows past M read zeros (buffer range); their outputs are dropped.
         a_buf = ptr_buf_tensor(
