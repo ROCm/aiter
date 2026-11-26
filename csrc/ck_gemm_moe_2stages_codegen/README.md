@@ -63,6 +63,56 @@ Staged screening can miss a faster pair. Use `full` to check the selected
 kernel, and keep activation limits and stage2 settings consistent across
 tuning, AOT and production; see [MXFP4 settings](../../aiter/aot/flydsl/README.md#mxfp4-activation-and-stage2-settings).
 
+#### `--mxfp6-flydsl`
+
+Use `--mxfp6-flydsl` on gfx950 to tune the FlyDSL MXFP6 MoE
+(`aiter.ops.flydsl.flydsl_mxfp6_moe`). It reads
+`aiter/configs/untuned_mxfp6_moe.csv` and writes
+`aiter/configs/tuned_mxfp6_moe.csv` (`AITER_CONFIG_MXFP6_MOE`), one row per
+shape; the op runs a shape's row on the device it was tuned on and its
+heuristic everywhere else.
+
+The untuned file has the columns of `untuned_fmoe.csv`. `q_dtype_w` is
+`mxfp6_e2m3` or `mxfp6_e3m2`; `q_dtype_a` is one of those (A6W6) or
+`torch.float8_e4m3fn` (A8W6). The other cells are fixed:
+`ActivationType.Silu`, `torch.bfloat16`, `QuantType.per_1x32`, `use_g1u1` 1,
+`doweight_stage1` 0.
+
+Per shape the search starts from the heuristic's kernels and covers:
+
+- the routing tile (`block_m`: 128 or 256 rows),
+- the layout of a 6-bit `h` between the stages (`h_layout`),
+- per stage: the tile and its LDS ring, the tile group size, non-temporal
+  weight loads, padded rows (stage 1, 6-bit activations) and the L2 warm
+  (stage 2). `kernelName1` / `kernelName2` name the result:
+  `flydsl_mxfp6_moe{1|2}_t{rows}x{columns}_r{ring}_gm{group}[_nt][_pad][_warm{n}][_half]`.
+
+Each shape is timed on one random call of a fixed seed, as by the other
+tuners here. The search has two steps:
+
+1. Propose: per routing tile and `h` layout, each stage is searched alone.
+   `--mxfp6-search-mode descent` (default) moves one of the
+   dimensions above at a time; `full` times every combination. A stage kernel
+   is timed only if its output equals the heuristic kernel's bit for bit.
+2. Rank: the whole op of every pair of a proposed and a heuristic stage is
+   timed, each only after its output equals the heuristic's bit for bit. The
+   row names the fastest pair.
+
+The heuristic's own kernels are one of the ranked pairs, so the row names them
+where nothing found is faster, and a rerun skips the shape either way.
+
+Weights are random and the routing uniformly random. Shapes run one after
+another on the current GPU. `--compare`, `--run_config`, `--e2e_tune`,
+`--ep-size`, `--swiglu_limit` and `--select power` are refused: the op is not
+dispatched by `fused_moe`. `-o2` stores every stage kernel tried.
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp6-flydsl
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp6-flydsl \
+  -i <untuned.csv> -o <tuned.csv> -o2 <profile.csv> --mxfp6-search-mode full --all
+```
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`

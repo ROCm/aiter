@@ -98,6 +98,7 @@ FAMILIES = [
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_MXFP6_MOE", "tuned_mxfp6_moe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
     ("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned"),
 ]
@@ -554,6 +555,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_mxfp6_moe(self):
+        self._check_family("AITER_CONFIG_MXFP6_MOE", "tuned_mxfp6_moe")
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")

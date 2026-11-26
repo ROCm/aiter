@@ -44,7 +44,7 @@ from .mxfp6_moe_kernels import (
     flydsl_mxfp6_moe_stage1,
     flydsl_mxfp6_moe_stage2,
 )
-from .mxfp6_moe_policy import Mxfp6MoeConfig, default_config, stage_bn
+from .mxfp6_moe_policy import Mxfp6MoeConfig, select_config, stage_bn
 
 __all__ = [
     "SUPPORTED_GFX",
@@ -227,17 +227,19 @@ def flydsl_mxfp6_moe(
         topk_weight: float [T, topk] routing weights (cast to fp32).
         topk_ids: int32 or int64 [T, topk] expert ids in [0, E) (not checked: that
             would read the tensor on the host).
-        config: the kernels to run (mxfp6_moe_policy); None = the heuristic's
-            (default_config).
+        config: the kernels to run (mxfp6_moe_policy); None = the tuned row of this
+            call's shape where the tuned config has one, else the heuristic's
+            (select_config).
 
     Returns:
         bf16 [T, H] on the hidden_states device.
 
     Raises:
-        RuntimeError: not on gfx950.
+        RuntimeError: not on gfx950; tuned config files that repeat a shape.
         TypeError: weights not a Mxfp6MoeWeights, config not a Mxfp6MoeConfig.
         ValueError: a tensor of another dtype, shape or device than above; a config
-            whose stages do not run on its routing tiles; from the stage wrappers
+            whose stages do not run on its routing tiles; a tuned config file with a
+            malformed row, or a row that does not fit the layer; from the stage wrappers
             (flydsl_mxfp6_moe_stage1), a config that does not fit the prepared
             weights, or token / routed rows of 4 GiB - 4 KiB or more.
     """
@@ -253,18 +255,20 @@ def flydsl_mxfp6_moe(
     if topk_weight.dtype != torch.float32:
         topk_weight = topk_weight.float()
     if config is None:
-        config = default_config(
+        config = select_config(
             tokens=T,
             topk=K,
             experts=E,
             model_dim=H,
             inter_dim=I,
             a_fmt=af,
+            w_fmt=wf,
             slab_n1=weights.slab_n1,
             slab_n2=weights.slab_n2,
             w1_bytes=weights.w1_bytes,
             w2_bytes=weights.w2_bytes,
             cu_num=get_cu_num(),
+            gfx=get_gfx_runtime(),
         )
     elif (
         config.stage1.route_m != config.route_m

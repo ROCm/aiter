@@ -44,6 +44,7 @@ runtime budgets.
 | `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
 | `fhmoe` | `op_tests/tuners/tune_fhmoe.py` | `tuned_fhmoe.csv` | — | ✓ (HY4 MXFP8/FP8) |
+| `mxfp6_moe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp6-flydsl` | `tuned_mxfp6_moe.csv` | — | — (host tests: `test_mxfp6_moe_tuner`; rows: `op_tests/test_flydsl_mxfp6_moe.py`) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
 
@@ -71,6 +72,7 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_arch_resolution \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
+  op_tests.tuning_tests.test_mxfp6_moe_tuner \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
 

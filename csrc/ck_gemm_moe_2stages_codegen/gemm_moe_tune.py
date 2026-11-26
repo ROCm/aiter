@@ -56,11 +56,13 @@ from aiter.int4_utils import (
 from aiter.jit.core import (
     AITER_CONFIG_FMOE,
     AITER_CONFIG_GROUPED_FMOE,
+    AITER_CONFIG_MXFP6_MOE,
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, gfx_from_cu_num
+from aiter.ops.flydsl import mxfp6_moe_policy
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -999,6 +1001,15 @@ class FmoeTuner(TunerCommon):
             action="store_true",
             required=False,
             help="Tune FlyDSL MXFP4 A4W4/A8W4 as a coupled (g1, g2) pipeline.",
+        )
+        self.parser.add_argument(
+            "--mxfp6-flydsl",
+            action="store_true",
+            required=False,
+            help="Tune the FlyDSL MXFP6 MoE (flydsl_mxfp6_moe, gfx950): the routing "
+            "tile, the h layout and each stage's kernel, searched from the "
+            "heuristic's choice. Reads untuned_mxfp6_moe.csv, writes "
+            "tuned_mxfp6_moe.csv.",
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
@@ -9728,6 +9739,185 @@ def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
     return results
 
 
+class Mxfp6FlydslTuner(FmoeTuner):
+    """Tune the FlyDSL MXFP6 MoE (aiter.ops.flydsl.flydsl_mxfp6_moe).
+
+    Per shape, searches the routing tile, the h layout and each stage's kernel from
+    the heuristic's choice (mxfp6_moe_search) and writes the fastest kernels found as
+    the shape's tuned row, which the op then picks for that exact shape
+    (mxfp6_moe_policy.select_config). A shape is timed on one random call of a
+    fixed seed, as by the other tuners here. The heuristic's own kernels are among
+    the candidates: the row names them where nothing found is faster.
+
+    Shapes run one after another on the current GPU. The op is not behind fused_moe,
+    so the options that benchmark through it are refused.
+    """
+
+    SUPPORTS_POWER_SELECT = False
+    # each stage kernel a search tried, with -o2
+    PROFILE_COLUMNS = ("block_m", "h_layout", "stage", "kernelName", "us", "status")
+    REFUSED: ClassVar[dict[str, str]] = {
+        "grouped_gemm": "--grouped-gemm",
+        "mxfp4_flydsl": "--mxfp4-flydsl",
+        "compare": "--compare",
+        "run_config": "--run_config",
+        "e2e_tune": "--e2e_tune",
+        "ep_size": "--ep-size",
+    }
+
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **FmoeTuner.ARG_DEFAULTS,
+        "tune_file": f"{AITER_CONFIG_MXFP6_MOE}",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_mxfp6_moe.csv",
+        "config_env_name": "AITER_CONFIG_MXFP6_MOE",
+    }
+
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        self.parser.add_argument(
+            "--mxfp6-search-mode",
+            choices=("descent", "full"),
+            default="descent",
+            help="per stage: coordinate descent over the tile and ring, the group "
+            "size, non-temporal weight loads, padded rows and the L2 warm (descent, "
+            "the default), or every combination of them (full).",
+        )
+
+    def parse_args(self) -> argparse.Namespace:
+        args = super().parse_args()
+        refused = [flag for name, flag in self.REFUSED.items() if getattr(args, name)]
+        if args.swiglu_limit is not None:
+            refused.append("--swiglu_limit")
+        if refused:
+            self.parser.error(
+                f"--mxfp6-flydsl does not support {', '.join(refused)}: it times "
+                "flydsl_mxfp6_moe directly, which fused_moe does not dispatch to"
+            )
+        return args
+
+    def _shape_row(self, row, call, result):
+        """The tuned row of one searched shape."""
+        tokens, model_dim, inter_dim, experts, topk, a_fmt, _ = call
+        flops, nbytes = self._search.moe_work(
+            tokens, model_dim, inter_dim, experts, topk, a_fmt
+        )
+        return {
+            **{key: row[key] for key in self.keys},
+            **mxfp6_moe_policy.row_results(result.best),
+            "us1": round(result.us1, 4),
+            "us2": round(result.us2, 4),
+            "us": round(result.us, 4),
+            "tflops": round(flops / (result.us * 1e6), 2),
+            "bw": round(nbytes / (result.us * 1e3), 2),
+        }
+
+    def _failed_row(self, row, error):
+        """A row standing in for a shape whose search raised."""
+        reason = f"FAILED: {type(error).__name__}: {error}"[:240]
+        return {
+            **{key: row[key] for key in self.keys},
+            "block_m": 0,
+            "h_layout": "",
+            "kernelName1": reason,
+            "kernelName2": "",
+            "us1": self.INVALID_TIME,
+            "us2": self.INVALID_TIME,
+            "us": self.INVALID_TIME,
+            "tflops": 0,
+            "bw": 0,
+        }
+
+    def _save_profile(self, row, result, file):
+        """Append the stage kernels one search tried to the -o2 file."""
+        keys = {key: row[key] for key in self.keys}
+        frame = pd.DataFrame(
+            [{**keys, **tried} for tried in result.profile],
+            columns=[*self.keys, *self.PROFILE_COLUMNS],
+        )
+        frame.to_csv(file, mode="a", header=not os.path.exists(file), index=False)
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf
+        # FlyDSL kernels are built on import: only a MXFP6 run pays for it
+        from csrc.ck_gemm_moe_2stages_codegen import mxfp6_moe_search
+
+        self._search = mxfp6_moe_search
+        rows = [row.to_dict() for _, row in untunedf.iterrows()]
+        calls = []
+        for row in rows:
+            try:
+                calls.append(mxfp6_moe_policy.row_call(row))
+            except (KeyError, ValueError) as e:
+                raise ValueError(f"not a MXFP6 MoE shape ({e}): {row}") from e
+        options = mxfp6_moe_search.SearchOptions(
+            full=args.mxfp6_search_mode == "full",
+            warmup=args.warmup,
+            max_iters=args.iters,
+        )
+        results, report = [], []
+        layer, layer_key = None, None
+        for row, call in zip(rows, calls):
+            tokens, model_dim, inter_dim, experts, topk, a_fmt, w_fmt = call
+            shape = (
+                f"token={tokens} model_dim={model_dim} inter_dim={inter_dim} "
+                f"expert={experts} topk={topk} a={a_fmt} w={w_fmt}"
+            )
+            print(f"[mxfp6] {shape}", flush=True)
+            try:
+                # consecutive rows of one layer share its prepared weights
+                key = (model_dim, inter_dim, experts, a_fmt, w_fmt)
+                if key != layer_key:
+                    layer = layer_key = None
+                    torch.cuda.empty_cache()
+                    layer = mxfp6_moe_search.make_layer(*key, seed=options.seed)
+                    layer_key = key
+                case = mxfp6_moe_search.make_case(layer, tokens, topk, options.seed)
+                result = mxfp6_moe_search.search_shape(
+                    case, options, lambda text: print(f"[mxfp6]{text}", flush=True)
+                )
+            except Exception as e:  # one shape's failure is its row
+                if mxfp6_moe_search.device_lost(e):
+                    raise
+                print(f"[mxfp6] {shape}: failed: {e}", flush=True)
+                results.append(self._failed_row(row, e))
+                continue
+            results.append(self._shape_row(row, call, result))
+            if args.profile_file:
+                self._save_profile(row, result, args.profile_file)
+            cells = mxfp6_moe_policy.row_results
+            report.append(
+                f"[mxfp6] {shape}: fastest {result.us:.1f} us, heuristic "
+                f"{result.us_heuristic:.1f} us "
+                f"({result.us_heuristic / result.us - 1:+.1%}; "
+                f"{result.candidates} stage kernels tried, {result.pairs} pairs "
+                f"ranked): "
+                + (
+                    f"the heuristic's kernels, {cells(result.best)}"
+                    if result.best == result.heuristic
+                    else f"{cells(result.heuristic)} -> {cells(result.best)}"
+                )
+            )
+            print(report[-1], flush=True)
+        print("\n".join(["[mxfp6] fastest kernels found:", *report]), flush=True)
+        return results
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        del args, topk, fast_mode
+        return pd.DataFrame(results, columns=self.columns)
+
+    def result_to_csv(self, results, file, concat=False):
+        del concat
+        old_tunedf = self.get_tuned_gemm_list(file, self.columns)
+        valid = results[results["us"] > 0]
+        self.failed = pd.concat(
+            [self.failed, results[~results.index.isin(valid.index)]], ignore_index=True
+        )
+        resultdf = self.update_tunedf(old_tunedf, valid)
+        self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
+        # counted once saved: an unsaved shape reports as untuned
+        self.success = pd.concat([self.success, valid], ignore_index=True)
+
+
 if __name__ == "__main__":
     key = [
         "gfx",
@@ -9782,9 +9972,25 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
+    mxfp6_result_list = [
+        "block_m",
+        "h_layout",
+        "us1",
+        "kernelName1",
+        "us2",
+        "kernelName2",
+        "us",
+        "tflops",
+        "bw",
+    ]
     use_grouped = "--grouped-gemm" in sys.argv
     use_mxfp4_flydsl = "--mxfp4-flydsl" in sys.argv
-    if use_grouped:
+    if "--mxfp6-flydsl" in sys.argv:
+        # first: its parse_args refuses the other two modes
+        tuner = Mxfp6FlydslTuner(
+            "mxfp6FlydslTuner", key, mxfp6_result_list, "FlyDSL MXFP6 MoE tuner"
+        )
+    elif use_grouped:
         if get_gfx() != "gfx1250":
             raise SystemExit("--grouped-gemm is only supported on gfx1250")
         tuner = GroupedFmoeTuner(

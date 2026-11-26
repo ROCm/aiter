@@ -20,6 +20,9 @@ Correctness against torch references and timing, one markdown table per test fun
                       torch.inference_mode() and torch.no_grad(), and with an x that
                       requires grad: each against the torch reference and bitwise equal
                       to the default call
+  test_tuned_row      every row of the tuned config for this device: the op runs the
+                      row's kernels, against the torch reference and bitwise equal to
+                      the heuristic's kernels, with both timed in alternating rounds
 No GPU needed (aiter's dry run):
   test_agpr_form      the 256x256 tiles keep their accumulators in AGPRs through
                       rocdl.experimental.sched_agpr and the LLVM option
@@ -34,6 +37,12 @@ No GPU needed (aiter's dry run):
                       tensors, no tokens) and the ones it refuses before a kernel is
                       picked (dtype, shape, device, architecture, argument types);
                       weight preparation on the CPU and its refusals
+  test_tuned_dispatch the tuned config: a row is picked for exactly its device and
+                      shape and the heuristic for every other call; a malformed row
+                      and one whose kernels do not fit the layer are refused before a
+                      kernel is picked
+Only test_mxfp6_moe and test_tuned_row read the shipped tuned config
+(aiter/configs/tuned_mxfp6_moe.csv); the others run on the heuristic's kernels.
 
     python3 op_tests/test_flydsl_mxfp6_moe.py
     python3 op_tests/test_flydsl_mxfp6_moe.py -s 8192,4608,64,4 -t 4096 32768 \
@@ -50,6 +59,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -64,6 +74,7 @@ from flydsl.expr.typing import T
 import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.dry_run import dry_run
+from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl import (
     Mxfp6MoeWeights,
@@ -426,22 +437,31 @@ def test_route(router, tokens, topk, experts, route_m):
 # ---------------------------------------------------------------------------------
 # 4. whole op
 # ---------------------------------------------------------------------------------
-def _moe_inputs(tokens, hidden, inter, experts, topk):
-    # the previous case's layer is released by now: give its memory back before this
-    # case's weights are allocated
-    torch.cuda.empty_cache()
-    g = torch.Generator(device="cuda").manual_seed(0)
+def _layer_inputs(g, hidden, inter, experts):
     w1 = torch.randn(experts, 2 * inter, hidden, generator=g, device="cuda")
     w2 = torch.randn(experts, hidden, inter, generator=g, device="cuda")
     w1 = (w1 / math.sqrt(hidden)).to(dtypes.bf16)
     w2 = (w2 / math.sqrt(inter)).to(dtypes.bf16)
+    return w1, w2
+
+
+def _call_inputs(g, tokens, hidden, experts, topk):
     x = torch.randn(tokens, hidden, generator=g, device="cuda").to(dtypes.bf16)
     # random distinct experts per token (uneven per-expert load) and distinct routing
     # weights
     ids = torch.rand(tokens, experts, generator=g, device="cuda").argsort(-1)
     ids = ids[:, :topk].int().contiguous()
     w = torch.rand(tokens, topk, generator=g, device="cuda") + 0.5
-    return w1, w2, x, ids, (w / w.sum(-1, keepdim=True)).float()
+    return x, ids, (w / w.sum(-1, keepdim=True)).float()
+
+
+def _moe_inputs(tokens, hidden, inter, experts, topk):
+    # the previous case's layer is released by now: give its memory back before this
+    # case's weights are allocated
+    torch.cuda.empty_cache()
+    g = torch.Generator(device="cuda").manual_seed(0)
+    layer = _layer_inputs(g, hidden, inter, experts)
+    return (*layer, *_call_inputs(g, tokens, hidden, experts, topk))
 
 
 def _moe_work(tokens, hidden, inter, experts, topk, afmt):
@@ -539,11 +559,54 @@ def _spy_gemm(calls, build=True):
     return mock.patch.object(mk, "_get_compiled_gemm", spy)
 
 
+def _asked(calls):
+    """(stage kernels, h layouts) of recorded stage launches, as the configs name
+    them."""
+    kernels = [
+        policy.Mxfp6StageConfig(
+            tile_m=32 * c["FM"],
+            tile_n=32 * c["FN"],
+            ring=c["NSTAGE"],
+            group_m=c["GM"],
+            nt_weights=bool(c["NT_WEIGHTS"]),
+            pad_rows=bool(c["PAD_A"]),
+            warm=c["WARM"],
+            half_tiles=bool(c["HALF_TILES"]),
+        )
+        for c in calls
+    ]
+    return kernels, [c["H_TILE_STEP"] for c in calls]
+
+
+def _names(config, afmt):
+    """(stage kernels, h layouts) the stage launches of the op ask for with config."""
+    step = int(q.FORMATS[afmt][3] == 6 and config.h_layout == "tile_step")
+    return [config.stage1, config.stage2], [step, step]
+
+
+@contextlib.contextmanager
+def _tuned_table(rows=()):
+    """The op with a tuned config of these rows only (column -> cell) in place of the
+    shipped one; no rows: every call takes the heuristic's kernels."""
+    columns = [*policy.TUNED_KEYS, *policy.TUNED_RESULTS]
+    with tempfile.TemporaryDirectory(prefix="mxfp6_moe_tuned.") as tmp:
+        path = os.path.join(tmp, "tuned_mxfp6_moe.csv")
+        pd.DataFrame(list(rows), columns=columns).to_csv(path, index=False)
+        try:
+            with mock.patch.dict(os.environ, {"AITER_CONFIG_MXFP6_MOE": path}):
+                policy.clear_tuned_configs()
+                yield
+        finally:
+            policy.clear_tuned_configs()
+
+
 @contextlib.contextmanager
 def _host_only(calls):
     """The launch wrappers with nothing compiled and nothing launched; the GEMM kernel
-    each stage launch asks for is recorded in calls."""
+    each stage launch asks for is recorded in calls. No tuned rows: the op picks the
+    heuristic's kernels."""
     with contextlib.ExitStack() as stack:
+        stack.enter_context(_tuned_table())
         stack.enter_context(_spy_gemm(calls, build=False))
         for name in _LAUNCHERS[:-1]:
             stack.enter_context(mock.patch.object(mk, name, lambda *a: None))
@@ -906,6 +969,124 @@ def test_contract(hidden, inter, experts, topk, tokens, afmt):
     return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
 
 
+@benchmark()
+def test_tuned_dispatch(hidden, inter, experts, topk, tokens, afmt):
+    # host code only, as test_h_layout: no reference and no timing
+    calls, got = [], {}
+    six = q.FORMATS[afmt][3] == 6
+    with dry_run(SUPPORTED_GFX[0], DRY_RUN_CU), _host_only(calls):
+        st = _empty_layer(hidden, inter, experts, afmt)
+        heuristic = _config(st, tokens, topk)
+        # kernels that fit the layer and are not the heuristic's: the other routing
+        # tile, and the other layout of a 6-bit h
+        tuned = _config(
+            st,
+            tokens,
+            topk,
+            route_m=384 - heuristic.route_m,
+            h_layout="rows" if six else heuristic.h_layout,
+        )
+        gfx, cu = get_gfx_runtime(), get_cu_num()
+
+        def row(**cells):
+            return {
+                "gfx": gfx,
+                "cu_num": cu,
+                "token": tokens,
+                "model_dim": hidden,
+                "inter_dim": inter,
+                "expert": experts,
+                "topk": topk,
+                **policy.TUNED_CALL,
+                "q_dtype_a": policy.Q_DTYPE_NAMES[afmt],
+                "q_dtype_w": policy.Q_DTYPE_NAMES[st.w_fmt],
+                **policy.row_results(tuned),
+                **cells,
+            }
+
+        def op(rows, t=tokens):
+            """The kernels the op asks for with a tuned config of rows."""
+            del calls[:]
+            with _tuned_table(rows):
+                x = _empty(t, hidden, dtype=dtypes.bf16)
+                ids = _empty(t, topk, dtype=torch.int32)
+                flydsl_mxfp6_moe(x, st, _empty(t, topk, dtype=dtypes.fp32), ids)
+            return _asked(calls)
+
+        want, base = _names(tuned, afmt), _names(heuristic, afmt)
+        got["the row differs from the heuristic"] = want != base
+        got["no rows: heuristic"] = op([]) == base
+        got["row of the call: tuned"] = op([row()]) == want
+        # a table rewritten through pandas holds integers as floats
+        floats = {"token": f"{tokens}.0", "block_m": f"{tuned.route_m}.0"}
+        got["float cells: tuned"] = op([row(**floats)]) == want
+        # any other device or shape keeps the heuristic
+        for column, cell in (
+            ("gfx", "gfx942"),
+            ("cu_num", cu // 2),
+            ("token", tokens + 1),
+            ("model_dim", 2 * hidden),
+            ("inter_dim", 2 * inter),
+            ("expert", experts + 1),
+            ("topk", topk + 1),
+            ("q_dtype_a", policy.Q_DTYPE_NAMES["e4m3" if six else "e2m3"]),
+            ("q_dtype_w", policy.Q_DTYPE_NAMES["e3m2"]),
+        ):
+            got[f"row of another {column}: heuristic"] = (
+                op([row(**{column: cell})]) == base
+            )
+        other = _config(st, tokens + 1, topk)
+        got["other token count: its heuristic"] = op([row()], tokens + 1) == _names(
+            other, afmt
+        )
+        both = [row(gfx="gfx942"), row(), row(token=tokens + 1)]
+        got["its row among others: tuned"] = op(both) == want
+
+        # every refusal comes before a kernel is picked (op clears calls)
+        name1, name2 = (
+            policy.row_results(tuned)[k] for k in ("kernelName1", "kernelName2")
+        )
+        narrow = dataclasses.replace(tuned.stage2, tile_n=st.slab_n2 // 2)
+        for what, rows in {
+            "another activation": [row(act_type="ActivationType.Gelu")],
+            "another quant type": [row(q_type="QuantType.per_1x128")],
+            "doweight_stage1": [row(doweight_stage1=1)],
+            "an unknown format": [row(q_dtype_a="torch.float4_e2m1fn_x2")],
+            "an unknown kernel": [row(kernelName1="moe_ck2stages_gemm1_256x32x64x128")],
+            "stage kernels swapped": [row(kernelName1=name2, kernelName2=name1)],
+            "an unknown h_layout": [row(h_layout="row")],
+            "kernels off the routing tiles": [row(block_m=384 - tuned.route_m)],
+            "a missing column": [{k: v for k, v in row().items() if k != "h_layout"}],
+            "a tile across the weight slabs": [
+                row(kernelName2=policy.stage_kernel_name(False, narrow))
+            ],
+        }.items():
+            got[f"{what} refused"] = _refused(op, rows) and not calls
+        # a repeated key is refused where aiter merges a family's tuned files
+        twice = _raises(RuntimeError, op, [row(), row()])
+        got["a repeated key refused"] = twice and not calls
+        # a misfit row of another shape is never looked at
+        got["misfit row of another shape: heuristic"] = (
+            op(
+                [
+                    row(
+                        token=tokens + 1,
+                        kernelName2=policy.stage_kernel_name(False, narrow),
+                    )
+                ]
+            )
+            == base
+        )
+        # the names a row holds read back as the kernels
+        for stage1, stage in ((True, tuned.stage1), (False, heuristic.stage2)):
+            name = policy.stage_kernel_name(stage1, stage)
+            ok = policy.stage_config_from_name(name) == (stage1, stage)
+            got[f"{name} reads back"] = ok
+    bad = [k for k, v in got.items() if not v]
+    assert not bad, f"tuned dispatch, {afmt}: {bad}"
+    return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
+
+
 # what a whole-op case must reach, from the GEMM kernels its stage launches ask for
 # and the launchers of the row-padding kernel it built
 REACHES = {
@@ -926,7 +1107,12 @@ def test_moe_paths(hidden, inter, experts, topk, tokens, afmt, wfmt, reach):
         pads.append(args)
         return real_pad(*args)
 
-    with _spy_gemm(calls), mock.patch.object(mk, "_get_compiled_pad_rows", spy_pad):
+    # the path is the heuristic's choice: no tuned rows
+    with (
+        _tuned_table(),
+        _spy_gemm(calls),
+        mock.patch.object(mk, "_get_compiled_pad_rows", spy_pad),
+    ):
         ret = test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt)
     ok = REACHES[reach](calls, pads)
     assert ok, (
@@ -975,7 +1161,8 @@ def test_moe_modes(tokens, hidden, inter, experts, topk, wfmt, afmt):
     ret, outs, calls = {"gfx": get_gfx_runtime()}, {}, []
     for name, fn in candidates.items():
         del calls[:]
-        with _spy_gemm(calls):
+        # "default" is the heuristic's choice: no tuned rows
+        with _tuned_table(), _spy_gemm(calls):
             out, us = run_perftest(fn, num_iters=20, num_warmup=3, **TIMING)
         # stage 2 must read the layout stage 1 wrote; "rows" / "tile_step" must run
         # the kernels of that layout
@@ -992,6 +1179,80 @@ def test_moe_modes(tokens, hidden, inter, experts, topk, wfmt, afmt):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+# one prepared layer: the rows of a layer follow each other in the tuned config
+_TUNED_LAYER = {}
+
+
+def _tuned_layer(hidden, inter, experts, wfmt, afmt):
+    key = (hidden, inter, experts, wfmt, afmt)
+    if key not in _TUNED_LAYER:
+        _TUNED_LAYER.clear()
+        torch.cuda.empty_cache()
+        g = torch.Generator(device="cuda").manual_seed(0)
+        w1, w2 = _layer_inputs(g, hidden, inter, experts)
+        st = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt, w_fmt=wfmt)
+        _TUNED_LAYER[key] = (w1, w2, st)
+    return _TUNED_LAYER[key]
+
+
+def _tuned_rows():
+    """The rows of the tuned config for this device: (token, hidden, inter, experts,
+    topk, wfmt, afmt) -> the kernels the row names."""
+    device = (get_gfx_runtime(), get_cu_num())
+    table = policy.load_tuned_configs(AITER_CONFIGS.AITER_CONFIG_MXFP6_MOE_FILE)
+    return {
+        (t, h, i, e, k, wf, af): config
+        for (*dev, t, h, i, e, k, af, wf), config in table.items()
+        if tuple(dev) == device
+    }
+
+
+@benchmark()
+def test_tuned_row(tokens, hidden, inter, experts, topk, wfmt, afmt):
+    w1, w2, st = _tuned_layer(hidden, inter, experts, wfmt, afmt)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    x, ids, w = _call_inputs(g, tokens, hidden, experts, topk)
+    tuned = _tuned_rows()[tokens, hidden, inter, experts, topk, wfmt, afmt]
+    heuristic = _config(st, tokens, topk)
+
+    def run_tuned():  # as a caller runs the op: the row is picked by the op
+        return flydsl_mxfp6_moe(x, st, w, ids)
+
+    def run_heuristic():
+        return flydsl_mxfp6_moe(x, st, w, ids, config=heuristic)
+
+    calls = []
+    with _spy_gemm(calls):
+        out = run_tuned()
+    assert _asked(calls) == _names(
+        tuned, afmt
+    ), f"the op asked for {_asked(calls)}, the tuned row names {tuned}"
+    assert torch.equal(
+        out, run_heuristic()
+    ), "output bits differ from the heuristic's kernels'"
+    ref = run_torch_mx(x, ids, w, w1, w2, wfmt, afmt)
+    err, row, med = _check_moe(out, ref, f"mxfp6_moe tuned {wfmt}/{afmt}: ")
+    # alternating rounds: the two are compared within this process
+    us_t, us_h = [], []
+    for _ in range(3):
+        for fn, samples in ((run_tuned, us_t), (run_heuristic, us_h)):
+            samples.append(run_perftest(fn, num_iters=20, num_warmup=3, **TIMING)[1])
+    us = statistics.median(us_t)
+    flops, nbytes = _moe_work(tokens, hidden, inter, experts, topk, afmt)
+    return {
+        "gfx": get_gfx_runtime(),
+        "row": "heuristic's kernels" if tuned == heuristic else "tuned",
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
+        "max row rel_l2": row,
+        "median row rel_l2": med,
+        "heuristic us": statistics.median(us_h),
+        "heuristic / tuned": statistics.median(h / t for h, t in zip(us_h, us_t)),
+    }
 
 
 def summarize(name, rows):
@@ -1102,6 +1363,13 @@ def main():
         "contract",
         [test_contract(*c, af) for c, af in itertools.product(args.modes, args.afmt)],
     )
+    summarize(
+        "tuned dispatch",
+        [
+            test_tuned_dispatch(*c, af)
+            for c, af in itertools.product(args.agpr + args.modes, args.afmt)
+        ],
+    )
     gfx = get_gfx_runtime() if torch.cuda.is_available() else "no GPU"
     if gfx not in SUPPORTED_GFX:
         aiter.logger.warning("mxfp6_moe unsupported on %s; skipping the GPU tests", gfx)
@@ -1140,6 +1408,10 @@ def main():
             for (h, i, e, k, t), af in itertools.product(args.modes, args.afmt)
         ],
     )
+    # every row of the tuned config for this device, a layer's rows together
+    rows = sorted(_tuned_rows(), key=lambda r: (r[1:], r[0]))
+    summarize("mxfp6_moe tuned rows", [test_tuned_row(*r) for r in rows])
+    _TUNED_LAYER.clear()
 
 
 if __name__ == "__main__":

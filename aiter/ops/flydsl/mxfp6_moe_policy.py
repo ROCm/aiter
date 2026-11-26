@@ -3,19 +3,26 @@
 
 """Host policy of the FlyDSL MXFP6 MoE: which kernel each stage of a call runs.
 
+`select_config` is what the op runs: the tuned row of the call's shape where the tuned
+config (aiter/configs/tuned_mxfp6_moe.csv and its model_configs siblings, or the file
+AITER_CONFIG_MXFP6_MOE names) has one, else the heuristic.
+
 `default_config` holds the heuristic: the routing tile, and per stage the kernel tile,
 LDS ring, tile-group size, non-temporal weight loads, padded rows, L2 warm and half
 tiles. The per-stage choices change the schedule of the two grouped GEMMs, no output
 bit. The rules were measured on gfx950 on 88 (layer, token count) points, 8 alternating
 rounds each.
 
-Host arithmetic only: no kernel is built here (aiter.ops.flydsl.mxfp6_moe_kernels).
+Host code only: no kernel is built here (aiter.ops.flydsl.mxfp6_moe_kernels).
 """
 
 from __future__ import annotations
 
+import csv
 import functools
 import math
+import os
+import re
 from dataclasses import dataclass
 
 from .mxfp6_moe_quant import FORMATS
@@ -274,6 +281,7 @@ def default_config(
     cu_num: int,
     pad_rows: bool = True,
     h_layout: str = "tile_step",
+    route_m: int | None = None,
 ) -> Mxfp6MoeConfig:
     """The heuristic's kernels of one call: `tokens` rows of `model_dim`, `topk` of
     `experts` experts each.
@@ -281,11 +289,13 @@ def default_config(
     slab_n1 / slab_n2: weight slab widths of the prepared layer (stage_bn);
     w1_bytes / w2_bytes: bytes of each stage's prepared weights and scales; cu_num: the
     device's compute units; pad_rows / h_layout: see default_stage_config and
-    Mxfp6MoeConfig."""
+    Mxfp6MoeConfig; route_m: the routing tile the stages are picked for (128 or 256),
+    None = the heuristic's (pick_bm)."""
     if h_layout not in H_LAYOUTS:
         raise ValueError(f"h_layout {h_layout!r}: use 'tile_step' or 'rows'")
     bits = FORMATS[a_fmt][3]
-    route_m = pick_bm(tokens * topk / experts)
+    if route_m is None:
+        route_m = pick_bm(tokens * topk / experts)
     m_tiles = route_tiles(tokens * topk, experts, route_m)
     tile_step = bits == 6 and h_layout == "tile_step"
     shared = {
@@ -316,3 +326,222 @@ def default_config(
     return Mxfp6MoeConfig(
         route_m=route_m, stage1=stage1, stage2=stage2, h_layout=h_layout
     )
+
+
+# ---------------------------------------------------------------------------------
+# tuned configs
+# ---------------------------------------------------------------------------------
+# A tuned row is keyed as tuned_fmoe.csv keys a fused_moe call. torch has no FP6 dtype,
+# so the q_dtype_a / q_dtype_w cells of the 6-bit formats hold these names.
+Q_DTYPE_NAMES = {
+    "e2m3": "mxfp6_e2m3",
+    "e3m2": "mxfp6_e3m2",
+    "e4m3": "torch.float8_e4m3fn",
+}
+# the call every row describes: bf16 in and out, silu(gate) * up, MX scales per 32
+# along K, routing weights applied by the combine
+TUNED_CALL = {
+    "act_type": "ActivationType.Silu",
+    "dtype": "torch.bfloat16",
+    "q_type": "QuantType.per_1x32",
+    "use_g1u1": 1,
+    "doweight_stage1": 0,
+}
+TUNED_KEYS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
+TUNED_KEYS += ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type")
+TUNED_KEYS += ("use_g1u1", "doweight_stage1")
+# block_m: rows of the routing tile; kernelName1 / kernelName2: stage_kernel_name
+TUNED_RESULTS = ("block_m", "h_layout", "kernelName1", "kernelName2")
+
+_STAGE_NAME = re.compile(
+    r"flydsl_mxfp6_moe(?P<stage>[12])_t(?P<tile_m>\d+)x(?P<tile_n>\d+)"
+    r"_r(?P<ring>\d+)_gm(?P<group_m>\d+)(?P<nt>_nt)?(?P<pad>_pad)?"
+    r"(?:_warm(?P<warm>\d+))?(?P<half>_half)?"
+)
+
+
+def stage_kernel_name(stage1: bool, config: Mxfp6StageConfig) -> str:
+    """The name a tuned row holds for a stage's kernel:
+    flydsl_mxfp6_moe{1|2}_t{rows}x{columns}_r{ring}_gm{group}[_nt][_pad][_warm{n}]
+    [_half]."""
+    return (
+        f"flydsl_mxfp6_moe{1 if stage1 else 2}_t{config.tile_m}x{config.tile_n}"
+        f"_r{config.ring}_gm{config.group_m}"
+        + "_nt" * config.nt_weights
+        + "_pad" * config.pad_rows
+        + (f"_warm{config.warm}" if config.warm else "")
+        + "_half" * config.half_tiles
+    )
+
+
+def stage_config_from_name(name: str) -> tuple[bool, Mxfp6StageConfig]:
+    """(is stage 1, the kernel) of a stage_kernel_name. Raises ValueError for any
+    other text and for a flag of the other stage."""
+    m = _STAGE_NAME.fullmatch(name)
+    stage1 = bool(m) and m["stage"] == "1"
+    if not m or ((m["pad"] or m["half"]) and not stage1) or (m["warm"] and stage1):
+        raise ValueError(f"not a MXFP6 MoE stage kernel name: {name!r}")
+    return stage1, Mxfp6StageConfig(
+        tile_m=int(m["tile_m"]),
+        tile_n=int(m["tile_n"]),
+        ring=int(m["ring"]),
+        group_m=int(m["group_m"]),
+        nt_weights=bool(m["nt"]),
+        pad_rows=bool(m["pad"]),
+        warm=int(m["warm"] or 0),
+        half_tiles=bool(m["half"]),
+    )
+
+
+def _int_cell(value) -> int:
+    """An integer cell; a table rewritten through pandas holds 256 as 256.0."""
+    number = float(value)
+    if number != int(number):
+        raise ValueError(f"{value!r} is not an integer")
+    return int(number)
+
+
+def row_call(row) -> tuple[int, int, int, int, int, str, str]:
+    """(token, model_dim, inter_dim, expert, topk, a_fmt, w_fmt) of a row of an
+    untuned or tuned config file (a mapping column -> cell).
+
+    Raises ValueError for a row that is not a MXFP6 MoE call (TUNED_CALL) or names
+    another format, KeyError for a missing column."""
+    for column, value in TUNED_CALL.items():
+        cell = str(row[column]).strip()
+        if (_int_cell(cell) if isinstance(value, int) else cell) != value:
+            raise ValueError(f"{column} {cell!r} is not {value!r}")
+    formats = {name: fmt for fmt, name in Q_DTYPE_NAMES.items()}
+    a_name, w_name = (str(row[c]).strip() for c in ("q_dtype_a", "q_dtype_w"))
+    if a_name not in formats or formats.get(w_name) not in ("e2m3", "e3m2"):
+        raise ValueError(
+            f"q_dtype_a {a_name!r} / q_dtype_w {w_name!r}: activations are one of "
+            f"{sorted(formats)}, weights a mxfp6 one"
+        )
+    return (
+        *(_int_cell(row[column]) for column in TUNED_KEYS[2:7]),
+        formats[a_name],
+        formats[w_name],
+    )
+
+
+def row_results(config: Mxfp6MoeConfig) -> dict[str, int | str]:
+    """The TUNED_RESULTS cells of a tuned row that names config."""
+    return {
+        "block_m": config.route_m,
+        "h_layout": config.h_layout,
+        "kernelName1": stage_kernel_name(True, config.stage1),
+        "kernelName2": stage_kernel_name(False, config.stage2),
+    }
+
+
+def row_config(row) -> Mxfp6MoeConfig:
+    """The kernels a tuned row names (its TUNED_RESULTS cells). Raises ValueError for
+    cells that name no MXFP6 MoE config, KeyError for a missing column."""
+    first, stage1 = stage_config_from_name(str(row["kernelName1"]).strip())
+    second, stage2 = stage_config_from_name(str(row["kernelName2"]).strip())
+    config = Mxfp6MoeConfig(
+        route_m=_int_cell(row["block_m"]),
+        stage1=stage1,
+        stage2=stage2,
+        h_layout=str(row["h_layout"]).strip(),
+    )
+    if not first or second:
+        raise ValueError("a stage kernel in the other stage's column")
+    if config.h_layout not in H_LAYOUTS:
+        raise ValueError(f"h_layout {config.h_layout!r}: use 'tile_step' or 'rows'")
+    if stage1.route_m != config.route_m or stage2.route_m != config.route_m:
+        raise ValueError(f"a kernel off the {config.route_m}-row routing tiles")
+    return config
+
+
+def load_tuned_configs(path: str) -> dict[tuple, Mxfp6MoeConfig]:
+    """The rows of a tuned config file: (gfx, cu_num, token, model_dim, inter_dim,
+    expert, topk, a_fmt, w_fmt) -> the kernels of that call. No file: no rows.
+
+    Raises ValueError, naming the file and line, for a row that is not a MXFP6 MoE
+    call (row_call), names no config (row_config) or repeats a key."""
+    configs: dict[tuple, Mxfp6MoeConfig] = {}
+    if not path or not os.path.exists(path):
+        return configs
+    with open(path, newline="", encoding="utf-8") as source:
+        for line, row in enumerate(csv.DictReader(source), 2):
+            try:
+                key = (row["gfx"].strip(), _int_cell(row["cu_num"]), *row_call(row))
+                if key in configs:
+                    raise ValueError("a repeated key")
+                configs[key] = row_config(row)
+            except (KeyError, TypeError, ValueError) as e:
+                raise ValueError(
+                    f"{path}, line {line}: not a tuned MXFP6 MoE row ({e})"
+                ) from e
+    return configs
+
+
+@functools.cache
+def _tuned_configs() -> dict[tuple, Mxfp6MoeConfig]:
+    from aiter.jit.core import AITER_CONFIGS
+
+    return load_tuned_configs(AITER_CONFIGS.AITER_CONFIG_MXFP6_MOE_FILE)
+
+
+def clear_tuned_configs() -> None:
+    """Forget the tuned config and every selection made from it: the next call reads
+    the file AITER_CONFIG_MXFP6_MOE names then. For tuners and tests; a serving
+    process reads it once."""
+    from aiter.jit.core import AITER_CONFIGS
+
+    type(AITER_CONFIGS).get_config_file.cache_clear()
+    _tuned_configs.cache_clear()
+    select_config.cache_clear()
+
+
+# cached: tiny calls (~75 us) are host-bound
+@functools.cache
+def select_config(
+    *,
+    tokens: int,
+    topk: int,
+    experts: int,
+    model_dim: int,
+    inter_dim: int,
+    a_fmt: str,
+    w_fmt: str,
+    slab_n1: int,
+    slab_n2: int,
+    w1_bytes: int,
+    w2_bytes: int,
+    cu_num: int,
+    gfx: str,
+) -> Mxfp6MoeConfig:
+    """The kernels the op runs for a call: the tuned row of exactly this device and
+    shape, else the heuristic's (default_config, whose arguments these are).
+
+    Raises ValueError for a tuned row whose kernels do not fit the layer: a tile that
+    does not cover whole weight slabs or does not divide the stage's columns."""
+    key = (gfx, cu_num, tokens, model_dim, inter_dim, experts, topk, a_fmt, w_fmt)
+    config = _tuned_configs().get(key)
+    if config is None:
+        return default_config(
+            tokens=tokens,
+            topk=topk,
+            experts=experts,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            a_fmt=a_fmt,
+            slab_n1=slab_n1,
+            slab_n2=slab_n2,
+            w1_bytes=w1_bytes,
+            w2_bytes=w2_bytes,
+            cu_num=cu_num,
+        )
+    for stage, n, slab in (
+        (config.stage1, 2 * inter_dim, slab_n1),
+        (config.stage2, model_dim, slab_n2),
+    ):
+        if stage.tile_n % slab or n % stage.tile_n:
+            raise ValueError(
+                f"tuned MXFP6 MoE row {key}: the {stage.tile_n}-column tile of "
+                f"{stage} does not fit {n} columns in {slab}-column weight slabs"
+            )
+    return config
