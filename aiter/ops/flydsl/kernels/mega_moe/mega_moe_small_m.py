@@ -44,8 +44,8 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
-from .gemm1 import _LA_CM
 from .gemm_ring import (
+    _LA_CM,
     gemm1_ring_lds_bytes,
     gemm2_ring_lds_bytes,
     make_ring_gemm1,

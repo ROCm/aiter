@@ -8,7 +8,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..tensor_shim import _run_compiled, ptr_buf_tensor
@@ -24,9 +23,6 @@ from .gemm_util import (
     TileScheduler,
     wait_lds_barrier,
 )
-
-# Cache policy (sc0|nt) of do_tile_la's B-scale loads and epilogue stores.
-_LA_CM = 3
 
 
 class _LdsF32View:
@@ -61,7 +57,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
         a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"])
         s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"])
         row_map["wait"](a_srcs)
-        a_gather.for_tile(tile_row_base, None, row_map, a_srcs)
+        a_gather.for_tile(tile_row_base, row_map, a_srcs)
     else:
         a_gather.for_tile(tile_input_base)
     if const_expr(pipe_weights):
@@ -78,7 +74,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 fx.Int32(0),
             )
         if const_expr(row_map is not None):
-            a_scale.stage(a_scale_lds, tile_row_base, row_map, None, s_srcs)
+            a_scale.stage(a_scale_lds, tile_row_base, row_map, s_srcs)
         else:
             a_scale.stage(a_scale_lds, tile_input_base)
         wait_lds_barrier(0 if async_a_copy else 63)
@@ -255,7 +251,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 fx.Int32(0),
             )
         if const_expr(row_map is not None):
-            a_scale.stage(a_scale_lds, tile_row_base, row_map, None, s_srcs)
+            a_scale.stage(a_scale_lds, tile_row_base, row_map, s_srcs)
         else:
             a_scale.stage(a_scale_lds, tile_input_base)
         wait_lds_barrier(0 if async_a_copy else 63)
@@ -308,133 +304,6 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 
 
 # fmt: off
-@flyc.jit
-def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
-    a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA, row_map=None,
-    meta=None, a_ahead=1, a_major=False):
-# fmt: on
-    """pipe_weights K-loop with B / B-scale issued LA K-steps ahead, unrolled xLA.
-
-    The baseline x1 loop yields freshly loaded B registers that still interfere with the B registers feeding the
-    MFMAs, so LLVM emits phi copies and drains the next-step loads before the back-edge: no real lookahead, one
-    full HBM latency per K-step. Unrolling by LA rotates the LA-deep register queue back to identity each
-    iteration, so the yielded sets coalesce with the loop arguments and loads stay in flight across the back-edge.
-    Per-accumulator MFMA order (ksub 0 then 1, K-steps ascending) is unchanged -> bit-identical output.
-    B-scale loads and epilogue stores use sc0|nt (_LA_CM); the epilogue stores are clamped to the tile's valid rows.
-    ``meta = (tile_row_base, valid_rows[, row_stride])`` replaces their loads (the caller's own plan; tile row r
-    reads srcmap slot tile_row_base + r * row_stride); ``row_map`` as :func:`do_tile`, without the arrival wait.
-    a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
-    k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
-    a_major: the K-steps issue their MFMAs A-major (MfmaScaleGU.call_pipe_am, one A operand live), which keeps the
-    paired tiles' twice as many accumulators in registers.
-    """
-    assert 1 <= a_ahead < K_ITERS
-    N_ACC = M_REPEAT * NUM_ACC_N
-    NUM_B = NUM_ACC_N * _PACK
-    NUM_SB = NUM_ACC_N // _PACK
-    valid_rows = row_stride = None
-    if const_expr(meta is not None):
-        tile_row_base, valid_rows = meta[0], meta[1]
-        if const_expr(len(meta) > 2):
-            row_stride = meta[2]
-    else:
-        tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, trb_rsrc[m_tile]))
-    b_row = sched.gate_base_row(expert) + n_tile_base
-    if const_expr(meta is None and rows_rsrc is not None):
-        valid_rows = fx.Int32(rocdl.readfirstlane(T.i32, rows_rsrc[m_tile]))
-    if const_expr(row_map is not None):
-        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
-        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
-        a_gather.for_tile(tile_row_base, valid_rows, row_map, a_srcs)
-        a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
-        a_scale.stage(a_scale_lds, tile_row_base, row_map, valid_rows, s_srcs)
-    else:
-        a_gather.for_tile(tile_row_base, valid_rows)
-        a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
-        a_scale.stage(a_scale_lds, tile_row_base)
-    wait_lds_barrier(63)
-    init = [mfma.zero_value for _ in range(N_ACC)]
-    for q in range_constexpr(LA):
-        init += [h for ni_list in b_loader.load_step(b_row, fx.Int32(q)) for h in ni_list]
-    for q in range_constexpr(LA):
-        init += b_scale.load_step(b_row, fx.Int32(q), _LA_CM)
-    a_lds_bytes = [lb for lb, _c in a_gather._chunks]
-    # a_ahead > 1: A register sets of K-steps k+1 .. k+a_ahead-1 (only in the unrolled K-loop).
-    aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(j * A_K_STEP_BYTES))] for j in range_constexpr(1, a_ahead)]
-
-    def unpack(state):
-        acc = [Vec(a) for a in state[:N_ACC]]
-        bq = []
-        for q in range_constexpr(LA):
-            base = N_ACC + q * NUM_B
-            bq.append([[Vec(state[base + ni * _PACK + ks]) for ks in range(_PACK)] for ni in range(NUM_ACC_N)])
-        sbase = N_ACC + LA * NUM_B
-        sbq = [[fx.Int32(state[sbase + q * NUM_SB + g]) for g in range(NUM_SB)] for q in range(LA)]
-        return acc, bq, sbq
-
-    def pack(acc, bq, sbq):
-        out = list(acc)
-        for b in bq:
-            out += [h for ni_list in b for h in ni_list]
-        for sb in sbq:
-            out += list(sb)
-        return out
-
-    def step(sp, acc, bq, sbq, issue, a_next, a_issue=False):
-        cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
-        nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-        kl = sp + fx.Int32(LA)
-        if const_expr(a_issue):
-            aq.append([v for _lb, v in a_gather.load_regs((sp + fx.Int32(a_ahead)) * fx.Int32(A_K_STEP_BYTES))])
-        sb_new = b_scale.load_step(b_row, kl, _LA_CM) if const_expr(issue) else None
-        sa = a_scale.load_step(a_scale_lds, sp)
-        a_regs = None
-        if const_expr(a_next):
-            if const_expr(a_ahead > 1):
-                a_regs = aq.pop(0)
-            else:
-                a_regs = [v for _lb, v in a_gather.load_regs((sp + fx.Int32(1)) * fx.Int32(A_K_STEP_BYTES))]
-
-        def a_load(mi, ks, _base=cur_off):
-            return a_s2r.load_operand(a_buf, mi, ks, _base)
-
-        def load_next(ni, _kn=kl):
-            return b_loader.load_ni(b_row, ni, _kn)
-
-        if const_expr(issue):
-            call_pipe = mfma.call_pipe_am if const_expr(a_major) else mfma.call_pipe
-            acc, b_new = call_pipe(a_load, bq[0], acc, sa, sbq[0], load_next)
-            bq = bq[1:] + [b_new]
-            sbq = sbq[1:] + [sb_new]
-        else:
-            acc = mfma.call(a_load, bq[0], acc, sa, sbq[0])
-            bq = bq[1:]
-            sbq = sbq[1:]
-        if const_expr(a_next):
-            a_gather.store(a_buf, list(zip(a_lds_bytes, a_regs)), nxt_off)
-            wait_lds_barrier()
-        return acc, bq, sbq
-
-    # a_ahead > 1 unrolls every K-step: a loop would rotate the register queues through phi copies, which wait for
-    # the loads still in flight.
-    n_loop = 0 if const_expr(a_ahead > 1) else (K_ITERS - LA) // LA
-    state = init
-    if const_expr(n_loop > 0):
-        for it_i, state in range(0, n_loop, 1, init=init):
-            sp0 = fx.Int32(it_i) * fx.Int32(LA)
-            acc, bq, sbq = unpack(state)
-            for u in range_constexpr(LA):
-                acc, bq, sbq = step(sp0 + fx.Int32(u), acc, bq, sbq, True, True)
-            state = yield pack(acc, bq, sbq)
-    acc, bq, sbq = unpack(state)
-    for k in range_constexpr(n_loop * LA, K_ITERS):
-        acc, bq, sbq = step(fx.Int32(k), acc, bq, sbq, k + LA <= K_ITERS - 1, k < K_ITERS - 1,
-            a_ahead > 1 and k + a_ahead <= K_ITERS - 1)
-    wait_lds_barrier()
-    epi.store(acc, m_tile, tile_row_base, n_tile_base, valid_rows, _LA_CM)
-
-
-# fmt: off
 def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     out_rsrc, os_rsrc, trb_rsrc, tib_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
@@ -442,32 +311,23 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
-    act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, pair_tiles=False):
+    a_async_lds=False, ascale_packed=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
-    ``lookahead > 0`` runs tiles with :func:`do_tile_la`, clamping each tile to its ``rows_rsrc`` row count;
-    ``out_cache_modifier`` is the epilogue store cache policy (not used with ``lookahead > 0``, whose stores use
-    ``_LA_CM``) and ``tile_zero`` is forwarded to :func:`do_tile`.
+    ``out_cache_modifier`` is the epilogue store cache policy and ``tile_zero`` is forwarded to :func:`do_tile`.
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
-    ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows[,
-    row_stride])`` takes the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is
-    :func:`do_tile_la`'s.
-
-    pair_tiles: returns two runners, ``(flat, plan)`` with the unit's plan ``(expert, m_tile, paired, tile_row_base,
-    (rows0, rows1), row_stride)`` from the caller: one runs m-tile m_tile (rows0 rows), the other a pair, m-tile
-    m_tile and the next interleaved m-tile of its expert (rows1 rows), as one 2 x sort_block_m row tile that reads
-    the W1 slab once for both and stores each m-tile as a sort_block_m tile.
+    ``ascale_packed`` are the A loaders' modes.
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
     fold_rows > 0 also returns a runner for an m-tile followed by a tail tile of its expert with at most
     fold_rows real rows: one sort_block_m + fold_rows row tile (the rows are contiguous) storing both.
     """
-    assert row_map is None or lookahead > 0 or async_a_copy
+    assert row_map is None or async_a_copy
     sched = TileScheduler(
         expert_rsrc=expert_rsrc,
         inter_dim=inter_dim,
@@ -524,70 +384,11 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         m_tile, _n = _decode(flat)
         return sched.expert_of(m_tile)
 
-    if const_expr(pair_tiles):
-        assert lookahead > 0 and row_map is not None and not short_rows
-        mfma_p = MfmaScaleGU(m_repeat=2 * m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
-        epi_p = _PairEpilogue(epi, m_repeat * num_acc_n)
-
-        def unit_a_loaders(flat, rows):
-            # The unit's A loaders for a tile of ``rows`` rows (2 * sort_block_m: a pair). Their thread offsets depend
-            # on the unit (flat >= 0 adds 0): hoisted out of the persistent loop, the offsets of every GEMM1 body would
-            # stay live across all of them, which then spill.
-            tx = fx.thread_idx.x + (flat < fx.Int32(0)).select(flat, fx.Int32(0))
-            paired = rows > sort_block_m
-            # fmt: off
-            return (
-                ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=rows, k_step_bytes=a_k_step_bytes,
-                    total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_lds=a_async_lds,
-                    a_dtype=a_dtype, paired=paired, tx=tx),
-                AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype, tx=tx),
-                AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=rows // 16, model_dim=model_dim, sort_block_m=rows,
-                    total_threads=total_threads, packed=ascale_packed, paired=paired, tx=tx),
-            )
-            # fmt: on
-
-        def do_planned_tile(flat, plan):
-            _group, n_tile = _decode(flat)
-            n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
-            expert, m_tile, _paired, tile_row_base, rows, row_stride = plan
-            a_gather_u, a_s2r_u, a_scale_u = unit_a_loaders(flat, sort_block_m)
-            # fmt: off
-            do_tile_la(m_tile, n_tile_base, expert, sched, a_gather_u, a_s2r_u, b_loader, b_scale, a_scale_u, mfma,
-                epi, a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc,
-                rows_rsrc, lookahead, row_map, (tile_row_base, rows[0], row_stride), a_ahead)
-            # fmt: on
-
-        def do_paired_tile(flat, plan):
-            _group, n_tile = _decode(flat)
-            n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
-            expert, m_tile, _paired, tile_row_base, rows, row_stride = plan
-            a_gather_u, a_s2r_u, a_scale_u = unit_a_loaders(flat, 2 * sort_block_m)
-            # fmt: off
-            do_tile_la(m_tile, n_tile_base, expert, sched, a_gather_u, a_s2r_u, b_loader, b_scale, a_scale_u, mfma_p,
-                epi_p, a_buf, a_scale_lds, 2 * a_lds_i32, k_iters, 2 * m_repeat, num_acc_n, a_k_step_bytes,
-                trb_rsrc, rows_rsrc, lookahead, row_map, (tile_row_base, rows, row_stride), a_ahead, a_major=True)
-            # fmt: on
-
-        return expert_of_flat, do_planned_tile, do_paired_tile
-
     def do_scheduled_tile(flat):
         m_tile, n_tile = _decode(flat)
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
-        meta = None
-        if const_expr(plan_lookup is not None):
-            # (local expert, tile row base, valid rows[, row stride]) from the CTA's own plan.
-            plan = plan_lookup(m_tile)
-            expert, meta = plan[0], plan[1:]
-        else:
-            expert = sched.expert_of(m_tile)
+        expert = sched.expert_of(m_tile)
         # fmt: off
-        if const_expr(lookahead > 0):
-            assert pipe_weights and not async_a_copy and not mfma_amajor and not indirect_input
-            do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
-                a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, rows_rsrc,
-                lookahead, row_map, meta, a_ahead)
-            return
-        assert plan_lookup is None
         do_tile(m_tile, n_tile_base, expert, sched, a_gather,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
@@ -597,7 +398,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
 
     if const_expr(not short_rows):
         return expert_of_flat, do_scheduled_tile
-    assert lookahead == 0 and not indirect_input and sort_block_m % short_rows == 0
+    assert not indirect_input and sort_block_m % short_rows == 0
     s_repeat = short_rows // 16
     # fmt: off
     a_gather_s = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=short_rows, k_step_bytes=a_k_step_bytes,
@@ -648,20 +449,6 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile, do_short_tile, do_fold_tile
-
-
-class _PairEpilogue:
-    """Stores a paired tile: each of its two interleaved m-tiles as a tile of its own, with its own valid rows."""
-
-    def __init__(self, tile, tile_accs):
-        self._tile, self._tile_accs = tile, tile_accs
-
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows, store_cm):
-        # Each store ends with an LDS barrier, so the second may reuse the cshuffle LDS. The next m-tile of the
-        # expert starts one slot later (emit_direct_fixed_slot_finalize interleave).
-        for half in range_constexpr(2):
-            self._tile.store(acc[half * self._tile_accs : (half + 1) * self._tile_accs], tile_i32 + fx.Int32(half),
-                tile_row_base_i32 + fx.Int32(half), n_tile_base_i32, valid_rows[half], store_cm)
 
 
 class _FoldEpilogue:

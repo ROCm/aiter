@@ -112,13 +112,11 @@ def issue_a_load_lds_dt(
     KH_TILE_A,
     K_BYTES,
     BM=32,
-    valid_rows=None,
     NW=4,
     slot_rows=None,
 ):
     """Load one A tile through a tile-local descriptor so allocations may span the 4 GiB buffer ABI.
 
-    ``valid_rows`` bounds the descriptor to the tile's real rows (the rest read as zero);
     ``slot_rows`` (default ``BM``) is the row count an LDS slot holds.
     """
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -145,8 +143,7 @@ def issue_a_load_lds_dt(
         align=16,
         elem_bytes=4,
         fold=False,
-        num_records_bytes=fx.Int64(BM if valid_rows is None else valid_rows)
-        * fx.Int64(K_BYTES),
+        num_records_bytes=fx.Int64(BM) * fx.Int64(K_BYTES),
     )
     for g in range_constexpr(n_row_groups):
         lds_row = gather_base_row + g * rows_per_call
@@ -244,7 +241,6 @@ def gemm2_compute_v2(
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
-    valid_rows=None,
     NW=4,
     early_b_load=False,
     a_dma_uniform=False,
@@ -254,9 +250,8 @@ def gemm2_compute_v2(
 ):
     """Run GEMM2, optionally using an explicitly selected expert row/tile.
 
-    ``NW`` is the CTA wave count, ``valid_rows`` bounds the A tile loads to the
-    tile's real rows, and ``early_b_load`` (1-stage B path) issues each K-tile's
-    B and A-scale loads before the barrier and the next A-tile DMA.
+    ``NW`` is the CTA wave count, and ``early_b_load`` (1-stage B path) issues each
+    K-tile's B and A-scale loads before the barrier and the next A-tile DMA.
 
     The fused large-input kernel's BM64 1-stage knobs: ``a_dma_uniform`` issues
     the A copy on every K-step, ``a_scale_lds`` reads the A scales from LDS
@@ -355,7 +350,6 @@ def gemm2_compute_v2(
             KH_TILE_A,
             K_BYTES,
             BM=BM,
-            valid_rows=valid_rows,
             NW=NW,
             slot_rows=slot_rows,
         )

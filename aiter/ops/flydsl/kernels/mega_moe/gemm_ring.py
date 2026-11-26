@@ -29,6 +29,8 @@ from .gemm_util import _e8m0_scale, _group_absmax, silu_mul_f32
 
 _STEP_K = 128
 _SLOT = 1024
+# Cache policy (sc0|nt) of the small-input kernel's GEMM1 weight-scale loads and output stores.
+_LA_CM = 3
 
 
 def _load_w(buf, unit, soff_dw, cm, width=4):
