@@ -230,6 +230,46 @@ def check_edges():
     aiter.logger.info("spec_verify_pick edge checks passed")
 
 
+def check_split_invariance():
+    """Split rows (16 workgroups a row + a finishing pass) and whole rows (one
+    workgroup a row) must pick bit for bit the same, sampled rows included: the
+    split re-runs the one-workgroup race thread for thread. The public op picks
+    between them by row count, so this is what makes a pick independent of the
+    step's batch size."""
+    from aiter.ops.sample import _SPEC_VERIFY_PICK_WS_PER_ROW, _spec_verify_pick_hip
+
+    def pick(args, split):
+        target, bonus = args[4], args[5]
+        rows = target.numel() + bonus.numel()
+        ot = torch.empty(target.numel(), dtype=torch.int32, device="cuda")
+        ob = torch.empty(bonus.numel(), dtype=torch.int32, device="cuda")
+        ws = torch.full(
+            (rows * _SPEC_VERIFY_PICK_WS_PER_ROW,), -1, dtype=torch.int32, device="cuda"
+        )
+        _spec_verify_pick_hip(ot, ob, *args, ws, split, EPS, EPS)
+        return torch.cat([ot, ob])
+
+    n = 0
+    for dtype in (dtypes.bf16, dtypes.fp16, dtypes.fp32):
+        for V in (129280, 4096 * 9 + 3, 4097, 1000, 160):
+            for conc in (1, 8, 64):
+                for seed in range(3):
+                    args = build(
+                        conc, 5, V, dtype, pitch=64 * (seed % 2), seed=seed + V
+                    )
+                    if seed == 2:
+                        # Ties and specials: many equal logits, NaN / +-inf.
+                        logits = args[0]
+                        logits[:, : V // 2] = logits[:, :1]
+                        logits[0, V // 3] = float("nan")
+                        logits[-1, V - 1] = float("inf")
+                        logits[-1, 0] = float("-inf")
+                    a, b = pick(args, False), pick(args, True)
+                    assert torch.equal(a, b), f"split rows {dtype} {V=} {conc=} {seed=}"
+                    n += a.numel()
+    aiter.logger.info("spec_verify_pick split rows == whole rows on %d picks", n)
+
+
 def check_graph(replays=20):
     V, conc = 129280, 16
     args = build(conc, 5, V, dtypes.bf16, seed=3, ragged=False)
@@ -324,11 +364,12 @@ l_dtype = (
 
 check_accuracy(l_dtype, args.conc, args.vocab, max_draft=5)
 check_edges()
+check_split_invariance()
 check_graph()
 if args.perf:
     df = [
         test_spec_verify_pick_perf(conc, 129280, dtypes.bf16)
-        for conc in (1, 8, 16, 32, 64, 128)
+        for conc in (1, 8, 16, 32, 64, 128, 256)
     ]
     aiter.logger.info(
         "spec_verify_pick perf (median us per call, CUDA graph replay, noise excluded):\n%s",

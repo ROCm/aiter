@@ -2374,6 +2374,8 @@ namespace py = pybind11;
           py::arg("target_idx"),                                                     \
           py::arg("bonus_idx"),                                                      \
           py::arg("cu_draft"),                                                       \
+          py::arg("workspace"),                                                      \
+          py::arg("split_rows") = false,                                             \
           py::arg("eps")        = 1e-10,                                             \
           py::arg("greedy_eps") = 1e-10);
 

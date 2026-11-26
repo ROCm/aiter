@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+
 import torch
 from torch import Generator, Tensor
 
@@ -133,9 +135,35 @@ def _spec_verify_pick_hip(
     target_idx: Tensor,
     bonus_idx: Tensor,
     cu_draft: Tensor,
+    workspace: Tensor,
+    split_rows: bool = False,
     eps: float = 1e-10,
     greedy_eps: float = 1e-10,
 ) -> None: ...
+
+
+# int32 of workspace per row of a split launch (sample_kernels.cu, SvpWsPerRow).
+_SPEC_VERIFY_PICK_WS_PER_ROW = 4 * 1024
+
+
+@functools.cache
+def _cu_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _spec_verify_pick_split_rows(rows: int, device: torch.device) -> bool:
+    """Whether to spread each row over 16 one-wave workgroups.
+
+    Unsplit, a row is one 1024-thread workgroup: 16 waves sharing a CU's 4
+    SIMDs, ~33 us at V = 129280 whether the step has 1 row or one per CU. Split,
+    the same 16 waves land on 16 SIMDs, ~14 us a row plus ~3 us of finishing
+    pass while there is about a wave per SIMD; with more rows the waves share
+    SIMDs again and the unsplit kernel, one pass, is as fast or faster. Split
+    while the rows' waves (16 a row) fill at most half the SIMDs (4 a CU) --
+    rows <= CUs / 2. The picks are the same either way.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return 2 * rows <= _cu_count(index)
 
 
 def _spec_verify_pick_fake(*args, **kwargs) -> None:
@@ -180,7 +208,7 @@ def spec_verify_pick(
     eps: float = 1e-10,
     greedy_eps: float = 1e-10,
 ) -> None:
-    """The token picks of a sampled speculative-verification step, in one launch.
+    """The token picks of a sampled speculative-verification step, fused.
 
     Writes ``out_t`` and ``out_b`` in place and returns None.
 
@@ -222,6 +250,11 @@ def spec_verify_pick(
         eps: added to the noise before the division.
         greedy_eps: rows at or below this temperature are greedy; 0.0 gives
             the ``temperature == 0`` rule of ``mixed_sample_outer_exponential``.
+
+    One launch; a step with few rows (at most half the CU count) spreads each
+    row over 16 workgroups and adds a finishing launch, with the same picks
+    bit for bit -- the split re-runs the one-workgroup race thread for thread
+    -- so a pick does not depend on how many rows the step has.
 
     The kernel runs on GPU tensors with the last dim of ``input`` and the
     noise contiguous; index lists, prefix sums, temperatures and outputs are
@@ -273,6 +306,12 @@ def spec_verify_pick(
         return torch.empty(x.shape, dtype=torch.int32, device=device)
 
     kt, kb = writable(out_t), writable(out_b)
+    split_rows = _spec_verify_pick_split_rows(n_t + n_req, device)
+    workspace = torch.empty(
+        (n_t + n_req) * _SPEC_VERIFY_PICK_WS_PER_ROW if split_rows else 0,
+        dtype=torch.int32,
+        device=device,
+    )
     _spec_verify_pick_hip(
         kt,
         kb,
@@ -283,6 +322,8 @@ def spec_verify_pick(
         dense(target_idx, torch.int64),
         dense(bonus_idx, torch.int64),
         dense(cu_draft, torch.int32),
+        workspace,
+        split_rows,
         eps,
         greedy_eps,
     )
