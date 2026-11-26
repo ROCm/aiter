@@ -149,6 +149,10 @@ def _launch(
 ):
     from .mxscale_preshuffle_kernels import _bound_reduce_exe
 
+    if w.ndim != 2:
+        raise ValueError(
+            f"ring GEMM takes a 2-D weight [N, K], got shape {tuple(w.shape)}"
+        )
     n = w.shape[0]
     # The kernel reads row ``i`` of a tap at byte ``i * stride_bytes`` through 32-bit offsets and a descriptor that
     # spans the last row's ``seg_k`` elements: a zero (expanded) or padded row stride is fine, a span past 2**31 is not.
@@ -333,11 +337,15 @@ def gemm_a16w16_ring_splitk(
 def warmup_cat_x_ring(
     m_max: int, n: int, seg_k: int, w: torch.Tensor, ks: int = 10
 ) -> None:
-    """Compile every row tier (call before CUDA-graph capture)."""
+    """Compile every row tier up to and including ``m_max`` (call before CUDA-graph capture)."""
     x = [
         torch.zeros(m_max, seg_k, dtype=torch.bfloat16, device=w.device)
         for _ in range(NSEG)
     ]
     for m in range(16, m_max + 1, 16):
         gemm_a16w16_cat_x_ring([t[:m] for t in x], w, ks=ks)
+    if m_max % 16:
+        # The last tier is a partial 16-row tile (e.g. m_max=17 needs mt=2, m_max=8 needs mt=1):
+        # the loop above only reaches multiples of 16 and would otherwise leave it uncompiled.
+        gemm_a16w16_cat_x_ring([t[:m_max] for t in x], w, ks=ks)
     torch.cuda.synchronize(w.device)

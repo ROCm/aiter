@@ -113,6 +113,36 @@ def test_cat_x_ring_rejects_unsupported():
 
 
 @_SKIP
+def test_cat_x_ring_rejects_non_2d_weight():
+    """A weight with extra dimensions (e.g. a trailing size-0 axis) must not reach the raw-pointer launch:
+    w.shape[0]/[1] alone do not catch it."""
+    xs, w = _inputs(8)
+    ws = shuffle_weight_ring(w)
+    with pytest.raises(ValueError, match="2-D"):
+        gemm_a16w16_cat_x_ring(xs, ws.unsqueeze(-1))
+    with pytest.raises(ValueError, match="2-D"):
+        gemm_a16w16_ring_splitk(xs[0].repeat(1, NSEG), ws.unsqueeze(-1))
+
+
+@_SKIP
+@pytest.mark.parametrize("m_max", (8, 17))
+def test_warmup_cat_x_ring_compiles_the_final_partial_tier(m_max):
+    """``warmup_cat_x_ring`` must compile every tier up to and including a non-multiple-of-16 ``m_max`` (m_max=8:
+    the loop over range(16, m_max+1, 16) is empty; m_max=17: the loop stops at mt=1 and never reaches mt=2),
+    so a later call at that exact M does not trigger a fresh (capture-unsafe) compile.
+    """
+    from aiter.ops.flydsl.kernels.gemm_a16w16_cat_x_ring_gfx950 import compile_cat_ring
+
+    xs, w = _inputs(m_max)
+    ws = shuffle_weight_ring(w)
+    compile_cat_ring.cache_clear()
+    warmup_cat_x_ring(m_max, N, SEG_K, ws)
+    misses_after_warmup = compile_cat_ring.cache_info().misses
+    gemm_a16w16_cat_x_ring(xs, ws)
+    assert compile_cat_ring.cache_info().misses == misses_after_warmup
+
+
+@_SKIP
 def test_cat_x_ring_expanded_taps_and_output_rows():
     """A tap row stride of 0 (one row broadcast over M) and a padded output are served; overlapping output rows
     (a ``[1, N]`` buffer expanded to ``[M, N]``) are refused, not written over each other.

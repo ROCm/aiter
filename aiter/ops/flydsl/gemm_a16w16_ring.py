@@ -164,7 +164,8 @@ def gemm_a16w16_ring(
     if not ring_supported(m, n, k, x.device, tiling):
         raise ValueError(f"ring GEMM does not take M={m} N={n} K={k} on this device")
     if (
-        x.dtype != torch.bfloat16
+        w.ndim != 2
+        or x.dtype != torch.bfloat16
         or w.dtype != torch.bfloat16
         or w.shape[1] != k
         or not x.is_contiguous()

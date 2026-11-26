@@ -102,6 +102,15 @@ def test_ring_rejects_weights_past_32bit_offsets():
 
 
 @_SKIP
+def test_ring_rejects_non_2d_weight():
+    """A weight with an extra dimension (e.g. a trailing size-0 axis) must not reach the raw-pointer launch:
+    w.shape[1] == k alone does not catch it."""
+    x, w = _inputs(8, *_SHAPES[0])
+    with pytest.raises(ValueError, match="contiguous 16-byte-aligned"):
+        gemm_a16w16_ring(x, w.unsqueeze(-1))
+
+
+@_SKIP
 def test_ring_rejects_cpu_and_foreign_device_tensors():
     x, w = _inputs(8, *_SHAPES[0])
     with pytest.raises(ValueError):
