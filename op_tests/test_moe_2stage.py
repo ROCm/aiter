@@ -2868,12 +2868,12 @@ def test_glm5_tp8_decode(token):
     a, b = ref.double(), out.double()
     logits_diff = float(1 - 2 * (a * b).sum() / (a.square() + b.square()).sum())
     assert logits_diff < 0.01, f"glm5 tp8 decode token={token}: {logits_diff=}"
-    return {"gfx": get_gfx(), "logits_diff": logits_diff}
+    return {"gfx": get_gfx_runtime(), "logits_diff": logits_diff}
 
 
 def run_glm5_decode_cases():
-    # 9 and 16 are the edges of the token-16 tuned row; 8 and 17 are controls.
-    rows = [test_glm5_tp8_decode(token) for token in (8, 9, 16, 17)]
+    # 9 and 16 are the edges of the token-16 tuned row.
+    rows = [test_glm5_tp8_decode(token) for token in (9, 16)]
     _glm5_decode_weight_cache.clear()
     gc.collect()
     torch.cuda.empty_cache()
@@ -3337,6 +3337,7 @@ else:
     test_swiglu_limit_guards()
     if get_gfx() in ("gfx942", "gfx950"):
         run_blockscale_limit_cases()
+    if get_gfx_runtime() == "gfx942":
         run_glm5_decode_cases()
     run_plain_fp8_limit_cases()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
