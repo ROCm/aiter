@@ -24,15 +24,7 @@ _AOT_SOURCES = [
 ]
 
 
-# The variables moe_common.py reads.
-_AOT_ENV = [
-    "AITER_FLYDSL_STAGE2_FP8",
-    "AITER_MXFP4_INTERMEDIATE",
-    "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
-]
-
-
-@aot_factory("mixed_fhmoe_gemm1", sources=_AOT_SOURCES, env=_AOT_ENV)
+@aot_factory("mixed_fhmoe_gemm1", sources=_AOT_SOURCES)
 @functools.cache
 def compile_mixed_fhmoe_gemm1(
     *,
@@ -103,7 +95,7 @@ def compile_mixed_fhmoe_gemm1(
     )
 
 
-@aot_factory("mixed_fhmoe_gemm2", sources=_AOT_SOURCES, env=_AOT_ENV)
+@aot_factory("mixed_fhmoe_gemm2", sources=_AOT_SOURCES)
 @functools.cache
 def compile_mixed_fhmoe_gemm2(
     *,

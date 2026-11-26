@@ -409,8 +409,8 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
         "kernels/gdr_prefill/chunk_gated_delta_h.py",
         "kernels/gdr_common.py",
     ],
-    # Read in this file; the BV override also reaches the key as BV.
-    env=["AITER_K5_OPT_CHECK", "FLYDSL_K5_OPT_BV"],
+    # Read in this file (its value also reaches the key, as BV).
+    env=["FLYDSL_K5_OPT_BV"],
 )
 @functools.cache
 def _get_or_compile_opt(

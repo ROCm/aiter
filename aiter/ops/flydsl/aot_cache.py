@@ -173,6 +173,14 @@ _ENV_NOT_CODE = frozenset(
         "AITER_GPU_ARCHS",
         "CU_NUM",
         "AITER_AOT_REPLAY",
+        # Read by dispatch helpers of moe_common.py (which kernels import
+        # for GateMode): what they choose reaches a kernel as a factory
+        # argument (the output dtype, the SwiGLU limit), which is its key.
+        "AITER_FLYDSL_STAGE2_FP8",
+        "AITER_MXFP4_INTERMEDIATE",
+        "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
+        # A host-side argument audit of the GDN wrapper.
+        "AITER_K5_OPT_CHECK",
         # FlyDSL's own cache.
         "FLYDSL_RUNTIME_CACHE_DIR",
         "FLYDSL_RUNTIME_ENABLE_CACHE",
@@ -185,7 +193,6 @@ _ENV_NOT_CODE = frozenset(
 _COMMON_ENV = (
     "AITER_FLYDSL_KERNARG_PRELOAD",
     "AITER_FLYDSL_KERNARG_PRELOAD_COUNT",
-    "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE",
 )
 
 
