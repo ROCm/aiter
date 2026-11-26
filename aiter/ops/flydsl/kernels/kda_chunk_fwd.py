@@ -182,6 +182,24 @@ def _mfma(a, b, acc):
     return fx.Vector(fx.memref_load_vec(fc))
 
 
+def _mfma_f32(a, b, acc):
+    """A 16x16x16 fp32 product as four ``v_mfma_f32_16x16x4_f32``.
+
+    Same lane layout as ``_mfma``: step ``p`` pairs ``A[.][4 * (l // 16) + p]``
+    with ``B[4 * (l // 16) + p][.]``, so the four steps cover all 16 of K.
+    """
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    fa = fx.make_rmem_tensor(1, fx.Float32)
+    fb = fx.make_rmem_tensor(1, fx.Float32)
+    fc = fx.make_rmem_tensor(4, fx.Float32)
+    fc.store(acc)
+    for p in range_constexpr(4):
+        fa[0] = a[p]
+        fb[0] = b[p]
+        fx.gemm(mma, fc, fa, fb, fc)
+    return fx.Vector(fc.load())
+
+
 def _zero4():
     return fx.Vector.filled(4, 0.0, fx.Float32)
 
@@ -341,6 +359,7 @@ def compile_intra(
         l: fx.Array[fx.Float32, BT * BT, 16]
         x: fx.Array[fx.Float32, BT * BT, 16]
         beta: fx.Array[fx.Float32, BT, 16]
+        t: fx.Array[fx.Float32, 4 * 16 * 16, 16]  # per-wave 16x16 solve scratch
 
     @flyc.kernel(name="kda_fwd_intra_flydsl")
     def kernel(
@@ -524,21 +543,65 @@ def compile_intra(
             lds_st(s_q, cols[e] * BT + r, kb_r[e])
             lds_st(s_k, cols[e] * BT + r, vb_r[e])
 
-        # Forward substitution, one row of X = (I + L)^-1 per step:
-        # X[i, c] = [i == c] - sum_{j < i} L[i, j] X[j, c]. Thread r owns column r.
-        for i, st in range(0, BT, 1, init=[_zero()]):
+        # X = (I + L)^-1 blockwise. Each wave inverts its 16x16 diagonal block
+        # by forward substitution (the four in lockstep), then block row I is
+        # X_IJ = -X_II sum_{K < I} L_IK X_KJ on fp32 MFMA (X's upper blocks
+        # are zero, so the sum can start at K = 0).
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            lds_st(s_x, tid + e * NUM_THREADS, _zero())
+        gpu.barrier()
+        dbase = wave * 16
+        dc = lane // 4
+        dseg = lane % 4
+        for i, st in range(0, 16, 1, init=[_zero()]):
             iq = fx.Int32(i)
             part = _zero()
-            for m in range_constexpr(BT // 4):
-                j = seg + 4 * m
+            for m in range_constexpr(4):
+                j = dseg + 4 * m
                 part = part + _sel(
-                    j < iq, lds_ld(s_l, iq * BT + j) * lds_ld(s_x, j * BT + r), _zero()
+                    j < iq,
+                    lds_ld(s_l, (dbase + iq) * BT + dbase + j)
+                    * lds_ld(s_x, (dbase + j) * BT + dbase + dc),
+                    _zero(),
                 )
             part = _row_sum(part)
-            if seg == 0:
-                lds_st(s_x, iq * BT + r, _sel(iq == r, fx.Float32(1.0), -part))
+            if dseg == 0:
+                lds_st(
+                    s_x,
+                    (dbase + iq) * BT + dbase + dc,
+                    _sel(iq == dc, fx.Float32(1.0), -part),
+                )
             gpu.barrier()
             res = yield [st[0]]
+
+        s_l4 = _lds4(lds.l, BT * BT)
+        s_t = _lds(lds.t, 4 * 256)
+        tbase = wave * 256
+        for I in range_constexpr(1, BT // 16):
+            acc = _zero4()
+            for Kb in range_constexpr(I):
+                a = lds_ld4(s_l4, (I * 16 + lr) * BT + Kb * 16 + lk)
+                bx = fx.Vector.from_elements(
+                    [
+                        lds_ld(s_x, (Kb * 16 + lk + p) * BT + dbase + lr)
+                        for p in range_constexpr(4)
+                    ],
+                    dtype=fx.Float32,
+                )
+                acc = _mfma_f32(a, bx, acc)
+            for vi in range_constexpr(4):
+                lds_st(s_t, tbase + (lk + vi) * 16 + lr, acc[vi])
+            gpu.barrier()
+            a = lds_ld4(s_x4, (I * 16 + lr) * BT + I * 16 + lk)
+            bt = fx.Vector.from_elements(
+                [lds_ld(s_t, tbase + (lk + p) * 16 + lr) for p in range_constexpr(4)],
+                dtype=fx.Float32,
+            )
+            acc = _mfma_f32(a, bt, _zero4())
+            if wave < I:
+                for vi in range_constexpr(4):
+                    lds_st(s_x, (I * 16 + lk + vi) * BT + dbase + lr, -acc[vi])
+            gpu.barrier()
 
         akk_v = _flat(Akk, hb * BT)
         if rv:
