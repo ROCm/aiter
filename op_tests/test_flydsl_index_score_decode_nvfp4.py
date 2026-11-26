@@ -19,6 +19,12 @@ K = 7), 1 x 8 on a TP4 rank, plain decode (1 row), contexts of 50K-300K tokens,
 the 9216 B pages of ATOM's NVFP4 index pool (payload and scales two byte views
 of one buffer).
 
+``index_select_decode`` (the decode top-k and its sparse-table emit) against a
+torch reference of ATOM's Triton selector: the same ids in the same order, the
+same table rows and context lengths, exactly (scores with ties, NaN, -inf, -0.0,
+graph pad requests); and ``index_topk_decode_nvfp4`` (the scorer's flat plan +
+the selector) end to end against the reference selection of its own scores.
+
 Run with: python op_tests/test_flydsl_index_score_decode_nvfp4.py
 """
 
@@ -161,7 +167,25 @@ def test_index_score_decode_nvfp4(
         )
         return score
 
-    candidates = {"flydsl": flydsl}
+    flat_score = torch.full_like(ref, float("nan"))
+
+    def flydsl_flat():
+        index_score_decode_nvfp4(
+            q,
+            payload,
+            scale,
+            flat_score,
+            bt,
+            seq_lens,
+            sm_scale,
+            query_len,
+            workgroups=workgroups or None,
+            ring=ring,
+            flat=True,
+        )
+        return flat_score
+
+    candidates = {"flydsl": flydsl, "flat": flydsl_flat}
     blocks = sum(min(-(-n // PAGE), max_block) for n in lens)
     nbytes = blocks * PAGE_BYTES + q.numel() * 2 + int(live.sum()) * 4
     # Two scaled dots (hi, lo) a (row, head, key).
@@ -190,6 +214,193 @@ def test_index_score_decode_nvfp4(
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def ref_select(score, seq_lens, query_len, topk, init_blocks, local_blocks):
+    """ATOM's decode selection (``_score_tile_keys`` + ``_pack_score_key`` +
+    ``tl.topk``) in torch: [heads, rows, topk] ids, -1 past the row's blocks."""
+    heads, _, max_block = score.shape
+    rows = seq_lens.numel() * query_len
+    s = score[:, :rows].clone()
+    r = torch.arange(rows, device=score.device)
+    t = r % query_len
+    valid = (seq_lens.long()[r // query_len] - query_len + t + PAGE) // PAGE
+    idx = torch.arange(max_block, device=score.device)
+    live = idx[None] < valid[:, None]
+    local_start = (valid - local_blocks).clamp(min=0)
+    s = torch.where(live & (idx[None] < init_blocks), 1e30, s)
+    s = torch.where(live & (idx[None] >= local_start[:, None]), 1e29, s)
+    bits = s.view(torch.int32).long() & 0xFFFFFFFF
+    bits = torch.where(bits == 0x80000000, 0, bits)
+    ordered = bits ^ torch.where(bits >> 31 != 0, 0xFFFFFFFF, 0x80000000)
+    ordered = torch.where((bits & 0x7FFFFFFF) > 0x7F800000, 0, ordered)
+    key = (1 << 48) | (ordered << 16) | (idx + 1)
+    key = torch.where(live, key, 0)
+    k = min(topk, max_block)
+    top = key.topk(k, dim=-1).values
+    ids = ((top & 0xFFFF) - 1).int()
+    ids = torch.where(
+        torch.arange(k, device=score.device) < valid.clamp(max=topk)[:, None], ids, -1
+    )
+    out = torch.full((heads, rows, topk), -1, dtype=torch.int32, device=score.device)
+    out[..., :k] = ids
+    return out
+
+
+def ref_emit(topk_idx, seq_lens, bt, query_len, pages_per_block, block_page_stride):
+    """``_emit_sparse_block_table_row`` in torch: (table rows, context lengths)
+    of row ``r * heads + h``."""
+    heads, rows, topk = topk_idx.shape
+    sbt = torch.zeros(rows * heads, topk * pages_per_block, dtype=torch.int32)
+    sctx = torch.zeros(rows * heads, dtype=torch.int32)
+    ids, lens, btc = topk_idx.cpu(), seq_lens.cpu().tolist(), bt.cpu()
+    for r in range(rows):
+        b, t = divmod(r, query_len)
+        causal = lens[b] - query_len + t + 1
+        self_blk = int((causal - 1) / PAGE)  # Triton's division truncates
+        for h in range(heads):
+            blk = ids[h, r].tolist()
+            ok = [x >= 0 and x <= self_blk for x in blk]
+            if pages_per_block == 1:
+                ok = [o and causal > 0 for o in ok]
+            full = [o and x < self_blk for o, x in zip(ok, blk)]
+            n_full, n_ok = sum(full), sum(ok)
+            e = r * heads + h
+            seen = 0
+            for o, f, x in zip(ok, full, blk):
+                if not o:
+                    continue
+                slot = seen if f else n_full
+                seen += f
+                base = int(btc[b, x]) * block_page_stride * heads + h
+                for j in range(pages_per_block):
+                    sbt[e, slot * pages_per_block + j] = base + j * heads
+            has_tail = any(o and x == self_blk for o, x in zip(ok, blk))
+            ctx = (
+                n_full * PAGE + causal - self_blk * PAGE
+                if has_tail
+                else min(n_ok * PAGE, causal)
+            )
+            sctx[e] = max(ctx, 0) if pages_per_block == 1 else ctx
+    return sbt, sctx
+
+
+def select_scores(heads, rows, max_block, kind, seed):
+    """Score planes the selector must rank exactly as ATOM does."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    s = torch.randn(heads, rows, max_block, device="cuda", generator=g)
+    if kind == "ties":  # few distinct values: ties at the cut everywhere
+        s = (s * 2).round()
+    elif kind == "specials":
+        m = torch.rand(s.shape, device="cuda", generator=g)
+        s = torch.where(m < 0.02, float("nan"), s)
+        s = torch.where((m >= 0.02) & (m < 0.05), float("-inf"), s)
+        s = torch.where((m >= 0.05) & (m < 0.08), -0.0, s)
+        s = torch.where((m >= 0.08) & (m < 0.1), 0.0, s)
+        s = torch.where((m >= 0.1) & (m < 0.11), float("inf"), s)
+    elif kind == "ascending":  # the newest blocks score highest
+        s = s * 0.01 + torch.arange(max_block, device="cuda") / max_block
+    elif kind == "constant":
+        s = torch.zeros_like(s)
+    return s
+
+
+@benchmark()
+def test_index_select_decode(
+    batch, context, query_len, heads, topk, init_blocks, local_blocks, kind, emit, lens
+):
+    from aiter.ops.flydsl.index_score_decode import (
+        index_select_decode,
+        index_topk_decode_score_plane,
+    )
+
+    max_block = -(-context // PAGE)
+    rows = batch * query_len
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    # the plane's padding columns hold garbage too: never read as a block
+    score = index_topk_decode_score_plane(heads, rows + 3, max_block, "cuda")
+    padded = (heads, rows + 3, score.stride(1))
+    torch.as_strided(score, padded, score.stride()).copy_(
+        select_scores(*padded, "specials", 7)
+    )
+    score.copy_(select_scores(heads, rows + 3, max_block, kind, batch + context))
+    bt = torch.randint(
+        0, 1 << 20, (batch, max_block + 5), dtype=torch.int32, device="cuda"
+    )
+    ref = ref_select(score, seq_lens, query_len, topk, init_blocks, local_blocks)
+    # -7 poison: a slot the kernel misses shows
+    ids = torch.full((heads, rows + 3, topk), -7, dtype=torch.int32, device="cuda")
+    kw = {}
+    if emit:
+        ppb, bps = emit
+        sbt = torch.full(
+            (rows * heads + 2, topk * ppb), -7, dtype=torch.int32, device="cuda"
+        )
+        sctx = torch.full((rows * heads + 2,), -7, dtype=torch.int32, device="cuda")
+        kw = {
+            "block_table": bt,
+            "sparse_bt": sbt,
+            "sparse_ctx": sctx,
+            "pages_per_block": ppb,
+            "block_page_stride": bps,
+        }
+
+    def flydsl():
+        index_select_decode(
+            score, seq_lens, ids, query_len, init_blocks, local_blocks, **kw
+        )
+        return ids
+
+    _, us = run_perftest(flydsl)
+    assert torch.equal(ids[:, :rows], ref), "top-k ids differ from ATOM's selection"
+    assert (ids[:, rows:] == -7).all(), "wrote a row past the batch"
+    if emit:
+        rsbt, rsctx = ref_emit(ref, seq_lens, bt, query_len, *emit)
+        assert torch.equal(sbt[: rows * heads].cpu(), rsbt), "sparse table differs"
+        assert torch.equal(sctx[: rows * heads].cpu(), rsctx), "context differs"
+        assert (sbt[rows * heads :] == -7).all() and (sctx[rows * heads :] == -7).all()
+    return {"gfx": get_gfx_runtime(), "select us": us}
+
+
+@benchmark()
+def test_index_topk_decode_nvfp4(batch, context, query_len, heads, topk, ring, lens):
+    """The fused op end to end: its scores within the WMMA bound of the
+    reference, and its selection exactly the reference selection of those
+    scores (scores are not bitwise the reference's, so the ids are graded on
+    the op's own)."""
+    from aiter.ops.flydsl.index_score_decode import (
+        index_topk_decode_nvfp4,
+        index_topk_decode_score_plane,
+    )
+
+    sm_scale = D**-0.5
+    q, payload, scale, bt, seq_lens = make_inputs(lens, query_len, heads)
+    max_block = bt.shape[1]
+    rows = batch * query_len
+    score = index_topk_decode_score_plane(heads, rows, max_block, "cuda")
+    score.fill_(float("nan"))
+    ids = torch.full((heads, rows, topk), -7, dtype=torch.int32, device="cuda")
+    sbt = torch.full((rows * heads, topk), -7, dtype=torch.int32, device="cuda")
+    sctx = torch.full((rows * heads,), -7, dtype=torch.int32, device="cuda")
+
+    def flydsl():
+        index_topk_decode_nvfp4(
+            q, payload, scale, score, bt, seq_lens, sm_scale, query_len, ids, 1, 1,
+            sparse_bt=sbt, sparse_ctx=sctx, ring=ring,
+        )  # fmt: skip
+        return ids
+
+    _, us = run_perftest(flydsl)
+    ref, live, tol = run_torch(
+        q, payload, scale, bt, seq_lens, sm_scale, query_len, max_block
+    )
+    graded = live & (ref != float("-inf"))
+    assert (((score - ref).abs() <= tol) | ~graded).all(), "scores off the bound"
+    assert torch.equal(ids, ref_select(score, seq_lens, query_len, topk, 1, 1))
+    rsbt, rsctx = ref_emit(ids, seq_lens, bt, query_len, 1, 1)
+    assert torch.equal(sbt.cpu(), rsbt) and torch.equal(sctx.cpu(), rsctx)
+    blocks = sum(min(-(-n // PAGE), max_block) for n in lens)
+    return {"gfx": get_gfx_runtime(), "us": us, "TB/s": blocks * PAGE_BYTES / us / 1e6}
 
 
 def request_lens(batch, context, ragged):
@@ -242,43 +453,121 @@ def main():
     parser.add_argument(
         "--ragged", type=int, nargs="*", default=[0, 1], help="1: mixed lengths"
     )
+    parser.add_argument(
+        "--only",
+        choices=["score", "select", "fused"],
+        nargs="*",
+        default=["score", "select", "fused"],
+        help="which of the three tests to run",
+    )
     args = parser.parse_args()
 
-    cells = list(
-        itertools.product(
-            args.ragged, args.batch, args.context, args.rows, args.workgroups, args.ring
-        )
-    )
-    # Launch knobs off their defaults: one workgroup a 64-block window (the
-    # widest chunk), a large budget, the shortest and a long ring.
-    cells += [
-        (1, 8, 64 * 18 * PAGE, (8, 4), workgroups, ring)
-        for workgroups, ring in ((1, 4), (1, 2), (96, 6), (4096, 3))
-    ]
-    df = []
-    for (
-        ragged,
-        batch,
-        context,
-        (query_len, heads),
-        workgroups,
-        ring,
-    ) in cells:
-        df.append(
-            test_index_score_decode_nvfp4(
-                batch,
-                context,
-                query_len,
-                heads,
-                workgroups,
-                ring,
-                request_lens(batch, context, ragged),
+    if "score" in args.only:
+        cells = list(
+            itertools.product(
+                args.ragged,
+                args.batch,
+                args.context,
+                args.rows,
+                args.workgroups,
+                args.ring,
             )
         )
-    df = pd.DataFrame(df).drop(columns=["lens"], errors="ignore")
-    aiter.logger.info(
-        "index_score_decode_nvfp4 summary (markdown):\n%s", df.to_markdown(index=False)
-    )
+        # Launch knobs off their defaults: one workgroup a 64-block window (the
+        # widest chunk), a large budget, the shortest and a long ring.
+        cells += [
+            (1, 8, 64 * 18 * PAGE, (8, 4), workgroups, ring)
+            for workgroups, ring in ((1, 4), (1, 2), (96, 6), (4096, 3))
+        ]
+        # The flat plan at its widest split (even lengths, budget 1: S = 128)
+        # and past one wave of requests.
+        cells += [
+            (0, 4, 256 * PAGE, (8, 4), 1, 4),
+            (0, 4, 256 * PAGE, (8, 4), 1, 8),
+            (1, 44, 40000, (8, 4), 0, 4),
+            (0, 44, 20000, (8, 4), 1, 4),
+        ]
+        df = []
+        for (
+            ragged,
+            batch,
+            context,
+            (query_len, heads),
+            workgroups,
+            ring,
+        ) in cells:
+            df.append(
+                test_index_score_decode_nvfp4(
+                    batch,
+                    context,
+                    query_len,
+                    heads,
+                    workgroups,
+                    ring,
+                    request_lens(batch, context, ragged),
+                )
+            )
+        df = pd.DataFrame(df).drop(columns=["lens"], errors="ignore")
+        aiter.logger.info(
+            "index_score_decode_nvfp4 summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    if "select" in args.only:
+        # The selector: D's shapes, graph pads (a request shorter than its rows),
+        # rows of 0-34 blocks (around a lane's and a wave's width), the widest
+        # plane it serves at top-16 (8192 blocks, the winners in the last
+        # columns when ascending), every score kind, top-k 16 and an odd 13, the
+        # emit off / page-128 / page-16.
+        edges = [n * PAGE + 7 for n in (0, 1, 15, 16, 17, 31, 32, 33)]
+        df = []
+        for batch, context in (
+            (16, 88000),
+            (16, 600000),
+            (3, 1000),
+            (5, 300),
+            (8, 34 * PAGE),
+            (2, 8192 * PAGE),
+        ):
+            lens = request_lens(batch, context, 1)
+            if batch == 8:
+                lens = edges
+            lens[-1] = 0  # a graph pad request
+            for kind, (topk, init, local), emit in itertools.product(
+                ("random", "ties", "specials", "ascending", "constant"),
+                ((16, 1, 1), (16, 0, 0), (13, 2, 3)),
+                (None, (1, 1), (8, 16)),
+            ):
+                df.append(
+                    test_index_select_decode(
+                        batch, context, 8, 4, topk, init, local, kind, emit, lens
+                    )
+                )
+        df = pd.DataFrame(df).drop(columns=["lens"], errors="ignore")
+        aiter.logger.info(
+            "index_select_decode summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+
+    if "fused" in args.only:
+        df = []
+        for batch, context, ragged in ((15, 88000, 0), (16, 150000, 1), (4, 50000, 1)):
+            for ring in (4, 6):
+                df.append(
+                    test_index_topk_decode_nvfp4(
+                        batch,
+                        context,
+                        8,
+                        4,
+                        16,
+                        ring,
+                        request_lens(batch, context, ragged),
+                    )
+                )
+        df = pd.DataFrame(df).drop(columns=["lens"], errors="ignore")
+        aiter.logger.info(
+            "index_topk_decode_nvfp4 summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
