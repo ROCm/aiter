@@ -131,7 +131,7 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_mla_nvfp4": {
+    "module_mla_nvfp4_v7": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_nvfp4.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/quantize.cuh'"
@@ -140,6 +140,23 @@
         "flags_extra_hip": ["'-DENABLE_CK=0'", "'-ffp-contract=off'"],
         "extra_ldflags": "None",
         "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_nvfp4_decode_prep": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_nvfp4_decode_prep_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/decode_prep.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
@@ -876,6 +893,25 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_moe_nvfp4": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_entry.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-gpu-flush-denormals-to-zero'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/gen_instances.py --working_path {{}}'",
+        "is_experimental": "True"
+    },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu'",
@@ -1245,6 +1281,19 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/dsv4_rotate_quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/dsv4_rotate_quant.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_kpool_compress": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kpool_compress_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/kpool_compress.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -1995,7 +2044,8 @@
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'",
-            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
+            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' ",
+            "'-DAITER_HIPBLASLT_HAS_W4A16=1' if check_hipblaslt_has_w4a16() else ''"
         ],
         "extra_ldflags": "['-lhipblaslt', '-lhipblas']",
         "extra_include": [
@@ -2227,7 +2277,9 @@
     "module_mhc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gfx950.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -2360,6 +2412,23 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_fp8_mqa_logits": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fp8_mqa_logits_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_logits.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-honor-nans'",
+            "'-fno-slp-vectorize'",
+            "'-mllvm -disable-machine-sink'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

@@ -9,10 +9,24 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
 from .common import _ptr
+
+_SORTED_SUM_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_sorted_sum",
+    sources=[
+        "kernels/moe_gemm_2stage/gfx9_fp8",
+    ],
+    # Read by common.py.
+    env=[
+        "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+        "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+    ],
+)
 
 
 @functools.cache
@@ -81,6 +95,8 @@ def sorted_sum(TOPK, N, output_padding_bytes=0):
         sorted_sum_kernel(loc_ids, A, B).launch(
             grid=(batch_size, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _SORTED_SUM_AOT_CACHE, (TOPK, N, output_padding_bytes))
 
     def callable(
         loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int

@@ -7,7 +7,12 @@
 set -euo pipefail
 
 CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Checks}"
+# Two separate budgets, because "the run is not there" and "the run is still
+# going" are not the same situation. The first is a lookup that should not take
+# long; the second is just waiting, and on a busy day the queue alone can hold
+# a run past any short budget.
 MAX_RETRIES="${MAX_RETRIES:-5}"
+MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-2700}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
 
@@ -108,12 +113,25 @@ print_failed_jobs() {
     || true
 }
 
-for i in $(seq 1 "${MAX_RETRIES}"); do
-  echo "Attempt ${i}: Locating ${CHECKS_WORKFLOW_NAME} workflow run..."
+DEADLINE=$(( $(date +%s) + MAX_WAIT_SECONDS ))
+LOCATE_ATTEMPTS=0
+RUN_ID=""
 
-  RUN_ID="$(find_checks_run_id || true)"
+while true; do
+  FOUND="$(find_checks_run_id || true)"
+  if [ -n "${FOUND}" ]; then
+    RUN_ID="${FOUND}"
+  fi
+
   if [ -z "${RUN_ID}" ]; then
-    echo "Attempt ${i}: Matching ${CHECKS_WORKFLOW_NAME} run not found yet."
+    # Still looking. This budget is small on purpose: a missing run usually
+    # means the event never started one, not that it is slow.
+    LOCATE_ATTEMPTS=$(( LOCATE_ATTEMPTS + 1 ))
+    echo "Attempt ${LOCATE_ATTEMPTS}: matching ${CHECKS_WORKFLOW_NAME} run not found yet."
+    if [ "${LOCATE_ATTEMPTS}" -ge "${MAX_RETRIES}" ]; then
+      echo "Could not locate a ${CHECKS_WORKFLOW_NAME} run after ${MAX_RETRIES} attempts. Exiting workflow."
+      exit 1
+    fi
   else
     STATE="$(fetch_run_state "${RUN_ID}" || true)"
     STATUS="${STATE%%$'\t'*}"
@@ -121,7 +139,7 @@ for i in $(seq 1 "${MAX_RETRIES}"); do
     # If STATE is unexpected treat that as "no conclusion yet".
     [ "${CONCLUSION}" = "${STATE}" ] && CONCLUSION=""
 
-    echo "Attempt ${i}: run ${RUN_ID} status=${STATUS:-unknown} conclusion=${CONCLUSION:-<none>}"
+    echo "Run ${RUN_ID} status=${STATUS:-unknown} conclusion=${CONCLUSION:-<none>}"
 
     if [ "${STATUS}" = "completed" ]; then
       if [ "${CONCLUSION}" = "success" ]; then
@@ -133,11 +151,15 @@ for i in $(seq 1 "${MAX_RETRIES}"); do
       print_failed_jobs "${RUN_ID}"
       exit 78  # 78 = neutral/skip
     fi
+
+    # Located and still running: waiting is the expected state, not a fault.
+    REMAINING=$(( DEADLINE - $(date +%s) ))
+    if [ "${REMAINING}" -le 0 ]; then
+      echo "Run ${RUN_ID} is still ${STATUS:-unknown} after ${MAX_WAIT_SECONDS}s. Exiting workflow."
+      exit 1
+    fi
+    echo "Pre-checks not finished yet, retrying in ${RETRY_INTERVAL_SECONDS}s (${REMAINING}s left)..."
   fi
 
-  echo "Pre-checks not ready yet, retrying in ${RETRY_INTERVAL_SECONDS}s..."
   sleep "${RETRY_INTERVAL_SECONDS}"
 done
-
-echo "Failed to read pre-checks status after ${MAX_RETRIES} attempts. Exiting workflow."
-exit 1

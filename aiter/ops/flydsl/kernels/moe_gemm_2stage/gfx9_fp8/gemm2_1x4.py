@@ -358,7 +358,10 @@ def _build_moe_gemm2_1x4_n256(
                 )
                 scale_lds_logical = fx.make_view(
                     fx.get_iter(scale_lds),
-                    fx.make_layout(((4, 2, 2, 4, 4), 1), ((1, 16, 32, 64, 4), 0)),
+                    # N spans one whole MMA N tile (16) with stride 0: every column
+                    # reads the same per-channel scale. FlyDSL >= 0.5.1 rejects an N
+                    # extent that is not a multiple of the tile.
+                    fx.make_layout(((4, 2, 2, 4, 4), 16), ((1, 16, 32, 64, 4), 0)),
                 )
             scale_lds_copy_atom = down_ops.get_universal_copy_atom(fx.Float32, 128)
 
