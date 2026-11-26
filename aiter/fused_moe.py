@@ -3447,10 +3447,15 @@ def _mxfp4_a4w4_stage2_fw(
     kernelName2="",
     reverse_sorted=None,
     use_valid_token_count=False,
+    scatter_intermediate=None,
     expert_mask=None,
     topk_ids=None,
     **_kwargs,
 ):
+    """``scatter_intermediate``: see ``_flydsl_v2_stage2_wrapper``. The native
+    MXMOE GEMM2 ignores it and returns the complete ``moe_out``."""
+    if scatter_intermediate is not None:
+        scatter_intermediate.clear()  # no items of an earlier call
 
     device = inter_states.device
     # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
@@ -3502,6 +3507,7 @@ def _mxfp4_a4w4_stage2_fw(
             topk_ids=topk_ids,
             reverse_sorted=reverse_sorted,
             use_valid_token_count=use_valid_token_count,
+            scatter_intermediate=scatter_intermediate,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -3598,8 +3604,30 @@ def _flydsl_v2_stage2_wrapper(
     reverse_sorted=None,
     use_valid_token_count=False,
     per_slot_out=None,
+    scatter_intermediate=None,
     **_kwargs,
 ):
+    """``scatter_intermediate``: None (the default) or a dict. With a dict and the
+    bf16 ``scatter`` epilogue, the wrapper does not call
+    ``mxfp4_moe_scatter_reduce`` and does not write ``out``. It puts these items
+    in the dict, so that the caller can do the top-k combine, for example in
+    ``fused_moe_combine_reduce_scatter``:
+
+    - ``inter``: [max_sorted, model_dim] bf16, one unweighted row for each sorted
+      position. It is a stage-2 scratch buffer: use it before the next stage-2
+      call on this stream.
+    - ``reverse_sorted``: [M * topk] int32, the sorted position of each (token, k).
+    - ``sorted_weights``: fp32, the weight of each sorted position.
+    - ``topk``, ``M``, ``model_dim`` and ``MB``.
+
+    With another epilogue, the dict is empty and ``out`` is complete. The wrapper
+    clears the dict first, so a caller can use one dict for all calls.
+    ``per_slot_out`` gives weighted per-(token, slot) rows of the ``reduce``
+    epilogue instead; do not give both."""
+    if scatter_intermediate is not None:
+        if per_slot_out is not None:
+            raise ValueError("give per_slot_out or scatter_intermediate, not both")
+        scatter_intermediate.clear()  # no items of an earlier call
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
         _validate_v2_gemm2_dtypes,
         mxfp4_moe_gemm2,
@@ -3790,6 +3818,17 @@ def _flydsl_v2_stage2_wrapper(
             NE=num_experts,
             TOPK=topk,
             D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
+    if epilog == "scatter" and scatter_intermediate is not None:
+        scatter_intermediate.update(
+            inter=target,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            topk=topk,
+            M=token_num,
+            model_dim=model_dim_runtime,
             MB=bm,
         )
         return out
@@ -6285,7 +6324,8 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    # Fused-quant stage1 kernels also allocate their own output.
+    if _is_a16w4_port or metadata.fuse_quant:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -6408,7 +6448,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if metadata.fuse_quant else a2,
+        a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
