@@ -167,7 +167,14 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
     candidates = {  # pa_decode: the per-token path the reuse kernel replaces
         "pa_decode": lambda o: pa_decode(o, *pa_args, **pa_kw),
         "reuse_v1": lambda o: reuse(o, *args, **kv),
-        "reuse_v2": lambda o: reuse(o, *args, tile_rows=2, impl="v2", **kv),  # ATOM's
+        "reuse_v2": lambda o: reuse(o, *args, tile_rows=2, impl="v2", **kv),
+        # v3 itself (these grids are under its v2 fallback threshold)
+        "reuse_v3": lambda o: reuse(
+            o, *args, tile_rows=8, impl="v3", v3={"min_ctas": 0}, **kv
+        ),
+        "reuse_v3_tq4": lambda o: reuse(
+            o, *args, tile_rows=4, impl="v3", v3={"min_ctas": 0}, **kv
+        ),
     }
     ref, ret = run_torch(*host), {}
     for name, fn in candidates.items():
@@ -203,9 +210,10 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
 
 @benchmark()
 def bench_m31_prefill(case):
-    """One M3.1 chunk as ATOM's P calls the kernel (``_flydsl_attention``):
-    pa_sparse_prefill_nvfp4_v2_..._tq2_rb0_qr_vw_w3 (impl v2, tile_rows 2,
-    BF16 output) over 4 interleaved KV heads, every row against FP32."""
+    """One M3.1 chunk as ATOM's P calls the kernel (``_flydsl_attention``,
+    ``M31_PREFILL_CALL``, BF16 output) over 4 interleaved KV heads, every row
+    against FP32."""
+    from aiter.ops.flydsl.pa_sparse_prefill import M31_PREFILL_CALL
     from aiter.ops.flydsl.pa_sparse_prefill import pa_sparse_prefill_nvfp4 as reuse
 
     requests, trace_us = M31_CASES[case]
@@ -215,7 +223,7 @@ def bench_m31_prefill(case):
     out = torch.full_like(q, float("nan"))  # ATOM's output, a view like q
     args = (q, kp, vp, ks, vs, table, ctx, SCALE)
     _, us = run_perftest(
-        reuse, out, *args, kv_heads=M31_KV_HEADS, tile_rows=2, impl="v2",
+        reuse, out, *args, kv_heads=M31_KV_HEADS, **M31_PREFILL_CALL,
         num_rotate_args=1,
     )  # fmt: skip
     err = checkAllclose(

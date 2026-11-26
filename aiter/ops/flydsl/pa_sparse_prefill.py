@@ -29,7 +29,17 @@ from .kernels.pa_sparse_prefill_nvfp4_v2 import (
     TILE_ROWS as TILE_ROWS_V2,
     compile_pa_sparse_prefill_nvfp4_v2,
 )
+from .kernels.pa_sparse_prefill_nvfp4_v3 import (
+    TILE_ROWS as TILE_ROWS_V3,
+    compile_pa_sparse_prefill_nvfp4_v3,
+)
 from .kernels.tensor_shim import _run_compiled, ptr_arg
+
+# The arguments MiniMax-M3.1's prefill (ATOM's P path) passes after kv_heads.
+M31_PREFILL_CALL = {"impl": "v3", "tile_rows": 8}
+# impl "v3" runs v2 (tile_rows 2) on grids of fewer v3 CTAs than this, on one KV
+# head and for the MXFP8 output.
+V3_MIN_CTAS = 4096
 
 
 def pa_sparse_prefill_nvfp4_supported(query, key_cache, table) -> bool:
@@ -70,6 +80,7 @@ def pa_sparse_prefill_nvfp4(
     quantized_pad_rows: int = 0,
     impl: str = "v1",
     v2: dict | None = None,
+    v3: dict | None = None,
 ) -> None:
     """Sparse prefill attention of every sequence over its compacted page table.
 
@@ -88,8 +99,14 @@ def pa_sparse_prefill_nvfp4(
     MXFP8 input instead of ``output`` (left unwritten), bit for bit the separate
     group-32 quant of the BF16 rows; the padded rows get FP8 zeros and unit
     scales. One KV head.
+
+    ``impl``: "v1", "v2" (``v2``: its compile options) or "v3" (the tile's rows
+    split over waves, ``tile_rows`` 4 or 8; ``v3``: its compile options and
+    ``min_ctas``, default ``V3_MIN_CTAS``). "v3" runs "v2" at ``tile_rows`` 2 on
+    one KV head, for the MXFP8 output and on grids under ``min_ctas`` v3 CTAs.
     """
-    if tile_rows not in (TILE_ROWS_V2 if impl == "v2" else TILE_ROWS):
+    served = {"v2": TILE_ROWS_V2, "v3": TILE_ROWS_V3}.get(impl, TILE_ROWS)
+    if tile_rows not in served:
         raise ValueError(f"tile_rows {tile_rows} is not served by impl {impl}")
     seqs = query.shape[0]
     dev = query.device
@@ -166,7 +183,22 @@ def pa_sparse_prefill_nvfp4(
             )
     if seqs == 0 and quant_rows == 0:
         return
-    if impl == "v2":
+    v3 = dict(v3 or {})
+    min_ctas = v3.pop("min_ctas", V3_MIN_CTAS)
+    if impl == "v3" and (
+        kv_heads == 1
+        or quant
+        or -(-seqs // (kv_heads * tile_rows)) * kv_heads < min_ctas
+    ):
+        impl, tile_rows, v2 = "v2", 2, None
+    if impl == "v3":
+        compiled = compile_pa_sparse_prefill_nvfp4_v3(
+            tile_rows=tile_rows,
+            softmax_scale=softmax_scale,
+            nvfp4_buffers=nvfp4_buffers,
+            **v3,
+        )
+    elif impl == "v2":
         compiled = compile_pa_sparse_prefill_nvfp4_v2(
             tile_rows=tile_rows,
             softmax_scale=softmax_scale,

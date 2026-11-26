@@ -104,6 +104,182 @@ def _wmma_scale16_32x16(a, b, scale_a, scale_b):
     )
 
 
+def _query_block(mem, values):
+    block = values.to(fx.Float32)
+    amax = fx.math.absf(block).reduce(ReductionOp.MAX)
+    exponent = ((_f32_bits(amax) >> 23) & 0xFF) - 127
+    residual = block
+    out = []
+    for i in range_constexpr(QUERY_TERMS):
+        k = fx.max(fx.min(exponent - (7 + 4 * i), fx.Int32(120)), fx.Int32(-120))
+        scaled = residual * fx.Vector.from_elements(
+            [_pow2(-k)], dtype=fx.Float32
+        ).broadcast_to(16)
+        words = []
+        backs = []
+        for h in range_constexpr(2):
+            pair = mem.fp8(
+                fx.Vector.from_elements(
+                    [scaled[h * 8 + e] for e in range_constexpr(8)],
+                    dtype=fx.Float32,
+                )
+            )
+            words.extend([pair[0], pair[1]])
+            if const_expr(i + 1 < QUERY_TERMS):
+                backs.append(
+                    fx.Vector(
+                        fx.rocdl.cvt_scale_pk8_f32_fp8(
+                            T.vec(8, T.f32),
+                            fx.as_ir_value(
+                                fx.Vector.from_elements(
+                                    [pair[0], pair[1]], dtype=fx.Int32
+                                )
+                            ),
+                            fx.as_ir_value(fx.Int32(0x7F7F7F7F)),
+                            0,
+                        )
+                    )
+                )
+        out.append((words, _e8m0_pow2(k)))
+        if const_expr(i + 1 < QUERY_TERMS):
+            quantized = fx.Vector.from_elements(
+                [backs[0][e] for e in range_constexpr(8)]
+                + [backs[1][e] for e in range_constexpr(8)],
+                dtype=fx.Float32,
+            )
+            residual = residual - quantized * fx.Vector.from_elements(
+                [_pow2(k)], dtype=fx.Float32
+            ).broadcast_to(16)
+    return out
+
+
+def _query_scales(half, scale_words):
+    result = []
+    lower = half == 0
+    for mine in scale_words:
+        other = fx.Int32(mine.shuffle_xor(16, WAVE))
+        even = lower.select(mine, other)
+        odd = lower.select(other, mine)
+        lo = (
+            (even & 0xFF)
+            | ((odd & 0xFF) << 8)
+            | ((even & 0xFF00) << 8)
+            | ((odd & 0xFF00) << 16)
+        )
+        hi = (
+            ((even >> 16) & 0xFF)
+            | (((odd >> 16) & 0xFF) << 8)
+            | (((even >> 24) & 0xFF) << 16)
+            | (((odd >> 24) & 0xFF) << 24)
+        )
+        result.append(
+            fx.Vector.from_elements([lo, hi], dtype=fx.Int32).bitcast(fx.Int64)[0]
+        )
+    return result
+
+
+def _query_terms(mem, loaded, half):
+    operands = [[] for _ in range_constexpr(QUERY_TERMS)]
+    scale_words = [fx.Int32(0) for _ in range_constexpr(QUERY_TERMS)]
+    for j in range_constexpr(4):
+        for i, (words, code) in enumerate(_query_block(mem, loaded[j])):
+            operands[i].extend(words)
+            scale_words[i] = scale_words[i] | (code << (8 * j))
+    scales = _query_scales(half, scale_words)
+    return [
+        (fx.Vector.from_elements(operands[i], dtype=fx.Int32), scales[i])
+        for i in range_constexpr(QUERY_TERMS)
+    ]
+
+
+def _rows_operand(load, base, plane, scale_plane, n, lane16, half):
+    token = n * 16 + lane16
+    row = base + plane + token * _ROW + half * 16
+    words = []
+    for j in range_constexpr(2):
+        frag = load(row + j * 32, fx.Int32, 4)
+        words.extend([frag[i] for i in range_constexpr(4)])
+    sc = load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
+    return fx.Vector.from_elements(words, dtype=fx.Int32), sc
+
+
+def _selector_operand(lane16):
+    one = fx.Int32(2) << ((lane16 % 8) * 4)
+    even = (lane16 < 8).select(one, fx.Int32(0))
+    odd = (lane16 >= 8).select(one, fx.Int32(0))
+    return fx.Vector.from_elements([even, odd] * 4, dtype=fx.Int32)
+
+
+def _bound_mask(bound, warp, half):
+    out = []
+    for i in range_constexpr(16):
+        n, r = i // 8, i % 8
+        token = warp * _TOKENS + n * 16 + half * 8 + r
+        out.append((token < bound).select(fx.Float32(0.0), fx.Float32(float("-inf"))))
+    return fx.Vector.from_elements(out, dtype=fx.Float32)
+
+
+def _qk(q, k_tiles):
+    """Raw scores (16 a lane: tokens 8 half + r of both 16-token tiles)."""
+    raw = []
+    for n in range_constexpr(2):
+        k_rows, k_scale = k_tiles[n]
+        s = fx.Vector.filled(8, 0.0, fx.Float32)
+        for operand, qscale in q:
+            s = _wmma_scale16(
+                k_rows, operand, s, k_scale, qscale, "fp4_e2m1", "fp8_e4m3", "e8"
+            )
+        raw.extend([s[r] for r in range_constexpr(8)])
+    return fx.Vector.from_elements(raw, dtype=fx.Float32)
+
+
+def _head_max(raw, unit):
+    """This lane's head maximum over the wave's 32 tokens, in log2 units."""
+    m = raw.reduce(ReductionOp.MAX)
+    m = fx.maxnumf(m, m.shuffle_xor(16, WAVE))
+    return m * fx.Float32(unit)
+
+
+def _rescale(acc, corr):
+    scaled = fx.Vector.from_elements(
+        [acc[b][e] for b in range_constexpr(8) for e in range_constexpr(8)],
+        dtype=fx.Float32,
+    ) * fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(64)
+    return [
+        fx.Vector.from_elements(
+            [scaled[b * 8 + e] for e in range_constexpr(8)], dtype=fx.Float32
+        )
+        for b in range_constexpr(8)
+    ]
+
+
+def _probs(raw, ref, unit):
+    """(BF16 P operand, its lane sum over both halves) relative to ``ref``."""
+    safe = (ref > fx.Float32(float("-inf"))).select(ref, fx.Float32(0.0))
+    p = fx.Vector(
+        fx.exp2(
+            fx.math.fma(
+                raw,
+                fx.Vector.filled(16, unit, fx.Float32),
+                fx.Vector.from_elements([-safe], dtype=fx.Float32).broadcast_to(16),
+            ),
+            fastmath="afn",
+        )
+    )
+    part = p
+    width = 16
+    while width > 2:
+        width //= 2
+        part = fx.Vector.from_elements(
+            [part[i] for i in range_constexpr(width)], dtype=fx.Float32
+        ) + fx.Vector.from_elements(
+            [part[width + i] for i in range_constexpr(width)], dtype=fx.Float32
+        )
+    total = part[0] + part[1]
+    total = total + total.shuffle_xor(16, WAVE)
+    return p.to(fx.BFloat16), total
+
+
 def kernel_name(
     tq,
     nb,
@@ -244,174 +420,6 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         buf: fx.Array[fx.Int32, lds_words, 16]
 
     unit = scale * LOG2E
-
-    def query_block(mem, values):
-        block = values.to(fx.Float32)
-        amax = fx.math.absf(block).reduce(ReductionOp.MAX)
-        exponent = ((_f32_bits(amax) >> 23) & 0xFF) - 127
-        residual = block
-        out = []
-        for i in range_constexpr(QUERY_TERMS):
-            k = fx.max(fx.min(exponent - (7 + 4 * i), fx.Int32(120)), fx.Int32(-120))
-            scaled = residual * fx.Vector.from_elements(
-                [_pow2(-k)], dtype=fx.Float32
-            ).broadcast_to(16)
-            words = []
-            backs = []
-            for h in range_constexpr(2):
-                pair = mem.fp8(
-                    fx.Vector.from_elements(
-                        [scaled[h * 8 + e] for e in range_constexpr(8)],
-                        dtype=fx.Float32,
-                    )
-                )
-                words.extend([pair[0], pair[1]])
-                if const_expr(i + 1 < QUERY_TERMS):
-                    backs.append(
-                        fx.Vector(
-                            fx.rocdl.cvt_scale_pk8_f32_fp8(
-                                T.vec(8, T.f32),
-                                fx.as_ir_value(
-                                    fx.Vector.from_elements(
-                                        [pair[0], pair[1]], dtype=fx.Int32
-                                    )
-                                ),
-                                fx.as_ir_value(fx.Int32(0x7F7F7F7F)),
-                                0,
-                            )
-                        )
-                    )
-            out.append((words, _e8m0_pow2(k)))
-            if const_expr(i + 1 < QUERY_TERMS):
-                quantized = fx.Vector.from_elements(
-                    [backs[0][e] for e in range_constexpr(8)]
-                    + [backs[1][e] for e in range_constexpr(8)],
-                    dtype=fx.Float32,
-                )
-                residual = residual - quantized * fx.Vector.from_elements(
-                    [_pow2(k)], dtype=fx.Float32
-                ).broadcast_to(16)
-        return out
-
-    def query_scales(half, scale_words):
-        result = []
-        lower = half == 0
-        for mine in scale_words:
-            other = fx.Int32(mine.shuffle_xor(16, WAVE))
-            even = lower.select(mine, other)
-            odd = lower.select(other, mine)
-            lo = (
-                (even & 0xFF)
-                | ((odd & 0xFF) << 8)
-                | ((even & 0xFF00) << 8)
-                | ((odd & 0xFF00) << 16)
-            )
-            hi = (
-                ((even >> 16) & 0xFF)
-                | (((odd >> 16) & 0xFF) << 8)
-                | (((even >> 24) & 0xFF) << 16)
-                | (((odd >> 24) & 0xFF) << 24)
-            )
-            result.append(
-                fx.Vector.from_elements([lo, hi], dtype=fx.Int32).bitcast(fx.Int64)[0]
-            )
-        return result
-
-    def query_terms(mem, loaded, half):
-        operands = [[] for _ in range_constexpr(QUERY_TERMS)]
-        scale_words = [fx.Int32(0) for _ in range_constexpr(QUERY_TERMS)]
-        for j in range_constexpr(4):
-            for i, (words, code) in enumerate(query_block(mem, loaded[j])):
-                operands[i].extend(words)
-                scale_words[i] = scale_words[i] | (code << (8 * j))
-        scales = query_scales(half, scale_words)
-        return [
-            (fx.Vector.from_elements(operands[i], dtype=fx.Int32), scales[i])
-            for i in range_constexpr(QUERY_TERMS)
-        ]
-
-    def rows_operand(load, base, plane, scale_plane, n, lane16, half):
-        token = n * 16 + lane16
-        row = base + plane + token * _ROW + half * 16
-        words = []
-        for j in range_constexpr(2):
-            frag = load(row + j * 32, fx.Int32, 4)
-            words.extend([frag[i] for i in range_constexpr(4)])
-        sc = load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
-        return fx.Vector.from_elements(words, dtype=fx.Int32), sc
-
-    def selector_operand(lane16):
-        one = fx.Int32(2) << ((lane16 % 8) * 4)
-        even = (lane16 < 8).select(one, fx.Int32(0))
-        odd = (lane16 >= 8).select(one, fx.Int32(0))
-        return fx.Vector.from_elements([even, odd] * 4, dtype=fx.Int32)
-
-    def bound_mask(bound, warp, half):
-        out = []
-        for i in range_constexpr(16):
-            n, r = i // 8, i % 8
-            token = warp * _TOKENS + n * 16 + half * 8 + r
-            out.append(
-                (token < bound).select(fx.Float32(0.0), fx.Float32(float("-inf")))
-            )
-        return fx.Vector.from_elements(out, dtype=fx.Float32)
-
-    def qk(q, k_tiles):
-        """Raw scores (16 a lane: tokens 8 half + r of both 16-token tiles)."""
-        raw = []
-        for n in range_constexpr(2):
-            k_rows, k_scale = k_tiles[n]
-            s = fx.Vector.filled(8, 0.0, fx.Float32)
-            for operand, qscale in q:
-                s = _wmma_scale16(
-                    k_rows, operand, s, k_scale, qscale, "fp4_e2m1", "fp8_e4m3", "e8"
-                )
-            raw.extend([s[r] for r in range_constexpr(8)])
-        return fx.Vector.from_elements(raw, dtype=fx.Float32)
-
-    def head_max(raw):
-        """This lane's head maximum over the wave's 32 tokens, in log2 units."""
-        m = raw.reduce(ReductionOp.MAX)
-        m = fx.maxnumf(m, m.shuffle_xor(16, WAVE))
-        return m * fx.Float32(unit)
-
-    def rescale(acc, corr):
-        scaled = fx.Vector.from_elements(
-            [acc[b][e] for b in range_constexpr(8) for e in range_constexpr(8)],
-            dtype=fx.Float32,
-        ) * fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(64)
-        return [
-            fx.Vector.from_elements(
-                [scaled[b * 8 + e] for e in range_constexpr(8)], dtype=fx.Float32
-            )
-            for b in range_constexpr(8)
-        ]
-
-    def probs(raw, ref):
-        """(BF16 P operand, its lane sum over both halves) relative to ``ref``."""
-        safe = (ref > fx.Float32(float("-inf"))).select(ref, fx.Float32(0.0))
-        p = fx.Vector(
-            fx.exp2(
-                fx.math.fma(
-                    raw,
-                    fx.Vector.filled(16, unit, fx.Float32),
-                    fx.Vector.from_elements([-safe], dtype=fx.Float32).broadcast_to(16),
-                ),
-                fastmath="afn",
-            )
-        )
-        part = p
-        width = 16
-        while width > 2:
-            width //= 2
-            part = fx.Vector.from_elements(
-                [part[i] for i in range_constexpr(width)], dtype=fx.Float32
-            ) + fx.Vector.from_elements(
-                [part[width + i] for i in range_constexpr(width)], dtype=fx.Float32
-            )
-        total = part[0] + part[1]
-        total = total + total.shuffle_xor(16, WAVE)
-        return p.to(fx.BFloat16), total
 
     @flyc.kernel(
         name=kernel_name(
@@ -751,7 +759,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         for t0 in range_constexpr(0, tq, NWARP):
             t_mine = t0 + warp
             loaded = q_loaded[t0 // NWARP]
-            terms = query_terms(mem, loaded, half)
+            terms = _query_terms(mem, loaded, half)
             if t_mine < tq:
                 for i in range_constexpr(QUERY_TERMS):
                     operand, qscale = terms[i]
@@ -785,7 +793,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 out.append((words, lds_load(at + 64, fx.Int64, 1)[0]))
             return out
 
-        selector = selector_operand(lane16)
+        selector = _selector_operand(lane16)
         zeros = fx.Vector.filled(8, 0.0, fx.Float32)
         zero_v = fx.Vector.filled(16, 0.0, fx.Float32).to(fx.BFloat16)
         initial = []
@@ -801,7 +809,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         def tail_mask(raw, bound):
             """-inf past the row's in-page bound (its tail page: rare)."""
             if (bound < hi) & (bound > lo):
-                raw = raw + bound_mask(bound, warp, half)
+                raw = raw + _bound_mask(bound, warp, half)
             return raw
 
         def rebase(ref, l, acc, m):  # noqa: E741 -- the softmax sum
@@ -817,7 +825,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     new_ref, fx.Float32(0.0)
                 )
                 corr = fx.Float32(fx.exp2(ref - safe, fastmath="afn"))
-                acc = rescale(acc, corr)
+                acc = _rescale(acc, corr)
                 l = l * corr  # noqa: E741
                 ref = new_ref
             return ref, l, acc
@@ -887,7 +895,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             base = slot_base(slot)
             bounds = bounds_of(u)
             k_tiles = [
-                rows_operand(lds_load, base, P_K, P_KS, n, lane16, half)
+                _rows_operand(lds_load, base, P_K, P_KS, n, lane16, half)
                 for n in range_constexpr(2)
             ]
             # VGPR block scales of the selector (see pa_sparse_prefill_nvfp4), built per page.
@@ -994,7 +1002,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 v_hoisted = [zero_v for _ in range_constexpr(8)]
                 if top > lo:
                     v_raw_h = [
-                        rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
+                        _rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
                         for n in range_constexpr(2)
                     ]
                     if const_expr(v_wide):
@@ -1010,7 +1018,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 if const_expr(not v_hoist):
                     # Issued first: the LDS latency hides under QK.
                     v_raw = [
-                        rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
+                        _rows_operand(lds_load, base, P_V, P_VS, n, lane16, half)
                         for n in range_constexpr(2)
                     ]
                     if const_expr(v_wide):
@@ -1020,10 +1028,10 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 raws, maxes = [], []
                 for t in ts:
                     raw = tail_mask(
-                        qk(q_resident[t] if q_regs else q_row(t), k_tiles), bounds[t]
+                        _qk(q_resident[t] if q_regs else q_row(t), k_tiles), bounds[t]
                     )
                     raws.append(raw)
-                    maxes.append(head_max(raw))
+                    maxes.append(_head_max(raw, unit))
                 cur, refs_p = [], []
                 for i, t in enumerate(ts):
                     ref, l = rows_state[i * 10], rows_state[i * 10 + 1]  # noqa: E741
@@ -1042,7 +1050,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     cur.append([ref, l, acc])
                 ps, totals = [], []
                 for i in range_constexpr(len(ts)):
-                    p, total = probs(raws[i], refs_p[i])
+                    p, total = _probs(raws[i], refs_p[i], unit)
                     ps.append(p)
                     totals.append(total)
                 accs = [cur[i][2] for i in range_constexpr(len(ts))]
