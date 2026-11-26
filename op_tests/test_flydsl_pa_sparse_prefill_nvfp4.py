@@ -231,6 +231,27 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
     return ret
 
 
+def test_v3_spread_scores(case="long", kv_heads=M31_KV_HEADS):
+    """v3 (lazy softmax reference, FP16 P) on rows whose scores span many
+    octaves: per-row query gains 2**-3 .. 2**6, from near-uniform to one-token
+    softmax, so references jump far and P runs over FP16's whole range."""
+    from aiter.ops.flydsl.pa_sparse_prefill import pa_sparse_prefill_nvfp4 as reuse
+
+    host = list(make_case(CASES[case], kv_heads))
+    g = torch.Generator().manual_seed(1)
+    gain = torch.exp2(torch.rand(host[0].shape[0], 1, 1, generator=g) * 9 - 3)
+    host[0] = (host[0].float() * gain).bfloat16()
+    q, kp, vp, ks, vs, table, ctx = (t.cuda() for t in host)
+    out = torch.full_like(q, float("nan"))
+    v3 = {"min_ctas": 0}
+    args = (q, kp, vp, ks, vs, table, ctx, SCALE)
+    reuse(out, *args, tile_rows=8, impl="v3", v3=v3, kv_heads=kv_heads)
+    err = checkAllclose(
+        run_torch(*host), out.cpu().float(), atol=3e-2, rtol=3e-2, msg="v3 spread"
+    )
+    assert err == 0, f"{case} v3 spread scores: {err:.2%} mismatched"
+
+
 @benchmark()
 def bench_m31_prefill(case):
     """One M3.1 chunk as ATOM's P calls the kernel (``_flydsl_attention``,
@@ -292,6 +313,7 @@ def main():
     rows = itertools.product(args.case, args.kv_heads)
     df = pd.DataFrame([test_pa_sparse_prefill_nvfp4(*r) for r in rows])
     aiter.logger.info("pa_sparse_prefill_nvfp4:\n%s", df.to_markdown(index=False))
+    test_v3_spread_scores()
     if args.m31:
         df = pd.DataFrame([bench_m31_prefill(c) for c in args.m31])
         aiter.logger.info(

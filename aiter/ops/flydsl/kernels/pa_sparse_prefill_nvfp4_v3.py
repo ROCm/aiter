@@ -17,7 +17,7 @@ goes to one of two phases, by how many waves select it:
   plane w of the page (K, V, K scales, V scales: one tensor DMA a page and wave),
   and a CTA barrier a page publishes the planes and frees the oldest slot. Wave
   w then dequantizes the page's V quarter w once for the CTA (the 32x16x128
-  selector WMMA, to BF16 in the PV A operand's order) into a shared V buffer,
+  selector WMMA, to FP16 in the PV A operand's order) into a shared V buffer,
   and a second barrier publishes it. Every wave passes every A page's barriers;
   it computes only the 32-token quarters its rows reach, its PV operands read
   from the shared V (V_AHEAD blocks in flight).
@@ -36,9 +36,16 @@ V planes before its barrier), so no LDS latency sits between a step's start
 and its first DMA or WMMA. A row has one owner, so the epilogue scales and
 stores without a cross-wave merge.
 
-Numerics are v2's per (row, page); a row's pages are accumulated in A-then-B
-order, so the result matches v2 to rounding. BF16 output only: the wrapper
-routes the MXFP8 output (one KV head) and small grids to v2.
+Numerics: QK is v2's (FP32 over the exact NVFP4 K and the query's two FP8
+terms); a row's pages accumulate in A-then-B order. PV takes FP16 operands
+where v2 takes BF16: NVFP4 V is exact in both, P rounds 8x finer. That margin
+pays for a lazy softmax reference: a row's moves only when a head's maximum
+passes it by ``2**REBASE_LOG2``, so the accumulator rescale (64 FP32 products a
+row) runs on a few of a row's quarters instead of about half of them. P is
+computed ``2**P_SHIFT`` above the reference: at most ``2**P_MAX_LOG2``, and
+FP16-normal down to ``2**-(14 + P_SHIFT)`` of a head's running maximum. The
+error vs FP32 is below v2's. BF16 output only: the wrapper routes the MXFP8 output (one
+KV head) and small grids to v2.
 
 ``dbg`` (benchmark decomposition only): 1 the walk and its DMA without math,
 2 prologue and epilogue only, 3 the math without DMA (barriers kept).
@@ -50,7 +57,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 
-from .pa_decode.op_gemm import Gfx1250Gemm
 from .pa_decode.op_lds import _gptr
 from .pa_sparse_prefill_nvfp4 import _bound_stride, _Lds
 from .pa_sparse_prefill_nvfp4_v2 import (
@@ -70,6 +76,7 @@ from .pa_sparse_prefill_nvfp4_v2 import (
     TOPK,
     WAVE,
     WAVE_SLOT_BYTES,
+    _attr,
     _bound_mask,
     _head_max,
     _probs,
@@ -91,7 +98,7 @@ A_SLOT = NWARP * WAVE_SLOT_BYTES
 A_PLANE_V = PAGE * _ROW
 A_PLANE_KS = 2 * PAGE * _ROW
 A_PLANE_VS = A_PLANE_KS + PAGE * _SROW
-# The shared V of an A page: BF16 in the PV A operand's VGPR order, quarter q
+# The shared V of an A page: FP16 in the PV A operand's VGPR order, quarter q
 # (32 tokens, dequantized by wave q), dims block b, lane half j at
 # q * V_QUARTER + b * 1024 + j * 512, 16 B a lane.
 V_QUARTER = _TOKENS * HEAD_DIM * 2
@@ -103,6 +110,12 @@ V_AHEAD = 5
 # in the A list and (A items) "this wave dequantizes its quarter of the V".
 _Q_SHIFT, _HEAD_SHIFT, _SLOT_SHIFT, _FRAME_SHIFT, _IDX_SHIFT = 16, 18, 19, 21, 24
 _DQ_SHIFT = 31
+# FP16 P (see the module notes): at most 2**P_MAX_LOG2, computed P_SHIFT above
+# the reference, which moves when a head's maximum passes it by 2**REBASE_LOG2
+# (0: 0.959x, 4: 0.989x, 12: 1.000x of 8's speed; paired A/B on the M3.1 chunks).
+P_MAX_LOG2 = 15
+REBASE_LOG2 = 8
+P_SHIFT = P_MAX_LOG2 - REBASE_LOG2
 
 _CACHE = {}
 
@@ -144,6 +157,22 @@ def _layout_v3(tq, nb_a, nb_b):
         "per_wave": per_wave,
         "total": (total + 15) // 16 * 16,
     }
+
+
+def _wmma_f16(a, b, acc):
+    """16x16x32 FP16 WMMA, FP32 accumulator (raw ROCDL: Gfx1250Gemm.mma takes
+    BF16 or FP8 operands only)."""
+    return fx.Vector(
+        fx.rocdl.wmma_f32_16x16x32_f16(
+            fx.Vector.make_type(8, fx.Float32),
+            fx.as_ir_value(a),
+            fx.as_ir_value(b),
+            fx.as_ir_value(acc),
+            modC=_attr("#rocdl<wmma_c_modifier none>"),
+            reuseA=False,
+            reuseB=False,
+        ).result
+    )
 
 
 def kernel_name(tq, share_min, nb_a, nb_b, waves_per_eu, dbg, tdm_fold=""):
@@ -636,12 +665,14 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             )
 
         def rebase(ref, l, acc, m):
-            """Move the reference when a head's maximum ``m`` passed it (v2's
-            rule at ``rebase_log2`` 0); ``l`` is the softmax sum."""
-            grow = m > ref
+            """Move the reference when a head's maximum ``m`` passed it by
+            2**REBASE_LOG2 (v2's ``rebase_log2`` rule). ``ref`` carries the
+            reference minus P_SHIFT, so P = 2**(score - ref) needs no shift;
+            ``l`` is the softmax sum (P's scale cancels in the epilogue)."""
+            grow = m > ref + fx.Float32(float(P_MAX_LOG2))
             moved = fx.Int32(fx.rocdl.ballot(T.i32, grow))
             if moved != fx.Int32(0):
-                new_ref = grow.select(m, ref)
+                new_ref = grow.select(m - fx.Float32(float(P_SHIFT)), ref)
                 safe = (new_ref > fx.Float32(float("-inf"))).select(
                     new_ref, fx.Float32(0.0)
                 )
@@ -660,7 +691,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 dtype=fx.Int32,
             )
             return _wmma_scale16_32x16(a32, selector, v_raw[2], sel_scale).to(
-                fx.BFloat16
+                fx.Float16
             )
 
         def tail_mask(raw, bound, quarter):
@@ -687,7 +718,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 [lo[e] for e in range_constexpr(4)]
                 + [hi[e] for e in range_constexpr(4)],
                 dtype=fx.Int32,
-            ).bitcast(fx.BFloat16)
+            ).bitcast(fx.Float16)
 
         def v_quarter(idx):
             """This wave's quarter of A page ``idx``'s V planes."""
@@ -744,7 +775,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 cur.append([ref, l, acc])
             ps, totals = [], []
             for i in range_constexpr(len(ts)):
-                p, total = _probs(raws[i], refs_p[i], unit)
+                p, total = _probs(raws[i], refs_p[i], unit, fx.Float16)
                 ps.append(p)
                 totals.append(total)
             accs = [cur[i][2] for i in range_constexpr(len(ts))]
@@ -757,7 +788,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                         vts.append(v_shared(v_src[1], b + V_AHEAD))
                     vt = vts[b]
                 for i in range_constexpr(len(ts)):
-                    accs[i][b] = Gfx1250Gemm.mma(vt, ps[i], accs[i][b], 32, True)
+                    accs[i][b] = _wmma_f16(vt, ps[i], accs[i][b])
             res = []
             for i in range_constexpr(len(ts)):
                 res.extend([cur[i][0], cur[i][1] + totals[i]])

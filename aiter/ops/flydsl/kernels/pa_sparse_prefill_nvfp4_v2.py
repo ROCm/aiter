@@ -253,8 +253,8 @@ def _rescale(acc, corr):
     ]
 
 
-def _probs(raw, ref, unit):
-    """(BF16 P operand, its lane sum over both halves) relative to ``ref``."""
+def _probs(raw, ref, unit, dtype=fx.BFloat16):
+    """(P operand in ``dtype``, its lane sum over both halves) relative to ``ref``."""
     safe = (ref > fx.Float32(float("-inf"))).select(ref, fx.Float32(0.0))
     p = fx.Vector(
         fx.exp2(
@@ -277,7 +277,7 @@ def _probs(raw, ref, unit):
         )
     total = part[0] + part[1]
     total = total + total.shuffle_xor(16, WAVE)
-    return p.to(fx.BFloat16), total
+    return p.to(dtype), total
 
 
 def kernel_name(
