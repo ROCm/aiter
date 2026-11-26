@@ -28,9 +28,29 @@ WORLD = 4
 HIDDEN = 6144
 EPS = 1e-6
 ITERS = 50  # graph replays per timing
-# One row count per tier edge: one-shot (<= 11), pull (12-287; block / wave hand-offs
-# below / above 37 and 96), streamed (288-480 at R2, 481-640 at R4).
-ROWS = (1, 8, 11, 12, 36, 37, 96, 97, 256, 287, 288, 384, 480, 481, 640)
+# One row count per tier edge: one-shot (<= 11), pull (12-256; block / wave hand-offs
+# below / above 37 and 96), streamed (257-512 at R2, 513-1024 at R4).
+ROWS = (
+    1,
+    8,
+    11,
+    12,
+    36,
+    37,
+    96,
+    97,
+    256,
+    257,
+    287,
+    288,
+    384,
+    480,
+    512,
+    513,
+    640,
+    768,
+    1024,
+)
 
 
 def _reference(xs, residual, weight, eps):
@@ -99,7 +119,7 @@ def _worker(rank, port):
                 assert not eng.accepts(x, r, weight, gemma_norm=False)
                 out, res_out = eng.allreduce_rmsnorm(x, r, weight, EPS, gemma_norm=True)
             graphs.append((rows, x, r, graph, out, res_out))
-        too_many = _data(641, 1, rank, device)
+        too_many = _data(1025, 1, rank, device)
         # destinations the kernels cannot write correctly are declined, not launched
         x8, r8 = _data(8, 1, rank, device), _data(8, 2, rank, device)
         other = torch.device("cuda", (rank + 1) % WORLD)

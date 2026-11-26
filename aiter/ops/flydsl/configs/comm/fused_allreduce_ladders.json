@@ -270,6 +270,21 @@
             {"min_bytes": "48 MiB", "super_tile": 32, "grid_cap": 128}
           ]
         }
+      },
+      "pull": {
+        "_comment": "Exact bf16 Gemma all-reduce + RMSNorm on registered graph inputs (pull_allreduce_rmsnorm), rows of 6144 bf16 (12288 B). Fitted on MI355X TP4 by op_tests/multigpu_tests/bench_fused_ar_rms_gemma.py (graph replay, max over ranks, ABAB; table in docs/flydsl_pull_ar_m31.md): one-shot with acks 1-11 rows, one-row pull 12-256 (per-wave hand-offs 37-96), streamed with the weight hoisted at 2 rows per workgroup 257-512 and at 4 above. The one-row kernels need every workgroup resident (they hang above ~640 rows): the engine refuses a ladder that reaches them there.",
+        "hidden": {
+          "6144": {
+            "rungs": [
+              {"min_bytes": 0, "kernel": "oneshot"},
+              {"min_bytes": 147456, "kernel": "pull"},
+              {"min_bytes": 454656, "kernel": "pull", "wave": true},
+              {"min_bytes": 1191936, "kernel": "pull"},
+              {"min_bytes": 3158016, "kernel": "stream", "rows_per_wg": 2},
+              {"min_bytes": 6303744, "kernel": "stream", "rows_per_wg": 4}
+            ]
+          }
+        }
       }
     },
     {

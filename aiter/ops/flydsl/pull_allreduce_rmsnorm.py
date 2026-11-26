@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 
 """Host side of the ``pull`` schedule of ``FlyQuickAllReduceRMSNorm``: bf16 all-reduce + residual add + Gemma
-RMSNorm on registered CUDA-graph inputs (TP4, gfx950, hidden 6144, 1-640 rows).
+RMSNorm on registered CUDA-graph inputs (TP4, gfx950, hidden 6144).
 
 ``PullAllReduceRMSNorm`` is what ``FlyQuickAllReduceRMSNorm(algorithm="pull")`` delegates to. Its wire is plain bf16
 rows read in place, so it has no codec and no super-tile ladder; the ranks exchange two things instead:
@@ -15,7 +15,10 @@ rows read in place, so it has no codec and no super-tile ladder; the ranks excha
   ``CustomAllreduce.capture()``; calls outside a registered capture are declined (``accepts``) and the caller's next
   backend serves them.
 
-The tiers (rows, graphs only) and the numerics follow amd-kernels' ``StagedArNormComm`` registered tiers
+Which payloads it serves and which kernel serves each is not decided here: the payload window is the ``pull`` window
+of the fused policy row (``allreduce_policy.FUSED_FAMILY_POLICIES``, ``AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES``) and
+the kernel of each payload is a rung of the ``pull`` ladder of the width (``fused_allreduce_ladders.json``). The
+kernels and the numerics follow amd-kernels' ``StagedArNormComm`` registered tiers
 (``allreduce_add_rmsnorm/staged_host.py`` and ``host.py``): the residual output equals AITER's two-stage fp32 rank sum
 bit for bit except a rare fp32 summation-order difference, and the norm output matches ``gemma_add_rmsnorm`` (Triton's
 ``tl.sum`` order).
@@ -33,6 +36,7 @@ import torch
 import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
+from . import allreduce_policy as policy
 from .comm_collectives_host_shared import (
     _cuda_index,
     _validate_ipc_process_group,
@@ -49,23 +53,11 @@ logger = logging.getLogger("aiter")
 
 WORLD = K.WORLD
 HIDDEN = K.H
-#: Rows the registered tiers serve. Above it the streamed tiers (batched handshakes, lossless coded all-gather) of
-#: amd-kernels apply; they are not part of this schedule yet and the caller's next backend serves them.
-MAX_ROWS = 640
+ROW_BYTES = 2 * HIDDEN
+#: Rows the flag tables of the kernels hold: the physical bound, whatever the policy window says.
+MAX_ROWS = K.MAX_ROWS
 #: Captured calls the address table holds.
 MAX_ENTRIES = 1 << 15
-
-# Row tiers, measured in amd-kernels (graphs of >= 64 calls, max over ranks) on TP4 MI355X.
-ONESHOT_ACK_MAX_ROWS = 11  # the one-shot with read acks wins up to here
-WAVE_HANDOFF_ROWS = (
-    37,
-    96,
-)  # per-wave hand-offs of the pull kernel win here and above ...
-WAVE_HANDOFF_ABOVE = 256  # ... this row count
-STREAM_MIN_ROWS = (
-    288  # the streamed pull kernel reads the registered inputs in place from here
-)
-STREAM_R4_MIN_ROWS = 481  # rows per workgroup: 2 up to 480 rows, 4 up to MAX_ROWS
 
 
 def _f32_bits(v: float) -> int:
@@ -89,24 +81,11 @@ def _stream_kernel(device: int, rpw: int, hoist: bool):
     return K.make_stream_pull_kernel(rpw, hoist)
 
 
-def tier_name(rows: int) -> str:
+def rung_name(rung: policy.FusedPullRung) -> str:
     return "_".join(
         str(k).lower() if not isinstance(k, bool) else ("wave" if k else "block")
-        for k in tier(rows)
+        for k in rung.cfg
     )
-
-
-def tier(rows: int) -> tuple:
-    """The kernel (key for the ``_*_kernel`` factories) that serves *rows*."""
-    if rows <= ONESHOT_ACK_MAX_ROWS:
-        return ("oneshot",)
-    if rows < STREAM_MIN_ROWS:
-        wave = (
-            WAVE_HANDOFF_ROWS[0] <= rows <= WAVE_HANDOFF_ROWS[1]
-            or rows > WAVE_HANDOFF_ABOVE
-        )
-        return ("pull", wave)
-    return ("stream", 2 if rows < STREAM_R4_MIN_ROWS else 4, True)
 
 
 class _IpcRegistry:
@@ -148,13 +127,31 @@ class _IpcRegistry:
 
 
 class PullAllReduceRMSNorm:
-    """TP4 bf16 all-reduce + residual add + Gemma RMSNorm of 1-``MAX_ROWS`` rows of 6144, on graph-registered inputs.
+    """TP4 bf16 all-reduce + residual add + Gemma RMSNorm of rows of 6144, on graph-registered inputs.
+
+    *window* (``policy.Window``, payload bytes) is where the engine serves and *ladders* maps a hidden width to its
+    ``policy.FusedPullRung`` ladder, both from the fused policy (``allreduce_policy``): this class has no thresholds of
+    its own, only the physical bound ``MAX_ROWS`` of the kernels' flag tables.
 
     Construction is a collective (IPC handle exchange of one flag buffer per rank). ``capture()`` wraps every graph
     capture on every rank. ``accepts`` says whether a call is served; ``allreduce_rmsnorm`` raises when it is not.
     """
 
-    def __init__(self, *, group, device, rank: int, world_size: int):
+    def __init__(
+        self, *, group, device, rank: int, world_size: int, window, ladders: dict
+    ):
+        if window is None or window.is_empty:
+            raise ValueError("the pull window is empty: nothing to serve")
+        # The kernels are built for one width; a ladder for another one has nothing to run on.
+        self._ladders = {
+            int(h): tuple(r) for h, r in ladders.items() if int(h) == HIDDEN
+        }
+        if not self._ladders:
+            raise ValueError(f"no pull ladder for hidden={HIDDEN}")
+        self.window = window
+        self.max_rows = min(MAX_ROWS, window.inclusive_range()[1] // ROW_BYTES)
+        for ladder in self._ladders.values():
+            self._check_ladder(ladder)
         if int(world_size) != WORLD:
             raise ValueError(f"the pull schedule is TP{WORLD} only, got TP{world_size}")
         _validate_ipc_process_group(
@@ -219,6 +216,24 @@ class PullAllReduceRMSNorm:
             self.close()
             raise error or RuntimeError("a peer rank failed to set up the pull engine")
 
+    def _check_ladder(self, ladder) -> None:
+        """Refuse a ladder that runs a kernel on rows it is not known to survive:
+        the one-row-per-workgroup kernels hang when their grid cannot be
+        resident (``policy.PULL_KERNEL_MAX_ROWS``), and a hang inside a graph
+        replay cannot be recovered."""
+        first = max(1, -(-self.window.min // ROW_BYTES))
+        for i, rung in enumerate(ladder):
+            lo = max(first, -(-rung.min_bytes // ROW_BYTES))
+            hi = self.max_rows
+            if i + 1 < len(ladder):
+                hi = min(hi, -(-ladder[i + 1].min_bytes // ROW_BYTES) - 1)
+            cap = policy.PULL_KERNEL_MAX_ROWS[rung.kernel]
+            if lo <= hi and hi > cap:
+                raise ValueError(
+                    f"pull ladder: the {rung.kernel} kernel serves rows {lo}..{hi} "
+                    f"but is only known to run to {cap} rows"
+                )
+
     # -- registration --------------------------------------------------------
 
     @contextlib.contextmanager
@@ -280,23 +295,31 @@ class PullAllReduceRMSNorm:
 
     # -- selection -----------------------------------------------------------
 
-    @staticmethod
-    def tier_name(rows: int) -> str:
-        return tier_name(rows)
+    def rung(self, rows: int) -> policy.FusedPullRung:
+        """The rung of the ladder that runs *rows* rows."""
+        return policy.select_rung(self._ladders[HIDDEN], rows * ROW_BYTES)
 
-    @staticmethod
-    def supports_hidden(hidden: int) -> bool:
-        return int(hidden) == HIDDEN
+    def tier_name(self, rows: int) -> str:
+        return rung_name(self.rung(rows))
+
+    def supports_hidden(self, hidden: int) -> bool:
+        return int(hidden) in self._ladders
 
     def accepts(self, inp, residual_in, weight, out=None, residual_out=None) -> bool:
-        """Whether this call is served: registered graph capture, bf16 [rows, 6144], 1..MAX_ROWS rows, a contiguous
+        """Whether this call is served: registered graph capture, bf16 [rows, 6144], a payload inside the window, a contiguous
         input and residual rows of 16-byte multiples. Never raises."""
         if not (self._capturing and torch.cuda.is_current_stream_capturing()):
             return False
         if len(self._inputs) >= MAX_ENTRIES:
             # the address table is full: the caller's next backend serves it
             return False
-        if inp.dim() != 2 or inp.shape[1] != HIDDEN or not 0 < inp.shape[0] <= MAX_ROWS:
+        if (
+            inp.dim() != 2
+            or inp.shape[1] != HIDDEN
+            or not 0 < inp.shape[0] <= self.max_rows
+        ):
+            return False
+        if not self.window.contains(inp.shape[0] * ROW_BYTES):
             return False
         for t in (inp, residual_in, weight):
             if t.dtype is not torch.bfloat16 or t.device.index != self._device_index:
@@ -333,7 +356,7 @@ class PullAllReduceRMSNorm:
                 return False
         if not launcher_loaded(self._launcher(rows)[0]):
             return False  # not preloaded: a capture cannot JIT-compile
-        if rows <= ONESHOT_ACK_MAX_ROWS:
+        if self.rung(rows).kernel == "oneshot":
             # the one-shot acks after the norm stores start: an output over the input would race the readers
             lo, hi = inp.data_ptr(), inp.data_ptr() + inp.numel() * inp.element_size()
             for t in (out, residual_out):
@@ -347,7 +370,7 @@ class PullAllReduceRMSNorm:
     # -- launch --------------------------------------------------------------
 
     def _launcher(self, rows: int):
-        key = tier(rows)
+        key = self.rung(rows).cfg
         if key[0] == "oneshot":
             return _oneshot_kernel(self._device_index), K.ACK_OFF, 0
         if key[0] == "pull":
@@ -381,14 +404,21 @@ class PullAllReduceRMSNorm:
         compile). Local to the rank; no collective."""
         if not self.supports_hidden(hidden):
             raise ValueError(f"the pull schedule serves hidden={HIDDEN}, got {hidden}")
-        lo_rows, hi_rows = 1, MAX_ROWS
+        lo_rows, hi_rows = 1, self.max_rows
         if payload_range is not None:
-            row_bytes = HIDDEN * 2
-            lo_rows = max(1, -(-int(payload_range[0]) // row_bytes))
-            hi_rows = min(MAX_ROWS, int(payload_range[1]) // row_bytes)
+            lo_rows = max(1, -(-int(payload_range[0]) // ROW_BYTES))
+            hi_rows = min(self.max_rows, int(payload_range[1]) // ROW_BYTES)
+        # One row per kernel the ladder can pick inside [lo_rows, hi_rows]: the first row of each rung that the
+        # window and the range leave.
+        ladder = self._ladders[HIDDEN]
         seen = {}
-        for rows in range(lo_rows, hi_rows + 1):
-            seen.setdefault(tier(rows), rows)
+        for i, rung in enumerate(ladder):
+            first = max(lo_rows, -(-rung.min_bytes // ROW_BYTES))
+            last = hi_rows
+            if i + 1 < len(ladder):
+                last = min(last, -(-ladder[i + 1].min_bytes // ROW_BYTES) - 1)
+            if first <= last:
+                seen.setdefault(rung.cfg, first)
         with torch.cuda.device(self._device_index):
             for rows in seen.values():
                 launch, bufoff, cntoff = self._launcher(rows)
@@ -405,7 +435,7 @@ class PullAllReduceRMSNorm:
         graph capture (``accepts``)."""
         if not self.accepts(inp, residual_in, weight, out, residual_out):
             raise ValueError(
-                f"PullAllReduceRMSNorm serves bf16 [1..{MAX_ROWS}, {HIDDEN}] calls "
+                f"PullAllReduceRMSNorm serves bf16 [1..{self.max_rows}, {HIDDEN}] calls "
                 "recorded inside capture() on a graph capture"
             )
         if out is None:

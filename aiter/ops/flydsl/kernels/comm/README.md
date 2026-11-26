@@ -269,14 +269,29 @@ inbox, ladder or super-tile.
   `residual_out` therefore equals the two-stage kernel's, except a rare fp32
   summation-order difference; `out` differs from an fp32 reference by at most
   one bf16 ulp, at rounding ties.
-* Tiers by rows, for hidden 6144 at TP4 on gfx950: 1-11 one-shot with read
-  acks, 12-287 one row per workgroup (block hand-offs, wave hand-offs from 37
-  to 96 and above 256), 288-640 streamed (2 rows per workgroup, 4 from 481).
+* Where it runs is table data like the other families': the `pull` window of
+  the fused policy row (`FUSED_FAMILY_POLICIES`, payload bytes; gfx950 / xGMI /
+  TP4: 1-1024 rows of 6144 bf16, moved with
+  `AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES`) and the `pull` ladder of the width
+  in `configs/comm/fused_allreduce_ladders.json` (one rung per kernel,
+  `min_bytes` in ascending order, no default ladder: only a width with an entry
+  is served). For hidden 6144 at TP4 on gfx950 the rungs are 1-11 rows one-shot
+  with read acks, 12-256 one row per workgroup (wave hand-offs from 37 to 96),
+  257-512 streamed with the weight hoisted (2 rows per workgroup), 513-1024
+  streamed at 4 rows per workgroup. The one-row kernels hang above about 640
+  rows (every workgroup has to be resident), so the engine refuses a ladder
+  that reaches them there (`PULL_KERNEL_MAX_ROWS`). The measurements behind the
+  rungs are in `docs/flydsl_pull_ar_m31.md`
+  (`op_tests/multigpu_tests/bench_fused_ar_rms_gemma.py` reproduces them).
 * `CustomAllreduce` builds it when `AITER_FLY_AR=1`, and
   `CudaCommunicator.fused_allreduce_rmsnorm` tries it first for `gemma_norm`
-  calls. `AITER_FLY_AR_PULL=1` builds it without the rest of the FlyDSL
-  all-reduce, and `AITER_FLY_AR_PULL=0` switches it off. Every rank must set
-  these alike.
+  calls. `AITER_FLY_AR_PULL=0` switches it off and `=1` builds it without the
+  rest of the FlyDSL all-reduce: a kill switch, not a route. The ranks vote on
+  a digest of the window and the ladders before building, so ranks that
+  resolved different ones decline together. Every rank must set these alike.
+* `AITER_AR_ROUTE_TRACE=1` (or a path prefix) counts which backend served
+  each fused all-reduce call, by rows and width: graph captures count once per
+  recorded call site, eager calls every call.
 
 The fused path declines a call if:
 

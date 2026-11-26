@@ -49,13 +49,18 @@ from .allreduce_policy import (
     RS_CODECS,
     SUPER_TILES,
     FusedTwoShotRung,
+    NoPolicyError,
     TwoShotRung,
+    Window,
     default_codecs,
     fused_mesh_st_ladder,
+    fused_pull_hiddens,
+    fused_pull_ladder,
     fused_qr_row_atoms,
     fused_ring_st_ladder,
     mesh_st_ladder,
     quantized_floor,
+    resolve_fused_policy,
     resolve_link,
     ring_st_ladder,
     select_rung,
@@ -956,11 +961,37 @@ class FlyQuickAllReduceRMSNorm:
         self.inbox_memory = "uncached"
         self.arch = arch
         self.supports_mxfp4 = False
-        self.min_bytes = 0 if min_bytes is None else int(min_bytes)
-        self.max_bytes = max_bytes
+        # The window and the rungs come from the fused policy. An explicit
+        # ``min_bytes`` / ``max_bytes`` (inclusive) moves the window as the
+        # ``AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES`` overrides do.
+        row = resolve_fused_policy(world_size=int(world_size), arch=arch, link=link)
+        window = row.pull_window()
+        if window is None:
+            raise NoPolicyError(
+                f"the pull schedule is disabled on {arch}/{link}/TP{world_size}"
+            )
+        if min_bytes is not None or max_bytes is not None:
+            window = Window(
+                window.min if min_bytes is None else int(min_bytes),
+                window.max if max_bytes is None else int(max_bytes) + 1,
+            )
+        self.min_bytes = window.min
+        self.max_bytes = None if window.max is None else window.max - 1
         self._by_cfg = {}
         self._registered_engine = PullAllReduceRMSNorm(
-            group=group, device=device, rank=rank, world_size=world_size
+            group=group,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+            window=window,
+            ladders={
+                h: fused_pull_ladder(
+                    world_size=int(world_size), link=link, arch=arch, hidden=h
+                )
+                for h in fused_pull_hiddens(
+                    world_size=int(world_size), link=link, arch=arch
+                )
+            },
         )
         self.device = self._registered_engine.device
 
