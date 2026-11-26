@@ -24,7 +24,7 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 MX32_DECODE_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_decode"
 _KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_DECODE_NAME_PREFIX)}_t(?P<tile_m>\d+)_nb(?P<nb>\d+)"
-    r"_ks(?P<ks>\d+)_kw(?P<kw>\d+)_wn(?P<wn>\d+)_d(?P<wdepth>\d+)$"
+    r"_ks(?P<ks>\d+)_kw(?P<kw>\d+)_wn(?P<wn>\d+)_d(?P<wdepth>\d+)(?P<kint>_ki)?$"
 )
 # Tuner candidates: decode token counts, and at most 16 K-waves (with one 128-wide
 # K step each, every weight load of a workgroup is in flight at once).
@@ -32,13 +32,21 @@ _CANDIDATE_MAX_M = 128
 _MAX_K_WAVES = 16
 
 
-def mxfp8_32_decode_kernel_name(tile_m, nb, ks, kw, wn, wdepth) -> str:
-    return f"{MX32_DECODE_NAME_PREFIX}_t{tile_m}_nb{nb}_ks{ks}_kw{kw}_wn{wn}_d{wdepth}"
+def mxfp8_32_decode_kernel_name(tile_m, nb, ks, kw, wn, wdepth, kint=0) -> str:
+    """kint (``_ki``): a K-wave takes every kw-th K step instead of a contiguous run."""
+    return (
+        f"{MX32_DECODE_NAME_PREFIX}_t{tile_m}_nb{nb}_ks{ks}_kw{kw}_wn{wn}_d{wdepth}"
+        f"{'_ki' if kint else ''}"
+    )
 
 
 def parse_mxfp8_32_decode_kernel_name(name: str) -> dict | None:
     m = _KERNEL_NAME_RE.fullmatch(name)
-    return {key: int(v) for key, v in m.groupdict().items()} if m else None
+    if m is None:
+        return None
+    cfg = {key: int(v) for key, v in m.groupdict().items() if key != "kint"}
+    cfg["kint"] = int(m.group("kint") is not None)
+    return cfg
 
 
 @functools.lru_cache(maxsize=4096)
@@ -54,7 +62,9 @@ def mxfp8_32_decode_kernel_launchable(kernel_name: str, M: int, N: int, K: int) 
 def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
     """Decode kernelNames the tuner times: 16- or 32-row tiles, 1 to 8 column
     blocks, the most K-waves (up to 16) that split the K steps evenly, and one
-    K step or all of a wave's K steps of weight loads in flight."""
+    K step or all of a wave's K steps of weight loads in flight; plus 8 K-waves
+    with a 2- or 4-workgroup cluster split of K and one or two n-waves, which
+    put more workgroups and loads in flight at small N or larger M."""
     if not 0 < M <= _CANDIDATE_MAX_M or N % 32 or K % 128:
         return []
     steps = K // 128
@@ -65,6 +75,24 @@ def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
         for nb in (1, 2, 3, 4, 6, 8)
         for wdepth in sorted({1, steps // kw})
     ]
+    names += [
+        mxfp8_32_decode_kernel_name(tile_m, nb, ks, 8, wn, wdepth)
+        for tile_m in (16, 32)
+        for nb in (2, 4, 8)
+        for ks in (1, 2, 4)
+        for wn in (1, 2)
+        if steps % (8 * ks) == 0
+        for wdepth in sorted({1, steps // (8 * ks)})
+    ]
+
+    # Interleaved K steps (``_ki``) wherever a wave owns two or more steps: the
+    # contiguous runs of the K-waves start a power of two apart when K is one.
+    def wave_steps(name):
+        cfg = parse_mxfp8_32_decode_kernel_name(name)
+        return steps // (cfg["ks"] * cfg["kw"])
+
+    names += [f"{name}_ki" for name in names if wave_steps(name) > 1]
+    names = list(dict.fromkeys(names))
     return [name for name in names if mxfp8_32_decode_kernel_launchable(name, M, N, K)]
 
 
@@ -133,8 +161,20 @@ def run_gemm_a8w8_mxfp8_32_decode_gfx1250(
     mpad = (m + tile_m - 1) // tile_m * tile_m
     slab = _slab(XQ.device, ks * mpad * n) if ks > 1 else Out
     stream = torch.cuda.current_stream(XQ.device)
-    # (N, K, tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
-    spec = (n, k, tile_m, cfg["nb"], ks, cfg["kw"], cfg["wn"], cfg["wdepth"], 1, 1)
+    # (N, K, tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm, kint)
+    spec = (
+        n,
+        k,
+        tile_m,
+        cfg["nb"],
+        ks,
+        cfg["kw"],
+        cfg["wn"],
+        cfg["wdepth"],
+        1,
+        1,
+        cfg["kint"],
+    )
     _run_compiled(
         _launcher(),
         ptr_arg(XQ), ptr_arg(x_scale), ptr_arg(WQ), ptr_arg(w_scale), ptr_arg(Out), ptr_arg(slab),

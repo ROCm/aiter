@@ -888,19 +888,21 @@ MX32_STREAM_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_stream"
 _MX32_STREAM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_STREAM_NAME_PREFIX)}_t(?P<tile_m>\d+)x(?P<tile_n>\d+)"
     r"_wn(?P<wn>\d+)_wk(?P<wk>\d+)_sk(?P<split_k>\d+)(?P<cluster>c)?"
-    r"_d(?P<depth>\d+)(?P<a_lds>_al)?(?P<a_wave>_aw)?$"
+    r"_d(?P<depth>\d+)(?P<a_lds>_al)?(?P<a_wave>_aw)?(?P<k_interleave>_ki)?$"
 )
 _launch_stream = None
 
 
 def mxfp8_32_stream_kernel_name(
-    tile_m, tile_n, wn, wk, split_k, depth, a_lds=0, cluster=False
+    tile_m, tile_n, wn, wk, split_k, depth, a_lds=0, cluster=False, k_interleave=False
 ) -> str:
-    """a_lds: 0 direct A, 1 workgroup-staged A (``_al``), 2 per-wave A transpose (``_aw``)."""
+    """a_lds: 0 direct A, 1 workgroup-staged A (``_al``), 2 per-wave A transpose (``_aw``).
+    k_interleave (``_ki``): a K-wave takes every wk-th K step instead of a contiguous range.
+    """
     return (
         f"{MX32_STREAM_NAME_PREFIX}_t{tile_m}x{tile_n}_wn{wn}_wk{wk}"
         f"_sk{split_k}{'c' if cluster else ''}_d{depth}"
-        f"{ {0: '', 1: '_al', 2: '_aw'}[int(a_lds)] }"
+        f"{ {0: '', 1: '_al', 2: '_aw'}[int(a_lds)] }{'_ki' if k_interleave else ''}"
     )
 
 
@@ -923,6 +925,7 @@ def parse_mxfp8_32_stream_kernel_name(name: str) -> dict | None:
     cfg["a_lds"] = (
         1 if g["a_lds"] is not None else (2 if g["a_wave"] is not None else 0)
     )
+    cfg["k_interleave"] = g["k_interleave"] is not None
     return cfg
 
 
@@ -1061,6 +1064,7 @@ def run_gemm_a8w8_mxfp8_32_stream_gfx1250(
         cfg["a_lds"],
         cfg["cluster"],
         1 if out_dtype == "f16" else 0,
+        cfg["k_interleave"],
     )
     _run_compiled(
         _launch_stream,
@@ -1100,7 +1104,12 @@ def mxfp8_32_stream_candidates(M: int, N: int, K: int) -> list[str]:
             if kpw < 1:
                 continue
             for depth in sorted({min(kpw, 3), min(kpw, 6)}):
-                name = mxfp8_32_stream_kernel_name(16, tile_n, 1, wk, 1, depth)
-                if mxfp8_32_stream_kernel_launchable(name, M, N, K):
-                    names.append(name)
+                # Interleaved K steps (_ki) only change the order when a wave
+                # owns two or more steps.
+                for k_interleave in (False, True) if kpw > 1 else (False,):
+                    name = mxfp8_32_stream_kernel_name(
+                        16, tile_n, 1, wk, 1, depth, k_interleave=k_interleave
+                    )
+                    if mxfp8_32_stream_kernel_launchable(name, M, N, K):
+                        names.append(name)
     return names

@@ -114,6 +114,7 @@ def launch_gemm_a8w8_mx32_stream(
     a_lds: Constexpr[int],
     cluster_reduce: Constexpr[bool],
     out_is_f16: Constexpr[int],
+    k_interleave: Constexpr[bool] = False,
 ):
     waves = wn * wk
     if tile_m % 16 or not 16 <= tile_m <= 256:
@@ -163,7 +164,7 @@ def launch_gemm_a8w8_mx32_stream(
     kernel_name = format_kernel_name(
         f"gemm_a8w8_mx32_stream_t{tile_m}x{tile_n}_wn{wn}_wk{wk}_sk{split_k}"
         f"{'c' if cluster_reduce else ''}_d{depth}{'_al' if a_lds else ''}"
-        f"{'_aw' if wave_stage else ''}_k{K}"
+        f"{'_aw' if wave_stage else ''}{'_ki' if k_interleave else ''}_k{K}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -214,7 +215,13 @@ def launch_gemm_a8w8_mx32_stream(
 
         ks_wg = split * (K // 128 // split_k)  # first K step of the workgroup
         ks_w = w_k * kpw  # first K step of the wave inside the workgroup
-        ks0 = ks_wg + ks_w
+
+        def wave_step(i):
+            """The wave's i-th K step inside the workgroup: a contiguous range of
+            kpw steps, or with k_interleave every wk-th step from w_k, so the wk
+            waves read neighbouring 2 KB weight pieces at the same time."""
+            return i * wk + w_k if const_expr(k_interleave) else ks_w + i
+
         a_row_g = [m0 + mi * 16 + lane16 for mi in range_constexpr(mb)]
         a_base = [r * lda16 + kgrp for r in a_row_g]
         sa_row = [
@@ -236,7 +243,7 @@ def launch_gemm_a8w8_mx32_stream(
             return v01.shuffle(v23, list(range(16)))
 
         def load_b_step(i):
-            ks = ks0 + i
+            ks = ks_wg + wave_step(i)
             bfr = [
                 [
                     buf_copy_load(b_buf, b_base[j] + ks * 128 + jj * 32, fx.Int32, 4)
@@ -261,7 +268,7 @@ def launch_gemm_a8w8_mx32_stream(
             return bfr, sb, sa
 
         def load_a_global(i):
-            ks = ks0 + i
+            ks = ks_wg + wave_step(i)
             return [
                 [
                     buf_copy_load(a_buf, a_base[mi] + ks * 8 + jj * 2, fx.Int32, 4)
@@ -280,7 +287,7 @@ def launch_gemm_a8w8_mx32_stream(
         aw_slot = AW_OFF + wave * (tile_m * A_WAVE_ROW)
 
         def load_a_rows(i):
-            ks = ks0 + i
+            ks = ks_wg + wave_step(i)
             return [
                 [
                     buf_copy_load(
@@ -319,7 +326,7 @@ def launch_gemm_a8w8_mx32_stream(
 
         def load_a_lds(i):
             # K offset of step i inside the workgroup's staged K range.
-            kb = (ks_w + i) * 128
+            kb = wave_step(i) * 128
             return [
                 [
                     Vec(lds_load_b128(lds_idx, a_lds_lane[mi] + kb + jj * 32))
@@ -336,7 +343,7 @@ def launch_gemm_a8w8_mx32_stream(
         def load_sa_lds(i):
             return [
                 lds_load_b32(
-                    lds_idx, SA_LDS_OFF + (sa_lds_row[p] * steps_wg + ks_w + i) * 4
+                    lds_idx, SA_LDS_OFF + (sa_lds_row[p] * steps_wg + wave_step(i)) * 4
                 )[0]
                 for p in range_constexpr(sa_loads)
             ]

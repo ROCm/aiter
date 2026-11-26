@@ -61,7 +61,8 @@ def decode_gemm_lds_bytes(tile_m, nb, kw, K=0, ks=1, atdm=0):
     return planes + (tile_m * (A_KC + A_PAD) * (K // ks // A_KC) if atdm else 0)
 
 
-def decode_gemm_config_error(N, K, tile_m, nb, ks, kw, wn, wdepth, atdm=0):
+def decode_gemm_config_error(N, K, tile_m, nb, ks, kw, wn, wdepth, atdm=0, kint=0):
+    del kint  # any K-step order is legal
     if K % (WMMA_K * ks * kw):
         return f"ks={ks} x kw={kw} must divide {K // WMMA_K} K steps"
     if N % (nb * 16):
@@ -112,6 +113,7 @@ def launch_mxfp8_decode_gemm(
     wdepth: Constexpr[int],
     wcpol: Constexpr[int] = 0,
     atdm: Constexpr[int] = 0,
+    kint: Constexpr[int] = 0,
 ):
     # atdm: the activation tile goes global -> LDS by TDM in the production gfx1250
     # GEMMs' descriptor form (no multicast, pipeline_fence), and the waves read
@@ -140,7 +142,7 @@ def launch_mxfp8_decode_gemm(
     rpr = tile_m // ks  # rows a cluster rank reduces (ks > 1)
     kernel_name = (
         f"mxfp8_decode_gemm_gfx1250_n{N}_k{K}_t{tile_m}x{cols}_ks{ks}_w{kw}x{wn}_d{wdepth}"
-        f"{f'_c{wcpol}' if wcpol else ''}{'_at' if atdm else ''}"
+        f"{f'_c{wcpol}' if wcpol else ''}{'_at' if atdm else ''}{'_ki' if kint else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -167,7 +169,13 @@ def launch_mxfp8_decode_gemm(
         lane16 = lane % 16
         kgrp = lane // 16
         m0 = mgrp * tile_m
-        ks0 = kpart * steps + w_k * steps_w  # first global K step of the wave
+        ks_wg = kpart * steps  # first global K step of the workgroup
+
+        def wave_step(i):
+            """The wave's i-th K step inside the workgroup range: a contiguous run
+            of steps_w steps, or with kint every kw-th step from w_k, so the kw
+            waves read neighbouring 2 KB weight pieces at the same time."""
+            return i * kw + w_k if const_expr(kint) else w_k * steps_w + i
 
         arena = fx.SharedAllocator(static=False)
         arena.allocate(lds_bytes)
@@ -239,7 +247,7 @@ def launch_mxfp8_decode_gemm(
             return v01.shuffle(v23, list(range(16)))
 
         def load_step(i):
-            ksg = ks0 + i
+            ksg = ks_wg + wave_step(i)
             bfr = [
                 [
                     buf_copy_load(
@@ -273,7 +281,7 @@ def launch_mxfp8_decode_gemm(
             return bfr, sb, sa, afr
 
         def lds_a_frag(mi, i):
-            s_ = w_k * steps_w + i  # K step inside the workgroup range
+            s_ = wave_step(i)  # K step inside the workgroup range
             base = (
                 PLANES
                 + (s_ // 4) * A_STAGE
