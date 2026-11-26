@@ -138,8 +138,7 @@ class Stage2ScatterContext:
             and self.slot_stride_bytes in (10240, 14336)
         )
         if self.slot_stride_bytes <= 0 or (
-            self.slot_stride_bytes & (self.slot_stride_bytes - 1)
-            and not dense_ep4_bf16
+            self.slot_stride_bytes & (self.slot_stride_bytes - 1) and not dense_ep4_bf16
         ):
             raise ValueError(
                 "slot_stride_bytes must be a positive power of two or the "

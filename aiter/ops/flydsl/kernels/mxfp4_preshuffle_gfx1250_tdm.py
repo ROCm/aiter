@@ -2609,7 +2609,7 @@ def build_gemm_a8w4_tdm_task(
             None.
             """
 
-            active_m_rep, rmem_slots, alternate_b1, ring_addresses = state
+            active_m_rep, rmem_slots, _alternate_b1, _ring_addresses = state
             compute_n_acc = active_m_rep * wmma_n_rep
             compute_state_ds = (
                 (

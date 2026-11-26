@@ -94,8 +94,13 @@ def _bf16_prefill_threads(config, token_count, quant_bits, shared_add):
         and token_count >= 4096
         and config.max_tokens_per_rank >= 4096
         and config.stage1_fused
-        and (config.hidden_dim, config.geometry.inter_dim,
-             config.experts_per_rank, config.topk, config.world_size)
+        and (
+            config.hidden_dim,
+            config.geometry.inter_dim,
+            config.experts_per_rank,
+            config.topk,
+            config.world_size,
+        )
         in ((5120, 2304, 96, 6, 4), (7168, 2048, 65, 9, 4))
         and config.combine_slot_stride_for(0) == 2 * config.hidden_dim
     ):
@@ -257,13 +262,16 @@ class _FusedScatterCombine:
             self.config, routing.token_count, quant_bits, shared_add
         )
         reduce = (
-            self._prefill_bf16_reduce if direct_threads
+            self._prefill_bf16_reduce
+            if direct_threads
             else self._reduces[quant_bits, shared_add is not None]
         )
         grid = (
-            (combine_direct_reduce_blocks(
-                self.config.hidden_dim, routing.token_count, direct_threads
-            ),)
+            (
+                combine_direct_reduce_blocks(
+                    self.config.hidden_dim, routing.token_count, direct_threads
+                ),
+            )
             if quant_bits == 0
             else ()
         )

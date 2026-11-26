@@ -132,8 +132,11 @@ def _combine_direct_threads(hidden_dim, block_threads=0):
     """Keep whole waves inside one token when its row admits that geometry."""
     lanes_per_tok = hidden_dim // DIRECT_ELEMS_PER_LANE
     if block_threads:
-        if not (WAVE <= block_threads <= 1024 and block_threads % WAVE == 0
-                and lanes_per_tok % block_threads == 0):
+        if not (
+            WAVE <= block_threads <= 1024
+            and block_threads % WAVE == 0
+            and lanes_per_tok % block_threads == 0
+        ):
             raise ValueError("explicit combine threads must divide one token's lanes")
         return block_threads
     if lanes_per_tok % DIRECT_BLOCK_THREADS == 0:

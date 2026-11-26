@@ -711,9 +711,7 @@ class _CompactDispatch(_Dispatch):
 
         config, geo = self.config, self.compact
         bound = max(1, min(int(recv_bound), config.max_recv))
-        tile_m, tile_m2, m_warp2, a2_pre = _compact_gemm_tiles(
-            config, recv_bound=bound
-        )
+        tile_m, tile_m2, m_warp2, a2_pre = _compact_gemm_tiles(config, recv_bound=bound)
         # The arena holds rows for the capacity tile, and the CSV tiles are not
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
