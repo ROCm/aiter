@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""MiniMax-M3 prefill index block scores over the NVFP4 index cache (gfx1250).
+"""Causal prefill block scores of index queries over an NVFP4 key cache (gfx1250).
 
-Bitwise drop-in for ATOM's Triton ``_index_block_score_kernel`` on the FP4 index
-cache; see ``kernels.index_score_prefill_nvfp4_gfx1250``.
+See ``kernels.index_score_prefill_nvfp4_gfx1250``.
 """
 
 import flydsl.expr as fx
@@ -17,35 +16,69 @@ from .kernels.index_score_prefill_nvfp4_gfx1250 import (
     compile_index_score_prefill_nvfp4,
     sm_scale_log2e,
 )
-from .kernels.minimax_m3_index_score import HEAD_DIM, PAGE
+from .kernels.minimax_m3_index_score import (
+    DATA_BYTES,
+    HEAD_DIM,
+    NVFP4_SCALE_BYTES,
+    PAGE,
+)
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 
-def index_score_prefill_nvfp4_supported(idx_q, payload, scale) -> bool:
+def _byte_pages(t, row_bytes):
+    """``[pages, PAGE, row_bytes]`` bytes, each page contiguous and 16 B aligned:
+    a page is one tensor DMA of ``PAGE * row_bytes`` bytes."""
+    return (
+        t.element_size() == 1
+        and t.shape[1:] == (PAGE, row_bytes)
+        and t.stride()[1:] == (row_bytes, 1)
+        and t.stride(0) % 16 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def index_score_prefill_nvfp4_supported(
+    idx_q,
+    payload,
+    scale,
+    score,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    sm_scale,
+) -> bool:
+    """Whether ``index_score_prefill_nvfp4`` takes these, its first nine arguments.
+    The kernel gets bare pointers and int32 strides, so these are what it assumes
+    of them; the op raises ``ValueError`` when this is False."""
+    meta = (block_table, cu_seqlens_q, seq_lens, prefix_lens)
+    batch = cu_seqlens_q.shape[0] - 1
     return (
         get_gfx_runtime() == "gfx1250"
-        and idx_q.dim() == 3
-        and idx_q.shape[2] == HEAD_DIM
         and idx_q.dtype == torch.bfloat16
+        and idx_q.shape[2:] == (HEAD_DIM,)
         and idx_q.stride(2) == 1
-        and payload.dtype == torch.uint8
-        and scale.dtype in (torch.uint8, torch.float8_e4m3fn)
-        and payload.shape[1:] == (PAGE, HEAD_DIM // 2)
-        and payload.stride()[1:] == (HEAD_DIM // 2, 1)
-        and scale.shape[1:] == (PAGE, HEAD_DIM // 16)
-        and scale.stride()[1:] == (HEAD_DIM // 16, 1)
-        and payload.stride(0) % 16 == 0
-        and scale.stride(0) % 16 == 0
-        and payload.data_ptr() % 16 == 0
-        and scale.data_ptr() % 16 == 0
+        and _byte_pages(payload, DATA_BYTES)
+        and _byte_pages(scale, NVFP4_SCALE_BYTES)
+        and all(t.device == idx_q.device for t in (payload, scale, score) + meta)
+        and all(t.dtype == torch.int32 and t.stride(-1) == 1 for t in meta)
+        and min(block_table.shape[0], seq_lens.shape[0], prefix_lens.shape[0]) >= batch
+        and score.dtype == torch.float32
+        and score.dim() == 3
+        and score.shape[0] == idx_q.shape[1]
+        and score.shape[1] >= idx_q.shape[0]
+        and score.stride(2) == 1
+        and max(score.stride()) < 2**31
+        # The kernel takes the block max before the scale.
+        and 0.0 < sm_scale_log2e(sm_scale) < float("inf")
     )
 
 
 def index_score_prefill_nvfp4(
     idx_q: torch.Tensor,  # [total_q, heads, 128] bf16
-    payload: torch.Tensor,  # [blocks, 128, 64] uint8
-    scale: torch.Tensor,  # [blocks, 128, 8] uint8 (E4M3 bits)
-    score: torch.Tensor,  # [heads, total_q, max_block] fp32, written like Triton's
+    payload: torch.Tensor,  # [pages, 128, 64] uint8: e2m1 pairs
+    scale: torch.Tensor,  # [pages, 128, 8] uint8 / float8_e4m3fn: one per 16 values
+    score: torch.Tensor,  # [heads, >= total_q, max_block] fp32
     block_table: torch.Tensor,  # [reqs, max_blocks] int32
     cu_seqlens_q: torch.Tensor,  # [reqs + 1] int32
     seq_lens: torch.Tensor,  # [reqs] int32
@@ -58,42 +91,45 @@ def index_score_prefill_nvfp4(
     waves: int = 4,
     ring: int = 4,
 ) -> None:
-    """``score[h, r, blk]`` for every block up to the last row of r's
-    ``block_q``-row tile, exactly as ATOM's Triton prefill scorer (same bits). A
-    CTA scores at most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the
-    scores do not depend on the chunking) and stores each row's chunk with one
-    coalesced store.
+    """For query row ``r`` of request ``b`` (at position ``prefix_lens[b] + r -
+    cu_seqlens_q[b]``), index head ``h`` and 128-key block ``blk`` of ``b``'s pages
+    (page ``block_table[b, blk]``)::
 
-    What only the device can see is the caller's to guarantee, as with Triton:
-    ``cu_seqlens_q`` ends at ``total_q``, ``max_query_len`` covers every request,
-    and ``block_table`` and ``score`` hold ``ceil(seq_len / 128)`` blocks of each
+        score[h, r, blk] = max over the block's keys k at or before r's position of
+                           dot(e4m3(clamp(idx_q[r, h], +-448)), dequant(K[k]))
+                           * (sm_scale * log2(e))
+
+    ``-inf`` for a block past the row's own. Written for every block up to the
+    block of the last row of r's ``block_q``-row tile; later entries of ``score``
+    are left as they are. A CTA scores at most ``CHUNK_MAX`` blocks
+    (``chunk_blocks`` is clamped to ``[1, CHUNK_MAX]``; the scores do not depend on
+    it).
+
+    What only the device can see is the caller's to guarantee: ``cu_seqlens_q``
+    ends at ``total_q``, ``max_query_len`` covers every request, and
+    ``block_table`` and ``score`` hold ``ceil(seq_len / 128)`` blocks of each
     request (pages inside the cache)."""
+    if not index_score_prefill_nvfp4_supported(
+        idx_q,
+        payload,
+        scale,
+        score,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        sm_scale,
+    ):
+        raise ValueError(
+            "index_score_prefill_nvfp4: unsupported device, dtype, layout or scale"
+        )
     total_q, heads, _ = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
     max_block = score.shape[2]
     if total_q == 0 or batch == 0:
         return
-    # Everything reaches the kernel as a bare pointer: check what it assumes.
-    dev, meta = idx_q.device, (block_table, cu_seqlens_q, seq_lens, prefix_lens)
-    scaled = sm_scale_log2e(sm_scale)
-    if not (
-        index_score_prefill_nvfp4_supported(idx_q, payload, scale)
-        and all(t.device == dev for t in (payload, scale, score) + meta)
-        and all(t.dtype == torch.int32 for t in meta)
-        and min(block_table.shape[0], seq_lens.shape[0], prefix_lens.shape[0]) >= batch
-        and score.dtype == torch.float32
-        and score.shape[0] == heads
-        and score.shape[1] >= total_q
-        and score.stride(2) == 1
-        and score.stride(0) <= 0x7FFFFFFF  # the kernel takes int32 strides
-        and block_table.stride(1) == 1
-        and chunk_blocks >= 1
-        and 0.0 < scaled < float("inf")  # the max is taken before the scale
-    ):
-        raise ValueError(
-            "index_score_prefill_nvfp4: unsupported device, dtype, layout or scale"
-        )
-    chunk_blocks = min(chunk_blocks, CHUNK_MAX)
+    dev = idx_q.device
+    chunk_blocks = max(1, min(chunk_blocks, CHUNK_MAX))
     q_tiles = (max_query_len + block_q - 1) // block_q
     chunks = (max_block + chunk_blocks - 1) // chunk_blocks
     compiled = compile_index_score_prefill_nvfp4(
@@ -112,7 +148,7 @@ def index_score_prefill_nvfp4(
         ptr_arg(seq_lens, fx.Int32),
         ptr_arg(prefix_lens, fx.Int32),
         heads,
-        scaled,
+        sm_scale_log2e(sm_scale),
         chunk_blocks,
         idx_q.stride(0),
         idx_q.stride(1),

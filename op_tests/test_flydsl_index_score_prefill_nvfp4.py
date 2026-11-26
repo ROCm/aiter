@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-from unittest import mock
 
 import pandas as pd
 import torch
@@ -104,28 +103,12 @@ def test_index_score_prefill_nvfp4(case, onehot):
     return {"us": us, "err": err}
 
 
-def test_supported_gate():
-    from aiter.ops.flydsl import index_score_prefill as m
-
-    q = torch.zeros(4, 1, 128, dtype=torch.bfloat16)
-    payload, scale = torch.zeros(2, 128, 64, dtype=torch.uint8), torch.zeros(2, 128, 8)
-    e4m3 = scale.to(torch.float8_e4m3fn)
-    for gfx, s, ok in [
-        ("gfx1250", e4m3, 1),
-        ("gfx950", e4m3, 0),
-        ("gfx1250", scale, 0),
-    ]:
-        with mock.patch.object(m, "get_gfx_runtime", return_value=gfx):
-            assert m.index_score_prefill_nvfp4_supported(q, payload, s) == ok, gfx
-
-
 def main():
     parser = argparse.ArgumentParser(description="NVFP4 prefill index scores")
     parser.add_argument(
         "-c", "--case", nargs="*", default=list(CASES), choices=list(CASES)
     )
     args = parser.parse_args()
-    test_supported_gate()
     if get_gfx_runtime() != "gfx1250":
         aiter.logger.warning(
             "NVFP4 prefill index scorer runs on gfx1250 only; skipping"

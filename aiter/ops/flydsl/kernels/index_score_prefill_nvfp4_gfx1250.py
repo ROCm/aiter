@@ -1,30 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""gfx1250 MiniMax-M3 lightning-indexer PREFILL block scores over the NVFP4 index cache.
+"""gfx1250 causal prefill block scores of index queries over an NVFP4 key cache.
 
-Drop-in for ATOM's Triton ``_index_block_score_kernel`` on the FP4 index cache
-(``--index-cache-dtype fp4``): for request b, query row r, index head h and
-128-token block blk,
+The cache is two byte views, each with its own page stride: e2m1 pairs
+``[pages, 128, 64]`` and one E4M3 scale per 16 values ``[pages, 128, 8]``. For
+request b, query row r, index head h and 128-key block blk of b's pages,
 
     score[h, r, blk] = max over the block's keys k at or before r's position of
                        dot(e4m3(clamp(q[r, h], +-448)), dequant(K[page, k])) * (sm_scale * log2 e)
 
-stored for the blocks up to the CTA's last row's block, as Triton stores them
-(the same grid: 256-row query tiles x batch*heads x block chunks). Every dot is
-the one ``v_wmma_scale16_f32_16x16x128_f8f6f4`` Triton's ``tl.dot_scaled`` emits
-there (A = the page's e2m1 rows with their E4M3 block scales, B = the E4M3 query
-with unit E8M0 scales, K = 128 = head_dim), the max is exact and the scale is
-applied after it (rounding is monotone): the scores are bitwise Triton's.
+stored for the blocks up to the block of the last row of r's ``block_q``-row tile
+(grid: query tiles x batch*heads x block chunks). Every dot is one
+``v_wmma_scale16_f32_16x16x128_f8f6f4`` (A = the page's e2m1 rows with their E4M3
+block scales, B = the E4M3 query with unit E8M0 scales, K = 128 = head_dim), so K
+is never widened. The max is taken before the scale, which is exact for a
+positive scale (rounding is monotone).
 
-What differs is the data movement. Triton gathers the FP4 rows with byte and
-short global loads and byte LDS stores (128 + 36 loads and 128 LDS byte stores a
-page and wave); here the page (8 KB payload + 1 KB scales) arrives by tensor DMA
-into a CTA-shared LDS ring (wave 0 the payload, wave 1 the scales, the decode
-tiles' one-copy-a-wave pattern: each wave waits on its own copies, then a CTA
-barrier) and every wave reads the A operands with 16-byte LDS loads. Each wave
+Data movement: the page (8 KB payload + 1 KB scales) arrives by tensor DMA into a
+CTA-shared LDS ring of ``ring`` pages (wave 0 copies the payload, wave 1 the
+scales, as in the decode tiles: each wave waits on its own copies, then a CTA
+barrier), and every wave reads the A operands with 16-byte LDS loads. Each wave
 owns ``block_q / (16 * waves)`` 16-row query tiles (4 for the wrapper's 256 rows
-over 4 waves); a page is 8 key tiles x that many WMMAs a wave.
+over 4 waves); a page is 8 key tiles x that many WMMAs a wave. A CTA's scores are
+staged in LDS and leave as one coalesced store per row chunk.
 """
 
 import flydsl.compiler as flyc
@@ -45,7 +44,7 @@ E4M3_MAX = 448.0
 
 
 def sm_scale_log2e(sm_scale: float) -> float:
-    """``sm_scale * LOG2E`` multiplied in FP32, as ATOM's Triton kernel does."""
+    """The kernel's scale: ``sm_scale * LOG2E``, multiplied in FP32."""
     return float(np.float32(sm_scale) * np.float32(LOG2E))
 
 
@@ -62,8 +61,8 @@ _CACHE = {}
 
 
 # Blocks a CTA scores: its scores are staged in LDS, and a wave stores one row's
-# chunk of at most WAVE scores with one coalesced store (94 us against 128 us
-# for a 4-byte store per block and row: 14336 new rows on 99968 cached, MI455X).
+# chunk of at most WAVE scores with one coalesced store (on MI455X, one 4-byte
+# store per block and row instead was up to 1.37x slower, at most 0.5 us faster).
 CHUNK_MAX = 32
 
 
@@ -131,7 +130,7 @@ def compile_index_score_prefill_nvfp4(*, block_q, waves, ring):
         blk_end = (hi + PAGE - 1) // PAGE
         blk_lo = pid_chunk * chunk_blocks
         blk_hi = fx.min(blk_lo + chunk_blocks, blk_end)
-        # CTA-uniform: Triton's early exits (past the request's rows or blocks).
+        # CTA-uniform early exit: past the request's rows or blocks.
         live = (pid_q * block_q < q_len) & (blk_lo < blk_end)
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         mem = _Lds(fx.recast_iter(fx.Uint8, storage.buf.ptr))
