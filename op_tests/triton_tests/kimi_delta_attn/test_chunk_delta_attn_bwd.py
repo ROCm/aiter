@@ -324,3 +324,42 @@ def test_chunk_bwd_contract_flydsl(l2norm, gate, sigmoid):
             continue
         assert torch.isfinite(a).all(), name
         assert _err_ratio(b, a) < _ERR_RATIO, name
+
+
+def test_flydsl_fwd_prepare_hook(monkeypatch):
+    """A registered prepare runs only when selected, by argument or environment."""
+    pytest.importorskip("flydsl")
+    from aiter.ops.flydsl import kda_chunk_bwd as fb
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+        chunk_delta_attn_fwd_prepare,
+    )
+
+    calls = []
+
+    def counting_prepare(**kw):
+        calls.append(kw["chunk_size"])
+        return chunk_delta_attn_fwd_prepare(**kw)
+
+    monkeypatch.setitem(fb._PREPARE_IMPLS, "counting", counting_prepare)
+    x, _ = _inputs(1, 200, 96, 96, 128, 128, False, "none", precomputed_gate=False)
+    do = torch.randn(x["v"].shape, device="cuda").to(torch.bfloat16)
+    kw = {
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "A_log": x["A_log"],
+        "dt_bias": x["dt_bias"],
+        "use_beta_sigmoid_in_kernel": True,
+        "lower_bound": -5.0,
+    }
+    args = (do, x["q"], x["k"], x["v"], x["g"], x["beta"], 128**-0.5, 64)
+    base = fb.chunk_kda_bwd_flydsl(*args, **kw)
+    assert calls == []
+    hooked = fb.chunk_kda_bwd_flydsl(*args, prepare="counting", **kw)
+    assert calls == [64]
+    for a, b in zip(base, hooked):
+        assert torch.equal(a, b)
+    monkeypatch.setenv("AITER_KDA_BWD_PREPARE", "counting")
+    fb.chunk_kda_bwd_flydsl(*args, **kw)
+    assert calls == [64, 64]
+    with pytest.raises(ValueError, match="not registered"):
+        fb.chunk_kda_bwd_flydsl(*args, prepare="missing", **kw)

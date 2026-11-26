@@ -63,6 +63,43 @@ _MFMA = os.environ.get("AITER_KDA_FLYDSL_MFMA", "1") == "1"
 _PROFILE = os.environ.get("AITER_KDA_FLYDSL_PROFILE", "0") == "1"
 
 
+# Forward-intermediate recompute ("prepare") backends: name -> fn with the
+# signature and 10-tuple result of the Triton ``chunk_delta_attn_fwd_prepare``.
+_PREPARE_IMPLS = {}
+
+
+def register_fwd_prepare(name: str, fn) -> None:
+    """Register a forward-prepare backend for the FlyDSL backward.
+
+    ``fn(*, q, k, v, g, beta, scale, cu_seqlens, chunk_indices, chunk_size,
+    safe_gate, lower_bound, use_gate_in_kernel, A_log, dt_bias,
+    use_qk_l2norm_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute)``
+    returns ``(q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)`` in the Triton
+    prepare's layouts and dtypes. It is used only when selected, through
+    ``prepare=name`` or ``AITER_KDA_BWD_PREPARE=name``; the default stays
+    ``"triton"``.
+    """
+    if name == "triton":
+        raise ValueError('"triton" is the built-in default and cannot be replaced.')
+    _PREPARE_IMPLS[name] = fn
+
+
+def _fwd_prepare_fn(prepare):
+    name = prepare or os.environ.get("AITER_KDA_BWD_PREPARE", "triton")
+    if name == "triton":
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+            chunk_delta_attn_fwd_prepare,
+        )
+
+        return chunk_delta_attn_fwd_prepare
+    if name not in _PREPARE_IMPLS:
+        raise ValueError(
+            f"KDA backward prepare {name!r} is not registered "
+            f"(registered: {sorted(_PREPARE_IMPLS)} and 'triton')."
+        )
+    return _PREPARE_IMPLS[name]
+
+
 class _Timer:
     def __init__(self):
         self.marks = []
@@ -251,6 +288,7 @@ def chunk_kda_bwd_flydsl_full(
     use_qk_l2norm_in_kernel=False,
     use_beta_sigmoid_in_kernel=False,
     state_v_first=False,
+    prepare=None,
 ):
     """FlyDSL ``chunk_delta_attn_bwd``: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``.
 
@@ -259,10 +297,11 @@ def chunk_kda_bwd_flydsl_full(
     stop at sequence edges, every sequence has its own state (``initial_state``
     / ``dht`` / ``dh0`` are ``[N, H, *, *]``), and tokens past
     ``cu_seqlens[-1]`` get zero gradients, as in the Triton backward.
+    ``prepare`` names the forward-recompute backend (see
+    ``register_fwd_prepare``); None reads ``AITER_KDA_BWD_PREPARE``, default
+    ``"triton"``.
     """
-    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
-        chunk_delta_attn_fwd_prepare,
-    )
+    chunk_delta_attn_fwd_prepare = _fwd_prepare_fn(prepare)
 
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -516,6 +555,7 @@ def chunk_kda_bwd_flydsl(
     cu_seqlens=None,
     lower_bound=None,
     safe_gate=None,
+    prepare=None,
 ):
     """#8739 ``register_chunk_bwd`` contract: ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias)``.
 
@@ -524,7 +564,9 @@ def chunk_kda_bwd_flydsl(
     variable-length sequences. With ``use_gate_in_kernel``, ``lower_bound``
     selects K3's safe gate ``g = lower_bound * sigmoid(exp(A_log) * (g +
     dt_bias))`` (``[-5, 0)``) instead of ``-exp(A_log) * softplus(g +
-    dt_bias)``; ``safe_gate`` defaults to ``lower_bound is not None``. q/k/v/do are computed in bf16; each gradient
+    dt_bias)``; ``safe_gate`` defaults to ``lower_bound is not None``.
+    ``prepare`` selects a registered forward-recompute backend
+    (``register_fwd_prepare``). q/k/v/do are computed in bf16; each gradient
     comes back in its input's dtype. Falls back to the Triton backward when
     the call is outside ``kda_bwd_flydsl_supported``.
     """
@@ -554,7 +596,17 @@ def chunk_kda_bwd_flydsl(
         B=B,
     ):
         out = chunk_kda_bwd_flydsl_full(
-            do, None, q, k, v, g, beta, scale, chunk_size=chunk_size, **kw
+            do,
+            None,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            chunk_size=chunk_size,
+            prepare=prepare,
+            **kw,
         )
     else:
         from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_bwd import (
