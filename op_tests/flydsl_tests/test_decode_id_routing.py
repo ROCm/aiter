@@ -17,10 +17,9 @@ import pytest
 import torch
 
 pytest.importorskip("flydsl")
-if (
-    not torch.cuda.is_available()
-    or "gfx95" not in torch.cuda.get_device_properties(0).gcnArchName
-):
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
     pytest.skip("needs a gfx950 GPU", allow_module_level=True)
 
 import flydsl.compiler as flyc

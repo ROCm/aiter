@@ -66,11 +66,12 @@ def router_gemm_partials(hidden_states, router_weight, router_weight_lines=None)
         router_weight_lines: ``router_line_layout(router_weight)``, read by the 1-32 row tiers when given (the
             larger tiers read ``router_weight``). The two must hold the same gate: the kernels cannot check that.
     """
+    if hidden_states.dim() != 2:
+        return None
     m = hidden_states.shape[0]
     if (
         m == 0
         or m > MAX_ROWS
-        or hidden_states.dim() != 2
         or hidden_states.shape[1] != H
         or hidden_states.dtype != torch.bfloat16
         or hidden_states.stride(1) != 1
