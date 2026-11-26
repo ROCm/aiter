@@ -30,6 +30,10 @@ at a time). What changes:
   tiles: the last two K-steps load the next tile's first two, so the
   pipeline never drains, and a tile's output is converted and stored in the
   next tile's first K-step, a quadrant at a time (``run_tile_stream``).
+* Stage 1 (K = 4096) streams its loads the same way (``run_tile_stream_s1``):
+  the next tile's sorted_ids are DMA'd into LDS in step 0, its scales in
+  step K - 4 and its K-steps 0 and 1 in the last two steps, and its SwiGLU
+  epilogue runs at the tile's end while those loads land.
 """
 
 import flydsl.compiler as flyc
@@ -107,10 +111,29 @@ def _load_i32_lane(div, idx):
     return fx.Int32(reg.load()[0])
 
 
-def _lane_col8():
+def _lane_col8(lane=None):
     """Column (in elements) of the 8 a lane holds after the pair swap, within a 32-column pair."""
-    q = fx.thread_idx.x % 64 // 16
+    q = (fx.thread_idx.x % 64 if lane is None else lane) // 16
     return (q % 2 == 1).select(16 + 4 * (q - 1), 4 * q)
+
+
+def _fresh_lane():
+    """``thread_idx.x % 64`` recomputed where it is used.
+
+    A side-effecting move, so LICM cannot hoist it (or anything derived from
+    it) out of the tile loop: values used only in the stage-1 epilogue were
+    otherwise held across the K loop, spilled, and their reloads' vmcnt(0)
+    drained the next tile's streamed loads (ISA). Inline asm: no stable API
+    pins a value in place.
+    """
+    tid = _llvm.inline_asm(
+        res=fx.Int32.ir_type,
+        operands_=[fx.Int32(fx.thread_idx.x).ir_value()],
+        asm_string="v_mov_b32 $0, $1",
+        constraints="=v,v",
+        has_side_effects=True,
+    )
+    return fx.Int32(tid) % 64
 
 
 def _swap_pair(x, y):
@@ -352,10 +375,6 @@ class SwigluFp8Epilogue:
         self.neg_limit = -limit
         self.wave_m = wave_m
         self.wave_n = wave_n
-        lane = fx.thread_idx.x % 64
-        self.lane_row = lane % 16
-        self.q = lane // 16
-        self.lane_col = _lane_col8()
         self.c_div = _i32_view(C, m_pad * inter, m_pad * (inter // 4), 8)
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
@@ -368,7 +387,9 @@ class SwigluFp8Epilogue:
         )
         self.sc_atom = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8)
         self.sc_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
-        self.sc_oob = fx.Int32(n_sc)
+        # Past the descriptor (n_sc bytes): a dropped store. A constant, not
+        # n_sc: a VGPR copy of n_sc was held across the tile loop and spilled.
+        self.sc_oob = fx.Int32(1 << 30)
         self.amax = amax_lds
 
     def _amax_at(self, wn, r):
@@ -398,6 +419,10 @@ class SwigluFp8Epilogue:
 
     def store(self, gate_up, row0, nb):
         """``gate_up[h] = (gate accs, up accs)`` of row half h; acc ``j * N_TILES_A + i``."""
+        lane = _fresh_lane()
+        self.lane_row = lane % 16
+        self.q = lane // 16
+        self.lane_col = _lane_col8(lane)
         acts = {}
         for h in range_constexpr(2):
             g_frag, u_frag = gate_up[h]
@@ -509,6 +534,17 @@ def _interleave_store_burst(n_row_tiles):
         if const_expr(t > 0):
             rocdl.sched_group_barrier(vmem_w, 1, 0)
     rocdl.sched_group_barrier(vmem_w, 1, 0)
+
+
+def _wait_barrier_seen(count):
+    """``wait_barrier`` as intrinsics: the compiler's waitcnt pass sees the vmcnt.
+
+    Behind inline asm the pass assumed the stage-1 sorted_ids LDS-DMA (issued
+    at step 0) still in flight when step K - 4 read it back, and drained
+    every streamed load with a vmcnt(0) there (~550 cycles a tile, ATT).
+    """
+    fx.rocdl.s_waitcnt(vmcnt=count)
+    rocdl.s_barrier()
 
 
 def _opaque_vgpr(value):
@@ -640,6 +676,38 @@ class G2SRoundsNt(G2SRounds):
                 0,
                 self.NT,
             )
+
+
+def _sgpr_here(c):
+    """The constant ``c`` in an SGPR materialized where it is used (an ``s_mov`` per use).
+
+    Side-effecting inline asm, so LICM cannot hoist it: as plain constants,
+    the 31 K offsets of the stage-1 gather loads were all hoisted out of the
+    tile loop into SGPRs and the SGPR file spilled (24 spills, ISA). No
+    stable API pins a value in place.
+    """
+    return fx.Int32(
+        _llvm.inline_asm(
+            res=fx.Int32.ir_type,
+            operands_=[],
+            asm_string=f"s_mov_b32 $0, {int(c)}",
+            constraints="=s",
+            has_side_effects=True,
+        )
+    )
+
+
+class G2SGather(G2SLoader):
+    """Gathered A rows: one lane offset per round, the K offset an SGPR set at the load."""
+
+    def __init__(self, gl_src, wave_id):
+        super().__init__(gl_src, [], N_LDS_STEPS, fx.Float8E4M3FN.ir_type, wave_id)
+
+    def load(self, lds_dst, offsets, k_offset):
+        soff = _sgpr_here(k_offset) if k_offset else fx.Int32(0)
+        for step in range_constexpr(len(offsets)):
+            src = fx.slice(self.gl_src, (None, fx.Int32(offsets[step])))
+            fx.copy(self.g2lds_atom, src, self._lds_dst_at(lds_dst, step), soffset=soff)
 
 
 class MoeScaleLds:
@@ -808,6 +876,93 @@ class TileScaleLds:
         return [self._byte(base, h * 16 + k)] * n_tiles
 
 
+class GatherTileScaleLds:
+    """Stage 1: a tile's E8M0 A / B scales for every K block, two DMA instructions a wave.
+
+    A (gathered row-major ``[T, K // 128]``, 32 bytes a token at K = 4096):
+    lane ``l`` of wave ``w`` copies the 16 bytes of K blocks ``16 (w // 4) +
+    [0, 16)`` of tile row ``64 (w % 4) + l``, so the LDS image is ``[2][256
+    rows][16]``. A read's 16 rows then sit 16 bytes apart, on distinct banks
+    (in the tile's ``[256, 32]`` order they were 32 bytes apart: two-way bank
+    conflicts, ~120 cycles a K-step a wave, ATT). B: every wave loads both
+    weight row blocks' ``k128`` bytes (lanes 0..7 / 8..15, the rest repeat
+    them) into its own 256 bytes. Chunked through ``MoeScaleLds`` instead,
+    the A bytes were one 1-byte gather a lane, 32 such instructions a wave a
+    tile, and every fourth K-step ran ~1.3k cycles slower (ATT, T = 16384).
+    """
+
+    def __init__(self, a_div, b_div, k128, lds, wave_id, a_row, slot_bytes):
+        assert (
+            k128 * BLOCK_M == N_WAVES * 64 * 16
+        ), "16 bytes a lane cover the tile's A scales"
+        self.a_div = a_div
+        self.b_div = b_div
+        self.k128 = k128
+        self.lds = lds
+        self.wave_id = wave_id
+        self.a_area = BLOCK_M * k128
+        self.slot_bytes = slot_bytes
+        lane = fx.thread_idx.x % 64
+        self.dma_row = wave_id % 4 * 64 + lane
+        self.dma_col = wave_id // 4 * 16
+        self.a_row = a_row
+        self.a_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        self.b_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+        self.LdsPtr_t = fx.PointerType.get(fx.Float8E4M3FN.ir_type, 2, 512)
+
+    BYTES_PER_SLOT = 8 * 1024 + N_WAVES * 256
+
+    def dma(self, slot, tok, b_rows):
+        """Stage a tile's scales into ``slot``: ``tok`` = token of tile row ``dma_row``, ``b_rows`` its two weight row blocks."""
+        base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
+        slot_off = slot * self.slot_bytes
+        dst = fx.inttoptr(self.LdsPtr_t, base_i32 + slot_off + self.wave_id * 1024)
+        fx.copy(
+            self.a_atom,
+            fx.slice(self.a_div, (None, tok * self.k128 + self.dma_col)),
+            fx.make_view(dst, fx.make_layout(1, 1)),
+        )
+        j = _fresh_lane() % 16
+        off = (j < 8).select(b_rows[0], b_rows[1]) * self.k128 + j % 8 * 4
+        bdst = fx.inttoptr(
+            self.LdsPtr_t, base_i32 + slot_off + self.a_area + self.wave_id * 256
+        )
+        fx.copy(
+            self.b_atom,
+            fx.slice(self.b_div, (None, off)),
+            fx.make_view(bdst, fx.make_layout(1, 1)),
+        )
+
+    def bases(self, slot):
+        """Read bases: opaque offsets off the field, which keep the reads' alias scope."""
+        bias = fx.Int32(fx.ptrtoint(self.lds.ptr))
+        slot_off = slot * self.slot_bytes
+        a_lane = (self.a_row + _fresh_lane() % 16) * 16
+        a = _opaque_vgpr(slot_off + a_lane + bias) - bias
+        b_off = slot_off + self.a_area + self.wave_id * 256
+        return a, _opaque_vgpr(b_off + bias) - bias
+
+    def _byte(self, base, off):
+        v = fx.make_view(
+            fx.recast_iter(
+                fx.Uint8, fx.add_offset(self.lds.ptr, fx.make_int_tuple(base + off))
+            ),
+            fx.make_layout(1, 1),
+        )
+        return fx.Int32(v.load()[0])
+
+    def read_a(self, base, k, half_row, n_tiles):
+        return [
+            self._byte(
+                base, k // 16 * (BLOCK_M * 16) + (half_row + t * 16) * 16 + k % 16
+            )
+            for t in range_constexpr(n_tiles)
+        ]
+
+    def read_b(self, base, k, h, n_tiles):
+        return [self._byte(base, h * 32 + k)] * n_tiles
+
+
 def compile_moe_bs_gemm_8w(
     *,
     K: int,
@@ -854,6 +1009,8 @@ def compile_moe_bs_gemm_8w(
             return h * gate_up_inter + nb * LDS_BLOCK_N
         return nb * BLOCK_N + h * LDS_BLOCK_N
 
+    # Stage 1 streams K-steps across its tiles (run_tile_stream_s1).
+    stream_s1 = gather and epilogue == "swiglu_fp8"
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
     n_chunks = (K_ITERS + MoeScaleLds.CHUNK - 1) // MoeScaleLds.CHUNK
@@ -868,10 +1025,14 @@ def compile_moe_bs_gemm_8w(
     class SharedStorage:
         if epilogue == "slot_bf16":
             S_lds: fx.Array[fx.Float8E4M3FN, TileScaleLds.BYTES, 16]
+        elif gather:
+            S_lds: fx.Array[fx.Float8E4M3FN, 2 * GatherTileScaleLds.BYTES_PER_SLOT, 16]
         else:
             S_lds: fx.Array[fx.Float8E4M3FN, 2 * MoeScaleLds.BYTES, 16]
         if epilogue == "swiglu_fp8":
             R_lds: fx.Array[fx.Float32, 2 * 4 * 128, 16]
+            # A tile's sorted_ids, one slot per tile parity (the stage-1 stream).
+            I_lds: fx.Array[fx.Int32, 2 * BLOCK_M, 16]
         if epilogue == "slot_bf16":
             T_lds: fx.Array[fx.Int32, 2 * 512, 16]
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -913,6 +1074,9 @@ def compile_moe_bs_gemm_8w(
         )
         a_scale_rsrc = fx.rocdl.get_buffer_rsrc(
             fx.get_iter(fx.rocdl.make_buffer_tensor(A_scale, max_size=False))
+        )
+        a_scale_div = fx.logical_divide(
+            make_fp8_buffer_tensor(A_scale, F8_IR_t), fx.make_layout(1, 1)
         )
         b_scale_div = fx.logical_divide(
             make_fp8_buffer_tensor(B_scale, F8_IR_t), fx.make_layout(1, 1)
@@ -956,6 +1120,16 @@ def compile_moe_bs_gemm_8w(
         # Operands swapped (weights as the MFMA's A): a lane then holds four
         # consecutive output columns of one row, which pack into wide stores.
         mfma = MxMfma(N_TILES_B, N_TILES_A, paired_tiles=False)
+        if const_expr(gather):
+            gsc = GatherTileScaleLds(
+                a_scale_div,
+                b_scale_div,
+                k128,
+                lds.S_lds,
+                wave_id,
+                wave_m * A_GRP_ROWS,
+                GatherTileScaleLds.BYTES_PER_SLOT,
+            )
         a_s2r = LdsFragReader(lds.A_lds_cur_0, wave_m, N_TILES_A, preshuffled=False)
         b_s2r = LdsFragReader(lds.B_lds_cur_0, wave_n, N_TILES_B, preshuffled=True)
         if const_expr(epilogue == "bf16"):
@@ -1027,9 +1201,7 @@ def compile_moe_bs_gemm_8w(
                     for h in range_constexpr(2)
                 ]
                 a_base = [0, 0]
-                sc_tok = _load_i32_lane(ids_div, row0 + sc_row) & 0xFFFFFF
-                a_sc_offs = [sc_tok * k128 + sc_col[s] for s in range_constexpr(2)]
-                a_k_stride = fx.Int32(1)
+                sc_tok = _load_i32_lane(ids_div, row0 + gsc.dma_row) & 0xFFFFFF
             else:
                 g2s = G2SRounds(
                     a_div, gl_off_a[0], N_LDS_STEPS, F8_IR_t, wave_id, 64 * K
@@ -1059,27 +1231,40 @@ def compile_moe_bs_gemm_8w(
             )
             B0_off = half_row0(nb, 0) * K
             B1_off = half_row0(nb, 1) * K
-            # Half h's B scale row; lane parity picks the half (slot w % 2).
-            b_sc_row = expert * (N // 128) + (
-                (lane_id % 2 == 0).select(half_row0(nb, 0), half_row0(nb, 1)) // 128
-            )
-            raw_sc = MoeScaleLds(
-                a_scale_rsrc,
-                a_sc_offs,
-                a_k_stride,
-                b_scale_div,
-                b_sc_row * k128,
-                k128,
-                wave_id,
-                wave_m * A_GRP_ROWS,
-                lds.S_lds,
-            )
+            if const_expr(gather):
+                b_rows = [
+                    expert * (N // 128) + half_row0(nb, h) // 128
+                    for h in range_constexpr(2)
+                ]
+            else:
+                # Half h's B scale row; lane parity picks the half (slot w % 2).
+                b_sc_row = expert * (N // 128) + (
+                    (lane_id % 2 == 0).select(half_row0(nb, 0), half_row0(nb, 1)) // 128
+                )
+                raw_sc = MoeScaleLds(
+                    a_scale_rsrc,
+                    a_sc_offs,
+                    a_k_stride,
+                    b_scale_div,
+                    b_sc_row * k128,
+                    k128,
+                    wave_id,
+                    wave_m * A_GRP_ROWS,
+                    lds.S_lds,
+                )
 
             def a_load(h, dst, k):
                 a_g2s[h].load(dst, a_base[h] + k * BLOCK_K)
 
+            if const_expr(gather):
+                sc_a, sc_b = gsc.bases(0)
+
             def scale_read(k, which):
                 op, h = int(which[0] == "b"), int(which[1])
+                if const_expr(gather):
+                    if const_expr(op == 1):
+                        return gsc.read_b(sc_b, k, h, N_TILES_B)
+                    return gsc.read_a(sc_a, k, h * LDS_BLOCK_M, N_TILES_A)
                 half_row = h * (LDS_BLOCK_N if op else LDS_BLOCK_M)
                 return raw_sc.read(op, half_row, N_TILES_B if op else N_TILES_A, k)
 
@@ -1087,7 +1272,10 @@ def compile_moe_bs_gemm_8w(
                 # As the dense kernel: chunk k // CHUNK + 1 after step k's first barrier.
                 chunk = k // MoeScaleLds.CHUNK + 1
                 if const_expr(
-                    k % MoeScaleLds.CHUNK == 0 and k > 0 and chunk < n_chunks
+                    not gather
+                    and k % MoeScaleLds.CHUNK == 0
+                    and k > 0
+                    and chunk < n_chunks
                 ):
                     raw_sc.dma(chunk)
 
@@ -1096,8 +1284,11 @@ def compile_moe_bs_gemm_8w(
             c10 = list(c00)
             c11 = list(c00)
 
-            for chunk in range_constexpr(min(2, n_chunks)):
-                raw_sc.dma(chunk)
+            if const_expr(gather):
+                gsc.dma(0, sc_tok, b_rows)
+            else:
+                for chunk in range_constexpr(min(2, n_chunks)):
+                    raw_sc.dma(chunk)
 
             b_g2s.load(b_cur0, B0_off)
             a_load(0, a_cur0, 0)
@@ -1562,11 +1753,192 @@ def compile_moe_bs_gemm_8w(
 
             return [c00, c01, c10, c11], nxt_expert, nxt_mask
 
+        if const_expr(stream_s1):
+            ids8_div = fx.logical_divide(
+                make_fp8_buffer_tensor(sorted_ids, F8_IR_t), fx.make_layout(1, 1)
+            )
+            ids_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+            a_gather = G2SGather(a_div, wave_id)
+            LdsF8Ptr_t = fx.PointerType.get(F8_IR_t, 2, 512)
+
+        def ids_dma(tile, slot):
+            """``tile``'s 256 sorted_ids into ``I_lds`` slot ``slot``, a dword a lane (waves 4..7 repeat 0..3)."""
+            row0 = _pow2_div(tile, NB) * BLOCK_M
+            q = wave_id % 4
+            base_i32 = fx.Int32(fx.ptrtoint(lds.I_lds.ptr))
+            dst = fx.inttoptr(LdsF8Ptr_t, base_i32 + slot * (BLOCK_M * 4) + q * 256)
+            fx.copy(
+                ids_atom,
+                fx.slice(ids8_div, (None, (row0 + q * 64 + _fresh_lane()) * 4)),
+                fx.make_view(dst, fx.make_layout(1, 1)),
+            )
+
+        def ids_at(idx):
+            return Vec(
+                fx.make_view(
+                    fx.add_offset(lds.I_lds.ptr, fx.make_int_tuple(idx)),
+                    fx.make_layout(1, 1),
+                ).load()
+            )[0]
+
+        def make_ctx_s1(tile, expert, slot, lazy):
+            """Stage 1's loaders of one tile, its ids in ``I_lds`` slot ``slot`` (also its scale slot).
+
+            ``lazy``: each A load reads its two tokens from LDS when issued;
+            else the tile's four A offsets are read once, here, and held.
+            """
+            m_blk = _pow2_div(tile, NB)
+            nb = _pow2_mod(tile, NB)
+
+            # Lane terms from a fresh lane id at each use (_fresh_lane): held
+            # across the K loop they spilled, and their reloads drained the
+            # streamed loads with vmcnt(0).
+            def a_offs(h):
+                lane = _fresh_lane()
+                row = lane // 8 + wave_id * 8
+                # One opaque base, every read a constant past it.
+                a_ids = _opaque_vgpr(slot * BLOCK_M + row)
+                _, col = swizzle_128(row, (lane % 8) * 16)
+                # Row r * 64 further on: the same swizzled column.
+                return [
+                    (ids_at(a_ids + h * LDS_BLOCK_M + r * 64) & 0xFFFFFF) * K + col
+                    for r in range_constexpr(N_LDS_STEPS)
+                ]
+
+            offs = None if lazy else [a_offs(h) for h in range_constexpr(2)]
+
+            def a_load(h, dst, k):
+                a_gather.load(dst, a_offs(h) if lazy else offs[h], k * BLOCK_K)
+
+            b_buf = fx.rocdl.make_buffer_tensor(
+                fx.make_view(
+                    b_iter + fx.Int64(expert) * (N * K), fx.make_layout(N * K, 1)
+                ),
+                max_size=False,
+                num_records_bytes=N * K,
+            )
+            b_g2s = G2SRounds(
+                fx.logical_divide(b_buf, fx.make_layout(1, 1)),
+                gl_off_b[0],
+                N_LDS_STEPS,
+                F8_IR_t,
+                wave_id,
+                64 * K,
+            )
+            b_off = [half_row0(nb, h) * K for h in range_constexpr(2)]
+            b_rows = [
+                expert * (N // 128) + _pow2_div(half_row0(nb, h), 128)
+                for h in range_constexpr(2)
+            ]
+
+            def b_load(h, dst, k):
+                b_g2s.load(dst, b_off[h] + k * B_K_STEP)
+
+            def sc_dma():
+                row = wave_id % 4 * 64 + _fresh_lane()
+                tok = ids_at(_opaque_vgpr(slot * BLOCK_M + row)) & 0xFFFFFF
+                gsc.dma(slot, tok, b_rows)
+
+            return {"a": a_load, "b": b_load, "sc": sc_dma, "m_blk": m_blk, "nb": nb}
+
+        # Epilogue VMEM per wave: an 8-byte act store and a 1-byte scale store per row tile.
+        EPI_STORES = 2 * 2 * N_TILES_A
+
+        def run_tile_stream_s1(tile, expert, next_tile, parity):
+            """Stage 1: K-steps 0 .. K - 1 of ``tile``, then its SwiGLU epilogue.
+
+            One K-step stream runs across tiles, as stage 2's: the last two
+            steps load ``next_tile``'s steps 0 and 1, step K - 4 its scales
+            (into the other parity's slot) and step 0 its expert id and
+            sorted_ids (into the other parity's ``I_lds`` slot). Only the loads
+            move: the accumulators are converted and stored at the tile's end
+            (SwiGLU needs all of them). Returns the next tile's expert.
+            """
+            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
+                LDS_BUFS
+            )
+            cur = make_ctx_s1(tile, expert, parity, False)
+            nxt = None
+            nxt_expert = None
+            c00 = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
+            c01 = list(c00)
+            c10 = list(c00)
+            c11 = list(c00)
+
+            def src(kk):
+                return (cur, kk) if kk < K_ITERS else (nxt, kk - K_ITERS)
+
+            sc_a, sc_b = gsc.bases(parity)
+
+            def sc_read(k, which):
+                op, h = int(which[0] == "b"), int(which[1])
+                if const_expr(op == 1):
+                    return gsc.read_b(sc_b, k, h, N_TILES_B)
+                return gsc.read_a(sc_a, k, h * LDS_BLOCK_M, N_TILES_A)
+
+            for k in range_constexpr(K_ITERS):
+                if const_expr(k == K_ITERS - 4):
+                    nxt = make_ctx_s1(next_tile, nxt_expert, 1 - parity, True)
+                sa0 = sc_read(k, "a0")
+                sb0 = sc_read(k, "b0")
+                b0_frag = b_s2r.load(b_cur0)
+                a0_frag = a_s2r.load(a_cur0)
+                if const_expr(k == 0):
+                    # Older than this step's A1 load: its end wait drains them.
+                    nxt_eid = _load_i32_lane(eids_div, _pow2_div(next_tile, NB))
+                    ids_dma(next_tile, 1 - parity)
+                ctx, kk = src(k + 1)
+                ctx["a"](1, a_next1, kk)
+                rocdl.s_barrier()
+                # The next tile's scales go to the other parity's slot, which
+                # the previous tile finished reading tiles ago.
+                sc_dma = k == K_ITERS - 4
+                if const_expr(sc_dma):
+                    nxt["sc"]()
+
+                c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
+
+                sb1 = sc_read(k, "b1")
+                b1_frag = b_s2r.load(b_cur1)
+                ctx, kk = src(k + 2)
+                ctx["b"](0, b_cur0, kk)
+                rocdl.s_barrier()
+
+                c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
+
+                sa1 = sc_read(k, "a1")
+                a1_frag = a_s2r.load(a_cur1)
+                ctx["a"](0, a_cur0, kk)
+                n_sc = 2 if sc_dma else 0
+                # vmcnt is in order: step 0's middle wait must not drain the
+                # previous tile's epilogue stores or this step's two fetches,
+                # all issued after K-step 1's B1 load.
+                _wait_barrier_seen(
+                    4 * N_LDS_STEPS + n_sc + (EPI_STORES + 2 if k == 0 else 0)
+                )
+
+                c10 = mfma.call(b0_frag, a1_frag, c10, sb0, sa1, k_pack=0)
+
+                ctx["b"](1, b_cur1, kk)
+                _wait_barrier_seen(3 * N_LDS_STEPS + n_sc)
+                if const_expr(k == 0):
+                    nxt_expert = _sgpr(nxt_eid)
+
+                c11 = mfma.call(b1_frag, a1_frag, c11, sb1, sa1, k_pack=0)
+
+                a_cur0, a_next0 = a_next0, a_cur0
+                a_cur1, a_next1 = a_next1, a_cur1
+                b_cur0, b_next0 = b_next0, b_cur0
+                b_cur1, b_next1 = b_next1, b_cur1
+
+            store_c.store([(c00, c01), (c10, c11)], cur["m_blk"] * BLOCK_M, cur["nb"])
+            return nxt_expert
+
         grid = fx.Int32(fx.grid_dim.x)
         bid = fx.Int32(fx.block_idx.x)
         start = (bid % NUM_XCDS) * (grid // NUM_XCDS) + bid // NUM_XCDS
         n_tiles = _sgpr((_load_i32(nv_div, 0) // BLOCK_M) * NB)
-        if const_expr(gather):
+        if const_expr(gather and not stream_s1):
             # i32 bounds keep this an i32 loop: an init= loop is index (i64),
             # and with no scalar 64-bit less-than its bound sits in a VGPR
             # pair that spilled; the reload's vmcnt(0) at the tile's end then
@@ -1643,6 +2015,53 @@ def compile_moe_bs_gemm_8w(
                     offs = store_c.quad_offsets(rows, final[1] >= 0)
                 acc = final[5 + g * n_acc : 5 + (g + 1) * n_acc]
                 store_c.store(store_c.pack(acc, rows), offs, last_cols[g % 2])
+            # No LDS-DMA may land after the workgroup exits; the leading
+            # group's barrier pairs the lagging group's prologue one.
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            barrier_if_zero(leading)
+        elif const_expr(stream_s1):
+            # Prologue: the first tile's ids, scales and K-steps 0 and 1, as
+            # the previous tile's stream would have loaded them (a workgroup
+            # without a tile runs it on tile 0 of expert 0, as stage 2 does).
+            has_tile = start < n_tiles
+            first_tile = has_tile.select(start, fx.Int32(0))
+            first_expert = has_tile.select(
+                _load_i32(eids_div, _pow2_div(first_tile, NB)), fx.Int32(0)
+            )
+            ids_dma(first_tile, 0)
+            _wait_barrier_seen(0)
+            first = make_ctx_s1(first_tile, first_expert, fx.Int32(0), False)
+            first["sc"]()
+            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
+                LDS_BUFS
+            )
+            first["b"](0, b_cur0, 0)
+            first["a"](0, a_cur0, 0)
+            first["b"](1, b_cur1, 0)
+            first["a"](1, a_cur1, 0)
+            # The wave_m == 1 group runs one barrier behind, for the whole kernel.
+            barrier_if_zero(lagging)
+            _wait_barrier_seen(2 * N_LDS_STEPS)
+            first["b"](0, b_next0, 1)
+            first["a"](0, a_next0, 1)
+            first["b"](1, b_next1, 1)
+            # Drained, so step 0's waits (counted for the previous tile's
+            # epilogue stores) also hold for the first tile.
+            _wait_barrier_seen(0)
+            # A while loop keeps the carried state and the bound i32: an
+            # init= range loop is index (i64), its bound compare needs a VGPR
+            # pair, which spilled, and the reload's vmcnt(0) at the tile's end
+            # drained the epilogue stores and the streamed next-tile loads.
+            tile = start
+            expert = first_expert
+            count = fx.Int32(0)
+            while tile < n_tiles:
+                nt = tile + grid
+                # The last tile streams itself again; nothing reads those loads.
+                nt = (nt < n_tiles).select(nt, tile)
+                expert = run_tile_stream_s1(tile, expert, nt, count & 1)
+                count = count + 1
+                tile = tile + grid
             # No LDS-DMA may land after the workgroup exits; the leading
             # group's barrier pairs the lagging group's prologue one.
             fx.rocdl.s_waitcnt(vmcnt=0)
