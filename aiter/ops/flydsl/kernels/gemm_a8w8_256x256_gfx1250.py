@@ -113,6 +113,7 @@ def launch_gemm_a8w8_256x256(
     batched: Constexpr[bool] = False,
     m_run_cap: Constexpr[int] = 32,
     c_vmem_store: Constexpr[bool] = False,
+    xcd_swizzle: Constexpr[int] = 0,
     batch: fx.Int32 = 1,
 ):
     """N must be a multiple of ``tile_n`` (of ``tile_n * cluster_n`` when
@@ -128,7 +129,11 @@ def launch_gemm_a8w8_256x256(
     ``m_run_cap``: the most M tiles one grid.x run spans before the rest of M
     moves to grid.z (a power of two; the M-tile count must split into runs).
     ``c_vmem_store`` (persistent nb2 C relocation only): C leaves LDS through
-    ``ds_load`` + ``buffer_store`` instead of a TDM store."""
+    ``ds_load`` + ``buffer_store`` instead of a TDM store.
+    ``xcd_swizzle`` (``_xcd<n>``; split_k 1, not batched): remap launch tiles
+    so each XCD owns a contiguous block (cluster-preserving). ``n==1`` is
+    that remap only; ``n>=cluster_m`` (multiple of ``cluster_m``) also
+    M-major-groups by ``n`` M tiles for L2 reuse."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -150,6 +155,18 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
+    assert xcd_swizzle >= 0, f"xcd_swizzle must be >= 0, got {xcd_swizzle}"
+    assert not xcd_swizzle or (
+        split_k == 1
+        and not batched
+        and (
+            xcd_swizzle == 1
+            or (xcd_swizzle >= cluster_m and xcd_swizzle % cluster_m == 0)
+        )
+    ), (
+        "xcd_swizzle needs split_k=1, no batching, and either 1 (XCD order "
+        f"only) or a multiple of cluster_m={cluster_m}, got {xcd_swizzle}"
+    )
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
@@ -344,6 +361,7 @@ def launch_gemm_a8w8_256x256(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
         + (f"_mr{m_run_cap}" if m_run_cap != 32 else "")
+        + (f"_xcd{xcd_swizzle}" if xcd_swizzle else "")
         + ("_cv" if c_vmem_store else "")
     )
 
@@ -373,8 +391,6 @@ def launch_gemm_a8w8_256x256(
 
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
-        if const_expr(persistent_n_tiles > 1):
-            bid_y = bid_y + tile_idx * fx.Int32(fx.grid_dim.y)
         if const_expr(split_k > 1):
             m_chunks = fx.Int32(fx.grid_dim.z) // split_k
             split_idx = bid_z // m_chunks
@@ -384,6 +400,51 @@ def launch_gemm_a8w8_256x256(
             split_idx = fx.Int32(0)
             m_chunk = fx.Int32(0) if const_expr(batched) else bid_z
             kt_base = fx.Int64(0)
+        # Remap launch tiles before the persistent N advance so one CTA keeps a
+        # contiguous N strip. Local (lx, ly) inside a hardware cluster is fixed
+        # so A/B multicast peers stay a contiguous cm x cn tile block.
+        if const_expr(xcd_swizzle > 0):
+            _NUM_XCDS = 8
+            _cm = fx.Int32(cluster_m)
+            _cn = fx.Int32(cluster_n)
+            _gx = fx.Int32(fx.grid_dim.x)
+            _gy = fx.Int32(fx.grid_dim.y)
+            _lx = bid_x % _cm
+            _ly = bid_y % _cn
+            _n_cx = _gx // _cm
+            _n_cy = _gy // _cn
+            _cx = bid_x // _cm
+            _cy = bid_y // _cn
+            _m_ct = fx.Int32(fx.grid_dim.z) * _n_cx
+            _m_crow = m_chunk * _n_cx + _cx
+            _flat = _m_crow * _n_cy + _cy
+            _num = _m_ct * _n_cy
+            _xcd = _flat % fx.Int32(_NUM_XCDS)
+            _intra = _flat // fx.Int32(_NUM_XCDS)
+            _base = _num // fx.Int32(_NUM_XCDS)
+            _extra = _num % fx.Int32(_NUM_XCDS)
+            _clip = (_xcd < _extra).select(_xcd, _extra)
+            _wgid = _xcd * _base + _clip + _intra
+            if const_expr(xcd_swizzle == 1):
+                # Contiguous XCD order only: decode row-major, no M-group.
+                _m_crow2 = _wgid // _n_cy
+                _cy2 = _wgid - _m_crow2 * _n_cy
+            else:
+                # M-major groups of xcd_swizzle M tiles (= n/cm cluster rows).
+                _g = fx.Int32(xcd_swizzle // cluster_m)
+                _num_in_grp = _g * _n_cy
+                _first_m = (_wgid // _num_in_grp) * _g
+                _rem_m = _m_ct - _first_m
+                _gsz = (_rem_m < _g).select(_rem_m, _g)
+                _in_grp = _wgid % _num_in_grp
+                _m_crow2 = _first_m + _in_grp % _gsz
+                _cy2 = _in_grp // _gsz
+            m_chunk = _m_crow2 // _n_cx
+            _cx2 = _m_crow2 - m_chunk * _n_cx
+            bid_x = _cx2 * _cm + _lx
+            bid_y = _cy2 * _cn + _ly
+        if const_expr(persistent_n_tiles > 1):
+            bid_y = bid_y + tile_idx * fx.Int32(fx.grid_dim.y)
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -1850,6 +1911,8 @@ def launch_gemm_a8w8_256x256(
             q_rows = (q_rows < warp_tile_m).select(q_rows, fx.Int32(warp_tile_m))
             q_rows = (q_rows > 0).select(q_rows, fx.Int32(0))
             if const_expr(C_VMEM):
+                # Soft-pipe ds_load / buffer_store (depth 2): hide LDS latency
+                # without the store-burst backpressure of issuing all loads first.
                 row_b = Q_LDS_ROW * 2
                 c_base = buf_base_i64(arg_c) + (
                     (blk_m64 + fx.Int64(wmb)) * ldc64 + blk_n64 + fx.Int64(wnb)
@@ -1865,8 +1928,9 @@ def launch_gemm_a8w8_256x256(
                     T.index, lrow * row_b + lc16 * 16
                 )
                 ldc16 = i32_ldc * partial_bytes // 16
-                for it in range_constexpr(warp_tile_m // 2):
-                    v = lds_load_b128(q_lds, it * 2 * row_b)
+                n_store = warp_tile_m // 2
+
+                def _c_store(it, v):
                     buf_copy_store(
                         cbuf,
                         (fx.Int32(it * 2) + lrow) * ldc16 + lc16,
@@ -1875,6 +1939,13 @@ def launch_gemm_a8w8_256x256(
                         unit_elems=4,
                         cache_modifier=C_STORE_TH_NT,
                     )
+
+                v0 = lds_load_b128(q_lds, 0)
+                for it in range_constexpr(1, n_store):
+                    v1 = lds_load_b128(q_lds, it * 2 * row_b)
+                    _c_store(it - 1, v0)
+                    v0 = v1
+                _c_store(n_store - 1, v0)
         if const_expr(c_relocate and not C_VMEM):
             for part, row0, n_rows in (
                 (0, 0, Q_SPLIT),

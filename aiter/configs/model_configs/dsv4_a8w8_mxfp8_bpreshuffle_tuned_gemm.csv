@@ -19,10 +19,10 @@ gfx1250,256,256,8192,1536,1x32,flydsl,12,1,5.739,flydsl_mxfp8_32_bpreshuffle_com
 gfx1250,256,512,8192,1536,1x32,flydsl,16,1,6.177,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm4_cn4,2086.03,3590.20,0.0
 gfx1250,256,1024,8192,1536,1x32,flydsl,-1,1,8.983,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm4_cn4,2868.57,3492.55,0.0
 gfx1250,256,2048,8192,1536,1x32,flydsl,-1,1,13.430,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4,3837.65,3706.22,0.0
-gfx1250,256,4096,8192,1536,1x32,flydsl,-1,1,20.200,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn2_ps2_cv,5102.93,4285.82,0.0
-gfx1250,256,8192,8192,1536,1x32,flydsl,-1,1,36.950,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_cv,5579.39,4334.78,0.0
-gfx1250,256,16384,8192,1536,1x32,flydsl,-1,1,71.000,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_cv,5807.28,4329.04,0.0
-gfx1250,256,32768,8192,1536,1x32,flydsl,-1,1,137.000,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_cv,6019.22,4392.36,0.0
+gfx1250,256,4096,8192,1536,1x32,flydsl,-1,1,21.300,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn2_ps2_xcd1_cv,4839.40,4064.36,0.0
+gfx1250,256,8192,8192,1536,1x32,flydsl,-1,1,37.500,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_xcd8_cv,5497.56,4271.21,0.0
+gfx1250,256,16384,8192,1536,1x32,flydsl,-1,1,69.500,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_xcd4_cv,5932.68,4422.57,0.0
+gfx1250,256,32768,8192,1536,1x32,flydsl,-1,1,128.700,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_ps4_mr4_xcd4_cv,6407.40,4675.43,0.0
 gfx1250,256,16,65536,1536,1x32,flydsl,129,1,7.621,flydsl_mxfp8_32_bpreshuffle_wmma_t16x256x256_mw1_nw4_nb3_sk1_cm1_cn1,422.66,13899.27,0.0
 gfx1250,256,32,65536,1536,1x32,flydsl,132,1,8.102,flydsl_mxfp8_32_bpreshuffle_wmma_t32x128x256_mw2_nw2_nb3_sk1_cm1_cn1,795.17,13336.71,0.0
 gfx1250,256,64,65536,1536,1x32,flydsl,135,1,8.443,flydsl_mxfp8_32_bpreshuffle_wmma_t64x256x128_mw2_nw2_nb4_sk1_cm1_cn1,1526.17,13301.43,0.0

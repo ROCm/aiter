@@ -80,6 +80,7 @@ class WmmaKernelInstance:
     persistent_n_tiles: int = 1
     m_run_cap: int = 32
     c_vmem_store: bool = False
+    xcd_swizzle: int = 0
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
@@ -89,6 +90,7 @@ class WmmaKernelInstance:
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
             + (f"_mr{self.m_run_cap}" if self.m_run_cap != 32 else "")
+            + (f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle else "")
             + ("_cv" if self.c_vmem_store else "")
         )
 

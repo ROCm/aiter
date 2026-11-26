@@ -1785,10 +1785,10 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     """Fall back to the bpreshuffle winner for a shape with no A-preshuffle row.
 
     The two kernel families differ only by an ``_apre`` marker, which sits before
-    any ``_ps<n>`` persistent-tile, ``_mr<n>`` M-run and ``_cv`` suffix. Those
-    bpreshuffle rows are the e8m0 2D-GEMM rows of the mxscale table -- the very
-    ones the non-A-preshuffled gfx1250 path reads -- not the fp32
-    blockscale-bpreshuffle table.
+    any ``_ps<n>`` persistent-tile, ``_mr<n>`` M-run, ``_xcd<n>`` and ``_cv``
+    suffix. Those bpreshuffle rows are the e8m0 2D-GEMM rows of the mxscale
+    table -- the very ones the non-A-preshuffled gfx1250 path reads -- not the
+    fp32 blockscale-bpreshuffle table.
     """
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
 
@@ -1798,7 +1798,7 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     borrowed = None
     if config is not None and config.get("libtype") == "flydsl":
         name = re.sub(
-            r"((?:_ps\d+)?(?:_mr\d+)?(?:_cv)?(?:_aspre)?)$",
+            r"((?:_ps\d+)?(?:_mr\d+)?(?:_xcd\d+)?(?:_cv)?(?:_aspre)?)$",
             r"_apre\1",
             str(config["kernelName"]),
             count=1,
