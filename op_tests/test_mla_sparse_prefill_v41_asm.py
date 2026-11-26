@@ -35,13 +35,14 @@ def _requires_gfx1250():
         pytest.skip("the fused V4.1 A8W4 CO requires gfx1250")
 
 
-def _case(n=2, csa_rows=65, swa_rows=128, *, no_sink=False):
+def _case(n=2, csa_rows=65, swa_rows=128, *, no_sink=False, window=None):
     data = _make_inputs_v41(
         n,
         64,
         csa_rows,
         swa_rows,
         topk=0,
+        window=window,
         prefix_fp4=True,
         seed=0,
     )
@@ -107,6 +108,33 @@ def test_pool_and_tile_boundaries(splits, n, csa_rows, swa_rows):
     _check(_invoke(inputs, splits), expected)
 
 
+@pytest.mark.parametrize("splits", [1, 4, 16])
+@pytest.mark.parametrize(
+    "n,csa_rows,window",
+    [
+        (129, 65, 0),
+        (129, 0, 128),
+        (129, 65, 128),
+        (257, 65, 128),
+        (129, 65, 1000),
+    ],
+)
+def test_sliding_window(splits, n, csa_rows, window):
+    inputs, expected = _case(n, csa_rows, n, window=window)
+    indptr = inputs["kv_indptr_extend"].tolist()
+    indices = inputs["kv_indices_extend"].tolist()
+    if window == 0:
+        assert indptr == [0] * (n + 1) and indices == []
+    else:
+        assert indices[indptr[0] : indptr[1]] == [0]
+        # Check the advancing row IDs independently of the numerical reference,
+        # which consumes the generated CSR too. N=257 also crosses the next window.
+        for token in (127, 128, n - 1):
+            rows = indices[indptr[token] : indptr[token + 1]]
+            assert rows == list(range(max(0, token + 1 - window), token + 1))
+    _check(_invoke(inputs, splits), expected)
+
+
 @pytest.mark.parametrize("splits", [None, 1, 3, 16])
 @pytest.mark.parametrize("provided_out", [False, True])
 def test_no_sink_and_output(splits, provided_out):
@@ -149,8 +177,17 @@ def test_public_default_reaches_native_entry(monkeypatch, splits):
         assert args[14].dtype == args[15].dtype == torch.float32
 
 
-@pytest.mark.parametrize("n,csa_rows", [(8, 4096), (16, 1024), (32, 1024), (96, 1024)])
-def test_auto_split_matches_forced(monkeypatch, n, csa_rows):
+@pytest.mark.parametrize(
+    "n,csa_rows,window",
+    [
+        (8, 4096, None),
+        (16, 1024, None),
+        (32, 1024, None),
+        (96, 1024, None),
+        (32, 1024, 16),
+    ],
+)
+def test_auto_split_matches_forced(monkeypatch, n, csa_rows, window):
     native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
     native_entry = native_module.asm_mla_sparse_prefill_v41_fwd
     selected = []
@@ -162,11 +199,22 @@ def test_auto_split_matches_forced(monkeypatch, n, csa_rows):
     monkeypatch.setattr(
         native_module, "asm_mla_sparse_prefill_v41_fwd", record_and_launch
     )
-    inputs, expected = _case(n=n, csa_rows=csa_rows)
+    inputs, expected = _case(
+        n=n, csa_rows=csa_rows, swa_rows=128 if window is None else n, window=window
+    )
     nnz = inputs["kv_indices_prefix"].numel() + inputs["kv_indices_extend"].numel()
     split = native_module._auto_v41_asm_splits(
         n, nnz, prefix_nnz=inputs["kv_indices_prefix"].numel()
     )
+    if window is not None:
+        # Cover sliding-window correctness with the host-selected S4 launch.
+        assert split == 4
+        indptr = inputs["kv_indptr_extend"].tolist()
+        indices = inputs["kv_indices_extend"].tolist()
+        for token in (window - 1, window, n - 1):
+            assert indices[indptr[token] : indptr[token + 1]] == list(
+                range(max(0, token + 1 - window), token + 1)
+            )
     actual = _invoke(inputs, None)
     _check(actual, expected)
     forced = _invoke(inputs, split)
@@ -490,7 +538,9 @@ CASES = [
     ("gfx1250", 8, 32, 512, public.dtypes.fp8, 0.0, "row_strided", True, "opus"),
     ("gfx950", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, "opus"),
     ("gfx942", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
-    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
+    ("gfx1250-strict", 8, 64, 512, torch.uint8, SCALE, "contiguous", False, None),
+    ("gfx1250-strict", 8, 64, 512, public.dtypes.fp8, SCALE, "contiguous", True, None),
 ]
 
 

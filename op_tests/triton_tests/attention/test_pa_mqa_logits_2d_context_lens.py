@@ -27,7 +27,7 @@ from aiter.ops.triton.utils.shuffle import shuffle_weight
 # and ignores VarCtxSchedule, so only its preshuffle (TDM) path is covered.
 ENTRIES = {
     "gluon": ("gfx942", "gfx950"),
-    "gluon_preshuffle": ("gfx942", "gfx950", "gfx1250"),
+    "gluon_preshuffle": ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"),
     "gluon_varctx": ("gfx942", "gfx950"),
     "gluon_persistent": ("gfx942", "gfx950"),
     "triton": ("gfx942", "gfx950"),

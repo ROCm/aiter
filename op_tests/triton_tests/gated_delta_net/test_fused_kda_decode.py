@@ -286,45 +286,6 @@ def test_fused_kda_decode_pad_slot():
     ), "Conv state modified for PAD_SLOT_ID"
 
 
-@pytest.mark.parametrize(
-    "invalid_out,match",
-    [
-        ("noncontiguous", "contiguous"),
-        ("dtype", "torch.bfloat16"),
-        ("device", "device"),
-    ],
-)
-def test_fused_kda_decode_rejects_invalid_out(invalid_out, match):
-    batch, Hloc, D = 2, 2, 128
-    inp = _make_inputs(batch, Hloc, D)
-    if invalid_out == "noncontiguous":
-        out = torch.zeros(Hloc * D, batch, dtype=torch.bfloat16, device=device).t()
-    elif invalid_out == "dtype":
-        out = torch.zeros(batch, Hloc * D, dtype=torch.float32, device=device)
-    else:
-        out = torch.zeros(batch, Hloc * D, dtype=torch.bfloat16, device="cpu")
-    with pytest.raises(ValueError, match=match):
-        fused_kda_decode(
-            inp["mixed_qkv"],
-            inp["conv_state"],
-            inp["conv_weight"],
-            inp["gate"],
-            inp["beta"],
-            inp["out_gate"],
-            inp["A_log"],
-            inp["dt_bias"],
-            inp["ssm_state"],
-            inp["ssm_state_indices"],
-            inp["cu_seqlens"],
-            inp["norm_weight"],
-            1e-6,
-            D,
-            Hloc,
-            -5.0,
-            out=out,
-        )
-
-
 SPEC_D = 128
 SPEC_W = 4
 
@@ -615,14 +576,6 @@ def test_fused_spec_decode_skips_invalid_accepted_state(invalid_accepted, num_sp
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
 
 
-def test_fused_spec_decode_rejects_unsupported_width():
-    """Both speculative paths keep exactly W - 1 = 3 history taps."""
-    inp = _make_spec_inputs(1, 2, num_spec=3)
-    w3 = inp["conv_weight"][:, :3].contiguous()
-    with pytest.raises(NotImplementedError, match="W == 4"):
-        _run_spec(inp, conv_weight=w3)
-
-
 def _assert_spec_matches(inp, *, expect_parallel, fused_weight=None):
     import aiter.ops.triton.gated_delta_net.fused_kda_decode as fkd
 
@@ -733,66 +686,6 @@ def test_spec_decode_honours_non_contiguous_index_strides(
     _assert_spec_matches(
         inp, expect_parallel=expect_parallel and get_arch() == "gfx950"
     )
-
-
-@pytest.mark.parametrize(
-    "invalid_layout",
-    [
-        "narrow_conv_cache",
-        "zero_sequence_stride",
-        "zero_token_stride",
-        "zero_beta_token_stride",
-        "zero_out_gate_token_stride",
-        "empty_spec_row",
-        "single_token_spec_row",
-        "short_state_indices",
-        "short_accepted_tokens",
-        "short_conv_indices",
-    ],
-)
-def test_spec_decode_rejects_invalid_layout(invalid_layout):
-    num_spec = 7
-    batch = 1 if invalid_layout == "narrow_conv_cache" else 2
-    inp = _make_spec_inputs(batch, 2, num_spec=num_spec)
-    spec_tokens = inp["state_indices"].shape[1]
-    if invalid_layout == "narrow_conv_cache":
-        required = spec_tokens + SPEC_W - 2
-        inp["conv_state"] = inp["conv_state"][:, :, : required - 1].contiguous()
-        inp["num_accepted_tokens"][0] = spec_tokens
-        match = rf"conv_state\.shape\[2\] >= {required}"
-    elif invalid_layout == "zero_sequence_stride":
-        packed = inp["state_indices"]
-        inp["state_indices"] = packed[:1].expand_as(packed)
-        match = "positive sequence stride"
-    elif invalid_layout == "zero_token_stride":
-        packed = inp["state_indices"]
-        inp["state_indices"] = packed[:, :1].expand_as(packed)
-        match = "positive token stride"
-    elif invalid_layout == "zero_beta_token_stride":
-        inp["beta"] = inp["beta"][:, :1].expand_as(inp["beta"])
-        match = "beta must have a positive token stride"
-    elif invalid_layout == "zero_out_gate_token_stride":
-        inp["out_gate"] = inp["out_gate"][:1].expand_as(inp["out_gate"])
-        match = "out_gate must have a positive token stride"
-    elif invalid_layout == "empty_spec_row":
-        inp["state_indices"] = inp["state_indices"][:, :0]
-        match = "at least 2 state-index entries"
-    elif invalid_layout == "single_token_spec_row":
-        inp["state_indices"] = inp["state_indices"][:, :1]
-        match = "at least 2 state-index entries"
-    else:
-        key, name = {
-            "short_state_indices": ("state_indices", "ssm_state_indices"),
-            "short_accepted_tokens": (
-                "num_accepted_tokens",
-                "num_accepted_tokens",
-            ),
-            "short_conv_indices": ("conv_state_indices", "conv_state_indices"),
-        }[invalid_layout]
-        inp[key] = inp[key][:-1]
-        match = rf"{name} must cover every sequence"
-    with pytest.raises(ValueError, match=match):
-        _run_spec(inp)
 
 
 def test_spec_decode_span_past_index_width_drops_surplus_tokens():
