@@ -88,10 +88,9 @@ def route_quant_small(
         router_weight: fp32 [128, 6144]; router_weight_lines: ``router_line_layout(router_weight)`` or None.
         correction_bias: fp32 [128]. All three on x's device.
     """
-    n = x.shape[0]
     if not (
         x.dim() == 2
-        and 0 < n <= MAX_ROWS
+        and 0 < x.shape[0] <= MAX_ROWS
         and x.shape[1] == H
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
@@ -104,6 +103,7 @@ def route_quant_small(
         and on_supported_device(x, router_weight, correction_bias)
     ):
         return None
+    n = x.shape[0]
     if router_quant_placement(n):
         return _router_gemm_topk_quant(
             x, router_weight, correction_bias, routed_scaling_factor

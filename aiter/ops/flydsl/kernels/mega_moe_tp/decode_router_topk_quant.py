@@ -342,6 +342,13 @@ def _get_kernel(num_experts: int, topk: int, split_k: int, token_major: bool = F
     )
 
 
+def _row_major_byte_span(t: torch.Tensor, rows: int, cols: int) -> tuple[int, int]:
+    """[lo, hi) byte range of a ``rows x cols`` row-major view (stride(1) == 1 already checked)."""
+    lo = t.data_ptr()
+    hi = lo + ((rows - 1) * t.stride(0) + (cols - 1) + 1) * t.element_size()
+    return lo, hi
+
+
 def splitk_biased_topk_mxfp4_mxfp8_quant(
     partials: torch.Tensor,  # [M, split_k, E] fp32 (any strides, last dim dense)
     correction_bias: torch.Tensor,  # [E] fp32
@@ -387,6 +394,13 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
             "splitk_biased_topk_mxfp4_mxfp8_quant: unsupported inputs (1-256 rows of bf16 [m, 6144] x, fp32 "
             f"[m, split_k, 128] partials, fp32 [128] bias, fp32 / int32 [m, 4] outputs on one gfx950 device): "
             f"x {tuple(x.shape)} {x.dtype}, partials {tuple(partials.shape)} {partials.dtype}"
+        )
+    w_lo, w_hi = _row_major_byte_span(topk_weights, m, TOPK)
+    i_lo, i_hi = _row_major_byte_span(topk_ids, m, TOPK)
+    if w_lo < i_hi and i_lo < w_hi:
+        raise ValueError(
+            "splitk_biased_topk_mxfp4_mxfp8_quant: topk_weights and topk_ids must not alias the same storage "
+            "(the kernel writes both as independent fp32 / int32 outputs)"
         )
     q = torch.empty((m, H // 2), dtype=torch.uint8, device=x.device)
     s = torch.empty((m, H // 32), dtype=torch.uint8, device=x.device)

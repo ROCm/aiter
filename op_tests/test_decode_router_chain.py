@@ -98,6 +98,10 @@ def test_unsupported_inputs_return_none():
     assert route_quant_small(x, w.cpu(), wl, bias) is None
     big = torch.randn(129, H, device="cuda", dtype=torch.bfloat16)
     assert route_quant_small(big, w, wl, bias) is None  # > 128 rows
+    x0 = torch.randn((), device="cuda", dtype=torch.bfloat16)
+    assert (
+        route_quant_small(x0, w, wl, bias) is None
+    )  # 0-d: rank checked before x.shape[0]
 
 
 def test_topk_quant_rejects_bad_outputs():
@@ -117,4 +121,8 @@ def test_topk_quant_rejects_bad_outputs():
     with pytest.raises(ValueError):  # wrong top-k width
         splitk_biased_topk_mxfp4_mxfp8_quant(
             parts, bias, wt[:, :2], ids[:, :2], SCALE, x
+        )
+    with pytest.raises(ValueError):  # topk_ids aliases topk_weights' storage
+        splitk_biased_topk_mxfp4_mxfp8_quant(
+            parts, bias, wt, wt.view(torch.int32), SCALE, x
         )
