@@ -1007,6 +1007,7 @@ def run_gfx1250_fp8_ptpc_ci_correctness(n=2112, k=7168):
         assert err == 0, f"gfx1250 ptpc M={m}: {err:.2%} of outputs mismatch"
 
 
+@torch.no_grad()
 def run_int8_4wave_dispatch_checks():
     """INT8 routing decisions, checked with fake tuned rows and launches."""
     if get_gfx() != "gfx950":
