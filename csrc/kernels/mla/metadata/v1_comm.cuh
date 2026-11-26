@@ -103,6 +103,8 @@ struct MlaMetadataV1KernelParameter
     // XCDs the part exposes; 1 disables the XCD grouping below. Workgroup -> XCD is round-robin.
     int32_t num_xcd;
     bool xcd_lane_works;
+    // AITER_MLA_XCD_WAVE_CAP: the XCD planner re-cuts a plan that spills past whole work waves.
+    bool xcd_wave_cap;
     int32_t fixed_over_head_num_blocks;
     int32_t tail_done_threshold;
 };
