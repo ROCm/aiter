@@ -1120,12 +1120,14 @@ def build_gemm_a8w4_tdm_task(
                         e_idx = lane + i * WAVE
                         if const_expr((i + 1) * WAVE <= n_experts):
                             end_e = tile_map[e_idx]
-                            psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
+                            psum_hits = psum_hits + (end_e <= blk_m).select(
+                                fx.Int32(1), fx.Int32(0)
+                            )
                         else:
                             e_ok = e_idx < n_experts
                             end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
                             psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(
-                                1, 0
+                                fx.Int32(1), fx.Int32(0)
                             )
                     for sh in range_constexpr(int.bit_length(WAVE) - 1):
                         psum_hits = psum_hits + psum_hits.shuffle_xor(
@@ -1184,8 +1186,10 @@ def build_gemm_a8w4_tdm_task(
             for mi in range_constexpr(cluster_m):
                 peer_m = cluster_first_m + mi
                 same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
-                group_size = group_size + same_expert.select(1, 0)
+                column_mask = column_mask | same_expert.select(
+                    fx.Int32(1 << (mi * cluster_n)), fx.Int32(0)
+                )
+                group_size = group_size + same_expert.select(fx.Int32(1), fx.Int32(0))
             # A partial M-tail retains four independent copies of the current
             # 1x4 A protocol.  Disable B multicast there so sentinel rows can
             # take the existing early exit without entering a cluster barrier.
