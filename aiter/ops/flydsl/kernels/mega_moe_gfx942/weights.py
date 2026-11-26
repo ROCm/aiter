@@ -15,6 +15,7 @@ Output, still four tensors (``prepare_weights``):
 The kernels' FP8 operands are then exactly the input's MXFP4 values: a group within
 2^11 of its output channel's largest scale decodes exactly, and the decode flushes a
 group further below to 0, so such a group must hold only zeros (ValueError otherwise).
+A NaN scale (0xFF) is refused as well: the fd2 form has no NaN.
 
 a8w8 (``prepare_weights_a8w8``): fp8 W with f32 128x128 block scales.
   w1        [E, 2I, H]    float8_e4m3fnuz, rows [gate (I); up (I)], in aiter's fp8 MoE
@@ -175,6 +176,9 @@ def prepare_weights(w1, w1_scale, w2, w2_scale):
                 f"W {tuple(w.shape)} with {s_u8.numel()} scale bytes: expected N a "
                 "multiple of 32, K of 256, and one e8m0 byte per 32 K values"
             )
+        # e8m0 0xFF is NaN: the fd2 form has no NaN, so it would come out finite.
+        if bool((s_u8 == 0xFF).any()):
+            raise ValueError("an e8m0 scale is 0xFF (NaN): expected finite scales")
         exp = channel_exponents(w_u8, s_u8)  # from the original scales
         s_u8 = _predelta(w_u8, s_u8, exp)
         tail = exp.contiguous().view(-1).view(torch.uint8)

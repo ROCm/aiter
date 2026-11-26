@@ -211,10 +211,11 @@ def _make_weights_a8w4(rank):
 
 
 def test_prepare_weights_checks():
-    """prepare_weights refuses, before it launches anything on them, scales on another
-    device than W or of the wrong size; and MXFP4 weights that the kernels' FP8 decode
-    would flush: a 32-K group 12 binades below its output channel's largest scale must
-    hold only zeros. A one-expert layer, H 512, I 256."""
+    """prepare_weights refuses scales on another device than W or of the wrong size
+    (before it launches anything on them), NaN scales (e8m0 0xFF, which the fd2 form
+    cannot hold), and MXFP4 weights that the kernels' FP8 decode would flush: a 32-K
+    group 12 binades below its output channel's largest scale must hold only zeros. A
+    one-expert layer, H 512, I 256."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
     quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -247,6 +248,10 @@ def test_prepare_weights_checks():
     s1_shuffled = shuffle_scale_a16w4(s1, 1, False)
     refused("one GPU", w1_scale=s1_shuffled.cpu())
     refused("scale bytes", w1_scale=s1_shuffled.view(-1)[:-16])
+    nan_scale = s1_shuffled.clone()
+    # all scales NaN: every channel's maximum is 0xFF, so the distance checks pass
+    nan_scale.view(torch.uint8).fill_(0xFF)
+    refused("NaN", w1_scale=nan_scale)
     codes = s1.view(torch.uint8).view(512, 512 // 32)
     codes[0, 0], codes[0, 1] = 130, 130 - 12  # w1 row 0: group 1 is 12 binades down
     refused("binades")
