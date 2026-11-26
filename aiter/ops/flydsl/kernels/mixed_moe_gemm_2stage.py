@@ -27,26 +27,7 @@ __all__ = [
 ]
 
 
-# What the launchers below are built from, besides this file.
-_AOT_SOURCES = [
-    "kernels/mixed_moe_gemm_2stage_common.py",
-    "kernels/act.py",
-    "kernels/layout_utils.py",
-    "kernels/mfma_epilogues.py",
-    "kernels/mfma_preshuffle_pipeline.py",
-    "moe_common.py",
-]
-
-
-# The variables moe_common.py reads.
-_AOT_ENV = [
-    "AITER_FLYDSL_STAGE2_FP8",
-    "AITER_MXFP4_INTERMEDIATE",
-    "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
-]
-
-
-@aot_factory("mixed_moe_gemm1", sources=_AOT_SOURCES, env=_AOT_ENV)
+@aot_factory("mixed_moe_gemm1")
 @functools.cache
 def compile_mixed_moe_gemm1(
     *,
@@ -110,7 +91,7 @@ def compile_mixed_moe_gemm1(
     )
 
 
-@aot_factory("mixed_moe_gemm2", sources=_AOT_SOURCES, env=_AOT_ENV)
+@aot_factory("mixed_moe_gemm2")
 @functools.cache
 def compile_mixed_moe_gemm2(
     *,

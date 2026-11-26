@@ -19,8 +19,8 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_gating import (
     get_kda_gating_config,
     kda_gating_kernel,
 )
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

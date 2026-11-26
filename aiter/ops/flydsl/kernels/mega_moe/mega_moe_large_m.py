@@ -22,6 +22,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.utility import dtypes
 
 from .. import communication_ops_utils as comm_ops
@@ -1846,6 +1847,7 @@ def _wave_uniform_i64(addr):
 
 
 # fmt: off
+@aot_factory("mega_moe_large_m_stage1")
 @functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
@@ -2987,7 +2989,8 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     """The persistent kernel's launcher and its fused Stage2/Combine launch arguments.
 
     Returns ``(launch, fused, combine_cur_tok, combine_row_nbytes)``: ``fused`` are the i64 addresses that
-    follow ``addr_expected``; the two Combine i32 follow them.
+    follow ``addr_expected``; the two Combine i32 follow them. ``launch`` is compile_mega_moe_stage1's
+    ``lazy`` handle: pass it to ``_run_compiled`` or ``_preload_compiled`` only.
     """
     if len(fused_args) != 14:
         raise ValueError("fused Stage2 needs (mtile_ctr, 13 Stage2 runtime addresses)")
@@ -2995,7 +2998,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     c_args = tuple(fused_combine_args)
     if len(c_args) != 7:
         raise ValueError("fused Combine needs 7 runtime args")
-    launch = compile_mega_moe_stage1(
+    launch = compile_mega_moe_stage1.lazy(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
         fuse_scale_dim=fuse_scale_dim, fused_stage2=tuple(fused_stage2), fused_combine=tuple(fused_combine),
