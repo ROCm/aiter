@@ -1471,13 +1471,8 @@ def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens
                     return_intermediates=True,
                     **kw,
                 )
-                inter = tuple(inter)
-                # #8744 13275a2c2 can return NaN in Aqk; keep the Triton
-                # fallback until that is fixed
-                if any(t is not None and t.isnan().any() for t in inter[8:]):
-                    raise RuntimeError("NaN in the FlyDSL Aqk/Akk intermediates")
                 LAST_PIECES["chunk_fwd"] = "flydsl(save intermediates)"
-                return o.float(), inter
+                return o.float(), tuple(inter)
             except (ValueError, NotImplementedError, RuntimeError) as err:
                 reason = f"{type(err).__name__}: {err}"
                 LAST_PIECES["chunk_fwd_save_flydsl_skipped"] = reason

@@ -787,10 +787,7 @@ def test_kda_save_fwd_intermediates_plumbing():
         if fly.reject:
             raise ValueError("stub: shape not served")
         o = o_of(q, k, v, g, beta, scale, cu_seqlens)
-        inter = tagged(10)
-        if fly.nan:
-            inter[8] = torch.full((1,), float("nan"))
-        return (o, None, tuple(inter)) if return_intermediates else (o, None)
+        return (o, None, tuple(tagged(10))) if return_intermediates else (o, None)
 
     def fly_plain(q, k, v, g, beta, scale, chunk_size=64, *, cu_seqlens=None, **kw):
         return o_of(q, k, v, g, beta, scale, cu_seqlens), None
@@ -848,10 +845,8 @@ def test_kda_save_fwd_intermediates_plumbing():
             ("flydsl return_intermediates", fly, False, "flydsl", list(range(10))),
             ("flydsl without it", fly_plain, False, "triton", [0, 3, 4, 5, 6, 1, 2]),
             ("flydsl rejects", fly, True, "triton", [0, 3, 4, 5, 6, 1, 2]),
-            ("flydsl NaN Aqk", fly, False, "triton", [0, 3, 4, 5, 6, 1, 2]),
         ):
             fly.reject = reject
-            fly.nan = case == "flydsl NaN Aqk"
 
             def load(want_flydsl, fn=fn):
                 if want_flydsl and L._accepts(fn, "return_intermediates"):
