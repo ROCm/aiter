@@ -518,3 +518,59 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
     finally:
         gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
     assert launched == [job["kernel_name"] for job in jobs]
+
+
+def test_4wave_mxfp8_csv_rows_reach_flydsl_through_public_replay(tmp_path):
+    # A 4-wave row used to fail its replay: the scale shuffle's Triton launch is another
+    # backend's, and the dry run's Triton driver rejects it from under aiter/ops/flydsl.
+    # Run as a wheel build's replay does, in a process with the GPUs hidden.
+    from aiter.aot.flydsl.common import replay_env
+
+    source = (
+        _REPO_ROOT
+        / "aiter/configs/model_configs/minimax_m3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
+    )
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = [
+            row for row in reader if row["kernelName"].startswith("flydsl_mxfp8_4w_")
+        ]
+        fieldnames = reader.fieldnames
+    assert rows
+    path = tmp_path / "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    code = (
+        "import sys\n"
+        "from aiter.aot.flydsl import gemm, replay\n"
+        "from aiter.aot.flydsl.dry_run import dry_run\n"
+        "from aiter.ops.flydsl import gemm_a8w8_mxfp8_4wave as four_wave\n"
+        "jobs = gemm.parse_csv(sys.argv[1])\n"
+        f"assert len(jobs) == {len(rows)}, len(jobs)\n"
+        "launched = []\n"
+        "run_4wave = four_wave.run_gemm_a8w8_mxfp8_4wave\n"
+        "def record(*args, **kwargs):\n"
+        "    launched.append(args[5])\n"
+        "    return run_4wave(*args, **kwargs)\n"
+        "four_wave.run_gemm_a8w8_mxfp8_4wave = record\n"
+        "with dry_run('gfx950', 256, python_ops=True):\n"
+        "    for job in jobs:\n"
+        "        with replay.identified_kernels() as kernels:\n"
+        "            gemm.replay(job)\n"
+        "        assert kernels, job\n"
+        "assert launched == [job['kernel_name'] for job in jobs], launched\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        cwd=_REPO_ROOT,
+        env={
+            **replay_env("gfx950"),
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE": str(path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]

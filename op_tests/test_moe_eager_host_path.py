@@ -32,6 +32,7 @@ import aiter
 import aiter.fused_moe as fm
 from aiter import ActivationType, QuantType, dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.moev2.segments import sort as moev2_sort
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, run_perftest
 
@@ -644,7 +645,7 @@ def test_same_stream_threads_do_not_interfere():
         stream.wait_stream(torch.cuda.current_stream())
         sorted_first, release_first = threading.Event(), threading.Event()
         results, errors = [], []
-        original_sort = fm.moe_sorting
+        original_sort = moev2_sort.moe_sorting
 
         def gated_sort(*args, **kwargs):
             ret = original_sort(*args, **kwargs)
@@ -661,7 +662,7 @@ def test_same_stream_threads_do_not_interfere():
                 errors.append(exc)
 
         worker = threading.Thread(target=first_call, daemon=True)
-        with mock.patch.object(fm, "moe_sorting", gated_sort):
+        with mock.patch.object(moev2_sort, "moe_sorting", gated_sort):
             worker.start()
             try:
                 assert sorted_first.wait(30), f"first call did not reach sort: {errors}"
@@ -694,7 +695,7 @@ def test_workspace_size_is_the_ops():
     for policy, tokens, (experts, topk) in itertools.product(
         (0, 1, 2), (1, 7, 64, 2112, 16384), ((64, 8), (257, 9), (514, 12))
     ):
-        assert fm._moe_sorting_opus_workspace_size(
+        assert moev2_sort._moe_sorting_opus_workspace_size(
             tokens, experts, topk, policy, dev
         ) == aiter.moe_sorting_opus_get_workspace_size(
             tokens, experts, topk, policy, dev
