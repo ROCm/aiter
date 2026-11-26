@@ -432,6 +432,8 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
     "scale [2]": ({"k_scale": torch.ones(2)}, "one element each"),
     "block 16": ({"block": 16}, "block_size must be 128"),
     "aliased pages": ({"alias": True}, "page stride must be at least the page size"),
+    # a 4 B aligned stride would put the V 16 B loads / 64-bit atomics on misaligned addresses
+    "page stride 4 B aligned": ({"pad_stride": 4}, "(16 B aligned)"),
 }
 
 
@@ -453,6 +455,11 @@ def run_reject(name):
     kw.update(REJECT[name][0])
     block = kw.pop("block", PAGE)
     idx = torch.zeros(kw.pop("idx_bytes", 2 * HEAD_SIDE), dtype=torch.uint8)
+    pad = kw.pop("pad_stride", 0)
+    if pad:
+        kv = torch.zeros(2, 2 * nkv * HEAD_SIDE + pad, dtype=torch.uint8)[
+            :, : 2 * nkv * HEAD_SIDE
+        ]  # page stride 4 B above the page size
     if kw.pop("alias", False):
         kv = kv[:1].expand(2, -1)  # page stride 0: both pages are the same bytes
     aiter.fused_qknorm_idxrqknorm(

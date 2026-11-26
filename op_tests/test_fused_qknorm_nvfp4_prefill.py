@@ -28,6 +28,10 @@ EPS = 1e-6
 dev = "cuda"
 
 
+class NoSlots(Exception):
+    """make() cannot build this slot pattern for this n (the only reason a case is skipped)."""
+
+
 def distinct_from(g, total, k):
     return torch.randperm(total, generator=g, device="cpu")[:k]
 
@@ -111,7 +115,7 @@ def make_slots(kind, n, g):
         slot = torch.tensor(s[:n])
         nb = no // 16 + 2
         if slot.numel() < n:
-            raise RuntimeError("shared: too few slots")
+            raise NoSlots("shared: too few slots")
     elif kind == "rev":
         st = gi(128)[0]
         slot = torch.arange(st + n - 1, st - 1, -1)
@@ -211,21 +215,41 @@ def dig(t):
     ).hexdigest()[:16]
 
 
+def prefill_launched(n):
+    """Whether one raw-entry call at n tokens launches the prefill kernel (kernel-name trace)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    c = make(n, "contig", 0)
+    run(c, n)  # build and warm up outside the trace
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        run(c, n)
+    return any(
+        "fusedNvfp4InsertPrefillKernel" in e.name
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+    )
+
+
+# the prefill kernel reads qkv through a 32-bit byte extent: 2**31 // (ROW * 2) = 419430 tokens is
+# its largest call, the generic kernel takes the one above it
+BIG_N = (419430, 419431)
+
+
 def child(args):
     res = {}
-    for n in args.n:
-        for kind in args.kinds:
-            for seed in range(args.seeds):
-                try:
-                    c = make(n, kind, seed)
-                except (
-                    RuntimeError
-                ):  # the pattern needs more slots than it can make for this n
-                    continue
-                res[f"{n}/{kind}/{seed}"] = {k: dig(v) for k, v in run(c, n).items()}
-                res[f"{n}/{kind}/{seed}/marshalled"] = {
-                    k: dig(v) for k, v in run(c, n, marshalled=True).items()
-                }
+    cases = [(n, k, s) for n in args.n for k in args.kinds for s in range(args.seeds)]
+    cases += [(n, "aligned", 0) for n in BIG_N]
+    for n, kind, seed in cases:
+        try:
+            c = make(n, kind, seed)
+        except NoSlots:  # the pattern needs more slots than it can make for this n
+            continue
+        res[f"{n}/{kind}/{seed}"] = {k: dig(v) for k, v in run(c, n).items()}
+        res[f"{n}/{kind}/{seed}/marshalled"] = {
+            k: dig(v) for k, v in run(c, n, marshalled=True).items()
+        }
+        del c
+    res["_prefill_launched"] = prefill_launched(max(args.n))
     with open(args.child, "w") as f:
         json.dump(res, f)
 
@@ -293,6 +317,14 @@ def main():
         subprocess.run(cmd, env=env, check=True)
         with open(path) as f:
             out[tag] = json.load(f)
+        # the dispatch itself: a forced-prefill child must launch the prefill kernel and the
+        # generic child must not, or the digest comparison below proves nothing
+        launched = out[tag].pop("_prefill_launched")
+        assert launched == (tag == "prefill"), (
+            f"[{tag}] prefill kernel launched={launched}: the dispatch does not follow "
+            "AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS"
+        )
+        assert out[tag], f"[{tag}] no case ran"
     # the raw-pointer entry (every token count) against the generic marshalled entry, per floor
     for tag, digests in out.items():
         rawbad = [
@@ -302,9 +334,12 @@ def main():
             and digests[k] != digests[k + "/marshalled"]
         ]
         print(f"[{tag}] raw entry vs marshalled entry: {len(rawbad)} differ")
-        assert not rawbad, (
-            f"the raw entry differs from the marshalled entry: {rawbad[:5]}"
-        )
+        assert (
+            not rawbad
+        ), f"the raw entry differs from the marshalled entry: {rawbad[:5]}"
+    assert (
+        out["generic"].keys() == out["prefill"].keys()
+    ), "the two children ran different cases"
     out = {
         tag: {k: v for k, v in digests.items() if not k.endswith("/marshalled")}
         for tag, digests in out.items()

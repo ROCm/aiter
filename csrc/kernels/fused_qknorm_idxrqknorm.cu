@@ -1697,11 +1697,7 @@ static bool pfDeviceIsGfx950()
     int c = cache[dev].load(std::memory_order_relaxed);
     if(c == 0)
     {
-        hipDeviceProp_t prop;
-        c = (hipGetDeviceProperties(&prop, dev) == hipSuccess &&
-             std::strncmp(prop.gcnArchName, "gfx950", 6) == 0)
-                ? 1
-                : 2;
+        c = get_gpu_arch() == "gfx950" ? 1 : 2;
         cache[dev].store(c, std::memory_order_relaxed);
     }
     return c == 1;
@@ -1768,8 +1764,12 @@ static void pfLaunch(const scalar_t* qkv,
     }
 }
 
+// The kernel addresses qkv through a buffer descriptor whose byte extent and row offsets are 32-bit
+// ints: larger calls run the generic kernel (64-bit row addresses).
+constexpr int kPfMaxTokens = INT32_MAX / (kPfRow * 2);
+
 // Launches the prefill variant when this call is one it takes: gfx950, the TP4 head set, bf16,
-// bf16 q_out + e4m3 index_q_out, at least pfMinTokens() tokens. Returns false (nothing launched)
+// bf16 q_out + e4m3 index_q_out, from pfMinTokens() to kPfMaxTokens tokens. Returns false (nothing launched)
 // otherwise, and the caller runs the generic kernel.
 template <typename scalar_t>
 static bool launchNvfp4Prefill(const scalar_t* qkv,
@@ -1808,7 +1808,7 @@ static bool launchNvfp4Prefill(const scalar_t* qkv,
         if(!process_index || !insert_kv || q_out == nullptr || q_fp8_out != nullptr ||
            index_q_fp8_out == nullptr || nq != kPfNQ || nkv != kPfNKV || niq != kPfNIQ ||
            rotary_dim != kPfRot || num_tokens < 2 || num_tokens < pfMinTokens() ||
-           !pfDeviceIsGfx950())
+           num_tokens > kPfMaxTokens || !pfDeviceIsGfx950())
         {
             return false;
         }
@@ -2339,18 +2339,18 @@ static void fused_qknorm_idxrqknorm_impl(
         if(nvfp4_kv_cache)
         {
             // [num_pages, 2 * num_kv_heads * 9216] uint8, K side then V side; kv_cache_k and
-            // kv_cache_v are the same pages. The page stride (bytes) may be wider; 4 B aligned
-            // for the 32-bit V words.
+            // kv_cache_v are the same pages. The page stride (bytes) may be wider; 16 B aligned
+            // for the 16 B V loads and the 64-bit V nibble atomics.
             AITER_CHECK(block_size == kNvTokens,
                         "kv_cache_dtype='nvfp4' pages hold 128 tokens: block_size must be 128");
             AITER_CHECK(
                 kv_cache_k->dtype() == AITER_DTYPE_u8 && kv_cache_v->dtype() == AITER_DTYPE_u8 &&
                     kv_cache_k->data_ptr() == kv_cache_v->data_ptr() && kv_cache_k->dim() == 2 &&
                     kv_cache_k->size(1) == 2 * nkv * kNvHeadSide && kv_cache_k->stride(1) == 1 &&
-                    kv_cache_k->stride(0) % 4 == 0 && kv_cache_k->data_ptr() != nullptr &&
-                    reinterpret_cast<uintptr_t>(kv_cache_k->data_ptr()) % 4 == 0,
+                    kv_cache_k->stride(0) % 16 == 0 && kv_cache_k->data_ptr() != nullptr &&
+                    reinterpret_cast<uintptr_t>(kv_cache_k->data_ptr()) % 16 == 0,
                 "nvfp4 kv_cache_k and kv_cache_v must be the same uint8 "
-                "[num_pages, 2 * num_kv_heads * 9216] pages (4 B aligned)");
+                "[num_pages, 2 * num_kv_heads * 9216] pages (16 B aligned)");
             // A page stride below the page size (e.g. an expanded view, stride 0) would alias
             // distinct pages.
             AITER_CHECK(kv_cache_k->size(0) <= 1 || kv_cache_k->stride(0) >= kv_cache_k->size(1),

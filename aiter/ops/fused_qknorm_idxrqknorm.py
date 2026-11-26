@@ -106,6 +106,7 @@ def _nvfp4_raw_front(
     bf16 = torch.bfloat16
     if (
         qkv.dtype is not bf16
+        or qkv.dim() != 2
         or qkv.shape[1] != _NV_PF_ROW
         or not qkv.is_contiguous()
         or cos_sin_cache.dtype is not bf16
@@ -150,8 +151,8 @@ def _nvfp4_raw_front(
         or kv_cache_k.shape[1] != 2 * _NV_PF_PAGE
         or kv_cache_k.stride(1) != 1
         or kv_cache_k.stride(0) < 2 * _NV_PF_PAGE
-        or kv_cache_k.stride(0) % 4
-        or kv_cache_k.data_ptr() % 4
+        or kv_cache_k.stride(0) % 16
+        or kv_cache_k.data_ptr() % 16
         or index_cache is None
         or index_cache.dtype is not torch.uint8
         or not index_cache.is_contiguous()
@@ -265,7 +266,7 @@ def fused_qknorm_idxrqknorm(
     #   16 elements) straight into the pages, in the same pass as norm/RoPE. kv_cache_k and kv_cache_v are the
     #   same uint8 [num_pages, 2 * num_kv_heads * 9216] pages ([K data | K scale | V data | V scale]; K scale
     #   in MFMA lane order, V data in 32-bit words (8 tokens x 4 bit), V scale [group][token]), block_size 128,
-    #   4 B aligned page stride; V is written by atomic and/or on 32-bit words, so no two tokens of one call
+    #   16 B aligned page stride and base; V is written by atomic and/or on 32-bit words, so no two tokens of one call
     #   may share a slot;
     #   index_cache is whole contiguous 9216 B pages ([128 x 64 B e2m1][128 x 8 B e4m3]); k_scale / v_scale are
     #   the fp32 [1] global scales of K and V (the index key has none; they must be positive). The
