@@ -369,18 +369,10 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
                 lambda: P.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
             )
         if stage == "gate_proj_bwd":
-
-            def per_head(out):
-                dz, dterm = out
-                return dz, dterm.view(m, h, k).sum((0, 2))
-
+            # (dz, dA_log, d dt_bias)
             return (
-                lambda: per_head(
-                    fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
-                ),
-                lambda: per_head(
-                    P.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
-                ),
+                lambda: fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb),
+                lambda: P.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb),
             )
         x = torch.randn(m, d).to(dtype)
         g_proj = (torch.randn(hk, d) * d**-0.5).to(dtype)
