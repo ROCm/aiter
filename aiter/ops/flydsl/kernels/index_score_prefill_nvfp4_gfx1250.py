@@ -92,10 +92,21 @@ CHUNK_MAX = 32
 
 
 def compile_index_score_prefill_nvfp4(
-    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, _probe=""
+    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, _probe=""
 ):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight.
+
+    ``fold_max``: each WMMA's 8 values folded one by one into the running max
+    instead of a vector reduction first. The same maxnum, so the same scores (NaN
+    handling included); the reduction leaves two-input maxnums whose operands
+    LLVM quiets (``v_max_num_f32 x, x, x``), the fold is ``v_max3_num_f32``
+    only: 4 VALU instructions a WMMA instead of ~5.6 on an unmasked page.
+
+    ``_probe``: debug builds that write wrong scores, for timing only.
+    ``_nostore``: no score stores. ``_acc``: an unmasked page's dots of a query
+    tile summed through the WMMA's C operand and max-reduced once (the page loop
+    without its max epilogue).
 
     ``select`` = (init_blocks, local_blocks) builds the fused scorer + top-16
     instead (``chunk_max`` = ``CHUNK_MAX``, waves of whole 32 rows). The scores
@@ -131,7 +142,7 @@ def compile_index_score_prefill_nvfp4(
         raise ValueError(
             f"select needs chunk_max = {CHUNK_MAX} and waves of whole {WAVE} rows"
         )
-    key = (block_q, waves, ring, chunk_max, select, _probe)
+    key = (block_q, waves, ring, chunk_max, select, fold_max, _probe)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
@@ -146,6 +157,8 @@ def compile_index_score_prefill_nvfp4(
         buf: fx.Array[fx.Int32, total // 4, 16]
 
     name = f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}{_probe}"
+    if fold_max:
+        name += "_fold"
     if select:
         init_blocks, local_blocks = select
         name = name.replace("score", "topk") + f"_i{init_blocks}_l{local_blocks}"
@@ -331,6 +344,9 @@ def compile_index_score_prefill_nvfp4(
                     """Per query tile, this lane's max over its keys of the page
                     (causally masked on the diagonal pages only)."""
                     out = [fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)]
+                    acc = [None for _ in range_constexpr(tiles_per_wave)]
+                    # Probe ``_acc`` (unmasked pages): the dots summed through C.
+                    chain = const_expr(_probe == "_acc" and not masked)
                     for kt in range_constexpr(PAGE // 16):
                         key = kt * 16 + lane16
                         at = base + key * ROW + half * 16
@@ -344,7 +360,11 @@ def compile_index_score_prefill_nvfp4(
                             dots = _wmma_scale16(
                                 k_rows,
                                 q_ops[rt],
-                                fx.Vector.filled(8, 0.0, fx.Float32),
+                                (
+                                    acc[rt]
+                                    if const_expr(chain and kt > 0)
+                                    else fx.Vector.filled(8, 0.0, fx.Float32)
+                                ),
                                 k_scale,
                                 unit,
                                 "fp4_e2m1",
@@ -360,10 +380,20 @@ def compile_index_score_prefill_nvfp4(
                                     )
                                     for e in range_constexpr(8)
                                 ]
-                            m = fx.Vector.from_elements(vals, dtype=fx.Float32).reduce(
-                                ReductionOp.MAX
-                            )
-                            out[rt] = fx.maxnumf(out[rt], m)
+                            if const_expr(chain):
+                                acc[rt] = dots
+                                if const_expr(kt == PAGE // 16 - 1):
+                                    out[rt] = fx.Vector.from_elements(
+                                        vals, dtype=fx.Float32
+                                    ).reduce(ReductionOp.MAX)
+                            elif const_expr(fold_max):
+                                for e in range_constexpr(8):
+                                    out[rt] = fx.maxnumf(out[rt], vals[e])
+                            else:
+                                m = fx.Vector.from_elements(vals, dtype=fx.Float32).reduce(
+                                    ReductionOp.MAX
+                                )
+                                out[rt] = fx.maxnumf(out[rt], m)
                     return out
 
                 maxes = [fx.Float32(float("-inf")) for _ in range_constexpr(tiles_per_wave)]
