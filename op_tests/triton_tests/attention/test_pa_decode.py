@@ -1113,3 +1113,59 @@ def test_paged_attn_page128_busy_v1_output(
     assert launches == [(f"{expect}_w_dot", 128)]
     atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
     torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
+
+
+def _server_like_views(npages, heads, page, dim, device="cuda"):
+    """vLLM-style KV storage [B, H, page, 2*hs] split into (B, H, page, hs) views."""
+    stor = torch.empty(npages, heads, page, 2 * dim, dtype=torch.bfloat16, device="cuda")
+    stor.normal_(0, 0.1)
+    kv = stor.transpose(1, 2)
+    key4d, val4d = kv.split(dim, dim=-1)
+    return key4d.permute(0, 2, 1, 3), val4d.permute(0, 2, 1, 3)
+
+
+def test_pa_decode_deep_page_id_no_int32_overflow():
+    """Page-id x page-stride must not wrap int32 on large KV pools.
+
+    Plain vLLM-layout K/V strides are [pages * heads * page * 2 * hs] per
+    block-table entry; with heads 8, dim 512, page 16 that makes every page
+    131072 elements, so a pool beyond ~16k pages overflows int32 in any
+    kernel that computes block_id * page_stride in 32 bits (this regressed
+    production vLLM decode past engine page 16385 on MI300-class GPUs).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    heads, dim, page, npages = 8, 512, 16, 17000
+    key4d, val4d = _server_like_views(npages, heads, page, dim, device)
+    deep = npages - 1
+    # One-request, one-block decode at the deepest page of the pool.
+    lens = torch.tensor([page], dtype=torch.int32, device=device)
+    tables = torch.tensor([[deep]], dtype=torch.int32, device=device)
+    for nkv, nq in [(2, 8), (4, 4)]:  # GQA and MHA (wo_dot) variants
+        q = torch.randn(1, nq, dim, device=device).to(torch.bfloat16) * 0.25
+        out = torch.empty_like(q)
+        paged_attention_decode(
+            out,
+            q,
+            key4d[:, :nkv],
+            val4d[:, :nkv],
+            lens,
+            tables,
+            dim**-0.5,
+            page,
+            tl.bfloat16,
+            k_scale=torch.ones(1, device=device),
+            v_scale=torch.ones(1, device=device),
+            alibi_slopes=None,
+        )
+        torch.cuda.synchronize()
+        k = key4d[deep, :nkv].permute(1, 0, 2).float()
+        v = val4d[deep, :nkv].permute(1, 0, 2).float()
+        group = nq // nkv
+        qq = q[0].float().reshape(nkv, group, dim)
+        s = torch.einsum("kgd,tkd->kgt", qq, k) * (dim**-0.5)
+        expected = torch.einsum("kgt,tkd->kgd", s.softmax(-1), v).reshape(nq, dim)
+        diff = (out[0].float() - expected).abs()
+        assert diff.amax() < 2e-3, (nkv, diff.amax().item())
