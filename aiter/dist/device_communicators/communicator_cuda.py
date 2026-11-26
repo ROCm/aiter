@@ -242,9 +242,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """Return the requested all-to-all manager, creating it on demand.
 
         Callers that require a particular transport should name it explicitly.
-        Constructing a manager also initializes all resources owned by that
-        backend; callers that use a different communication path should not call
-        this method.
+        Constructing a manager may initialize resources owned by that backend
+        (the ``"mori"`` manager only registers the group; mori's shmem heap is
+        initialized when a handle first needs it); callers that use a
+        different communication path should not call this method.
         """
         if not self.use_all2all:
             raise RuntimeError(

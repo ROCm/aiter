@@ -1850,6 +1850,11 @@ class GroupCoordinator:
         A ``reuse_from`` group borrows its process groups and (unless EP) its
         device_communicator; only the owner tears those down, since a second
         destroy raises and aborts teardown part-way.
+
+        The device communicator goes first, while the process groups are still
+        alive: releasing IPC buffers shared with the peers (custom / quick
+        all-reduce inboxes, the FlyDSL all-to-all heaps) needs the ranks to
+        agree that every peer is done with them.
         """
         # Communicators first: their teardown may sync the ranks over cpu_group.
         if self.device_communicator is not None:
