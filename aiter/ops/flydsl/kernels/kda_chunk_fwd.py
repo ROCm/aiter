@@ -17,6 +17,9 @@ inter-chunk recurrence between ``intra`` and ``output`` is the GDN K5 kernel.
   ``qg = q exp2(g)`` and ``kg = k exp2(g_last - g)``.
 * ``output``: ``o = scale * qg h + Aqk v_new``.
 
+The intra off-diagonal ``Aqk`` / ``Akk`` tiles, ``w`` / ``u`` and both
+``output`` GEMMs run on the 16x16x16 bf16 MFMA, one 16-row tile per wave.
+
 Every program owns one 64-token chunk of one head with 256 threads (the gate
 kernel: 128). Operand tiles are staged in LDS and the contractions run as fp32
 FMAs: thread ``tid`` owns row ``tid // 4`` and the columns ``tid % 4 + 4 * e``
@@ -136,6 +139,51 @@ def _row_sum(x):
     """Sum over the 4 lanes that share a row."""
     x = x + x.shuffle_xor(fx.Int32(1), fx.Int32(64))
     return x + x.shuffle_xor(fx.Int32(2), fx.Int32(64))
+
+
+def _lds4(arr, n):
+    """LDS view addressed in aligned groups of 4 elements."""
+    return arr.view(fx.make_layout((n // 4, 4), (4, 1)))
+
+
+def lds_ld4(view4, i, num=fx.Float32):
+    """4 contiguous elements starting at element ``i`` (a multiple of 4)."""
+    frag = fx.make_rmem_tensor(4, num)
+    bits = 64 if num is fx.BFloat16 else 128
+    fx.copy(
+        fx.make_copy_atom(fx.UniversalCopy(bits), num),
+        fx.slice(view4, (i // 4, None)),
+        frag,
+    )
+    return fx.Vector(frag.load())
+
+
+def _bf4(vals):
+    return fx.Vector.from_elements(
+        [fx.Float32(x).to(fx.BFloat16) for x in vals], dtype=fx.BFloat16
+    )
+
+
+def _mfma(a, b, acc):
+    """One ``v_mfma_f32_16x16x16_bf16_1k`` on bare v4 register values.
+
+    Lane ``l`` holds ``A[l % 16][4 * (l // 16) + v]``,
+    ``B[4 * (l // 16) + v][l % 16]`` and returns
+    ``C[4 * (l // 16) + v][l % 16]``.
+    """
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    fa = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    fb = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    fc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+    fx.memref_store_vec(a, fa)
+    fx.memref_store_vec(b, fb)
+    fx.memref_store_vec(acc, fc)
+    fx.mma_atom_call(mma, fc, fa, fb, fc)
+    return fx.Vector(fx.memref_load_vec(fc))
+
+
+def _zero4():
+    return fx.Vector.filled(4, 0.0, fx.Float32)
 
 
 def _l2norm(x):
@@ -369,33 +417,92 @@ def compile_intra(
                     stg(_flat(bn, hb), r * H, beta_r, fx.Float32)
         gpu.barrier()
 
-        # Aqk[r, j] / Akk[r, j] = sum_k {q, k}[r, k] k[j, k] exp2(g[r, k] - g[j, k])
-        for kk, st in range(0, K, 1, init=[_zero()] * 32):
-            kq = fx.Int32(kk)
-            qx = lds_ld(s_q, r * K + kq)
-            kx = lds_ld(s_k, r * K + kq)
-            gx = lds_ld(s_g, r * K + kq)
-            acc_q, acc_k = [], []
-            for e in range_constexpr(16):
-                j = seg + 4 * e
-                ex = _exp2(_sel(j <= r, gx - lds_ld(s_g, j * K + kq), _zero()))
-                kj = lds_ld(s_k, j * K + kq) * ex
-                acc_q.append(st[e] + qx * kj)
-                acc_k.append(st[16 + e] + kx * kj)
-            res = yield acc_q + acc_k
-        acc = _results(res, 32)
-
+        lane = tid % 64
+        wave = tid // 64
+        lr = lane % 16
+        lk = (lane // 16) * 4
         aqk_v = _flat(Aqk, hb * BT)
-        for e in range_constexpr(16):
-            j = seg + 4 * e
-            lds_st(s_l, r * BT + j, _sel(j < r, acc[16 + e] * beta_r, _zero()))
-            if rv:
+        s_q4 = _lds4(lds.q, BT * K)
+        s_k4 = _lds4(lds.k, BT * K)
+        s_g4 = _lds4(lds.g, BT * K)
+        s_x4 = _lds4(lds.x, BT * BT)
+
+        # Off-diagonal 16x16 tiles (I = wave > J) on MFMA. The decay splits at
+        # gn = g[end of block J]: exp2(g_i - gn) and exp2(gn - g_j) are both
+        # <= 1 there, so the bf16 operands neither overflow nor need masking.
+        ia = wave * 16 + lr  # A-operand row
+        for J in range_constexpr(BT // 16 - 1):
+            jb = J * 16 + lr  # B-operand row (column j of the tile)
+            gn_row = _min(fx.Int32(J * 16 + 15), nvalid - 1)
+            acc_q = _zero4()
+            acc_k = _zero4()
+            for kt in range_constexpr(K // 16):
+                kc = kt * 16 + lk
+                gn = lds_ld4(s_g4, gn_row * K + kc)
+                gi = lds_ld4(s_g4, ia * K + kc)
+                qi = lds_ld4(s_q4, ia * K + kc)
+                ki = lds_ld4(s_k4, ia * K + kc)
+                gj = lds_ld4(s_g4, jb * K + kc)
+                kj = lds_ld4(s_k4, jb * K + kc)
+                # min(., 0) only bites on padded rows (g = 0), where it keeps inf * 0 out.
+                di = [
+                    _exp2(_min(gi[vi] - gn[vi], _zero())) for vi in range_constexpr(4)
+                ]
+                bj = _bf4(
+                    [kj[vi] * _exp2(gn[vi] - gj[vi]) for vi in range_constexpr(4)]
+                )
+                acc_q = _mfma(
+                    _bf4([qi[vi] * di[vi] for vi in range_constexpr(4)]), bj, acc_q
+                )
+                acc_k = _mfma(
+                    _bf4([ki[vi] * di[vi] for vi in range_constexpr(4)]), bj, acc_k
+                )
+            if wave > J:
+                for vi in range_constexpr(4):
+                    i = wave * 16 + lk + vi
+                    j = J * 16 + lr
+                    lds_st(s_l, i * BT + j, acc_k[vi] * lds_ld(s_b, i))
+                    if i < nvalid:
+                        stg(aqk_v, i * (H * BT) + j, acc_q[vi] * scale, fx.Float32)
+
+        # Diagonal tiles in fp32 with the exact pairwise decay: wave I, row
+        # 16I + lane // 4, columns 16I + lane % 4 + 4p.
+        di_r = wave * 16 + lane // 4
+        for kk, st in range(0, K, 1, init=[_zero()] * 8):
+            kq = fx.Int32(kk)
+            qx = lds_ld(s_q, di_r * K + kq)
+            kx = lds_ld(s_k, di_r * K + kq)
+            gx = lds_ld(s_g, di_r * K + kq)
+            acc_q, acc_k = [], []
+            for p in range_constexpr(4):
+                j = wave * 16 + lane % 4 + 4 * p
+                ex = _exp2(
+                    _sel(
+                        j <= di_r, _min(gx - lds_ld(s_g, j * K + kq), _zero()), _zero()
+                    )
+                )
+                kj = lds_ld(s_k, j * K + kq) * ex
+                acc_q.append(st[p] + qx * kj)
+                acc_k.append(st[4 + p] + kx * kj)
+            res = yield acc_q + acc_k
+        acc = _results(res, 8)
+        beta_d = lds_ld(s_b, di_r)
+        for p in range_constexpr(4):
+            j = wave * 16 + lane % 4 + 4 * p
+            lds_st(s_l, di_r * BT + j, _sel(j < di_r, acc[4 + p] * beta_d, _zero()))
+            if di_r < nvalid:
                 stg(
                     aqk_v,
-                    r * (H * BT) + j,
-                    _sel(j <= r, acc[e] * scale, _zero()),
+                    di_r * (H * BT) + j,
+                    _sel(j <= di_r, acc[p] * scale, _zero()),
                     fx.Float32,
                 )
+        # Aqk above the diagonal tiles is zero.
+        if rv:
+            for e in range_constexpr(16):
+                j = seg + 4 * e
+                if j // 16 > r // 16:
+                    stg(aqk_v, r * (H * BT) + j, _zero(), fx.Float32)
 
         qg_v = _flat(qg, hk)
         kg_v = _flat(kg, hk)
@@ -412,9 +519,10 @@ def compile_intra(
         vb_r = [_sel(rv, ldg(v_v, row + c, VN), _zero()) * beta_r for c in cols]
         gpu.barrier()
 
+        # Transposed ([col][token]) so each MFMA B operand is 4 contiguous tokens.
         for e in range_constexpr(NE):
-            lds_st(s_q, r * K + cols[e], kb_r[e])
-            lds_st(s_k, r * V + cols[e], vb_r[e])
+            lds_st(s_q, cols[e] * BT + r, kb_r[e])
+            lds_st(s_k, cols[e] * BT + r, vb_r[e])
 
         # Forward substitution, one row of X = (I + L)^-1 per step:
         # X[i, c] = [i == c] - sum_{j < i} L[i, j] X[j, c]. Thread r owns column r.
@@ -438,25 +546,27 @@ def compile_intra(
                 j = seg + 4 * e
                 stg(akk_v, r * (H * BT) + j, lds_ld(s_x, r * BT + j), fx.Float32)
 
-        # w = X (beta k exp2(g)), u = X (beta v)
-        for j, st in range(0, BT, 1, init=[_zero()] * (2 * NE)):
-            jq = fx.Int32(j)
-            a = _sel(jq <= r, lds_ld(s_x, r * BT + jq), _zero())
-            acc_w = [
-                st[e] + a * lds_ld(s_q, jq * K + cols[e]) for e in range_constexpr(NE)
-            ]
-            acc_u = [
-                st[NE + e] + a * lds_ld(s_k, jq * V + cols[e])
-                for e in range_constexpr(NE)
-            ]
-            res = yield acc_w + acc_u
-        acc = _results(res, 2 * NE)
-        if rv:
-            w_v = _flat(w, hk)
-            u_v = _flat(u, hk)
-            for e in range_constexpr(NE):
-                stg(w_v, r * (H * K) + cols[e], acc[e], BF)
-                stg(u_v, r * (H * V) + cols[e], acc[NE + e], BF)
+        # w = X (beta k exp2(g)), u = X (beta v) on MFMA: wave I owns rows
+        # 16I..16I+15; X is lower triangular, so its upper tiles add zeros.
+        xa = [
+            _bf4(list(lds_ld4(s_x4, ia * BT + jt * 16 + lk)))
+            for jt in range_constexpr(BT // 16)
+        ]
+        w_v = _flat(w, hk)
+        u_v = _flat(u, hk)
+        for nt in range_constexpr(K // 16):
+            c = nt * 16 + lr
+            acc_w = _zero4()
+            acc_u = _zero4()
+            for jt in range_constexpr(BT // 16):
+                tj = jt * 16 + lk
+                acc_w = _mfma(xa[jt], _bf4(list(lds_ld4(s_q4, c * BT + tj))), acc_w)
+                acc_u = _mfma(xa[jt], _bf4(list(lds_ld4(s_k4, c * BT + tj))), acc_u)
+            for vi in range_constexpr(4):
+                i = wave * 16 + lk + vi
+                if i < nvalid:
+                    stg(w_v, i * (H * K) + nt * 16 + lr, acc_w[vi], BF)
+                    stg(u_v, i * (H * V) + nt * 16 + lr, acc_u[vi], BF)
 
     @flyc.jit
     def launch(
@@ -508,9 +618,9 @@ def compile_output(
     @fx.struct
     class Smem:
         h: fx.Array[fx.BFloat16, V * K, 16]  # K5 snapshot h[v][k]
-        qg: fx.Array[fx.Float32, BT * K, 16]
-        vn: fx.Array[fx.Float32, BT * V, 16]
-        a: fx.Array[fx.Float32, BT * BT, 16]
+        qg: fx.Array[fx.BFloat16, BT * K, 16]
+        vn: fx.Array[fx.BFloat16, V * BT, 16]  # v_new^T [v][t]
+        a: fx.Array[fx.BFloat16, BT * BT, 16]
 
     @flyc.kernel(name="kda_fwd_output_flydsl")
     def kernel(
@@ -529,8 +639,6 @@ def compile_output(
         b = i_bh // H
         h = i_bh % H
         tid = fx.thread_idx.x
-        r = tid // 4
-        seg = tid % 4
         NT = (T + (BT - 1)) // BT
         t0, nvalid = _chunk_of(i_t, T, varlen, cbos, clen)
         hb = fx.Int64(b * T + t0) * H + fx.Int64(h)
@@ -540,59 +648,56 @@ def compile_output(
         lds = fx.SharedAllocator().allocate(Smem).peek()
         s_h = _lds(lds.h, V * K)
         s_qg = _lds(lds.qg, BT * K)
-        s_vn = _lds(lds.vn, BT * V)
+        s_vn = _lds(lds.vn, V * BT)
         s_a = _lds(lds.a, BT * BT)
         h_v = _flat(hs, state)
         for e in range_constexpr(V * K // NUM_THREADS):
             i = tid + e * NUM_THREADS
             lds_st(s_h, i, ldg(h_v, i, HN), BF)
-        _load_tile(_flat(qg, hb * K), H * K, s_qg, BT, K, nvalid, tid, BF, fx.Float32)
+        _load_tile(_flat(qg, hb * K), H * K, s_qg, BT, K, nvalid, tid, BF, BF)
+        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        for e in range_constexpr(BT * V // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // V
+            c = i % V
+            ok = t < nvalid
+            x = ldg(vn_v, _sel(ok, t, 0) * V + c, VN)
+            lds_st(s_vn, c * BT + t, _sel(ok, x, _zero()), BF)
         _load_tile(
-            _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V),
-            V,
-            s_vn,
-            BT,
-            V,
-            nvalid,
-            tid,
-            VN,
-            fx.Float32,
-        )
-        _load_tile(
-            _flat(Aqk, hb * BT),
-            H * BT,
-            s_a,
-            BT,
-            BT,
-            nvalid,
-            tid,
-            fx.Float32,
-            fx.Float32,
+            _flat(Aqk, hb * BT), H * BT, s_a, BT, BT, nvalid, tid, fx.Float32, BF
         )
         gpu.barrier()
 
-        cols = [seg + 4 * e for e in range_constexpr(NE)]
-        for kk, st in range(0, K, 1, init=[_zero()] * NE):
-            kq = fx.Int32(kk)
-            x = lds_ld(s_qg, r * K + kq)
-            res = yield [
-                st[e] + x * lds_ld(s_h, cols[e] * K + kq, BF)
-                for e in range_constexpr(NE)
-            ]
-        inter = _results(res, NE)
-        for j, st in range(
-            0, BT, 1, init=[inter[e] * scale for e in range_constexpr(NE)]
-        ):
-            jq = fx.Int32(j)
-            a = lds_ld(s_a, r * BT + jq)
-            res = yield [
-                st[e] + a * lds_ld(s_vn, jq * V + cols[e]) for e in range_constexpr(NE)
-            ]
-        acc = _results(res, NE)
-        if r < nvalid:
-            o_v = _flat(o, hb * V)
-            for e in range_constexpr(NE):
-                stg(o_v, r * (H * V) + cols[e], acc[e], ON)
+        # o = scale * qg h + Aqk v_new on MFMA; wave I owns rows 16I..16I+15.
+        lane = tid % 64
+        wave = tid // 64
+        lr = lane % 16
+        lk = (lane // 16) * 4
+        ia = wave * 16 + lr
+        s_h4 = _lds4(lds.h, V * K)
+        s_qg4 = _lds4(lds.qg, BT * K)
+        s_vn4 = _lds4(lds.vn, V * BT)
+        s_a4 = _lds4(lds.a, BT * BT)
+        qa = [
+            lds_ld4(s_qg4, ia * K + kt * 16 + lk, BF) for kt in range_constexpr(K // 16)
+        ]
+        aa = [
+            lds_ld4(s_a4, ia * BT + jt * 16 + lk, BF)
+            for jt in range_constexpr(BT // 16)
+        ]
+        o_v = _flat(o, hb * V)
+        for nt in range_constexpr(V // 16):
+            c = nt * 16 + lr
+            acc_h = _zero4()
+            for kt in range_constexpr(K // 16):
+                acc_h = _mfma(qa[kt], lds_ld4(s_h4, c * K + kt * 16 + lk, BF), acc_h)
+            acc_v = _zero4()
+            for jt in range_constexpr(BT // 16):
+                acc_v = _mfma(aa[jt], lds_ld4(s_vn4, c * BT + jt * 16 + lk, BF), acc_v)
+            for vi in range_constexpr(4):
+                i = wave * 16 + lk + vi
+                if i < nvalid:
+                    stg(o_v, i * (H * V) + c, acc_h[vi] * scale + acc_v[vi], ON)
 
     @flyc.jit
     def launch(
