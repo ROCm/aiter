@@ -37,6 +37,8 @@ H, I, E, TOPK = 6144, 768, 128, 4
 # element, dominates; the requantization codes agree with the kernels'). The gate is 6x above it
 # and ~2 orders below the error of any layout, expert-offset or K-order mistake (O(1)).
 TOL = 0.01
+# worst single token (per-row Frobenius): rows carry fewer elements than the batch, so more rounding noise
+TOL_ROW = 0.02
 
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -168,6 +170,8 @@ def _reference(n, logical, ids, wt):
     x8 = q8.view(torch.float8_e4m3fn).float() * _e8m0(s8).repeat_interleave(32, dim=-1)
     slots = torch.zeros((n, TOPK, H), device=x.device)
     for e in ids.unique().tolist():
+        if not 0 <= e < E:  # a dropped route: its slot stays zero
+            continue
         tok, slot = (ids == e).nonzero(as_tuple=True)
         wg = _fp4_to_f32(w13[e]) * _e8m0(e13[e])  # (2, I, H)
         gate, up = x[tok] @ wg[0].T, x[tok] @ wg[1].T
@@ -183,6 +187,13 @@ def _reference(n, logical, ids, wt):
 
 def _rel(out, ref):
     return ((out.float() - ref).norm() / ref.norm()).item()
+
+
+def _rel_rows(out, ref):
+    """Worst per-token relative error: a batch-wide norm lets a corrupted chunk of one token hide."""
+    n = out.shape[0]
+    d = (out.float() - ref).reshape(n, -1).norm(dim=1)
+    return (d / ref.reshape(n, -1).norm(dim=1)).max().item()
 
 
 @pytest.mark.parametrize("n", [8, 16, 24, 40, 64, 97, 128])
@@ -202,6 +213,37 @@ def test_decode_expert_gemms_matches_torch(n):
     print(f"n={n}: routed rel err {err:.4f}, shared rel err {err_sh:.4f}")
     assert err < TOL, err
     assert err_sh < TOL, err_sh
+    # per token: localized corruption of one row (a missing store, a wrong row / scale offset) is not diluted
+    assert _rel_rows(out, ref) < TOL_ROW, _rel_rows(out, ref)
+    assert _rel_rows(sh_out, ref_sh) < TOL_ROW, _rel_rows(sh_out, ref_sh)
+
+
+@pytest.mark.parametrize("case", ["all_dropped", "mixed"])
+def test_decode_expert_gemms_dropped_routes_are_zero(case):
+    """An id outside [0, E) (a dropped route) leaves a zero slot row, not uninitialized memory; the valid slots and
+    the shared expert are unaffected."""
+    n = 16
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(99)
+    logical, args = _build(n, dev, g)
+    ids, wt = args[-2], args[-1]
+    if case == "all_dropped":
+        ids.fill_(-1)
+    else:
+        ids[:, 1] = -1
+        ids[0, :] = E
+        ids[3, 2] = 2**20
+    valid = (ids >= 0) & (ids < E)
+    ref, ref_sh = _reference(n, logical, ids, wt)
+    # poison the allocator: a torch.empty slot buffer would come back holding NaNs
+    poison = torch.full((n, TOPK, H), float("nan"), dtype=torch.bfloat16, device=dev)
+    del poison
+    out, sh_out = D.decode_expert_gemms(D.get_plan(n), *args)
+    torch.cuda.synchronize()
+    assert (out[~valid] == 0).all(), "dropped slots must be exactly zero"
+    if valid.any():
+        assert _rel(out[valid], ref[valid]) < TOL
+    assert _rel(sh_out, ref_sh) < TOL
 
 
 def test_decode_expert_gemms_rejects_bad_operands():
@@ -384,10 +426,6 @@ def test_decode_expert_gemms_matches_amd_kernels(n, asm):
         assert torch.equal(_bits(sh_out), _bits(ref_sh))
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v", "-s"]))
-
-
 @pytest.mark.parametrize("n", [8, 24, 64, 128])
 def test_decode_expert_gemms_w13_split_layout_is_bitwise_equal(n):
     """The routed w13 read in place in its preshuffled [E, 2, I/16, block] layout gives the same bits as the
@@ -410,3 +448,7 @@ def test_decode_expert_gemms_w13_split_layout_is_bitwise_equal(n):
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), out_s.view(torch.int16))
     assert torch.equal(sh.view(torch.int16), sh_s.view(torch.int16))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v", "-s"]))

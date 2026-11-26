@@ -24,6 +24,7 @@ from .decode_expert_tiles import (
     compile_gemm2_shared_first,
 )
 from .decode_id_routing import TOPK
+from .decode_router_common import SUPPORTED_ARCH, on_supported_device
 from .decode_tile_primitives import (
     id_pairs_for,
     max_sorted_rows,
@@ -139,6 +140,8 @@ def _bytes(t, nbytes, name, dev):
 def _check_operands(n, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
     dev = xq.device
     assert dev.type == "cuda", dev
+    # the tiles issue gfx950-only scaled-MFMA / conversion instructions
+    assert on_supported_device(xq), f"needs a {SUPPORTED_ARCH} GPU, got {dev}"
     w13, s13, w2, s2 = w
     sw13, ss13, sw2, ss2 = shared
     ops = (
@@ -180,7 +183,7 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
         topk_ids, topk_w: (n, 4) int32 ids / float32 weights.
 
     Returns:
-        ``(slots, shared_out)``: (n, 4, H) BF16 weighted routed slot rows and (n, H) BF16
+        ``(slots, shared_out)``: (n, 4, H) BF16 weighted routed slot rows (zero for an id outside [0, E)) and (n, H) BF16
         shared-expert output, for the caller's slot + shared reduction.
     """
     n, dev = plan.n, xq.device
@@ -195,7 +198,9 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
     nv = torch.empty(rows, device=dev, dtype=torch.int32)
     q = torch.empty((rows, 384), device=dev, dtype=torch.uint8)
     s = torch.empty((rows, 24), device=dev, dtype=torch.uint8)
-    out = torch.empty((n, 4, H), device=dev, dtype=torch.bfloat16)
+    # zeros, not empty: GEMM2 writes only the slots of routed ids in [0, E); an id outside it (a dropped route) must
+    # read as a zero row in the caller's slot reduction, not as uninitialized memory
+    out = torch.zeros((n, 4, H), device=dev, dtype=torch.bfloat16)
     hq = torch.empty((n, 768), device=dev, dtype=torch.uint8)
     hs = torch.empty((n, 24), device=dev, dtype=torch.uint8)
     sh_out = torch.empty((n, H), device=dev, dtype=torch.bfloat16)

@@ -73,11 +73,12 @@ def router_gemm_partials(
             kernel and tile of the router launch. None is returned for a ``direct`` / ``lines`` cfg without
             ``router_weight_lines``.
     """
+    if hidden_states.dim() != 2:
+        return None
     m = hidden_states.shape[0]
     if (
         m == 0
         or m > MAX_ROWS
-        or hidden_states.dim() != 2
         or hidden_states.shape[1] != H
         or hidden_states.dtype != torch.bfloat16
         or hidden_states.stride(1) != 1
