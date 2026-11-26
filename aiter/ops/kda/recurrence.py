@@ -12,7 +12,9 @@ pair, Triton or FlyDSL; ``cp_context`` adds chunkwise context parallelism
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -37,6 +39,8 @@ __all__ = [
     "kda_recurrence",
     "kda_transition",
 ]
+
+_LOGGER = logging.getLogger("aiter")
 
 # The backward recomputes with the default pipeline's chunk size when unset.
 _BWD_DEFAULT_CHUNK_SIZE = 64
@@ -104,10 +108,81 @@ def _triton_fwd(fwd_backend: str):
             backend = "flydsl" if supported else "triton"
         else:
             backend = fwd_backend
+        if backend == "triton" and kw["chunk_size"] is None and _flash_kda_blocker():
+            kw = dict(kw, chunk_size=_PIPELINE_CHUNK_SIZE)
         with torch.no_grad():
-            return chunk_kimi_delta_attn(q, k, v, g, beta, fwd_backend=backend, **kw)
+            try:
+                return chunk_kimi_delta_attn(
+                    q, k, v, g, beta, fwd_backend=backend, **kw
+                )
+            except _gluon_errors() as e:
+                if (
+                    backend != "triton"
+                    or kw["chunk_size"] == _PIPELINE_CHUNK_SIZE
+                    or isinstance(e, torch.OutOfMemoryError)
+                ):
+                    raise
+                _disable_flash_kda(f"the FlashKDA forward raised {e!r}")
+                kw = dict(kw, chunk_size=_PIPELINE_CHUNK_SIZE)
+                return chunk_kimi_delta_attn(
+                    q, k, v, g, beta, fwd_backend=backend, **kw
+                )
 
     return fwd
+
+
+# FlashKDA, the gluon chunk-32 forward, is what an unset chunk size selects
+# when the call qualifies; chunk 64 always runs the Triton chunk pipeline.
+_PIPELINE_CHUNK_SIZE = 64
+_GLUON_MIN_TRITON = (3, 7)
+# Why this process skips FlashKDA; "" once probed and usable.
+_flash_kda_off: str | None = None
+
+
+def _disable_flash_kda(reason: str) -> None:
+    global _flash_kda_off
+    _flash_kda_off = reason
+    _LOGGER.warning(
+        "aiter KDA: %s; the Triton backend runs the chunk-%d pipeline instead.",
+        reason,
+        _PIPELINE_CHUNK_SIZE,
+    )
+
+
+def _flash_kda_blocker() -> str | None:
+    """Why FlashKDA cannot run here (gluon missing, or triton < 3.7), probed once."""
+    global _flash_kda_off
+    if _flash_kda_off is None:
+        import triton
+
+        version = tuple(int(p) for p in re.findall(r"\d+", triton.__version__)[:2])
+        try:
+            from triton.experimental import gluon  # noqa: F401
+        except ImportError as e:
+            _disable_flash_kda(f"triton.experimental.gluon is unavailable ({e})")
+        else:
+            if version < _GLUON_MIN_TRITON:
+                _disable_flash_kda(
+                    f"the gluon FlashKDA forward needs triton >= 3.7, found "
+                    f"{triton.__version__}"
+                )
+            else:
+                _flash_kda_off = ""
+    return _flash_kda_off or None
+
+
+def _gluon_errors() -> tuple[type[BaseException], ...]:
+    """What a gluon kernel that cannot build or launch raises."""
+    from triton.compiler.errors import CompilationError
+
+    return (
+        AttributeError,
+        CompilationError,
+        ImportError,
+        NotImplementedError,
+        RuntimeError,
+        TypeError,
+    )
 
 
 def _triton_bwd(bwd_backend: str):
@@ -139,6 +214,10 @@ def get_kda_kernels(backend: str | KdaKernels | None = None) -> KdaKernels:
     runs the FlyDSL forward (gfx950, bf16, ``K = V = 128``, chunk 64, no GVA;
     other calls raise) and the FlyDSL backward, which falls back to Triton per
     call. ``"auto"`` takes the FlyDSL forward only where it is supported.
+
+    The Triton forward with an unset ``chunk_size`` may pick the gluon
+    FlashKDA path; without gluon or below triton 3.7, or once that path
+    raises, it logs why and runs the chunk-64 Triton pipeline instead.
     """
     if isinstance(backend, KdaKernels):
         return backend
