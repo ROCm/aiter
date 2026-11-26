@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
+import functools
 import os
 
 import flydsl.compiler as flyc
@@ -10,6 +11,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 
 from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
@@ -718,6 +721,24 @@ def compile_gemm2_a4w4_port(
 
 # ---- launcher cache + dispatch (compile once per config, fast-dispatch after) ----
 G2_CACHE = {}
+_G2_AOT_CACHE = FlyDSLAotCache(
+    "mxmoe_gemm2",
+    sources=[
+        "kernels/mxmoe_gemm_v2.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/dpp_utils.py",
+        "kernels/act.py",
+        "kernels/layout_utils.py",
+    ],
+    # Read below; their values are also in get_g2's key.
+    env=[
+        "MXFP4_G2_ASCALE_PF",
+        "MXFP4_G2_BF16_LDS",
+        "MXFP4_G2_BHOIST",
+        "MXFP4_G2_PREFETCH_IDS",
+        "MXFP4_G2_SPART",
+    ],
+)
 
 
 def get_g2(
@@ -785,7 +806,8 @@ def get_g2(
     )
     launch = G2_CACHE.get(key)
     if launch is None:
-        launch = compile_gemm2_a4w4_port(
+        compile_g2 = functools.partial(
+            compile_gemm2_a4w4_port,
             BM=BM,
             BN=BN,
             BK=BK,
@@ -809,6 +831,10 @@ def get_g2(
             use_valid_token_count=use_valid_token_count,
             g2_scatter_lds_pairs=g2_scatter_lds_pairs,
         )
+        # The key holds every compile argument, the env knobs resolved above
+        # included. The cache builds an entry from a launcher it compiles
+        # itself, so that the files the compile runs are recorded with it.
+        launch = bind_aot(compile_g2(), _G2_AOT_CACHE, key, compile_g2)
         G2_CACHE[key] = launch
     return launch
 

@@ -42,6 +42,11 @@ DEFAULT_MNK_GFX950 = [
     for m in (1, 16, 37, 64, 300, 1024, 4096)
 ]
 
+# gfx950, untuned K that 128 does not divide: no mxpsh tile runs it, so the
+# entry falls back to the batched GEMM's heuristic (DeepSeek-V4.1's
+# shared-expert down projection at TP8).
+RAGGED_K_MNK_GFX950 = [(6, 5120, 288), (2048, 5120, 288)]
+
 
 def run_torch(x, x_scale, weight, w_scale, w_block=(128, 128)):
     """fp32 reference from row-major 1x32 A-scales and w_block B-scales."""
@@ -506,10 +511,10 @@ def main():
             "gemm_a8w8_mxfp8_bpreshuffle unsupported on %s; skipping", get_gfx()
         )
         return
-    summarize(
-        "gemm_a8w8_mxfp8_bpreshuffle",
-        [test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()],
-    )
+    shapes = args.mnk or tuned_shapes()
+    if args.mnk is None and get_gfx() == "gfx950":
+        shapes = shapes + RAGGED_K_MNK_GFX950
+    summarize("gemm_a8w8_mxfp8_bpreshuffle", [test_gemm(*mnk) for mnk in shapes])
     if get_gfx() != "gfx950":
         aiter.logger.warning(
             "%s: OPUS MXFP8 1x32 is gfx950 only; skipping it", get_gfx()
