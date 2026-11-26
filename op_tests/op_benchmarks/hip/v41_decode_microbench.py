@@ -35,12 +35,14 @@ from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from aiter import dtypes
 from aiter.ops.topk import top_k_per_row_decode
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 
 DEVICE = "cuda"
 HEADS = 16  # 64 attention heads / TP 4
 INDEX_HEADS = 32
 INDEX_DIM = 128
 ATTN_DIM = 512
+ROPE_DIM = 64
 TOPK = 512
 WINDOW = 128
 INDEX_BLOCK = 16  # MQA_LOGITS_PRESHUFFLE_ROWS
@@ -60,6 +62,25 @@ CONCURRENCY = (1, 4, 8)
 
 ARGS = None
 _BALLOT = None
+_HIP_ATTN = None
+_ROPE = None
+
+
+def hip_attn_op():
+    global _HIP_ATTN
+    if _HIP_ATTN is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from bench_sparse_attn_v4_gfx942 import HipSparseAttnV4
+
+        _HIP_ATTN = HipSparseAttnV4(ARGS.attn_so)
+    return _HIP_ATTN
+
+
+def get_rope():
+    global _ROPE
+    if _ROPE is None:
+        _ROPE = RotaryEmbedding(ROPE_DIM, 102400, base=160000).to(DEVICE)
+    return _ROPE
 
 
 def ballot_lib():
@@ -230,8 +251,28 @@ def make_attention(batch, csa, swa):
 
     csa_pool, csa_idx, csa_ptr = source(csa)
     swa_pool, swa_idx, swa_ptr = source(swa)
+    positions = torch.full((batch,), 99999, device=DEVICE, dtype=torch.int64)
+    rope = get_rope() if ARGS.fuse_irope else None
 
     def run():
+        if ARGS.attn == "hip":
+            hip_attn_op()(
+                q,
+                csa_pool,
+                csa_idx,
+                csa_ptr,
+                swa_pool,
+                swa_idx,
+                swa_ptr,
+                sink,
+                SINK_SCALE,
+                out=out,
+                cos_cache=None if rope is None else rope.cos_cache,
+                sin_cache=None if rope is None else rope.sin_cache,
+                positions=None if rope is None else positions,
+                rope_dim=ROPE_DIM if rope is not None else 0,
+            )
+            return
         sparse_attn_v4_paged_2src(
             q,
             csa_pool,
@@ -244,6 +285,8 @@ def make_attention(batch, csa, swa):
             SINK_SCALE,
             out=out,
         )
+        if rope is not None:
+            rope(out.unsqueeze(0), positions, inverse=True)
 
     return run
 
@@ -256,9 +299,18 @@ def main():
     global ARGS
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--topk", choices=("aiter", "ballot"), default="aiter")
+    ap.add_argument("--attn", choices=("triton", "hip"), default="triton")
+    ap.add_argument(
+        "--fuse-irope",
+        action="store_true",
+        help="include inverse_rope (unfused for triton, fused in epilogue for hip)",
+    )
     ap.add_argument("--index-cache", choices=("empty", "random"), default="empty")
     ap.add_argument(
         "--ballot-so", default=None, help="a prebuilt topk_ballot.so; built if absent"
+    )
+    ap.add_argument(
+        "--attn-so", default=None, help="a prebuilt sparse_attn_v4_gfx942.so; built if absent"
     )
     ARGS = ap.parse_args()
 
@@ -268,7 +320,10 @@ def main():
         f"device {props.name} {arch}  CUs {props.multi_processor_count}  "
         f"TP4 attention heads/rank {HEADS}  indexer heads {INDEX_HEADS}"
     )
-    print(f"top-k {ARGS.topk}  index cache {ARGS.index_cache}")
+    print(
+        f"top-k {ARGS.topk}  attn {ARGS.attn}  fuse-irope {ARGS.fuse_irope}  "
+        f"index cache {ARGS.index_cache}"
+    )
     print(
         "times are microseconds per launch, one rank. graph is the server's decode path."
     )
