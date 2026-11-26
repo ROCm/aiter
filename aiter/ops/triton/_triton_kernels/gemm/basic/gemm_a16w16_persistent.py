@@ -1,8 +1,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _gemm_a16w16_repr = make_kernel_repr(
     "gemm_a16w16_persistent_kernel_",
@@ -70,6 +73,7 @@ def gemm_a16w16_persistent_kernel_(
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     NUM_WGS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     num_stages: tl.constexpr = 0,
     waves_per_eu: tl.constexpr = 0,
 ):
@@ -97,7 +101,7 @@ def gemm_a16w16_persistent_kernel_(
     # Persistent loop, flattens to main loop
     for tile_id in tl.range(start_pid, num_tiles, NUM_WGS, flatten=True):
         # remap tile index on num tiles
-        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
+        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=NUM_XCDS)
         pid_k = t % NUM_KSPLIT
         pid = t // NUM_KSPLIT
 
@@ -182,7 +186,7 @@ def gemm_a16w16_persistent_kernel_(
                 c_ptr
                 + stride_cm * offs_cm[:, None]
                 + stride_cn * offs_cn[None, :]
-                + pid_k * stride_ck
+                + pid_k.to(tl.int64) * stride_ck
             )
             if EVEN_MN:
                 tl.store(c_ptrs, c)

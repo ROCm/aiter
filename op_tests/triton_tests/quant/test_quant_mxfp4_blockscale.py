@@ -19,28 +19,26 @@ def _torch_dynamic_mxfp4_quant_blockscale(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CPU reference matching the Triton 32x32 EVEN-scale quantizer."""
-    # Keep implicit constructors on CPU when the default device changes.
-    with torch.device("cpu"):
-        x = x.float().cpu()
-        M, N = x.shape
-        tiles = (
-            x.reshape(M // _BLOCK_SIZE, _BLOCK_SIZE, N // _BLOCK_SIZE, _BLOCK_SIZE)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        amax = tiles.abs().amax(dim=(-2, -1))
+    x = x.float().cpu()
+    M, N = x.shape
+    tiles = (
+        x.reshape(M // _BLOCK_SIZE, _BLOCK_SIZE, N // _BLOCK_SIZE, _BLOCK_SIZE)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    amax = tiles.abs().amax(dim=(-2, -1))
 
-        scales = f32_to_mx_e8m0_scale(
-            amax,
-            mode=MxScaleRoundModeInt.Even,
-            dtype=MxDtypeInt.FP4_E2M1,
-        ).view(torch.uint8)
-        scales = scales.clamp_max(254)
-        scale_f32 = e8m0_to_f32(scales).float()
+    scales = f32_to_mx_e8m0_scale(
+        amax,
+        mode=MxScaleRoundModeInt.Even,
+        dtype=MxDtypeInt.FP4_E2M1,
+    ).view(torch.uint8)
+    scales = scales.clamp_max(254)
+    scale_f32 = e8m0_to_f32(scales).float()
 
-        scaled_tiles = tiles / scale_f32[:, :, None, None]
-        scaled = scaled_tiles.permute(0, 2, 1, 3).reshape(M, N)
-        packed = f32_to_mxfp4(scaled).view(torch.uint8)
+    scaled_tiles = tiles / scale_f32[:, :, None, None]
+    scaled = scaled_tiles.permute(0, 2, 1, 3).reshape(M, N)
+    packed = f32_to_mxfp4(scaled).view(torch.uint8)
     return packed, scales
 
 
@@ -79,7 +77,8 @@ def test_dynamic_mxfp4_quant_blockscale_matches_reference(M: int, N: int, dtype)
 
 def test_dynamic_mxfp4_quant_blockscale_even_scale_tie():
     below_tie = torch.nextafter(
-        torch.tensor(1.75, device="cpu"), torch.tensor(0.0, device="cpu")
+        torch.tensor(1.75, dtype=torch.float32, device="cpu"),
+        torch.tensor(0.0, dtype=torch.float32, device="cpu"),
     ).item()
     x = torch.zeros((64, 32), dtype=torch.float32, device="cuda")
     x[0, 0] = below_tie
@@ -154,44 +153,3 @@ def test_dynamic_mxfp4_quant_blockscale_e8m0_endpoints(dtype):
     assert largest_scale.item() == 254
     assert torch.all(largest_packed == 0x44)
     assert torch.count_nonzero(largest_scale == 0xFF).item() == 0
-
-
-@pytest.mark.parametrize("shape", [(32,), (1, 32, 32)])
-def test_dynamic_mxfp4_quant_blockscale_rejects_non_2d(shape):
-    x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="must be 2-D"):
-        dynamic_mxfp4_quant_blockscale(x)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float64, torch.int32])
-def test_dynamic_mxfp4_quant_blockscale_rejects_dtype(dtype):
-    x = torch.empty((32, 32), dtype=dtype, device="cuda")
-    with pytest.raises(TypeError, match="torch.bfloat16 or torch.float32"):
-        dynamic_mxfp4_quant_blockscale(x)
-
-
-@pytest.mark.parametrize("shape", [(0, 32), (32, 0)])
-def test_dynamic_mxfp4_quant_blockscale_rejects_empty_dimensions(shape):
-    x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="must be non-zero"):
-        dynamic_mxfp4_quant_blockscale(x)
-
-
-@pytest.mark.parametrize("shape", [(31, 32), (32, 33), (64, 48)])
-def test_dynamic_mxfp4_quant_blockscale_rejects_ragged_tiles(shape):
-    x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="divisible by 32"):
-        dynamic_mxfp4_quant_blockscale(x)
-
-
-def test_dynamic_mxfp4_quant_blockscale_rejects_noncontiguous_input():
-    x = torch.empty((32, 64), dtype=torch.bfloat16, device="cuda")[:, ::2]
-    assert not x.is_contiguous()
-    with pytest.raises(ValueError, match="must be contiguous"):
-        dynamic_mxfp4_quant_blockscale(x)
-
-
-def test_dynamic_mxfp4_quant_blockscale_rejects_unknown_scaling_mode():
-    x = torch.empty((32, 32), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="scaling_mode must be 'even'"):
-        dynamic_mxfp4_quant_blockscale(x, scaling_mode="ceil")

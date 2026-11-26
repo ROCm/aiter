@@ -22,6 +22,8 @@ from functools import cache, lru_cache, partial
 from jinja2 import Template
 from packaging.version import Version, parse
 
+from aiter_worker_limits import get_worker_count_for
+
 IS_WINDOWS = sys.platform == "win32"
 NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
 # Built shared library: Python loads `.pyd`/`.dll` on Windows, `.so` elsewhere.
@@ -95,9 +97,15 @@ sys.path.insert(0, os.path.join(AITER_PYTHON_ROOT_DIR, "aiter", "jit", "utils"))
 
 from chip_info import get_gfx_runtime
 
-GPU_ARCH = os.environ.get("GPU_ARCHS")
-if GPU_ARCH is None:
-    GPU_ARCH = get_gfx_runtime()
+
+@cache
+def get_gpu_arch():
+    gpu_arch = os.environ.get("GPU_ARCHS")
+    if gpu_arch is None:
+        gpu_arch = get_gfx_runtime()
+    return gpu_arch
+
+
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 HOME_PATH = (
@@ -160,6 +168,12 @@ default {{target}}
 )
 
 
+def _build_command(source_count: int) -> list[str]:
+    """Build with the live AITER budget, including nested-worker limits."""
+    command = ["ninja"] if IS_WINDOWS else ["make", "build"]
+    return [*command, f"-j{get_worker_count_for(source_count)}"]
+
+
 def mp_lock(
     lock_path: str,
     main_func: Callable,
@@ -214,7 +228,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
 
 
 def validate_and_update_archs():
-    archs = GPU_ARCH.split(";")
+    archs = get_gpu_arch().split(";")
     archs = [arch.strip().split(":")[0] for arch in archs]
     # List of allowed architectures
     allowed_archs = [
@@ -329,26 +343,19 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             )
             with open(os.path.join(sub_build_dir, "build.ninja"), "w") as f:
                 f.write(ninja_file)
-            subprocess.run(
-                ["ninja", f"-j{len(sources)}"],
-                cwd=sub_build_dir,
-                shell=False,
-                capture_output=AITER_LOG_MORE < 2,
-                check=True,
-            )
         else:
             makefile_file = makefile_template.render(
                 includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
             )
             with open(f"{sub_build_dir}/Makefile", "w") as f:
                 f.write(makefile_file)
-            subprocess.run(
-                ["make", "build", f"-j{len(sources)}"],
-                cwd=sub_build_dir,
-                shell=False,
-                capture_output=AITER_LOG_MORE < 2,
-                check=True,
-            )
+        subprocess.run(
+            _build_command(len(sources)),
+            cwd=sub_build_dir,
+            shell=False,
+            capture_output=AITER_LOG_MORE < 2,
+            check=True,
+        )
 
     def final_func():
         logger.info(
@@ -482,10 +489,12 @@ def compile_hsaco(
     kernel_name,
     hsaco,
     shared=0,
-    gcnArchName=GPU_ARCH,
+    gcnArchName=None,
     constexprs=None,
     extra_metadata=None,
 ):
+    if gcnArchName is None:
+        gcnArchName = get_gpu_arch()
     build_dir = f"{BUILD_DIR}/{gcnArchName}"
     constexprs = OrderedDict(constexprs or {})
     func_name = get_default_func_name(kernel_name, tuple(constexprs.values()))
@@ -517,14 +526,14 @@ def compile_hsaco(
 def check_hsaco(func_name, constexprs=None):
     constexprs = OrderedDict(constexprs or {})
     hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
-    return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    return os.path.exists(f"{BUILD_DIR}/{get_gpu_arch()}/{hsaco_name}.hsaco")
 
 
 @cache
 def get_hsaco_launcher(hsaco_name, kernel_name):
     from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
 
-    hsaco = read_hsaco(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    hsaco = read_hsaco(f"{BUILD_DIR}/{get_gpu_arch()}/{hsaco_name}.hsaco")
     hsaco_launcher = HsacoLauncher()
     hsaco_launcher.load_module(hsaco)
     hsaco_launcher.get_function(kernel_name)
@@ -536,7 +545,7 @@ def run_hsaco(
 ):
     constexprs = OrderedDict(constexprs or {})
     hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
-    metadata_path = f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json"
+    metadata_path = f"{BUILD_DIR}/{get_gpu_arch()}/{hsaco_name}.json"
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
     with open(metadata_path, "r") as f:

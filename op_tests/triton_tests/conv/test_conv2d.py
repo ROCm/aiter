@@ -6,24 +6,16 @@ Kernel correctness tests compare Triton against torch.nn.functional.conv2d on
 synthetic tensors. Routing tests exercise configuration lookup without launching
 kernels. No model loading, network access, or torchvision.
 
-Test matrix (uniform across the four primary test families):
+Numerical tests cover fp16/bf16, NCHW/NHWC, edge cases, fuzzing, bias,
+activations, and NCHW cross-method agreement. Regression tests cover routing,
+configuration selection, scalar parameters, weight-pack caches, and inference
+tensors.
 
-    NCHW × {fp16, bf16} × every kernel  (5 kernels)         = 10
-    NHWC × {fp16, bf16}                  (single dispatch)  =  2
-                                                            ---
-                                  base cases per test family  12
+Padding tests cover routed and specialized APIs, validation, layouts, boundary
+amounts, empty batches, no-op reuse, and prepacked-input restrictions.
 
-test_edge, test_fuzz, test_no_bias use the base matrix as-is.
-test_activations multiplies the base matrix by 3 (relu/relu6/gelu) -> 36.
-
-Plus test_cross_method (differential correctness) that runs every NCHW
-kernel on shapes routable by all of them and verifies they all match
-F.conv2d. NCHW-only by design; 2 cases (one per dtype).
-
-Plus 7 exact-route and configuration-precedence regression cases, 2
-scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
-
-Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86 cases.
+The whole module is skipped without a supported GPU. Padding preparation itself
+does not require architecture-specific padding configurations.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -38,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
+from aiter.ops.triton.conv import _launch as padding_ops
 from aiter.ops.triton.conv import _prepack as conv_prepack
 from aiter.ops.triton.conv._prepack import clear_conv2d_weight_pack_caches
 from aiter.ops.triton.utils import conv_config_utils
@@ -47,7 +40,9 @@ from op_tests.triton_tests.conv._helpers import (
     CONV2D_WEIGHT_PACK_CACHE_NAMES,
     ORDERED_METHODS,
     TestSuite,
+    _winograd_tolerances,
     assert_weight_pack_cache_clear_is_scoped,
+    conv_padding_reference,
     dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
@@ -56,10 +51,7 @@ from op_tests.triton_tests.conv._helpers import (
     run_random_fuzzing,
 )
 
-# Module-level arch gate. Skip the whole test module on unsupported archs
-# rather than fail per-test. Extend SUPPORTED_ARCHS in _helpers.py when
-# adding CDNA (or other RDNA) support.
-_current_arch = get_arch()
+_current_arch = get_arch() if torch.cuda.is_available() else None
 if _current_arch not in ALL_SUPPORTED_ARCHS:
     pytest.skip(
         f"aiter.ops.triton.conv tests run on {sorted(ALL_SUPPORTED_ARCHS)}; "
@@ -339,3 +331,304 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
     assert (
         selected("nhwc", key="missing", M=65) == "any"
     ), "generic fallback was not used after shape and bucket misses"
+
+
+@pytest.mark.parametrize(
+    "padding_mode,layout,dtype",
+    [
+        pytest.param("reflect", "nchw", torch.float16, id="reflect-nchw-fp16"),
+        pytest.param("replicate", "nhwc", torch.bfloat16, id="replicate-nhwc-bf16"),
+        pytest.param("circular", "nhwc", torch.float16, id="circular-nhwc-fp16"),
+    ],
+)
+def test_prepared_padding_delegates_to_pytorch(
+    monkeypatch, padding_mode, layout, dtype
+):
+    """Check our forwarding/layout contract, not PyTorch's padding arithmetic."""
+    input_format = torch.channels_last if layout == "nchw" else torch.contiguous_format
+    output_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    source = torch.randn(1, 64, 56, 56, device="cuda", dtype=dtype).contiguous(
+        memory_format=input_format
+    )
+    original = source.clone()
+    original_pad = F.pad
+    calls = []
+
+    def recording_pad(input_tensor, padding, mode):
+        calls.append((input_tensor, padding, mode))
+        return original_pad(input_tensor, padding, mode=mode)
+
+    def unexpected_config(*args, **kwargs):
+        pytest.fail("F.pad must not need Triton padding launch configurations")
+
+    monkeypatch.setattr(padding_ops.F, "pad", recording_pad)
+    monkeypatch.setattr(conv_config_utils, "_get_conv_config_file", unexpected_config)
+    actual, conv_padding = padding_ops._prepare_conv_padding(
+        source, (1, 2), padding_mode, layout=layout
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is source
+    assert calls[0][1:3] == ((2, 2, 1, 1), padding_mode)
+    assert actual.shape == (1, 64, 58, 60)
+    assert actual.is_contiguous(memory_format=output_format)
+    assert actual.dtype == source.dtype
+    assert actual.device == source.device
+    assert actual.data_ptr() != source.data_ptr()
+    assert conv_padding == (0, 0)
+    torch.testing.assert_close(source, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "padding_mode,height,width,padding",
+    [
+        pytest.param("reflect", 3, 5, (2, 4), id="reflect-limit"),
+        pytest.param("reflect", 1, 5, (0, 4), id="reflect-singleton-axis"),
+        pytest.param("replicate", 1, 1, 3, id="replicate-beyond-size-scalar"),
+        pytest.param("circular", 3, 5, (3, 5), id="circular-limit"),
+    ],
+)
+def test_prepared_padding_accepts_boundary_amounts(
+    padding_mode, height, width, padding
+):
+    source = torch.ones(2, 3, height, width, device="cuda", dtype=torch.float16)
+    actual, conv_padding = padding_ops._prepare_conv_padding(
+        source, padding, padding_mode, layout="nchw"
+    )
+    pad_height, pad_width = (padding, padding) if isinstance(padding, int) else padding
+    assert actual.shape == (2, 3, height + 2 * pad_height, width + 2 * pad_width)
+    assert actual.is_contiguous()
+    assert conv_padding == (0, 0)
+
+
+def test_prepared_padding_handles_empty_batch():
+    source = torch.empty(0, 3, 5, 7, device="cuda", dtype=torch.float16)
+    actual, conv_padding = padding_ops._prepare_conv_padding(
+        source, (1, 2), "replicate", layout="nhwc"
+    )
+    assert actual.shape == (0, 3, 7, 11)
+    assert actual.is_contiguous(memory_format=torch.channels_last)
+    assert actual.dtype == source.dtype
+    assert actual.device == source.device
+    assert conv_padding == (0, 0)
+
+
+@pytest.mark.parametrize("entry_point", ["routed", "specialized"])
+@pytest.mark.parametrize(
+    "api,layout,route_name,filter_shape,stride,dilation,padding_mode,dtype",
+    [
+        (
+            "conv2d_nhwc",
+            "nhwc",
+            "ONE_X_ONE",
+            (1, 1),
+            (2, 1),
+            (1, 1),
+            "replicate",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d_nchw",
+            "nchw",
+            "GENERAL",
+            (2, 3),
+            (1, 2),
+            (2, 1),
+            "circular",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d",
+            "nchw",
+            "DIRECT_NCHW_3X3",
+            (3, 3),
+            (2, 1),
+            (1, 2),
+            "circular",
+            torch.float16,
+        ),
+        (
+            "conv2d_nchw",
+            "nchw",
+            "CBLOCKED_NCHW",
+            (3, 3),
+            (1, 2),
+            (2, 1),
+            "reflect",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d",
+            "nhwc",
+            "NHWC_3X3",
+            (3, 3),
+            (2, 1),
+            (1, 2),
+            "replicate",
+            torch.float16,
+        ),
+        (
+            "conv2d",
+            "nchw",
+            "WF4X3_CBLOCKED",
+            (3, 3),
+            (1, 1),
+            (1, 1),
+            "replicate",
+            torch.bfloat16,
+        ),
+        ("conv2d", "nhwc", "WF4X3", (3, 3), (1, 1), (1, 1), "reflect", torch.bfloat16),
+    ],
+)
+def test_padding_matches_reference(
+    monkeypatch,
+    entry_point,
+    api,
+    layout,
+    route_name,
+    filter_shape,
+    stride,
+    dilation,
+    padding_mode,
+    dtype,
+):
+    if route_name == "DIRECT_NCHW_3X3" and not conv2d_module.has_conv_config(
+        "CONV-3X3-NCHW"
+    ):
+        pytest.skip("direct NCHW 3x3 configuration is unavailable")
+    torch.manual_seed(0)
+    channels = 5 if route_name in ("GENERAL", "ONE_X_ONE") else 65
+    source = torch.randn(2, channels, 7, 9, device="cuda", dtype=dtype)
+    if layout == "nhwc" and padding_mode == "reflect":
+        source = source.contiguous(memory_format=torch.channels_last)
+    weight = torch.randn(17, channels, *filter_shape, device="cuda", dtype=dtype)
+    bias = torch.randn(17, device="cuda", dtype=dtype)
+    padding = (1, 2)
+    expected = conv_padding_reference(
+        source.float(),
+        weight.float(),
+        bias.float(),
+        stride,
+        padding,
+        dilation,
+        padding_mode=padding_mode,
+    ).relu()
+    if entry_point == "routed":
+        method = {
+            "GENERAL": "general",
+            "WF4X3": "winograd_f4x3",
+            "WF4X3_CBLOCKED": "winograd_f4x3_cblocked",
+        }.get(route_name, "cblocked")
+        monkeypatch.setattr(conv2d_module, "_select_3x3_method", lambda *args: method)
+        monkeypatch.setattr(
+            conv2d_module,
+            "_nchw_direct_is_profitable",
+            lambda *args: route_name == "DIRECT_NCHW_3X3",
+        )
+        layout_kwargs = {"layout": layout} if api == "conv2d" else {}
+    else:
+        api = {
+            "ONE_X_ONE": "conv2d_1x1",
+            "GENERAL": "conv2d_general",
+            "DIRECT_NCHW_3X3": "conv2d_nchw_3x3_direct",
+            "CBLOCKED_NCHW": "conv2d_nchw_cblocked",
+            "NHWC_3X3": "conv2d_nhwc_3x3",
+            "WF4X3_CBLOCKED": "conv2d_winograd_f4x3_cblocked",
+            "WF4X3": "conv2d_winograd_f4x3",
+        }[route_name]
+        layout_kwargs = (
+            {"layout": layout}
+            if route_name in ("ONE_X_ONE", "GENERAL", "WF4X3")
+            else {}
+        )
+    actual = getattr(conv2d_module, api)(
+        source,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        activation="relu",
+        padding_mode=padding_mode,
+        **layout_kwargs,
+    )
+
+    tolerances = (
+        _winograd_tolerances
+        if route_name.startswith("WF4X3")
+        else dynamic_conv_tolerances
+    )
+    rtol, atol = tolerances(dtype, channels * filter_shape[0] * filter_shape[1])
+    torch.testing.assert_close(
+        actual.float(),
+        expected,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda details: (
+            f"{api}, padding_mode={padding_mode!r}, layout={layout}:\n{details}"
+        ),
+    )
+    assert actual.dtype == dtype, "convolution output must preserve the input dtype"
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected contiguous {layout} output, got strides={actual.stride()}"
+
+
+def test_routed_padding_noop_preserves_zero_path(monkeypatch):
+    source = torch.randn(1, 64, 9, 11, device="cuda", dtype=torch.float16)
+    weight = torch.randn(17, 64, 3, 3, device="cuda", dtype=torch.float16)
+
+    def unexpected_pad(*args, **kwargs):
+        pytest.fail("zero-padding paths must not call F.pad")
+
+    monkeypatch.setattr(padding_ops.F, "pad", unexpected_pad)
+    baseline = conv2d_module.conv2d(source, weight, padding=0, layout="nhwc")
+    actual = conv2d_module.conv2d(
+        source, weight, padding=0, layout="nhwc", padding_mode="reflect"
+    )
+    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "api", ["conv2d_nchw_cblocked", "conv2d_winograd_f4x3_cblocked"]
+)
+def test_specialized_padding_prepacked_input(api):
+    torch.manual_seed(0)
+    source = torch.randn(2, 65, 7, 9, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(17, 65, 3, 3, device="cuda", dtype=source.dtype)
+    x_blocked, _ = conv_prepack.prepack_nchw_to_cblocked(source)
+    convolution = getattr(conv2d_module, api)
+
+    with pytest.raises(ValueError, match="x_blocked.*materialized padding"):
+        convolution(
+            source,
+            weight,
+            padding=(0, 1),
+            padding_mode="reflect",
+            x_blocked=x_blocked,
+        )
+
+    tolerances = _winograd_tolerances if "winograd" in api else dynamic_conv_tolerances
+    rtol, atol = tolerances(source.dtype, 65 * 3 * 3)
+    for padding, padding_mode in [((1, 2), "zeros"), (0, "reflect")]:
+        actual = convolution(
+            source,
+            weight,
+            padding=padding,
+            padding_mode=padding_mode,
+            x_blocked=x_blocked,
+        )
+        expected = conv_padding_reference(
+            source.float(), weight.float(), padding=padding, padding_mode=padding_mode
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda details, padding_mode=padding_mode, padding=padding: (
+                f"{api} with x_blocked, padding_mode={padding_mode!r}, "
+                f"padding={padding}:\n{details}"
+            ),
+        )

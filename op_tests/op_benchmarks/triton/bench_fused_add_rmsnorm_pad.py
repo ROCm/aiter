@@ -1,12 +1,21 @@
-import argparse
+import functools
 
 import triton
 
 from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.normalization.test_fused_add_rmsnorm_pad import (
     generate_inputs,
@@ -71,27 +80,34 @@ def run_benchmark(args):
     add_residual = args.add_residual
     pad_to_multiple = args.pad_to_multiple
     c_dtype = str_to_torch_dtype[args.dtype]
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_add_rmsnorm_pad(M, N, metric, **kwargs):
-        x, weight, res = generate_inputs(M, N, add_residual, c_dtype)
         eps = 1e-6
 
-        fn = lambda: fused_add_rmsnorm_pad(
-            x,
-            weight,
-            eps,
-            res=res,
-            x_pad_to_multiple=pad_to_multiple,
-            backend=backend,
-        )
+        _p_gen = functools.partial(generate_inputs, M, N, add_residual, c_dtype)
+        _out_val_keys = ["x", "weight", "res"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+
+        def _run(x, weight, res):
+            fused_add_rmsnorm_pad(
+                x,
+                weight,
+                eps,
+                res=res,
+                x_pad_to_multiple=pad_to_multiple,
+                backend=backend,
+            )
 
         n_out = (
             triton.cdiv(N, pad_to_multiple) * pad_to_multiple
             if pad_to_multiple > 0
             else N
         )
-        es = x.element_size()
+        es = rot_bufs[0]["x"].element_size()
         mem_read = M * N * es + N * es
         mem_write = M * n_out * es
         if add_residual:
@@ -101,7 +117,7 @@ def run_benchmark(args):
 
         flops = 4 * M * N + (M * N if add_residual else 0)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = bencher.bench(_run)
 
         if metric == "time":
             return ms
@@ -116,11 +132,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FusedAddRMSNormPad",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="FusedAddRMSNormPad")
     parser.add_argument(
         "--shape",
         type=int,
@@ -128,20 +140,7 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="user-defined shape to benchmark",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth", "throughput"],
-        default="bandwidth",
-        help="metric to plot",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend. Default follows the arch: gluon on gfx1250, triton othwerise.",
-    )
+    override_parser_action(parser, action="--metric", default="bandwidth")
     parser.add_argument(
         "--add-residual",
         action="store_true",

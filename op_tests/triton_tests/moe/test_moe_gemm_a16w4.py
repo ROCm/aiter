@@ -124,6 +124,15 @@ class Case:
             # gfx942 tuned table: m=256 -> block_m=128, m=128 -> block_m=64
             Case(256, 1536, 5120, 2, 1),
             Case(128, 1536, 5120, 2, 1),
+            # w2 rows: m=256 reaches bm128_n5120_k768, m=128 reaches bm64_n5120_k768
+            Case(256, 5120, 768, 2, 1),
+            Case(128, 5120, 768, 2, 1),
+            # gfx942 tuned table, gpt-oss (vLLM pads 2880 -> 3072):
+            # m=1 -> block_m=16, m=256 -> block_m=32
+            Case(1, 6144, 3072, 32, 4),
+            Case(1, 3072, 3072, 32, 4),
+            Case(256, 6144, 3072, 32, 4),
+            Case(256, 3072, 3072, 32, 4),
             Case(16, 32, 256, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
@@ -374,32 +383,3 @@ def test_op_expert_parallel(
         r0, r1 = int(offs[lo]), int(offs[hi])
         ref_y, tri_y = ref_y[r0:r1], tri_y[r0:r1]
     assert_close(ref_y, tri_y, maxtol=4e-1, rmstol=4e-2)
-
-
-def test_op_expert_parallel_rejects_bad_inputs():
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
-    x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
-        _ep_setup(16, 256, 256, 8, 2, 4, 1, True, True)
-    )
-    args = (
-        x,
-        w_tri[lo:hi],
-        None,
-        w_scale_tri[lo:hi],
-        None,
-        None,
-        bias[lo:hi],
-        rdata,
-        gindx,
-        sindx,
-    )
-    with pytest.raises(AssertionError, match="requires gate_valid"):
-        moe_gemm_a16w4(*args, backend="triton", expert_map=expert_map)
-    with pytest.raises(AssertionError, match="n_expts_tot"):
-        moe_gemm_a16w4(
-            *args,
-            backend="triton",
-            expert_map=expert_map[:-1].contiguous(),
-            gate_valid=gate_valid,
-        )

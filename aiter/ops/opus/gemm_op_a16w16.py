@@ -151,6 +151,7 @@ def _execute_a16w16(
     split_k: int = 0,
     workspace: torch.Tensor | None = None,
     route_arch: str | None = None,
+    route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
     """Validate, plan, and launch one exact 3D A16W16 operation."""
@@ -160,16 +161,15 @@ def _execute_a16w16(
 
     use_gfx950_caller_workspace_fast_path = (
         route_arch == "gfx950"
+        and route_cu_num is not None
         and workspace is not None
         and split_k > 0
         and instance is not None
         and instance.splitk_workspace_dtype is not None
     )
     if use_gfx950_caller_workspace_fast_path:
-        # A caller-owned gfx950 workspace and the public registry route avoid
-        # re-reading device metadata. Explicit gfx950 plans do not consult the
-        # CU count, so one is a safe cache-key placeholder here.
-        arch, cu_num = route_arch, 1
+        # Reuse the dispatcher's actual device identity for local-kid lookup.
+        arch, cu_num = route_arch, route_cu_num
     else:
         arch, cu_num = _device_arch_and_cu(XQ.device)
 
@@ -227,6 +227,7 @@ def _launch_a16w16_gemm(
     split_k: int = 0,
     workspace: torch.Tensor | None = None,
     route_arch: str | None = None,
+    route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
     """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` A16W16 GEMM."""
@@ -244,6 +245,7 @@ def _launch_a16w16_gemm(
         split_k=split_k,
         workspace=workspace,
         route_arch=route_arch,
+        route_cu_num=route_cu_num,
         instance=instance,
     )
     return Y
@@ -259,6 +261,7 @@ def _launch_a16w16_bmm(
     split_k: int = 0,
     workspace: torch.Tensor | None = None,
     route_arch: str | None = None,
+    route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
     """Launch batch-first ``[B,M,K] x [B,N,K] -> [B,M,N]`` A16W16 BMM."""
@@ -276,6 +279,7 @@ def _launch_a16w16_bmm(
         split_k=split_k,
         workspace=workspace,
         route_arch=route_arch,
+        route_cu_num=route_cu_num,
         instance=instance,
     )
 

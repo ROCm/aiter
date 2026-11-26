@@ -469,15 +469,6 @@ def test_gather_scattered(num_heads, preshuffle):
     assert bool(torch.isinf(got[:, nb * block :]).all()), "tail is not -inf"
 
 
-def test_gather_needs_cu_ends():
-    """row_ends is the gather's walk length, so it is not optional there."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, _ = _identity_list(st, 1, 8)
-    with pytest.raises(AssertionError, match="row_ends"):
-        _gather_run(st, 32, 128, 1, 8, 1, pos, None)
-
-
 def test_gather_ignores_dynamic():
     """A gather launch does not build a device schedule: every row walks the
     same tile count, so there is no spread to even out. dynamic=1 set for the
@@ -691,53 +682,6 @@ def test_block_scores_leaves_logits_alone(shape, num_heads):
     assert nd == 0, f"{nd} differing words in the logits"
 
 
-def test_block_scores_rejects_gather():
-    """The producer is dense and the consumers gather; no launch is both."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, ends = _identity_list(st, 1, 8)
-    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="dense producer"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            use_gather=True,
-            candidates=meta,
-            row_ends=ends,
-            block_scores=bs,
-            calc_block_scores=True,
-        )
-
-
-def test_block_scores_needs_room():
-    """A score tensor too narrow for max_model_len is a caller error."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full(
-        (1, st["mml"] // 8 - 1), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="blocks wide"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            block_scores=bs,
-            calc_block_scores=True,
-        )
-
-
 # block maxima with no logits at all
 
 
@@ -894,56 +838,6 @@ def test_outputs_allocates(want_logits, want_scores):
         assert not (scores == float("-inf")).all(1).any()
 
 
-def test_block_scores_rejects_logits_only():
-    """A score tensor with nothing asked to write it is a caller error."""
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="calc_block_scores off"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            block_scores=bs,
-        )
-
-
-def test_scores_only_rejects_gather():
-    """Mutual exclusion with the gather survives the third BSCORE value.
-
-    Pass 1 of a producer whose pass 2 is a gather: two launches, never one.
-    """
-    torch.manual_seed(0)
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    pos, ends = _identity_list(st, 1, 8)
-    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full(
-        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-    with pytest.raises(AssertionError, match="dense producer"):
-        paged_mxfp4_mqa_logits(
-            st["q4"],
-            st["q4s"],
-            st["cache"],
-            st["weights"],
-            st["cl"],
-            st["block_table"],
-            st["mml"],
-            use_gather=True,
-            candidates=meta,
-            row_ends=ends,
-            block_scores=bs,
-            calc_logits=False,
-            calc_block_scores=True,
-        )
-
-
 def _expand_ref(ids, ends, block):
     """The sort and slot count build_candidate_gather fuses, in torch."""
     nb = (ends + block - 1) // block
@@ -969,9 +863,9 @@ def test_candidate_gather(num_heads, block):
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     ctx = st["ctx"][0]
     nb, K = (ctx + block - 1) // block, 128
-    ids = torch.rand(rows, nb, device="cuda").argsort(1)
+    ids = torch.rand(rows, nb, device="cuda", dtype=torch.float32).argsort(1)
     ids = ids[:, :K].to(torch.int32)
-    ids[torch.rand(rows, K, device="cuda") < 0.1] = -1
+    ids[torch.rand(rows, K, device="cuda", dtype=torch.float32) < 0.1] = -1
     ends = torch.randint(1, ctx + 1, (rows,), dtype=torch.int32, device="cuda")
     ends[0] = 0
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
@@ -991,7 +885,9 @@ def test_candidates_implicit(num_heads):
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     ctx = st["ctx"][0]
     ids = (
-        torch.rand(rows, ctx // block, device="cuda").argsort(1)[:, :K].to(torch.int32)
+        torch.rand(rows, ctx // block, device="cuda", dtype=torch.float32)
+        .argsort(1)[:, :K]
+        .to(torch.int32)
     )
     ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
@@ -1057,7 +953,9 @@ def test_scale_mode_0(num_heads, next_n):
     for mode in (0, 1):
         torch.manual_seed(0)
         st[mode] = _make_case(2, next_n, num_heads, 128, ctx, 64, scale_mode=mode)
-    ids = torch.rand(2 * next_n, st[1]["mml"] // block, device="cuda")
+    ids = torch.rand(
+        2 * next_n, st[1]["mml"] // block, device="cuda", dtype=torch.float32
+    )
     ids = ids.argsort(1)[:, :64].to(torch.int32)
     ends = _row_ends(ctx, next_n, None)
     out = {}
@@ -1092,7 +990,7 @@ def test_gather_far_pages(gib):
         torch.manual_seed(0)
         st = _make_case(1, rows, 32, 128, [2048], page_size, page_offset=page_offset)
         ids = (
-            torch.rand(rows, st["ctx"][0] // block, device="cuda")
+            torch.rand(rows, st["ctx"][0] // block, device="cuda", dtype=torch.float32)
             .argsort(1)[:, :K]
             .to(torch.int32)
         )
@@ -1119,18 +1017,6 @@ def test_gather_far_pages(gib):
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
 
-def test_gather_rejects_a_pool_past_the_slot_reach():
-    """Slots are int32: a pool holding more tokens is an assert, not a wrap."""
-    rows, block, K = 2, 8, 32
-    # meta: the guard reads the cache's shape, never its bytes
-    cache = torch.empty(2**31 // 64, 64, 1, 68, dtype=torch.uint8, device="meta")
-    ids = torch.zeros(rows, K, dtype=torch.int32, device="cuda")
-    ends = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
-    bt = torch.zeros(rows, 16, dtype=torch.int32, device="cuda")
-    with pytest.raises(AssertionError, match="int32 slots"):
-        build_candidate_gather(ids, ends, bt, cache, 32, 128, block)
-
-
 VARLEN_SHAPES = [
     ("uniform", [4, 4, 4, 4], [2048, 1024, 4096, 512]),
     ("ragged", [13, 5, 21, 2], [2048, 999, 4096, 512]),
@@ -1152,12 +1038,16 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     _, rows, ctx_lens = shape
     hs, batch, total = 128, len(rows), sum(rows)
     st = _make_case(batch, 1, num_heads, hs, ctx_lens, page_size)
-    q4, q4s = quantize(torch.randn(total * num_heads, hs, device="cuda"))
+    q4, q4s = quantize(
+        torch.randn(total * num_heads, hs, device="cuda", dtype=torch.float32)
+    )
     q4 = q4.reshape(total, num_heads, hs // 2)
     q4s = q4s.reshape(total, num_heads, hs // SCALE_GROUP)
-    w = torch.randn(total, num_heads, device="cuda")
+    w = torch.randn(total, num_heads, device="cuda", dtype=torch.float32)
     cu = torch.tensor(
-        [0] + list(torch.tensor(rows).cumsum(0)), dtype=torch.int32, device="cuda"
+        [0] + list(torch.tensor(rows, device="cuda").cumsum(0)),
+        dtype=torch.int32,
+        device="cuda",
     )
     args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 

@@ -4,6 +4,9 @@
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.rmsnorm import (
+    _gluon_rms_norm_kernel,
+)
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
     _quant_fused_add_rmsnorm_kernel,
@@ -15,6 +18,11 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_kernel_large_m_small_n,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
@@ -68,7 +76,61 @@ def num_programs_fwd(x):
         return num_programs(x)
 
 
+def _use_gluon_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    # TDM needs a unit inner stride, 16B-aligned base and row pitch, and a
+    # contiguous weight; rows wider than the non-blocked cap stay on Triton.
+    # No Gluon config is shipped for gfx1250-strict.
+    # data_ptr() checks cannot be traced, so compiled graphs use Triton.
+    if get_arch() != "gfx1250" or torch.compiler.is_compiling():
+        return False
+    es = x.element_size()
+    return (
+        x.stride(1) == 1
+        and (x.stride(0) * es) % 16 == 0
+        and x.data_ptr() % 16 == 0
+        and weight.is_contiguous()
+        and weight.data_ptr() % 16 == 0
+        and triton.next_power_of_2(x.shape[1]) * es <= 65536
+    )
+
+
+def _rmsnorm_forward_gluon(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
+    n_rows, n_cols = x.shape
+    y = torch.empty_like(x)
+    rsigma = torch.empty((n_rows,), dtype=torch.float32, device=x.device)
+
+    block_n = triton.next_power_of_2(n_cols)
+    config = select_leq_config(
+        load_config_json(
+            f"{resolve_config_dir('normalization', 'RMSNORM', backend='gluon')}/DEFAULT.json"
+        ),
+        block_n,
+    )
+    # Keep one 16B vector per lane per warp from exceeding the row.
+    max_warps = max(1, block_n // (16 // x.element_size() * 32))
+    num_warps = min(config["num_warps"], max_warps)
+    grid = (min(n_rows, get_num_sms() * config["PROGRAMS_PER_CU"]),)
+    _gluon_rms_norm_kernel[grid](
+        x,
+        y,
+        weight,
+        rsigma,
+        epsilon,
+        n_rows,
+        n_cols,
+        x.stride(0),
+        y.stride(0),
+        BLOCK_SIZE_N=block_n,
+        NUM_BUFFERS=config["NUM_BUFFERS"],
+        num_warps=num_warps,
+    )
+    return y, rsigma
+
+
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
+
+    if _use_gluon_rmsnorm(x, weight):
+        return _rmsnorm_forward_gluon(x, weight, epsilon)
 
     n_rows, n_cols = x.shape
 
@@ -77,9 +139,9 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs_fwd(x)
+    num_prgms = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _rms_norm_kernel[grid](
         x,
         y,
@@ -92,7 +154,6 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         epsilon,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
     return y, rsigma
@@ -112,9 +173,9 @@ def _rmsnorm_forward_with_add(
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs_fwd(x)
+    num_prgms = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _fused_add_rmsnorm_kernel[grid](
         x,
         out,
@@ -129,7 +190,6 @@ def _rmsnorm_forward_with_add(
         epsilon,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -413,7 +473,7 @@ def rmsnorm2d_fwd_with_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -429,7 +489,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -452,7 +512,6 @@ def rmsnorm2d_fwd_with_smoothquant(
         dump_rms_norm,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -486,7 +545,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -502,7 +561,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -525,7 +584,6 @@ def rmsnorm2d_fwd_with_dynamicquant(
         dump_rms_norm,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
     return out_rms_norm
@@ -567,7 +625,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -577,7 +635,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -597,7 +655,6 @@ def rmsnorm2d_fwd_with_add_smoothquant(
         IS_SMOOTH,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -634,7 +691,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -645,7 +702,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -665,7 +722,6 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         IS_SMOOTH,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Heterogeneous MoE facades for the shared MXFP4/FP8 kernel builders."""
+"""Heterogeneous MoE facades for MXFP4/MXFP8 routed and FP8 shared weights."""
 
 import functools
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .mixed_moe_gemm_2stage_common import (
@@ -12,7 +13,26 @@ from .mixed_moe_gemm_2stage_common import (
     compile_mixed_moe_gemm2_common,
 )
 
+# What the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "kernels/mixed_moe_gemm_2stage_common.py",
+    "kernels/act.py",
+    "kernels/layout_utils.py",
+    "kernels/mfma_epilogues.py",
+    "kernels/mfma_preshuffle_pipeline.py",
+    "moe_common.py",
+]
 
+
+# The variables moe_common.py reads.
+_AOT_ENV = [
+    "AITER_FLYDSL_STAGE2_FP8",
+    "AITER_MXFP4_INTERMEDIATE",
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
+]
+
+
+@aot_factory("mixed_fhmoe_gemm1", sources=_AOT_SOURCES, env=_AOT_ENV)
 @functools.cache
 def compile_mixed_fhmoe_gemm1(
     *,
@@ -43,9 +63,10 @@ def compile_mixed_fhmoe_gemm1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     shared_expert_id: int,
+    clamp_shared: bool = True,
 ):
     """Compile a stage1 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
@@ -78,9 +99,11 @@ def compile_mixed_fhmoe_gemm1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
+@aot_factory("mixed_fhmoe_gemm2", sources=_AOT_SOURCES, env=_AOT_ENV)
 @functools.cache
 def compile_mixed_fhmoe_gemm2(
     *,
@@ -111,7 +134,7 @@ def compile_mixed_fhmoe_gemm2(
     use_global_a: bool = True,
 ):
     """Compile a stage2 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"

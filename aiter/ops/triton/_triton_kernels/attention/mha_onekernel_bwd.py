@@ -6,8 +6,10 @@ import functools
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
+    _compute_fp8_scaling_factors,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -484,6 +486,10 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        else:
+            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
+            p = tl.where(mask_n[None, :], p, 0.0)
         if SLIDING_WINDOW > 0:
             window_mask = offs_n[None, :] >= (
                 offs_m[:, None] - delta_qk - SLIDING_WINDOW
@@ -534,6 +540,7 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "HEAD_DIM",
         "ENABLE_DROPOUT",
         "IS_VARLEN",
+        "IS_MHA",
         "USE_ALIBI",
         "USE_EXP2",
         "IS_FP8",
@@ -624,6 +631,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_MHA: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -750,7 +758,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     offs_d = tl.arange(0, HEAD_DIM)
     if HAS_PE:
         offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-    GROUP_SIZE: tl.constexpr = HQ // HK
+    # Fold the single-iteration head loops in varlen MHA to reduce register pressure.
+    GROUP_SIZE = 1 if IS_VARLEN and IS_MHA else HQ // HK
 
     # align the delta_qk
     start_n = pid * BLOCK_N1

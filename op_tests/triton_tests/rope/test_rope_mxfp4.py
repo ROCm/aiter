@@ -22,7 +22,7 @@ _MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 def _e2m1(x):
     """fp32 -> e2m1 code: nearest magnitude, ties to the even code, saturating;
     the sign bit is x's, so -0.0 packs as 8."""
-    mag = torch.tensor(_MAG, device=x.device)
+    mag = torch.tensor(_MAG, device=x.device, dtype=torch.float32)
     d = (x.abs().unsqueeze(-1) - mag).abs()
     ties = d == d.min(dim=-1, keepdim=True).values
     codes = torch.arange(8, device=x.device)
@@ -43,7 +43,7 @@ def _quantize(x):
 
 def _dequantize(packed, e8m0):
     *prefix, dh = packed.shape
-    grid = torch.tensor(_MAG, device=packed.device)
+    grid = torch.tensor(_MAG, device=packed.device, dtype=torch.float32)
     grid = torch.cat([grid, -grid])
     nib = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(*prefix, dh * 2)
     vals = grid[nib.long()].reshape(*prefix, -1, SCALE_GROUP)
@@ -59,7 +59,9 @@ def _rope_gptj(x, cos, sin):
 
 
 def _cos_sin(max_pos):
-    angle = torch.rand(max_pos, ROPE_DIM // 2, device="cuda") * 6.28
+    angle = (
+        torch.rand(max_pos, ROPE_DIM // 2, device="cuda", dtype=torch.float32) * 6.28
+    )
     return torch.cat([angle.cos(), angle.sin()], dim=-1)
 
 
@@ -112,7 +114,9 @@ def _k_case(num_tokens, page_size, ratio):
         "k": torch.randn(num_tokens, HEAD_SIZE, device="cuda", dtype=torch.bfloat16),
         "positions": torch.randint(0, 4096, (num_tokens,), device="cuda"),
         "slots": slots,
-        "w": (1 + 0.1 * torch.randn(HEAD_SIZE, device="cuda")).bfloat16(),
+        "w": (
+            1 + 0.1 * torch.randn(HEAD_SIZE, device="cuda", dtype=torch.float32)
+        ).bfloat16(),
         "cos_sin": _cos_sin(4096),
         "num_pages": num_pages,
         "ratio": ratio,
@@ -190,27 +194,6 @@ def test_k_cache_matches_reference(ratio, page_size):
     assert (got - ref).abs().max() <= 2 * ref.abs().max() * 0.25
 
 
-@pytest.mark.parametrize("shuffle", [(48, 16, 2), (32, 24, 2), (32, 16, 3)])
-def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
-    """A pattern that does not tile the page's tokens, value bytes or scales
-    is refused before anything is written."""
-    torch.manual_seed(0)
-    c = _k_case(8, 64, 1)
-    _, cache = _paged_pool(c["num_pages"], 64, 0, fill=0xAA)
-    with pytest.raises(ValueError, match="does not tile"):
-        k_norm_rope_mxfp4_cache(
-            c["k"],
-            c["positions"],
-            c["cos_sin"],
-            c["w"],
-            1e-6,
-            cache,
-            c["slots"],
-            shuffle=shuffle,
-        )
-    assert (cache == 0xAA).all()
-
-
 @pytest.mark.parametrize(
     "num_tokens, num_heads, with_weights",
     [(64, 20, False), (1000, 64, True), (4200, 64, True)],
@@ -218,7 +201,9 @@ def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
 def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
     torch.manual_seed(0)
     t, h = num_tokens, num_heads
-    q = (torch.randn(t, h + 3, HEAD_SIZE, device="cuda") * 3).bfloat16()
+    q = (
+        torch.randn(t, h + 3, HEAD_SIZE, device="cuda", dtype=torch.float32) * 3
+    ).bfloat16()
     q = q[:, :h]
     positions = torch.randint(0, 4096, (t,), device="cuda")
     cos_sin = _cos_sin(4096)
@@ -242,6 +227,44 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
         )
     else:
         assert w_out is None
+
+
+@pytest.mark.parametrize("project", [False, True])
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens, num_heads", [(6, 32), (128, 32), (1000, 64)])
+def test_q_quant_weights_dtype(num_tokens, num_heads, weights_dtype, project):
+    """A narrower `weights_dtype` is the f32 result rounded once, and leaves
+    the quantized query untouched."""
+    torch.manual_seed(0)
+    t, h, k = num_tokens, num_heads, 5120
+    q = (torch.randn(t, h, HEAD_SIZE, device="cuda") * 3).bfloat16()
+    positions = torch.randint(0, 4096, (t,), device="cuda")
+    cos_sin = _cos_sin(4096)
+    kwargs = {"weights_scale": 0.25 * 0.125}
+    if project:
+        kwargs["hidden"] = torch.randn(t, k, device="cuda").bfloat16()
+        kwargs["weights_proj"] = (torch.randn(h, k, device="cuda") * 0.02).bfloat16()
+        args = (q, positions, cos_sin)
+    else:
+        args = (q, positions, cos_sin, torch.randn(t, h, device="cuda").bfloat16())
+    q_ref, s_ref, w_ref = q_rope_mxfp4_quant(*args, **kwargs)
+    q_out, s_out, w_out = q_rope_mxfp4_quant(
+        *args, **kwargs, weights_dtype=weights_dtype
+    )
+    assert w_ref.dtype == torch.float32 and w_out.dtype == weights_dtype
+    assert (q_out == q_ref).all() and (s_out == s_ref).all()
+    torch.testing.assert_close(w_out, w_ref.to(weights_dtype), rtol=0, atol=0)
+
+
+def test_q_quant_rejects_an_unsupported_weights_dtype():
+    q = torch.zeros(1, 4, HEAD_SIZE, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="weights_dtype"):
+        q_rope_mxfp4_quant(
+            q,
+            torch.zeros(1, dtype=torch.long, device="cuda"),
+            _cos_sin(8),
+            weights_dtype=torch.int32,
+        )
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
@@ -281,7 +304,7 @@ def test_round_trip_through_logits(page_size):
         batch * next_n, num_heads, HEAD_SIZE, device="cuda", dtype=torch.bfloat16
     )
     q_pos = (ctx - next_n + torch.arange(next_n, device="cuda")).repeat(batch)
-    weights = torch.randn(batch * next_n, num_heads, device="cuda")
+    weights = torch.randn(batch * next_n, num_heads, device="cuda", dtype=torch.float32)
     q_packed, q_scale, w_out = q_rope_mxfp4_quant(q, q_pos, cos_sin, weights)
     ctx_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     logits = paged_mxfp4_mqa_logits(

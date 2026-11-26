@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
@@ -6,9 +8,13 @@ from triton.experimental import gluon
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _mxfp4_quant_op,
 )
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
     "BLOCK_M",
@@ -44,7 +50,7 @@ def matmul_launch_metadata(grid, kernel, args):
     hist = args["ExptHist"]
     if hist is not None:
         n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
+        n_tokens = int(hist.sum())
         n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
     else:
         n_tokens = None
@@ -93,6 +99,12 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
+def _fp4_wmma_m():
+    # gfx1250-strict has no v_wmma_scale_f32_32x16x128_f4, so use v_wmma_scale_f32_16x16x128_f8f6f4.
+    return 16 if get_arch() == "gfx1250-strict" else 32
+
+
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
     BLOCK_N,
@@ -102,7 +114,8 @@ def get_moe_a4w4_layouts_prefill(
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
-    GatherIndx,
+    has_GatherIndx,
+    gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
@@ -161,7 +174,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[_fp4_wmma_m(), 16, 128],
         cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
@@ -169,7 +182,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[_fp4_wmma_m(), 16, 64],
         cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
@@ -215,9 +228,7 @@ def get_moe_a4w4_layouts_prefill(
     )
 
     GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
-        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if has_GatherIndx:
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
@@ -336,6 +347,7 @@ def get_moe_a4w4_layouts_prefill(
     return layouts
 
 
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_decode(
     BLOCK_M,
     BLOCK_N,
@@ -344,7 +356,8 @@ def get_moe_a4w4_layouts_decode(
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
-    GatherIndx,
+    has_GatherIndx,
+    gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
@@ -384,14 +397,14 @@ def get_moe_a4w4_layouts_decode(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[_fp4_wmma_m(), 16, 128],
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[_fp4_wmma_m(), 16, 64],
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
         operand_index=0,
@@ -413,9 +426,7 @@ def get_moe_a4w4_layouts_decode(
     )
 
     GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
-        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if has_GatherIndx:
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
