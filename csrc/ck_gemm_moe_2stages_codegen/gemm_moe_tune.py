@@ -7549,7 +7549,8 @@ class DecodeChainTuner(FmoeTuner):
         from csrc.ck_gemm_moe_2stages_codegen.decode_chain_tune import tune_shape
 
         del tunedf
-        if get_gfx() != "gfx950":
+        # the GPU being timed (get_gfx() follows the GPU_ARCHS build targets)
+        if self.get_gfx() != "gfx950":
             raise SystemExit("--decode-chain is only supported on gfx950")
         rows = []
         for _, row in untunedf.iterrows():

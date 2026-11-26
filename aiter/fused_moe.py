@@ -748,6 +748,8 @@ def fused_moe(
                 "splitk": splitk,
                 "quant_type_a": None if quant_type_a is None else str(quant_type_a),
                 "quant_dtype_a2": quant_dtype_a2,
+                # the shared GEMM hard-codes the limit-7 clamp
+                "clamp_shared=False": None if clamp_shared else "unclamped shared SiLU",
                 # the row quantizes the input to the weights' dtype: only that (or no override) is served
                 "quant_dtype_a": (
                     None if quant_dtype_a in (None, w1.dtype) else quant_dtype_a
@@ -959,6 +961,10 @@ def _fused_moe_shared_folded(
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = torch.bfloat16 if dtype is None else dtype
+    _validate_output_buffer_metadata(
+        output, (M, model_dim), dtype, hidden_states.device
+    )
+    _validate_output_buffer_no_overlap(output, hidden_states)
     metadata = get_2stage_cfgs(
         get_padded_M(M),
         model_dim,

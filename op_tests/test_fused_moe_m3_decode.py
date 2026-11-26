@@ -21,8 +21,12 @@ import torch
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
-    pytest.skip("needs a gfx950 GPU", allow_module_level=True)
+# a module-wide mark (not a module-level skip) keeps the tests collected on other GPUs, so the per-file pytest
+# run reports skips instead of "no tests collected" (exit code 5)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    reason="needs a gfx950 GPU",
+)
 
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe, moe_route_quant
@@ -232,6 +236,49 @@ def test_shared_weights_must_be_preshuffled_e4m3():
     for bad in (plain, e5m2):
         with pytest.raises(NotImplementedError):
             _fmoe16(bad, w, ids, x)
+
+
+def test_prequantized_codes_keep_their_encoding():
+    """moe_route_quant's opaque uint8 codes are accepted; typed codes of another encoding (E5M2 shared codes,
+    FP8 routed codes) with the right element count are refused, not reinterpreted."""
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    (q4, s4), (q8, s8), w, ids = moe_route_quant(x, gate, bias)
+    ok = _fmoe16(L, w, ids, q4, a1_scale=s4, shared_a1=(q8, s8))
+    assert ok.shape == (16, H)
+    with pytest.raises(NotImplementedError):
+        _fmoe16(L, w, ids, q4, a1_scale=s4, shared_a1=(q8.view(torch.float8_e5m2), s8))
+    with pytest.raises(NotImplementedError):
+        _fmoe16(
+            L, w, ids, q4.view(torch.float8_e4m3fn), a1_scale=s4, shared_a1=(q8, s8)
+        )
+
+
+def test_shared_folded_rejects_unsupported_clamp_and_bad_output():
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
+    with pytest.raises(
+        NotImplementedError
+    ):  # the shared GEMM hard-codes the limit-7 clamp
+        _fmoe16(L, w, ids, x, clamp_shared=False)
+    ok = torch.empty(16, H, dtype=torch.bfloat16, device=dev)
+    assert _fmoe16(L, w, ids, x, output=ok) is ok
+    for bad in (
+        torch.empty(16, H, dtype=torch.float32, device=dev),
+        torch.empty(H, 16, dtype=torch.bfloat16, device=dev).t(),
+        torch.empty(8, H, dtype=torch.bfloat16, device=dev),
+    ):
+        with pytest.raises(RuntimeError):
+            _fmoe16(L, w, ids, x, output=bad)
+    with pytest.raises(RuntimeError):  # overlaps hidden_states
+        _fmoe16(L, w, ids, x, output=x)
+
+
+def test_derived_cache_keeps_its_source_alive():
+    """The cached layout holds its source tensor, so a freed layer's address cannot alias another layer's entry."""
+    m3.clear_derived_weight_cache()
+    L = make_layer()
+    m3.prepare_decode_weights(L["w1_scale"], L["shared_w1_scale"], L["shared_w2_scale"])
+    assert all(src is not None for _, src in m3._DERIVED.values())
 
 
 def test_shared_scale_layouts_are_cached_independently():

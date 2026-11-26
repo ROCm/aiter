@@ -9,6 +9,7 @@ import os
 import pytest
 
 from aiter.ops.flydsl.kernels.mega_moe_tp.decode_moe_cfg import (
+    LDS_LIMIT,
     ROUTE_PREFIX,
     ROWS,
     ExpertCfg,
@@ -118,3 +119,15 @@ def test_zero_valued_names_do_not_divide_by_zero():
         cfg = RouterCfg.parse(ROUTE_PREFIX + name)
         for m in (8, 16, 32, 100):
             assert not cfg.fits(m), (name, m)
+
+
+def test_router_configs_must_fit_the_lds():
+    """``decode_router_gemm_nblocks`` keeps ``nbw`` n-blocks of the whole split-K slice in LDS: a name whose
+    footprint exceeds the workgroup's LDS (here 598016 B for s8 / bk64 / w2 / nb8) is not a candidate.
+    """
+    big = RouterCfg("nblocks", 8, 64, 2, 8, 0)
+    assert big.lds_bytes() == 598016
+    assert not big.fits(32)
+    assert RouterCfg.default(32).lds_bytes() <= LDS_LIMIT
+    for m in ALL_ROWS:
+        assert all(c.lds_bytes() <= LDS_LIMIT for c in router_candidates(m, full=True))

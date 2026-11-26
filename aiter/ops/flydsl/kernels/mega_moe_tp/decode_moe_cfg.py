@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, replace
 
 H, I, E, TOPK = 6144, 768, 128, 4
+# gfx950 LDS budget of a workgroup (same value as ``mega_moe_tp.LDS_LIMIT``; not imported to keep this module CPU-only)
+LDS_LIMIT = 160 * 1024
 ROWS = (8, 128)  # rows the expert tiles cover (the router covers 1-128)
 ROUTER_MAX_ROWS = 128
 IMPL_NAME = "flydsl_m3decode"
@@ -262,7 +264,15 @@ class RouterCfg:
         # measured: nbw >= 4 at 65-128 rows faults the GPU (the weight tile outgrows the LDS next to the x tile)
         if m > 64 and self.nbw > 2:
             return False
-        return not (self.x_direct and not 33 <= m <= 57)
+        return self.lds_bytes() <= LDS_LIMIT and not (
+            self.x_direct and not 33 <= m <= 57
+        )
+
+    def lds_bytes(self) -> int:
+        """LDS of the ``nblocks`` kernel (``decode_router_gemm_nblocks.Shared``: weight ring + double-buffered x)."""
+        spb = self.block_k // 32
+        nstep = H // self.split_k // self.block_k
+        return (self.nbw * nstep * 3 * spb * 64 * 4 + 2 * self.waves * spb * 64 * 4) * 4
 
     @classmethod
     def default(cls, m: int) -> "RouterCfg":

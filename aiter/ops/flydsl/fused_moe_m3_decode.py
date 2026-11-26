@@ -75,8 +75,10 @@ def _derived(kind: str, src: torch.Tensor, build):
     key = (kind, src.data_ptr(), tuple(src.shape), src.device, version)
     hit = _DERIVED.get(key)
     if hit is None:
-        hit = _DERIVED[key] = build(src)
-    return hit
+        # keep the source alive with its layout: while the entry exists its storage address cannot be
+        # recycled by another tensor (same shape and version counter would alias the key)
+        hit = _DERIVED[key] = (build(src), src)
+    return hit[0]
 
 
 def router_lines(router_weight: torch.Tensor) -> torch.Tensor:
@@ -165,6 +167,12 @@ def check_request(req: FusedMoeRequest) -> str | None:
             return "hidden_states must be bf16 [rows, 6144]"
     elif x.numel() != n * H // 2 or req.a1_scale is None:
         return "prequantized input needs fp4 codes [rows, 3072] and a1_scale"
+    else:
+        # moe_route_quant returns opaque uint8 codes; typed tensors must carry the encoding the kernels read
+        if x.dtype not in (torch.uint8, dtypes.fp4x2):
+            return "prequantized routed codes must be uint8 or float4_e2m1fn_x2 (MXFP4)"
+        if req.shared_a1[0].dtype not in (torch.uint8, dtypes.fp8):
+            return "prequantized shared codes must be uint8 or float8_e4m3fn (MXFP8)"
     return None
 
 
