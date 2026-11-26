@@ -372,12 +372,17 @@ def _chunk_fwd_triton():
 def _chunk_fwd_flydsl():
     from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
 
+    native_varlen = _accepts(chunk_kda_fwd_flydsl, "cu_seqlens")
+
     def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
+        kw = {}
         if cu_seqlens is not None:
-            raise NotImplementedError("the FlyDSL KDA forward has no varlen")
+            if not native_varlen:
+                raise NotImplementedError("this FlyDSL KDA forward has no varlen")
+            kw["cu_seqlens"] = cu_seqlens
         bf = torch.bfloat16
         o, _ = chunk_kda_fwd_flydsl(
-            q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size
+            q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size, **kw
         )
         return o.float()
 
@@ -564,8 +569,10 @@ def conv_silu_bwd(a, w, dq, dk, dv, fn=None, cu_seqlens=None):
     """Backward of ``silu(causal_depthwise_conv(a, w))`` split into q/k/v.
 
     a: [B, T, C] conv input; w: [C, W]; dq, dk: [B, T, HK]; dv: [B, T, HV].
-    Returns (da [B, T, C], dw [C, W]), fp32. On GPU this is the Triton
-    ``causal_conv1d_split_qkv_bwd_triton_fn`` (ROCm/aiter#8726) when installed.
+    Returns (da [B, T, C], dw [C, W]), fp32. ``fn`` is a ROCm/aiter#8726
+    split-q/k/v conv backward (Triton ``causal_conv1d_split_qkv_bwd_triton_fn``
+    or FlyDSL ``causal_conv1d_split_qkv_bwd_flydsl_fn``, same signature), fed
+    fp32 with ``query_start_loc = cu_seqlens`` for varlen.
     """
     B, T, C = a.shape
     hk, hv = dq.shape[-1], dv.shape[-1]
