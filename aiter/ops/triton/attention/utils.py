@@ -1003,6 +1003,11 @@ def sol_prepare(
             raise ValueError(
                 f"{name}_source must share (batch, seqlen_k, nheads_kv) with k_quant"
             )
+    if k_scale is not None and k_quant.shape[-1] == 256:
+        raise ValueError(
+            "k_scale pools an addressable block-scaled K, and every hd256 row reads a packed one: "
+            'pass k_source with k_packed_format ("mxfp8" for an MXFP8 K) instead'
+        )
 
     if router not in ("mean", "error"):
         raise ValueError(f"router must be 'mean' or 'error', got {router!r}")

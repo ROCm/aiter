@@ -444,6 +444,19 @@ def test_packed_path_rejects_a_stored_scale_it_cannot_pool():
         sol_prepare(q, k, v, BETA, k_scale=scale, k_source=k, k_packed_format="mxfp4")
 
 
+def test_hd256_rejects_a_stored_k_scale():
+    """An hd256 MXFP8 K is packed, so pooling its codes through k_scale gives rows no hd256 row
+    reads; it has to be pooled from its source."""
+    batch, seqlen_k, nhead = 1, 2 * SOL_ATTN_TS_KV, 2
+    q, k, v = _operands(batch, 256, seqlen_k, nhead, nhead, d=256)
+    scale = torch.full(
+        (batch, seqlen_k, nhead, 8), 127, dtype=torch.uint8, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match='k_packed_format \\("mxfp8"'):
+        sol_prepare(q, k, v, BETA, k_scale=scale)
+
+
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
 def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
     batch, seqlen_q, seqlen_k, nhead_q, nhead_kv
