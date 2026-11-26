@@ -1575,6 +1575,22 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
             n,
             k,
         )
+    if row is not None and row.get("libtype") == "flydsl":
+        from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+            is_compute_wmma_kernel_name,
+            parse_wmma_kernel_name,
+        )
+
+        kernel_name = str(row["kernelName"])
+        wmma_config = parse_wmma_kernel_name(kernel_name)
+        # A padded row must not send a decode M below a compute kernel's
+        # full M tile; kernel_fits_shape rejects that cluster-barrier case.
+        if (
+            wmma_config is not None
+            and is_compute_wmma_kernel_name(kernel_name)
+            and m < wmma_config["tile_m"]
+        ):
+            row = None
     if row is None:
         report_key = (gfx, n, k, w_scale_block)
         if report_key not in _MXSCALE_UNTUNED_REPORTED:
@@ -3211,6 +3227,11 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"
         )
+        if kernel_name is None and Y.dtype == dtypes.bf16:
+            # No tuned row and no mxpsh tile runs the shape (mxpsh needs K a
+            # multiple of 128): the batched GEMM's heuristic, which takes any
+            # K that 32 divides.
+            is_bmm = True
         if is_bmm and Y.dtype != dtypes.bf16:
             # The gfx950 BMM writes bf16 only; let the mxpsh heuristic pick.
             kernel_name = None

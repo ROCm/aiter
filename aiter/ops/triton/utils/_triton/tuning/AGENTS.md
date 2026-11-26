@@ -25,7 +25,10 @@ here. Update this file in the same change as any behaviour change.
    kernel does not take is never launched. A key without a `SEARCH_SPACE` entry stops the run with
    `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
    or skip it silently.
-3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
+3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. `BLOCK_SIZE_M/N`
+   values below `MIN_DOT_TILE` (8) are vector tiles: only a kernel with `vector_tiles=True` gets
+   them, so the other kernels keep the lists they had. With several K steps, `should_skip_generic`
+   keeps `num_stages` 1 only for a vector `BLOCK_SIZE_N`. Pruning is: the
    shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
    thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
@@ -85,7 +88,8 @@ One function in `kernels.py`, decorated with `@kernel(config_name, ...)`: `confi
 the kernel's `_get_config` passes it, `dims` (`("B", "M", "N", "K")` for batched), `bits` (A and B
 element widths as they sit in LDS, scales not counted), `cta_split` when a key such as
 `num_ctas` makes `BLOCK_SIZE_M/N` a cluster tile (returns how the kernel splits it, so the LDS
-and register checks and `should_skip` judge one CTA's share), `gluon_archs` / `gluon_default_archs` /
+and register checks and `should_skip` judge one CTA's share), `vector_tiles=True` when a path
+without `tl.dot` takes `BLOCK_SIZE_M/N` below 8 (the `gemm_a16w32` fp32 FMA kernel), `gluon_archs` / `gluon_default_archs` /
 `backend_kwarg` from the wrapper, `bounds` copied from the kernel's `_get_config` (the CLI K is the
 logical K, so no K transform is needed). The function builds the inputs once with the `op_tests`
 generator, preallocates the output, and returns `(call, inputs, should_skip)`;

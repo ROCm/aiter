@@ -65,11 +65,12 @@ y = conv2d(
 )
 ```
 
-### Conv2D padding modes
+### Padding modes
 
-All routed and specialized Conv2D APIs accept `padding_mode="zeros"` as a
+All routed and specialized Conv2D and Conv3D APIs accept `padding_mode="zeros"` as a
 positional or keyword argument. Padding is symmetric on opposing sides and
-accepts an integer or `(pad_height, pad_width)`.
+accepts an integer, `(pad_height, pad_width)` for Conv2D, or
+`(pad_depth, pad_height, pad_width)` for Conv3D.
 
 | Mode | Border behavior | Padding limits per spatial axis |
 |---|---|---|
@@ -82,7 +83,7 @@ Input spatial dimensions must be positive, and padding must be nonnegative.
 Invalid modes are rejected even when padding is zero.
 
 For nonzero modes with nonzero padding, `torch.nn.functional.pad` runs before
-routing and activation packing; convolution then uses padding `(0, 0)`.
+routing and activation packing; convolution then uses zero padding amounts.
 Zero padding amounts skip materialization.
 Materialized padding allocates a temporary input; layout conversion may require
 an extra copy.
@@ -168,7 +169,6 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Conv3D supports only implicit zero padding.
 - Per-axis pad amounts may differ, for example `(0, 2)` for Conv2D or
   `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
@@ -308,6 +308,8 @@ Conv3D cross-axis flags:
 ```
 --dtype {fp16,bf16}                           # default fp16
 --layout {ncdhw,ndhwc}                        # default ncdhw
+--padding-mode {zeros,reflect,replicate,circular}
+--end-to-end                                 # include input preparation; implied by nonzero modes
 --method {auto,general,1x1x1,cblocked,ndhwc_3x3x3,winograd,winograd_cblocked}
 --metric {time,throughput,bandwidth}          # default throughput
 --activation {none,relu,relu6,gelu}           # default none
@@ -321,6 +323,9 @@ Conv3D cross-axis flags:
 --dilation DD DH DW                           # single-shape dilation
 -o, --output                                  # save results as CSV
 ```
+
+Conv3D uses the same padding timing scope as Conv2D. Results include the mode,
+timing scope, and actual PyTorch convolution input layout; weight packs stay cached.
 
 ---
 

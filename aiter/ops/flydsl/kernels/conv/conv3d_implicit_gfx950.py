@@ -14,6 +14,9 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
+
 from .conv3d_gfx950_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_TILE,
@@ -237,6 +240,26 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
         f"{probe.d}x{probe.h}x{probe.w} derive different kernel constants "
         f"({[(a, b) for a, b in zip(mine, theirs) if a != b]}). One artifact "
         "per layer is no longer what this compiles to."
+    )
+
+
+_CONV3D_AOT_CACHE = FlyDSLAotCache("conv3d_implicit_gfx950")
+
+
+def _aot_key(param, dyn_closure=None):
+    """``param``'s fields as plain values: the AOT cache cannot key an fx.struct.
+
+    A variable-resolution kernel reads D/H/W at launch, so they are left out
+    and ``dyn_closure`` (``_dyn_hw_closure_key``: every constant the kernel
+    still closes over) takes their place; resolutions then share an entry.
+    """
+    dyn = dyn_closure is not None
+    return (
+        tuple(
+            (name, None if dyn and name in ("d", "h", "w") else getattr(param, name))
+            for name in Conv3dImplicitParam.__annotations__
+        ),
+        dyn_closure,
     )
 
 
@@ -711,8 +734,15 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             )
 
     _launch.compile = _compile
-    # The compiled function is called directly on the steady-state path (see
-    # ``conv_kernels._dispatch``), which bypasses this closure, so the extents
-    # have to be reachable from the object rather than captured here alone.
+    # ``conv_kernels._dispatch`` launches the @flyc.jit launcher itself, which
+    # bypasses this closure, so the extents have to be reachable from the
+    # object rather than captured here alone.
     _launch.extra_args = extra_args
+    _launch.launcher = launch
+    dyn_closure = (
+        _dyn_hw_closure_key(kernel_grid, im2col_plan, scatter_plan, dyn_unit)
+        if param.dyn_hw
+        else None
+    )
+    bind_aot(launch, _CONV3D_AOT_CACHE, _aot_key(param, dyn_closure))
     return _launch

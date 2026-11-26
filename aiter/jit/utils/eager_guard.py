@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""When an aiter entry point may skip its custom op.
+"""When FP8 GEMM and per-token quant entry points may skip their custom ops.
+
+These guards serve the FP8 GEMM and per-token quant fast paths. Tuned BF16
+GEMM uses its ordinary registered-op path and does not use this helper.
 
 Outside torch.compile some entry points make the C++ call their custom op
 would make, without the torch.ops dispatch in between. `plain_eager` says

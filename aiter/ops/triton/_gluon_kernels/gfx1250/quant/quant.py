@@ -355,6 +355,16 @@ def _mxfp8_quant_tile(
     )
 
 
+@gluon.constexpr_function
+def _mxfp8_scale_smem_layout(BLOCK_SIZE_M, NUM_QUANT_BLOCKS):
+    # Pad only when NUM_QUANT_BLOCKS is 8 to 1024 and a multiple of 4; otherwise use a plain layout.
+    if NUM_QUANT_BLOCKS % 4 == 0 and 8 <= NUM_QUANT_BLOCKS <= 1024:
+        return gl.PaddedSharedLayout.with_identity_for(
+            [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+        )
+    return gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+
+
 @gluon.jit(repr=_gluon_dynamic_mxfp8_quant_kernel_gfx1250_repr)
 def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     x_ptr,
@@ -420,8 +430,8 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_OUT,
     )
-    SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+    SHARED_LAYOUT_BS: gl.constexpr = _mxfp8_scale_smem_layout(
+        BLOCK_SIZE_M, NUM_QUANT_BLOCKS
     )
     bs_smem = gl.allocate_shared_memory(
         bs_ptr.type.element_ty,

@@ -831,7 +831,8 @@ def per_tensor_quant_hip(
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
 ):
-    assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
+    if num_rows is not None:
+        raise NotImplementedError("num_rows is not supported for per_tensor_quant_hip")
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
     if quant_dtype in [dtypes.fp8, dtypes.i8]:
         if scale is None:

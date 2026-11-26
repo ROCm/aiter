@@ -10,10 +10,12 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import traceback
 import types
 import typing
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -21,6 +23,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -167,6 +170,11 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_STAGE2_FP8 = os.getenv(
+    "AITER_CONFIG_FMOE_STAGE2_FP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_stage2_fp8_fmoe.csv",
+)
+
 # NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
 AITER_CONFIG_MOE_NVFP4 = os.getenv(
     "AITER_CONFIG_MOE_NVFP4",
@@ -276,6 +284,12 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
 AITER_CONFIG_MEGA_MOE_TP = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+# the small-M schedule's per-batch launch configs (row tile, CTAs, two-shot all-reduce)
+AITER_CONFIG_MEGA_MOE_TP_SM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_SM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_sm_tuned.csv",
 )
 
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
@@ -402,6 +416,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_STAGE2_FP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_STAGE2_FP8",
+            AITER_CONFIG_FMOE_STAGE2_FP8,
+            "tuned_stage2_fp8_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -509,6 +531,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_SM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_SM",
+            AITER_CONFIG_MEGA_MOE_TP_SM,
+            "mega_moe_tp_sm_tuned",
         )
 
     @property
@@ -1614,6 +1644,19 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
@@ -2360,6 +2403,47 @@ def _develop_arg(a, convert, tensor_cls):
     return a
 
 
+class _TensorDescriptorCache:
+    """Private metadata-only handles for explicitly opted-in const arguments.
+
+    The pybind descriptor has writable fields, so it must not escape to callers
+    or a native argument that mutates it. Neither keys nor values own a tensor.
+    """
+
+    def __init__(self, tensor_types, maxsize=1024):
+        self._tensor_types = tensor_types
+        self._maxsize = maxsize
+        self._handles = OrderedDict()
+        self._lock = threading.Lock()
+
+    def convert(self, tensor, convert, tensor_cls):
+        if type(tensor) not in self._tensor_types:
+            return _develop_arg(tensor, convert, tensor_cls)
+        key = (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tensor.stride(),
+            tensor.dtype,
+            tensor.get_device(),
+        )
+        with self._lock:
+            handle = self._handles.get(key)
+            if handle is not None:
+                self._handles.move_to_end(key)
+                return handle
+        # Conversion can load a module; do not hold the cache lock around it.
+        handle = convert(tensor)
+        with self._lock:
+            existing = self._handles.get(key)
+            if existing is not None:
+                self._handles.move_to_end(key)
+                return existing
+            self._handles[key] = handle
+            if len(self._handles) > self._maxsize:
+                self._handles.popitem(last=False)
+        return handle
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2367,9 +2451,25 @@ def compile_ops(
     gen_fake: Callable[..., Any] | None = None,
     ffi_type: str = "pybind",
     develop: bool = False,
+    tensor_cache_args: tuple[str, ...] = (),
 ):
+    if tensor_cache_args and (ffi_type != "pybind" or not develop):
+        raise ValueError("tensor_cache_args requires develop=True with pybind")
+
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
+        if tensor_cache_args:
+            import inspect
+
+            import torch
+
+            parameters = tuple(inspect.signature(func).parameters)
+            unknown = set(tensor_cache_args) - set(parameters)
+            if unknown:
+                raise ValueError(f"Unknown cached tensor arguments: {sorted(unknown)}")
+            cached_positions = frozenset(parameters.index(n) for n in tensor_cache_args)
+            cached_names = frozenset(tensor_cache_args)
+            tensor_cache = _TensorDescriptorCache((torch.Tensor, torch.nn.Parameter))
 
         if ffi_type == "ctypes":
             ctypes_caller = _ctypes_call(func, loadName, _md_name)
@@ -2665,12 +2765,31 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
-                    if kwargs:
-                        kwargs = {
-                            k: _develop_arg(v, convert, tensor_cls)
-                            for k, v in kwargs.items()
-                        }
+                    if tensor_cache_args:
+                        args = tuple(
+                            (
+                                tensor_cache.convert(a, convert, tensor_cls)
+                                if i in cached_positions
+                                else _develop_arg(a, convert, tensor_cls)
+                            )
+                            for i, a in enumerate(args)
+                        )
+                        if kwargs:
+                            kwargs = {
+                                k: (
+                                    tensor_cache.convert(v, convert, tensor_cls)
+                                    if k in cached_names
+                                    else _develop_arg(v, convert, tensor_cls)
+                                )
+                                for k, v in kwargs.items()
+                            }
+                    else:
+                        args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
+                        if kwargs:
+                            kwargs = {
+                                k: _develop_arg(v, convert, tensor_cls)
+                                for k, v in kwargs.items()
+                            }
 
                     module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)
