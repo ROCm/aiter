@@ -18,6 +18,10 @@ import torch
 from torch import Tensor
 
 BLOCK_M = 256
+# Stage 2's [T * topk, D] bf16 slot buffer passes its element count as an i32
+# and is addressed through 32-bit buffer ranges; moe_bs_forward runs larger T in
+# token chunks no bigger than the largest validated buffer (T 32768, top-k 9, D 4096).
+_MAX_SLOT_BYTES = 32768 * 9 * 4096 * 2
 
 
 def e8m0_from_pow2(scale: Tensor) -> Tensor:
@@ -185,6 +189,23 @@ def moe_bs_forward(
     if out is None:
         out = torch.empty_like(x)
     if T == 0:
+        return out
+    chunk = max(1, _MAX_SLOT_BYTES // (topk * D * 2))
+    if T > chunk:
+        step = -(-T // -(-T // chunk))
+        for t0 in range(0, T, step):
+            rows = slice(t0, t0 + step)
+            moe_bs_forward(
+                x[rows],
+                topk_ids[rows],
+                topk_weights[rows],
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                out=out[rows],
+                swiglu_limit=swiglu_limit,
+            )
         return out
     # The sort drops ids outside [0, E) itself; the reduction skips only
     # negative ones, so ids >= E become -1 (their slot rows are never written).

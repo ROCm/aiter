@@ -205,6 +205,31 @@ def test_moe_blockscale_graph(tokens, topk):
 
 
 @benchmark()
+def test_moe_blockscale_chunked(tokens, topk, chunks):
+    """Token-chunked forward (the large-T path) is bitwise equal to one pass.
+
+    ``_MAX_SLOT_BYTES`` is lowered so ``tokens`` splits into ``chunks`` passes;
+    every output row depends only on its own token, so the bytes must match.
+    """
+    import aiter.ops.flydsl.moe_blockscale_pp as bspp
+
+    E = ROUTED_EXPERTS + int(topk == 9)
+    w13, s13, w2, s2 = weights(E, 1024, 4096)
+    w13s, w2s = shuffle_weight(w13, (16, 16)), shuffle_weight(w2, (16, 16))
+    e13, e2 = bspp.e8m0_from_pow2(s13), bspp.e8m0_from_pow2(s2)
+    x, ids, tw = make_routing(tokens, E, topk, seed=5)
+    whole = bspp.moe_bs_forward(x, ids, tw, w13s, e13, w2s, e2)
+    saved = bspp._MAX_SLOT_BYTES
+    try:
+        bspp._MAX_SLOT_BYTES = -(-tokens // chunks) * topk * 4096 * 2
+        chunked = bspp.moe_bs_forward(x, ids, tw, w13s, e13, w2s, e2)
+    finally:
+        bspp._MAX_SLOT_BYTES = saved
+    assert torch.equal(whole, chunked), "chunked forward differs from one pass"
+    return {"gfx": get_gfx_runtime(), "chunks": chunks, "equal": True}
+
+
+@benchmark()
 def test_moe_blockscale_dispatch(tokens, topk, swiglu_limit):
     """fused_moe reaches the FlyDSL backend through an ``impl__flydsl_bspp__default`` row.
 
@@ -329,6 +354,11 @@ def main():
     df = [test_moe_blockscale_graph(t, k) for k in args.topk for t in (128, 4096)]
     aiter.logger.info(
         "moe_blockscale graph replay (markdown):\n%s",
+        pd.DataFrame(df).to_markdown(index=False),
+    )
+    df = [test_moe_blockscale_chunked(4097, k, 3) for k in args.topk]
+    aiter.logger.info(
+        "moe_blockscale token chunks (markdown):\n%s",
         pd.DataFrame(df).to_markdown(index=False),
     )
 
