@@ -236,8 +236,16 @@ def fused_moe(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    shared_folded: bool = False,
+    shared_a1: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
+    if shared_folded:
+        # a tuned whole-graph row of tuned_shared_fmoe.csv, run by the legacy entry only
+        raise NotImplementedError(
+            "aiter.moev2 does not serve shared_folded=True; "
+            "use aiter.fused_moe.fused_moe (the legacy code)"
+        )
     call = dict(locals())
     op = None
     for path in paths.registered().values():

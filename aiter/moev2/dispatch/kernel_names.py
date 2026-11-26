@@ -26,6 +26,7 @@ FLYDSL_LAYOUT = "flydsl_layout"  # flydsl_moe2_layout_a.._w.._<out>_tMxNxK[_opts
 MXMOE = "mxmoe"  # flydsl_mxmoe_g{1,2}_aXwY_MxNxK[_opts]
 OPUS = "opus"  # opus_moe{1,2}[_layout]_...
 IMPL = "impl"  # impl__<name>__<config>: a whole-graph implementation
+ROUTE = "route"  # flydsl_m3route_<name>: the router entry of a whole-graph row (kernelName2)
 GROUPED_GEMM = "grouped_gemm"  # grouped_gemm{1,2}_...
 NULL = "null"  # the literal "Null" some 1-stage rows carry in kernelName2
 
@@ -38,6 +39,7 @@ FAMILIES = (
     MXMOE,
     OPUS,
     IMPL,
+    ROUTE,
     GROUPED_GEMM,
     NULL,
 )
@@ -100,6 +102,7 @@ _GROUPED = re.compile(r"grouped_gemm(?P<stage>[12])(?P<opts>(?:_[A-Za-z0-9]+)+)"
 _CKTILE = re.compile(r"cktile(?P<opts>(?:_[A-Za-z0-9]+)+)")
 _CKTILE_ALIAS = "swiglu_mxfp4_bf16_cktile"
 _IMPL_PREFIX = "impl__"
+_ROUTE_PREFIX = "flydsl_m3route_"
 
 
 def _ints(match, *names):
@@ -208,6 +211,10 @@ def _format_impl(k):
     return f"{_IMPL_PREFIX}{k.fields['name']}__{k.fields['config']}"
 
 
+def _format_route(k):
+    return f"{_ROUTE_PREFIX}{k.fields['name']}"
+
+
 _FORMATTERS = {
     ASM: _format_asm,
     CK2STAGES: _format_ck,
@@ -217,6 +224,7 @@ _FORMATTERS = {
     MXMOE: _format_mxmoe,
     OPUS: _format_opus,
     IMPL: _format_impl,
+    ROUTE: _format_route,
     GROUPED_GEMM: _format_grouped,
     NULL: lambda k: "Null",
 }
@@ -246,6 +254,11 @@ def parse(name) -> KernelName | None:
         if not impl or not sep:
             raise KernelNameError(f"invalid whole-graph kernel name {name!r}")
         return KernelName(IMPL, None, FrozenMap({"name": impl, "config": config}))
+    if name.startswith(_ROUTE_PREFIX):
+        route = name[len(_ROUTE_PREFIX) :]
+        if not route:
+            raise KernelNameError(f"invalid router kernel name {name!r}")
+        return KernelName(ROUTE, None, FrozenMap({"name": route}))
     for family, pattern, parser in (
         (CK2STAGES, _CK, _parse_ck),
         (ASM, _ASM, _parse_asm),

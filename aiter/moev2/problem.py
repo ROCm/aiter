@@ -351,6 +351,7 @@ class MoeProblem:
         _exclude_mxmoe=False,
         _has_input_activation_scales=False,
         has_global_scale=False,
+        shared_expert_id=None,
         *,
         arch: str,
         cu_num: int,
@@ -378,6 +379,8 @@ class MoeProblem:
             extras["disable_inline_sort"] = True
         if _exclude_mxmoe:
             extras["exclude_mxmoe"] = True
+        if shared_expert_id is not None:
+            extras["shared_expert_id"] = shared_expert_id
         q_type = QuantType(q_type)
         return cls(
             arch=arch,
@@ -448,6 +451,8 @@ class MoeProblem:
             "_has_input_activation_scales": "a1_scale" in self.features,
             "has_global_scale": "global_scale" in self.features,
         }
+        if "shared_expert_id" in self.extras:
+            kwargs["shared_expert_id"] = self.extras["shared_expert_id"]
         return args, kwargs
 
     def log_keys(self) -> tuple:
