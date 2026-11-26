@@ -46,18 +46,17 @@ def ring_depth(mt: int) -> int:
     return 4 if mt <= 6 else 3
 
 
-def _raw(v):
-    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
-
-
 def _sb():
     fx.rocdl.sched_barrier(0)
 
 
 def _lds_ptr(byte_addr):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(byte_addr)))
+    # The backend-resolved LDS pointer (no hand-built address space), as ``issue`` below builds it.
+    return fx.to_llvm_ptr(
+        fx.inttoptr(
+            fx.PointerType.get(T.i8, fx.AddressSpace.Shared), fx.Int64(byte_addr)
+        )
+    )
 
 
 def _barrier():
@@ -267,6 +266,9 @@ def compile_ring(
             wv, xv = ops
             for i in range_constexpr(NRW):
                 for m in range_constexpr(MT):
+                    # Raw MFMA, not fx.make_mma_atom + fx.gemm: the s_waitcnt vmcnt / lgkmcnt counts and the
+                    # sched_barrier groups of this ring are written against this exact MFMA issue order (A/B
+                    # operands as register vectors); the atom form is not yet ISA-diffed against it.
                     acc[i][m] = Vec(
                         fx.rocdl.mfma_f32_16x16x32_bf16(
                             Vec.make_type(4, fx.Float32),

@@ -226,6 +226,8 @@ def bench_ring(m, n, k):
         ret[f"{name} err"] = checkAllclose(
             ref.float(), o.float(), atol=2e-3, rtol=2e-2, msg=name
         )
+        # checkAllclose reports the mismatch fraction, it does not raise: a wrong candidate must fail the run
+        assert ret[f"{name} err"] == 0, f"{name} mismatches the reference at M={m}"
     return ret
 
 

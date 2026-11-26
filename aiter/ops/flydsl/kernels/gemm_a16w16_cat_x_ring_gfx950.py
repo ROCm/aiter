@@ -101,7 +101,7 @@ def compile_cat_ring(
         xa = (seg == 3).select(x3, xa)
         xa = (seg == 4).select(x4, xa)
         xr = buffer_ops.create_buffer_resource_from_addr(
-            xa, num_records_bytes=i32_m * i32_xs
+            xa, num_records_bytes=(i32_m - 1) * i32_xs + seg_k * 2
         )
         wr = buffer_ops.create_buffer_resource_from_addr(
             arg_w, num_records_bytes=n * K * 2
@@ -190,6 +190,8 @@ def compile_cat_ring(
         def mfmas(ops):
             wv, xv = ops
             for m in range_constexpr(MT):
+                # Raw MFMA, not fx.make_mma_atom + fx.gemm: the vmcnt / lgkmcnt waits and sched_barrier groups
+                # of this ring depend on this exact MFMA issue order (same as gemm_a16w16_ring_gfx950).
                 acc[m] = Vec(
                     fx.rocdl.mfma_f32_16x16x32_bf16(
                         Vec.make_type(4, fx.Float32), [wv, xv[m], acc[m], 0, 0, 0]

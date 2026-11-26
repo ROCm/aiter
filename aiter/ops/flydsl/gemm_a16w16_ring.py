@@ -117,7 +117,9 @@ def _device_ok(index: int) -> bool:
 def ring_supported(m: int, n: int, k: int, device=None, tiling=None) -> bool:
     """Whether ``gemm_a16w16_ring`` takes this M/N/K (and ``tiling``, default ``ring_tiling(m)``) on this GPU
     (gfx950, 256 CUs)."""
-    if not 1 <= m <= MAX_ROWS or not torch.cuda.is_available():
+    # ``is_available`` only gates the device-less (tuner catalog) callers; with a device the AOT dry run (no GPU
+    # runtime) and a launch (CUDA tensors) both reach ``_device_ok``, which asks the arch and the CU count.
+    if not 1 <= m <= MAX_ROWS or (device is None and not torch.cuda.is_available()):
         return False
     index = (
         torch.cuda.current_device() if device is None else torch.device(device).index

@@ -113,6 +113,87 @@ def test_cat_x_ring_rejects_unsupported():
 
 
 @_SKIP
+def test_cat_x_ring_expanded_taps_and_output_rows():
+    """A tap row stride of 0 (one row broadcast over M) and a padded output are served; overlapping output rows
+    (a ``[1, N]`` buffer expanded to ``[M, N]``) are refused, not written over each other."""
+    xs, w = _inputs(8)
+    ws = shuffle_weight_ring(w)
+    one = [x[:1].expand(8, SEG_K) for x in xs]
+    out = gemm_a16w16_cat_x_ring(one, ws)
+    torch.testing.assert_close(
+        out.float(), run_torch(one, w).float(), atol=0.05, rtol=1e-2
+    )
+    assert torch.equal(out[0], out[7])
+    padded = torch.full((8, N + 64), float("nan"), dtype=dtypes.bf16, device="cuda")
+    got = gemm_a16w16_cat_x_ring(xs, ws, out=padded[:, :N])
+    assert got.data_ptr() == padded.data_ptr()
+    assert torch.equal(got, gemm_a16w16_cat_x_ring(xs, ws))
+    assert padded[:, N:].isnan().all()  # the pad columns are not written
+    overlap = torch.empty(1, N, dtype=dtypes.bf16, device="cuda").expand(8, N)
+    with pytest.raises(ValueError):
+        gemm_a16w16_cat_x_ring(xs, ws, out=overlap)
+
+
+@_SKIP
+@pytest.mark.parametrize("m, mt", ((40, 3), (40, 4), (100, 7), (100, 8)))
+def test_ring_splitk_tile_larger_than_rows(m, mt):
+    """A padded-M lookup runs a row tuned for a larger M: M = 33..48 on the M = 64 tile (``mt = 4``), 65..112 on the
+    M = 128 tile (``mt = 8``). Rows past M load the last row and are not stored."""
+    xs, w = _inputs(m)
+    x = torch.cat(xs, dim=-1)
+    out = gemm_a16w16_ring_splitk(x, w, mt=mt)
+    torch.testing.assert_close(
+        out.float(), run_torch(xs, w).float(), atol=0.05, rtol=1e-2
+    )
+    # a row's result does not depend on the tile that holds it
+    assert torch.equal(out, gemm_a16w16_ring_splitk(x, w))
+
+
+@_SKIP
+@pytest.mark.parametrize("m", (40, 100))
+def test_ring_splitk_tuned_row_of_a_larger_m(m, monkeypatch):
+    """``tgemm.mm`` at M reaches an injected ``rk`` row tuned at the padded M (a larger tile than M needs)."""
+    import aiter.tuned_gemm as tuned
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.gemm_op_common import get_padded_m
+
+    k = NSEG * SEG_K
+    padded = get_padded_m(m, N, k, 0)
+    assert (padded + 15) // 16 > (m + 15) // 16
+    xs, w = _inputs(m)
+    x = torch.cat(xs, dim=-1)
+    name = _tuned_name(padded, ((padded + 15) // 16, 10, 4))
+    key = (
+        "gfx950",
+        get_cu_num(),
+        padded,
+        N,
+        k,
+        False,
+        str(dtypes.bf16),
+        str(dtypes.bf16),
+        False,
+        False,
+    )
+    row = {"libtype": "flydsl", "solidx": 0, "splitK": 1, "kernelName": name}
+    monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {key: row})
+    tuned.get_GEMM_A16W16_config.cache_clear()
+    calls = []
+    orig = tuned.solMap["flydsl"]
+    monkeypatch.setitem(
+        tuned.solMap, "flydsl", lambda *a, **kw: calls.append(1) or orig(*a, **kw)
+    )
+    try:
+        got = tgemm.mm(x, w)
+    finally:
+        tuned.get_GEMM_A16W16_config.cache_clear()
+    assert calls, "tgemm.mm did not reach the injected rk row"
+    torch.testing.assert_close(
+        got.float(), run_torch(xs, w).float(), atol=0.05, rtol=1e-2
+    )
+
+
+@_SKIP
 @pytest.mark.parametrize("layout", ["row", "aiter", "ring"])
 @pytest.mark.parametrize("m", (1, 17, 64, 128))
 def test_ring_splitk_plain_matches_torch(m, layout):
@@ -231,6 +312,8 @@ def bench_cat_x(m):
         ret[f"{name} err"] = checkAllclose(
             ref.float(), out.float(), atol=0.05, rtol=1e-2, msg=name
         )
+        # checkAllclose reports the mismatch fraction, it does not raise: a wrong candidate must fail the run
+        assert ret[f"{name} err"] == 0, f"{name} mismatches the reference at M={m}"
     return ret
 
 

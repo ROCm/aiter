@@ -9,16 +9,11 @@ without materializing the concat (the DSpark draft ``fc``: five taps of 6144, N=
         out = gemm_a16w16_cat_x_ring(xs, w_ring)
 
 K is split ``ks`` ways (default 10: two splits per tap), each split's fp32 partial is stored, and the partials are
-summed in ascending split order by aiter's Triton split-K reduce kernel with one bf16 rounding, so the result is
-deterministic. It is not bit-identical to a single-pass K order (or to hipBLASLt), only to bf16 rounding.
+summed in ascending split order by aiter's FlyDSL split-K reduce (the one of the mxscale preshuffle GEMM, so this op
+stays on one backend and its AOT replay is complete) with one bf16 rounding, so the result is deterministic. It is not bit-identical to a single-pass K order (or to hipBLASLt), only to bf16 rounding.
 """
 
 import torch
-import triton
-
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
 
 from .gemm_a16w16_ring import MAX_ROWS, _device_ok
 from .kernels.gemm_a16w16_cat_x_ring_gfx950 import (
@@ -28,7 +23,7 @@ from .kernels.gemm_a16w16_cat_x_ring_gfx950 import (
     NSEG,
     compile_cat_ring,
 )
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 MAX_SPLIT_K = 40  # tuner bound on ks: the fp32 partials are [ks, M, N]
 NWAVE_FRAGS = 4  # 16-row weight fragments per workgroup column tile (one per wave)
@@ -59,7 +54,9 @@ def cat_x_ring_supported(
     """Whether ``gemm_a16w16_cat_x_ring`` takes M rows of five ``seg_k``-wide taps and an ``[n, 5 * seg_k]`` weight
     with ``ks`` K splits, ring depth ``r`` (default: ``_ring_depth``) and ``mt`` 16-row M fragments per tile (default
     ``ceil(m / 16)``)."""
-    if not 1 <= m <= MAX_ROWS or not torch.cuda.is_available():
+    # ``is_available`` only gates the device-less (tuner catalog) callers; with a device the AOT dry run (no GPU
+    # runtime) and a launch (CUDA tensors) both reach ``_device_ok``, which asks the arch and the CU count.
+    if not 1 <= m <= MAX_ROWS or (device is None and not torch.cuda.is_available()):
         return False
     index = (
         torch.cuda.current_device() if device is None else torch.device(device).index
@@ -150,7 +147,15 @@ def ring_splitk_tilings(m: int, k: int, n: int, device=None):
 def _launch(
     ptrs, m, seg_k, stride_bytes, w, out, ks, r, layout, workspace, tune_mt=None
 ):
+    from .mxscale_preshuffle_kernels import _bound_reduce_exe
+
     n = w.shape[0]
+    # The kernel reads row ``i`` of a tap at byte ``i * stride_bytes`` through 32-bit offsets and a descriptor that
+    # spans the last row's ``seg_k`` elements: a zero (expanded) or padded row stride is fine, a span past 2**31 is not.
+    if stride_bytes < 0 or (m - 1) * stride_bytes + seg_k * 2 >= 2**31:
+        raise ValueError(
+            f"tap row stride {stride_bytes} B x {m} rows exceeds the kernel's 32-bit address range"
+        )
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=w.device)
     elif (
@@ -158,8 +163,14 @@ def _launch(
         or out.shape != (m, n)
         or out.dtype != torch.bfloat16
         or out.stride(1) != 1
+        # rows must not overlap (an expanded [1, N] buffer would take every result row at the same addresses); the
+        # reduce kernel stores dwords of two bf16, so the row stride is even and the base 4-byte aligned
+        or (m > 1 and (out.stride(0) < n or out.stride(0) % 2))
+        or out.data_ptr() % 4
     ):
-        raise ValueError("out must be a bf16 [M, N] with unit column stride")
+        raise ValueError(
+            "out must be a bf16 [M, N] with unit column stride, a non-overlapping even row stride and 4-byte alignment"
+        )
     if workspace is None:
         workspace = torch.empty(ks, m, n, dtype=torch.float32, device=w.device)
     elif (
@@ -169,7 +180,9 @@ def _launch(
         or not workspace.is_contiguous()
     ):
         raise ValueError("workspace must be a contiguous fp32 [ks, M, N]")
+    ldc = out.stride(0) if m > 1 else n
     with torch.cuda.device(w.device):
+        stream = torch.cuda.current_stream()
         exe = compile_cat_ring(
             n,
             seg_k,
@@ -186,26 +199,18 @@ def _launch(
             workspace.data_ptr(),
             m,
             stride_bytes,
-            torch.cuda.current_stream(),
+            stream,
         )
-        _gemm_splitk_reduce_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 32))](
-            workspace,
-            out,
-            None,
-            m,
-            n,
-            workspace.stride(0),
-            workspace.stride(1),
-            workspace.stride(2),
-            out.stride(0),
-            out.stride(1),
-            32,
-            32,
-            ks,
-            triton.next_power_of_2(ks),
-            ADD_BIAS=False,
-            activation=None,
-            use_activation=False,
+        _run_compiled(
+            _bound_reduce_exe.lazy(ks, "bf16", ldc != n),
+            ptr_arg(workspace),
+            ptr_arg(out),
+            m * n // 2,  # n_out_dw (2 bf16 per dword)
+            m * n,  # slab_stride_dw (fp32: 1 dword per element)
+            n // 2,  # row_dw
+            ldc // 2,  # ldc_dw
+            stream,
+            specialization_key=w.device,
         )
     return out
 
