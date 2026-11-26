@@ -22,7 +22,10 @@ import torch
 import torch._dynamo
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mha_v4_quant import rotate_activation_hd128
+from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+    rotate_activation_hd128,
+)
 from aiter.ops.triton.attention import sol_tilt
 from aiter.ops.triton.attention.sol_tilt import (
     sol_jensen_cap,
@@ -368,20 +371,29 @@ def test_tilt_planes_scale_by_the_block_gain():
     )
 
 
-def test_tilt_planes_pad_each_mxfp8_k_scale_plane_to_a_whole_scale_tile():
-    """Every MXFP8 K-scale plane is read 128 rows at a time, so each runs zeroed to that tile."""
-    inputs = make_tilt_inputs("mxfp8", "e4m3", seqlen_k=2048, kv_tile=64)
+@pytest.mark.parametrize(
+    "seqlen_k",
+    # 32 pooled rows leave most of the 128-row scale tile as padding; 128 fill it.
+    [2048, 128 * 64],
+    ids=["padded-tile", "full-tile"],
+)
+def test_tilt_planes_pad_each_mxfp8_k_scale_plane_to_a_whole_scale_tile(seqlen_k):
+    """Every MXFP8 K-scale plane is read 128 rows at a time, so each runs zeroed to that tile,
+    and the 64x64 row reads the producer's lookahead rows past the last one."""
+    inputs = make_tilt_inputs("mxfp8", "e4m3", seqlen_k=seqlen_k, kv_tile=64)
     with _poisoned_allocations():
         planes = sol_tilt_planes(**inputs)
     scale, stride = planes.mean_k_scale, planes.k_scale_plane_stride
     blocks, row = scale.shape[1], scale[0, 0].numel()
     pad = (-blocks % SOL_ATTN_TS_KV) * row
-    assert pad > 0 and stride >= scale.numel() + pad
+    assert stride == scale.numel() + pad
     storage = _bytes(scale)
-    assert storage.numel() >= planes.rank * stride + scale.numel() + pad
     for i in range(planes.rank + 1):
         start = i * stride + scale.numel()
         assert not storage[start : start + pad].any(), f"plane {i}"
+    lookahead = storage[(planes.rank + 1) * stride :]
+    assert lookahead.numel() >= MHA_V4_KV_SCALE_LOOKAHEAD_ROWS * row
+    assert not lookahead.any()
 
 
 @requires_gfx950

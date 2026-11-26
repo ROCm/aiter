@@ -611,33 +611,42 @@ def _as_descale(
 
 
 def _stack_planes(
-    plane0: torch.Tensor, planes: torch.Tensor, row_tile: int = 1
+    plane0: torch.Tensor, planes: torch.Tensor, row_tile: int = 1, tail_rows: int = 0
 ) -> tuple[torch.Tensor, int]:
     """plane0 and planes as one contiguous (1 + rank)-plane allocation: (plane 0 view, stride in bytes).
 
     With row_tile > 1 each plane is followed by zeroed rows (dim 1, BSHD) taking the last batch's
-    up to a multiple of it; plane 0's strides are contiguous either way.
+    up to a multiple of it, and the last plane by tail_rows more, for a reader that runs past its
+    last tile; plane 0's strides are contiguous either way.
 
     A kernel writes every plane: the Sol kernel reaches planes 1..rank only through the byte
     stride, so under torch.compile torch ops building them would be cut down to plane 0.
     """
     plane0 = plane0.contiguous()
     size = plane0.numel()
-    pad = (-plane0.shape[1] % row_tile) * plane0[0, 0].numel()
+    row = plane0[0, 0].numel()
+    pad = (-plane0.shape[1] % row_tile) * row
     shape = (1 + planes.shape[0], size + pad)
-    ext = plane0.new_zeros(shape) if pad else plane0.new_empty(shape)
+    stacked = shape[0] * shape[1]
+    # The kernel writes the whole allocation, tail included: handed a view of it, torch.compile
+    # gives the kernel a buffer of the view's size and drops the tail.
+    flat = plane0.new_empty(stacked + tail_rows * row)
+    if pad:
+        flat[:stacked].view(shape)[:, size:].zero_()
+    if tail_rows:
+        flat[stacked:].zero_()
     block = 1024
     _sol_tilt_stack_kernel[(triton.cdiv(size, block), shape[0])](
         plane0,
         planes.to(plane0.dtype).contiguous(),
-        ext,
+        flat,
         size,
         shape[1],
         BLOCK=block,
     )
     return (
-        ext.as_strided(plane0.shape, plane0.stride()),
-        ext.stride(0) * ext.element_size(),
+        flat.as_strided(plane0.shape, plane0.stride()),
+        shape[1] * flat.element_size(),
     )
 
 
@@ -777,10 +786,12 @@ def sol_tilt_planes(
     )
 
     if k_format == "mxfp8" and not k_packed:
+        from aiter.ops.mha_v4_quant import MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+
         data, scale = _e8m0_quantize(planes_a, mean_k.dtype)
         ext_k, k_stride = _stack_planes(mean_k, data)
         k_scale, k_scale_stride = _stack_planes(
-            mean_k_scale, scale, _TILT_SCALE_ROW_TILE
+            mean_k_scale, scale, _TILT_SCALE_ROW_TILE, MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
         )
     elif k_mx:
         x = torch.cat(
