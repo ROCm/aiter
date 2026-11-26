@@ -691,8 +691,10 @@ def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
     ``cd`` is the input dtype (fp32 accumulation and output). ``epilogue``
     ("kda_gate", "kda_gate_bwd", "sigmoid_mul"; ``kind="fwd"``) runs on
     ``ops`` (FlyDSL GEMM epilogues or ``_TorchProj``) with ``epi`` as its
-    arguments. ``name`` labels the projection (qkv, f_a, f_b, w_beta, g_proj,
-    w_o, ...) for an installed hook.
+    arguments; "kda_gate_bwd" returns (dz, dA_log [H], d dt_bias [H*K]), and
+    the FlyDSL "sigmoid_mul" stores in the weight dtype, which the output
+    projection reads. ``name`` labels the projection (qkv, f_a, f_b, w_beta,
+    g_proj, w_o, ...) for an installed hook.
     """
     if _proj_gemm_hook is not None:
         out = _proj_gemm_hook(
@@ -808,7 +810,7 @@ class _TorchProj:
 
     @staticmethod
     def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
-        """(dz, per-element dA_log terms), fp32 [M, H*K]."""
+        """(dz fp32 [M, H*K], dA_log fp32 [H], d dt_bias fp32 [H*K])."""
         z = (lr.float() @ f_b.float().t() + dt_bias.float()).unflatten(
             -1, (num_heads, -1)
         )
@@ -821,17 +823,18 @@ class _TorchProj:
             sg = torch.sigmoid(a * z)
             dz = dg * lower_bound * sg * (1 - sg) * a
             dterm = dz * z
-        return dz.flatten(-2), dterm.flatten(-2)
+        return dz.flatten(-2), dterm.sum((0, 2)), dz.flatten(-2).sum(0)
 
     @staticmethod
-    def gate_proj_bwd_gemms(dgp, x, g_proj):
+    def gate_proj_bwd_gemms(dgp, x, g_proj, dw_dtype=torch.float32):
         dgp = dgp.float()
-        return dgp @ g_proj.float(), dgp.t() @ x.float()
+        return dgp @ g_proj.float(), (dgp.t() @ x.float()).to(dw_dtype)
 
     @staticmethod
-    def sigmoid_gate_proj(x, g_proj, aux=None):
+    def sigmoid_gate_proj(x, g_proj, aux=None, out_dtype=None):
         out = torch.sigmoid(x.float() @ g_proj.float().t())
-        return out if aux is None else out * aux.float()
+        out = out if aux is None else out * aux.float()
+        return out if out_dtype is None else out.to(out_dtype)
 
 
 def _proj_ops(x, w):
@@ -1140,7 +1143,7 @@ def _kda_layer_fused_bwd(
     )
     dz = dg.float().reshape(B * T, -1)
     if "gate" not in fuses:
-        dz, dterm = _proj_gemm(
+        dz, dA_log, ddt = _proj_gemm(
             lr,
             w.f_b,
             "fwd",
@@ -1154,7 +1157,6 @@ def _kda_layer_fused_bwd(
             dg=dz,
             lower_bound=lower_bound,
         )
-        dA_log = dterm.view(-1, *s["g"].shape[-2:]).sum((0, 2))
     # padded A_log entries get a zero gradient
     dA_log = F.pad(dA_log.float(), (0, w.A_log.numel() - dA_log.numel()))
     db = dbeta.float()
