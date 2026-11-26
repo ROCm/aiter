@@ -211,3 +211,20 @@ def test_backward_matches_fla():
         grads.append({n: t.grad for n, t in leaves.items()})
     for n in x:
         assert _err_ratio(grads[1][n], grads[0][n]) < _ERR_RATIO, n
+
+
+@pytest.mark.parametrize("state", ["none", "h0", "h0_vfirst"])
+def test_backward_flydsl_matches_triton(state):
+    """bwd_backend="flydsl" (FlyDSL state recurrence) agrees with the Triton backward."""
+    pytest.importorskip("flydsl")
+    x, _ = _inputs(2, 1000, 96, 96, 128, 128, False, state, precomputed_gate=False)
+    opts = dict(_FLASH, chunk_size=64, state_v_first=state == "h0_vfirst")
+    grads = []
+    for backend in ("triton", "flydsl"):
+        leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+        o, _ = chunk_kimi_delta_attn(**leaves, bwd_backend=backend, **opts)
+        o.float().square().sum().backward()
+        grads.append({n: t.grad for n, t in leaves.items()})
+    for n in x:
+        assert torch.isfinite(grads[1][n]).all(), n
+        assert _err_ratio(grads[0][n], grads[1][n]) < _ERR_RATIO, n

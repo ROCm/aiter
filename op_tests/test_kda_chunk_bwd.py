@@ -11,9 +11,14 @@ only feeds the projections around the op; the chunk kernel sees
 Gradients of q, k, v, g and beta are graded against autograd through an fp32
 chunked (WY / triangular-solve) reference, adapted from ``chunk_kda_torch`` in
 the fused-layer backward draft (ROCm/aiter#8739).
+
+Candidates: ``triton`` (the #6498 backward, baseline) and ``flydsl``
+(``bwd_backend="flydsl"``: the recomputed chunk-state recurrence on the FlyDSL
+GDN K5 kernel, the other stages on Triton).
 """
 
 import argparse
+import importlib.util
 import itertools
 
 import pandas as pd
@@ -29,6 +34,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+HAS_FLYDSL = importlib.util.find_spec("flydsl") is not None
 CHUNK = 64
 GRADS = ("q", "k", "v", "g", "beta")
 
@@ -109,13 +115,21 @@ def test_kda_chunk_bwd(b, t, h, d, dtype):
     ref = torch.autograd.grad(o_ref, [ref_in[n] for n in GRADS], do)
     del o_ref, ref_in
 
-    leaves = {n: x[n].detach().clone().requires_grad_(True) for n in GRADS}
-    o, _ = chunk_kimi_delta_attn(**leaves, scale=scale, chunk_size=CHUNK)
-    do_k = do.to(o.dtype)
-    inputs = [leaves[n] for n in GRADS]
-    candidates = {
-        "triton": lambda: torch.autograd.grad(o, inputs, do_k, retain_graph=True),
-    }
+    do_k = do.to(dtype)
+
+    def bwd(backend):
+        leaves = {n: x[n].detach().clone().requires_grad_(True) for n in GRADS}
+        o, _ = chunk_kimi_delta_attn(
+            **leaves, scale=scale, chunk_size=CHUNK, bwd_backend=backend
+        )
+        inputs = [leaves[n] for n in GRADS]
+        return lambda: torch.autograd.grad(o, inputs, do_k, retain_graph=True)
+
+    # triton is the baseline; flydsl runs the recomputed chunk-state
+    # recurrence on FlyDSL and the remaining stages on Triton.
+    candidates = {"triton": bwd("triton")}
+    if HAS_FLYDSL:
+        candidates["flydsl"] = bwd("flydsl")
 
     # Nominal count: ~2x the chunked forward's matmul work
     # (intra-chunk C x C scores/WY plus K x V state updates per token).
@@ -151,6 +165,10 @@ def main():
             "kda chunk bwd unsupported on %s; skipping", get_gfx_runtime()
         )
         return
+    if not HAS_FLYDSL:
+        aiter.logger.warning(
+            "flydsl not installed; benchmarking the triton backend only"
+        )
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

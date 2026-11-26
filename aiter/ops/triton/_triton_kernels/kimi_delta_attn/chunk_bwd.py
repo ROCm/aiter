@@ -1700,6 +1700,7 @@ def _recompute_fwd(
     state_v_first,
     run_fwd_h,
     num_cus,
+    backend="triton",
 ):
     """The default forward pipeline up to (not including) the output kernel.
 
@@ -1735,6 +1736,14 @@ def _recompute_fwd(
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         disable_recompute=True,
     )
+
+    if run_fwd_h and backend == "flydsl":
+        from aiter.ops.flydsl.kda_chunk_bwd import kda_bwd_fwd_h_flydsl
+
+        h, v_new = kda_bwd_fwd_h_flydsl(
+            kg, w, u, g_cumsum, initial_state, state_v_first
+        )
+        return q, k, beta, g_cumsum, Aqk, Akk, w, u, qg, kg, h, v_new
 
     h = k.new_empty(B, NT, HV, K, V)
     v_new = torch.empty_like(u)
@@ -1830,6 +1839,7 @@ def chunk_delta_attn_bwd(
     use_qk_l2norm_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     state_v_first: bool = False,
+    backend: str = "triton",
 ) -> tuple:
     """
     Backward pass for chunk_delta_attn, recomputing the forward's intermediates.
@@ -1839,7 +1849,9 @@ def chunk_delta_attn_bwd(
         dht:  Gradient of the final state, laid out like ``initial_state``, or None.
         The rest are the forward's inputs, contiguous, as ``chunk_delta_attn_fwd``
         takes them. ``chunk_size`` is the default pipeline's (32 or 64), whatever
-        the forward ran with.
+        the forward ran with. ``backend="flydsl"`` recomputes the forward's
+        chunk-state recurrence on FlyDSL where its shape allows (bf16,
+        K = V = 128, chunk 64, not varlen); every other stage stays Triton.
 
     Returns:
         ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``, each in the dtype of
@@ -1862,8 +1874,20 @@ def chunk_delta_attn_bwd(
     else:
         chunk_offsets = None
         NT = triton.cdiv(T, BT)
+    if backend not in ("triton", "flydsl"):
+        raise ValueError(f"`backend` must be 'triton' or 'flydsl', got {backend!r}.")
+    if backend == "flydsl":
+        from aiter.ops.flydsl.kda_chunk_bwd import kda_bwd_fwd_h_supported
+
+        if not kda_bwd_fwd_h_supported(
+            K=K, V=V, chunk_size=BT, is_varlen=is_varlen, dtype=q.dtype
+        ):
+            backend = "triton"
     num_cus = _num_cus(q.device.index or 0)
-    rec_cfg = _fused_recurrences_config(N * HV, V, num_cus)
+    # The FlyDSL recurrence runs on its own, so dhu cannot share its launch.
+    rec_cfg = (
+        _fused_recurrences_config(N * HV, V, num_cus) if backend == "triton" else None
+    )
 
     qn, kn, bn, gc, Aqk, Akk, w, u, qg, kg, h, v_new = _recompute_fwd(
         q=q,
@@ -1887,6 +1911,7 @@ def chunk_delta_attn_bwd(
         state_v_first=state_v_first,
         run_fwd_h=rec_cfg is None,
         num_cus=num_cus,
+        backend=backend,
     )
     do = do.contiguous()
     dht = dht.contiguous() if dht is not None else None

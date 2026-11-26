@@ -52,6 +52,8 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs):
+        kwargs = dict(kwargs)
+        ctx.bwd_backend = kwargs.pop("bwd_backend")
         o, final_state, *_ = chunk_delta_attn_fwd(
             q=q,
             k=k,
@@ -92,6 +94,7 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
             dt_bias=dt_bias,
             initial_state=initial_state,
             cu_seqlens=cu_seqlens,
+            backend=ctx.bwd_backend,
             **kwargs,
         )
         return (*grads, None)
@@ -121,6 +124,7 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    bwd_backend: str = "triton",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention using Triton.
@@ -219,6 +223,11 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        bwd_backend (str):
+            Backend of the backward pass: `"triton"`, or `"flydsl"` to run the
+            recomputed chunk-state recurrence on FlyDSL (bf16, `K = V = 128`,
+            chunk 64, not varlen; other calls stay on Triton). The rest of the
+            backward is Triton either way. Default: `"triton"`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -357,6 +366,7 @@ def chunk_kimi_delta_attn(
                 "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
                 "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
                 "state_v_first": state_v_first,
+                "bwd_backend": bwd_backend,
             },
         )
         return o.to(q.dtype), final_state
