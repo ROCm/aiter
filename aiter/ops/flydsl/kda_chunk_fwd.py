@@ -70,7 +70,8 @@ class _Timer:
 # Tunables, by name: ``k5_bv`` -- the K5 recurrence's V block (16 / 32 / 64);
 # ``diag_mfma`` -- the intra diagonal tiles on MFMA (only honoured for the
 # ``lower_bound`` gate, whose bounded decay it needs).
-# ``out_bv`` -- V columns per output program (64 doubles the program count).
+# ``out_bv`` -- V columns per output program (64 doubles the program count;
+# measured slower from T = 2048 at H = 96, so 128 is the default).
 TUNABLES = {"k5_bv": (16, 32, 64), "diag_mfma": (False, True), "out_bv": (64, 128)}
 _TUNED_TABLE = None
 
@@ -123,7 +124,7 @@ def default_config(*, H, total_chunks, max_seq_chunks, lower_bound_gate, device)
     return {
         "k5_bv": _hipeq_select_bv(device, H, total_chunks, max_seq_chunks),
         "diag_mfma": bool(lower_bound_gate),
-        "out_bv": 64,
+        "out_bv": 128,
     }
 
 
@@ -507,7 +508,7 @@ def chunk_kda_fwd_flydsl(
     o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
     _run_compiled(
         compile_output(
-            H, h.dtype, v_new.dtype, o.dtype, chunks.varlen, config.get("out_bv", 64)
+            H, h.dtype, v_new.dtype, o.dtype, chunks.varlen, config.get("out_bv", 128)
         ),
         qg,
         h,
