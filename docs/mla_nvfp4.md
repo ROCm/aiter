@@ -148,6 +148,83 @@ aiter.mla.mla_decode_prepare_page_csr(
 The adapter requires `indices` capacity at least `B * block_tables.shape[1]`.
 It converts metadata only, not KV bytes.
 
+## Fused decode prep
+
+`mla_nvfp4_decode_prep` does a decode step's Q RoPE quantization and KV append
+in one HIP launch (its own module, `module_mla_nvfp4_decode_prep`; no ASM code
+object). For B tokens, one per request:
+
+```python
+aiter.mla_nvfp4_decode_prep(
+    q_rope, q_aux, ring, req_ids, k_nope, k_rope, positions, slots,
+    kv_nope, kv_aux, cos_cache, sin_cache,
+)
+```
+
+- `q_aux [B,128,128]` gets bytes 0..63 and 96..127 exactly as
+  `mla_nvfp4_quantize_q` writes them. Bytes 64..95, the NoPE scales, are left
+  as written, so the NoPE producer may run before or after.
+- `ring [R,16,576]` is the caller's BF16 tail: one 16-token tile per request
+  (512 NoPE channels, then 64 rotated RoPE channels). The token's row
+  `positions % 16` of `ring[req_ids]` is set, and rows 0..that row are
+  requantized into page `slots // 64`, tile `positions % 64 // 16`, exactly as
+  `mla_nvfp4_update_cache` writes that tile. A tile's first token also writes
+  the zero codes and 0x7F scales of its later rows.
+- With BF16 `cos_cache`/`sin_cache` (GPT-J pairs), `q_rope [B,128,64]` and
+  `k_rope [B,64]` are rotated at `positions`, rounding as aiter's Triton RoPE
+  (`forward_triton`) does; without them they are already rotated.
+- Slot -1 marks a padding row: zero Q codes, 0x7F scales, no KV write. Tokens
+  whose page or request id is outside the cache or the ring write no KV either.
+
+`req_ids` is int32, `positions` and `slots` are int64, all `[B]`. `q_rope` rows
+must be 128 head strides apart: contiguous, or the RoPE slice of a
+`[B,128,D]` Q. A batch must not repeat a request. The written tensors
+(`q_aux`, the ring, both cache planes) must not overlap each other or the
+inputs; a ring whose rows overlap is rejected. The caller owns tail
+recycling: a tile's first token overwrites row 0. The op is graph-safe; warm
+it up before capture.
+
+For fused RoPE at B >= 1024, each 384-thread block handles one request: four Q
+waves each load 32 heads through TDM and process four groups of eight heads,
+while eight K waves handle the tail tile. Q and K use disjoint LDS and output
+regions, and K RoPE processing overlaps the historical NoPE tile load. Batch
+size is a runtime argument: non-aligned sizes such as 1537, 2049 and 4097 use
+the same kernel. A fixed-stride DSR1 entry checks all specialized strides
+before dispatch and uses a compact 116-byte kernel argument list for gfx1250
+kernarg preload. Other layouts at B >= 1024 use the generic-stride joint
+entry; smaller batches and the already-rotated path retain the 256-thread
+implementation. A captured graph keeps its launch batch size; changes to the
+live request count use the existing negative-slot padding convention.
+
+For the fixed-stride entry at B >= 2048, Q RoPE keeps cos/sin packed and uses
+BF16 instruction operand selectors for coefficient broadcast and GPT-J rotation.
+The BF16 multiply/FMA rounding is unchanged. This lowers VGPR allocation from
+76 to 60 without changing LDS or kernel arguments; padding writes are unrolled
+in this specialization. Smaller batches and other strides retain their previous
+scheduling; K and quantization arithmetic are unchanged.
+
+On a four-gfx1250 DeepSeek-R1 MLPerf trace using ATOM 1117 dev10 and the
+`gfx1250-atom-20261117-dsr1` image, logical rank dp0's complete decode-prep
+kernel medians were 10.494, 10.815 and 10.895 us in the 300/600/900-second
+windows. Actual 61-layer per-graph sums had medians of 0.647, 0.665 and
+0.670 ms. These are model trace observations, not a bandwidth benchmark.
+They predate the runtime-batch extension and packed Q RoPE optimization.
+
+On 2026-11-24, full 4388-sample model accuracy runs passed with the latest
+K-up and decode-prep optimizations, attention #8200 at b3bef9970, and the
+same image:
+
+| Maximum graph batch | Exact match | Tokens/sample |
+| ---: | ---: | ---: |
+| 1536 | 80.674567% | 3927.594348 |
+| 2048 | 80.674567% | 3927.594348 |
+
+All four ranks replayed each run's largest graph bucket. At the first
+observed replay, active requests ranged from 1026 to 1091 per rank for the
+1536 run, and from 1042 to 1091 for the 2048 run. The other rows were padding;
+these runs do not establish full live-request occupancy at those batch sizes.
+Op tests cover full batches and changing padding. No new model trace was run.
+
 ## Unified MLA entry
 
 The same backend is available through `aiter.mla.mla_decode_fwd` using
