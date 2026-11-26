@@ -273,6 +273,32 @@ def test_shared_folded_rejects_unsupported_clamp_and_bad_output():
         _fmoe16(L, w, ids, x, output=x)
 
 
+def test_routed_weight_and_scale_dtypes_are_validated():
+    """A weight / scale of the right byte count but another encoding (FP8 weights read as packed FP4, E4M3 scales
+    read as E8M0 exponents) is refused, not reinterpreted."""
+    L, (gate, bias), x = make_layer(), make_router(), make_x(16)
+    _, w, ids = chain_direct(x, L, gate, router_line_layout(gate), bias)
+    w2 = L["w2"].view(torch.uint8).view(torch.float8_e4m3fn)
+    w2.is_shuffled = True
+    with pytest.raises(NotImplementedError):
+        _fmoe16(dict(L, w2=w2), w, ids, x)
+    bad = L["w1_scale"].view(torch.uint8).view(torch.float8_e4m3fn)
+    with pytest.raises(NotImplementedError):
+        _fmoe16(dict(L, w1_scale=bad), w, ids, x)
+
+
+def test_derived_cache_key_includes_strides():
+    """Two views of one storage with the same pointer / shape but different strides hold different logical
+    values: they must not share a cache entry."""
+    m3.clear_derived_weight_cache()
+    base = torch.arange(64 * 224, device=dev, dtype=torch.int32).to(torch.uint8)
+    a = base.as_strided((64, 192), (224, 1))
+    b = base.as_strided((64, 192), (192, 1))
+    ra = m3._derived("t", a, lambda t: t.contiguous().clone())
+    rb = m3._derived("t", b, lambda t: t.contiguous().clone())
+    assert torch.equal(ra, a) and torch.equal(rb, b) and not torch.equal(ra, rb)
+
+
 def test_derived_cache_keeps_its_source_alive():
     """The cached layout holds its source tensor, so a freed layer's address cannot alias another layer's entry."""
     m3.clear_derived_weight_cache()
@@ -394,6 +420,9 @@ def run_timing(rows, nsets, abab, ecfgs=None):
 
 
 def main():
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        print("test_fused_moe_m3_decode: needs a gfx950 GPU, skipping")
+        return
     p = argparse.ArgumentParser()
     p.add_argument("--rows", type=int, nargs="+", default=list(ROWS))
     p.add_argument(

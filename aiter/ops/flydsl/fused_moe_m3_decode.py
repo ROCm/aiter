@@ -72,7 +72,14 @@ def _derived(kind: str, src: torch.Tensor, build):
         version = src._version
     except RuntimeError:  # inference tensors have no version counter
         version = -1
-    key = (kind, src.data_ptr(), tuple(src.shape), src.device, version)
+    key = (
+        kind,
+        src.data_ptr(),
+        tuple(src.shape),
+        tuple(src.stride()),
+        src.device,
+        version,
+    )
     hit = _DERIVED.get(key)
     if hit is None:
         # keep the source alive with its layout: while the entry exists its storage address cannot be
@@ -116,6 +123,10 @@ def prepare_decode_weights(w1_scale, shared_w1_scale, shared_w2_scale):
     return s13, ss13, ss2
 
 
+_FP4_DTYPES = (dtypes.fp4x2, torch.uint8)
+_E8M0_DTYPES = (dtypes.fp8_e8m0, torch.uint8)
+
+
 def check_request(req: FusedMoeRequest) -> str | None:
     """Why the request is outside the kernels' contract, or None."""
     x, w1, w2 = req.hidden_states, req.w1, req.w2
@@ -133,6 +144,13 @@ def check_request(req: FusedMoeRequest) -> str | None:
         return "topk_ids / topk_weight must be contiguous"
     if w1.numel() != E * 2 * I * H // 2 or w2.numel() != E * H * I // 2:
         return "routed weights are not E128 H6144 I768 MXFP4"
+    if w1.dtype not in _FP4_DTYPES or w2.dtype not in _FP4_DTYPES:
+        return "routed weights must be MXFP4 (float4_e2m1fn_x2 or uint8)"
+    scales = (req.w1_scale, req.w2_scale, req.shared_w1_scale, req.shared_w2_scale)
+    if req.shared_a1 is not None:
+        scales += (req.a1_scale, req.shared_a1[1])
+    if any(t is not None and t.dtype not in _E8M0_DTYPES for t in scales):
+        return "scales must be E8M0 (float8_e8m0fnu or opaque uint8)"
     if not (getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
         return "routed weights must be preshuffled (is_shuffled=True)"
     if req.w1_scale is None or req.w2_scale is None:
