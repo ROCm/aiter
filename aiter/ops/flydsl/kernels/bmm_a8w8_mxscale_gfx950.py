@@ -27,9 +27,9 @@ first stage (scale_preload); otherwise every stage carries its own tile's. The
 tile, so a 128-wide block is four groups reading the same byte.
 A w_scale block may also be a single row, 1x32 only.
 
-K is a multiple of 64. A K of 64 mod 128 is split as if padded to whole MFMA
-steps; its last half step zeroes A's upper 64 K (see half_step). N is a multiple of tile_n, itself a
-multiple of 16. The split-K and xcd_order grids group tiles by 8, one group per
+K is a multiple of 32. A K that 128 does not divide is split as if padded to
+whole MFMA steps; its last step zeroes A's fp8 halves past K (see k_tail). N is
+a multiple of tile_n, itself a multiple of 16. The split-K and xcd_order grids group tiles by 8, one group per
 XCD, rounding up with idle pids when the tile count is not a multiple of 8.
 """
 
@@ -138,8 +138,8 @@ def _lds_layout(
 
 
 def _padded_k(K):
-    """K rounded up to whole MFMA steps. A K of 64 mod 128 ends in a half step
-    whose upper 64 K the kernel zeroes in A."""
+    """K rounded up to whole MFMA steps. A K that 128 does not divide ends in a
+    partial step (32, 64 or 96 K) whose A halves past K the kernel zeroes."""
     return ceildiv(K, MFMA_K) * MFMA_K
 
 
@@ -228,7 +228,7 @@ def check_bmm_config(
         and tile_k >= MFMA_K
         and tile_k & (tile_k - 1) == 0  # the A swizzle XORs within a row
         and num_buffers >= 2
-        and K % (MFMA_K // 2) == 0
+        and K % SCALE_GROUP == 0  # whole 16-byte A halves and 32-K scale groups
         and _padded_k(K) % (tile_k * splits) == 0
         and k_span // tile_k >= num_buffers - 1
     ):
@@ -384,7 +384,7 @@ def launch_bmm_a8w8_mxscale(
         )
     k_steps = tile_k // MFMA_K
     k_span = _padded_k(K) // splits  # the K range of one split
-    half_step = K % MFMA_K != 0  # the last MFMA step holds 64 K
+    k_tail = K % MFMA_K  # K of the last MFMA step when partial (32, 64, 96), else 0
     # The 1-D grids (split-K, xcd_order) put tiles in groups of 8, one per XCD;
     # a tile count that is not a multiple of 8 is rounded up with idle pids.
     padded = (splits > 1 or xcd_order) and (N // tile_n * batch) % 8 != 0
@@ -763,24 +763,25 @@ def launch_bmm_a8w8_mxscale(
                 fx.copy(read16, view, frag)
                 return fx.memref_load_vec(frag)
 
-            def _pair(lo_off, hi_off, hi_mask=None):
+            def _pair(lo_off, hi_off, masks=(None, None)):
                 # fp8 halves 64 K apart form one i32[8] MFMA operand (f8f6f4 ABI).
-                # hi_mask (0 or -1) keeps or clears the upper half.
+                # masks (0 or -1 each, None for -1) keep or clear each half.
                 lo, hi = _read(lo_off), _read(hi_off)
+                lo_mask, hi_mask = masks
+                if const_expr(lo_mask is not None):
+                    lo = lo & lo_mask
                 if const_expr(hi_mask is not None):
                     hi = hi & hi_mask
                 frag = fx.make_rmem_tensor(8, Int32)
                 frag.store(lo.shuffle(hi, list(range(8))))
                 return frag
 
-            def load_a(stage_i32, mi, ks, hi_mask=None):
+            def load_a(stage_i32, mi, ks, masks=(None, None)):
                 row = wmb + mi * MFMA_M + lane16
                 lo = ks * 8 + kgrp
                 swz = row % k_blk16
                 base = stage_i32 + row * (tile_k // 4)
-                return _pair(
-                    base + (lo ^ swz) * 4, base + ((lo + 4) ^ swz) * 4, hi_mask
-                )
+                return _pair(base + (lo ^ swz) * 4, base + ((lo + 4) ^ swz) * 4, masks)
 
             def load_b(stage_i32, ni, ks):
                 group = (wnb + ni * MFMA_N) // 16
@@ -903,6 +904,21 @@ def launch_bmm_a8w8_mxscale(
                     load_b_global(kt0 + t, b_regs[phase % b_sets])
                     rocdl.sched_barrier(0)
 
+            def _tail_mask(start, final):
+                """Mask of the half that starts at K offset start of the last
+                (partial) step: lane group g holds K [start + 16g, +16), kept
+                (-1) while inside k_tail, else cleared (0). None keeps every
+                lane's. A non-final split's last step is whole."""
+                groups = (k_tail - start) // 16  # lane groups inside K
+                if const_expr(groups >= 4):
+                    return None
+                mask = (
+                    fx.Int32(0)
+                    if groups <= 0
+                    else (kgrp < groups).select(fx.Int32(-1), fx.Int32(0))
+                )
+                return mask if final is None else final.select(mask, fx.Int32(-1))
+
             def read_stage(stage, t, b_set):
                 """Every fragment and scale of K tile t, read out of LDS."""
                 stage_i32 = stage * (pitch // 4)
@@ -912,20 +928,20 @@ def launch_bmm_a8w8_mxscale(
                 scale_base = 0 if scale_preload else stage * pitch
                 frags = []
                 for ks in range_constexpr(k_steps):
-                    # The last split's last step may be a half step: its upper
-                    # 64 K of A are zeroed (B and the scales there are a
-                    # neighbouring row's finite bytes, or zeros past the
-                    # tensor). The last tile is always a (static) tail step.
+                    # The last split's last step may be partial: A's fp8 halves
+                    # past K are zeroed (B and the scales there are a
+                    # neighbouring row's bytes, which the GEMM reads anyway, or
+                    # zeros past the tensor). The last tile is always a (static)
+                    # tail step.
                     last = isinstance(t, int) and t == k_tiles - 1 and ks == k_steps - 1
-                    half = half_step and last
                     final = split == splits - 1 if splits > 1 else None
-                    hi_mask = None
-                    if const_expr(half):
-                        hi_mask = fx.Int32(0)
-                        if const_expr(final is not None):
-                            hi_mask = final.select(hi_mask, fx.Int32(-1))
+                    masks = (None, None)
+                    if const_expr(k_tail and last):
+                        masks = tuple(
+                            _tail_mask(start, final) for start in (0, MFMA_K // 2)
+                        )
                     a = [
-                        load_a(stage_i32, mi, ks, hi_mask)
+                        load_a(stage_i32, mi, ks, masks)
                         for mi in range_constexpr(m_rep)
                     ]
                     if const_expr(b_direct):
