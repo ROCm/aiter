@@ -621,8 +621,10 @@ and gfx950:
 Each cache declares the files its builder runs as sources (the conv plans in
 `conv3d_im2col.py`, the FMHA traits in `fmha_gfx950/`; §4.2). The conv wrapper
 launched through its own cache (`exe.compile`, then the `CompiledFunction`
-kept on the builder's result); `conv_kernels._dispatch` now calls `_run_compiled` on
-the `@flyc.jit` launcher, under the same (empty) `CONV_COMPILE_HINTS`.
+kept on the builder's result); `conv_kernels._dispatch` now launches the
+`@flyc.jit` launcher through the cache the first time
+(`tensor_shim._compile_and_keep`, under the same, empty, `CONV_COMPILE_HINTS`)
+and calls the function it got directly afterwards.
 `op_tests/test_flydsl_pa_decode.py` spies on `compile_pa_decode_plan`; its
 spy now wraps `.lazy`.
 
