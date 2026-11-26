@@ -19,7 +19,7 @@ import collections
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import get_flydsl_a16w16_decode_configs
 from aiter.ops.flydsl.gemm_kernels import get_flydsl_decode_kernel_params
 from aiter.tuned_gemm import (
@@ -29,7 +29,8 @@ from aiter.tuned_gemm import (
     tgemm,
 )
 
-ARCH = get_gfx()
+# The arch the dispatcher answers for (GPU_ARCHS can name several targets).
+ARCH = get_gfx_runtime()
 MAX_REL_ERR = 0.02
 PROBE_SHAPES = ((1, 896, 7168), (4, 1536, 7168), (5, 2112, 7168))
 
