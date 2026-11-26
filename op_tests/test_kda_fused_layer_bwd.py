@@ -458,37 +458,73 @@ def main():
         "--pieces",
         nargs="*",
         default=list(kda_fused_layer.KDA_PIECE_DEFAULTS),
-        help="stages to run on FlyDSL one at a time (the rest on Triton)",
+        help="stages to run on FlyDSL one at a time (the rest on Triton);\n"
+        "a bare -p means all of them",
     )
     args = parser.parse_args()
+    # argparse turns a bare `-p` (nargs="*") into [], which would sweep nothing
+    if not args.pieces:
+        args.pieces = list(kda_fused_layer.KDA_PIECE_DEFAULTS)
+    unknown = set(args.pieces) - set(kda_fused_layer.KDA_PIECE_DEFAULTS)
+    if unknown:
+        parser.error(
+            f"unknown -p pieces {sorted(unknown)}; "
+            f"expected {sorted(kda_fused_layer.KDA_PIECE_DEFAULTS)}"
+        )
+
+    def summarize(title, rows, axes):
+        if not rows:
+            raise RuntimeError(
+                f"{title}: no rows; the sweep is empty ("
+                + ", ".join(f"{name}={vals}" for name, vals in axes.items())
+                + ")"
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
+        return df
 
     for dtype in args.dtype:
-        df = []
-        for b, t, (d, h, k, w, r), c, lb in itertools.product(
-            args.batch, args.seqlen, args.shape, args.chunk, args.gate_lb
-        ):
-            df.append(test_kda_layer_bwd(b, t, d, h, k, w, r, c, lb, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "kda fused layer bwd summary (markdown):\n%s", df.to_markdown(index=False)
+        layer_axes = {
+            "batch": args.batch,
+            "seqlen": args.seqlen,
+            "shape": args.shape,
+            "chunk": args.chunk,
+            "gate_lb": args.gate_lb,
+        }
+        summarize(
+            "kda fused layer bwd summary",
+            [
+                test_kda_layer_bwd(b, t, d, h, k, w, r, c, lb, dtype)
+                for b, t, (d, h, k, w, r), c, lb in itertools.product(
+                    args.batch, args.seqlen, args.shape, args.chunk, args.gate_lb
+                )
+            ],
+            layer_axes,
         )
-        df = []
-        for (b, t, nseq), (d, h, k, w, r), c, lb in itertools.product(
-            args.block, args.shape, args.chunk, args.gate_lb
-        ):
-            df.append(test_kda_block(b, t, nseq, d, h, k, w, r, c, lb, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "kda block fwd+bwd summary (markdown):\n%s", df.to_markdown(index=False)
+        summarize(
+            "kda block fwd+bwd summary",
+            [
+                test_kda_block(b, t, nseq, d, h, k, w, r, c, lb, dtype)
+                for (b, t, nseq), (d, h, k, w, r), c, lb in itertools.product(
+                    args.block, args.shape, args.chunk, args.gate_lb
+                )
+            ],
+            {"block": args.block, "shape": args.shape, "chunk": args.chunk},
         )
-        df = []
-        for piece, b, t, (d, h, k, w, r), c, lb in itertools.product(
-            args.pieces, args.batch, args.seqlen, args.shape, args.chunk, args.gate_lb
-        ):
-            df.append(test_kda_piece(piece, b, t, d, h, k, w, r, c, lb, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "kda per-piece flydsl summary (markdown):\n%s", df.to_markdown(index=False)
+        df = summarize(
+            "kda per-piece flydsl summary",
+            [
+                test_kda_piece(piece, b, t, d, h, k, w, r, c, lb, dtype)
+                for piece, b, t, (d, h, k, w, r), c, lb in itertools.product(
+                    args.pieces,
+                    args.batch,
+                    args.seqlen,
+                    args.shape,
+                    args.chunk,
+                    args.gate_lb,
+                )
+            ],
+            {"pieces": args.pieces, **layer_axes},
         )
         bad = df[df["failed grads"] != "-"]
         assert bad.empty, "flydsl pieces outside tolerance:\n" + bad[
@@ -503,15 +539,15 @@ def main():
         )
         return
     for dtype in proj_dtypes:
-        df = []
-        for b, t, (d, h, k, _, r), lb in itertools.product(
-            args.batch, args.seqlen, args.shape, args.gate_lb
-        ):
-            df.append(test_kda_proj(b * t, d, h, k, r, lb, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "kda projection fusion summary (markdown):\n%s",
-            df.to_markdown(index=False),
+        summarize(
+            "kda projection fusion summary",
+            [
+                test_kda_proj(b * t, d, h, k, r, lb, dtype)
+                for b, t, (d, h, k, _, r), lb in itertools.product(
+                    args.batch, args.seqlen, args.shape, args.gate_lb
+                )
+            ],
+            {"batch": args.batch, "seqlen": args.seqlen, "shape": args.shape},
         )
 
 
