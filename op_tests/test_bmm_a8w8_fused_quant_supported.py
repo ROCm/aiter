@@ -5,7 +5,7 @@
 The runner folds gfx1250-strict through ``base_gfx_arch`` before the
 ``_RUNNERS`` lookup. The supported() check has to do the same, or a strict
 part misses the gfx1250 mxfp8_32 row and a caller logs the miss as an
-unsupported shape.
+unsupported shape. gfx950's bmm runner fuses too, for a row-major x_scale.
 """
 
 import unittest
@@ -30,9 +30,15 @@ class TestFusedQuantSupportedArch(unittest.TestCase):
         self.assertEqual(gfx1250, {"1x32": True, "32x32": True, "128x128": False})
         self.assertEqual(self._answers("gfx1250-strict"), gfx1250)
 
-    def test_other_arch_has_no_fused_epilogue(self):
+    def test_gfx950_fuses_every_block(self):
         self.assertEqual(
             self._answers("gfx950"),
+            {"1x32": True, "32x32": True, "128x128": True},
+        )
+
+    def test_other_arch_has_no_fused_epilogue(self):
+        self.assertEqual(
+            self._answers("gfx942"),
             {"1x32": False, "32x32": False, "128x128": False},
         )
 

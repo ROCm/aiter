@@ -91,6 +91,11 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE,
 ]
+# The runtime serves the shapes of this table with its rows only under the switch
+# (get_2stage_cfgs). The test of _flydsl_stage2_fp8_enabled, without importing
+# aiter.ops.flydsl in this process.
+if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1":
+    DEFAULT_CSVS.append(AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE)
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 _ROW_FIELDS = (
@@ -151,9 +156,11 @@ def _is_grouped(row: dict) -> bool:
 def _reaches_flydsl(row: dict) -> bool:
     kernel1 = (row.get("kernelName1") or "").strip()
     kernel2 = (row.get("kernelName2") or "").strip()
-    # A cktile stage1 finishes with a FlyDSL activation epilogue.
+    # A cktile stage1 finishes with a FlyDSL activation epilogue. An impl__
+    # row is a whole-graph backend (fused_moe_gfx942) that launches FlyDSL
+    # kernels itself, so its name does not start with flydsl_.
     return (
-        kernel1.startswith(("flydsl_", "cktile_"))
+        kernel1.startswith(("flydsl_", "cktile_", "impl__flydsl_"))
         or kernel2.startswith("flydsl_")
         or _is_grouped(row)
     )

@@ -119,7 +119,7 @@ _VALID_BACKENDS = ("triton", "gluon")
 # targets) while still rejecting anything path-unsafe.
 _OP_RE = re.compile(r"[a-z][a-z0-9_]*")
 _CONFIG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-_ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*")
+_ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*")
 _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 
 _CU_NUM = None  # the device's CU count, read once per process
@@ -234,7 +234,7 @@ def resolve_config_dir(
     ), f"unknown backend {backend!r}; expected one of {_VALID_BACKENDS}"
     assert arch is None or (
         isinstance(arch, str) and _ARCH_OVERRIDE_RE.fullmatch(arch)
-    ), f"arch override must match [a-z][a-z0-9_]* (e.g. 'gfx942'), got {arch!r}"
+    ), f"arch override must match [a-z][a-z0-9_]*(-[a-z0-9_]+)* (e.g. 'gfx942', 'gfx1250-strict'), got {arch!r}"
     assert (
         cu_num is DEVICE_CU_NUM
         or cu_num is None

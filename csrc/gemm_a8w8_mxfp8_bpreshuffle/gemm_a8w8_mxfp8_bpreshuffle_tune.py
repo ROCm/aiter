@@ -260,7 +260,7 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
     return selected
 
 
-def opus_candidates(m, n, k, *, cu_num):
+def _opus_large_candidates(m, n, k, *, cu_num):
     """Calculate tile ranges and variants from shape and cached kernel resources."""
     from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
 
@@ -423,6 +423,97 @@ def opus_candidates(m, n, k, *, cu_num):
         f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
         f"primary={len(primary)} secondary={len(secondary)} "
         f"co={co_count} candidates={len(selected)}",
+        flush=True,
+    )
+    return [(kid, registry[kid]) for kid in sorted(selected)]
+
+
+def opus_candidates(m, n, k, *, cu_num):
+    """Use the small-shape search up to M=1024 and the native search above it."""
+    if m > 1024:
+        return _opus_large_candidates(m, n, k, cu_num=cu_num)
+
+    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
+    legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
+    selected, layouts = set(), defaultdict(list)
+    for kid in legal:
+        instance = registry[kid]
+        if instance.bpreshuffle_co is not None:
+            selected.add(kid)
+            continue
+        entry = instance.bpreshuffle_entry
+        split = entry.get("split_k", 1)
+        mt, nt = math.ceil(m / instance.B_M), math.ceil(n / instance.B_N)
+        padding = mt * instance.B_M * nt * instance.B_N / (m * n)
+        grid = mt * nt * split / max(cu_num, 1)
+        cost = (
+            0.25 * (padding - 1)
+            + 0.25 * max(0, 1 - grid)
+            + 8 / instance.B_M
+            + 8 / instance.B_N
+        )
+        layout = (
+            entry["pipeline"],
+            instance.B_K,
+            instance.T_M,
+            instance.T_N,
+            split,
+            instance.WG_PER_CU,
+        )
+        layouts[layout].append((cost, kid))
+    for layout, candidates in layouts.items():
+        pipeline, bk, wm, wn, split, _ = layout
+        if pipeline == "staged_b":
+            margin = 1.5
+        elif k > 1024:
+            margin = 1.4
+        else:
+            margin = 1.75 if pipeline == "direct_b" else 1.6
+        bound = margin * min(cost for cost, _ in candidates)
+        for cost, kid in candidates:
+            instance = registry[kid]
+            if cost > bound:
+                continue
+            bm, bn = instance.B_M, instance.B_N
+            if pipeline == "direct_b":
+                if bm > max(2 * m, 32):
+                    continue
+                if m >= 32 and (
+                    wm != 1
+                    or wn < 2
+                    or (wn == 2 and bk < 512 and bm < 128)
+                    or (wn == 4 and bk < 512 and bm < 48)
+                    or (wn == 4 and bm > 96 and bn != 128)
+                ):
+                    continue
+            elif pipeline == "staged_b":
+                if (
+                    bm > max(2 * m, 16)
+                    or bm > 64 * wm
+                    or (bm >= 64 and wm == 1)
+                    or (instance.cachectl_a, instance.cachectl_b) == (17, 2)
+                ):
+                    continue
+                panel = instance.max_k // (128 * split)
+                if instance.cachectl_a and 8 < panel < 64:
+                    continue
+            elif pipeline == "pingpong_lds":
+                if wm != 4 or bm < 128 or bn < 128:
+                    continue
+            else:
+                if bm < 64 or wn < 2:
+                    continue
+            selected.add(kid)
+    pipeline_counts = Counter(
+        (registry[kid].bpreshuffle_entry or {}).get("pipeline", "co")
+        for kid in selected
+    )
+    print(
+        f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
+        f"direct_b={pipeline_counts['direct_b']} staged_b={pipeline_counts['staged_b']} "
+        f"candidates={len(selected)}",
         flush=True,
     )
     return [(kid, registry[kid]) for kid in sorted(selected)]
@@ -594,6 +685,22 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 return pipe.kernels_list[kernelId].name
         return None
 
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as op
+
+        for cached in (
+            op._get_mxfp8_bpreshuffle_config,
+            op._load_mxfp8_bpreshuffle_tuned,
+            op._mxfp8_bpreshuffle_tuned_nk,
+            op.get_mxscale_bpreshuffle_config,
+            op._load_mxscale_bpreshuffle_tuned,
+            op._mxscale_bpreshuffle_tuned_nk,
+        ):
+            cached.cache_clear()
+        op._CKGEMM_CONFIG_CACHE.clear()
+        op._CKGEMM_HAS_GFX.clear()
+        op._MXSCALE_UNTUNED_REPORTED.clear()
+
     def _setup_specific_arguments(self):
         self.parser.add_argument(
             "--mxscale_table",
@@ -621,19 +728,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
         super().pre_process(args)
-
-    def _clear_op_caches(self):
-        from aiter.ops import gemm_op_a8w8 as op
-
-        if getattr(self, "_mxscale_table", False):
-            op.get_mxscale_bpreshuffle_config.cache_clear()
-            op._load_mxscale_bpreshuffle_tuned.cache_clear()
-            op._mxscale_bpreshuffle_tuned_nk.cache_clear()
-            op._MXSCALE_UNTUNED_REPORTED.clear()
-        else:
-            op._get_mxfp8_bpreshuffle_config.cache_clear()
-            op._load_mxfp8_bpreshuffle_tuned.cache_clear()
-            op._mxfp8_bpreshuffle_tuned_nk.cache_clear()
 
     def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         super()._restore_config_env(env_name, old_val, old_rebuild)
@@ -723,9 +817,28 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         from aiter.ops.gemm_op_a8w8 import (
             gemm_a8w8_blockscale_bpreshuffle,
             gemm_a8w8_mxfp8_bpreshuffle,
+            get_mxscale_bpreshuffle_config,
         )
         from aiter.test_common import checkAllclose, run_perftest
 
+        if self._mxscale_table and self.get_gfx() == "gfx950":
+            configs = (
+                get_mxscale_bpreshuffle_config(
+                    int(row.M),
+                    int(row.N),
+                    int(row.K),
+                    getattr(row, "w_scale_block", W_SCALE_BLOCK),
+                )
+                for row in self.untunedf.itertuples()
+            )
+            ensure_opus_kids_compiled(
+                {
+                    int(config["kernelId"])
+                    for config in configs
+                    if config is not None and config["libtype"] == "opus"
+                },
+                cu_num=self.get_cu_num(),
+            )
         production_op = (
             gemm_a8w8_blockscale_bpreshuffle
             if self._mxscale_table

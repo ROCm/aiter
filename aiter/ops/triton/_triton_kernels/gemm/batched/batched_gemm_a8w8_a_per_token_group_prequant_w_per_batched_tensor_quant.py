@@ -135,8 +135,13 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
-    split_k_start = pid_k * SPLITK_BLOCK_SIZE
-    k_span = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K) - split_k_start
+    if NUM_KSPLIT == 1:
+        # No split: skip the K-range math so the code is the same as before split-K.
+        split_k_start = 0
+        k_span = K
+    else:
+        split_k_start = pid_k * SPLITK_BLOCK_SIZE
+        k_span = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K) - split_k_start
 
     batch_id = tl.cast(batch_id, tl.int64)
     pid_k = tl.cast(pid_k, tl.int64)
@@ -189,7 +194,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         a_scale_recip = 1.0 / a_scale
         a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
-        accumulator += tl.dot(a, b) * a_scale
+        # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+        accumulator = tl.fma(tl.dot(a, b), a_scale, accumulator)
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
