@@ -188,8 +188,8 @@ from aiter.ops.flydsl.kernels.comm.transport import (
     has_release_fence,
 )
 from aiter.ops.flydsl.quick_allreduce import (
-    _resolve_inbox_flags,
     batches_publishes,
+    resolve_inbox_flags,
 )
 
 ARCH = get_gfx()
@@ -570,7 +570,7 @@ def _kernel_payloads(
     everything.
     """
     ladder = _ladder(algorithm, world_size, link)
-    inbox_memory = _resolve_inbox_flags("auto", world_size)[1]
+    inbox_memory = resolve_inbox_flags("auto", world_size)[1]
     batched = batches_publishes(inbox_memory, algorithm, link)
     grids = _rung_grids(world_size, ladder)
     ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
@@ -1201,7 +1201,7 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     import torch.distributed as dist
 
     from aiter.dist.parallel_state import graph_capture
-    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+    from aiter.ops.flydsl.comm_collectives_host_shared import launcher_loaded
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -2616,7 +2616,7 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
     # engine batches only behind a release fence -- not ``batches_publishes``,
     # whose PCIe-ring clause is the plain engine's alone.
     link = fly_policy.detect_link()
-    batched = has_release_fence(_resolve_inbox_flags("auto", tp, link)[1])
+    batched = has_release_fence(resolve_inbox_flags("auto", tp, link)[1])
     cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     fails, rows_all = [], []
     for *case, c in walk:
@@ -2947,7 +2947,10 @@ def _capture_first_fused_rank(rank: int, tp: int, init_method: str) -> dict:
     from flydsl.compiler import jit_function as jf
 
     from aiter.dist.parallel_state import graph_capture
-    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded, payload_probes
+    from aiter.ops.flydsl.comm_collectives_host_shared import (
+        launcher_loaded,
+        payload_probes,
+    )
 
     hidden = FUSED_CAPTURE_HIDDEN
     row_bytes = hidden * 2

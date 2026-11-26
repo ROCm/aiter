@@ -1114,7 +1114,13 @@ def test_status_lists_what_is_deprecated_and_when_it_goes(monkeypatch):
     def add(left: int, right: int = 1) -> int:
         return left + right
 
-    assert plugin.status()["deprecations"] == (
+    # AITER's own routed ops now declare superseded op versions of their own, so
+    # select the two subjects this test creates rather than asserting that the
+    # whole registry holds nothing else.
+    owned = ("test.add", "aklr")
+    assert tuple(
+        entry for entry in plugin.status()["deprecations"] if entry["subject"] in owned
+    ) == (
         {
             "kind": "op-version",
             "subject": "test.add",

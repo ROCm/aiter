@@ -36,6 +36,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.aot_launch import aot_factory
+
 from ..kernels_common import LOG2E
 
 BT = 64
@@ -247,6 +249,7 @@ ZERO_TILE = N_A_TILES + 10
 N_AP_TILES = ZERO_TILE + 1
 
 
+@aot_factory("gdn_fused_prefill")
 @functools.lru_cache(maxsize=32)
 def compile_gdn_fused_prefill(
     *,

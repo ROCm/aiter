@@ -1241,6 +1241,58 @@ def _run_decode(tokens, fold_w):
     )
 
 
+def _run_unfolded_skinny_route():
+    """Unfolded decode must take the skinny path for every norm-weight form."""
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import op
+
+    calls = []
+    real = op.flydsl_k1k2_skinny_decode
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("fold_w"))
+        return real(*args, **kwargs)
+
+    op.flydsl_k1k2_skinny_decode = spy
+    try:
+        for tokens in (1, 2, 4, 8):
+            for full_norm in (False, True):
+                for dtype in (torch.bfloat16, torch.float32):
+                    inp = _make_inputs(tokens, full_norm=full_norm, seed=43)
+                    inp["norm_weight"] = inp["norm_weight"].to(dtype)
+                    label = (
+                        f"unfolded_skinny[M={tokens}][full={full_norm}]"
+                        f"[{str(dtype)[6:]}]"
+                    )
+                    del calls[:]
+                    r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
+                        inp["residual"],
+                        inp["block_output"],
+                        inp["injection"],
+                        inp["norm_weight"],
+                        inp["w_down"],
+                        inp["w_up"],
+                        inp["w_inject"],
+                        HC,
+                        EPS,
+                    )
+                    torch.cuda.synchronize()
+                    if calls != [False]:
+                        print(f"[FAIL] {label}: skinny calls {calls}")
+                        _FAILURES.append(label)
+                        continue
+                    r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+                    _check(r2_ref.to(r2.dtype), r2, f"{label} r2", atol=0.05, rtol=0.02)
+                    _check(x_ref.to(x.dtype), x, f"{label} x")
+                    _check(
+                        inj_ref.to(inj.dtype),
+                        inj.contiguous(),
+                        f"{label} inj",
+                        atol=0.05,
+                    )
+    finally:
+        op.flydsl_k1k2_skinny_decode = real
+
+
 def _run_full_norm_weight(tokens, fold_w):
     """Check per-stream norm weights in K1, K2, and skinny decode."""
     tag = "fold" if fold_w else "nofold"
@@ -1365,7 +1417,6 @@ def main():
     _run_direct_k2()
     _run_direct_k1_buffers()
     for m in args.decode_tokens:
-        # Unfolded decode uses the padded tail because skinny K1 requires folding.
         for fold_w in (False, True):
             _run_decode(m, fold_w)
         # The final mixer exercises the narrower no-injection output.
@@ -1373,6 +1424,7 @@ def main():
     for m in (3, 512):
         for fold_w in (False, True):
             _run_full_norm_weight(m, fold_w)
+    _run_unfolded_skinny_route()
     for m in (
         1,
         2,

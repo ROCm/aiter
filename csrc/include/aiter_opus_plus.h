@@ -107,8 +107,8 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
 OPUS_D decltype(auto) to_fp8_scalef32_x8(const S& s, float scale)
 {
-    typedef int __attribute__((ext_vector_type(2))) i2;
-    i2 r;
+    typedef unsigned int __attribute__((ext_vector_type(2))) u2;
+    u2 r;
     if constexpr(std::is_same_v<S, bf16x8_t>)
         r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
     else

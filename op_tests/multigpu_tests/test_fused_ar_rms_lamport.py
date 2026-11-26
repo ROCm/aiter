@@ -1,24 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx1250 Lamport one-shot fused allreduce + residual + RMSNorm.
+"""gfx1250 Lamport one-shot fused allreduce + residual + RMSNorm (+ per-token FP8).
 
-tensor_model_parallel_fused_allreduce_rmsnorm takes the Lamport kernel up to its
-size cap (TP2 16 MiB, TP4 8 MiB; AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE). Candidates,
-all with the same (out, residual_out):
-  prod_route   the production entry, whatever it routes to
-  lamport      CustomAllreduce.lamport_fused_ar_rms, where the route takes it
-  car_fused    the barrier fused kernel ar_rmsnorm_gfx1250, one-stage
-  car_ar+norm  custom allreduce + rmsnorm2d_fwd_with_add, the route below 4 MiB
-               before the Lamport kernel
-  rccl+norm    RCCL allreduce + rmsnorm2d_fwd_with_add
+tensor_model_parallel_fused_allreduce_rmsnorm, and with quant_type="per_token"
+tensor_model_parallel_fused_allreduce_rmsnorm_quant, take the Lamport kernel up
+to its size cap (TP2 16 MiB, TP4 8 MiB; AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE).
+Candidates, all with the same (out, residual_out), and the scale with FP8 (-q 1):
+  prod_route     the production entry, whatever it routes to
+  lamport        CustomAllreduce.lamport_fused_ar_rms(_quant), where the route takes it
+  lamport+quant  FP8: lamport_fused_ar_rms + per-token quant, the route before the
+                 FP8 Lamport kernel
+  car_fused      the barrier fused kernel ar_rmsnorm_gfx1250, one-stage
+  car_ar+norm    custom allreduce + rmsnorm2d_fwd_with_add (+ per-token quant), the
+                 route below 4 MiB before the Lamport kernel
+  rccl+norm      RCCL allreduce + rmsnorm2d_fwd_with_add (+ per-token quant)
 
-Correctness: every candidate against a torch reference, and the Lamport kernel
-bit for bit against car_fused (two NaNs count as equal). A second table runs one
-mixed sequence per TP on the one shared inbox: row widths and row counts change
-call to call (block a row and cluster shapes), 0xffff is injected now and then,
-the odd ranks hold the input, residual and weight off 16B alignment (every rank
-must still take the Lamport kernel), and a CUDA graph of three sizes is replayed
-between eager calls.
+Correctness: every candidate against a torch reference (an error ratio of 5%,
+checkAllclose's tol_err_ratio, fails), and the Lamport kernel bit for bit
+against car_fused (two NaNs count as equal); with FP8 also lamport+quant, and
+the bf16/fp16 output of emit_bf16. A second table runs one mixed sequence per TP
+on the one shared inbox: row widths and row counts change
+call to call (block a row and cluster shapes), bf16 and FP8 calls alternate,
+0xffff is injected now and then, the odd ranks hold the input, residual and
+weight off 16B alignment (every rank must still take the Lamport kernel), and a
+CUDA graph of three sizes is replayed between eager calls. Any bit difference
+fails the run.
 
 Timing: run_perftest times kernels on one rank and adds calls of its own, which a
 cross-rank collective cannot take. Instead a CUDA graph of CALLS calls is
@@ -36,7 +42,10 @@ import torch.distributed as dist
 
 import aiter
 from aiter import dtypes
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import (
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+)
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -95,47 +104,81 @@ def offset_view(t):
     return storage[1:].view(t.shape).copy_(t)
 
 
+_BITS = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+
+
 def bit_mismatch(a, b):
     """Elements whose bits differ; two NaNs count as equal."""
-    same = (a.view(torch.int16) == b.view(torch.int16)) | (
-        torch.isnan(a) & torch.isnan(b)
+    assert a.shape == b.shape and a.dtype == b.dtype, (a.shape, a.dtype, b.dtype)
+    bits = _BITS[a.element_size()]
+    same = (a.view(bits) == b.view(bits)) | (
+        torch.isnan(a.float()) & torch.isnan(b.float())
     )
     return int((~same).sum().item())
 
 
 def pair_mismatch(got, want):
-    return max(bit_mismatch(got[0], want[0]), bit_mismatch(got[1], want[1]))
+    """The most elements whose bits differ in any output: (out, residual_out),
+    and the scale (and the bf16/fp16 output) with FP8."""
+    assert len(got) == len(want)
+    return max(bit_mismatch(g, w) for g, w in zip(got, want))
 
 
-def car_fused(ca, x, residual, weight):
+def route(quant):
+    if quant:
+        return lambda x, residual, weight: (
+            tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                x, residual, weight, EPS, quant_type="per_token"
+            )
+        )
+    return lambda x, residual, weight: tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, residual, weight, EPS
+    )
+
+
+def car_fused(ca, x, residual, weight, quant=False):
+    if quant:
+        return ca.custom_fused_ar_rms_quant(x, residual, weight, EPS, use_1stage=True)
     return ca.custom_fused_ar_rms(x, residual, weight, EPS, use_1stage=True)
 
 
-def norm_with_add(ar, residual, weight):
+def per_token_quant(out, res_out):
+    q, scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+        out, quant_dtype=dtypes.fp8
+    )
+    return q, res_out, scale
+
+
+def norm_with_add(ar, residual, weight, quant=False):
     out = torch.empty_like(ar)
     res_out = torch.empty_like(ar)
     aiter.rmsnorm2d_fwd_with_add(out, ar, residual, res_out, weight, EPS, False, 0)
-    return out, res_out
+    return per_token_quant(out, res_out) if quant else (out, res_out)
 
 
-def make_candidates(ca, x, residual, weight, rccl_buf):
+def make_candidates(ca, x, residual, weight, rccl_buf, quant):
     group = get_tp_group().device_group
-    cands = {
-        "prod_route": lambda: tensor_model_parallel_fused_allreduce_rmsnorm(
-            x, residual, weight, EPS
-        ),
-    }
+    prod = route(quant)
+    cands = {"prod_route": lambda: prod(x, residual, weight)}
     if ca.should_lamport_ar_rms(x, residual, weight, x.shape[-1]):
-        cands["lamport"] = lambda: ca.lamport_fused_ar_rms(x, residual, weight, EPS)
-    cands["car_fused"] = lambda: car_fused(ca, x, residual, weight)
+        if quant:
+            cands["lamport"] = lambda: ca.lamport_fused_ar_rms_quant(
+                x, residual, weight, EPS
+            )
+            cands["lamport+quant"] = lambda: per_token_quant(
+                *ca.lamport_fused_ar_rms(x, residual, weight, EPS)
+            )
+        else:
+            cands["lamport"] = lambda: ca.lamport_fused_ar_rms(x, residual, weight, EPS)
+    cands["car_fused"] = lambda: car_fused(ca, x, residual, weight, quant)
     cands["car_ar+norm"] = lambda: norm_with_add(
-        ca.custom_all_reduce(x), residual, weight
+        ca.custom_all_reduce(x), residual, weight, quant
     )
     # in place on its own buffer, as a model reduces its GEMM output; the buffer
     # keeps growing over the graph replays, which does not change the time
     cands["rccl+norm"] = lambda: (
         dist.all_reduce(rccl_buf, group=group),
-        norm_with_add(rccl_buf, residual, weight),
+        norm_with_add(rccl_buf, residual, weight, quant),
     )[1]
     return cands
 
@@ -165,25 +208,40 @@ def time_graph(fn):
     return us
 
 
-def test_case(ca, tp, rank, m, n, dtype):
+def test_case(ca, tp, rank, m, n, dtype, quant):
     """One (m, n): every candidate's error and time, Lamport bits vs car_fused."""
     x, xs, residual, weight = make_inputs(tp, rank, n * 1000 + m, m, n, dtype)
     ref = run_torch(xs, residual, weight, EPS)
     rccl_buf = x.clone()
-    cands = make_candidates(ca, x, residual, weight, rccl_buf)
-    base = car_fused(ca, x, residual, weight)
-    # traffic of the op on one rank: input, residual, weight in; out, residual out
-    nbytes = (4 * m * n + n) * x.element_size()
-    ret = {"tp": tp, "m": m, "n": n, "KB": m * n * x.element_size() / 1024}
-    ret["lamport bitdiff"] = (
-        pair_mismatch(cands["lamport"](), base) if "lamport" in cands else -1
-    )
+    cands = make_candidates(ca, x, residual, weight, rccl_buf, quant)
+    base = car_fused(ca, x, residual, weight, quant)
+    # traffic of the op on one rank: input, residual, weight in; out, residual
+    # out and the FP8 scales out
+    es = x.element_size()
+    nbytes = (3 * m * n + n) * es + (m * n + 4 * m if quant else m * n * es)
+    ret = {"tp": tp, "m": m, "n": n, "quant": quant, "KB": m * n * es / 1024}
+    diff = -1
+    if "lamport" in cands:
+        diff = pair_mismatch(cands["lamport"](), base)
+        if quant:
+            diff = max(diff, pair_mismatch(cands["lamport+quant"](), base))
+            got = ca.lamport_fused_ar_rms_quant(
+                x, residual, weight, EPS, emit_bf16=True
+            )
+            want = ca.custom_fused_ar_rms_quant(
+                x, residual, weight, EPS, use_1stage=True, emit_bf16=True
+            )
+            diff = max(diff, pair_mismatch(got, want))
+    ret["lamport bitdiff"] = diff
+    # FP8: the dequantized out is within half a code (2^-4) of the reference
+    tol = {"rtol": 0.07, "atol": 1e-2} if quant else {}
     for name, fn in cands.items():
         rccl_buf.copy_(x)
-        out, res_out = fn()
+        got = fn()
+        out = got[0].float() * got[2] if quant else got[0].float()
         ret[f"{name} err"] = max(
-            checkAllclose(ref[0].float(), out.float(), printLog=False),
-            checkAllclose(ref[1].float(), res_out.float(), printLog=False),
+            checkAllclose(ref[0].float(), out, printLog=False, **tol),
+            checkAllclose(ref[1].float(), got[1].float(), printLog=False),
         )
     for name, fn in cands.items():
         us = time_graph(fn)
@@ -193,49 +251,58 @@ def test_case(ca, tp, rank, m, n, dtype):
 
 
 def check_mixed_sequence(ca, tp, rank, dtype):
-    """Shapes change call to call on the one inbox, eager and in a graph, against
-    car_fused bit for bit. Returns the worst mismatch and the calls checked."""
+    """Shapes and bf16/FP8 change call to call on the one inbox, eager and in a
+    graph, against car_fused bit for bit. Returns the worst mismatch and the
+    calls checked."""
     max_bytes = ca._lamport_max_bytes
     worst, calls = 0, 0
 
-    def check(seed, m, n, nan=False):
+    def check(seed, m, n, quant, nan=False):
         nonlocal worst, calls
         x, _, residual, weight = make_inputs(tp, rank, seed, m, n, dtype, nan=nan)
         assert ca.should_lamport_ar_rms(x, residual, weight, n), (m, n)
-        got = tensor_model_parallel_fused_allreduce_rmsnorm(x, residual, weight, EPS)
-        worst = max(worst, pair_mismatch(got, car_fused(ca, x, residual, weight)))
+        got = route(quant)(x, residual, weight)
+        want = car_fused(ca, x, residual, weight, quant)
+        worst = max(worst, pair_mismatch(got, want))
         calls += 1
 
-    # the largest row count of each width that fits the cap, then the sequence
+    # the largest row count of each width that fits the cap, then the sequence;
+    # the second pass flips which calls are FP8
     cases = [(n, max_bytes // (n * dtype.itemsize)) for n in STRESS_NS]
     cases += list(zip(STRESS_NS, STRESS_MS))
     for i, (n, m) in enumerate(cases * 2):
-        check(i, m, n, nan=i % 3 == 0)
+        check(i, m, n, (i + i // len(cases)) % 2 == 1, nan=i % 3 == 0)
 
     # the odd ranks' operands one element into their storage: every rank must
     # still take the Lamport kernel, the odd ones copying them first; car_fused
     # gets the aligned originals
-    for n, m in zip(STRESS_NS, STRESS_MS):
+    for (n, m), quant in itertools.product(zip(STRESS_NS, STRESS_MS), (False, True)):
         x, _, residual, weight = make_inputs(tp, rank, 9000 + n, m, n, dtype)
-        want = car_fused(ca, x, residual, weight)
+        want = car_fused(ca, x, residual, weight, quant)
         if rank % 2:
             x, residual, weight = (offset_view(t) for t in (x, residual, weight))
         assert ca.should_lamport_ar_rms(x, residual, weight, n), (m, n)
-        got = tensor_model_parallel_fused_allreduce_rmsnorm(x, residual, weight, EPS)
-        worst = max(worst, pair_mismatch(got, want))
+        worst = max(worst, pair_mismatch(route(quant)(x, residual, weight), want))
         calls += 1
 
-    # a graph of three sizes, replayed between eager calls of other sizes
-    graph_in = [make_inputs(tp, rank, 7000 + n, m, n, dtype) for n, m in GRAPH_CASES]
-    want = [car_fused(ca, x, res, w) for x, _, res, w in graph_in]
+    # a graph of three sizes, bf16 and FP8, replayed between eager calls of
+    # other sizes
+    graph_cases = list(itertools.product(GRAPH_CASES, (False, True)))
+    graph_in = [
+        make_inputs(tp, rank, 7000 + n, m, n, dtype) for (n, m), _ in graph_cases
+    ]
+    want = [
+        car_fused(ca, x, res, w, quant)
+        for (x, _, res, w), (_, quant) in zip(graph_in, graph_cases)
+    ]
     if rank % 2:  # unaligned operands inside the graph as well
         x, xs, res, w = graph_in[0]
         graph_in[0] = (offset_view(x), xs, offset_view(res), offset_view(w))
     graph = torch.cuda.CUDAGraph()
     with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
         graph_out = [
-            tensor_model_parallel_fused_allreduce_rmsnorm(x, res, w, EPS)
-            for x, _, res, w in graph_in
+            route(quant)(x, res, w)
+            for (x, _, res, w), (_, quant) in zip(graph_in, graph_cases)
         ]
     for i in range(4):
         graph.replay()
@@ -244,12 +311,12 @@ def check_mixed_sequence(ca, tp, rank, dtype):
             worst = max(worst, pair_mismatch(got, w))
             calls += 1
         n, m = cases[i % len(cases)]
-        check(100 + i, m, n)
+        check(100 + i, m, n, i % 2 == 1)
     graph.reset()
     return {"tp": tp, "calls": calls, "max bitdiff": worst}
 
 
-def worker(tp, rank, ms, ns, dtype, init_method):
+def worker(tp, rank, ms, ns, dtype, quants, init_method):
     torch.cuda.set_device(rank)
     set_custom_all_reduce(True)
     init_distributed_environment(
@@ -260,7 +327,10 @@ def worker(tp, rank, ms, ns, dtype, init_method):
     assert ca is not None and not ca.disabled, "custom allreduce is disabled"
     dist.all_reduce(torch.zeros(1, device="cuda"), group=get_tp_group().device_group)
 
-    rows = [test_case(ca, tp, rank, m, n, dtype) for n, m in itertools.product(ns, ms)]
+    rows = [
+        test_case(ca, tp, rank, m, n, dtype, quant)
+        for quant, n, m in itertools.product(quants, ns, ms)
+    ]
     mixed = (
         check_mixed_sequence(ca, tp, rank, dtype) if ca._lamport_max_bytes > 0 else {}
     )
@@ -286,11 +356,11 @@ def merge_ranks(per_rank):
     return merged
 
 
-def run_tp(tp, ms, ns, dtype):
+def run_tp(tp, ms, ns, dtype, quants):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     with Pool(processes=tp) as pool:
         jobs = [
-            pool.apply_async(worker, (tp, r, ms, ns, dtype, init_method))
+            pool.apply_async(worker, (tp, r, ms, ns, dtype, quants, init_method))
             for r in range(tp)
         ]
         # a protocol bug hangs instead of failing
@@ -318,32 +388,50 @@ def main():
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
+    parser.add_argument(
+        "-q",
+        "--quant",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+        help="0: bf16/fp16 out, 1: per-token FP8 out",
+    )
     args = parser.parse_args()
     ngpus = torch.cuda.device_count()
 
     set_start_method("spawn", force=True)
+    bad = []
     for dtype in args.dtype:
         rows, mixed = [], []
         for tp in args.tp:
             if tp > ngpus:
                 aiter.logger.warning("tp%d needs %d GPUs, have %d", tp, tp, ngpus)
                 continue
-            tp_rows, tp_mixed = run_tp(tp, args.m, args.n, dtype)
+            quants = [bool(q) for q in args.quant]
+            tp_rows, tp_mixed = run_tp(tp, args.m, args.n, dtype, quants)
             rows += tp_rows
             if tp_mixed:
                 mixed.append(tp_mixed)
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "lamport fused ar + rmsnorm %s summary (markdown):\n%s",
-            dtype,
-            df.to_markdown(index=False, floatfmt=".3g"),
-        )
+        for quant in sorted({r["quant"] for r in rows}):
+            df = pd.DataFrame([r for r in rows if r["quant"] == quant])
+            aiter.logger.info(
+                "lamport fused ar + rmsnorm%s %s summary (markdown):\n%s",
+                " + per-token FP8" if quant else "",
+                dtype,
+                df.drop(columns="quant").to_markdown(index=False, floatfmt=".3g"),
+            )
         if mixed:
             aiter.logger.info(
                 "lamport fused ar + rmsnorm %s mixed sequence (markdown):\n%s",
                 dtype,
                 pd.DataFrame(mixed).to_markdown(index=False),
             )
+        bad += [r for r in rows if r["lamport bitdiff"] > 0]
+        # an error ratio at checkAllclose's tol_err_ratio fails, as it does there
+        bad += [r for r in rows if any(r[k] >= 0.05 for k in r if k.endswith(" err"))]
+        bad += [r for r in mixed if r["max bitdiff"] > 0]
+    assert not bad, f"off the reference, or the Lamport kernel off car_fused: {bad}"
 
 
 if __name__ == "__main__":

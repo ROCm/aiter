@@ -148,9 +148,7 @@ def get_gfx_runtime() -> str:
 
             if torch.version.hip is None or not torch.cuda.is_available():
                 raise
-            gfx_arch = (
-                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-            )
+            gfx_arch = get_gfx_runtime_for_device(0)
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -158,6 +156,18 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+def get_gfx_runtime_for_device(device=None) -> str:
+    """Return the selected Torch device's exact runtime architecture.
+
+    None (or an unindexed CUDA device) follows the current device each call,
+    so this query must not use the node-wide get_gfx_runtime cache. Device
+    errors propagate. Build-time GPU_ARCHS does not affect this query.
+    """
+    import torch
+
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0].lower()
 
 
 def _parse_asic_revision(value: str) -> int:
@@ -698,6 +708,23 @@ def get_cdna4_num_xcds(cu_num: int | None = None) -> int:
             f"got {num_xcds} from {cu_num} CUs"
         )
     return num_xcds
+
+
+@functools.cache
+def get_cu_num_device(device_index: int) -> int:
+    """CU count of one GPU, which `CU_NUM` may lower but never raise past the card.
+
+    Unlike `get_cu_num()`, it does not assert when the node's GPUs differ, e.g. an
+    iGPU beside the card.
+    """
+    import torch
+
+    props = torch.cuda.get_device_properties(device_index)
+    physical = torch_processor_count_to_cu(
+        props.gcnArchName, props.multi_processor_count
+    )
+    cu_num = int(os.getenv("CU_NUM", "0"))
+    return min(cu_num, physical) if cu_num > 0 else physical
 
 
 def get_build_targets() -> list[tuple[str, int]]:
