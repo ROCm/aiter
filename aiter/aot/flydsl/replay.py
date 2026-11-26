@@ -40,9 +40,9 @@ For an arch in ``SCAN_ARCHS``, the sizes of a job's range that
 their launches stopped at their cache identity (:func:`identified_kernels`,
 nothing compiled), and one size per set of kernels not yet built is replayed
 for real. A runtime whose choices are not monotonic in the size needs that,
-as a gfx1250 GEMM's are: it fits cluster_m to the number of M tiles and
-specializes a ragged last tile, so M=5120 and M=6144 can request one kernel
-and M=5632 another.
+as a gfx1250 GEMM's are: its kernels follow M's tile counts (the heuristics'
+picks, the plain kernel where cluster_m fits to one workgroup), so two sizes
+that request one kernel can bound a size that requests another.
 
 Otherwise, where a job's two ends request different FlyDSL kernels, the sizes
 between them are bisected down to every size at which the runtime switches

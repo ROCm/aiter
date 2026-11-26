@@ -6,6 +6,7 @@ import torch
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_mul_add import (
     fused_gemm_a16w16_mul_add,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def generate_fused_gemm_a16w16_mul_add_inputs(
@@ -46,17 +47,7 @@ def run_torch(x, w, a, b, bias, dtype):
     return (a * y + b).to(dtype)
 
 
-def get_2d_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(16, 1024, 1024)]
-    x_vals += [(128, 8192, 512)]
-    x_vals += [(1024, 1024, 1024)]
-    x_vals += [(4096, 1152, 1152)]
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_2d_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("a_kind", ["scalar", "channel", "full"])
 @pytest.mark.parametrize("b_kind", ["scalar", "full"])
@@ -86,15 +77,7 @@ def test_fused_gemm_a16w16_mul_add_strided_bias(M, N, K, dtype, step):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
-def get_3d_vals():
-    x_vals = [(2, 77, 640, 320)]  # S is not a multiple of the tile
-    x_vals += [(2, 333, 2432, 2432)]  # SD3.5-Large context stream
-    x_vals += [(2, 1024, 1152, 1152)]  # PixArt-XL at 512px
-    x_vals += [(1, 4096, 1536, 1536)]  # Wan2.1-1.3B
-    return x_vals
-
-
-@pytest.mark.parametrize("B, S, N, K", get_3d_vals())
+@pytest.mark.parametrize("B, S, N, K", get_shapes(batch=[1, 2]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("a_kind", ["gate", "full"])
 @pytest.mark.parametrize("x_strided", [False, True])

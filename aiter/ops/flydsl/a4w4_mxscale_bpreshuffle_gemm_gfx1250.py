@@ -169,12 +169,16 @@ def a4w4_fit_cluster_m(cfg: dict, M: int) -> int | None:
 
     A cluster must not hold workgroups that own no M row (they can deadlock it), so the
     tuned cluster_m is kept only when whole cluster rows tile M; otherwise the largest
-    smaller cluster_m that does is used, as the a8w8 wrapper does. A compute kernel still
+    power of two that does is used, as the a8w8 wrapper does. A compute kernel still
     needs a real cluster (cluster_m * cluster_n >= 2)."""
     m_tiles = -(-M // cfg["tile_m"])
     cn = cfg["cluster_n"]
     for cm in range(cfg["cluster_m"], 0, -1):
-        if m_tiles % cm == 0 and (not cfg["compute_bound"] or cm * cn >= 2):
+        if (
+            (cm == cfg["cluster_m"] or not cm & (cm - 1))
+            and m_tiles % cm == 0
+            and (not cfg["compute_bound"] or cm * cn >= 2)
+        ):
             return cm
     return None
 
@@ -263,30 +267,26 @@ def a4w4_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
     return cfg is not None and a4w4_launch_error(cfg, M, N, K) is None
 
 
-def _launch_specialization(
-    cfg: dict, M: int, cluster_m: int, out_is_f16: int, bounded_m: bool | None
-):
-    """(launcher, constexpr arguments) of a kernel config for this M.
+def _launch_specialization(cfg: dict, cluster_m: int, out_is_f16: int):
+    """(launcher, constexpr arguments) of a kernel config.
 
-    ``bounded_m`` is the compute kernel's masked-M variant, needed when M does not fill
-    whole tiles; None derives it from M."""
+    ``cluster_m``, the one that fits M, is passed at launch, so M picks no JIT specialization.
+    """
     tile_m, tile_n, tile_k = cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]
     m_warp, n_warp, nb = cfg["m_warp"], cfg["n_warp"], cfg["num_buffers"]
     split_k, cluster_n = cfg["split_k"], cfg["cluster_n"]
     common = (tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, nb)
     if cfg["compute_bound"]:
-        if bounded_m is None:
-            bounded_m = bool(M % tile_m or (-(-M // tile_m)) % cluster_m)
         return _launch_compute, (
             *common,
-            cluster_m,
             cluster_n,
             split_k,
             False,  # a_preshuffle
             split_k > 1,  # fused_splitk
-            bounded_m,
         )
-    return _launch_general, (*common, cluster_m, cluster_n, split_k)
+    # A launch of one workgroup is no cluster: it runs the plain kernel.
+    use_cluster = cluster_m * cluster_n * split_k > 1
+    return _launch_general, (*common, use_cluster, cluster_n, split_k)
 
 
 def preload_a4w4_kernel(
@@ -295,13 +295,11 @@ def preload_a4w4_kernel(
     N: int,
     K: int,
     out_dtype: torch.dtype = torch.bfloat16,
-    bounded_m: bool | None = None,
 ) -> None:
     """Compile a kernel config into FlyDSL's disk cache without launching it.
 
     The runtime arguments (M, N, K, pointers) are not part of the compiled artifact, so one
-    compile serves every shape the config can launch for. ``bounded_m`` picks the compute
-    kernel's masked-M variant (None: derived from M)."""
+    compile serves every shape the config can launch for."""
     cfg = parse_a4w4_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(
@@ -314,9 +312,8 @@ def preload_a4w4_kernel(
     from .kernels.tensor_shim import _preload_compiled
 
     out_is_f16 = 1 if _OUT_DTYPE_NAME[out_dtype] == "f16" else 0
-    launch, specialization = _launch_specialization(
-        cfg, M, a4w4_fit_cluster_m(cfg, M), out_is_f16, bounded_m
-    )
+    cluster_m = a4w4_fit_cluster_m(cfg, M)
+    launch, specialization = _launch_specialization(cfg, cluster_m, out_is_f16)
     null = lambda: _flyc.from_c_void_p(_fx.Uint8, 0, assumed_align=ALIGN_BYTES)
     runtime_args = (
         null(),
@@ -331,6 +328,7 @@ def preload_a4w4_kernel(
         K,
         N,
         null(),
+        cluster_m,
     )
     _preload_compiled(launch, *runtime_args, *specialization)
 
@@ -441,11 +439,13 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
         ldc,
         _ptr_arg(Out),
     )
-    launch, specialization = _launch_specialization(
-        cfg, M, cluster_m, out_is_f16, bounded_m=None
-    )
+    launch, specialization = _launch_specialization(cfg, cluster_m, out_is_f16)
     _run_compiled(
-        launch, *runtime_args, *specialization, specialization_key=specialization
+        launch,
+        *runtime_args,
+        cluster_m,
+        *specialization,
+        specialization_key=specialization,
     )
     return Out
 

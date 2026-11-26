@@ -86,10 +86,10 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _ncx_to_cblocked_kernel,
 )
 from aiter.ops.triton.conv._utils import (
-    _conv2d_padding_geometry,
     _ensure_layout,
     _normalize_tuple,
-    _validate_conv2d_padding_mode,
+    _padding_geometry,
+    _validate_padding_mode,
     _winograd_transform_storage_dtype,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
@@ -150,48 +150,46 @@ def _make_wino_output_grid(T, K_out):
     return grid
 
 
-def _prepare_conv2d_padding(
+def _prepare_conv_padding(
     source: torch.Tensor,
     padding,
     padding_mode: str = "zeros",
     *,
-    layout: str = "nchw",
+    layout: str,
     x_blocked: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Return the input and effective padding for an existing Conv2D kernel.
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Prepare Conv2D or Conv3D padding before routing and activation packing.
 
-    Nonzero modes use F.pad, then convert to the requested storage layout.
-    Zeros and zero-padding calls return the original tensor without allocation
-    or launch; layout conversion on those paths is the caller's responsibility.
-    Prepacked activations cannot be supplied when padding is materialized.
-    Using F.pad here does not provide a backward for the convolution kernels.
+    No-op paths return the input unchanged; callers handle their layout.
     """
-    if source.ndim != 4:
-        raise ValueError(f"conv2d padding input must be 4-D NCHW, got {source.ndim}-D")
-    if layout not in ("nchw", "nhwc"):
-        raise ValueError(f"layout must be 'nchw' or 'nhwc', got {layout!r}")
-    padding = _normalize_tuple(padding, 2, "padding", allow_zero=True)
-    height, width = source.shape[2:]
-    _validate_conv2d_padding_mode(padding_mode, height, width, padding)
-    padded_height, padded_width, conv_padding = _conv2d_padding_geometry(
-        height, width, padding, padding_mode
-    )
-    if (padded_height, padded_width) == (height, width):
+    if layout in ("nchw", "nhwc"):
+        rank = 4
+    elif layout in ("ncdhw", "ndhwc"):
+        rank = 5
+    else:
+        raise ValueError(
+            "layout must be one of ('nchw', 'nhwc', 'ncdhw', 'ndhwc'), "
+            f"got {layout!r}"
+        )
+    if source.ndim != rank:
+        logical_layout = "NCHW" if rank == 4 else "NCDHW"
+        raise ValueError(
+            f"conv{rank - 2}d padding input must be {rank}-D {logical_layout}, "
+            f"got {source.ndim}-D"
+        )
+    padding = _normalize_tuple(padding, rank - 2, "padding", allow_zero=True)
+    spatial = tuple(source.shape[2:])
+    _validate_padding_mode(padding_mode, spatial, padding)
+    padded_spatial, conv_padding = _padding_geometry(spatial, padding, padding_mode)
+    if padded_spatial == spatial:
         return source, conv_padding
     if x_blocked is not None:
         raise ValueError(
             "x_blocked cannot be used with materialized padding; "
             "omit it to pack the padded input"
         )
-    if not source.is_cuda:
-        raise ValueError("materialized conv2d padding requires a CUDA/ROCm tensor")
-
-    pad_height, pad_width = padding
-    output = F.pad(
-        source,
-        (pad_width, pad_width, pad_height, pad_height),
-        mode=padding_mode,
-    )
+    pad = tuple(value for amount in reversed(padding) for value in (amount, amount))
+    output = F.pad(source, pad, mode=padding_mode)
     return _ensure_layout(output, layout), conv_padding
 
 

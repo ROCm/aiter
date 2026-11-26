@@ -77,6 +77,7 @@ def chunk_kda_prepare(
     """The walk's workspace in one launch; see chunk_kda."""
     assert _ARCH in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
     _, T, H, K = q.shape
@@ -169,6 +170,7 @@ def chunk_kda_walk(
     """Chunk recurrence and output from the chunk_kda_prepare workspace; see chunk_kda."""
     assert _ARCH in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
     _, T, H, K = qg.shape
