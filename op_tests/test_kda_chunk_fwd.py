@@ -251,7 +251,11 @@ def test_kda_chunk_fwd_intermediates(b, t, h, d, mode, varlen):
     """``return_intermediates`` (save_fwd) vs Triton's ``disable_recompute`` ones.
 
     Each is graded by max |diff| / max |triton|, since their scales differ.
+    Every FlyDSL intermediate must be finite everywhere (the backward reads
+    all of Aqk / Akk). The FlyDSL backward fed these intermediates must match
+    its own recompute.
     """
+    from aiter.ops.flydsl.kda_chunk_bwd import chunk_kda_bwd_flydsl
     from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
     from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 
@@ -282,6 +286,8 @@ def test_kda_chunk_fwd_intermediates(b, t, h, d, mode, varlen):
     # Triton returns (g_cumsum, Aqk, Akk, w, u, qg, kg).
     ref = dict(zip(("g_cumsum", "Aqk", "Akk", "w", "u", "qg", "kg"), ref))
     got = dict(zip(INTERMEDIATES, inter[3:]))
+    for n, tsr in zip(("q", "k", "beta") + INTERMEDIATES, inter):
+        assert torch.isfinite(tsr).all(), f"flydsl {n} has non-finite values"
     assert inter[0].shape == x["q"].shape and inter[2].shape == x["beta"].shape
     # Aqk / Akk are defined on j <= the token's position in its chunk; Triton
     # need not write the rest.
@@ -294,10 +300,27 @@ def test_kda_chunk_fwd_intermediates(b, t, h, d, mode, varlen):
         a, r = got[n].float(), ref[n].float()
         assert a.shape == r.shape, f"{n}: {tuple(a.shape)} vs {tuple(r.shape)}"
         if n in ("Aqk", "Akk"):
-            a, r = a * tri, r * tri
+            # where, not *: Triton leaves the rest uninitialized (NaN * 0 = NaN).
+            a, r = torch.where(tri, a, 0.0), torch.where(tri, r, 0.0)
         rel = ((a - r).abs().max() / r.abs().max().clamp_min(1e-6)).item()
         assert rel < 2e-2, f"{n}: max rel err {rel:.3g}"
         ret[f"{n} rel"] = rel
+
+    do = torch.randn(x["v"].shape, generator=torch.Generator("cuda").manual_seed(3))
+    do = do.to(x["v"].dtype)
+    bwd_kw = dict(kw, cu_seqlens=cu)
+    g_re = chunk_kda_bwd_flydsl(do, *(x[n] for n in "qkvg"), x["beta"], scale, **bwd_kw)
+    g_sv = chunk_kda_bwd_flydsl(
+        do, *(x[n] for n in "qkvg"), x["beta"], scale, fwd_intermediates=inter, **bwd_kw
+    )
+    for n, a, r in zip(("dq", "dk", "dv", "dg", "dbeta", "dA_log", "ddt"), g_sv, g_re):
+        if r is None:
+            continue
+        a, r = a.float(), r.float()
+        assert torch.isfinite(a).all(), f"save_fwd {n} not finite"
+        rel = ((a - r).abs().max() / r.abs().max().clamp_min(1e-6)).item()
+        assert rel < 2e-2, f"save_fwd {n} vs recompute: max rel err {rel:.3g}"
+        ret[f"bwd {n} rel"] = rel
     return ret
 
 
