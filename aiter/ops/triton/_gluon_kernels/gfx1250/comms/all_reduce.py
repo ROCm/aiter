@@ -3,13 +3,15 @@ into the inbox of each peer as 16-byte lines of 2 units [value, value, value, ta
 receiver waits until its lines carry the tag of the call, then adds the 4 chunks. Even
 and odd calls use 2 banks of the inbox: a GPU can be one call ahead of a peer.
 
-_all_reduce_rmsnorm_kernel is the same all-reduce of rows that then adds the residual
-and applies RMSNorm (and per-token FP8 quant). A row is cdiv(HIDDEN, 384) chunks; the last one is partial and
-its lines past the row carry 0. A program runs W waves (a power of 2, at least
-HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes one row, 2 chunks
-a wave. For HIDDEN 6144 (W 8), these 768 values are those of one wave of the HIP
-add_rmsnorm_quant kernel, and the waves add and compare their results through LDS in
-the order of that kernel. So the results have the same bits."""
+_all_reduce_rmsnorm_kernel is the same all-reduce of rows that then adds the
+residual and applies RMSNorm, optionally followed by per-token FP8 or native
+group-32 MXFP8 quantization. A row is cdiv(HIDDEN, 384) chunks; the last one is
+partial and its lines past the row carry 0. A program runs W waves (a power of
+2, at least HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes
+one row, 2 chunks a wave. For HIDDEN 6144 (W 8), these 768 values are those of
+one wave of the HIP add_rmsnorm_quant kernel, and the waves add and compare
+their results through LDS in the order of that kernel. So the results have the
+same bits."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -247,6 +249,50 @@ def _asm(op: gl.constexpr, v):
 
 
 @gluon.jit
+def _mxfp8_quant_store(
+    y,
+    out,
+    scale,
+    at,
+    local,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+):
+    """Store one contiguous 128-value plane as native group-32 MXFP8."""
+    y = _wave_units(y.to(gl.bfloat16).to(gl.float32))
+    at = _wave_units(at)
+    mask = gl.broadcast(mask, local)[0]
+    local = _wave_units(local)
+    mask = _wave_units(mask)
+
+    W: gl.constexpr = gl.num_warps()
+    groups = gl.reshape(y, [4 * W, 32])
+    amax = gl.maximum(gl.max(gl.abs(groups), axis=1), 1e-10)
+    scaled = amax * (1.0 / 448.0)
+    bits = scaled.to(gl.uint32, bitcast=True)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
+    reciprocal = (gl.maximum(254 - code.to(gl.int32), 0) << 23).to(
+        gl.float32, bitcast=True
+    )
+    reciprocal = gl.reshape(
+        gl.broadcast(reciprocal[:, None], groups)[0],
+        [W, 128],
+    )
+    q = gl.clamp(y * reciprocal, -448.0, 448.0).to(gl.float8e4nv)
+    gl.amd.cdna5.buffer_store(q, out, at, mask=mask)
+
+    code = gl.reshape(gl.broadcast(code[:, None], groups)[0], [W, 128]).to(gl.uint8)
+    group_at = row * (HIDDEN // 32) + local // 32
+    gl.amd.cdna5.buffer_store(
+        code,
+        scale,
+        group_at,
+        mask=mask & (local % 32 == 0),
+    )
+
+
+@gluon.jit
 def _wave_units(p):
     """Plane p [rows, 2] of the waves as [wave, unit] (see _wave_lines)."""
     W: gl.constexpr = gl.num_warps()
@@ -365,16 +411,18 @@ def _receive_norm(
     LINES: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
-    QUANT: gl.constexpr,
+    NORM: gl.constexpr,
     HIDDEN: gl.constexpr,
     GEMMA: gl.constexpr,
     EPS: gl.constexpr,
 ):
     """Receives one row: wave w takes slab w (chunks 2w and 2w + 1 of the row; the
     values past the row are masked). Then stores residual_out = the sum + residual and
-    out = RMSNorm(residual_out) as bf16, or with QUANT as per-token FP8 and its fp32
-    scale. The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>, and with
-    QUANT then that of the per-token quant of its bf16 out."""
+    out = RMSNorm(residual_out) as bf16 (NORM 1), per-token FP8 with its fp32
+    scale (NORM 2), or E4M3 with row-major group-32 E8M0 scales (NORM 3).
+    The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>; quantization
+    reads the BF16 norm result, matching the corresponding standalone quantizer.
+    """
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
@@ -439,10 +487,10 @@ def _receive_norm(
     y = ()
     for j in gl.static_range(6):
         y += (s[j] * rstd * (w[j].to(gl.float32) + offset),)
-    if not QUANT:
+    if NORM == 1:
         for j in gl.static_range(6):
             gl.amd.cdna5.buffer_store(y[j].to(gl.bfloat16), out, at[j], mask=masks[j])
-    else:
+    elif NORM == 2:
         # Quantize the bf16 norm output, as the split norm -> per-token quant path.
         q = ()
         for j in gl.static_range(6):
@@ -465,6 +513,14 @@ def _receive_norm(
         for j in gl.static_range(6):
             v = gl.clamp(q[j] * inv, -448.0, 448.0).to(gl.float8e4nv)
             gl.amd.cdna5.buffer_store(v, out, at[j], mask=masks[j])
+    else:
+        gl.static_assert(NORM == 3)
+        _mxfp8_quant_store(y[0], out, scale, at[0], cols[0], masks[0], row, HIDDEN)
+        _mxfp8_quant_store(y[1], out, scale, at[1], cols[1], masks[1], row, HIDDEN)
+        _mxfp8_quant_store(y[2], out, scale, at[2], cols[2], masks[2], row, HIDDEN)
+        _mxfp8_quant_store(y[3], out, scale, at[3], cols[3], masks[3], row, HIDDEN)
+        _mxfp8_quant_store(y[4], out, scale, at[4], cols[4], masks[4], row, HIDDEN)
+        _mxfp8_quant_store(y[5], out, scale, at[5], cols[5], masks[5], row, HIDDEN)
 
 
 _all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
@@ -531,7 +587,7 @@ def _all_reduce_kernel(
 
 
 _all_reduce_rmsnorm_repr = make_kernel_repr(
-    "_all_reduce_rmsnorm_kernel", ["RANK", "LINES", "QUANT", "GEMMA", "HIDDEN"]
+    "_all_reduce_rmsnorm_kernel", ["RANK", "LINES", "NORM", "GEMMA", "HIDDEN"]
 )
 
 
@@ -551,15 +607,17 @@ def _all_reduce_rmsnorm_kernel(
     LINES: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
-    QUANT: gl.constexpr,
+    NORM: gl.constexpr,
     HIDDEN: gl.constexpr,
     GEMMA: gl.constexpr,
     EPS: gl.constexpr,
 ):
     """_all_reduce_kernel of tokens rows of HIDDEN values, then residual_out = the sum +
-    residual and out = RMSNorm(residual_out), bf16 or per-token FP8. The W-wave
-    programs 0 to S - 1 send W chunks each (S = cdiv(tokens cdiv(HIDDEN, 6 LINES), W));
-    the next programs receive one row each."""
+    residual and out = RMSNorm(residual_out), as bf16 (NORM 1), per-token FP8
+    (NORM 2), or native group-32 MXFP8 (NORM 3). The W-wave programs 0 to S - 1
+    send W chunks each (S = cdiv(tokens cdiv(HIDDEN, 6 LINES), W)); the next
+    programs receive one row each.
+    """
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
     senders = gl.cdiv(tokens * ROW, gl.num_warps())
     pid = gl.program_id(0)
@@ -581,7 +639,7 @@ def _all_reduce_rmsnorm_kernel(
             LINES,
             SLOT,
             MAXIT,
-            QUANT,
+            NORM,
             HIDDEN,
             GEMMA,
             EPS,

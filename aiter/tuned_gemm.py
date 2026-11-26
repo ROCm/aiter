@@ -565,6 +565,69 @@ def _gemm_a16w16(
     return result
 
 
+def gemm_a16w16_rows_of(
+    A: Tensor,
+    B: Tensor,
+    config_m: int,
+    otype: torch.dtype | None = None,
+) -> Tensor:
+    """`gemm_a16w16(A, B)` (no bias, no scales) launched with the kernel the tuned table
+    picks for ``config_m`` rows rather than for A's own row count.
+
+    For a GEMM computed on a subset of the rows of a larger one -- e.g. the rows a
+    sequence-parallel rank owns of a prefill's router GEMM -- whose result must carry the
+    larger GEMM's bits: the same kernel gives them wherever a row's result does not depend
+    on the other rows (no cross-row reduction, a fixed K order). That is the kernel's
+    property, not this function's; the caller's tests check it for the shapes it serves.
+    """
+    assert A.dim() == 2 and A.is_contiguous()
+    m, k = A.shape
+    n = B.shape[0]
+    bpreshuffle = bool(getattr(B, "is_shuffled", False))
+    otype = otype if otype is not None else A.dtype
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
+
+    # The arch, tuned row and backend `gemm_a16w16` would take for `config_m` rows.
+    gfx, cu_num = _device_arch_and_cu(A.device)
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx, cu_num = get_gfx_runtime(), get_cu_num()
+    config = get_GEMM_A16W16_config(
+        M=int(config_m),
+        N=n,
+        K=k,
+        bias=False,
+        dtype=str(A.dtype),
+        otype=str(otype),
+        scaleAB=False,
+        bpreshuffle=bpreshuffle,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if config["libtype"] == "opus" and not (
+        _opus_reads_layout(A, k) and _opus_reads_layout(B, k)
+    ):
+        config = {
+            "libtype": "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch",
+            "solidx": 0,
+        }
+    result = solMap[config["libtype"]](
+        A,
+        B,
+        config["solidx"],
+        None,
+        otype,
+        None,
+        None,
+        None,
+        bpreshuffle,
+        config=config,
+        out=None,
+    )
+    if result.dtype != otype:
+        result = result.to(otype)
+    return result
+
+
 def _result_buffer(
     out: Tensor | None, m: int, n: int, dtype: torch.dtype, device: torch.device
 ) -> Tensor:
