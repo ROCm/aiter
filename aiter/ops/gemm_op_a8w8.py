@@ -3089,6 +3089,11 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"
         )
+        if kernel_name is None and Y.dtype == dtypes.bf16:
+            # No tuned row and no mxpsh tile runs the shape (mxpsh needs K a
+            # multiple of 128): the batched GEMM's heuristic, which takes any
+            # K that 32 divides.
+            is_bmm = True
         if is_bmm and Y.dtype != dtypes.bf16:
             # The gfx950 BMM writes bf16 only; let the mxpsh heuristic pick.
             kernel_name = None

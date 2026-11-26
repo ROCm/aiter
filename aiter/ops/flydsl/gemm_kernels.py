@@ -785,16 +785,7 @@ def _get_compile_fn():
     return compile_preshuffle_gemm
 
 
-@aot_factory(
-    "preshuffle_gemm_a8",
-    sources=[
-        "kernels/preshuffle_gemm.py",
-        "kernels/mfma_preshuffle_pipeline.py",
-        "kernels/splitk_epilogue.py",
-        "kernels/communication_ops_utils.py",
-        "kernels/gemm_a16w16_gfx950_utils.py",
-    ],
-)
+@aot_factory("preshuffle_gemm_a8")
 @functools.cache
 def _preshuffle_launcher(**compile_kwargs):
     """The preshuffle launcher; its compile arguments are its AOT cache key."""
