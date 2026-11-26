@@ -20,6 +20,8 @@ import re
 import torch
 from torch import Tensor
 
+from .aot_launch import aot_factory
+
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K step, a 256x256 parent
 # tile, scales gathered a 256-K block at a time (K >= 4 steps for the pipelined K loop).
 BLOCK_K = 128
@@ -76,6 +78,7 @@ def fits_shape(M: int, N: int, K: int) -> bool:
     return M * N * 2 < _I32_MAX and M * K < _I32_MAX and N * K < _I32_MAX
 
 
+@aot_factory("gemm_a8w8_mxfp8_4wave")
 @functools.lru_cache(maxsize=256)
 def compile_mxfp8_4wave_gemm(
     *, K: int, xcd_remap: bool, store_nt: bool, tiles: tuple, grid_max: int
@@ -307,8 +310,12 @@ def launch_mxfp8_4wave_shuffled(
     stream = current_stream_arg(XQ.device)
     for tiles, tile_off, n_work in launch_plan(M, N, cus, xcd_remap):
         _run_compiled(
-            compile_mxfp8_4wave_gemm(
-                K=K, xcd_remap=xcd_remap, store_nt=store_nt, tiles=tiles, grid_max=cus
+            compile_mxfp8_4wave_gemm.lazy(
+                K=K,
+                xcd_remap=bool(xcd_remap),
+                store_nt=bool(store_nt),
+                tiles=tuple(tiles),
+                grid_max=int(cus),
             ),
             a, w, c, xs, ws, M, N, tile_off, n_work, stream,
             specialization_key=XQ.device,

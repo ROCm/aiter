@@ -128,6 +128,9 @@ AOT_CACHES = {
             "kernels/mfma_preshuffle_pipeline.py",
         ),
     },
+    "gemm_a8w8_mxfp8_4wave": {
+        "sources": ("kernels/mxfp8_gemm_4wave.py",),
+    },
     "gemm_a8w8_fp8_8wave": {
         "sources": (
             "kernels/gemm_a8w8_8wave.py",
