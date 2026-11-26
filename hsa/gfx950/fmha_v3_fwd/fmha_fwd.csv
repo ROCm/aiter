@@ -1,5 +1,8 @@
 # mode: 0 = batch, 1 = group (varlen), 2 = THD (varlen self-attention: equal per-document Q and
-# K lengths, no padding). Matches FmhaFwdV3Mode in csrc/cpp_itfs/mha_fwd.cu.
+# K lengths, no padding), 3 = THD that also splits each work-group's key walk into KV slices
+# in-kernel (FP32 partials merged by their LSE); a causal mode 3 row also runs pair_split.
+# A THD call takes the mode 3 row if there is one, else the mode 2 row on one KV slice.
+# Matches FmhaFwdV3Mode in csrc/cpp_itfs/mha_fwd.cu.
 dtype,hdim_q,hdim_v,mask,mode,bf16_cvt,ts_qo,ts_kv,knl_name,co_name
 bf16,128,128,0,0,0,256,64,_ZN5aiter19fmha_fwd_hd128_bf16E,fwd_hd128_bf16.co
 bf16,128,128,2,0,0,256,64,_ZN5aiter26fmha_fwd_hd128_bf16_causalE,fwd_hd128_bf16_causal.co
@@ -15,8 +18,8 @@ fp8bf16,128,128,0,1,0,256,128,_ZN5aiter30fmha_fwd_hd128_fp8_group_gfx950E,fwd_hd
 fp8bf16,128,128,2,1,0,256,128,_ZN5aiter37fmha_fwd_hd128_fp8_causal_group_gfx950E,fwd_hd128_fp8_causal_group.co
 bf16,256,256,0,1,0,128,128,_ZN5aiter35fmha_fwd_hd256_bf16_group_gfx950E,fwd_hd256_bf16_group.co
 bf16,256,256,2,1,0,128,128,_ZN5aiter42fmha_fwd_hd256_bf16_causal_group_gfx950E,fwd_hd256_bf16_causal_group.co
-bf16,256,256,0,2,0,256,64,_ZN5aiter26fmha_fwd_hd256_bf16_varlenE,fwd_hd256_bf16_varlen.co
-bf16,256,256,2,2,0,256,64,_ZN5aiter33fmha_fwd_hd256_bf16_varlen_causalE,fwd_hd256_bf16_varlen_causal.co
+bf16,256,256,0,3,0,256,64,_ZN5aiter26fmha_fwd_hd256_bf16_varlenE,fwd_hd256_bf16_varlen.co
+bf16,256,256,2,3,0,256,64,_ZN5aiter33fmha_fwd_hd256_bf16_varlen_causalE,fwd_hd256_bf16_varlen_causal.co
 fp8bf16,256,256,0,0,0,256,64,_ZN5aiter25fmha_fwd_hd256_fp8_gfx950E,fwd_hd256_fp8.co
 fp8bf16,256,256,2,0,0,256,64,_ZN5aiter32fmha_fwd_hd256_fp8_causal_gfx950E,fwd_hd256_fp8_causal.co
 fp8bf16,256,256,0,1,0,256,64,_ZN5aiter31fmha_fwd_hd256_fp8_group_gfx950E,fwd_hd256_fp8_group.co
