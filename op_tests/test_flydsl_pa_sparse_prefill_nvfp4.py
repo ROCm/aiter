@@ -155,6 +155,7 @@ def mxfp8_ref(x):
 @benchmark()
 def test_pa_sparse_prefill_nvfp4(case, kv_heads):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+    from aiter.ops.flydsl.pa_sparse_prefill import M31_PREFILL_CALL
     from aiter.ops.flydsl.pa_sparse_prefill import pa_sparse_prefill_nvfp4 as reuse
 
     host = make_case(CASES[case], kv_heads)  # the FP32 reference runs on the CPU
@@ -162,8 +163,8 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
     plan = plan_pa_decode(ctx, 1, max_partitions=1)
     args = (q, kp, vp, ks, vs, table, ctx, SCALE)
     kv = {"kv_heads": kv_heads}
-    # the same K/V planes in the other address order (v3 folds a K/V pair of
-    # planes into one 2-D tensor DMA, the lower-addressed plane leading)
+    # the same K/V planes in the other address order (v2 and v3 fold a K/V pair
+    # of planes into one 2-D tensor DMA, the lower-addressed plane leading)
     vk, sk = torch.stack([vp, kp]), torch.stack([vs, ks])
     args_rev = (q, vk[1], vk[0], sk[1], sk[0], table, ctx, SCALE)
     pa_args = (q, kp, vp, ctx, table, SCALE, 1)
@@ -172,6 +173,9 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
         "pa_decode": lambda o: pa_decode(o, *pa_args, **pa_kw),
         "reuse_v1": lambda o: reuse(o, *args, **kv),
         "reuse_v2": lambda o: reuse(o, *args, tile_rows=2, impl="v2", **kv),
+        # ATOM's call: v3, here on v2's two-plane DMAs (grids under min_ctas)
+        "reuse_m31": lambda o: reuse(o, *args, **kv, **M31_PREFILL_CALL),
+        "reuse_m31_kvrev": lambda o: reuse(o, *args_rev, **kv, **M31_PREFILL_CALL),
         # v3 itself (these grids are under its v2 fallback threshold)
         "reuse_v3": lambda o: reuse(
             o, *args, tile_rows=8, impl="v3", v3={"min_ctas": 0}, **kv

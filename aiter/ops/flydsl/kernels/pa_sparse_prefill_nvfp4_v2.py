@@ -295,8 +295,11 @@ def kernel_name(
     dbg=0,
     async_dma=False,
     cta_dma=False,
+    tdm_fold="",
 ):
     name = f"pa_sparse_prefill_nvfp4_v2_d128_bs128_gqa16_top16_tq{tq}_rb{rebase_log2}"
+    if tdm_fold:
+        name += f"_tf{tdm_fold.replace('-', 'x')}"
     if cta_dma:
         name += "_cdma"
     if async_dma:
@@ -341,6 +344,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     dbg=0,
     async_dma=False,
     cta_dma=False,
+    tdm_fold="",
 ):
     """Compile (cached) the pair-batched reuse kernel; ``launch`` takes the same
     arguments as ``compile_pa_sparse_prefill_nvfp4``'s.
@@ -367,6 +371,13 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     ``cta_dma``: wave w DMAs plane w (K, V, K scales, V scales) of the whole
     page, then a CTA barrier a page: one tensor DMA a page and wave instead of
     four (the waves walk the same union in lockstep anyway).
+    ``tdm_fold``: stage a K/V pair of planes (the codes, then the scales) with
+    one 2-D tensor DMA, its row stride the distance between the two pointers,
+    instead of two. One letter a pair ("k"/"v": the lower-addressed plane, which
+    leads the DMA and takes the pair's first slot plane; the wrapper reads it off
+    the pointers; "-": two DMAs). True means "kk"; the tail stays zero-filled.
+    "v" for the scales swaps the readers' two scale-plane offsets, which costs
+    the page step more than the DMA it saves: the wrapper folds them K-first only.
     """
     tq, nb = int(tile_rows), int(nvfp4_buffers)
     # Defaults measured on real MiniMax-M3.1 picks (MI455X, 14336 new on 99968
@@ -379,6 +390,13 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         raise ValueError(f"tile_rows must be one of {TILE_ROWS}")
     if nb not in (2, 3, 4):
         raise ValueError("nvfp4_buffers must be 2, 3 or 4")
+    tdm_fold = "kk" if tdm_fold is True else (tdm_fold or "")
+    if tdm_fold and (
+        len(tdm_fold) != 2 or set(tdm_fold) - set("kv-") or tdm_fold == "--"
+    ):
+        raise ValueError("tdm_fold must be a bool or two of 'k'/'v'/'-'")
+    if tdm_fold and (async_dma or cta_dma or dbg in (4, 5)):
+        raise ValueError("tdm_fold stages every plane with tensor DMAs")
     pairs = tq // 2
     all_rows = bool(all_rows)
     v_hoist = (pairs > 1 and not all_rows) if v_hoist is None else bool(v_hoist)
@@ -400,6 +418,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         int(dbg),
         bool(async_dma),
         bool(cta_dma),
+        tdm_fold,
     )
     if key in _CACHE:
         return _CACHE[key]
@@ -411,6 +430,9 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     entries = tq * TOPK
     ub = _bound_stride(tq)
     assert entries <= THREADS and lay["total"] <= 327680
+    # A folded pair's second plane lands one packed row after its first.
+    assert _PLANE_V - _PLANE_K == _TOKENS * _ROW
+    assert _PLANE_VS - _PLANE_KS == _TOKENS * _SROW
     # A name, not lay["total"]: linters read a string in an annotation as a
     # forward reference.
     lds_words = lay["total"] // 4
@@ -437,6 +459,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             dbg,
             async_dma,
             cta_dma,
+            tdm_fold,
         ),
         known_block_size=(THREADS, 1, 1),
     )
@@ -637,6 +660,21 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         # spares the page step a 64-bit floor division.
         scale_page = fx.Int64(sk_block >> 1)
 
+        if const_expr(tdm_fold):
+            # A folded pair's lower-addressed plane leads its 2-D DMA and lands
+            # in the pair's first slot plane: (leading pointer, row stride in
+            # BF16 elements), once a CTA in SALU. The page step's DMAs then
+            # build their descriptors in SALU as the 1-D ones do.
+            fold = []
+            for lead, pair in zip(tdm_fold, ((key, value), (ks, vs))):
+                near, far = pair[::-1] if lead == "v" else pair
+                gap = fx.Int64(fx.ptrtoint(far)) - fx.Int64(fx.ptrtoint(near))
+                fold.append((near, gap >> 1))
+            if const_expr(tdm_fold[0] == "v"):
+                P_K, P_V = P_V, P_K
+            if const_expr(tdm_fold[1] == "v"):
+                P_KS, P_VS = P_VS, P_KS
+
         def slot_base(slot):
             if const_expr(cta_dma):
                 return slot * (NWARP * WAVE_SLOT_BYTES)
@@ -668,6 +706,41 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             scales = fx.Int64(page) * scale_page + fx.Int64(
                 warp * (_TOKENS * _SROW // 2)
             )
+            if const_expr(tdm_fold):
+                # A page's staging costs per tensor DMA it issues: one 2-D DMA
+                # moves both planes of a folded pair (the same rows and bytes).
+                for (ptr, far, plane, row, src), lead, (near, stride) in zip(
+                    (
+                        (key, value, _PLANE_K, _ROW, payload),
+                        (ks, vs, _PLANE_KS, _SROW, scales),
+                    ),
+                    tdm_fold,
+                    fold,
+                ):
+                    if const_expr(lead == "-"):
+                        for p, at in ((ptr, plane), (far, plane + _TOKENS * row)):
+                            mem.tdm_copy(
+                                _gptr(p, fx.BFloat16, 16),
+                                src,
+                                base + at,
+                                (_TOKENS * row // 2,),
+                                (1,),
+                                (valid * (row // 2),),
+                                8,
+                                8,
+                            )
+                    else:
+                        mem.tdm_copy(
+                            _gptr(near, fx.BFloat16, 16),
+                            src,
+                            base + plane,
+                            (2, _TOKENS * row // 2),
+                            (stride, 1),
+                            (None, valid * (row // 2)),
+                            8,
+                            8,
+                        )
+                return
             for ptr, plane in (
                 ((key, _PLANE_K),) if dbg == 5 else ((key, _PLANE_K), (value, _PLANE_V))
             ):
@@ -841,6 +914,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             return ref, l, acc
 
         # ---- the union walk ----
+        # Tensor DMAs a page and wave (``stage``): a folded pair issues one.
+        page_dmas = 4 - (len(tdm_fold) - tdm_fold.count("-"))
         for u_i, state in range(fx.Int32(0), n_union, fx.Int32(1), init=initial):
             u = fx.Int32(u_i)
             slot = u % nb
@@ -888,15 +963,15 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 tdm_ops.tensor_wait(0)
             elif const_expr(nb == 3):
                 if u + 1 < n_union:
-                    tdm_ops.tensor_wait(4)
+                    tdm_ops.tensor_wait(page_dmas)
                 else:
                     tdm_ops.tensor_wait(0)
             else:
                 if u + 2 < n_union:
-                    tdm_ops.tensor_wait(8)
+                    tdm_ops.tensor_wait(2 * page_dmas)
                 else:
                     if u + 1 < n_union:
-                        tdm_ops.tensor_wait(4)
+                        tdm_ops.tensor_wait(page_dmas)
                     else:
                         tdm_ops.tensor_wait(0)
             if const_expr(dbg != 3):

@@ -37,24 +37,37 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 # The arguments MiniMax-M3.1's prefill (ATOM's P path) passes after kv_heads.
 M31_PREFILL_CALL = {"impl": "v3", "tile_rows": 8}
-# impl "v3" runs v2 (tile_rows 2) on grids of fewer v3 CTAs than this, on one KV
-# head and for the MXFP8 output.
+# impl "v3" runs v2 (tile_rows 2, V3_FALLBACK_V2) on grids of fewer v3 CTAs than
+# this, on one KV head and for the MXFP8 output.
 V3_MIN_CTAS = 4096
+# v2's options on that route: a page's K/V pair of planes staged with one 2-D
+# tensor DMA.
+V3_FALLBACK_V2 = {"tdm_fold": True}
 
 # A tensor DMA's row stride: a 48-bit count of (BF16) elements.
 _TDM_STRIDE_LIMIT = 1 << 48
 
 
-def _tdm_fold_order(key_cache, value_cache, key_scale, value_scale):
-    """v3's ``tdm_fold`` for these planes: per K/V pair (codes, scales) the
+def _tdm_fold_order(key_cache, value_cache, key_scale, value_scale, scale_leads="kv"):
+    """``tdm_fold`` for these planes: per K/V pair (codes, scales) the
     lower-addressed plane ("k"/"v"), or "-" (two DMAs) for a pair at distance
-    zero or past a stride. Host pointers only (no device sync); every plane is
-    16 B aligned, so the BF16 stride is exact."""
+    zero or past a stride, or a scale pair led by a plane not in ``scale_leads``.
+    Host pointers only (no device sync); every plane is 16 B aligned, so the
+    BF16 stride is exact.
+
+    v2 folds the scales only with K's plane first (``scale_leads`` "k"): V's
+    first swaps its two scale-plane offsets, which costs it more registers and
+    instructions than the DMA saves (measured slower than two scale DMAs on
+    MI455X). v3's phase-B plane offsets are runtime values in either order."""
     order = ""
-    for near, far in ((key_cache, value_cache), (key_scale, value_scale)):
+    for leads, (near, far) in (
+        ("kv", (key_cache, value_cache)),
+        (scale_leads, (key_scale, value_scale)),
+    ):
         gap = far.data_ptr() - near.data_ptr()
+        lead = "k" if gap > 0 else "v"
         fits = gap != 0 and abs(gap) // 2 < _TDM_STRIDE_LIMIT
-        order += ("k" if gap > 0 else "v") if fits else "-"
+        order += lead if fits and lead in leads else "-"
     return order
 
 
@@ -116,12 +129,13 @@ def pa_sparse_prefill_nvfp4(
     group-32 quant of the BF16 rows; the padded rows get FP8 zeros and unit
     scales. One KV head.
 
-    ``impl``: "v1", "v2" (``v2``: its compile options) or "v3" (the tile's rows
-    split over waves, ``tile_rows`` 4 or 8; ``v3``: its compile options,
-    ``min_ctas``, default ``V3_MIN_CTAS``, and ``tdm_fold``, default True: the
-    order of a K/V pair's planes is read off the pointers; False: no fold). "v3"
-    runs "v2" at ``tile_rows`` 2 on one KV head, for the MXFP8 output and on
-    grids under ``min_ctas`` v3 CTAs.
+    ``impl``: "v1", "v2" (``v2``: its compile options; ``tdm_fold`` True: the
+    order of a K/V pair's planes is read off the pointers) or "v3" (the tile's
+    rows split over waves, ``tile_rows`` 4 or 8; ``v3``: its compile options,
+    ``min_ctas``, default ``V3_MIN_CTAS``, and ``tdm_fold``, default True;
+    False: no fold). "v3" runs "v2" at ``tile_rows`` 2 with ``V3_FALLBACK_V2``
+    on one KV head, for the MXFP8 output and on grids under ``min_ctas`` v3
+    CTAs.
     """
     served = {"v2": TILE_ROWS_V2, "v3": TILE_ROWS_V3}.get(impl, TILE_ROWS)
     if tile_rows not in served:
@@ -208,7 +222,7 @@ def pa_sparse_prefill_nvfp4(
         or quant
         or -(-seqs // (kv_heads * tile_rows)) * kv_heads < min_ctas
     ):
-        impl, tile_rows, v2 = "v2", 2, None
+        impl, tile_rows, v2 = "v2", 2, V3_FALLBACK_V2
     if impl == "v3":
         # A phase-B quarter stages each K/V pair of planes (codes, scales) with
         # one 2-D tensor DMA in the pointers' order (tdm_fold False: four DMAs).
@@ -227,12 +241,22 @@ def pa_sparse_prefill_nvfp4(
             **v3,
         )
     elif impl == "v2":
+        v2 = dict(v2 or {})
+        if "tdm_fold" in v2:
+            # A bool: the plane order is read off the pointers (False: four DMAs).
+            if not isinstance(v2["tdm_fold"], bool):
+                raise ValueError("v2 tdm_fold must be a bool")
+            if v2["tdm_fold"]:
+                order = _tdm_fold_order(
+                    key_cache, value_cache, key_scale, value_scale, "k"
+                )
+                v2["tdm_fold"] = False if order == "--" else order
         compiled = compile_pa_sparse_prefill_nvfp4_v2(
             tile_rows=tile_rows,
             softmax_scale=softmax_scale,
             nvfp4_buffers=nvfp4_buffers,
             quant_mx=quant,
-            **(v2 or {}),
+            **v2,
         )
     else:
         compiled = compile_pa_sparse_prefill_nvfp4(
