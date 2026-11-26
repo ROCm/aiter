@@ -1792,6 +1792,8 @@ def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoECo
     # knobs. K2.6: 0.890x (uniform), 0.844x (zipf:1), 0.758x (spike) the knobs above (presend alone 0.92x, the small
     # knobs alone 0.90x). V4-Pro, against the default: 0.865x / 0.930x / 0.880x, while the knobs above alone lose
     # 1.09x (zipf:1) / 1.17x (spike).
+    # The GEMM2 knobs of the V4.1-Flash tune that fit (row-aligned, staged, lean GEMM2) and 32-row short tails:
+    # K2.6 0.92x-0.99x, V4-Pro 0.85x-0.99x the knobs above (MTPR 8192, 768-8192 tokens a rank).
     return replace(
         config,
         stage1=replace(config.stage1, num_dispatch_cu=48 * expert_waves),
@@ -1819,6 +1821,17 @@ def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoECo
             epi_lean=3,
             early_clear=True,
             peer_hoist=True,
+            short_tail_rows=32,
+        ),
+        fused_stage2=replace(
+            config.fused_stage2,
+            row_align=128,
+            scale_stage=True,
+            a_dma_uniform=True,
+            skip_pad=True,
+            epi_lean=True,
+            ascale_lds=True,
+            route_i8=True,
         ),
     )
 
