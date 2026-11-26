@@ -4250,6 +4250,209 @@ def test_mha_v4_sol_head_dim_256_tilt_reaches_the_pooled_values(name):
     ), f"{name}: the tilt reached exact blocks"
 
 
+class _DeviceBytes:
+    """A raw device range in the form torch.as_tensor takes."""
+
+    def __init__(self, pointer, nbytes):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (pointer, False),
+            "version": 2,
+        }
+
+
+def _hip_vmm_available():
+    try:
+        from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+        return hasattr(load_hip_runtime(), "hipMemAddressReserve")
+    except (ImportError, OSError):
+        return False
+
+
+_END_OF_MAPPING_KEEP = []
+
+
+def _at_end_of_mapping(x, image_bytes):
+    """A copy of x's first image_bytes from its first element, ending at the last mapped byte of
+    a VMM mapping whose next granule is reserved and unmapped, so any read past it faults."""
+    import ctypes
+
+    from aiter.dist.device_communicators import vmm_allocator as vmm
+    from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+    hip = load_hip_runtime()
+    device = x.device.index or 0
+    granule = vmm._get_granularity(device)
+    size = -(-image_bytes // granule) * granule
+    physical, address = ctypes.c_void_p(), ctypes.c_void_p()
+    prop = vmm._make_prop(device)
+    vmm._check(hip.hipMemCreate(ctypes.byref(physical), size, ctypes.byref(prop), 0))
+    vmm._check(
+        hip.hipMemAddressReserve(
+            ctypes.byref(address), size + granule, granule, ctypes.c_void_p(0), 0
+        )
+    )
+    vmm._check(hip.hipMemMap(address, size, 0, physical, 0))
+    access = vmm._hipMemAccessDesc(vmm._DEVICE, device, vmm._READ_WRITE)
+    vmm._check(hip.hipMemSetAccess(address, size, ctypes.byref(access), 1))
+    # Left mapped: the child process exits after its last launch.
+    _END_OF_MAPPING_KEEP.append((physical, address))
+    source = torch.empty(0, dtype=torch.uint8, device=x.device)
+    source.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    start = x.storage_offset() * x.element_size()
+    placed = torch.as_tensor(
+        _DeviceBytes(address.value + size - image_bytes, image_bytes), device=x.device
+    )
+    placed.copy_(source[start : start + image_bytes])
+    out = torch.empty(0, dtype=x.dtype, device=x.device)
+    out.set_(placed.untyped_storage(), 0, x.shape, x.stride())
+    return out
+
+
+def _image_bytes(x, planes=1, plane_stride=0):
+    """What x's layout spans from its first element: each batch at x's batch stride, or the
+    view's extent where that reaches further, over `planes` planes plane_stride bytes apart."""
+    extent = sum((n - 1) * s for n, s in zip(x.shape, x.stride())) + 1
+    plane = max(x.shape[0] * x.stride(0), extent) * x.element_size()
+    return (planes - 1) * plane_stride + plane
+
+
+# The MXFP4 K scale reader takes one dword past the last row, at either head dim.
+_MXFP4_K_SCALE_TRAILING_BYTES = 4
+
+
+def _hd256_end_of_mapping_child(rows):
+    """_hd256_end_of_mapping_row for each (name, sequence_k) of rows, then `done`."""
+    for name, sequence_k in rows:
+        _hd256_end_of_mapping_row(name, sequence_k)
+    print("done", flush=True)
+
+
+def _hd256_end_of_mapping_row(name, sequence_k):
+    """Launch the hd256 `name` row with Jensen and tilt on, once per tensor it reads, that tensor
+    placed at the end of a mapping with only its image kept. Prints `placed <row> <tensor>` before
+    each launch; a read past an image is a fault, which ends the process.
+
+    A tensor whose backing the launcher checks is kept whole once the launcher has refused its
+    bare image: the refusal is the guard there, and the launch then checks the producer's slack.
+    """
+    q_tile, kv_tile = _HD256_SOL_TILE
+    heads, rank = 2, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(1, sequence_k, heads, 256, rank)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=True)
+    planes = sol_tilt_planes(
+        q_abs_max=sol_q_abs_max(q, q_tile),
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        rank=rank,
+        kv_tile=kv_tile,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        mean_k_pooled=plan["mean_k_pooled"],
+        mean_v_pooled=plan["mean_v_pooled"],
+        **case["tilt"],
+    )
+    operands = ("q", "k", "v", "q_descale", "k_descale", "v_descale")
+    tensors = {
+        **dict(zip(operands, case["packed"])),
+        **{key: plan[key] for key in ("kv_block_indices", "lut_start", "lut_count")},
+        "block_bitmap": plan["block_bitmap"],
+        **{key: getattr(planes, key) for key in ("mean_k", "mean_v")},
+        **{key: getattr(planes, key) for key in ("mean_k_scale", "mean_v_scale")},
+        **{key: plan[key] for key in ("mean_k_var", "mean_k_var_scale")},
+        "sol_tilt_params": case["tilt_params"](planes),
+    }
+    plane_strides = {
+        "mean_k": planes.k_plane_stride,
+        "mean_v": planes.v_plane_stride,
+        "mean_k_scale": planes.k_scale_plane_stride,
+        "mean_v_scale": planes.v_scale_plane_stride,
+    }
+
+    def launch(tensors):
+        return mha_v4_packed(
+            *(tensors[key] for key in operands),
+            *case["formats"],
+            *case["scale_modes"],
+            v_pack=case["v_pack"],
+            softmax_scale=_HD256_SOFTMAX_SCALE,
+            block_tile=_HD256_SOL_TILE,
+            sol_tilt=(planes.rank, planes.k_plane_stride, tensors["sol_tilt_params"]),
+            **{
+                key: value
+                for key, value in tensors.items()
+                if key not in operands and key != "sol_tilt_params"
+            },
+        )
+
+    reference = launch(tensors)
+    torch.cuda.synchronize()
+    for key, x in tensors.items():
+        if not torch.is_tensor(x):
+            continue
+        stride = plane_strides.get(key) or 0
+        image = _image_bytes(x, 1 + rank if stride else 1, stride)
+        if name == "mxfp4" and key in ("mean_k_scale", "mean_k_var_scale"):
+            image += _MXFP4_K_SCALE_TRAILING_BYTES
+        print(f"placed {name} at {sequence_k} keys: {key}", flush=True)
+        try:
+            out = launch({**tensors, key: _at_end_of_mapping(x, image)})
+        except RuntimeError as refused:
+            if "mapped bytes" not in str(refused):
+                raise
+            print(
+                f"placed {name} at {sequence_k} keys: {key} whole, the launcher refusing "
+                "its image",
+                flush=True,
+            )
+            whole = x.untyped_storage().nbytes() - x.storage_offset() * x.element_size()
+            out = launch({**tensors, key: _at_end_of_mapping(x, whole)})
+        torch.cuda.synchronize()
+        assert torch.equal(
+            out, reference
+        ), f"{key} changed the output where it was placed"
+
+
+@skipif(not _hip_vmm_available(), reason="HIP virtual memory management")
+def test_mha_v4_sol_head_dim_256_reads_stop_at_each_image():
+    """The hd256 rows read nothing past what each tensor lays out: every tensor of a Jensen and
+    tilt launch, in turn, ends at the last mapped byte, the MXFP4 K scales one dword later, at a
+    whole and a ragged last 128-row scale tile. A zeroed pad behind an image would hide a read
+    past it, and a read that is not used changes no output; past a mapping, either faults. A
+    fault ends the process, so the rows run in a child, all in one to start it once."""
+    kv_tile = _HD256_SOL_TILE[1]
+    rows = [
+        (row.values[0], sequence_k)
+        for row in _hd256_sol_params()
+        if not row.skip
+        for sequence_k in (128 * kv_tile, 128 * kv_tile + 37)
+    ]
+    if not rows:
+        return
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    child = (
+        "from op_tests.test_mha_v4_sparse import _hd256_end_of_mapping_child; "
+        f"_hd256_end_of_mapping_child({rows!r})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    placed = [line for line in result.stdout.splitlines() if line.startswith("placed")]
+    assert result.returncode == 0 and "done" in result.stdout.splitlines(), (
+        f"stopped with {placed[-1:]} at the end of a mapping:\n{result.stderr[-3000:]}"
+    )
+
+
 @skipif(get_gfx() != "gfx950", reason="the gfx950 hd256 block-sparse rows")
 def test_mha_v4_head_dim_256_block_tile_is_its_own():
     """MXFP8 tiles KV at 128 at hd128 and at 64 at hd256, so the hd128 geometry is refused at hd256
