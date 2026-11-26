@@ -431,13 +431,13 @@ def test_packed_tilt_planes_keep_plane_zero_and_the_packers_backing(
         packed_slack = _bytes(packed)[stride:]
         assert slack.numel() == packed_slack.numel(), name
         assert not slack[packed_slack == 0].any(), name
-        # The hd128 V and MXFP4 K scale readers run past their last row; the MXFP6 K reader takes
-        # its scales from the records' tile tails, never from this image. The hd256 readers are
-        # bounded by the image.
-        reads_past = name == "mean_v_scale" or (
+        # The hd128 V scale readers and the MXFP4 K scale reader, at either head dim, run past
+        # their last row; the hd256 V scale readers stop at the image, and the MXFP6 K reader
+        # takes its scales from the records' tile tails, never from this image.
+        reads_past = (name == "mean_v_scale" and head_dim == HEAD_DIM) or (
             name == "mean_k_scale" and k_format == "mxfp4"
         )
-        if reads_past and head_dim == HEAD_DIM:
+        if reads_past:
             assert packed_slack.numel() and not packed_slack.any(), name
 
 
