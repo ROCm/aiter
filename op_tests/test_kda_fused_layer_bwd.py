@@ -102,7 +102,7 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, dtype):
         "torch_chunk": lambda: kda_layer_bwd(
             dy, x, wt, h, chunk_size=chunk, backend="torch"
         ),
-        # FlyDSL norm/gate kernels + conv1d bwd (Triton when #8726 is in the
+        # FlyDSL l2norm/gate kernels + conv1d bwd (Triton when #8726 is in the
         # tree, else torch); chunk bwd is torch until a kernel is registered.
         "fused": lambda: kda_layer_bwd(dy, x, wt, h, chunk_size=chunk, backend="fused"),
     }

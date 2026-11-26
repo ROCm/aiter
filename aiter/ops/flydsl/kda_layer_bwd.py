@@ -13,13 +13,11 @@ import torch
 from .kernels.kda_layer_bwd import (
     WAVE,
     create_gate_beta_bwd_kernel,
-    create_gated_rmsnorm_bwd_kernel,
     create_l2norm_bwd_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
 
 ROW_WAVES = 4
-RMSNORM_ROWS_PER_WAVE = 16
 GATE_BLOCK = 256
 
 
@@ -71,35 +69,3 @@ def gate_beta_bwd(z, A_log, dg, braw, dbeta):
         n_beta,
     )
     return dz, dgg.view(-1, H, K).sum((0, 2)), db
-
-
-def gated_rmsnorm_bwd(o, gp, w, dy, eps=1e-6):
-    """Backward of ``rmsnorm(o) * w * sigmoid(gp)`` over the last dim.
-
-    o, gp, dy: [..., V]; w: [V]. Returns (do, dgp, dw), fp32.
-    """
-    dim = o.shape[-1]
-    _check_dim(dim, "gated rmsnorm row length")
-    rows = o.numel() // dim
-    n_groups = (rows + RMSNORM_ROWS_PER_WAVE - 1) // RMSNORM_ROWS_PER_WAVE
-    do = torch.empty(o.shape, device=o.device, dtype=torch.float32)
-    dgp = torch.empty_like(do)
-    dw_part = torch.empty(n_groups, dim, device=o.device, dtype=torch.float32)
-    launch = create_gated_rmsnorm_bwd_kernel(
-        dim, float(eps), ROW_WAVES, RMSNORM_ROWS_PER_WAVE, o.device.index
-    )
-    _run_compiled(
-        launch,
-        _f32(o),
-        _f32(gp),
-        _f32(w),
-        _f32(dy),
-        do.view(-1),
-        dgp.view(-1),
-        dw_part.view(-1),
-        rows,
-        n_groups,
-        o.numel(),
-        dw_part.numel(),
-    )
-    return do, dgp, dw_part.sum(0)

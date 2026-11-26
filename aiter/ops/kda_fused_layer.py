@@ -20,12 +20,12 @@ One KDA layer, token-major (packed varlen is not supported yet):
 
 * ``"torch"``: chunked (WY / triangular-solve) PyTorch implementation, gradients
   from autograd. Slow; it is the reference the fused path is graded against.
-* ``"fused"``: hand-written backward. q/k L2 norm, decay/beta gates and gated
-  RMSNorm run as FlyDSL kernels (``aiter.ops.flydsl.kda_layer_bwd``); conv1d +
-  SiLU reuses the Triton split-q/k/v conv backward; projections are GEMMs; the
-  chunk delta-rule backward goes through ``register_chunk_bwd`` (which can also
-  absorb the L2 norm and gate stages) and falls back to autograd over
-  ``chunk_kda_torch`` while no kernel is registered.
+* ``"fused"``: hand-written backward. q/k L2 norm and decay/beta gates run as
+  FlyDSL kernels (``aiter.ops.flydsl.kda_layer_bwd``); gated RMSNorm goes through
+  ``register_gated_rmsnorm_bwd``; conv1d + SiLU reuses the Triton split-q/k/v
+  conv backward; projections are GEMMs; the chunk delta-rule backward goes
+  through ``register_chunk_bwd`` (which can also absorb the L2 norm and gate
+  stages). Unregistered stages fall back to PyTorch.
 """
 
 from collections.abc import Callable
@@ -191,6 +191,22 @@ def register_chunk_bwd(fn: ChunkBwdFn | None, fuses=()):
     _chunk_bwd_impl, _chunk_bwd_fuses = fn, fuses if fn is not None else frozenset()
 
 
+GatedRMSNormBwdFn = Callable[..., tuple]
+_gated_rmsnorm_bwd_impl: GatedRMSNormBwdFn | None = None
+
+
+def register_gated_rmsnorm_bwd(fn: GatedRMSNormBwdFn | None):
+    """Install the gated RMSNorm backward used by ``backend="fused"``.
+
+    Contract: ``fn(o, gp, w, dy, eps) -> (do, dgp, dw)`` for
+    ``out = o * rsqrt(mean(o^2, -1) + eps) * w * sigmoid(gp)`` with o, gp, dy
+    ``[B, T, H, V]`` and w ``[V]``; outputs fp32. ``None`` restores the PyTorch
+    fallback.
+    """
+    global _gated_rmsnorm_bwd_impl
+    _gated_rmsnorm_bwd_impl = fn
+
+
 def chunk_kda_bwd_torch(
     do,
     q,
@@ -270,7 +286,7 @@ def _flydsl_ops():
 
 
 class _TorchOps:
-    """The FlyDSL stages written with torch ops, for hosts without the kernels."""
+    """Torch versions of the kernel stages: fallbacks and CPU stand-ins."""
 
     @staticmethod
     def l2norm_bwd(x, dy, eps=1e-6):
@@ -358,7 +374,8 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
 
     d_wo = dy.t() @ s["on"].reshape(B * T, -1)
     d_on = (dy @ w.w_o.float()).view_as(s["o"])
-    do, dgp, d_norm = ops.gated_rmsnorm_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
+    rms_bwd = _gated_rmsnorm_bwd_impl or _TorchOps.gated_rmsnorm_bwd
+    do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
     ga = s["ga"].reshape(B * T, -1)
     d_gb = dgp.t() @ ga
