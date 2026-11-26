@@ -158,9 +158,9 @@ def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
         (CAP, 6144, True, "gluon"),  # every Gluon wave busy
         (CAP + 1, 6144, True, "lamport"),
         (1, 7168, True, "lamport"),  # 16 Gluon waves for 10 chunks: Lamport
-        (512, 4096, True, "lamport"),  # 4 MiB
-        (513, 4096, True, "split"),  # the Gluon power-of-2 kernel and the quant
-        (513, 4096, False, "lamport"),
+        (2048, 1024, True, "lamport"),  # 4 MiB
+        (2049, 1024, True, "split"),  # the Gluon power-of-2 kernel and the quant
+        (513, 4096, True, "lamport"),  # the bound stops at hidden 1024
         (1, 6144, False, "lamport"),
         (682, 6144, False, "lamport"),  # 8 MiB, the TP4 Lamport cap
         (683, 6144, False, "split"),

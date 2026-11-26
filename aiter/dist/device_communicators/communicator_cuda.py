@@ -22,8 +22,9 @@ _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 # Where fused_allreduce_rmsnorm takes the Gluon power-of-2 kernel (self.gluon_ar), the
-# Lamport MXFP8 kernel is faster than it and the quant up to 4 MiB at hidden 1024 to
-# 8192, not at hidden 1024 from 6 MiB; larger MXFP8 calls keep those two.
+# Lamport MXFP8 kernel is faster than it and the quant at hidden 2048 to 8192 up to
+# the cap, at hidden 1024 only up to 4 MiB (not from 6 MiB): larger MXFP8 calls of
+# power-of-2 hidden up to 1024 keep those two.
 _GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
@@ -812,6 +813,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.gluon_ar is None
             or input_.dtype != torch.bfloat16
             or hidden & (hidden - 1)
+            or hidden > 1024
             or input_.numel() * input_.element_size()
             <= _GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES
         ):
