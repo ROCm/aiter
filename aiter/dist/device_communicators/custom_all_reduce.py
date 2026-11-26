@@ -376,7 +376,8 @@ def _runtime_gfx() -> str | None:
 #   AITER_CUSTOM_AG_MAX_SIZE  all-gather per-rank input.    Default
 #                             max_size / (2 * world_size), i.e. 128 MiB at
 #                             world_size 4 with the default 1 GiB max_size.
-#   AITER_CUSTOM_RS_MAX_SIZE  reduce-scatter input bytes.   Default 64 MiB.
+#   AITER_CUSTOM_RS_MAX_SIZE  reduce-scatter input bytes.   Default 64 MiB;
+#                             256 MiB for a first-dim split on gfx950.
 #
 # All three ops stage their input in the registered input pool on the copy-in
 # path, so none can exceed the pool. How that pool is sized depends on the arch
@@ -395,6 +396,10 @@ def _runtime_gfx() -> str | None:
 #            capped there, and inputs above the cap fall back to RCCL.
 _DEFAULT_CAR_MAX_SIZE = 8192 * 8192
 _DEFAULT_CRS_MAX_SIZE = 8192 * 8192
+# First-dim split on gfx950. Timed on MI355X, bf16, up to 256 MiB: the eager
+# copy-in path is ahead of RCCL at TP2 / TP4 and level with it at TP8 from
+# 192 MiB up; a registered input is ahead at every world size.
+_GFX950_CRS_FIRST_DIM_MAX_SIZE = 4 * 8192 * 8192
 _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
 _CAG_MAX_SIZE_ENV = "AITER_CUSTOM_AG_MAX_SIZE"
 _CRS_MAX_SIZE_ENV = "AITER_CUSTOM_RS_MAX_SIZE"
@@ -472,10 +477,12 @@ class _CustomSizes(NamedTuple):
     rs: int
     # Whether AITER_CUSTOM_AR_MAX_SIZE set ar.
     ar_set: bool = False
+    # RS cutoff for a first-dim split; rs unless the arch has its own default.
+    rs_first_dim: int = 0
 
 
 def _resolve_custom_sizes(
-    is_gfx1250: bool, world_size: int, max_size: int
+    is_gfx1250: bool, world_size: int, max_size: int, gfx: str | None = None
 ) -> _CustomSizes:
     """Resolve the input-pool size and the AR / AG / RS cutoffs from the env.
 
@@ -549,7 +556,10 @@ def _resolve_custom_sizes(
     for name, v in requested:
         if v == 0:
             logger.info("%s=0: that op always falls back to RCCL.", name)
-    return _CustomSizes(pool, ar, ar_prefill, ag, rs, ar_set)
+    rs_first_dim = rs
+    if gfx == "gfx950" and not rs_set:
+        rs_first_dim = min(_GFX950_CRS_FIRST_DIM_MAX_SIZE, pool)
+    return _CustomSizes(pool, ar, ar_prefill, ag, rs, ar_set, rs_first_dim)
 
 
 def _resolve_plain_ar_max_size(
@@ -902,7 +912,7 @@ class IPCBufferPool:
         self._free_fn = free_fn or ops.free_meta_buffer
 
         self._store = dist.distributed_c10d._get_default_store()
-        self._assert_pure_tcp_store(self._store)
+        self._assert_backend_free_store(self._store)
 
         ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(group))))
         self._store_key_prefix = f"aiter_ipc/p{IPCBufferPool._pool_seq}/g{ranks_tag}"
@@ -911,15 +921,15 @@ class IPCBufferPool:
         self._peer_bases: list[int] = []  # mapped by open_peer_buffers
 
     @staticmethod
-    def _assert_pure_tcp_store(store) -> None:
-        """Verify the store is a pure-TCP KV store, free from any collective
-        communication backend (RCCL / gloo / MPI)."""
+    def _assert_backend_free_store(store) -> None:
+        """Verify the store is a plain KV store (TCPStore or FileStore), free
+        from any collective communication backend (RCCL / gloo / MPI)."""
         s = store
         while isinstance(s, dist.PrefixStore):
             s = s.underlying_store
-        assert isinstance(s, dist.TCPStore), (
-            f"IPC metadata exchange requires a pure-TCP KV store "
-            f"(torch.distributed.TCPStore), got {type(s).__name__}. "
+        assert isinstance(s, (dist.TCPStore, dist.FileStore)), (
+            f"IPC metadata exchange requires a TCPStore or FileStore KV store "
+            f"(tcp:// or file:// init method), got {type(s).__name__}. "
             f"This ensures the exchange is backend-free — no RCCL, "
             f"gloo, or MPI collective is involved."
         )
@@ -1061,7 +1071,7 @@ class IPCBufferPool:
         return self._gather_ipc_meta((handle, data_ptr - base_ptr))
 
     def all_gather_object(self, obj) -> list:
-        """Gather a picklable *obj* from every rank via the TCP store.
+        """Gather a picklable *obj* from every rank via the default KV store.
 
         Each rank writes its serialised *obj* under a unique key, then reads
         every other rank's.  ``store.get()`` blocks until the key is
@@ -1511,7 +1521,9 @@ class CustomAllreduce:
         # op's cutoff run on the custom kernels; larger ones fall back to RCCL.
         # Set by AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE; on gfx1250 the pool grows to
         # hold the largest one set. See _resolve_custom_sizes.
-        sizes = _resolve_custom_sizes(self._is_gfx1250, world_size, max_size)
+        sizes = _resolve_custom_sizes(
+            self._is_gfx1250, world_size, max_size, _runtime_gfx()
+        )
         self.max_size = sizes.pool
         self._car_max_size = sizes.ar
         self._car_prefill_max_size = sizes.ar_prefill
@@ -1523,9 +1535,10 @@ class CustomAllreduce:
         )
         self._cag_max_size = sizes.ag
         self._crs_max_size = sizes.rs
+        self._crs_first_dim_max_size = sizes.rs_first_dim
         logger.info(
             "Custom allreduce rank %d: input pool %d bytes; cutoffs AR %d "
-            "(prefill %d, plain %d), AG %d, RS %d bytes.",
+            "(prefill %d, plain %d), AG %d, RS %d (first dim %d) bytes.",
             rank,
             sizes.pool,
             sizes.ar,
@@ -1533,6 +1546,7 @@ class CustomAllreduce:
             self._plain_ar_max_size,
             sizes.ag,
             sizes.rs,
+            sizes.rs_first_dim,
         )
         # Custom-AR lower size bound (bytes): inputs at or below this fall back
         # to RCCL. Default 0 (no lower bound). Overridable via
@@ -2935,7 +2949,9 @@ class CustomAllreduce:
         if not self._has_gather_scatter_kernel():
             return False
         # AITER_CUSTOM_RS_MAX_SIZE; the AR cutoffs do not apply.
-        if not self._fits_custom_size(inp, self._crs_max_size):
+        first_dim = dim in (0, -inp.dim())
+        max_size = self._crs_first_dim_max_size if first_dim else self._crs_max_size
+        if not self._fits_custom_size(inp, max_size):
             return False
         if not is_weak_contiguous(inp):
             return False

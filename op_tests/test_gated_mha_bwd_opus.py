@@ -1,27 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""`gated_mha_bwd`: the backward of the D_QK = 192 / D_V = 128 attention on the OPUS gfx950
-kernels, with the output gate, out = attention(q, k, v) * sigmoid(gate), and without it.
+"""`gated_mha_bwd`: the backward of the D_QK = 192 / D_V = 128 attention on the OPUS
+gfx950 kernels, with the output gate, out = attention(q, k, v) * sigmoid(gate), and
+without it.
 
-Each case runs the OPUS forward, gates its output in fp32 where the case has a gate, and calls
-the op on that output and LSE. dq, dk, dv and dgate are compared with fp32 autograd of a
-torch attention (`_ref_bwd`): the relative L2 error must stay within PARITY_REL_L2, over each
-output and over each head of it, and no row (token, head) may be off by more than
-LOCAL_ROW_ERR of its norm (of its head's RMS row norm for rows smaller than that), so that a
-wrong row or head is not diluted.
+Each case runs the OPUS forward, gates its output in fp32 where the case has a gate, and
+calls the op on that output and LSE. dq, dk, dv and dgate are compared with fp32
+autograd of a torch attention (`_ref_bwd`): the relative L2 error must stay within
+PARITY_REL_L2 over each output and over each of its heads. Each row (token, head) is
+compared with `_faithful_bwd`, which forms D from the bf16 `out` as the kernels do: its
+error must stay within LOCAL_ROW_ERR of the row's norm, floored at a hundredth of its
+head's RMS row norm. A wrong row or head is thus not diluted.
 
-The cases cover sequence lengths from one token, around the kernels' tile and block edges,
-to 65536 tokens and batches of 131072 at 96 heads, equal-length batches and varlen mixes, key
-sequences of other lengths than the queries', sequences without queries and no query at all,
-head counts around the scheduling groups of 16 and 32 heads that the kernels deal over the 8
+The cases cover sequence lengths from one token, around the kernels' tile and block
+edges, to 16384 tokens at 96 heads (65536 tokens and batches of 131072 with
+AITER_GATED_MHA_BWD_FULL_SIZE=1), equal-length batches and varlen mixes, key sequences
+of other lengths than the queries', sequences without queries and no query at all, head
+counts around the scheduling groups of 16 and 32 heads that the kernels deal over the 8
 XCDs, causal and unmasked attention, other softmax scales, max_seqlen bounds above the
-lengths, views of every input (q, k, v, out, dout, gate, lse and cu_seqlens: strided, sliced,
-unaligned, broadcast and overlapping), gate and dout as [T, H * 128] and [T, H, 128], KV heads
-shared by several query heads (GQA / MQA), run-to-run determinism, torch.compile with
-fullgraph=True, the ops' schemas, the exports and the input checks.
+lengths, views of every input (q, k, v, out, dout, gate, lse and cu_seqlens: strided,
+sliced, unaligned, broadcast and overlapping), token strides at and past the kernels'
+2^24 limit, gate and dout as [T, H * 128] and [T, H, 128], KV heads shared by several
+query heads (GQA / MQA), run-to-run determinism, torch.compile with fullgraph=True, the
+ops' schemas, the exports and the input checks.
 """
 
-import importlib
 import itertools
 import os
 import sys
@@ -30,21 +33,21 @@ import pytest
 import torch
 
 import aiter
+import aiter.ops.opus._gated_mha_bwd as _OP_MODULE
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
-from aiter.ops.opus.gated_mha_bwd import gated_mha_bwd
-
-# The op's module: aiter.ops.opus.gated_mha_bwd is the function.
-_OP_MODULE = importlib.import_module("aiter.ops.opus.gated_mha_bwd")
+from aiter.ops.opus import gated_mha_bwd
 
 D_QK = 192
 D_V = 128
 SCALE = D_QK**-0.5
 # Bound on the relative L2 error of the bf16 gradients against fp32 autograd.
 PARITY_REL_L2 = 2e-2
-# Bound on a row's (token, head) L2 error against fp32 autograd, over the row's reference norm
-# or, where larger, the RMS of its head's reference rows.
+# Bound on a row's (token, head) L2 error against `_faithful_bwd`, over the row's norm
+# floored at a hundredth of its head's RMS row norm.
 LOCAL_ROW_ERR = 0.1
+# The cases of 32768 tokens and more need about 100 GB for their fp32 references.
+FULL_SIZE = os.environ.get("AITER_GATED_MHA_BWD_FULL_SIZE", "0") == "1"
 
 
 def _is_gfx950():
@@ -71,7 +74,8 @@ def _error_summary():
 
 
 def _case_ids(cases):
-    """b<sequences>_s<length>_h<heads>, or the shortest and longest length of a varlen mix."""
+    """b<sequences>_s<length>_h<heads>, or the shortest and longest length of a varlen
+    mix."""
     ids = []
     for seqlens, heads in cases:
         lo, hi = min(seqlens), max(seqlens)
@@ -97,9 +101,9 @@ def _inputs(seqlens, heads, seed=0):
 
 
 def _ref_attention(q, k, v, gate, cu, causal, cu_k=None, scale=SCALE):
-    """fp32 per-sequence attention: gated output [T, H, D_V] and LSE [H, T]. `cu_k` bounds
-    the keys' sequences where they differ from the queries'; the causal mask is aligned to
-    the bottom right, and a query that sees no key has a zero output."""
+    """fp32 per-sequence attention: gated output [T, H, D_V] and LSE [H, T]. `cu_k`
+    bounds the keys' sequences where they differ from the queries'; the causal mask is
+    aligned to the bottom right, and a query that sees no key has a zero output."""
     q, k, v = (x.float() for x in (q, k, v))
     cu_k = cu if cu_k is None else cu_k
     heads = q.shape[1]
@@ -126,8 +130,8 @@ def _ref_attention(q, k, v, gate, cu, causal, cu_k=None, scale=SCALE):
 
 
 def _ref_bwd(q, k, v, gate, dout, cu, causal, cu_k=None, scale=SCALE):
-    """fp32 autograd of the gated attention: d(q), d(k), d(v), d(gate); without a gate, the
-    first three."""
+    """fp32 autograd of the gated attention: d(q), d(k), d(v), d(gate); without a gate,
+    the first three."""
     qf, kf, vf = (x.detach().float().requires_grad_() for x in (q, k, v))
     gf = None if gate is None else gate.detach().float().requires_grad_()
     out, _ = _ref_attention(qf, kf, vf, gf, cu, causal, cu_k, scale)
@@ -164,10 +168,11 @@ def _fwd_bwd(
     bounds=None,
     seen=None,
 ):
-    """dq, dk, dv and dgate (None without a gate) of `gated_mha_bwd`, on the OPUS forward's
-    output, gated in fp32, and its LSE. `views` maps "out", "lse", "cu" and "cu_k" to functions
-    that give the op a view of that argument; `bounds` replaces (max_seqlen_q, max_seqlen_k)
-    of the op's call; `seen`, a dict, gets the `out` the op was given."""
+    """dq, dk, dv and dgate (None without a gate) of `gated_mha_bwd`, on the OPUS
+    forward's output, gated in fp32, and its LSE. `views` maps "out", "lse", "cu" and
+    "cu_k" to functions that give the op a view of that argument; `bounds` replaces
+    (max_seqlen_q, max_seqlen_k) of the op's call; `seen`, a dict, gets the `out` the op
+    was given."""
     cu_k, smax_k = cu if cu_k is None else cu_k, smax if smax_k is None else smax_k
     out, lse = fmha_fwd_bf16_opus_varlen_fwd(
         q.contiguous(),
@@ -219,9 +224,9 @@ def _head_error(a, r):
 
 
 def _row_error(a, r):
-    """The largest L2 error of a row (token, head) over its reference's norm, floored at a
-    hundredth of its head's RMS row norm (a row of 0 stays 0, as dq of a query that sees one
-    key)."""
+    """The largest L2 error of a row (token, head) over its reference's norm, floored at
+    a hundredth of its head's RMS row norm (a row of 0 stays 0, as dq of a query that
+    sees one key)."""
     a, r = _as_rows(a), _as_rows(r)
     diff, ref = (a - r).pow(2).sum(-1), r.pow(2).sum(-1)  # [T, heads]
     if not diff.numel():
@@ -231,12 +236,13 @@ def _row_error(a, r):
 
 
 def _faithful_bwd(q, k, v, out, gate, dout, cu, causal, heads=None, scale=SCALE):
-    """fp32 gradients from the op's own inputs as the kernels form them: D = rowsum(dout *
-    out) of the bf16 `out` the op is given, and dO = dout * sigmoid(gate) rounded to bf16.
-    Against fp32 autograd a row whose dS cancels (a query that sees few keys) differs by the
-    rounding of `out` in D; against this it carries only the op's own rounding, so it bounds
-    each row. One cu_seqlens for queries and keys and as many KV heads as query heads:
-    dq, dk, dv and dgate (None without a gate) of `heads` (all by default)."""
+    """fp32 gradients from the op's own inputs as the kernels form them: D = rowsum(dout
+    * out) of the bf16 `out` the op is given, and dO = dout * sigmoid(gate) rounded to
+    bf16. Against fp32 autograd a row whose dS cancels (a query that sees few keys)
+    differs by the rounding of `out` in D; against this it carries only the op's own
+    rounding, so it bounds each row. One cu_seqlens for queries and keys and as many KV
+    heads as query heads: dq, dk, dv and dgate (None without a gate) of `heads` (all by
+    default)."""
     t, h = q.shape[:2]
     heads = list(range(h)) if heads is None else list(heads)
     dout3, out3 = dout.reshape(t, h, D_V).float(), out.reshape(t, h, D_V).float()
@@ -277,8 +283,8 @@ def _faithful_bwd(q, k, v, out, gate, dout, cu, causal, heads=None, scale=SCALE)
 def _assert_parity(ours, ref, names=_OUTPUTS, scales=None, faithful=None):
     """Relative L2 error of each of `ours` against `ref` within PARITY_REL_L2, over each
     output and each of its heads; with `faithful` (`_faithful_bwd`), every row within
-    LOCAL_ROW_ERR of it. `scales` replaces the reference norms as the errors' denominators,
-    and leaves out the head bounds."""
+    LOCAL_ROW_ERR of it. `scales` replaces the reference norms as the errors'
+    denominators, and leaves out the head bounds."""
     case = os.environ.get("PYTEST_CURRENT_TEST", "").split("::")[-1].split(" ")[0]
     failed = []
     for i, (name, a, r) in enumerate(zip(names, ours, ref)):
@@ -316,12 +322,12 @@ def _check(seqlens, heads, causal):
     )
 
 
-# Around the 32-row tiles, the 48 rows of a wave and the 192-row blocks of the dK / dV pass, and
-# around other powers of two.
+# Around the 32-row tiles, the 48 rows of a wave and the 192-row blocks of the dK / dV
+# pass, and around other powers of two.
 _EDGE_LENS = [n + d for n in (32, 48, 64, 96, 128, 192, 256) for d in (-1, 0, 1)]
 _EDGE_LENS += [383, 385, 511, 513]
-# The dQ pass's blocks are of 256 queries, a sequence's last ones of 192: lengths where the split
-# of a sequence changes.
+# The dQ pass's blocks are of 256 queries, a sequence's last ones of 192: lengths where
+# the split of a sequence changes.
 _EDGE_LENS += [n + d for n in (320, 448, 576, 640, 832) for d in (0, 1)]
 
 
@@ -356,12 +362,12 @@ def _dp_term_norms(q, k, v, gate, dout, cu, causal):
 @pytest.mark.parametrize("batch", [1, 4, 16])
 @pytest.mark.parametrize("seqlen", [1, 2])
 def test_gated_mha_bwd_one_and_two_tokens(seqlen, batch, causal):
-    """Sequences of one or two tokens. A query that sees one key has P = 1 and
-    dS = P (dP - D) = 0, and two keys leave dS = +-P0 P1 (dP0 - dP1): dq and dk are zero or
-    what is left of two terms that cancel, while the kernels' D, the rowsum of dout times
-    the bf16 `out`, carries that output's rounding. Their errors against fp32 autograd are
-    therefore measured against the dP half of each gradient instead of the reference's own
-    norm; dv and dgate do not cancel and are compared as usual."""
+    """Sequences of one or two tokens. A query that sees one key has P = 1 and dS = P
+    (dP - D) = 0, and two keys leave dS = +-P0 P1 (dP0 - dP1): dq and dk are zero or
+    what is left of two terms that cancel, while the kernels' D, the rowsum of dout
+    times the bf16 `out`, carries that output's rounding. Their errors against fp32
+    autograd are therefore measured against the dP half of each gradient instead of the
+    reference's own norm; dv and dgate do not cancel and are compared as usual."""
     cu, smax, q, k, v, gate, dout = _inputs([seqlen] * batch, 9)
     dq, dk, dv, dgate = _fwd_bwd(q, k, v, gate, dout, cu, smax, causal)
     ref_dq, ref_dk, ref_dv, ref_dgate = _ref_bwd(q, k, v, gate, dout, cu, causal)
@@ -374,8 +380,8 @@ def test_gated_mha_bwd_one_and_two_tokens(seqlen, batch, causal):
     _assert_parity((dv, dgate), (ref_dv, ref_dgate), ("dv", "dgate"))
 
 
-# Up to 20 dQ blocks and 40 pair-pass blocks a head, lengths off the 32-row tiles included,
-# from a partial scheduling group of heads to several whole ones.
+# Up to 20 dQ blocks and 27 dK / dV blocks a head, lengths off the 32-row tiles
+# included, from a partial scheduling group of heads to several whole ones.
 _MEDIUM = [
     ([1000], 24),
     ([2048], 24),
@@ -412,8 +418,8 @@ def test_gated_mha_bwd_large(seqlens, heads, causal):
 
 
 def _ref_bwd_per_head(q, k, v, gate, dout, cu, causal, heads):
-    """`_ref_bwd` one sequence and one head at a time, which bounds its temporaries to
-    s * s * 4 bytes each: d(q), d(k), d(v) and d(gate) of `heads` as [T, len(heads), ...].
+    """`_ref_bwd` one sequence and one head at a time, which bounds its temporaries to s
+    * s * 4 bytes each: d(q), d(k), d(v) and d(gate) of `heads` as [T, len(heads), ...].
     """
     t, h = q.shape[:2]
     gate, dout = gate.view(t, h, -1), dout.view(t, h, -1)
@@ -449,9 +455,9 @@ def _ref_bwd_per_head(q, k, v, gate, dout, cu, causal, heads):
 
 # The first and last heads of scheduling groups and a few in between.
 _SOME_HEADS = (0, 1, 15, 16, 47, 64, 80, 95)
-# (seqlens, heads, heads the fp32 reference is computed for; None: all). The K3 head count
-# from 8192 tokens to batches of 131072, where q and k and their gradients are 4.5 GiB each,
-# and its share of a GPU at tensor parallelism 4 and 8 (24 and 12 heads).
+# (seqlens, heads, heads the fp32 reference is computed for; None: all). The K3 head
+# count from 8192 tokens to batches of 131072, where q and k and their gradients are 4.5
+# GiB each, and its share of a GPU at tensor parallelism 4 and 8 (24 and 12 heads).
 _FULL_SIZE = [
     ([8192], 96, None),
     ([8192], 24, None),
@@ -467,11 +473,22 @@ _FULL_SIZE = [
 ]
 
 
+def _full_size_param(case, case_id):
+    """The case, skipped from 32768 tokens on unless AITER_GATED_MHA_BWD_FULL_SIZE=1."""
+    big = max(case[0]) >= 32768
+    skip = pytest.mark.skipif(
+        big and not FULL_SIZE, reason="AITER_GATED_MHA_BWD_FULL_SIZE"
+    )
+    return pytest.param(*case, id=case_id, marks=skip)
+
+
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize(
     "seqlens,heads,ref_heads",
-    _FULL_SIZE,
-    ids=_case_ids([case[:2] for case in _FULL_SIZE]),
+    [
+        _full_size_param(case, case_id)
+        for case, case_id in zip(_FULL_SIZE, _case_ids([c[:2] for c in _FULL_SIZE]))
+    ],
 )
 def test_gated_mha_bwd_full_size(seqlens, heads, ref_heads, causal):
     """Production-size problems against fp32 autograd taken one head at a time, on all
@@ -487,8 +504,8 @@ def test_gated_mha_bwd_full_size(seqlens, heads, ref_heads, causal):
 
 
 # Equal-length batches and varlen mixes of 2 to 32 sequences: one-token sequences
-# between longer ones, every edge length at an unaligned token offset, and one long sequence
-# with many short ones (its blocks are dispatched with theirs).
+# between longer ones, every edge length at an unaligned token offset, and one long
+# sequence with many short ones (its blocks are dispatched with theirs).
 _BATCHES = [
     ([513] * 2, 96),
     ([1000] * 4, 96),
@@ -509,8 +526,8 @@ def test_gated_mha_bwd_batches(seqlens, heads, causal):
     _check(seqlens, heads, causal)
 
 
-# Whole and partial scheduling groups (16 heads, 32 with a causal mask), and heads per XCD from
-# none to several.
+# Whole and partial scheduling groups (16 heads, 32 with a causal mask), and heads per
+# XCD from none to several.
 _HEAD_COUNTS = [1, 2, 3, 7, 8, 9, 12, 16, 17, 24, 33, 96, 128]
 # Several blocks of both passes a sequence, with a one-token sequence in between.
 _SEQLENS = [600, 1, 257, 1000]
@@ -560,11 +577,11 @@ def _transposed(x):
     return x.t().contiguous().t()
 
 
-# Views of the contiguous inputs, by argument: q, k, v, gate and dout are the op's inputs, out,
-# lse, cu and cu_k (cu_seqlens_q, cu_seqlens_k) the forward's outputs and bounds given to the
-# op. 16-byte aligned rows with strides that are multiples of 8 elements are read in place;
-# the op copies the others (an element offset off 16 bytes, a column-major LSE, strided
-# cu_seqlens).
+# Views of the contiguous inputs, by argument: q, k, v, gate and dout are the op's
+# inputs, out, lse, cu and cu_k (cu_seqlens_q, cu_seqlens_k) the forward's outputs and
+# bounds given to the op. 16-byte aligned rows with strides that are multiples of 8
+# elements are read in place; the op copies the others (an element offset off 16 bytes,
+# a column-major LSE, strided cu_seqlens).
 _LAYOUTS = {
     "q_slice": {"q": lambda x: _within(x, 8)},
     "q_slice_unaligned": {"q": lambda x: _within(x, 1)},
@@ -620,8 +637,8 @@ _OUTPUT_ARGS = ("out", "lse", "cu", "cu_k")
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("layout", _LAYOUTS)
 def test_gated_mha_bwd_input_layouts(layout, causal):
-    """Strided, sliced, unaligned and reshaped views of every input give the gradients of
-    contiguous inputs bit for bit."""
+    """Strided, sliced, unaligned and reshaped views of every input give the gradients
+    of contiguous inputs bit for bit."""
     seqlens, heads = [300, 1, 700], 17
     cu, smax, q, k, v, gate, dout = _inputs(seqlens, heads)
     x = {"q": q, "k": k, "v": v, "gate": gate, "dout": dout}
@@ -667,8 +684,8 @@ def _overlapping_rows(x):
     return flat.as_strided((t, h, d), (8, d, 1))
 
 
-# Views the kernels cannot read in place, by argument: broadcast tokens (token stride 0) and
-# overlapping rows are copied; broadcast heads (head stride 0) are read in place.
+# Views the kernels cannot read in place, by argument: broadcast tokens (token stride 0)
+# and overlapping rows are copied; broadcast heads (head stride 0) are read in place.
 _BROADCAST = {
     "q_tokens": {"q": _broadcast_tokens},
     "k_tokens": {"k": _broadcast_tokens},
@@ -692,11 +709,11 @@ _BROADCAST = {
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("layout", _BROADCAST)
 def test_gated_mha_bwd_broadcast_inputs(layout, causal, gated):
-    """Broadcast (zero-stride) and overlapping views give the gradients of their dense copies
-    bit for bit, and match fp32 autograd: the kernels never read them through buffers sized
-    by their token stride. With one token's q, k or v for all, dq and dk are sums that cancel
-    to about 0 (equal keys or values make dS sum to 0 over them), so there only dv and dgate
-    are held to fp32 autograd."""
+    """Broadcast (zero-stride) and overlapping views give the gradients of their dense
+    copies bit for bit, and match fp32 autograd: the kernels never read them through
+    buffers sized by their token stride. With one token's q, k or v for all, dq and dk
+    are sums that cancel to about 0 (equal keys or values make dS sum to 0 over them),
+    so there only dv and dgate are held to fp32 autograd."""
     seqlens, heads = [300, 1, 700], 9
     cu, smax, q, k, v, gate, dout = _inputs(seqlens, heads)
     x = {"q": q, "k": k, "v": v, "gate": gate, "dout": dout}
@@ -716,8 +733,8 @@ def test_gated_mha_bwd_broadcast_inputs(layout, causal, gated):
 
 def _ref_bwd_shared_kv(q, k, v, gate, dout, cu, causal, cu_k=None):
     """fp32 autograd as `_ref_bwd`, each head of `k` and `v` shared by the next
-    q.shape[1] / k.shape[1] query heads: d(q), d(k), d(v) of the KV heads, d(gate); without a
-    gate, the first three."""
+    q.shape[1] / k.shape[1] query heads: d(q), d(k), d(v) of the KV heads, d(gate);
+    without a gate, the first three."""
     qf, kf, vf = (x.detach().float().requires_grad_() for x in (q, k, v))
     gf = None if gate is None else gate.detach().float().requires_grad_()
     group = q.shape[1] // k.shape[1]
@@ -761,7 +778,8 @@ def test_gated_mha_bwd_shared_kv(heads, kv_heads, causal):
     _assert_parity(ours, _ref_bwd_shared_kv(q, k, v, gate, dout, cu, causal))
 
 
-# (query lengths, key lengths) of the sequences: keys of other lengths than the queries'.
+# (query lengths, key lengths) of the sequences: keys of other lengths than the
+# queries'.
 _CROSS = [
     ([100], [300]),
     ([300], [100]),
@@ -815,8 +833,8 @@ def test_gated_mha_bwd_no_gate(seqlens, heads, causal):
 
 
 def _junk_allocator():
-    """Leaves NaN in the blocks the caching allocator hands out next, so that an output the op
-    leaves unwritten shows."""
+    """Leaves NaN in the blocks the caching allocator hands out next, so that an output
+    the op leaves unwritten shows."""
     junk = torch.full((1 << 26,), float("nan"), device="cuda")
     del junk
 
@@ -836,8 +854,8 @@ _NO_QUERIES = [
     "lens_q,lens_k", _NO_QUERIES, ids=[f"q{a}_k{b}" for a, b in _NO_QUERIES]
 )
 def test_gated_mha_bwd_no_queries(lens_q, lens_k, heads, kv_heads, gated, causal):
-    """Keys that no query sees get zero gradients, also with no query at all (max_seqlen_q
-    0), where the kernels have nothing to run on."""
+    """Keys that no query sees get zero gradients, also with no query at all
+    (max_seqlen_q 0), where the kernels have nothing to run on."""
     bf = torch.bfloat16
     torch.manual_seed(0)
     cu = torch.tensor(
@@ -910,12 +928,14 @@ def test_gated_mha_bwd_softmax_scale(scale, causal):
         ([300, 1, 700], None, (701, 700)),
         ([300, 1, 700], None, (2000, 5000)),
         ([257, 1, 40], [64, 500, 40], (600, 1200)),
+        ([300, 1, 700], None, (2**31 - 1, 2**31 - 1)),
     ],
-    ids=["q_plus_1", "far_above", "cross_lengths"],
+    ids=["q_plus_1", "far_above", "cross_lengths", "int_max"],
 )
 def test_gated_mha_bwd_max_seqlen_bounds(lens_q, lens_k, bounds, causal):
-    """max_seqlen_q and max_seqlen_k above the longest sequences' lengths give the gradients
-    of the exact bounds bit for bit: the blocks past a sequence end at once."""
+    """max_seqlen_q and max_seqlen_k above the longest sequences' lengths give the
+    gradients of the exact bounds bit for bit: the blocks past a sequence end at once.
+    """
     heads = 9
     cu, smax, q, k, v, gate, dout = _inputs(lens_q, heads)
     cu_k, smax_k = cu, smax
@@ -926,9 +946,70 @@ def test_gated_mha_bwd_max_seqlen_bounds(lens_q, lens_k, bounds, causal):
     _assert_equal(above, exact, f"bounds {bounds} against the exact ones")
 
 
+_ROW_STRIDE_LIMIT = 1 << 24
+
+
+def _token_stride(x, stride):
+    """A copy of `x` [T, H, d] with token stride `stride` elements (at least H * d)."""
+    t, h, d = x.shape
+    flat = torch.empty((t - 1) * stride + h * d, device=x.device, dtype=x.dtype)
+    view = flat.as_strided((t, h, d), (stride, d, 1))
+    view.copy_(x)
+    return view
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize(
+    "stride,tokens",
+    [(_ROW_STRIDE_LIMIT, 70), (_ROW_STRIDE_LIMIT + 8, 4)],
+    ids=["at_limit", "past_limit"],
+)
+def test_gated_mha_bwd_token_stride_limit(stride, tokens, causal):
+    """Token strides up to 2^24 elements, the limit of the attention kernel's 32-bit
+    offsets within a tile, are read in place, past it copied; both give the bits of
+    dense inputs. At the limit 70 tokens span the dQ pass's 64-row reads (2.3 GB a
+    tensor)."""
+    cu, smax, q, k, v, _, dout = _inputs([tokens], 1)
+    x = {"q": q, "k": k, "v": v, "dout": dout.view(tokens, 1, D_V)}
+    views = {n: _token_stride(t, stride) for n, t in x.items()}
+    for view in views.values():
+        assert _OP_MODULE._strides_ok(view) == (stride <= _ROW_STRIDE_LIMIT)
+    ours = _fwd_bwd(**views, gate=None, cu=cu, smax=smax, causal=causal)
+    plain = _fwd_bwd(**x, gate=None, cu=cu, smax=smax, causal=causal)
+    del views
+    _assert_equal(ours, plain, f"token stride {stride} against dense inputs")
+
+
+def test_gated_mha_bwd_binding_checks():
+    """The attention kernel's binding refuses a token stride past 2^24 elements and
+    tensors without heads, which the op never passes it."""
+    bf = torch.bfloat16
+    cu = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+
+    def call(q, k, v):
+        t, h = q.shape[:2]
+        d_o = torch.zeros(t, h, D_V, device="cuda", dtype=bf)
+        lse = torch.zeros(h, t, device="cuda")
+        grads = [
+            torch.empty(t, h, n, device="cuda", dtype=bf) for n in (D_QK, D_QK, D_V)
+        ]
+        _OP_MODULE._fmha_bwd_bf16_opus_bwd(
+            q, k, v, d_o, lse, lse.clone(), *grads, cu, cu, 4, 4, False, SCALE
+        )
+
+    q = torch.zeros(4, 1, D_QK, device="cuda", dtype=bf)
+    k, v = torch.zeros_like(q), torch.zeros(4, 1, D_V, device="cuda", dtype=bf)
+    call(q, k, v)  # dense: accepted
+    with pytest.raises(RuntimeError, match="token stride"):
+        call(_token_stride(q, _ROW_STRIDE_LIMIT + 8), k, v)
+    empty = torch.zeros(4, 0, D_QK, device="cuda", dtype=bf)
+    with pytest.raises(RuntimeError, match="at least one head"):
+        call(empty, empty, torch.zeros(4, 0, D_V, device="cuda", dtype=bf))
+
+
 def test_gated_mha_bwd_op_schemas():
-    """The three kernel ops mark only the tensors they write, so that torch.compile neither
-    copies nor writes back their inputs."""
+    """The three kernel ops mark only the tensors they write, so that torch.compile
+    neither copies nor writes back their inputs."""
     writes = {
         "_gated_mha_bwd_pre_gate": ["d_o", "dgate", "d"],
         "_gated_mha_bwd_pre": ["d"],
@@ -946,12 +1027,14 @@ def test_gated_mha_bwd_op_schemas():
 
 
 def test_gated_mha_bwd_exported():
-    """The op is aiter.gated_mha_bwd and aiter.ops.opus.gated_mha_bwd."""
+    """The op is aiter.gated_mha_bwd and aiter.ops.opus.gated_mha_bwd; its module is
+    aiter.ops.opus._gated_mha_bwd."""
+    import aiter.ops.opus._gated_mha_bwd as module
     from aiter.ops import opus
 
     assert "gated_mha_bwd" in opus.__all__
     assert opus.gated_mha_bwd is gated_mha_bwd is aiter.gated_mha_bwd
-    assert callable(gated_mha_bwd) and _OP_MODULE.gated_mha_bwd is gated_mha_bwd
+    assert callable(gated_mha_bwd) and module.gated_mha_bwd is gated_mha_bwd
 
 
 @pytest.mark.parametrize(
@@ -960,8 +1043,8 @@ def test_gated_mha_bwd_exported():
     ids=["mha_gated", "mha_no_gate", "gqa_gated"],
 )
 def test_gated_mha_bwd_compiled(heads, kv_heads, gated):
-    """torch.compile(fullgraph=True) traces the op into one graph around its three kernel ops
-    and gives the eager gradients bit for bit."""
+    """torch.compile(fullgraph=True) traces the op into one graph around its three
+    kernel ops and gives the eager gradients bit for bit."""
     import torch._dynamo
 
     cu, smax, q, _, _, gate, dout = _inputs([300, 1, 700], heads)
@@ -995,9 +1078,8 @@ def test_gated_mha_bwd_compiled(heads, kv_heads, gated):
 
 
 def test_gated_mha_bwd_needs_gfx950(monkeypatch):
-    """Built for another architecture the kernels are empty: the op raises instead of
-    returning the outputs they would leave unwritten. The architecture is that of q's
-    device, not the build target."""
+    """The code object is gfx950's: on another device the op raises a clear error. The
+    architecture is that of q's device, not the build target."""
     cu, smax, q, k, v, gate, dout = _inputs([40], 3)
     out, lse = fmha_fwd_bf16_opus_varlen_fwd(
         q, k, v, SCALE, True, cu, cu, smax, smax, return_lse=True

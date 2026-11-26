@@ -107,7 +107,8 @@ NONE_WRAPPED_OP = [
     "qr_open_handles",
     "qr_get_handle",
     "qr_uses_pull_q4",
-    # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
+    # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with
+    # torch.compile
     "all_reduce",
     "reduce_scatter",
     "all_gather_reg",
@@ -123,7 +124,8 @@ NONE_WRAPPED_OP = [
     "_moe_nvfp4_cfg_field",
     "_moe_nvfp4_cfg_fits",
     "_moe_nvfp4_gemm",
-    # Wrapped by torch ops whose schemas mark only what they write (aiter/ops/opus/gated_mha_bwd.py)
+    # Wrapped by torch ops whose schemas mark only what they write
+    # (aiter/ops/opus/_gated_mha_bwd.py)
     "_fmha_bwd_bf16_opus_gate",
     "_fmha_bwd_bf16_opus_dot",
     "_fmha_bwd_bf16_opus_bwd",

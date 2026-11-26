@@ -66,6 +66,7 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from . import buffer_ops
 from .kernels_common import create_llvm_ptr
@@ -130,6 +131,7 @@ def skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves):
     return None
 
 
+@aot_factory("gemm_a16w16_skinny_gfx950")
 @functools.lru_cache(maxsize=256)
 def compile_gemm_a16w16_skinny_gfx950(
     n: int,

@@ -52,8 +52,9 @@ __host__ __device__ inline int wg_heads(int causal) { return causal ? HG_CAUSAL 
 // q [total_q, H, 192] and d_o [total_q, H, 128] are bf16, a row per head; k [total_k, H_k, 192]
 // and v [total_k, H_k, 128] likewise, H a multiple of H_k: head h reads the K and V of head
 // h / (H / H_k). The outputs dq [total_q, H, 192], dk [total_k, H, 192] and dv [total_k, H, 128]
-// are bf16, a row per head h. dK and dQ include softmax_scale. Strides are in elements.
-// 192 bytes, which the kernel reads in scalar loads. A pass with no blocks is left out.
+// are bf16, a row per head h. dK and dQ include softmax_scale. Strides are in elements. The
+// arguments are 192 bytes, which the kernel reads in scalar loads. A pass with no blocks is left
+// out.
 //
 // The launch's grid is the workgroup's place, so the kernel divides nothing: x is the head within
 // its group of fmha_bwd_d192_v128::wg_heads heads, and a pass's blocks go in order, the long ones

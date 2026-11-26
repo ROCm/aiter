@@ -9,6 +9,7 @@
 
 #include <ATen/hip/HIPContext.h>
 
+#include <algorithm>
 #include <climits>
 
 namespace {
@@ -149,7 +150,8 @@ void fmha_bwd_bf16_opus_bwd(at::Tensor& q,
     const int H       = static_cast<int>(q.size(1));
     const int total_k = static_cast<int>(k.size(0));
     const int H_k     = static_cast<int>(k.size(1));
-    const int share   = H_k > 0 ? H / H_k : 1; // the heads that read a K / V head
+    TORCH_CHECK(H > 0 && H_k > 0, "q and k need at least one head");
+    const int share = H / H_k; // the heads that read a K / V head
     TORCH_CHECK(share * H_k == H, "q's heads must be a multiple of k's");
     // `vec` is the widest access, in elements: rows and strides must keep it aligned. A row of a
     // [total, heads, D] tensor is read through a buffer of its token stride times the rows read,
@@ -233,6 +235,9 @@ void fmha_bwd_bf16_opus_bwd(at::Tensor& q,
     a.stride_lse_h   = static_cast<int>(lse.stride(0));
     a.softmax_scale  = softmax_scale;
     a.causal         = causal ? 1 : 0;
+    // No sequence is longer than its tensor: a looser bound only adds empty blocks, or overflows.
+    const int64_t len_q = std::min<int64_t>(max_seqlen_q, total_q);
+    const int64_t len_k = std::min<int64_t>(max_seqlen_k, total_k);
     // The dQ pass of queries that see no key writes zeros; the dK / dV pass has nothing to write
     // without keys.
     if(total_q > 0)
@@ -240,7 +245,8 @@ void fmha_bwd_bf16_opus_bwd(at::Tensor& q,
         a.ptr_dq      = dq.data_ptr();
         a.stride_dq_n = static_cast<int>(dq.stride(0));
         a.stride_dq_h = static_cast<int>(dq.stride(1));
-        a.n_q_blocks  = (max_seqlen_q + fmha_bwd_d192_v128_dq::BQ - 1) / fmha_bwd_d192_v128_dq::BQ;
+        a.n_q_blocks =
+            static_cast<int>((len_q + fmha_bwd_d192_v128_dq::BQ - 1) / fmha_bwd_d192_v128_dq::BQ);
     }
     if(total_q > 0 && total_k > 0)
     {
@@ -250,7 +256,7 @@ void fmha_bwd_bf16_opus_bwd(at::Tensor& q,
         a.stride_dk_h = static_cast<int>(dk.stride(1));
         a.stride_dv_n = static_cast<int>(dv.stride(0));
         a.stride_dv_h = static_cast<int>(dv.stride(1));
-        a.n_kv_blocks = (max_seqlen_k + BK - 1) / BK;
+        a.n_kv_blocks = static_cast<int>((len_k + BK - 1) / BK);
     }
     unsigned int grid[3];
     TORCH_CHECK(fmha_bwd_d192_v128_grid(a, share, grid), "too many sequences or blocks");

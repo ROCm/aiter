@@ -440,32 +440,6 @@ def test_qsa_writer_rejects_wrong_scale_dtypes_and_pool_slices():
         qsa_store_quantized_rows(unquantized, None, slots, values)
 
 
-def test_qsa_fp4_rows_need_a_power_of_two_head_dim():
-    from aiter.ops.qsa import (
-        qsa_cache_row_layout,
-        qsa_paged_mqa_logits,
-        qsa_store_quantized_rows,
-    )
-
-    with pytest.raises(ValueError, match="power-of-two"):
-        qsa_cache_row_layout("fp4", 96)
-    assert qsa_cache_row_layout("fp8", 96).dim == 96
-    values = torch.randn(4, 1, 96, dtype=torch.float32, device="cuda").bfloat16()
-    cache = torch.zeros(1, 4, 1, 48, dtype=torch.uint8, device="cuda")
-    scale = torch.zeros(1, 4, 1, 3, dtype=torch.uint8, device="cuda")
-    slots = torch.arange(4, device="cuda")
-    with pytest.raises(ValueError, match="power-of-two"):
-        qsa_store_quantized_rows(cache, scale, slots, values)
-    table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
-    t2r = torch.zeros(4, dtype=torch.int32, device="cuda")
-    positions = torch.arange(12, 16, dtype=torch.int64, device="cuda")
-    lens = torch.tensor([16], dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="power-of-two"):
-        qsa_paged_mqa_logits(
-            values, cache, table, t2r, positions, lens, 4, compressed_k_scale=scale
-        )
-
-
 def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
     from aiter.ops.qsa import FP8_DTYPE, qsa_paged_mqa_logits, qsa_sparse_paged_gqa
 

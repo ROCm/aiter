@@ -7,9 +7,20 @@ import functools
 import torch
 
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
 
+@aot_factory(
+    "mxfp4_moe_gemm1",
+    sources=[
+        "kernels/mxfp4_gemm1.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/act.py",
+        "kernels/dpp_utils.py",
+        "kernels/layout_utils.py",
+    ],
+)
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
     BM,
