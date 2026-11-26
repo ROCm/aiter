@@ -183,6 +183,10 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
         "reuse_v3_nb2": lambda o: reuse(
             o, *args, tile_rows=8, impl="v3", nvfp4_buffers=2, v3={"min_ctas": 0}, **kv
         ),
+        # a 3-slot B ring (each wave stages two quarters ahead)
+        "reuse_v3_bb3": lambda o: reuse(
+            o, *args, tile_rows=8, impl="v3", v3={"min_ctas": 0, "nb_b": 3}, **kv
+        ),
         "reuse_v3_kvrev": lambda o: reuse(
             o, *args_rev, tile_rows=8, impl="v3", v3={"min_ctas": 0}, **kv
         ),

@@ -30,8 +30,11 @@ goes to one of two phases, by how many waves select it:
 
 Each wave walks a list of (page, quarter) items from LDS, A's in one loop and
 B's in a second; the page step on a quarter is v2's (rows paired when both
-selected the page, the query terms in VGPRs). A row has one owner, so the
-epilogue scales and stores without a cross-wave merge.
+selected the page, the query terms in VGPRs). The walk reads its metadata a
+step ahead (the next item's word, the ring entry an A page stages, the page's
+V planes before its barrier), so no LDS latency sits between a step's start
+and its first DMA or WMMA. A row has one owner, so the epilogue scales and
+stores without a cross-wave merge.
 
 Numerics are v2's per (row, page); a row's pages are accumulated in A-then-B
 order, so the result matches v2 to rounding. BF16 output only: the wrapper
@@ -127,8 +130,8 @@ def _layout_v3(tq, nb_a, nb_b):
     # A wave's items: at most one a page it does not select (an A page's
     # barrier) plus four quarters a page its rows select.
     per_wave = entries + QUARTERS * TOPK * (tq // NWARP)
-    # + 16: the loop reads an item with the one it stages, past the last.
-    total = items + NWARP * per_wave * 8 + 16
+    # + 32: the walk reads up to three items past the last.
+    total = items + NWARP * per_wave * 8 + 32
     return {
         "vbuf": vbuf,
         "keys": keys,
@@ -184,6 +187,10 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     """
     tq, nb_a, nb_b = int(tile_rows), int(nvfp4_buffers), int(nb_b)
     share_min, dbg = int(share_min), int(dbg)
+    # A page's V planes are published at the previous page's first barrier
+    # (its V reads then precede its own): page idx's DMA must be issued two
+    # pages ahead, i.e. a CTA ring of 3.
+    early_v = nb_a == 3
     if tq not in TILE_ROWS:
         raise ValueError(f"tile_rows must be one of {TILE_ROWS}")
     if nb_a not in (2, 3) or nb_b not in (2, 3):
@@ -211,6 +218,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     # B slot plane offsets: a folded pair's lower-addressed plane takes the
     # pair's first plane.
     fold = tdm_fold or "--"
+    b_dmas = sum(1 if lead != "-" else 2 for lead in fold)
     b_k, b_v = (_PLANE_V, _PLANE_K) if fold[0] == "v" else (_PLANE_K, _PLANE_V)
     b_ks, b_vs = (_PLANE_VS, _PLANE_KS) if fold[1] == "v" else (_PLANE_KS, _PLANE_VS)
     # A name, not lay["total"]: linters read a string in an annotation as a
@@ -523,10 +531,11 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             gap = fx.Int64(fx.ptrtoint(far)) - fx.Int64(fx.ptrtoint(near))
             pairs.append((near, far, gap >> 1))
 
-        def stage_a(i):
+        def stage_a(i, entry=None):
             """Wave w DMAs plane w of A page ``i`` (tokens past the page's
             largest bound zero-filled)."""
-            entry = lds_load(lay["alist"] + i * 8, fx.Int32, 2)
+            if const_expr(entry is None):
+                entry = lds_load(lay["alist"] + i * 8, fx.Int32, 2)
             page, top = uniform(entry[0]), uniform(entry[1])
             base = (i % nb_a) * A_SLOT
             for w, (ptr, plane, row) in enumerate(
@@ -680,17 +689,22 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 dtype=fx.Int32,
             ).bitcast(fx.BFloat16)
 
-        def share_v(idx, k):
+        def v_quarter(idx):
+            """This wave's quarter of A page ``idx``'s V planes."""
+            frame = (idx % nb_a) * A_SLOT
+            return v_private(
+                frame + A_PLANE_V + warp * (_TOKENS * _ROW),
+                frame + A_PLANE_VS + warp * (_TOKENS * _SROW),
+            )
+
+        def share_v(idx, k, v_raw=None):
             """Dequantize quarter ``warp`` of A page ``idx``'s V into the shared
             V (the operands ``v_tile`` gives each wave in the private walk)."""
             if const_expr(dbg == 1):
                 # Debug: no attention math, the shared V included.
                 return
-            frame = (idx % nb_a) * A_SLOT
-            v_raw = v_private(
-                frame + A_PLANE_V + warp * (_TOKENS * _ROW),
-                frame + A_PLANE_VS + warp * (_TOKENS * _SROW),
-            )
+            if const_expr(v_raw is None):
+                v_raw = v_quarter(idx)
             lane_zero = fx.Int64((lane + k) >> 31)
             dst = lay["vbuf"] + warp * V_QUARTER + lane * 16
             for b in range_constexpr(8):
@@ -786,17 +800,56 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             return grp
 
         # ---- the walk: this wave's A items (CTA ring), then its B items ----
-        for k_i, state in range(fx.Int32(0), n_ai, fx.Int32(1), init=initial):
+        # The walk's LDS reads of its own metadata are issued a step ahead: the
+        # next item's word (carried in an SGPR), an A page's ring entry and its
+        # V planes before the page's barrier, a B item's staging (page, word)
+        # an item early. Read when needed, each one's LDS latency stalled the
+        # wave in every step (and the A page's lockstep path).
+        ng = len(initial)
+
+        def item_info(i):
+            return lds_load(items_w + i * 8 + 4, fx.Int32, 1)[0]
+
+        def publish_first():
+            """Page 0's V planes published before the walk (page idx + 1's at
+            page idx's first barrier)."""
+            if n_a > 0:
+                if (warp & 1) != 0:
+                    if n_a > 1:
+                        tdm_ops.tensor_wait(1)
+                    else:
+                        tdm_ops.tensor_wait(0)
+                gpu.barrier()
+
+        a_init = list(initial) + [uniform(item_info(fx.Int32(0)))]
+        if const_expr(early_v and dbg != 3):
+            publish_first()
+
+        for k_i, state in range(fx.Int32(0), n_ai, fx.Int32(1), init=a_init):
             k = fx.Int32(k_i)
-            info = uniform(lds_load(items_w + k * 8 + 4, fx.Int32, 1)[0])
+            st = list(state)
+            info = st[ng]
+            nxt = item_info(k + 1)
             if ((info >> _HEAD_SHIFT) & 1) != 0:
                 idx = (info >> _IDX_SHIFT) & 0x7F
+                a_entry = lds_load(lay["alist"] + (idx + (nb_a - 1)) * 8, fx.Int32, 2)
+                v_early = None
+                if const_expr(early_v):
+                    v_early = v_quarter(idx)
                 # Page idx: this wave's plane landed (only later A pages' DMAs
                 # may be in flight; B's start after the last wait), the barrier
                 # publishes every plane and frees page idx - 1's slot (and the
-                # shared V).
+                # shared V). With early V the V and V-scale waves (1, 3) also
+                # wait for page idx + 1's plane, which the barrier publishes.
                 if const_expr(dbg != 3):
-                    if const_expr(nb_a == 3):
+                    if const_expr(early_v):
+                        if (warp & 1) != 0:
+                            tdm_ops.tensor_wait(0)
+                        elif idx + 1 < n_a:
+                            tdm_ops.tensor_wait(1)
+                        else:
+                            tdm_ops.tensor_wait(0)
+                    elif const_expr(nb_a == 3):
                         if idx + 1 < n_a:
                             tdm_ops.tensor_wait(1)
                         else:
@@ -806,35 +859,46 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 gpu.barrier()
                 if const_expr(dbg != 3):
                     if idx + (nb_a - 1) < n_a:
-                        stage_a(idx + (nb_a - 1))
+                        stage_a(idx + (nb_a - 1), a_entry)
                     if idx + 1 == n_a:
                         stage_b_head()
                 if ((info >> _DQ_SHIFT) & 1) != 0:
-                    share_v(idx, k)
+                    share_v(idx, k, v_early)
                 # Publishes page idx's V quarters.
                 gpu.barrier()
-            grp_a = run_item(list(state), info, k, True)
-            final_a = yield grp_a
+            grp_a = run_item(st[:ng], info, k, True)
+            final_a = yield grp_a + [uniform(nxt)]
 
-        for k_i, state in range(n_ai, n_items, fx.Int32(1), init=list(final_a)):
+        # Item n_ai's word came with the A walk; then (page, word) of the items
+        # the first B step stages ahead.
+        b_init = list(final_a)
+        for j in range_constexpr(1, nb_b):
+            e = lds_load(items_w + (n_ai + j) * 8, fx.Int32, 2)
+            b_init.extend([uniform(e[0]), uniform(e[1])])
+        for k_i, state in range(n_ai, n_items, fx.Int32(1), init=b_init):
             k = fx.Int32(k_i)
-            # Item k and the item it stages (k + nb_b - 1) in one LDS read.
-            entry = lds_load(items_w + k * 8, fx.Int32, 2 * nb_b)
-            info = uniform(entry[1])
+            st = list(state)
+            # Carried: item k's word, then (page, word) of items k + 1 ..
+            # k + nb_b - 1; item k + nb_b is read for the next step.
+            info = st[ng]
+            queue = st[ng + 1 :]
+            nxt = lds_load(items_w + (k + nb_b) * 8, fx.Int32, 2)
             if const_expr(dbg != 3):
-                # Four DMAs an item: item k is done when at most the later
-                # in-flight items' remain.
+                # Item k is done when at most the later in-flight item's DMAs
+                # (one a folded pair, two an unfolded one) remain.
                 if const_expr(nb_b == 3):
                     if k + 1 < n_items:
-                        tdm_ops.tensor_wait(4)
+                        tdm_ops.tensor_wait(b_dmas)
                     else:
                         tdm_ops.tensor_wait(0)
                 else:
                     tdm_ops.tensor_wait(0)
                 if k + (nb_b - 1) < n_items:
-                    stage_b(uniform(entry[2 * nb_b - 2]), uniform(entry[2 * nb_b - 1]))
-            grp_b = run_item(list(state), info, k, False)
-            final = yield grp_b
+                    stage_b(queue[-2], queue[-1])
+            grp_b = run_item(st[:ng], info, k, False)
+            final = yield (
+                grp_b + queue[1:2] + queue[2:] + [uniform(nxt[0]), uniform(nxt[1])]
+            )
 
         # ---- epilogue: one owner a row, no merge ----
         tdm_ops.tensor_wait(0)
