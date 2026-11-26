@@ -38,6 +38,10 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+# Opus multi-phase sort (>= 2048 tokens) with its expert-scatter phase split by
+# token chunk (dispatch_policy 3): same outputs byte for byte, no single CTA
+# walking a hot expert's routes. On by default; 0 keeps dispatch_policy 0.
+_MOE_SORT_P23_SPLIT = os.environ.get("AITER_MOE_SORT_P23_SPLIT", "1") == "1"
 
 AUX_SORT_OPUS = "opus"
 
@@ -298,6 +302,8 @@ def _moe_sorting_impl(
         )
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
+    if use_opus and dispatch_policy == 0 and _MOE_SORT_P23_SPLIT:
+        dispatch_policy = 3
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
