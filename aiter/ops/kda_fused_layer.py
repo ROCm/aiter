@@ -32,6 +32,7 @@ One KDA layer, token-major (packed varlen through ``cu_seqlens``):
   gate stages). Unregistered or unsupported stages fall back to PyTorch.
 """
 
+import contextlib
 import inspect
 import itertools
 import os
@@ -907,14 +908,15 @@ class MXFP8ProjGemm:
         from aiter.ops.mxfp8_linear import (
             mxfp8_fastpath,
             mxfp8_mm,
-            mxfp8_weight_reuse_active,
+            mxfp8_weight_reuse,
         )
 
         # quantized-operand cache: the layer input X is reused, rowwise by every
-        # fprop and columnwise by every wgrad; weights only when asked to
-        # (inside mxfp8_weight_reuse(): one fp8 copy per weight and layout)
-        weights = mxfp8_weight_reuse_active()
-        wa = _weight_anchor(w) if weights and kind != "wgrad" else None
+        # fprop and columnwise by every wgrad, within the call; weight operands
+        # across calls only under is_first_microbatch True / False (TE), one
+        # fp8 copy per weight and layout, dropped by invalidate_weight_caches
+        reuse = kda_weight_reuse()
+        wa = _weight_anchor(w) if reuse and kind != "wgrad" else None
         anchors = {
             "fwd": (a, 1, wa, 1, True),
             "dgrad": (None, 1, wa, 0, True),
@@ -927,7 +929,8 @@ class MXFP8ProjGemm:
         lhs = a.t() if kind == "wgrad" else a
         rhs = w.t() if kind == "fwd" else w
         out16 = kind != "wgrad"
-        out = mxfp8_mm(lhs, rhs, out16=out16, anchors=anchors, round_to=round_to)
+        with mxfp8_weight_reuse() if reuse else contextlib.nullcontext():
+            out = mxfp8_mm(lhs, rhs, out16=out16, anchors=anchors, round_to=round_to)
         return out if out16 and out16_ok and mxfp8_fastpath() else out.float()
 
     def __call__(self, a, w, *, kind, cd, epilogue=None, name=None, ops=None, **epi):
@@ -1193,26 +1196,100 @@ class _CachedCat(torch.autograd.Function):
         return (None,) + tuple(p.to(dt) for p, dt in zip(g.split(ctx.rows), ctx.dtypes))
 
 
-def cached_weight_cat(srcs, dtype):
-    """``torch.cat(srcs).to(dtype)``, cached across calls.
+_WEIGHT_CACHE_MODE = None
+_INVALIDATE_HOOKS = []
 
-    The key is each source's identity, ``data_ptr`` and ``_version``, so an
-    in-place optimizer step or a new parameter rebuilds it. Under grad mode
-    the gradient is split back to the sources. The result must not be
-    modified in place."""
+
+@contextlib.contextmanager
+def _weight_cache_mode(is_first_microbatch):
+    global _WEIGHT_CACHE_MODE
+    prev, _WEIGHT_CACHE_MODE = _WEIGHT_CACHE_MODE, is_first_microbatch
+    try:
+        yield
+    finally:
+        _WEIGHT_CACHE_MODE = prev
+
+
+def kda_weight_reuse():
+    """True while a KDA call with ``is_first_microbatch`` True/False runs (its
+    forward and its backward): derived weights may be cached across calls.
+    False for ``is_first_microbatch=None``: build them per call."""
+    return _WEIGHT_CACHE_MODE is not None
+
+
+def register_weight_cache_invalidator(fn):
+    """``fn(weights, anchors)`` runs on every ``invalidate_weight_caches``:
+    ``weights`` as passed (None means everything), ``anchors`` the dropped
+    ``cached_weight_cat`` results (w_qkv / w_all / conv_qkv) of those weights,
+    e.g. for a cache of quantized weights keyed on them."""
+    _INVALIDATE_HOOKS.append(fn)
+    return fn
+
+
+def invalidate_weight_caches(weights=None):
+    """Drop cached derived weights (concatenations, and those of registered
+    hooks) built from ``weights`` (a KDALayerWeights or tensors), or all of
+    them. Needed after an update that keeps ``data_ptr`` and ``_version``
+    (``p.data.copy_``, a distributed optimizer's shared buffer) when calls
+    pass ``is_first_microbatch=False``."""
+    if weights is None:
+        drop = list(_WEIGHT_CAT_CACHE)
+    else:
+        ts = weights.tensors() if hasattr(weights, "tensors") else weights
+        ids = {id(t) for t in ts if t is not None}
+        drop = [
+            k
+            for k, (refs, _, _) in _WEIGHT_CAT_CACHE.items()
+            if any(id(r()) in ids for r in refs)
+        ]
+    anchors = [_WEIGHT_CAT_CACHE.pop(k)[1] for k in drop]
+    for fn in _INVALIDATE_HOOKS:
+        fn(weights, anchors)
+
+
+def _drop_mxfp8_weight_operands(weights, anchors):
+    """``invalidate_weight_caches`` hook: forget the quantized MXFP8 operands of
+    those weights and of their dropped concatenations (all when None)."""
+    from aiter.ops.mxfp8_linear import drop_weight_cache
+
+    if weights is None:
+        drop_weight_cache()
+        return
+    ts = weights.tensors() if hasattr(weights, "tensors") else weights
+    drop_weight_cache([t for t in ts if t is not None] + list(anchors))
+
+
+register_weight_cache_invalidator(_drop_mxfp8_weight_operands)
+
+
+def cached_weight_cat(srcs, dtype):
+    """``torch.cat(srcs).to(dtype)`` with Transformer Engine's
+    ``is_first_microbatch`` semantics (set by ``kda_layer_fwd``/``_bwd``):
+    None builds it fresh, True rebuilds and caches it, False reuses the
+    cached copy. An optimizer update through ``p.data.copy_`` or a shared
+    buffer is invisible to the cache, so pass True on the first microbatch
+    after a step (or call ``invalidate_weight_caches``). Under grad mode the
+    gradient is split back to the sources. Do not modify the result in place.
+    """
+    mode = _WEIGHT_CACHE_MODE
     key = (dtype,) + tuple(
-        (t.data_ptr(), t._version, tuple(t.shape), t.stride(), t.dtype, t.device)
-        for t in srcs
+        (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device) for t in srcs
     )
-    hit = _WEIGHT_CAT_CACHE.get(key)
-    if hit is not None and all(r() is t for r, t in zip(hit[0], srcs)):
+    versions = tuple(t._version for t in srcs)
+    hit = _WEIGHT_CAT_CACHE.get(key) if mode is False else None
+    if (
+        hit is not None
+        and hit[2] == versions
+        and all(r() is t for r, t in zip(hit[0], srcs))
+    ):
         cat = hit[1]
     else:
         with torch.no_grad():
             cat = torch.cat([t.detach() for t in srcs]).to(dtype)
-        if len(_WEIGHT_CAT_CACHE) >= _WEIGHT_CAT_CACHE_MAX:
-            _WEIGHT_CAT_CACHE.clear()
-        _WEIGHT_CAT_CACHE[key] = ([weakref.ref(t) for t in srcs], cat)
+        if mode is not None:
+            if len(_WEIGHT_CAT_CACHE) >= _WEIGHT_CAT_CACHE_MAX:
+                _WEIGHT_CAT_CACHE.clear()
+            _WEIGHT_CAT_CACHE[key] = ([weakref.ref(t) for t in srcs], cat, versions)
     if torch.is_grad_enabled() and any(t.requires_grad for t in srcs):
         return _CachedCat.apply(cat, *srcs)
     return cat
@@ -1222,7 +1299,8 @@ def _weight_anchor(t):
     """The ``cached_weight_cat`` tensor ``t`` aliases (under grad mode the cat
     comes back as a new alias of the cached tensor), else ``t``: a stable
     identity for caches keyed by weight tensors."""
-    for _, cat in _WEIGHT_CAT_CACHE.values():
+    for entry in _WEIGHT_CAT_CACHE.values():
+        cat = entry[1]
         if (
             cat.data_ptr() == t.data_ptr()
             and cat.shape == t.shape
@@ -1645,7 +1723,18 @@ def _kda_layer_fused_bwd(
 
 class _KDALayerFused(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *ws):
+    def forward(
+        ctx, x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, first_mb, *ws
+    ):
+        with _weight_cache_mode(first_mb):
+            return _KDALayerFused._forward(
+                ctx, x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *ws
+            )
+
+    @staticmethod
+    def _forward(ctx, x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *ws):
+        # the backward reuses what this forward built, if it cached anything
+        ctx.cache_mode = None if _WEIGHT_CACHE_MODE is None else False
         ctx.save_for_backward(x, *ws)
         ctx.cfg = (num_heads, chunk_size, eps)
         ctx.lower_bound, ctx.cu_seqlens = lower_bound, cu_seqlens
@@ -1676,7 +1765,9 @@ class _KDALayerFused(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         x, *ws = ctx.saved_tensors
-        with _GemmPrecisionScope(ctx.gemm_precision, x):
+        with _GemmPrecisionScope(ctx.gemm_precision, x), _weight_cache_mode(
+            ctx.cache_mode
+        ):
             dx, dw = _kda_layer_fused_bwd(
                 dy,
                 x,
@@ -1688,7 +1779,7 @@ class _KDALayerFused(torch.autograd.Function):
                 saved=ctx.saved_state,
             )
         ctx.saved_state = None
-        return (dx, None, None, None, None, None, *dw.tensors())
+        return (dx, None, None, None, None, None, None, *dw.tensors())
 
 
 def _segments(x, cu_seqlens):
@@ -1712,9 +1803,17 @@ def kda_layer_fwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    is_first_microbatch=None,
     gemm_precision=None,
 ):
     """x: [B,T,D] -> y: [B,T,D]. Differentiable for both backends.
+
+    ``is_first_microbatch`` follows Transformer Engine for the derived weights
+    the fused backend caches (``cached_weight_cat``): None builds them per
+    call, True rebuilds and caches them (first microbatch after an optimizer
+    step; it first calls ``invalidate_weight_caches(w)``), False reuses them
+    (later microbatches of the same step). ``kda_weight_reuse()`` reports
+    which applies during the call's forward and backward.
 
     ``lower_bound`` (e.g. Kimi-K3 ``gate_lower_bound=-5``) selects the safe gate
     ``lower_bound * sigmoid(exp(A_log) * z)``.
@@ -1730,7 +1829,15 @@ def kda_layer_fwd(
     """
     with _GemmPrecisionScope(gemm_precision, x):
         return _kda_layer_fwd(
-            x, w, num_heads, chunk_size, eps, backend, cu_seqlens, lower_bound
+            x,
+            w,
+            num_heads,
+            chunk_size,
+            eps,
+            backend,
+            cu_seqlens,
+            lower_bound,
+            is_first_microbatch,
         )
 
 
@@ -1743,13 +1850,23 @@ def _kda_layer_fwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    is_first_microbatch=None,
 ):
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
     if backend == "fused":
+        if is_first_microbatch:
+            invalidate_weight_caches(w)
         return _KDALayerFused.apply(
-            x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *w.tensors()
+            x,
+            num_heads,
+            chunk_size,
+            eps,
+            lower_bound,
+            cu_seqlens,
+            is_first_microbatch,
+            *w.tensors(),
         )
     if segments is not None:
         return torch.cat(
@@ -1774,6 +1891,7 @@ def kda_layer_bwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    is_first_microbatch=None,
     gemm_precision=None,
 ):
     """Backward of one KDA layer.
@@ -1781,12 +1899,22 @@ def kda_layer_bwd(
     Returns (dx, dw) where dw is a KDALayerWeights holding the gradient of every
     weight (q/k/v proj, short conv, F-decay low-rank gate + A_log/dt_bias, beta
     proj, output gate proj, norm weight, output proj). The forward is recomputed.
-    ``cu_seqlens`` and ``gemm_precision`` as in ``kda_layer_fwd``; weight
+    ``cu_seqlens``, ``is_first_microbatch`` and ``gemm_precision`` as in
+    ``kda_layer_fwd``; weight
     gradients sum over sequences.
     """
     with _GemmPrecisionScope(gemm_precision, x):
         return _kda_layer_bwd(
-            dy, x, w, num_heads, chunk_size, eps, backend, cu_seqlens, lower_bound
+            dy,
+            x,
+            w,
+            num_heads,
+            chunk_size,
+            eps,
+            backend,
+            cu_seqlens,
+            lower_bound,
+            is_first_microbatch,
         )
 
 
@@ -1800,22 +1928,26 @@ def _kda_layer_bwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    is_first_microbatch=None,
 ):
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
     if backend == "fused":
-        return _kda_layer_fused_bwd(
-            dy,
-            x,
-            w,
-            num_heads,
-            chunk_size,
-            eps,
-            _row_ops(x),
-            lower_bound,
-            cu_seqlens if segments is not None else None,
-        )
+        if is_first_microbatch:
+            invalidate_weight_caches(w)
+        with _weight_cache_mode(is_first_microbatch):
+            return _kda_layer_fused_bwd(
+                dy,
+                x,
+                w,
+                num_heads,
+                chunk_size,
+                eps,
+                _row_ops(x),
+                lower_bound,
+                cu_seqlens if segments is not None else None,
+            )
     if segments is not None:
         dxs, dw = [], None
         for s, e in segments:

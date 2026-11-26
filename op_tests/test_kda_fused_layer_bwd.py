@@ -952,6 +952,141 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     return ret
 
 
+def test_kda_mxfp8_weight_cache(concat_proj=False):
+    """gemm_precision="mxfp8" keeps quantized weight operands across calls only
+    under is_first_microbatch True / False, drops them in
+    invalidate_weight_caches, and matches the uncached path bit for bit.
+    Asserts on CPU or GPU."""
+    D, H, K, W, R, T = 128, 2, 64, 4, 16, 40
+    saved = dict(kda_fused_layer._fusion_overrides)
+    kda_fused_layer.set_kda_fusions(concat_proj=concat_proj)
+    try:
+        x = torch.randn(1, T, D).to(dtypes.bf16)
+        dy = torch.randn(1, T, D).to(dtypes.bf16)
+        w = make_weights(D, H, K, W, R, dtypes.bf16)
+
+        def run(first):
+            kw = {"backend": "fused", "is_first_microbatch": first}
+            kw["gemm_precision"] = "mxfp8"
+            y = kda_layer_fwd(x, w, H, **kw)
+            dx, dw = kda_layer_bwd(dy, x, w, H, **kw)
+            return [y, dx, *dw.tensors()]
+
+        def same(a, b):
+            return all(torch.equal(p, q) for p, q in zip(a, b))
+
+        cached = mxfp8_linear.mxfp8_weight_cache_bytes
+        kda_fused_layer.invalidate_weight_caches()
+        base = run(None)
+        assert cached() == 0, "is_first_microbatch=None kept weight operands"
+        assert same(run(True), base) and cached() > 0, "True: not built or differs"
+        assert same(run(False), base), "False: reuse differs"
+        names = ("w_q", "w_k", "w_v", "f_a", "f_b", "w_beta", "g_proj", "w_o")
+        for n in names:  # an update the version counter does not see
+            getattr(w, n).data.copy_(getattr(w, n) * 0.5)
+        want = run(None)
+        kda_fused_layer.invalidate_weight_caches(w)
+        assert cached() == 0, "invalidate_weight_caches kept MXFP8 operands"
+        assert same(run(False), want), "False after invalidation: stale weights"
+        assert same(run(True), want), "True: stale weights"
+    finally:
+        kda_fused_layer._fusion_overrides.clear()
+        kda_fused_layer._fusion_overrides.update(saved)
+        kda_fused_layer.invalidate_weight_caches()
+
+
+def test_kda_weight_cache_update(dtype=torch.float32, concat_proj=False):
+    """Optimizer updates that keep data_ptr and _version (p.data.copy_, a
+    distributed optimizer's shared flat buffer) must reach the next call:
+    is_first_microbatch None always rebuilds, True rebuilds, and False reuses
+    until invalidate_weight_caches. Asserts on CPU or GPU."""
+    D, H, K, W, R = 128, 2, 64, 4, 16
+    T, saved = 40, dict(kda_fused_layer._fusion_overrides)
+    kda_fused_layer.set_kda_fusions(concat_proj=concat_proj)
+    seen = []
+
+    def hook(weights, anchors):
+        seen.append((weights, len(anchors)))
+        assert all(isinstance(a, torch.Tensor) for a in anchors)
+
+    def reuse_probe(*a, **k):
+        reuse.append(kda_fused_layer.kda_weight_reuse())
+        return NotImplemented
+
+    reuse = []
+    kda_fused_layer.register_weight_cache_invalidator(hook)
+    prev_gemm = kda_fused_layer._proj_gemm_hook
+    kda_fused_layer.register_proj_gemm(reuse_probe)
+    try:
+        x = torch.randn(1, T, D).to(dtype)
+        dy = torch.randn(1, T, D).to(dtype)
+
+        def run(w, first):
+            y = kda_fused_layer.kda_layer_fwd(
+                x, w, H, backend="fused", is_first_microbatch=first
+            )
+            dx, dw = kda_fused_layer.kda_layer_bwd(
+                dy, x, w, H, backend="fused", is_first_microbatch=first
+            )
+            return [y, dx, *dw.tensors()]
+
+        def same(a, b):
+            return all(torch.equal(p, q) for p, q in zip(a, b))
+
+        names = ("w_q", "w_k", "w_v", "conv_q", "f_a", "w_beta", "g_proj")
+        for how in ("copy_", "buffer"):
+            kda_fused_layer.invalidate_weight_caches()
+            w = make_weights(D, H, K, W, R, dtype)
+            if how == "buffer":
+                ps = [getattr(w, n) for n in names]
+                buf = torch.cat([p.detach().reshape(-1).float() for p in ps])
+                off = 0
+                for p in ps:
+                    view = buf[off : off + p.numel()].view(p.shape)
+                    assert p.dtype == buf.dtype, "shared-buffer case needs fp32 weights"
+                    p.data = view
+                    off += p.numel()
+            new = {n: torch.randn_like(getattr(w, n)) for n in names}
+            fresh = kda_fused_layer.KDALayerWeights.from_tensors(
+                [t.clone() for t in w.tensors()]
+            )
+            for n in names:
+                getattr(fresh, n).data.copy_(new[n])
+            want = run(fresh, None)
+
+            reuse.clear()
+            run(w, None)
+            assert reuse and not any(reuse), f"{how}: kda_weight_reuse under None"
+            seen.clear()
+            reuse.clear()
+            old = run(w, True)
+            assert reuse and all(reuse), f"{how}: kda_weight_reuse under True"
+            assert seen and seen[0][0] is w, f"{how}: True did not invalidate w"
+            assert same(run(w, False), old), f"{how}: False did not reuse"
+            if how == "copy_":
+                for n in names:
+                    getattr(w, n).data.copy_(new[n])
+            else:
+                buf.copy_(torch.cat([new[n].reshape(-1).float() for n in names]))
+            assert same(run(w, None), want), f"{how}: None used stale weights"
+            assert same(run(w, True), want), f"{how}: True used stale weights"
+            for n in names:
+                getattr(w, n).data.copy_(getattr(w, n) * 0.5)
+            kda_fused_layer.invalidate_weight_caches(w)
+            got = run(w, False)
+            for n in names:
+                getattr(fresh, n).data.copy_(getattr(w, n))
+            assert same(
+                got, run(fresh, None)
+            ), f"{how}: False after invalidate_weight_caches used stale weights"
+    finally:
+        kda_fused_layer._fusion_overrides.clear()
+        kda_fused_layer._fusion_overrides.update(saved)
+        kda_fused_layer._INVALIDATE_HOOKS.remove(hook)
+        kda_fused_layer.register_proj_gemm(prev_gemm)
+        kda_fused_layer.invalidate_weight_caches()
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -1041,6 +1176,9 @@ def main():
             f"unknown -p pieces {sorted(unknown)}; "
             f"expected {sorted(kda_fused_layer.KDA_PIECE_DEFAULTS)}"
         )
+    for concat_proj in (False, True):
+        test_kda_weight_cache_update(torch.float32, concat_proj)
+        test_kda_mxfp8_weight_cache(concat_proj)
 
     def summarize(title, rows, axes):
         if not rows:
