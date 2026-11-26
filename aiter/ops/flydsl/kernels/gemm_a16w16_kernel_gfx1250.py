@@ -788,47 +788,13 @@ def compile_gemm_a16w16(
             rocdl.sched_barrier(0)
         epilogue_stores(accs)
 
-    @flyc.jit
-    def launch_gemm_a16w16(
-        arg_y: fx.Pointer,
-        arg_x: fx.Pointer,
-        arg_w: fx.Pointer,
-        arg_bias: fx.Pointer,
-        arg_ws: fx.Pointer,
-        arg_sem: fx.Pointer,
-        i32_m: fx.Int32,
-        i32_ldy: fx.Int32,
-        i32_lda: fx.Int32,
-        i32_ldb: fx.Int32,
-        arg_v: fx.Pointer,
-        arg_rope: fx.Pointer,
-        i32_k_head_stride: fx.Int32,
-        i32_v_row_stride: fx.Int32,
-        i32_v_head_stride: fx.Int32,
-        i32_rope_row_stride: fx.Int32,
-        stream: fx.Stream,
-    ):
-        gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
+    def _launch(stream, *args):  # args: kernel_gemm_a16w16's, args[6] is i32_m
+        gx = (fx.Uint64(args[6]) + (tile_m - 1)) // tile_m
         gy = (N + tile_n - 1) // tile_n
 
         wpe = int(waves_per_eu) if waves_per_eu is not None else 0
         launcher = kernel_gemm_a16w16(
-            arg_y,
-            arg_x,
-            arg_w,
-            arg_bias,
-            arg_ws,
-            arg_sem,
-            i32_m,
-            i32_ldy,
-            i32_lda,
-            i32_ldb,
-            arg_v,
-            arg_rope,
-            i32_k_head_stride,
-            i32_v_row_stride,
-            i32_v_head_stride,
-            i32_rope_row_stride,
+            *args,
             value_attrs={
                 "rocdl.flat_work_group_size": f"{block_threads},{block_threads}",
                 "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
@@ -838,6 +804,82 @@ def compile_gemm_a16w16(
         launcher.launch(
             grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
         )
+
+    # Two signatures, so the default path takes no split-cat host arguments.
+    if split_cat is None:
+
+        @flyc.jit
+        def launch_gemm_a16w16(
+            arg_y: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_ws: fx.Pointer,
+            arg_sem: fx.Pointer,
+            i32_m: fx.Int32,
+            i32_ldy: fx.Int32,
+            i32_lda: fx.Int32,
+            i32_ldb: fx.Int32,
+            stream: fx.Stream,
+        ):
+            # The kernel does not read the split-cat arguments: pass Y's.
+            unread = (arg_y, arg_y, i32_ldy, i32_ldy, i32_ldy, i32_ldy)
+            _launch(
+                stream,
+                arg_y,
+                arg_x,
+                arg_w,
+                arg_bias,
+                arg_ws,
+                arg_sem,
+                i32_m,
+                i32_ldy,
+                i32_lda,
+                i32_ldb,
+                *unread,
+            )
+
+    else:
+
+        @flyc.jit
+        def launch_gemm_a16w16(
+            arg_y: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_ws: fx.Pointer,
+            arg_sem: fx.Pointer,
+            i32_m: fx.Int32,
+            i32_ldy: fx.Int32,
+            i32_lda: fx.Int32,
+            i32_ldb: fx.Int32,
+            arg_v: fx.Pointer,
+            arg_rope: fx.Pointer,
+            i32_k_head_stride: fx.Int32,
+            i32_v_row_stride: fx.Int32,
+            i32_v_head_stride: fx.Int32,
+            i32_rope_row_stride: fx.Int32,
+            stream: fx.Stream,
+        ):
+            _launch(
+                stream,
+                arg_y,
+                arg_x,
+                arg_w,
+                arg_bias,
+                arg_ws,
+                arg_sem,
+                i32_m,
+                i32_ldy,
+                i32_lda,
+                i32_ldb,
+                arg_v,
+                arg_rope,
+                i32_k_head_stride,
+                i32_v_row_stride,
+                i32_v_head_stride,
+                i32_rope_row_stride,
+            )
 
     _llvm_opts = {
         "amdgpu-expert-scheduling-mode": True,

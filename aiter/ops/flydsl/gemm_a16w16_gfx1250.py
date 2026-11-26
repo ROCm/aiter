@@ -141,7 +141,7 @@ def gemm_a16w16(
     in_dtype_str = "fp16" if x.dtype == torch.float16 else "bf16"
     out_dtype_str = {torch.float16: "f16", torch.bfloat16: "bf16"}.get(dtype, "f32")
 
-    split_cat = None
+    split_cat, split_cat_args = None, ()
     if split_sizes is not None:
         # The kernel stores K through Y and takes V and k_rope as extra arguments.
         k_size, v_size = split_sizes
@@ -233,12 +233,9 @@ def gemm_a16w16(
         ldb = w.stride(1) if K > 1 else N
     else:
         ldb = w.stride(0) if N > 1 else K
-    y_ptr = _p(y_buf)
-    if split_cat is None:  # the kernel does not read these
-        split_cat_args = (y_ptr, y_ptr, 0, 0, 0, 0)
     _run_compiled(
         launch_fn,
-        y_ptr,
+        _p(y_buf),
         _p(x),
         _p(w),
         _p(bias),
