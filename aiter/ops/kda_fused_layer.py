@@ -29,6 +29,7 @@ One KDA layer, token-major (packed varlen is not supported yet):
   gate stages). Unregistered or unsupported stages fall back to PyTorch.
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 
@@ -256,31 +257,158 @@ def chunk_kda_bwd_torch(
     return (*grads[:5], *(grads[5:] or (None, None)))
 
 
-# Which optional kernel served each stage in the latest fused call.
+# Which implementation served each stage in the latest fused call.
 LAST_PIECES: dict = {}
-_auto_registered = False
+
+# Stages with both Triton and FlyDSL kernels default to Triton; FlyDSL is used
+# only when selected (``set_kda_pieces`` or ``AITER_KDA_PIECES``, e.g.
+# ``chunk_fwd=flydsl,conv_bwd=torch``). A missing or rejecting kernel falls
+# back to the next choice: flydsl -> triton -> torch, triton -> torch.
+KDA_PIECE_DEFAULTS = {
+    "chunk_fwd": "triton",
+    "chunk_bwd": "triton",
+    "conv_bwd": "triton",
+}
+KDA_PIECE_CHOICES = ("triton", "flydsl", "torch")
+_piece_overrides: dict = {}
+
+
+def set_kda_pieces(**choices):
+    """Select the implementation per stage, e.g. ``set_kda_pieces(chunk_bwd="flydsl")``.
+
+    ``None`` drops an override (back to the environment / default).
+    """
+    for name, choice in choices.items():
+        if name not in KDA_PIECE_DEFAULTS:
+            raise ValueError(
+                f"unknown KDA piece {name!r}, expected {sorted(KDA_PIECE_DEFAULTS)}"
+            )
+        if choice is None:
+            _piece_overrides.pop(name, None)
+        elif choice not in KDA_PIECE_CHOICES:
+            raise ValueError(f"{name}={choice!r}, expected one of {KDA_PIECE_CHOICES}")
+        else:
+            _piece_overrides[name] = choice
+
+
+def kda_piece_choices():
+    """Current selection: overrides, then ``AITER_KDA_PIECES``, then defaults."""
+    out = dict(KDA_PIECE_DEFAULTS)
+    for item in filter(None, os.environ.get("AITER_KDA_PIECES", "").split(",")):
+        name, _, choice = item.strip().partition("=")
+        if name in out and choice in KDA_PIECE_CHOICES:
+            out[name] = choice
+    out.update(_piece_overrides)
+    return out
+
+
+def _fallback_order(choice):
+    return {"flydsl": ("flydsl", "triton", "torch"), "triton": ("triton", "torch")}.get(
+        choice, ("torch",)
+    )
+
+
+def _chunk_fwd_triton():
+    from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+    def run(q, k, v, g, beta, scale, chunk_size):
+        bf = torch.bfloat16
+        o, _ = chunk_kimi_delta_attn(
+            q.to(bf), k.to(bf), v.to(bf), g, beta, scale=scale, chunk_size=chunk_size
+        )
+        return o.float()
+
+    return run
+
+
+def _chunk_fwd_flydsl():
+    from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
+
+    def run(q, k, v, g, beta, scale, chunk_size):
+        bf = torch.bfloat16
+        o, _ = chunk_kda_fwd_flydsl(
+            q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size
+        )
+        return o.float()
+
+    return run
+
+
+def _chunk_bwd_triton():
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_bwd import (
+        chunk_delta_attn_bwd,
+    )
+
+    def run(do, q, k, v, g, beta, scale, chunk_size, **kw):
+        dtypes_in = [t.dtype for t in (q, k, v, g, beta)]
+        q, k, v, do = (t.to(torch.bfloat16).contiguous() for t in (q, k, v, do))
+        out = chunk_delta_attn_bwd(
+            do,
+            None,
+            q,
+            k,
+            v,
+            g.contiguous(),
+            beta.contiguous(),
+            scale,
+            chunk_size=chunk_size,
+            **kw,
+        )
+        grads = [t.to(dt) for t, dt in zip(out[:5], dtypes_in)]
+        return (*grads, out[5], out[6])
+
+    return run, CHUNK_BWD_FUSIONS
+
+
+def _chunk_bwd_flydsl():
+    from aiter.ops.flydsl.kda_chunk_bwd import CHUNK_BWD_FUSES, chunk_kda_bwd_flydsl
+
+    return chunk_kda_bwd_flydsl, CHUNK_BWD_FUSES
+
+
+def _conv_bwd_triton():
+    from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_bwd_triton_fn
+
+    return causal_conv1d_split_qkv_bwd_triton_fn
+
+
+def _conv_bwd_flydsl():
+    from aiter.ops.flydsl.causal_conv1d_bwd_flydsl import (
+        causal_conv1d_split_qkv_bwd_flydsl_fn,
+    )
+
+    return causal_conv1d_split_qkv_bwd_flydsl_fn
+
+
+_PIECE_LOADERS = {
+    ("chunk_fwd", "triton"): _chunk_fwd_triton,
+    ("chunk_fwd", "flydsl"): _chunk_fwd_flydsl,
+    ("chunk_bwd", "triton"): _chunk_bwd_triton,
+    ("chunk_bwd", "flydsl"): _chunk_bwd_flydsl,
+    ("conv_bwd", "triton"): _conv_bwd_triton,
+    ("conv_bwd", "flydsl"): _conv_bwd_flydsl,
+}
+
+
+def _resolve(name, on_gpu):
+    """[(backend, impl), ...] to try in order for ``name``; torch is ``None``."""
+    order = _fallback_order(kda_piece_choices()[name]) if on_gpu else ("torch",)
+    found = []
+    for backend in order:
+        if backend == "torch":
+            found.append(("torch", None))
+            continue
+        try:
+            found.append((backend, _PIECE_LOADERS[(name, backend)]()))
+        except ImportError:
+            pass
+    return found
 
 
 def _conv_bwd_kernel(on_gpu):
-    """The #8726 split-q/k/v conv backward: FlyDSL, else Triton, else None."""
-    if not on_gpu:
-        return None
-    try:
-        from aiter.ops.flydsl.causal_conv1d_bwd_flydsl import (
-            causal_conv1d_split_qkv_bwd_flydsl_fn,
-        )
-
-        return causal_conv1d_split_qkv_bwd_flydsl_fn
-    except ImportError:
-        pass
-    try:
-        from aiter.ops.triton.gated_delta_net import (
-            causal_conv1d_split_qkv_bwd_triton_fn,
-        )
-
-        return causal_conv1d_split_qkv_bwd_triton_fn
-    except ImportError:
-        return None
+    backend, fn = _resolve("conv_bwd", on_gpu)[0]
+    LAST_PIECES["conv_bwd"] = backend
+    return fn
 
 
 def _piece(impl):
@@ -291,33 +419,19 @@ def _piece(impl):
     return module.rsplit(".", 1)[-1]
 
 
-def _auto_register_chunk_bwd(on_gpu):
-    """Register the #8740 FlyDSL chunk backward once, when it is installed."""
-    global _auto_registered
-    if _auto_registered or not on_gpu or _chunk_bwd_impl is not None:
-        return
-    _auto_registered = True
-    try:
-        from aiter.ops.flydsl.kda_chunk_bwd import register_with_kda_layer
-    except ImportError:
-        return
-    register_with_kda_layer()
-
-
 def _chunk_fwd(q, k, v, g, beta, scale, chunk_size):
-    """Chunk forward: the #8744 FlyDSL kernel when it supports the call, else torch."""
-    if q.is_cuda:
+    """Chunk forward by the selected backend; a kernel that rejects the call
+    (``ValueError``) or fails to build falls through to the next choice."""
+    for backend, fn in _resolve("chunk_fwd", q.is_cuda):
+        if fn is None:
+            break
         try:
-            from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
-
-            bf = torch.bfloat16
-            o, _ = chunk_kda_fwd_flydsl(
-                q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size
-            )
-            LAST_PIECES["chunk_fwd"] = "flydsl#8744"
-            return o.float()
-        except (ImportError, ValueError):
-            pass
+            o = fn(q, k, v, g, beta, scale, chunk_size)
+        except (ValueError, NotImplementedError, RuntimeError) as err:
+            LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
+            continue
+        LAST_PIECES["chunk_fwd"] = backend
+        return o
     LAST_PIECES["chunk_fwd"] = "torch"
     return chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
 
@@ -465,7 +579,7 @@ def _kda_layer_fused_fwd(
         if chunk_graph:
             chunk_in = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
             o = chunk_kda_torch(*chunk_in, scale, chunk_size)
-            LAST_PIECES["chunk_fwd"] = "torch"
+            LAST_PIECES["chunk_fwd"] = "torch(autograd)"
         else:
             o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size)
     o_graph = o if chunk_graph else None
@@ -507,17 +621,21 @@ def _kda_layer_fused_fwd(
 
 
 def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
-    _auto_register_chunk_bwd(x.is_cuda)
+    LAST_PIECES.clear()
+    if _chunk_bwd_impl is not None:
+        chunk_impl, fuses = _chunk_bwd_impl, _chunk_bwd_fuses
+        LAST_PIECES["chunk_bwd"] = f"registered:{_piece(chunk_impl)}"
+    else:
+        backend, impl = _resolve("chunk_bwd", x.is_cuda)[0]
+        chunk_impl, fuses = impl if impl is not None else (None, frozenset())
+        LAST_PIECES["chunk_bwd"] = backend
     conv_kernel = _conv_bwd_kernel(x.is_cuda)
     rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
-    LAST_PIECES.clear()
     LAST_PIECES.update(
         proj_gemms=_piece(_proj_ops(x, w)),
         rmsnorm_bwd=_piece(rms_bwd),
-        chunk_bwd=_piece(_chunk_bwd_impl),
-        chunk_bwd_fuses=",".join(sorted(_chunk_bwd_fuses)) or "-",
-        conv_bwd=_piece(conv_kernel),
-        l2norm_bwd="fused" if "qk_l2norm" in _chunk_bwd_fuses else _piece(ops),
+        chunk_bwd_fuses=",".join(sorted(fuses)) or "-",
+        l2norm_bwd="fused" if "qk_l2norm" in fuses else _piece(ops),
     )
     _, s = _kda_layer_fused_fwd(
         x,
@@ -526,7 +644,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
         chunk_size,
         eps,
         conv_graph=conv_kernel is None,
-        chunk_graph=_chunk_bwd_impl is None,
+        chunk_graph=chunk_impl is None,
     )
     B, T, D = x.shape
     xf = s["xf"].reshape(B * T, D)
@@ -540,15 +658,14 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
         dgp, x.reshape(B * T, D), w.g_proj
     )
 
-    if _chunk_bwd_impl is None:
+    if chunk_impl is None:
 
         def chunk_bwd(do, *_, **__):
             grads = torch.autograd.grad(s["o_graph"], s["chunk_in"], do.float())
             return (*grads, None, None)
 
     else:
-        chunk_bwd = _chunk_bwd_impl
-    fuses = _chunk_bwd_fuses
+        chunk_bwd = chunk_impl
     lr = s["lr"].reshape(B * T, -1)
     kw = {}
     q_in, k_in, g_in, b_in = s["q"], s["k"], s["g"], s["beta"]
