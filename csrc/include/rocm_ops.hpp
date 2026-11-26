@@ -1638,6 +1638,54 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
+#define MQA_TOPK_BF16_PYBIND                             \
+    m.def("mqa_topk_bf16_instances",                     \
+          &mqa_topk_bf16_instances,                      \
+          py::arg("device_id"),                          \
+          py::arg("out"));                               \
+    m.def("mqa_topk_bf16_workspace_bytes",               \
+          &mqa_topk_bf16_workspace_bytes,                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("fb_slots"));                          \
+    m.def("mqa_topk_bf16_launch",                        \
+          &mqa_topk_bf16_launch,                         \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("indices"),                            \
+          py::arg("values"),                             \
+          py::arg("workspace"),                          \
+          py::arg("workspace_bytes"),                    \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("topk"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("chunk_keys"),                         \
+          py::arg("fb_slots"),                           \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));                            \
+    m.def("mqa_logits_bf16_launch",                      \
+          &mqa_logits_bf16_launch,                       \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("out"),                                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("chunk_keys"),                         \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));
+
 #define FMHA_FWD_BF16_OPUS_PYBIND                     \
     m.def("fmha_fwd_bf16_opus_fwd",                   \
           &fmha_fwd_bf16_opus_fwd,                    \
