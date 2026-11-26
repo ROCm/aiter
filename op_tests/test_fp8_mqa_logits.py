@@ -22,7 +22,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits as triton_logits
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
@@ -237,7 +237,7 @@ def test_fp8_mqa_logits(s_q, s_k, num_heads, head_dim, clean_logits, window):
         + s_q * s_k * 4  # output
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, (time_fn, grade_fn) in candidates.items():
         _, us = run_perftest(time_fn)
         out = grade_fn()
@@ -278,8 +278,9 @@ def test_fp8_mqa_logits(s_q, s_k, num_heads, head_dim, clean_logits, window):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("fp8_mqa_logits unsupported on %s; skipping", get_gfx())
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("fp8_mqa_logits unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(
