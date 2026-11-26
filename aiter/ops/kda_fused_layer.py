@@ -256,16 +256,70 @@ def chunk_kda_bwd_torch(
     return (*grads[:5], *(grads[5:] or (None, None)))
 
 
+# Which optional kernel served each stage in the latest fused call.
+LAST_PIECES: dict = {}
+_auto_registered = False
+
+
 def _conv_bwd_kernel(on_gpu):
+    """The #8726 split-q/k/v conv backward: FlyDSL, else Triton, else None."""
     if not on_gpu:
         return None
+    try:
+        from aiter.ops.flydsl.causal_conv1d_bwd_flydsl import (
+            causal_conv1d_split_qkv_bwd_flydsl_fn,
+        )
+
+        return causal_conv1d_split_qkv_bwd_flydsl_fn
+    except ImportError:
+        pass
     try:
         from aiter.ops.triton.gated_delta_net import (
             causal_conv1d_split_qkv_bwd_triton_fn,
         )
+
+        return causal_conv1d_split_qkv_bwd_triton_fn
     except ImportError:
         return None
-    return causal_conv1d_split_qkv_bwd_triton_fn
+
+
+def _piece(impl):
+    """Short label of where an optional stage implementation comes from."""
+    module = getattr(impl, "__module__", None) or getattr(impl, "__name__", "")
+    if impl is None or module == __name__:
+        return "torch"
+    return module.rsplit(".", 1)[-1]
+
+
+def _auto_register_chunk_bwd(on_gpu):
+    """Register the #8740 FlyDSL chunk backward once, when it is installed."""
+    global _auto_registered
+    if _auto_registered or not on_gpu or _chunk_bwd_impl is not None:
+        return
+    _auto_registered = True
+    try:
+        from aiter.ops.flydsl.kda_chunk_bwd import register_with_kda_layer
+    except ImportError:
+        return
+    register_with_kda_layer()
+
+
+def _chunk_fwd(q, k, v, g, beta, scale, chunk_size):
+    """Chunk forward: the #8744 FlyDSL kernel when it supports the call, else torch."""
+    if q.is_cuda:
+        try:
+            from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
+
+            bf = torch.bfloat16
+            o, _ = chunk_kda_fwd_flydsl(
+                q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size
+            )
+            LAST_PIECES["chunk_fwd"] = "flydsl#8744"
+            return o.float()
+        except (ImportError, ValueError):
+            pass
+    LAST_PIECES["chunk_fwd"] = "torch"
+    return chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
 
 
 def conv_silu_bwd(a, w, dq, dk, dv):
@@ -353,6 +407,11 @@ class _TorchProj:
         return dg * neg_a * torch.sigmoid(z), dg * neg_a * F.softplus(z)
 
     @staticmethod
+    def gate_proj_bwd_gemms(dgp, x, g_proj):
+        dgp = dgp.float()
+        return dgp @ g_proj.float(), dgp.t() @ x.float()
+
+    @staticmethod
     def sigmoid_gate_proj(x, g_proj, aux=None):
         out = torch.sigmoid(x.float() @ g_proj.float().t())
         return out if aux is None else out * aux.float()
@@ -406,8 +465,9 @@ def _kda_layer_fused_fwd(
         if chunk_graph:
             chunk_in = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
             o = chunk_kda_torch(*chunk_in, scale, chunk_size)
+            LAST_PIECES["chunk_fwd"] = "torch"
         else:
-            o = chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
+            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size)
     o_graph = o if chunk_graph else None
     o = o.detach()
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
@@ -447,7 +507,18 @@ def _kda_layer_fused_fwd(
 
 
 def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
+    _auto_register_chunk_bwd(x.is_cuda)
     conv_kernel = _conv_bwd_kernel(x.is_cuda)
+    rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
+    LAST_PIECES.clear()
+    LAST_PIECES.update(
+        proj_gemms=_piece(_proj_ops(x, w)),
+        rmsnorm_bwd=_piece(rms_bwd),
+        chunk_bwd=_piece(_chunk_bwd_impl),
+        chunk_bwd_fuses=",".join(sorted(_chunk_bwd_fuses)) or "-",
+        conv_bwd=_piece(conv_kernel),
+        l2norm_bwd="fused" if "qk_l2norm" in _chunk_bwd_fuses else _piece(ops),
+    )
     _, s = _kda_layer_fused_fwd(
         x,
         w,
@@ -463,11 +534,11 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
 
     d_wo = dy.t() @ s["on"].reshape(B * T, -1)
     d_on = (dy @ w.w_o.float()).view_as(s["o"])
-    rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
-    d_gproj = dgp.t() @ xf
-    dx = dgp @ w.g_proj.float()
+    dx, d_gproj = _proj_ops(x, w).gate_proj_bwd_gemms(
+        dgp, x.reshape(B * T, D), w.g_proj
+    )
 
     if _chunk_bwd_impl is None:
 

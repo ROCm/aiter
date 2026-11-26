@@ -46,13 +46,18 @@ _PROJ_GEMM_KWARGS = {"block_m": 128, "block_n": 128, "use_half_tile_interleaved"
 
 
 def _proj_gemm(a, w, **kw):
+    """a @ w^T with ``w`` an [N, K] weight."""
+    return _gemm(a.contiguous(), w.t(), "nt", **kw)
+
+
+def _gemm(a, b, layout, **kw):
     from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
 
     return gemm_a16w16(
-        a.contiguous(),
-        w.t(),
+        a,
+        b,
         user_kwargs=dict(_PROJ_GEMM_KWARGS),
-        layout="nt",
+        layout=layout,
         out_dtype=torch.float32,
         **kw,
     )
@@ -111,3 +116,23 @@ def sigmoid_gate_proj(x, g_proj, aux=None):
         epilogue=GEMM_EPI_SIGMOID_MUL,
         aux=aux.float().contiguous(),
     )
+
+
+def gate_proj_bwd_gemms(dgp, x, g_proj):
+    """(dgp @ g_proj, dgp^T @ x) in bf16 with fp32 output.
+
+    dgp: [M, H*V]; x: [M, D]; g_proj: [H*V, D]. Shapes the GEMM cannot take
+    (a K tail, misaligned strides) fall back to torch for that product.
+    """
+    dt = g_proj.dtype
+    d16 = dgp.to(dt).contiguous()
+    x16 = x.to(dt).contiguous()
+    try:
+        dx = _gemm(d16, g_proj.contiguous(), "nn")
+    except (AssertionError, ValueError):
+        dx = dgp.float() @ g_proj.float()
+    try:
+        dw = _gemm(d16.t(), x16, "tn")
+    except (AssertionError, ValueError):
+        dw = dgp.float().t() @ x.float()
+    return dx, dw

@@ -10,9 +10,11 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops import kda_fused_layer
 from aiter.ops.kda_fused_layer import (
     KDALayerWeights,
     kda_layer_bwd,
+    kda_layer_fwd,
     kda_layer_postprocess,
     kda_layer_preprocess,
 )
@@ -132,6 +134,70 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, dtype):
     return ret
 
 
+def run_torch_block(dy, x, w, num_heads, eps=1e-6):
+    """Reference block: recurrent forward output and all gradients, fp32."""
+    xs = x.detach().float().requires_grad_(True)
+    ws = [t.detach().float().requires_grad_(True) for t in w.tensors()]
+    wr = KDALayerWeights.from_tensors(ws)
+    q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps)
+    o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
+    y = kda_layer_postprocess(o, xs, wr, eps)
+    grads = torch.autograd.grad(y, [xs, *ws], dy.float())
+    return y.detach(), grads
+
+
+@benchmark()
+def test_kda_block(b, t, d, h, k, w, r, chunk, dtype):
+    """End to end: kda_layer_fwd + autograd backward of the whole layer."""
+    x = torch.randn(b, t, d).to(dtype)
+    dy = torch.randn(b, t, d).to(dtype)
+    wt = make_weights(d, h, k, w, r, dtype)
+    ref_y, ref_g = run_torch_block(dy, x, wt, h)
+
+    def block(backend):
+        def run():
+            xs = x.detach().requires_grad_(True)
+            ws = [p.detach().requires_grad_(True) for p in wt.tensors()]
+            y = kda_layer_fwd(
+                xs, KDALayerWeights.from_tensors(ws), h, chunk, backend=backend
+            )
+            return y, torch.autograd.grad(y, [xs, *ws], dy)
+
+        return run
+
+    flops = layer_flops(b, t, d, h, k, w, r, chunk) * 4 // 3  # fwd + recompute + bwd
+    nbytes = sum(p.numel() for p in wt.tensors()) * 2 * x.element_size()
+    nbytes += (3 * b * t * d + 6 * b * t * h * k) * x.element_size()
+    tol = 2e-2 if dtype == dtypes.fp32 else 5e-2
+    names = ["y", "dx"] + [
+        f.name for f in KDALayerWeights.__dataclass_fields__.values()
+    ]
+    ret = {"gfx": get_gfx_runtime()}
+    for name in ("torch", "fused"):
+        (y, grads), us = run_perftest(block(name), num_iters=3, num_warmup=1)
+        worst = 0.0
+        for gname, ref, out in zip(names, [ref_y, *ref_g], [y, *grads]):
+            sc = ref.abs().max().clamp_min(1e-6)
+            err = checkAllclose(
+                (ref / sc).to(dtypes.fp32),
+                (out.float() / sc).to(dtypes.fp32),
+                rtol=tol,
+                atol=tol,
+                msg=f"block {name}: {gname}",
+            )
+            assert err == 0, f"block {name}: {gname} {err:.2%} outside tolerance"
+            worst = max(worst, err)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = worst
+    # which optional FlyDSL / Triton pieces the fused run actually used
+    ret["fused pieces"] = " ".join(
+        f"{key}={val}" for key, val in sorted(kda_fused_layer.LAST_PIECES.items())
+    )
+    return ret
+
+
 def run_torch_proj(lr, f_b, dt_bias, A_log, dg, x, g_proj, aux):
     """Reference for the fused projections, fp32."""
     H = A_log.numel()
@@ -143,6 +209,7 @@ def run_torch_proj(lr, f_b, dt_bias, A_log, dg, x, g_proj, aux):
         "gate": neg_a * sp,
         "gate_bwd": (dg * neg_a * sig, dg * neg_a * sp),
         "sigmoid_mul": gate_out * aux,
+        "gproj_bwd": (aux @ g_proj.float(), aux.t() @ x.float()),
     }
 
 
@@ -175,6 +242,12 @@ def test_kda_proj(m, d, h, k, r, dtype):
             lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
             2 * m * d * hk,
             (m * d + hk * d) * 2 + 2 * m * hk * 4,
+        ),
+        # aux stands in for dgp: dx += dgp @ g_proj, dg_proj = dgp^T @ x
+        "gproj_bwd": (
+            lambda: fk.gate_proj_bwd_gemms(aux, x, g_proj),
+            4 * m * d * hk,
+            (m * d + hk * d) * 2 * 2 + m * hk * 4 + (m * d + hk * d) * 4,
         ),
     }
     ret = {"gfx": get_gfx_runtime()}
@@ -248,6 +321,15 @@ def main():
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda fused layer bwd summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        df = []
+        for b, t, (d, h, k, w, r), c in itertools.product(
+            args.batch, args.seqlen, args.shape, args.chunk
+        ):
+            df.append(test_kda_block(b, t, d, h, k, w, r, c, dtype))
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "kda block fwd+bwd summary (markdown):\n%s", df.to_markdown(index=False)
         )
 
     # the fused projections are the gfx950 bf16/fp16 GEMM with an epilogue
