@@ -21,6 +21,8 @@ Triton ``chunk_delta_attn_fwd_prepare`` so the backward's recompute can use it.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels.kda_chunk_fwd import (
@@ -37,6 +39,33 @@ from .linear_attention_prefill_kernels import (
     _placeholder_pair,
     _resolve_prologue,
 )
+
+# Same switch as the FlyDSL chunk backward: print per-stage times of each call.
+_PROFILE = os.environ.get("AITER_KDA_FLYDSL_PROFILE", "0") == "1"
+
+
+class _Timer:
+    def __init__(self):
+        self.marks = []
+        self.mark("start")
+
+    def mark(self, name):
+        if _PROFILE:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self.marks.append((name, ev))
+
+    def report(self, shape):
+        if not _PROFILE:
+            return
+        torch.cuda.synchronize()
+        parts = [
+            f"{n}={a.elapsed_time(b) * 1e3:.0f}us"
+            for (_, a), (n, b) in zip(self.marks, self.marks[1:])
+        ]
+        total = self.marks[0][1].elapsed_time(self.marks[-1][1]) * 1e3
+        print(f"[kda flydsl fwd {shape}] {' '.join(parts)} total={total:.0f}us")
+
 
 # Tunables, by name: ``k5_bv`` -- the K5 recurrence's V block (16 / 32 / 64);
 # ``diag_mfma`` -- the intra diagonal tiles on MFMA (only honoured for the
@@ -440,6 +469,7 @@ def chunk_kda_fwd_flydsl(
             device=q.device,
         )
 
+    timer = _Timer()
     *_, gc, w, u, qg, kg, Aqk, _ = chunk_kda_fwd_prepare_flydsl(
         q,
         k,
@@ -457,6 +487,7 @@ def chunk_kda_fwd_flydsl(
         chunks=chunks,
         diag_mfma=config.get("diag_mfma"),
     )
+    timer.mark("intra")
     h, v_new, fs = kda_fwd_h_flydsl(
         kg,
         w,
@@ -469,6 +500,7 @@ def chunk_kda_fwd_flydsl(
         bv=config.get("k5_bv"),
     )
     # Not empty_like(v): a permuted v view would hand the kernel its strides.
+    timer.mark("k5")
     o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
     _run_compiled(
         compile_output(H, h.dtype, v_new.dtype, o.dtype, chunks.varlen),
@@ -485,6 +517,8 @@ def chunk_kda_fwd_flydsl(
         B * H,
         torch.cuda.current_stream(),
     )
+    timer.mark("output")
+    timer.report(f"B={B} T={T} H={H} N={chunks.N}")
     return o, fs
 
 
