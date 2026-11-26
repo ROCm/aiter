@@ -1209,7 +1209,7 @@ def _pa_ps_reduce_waves(
     return 8
 
 
-@_route(op="pa_persistent_fwd", version=1)
+@_route(op="pa_persistent_fwd", version=2)
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -1250,6 +1250,8 @@ def pa_persistent_fwd(
     for the second result. The default preserves the existing LSE output.
     Split work returns FP32 partials by default. On supported gfx950 MTP calls,
     compact_partials=True returns BF16 SplitO; SplitLSE stays FP32 in both modes.
+    Provider contract v2 includes compact_partials. Version-1 providers cannot
+    implement the BF16 return contract and are not offered this operation.
     Use the padded WorkInfo from get_pa_metadata_info_v1. Metadata partial=-1
     selects direct output in Q's dtype without materializing a partial or LSE.
     """
