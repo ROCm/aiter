@@ -944,29 +944,35 @@ _WGRAD_UNROLL = 16  # partial rows each lane has in flight
 
 
 def build_attn_res_weight_grads(
-    hidden_size: int, num_bank: int, output_norm: bool, weight_bf16: tuple
+    hidden_size: int,
+    num_bank: int,
+    output_norm: bool,
+    weight_bf16: tuple,
+    warp_size: int = WARP_SIZE,
 ):
     """``dquery``, ``drms`` and ``dwo`` from the backward's per-workgroup partial rows.
 
     A workgroup owns 32 columns, a 128-byte line of each partial row: each of 32
-    lanes walks every 32nd row with 16-byte loads, sixteen rows in flight. The four
-    lanes of a wave that share columns combine with two xor shuffles, and the eight
-    wave partials add up in LDS in a fixed order, so the result does not depend on
-    scheduling. ``dquery = dqw * w`` and ``drms = dqw * q``; with no bank the scores
-    get no gradient and both are zero.
+    lanes walks every 32nd row with 16-byte loads, sixteen rows in flight. The
+    lanes of a wave that share columns (four on wave32, eight on wave64) combine
+    with xor shuffles, and the wave partials add up in LDS in a fixed order, so the
+    result does not depend on scheduling. ``dquery = dqw * w`` and
+    ``drms = dqw * q``; with no bank the scores get no gradient and both are zero.
     """
     threads = _WGRAD_VECS * _WGRAD_LANES
-    n_waves = threads // WARP_SIZE
+    n_waves = threads // warp_size
     lane_xors = [
-        _WGRAD_VECS << s for s in range((WARP_SIZE // _WGRAD_VECS).bit_length() - 1)
+        _WGRAD_VECS << s for s in range((warp_size // _WGRAD_VECS).bit_length() - 1)
     ]
     blocks = -(-hidden_size // (_WGRAD_VECS * _F32_VEC))
     q_bf16, w_bf16, wo_bf16 = weight_bf16
     has_dqw = num_bank > 0
     # Always two carried sums: a single loop-carried value comes back bare.
     n_sums = 2
-    name = f"attn_res_train_wgrad_h{hidden_size}_k{num_bank}" + (
-        "_onorm" if output_norm else ""
+    name = (
+        f"attn_res_train_wgrad_h{hidden_size}_k{num_bank}"
+        + ("_onorm" if output_norm else "")
+        + ("" if warp_size == WARP_SIZE else f"_w{warp_size}")
     )
 
     @fx.struct
@@ -988,7 +994,7 @@ def build_attn_res_weight_grads(
         vec = tid % _WGRAD_VECS
         lane = tid // _WGRAD_VECS
         col_vec = fx.Int32(fx.block_idx.x) * _WGRAD_VECS + vec
-        wave = tid // WARP_SIZE
+        wave = tid // warp_size
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_waves = fx.logical_divide(
             lds.waves.view(
@@ -1033,7 +1039,7 @@ def build_attn_res_weight_grads(
             for e in range_constexpr(_F32_VEC):
                 x = value[e]
                 for d in lane_xors:
-                    x = x + x.shuffle_xor(fx.Int32(d), fx.Int32(WARP_SIZE))
+                    x = x + x.shuffle_xor(fx.Int32(d), fx.Int32(warp_size))
                 lanes.append(x)
             return fx.Vector.from_elements(lanes, fx.Float32)
 
@@ -1066,7 +1072,7 @@ def build_attn_res_weight_grads(
             wave_sum(results[i]) if sums_on[i] else zero
             for i in range_constexpr(n_sums)
         ]
-        if tid % WARP_SIZE < _WGRAD_VECS:
+        if tid % warp_size < _WGRAD_VECS:
             for i in range_constexpr(n_sums):
                 if const_expr(sums_on[i]):
                     reg = fx.make_rmem_tensor(_F32_VEC, fx.Float32)

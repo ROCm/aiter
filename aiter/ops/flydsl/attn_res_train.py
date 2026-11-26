@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AttnRes for training: FlyDSL forward and backward on gfx1250.
+"""AttnRes for training: FlyDSL forward and backward on gfx950 and gfx1250.
 
 ``flydsl_attn_res_train(query, bank, prefix, rms_weight, output_rms_weight)``
 returns the mixed residual of one AttnRes site and is differentiable in every
@@ -17,21 +17,24 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
-from .kernels.attn_res_train import (
-    build_attn_res_bwd,
-    build_attn_res_fwd,
-    build_attn_res_weight_grads,
-    bwd_lds_bytes,
-)
+from .kernels import attn_res_train as _kernels_gfx1250
+from .kernels import attn_res_train_gfx950 as _kernels_gfx950
+from .kernels.attn_res_train import bwd_lds_bytes
 from .kernels.tensor_shim import _run_compiled
 
-SUPPORTED_GFX = ("gfx1250",)
+SUPPORTED_GFX = ("gfx950", "gfx1250")
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
 _BUFFER_LIMIT_BYTES = 1 << 32
 # Both kernels are persistent and size their grid to the workgroups that fit at
-# once. HIP cannot load a module to ask while a graph is captured; at Kimi-K3's
-# width two workgroups fill a WGP.
+# once, on gfx950 no more than a CU streams best with (``blocks_per_cu_cap``).
+# HIP cannot load a module to ask while a graph is captured; at Kimi-K3's
+# width two workgroups fill a gfx1250 WGP. gfx950 asks its kernels instead, from
+# their LDS.
 _FALLBACK_BLOCKS_PER_CU = 2
+# A gfx950 backward workgroup ends with two fp32 partial rows. Short rows fit many
+# workgroups per CU, so at least this many tokens each keep those rows a small
+# part of the traffic; its deeper row ring makes up for fewer workgroups.
+_GFX950_BWD_TOKENS_PER_GROUP = 8
 
 _launchers: dict = {}
 
@@ -43,26 +46,48 @@ def _launcher(key, build):
     return launcher
 
 
+def _kernels(arch: str):
+    return _kernels_gfx950 if arch == "gfx950" else _kernels_gfx1250
+
+
 @cache
 def _num_cus(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _resident_groups(launcher, args, num_tokens: int, device_index: int) -> int:
-    """Workgroups that run at once, cached on the launcher; at most one per token."""
+def _resident_groups(
+    launcher, args, num_tokens: int, device_index: int, fallback, cap=0
+):
+    """Workgroups that run at once, cached on the launcher; at most one per token,
+    and at most ``cap`` per CU when it is set."""
     per_cu = getattr(launcher, "_blocks_per_cu", None)
     if per_cu is None:
         if torch.cuda.is_current_stream_capturing():
-            per_cu = _FALLBACK_BLOCKS_PER_CU
+            per_cu = fallback
         else:
             # Meta tensors make flyc.compile compile only, without launching.
             meta = [a.to("meta") if isinstance(a, torch.Tensor) else a for a in args]
             try:
                 per_cu = flyc.compile(launcher, *meta).max_blocks_per_cu()
             except (RuntimeError, ValueError):
-                per_cu = _FALLBACK_BLOCKS_PER_CU
+                per_cu = fallback
             launcher._blocks_per_cu = per_cu
+    if cap:
+        per_cu = min(per_cu, cap)
     return max(1, min(num_tokens, per_cu * _num_cus(device_index)))
+
+
+def _records(tensor: torch.Tensor) -> int:
+    """Bytes from ``tensor``'s base to its end, as the kernels' signed i32 argument.
+
+    gfx950 makes it the buffer's record count, so that a load the kernels point
+    past it fetches nothing.
+    """
+    extent = sum((d - 1) * s for d, s in zip(tensor.shape, tensor.stride())) + 1
+    nbytes = extent * tensor.element_size() if tensor.numel() else 0
+    if nbytes >= _BUFFER_LIMIT_BYTES:
+        raise ValueError(f"a tensor spans {nbytes} bytes, past a 32-bit record count")
+    return nbytes - _BUFFER_LIMIT_BYTES if nbytes >= 1 << 31 else nbytes
 
 
 def _check_rows(tensor: torch.Tensor, name: str, hidden_size: int) -> None:
@@ -99,6 +124,7 @@ def _forward(query, bank, prefix, rms_weight, output_rms_weight, eps, out_eps, s
     num_tokens, hidden_size = prefix.shape
     num_bank = 0 if bank is None else bank.shape[1]
     device = prefix.device
+    arch = get_gfx_runtime()
     output_norm = output_rms_weight is not None
     weights, weight_bf16 = _weight_rows(query, rms_weight, output_rms_weight)
     y = torch.empty((num_tokens, hidden_size), device=device, dtype=prefix.dtype)
@@ -112,6 +138,7 @@ def _forward(query, bank, prefix, rms_weight, output_rms_weight, eps, out_eps, s
     bank_strides = tuple(bank.stride()[:2]) if num_bank else (0, 0)
     key = (
         "fwd",
+        arch,
         device.index,
         hidden_size,
         num_bank,
@@ -125,7 +152,7 @@ def _forward(query, bank, prefix, rms_weight, output_rms_weight, eps, out_eps, s
     )
     launcher = _launcher(
         key,
-        lambda: build_attn_res_fwd(
+        lambda: _kernels(arch).build_attn_res_fwd(
             hidden_size,
             num_bank,
             output_norm,
@@ -139,11 +166,25 @@ def _forward(query, bank, prefix, rms_weight, output_rms_weight, eps, out_eps, s
     )
     if num_tokens:
         args = (bank_arg, prefix, *weights, y, logit, rstd, lse, out_rstd)
+        records, fallback, cap = (), _FALLBACK_BLOCKS_PER_CU, 0
+        if arch == "gfx950":
+            records = (_records(bank_arg), _records(prefix))
+            fallback = _kernels_gfx950.fallback_blocks_per_cu(
+                hidden_size, num_bank, output_norm, False
+            )
+            cap = _kernels_gfx950.blocks_per_cu_cap(
+                hidden_size, num_bank, output_norm, False
+            )
         stream = torch._C._cuda_getCurrentRawStream(device.index)
         groups = _resident_groups(
-            launcher, (*args, num_tokens, 1, stream), num_tokens, device.index
+            launcher,
+            (*args, num_tokens, 1, *records, stream),
+            num_tokens,
+            device.index,
+            fallback,
+            cap,
         )
-        _run_compiled(launcher, *args, num_tokens, groups, stream)
+        _run_compiled(launcher, *args, num_tokens, groups, *records, stream)
     return y, logit, rstd, lse, out_rstd
 
 
@@ -164,6 +205,7 @@ def _backward(
     num_tokens, hidden_size = prefix.shape
     num_bank = 0 if bank is None else bank.shape[1]
     device = prefix.device
+    arch = get_gfx_runtime()
     output_norm = output_rms_weight is not None
     weights, weight_bf16 = _weight_rows(query, rms_weight, output_rms_weight)
     if dy.stride(-1) != 1 or dy.data_ptr() % 16 or dy.stride(0) % 8:
@@ -181,6 +223,7 @@ def _backward(
     bank_strides = tuple(bank.stride()[:2]) if num_bank else (0, 0)
     key = (
         "bwd",
+        arch,
         device.index,
         hidden_size,
         num_bank,
@@ -194,7 +237,7 @@ def _backward(
     )
     launcher = _launcher(
         key,
-        lambda: build_attn_res_bwd(
+        lambda: _kernels(arch).build_attn_res_bwd(
             hidden_size,
             num_bank,
             output_norm,
@@ -206,16 +249,30 @@ def _backward(
         ),
     )
     args = (dy, bank_arg, prefix, *weights, logit, rstd, lse, out_rstd, dbank_arg)
+    records, fallback, cap = (), _FALLBACK_BLOCKS_PER_CU, 0
+    if arch == "gfx950":
+        records = (_records(dy), _records(bank_arg), _records(prefix))
+        fallback = _kernels_gfx950.fallback_blocks_per_cu(
+            hidden_size, num_bank, output_norm, True
+        )
+        cap = _kernels_gfx950.blocks_per_cu_cap(
+            hidden_size, num_bank, output_norm, True
+        )
     stream = torch._C._cuda_getCurrentRawStream(device.index)
     groups = 1
     if num_tokens:
         part = torch.empty((1, hidden_size), device="meta", dtype=torch.float32)
         groups = _resident_groups(
             launcher,
-            (*args, dprefix, part, part, num_tokens, 1, stream),
+            (*args, dprefix, part, part, num_tokens, 1, *records, stream),
             num_tokens,
             device.index,
+            fallback,
+            cap,
         )
+        if arch == "gfx950":
+            per_group = -(-num_tokens // _GFX950_BWD_TOKENS_PER_GROUP)
+            groups = min(groups, max(_num_cus(device.index), per_group))
     part_dqw = torch.empty((groups, hidden_size), device=device, dtype=torch.float32)
     part_dwo = torch.empty_like(part_dqw) if output_norm else part_dqw
     if num_tokens:
@@ -227,16 +284,18 @@ def _backward(
             part_dwo,
             num_tokens,
             groups,
+            *records,
             stream,
         )
     q_row, w_row, wo_row = weights
     dquery = torch.empty_like(q_row)
     drms = torch.empty_like(w_row)
     dwo = torch.empty_like(wo_row) if output_norm else dquery
+    warp_size = _kernels_gfx950.WAVE if arch == "gfx950" else _kernels_gfx1250.WARP_SIZE
     wgrad = _launcher(
-        ("wgrad", device.index, hidden_size, num_bank, output_norm, weight_bf16),
-        lambda: build_attn_res_weight_grads(
-            hidden_size, num_bank, output_norm, weight_bf16
+        ("wgrad", arch, device.index, hidden_size, num_bank, output_norm, weight_bf16),
+        lambda: _kernels_gfx1250.build_attn_res_weight_grads(
+            hidden_size, num_bank, output_norm, weight_bf16, warp_size
         ),
     )
     _run_compiled(
@@ -309,6 +368,20 @@ class _AttnResTrain(torch.autograd.Function):
         return dquery, dbank, dprefix, drms, dout, None, None, None
 
 
+def _check_capacity(arch: str, hidden_size: int, num_bank: int, output_norm: bool):
+    """Raise ValueError when this arch's kernels cannot hold one token of the site."""
+    if arch == "gfx950":
+        # The current token's rows sit in VGPRs; LDS only sets how many stream in.
+        _kernels_gfx950.check_supported(hidden_size, num_bank, output_norm)
+        return
+    lds_bytes = bwd_lds_bytes(hidden_size, num_bank, output_norm)
+    if lds_bytes > get_lds_capacity_bytes(arch):
+        raise ValueError(
+            f"the backward stages {num_bank + 1} rows of {hidden_size} in LDS, "
+            f"{lds_bytes} bytes, over the {arch} capacity"
+        )
+
+
 def flydsl_attn_res_train(
     query: torch.Tensor,
     bank: torch.Tensor | None,
@@ -333,9 +406,10 @@ def flydsl_attn_res_train(
 
     Returns ``y`` of shape ``[N, H]`` in the candidates' dtype.
     """
-    if get_gfx_runtime() not in SUPPORTED_GFX:
+    arch = get_gfx_runtime()
+    if arch not in SUPPORTED_GFX:
         raise RuntimeError(
-            f"flydsl_attn_res_train supports {SUPPORTED_GFX}, got {get_gfx_runtime()}"
+            f"flydsl_attn_res_train supports {SUPPORTED_GFX}, got {arch}"
         )
     if prefix.dim() != 2:
         raise ValueError(f"prefix must be [N, H], got {tuple(prefix.shape)}")
@@ -352,12 +426,7 @@ def flydsl_attn_res_train(
         if bank.shape[1] == 0:
             bank = None
     num_bank = 0 if bank is None else bank.shape[1]
-    lds_bytes = bwd_lds_bytes(hidden_size, num_bank, output_rms_weight is not None)
-    if lds_bytes > get_lds_capacity_bytes(get_gfx_runtime()):
-        raise ValueError(
-            f"the backward stages {num_bank + 1} rows of {hidden_size} in LDS, "
-            f"{lds_bytes} bytes, over the {get_gfx_runtime()} capacity"
-        )
+    _check_capacity(arch, hidden_size, num_bank, output_rms_weight is not None)
     for name, weight in (
         ("query", query),
         ("rms_weight", rms_weight),
