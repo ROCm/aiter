@@ -683,12 +683,18 @@ MXFP8_TIGHT_TOL = 1e-2
 # Through the whole layer a bf16 rounding that lands differently can move a
 # later fp8 rounding, or a block's amax across a power of two (rescaling its 32
 # values), so a few elements of a gradient move by about one fp8 step while the
-# tensor stays close. A layer comparison is therefore graded per tensor by
-# (rel-L2 bound, elementwise tol, outlier fraction bound, max |delta| / max|ref|).
-# An unquantized operand puts rel-L2 at 0.06-0.15.
+# tensor stays close; how far depends on the tensor (the low-rank f_a / f_b
+# path is the most sensitive). Each tensor is therefore graded against the
+# emulated layer by its deviation relative to the recipe's own effect on it,
+# rel_l2(aiter, emulated) / rel_l2(emulated, bf16 layer) <= MXFP8_NOISE_RATIO.
+# Simulated 1% one-ulp output flips stay <= 0.11 (GPU K3 rows <= 0.17); an
+# unquantized operand gives 0.7-0.9, unquantized wgrad operands alone up to 0.37.
+MXFP8_NOISE_RATIO = 0.25
+# Backstops per comparison: (rel-L2, max |delta| / max|ref|), plus the
+# elementwise tolerance of the reported (not asserted) outlier fraction.
 MXFP8_BLOCK_GRADES = {
-    "emulated": (3e-2, 1e-2, 2e-2, 0.1),
-    "torch": (5e-2, 5e-2, 1e-2, 0.2),
+    "emulated": (5e-2, 0.1, 1e-2),
+    "torch": (5e-2, 0.2, 5e-2),
 }
 MXFP8_PROJS = ("qkv", "f_a", "f_b", "w_beta", "g_proj", "w_o")
 MXFP8_KINDS = ("fwd", "dgrad", "wgrad")
@@ -794,9 +800,12 @@ def test_kda_mxfp8_gemm(proj, kind, m, d, h, k, r, dtype):
 def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     """kda_layer_fwd + autograd backward with ``gemm_precision="mxfp8"``.
 
-    * ``rel l2`` / ``err`` / ``max delta`` (worst tensor): the fused layer on
-      aiter's MXFP8 GEMMs against the same fused layer with every projection
-      GEMM emulated in fp32;
+    * ``noise ratio`` / ``rel l2`` / ``err`` / ``max delta`` (worst tensor): the
+      fused layer on aiter's MXFP8 GEMMs against the same fused layer with
+      every projection GEMM emulated in fp32 (``err``: fraction of elements
+      outside 1e-2, reported only);
+    * ``deterministic``: two runs of the aiter path (and, up to
+      ORACLE_MAX_TOKENS, of the emulated reference) agree bit for bit;
     * ``vs torch ...``: against the torch backend's MXFP8 emulation (chunked
       recurrence in fp32, every GEMM emulated), up to ORACLE_MAX_TOKENS;
     * ``failed``: tensors past ``MXFP8_BLOCK_GRADES``, asserted after the table;
@@ -835,11 +844,12 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
 
     failed = []
 
-    def grade(out, ref, against):
-        """(worst rel-L2, worst outlier fraction, worst max delta); tensors past
-        a bound are collected in ``failed`` (asserted after the table)."""
-        rel_max, tol, frac_max, delta_max = MXFP8_BLOCK_GRADES[against]
-        worst = [0.0, 0.0, 0.0]
+    def grade(out, ref, against, effect=None):
+        """(worst noise ratio, rel-L2, outlier fraction, max delta); tensors past
+        a bound are collected in ``failed`` (asserted after the table).
+        ``effect``: per-tensor rel-L2 of the recipe (emulated vs bf16 layer)."""
+        rel_max, delta_max, tol = MXFP8_BLOCK_GRADES[against]
+        worst = [0.0, 0.0, 0.0, 0.0]
         for gname, rf, o in zip(names, [ref[0], *ref[1]], [out[0], *out[1]]):
             sc = rf.float().abs().max().clamp_min(1e-6)
             rf_n = (rf.float() / sc).to(dtypes.fp32)
@@ -849,17 +859,18 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
                 o_n,
                 rtol=tol,
                 atol=tol,
-                tol_err_ratio=frac_max,
-                msg=f"mxfp8 vs {against}: {gname}",
+                tol_err_ratio=1.0,
+                printLog=False,
             )
             rel = _rel_l2(o_n, rf_n)
             delta = (o_n - rf_n).abs().max().item()
-            if rel > rel_max or frac > frac_max or delta > delta_max:
+            ratio = rel / max(effect[gname], 1e-12) if effect else 0.0
+            if rel > rel_max or delta > delta_max or ratio > MXFP8_NOISE_RATIO:
                 failed.append(
-                    f"vs {against} {gname}: rel l2 {rel:.2e}, "
-                    f"{frac:.2e} outside, max {delta:.2e}"
+                    f"vs {against} {gname}: noise ratio {ratio:.3f}, rel l2 "
+                    f"{rel:.2e}, max {delta:.2e} ({frac:.2e} outside {tol})"
                 )
-            worst = [max(a, b) for a, b in zip(worst, (rel, frac, delta))]
+            worst = [max(a, b) for a, b in zip(worst, (ratio, rel, frac, delta))]
         return worst
 
     mxfp8_linear.set_mxfp8_gemm_impl("emulate")
@@ -890,15 +901,42 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     ret["fastpath bitwise"] = not differ
     if differ:
         failed.append("fast path not bit-identical: " + ",".join(differ))
-    rel, frac, delta = grade(out, emulated, "emulated")
-    ret.update({"rel l2": rel, "err": frac, "max delta": delta})
+    again = block("fused", "mxfp8")()
+    nondet = [
+        gname
+        for gname, o, o2 in zip(names, [out[0], *out[1]], [again[0], *again[1]])
+        if not torch.equal(o, o2)
+    ]
     if b * t <= ORACLE_MAX_TOKENS:
-        rel, frac, delta = grade(out, block("torch", "mxfp8")(), "torch")
+        mxfp8_linear.set_mxfp8_gemm_impl("emulate")
+        try:
+            emulated2 = block("fused", "mxfp8")()
+        finally:
+            mxfp8_linear.set_mxfp8_gemm_impl(None)
+        nondet += [
+            f"emulated:{gname}"
+            for gname, e, e2 in zip(
+                names, [emulated[0], *emulated[1]], [emulated2[0], *emulated2[1]]
+            )
+            if not torch.equal(e, e2)
+        ]
+    ret["deterministic"] = not nondet
+    ret["nondeterministic"] = ",".join(nondet) or "-"
+    bf16, bf16_us = run_perftest(block("fused", "bf16"), num_iters=3, num_warmup=1)
+    ret["bf16 us"] = bf16_us
+    effect = {
+        gname: _rel_l2(e, b16)
+        for gname, e, b16 in zip(
+            names, [emulated[0], *emulated[1]], [bf16[0], *bf16[1]]
+        )
+    }
+    ratio, rel, frac, delta = grade(out, emulated, "emulated", effect)
+    ret.update({"noise ratio": ratio, "rel l2": rel, "err": frac, "max delta": delta})
+    if b * t <= ORACLE_MAX_TOKENS:
+        _, rel, frac, delta = grade(out, block("torch", "mxfp8")(), "torch")
         ret.update(
             {"vs torch rel l2": rel, "vs torch err": frac, "vs torch max": delta}
         )
-    bf16, bf16_us = run_perftest(block("fused", "bf16"), num_iters=3, num_warmup=1)
-    ret["bf16 us"] = bf16_us
     dev = {
         gname: (
             _rel_l2(o, rf),
