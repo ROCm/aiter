@@ -13,22 +13,34 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-D, PAGE, K, NQ, NKV, ROT, EPS = 128, 128, 6144, 16, 1, 64, 1e-6
+D, PAGE, EPS = 128, 128, 1e-6
+# m, num_heads, num_kv_heads, num_index_heads, rotary_dim, hidden_size
+CASES = [
+    (1, 16, 1, 1, 64, 6144),  # MiniMax-M3.1 TP4 (tuned rows)
+    (8, 16, 1, 4, 64, 6144),
+    (96, 16, 1, 1, 64, 6144),
+    (150, 16, 1, 1, 64, 6144),
+    (128, 16, 1, 4, 64, 6144),
+    (5, 8, 2, 2, 128, 4096),  # GQA, full rotary (default config)
+    (64, 8, 2, 2, 128, 4096),
+    (33, 4, 4, 1, 96, 2560),  # 4 kv heads, rotary 96 (no xor partner lane)
+]
 
 
-def make_case(m, niq, pages=512):
+def make_case(m, nq, nkv, niq, rot, k, pages=256):
     torch.manual_seed(m * 7 + niq)
-    n = (NQ + 2 * NKV + niq + 1) * D
-    x = torch.randn(m, K).clamp(-8, 8).to(torch.float8_e4m3fn)
-    w = (torch.randn(n, K) * 0.5).clamp(-8, 8).to(torch.float8_e4m3fn)
+    n = (nq + 2 * nkv + niq + 1) * D
+    x = torch.randn(m, k).clamp(-8, 8).to(torch.float8_e4m3fn)
+    w = (torch.randn(n, k) * 0.5).clamp(-8, 8).to(torch.float8_e4m3fn)
     e8m0 = torch.float8_e8m0fnu
-    xs = torch.randint(120, 127, (m, K // 32), dtype=torch.uint8).view(e8m0)
-    ws = torch.randint(118, 126, (n, K // 32), dtype=torch.uint8).view(e8m0)
-    inv = 1e7 ** -(torch.arange(0, ROT, 2, dtype=torch.float64) / ROT)
+    xs = torch.randint(120, 127, (m, k // 32), dtype=torch.uint8).view(e8m0)
+    ws = torch.randint(118, 126, (n, k // 32), dtype=torch.uint8).view(e8m0)
+    inv = 1e7 ** -(torch.arange(0, rot, 2, dtype=torch.float64) / rot)
     fr = torch.outer(torch.arange(8192, dtype=torch.float64), inv)
     slots = torch.randperm(pages * PAGE)[:m]
     slots[3::11] = -1  # skipped tokens
-    c = {"x": x, "xs": xs, "w": w, "ws": ws, "n": n, "niq": niq, "slots": slots}
+    c = {"x": x, "xs": xs, "w": w, "ws": ws, "n": n, "slots": slots}
+    c.update(nq=nq, nkv=nkv, niq=niq, rot=rot)
     c["w_sh"] = shuffle_weight(w, layout=(16, 16))
     c["ws_sh"] = shuffle_mxfp8_bpreshuffle_scale(ws)
     c["nw"] = [(torch.randn(D) * 0.3).bfloat16() for _ in range(4)]
@@ -38,11 +50,12 @@ def make_case(m, niq, pages=512):
     def full(*shape):
         return torch.full(shape, 0xEE, dtype=torch.uint8)
 
-    c["pools"] = lambda: {  # pages poisoned: every byte written is compared
-        "kp": full(pages, NKV, PAGE, D // 2), "vp": full(pages, NKV, PAGE, D // 2),
-        "ksc": full(pages, NKV, PAGE, D // 16), "vsc": full(pages, NKV, PAGE, D // 16),
+    # pools poisoned: every byte is compared. K and V are the halves of one pool
+    # [pages, 2, nkv, 128, row bytes], so the page stride is not nkv rows.
+    c["pools"] = lambda: {
+        "kv": full(pages, 2, nkv, PAGE, D // 2), "kvs": full(pages, 2, nkv, PAGE, D // 16),
         "ip": full(pages, PAGE, D // 2), "isc": full(pages, PAGE, D // 16),
-        "q": torch.full((m, NQ * D), -7.0).bfloat16(),
+        "q": torch.full((m, nq * D), -7.0).bfloat16(),
         "iq": torch.full((m, niq * D), -7.0).bfloat16(),
     }  # fmt: skip
     return c
@@ -59,10 +72,11 @@ def run_unfused(c, o):
 def run_tail(c, qkv, o):
     nw, s = c["nw"], c["slots"]
     aiter.fused_qknorm_idxrqknorm(
-        qkv, nw[0], nw[1], c["cos_sin"], c["pos"], NQ, NKV, ROT, EPS, nw[2], nw[3],
-        c["niq"], s, o["kp"], o["vp"], o["ip"], PAGE, o["q"], o["iq"], s,
-        kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=o["ksc"],
-        v_scale=o["vsc"], asm_layout=False, index_scale=o["isc"],
+        qkv, nw[0], nw[1], c["cos_sin"], c["pos"], c["nq"], c["nkv"], c["rot"], EPS,
+        nw[2], nw[3], c["niq"], s, o["kv"][:, 0], o["kv"][:, 1], o["ip"], PAGE, o["q"],
+        o["iq"], s, kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4",
+        k_scale=o["kvs"][:, 0], v_scale=o["kvs"][:, 1], asm_layout=False,
+        index_scale=o["isc"],
     )  # fmt: skip
 
 
@@ -74,7 +88,8 @@ def run_fused(c, o, qkv_out=None):
     nw, s = c["nw"], c["slots"]
     mxfp8_qkv_norm_rope_nvfp4_insert(
         c["x"], c["xs"], c["w_sh"], c["ws_sh"], *nw, c["cos_sin"], c["pos"], s, s,
-        o["kp"], o["vp"], o["ksc"], o["vsc"], o["ip"], o["isc"], o["q"], o["iq"], EPS,
+        o["kv"][:, 0], o["kv"][:, 1], o["kvs"][:, 0], o["kvs"][:, 1], o["ip"],
+        o["isc"], o["q"], o["iq"], c["nq"], c["nkv"], c["rot"], EPS,
         num_index_heads=c["niq"], qkv_out=qkv_out,
     )  # fmt: skip
 
@@ -88,8 +103,8 @@ def run_torch(c):  # fp64 on the CPU
 
 
 @benchmark()
-def test_mxfp8_qkv_chain(m, niq):
-    c = make_case(m, niq)
+def test_mxfp8_qkv_chain(m, nq, nkv, niq, rot, k):
+    c = make_case(m, nq, nkv, niq, rot, k)
     of, ou, o2 = c["pools"](), c["pools"](), c["pools"]()
     qkv = torch.full((m, c["n"]), float("nan"), dtype=dtypes.bf16)
     _, us_fused = run_perftest(run_fused, c, of, qkv)
@@ -97,10 +112,10 @@ def test_mxfp8_qkv_chain(m, niq):
     err = checkAllclose(run_torch(c).float(), qkv.cpu().float(), rtol=1e-2, atol=1e-2)
     assert err < 1e-3, f"pre-norm rows vs fp64: {err:.2%}"
     same = (qkv.view(torch.int16) == cur.view(torch.int16)).double().mean().item()
-    assert same > 0.995, f"pre-norm rows == tuned GEMM's for {same:.2%} only"
+    assert same > 0.995, f"pre-norm rows == gemm_a8w8_blockscale's for {same:.2%} only"
     ot = c["pools"]()
     run_tail(c, qkv.clone(), ot)  # the unfused tail on the fused GEMM's rows
-    run_fused(c, o2)  # ATOM's call: no qkv_out
+    run_fused(c, o2)  # without qkv_out
     for key in of:
         assert torch.equal(of[key].view(torch.uint8), ot[key].view(torch.uint8)), key
         assert torch.equal(o2[key].view(torch.uint8), of[key].view(torch.uint8)), key
@@ -108,17 +123,31 @@ def test_mxfp8_qkv_chain(m, niq):
 
 
 def test_chain_gate():
-    from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import (
-        mxfp8_qkv_chain_supported as ok,
+    from aiter.ops.flydsl import mxfp8_qkv_rope_nvfp4_gfx1250 as chain
+    from aiter.ops.flydsl.kernels.mxfp8_qkv_rope_nvfp4_gfx1250 import (
+        chain_config_error,
     )
 
-    m3 = (NQ, NKV, D, ROT, K)
-    with mock.patch(
-        "aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx1250"
+    for key, rows in chain._tuned_table().items():  # every tuned row is valid
+        for m, cfg in rows:
+            assert chain_config_error(key[-1], *cfg[:8]) is None, (key, m, cfg)
+
+    ok = chain.mxfp8_qkv_chain_supported
+    m3 = (16, 1, D, 64, 6144)  # (num_heads, num_kv_heads, head_dim, rotary_dim, K)
+    gqa = (8, 2, D, 128, 4096)  # no tuned rows: the default config
+    with (
+        mock.patch("aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx1250"),
+        mock.patch("aiter.jit.utils.chip_info.get_cu_num", return_value=256),
     ):
         assert ok(1, *m3) and ok(192, *m3) and ok(128, *m3, num_index_heads=4)
         assert not ok(193, *m3) and not ok(129, *m3, num_index_heads=4)
-        assert not ok(64, 8, NKV, D, ROT, K)  # another head shape
+        assert ok(1, *gqa) and ok(64, *gqa) and not ok(65, *gqa)
+        assert ok(33, 4, 4, D, 96, 2560) and ok(16, 1, 1, D, 8, 128)
+        assert not ok(8, 16, 1, 64, 64, 6144)  # head_dim 64
+        assert not ok(8, 16, 1, D, 60, 6144)  # rotary_dim not a multiple of 8
+        assert not ok(8, 16, 1, D, 136, 6144)  # rotary_dim > head_dim
+        assert not ok(8, 16, 1, D, 64, 6000)  # K not a multiple of 128
+        assert not ok(8, *m3, num_index_heads=0) and not ok(0, *m3)
     with mock.patch("aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx950"):
         assert not ok(64, *m3)
 
@@ -126,8 +155,8 @@ def test_chain_gate():
 def main():
     parser = argparse.ArgumentParser(description="fused MXFP8 QKV chain (gfx1250)")
     parser.add_argument(
-        "-s", "--shape", type=dtypes.str2tuple, nargs="*",
-        default=[(1, 1), (96, 1), (150, 1), (128, 4)], help="m,num_index_heads",
+        "-s", "--shape", type=dtypes.str2tuple, nargs="*", default=CASES,
+        help="m,num_heads,num_kv_heads,num_index_heads,rotary_dim,hidden_size",
     )  # fmt: skip
     args = parser.parse_args()
     test_chain_gate()
@@ -135,7 +164,7 @@ def main():
         aiter.logger.warning("the fused QKV chain runs on gfx1250 only; skipping")
         return
     torch.set_default_device("cuda")
-    df = [test_mxfp8_qkv_chain(m, niq) for m, niq in args.shape]
+    df = [test_mxfp8_qkv_chain(*shape) for shape in args.shape]
     aiter.logger.info("mxfp8_qkv_chain:\n%s", pd.DataFrame(df).to_markdown(index=False))
 
 

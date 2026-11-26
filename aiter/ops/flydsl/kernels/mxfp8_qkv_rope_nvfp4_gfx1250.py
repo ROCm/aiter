@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 TP4 decode QKV chain in one gfx1250 launch.
+"""Decode QKV chain in one gfx1250 launch.
 
-The native-MXFP8 QKV GEMM (rows [q | k | v | index-q | index-k], 128-wide heads,
-K 6144) with the Gemma q/k RMS norm, partial NeoX RoPE (rotary 64), bf16 q /
-index-q and the NVFP4 K / V / index-K row inserts fused into its tail.
+The native-MXFP8 QKV GEMM (rows [q | k | v | index-q | index-k], nq, nkv, nkv, niq
+and 1 heads of 128 columns, hidden size K) with the Gemma q/k RMS norm, partial
+NeoX RoPE (rotary dim ``rot``), bf16 q / index-q and the NVFP4 K / V / index-K row
+inserts fused into its tail. The head counts, ``rot`` and K are compile-time
+parameters; ``chain_shape_error`` states what the kernel accepts.
 
 Grid (ns * ks, heads, ceil(M / tile_m)); the ns * ks workgroups of one (head, row
 tile) are one hardware cluster (a cluster sits inside one 16-CU shader engine, so
-ns * ks is 4, 8 or 16). Rank r owns columns (r % ns) * 128 / ns of the head and K
+ns * ks is 2 to 16). Rank r owns columns (r % ns) * 128 / ns of the head and K
 range r // ns of ks. Each workgroup
 
 * stages its activation slab [tile_m, K / ks] in LDS (row loads, one wave a
@@ -32,15 +34,14 @@ reaches it exactly once (no early exit) and grid x is the cluster size.
 
 Layouts: A [M, K] e4m3 row-major (row stride a multiple of 16 bytes), A scale
 [M, K / 32] e8m0 row-major, W [N, K] e4m3 (16, 16) preshuffled, W scale [N, K / 32]
-e8m0 32x4 shuffled. K / V caches: NVFP4 row layout, payload [pages, 1, 128, 64] u8
-+ E4M3 scale planes [pages, 1, 128, 8]; index cache payload [pages, 128, 64] +
-scales [pages, 128, 8]. One KV head (TP4); the head strides are accepted for the
-host contract and unused.
+e8m0 32x4 shuffled. K / V caches: NVFP4 row layout, payload [pages, nkv, 128, 64] u8
++ E4M3 scale planes [pages, nkv, 128, 8] (free page and head strides); index cache
+payload [pages, 128, 64] + scales [pages, 128, 8].
 
 Measured on gfx1250 (MI455X, 256 CUs as 16 shader engines of 16): a CU reads
 ~150 GB/s, global writes cost ~4x reads past ~8 MB, and a cluster stays inside a
-shader engine. Hence ns * ks = 8 (two clusters a shader engine, 160 CUs at 20 heads)
-and a small ks (the FP32 partial planes are ks * M * N * 4 bytes).
+shader engine. Hence clusters of 8 or 16 and a small ks (the FP32 partial planes are
+ks * M * N * 4 bytes).
 """
 
 import flydsl.compiler as flyc
@@ -66,31 +67,44 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 WAVE = 32
 WMMA_K = 128
-D = 128
-K_DIM = 6144
-NQ = 16
-NKV = 1
-ROT = 64
+D = 128  # head dim: one wave holds a head row, 4 dims a lane
 CPOL_DEV = 16  # device scope: the ranks of a cluster sit on different CUs
 A_BATCH = 32  # 16-byte activation units a thread has in flight while staging
 P_PAD = 16  # LDS row pad of the partial tile
 
 
-def chain_heads(niq: int) -> int:
-    return NQ + 2 * NKV + niq + 1
+def chain_heads(nq: int, nkv: int, niq: int) -> int:
+    return nq + 2 * nkv + niq + 1
 
 
-def chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage=1):
-    steps_total = K_DIM // WMMA_K
-    if ns not in (1, 2, 4, 8) or ns * ks > 16 or ns * ks < 2:
-        return f"ns={ns} x ks={ks} must be a 2..16 cluster"
+def chain_shape_error(nq, nkv, niq, head_dim, rot, k_dim):
+    """Why the kernel cannot take this head shape, or None."""
+    if min(nq, nkv, niq) < 1:
+        return "num_heads, num_kv_heads and num_index_heads must be >= 1"
+    if head_dim != D:
+        # one wave of 32 lanes x 4 dims a row; the NVFP4 rows are 64 + 8 bytes
+        return f"head_dim={head_dim}: only {D}"
+    if rot % 8 or not 0 < rot <= head_dim:
+        # 4 dims a lane stay inside one rotary half
+        return f"rotary_dim={rot}: a multiple of 8 in (0, {head_dim}]"
+    if k_dim % WMMA_K:
+        # whole 128-deep MXFP8 WMMA steps (and whole 32x4-shuffled scale dwords)
+        return f"hidden_size={k_dim}: a multiple of {WMMA_K}"
+    return None
+
+
+def chain_config_error(k_dim, tile_m, ns, ks, kw, wm, wn, depth, astage=1):
+    steps_total = k_dim // WMMA_K
+    nb = D // 16  # 16-column blocks of a head
+    if nb % ns or ns * ks > 16 or ns * ks < 2:
+        return f"ns={ns} x ks={ks} must be a 2..16 cluster, ns dividing {nb}"
     if steps_total % (ks * kw):
         return f"ks={ks} x kw={kw} must divide {steps_total} K steps"
     if tile_m % 16 or not 16 <= tile_m <= 256:
         return f"tile_m={tile_m}"
-    if (tile_m // 16) % wm or (8 // ns) % wn:
+    if (tile_m // 16) % wm or (nb // ns) % wn:
         return (
-            f"wm={wm} / wn={wn} do not divide the {tile_m // 16}x{8 // ns} block grid"
+            f"wm={wm} / wn={wn} do not divide the {tile_m // 16}x{nb // ns} block grid"
         )
     steps = steps_total // ks
     block = kw * wm * wn * WAVE
@@ -98,11 +112,11 @@ def chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage=1):
         return "more than 32 waves"
     if astage == 1 and (tile_m * steps * 8) % block:
         return "staged activation does not divide over the block"
-    if astage == 2 and ((K_DIM // ks) % A_KC or block // WAVE < (K_DIM // ks) // A_KC):
+    if astage == 2 and ((k_dim // ks) % A_KC or block // WAVE < (k_dim // ks) // A_KC):
         return f"TDM activation: whole {A_KC}-byte K chunks, one wave a chunk"
     if depth < 1:
         return "depth >= 1"
-    if chain_lds_bytes(tile_m, ns, ks, kw, astage) > 320 * 1024:
+    if chain_lds_bytes(k_dim, tile_m, ns, ks, kw, astage) > 320 * 1024:
         return "LDS over 320 KB"
     return None
 
@@ -111,11 +125,11 @@ A_KC = 512  # K bytes of one TDM activation chunk (the pad interval must be <= 1
 A_PAD = 16  # its LDS row pad (the production GEMMs' LDS_PAD_A)
 
 
-def chain_lds_bytes(tile_m, ns, ks, kw, astage=1):
+def chain_lds_bytes(k_dim, tile_m, ns, ks, kw, astage=1):
     if astage == 2:
-        a = (K_DIM // ks) // A_KC * tile_m * (A_KC + A_PAD)
+        a = (k_dim // ks) // A_KC * tile_m * (A_KC + A_PAD)
     else:
-        a = tile_m * (K_DIM // ks) if astage else 0
+        a = tile_m * (k_dim // ks) if astage else 0
     p = kw * tile_m * (D // ns * 4 + P_PAD)
     return max(a, p)
 
@@ -243,6 +257,12 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     i64_is_page: fx.Int64,
     i32_eps: fx.Int32,
     stream: fx.Stream,
+    nq: Constexpr[int],
+    nkv: Constexpr[int],
+    niq: Constexpr[int],
+    head_dim: Constexpr[int],
+    rot: Constexpr[int],
+    k_dim: Constexpr[int],
     tile_m: Constexpr[int],
     ns: Constexpr[int],
     ks: Constexpr[int],
@@ -250,12 +270,13 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     wm: Constexpr[int],
     wn: Constexpr[int],
     depth: Constexpr[int],
-    niq: Constexpr[int],
+    astage: Constexpr[int],
+    wcpol: Constexpr[int],
+    owner_keeps: Constexpr[int],
     write_qkv: Constexpr[bool],
-    astage: Constexpr[int] = 1,
-    wcpol: Constexpr[int] = 0,
-    owner_keeps: Constexpr[int] = 0,
 ):
+    # Shape: nq q heads, nkv K and nkv V heads, niq index-q heads and one index-k
+    # head of head_dim columns, rotary dim rot, hidden size k_dim.
     # astage 1: the activation slab is staged in LDS through VGPRs; 2: by TDM in
     # 512-byte K chunks into padded LDS rows (the production gfx1250 GEMMs'
     # non-multicast descriptor + pipeline_fence); 0: each wave loads its
@@ -264,11 +285,13 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     # policy (1: non-temporal; every weight byte is read once). owner_keeps: a rank's
     # own K-part of the rows it reduces stays in its LDS K-wave planes (and padding
     # rows are never written), so only the other ranks' rows cross the slab.
-    err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
+    err = chain_shape_error(nq, nkv, niq, head_dim, rot, k_dim) or chain_config_error(
+        k_dim, tile_m, ns, ks, kw, wm, wn, depth, astage
+    )
     if err is not None:
         raise ValueError(f"qkv chain: {err}")
-    K = K_DIM
-    HEADS = chain_heads(niq)
+    K = k_dim
+    HEADS = chain_heads(nq, nkv, niq)
     N = HEADS * D
     csize = ns * ks
     steps = K // WMMA_K // ks  # K steps of a workgroup
@@ -287,18 +310,21 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
     sa_loads = mbw // 2 if sa_opsel else mbw
     KB4 = K // 128  # activation-scale dwords of a row
     per_thr = tile_m * CPR // block
-    lds_bytes = chain_lds_bytes(tile_m, ns, ks, kw, astage)
+    lds_bytes = chain_lds_bytes(K, tile_m, ns, ks, kw, astage)
     P_ROW = cols * 4 + P_PAD  # LDS pitch of a partial row
     P_PLANE = tile_m * P_ROW
     p_units = tile_m * cols // 4  # float4s of a partial tile
     U_ROW = cols // 4
     rpr = (tile_m + csize - 1) // csize  # rows a cluster rank reduces
     row_iters = (rpr + waves - 1) // waves
-    IQ0 = NQ + 2 * NKV  # first index-q head
+    V0 = nq + nkv  # first V head
+    IQ0 = V0 + nkv  # first index-q head
     IK = IQ0 + niq  # the index-k head
+    RH = rot // 8  # lanes of a rotary half (4 dims a lane)
     cpol = CPOL_DEV
     kernel_name = (
-        f"mxfp8_qkv_norm_rope_nvfp4_insert_gfx1250_n{N}_t{tile_m}_ns{ns}_ks{ks}"
+        f"mxfp8_qkv_norm_rope_nvfp4_insert_gfx1250_q{nq}_kv{nkv}_iq{niq}_hd{head_dim}"
+        f"_r{rot}_k{K}_t{tile_m}_ns{ns}_ks{ks}"
         f"_w{kw}x{wm}x{wn}_d{depth}{'_wq' if write_qkv else ''}{'' if astage == 1 else ('_tdmA' if astage == 2 else '_dA')}"
         f"{f'_c{wcpol}' if wcpol else ''}{'_ok' if owner_keeps else ''}"
     )
@@ -392,7 +418,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
         ]
         sb_buf = ptr_buf_tensor(arg_ws, fx.Int32)
 
-        nblk0 = head * 8 + npart * nbt + w_n * nbw
+        nblk0 = head * (D // 16) + npart * nbt + w_n * nbw
         b_base = [(nblk0 + j) * K + lane for j in range_constexpr(nbw)]
         sb_col = [(nblk0 + j) * 16 + lane16 for j in range_constexpr(nbw)]
         sb_base = [(c // 32) * (K // 4) + c % 32 for c in sb_col]
@@ -631,17 +657,25 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             compute_step(st, afr)
 
         # ---- epilogue inputs that are not partials: in flight across the barrier ----
-        is_q = head < NQ
-        is_k = head == NQ
-        is_v = head == NQ + NKV
+        is_q = head < nq
+        is_k = (head >= nq) & (head < V0)
+        is_v = (head >= V0) & (head < IQ0)
         is_iq = (head >= IQ0) & (head < IK)
         is_ik = head == IK
         hl = lane
         dim0 = hl * 4
-        first = hl < (ROT // 8)  # dims < rotary / 2
-        in_rope = hl < (ROT // 4)  # dims < rotary
-        ib = first.select(dim0, dim0 - ROT // 2)
+        first = hl < RH  # dims < rotary / 2
+        in_rope = hl < 2 * RH  # dims < rotary
+        ib = first.select(dim0, dim0 - rot // 2)
         ib = in_rope.select(ib, fx.Int32(0))
+
+        def _rope_partner(x):
+            """x of the lane that holds the other rotary half of this lane's dims."""
+            if const_expr(RH & (RH - 1) == 0):
+                return _xor(x, RH)  # hl ^ RH is hl +- RH on the rotary lanes
+            src = first.select(hl + RH, hl - RH)
+            return fx.Float32(fx.shuffle_idx(fx.Float32(x), src, WAVE))
+
         w_addr = is_q.select(
             fx.Int64(fx.ptrtoint(arg_qw)),
             is_k.select(
@@ -698,14 +732,14 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
                 if u < p_units:
                     buf_copy_store(slab_buf, g, tot, fx.Float32, 4, cache_modifier=cpol)
         cs_buf = ptr_buf_tensor(
-            arg_cs, fx.Int32, unit_elems=2, num_records_bytes=i32_cs_rows * (ROT * 2)
+            arg_cs, fx.Int32, unit_elems=2, num_records_bytes=i32_cs_rows * (rot * 2)
         )
         e_cos = []
         e_sin = []
         for t in range_constexpr(row_iters):
-            off = e_pos[t] * (ROT // 4) + ib // 4  # units of 4 bf16
+            off = e_pos[t] * (rot // 4) + ib // 4  # units of 4 bf16
             e_cos.append(Vec(buf_copy_load(cs_buf, off, fx.Int32, 2)))
-            e_sin.append(Vec(buf_copy_load(cs_buf, off + ROT // 8, fx.Int32, 2)))
+            e_sin.append(Vec(buf_copy_load(cs_buf, off + RH, fx.Int32, 2)))
 
         rocdl.s_wait_storecnt(0)
         cluster.cluster_barrier()
@@ -740,7 +774,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
                     own = part if own is None else own + part
                 owns.append(own)
         q_buf = ptr_buf_tensor(
-            arg_q, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (NQ * D * 2)
+            arg_q, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (nq * D * 2)
         )
         iq_buf = ptr_buf_tensor(
             arg_iq, fx.Int32, unit_elems=2, num_records_bytes=i32_m * (niq * D * 2)
@@ -767,7 +801,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             raw = acc4.to(fx.BFloat16)
             raw_w = raw.bitcast(fx.Int32)  # 2 dwords
             e = _bf16x4(raw_w)
-            if const_expr(write_qkv):
+            if const_expr(write_qkv):  # noqa: SIM102
                 if valid:
                     buf_copy_store(
                         qkv_buf, (row * N + head * D) // 4 + hl, raw_w, fx.Int32, 2
@@ -779,13 +813,13 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             ss = fx.math.fma(e[3], e[3], ss)
             for msk in (16, 8, 4, 2, 1):
                 ss = ss + _xor(ss, msk)
-            r = _rsq(fx.math.fma(ss, fx.Float32(0.0078125), eps))
+            r = _rsq(fx.math.fma(ss, fx.Float32(1.0 / D), eps))
             nrm = [(e[i] * r) * (fx.Float32(1.0) + w[i]) for i in range_constexpr(4)]
             cos = _bf16x4(e_cos[t])
             sin = _bf16x4(e_sin[t])
             y = []
             for i in range_constexpr(4):
-                pr = _xor(nrm[i], ROT // 8)
+                pr = _rope_partner(nrm[i])
                 ps = pr * sin[i]
                 roped = fx.math.fma(nrm[i], cos[i], first.select(-ps, ps))
                 y.append(in_rope.select(roped, nrm[i]))
@@ -794,7 +828,7 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             if valid:
                 if is_q:
                     buf_copy_store(
-                        q_buf, (row * (NQ * D) + head * D) // 4 + hl, yw, fx.Int32, 2
+                        q_buf, (row * (nq * D) + head * D) // 4 + hl, yw, fx.Int32, 2
                     )
                 if is_iq:
                     buf_copy_store(
@@ -812,14 +846,14 @@ def launch_mxfp8_qkv_norm_rope_nvfp4_insert(
             page = fx.Int64(slot >> 7)
             pos = fx.Int64(slot & 127)
             kv = is_k | is_v
-            pay = kv.select(
-                is_k.select(kp_base, vp_base) + page * i64_kp_page + pos * 64,
-                ip_base + page * i64_ip_page + pos * 64,
-            )
-            sca = kv.select(
-                is_k.select(ksc_base, vsc_base) + page * i64_ks_page + pos * 8,
-                isc_base + page * i64_is_page + pos * 8,
-            )
+            kp_row = is_k.select(kp_base, vp_base) + page * i64_kp_page + pos * 64
+            ks_row = is_k.select(ksc_base, vsc_base) + page * i64_ks_page + pos * 8
+            if const_expr(nkv > 1):
+                kvh = fx.Int64(is_k.select(head - nq, head - V0))
+                kp_row = kp_row + kvh * i64_kp_head
+                ks_row = ks_row + kvh * i64_ks_head
+            pay = kv.select(kp_row, ip_base + page * i64_ip_page + pos * 64)
+            sca = kv.select(ks_row, isc_base + page * i64_is_page + pos * 8)
             if valid & (slot >= 0) & (kv | is_ik):
                 fx.ptr_store(code.to(fx.Int16), _gptr(pay + fx.Int64(hl * 2), T.i16, 2))
                 if hl % 4 == 0:
