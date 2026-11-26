@@ -10,6 +10,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.dtypes import fp8, fp8_e8m0
 
 _LOGGER = AiterTritonLogger()
 
@@ -206,7 +207,7 @@ def all_reduce_rmsnorm_per_token_quant(
         LINES=_LINES,
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
-        QUANT=bool(quant),
+        NORM=2 if quant else 1,
         HIDDEN=hidden,
         GEMMA=bool(gemma),
         EPS=float(eps),
@@ -217,3 +218,92 @@ def all_reduce_rmsnorm_per_token_quant(
     if quant:
         return out, residual_out, scale
     return out, residual_out
+
+
+def all_reduce_rmsnorm_mxfp8_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+    group,
+    inboxes,
+    calls: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run TP4 all-reduce + residual + RMSNorm + native group-32 MXFP8.
+
+    The activation values are E4M3 and the scale is row-major E8M0 with shape
+    ``(tokens, hidden // 32)``. All ranks must make the same calls in the same
+    order.
+    """
+    if x.dim() != 2 or x.shape[-1] % 32:
+        raise ValueError(
+            "MXFP8 all-reduce RMSNorm requires a 2-D input with hidden size "
+            "divisible by 32"
+        )
+
+    tokens, hidden = x.shape
+    if x.dtype != torch.bfloat16:
+        raise ValueError("MXFP8 all-reduce RMSNorm requires BF16 inputs")
+    if residual.dtype != x.dtype or weight.dtype != x.dtype:
+        raise ValueError("input, residual, and weight must have the same BF16 dtype")
+    if residual.shape != x.shape or weight.shape != (hidden,):
+        raise ValueError(
+            "residual must match input and weight must have shape (hidden,)"
+        )
+    if (
+        not x.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("input, residual, and weight must be contiguous")
+
+    out = torch.empty(x.shape, dtype=fp8, device=x.device)
+    residual_out = torch.empty_like(x)
+    scale = torch.empty(
+        (tokens, hidden // 32),
+        dtype=fp8_e8m0,
+        device=x.device,
+    )
+    if tokens == 0:
+        return out, residual_out, scale
+    if not norm_fits(tokens, hidden, calls):
+        raise ValueError("input does not fit the Gluon all-reduce inbox")
+
+    # Keep the current main behavior for misaligned operands: copy them so all
+    # ranks stay on the same collective path instead of dispatching by address.
+    x, residual, weight = (
+        tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
+        for tensor in (x, residual, weight)
+    )
+
+    # Sixteen waves reduce sender workgroups by half and win only at these
+    # measured launch crossovers; all other rows keep norm_waves(hidden).
+    waves = 16 if tokens in (120, 128) and hidden == 6144 else norm_waves(hidden)
+    chunks = (calls.numel() - 1) // 2
+    num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)
+
+    _LOGGER.info("ALL_REDUCE_RMSNORM_MXFP8_QUANT [gluon]: x=%s", x.shape)
+    _all_reduce_rmsnorm_kernel[(triton.cdiv(num_chunks, waves) + tokens,)](
+        x,
+        residual_out,
+        inboxes,
+        calls,
+        calls[-1:],
+        tokens,
+        residual,
+        weight,
+        out,
+        scale.view(torch.uint8),
+        RANK=dist.get_rank(group),
+        LINES=_LINES,
+        SLOT=4 * _LINES * chunks,
+        MAXIT=_MAXIT,
+        NORM=3,
+        HIDDEN=hidden,
+        GEMMA=bool(gemma),
+        EPS=float(eps),
+        num_warps=waves,
+        enable_fp_fusion=False,
+    )
+    return out, residual_out, scale

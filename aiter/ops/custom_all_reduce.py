@@ -744,3 +744,103 @@ def launch_fused_allreduce_mhc_post_split(
         reg_ptr=reg_ptr,
         reg_bytes=reg_bytes,
     )
+
+
+# ---- gfx1250 pushed two-shot all-reduce + residual add + RMSNorm (prefill sizes) ----
+# Every rank allocates ar2s_rms_buffer_size_gfx1250 data bytes and
+# ar2s_rms_flags_size_gfx1250 flag bytes (cached, IPC), maps every rank's
+# buffers, calls init_ar2s_rms_gfx1250 once and barriers before the first call.
+AR2S_MD_NAME = "module_ar_2shot_rms_gfx1250"
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_buffer_size", develop=True)
+def ar2s_rms_buffer_size_gfx1250(world_size: int, max_bytes: int) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_flags_size", develop=True)
+def ar2s_rms_flags_size_gfx1250() -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="init_ar2s_rms", develop=True)
+def init_ar2s_rms_gfx1250(
+    rank: int, data_ptrs: list[int], flag_ptrs: list[int], max_bytes: int, grid: int
+) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_max_rows", develop=True)
+def ar2s_rms_max_rows_gfx1250(ctx: int, hidden: int) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms", develop=True)
+def ar2s_rms_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+) -> None: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_ex", develop=True)
+def ar2s_rms_ex_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    out_q: int,
+    out_s: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    fp8_out: bool,
+    sp_residual: bool,
+    aux_residual: bool,
+    grid: int = 0,
+) -> None: ...
+
+
+# ---- gfx1250 TP4 one-shot all-reduce + residual add + RMSNorm (+ MXFP8), decode sizes ----
+# Every rank allocates k5_ar_buffer_size_gfx1250 inbox bytes (cached, IPC), maps every rank's
+# inbox, calls init_k5_ar_gfx1250 once (it arms its own inbox) and barriers before the first call.
+K5_AR_MD_NAME = "module_ar_k5_gfx1250"
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_buffer_size", develop=True)
+def k5_ar_buffer_size_gfx1250(world_size: int, max_rows: int, hidden: int) -> int: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="init_k5_ar", develop=True)
+def init_k5_ar_gfx1250(
+    rank: int, inbox_ptrs: list[int], max_rows: int, hidden: int
+) -> int: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_rms", develop=True)
+def k5_ar_rms_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    scale: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+    lamport_order: bool,
+    fp8_out: bool,
+    maxit: int,
+) -> None: ...
+
+
+@compile_ops(K5_AR_MD_NAME, fc_name="k5_ar_errors", develop=True)
+def k5_ar_errors_gfx1250(ctx: int) -> int: ...
