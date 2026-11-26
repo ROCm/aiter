@@ -268,10 +268,9 @@ def flydsl_hgemm(
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
     A/B are made contiguous before launch. Other unsupported inputs raise
     rather than silently selecting a different kernel.
-    On gfx1250 FT/HT, passing ``k_out``, ``v_out``, ``k_rope`` and
-    ``split_sizes=(k_nope, v_dim)`` selects the opt-in MLA split-cat epilogue.
-    It returns the two preallocated outputs. Omitting all four arguments keeps
-    the existing GEMM path.
+    On gfx1250 ft/ht/hti, ``split_sizes=(k_size, v_size)`` stores the output
+    into ``k_out`` and ``v_out`` heads, with ``k_rope`` in every K head's tail,
+    and returns ``(k_out, v_out)``; see ``gemm_a16w16_gfx1250.gemm_a16w16``.
     """
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
@@ -292,10 +291,7 @@ def flydsl_hgemm(
         raise ValueError("BF16 preshuffle requires gfx950 sk or unsplit ft policy")
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
-    split_cat_requested = any(
-        value is not None for value in (k_out, v_out, k_rope, split_sizes)
-    )
-    if split_cat_requested and (
+    if split_sizes is not None and (
         gfx not in ("gfx1250", "gfx1250-strict") or policy not in ("ft", "ht", "hti")
     ):
         raise ValueError("split-cat outputs require a gfx1250 FT/HT HGEMM policy")
@@ -391,16 +387,6 @@ def flydsl_hgemm(
     if gfx in ("gfx1250", "gfx1250-strict"):
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
-        split_cat_kwargs = (
-            {
-                "k_out": k_out,
-                "v_out": v_out,
-                "k_rope": k_rope,
-                "split_sizes": split_sizes,
-            }
-            if split_cat_requested
-            else {}
-        )
         with torch.cuda.stream(launch_stream):
             return gemm_a16w16_gfx1250(
                 a,
@@ -416,7 +402,10 @@ def flydsl_hgemm(
                 num_buffers=stages,
                 split_k=split_k,
                 main_loop_unroll=policy in ("ht", "hti"),
-                **split_cat_kwargs,
+                k_out=k_out,
+                v_out=v_out,
+                k_rope=k_rope,
+                split_sizes=split_sizes,
             )
     if gfx != "gfx950":
         raise RuntimeError(

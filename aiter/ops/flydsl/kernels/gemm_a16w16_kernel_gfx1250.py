@@ -64,10 +64,9 @@ def compile_gemm_a16w16(
     sched_strategy: str | None = None,
     main_loop_unroll: bool = False,
     variant: str = "bandwidth_bound",
-    split_cat: bool = False,
-    k_split_size: int = 0,
-    v_split_size: int = 0,
-    rope_size: int = 0,
+    # (k_size, v_size, rope_size): store Y's [head, k_size + v_size] columns
+    # into K and V heads instead of Y; see store_split_cat.
+    split_cat: tuple[int, int, int] | None = None,
 ):
     def _req(cond, msg):
         if not cond:
@@ -86,29 +85,6 @@ def compile_gemm_a16w16(
         f"bad sched_strategy {sched_strategy!r}",
     )
     _req(split_k >= 1, f"split_k must be >= 1, got {split_k}")
-    split_width = k_split_size + v_split_size
-    if split_cat:
-        _req(out_dtype == "bf16", "split-cat requires BF16 output")
-        _req(
-            k_split_size > 0 and k_split_size % 8 == 0,
-            f"k_split_size must be a positive multiple of 8, got {k_split_size}",
-        )
-        _req(
-            v_split_size > 0 and v_split_size % 8 == 0,
-            f"v_split_size must be a positive multiple of 8, got {v_split_size}",
-        )
-        _req(
-            rope_size > 0 and rope_size % 8 == 0,
-            f"rope_size must be a positive multiple of 8, got {rope_size}",
-        )
-        _req(
-            rope_size <= v_split_size,
-            f"rope_size={rope_size} cannot exceed v_split_size={v_split_size}",
-        )
-        _req(
-            N % split_width == 0,
-            f"N={N} must be divisible by split width {split_width}",
-        )
 
     elem_bytes = 2
     elem_bytes_d = 2 if out_dtype in ("f16", "bf16") else 4
@@ -187,6 +163,9 @@ def compile_gemm_a16w16(
 
     _TDMS_PER_TILE = 2  # A + B
     n_edge = N % tile_n
+    if split_cat is not None:
+        k_size, v_size, rope_size = split_cat
+        head_size = k_size + v_size
 
     @flyc.kernel
     def kernel_gemm_a16w16(
@@ -200,10 +179,8 @@ def compile_gemm_a16w16(
         i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldb: fx.Int32,
-        arg_k_out: fx.Pointer,
-        arg_v_out: fx.Pointer,
-        arg_k_rope: fx.Pointer,
-        i32_k_row_stride: fx.Int32,
+        arg_v: fx.Pointer,
+        arg_rope: fx.Pointer,
         i32_k_head_stride: fx.Int32,
         i32_v_row_stride: fx.Int32,
         i32_v_head_stride: fx.Int32,
@@ -237,8 +214,8 @@ def compile_gemm_a16w16(
             max_size=False,
             num_records_bytes=m_idx * ld_y * elem_bytes_d,
         )
-        if const_expr(split_cat):
-            k_row_stride = fx.Uint64(i32_k_row_stride)
+        if const_expr(split_cat is not None):
+            # Y is K's storage, so ld_y is K's row stride.
             k_head_stride = fx.Uint64(i32_k_head_stride)
             v_row_stride = fx.Uint64(i32_v_row_stride)
             v_head_stride = fx.Uint64(i32_v_head_stride)
@@ -251,9 +228,8 @@ def compile_gemm_a16w16(
                     num_records_bytes=m_idx * row_stride * elem_bytes_d,
                 )
 
-            gK = _out_buffer(arg_k_out, k_row_stride)
-            gV = _out_buffer(arg_v_out, v_row_stride)
-            gRope = _out_buffer(arg_k_rope, rope_row_stride)
+            gV = _out_buffer(arg_v, v_row_stride)
+            gRope = _out_buffer(arg_rope, rope_row_stride)
         if const_expr(split_k > 1):
             tiles_n = (N + tile_n - 1) // tile_n
             n_pad = tiles_n * tile_n
@@ -596,6 +572,27 @@ def compile_gemm_a16w16(
                         elems.append(total[vi])
                 return fx.Vector.from_elements(elems, fx.Float32)
 
+            def store_split_cat(h_vec, row, col_base):
+                # Y column c of head h = c // head_size goes to K[row, h, c] if
+                # c < k_size, else to V[row, h, c - k_size]. The lanes storing
+                # V columns below rope_size also copy k_rope[row] to K's tail.
+                if fx.Int32(col_base) < fx.Int32(N):
+                    head = col_base // head_size
+                    head_col = col_base - head * head_size
+                    if head_col < k_size:
+                        k_off = row * ld_y + head * k_head_stride + head_col
+                        fx.copy(st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, k_off])
+                    else:
+                        v_col = head_col - k_size
+                        v_off = row * v_row_stride + head * v_head_stride + v_col
+                        fx.copy(st_atom, _rmem_vec(h_vec, 8, _out_num), gV[None, v_off])
+                        if v_col < rope_size:
+                            rope = fx.make_rmem_tensor(8, _out_num)
+                            rope_off = row * rope_row_stride + v_col
+                            fx.copy(st_atom, gRope[None, rope_off], rope)
+                            rope_k_off = row * ld_y + head * k_head_stride + k_size
+                            fx.copy(st_atom, rope, gY[None, rope_k_off + v_col])
+
             def store_final(acc, row, col_base, wn):
                 if const_expr(add_bias):
                     acc = acc + bias_vecs[wn]
@@ -609,60 +606,28 @@ def compile_gemm_a16w16(
                     ).ir_value()
                 if const_expr(_half_out):
                     h_vec = fx.Vector(acc).to(_out_num)
-                    h_rmem = _rmem_vec(h_vec, 8, _out_num)
-                    if const_expr(split_cat):
-                        if fx.Int32(col_base) < fx.Int32(N):
-                            source_col = fx.Uint64(col_base)
-                            head = source_col // split_width
-                            head_col = source_col - head * split_width
-                            if head_col < k_split_size:
-                                k_off = (
-                                    row * k_row_stride + head * k_head_stride + head_col
-                                )
-                                fx.copy(st_atom, h_rmem, gK[None, k_off])
-                            else:
-                                v_col = head_col - k_split_size
-                                v_off = (
-                                    row * v_row_stride + head * v_head_stride + v_col
-                                )
-                                fx.copy(st_atom, h_rmem, gV[None, v_off])
-                                if v_col < rope_size:
-                                    rope_rmem = fx.make_rmem_tensor(8, _out_num)
-                                    fx.copy(
-                                        st_atom,
-                                        gRope[None, row * rope_row_stride + v_col],
-                                        rope_rmem,
-                                    )
-                                    rope_k_off = (
-                                        row * k_row_stride
-                                        + head * k_head_stride
-                                        + k_split_size
-                                        + v_col
-                                    )
-                                    fx.copy(st_atom, rope_rmem, gK[None, rope_k_off])
+                    c_off = row * ld_y + col_base
+                    if const_expr(split_cat is not None):
+                        store_split_cat(h_vec, row, col_base)
+                    elif const_expr(n_edge == 0):
+                        fx.copy(st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off])
                     else:
-                        c_off = row * ld_y + col_base
-                        if const_expr(n_edge == 0):
+                        n_left = fx.Int32(N) - fx.Int32(col_base)
+                        if n_left >= 8:
                             fx.copy(
-                                st_atom,
-                                h_rmem,
-                                gY[None, c_off],
+                                st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off]
                             )
-                        else:
-                            n_left = fx.Int32(N) - fx.Int32(col_base)
-                            if n_left >= 8:
-                                fx.copy(st_atom, h_rmem, gY[None, c_off])
-                            if n_left < 8:
-                                for e in range_constexpr(8):
-                                    if fx.Int32(e) < n_left:
-                                        one_vec = fx.Vector.from_elements(
-                                            [h_vec[e]], _out_num
-                                        )
-                                        fx.copy(
-                                            st1_atom,
-                                            _rmem_vec(one_vec, 1, _out_num),
-                                            gY[None, c_off + e],
-                                        )
+                        if n_left < 8:
+                            for e in range_constexpr(8):
+                                if fx.Int32(e) < n_left:
+                                    one_vec = fx.Vector.from_elements(
+                                        [h_vec[e]], _out_num
+                                    )
+                                    fx.copy(
+                                        st1_atom,
+                                        _rmem_vec(one_vec, 1, _out_num),
+                                        gY[None, c_off + e],
+                                    )
                 else:
                     for half in range_constexpr(2):
                         vec4 = _vec4(acc, half)
@@ -823,111 +788,56 @@ def compile_gemm_a16w16(
             rocdl.sched_barrier(0)
         epilogue_stores(accs)
 
-    if split_cat:
+    @flyc.jit
+    def launch_gemm_a16w16(
+        arg_y: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_ws: fx.Pointer,
+        arg_sem: fx.Pointer,
+        i32_m: fx.Int32,
+        i32_ldy: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldb: fx.Int32,
+        arg_v: fx.Pointer,
+        arg_rope: fx.Pointer,
+        i32_k_head_stride: fx.Int32,
+        i32_v_row_stride: fx.Int32,
+        i32_v_head_stride: fx.Int32,
+        i32_rope_row_stride: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
+        gy = (N + tile_n - 1) // tile_n
 
-        @flyc.jit
-        def launch_gemm_a16w16(
-            arg_y: fx.Pointer,
-            arg_x: fx.Pointer,
-            arg_w: fx.Pointer,
-            arg_bias: fx.Pointer,
-            arg_ws: fx.Pointer,
-            arg_sem: fx.Pointer,
-            i32_m: fx.Int32,
-            i32_ldy: fx.Int32,
-            i32_lda: fx.Int32,
-            i32_ldb: fx.Int32,
-            arg_k_out: fx.Pointer,
-            arg_v_out: fx.Pointer,
-            arg_k_rope: fx.Pointer,
-            i32_k_row_stride: fx.Int32,
-            i32_k_head_stride: fx.Int32,
-            i32_v_row_stride: fx.Int32,
-            i32_v_head_stride: fx.Int32,
-            i32_rope_row_stride: fx.Int32,
-            stream: fx.Stream,
-        ):
-            gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
-            gy = (N + tile_n - 1) // tile_n
+        wpe = int(waves_per_eu) if waves_per_eu is not None else 0
+        launcher = kernel_gemm_a16w16(
+            arg_y,
+            arg_x,
+            arg_w,
+            arg_bias,
+            arg_ws,
+            arg_sem,
+            i32_m,
+            i32_ldy,
+            i32_lda,
+            i32_ldb,
+            arg_v,
+            arg_rope,
+            i32_k_head_stride,
+            i32_v_row_stride,
+            i32_v_head_stride,
+            i32_rope_row_stride,
+            value_attrs={
+                "rocdl.flat_work_group_size": f"{block_threads},{block_threads}",
+                "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
+            },
+        )
 
-            wpe = int(waves_per_eu) if waves_per_eu is not None else 0
-            launcher = kernel_gemm_a16w16(
-                arg_y,
-                arg_x,
-                arg_w,
-                arg_bias,
-                arg_ws,
-                arg_sem,
-                i32_m,
-                i32_ldy,
-                i32_lda,
-                i32_ldb,
-                arg_k_out,
-                arg_v_out,
-                arg_k_rope,
-                i32_k_row_stride,
-                i32_k_head_stride,
-                i32_v_row_stride,
-                i32_v_head_stride,
-                i32_rope_row_stride,
-                value_attrs={
-                    "rocdl.flat_work_group_size": (f"{block_threads},{block_threads}"),
-                    "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
-                },
-            )
-
-            launcher.launch(
-                grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
-            )
-
-    else:
-
-        @flyc.jit
-        def launch_gemm_a16w16(
-            arg_y: fx.Pointer,
-            arg_x: fx.Pointer,
-            arg_w: fx.Pointer,
-            arg_bias: fx.Pointer,
-            arg_ws: fx.Pointer,
-            arg_sem: fx.Pointer,
-            i32_m: fx.Int32,
-            i32_ldy: fx.Int32,
-            i32_lda: fx.Int32,
-            i32_ldb: fx.Int32,
-            stream: fx.Stream,
-        ):
-            gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
-            gy = (N + tile_n - 1) // tile_n
-
-            wpe = int(waves_per_eu) if waves_per_eu is not None else 0
-            launcher = kernel_gemm_a16w16(
-                arg_y,
-                arg_x,
-                arg_w,
-                arg_bias,
-                arg_ws,
-                arg_sem,
-                i32_m,
-                i32_ldy,
-                i32_lda,
-                i32_ldb,
-                arg_y,
-                arg_y,
-                arg_y,
-                i32_ldy,
-                i32_ldy,
-                i32_ldy,
-                i32_ldy,
-                i32_ldy,
-                value_attrs={
-                    "rocdl.flat_work_group_size": (f"{block_threads},{block_threads}"),
-                    "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
-                },
-            )
-
-            launcher.launch(
-                grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
-            )
+        launcher.launch(
+            grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
+        )
 
     _llvm_opts = {
         "amdgpu-expert-scheduling-mode": True,
