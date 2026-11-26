@@ -28,15 +28,21 @@ Requirements: fp8 Q / KV with per-tensor descales, page_size 1, one KV head, a K
 request. A plan that needs more than ``item_cap`` work items (1024 by default; 128 heads x 8
 tokens x batch 128 under CP needs 1216) makes ``plan`` raise a ``ValueError`` naming both numbers.
 
-When to use it. Measured on MI355X against ``mla_decode_fwd`` at 66k tokens of context per request:
+When to use it. Speedup over the faster of the two ``mla_decode_fwd`` paths (default asm or
+``AITER_MLA_USE_OPUS=1``), on MI355X at 66k tokens of context per request and batch 1-64:
 
-- round-robin CP, requests of 96 rows or more (``q_len * num_heads``): within 8% either way at
-  batch 1-8 when the request is a single chunk, faster from batch 16; requests of 2+ chunks are
-  on par at batch 1-4 and 1.3-2.7x faster from batch 8;
-- no CP, 12 or 16 heads: 1.1-1.2x faster from batch 8 with several tokens per request; at batch
-  4 and below ``mla_decode_fwd`` is up to 1.6x faster, and one token at 16 heads is on par at best;
-- round-robin CP, requests under 96 rows (a few tokens at 12-64 heads): keep ``mla_decode_fwd``
-  below batch 32 (64 rows) to batch 64 (12-16 rows), where it is up to 2x faster.
+- round-robin CP, requests of 96 rows or more (``q_len * num_heads``): 0.9-1.2x at batch 1-8
+  and 1.0-1.4x from batch 16 when the request is a single chunk; with 2+ chunks 0.9-1.6x at
+  batch 1-4 (2.0-2.8x at 768 rows) and 1.0-2.2x from batch 8;
+- no CP, 12 or 16 heads, 2+ tokens per request: 0.7-1.0x at batch 1-2 and 0.9-1.2x from batch
+  4 (on par at 16 heads with 3-4 tokens);
+- no CP, one token per request: 0.6-0.9x at batch 1-4 and 0.9-1.1x from batch 8;
+- round-robin CP, requests under 96 rows (a few tokens at 12-64 heads): 0.55-1.15x up to
+  batch 16, 0.75-1.15x at batch 32 and 0.9-1.2x at batch 64.
+
+So keep ``mla_decode_fwd`` without CP at batch 1-2, at 16 heads with 3-4 tokens and with one
+token per request, and under round-robin CP for requests under 96 rows below batch 32 (64-72
+rows) to batch 64 (12-16 rows).
 
 Toolchain: the kernel keeps O in all 256 AccVGPRs and issues its PV MFMAs as inline asm, so the
 module is built with ``--amdgpu-mfma-vgpr-form`` to keep the compiler's own MFMA results out of
