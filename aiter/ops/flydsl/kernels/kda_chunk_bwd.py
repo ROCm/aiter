@@ -1461,22 +1461,22 @@ def compile_wy_dqkg_mfma(
             b_dq += to_regs(run(s_do, LDK, hb, LDK, V), half, 16)
             b_dw += to_regs(run(s_dv, LDK, hb, LDK, V), half, 16)
 
-        # dh replaces h; dgk[k] = sum_v h[k, v] dh[k, v] re-reads h from global.
+        # dh replaces h in place: thread pair (k = tid // 2) walks half a row
+        # each, so dgk[k] = sum_v h[k, v] dh[k, v] accumulates from the h still
+        # in LDS without a serial chain of global loads.
         dh_v = _flat(dh, state)
-        for e in range_constexpr(K * V // NUM_THREADS):
-            i = tid + e * NUM_THREADS
-            kk = i // V
-            vv = i % V
-            lds_st(s_hd, kk * LDK + vv, ldg(dh_v, i, HN), BF)
+        kr = tid // 2
+        v_base = (tid % 2) * (V // 2)
+        part = _zero()
+        for e in range_constexpr(V // 2):
+            vv = v_base + e
+            x = ldg(dh_v, kr * V + vv, HN)
+            part = part + lds_ld(s_hd, kr * LDK + vv, BF) * x
+            lds_st(s_hd, kr * LDK + vv, x, BF)
+        part = part + part.shuffle_xor(fx.Int32(1), fx.Int32(64))
+        if tid % 2 == 0:
+            lds_st(s_dgk, kr, part)
         gpu.barrier()
-        if tid < K:
-            for vv, st in range(0, V, 1, init=[_zero()]):
-                vq = fx.Int32(vv)
-                res = yield [
-                    st[0]
-                    + lds_ld(s_hd, tid * LDK + vq, BF) * ldg(h_v, vq * K + tid, HN)
-                ]
-            lds_st(s_dgk, tid, _results(res, 1)[0])
 
         # dk = v_new dh^T
         b_dk = []
