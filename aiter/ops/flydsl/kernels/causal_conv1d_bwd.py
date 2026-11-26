@@ -31,6 +31,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr
 
+from aiter.ops.flydsl.kernels.act import sigmoid_batch
+
 _DEFAULT_STREAM = fx.Stream(None)
 
 _ELEMENT = {
@@ -60,6 +62,7 @@ def create_causal_conv1d_bwd_kernel(
     lanes: int,
     dtype: torch.dtype,
     state_dtype: torch.dtype,
+    runtime_loop: bool = False,
 ):
     """Launcher for one configuration.
 
@@ -143,12 +146,14 @@ def create_causal_conv1d_bwd_kernel(
         pid = fx.block_idx.x
         c = (fx.block_idx.y * block + fx.thread_idx.x) * lanes
         cc = fx.Int64(c)
+        # Token positions are int32 (cheaper compares); addresses are int64.
         seq = fx.Int32(batch_ids[pid])
-        chunk = fx.Int64(chunk_ids[pid])
-        start = fx.Int64(starts[seq])
-        length = fx.Int64(starts[seq + 1]) - start
+        chunk = fx.Int32(chunk_ids[pid])
+        start32 = fx.Int32(starts[seq])
+        start = fx.Int64(start32)
+        length = fx.Int32(starts[seq + 1]) - start32
         c0 = chunk * tokens
-        n_tok = (length - c0 < tokens).select(length - c0, fx.Int64(tokens))
+        n_tok = (length - c0 < tokens).select(length - c0, fx.Int32(tokens))
         last = length - 1
         slot = fx.Int64(seq)
         if const_expr(has_indices):
@@ -156,11 +161,11 @@ def create_causal_conv1d_bwd_kernel(
         # A padded sequence reads nothing live, so its gradients are exactly zero.
         live = length
         if const_expr(pad_slot is not None):
-            live = (slot == pad_slot).select(fx.Int64(0), length)
-        n_state = fx.Int64(0)
+            live = (slot == pad_slot).select(fx.Int32(0), length)
+        n_state = fx.Int32(0)
         if const_expr(has_initial):
             use = (fx.Int32(initial[seq]) != 0) & (live == length)
-            n_state = use.select(fx.Int64(halo), fx.Int64(0))
+            n_state = use.select(fx.Int32(halo), fx.Int32(0))
         zeros = fx.Vector.filled(lanes, 0.0, fx.Float32)
         one = fx.Vector.filled(lanes, 1.0, fx.Float32)
 
@@ -179,13 +184,17 @@ def create_causal_conv1d_bwd_kernel(
             base = zeros
             if const_expr(has_bias):
                 base = load_lanes(bias, cc, fx.Int64(1)).to(fx.Float32)
+            # Per-thread channel offsets, so a row adds only its token offset.
+            x_lane = cc * xs0
+            g_lane = gc * gs0
+            dx_lane = [(cc + lane) * ds0 for lane in range_constexpr(lanes)]
             # xw[j] = xe[c0 - halo + j], oldest first.
             xw = []
             for j in range_constexpr(halo):
                 pos = c0 - halo + j
                 in_x = (pos >= 0) & (pos < live)
-                safe = (pos >= 0).select(pos, fx.Int64(0))
-                value = load_lanes(x, cc * xs0 + (start + safe) * xs1, xs0).to(
+                safe = (pos >= 0).select(pos, fx.Int32(0))
+                value = load_lanes(x, x_lane + (start + fx.Int64(safe)) * xs1, xs0).to(
                     fx.Float32
                 )
                 value = vsel(in_x, value, zeros)
@@ -194,7 +203,8 @@ def create_causal_conv1d_bwd_kernel(
                     # Keep compile-time and runtime branches separate for FlyDSL.
                     if (pos < 0) & (pos + n_state >= 0):
                         hvalue = load_lanes(
-                            state, slot * ss[0] + cc * ss[1] + (pos + halo) * ss[2],
+                            state,
+                            slot * ss[0] + cc * ss[1] + fx.Int64(pos + halo) * ss[2],
                             fx.Int64(ss[1]),
                         ).to(fx.Float32)  # fmt: skip
                     value = value + hvalue
@@ -212,13 +222,13 @@ def create_causal_conv1d_bwd_kernel(
                 gs = []
                 for p in range_constexpr(prefetch):
                     pos = c0 + first + p
-                    safe = (pos < length).select(pos, last)
-                    xs.append(load_lanes(x, cc * xs0 + (start + safe) * xs1, xs0))
-                    gs.append(load_lanes(g, gc * gs0 + (start + safe) * gs1, gs0))
+                    tok = start + fx.Int64((pos < length).select(pos, last))
+                    xs.append(load_lanes(x, x_lane + tok * xs1, xs0))
+                    gs.append(load_lanes(g, g_lane + tok * gs1, gs0))
                 return xs + gs
 
             def row(i, raw_x, raw_g, xw, gw, dw, db, g_first, dx):
-                """Chunk row ``i`` (int64): update the sums, store dx[i - halo]."""
+                """Chunk row ``i`` (int32): update the sums, store dx[i - halo]."""
                 ok = (c0 + i) < live
                 xu = vsel(ok, raw_x.to(fx.Float32), zeros)
                 gu = vsel(ok, raw_g.to(fx.Float32), zeros)
@@ -227,7 +237,10 @@ def create_causal_conv1d_bwd_kernel(
                     pre = pre + weights[j] * xw[j]
                 dpre = gu
                 if const_expr(silu):
-                    sig = one / (one + fx.exp(-pre))
+                    # exp2 + rcp: the fast sigmoid of the other FlyDSL kernels.
+                    sig = fx.Vector.from_elements(
+                        sigmoid_batch([pre[lane] for lane in range_constexpr(lanes)])
+                    )
                     dpre = gu * sig * (one + pre * (one - sig))
 
                 gin = vsel(i < n_tok, dpre, zeros)
@@ -247,23 +260,51 @@ def create_causal_conv1d_bwd_kernel(
                     dxv = dxv + weights[j] * gw[halo - j]
                 t = i - halo
                 if (t >= 0) & (t < n_tok):
-                    r = start + c0 + t
+                    r = (start + fx.Int64(c0 + t)) * ds1
                     for lane in range_constexpr(lanes):
-                        dx[(cc + lane) * ds0 + r * ds1] = element(dxv[lane])
+                        dx[dx_lane[lane] + r] = element(dxv[lane])
                 return xw[1:] + [xu], gw[1:] + [dpre], dw, db, g_first
 
-            # Fully unrolled: register use grows with the chunk length, so short
-            # chunks (block_m 32) do best. A runtime loop over prefetch groups was
-            # not faster on gfx950.
-            raws = []
-            for i in range_constexpr(steps):
-                if const_expr(i % prefetch == 0):
-                    raws = load_group(fx.Int64(i))
-                p = i % prefetch
-                xw, gw, dw, db, g_first = row(
-                    fx.Int64(i), raws[p], raws[prefetch + p],
-                    xw, gw, dw, db, g_first, dx,
-                )  # fmt: skip
+            if const_expr(runtime_loop):
+                # Runtime loop over groups of ``prefetch`` rows: the next group is
+                # loaded before the current one is used, and register use does not
+                # grow with the chunk length.
+                o_db = 2 * halo + width
+                o_gf = o_db + 1
+                o_raw = o_gf + len(g_first)
+                n_groups = (n_tok + (halo + prefetch - 1)) // prefetch
+                state = xw + gw + dw + [db] + g_first + load_group(fx.Int32(0))
+                for it, st in range(fx.Int32(0), n_groups, fx.Int32(1), init=state):
+                    it = fx.Int32(it)  # the induction variable is an MLIR index
+                    st = list(st)
+                    cx = st[:halo]
+                    cg = st[halo : 2 * halo]
+                    cw = st[2 * halo : o_db]
+                    cb = st[o_db]
+                    cf = st[o_gf:o_raw]
+                    raw = st[o_raw:]
+                    nxt = load_group((it + 1) * prefetch)
+                    for p in range_constexpr(prefetch):
+                        cx, cg, cw, cb, cf = row(
+                            it * prefetch + p, raw[p], raw[prefetch + p],
+                            cx, cg, cw, cb, cf, dx,
+                        )  # fmt: skip
+                    results = yield cx + cg + cw + [cb] + cf + nxt
+                results = list(results)
+                dw = results[2 * halo : o_db]
+                db = results[o_db]
+                g_first = results[o_gf:o_raw]
+            else:
+                # Fully unrolled: register use grows with the chunk length.
+                raws = []
+                for i in range_constexpr(steps):
+                    if const_expr(i % prefetch == 0):
+                        raws = load_group(fx.Int32(i))
+                    p = i % prefetch
+                    xw, gw, dw, db, g_first = row(
+                        fx.Int32(i), raws[p], raws[prefetch + p],
+                        xw, gw, dw, db, g_first, dx,
+                    )  # fmt: skip
 
             # Per-chunk partial sums; the host reduces them over chunks (deterministic).
             part = (fx.Int64(pid) * dim + cc) * n_rows

@@ -86,10 +86,11 @@ def causal_conv1d_split_qkv_bwd_flydsl_fn(
     pad_slot_id: int | None = PAD_SLOT_ID,
     metadata=None,
     *,
-    block_m: int = 32,
-    block: int = 128,
-    prefetch: int = 16,
+    block_m: int = 64,
+    block: int = 64,
+    prefetch: int = 4,
     channels_per_thread: int | None = None,
+    runtime_loop: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Gradients of the varlen causal conv1d with split q/k/v output.
 
@@ -186,6 +187,7 @@ def causal_conv1d_split_qkv_bwd_flydsl_fn(
         lanes,
         x.dtype,
         state.dtype,
+        runtime_loop,
     )
     # Absent optional pointers are never dereferenced by the specialized kernel.
     args = (
