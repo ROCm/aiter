@@ -211,7 +211,9 @@ def main():
         "--k",
         type=int,
         nargs="*",
-        default=[2048, 6144, 2304, 1536],
+        # 288 and 160 are 9 and 5 groups: the column count is not a multiple of 8, so the scale is
+        # padded in columns as well as rows (at M=64 in columns only)
+        default=[2048, 6144, 2304, 1536, 288, 160],
         help="Columns, a multiple of 32. e.g.: -k 2048",
     )
     args = parser.parse_args()
@@ -227,7 +229,13 @@ def main():
         )
         df = [
             test_scale_alloc_nd(shape, h_dtype)
-            for shape in [(2, 5, 2048), (3, 11, 2304), (4, 8, 1536)]
+            for shape in [
+                (2, 5, 2048),
+                (3, 11, 2304),
+                (4, 8, 1536),
+                (2, 32, 288),
+                (3, 7, 160),
+            ]
         ]
         aiter.logger.info(
             "quant scale alloc nd summary (markdown):\n%s",
