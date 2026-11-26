@@ -33,4 +33,5 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& x_scale,
     aiter_tensor_t& w_scale,
     aiter_tensor_t& Y,
-    int kid);
+    int kid,
+    std::optional<aiter_tensor_t> workspace = std::nullopt);

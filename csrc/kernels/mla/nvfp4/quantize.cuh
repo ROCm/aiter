@@ -6,7 +6,9 @@
 
 namespace mla_nvfp4 {
 __device__ __forceinline__ float bf16(const uint16_t* p)
-{ return __uint_as_float(uint32_t(*p) << 16); }
+{
+    return __uint_as_float(uint32_t(*p) << 16);
+}
 __device__ __forceinline__ float sf_value(uint8_t c)
 {
     return c < 8 ? c * 0x1p-9f
@@ -37,15 +39,20 @@ __device__ __forceinline__ uint8_t f4_code(float v)
 {
     float x = fabsf(v), best = x;
     int code = 0;
-    for(int i = 1; i < 8; ++i)
-    {
-        float d = fabsf(x - f4_value(i));
-        if(d < best || (d == best && !(i & 1)))
+    // Finite values past 5 are nearest to 6.0. From 2**25 up the FP32 distances
+    // to 4.0 and 6.0 below round alike, and the even-code tie would keep 4.0.
+    if(x > 5.0f && x <= 3.40282347e38f)
+        code = 7;
+    else
+        for(int i = 1; i < 8; ++i)
         {
-            best = d;
-            code = i;
+            float d = fabsf(x - f4_value(i));
+            if(d < best || (d == best && !(i & 1)))
+            {
+                best = d;
+                code = i;
+            }
         }
-    }
     return code | ((__float_as_uint(v) >> 28) & 8);
 }
 __device__ __forceinline__ uint8_t quantize16(float (&v)[16], float gain, uint8_t (&codes)[16])
@@ -66,9 +73,13 @@ residual16(float (&v)[16], float gain, uint8_t sf, const uint8_t (&codes)[16])
         v[i] -= f4_value(codes[i]) * sf_value(sf) / gain;
 }
 __device__ __forceinline__ int c_offset(int t, int d)
-{ return (t / 16) * 4096 + (d / 32) * 256 + (t % 16) * 16 + (d % 32) / 2; }
+{
+    return (t / 16) * 4096 + (d / 32) * 256 + (t % 16) * 16 + (d % 32) / 2;
+}
 __device__ __forceinline__ int r_offset(int t, int byte)
-{ return (t / 32) * 4096 + ((t % 32) / 16) * 512 + (byte / 16) * 256 + (t % 16) * 16 + byte % 16; }
+{
+    return (t / 16) * 2048 + (byte / 16) * 256 + (t % 16) * 16 + byte % 16;
+}
 } // namespace mla_nvfp4
 
 // Alignment applies to the instruction entry, not just its descriptor.
@@ -141,8 +152,8 @@ __launch_bounds__(64) void mla_nvfp4_update_cache_kernel(const uint16_t* tiles,
                     t < valid ? f4_code(bf16(tiles + t * 576 + lane * 16 + d + 1) / ideal) : 0;
                 cn[c_offset(pt, lane * 16 + d)] = a | (b << 4);
             }
-            ca[(pt / 32) * 4096 + 2048 + (lane / 8) * 256 + (pt % 32) * 8 + lane % 8] =
-                t < valid ? sf : 0x7f;
+            int offset = tile * 2048 + 1024 + (lane / 16) * 256 + t * 16 + lane % 16;
+            ca[offset] = t < valid ? sf : 0x7f;
         }
     }
     else
@@ -153,16 +164,20 @@ __launch_bounds__(64) void mla_nvfp4_update_cache_kernel(const uint16_t* tiles,
             uint8_t code[16];
             for(int i = 0; i < 16; ++i)
                 v[i] = t < valid ? bf16(tiles + t * 576 + 512 + rb * 16 + i) : 0;
-            uint8_t sf                                       = quantize16(v, 89.6f, code);
-            ca[(pt / 32) * 4096 + 3072 + (pt % 32) * 4 + rb] = t < valid ? sf : 0x7f;
+            uint8_t sf       = quantize16(v, 89.6f, code);
+            int scale_offset = tile * 2048 + 1536 + t * 16 + rb;
+            ca[scale_offset] = t < valid ? sf : 0x7f;
             for(int i = 0; i < 8; ++i)
                 ca[r_offset(pt, rb * 8 + i)] = code[2 * i] | (code[2 * i + 1] << 4);
             residual16(v, 89.6f, sf, code);
-            sf                                               = quantize16(v, 89.6f, code);
-            ca[(pt / 32) * 4096 + 3200 + (pt % 32) * 4 + rb] = t < valid ? sf : 0x7f;
+            sf                   = quantize16(v, 89.6f, code);
+            ca[scale_offset + 4] = t < valid ? sf : 0x7f;
             for(int i = 0; i < 8; ++i)
-                ca[1024 + r_offset(pt, rb * 8 + i)] = code[2 * i] | (code[2 * i + 1] << 4);
+                ca[512 + r_offset(pt, rb * 8 + i)] = code[2 * i] | (code[2 * i + 1] << 4);
         }
     for(int i = lane; i < 16 * 24; i += 64)
-        ca[(tile / 2) * 4096 + 3328 + (tile % 2) * 16 * 24 + i] = 0x7f;
+    {
+        int offset = tile * 2048 + (i < 128 ? 1536 + (i / 8) * 16 + 8 + i % 8 : 1792 + i - 128);
+        ca[offset] = 0x7f;
+    }
 }

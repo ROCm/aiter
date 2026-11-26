@@ -2209,6 +2209,8 @@ def index_score_supported_nvfp4(
     out=None,
     work_map=None,
     k_round="e4m3",
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ) -> bool:
     """Metadata-only predicate for `score_flydsl_nvfp4`."""
     if k_round not in NVFP4_ROUNDINGS:  # None would validate as an MXFP4 cache
@@ -2226,6 +2228,8 @@ def index_score_supported_nvfp4(
         work_map=work_map,
         k_scale=k_scale,
         nvfp4=k_round,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
     )
 
 
@@ -2450,6 +2454,8 @@ def score_flydsl_nvfp4(
     out=None,
     work_map=None,
     k_round="e4m3",
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ):
     """`score_flydsl` for an NVFP4 index cache (decode).
 
@@ -2461,7 +2467,9 @@ def score_flydsl_nvfp4(
     the bf16 MFMA, or on the f16 MFMA with an e4m3 Q). Scale bytes must be non-negative
     e4m3 (sign bit unread) and not 0x7F. Work map and score layout as in `score_flydsl`;
     `build_work_map(..., nvfp4=True)` builds the map for this scorer's tuned depth table
-    (S8H4, batches 5..16), which `work_map=None` also resolves.
+    (S8H4, batches 5..16), which `work_map=None` also resolves. `cp_world`/`cp_rank`
+    shard the blocks round robin as in `score_flydsl` (a map for the shard is built with
+    the same `cp_world`/`cp_rank`; the tuned depth table is for the unsharded launch).
     """
     if k_round not in NVFP4_ROUNDINGS:
         raise ValueError(f"k_round must be one of {NVFP4_ROUNDINGS}, got {k_round!r}")
@@ -2476,6 +2484,8 @@ def score_flydsl_nvfp4(
         max_block,
         out=out,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         k_scale=k_scale,
         nvfp4=k_round,
     )

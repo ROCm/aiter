@@ -10,6 +10,7 @@ import torch
 
 from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.build_targets import is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..utility import dtypes
 
@@ -180,7 +181,7 @@ def _asm_sparse_prefill_v41(
 
     with torch.cuda.device(device):
         gfx = get_gfx_runtime()
-        if gfx != "gfx1250":
+        if not is_gfx1250_family(gfx):
             raise RuntimeError(
                 f"mla_sparse_prefill_v41 asm requires gfx1250, got {gfx}"
             )
