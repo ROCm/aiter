@@ -23,9 +23,11 @@ Notes on the fla-compatible surface:
       kernel reads it. Since this path is forward-only and returns no scratch,
       honouring ``True`` would allocate and write a ``T x HV x K`` tensor that
       nothing can observe, so the flag is pinned off internally.
-    * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
-      ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
-      silently ignored.
+    * ``allow_neg_eigval`` / ``cp_context`` / ``cu_seqlens_cpu`` have no
+      counterpart yet and are rejected rather than silently ignored.
+      ``return_intermediate_states`` is not accepted either; the nearest thing
+      here is ``snapshot_targets`` / ``snapshot_out``, which write the
+      recurrent state at the chunk boundaries the caller names.
     * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
       because some kernels below assume contiguous strides. On gfx1250 the
       FlashKDA kernels read q, k, v and g at their own token stride instead.
@@ -167,10 +169,11 @@ def chunk_kimi_delta_attn(
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
         snapshot_targets (tuple, optional):
-            `((n, off), ...)` host ints: also return sequence `n`'s recurrent
-            state after its first `off` tokens, for `off` a multiple of
-            `FLASH_KDA_CHUNK` strictly inside the sequence. Any number per
-            sequence, in any order, but no position twice. FlashKDA-only:
+            `((n, off), ...)` host ints: also write sequence `n`'s recurrent
+            state after its first `off` tokens into `snapshot_out`, for `off` a
+            multiple of `FLASH_KDA_CHUNK` strictly inside the sequence. Nothing
+            more is returned. Any number per sequence, in any order, but no
+            position twice. FlashKDA-only:
             `AITER_FDA_ENABLE` and `flash_kda_supported` decide whether a call
             takes that path, and this package exports all three. It is the
             state a forward ending at `off` would return as its final state
