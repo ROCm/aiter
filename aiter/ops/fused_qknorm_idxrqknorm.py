@@ -121,7 +121,7 @@ def _nvfp4_raw_front(
         or q_out.numel() != n * 2048
         or not q_out.is_contiguous()
         or index_q_out is None
-        or index_q_out.dtype not in _FP8_E4M3_DTYPES
+        or index_q_out.dtype is not torch.float8_e4m3fn
         or index_q_out.numel() != n * 128
         or not index_q_out.is_contiguous()
     ):
@@ -299,6 +299,10 @@ def fused_qknorm_idxrqknorm(
         and num_index_heads == 1
         and rotary_dim == 64
         and block_size == 128
+        # data_ptr() / get_device() in _nvfp4_raw_front cannot be traced: a torch.compile(fullgraph=True)
+        # call must use the existing guarded HIP entry below (it has a fake/meta implementation for
+        # tracing), the same restriction aiter/ops/triton/normalization/rmsnorm.py:83-85 documents.
+        and not torch.compiler.is_compiling()
         and _nvfp4_raw_front(
             qkv,
             q_norm_weight,

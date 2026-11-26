@@ -159,7 +159,7 @@ KINDS = [
 ]
 
 
-def make(n, kind, seed):
+def make(n, kind, seed, misaligned_w=False):
     g = torch.Generator().manual_seed(seed * 1000 + n)
     gd = torch.Generator(device=dev).manual_seed(seed * 1000 + n)
     qkv = (torch.randn(n, ROW, generator=gd, device=dev) * 2).bfloat16()
@@ -168,6 +168,17 @@ def make(n, kind, seed):
             qkv.float() * torch.exp(torch.randn(n, 1, generator=gd, device=dev) * 2)
         ).bfloat16()
     w = [(torch.randn(D, generator=gd, device=dev) * 0.2).bfloat16() for _ in range(4)]
+    if misaligned_w:
+        # A contiguous bf16 view sliced at storage offset 1 (2 B) keeps shape/dtype/contiguity
+        # but is no longer 8 B aligned: the prefill wave kernel's uint2 loads of the norm weight
+        # need that alignment (launchNvfp4Prefill's pfPtrAligned8 check), so this must fall back
+        # to the generic kernel instead of reaching those loads.
+        padded = torch.zeros(D + 1, dtype=w[0].dtype, device=dev)
+        padded[1:] = w[0]
+        w[0] = padded[1:]
+        assert (
+            w[0].data_ptr() % 8 != 0
+        ), "test setup: weight view is unexpectedly aligned"
     ang = torch.rand(max(2 * n, 4096), ROT // 2, generator=gd, device=dev) * 6.28
     cs = torch.cat([ang.cos(), ang.sin()], -1).bfloat16().contiguous()
     pos = torch.randint(0, cs.shape[0], (n,), generator=gd, device=dev)
@@ -250,6 +261,19 @@ def child(args):
             continue
         res[f"{n}/{kind}/{seed}"] = {k: dig(v) for k, v in run(c, n).items()}
         res[f"{n}/{kind}/{seed}/marshalled"] = {
+            k: dig(v) for k, v in run(c, n, marshalled=True).items()
+        }
+        del c
+    # q_norm_weight sliced at an odd storage offset (misaligned_w=True): must give the generic
+    # kernel's bytes under both floors (below and at/above the default pfMinTokens()=512), proving
+    # the prefill wave declines instead of reaching its uint2 loads misaligned.
+    for n in (DISPATCH_PROBE_N, 511, 512, 2048):
+        try:
+            c = make(n, "aligned", 0, misaligned_w=True)
+        except NoSlots:
+            continue
+        res[f"{n}/misaligned_w"] = {k: dig(v) for k, v in run(c, n).items()}
+        res[f"{n}/misaligned_w/marshalled"] = {
             k: dig(v) for k, v in run(c, n, marshalled=True).items()
         }
         del c

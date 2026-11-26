@@ -486,6 +486,54 @@ def test_reject():
     return "ok"
 
 
+def test_compile_fullgraph():
+    """A torch.compile(fullgraph=True) call with the raw-front's TP4/nvfp4 shape must not graph
+    break on the raw front's Tensor.data_ptr() / get_device() calls: _nvfp4_raw_front is skipped
+    while compiling (torch.compiler.is_compiling()), and the call falls through to the generic,
+    compile-guarded HIP entry instead, giving the same bytes as the eager (raw-front) call.
+    """
+    n, nkv, niq = 4, 1, 1
+    dtype = torch.bfloat16
+    qn, kn, iqn, ikn = (torch.randn(HEAD_DIM, dtype=dtype) * 0.1 for _ in range(4))
+    cos_sin = (torch.randn(8, 64, dtype=torch.float32) * 0.1).to(dtype)
+    pos = torch.zeros(n, dtype=torch.int64)
+    row = (16 + 2 * nkv + niq + 1) * HEAD_DIM
+    qkv = torch.randn(n, row, dtype=dtype)
+    slots = torch.arange(n, dtype=torch.int64)
+    kv = torch.zeros(2, 2 * nkv * HEAD_SIDE, dtype=torch.uint8)
+    idx = torch.zeros(2, HEAD_SIDE, dtype=torch.uint8)
+    ks, vs = torch.ones(1), torch.ones(1)
+
+    def call(qkv_, q_out, iq_out):
+        aiter.fused_qknorm_idxrqknorm(
+            qkv_, qn, kn, cos_sin, pos, 16, nkv, 64, 1e-6, iqn, ikn, niq,
+            slots, kv, kv, idx, 128, q_out, iq_out, slots,
+            kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=ks, v_scale=vs,
+        )  # fmt: skip
+        return q_out, iq_out
+
+    q_eager = torch.zeros(n, 16 * HEAD_DIM, dtype=dtype)
+    iq_eager = torch.zeros(n, niq * HEAD_DIM, dtype=torch.float8_e4m3fn)
+    call(qkv.clone(), q_eager, iq_eager)
+    torch.cuda.synchronize()
+
+    q_c = torch.zeros(n, 16 * HEAD_DIM, dtype=dtype)
+    iq_c = torch.zeros(n, niq * HEAD_DIM, dtype=torch.float8_e4m3fn)
+    compiled = torch.compile(call, fullgraph=True)
+    compiled(qkv.clone(), q_c, iq_c)
+    torch.cuda.synchronize()
+
+    checkAllclose(q_eager.float(), q_c.float(), rtol=0, atol=0, msg="q_out")
+    checkAllclose(
+        iq_eager.view(torch.uint8).float(),
+        iq_c.view(torch.uint8).float(),
+        rtol=0,
+        atol=0,
+        msg="index_q_out",
+    )
+    return "ok"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="fused_qknorm_idxrqknorm nvfp4 pages vs the torch reference, byte for byte",
@@ -534,6 +582,7 @@ def main():
         )
         return
     aiter.logger.info("reject: %s", test_reject())
+    aiter.logger.info("compile fullgraph: %s", test_compile_fullgraph())
     cases = [
         (t, n, s, gs)
         for t, n, s, gs in itertools.product(args.tokens, args.nkv, args.slots, args.gs)
