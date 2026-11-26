@@ -183,6 +183,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     persistent_n_tiles: int = 1,
     early_a: bool = False,
     early_b: bool = False,
+    k_pipe: int = 0,
     fused_splitk: bool = True,
     scale_block: int = BLOCK_K,
     w_scale_32x32: bool = False,
@@ -525,6 +526,10 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     # Dispatch through the cached CompiledFunction of each constexpr set: calling
     # the JitFunction re-derives its specialization on the host every launch.
     runtime_args, constexpr_args = launch_args[:12], launch_args[12:]
+    if compute_bound and k_pipe:
+        raise ValueError(
+            "[FlyDSL gfx1250] k_pipe (_pd) applies to the direct kernel only"
+        )
     if compute_bound:
         # A launch of one workgroup is no cluster: it runs the plain kernel.
         use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
@@ -564,6 +569,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,
             fused,
             rank0_splitk,
+            k_pipe,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -582,6 +588,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             _ptr_arg(Out),  # arg_out
             fused,
             rank0_splitk,
+            k_pipe,
             specialization_key=specialization,
         )
     if partials is not None and not fused:
@@ -613,7 +620,9 @@ NAME_SUFFIX_RE = (
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
     r"(?P<early_merge>_eab|_ea|_eb)?"
 )
-MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
+MX32_NAME_SUFFIX_RE = (
+    NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?" + r"(?:_pd(?P<k_pipe>\d+))?"
+)
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
@@ -638,7 +647,9 @@ def _parse_name(match):
     fused_splitk = groups.pop("fused_splitk", None) is not None
     early_merge = groups.pop("early_merge", None)
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    k_pipe = groups.pop("k_pipe", None)
     cfg = {key: int(value) for key, value in groups.items()}
+    cfg["k_pipe"] = int(k_pipe) if k_pipe else 0
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
@@ -664,6 +675,14 @@ def parse_mxfp8_32_wmma_kernel_name(name: str):
     )
 
 
+def mxfp8_32_k_pipe_ok(cfg: dict) -> bool:
+    """A ``_pd`` (k_pipe) name: the direct kernel's row path, at most tile_k/128 deep."""
+    wm = cfg["tile_m"] // cfg["m_warp"] // 16
+    wn = cfg["tile_n"] // cfg["n_warp"] // 16
+    quadrant = wm % 2 == 0 and wn % 2 == 0 and wm * wn >= 8
+    return 0 < cfg["k_pipe"] <= cfg["tile_k"] // 128 and not quadrant
+
+
 @functools.lru_cache(maxsize=4096)
 def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
     """Whether a tuned mx32 kernelName can launch for the real, unpadded shape."""
@@ -676,7 +695,9 @@ def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool
         mxfp8_32_kernel_fits_shape,
     )
 
-    base_name = kernel_name.removesuffix("_aspre")
+    if cfg["k_pipe"] and not mxfp8_32_k_pipe_ok(cfg):
+        return False
+    base_name = re.sub(r"_pd\d+$", "", kernel_name).removesuffix("_aspre")
     for instance in kernels_list.values():
         if instance.name.replace("mxfp8_128", "mxfp8_32") == base_name:
             # The launch fits cluster_m to M (_resolved_wmma_config); check that.
@@ -872,6 +893,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         persistent_n_tiles=cfg["persistent_n_tiles"],
         early_a=cfg["early_a"],
         early_b=cfg["early_b"],
+        k_pipe=cfg["k_pipe"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,

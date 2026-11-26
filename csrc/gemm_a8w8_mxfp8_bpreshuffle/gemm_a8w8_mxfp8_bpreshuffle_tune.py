@@ -598,6 +598,7 @@ KERNEL_ID_BASE_STREAM = 3_900_000  # inside the bmm id range: rows get kernelId 
 # Decode mxfp8_32 kernels (flydsl_mxfp8_32_bpreshuffle_decode_*), also run through
 # the B = 1 bmm dispatch.
 KERNEL_ID_BASE_DECODE = 3_950_000
+KERNEL_ID_BASE_PIPE = 5_000_000  # direct kernels with k_pipe 2 (``_pd2``)
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
@@ -698,19 +699,34 @@ def gfx1250_1x32_runs(m, n, k):
         kernels_list,
         mxfp8_32_kernel_fits_shape,
     )
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        mxfp8_32_k_pipe_ok,
+        parse_mxfp8_32_wmma_kernel_name,
+    )
 
     runs = []
     for kernel_id, ki in kernels_list.items():
         if ki.a_preshuffle or not mxfp8_32_kernel_fits_shape(ki, m, n, k):
             continue
-        runs.append(
-            (
-                kernel_id,
-                ki.split_k,
-                ki.name.replace("mxfp8_128", "mxfp8_32"),
-                run_gemm_flydsl_gfx1250_1x32,
+        name = ki.name.replace("mxfp8_128", "mxfp8_32")
+        runs.append((kernel_id, ki.split_k, name, run_gemm_flydsl_gfx1250_1x32))
+        # The direct kernel's row path with 1024-wide K tiles, its LDS loads two
+        # K steps ahead (``_pd2``): same WMMA order, same output.
+        cfg = parse_mxfp8_32_wmma_kernel_name(name)
+        if (
+            cfg is not None
+            and ki.tile_k >= 1024
+            and "_compute_" not in name
+            and mxfp8_32_k_pipe_ok({**cfg, "k_pipe": 2})
+        ):
+            runs.append(
+                (
+                    KERNEL_ID_BASE_PIPE + kernel_id,
+                    ki.split_k,
+                    f"{name}_pd2",
+                    run_gemm_flydsl_gfx1250_1x32,
+                )
             )
-        )
 
     for index, cfg in enumerate(gfx1250_bmm_candidates(1, m, n, k)):
         runs.append(
