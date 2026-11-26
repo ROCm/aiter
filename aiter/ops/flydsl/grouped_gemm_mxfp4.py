@@ -147,6 +147,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     gemm_stage=None,
+    quant_payload_preshuffled=None,
     m_align=0,
     k_waves=1,
 ):
@@ -172,12 +173,23 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled A requires M and tile_m divisible by 16, K and "
             "tile_k divisible by 128, and no padded A row stride"
         )
-    if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
+    if quant_payload_preshuffled is None:
+        quant_payload_preshuffled = bool(
+            a_preshuffled and stage1_quant_out and stage1_act
+        )
+    if quant_payload_preshuffled and not (a_is_fp4 and stage1_quant_out and stage1_act):
+        raise ValueError("preshuffled quant output requires fused MXFP4 activation")
+    if quant_payload_preshuffled and (
+        N % 256 or tile_n % 64 or contiguous_m % 16 or tile_m % 16
+    ):
         raise ValueError(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
-            "and tile_n divisible by 64"
+            "and tile_n divisible by 64, with M and tile_m divisible by 16"
         )
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        SUPPORT_EXPLICIT_VGPR_PARTITION,
+        launch_gemm_a8w4_tdm,
+    )
 
     if stream is None:
         stream = current_stream_arg()
@@ -208,18 +220,28 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # These arguments only supply base addresses. Pass pointers below so large
-    # buffers do not cross the C ABI with signed 32-bit tensor dimensions.
+    # Optional arguments may reuse the output as an unused address placeholder.
     quant_scale_tensor = out if quant_scale is None else quant_scale
     out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
     if stage1_quant_out:
         out_dtype = fx.Uint8
     n_tiles = (N + tile_n - 1) // tile_n
-    cluster_n = _select_cluster_n(n_tiles, cluster_n)
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
-    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
+    # A weight placed by moe_shuffle_weight_iod at load time (AITER_MOE_LOC,
+    # gfx1250 only) holds only the placed layout, so it is always read placed;
+    # iod_locality.mode picks the schedule.
+    from .iod_locality import lookup
+    from .iod_locality import mode as iod_mode
+
+    loc_phase, b_placed, loc_group = lookup(w, w_scales, N, K, tile_n, tile_k)
+    iod_loc = iod_mode() if loc_phase is not None else 0
+    cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    if iod_loc in (1, 2):
+        # A cluster must sit inside one run of a domain's n-tiles.
+        cluster_n = min(cluster_n, loc_group * b_placed)
+    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     if m_align:
         # A tile skipped for starting in an expert's padding never reaches the
         # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
@@ -234,13 +256,14 @@ def flydsl_grouped_gemm_a8w4_masked(
         raise ValueError("persistent_workers must be nonnegative")
     if persistent_workers:
         if cluster_m != 1:
-            raise ValueError("persistent workers require cluster_m=1")
+            raise ValueError("persistent workers require cluster_m == 1")
         if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
             )
+        cluster_size = cluster_n * cluster_m
         persistent_workers = (
-            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+            (persistent_workers + cluster_size - 1) // cluster_size * cluster_size
         )
     # k_waves owns the grid: no clusters, no persistent workers, no As prologue.
     # Reject a config that asks for them rather than dropping them.
@@ -253,6 +276,60 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"tdm_as_in_prologue={tdm_as_in_prologue}"
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    next_stage_prefetch = _select_bool_env(
+        "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+    )
+    enable_ep_scatter = stage2_scatter is not None
+    # Use this step's source-token count, not the padded receive capacity, so
+    # a small step in a prefill-sized arena keeps its existing specialization.
+    fixed_n_ep_shape = (
+        enable_ep_scatter
+        and stage2_scatter.source_token_count >= 4096
+        and SUPPORT_EXPLICIT_VGPR_PARTITION
+        and not stage2_scatter.combine_quant_bits
+        and stage2_scatter.world_size == 4
+        and (N, K, n_experts, stage2_scatter.slot_stride_bytes)
+        in ((5120, 2304, 96, 10240), (7168, 2048, 65, 14336))
+        and a_is_fp4
+        and a_preshuffled
+        and not stage1_act
+        and not stage1_quant_out
+        and not has_bias
+        and not row_major_ascale
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (256, 256, 256, 2, 2, 4)
+        and cluster_m == cluster_n == k_waves == 1
+        and next_stage_prefetch == 1
+    )
+    loc_sched = 0
+    if loc_phase is not None:
+        if not (waves_per_tensor_tdm == 2 and m_warp * n_warp == 4):
+            raise ValueError(
+                "an IOD-placed weight needs waves_per_tensor_tdm 2 and four "
+                f"waves, got waves_per_tensor_tdm {waves_per_tensor_tdm}, "
+                f"waves {m_warp} x {n_warp}"
+            )
+        # The schedule is persistent, which the EP scatter serves only unquantized.
+        # The pinned EP4 prefill GEMM2 keeps its live-route grid and reads the
+        # placed B there: the domain schedule (1024 workers) ran it 2-5% slower
+        # (DSR1 EP4 tpr 8192: 527 vs 504 us).
+        if (
+            iod_loc in (1, 2)
+            and not (stage2_scatter is not None and stage2_scatter.combine_quant_bits)
+            and not (fixed_n_ep_shape and not persistent_workers)
+        ):
+            loc_sched = iod_loc
+            # Workgroups in all, four per CU by default: fewer leave the tail
+            # of the per-domain task list on too few CUs (measured on 256 CUs,
+            # no cluster: 512 -> 73 us, 1024 -> 68.5 us, 2048 -> 68.5 us).
+            pw = int(os.environ.get("AITER_MOE_LOC_PW", "0"))
+            if not pw:
+                from aiter.jit.utils.chip_info import get_cu_num
+
+                pw = 4 * int(get_cu_num())
+            # The grid's x extent, whole groups of 8 clusters.
+            step = 8 * cluster_n
+            persistent_workers = max(step, pw // cluster_m // step * step)
     rolled_drain = int(rolled_drain)
     if rolled_drain not in (0, 1):
         raise ValueError("rolled_drain must be 0 or 1")
@@ -261,7 +338,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    enable_ep_scatter = stage2_scatter is not None
     if enable_ep_scatter and stage2_scatter.combine_quant_bits:
         # N is the payload plane's length and so the scale plane's base, which
         # has to land on a cache line; fp4 packs two elements to the byte and
@@ -291,7 +367,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     tdm_spec = (
         cluster_n,
         cluster_m,
-        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
+        next_stage_prefetch,
         waves_per_tensor_tdm,
         _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
         _select_tdm_b_th(tdm_b_th),
@@ -305,6 +381,21 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
+    fixed_n_ep = fixed_n_ep_shape and not persistent_workers
+    # Pinned EP4 prefill steps use a live-route grid from T4096 per rank.
+    # Explicit worker overrides keep their requested dispatch.
+    if (
+        fixed_n_ep
+        and stage == 2
+        and not any(
+            name in os.environ
+            for name in (
+                "AITER_FLYDSL_PERSISTENT_WORKERS",
+                "AITER_FLYDSL_PERSISTENT_WORKERS2",
+            )
+        )
+    ):
+        persistent_workers = 4096
     layout_spec = (
         int(row_major_ascale),
         int(a_row_stride_bytes),
@@ -316,6 +407,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
+    launch_spec = (
+        int(quant_payload_preshuffled),
+        int(N) if fixed_n_ep else 0,
+    )
+    explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
     _run_compiled(
         launch_gemm_a8w4_tdm,
         ptr_arg(out, out_dtype),
@@ -339,6 +435,12 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        *launch_spec,
+        explicit_vgpr_partition,
+        b_placed,
+        loc_sched,
+        ptr_arg(out if loc_phase is None else loc_phase, fx.Int32),
+        loc_group or 1,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -346,6 +448,12 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            launch_spec,
+            explicit_vgpr_partition,
+            out.device,
+            b_placed,
+            loc_sched,
+            loc_group,
         ),
     )
     return out

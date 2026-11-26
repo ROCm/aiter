@@ -63,7 +63,7 @@ def _compact_gemm_align_m(
     tile disagree.
     """
 
-    tile_m, tile_m2, _ = _compact_gemm_tiles(config, recv_bound)
+    tile_m, tile_m2, _, _ = _compact_gemm_tiles(config, recv_bound)
     return max(tile_m, tile_m2)
 
 
@@ -76,9 +76,9 @@ def _env_int(name: str) -> int | None:
 
 def _compact_gemm_tiles(
     config: "MegaMoEConfig", recv_bound: int | None = None
-) -> tuple[int, int, int]:
-    """``(tile_m, tile_m2, m_warp2)`` fused_moe resolves for this recv bound,
-    before it clamps both tiles to the plan alignment.
+) -> tuple[int, int, int, int]:
+    """``(tile_m, tile_m2, m_warp2, a2_preshuffled)`` fused_moe resolves for
+    this recv bound, before it clamps both tiles to the plan alignment.
 
     Same precedence as ``grouped_gemm_gfx1250_a8w4``: the grouped-GEMM CSV row
     for ``_get_padded_m(recv_bound)`` (64 / 64 / 1 when it misses), then
@@ -86,12 +86,18 @@ def _compact_gemm_tiles(
     following the stage-1 one when only that is set. The stage-1 kernel's
     verdict and its launcher key are computed from this, so it has to name the
     tiles GEMM1 later receives; the GEMM1 hook rejects a launch where it does not.
+
+    ``a2_preshuffled``: the row's ``a_preshuffle`` (or
+    ``AITER_GROUPED_A4W4_A_PRESHUFFLE``) on the fp4 wire, which on the compact
+    dispatch packs GEMM1's quant output for GEMM2.
     """
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
         _find_grouped_config,
         _get_padded_m,
     )
+
+    from ..s1f_ctl import s1f_prefill_config
 
     row = None
     if config.dispatch_wire in ("fp4", "fp8"):
@@ -109,14 +115,34 @@ def _compact_gemm_tiles(
             q_dtype_w=dtypes.fp4x2,
             quant_type=config.recipe.compute.quant_type,
             ep_fused=True,
+            compact=True,
         )
+    tuned = s1f_prefill_config(
+        hidden_dim=config.hidden_dim,
+        inter_dim=config.geometry.inter_dim,
+        experts_per_rank=config.experts_per_rank,
+        topk=config.topk,
+        world_size=config.world_size,
+        recv_bound=config.max_recv if recv_bound is None else int(recv_bound),
+        dispatch_wire=config.dispatch_wire,
+        stage1_fused=config.stage1_fused,
+        activation=config.recipe.compute.activation,
+    )
+    if tuned is not None:
+        row = tuned
     tile_m, m_warp = 64, 1
     tile_m2 = m_warp2 = None
+    a_pre = 0
     if row is not None:
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
         m_warp = _as_int(row.get("m_warp"), m_warp) or m_warp
         m_warp2 = _as_int(row.get("m_warp2"), m_warp) or m_warp
+        a_pre = _as_int(row.get("a_preshuffle"), 0)
+    ov_apre = _env_int("AITER_GROUPED_A4W4_A_PRESHUFFLE")
+    if ov_apre is not None:
+        a_pre = ov_apre
+    a2_pre = int(config.dispatch_wire == "fp4" and bool(a_pre))
     ov_m, ov_m2 = _env_int("AITER_TDM_TILE_M"), _env_int("AITER_TDM_TILE_M2")
     if ov_m is not None or ov_m2 is not None:
         tile_m = tile_m if ov_m is None else ov_m
@@ -135,7 +161,7 @@ def _compact_gemm_tiles(
         m_warp2 = m_warp if ov_mw2 is None else ov_mw2
     tile_m2 = tile_m if tile_m2 is None else tile_m2
     m_warp2 = m_warp if m_warp2 is None else m_warp2
-    return int(tile_m), int(tile_m2), int(m_warp2)
+    return int(tile_m), int(tile_m2), int(m_warp2), a2_pre
 
 
 _OVERRIDE_LOGGED: set = set()
@@ -199,6 +225,8 @@ class _CompactStep:
     # align_m; 0 when not resolved (the arena-capacity placeholder step).
     g1_tile_m: int = 0
     quant_wmma_rep: int = 0
+    # GEMM1 writes GEMM2's A preshuffled (``quant_payload_preshuffled``).
+    a2_preshuffled: int = 0
 
 
 class _CompactDispatch(_Dispatch):
@@ -593,7 +621,7 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count),
+            routing=self._routing(token_count, topk_ids),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],
@@ -683,7 +711,7 @@ class _CompactDispatch(_Dispatch):
 
         config, geo = self.config, self.compact
         bound = max(1, min(int(recv_bound), config.max_recv))
-        tile_m, tile_m2, m_warp2 = _compact_gemm_tiles(config, recv_bound=bound)
+        tile_m, tile_m2, m_warp2, a2_pre = _compact_gemm_tiles(config, recv_bound=bound)
         # The arena holds rows for the capacity tile, and the CSV tiles are not
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
@@ -702,10 +730,11 @@ class _CompactDispatch(_Dispatch):
             rows=min(rows, geo.cap),
             g1_tile_m=min(tile_m, align_m),
             quant_wmma_rep=max(1, tile_m2 // max(1, m_warp2) // 16),
+            a2_preshuffled=a2_pre,
         )
 
     def _precompile_s1f_plans(self) -> None:
-        """Compile every stage-1 plan variant before serving.
+        """Compile every automatic stage-1 plan variant before serving.
 
         With S1F on (the default) the plan is keyed by (align_m, slot, waves,
         blocks, tok_map, fused quant), and waves/blocks follow the step's token
@@ -715,6 +744,8 @@ class _CompactDispatch(_Dispatch):
         fused step can have (<= the S1F max recv), takes the
         alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
+        Explicit wide APRE configurations are warmed eagerly at the token
+        widths used for capture, rather than compiling every prefill width.
         """
         if not self.fusion.enabled:
             return
@@ -730,7 +761,9 @@ class _CompactDispatch(_Dispatch):
             st = self._step_for(b)
             steps.setdefault(int(st.align_m), st)
             if not self.fusion.step_reasons(st):
-                self.fusion.launch_keys.add((int(st.align_m), int(st.quant_wmma_rep)))
+                self.fusion.launch_keys.add(
+                    (int(st.align_m), int(st.quant_wmma_rep), int(st.a2_preshuffled))
+                )
         max_tok = min(int(config.max_tokens_per_rank), limit)
         widths = {}
         for tok in range(1, max_tok + 1):
