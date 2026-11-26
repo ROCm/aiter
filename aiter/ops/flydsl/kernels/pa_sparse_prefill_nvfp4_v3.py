@@ -328,6 +328,13 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 ]
             )
 
+        def union_barrier():
+            """Publishes the union's LDS words with a fence over LDS only:
+            gpu.barrier()'s workgroup fence also waits for every global load
+            and store in flight (s_wait_loadcnt / storecnt 0), the query rows
+            above included, which only the query terms read."""
+            gpu.barrier(address_spaces=_attr("[#gpu.address_space<workgroup>]"))
+
         # ---- the union of the tile's page tables (as pa_sparse_prefill_nvfp4_v2) ----
         e_row = tid // TOPK
         e_slot = tid % TOPK
@@ -356,7 +363,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                     fx.Vector.from_elements([fx.Int32(0)], dtype=fx.Int32),
                     fx.Int32,
                 )
-        gpu.barrier()
+        union_barrier()
         # The first entry with this lane's key: scanned from the last entry to
         # the first, one select a key (the last match is the lowest index).
         # Testing "no match yet" in a forward scan puts a compare -> SGPR ->
@@ -381,7 +388,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 fx.Vector.from_elements([fx.Int32(fx.ctpop(rep_mask))], dtype=fx.Int32),
                 fx.Int32,
             )
-        gpu.barrier()
+        union_barrier()
         counts = lds_load(lay["counts"], fx.Int32, 4)
         wave_base = fx.Int32(0)
         for w in range_constexpr(1, NWARP):
@@ -399,7 +406,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 fx.Vector.from_elements([e_page], dtype=fx.Int32),
                 fx.Int32,
             )
-        gpu.barrier()
+        union_barrier()
         if e_valid:
             u_entry = lds_load(lay["uidx"] + first * 4, fx.Int32, 1)[0]
             lds_store(
@@ -407,7 +414,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 fx.Vector.from_elements([e_bound.to(fx.Int8)], dtype=fx.Int8),
                 fx.Int8,
             )
-        gpu.barrier()
+        union_barrier()
 
         # ---- the A list (shared) and this wave's item list ----
         # Every wave derives the same A list from the union (and writes the same
@@ -846,6 +853,20 @@ def compile_pa_sparse_prefill_nvfp4_v3(
         def item_info(i):
             return lds_load(items_w + i * 8 + 4, fx.Int32, 1)[0]
 
+        def plane_barrier():
+            """CTA barrier that publishes the planes the waves' tensor DMAs
+            wrote (each wave waited for its own first) without a fence:
+            gpu.barrier() signals after a workgroup fence, s_wait_dscnt 0 (and
+            loadcnt / storecnt 0), which would drain the LDS loads a step
+            issues ahead of it. FlyDSL has no fence-free barrier, hence the raw
+            ROCDL split barrier (x1.006 on the M3.1 chunks at the A page's
+            barrier, paired A/B); the wavefront-scope fences emit no code and
+            only keep LDS accesses on their side of it."""
+            fx.memory_fence(syncscope="wavefront", ordering=fx.AtomicOrdering.Release)
+            fx.rocdl.s_barrier_signal(-1)
+            fx.rocdl.s_barrier_wait(-1)
+            fx.memory_fence(syncscope="wavefront", ordering=fx.AtomicOrdering.Acquire)
+
         def publish_first():
             """Page 0's V planes published before the walk (page idx + 1's at
             page idx's first barrier)."""
@@ -877,6 +898,11 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 # publishes every plane and frees page idx - 1's slot (and the
                 # shared V). With early V the V and V-scale waves (1, 3) also
                 # wait for page idx + 1's plane, which the barrier publishes.
+                # No fence: the LDS loads in flight at it are this step's item
+                # word, ring entry and page idx's V quarter (slot idx, not the
+                # slot stage_a(idx + 2) overwrites); every read of page idx - 1
+                # or the shared V that feeds the math completed at its WMMA,
+                # and the second barrier drained the rest.
                 if const_expr(dbg != 3):
                     if const_expr(early_v):
                         if (warp & 1) != 0:
@@ -892,7 +918,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                             tdm_ops.tensor_wait(0)
                     else:
                         tdm_ops.tensor_wait(0)
-                gpu.barrier()
+                plane_barrier()
                 if const_expr(dbg != 3):
                     if idx + (nb_a - 1) < n_a:
                         stage_a(idx + (nb_a - 1), a_entry)
