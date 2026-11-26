@@ -15,7 +15,7 @@ import aiter.fused_moe as fm
 import aiter.moev2.segments.sort as sorting
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -1126,6 +1126,8 @@ def main():
 
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_onewg()
+    if get_gfx_runtime() == "gfx950":  # asserts the one-workgroup path is taken
+        test_moe_sorting_onewg_table_boundary()
     test_moe_slots_shared_reduce()
     test_moe_slots_shared_reduce_dropped_routes()
     test_moe_sorting_opus_workspace_uses_explicit_device()
