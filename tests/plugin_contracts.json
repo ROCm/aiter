@@ -151,11 +151,13 @@
   "version": 1
  },
  "mla_decode_fwd": {
-  "fingerprint": "8c1528aa5cb5de72",
-  "signature": "q:positional, kv_buffer:positional, o:positional, qo_indptr:positional, kv_indptr:positional, kv_indices:positional, kv_last_page_lens:positional, max_seqlen_q:positional, page_size:positional=1, nhead_kv:positional=1, sm_scale:positional=None, logit_cap:positional=0.0, num_kv_splits:positional=None, num_kv_splits_indptr:positional=None, work_meta_data:positional=None, work_indptr:positional=None, work_info_set:positional=None, reduce_indptr:positional=None, reduce_final_map:positional=None, reduce_partial_map:positional=None, q_scale:positional=None, kv_scale:positional=None, intra_batch_mode:positional=False, return_logits:positional=False, return_lse:positional=False, g_kv_indptr:positional=None, cp_world_size:positional=1, cp_rank:positional=0, causal:positional=True, kv_layout:positional='token_major', seq_lens:positional=None, page_table:positional=None, kv_csr_layout:positional='page', fast_mode:positional=True, q_aux:keyword-only=None, kv_aux:keyword-only=None, nvfp4_params:keyword-only=None, nvfp4_lse:keyword-only=None",
+  "fingerprint": "c9da1f64c630feaa",
+  "signature": "q:positional, kv_buffer:positional, o:positional, qo_indptr:positional, kv_indptr:positional, kv_indices:positional, kv_last_page_lens:positional, max_seqlen_q:positional, page_size:positional=1, nhead_kv:positional=1, sm_scale:positional=None, logit_cap:positional=0.0, num_kv_splits:positional=None, num_kv_splits_indptr:positional=None, work_meta_data:positional=None, work_indptr:positional=None, work_info_set:positional=None, reduce_indptr:positional=None, reduce_final_map:positional=None, reduce_partial_map:positional=None, q_scale:positional=None, kv_scale:positional=None, intra_batch_mode:positional=False, return_logits:positional=False, return_lse:positional=False, g_kv_indptr:positional=None, cp_world_size:positional=1, cp_rank:positional=0, causal:positional=True, kv_layout:positional='token_major', seq_lens:positional=None, page_table:positional=None, kv_csr_layout:positional='page', fast_mode:positional=True, q_aux:keyword-only=None, kv_aux:keyword-only=None, nvfp4_params:keyword-only=None, nvfp4_lse:keyword-only=None, has_partials:keyword-only=True",
   "source": "aiter/mla.py",
-  "supersedes": [],
-  "version": 1
+  "supersedes": [
+   1
+  ],
+  "version": 2
  },
  "mla_decode_fwd_v4_nm": {
   "fingerprint": "da501459c91a356a",

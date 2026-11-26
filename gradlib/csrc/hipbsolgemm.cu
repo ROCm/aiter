@@ -1781,13 +1781,14 @@ struct W4A16Plan
     bool found = false;
 };
 
-// bf16, N, K, lda, ldb, ldd, group_size, has_zp, int4_encoding, batch the plan was queried at
-using W4A16PlanKey =
-    std::tuple<bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t>;
+// bf16, N, K, lda, ldb, ldd, group_size, has_zp, int4_encoding, bias epilogue, batch the plan was
+// queried at
+using W4A16PlanKey = std::
+    tuple<bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, bool, int64_t>;
 std::map<W4A16PlanKey, W4A16Plan> w4a16_plans;
 
-// The heuristic's choice depends on the batch size, so plans are keyed on it, bucketed to the next
-// power of two to bound the cache: decode (M = 1) and each prefill octave get their own query.
+// Next power of two of the batch: the batches hipb_w4a16_is_supported is usually asked about, and
+// the fallback plan when the heuristic has no kernel at an exact batch.
 int64_t w4a16_batch_bucket(int64_t m)
 {
     int64_t b = 1;
@@ -1800,6 +1801,7 @@ struct W4A16Launch
 {
     W4A16Plan* plan        = nullptr;
     size_t workspace_bytes = 0;
+    bool fuses_bias        = false;
 };
 
 // Keyed like the plans, with the exact batch last.
@@ -1828,7 +1830,8 @@ void w4a16_destroy_plans()
 // solution. A missing kernel is not an error: the plan records found=false, whether the heuristic
 // returns no result or rejects the problem (e.g. no solution library for this device). `scale`
 // only has to be non-null for the query (the heuristic offers no block-scale solution without
-// it); the real pointer is set per call.
+// it); the real pointer is set per call, and so is the bias pointer of a `bias` plan, which adds
+// an [N] vector in the activation dtype to each output row.
 W4A16Plan& w4a16_get_plan(bool bf16,
                           int64_t n,
                           int64_t k,
@@ -1838,10 +1841,12 @@ W4A16Plan& w4a16_get_plan(bool bf16,
                           int64_t group_size,
                           bool has_zp,
                           int64_t int4_encoding,
+                          bool bias,
                           int64_t query_m,
                           const void* scale)
 {
-    const W4A16PlanKey key{bf16, n, k, lda, ldb, ldd, group_size, has_zp, int4_encoding, query_m};
+    const W4A16PlanKey key{
+        bf16, n, k, lda, ldb, ldd, group_size, has_zp, int4_encoding, bias, query_m};
     if(auto it = w4a16_plans.find(key); it != w4a16_plans.end())
         return it->second;
 
@@ -1875,6 +1880,19 @@ W4A16Plan& w4a16_get_plan(bool bf16,
     if(status == HIPBLAS_STATUS_SUCCESS)
         status = hipblasLtMatmulDescSetAttribute(
             plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale, sizeof(scale));
+    if(bias)
+    {
+        const hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_BIAS;
+        if(status == HIPBLAS_STATUS_SUCCESS)
+            status = hipblasLtMatmulDescSetAttribute(
+                plan.desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+        if(status == HIPBLAS_STATUS_SUCCESS)
+            status = hipblasLtMatmulDescSetAttribute(
+                plan.desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &act, sizeof(act));
+        if(status == HIPBLAS_STATUS_SUCCESS)
+            status = hipblasLtMatmulDescSetAttribute(
+                plan.desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &scale, sizeof(scale));
+    }
 
     hipblasLtMatmulHeuristicResult_t result;
     int found = 0;
@@ -1984,25 +2002,34 @@ hipblasStatus_t w4a16_set_batch(W4A16Plan& plan, int64_t m)
     return status;
 }
 
-// The plan and workspace size for an exact batch, resolved once and without launching: the
-// power-of-two bucket's plan when hipBLASLt accepts its kernel for this batch (hand-written
-// kernels can exclude batches through their problem predicates), else a plan queried at the batch.
+// The plan and workspace size for an exact batch, resolved once and without launching. The
+// heuristic picks the macro tile for the batch it is given, so it is queried at the exact batch:
+// a kernel picked for the power-of-two bucket can quantize this batch badly (M = 412 queried as
+// 512). The bucket's plan is the fallback, which keeps hipb_w4a16_is_supported's answer for the
+// buckets valid at every batch they cover.
+// With `has_bias`, a kernel with the bias epilogue is preferred; without one the launch leaves the
+// bias to the caller (fuses_bias=false).
 W4A16Launch& w4a16_resolve(const W4A16Problem& p,
                            int64_t group_size,
                            bool has_zp,
                            int64_t int4_encoding,
+                           bool has_bias,
                            const void* scale)
 {
     const W4A16PlanKey key{
-        p.bf16, p.n, p.k, p.lda, p.ldb, p.ldd, group_size, has_zp, int4_encoding, p.m};
+        p.bf16, p.n, p.k, p.lda, p.ldb, p.ldd, group_size, has_zp, int4_encoding, has_bias, p.m};
     if(auto it = w4a16_launches.find(key); it != w4a16_launches.end())
         return it->second;
 
     W4A16Launch launch;
     const float alpha = 1.0f, beta = 0.0f;
     const int64_t bucket = w4a16_batch_bucket(p.m);
-    for(int64_t query_m : {bucket, p.m})
+    // Epilogue kernels first, then exact batch before bucket.
+    for(auto [bias, query_m] :
+        {std::pair<bool, int64_t>{true, p.m}, {true, bucket}, {false, p.m}, {false, bucket}})
     {
+        if(bias && !has_bias)
+            continue;
         W4A16Plan& plan = w4a16_get_plan(p.bf16,
                                          p.n,
                                          p.k,
@@ -2012,6 +2039,7 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
                                          group_size,
                                          has_zp,
                                          int4_encoding,
+                                         bias,
                                          query_m,
                                          scale);
         if(!plan.found || w4a16_set_batch(plan, p.m) != HIPBLAS_STATUS_SUCCESS)
@@ -2029,7 +2057,7 @@ W4A16Launch& w4a16_resolve(const W4A16Problem& p,
                                                 algo,
                                                 workspace_bytes) == HIPBLAS_STATUS_SUCCESS)
         {
-            launch = {&plan, workspace_bytes};
+            launch = {&plan, workspace_bytes, bias};
             break;
         }
     }
@@ -2084,7 +2112,7 @@ bool hipb_w4a16_is_supported(bool bf16,
         return false;
     for(int64_t m : batch_sizes)
         if(!w4a16_get_plan(
-                bf16, n, k, lda, ldb, ldd, group_size, has_zp, int4_encoding, m, d_workspace)
+                bf16, n, k, lda, ldb, ldd, group_size, has_zp, int4_encoding, false, m, d_workspace)
                 .found)
             return false;
     return true;
@@ -2098,7 +2126,8 @@ int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
                                   const aiter_tensor_t& result,
                                   int64_t group_size,
                                   bool has_zp,
-                                  int64_t int4_encoding)
+                                  int64_t int4_encoding,
+                                  bool has_bias)
 {
     aiter_detail::g_aiter_can_throw = true;
 #if AITER_HIPBLASLT_HAS_W4A16
@@ -2106,7 +2135,8 @@ int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
     if(p.m == 0)
         return 0;
     // Any non-null scale pointer serves the plan query; the real one is set per launch.
-    const W4A16Launch& launch = w4a16_resolve(p, group_size, has_zp, int4_encoding, d_workspace);
+    const W4A16Launch& launch =
+        w4a16_resolve(p, group_size, has_zp, int4_encoding, has_bias, d_workspace);
     if(!launch.plan)
         w4a16_no_kernel(p, group_size, has_zp);
     return static_cast<int64_t>(launch.workspace_bytes);
@@ -2120,11 +2150,13 @@ int64_t hipb_w4a16_workspace_size(const aiter_tensor_t& x,
 
 // Torch-free: `result` is the caller-allocated [M, N] output in x's dtype, `workspace` a
 // caller-allocated buffer of at least hipb_w4a16_workspace_size bytes (None when that is 0).
-void hipb_w4a16_mm(const aiter_tensor_t& x,
+// Returns whether `bias` was added by the kernel's epilogue; when false the caller adds it.
+bool hipb_w4a16_mm(const aiter_tensor_t& x,
                    const aiter_tensor_t& w_q,
                    const aiter_tensor_t& scale,
                    aiter_tensor_t& result,
                    std::optional<aiter_tensor_t> workspace,
+                   std::optional<aiter_tensor_t> bias,
                    int64_t group_size,
                    bool has_zp,
                    int64_t int4_encoding)
@@ -2151,6 +2183,10 @@ void hipb_w4a16_mm(const aiter_tensor_t& x,
                     "dtype");
     }
     AITER_CHECK(scale.is_gpu() && scale.device_id == x.device_id, "scale must be on x's device");
+    if(bias.has_value())
+        AITER_CHECK(bias->dim() == 1 && bias->size(0) == p.n && bias->dtype() == x.dtype() &&
+                        bias->is_contiguous() && bias->is_gpu() && bias->device_id == x.device_id,
+                    "bias must be a contiguous [N] tensor in x's dtype on x's device");
     void* workspace_ptr    = nullptr;
     size_t workspace_bytes = 0;
     if(workspace.has_value())
@@ -2162,10 +2198,11 @@ void hipb_w4a16_mm(const aiter_tensor_t& x,
         workspace_bytes = workspace->numel() * workspace->element_size();
     }
     if(p.m == 0)
-        return;
+        return true;
 
-    const void* scale_ptr     = scale.data_ptr();
-    const W4A16Launch& launch = w4a16_resolve(p, group_size, has_zp, int4_encoding, scale_ptr);
+    const void* scale_ptr = scale.data_ptr();
+    const W4A16Launch& launch =
+        w4a16_resolve(p, group_size, has_zp, int4_encoding, bias.has_value(), scale_ptr);
     if(!launch.plan)
         w4a16_no_kernel(p, group_size, has_zp);
     AITER_CHECK(workspace_bytes >= launch.workspace_bytes,
@@ -2178,6 +2215,12 @@ void hipb_w4a16_mm(const aiter_tensor_t& x,
     W4A16Plan& plan        = *launch.plan;
     hipblasStatus_t status = hipblasLtMatmulDescSetAttribute(
         plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_ptr, sizeof(scale_ptr));
+    if(status == HIPBLAS_STATUS_SUCCESS && launch.fuses_bias)
+    {
+        const void* bias_ptr = bias->data_ptr();
+        status               = hipblasLtMatmulDescSetAttribute(
+            plan.desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr));
+    }
     if(status == HIPBLAS_STATUS_SUCCESS)
         status = w4a16_set_batch(plan, p.m);
     const float alpha = 1.0f, beta = 0.0f;
@@ -2200,10 +2243,12 @@ void hipb_w4a16_mm(const aiter_tensor_t& x,
                                  aiter::getCurrentHIPStream());
     AITER_CHECK(
         status == HIPBLAS_STATUS_SUCCESS, "hipb_w4a16_mm: hipblasLtMatmul failed: ", status);
+    return launch.fuses_bias;
 #else
     AITER_CHECK(false,
                 "hipb_w4a16_mm: aiter was built against hipBLASLt headers without the w4a16 "
                 "API");
+    return false;
 #endif
 }
 
@@ -2330,6 +2375,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("scale"),
           py::arg("result"),
           py::arg("workspace"),
+          py::arg("bias"),
           py::arg("group_size"),
           py::arg("has_zp"),
           py::arg("int4_encoding"));
@@ -2341,7 +2387,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("result"),
           py::arg("group_size"),
           py::arg("has_zp"),
-          py::arg("int4_encoding"));
+          py::arg("int4_encoding"),
+          py::arg("has_bias"));
     m.def("hipb_w4a16_is_supported",
           &hipb_w4a16_is_supported,
           "hipb_w4a16_is_supported",
