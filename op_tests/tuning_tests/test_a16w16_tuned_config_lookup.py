@@ -675,7 +675,29 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                         kernels, "gemm_a16w16_gfx1250", return_value=out
                     ) as launch,
                     mock.patch.object(kernels, "gemm_a16w16_band") as band,
+                    mock.patch(
+                        "aiter.ops.flydsl.gemm_a16w16_tdm.gemm_a16w16_tdm",
+                        return_value=out,
+                    ) as tdm,
                 ):
+                    if (
+                        params["policy"] in kernels.TDM_POLICIES
+                        and gfx == "gfx1250-strict"
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "TDM HGEMM policies require gfx1250"
+                        ):
+                            kernels.flydsl_hgemm(
+                                a,
+                                b,
+                                out=out,
+                                stream=stream,
+                                **{field: params[field] for field in fields},
+                            )
+                        launch.assert_not_called()
+                        tdm.assert_not_called()
+                        band.assert_not_called()
+                        continue
                     result = kernels.flydsl_hgemm(
                         a,
                         b,
@@ -685,6 +707,36 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     )
                     self.assertIs(result, out)
                     band.assert_not_called()
+                    if params["policy"] in kernels.TDM_POLICIES:
+                        launch.assert_not_called()
+                        tdm.assert_called_once()
+                        operands = tdm.call_args.args
+                        self.assertIs(operands[0], a)
+                        self.assertEqual(operands[1].shape, b.t().shape)
+                        self.assertEqual(operands[1].stride(), b.t().stride())
+                        self.assertEqual(operands[1].data_ptr(), b.data_ptr())
+                        self.assertIs(operands[2], out)
+                        self.assertIsNone(operands[3])
+                        args = tdm.call_args.kwargs
+                        for field in (
+                            "block_m",
+                            "block_n",
+                            "block_k",
+                            "stages",
+                            "split_k",
+                            "m_waves",
+                            "n_waves",
+                            "group_m",
+                        ):
+                            self.assertEqual(args[field], params[field])
+                        self.assertEqual(args["layout"], "nt")
+                        self.assertEqual(args["interleave"], params["interleave"])
+                        self.assertEqual(
+                            args["split_k_atomic"], params["split_k_atomic"]
+                        )
+                        self.assertIs(args["stream"], stream)
+                        continue
+                    tdm.assert_not_called()
                     args = launch.call_args.kwargs
                     for old, new in (
                         ("tile_m", "block_m"),
