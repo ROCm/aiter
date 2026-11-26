@@ -1047,6 +1047,27 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+# A 256x256x256 tile pins each A/B prefetch slot to 128 VGPRs. An a4w4 1x4
+# wave grid needs 16*8 + 2*16 = 160 per slot, as tuned prefill rows select,
+# and must build with compiler allocation instead of asserting.
+def test_grouped_a4w4_prefill_tile_beyond_vgpr_partition(monkeypatch):
+    for name, value in (
+        ("TILE_M", 256),
+        ("TILE_N", 256),
+        ("TILE_K", 256),
+        ("M_WARP", 1),
+        ("N_WARP", 4),
+    ):
+        monkeypatch.setenv(f"AITER_TDM_{name}", str(value))
+    run_moe(
+        "a4w4",
+        tokens=512,
+        model_dim=1024,
+        inter_dim=1024,
+        check_aot_cache=False,
+    )
+
+
 # Kimi-K3 at TP8 with every expert split 8 ways: inter_dim 3072 / 8 = 384 is a
 # multiple of 128 but not of 256.
 KIMI_K3_TP8_CSV_PATH = os.path.normpath(

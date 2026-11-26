@@ -9,6 +9,10 @@ import torch
 
 import aiter
 import aiter.fused_moe as fm
+
+# moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+# see aiter/moev2/README.md); its backend flags are patched there.
+import aiter.moev2.segments.sort as sorting
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
@@ -101,14 +105,14 @@ def _device_arch(device_id: int) -> str:
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = True
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = True
     elif backend == "opus":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "ck":
-        fm._USE_CK_MOE_SORTING = True
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = True
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "auto":
         pass
     else:

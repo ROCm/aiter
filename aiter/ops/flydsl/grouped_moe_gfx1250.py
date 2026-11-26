@@ -1725,6 +1725,20 @@ def _grouped_a8w4_tdm_moe(
     return moe_out
 
 
+def _is_gfx1250_strict(gfx: str) -> bool:
+    """gfx1250-strict (MI450 A0): a gfx1250-family identity other than the base."""
+    return gfx != "gfx1250" and base_gfx_arch(gfx) == "gfx1250"
+
+
+@functools.cache
+def _warn_strict_a4w4_as_a8w4(gfx: str) -> None:
+    logger.warning(
+        "[grouped-moe] %s has no wmma-f4-insts (MI450 A0 errata, ROCm/aiter#8527): "
+        "running the a4w4 MoE as a8w4 (fp8 activations, same mxfp4 weights)",
+        gfx,
+    )
+
+
 def grouped_gemm_gfx1250_a8w4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1866,6 +1880,26 @@ def grouped_gemm_gfx1250_a8w4(
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
+    # gfx1250-strict drops wmma-f4-insts (A0 errata), and the fp4-activation TDM
+    # GEMM always emits v_wmma_scale_f32_32x16x128_f4, which the strict target
+    # compiles into a matmul-less kernel (NaN output). Quantize the activations
+    # to fp8 instead: the a8w4 GEMM uses the A0-legal 16x16x128 f8f6f4 scaled
+    # WMMA and reads the same preshuffled mxfp4 weights and scales.
+    _gfx = get_gfx()
+    if is_grouped_a4w4 and _is_gfx1250_strict(_gfx):
+        if a1_scale is not None and hidden_states.dtype in (
+            dtypes.fp8,
+            torch.uint8,
+            dtypes.fp4x2,
+        ):
+            raise NotImplementedError(
+                f"grouped a4w4 MoE with pre-quantized fp4 activations is not "
+                f"supported on {_gfx}: it has no wmma-f4-insts (MI450 A0 errata, "
+                "ROCm/aiter#8527). Dispatch bf16 or fp8 activations instead."
+            )
+        _warn_strict_a4w4_as_a8w4(_gfx)
+        is_grouped_a4w4, is_grouped_a8w4 = False, True
+        q_dtype_a = dtypes.fp8
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
     _grouped_dbg(lambda: f"eligible data_format={data_format}")
