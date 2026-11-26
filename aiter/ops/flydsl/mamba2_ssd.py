@@ -42,8 +42,10 @@ from .kernels.mamba2_ssd_kernels import (
     TILE,
     WAVE,
     build_chunk_cumsum,
+    build_chunk_cumsum_staged,
     build_compute_out,
     build_fwd_pass_state,
+    chunk_cumsum_staged_supported,
     compute_out_lds_bytes,
     fwd_pass_state_lds_bytes,
 )
@@ -90,17 +92,26 @@ def _out_configs(P, N, L):
         yield {"rp": rp, "ku": ku, "persistent": persistent, "occupancy": occupancy}
 
 
+def _cumsum_configs(num_heads, chunk_size):
+    # The direct kernel comes last, so it stays the untuned default.
+    if chunk_cumsum_staged_supported(num_heads, chunk_size, _CUMSUM_BLOCK_H):
+        yield {"cumsum": "staged"}
+    yield {"cumsum": "direct"}
+
+
 def default_config(head_size, state_size, chunk_size):
     """Untuned fallback: widest tiles that divide the sizes and fit in LDS."""
     state = list(_state_configs(head_size, state_size, chunk_size))[-1]
-    return {**state, **list(_out_configs(head_size, state_size, chunk_size))[-1]}
+    out = list(_out_configs(head_size, state_size, chunk_size))[-1]
+    return {**state, **out, "cumsum": "direct"}
 
 
 # Compiled handles are per device (``_run_compiled`` caches one per launcher),
 # so every factory takes the device index as its first cache key.
 @functools.cache
-def _cumsum(device, H, L):
-    return build_chunk_cumsum(H, L, _CUMSUM_BLOCK_H)
+def _cumsum(device, H, L, staged=False):
+    build = build_chunk_cumsum_staged if staged else build_chunk_cumsum
+    return build(H, L, _CUMSUM_BLOCK_H)
 
 
 @functools.cache
@@ -230,22 +241,35 @@ def _check_buffers(
         )
 
 
-def _chunk_cumsum(a, dt, chunk_size, stream):
-    """dt [T, H] f32 -> (decay [H, T] in log2 units, dt [H, T])."""
+def _chunk_cumsum(a, dt, chunk_size, stream, config=None):
+    """dt [T, H] f32 -> (decay [H, T] in log2 units, dt [H, T]).
+
+    Two kernels give bitwise-identical results; the tuner keeps the faster one
+    per shape. The LDS-staged one writes whole rows instead of scattered 4-byte
+    stores, which avoids partial-line write-backs once the rows outgrow L2.
+    """
     num_tokens, num_heads = dt.shape
     decay_ht = dt.new_empty(num_heads, num_tokens, dtype=torch.float32)
     dt_ht = torch.empty_like(decay_ht)
-    _run_compiled(
-        _cumsum(dt.device.index, num_heads, chunk_size),
-        a,
-        dt,
-        decay_ht,
-        dt_ht,
-        num_tokens,
-        num_tokens // chunk_size,
-        1,
-        stream,
-    )
+
+    def launch(cfg):
+        _run_compiled(
+            _cumsum(dt.device.index, num_heads, chunk_size, cfg["cumsum"] == "staged"),
+            a,
+            dt,
+            decay_ht,
+            dt_ht,
+            num_tokens,
+            num_tokens // chunk_size,
+            1,
+            stream,
+        )
+
+    configs = list(_cumsum_configs(num_heads, chunk_size))
+    if config is not None:
+        config = {"cumsum": config.get("cumsum", "direct")}
+    key = _tuning_key(dt, a, 1, chunk_size)
+    launch(_tuned_config("chunk_cumsum", key, configs, launch, config))
     return decay_ht, dt_ht
 
 
@@ -423,7 +447,7 @@ def _chunk_grads(x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, L):
 def _forward(x, dt, a, b, c, d, init_state, layout, chunk_size, config):
     with torch.cuda.device(x.device):
         stream = fx.Stream(torch.cuda.current_stream(x.device))
-        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream)
+        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream, config)
         hiddens, final_state = _pass_state(
             x, b, dt_ht, decay_ht, init_state, layout, chunk_size, stream, config
         )
@@ -438,7 +462,7 @@ def _backward(x, dt, a, b, c, d, init_state, dout, dfinal, layout, chunk_size, c
     both ways; the per-chunk gradients are computed from them in torch."""
     with torch.cuda.device(x.device):
         stream = fx.Stream(torch.cuda.current_stream(x.device))
-        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream)
+        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream, config)
         fp32 = {"state_dtype": torch.float32}
         hiddens, _ = _pass_state(
             x,

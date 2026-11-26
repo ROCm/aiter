@@ -196,6 +196,94 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
     return launch
 
 
+def chunk_cumsum_staged_supported(num_heads, chunk_size, block_h):
+    """The staged variant writes rows in block_h-wide stores."""
+    return chunk_size % block_h == 0
+
+
+def build_chunk_cumsum_staged(num_heads, chunk_size, block_h):
+    """``build_chunk_cumsum`` with its outputs staged in LDS.
+
+    Each thread still accumulates its head's cumsum in the same order, so the
+    results are bitwise identical. Only the stores change: the direct kernel
+    writes 4 bytes per step to ``H`` rows that are ``num_tokens * 4`` bytes
+    apart, leaving partial cache lines that L2 evicts and re-reads once the rows
+    stop fitting in it. Here the chunk is staged in LDS and every row is then
+    written by the whole wave, ``block_h`` consecutive floats per store.
+    """
+    H, L, BH = num_heads, chunk_size, block_h
+    assert chunk_cumsum_staged_supported(H, L, BH)
+    ROWS = min(BH, H)  # heads handled per workgroup
+    DT_OFF = ROWS * L * 4  # decay rows, then dt rows
+    LDS_TOTAL = 2 * ROWS * L * 4
+
+    @fx.struct
+    class SharedStorage:
+        buf: fx.Array[fx.Uint8, LDS_TOTAL, 16]
+
+    @flyc.kernel
+    def chunk_cumsum_staged_kernel(
+        a: fx.Tensor,
+        dt: fx.Tensor,
+        decay: fx.Tensor,
+        dt_bht: fx.Tensor,
+        num_tokens: Int32,
+    ):
+        a_r = ptr_buf_tensor(a, fx.Float32)
+        dt_r = ptr_buf_tensor(dt, fx.Float32)
+        dec_w = ptr_buf_tensor(decay, fx.Float32)
+        dtw = ptr_buf_tensor(dt_bht, fx.Float32)
+        lds = _lds_base(SharedStorage)
+
+        chunk = fx.block_idx.x
+        lane = fx.thread_idx.x
+        h0 = fx.block_idx.y * BH
+        batch = fx.block_idx.z
+        t0 = chunk * L
+
+        # 1. One thread per head: the same serial cumsum as the direct kernel.
+        h = h0 + lane
+        if lane < ROWS:  # noqa: SIM102 (`and` on runtime values does not trace)
+            if h < H:
+                a_h = fx.Float32(a_r[h])
+                src = (batch * num_tokens + t0) * H + h
+                acc = fx.Float32(0.0)
+                for k in range_constexpr(L):
+                    dtk = fx.Float32(dt_r[src + k * H])
+                    acc = acc + a_h * dtk
+                    _lds_store(lds, (lane * L + k) * 4, fx.Float32, acc * LOG2E)
+                    _lds_store(lds, DT_OFF + (lane * L + k) * 4, fx.Float32, dtk)
+        gpu.barrier()
+
+        # 2. The whole wave writes each row: BH consecutive floats per store.
+        for r in range_constexpr(ROWS):
+            if h0 + r < H:
+                dst = (batch * H + h0 + r) * num_tokens + t0
+                for j in range_constexpr(L // BH):
+                    k = j * BH + lane
+                    dec_w[dst + k] = _lds_load(lds, (r * L + k) * 4, fx.Float32)
+                    dtw[dst + k] = _lds_load(lds, DT_OFF + (r * L + k) * 4, fx.Float32)
+
+    @flyc.jit
+    def launch(
+        a: fx.Tensor,
+        dt: fx.Tensor,
+        decay: fx.Tensor,
+        dt_bht: fx.Tensor,
+        num_tokens: Int32,
+        num_chunks: Int32,
+        batch: Int32,
+        stream: fx.Stream,
+    ):
+        chunk_cumsum_staged_kernel(a, dt, decay, dt_bht, num_tokens).launch(
+            grid=(fx.Int64(num_chunks), (H + BH - 1) // BH, fx.Int64(batch)),
+            block=(BH, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
 def build_fwd_pass_state(
     arch,
     num_heads,
