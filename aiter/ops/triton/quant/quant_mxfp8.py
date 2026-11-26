@@ -28,6 +28,7 @@ def convert_to_mxfp8(
     use_asm: bool | None = None,
     block_m: int = 64,
     block_n: int = 64,
+    scale_mode: str = "torchao",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MXFP8 format.
@@ -43,6 +44,12 @@ def convert_to_mxfp8(
             auto-selects ASM on gfx950 and the portable path elsewhere.
         block_m: Tile size along M dimension.
         block_n: Tile size along N dimension.
+        scale_mode: ``"torchao"`` (default): e8m0 exponent
+            ``floor(log2(rne_mbits(amax))) - target_max_pow2``. ``"te"``:
+            Transformer Engine ``MXFP8BlockScaling`` (Megatron-LM MXFP8),
+            ``ceil(log2(amax / max_pos))`` clamped to [0, 254] (0 for amax 0),
+            then a saturating round-to-nearest-even cast of ``x * 2^(127-s)``;
+            bit-exact with TE. ``"te"`` takes the portable path (no ASM, no SR).
 
     Returns:
         Tuple of (quantized_tensor, scales) where quantized_tensor has fp8_dtype
@@ -64,10 +71,17 @@ def convert_to_mxfp8(
         raise ValueError(
             f"fp8_dtype must be torch.float8_e4m3fn or torch.float8_e5m2, got {fp8_dtype}"
         )
+    if scale_mode not in ("torchao", "te"):
+        raise ValueError(f"scale_mode must be 'torchao' or 'te', got {scale_mode!r}")
+    te_scale = scale_mode == "te"
+    if te_scale and (use_asm or use_sr):
+        raise ValueError("scale_mode='te' supports neither use_asm nor use_sr")
     # The ASM path (v_cvt_scalef32_*) is gfx950-only and _pack_fp8 only accepts
     # e4m3fn; anything else must take the portable path.
     asm_supported = (
-        arch_info.get_arch() == "gfx950" and fp8_dtype == torch.float8_e4m3fn
+        arch_info.get_arch() == "gfx950"
+        and fp8_dtype == torch.float8_e4m3fn
+        and not te_scale
     )
     if use_asm is None:
         use_asm = asm_supported
@@ -119,6 +133,7 @@ def convert_to_mxfp8(
         IS_2D_BLOCK=is_2d_block,
         USE_SR=use_sr,
         USE_ASM=use_asm,
+        TE_SCALE=te_scale,
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,

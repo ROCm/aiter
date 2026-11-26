@@ -12,7 +12,8 @@ with ``--fp8-format e4m3 --fp8-recipe mxfp8``):
   dgrad ``dX = dY W`` quantizes dY rowwise and W columnwise (along N), wgrad
   ``dW = dY^T X`` quantizes dY and X columnwise (along the tokens);
 * each copy is quantized from the 16-bit tensor (never fp8 -> fp8); weights
-  from their bf16 staging copy of the fp32 master;
+  from their bf16 staging copy of the fp32 master; on GPU through aiter's
+  Triton ``convert_to_mxfp8(scale_mode="te")``, else the torch port below;
 * scale: ``e = float_to_e8m0(amax * fp32(1 / 448))``, the biased exponent
   rounded **up** (``cvt.rp.satfinite.ue8m0``), so ``amax / 2^(e-127) <= 448``;
 * values: ``fp8_e4m3(x * 2^(127-e))``, round to nearest even, saturating;
@@ -110,13 +111,50 @@ def _blocks(x, dim):
     return x.reshape(*x.shape[:-1], n // MXFP8_BLOCK, MXFP8_BLOCK)
 
 
-def mxfp8_quantize(x, dim=-1):
+def _quantize_triton(x, dim):
+    """aiter's Triton MXFP8 convert in its TE scale mode (``scale_mode="te"``);
+    rows and columns are zero-padded to its 64x64 tile, which adds whole zero
+    blocks only."""
+    from aiter.ops.triton.quant.quant_mxfp8 import convert_to_mxfp8
+
+    xt = x.movedim(dim, -1)
+    lead, n = xt.shape[:-1], xt.shape[-1]
+    x2 = xt.reshape(-1, n)
+    rows = x2.shape[0]
+    x2 = _pad_to(_pad_to(x2, 0, 64), 1, 64).contiguous()
+    q, s = convert_to_mxfp8(x2, torch.float8_e4m3fn, scale_mode="te")
+    q = q[:rows, :n].reshape(*lead, n).movedim(-1, dim)
+    s = s[:rows, : n // MXFP8_BLOCK].reshape(*lead, -1).movedim(-1, dim)
+    return q, s
+
+
+def mxfp8_quantize(x, dim=-1, backend=None):
     """E4M3 values and E8M0 scales of ``x`` in blocks of 32 along ``dim``.
 
     Returns ``(q, scale)``: ``q`` float8_e4m3fn shaped like ``x``; ``scale``
     uint8 (biased exponent) shaped like ``x`` with ``dim`` divided by 32.
-    Bit-exact with TE's MXFP8 cast of the same tensor.
+    Bit-exact with TE's MXFP8 cast of the same tensor. ``backend``: "triton"
+    (``convert_to_mxfp8(scale_mode="te")``), "torch", or None for triton on
+    GPU for fp32 / bf16 inputs (torch where it fails to build or run).
     """
+    if x.shape[dim] % MXFP8_BLOCK:
+        raise ValueError(f"MXFP8 quantizes axes of a multiple of 32, got {x.shape}")
+    if backend is None:
+        backend = (
+            "triton"
+            if x.is_cuda and x.dtype in (torch.float32, torch.bfloat16)
+            else "torch"
+        )
+        if backend == "triton":
+            try:
+                out = _quantize_triton(x, dim)
+                LAST_IMPLS["quant:triton_te"] += 1
+                return out
+            except (ImportError, RuntimeError, ValueError, AssertionError) as err:
+                LAST_IMPLS[f"quant:torch({type(err).__name__})"] += 1
+                backend = "torch"
+    elif backend == "triton":
+        return _quantize_triton(x, dim)
     xb = _blocks(x, dim).float()
     amax = xb.abs().amax(-1, keepdim=True)
     e = float_to_e8m0(amax * _E4M3_MAX_RCP)

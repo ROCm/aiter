@@ -180,3 +180,64 @@ def test_mxfp8_asm_matches_portable(is_2d_block, in_dtype):
     assert (
         err <= _TOL[fp8_dtype] * scale
     ), f"ASM vs portable max err {err:.4f} > {_TOL[fp8_dtype]} * {scale:.4f}"
+
+
+def _te_mxfp8_reference(x, is_2d_block, fp8_dtype, qbs=32):
+    """Transformer Engine MXFP8BlockScaling in plain torch: byte =
+    ceil(log2(amax / max_pos)) + 127 clamped to [0, 254] (0 for amax 0), then a
+    saturating RNE cast of x * 2^(127 - byte)."""
+    max_pos = torch.finfo(fp8_dtype).max
+    M, N = x.shape
+    xf = x.float()
+    if is_2d_block:
+        blocks = xf.view(M // qbs, qbs, N // qbs, qbs).abs().amax((1, 3))
+    else:
+        blocks = xf.view(M, N // qbs, qbs).abs().amax(-1)
+    v = blocks * torch.tensor(1.0 / max_pos, dtype=torch.float32)
+    mant, exp = torch.frexp(v)
+    ceil_log2 = torch.where(mant == 0.5, exp - 1, exp)
+    byte = torch.where(v > 0, (ceil_log2 + 127).clamp(0, 254), torch.zeros_like(exp))
+    rcp = torch.exp2((127 - byte).float())
+    if is_2d_block:
+        rcp = rcp.repeat_interleave(qbs, 0).repeat_interleave(qbs, 1)
+    else:
+        rcp = rcp.repeat_interleave(qbs, 1)
+    q = (xf * rcp).clamp(-max_pos, max_pos).to(fp8_dtype)
+    return q, byte.to(torch.uint8)
+
+
+@pytest.mark.parametrize("is_2d_block", [False, True])
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("in_dtype", [torch.float32, torch.bfloat16])
+def test_mxfp8_te_scale_mode_bitexact(is_2d_block, fp8_dtype, in_dtype):
+    """scale_mode="te" is bit-exact with TE: scale bytes and fp8 data."""
+    torch.manual_seed(3)
+    M, N = 128, 256
+    x = torch.randn(M, N, device="cuda") * torch.logspace(
+        -30, 30, M, device="cuda"
+    ).unsqueeze(1)
+    # block maxima where torchao's rule picks a smaller power of two than TE's
+    x[64, 0], x[65, 0], x[66, 0], x[67, :32] = 460.0, 230.0, 448.0, 0.0
+    x = x.to(in_dtype)
+    y, s = convert_to_mxfp8(x, fp8_dtype, is_2d_block=is_2d_block, scale_mode="te")
+    y_ref, s_ref = _te_mxfp8_reference(x, is_2d_block, fp8_dtype)
+    assert torch.equal(s, s_ref), "TE-mode e8m0 bytes differ from TE"
+    assert torch.equal(y.view(torch.uint8), y_ref.view(torch.uint8)), "fp8 data"
+
+
+def test_mxfp8_default_scale_mode_unchanged():
+    """The default (torchao) rule still gives amax 460 the scale 2^0 (the block max
+    does not fit e4m3); TE mode gives 2^1 and stores 460 / 2 -> 224."""
+    x = torch.zeros(64, 64, device="cuda")
+    x[0, 0] = 460.0
+    _, s = convert_to_mxfp8(x, torch.float8_e4m3fn, use_asm=False)
+    y_te, s_te = convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te")
+    assert s[0, 0].item() == 127
+    assert s_te[0, 0].item() == 128 and y_te[0, 0].float().item() == 224.0
+
+
+def test_mxfp8_te_scale_mode_rejects_asm_and_sr():
+    x = torch.randn(64, 64, device="cuda")
+    for kw in ({"use_asm": True}, {"use_sr": True}):
+        with pytest.raises(ValueError):
+            convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te", **kw)

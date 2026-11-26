@@ -10,7 +10,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops import kda_fused_layer
+from aiter.ops import kda_fused_layer, mxfp8_linear
 from aiter.ops.kda_fused_layer import (
     KDALayerWeights,
     kda_layer_bwd,
@@ -644,6 +644,194 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     return ret
 
 
+# MXFP8 recipe (Megatron-LM Kimi-K3 / TE MXFP8BlockScaling): the aiter path
+# against the fp32 emulation of the same quantized operands. Native FP8 GEMMs
+# and the emulation differ only in summation order and in which side of a bf16
+# rounding a value lands, hence the tight tolerance.
+MXFP8_TIGHT_TOL = 1e-2
+MXFP8_PROJS = ("qkv", "f_a", "f_b", "w_beta", "g_proj", "w_o")
+MXFP8_KINDS = ("fwd", "dgrad", "wgrad")
+
+
+def mxfp8_proj_shapes(d, h, k, r):
+    """(N, K) of each KDA projection weight."""
+    hk = h * k
+    return {
+        "qkv": (3 * hk, d),
+        "f_a": (r, d),
+        "f_b": (hk, r),
+        "w_beta": (h, d),
+        "g_proj": (hk, d),
+        "w_o": (d, hk),
+    }
+
+
+def _rel_l2(out, ref):
+    return (
+        (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
+    ).item()
+
+
+@benchmark()
+def test_kda_mxfp8_gemm(proj, kind, m, d, h, k, r, dtype):
+    """One projection GEMM through ``MXFP8ProjGemm.gemm`` as the layer calls it
+    (``kda_fused_layer._proj_gemm`` operand convention): fprop / dgrad on the
+    native FP8 GEMM (bf16 out), wgrad on the bf16 GEMM over dequantized
+    operands (fp32 out), against the fp32 emulation. ``us`` includes the
+    torch-side quantization of both operands."""
+    n, kk = mxfp8_proj_shapes(d, h, k, r)[proj]
+    if kind == "fwd":
+        a, wt = torch.randn(m, kk), torch.randn(n, kk) * kk**-0.5
+    elif kind == "dgrad":
+        a, wt = torch.randn(m, n), torch.randn(n, kk) * kk**-0.5
+    else:
+        a, wt = torch.randn(m, n), torch.randn(m, kk)
+    a, wt = a.to(dtype), wt.to(dtype)
+    hook = kda_fused_layer.MXFP8ProjGemm(dtype)
+    mxfp8_linear.set_mxfp8_gemm_impl("emulate")
+    try:
+        ref = hook.gemm(a, wt, kind)
+    finally:
+        mxfp8_linear.set_mxfp8_gemm_impl(None)
+    # the layer's GPU cast (Triton convert_to_mxfp8, scale_mode="te") must match
+    # the torch port of TE's cast bit for bit
+    blocks = a.reshape(-1)[: a.numel() // 32 * 32].view(-1, 32)
+    qg, sg = mxfp8_linear.mxfp8_quantize(blocks, backend="triton")
+    qc, sc = mxfp8_linear.mxfp8_quantize(blocks.cpu())
+    bitexact = torch.equal(qg.view(torch.uint8).cpu(), qc.view(torch.uint8)) and (
+        torch.equal(sg.cpu(), sc)
+    )
+    # whether aiter's HIP 1x32 e8m0 quant (RoundUp) could replace the torch cast
+    try:
+        from aiter.ops.quant import per_group_quant_hip
+
+        rows = blocks.reshape(-1, 256) if blocks.numel() % 256 == 0 else blocks
+        qh, shh = per_group_quant_hip(
+            rows, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+        )
+        qt, st = mxfp8_linear.mxfp8_quantize(rows)
+        hip_bitexact = torch.equal(
+            qh.view(torch.uint8), qt.view(torch.uint8)
+        ) and torch.equal(shh.view(torch.uint8).reshape(st.shape), st)
+    except (ImportError, RuntimeError, ValueError, TypeError) as err:
+        # reported, not fatal: the layer does not use this kernel
+        hip_bitexact = f"n/a ({type(err).__name__})"
+    mxfp8_linear.LAST_IMPLS.clear()
+    out, us = run_perftest(hook.gemm, a, wt, kind, num_iters=10, num_warmup=2)
+    impl = ",".join(sorted(mxfp8_linear.LAST_IMPLS))
+    sc_ = ref.abs().max().clamp_min(1e-6)
+    err = checkAllclose(
+        (ref / sc_).to(dtypes.fp32),
+        (out / sc_).to(dtypes.fp32),
+        rtol=MXFP8_TIGHT_TOL,
+        atol=MXFP8_TIGHT_TOL,
+        msg=f"mxfp8 {proj} {kind}",
+    )
+    flops = 2 * m * n * kk
+    nbytes = (a.numel() + wt.numel()) * a.element_size() + out.numel() * 4
+    return {
+        "gfx": get_gfx_runtime(),
+        "impl": impl,
+        "us": us,
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": nbytes / us / 1e6,
+        "err": err,
+        "rel l2": _rel_l2(out, ref),
+        "quant bitexact": bitexact,
+        "hip quant bitexact": hip_bitexact,
+    }
+
+
+@benchmark()
+def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
+    """kda_layer_fwd + autograd backward with ``gemm_precision="mxfp8"``.
+
+    * ``err``: the fused layer on aiter's MXFP8 GEMMs against the same fused
+      layer with every projection GEMM emulated in fp32 (tight);
+    * ``vs torch err``: against the torch backend's MXFP8 emulation (chunked
+      recurrence in fp32, every GEMM emulated), up to ORACLE_MAX_TOKENS;
+    * ``vs bf16``: how far the MXFP8 recipe moves y and each gradient from the
+      bf16 fused layer (reported, not asserted).
+    """
+    x = torch.randn(b, t, d).to(dtype)
+    dy = torch.randn(b, t, d).to(dtype)
+    wt = make_weights(d, h, k, w, r, dtype)
+    cu = None
+    if nseq > 1:
+        assert b == 1 and t % nseq == 0, "varlen rows pack equal sequences into b=1"
+        cu = torch.arange(nseq + 1, dtype=torch.int32) * (t // nseq)
+
+    def block(backend, precision):
+        def run():
+            xs = x.detach().requires_grad_(True)
+            ws = [p.detach().requires_grad_(True) for p in wt.tensors()]
+            y = kda_layer_fwd(
+                xs,
+                KDALayerWeights.from_tensors(ws),
+                h,
+                chunk,
+                backend=backend,
+                cu_seqlens=cu,
+                lower_bound=lb,
+                gemm_precision=precision,
+            )
+            return y, torch.autograd.grad(y, [xs, *ws], dy)
+
+        return run
+
+    names = ["y", "dx"] + [
+        f.name for f in KDALayerWeights.__dataclass_fields__.values()
+    ]
+
+    def grade(out, ref, tol, msg):
+        worst = 0.0
+        for gname, rf, o in zip(names, [ref[0], *ref[1]], [out[0], *out[1]]):
+            sc = rf.float().abs().max().clamp_min(1e-6)
+            err = checkAllclose(
+                (rf.float() / sc).to(dtypes.fp32),
+                (o.float() / sc).to(dtypes.fp32),
+                rtol=tol,
+                atol=tol,
+                msg=f"{msg}: {gname}",
+            )
+            assert err == 0, f"{msg}: {gname} {err:.2%} outside tolerance"
+            worst = max(worst, err)
+        return worst
+
+    mxfp8_linear.set_mxfp8_gemm_impl("emulate")
+    try:
+        emulated = block("fused", "mxfp8")()
+    finally:
+        mxfp8_linear.set_mxfp8_gemm_impl(None)
+    out, us = run_perftest(block("fused", "mxfp8"), num_iters=3, num_warmup=1)
+    gemms = kda_fused_layer.LAST_PIECES.get("gemm", "-")
+    flops = layer_flops(b, t, d, h, k, w, r, chunk) * 4 // 3
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "mxfp8 us": us,
+        "mxfp8 TFLOPS": flops / us / 1e6,
+        "err": grade(out, emulated, MXFP8_TIGHT_TOL, "mxfp8 aiter vs emulated"),
+        "bwd gemms": gemms,
+    }
+    if b * t <= ORACLE_MAX_TOKENS:
+        ref = block("torch", "mxfp8")()
+        ret["vs torch err"] = grade(out, ref, 5e-2, "mxfp8 fused vs torch")
+    bf16, bf16_us = run_perftest(block("fused", "bf16"), num_iters=3, num_warmup=1)
+    ret["bf16 us"] = bf16_us
+    dev = {
+        gname: (
+            _rel_l2(o, rf),
+            ((o.float() - rf.float()).abs().max() / rf.float().abs().max()).item(),
+        )
+        for gname, o, rf in zip(names, [out[0], *out[1]], [bf16[0], *bf16[1]])
+    }
+    worst = max(dev, key=lambda g: dev[g][0])
+    ret["vs bf16 rel l2 (y)"] = dev["y"][0]
+    ret["vs bf16 rel l2 (dx)"] = dev["dx"][0]
+    ret["vs bf16 worst"] = f"{worst} {dev[worst][0]:.3g} (max {dev[worst][1]:.3g})"
+    return ret
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -836,6 +1024,46 @@ def main():
             ],
             layer_axes,
         )
+        if dtype == dtypes.bf16:
+            # the Megatron-LM MXFP8 recipe runs on bf16 layers
+            gemm_df = summarize(
+                "kda mxfp8 projection GEMM summary",
+                [
+                    test_kda_mxfp8_gemm(proj, kind, b * t, d, h, k, r, dtype)
+                    for proj, kind, b, t, (d, h, k, _, r) in itertools.product(
+                        MXFP8_PROJS, MXFP8_KINDS, args.batch, args.seqlen, args.shape
+                    )
+                ],
+                layer_axes,
+            )
+            bad_gemm = gemm_df[(gemm_df["err"] != 0) | ~gemm_df["quant bitexact"]]
+            assert bad_gemm.empty, "mxfp8 GEMMs off the emulation:\n" + bad_gemm[
+                ["proj", "kind", "m", "impl", "err", "quant bitexact"]
+            ].to_string(index=False)
+            mx_rows = []
+            for combo in args.fusions:
+                spec = (
+                    {}
+                    if combo == "default"
+                    else dict(item.split("=", 1) for item in combo.split(",") if item)
+                )
+                kda_fused_layer.set_kda_fusions(**spec)
+                try:
+                    for (b, t, nseq), (d, h, k, w, r), c, lb in itertools.product(
+                        args.block, args.shape, args.chunk, args.gate_lb
+                    ):
+                        row = test_kda_mxfp8_block(
+                            b, t, nseq, d, h, k, w, r, c, lb, dtype
+                        )
+                        row["fusion combo"] = combo
+                        mx_rows.append(row)
+                finally:
+                    kda_fused_layer.set_kda_fusions(**dict.fromkeys(spec))
+            summarize(
+                "kda mxfp8 block fwd+bwd summary",
+                mx_rows,
+                {"block": args.block, "shape": args.shape, "fusions": args.fusions},
+            )
         bad_stage = stage_df[stage_df["failed"] != "-"]
         assert bad_stage.empty, "GPU-only stages outside tolerance:\n" + bad_stage[
             ["stage", "m", "lb", "failed"]
