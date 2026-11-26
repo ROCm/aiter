@@ -2056,11 +2056,10 @@ def compile_dhu_mfma(
         cp8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
         def tile_coord(e, transpose):
-            """(row, 8-column group) of this thread's e-th vector of a tile; a
-            transposed tile uses ``_tcoord``'s 8 x 8 blocks."""
+            """(row, 8-column group) of this thread's e-th vector of a tile."""
+            # Row-major for both: measured faster here than the 8 x 8 blocks of
+            # _tcoord (the prefetched loads issue a chunk ahead of their stores).
             i_ = tid + e * NUM_THREADS
-            if const_expr(transpose):
-                return _tcoord(i_, BT, K // 8)
             return i_ // (K // 8), i_ % (K // 8)
 
         def tile_regs(tensor, it_, transpose):
