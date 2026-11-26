@@ -8,7 +8,6 @@ unless beaten by more than the band and ``--min_improvement_pct``) beats the
 unfused path by more than the band."""
 
 import functools
-import importlib.util
 import statistics
 import subprocess
 import sys
@@ -23,17 +22,54 @@ from aiter.jit.core import AITER_CONFIG_MOE_ROUTER_TOPK, AITER_CONFIGS, AITER_RO
 from aiter.ops.flydsl.gemm_a16w16_policy import get_flydsl_a16w16_configs
 from aiter.ops.flydsl.moe_front_gfx1250 import flydsl_moe_router_topk as fused_topk
 from aiter.ops.flydsl.moe_front_gfx1250 import router_gemm_split_k
+from aiter.ops.topk import topk_gating
 from aiter.utility.base_tuner import TunerCommon
 
 KEYS = ["gfx", "cu_num", "M", "N", "K", "topk"]
 CAPTURES = 3
 PREFETCH = (2, 4, 8, 16)
 BF16 = str(torch.bfloat16)
-_spec = importlib.util.spec_from_file_location(
-    "_moe_front_test", f"{AITER_ROOT_DIR}/op_tests/test_flydsl_moe_front.py"
-)
-_t = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_t)
+
+
+def _unfused(x, w, bias, nvr, topk):
+    """``tgemm.mm`` + ``topk_gating``, the path the fused launch replaces."""
+    logits = tuned_gemm.tgemm.mm(x, w, None, otype=torch.bfloat16)
+    tw = torch.empty(x.shape[0], topk, dtype=torch.float32, device="cuda")
+    ti = torch.empty(x.shape[0], topk, dtype=torch.int32, device="cuda")
+    topk_gating(
+        tw, ti, logits, bias, True, 1.0, score_func="sigmoid", num_valid_rows=nvr
+    )
+    return tw, ti
+
+
+def _interleaved_us(fns, reps=10, replays=20, rounds=50):
+    """Per-call us of each of ``fns``: a CUDA graph of ``reps`` calls each,
+    replayed in turn (rotating the order) for ``rounds`` rounds; medians."""
+    graphs = []
+    for fn in fns:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fn()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(reps):
+                fn()
+        graphs.append(g)
+    torch.cuda.synchronize()
+    times = [[] for _ in fns]
+    for r in range(rounds):
+        for i in range(len(fns)):
+            j = (i + r) % len(fns)
+            a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+            a.record()
+            for _ in range(replays):
+                graphs[j].replay()
+            b.record()
+            b.synchronize()
+            times[j].append(a.elapsed_time(b) * 1000 / (replays * reps))
+    return [statistics.median(t) for t in times]
 
 
 def _matches(rw, ri, tw, ti):
@@ -102,9 +138,12 @@ class MoeRouterTopkTuner(TunerCommon):
         router_gemm_split_k.cache_clear()
 
     def tune_shape(self, M, N, K, topk, min_gain_pct):
-        x, w, bias, _ = _t.make_inputs(M, "rand", 0, K)
+        g = torch.Generator(device="cuda").manual_seed(M)
+        x = torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16)
+        w = (torch.randn(N, K, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+        bias = torch.randn(N, generator=g, device="cuda") * 0.05
         nvr = torch.tensor([M], dtype=torch.int32, device="cuda")
-        rw, ri = _t.reference(x, w, bias, nvr, topk)
+        rw, ri = _unfused(x, w, bias, nvr, topk)
         gemm_split_k = router_gemm_split_k(M, N, K)
         fused = {}
         for sk, pf in _candidates(M, N, K, gemm_split_k):
@@ -120,11 +159,9 @@ class MoeRouterTopkTuner(TunerCommon):
                 fused_topk, x, w, bias, topk, sk, prefetch=pf, **out
             )
 
-        def unfused():
-            _t.reference(x, w, bias, nvr, topk)
-
+        unfused = functools.partial(_unfused, x, w, bias, nvr, topk)
         arms = [unfused, *fused.values(), unfused]
-        runs = [_t.interleaved_us(arms) for _ in range(CAPTURES)]
+        runs = [_interleaved_us(arms) for _ in range(CAPTURES)]
         base = statistics.median(t for r in runs for t in (r[0], r[-1]))
         band = max(abs(r[0] - r[-1]) for r in runs)
         us = {c: statistics.median(r[i] for r in runs) for i, c in enumerate(fused, 1)}
