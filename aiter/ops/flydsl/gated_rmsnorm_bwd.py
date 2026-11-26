@@ -14,6 +14,9 @@ from .kernels.tensor_shim import _run_compiled
 
 BLOCK = 256
 PASSES = 4
+# large inputs get 8 passes per block while the grid still fills the GPU
+PASSES_LARGE = 8
+LARGE_ROWS = 131072
 _IN_DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
@@ -37,19 +40,20 @@ def gated_rmsnorm_bwd(o, gp, w, dy, eps=1e-6):
     if numel * 4 >= 2**31:
         raise ValueError(f"too many elements for 32-bit buffer offsets: {numel}")
     rows = numel // dim
-    rows_per_block = BLOCK // (dim // EPL) * PASSES
+    passes = PASSES_LARGE if rows >= LARGE_ROWS else PASSES
+    rows_per_block = BLOCK // (dim // EPL) * passes
     n_blocks = max(1, (rows + rows_per_block - 1) // rows_per_block)
     do = torch.empty(o.shape, device=o.device, dtype=torch.float32)
     dgp = torch.empty_like(do)
     dw_part = torch.empty(n_blocks, dim, device=o.device, dtype=torch.float32)
     launch = create_gated_rmsnorm_bwd_kernel(
-        dim, float(eps), in_dtype, BLOCK, PASSES, o.device.index
+        dim, float(eps), in_dtype, BLOCK, passes, o.device.index
     )
     _run_compiled(
         launch,
         o_,
         gp_,
-        w.detach().to(torch.float32).contiguous(),
+        w.detach().to(cast).contiguous(),
         dy_,
         do.view(-1),
         dgp.view(-1),

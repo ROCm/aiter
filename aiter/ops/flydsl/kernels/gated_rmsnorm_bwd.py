@@ -69,7 +69,7 @@ def create_gated_rmsnorm_bwd_kernel(
     passes: int = 4,
     device: int | None = None,
 ):
-    """o, gp, dy: [rows, dim] in ``in_dtype``; w: [dim] fp32;
+    """o, gp, dy: [rows, dim] and w: [dim] in ``in_dtype``;
     do, dgp: [rows, dim] fp32; dw_part: [n_blocks, dim] fp32.
 
     out = o * r * w * sigmoid(gp), r = rsqrt(mean(o^2) + eps).
@@ -115,17 +115,22 @@ def create_gated_rmsnorm_bwd_kernel(
         dy_t = _vec_tiles(dy, span, IN_W)
         do_t = _vec_tiles(do, span, OUT_W)
         dg_t = _vec_tiles(dgp, span, OUT_W)
-        w_t = _vec_tiles(w, fx.Int64(dim), OUT_W)
+        w_t = _vec_tiles(w, fx.Int64(dim), IN_W)
         in_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_ty)
         f32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
-        def load_in(tiles, elem):
-            vals = []
+        def load_raw(tiles, elem):
+            raw = []
             for j in range_constexpr(IN_N):
                 frag = fx.make_rmem_tensor(IN_W, in_ty)
                 idx = (elem + j * IN_W) // IN_W
                 fx.copy(in_atom, fx.slice(tiles, (None, idx)), frag)
-                v = fx.Vector(fx.memref_load_vec(frag))
+                raw.append(fx.Vector(fx.memref_load_vec(frag)))
+            return raw
+
+        def to_f32(raw):
+            vals = []
+            for v in raw:
                 if in_dtype != "f32":
                     v = v.extf(T.vec(IN_W, T.f32))
                 for i in range_constexpr(IN_W):
@@ -144,23 +149,24 @@ def create_gated_rmsnorm_bwd_kernel(
                 idx = (elem + j * OUT_W) // OUT_W
                 fx.copy(f32_atom, frag, fx.slice(tiles, (None, idx)))
 
-        wv = []
-        for j in range_constexpr(OUT_N):
-            frag = fx.make_rmem_tensor(OUT_W, fx.Float32)
-            fx.copy(f32_atom, fx.slice(w_t, (None, sub * OUT_N + j)), frag)
-            v = fx.Vector(fx.memref_load_vec(frag))
-            for i in range_constexpr(OUT_W):
-                wv.append(fx.Float32(v[i]))
+        wv = to_f32(load_raw(w_t, col))
 
         dwacc = [fx.Float32(0.0) for _ in range_constexpr(EPL)]
+        # issue every pass's loads before any math to keep more bytes in flight
+        bases, valids, raws = [], [], []
         for p in range_constexpr(passes):
             row = bid * ROWS_PER_BLOCK + p * SLOTS + slot
             valid = row < rows
             base = valid.select(row, fx.Int64(0)) * dim + col
-            ov = load_in(o_t, base)
-            gv = [_sigmoid(x) for x in load_in(g_t, base)]
+            bases.append(base)
+            valids.append(valid)
+            raws.append([load_raw(t, base) for t in (o_t, g_t, dy_t)])
+        for p in range_constexpr(passes):
+            base, valid = bases[p], valids[p]
+            ov = to_f32(raws[p][0])
+            gv = [_sigmoid(x) for x in to_f32(raws[p][1])]
             # rows past the end contribute nothing to the weight gradient
-            dv = [valid.select(x, fx.Float32(0.0)) for x in load_in(dy_t, base)]
+            dv = [valid.select(x, fx.Float32(0.0)) for x in to_f32(raws[p][2])]
             ss = fx.Float32(0.0)
             for e in range_constexpr(EPL):
                 ss = ss + ov[e] * ov[e]
