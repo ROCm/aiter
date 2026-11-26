@@ -54,7 +54,9 @@ def mxfp8_32_decode_kernel_launchable(kernel_name: str, M: int, N: int, K: int) 
 def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
     """Decode kernelNames the tuner times: 16- or 32-row tiles, 1 to 8 column
     blocks, the most K-waves (up to 16) that split the K steps evenly, and one
-    K step or all of a wave's K steps of weight loads in flight."""
+    K step or all of a wave's K steps of weight loads in flight; plus 8 K-waves
+    with a 2- or 4-workgroup cluster split of K and one or two n-waves, which
+    put more workgroups and loads in flight at small N or larger M."""
     if not 0 < M <= _CANDIDATE_MAX_M or N % 32 or K % 128:
         return []
     steps = K // 128
@@ -65,6 +67,16 @@ def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
         for nb in (1, 2, 3, 4, 6, 8)
         for wdepth in sorted({1, steps // kw})
     ]
+    names += [
+        mxfp8_32_decode_kernel_name(tile_m, nb, ks, 8, wn, wdepth)
+        for tile_m in (16, 32)
+        for nb in (2, 4, 8)
+        for ks in (1, 2, 4)
+        for wn in (1, 2)
+        if steps % (8 * ks) == 0
+        for wdepth in sorted({1, steps // (8 * ks)})
+    ]
+    names = list(dict.fromkeys(names))
     return [name for name in names if mxfp8_32_decode_kernel_launchable(name, M, N, K)]
 
 
