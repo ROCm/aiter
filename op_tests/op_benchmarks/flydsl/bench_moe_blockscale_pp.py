@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Block-FP8 MoE forward on gfx950 (D 4096 / I 1024, GLM-5.3-Flash): FlyDSL vs main vs HipKittens.
+"""Block-FP8 MoE forward on gfx950 (D 4096 / I 1024, GLM-5.3-Flash): FlyDSL vs main.
 
-The whole forward is timed with PR 6742's protocol (bench_hk_fp8_moe.py). Each
-candidate is captured into a warm HIP graph of 10 calls, the graphs are
-replayed alternately for 21 rounds, and the median per call is reported.
+The whole forward is timed with PR 6742's protocol (bench_hk_fp8_moe.py). Per
+candidate and case: 5 eager warm-up calls, a HIP graph of ``--reps`` (10) calls
+replayed 5 times to warm up, and one eager call under the profiler to record
+the kernels it launched. The candidates' graphs are then replayed alternately
+for ``--rounds`` (21) rounds; the time per call is the median over the rounds
+of replay time / ``--reps``.
 
   flydsl  fused_moe on a one-row tuned table naming impl__flydsl_bspp__default
   main    fused_moe on the GLM-5.3-Flash tuned tables at --main-ref (default: the
           merge-base with origin/main); dropped when those tables run FlyDSL too
-  hk      aiter.ops.hk_fp8_moe (PR 6742), when importable
 
-Every output is checked against the FP32 reference (relative L2 < 0.06), and
-the kernels each candidate launched are recorded by name. ``flydsl speedup`` is
-a candidate's time over FlyDSL's for the same case (above 1: FlyDSL is faster). For stable numbers,
-run one case per process on an idle GPU:
+Every output is checked against the FP32 reference (relative L2 < 0.06).
+``flydsl speedup`` is a candidate's time over FlyDSL's for the same case (above
+1: FlyDSL is faster). For stable numbers, run one case per process on an idle
+GPU:
 
   python op_tests/op_benchmarks/flydsl/bench_moe_blockscale_pp.py -t 8192 -k 8
 """
@@ -132,15 +134,6 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
             tokens,
         )
         del graphs["main"], info["main"]
-    try:
-        from aiter.ops.hk_fp8_moe import hk_fp8_moe
-    except ImportError:
-        hk_fp8_moe = None  # PR 6742 is not part of this checkout
-    if hk_fp8_moe is not None:
-        hk_out = torch.empty_like(x)
-        call = lambda: hk_fp8_moe(x, ids, tw, w13s, s13, w2s, s2, out=hk_out)  # noqa
-        graphs["hk"], out = capture(call, reps)
-        info["hk"] = {"kernels": kernels(call), "err": rel_l2(out[rows], ref)}
 
     samples = {name: [] for name in graphs}
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
