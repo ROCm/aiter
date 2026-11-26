@@ -308,7 +308,7 @@
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
-    "QQB.Q_LEQ_32": {
+    "QQB.Q_RANGE_2_32": {
       "SEGMENTS_PER_CU": 4,
       "MFMA_DIM": 16,
       "MIN_SEGMENTS": 1,

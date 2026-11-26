@@ -2908,6 +2908,22 @@ def test_tree_bias_matches_dense_reference(
     torch.testing.assert_close(out.float(), _tree_reference(c), atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+@pytest.mark.parametrize("D", [1, 2, 3])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("num_seqs", [1, 8, 64, 128, 256, 512])
+@torch.inference_mode()
+def test_tree_bias_default_dispatch_matches_dense_reference(
+    D, head_size, kv_dtype, num_seqs
+):
+    ctxs = [300 + 7 * i for i in range(num_seqs)]
+    c = _tree_case(ctxs, D, (24, 4), 16, kv_dtype, False, seed=D, head_size=head_size)
+    out, _ = _run_tree(c)
+    atol, rtol = _tree_tolerance(kv_dtype)
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=atol, rtol=rtol)
+
+
 @pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 tree configs")
 @pytest.mark.parametrize("num_seqs, D", [(32, 8), (64, 16)])
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])

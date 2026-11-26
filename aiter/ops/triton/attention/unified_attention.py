@@ -472,6 +472,7 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         params.use_qq_bias
         and DEVICE_ARCH == "gfx950"
         and params.head_size >= 128
+        and params.max_seqlen_q >= 2
         and (params.max_seqlen_q >= 3 or params.head_size >= 256)
         and params.max_seqlen_q <= 32
         and qblock_programs(params) >= params.target_num_prgms // 2
@@ -560,6 +561,7 @@ def unified_attention(
     if use_qq_bias and qq_bias.ndim == 3:
         assert qq_bias.shape[0] >= len(seqused_k), "3-D qq_bias needs one slab per seq"
         assert qq_bias.shape[-1] >= max_seqlen_q and qq_bias.stride(-1) == 1
+        assert qq_bias.shape[-2] >= max_seqlen_q, "3-D qq_bias needs max_seqlen_q rows"
         assert qq_bias.stride(-2) == qq_bias.shape[-1], "3-D qq_bias rows must be dense"
 
     q_dtype = q.dtype
