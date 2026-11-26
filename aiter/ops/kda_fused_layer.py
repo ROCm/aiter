@@ -410,12 +410,14 @@ def chunk_kda_bwd_torch(
 # Which implementation served each stage in the latest fused call.
 LAST_PIECES: dict = {}
 
-# Stages with both Triton and FlyDSL kernels default to Triton; FlyDSL is used
-# only when selected (``set_kda_pieces`` or ``AITER_KDA_PIECES``, e.g.
-# ``chunk_fwd=flydsl,conv_bwd=torch``). A missing or rejecting kernel falls
-# back to the next choice: flydsl -> triton -> torch, triton -> torch.
+# Each stage defaults to its faster kernel on MI350X: FlyDSL for the chunk
+# forward (#8744, 22-31% faster than Triton), Triton elsewhere. Override with
+# ``set_kda_pieces`` or ``AITER_KDA_PIECES`` (e.g. ``chunk_fwd=triton``). A
+# missing, unsupported or rejecting kernel falls back to the next choice, with
+# the reason in LAST_PIECES and the log: flydsl -> triton -> torch,
+# triton -> torch.
 KDA_PIECE_DEFAULTS = {
-    "chunk_fwd": "triton",
+    "chunk_fwd": "flydsl",
     "chunk_bwd": "triton",
     "conv_bwd": "triton",
 }
@@ -564,9 +566,28 @@ def _chunk_fwd_triton():
 def _chunk_fwd_flydsl():
     from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
 
+    try:
+        from aiter.ops.flydsl.kda_chunk_fwd import kda_fwd_flydsl_supported as supported
+    except ImportError:
+        supported = None
     native_varlen = _accepts(chunk_kda_fwd_flydsl, "cu_seqlens")
 
     def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
+        H, K, V = q.shape[2], q.shape[3], v.shape[3]
+        if supported is not None and not supported(
+            H=H,
+            HV=v.shape[2],
+            K=K,
+            V=V,
+            chunk_size=chunk_size,
+            dtype=torch.bfloat16,
+            is_varlen=cu_seqlens is not None,
+        ):
+            raise ValueError(
+                f"unsupported shape for the FlyDSL chunk forward: H={H} "
+                f"HV={v.shape[2]} K={K} V={V} chunk={chunk_size} (needs gfx950, "
+                "K=V=128, chunk 64, H=HV)"
+            )
         kw = {}
         if cu_seqlens is not None:
             if not native_varlen:
@@ -660,6 +681,21 @@ FLYDSL_PIECE_DTYPES = {
 }
 
 
+_logged_fallbacks = set()
+
+
+def _log_fallback(stage, backend, reason):
+    """Log each distinct fallback once per process."""
+    if (stage, backend, reason) in _logged_fallbacks:
+        return
+    _logged_fallbacks.add((stage, backend, reason))
+    import logging
+
+    logging.getLogger("aiter").info(
+        "KDA %s: %s not used, falling back (%s)", stage, backend, reason
+    )
+
+
 def _resolve(name, on_gpu, dtype=None):
     """[(backend, impl), ...] to try in order for ``name``; torch is ``None``.
 
@@ -674,12 +710,14 @@ def _resolve(name, on_gpu, dtype=None):
             continue
         if backend == "flydsl" and dtype not in FLYDSL_PIECE_DTYPES[name]:
             LAST_PIECES[f"{name}_flydsl_skipped"] = f"dtype {dtype}"
+            _log_fallback(name, backend, f"dtype {dtype}")
             continue
         try:
             found.append((backend, _PIECE_LOADERS[(name, backend)]()))
         except ImportError as err:
             # recorded, not hidden: a selected kernel that is not in the tree
             LAST_PIECES[f"{name}_{backend}_missing"] = f"ImportError: {err}"
+            _log_fallback(name, backend, f"ImportError: {err}")
     return found
 
 
@@ -715,7 +753,9 @@ def _chunk_fwd(
                 kw["lower_bound"] = lower_bound
             o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens, **kw)
         except (ValueError, NotImplementedError, RuntimeError) as err:
-            LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
+            reason = f"{type(err).__name__}: {err}"
+            LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = reason
+            _log_fallback("chunk_fwd", backend, reason)
             continue
         LAST_PIECES["chunk_fwd"] = backend
         return o
@@ -1642,6 +1682,12 @@ def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens
             **kw,
         )
         LAST_PIECES["chunk_fwd"] = "triton(save intermediates)"
+        LAST_PIECES["chunk_fwd_note"] = (
+            "save_fwd=1 with a chunk backward taking fwd_intermediates: the "
+            "forward runs the Triton disable_recompute path for its "
+            "intermediates (the FlyDSL forward returns only (o, final_state)), "
+            f"overriding chunk_fwd={kda_piece_choices()['chunk_fwd']}"
+        )
         return o.float(), (None, None, None, gc, wt, u, qg, kg, Aqk, Akk)
 
     return run
