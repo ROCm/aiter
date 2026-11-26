@@ -23,7 +23,7 @@ from .kernels.gemm_a16w16_cat_x_ring_gfx950 import (
     NSEG,
     compile_cat_ring,
 )
-from .kernels.tensor_shim import _run_compiled, ptr_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 MAX_SPLIT_K = 40  # tuner bound on ks: the fp32 partials are [ks, M, N]
 NWAVE_FRAGS = 4  # 16-row weight fragments per workgroup column tile (one per wave)
@@ -209,7 +209,7 @@ def _launch(
             m * n,  # slab_stride_dw (fp32: 1 dword per element)
             n // 2,  # row_dw
             ldc // 2,  # ldc_dw
-            stream,
+            current_stream_arg(w.device),
             specialization_key=w.device,
         )
     return out

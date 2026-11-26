@@ -115,7 +115,8 @@ def test_cat_x_ring_rejects_unsupported():
 @_SKIP
 def test_cat_x_ring_expanded_taps_and_output_rows():
     """A tap row stride of 0 (one row broadcast over M) and a padded output are served; overlapping output rows
-    (a ``[1, N]`` buffer expanded to ``[M, N]``) are refused, not written over each other."""
+    (a ``[1, N]`` buffer expanded to ``[M, N]``) are refused, not written over each other.
+    """
     xs, w = _inputs(8)
     ws = shuffle_weight_ring(w)
     one = [x[:1].expand(8, SEG_K) for x in xs]
@@ -158,7 +159,9 @@ def test_ring_splitk_tuned_row_of_a_larger_m(m, monkeypatch):
     from aiter.ops.gemm_op_common import get_padded_m
 
     k = NSEG * SEG_K
-    padded = get_padded_m(m, N, k, 0)
+    padded = get_padded_m(
+        m, N, k, 1
+    )  # the coarse level: M = 33..48 -> 64, 65..112 -> 128
     assert (padded + 15) // 16 > (m + 15) // 16
     xs, w = _inputs(m)
     x = torch.cat(xs, dim=-1)
