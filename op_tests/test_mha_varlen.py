@@ -933,6 +933,10 @@ def varlen_flash_attn_seq_padding_benchmark(
 _THD_HD256_FWD_KERNEL = "fmha_fwd_hd256_bf16_varlen"
 _THD_KV_SPLIT_MERGE_KERNEL = "thd_kv_split_merge"
 _THD_KV_SPLITS_ENV = "AITER_FMHA_V3_FWD_THD_KV_SPLITS"
+# AITER_FMHA_V3_FWD_THD=0 turns the THD rows off, so the cases below would not reach them.
+_THD_HD256_ENABLED = (
+    get_gfx() == "gfx950" and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
+)
 _THD_HD256_CASES = [
     # (gqa_ratio, causal, kv_splits); kv_splits None leaves the default, one slice.
     (1, False, None),
@@ -955,7 +959,10 @@ def _launched_gpu_kernels(fn):
     return result, names
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD rows")
+@pytest.mark.skipif(
+    not _THD_HD256_ENABLED,
+    reason="gfx950 hd256 BF16 THD rows (off on other GPUs or with AITER_FMHA_V3_FWD_THD=0)",
+)
 @pytest.mark.parametrize("gqa_ratio,causal,kv_splits", _THD_HD256_CASES)
 def test_flash_attn_varlen_func_thd_hd256(gqa_ratio, causal, kv_splits):
     torch.random.manual_seed(0)
@@ -1284,7 +1291,7 @@ if __name__ == "__main__":
 
     # The gfx950 hd256 BF16 THD rows, which the sweep above never reaches (CI runs this file
     # as a script, so the pytest cases need this call to run there).
-    if (256, 256) in args.d_qk_v and "bf16" in args.dtype and get_gfx() == "gfx950":
+    if (256, 256) in args.d_qk_v and "bf16" in args.dtype and _THD_HD256_ENABLED:
         for gqa_ratio, causal, kv_splits in _THD_HD256_CASES:
             test_flash_attn_varlen_func_thd_hd256(gqa_ratio, causal, kv_splits)
 
