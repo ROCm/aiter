@@ -160,6 +160,7 @@ step3 用的是 naive 自己扫出来的 tile，和线上不可比，所以表�
 - **Occupancy 不是差距来源。** 用 clang `-Rpass-analysis=kernel-resource-usage` 对 dump 出的 IR 统计，naive 和线上每行的 VGPR、LDS、每个 CU 驻留的 WG 数几乎一样。
   - prefill 阶段每个 SIMD 只有 1–2 个 wave，T=1 / T=16 的 gemm1 填不满 256 个 CU。
   - 这些是静态值；实际 occupancy 需要用 rocprof 计数器测。
+  - step6 给 A 加 padding 后，T=16 gemm1 的 LDS 从 79.7K 涨到 80.4K，每个 CU 驻留的 WG 从 4 个降到 3 个。这和线上一致（81.0K，3 个），测速上也没有看出变化。
 - **线上 K tail 越界读（K=576、tile_k=128）。** `add_tdm_loads` 的 view extent 用了 `inner * K_TILES`（`mxfp4_preshuffle_gfx1250_tdm.py` 第 1028 行），没有用按 K_TAIL 截断的长度。于是最后一个 K tile：
   - A 每行多读 32 B（读进下一行）；
   - W 每个 16 行组多读 512 B（读进下一组）。
@@ -343,14 +344,37 @@ LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每
 - **找专家**：线上第 727–750 行用的算法和 naive 相同（lane 并行数 psum，再 `shuffle_xor` 求和）。
 - **K 尾块**：目前两边读的字节数和 WMMA 条数相同。线上最后一个 K tile 有越界读的 bug，也按整个 tile 去读；线上的尾块同样做 1 个 128 的 WMMA 步（K=576 的最后 64 补零）。等线上修好这个 bug，gemm2 线上会少读最多 11%，这一项才会变成差距。
 - **occupancy、epilogue**：两边已经一致。
+- **主循环里的 VALU 地址计算**：试过，没有收益，见下一节。
+
+### 试过但没有保留：预先算好 LDS 地址（step8 之后）
+- **问题**：step8 之后主循环每个 K tile 有 25 条 VALU，线上只有 3 条。其中约 16 条是 `v_add_nc_u32 vX, s_stage, v_lane`：stage 号 `kt % NB` 是运行时的值，编译器给每个 WMMA 块、每次读都单独留了一个循环外的 lane 偏移寄存器，每个 tile 都要给它们加一次 stage 基址。其余 8 条是填 hazard 的 `v_nop`。
+- **做法**：
+  1. **中间版**：每个读取器（A、W、A scale、W scale）只保留一个 lane 偏移，WMMA 块、K step、第几次读的差别都作为编译期常量折进 `ds_load` 的立即数 offset。每个 tile 的 VALU 从 25 降到 15（7 次加法和 8 条 `v_nop`）。
+  2. **展开版**：再把稳态循环按 NB 展开，每份循环体里的 stage 号都是编译期常量，stage 偏移也进了立即数。循环里的 VALU 变成 0。
+  - 两个版本的正确性都是 15/15，`s_nop` 为 0，没有任何 TDM 后紧跟分支。
+- **结果**（同一进程里交替跑 3 轮取最小值，单位 us，GPU 上没有别人的进程）：
+
+  | 行 | step8 | 中间版 | 展开版 |
+  |---|---|---|---|
+  | T=1 gemm1 | 7.3 | 7.3 | 7.4 |
+  | T=16 gemm1 | 23.9 | 23.7 | 23.6 |
+  | T=128 gemm1 | 75.8 | 75.3 | 77.2 |
+  | T=128 gemm2 | 44.0 | 43.3 | 43.5 |
+  | T=1024 gemm1 | 85.2 | 86.1 | 84.6 |
+  | T=8192 gemm1 | 155.4 | 153.6 | 152.7 |
+  | T=8192 gemm2 | 123.8 | 123.4 | 126.2 |
+  | T=32768 gemm1 | 384.3 | 403.0 | 393.2 |
+  | T=32768 gemm2 | 353.3 | 356.8 | 357.2 |
+
+  另外 3 行（T=1 gemm2、T=16 gemm2、T=1024 gemm2）三个版本之间相差都不超过 0.5 us。
+- **结论**：除了 T=32768 gemm1，其余各行三个版本的差别都在 ±2% 以内；T=32768 gemm1 两个新版本反而慢 2–5%。展开版还让这一行的 VGPR 从 674 涨到 786，代码量也变大。所以 VALU 地址计算不是瓶颈：和每个 tile 的 32 条 WMMA、48 条 `ds_load` 比，它的开销很小。代码回退到 step8。
 
 ## 后续优化方案
 
 按预期收益和依据排序（A 的 LDS padding、A scale 连续布局、无分支的 TDM 发射已分别在 step6、step7、step8 完成）：
 
-1. **T=8192 gemm1 剩下的 1.23 倍（2 个 buffer 的配置）。** step8 之后分支和等待次数已经接近线上（`s_wait_dscnt` 10 vs 11），差距还在，需要换个方向查：
-   - 主循环每个 K tile 的 VALU 是 25 条，线上是 3 条：预先算好各 stage 的 LDS 基址和每个 wave 的 TDM 偏移，常量折进 `ds_load` 的 offset 字段。
-   - `ds_load` 和 WMMA 的具体排列顺序（线上用 `sched_barrier` 手工控制交错），以及等待的位置。
+1. **T=8192 gemm1 剩下的 1.23 倍（2 个 buffer 的配置）。** step8 之后分支和等待次数已经接近线上（`s_wait_dscnt` 10 vs 11），VALU 地址计算也已排除（见「试过但没有保留」），差距还在，需要换个方向查：
+   - `ds_load` 和 WMMA 的具体排列顺序（线上用 `sched_barrier` 手工控制交错），以及等待的位置。最好用 rocprof 看这一行的 LDS、TDM 和 WMMA 各自的忙闲情况，再决定改哪里。
    - 4 个 wave 以上的配置可以试试线上的"每 2 个 wave 分一个 tensor"，减少每个 wave 的 TDM 条数。
 2. **split-K（线上 `k_waves`）。** 只影响 T=1 gemm1，但这一行还差 1.65 倍，其中约 79% 来自 split-K。
    - 每组 wave 算一段 K，部分和经 LDS 归约（线上的 `K_PARTIAL_B` / `GROUP_ARENA_B`）。
