@@ -18,7 +18,8 @@ of one shape; run the config-shape guard after editing a family:
 
 Shape ownership of the Kimi tables: ``kimik3_*`` holds tokens <= 8192 plus
 16384 (varlen 8x2048), TP1; ``kimik3_1_*`` holds 32768 and 65536 with
-H*K = 12288 / TP for TP 1, 4 and 8.
+H*K = 12288 / TP for TP 1, 4 and 8. The f_b gate rows have K = 2R = 256: the
+layer's fp32 lr enters as bf16 hi | lo.
 """
 
 import argparse
@@ -44,6 +45,7 @@ from aiter.test_common import checkAllclose, run_perftest
 
 # Kimi-K3 gate_lower_bound for the safe-gate modes
 LOWER_BOUND = -5.0
+KDA_B_K_REPEAT = 2
 
 
 def _inputs(row):
@@ -51,11 +53,15 @@ def _inputs(row):
     layout, mode = row["layout"], int(row["epilogue"])
     dt = cfgs.torch_dtype(row["dtype"])
     a = torch.randn(k, m).to(dt).t() if layout[0] == "t" else torch.randn(m, k).to(dt)
+    # the gate GEMMs: A is lr split into bf16 hi | lo (K = 2R), B is f_b read
+    # once per half, as kda_layer_bwd launches them
+    rep = KDA_B_K_REPEAT if mode in GEMM_EPI_KDA_MODES else 1
+    kb = k // rep
     if layout[1] == "t":
-        b = (torch.randn(n, k) * k**-0.5).to(dt).t()
+        b = (torch.randn(n, kb) * k**-0.5).to(dt).t()
     else:
-        b = (torch.randn(k, n) * k**-0.5).to(dt)
-    kw = {}
+        b = (torch.randn(kb, n) * k**-0.5).to(dt)
+    kw = {"b_k_repeat": rep} if rep > 1 else {}
     if mode in GEMM_EPI_KDA_MODES:
         heads = n // KDA_HEAD_DIM
         kw.update(
@@ -70,7 +76,8 @@ def _inputs(row):
 
 
 def _reference(a, b, mode, kw):
-    z = a.float() @ b.float()
+    b = b.float().repeat(kw.get("b_k_repeat", 1), 1)
+    z = a.float() @ b
     if mode == 0:
         return z, None
     if mode in (3, 4):
@@ -108,6 +115,7 @@ def tune_shape(row, iters, max_candidates):
         ),
         "epilogue": mode,
         "epi_group": KDA_HEAD_DIM if mode in GEMM_EPI_KDA_MODES else 1,
+        "b_k_repeat": kw.get("b_k_repeat", 1),
     }
     legal = _validate(m, n, k, layout, extra)
     best = None
@@ -153,7 +161,7 @@ def tune_shape(row, iters, max_candidates):
     cfg, us, err = best
     flops = 2 * m * n * k
     out_bytes = torch.empty(0, dtype=out_dtype).element_size()
-    nbytes = (m * k + n * k) * a.element_size() + m * n * out_bytes
+    nbytes = (m * k + b.numel()) * a.element_size() + m * n * out_bytes
     if mode in GEMM_EPI_AUX_MODES:
         nbytes += m * n * 4
     return {
