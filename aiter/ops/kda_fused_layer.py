@@ -139,28 +139,36 @@ def kda_layer_preprocess(x, w: KDALayerWeights, num_heads, eps=1e-6, lower_bound
     g (log decay) [B,T,H,K], beta [B,T,H], fp32."""
     B, T, _ = x.shape
     H = num_heads
-    xf = x.float()
-    q = _short_conv(_rb(xf @ w.w_q.float().t()), w.conv_q.float()).view(B, T, H, -1)
-    k = _short_conv(_rb(xf @ w.w_k.float().t()), w.conv_k.float()).view(B, T, H, -1)
-    v = _short_conv(_rb(xf @ w.w_v.float().t()), w.conv_v.float()).view(B, T, H, -1)
+    xf, cd = x.float(), _compute_dtype(x)
+
+    def proj(a, wt):
+        return _rb(_ref_linear(a, wt, cd))
+
+    # one QKV projection, like Megatron's in_proj (one rounding of its output)
+    w_qkv = torch.cat([w.w_q, w.w_k, w.w_v])
+    sizes = [w.w_q.shape[0], w.w_k.shape[0], w.w_v.shape[0]]
+    a_q, a_k, a_v = proj(xf, w_qkv).split(sizes, -1)
+    q = _short_conv(a_q, w.conv_q.float()).view(B, T, H, -1)
+    k = _short_conv(a_k, w.conv_k.float()).view(B, T, H, -1)
+    v = _short_conv(a_v, w.conv_v.float()).view(B, T, H, -1)
     q = _rb(F.normalize(q, dim=-1, eps=L2NORM_EPS))
     k = _rb(F.normalize(k, dim=-1, eps=L2NORM_EPS))
-    raw = _rb(_rb(xf @ w.f_a.float().t()) @ w.f_b.float().t())
+    raw = proj(proj(xf, w.f_a), w.f_b)
     g = kda_gate((raw + w.dt_bias.float()).view(B, T, H, -1), w.A_log, lower_bound)
-    beta = torch.sigmoid(_rb(xf @ w.w_beta.float().t()))
+    beta = torch.sigmoid(proj(xf, w.w_beta))
     return q, k, v, g, beta
 
 
 def kda_layer_postprocess(o, x, w: KDALayerWeights, eps=1e-6):
     """Gated RMSNorm + output projection. o: [B,T,H,V] fp32."""
     B, T, H, V = o.shape
-    xf = x.float()
+    xf, cd = x.float(), _compute_dtype(x)
     o = _rb(o)
-    gate = torch.sigmoid(_rb(xf @ w.g_proj.float().t())).view(B, T, H, V)
+    gate = torch.sigmoid(_rb(_ref_linear(xf, w.g_proj, cd))).view(B, T, H, V)
     rstd = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
     normed = _rb(o * rstd * _rb(w.norm_w.float()))
     o = _rb(normed * gate)
-    return _rb(o.reshape(B, T, H * V) @ w.w_o.float().t()).to(x.dtype)
+    return _rb(_ref_linear(o.reshape(B, T, H * V), w.w_o, cd)).to(x.dtype)
 
 
 def _chunk_step(S, q, k, v, g, beta):
@@ -421,11 +429,15 @@ _piece_overrides: dict = {}
 #   proj_epilogue  0: plain torch GEMMs instead of the FlyDSL GEMM epilogues
 #   chunk_fuse     auto (the kernel's own set), none, or a "+"-joined subset of
 #                  qk_l2norm / gate / beta_sigmoid handed to the chunk backward
+#   mxfp8_epilogue 1: under gemm_precision="mxfp8", run the gate / sigmoid GEMM
+#                  epilogues fused on the MXFP8 operands (fp32 GEMM output into
+#                  the epilogue); 0: unfused on the bf16 GEMM output, as TE does
 KDA_FUSION_DEFAULTS = {
     "save_fwd": "0",
     "concat_proj": "0",
     "proj_epilogue": "1",
     "chunk_fuse": "auto",
+    "mxfp8_epilogue": "0",
 }
 _fusion_overrides: dict = {}
 
@@ -770,11 +782,14 @@ _proj_gemm_hook: ProjGemmHook | None = None
 def register_proj_gemm(fn: ProjGemmHook | None):
     """Install a projection-GEMM implementation (e.g. an MXFP8 recipe).
 
-    ``fn(a, w, *, kind, cd, epilogue, name, **epilogue_args)`` gets every
+    ``fn(a, w, *, kind, cd, epilogue, name, ops, **epilogue_args)`` gets every
     projection GEMM of the fused path, forward, dgrad and wgrad, including the
     concatenated projection and the epilogue-fused ones (see ``_proj_gemm`` for
     the operand convention). It returns the fp32 result, or ``NotImplemented``
-    to leave that call to the default path. ``None`` uninstalls it.
+    to leave that call to the default path; a hook that only transforms the
+    operands can finish with ``_proj_gemm_default``. ``None`` uninstalls it.
+    ``kda_layer_fwd(..., gemm_precision="mxfp8")`` installs ``MXFP8ProjGemm``
+    for the duration of the call.
     """
     global _proj_gemm_hook
     _proj_gemm_hook = fn
@@ -794,10 +809,15 @@ def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
     """
     if _proj_gemm_hook is not None:
         out = _proj_gemm_hook(
-            a, w, kind=kind, cd=cd, epilogue=epilogue, name=name, **epi
+            a, w, kind=kind, cd=cd, epilogue=epilogue, name=name, ops=ops, **epi
         )
         if out is not NotImplemented:
             return out
+    return _proj_gemm_default(a, w, kind, cd, epilogue, ops, **epi)
+
+
+def _proj_gemm_default(a, w, kind, cd, epilogue=None, ops=None, **epi):
+    """``_proj_gemm`` without the installed hook."""
     if epilogue is not None:
         ops = ops or _TorchProj
         lb = epi.get("lower_bound")
@@ -821,6 +841,137 @@ def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
     if kind == "wgrad":
         return _mm(a.t(), w, cd)
     raise ValueError(f"unknown projection GEMM kind {kind!r}")
+
+
+# GEMM precision of the projections: "bf16" runs them in the layer's own dtype
+# (no quantization); "mxfp8" applies the Transformer Engine MXFP8 recipe.
+KDA_GEMM_PRECISIONS = ("bf16", "mxfp8")
+_active_gemm_precision = None
+
+# Reduction axis of (a, w) for each ``_proj_gemm`` kind: MXFP8 blocks run along it.
+_PROJ_K_AXES = {"fwd": (1, 1), "dgrad": (1, 0), "wgrad": (0, 0)}
+
+
+def kda_gemm_precision(precision=None):
+    """``precision``, else the running layer call's, else
+    ``AITER_KDA_GEMM_PRECISION``, else "bf16"."""
+    p = (
+        precision
+        or _active_gemm_precision
+        or os.environ.get("AITER_KDA_GEMM_PRECISION", "bf16")
+    )
+    if p not in KDA_GEMM_PRECISIONS:
+        raise ValueError(
+            f"unknown GEMM precision {p!r}, expected one of {KDA_GEMM_PRECISIONS}"
+        )
+    return p
+
+
+class MXFP8ProjGemm:
+    """``register_proj_gemm`` hook: Transformer Engine ``MXFP8BlockScaling``
+    (E4M3) on every projection GEMM, as Megatron-LM's Kimi-K3 recipes run the
+    KDA projections (``--fp8-recipe mxfp8 --fp8-format e4m3``; every KDA
+    projection is a TE linear and ``kda_disable_fp8`` is off).
+
+    Operands are rounded to the layer's compute dtype (TE quantizes the bf16
+    activations, gradients and the bf16 staging copy of the weights) and
+    quantized with one E8M0 scale per 32 values along the GEMM's reduction
+    axis (``aiter.ops.mxfp8_linear``): fprop X and W rowwise, dgrad dY rowwise
+    and W columnwise, wgrad dY and X columnwise, every copy from the 16-bit
+    tensor. Accumulation is fp32; fprop and dgrad outputs are rounded to the
+    compute dtype, wgrad stays fp32. That covers the low-rank f_a / f_b and
+    the w_beta projections too. The gate and sigmoid apply to the rounded
+    f_b / g_proj output in fp32 (unfused), unless the ``mxfp8_epilogue``
+    fusion runs the FlyDSL epilogues on the MXFP8 operands instead.
+
+    By ``mxfp8_gemm_impl()``: ``auto`` runs fprop / dgrad on aiter's FP8 GEMM
+    (bf16 out) and wgrad (fp32 out) as a bf16 GEMM on the dequantized
+    operands, which are exact in bf16; ``qdq`` runs everything that way;
+    ``emulate`` in fp32 torch (the reference).
+    """
+
+    def __init__(self, cd):
+        self.cd = cd
+
+    def gemm(self, a, w, kind):
+        from aiter.ops.mxfp8_linear import mxfp8_mm
+
+        a, w = a.to(self.cd), w.to(self.cd)
+        lhs = a.t() if kind == "wgrad" else a
+        rhs = w.t() if kind == "fwd" else w
+        return mxfp8_mm(lhs, rhs, out16=kind != "wgrad").float()
+
+    def __call__(self, a, w, *, kind, cd, epilogue=None, name=None, ops=None, **epi):
+        if epilogue is None:
+            return self.gemm(a, w, kind)
+        if _fusion_on("mxfp8_epilogue"):
+            return self._fused_epilogue(a, w, kind, epilogue, ops, epi)
+        raw = self.gemm(a, w, kind)
+        lb = epi.get("lower_bound")
+        if epilogue == "kda_gate":
+            gate = (epi["dt_bias"], epi["A_log"], epi["num_heads"])
+            return _TorchProj.gate_from_raw(raw, *gate, lb)
+        if epilogue == "kda_gate_bwd":
+            gate = (epi["dt_bias"], epi["A_log"], epi["num_heads"], epi["dg"])
+            return _TorchProj.gate_bwd_from_raw(raw, *gate, lb)
+        if epilogue == "sigmoid_mul":
+            out = torch.sigmoid(raw)
+            return out if epi.get("aux") is None else out * epi["aux"].float()
+        raise ValueError(f"unknown projection epilogue {epilogue!r}")
+
+    def _fused_epilogue(self, a, w, kind, epilogue, ops, epi):
+        from aiter.ops.mxfp8_linear import (
+            LAST_IMPLS,
+            mxfp8_gemm_impl,
+            mxfp8_qdq,
+            mxfp8_qdq_dtype,
+        )
+
+        on_gpu = a.is_cuda and mxfp8_gemm_impl() != "emulate"
+        qd = mxfp8_qdq_dtype(self.cd) if on_gpu else torch.float32
+        LAST_IMPLS["qdq_epilogue" if qd == torch.bfloat16 else "emulate"] += 1
+        ka, kw = _PROJ_K_AXES[kind]
+        aq = mxfp8_qdq(a.to(self.cd), ka, qd)
+        wq = mxfp8_qdq(w.to(self.cd), kw, qd)
+        if qd != torch.bfloat16:
+            ops = None  # the FlyDSL GEMMs take 16-bit operands
+        return _proj_gemm_default(aq, wq, kind, qd, epilogue, ops, **epi)
+
+
+class _GemmPrecisionScope:
+    """Runs a layer call at ``precision``; "mxfp8" installs ``MXFP8ProjGemm``
+    as the projection-GEMM hook for its duration."""
+
+    def __init__(self, precision, x):
+        self.precision = kda_gemm_precision(precision)
+        self.hook = None
+        if self.precision == "mxfp8":
+            self.hook = MXFP8ProjGemm(_compute_dtype(x))
+
+    def __enter__(self):
+        global _active_gemm_precision, _proj_gemm_hook
+        self.saved = _active_gemm_precision, _proj_gemm_hook
+        _active_gemm_precision = self.precision
+        if self.hook is not None:
+            from aiter.ops.mxfp8_linear import LAST_IMPLS
+
+            LAST_IMPLS.clear()
+            _proj_gemm_hook = self.hook
+        return self
+
+    def __exit__(self, *exc):
+        global _active_gemm_precision, _proj_gemm_hook
+        _active_gemm_precision, _proj_gemm_hook = self.saved
+
+
+def _ref_linear(a, w, cd):
+    """``a @ w^T`` of the torch backend: fp32, or under "mxfp8" the recipe's
+    fp32 emulation in forward and backward (operands rounded to ``cd``)."""
+    if _active_gemm_precision == "mxfp8":
+        from aiter.ops.mxfp8_linear import mxfp8_matmul
+
+        return mxfp8_matmul(a, w.t(), cd)
+    return a @ w.float().t()
 
 
 def conv_silu_bwd(a, w, dq, dk, dv, fn=None, cu_seqlens=None):
@@ -919,17 +1070,26 @@ class _TorchProj:
 
     @staticmethod
     def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
-        z = (lr.float() @ f_b.float().t() + dt_bias.float()).unflatten(
-            -1, (num_heads, -1)
+        return _TorchProj.gate_from_raw(
+            lr.float() @ f_b.float().t(), dt_bias, A_log, num_heads, lower_bound
         )
-        return kda_gate(z, A_log, lower_bound).flatten(-2)
 
     @staticmethod
     def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
-        """(dz, per-element dA_log terms), fp32 [M, H*K]."""
-        z = (lr.float() @ f_b.float().t() + dt_bias.float()).unflatten(
-            -1, (num_heads, -1)
+        return _TorchProj.gate_bwd_from_raw(
+            lr.float() @ f_b.float().t(), dt_bias, A_log, num_heads, dg, lower_bound
         )
+
+    @staticmethod
+    def gate_from_raw(raw, dt_bias, A_log, num_heads, lower_bound=None):
+        """Decay gate of the f_b GEMM output ``raw`` [M, H*K], fp32."""
+        z = (raw.float() + dt_bias.float()).unflatten(-1, (num_heads, -1))
+        return kda_gate(z, A_log, lower_bound).flatten(-2)
+
+    @staticmethod
+    def gate_bwd_from_raw(raw, dt_bias, A_log, num_heads, dg, lower_bound=None):
+        """(dz, per-element dA_log terms), fp32 [M, H*K]."""
+        z = (raw.float() + dt_bias.float()).unflatten(-1, (num_heads, -1))
         return _TorchProj.gate_bwd_from_z(z, A_log, num_heads, dg, lower_bound)
 
     @staticmethod
@@ -1381,6 +1541,11 @@ def _kda_layer_fused_bwd(
         if cd == torch.float32
         else f"{cd}->fp32" if _MM_OUT_DTYPE_OK else f"{cd} inputs, fp32 GEMM"
     )
+    if _active_gemm_precision == "mxfp8":
+        from aiter.ops.mxfp8_linear import LAST_IMPLS, mxfp8_gemm_impl
+
+        counts = ",".join(f"{k}:{v}" for k, v in sorted(LAST_IMPLS.items()))
+        LAST_PIECES["gemm"] = f"mxfp8[{mxfp8_gemm_impl()}] {counts}"
     return dx.view(B, T, D).to(x.dtype), grads
 
 
@@ -1390,6 +1555,7 @@ class _KDALayerFused(torch.autograd.Function):
         ctx.save_for_backward(x, *ws)
         ctx.cfg = (num_heads, chunk_size, eps)
         ctx.lower_bound, ctx.cu_seqlens = lower_bound, cu_seqlens
+        ctx.gemm_precision = kda_gemm_precision()
         w = KDALayerWeights.from_tensors(ws)
         ctx.saved_state = None
         if _fusion_on("save_fwd"):
@@ -1416,16 +1582,17 @@ class _KDALayerFused(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         x, *ws = ctx.saved_tensors
-        dx, dw = _kda_layer_fused_bwd(
-            dy,
-            x,
-            KDALayerWeights.from_tensors(ws),
-            *ctx.cfg,
-            _row_ops(x),
-            lower_bound=ctx.lower_bound,
-            cu_seqlens=ctx.cu_seqlens,
-            saved=ctx.saved_state,
-        )
+        with _GemmPrecisionScope(ctx.gemm_precision, x):
+            dx, dw = _kda_layer_fused_bwd(
+                dy,
+                x,
+                KDALayerWeights.from_tensors(ws),
+                *ctx.cfg,
+                _row_ops(x),
+                lower_bound=ctx.lower_bound,
+                cu_seqlens=ctx.cu_seqlens,
+                saved=ctx.saved_state,
+            )
         ctx.saved_state = None
         return (dx, None, None, None, None, None, *dw.tensors())
 
@@ -1451,6 +1618,7 @@ def kda_layer_fwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    gemm_precision=None,
 ):
     """x: [B,T,D] -> y: [B,T,D]. Differentiable for both backends.
 
@@ -1460,7 +1628,28 @@ def kda_layer_fwd(
     ``cu_seqlens`` ([N + 1] cumulative lengths, x packed as [1, total, D]) runs
     each sequence independently: the conv and the recurrence restart at every
     boundary.
+
+    ``gemm_precision`` ("bf16" | "mxfp8", default ``kda_gemm_precision()``)
+    sets the projection GEMMs, forward and backward: "bf16" runs them in the
+    layer's dtype; "mxfp8" applies the Transformer Engine MXFP8 recipe to every
+    projection (``MXFP8ProjGemm``; the torch backend emulates it in fp32).
     """
+    with _GemmPrecisionScope(gemm_precision, x):
+        return _kda_layer_fwd(
+            x, w, num_heads, chunk_size, eps, backend, cu_seqlens, lower_bound
+        )
+
+
+def _kda_layer_fwd(
+    x,
+    w: KDALayerWeights,
+    num_heads,
+    chunk_size=64,
+    eps=1e-6,
+    backend="torch",
+    cu_seqlens=None,
+    lower_bound=None,
+):
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
@@ -1491,14 +1680,33 @@ def kda_layer_bwd(
     backend="torch",
     cu_seqlens=None,
     lower_bound=None,
+    gemm_precision=None,
 ):
     """Backward of one KDA layer.
 
     Returns (dx, dw) where dw is a KDALayerWeights holding the gradient of every
     weight (q/k/v proj, short conv, F-decay low-rank gate + A_log/dt_bias, beta
     proj, output gate proj, norm weight, output proj). The forward is recomputed.
-    ``cu_seqlens`` as in ``kda_layer_fwd``; weight gradients sum over sequences.
+    ``cu_seqlens`` and ``gemm_precision`` as in ``kda_layer_fwd``; weight
+    gradients sum over sequences.
     """
+    with _GemmPrecisionScope(gemm_precision, x):
+        return _kda_layer_bwd(
+            dy, x, w, num_heads, chunk_size, eps, backend, cu_seqlens, lower_bound
+        )
+
+
+def _kda_layer_bwd(
+    dy,
+    x,
+    w: KDALayerWeights,
+    num_heads,
+    chunk_size=64,
+    eps=1e-6,
+    backend="torch",
+    cu_seqlens=None,
+    lower_bound=None,
+):
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
