@@ -16,8 +16,8 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
     SPLIT_K_WORKSPACE_MAX_ELEMS,
-    make_gemm_a16w16_param_and_validate,
     split_k_workspace_supported,
+    validate_gemm_a16w16_candidate,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
@@ -430,7 +430,7 @@ def get_flydsl_a16w16_configs(
         return _gfx1250_tdm_configs(m, n, k, dtype) + _gfx1250_configs(m, n, k)
     if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
-    if make_gemm_a16w16_param_and_validate is None:
+    if validate_gemm_a16w16_candidate is None:
         return []
     if get_gfx_runtime() != "gfx950":
         return []
@@ -680,15 +680,6 @@ def get_flydsl_a16w16_configs(
     valid_configs = []
     memory_configs = []
     for config in configs:
-        # The small-BM half-tile path corrupts ragged-N output because its
-        # second N half uses a full-tile async-load layout. Keep ragged N on
-        # full-tile or BM>=128 policies until that kernel path is fixed.
-        if (
-            config["use_half_tile_interleaved"]
-            and config["block_m"] < 128
-            and n % config["block_n"] != 0
-        ):
-            continue
         if (
             apply_policy_pruning
             and not is_large_gemm
@@ -716,9 +707,6 @@ def get_flydsl_a16w16_configs(
                     (256, 256),
                     (400, 128),
                 )
-                # Past 64 accumulator tiles per wave the kernel spills to
-                # scratch, which can exhaust device memory at dispatch.
-                or mma_m_iters * mma_n_iters > 64
             ):
                 continue
 
@@ -730,31 +718,14 @@ def get_flydsl_a16w16_configs(
             "b_is_transposed": True,
             "has_bias": has_bias,
         }
-        param = make_gemm_a16w16_param_and_validate(m, n, k, validation_config)
+        param = validate_gemm_a16w16_candidate(m, n, k, validation_config)
         if param is not None:
-            hti_atomic_split_k = (
-                config["use_half_tile_interleaved"] and config["split_k"] > 1
-            )
-            # HTI atomic split-K loses partial updates on large-M grids.
-            if not hti_atomic_split_k:
-                valid_configs.append(config)
-            # Atomic and workspace reductions trade launch count for traffic;
-            # keep both so tuning picks the faster one per shape.
-            if split_k_workspace_supported(
-                m, n, config["split_k"], out_dtype_id, has_bias
-            ) and (
-                make_gemm_a16w16_param_and_validate(
-                    m, n, k, {**validation_config, "use_split_k_workspace": True}
-                )
-                is not None
-            ):
-                valid_configs.append({**config, "use_split_k_workspace": True})
+            valid_configs.append(config)
             # Stagger is a measured option, never a global default. At small
             # M, a single row tile streams B; preserve the original catalog
             # and let tuning race stagger and B cache policy against the original.
             if (
-                not hti_atomic_split_k
-                and m <= 128
+                m <= 128
                 and m <= config["block_m"]
                 and _config_key(config) in memory_bases
                 and _uniform_async_loads(param)
@@ -765,6 +736,15 @@ def get_flydsl_a16w16_configs(
                     for nt in (False, True)
                     if stride or nt
                 )
+
+        # Atomic and workspace reductions trade launch count for traffic.
+        # Validate workspace independently because an unsafe HTI atomic base
+        # can still have a safe FP32 workspace reduction.
+        workspace_config = {**validation_config, "use_split_k_workspace": True}
+        if split_k_workspace_supported(
+            m, n, config["split_k"], out_dtype_id, has_bias
+        ) and validate_gemm_a16w16_candidate(m, n, k, workspace_config):
+            valid_configs.append({**config, "use_split_k_workspace": True})
     skinny_configs = []
     if dtype == out_dtype == torch.bfloat16 and not has_bias and 0 < m <= 128:
         # The public wrapper and tuned-name parser already support skinny,

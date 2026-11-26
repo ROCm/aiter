@@ -388,7 +388,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
     name += f"_bpgr{param.b_stages - 1}" if param.b_stages > param.stages else ""
-    name += "_phti" if param.use_half_tile_interleaved else "_pft"
+    # The suffix invalidates native FlyDSL artifacts from before the LDS waits.
+    name += "_phti_lds2" if param.use_half_tile_interleaved else "_pft"
     return name
 
 
@@ -1538,6 +1539,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         b0 = load_b_fragment(0, 0)
         a0 = load_a_fragment(0, 0)
         async_load_a_to_lds(1, k_tile + 1, 1)
+        # The other wave group can refill B after this barrier.
+        rocdl.s_waitcnt(lgkmcnt=0)
         rocdl.s_barrier()
         consume(c00, a0, b0, True)
         rocdl.s_barrier()
@@ -1555,6 +1558,7 @@ def gemm_a16w16_hti_gfx950_kernel(
         async_load_b_to_lds(1, next_k_tile, 0)
         wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(c11, a1, b1, True)
+        rocdl.s_waitcnt(lgkmcnt=0)
         rocdl.s_barrier()
         # 1
         a0 = load_a_fragment(0, 1)
@@ -1613,6 +1617,8 @@ def gemm_a16w16_hti_gfx950_kernel(
     consume(c01, a0, b1, True)
     rocdl.s_barrier()
     a1 = load_a_fragment(1, 1)
+    # Complete the A read before C reuses this LDS region.
+    rocdl.s_waitcnt(lgkmcnt=0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
     store_half_tile_to_lds(0, 0, c00)
@@ -1631,17 +1637,25 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_lds(1, 1, c11)
         if const_expr(atomic_split_k):
             splitk_protocol.wait_until_initialized(expected_signal)
+        else:
+            # The signal wait holds the barrier that orders these LDS reads.
+            rocdl.sched_barrier(0)
+            gpu.barrier()
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
+        if wid // n_waves == 0:
+            rocdl.s_barrier()
+        rocdl.s_waitcnt(lgkmcnt=0)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
+        rocdl.s_waitcnt(lgkmcnt=0)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
@@ -1849,6 +1863,42 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
             or result.block_m * result.block_n % c_elements_per_iteration != 0
         ):
             return None
+    return result
+
+
+def validate_gemm_a16w16_candidate(m, n, k, kwargs):
+    """Return a launchable and catalog-safe gfx950 A16W16 configuration."""
+    result = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
+    if result is None:
+        return None
+
+    # HTI packed atomics lose partial updates on large grids. Workspace
+    # reduction uses a separate FP32 path and remains safe.
+    if (
+        result.use_half_tile_interleaved
+        and result.is_split_k
+        and not result.use_split_k_workspace
+    ):
+        return None
+
+    # The small-M HTI load layout does not mask a ragged second N half.
+    if result.use_half_tile_interleaved and result.block_m < 128 and n % result.block_n:
+        return None
+
+    # HTI BN256 needs four N waves to cover both halves safely.
+    if (
+        result.use_half_tile_interleaved
+        and result.block_n == 256
+        and result.n_waves < 4
+    ):
+        return None
+
+    # Larger per-wave accumulator grids spill heavily and include configurations
+    # that fail LLVM machine verification before launch.
+    mma_m_steps = result.block_m // (result.m_waves * result.mma_m)
+    mma_n_steps = result.block_n // (result.n_waves * result.mma_n)
+    if mma_m_steps * mma_n_steps > 64:
+        return None
     return result
 
 
@@ -2112,7 +2162,7 @@ def gemm_a16w16(
         from .gemm_a8w8_splitk_reduce_gfx1250 import (
             compile_gemm_a8w8_splitk_reduce,
         )
-        from .tensor_shim import _run_compiled, ptr_arg
+        from .tensor_shim import ptr_arg
 
         _run_compiled(
             compile_gemm_a8w8_splitk_reduce(

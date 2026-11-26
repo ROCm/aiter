@@ -41,6 +41,13 @@ def _fake_gfx950_param(m, n, k, kwargs):
         block_threads=waves * GFX950_WAVE_SIZE,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=2,
+        use_half_tile_interleaved=kwargs["use_half_tile_interleaved"],
+        is_split_k=kwargs["split_k"] > 1,
+        use_split_k_workspace=kwargs.get("use_split_k_workspace", False),
+        m_waves=kwargs["m_waves"],
+        n_waves=kwargs["n_waves"],
+        mma_m=16,
+        mma_n=16,
     )
 
 
@@ -613,8 +620,10 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             mock.patch.object(
                 policy.torch.cuda, "get_device_properties", return_value=None
             ),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
             mock.patch.object(policy, "skinny_config_error", return_value=None),
             mock.patch.object(policy, "band_stream_config", return_value=None),
@@ -670,6 +679,178 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
 
 
 class TestGfx950FlydslCandidates(unittest.TestCase):
+    def test_internal_kernel_name_separates_code_changing_fields(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            GEMM_A16W16_DTYPE_BF16,
+            make_gemm_a16w16_gfx950_kernel_name,
+            make_gemm_a16w16_gfx950_param,
+        )
+
+        bf16 = GEMM_A16W16_DTYPE_BF16
+
+        def make(**kwargs):
+            return make_gemm_a16w16_gfx950_param(
+                bf16,
+                bf16,
+                **kwargs,
+            )
+
+        atomic = make(
+            block_m=256,
+            block_n=256,
+            split_k=4,
+            use_half_tile_interleaved=True,
+        )
+        workspace = make(
+            block_m=256,
+            block_n=256,
+            split_k=4,
+            use_half_tile_interleaved=True,
+            use_split_k_workspace=True,
+        )
+        atomic_name = make_gemm_a16w16_gfx950_kernel_name(atomic)
+        workspace_name = make_gemm_a16w16_gfx950_kernel_name(workspace)
+        self.assertNotEqual(atomic_name, workspace_name)
+        self.assertNotIn("_skws", atomic_name)
+        self.assertIn("_skws", workspace_name)
+        self.assertTrue(atomic_name.endswith("_phti_lds2"))
+        self.assertTrue(workspace_name.endswith("_phti_lds2"))
+
+        b_prefetch = make(block_m=128, block_n=192)
+        b_prefetch_name = make_gemm_a16w16_gfx950_kernel_name(b_prefetch)
+        self.assertGreater(b_prefetch.b_stages, b_prefetch.stages)
+        self.assertIn(f"_bpgr{b_prefetch.b_stages - 1}", b_prefetch_name)
+
+        residual = make(block_m=208, block_n=256)
+        regular = make(block_m=192, block_n=256)
+        self.assertTrue(residual.residual_m_tile)
+        self.assertFalse(regular.residual_m_tile)
+        self.assertNotEqual(
+            make_gemm_a16w16_gfx950_kernel_name(residual),
+            make_gemm_a16w16_gfx950_kernel_name(regular),
+        )
+
+    def test_aot_specialization_key_separates_reduction_and_device(self):
+        from aiter.ops.flydsl.kernels import gemm_a16w16_gfx950 as kernel
+
+        bf16 = kernel.GEMM_A16W16_DTYPE_BF16
+        base = {
+            "in_dtype_id": bf16,
+            "out_dtype_id": bf16,
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 4,
+            "m_waves": 2,
+            "n_waves": 4,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": True,
+            "a_is_transposed": False,
+            "b_is_transposed": True,
+            "has_bias": False,
+        }
+
+        def specialization_key(workspace, device):
+            items = tuple(sorted({**base, "use_split_k_workspace": workspace}.items()))
+            param = kernel._gemm_a16w16_gfx950_param_for(items)
+            return items, (kernel._PARAM_ITEMS[id(param)], torch.device(device))
+
+        atomic_items, atomic_key = specialization_key(False, "cuda:0")
+        workspace_items, workspace_key = specialization_key(True, "cuda:0")
+        _, other_device_key = specialization_key(True, "cuda:1")
+        self.assertEqual(atomic_key[0], atomic_items)
+        self.assertEqual(workspace_key[0], workspace_items)
+        self.assertNotEqual(atomic_key, workspace_key)
+        self.assertNotEqual(workspace_key, other_device_key)
+
+        binding = getattr(kernel.gemm_a16w16_gfx950, "_aiter_aot", None)
+        self.assertTrue(binding)
+        self.assertEqual(binding.key, ())
+        self.assertEqual(binding.cache.name, "gemm_a16w16_gfx950")
+
+    def test_catalog_safety_boundaries(self):
+        from types import SimpleNamespace
+
+        from aiter.ops.flydsl.kernels import gemm_a16w16_gfx950 as kernel
+
+        base = SimpleNamespace(
+            use_half_tile_interleaved=False,
+            is_split_k=False,
+            use_split_k_workspace=False,
+            block_m=128,
+            block_n=128,
+            block_k=64,
+            m_waves=2,
+            n_waves=2,
+            mma_m=16,
+            mma_n=16,
+        )
+
+        def validate(param, n=128):
+            with mock.patch.object(
+                kernel, "make_gemm_a16w16_param_and_validate", return_value=param
+            ):
+                return kernel.validate_gemm_a16w16_candidate(128, n, 1024, {})
+
+        self.assertIs(validate(base), base)
+
+        hti_atomic = SimpleNamespace(
+            **{
+                **vars(base),
+                "use_half_tile_interleaved": True,
+                "is_split_k": True,
+            }
+        )
+        self.assertIsNone(validate(hti_atomic))
+        hti_workspace = SimpleNamespace(
+            **{**vars(hti_atomic), "use_split_k_workspace": True}
+        )
+        self.assertIs(validate(hti_workspace), hti_workspace)
+
+        ragged = SimpleNamespace(
+            **{
+                **vars(base),
+                "use_half_tile_interleaved": True,
+                "block_m": 64,
+                "block_n": 96,
+            }
+        )
+        self.assertIsNone(validate(ragged, n=100))
+
+        narrow_bn_waves = SimpleNamespace(
+            **{
+                **vars(base),
+                "use_half_tile_interleaved": True,
+                "block_n": 256,
+                "n_waves": 2,
+            }
+        )
+        self.assertIsNone(validate(narrow_bn_waves, n=256))
+
+        compiler_unsafe = SimpleNamespace(
+            **{
+                **vars(base),
+                "block_m": 96,
+                "block_n": 256,
+                "m_waves": 1,
+                "n_waves": 1,
+            }
+        )
+        self.assertIsNone(validate(compiler_unsafe, n=256))
+
+        accumulator_boundary = SimpleNamespace(
+            **{
+                **vars(base),
+                "block_m": 128,
+                "block_n": 128,
+                "m_waves": 1,
+                "n_waves": 1,
+            }
+        )
+        self.assertIs(validate(accumulator_boundary), accumulator_boundary)
+
     def test_split_k_workspace_boundary_and_fallbacks(self):
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm_kernel_name,
@@ -740,8 +921,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -779,8 +962,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -906,8 +1091,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -999,8 +1186,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -1029,8 +1218,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
+            mock.patch(
+                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+                "make_gemm_a16w16_param_and_validate",
+                _fake_gfx950_param,
             ),
         ):
             for shape, tile in (

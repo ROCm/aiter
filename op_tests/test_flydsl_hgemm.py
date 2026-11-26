@@ -483,6 +483,54 @@ def test_hgemm_concurrent_copy(m, n, k, dtype):
     torch.cuda.synchronize()
     bad = bad_launches.item()
     assert bad == 0, f"{bad} of {launches} launches differ from the idle-GPU output"
+
+    def check_wave_group_race(name, shape, config, repeats):
+        m_race, n_race, k_race = shape
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(SEED)
+        a_race = torch.randint(
+            -1, 2, (m_race, k_race), generator=gen, device="cuda"
+        ).to(dtype)
+        w_race = torch.randint(
+            -1, 2, (n_race, k_race), generator=gen, device="cuda"
+        ).to(dtype)
+        ref = run_torch(a_race, w_race, dtype)
+        out_race = torch.empty_like(ref)
+        wrong = torch.zeros((), dtype=torch.int64, device="cuda")
+        for _ in range(repeats):
+            out_race.fill_(float("nan"))
+            flydsl_hgemm(
+                a_race,
+                w_race,
+                out=out_race,
+                block_k=64,
+                stages=2,
+                split_k=1,
+                m_waves=2,
+                k_waves=1,
+                group_m=0,
+                policy="hti",
+                **config,
+            )
+            wrong += (out_race != ref).any()
+        torch.cuda.synchronize()
+        bad_race = int(wrong)
+        assert bad_race == 0, f"{name}: {bad_race} of {repeats} launches are wrong"
+
+    check_wave_group_race(
+        "HTI main loop",
+        (2048, 4096, 1024),
+        {"block_m": 64, "block_n": 64, "n_waves": 2},
+        512,
+    )
+    for block_m in (128, 256):
+        check_wave_group_race(
+            f"HTI {block_m}x256 epilogue",
+            (1024, 1024, 1024),
+            {"block_m": block_m, "block_n": 256, "n_waves": 2},
+            3,
+        )
+
     return {
         "gfx": get_gfx_runtime(),
         "tile": (
