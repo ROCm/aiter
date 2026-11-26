@@ -858,10 +858,6 @@ path's). Issue 4 is in the JIT path and remains.
   as a batched mxfp8 GEMM that falls back to its heuristic config, has no
   entry: it traces on the JIT path in every process, with one error per key;
   tuning the shape adds it to the prebuild.
-- No replay prebuilds the gfx942 whole-MoE launchers (`moe_gfx942_gemm`,
-  `moe_gfx942_sorted_sum`, `moe_gfx942_absmax`, `moe_gfx942_quant_per_tensor`):
-  `aiter.aot.flydsl.moe` builds only the 2-stage ones for gfx942. Until one
-  does, they take the JIT path.
 - Only the launchers in §5 are converted: those of the AOT replays on gfx942
   and gfx950 (GEMMs, 2-stage MoE, the paged-attention planner, the GDN
   prefill kernels, conv3d, the gfx950 FP8 attention and the gfx950
