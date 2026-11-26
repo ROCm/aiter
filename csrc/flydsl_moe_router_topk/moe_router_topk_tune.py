@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tuner for ``router_topk_config``: per shape, the tuned router GEMM (tuned into
-``--gemm_tuned_file`` first if missing) + ``topk_gating`` against the fused
-launch at each split_k of the FlyDSL GEMM catalog and prefetch depth, interleaved
-with an A/A band. ``fused`` = the best candidate beats the unfused path by more
-than the band; where the router GEMM is the FlyDSL kernel, only its own split_k
-(``bitexact``: the unfused bytes) is a candidate."""
+"""Tuner for ``flydsl_moe_router_topk``: per shape, the tuned router GEMM (tuned
+into ``--gemm_tuned_file`` first if missing) + ``topk_gating`` against the fused
+launch at each split_k of ``SPLIT_KS`` that divides K into 32-wide steps, and
+each prefetch depth, in interleaved CUDA graphs with an A/A band. Candidates
+must match the op test's fp32 reference (``check_routes``). ``fused`` = the
+fastest beats the unfused path by more than the band."""
 
-import functools
+import importlib.util
 import statistics
 import subprocess
 import sys
@@ -19,27 +19,27 @@ import torch
 
 from aiter import logger, tuned_gemm
 from aiter.jit.core import AITER_CONFIG_MOE_ROUTER_TOPK, AITER_CONFIGS, AITER_ROOT_DIR
-from aiter.ops.flydsl.gemm_a16w16_policy import get_flydsl_a16w16_configs
 from aiter.ops.flydsl.moe_front_gfx1250 import flydsl_moe_router_topk as fused_topk
-from aiter.ops.flydsl.moe_front_gfx1250 import router_gemm_split_k
-from aiter.ops.topk import topk_gating
 from aiter.utility.base_tuner import TunerCommon
 
 KEYS = ["gfx", "cu_num", "M", "N", "K", "topk"]
 CAPTURES = 3
+SPLIT_KS = (1, 2, 4, 8, 16)  # the cluster holds 16 workgroups
 PREFETCH = (2, 4, 8, 16)
 BF16 = str(torch.bfloat16)
 
 
-def _unfused(x, w, bias, nvr, topk):
-    """``tgemm.mm`` + ``topk_gating``, the path the fused launch replaces."""
-    logits = tuned_gemm.tgemm.mm(x, w, None, otype=torch.bfloat16)
-    tw = torch.empty(x.shape[0], topk, dtype=torch.float32, device="cuda")
-    ti = torch.empty(x.shape[0], topk, dtype=torch.int32, device="cuda")
-    topk_gating(
-        tw, ti, logits, bias, True, 1.0, score_func="sigmoid", num_valid_rows=nvr
-    )
-    return tw, ti
+def _load_op_test():
+    """Inputs, fp32 reference, route check and unfused path of the op test."""
+    path = f"{AITER_ROOT_DIR}/op_tests/test_flydsl_moe_front.py"
+    spec = importlib.util.spec_from_file_location("_moe_front_test", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_T = _load_op_test()
 
 
 def _interleaved_us(fns, reps=10, replays=20, rounds=50):
@@ -72,17 +72,8 @@ def _interleaved_us(fns, reps=10, replays=20, rounds=50):
     return [statistics.median(t) for t in times]
 
 
-def _matches(rw, ri, tw, ti):
-    """Routes equal on >= 99% of rows, with weights there within 1e-2."""
-    same = (ri == ti).all(dim=1)
-    return same.float().mean() >= 0.99 and torch.allclose(rw[same], tw[same], atol=1e-2)
-
-
-def _candidates(M, N, K, gemm_split_k):
-    catalog = get_flydsl_a16w16_configs(M, N, K, torch.bfloat16, torch.bfloat16, 0)
-    splits = {c["split_k"] for c in catalog if not c.get("split_k_atomic")}
-    splits = {s for s in splits | {gemm_split_k} - {None} if not K % (s * 32)}
-    steps = {s: K // (s * 32) for s in splits if s <= 16}
+def _candidates(K):
+    steps = {s: K // (s * 32) for s in SPLIT_KS if not K % (s * 32)}
     return sorted({(s, min(p, n)) for s, n in steps.items() for p in PREFETCH})
 
 
@@ -98,7 +89,7 @@ class MoeRouterTopkTuner(TunerCommon):
         super().__init__(
             "moe_router_topk_tuned",
             KEYS,
-            ["fused", "split_k", "prefetch", "bitexact", "us", "unfused_us"],
+            ["fused", "split_k", "prefetch", "us", "unfused_us"],
             "gfx1250 fused MoE router top-k tuner",
         )
 
@@ -135,37 +126,30 @@ class MoeRouterTopkTuner(TunerCommon):
         type(AITER_CONFIGS).get_config_file.cache_clear()
         tuned_gemm.get_GEMM_A16W16_config_.cache_clear()
         tuned_gemm.get_GEMM_A16W16_config.cache_clear()
-        router_gemm_split_k.cache_clear()
 
     def tune_shape(self, M, N, K, topk):
-        g = torch.Generator(device="cuda").manual_seed(M)
-        x = torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16)
-        w = (torch.randn(N, K, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-        bias = torch.randn(N, generator=g, device="cuda") * 0.05
-        nvr = torch.tensor([M], dtype=torch.int32, device="cuda")
-        rw, ri = _unfused(x, w, bias, nvr, topk)
-        gemm_split_k = router_gemm_split_k(M, N, K)
+        torch.manual_seed(M)
+        x, w, bias, _ = _T.make_inputs(M, N, K, "rand")
+        nvr = torch.tensor([M], dtype=torch.int32, device="cuda")  # as callers pass it
+        ref = _T.run_torch(x, w, topk, bias, nvr)
         fused = {}
-        for sk, pf in _candidates(M, N, K, gemm_split_k):
-            cfg = {"split_k": sk, "prefetch": pf}
-            tw, ti = fused_topk(x, w, topk, bias, num_valid_rows=nvr, **cfg)
-            if sk == gemm_split_k:
-                assert torch.equal(rw.view(torch.int32), tw.view(torch.int32))
-                assert torch.equal(ri, ti)
-            elif not _matches(rw, ri, tw, ti):
+        for sk, pf in _candidates(K):
+            cfg = {"num_valid_rows": nvr, "split_k": sk, "prefetch": pf}
+            tw, ti = fused_topk(x, w, topk, bias, **cfg)
+            if _T.check_routes(ref, tw, ti):
                 logger.warning(f"M={M} K={K} split_k={sk}: routes differ, skipped")
                 continue
-            cfg.update(num_valid_rows=nvr, topk_weights=tw, topk_ids=ti)
-            fused[sk, pf] = functools.partial(fused_topk, x, w, topk, bias, **cfg)
+            fused[sk, pf] = lambda cfg=cfg: fused_topk(x, w, topk, bias, **cfg)
 
-        unfused = functools.partial(_unfused, x, w, bias, nvr, topk)
+        def unfused():
+            _T.run_unfused(x, w, topk, bias, nvr)
+
         arms = [unfused, *fused.values(), unfused]
         runs = [_interleaved_us(arms) for _ in range(CAPTURES)]
         base = statistics.median(t for r in runs for t in (r[0], r[-1]))
         band = max(abs(r[0] - r[-1]) for r in runs)
         us = {c: statistics.median(r[i] for r in runs) for i, c in enumerate(fused, 1)}
-        own = [c for c in us if c[0] == gemm_split_k]
-        best = min(own or us, key=us.get)
+        best = min(us, key=us.get)
         logger.info(
             f"M={M} N={N} K={K} topk={topk}: unfused {base:.2f} us, A/A {band:.3f}, "
             f"fused {', '.join(f'{s}/{p}:{t:.2f}' for (s, p), t in us.items())}"
@@ -174,7 +158,6 @@ class MoeRouterTopkTuner(TunerCommon):
             "fused": int(base - us[best] > band),
             "split_k": best[0],
             "prefetch": best[1],
-            "bitexact": int(best[0] == gemm_split_k),
             "us": round(us[best], 2),
             "unfused_us": round(base, 2),
         }

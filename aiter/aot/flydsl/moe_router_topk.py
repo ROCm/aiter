@@ -45,7 +45,6 @@ def replay(job: dict) -> None:
 
     # Rows of several cu_num can share a worker.
     front.router_topk_config.cache_clear()
-    front.router_gemm_split_k.cache_clear()
     m, n, k, topk = job["M"], job["N"], job["K"], job["topk"]
 
     def empty(*shape, dtype=torch.bfloat16):

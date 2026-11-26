@@ -30,10 +30,9 @@ def _tuned_rows() -> dict:
     with open(AITER_CONFIGS.AITER_CONFIG_MOE_ROUTER_TOPK_FILE, newline="") as f:
         rows = list(csv.DictReader(f))
     key = ("cu_num", "M", "N", "K", "topk")
-    cfg = ("split_k", "prefetch", "bitexact")
     return {
         (r["gfx"], *(int(r[c]) for c in key)): (
-            tuple(int(r[c]) for c in cfg) if r["fused"] == "1" else ()
+            (int(r["split_k"]), int(r["prefetch"])) if r["fused"] == "1" else ()
         )
         for r in rows
     }
@@ -41,10 +40,9 @@ def _tuned_rows() -> dict:
 
 @functools.lru_cache(maxsize=4096)
 def router_topk_config(m: int, n: int, k: int, topk: int) -> dict | None:
-    """``split_k`` / ``prefetch`` of ``flydsl_moe_router_topk`` for this call, or
-    None to keep ``tgemm.mm`` + ``topk_gating``: the tuned table
-    (``AITER_CONFIG_MOE_ROUTER_TOPK``, padded M) has no fused row, or a bitexact
-    row's split_k is no longer the router GEMM's."""
+    """``split_k`` / ``prefetch`` of the fused launch from the tuned table
+    (``AITER_CONFIG_MOE_ROUTER_TOPK``, padded M), or None where it has no
+    fused row for this shape on this GPU."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.gemm_op_common import find_padded_m_row
 
@@ -52,45 +50,7 @@ def router_topk_config(m: int, n: int, k: int, topk: int) -> dict | None:
     row, _ = find_padded_m_row(
         _tuned_rows(), lambda pm: (gfx, cu_num, pm, n, k, topk), m, n, k
     )
-    if not row or (row[2] and row[0] != router_gemm_split_k(m, n, k)):
-        return None
-    return {"split_k": row[0], "prefetch": row[1]}
-
-
-@functools.lru_cache(maxsize=4096)
-def router_gemm_split_k(m: int, n: int, k: int) -> int | None:
-    """split_k of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` launches for this
-    bf16 shape (the fused launch then gives its bytes), or None when the tuned
-    config names anything else."""
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-
-    gfx = get_gfx_runtime()
-    if gfx != "gfx1250":
-        return None
-    from aiter.tuned_gemm import get_GEMM_A16W16_config
-
-    bf16 = str(torch.bfloat16)
-    try:
-        config = get_GEMM_A16W16_config(
-            m, n, k, False, bf16, bf16, gfx=gfx, cu_num=get_cu_num()
-        )
-    except Exception:  # noqa: BLE001 - no config: not this kernel's GEMM
-        return None
-    if config is None or config.get("libtype") != "flydsl":
-        return None
-    from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
-
-    p = get_flydsl_hgemm_kernel_params(config["kernelName"]) or {}
-    if (
-        p.get("policy") not in ("ft", "ht")
-        or p.get("k_waves", 1) != 1
-        or p.get("has_bias")
-        or (p.get("dtype"), p.get("out_dtype")) != ("bf16", "bf16")
-        or not 1 <= p["split_k"] <= 16
-        or k % (p["split_k"] * 32)
-    ):
-        return None
-    return p["split_k"]
+    return {"split_k": row[0], "prefetch": row[1]} if row else None
 
 
 def _unsupported_reason(
@@ -219,9 +179,11 @@ def flydsl_moe_router_topk(
     num_valid_rows=num_valid_rows)`` in one launch: returns ``(topk_weights
     fp32 [M, topk], topk_ids int32 [M, topk])``, allocated when not given.
 
-    x is [M, K] and w [E, K], both bfloat16. Raises ValueError where
+    x is [M, K] and w [E, K], both bfloat16. The logits are summed in fp32 in
+    this kernel's order and rounded to bf16, so near ties may rank otherwise
+    than after ``tgemm.mm``. Raises ValueError where
     ``flydsl_moe_router_topk_supported`` is False. ``split_k`` / ``prefetch``
-    replace the tuned launch (the tuner); then no tuned row is needed."""
+    replace the tuned launch (the tuner and op test); then no row is needed."""
     reason = _unsupported_reason(
         x,
         w,

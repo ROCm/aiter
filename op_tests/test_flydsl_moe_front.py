@@ -13,14 +13,53 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_front_gfx1250 import (
     flydsl_moe_router_topk,
     flydsl_moe_router_topk_supported,
-    router_gemm_split_k,
 )
 from aiter.ops.topk import topk_gating
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, run_perftest
 from aiter.tuned_gemm import tgemm
 
 torch.set_default_device("cuda")
 E = 128
+# Selection values (score + bias) closer than this may rank either way: the
+# kernels round the logits to bf16 (0.5 ulp moves a sigmoid score <= 9e-4).
+NEAR_TIE = 2e-3
+
+
+def make_inputs(m, n, k, case):
+    x = torch.randn(m, k).to(torch.bfloat16)
+    w = (torch.randn(n, k) * 0.02).to(torch.bfloat16)
+    bias = torch.randn(n) * 0.05
+    nvr = torch.tensor([m - 2], dtype=torch.int32) if case == "pad_rows" else None
+    if case == "ties":  # equal experts across lanes and inside one lane
+        for a, b in ((5, 77), (3, 35), (64, 96), (0, 127)):
+            w[b], bias[b] = w[a], bias[a]
+    elif case == "saturate":  # sigmoid == 1.0 on many experts
+        x, bias = (x.float() * 60).to(torch.bfloat16), bias.zero_()
+    return x, w, bias, nvr
+
+
+def run_torch(x, w, topk, bias, nvr):
+    """fp32 logits, biased sigmoid top-k, renormalized; and per row the
+    smallest gap between neighbors of the top-(k+1) selection values."""
+    scores = torch.sigmoid(x.float() @ w.float().t())
+    top = (scores + bias).topk(topk + 1, dim=1)
+    ids = top.indices[:, :topk]
+    weights = scores.gather(1, ids)
+    weights = weights / weights.sum(1, keepdim=True)
+    gap = (top.values[:, :-1] - top.values[:, 1:]).min(1).values
+    if nvr is not None:  # padding rows: weight 0, id -1
+        pad = torch.arange(x.shape[0]) >= nvr
+        weights[pad], ids[pad], gap[pad] = 0, -1, float("inf")
+    return weights, ids.int(), gap
+
+
+def check_routes(ref, out_w, out_i):
+    """Rows that differ from ``run_torch``: other ids outside a near tie, or
+    the same ids with other weights."""
+    ref_w, ref_i, gap = ref
+    same = (ref_i == out_i).all(1)
+    close = torch.isclose(ref_w, out_w, rtol=1e-2, atol=1e-3).all(1)
+    return int(((~same & (gap >= NEAR_TIE)) | (same & ~close)).sum())
 
 
 def run_unfused(x, w, topk, bias, nvr):
@@ -34,34 +73,26 @@ def run_unfused(x, w, topk, bias, nvr):
 
 
 @benchmark()
-def test_moe_router_topk(m, k, topk, case):
-    x = torch.randn(m, k).to(torch.bfloat16)
-    w = (torch.randn(E, k) * 0.02).to(torch.bfloat16)
-    bias = torch.randn(E) * 0.05
-    nvr = torch.tensor([m - 2], dtype=torch.int32) if case == "pad_rows" else None
-    if case == "ties":  # equal experts across lanes and inside one lane
-        for a, b in ((5, 77), (3, 35), (64, 96), (0, 127)):
-            w[b], bias[b] = w[a], bias[a]
-    elif case == "saturate":  # sigmoid == 1.0 on many experts
-        x, bias = (x.float() * 60).to(torch.bfloat16), bias.zero_()
-    # The router GEMM's own split_k: the fused launch then gives its bytes.
-    split_k = router_gemm_split_k(m, E, k)
-    (ref_w, ref_i), us_ref = run_perftest(run_unfused, x, w, topk, bias, nvr)
-    (out_w, out_i), us = run_perftest(
-        flydsl_moe_router_topk, x, w, topk, bias, num_valid_rows=nvr, split_k=split_k
-    )
-    err = max(
-        checkAllclose(ref_w.view(torch.int32), out_w.view(torch.int32), 0, 0),
-        checkAllclose(ref_i, out_i, 0, 0, msg="ids"),
-    )
-    assert err == 0, f"fused router differs from tgemm.mm + topk_gating ({case})"
-    return {"split_k": split_k, "unfused us": us_ref, "fused us": us, "err": err}
+def test_moe_router_topk(m, k, topk, split_k, case):
+    x, w, bias, nvr = make_inputs(m, E, k, case)
+    ref = run_torch(x, w, topk, bias, nvr)
+    candidates = {
+        "unfused": (run_unfused, x, w, topk, bias, nvr),
+        "fused": (flydsl_moe_router_topk, x, w, topk, bias),
+    }
+    kwargs = {"fused": {"num_valid_rows": nvr, "split_k": split_k}}
+    ret = {}
+    for name, (fn, *args) in candidates.items():
+        (out_w, out_i), us = run_perftest(fn, *args, **kwargs.get(name, {}))
+        ret[f"{name} us"], ret[f"{name} err"] = us, check_routes(ref, out_w, out_i)
+    ret["near-tie rows"] = int((ref[2] < NEAR_TIE).sum())
+    assert ret["fused err"] == ret["unfused err"] == 0, f"routes differ: {ret}"
+    return ret
 
 
 def check_supported():
-    """Every tuned row of this GPU: supported where it is fused (a router GEMM
-    retune can kill one), not where it is not. Unimplemented arguments are
-    unsupported, and the op raises on them."""
+    """Every tuned row of this GPU: supported where it is fused, not where it is
+    not. Unimplemented arguments are unsupported, and the op raises on them."""
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_MOE_ROUTER_TOPK_FILE)
     df = df[(df.gfx == get_gfx_runtime()) & (df.cu_num == get_cu_num())]
     for r in df.itertuples():
@@ -85,20 +116,21 @@ def main():
         aiter.logger.warning("flydsl_moe_router_topk is gfx1250-only; skipping")
         return
     ap = argparse.ArgumentParser()
-    ap.add_argument("-m", type=int, nargs="*", default=[1, 16, 33, 256])
+    ap.add_argument("-m", type=int, nargs="*", default=[1, 33, 256])
     ap.add_argument("-k", type=int, nargs="*", default=[6144])
-    ap.add_argument("--topk", type=int, nargs="*", default=[1, 4, 8, 32])
+    ap.add_argument("--topk", type=int, nargs="*", default=[1, 4, 32])
+    ap.add_argument("--split_k", type=int, nargs="*", default=[1, 2, 4, 8, 16])
     ap.add_argument(
         "--case", nargs="*", default=["rand", "ties", "saturate", "pad_rows"]
     )
     args = ap.parse_args()
     check_supported()
     df = [
-        test_moe_router_topk(m, k, topk, case)
-        for m, k, topk, case in itertools.product(args.m, args.k, args.topk, args.case)
-        if router_gemm_split_k(m, E, k) is not None
+        test_moe_router_topk(*shape)
+        for shape in itertools.product(
+            args.m, args.k, args.topk, args.split_k, args.case
+        )
     ]
-    assert df, "no shape runs on the FlyDSL router GEMM"
     aiter.logger.info("moe_router_topk:\n%s", pd.DataFrame(df).to_markdown(index=False))
 
 

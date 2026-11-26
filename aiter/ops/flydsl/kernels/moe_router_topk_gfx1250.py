@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE router GEMM + top-k gating in one gfx1250 launch (FlyDSL), as
-``tgemm.mm(x, w)`` + ``topk_gating``; bitwise equal when ``split_k`` is that of
-the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` runs:
+"""MoE router GEMM + top-k gating in one gfx1250 launch (FlyDSL): what
+``tgemm.mm(x, w)`` (bf16 logits) + ``topk_gating`` compute, with the logits
+summed in this kernel's own order:
 
 * Logits: each 16x16 (expert, token) block is ``split_k`` WMMA chains over
   consecutive K chunks from a zero accumulator (weight as operand A, activation
-  as B, the GEMM's fragment slots), summed in split order, rounded to bf16.
+  as B), summed in split order in fp32, rounded to bf16.
 * Top-k: as ``topk_gating_kernel_opt``: lane L holds experts L + 32i, scored
   by ``score_func`` (``SCORE_FUNCS``); selection value ``score + bias`` (NaN ->
   -inf), the reference's sorting network per lane (``EXPERT_COUNTS``), ``topk``
