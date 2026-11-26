@@ -26,8 +26,11 @@ outputs and those final states, so final-state gradients cross ranks too.
 
 ``-k torch_ref`` runs the same reference as the local kernels, which isolates
 the CP algebra (fp32, tight tolerance) and needs no GPU; ``triton`` and
-``flydsl`` run aiter's chunk kernels (bf16 tolerance). Correctness only:
-kernel timing is in ``test_kda_chunk_fwd.py`` / ``test_kda_chunk_bwd.py``.
+``flydsl`` run aiter's chunk kernels (bf16 criteria, see ``CRITERIA``). The
+column ``cp_staged vs nocp rel_l2`` is the error CP adds over the same
+kernels. Every case runs and the tables print before the run fails on any
+case. Correctness only: kernel timing is in ``test_kda_chunk_fwd.py`` /
+``test_kda_chunk_bwd.py``.
 """
 
 import argparse
@@ -89,9 +92,28 @@ MODES = {
     "plain": {},
 }
 GRADS = ("q", "k", "v", "g", "beta", "A_log", "dt_bias")
-TOL = {
-    torch.float32: {"rtol": 1e-4, "atol": 1e-5},
-    torch.bfloat16: {"rtol": 3e-2, "atol": 3e-2},
+# fp32 (torch_ref): every element within rtol/atol. bf16 kernels against the
+# fp32 reference: relative L2 error per tensor (the 1e-2 of
+# test_chunk_delta_attn_bwd.py) plus at most 1e-3 of the elements outside
+# rtol/atol (the ratio test_kda_chunk_fwd.py allows). A zero-outlier bound
+# does not hold in bf16: with q/k normalized outside the kernel (megatron
+# mode) dk is not damped by the l2norm backward, and an element that cancels
+# large bf16-rounded terms lands outside any fixed per-element tolerance.
+CRITERIA = {
+    torch.float32: {
+        "rel_l2": 1e-5,
+        "rtol": 1e-4,
+        "atol": 1e-5,
+        "outliers": 0.0,
+        "sum_terms": 1e-6,
+    },
+    torch.bfloat16: {
+        "rel_l2": 1e-2,
+        "rtol": 3e-2,
+        "atol": 3e-2,
+        "outliers": 1e-3,
+        "sum_terms": 1e-3,
+    },
 }
 
 
@@ -418,30 +440,65 @@ def run_cp_staged(x, bounds, w_o, w_h, opts, kernels, world):
     return _gather_results(x, bounds, world, ranks)
 
 
-def _check(name, ref, out, dtype, msg):
-    tol = TOL[dtype]
-    err = checkAllclose(
-        ref.float(), out.float(), **tol, tol_err_ratio=0.0, msg=f"{name}: {msg}"
-    )
-    return err, (out.float() - ref.float()).abs().max().item()
+def _rel_l2(ref, out):
+    return (
+        (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-30)
+    ).item()
 
 
-def grade(name, ref, out, dtype):
+def sum_terms(x, ref_grads, HV, D):
+    """``sum |dg * (g + dt_bias)|`` per head: the summands of dA_log, for its bound."""
+    if "A_log" not in x:
+        return None
+    z = x["g"].float() + x["dt_bias"].float().view(HV, D)
+    return (ref_grads["g"].float() * z).abs().sum((0, 1, 3))
+
+
+def grade(name, ref, out, dtype, terms=None):
+    """Per-tensor verdicts against the reference; returns ``(row, failures)``, never raises.
+
+    Every tensor but dA_log needs ``rel_l2`` and the outlier fraction within
+    ``CRITERIA``. dA_log, a per-head sum over every token and channel that
+    largely cancels, is bounded per head by ``sum_terms`` times the size of its
+    summands.
+    """
+    crit = CRITERIA[dtype]
     (o_ref, ht_ref, g_ref), (o, ht, grads) = ref, out
     checks = [("o", o_ref, o), ("ht", ht_ref, ht)]
     checks += [(f"d{n}", g_ref[n], grads[n]) for n in g_ref]
-    worst, res = 0.0, {}
+    row, failures = {}, []
+    worst_name, worst_score = "", -1.0
+    worst_rel = worst_out = 0.0
     for label, a, b in checks:
-        err, diff = _check(name, a, b, dtype, label)
-        worst = max(worst, err)
-        res[label] = diff
-    assert worst == 0, f"{name}: {worst:.2%} of elements outside tolerance"
-    return {
-        f"{name} err": worst,
-        f"{name} o maxabs": res["o"],
-        f"{name} ht maxabs": res["ht"],
-        f"{name} grad maxabs": max(v for k, v in res.items() if k.startswith("d")),
-    }
+        a, b = a.float(), b.float()
+        rel = _rel_l2(a, b)
+        frac = checkAllclose(
+            a,
+            b,
+            rtol=crit["rtol"],
+            atol=crit["atol"],
+            tol_err_ratio=crit["outliers"],
+            msg=f"{name}: {label}",
+            printLog=False,
+        )
+        if label == "dA_log" and terms is not None:
+            score = ((b - a).abs() / (crit["sum_terms"] * terms)).max().item()
+            ok = score <= 1.0
+        else:
+            score = max(rel / crit["rel_l2"], frac / max(crit["outliers"], 1e-12))
+            ok = rel <= crit["rel_l2"] and frac <= crit["outliers"]
+            worst_rel, worst_out = max(worst_rel, rel), max(worst_out, frac)
+        if score > worst_score:
+            worst_name, worst_score = label, score
+        if not ok:
+            failures.append(
+                f"{name} {label}: rel_l2 {rel:.2e}, outliers {frac:.2e}, score {score:.2f}"
+            )
+    row[f"{name} rel_l2"] = worst_rel
+    row[f"{name} outliers"] = worst_out
+    row[f"{name} worst"] = f"{worst_name} {worst_score:.2f}"
+    row[f"{name} ok"] = not failures
+    return row, failures
 
 
 @benchmark()
@@ -459,9 +516,26 @@ def test_kda_cp(backend, mode, layout, world, T, H, HV, D, dtype):
         candidates["cp_autograd"] = lambda: run_cp_autograd(
             x, bounds, w_o, w_h, opts, kernels, world, via_megatron=mode == "megatron"
         )
-    ret = {"bounds": str(bounds)}
+    terms = sum_terms(x, ref[2], HV, D)
+    ret, failures, outs = {"bounds": str(bounds)}, [], {}
     for name, fn in candidates.items():
-        ret.update(grade(name, ref, fn(), dtype))
+        outs[name] = fn()
+        row, fails = grade(name, ref, outs[name], dtype, terms)
+        ret.update(row)
+        failures += fails
+    # Informational: the error CP adds on top of the same kernels without CP.
+    ret["cp_staged vs nocp rel_l2"] = max(
+        _rel_l2(a, b)
+        for a, b in zip(
+            [outs["nocp"][0], outs["nocp"][1], *outs["nocp"][2].values()],
+            [
+                outs["cp_staged"][0],
+                outs["cp_staged"][1],
+                *outs["cp_staged"][2].values(),
+            ],
+        )
+    )
+    ret["failures"] = "; ".join(failures)
     return ret
 
 
@@ -474,10 +548,11 @@ def test_kda_initial_state(backend, mode, T, H, HV, D, dtype):
     x, bounds, w_o, w_h = make_inputs(T, H, HV, D, dtype, device, mode, "packed")
     gen = torch.Generator(device="cpu").manual_seed(7)
     h0 = torch.randn(len(bounds) - 1, HV, D, D, generator=gen).to(device) * 0.1
-    o_ref, ht_ref, g_ref = reference(x, bounds, w_o, w_h, opts, h0=h0)
-    o, ht, grads = run_nocp(x, bounds, w_o, w_h, opts, kernels, h0=h0)
-    ret = grade("nocp", (o_ref, ht_ref, g_ref), (o, ht, grads), dtype)
-    ret["dh0 maxabs"] = (grads["h0"] - g_ref["h0"]).abs().max().item()
+    ref = reference(x, bounds, w_o, w_h, opts, h0=h0)
+    out = run_nocp(x, bounds, w_o, w_h, opts, kernels, h0=h0)
+    ret, failures = grade("nocp", ref, out, dtype, sum_terms(x, ref[2], HV, D))
+    ret["dh0 rel_l2"] = _rel_l2(ref[2]["h0"], out[2]["h0"])
+    ret["failures"] = "; ".join(failures)
     return ret
 
 
@@ -527,6 +602,7 @@ def main():
         backends = ["torch_ref"]
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // 2))
 
+    failures = []
     for backend in backends:
         dtype = torch.float32 if backend == "torch_ref" else torch.bfloat16
         shapes = args.shape or (
@@ -541,11 +617,14 @@ def main():
             )
         ]
         summarize(f"KDA chunkwise CP [{backend}]", rows)
+        failures += [r["failures"] for r in rows if r["failures"]]
         rows = [
             test_kda_initial_state(backend, mode, T, H, HV, D, dtype)
             for mode, (T, H, HV, D) in itertools.product(args.mode, shapes)
         ]
         summarize(f"KDA initial/final state [{backend}]", rows)
+        failures += [r["failures"] for r in rows if r["failures"]]
+    assert not failures, f"{len(failures)} failing cases:\n" + "\n".join(failures)
 
 
 if __name__ == "__main__":
