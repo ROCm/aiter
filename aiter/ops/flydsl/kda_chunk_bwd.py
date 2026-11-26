@@ -38,6 +38,7 @@ from .kernels.kda_chunk_bwd import (
     compile_gate_cumsum,
     compile_intra,
     compile_wy_dqkg,
+    compile_wy_dqkg_mfma,
 )
 from .kernels.tensor_shim import _run_compiled
 from .linear_attention_prefill_kernels import (
@@ -52,6 +53,34 @@ CHUNK_BWD_FUSES = frozenset({"qk_l2norm", "gate", "beta_sigmoid"})
 # AITER_KDA_FLYDSL_CHECK=1 synchronizes after each stage and raises on the first
 # non-finite output, naming the stage. A debugging aid, off by default.
 _CHECK = os.environ.get("AITER_KDA_FLYDSL_CHECK", "0") == "1"
+# AITER_KDA_FLYDSL_MFMA=0 selects the fp32-FMA stage kernels instead of their
+# MFMA versions (A/B and bisection aid).
+_MFMA = os.environ.get("AITER_KDA_FLYDSL_MFMA", "1") == "1"
+# AITER_KDA_FLYDSL_PROFILE=1 times every stage with CUDA events and logs it.
+_PROFILE = os.environ.get("AITER_KDA_FLYDSL_PROFILE", "0") == "1"
+
+
+class _Timer:
+    def __init__(self):
+        self.marks = []
+        self.mark("start")
+
+    def mark(self, name):
+        if _PROFILE:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self.marks.append((name, ev))
+
+    def report(self, shape):
+        if not _PROFILE:
+            return
+        torch.cuda.synchronize()
+        parts = [
+            f"{n}={a.elapsed_time(b) * 1e3:.0f}us"
+            for (_, a), (n, b) in zip(self.marks, self.marks[1:])
+        ]
+        total = self.marks[0][1].elapsed_time(self.marks[-1][1]) * 1e3
+        print(f"[kda flydsl bwd {shape}] {' '.join(parts)} total={total:.0f}us")
 
 
 def _check(stage, **tensors):
@@ -252,6 +281,7 @@ def chunk_kda_bwd_flydsl_full(
     # Varlen tokens past cu_seqlens[-1] are never written: zero those outputs.
     alloc = torch.zeros if varlen else torch.empty
 
+    timer = _Timer()
     qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
         q=q,
         k=k,
@@ -271,11 +301,13 @@ def chunk_kda_bwd_flydsl_full(
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         disable_recompute=True,
     )
+    timer.mark("fwd_prepare")
     _check("fwd_prepare (Triton)", q=qn, k=kn, g=gc, w=w, u=u, qg=qg, kg=kg, Akk=Akk)
     h, v_new = kda_bwd_fwd_h_flydsl(
         kg, w, u, gc, initial_state, state_v_first, cu_seqlens
     )
     _check("fwd_h", h=h, v_new=v_new)
+    timer.mark("fwd_h")
     do = do.contiguous()
 
     dAqk = alloc(B, T, H, BT, **f32)
@@ -296,6 +328,7 @@ def chunk_kda_bwd_flydsl_full(
         stream,
     )
     _check("dav", dAqk=dAqk, dv=dv)
+    timer.mark("dav")
 
     dh = q.new_empty(B, NT, H, K, V)
     dh0 = (
@@ -332,6 +365,7 @@ def chunk_kda_bwd_flydsl_full(
         stream,
     )
     _check("dhu", dh=dh, dh0=dh0, dv2=dv2)
+    timer.mark("dhu")
 
     dq = alloc(B, T, H, K, **f32)
     dk = alloc(B, T, H, K, **f32)
@@ -340,7 +374,9 @@ def chunk_kda_bwd_flydsl_full(
     db = alloc(B, T, H, **f32)
     dAkk = alloc(B, T, H, BT, **f32)
     _run_compiled(
-        compile_wy_dqkg(H, qn.dtype, v.dtype, bn.dtype, Akk.dtype, h.dtype, varlen),
+        (compile_wy_dqkg_mfma if _MFMA else compile_wy_dqkg)(
+            H, qn.dtype, v.dtype, bn.dtype, Akk.dtype, h.dtype, varlen
+        ),
         qn,
         kn,
         v,
@@ -367,6 +403,7 @@ def chunk_kda_bwd_flydsl_full(
         stream,
     )
     _check("wy_dqkg", dq=dq, dk=dk, dv=dv, dg=dg, db=db, dAkk=dAkk)
+    timer.mark("wy_dqkg")
 
     dq2 = alloc(q.shape, device=dev, dtype=q.dtype)
     dk2 = alloc(k.shape, device=dev, dtype=k.dtype)
@@ -410,6 +447,7 @@ def chunk_kda_bwd_flydsl_full(
         stream,
     )
     _check("intra", dq=dq2, dk=dk2, dg=dg2, db=db2)
+    timer.mark("intra")
 
     use_bias = use_gate_in_kernel and dt_bias is not None
     dA_part = torch.empty(NT, B, H, K, **f32) if use_gate_in_kernel else None
@@ -441,6 +479,8 @@ def chunk_kda_bwd_flydsl_full(
         stream,
     )
     _check("gate_cumsum", dg=dg_out, dA_part=dA_part, db_part=db_part)
+    timer.mark("gate_cumsum")
+    timer.report(f"B={B} T={T} H={H} varlen={varlen}")
     dA_log = dA_part.sum((0, 1, 3)).to(A_log.dtype) if use_gate_in_kernel else None
     ddt_bias = db_part.sum((0, 1)).reshape(-1).to(dt_bias.dtype) if use_bias else None
     return (

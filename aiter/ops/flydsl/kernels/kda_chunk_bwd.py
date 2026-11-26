@@ -1224,3 +1224,429 @@ def compile_gate_cumsum(
         ).launch(grid=(NT, NBH, 1), block=(K, 1, 1), stream=stream)
 
     return launch
+
+
+# ---------------------------------------------------------------------------
+# MFMA building blocks
+# ---------------------------------------------------------------------------
+# LDS row strides (elements) for MFMA operands: 4 elements of padding keep
+# each row 8-byte aligned for the b64 operand copies and stagger the banks.
+LDK = K + 4  # rows of 128 (K or V) columns
+LDT = BT + 4  # rows of 64 (token) columns
+LDC = 64 + 4  # fp32 [64, 64] accumulator staging
+
+
+def _stage(
+    view, ld_stride, dst, ld_dst, rows, cols, nvalid, tid, num, dst_num, transpose=False
+):
+    """Stage a ``[rows, cols]`` token tile into LDS at row stride ``ld_dst``.
+
+    ``transpose`` writes it as ``[cols, rows]``. Rows ``>= nvalid`` are zeroed.
+    """
+    for e in range_constexpr(rows * cols // NUM_THREADS):
+        i = tid + e * NUM_THREADS
+        t = i // cols
+        c = i % cols
+        ok = t < nvalid
+        x = _sel(ok, ldg(view, _sel(ok, t, 0) * ld_stride + c, num), _zero())
+        lds_st(dst, c * ld_dst + t if transpose else t * ld_dst + c, x, dst_num)
+
+
+class _Mma:
+    """``C[64, N] += A[64, Kd] @ B[N, Kd]^T`` on bf16 LDS operands (K contiguous).
+
+    One 16x16x16 bf16 MFMA per 16-wide K slice, the 4 waves splitting M.
+    ``store`` writes C as fp32 into a row-major LDS view.
+    """
+
+    def __init__(self, tid):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        self.tiled = fx.make_tiled_mma(self.atom, fx.make_layout((4, 1, 1), (1, 0, 0)))
+        self.thr = self.tiled.thr_slice(tid)
+        self.cp64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        self.cp32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        self.cpA = fx.make_tiled_copy_A(self.cp64, self.tiled).get_slice(tid)
+        self.cpB = fx.make_tiled_copy_B(self.cp64, self.tiled).get_slice(tid)
+        self.cpC = fx.make_tiled_copy_C(self.cp32, self.tiled).get_slice(tid)
+
+    def acc(self, c_view):
+        frag = self.thr.make_fragment_C(c_view)
+        frag.fill(0.0)
+        return frag
+
+    def gemm(self, acc, a, lda, b, ldb, n, kd):
+        """``a``/``b``: bf16 LDS views at the operand's first element."""
+        for ek in range_constexpr(kd // 16):
+            a_t = fx.make_view(
+                fx.get_iter(a) + ek * 16, fx.make_layout((64, 16), (lda, 1))
+            )
+            b_t = fx.make_view(
+                fx.get_iter(b) + ek * 16, fx.make_layout((n, 16), (ldb, 1))
+            )
+            f_a = self.thr.make_fragment_A(a_t)
+            f_b = self.thr.make_fragment_B(b_t)
+            fx.copy(self.cp64, self.cpA.partition_S(a_t), self.cpA.retile(f_a))
+            fx.copy(self.cp64, self.cpB.partition_S(b_t), self.cpB.retile(f_b))
+            fx.gemm(self.atom, acc, f_a, f_b, acc)
+
+    def store(self, acc, c_view):
+        fx.copy(self.cp32, self.cpC.retile(acc), self.cpC.partition_D(c_view))
+
+
+def _offset_view(base, off, n):
+    return fx.make_view(fx.get_iter(base) + off, fx.make_layout((n, 1), (1, 1)))
+
+
+# ---------------------------------------------------------------------------
+# wy_dqkg on MFMA
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_wy_dqkg_mfma(
+    H: int,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    a_dtype: torch.dtype,
+    h_dtype: torch.dtype,
+    varlen: bool = False,
+):
+    """``compile_wy_dqkg`` with every contraction on 16x16x16 bf16 MFMA.
+
+    Same arguments, outputs and launch. The operands are the bf16 values the
+    Triton kernel feeds ``tl.dot`` (h, dh, do, v_new, dv, v, Akk, and kg, dw,
+    the masked dA rounded to bf16); accumulation is fp32. Each ``[64, 128]``
+    product runs as two ``N = 64`` halves through a ``[64, 64]`` fp32 LDS
+    staging tile, from which the elementwise epilogue reads with the same
+    ``(tid // 4, tid % 4 + 4 * e)`` ownership as the FMA kernel.
+    """
+    KN = _num(k_dtype)
+    VN = _num(v_dtype)
+    BN = _num(beta_dtype)
+    AN = _num(a_dtype)
+    HN = _num(h_dtype)
+    BF = fx.BFloat16
+
+    @fx.struct
+    class KgDw:
+        kg: fx.Array[fx.BFloat16, BT * LDK, 16]
+        dw: fx.Array[fx.BFloat16, BT * LDK, 16]
+
+    @fx.union
+    class Big:
+        hd: fx.Array[fx.BFloat16, K * LDK, 16]  # h[k][v], then dh[k][v]
+        kgdw: KgDw
+
+    @fx.struct
+    class Smem:
+        big: Big
+        do: fx.Array[fx.BFloat16, BT * LDK, 16]  # do[t][v], later M[r][j]
+        vn: fx.Array[fx.BFloat16, BT * LDK, 16]  # v_new, then v, later M1^T
+        dv: fx.Array[fx.BFloat16, BT * LDK, 16]
+        dvT: fx.Array[fx.BFloat16, V * LDT, 16]  # dv^T[v][t], later dw^T[k][t]
+        a: fx.Array[fx.BFloat16, BT * LDT, 16]  # Akk[t][s]
+        aT: fx.Array[fx.BFloat16, BT * LDT, 16]  # Akk^T[t][s] = Akk[s][t]
+        c: fx.Array[fx.Float32, BT * LDC, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+        dgk: fx.Array[fx.Float32, K, 16]
+        col: fx.Array[fx.Float32, 4 * K, 16]
+
+    @flyc.kernel(name="kda_bwd_wy_dqkg_mfma_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        lane = tid % 64
+        wave = tid // 64
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        last = nvalid - 1
+        rv = r < nvalid
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hv = (tok * H + fx.Int64(h)) * V
+        if const_expr(varlen):
+            i_c = i_t
+        else:
+            i_c = b * ((T + (BT - 1)) // BT) + i_t
+        state = (fx.Int64(i_c) * H + fx.Int64(h)) * (K * V)
+        a_off = (tok * H + fx.Int64(h)) * BT
+
+        lds = fx.SharedAllocator().allocate(Smem)
+        s_hd = _lds(lds.big.hd.peek(), K * LDK)
+        s_kg = _lds(lds.big.kgdw.kg.peek(), BT * LDK)
+        s_dw = _lds(lds.big.kgdw.dw.peek(), BT * LDK)
+        s_do = _lds(lds.do.peek(), BT * LDK)
+        s_vn = _lds(lds.vn.peek(), BT * LDK)
+        s_dv = _lds(lds.dv.peek(), BT * LDK)
+        s_dvT = _lds(lds.dvT.peek(), V * LDT)
+        s_a = _lds(lds.a.peek(), BT * LDT)
+        s_aT = _lds(lds.aT.peek(), BT * LDT)
+        s_c = _lds(lds.c.peek(), BT * LDC)
+        s_beta = _lds(lds.beta.peek(), BT)
+        s_dgk = _lds(lds.dgk.peek(), K)
+        s_col = _lds(lds.col.peek(), 4 * K)
+        c_tile = fx.make_view(fx.get_iter(s_c), fx.make_layout((BT, 64), (LDC, 1)))
+        mma = _Mma(tid)
+
+        def run(a, lda, b_, ldb, kd, acc=None):
+            """One [64, 64] product into ``acc`` (a fresh one if None)."""
+            if const_expr(acc is None):
+                acc = mma.acc(c_tile)
+            mma.gemm(acc, a, lda, b_, ldb, 64, kd)
+            return acc
+
+        def to_regs(acc, half, n_e):
+            """Stage ``acc`` and read this thread's columns ``seg + 4 e`` of the half."""
+            mma.store(acc, c_tile)
+            gpu.barrier()
+            out = [
+                lds_ld(s_c, r * LDC + (seg + 4 * e) - 64 * half)
+                for e in range(16 * half, 16 * half + n_e)
+            ]
+            gpu.barrier()
+            return out
+
+        # -- stage h as [k][v] (the K5 snapshot is [v][k]), do, v_new, dv, dv^T, Akk
+        h_v = _flat(hs, state)
+        for e in range_constexpr(K * V // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            vv = i // K
+            kk = i % K
+            lds_st(s_hd, kk * LDK + vv, ldg(h_v, i, HN), BF)
+        do_v = _flat(do, hv)
+        dv_v = _flat(dv, hv)
+        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        _stage(do_v, H * V, s_do, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(vn_v, V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(dv_v, H * V, s_dv, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(dv_v, H * V, s_dvT, LDT, BT, V, nvalid, tid, VN, BF, transpose=True)
+        a_v = _flat(A, a_off)
+        _stage(a_v, H * BT, s_a, LDT, BT, BT, nvalid, tid, AN, BF)
+        _stage(a_v, H * BT, s_aT, LDT, BT, BT, nvalid, tid, AN, BF, transpose=True)
+        beta_v = _flat(beta, tok * H + fx.Int64(h))
+        if tid < BT:
+            bb = ldg(beta_v, _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_beta, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        # dq = do h^T, dw = dv h^T
+        b_dq, b_dw = [], []
+        for half in range_constexpr(2):
+            hb = _offset_view(s_hd, half * 64 * LDK, 64 * LDK)
+            b_dq += to_regs(run(s_do, LDK, hb, LDK, V), half, 16)
+            b_dw += to_regs(run(s_dv, LDK, hb, LDK, V), half, 16)
+
+        # dh replaces h; dgk[k] = sum_v h[k, v] dh[k, v] re-reads h from global.
+        dh_v = _flat(dh, state)
+        for e in range_constexpr(K * V // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            kk = i // V
+            vv = i % V
+            lds_st(s_hd, kk * LDK + vv, ldg(dh_v, i, HN), BF)
+        gpu.barrier()
+        if tid < K:
+            for vv, st in range(0, V, 1, init=[_zero()]):
+                vq = fx.Int32(vv)
+                res = yield [
+                    st[0]
+                    + lds_ld(s_hd, tid * LDK + vq, BF) * ldg(h_v, vq * K + tid, HN)
+                ]
+            lds_st(s_dgk, tid, _results(res, 1)[0])
+
+        # dk = v_new dh^T
+        b_dk = []
+        for half in range_constexpr(2):
+            hb = _offset_view(s_hd, half * 64 * LDK, 64 * LDK)
+            b_dk += to_regs(run(s_vn, LDK, hb, LDK, V), half, 16)
+
+        # v replaces v_new; dA = dv v^T (kept in registers), dvb = A^T dv
+        _stage(_flat(v, hv), H * V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        gpu.barrier()
+        acc_da = run(s_dv, LDK, s_vn, LDK, V)
+        dvb = []
+        for half in range_constexpr(2):
+            bT = _offset_view(s_dvT, half * 64 * LDT, 64 * LDT)
+            dvb += to_regs(run(s_aT, LDT, bT, LDT, BT), half, 16)
+        beta_r = lds_ld(s_beta, r)
+        dvo_v = _flat(dv_out, hv)
+        db_r = _zero()
+        for e in range_constexpr(32):
+            c = seg + 4 * e
+            db_r = db_r + dvb[e] * lds_ld(s_vn, r * LDK + c, BF)
+            if rv:
+                stg(dvo_v, r * (H * V) + c, dvb[e] * beta_r, VN)
+
+        q_v = _flat(q, hk)
+        k_v = _flat(k, hk)
+        g_v = _flat(g, hk)
+        rc = _sel(rv, r, 0)
+        gexp, kg_r, k_r, gn = [], [], [], []
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            gg = ldg(g_v, rc * (H * K) + kk, fx.Float32)
+            gl = ldg(g_v, last * (H * K) + kk, fx.Float32)
+            kx = _sel(rv, ldg(k_v, rc * (H * K) + kk, KN), _zero())
+            ge = _decay(gg)
+            gexp.append(ge)
+            gn.append(gl)
+            k_r.append(kx)
+            kg_r.append(kx * ge)
+            b_dq[e] = b_dq[e] * ge * scale
+            b_dk[e] = _sel(rv, b_dk[e] * _decay(gl - gg), _zero())
+            b_dw[e] = -b_dw[e]
+        # kg, dw (row-major) and dw^T replace dh and dv^T.
+        gpu.barrier()
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            lds_st(s_kg, r * LDK + kk, kg_r[e], BF)
+            lds_st(s_dw, r * LDK + kk, b_dw[e], BF)
+            lds_st(s_dvT, kk * LDT + r, b_dw[e], BF)
+        gpu.barrier()
+
+        # dA += dw kg^T ; dkgb = A^T dw
+        acc_da = run(s_dw, LDK, s_kg, LDK, K, acc_da)
+        dkgb = []
+        for half in range_constexpr(2):
+            bT = _offset_view(s_dvT, half * 64 * LDT, 64 * LDT)
+            dkgb += to_regs(run(s_aT, LDT, bT, LDT, BT), half, 16)
+
+        kdk = []
+        for e in range_constexpr(32):
+            db_r = db_r + dkgb[e] * kg_r[e]
+            kdk.append(k_r[e] * b_dk[e])
+        for e in range_constexpr(32):
+            x = kdk[e]
+            for sh in (4, 8, 16, 32):
+                x = x + x.shuffle_xor(fx.Int32(sh), fx.Int32(64))
+            if lane < 4:
+                lds_st(s_col, wave * K + seg + 4 * e, x)
+        gpu.barrier()
+
+        dq_v = _flat(dq, hk)
+        dk_v = _flat(dk, hk)
+        dg_v = _flat(dg, hk)
+        is_last = r == last
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            col = (
+                lds_ld(s_col, kk)
+                + lds_ld(s_col, K + kk)
+                + lds_ld(s_col, 2 * K + kk)
+                + lds_ld(s_col, 3 * K + kk)
+            )
+            dgk = lds_ld(s_dgk, kk) * _decay(gn[e]) + col
+            qx = _sel(rv, ldg(q_v, rc * (H * K) + kk, KN), _zero())
+            dgv = (
+                qx * b_dq[e]
+                - kdk[e]
+                + _sel(is_last, dgk, _zero())
+                + kg_r[e] * dkgb[e] * beta_r
+            )
+            dkv = b_dk[e] + dkgb[e] * gexp[e] * beta_r
+            if rv:
+                stg(dq_v, r * (H * K) + kk, b_dq[e], fx.Float32)
+                stg(dk_v, r * (H * K) + kk, dkv, fx.Float32)
+                stg(dg_v, r * (H * K) + kk, dgv, fx.Float32)
+        db_r = _row_sum(db_r)
+        if rv & (seg == 0):
+            stg(_flat(db, tok * H + fx.Int64(h)), r * H, db_r, fx.Float32)
+
+        # dAkk = -mask(A^T (mask(dA * beta) A^T)), strictly lower.
+        b_da = to_regs(acc_da, 0, 16)
+        s_m = _lds(lds.do.peek(), BT * LDT)  # M[r][j], bf16
+        s_m1T = _lds(lds.vn.peek(), BT * LDT)  # M1^T[s][j], bf16
+        for e in range_constexpr(16):
+            s = seg + 4 * e
+            m_a = (s < r) & rv
+            lds_st(
+                s_m, r * LDT + s, _sel(m_a, b_da[e] * lds_ld(s_beta, s), _zero()), BF
+            )
+        gpu.barrier()
+        m1 = to_regs(run(s_m, LDT, s_a, LDT, BT), 0, 16)
+        for e in range_constexpr(16):
+            lds_st(s_m1T, (seg + 4 * e) * LDT + r, m1[e], BF)
+        gpu.barrier()
+        m2 = to_regs(run(s_aT, LDT, s_m1T, LDT, BT), 0, 16)
+        da_v = _flat(dA, a_off)
+        if rv:
+            for e in range_constexpr(16):
+                s = seg + 4 * e
+                stg(da_v, r * (H * BT) + s, _sel(s < r, -m2[e], _zero()), fx.Float32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            v,
+            vnew,
+            g,
+            beta,
+            A,
+            hs,
+            do,
+            dh,
+            dv,
+            dq,
+            dk,
+            dv_out,
+            dg,
+            db,
+            dA,
+            cu,
+            ci,
+            T,
+            scale,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
