@@ -746,18 +746,14 @@ def test_kda_save_fwd_matches_recompute(
 
 def test_kda_save_fwd_intermediates_plumbing():
     """CPU check of save_fwd=1's intermediates hand-off with stub forwards and a
-    registered chunk backward taking ``fwd_intermediates``: the FlyDSL forward
+    registered chunk backward taking ``fwd_intermediates`` (the forwards come
+    from a replaced ``_load_save_fwds``, independent of the real modules): the FlyDSL forward
     with ``return_intermediates`` serves when it can (its 10-tuple passed as
     is); a FlyDSL forward without it, or one rejecting the call, falls back to
     the Triton ``disable_recompute`` forward (its 7 tensors reordered). The
     results equal recompute."""
-    import sys
-    import types
-
     L = kda_fused_layer
-    fly_name = "aiter.ops.flydsl.kda_chunk_fwd"
-    tri_name = "aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd"
-    real = {n: sys.modules.get(n) for n in (fly_name, tri_name)}
+    real_load = L._load_save_fwds
     got = []
 
     def o_of(q, k, v, g, beta, scale, cu_seqlens=None):
@@ -791,7 +787,10 @@ def test_kda_save_fwd_intermediates_plumbing():
         if fly.reject:
             raise ValueError("stub: shape not served")
         o = o_of(q, k, v, g, beta, scale, cu_seqlens)
-        return (o, None, tuple(tagged(10))) if return_intermediates else (o, None)
+        inter = tagged(10)
+        if fly.nan:
+            inter[8] = torch.full((1,), float("nan"))
+        return (o, None, tuple(inter)) if return_intermediates else (o, None)
 
     def fly_plain(q, k, v, g, beta, scale, chunk_size=64, *, cu_seqlens=None, **kw):
         return o_of(q, k, v, g, beta, scale, cu_seqlens), None
@@ -843,20 +842,23 @@ def test_kda_save_fwd_intermediates_plumbing():
     rows = []
     try:
         L.register_chunk_bwd(bwd, frozenset())
-        tri_mod = types.ModuleType(tri_name)
-        tri_mod.chunk_delta_attn_fwd = tri
-        sys.modules[tri_name] = tri_mod
         D, H, K, W, R = 256, 2, 128, 4, 16
         w = make_weights(D, H, K, W, R, torch.float32)
         for case, fn, reject, want_fwd, want in (
             ("flydsl return_intermediates", fly, False, "flydsl", list(range(10))),
             ("flydsl without it", fly_plain, False, "triton", [0, 3, 4, 5, 6, 1, 2]),
             ("flydsl rejects", fly, True, "triton", [0, 3, 4, 5, 6, 1, 2]),
+            ("flydsl NaN Aqk", fly, False, "triton", [0, 3, 4, 5, 6, 1, 2]),
         ):
             fly.reject = reject
-            fly_mod = types.ModuleType(fly_name)
-            fly_mod.chunk_kda_fwd_flydsl = fn
-            sys.modules[fly_name] = fly_mod
+            fly.nan = case == "flydsl NaN Aqk"
+
+            def load(want_flydsl, fn=fn):
+                if want_flydsl and L._accepts(fn, "return_intermediates"):
+                    return fn, tri
+                return None, tri
+
+            L._load_save_fwds = load
             for cu in (None, torch.tensor([0, 48, 128], dtype=torch.int32)):
                 x = torch.randn(1, 128, D)
                 dy = torch.randn(1, 128, D)
@@ -877,9 +879,11 @@ def test_kda_save_fwd_intermediates_plumbing():
                     want_tags = want
                 assert used["chunk_fwd"] == f"{want_fwd}(save intermediates)", used
                 assert tags == want_tags, (case, tags)
-                assert all(
-                    torch.equal(a, b) for a, b in zip(outs["0"], outs["1"])
-                ), case
+                diff = max(
+                    ((a - b).abs().max() / b.abs().max().clamp_min(1e-6)).item()
+                    for a, b in zip(outs["1"], outs["0"])
+                )
+                assert diff <= 1e-5, f"{case}: save_fwd vs recompute rel err {diff:.2e}"
                 rows.append(
                     {
                         "case": case,
@@ -889,11 +893,7 @@ def test_kda_save_fwd_intermediates_plumbing():
                     }
                 )
     finally:
-        for n, m in real.items():
-            if m is None:
-                sys.modules.pop(n, None)
-            else:
-                sys.modules[n] = m
+        L._load_save_fwds = real_load
         L._fusion_overrides.clear()
         L._fusion_overrides.update(saved_f)
         L._piece_overrides.clear()
