@@ -395,6 +395,10 @@ class MegaMoEConfig:
             raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
         if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
             raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
+        # The small-input grid must be co-resident (2 CTAs a CU): a pair of 64-row m-tiles needs more than 256 VGPRs
+        # and half the LDS, so one CTA a CU would leave the combine waiting for CTAs that never start.
+        if self.fused_stage1.pair_tiles and sbm != 32:
+            raise ValueError(f"pair_tiles requires sort_block_m=32, got {sbm}")
 
 
 @dataclass(frozen=True, slots=True)

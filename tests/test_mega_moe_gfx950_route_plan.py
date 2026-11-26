@@ -16,7 +16,7 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib
-from dataclasses import astuple, fields
+from dataclasses import astuple, fields, replace
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -530,6 +530,16 @@ def test_v41ep8_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _V41EP8_FUSED_DIGEST, table
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+def test_pair_tiles_requires_32_row_m_tiles(quant):
+    """A pair of 64-row m-tiles would leave one small-input CTA a CU, so its grid would not be co-resident."""
+    config = select_fused_config(32, 256, quant=quant, **V41_FLASH_EP8_SHAPE)
+    paired = replace(config, fused_stage1=replace(config.fused_stage1, pair_tiles=True))
+    assert paired.stage1.sort_block_m == 32
+    with pytest.raises(ValueError):
+        replace(paired, stage1=replace(paired.stage1, sort_block_m=64))
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))

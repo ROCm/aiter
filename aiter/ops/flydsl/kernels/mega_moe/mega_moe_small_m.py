@@ -1229,8 +1229,12 @@ def compile_mega_moe_stage1(
     g2_scratch_off = max(g2_lay["bytes"], g1_a_bytes)
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
-    # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
-    assert grid_mult <= 2 and 2 * lds_pool_bytes <= 160 * 1024, (grid_mult, lds_pool_bytes)
+    # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS, the
+    # SharedStorage below).
+    plan_chunks = (fz_epr + 63) // 64
+    plan_tables = (2 if plan_local else 0) + (1 if pair_tiles else 0)
+    lds_bytes = lds_pool_bytes + (n_scale_bytes + 15) // 16 * 16 + 16 + plan_tables * plan_chunks * 64 * 4
+    assert grid_mult <= 2 and 2 * lds_bytes <= 160 * 1024, (grid_mult, lds_bytes)
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1245,7 +1249,6 @@ def compile_mega_moe_stage1(
     # per-grid-size epochs would let a flag left by a launch of the other grid size pass (or block) the wait.
     entry_slot = len(GRID_MULT_VALUES)
 
-    plan_chunks = (fz_epr + 63) // 64
     # g2_early = (K, P): one CTA in K (by in-XCD workgroup index) leaves GEMM1 for GEMM2 after a unit claimed past
     # P/16 of its XCD's GEMM1 slice, so the GEMM2 scatter uses the XGMI links the finished dispatch left idle while
     # GEMM1 still runs. GEMM2 units then take their own claim word (word 3 of the XCD's line) instead of following
