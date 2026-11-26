@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 decode GEMM on the native-MXFP8 path, shaped for the MiniMax-M3 TP4
-o_proj (N 6144, K 2048; the PA epilogue writes its E4M3 + row-major E8M0 input):
+"""gfx1250 decode GEMM on the native-MXFP8 path:
 kernels/mxfp8_decode_gemm_gfx1250.py.
 
 Same operands and bf16 output as ``gemm_a8w8_blockscale(isBpreshuffled=True)``;
 the values differ from the tuned GEMM's only by the FP32 K order (rare one-ulp
-bf16 flips). Rows outside the table keep the tuned GEMM (callers check
-``mxfp8_decode_gemm_supported``).
+bf16 flips). Callers check ``mxfp8_decode_gemm_supported`` and keep the tuned
+GEMM for the shapes it declines.
 """
 
 from __future__ import annotations
@@ -19,25 +18,43 @@ import torch
 
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-# (N, K) -> [(max rows, (tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm))];
-# graph-replay sweeps on MI455X, 32 cold weight copies (bench_dg.py /
-# validate_k3.py). 16 K-waves of one K step each put every weight load of a
-# workgroup in flight at once; non-temporal weight loads (wcpol 1); the activation
-# by TDM (atdm 1). Past 128 rows the tuned GEMM is as fast and keeps the call.
-_TABLE = {
-    (6144, 2048): [
-        (64, (32, 3, 1, 16, 1, 1, 1, 1)),
-        (128, (32, 6, 1, 16, 1, 1, 1, 1)),
-    ],
-}
+# Decode token counts only: past this the tuned GEMM's tiles are as fast.
+_MAX_ROWS = 128
+# K-waves of a workgroup: with one 128-wide K step each, every weight load of
+# the workgroup is in flight at once.
+_MAX_K_WAVES = 16
 
 
+@functools.cache
 def mxfp8_decode_gemm_config(m: int, n: int, k: int):
-    """The kernel config for ``m`` rows of an (n, k) GEMM, or None (not served)."""
-    for max_rows, cfg in _TABLE.get((n, k), ()):
-        if 0 < m <= max_rows:
-            return cfg
-    return None
+    """The kernel config for ``m`` rows of an (n, k) GEMM, or None (not served).
+
+    A 16-row tile up to 16 rows, else 32-row tiles; one K-wave per 128-wide K
+    step (at most 16, each taking an equal share of the K steps); and the fewest
+    16-column blocks per workgroup that keep the grid within one workgroup per
+    CU. Weight loads are non-temporal and the activation goes to LDS by TDM.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    from .kernels.mxfp8_decode_gemm_gfx1250 import decode_gemm_config_error
+
+    if not 0 < m <= _MAX_ROWS or n % 32 or k % 128:
+        return None
+    tile_m = 16 if m <= 16 else 32
+    steps = k // 128
+    kw = max(w for w in range(1, _MAX_K_WAVES + 1) if steps % w == 0)
+    m_tiles = -(-m // tile_m)
+    n_blocks = n // 16
+    nb = next(
+        nb
+        for nb in range(1, n_blocks + 1)
+        if n_blocks % nb == 0 and m_tiles * (n_blocks // nb) <= get_cu_num()
+    )
+    # (tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
+    cfg = (tile_m, nb, 1, kw, 1, 1, 1, 1)
+    if decode_gemm_config_error(n, k, tile_m, nb, 1, kw, 1, 1, atdm=1):
+        return None
+    return cfg
 
 
 def mxfp8_decode_gemm_supported(m: int, n: int, k: int) -> bool:
@@ -80,8 +97,9 @@ def mxfp8_decode_gemm(
     """out[M, N] bf16 = x [M, K] (e4m3, unit column stride, 16-byte row stride) with
     x_scale [M, K / 32] (e8m0, row-major) times w [N, K] ((16, 16)-preshuffled e4m3)
     with w_scale (32x4-shuffled e8m0, shuffle_mxfp8_bpreshuffle_scale)."""
-    from .kernels.tensor_shim import _run_compiled, ptr_arg
     import flydsl.expr as fx
+
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     m, k = x.shape
     n = w.shape[0]

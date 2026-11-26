@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Decode-shaped native-MXFP8 GEMM on gfx1250 (MiniMax-M3 TP4 o_proj, N 6144 x K 2048).
+"""Decode-shaped native-MXFP8 GEMM on gfx1250.
 
 out[M, N] (bf16) = A[M, K] (e4m3, row-major, + row-major e8m0 per 32) x W[N, K]^T
 ((16, 16)-preshuffled e4m3 + 32x4-shuffled e8m0): the operands and output of
