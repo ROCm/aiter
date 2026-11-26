@@ -1,0 +1,4 @@
+{
+    "N_LEQ_16384": { "num_warps": 4 },
+    "any": { "num_warps": 16 }
+}
