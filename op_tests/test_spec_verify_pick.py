@@ -230,6 +230,62 @@ def check_edges():
     aiter.logger.info("spec_verify_pick edge checks passed")
 
 
+def check_temperatures():
+    """T == 0 is greedy; T in (greedy_eps, 1e-5] samples at T = 1e-5 in the
+    kernel (split or not) as in the torch definition; a malformed ``temps``
+    is a ValueError, not an IndexError or a kernel check."""
+    V = 4099
+    for conc in (2, 200):  # split rows, whole rows
+        args = build(conc, 3, V, dtypes.bf16, greedy_frac=0.0, seed=7 + conc)
+        logits, expo_t, expo_b, _, target, bonus, cu = args
+        picks = {}
+        for t in (0.0, 1e-9, 1e-7, 1e-5):
+            temps = torch.full((conc,), t, device="cuda")
+            picks[t] = torch.cat(
+                run_fused(logits, expo_t, expo_b, temps, target, bonus, cu)
+            )
+            if t:
+                ot = torch.empty(target.numel(), dtype=torch.int32)
+                ob = torch.empty(conc, dtype=torch.int32)
+                cpu = [a.cpu() for a in (logits, expo_t, expo_b, temps)]
+                aiter.spec_verify_pick(
+                    ot,
+                    ob,
+                    *cpu,
+                    target.cpu(),
+                    bonus.cpu(),
+                    cu.cpu(),
+                    eps=EPS,
+                    greedy_eps=EPS,
+                )
+                assert torch.equal(
+                    torch.cat([ot, ob]), picks[t].cpu()
+                ), f"T={t} kernel vs torch definition, {conc=}"
+        rows = torch.cat(
+            [logits.index_select(0, target), logits.index_select(0, bonus)]
+        )
+        # No NaN here, so torch's first-index argmax is the tie="low" rule.
+        greedy = rows.float().argmax(dim=-1).to(torch.int32)
+        assert torch.equal(picks[0.0], greedy), f"T=0 greedy, {conc=}"
+        assert torch.equal(picks[1e-9], picks[1e-5]) and torch.equal(
+            picks[1e-7], picks[1e-5]
+        ), f"T below the 1e-5 clamp, {conc=}"
+
+    logits, expo_t, expo_b, temps, target, bonus, cu = build(4, 2, V, dtypes.bf16)
+    for bad in (
+        (logits, expo_t, expo_b[:0], temps[:0], target, bonus[:0], cu[:0]),
+        (logits, expo_t, expo_b, temps[0], target, bonus, cu),
+    ):
+        ot = torch.empty(bad[4].numel(), dtype=torch.int32, device="cuda")
+        ob = torch.empty(bad[5].numel(), dtype=torch.int32, device="cuda")
+        try:
+            aiter.spec_verify_pick(ot, ob, *bad, eps=EPS, greedy_eps=EPS)
+        except ValueError:
+            continue
+        raise AssertionError("malformed temps did not raise ValueError")
+    aiter.logger.info("spec_verify_pick temperature checks passed")
+
+
 def check_split_invariance():
     """Split rows (16 workgroups a row + a finishing pass) and whole rows (one
     workgroup a row) must pick bit for bit the same, sampled rows included: the
@@ -364,6 +420,7 @@ l_dtype = (
 
 check_accuracy(l_dtype, args.conc, args.vocab, max_draft=5)
 check_edges()
+check_temperatures()
 check_split_invariance()
 check_graph()
 if args.perf:

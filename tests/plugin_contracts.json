@@ -278,8 +278,8 @@
   "version": 1
  },
  "spec_verify_pick": {
-  "fingerprint": "65f1daee41ba3ff9",
-  "signature": "out_t:positional:Tensor, out_b:positional:Tensor, input:positional:Tensor, expo_t:positional:Tensor, expo_b:positional:Tensor, temps:positional:Tensor, target_idx:positional:Tensor, bonus_idx:positional:Tensor, cu_draft:positional:Tensor, eps:positional:float=1e-10, greedy_eps:positional:float=1e-10, -> None",
+  "fingerprint": "cfea9312f201e44c",
+  "signature": "out_t:positional:Tensor, out_b:positional:Tensor, input:positional:Tensor, expo_t:positional:Tensor, expo_b:positional:Tensor, temps:positional:Tensor, target_idx:positional:Tensor, bonus_idx:positional:Tensor, cu_draft:positional:Tensor, eps:keyword-only:float=1e-10, greedy_eps:keyword-only:float=1e-10, -> None",
   "source": "aiter/ops/sample.py",
   "supersedes": [],
   "version": 1

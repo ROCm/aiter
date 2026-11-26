@@ -205,6 +205,7 @@ def spec_verify_pick(
     target_idx: Tensor,
     bonus_idx: Tensor,
     cu_draft: Tensor,
+    *,
     eps: float = 1e-10,
     greedy_eps: float = 1e-10,
 ) -> None:
@@ -247,9 +248,36 @@ def spec_verify_pick(
         target_idx: ``[n_target]`` rows of ``input`` that are verification rows.
         bonus_idx: ``[n_req]`` rows of ``input`` that are bonus rows.
         cu_draft: ``[n_req]`` inclusive prefix sums of the draft counts.
-        eps: added to the noise before the division.
-        greedy_eps: rows at or below this temperature are greedy; 0.0 gives
-            the ``temperature == 0`` rule of ``mixed_sample_outer_exponential``.
+        eps: keyword-only; added to the noise before the division.
+        greedy_eps: keyword-only; rows at or below this temperature are
+            greedy; 0.0 gives the ``temperature == 0`` rule of
+            ``mixed_sample_outer_exponential``.
+
+    Raises:
+        ValueError: ``temps`` or ``cu_draft`` is not ``[n_req]`` -- a 0-dim
+            temperature, or verification rows with no requests to own them.
+
+    The contract, i.e. what a provider must keep and what a change to this op
+    must treat as breaking (a new ``version=``):
+
+    - Greedy rows: ``temperature <= greedy_eps`` (inclusive) picks the
+      column of the largest score under the integer-ordered key: -0.0 and
+      0.0 are one score, NaN (either sign) is above +inf, ties go to the
+      smallest column (``tie="low"``; an all -inf row picks 0). Exact.
+    - Sampled rows: the pick is ``argmax_j p_j / (expo_j + eps)`` with
+      ``p = softmax(x / max(T, 1e-5))`` in fp32 -- the logits are scaled by
+      ``1 / T`` first and the row max is subtracted after (the
+      ``mixed_sample_outer_exponential`` order; ``fused_mixed_sample``
+      subtracts first). ``T`` in ``(greedy_eps, 1e-5]`` samples at
+      ``T = 1e-5``, on the GPU and off it. Ties of the race go to the
+      smallest column. Changing the clamp, the eps placement or the scaling
+      order is breaking; the rounding of the native kernel is not part of the
+      contract (the torch definition divides by ``T`` where the kernel
+      multiplies by ``1 / T``), so a provider matches the law, not the bits.
+    - A verification row's temperature is ``temps[owner]``,
+      ``owner = searchsorted(cu_draft, row, right=True)`` clamped to the last
+      request; ``expo_t[i]`` / ``expo_b[j]`` is the noise of ``out_t[i]`` /
+      ``out_b[j]``. The op draws no noise.
 
     One launch; a step with few rows (at most half the CU count) spreads each
     row over 16 workgroups and adds a finishing launch, with the same picks
@@ -266,6 +294,21 @@ def spec_verify_pick(
     n_t, n_req = target_idx.numel(), bonus_idx.numel()
     if n_t + n_req == 0:
         return
+    # Host metadata only, so graph-safe. Without these a 0-dim or empty
+    # ``temps`` fails as an IndexError deep in the torch path (``t[owner]``)
+    # and as a kernel-side check on the GPU.
+    if (
+        n_req == 0
+        or temps.dim() != 1
+        or temps.numel() != n_req
+        or cu_draft.numel() != n_req
+    ):
+        raise ValueError(
+            "spec_verify_pick: verification rows need their requests, and temps "
+            "and cu_draft must be [n_req] "
+            f"(n_req = bonus_idx.numel() = {n_req}, n_target = {n_t}); got "
+            f"temps {tuple(temps.shape)}, cu_draft {tuple(cu_draft.shape)}"
+        )
     if (
         not input.is_cuda
         or input.dtype not in (torch.float32, torch.float16, torch.bfloat16)
@@ -275,7 +318,7 @@ def spec_verify_pick(
         cu = cu_draft.to(device=device, dtype=torch.int64)
         owner = torch.searchsorted(
             cu, torch.arange(n_t, device=device), right=True
-        ).clamp_max_(max(n_req - 1, 0))
+        ).clamp_max_(n_req - 1)
         t = temps.to(device=device, dtype=torch.float32)
         rows_t, rows_b = target_idx.to(device), bonus_idx.to(device)
         if n_t:
