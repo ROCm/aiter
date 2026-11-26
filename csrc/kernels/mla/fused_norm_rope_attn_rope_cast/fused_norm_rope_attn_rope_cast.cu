@@ -39,6 +39,7 @@ inline bool try_launch_fused_fp8_attention(const FusedNormRopeAttnRopeCastArgs& 
     FusedNormRopeAttnRopeCastParams k{};
     k.partial_ptr = a.partial;
     k.num_splits  = a.num_splits;
+    k.split_flags = a.split_flags;
 
     k.raw_q_ptr            = a.q;
     k.unified_kv_ptr       = a.pool;
@@ -315,6 +316,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                      float norm_eps,
                                      int64_t num_splits,
                                      const aiter_tensor_t* workspace,
+                                     const aiter_tensor_t* split_flags,
                                      hipStream_t stream),
                                     (q,
                                      unified_kv,
@@ -339,6 +341,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                      norm_eps,
                                      num_splits,
                                      workspace,
+                                     split_flags,
                                      stream))
 {
     AITER_CHECK(q && unified_kv && unified_kv_scale && kv_indices_prefix && kv_indptr_prefix &&
@@ -404,7 +407,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                 "split decode requires workspace, single split must omit it");
     if(workspace)
         check_tensor(workspace, "workspace", AITER_DTYPE_fp32, {t, num_splits, h, 516}, device, 16);
-    const aiter_tensor_t* outputs[] = {workspace, out, out_scale, max_logits, lse};
+    if(split_flags)
+    {
+        // Zeroed by the caller once; the kernel leaves it zero after each launch.
+        AITER_CHECK(split_flags->dim() == 1 && split_flags->numel() >= int64_t(t) * 32,
+                    "split_flags must hold at least 32 words per token");
+        check_tensor(split_flags,
+                     "split_flags",
+                     AITER_DTYPE_i32,
+                     {static_cast<int64_t>(split_flags->numel())},
+                     device,
+                     128);
+    }
+    const aiter_tensor_t* outputs[] = {workspace, out, out_scale, max_logits, lse, split_flags};
     const aiter_tensor_t* inputs[]  = {q,
                                        unified_kv,
                                        unified_kv_scale,
@@ -418,7 +433,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                        sin,
                                        positions,
                                        attn_sink};
-    for(size_t i = 0; i < 5; ++i)
+    for(size_t i = 0; i < 6; ++i)
     {
         for(const auto* input : inputs)
             AITER_CHECK(!overlaps(outputs[i], input), "outputs must not overlap inputs");
@@ -472,6 +487,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
     a.norm_eps      = norm_eps;
     a.num_splits    = num_splits;
     a.partial       = workspace ? static_cast<float*>(workspace->data_ptr()) : nullptr;
+    a.split_flags   = split_flags ? static_cast<uint32_t*>(split_flags->data_ptr()) : nullptr;
     if(!try_launch_fused_fp8_attention(a, !q_is_rotated, stream))
         HIP_CALL(launch_fused_norm_rope_attn_rope_cast(&a, !q_is_rotated, stream));
 }

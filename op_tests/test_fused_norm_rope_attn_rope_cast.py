@@ -1612,6 +1612,72 @@ def check_mid_batch_attention_capacity(tokens, heads, capacity, mode):
     )
 
 
+def check_h64_split_pair_reduce(tokens, mode, layout):
+    # Two-way H64 decode can reduce each CTA pair inside the attention kernel.
+    # It must match the separate reduction bit for bit and leave its flags zero.
+    kwargs, _ = two_source_inputs(64, layout, mode, wide=True)
+    selected = (torch.arange(tokens, device="cuda") + 5) % kwargs["q"].shape[0]
+    q = kwargs["q"]
+    kwargs["q"] = q.view(torch.uint8).index_select(0, selected).view(q.dtype)
+    kwargs["positions"] = kwargs["positions"].index_select(0, selected)
+    for source in ("prefix", "extend"):
+        ptr = kwargs[f"kv_indptr_{source}"].tolist()
+        ids = kwargs[f"kv_indices_{source}"]
+        rows = [ids[ptr[i] : ptr[i + 1]] for i in selected.tolist()]
+        ids, ptr = csr(rows, torch.int32, 2**31 - 1)
+        kwargs[f"kv_indices_{source}"] = ids
+        kwargs[f"kv_indptr_{source}"] = ptr
+    stats = torch.empty((tokens, 64), device="cuda")
+    kwargs.update(num_splits=2, max_logits=stats, lse=torch.empty_like(stats))
+    with patch(
+        "aiter.ops.fused_norm_rope_attn_rope_cast._stream_split_flags",
+        return_value=None,
+    ):
+        reference = [x.clone() for x in fused_v41(**kwargs)]
+    # 128-byte aligned flags with sentinels on both sides.
+    storage = torch.full(
+        (tokens * 32 + 64,), 0x5A5A5A5A, device="cuda", dtype=torch.int32
+    )
+    flags = storage[32:-32]
+    flags.zero_()
+
+    def check(outputs):
+        for value, ref in zip(outputs, reference):
+            torch.testing.assert_close(
+                value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+            )
+        assert not bool(flags.any())
+        assert bool((storage[:32] == 0x5A5A5A5A).all())
+        assert bool((storage[-32:] == 0x5A5A5A5A).all())
+
+    with patch(
+        "aiter.ops.fused_norm_rope_attn_rope_cast._fused_norm_rope_attn_rope_cast_fwd",
+        wraps=fused_v41_fwd,
+    ) as native:
+        for _ in range(3):
+            check(fused_v41(**kwargs, split_flags=flags))
+            assert native.call_args.args[23] is flags
+        # Default flags are cached per (device, stream).
+        check(fused_v41(**kwargs))
+        if tokens > 48:
+            assert native.call_args.args[23] is not None
+    outputs = fused_v41(**kwargs, split_flags=flags)
+    kwargs.update(out=outputs[0], out_scale=outputs[1], split_flags=flags)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_v41(**kwargs)
+    for _ in range(3):
+        for value in outputs:
+            value.view(torch.uint8).fill_(255)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(outputs)
+    with _raises(RuntimeError, match="split_flags"):
+        fused_v41(**dict(kwargs, split_flags=flags[: tokens * 32 - 1]))
+    with _raises(RuntimeError, match="split_flags"):
+        fused_v41(**dict(kwargs, split_flags=flags.float()))
+
+
 def check_h64_large_prefill_capacity(tokens, capacity, mode, layout, valid_indices):
     # Spare CSR allocation must not turn padding into attended keys at the route boundary.
     _check_shared_kv_wave_boundary(
@@ -3048,6 +3114,14 @@ def run_contract_checks():
                         1024,
                     ],
                 ),
+            ],
+        ),
+        (
+            check_h64_split_pair_reduce,
+            [
+                ("layout", ["interleaved", "padded"]),
+                ("mode", ["raw", "rotated", "norm"]),
+                ("tokens", [48, 49, 64, 66, 96, 128, 200, 512]),
             ],
         ),
         (

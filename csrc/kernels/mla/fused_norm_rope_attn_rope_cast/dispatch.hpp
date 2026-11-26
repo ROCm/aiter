@@ -56,6 +56,7 @@ struct FusedNormRopeAttnRopeCastArgs
     Fp8CacheLayout extend_cache;
     int num_splits;
     float* partial;
+    uint32_t* split_flags; // see FusedNormRopeAttnRopeCastParams::split_flags
     __device__ __forceinline__ const int* prefix_at(int begin) const { return prefix + begin; }
 };
 hipError_t
@@ -105,9 +106,13 @@ struct FusedNormRopeAttnRopeCastParams
     int stride_kv_scale_extend; // independent extend scale row stride in bytes
     float* partial_ptr;
     int num_splits;
+    // Optional zeroed flags, 32 words per token, for an H64 two-way split that
+    // reduces in-kernel; the kernel leaves them zero. Not shared by launches
+    // that may run concurrently. nullptr keeps the separate reduction.
+    uint32_t* split_flags;
 };
 
-static_assert(sizeof(FusedNormRopeAttnRopeCastParams) == 240);
+static_assert(sizeof(FusedNormRopeAttnRopeCastParams) == 248);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, lse_ptr) == 48);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, kv_indices_extend) == 80);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, N) == 88);
@@ -189,6 +194,10 @@ constexpr bool prefer_h128_shared_kv(int tokens, int64_t capacity)
         (tokens > 128 && tokens <= 1024 && (tokens - 1) % 256 >= 128) || tokens > 1024;
     return token_band && has_capacity(tokens, capacity, tokens <= 1024 ? 512 : 1024);
 }
+
+// The in-kernel pair reduction of a two-way H64 split replaces the separate
+// reduction launch (4 * tokens CTAs); below this grid that launch is cheaper.
+constexpr bool prefer_h64_pair_split(int tokens) { return tokens > 48; }
 
 // Semantic layout and address-range guards remain in the caller.
 constexpr bool prefer_bounded_prefill(int tokens, int heads)
