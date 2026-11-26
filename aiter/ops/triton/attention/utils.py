@@ -52,12 +52,13 @@ _E8M0_BIAS = 127
 _E8M0_MAX_CODE = 254
 _E8M0_GROUP = 32
 
-# Packed formats whose stored codes are not element addressable, so a pooled operand has to be
-# built from the tensor the packer was given rather than from the codes it produced. The name says
-# which packer the pooled operand goes through, so it has to be the one the row reads: a V named
-# *_fp6_p is packed in the token order an FP6 P operand contracts over (AttentionPack.V_FOR_FP6_P),
-# which is the only packed V order a Sol-Attn row reads. An MXFP8 K is packed only at head dim 256,
-# where it is 64-token records with the scales inline; at 128 its codes are addressable.
+# Packed formats: an operand stored in one has codes that are not element addressable, so its
+# pooled operand is built from the tensor the packer was given rather than from the codes it
+# produced. The name says which packer the pooled operand goes through, so it has to be the one
+# the row reads: a V named *_fp6_p is packed in the token order an FP6 P operand contracts over
+# (AttentionPack.V_FOR_FP6_P), which is the only packed V order a Sol-Attn row reads. MXFP8 is a
+# packed K format at head dim 256 only, where its records carry their scales; an hd128 MXFP8 K
+# is addressable and pools from its codes through k_scale.
 SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6", "mxfp8")
 SOL_ATTN_PACKED_V_FORMATS = ("mxfp4_fp6_p", "mxfp6_fp6_p")
 SOL_ATTN_PACKED_FORMATS = tuple(
@@ -856,12 +857,12 @@ def sol_prepare(
     Sol-Attn without wrapping the routing in its own opaque custom op.
 
     q: (batch, seqlen_q, nheads_q, d), any dtype; only used for routing, which is scale invariant,
-        so the stored fp8 Q can be passed directly. A Q stored in one of SOL_ATTN_PACKED_FORMATS
-        cannot: its codes are neither element addressable nor even d wide, so pass its
-        pre-quantization tensor. Scale invariance is what makes the two interchangeable, and the
-        MXFP4 and MXFP8 packers' Hadamard rotation is orthogonal, so it leaves the proxy alone too.
-        An E8M0-scaled Q's codes are addressable but not proportional to Q, since the scale
-        varies per token and channel group; pass its scale as q_scale.
+        so the stored fp8 Q can be passed directly. A packed MXFP4 or MXFP6 Q cannot: its codes
+        are neither element addressable nor even d wide, so pass its pre-quantization tensor.
+        Scale invariance is what makes the two interchangeable, and the packers' Hadamard
+        rotation is orthogonal, so it leaves the proxy alone too. An MXFP8 Q is addressable at
+        either head dim, but its codes are not proportional to Q, since the E8M0 scale varies per
+        token and channel group; pass its scale as q_scale.
     k_quant: (batch, seqlen_k, nheads_kv, d) already quantized, typically fp8 e4m3.
     v_quant: (batch, seqlen_k, nheads_kv, d_v) already quantized.
     beta: routing threshold, tau = mean_j(proxy) + beta * population_std_j(proxy). Pass this to
@@ -933,9 +934,10 @@ def sol_prepare(
             unless the matching *_scale argument was given.
         mean_k_scale, mean_v_scale: the pooled operand's own E8M0 scale, same layout as the input
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
-            reused. These go in the mode-2 kernarg's pooled scale slots, except an MXFP6 K's:
-            its packer also stores the scales inside mean_k's tile records, which is where the
-            kernel reads them, so this image is only the readable copy for the host-side helpers.
+            reused. These go in the mode-2 kernarg's pooled scale slots, except where K's packer
+            also stores the scales inside mean_k's records, which is where the kernel reads them:
+            an MXFP6 K at either head dim and an hd256 MXFP8 K. There this image is only the
+            readable copy for the host-side helpers.
         mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
             when k_variance is set; otherwise None. For an 8-bit K it is stored divided by
             SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With
@@ -1001,6 +1003,11 @@ def sol_prepare(
             raise ValueError(
                 f"{name}_source must share (batch, seqlen_k, nheads_kv) with k_quant"
             )
+    if k_scale is not None and k_quant.shape[-1] == 256:
+        raise ValueError(
+            "k_scale pools an addressable block-scaled K, and every hd256 row reads a packed one: "
+            'pass k_source with k_packed_format ("mxfp8" for an MXFP8 K) instead'
+        )
 
     if router not in ("mean", "error"):
         raise ValueError(f"router must be 'mean' or 'error', got {router!r}")

@@ -10,6 +10,7 @@ against a torch/packer reference and then times the exchange with run_perftest.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import gc
 import itertools
@@ -19,6 +20,7 @@ import socket
 from multiprocessing import freeze_support, get_context
 from types import SimpleNamespace
 from typing import NamedTuple
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -26,6 +28,7 @@ import torch.distributed as dist
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import _f32_to_floatx_unpacked, e8m0_to_f32
@@ -688,19 +691,23 @@ def _check_valid_kv_rejections(rank, world_size, op_cls):
 def _check_group_disagreement(rank, world_size, op_cls):
     """Differing configs must raise ValueError on every rank before any allocation."""
     failure = None
-    try:
-        op_cls(
-            rank=rank,
-            world_size=world_size,
-            shape=(1, 64, 8, 128),
-            block_num=64 if rank == 0 else _DEFAULT_BLOCKS,
-        )
-        failure = "accepted a config that differs across ranks"
-    except ValueError as exc:
-        if "disagree" not in str(exc):
-            failure = f"wrong ValueError: {exc}"
-    except Exception as exc:  # noqa: BLE001
-        failure = f"{type(exc).__name__}: {exc}"
+    # Each case differs on rank 0 only. The inbox_memory one must raise before
+    # the heap exists, even where one rank would fail its MoRI check.
+    cases = (
+        {"block_num": 64 if rank == 0 else _DEFAULT_BLOCKS},
+        {"inbox_memory": "uncached" if rank == 0 else "finegrained"},
+    )
+    for case in cases:
+        try:
+            op_cls(rank=rank, world_size=world_size, shape=(1, 64, 8, 128), **case)
+            failure = f"accepted a config that differs across ranks: {case}"
+        except ValueError as exc:
+            if "disagree" not in str(exc):
+                failure = f"wrong ValueError: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            failure = f"{type(exc).__name__}: {exc}"
+        if failure is not None:
+            break
     # Report cross-rank so one rank's failure is seen by all, not just itself.
     flags = torch.zeros(world_size, dtype=torch.int32)
     flags[rank] = failure is not None
@@ -785,6 +792,167 @@ def _check_negative_construction(rank, world_size, op_cls):
     )
     torch.cuda.synchronize()
     dist.barrier(group=_CTX.cpu_group)
+    op.close()
+
+
+def _agree(name, rank, world_size, failure):
+    """Raise on every rank if *failure* is set on any of them."""
+    flags = torch.zeros(world_size, dtype=torch.int32)
+    flags[rank] = failure is not None
+    dist.all_reduce(flags, group=_CTX.cpu_group)
+    failed = flags.nonzero().flatten().tolist()
+    if failed:
+        raise AssertionError(f"{name} failed on rank(s) {failed}: {failure}")
+    _STATS.checks += 1
+
+
+@contextlib.contextmanager
+def _counting_ipc_heap(fail_rank=None, fail_after=None):
+    """Record the IPC heap's allocations and frees; optionally make allocation
+    number *fail_after* (0-based) fail on *fail_rank* alone."""
+    from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+    # freed: the addresses freed and not allocated again since. A freed
+    # address may be reused by a later allocation.
+    counts = {"alloc": [], "free": [], "freed": set()}
+    alloc, free = IpcHeap.alloc, IpcHeap.free_device_mem
+
+    def counting_alloc(*args, **kwargs):
+        if _CTX.rank == fail_rank and len(counts["alloc"]) == fail_after:
+            raise RuntimeError("injected allocation failure")
+        ptr = alloc(*args, **kwargs)
+        counts["alloc"].append(ptr)
+        counts["freed"].discard(ptr)
+        return ptr
+
+    def counting_free(ptr):
+        free(ptr)
+        counts["free"].append(ptr)
+        counts["freed"].add(ptr)
+
+    with (
+        mock.patch.object(IpcHeap, "alloc", counting_alloc),
+        mock.patch.object(IpcHeap, "free_device_mem", counting_free),
+    ):
+        yield counts
+
+
+def _trio_outputs_only(rank, world_size, inputs, op_cls, **kwargs):
+    """One trio's outputs, as from a helper that keeps no op: the op is closed
+    and dropped here. Also returns a copy of each output taken before."""
+    op = op_cls(rank=rank, world_size=world_size, shape=inputs[0].shape, **kwargs)
+    outputs = _submit_roles(op, inputs)
+    torch.cuda.synchronize()
+    flat = list(itertools.chain(*outputs)) if op.return_packed else list(outputs)
+    copies = [t.clone() for t in flat]
+    op.close()
+    try:
+        op.submit_role(0, inputs[0])
+    except RuntimeError as exc:
+        assert "closed" in str(exc), str(exc)
+    else:
+        raise AssertionError("a closed op accepted a submit")
+    return flat, copies
+
+
+def _check_outputs_outlive_op(rank, world_size, device, op_cls):
+    """Outputs, and views of them, stay valid after the op is closed and dropped
+    on every rank; a fine-grained op frees each buffer after the last of them."""
+    from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+    heads, sequence = 8, 64
+    inputs = tuple(
+        _input(rank + 13 * role, heads, sequence, device) for role in range(3)
+    )
+    expected = tuple(_all_to_all(value, rank, world_size) for value in inputs)
+    finegrained = _CTX.inbox_memory == "finegrained"
+    alloc, free = IpcHeap.alloc, IpcHeap.free_device_mem
+    failure = None
+    try:
+        with _counting_ipc_heap() as counts:
+            bf16, bf16_copies = _trio_outputs_only(rank, world_size, inputs, op_cls)
+            packed, packed_copies = _trio_outputs_only(
+                rank,
+                world_size,
+                inputs,
+                op_cls,
+                quant="e4m3",
+                return_packed=True,
+                softmax_scale=0.125,
+                hadamard=True,
+            )
+            # Keep views only: their storage is all that holds the buffers.
+            # A per-tensor scale has one element, so it is kept whole.
+            kept = [t.view(-1)[int(t.numel() > 1) :] for t in bf16 + packed]
+            copies = [
+                t.view(-1)[int(t.numel() > 1) :] for t in bf16_copies + packed_copies
+            ]
+            backing = {t.untyped_storage().data_ptr() for t in kept}
+            sizes = [t.untyped_storage().nbytes() for t in kept]
+            del bf16, packed
+            gc.collect()
+            # The op's other buffers go with it; the ones under the views stay.
+            if finegrained and backing & counts["freed"]:
+                raise AssertionError("buffers freed under live views")
+            allocated = list(counts["alloc"])
+            # Fresh memory filled with 0xFF: if a buffer had been freed, it may
+            # land here and overwrite the views. Not counted.
+            churn = [
+                alloc(size, IpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED, 0xFF)
+                for size in sizes
+            ]
+            for ptr in churn:
+                free(ptr)
+            for i, (got, want) in enumerate(zip(kept, copies, strict=True)):
+                _exact(got, want, f"output {i} after close")
+            for role, (got, want) in enumerate(zip(kept, expected)):
+                _exact(got, want.reshape(-1)[1:], f"bf16 {'QKV'[role]} after close")
+            # The loop variables hold views too.
+            del kept, got, want
+            gc.collect()
+            if finegrained and (
+                not allocated or sorted(counts["free"]) != sorted(allocated)
+            ):
+                raise AssertionError(
+                    f"{len(allocated)} buffers allocated, "
+                    f"{len(counts['free'])} freed"
+                )
+    except Exception as exc:  # noqa: BLE001
+        failure = f"{type(exc).__name__}: {exc}"
+    _agree("outputs outlive the op", rank, world_size, failure)
+
+
+def _check_rank_local_alloc_failure(rank, world_size, op_cls):
+    """An allocation failing on one rank alone raises on every rank instead of
+    leaving the others in publish, and every rank frees what it allocated."""
+    if _CTX.inbox_memory != "finegrained":
+        return
+    failing = world_size - 1
+    # The first allocation leaves the failing rank's heap empty.
+    for fail_after in (0, 3):
+        failure = None
+        with _counting_ipc_heap(failing, fail_after) as counts:
+            try:
+                op_cls(rank=rank, world_size=world_size, shape=(1, 64, 8, 128))
+                failure = "did not raise"
+            except RuntimeError as exc:
+                # The others learn of it from the handle exchange or the vote.
+                want = "injected" if rank == failing else "failed to"
+                if want not in str(exc):
+                    failure = f"wrong RuntimeError: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                failure = f"{type(exc).__name__}: {exc}"
+            gc.collect()
+            if failure is None and sorted(counts["free"]) != sorted(counts["alloc"]):
+                failure = (
+                    f"{len(counts['alloc'])} allocated, {len(counts['free'])} freed"
+                )
+        _agree(
+            f"allocation failure after {fail_after} on rank {failing}",
+            rank,
+            world_size,
+            failure,
+        )
 
 
 def _check_e4m3_scale_rounding(
@@ -1336,24 +1504,35 @@ def test_a2a(world_size, recipe, sequence, heads, blocks):
     # arithmetic, so there is no TFLOPS column.
     nbytes = 3 * sequence * heads * 128 * 2
     out, us = run_perftest(exchange, num_iters=20, use_cuda_event=True)
+    # Every rank passed the check, so every rank closes, as close() requires.
+    for op in keep if isinstance(keep, tuple) else (keep,):
+        op.close()
     del keep, exchange, out
     gc.collect()
     return {
         "gfx": _CTX.gfx,
+        "inbox": _CTX.inbox_memory,
         "a2a us": us,
         "a2a TB/s": nbytes / us / 1e6,
         "a2a err": _STATS.err,
     }
 
 
-def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_len):
+def _run_rank(
+    rank, world_size, port, recipes, sequences, heads_list, valid_kv_len, inbox_memory
+):
     _CTX.valid_kv_len = valid_kv_len
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    import mori.shmem as ms
-
     from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
+
+    # Only the uncached (MoRI heap) path needs MoRI.
+    _CTX.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
+    ms = None
+    if _CTX.inbox_memory == "uncached":
+        import mori.shmem as ms
 
     dist.init_process_group(
         "cpu:gloo,cuda:nccl",
@@ -1364,8 +1543,9 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
     )
     try:
         cpu_group = dist.new_group(backend="gloo")
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        ms.shmem_torch_process_group_init("mori")
+        if ms is not None:
+            torch._C._distributed_c10d._register_process_group("mori", cpu_group)
+            ms.shmem_torch_process_group_init("mori")
         gfx = get_gfx()
         _CTX.rank, _CTX.device, _CTX.gfx = rank, device, gfx
         _CTX.cpu_group = cpu_group
@@ -1375,10 +1555,14 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             else (torch.float8_e4m3fn, 448.0)
         )
         rows = []
-        _CTX.op_cls = functools.partial(AttentionA2AIntraNodeOp, group=cpu_group)
+        _CTX.op_cls = functools.partial(
+            AttentionA2AIntraNodeOp, group=cpu_group, inbox_memory=inbox_memory
+        )
         _check_valid_kv_rejections(rank, world_size, _CTX.op_cls)
         _check_group_disagreement(rank, world_size, _CTX.op_cls)
         _check_negative_construction(rank, world_size, _CTX.op_cls)
+        _check_outputs_outlive_op(rank, world_size, device, _CTX.op_cls)
+        _check_rank_local_alloc_failure(rank, world_size, _CTX.op_cls)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):
@@ -1400,6 +1584,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             _CTX.op_cls = functools.partial(
                 AttentionA2AIntraNodeOp,
                 group=cpu_group,
+                inbox_memory=inbox_memory,
                 block_num=_OVERSUBSCRIBED_BLOCKS,
             )
             rows.append(
@@ -1414,12 +1599,13 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
         return rows, _STATS.checks
     finally:
         try:
-            ms.shmem_finalize()
+            if ms is not None:
+                ms.shmem_finalize()
         finally:
             dist.destroy_process_group()
 
 
-def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
+def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len, inbox_memory):
     visible = torch.cuda.device_count()
     if visible < world_size:
         aiter.logger.warning(
@@ -1431,7 +1617,16 @@ def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
         results = pool.starmap(
             _run_rank,
             [
-                (rank, world_size, port, recipes, sequences, heads_list, valid_kv_len)
+                (
+                    rank,
+                    world_size,
+                    port,
+                    recipes,
+                    sequences,
+                    heads_list,
+                    valid_kv_len,
+                    inbox_memory,
+                )
                 for rank in range(world_size)
             ],
         )
@@ -1482,6 +1677,13 @@ def main():
         default=None,
         help="compact K/V length for v4-consumer recipes; Q retains the padded length",
     )
+    parser.add_argument(
+        "--inbox-memory",
+        choices=INBOX_MEMORY_MODES,
+        default="auto",
+        help="memory type of the peer-written buffers (auto: uncached on xGMI,\n"
+        "fine-grained on PCIe); only uncached needs MoRI",
+    )
     args = parser.parse_args()
     if args.valid_kv_len is not None and any(
         not recipe.startswith("v4-consumer-") for recipe in args.recipes
@@ -1493,7 +1695,12 @@ def main():
     rows, checks = [], 0
     for world_size in args.world_sizes:
         world_rows, world_checks = _run_world(
-            world_size, args.recipes, args.sequences, args.heads, args.valid_kv_len
+            world_size,
+            args.recipes,
+            args.sequences,
+            args.heads,
+            args.valid_kv_len,
+            args.inbox_memory,
         )
         rows += world_rows
         checks += world_checks

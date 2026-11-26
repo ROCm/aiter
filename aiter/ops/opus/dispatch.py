@@ -86,7 +86,7 @@ def _resolve_contract(
         return "a16w16", instance, _a16w16_family
 
     family = launch_plan._validate_a8w8_public_contract(
-        kernel_tag=instance.kernel_tag,
+        instance=instance,
         kid=kid,
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
@@ -258,5 +258,6 @@ def _opus_dispatch(
             kid=kid,
             route_arch=route_arch,
             instance=instance,
+            workspace=workspace,
         )
     raise RuntimeError(f"unsupported canonical OPUS family {family!r}")

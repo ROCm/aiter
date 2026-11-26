@@ -16,10 +16,9 @@ float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
-# tdm.async_gather takes a source column in upstream Triton (desc, rows, col, dst) but not in every gfx1250 build
-# (desc, rows, dst); _tdm_gather calls whichever this Triton has.
+# True if tdm.async_gather takes a column argument (its third parameter is not "dst").
 _GATHER_TAKES_COL = gl.constexpr(
-    len(inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters) >= 6
+    list(inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters)[2] != "dst"
 )
 
 

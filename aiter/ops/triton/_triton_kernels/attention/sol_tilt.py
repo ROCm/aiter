@@ -137,6 +137,7 @@ _sol_jensen_cap_kernel_repr = make_kernel_repr(
         "HAS_DESCALE",
         "HAS_VAR_SCALE",
         "EXPONENT_GAIN",
+        "STORE_SCALE",
         "TILE_CHUNK",
         "HEAD_DIM",
     ],
@@ -177,6 +178,7 @@ def _sol_jensen_cap_kernel(
     HAS_DESCALE: tl.constexpr,
     HAS_VAR_SCALE: tl.constexpr,
     EXPONENT_GAIN: tl.constexpr,
+    STORE_SCALE: tl.constexpr,
     TILE_CHUNK: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
@@ -184,7 +186,8 @@ def _sol_jensen_cap_kernel(
 
     HAS_VAR_SCALE decodes var by the E8M0 bytes at var_scale_ptr, one per 32 dims. EXPONENT_GAIN
     applies 2^floor(log2 gain) to those bytes instead of scaling var, which stays as it is, and
-    stores that power of two as the gain.
+    stores that power of two as the gain. Without STORE_SCALE it only stores that gain, for a
+    caller that packs the capped variance again.
     """
     per_nat = tl.cast(per_nat, tl.float32)
     log_kv_tile = tl.cast(log_kv_tile, tl.float32)
@@ -196,7 +199,7 @@ def _sol_jensen_cap_kernel(
     var = tl.load(var_ptr + var_off).to(tl.float32)
     groups = tl.arange(0, HEAD_DIM // 32)
     scale_off = b * stride_sb + n * stride_sn + h * stride_sh + groups
-    if HAS_VAR_SCALE or EXPONENT_GAIN:
+    if HAS_VAR_SCALE or STORE_SCALE:
         scale = tl.load(var_scale_ptr + scale_off).to(tl.int32)
     if HAS_VAR_SCALE:
         var = (
@@ -241,10 +244,13 @@ def _sol_jensen_cap_kernel(
     if EXPONENT_GAIN:
         shift = tl.floor(tl.log2(gain))
         gain = tl.exp2(shift)
-        tl.store(
-            out_scale_ptr + scale_off,
-            tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(tl.uint8),
-        )
+        if STORE_SCALE:
+            tl.store(
+                out_scale_ptr + scale_off,
+                tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(
+                    tl.uint8
+                ),
+            )
     else:
         tl.store(out_var_ptr + var_off, (var * gain).to(out_var_ptr.dtype.element_ty))
     tl.store(gain_ptr + b * stride_gb + n * stride_gn + h * stride_gh, gain)
