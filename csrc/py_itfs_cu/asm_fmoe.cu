@@ -852,6 +852,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
     }
+    else if(input->dtype() == AITER_DTYPE_fp8 && gate->dtype() == AITER_DTYPE_fp4x2) // mxfp8 X + mxfp4 W
+    {
+        if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4Fp8_g1u1_situv2;
+        else
+            AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4Fp8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, /*block_size_M=*/32, model_dim);
+        impl_ptr->set_4bit(true);
+    }
     else if(input->dtype() == AITER_DTYPE_fp8) // fp8
     {
         if(fc2_smooth_scale)
