@@ -16,7 +16,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from . import buffer_ops
@@ -28,16 +28,21 @@ CHUNK = THREADS * VEC  # columns per workgroup
 
 
 @functools.lru_cache(maxsize=32)
-def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int, device: int = 0):
+def compile_moe_slots_shared_reduce(
+    *, topk: int, model_dim: int, num_experts: int = 0, device: int = 0
+):
     # ``device`` only keys the cache: a compiled handle is bound to the device it was built on.
+    # ``num_experts`` > 0: the kernel also takes the routed ids and a slot whose id is outside [0, num_experts) (a
+    # dropped route, which the routed GEMM2 never writes) adds zero instead of its buffer contents.
     assert model_dim % CHUNK == 0, f"model_dim must be a multiple of {CHUNK}"
     chunks = model_dim // CHUNK
 
     @flyc.kernel(
-        name=f"moe_slots_shared_reduce_top{topk}_h{model_dim}",
+        name=f"moe_slots_shared_reduce_top{topk}_h{model_dim}"
+        + (f"_e{num_experts}" if num_experts else ""),
         known_block_size=[THREADS, 1, 1],
     )
-    def kernel(P: fx.Tensor, S: fx.Tensor, O: fx.Tensor, m: fx.Int32):
+    def kernel(P: fx.Tensor, S: fx.Tensor, O: fx.Tensor, ids: fx.Tensor, m: fx.Int32):
         tx = fx.thread_idx.x
         row, chunk = fx.block_idx.x // chunks, fx.block_idx.x % chunks
         col = chunk * CHUNK + tx * VEC
@@ -50,8 +55,21 @@ def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int, device: int = 
         out = buffer_ops.create_buffer_resource(
             O, max_size=False, num_records_bytes=m * model_dim * 2
         )
+        if const_expr(num_experts):
+            ir = buffer_ops.create_buffer_resource(
+                ids, max_size=False, num_records_bytes=m * topk * 4
+            )
         acc = Vec.filled(VEC, 0.0, fx.Float32)
         for k in range_constexpr(topk):
+            valid = None
+            if const_expr(num_experts):
+                eid = fx.Int32(
+                    buffer_ops.buffer_load(
+                        ir, row * topk + k, vec_width=1, dtype=fx.Int32
+                    )
+                )
+                # a masked load reads zeros (out-of-range offset on a bounded descriptor)
+                valid = (eid >= 0) & (eid < num_experts)
             v = (
                 Vec(
                     buffer_ops.buffer_load(
@@ -59,6 +77,7 @@ def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int, device: int = 
                         ((row * topk + k) * model_dim + col) // 2,
                         vec_width=4,
                         dtype=fx.Int32,
+                        mask=valid,
                     )
                 )
                 .bitcast(fx.BFloat16)
@@ -82,17 +101,26 @@ def compile_moe_slots_shared_reduce(*, topk: int, model_dim: int, device: int = 
 
     @flyc.jit
     def launch(
-        P: fx.Tensor, S: fx.Tensor, O: fx.Tensor, m: fx.Int32, stream: fx.Stream
+        P: fx.Tensor,
+        S: fx.Tensor,
+        O: fx.Tensor,
+        ids: fx.Tensor,
+        m: fx.Int32,
+        stream: fx.Stream,
     ):
-        kernel(P, S, O, m).launch(
+        kernel(P, S, O, ids, m).launch(
             grid=(m * chunks, 1, 1), block=(THREADS, 1, 1), stream=stream
         )
 
     return launch
 
 
-def moe_slots_shared_reduce(parts, shared, out=None):
-    """``parts`` [M, topk, model_dim] bf16 and ``shared`` [M, model_dim] bf16 -> [M, model_dim] bf16."""
+def moe_slots_shared_reduce(parts, shared, out=None, *, topk_ids=None, num_experts=0):
+    """``parts`` [M, topk, model_dim] bf16 and ``shared`` [M, model_dim] bf16 -> [M, model_dim] bf16.
+
+    ``topk_ids`` [M, topk] int32 with ``num_experts``: a slot whose id is outside ``[0, num_experts)`` (a dropped
+    route: the routed GEMM2 never writes its row) contributes zero instead of whatever its buffer holds.
+    """
     M, topk, model_dim = parts.shape
     assert parts.is_cuda and parts.device == shared.device
     assert parts.dtype == shared.dtype == torch.bfloat16
@@ -111,16 +139,32 @@ def moe_slots_shared_reduce(parts, shared, out=None):
         and out.is_contiguous()
         and out.shape == shared.shape
     )
+    if topk_ids is None:
+        num_experts = 0
+        ids = shared  # unused by the unmasked kernel
+    else:
+        assert num_experts > 0, "topk_ids needs num_experts"
+        assert (
+            topk_ids.device == parts.device
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and tuple(topk_ids.shape) == (M, topk)
+        )
+        ids = topk_ids
     if M == 0:
         return out
     with torch.cuda.device(parts.device):
         _run_compiled(
             compile_moe_slots_shared_reduce(
-                topk=topk, model_dim=model_dim, device=torch.cuda.current_device()
+                topk=topk,
+                model_dim=model_dim,
+                num_experts=num_experts,
+                device=torch.cuda.current_device(),
             ),
             parts.view(-1),
             shared.view(-1),
             out.view(-1),
+            ids.view(-1),
             M,
             torch.cuda.current_stream(parts.device),
         )
