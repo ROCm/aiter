@@ -124,7 +124,7 @@ class ATileLoader:
         below ``row_map["rows"]`` are the padding.
         """
         if const_expr(row_map is not None):
-            assert not self._indexed_input and not self._is_fp4
+            assert not self._indexed_input
             input_iter = fx.get_iter(self._x_tensor)
             input_view = fx.Tensor(
                 fx.make_view(
@@ -825,11 +825,13 @@ def _group_absmax(vals, shuffle_offs, c64):
     return m
 
 
-def _e8m0_scale(amax):
-    """E8M0 exponent of a 1x32 group's |max| and the matching FP8 quant multiplier."""
+def _e8m0_scale(amax, fp4=False):
+    """E8M0 exponent of a 1x32 group's |max| and the matching FP8 quant multiplier (``fp4``: the FP4 dequant scale)."""
     max_rounded = (amax.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-    e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
+    e = (max_rounded >> fx.Int32(23)) - fx.Int32(2 if fp4 else 8)
     e8m0 = (e > fx.Int32(0)).select(e, fx.Int32(0))
+    if fp4:
+        return e8m0, (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
     quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, quant_scale
 
@@ -875,11 +877,11 @@ class SiluQuantEpilogue:
         # Without out_tensor, out_rsrc is the whole output in that store's width:
         # Int16 elements for 2, Int32 x2 units for 8.
         assert evec in (2, 8)
-        # FP4 output is only implemented in the evec==2 store branch; the evec==8
-        # vectorized store (_store_quant_vec8) is FP8-only.  Force evec=2 for FP4
+        # FP4 output is implemented in the evec==2 store branch and the fused evec==8 one; the other evec==8
+        # vectorized store (_store_quant_vec8) is FP8-only.  Force evec=2 for FP4 there
         # so Stage1's evec=8 never routes FP4 to the FP8 store path (which would
         # write FP8 words into the Int8 FP4 buffer).
-        self._evec = 2 if self._is_fp4 else evec
+        self._evec = 2 if self._is_fp4 and not fused_v8 else evec
         # fused_v8: the fused kernels' evec 8 store pass (_store_quant_vec8_fused: valid rows, a store cache policy,
         # tile_rows); lean (fused_v8 only): bit 0 = that pass without serial waits, bit 1 = fast SiLU.
         assert not (fused_v8 and self._evec == 8) or out_tensor is not None
@@ -1186,8 +1188,9 @@ class SiluQuantEpilogue:
         """The fused kernels' store pass with 8 columns per lane: 4 lanes share a 32-column scale group.
 
         Unlike _store_quant_vec8 it drops padding rows past ``valid_rows_i32``,
-        takes the store cache policy and stores only the tile's leading
-        ``tile_rows`` rows.
+        takes the store cache policy, stores only the tile's leading
+        ``tile_rows`` rows and stores FP4 too (one i32 of 8 values a lane, the
+        evec 2 branch's numerics).
         """
         tx = fx.thread_idx.x
         if const_expr(self._lean):
@@ -1202,19 +1205,21 @@ class SiluQuantEpilogue:
         assert self._tile_rows % rows_per_iter == 0
         mlane = tx // fx.Int32(NLANE)
         nlane = tx % fx.Int32(NLANE)
-        # 8-byte groups of the tile's output rows.
+        # A lane's 8 values: 8 bytes of FP8, 4 bytes of FP4.
+        out_unit = 1 if self._is_fp4 else 2
+        row_bytes = self._out_row_bytes
         tile_iter = fx.add_offset(
             fx.get_iter(self._out_tensor),
-            fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
+            fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * row_bytes),
         )
         out_vec = ptr_buf_tensor(
             tile_iter,
             fx.Int32,
-            unit_elems=2,
+            unit_elems=out_unit,
             num_records_bytes=(
-                fx.Int32(self._sort_block_m * self._inter_dim)
+                fx.Int32(self._sort_block_m * row_bytes)
                 if valid_rows_i32 is None
-                else valid_rows_i32 * fx.Int32(self._inter_dim)
+                else valid_rows_i32 * fx.Int32(row_bytes)
             ),
         )
         col0 = nlane * fx.Int32(8)
@@ -1243,16 +1248,26 @@ class SiluQuantEpilogue:
                     m = m.maximumf(fx.Float32(dpp_xor_f32(m, off)))
                 else:
                     m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
-            e8m0_v, quant_scale = _e8m0_scale(m)
+            e8m0_v, quant_scale = _e8m0_scale(m, self._is_fp4)
             words = []
-            for w in range_constexpr(2):
-                lo = rocdl.cvt_pk_fp8_f32(T.i32, v[4 * w] * quant_scale, v[4 * w + 1] * quant_scale, fx.Int32(0), False)
-                words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
-                    T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
+            if const_expr(self._is_fp4):
+                packed = fx.Int32(0)
+                for pair in range_constexpr(4):
+                    packed = fx.Int32(rocdl.cvt_scalef32_pk_fp4_f32(
+                        T.i32, packed, v[2 * pair], v[2 * pair + 1], quant_scale, pair))
+                words.append(packed)
+            else:
+                for w in range_constexpr(2):
+                    lo = rocdl.cvt_pk_fp8_f32(T.i32, v[4 * w] * quant_scale, v[4 * w + 1] * quant_scale, fx.Int32(0),
+                        False)
+                    words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
+                        T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
             valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
-            out_byte = valid.select(row * fx.Int32(self._inter_dim) + gcol, fx.Int32(0x40000000))
-            buf_copy_store(out_vec, out_byte // fx.Int32(8), Vec.from_elements(words, fx.Int32), fx.Int32,
-                unit_elems=2, cache_modifier=store_cm)
+            out_byte = valid.select(row * fx.Int32(row_bytes) + ((gcol >> fx.Int32(1)) if self._is_fp4 else gcol),
+                fx.Int32(0x40000000))
+            buf_copy_store(out_vec, out_byte // fx.Int32(4 * out_unit),
+                words[0] if self._is_fp4 else Vec.from_elements(words, fx.Int32), fx.Int32, unit_elems=out_unit,
+                cache_modifier=store_cm)
             writer = is_writer if valid_rows_i32 is None else is_writer & (row < valid_rows_i32)
             d0 = row_g >> fx.Int32(5)
             d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)

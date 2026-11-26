@@ -76,6 +76,9 @@ FUSED_LAYOUTS = {
         (M31_EP4_LAYOUT, 4, ("swigluoai", 7.0)),
     )
 }
+# The FUSED_LAYOUTS keys the fused kernels also serve with MXFP4 activations (a4w4): the small-input kernel's
+# a4w4 path is measured on MiniMax-M3.1 only, and that layout has no large-input capacity (large_m_mtprs_for).
+A4W4_FUSED_LAYOUTS = frozenset({(4, 6144, 3072, 128, 4)})  # EP4 MiniMax-M3.1
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -479,16 +482,17 @@ def fused_layout_supported(
     act: str = "silu",
     fanout_masks: tuple[int, ...] = (),
 ) -> bool:
-    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a8w4 on gfx950.
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS on gfx950, a8w4 or (A4W4_FUSED_LAYOUTS)
+    a4w4.
 
     The small-input kernel serves every such layout; the large-input kernel the
     capacities large_m_mtprs_for() gives it.
     """
+    layout = (world_size, model_dim, inter_dim, experts, topk)
     return (
         arch.split(":", 1)[0] == "gfx950"
-        and FUSED_LAYOUTS.get((world_size, model_dim, inter_dim, experts, topk))
-        == (act, swiglu_limit)
-        and quant == "a8w4"
+        and FUSED_LAYOUTS.get(layout) == (act, swiglu_limit)
+        and (quant == "a8w4" or (quant == "a4w4" and layout in A4W4_FUSED_LAYOUTS))
         and not fanout_masks
     )
 

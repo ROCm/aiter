@@ -5,12 +5,13 @@ r"""MegaMoEV2 EP4 at MiniMax-M3.1 decode shapes, on captured M3.1 routing.
 Each point gives the decode requests per rank; a request is 8 DSpark verify rows.
 Every rank takes distinct captured requests of the layer (MoE input hidden states,
 topk ids and weights as the server routed them), so the cross-rank routing is real.
-The instance is the one ATOM builds: a8w4, --mtpr 512, swiglu_limit 7, staged route
-unless --routed. Weights are random MXFP4: the op streams them, its time does not
-depend on their values. Per point it reports the graph-replay time of one call
-(median of --trials replays of a --calls-call graph, max over ranks), the relL2
-against an emulation of the op's own MXFP8 quantization (the error check), the
-relL2 against the fp32 reference of its activation, and the rows each rank receives.
+The instance is the one ATOM builds: a8w4 (--quant a4w4: MXFP4 activations), --mtpr 512,
+swiglu_limit 7, staged route unless --routed. Weights are random MXFP4: the op streams
+them, its time does not depend on their values. Per point it reports the graph-replay
+time of one call (median of --trials replays of a --calls-call graph, max over ranks),
+the relL2 against an emulation of the op's own MXFP8 (a4w4: MXFP4) activation
+quantization (the error check), the relL2 against the fp32 reference of its
+activation, and the rows each rank receives.
 With --baseline, a point whose emulation error exceeds the baseline run's largest
 one fails the run.
 
@@ -90,6 +91,7 @@ def main():
     )
     p.add_argument("--capture", required=True, help="directory of part*.pt captures")
     p.add_argument("--act", choices=("silu", "swigluoai"), default="swigluoai")
+    p.add_argument("--quant", choices=("a8w4", "a4w4"), default="a8w4")
     p.add_argument("--layers", default="3,20,40,59")
     p.add_argument("--points", default="", help="JSON {name: [requests per rank]}")
     p.add_argument("--mtpr", type=int, default=512)
@@ -119,7 +121,7 @@ def main():
     moe = MegaMoEV2(
         rank=rank,
         world_size=world,
-        quant="a8w4",
+        quant=args.quant,
         w1=w1,
         w1_scale=w1s,
         w2=w2,
@@ -159,7 +161,7 @@ def main():
             results.append(row)
             if rank == 0:
                 print(
-                    f"[M31] act={args.act} layer={layer} {name:<10} "
+                    f"[M31] {args.quant} act={args.act} layer={layer} {name:<10} "
                     f"rows={max_tokens:>3} us={us:7.1f} emul={emul:.5f} relL2={rel:.4f}",
                     flush=True,
                 )

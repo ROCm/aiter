@@ -125,6 +125,9 @@ NETWORKS = {
 }
 # Networks whose fused routes must send BF16 combine rows, a hot expert's included.
 BF16_COMBINE_NETWORKS = {"m31"}
+# Routes suite, a4w4: relL2 bound of the fused route against the staged route (measured 0.027 at --mtpr 1024,
+# where the staged route sends FP8 combine rows).
+A4W4_STAGED_RTOL = 0.05
 
 
 def _setup_dist():
@@ -180,6 +183,23 @@ def _mxfp8_round(v):
     scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
     q = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
     return q.reshape(v.shape)
+
+
+def _mxfp4_round(v, round_up):
+    """Round-trip through MXFP4: 1x32 blocks, E2M1 values (nearest even, saturating). The E8M0 scale is
+    ceil_pow2(amax / 6) with ``round_up`` (the op's input quant), else amax rounded to the nearest power of two
+    (a mantissa of 1.5 or more rounds up) divided by 4 (its GEMM1 epilogue)."""
+    blocks = v.float().reshape(*v.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    if round_up:
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 6.0)))
+    else:
+        rounded = ((amax.view(torch.int32) + 0x400000) & -0x800000).view(torch.float32)
+        scale = rounded / 4.0
+    q = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(blocks / scale)).view(
+        blocks.shape
+    )
+    return (q * scale).reshape(v.shape)
 
 
 def _all_ranks(flag, device):
@@ -387,10 +407,10 @@ def _reference(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
-    quantize=False,
+    quantize=None,
 ):
-    """fp32 MoE output; ``quantize`` emulates the a8w4 op's MXFP8 rounding of
-    the input and of the GEMM1 activation output."""
+    """fp32 MoE output; ``quantize`` ("fp8" / "fp4") emulates the a8w4 op's MXFP8
+    or the a4w4 op's MXFP4 rounding of the input and of the GEMM1 activation output."""
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
     ids_all, _ = _all_gather_variable(ids, token_counts)
@@ -412,8 +432,10 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
-        if quantize:
+        if quantize == "fp8":
             inp = _mxfp8_round(inp)
+        elif quantize == "fp4":
+            inp = _mxfp4_round(inp, round_up=True)
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
         if act == "situv2":
@@ -434,8 +456,10 @@ def _reference(
                 gate = gate.clamp(max=swiglu_limit)
                 up = up.clamp(-swiglu_limit, swiglu_limit)
             hidden = F.silu(gate) * up
-        if quantize:
+        if quantize == "fp8":
             hidden = _mxfp8_round(hidden)
+        elif quantize == "fp4":
+            hidden = _mxfp4_round(hidden, round_up=False)
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -445,7 +469,7 @@ def _reference(
 
 
 def _moe_reference(moe, x, route_weights, ids, ref_weights, quantize=False):
-    """_reference() for the layout and activation of ``moe``."""
+    """_reference() for the layout and activation of ``moe``; ``quantize`` emulates its activation format."""
     return _reference(
         x,
         route_weights,
@@ -460,7 +484,7 @@ def _moe_reference(moe, x, route_weights, ids, ref_weights, quantize=False):
         moe.act,
         moe.situ_beta,
         moe.situ_linear_beta,
-        quantize,
+        moe._a_dtype if quantize else None,
     )
 
 
@@ -1279,7 +1303,7 @@ def _routes_instance(args, rank, world, device):
     moe = MegaMoEV2(
         rank=rank,
         world_size=world,
-        quant="a8w4",
+        quant=args.quant,
         w1=packs[0][0],
         w1_scale=packs[0][1],
         w2=packs[0][2],
@@ -1293,8 +1317,8 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks, "
-            "MiniMax-M3.1 on 4 ranks) "
+            "layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks, "
+            "MiniMax-M3.1 on 4 ranks; a4w4 MiniMax-M3.1 only) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
@@ -1388,7 +1412,10 @@ def _routes_accuracy(ctx, args):
             pad_ok = _all_ranks(torch.isfinite(out_g).all(), device)
             pad_zero = _all_ranks((out_g[real:] == 0).all(), device) if pad else True
             outputs[(name, which)] = (xi, wi, ii, out_g, real, max_tokens)
-            ok = rel_ref < args.rtol and rel_staged < args.rtol and pad_ok
+            # a4w4: the fp32 bound is loose for MXFP4, so a tighter one against the staged route catches
+            # fused-only error.
+            staged_rtol = A4W4_STAGED_RTOL if args.quant == "a4w4" else args.rtol
+            ok = rel_ref < args.rtol and rel_staged < staged_rtol and pad_ok
             if rank == 0:
                 print(
                     f"[ACC] {name:10s} w{which} tpr={tpr} pad={pad} relL2_vs_ref={rel_ref:.6f} "
@@ -1866,7 +1893,7 @@ def main():
     parser.add_argument(
         "--rtol",
         type=float,
-        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 in the routes suite",
+        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 (0.25 for a4w4) in the routes suite",
     )
     parser.add_argument(
         "--max-tok-per-rank",
@@ -1944,12 +1971,15 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash", "m31") or args.quant != "a8w4":
+        if args.network not in ("v4_pro", "v41_flash", "m31") or (
+            args.quant != "a8w4" and args.network != "m31"
+        ):
             raise ValueError(
-                "--suite routes needs --network v4_pro, v41_flash or m31 and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or m31, and --quant a8w4 except on m31"
             )
         args.seed = 7 if args.seed is None else args.seed
-        args.rtol = 0.08 if args.rtol is None else args.rtol
+        if args.rtol is None:
+            args.rtol = 0.25 if args.quant == "a4w4" else 0.08
         if args.max_tok_per_rank is None:
             args.max_tok_per_rank = 8192
         if args.large_m_state_slots is None:
