@@ -300,6 +300,13 @@ AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
 )
 
+# Fused decode QKV chain (aiter/ops/flydsl/mxfp8_qkv_rope_nvfp4_gfx1250.py): launch
+# configs by head shape and row count
+AITER_CONFIG_MXFP8_QKV_CHAIN = os.getenv(
+    "AITER_CONFIG_MXFP8_QKV_CHAIN",
+    f"{AITER_ROOT_DIR}/aiter/configs/mxfp8_qkv_chain_tuned.csv",
+)
+
 
 def _runtime_power_selection() -> bool:
     """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
@@ -553,6 +560,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_PAGED_MQA_LOGITS",
             AITER_CONFIG_PAGED_MQA_LOGITS,
             "paged_mqa_logits_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_MXFP8_QKV_CHAIN_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MXFP8_QKV_CHAIN",
+            AITER_CONFIG_MXFP8_QKV_CHAIN,
+            "mxfp8_qkv_chain_tuned",
         )
 
     @property
