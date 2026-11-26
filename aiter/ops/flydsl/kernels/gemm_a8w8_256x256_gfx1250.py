@@ -108,6 +108,7 @@ def launch_gemm_a8w8_256x256(
     k_tiles_class: Constexpr[int] = 2,
     b_scale_32x32: Constexpr[bool] = False,
     batched: Constexpr[bool] = False,
+    m_run_cap: Constexpr[int] = 32,
     batch: fx.Int32 = 1,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
@@ -117,7 +118,9 @@ def launch_gemm_a8w8_256x256(
     timeout on A/B and the plain K-loop schedule, which run faster there.
     ``b_scale_32x32``: the mxfp8_32 B scale is row-major ``[N/32, K/32]``.
     ``batched``: A ``[M, batch, K]``, A scale ``[M, batch, K/32]``, B and its
-    scale ``[batch, ...]``, C ``[M, batch, N]``."""
+    scale ``[batch, ...]``, C ``[M, batch, N]``.
+    ``m_run_cap``: the most M tiles one grid.x run spans before the rest of M
+    moves to grid.z (a power of two; the M-tile count must split into runs)."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -130,6 +133,9 @@ def launch_gemm_a8w8_256x256(
         1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
+    assert (
+        m_run_cap >= 1 and m_run_cap & (m_run_cap - 1) == 0
+    ), f"m_run_cap must be a power of two, got {m_run_cap}"
     assert (
         persistent_n_tiles >= 1
     ), f"persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
@@ -146,7 +152,7 @@ def launch_gemm_a8w8_256x256(
     ), "all K splits must fit in one cluster with at most 16 workgroups"
     use_cluster = cluster_m * cluster_n * cluster_k > 1
     cluster_sync_revs = 8
-    m_run_max, m_run_min = 32, 8
+    m_run_max, m_run_min = m_run_cap, min(8, m_run_cap)
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -320,6 +326,7 @@ def launch_gemm_a8w8_256x256(
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
+        + (f"_mr{m_run_cap}" if m_run_cap != 32 else "")
     )
 
     def _run_tile(

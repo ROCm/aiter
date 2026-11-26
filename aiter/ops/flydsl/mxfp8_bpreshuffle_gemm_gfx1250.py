@@ -146,6 +146,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     scale_block: int = BLOCK_K,
     w_scale_32x32: bool = False,
     batch: int = 1,
+    m_run_cap: int = 32,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -165,8 +166,15 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     ``batch > 1`` (compute mxfp8_32, split_k 1): the operands are batch 0 of
     ``[M, batch, K]`` XQ / x_scale, ``[batch, N, K]`` WQ / w_scale and
     ``[M, batch, N]`` Out.
+
+    ``m_run_cap`` (compute kernels, kernelName ``_mr<n>``): the most M tiles
+    one launch-grid row spans; 32 by default.
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
+    if m_run_cap != 32 and not compute_bound:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] m_run_cap (_mr) needs a compute-bound kernel"
+        )
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
         raise RuntimeError(
@@ -414,6 +422,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             compute_kernel_k_tiles_class(num_k_tiles),
             w_scale_32x32,
             batch > 1,
+            m_run_cap,
         )
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
@@ -473,6 +482,7 @@ NAME_SUFFIX_RE = (
     BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
+    r"(?:_mr(?P<m_run_cap>\d+))?"
 )
 MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -495,11 +505,13 @@ def _parse_name(match):
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    m_run_cap = groups.pop("m_run_cap", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["m_run_cap"] = int(m_run_cap) if m_run_cap else 32
     return cfg
 
 
@@ -649,6 +661,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        m_run_cap=cfg["m_run_cap"],
     )
 
 
@@ -698,6 +711,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        m_run_cap=cfg["m_run_cap"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,
