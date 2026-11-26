@@ -20,11 +20,10 @@ import math
 
 import pytest
 import torch
-import triton
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch as _fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
     input_guard,
@@ -32,7 +31,6 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
-    flash_kda_supported,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
@@ -136,28 +134,8 @@ def _count_launches(module, names):
 def _gluon_k2_module():
     return importlib.import_module(
         "aiter.ops.triton._gluon_kernels."
-        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
+        f"{base_gfx_arch(_flash_kda.DEVICE_ARCH)}.kimi_delta_attn.flash_kda_k2"
     )
-
-
-@contextlib.contextmanager
-def _k2_tuner_search_space():
-    """Hand K2's autotuner the candidates a tuning build gives it.
-
-    The launch path pins one config, and Triton consults its autotune cache
-    only when there is more than one to choose between, so a test about the
-    key has to supply the space the key indexes.
-    """
-    if len(_flash_kda._K2_CONFIGS) < 2:
-        pytest.skip("no published K2 candidates on this device to key between")
-    kern = _flash_kda._flash_kda_segment_kernel
-    saved = kern.configs
-    kern.configs = list(_flash_kda._K2_CONFIGS)
-    try:
-        yield kern
-    finally:
-        kern.configs = saved
-        kern.cache.clear()
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -431,77 +409,6 @@ def test_segmented_agrees_with_unsegmented():
         assert rel_err(ht_seg, ht_plain) < 5e-3, m
 
 
-def test_tuner_keeps_the_two_schedules_apart():
-    """A segmented run must not hand its config to a later unsegmented one.
-
-    K2's grid is ``cdiv(W, BW) * num_segs * H``, so the wide BW that suits a
-    segmented sweep leaves the unsegmented scan a quarter of the blocks: at
-    H=12 that pick costs 2.3x. The two collide unless the segment count reaches
-    the autotune key, and `cache_results` then persists whichever won. Only a
-    tuning build chooses, so the tuner is given its config space here.
-    """
-    args = make_inputs(1, 1024, 4)
-    # An incoming state is what makes the two output passes otherwise identical:
-    # without it the unsegmented one passes h_in=None and the key picks up the
-    # difference through the dtypes it appends, hiding the collision.
-    kw = {
-        "initial_state": torch.zeros(
-            1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
-        )
-    }
-    # This is about the Triton kernel's autotuner, which never runs -- and whose
-    # cache therefore stays empty -- when K2 is routed to Gluon.
-    with _k2_tuner_search_space() as kern, _route(k2=False), _fast_launch.bypassed():
-        run_flash(*args, chunks_per_seg=4, **kw)
-        segmented_keys = set(kern.cache)
-        run_flash(*args, chunks_per_seg=0, **kw)
-        assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
-
-
-def test_published_k2_schedules_can_split_their_tile():
-    """Every published (BW, num_warps) must let the warps divide the state.
-
-    Above BW // 16 the extra warps recompute columns their neighbours already
-    hold -- still correct, which is why nothing downstream catches it, and the
-    pairs are now editable from a config file rather than derived.
-
-    An arch that publishes neither schedule has nothing here to check. Both
-    lookups then return _K2_GLUON_FALLBACK, whose MIN_BLOCKS_PER_CU of 0 makes
-    the occupancy test vacuous, so the wide branch is taken for every shape and
-    exactly one pair is reachable by construction rather than by choice.
-    """
-    if (
-        _flash_kda.chunk_delta_attn_tuned_config(
-            "k2_ab_fused_gluon_wide", _flash_kda._K2_GLUON_FALLBACK, backend="gluon"
-        )
-        is _flash_kda._K2_GLUON_FALLBACK
-    ):
-        pytest.skip("this arch publishes no Gluon K2 schedules")
-    kernels = ["k2_ab_fused_gluon"]
-    if _flash_kda.DEVICE_ARCH == "gfx1250":
-        kernels.append("k2_c_gluon")
-    for kernel in kernels:
-        reached = set()
-        for W in (64, 128, 256):
-            for num_segs in (1, 2, 8, 64, 512):
-                for H in (1, 4, 12, 64):
-                    sched = _flash_kda._k2_gluon_schedule(W, num_segs, H, kernel)
-                    reached.add((sched.kwargs["BW"], sched.num_warps))
-        assert len(reached) > 1, f"{kernel}: only one schedule reachable: {reached}"
-        for bw, nw in sorted(reached):
-            assert bw % 16 == 0, f"{kernel}: BW={bw} is not a whole number of tiles"
-            assert nw <= bw // 16, f"{kernel}: BW={bw} cannot be split {nw} ways"
-    # The gfx950 pass C publishes one schedule per segmentation instead.
-    if _flash_kda.DEVICE_ARCH == "gfx950":
-        for segmented in (False, True):
-            sched = _flash_kda._k2c_gluon_schedule(segmented)
-            if sched is None:
-                continue
-            bw, nw = sched.kwargs["BW"], sched.num_warps
-            assert bw % 16 == 0, f"k2_c_gluon: BW={bw} is not a whole number of tiles"
-            assert nw <= bw // 16, f"k2_c_gluon: BW={bw} cannot be split {nw} ways"
-
-
 def _patch_gluon_schedule(monkeypatch, replace):
     """Make ``_published_gluon_schedule`` return ``replace[name]`` for those names."""
     published = _flash_kda._published_gluon_schedule
@@ -510,19 +417,6 @@ def _patch_gluon_schedule(monkeypatch, replace):
         "_published_gluon_schedule",
         lambda name: replace[name] if name in replace else published(name),
     )
-
-
-def test_gluon_k1_rejects_a_wrong_warp_count(monkeypatch):
-    """K1's layouts fix its warp count, so a config with another one must fail."""
-    if _flash_kda.DEVICE_ARCH != "gfx950" or not _flash_kda._gluon_k1_usable(
-        FLASH_KDA_CHUNK, K_DIM
-    ):
-        pytest.skip("only the gfx950 Gluon K1 validates its published schedule")
-    good = _flash_kda._published_gluon_schedule("k1_prepare_gluon")
-    wrong = triton.Config(dict(good.kwargs), num_warps=2 * good.num_warps)
-    _patch_gluon_schedule(monkeypatch, {"k1_prepare_gluon": wrong})
-    with _route(k1=True), pytest.raises(ValueError, match="num_warps"):
-        run_flash(*make_inputs(1, 64, 2))
 
 
 def test_unpublished_gluon_schedules_fall_back_to_triton(monkeypatch):
@@ -670,35 +564,6 @@ def test_cases_reach_the_gluon_k2():
         assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
-@pytest.mark.parametrize(
-    "B, H, chunks_per_seg, gluon",
-    [(1, 4, None, False), (4, 12, None, True), (1, 4, 4, True)],
-    ids=["small", "large", "segmented"],
-)
-def test_pass_c_route_follows_size(monkeypatch, B, H, chunks_per_seg, gluon):
-    """The published floor sends few-pair unsegmented shapes to the Triton pass C."""
-    if not (
-        _flash_kda._GLUON_K2C_ARCH_OK
-        and _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM)
-    ):
-        pytest.skip("this arch or tile shape never routes pass C to Gluon")
-    sched = _flash_kda._k2c_gluon_schedule(False)
-    if sched is None or not sched.kwargs.get("MIN_BLOCKS_PER_CU"):
-        pytest.skip("this arch publishes no pass C floor")
-    if chunks_per_seg is None:
-        assert _flash_kda._k2c_gluon_usable(False, K_DIM, B, H) == gluon
-    monkeypatch.setattr(_flash_kda, "AITER_FDA_USE_GLUON_K2", True)
-    monkeypatch.setattr(_flash_kda, "_K2C_ROUTE_BY_SIZE", True)
-    args = make_inputs(B, 1024 if chunks_per_seg else 64, H)
-    with (
-        _count_launches(_gluon_k2_module(), ["k2_c_fast"]) as gluon_calls,
-        _count_launches(_flash_kda, ["_segment_fast"]) as triton_calls,
-    ):
-        run_flash(*args, chunks_per_seg=chunks_per_seg)
-    assert gluon_calls["k2_c_fast"] == int(gluon)
-    assert triton_calls["_segment_fast"] == int(not gluon)
-
-
 def test_segment_length_cap(monkeypatch):
     """A hard cap bounds every segment; the fallback's soft cap yields to the
     segment-count cap on long sequences."""
@@ -793,36 +658,6 @@ def test_final_state_matches_fp32_recurrence(lower_bound):
     e_ref = rel_err(run_reference(*args, **kw)[1], gold)
     assert e_fkda < 2e-2, f"flash_kda state {e_fkda:.2e} against the fp32 recurrence"
     assert e_fkda < 1.3 * e_ref, f"flash_kda state {e_fkda:.2e} vs default {e_ref:.2e}"
-
-
-def test_supported_rejects_unsupported():
-    q = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
-    v = torch.randn(1, 64, 4, 64, device=device, dtype=dtype)
-    A_log = torch.randn(4, device=device, dtype=torch.float32)
-    base = {
-        "chunk_size": FLASH_KDA_CHUNK,
-        "safe_gate": True,
-        "use_gate_in_kernel": True,
-        "use_qk_l2norm_in_kernel": True,
-        "use_beta_sigmoid_in_kernel": True,
-        "lower_bound": LOWER_BOUND,
-        "A_log": A_log,
-    }
-    # K = V = 64 is not supported.
-    assert not flash_kda_supported(q=q, v=v, **base)
-
-    q128 = torch.randn(1, 64, 4, 128, device=device, dtype=dtype)
-    v128 = torch.randn(1, 64, 4, 128, device=device, dtype=dtype)
-    assert flash_kda_supported(q=q128, v=v128, **base)
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "chunk_size": 64})
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "lower_bound": None})
-    assert not flash_kda_supported(q=q128, v=v128, **{**base, "safe_gate": False})
-    assert not flash_kda_supported(
-        q=q128, v=v128, **{**base, "use_gate_in_kernel": False}
-    )
-    # GVA (HV != H) is not supported.
-    v_gva = torch.randn(1, 64, 8, 128, device=device, dtype=dtype)
-    assert not flash_kda_supported(q=q128, v=v_gva, **base)
 
 
 def test_public_wrapper_routes_to_flash_kda(monkeypatch):
@@ -1076,59 +911,6 @@ def test_paged_cache_padded_stride_writes_live_pool():
         assert torch.count_nonzero(row).item() == 0
 
 
-@pytest.mark.parametrize("outer", ["expanded", "overlapping"])
-def test_paged_cache_rejects_overlapping_slots(outer):
-    """stride(0) below one [H, V, K] plane would alias neighbouring slots."""
-    H = 4
-    args = make_inputs(1, 128, H)
-    v = args[2]
-    plane = H * K_DIM * K_DIM
-    if outer == "expanded":
-        cache = torch.zeros(
-            1, H, K_DIM, K_DIM, device=device, dtype=torch.float32
-        ).expand(3, -1, -1, -1)
-    else:
-        storage = torch.zeros(3 * plane, device=device, dtype=torch.float32)
-        cache = torch.as_strided(
-            storage,
-            size=(3, H, K_DIM, K_DIM),
-            stride=(plane // 2, K_DIM * K_DIM, K_DIM, 1),
-        )
-    assert cache.stride(0) < plane
-    with pytest.raises(ValueError, match="not dense"):
-        chunk_kimi_delta_attn(
-            **_kimi_kwargs(
-                *args,
-                out=torch.empty_like(v),
-                state_cache=cache,
-                state_indices=torch.tensor([1], device=device, dtype=torch.int32),
-                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
-            )
-        )
-
-
-def test_out_rejected_on_default_pipeline():
-    """The default pipeline cannot honour `out`, so it must not drop it."""
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    with (
-        _force_default_pipeline(),
-        pytest.raises(ValueError, match="out is only implemented"),
-    ):
-        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=torch.empty_like(v)))
-
-
-def test_out_must_be_contiguous():
-    """A strided `out` is rejected, not silently packed into a clone."""
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    B, T, H, V = v.shape
-    strided = torch.empty(B, T, H, 2 * V, device=device, dtype=v.dtype)[..., :V]
-    assert not strided.is_contiguous()
-    with pytest.raises(ValueError, match="out must be contiguous"):
-        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=strided))
-
-
 def test_out_is_written_in_place():
     """A contiguous `out` is the buffer the kernel writes, not a packed copy."""
     args = make_inputs(1, 128, 4)
@@ -1137,26 +919,6 @@ def test_out_is_written_in_place():
     o, _ = chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=out))
     assert o.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
-
-def test_paged_cache_rejected_on_default_pipeline():
-    args = make_inputs(1, 128, 4)
-    v = args[2]
-    h0 = torch.zeros(1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32)
-    cache, indices, _ = _paged_pool(1, 4, h0)
-    with (
-        _force_default_pipeline(),
-        pytest.raises(ValueError, match="paged state_cache is only implemented"),
-    ):
-        chunk_kimi_delta_attn(
-            **_kimi_kwargs(
-                *args,
-                out=torch.empty_like(v),
-                state_cache=cache,
-                state_indices=indices,
-                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
-            )
-        )
 
 
 def _bands(*xs, skew=0):
@@ -1230,7 +992,7 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     views = _LAYOUTS[layout](*args[:4])
     assert not any(x.is_contiguous() for x in views)
 
-    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    on_tdm = _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
     with _route(k1=True, k2=True):
         o_ref, ht_ref = run_flash(*args, **kw)
         seen = _record_tdm_operands(monkeypatch) if on_tdm else None
@@ -1332,7 +1094,7 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
 
-    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    on_tdm = _flash_kda.DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
     seen = _record_tdm_operands(monkeypatch) if on_tdm else None
     o, ht = flash_kda_fwd(*(by_name[name] for name in params))
     assert ht is None

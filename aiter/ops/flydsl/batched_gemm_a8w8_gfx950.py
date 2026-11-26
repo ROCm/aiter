@@ -35,7 +35,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
     W_SCALE_ROWS,
@@ -45,7 +45,12 @@ from .kernels.bmm_a8w8_mxscale_gfx950 import (
     xcd_swizzle_runs,
 )
 from .kernels.kernels_common import ceildiv
-from .kernels.tensor_shim import check_e8m0, current_raw_stream, ptr_arg
+from .kernels.tensor_shim import (
+    _run_compiled,
+    check_e8m0,
+    current_raw_stream,
+    ptr_arg,
+)
 
 BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 
@@ -297,9 +302,16 @@ def _constexprs(
     return bound.args[_RUNTIME_PARAMS:]
 
 
-_AOT_CACHE = FlyDSLAotCache("bmm_a8w8_mxscale_gfx950")
-
-
+@aot_factory(
+    "bmm_a8w8_mxscale_gfx950",
+    sources=[
+        "kernels/bmm_a8w8_mxscale_gfx950.py",
+        "kernels/mfma_preshuffle_pipeline.py",
+        "../../utility/mx_types.py",
+        "kernels/quant_utils.py",
+    ],
+)
+@functools.cache
 def _bound_launcher(constexprs: tuple):
     """launch_bmm_a8w8_mxscale with its Constexprs bound, so that every
     parameter left is a runtime argument the AOT cache can export."""
@@ -339,12 +351,12 @@ def _launch(tensors, m, stream, constexprs: tuple) -> None:
     both build the same cache entry. ``tensors`` are Out, XQ, WQ, x_scale,
     w_scale, split-K partials and counters; only their addresses reach the
     kernel. Under compile-only (AOT) it builds the entry without launching."""
-    _AOT_CACHE.launch(
-        (constexprs, tensors[0].device),
-        lambda: _bound_launcher(constexprs),
+    _run_compiled(
+        _bound_launcher.lazy(constexprs),
         *map(ptr_arg, tensors),
         m,
         stream,
+        specialization_key=tensors[0].device,
     )
 
 

@@ -15,7 +15,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
@@ -23,7 +23,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     gemm_a16w16,
 )
 from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
-from .kernels.tensor_shim import current_stream_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg
 
 __all__ = [
     "SKINNY_POLICY",
@@ -436,9 +436,6 @@ def flydsl_hgemm(
 # ---------------------------------------------------------------------------
 
 
-_PRESHUFFLE_AOT_CACHE = FlyDSLAotCache("preshuffle_gemm_a8")
-
-
 @functools.lru_cache(maxsize=1)
 def _get_compile_fn():
     """Import the preshuffle compiler on first use."""
@@ -446,6 +443,22 @@ def _get_compile_fn():
 
     logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
     return compile_preshuffle_gemm
+
+
+@aot_factory(
+    "preshuffle_gemm_a8",
+    sources=[
+        "kernels/preshuffle_gemm.py",
+        "kernels/mfma_preshuffle_pipeline.py",
+        "kernels/splitk_epilogue.py",
+        "kernels/communication_ops_utils.py",
+        "kernels/gemm_a16w16_gfx950_utils.py",
+    ],
+)
+@functools.cache
+def _preshuffle_launcher(**compile_kwargs):
+    """The preshuffle launcher; its compile arguments are its AOT cache key."""
+    return _get_compile_fn()(**compile_kwargs)
 
 
 # Fixed size rather than one buffer per shape: a shape-keyed cache grows without
@@ -664,15 +677,10 @@ def flydsl_preshuffle_gemm_a8(
     # Every tensor is a flat contiguous view, so the constexprs and the scale
     # dtypes determine the launcher's argument signature. The device keeps
     # the JIT path's handles apart; entries on disk are shared.
-    key = (
-        tuple(sorted(compile_kwargs.items())),
-        x_scale.dtype,
-        w_scale.dtype,
-        XQ.device,
-    )
-    # The compiler is imported only on a miss: importing it costs about 30 ms.
-    _PRESHUFFLE_AOT_CACHE.launch(
-        key, lambda: _get_compile_fn()(**compile_kwargs), *args
+    _run_compiled(
+        _preshuffle_launcher.lazy(**compile_kwargs),
+        *args,
+        specialization_key=(x_scale.dtype, w_scale.dtype, XQ.device),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

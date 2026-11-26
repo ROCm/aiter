@@ -12,10 +12,30 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
 from .common import _ptr
+
+# What the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "kernels/moe_gemm_2stage/gfx9_fp8",
+]
+
+# The variables common.py reads.
+_AOT_ENV = [
+    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+    "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+]
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_absmax", sources=_AOT_SOURCES, env=_AOT_ENV
+)
+_QUANT_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_quant_per_tensor", sources=_AOT_SOURCES, env=_AOT_ENV
+)
 
 
 @functools.cache
@@ -78,6 +98,8 @@ def flydsl_absmax():
         absmax(A, Amax, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _ABSMAX_AOT_CACHE, ())
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
         stream = torch.cuda.current_stream()
@@ -191,6 +213,8 @@ def flydsl_quant_per_tensor(torch_dtype):
         quantize_per_tensor(A, Amax, B, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _QUANT_AOT_CACHE, (torch_dtype,))
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
         stream = torch.cuda.current_stream()
