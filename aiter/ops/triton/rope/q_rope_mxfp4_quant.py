@@ -12,6 +12,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 _SCALE_GROUP = 32
+_WEIGHTS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
 def _launch_config(num_tokens: int, num_heads: int, head_size: int) -> tuple[int, int]:
@@ -36,6 +37,7 @@ def q_rope_mxfp4_quant(
     hidden: torch.Tensor | None = None,
     weights_proj: torch.Tensor | None = None,
     proj_block_k: int = 256,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """GPT-J RoPE on the last rope_dim dims -> MXFP4 query, plus scaled weights.
 
@@ -57,10 +59,15 @@ def q_rope_mxfp4_quant(
         hidden: optional [T, K] projection input, unit last stride.
         weights_proj: optional [H, K] head-major projection, unit last stride.
         proj_block_k: K tile of the in-kernel projection; must divide K.
+        weights_dtype: dtype of the returned weights: float32 (default),
+            bfloat16 or float16. A projected weight is already rounded through
+            bf16 in-kernel, so bfloat16 stores it as is, with no separate cast
+            launch for a bf16 consumer; `weights_scale` is applied in fp32
+            before the store.
 
     Returns:
         (q_fp4 u8 [T, H, head_size // 2], q_scale u8 e8m0
-        [T, H, head_size // 32], weights f32 [T, H] or None).
+        [T, H, head_size // 32], weights `weights_dtype` [T, H] or None).
     """
     project = hidden is not None or weights_proj is not None
     _LOGGER.info(
@@ -70,6 +77,10 @@ def q_rope_mxfp4_quant(
         None if weights is None else tuple(weights.shape),
         project,
     )
+    if weights_dtype not in _WEIGHTS_DTYPES:
+        raise ValueError(
+            f"weights_dtype must be one of {_WEIGHTS_DTYPES}, got {weights_dtype}"
+        )
     if q.ndim != 3 or q.stride(2) != 1:
         raise ValueError(
             f"q must be [T, H, D] with unit last stride, got "
@@ -136,7 +147,7 @@ def q_rope_mxfp4_quant(
     weights_out = None
     if weights is not None or project:
         weights_out = torch.empty(
-            (num_tokens, num_heads), dtype=torch.float32, device=q.device
+            (num_tokens, num_heads), dtype=weights_dtype, device=q.device
         )
     if num_tokens == 0:
         return q_fp4, q_scale, weights_out

@@ -1572,8 +1572,145 @@ def test_mhc_post_pre_prefill_dispatch(
 
     Inside the row range of ``aiter.ops.mhc`` (MHC_FUSED_PREFILL_*_GFX950) the call
     must launch the fused GEMM once, with 32-row, 64-wide tiles; outside it must not
-    launch it. Weights and mixes are random, so a projection or a mix read from the
-    wrong row fails the comparison with the reference.
+    launch it. For hidden size 7168 the two-kernel route takes the row counts from
+    MHC_GFX950_PREFILL_M_MIN to MHC_GFX950_PREFILL_M_MAX instead. Weights and mixes
+    are random, so a projection or a mix read from the wrong row fails the comparison
+    with the reference.
+    """
+    from aiter.ops import mhc as mhc_ops
+
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), "norm", gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), "norm", gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), "norm", gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), "norm", gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_mult * hidden_size), "norm", gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+        "norm_weight": fill((hidden_size,), "norm", gen, dtype=dtype),
+        "norm_eps": 1e-6,
+    }
+    refs = mhc_post_pre_ref(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+    )
+
+    launches = []
+    routed = []
+    fused_gemm = mhc_ops.mhc_fused_post_pre_gemm_sqrsum
+    post_project = mhc_ops.mhc_post_project_gfx950
+
+    def record(*args, **kwargs):
+        # (split_k, tile_m, tile_n, tile_k) of the launch
+        launches.append((args[1].size(0), *args[8:11]))
+        return fused_gemm(*args, **kwargs)
+
+    def record_route(*args, **kwargs):
+        routed.append(args[3].size(0))
+        return post_project(*args, **kwargs)
+
+    with (
+        patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record),
+        patch.object(mhc_ops, "mhc_post_project_gfx950", record_route),
+    ):
+        outs = aiter.mhc_fused_post_pre(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            mhc_ops.mhc_shuffle_fn(fn),
+            hc_scale,
+            hc_base,
+            w_preshuffle_bf16=True,
+            **extra_args,
+        )
+    in_range = (
+        hidden_size in mhc_ops.MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950
+        and mhc_ops.MHC_FUSED_PREFILL_M_MIN_GFX950
+        <= m
+        <= mhc_ops.MHC_FUSED_PREFILL_M_MAX_GFX950
+    )
+    two_kernel = (
+        hidden_size == 7168
+        and mhc_ops.MHC_GFX950_PREFILL_M_MIN <= m <= mhc_ops.MHC_GFX950_PREFILL_M_MAX
+    )
+    if two_kernel:
+        assert routed == [m] and not launches, (routed, launches)
+    elif in_range:
+        assert not routed, routed
+        assert len(launches) == 1 and launches[0][1:] == (32, 32, 64), launches
+    else:
+        assert not routed and not launches, (routed, launches)
+    ret = {
+        "fused_gemm": str(launches[0]) if launches else "not launched",
+        "two_kernel": "launched" if routed else "not launched",
+    }
+    for what, ref, out in zip(
+        ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
+    ):
+        # One wrong row of the largest row count here is 1.2e-4 of the elements.
+        err = assertAllclose(
+            ref, out, tol_err_ratio=1e-5, msg=f"prefill dispatch/{what}"
+        )
+        if what == "layer_input":
+            ret["err"] = err
+    return ret
+
+
+def test_mhc_prefill_launchers_raise():
+    """The two launchers of the gfx950 packed prefill route answer a tensor they
+    cannot take with RuntimeError. They are exported, so a direct call with a
+    wrong shape must not end the process."""
+    from aiter.ops import mhc as mhc_ops
+
+    m, eps = 4096, 1e-6
+    f32, b16, i32 = dtypes.fp32, dtypes.bf16, torch.int32
+
+    def z(dtype, *shape):
+        return torch.zeros(shape, dtype=dtype, device="cuda")
+
+    # hidden 4096 where the producer takes 7168, and a (m, 4, 2) post mix
+    producer = [z(f32, 4, m, 32), z(f32, 4, m, 4), z(b16, m, 4, 4096), z(b16, m, 4096)]
+    producer += [z(b16, m, 4, 4096), z(i32, 24, 16384), z(f32, m, 4), z(f32, m, 4, 4)]
+    finisher = [z(f32, m, 4, 2), z(f32, m, 4, 4), z(b16, m, 7168), z(f32, 4, m, 32)]
+    finisher += [z(f32, 4, m, 4), z(f32, 3), z(f32, 24), z(b16, m, 4, 7168)]
+    finisher += [z(b16, 7168), eps, eps, eps, eps, 2.0, 20]
+    calls = {"mhc_post_project_gfx950": producer, "mhc_finalize_gfx950": finisher}
+    for name, args in calls.items():
+        try:
+            getattr(mhc_ops, name)(*args)
+        except RuntimeError as e:
+            assert "mHC gfx950" in str(e), str(e)
+        else:
+            raise AssertionError(f"{name} accepted a tensor of the wrong shape")
+
+
+@benchmark()
+def test_mhc_post_pre_decode_dispatch(
+    m, hidden_size, hc_mult, w_preshuffle_bf16=False, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the setting of the fused post+pre GEMM below 1024 rows.
+
+    At a row count of MHC_FUSED_DECODE_CONFIG_GFX950_256 the default call must launch
+    the fused GEMM once with that row's split count and tiles; at every other row
+    count with the setting that get_mhc_fused_post_pre_config computes. A row count
+    of the table is called as it is, so the test also fails when the Gram route
+    answers there. The other row counts are called with the Gram route's table
+    emptied, because that route lists some of them. Weights and mixes are random and
+    the outputs are compared with the reference.
     """
     from aiter.ops import mhc as mhc_ops
 
@@ -1610,40 +1747,116 @@ def test_mhc_post_pre_prefill_dispatch(
     fused_gemm = mhc_ops.mhc_fused_post_pre_gemm_sqrsum
 
     def record(*args, **kwargs):
-        # (split_k, tile_m, tile_n, tile_k) of the launch
         launches.append((args[1].size(0), *args[8:11]))
         return fused_gemm(*args, **kwargs)
 
-    with patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record):
+    row = mhc_ops._mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+    # A row count of the table keeps the Gram route's table: the default call has to
+    # reach the fused GEMM there. Next to the rows that route may answer first, so
+    # its table is empty for those calls.
+    gram_rows = dict(mhc_ops.MHC_GRAM_CONFIG_GFX950_256) if row else {}
+    with patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record), patch.dict(
+        mhc_ops.MHC_GRAM_CONFIG_GFX950_256, gram_rows, clear=True
+    ):
         outs = aiter.mhc_fused_post_pre(
             layer_input,
             residual_in,
             post_layer_mix,
             comb_res_mix,
-            mhc_ops.mhc_shuffle_fn(fn),
+            mhc_ops.mhc_shuffle_fn(fn) if w_preshuffle_bf16 else fn,
             hc_scale,
             hc_base,
-            w_preshuffle_bf16=True,
+            w_preshuffle_bf16=w_preshuffle_bf16,
             **extra_args,
         )
-    in_range = (
-        hidden_size in mhc_ops.MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950
-        and mhc_ops.MHC_FUSED_PREFILL_M_MIN_GFX950
-        <= m
-        <= mhc_ops.MHC_FUSED_PREFILL_M_MAX_GFX950
+    # No row: the setting that the config function computes for this row count.
+    expected = row or mhc_ops.get_mhc_fused_post_pre_config(
+        m, hidden_size, w_preshuffle_bf16
     )
-    if in_range:
-        assert len(launches) == 1 and launches[0][1:] == (32, 32, 64), launches
-    else:
-        assert not launches, launches
-    ret = {"fused_gemm": str(launches[0]) if launches else "not launched"}
+    assert launches == [tuple(expected)], (launches, expected)
+    ret = {"split_k": expected[0], "tile_m": expected[1], "tile_k": expected[3]}
+    ret["setting"] = "table" if row else "computed"
     for what, ref, out in zip(
         ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
     ):
-        # One wrong row of the largest row count here is 1.2e-4 of the elements.
-        err = assertAllclose(
-            ref, out, tol_err_ratio=1e-5, msg=f"prefill dispatch/{what}"
+        err = assertAllclose(ref, out, msg=f"decode dispatch/{what}")
+        if what == "layer_input":
+            ret["err"] = err
+    return ret
+
+
+@benchmark()
+def test_mhc_post_pre_store_dispatch(
+    m, hidden_size, hc_mult, w_preshuffle_bf16=False, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the store policy of the unfused post + pre of the default call.
+
+    With FP32 projection weights, from 8 * 256 + 1 rows up to
+    MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 the call must pass regular stores (0) to
+    ``mhc_post``; outside that range, and with packed weights, it must leave the
+    policy to ``mhc_post`` (-1). Weights and mixes are random and the outputs are
+    compared with the reference.
+    """
+    from aiter.ops import mhc as mhc_ops
+
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), "norm", gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), "norm", gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), "norm", gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), "norm", gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_mult * hidden_size), "norm", gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+        "norm_weight": fill((hidden_size,), "norm", gen, dtype=dtype),
+        "norm_eps": 1e-6,
+    }
+    refs = mhc_post_pre_ref(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+    )
+
+    stores = []
+    post = mhc_ops.mhc_post
+
+    def record(*args, **kwargs):
+        stores.append(args[5] if len(args) > 5 else kwargs.get("store_nt", -1))
+        return post(*args, **kwargs)
+
+    with patch.object(mhc_ops, "mhc_post", record):
+        outs = aiter.mhc_fused_post_pre(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            mhc_ops.mhc_shuffle_fn(fn) if w_preshuffle_bf16 else fn,
+            hc_scale,
+            hc_base,
+            w_preshuffle_bf16=w_preshuffle_bf16,
+            **extra_args,
         )
+    regular = (
+        not w_preshuffle_bf16
+        and 8 * 256 < m <= mhc_ops.MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950
+    )
+    assert stores == [0 if regular else -1], stores
+    ret = {"store_nt": stores[0]}
+    for what, ref, out in zip(
+        ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
+    ):
+        err = assertAllclose(ref, out, tol_err_ratio=1e-5, msg=f"store dispatch/{what}")
         if what == "layer_input":
             ret["err"] = err
     return ret
@@ -1953,17 +2166,20 @@ if not args.hc_head:
             name in os.environ for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
     ):
-        # Just below the range, its first row count (odd, partial row tile), a
-        # partial row tile at the other split count, and a full grid.
+        # Just below the range, its first row count (odd, partial row tile), the
+        # row counts around the two-kernel route of hidden size 7168 (4095 and
+        # 16385 outside, 4099 with a partial row tile and an odd last row inside),
+        # and a full grid.
         df = [
             test_mhc_post_pre_prefill_dispatch(
                 m=m, hidden_size=hidden_size, hc_mult=4, seed=args.seed
             )
             for hidden_size, m in itertools.product(
-                args.hidden_size, (2048, 2049, 4099, 8192)
+                args.hidden_size, (2048, 2049, 4095, 4099, 8192, 16385)
             )
         ]
         print_json_table("mhc_post_pre prefill dispatch summary", df)
+        test_mhc_prefill_launchers_raise()
     else:
         aiter.logger.warning(
             "skip mhc_post_pre prefill dispatch cases: unmasked 256-CU gfx950 only"
@@ -2035,3 +2251,73 @@ if not args.hc_head:
         aiter.logger.warning(
             "skip mhc_post_pre gram dispatch cases: unmasked 256-CU gfx950 only"
         )
+
+
+# The table of the gfx950 decode settings: ascending row ranges below the fused bound,
+# settings that the fused GEMM has, and no row count that the Gram route lists (the
+# default call with fused RMSNorm would never ask for its setting).
+for key, rows in aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items():
+    hidden_size = key[0]
+    gram_rows = aiter.ops.mhc.MHC_GRAM_CONFIG_GFX950_256.get(key, ())
+    last = 0
+    for m_first, m_last, split_k, tile_m, tile_k in rows:
+        assert last < m_first <= m_last < 1024, rows
+        assert tile_m in (16, 32) and tile_k in (32, 64), rows
+        assert hidden_size % (split_k * tile_k) == 0, rows
+        assert hidden_size // split_k >= 2 * tile_k, rows
+        for gram_first, gram_last, *_ in gram_rows:
+            assert m_last < gram_first or gram_last < m_first, (key, rows, gram_rows)
+        last = m_last
+
+if get_gfx_runtime() == "gfx950" and get_cu_num() == 256:
+    # Per table row: its first and last row count, and the row counts next to them
+    # that no row lists (they keep the computed setting).
+    df = []
+    for (hidden_size, packed), rows in sorted(
+        aiter.ops.mhc.MHC_FUSED_DECODE_CONFIG_GFX950_256.items()
+    ):
+        listed = {m for m_first, m_last, *_ in rows for m in (m_first, m_last)}
+        nearby = {m for m_first, m_last, *_ in rows for m in (m_first - 1, m_last + 1)}
+        for m in sorted(listed | {m for m in nearby if 0 < m < 1024}):
+            df.append(
+                test_mhc_post_pre_decode_dispatch(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=4,
+                    w_preshuffle_bf16=packed,
+                    seed=args.seed,
+                )
+            )
+    print_json_table("mhc_post_pre decode dispatch summary", df)
+else:
+    aiter.logger.warning("skip mhc_post_pre decode dispatch cases: 256-CU gfx950 only")
+
+
+if (
+    get_gfx_runtime() == "gfx950"
+    and get_cu_num() == 256
+    and not any(name in os.environ for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK"))
+):
+    # FP32 projection weights keep post + pre at these row counts: the row count
+    # below the regular-store range, its first and last row counts, and the first
+    # one above it.
+    store_m_max = aiter.ops.mhc.MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950
+    df = [
+        test_mhc_post_pre_store_dispatch(
+            m=m, hidden_size=hidden_size, hc_mult=4, seed=args.seed
+        )
+        for hidden_size, m in itertools.product(
+            args.hidden_size, (2048, 2049, 4099, store_m_max, store_m_max + 1)
+        )
+    ]
+    # Packed weights keep post + pre with the store policy of mhc_post.
+    df.append(
+        test_mhc_post_pre_store_dispatch(
+            m=4099, hidden_size=5120, hc_mult=4, w_preshuffle_bf16=True, seed=args.seed
+        )
+    )
+    print_json_table("mhc_post_pre store dispatch summary", df)
+else:
+    aiter.logger.warning(
+        "skip mhc_post_pre store dispatch cases: unmasked 256-CU gfx950 only"
+    )

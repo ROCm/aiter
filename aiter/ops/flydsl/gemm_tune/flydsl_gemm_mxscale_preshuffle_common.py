@@ -593,6 +593,47 @@ kernels_list_8wave = {
 
 
 # ===========================================================================
+# 4-wave mxfp8 (gemm_a8w8_mxfp8_4wave): persistent 256x256 tile, 1x32 row scales
+# ===========================================================================
+
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_4wave import (
+    fits_shape as fits_shape_4wave_raw,
+)
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_4wave import (
+    make_mxfp8_4wave_kernel_name,
+)
+
+# Ids past the 8-wave ones; dispatch is by kernelName prefix, the base only keeps the
+# CSV rows unambiguous. Disjoint from the other pipelines' ranges (1M 8-wave, 2M
+# ``_fsk``, 3M bmm, 4M / 5M ``_pf`` / ``_pf_nt``): the tuner names a result by the first
+# pipeline that holds its id.
+KERNEL_ID_BASE_4WAVE = 6_000_000
+
+
+@dataclass
+class FourWaveKernelInstance:
+    xcd_remap: bool
+    store_nt: bool
+    split_k: int = 1
+
+    @property
+    def name(self) -> str:
+        return make_mxfp8_4wave_kernel_name(self.xcd_remap, self.store_nt)
+
+
+def fits_shape_4wave(
+    ki: FourWaveKernelInstance, M: int, N: int, K: int, w_scale_block: str = "1x32"
+) -> bool:
+    return w_scale_block == "1x32" and fits_shape_4wave_raw(M, N, K)
+
+
+kernels_list_4wave = {
+    KERNEL_ID_BASE_4WAVE + i: FourWaveKernelInstance(xcd, nt)
+    for i, (xcd, nt) in enumerate((x, n) for x in (True, False) for n in (False, True))
+}
+
+
+# ===========================================================================
 # gemm_a8w8_mxfp8_bpreshuffle (gfx950): the pipelines its tuner iterates
 # ===========================================================================
 
@@ -676,6 +717,7 @@ def _fits_8wave_w128x128(ki: EightWaveKernelInstance, M: int, N: int, K: int) ->
 MXFP8_ROW_PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("mxpsh", kernels_list, _fits_mxpsh_row),
     Pipeline("8wave", kernels_list_8wave, fits_shape_8wave),
+    Pipeline("4wave", kernels_list_4wave, fits_shape_4wave),
 )
 # The same kernels (and kernelNames) on a 32x32 w_scale, and on the blockscale
 # pair (1x128 column-major x_scale, 128x128 w_scale).
