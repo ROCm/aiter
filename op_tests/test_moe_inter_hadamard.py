@@ -189,11 +189,12 @@ def _rel(got, want):
     return float((got.float() - want.float()).norm() / want.float().norm())
 
 
-# Token counts on both sides of where AITER switches the stage-2 activation
-# from bf16 to a quantized dtype (256), so both consumers of the rotated
-# SwiGLU output run.
+# Below 256 tokens stage 2 consumes the bf16 SwiGLU output, rotated in torch.
+# From 256 tokens stage 1 quantizes it in-kernel and rotates it first; for the
+# MiniMax shape the tuned configs pick the MXMOE GEMM1 at 256, 1024 and 4096
+# tokens and the FlyDSL moe1 kernel at 512.
 @pytest.mark.skipif(not _on_gfx950(), reason="MXFP4 fused MoE needs gfx950")
-@pytest.mark.parametrize("M", [1, 64, 255, 256, 1024])
+@pytest.mark.parametrize("M", [1, 64, 255, 256, 512, 1024, 4096])
 @pytest.mark.parametrize(
     "model_dim,inter_dim,E,topk",
     [
@@ -215,6 +216,33 @@ def test_fused_moe_rotates_swiglu_output(M, model_dim, inter_dim, E, topk):
     assert err < 0.2 * _rel(got, skipped), (err, _rel(got, skipped))
 
 
+def test_fused_quant_stage1_names_widen_to_hold_a_block():
+    pytest.importorskip("flydsl")
+    from aiter.fused_moe import (
+        _flydsl_moe1_kname_with_hadamard,
+        _mxmoe_g1_kname_with_hadamard,
+    )
+
+    assert (
+        _mxmoe_g1_kname_with_hadamard(
+            "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu_xcd2", 128
+        )
+        == "flydsl_mxmoe_g1_a4w4_16x256x256_f16in_hpf_nt_swiglu_xcd2_had128"
+    )
+    assert (
+        _flydsl_moe1_kname_with_hadamard(
+            "flydsl_moe1_afp4_wfp4_bf16_t32x64x256_w3_xcd4_kw2_fp4", 128
+        )
+        == "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w3_xcd4_fp4"
+    )
+    name = "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w4_fp4"
+    assert _flydsl_moe1_kname_with_hadamard(name, 128) == name
+    with pytest.raises(NotImplementedError, match="tile_n >= 256"):
+        _flydsl_moe1_kname_with_hadamard(
+            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w3_gui_fp8", 128
+        )
+
+
 def _bench(M, model_dim, inter_dim, E, topk):
     from aiter.test_common import run_perftest
 
@@ -230,7 +258,9 @@ def _bench(M, model_dim, inter_dim, E, topk):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--tokens", type=int, nargs="+", default=[1, 64, 256, 1024])
+    parser.add_argument(
+        "-t", "--tokens", type=int, nargs="+", default=[1, 64, 256, 512, 1024, 4096]
+    )
     parser.add_argument(
         "-s",
         "--shape",

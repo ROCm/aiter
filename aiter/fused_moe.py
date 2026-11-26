@@ -4062,6 +4062,48 @@ def _mxmoe_opus_cfg_unsupported(
     return ""
 
 
+@functools.cache
+def _mxmoe_g1_kname_with_hadamard(kernel_name1: str, inter_hadamard: int) -> str:
+    """The GEMM1 variant that rotates the SwiGLU output before quantizing it.
+
+    The rotation runs on 128 columns held by one tile row, so BN128 tiles,
+    which hold 64 output columns, are widened to BN256.
+    """
+    tokens = kernel_name1.split("_")
+    for i, tok in enumerate(tokens):
+        m = re.fullmatch(r"(\d+)x(\d+)x(\d+)", tok)
+        if m and int(m.group(2)) < 256:
+            tokens[i] = f"{m.group(1)}x256x{m.group(3)}"
+    name = "_".join(tokens) + f"_had{inter_hadamard}"
+    _parse_mxfp4_g1_kname(name)
+    return name
+
+
+@functools.cache
+def _flydsl_moe1_kname_with_hadamard(kernel_name: str, inter_hadamard: int) -> str:
+    """The FlyDSL stage 1 tile wide enough to rotate its SwiGLU output.
+
+    One output row of a tile has to hold whole rotation blocks; interleaved
+    gate/up tiles hold tile_n // 2 output columns. Widened tiles drop k_wave:
+    k_wave > 1 with tile_n >= 128 produces NaNs even without the rotation.
+    """
+    moe_kernels = _get_flydsl_moe_kernels()
+    params = moe_kernels.get_flydsl_kernel_params(kernel_name)
+    if params is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernel_name}")
+    min_n = inter_hadamard * (2 if params.get("gate_mode") == "interleave" else 1)
+    if params["tile_n"] >= min_n:
+        return kernel_name
+    name = re.sub(r"_t(\d+)x\d+x(\d+)", rf"_t\g<1>x{min_n}x\g<2>", kernel_name, count=1)
+    name = re.sub(r"_kw\d+", "", name)
+    if moe_kernels.get_flydsl_kernel_params(name) is None:
+        raise NotImplementedError(
+            f"inter_hadamard={inter_hadamard} needs tile_n >= {min_n}, but "
+            f"{kernel_name} has no registered {name} variant"
+        )
+    return name
+
+
 def _is_mxmoe_opus_metadata(metadata: MOEMetadata) -> bool:
     return (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
@@ -6485,8 +6527,37 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
+    stage1 = metadata.stage1
+    rotated_in_stage1 = False
+    if inter_hadamard and stage1_func is _mxfp4_a4w4_stage1_fw:
+        stage1 = functools.partial(
+            stage1.func,
+            *stage1.args,
+            **{
+                **stage1.keywords,
+                "kernelName1": _mxmoe_g1_kname_with_hadamard(
+                    stage1.keywords["kernelName1"], inter_hadamard
+                ),
+            },
+        )
+        rotated_in_stage1 = True
+    elif (
+        inter_hadamard and stage1_func is _flydsl_stage1_wrapper and metadata.fuse_quant
+    ):
+        stage1 = functools.partial(
+            stage1.func,
+            *stage1.args,
+            **{
+                **stage1.keywords,
+                "kernelName": _flydsl_moe1_kname_with_hadamard(
+                    stage1.keywords["kernelName"], inter_hadamard
+                ),
+            },
+        )
+        extra_stage1_args["inter_hadamard"] = inter_hadamard
+        rotated_in_stage1 = True
     _stage1_call = functools.partial(
-        metadata.stage1,
+        stage1,
         a1,
         w1,
         w2,
@@ -6511,7 +6582,7 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
-    if inter_hadamard:
+    if inter_hadamard and not rotated_in_stage1:
         # Stage 2 weights were quantized in the rotated basis, so the SwiGLU
         # output has to be rotated before it is quantized or consumed in bf16.
         if (
