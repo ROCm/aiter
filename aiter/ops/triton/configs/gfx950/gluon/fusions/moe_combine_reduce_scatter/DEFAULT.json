@@ -1,0 +1,20 @@
+{
+    "WORLD_LEQ_4": {
+        "BLOCKS": 256,
+        "LAG": 2,
+        "PARTS": 1,
+        "num_warps": 16
+    },
+    "N_LEQ_5120": {
+        "BLOCKS": 256,
+        "LAG": 2,
+        "PARTS": 2,
+        "num_warps": 16
+    },
+    "any": {
+        "BLOCKS": 255,
+        "LAG": 2,
+        "PARTS": 3,
+        "num_warps": 16
+    }
+}

@@ -94,6 +94,17 @@ _M8_SHAPES = [
 ]
 
 
+# Retuned gfx950 buckets (M_LEQ_4, M_LEQ_8, M_LEQ_64) that get_x_vals() does not reach.
+_RETUNED_GATED_SHAPES = [
+    (4, 8192, 8192),  # N=16384,K=8192 M_LEQ_4
+    (64, 8192, 8192),  # N=16384,K=8192 M_LEQ_64
+]
+_RETUNED_UNGATED_SHAPES = [
+    (8, 1280, 16384),  # N=16384,K=1280 M_LEQ_8
+    (64, 1280, 16384),  # N=16384,K=1280 M_LEQ_64
+]
+
+
 def _skip_unless_gfx950():
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -101,7 +112,9 @@ def _skip_unless_gfx950():
         pytest.skip("FF-A16W16-fused configs are tuned for gfx950")
 
 
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", _M8_SHAPES)
+@pytest.mark.parametrize(
+    "batch, hidden_dim, intermediate_dim", _M8_SHAPES + _RETUNED_GATED_SHAPES
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_ff_a16w16_fused_gated_m8_launch(batch, hidden_dim, intermediate_dim, dtype):
     _skip_unless_gfx950()
@@ -120,7 +133,9 @@ def test_ff_a16w16_fused_gated_m8_launch(batch, hidden_dim, intermediate_dim, dt
     )
 
 
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", _M8_SHAPES)
+@pytest.mark.parametrize(
+    "batch, hidden_dim, intermediate_dim", _M8_SHAPES + _RETUNED_UNGATED_SHAPES
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_ff_a16w16_fused_ungated_m8_launch(batch, hidden_dim, intermediate_dim, dtype):
     _skip_unless_gfx950()
