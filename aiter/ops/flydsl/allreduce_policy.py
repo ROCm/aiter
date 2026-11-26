@@ -35,6 +35,9 @@ The one-shot window may overlap the mesh and the ring windows:
 ``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on,
 the mesh and the ring take their payloads first.
 
+A row may also give the hierarchical schedule a window (``hier``). It applies
+only on a host whose ranks split into two uniform groups.
+
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
@@ -42,10 +45,12 @@ overrides applied.
 **Level 2: which configuration**
 
 Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
-``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
+``ONESHOT_LADDER``, ``MESH_ST_LADDER``, ``RING_ST_LADDER`` and
+``HIER_ST_LADDER``. A ladder is a
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
-one engine per rung.
+one engine per rung. A hierarchical rung (``HierRung``) also picks the schedule
+of its two local laps, the mesh or the ring.
 
 **Fused all-reduce + RMSNorm**
 """
@@ -117,6 +122,16 @@ FANOUT_ORDERS = ("peer", "atom")
 # Super-tile values the mesh accepts.
 SUPER_TILES = (1, 8)
 
+# The Lamport handshake has no publish to batch, so a super-tile there is only
+# an overlap of several tiles' fanouts and polls, and 2 and 4 are worth trying.
+LAMPORT_SUPER_TILES = (1, 2, 4, 8)
+
+
+def mesh_super_tiles(handshake: str) -> tuple[int, ...]:
+    """Super-tile values the mesh accepts on *handshake*."""
+    return LAMPORT_SUPER_TILES if handshake == "lamport" else SUPER_TILES
+
+
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
@@ -137,9 +152,173 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
+# Mesh and ring algorithms.
+#
+# How a receiver learns that a peer's packet has landed.
+#
+# "flag": the sender drains its payload stores, then writes a colour into a
+# 64 B handshake sector; the receiver spins on the flag.
+#
+# "lamport": no flag. An unwritten inbox dword holds a sentinel, the sender
+# keeps its packets off that value, and the receiver polls the packet words it
+# reads until none is the sentinel, then re-arms them.
+HANDSHAKES = ("flag", "lamport")
+
+# Hierarchical algorithm. It takes either of ``HANDSHAKES`` on all three laps.
+HIER_CODECS = ("int4", "int5", "int6", "fp16")
+HIER_SUPER_TILES = (1, 8, 16, 32)
+HIER_LOCAL_SCHEDULES = ("mesh", "ring")
+# The default wire format of the hierarchical algorithm's exchange between the two
+# groups.
+HIER_X_CODEC = "int6"
+
 # How the IPC inbox is allocated. ``"auto"`` resolves to one of the others. The
 # wire protocol is identical in every mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
+
+
+# Mesh tuning knobs
+# =================
+#
+# Default-off levers of the Lamport mesh kernel, which a search tunes per rung.
+# Every default is what the kernel did before the knob existed: a rung with
+# ``DEFAULT_MESH_KNOBS`` builds the same code, under the same symbol name.
+#
+#   stripe       "cap8": a rank-tile's sectors go out in stripes of at most 8
+#                quads per destination. "full": as wide as the block's quads
+#                allow, fewer and wider store instructions.
+#   fanout       "policy": the inbox memory type's own quad order. "sector" /
+#                "peer": force the axis that runs fastest across quads.
+#   poll_sleep   ``s_sleep`` count in the Lamport spin loop (0 = none).
+#   recv_order   "batch": all packets are polled together, then dequantized.
+#                "per_source": poll and dequantize one source at a time, so the
+#                dequant of early sources overlaps the arrival of later ones.
+#   prefetch     1: the next tile's input atoms are loaded before this tile's
+#                reduce-scatter poll (super_tile 1 only).
+#   lds_bufs     2: the reduce-scatter and all-gather packs stage in separate
+#                LDS buffers, which drops one workgroup join per pack.
+#   prio         ``s_setprio`` level raised around the fanout and the poll.
+MESH_KNOB_VALUES = {
+    "stripe": ("cap8", "full"),
+    "fanout": ("policy", "sector", "peer"),
+    "poll_sleep": (0, 1, 2),
+    "recv_order": ("batch", "per_source"),
+    "prefetch": (0, 1),
+    "lds_bufs": (1, 2),
+    "prio": (0, 1, 2),
+}
+# Short key and value spellings of ``MeshKnobs.tag``.
+_KNOB_TAG_KEY = {
+    "stripe": "stripe",
+    "fanout": "fan",
+    "poll_sleep": "slp",
+    "recv_order": "ord",
+    "prefetch": "pre",
+    "lds_bufs": "lds",
+    "prio": "prio",
+}
+_KNOB_TAG_VALUE = {"per_source": "src"}
+
+
+@dataclass(frozen=True)
+class MeshKnobs:
+    """Tuning knobs of the Lamport mesh kernel; see ``MESH_KNOB_VALUES``.
+
+    ``str(knobs)`` is the ``"key=value;key=value"`` form of the non-default
+    fields (``""`` at the defaults), and ``MeshKnobs.parse`` reads it back.
+    ``tag()`` is the symbol-name suffix, ``""`` at the defaults.
+    """
+
+    stripe: str = "cap8"
+    fanout: str = "policy"
+    poll_sleep: int = 0
+    recv_order: str = "batch"
+    prefetch: int = 0
+    lds_bufs: int = 1
+    prio: int = 0
+
+    def __post_init__(self) -> None:
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            legal = MESH_KNOB_VALUES[f.name]
+            # bool is an int: ``prefetch=True`` is not a legal spelling.
+            if isinstance(value, bool) or value not in legal:
+                raise ValueError(
+                    f"mesh knob {f.name}: must be one of {legal}, got {value!r}"
+                )
+
+    def is_default(self) -> bool:
+        return self == DEFAULT_MESH_KNOBS
+
+    def _non_default(self) -> list[tuple[str, object]]:
+        return [
+            (f.name, getattr(self, f.name))
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) != f.default
+        ]
+
+    def tag(self) -> str:
+        """Symbol-name suffix: ``""`` at the defaults, else ``_k<key><value>``
+        per non-default field, in field order (``_kstripefull_kpre1``)."""
+        return "".join(
+            f"_k{_KNOB_TAG_KEY[k]}{_KNOB_TAG_VALUE.get(v, v)}"
+            for k, v in self._non_default()
+        )
+
+    def __str__(self) -> str:
+        return ";".join(f"{k}={v}" for k, v in self._non_default())
+
+    @classmethod
+    def parse(cls, text) -> MeshKnobs:
+        """``"stripe=full;prefetch=1"`` -> ``MeshKnobs``. ``""`` / ``None`` are
+        the defaults; a ``MeshKnobs`` passes through. An unknown key, a value
+        out of range or a repeated key raises."""
+        if isinstance(text, cls):
+            return text
+        if text is None or not str(text).strip():
+            return DEFAULT_MESH_KNOBS
+        values: dict = {}
+        for part in str(text).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            key, sep, raw = part.partition("=")
+            key, raw = key.strip(), raw.strip()
+            if not sep or key not in MESH_KNOB_VALUES:
+                raise ValueError(
+                    f"mesh knob {part!r}: expected key=value with key in "
+                    f"{tuple(MESH_KNOB_VALUES)}"
+                )
+            if key in values:
+                raise ValueError(f"mesh knob {key} given twice in {text!r}")
+            legal = MESH_KNOB_VALUES[key]
+            if isinstance(legal[0], int):
+                try:
+                    raw = int(raw)
+                except ValueError:
+                    raise ValueError(
+                        f"mesh knob {key}: must be one of {legal}, got {raw!r}"
+                    ) from None
+            values[key] = raw
+        return cls(**values)
+
+    def check(self, *, handshake: str, super_tile: int, where: str = "knobs") -> None:
+        """Reject a combination the kernel cannot build. The defaults pass on
+        every rung."""
+        if self.is_default():
+            return
+        if handshake != "lamport":
+            raise ValueError(
+                f"{where}: mesh knobs ({self}) need handshake='lamport', got "
+                f"{handshake!r}"
+            )
+        if self.prefetch and super_tile != 1:
+            raise ValueError(
+                f"{where}: prefetch=1 needs super_tile=1, got {super_tile}"
+            )
+
+
+DEFAULT_MESH_KNOBS = MeshKnobs()
 
 # Defaults
 # ========
@@ -165,6 +344,7 @@ RS_INT6_MIN_WORLD = 4
 _TWO_SHOT_CODECS = {
     "mesh": (MESH_CODECS, MESH_CODECS),
     "ring": (RS_CODECS, AG_CODECS),
+    "hier": (HIER_CODECS, HIER_CODECS),
 }
 
 
@@ -254,13 +434,94 @@ class TwoShotRung:
 
     ``super_tile`` is the number of tiles a block publishes at once, and
     ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
-    ``super_tile`` it sets the size of the IPC inbox.
+    ``super_tile`` it sets the size of the IPC inbox. ``handshake`` is one of
+    ``HANDSHAKES``; every rung of one ladder names the same one, because one
+    ``FlyQuickAllReduce`` runs one handshake. ``knobs`` are the Lamport mesh
+    tuning knobs (``MeshKnobs``); the defaults leave the kernel as it was, and
+    the ring takes only the defaults.
     """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
     block: int
+    handshake: str = "flag"
+    knobs: MeshKnobs = DEFAULT_MESH_KNOBS
+
+    def __post_init__(self) -> None:
+        self.knobs.check(
+            handshake=self.handshake,
+            super_tile=self.super_tile,
+            where="TwoShotRung.knobs",
+        )
+
+    @property
+    def engine_key(self) -> tuple:
+        """The host's engine key, ``(super_tile, block, knobs)``: rungs that
+        share it share one engine, at the first such rung's ``grid_cap``."""
+        return (self.super_tile, self.block, self.knobs)
+
+
+@dataclass(frozen=True)
+class HierRung(TwoShotRung):
+    """A hierarchical rung: a ``TwoShotRung`` plus the schedule of each local
+    lap, ``local_rs`` for the reduce-scatter and ``local_ag`` for the
+    all-gather inside a group, ``"mesh"`` or ``"ring"``.
+
+    The choice follows the TP``G`` policy of the same platform: the mesh's one
+    hop wins on small payloads, the ring's ``G - 1`` single-destination hops
+    on large ones.
+
+    ``rs_codec``, ``x_codec`` and ``ag_codec`` are the rung's wire formats,
+    ``None`` for the default: ``HIER_X_CODEC`` on the exchange and, on a local
+    lap, that of a TP``G`` schedule like its own (``default_codecs``; a ring
+    reduce-scatter requantizes its partial at every hop, so it is INT6 from
+    ``RS_INT6_MIN_WORLD``). Codecs a caller passes to the engine override
+    them.
+
+    ``handshake`` is as on ``TwoShotRung``, for all three laps. The
+    hierarchical kernel has no tuning knobs, so ``knobs`` must be the defaults.
+    """
+
+    local_rs: str = "mesh"
+    local_ag: str = "mesh"
+    rs_codec: str | None = None
+    x_codec: str | None = None
+    ag_codec: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.knobs.is_default():
+            raise ValueError(
+                f"HierRung.knobs: the hierarchical kernel takes no mesh tuning "
+                f"knobs, got {str(self.knobs)!r}"
+            )
+        for name in ("local_rs", "local_ag"):
+            if getattr(self, name) not in HIER_LOCAL_SCHEDULES:
+                raise ValueError(
+                    f"{name} must be one of {HIER_LOCAL_SCHEDULES}, "
+                    f"got {getattr(self, name)!r}"
+                )
+        for name in ("rs_codec", "x_codec", "ag_codec"):
+            value = getattr(self, name)
+            if value is not None and value not in HIER_CODECS:
+                raise ValueError(
+                    f"{name} must be one of {HIER_CODECS} or None, got {value!r}"
+                )
+
+    @property
+    def engine_key(self) -> tuple:
+        """``(super_tile, block, local_rs, local_ag, rs_codec, x_codec,
+        ag_codec)``."""
+        return (
+            self.super_tile,
+            self.block,
+            self.local_rs,
+            self.local_ag,
+            self.rs_codec,
+            self.x_codec,
+            self.ag_codec,
+        )
 
 
 @dataclass(frozen=True)
@@ -290,13 +551,31 @@ class FusedTwoShotRung:
     ``low_latency`` picks the mesh's low-latency build: the residual is loaded
     ahead of the exchanges, and two workgroups per CU stay resident instead of
     one, so ``grid_cap`` may go up to twice the CU count. It needs
-    ``super_tile=1`` and a width whose block is ``BLOCK``.
+    ``super_tile=1`` and a width whose block is ``BLOCK``. ``handshake`` is as
+    on ``TwoShotRung``: one of ``HANDSHAKES``, the same on every rung of a
+    width's ladder. ``knobs`` are the Lamport mesh tuning knobs (``MeshKnobs``;
+    in the JSON file a ``"knobs": "stripe=full;fanout=peer"`` string): every
+    knob but ``prefetch`` works with a fused build, low-latency included. The
+    ring takes only the defaults.
     """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
     low_latency: bool = False
+    handshake: str = "flag"
+    knobs: MeshKnobs = DEFAULT_MESH_KNOBS
+
+    def __post_init__(self) -> None:
+        self.knobs.check(
+            handshake=self.handshake,
+            super_tile=self.super_tile,
+            where="FusedTwoShotRung.knobs",
+        )
+        if self.knobs.prefetch:
+            # The fused epilogue's prefetch result is not carried across the
+            # loop the knob builds; see ``make_quick_allreduce_mesh_kernel``.
+            raise ValueError("FusedTwoShotRung.knobs: prefetch=1 is a plain-path knob")
 
 
 def select_rung(ladder, nbytes: int):
@@ -320,6 +599,7 @@ class AllReduceAlgorithm(enum.Enum):
     OneShot = "oneshot"
     TwoShotMesh = "mesh"
     TwoShotRing = "ring"
+    TwoShotHierarchical = "hier"
 
 
 @dataclass(frozen=True)
@@ -382,6 +662,12 @@ class FamilyPolicy:
     The mesh and the ring are quantized, so they run only with quantization on
     (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
     overlap. The one-shot is exact and runs in both modes.
+
+    ``hier`` is the window of the hierarchical schedule, which needs the ranks
+    to split into two uniform groups (``PeerTopology.is_hierarchical``). It
+    applies only once ``with_topology(hierarchical=True)`` has set
+    ``hierarchical``, and then it takes over from the mesh at ``hier.min`` and
+    takes the start of the ring's window.
     """
 
     arch: str
@@ -390,6 +676,8 @@ class FamilyPolicy:
     oneshot: Window | None
     mesh: Window | None
     ring: Window | None
+    hier: Window | None = None
+    hierarchical: bool = False
 
     def __post_init__(self):
         if self.arch not in SUPPORTED_ARCHS:
@@ -425,6 +713,8 @@ class FamilyPolicy:
             w = None
         elif algorithm == AllReduceAlgorithm.TwoShotMesh:
             w = self.mesh
+        elif algorithm == AllReduceAlgorithm.TwoShotHierarchical:
+            w = self.hier if self.hierarchical else None
         else:
             w = self.ring
         return None if w is None or w.is_empty else w
@@ -440,9 +730,10 @@ class FamilyPolicy:
 
     def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
         """The algorithm that runs *nbytes*, or None for
-        ``cross_device_reduce`` or RCCL. The mesh and the ring come first, as
-        in dispatch."""
+        ``cross_device_reduce`` or RCCL. The quantized schedules come first,
+        as in dispatch, and the hierarchical one first of them."""
         for alg in (
+            AllReduceAlgorithm.TwoShotHierarchical,
             AllReduceAlgorithm.TwoShotMesh,
             AllReduceAlgorithm.TwoShotRing,
             AllReduceAlgorithm.OneShot,
@@ -451,6 +742,31 @@ class FamilyPolicy:
             if w is not None and w.contains(nbytes):
                 return alg
         return None
+
+    def with_topology(self, *, hierarchical: bool) -> FamilyPolicy:
+        """This policy on a host whose ranks do (or do not) split into two
+        uniform groups. Splitting enables ``hier``, ends the mesh where
+        ``hier`` starts, and starts the ring where ``hier`` ends, so that no
+        ring engine is built for payloads it would never run."""
+        if not hierarchical or self.hier is None or self.hier.is_empty:
+            return dataclasses.replace(self, hierarchical=False)
+        mesh = self.mesh
+        if mesh is not None and not mesh.is_empty:
+            if self.hier.min <= mesh.min:
+                mesh = None
+            else:
+                end = (
+                    self.hier.min if mesh.max is None else min(mesh.max, self.hier.min)
+                )
+                mesh = Window(mesh.min, end)
+        ring = self.ring
+        if ring is not None and not ring.is_empty:
+            if self.hier.max is None:
+                ring = None
+            else:
+                lo = max(ring.min, self.hier.max)
+                ring = Window(lo, None if ring.max is None else max(ring.max, lo))
+        return dataclasses.replace(self, hierarchical=True, mesh=mesh, ring=ring)
 
     def describe(self, *, quantized: bool) -> str:
         """The enabled windows, for logs."""
@@ -532,16 +848,24 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="pcie",
         world_size=4,
         oneshot=Window(0, 896 * KiB),
-        mesh=Window(128 * KiB, 18 * MiB),
-        ring=Window(18 * MiB, None),
+        # The Lamport mesh leads the flag ring up to 24 MiB (PCIe search on
+        # one socket's four GPUs, 2026-11-19).
+        mesh=Window(128 * KiB, 24 * MiB),
+        ring=Window(24 * MiB, None),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="pcie",
         world_size=8,
         oneshot=Window(0, 1216 * KiB),
-        mesh=Window(96 * KiB, 24 * MiB),
-        ring=Window(24 * MiB, None),
+        # The mesh/ring is the fallback of a host that does not split into two
+        # groups, or whose topology cannot be read.
+        mesh=Window(96 * KiB, 256 * MiB),
+        ring=Window(256 * MiB, None),
+        # On a host that splits into two groups the hierarchical algorithm
+        # takes over from the Lamport mesh at 28 MiB (2-8 % ahead up to
+        # 128 MiB; the mesh is ahead below).
+        hier=Window(28 * MiB, None),
     ),
 )
 
@@ -638,16 +962,38 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     ),
 }
 
+# The one knob the TP2/TP4 Lamport rungs set: one fanout stripe per rank-tile.
+_STRIPE_FULL = MeshKnobs(stripe="full")
+
 # Mesh, ``TwoShotRung``.
 #
 #   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #           Block 512 from 4 MiB.
-#         gfx950: one b256 rung per TP.
-#           - TP2 ST=1 cap512
-#           - TP4 ST=1 cap1024
-#           - TP8 ST=8 cap384:
-#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere.
+#         gfx950: the Lamport handshake (``HANDSHAKES``), which has no
+#           publish to batch. Rungs and ``MeshKnobs`` picked by a knob search
+#           (Step 0, a search over knobs x block x ST x cap per TP and size,
+#           leave-one-out, then a dense size sweep for the switch points). A
+#           rung's super-tile runs ST=1 until the tiles outnumber its grid.
+#           - TP2: b128 ST=8 cap256, b256 ST=8 cap384 from 4 MiB (both
+#             stripe=full), b256 ST=1 cap256 from 12 MiB. Cap 384 takes the
+#             8-12 MiB payloads past cap 256's second pass (1.07-1.09x).
+#           - TP4 stripe=full: b128 ST=1 cap1024, b256 ST=8 cap768 from
+#             4.5 MiB, b128 again from 10 MiB; b256 ST=1 cap1024 (default
+#             knobs) from 32 MiB.
+#           - TP8 cap384: b128 ST=1, then b256 ST=2 fanout=peer prio=1 from
+#             4 MiB. ST=2 beats ST=8 by 2-11 % from 14 MiB and ST=1 by 4-5 %
+#             from 80 MiB, and ties both below.
+#           Against the previous Lamport ladder: 1.02-1.06x at 2-4 MiB,
+#           1.07-1.09x at TP2 8-9 MiB, 1.03-1.11x at TP8 from 28 MiB.
+#   PCIe  The Lamport handshake, with rungs and ``MeshKnobs`` from a knob
+#         search (2026-11-19; a portfolio search at six anchor payloads from
+#         256 KiB to 128 MiB per TP, then a dense 128 KiB-128 MiB sweep of the
+#         winners and the former flag rungs, fitted to at most four rungs).
+#         Against the flag ladders it replaces, per size: 1.03-1.19x at TP2,
+#         0.95-1.52x at TP4 (ties from 12 MiB up) and 1.4-2.4x at TP8. The mesh runs ST=1 almost
+#         everywhere (TP2 ST=2 from 12 MiB); the large rungs use ``fanout=peer``
+#         or a poll sleep, the small ones ``stripe=full``, ``lds_bufs=2`` and
+#         ``prio``. The search ran on one socket's GPUs for TP2 and TP4.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -665,25 +1011,169 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=8,
+            grid_cap=256,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB,
+            super_tile=8,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=12 * MiB,
+            super_tile=1,
+            grid_cap=256,
+            block=256,
+            handshake="lamport",
+        ),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=1024,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB + 512 * KiB,
+            super_tile=8,
+            grid_cap=768,
+            block=256,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=10 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=32 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=256,
+            handshake="lamport",
+        ),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
+        TwoShotRung(
+            min_bytes=0, super_tile=1, grid_cap=384, block=128, handshake="lamport"
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB,
+            super_tile=2,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", prio=1),
+        ),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=384,
+            block=128,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", fanout="sector", lds_bufs=2),
+        ),
+        TwoShotRung(
+            min_bytes=3 * MiB,
+            super_tile=1,
+            grid_cap=128,
+            block=256,
+            handshake="lamport",
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=12 * MiB,
+            super_tile=2,
+            grid_cap=128,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1, recv_order="per_source", lds_bufs=2, prio=2),
+        ),
     ),
     ("gfx950", "pcie", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=768 * KiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", lds_bufs=2, prio=1),
+        ),
+        TwoShotRung(
+            min_bytes=2 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1, lds_bufs=2),
+        ),
+        TwoShotRung(
+            min_bytes=6 * MiB,
+            super_tile=1,
+            grid_cap=128,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", poll_sleep=2, lds_bufs=2, prio=1),
+        ),
+        TwoShotRung(
+            min_bytes=8 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=2, lds_bufs=2),
+        ),
     ),
     ("gfx950", "pcie", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=128,
+            block=256,
+            handshake="lamport",
+            knobs=MeshKnobs(stripe="full", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=1536 * KiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", lds_bufs=2, prio=2),
+        ),
+        TwoShotRung(
+            min_bytes=96 * MiB,
+            super_tile=1,
+            grid_cap=64,
+            block=512,
+            handshake="lamport",
+            knobs=MeshKnobs(poll_sleep=1),
+        ),
     ),
 }
 
@@ -714,12 +1204,42 @@ RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
 }
 
+# Hierarchical, ``HierRung``. Only for hosts whose ranks split into two
+# uniform groups, and only from its window's start, 28 MiB, where it overtakes
+# the Lamport mesh. Rungs from the same search as the PCIe mesh's (2026-11-19):
+# the exchange runs INT5, a mesh reduce-scatter and a ring all-gather up to
+# 96 MiB, then the INT6 exchange between mesh laps at ST=8.
+HIER_ST_LADDER: dict[tuple[str, str, int], tuple[HierRung, ...]] = {
+    ("gfx950", "pcie", 8): (
+        HierRung(
+            min_bytes=0,
+            super_tile=16,
+            grid_cap=256,
+            block=512,
+            handshake="lamport",
+            local_rs="mesh",
+            local_ag="ring",
+            rs_codec="int4",
+            x_codec="int5",
+            ag_codec="int5",
+        ),
+        HierRung(
+            min_bytes=96 * MiB,
+            super_tile=8,
+            grid_cap=256,
+            block=256,
+            handshake="lamport",
+        ),
+    ),
+}
+
 # The ladder table of each algorithm. A table has a row exactly where the
 # policy table gives its algorithm a window.
 LADDERS: dict[AllReduceAlgorithm, dict] = {
     AllReduceAlgorithm.OneShot: ONESHOT_LADDER,
     AllReduceAlgorithm.TwoShotMesh: MESH_ST_LADDER,
     AllReduceAlgorithm.TwoShotRing: RING_ST_LADDER,
+    AllReduceAlgorithm.TwoShotHierarchical: HIER_ST_LADDER,
 }
 
 
@@ -754,6 +1274,14 @@ def ring_st_ladder(
     """The ring rungs for *(arch, link, world_size)*. *arch* defaults to this
     host's."""
     return _ladder(RING_ST_LADDER, "ring", arch, link, world_size)
+
+
+def hier_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[HierRung, ...]:
+    """The hierarchical rungs for *(arch, link, world_size)*. *arch* defaults
+    to this host's."""
+    return _ladder(HIER_ST_LADDER, "hier", arch, link, world_size)
 
 
 # Host and environment
@@ -802,6 +1330,7 @@ _WINDOW_ENV = {
     AllReduceAlgorithm.OneShot: "ONESHOT",
     AllReduceAlgorithm.TwoShotMesh: "MESH",
     AllReduceAlgorithm.TwoShotRing: "RING",
+    AllReduceAlgorithm.TwoShotHierarchical: "HIER",
 }
 
 
@@ -826,7 +1355,7 @@ def _has_ladder(alg: AllReduceAlgorithm, key: tuple, *, fused: bool) -> bool:
         AllReduceAlgorithm.OneShot: FUSED_ONESHOT_LADDER,
         AllReduceAlgorithm.TwoShotMesh: FUSED_MESH_ST_LADDER,
         AllReduceAlgorithm.TwoShotRing: FUSED_RING_ST_LADDER,
-    }[alg]
+    }.get(alg, {})
     return any(k[:3] == key for k in table)
 
 
@@ -853,6 +1382,7 @@ def apply_env_overrides(
         (AllReduceAlgorithm.OneShot, "oneshot"),
         (AllReduceAlgorithm.TwoShotMesh, "mesh"),
         (AllReduceAlgorithm.TwoShotRing, "ring"),
+        (AllReduceAlgorithm.TwoShotHierarchical, "hier"),
     ):
         window = _override(getattr(policy, field), *bounds[alg])
         if (
@@ -1152,10 +1682,21 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles, *, low_latency: bool):
+def _two_shot_check(
+    super_tiles, *, low_latency: bool, by_handshake=None, knobs: bool = False
+):
+    """The rung check of a fused family. *by_handshake*, if given, maps a
+    handshake to the super-tiles legal on it, and replaces *super_tiles*."""
+
     def check(rung: FusedTwoShotRung, where: str) -> None:
-        _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
+        legal = super_tiles if by_handshake is None else by_handshake(rung.handshake)
+        _check_in(rung.super_tile, legal, f"{where}.super_tile")
         _check_grid_cap(rung, where)
+        if rung.knobs != DEFAULT_MESH_KNOBS and not knobs:
+            raise ValueError(
+                f"{where}.knobs: only a mesh rung takes tuning knobs, got "
+                f"{str(rung.knobs)!r}"
+            )
         if not isinstance(rung.low_latency, bool):
             msg = f"{where}.low_latency: must be true or false"
             raise ValueError(msg)  # noqa: TRY004
@@ -1164,6 +1705,11 @@ def _two_shot_check(super_tiles, *, low_latency: bool):
                 f"{where}.low_latency: only a mesh rung with super_tile=1 can be a "
                 "low-latency build"
             )
+        if rung.handshake not in HANDSHAKES:
+            raise ValueError(
+                f"{where}.handshake: must be one of {HANDSHAKES}, got "
+                f"{rung.handshake!r}"
+            )
 
     return check
 
@@ -1171,7 +1717,15 @@ def _two_shot_check(super_tiles, *, low_latency: bool):
 # The rung record and the rung check of each family in the file.
 _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
-    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, low_latency=True)),
+    "mesh": (
+        FusedTwoShotRung,
+        _two_shot_check(
+            SUPER_TILES,
+            low_latency=True,
+            by_handshake=mesh_super_tiles,
+            knobs=True,
+        ),
+    ),
     "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
 }
 
@@ -1189,7 +1743,21 @@ def _parse_rungs(raw, cls, check, where: str) -> tuple:
         values = {name: fields[name] for name in names}
         values.update({k: fields.get(k, v) for k, v in optional.items()})
         values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
-        rung = cls(**values)
+        if "knobs" in fields:
+            raw_knobs = fields["knobs"]
+            if not isinstance(raw_knobs, str):
+                raise ValueError(
+                    f"{rw}.knobs: expected a string like 'stripe=full;fanout=peer', "
+                    f"got {raw_knobs!r}"
+                )
+            try:
+                values["knobs"] = MeshKnobs.parse(raw_knobs)
+            except ValueError as exc:
+                raise ValueError(f"{rw}.knobs: {exc}") from None
+        try:
+            rung = cls(**values)
+        except ValueError as exc:
+            raise ValueError(f"{rw}: {exc}") from None
         check(rung, rw)
         rungs.append(rung)
     floors = [r.min_bytes for r in rungs]
@@ -1284,6 +1852,12 @@ def load_fused_ladders(path: str) -> FusedLadders:
             for hidden, entry, ew in entries:
                 _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
                 rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                named = {r.handshake for r in rungs if hasattr(r, "handshake")}
+                if len(named) > 1:
+                    raise ValueError(
+                        f"{ew}: every rung must name one handshake, got "
+                        f"{sorted(named)}"
+                    )
                 if link != "xgmi" and any(
                     getattr(r, "low_latency", False) for r in rungs
                 ):

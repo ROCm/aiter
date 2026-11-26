@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Transport parts that the one-shot, mesh and ring all-reduce kernels share.
+"""Transport parts that the one-shot, mesh, ring and hierarchical all-reduce
+kernels share.
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
 store and load primitives, and the LDS staging factory. The limits and the
@@ -11,7 +12,7 @@ policy records are in ``aiter.ops.flydsl.allreduce_policy``.
 import logging
 
 import flydsl.expr as fx
-from flydsl.expr import rocdl
+from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
@@ -139,6 +140,28 @@ def _i32_to_bytes(i32_off):
     return fx.Int64(i32_off) * fx.Int64(I32_BYTES)
 
 
+def fanout_stripes(n_sectors, width):
+    """``[(first sector, width)]`` of the stripes of up to *width* sectors that
+    cover a rank-tile of *n_sectors* 64 B sectors."""
+    return [(b, min(width, n_sectors - b)) for b in range(0, n_sectors, width)]
+
+
+def fanout_quad(quad_id, n_push, width, sector_fastest):
+    """``(n_quads, dest, sector_in_stripe)`` of a quad in one fanout stripe.
+
+    One quad per (destination, sector) of a stripe, the quads past ``n_quads``
+    idle. Either order is a bijection of the pairs onto quads: *sector_fastest*
+    puts consecutive quads on consecutive destinations of one sector, else on
+    consecutive sectors of one destination. Idle quads get destination 0, so
+    the result is always safe to index with.
+    """
+    n_quads = fx.Int32(n_push * width)
+    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
+    if sector_fastest:
+        return n_quads, safe % fx.Int32(n_push), safe // fx.Int32(n_push)
+    return n_quads, safe // fx.Int32(width), safe % fx.Int32(width)
+
+
 def _to_sgpr_i64(addr):
     """Copy a wave-uniform i64 from vector to scalar registers."""
     return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
@@ -219,6 +242,23 @@ def _poll_v4i32(addr_i64):
         for h in range(2)
     ]
     return fx.Vector.from_elements(halves, fx.Int64).bitcast(fx.Int32)
+
+
+# Lamport handshake
+# =================
+#
+# An unwritten inbox dword holds the sentinel; the inbox starts filled with
+# ``LAMPORT_FILL_BYTE``. The protocol and the receive and re-arm helpers of the
+# mesh, ring and hierarchical kernels are in ``quick_allreduce_lamport``.
+LAMPORT_SENTINEL = -1
+LAMPORT_FILL_BYTE = 0xFF
+
+
+def _lds_free():
+    """Join the workgroup once this wave's LDS reads have landed, so the next
+    pack cannot overwrite rows that a push still reads."""
+    rocdl.s_waitcnt(lgkmcnt=0)
+    gpu.barrier()
 
 
 def _buffer_ptr(addr_i64, elem_ty, alignment, num_records_bytes=None):

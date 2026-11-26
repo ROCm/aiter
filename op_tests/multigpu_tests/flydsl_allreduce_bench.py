@@ -423,16 +423,18 @@ RMS_EPS = 1e-6
 CANDIDATE_KNOBS = {
     ("oneshot", "ar"): ("atoms", "grid_cap", "fanout", "block"),
     ("oneshot", "ar_rmsnorm"): ("atoms", "grid_cap", "fanout", "block", "split"),
-    ("mesh", "ar"): ("super_tile", "grid_cap", "block"),
-    ("ring", "ar"): ("super_tile", "grid_cap", "block"),
+    ("mesh", "ar"): ("super_tile", "grid_cap", "block", "handshake", "tuning"),
+    ("ring", "ar"): ("super_tile", "grid_cap", "block", "handshake"),
     ("mesh", "ar_rmsnorm"): (
         "super_tile",
         "grid_cap",
         "block",
         "atoms_per_row",
         "low_latency",
+        "handshake",
+        "tuning",
     ),
-    ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row"),
+    ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row", "handshake"),
 }
 _CANDIDATE_COLUMNS = (
     "name",
@@ -446,10 +448,12 @@ _CANDIDATE_COLUMNS = (
     "super_tile",
     "atoms_per_row",
     "low_latency",
+    "handshake",
+    "tuning",
     "sets",
 )
 # Columns a candidate file may leave out; a missing one is empty on every row.
-_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency",)
+_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency", "handshake", "tuning")
 
 
 @dataclass(frozen=True)
@@ -474,13 +478,18 @@ def load_candidates(
 
     A candidate file is a CSV with the columns ``name, operation, algorithm``,
     one column per knob (``atoms, grid_cap, fanout, block, split, super_tile,
-    atoms_per_row``, and the optional ``low_latency``, 0 or 1) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
+    atoms_per_row``, the optional ``low_latency``, 0 or 1, and the optional
+    ``handshake``, ``flag`` or ``lamport``, and the optional ``tuning``, the
+    Lamport mesh knobs as ``key=value;key=value``, ``MeshKnobs.parse``) and
+    ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
     ``algorithm`` is ``oneshot``, ``mesh`` or ``ring``. A knob cell is empty
     when the row leaves it to the engine, and a row may only pin the knobs of
     its algorithm and operation (``CANDIDATE_KNOBS``). ``sets`` is a list of
     tags separated by ``;`` that ``--candidate-set`` selects on. Names are
     unique: each is a column prefix in the bench tables.
     """
+    from aiter.ops.flydsl.allreduce_policy import MeshKnobs
+
     df = pd.read_csv(path, dtype=str, keep_default_na=False, comment="#")
     for col in _OPTIONAL_CANDIDATE_COLUMNS:
         if col not in df.columns:
@@ -508,8 +517,15 @@ def load_candidates(
                     f"{path} row {i} ({row['name']}): {col} is not a knob of "
                     f"{key[0]} {key[1]}"
                 )
-            if col == "fanout":
+            if col in ("fanout", "handshake"):
                 knobs[col] = cell
+            elif col == "tuning":
+                try:
+                    knobs[col] = MeshKnobs.parse(cell)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path} row {i} ({row['name']}): tuning: {exc}"
+                    ) from exc
             elif col == "low_latency":
                 if cell not in ("0", "1"):
                     raise ValueError(
@@ -587,7 +603,8 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
 
 
 FUSED_DEFAULT_LADDER_HIDDENS = (2048, 4096, 5120, 7168, 8192)
-# The payload an unbounded dispatch window is cut at.
+# The payload an unbounded dispatch window is cut at, unless a ladder has a rung
+# starting at or above it.
 FUSED_WALK_TOP_BYTES = 64 << 20
 
 
@@ -617,8 +634,7 @@ def fused_ladder_cases(
     )
     if window is None:
         return []
-    lo, hi = window.inclusive_range()
-    hi = min(hi, top_bytes)
+    lo, window_hi = window.inclusive_range()
     kw = {"world_size": world_size, "link": link}
     ladder_of = {
         "oneshot": fp.fused_oneshot_ladder,
@@ -630,10 +646,13 @@ def fused_ladder_cases(
     for hidden in hiddens:
         row = hidden * 2
         ladder = ladder_of(**kw, hidden=hidden)
-        ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
+        # The cut never hides a rung: the top rung gets at least one row past its
+        # start.
+        hi_h = min(window_hi, max(top_bytes, ladder[-1].min_bytes + row))
+        ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi_h]
         for rung, end in zip(ladder, ends):
             first = -(-max(lo, rung.min_bytes, 1) // row) * row
-            last = min(hi, end) // row * row
+            last = min(hi_h, end) // row * row
             if first > last:
                 continue
             for nbytes in sorted({first, last}):

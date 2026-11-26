@@ -12,10 +12,12 @@ node.
 | `one_shot_allreduce_rmsnorm.py` | The one-shot's residual-add + RMSNorm epilogue, its row geometry (`fused_*`) and the split-row exchange. |
 | `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
 | `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
+| `quick_allreduce_hier.py` | The quantized **hierarchical** kernel, for ranks that split into two groups (the CPU sockets of a PCIe host): a reduce-scatter in each group, an exchange between partner ranks, an all-gather in each group. Each local lap runs the mesh or the ring. |
 | `quick_allreduce_epilogue.py` | The plain epilogue of the mesh and the ring, and the hooks every mesh or ring epilogue implements. |
 | `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `quick_allreduce_lamport.py` | The Lamport handshake's receive (poll and spin), re-arm and post-push release, which the mesh, the ring and the hierarchical kernel share. Each kernel keeps its own buffer count and re-arm timing. |
 | `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
 The host classes are in `aiter/ops/flydsl/`:
@@ -25,7 +27,7 @@ The host classes are in `aiter/ops/flydsl/`:
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
-| `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+| `comm_collectives_host_shared.py` | IPC inbox setup, link and socket-group detection (`probe_peer_topology`) and other host helpers. |
 
 The dispatchers are in `aiter/dist/device_communicators/`:
 
@@ -44,6 +46,7 @@ The dispatchers are in `aiter/dist/device_communicators/`:
 | One-shot | 1 | `(N-1)*S` | Exact: fp32 accumulate, one bf16 rounding | Small payloads (decode) |
 | Mesh | 2 | `2(N-1)/N*S` | INT4, INT5, INT6 or FP16 on the wire | Medium and large payloads |
 | Ring | `2(N-1)` | `2(N-1)/N*S` | INT4, INT6 or FP16 on the wire, per lap | Large payloads, mostly on PCIe |
+| Hierarchical | 3 (mesh laps) to `2G-1` (ring laps) | `2(G-1)/G*S` inside the group, `S/G` to the partner | INT4, INT5, INT6 or FP16 on the wire, per lap | Medium and large payloads on a two-socket PCIe host |
 
 ### One-shot
 
@@ -66,6 +69,37 @@ The ring is also a two-shot all-reduce. The ranks make a cycle. In each step,
 a rank pushes one contiguous run of data into the inbox of its successor only.
 This is better on PCIe, where each GPU has one shared x16 uplink.
 
+### Hierarchical
+
+For hosts whose GPUs split into two uniform groups of `G`, such as the two CPU
+sockets of the MI350P host (GPUs 0-3 and 4-7). Ranks at the same position in
+the two groups are partners. Three laps: a reduce-scatter inside each group,
+an exchange of each rank's partial sum with its partner, and an all-gather
+inside each group. Only the exchange crosses the groups, on `G` concurrent
+pair streams; the mesh pushes to every remote peer, and the ring sends all of
+its bytes over one crossing stream. The default codecs are INT4, INT6 for the
+exchange, and INT4: INT4 on the exchange too costs about 1.8 dB, which puts it
+under the mesh.
+
+Each local lap runs one of two schedules inside the group, picked per rung of
+`HIER_ST_LADDER` (`HierRung.local_rs`, `HierRung.local_ag`), or pinned with
+`FlyQuickAllReduce(local_rs=..., local_ag=...)`:
+
+* `mesh`: one hop to all `G-1` other ranks of the group.
+* `ring`: `G-1` hops to the next rank of the group, each one contiguous run
+  into one inbox. The reduce-scatter quantizes the running partial sum again
+  at each hop, so a ring reduce-scatter left to its default codec runs INT6,
+  as a TP`G` ring does. The all-gather forwards the bytes it received.
+
+On a host that splits GPUs into two socket groups, `hier` takes the quantized
+payloads from its window's floor (28 MiB on PCIe TP8) and the mesh runs below.
+
+Each rank also writes its own exchange packet into its own inbox, so both
+partners add the same two packets in the same order and every rank ends with
+the same bits. The exchange slots are double-buffered: a partner can run a
+super-tile group ahead, because its next local reduce-scatter does not wait
+for us.
+
 ### Mesh and ring compared
 
 | Item | Mesh | Ring |
@@ -83,6 +117,65 @@ the received bytes without a change, so it adds only one quantization.
 After the all-gather, every rank holds the same bits. Each rank decodes every
 chunk from the packets that the lap sends, and the owner of a chunk decodes
 its own chunk from the packet that it sent.
+
+### Handshake: flag or Lamport
+
+The mesh and the ring tell a receiver that a packet has landed in one of two
+ways (`TwoShotRung.handshake`, or the `handshake` argument of
+`FlyQuickAllReduce`):
+
+* `flag`: the sender drains its payload stores (`vmcnt(0)`, a barrier, and on
+  a cacheable inbox an L2 writeback), then writes a colour into a 64 B sector
+  at the tail of the slot. The receiver spins on that sector.
+* `lamport`: no flag. An unwritten inbox dword holds a sentinel, all ones, and
+  the sender keeps its packets off that value (`lamport_fix` in
+  `quick_allreduce_codec.py`). Each thread polls the packet words that it
+  reads until none is the sentinel, then writes the sentinel back. This
+  removes the drain, the flag store and two barriers from each lap. The poll,
+  the re-arm and the release are in `quick_allreduce_lamport.py`.
+
+`lamport_fix` keeps every polled dword off the sentinel, per plane:
+
+* The scale dword (four E5M2 bytes) cannot be the sentinel, because the scale
+  encode clamps its exponent field to 30. A finite fp16 extremum gives at most
+  28; `-Inf`, `+Inf` and NaN land on the clamp, not on `0xFF`, which four
+  `-Inf` pairs would turn into the sentinel.
+* The INT6 and INT5 extra planes and the INT5/INT6 nibble words are fixed as
+  the docstring of `lamport_fix` describes.
+* An INT4 nibble word whose eight values are all at code 15 moves one of them
+  down one step. This needs eight values at -7/8 of their group's extremum,
+  which sits in the neighbour thread, so it is rare; a crafted input that hits
+  it in every word still gives 29.6 dB.
+* The fp16 passthrough turns two NaN halves (`0xFFFF`) into `0x7FFF`.
+
+Every rank decodes the same fixed packet, so the ranks still agree bit for
+bit.
+
+The Lamport mesh rotates three inbox buffers (1.5x the flag inbox): the
+reduce-scatter and all-gather of a tile are two rounds of one sequence, and a
+peer is at most one round ahead. The Lamport ring keeps two buffers per hop,
+by super-tile group parity (2x).
+
+On a fine-grained (cacheable) inbox a push can reach the reader by eviction
+before the writer's release writes the line back, and a sentinel put back at
+once could be overwritten by the same stale line. There the mesh and the ring
+re-arm a round late instead (`lamport_defers_rearm`): whole slots, once the
+reader holds a later packet from every writer of them, which left after that
+writer's release. It costs one more inbox buffer: four on the mesh (2x the flag
+inbox), three per hop on the ring (3x). The uncached inbox of xGMI keeps the
+re-arm right after the poll. The fused builds take the same handshake
+(`FusedTwoShotRung.handshake`, an optional `"handshake"` key on a rung of the
+ladder file); their epilogue hooks are unchanged. gfx950 runs Lamport on
+xGMI and PCIe, plain and fused; gfx942 runs flag.
+
+The hierarchical kernel takes either handshake on all three laps, from its
+rungs as the mesh and the ring do (`HierRung` is a `TwoShotRung`; it takes no
+`MeshKnobs`). Its Lamport build re-arms whole slots one super-tile group late,
+not each dword right after the poll: on a fine-grained inbox a push can reach
+the reader by eviction before the writer's release, and a sentinel put back at
+once could be overwritten by the same stale line. It keeps two local buffers
+and three exchange buffers (see `quick_allreduce_hier.py`). `HIER_ST_LADDER`
+runs Lamport, like the PCIe mesh ladders.
 
 ### Accuracy limits
 
@@ -120,6 +213,10 @@ Then `CustomAllreduce` uses the one-shot for small plain bf16 all-reduce
 operations. `QuickAllReduce` uses the mesh and the ring when the INT4
 quantization regime is set.
 
+On a host whose ranks split into two uniform groups, `QuickAllReduce` also uses
+the hierarchical kernel, in the window the policy gives it. The split comes from 
+the KFD link weights or from `AITER_FLY_AR_GROUPS`.
+
 The communicator tries `QuickAllReduce` first, then `CustomAllreduce`. For
 this reason, a payload goes to the mesh or the ring if it is in the mesh or
 ring window. Other payloads go to `CustomAllreduce`, which uses the one-shot in
@@ -130,8 +227,12 @@ levels:
 
 1. Which algorithm runs a payload. `FAMILY_POLICIES` has one `FamilyPolicy`
    for each arch, link type and world size. A policy has one payload-size
-   window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh` and
-   `ring`. A window includes its minimum and excludes its maximum, and a
+   window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh`,
+   `ring` and `hier`. The `hier` window applies only on a host that splits
+   (`FamilyPolicy.with_topology`); there it comes first, ends the mesh
+   window where its own starts (the mesh runs alone on a host that does not
+   split), and moves the start of the ring's window to its own end (on PCIe
+   TP8 `hier` is unbounded, so the ring does not run there). A window includes its minimum and excludes its maximum, and a
    maximum of `None` means no upper limit. A missing or empty window disables
    the algorithm. A payload that is in no window goes to `cross_device_reduce`
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
@@ -142,7 +243,7 @@ levels:
    first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
-   `MESH_ST_LADDER` and `RING_ST_LADDER`.
+   `MESH_ST_LADDER`, `RING_ST_LADDER` and `HIER_ST_LADDER`.
 
 ## Fused all-reduce + RMSNorm
 
@@ -357,9 +458,13 @@ is not.
 | `AITER_FLY_AR_MESH_MAX_BYTES` | The maximum of the mesh window. |
 | `AITER_FLY_AR_RING_MIN_BYTES` | The minimum of the ring window. |
 | `AITER_FLY_AR_RING_MAX_BYTES` | The maximum of the ring window. |
+| `AITER_FLY_AR_HIER_MIN_BYTES` | The minimum of the hierarchical window. |
+| `AITER_FLY_AR_HIER_MAX_BYTES` | The maximum of the hierarchical window. |
 
 * If a variable is not set, is empty, or is `-1`, the code uses the value from
   the table.
+* On a host that splits into groups and runs `hier`, the mesh window ends at
+  the start of the `hier` window, whatever the `MESH_MAX` variable says.
 * `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
 * A maximum of `0` disables the algorithm. A minimum that is equal to the
   maximum also disables it.
@@ -374,6 +479,16 @@ ring windows, because with quantization on the mesh and the ring take their
 payloads first. To move the boundary between the one-shot and the mesh with
 quantization on, set `AITER_FLY_AR_MESH_MIN_BYTES`. To change the payloads that
 the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
+
+### Set the socket groups
+
+| Variable | Values | Effect |
+|---|---|---|
+| `AITER_FLY_AR_GROUPS` | e.g. `0,1,2,3;4,5,6,7`, or not set | The groups of ranks the hierarchical kernel uses, instead of the ones the KFD topology gives. |
+
+Every rank must be in exactly one group. Rank 0's value is the one used. With
+two groups, the hierarchical kernel can also run on a host that does not split,
+which the tests use.
 
 ### Fused all-reduce + RMSNorm
 
@@ -471,7 +586,7 @@ and how it prevents bias in the comparison.
 
 FlyDSL 0.5.0 and later key the JIT cache on the traced kernel IR. A change to a
 helper in another module, for example `transport.py`,
-`quick_allreduce_codec.py` or the epilogue modules (`*_epilogue.py`,
+`quick_allreduce_codec.py`, `quick_allreduce_lamport.py` or the epilogue modules (`*_epilogue.py`,
 `*_rmsnorm.py`), changes the IR of every kernel that uses it, so FlyDSL
 compiles a new binary.
 
@@ -500,13 +615,18 @@ collectives are off on every rank. The vote runs even when FlyDSL is off or
 declines on that rank, because a rank that skipped it would leave its peers
 waiting.
 
-### The mesh and the ring are persistent kernels
+### The mesh, the ring and hier are persistent kernels
 
 All workgroups of a persistent kernel must be on the GPU at the same time.
-If the grid is too large, the kernel deadlocks. `clamp_grid_cap` limits the
-grid with measured occupancy values. The host then uses the minimum grid of
-all ranks. A grid that is too small is always safe, because each block then
-does more tiles.
+If the grid is too large, the kernel deadlocks. The grid is fixed before the
+kernel is compiled, because it sizes the inbox, so the host first estimates
+it: `clamp_grid_cap` (`comm_collectives_host_shared.py`) limits the grid with
+occupancy values measured on the mesh, and the host then uses the minimum grid
+of all ranks. Before the first launch the host asks HIP whether the compiled
+kernel fits that grid. If it does not, the host compiles it again under a
+`waves_per_eu` floor for the grid, or raises if that does not fit either
+(`FlyQuickAllReduce._load_checked`). A grid that is too small is always safe,
+because each block then does more tiles.
 
 ### Change `acquire` and `recv` together
 

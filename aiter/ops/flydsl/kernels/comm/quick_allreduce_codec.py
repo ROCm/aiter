@@ -52,6 +52,7 @@ from ..kernels_common import ceildiv
 from .transport import (
     BLOCK,
     I32_BYTES,
+    LAMPORT_SENTINEL,
     WAVE,
 )
 
@@ -105,6 +106,9 @@ _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 _FP16_MAX = 65504.0
 # Exponent bias of the E5M2 group scale.
 _SCALE_BIAS = 12
+# Largest scale exponent field written. 31 with a sign bit and mantissa 3 is
+# 0xFF, and four such bytes are the Lamport sentinel; finite fp16 stops at 28.
+_SCALE_MAX_E5 = 30
 # Names the group-scale codec in every mesh and ring launch name. FlyDSL 0.5.0
 # keys its cache on the traced IR, so a codec change rebuilds the kernels
 # without a new tag; the tag only labels the binaries.
@@ -344,6 +348,12 @@ def scale_slot_of(tid, block: int = BLOCK):
     return scale_slot, pair_in_slot
 
 
+def is_scale_leader(tid):
+    """Whether *tid* is the lowest thread of its scale group: the one that
+    stores, or re-arms, the group's scale byte word."""
+    return (tid % GROUP) == 0
+
+
 def hi_slot_of(tid, share):
     """(hi_leader, hi_slot) for the extra-bit plane.
 
@@ -440,15 +450,17 @@ def _f32_to_e4m3(x, min_e5=0, round_up=False):
     unchanged; the function names keep "e4m3" for a small diff.
 
     Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
-    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+    (no denorms). ``0x7B`` / ``0xFB`` are the largest bytes
+    written (``±Inf`` and NaN land there too), so no scale byte is ``0xFF``
+    and four of them never form ``LAMPORT_SENTINEL``.
 
     *min_e5* floors the exponent field (see :attr:`Codec.scale_min_e5`), and
     *round_up* rounds the mantissa up instead of to nearest (see
     :attr:`Codec.scale_rounds_up`).
     ``0x00`` is +0 only. Any other value that would land there (positive
     underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
-    and mantissa.
+    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps the exponent
+    to ``_SCALE_MAX_E5`` and sets the mantissa to 3.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
@@ -460,10 +472,10 @@ def _f32_to_e4m3(x, min_e5=0, round_up=False):
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m2 = carry.select(fx.Int32(0), m2)
     e5 = e + fx.Int32(_SCALE_BIAS)
-    overflow = e5 > fx.Int32(31)
+    overflow = e5 > fx.Int32(_SCALE_MAX_E5)
     m2 = overflow.select(fx.Int32(3), m2)
     e5 = (e5 < fx.Int32(min_e5)).select(
-        fx.Int32(min_e5), overflow.select(fx.Int32(31), e5)
+        fx.Int32(min_e5), overflow.select(fx.Int32(_SCALE_MAX_E5), e5)
     )
     byte = sign | (e5 << fx.Int32(2)) | (m2 & fx.Int32(3))
     return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
@@ -604,8 +616,7 @@ def _codec_quant(codec, atom, lane, tid):
     words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
     if codec.hi2_i32_off is not None:
         words = (words[0], _compact_hi(words[1], lane, codec.hi_bits))
-    is_leader = (tid % GROUP) == 0
-    return words, _pack_e4m3_word(e, lane), is_leader
+    return words, _pack_e4m3_word(e, lane), is_scale_leader(tid)
 
 
 def _codec_dequant(codec, words, scale, tid, acc=None):
@@ -646,6 +657,73 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
         else:
             out.append(_i32(fx.fma(dq, scale, _f16x2(acc[i]))))
     return fx.Vector.from_elements(out, fx.Int32)
+
+
+def lamport_fix(codec, words, tid):
+    """*words* of one packet, with no dword equal to the Lamport sentinel.
+
+    A Lamport receiver (``handshake="lamport"``) takes a dword as landed once it
+    is not ``0xFFFFFFFF``, so the producer must never write that value. Per
+    plane:
+
+    * Scale: four signed E5M2 bytes of fp16 extrema. A finite extremum gives
+      an exponent field of at most 28, and :func:`_f32_to_e4m3` clamps ``±Inf``
+      to ``_SCALE_MAX_E5`` (30), so no byte is ``0xFF``. Never the sentinel.
+    * INT6 extra plane: the dword is one scale group (a lane pair). The group's
+      extremum maps to ``q <= 0``, code ``<= 32``, extra field ``<= 2``; all
+      sixteen fields 3 cannot happen.
+    * INT5 extra plane: the dword is two scale groups (a lane quartet), one bit
+      per value. All ones means both groups quantize to ``q = 0`` (every code
+      16), so the four threads' nibble words are 0. The quartet's leader moves
+      its value 0 from code 16 to 15 (``q = -1``): one step of a scale that is
+      0, or the INT5 floor ``2**-11`` when the extremum is below ``2**-16``.
+    * Nibble plane: all eight low nibbles 15 can happen, when this thread's
+      eight values all sit at ``q = +7`` against an extremum of the other sign
+      in its pair neighbour. Flip bit 0: one code step on value 0 of this
+      thread.
+    * FP16 passthrough: two NaN halves ``0xFFFF``; becomes ``0x7FFF`` NaN.
+
+    Every reader decodes the same fixed bytes, and a rank that decodes its own
+    packet must decode the fixed one too, so the ranks stay bit-identical.
+    """
+    sentinel = fx.Int32(LAMPORT_SENTINEL)
+    if not codec.has_scale:
+        return tuple((w == sentinel).select(fx.Int32(0x7FFF7FFF), w) for w in words)
+    nib = words[0]
+    rest = tuple(words[1:])
+    if codec.hi2_i32_off is not None and codec.hi_bits == 1:
+        hi = words[1]
+        hit = hi == sentinel
+        leader, _ = hi_slot_of(tid, codec.hi_share)
+        nib = hit.select(leader.select(nib | fx.Int32(0xF), nib), nib)
+        rest = (hit.select(hi & fx.Int32(-2), hi),)
+    nib = (nib == sentinel).select(nib ^ fx.Int32(1), nib)
+    return (nib, *rest)
+
+
+def lamport_slots(codec, tid, scale_slot):
+    """``[(i32 offset within the rank-tile, re-arm predicate)]`` of every dword
+    this thread reads from one packet, in :func:`_codec_load` order.
+
+    The predicate picks the one thread that re-arms a dword that several
+    threads read: the extra-plane leader, and the scale group's leader.
+    """
+    slots = list(codec.plane_slots(tid))
+    if codec.has_scale:
+        slots.append(
+            (
+                fx.Int32(codec.scale_i32_off) + scale_slot,
+                is_scale_leader(tid),
+            )
+        )
+    return slots
+
+
+def split_lamport_packet(codec, got):
+    """``(words, scale_word)`` out of the dwords :func:`lamport_slots` lists,
+    in that order: what :func:`_codec_load` returns for the same packet."""
+    n = codec.n_words_per_thread
+    return tuple(got[:n]), (got[n] if codec.has_scale else None)
 
 
 def _codec_load(codec, get, tid, scale_slot):

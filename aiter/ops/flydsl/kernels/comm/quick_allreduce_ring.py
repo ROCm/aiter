@@ -39,7 +39,6 @@ from ...allreduce_policy import (
     SUPPORTED_WORLDS,
 )
 from .quick_allreduce_codec import (
-    GROUP,
     SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
@@ -47,11 +46,24 @@ from .quick_allreduce_codec import (
     _codec_quant,
     _scale_from_word,
     codecs_for_block,
+    is_scale_leader,
+    lamport_fix,
     scale_slot_of,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .quick_allreduce_fusions import check_fusion_args
+from .quick_allreduce_lamport import (
+    check_handshake,
+    lamport_defers_rearm,
+    lamport_offsets,
+    lamport_packets,
+    lamport_poll,
+    lamport_pushed,
+    lamport_rearm_dwords,
+    lamport_rearm_modifier,
+    lamport_rearm_span,
+)
 from .quick_allreduce_rmsnorm import RingRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
@@ -59,6 +71,7 @@ from .transport import (
     ATOMS,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
+    LAMPORT_FILL_BYTE,
     QUAD_LANES,
     QUADS_PER_WAVE,
     _acquire_inbox,
@@ -66,6 +79,7 @@ from .transport import (
     _buffer_ptr,
     _color_io,
     _i32_to_bytes,
+    _lds_free,
     _load_flag,
     _load_peers,
     _release_inbox,
@@ -74,6 +88,24 @@ from .transport import (
     _to_sgpr_i64,
     make_pack_storage,
 )
+
+# Inbox buffers of the Lamport handshake, by super-tile group parity. A slot
+# has one writer, the predecessor ``p``. ``p`` writes a slot of group ``g + 1``
+# while we may still read the same slot of ``g``, so the two need separate
+# buffers. ``p`` writes group ``g + 2`` only after it has finished ``g + 1``,
+# which needs our op ``N`` of ``g + 1``; we push that after a poll of
+# ``g + 1``, whose ``vmcnt(0)`` drains every re-arm of group ``g``.
+LAMPORT_BUFFERS = 2
+
+# Inbox buffers of the Lamport handshake on a cacheable (fine-grained) inbox,
+# where the re-arm is deferred (``lamport_defers_rearm``). After our op-1
+# pushes of group ``g`` we re-arm every slot of group ``g - 2``
+# (``_rearm_group``): by then we hold ``p``'s packets of group ``g - 1``,
+# which it pushed after its release of ``g - 2``. ``p`` writes the buffer of
+# ``g - 2`` again in group ``g + 1``, only after it has finished ``g``, which
+# needs our op ``N`` of ``g``; we push that after the op-2 poll of ``g``, whose
+# ``vmcnt(0)`` drains the re-arm.
+LAMPORT_BUFFERS_DEFERRED = 3
 
 
 def _load_i32_at(ptr, elem_off, cache_modifier):
@@ -109,6 +141,7 @@ def make_quick_allreduce_ring_kernel(
     block: int | None = None,
     h_pad: int | None = None,
     mxfp4: bool = False,
+    handshake: str = "flag",
 ):
     """Build the ring kernel for one *rank*.
 
@@ -129,6 +162,7 @@ def make_quick_allreduce_ring_kernel(
     is where the ring's throughput goes to die.
     """
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
+    lamport = check_handshake(handshake)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -193,12 +227,23 @@ def make_quick_allreduce_ring_kernel(
     # Per-step geometry.
     payload_i32 = [rank_atoms * c.rank_tile_i32 for c in step_codec]
     release_i32_off = [super_tile * p for p in payload_i32]
-    wire_tile_i32 = [r + 16 for r in release_i32_off]  # + one 64 B handshake sector
+    # + one 64 B handshake sector, which a Lamport slot does not have.
+    wire_tile_i32 = [r + (0 if lamport else 16) for r in release_i32_off]
     step_base_i32, _acc = [], 0
     for w in wire_tile_i32:
         step_base_i32.append(_acc)
         _acc += grid * w
-    inbox_bytes = _acc * 4
+    buffer_i32 = _acc
+    # Re-arm a group late, whole slots, rather than each polled dword at once.
+    defer_rearm = lamport and lamport_defers_rearm(inbox_memory)
+    if not lamport:
+        n_buffers = 1
+    elif defer_rearm:
+        n_buffers = LAMPORT_BUFFERS_DEFERRED
+    else:
+        n_buffers = LAMPORT_BUFFERS
+    inbox_bytes = n_buffers * buffer_i32 * 4
+    rearm_cm = lamport_rearm_modifier(inbox_memory)
 
     # Each slot has only one writer, the ring predecessor. For this reason, the
     # inbox has no sender axis and the design does not need atomics. PCIe has
@@ -301,17 +346,21 @@ def make_quick_allreduce_ring_kernel(
         _end_chunk = ep.end_chunk
         _load_color, _store_color = _color_io(colors_ptr, bid)
 
-        def _slot_i32(step, sub):
-            """i32 offset of (*step*, this block, *sub*) inside the inbox.
+        def _slot_i32(step, sub, buf=None):
+            """i32 offset of (*step*, this block, *sub*) inside the inbox, in
+            Lamport buffer *buf* (None on the flag handshake, which has one).
 
             With two codecs the steps are no longer uniformly sized, so the base
             is a prefix sum rather than a product.
             """
-            return (
+            off = (
                 fx.Int32(step_base_i32[step])
                 + bid * fx.Int32(wire_tile_i32[step])
                 + sub * fx.Int32(payload_i32[step])
             )
+            if const_expr(buf is not None):
+                off = off + buf * fx.Int32(buffer_i32)
+            return off
 
         def _load_chunk_atoms(tile, chunk):
             """This rank's own bf16 data for *chunk*, as fp16 register atoms."""
@@ -350,10 +399,51 @@ def make_quick_allreduce_ring_kernel(
 
             return _codec_load(codec, _get, tid, scale_slot)
 
+        def _lamport_recv(codec, step, sub, buf):
+            """``[(words, scale_word)]`` per rank-atom of our slot for *step*
+            in *buf*, raw as ``_recv_raw`` returns them, once none of the
+            dwords this thread reads is the sentinel (``lamport_poll``); then
+            put the sentinel back in them (``lamport_rearm_dwords``), which
+            must land before this group's op ``N`` push (``LAMPORT_BUFFERS``).
+            Deferred, ``vmcnt(0)`` only: it drains ``_rearm_group``
+            (``LAMPORT_BUFFERS_DEFERRED``).
+            """
+            offs, rearm = lamport_offsets(
+                codec,
+                tid,
+                scale_slot,
+                (
+                    _slot_i32(step, sub, buf) + fx.Int32(j * codec.rank_tile_i32)
+                    for j in range_constexpr(rank_atoms)
+                ),
+            )
+            got = lamport_poll(inbox, self_base, offs)
+            if const_expr(defer_rearm):
+                rocdl.s_waitcnt(vmcnt=0)
+            else:
+                lamport_rearm_dwords(inbox, rearm, rearm_cm)
+            return list(lamport_packets(codec, got, rank_atoms))
+
+        def _rearm_group(buf):
+            """Deferred re-arm, after the op-1 pushes of the group in *buf*:
+            every slot of this block in the buffer of two groups before
+            (``LAMPORT_BUFFERS_DEFERRED``)."""
+            back = buf - fx.Int32(2)
+            back = (back < fx.Int32(0)).select(back + fx.Int32(n_buffers), back)
+            for step in range_constexpr(len(wire_tile_i32)):
+                lamport_rearm_span(
+                    inbox,
+                    _slot_i32(step, fx.Int32(0), back),
+                    wire_tile_i32[step],
+                    tid,
+                    block,
+                    rearm_cm,
+                )
+
         def _scale_of(codec, word):
             return _scale_from_word(codec, word, pair_in_slot)
 
-        def _fanout_to_next(step, sub):
+        def _fanout_to_next(step, sub, buf=None):
             """Push the staged rank-tiles from LDS into the successor's inbox.
 
             One destination, sectors in address order, so the whole
@@ -389,7 +479,7 @@ def make_quick_allreduce_ring_kernel(
                         smem_ptr + flat,
                         result_type=fx.Vector.make_type(4, fx.Int32),
                     )
-                    byte_off = _i32_to_bytes(_slot_i32(step, sub) + flat)
+                    byte_off = _i32_to_bytes(_slot_i32(step, sub, buf) + flat)
                     _store_v4i32_peer(next_base + byte_off, v4, payload_policy)
 
         def _publish(step, color):
@@ -476,7 +566,7 @@ def make_quick_allreduce_ring_kernel(
             """Hand an atom whose all-reduce is finished to the epilogue."""
             _complete_atom(tile, chunk * rank_atoms + j, value, recv)
 
-        def _op_substep(k, tile, sub, recv):
+        def _op_substep(k, tile, sub, recv, buf=None):
             """One op of the ring, for one sub-tile. Stages LDS; does not send.
 
             Completed atoms go to the epilogue's ``complete``, which may hold
@@ -491,28 +581,42 @@ def make_quick_allreduce_ring_kernel(
             writes an all-gather one.
             """
             chunk = _chunk_of(k)
-            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            is_leader = is_scale_leader(tid)
             if const_expr(k >= world_size):
                 # Ahead of the receive, so the HBM latency hides behind it.
                 _begin_chunk(tile, chunk, recv)
             c_in = step_codec[k - 2] if k >= 2 else None
             c_out = step_codec[k - 1] if k <= steps else None
+            if const_expr(lamport and k >= 2):
+                polled = _lamport_recv(c_in, k - 2, sub, buf)
+
+            def _recv_in(j):
+                if const_expr(lamport):
+                    return polled[j]
+                return _recv_raw(c_in, k - 2, sub, j)
+
+            def _fix(codec, words):
+                if const_expr(lamport):
+                    return lamport_fix(codec, words, tid)
+                return words
 
             if const_expr(k == 1):
                 # Pipeline fill: nothing to receive, push our own contribution.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
                     words, word, leader = _codec_quant(c_out, atoms[j], lane, tid)
+                    words = _fix(c_out, words)
                     _lds_write_packet(c_out, j, words, word, leader)
             elif const_expr(k < world_size):
                 # Reduce-scatter: add our contribution to the running partial.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    words_in, word_in = _recv_in(j)
                     acc = _codec_dequant(
                         c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
                     )
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
+                    words = _fix(c_out, words)
                     _lds_write_packet(c_out, j, words, word, leader)
             elif const_expr(k == world_size):
                 # Last reduce, and the seam: c_in is the reduce-scatter codec,
@@ -523,11 +627,12 @@ def make_quick_allreduce_ring_kernel(
                 # so every rank ends with the same bits.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    words_in, word_in = _recv_in(j)
                     acc = _codec_dequant(
                         c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
                     )
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
+                    words = _fix(c_out, words)
                     _lds_write_packet(c_out, j, words, word, leader)
                     _complete(
                         tile,
@@ -542,7 +647,7 @@ def make_quick_allreduce_ring_kernel(
                 # dequantizing-and-requantizing is what keeps this lap free of
                 # additional error -- and it is why c_in is c_out here.
                 for j in range_constexpr(rank_atoms):
-                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    words_in, word_in = _recv_in(j)
                     _complete(
                         tile,
                         chunk,
@@ -554,7 +659,7 @@ def make_quick_allreduce_ring_kernel(
             else:
                 # Final op: the last chunk arrives and stops here.
                 for j in range_constexpr(rank_atoms):
-                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    words_in, word_in = _recv_in(j)
                     _complete(
                         tile,
                         chunk,
@@ -612,6 +717,35 @@ def make_quick_allreduce_ring_kernel(
                 else:
                     pass
 
+        def _ring_group_lamport(i, n_this, buf):
+            """``_ring_group`` on the Lamport handshake: no wait and no
+            publish. Op ``k`` of sub-tile ``s`` polls slot ``k - 2`` of ``s``
+            itself, so it starts as soon as the predecessor's op ``k - 1`` of
+            ``s`` lands rather than once its whole op has."""
+            for _ki in range_constexpr(n_ops):
+                k = _ki + 1
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    recv = []
+                    if const_expr(k <= steps):
+                        # The last fanout's LDS reads must land before this
+                        # op overwrites the staging rows.
+                        _lds_free()
+                        _op_substep(k, tile, s, recv, buf)
+                        gpu.barrier()
+                        _fanout_to_next(k - 1, s, buf)
+                        lamport_pushed(release_scope)
+                    else:
+                        _op_substep(k, tile, s, recv, buf)
+                    if const_expr(k >= world_size):
+                        _end_chunk(tile, _chunk_of(k), recv)
+                    else:
+                        pass
+                if const_expr(defer_rearm and k == 1):
+                    _rearm_group(buf)
+                else:
+                    pass
+
         # Stride by the launched grid, not the compile-time cap: the host
         # launches fewer blocks than `grid` when it wants each block to own a
         # whole super-tile, and striding by the cap would silently leave every
@@ -622,10 +756,22 @@ def make_quick_allreduce_ring_kernel(
         for i in range(fx.Int32(0), n_block_tiles, st_i):
             remain = n_block_tiles - i
             n_this = (remain < st_i).select(remain, st_i)
-            _ring_group(i, n_this, color)
-            color = color + fx.Int32(1)
-            if color == fx.Int32(0):  # 0 is the unset sentinel
-                color = fx.Int32(1)
+            if const_expr(lamport):
+                _ring_group_lamport(i, n_this, color)
+            else:
+                _ring_group(i, n_this, color)
+            if const_expr(defer_rearm):
+                # The colour is the Lamport buffer, 0 .. 2.
+                color = color + fx.Int32(1)
+                if color == fx.Int32(n_buffers):
+                    color = fx.Int32(0)
+            elif const_expr(lamport):
+                # The colour is the Lamport buffer, 0 or 1.
+                color = fx.Int32(1) - color
+            else:
+                color = color + fx.Int32(1)
+                if color == fx.Int32(0):  # 0 is the unset sentinel
+                    color = fx.Int32(1)
         if tid == 0:
             _store_color(color)
         gpu.barrier()
@@ -723,6 +869,8 @@ def make_quick_allreduce_ring_kernel(
         f"_{inbox_memory}_{rs_codec}_{ag_codec}"
     )
     tag += f"_b{block}" + epilogue.tag
+    if lamport:
+        tag += "_lamport"
     launcher = (
         launch_quick_allreduce_ring_fused
         if epilogue.takes_operands
@@ -761,5 +909,8 @@ def make_quick_allreduce_ring_kernel(
         "grid": grid,
         "block": block,
         "rows_per_chunk": epilogue.rows_per_chunk,
+        "handshake": handshake,
+        # Byte every inbox byte starts as: the Lamport sentinel, or 0.
+        "inbox_fill": LAMPORT_FILL_BYTE if lamport else 0,
         **epilogue.spec(),
     }

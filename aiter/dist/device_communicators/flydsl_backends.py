@@ -23,7 +23,12 @@ logger = logging.getLogger(__name__)
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
+    from aiter.ops.flydsl.comm_collectives_host_shared import (
+        _cuda_index,
+        eligible_payload_bytes,
+        probe_peer_topology,
+    )
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
     from aiter.ops.flydsl.quick_allreduce import (
         FlyQuickAllReduce,
@@ -33,7 +38,10 @@ try:
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
+    _cuda_index = None
+    check_groups = None
     eligible_payload_bytes = None
+    probe_peer_topology = None
     OneShotAllReduceRMSNorm = None
     FlyQuickAllReduce = None
     FlyQuickAllReduceRMSNorm = None
@@ -186,7 +194,9 @@ def preload_fly_engines(engines, *args) -> None:
 
 
 class FlyDSLQuickAllReduce:
-    """Quantized FlyDSL plain all-reduce: the mesh and ring schedules.
+    """Quantized FlyDSL plain all-reduce: the mesh, ring, and hierarchical
+    schedules. The hierarchical one runs only where the policy gives it a
+    window and the KFD topology splits the ranks into two uniform groups.
 
     The policy (``resolve_family_policy``, quantized) picks the schedule per
     payload and leaves the one-shot window to the exact one-shot, which the
@@ -267,6 +277,42 @@ class FlyDSLQuickAllReduce:
         self.rank = dist.get_rank(group=group)
         self.world_size = world_size
         self.link = link
+        # Every rank voted to build with the same policy, so every rank gets
+        # here and the topology probe, a collective, cannot deadlock.
+        groups = None
+        if policy.hier is not None and not policy.hier.is_empty:
+            ok = True
+            try:
+                topo = probe_peer_topology(
+                    group,
+                    rank=self.rank,
+                    world_size=world_size,
+                    device_index=_cuda_index(device, owner="FlyDSLQuickAllReduce"),
+                )
+            except Exception:
+                logger.warning(
+                    "%s: cannot probe the topology; running without the "
+                    "hierarchical schedule.",
+                    self._tag,
+                    exc_info=True,
+                )
+                ok = False
+            if all_ranks_agree(ok, group) and len(topo.groups) >= 2:
+                # The topology is identical on every rank, so every rank falls
+                # back together. A groups override that the kernel cannot
+                # build on (unequal sizes, not two groups) must not reach the
+                # engine build, where its error would disable mesh and ring.
+                try:
+                    groups = check_groups(topo.groups, world_size)
+                except ValueError:
+                    logger.warning(
+                        "%s: cannot build the hierarchical schedule on groups "
+                        "%s; running the flat schedules.",
+                        self._tag,
+                        topo.groups,
+                        exc_info=True,
+                    )
+            policy = policy.with_topology(hierarchical=groups is not None)
         algorithms = [
             alg
             for alg in policy.algorithms(quantized=True)
@@ -281,6 +327,7 @@ class FlyDSLQuickAllReduce:
         try:
             for alg in algorithms:
                 # The policy window is the floor here, not the engine's own.
+                hier = alg == fly_policy.AllReduceAlgorithm.TwoShotHierarchical
                 self.engines[alg] = FlyQuickAllReduce(
                     group=group,
                     device=device,
@@ -291,6 +338,7 @@ class FlyDSLQuickAllReduce:
                     ag_codec=ag_codec,
                     min_bytes=0,
                     link=link,
+                    **({"groups": groups} if hier else {}),
                 )
             preload_fly_engines(
                 (eng, policy.window(alg, quantized=True).inclusive_range())

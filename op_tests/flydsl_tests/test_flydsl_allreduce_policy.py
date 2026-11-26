@@ -32,7 +32,6 @@ from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl import comm_collectives_host_shared as H
 from aiter.ops.flydsl.allreduce_policy import (
     RING_SUPER_TILES,
-    SUPER_TILES,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
     SUPPORTED_SPLITS,
@@ -65,6 +64,7 @@ CELLS = [
 ONESHOT = AllReduceAlgorithm.OneShot
 MESH = AllReduceAlgorithm.TwoShotMesh
 RING = AllReduceAlgorithm.TwoShotRing
+HIER = AllReduceAlgorithm.TwoShotHierarchical
 
 
 def _row(link, ws, arch):
@@ -176,7 +176,13 @@ def test_ladders_match_the_windows(alg):
     windowed = sorted(
         (arch, link, ws)
         for link, ws, arch in CELLS
-        if _row(link, ws, arch).window(alg, quantized=True) is not None
+        if any(
+            row.window(alg, quantized=True) is not None
+            for row in (
+                _row(link, ws, arch),
+                _row(link, ws, arch).with_topology(hierarchical=True),
+            )
+        )
     )
     assert sorted(P.LADDERS[alg]) == windowed
 
@@ -191,18 +197,32 @@ def test_ladders_are_well_formed(cell):
     """
     link, ws, arch = cell
     kw = {"world_size": ws, "link": link, "arch": arch}
-    two_shot = [("mesh", mesh_st_ladder(**kw), SUPER_TILES)]
+    # The mesh's legal super-tiles depend on the rung's handshake.
+    two_shot = [("mesh", mesh_st_ladder(**kw), None)]
     if _row(*cell).window(RING, quantized=True) is not None:
         two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
+    if _row(*cell).hier is not None:
+        hier = P.hier_st_ladder(**kw)
+        assert all(isinstance(r, P.HierRung) for r in hier)
+        two_shot.append(("hier", hier, P.HIER_SUPER_TILES))
     for name, rungs, valid_st in two_shot:
         assert rungs, name
         assert rungs[0].min_bytes == 0, name
         floors = [r.min_bytes for r in rungs]
         assert floors == sorted(floors), name
         for r in rungs:
-            assert r.super_tile in valid_st, (name, r)
+            legal = P.mesh_super_tiles(r.handshake) if valid_st is None else valid_st
+            assert r.super_tile in legal, (name, r)
             assert r.grid_cap >= 1, (name, r)
             assert r.block in SUPPORTED_BLOCKS, (name, r)
+            # Only a Lamport mesh rung builds with non-default knobs, and
+            # ``prefetch`` only at ST=1.
+            if r.knobs != P.DEFAULT_MESH_KNOBS:
+                assert name == "mesh" and r.handshake == "lamport", (name, r)
+                assert not r.knobs.prefetch or r.super_tile == 1, (name, r)
+            assert r.handshake in P.HANDSHAKES, (name, r)
+        # One FlyQuickAllReduce runs one handshake.
+        assert len({r.handshake for r in rungs}) == 1, name
 
     one = oneshot_ladder(**kw)
     assert one and one[0].min_bytes == 0
@@ -344,10 +364,6 @@ def test_window_overrides():
         p = _resolve()
         assert p.window(MESH, quantized=True).max is None
         assert p.window(RING, quantized=True) is None
-    # gfx950/PCIe TP8 has a ring: an unbounded mesh would overlap it.
-    with _env(AITER_FLY_AR_MESH_MAX_BYTES="None", AITER_FLY_AR_RING_MAX_BYTES="0"):
-        p = _resolve(ws=8)
-        assert p.window(MESH, quantized=True).max is None
 
 
 def test_link_variable_backs_up_an_unreadable_probe():
@@ -411,6 +427,50 @@ def test_override_cannot_enable_an_algorithm_without_a_ladder(cell):
     assert warning.call_args.args[1] == "RING"
 
 
+def test_mesh_is_the_fallback_of_a_host_that_does_not_split():
+    """PCIe TP8 runs the mesh up to the ring unless the host splits into two
+    groups, where it runs up to ``hier``. The mesh variables move the mesh
+    window on either kind of host, and a mesh floor at or above ``hier``'s
+    leaves a split host no mesh."""
+    var = "AITER_FLY_AR_MESH_MIN_BYTES"
+    flat = _resolve(ws=8)
+    assert flat.window(MESH, quantized=True) == Window(96 << 10, 256 << 20)
+    assert (
+        flat.with_topology(hierarchical=False).select(1 << 20, quantized=True) == MESH
+    )
+    split = flat.with_topology(hierarchical=True)
+    assert split.window(MESH, quantized=True) == Window(96 << 10, 28 << 20)
+    assert split.select(27 << 20, quantized=True) == MESH
+    assert split.select(28 << 20, quantized=True) == HIER
+    with _env(**{var: str(256 << 10)}):
+        flat = _resolve(ws=8)
+        assert flat.window(MESH, quantized=True) == Window(256 << 10, 256 << 20)
+        split = flat.with_topology(hierarchical=True)
+        assert split.window(MESH, quantized=True) == Window(256 << 10, 28 << 20)
+    with _env(**{var: str(32 << 20)}):
+        split = _resolve(ws=8).with_topology(hierarchical=True)
+        assert split.window(MESH, quantized=True) is None
+
+
+def test_split_host_runs_hier_over_the_ring_window():
+    """On a split PCIe TP8 host ``hier`` takes the quantized payloads from its
+    floor up and the ring does not run, and below it the mesh runs. A bounded
+    ``hier`` hands the rest to the ring."""
+    flat = _resolve(ws=8)
+    split = flat.with_topology(hierarchical=True)
+    assert split.window(HIER, quantized=True) == Window(28 << 20, None)
+    assert split.window(RING, quantized=True) is None
+    assert split.select(1 << 31, quantized=True) == HIER
+    assert flat.with_topology(hierarchical=False).window(RING, quantized=True) == (
+        Window(256 << 20, None)
+    )
+    with _env(AITER_FLY_AR_HIER_MAX_BYTES=str(512 << 20)):
+        split = _resolve(ws=8).with_topology(hierarchical=True)
+        assert split.window(RING, quantized=True) == Window(512 << 20, None)
+        assert split.select(512 << 20, quantized=True) == RING
+        assert split.select(511 << 20, quantized=True) == HIER
+
+
 def test_equal_bounds_disable():
     with _env(
         AITER_FLY_AR_RING_MIN_BYTES=str(1 << 30),
@@ -432,7 +492,7 @@ def test_ignored_overrides():
 def test_overlapping_overrides_raise():
     # Raising the mesh ceiling without moving the ring floor.
     with (
-        _env(AITER_FLY_AR_MESH_MAX_BYTES=str(64 << 20)),
+        _env(AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20)),
         pytest.raises(ValueError, match="overlaps"),
     ):
         _resolve()
@@ -466,6 +526,77 @@ def test_default_codecs(ws):
     ):
         got_rs, got_ag = P.default_codecs(algorithm, ws)
         assert got_rs in rs_codecs and got_ag in ag_codecs
+
+
+def test_hier_rungs_name_their_local_schedules():
+    """A ``HierRung`` runs the mesh on both local laps unless it names the
+    ring, and its schedules are part of the engine key, so two rungs that
+    differ only there build two engines."""
+    rung = P.HierRung(min_bytes=0, super_tile=8, grid_cap=128, block=512)
+    assert (rung.local_rs, rung.local_ag) == ("mesh", "mesh")
+    assert rung.engine_key == (8, 512, "mesh", "mesh", None, None, None)
+    ring = dataclasses.replace(rung, local_rs="ring", local_ag="ring", x_codec="int5")
+    assert ring.engine_key == (8, 512, "ring", "ring", None, "int5", None)
+    assert P.TwoShotRung(0, 8, 128, 512).engine_key == (8, 512, P.DEFAULT_MESH_KNOBS)
+    # A tuned mesh rung never shares an engine with a default one.
+    on = P.MeshKnobs(stripe="full")
+    tuned = P.TwoShotRung(0, 8, 128, 512, handshake="lamport", knobs=on)
+    assert tuned.engine_key == (8, 512, on)
+    with pytest.raises(ValueError, match="local_rs"):
+        P.HierRung(0, 8, 128, 512, local_rs="tree")
+    with pytest.raises(ValueError, match="local_ag"):
+        P.HierRung(0, 8, 128, 512, local_ag="tree")
+    with pytest.raises(ValueError, match="rs_codec"):
+        P.HierRung(0, 8, 128, 512, rs_codec="int3")
+
+
+def test_hier_engines_resolve_their_rungs():
+    """The host turns any rung into a ``HierRung`` and pins the requested
+    local schedules on it, keeping its codecs. An engine's codecs are the
+    caller's, else the rung's, else ``HIER_X_CODEC`` on the exchange and that
+    of a TP``G`` schedule like its own on a local lap."""
+    from aiter.ops.flydsl.quick_allreduce import _as_hier_rung, _hier_codecs
+
+    plain = P.TwoShotRung(0, 8, 128, 512)
+    assert _as_hier_rung(plain, None, None) == P.HierRung(0, 8, 128, 512)
+    ring_rs = P.HierRung(0, 8, 128, 512, local_rs="ring", rs_codec="int5")
+    pinned = _as_hier_rung(ring_rs, None, "ring")
+    assert (pinned.local_rs, pinned.local_ag, pinned.rs_codec) == (
+        "ring",
+        "ring",
+        "int5",
+    )
+    assert _as_hier_rung(ring_rs, "mesh", None).local_rs == "mesh"
+    none = (None, None, None)
+    x = P.HIER_X_CODEC
+    mesh = P.HierRung(0, 8, 128, 512)
+    ring = dataclasses.replace(mesh, local_rs="ring", local_ag="ring")
+    assert _hier_codecs(none, mesh, 4) == ("int4", x, "int4")
+    assert _hier_codecs(none, ring, 4) == ("int6", x, "int4")
+    assert _hier_codecs(none, ring, 2) == ("int4", x, "int4")
+    assert _hier_codecs(none, ring_rs, 4) == ("int5", x, "int4")
+    assert _hier_codecs(("fp16", "fp16", None), ring_rs, 4) == ("fp16", "fp16", "int4")
+
+
+def test_hier_lds_follows_the_local_schedules():
+    """A mesh lap stages ``G - 1`` destinations, a ring hop and the exchange
+    one. Block 512, G = 4: two rank-tiles per destination, INT4 576 i32,
+    INT6 832 i32."""
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import (
+        hier_fanout_quads,
+        hier_lds_bytes,
+    )
+
+    assert hier_lds_bytes(512, 4, "int4", "int6", "int4") == 4 * 3 * 2 * 576
+    assert hier_lds_bytes(512, 4, "int6", "int6", "int4", "ring", "ring") == (
+        4 * 2 * 832
+    )
+    assert hier_lds_bytes(512, 4, "int6", "int6", "int4", "ring", "mesh") == (
+        4 * 3 * 2 * 576
+    )
+    # Only a mesh lap needs a quad per (destination, sector) of a stripe.
+    assert hier_fanout_quads(512, 4, ()) == (128, 0)
+    assert hier_fanout_quads(512, 4, ("int4",)) == (128, 3 * 8)
 
 
 def test_default_inbox_memory():
@@ -664,6 +795,20 @@ def _widths(link, ws, arch):
 
 
 @pytest.mark.parametrize("cell", CELLS)
+def test_fused_rungs_sharing_an_engine_state_the_cap_that_runs(cell):
+    """Rungs with one engine key share one engine, built at the first such
+    rung's ``grid_cap``; a later rung must state that cap, not another."""
+    link, ws, arch = cell
+    for ladder in (fused_mesh_st_ladder, fused_ring_st_ladder):
+        for hidden in _widths(link, ws, arch):
+            caps = {}
+            for rung in ladder(world_size=ws, link=link, arch=arch, hidden=hidden):
+                key = (rung.super_tile, rung.low_latency, rung.knobs)
+                first = caps.setdefault(key, rung.grid_cap)
+                assert rung.grid_cap == first, (ladder.__name__, hidden, rung)
+
+
+@pytest.mark.parametrize("cell", CELLS)
 def test_fused_disabled_ring_is_reachable_by_env_override(cell):
     """A fused family whose default window is empty keeps its ladder because
     the window variables can enable it: the ring is off by default on xGMI and
@@ -722,15 +867,21 @@ def test_fused_ladders_are_well_formed(cell):
     for hidden in _widths(*cell):
         kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
         for name, rungs, valid_st in (
-            ("mesh", fused_mesh_st_ladder(**kw), SUPER_TILES),
+            ("mesh", fused_mesh_st_ladder(**kw), None),
             ("ring", fused_ring_st_ladder(**kw), RING_SUPER_TILES),
         ):
             assert rungs and rungs[0].min_bytes == 0, (name, hidden)
             floors = [r.min_bytes for r in rungs]
             assert floors == sorted(floors), (name, hidden)
             for r in rungs:
-                assert r.super_tile in valid_st, (name, hidden, r)
+                legal = (
+                    P.mesh_super_tiles(r.handshake) if valid_st is None else valid_st
+                )
+                assert r.super_tile in legal, (name, hidden, r)
                 assert r.grid_cap >= 1, (name, hidden, r)
+                assert r.handshake in P.HANDSHAKES, (name, hidden, r)
+            # One engine set per width runs one handshake.
+            assert len({r.handshake for r in rungs}) == 1, (name, hidden)
 
         one = fused_oneshot_ladder(**kw)
         assert one and one[0].min_bytes == 0, hidden
@@ -956,6 +1107,7 @@ _MESH = ("mesh", "default")
         (_set(("ring", "default", "rungs", 0, "block"), 256), "unknown"),
         (_set(("ring", "default", "rungs", 0, "grid_cap"), _DROP), "missing"),
         (_set(("ring", "default", "rungs", 0, "grid_cap"), 0), "grid_cap"),
+        (_set(("ring", "default", "rungs", 0, "handshake"), "ll"), "handshake"),
         (_set(("oneshot", "hidden", "7168", "rungs", 0, "split"), 3), "split"),
         (_set((*_D1, "atoms"), 3), "atoms"),
         (_set((*_D1, "fanout"), "ring"), "fanout"),
@@ -976,6 +1128,21 @@ def test_fused_ladder_file_rejects(tmp_path, edit, match):
     doc = _ladder_doc()
     edit(doc["platforms"][0])
     with pytest.raises(ValueError, match=match):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_ladder_file_rejects_a_mixed_handshake_ladder(tmp_path):
+    """One engine set serves a width's ladder, so its rungs name one handshake;
+    the loader says so up front, not at the first launch."""
+    doc = _ladder_doc()
+    plat = doc["platforms"][0]
+    for edit in (
+        _set((*_MESH, "rungs", 0, "super_tile"), 1),
+        _set((*_MESH, "rungs", 1, "super_tile"), 1),
+        _set((*_MESH, "rungs", 1, "handshake"), "lamport"),
+    ):
+        edit(plat)
+    with pytest.raises(ValueError, match="one handshake"):
         P.load_fused_ladders(_write_ladders(tmp_path, doc))
 
 
@@ -1307,3 +1474,567 @@ def test_old_ipc_module_name_still_imports():
     from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap as Old
 
     assert Old is UncachedIpcHeap
+
+
+# --- Lamport mesh tuning knobs ------------------------------------------------
+
+
+def test_mesh_knobs_default_tag_and_string_are_empty():
+    k = P.DEFAULT_MESH_KNOBS
+    assert k == P.MeshKnobs() and k.is_default()
+    assert k.tag() == "" and str(k) == ""
+    assert P.MeshKnobs.parse("") == k and P.MeshKnobs.parse(None) == k
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "stripe=full",
+        "fanout=sector",
+        "fanout=peer",
+        "poll_sleep=2",
+        "recv_order=per_source",
+        "prefetch=1",
+        "lds_bufs=2",
+        "prio=1",
+        "stripe=full;prefetch=1",
+        (
+            "stripe=full;fanout=peer;poll_sleep=1;recv_order=per_source;"
+            "prefetch=1;lds_bufs=2;prio=2"
+        ),
+    ],
+)
+def test_mesh_knobs_parse_round_trip(text):
+    k = P.MeshKnobs.parse(text)
+    assert not k.is_default()
+    assert P.MeshKnobs.parse(str(k)) == k
+    # The string form is canonical (field order); the tag is deterministic.
+    assert str(k) == str(P.MeshKnobs.parse(str(k)))
+    assert k.tag() == P.MeshKnobs.parse(str(k)).tag() and k.tag().startswith("_k")
+    assert P.MeshKnobs.parse(k) is k
+
+
+def test_mesh_knobs_tag_example_and_uniqueness():
+    k = P.MeshKnobs.parse("prefetch=1;stripe=full")
+    assert k.tag() == "_kstripefull_kpre1" and str(k) == "stripe=full;prefetch=1"
+    singles = [
+        "stripe=full",
+        "fanout=sector",
+        "fanout=peer",
+        "poll_sleep=1",
+        "poll_sleep=2",
+        "recv_order=per_source",
+        "prefetch=1",
+        "lds_bufs=2",
+        "prio=1",
+        "prio=2",
+    ]
+    tags = [P.MeshKnobs.parse(t).tag() for t in singles]
+    assert len(set(tags)) == len(tags)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "nosuch=1",
+        "stripe=wide",
+        "fanout=atom",
+        "poll_sleep=3",
+        "poll_sleep=x",
+        "recv_order=random",
+        "prefetch=2",
+        "lds_bufs=3",
+        "prio=-1",
+        "stripe",
+        "stripe=full;stripe=cap8",
+    ],
+)
+def test_mesh_knobs_parse_rejects_bad_input(text):
+    with pytest.raises(ValueError):
+        P.MeshKnobs.parse(text)
+
+
+def test_mesh_knobs_constructor_rejects_bad_values():
+    for kw in ({"prefetch": True}, {"prio": 7}, {"stripe": "x"}):
+        with pytest.raises(ValueError):
+            P.MeshKnobs(**kw)
+
+
+def test_two_shot_rung_knob_combinations():
+    base = {"min_bytes": 0, "grid_cap": 64, "block": 256}
+    on = P.MeshKnobs.parse("stripe=full;lds_bufs=2")
+    pre = P.MeshKnobs.parse("prefetch=1")
+    # Defaults are legal on every handshake and super-tile.
+    P.TwoShotRung(**base, super_tile=8, handshake="flag")
+    P.TwoShotRung(**base, super_tile=8, handshake="lamport")
+    # Any non-default knob needs the Lamport handshake.
+    with pytest.raises(ValueError, match="lamport"):
+        P.TwoShotRung(**base, super_tile=1, handshake="flag", knobs=on)
+    P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    P.TwoShotRung(**base, super_tile=8, handshake="lamport", knobs=on)
+    # prefetch is ST=1 only.
+    P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=pre)
+    with pytest.raises(ValueError, match="super_tile=1"):
+        P.TwoShotRung(**base, super_tile=2, handshake="lamport", knobs=pre)
+    # ``dataclasses.replace`` re-validates, as the host does with the handshake.
+    rung = P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    with pytest.raises(ValueError, match="lamport"):
+        dataclasses.replace(rung, handshake="flag")
+
+
+def test_lamport_super_tiles_2_and_4_flag_does_not():
+    assert P.mesh_super_tiles("lamport") == (1, 2, 4, 8)
+    assert P.mesh_super_tiles("flag") == P.SUPER_TILES == (1, 8)
+    assert set(P.RING_SUPER_TILES) >= {1, 8}
+    kernel = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh")
+    # The kernel's own build check is handshake-aware too.
+    for st in (2, 4):
+        with pytest.raises(ValueError, match="super_tile"):
+            kernel.make_quick_allreduce_mesh_kernel(
+                world_size=8,
+                super_tile=st,
+                grid=8,
+                inbox_memory="uncached",
+                codec="int4",
+                block=256,
+                rank=0,
+                handshake="flag",
+            )
+
+
+def test_fused_two_shot_check_is_handshake_aware():
+    check = P._two_shot_check(
+        P.SUPER_TILES, low_latency=True, by_handshake=P.mesh_super_tiles
+    )
+
+    def mk(st, hs):
+        return P.FusedTwoShotRung(min_bytes=0, super_tile=st, grid_cap=8, handshake=hs)
+
+    check(mk(2, "lamport"), "r")
+    check(mk(4, "lamport"), "r")
+    with pytest.raises(ValueError, match="super_tile"):
+        check(mk(2, "flag"), "r")
+
+
+def test_mesh_lds_bytes_counts_the_buffers():
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import mesh_lds_bytes
+
+    one = mesh_lds_bytes(256, 8, "int4")
+    assert mesh_lds_bytes(256, 8, "int4", lds_bufs=2) == 2 * one
+    assert mesh_lds_bytes(256, 8, "int4", 16, 2) == 2 * one + 64
+
+
+# --- Fused Lamport mesh tuning knobs ---------------------------------------------
+
+
+def _shipped_fused_doc():
+    with open(P.fused_ladders_path()) as f:
+        return json.load(f)
+
+
+def _first_lamport_mesh_rung(doc):
+    for plat in doc["platforms"]:
+        spec = plat["mesh"]["default"]
+        rung = spec["rungs"][0]
+        if rung.get("handshake") == "lamport":
+            return plat, rung
+    raise AssertionError("no Lamport mesh rung in the shipped file")
+
+
+def test_fused_json_knobs_parse(tmp_path):
+    doc = _shipped_fused_doc()
+    plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = "stripe=full;fanout=peer"
+    got = P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    cell = (plat["arch"], plat["link"], plat["world_size"], None)
+    assert got.mesh[cell][0].knobs == P.MeshKnobs(stripe="full", fanout="peer")
+    # Lamport accepts super-tiles 2 and 4 on a fused mesh rung too.
+    rung["super_tile"] = 2
+    got = P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    assert got.mesh[cell][0].super_tile == 2
+
+
+@pytest.mark.parametrize(
+    "knobs, match",
+    [
+        ("nosuch=1", "knobs"),
+        ("stripe=wide", "knobs"),
+        ("prefetch=1", "prefetch"),
+        (7, "string"),
+    ],
+)
+def test_fused_json_rejects_bad_knobs(tmp_path, knobs, match):
+    doc = _shipped_fused_doc()
+    _plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = knobs
+    with pytest.raises(ValueError, match=match):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_json_rejects_knobs_on_flag_and_ring_rungs(tmp_path):
+    doc = _shipped_fused_doc()
+    plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = "stripe=full"
+    rung["handshake"] = "flag"
+    with pytest.raises(ValueError, match="lamport"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    # A flag rung may not take super_tile 2 either.
+    doc = _shipped_fused_doc()
+    _plat, rung = _first_lamport_mesh_rung(doc)
+    rung["handshake"] = "flag"
+    rung["super_tile"] = 2
+    with pytest.raises(ValueError, match="super_tile"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    # The ring takes no knobs, Lamport or not.
+    doc = _shipped_fused_doc()
+    plat = doc["platforms"][0]
+    ring_rung = plat["ring"]["default"]["rungs"][0]
+    ring_rung["handshake"] = "lamport"
+    ring_rung["knobs"] = "stripe=full"
+    with pytest.raises(ValueError, match="mesh rung"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_rung_knob_rules():
+    base = {"min_bytes": 0, "grid_cap": 8}
+    on = P.MeshKnobs.parse("stripe=full;fanout=peer")
+    P.FusedTwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    # Low latency composes with the knobs (checked on the GPU).
+    P.FusedTwoShotRung(
+        **base, super_tile=1, low_latency=True, handshake="lamport", knobs=on
+    )
+    with pytest.raises(ValueError, match="lamport"):
+        P.FusedTwoShotRung(**base, super_tile=1, handshake="flag", knobs=on)
+    with pytest.raises(ValueError, match="prefetch"):
+        P.FusedTwoShotRung(
+            **base,
+            super_tile=1,
+            handshake="lamport",
+            knobs=P.MeshKnobs.parse("prefetch=1"),
+        )
+
+
+@pytest.mark.parametrize("rung_cls", [P.TwoShotRung, P.FusedTwoShotRung])
+def test_handshake_pin_resets_knobs_alike_in_both_engines(rung_cls):
+    from aiter.ops.flydsl.quick_allreduce import _pin_handshake
+
+    on = P.MeshKnobs.parse("stripe=full;fanout=peer")
+    extra = {"block": 256} if rung_cls is P.TwoShotRung else {}
+    tuned = rung_cls(
+        min_bytes=0,
+        super_tile=1,
+        grid_cap=64,
+        handshake="lamport",
+        knobs=on,
+        **extra,
+    )
+    assert _pin_handshake(tuned, "lamport") == tuned
+    flagged = _pin_handshake(tuned, "flag")
+    assert flagged.handshake == "flag"
+    assert flagged.knobs == P.DEFAULT_MESH_KNOBS
+
+
+def test_shipped_fused_ladders_knobs_are_legal():
+    ladders = P.load_fused_ladders(P.fused_ladders_path())
+    for rungs in ladders.ring.values():
+        assert all(r.knobs == P.DEFAULT_MESH_KNOBS for r in rungs)
+    for rungs in ladders.mesh.values():
+        assert all(
+            r.knobs == P.DEFAULT_MESH_KNOBS or r.handshake == "lamport" for r in rungs
+        )
+
+
+# The hierarchical schedule
+# =========================
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_flat_host_never_selects_hier(cell):
+    """A table row is the policy of a host that does not split: the
+    hierarchical window stays off until ``with_topology`` turns it on."""
+    for row in (_row(*cell), _row(*cell).with_topology(hierarchical=False)):
+        assert row.window(HIER, quantized=True) is None
+        assert HIER not in row.algorithms(quantized=True)
+        for k in range(4, 33):
+            assert row.select(1 << k, quantized=True) != HIER
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_hier_takes_its_window_first_on_a_split_host(cell):
+    """On a split host every payload of the hier window runs hier and the rest
+    runs what the flat host runs, so the mesh window lies inside the hier one."""
+    flat = _row(*cell)
+    split = flat.with_topology(hierarchical=True)
+    hier = flat.hier
+    if hier is None:
+        assert split == dataclasses.replace(flat, hierarchical=False)
+        return
+    assert split.mesh is None or split.mesh.max <= hier.min
+    for k in range(4, 33):
+        n = 1 << k
+        if hier.contains(n):
+            assert split.select(n, quantized=True) == HIER
+        else:
+            assert split.select(n, quantized=True) == flat.select(n, quantized=True)
+
+
+def _weights(n, group_of, near=40, far=72):
+    return [
+        [
+            0 if i == j else (near if group_of(i) == group_of(j) else far)
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize(
+    "weights, want",
+    [
+        # The MI350P host: two sockets of four.
+        (_weights(8, lambda r: r // 4), ((0, 1, 2, 3), (4, 5, 6, 7))),
+        # Interleaved rank order.
+        (_weights(8, lambda r: r % 2), ((0, 2, 4, 6), (1, 3, 5, 7))),
+        # TP4 across the sockets (GPUs 0, 1, 4, 5).
+        (_weights(4, lambda r: r // 2), ((0, 1), (2, 3))),
+        # A uniform xGMI mesh is flat.
+        (_weights(8, lambda r: 0, near=15), ((0, 1, 2, 3, 4, 5, 6, 7),)),
+        # Unequal groups are flat.
+        (_weights(8, lambda r: r < 5), ((0, 1, 2, 3, 4, 5, 6, 7),)),
+        # Singleton groups are flat.
+        (_weights(4, lambda r: r), ((0, 1, 2, 3),)),
+    ],
+)
+def test_socket_groups(weights, want):
+    assert H.socket_groups(weights) == want
+
+
+def test_socket_groups_needs_one_far_weight():
+    """Two different cross-group weights are not a uniform split."""
+    w = _weights(8, lambda r: r // 4)
+    w[0][4] = w[4][0] = 80
+    assert H.socket_groups(w) == (tuple(range(8)),)
+
+
+def test_peer_topology_partner():
+    topo = H.PeerTopology(groups=((0, 2, 4, 6), (1, 3, 5, 7)))
+    assert topo.is_hierarchical
+    assert [topo.partner(r) for r in range(8)] == [1, 0, 3, 2, 5, 4, 7, 6]
+    assert topo.local_index(5) == 2
+    assert not H.PeerTopology(groups=(tuple(range(8)),)).is_hierarchical
+
+
+@pytest.mark.parametrize(
+    "grid, block, cu_count, want",
+    [
+        # One workgroup per CU of 4 waves: one wave per SIMD.
+        (128, 256, 128, 1),
+        # A lone 8-wave workgroup still takes two waves on each SIMD.
+        (64, 512, 128, 2),
+        # The shipped PCIe TP8 hier rung: two b512 workgroups per CU.
+        (256, 512, 128, 4),
+        # Three 2-wave workgroups per CU spread over the 4 SIMDs.
+        (384, 128, 128, 2),
+        # One workgroup past a whole number per CU rounds up.
+        (129, 256, 128, 2),
+    ],
+)
+def test_resident_waves_per_eu(grid, block, cu_count, want):
+    assert H.resident_waves_per_eu(grid=grid, block=block, cu_count=cu_count) == want
+
+
+def test_check_resident_grid_raises_on_a_grid_that_cannot_be_resident():
+    """A persistent grid larger than the compiled kernel's occupancy would
+    hang; the check raises before the first launch instead."""
+    artifact = SimpleNamespace(max_blocks_per_cu=lambda: 2)
+    with mock.patch.object(H, "_launch_artifacts", return_value=[artifact]):
+        H.check_resident_grid(object(), grid=256, cu_count=128, owner="t")
+        with pytest.raises(RuntimeError, match="would hang"):
+            H.check_resident_grid(object(), grid=257, cu_count=128, owner="t")
+
+
+@pytest.mark.parametrize(
+    "plain_per_cu, hinted_per_cu, want",
+    [
+        # Fits as compiled: no hint, one compile, the code it had.
+        (2, 2, {}),
+        # Does not fit: compiled again under the grid's waves-per-EU floor.
+        (1, 2, {"waves_per_eu": 4}),
+        # Not even the floor fits: raise instead of hanging.
+        (1, 1, None),
+    ],
+)
+def test_quick_allreduce_loads_a_binary_whose_grid_is_resident(
+    plain_per_cu, hinted_per_cu, want
+):
+    """``FlyQuickAllReduce._load_checked`` keeps a binary that fits its
+    persistent grid, and recompiles one that does not under the
+    ``waves_per_eu`` floor of the grid (``resident_waves_per_eu``)."""
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    from aiter.ops.flydsl import quick_allreduce as QA
+
+    launch = SimpleNamespace(_mem_cache={})
+
+    def preload(launch, *args):
+        # One artifact per distinct set of compile hints, as FlyDSL keys it.
+        hints = CompilationContext.get_compile_hints()
+        per_cu = hinted_per_cu if hints.get("waves_per_eu") else plain_per_cu
+        key = tuple(sorted(hints.items()))
+        launch._mem_cache.setdefault(
+            key, SimpleNamespace(max_blocks_per_cu=lambda: per_cu)
+        )
+
+    # The shipped PCIe TP8 hier rung: 256 b512 workgroups on 128 CUs.
+    eng = SimpleNamespace(launch=launch, grid=256, block=512, compile_hints=None)
+    host = SimpleNamespace(_cu_count=128)
+    with mock.patch.object(QA, "preload_launcher", side_effect=preload) as loads:
+        if want is None:
+            with pytest.raises(RuntimeError, match="would hang"):
+                QA.FlyQuickAllReduce._load_checked(host, eng, ())
+            return
+        assert QA.FlyQuickAllReduce._load_checked(host, eng, ()) == want
+        assert eng.compile_hints == want
+        assert len(launch._mem_cache) == (1 if not want else 2)
+        # A second load, e.g. a first call inside a HIP graph capture after
+        # ``preload``, reuses the decision: no compile, no module load and no
+        # occupancy query, which capture forbids.
+        n = loads.call_count
+        for artifact in launch._mem_cache.values():
+            artifact.max_blocks_per_cu = mock.Mock(side_effect=AssertionError)
+        assert QA.FlyQuickAllReduce._load_checked(host, eng, ()) == want
+        assert loads.call_count == n
+
+
+@pytest.mark.parametrize(
+    "text, want",
+    [
+        ("0,1,2,3;4,5,6,7", ((0, 1, 2, 3), (4, 5, 6, 7))),
+        (" 2,3 ; 0,1 ", ((0, 1), (2, 3))),
+    ],
+)
+def test_parse_groups_env(text, want):
+    assert H.parse_groups_env(text, len([r for g in want for r in g])) == want
+
+
+@pytest.mark.parametrize("text", ["0,1;2", "0,1;1,2,3", "a,b;c,d"])
+def test_parse_groups_env_rejects(text):
+    with pytest.raises(ValueError):
+        H.parse_groups_env(text, 4)
+
+
+def test_kfd_link_weights_from_a_fake_tree(tmp_path):
+    """Weights come from ``io_links`` and ``p2p_links`` alike."""
+    for node, links in {
+        2: [("io_links", 0, 20), ("p2p_links", 3, 40), ("p2p_links", 4, 72)],
+        3: [("p2p_links", 2, 40), ("p2p_links", 4, 72)],
+        4: [("io_links", 2, 72), ("p2p_links", 3, 72)],
+    }.items():
+        for k, (sub, to, weight) in enumerate(links):
+            d = tmp_path / str(node) / sub / str(k)
+            d.mkdir(parents=True)
+            (d / "properties").write_text(
+                f"type 2\nnode_from {node}\nnode_to {to}\nweight {weight}\n"
+            )
+    assert H.kfd_link_weights([2, 3, 4], root=tmp_path) == [
+        [0, 40, 72],
+        [40, 0, 72],
+        [72, 72, 0],
+    ]
+    # A pair with no link at all: unknown.
+    assert H.kfd_link_weights([2, 3, 5], root=tmp_path) is None
+
+
+def test_hier_rung_takes_a_handshake_but_no_knobs():
+    base = {"min_bytes": 0, "super_tile": 1, "grid_cap": 64, "block": 256}
+    for hs in P.HANDSHAKES:
+        assert P.HierRung(**base, handshake=hs).handshake == hs
+    with pytest.raises(ValueError, match="knobs"):
+        P.HierRung(**base, handshake="lamport", knobs=P.MeshKnobs(stripe="full"))
+
+
+def test_lamport_finegrained_inbox_holds_the_late_rearm_buffers():
+    """On a fine-grained inbox the Lamport mesh and ring re-arm a round late,
+    which takes four buffers on the mesh (three uncached) and three on the
+    ring (two uncached); the flag handshake is the same on both."""
+    mesh = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh")
+    ring = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_ring")
+
+    def data_bytes(build, memory, **kw):
+        return build(inbox_memory=memory, rank=0, grid=64, **kw)["data_bytes"]
+
+    for build, kw, ratio in (
+        (
+            mesh.make_quick_allreduce_mesh_kernel,
+            {"world_size": 8, "super_tile": 1, "codec": "int4", "block": 256},
+            (4, 3),
+        ),
+        (
+            ring.make_quick_allreduce_ring_kernel,
+            {
+                "world_size": 8,
+                "super_tile": 8,
+                "rs_codec": "int6",
+                "ag_codec": "int4",
+                "block": 256,
+            },
+            (3, 2),
+        ),
+    ):
+        fine = data_bytes(build, "finegrained", handshake="lamport", **kw)
+        uncached = data_bytes(build, "uncached", handshake="lamport", **kw)
+        assert fine * ratio[1] == uncached * ratio[0]
+        assert data_bytes(build, "finegrained", handshake="flag", **kw) == data_bytes(
+            build, "uncached", handshake="flag", **kw
+        )
+
+
+@pytest.mark.parametrize(
+    "text", ("0,1,2;3,4,5,6,7", "0,1,2,3,4,5,6,7", "0,1;2,3;4,5;6,7", "0;1,2,3,4,5,6,7")
+)
+def test_groups_override_the_hier_kernel_cannot_build_on_is_rejected(text):
+    """``parse_groups_env`` accepts any partition of the ranks; the backend runs
+    ``check_groups`` on the probed groups and falls back to the flat schedules
+    when it raises, instead of failing in the engine build."""
+    from aiter.ops.flydsl.comm_collectives_host_shared import parse_groups_env
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
+
+    groups = parse_groups_env(text, 8)
+    with pytest.raises(ValueError):
+        check_groups(groups, 8)
+    assert check_groups(parse_groups_env("0,1,2,3;4,5,6,7", 8), 8)
+
+
+def test_check_groups_order_is_canonical():
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import check_groups
+
+    a = check_groups(((4, 5, 6, 7), (0, 1, 2, 3)), 8)
+    assert (
+        a
+        == check_groups(((3, 2, 1, 0), (7, 6, 5, 4)), 8)
+        == ((0, 1, 2, 3), (4, 5, 6, 7))
+    )
+
+
+def test_lamport_grid_clamp_follows_the_codec():
+    """The Lamport mesh's VGPR count grows with the codec, so a wider one is
+    resident fewer workgroups per CU."""
+    from aiter.ops.flydsl.comm_collectives_host_shared import clamp_grid_cap
+
+    def cap(codec):
+        return clamp_grid_cap(
+            10_000,
+            arch="gfx950",
+            world_size=8,
+            super_tile=1,
+            cu_count=256,
+            handshake="lamport",
+            codec=codec,
+        )
+
+    assert [cap(c) for c in ("int4", "int5", "int6", "fp16")] == [
+        4 * 256,
+        3 * 256,
+        3 * 256,
+        2 * 256,
+    ]
