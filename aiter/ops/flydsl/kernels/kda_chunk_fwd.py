@@ -280,6 +280,17 @@ def lds_st_n(view_n, i, vals, num):
     )
 
 
+def lds_ld_n(view_n, i, n, num):
+    frag = fx.make_rmem_tensor(n, num)
+    fx.copy(
+        fx.make_copy_atom(fx.UniversalCopy(n * _bits(num)), num),
+        fx.slice(view_n, (i // n, None)),
+        frag,
+    )
+    vec = fx.Vector(frag.load())
+    return [vec[e] if num is fx.Float32 else vec[e].to(fx.Float32) for e in range(n)]
+
+
 def lds_st4(view4, i, vals):
     frag = fx.make_rmem_tensor(4, fx.Float32)
     frag.store(fx.Vector.from_elements([fx.Float32(x) for x in vals], dtype=fx.Float32))
@@ -889,7 +900,7 @@ def compile_output(
             lds_ld4(s_a4, ia * BT + jt * 16 + lk, BF)
             for jt in range_constexpr(BT // 16)
         ]
-        o_v = _flat(o, hb * V)
+        s_qg = _lds(lds.qg, BT * K)
         for nt in range_constexpr(V // 16):
             c = nt * 16 + lr
             acc_h = _zero4()
@@ -898,10 +909,23 @@ def compile_output(
             acc_v = _zero4()
             for jt in range_constexpr(BT // 16):
                 acc_v = _mfma(aa[jt], lds_ld4(s_vn4, c * BT + jt * 16 + lk, BF), acc_v)
+            # Each wave only rewrites its own qg rows, already in registers.
             for vi in range_constexpr(4):
-                i = wave * 16 + lk + vi
-                if i < nvalid:
-                    stg(o_v, i * (H * V) + c, acc_h[vi] * scale + acc_v[vi], ON)
+                lds_st(
+                    s_qg,
+                    (wave * 16 + lk + vi) * K + c,
+                    acc_h[vi] * scale + acc_v[vi],
+                    BF,
+                )
+        gpu.barrier()
+        r = tid // 4
+        c0 = (tid % 4) * NE
+        if r < nvalid:
+            s_o8 = _lds_n(lds.qg, BT * K, 8)
+            o_vn = _vflat(o, hb * V, 8)
+            for m in range_constexpr(NE // 8):
+                x = lds_ld_n(s_o8, r * K + c0 + 8 * m, 8, BF)
+                stg_n(o_vn, r * (H * V) + c0 + 8 * m, x, ON)
 
     @flyc.jit
     def launch(
