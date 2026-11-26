@@ -679,8 +679,61 @@ def test_top_k_top_p_fast_path_vs_core_equivalence(vocab_size, k, p):
             )
 
 
+def _fast_path_reference(probs, k, p):
+    """The fast path with a reference top-k: a stable sort ranks tied values by
+    index, and the k survivors go to top-p in index order."""
+    _, order = torch.sort(probs, dim=-1, descending=True, stable=True)
+    ids, _ = order[:, :k].sort(dim=-1)
+    values = probs.gather(1, ids)
+    denom = values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    s = denom.squeeze(-1)
+    top_p = (torch.full_like(s, float(p)) / s).clamp_(max=1.0)
+    local = torch.ops.aiter.top_p_sampling_from_probs(
+        values / denom, None, top_p, 0.0, deterministic=True
+    )
+    return ids.gather(1, local.view(-1, 1).long()).squeeze(1).to(torch.int32)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("vocab_size", [151936, 248320])
+@pytest.mark.parametrize("tied", [False, True])
+def test_top_k_top_p_fast_path_deterministic(batch_size, vocab_size, tied):
+    """With deterministic=True, the fast path gives the same tokens from the
+    same probs and RNG state, and they are the tokens of the reference.
+
+    The default radix select returns the k survivors in no fixed order, and
+    the top-p draw picks by position. When the select ignored `deterministic`,
+    two calls agreed in 14 of 50 trials at batch 1 and in 0 of 50 at batch 4
+    to 256 (MI355X, vocab 248077, k=20, p=0.95). `tied` rounds the logits to
+    bf16, as model logits are, so that some rows have ties at the k-th value.
+    """
+    k, p = 20, 0.95
+    torch.manual_seed(0)
+    logits = torch.randn(batch_size, vocab_size) * 3
+    if tied:
+        logits = logits.bfloat16().float()
+    probs = torch.softmax(logits / 0.8, dim=-1)
+
+    def draw(fn, seed):
+        torch.cuda.manual_seed(seed)
+        return fn()
+
+    def fast():
+        # scalar k <= 256 over a vocab >= 65536 -> fast path
+        return torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            probs, None, None, k, None, p, deterministic=True
+        )
+
+    for seed in range(20):
+        first, second = draw(fast, seed), draw(fast, seed)
+        ref = draw(lambda: _fast_path_reference(probs, k, p), seed)
+        assert torch.equal(first, second), f"seed {seed}: {first} vs {second}"
+        assert torch.equal(first, ref), f"seed {seed}: {first} vs reference {ref}"
+
+
 if __name__ == "__main__":
     test_top_k_top_p_joint_sampling_from_probs(40, 129280, 0.6, 20)
+    test_top_k_top_p_fast_path_deterministic(64, 248320, True)
     # test_top_k_top_p_statistical_distribution(10, 10000, 5, 0.3)
     # test_top_k_renorm_probs(1, 129280, 10)
     # test_top_p_sampling(1, 129280, 0.1)
