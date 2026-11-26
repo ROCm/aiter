@@ -135,6 +135,11 @@ for file in "${sharded_files[@]}"; do
             # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_mla_nvfp4.py|op_tests/test_mla_nvfp4_decode_prep.py)
+            # The test cases are pytest functions; test_mla_nvfp4.py has no script
+            # entry point and the decode prep's is a benchmark. Both skip off gfx1250.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
