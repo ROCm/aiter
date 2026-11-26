@@ -89,29 +89,21 @@ class DispatchSlot(IntEnum):
     P2P_SRCMAP = 3
     P2P_RUNNING = 4
     P2P_COUNT_DONE = 5
-    SORTED_EXPERT = 6
-    TILE_ROW_BASE = 7
-    NUM_VALID = 8
     RUNNING = 9
     COUNT_DONE = 10
-    # 11: unused.
     LAUNCH_EPOCH = 12  # i32 epoch of the last launch, at index entry_slot
     WORK_HEAD = 13
     GROUP_DONE = 14
-    TILE_ROWS = 15
     # GEMM2 and combine.
     G2_AQ = 16
     G2_ASCALE = 17
     G2_BQ = 18
     G2_BSCALE = 19
-    G2_EIDS = 20
     G2_STIDS = 21
     G2_SWEIGHTS = 22
-    G2_TRB = 23
     G2_P2P_COMB_INP = 24
     G2_CNT = 25
     G2_READY = 26
-    G2_MAX_M_BLOCKS = 27
     FC_CNT = 28
     FC_XDB = 29
     FC_P2P_XDB = 30
@@ -119,9 +111,6 @@ class DispatchSlot(IntEnum):
     FC_OUT = 32
     FC_TRECV = 33
     PLAN_NV = 34  # i64 (launch_epoch << 32 | row-count bits | num_valid): plan flag that carries num_valid
-    XCD_ACQ = (
-        35  # per-XCD i64 copy of PLAN_NV, republished after that XCD's L2 invalidation
-    )
     # Byte offsets of the token-row regions (one row per source rank and token) from the payload rows
     # and from their scales; the same on every rank (symmetric heap).
     TOKEN_ROWS = 36
@@ -499,17 +488,14 @@ def _interleaved_rows(count, num_tiles):
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, uniform=False, running_half=None, stream_w=False,
+    *, fz_npes, fz_epr, fz_cap, fz_tile_m, addr_disp, parity, expected, plan_nv, uniform=False, running_half=None,
+    stream_w=False,
 ):
-    """Finalize local fixed slots as soon as every source publishes this destination.
+    """Publish this rank's plan flag as soon as every source published to it.
 
-    ``plan_nv = (addr, epoch)``: the local plan is published as one i64 ``epoch << 32 | num_valid`` store, so
-    consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
-    is left unwritten: GEMM2 masks rows past the tile's valid count itself.
-    ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
-    M-tile t of an expert with nt m-tiles takes its slots t, t + nt, ... (_interleaved_rows); the tile's rows
-    word carries nt in its high half.
+    ``plan_nv = (addr, epoch)``: the flag is one i64 ``epoch << 32 | _plan_flag`` store; the consumers build the plan
+    itself in their own LDS. ``running_half``: the expert counters are two halves of fz_epr; this launch's routes
+    counted into this one.
     """
     assert 0 < fz_epr <= 256, "direct fixed-slot finalize requires 1..256 experts per rank"
     disp = ptr_buf_tensor(addr_disp, fx.Int64)
@@ -520,15 +506,10 @@ def emit_direct_fixed_slot_finalize(
             v = fx.Int64(comm_ops.wave_uniform_i64(v))
         return v
 
-    a_se = dp(DispatchSlot.SORTED_EXPERT)
-    a_trb = dp(DispatchSlot.TILE_ROW_BASE)
-    a_nv = dp(DispatchSlot.NUM_VALID)
     a_running = dp(DispatchSlot.RUNNING)
     if const_expr(running_half is not None):
         a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
     a_source_done = dp(DispatchSlot.COUNT_DONE)
-    a_tile_rows = dp(DispatchSlot.TILE_ROWS)
-    wt_cm = _SC0_SC1_CACHE if const_expr(plan_wt) else 0
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -538,36 +519,9 @@ def emit_direct_fixed_slot_finalize(
             done_index = parity * fx.Int32(fz_npes) + source
             comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
-
-        chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow = _plan_counts(
+        _chunks, total_tiles, routed_rows, max_count, _overflow, no_overflow = _plan_counts(
             a_running, lane, fz_epr, fz_cap, fz_tile_m)
         hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-        se_t, trb_t, nv_t, tile_rows_t = (ptr_buf_tensor(a, fx.Int32) for a in (a_se, a_trb, a_nv, a_tile_rows))
-
-        for chunk in range_constexpr(len(chunks)):
-            valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
-            if valid_expert:
-                if no_overflow:
-                    global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
-                    payload_base = safe_expert * fx.Int32(fz_cap)
-                    rows_q, rows_r = _interleaved_rows(safe_count, num_expert_tiles)
-                    for tile in range(fx.Int32(0), num_expert_tiles, 1):
-                        metadata_index = metadata_base + tile
-                        buf_copy_store(se_t, metadata_index, global_expert, cache_modifier=wt_cm)
-                        buf_copy_store(trb_t, metadata_index, payload_base + tile, cache_modifier=wt_cm)
-                        rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
-                        rows = rows | (num_expert_tiles << fx.Int32(16))
-                        buf_copy_store(tile_rows_t, metadata_index, rows, cache_modifier=wt_cm)
-
-        if lane == fx.Int32(0):
-            num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            buf_copy_store(nv_t, fx.Int32(0), num_valid, cache_modifier=wt_cm)
-            # num_valid[1] is a device-visible overflow status.
-            buf_copy_store(nv_t, fx.Int32(1), overflow_count, cache_modifier=wt_cm)
-
-        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        if const_expr(not plan_wt):
-            comm_ops.fence_system_release()
         if lane == fx.Int32(0):
             nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
             comm_ops.store_i64_global_system(
@@ -801,7 +755,7 @@ def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fused: tuple, sort_block_m: int = 64,
     tile_n: int = 256, num_waves: int = 4, grid_mult: int = 2, waves_per_eu_hint: int = 2, num_cu: int = 256,
-    num_dispatch_cu: int = 32, b_nt: int = 3, swiglu_limit: float = 0.0, plan_wt: bool = False,
+    num_dispatch_cu: int = 32, b_nt: int = 3, swiglu_limit: float = 0.0,
     g2_early: tuple = (0, 0), head_uniform: bool = False, g2_epi_lean: int = 0, direct_done: int = 0,
     tok_done: bool = False, tok_counters: bool = False, bf16_head_tokens: int = 0, stream_w: bool = False,
     a_dtype: str = "fp8",
@@ -944,7 +898,6 @@ def compile_mega_moe_stage1(
         f"megamoe_small_stage1_w{NUM_WAVES}_gm{grid_mult}_dcu{dispatch_blocks}_wpe{waves_per_eu_hint}"
         f"_bnt{b_cache_modifier}{swiglu_suffix}"
         f"_fused{'_'.join(str(v) for v in fused)}"
-        f"{'_pw' if plan_wt else ''}"
         f"{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
         f"{'_hu' if head_uniform else ''}{f'_dn{direct_done}' if direct_done else ''}"
         f"{'_td' if tok_done else ''}"
@@ -1045,10 +998,10 @@ def compile_mega_moe_stage1(
             )
         if owner:
             emit_direct_fixed_slot_finalize(
-                fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-                fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
-                expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch),
-                plan_wt=plan_wt, uniform=head_uniform, running_half=running_half, stream_w=stream_w,
+                fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_tile_m=fz_tile_m, addr_disp=addr_disp,
+                parity=payload_parity, expected=payload_expected,
+                plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch), uniform=head_uniform,
+                running_half=running_half, stream_w=stream_w,
             )
         # The rows sit in the token-row region (row source rank * mtpr + token) and GEMM1 maps its tile rows through
         # the srcmap; the region offsets are read past the plan. A constant bound keeps the A buffer resource scalar.
@@ -1457,7 +1410,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     k1, k2 = config.fused_stage1, config.fused_stage2
     # fmt: off
     return dict(  # noqa: C408
-        plan_wt=k1.plan_wt, g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), head_uniform=k1.head_uniform,
+        g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), head_uniform=k1.head_uniform,
         g2_epi_lean=k1.g2_epi_lean, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, stream_w=k1.stream_w,
     )
@@ -1648,14 +1601,10 @@ class SmallMRuntime:
         op = self.comb_op._gm
         assert op is not None, "combine op was built without enable_group_major"
         self._s1_op = op
-        # Metadata of one block an m-tile. The 32-row m-tiles of the small buckets (at most one per 32 routed rows
-        # and one more per expert) fit it too.
+        # One GEMM2 count and ready word an m-tile. The 32-row m-tiles of the small buckets (at most one per 32
+        # routed rows and one more per expert) fit them too.
         metadata_blocks = (op.num_valid_max + self.sort_block_m - 1) // self.sort_block_m
         assert ceildiv(self.world_size * self.mtpr * self.topk, 32) + self.epr <= metadata_blocks
-        if metadata_blocks > op.max_blocks:
-            op.max_blocks = metadata_blocks
-            op.sorted_expert_ids = torch.zeros(metadata_blocks, dtype=torch.int32, device=self.dev)
-            op.tile_row_base = torch.zeros(metadata_blocks, dtype=torch.int32, device=self.dev)
         self._s1_nvm = op.num_valid_max
         self._s1_cap = op.ll_cap
         self._s1_epoch_parity = torch.zeros(1, dtype=torch.int32, device=self.dev)
@@ -1699,11 +1648,9 @@ class SmallMRuntime:
             "launch_epoch": zeros(11),
             "work_head": zeros(8 * 16),
             "group_done": zeros(1),
-            "tile_rows": zeros(metadata_blocks),
             "g2_cnt": zeros(metadata_blocks),
             "g2_ready": zeros(metadata_blocks),
             "plan_nv": zeros(1, torch.int64),
-            "xcd_acq": zeros(8 * 16, torch.int64),  # one 128-byte line per XCD
         }
         workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
         if self._protocol.tok_counters:
@@ -1733,17 +1680,14 @@ class SmallMRuntime:
         workspace = self._s1_dispatch_workspace
         table = [0] * DISPATCH_TABLE_SIZE
         for slot in (
-            "launch_epoch", "work_head", "group_done", "tile_rows", "count_done", "p2p_count_done",
-            "g2_cnt", "g2_ready", "plan_nv", "xcd_acq",
+            "launch_epoch", "work_head", "group_done", "count_done", "p2p_count_done", "g2_cnt", "g2_ready",
+            "plan_nv",
         ):
             table[DispatchSlot[slot.upper()]] = workspace[slot].data_ptr()
         table[DispatchSlot.P2P_TOKEN] = op.p2p_rx_em.data_ptr()
         table[DispatchSlot.P2P_SCALE] = op.p2p_scale_em.data_ptr()
         table[DispatchSlot.P2P_WEIGHT] = op.p2p_wts_em.data_ptr()
         table[DispatchSlot.P2P_SRCMAP] = op.p2p_srcmap_em.data_ptr()
-        table[DispatchSlot.SORTED_EXPERT] = op.sorted_expert_ids.data_ptr()
-        table[DispatchSlot.TILE_ROW_BASE] = op.tile_row_base.data_ptr()
-        table[DispatchSlot.NUM_VALID] = op.num_valid.data_ptr()
         table[DispatchSlot.RUNNING] = op.running.data_ptr()
         table[DispatchSlot.P2P_RUNNING] = op.p2p_running.data_ptr()
         if self._protocol.tok_counters:
@@ -1755,15 +1699,12 @@ class SmallMRuntime:
         table[DispatchSlot.G2_ASCALE] = self._s1_osd.data_ptr()
         table[DispatchSlot.G2_BQ] = self.w2.data_ptr()
         table[DispatchSlot.G2_BSCALE] = self.w2_scale.data_ptr()
-        table[DispatchSlot.G2_EIDS] = op.sorted_expert_ids.data_ptr()
         table[DispatchSlot.G2_STIDS] = op.srcmap_em.data_ptr()
         table[DispatchSlot.G2_SWEIGHTS] = op.wts_em.data_ptr()
         if self._protocol.tok_counters:
             table[DispatchSlot.G2_STIDS] = workspace["srcmap"].data_ptr()
             table[DispatchSlot.G2_SWEIGHTS] = workspace["wts"].data_ptr()
-        table[DispatchSlot.G2_TRB] = op.tile_row_base.data_ptr()
         table[DispatchSlot.G2_P2P_COMB_INP] = comb_op._p2p_comb_inp.data_ptr()
-        table[DispatchSlot.G2_MAX_M_BLOCKS] = (self._s1_nvm + self.sort_block_m - 1) // self.sort_block_m
         table[DispatchSlot.FC_CNT] = comb_op.comb_bar.data_ptr()
         table[DispatchSlot.FC_XDB] = comb_op.shmem_xdev_bar_mem.data_ptr()
         table[DispatchSlot.FC_P2P_XDB] = comb_op._p2p_xdb_mem.data_ptr()

@@ -451,7 +451,7 @@ def _knob_table(config):
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
 # small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
 # table.
-_EP4_FUSED_DIGEST = "77fc702c58e28362362fb1b6d2c66fb4bfd97d77e66d5ac340e6b0c04816becb"
+_EP4_FUSED_DIGEST = "8099b23f9592c0eaecdeecac707a4dacff777d9b95ad112ac10f2c2a67aa2fab"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -508,7 +508,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table. Pinned with the ring GEMM cores at every small-input bucket.
 _V41EP8_FUSED_DIGEST = (
-    "ca30aacb098c495302e26a8bebefabf5dac90d944734a399d4dda50e6668004d"
+    "5fec03b5026cd86721330d7e016843a704d5d0543fe2039fed7beda35fcf4b90"
 )
 
 
@@ -751,7 +751,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "2d5d0fa6e04bec44db1aa0b122f5a1fbe7b9723406ad0d1d9fe0e77190b6ce19"
+_EP2_FUSED_DIGEST = "ee6447ea4a394e0fa9ed96677afa2661cbd427ac2a7251bfe5bc7bfd949d818f"
 
 
 def test_ep2_fused_configs_unchanged():
@@ -1058,10 +1058,10 @@ _A4W4_DIGEST_LARGE_MTPRS = {
     "v41_flash_ep2": (8192, 16384),
 }
 _A4W4_FUSED_DIGESTS = {
-    "v4_pro_ep8": "43b1c8f1dcde8f25e84301615feb6897572b7134840855eeb0135e2c5ab09d2e",
-    "v41_flash_ep8": "b1942f52f21381f187d5c4a7695e199139ffa089f534dae229257f90c515223d",
-    "v41_flash_ep4": "d77b83a12dd5863ad87f2b195e0274a4a96e10c27c331271c27d9b7e620ec9ce",
-    "v41_flash_ep2": "8cd5791530cd5ef0f6ee28483fe5c30b845be2002e90c9928dd396f46d9767d1",
+    "v4_pro_ep8": "02cb1e09de48c0c07e5107d26a03dbef213d680cdfc7b1adc7e6be39c3dd5f52",
+    "v41_flash_ep8": "3f693ea052bc694190e5f415b2a2d4f4afd88e080c3896d28ab48073156972be",
+    "v41_flash_ep4": "02348338ca7fe0329a2c642875c3b21d892c177e9f3233ff6d1d33e979bea89e",
+    "v41_flash_ep2": "602205aa4ad05cd1e4642ff40755921a1321f07302f955d571831c4aa4c61fe4",
 }
 
 

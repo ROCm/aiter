@@ -205,9 +205,6 @@ class FusedStage1Knobs:
     # Large-input dispatch: one row per (token, destination rank) instead of per route; GEMM1 reads A through the
     # srcmap (the small-input kernel always does). Every rank of a launch must agree.
     dedup_rows: bool = False
-    # Small-input fused kernel: the plan CTA writes the plan through to memory, so it publishes the flag without an L2
-    # writeback first.
-    plan_wt: bool = False
     # Small-input fused kernel: the dispatch-table and remote pointers of the head (producers, plan finalize,
     # kernel entry) in SGPRs, so their buffer accesses need no readfirstlane waterfall loop.
     head_uniform: bool = False
@@ -1507,7 +1504,6 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     # buckets, so every bucket sets the same values.
     stage1 = replace(
         config.fused_stage1,
-        plan_wt=True,
         direct_done=8,
         tok_counters=True,
         bf16_head_tokens=4,
