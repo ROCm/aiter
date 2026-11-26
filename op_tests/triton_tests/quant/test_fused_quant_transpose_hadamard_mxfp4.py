@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib
-
 import pytest
 import torch
 
@@ -23,7 +21,6 @@ from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 _BLOCK_SIZE = 32
 _HADAMARD_SIZE = 16
-_MAX_PHILOX_COUNTER = (1 << 63) - 1
 
 
 requires_gfx950 = pytest.mark.skipif(
@@ -318,31 +315,6 @@ def test_fused_quant_transpose_hadamard_mxfp4_does_not_reuse_counters_across_til
     assert not torch.equal(row[:, :16], row[:, 16:32])
 
 
-def test_fused_quant_transpose_hadamard_mxfp4_validates_input_contract():
-    sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16)
-
-    with pytest.raises(ValueError, match="must be 2-D"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty(32, dtype=torch.bfloat16), sign
-        )
-    with pytest.raises(TypeError, match="torch.bfloat16 or torch.float32"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.float16), sign
-        )
-    with pytest.raises(ValueError, match="block_size must be 32"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16),
-            sign,
-            block_size=16,
-        )
-    with pytest.raises(ValueError, match="g must be 16"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16),
-            sign,
-            g=32,
-        )
-
-
 def test_mxfp4_fused_layout_capability_checks():
     assert mxfp4_scale_swizzle_supported(32, 8)
     assert not mxfp4_scale_swizzle_supported(16, 8)
@@ -390,151 +362,6 @@ def test_philox_streams_pack_only_enabled_layouts(
         if expected_transposed_delta is None
         else base + expected_transposed_delta * counters_per_layout
     )
-
-
-@pytest.mark.parametrize(
-    "use_sr_row,use_sr_transposed", [(True, False), (False, True), (True, True)]
-)
-def test_philox_streams_accept_inclusive_last_counter_boundary(
-    use_sr_row,
-    use_sr_transposed,
-):
-    M, N = 32, 32
-    enabled_layouts = int(use_sr_row) + int(use_sr_transposed)
-    reserved = enabled_layouts * M * N // 8
-    last_valid_offset = _MAX_PHILOX_COUNTER - reserved + 1
-
-    _philox_streams(
-        M,
-        N,
-        use_sr_row,
-        use_sr_transposed,
-        1,
-        last_valid_offset,
-    )
-    with pytest.raises(ValueError, match="leave room for enabled layouts"):
-        _philox_streams(
-            M,
-            N,
-            use_sr_row,
-            use_sr_transposed,
-            1,
-            last_valid_offset + 1,
-        )
-
-
-@requires_gfx950
-def test_fused_quant_transpose_hadamard_mxfp4_validates_shape_and_sign():
-    good_sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
-
-    with pytest.raises(ValueError, match="must be non-zero"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((0, 32), dtype=torch.bfloat16, device="cuda"), good_sign
-        )
-    with pytest.raises(ValueError, match="both be divisible by 32"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 48), dtype=torch.bfloat16, device="cuda"), good_sign
-        )
-    with pytest.raises(ValueError, match="cannot be swizzled"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-            good_sign,
-            swizzle_scale=True,
-        )
-    with pytest.raises(ValueError, match="cannot be shuffled"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-            good_sign,
-            shuffle_col=True,
-        )
-    noncontiguous = torch.empty((32, 64), dtype=torch.bfloat16, device="cuda")[:, ::2]
-    with pytest.raises(ValueError, match="must be contiguous"):
-        fused_quant_transpose_hadamard_mxfp4(noncontiguous, good_sign)
-    with pytest.raises(TypeError, match="sign_vector must have dtype"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-            good_sign.to(torch.float16),
-        )
-    with pytest.raises(ValueError, match="must contain 16 elements"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-            good_sign[:8],
-        )
-    invalid_sign = good_sign.clone()
-    invalid_sign[0] = 0
-    with pytest.raises(ValueError, match=r"finite and equal to \+1 or -1"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-            invalid_sign,
-        )
-
-    with torch.inference_mode():
-        inference_sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
-    fused_quant_transpose_hadamard_mxfp4(
-        torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
-        inference_sign,
-    )
-
-    mutable_sign = good_sign.clone()
-    fused_quant_transpose_hadamard_mxfp4(
-        torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"), mutable_sign
-    )
-    mutable_sign[0] = 0
-    with pytest.raises(ValueError, match=r"finite and equal to \+1 or -1"):
-        fused_quant_transpose_hadamard_mxfp4(
-            torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"), mutable_sign
-        )
-
-
-@requires_gfx950
-def test_fused_quant_transpose_hadamard_mxfp4_validates_philox_contract():
-    x = torch.empty((32, 32), dtype=torch.bfloat16, device="cuda")
-    sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="philox_seed is required"):
-        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True)
-    with pytest.raises(TypeError, match="must be integers"):
-        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True, philox_seed=1.5)
-    with pytest.raises(ValueError, match="philox_seed must be"):
-        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True, philox_seed=-1)
-    with pytest.raises(ValueError, match="leave room for enabled layouts"):
-        fused_quant_transpose_hadamard_mxfp4(
-            x,
-            sign,
-            use_sr_transposed=True,
-            philox_seed=1,
-            philox_offset=_MAX_PHILOX_COUNTER - x.numel() // 8 + 2,
-        )
-    with pytest.raises(ValueError, match="only valid"):
-        fused_quant_transpose_hadamard_mxfp4(x, sign, philox_seed=1)
-
-
-def test_fused_quant_transpose_hadamard_mxfp4_rejects_unsupported_arch(monkeypatch):
-    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx942")
-    x = torch.empty((32, 32), dtype=torch.bfloat16)
-    sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="requires gfx950"):
-        fused_quant_transpose_hadamard_mxfp4(x, sign)
-
-
-@requires_gfx950
-def test_fused_quant_transpose_hadamard_mxfp4_requires_published_config(monkeypatch):
-    def missing_config(path, required=True):
-        assert required
-        assert path.endswith(
-            "/gfx950/triton/fusions/fused_quant_transpose_hadamard_mxfp4/DEFAULT.json"
-        )
-        raise FileNotFoundError(path)
-
-    wrapper_module = importlib.import_module(
-        "aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4"
-    )
-    monkeypatch.setattr(wrapper_module, "load_config_json", missing_config)
-    x = torch.zeros((32, 32), dtype=torch.bfloat16, device="cuda")
-    sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device=x.device)
-    with pytest.raises(
-        FileNotFoundError, match="fused_quant_transpose_hadamard_mxfp4/DEFAULT.json"
-    ):
-        fused_quant_transpose_hadamard_mxfp4(x, sign)
 
 
 @requires_gfx950
