@@ -6,8 +6,8 @@
 Candidates: the FlyDSL persistent 8-wave ping-pong kernels (``moe_bs_forward``)
 and AITER's per_1x128 ``fused_moe``. Graded against an FP32 reference on the
 dequantized weights with ideal (unquantized) activations: relative L2 < 0.06,
-the bar of SILOTIGER-1763 / PR 6742. Shapes: D 4096 / I 1024, 288 routed
-experts (+1 shared expert, selected by every token, for top-k 9).
+PR 6742's bar. Shapes: D 4096 / I 1024, 288 routed experts (+1 shared expert,
+selected by every token, for top-k 9).
 """
 
 import argparse
@@ -229,7 +229,7 @@ def test_moe_blockscale(tokens, topk, swiglu_limit, routing):
             x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], 0.0
         )
         assert swiglu_limit > 5 or rel_l2(unclamped, ref) > 0.12, "clamp not exercised"
-    # Bitwise determinism (no atomics in the FlyDSL path).
+    # Bitwise determinism (no atomics in the FlyDSL path) for the same inputs.
     a = candidates["flydsl_pp"]().clone()
     b = candidates["flydsl_pp"]()
     assert torch.equal(a, b), "flydsl_pp: nondeterministic output"

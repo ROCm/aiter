@@ -18,9 +18,9 @@ import torch
 from torch import Tensor
 
 BLOCK_M = 256
-# Stage 2's [T * topk, D] bf16 slot buffer passes its element count as an i32
-# and is addressed through 32-bit buffer ranges; moe_bs_forward runs larger T in
-# token chunks no bigger than the largest validated buffer (T 32768, top-k 9, D 4096).
+# Stage 2's [T * topk, D] bf16 slot buffer is addressed through 32-bit buffer
+# ranges: moe_bs_forward runs larger T in token chunks no bigger than the
+# largest validated buffer (T 32768, top-k 9, D 4096).
 _MAX_SLOT_BYTES = 32768 * 9 * 4096 * 2
 
 
@@ -33,39 +33,16 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
     return ((bits >> 23) & 0xFF).to(torch.uint8)
 
 
-def _compile(
-    K,
-    N,
-    gather,
-    gate_up_inter,
-    epilogue,
-    topk,
-    weighted=True,
-    swiglu_clamp=True,
-    half_skip=False,
-):
-    # One cache key whichever way the arguments are passed (lru_cache keys
-    # keyword and positional calls apart, so a positional lookup of a launcher
-    # moe_bs_gemm compiled by keyword got a fresh, never-compiled one).
-    return _compile_cached(
-        K, N, gather, gate_up_inter, epilogue, topk, weighted, swiglu_clamp, half_skip
-    )
-
-
 @functools.lru_cache(maxsize=64)
-def _compile_cached(
-    K, N, gather, gate_up_inter, epilogue, topk, weighted, swiglu_clamp, half_skip
-):
+def _compile(K, N, gather, topk, swiglu_clamp, half_skip):
+    # Call positionally: lru_cache keys keyword and positional calls apart.
     from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
 
     return compile_moe_bs_gemm_8w(
         K=K,
         N=N,
         gather=gather,
-        gate_up_inter=gate_up_inter,
-        epilogue=epilogue,
         topk=topk,
-        weighted=weighted,
         swiglu_clamp=swiglu_clamp,
         half_skip=half_skip,
     )
@@ -91,33 +68,24 @@ def moe_bs_gemm(
     num_valid_ids: Tensor,
     *,
     gather: bool,
-    gate_up_inter: int = 0,
-    epilogue: str = "bf16",
     out_scale: Tensor | None = None,
-    sorted_weights: Tensor | None = None,
     topk: int = 0,
     swiglu_limit: float = 0.0,
     half_skip: bool = False,
-    grid: int | None = None,
 ) -> Tensor:
-    """Grouped GEMM ``a[row(r)] @ w[expert(r)].T`` over ``moe_sorting``'s 256-row tiles.
+    """One stage, ``a[row(r)] @ w[expert(r)].T``, over ``moe_sorting``'s 256-row tiles.
 
-    a: fp8 ``[T, K]`` token-major (``gather=True``, row r reads token
-    ``sorted_ids[r] & 0xFFFFFF``) with e8m0 ``a_scale [T, K // 128]``; or fp8
-    ``[M_pad, K]`` already in sorted order (``gather=False``) with e8m0
-    ``a_scale [K // 128, M_pad]``. w: fp8 ``[E, N, K]`` in
-    ``shuffle_weight(w, (16, 16))`` layout, ``w_scale`` e8m0 ``[E, N // 128, K // 128]``.
-    ``M_pad = sorted_ids.numel()``. ``epilogue`` (see ``compile_moe_bs_gemm_8w``):
+    w: fp8 ``[E, N, K]`` in ``shuffle_weight(w, (16, 16))`` layout, ``w_scale``
+    e8m0 ``[E, N // 128, K // 128]``; ``M_pad = sorted_ids.numel()``.
 
-    * ``"bf16"``: out bf16 ``[M_pad, N]``.
-    * ``"swiglu_fp8"``: out fp8 ``[M_pad, N // 2]``, out_scale e8m0
-      ``[N // 256, M_pad]``; needs ``gate_up_inter = N // 2``.
-    * ``"slot_bf16"``: out bf16 ``[T * topk, N]``, weighted by ``sorted_weights``
-      when given (else unweighted: the top-k reduction applies the weights).
-
-    ``half_skip`` (``"swiglu_fp8"``): skip a wave's row-half-1 MFMAs when its
-    64 rows are all padding; worth its branches only when most 256-row tiles
-    are less than half full.
+    * ``gather=True`` (stage 1): a fp8 ``[T, K]`` token-major (row r reads
+      token ``sorted_ids[r] & 0xFFFFFF``), ``a_scale`` e8m0 ``[T, K // 128]``;
+      ``w`` gate rows then up rows. out fp8 ``[M_pad, N // 2]`` = requantized
+      SwiGLU, ``out_scale`` e8m0 ``[N // 256, M_pad]``. ``half_skip`` skips a
+      wave's row-half-1 MFMAs when its 64 rows are all padding.
+    * ``gather=False`` (stage 2): a fp8 ``[M_pad, K]`` in sorted order,
+      ``a_scale`` e8m0 ``[K // 128, M_pad]``. out bf16 ``[T * topk, N]``,
+      unweighted: the top-k reduction applies the routing weights.
     """
     from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
@@ -126,57 +94,40 @@ def moe_bs_gemm(
     dev = a.device
     assert m_pad % BLOCK_M == 0
     assert a.shape[1] == K and out.is_contiguous()
+    assert tuple(w_scale.shape) == (E, N // 128, K // 128)
     if gather:
         assert tuple(a_scale.shape) == (a.shape[0], K // 128)
+        assert out.shape == (m_pad, N // 2) and out.element_size() == 1
+        assert out_scale is not None
+        assert tuple(out_scale.shape) == (N // 256, m_pad)
     else:
         assert a.shape[0] == m_pad and tuple(a_scale.shape) == (K // 128, m_pad)
-    assert tuple(w_scale.shape) == (E, N // 128, K // 128)
-    if epilogue == "bf16":
-        assert out.shape == (m_pad, N) and out.dtype == torch.bfloat16
-    elif epilogue == "swiglu_fp8":
-        assert gate_up_inter == N // 2 and out.shape == (m_pad, gate_up_inter)
-        assert out.element_size() == 1 and out_scale is not None
-        assert tuple(out_scale.shape) == (gate_up_inter // 128, m_pad)
-    else:
-        assert epilogue == "slot_bf16" and topk > 0
-        assert out.dtype == torch.bfloat16 and out.shape[1] == N
+        assert topk > 0 and out.dtype == torch.bfloat16 and out.shape[1] == N
         assert out.shape[0] % topk == 0
-    if grid is None:
-        grid = torch.cuda.get_device_properties(dev).multi_processor_count
+    grid = torch.cuda.get_device_properties(dev).multi_processor_count
     assert grid % 8 == 0
-    # The kernel reads "no clamp" as an infinite limit.
-    limit = float(swiglu_limit) if swiglu_limit > 0 else 3.0e38
-    swiglu = epilogue == "swiglu_fp8"
     exe = _compile(
         K,
         N,
         bool(gather),
-        int(gate_up_inter),
-        epilogue,
-        int(topk) if epilogue == "slot_bf16" else 0,
-        sorted_weights is not None,
-        # The no-limit SwiGLU drops three clamp ops a value.
-        swiglu_clamp=not swiglu or swiglu_limit > 0,
-        half_skip=swiglu and bool(half_skip),
+        0 if gather else int(topk),
+        not gather or swiglu_limit > 0,  # swiglu_clamp: off for no limit
+        gather and bool(half_skip),
     )
     _run_compiled(
         exe,
         _u8(a),
         ptr_arg(w),
-        out.view(-1) if out.dtype == torch.bfloat16 else _u8(out),
+        _u8(out) if gather else out.view(-1),
         _u8(a_scale),
         _u8(w_scale),
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        _u8(out_scale) if out_scale is not None else _dummy(dev, torch.uint8),
-        (
-            sorted_weights.view(torch.int32)
-            if sorted_weights is not None
-            else _dummy(dev, torch.int32)
-        ),
+        _u8(out_scale) if gather else _dummy(dev, torch.uint8),
         m_pad,
-        limit,
+        # The kernel reads "no clamp" as an infinite limit.
+        float(swiglu_limit) if swiglu_limit > 0 else 3.0e38,
         grid,
         current_stream_arg(dev),
         specialization_key=dev,
@@ -200,8 +151,8 @@ def moe_bs_forward(
 
     x bf16 ``[T, D]``; topk_ids / topk_weights ``[T, topk]`` (ids outside
     ``[0, E)`` contribute nothing; a token's ids must be distinct, as from a
-    top-k router: ``moe_sorting`` keeps one route of a repeated expert); w13 fp8 ``[E, 2I, D]`` (gate rows, then up
-    rows) and w2 fp8 ``[E, D, I]`` in ``shuffle_weight(w, (16, 16))`` layout;
+    top-k router: ``moe_sorting`` keeps one route of a repeated expert); w13
+    fp8 ``[E, 2I, D]`` (gate rows, then up rows) and w2 fp8 ``[E, D, I]`` in ``shuffle_weight(w, (16, 16))`` layout;
     w13_scale / w2_scale their 128x128 block scales as e8m0 exponent bytes
     (``e8m0_from_pow2`` of power-of-two fp32 scales). act = ``silu(min(g, L)) *
     clamp(u, -L, L)`` for ``swiglu_limit`` L > 0, else ``silu(g) * u``.
@@ -239,9 +190,7 @@ def moe_bs_forward(
                 swiglu_limit=swiglu_limit,
             )
         return out
-    # The sort drops ids outside [0, E) itself, and the reduction skips them
-    # too (their slot rows are never written): no masking pass (it was three
-    # small kernels, ~13 us, before the sort).
+    # The sort and the reduction both skip ids outside [0, E): no masking pass.
     ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
     sorted_ids, _, sorted_eids, num_valid, _ = moe_sorting(
         ids, topk_weights.float(), E, D, x.dtype, BLOCK_M, accumulate=False
@@ -262,13 +211,10 @@ def moe_bs_forward(
         sorted_eids,
         num_valid,
         gather=True,
-        gate_up_inter=inter,
-        epilogue="swiglu_fp8",
         out_scale=a2s,
         swiglu_limit=swiglu_limit,
         # HK's HALF_SKIP rule: experts average at most 144 of a tile's 256
-        # rows (stage 1 at T = 4096 by top-k 8 / 9: -7%; at T = 16384, where
-        # few tiles skip, the branches cost +4%).
+        # rows (stage 1 -7% at T = 4096; at T = 16384 the branches cost +4%).
         half_skip=T * topk <= 144 * E,
     )
     slots = torch.empty(T * topk, D, dtype=torch.bfloat16, device=x.device)
@@ -282,13 +228,11 @@ def moe_bs_forward(
         sorted_eids,
         num_valid,
         gather=False,
-        epilogue="slot_bf16",
         topk=topk,
     )
-    # The routing weights are applied here, not in stage 2 (HK's split): the
-    # weight multiply was VALU issue in stage 2's store phases (ATT).
-    # Nontemporal loads pay once the slot rows outgrow the 256 MB MALL
-    # (T=16384: 239 -> 204 us); at 268 MB (T=4096, top-k 8) they cost 5 us.
+    # Applies the routing weights (stage 2 does not). Nontemporal loads pay
+    # once the slot rows outgrow the 256 MB MALL (T=16384: 239 -> 204 us); at
+    # 268 MB (T=4096, top-k 8) they cost 5 us.
     _run_moe_reduction(
         slots,
         out,
