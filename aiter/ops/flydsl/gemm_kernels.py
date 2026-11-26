@@ -671,7 +671,9 @@ def gemm_decode_bf16(
         has_bias=bias is not None,
         strided_a=strided_a,
     )
-    launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
+    # Compile and launch on A's device, whatever the caller's current device is.
+    with torch.cuda.device(A.device):
+        launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
     return C
 
 

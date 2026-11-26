@@ -307,6 +307,8 @@ def compile_gemm_decode_wave_bf16(
             unused_tensor_arg(bias, B),
             cache_tag,
             stream,
+            # A compiled handle is bound to the device it was loaded on.
+            specialization_key=A.device,
         )
 
     return launcher
