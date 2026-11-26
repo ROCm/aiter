@@ -92,6 +92,7 @@ __launch_bounds__(NUM_WARPS* WAVE_SIZE) void kernel(const fp8* __restrict__ Q_pt
                                                     int N,
                                                     int SplitN)
 {
+#if defined(__gfx950__)
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
     constexpr int TILE_N     = 32;
@@ -521,6 +522,11 @@ __launch_bounds__(NUM_WARPS* WAVE_SIZE) void kernel(const fp8* __restrict__ Q_pt
     wait_vmcnt<0>();   // no asm prefetch load may still be in flight when the next pipeline reuses its VGPRs
     run_pipeline(std::false_type{}, cb, ce);
     wait_vmcnt<0>();
+#else
+    // gfx950-only (mfma_scale f8f6f4, v_permlane32_swap): compiled out for the
+    // other archs of a multi-arch build; the host wrapper never launches it there.
+    __builtin_trap();
+#endif
 }
 
 

@@ -94,6 +94,12 @@ def fp8_mqa_logits(
     the buffer untouched otherwise.
     """
     del unroll2  # no unroll variant: the stage loop is always unrolled x4
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(
+            f"fp8_mqa_logits (HIP) supports {SUPPORTED_GFX} only, got {gfx}; "
+            "check is_supported() and route other archs to the Triton kernel"
+        )
     if out is None:
         out = torch.empty(
             (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device

@@ -42,7 +42,6 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
-from aiter.ops.triton.utils.mhc_config_utils import hip_post_dispatch_block
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
@@ -141,8 +140,6 @@ def get_benchmark_configs(args):
 
     Ms = [2**i for i in range(10, 15)]
     n = 4
-    # --with-hip: C=512 is excluded because the greedy post dispatcher selects
-    # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
     Cs = [1280, 2560, 4096, 7168]
     return sorted(product(Ms, [n], Cs), key=lambda x: (x[2], x[0]))
 
@@ -813,17 +810,15 @@ def _validate_with_hip_pre(args) -> None:
 
 def _validate_with_hip_post(args) -> None:
     """Validate --with-hip args for mhc_post; raises AssertionError on failure."""
+    # Imported here: aiter.ops.mhc needs the HIP side of aiter, which a
+    # Triton-only install (AITER_TRITON_ONLY=1) does not import.
+    from aiter.ops.mhc import mhc_post_supported
+
     arch_id = _aiter_chip_info.get_gfx()
     for M_, n_, C_ in get_benchmark_configs(args):
-        block = hip_post_dispatch_block(C_, arch_id)
-        assert block is not None, (
-            f"--with-hip requires C (hidden_size) divisible by 256 "
-            f"(got C={C_} for M={M_}, n={n_}). aiter.mhc_post dispatches with "
-            f"residual_block in {{256, 512, 1024}}."
-        )
-        assert C_ >= 2 * block, (
-            f"--with-hip on {arch_id} selects residual_block={block} for C={C_}; "
-            f"requires hidden_size >= {2 * block} (got C={C_} for M={M_}, n={n_})."
+        assert mhc_post_supported(C_, n_, torch.bfloat16, arch_id), (
+            f"--with-hip: aiter.mhc_post does not run hidden_size {C_} "
+            f"(hc_mult {n_}) on {arch_id} (see mhc_post_supported); got M={M_}."
         )
 
 
