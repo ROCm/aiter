@@ -17,6 +17,7 @@ from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
         "kernels/mxfp4_gemm1.py",
         "kernels/mxfp4_gemm_common.py",
         "kernels/act.py",
+        "kernels/hadamard.py",
         "kernels/dpp_utils.py",
         "kernels/layout_utils.py",
     ],
@@ -44,6 +45,7 @@ def _get_compiled_mxfp4_gemm1_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    inter_hadamard=0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -69,6 +71,7 @@ def _get_compiled_mxfp4_gemm1_port(
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
+        inter_hadamard=inter_hadamard,
     )
 
 
@@ -91,6 +94,7 @@ def _assert_supported(
     num_waves=4,
     native_scale_layout=False,
     k_wave=1,
+    inter_hadamard=0,
 ):
     if a_dtype not in MXFP4_G1_VARIANTS:
         raise NotImplementedError(
@@ -204,6 +208,24 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 cached inline quantization requires FP8 output"
         )
+    if inter_hadamard:
+        # Each lane holds 8 consecutive output columns and 16 lanes cover the
+        # BN // 2 = 128 columns of a BN256 tile, so a block must fit in them.
+        if inter_hadamard not in (8, 16, 32, 64, 128):
+            raise NotImplementedError(
+                "flydsl mxfp4 GEMM1 inter_hadamard must be a power of two in "
+                f"[8, 128], got {inter_hadamard}"
+            )
+        if BN != 256 or num_waves != 4:
+            raise NotImplementedError(
+                "flydsl mxfp4 GEMM1 inter_hadamard requires BN256 with 4 waves, "
+                f"got BN={BN}, num_waves={num_waves}"
+            )
+        if D_INTER % inter_hadamard:
+            raise NotImplementedError(
+                f"flydsl mxfp4 GEMM1 inter_hadamard={inter_hadamard} must divide "
+                f"D_INTER={D_INTER}"
+            )
 
 
 def flydsl_mxfp4_gemm1(
@@ -243,6 +265,7 @@ def flydsl_mxfp4_gemm1(
     stream=None,
     num_waves=4,
     k_wave=1,
+    inter_hadamard=0,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
     _assert_supported(
@@ -263,6 +286,7 @@ def flydsl_mxfp4_gemm1(
         num_waves=num_waves,
         native_scale_layout=native_scale_layout,
         k_wave=k_wave,
+        inter_hadamard=inter_hadamard,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -291,6 +315,7 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout,
         num_waves,
         k_wave,
+        inter_hadamard,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

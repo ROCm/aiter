@@ -666,6 +666,11 @@ def fused_moe(
     # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    # Block Hadamard size for the SwiGLU output. 0 leaves it unchanged. The
+    # second-GEMM weights of an online-rotated MXFP4 checkpoint were quantized
+    # after this rotation, so the activation has to be rotated before stage 2
+    # quantizes or consumes it. See aiter.ops.hadamard.
+    inter_hadamard: int = 0,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -696,6 +701,12 @@ def fused_moe(
     gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
     ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
     the ``shuffle_scale_nvfp4_moe`` layout.
+
+    ``inter_hadamard`` rotates the bf16 SwiGLU output between the two GEMMs by
+    a block Hadamard of that size. It is 0 by default. The 1-stage kernel,
+    FHMoE, and a stage 1 that quantizes inside the kernel do not expose that
+    tensor and raise instead of skipping the rotation.
+
     """
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
@@ -705,7 +716,12 @@ def fused_moe(
     # Entry "api": an enabled path may run this call on aiter.moev2.
     # aiter.moev2.api.op_call copies how this function calls fused_moe_; mirror
     # changes to those arguments there.
-    if not torch.compiler.is_compiling() and moev2_paths.any_active():
+    # No v2 path rotates the SwiGLU output yet, so inter_hadamard stays legacy.
+    if (
+        not inter_hadamard
+        and not torch.compiler.is_compiling()
+        and moev2_paths.any_active()
+    ):
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "api")
         if v2_path is not None:
@@ -743,6 +759,8 @@ def fused_moe(
             unsupported.append("quant_dtype_a2")
         if w1_global_scale is not None or w2_global_scale is not None:
             unsupported.append("w1_global_scale / w2_global_scale")
+        if inter_hadamard:
+            unsupported.append("inter_hadamard")
         # The MXFP8 path does not consume caller-prequantized activations and
         # requires an explicit preshuffle marker. Preserve the existing DSV4
         # MXFP4 path, which accepts activation scales and trusts its layout.
@@ -853,6 +871,7 @@ def fused_moe(
         deterministic=deterministic,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+        inter_hadamard=inter_hadamard,
     )
 
 
@@ -901,6 +920,7 @@ def fused_moe_fake(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    inter_hadamard: int = 0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1117,6 +1137,7 @@ def fused_moe_(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    inter_hadamard: int = 0,
 ) -> torch.Tensor:
     """Route each token to its top-k experts, run both expert projections and
     combine them, weighted by ``topk_weight``.
@@ -1181,7 +1202,7 @@ def fused_moe_(
     # (@qli88). See aiter/moev2/README.md.
     # Entry "op": an enabled path may run this call on aiter.moev2 instead of
     # _fused_moe_impl; DECLINED hands it back.
-    if moev2_paths.any_active():
+    if not inter_hadamard and moev2_paths.any_active():
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "op")
         if v2_path is not None:
@@ -1237,6 +1258,7 @@ def fused_moe_(
         deterministic=deterministic,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+        inter_hadamard=inter_hadamard,
     )
 
 
@@ -1282,6 +1304,7 @@ def _fused_moe_impl(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    inter_hadamard: int = 0,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1509,6 +1532,11 @@ def _fused_moe_impl(
         )
 
     if grouped_a8w4_out is not None:
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "grouped GEMM never exposes the SwiGLU output."
+            )
         return _return_output(grouped_a8w4_out, output)
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
@@ -1516,7 +1544,7 @@ def _fused_moe_impl(
             "gate_mode=INTERLEAVE)"
         )
 
-    if _can_use_bf16_g1u1_small_m_direct(
+    if not inter_hadamard and _can_use_bf16_g1u1_small_m_direct(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -1778,6 +1806,11 @@ def _fused_moe_impl(
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "whole-graph MoE never exposes the SwiGLU output."
+            )
         request = FusedMoeRequest(
             hidden_states=hidden_states,
             w1=w1,
@@ -2069,6 +2102,11 @@ def _fused_moe_impl(
                 f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r}; "
                 "the selected kernel has no clamp."
             )
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "1-stage kernel never exposes the SwiGLU output."
+            )
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -2148,6 +2186,7 @@ def _fused_moe_impl(
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            inter_hadamard=inter_hadamard,
         )
         return _return_output(ret, output)
 
@@ -2855,6 +2894,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    inter_hadamard: int = 0,
     fused_shared_w1=None,
     fused_shared_w1_scale=None,
     shared_inter_bf16=None,
@@ -2913,6 +2953,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        inter_hadamard=inter_hadamard,
         fused_shared_w1=fused_shared_w1,
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
@@ -3054,6 +3095,7 @@ def _mxfp4_a4w4_stage1(
     k_wave=1,
     prefetch_hidden=False,
     prequantized=False,
+    inter_hadamard=0,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -3174,6 +3216,7 @@ def _mxfp4_a4w4_stage1(
         bias=bias1,
         num_waves=num_waves,
         k_wave=k_wave,
+        inter_hadamard=inter_hadamard,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -3425,6 +3468,7 @@ def _mxfp4_a4w4_stage1_fw(
         k_wave=p1.get("k_wave", 1),
         prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
+        inter_hadamard=p1.get("inter_hadamard", 0),
     )
     return inter_sorted_quant, inter_sorted_scale
 
@@ -4017,6 +4061,48 @@ def _mxmoe_opus_cfg_unsupported(
     if p1["splitk"]:
         return "split-K GEMM1 is not supported"
     return ""
+
+
+@functools.cache
+def _mxmoe_g1_kname_with_hadamard(kernel_name1: str, inter_hadamard: int) -> str:
+    """The GEMM1 variant that rotates the SwiGLU output before quantizing it.
+
+    The rotation runs on 128 columns held by one tile row, so BN128 tiles,
+    which hold 64 output columns, are widened to BN256.
+    """
+    tokens = kernel_name1.split("_")
+    for i, tok in enumerate(tokens):
+        m = re.fullmatch(r"(\d+)x(\d+)x(\d+)", tok)
+        if m and int(m.group(2)) < 256:
+            tokens[i] = f"{m.group(1)}x256x{m.group(3)}"
+    name = "_".join(tokens) + f"_had{inter_hadamard}"
+    _parse_mxfp4_g1_kname(name)
+    return name
+
+
+@functools.cache
+def _flydsl_moe1_kname_with_hadamard(kernel_name: str, inter_hadamard: int) -> str:
+    """The FlyDSL stage 1 tile wide enough to rotate its SwiGLU output.
+
+    One output row of a tile has to hold whole rotation blocks; interleaved
+    gate/up tiles hold tile_n // 2 output columns. Widened tiles drop k_wave:
+    k_wave > 1 with tile_n >= 128 produces NaNs even without the rotation.
+    """
+    moe_kernels = _get_flydsl_moe_kernels()
+    params = moe_kernels.get_flydsl_kernel_params(kernel_name)
+    if params is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernel_name}")
+    min_n = inter_hadamard * (2 if params.get("gate_mode") == "interleave" else 1)
+    if params["tile_n"] >= min_n:
+        return kernel_name
+    name = re.sub(r"_t(\d+)x\d+x(\d+)", rf"_t\g<1>x{min_n}x\g<2>", kernel_name, count=1)
+    name = re.sub(r"_kw\d+", "", name)
+    if moe_kernels.get_flydsl_kernel_params(name) is None:
+        raise NotImplementedError(
+            f"inter_hadamard={inter_hadamard} needs tile_n >= {min_n}, but "
+            f"{kernel_name} has no registered {name} variant"
+        )
+    return name
 
 
 def _is_mxmoe_opus_metadata(metadata: MOEMetadata) -> bool:
@@ -6148,6 +6234,7 @@ def fused_moe_2stages(
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
     deterministic: bool = False,
+    inter_hadamard: int = 0,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -6461,8 +6548,37 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
+    stage1 = metadata.stage1
+    rotated_in_stage1 = False
+    if inter_hadamard and stage1_func is _mxfp4_a4w4_stage1_fw:
+        stage1 = functools.partial(
+            stage1.func,
+            *stage1.args,
+            **{
+                **stage1.keywords,
+                "kernelName1": _mxmoe_g1_kname_with_hadamard(
+                    stage1.keywords["kernelName1"], inter_hadamard
+                ),
+            },
+        )
+        rotated_in_stage1 = True
+    elif (
+        inter_hadamard and stage1_func is _flydsl_stage1_wrapper and metadata.fuse_quant
+    ):
+        stage1 = functools.partial(
+            stage1.func,
+            *stage1.args,
+            **{
+                **stage1.keywords,
+                "kernelName": _flydsl_moe1_kname_with_hadamard(
+                    stage1.keywords["kernelName"], inter_hadamard
+                ),
+            },
+        )
+        extra_stage1_args["inter_hadamard"] = inter_hadamard
+        rotated_in_stage1 = True
     _stage1_call = functools.partial(
-        metadata.stage1,
+        stage1,
         a1,
         w1,
         w2,
@@ -6487,6 +6603,24 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
+    if inter_hadamard and not rotated_in_stage1:
+        # Stage 2 weights were quantized in the rotated basis, so the SwiGLU
+        # output has to be rotated before it is quantized or consumed in bf16.
+        if (
+            metadata.fuse_quant
+            or isinstance(a2, tuple)
+            or a2.dtype not in (dtypes.bf16, dtypes.fp16)
+            or a2.shape[-1] != inter_dim
+        ):
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the bf16 SwiGLU output "
+                f"of stage 1, got fuse_quant={metadata.fuse_quant!r}, "
+                f"{type(a2).__name__} {getattr(a2, 'dtype', None)} "
+                f"{tuple(getattr(a2, 'shape', ()))}."
+            )
+        from aiter.ops.hadamard import block_hadamard_rotate
+
+        a2 = block_hadamard_rotate(a2, inter_hadamard)
     if isinstance(a2, tuple) and (
         stage1_func is _mxfp4_a4w4_stage1_fw
         or metadata.skip_inter_quant

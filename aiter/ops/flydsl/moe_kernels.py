@@ -809,6 +809,7 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    inter_hadamard: int = 0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if activation_bf16 and act != "silu_clamped":
@@ -875,6 +876,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            inter_hadamard=inter_hadamard,
         )
     else:
         raise ValueError(
@@ -1651,6 +1653,7 @@ def _flydsl_moe_stage1_impl(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    inter_hadamard: int = 0,
     fused_shared_w1: torch.Tensor | None = None,
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
@@ -1716,6 +1719,11 @@ def _flydsl_moe_stage1_impl(
     gate_up_interleave = gate_mode == "interleave"
 
     _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
+    if inter_hadamard and not (_fuse_any_quant and not _is_splitk):
+        raise ValueError(
+            f"inter_hadamard={inter_hadamard} is applied by the fused fp4/fp8 "
+            f"output quantization; got out_dtype={out_dtype!r}, k_batch={k_batch}"
+        )
 
     dev = a.device
     # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4), bf16 (a16w16)}
@@ -1958,6 +1966,8 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+    if inter_hadamard:
+        compile_kwargs["inter_hadamard"] = inter_hadamard
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -2140,6 +2150,7 @@ def flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    inter_hadamard: int = 0,
     fused_shared_w1: torch.Tensor | None = None,
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
@@ -2202,6 +2213,7 @@ def flydsl_moe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         activation_bf16=activation_bf16,
+        inter_hadamard=inter_hadamard,
         fused_shared_w1=fused_shared_w1,
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
