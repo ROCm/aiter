@@ -349,15 +349,28 @@ def _fallback_order(choice):
     )
 
 
+def _token_major(*ts, dtype=None):
+    """Contiguous ``[B, T, H, *]`` copies (cast to ``dtype`` in the same pass).
+
+    q/k/v come out of the short conv as a transposed, channel-major view; the
+    chunk kernels index them token-major, and a dtype cast alone keeps the
+    strides of a dense view.
+    """
+    return [
+        t.to(dtype=dtype or t.dtype, memory_format=torch.contiguous_format) for t in ts
+    ]
+
+
 def _chunk_fwd_triton():
     from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
     def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
-        bf = torch.bfloat16
+        q, k, v = _token_major(q, k, v, dtype=torch.bfloat16)
+        g, beta = _token_major(g, beta)
         o, _ = chunk_kimi_delta_attn(
-            q.to(bf),
-            k.to(bf),
-            v.to(bf),
+            q,
+            k,
+            v,
             g,
             beta,
             scale=scale,
@@ -380,10 +393,9 @@ def _chunk_fwd_flydsl():
             if not native_varlen:
                 raise NotImplementedError("this FlyDSL KDA forward has no varlen")
             kw["cu_seqlens"] = cu_seqlens
-        bf = torch.bfloat16
-        o, _ = chunk_kda_fwd_flydsl(
-            q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size, **kw
-        )
+        q, k, v = _token_major(q, k, v, dtype=torch.bfloat16)
+        g, beta = _token_major(g, beta)
+        o, _ = chunk_kda_fwd_flydsl(q, k, v, g, beta, scale, chunk_size, **kw)
         return o.float()
 
     return run

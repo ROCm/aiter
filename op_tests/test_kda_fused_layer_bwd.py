@@ -299,6 +299,40 @@ def test_kda_piece(piece, b, t, d, h, k, w, r, chunk, lb, dtype):
     return ret
 
 
+@benchmark()
+def test_kda_chunk_fwd_backends(b, t, h, k, lb, dtype):
+    """Chunk forward backends on the inputs exactly as the layer builds them
+    (q/k/v are channel-major views out of the short conv), against
+    ``chunk_kda_torch``: isolates the chunk-forward integration from the rest."""
+    a = torch.randn(b, t, 3 * h * k)
+    conv_w = torch.randn(3 * h * k, 4) * 0.5
+    c = kda_fused_layer._short_conv(a, conv_w)
+    q, kk, v = (x.reshape(b, t, h, k) for x in c.split(h * k, -1))
+    q = torch.nn.functional.normalize(q, dim=-1)
+    kk = torch.nn.functional.normalize(kk, dim=-1)
+    a_log = torch.zeros(K3_A_LOG_LEN)
+    a_log[:h] = torch.linspace(-0.5, 1.2, h)
+    g = kda_fused_layer.kda_gate(torch.randn(b, t, h, k), a_log, lb)
+    beta = torch.sigmoid(torch.randn(b, t, h))
+    scale = k**-0.5
+    ref = kda_fused_layer.chunk_kda_torch(q, kk, v, g, beta, scale, 64)
+    ret = {"gfx": get_gfx_runtime(), "q contiguous": q.is_contiguous()}
+    for backend in ("triton", "flydsl"):
+        try:
+            fn = kda_fused_layer._PIECE_LOADERS[("chunk_fwd", backend)]()
+        except ImportError:
+            ret[f"{backend} err"] = "n/a"
+            continue
+        o, us = run_perftest(fn, q, kk, v, g, beta, scale, 64, num_iters=5)
+        err = checkAllclose(
+            ref, o.float(), rtol=2e-2, atol=2e-2, msg=f"chunk fwd {backend}"
+        )
+        assert err == 0, f"chunk fwd {backend}: {err:.2%} outside tolerance"
+        ret[f"{backend} us"] = us
+        ret[f"{backend} err"] = err
+    return ret
+
+
 def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
     """Reference for the fused projections, fp32 (A_log: first h entries)."""
     with torch.enable_grad():
@@ -526,6 +560,17 @@ def main():
             ],
             {"pieces": args.pieces, **layer_axes},
         )
+        if dtype == dtypes.bf16:
+            summarize(
+                "kda chunk fwd backends (layer layout) summary",
+                [
+                    test_kda_chunk_fwd_backends(b, t, h, k, lb, dtype)
+                    for b, t, (_, h, k, _, _), lb in itertools.product(
+                        args.batch, args.seqlen, args.shape, args.gate_lb
+                    )
+                ],
+                layer_axes,
+            )
         bad = df[df["failed grads"] != "-"]
         assert bad.empty, "flydsl pieces outside tolerance:\n" + bad[
             ["piece", "t", "used", "failed grads"]
