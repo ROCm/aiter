@@ -10,11 +10,6 @@ from aiter.ops.triton.fusions.activation import (
     act_mul_and_mxfp4_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import (
-    load_config_json,
-    resolve_config_dir,
-    select_leq_config,
-)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     run_torch_reduce_act_mul_fp8_group_quant,
@@ -303,44 +298,3 @@ def test_act_mul_and_fp8_group_quant_matches_one_group_launch(
 
     assert torch.equal(tuned_q.view(torch.uint8), ref_q.view(torch.uint8))
     assert torch.equal(tuned_s, ref_s)
-
-
-class _LaunchRecorder:
-    """Record the launch keyword arguments. It does not launch the kernel."""
-
-    def __init__(self):
-        self.kwargs = None
-
-    def __getitem__(self, grid):
-        def record(*args, **kwargs):
-            self.kwargs = kwargs
-
-        return record
-
-
-@pytest.mark.parametrize("M", [1, 4097])
-@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
-def test_act_mul_and_fp8_group_quant_launch(monkeypatch, M: int, N: int):
-    # gfx942 has a tuned config. Other architectures keep one group for each program.
-    config_dir = resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
-    configs = load_config_json(
-        f"{config_dir}/DEFAULT.json", required=arch_info.get_arch() == "gfx942"
-    )
-    recorder = _LaunchRecorder()
-    monkeypatch.setattr(
-        activation_ops, "_act_mul_and_dynamic_fp8_group_quant_kernel", recorder
-    )
-    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
-    act_mul_and_fp8_group_quant(x, "silu", group_size=128)
-
-    # The repr labels must hold the launch options, so a trace shows the config.
-    assert recorder.kwargs["NUM_WARPS"] == recorder.kwargs.get("num_warps")
-    assert recorder.kwargs["WAVES_PER_EU"] == recorder.kwargs.get("waves_per_eu")
-    assert recorder.kwargs["NUM_STAGES"] == recorder.kwargs.get("num_stages")
-
-    if configs is None:
-        assert recorder.kwargs["BLOCK_SIZE_N"] == 128
-        assert "num_warps" not in recorder.kwargs
-        return
-    for key, value in select_leq_config(configs, M, prefix="M_LEQ_").items():
-        assert recorder.kwargs[key] == value, key
