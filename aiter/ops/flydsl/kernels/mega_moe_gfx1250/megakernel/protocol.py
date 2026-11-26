@@ -928,6 +928,8 @@ def gemm_queue(kc, n_mt):
         return i
 
     XQ = bool(STREAM and kc.XQ)
+    MIX = int(kc.READY_MIX) if XQ else 0
+    MIX_BURST = int(kc.READY_BURST) if XQ else 1
     q_head = fx.Int32(CTL_QHEAD * 4) + par * fx.Int32(128)
     if const_expr(XQ):
         # GEMM1 by XCC: XCC x runs n-tiles x, x + NXCC, ... of every m-tile,
@@ -955,6 +957,16 @@ def gemm_queue(kc, n_mt):
             kx = r // gsz
             return base + r - kx * gsz, xcc + kx * fx.Int32(NXCC)
 
+        if const_expr(MIX):
+            # Broadcast state is outside both GEMMs' aliased LDS arenas.
+            mix_g1 = fx.Int64(bc + fx.Int32(16))
+            mix_g2 = fx.Int64(bc + fx.Int32(20))
+            mix_burst = fx.Int64(bc + fx.Int32(24))
+            mix_g2_m = fx.Int64(bc + fx.Int32(28))
+            # Distribute preferred consumers evenly within every XCC group,
+            # including the producers when they join the compute queue.
+            prefer_g2 = ((bid >> fx.Int32(3)) & fx.Int32(3)) < fx.Int32(MIX)
+
         def xq_next(c):
             """t0: a GEMM1 claim past the group's items takes a GEMM2 one."""
             nq = c
@@ -967,7 +979,19 @@ def gemm_queue(kc, n_mt):
             rsrc_ctl, fx.Int32(is_t0.select(x_head, fx.Int32(_OOB))), 1, SCOPE_DEV
         )
         if is_t0:
-            comm_ops.store_i32_lds(bc_next, xq_next(c0))
+            if const_expr(MIX):
+                comm_ops.store_i32_lds(mix_g1, c0)
+                comm_ops.store_i32_lds(mix_g2, fx.Int32(-1))
+                comm_ops.store_i32_lds(mix_burst, fx.Int32(0))
+                comm_ops.store_i32_lds(mix_g2_m, fx.Int32(0))
+                first = c0
+                if c0 >= U1:
+                    # A producer can join after its XCC's G1 head is exhausted.
+                    first = U1 + _buffer_atomic_add_ret(rsrc_ctl, q_head, 1, SCOPE_DEV)
+                    comm_ops.store_i32_lds(mix_g2, first)
+                comm_ops.store_i32_lds(bc_next, first)
+            else:
+                comm_ops.store_i32_lds(bc_next, xq_next(c0))
         rocdl.s_wait_dscnt(0)
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
@@ -1031,6 +1055,13 @@ def gemm_queue(kc, n_mt):
                 set_meta1((e_, rows), a_ready1)
             else:
                 set_meta1((e_, rows))
+            if const_expr(STREAM and DEFER_SC):
+                # G2 C lies outside its input arena but aliases G1 input.
+                # Every wave retires its previous scatter before G1 writes
+                # any LDS; G2-to-G2 keeps the existing deferred restage.
+                tdm_ops.tensor_wait(0)
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
             g1_task(
                 arg_a2,
                 arg_disp,
@@ -1122,10 +1153,46 @@ def gemm_queue(kc, n_mt):
             )
         if is_t0:
             if const_expr(XQ):
-                nxq = U1 + claim
-                if u < U1:
-                    nxq = xq_next(claim)
-                comm_ops.store_i32_lds(bc_next, nxq)
+                if const_expr(MIX):
+                    pending1 = fx.Int32(comm_ops.load_i32_lds(mix_g1))
+                    pending2 = fx.Int32(comm_ops.load_i32_lds(mix_g2))
+                    burst = fx.Int32(comm_ops.load_i32_lds(mix_burst))
+                    ready_m = fx.Int32(comm_ops.load_i32_lds(mix_g2_m))
+                    new_g2 = fx.Int32(0)
+                    if u < U1:
+                        # The look-ahead G1 claim retains this XCC's N tiles.
+                        pending1 = claim
+                        burst = fx.Int32(0)
+                    else:
+                        pending2 = U1 + claim
+                        burst = burst + fx.Int32(1)
+                        new_g2 = fx.Int32(1)
+                    if (pending2 < U1) & (prefer_g2 | (pending1 >= U1)):
+                        pending2 = U1 + _buffer_atomic_add_ret(rsrc_ctl, q_head, 1, SCOPE_DEV)
+                        new_g2 = fx.Int32(1)
+                    if (new_g2 != fx.Int32(0)) & (pending2 < U):
+                        ready_m, _ = order(pending2 - U1, NT2, kc.GM2)
+                        ready_m = rot(ready_m)
+                    ready = fx.Int32(0)
+                    if (pending2 >= U1) & (pending2 < U):
+                        ready = _load_i32_dev(rsrc_ctl,
+                            fx.Int32(CTL_G1 + G1_READY) + ready_m * fx.Int32(G1_STRIDE))
+                    take_g2 = prefer_g2 & (burst < fx.Int32(MIX_BURST)) & (ready == gen)
+                    nxq = fx.Int32(take_g2.select(pending2, pending1))
+                    if pending1 >= U1:
+                        # All this WG's G1 claims are consumed: use the ordinary
+                        # G2 path, whose original ready wait remains mandatory.
+                        nxq = pending2
+                    comm_ops.store_i32_lds(mix_g1, pending1)
+                    comm_ops.store_i32_lds(mix_g2, pending2)
+                    comm_ops.store_i32_lds(mix_burst, burst)
+                    comm_ops.store_i32_lds(mix_g2_m, ready_m)
+                    comm_ops.store_i32_lds(bc_next, nxq)
+                else:
+                    nxq = U1 + claim
+                    if u < U1:
+                        nxq = xq_next(claim)
+                    comm_ops.store_i32_lds(bc_next, nxq)
             else:
                 comm_ops.store_i32_lds(bc_next, fx.Int32(SQ) + claim)
         rocdl.s_wait_dscnt(0)
@@ -1183,6 +1250,7 @@ def reduce(kc):
     CF_OFF, E, G, GATE_C, H, K = kc.CF_OFF, kc.E, kc.G, kc.GATE_C, kc.H, kc.K
     RED_CH, RED_UN, addr_out, bid = kc.RED_CH, kc.RED_UN, kc.addr_out, kc.bid
     RED_B64 = kc.RED_B64
+    RED_ROW2 = int(getattr(kc, 'RED_ROW2', 0))
     comb_slot_stride, lane, off_comb_inp = kc.comb_slot_stride, kc.lane, kc.off_comb_inp
     open_gates, peer_va, poll_peer_flags = kc.open_gates, kc.peer_va, kc.poll_peer_flags
     rank, rsrc_ids, stamp, tok = kc.rank, kc.rsrc_ids, kc.stamp, kc.tok
@@ -1208,17 +1276,39 @@ def reduce(kc):
         rsrc_comb_all = create_buffer_resource_from_addr(comb_base)
     rsrc_out = create_buffer_resource_from_addr(addr_out)
     n_red = tok * fx.Int32(RED_CH)
-    for w in range(wave_gid, n_red, G * 4 * RED_UN):
+    if const_expr(RED_ROW2):
+        if RED_CH % RED_UN or RED_UN != 2:
+            raise ValueError('row-paired reduce requires two complete chunks')
+        n_work = tok * fx.Int32(RED_CH // RED_UN)
+        work_stride = G * 4
+    else:
+        n_work = n_red
+        work_stride = G * 4 * RED_UN
+    for w in range(wave_gid, n_work, work_stride):
+        # Pair adjacent chunks to reuse one token's IDs, without a tail load.
+        if const_expr(RED_ROW2):
+            row_t = w // fx.Int32(RED_CH // RED_UN)
+            row_ch = (w - row_t * fx.Int32(RED_CH // RED_UN)) * fx.Int32(RED_UN)
+            row_gids = []
+            for rk in range_constexpr(K):
+                row_gids.append(fx.Int32(buffer_load(
+                    rsrc_ids, row_t * fx.Int32(K) + fx.Int32(rk),
+                    vec_width=1, dtype=T.i32, is_scalar=True)))
         # Every item's loads first, then each item's sum in k order (the
         # staged reduce's arithmetic). An item past the end reloads the
         # first one and skips its store.
         items = []
         for u in range_constexpr(RED_UN):
-            w_u = w + fx.Int32(u * G * 4)
-            in_u = w_u < n_red
-            w_u = fx.Int32(in_u.select(w_u, w))
-            t = w_u // fx.Int32(RED_CH)
-            ch = w_u - t * fx.Int32(RED_CH)
+            if const_expr(RED_ROW2):
+                t = row_t
+                ch = row_ch + fx.Int32(u)
+                in_u = fx.Boolean(True)
+            else:
+                w_u = w + fx.Int32(u * G * 4)
+                in_u = w_u < n_red
+                w_u = fx.Int32(in_u.select(w_u, w))
+                t = w_u // fx.Int32(RED_CH)
+                ch = w_u - t * fx.Int32(RED_CH)
             if const_expr(RED_B64):
                 rsrc_comb = create_buffer_resource_from_addr(
                     comb_base + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
@@ -1229,15 +1319,16 @@ def reduce(kc):
                 tok_b = t * fx.Int32(K * int(comb_slot_stride))
             vals = []
             for k in range_constexpr(K):
-                gid = fx.Int32(
-                    buffer_load(
-                        rsrc_ids,
-                        t * fx.Int32(K) + fx.Int32(k),
-                        vec_width=1,
-                        dtype=T.i32,
-                        is_scalar=True,
+                if const_expr(RED_ROW2):
+                    gid = row_gids[k]
+                else:
+                    gid = fx.Int32(
+                        buffer_load(
+                            rsrc_ids,
+                            t * fx.Int32(K) + fx.Int32(k),
+                            vec_width=1, dtype=T.i32, is_scalar=True,
+                        )
                     )
-                )
                 valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
                 slot_b = tok_b + fx.Int32(k * int(comb_slot_stride))
                 for j in range_constexpr(2):

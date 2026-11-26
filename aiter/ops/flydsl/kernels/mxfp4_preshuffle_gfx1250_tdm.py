@@ -241,6 +241,8 @@ def build_gemm_a8w4_tdm_task(
     scatter_cache_policy=0,
     defer_ep_wait=0,
     out_preshuffled=None,
+    tdm_native_coordinates=0,
+    tdm_native_scale_output_pack=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -305,6 +307,13 @@ def build_gemm_a8w4_tdm_task(
       under the next tile's mainloop. The next tile's epilogue waits for them
       before it restages C; the caller must drain tensorcnt before it counts
       the scatter as done or exits.
+    - ``tdm_native_coordinates``: the caller opts in only the verified
+      native STREAM profile. Hoist the TDM owner's M slice and use a checked
+      i32 local K advance followed by a carry-safe u64 address addition.
+      Other callers retain the original tiled-coordinate traversal.
+    - ``tdm_native_scale_output_pack``: an explicit native STREAM opt-in;
+      mode 2 stages four e8m0 bytes per row in LDS and drains contiguous
+      dwords with TDM. It shares the quant payload's retirement wait.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -432,6 +441,12 @@ def build_gemm_a8w4_tdm_task(
         and a_is_fp4
         and tile_m == tile_n == tile_k == 256
         and m_warp == n_warp == 2
+    )
+    native_tdm_owner = bool(
+        tdm_native_coordinates and a_is_fp4 and explicit_tile and n_experts == 65
+        and K in (7168, 2048) and not HAS_K_TAIL
+        and (tile_m, tile_n, m_warp, n_warp) == (128, 256, 1, 4)
+        and k_waves == cluster_m == cluster_n == 1
     )
     if enable_ep_scatter:
         if stage1_act != 0:
@@ -624,6 +639,21 @@ def build_gemm_a8w4_tdm_task(
     if out_preshuffled is None:
         out_preshuffled = a_preshuffled
     out_preshuffled = bool(out_preshuffled and stage1_quant_out and stage1_act)
+    scale_pack_request = int(tdm_native_scale_output_pack)
+    assert scale_pack_request in (0, 1, 2)
+    native_scale_pack = scale_pack_request if (
+        out_preshuffled and a_is_fp4 and not a_preshuffled
+        and stage1_quant_out and stage1_act and row_major_ascale
+        and K == 7168 and n_experts == 65 and explicit_tile
+        and (tile_m, tile_n, m_warp, n_warp) == (128, 256, 1, 4)
+        and QUANT_ROWS_PER_TILE == tile_m and num_waves == 4
+        and not C_Q_OFF and not enable_ep_scatter
+    ) else 0
+    # The quant payload is 8192 B; its four-byte scale row occupies the next
+    # 512 B of the dead mainloop arena. Both stages are retired before reuse.
+    SCALE_PACK_OFF = tile_m * (tile_n // 4)
+    if native_scale_pack:
+        assert SCALE_PACK_OFF + tile_m * 4 <= ARENA_B
     _a_layout = "_apre" if a_preshuffled else ""
     if out_preshuffled != bool(a_preshuffled and stage1_quant_out and stage1_act):
         _a_layout += "_cpre" if out_preshuffled else "_crm"
@@ -650,6 +680,8 @@ def build_gemm_a8w4_tdm_task(
     _ds_group = f"_dsgroup{sched_ds_group}" if sched_ds_group else ""
     _ds_wait = "_fencewait" if sched_ds_group else ""
     _explicit_vgpr_partition = "_regpart" if USE_EXPLICIT_VGPR_PARTITION else ""
+    _explicit_vgpr_partition += "_native_tdm_coords" if native_tdm_owner else ""
+    _explicit_vgpr_partition += f"_scale_output_pack{native_scale_pack}" if native_scale_pack else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
@@ -1030,7 +1062,7 @@ def build_gemm_a8w4_tdm_task(
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom blk on_i32 lds_off lds_stage lds_row inner outer waves nw",
+            "load atom blk on_i32 lds_off lds_stage lds_row inner outer waves nw",
         )
         jobs = []
         as_prologue_jobs = []
@@ -1072,6 +1104,16 @@ def build_gemm_a8w4_tdm_task(
             so it is kept only to assert the two agree.
             """
             nw = len(wv)
+            if const_expr(native_tdm_owner and outer % nw == 0):
+                # Hoist each owner's M coordinate as in hyg_pr6564_opt.
+                # The view still clamps all invalid M rows independently.
+                owner_rows = outer // nw
+                owner_offset = (wave - wv[0]) * owner_rows
+                g_off = g_off + fx.Int64(owner_offset) * g_stride
+                if const_expr(oob is not None):
+                    oob = fx.max(fx.Int32(oob) - owner_offset, fx.Int32(0))
+                lds_off = lds_off + owner_offset * lds_row
+                outer, nw = owner_rows, 1
             if const_expr(k_waves > 1 and k_adv):
                 # This group's first k-tile, in the view's element units.
                 g_off = g_off + fx.Int64(k_group * K_TILES) * fx.Int64(
@@ -1093,41 +1135,50 @@ def build_gemm_a8w4_tdm_task(
             assert (
                 not k_step or k_step == inner
             ), f"rest step {k_step} must equal the tile's inner width {inner}"
-            gt = tensor_view(
-                g_base + g_off,
-                (outer if oob is None else oob, inner * K_TILES if k_adv else inner),
-                (g_stride, 1),
-            )
-            tile = (outer, inner)
-            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
-                gt,
-                fx.make_layout(tile, (lds_row, 1)),
-                tile,
-                num_warps=nw,
-            )
-            if const_expr(wg_mask is not None):
-                # A runtime zero mask keeps a partial-M tail on the ordinary
-                # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
-                atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
-                # Descriptor bit 21 preserves the tuned multicast early release.
-                atom = fx.atom_set_value(
-                    atom, "early_timeout", fx.Int32(int(tdm_early_timeout))
+            global_inner = inner * K_TILES if k_adv else inner
+            local_coordinates = bool(native_tdm_owner and k_adv and k_adv * K_TILES < 2**31)
+            global_address = fx.Uint64(0)
+            if const_expr(local_coordinates):
+                global_address = fx.Uint64(fx.ptrtoint(g_base + g_off))
+
+            def tiled_load(offset, kt=None):
+                ptr = g_base + offset
+                extent = global_inner
+                if const_expr(kt is not None):
+                    # k_adv is bytes even for i32 scale payloads; widen after
+                    # its checked i32 product, before the carry-safe base add.
+                    address = global_address + fx.Uint64(fx.Uint32(kt) * k_adv)
+                    ptr = fx.inttoptr(
+                        fx.PointerType.get(
+                            elem_ty=(fx.Int32 if on_i32 else fx.Int8).ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=4 if on_i32 else 1,
+                        ), address,
+                    )
+                    extent = inner
+                gt = tensor_view(
+                    ptr, (outer if oob is None else oob, extent), (g_stride, 1),
                 )
-            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+                tile = (outer, inner)
+                atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
+                    gt, fx.make_layout(tile, (lds_row, 1)), tile,
+                    num_warps=nw,
+                )
+                if const_expr(wg_mask is not None):
+                    atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
+                    atom = fx.atom_set_value(atom, "early_timeout", fx.Int32(int(tdm_early_timeout)))
+                return atom, fx.zipped_divide(coord, tile)[None, (0, None)]
+
+            def load(kt):
+                return tiled_load(g_off, kt)
+
+            atom, blk = None, None
+            if const_expr(not local_coordinates):
+                atom, blk = tiled_load(g_off)
             (jobs if target_jobs is None else target_jobs).append(
-                Job(
-                    atom,
-                    blk,
-                    on_i32,
-                    lds_off,
-                    lds_stage,
-                    lds_row,
-                    inner,
-                    outer,
-                    wv,
-                    nw,
-                )
+                Job(load if local_coordinates else None, atom, blk,
+                    on_i32, lds_off, lds_stage, lds_row, inner, outer, wv, nw)
             )
 
         if const_expr(a_preshuffled):
@@ -1290,10 +1341,16 @@ def build_gemm_a8w4_tdm_task(
                     ((j.outer, j.inner), 1),
                     ((j.lds_row, 1), j.outer * j.lds_row),
                 )
+                atom, blk = j.atom, j.blk
+                rest_k = fx.Int32(kt)
+                if const_expr(j.load is not None):
+                    atom, blk = j.load(kt)
+                    rest_k = fx.Int32(0)
                 ts, tg = fx.rocdl.cdna5.tdm_partition(
-                    j.atom, wave - j.waves[0], fx.make_layout(j.nw, 1), dst, j.blk
+                    atom, wave - j.waves[0] if j.nw > 1 else fx.Int32(0),
+                    fx.make_layout(j.nw, 1), dst, blk,
                 )
-                fx.copy(j.atom, tg[None, fx.Int32(kt)], ts[None, 0])
+                fx.copy(atom, tg[None, rest_k], ts[None, 0])
                 if const_expr(tdm_snop):
                     # A branch must never directly follow a TDM issue (see
                     # mega_moe_gfx1250.tdm_prims); the owner test around this
@@ -1327,7 +1384,7 @@ def build_gemm_a8w4_tdm_task(
                     )
                     ts, tg = fx.rocdl.cdna5.tdm_partition(
                         job.atom,
-                        wave - job.waves[0],
+                        wave - job.waves[0] if job.nw > 1 else fx.Int32(0),
                         fx.make_layout(job.nw, 1),
                         destination,
                         job.blk,
@@ -2543,13 +2600,30 @@ def build_gemm_a8w4_tdm_task(
                             scale_value = row_valid.select(
                                 fx.Int8(e8m0_bytes[mx_blk]), fx.Int8(0)
                             )
-                            buffer_store(
-                                scale_value,
-                                scale_rsrc,
-                                dst_byte,
-                                mask=is_kgrp0,
-                                cache_modifier=c_cache_modifier,
-                            )
+                            if const_expr(native_scale_pack):
+                                # Stable fx.ptr_store lowers the byte store.
+                                # Each wave supplies one distinct e8m0 byte;
+                                # the existing quant staging barrier joins them.
+                                if is_kgrp0:
+                                    scale_lds_addr = (fx.Int32(stC_q_idx)
+                                        + fx.Int32(SCALE_PACK_OFF)
+                                        + row_in_tile * fx.Int32(4) + byte_in_dw)
+                                    scale_lds_ptr = fx.inttoptr(
+                                        fx.PointerType.get(
+                                            fx.Int8.ir_type,
+                                            address_space=fx.AddressSpace.Shared,
+                                            alignment=1,
+                                        ), scale_lds_addr,
+                                    )
+                                    fx.ptr_store(scale_value, scale_lds_ptr)
+                            else:
+                                buffer_store(
+                                    scale_value,
+                                    scale_rsrc,
+                                    dst_byte,
+                                    mask=is_kgrp0,
+                                    cache_modifier=c_cache_modifier,
+                                )
                             # Half-k128 tail (inter_dim % 128 == 64): one scale
                             # dword carries the e8m0 of four 32-column MX blocks,
                             # i.e. one k128 of GEMM2's K, but the last dword only
@@ -2757,6 +2831,22 @@ def build_gemm_a8w4_tdm_task(
                 rocdl.s_barrier_wait(-1)
             else:
                 workgroup_barrier()
+            if const_expr(native_scale_pack == 1):
+                # All 128 threads now own one complete, coalesced scale dword.
+                # The rounded last M16 block retains the original zero scales.
+                scale_row = fx.Int32(fx.thread_idx.x)
+                scale_addr = (fx.Int32(stC_q_idx) + fx.Int32(SCALE_PACK_OFF)
+                              + scale_row * fx.Int32(4))
+                packed_scale = fx.ptr_load(fx.inttoptr(
+                    fx.PointerType.get(fx.Int32.ir_type,
+                        address_space=fx.AddressSpace.Shared, alignment=4), scale_addr,
+                ))
+                scale_base_dw = (m_tile * q_dst_scale_dwpr + (blk_n >> 8)) * tile_m
+                # buffer_store uses element offsets: Int32 is one dword.
+                buffer_store(packed_scale, scale_rsrc,
+                    scale_base_dw + scale_row,
+                    mask=scale_row < ((mn_oob + 15) // 16) * 16,
+                    cache_modifier=c_cache_modifier)
             if const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
@@ -2919,6 +3009,17 @@ def build_gemm_a8w4_tdm_task(
                         fx.recast_iter(oc_store, c_q_base_ptr),
                         STORE_PITCH,
                     )
+                if const_expr(native_scale_pack == 2):
+                    # The extra tensor store shares the payload's final wait.
+                    # Scale dwords are contiguous within this APRE M128 slice.
+                    scale_base_dw = (fx.Int64(m_tile) * fx.Int64(q_dst_scale_dwpr)
+                                     + fx.Int64(blk_n >> 8)) * fx.Int64(tile_m)
+                    gt_scale = tensor_view(
+                        fx.recast_iter(fx.Int32, arg_quant_scale) + scale_base_dw,
+                        (1, ((mn_oob + 15) // 16) * 16), (tile_m, 1))
+                    tiled_store(gt_scale, (1, tile_m),
+                        fx.recast_iter(fx.Int32, c_q_base_ptr + SCALE_PACK_OFF),
+                        tile_m, c_cache_modifier)
                 if const_expr(tdm_snop):
                     rocdl.s_nop(0)
                 if const_expr(not defer_c_wait):

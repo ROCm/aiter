@@ -168,6 +168,13 @@ def make_megakernel(
         if MAXR > T_MAX * TALLY_MAXR:
             raise ValueError("more routes per rank than the tally CTAs count")
     STREAM = bool(stream) and COMPACT
+    # The accepted DSR1 EP4 prefill profile writes activation/scale directly
+    # in APRE layout and consumes it without an intervening reshuffle.
+    APRE = bool(
+        STREAM and TM == 128 and npes == 4
+        and H == 7168 and I == 2048 and EPR == 65 and K == 9
+        and int(max_tok_per_rank) == 8192
+    )
     st_kw = {}
     if STREAM:
         from ..compact_plan import S1F_SHARED_FIRST
@@ -205,12 +212,32 @@ def make_megakernel(
         NXCC = 8
         _xq = os.environ.get("AITER_MEGAKERNEL_XQ", "1" if NT1 == 2 * NXCC else "0")
         XQ = int(_xq == "1" and NT1 % NXCC == 0)
+        # Nine interleaved full-layer runs accepted this profile. Preserve
+        # producer progress and G1 XCC ownership; consume only ready M tiles.
+        mix_supported = bool(
+            APRE and G == 512 and XQ
+            and int(tile_k2) == 128 and int(num_buffers2) == 3
+        )
+        mix_slots = int(os.environ.get(
+            "AITER_MEGAKERNEL_READY_MIX", "4" if mix_supported else "0"
+        ))
+        mix_burst = int(os.environ.get(
+            "AITER_MEGAKERNEL_READY_BURST", "2" if mix_supported else "4"
+        ))
+        if not mix_supported:
+            mix_slots = 0
+        if not 0 <= mix_slots <= 4 or not 1 <= mix_burst <= 8:
+            raise ValueError("ready mix needs 0..4 slots and a burst of 1..8")
         st_kw = dict(  # noqa: C408 - KCtx fields
+            READY_MIX=mix_slots,
+            READY_BURST=mix_burst,
             XQ=XQ,
             NXCC=NXCC,
             GMX=int(os.environ.get("AITER_MEGAKERNEL_GMX", "32")),
             GM1=int(os.environ.get("AITER_MEGAKERNEL_GM1", "32")),
-            GM2=int(os.environ.get("AITER_MEGAKERNEL_GM2", "32")),
+            GM2=int(os.environ.get(
+                "AITER_MEGAKERNEL_GM2", "64" if mix_supported and mix_slots else "32"
+            )),
             FM=FM,
             FSH=FM.bit_length() - 1,
             SUB=SUB,
@@ -252,7 +279,25 @@ def make_megakernel(
     # slots: a GEMM2 item does not wait for its EP-scatter stores; they retire
     # under the next item, and the queue's end drains them before the close.
     # Its separate C stage does not fit next to 64-row tiles at 2 CTAs per CU.
-    DEFER_SC = int(not COMPACT and TM < 64)
+    # Three interleaved accepted rounds retain scatter across consecutive G2
+    # items. The protocol drains every wave before G1 can reuse their LDS.
+    stream_defer_supported = bool(
+        APRE and G == 512 and not st_kw.get("LOC", 0)
+        and int(tile_n) == int(tile_n2) == 256
+        and int(tile_k) == 256 and int(num_buffers) == 3
+        and int(tile_k2) == 128 and int(num_buffers2) == 3
+    )
+    stream_defer = bool(
+        stream_defer_supported
+        and os.environ.get("AITER_MEGAKERNEL_STREAM_DEFER_SC", "1") == "1"
+    )
+    DEFER_SC = int((not COMPACT and TM < 64) or stream_defer)
+    # Three interleaved full-layer rounds accepted packed APRE output
+    # scales. Keep the explicit builder opt-in within the verified profile.
+    scale_pack = (int(os.environ.get("AITER_NATIVE_SCALE_OUTPUT_PACK", "2"))
+                  if stream_defer_supported and int(stage1_act) == 1 else 0)
+    if scale_pack not in (0, 1, 2):
+        raise ValueError("native scale output packing needs mode 0, 1, or 2")
     # slots: a source signals "reserved" once its slot atomics returned, before
     # its rows retire; CTA 0 plans from the counters then, and GEMM items start
     # and stream weights while their A owners wait for the rows-landed gate.
@@ -268,6 +313,12 @@ def make_megakernel(
     # (token, chunk) items a reduce wave loads at once; compact's waves own
     # several items each.
     RED_UN = 2 if COMPACT else 1
+    # Three interleaved eight-layer rounds retained adjacent-chunk ID reuse
+    # within the accepted native APRE profile, with k-order sums unchanged.
+    RED_ROW2 = int(
+        stream_defer_supported and DEFER_SC and scale_pack == 2
+        and os.environ.get("AITER_NATIVE_REDUCE_ROW2", "1") == "1"
+    )
     # The reduce reads comb_inp through one resource and i32 offsets while the
     # region fits them, else through a 64-bit base per token.
     RED_B64 = int(int(max_tok_per_rank) * K * int(comb_slot_stride) >= 1 << 31)
@@ -277,6 +328,7 @@ def make_megakernel(
             ("st", (st_kw["P"] * 100 + st_kw["RBK"]) if STREAM else 0, 0),
             ("gm", (st_kw["GM1"] * 100 + st_kw["GM2"]) if STREAM else 3232, 3232),
             ("xq", st_kw["XQ"] * st_kw["GMX"] if STREAM else 32, 32),
+            ("rr", RED_ROW2, 0),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -318,6 +370,7 @@ def make_megakernel(
         PREF_B=PREF_B,
         RED_CH=RED_CH,
         RED_UN=RED_UN,
+        RED_ROW2=RED_ROW2,
         RED_B64=RED_B64,
         REP_W=REP_W,
         ROW=ROW,
@@ -389,9 +442,11 @@ def make_megakernel(
             lds_soa_load_interleave=0,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=0,
             m_align=0,
             explicit_tile=1,
+            # Independent three-round acceptance retained the TDM address
+            # preparation for this native APRE profile. Other layouts opt out.
+            tdm_native_coordinates=int(APRE),
             lds_base=lds_holder,
             raw_drain=True,
             defer_c_wait=False,
@@ -420,6 +475,9 @@ def make_megakernel(
             a_ready=ready1_holder if (COMPACT or EARLY) else None,
             a_cache_modifier=0,
             c_cache_modifier=SCOPE_DEV,
+            a_preshuffled=0,
+            out_preshuffled=int(APRE),
+            tdm_native_scale_output_pack=scale_pack,
             **common,
         )
         g2_task, block2, g2_name, _, lay2 = build_gemm_a8w4_tdm_task(
@@ -448,6 +506,7 @@ def make_megakernel(
             # of them cached.
             a_cache_modifier=0,
             scatter_cache_policy=SCOPE_SYS,
+            a_preshuffled=int(APRE),
             defer_ep_wait=DEFER_SC,
             **common,
         )
@@ -475,6 +534,10 @@ def make_megakernel(
             ("mega_compact" if COMPACT else "mega_slots")
             + f"_w{G}_r{rank}of{npes}_c{CAP if not COMPACT else MT_CAP * TM}"
             + knob_sfx
+            + (
+                f"_ready{st_kw['READY_MIX']}b{st_kw['READY_BURST']}"
+                if STREAM and st_kw["READY_MIX"] else ""
+            )
             + f"__{g1_name}__{g2_name}"
         )
         # Keep the separate-kernel launcher in this cache key's dependency set.

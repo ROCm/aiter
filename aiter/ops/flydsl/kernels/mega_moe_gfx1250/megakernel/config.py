@@ -22,7 +22,7 @@ from .protocol import (
 )
 
 #: AITER_MEGAKERNEL=1 runs steps of up to SLOTS_TOKENS tokens per rank on
-#: slots and larger steps below COMPACT_MAX_TOKENS on compact; larger steps
+#: slots and larger steps up to COMPACT_MAX_TOKENS on compact; larger steps
 #: run the staged path. A step's size is its receive bound per rank
 #: (``recv_token_bound``, else ``world * max_tokens_per_rank``), the same on
 #: every rank, so every rank picks the same path.
@@ -196,11 +196,11 @@ assert len(COMPACT_TILES) <= COMPACT_MAX_KERNELS
 def compact_variants(config) -> list:
     """(recv_lo, recv_hi, tile, CTAs per CU) of each compact kernel: the rows
     of COMPACT_TILES cut to the receive bounds compact serves, from past
-    slots' (or 0) to below COMPACT_MAX_TOKENS per rank, at most the
+    slots' (or 0) to COMPACT_MAX_TOKENS per rank inclusive, at most the
     instance's. A step runs the kernel whose (recv_lo, recv_hi] holds its
     bound."""
     lo = slots_recv_cap(config) if slots_reason(config) is None else 0
-    top = min(config.max_recv, config.world_size * COMPACT_MAX_TOKENS - 1)
+    top = min(config.max_recv, config.world_size * COMPACT_MAX_TOKENS)
     out = []
     for upto, tile, ctas in COMPACT_TILES:
         if lo >= top:
@@ -221,6 +221,17 @@ def compact_variants(config) -> list:
                 (config.hidden_dim, config.geometry.inter_dim), STREAM_TILES[None]
             )
         )
+        # DSR1 EP4 prefill: measured APRE A2 with GEMM2 K128/b3. Keep this
+        # profile on the validated geometry and retain explicit overrides.
+        if (
+            config.world_size == 4
+            and config.hidden_dim == 7168
+            and config.geometry.inter_dim == 2048
+            and config.experts_per_rank == 65
+            and config.topk == 9
+            and config.geometry.max_tokens_per_rank == 8192
+        ):
+            out[-1][2].update(tile_k2=128, num_buffers2=3)
     # Tuning: AITER_MEGAKERNEL_TILE="num_buffers=3,num_buffers2=3" overrides
     # the largest steps' kernel.
     env = os.environ.get("AITER_MEGAKERNEL_TILE", "")
