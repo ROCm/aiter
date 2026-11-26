@@ -78,16 +78,49 @@ def recurrent_kda_ref(q, k, v, g, beta, scale):
     return torch.stack(out, 1)
 
 
+def _mxfp8_active():
+    """Whether the layer calls run the MXFP8 recipe (``gemm_precision`` from
+    ``AITER_KDA_GEMM_PRECISION``); the tables then grade with ``_mxfp8_grade``."""
+    return kda_fused_layer.kda_gemm_precision() == "mxfp8"
+
+
+def _ref_input(x):
+    """The oracle's input leaf: fp32, or under MXFP8 the layer dtype itself, so
+    its emulated GEMMs round the operands as the fused path does."""
+    if _mxfp8_active():
+        return x.detach().requires_grad_(True)
+    return x.detach().float().requires_grad_(True)
+
+
+def _ref_scope(x):
+    """Emulate the active GEMM precision inside the oracle (fp32 GEMMs for bf16)."""
+    return kda_fused_layer._GemmPrecisionScope(None, x)
+
+
 def run_torch(dy, x, w, num_heads, lb=None, eps=1e-6):
-    """Reference layer backward: recurrent fwd + autograd, fp32."""
-    xs = x.detach().float().requires_grad_(True)
+    """Reference layer backward: recurrent fwd + autograd, fp32 (under MXFP8,
+    the recipe's emulated GEMMs)."""
+    xs = _ref_input(x)
     ws = [t.detach().float().requires_grad_(True) for t in w.tensors()]
     wr = KDALayerWeights.from_tensors(ws)
-    q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps, lb)
-    o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
-    y = kda_layer_postprocess(o, xs, wr, eps)
-    grads = torch.autograd.grad(y, [xs, *ws], dy.float())
+    with _ref_scope(xs):
+        q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps, lb)
+        o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
+        y = kda_layer_postprocess(o, xs, wr, eps)
+        grads = torch.autograd.grad(y, [xs, *ws], dy.float())
     return grads[0], list(grads[1:])
+
+
+def _mxfp8_grade(out, ref, base):
+    """(passed, noise ratio) of one tensor under the MXFP8 recipe: graded
+    against the emulated-MXFP8 reference relative to the recipe's own effect on
+    it (``ref`` vs ``base``, the fused layer at bf16), as the mxfp8 block table
+    does (``MXFP8_NOISE_RATIO``), with rel-L2 and max-delta backstops."""
+    rel = _rel_l2(out, ref)
+    ratio = rel / max(_rel_l2(ref, base), 1e-12)
+    sc = ref.float().abs().max().clamp_min(1e-6)
+    delta = ((out.float() - ref.float()).abs().max() / sc).item()
+    return ratio <= MXFP8_NOISE_RATIO and rel <= 5e-2 and delta <= 0.2, ratio
 
 
 def layer_flops(b, t, d, h, k, w, r, c):
@@ -105,6 +138,12 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, lb, dtype):
     dy = torch.randn(b, t, d).to(dtype)
     wt = make_weights(d, h, k, w, r, dtype)
     ref_dx, ref_dw = run_torch(dy, x, wt, h, lb)
+    mx = _mxfp8_active()
+    if mx:
+        bdx, bdw = kda_layer_bwd(
+            dy, x, wt, h, chunk, backend="fused", lower_bound=lb, gemm_precision="bf16"
+        )
+        base = [bdx, *bdw.tensors()]
 
     candidates = {
         "torch_chunk": lambda: kda_layer_bwd(
@@ -124,11 +163,18 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, lb, dtype):
 
     tol = 2e-2 if dtype == dtypes.fp32 else 5e-2
     names = ["dx"] + [f.name for f in KDALayerWeights.__dataclass_fields__.values()]
-    ret = {"gfx": get_gfx_runtime()}
+    ret = {"gfx": get_gfx_runtime(), "gemm": "mxfp8" if mx else "bf16"}
     for name, fn in candidates.items():
         (dx, dw), us = run_perftest(fn, num_iters=3, num_warmup=1)
         worst = 0.0
-        for gname, ref, out in zip(names, [ref_dx, *ref_dw], [dx, *dw.tensors()]):
+        for i, (gname, ref, out) in enumerate(
+            zip(names, [ref_dx, *ref_dw], [dx, *dw.tensors()])
+        ):
+            if mx:
+                ok, ratio = _mxfp8_grade(out, ref, base[i])
+                assert ok, f"{name}: d{gname} mxfp8 noise ratio {ratio:.3f}"
+                worst = max(worst, ratio)
+                continue
             # grade each gradient against its own scale so a small one is not hidden
             s = ref.abs().max().clamp_min(1e-6)
             err = checkAllclose(
@@ -143,7 +189,7 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, lb, dtype):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = worst
+        ret[f"{name} {'noise ratio' if mx else 'err'}"] = worst
     return ret
 
 
@@ -157,18 +203,19 @@ def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, lb=None, eps=1e-6):
 
     With ``cu_seqlens`` each packed sequence is run on its own.
     """
-    xs = x.detach().float().requires_grad_(True)
+    xs = _ref_input(x)
     ws = [t.detach().float().requires_grad_(True) for t in w.tensors()]
     wr = KDALayerWeights.from_tensors(ws)
     bounds = [0, x.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
     ys = []
-    for s, e in itertools.pairwise(bounds):
-        xseg = xs[:, s:e]
-        q, k, v, g, beta = kda_layer_preprocess(xseg, wr, num_heads, eps, lb)
-        o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
-        ys.append(kda_layer_postprocess(o, xseg, wr, eps))
-    y = torch.cat(ys, 1)
-    grads = torch.autograd.grad(y, [xs, *ws], dy.float())
+    with _ref_scope(xs):
+        for s, e in itertools.pairwise(bounds):
+            xseg = xs[:, s:e]
+            q, k, v, g, beta = kda_layer_preprocess(xseg, wr, num_heads, eps, lb)
+            o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
+            ys.append(kda_layer_postprocess(o, xseg, wr, eps))
+        y = torch.cat(ys, 1)
+        grads = torch.autograd.grad(y, [xs, *ws], dy.float())
     return y.detach(), grads
 
 
@@ -187,7 +234,7 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
         assert b == 1 and t % nseq == 0, "varlen rows pack equal sequences into b=1"
         cu = torch.arange(nseq + 1, dtype=torch.int32) * (t // nseq)
 
-    def block(backend):
+    def block(backend, precision=None):
         def run():
             xs = x.detach().requires_grad_(True)
             ws = [p.detach().requires_grad_(True) for p in wt.tensors()]
@@ -199,11 +246,16 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
                 backend=backend,
                 cu_seqlens=cu,
                 lower_bound=lb,
+                gemm_precision=precision,
             )
             return y, torch.autograd.grad(y, [xs, *ws], dy)
 
         return run
 
+    mx = _mxfp8_active()
+    if mx:
+        by, bg = block("fused", "bf16")()
+        base = [by, *bg]
     if b * t <= ORACLE_MAX_TOKENS:
         ref_name = "recurrent"
         ref_y, ref_g = run_torch_block(dy, x, wt, h, cu, lb)
@@ -218,11 +270,16 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     names = ["y", "dx"] + [
         f.name for f in KDALayerWeights.__dataclass_fields__.values()
     ]
-    ret = {"gfx": get_gfx_runtime(), "ref": ref_name}
+    ret = {"gfx": get_gfx_runtime(), "ref": ref_name + ("+mxfp8" if mx else "")}
     for name in ("torch", "fused"):
         (y, grads), us = run_perftest(block(name), num_iters=3, num_warmup=1)
         worst = 0.0
-        for gname, ref, out in zip(names, [ref_y, *ref_g], [y, *grads]):
+        for i, (gname, ref, out) in enumerate(zip(names, [ref_y, *ref_g], [y, *grads])):
+            if mx:
+                ok, ratio = _mxfp8_grade(out, ref, base[i])
+                assert ok, f"block {name}: {gname} mxfp8 noise ratio {ratio:.3f}"
+                worst = max(worst, ratio)
+                continue
             sc = ref.abs().max().clamp_min(1e-6)
             err = checkAllclose(
                 (ref / sc).to(dtypes.fp32),
@@ -236,7 +293,7 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = worst
+        ret[f"{name} {'noise ratio' if mx else 'err'}"] = worst
     # which optional FlyDSL / Triton pieces the fused run actually used
     ret["fused pieces"] = " ".join(
         f"{key}={val}" for key, val in sorted(kda_fused_layer.LAST_PIECES.items())
@@ -258,6 +315,12 @@ def test_kda_piece(piece, b, t, d, h, k, w, r, chunk, lb, dtype):
         ref_name = "torch_chunk"
         rdx, rdw = kda_layer_bwd(dy, x, wt, h, chunk, backend="torch", lower_bound=lb)
         ref_dx, ref_dw = rdx, rdw.tensors()
+    mx = _mxfp8_active()
+    if mx:
+        bdx, bdw = kda_layer_bwd(
+            dy, x, wt, h, chunk, backend="fused", lower_bound=lb, gemm_precision="bf16"
+        )
+        base = [bdx, *bdw.tensors()]
     choice = dict.fromkeys(kda_fused_layer.KDA_PIECE_DEFAULTS, "triton")
     choice[piece] = "flydsl"
     kda_fused_layer.set_kda_pieces(**choice)
@@ -273,7 +336,15 @@ def test_kda_piece(piece, b, t, d, h, k, w, r, chunk, lb, dtype):
     tol = 2e-2 if dtype == dtypes.fp32 else 5e-2
     names = ["x"] + [f.name for f in KDALayerWeights.__dataclass_fields__.values()]
     worst, failed = 0.0, []
-    for gname, ref, out in zip(names, [ref_dx, *ref_dw], [dx, *dw.tensors()]):
+    for i, (gname, ref, out) in enumerate(
+        zip(names, [ref_dx, *ref_dw], [dx, *dw.tensors()])
+    ):
+        if mx:
+            ok, ratio = _mxfp8_grade(out, ref, base[i])
+            if not ok:
+                failed.append(f"d{gname}")
+            worst = max(worst, ratio)
+            continue
         sc = ref.abs().max().clamp_min(1e-6)
         err = checkAllclose(
             (ref / sc).to(dtypes.fp32),
@@ -287,7 +358,7 @@ def test_kda_piece(piece, b, t, d, h, k, w, r, chunk, lb, dtype):
         worst = max(worst, err)
     ret = {
         "gfx": get_gfx_runtime(),
-        "ref": ref_name,
+        "ref": ref_name + ("+mxfp8" if mx else ""),
         # the backend that actually served the stage (flydsl may be skipped)
         "used": pieces.get(piece),
         "skipped": pieces.get(f"{piece}_flydsl_skipped", "-"),
