@@ -150,3 +150,51 @@ def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
     if expected == "lamport" and quant:
         args = ca.lamport_fused_ar_rms_quant.call_args.args
         assert args[3:] == (1e-6, False, emit_bf16)
+
+
+@pytest.mark.parametrize(
+    "m,n,gluon,expected",
+    [
+        (CAP, 6144, True, "gluon"),  # every Gluon wave busy
+        (CAP + 1, 6144, True, "lamport"),
+        (1, 7168, True, "lamport"),  # 16 Gluon waves for 10 chunks: Lamport
+        (512, 4096, True, "lamport"),  # 4 MiB
+        (513, 4096, True, "split"),  # the Gluon power-of-2 kernel and the quant
+        (513, 4096, False, "lamport"),
+        (1, 6144, False, "lamport"),
+        (682, 6144, False, "lamport"),  # 8 MiB, the TP4 Lamport cap
+        (683, 6144, False, "split"),
+        (16, 2880, True, "gluon"),  # not a Lamport hidden
+        (16, 2880, False, "split"),
+    ],
+)
+def test_mxfp8_route(m, n, gluon, expected):
+    x = torch.zeros((m, n), dtype=torch.bfloat16)
+    weight = torch.ones(n, dtype=torch.bfloat16)
+    out = (x, x, x)
+    ca = SimpleNamespace(
+        disabled=False,
+        _lamport_max_bytes=8 << 20,
+        lamport_fused_ar_rms_mxfp8=Mock(return_value=out),
+    )
+    ca.should_lamport_ar_rms = MethodType(CustomAllreduce.should_lamport_ar_rms, ca)
+    comm = SimpleNamespace(
+        ca_comm=ca,
+        cpu_group="group",
+        gluon_ar=("fused_inboxes", "fused_calls") if gluon else None,
+        gluon_ar_plain=("inboxes", CALLS) if gluon else None,
+        fused_allreduce_rmsnorm=Mock(return_value=(x, x)),
+    )
+    gluon_op = Mock(return_value=out)
+    with patch(
+        "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm_mxfp8_quant", gluon_op
+    ), patch("aiter.ops.quant.per_1x32_mx_quant_hip", return_value=(x, x)) as quant:
+        cc.CudaCommunicator.fused_allreduce_rmsnorm_mxfp8_quant(
+            comm, x, x, weight, 1e-6
+        )
+    taken = {
+        "gluon": gluon_op.called,
+        "lamport": ca.lamport_fused_ar_rms_mxfp8.called,
+        "split": quant.called and comm.fused_allreduce_rmsnorm.called,
+    }
+    assert taken == {path: path == expected for path in taken}, taken

@@ -19,6 +19,8 @@
  */
 #include "opus/opus.hpp"
 #include "hip_float8.h"
+#include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -1502,11 +1504,21 @@ DINLINE lamport_u32x4 lamport_load_b128(const void* src)
 #endif
 }
 
+// v from the lane that the DPP quad permute PERM names
+template <int PERM>
+DINLINE float lamport_quad_perm(float v)
+{
+    return __builtin_bit_cast(
+        float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), PERM, 0xf, 0xf, false));
+}
+
 // MAX_THREADS only bounds the block; blockDim.x is the block size, a multiple
 // of kLamportWave. OutT is T, or an FP8 type: then output gets the per-token
 // quant of ar_rmsnorm_gfx1250, scale_out a scale a row and bf16_output (unless
-// null) the T output.
-template <typename T, typename OutT, int ngpus, int MAX_THREADS, bool CLUSTER>
+// null) the T output. With MX the FP8 output is MXFP8 instead, the bytes of
+// per_1x32_mx_quant_hip(fp8, e8m0) of the T output: scale_out holds the
+// row-major E8M0 bytes, one a group of 32, and bf16_output is not written.
+template <typename T, typename OutT, int ngpus, int MAX_THREADS, bool CLUSTER, bool MX = false>
 __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
     const T* __restrict__ input,
     const T* __restrict__ residual_inp,
@@ -1602,12 +1614,29 @@ __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
     }
     P sum;
     float square_sum = 0.f;
-#pragma unroll
-    for(int j = 0; j < pack_size; ++j)
+    if constexpr(MX)
     {
-        x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
-        sum[j] = downcast_s<T>(x[j]);
-        square_sum += x[j] * x[j];
+        // The other instantiations round every square and add them in order;
+        // this one would fuse them into FMAs, and then its MXFP8 bytes would not
+        // be per_1x32_mx_quant_hip's of their output.
+#pragma clang fp contract(off)
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
+            sum[j] = downcast_s<T>(x[j]);
+            square_sum += x[j] * x[j];
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
+            sum[j] = downcast_s<T>(x[j]);
+            square_sum += x[j] * x[j];
+        }
     }
     reinterpret_cast<P*>(residual_out)[tid] = sum;
 
@@ -1658,6 +1687,36 @@ __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
     if constexpr(!QUANT)
     {
         reinterpret_cast<P*>(output)[tid] = o;
+    }
+    else if constexpr(MX)
+    {
+        // the steps of per_1x32_mx_quant_hip on gfx1250: a group of 32 is the
+        // packs of 4 neighbouring lanes, its amax starts at kAmaxFloor (fmaxf
+        // drops NaNs), the scale is the RoundUp E8M0 one capped at 2^127, and
+        // the hardware divides by it and converts.
+        float amax = aiter::kAmaxFloor;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            amax = fmaxf(amax, fabsf(upcast_s(o[j])));
+        amax              = fmaxf(amax, lamport_quad_perm<0xb1>(amax)); // lane ^ 1
+        amax              = fmaxf(amax, lamport_quad_perm<0x4e>(amax)); // lane ^ 2
+        const float scale = aiter::mxfp8_cap_scale(
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::kHwFp8MxDtype>(
+                amax));
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+        using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+        u32x2 q;
+        if constexpr(std::is_same_v<T, opus::bf16_t>)
+            q = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(o, scale);
+        else
+            q = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f16(o, scale);
+        reinterpret_cast<u32x2*>(output)[tid] = q;
+        if(tid % 4 == 0)
+            reinterpret_cast<uint8_t*>(scale_out)[tid / 4] =
+                __builtin_bit_cast(uint32_t, scale) >> 23;
+#else
+        __builtin_trap(); // the Lamport kernels run on gfx1250 only
+#endif
     }
     else
     {
@@ -2342,9 +2401,9 @@ struct LamportArRms
         HIP_CALL(hipGraphKernelNodeSetAttribute(deps[0], attr.id, &attr.val));
     }
 
-    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), see
-    // lamport_ar_rmsnorm_gfx1250
-    template <typename T, typename OutT>
+    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), MX
+    // picks MXFP8 over per-token FP8; see lamport_ar_rmsnorm_gfx1250
+    template <typename T, typename OutT, bool MX = false>
     void run(hipStream_t stream,
              const T* input,
              const T* residual_inp,
@@ -2381,7 +2440,7 @@ struct LamportArRms
 #define LAUNCH_LAMPORT_RMS(NG)                                                              \
     if(threads == 0)                                                                        \
     {                                                                                       \
-        lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportRowMaxThreads, false>               \
+        lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportRowMaxThreads, false, MX>           \
             <<<(int)rows, row_packs, 0, stream>>>(LAMPORT_RMS_ARGS);                        \
     }                                                                                       \
     else if constexpr(kLamportClusterLaunch)                                                \
@@ -2396,7 +2455,7 @@ struct LamportArRms
         config.numAttrs = 1;                                                                \
         HIP_CALL(hipLaunchKernelEx(                                                         \
             &config,                                                                        \
-            lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportClusterMaxThreads, true>,       \
+            lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportClusterMaxThreads, true, MX>,   \
             LAMPORT_RMS_ARGS));                                                             \
         set_captured_cluster_dim(stream, attr);                                             \
     }
@@ -3386,9 +3445,9 @@ public:
         lamport_ = std::move(state);
     }
 
-    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), see
-    // lamport_ar_rmsnorm_gfx1250
-    template <typename T, typename OutT>
+    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), MX
+    // picks MXFP8 over per-token FP8; see lamport_ar_rmsnorm_gfx1250
+    template <typename T, typename OutT, bool MX = false>
     void fused_allreduce_rmsnorm_lamport(hipStream_t stream,
                                          const T* input,
                                          const T* residual_inp,
@@ -3405,8 +3464,8 @@ public:
         if(!lamport_)
             throw std::runtime_error("fused_allreduce_rmsnorm_lamport: call init_lamport_ar_rms "
                                      "first");
-        lamport_->run<T, OutT>(stream, input, residual_inp, residual_out, output, weight,
-                               scale_out, bf16_out, eps, tokens, hidden, gemma_norm);
+        lamport_->run<T, OutT, MX>(stream, input, residual_inp, residual_out, output, weight,
+                                   scale_out, bf16_out, eps, tokens, hidden, gemma_norm);
     }
 
     // Lamport all-reduce of input + other on the same inbox, see lamport_ar_1shot_gfx1250.

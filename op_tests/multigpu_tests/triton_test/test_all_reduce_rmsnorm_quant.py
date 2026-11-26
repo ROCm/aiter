@@ -367,27 +367,35 @@ def _dispatch_worker(rank, init_method):
             if not op.called or _pt_wrong(outs, xs, res, w, quant, rank, ar):
                 failures.append(f"{name}: another path or wrong")
 
-        # MXFP8: the bytes of fused_allreduce_rmsnorm and then per_1x32_mx_quant_hip.
-        # One Gluon launch up to 128 rows (2880 and 7168 end in a partial chunk);
-        # 512 rows of 6144 are past its 4 MiB.
-        for tokens, hidden in (
-            (1, 2880),
-            (64, 7168),
-            (128, PT_HIDDEN),
-            (512, PT_HIDDEN),
+        # MXFP8: the bytes of the route's AR + RMSNorm, then per_1x32_mx_quant_hip.
+        # One Gluon launch where Lamport cannot run (2880 ends in a partial chunk) and,
+        # with every Gluon wave busy, up to 128 rows (6144); one Lamport launch
+        # elsewhere (7168: idle Gluon waves; 6144 x 192 a cluster a row, x 512 a block).
+        ca = tp.device_communicator.ca_comm
+        for tokens, hidden, gluon in (
+            (1, 2880, True),
+            (64, 7168, False),
+            (128, PT_HIDDEN, True),
+            (192, PT_HIDDEN, False),
+            (512, PT_HIDDEN, False),
         ):
             xs, res, w = _pt_inputs(tokens, hidden, 600 + tokens, device)
             with patch.object(
                 plain,
                 "all_reduce_rmsnorm_mxfp8_quant",
                 wraps=plain.all_reduce_rmsnorm_mxfp8_quant,
-            ) as op:
+            ) as op, patch.object(
+                ca, "lamport_fused_ar_rms_mxfp8", wraps=ca.lamport_fused_ar_rms_mxfp8
+            ) as lamport:
                 outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                     xs[rank], res, w, EPS, quant_type="mxfp8", gemma_norm=True
                 )
-            y, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                xs[rank], res, w, EPS, gemma_norm=True
-            )
+            if gluon:
+                y, res_out = all_reduce_rmsnorm_per_token_quant(
+                    xs[rank], res, w, EPS, True, False, *ar
+                )
+            else:
+                y, res_out = ca.lamport_fused_ar_rms(xs[rank], res, w, EPS, True)
             q, scale = per_1x32_mx_quant_hip(
                 y, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
             )
@@ -395,7 +403,7 @@ def _dispatch_worker(rank, init_method):
                 torch.equal(o.view(torch.uint8), r.view(torch.uint8))
                 for o, r in zip(outs, (q, res_out, scale))
             )
-            if op.called != (tokens <= 128) or not same:
+            if op.called != gluon or lamport.called == gluon or not same:
                 name = f"rank {rank} mxfp8 tokens {tokens} hidden {hidden}"
                 failures.append(f"{name}: another path or wrong")
     finally:

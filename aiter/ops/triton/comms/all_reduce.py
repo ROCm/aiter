@@ -30,6 +30,12 @@ def norm_waves(hidden: int) -> int:
     return waves if hidden > 0 and hidden % 8 == 0 and waves <= 32 else 0
 
 
+def norm_waves_busy(hidden: int) -> bool:
+    """Whether every wave of norm_waves(hidden) has a chunk of the row: no wave idles
+    because the count was rounded up to a power of two."""
+    return norm_waves(hidden) == triton.cdiv(hidden, 12 * _LINES)
+
+
 def norm_fits(tokens: int, hidden: int, calls: torch.Tensor) -> bool:
     """Whether all_reduce_rmsnorm_per_token_quant takes tokens rows of hidden values
     on the inboxes of these calls: a row is whole chunks, its last one partial."""

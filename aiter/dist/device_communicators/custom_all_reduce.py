@@ -35,7 +35,7 @@ from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.utility.dtypes import fp8
+from aiter.utility.dtypes import fp8, fp8_e8m0
 
 from .flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
@@ -2511,6 +2511,38 @@ class CustomAllreduce:
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
+
+    def lamport_fused_ar_rms_mxfp8(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+    ):
+        """lamport_fused_ar_rms with an MXFP8 out in the same kernel.
+
+        Returns (out, residual_out, scale): E4M3 out and row-major E8M0
+        scales (rows, hidden / 32), the bytes of lamport_fused_ar_rms followed
+        by per_1x32_mx_quant_hip. Check should_lamport_ar_rms first.
+        """
+        out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        res_out = torch.empty_like(inp)
+        scale = torch.empty(
+            inp.shape[:-1] + (inp.shape[-1] // 32,), dtype=fp8_e8m0, device=inp.device
+        )
+        ops.fused_allreduce_rmsnorm_quant_lamport_gfx1250(
+            self._ptr,
+            _lamport_aligned(inp),
+            _lamport_aligned(res_inp),
+            res_out,
+            out,
+            scale,
+            _lamport_aligned(w),
+            eps,
+            gemma_norm,
+        )
+        return out, res_out, scale
 
     def should_lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> bool:
         """Whether lamport_ar_add takes this call (gfx1250, IPC transport).

@@ -21,6 +21,10 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
+# Where fused_allreduce_rmsnorm takes the Gluon power-of-2 kernel (self.gluon_ar), the
+# Lamport MXFP8 kernel is faster than it and the quant up to 4 MiB at hidden 1024 to
+# 8192, not at hidden 1024 from 6 MiB; larger MXFP8 calls keep those two.
+_GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
@@ -30,19 +34,27 @@ _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 _GLUON_AR_NORM_MAX_TOKENS = 128
 
 
-def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
+def _use_gluon_ar_norm(
+    comm, input_, res_inp_, weight_, lamport: bool, mxfp8: bool = False
+) -> bool:
     """True if all_reduce_rmsnorm_per_token_quant takes the call: up to the 4 MiB of
     the plain Gluon all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the
-    Lamport one-shot can take it (lamport). As for Lamport, operand addresses are
-    not looked at: all ranks must take the same path."""
+    Lamport one-shot can take it (lamport). With mxfp8 only while no wave of the
+    Gluon program idles (norm_waves_busy) where Lamport can take it: the Lamport
+    MXFP8 kernel is faster otherwise (TP4 graph replay, hidden 1024 to 8192). As
+    for Lamport, operand addresses are not looked at: all ranks must take the same
+    path."""
     if comm.gluon_ar_plain is None or input_.dim() != 2:
         return False
-    from aiter.ops.triton.comms.all_reduce import norm_fits
+    from aiter.ops.triton.comms.all_reduce import norm_fits, norm_waves_busy
 
     tokens, hidden = input_.shape
+    max_tokens = _GLUON_AR_NORM_MAX_TOKENS
+    if mxfp8 and not norm_waves_busy(hidden):
+        max_tokens = 0
     return (
         norm_fits(tokens, hidden, comm.gluon_ar_plain[1])
-        and (tokens <= _GLUON_AR_NORM_MAX_TOKENS or not lamport)
+        and (tokens <= max_tokens or not lamport)
         and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
         and res_inp_.shape == input_.shape
         and weight_.shape == (hidden,)
@@ -768,8 +780,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         gemma_norm: bool = False,
     ):
         """(out, residual_out, scale): E4M3 out with row-major group-32 E8M0
-        scales. One Gluon launch where the per-token Gluon kernel would run, else
-        fused_allreduce_rmsnorm and then per_1x32_mx_quant_hip (the same bytes)."""
+        scales, the bytes of the AR + RMSNorm it runs followed by
+        per_1x32_mx_quant_hip. One launch of the Gluon kernel or the Lamport
+        one-shot where one takes the call (_use_gluon_ar_norm, then
+        should_lamport_ar_rms), else fused_allreduce_rmsnorm and then the quant."""
         if input_.dim() != 2 or input_.shape[-1] % 32:
             raise ValueError("mxfp8 takes a 2-D input with hidden divisible by 32")
         if input_.shape[0] == 0:
@@ -779,7 +793,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
             input_, res_inp_, weight_, input_.shape[-1]
         )
-        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport):
+        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport, mxfp8=True):
             from aiter.ops.triton.comms.all_reduce import (
                 all_reduce_rmsnorm_mxfp8_quant,
             )
@@ -792,6 +806,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 gemma_norm,
                 self.cpu_group,
                 *self.gluon_ar_plain,
+            )
+        hidden = input_.shape[-1]
+        if lamport and (
+            self.gluon_ar is None
+            or input_.dtype != torch.bfloat16
+            or hidden & (hidden - 1)
+            or input_.numel() * input_.element_size()
+            <= _GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES
+        ):
+            return ca_comm.lamport_fused_ar_rms_mxfp8(
+                input_, res_inp_, weight_, eps, gemma_norm
             )
         from aiter.ops.quant import per_1x32_mx_quant_hip
 
