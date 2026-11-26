@@ -26,12 +26,9 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
-    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
-    MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
     MHA_V4_MXFP8_HD256_K_ROW_BYTES,
     MHA_V4_MXFP8_HD256_K_TILE_BYTES,
-    block_scale_storage,
     k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -1527,26 +1524,6 @@ def _check_mxfp8_hd256_records(records: Tensor, name: str) -> None:
         )
 
 
-def _backed_pooled_k_scale(scale: Optional[Tensor]) -> Optional[Tensor]:  # noqa: UP045
-    """`scale` copied into the padded storage AITER's own K scales use.
-
-    The 64x64 MXFP8 Sol-Attn row reads its pooled E8M0 K scales (mean_k_scale, and mean_k_var_scale
-    under the Jensen term) past their last 128-row tile: a dword past a padded tile, and into the
-    next tile once the pooled rows fill it. sol_prepare pads them to that tile only, so the read
-    faults whenever the allocation ends at an unmapped page. The lookahead rows cover it.
-    """
-    if scale is None:
-        return None
-    backed = block_scale_storage(
-        scale,
-        *scale.shape,
-        MHA_V4_KV_TILE_ROWS,
-        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
-    )
-    backed.copy_(scale)
-    return backed
-
-
 @torch.library.custom_op("aiter::mha_v4_fwd_sol_launch", mutates_args=("out", "lse"))
 def _mha_v4_fwd_sol_launch(
     q: Tensor,
@@ -2119,17 +2096,6 @@ def mha_v4_packed(
         if pooled is None:
             _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)
         else:
-            if (
-                k_scale_mode == AttentionScaleMode.E8M0_PER_1X32
-                and _is_fp8_format(k_format)
-                and (q_tile, kv_tile) == (64, 64)
-            ):
-                # Under the tilt mean_k_scale is plane 0 of sol_tilt_planes' K scales, whose
-                # planes 1..rank the kernel reaches through a byte stride past it; a copy of
-                # the view would drop them. That allocation carries the lookahead rows itself.
-                if sol_tilt is None:
-                    mean_k_scale = _backed_pooled_k_scale(mean_k_scale)
-                mean_k_var_scale = _backed_pooled_k_scale(mean_k_var_scale)
             _mha_v4_fwd_sol_launch(
                 *launch_args,
                 *lut,
