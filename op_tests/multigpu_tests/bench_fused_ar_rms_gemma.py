@@ -152,13 +152,20 @@ def _worker(rank, args, port, result_q):
             for name, rung in _forced_rungs(rows):
                 names[name] = rung
         for name in sorted(n for n in names if not args.cands or n in args.cands):
+            rung = names[name]
+            # An unbounded window makes _check_ladder() measure every single-rung ladder
+            # against the full MAX_ROWS=1024: a 16-row oneshot or 640-row pull rung then
+            # raises at construction (its one rung would also have to serve rows above its
+            # known cap). Bound the window to the rung's own kernel cap instead, so cells
+            # outside it decline through accepts() during capture rather than aborting setup.
+            cap = policy.PULL_KERNEL_MAX_ROWS[rung.kernel]
             forced[name] = PullAllReduceRMSNorm(
                 group=group,
                 device=dev,
                 rank=rank,
                 world_size=WORLD,
-                window=policy.Window(0, None),
-                ladders={H: (names[name],)},
+                window=policy.Window(0, (cap + 1) * 2 * H),
+                ladders={H: (rung,)},
             )
             forced[name].preload(H)
     dist.barrier(group)
@@ -379,6 +386,20 @@ def main():
     ap.add_argument("--eager-calls", type=int, default=8)
     ap.add_argument("--csv", default=None)
     args = ap.parse_args()
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if torch.cuda.device_count() < WORLD:
+        print(
+            f"fewer than {WORLD} GPUs visible ({torch.cuda.device_count()}): "
+            "skipping the pull/custom-fused AR+RMS benchmark"
+        )
+        return
+    if get_gfx_runtime() != "gfx950":
+        print(
+            f"the pull schedule is gfx950-only, not {get_gfx_runtime()}: "
+            "skipping the benchmark"
+        )
+        return
     port = 29800 + os.getpid() % 150
     ctx = mp.get_context("spawn")
     q = ctx.SimpleQueue()

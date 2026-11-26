@@ -2247,9 +2247,20 @@ class CustomAllreduce:
             self._IS_CAPTURING = True
             try:
                 # The pull schedule reads the graph's inputs in place: it
-                # registers them when the capture ends.
+                # registers them when the capture ends, the same IPC export the
+                # registered custom-allreduce path uses. Only take that path when
+                # _agree_capture_path() (above) agreed to it on every rank: when
+                # expandable_segments is on or the host opted out
+                # (enable_register_for_capturing=False, e.g. ATOM's PIECEWISE
+                # graphs), self._register_for_capturing is False and pull must
+                # decline every call instead of registering unexportable
+                # pointers, exactly like the registered path does.
                 fly_pull = getattr(self, "_fly_pull", None)
-                with fly_pull.capture() if fly_pull is not None else nullcontext():
+                with (
+                    fly_pull.capture()
+                    if fly_pull is not None and self._register_for_capturing
+                    else nullcontext()
+                ):
                     yield
             finally:
                 self._IS_CAPTURING = False

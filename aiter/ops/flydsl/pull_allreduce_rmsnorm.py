@@ -354,6 +354,40 @@ class PullAllReduceRMSNorm:
             (a0, a1), (b0, b1) = span(out), span(residual_out)
             if a0 < b1 and b0 < a1:
                 return False
+
+        # A destination (out, residual_out) must not share bytes with a source (inp, residual_in,
+        # weight) either, unless it is the exact same tensor (identical data_ptr, shape and stride:
+        # every element then reads and writes the same address, so there is no cross-row hazard).
+        # A shifted or partial overlap -- e.g. residual_out advanced one row from residual_in, or an
+        # output row landing on weight -- lets one workgroup's write land on bytes a different
+        # workgroup (or the weight read of every row) has not read yet.
+        def _extent(t):
+            if t.dim() == 2 and t.shape[0] > 0:
+                lo = t.data_ptr()
+                hi = (
+                    lo
+                    + ((t.shape[0] - 1) * t.stride(0) + t.shape[1]) * t.element_size()
+                )
+                return lo, hi
+            return t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()
+
+        def _exact_alias(a, b):
+            return (
+                a.data_ptr() == b.data_ptr()
+                and tuple(a.shape) == tuple(b.shape)
+                and tuple(a.stride()) == tuple(b.stride())
+            )
+
+        for d in (out, residual_out):
+            if d is None:
+                continue
+            d0, d1 = _extent(d)
+            for s in (inp, residual_in, weight):
+                if _exact_alias(d, s):
+                    continue
+                s0, s1 = _extent(s)
+                if d0 < s1 and s0 < d1:
+                    return False
         if not launcher_loaded(self._launcher(rows)[0]):
             return False  # not preloaded: a capture cannot JIT-compile
         if self.rung(rows).kernel == "oneshot":
