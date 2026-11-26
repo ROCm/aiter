@@ -883,6 +883,21 @@ def _e8m0_scale(amax):
     return e8m0, quant_scale
 
 
+def _silu_f32(g, fast=False):
+    if const_expr(fast):
+        return g * sigmoid_f32(g)
+    emu = (g * fx.Float32(-LOG2E)).exp2()
+    return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
+
+
+def silu_mul_f32(g, u, swiglu_limit=0.0, fast=False):
+    """silu(g) * u; with ``swiglu_limit`` > 0, g is clamped above and u to +-swiglu_limit first."""
+    if swiglu_limit <= 0:
+        return _silu_f32(g, fast) * u
+    limit = fx.Float32(swiglu_limit)
+    return _silu_f32(-(-g).maximumf(-limit), fast) * fx.clampf(u, -limit, limit)
+
+
 class SiluQuantEpilogue:
     """silu(gate)*up -> fp8/fp4 + per-32 E8M0 out-scale."""
 
@@ -941,12 +956,6 @@ class SiluQuantEpilogue:
         self._lane = fx.thread_idx.x % 64
         self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
 
-    def _silu(self, g):
-        if const_expr(self._fast_silu):
-            return g * sigmoid_f32(g)
-        emu = (g * fx.Float32(-LOG2E)).exp2()
-        return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
-
     def _combine(self, acc):
         gui_n = self._num_acc_n // _PACK
         out = []
@@ -975,14 +984,7 @@ class SiluQuantEpilogue:
                 for i in range_constexpr(4)
             ]
             return Vec.from_elements(elems, fx.Float32)
-        if self._swiglu_limit <= 0:
-            elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
-            return Vec.from_elements(elems, fx.Float32)
-        limit = fx.Float32(self._swiglu_limit)
-        elems = [
-            self._silu(-(-gv[i]).maximumf(-limit)) * fx.clampf(uv[i], -limit, limit)
-            for i in range_constexpr(4)
-        ]
+        elems = [silu_mul_f32(gv[i], uv[i], self._swiglu_limit, self._fast_silu) for i in range_constexpr(4)]
         return Vec.from_elements(elems, fx.Float32)
 
     def _tile_out(self, tile_i32, elem, unit_elems=1):
