@@ -34,7 +34,9 @@ import torch
 from .kernels.kda_chunk_bwd import (
     BT,
     compile_dav,
+    compile_dav_mfma,
     compile_dhu,
+    compile_dhu_mfma,
     compile_gate_cumsum,
     compile_intra,
     compile_wy_dqkg,
@@ -313,7 +315,7 @@ def chunk_kda_bwd_flydsl_full(
     dAqk = alloc(B, T, H, BT, **f32)
     dv = alloc(v.shape, device=dev, dtype=v.dtype)
     _run_compiled(
-        compile_dav(H, v.dtype, Aqk.dtype, varlen),
+        (compile_dav_mfma if _MFMA else compile_dav)(H, v.dtype, Aqk.dtype, varlen),
         v_new,
         Aqk,
         do,
@@ -338,7 +340,7 @@ def chunk_kda_bwd_flydsl_full(
     )
     dv2 = alloc(dv.shape, device=dev, dtype=dv.dtype)
     _run_compiled(
-        compile_dhu(
+        (compile_dhu_mfma if _MFMA else compile_dhu)(
             H,
             kg.dtype,
             v.dtype,
