@@ -92,7 +92,7 @@ CHUNK_MAX = 32
 
 
 def compile_index_score_prefill_nvfp4(
-    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, lean=False, _probe=""
+    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, lean=False, pad_lds=False, _probe=""
 ):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight.
@@ -107,6 +107,12 @@ def compile_index_score_prefill_nvfp4(
     WMMAs run, with a scheduling barrier between key tiles, so two tiles' operands
     are live instead of the page's eight: fewer VGPRs (4 query tiles a wave: 216
     -> 175 in the scorer, 240 -> 201 in the select build), so more waves a SIMD.
+
+    ``pad_lds``: the page's payload rows 80 bytes apart in LDS (16 bytes of
+    padding a 64-byte row, by the tensor DMA). A wave reads the A operand with
+    16-byte loads, lane l16 at row l16: 64 bytes apart, the 16 lanes of a half
+    hit only 4 of the 16 four-bank groups (a 4-way bank conflict); 80 bytes
+    apart they hit all 16. Same scores; 2 KB more LDS a ring slot.
 
     ``_probe``: debug builds that write wrong scores, for timing only.
     ``_nostore``: no score stores. ``_acc``: an unmasked page's dots of a query
@@ -147,11 +153,14 @@ def compile_index_score_prefill_nvfp4(
         raise ValueError(
             f"select needs chunk_max = {CHUNK_MAX} and waves of whole {WAVE} rows"
         )
-    key = (block_q, waves, ring, chunk_max, select, fold_max, lean, _probe)
+    key = (block_q, waves, ring, chunk_max, select, fold_max, lean, pad_lds, _probe)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
-    ring_bytes = ring * PAGE_BYTES
+    # LDS pitch of a payload row, and a ring slot: the payload, then the scales.
+    prow = ROW + 16 if pad_lds else ROW
+    page_bytes = PAGE * prow + PAGE * SROW
+    ring_bytes = ring * page_bytes
     list_base = ring_bytes + block_q * chunk_max * 4
     total = list_base + (block_q * TOPK * 8 if select else 0)
     if total > get_lds_capacity_bytes("gfx1250"):
@@ -166,6 +175,8 @@ def compile_index_score_prefill_nvfp4(
         name += "_fold"
     if lean:
         name += "_lean"
+    if pad_lds:
+        name += "_pad"
     if select:
         init_blocks, local_blocks = select
         name = name.replace("score", "topk") + f"_i{init_blocks}_l{local_blocks}"
@@ -232,23 +243,36 @@ def compile_index_score_prefill_nvfp4(
         def stage(blk, slot):
             """Wave 0 DMAs the page's payload, wave 1 its scales (whole rows)."""
             page = fx.Int32(bt[pid_b * stride_bt_b + blk])
-            base = slot * PAGE_BYTES
+            base = slot * page_bytes
             if warp == 0:
-                tdm(
-                    _gptr(payload_ptr, fx.BFloat16, 16),
-                    fx.Int64(page) * fx.Int64(stride_p_blk) // 2,
-                    base,
-                    (PAGE * ROW // 2,),
-                    (1,),
-                    (None,),
-                    8,
-                    8,
-                )
+                if const_expr(pad_lds):
+                    # Rows of ROW bytes, prow bytes apart in LDS.
+                    tdm(
+                        _gptr(payload_ptr, fx.BFloat16, 16),
+                        fx.Int64(page) * fx.Int64(stride_p_blk) // 2,
+                        base,
+                        (PAGE, ROW // 2),
+                        (ROW // 2, 1),
+                        (None, None),
+                        ROW // 2,
+                        prow // 2,
+                    )
+                else:
+                    tdm(
+                        _gptr(payload_ptr, fx.BFloat16, 16),
+                        fx.Int64(page) * fx.Int64(stride_p_blk) // 2,
+                        base,
+                        (PAGE * ROW // 2,),
+                        (1,),
+                        (None,),
+                        8,
+                        8,
+                    )
             if warp == 1:
                 tdm(
                     _gptr(scale_ptr, fx.BFloat16, 16),
                     fx.Int64(page) * fx.Int64(stride_s_blk) // 2,
-                    base + PAGE * ROW,
+                    base + PAGE * prow,
                     (PAGE * SROW // 2,),
                     (1,),
                     (None,),
@@ -341,7 +365,7 @@ def compile_index_score_prefill_nvfp4(
                 gpu.barrier()
                 if blk + (ring - 1) < blk_hi:
                     stage(blk + (ring - 1), (blk + (ring - 1) - blk_lo) % ring)
-                base = slot * PAGE_BYTES
+                base = slot * page_bytes
                 # Unit E8M0 scales of the query, in VGPRs (pipeline_nvfp4: a
                 # uniform i64 reaches the WMMA wrongly as a constant / SGPRs).
                 unit = fx.Int64(0x7F7F7F7F7F7F7F7F) | fx.Int64((lane + blk) >> 31)
@@ -358,13 +382,13 @@ def compile_index_score_prefill_nvfp4(
                     def key_tile(kt):
                         """Key tile kt's A operand: e2m1 rows and E4M3 scales."""
                         key = kt * 16 + lane16
-                        at = base + key * ROW + half * 16
+                        at = base + key * prow + half * 16
                         frags = [lds_load(at + j * 32, fx.Int32, 4) for j in range_constexpr(2)]
                         k_rows = fx.Vector.from_elements(
                             [frags[j][i] for j in range_constexpr(2) for i in range_constexpr(4)],
                             dtype=fx.Int32,
                         )
-                        return k_rows, lds_load(base + PAGE * ROW + key * SROW, fx.Int64, 1)[0]
+                        return k_rows, lds_load(base + PAGE * prow + key * SROW, fx.Int64, 1)[0]
 
                     ahead = key_tile(0) if const_expr(lean) else None
                     for kt in range_constexpr(PAGE // 16):
