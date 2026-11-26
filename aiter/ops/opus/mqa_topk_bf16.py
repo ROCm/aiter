@@ -44,19 +44,22 @@ _MD_NAME = "module_mqa_topk_bf16_opus"
 SUPPORTED_GFX = (GFX950,)
 HEADS = 32
 HEAD_DIM = 128
-MAX_KEYS = 1 << 24  # a key row's byte offset stays in 32 bits
+MAX_KEYS = 1 << 24  # exclusive: keys x 256 B fits in 32 bits
 MAX_TOPK = 4096  # select keeps a row's 3 x topk candidates in registers
 _CHUNK_KEYS = 8192  # keys (samples, for the sample stage) a work item walks
 _MIN_CAP = 1024
 
 
 # == JIT stubs: signatures must match MQA_TOPK_BF16_PYBIND exactly ===============================
+# Ops register by Python name, so the names carry the op prefix.
 @compile_ops(_MD_NAME, fc_name="mqa_topk_bf16_instances", develop=True)
-def _instances_raw(device_id: int, out: torch.Tensor) -> int: ...
+def _mqa_topk_bf16_instances_raw(device_id: int, out: torch.Tensor) -> int: ...
 
 
 @compile_ops(_MD_NAME, fc_name="mqa_topk_bf16_workspace_bytes", develop=True)
-def _workspace_bytes_raw(rows: int, keys: int, cap_row: int, fb_slots: int) -> int: ...
+def _mqa_topk_bf16_workspace_bytes_raw(
+    rows: int, keys: int, cap_row: int, fb_slots: int
+) -> int: ...
 
 
 # Addresses and scalars, not tensors: the tensor op below owns the tensors and checks them.
@@ -208,10 +211,10 @@ class _Instance:
 @functools.cache
 def _instances(device: torch.device) -> tuple[_Instance, ...]:
     buf = torch.empty(256, dtype=torch.int32, device="cpu")
-    need = _instances_raw(device.index, buf)
+    need = _mqa_topk_bf16_instances_raw(device.index, buf)
     if need > buf.numel():
         buf = torch.empty(need, dtype=torch.int32, device="cpu")
-        _instances_raw(device.index, buf)
+        _mqa_topk_bf16_instances_raw(device.index, buf)
     flat = buf[:need].tolist()
     n, recs = flat[0], flat[1:]
     return tuple(
@@ -301,9 +304,9 @@ def _config(
         raise RuntimeError(f"mqa_topk_bf16 supports {SUPPORTED_GFX}, not {arch}")
     if (heads, head_dim) != (HEADS, HEAD_DIM):
         raise ValueError(f"heads x head_dim must be {HEADS} x {HEAD_DIM}")
-    if not 1 <= topk <= MAX_TOPK or max_rows < 0 or not 1 <= max_keys <= MAX_KEYS:
+    if not 1 <= topk <= MAX_TOPK or max_rows < 0 or not 1 <= max_keys < MAX_KEYS:
         raise ValueError(
-            f"need 1 <= topk <= {MAX_TOPK}, max_rows >= 0, 1 <= max_keys <= {MAX_KEYS}; "
+            f"need 1 <= topk <= {MAX_TOPK}, max_rows >= 0, 1 <= max_keys < {MAX_KEYS}; "
             f"got {topk}, {max_rows}, {max_keys}"
         )
     insts = _instances(dev)
@@ -325,7 +328,7 @@ def _config(
     cap = max(-(-3 * width // 64) * 64, _MIN_CAP)
     cus = torch.cuda.get_device_properties(dev).multi_processor_count
     fb_slots = 32 if low_memory else cus
-    ws = _workspace_bytes_raw(max(max_rows, 1), max_keys, cap, fb_slots)
+    ws = _mqa_topk_bf16_workspace_bytes_raw(max(max_rows, 1), max_keys, cap, fb_slots)
     return MqaTopkConfig(
         dev,
         heads,
@@ -411,11 +414,12 @@ def mqa_topk_bf16(
     if (
         workspace.dtype != torch.uint8
         or workspace.device != dev
+        or not workspace.is_contiguous()
         or workspace.numel() < cfg.workspace_bytes
     ):
         raise ValueError(
-            f"workspace must be uint8 on {dev} with >= {cfg.workspace_bytes} bytes "
-            "(cfg.workspace())"
+            f"workspace must be contiguous uint8 on {dev} with >= {cfg.workspace_bytes} "
+            "bytes (cfg.workspace())"
         )
     if rows:
         _mqa_topk_bf16_launch(

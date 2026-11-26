@@ -512,7 +512,10 @@ __global__ __launch_bounds__(T::BLOCK, 2) void scan_kernel(mqa_topk_bf16_kargs k
                                          (unsigned)(valid_rows * keys) * 4u);
             const int row_off = g * keys;
             constexpr float NEG = -__builtin_inff();
-            for (int t = c0; t < kb; t += TILE) g_out.template store<1>(NEG, row_off + t + i);
+            // kb may lie past c1
+            const int pe = kb < c1 ? kb : c1;
+            for (int t = c0; t < pe; t += TILE)
+                g_out.template store<1>(NEG, t + i < pe ? row_off + t + i : (int)(OOB / 4));
             for (int t = kb + nt * TILE; t < c1; t += TILE)
                 g_out.template store<1>(NEG, t + i < c1 ? row_off + t + i : (int)(OOB / 4));
             if (nt == 0) return;   // workgroup-uniform

@@ -147,7 +147,8 @@ def check_contract(indices, values, row_starts, row_ends, keys, topk):
     lo, hi = clamp(row_starts, row_ends, keys)
     valid = torch.arange(width, device=indices.device) < (hi - lo).clamp(max=width)
     idx = indices.long()
-    assert torch.equal(idx >= 0, valid), "valid entries first, then -1"
+    assert torch.equal(idx >= 0, valid), "valid entries first"
+    assert (idx[~valid] == -1).all(), "padding is -1"
     assert ((idx >= lo) & (idx < hi))[valid].all(), "an index lies outside its window"
     ascending = idx[:, 1:] > idx[:, :-1]
     assert ascending[valid[:, 1:]].all(), "valid entries ascend, no duplicates"
@@ -313,6 +314,47 @@ def test_mqa_topk_bf16(docs, cp, cp_rank, topk, relu, inputs):
     run_case(docs, cp, cp_rank, topk, relu, inputs)
 
 
+def check_graph():
+    """Graph replay equals an eager call, also with new inputs."""
+    q, k, w, rs, re = make_inputs((16384, 8192), 4, 1, "cuda")
+    rows, keys = q.shape[0], k.shape[0]
+    cfg = mqa_topk_bf16_config(q.device, max_rows=rows, max_keys=keys)
+    ws = cfg.workspace()
+    idx = torch.empty(rows, cfg.width, dtype=torch.int32, device=q.device)
+    val = torch.empty(rows, cfg.width, dtype=torch.float32, device=q.device)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # warm up outside the capture
+        mqa_topk_bf16(q, k, w, rs, re, cfg=cfg, workspace=ws, indices=idx, values=val)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mqa_topk_bf16(q, k, w, rs, re, cfg=cfg, workspace=ws, indices=idx, values=val)
+    for _ in range(2):
+        q.copy_(torch.randn(q.shape, device=q.device).bfloat16())
+        idx.fill_(7)
+        graph.replay()
+        want_idx, want_val = mqa_topk_bf16(q, k, w, rs, re, cfg=cfg, return_values=True)
+        assert torch.equal(idx, want_idx) and torch.equal(val, want_val), "graph replay"
+
+
+def test_mqa_topk_bf16_graph():
+    if not _gfx950():
+        pytest.skip("requires gfx950")
+    check_graph()
+
+
+def test_registry_beside_mxfp4():
+    # Stub names shared with the MXFP4 module would mix the two registries.
+    if not _gfx950():
+        pytest.skip("requires gfx950")
+    from aiter.ops.opus import pa_mqa_logits_mxfp4
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    mqa_topk_bf16_config(dev, max_rows=1, max_keys=1)
+    assert pa_mqa_logits_mxfp4._instances(dev), "MXFP4 registry"
+
+
 def doc_pack(v):
     """'16384,16384' -> (16384, 16384): the lengths of one pack of documents."""
     return tuple(int(x) for x in v.strip("()").split(",") if x.strip())
@@ -363,6 +405,8 @@ def main():
     if not _gfx950():
         aiter.logger.warning("mqa_topk_bf16 requires gfx950; skipping the op")
         return
+    check_graph()
+    aiter.logger.info("mqa_topk_bf16 HIP graph capture: ok")
 
     rows, skipped, seen = [], [], set()
     for docs, cp, rank, topk, relu, inputs, low_mem in itertools.product(

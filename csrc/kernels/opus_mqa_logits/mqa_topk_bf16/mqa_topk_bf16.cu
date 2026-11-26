@@ -148,7 +148,7 @@ std::string device_arch(int device_id) {
 int ceil_div(int64_t a, int64_t b) { return static_cast<int>((a + b - 1) / b); }
 
 void check_bounds(int rows, int keys, int chunk_keys) {
-    AITER_CHECK(rows >= 0 && keys >= 1 && keys <= om::MAX_KEYS, "need rows >= 0 and 1 <= keys <= ",
+    AITER_CHECK(rows >= 0 && keys >= 1 && keys < om::MAX_KEYS, "need rows >= 0 and 1 <= keys < ",
                 om::MAX_KEYS, "; got ", rows, ", ", keys);
     AITER_CHECK(chunk_keys >= 16 && chunk_keys % 16 == 0,
                 "chunk_keys must be a positive multiple of 16, got ", chunk_keys);

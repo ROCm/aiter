@@ -56,7 +56,7 @@ namespace opus_mqa_topk {
 constexpr int HEADS         = 32;
 constexpr int HEAD_DIM      = 128;
 constexpr int SAMPLE_STRIDE = 32;        // keys a sample stands for
-constexpr int MAX_KEYS      = 1 << 24;   // byte offsets of a key row stay in 32 bits
+constexpr int MAX_KEYS      = 1 << 24;   // exclusive: keys x 256 B fits in 32 bits
 constexpr int FB_ROWS       = 4;         // rows a fallback workgroup scores at once
 constexpr int MQA_TOPK_RELU   = 1;
 constexpr int MQA_TOPK_VALUES = 2;
