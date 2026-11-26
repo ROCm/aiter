@@ -73,11 +73,12 @@ shape：E=384，topk=6，gemm1 N=1152 K=5120，gemm2 N=5120 K=576；均衡路由
 3. 第二次 `fx.barrier()`，然后每个 wave 发一条 TDM store（`num_warps=NUM_WAVES`，按行切分）。
    - 全局 view 是 `(rows_end - blk_m, tile_n)`，越界的 padding 行和 pad 列由硬件丢弃。
 4. 最后 `s_wait_tensorcnt(0)`：TDM 读完 LDS 之后 wave 才能退出。
-5. 在 epilogue 前加 `rocdl.sched_barrier(0)`。原先每行一个边界分支，天然隔开了调度区域；去掉分支后，调度器会把最后一个 K tile 和 epilogue 混在一起排：
-   - 128×256×128 的 VGPR 418 → 550，每个 SIMD 从 2 个 wave 降到 1 个；
-   - 128×384×256 涨到 1023 个 VGPR，并出现 scratch 溢出。
+5. 在 epilogue 前加 `rocdl.sched_barrier(0)`。原先每行一个边界分支，天然隔开了调度区域。去掉分支后，主循环和 epilogue 成了同一个调度区域，调度器为了让 WMMA 和末尾的 cvt / `ds_store` 交错，把 WMMA 越推越晚。
+   - WMMA 只碰寄存器，可以越过 barrier；`ds_load` 被 barrier 固定在原段不动。
+   - 于是 `ds_load` 比 WMMA 超前的距离从 1 个 K tile 涨到 2.2 个，好几个 tile 的 fragment 同时占着寄存器。
+   - 128×256×128 的 VGPR 416 → 550，每个 SIMD 从 2 个 wave 降到 1 个；128×384×256 涨到 1023 个 VGPR，并出现 scratch 溢出。
 
-   加上 `sched_barrier` 后恢复原样。
+   加上 `sched_barrier` 后恢复原样。逐段数据见「epilogue 能否和最后的 WMMA 重叠」。
 - 效果：大 M 的 gemm2 从慢 2.7–2.8 倍降到 1.12–1.13 倍。
 
 ## 性能进度
@@ -205,7 +206,25 @@ LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每
 - 这个配置每个 SIMD 有 2 个 wave，一个做 epilogue 时矩阵单元可以给另一个用。
 - 真正串行的是两次 barrier（等 WG 内最慢的 wave）和最后的 `s_wait_tensorcnt`。
 
-证据：不加 `sched_barrier` 时，编译器把最后的 WMMA 挪到 barrier 之后，和 epilogue 交错（ISA 里第一条 `ds_store` 在第 918 行，WMMA 排到第 1076 行），说明这样做是合法的。但它同时把最后一个 tile 的 `ds_load` 整批提前，VGPR 418 → 550，所以加了 `sched_barrier`。
+不加 `sched_barrier` 会怎样：编译器把 WMMA 挪到 epilogue 的 barrier 之后，和 cvt / `ds_store` 交错。这说明 WMMA 越过 barrier 是合法的，但这种推迟会沿着主循环一路往前传导。
+
+统计方法：对 128×256×128 w2×2（K=640，5 个 K tile）编译两版 ISA，按 `s_barrier` 切段，再从后往前推活跃寄存器。
+每次主循环 barrier 表示"tile k 已在 LDS"。每个 tile、每个 wave 有 28 条 `ds_load`（104 个 VGPR）和 16 条 WMMA；"超前"指截至这一段，`ds_load` 比 WMMA 多做的 tile 数。
+
+| 段 | 读的 tile | 有 `sched_barrier`：ds_load / WMMA，超前 | 没有：ds_load / WMMA，超前 |
+|---|---|---|---|
+| 第 0 次 barrier 后 | tile 0 | 28 / 0，1 | 28 / 0，1 |
+| 第 1 次后 | tile 1 | 28 / 16，1 | 28 / 16，1 |
+| 第 2 次后 | tile 2 | 28 / 24，0.5 | 28 / 4，1.75 |
+| 第 3 次后 | tile 3 | 28 / 16，0.5 | 28 / 12，2.0 |
+| 第 4 次后 | tile 4 | 28 / 24，0 | 28 / 13，2.2 |
+| epilogue（第 5 次后） | — | WMMA 0，cvt 128，store 32 | WMMA 35，cvt 120，store 32 |
+| 活跃 VGPR 峰值 | | 396 = 累加器 192 + fragment 181（约 1.7 个 tile） | 537 = 累加器 256 + fragment 275（约 2.6 个 tile） |
+
+- **`ds_load` 不会动**：它不能挪到"tile k 已到 LDS"的 barrier 之前（数据还没到），也不能挪到下一个 barrier 之后（那之后这个 stage 会被下一个 TDM 覆盖）。所以每个 tile 的 28 条 `ds_load` 固定在自己那一段。
+- **有 `sched_barrier`**：这是设计上的寄存器双缓冲。tile_k=128 时一个 tile 只有 1 个 K step，等价于读 tile k+1 的同时算 tile k，`ds_load` 超前 1 个 tile。WMMA 在 epilogue 之前全部发完。
+- **没有 `sched_barrier`**：中间几段只发了 4、12、13 条 WMMA，最后 35 条（2.2 个 tile）挤进 epilogue。`ds_load` 超前到 2.2 个 tile，峰值时 16 个累加器全活着，再加上约 2.6 个 tile 的 fragment，分配到 550 个 VGPR（超过 512），每个 SIMD 只能放 1 个 wave。
+- 这相当于编译器自动加深了一层软件流水：`ds_load` 的延迟藏得更好，但每个 SIMD 少一个 wave。两者谁快尚未实测。
 
 更深的重叠，按改动从小到大：
 1. **第一次 barrier 提前到最后一个 K step 之前。** 有寄存器双缓冲，最后一个 K step 的数据上一步已经读进寄存器，这一步没有 `ds_load`。再用 `sched_group_barrier` 控制交错，比如 WMMA(0,0)、WMMA(0,1)、块 (0,0) 的 cvt+store、WMMA(0,2)……既藏住 cvt/store，又控住 VGPR。收益上限约是每个 wave 128 条 cvt 加 32 条 `ds_store` 的时间。
