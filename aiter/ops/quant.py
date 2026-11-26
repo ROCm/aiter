@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from aiter.jit.utils.eager_guard import plain_eager
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
@@ -962,6 +963,97 @@ def dynamic_per_token_scaled_quant(
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None: ...
+
+
+# The custom ops: what torch.compile records, and what runs every call the
+# eager fast path below declines.
+_per_token_quant_hip_op = per_token_quant_hip
+_dynamic_per_token_scaled_quant_op = dynamic_per_token_scaled_quant
+# `_eager_body` is set only when the guard registered the op itself; a
+# registration made elsewhere may run a different body.
+_eager_quant_ops_are_ours = all(
+    hasattr(op, "_eager_body")
+    for op in (per_token_quant_hip, dynamic_per_token_scaled_quant)
+)
+
+# Eager fast path. Outside torch.compile a dynamic per-token quant goes through
+# two torch.ops dispatches (aiter::per_token_quant_hip, then
+# aiter::dynamic_per_token_scaled_quant) and the develop-mode wrapper before
+# the pybind call. `per_token_quant_hip` makes that call directly, with the
+# same outputs, stream and arguments, whenever `plain_eager` allows it.
+_eager_quant = None  # pybind entry points once resolved; False: off for the run
+
+
+def _resolve_eager_quant() -> None:
+    """Look the entry points up once the op path has run (and so loaded or
+    built the module). Off for the run under per-op argument logging, a forced
+    rebuild, an op running a body other than the one registered here, or a
+    module that cannot be loaded."""
+    global _eager_quant
+    from ..jit.core import (
+        AITER_LOG_MORE,
+        AITER_REBUILD,
+        _pybind_develop_hooks,
+        get_module,
+    )
+
+    _eager_quant = False
+    if not _eager_quant_ops_are_ours or AITER_LOG_MORE >= 2 or AITER_REBUILD:
+        return
+    try:
+        module = get_module("module_quant")
+    except ModuleNotFoundError:
+        return
+    convert, _, raw_stream, current_device = _pybind_develop_hooks()
+    _eager_quant = (
+        module._set_current_hip_stream,
+        module.dynamic_per_token_scaled_quant,
+        convert,
+        raw_stream,
+        current_device,
+    )
+
+
+def per_token_quant_hip(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    num_rows: Tensor | None = None,
+    num_rows_factor: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Dynamic per-token quant of ``x`` to ``quant_dtype``: the quantized
+    tensor and its fp32 ``[..., 1]`` scales."""
+    quant = _eager_quant
+    if (
+        quant
+        and scale is None
+        and not torch.compiler.is_compiling()
+        and type(quant_dtype) is torch.dtype
+        and type(num_rows_factor) is int
+        and dynamic_per_token_scaled_quant is _dynamic_per_token_scaled_quant_op
+        and plain_eager((x, num_rows))
+    ):
+        set_stream, quant_op, convert, raw_stream, current_device = quant
+        shape = x.shape
+        device = x.device
+        scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
+        y = torch.empty(shape, dtype=quant_dtype, device=device)
+        # What the develop-mode dynamic_per_token_scaled_quant wrapper hands over.
+        set_stream(raw_stream(current_device()))
+        quant_op(
+            convert(y),
+            convert(x),
+            convert(scale),
+            None,
+            False,
+            None if num_rows is None else convert(num_rows),
+            num_rows_factor,
+        )
+        return y, scale
+    result = _per_token_quant_hip_op(x, scale, quant_dtype, num_rows, num_rows_factor)
+    if quant is None:
+        _resolve_eager_quant()
+    return result
 
 
 @compile_ops("module_quant", develop=True)
