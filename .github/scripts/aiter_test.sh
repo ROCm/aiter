@@ -6,6 +6,14 @@ SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
 
+# FlyDSL AOT cache: re-trace every entry a test loads from disk and compare it
+# byte for byte with the cached object, so an input missing from a cache key
+# fails here rather than loading a stale kernel in production. A failure to
+# load an entry also fails. A launch with no prebuilt entry takes the JIT path
+# (logged as an error): only a prebuild builds entries, so a test shape the
+# wheel's prebuild did not cover is not checked here.
+export AITER_FLYDSL_AOT_CACHE="${AITER_FLYDSL_AOT_CACHE:-verify}"
+
 # Avoid per-invocation hipcc native arch probing (can timeout under heavy JIT
 # parallelism) by resolving the current GPU arch once for this job.
 if [[ -z "${GPU_ARCHS:-}" ]]; then
@@ -45,7 +53,6 @@ skip_tests=(
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_megamoe_internode.py"
-    "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
@@ -190,10 +197,18 @@ for file in "${sharded_files[@]}"; do
                 echo "Running fused A2A at world sizes 2/4/8 with heads 8 and 40"
             } | tee -a latest_test.log
             # The default would only run ws2 / heads 8. The test spawns its own
-            # per-rank processes, so plain python3 rather than torchrun.
+            # per-rank processes, so plain python3 rather than torchrun. The
+            # second pass forces the fine-grained IPC buffers that "auto"
+            # picks on PCIe hosts, so an xGMI runner still covers that path.
             test_cmd=(
                 timeout 60m
-                python3 "$file" -w 2 4 8 --heads 8 40
+                bash -c '
+                    set -euo pipefail
+                    python3 "$1" -w 2 4 8 --heads 8 40
+                    python3 "$1" -w 2 4 8 --heads 8 --sequences 1184 \
+                        --inbox-memory finegrained
+                '
+                _ "$file"
             )
             ;;
         op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
