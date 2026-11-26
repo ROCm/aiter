@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
-# Ported from pyhip a3a94c5a34fc525c118649418b76221cd6d91579, fixed to raw DMA.
 """gfx950 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16/FP16 output.
 
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128.
@@ -529,7 +528,7 @@ def compile_gemm_fp8_blockscale_gfx950(
                 fx.make_int_tuple(byte_offset),
             )
 
-        # pyhip g2s TV layout: 512 threads = 64 rows x 8 K groups; 1x16 FP8 per thread.
+        # g2s TV layout: 512 threads = 64 rows x 8 K groups; 1x16 FP8 per thread.
         _g2s_tile, _g2s_tv = fx.make_layout_tv(
             fx.make_layout((8 * 8, 8), (8, 1)),
             fx.make_layout((1, elements_per_128b), (1, 1)),
@@ -565,7 +564,7 @@ def compile_gemm_fp8_blockscale_gfx950(
             dma_dst_ptr(ldsB_r_wr[1], _b_wave_off_bytes),
         ]
 
-        # Per-thread (row, k) source mapping, matching pyhip a_lane_row = tid//8.
+        # Per-thread (row, k) source mapping.
         a_lane_row = tid // 8
         a_lane_k = tid % 8 * elements_per_128b
         # Each group of 8 lanes copies one row per load (16 FP8 elements per lane).

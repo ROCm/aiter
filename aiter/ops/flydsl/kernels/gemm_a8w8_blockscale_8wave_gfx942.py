@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
-# Ported from pyhip 8ff1d1de66ce247c217f74d1d074721cbaba3cd7, with an RNE epilogue.
 """gfx942 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16/FP16 output.
 
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128,
@@ -24,26 +23,18 @@ later (one-stage load lead, "pf1"). Waves 4-7 trail waves 0-3 by one barrier,
 and each compute phase runs at s_setprio 3. ScaleA uses per-lane buffer loads;
 ScaleB retains its inline-asm scalar buffer loads.
 
-The main loop is ported unchanged from PyHIP
-src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py, the FlyDSL form
-of PyHIP's gemm_fp8_gfx942_4x2_lds.py (which names the grid in gfx950's (N, M)
-order): tile order, LDS layout and swizzle, load/ds_write/ds_read order, every
-wait, barrier, sched_barrier and s_setprio, and the MFMA/dequant order are
-PyHIP's. Only the helpers are inlined, the kernel symbol is named, and names
-and helpers follow the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave_gfx950.py).
-PyHIP's BufferTensor.load is _buffer_load_dwordx4 below, the same
-buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
-below are kept for that reason; each names the stable API it stands in for.
+Names and helpers follow the gfx950 8-wave kernel
+(gemm_a8w8_blockscale_8wave_gfx950.py). Global A/B loads go through
+_buffer_load_dwordx4 below: one buffer_load_dwordx4 with a byte voffset and
+soffset. Each raw rocdl/llvm call names the stable API it stands in for and
+why that API is not used.
 
 At K = 128 (one K tile) the two inline-asm s_buffer_load_dword of the next
-tile's B scales still load values nothing reads (PyHIP design note F3).
-PyHIP's build loads both into one SGPR, which its ISA audit flags as a WAW;
-here FlyDSL 0.5.3 gives them separate SGPRs and the audit passes.
+tile's B scales still load values nothing reads. FlyDSL 0.5.3 gives the two
+loads separate SGPRs, so they do not write the same register.
 
-The epilogue is aiter's: it rounds the FP32 results to BF16 or FP16 to
-nearest even, as the gfx950 8-wave kernel does. PyHIP instead truncates to
-BF16 and has no FP16 output, so BF16 results differ from PyHIP's in the last
-bit wherever rounding goes up.
+The epilogue rounds the FP32 results to BF16 or FP16 to nearest even, as the
+gfx950 8-wave kernel does.
 """
 
 import flydsl.compiler as flyc
@@ -65,9 +56,9 @@ def _buffer_resource(tensor, num_records_bytes):
 def _buffer_load_dwordx4(rsrc, voffset_bytes, soffset_bytes):
     """One buffer_load_dwordx4 ... offen of four i32 at byte voffset + soffset."""
     # Raw load, not fx.copy(BufferCopy128b): a copy atom addresses a layout
-    # coordinate, while this pipeline issues PyHIP's precomputed tile-relative
+    # coordinate, while this pipeline issues a precomputed tile-relative
     # voffset (row offsets, range checked so rows past M/N read zero) with the
-    # K-tile offset in soffset; the raw op keeps PyHIP's instruction.
+    # K-tile offset in soffset, as a single buffer_load_dwordx4.
     return Vec(
         rocdl.raw_ptr_buffer_load(
             T.i32x4,
@@ -104,9 +95,9 @@ def compile_gemm_fp8_blockscale_gfx942(
 ):
     """Compile the 2x4-LDS pf1 blockscale kernel with VGPR-staged A/B loads.
 
-    A one-stage A/B load lead, ScaleA loads one stage ahead, inline-asm scalar
-    ScaleB loads one K tile ahead, and one scalar FMA per MFMA retain PyHIP's
-    pipeline. Each compute phase raises s_setprio to 3; waves 4-7 trail waves
+    The pipeline has a one-stage A/B load lead, ScaleA loads one stage ahead,
+    inline-asm scalar ScaleB loads one K tile ahead, and one scalar FMA per
+    MFMA. Each compute phase raises s_setprio to 3; waves 4-7 trail waves
     0-3 by one barrier. preshuffle_b uses the FP8 (16, 16) weight shuffle; only
     its B load and LDS write offsets differ from the plain path.
 
@@ -136,10 +127,9 @@ def compile_gemm_fp8_blockscale_gfx942(
 
     @flyc.jit
     def get_pids_942(pid, M, M01, GROUP_NUM):
-        # PyHIP's tb_swizzle (pyhip.contrib.common.loaders), the counterpart of
-        # get_pids_950: pids with equal pid % GROUP_NUM take one contiguous
-        # range of tile ids (cf. NUM_XCDS), and each band of M01 M tiles is
-        # walked M first (cf. GROUP_SIZE_M).
+        # Tile-id swizzle, the counterpart of get_pids_950: pids with equal
+        # pid % GROUP_NUM take one contiguous range of tile ids (cf. NUM_XCDS),
+        # and each band of M01 M tiles is walked M first (cf. GROUP_SIZE_M).
         num_pid_m = (M + TILE_M - 1) // TILE_M
         num_pid_n = ceildiv(N, TILE_N)
         group_size = (num_pid_m * num_pid_n + GROUP_NUM - 1) // GROUP_NUM
@@ -224,7 +214,7 @@ def compile_gemm_fp8_blockscale_gfx942(
         )
 
         ### Per-lane global and LDS offsets.
-        # pyhip g2r mapping: 512 threads = 64 rows x 8 16-byte chunks per packet.
+        # g2r mapping: 512 threads = 64 rows x 8 16-byte chunks per packet.
         # Row offsets stay in voffset so raw-buffer range checks zero rows past
         # M/N; the K-tile offset goes in soffset.
         a_lane_row = tid // 8
@@ -389,10 +379,9 @@ def compile_gemm_fp8_blockscale_gfx942(
                 )
 
         def barrier():
-            # A bare s_barrier between scheduling fences, as in PyHIP: the
-            # pipeline issues its own lgkmcnt/vmcnt waits, and gpu.barrier()
-            # adds workgroup-scope memory fences that reschedule this pipeline
-            # (its final ISA then differs from PyHIP's).
+            # A bare s_barrier between scheduling fences: the pipeline issues
+            # its own lgkmcnt/vmcnt waits, and gpu.barrier() adds workgroup-scope
+            # memory fences that reschedule this pipeline.
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)

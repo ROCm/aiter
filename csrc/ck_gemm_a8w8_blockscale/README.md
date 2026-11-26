@@ -44,10 +44,9 @@ has the exact limits):
 | 2 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps0` | gfx942 | plain | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
 | 3 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps1` | gfx942 | preshuffled | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
 
-IDs 2/3 are PyHIP's gfx942 2x4-LDS pf1 kernel: a 256x256 tile on eight waves
-with A and B staged through 64 KiB of LDS, its main loop ported unchanged.
-Like IDs 0/1, it rounds BF16 and FP16 output to nearest even (PyHIP truncates
-BF16), and its `B16` names serve FP16 calls too.
+IDs 2/3 are the gfx942 2x4-LDS pf1 kernel: a 256x256 tile on eight waves
+with A and B staged through 64 KiB of LDS. Like IDs 0/1, it rounds BF16 and
+FP16 output to nearest even, and its `B16` names serve FP16 calls too.
 
 - Plain B: row-major `x_scale[M, K/128]`; the adapter transposes it to
   `[K/128, M]` inside the timed call.

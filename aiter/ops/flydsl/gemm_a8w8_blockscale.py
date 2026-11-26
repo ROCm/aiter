@@ -4,7 +4,7 @@
 """Aiter adapter for the FlyDSL FP8 blockscale kernels.
 
 IDs 0/1: the gfx950 rebased half-M, raw-DMA kernel (BF16 or FP16 output).
-IDs 2/3: the gfx942 2x4-LDS pf1 kernel ported from PyHIP (BF16 or FP16 output).
+IDs 2/3: the gfx942 2x4-LDS pf1 kernel (BF16 or FP16 output).
 """
 
 import functools

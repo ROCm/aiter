@@ -13,14 +13,13 @@ names omit the fixed pipeline and DMA flags. The historical B16 names also
 serve FP16 calls; the output tensor specializes the epilogue, with separate
 runtime/AOT cache entries for the two dtypes.
 
-IDs 2 and 3 are the gfx942 8-wave kernel ported from PyHIP's 2x4-LDS pf1
-(kernels/gemm_a8w8_blockscale_8wave_gfx942.py), main loop unchanged: a
-256x256 tile, eight waves on a 2x4 (M x N) grid, A and B staged through
-64 KiB of LDS with a one-stage load lead. ID 2 is plain B and ID 3
-preshuffled B. It reads FP8 E4M3FNUZ and writes BF16 or FP16, rounded to
-nearest even as IDs 0/1 do; like theirs, its B16 names serve both. It needs
-N % 16 == 0, K % 128 == 0 and K >= 128, and takes any M >= 1: partial M/N
-tiles are range checked.
+IDs 2 and 3 are the gfx942 8-wave 2x4-LDS pf1 kernel
+(kernels/gemm_a8w8_blockscale_8wave_gfx942.py): a 256x256 tile, eight waves
+on a 2x4 (M x N) grid, A and B staged through 64 KiB of LDS with a one-stage
+load lead. ID 2 is plain B and ID 3 preshuffled B. It reads FP8 E4M3FNUZ and
+writes BF16 or FP16, rounded to nearest even as IDs 0/1 do; like theirs, its
+B16 names serve both. It needs N % 16 == 0, K % 128 == 0 and K >= 128, and
+takes any M >= 1: partial M/N tiles are range checked.
 
 kernelInstance(preshuffle_b, gfx) names the arch explicitly. No FlyDSL
 compiler imports are needed to read this table.
