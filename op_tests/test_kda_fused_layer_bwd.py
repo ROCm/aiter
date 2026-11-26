@@ -675,56 +675,231 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     return ret
 
 
-def test_kda_save_fwd_matches_recompute(dtype, cu_seqlens=None, lower_bound=-5.0):
+def test_kda_save_fwd_matches_recompute(
+    dtype, cu_seqlens=None, lower_bound=-5.0, chunk_bwd=None
+):
     """save_fwd=1 (the forward keeps its activations and, for a chunk backward
-    that takes ``fwd_intermediates``, the chunk forward's intermediates) must
-    give the default recompute's y and gradients. On gfx950 bf16 the chunk
-    backward is FlyDSL, so this covers the #8740 ``fwd_intermediates`` path."""
+    that takes ``fwd_intermediates``, the chunk forward's intermediates) vs the
+    default recompute. Both are graded against an fp32 torch reference: the
+    saved intermediates can come from a different forward than the backward's
+    own prepare (e.g. Triton's bf16 Aqk/Akk vs an fp32 recompute), so save_fwd
+    must be about as accurate as recompute, not bit-identical to it.
+    ``chunk_bwd="flydsl"`` covers the #8740 ``fwd_intermediates`` path; the
+    default pieces cover the FlyDSL chunk forward default."""
     D, H, K, W, R = 256, 2, 128, 4, 16
     total = 128
     cu = None if cu_seqlens is None else torch.tensor(cu_seqlens, dtype=torch.int32)
     saved = dict(kda_fused_layer._fusion_overrides)
     pieces = dict(kda_fused_layer._piece_overrides)
-    flydsl = dtype == torch.bfloat16 and get_gfx_runtime() == "gfx950"
-    if flydsl:
-        kda_fused_layer.set_kda_pieces(chunk_bwd="flydsl")
+    if chunk_bwd:
+        kda_fused_layer.set_kda_pieces(chunk_bwd=chunk_bwd)
     try:
         w = make_weights(D, H, K, W, R, dtype)
         x = torch.randn(1, total, D).to(dtype)
         dy = torch.randn(1, total, D).to(dtype)
-        outs = {}
-        for mode in ("0", "1"):
-            kda_fused_layer.set_kda_fusions(save_fwd=mode)
-            xs = x.clone().requires_grad_(True)
+
+        def run(backend, xx, ww, dyy):
+            xs = xx.clone().requires_grad_(True)
             ws = kda_fused_layer.KDALayerWeights.from_tensors(
-                [t.detach().clone().requires_grad_(True) for t in w.tensors()]
+                [t.detach().clone().requires_grad_(True) for t in ww.tensors()]
             )
             y = kda_fused_layer.kda_layer_fwd(
-                xs, ws, H, backend="fused", cu_seqlens=cu, lower_bound=lower_bound
+                xs, ws, H, backend=backend, cu_seqlens=cu, lower_bound=lower_bound
             )
-            y.backward(dy)
-            outs[mode] = [y.detach(), xs.grad, *(t.grad for t in ws.tensors())]
-            pieces_used = dict(kda_fused_layer.LAST_PIECES)
-        tol = 2e-2 if dtype != torch.float32 else 1e-5
-        errs = [
-            (
-                (a.float() - b.float()).abs().max()
-                / b.float().abs().max().clamp_min(1e-6)
-            ).item()
-            for a, b in zip(outs["1"], outs["0"])
-        ]
-        assert max(errs) <= tol, f"save_fwd=1 vs recompute: max rel err {max(errs):.2e}"
+            y.backward(dyy)
+            return [y.detach(), xs.grad, *(t.grad for t in ws.tensors())]
+
+        w32 = kda_fused_layer.KDALayerWeights.from_tensors(
+            [t.float() for t in w.tensors()]
+        )
+        ref = run("torch", x.float(), w32, dy.float())
+
+        def err(outs):
+            return max(
+                ((a.float() - b).abs().max() / b.abs().max().clamp_min(1e-6)).item()
+                for a, b in zip(outs, ref)
+            )
+
+        errs, used = {}, {}
+        for mode in ("0", "1"):
+            kda_fused_layer.set_kda_fusions(save_fwd=mode)
+            errs[mode] = err(run("fused", x, w, dy))
+            used[mode] = dict(kda_fused_layer.LAST_PIECES)
+        slack = 1e-4 if dtype == torch.float32 else 1e-2
+        ok = errs["1"] <= 2 * errs["0"] + slack
         return {
-            "max rel err": max(errs),
-            "chunk_fwd": pieces_used.get("chunk_fwd"),
-            "chunk_bwd": pieces_used.get("chunk_bwd"),
-            "fwd_intermediates": pieces_used.get("chunk_bwd_fwd_intermediates", "-"),
+            "pieces": chunk_bwd and f"chunk_bwd={chunk_bwd}" or "default",
+            "recompute err": errs["0"],
+            "save_fwd err": errs["1"],
+            "chunk_fwd (recompute)": used["0"].get("chunk_fwd"),
+            "chunk_fwd (save_fwd)": used["1"].get("chunk_fwd"),
+            "chunk_bwd": used["1"].get("chunk_bwd"),
+            "fwd_intermediates": used["1"].get("chunk_bwd_fwd_intermediates", "-"),
+            "passed": ok,
         }
     finally:
         kda_fused_layer._fusion_overrides.clear()
         kda_fused_layer._fusion_overrides.update(saved)
         kda_fused_layer._piece_overrides.clear()
         kda_fused_layer._piece_overrides.update(pieces)
+
+
+def test_kda_save_fwd_intermediates_plumbing():
+    """CPU check of save_fwd=1's intermediates hand-off with stub forwards and a
+    registered chunk backward taking ``fwd_intermediates``: the FlyDSL forward
+    with ``return_intermediates`` serves when it can (its 10-tuple passed as
+    is); a FlyDSL forward without it, or one rejecting the call, falls back to
+    the Triton ``disable_recompute`` forward (its 7 tensors reordered). The
+    results equal recompute."""
+    import sys
+    import types
+
+    L = kda_fused_layer
+    fly_name = "aiter.ops.flydsl.kda_chunk_fwd"
+    tri_name = "aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd"
+    real = {n: sys.modules.get(n) for n in (fly_name, tri_name)}
+    got = []
+
+    def o_of(q, k, v, g, beta, scale, cu_seqlens=None):
+        b = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+        return torch.cat(
+            [
+                L.chunk_kda_torch(
+                    *(t[:, s:e].float() for t in (q, k, v, g, beta)), scale, 64
+                )
+                for s, e in itertools.pairwise(b)
+            ],
+            1,
+        )
+
+    def tagged(n):
+        return [torch.full((1,), float(i)) for i in range(n)]
+
+    def fly(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        chunk_size=64,
+        *,
+        cu_seqlens=None,
+        return_intermediates=False,
+        **kw,
+    ):
+        if fly.reject:
+            raise ValueError("stub: shape not served")
+        o = o_of(q, k, v, g, beta, scale, cu_seqlens)
+        return (o, None, tuple(tagged(10))) if return_intermediates else (o, None)
+
+    def fly_plain(q, k, v, g, beta, scale, chunk_size=64, *, cu_seqlens=None, **kw):
+        return o_of(q, k, v, g, beta, scale, cu_seqlens), None
+
+    def tri(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        h0,
+        final,
+        cu_seqlens=None,
+        chunk_size=64,
+        safe_gate=False,
+        disable_recompute=False,
+        **kw,
+    ):
+        assert disable_recompute
+        return (o_of(q, k, v, g, beta, scale, cu_seqlens), None, *tagged(7))
+
+    def bwd(
+        do,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        cs,
+        *,
+        cu_seqlens=None,
+        fwd_intermediates=None,
+        **kw,
+    ):
+        got.append(fwd_intermediates)
+        b = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+        outs = [
+            L.chunk_kda_bwd_torch(
+                *(t[:, s:e] for t in (do, q, k, v, g, beta)), scale, cs
+            )
+            for s, e in itertools.pairwise(b)
+        ]
+        return (*(torch.cat([o[i] for o in outs], 1) for i in range(5)), None, None)
+
+    saved_f, saved_p = dict(L._fusion_overrides), dict(L._piece_overrides)
+    saved_bwd = (L._chunk_bwd_impl, L._chunk_bwd_fuses)
+    rows = []
+    try:
+        L.register_chunk_bwd(bwd, frozenset())
+        tri_mod = types.ModuleType(tri_name)
+        tri_mod.chunk_delta_attn_fwd = tri
+        sys.modules[tri_name] = tri_mod
+        D, H, K, W, R = 256, 2, 128, 4, 16
+        w = make_weights(D, H, K, W, R, torch.float32)
+        for case, fn, reject, want_fwd, want in (
+            ("flydsl return_intermediates", fly, False, "flydsl", list(range(10))),
+            ("flydsl without it", fly_plain, False, "triton", [0, 3, 4, 5, 6, 1, 2]),
+            ("flydsl rejects", fly, True, "triton", [0, 3, 4, 5, 6, 1, 2]),
+        ):
+            fly.reject = reject
+            fly_mod = types.ModuleType(fly_name)
+            fly_mod.chunk_kda_fwd_flydsl = fn
+            sys.modules[fly_name] = fly_mod
+            for cu in (None, torch.tensor([0, 48, 128], dtype=torch.int32)):
+                x = torch.randn(1, 128, D)
+                dy = torch.randn(1, 128, D)
+                outs = {}
+                for mode in ("0", "1"):
+                    L.set_kda_fusions(save_fwd=mode)
+                    got.clear()
+                    xs = x.clone().requires_grad_(True)
+                    y = L.kda_layer_fwd(xs, w, H, backend="fused", cu_seqlens=cu)
+                    y.backward(dy)
+                    outs[mode] = [y.detach(), xs.grad]
+                    used = dict(L.LAST_PIECES)
+                inter = got[-1]
+                tags = [None if t is None else int(t.item()) for t in inter]
+                if want_fwd == "triton":
+                    want_tags = [None, None, None] + want
+                else:
+                    want_tags = want
+                assert used["chunk_fwd"] == f"{want_fwd}(save intermediates)", used
+                assert tags == want_tags, (case, tags)
+                assert all(
+                    torch.equal(a, b) for a, b in zip(outs["0"], outs["1"])
+                ), case
+                rows.append(
+                    {
+                        "case": case,
+                        "varlen": cu is not None,
+                        "chunk_fwd": used["chunk_fwd"],
+                        "passed": True,
+                    }
+                )
+    finally:
+        for n, m in real.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+        L._fusion_overrides.clear()
+        L._fusion_overrides.update(saved_f)
+        L._piece_overrides.clear()
+        L._piece_overrides.update(saved_p)
+        L._chunk_bwd_impl, L._chunk_bwd_fuses = saved_bwd
+    return rows
 
 
 def test_kda_weight_cache_update(dtype=torch.float32, concat_proj=False):
@@ -819,6 +994,9 @@ def test_kda_weight_cache_update(dtype=torch.float32, concat_proj=False):
         kda_fused_layer.invalidate_weight_caches()
 
 
+SELF_CHECK_FAILURES = []
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -909,17 +1087,40 @@ def main():
             f"expected {sorted(kda_fused_layer.KDA_PIECE_DEFAULTS)}"
         )
     for concat_proj in (False, True):
-        test_kda_weight_cache_update(torch.float32, concat_proj)
-    print(
-        pd.DataFrame(
-            [
-                {"dtype": str(dt), "cu_seqlens": cu}
-                | test_kda_save_fwd_matches_recompute(dt, cu)
-                for dt in (torch.float32, torch.bfloat16)
-                for cu in (None, [0, 48, 128])
-            ]
-        ).to_markdown(index=False)
-    )
+        try:
+            test_kda_weight_cache_update(torch.float32, concat_proj)
+        except Exception as err:  # noqa: BLE001
+            msg = (
+                f"weight cache (concat_proj={concat_proj}): {type(err).__name__}: {err}"
+            )
+            aiter.logger.error(msg)
+            SELF_CHECK_FAILURES.append(msg)
+    # self-checks report and continue; __main__ raises after the tables
+    try:
+        print(pd.DataFrame(test_kda_save_fwd_intermediates_plumbing()).to_markdown())
+    except Exception as err:  # noqa: BLE001
+        msg = f"save_fwd intermediates plumbing: {type(err).__name__}: {err}"
+        aiter.logger.error(msg)
+        SELF_CHECK_FAILURES.append(msg)
+    save_rows = []
+    for dt in (torch.float32, torch.bfloat16):
+        bwds = [None] + (
+            ["flydsl"] if dt == torch.bfloat16 and get_gfx_runtime() == "gfx950" else []
+        )
+        for chunk_bwd in bwds:
+            for cu in (None, [0, 48, 128]):
+                row = {"dtype": str(dt), "cu_seqlens": cu}
+                try:
+                    row |= test_kda_save_fwd_matches_recompute(
+                        dt, cu, chunk_bwd=chunk_bwd
+                    )
+                except Exception as err:  # noqa: BLE001
+                    row |= {"passed": False, "error": f"{type(err).__name__}: {err}"}
+                if not row["passed"]:
+                    SELF_CHECK_FAILURES.append(f"save_fwd vs recompute: {row}")
+                save_rows.append(row)
+    print("\n### kda save_fwd vs recompute (both vs fp32 reference)\n")
+    print(pd.DataFrame(save_rows).to_markdown(index=False))
 
     def summarize(title, rows, axes):
         if not rows:
@@ -1064,3 +1265,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    if SELF_CHECK_FAILURES:
+        raise AssertionError("self-checks failed:\n" + "\n".join(SELF_CHECK_FAILURES))
