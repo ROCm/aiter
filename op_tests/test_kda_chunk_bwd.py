@@ -13,8 +13,8 @@ chunked (WY / triangular-solve) reference, adapted from ``chunk_kda_torch`` in
 the fused-layer backward draft (ROCm/aiter#8739).
 
 Candidates: ``triton`` (the #6498 backward, baseline) and ``flydsl``
-(``bwd_backend="flydsl"``: the recomputed chunk-state recurrence on the FlyDSL
-GDN K5 kernel, the other stages on Triton).
+(``bwd_backend="flydsl"``: every backward stage on FlyDSL, gfx950 only; the
+forward intermediates are recomputed by the Triton prologue in both).
 """
 
 import argparse
@@ -125,10 +125,10 @@ def test_kda_chunk_bwd(b, t, h, d, dtype):
         inputs = [leaves[n] for n in GRADS]
         return lambda: torch.autograd.grad(o, inputs, do_k, retain_graph=True)
 
-    # triton is the baseline; flydsl runs the recomputed chunk-state
-    # recurrence on FlyDSL and the remaining stages on Triton.
     candidates = {"triton": bwd("triton")}
-    if HAS_FLYDSL:
+    # The FlyDSL stages need gfx950's LDS; elsewhere the call falls back to
+    # Triton, which would only duplicate the baseline.
+    if HAS_FLYDSL and get_gfx_runtime() == "gfx950":
         candidates["flydsl"] = bwd("flydsl")
 
     # Nominal count: ~2x the chunked forward's matmul work

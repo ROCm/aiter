@@ -228,3 +228,38 @@ def test_backward_flydsl_matches_triton(state):
     for n in x:
         assert torch.isfinite(grads[1][n]).all(), n
         assert _err_ratio(grads[0][n], grads[1][n]) < _ERR_RATIO, n
+
+
+@pytest.mark.parametrize("l2norm", [False, True])
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("sigmoid", [False, True])
+def test_chunk_bwd_contract_flydsl(l2norm, gate, sigmoid):
+    """The #8739 7-tuple adapter matches the Triton backward for every prologue fusion."""
+    pytest.importorskip("flydsl")
+    from aiter.ops.flydsl.kda_chunk_bwd import chunk_kda_bwd_flydsl
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_bwd import (
+        chunk_delta_attn_bwd,
+    )
+
+    x, _ = _inputs(1, 1000, 96, 96, 128, 128, False, "none", precomputed_gate=not gate)
+    if not sigmoid:
+        x["beta"] = torch.sigmoid(x["beta"])
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    do = torch.randn(x["v"].shape, device="cuda", generator=gen).to(torch.bfloat16)
+    kw = {
+        "use_qk_l2norm_in_kernel": l2norm,
+        "use_gate_in_kernel": gate,
+        "A_log": x.get("A_log"),
+        "dt_bias": x.get("dt_bias"),
+        "use_beta_sigmoid_in_kernel": sigmoid,
+    }
+    args = (x["q"], x["k"], x["v"], x["g"], x["beta"], 128**-0.5)
+    got = chunk_kda_bwd_flydsl(do, *args, 64, **kw)
+    ref = chunk_delta_attn_bwd(do, None, *args, chunk_size=64, **kw)[:7]
+    assert len(got) == 7
+    for name, a, b in zip(("dq", "dk", "dv", "dg", "dbeta", "dA_log", "ddt"), got, ref):
+        if b is None:
+            assert a is None, name
+            continue
+        assert torch.isfinite(a).all(), name
+        assert _err_ratio(b, a) < _ERR_RATIO, name

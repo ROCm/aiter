@@ -224,10 +224,11 @@ def chunk_kimi_delta_attn(
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
         bwd_backend (str):
-            Backend of the backward pass: `"triton"`, or `"flydsl"` to run the
-            recomputed chunk-state recurrence on FlyDSL (bf16, `K = V = 128`,
-            chunk 64, not varlen; other calls stay on Triton). The rest of the
-            backward is Triton either way. Default: `"triton"`.
+            Backend of the backward pass: `"triton"`, or `"flydsl"` to run
+            every backward stage on FlyDSL (gfx950, bf16, `K = V = 128`,
+            chunk 64, no GVA, not varlen; other calls stay on Triton). The
+            forward intermediates are recomputed by the Triton forward
+            prologue either way. Default: `"triton"`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
