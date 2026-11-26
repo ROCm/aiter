@@ -746,6 +746,7 @@ def gemm_queue(kc, n_mt):
     """3./4. the GEMM1 then GEMM2 items; returns (this CTA's GEMM2 units,
     the rank's total units)."""
     COMPACT, DEFER_SC, EARLY, EPR = kc.COMPACT, kc.DEFER_SC, kc.EARLY, kc.EPR
+    SCATTER_ASYNC = kc.SCATTER_ASYNC
     EPR_CH, G, GATE_P, GATE_R, H = kc.EPR_CH, kc.G, kc.GATE_P, kc.GATE_R, kc.H
     MT_PER_E, N1, NT1, NT2 = kc.MT_PER_E, kc.N1, kc.NT1, kc.NT2
     POLL_SL, TM, TRACE, addr_ctl = kc.POLL_SL, kc.TM, kc.TRACE, kc.addr_ctl
@@ -1059,7 +1060,10 @@ def gemm_queue(kc, n_mt):
                 # G2 C lies outside its input arena but aliases G1 input.
                 # Every wave retires its previous scatter before G1 writes
                 # any LDS; G2-to-G2 keeps the existing deferred restage.
-                tdm_ops.tensor_wait(0)
+                if const_expr(SCATTER_ASYNC):
+                    rocdl.s_wait_asynccnt(0)
+                else:
+                    tdm_ops.tensor_wait(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
             g1_task(
@@ -1202,7 +1206,10 @@ def gemm_queue(kc, n_mt):
     if const_expr(DEFER_SC):
         # The last GEMM2 item's scatter: every wave retires its own
         # before the barrier that precedes the close.
-        tdm_ops.tensor_wait(0)
+        if const_expr(SCATTER_ASYNC):
+            rocdl.s_wait_asynccnt(0)
+        else:
+            tdm_ops.tensor_wait(0)
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
     stamp(4)

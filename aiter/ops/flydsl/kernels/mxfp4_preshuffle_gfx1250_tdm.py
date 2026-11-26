@@ -8,6 +8,7 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
@@ -240,6 +241,7 @@ def build_gemm_a8w4_tdm_task(
     c_cache_modifier=0,
     scatter_cache_policy=0,
     defer_ep_wait=0,
+    ep_scatter_async=0,
     out_preshuffled=None,
     tdm_native_coordinates=0,
     tdm_native_scale_output_pack=0,
@@ -305,8 +307,13 @@ def build_gemm_a8w4_tdm_task(
     - ``defer_ep_wait`` (persistent EP scatter): stage C past the input
       stages and skip the wait after the scatter, so the remote stores retire
       under the next tile's mainloop. The next tile's epilogue waits for them
-      before it restages C; the caller must drain tensorcnt before it counts
-      the scatter as done or exits.
+      before it restages C; the caller must drain the scatter counter before
+      it counts the scatter as done or exits.
+    - ``ep_scatter_async`` (native STREAM, bf16): send the same C LDS staging
+      directly to the origin's combine slots with per-lane b128 async global
+      stores. They use ASYNCcnt rather than TENSORcnt, so the next GEMM2's
+      input TDM fences need not retire the previous scatter. The caller must
+      drain ASYNCcnt before any overlapping LDS reuse or completion publish.
     - ``tdm_native_coordinates``: the caller opts in only the verified
       native STREAM profile. Hoist the TDM owner's M slice and use a checked
       i32 local K advance followed by a carry-safe u64 address addition.
@@ -317,6 +324,24 @@ def build_gemm_a8w4_tdm_task(
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
+    if ep_scatter_async:
+        if not (
+            enable_ep_scatter
+            and persistent_workers
+            and explicit_tile
+            and not ep_quant_bits
+            and not stage1_act
+            and k_waves == 1
+            and cluster_m == cluster_n == 1
+            and raw_drain
+        ):
+            raise ValueError(
+                "async EP scatter requires a persistent bf16 explicit tile"
+            )
+        if tile_n % (32 * 8) or ep_slot_stride_bytes % 16 or defer_c_wait:
+            raise ValueError(
+                "async EP scatter requires full wave32 b128 rows and separate C"
+            )
     if defer_c_wait:
         assert stage1_quant_out and stage1_act and persistent_workers
         assert not enable_ep_scatter
@@ -602,6 +627,7 @@ def build_gemm_a8w4_tdm_task(
         and tile_meta is None
         and item_hooks is None
         and not defer_ep_wait
+        and not ep_scatter_async
         and _mid_compute
         and not planar_lds_on
         and not tdm_as_in_prologue
@@ -715,6 +741,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_prefence}_earlyacc"
         f"{_malign}{_kwaves}{_cpol}"
         f"{'_dew' if defer_ep_wait else ''}"
+        f"{'_asc' if ep_scatter_async else ''}"
         f"{'_ipf' if INST_PREFETCH else ''}"
     )
 
@@ -2646,7 +2673,10 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(defer_ep_wait):
                     # The previous tile's scatter may still read the C stage:
                     # each wave retires its own, then no wave restages early.
-                    tdm_ops.tensor_wait(0)
+                    if const_expr(ep_scatter_async):
+                        rocdl.s_wait_asynccnt(0)
+                    else:
+                        tdm_ops.tensor_wait(0)
                     rocdl.s_barrier_signal(-1)
                     rocdl.s_barrier_wait(-1)
                 if const_expr(enable_ep_scatter):
@@ -2848,7 +2878,7 @@ def build_gemm_a8w4_tdm_task(
                     mask=scale_row < ((mn_oob + 15) // 16) * 16,
                     cache_modifier=c_cache_modifier)
             if const_expr(enable_ep_scatter):
-                # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
+                # EP gemm2-fused scatter. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
                 # are padded to a pow2 so perRankSize divides by the slot stride
                 # exactly -- which lets (pe, slot) fold into ONE row index
@@ -2940,21 +2970,88 @@ def build_gemm_a8w4_tdm_task(
                     )
                     tensor_store_gather(desc, cache_policy=scatter_cache_policy)
 
-                # Let every wave issue its own groups directly. This avoids
-                # cloning every descriptor behind a wave-selection branch.
-                for scatter_pass in range_constexpr(_passes):
-                    group = wave + fx.Int32(scatter_pass * num_waves)
-                    scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
-                    vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
-                    if const_expr(_ngrp % num_waves):
-                        if group < fx.Int32(_ngrp):
+                if const_expr(ep_scatter_async):
+                    _async_gptr_ty = fx.PointerType.get(
+                        fx.Int8.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=16,
+                    )
+                    _async_lptr_ty = fx.PointerType.get(
+                        fx.Int8.ir_type,
+                        address_space=fx.AddressSpace.Shared,
+                        alignment=16,
+                    )
+                    _comb_base = _ep_lsa0 + fx.Int64(ep_combine_input_offset)
+                    # Reuse the row-map loads and eight-row groups. Each issue
+                    # sends one full 256-column bf16 row per wave32, with lane
+                    # l reading C[row, 8*l:8*l+8], including its padded LDS pitch.
+                    for scatter_pass in range_constexpr(_passes):
+                        group = wave + fx.Int32(scatter_pass * num_waves)
+                        scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
+                        vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
+                        for row_in_group in range_constexpr(_GRP):
+                            row = group * fx.Int32(_GRP) + fx.Int32(row_in_group)
+                            src_lane = vector_pass * _GRP + row_in_group
+                            dst_idx = fx.Int32(
+                                rocdl.readlane(
+                                    T.i32,
+                                    _raw(_scatter_idx_lanes[scatter_vector]),
+                                    _raw(fx.Int32(src_lane)),
+                                )
+                            )
+                            # Unlike TDM gather, async VMEM has no descriptor
+                            # bounds check. Every lane of an invalid row skips
+                            # the instruction, rather than writing the OOB index.
+                            if (row < mn_oob) & (dst_idx < _oob):
+                                row_dst = (
+                                    _comb_base
+                                    + fx.Int64(dst_idx) * fx.Int64(ep_slot_stride_bytes)
+                                    + fx.Int64(_gboff)
+                                )
+                                row_src = fx.Int32(stC_ep_idx) + row * fx.Int32(
+                                    STORE_PITCH * 2
+                                )
+                                for chunk in range_constexpr(STORE_N // (WAVE * 8)):
+                                    col_bytes = lane * fx.Int32(16) + fx.Int32(
+                                        chunk * WAVE * 16
+                                    )
+                                    gdst = fx.inttoptr(
+                                        _async_gptr_ty, row_dst + fx.Int64(col_bytes)
+                                    )
+                                    lsrc = fx.inttoptr(
+                                        _async_lptr_ty, row_src + col_bytes
+                                    )
+                                    # No stable fx.copy atom emits this direct
+                                    # LDS->global b128 store with an independent
+                                    # ASYNCcnt. CDNA5 ISA section 10.8 specifies
+                                    # it; aux carries the caller's SYS scope.
+                                    rocdl.global_store_async_from_lds_b128(
+                                        fx.to_llvm_ptr(gdst),
+                                        fx.to_llvm_ptr(lsrc),
+                                        0,
+                                        aux=ir.IntegerAttr.get(
+                                            T.i32, scatter_cache_policy
+                                        ),
+                                    )
+                else:
+                    # Let every wave issue its own groups directly. This avoids
+                    # cloning every descriptor behind a wave-selection branch.
+                    for scatter_pass in range_constexpr(_passes):
+                        group = wave + fx.Int32(scatter_pass * num_waves)
+                        scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
+                        vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
+                        if const_expr(_ngrp % num_waves):
+                            if group < fx.Int32(_ngrp):
+                                issue_scatter_group(group, scatter_vector, vector_pass)
+                        else:
                             issue_scatter_group(group, scatter_vector, vector_pass)
-                    else:
-                        issue_scatter_group(group, scatter_vector, vector_pass)
                 # defer_c_wait: the next tile's first fence (or the drain after the
                 # persistent loop) retires the gather-stores, which complete in order.
                 if const_expr(not defer_ep_wait and not defer_c_wait):
-                    tdm_ops.tensor_wait(0)
+                    if const_expr(ep_scatter_async):
+                        rocdl.s_wait_asynccnt(0)
+                    else:
+                        tdm_ops.tensor_wait(0)
             else:
 
                 def store_tile(gt, tile, lds_ptr, lds_row):

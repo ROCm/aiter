@@ -292,6 +292,12 @@ def make_megakernel(
         and os.environ.get("AITER_MEGAKERNEL_STREAM_DEFER_SC", "1") == "1"
     )
     DEFER_SC = int((not COMPACT and TM < 64) or stream_defer)
+    # Experimental direct LDS->peer stores keep the existing native STREAM
+    # geometry and retirement protocol, but move scatter to ASYNCcnt.
+    scatter_async_env = os.environ.get("AITER_MEGAKERNEL_SCATTER_ASYNC", "0")
+    if scatter_async_env not in ("0", "1"):
+        raise ValueError("AITER_MEGAKERNEL_SCATTER_ASYNC must be 0 or 1")
+    SCATTER_ASYNC = int(stream_defer_supported and scatter_async_env == "1")
     # Three interleaved full-layer rounds accepted packed APRE output
     # scales. Keep the explicit builder opt-in within the verified profile.
     scale_pack = (int(os.environ.get("AITER_NATIVE_SCALE_OUTPUT_PACK", "2"))
@@ -329,6 +335,7 @@ def make_megakernel(
             ("gm", (st_kw["GM1"] * 100 + st_kw["GM2"]) if STREAM else 3232, 3232),
             ("xq", st_kw["XQ"] * st_kw["GMX"] if STREAM else 32, 32),
             ("rr", RED_ROW2, 0),
+            ("as", SCATTER_ASYNC, 0),
             ("ds", DEFER_SC, 1),
             ("ep", EARLY, 1),
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
@@ -341,6 +348,7 @@ def make_megakernel(
         CAP=CAP,
         CF_OFF=CF_OFF,
         COMPACT=COMPACT,
+        SCATTER_ASYNC=SCATTER_ASYNC,
         DEFER_SC=DEFER_SC,
         DEST_STRIDE=DEST_STRIDE,
         E=E,
@@ -507,6 +515,7 @@ def make_megakernel(
             a_cache_modifier=0,
             scatter_cache_policy=SCOPE_SYS,
             a_preshuffled=int(APRE),
+            ep_scatter_async=SCATTER_ASYNC,
             defer_ep_wait=DEFER_SC,
             **common,
         )
