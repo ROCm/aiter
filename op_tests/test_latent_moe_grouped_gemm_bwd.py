@@ -34,7 +34,6 @@ def _reference(x, weight, dy, offsets):
 def test_reference_against_autograd(counts, k, n):
     x, weight, dy, offsets = _inputs(counts, k, n)
     dx, dw = _reference(x, weight, dy, offsets)
-    # An independent forward picks a weight per assignment, including repeats.
     ids = torch.arange(len(counts)).repeat_interleave(torch.tensor(counts))
     xf = x.float().requires_grad_()
     wf = weight.float().requires_grad_()
@@ -65,12 +64,30 @@ def test_gfx950_projection(k, n):
     from aiter.ops.opus.latent_moe_grouped_gemm_bwd import latent_moe_grouped_gemm_bwd
 
     args = _inputs((1, 0, 17), k, n, device="cuda:0")
-    try:
-        dx, dw = latent_moe_grouped_gemm_bwd(*args)
-    except NotImplementedError as exc:
-        if str(exc) != "gfx950 OPUS latent MoE grouped GEMM backward is pending":
-            raise
-        pytest.skip(str(exc))
+    dx, dw = latent_moe_grouped_gemm_bwd(*args)
     ref_dx, ref_dw = _reference(*args)
     torch.testing.assert_close(dx, ref_dx.bfloat16(), atol=0.03125, rtol=0.015625)
     torch.testing.assert_close(dw, ref_dw, atol=1e-4, rtol=1e-4)
+
+
+def test_gfx950_empty_and_unaligned_on_current_stream():
+    if not torch.version.hip or not torch.cuda.is_available():
+        pytest.skip("requires gfx950")
+    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx950":
+        pytest.skip("requires gfx950")
+    from aiter.ops.opus.latent_moe_grouped_gemm_bwd import latent_moe_grouped_gemm_bwd
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        x, w, dy, off = _inputs((0, 3), 7, 5, device="cuda:0")
+        storage = x.new_empty(x.numel() + 1)
+        x = storage[1:].view_as(x).copy_(x)
+        for ends in ((0, 0, 3), (0, 3, 3)):
+            off.copy_(torch.tensor(ends, device=off.device, dtype=off.dtype))
+            dx, dw = latent_moe_grouped_gemm_bwd(x, w, dy, off)
+            ref_dx, ref_dw = _reference(x, w, dy, off)
+            torch.testing.assert_close(dx, ref_dx.bfloat16())
+            torch.testing.assert_close(dw, ref_dw)
+        dx, dw = latent_moe_grouped_gemm_bwd(x[:0], w, dy[:0], off.zero_())
+        assert dx.shape == (0, 7)
+        assert torch.count_nonzero(dw).item() == 0

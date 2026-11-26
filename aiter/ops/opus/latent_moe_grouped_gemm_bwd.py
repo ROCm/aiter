@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Draft gfx950 OPUS interface for the Kimi routed-expert linear backward."""
+"""gfx950 OPUS grouped backward for routed expert projections."""
 
 import torch
 
@@ -20,12 +20,10 @@ def latent_moe_grouped_gemm_bwd(
     the same device, nondecreasing from 0 to R. Equal offsets mean an empty
     expert. Offset values are a caller precondition to avoid a host sync.
 
-    The proposed outputs are dx [R, K] in BF16 (in the same routed order)
+    The outputs are dx [R, K] in BF16 (in the same routed order)
     and dw [E, N, K] in FP32, zero for empty experts. For Kimi gate/up use
     (K, N) = (3584, 3072); for down use (3072, 3584). The caller combines
     the two input gradients for gate/up and undoes the routing permutation.
-
-    This draft reserves the entry point; the OPUS kernel is pending.
     """
     if x.ndim != 2 or dy.ndim != 2 or weight.ndim != 3:
         raise ValueError("expected x [R,K], weight [E,N,K], dy [R,N]")
@@ -43,4 +41,15 @@ def latent_moe_grouped_gemm_bwd(
             raise ValueError("all inputs must share a device")
     if not all(t.is_contiguous() for t in (x, weight, dy, expert_offsets)):
         raise ValueError("all inputs must be contiguous")
-    raise NotImplementedError("gfx950 OPUS latent MoE grouped GEMM backward is pending")
+    from ..asm.asm_utils import device_guard, get_gfx_from_device
+
+    if (
+        x.device.type != "cuda"
+        or not torch.version.hip
+        or get_gfx_from_device(x.device) != "gfx950"
+    ):
+        raise NotImplementedError("latent MoE grouped GEMM backward requires gfx950")
+    from ._latent_moe_bwd_gfx950 import backward
+
+    with device_guard(x.device.index):
+        return backward(x, weight, dy, expert_offsets)

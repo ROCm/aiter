@@ -393,3 +393,19 @@ early by `kid_rejects_shape` — no buffer resource, every tail clamped by the D
 so no M/N/K alignment applies. Naming only one of them there once cost the `wl`
 family every shape whose `N` fell outside an unrelated gfx942 whitelist; see
 issue 4 in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+## gfx950 latent MoE grouped backward
+
+The Python operator `aiter.ops.opus.latent_moe_grouped_gemm_bwd` loads BF16
+M-grouped NN and K-grouped TN images from `gfx950/a16w16_grouped`. Each image
+exports the symbol given by its filename stem. The operator selects the NN and
+TN variants independently and writes FP32 weight gradients.
+
+To reproduce the images, point the generator at the `csrc` directory of
+[ROCm/aiter revision 1221392](https://github.com/ROCm/aiter/commit/1221392f761b2a3da80b33be7bb4a3714f69655a).
+The generator checks the two upstream image hashes before reusing their
+matrix instructions. The build requires ROCm 7.2, PyYAML and GNU patch.
+
+```bash
+python3 csrc/opus_gemm/gen_co/latent_moe_bwd/build.py /path/to/upstream/csrc --rocm /opt/rocm
+```

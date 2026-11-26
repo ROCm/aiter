@@ -1,0 +1,37 @@
+--- a/short_pipeline.cuh
++++ b/short_pipeline.cuh
+@@ -16,3 +16 @@
+-#if !__has_cpp_attribute(clang::amdgpu_pin_agpr)
+-#error "opus_gemm a16w16 grouped: [[clang::amdgpu_pin_agpr]] needs the AGPR-pinning toolchain"
+-#endif
++
+@@ -267 +265 @@
+-    [[clang::amdgpu_pin_agpr(AGPR)]] v = x;
++     v = x;
+@@ -275 +273 @@
+-        [[clang::amdgpu_pin_agpr(C_REG)]] c = base_mma{}(a, b, c);
++         c = base_mma{}(a, b, c);
+@@ -277 +275 @@
+-        [[clang::amdgpu_pin_vgpr(-C_REG - 2)]] c = base_mma{}(a, b, c);
++         c = base_mma{}(a, b, c);
+@@ -493 +491 @@
+-            const int m_end = masked ? grows : min(row0 + (grows + ALIGN - 1) / ALIGN * ALIGN, kargs.m);
++            const int m_end = masked ? grows : min(row0 + grows, kargs.m);
+@@ -540 +538 @@
+-        if constexpr (T::K_GROUPED) return max(2, ceil_div(c_tile.k_rows, T::B_K));
++        if constexpr (T::OPT_K) return 1; else if constexpr (T::K_GROUPED) return max(2, ceil_div(c_tile.k_rows, T::B_K));
+@@ -546 +544 @@
+-    const int c_n_rem = kargs.n - col;
++    const int c_n_rem = T::B_N; // supported grid consists exclusively of whole output tiles
+@@ -589 +587 @@
+-    constexpr bool RMW = T::K_GROUPED && T::C_F32;
++    constexpr bool RMW = false;
+@@ -697 +695 @@
+-        opus::static_for<E>([&](auto e) { opus::static_for<2>([&](auto kk) {
++        opus::static_for<E>([&](auto e) { opus::static_for<T::OPT_K==32 ? 1 : 2>([&](auto kk) {
+@@ -731 +729 @@
+-            mma_bf16<c_reg<T, hm, hn, m, n>(), MMA>(v_a[hm][1][m], v_b[hn][1][n], v_c[hm][hn][m * T::E_N + n]);   // kk = 1
++            if constexpr (T::OPT_K!=32) mma_bf16<c_reg<T, hm, hn, m, n>(), MMA>(v_a[hm][1][m], v_b[hn][1][n], v_c[hm][hn][m * T::E_N + n]);   // kk = 1
+@@ -831 +829 @@
+-    {   // second-to-last tile (loops >= 2): no more copies
++    if constexpr (!T::OPT_K) {   // second-to-last tile only for generic K
