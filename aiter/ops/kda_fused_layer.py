@@ -410,12 +410,14 @@ def chunk_kda_bwd_torch(
 # Which implementation served each stage in the latest fused call.
 LAST_PIECES: dict = {}
 
-# Stages with both Triton and FlyDSL kernels default to Triton; FlyDSL is used
-# only when selected (``set_kda_pieces`` or ``AITER_KDA_PIECES``, e.g.
-# ``chunk_fwd=flydsl,conv_bwd=torch``). A missing or rejecting kernel falls
-# back to the next choice: flydsl -> triton -> torch, triton -> torch.
+# Each stage defaults to its faster kernel on MI350X: FlyDSL for the chunk
+# forward (#8744, 22-31% faster than Triton), Triton elsewhere. Override with
+# ``set_kda_pieces`` or ``AITER_KDA_PIECES`` (e.g. ``chunk_fwd=triton``). A
+# missing, unsupported or rejecting kernel falls back to the next choice, with
+# the reason in LAST_PIECES and the log: flydsl -> triton -> torch,
+# triton -> torch.
 KDA_PIECE_DEFAULTS = {
-    "chunk_fwd": "triton",
+    "chunk_fwd": "flydsl",
     "chunk_bwd": "triton",
     "conv_bwd": "triton",
 }
@@ -564,9 +566,28 @@ def _chunk_fwd_triton():
 def _chunk_fwd_flydsl():
     from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
 
+    try:
+        from aiter.ops.flydsl.kda_chunk_fwd import kda_fwd_flydsl_supported as supported
+    except ImportError:
+        supported = None
     native_varlen = _accepts(chunk_kda_fwd_flydsl, "cu_seqlens")
 
     def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
+        H, K, V = q.shape[2], q.shape[3], v.shape[3]
+        if supported is not None and not supported(
+            H=H,
+            HV=v.shape[2],
+            K=K,
+            V=V,
+            chunk_size=chunk_size,
+            dtype=torch.bfloat16,
+            is_varlen=cu_seqlens is not None,
+        ):
+            raise ValueError(
+                f"unsupported shape for the FlyDSL chunk forward: H={H} "
+                f"HV={v.shape[2]} K={K} V={V} chunk={chunk_size} (needs gfx950, "
+                "K=V=128, chunk 64, H=HV)"
+            )
         kw = {}
         if cu_seqlens is not None:
             if not native_varlen:
@@ -660,6 +681,21 @@ FLYDSL_PIECE_DTYPES = {
 }
 
 
+_logged_fallbacks = set()
+
+
+def _log_fallback(stage, backend, reason):
+    """Log each distinct fallback once per process."""
+    if (stage, backend, reason) in _logged_fallbacks:
+        return
+    _logged_fallbacks.add((stage, backend, reason))
+    import logging
+
+    logging.getLogger("aiter").info(
+        "KDA %s: %s not used, falling back (%s)", stage, backend, reason
+    )
+
+
 def _resolve(name, on_gpu, dtype=None):
     """[(backend, impl), ...] to try in order for ``name``; torch is ``None``.
 
@@ -674,12 +710,14 @@ def _resolve(name, on_gpu, dtype=None):
             continue
         if backend == "flydsl" and dtype not in FLYDSL_PIECE_DTYPES[name]:
             LAST_PIECES[f"{name}_flydsl_skipped"] = f"dtype {dtype}"
+            _log_fallback(name, backend, f"dtype {dtype}")
             continue
         try:
             found.append((backend, _PIECE_LOADERS[(name, backend)]()))
         except ImportError as err:
             # recorded, not hidden: a selected kernel that is not in the tree
             LAST_PIECES[f"{name}_{backend}_missing"] = f"ImportError: {err}"
+            _log_fallback(name, backend, f"ImportError: {err}")
     return found
 
 
@@ -715,7 +753,9 @@ def _chunk_fwd(
                 kw["lower_bound"] = lower_bound
             o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens, **kw)
         except (ValueError, NotImplementedError, RuntimeError) as err:
-            LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
+            reason = f"{type(err).__name__}: {err}"
+            LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = reason
+            _log_fallback("chunk_fwd", backend, reason)
             continue
         LAST_PIECES["chunk_fwd"] = backend
         return o
@@ -1322,6 +1362,7 @@ def _kda_layer_fused_fwd(
     for_backward=True,
     lower_bound=None,
     cu_seqlens=None,
+    chunk_override=None,
 ):
     """Forward that keeps what the hand-written backward needs.
 
@@ -1394,12 +1435,16 @@ def _kda_layer_fused_fwd(
     braw = braw.reshape(B, T, H)
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
-    chunk_in = None
+    chunk_in, chunk_inter = None, None
     with torch.set_grad_enabled(chunk_graph):
         if chunk_graph:
             chunk_in = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
             o = _chunk_torch_varlen(*chunk_in, scale, chunk_size, cu_seqlens)
             LAST_PIECES["chunk_fwd"] = "torch(autograd)"
+        elif chunk_override is not None:
+            pre = {"q_pre": q_pre, "k_pre": k_pre, "q": q, "k": k, "v": v}
+            pre.update(g=g, raw_g=raw_g, braw=braw, beta=beta, lr=lr, scale=scale)
+            o, chunk_inter = chunk_override(pre)
         else:
             o = _chunk_fwd(
                 q, k, v, g, beta, scale, chunk_size, x.dtype, cu_seqlens, lower_bound
@@ -1455,6 +1500,7 @@ def _kda_layer_fused_fwd(
         "o_graph": o_graph,
         "chunk_in": chunk_in,
         "raw_g": raw_g,
+        "chunk_inter": chunk_inter,
     }
     return y, saved
 
@@ -1531,8 +1577,17 @@ def _fused_plan(x, w, ops, lower_bound):
     return chunk_impl, frozenset(fuses), conv_kernel, rms_bwd
 
 
-def _fused_saved_fwd(x, w, H, chunk_size, eps, plan, lower_bound, cu_seqlens):
+def _fused_saved_fwd(
+    x, w, H, chunk_size, eps, plan, lower_bound, cu_seqlens, keep_chunk=False
+):
+    """``keep_chunk`` (the ``save_fwd`` forward) also keeps the chunk forward's
+    intermediates for a chunk backward that takes them."""
     chunk_impl, _, conv_kernel, _ = plan
+    override = None
+    if keep_chunk and chunk_impl is not None:
+        override = _save_chunk_intermediates(
+            x, w, H, chunk_size, plan, lower_bound, cu_seqlens
+        )
     with torch.enable_grad():
         return _kda_layer_fused_fwd(
             x,
@@ -1544,7 +1599,92 @@ def _fused_saved_fwd(x, w, H, chunk_size, eps, plan, lower_bound, cu_seqlens):
             chunk_graph=chunk_impl is None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            chunk_override=override,
         )[1]
+
+
+def _chunk_bwd_args(s, w, H, fuses, lower_bound, chunk_impl, dtype):
+    """(q, k, v, g, beta, kwargs) the chunk backward gets for the fused
+    prologue ``fuses``, from a forward's saved state ``s``; token-major for a
+    kernel."""
+    B, T = s["q"].shape[:2]
+    lr = s["lr"].reshape(B * T, -1)
+    kw = {}
+    q_in, k_in, g_in, b_in = s["q"], s["k"], s["g"], s["beta"]
+    if "qk_l2norm" in fuses:
+        q_in, k_in = s["q_pre"], s["k_pre"]
+        kw["use_qk_l2norm_in_kernel"] = True
+    if "gate" in fuses:
+        g_in = s["raw_g"]
+        if g_in is None:
+            g_in = _proj_gemm(lr, w.f_b, "fwd", torch.float32, name="f_b")
+            g_in = g_in.view_as(s["g"])
+        kw.update(use_gate_in_kernel=True, A_log=w.A_log[:H], dt_bias=w.dt_bias)
+        if lower_bound is not None:
+            kw["lower_bound"] = lower_bound
+    if "beta_sigmoid" in fuses:
+        b_in = s["braw"]
+        kw["use_beta_sigmoid_in_kernel"] = True
+    if chunk_impl is not None and _has_param(chunk_impl, "compute_dtype"):
+        kw["compute_dtype"] = _compute_dtype_of(dtype)
+    v_in = s["v"]
+    if chunk_impl is not None:
+        # every chunk kernel indexes token-major; q/k/v are channel-major views
+        q_in, k_in, v_in, g_in, b_in = _token_major(q_in, k_in, v_in, g_in, b_in)
+    return q_in, k_in, v_in, g_in, b_in, kw
+
+
+def _save_chunk_intermediates(x, w, H, chunk_size, plan, lower_bound, cu_seqlens):
+    """``chunk_override`` for a ``save_fwd`` forward whose chunk backward takes
+    ``fwd_intermediates`` (#8740 FlyDSL): the Triton chunk forward with
+    ``disable_recompute=True`` on the backward's own inputs, keeping
+    (g_cumsum, w, u, qg, kg, Aqk, Akk). None when that does not apply."""
+    chunk_impl, fuses = plan[0], plan[1]
+    on_device = x.is_cuda or _chunk_bwd_impl is not None
+    if not (on_device and _accepts(chunk_impl, "fwd_intermediates")):
+        return None
+    if cu_seqlens is not None and not _accepts(chunk_impl, "cu_seqlens"):
+        return None
+    try:
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+            chunk_delta_attn_fwd,
+        )
+    except ImportError as err:
+        LAST_PIECES["chunk_fwd_save_intermediates_missing"] = f"ImportError: {err}"
+        return None
+    cd = _compute_dtype_of(x.dtype)
+
+    def run(pre):
+        q, k, v, g, beta, kw = _chunk_bwd_args(
+            pre, w, H, fuses, lower_bound, chunk_impl, x.dtype
+        )
+        kw.pop("compute_dtype", None)
+        q, k, v = _token_major(q, k, v, dtype=cd)
+        o, _, gc, Aqk, Akk, wt, u, qg, kg = chunk_delta_attn_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            pre["scale"],
+            None,
+            False,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            safe_gate=lower_bound is not None,
+            disable_recompute=True,
+            **kw,
+        )
+        LAST_PIECES["chunk_fwd"] = "triton(save intermediates)"
+        LAST_PIECES["chunk_fwd_note"] = (
+            "save_fwd=1 with a chunk backward taking fwd_intermediates: the "
+            "forward runs the Triton disable_recompute path for its "
+            "intermediates (the FlyDSL forward returns only (o, final_state)), "
+            f"overriding chunk_fwd={kda_piece_choices()['chunk_fwd']}"
+        )
+        return o.float(), (None, None, None, gc, wt, u, qg, kg, Aqk, Akk)
+
+    return run
 
 
 def _kda_layer_fused_bwd(
@@ -1595,30 +1735,14 @@ def _kda_layer_fused_bwd(
     else:
         chunk_bwd = chunk_impl
     lr = s["lr"].reshape(B * T, -1)
-    kw = {}
-    q_in, k_in, g_in, b_in = s["q"], s["k"], s["g"], s["beta"]
-    if "qk_l2norm" in fuses:
-        q_in, k_in = s["q_pre"], s["k_pre"]
-        kw["use_qk_l2norm_in_kernel"] = True
-    if "gate" in fuses:
-        g_in = s["raw_g"]
-        if g_in is None:
-            g_in = _proj_gemm(lr, w.f_b, "fwd", torch.float32, name="f_b")
-            g_in = g_in.view_as(s["g"])
-        kw.update(use_gate_in_kernel=True, A_log=w.A_log[:H], dt_bias=w.dt_bias)
-        if lower_bound is not None:
-            kw["lower_bound"] = lower_bound
-    if "beta_sigmoid" in fuses:
-        b_in = s["braw"]
-        kw["use_beta_sigmoid_in_kernel"] = True
-    if chunk_impl is not None and _has_param(chunk_impl, "compute_dtype"):
-        kw["compute_dtype"] = _compute_dtype_of(x.dtype)
-    v_in = s["v"]
+    q_in, k_in, v_in, g_in, b_in, kw = _chunk_bwd_args(
+        s, w, H, fuses, lower_bound, chunk_impl, x.dtype
+    )
     if chunk_impl is not None:
-        # every chunk kernel indexes token-major; q/k/v are channel-major views
-        do, q_in, k_in, v_in, g_in, b_in = _token_major(
-            do, q_in, k_in, v_in, g_in, b_in
-        )
+        do = _token_major(do)[0]
+    if s.get("chunk_inter") is not None and _accepts(chunk_impl, "fwd_intermediates"):
+        kw["fwd_intermediates"] = s["chunk_inter"]
+        LAST_PIECES["chunk_bwd_fwd_intermediates"] = "reused"
     dq, dk, dv, dg, dbeta, dA_log, ddt = _chunk_bwd_varlen(
         chunk_bwd,
         cu_seqlens,
@@ -1744,7 +1868,15 @@ class _KDALayerFused(torch.autograd.Function):
         if _fusion_on("save_fwd"):
             plan = _fused_plan(x, w, _row_ops(x), lower_bound)
             s = _fused_saved_fwd(
-                x, w, num_heads, chunk_size, eps, plan, lower_bound, cu_seqlens
+                x,
+                w,
+                num_heads,
+                chunk_size,
+                eps,
+                plan,
+                lower_bound,
+                cu_seqlens,
+                keep_chunk=True,
             )
             ctx.saved_state = (plan, s)
             B, T, D = x.shape
