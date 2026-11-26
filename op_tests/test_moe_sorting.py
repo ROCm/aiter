@@ -339,6 +339,37 @@ def test_moe_slots_shared_reduce():
         ), f"slots+shared reduce mismatch M={M} topk={topk} H={H}"
 
 
+def test_moe_slots_shared_reduce_dropped_routes():
+    """With ``topk_ids``, a slot whose id is outside [0, E) adds zero (even if its row holds NaN); valid slots keep
+    the unmasked kernel's bits."""
+    from aiter.ops.flydsl.kernels.moe_slots_shared_reduce import moe_slots_shared_reduce
+
+    E = 128
+    for M, topk, H in itertools.product((1, 16, 128), (4,), (2048, 6144)):
+        parts = (torch.randn(M, topk, H, device="cuda") * 3).bfloat16()
+        shared = (torch.randn(M, H, device="cuda") * 3).bfloat16()
+        ids = torch.randint(0, E, (M, topk), dtype=torch.int32, device="cuda")
+        # all valid: same bits as the unmasked kernel
+        assert torch.equal(
+            moe_slots_shared_reduce(parts, shared, topk_ids=ids, num_experts=E),
+            moe_slots_shared_reduce(parts, shared),
+        )
+        bad = ids.clone()
+        bad[:, 1] = -1
+        bad[0, :] = E
+        if M > 2:
+            bad[2, 3] = 2**20
+        valid = (bad >= 0) & (bad < E)
+        poisoned = parts.clone()
+        poisoned[~valid] = float("nan")
+        acc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+        for k in range(topk):
+            acc += torch.where(valid[:, k, None], parts[:, k].float(), 0.0)
+        ref = (acc + shared.float()).bfloat16()
+        out = moe_slots_shared_reduce(poisoned, shared, topk_ids=bad, num_experts=E)
+        assert torch.equal(out, ref), f"dropped-route reduce mismatch M={M} H={H}"
+
+
 def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
     max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
@@ -1092,6 +1123,7 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_onewg()
     test_moe_slots_shared_reduce()
+    test_moe_slots_shared_reduce_dropped_routes()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
     for dtype in args.dtype:
