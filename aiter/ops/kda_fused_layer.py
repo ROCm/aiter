@@ -35,6 +35,7 @@ One KDA layer, token-major (packed varlen through ``cu_seqlens``):
 import inspect
 import itertools
 import os
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 
@@ -986,6 +987,47 @@ def _proj_ops(x, w):
     return _TorchProj
 
 
+_WEIGHT_CAT_CACHE = {}
+_WEIGHT_CAT_CACHE_MAX = 16
+
+
+class _CachedCat(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, cat, *srcs):
+        ctx.rows = [t.shape[0] for t in srcs]
+        ctx.dtypes = [t.dtype for t in srcs]
+        return cat
+
+    @staticmethod
+    def backward(ctx, g):
+        return (None,) + tuple(p.to(dt) for p, dt in zip(g.split(ctx.rows), ctx.dtypes))
+
+
+def cached_weight_cat(srcs, dtype):
+    """``torch.cat(srcs).to(dtype)``, cached across calls.
+
+    The key is each source's identity, ``data_ptr`` and ``_version``, so an
+    in-place optimizer step or a new parameter rebuilds it. Under grad mode
+    the gradient is split back to the sources. The result must not be
+    modified in place."""
+    key = (dtype,) + tuple(
+        (t.data_ptr(), t._version, tuple(t.shape), t.stride(), t.dtype, t.device)
+        for t in srcs
+    )
+    hit = _WEIGHT_CAT_CACHE.get(key)
+    if hit is not None and all(r() is t for r, t in zip(hit[0], srcs)):
+        cat = hit[1]
+    else:
+        with torch.no_grad():
+            cat = torch.cat([t.detach() for t in srcs]).to(dtype)
+        if len(_WEIGHT_CAT_CACHE) >= _WEIGHT_CAT_CACHE_MAX:
+            _WEIGHT_CAT_CACHE.clear()
+        _WEIGHT_CAT_CACHE[key] = ([weakref.ref(t) for t in srcs], cat)
+    if torch.is_grad_enabled() and any(t.requires_grad for t in srcs):
+        return _CachedCat.apply(cat, *srcs)
+    return cat
+
+
 def _kda_layer_fused_fwd(
     x,
     w,
@@ -1011,15 +1053,15 @@ def _kda_layer_fused_fwd(
     B, T, D = x.shape
     cd = _compute_dtype(x)
     xc = x.to(cd).reshape(B * T, D)
-    w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).to(cd)
-    conv_qkv = _rb(torch.cat([w.conv_q, w.conv_k, w.conv_v]).float())
+    w_qkv = cached_weight_cat([w.w_q, w.w_k, w.w_v], cd)
+    conv_qkv = _rb(cached_weight_cat([w.conv_q, w.conv_k, w.conv_v], torch.float32))
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
     megatron = kda_precision() == "megatron"
     side = None
     if _fusion_on("concat_proj"):
         # one pass over x for every projection that has no epilogue of its own
         extra = [w.f_a, w.w_beta] + ([w.g_proj] if for_backward else [])
-        w_all = torch.cat([w_qkv, *(t.to(cd) for t in extra)])
+        w_all = cached_weight_cat([w.w_q, w.w_k, w.w_v, *extra], cd)
         full = _proj_gemm(xc, w_all, "fwd", cd, name="concat")
         a, *side = full.split([w_qkv.shape[0], *(t.shape[0] for t in extra)], -1)
         side = [_rb(t) for t in side]
