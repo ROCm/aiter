@@ -2345,25 +2345,25 @@ def compile_intra_mfma(
                 c = kt * 16 + n16
                 gn = lds_ld(s_g, m0 * K + c)  # pivot: first row of the sub-chunk
                 acc = fx.Float32x4(0.0)
-                for J in range_constexpr(BT // 16):
-                    use = wave > J
-                    a = []
-                    bv = []
-                    for p in range_constexpr(4):
-                        j = J * 16 + kq4 + p
-                        a.append(_sel(use, lds_ld(s_a, (m0 + n16) * BT + j), _zero()))
-                        bv.append(
-                            lds_ld(s_k, j * K + c, fx.BFloat16)
-                            * _decay(gn - lds_ld(s_g, j * K + c))
-                        )
-                    acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
+                for J in range_constexpr(BT // 16 - 1):
+                    # Only sub-chunks before this wave's; the branch is wave-uniform.
+                    if wave > J:
+                        a = _lds_row(s_a, (m0 + n16) * BT + J * 16 + kq4, 4, fx.Float32)
+                        bv = []
+                        for p in range_constexpr(4):
+                            j = J * 16 + kq4 + p
+                            bv.append(
+                                lds_ld(s_k, j * K + c, fx.BFloat16)
+                                * _decay(gn - lds_ld(s_g, j * K + c))
+                            )
+                        acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
                 for p in range_constexpr(4):
                     m = m0 + kq4 + p
                     lds_st(
                         s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * K + c) - gn)
                     )
             gpu.barrier()
-            out = [lds_ld(s_s, r * LDK + seg * 32 + e) for e in range_constexpr(32)]
+            out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
             gpu.barrier()
             return out
 
@@ -2374,31 +2374,26 @@ def compile_intra_mfma(
                 c = kt * 16 + n16
                 gn = lds_ld(s_g, g_row * K + c)
                 acc = fx.Float32x4(0.0)
-                for J in range_constexpr(BT // 16):
-                    use = J > wave
-                    aq, ak, bq, bk = [], [], [], []
-                    for p in range_constexpr(4):
-                        j = J * 16 + kq4 + p
-                        aq.append(_sel(use, lds_ld(s_aq, j * BT + m0 + n16), _zero()))
-                        ak.append(
-                            _sel(
-                                use,
-                                lds_ld(s_ak, j * BT + m0 + n16) * lds_ld(s_b, j),
-                                _zero(),
-                            )
-                        )
-                        dec = _decay(lds_ld(s_g, j * K + c) - gn)
-                        bq.append(lds_ld(s_q, j * K + c, fx.BFloat16) * dec)
-                        bk.append(lds_ld(s_k, j * K + c, fx.BFloat16) * dec)
-                    acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
-                    acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
+                for J in range_constexpr(1, BT // 16):
+                    # Only sub-chunks after this wave's; the branch is wave-uniform.
+                    if J > wave:
+                        aq, ak, bq, bk = [], [], [], []
+                        for p in range_constexpr(4):
+                            j = J * 16 + kq4 + p
+                            aq.append(lds_ld(s_aq, j * BT + m0 + n16))
+                            ak.append(lds_ld(s_ak, j * BT + m0 + n16) * lds_ld(s_b, j))
+                            dec = _decay(lds_ld(s_g, j * K + c) - gn)
+                            bq.append(lds_ld(s_q, j * K + c, fx.BFloat16) * dec)
+                            bk.append(lds_ld(s_k, j * K + c, fx.BFloat16) * dec)
+                        acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
+                        acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
                 for p in range_constexpr(4):
                     m = m0 + kq4 + p
                     lds_st(
                         s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * K + c))
                     )
             gpu.barrier()
-            out = [lds_ld(s_s, r * LDK + seg * 32 + e) for e in range_constexpr(32)]
+            out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
             gpu.barrier()
             return out
 
