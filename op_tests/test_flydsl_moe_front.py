@@ -38,28 +38,30 @@ def make_inputs(m, n, k, case):
     return x, w, bias, nvr
 
 
-def run_torch(x, w, topk, bias, nvr):
-    """fp32 logits, biased sigmoid top-k, renormalized; and per row the
-    smallest gap between neighbors of the top-(k+1) selection values."""
+def run_torch(x, w, topk, bias):
+    """fp32 reference: each expert's sigmoid score and selection value (score +
+    bias), and the top-k selection values in rank order."""
     scores = torch.sigmoid(x.float() @ w.float().t())
-    top = (scores + bias).topk(topk + 1, dim=1)
-    ids = top.indices[:, :topk]
-    weights = scores.gather(1, ids)
-    weights = weights / weights.sum(1, keepdim=True)
-    gap = (top.values[:, :-1] - top.values[:, 1:]).min(1).values
-    if nvr is not None:  # padding rows: weight 0, id -1
-        pad = torch.arange(x.shape[0]) >= nvr
-        weights[pad], ids[pad], gap[pad] = 0, -1, float("inf")
-    return weights, ids.int(), gap
+    sel = scores + bias
+    return scores, sel, sel.topk(topk, dim=1).values
 
 
-def check_routes(ref, out_w, out_i):
-    """Rows that differ from ``run_torch``: other ids outside a near tie, or
-    the same ids with other weights."""
-    ref_w, ref_i, gap = ref
-    same = (ref_i == out_i).all(1)
-    close = torch.isclose(ref_w, out_w, rtol=1e-2, atol=1e-3).all(1)
-    return int(((~same & (gap >= NEAR_TIE)) | (same & ~close)).sum())
+def check_routes(ref, out_w, out_i, nvr):
+    """Rows where (out_w, out_i) is no top-k of ``run_torch``: an id whose
+    selection value is more than NEAR_TIE off that rank's, a repeated id, or
+    weights off the renormalized scores of its ids. Rows at or past
+    ``nvr`` must be padding (weight 0, id -1)."""
+    scores, sel, vals = ref
+    ids = out_i.long().clamp(0, sel.shape[1] - 1)
+    w = scores.gather(1, ids)
+    w = w / w.sum(1, keepdim=True)
+    bad = (out_i < 0).any(1) | (ids.sort(1).values.diff(1) == 0).any(1)
+    bad |= (sel.gather(1, ids) - vals).abs().amax(1) > NEAR_TIE
+    bad |= ~torch.isclose(out_w, w, rtol=1e-2, atol=1e-3).all(1)
+    if nvr is not None:
+        pad = torch.arange(len(ids)) >= nvr
+        bad = torch.where(pad, (out_i != -1).any(1) | (out_w != 0).any(1), bad)
+    return int(bad.sum())
 
 
 def run_unfused(x, w, topk, bias, nvr):
@@ -75,7 +77,7 @@ def run_unfused(x, w, topk, bias, nvr):
 @benchmark()
 def test_moe_router_topk(m, k, topk, split_k, case):
     x, w, bias, nvr = make_inputs(m, E, k, case)
-    ref = run_torch(x, w, topk, bias, nvr)
+    ref = run_torch(x, w, topk, bias)
     candidates = {
         "unfused": (run_unfused, x, w, topk, bias, nvr),
         "fused": (flydsl_moe_router_topk, x, w, topk, bias),
@@ -84,8 +86,8 @@ def test_moe_router_topk(m, k, topk, split_k, case):
     ret = {}
     for name, (fn, *args) in candidates.items():
         (out_w, out_i), us = run_perftest(fn, *args, **kwargs.get(name, {}))
-        ret[f"{name} us"], ret[f"{name} err"] = us, check_routes(ref, out_w, out_i)
-    ret["near-tie rows"] = int((ref[2] < NEAR_TIE).sum())
+        ret[f"{name} us"] = us
+        ret[f"{name} err"] = check_routes(ref, out_w, out_i, nvr)
     assert ret["fused err"] == ret["unfused err"] == 0, f"routes differ: {ret}"
     return ret
 

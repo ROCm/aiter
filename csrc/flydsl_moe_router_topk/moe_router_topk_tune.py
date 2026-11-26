@@ -131,12 +131,12 @@ class MoeRouterTopkTuner(TunerCommon):
         torch.manual_seed(M)
         x, w, bias, _ = _T.make_inputs(M, N, K, "rand")
         nvr = torch.tensor([M], dtype=torch.int32, device="cuda")  # as callers pass it
-        ref = _T.run_torch(x, w, topk, bias, nvr)
+        ref = _T.run_torch(x, w, topk, bias)
         fused = {}
         for sk, pf in _candidates(K):
             cfg = {"num_valid_rows": nvr, "split_k": sk, "prefetch": pf}
             tw, ti = fused_topk(x, w, topk, bias, **cfg)
-            if _T.check_routes(ref, tw, ti):
+            if _T.check_routes(ref, tw, ti, nvr):
                 logger.warning(f"M={M} K={K} split_k={sk}: routes differ, skipped")
                 continue
             fused[sk, pf] = lambda cfg=cfg: fused_topk(x, w, topk, bias, **cfg)
