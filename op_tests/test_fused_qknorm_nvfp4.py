@@ -514,6 +514,18 @@ def test_compile_fullgraph():
         qkv, qn, kn, cos_sin, pos, 1e-6, iqn, ikn, slots, kv, kv, idx, q_out, iq_out, slots, ks, vs,
     )  # fmt: skip
 
+    # Under AITER_REBUILD=1, _nvfp4_raw_front declines (fused_qknorm_idxrqknorm.py:198-200) until
+    # the marshalled wrapper has rebuilt the module in *this* process; test_reject()'s rebuild runs
+    # in child processes and does not count here. Warm up one real call through the public op first
+    # -- the same way a real caller would reach the raw front -- so that precondition holds under
+    # any AITER_REBUILD setting before we probe the raw front directly below.
+    aiter.fused_qknorm_idxrqknorm(
+        qkv, qn, kn, cos_sin, pos, 16, nkv, 64, 1e-6, iqn, ikn, niq,
+        slots, kv, kv, idx, 128, q_out, iq_out, slots,
+        kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=ks, v_scale=vs,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
     # eager: this exact shape really does take the raw front (a meaningless test otherwise)
     assert _nvfp4_raw_front(*args) is True
 
