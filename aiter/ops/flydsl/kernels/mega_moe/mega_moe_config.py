@@ -112,11 +112,13 @@ V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
 V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
 # SwiGLU clamp each FUSED_LAYOUTS layout is served with (10.0 unless listed).
 _FUSED_SWIGLU_LIMITS = {K26_FUSED_LAYOUT: 0.0}
-# EP8 Kimi-K2.6 takes its large-input tune at the capacity it was measured at.
-K26_LARGE_M_MTPRS = (8192,)
-# EP8 DeepSeek-V4-Pro runs the large-input kernel at every LARGE_M_MTPRS capacity, tuned at the one its tune was
-# measured at (the others keep the default config).
-V4_PRO_TUNED_LARGE_M_MTPRS = (8192,)
+# EP8 Kimi-K2.6 takes its large-input tune at 8192 and 16384. At 16384 it runs 0.73x-0.97x the staged path
+# (1.01x under one-hot-expert routing from 12288 tokens); at 32768 the staged path stays, as it is 4% faster at
+# 32768 tokens under skewed routing.
+K26_LARGE_M_MTPRS = (8192, 16384)
+# EP8 DeepSeek-V4-Pro runs the large-input kernel at every LARGE_M_MTPRS capacity, tuned at 8192 and 16384 (the
+# others keep the default config). At 16384 the tune runs 0.67x-1.01x the default config.
+V4_PRO_TUNED_LARGE_M_MTPRS = (8192, 16384)
 # (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
 _V41_FLASH_LARGE_M_MTPRS = {
     (world, model_dim, inter_dim): mtprs
@@ -1762,6 +1764,10 @@ def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     if bucket >= 256:
         # Against the 4-wave tune: 0.87-0.91x (uniform), 0.81-0.83x (zipf:1), 0.86-0.89x (spike).
         return _small_m_eight_waves(config)
+    if 8 <= bucket <= 32:
+        # GEMM2 at block_n 256 (half the tiles, so half the per-tile P2P store drains): 0.95x-1.00x (uniform),
+        # 0.98x-1.02x (zipf:1), 0.96x-0.99x (spike) at 8-32 tokens.
+        config = replace(config, stage2=replace(config.stage2, block_n=256))
     knobs = config.fused_stage1
     if bucket in (16, 64, 128):
         # GEMM1 also reads A two K-steps ahead in its K-loop and runs two K-steps per iteration: 0.98x at 16 and
@@ -1772,7 +1778,8 @@ def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
 
 def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoEConfig:
     """EP8 Kimi-K2.6 (top-8) and DeepSeek-V4-Pro (top-6) large-input kernel (48 experts per rank, hidden 7168),
-    measured on gfx950 at MTPR 8192 (8 ranks; uniform, zipf:1 and one-hot-expert routes).
+    measured on gfx950 at MTPR 8192 (8 ranks; uniform, zipf:1 and one-hot-expert routes). Both also run it at
+    16384: its thresholds are rows a rank of the launch, so a capacity only sizes buffers.
     """
     # Half the payload producers leave their CTAs to GEMM1; a chunk's tile publication releases its stores
     # system-wide once, and nothing reads payload_ready. One row per (token, destination), copied with every load of
@@ -1784,6 +1791,8 @@ def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoECo
     # knobs above alone lose 1.09x (zipf:1) / 1.17x (spike).
     # The GEMM2 knobs of the V4.1-Flash tune that fit (row-aligned, staged, lean GEMM2) and 32-row short tails:
     # K2.6 0.90x-0.99x, V4-Pro 0.85x-0.99x the knobs above (MTPR 8192, 768-8192 tokens a rank).
+    # The per-token combine wait: 0.97x-0.99x on both at every routing, for a payload the runtime keeps to itself
+    # (world x MTPR token rows, about 0.5 GB a GPU at MTPR 8192).
     return replace(
         config,
         stage1=replace(config.stage1, num_dispatch_cu=48 * expert_waves),
@@ -1822,6 +1831,7 @@ def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoECo
             epi_lean=True,
             ascale_lds=True,
             route_i8=True,
+            comb_tok_wait=True,
         ),
     )
 
