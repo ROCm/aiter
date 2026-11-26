@@ -2716,10 +2716,10 @@ __global__ void static_fp8_quant_perhead_kernel(mrope_utils::fp8e4m3fnuz* out,
     }
 }
 
-template <typename scalar_t, int PackSize>
+template <typename scalar_t, int PackSize, typename cache_t>
 __device__ __forceinline__ vec_t<scalar_t, PackSize>
 minimax_apply_neox_rope_pack(vec_t<scalar_t, PackSize> x,
-                             scalar_t const* __restrict__ cos_sin_cache,
+                             cache_t const* __restrict__ cos_sin_cache,
                              int64_t const* __restrict__ position_ids,
                              int token_idx,
                              int access_id_in_head,
@@ -2727,9 +2727,9 @@ minimax_apply_neox_rope_pack(vec_t<scalar_t, PackSize> x,
 {
     int const embed_dim       = rotary_dim / 2;
     int64_t const pos_id      = position_ids[token_idx];
-    scalar_t const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
-    scalar_t const* cos_ptr   = cache_ptr;
-    scalar_t const* sin_ptr   = cache_ptr + embed_dim;
+    cache_t const* cache_ptr  = cos_sin_cache + pos_id * rotary_dim;
+    cache_t const* cos_ptr    = cache_ptr;
+    cache_t const* sin_ptr    = cache_ptr + embed_dim;
     int const cos_base =
         access_id_in_head < embed_dim ? access_id_in_head : access_id_in_head - embed_dim;
     int const partner_delta = embed_dim / PackSize;
@@ -2756,10 +2756,10 @@ minimax_apply_neox_rope_pack(vec_t<scalar_t, PackSize> x,
     return y;
 }
 
-template <typename scalar_t, int PackSize>
+template <typename scalar_t, int PackSize, typename cache_t>
 __device__ __forceinline__ vec_t<scalar_t, PackSize>
 minimax_apply_gptj_rope_pack(vec_t<scalar_t, PackSize> x,
-                             scalar_t const* __restrict__ cos_sin_cache,
+                             cache_t const* __restrict__ cos_sin_cache,
                              int64_t const* __restrict__ position_ids,
                              int token_idx,
                              int access_id_in_head,
@@ -2767,9 +2767,9 @@ minimax_apply_gptj_rope_pack(vec_t<scalar_t, PackSize> x,
 {
     int const embed_dim       = rotary_dim / 2;
     int64_t const pos_id      = position_ids[token_idx];
-    scalar_t const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
-    scalar_t const* cos_ptr   = cache_ptr;
-    scalar_t const* sin_ptr   = cache_ptr + embed_dim;
+    cache_t const* cache_ptr  = cos_sin_cache + pos_id * rotary_dim;
+    cache_t const* cos_ptr    = cache_ptr;
+    cache_t const* sin_ptr    = cache_ptr + embed_dim;
 
     vec_t<scalar_t, PackSize> y = x;
 #pragma unroll
@@ -2789,22 +2789,41 @@ minimax_apply_gptj_rope_pack(vec_t<scalar_t, PackSize> x,
     return y;
 }
 
-template <typename scalar_t, typename weight_t, int BlockSize>
-__global__ void minimax_qk_norm_rope_kernel(
-    scalar_t const* __restrict__ qkv,
-    weight_t const* __restrict__ q_weight,
-    weight_t const* __restrict__ k_weight,
-    scalar_t const* __restrict__ cos_sin_cache,
-    int64_t const* __restrict__ position_ids,
-    int const num_heads_q,
-    int const num_heads_k,
-    int const head_dim,
-    int const rotary_dim,
-    float const eps,
-    bool const is_neox,
-    scalar_t* __restrict__ q_out,
-    scalar_t* __restrict__ k_out,
-    scalar_t* __restrict__ v_out)
+template <typename scalar_t, int PackSize, typename cache_t>
+__device__ __forceinline__ vec_t<scalar_t, PackSize>
+minimax_apply_rope_pack(vec_t<scalar_t, PackSize> x,
+                        bool is_neox,
+                        cache_t const* __restrict__ cos_sin_cache,
+                        int64_t const* __restrict__ position_ids,
+                        int token_idx,
+                        int access_id_in_head,
+                        int rotary_dim)
+{
+    return is_neox ? minimax_apply_neox_rope_pack<scalar_t, PackSize>(
+                         x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim)
+                   : minimax_apply_gptj_rope_pack<scalar_t, PackSize>(
+                         x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim);
+}
+
+// One block per token. Thread t holds the 16-byte packs t, t + BlockSize, ...,
+// t + (PacksPerThread - 1) * BlockSize of the qkv row, so a row can have up to
+// BlockSize * PacksPerThread packs. PacksPerThread == 1 (one pack per thread)
+// is the only layout of the kernel before wider rows were added.
+template <typename scalar_t, typename weight_t, typename cache_t, int BlockSize, int PacksPerThread>
+__global__ void minimax_qk_norm_rope_kernel(scalar_t const* __restrict__ qkv,
+                                            weight_t const* __restrict__ q_weight,
+                                            weight_t const* __restrict__ k_weight,
+                                            cache_t const* __restrict__ cos_sin_cache,
+                                            int64_t const* __restrict__ position_ids,
+                                            int const num_heads_q,
+                                            int const num_heads_k,
+                                            int const head_dim,
+                                            int const rotary_dim,
+                                            float const eps,
+                                            bool const is_neox,
+                                            scalar_t* __restrict__ q_out,
+                                            scalar_t* __restrict__ k_out,
+                                            scalar_t* __restrict__ v_out)
 {
     constexpr int PackSize = 16 / sizeof(scalar_t);
     using pack_t           = vec_t<scalar_t, PackSize>;
@@ -2818,40 +2837,37 @@ __global__ void minimax_qk_norm_rope_kernel(
     int const q_packs    = q_size / PackSize;
     int const k_packs    = kv_size / PackSize;
     int const qk_packs   = q_packs + k_packs;
-    int const all_packs  = hidden_dim / PackSize;
-    int const pack_start = tid * PackSize;
+    int const all_packs          = hidden_dim / PackSize;
     int64_t const qkv_row_stride = static_cast<int64_t>(hidden_dim);
 
     scalar_t const* q_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row_stride;
-    scalar_t const* k_ptr = q_ptr + q_size;
-    scalar_t const* v_ptr = k_ptr + kv_size;
 
-    pack_t x{};
-    if(tid < all_packs)
-    {
-        x = *reinterpret_cast<pack_t const*>(q_ptr + pack_start);
-    }
-    float acc[PackSize];
-#pragma unroll
-    for(int i = 0; i < PackSize; ++i)
-    {
-        acc[i] = static_cast<float>(x[i]);
-    }
-
+    pack_t x[PacksPerThread];
     float q_square_sum = 0.0f;
     float k_square_sum = 0.0f;
-    if(tid < qk_packs)
-    {
 #pragma unroll
-        for(int i = 0; i < PackSize; ++i)
+    for(int j = 0; j < PacksPerThread; ++j)
+    {
+        int const pack_id = tid + j * BlockSize;
+        x[j]              = pack_t{};
+        if(pack_id < all_packs)
         {
-            if(tid < q_packs)
+            x[j] = *reinterpret_cast<pack_t const*>(q_ptr + pack_id * PackSize);
+        }
+        if(pack_id < qk_packs)
+        {
+#pragma unroll
+            for(int i = 0; i < PackSize; ++i)
             {
-                q_square_sum += acc[i] * acc[i];
-            }
-            else
-            {
-                k_square_sum += acc[i] * acc[i];
+                float const val = static_cast<float>(x[j][i]);
+                if(pack_id < q_packs)
+                {
+                    q_square_sum += val * val;
+                }
+                else
+                {
+                    k_square_sum += val * val;
+                }
             }
         }
     }
@@ -2862,46 +2878,56 @@ __global__ void minimax_qk_norm_rope_kernel(
     float const q_rstd = rsqrtf(q_square_sum / static_cast<float>(q_size) + eps);
     float const k_rstd = rsqrtf(k_square_sum / static_cast<float>(kv_size) + eps);
 
-    if(tid < q_packs)
-    {
-        weight_pack_t w = *reinterpret_cast<weight_pack_t const*>(q_weight + pack_start);
 #pragma unroll
-        for(int i = 0; i < PackSize; ++i)
-        {
-            x[i] = static_cast<scalar_t>(acc[i] * q_rstd * static_cast<float>(w[i]));
-        }
-        int const access_id_in_head = pack_start % head_dim;
-        x = is_neox ? minimax_apply_neox_rope_pack<scalar_t, PackSize>(
-                          x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim)
-                    : minimax_apply_gptj_rope_pack<scalar_t, PackSize>(
-                          x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim);
-        *reinterpret_cast<pack_t*>(q_out + static_cast<int64_t>(token_idx) * q_size + pack_start) =
-            x;
-    }
-    else if(tid < qk_packs)
+    for(int j = 0; j < PacksPerThread; ++j)
     {
-        int const k_pack_id = tid - q_packs;
-        int const k_start   = k_pack_id * PackSize;
-        weight_pack_t w     = *reinterpret_cast<weight_pack_t const*>(k_weight + k_start);
+        int const pack_id    = tid + j * BlockSize;
+        int const pack_start = pack_id * PackSize;
+        pack_t y             = x[j];
+        if(pack_id < q_packs)
+        {
+            weight_pack_t w = *reinterpret_cast<weight_pack_t const*>(q_weight + pack_start);
 #pragma unroll
-        for(int i = 0; i < PackSize; ++i)
-        {
-            x[i] = static_cast<scalar_t>(acc[i] * k_rstd * static_cast<float>(w[i]));
+            for(int i = 0; i < PackSize; ++i)
+            {
+                y[i] = static_cast<scalar_t>(static_cast<float>(x[j][i]) * q_rstd *
+                                             static_cast<float>(w[i]));
+            }
+
+            y = minimax_apply_rope_pack<scalar_t, PackSize>(y,
+                                                            is_neox,
+                                                            cos_sin_cache,
+                                                            position_ids,
+                                                            token_idx,
+                                                            pack_start % head_dim,
+                                                            rotary_dim);
+
+            scalar_t* dst = q_out + static_cast<int64_t>(token_idx) * q_size + pack_start;
+            *reinterpret_cast<pack_t*>(dst) = y;
         }
-        int const access_id_in_head = k_start % head_dim;
-        x = is_neox ? minimax_apply_neox_rope_pack<scalar_t, PackSize>(
-                          x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim)
-                    : minimax_apply_gptj_rope_pack<scalar_t, PackSize>(
-                          x, cos_sin_cache, position_ids, token_idx, access_id_in_head, rotary_dim);
-        *reinterpret_cast<pack_t*>(k_out + static_cast<int64_t>(token_idx) * kv_size + k_start) =
-            x;
-    }
-    else if(tid < all_packs)
-    {
-        int const v_pack_id = tid - qk_packs;
-        int const v_start   = v_pack_id * PackSize;
-        *reinterpret_cast<pack_t*>(v_out + static_cast<int64_t>(token_idx) * kv_size + v_start) =
-            x;
+        else if(pack_id < qk_packs)
+        {
+            int const k_start = (pack_id - q_packs) * PackSize;
+            weight_pack_t w   = *reinterpret_cast<weight_pack_t const*>(k_weight + k_start);
+#pragma unroll
+            for(int i = 0; i < PackSize; ++i)
+            {
+                y[i] = static_cast<scalar_t>(static_cast<float>(x[j][i]) * k_rstd *
+                                             static_cast<float>(w[i]));
+            }
+
+            y = minimax_apply_rope_pack<scalar_t, PackSize>(
+                y, is_neox, cos_sin_cache, position_ids, token_idx, k_start % head_dim, rotary_dim);
+
+            scalar_t* dst = k_out + static_cast<int64_t>(token_idx) * kv_size + k_start;
+            *reinterpret_cast<pack_t*>(dst) = y;
+        }
+        else if(pack_id < all_packs)
+        {
+            int const v_start = (pack_id - qk_packs) * PackSize;
+            scalar_t* dst     = v_out + static_cast<int64_t>(token_idx) * kv_size + v_start;
+            *reinterpret_cast<pack_t*>(dst) = y;
+        }
     }
 }
 
@@ -2922,6 +2948,10 @@ void minimax_qk_norm_rope(aiter_tensor_t& qkv,
                               aiter_tensor_t& k_out,
                               aiter_tensor_t& v_out)
 {
+    // Called from Python: a failed check below raises a Python exception
+    // instead of aborting the process.
+    aiter_detail::AiterThrowGuard throw_guard;
+
     CHECK_INPUT(qkv);
     CHECK_INPUT(q_weight);
     CHECK_INPUT(k_weight);
@@ -2968,13 +2998,16 @@ void minimax_qk_norm_rope(aiter_tensor_t& qkv,
                 "q_weight and k_weight must have the same dtype");
     AITER_CHECK(q_weight.dtype() == qkv.dtype() || q_weight.dtype() == AITER_DTYPE_fp32,
                 "MiniMax TP1 fused kernel supports q/k weights in qkv dtype or fp32");
-    AITER_CHECK(qkv.dtype() == cos_sin_cache.dtype() && qkv.dtype() == q_out.dtype() &&
-                    qkv.dtype() == k_out.dtype() && qkv.dtype() == v_out.dtype(),
-                "qkv, cos_sin_cache and outputs must have the same dtype");
+    AITER_CHECK(cos_sin_cache.dtype() == qkv.dtype() || cos_sin_cache.dtype() == AITER_DTYPE_fp32,
+                "cos_sin_cache must have the qkv dtype or fp32");
+    AITER_CHECK(qkv.dtype() == q_out.dtype() && qkv.dtype() == k_out.dtype() &&
+                    qkv.dtype() == v_out.dtype(),
+                "qkv and outputs must have the same dtype");
 
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    constexpr int block_size = 1024;
+    constexpr int block_size           = 1024;
+    constexpr int max_packs_per_thread = 4;
 
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(qkv.dtype(), "minimax_qk_norm_rope", [&] {
         constexpr int pack_size = 16 / sizeof(scalar_t);
@@ -2983,47 +3016,73 @@ void minimax_qk_norm_rope(aiter_tensor_t& qkv,
                     "MiniMax TP1 fused kernel requires q/k/head dims to be 16B-pack aligned");
         AITER_CHECK((rotary_dim / 2) % pack_size == 0,
                     "MiniMax TP1 fused kernel requires rotary_dim / 2 to be pack aligned");
-        AITER_CHECK((q_size + 2 * kv_size) / pack_size <= block_size,
-                    "MiniMax TP1 fused kernel supports at most 1024 packs per token");
+        int64_t const packs_per_token = (q_size + 2 * kv_size) / pack_size;
+        AITER_CHECK(packs_per_token <= block_size * max_packs_per_thread,
+                    "MiniMax TP1 fused kernel supports at most ",
+                    block_size * max_packs_per_thread,
+                    " packs of 16 bytes per token (q_size + 2 * kv_size <= ",
+                    block_size * max_packs_per_thread * pack_size,
+                    "), got ",
+                    packs_per_token);
+        int64_t const packs_per_thread = (packs_per_token + block_size - 1) / block_size;
         dim3 grid(num_tokens);
         dim3 block(block_size);
+
+        auto launch = [&](auto weight_tag, auto cache_tag, auto packs_tag) {
+            using weight_t = typename decltype(weight_tag)::type;
+            using cache_t  = typename decltype(cache_tag)::type;
+            minimax_qk_norm_rope_kernel<scalar_t,
+                                        weight_t,
+                                        cache_t,
+                                        block_size,
+                                        decltype(packs_tag)::value><<<grid, block, 0, stream>>>(
+                reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
+                reinterpret_cast<weight_t const*>(q_weight.data_ptr()),
+                reinterpret_cast<weight_t const*>(k_weight.data_ptr()),
+                reinterpret_cast<cache_t const*>(cos_sin_cache.data_ptr()),
+                reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
+                static_cast<int>(num_heads_q),
+                static_cast<int>(num_heads_k),
+                static_cast<int>(head_dim),
+                static_cast<int>(rotary_dim),
+                static_cast<float>(eps),
+                is_neox,
+                reinterpret_cast<scalar_t*>(q_out.data_ptr()),
+                reinterpret_cast<scalar_t*>(k_out.data_ptr()),
+                reinterpret_cast<scalar_t*>(v_out.data_ptr()));
+        };
+        // Rows of up to 1024 packs keep one pack per thread; wider rows use 2 or 4.
+        auto launch_packs = [&](auto weight_tag, auto cache_tag) {
+            if(packs_per_thread == 1)
+            {
+                launch(weight_tag, cache_tag, std::integral_constant<int, 1>{});
+            }
+            else if(packs_per_thread == 2)
+            {
+                launch(weight_tag, cache_tag, std::integral_constant<int, 2>{});
+            }
+            else
+            {
+                launch(weight_tag, cache_tag, std::integral_constant<int, max_packs_per_thread>{});
+            }
+        };
+        auto launch_cache = [&](auto weight_tag) {
+            if(cos_sin_cache.dtype() == AITER_DTYPE_fp32)
+            {
+                launch_packs(weight_tag, std::type_identity<float>{});
+            }
+            else
+            {
+                launch_packs(weight_tag, std::type_identity<scalar_t>{});
+            }
+        };
         if(q_weight.dtype() == AITER_DTYPE_fp32)
         {
-            minimax_qk_norm_rope_kernel<scalar_t, float, block_size>
-                <<<grid, block, 0, stream>>>(
-                    reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
-                    reinterpret_cast<float const*>(q_weight.data_ptr()),
-                    reinterpret_cast<float const*>(k_weight.data_ptr()),
-                    reinterpret_cast<scalar_t const*>(cos_sin_cache.data_ptr()),
-                    reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
-                    static_cast<int>(num_heads_q),
-                    static_cast<int>(num_heads_k),
-                    static_cast<int>(head_dim),
-                    static_cast<int>(rotary_dim),
-                    static_cast<float>(eps),
-                    is_neox,
-                    reinterpret_cast<scalar_t*>(q_out.data_ptr()),
-                    reinterpret_cast<scalar_t*>(k_out.data_ptr()),
-                    reinterpret_cast<scalar_t*>(v_out.data_ptr()));
+            launch_cache(std::type_identity<float>{});
         }
         else
         {
-            minimax_qk_norm_rope_kernel<scalar_t, scalar_t, block_size>
-                <<<grid, block, 0, stream>>>(
-                    reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
-                    reinterpret_cast<scalar_t const*>(q_weight.data_ptr()),
-                    reinterpret_cast<scalar_t const*>(k_weight.data_ptr()),
-                    reinterpret_cast<scalar_t const*>(cos_sin_cache.data_ptr()),
-                    reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
-                    static_cast<int>(num_heads_q),
-                    static_cast<int>(num_heads_k),
-                    static_cast<int>(head_dim),
-                    static_cast<int>(rotary_dim),
-                    static_cast<float>(eps),
-                    is_neox,
-                    reinterpret_cast<scalar_t*>(q_out.data_ptr()),
-                    reinterpret_cast<scalar_t*>(k_out.data_ptr()),
-                    reinterpret_cast<scalar_t*>(v_out.data_ptr()));
+            launch_cache(std::type_identity<scalar_t>{});
         }
     });
 }

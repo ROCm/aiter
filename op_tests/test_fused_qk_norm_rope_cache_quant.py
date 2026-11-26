@@ -1599,6 +1599,15 @@ def run_torch_minimax_qk_norm_rope(
 
     cos_sin = cos_sin.view(cos_sin.shape[0], rotary_dim)[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
+    if cos_sin.dtype == torch.float32 and qkv.dtype != torch.float32:
+        # fp32 cos/sin: rotate in fp32 and round once, as the kernel does.
+        q = _minimax_rope_fp32(
+            q, cos, sin, num_heads_q, head_size, rotary_dim, is_neox_style
+        )
+        k = _minimax_rope_fp32(
+            k, cos, sin, num_heads_k, head_size, rotary_dim, is_neox_style
+        )
+        return q, k, v
     q = apply_rotary_emb_dispatch(
         q.view(num_tokens, num_heads_q, head_size),
         cos,
@@ -1614,6 +1623,12 @@ def run_torch_minimax_qk_norm_rope(
         rotary_dim,
     ).reshape(num_tokens, kv_size)
     return q, k, v
+
+
+def _minimax_rope_fp32(x, cos, sin, num_heads, head_size, rotary_dim, is_neox_style):
+    x = x.view(x.size(0), num_heads, head_size)
+    x_rot = apply_rotary_emb_diffusers(x[..., :rotary_dim], cos, sin, is_neox_style)
+    return torch.cat((x_rot, x[..., rotary_dim:]), dim=-1).reshape(x.size(0), -1)
 
 
 @perftest()
@@ -1670,6 +1685,7 @@ def test_minimax_qk_norm_rope(
     rotary_dim,
     is_neox_style,
     eps=1e-6,
+    cos_sin_dtype=None,
 ):
     torch.manual_seed(0)
     q_size = num_heads_q * head_size
@@ -1684,7 +1700,7 @@ def test_minimax_qk_norm_rope(
     k_weight = torch.randn(kv_size, dtype=torch.float32, device="cuda")
     cos_sin = torch.randn(
         (max_positions, rotary_dim),
-        dtype=dtype,
+        dtype=dtype if cos_sin_dtype is None else cos_sin_dtype,
         device="cuda",
     )
     positions = torch.randint(
@@ -1721,10 +1737,12 @@ def test_minimax_qk_norm_rope(
 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}"
     info += f", head_size:{head_size}, rotary_dim:{rotary_dim}, is_neox_style:{is_neox_style}, eps:{eps}"
+    if cos_sin_dtype is not None:
+        info += f", cos_sin_dtype:{cos_sin_dtype}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
-    checkAllclose(q_ref, q_out, msg="minimax q", rtol=1e-2, atol=0.05)
-    checkAllclose(k_ref, k_out, msg="minimax k", rtol=1e-2, atol=0.05)
-    checkAllclose(v_ref, v_out, msg="minimax v", rtol=1e-2, atol=0.05)
+    err_q = checkAllclose(q_ref, q_out, msg="minimax q", rtol=1e-2, atol=0.05)
+    err_k = checkAllclose(k_ref, k_out, msg="minimax k", rtol=1e-2, atol=0.05)
+    err_v = checkAllclose(v_ref, v_out, msg="minimax v", rtol=1e-2, atol=0.05)
     print(msg, flush=True)
 
     ret = {}
@@ -1738,7 +1756,64 @@ def test_minimax_qk_norm_rope(
     ret["avg_torch"] = avg_torch
     ret["avg_cu"] = avg_cu
     ret["speedup"] = avg_torch / avg_cu
+    ret["err"] = max(err_q, err_k, err_v)
     return ret
+
+
+def test_minimax_qk_norm_rope_rejects(dtype):
+    """Invalid arguments raise RuntimeError; the process keeps running."""
+    num_tokens, head_size = 4, 128
+    positions = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+
+    def call(num_heads_q, num_heads_k, cos_sin_dtype):
+        q_size = num_heads_q * head_size
+        kv_size = num_heads_k * head_size
+        qkv = torch.randn(
+            (num_tokens, q_size + 2 * kv_size), dtype=dtype, device="cuda"
+        )
+        weight_q = torch.ones(q_size, dtype=torch.float32, device="cuda")
+        weight_k = torch.ones(kv_size, dtype=torch.float32, device="cuda")
+        cos_sin = torch.randn(
+            (num_tokens, head_size), dtype=cos_sin_dtype, device="cuda"
+        )
+        return aiter.minimax_qk_norm_rope(
+            qkv,
+            weight_q,
+            weight_k,
+            cos_sin,
+            positions,
+            num_heads_q=num_heads_q,
+            num_heads_k=num_heads_k,
+            head_dim=head_size,
+            rotary_dim=head_size,
+            eps=1e-6,
+            is_neox_style=False,
+        )
+
+    pack = 16 // torch.empty((), dtype=dtype).element_size()
+    heads_over_limit = 4096 * pack // (3 * head_size) + 1
+    other_dtype = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+    for num_heads, cos_sin_dtype, expected in (
+        (heads_over_limit, dtype, "packs of 16 bytes per token"),
+        (24, other_dtype, "cos_sin_cache must have the qkv dtype or fp32"),
+    ):
+        try:
+            call(num_heads, num_heads, cos_sin_dtype)
+        except RuntimeError as e:
+            assert expected in str(e), str(e)
+        else:
+            raise AssertionError(f"no error for {num_heads} heads, {cos_sin_dtype}")
+    # The process is still usable after the errors.
+    q, _, _ = call(24, 24, dtype)
+    torch.cuda.synchronize()
+    assert torch.isfinite(q).all()
+    aiter.logger.info(
+        "minimax_qk_norm_rope rejects: %d heads x %d over the limit and a %s cos/sin "
+        "cache raise RuntimeError",
+        heads_over_limit,
+        head_size,
+        other_dtype,
+    )
 
 
 @benchmark()
@@ -3990,6 +4065,33 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("minimax_qk_norm_rope summary (markdown):\n%s", df_md)
+
+    # MiniMax kernel on Wan 2.x-style rows (24 or 40 heads each of q, k and v,
+    # full-row q/k RMSNorm): 576 to 3840 packs of 16 bytes per token in bf16,
+    # so one, two and four packs per thread are all reached; cos/sin in the
+    # qkv dtype and in fp32.
+    df = []
+    for minimax_heads in ((24, 24), (40, 40)):
+        for head_size in args.head_sizes:
+            for num_tokens in args.token:
+                for is_neox_style in args.is_neox_styles:
+                    for cos_sin_dtype in (args.dtype, dtypes.fp32):
+                        ret = test_minimax_qk_norm_rope(
+                            args.dtype,
+                            num_tokens,
+                            *minimax_heads,
+                            head_size,
+                            head_size,
+                            is_neox_style,
+                            eps=1e-6,
+                            cos_sin_dtype=cos_sin_dtype,
+                        )
+                        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("minimax_qk_norm_rope wide rows summary (markdown):\n%s", df_md)
+    assert (df["err"] <= 0.05).all(), "minimax_qk_norm_rope wide rows mismatch"
+    test_minimax_qk_norm_rope_rejects(args.dtype)
 
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     df = []
