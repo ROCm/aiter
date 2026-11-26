@@ -123,6 +123,10 @@ NONE_WRAPPED_OP = [
     "_moe_nvfp4_cfg_field",
     "_moe_nvfp4_cfg_fits",
     "_moe_nvfp4_gemm",
+    # Wrapped by torch ops whose schemas mark only what they write (aiter/ops/opus/gated_mha_bwd.py)
+    "_fmha_bwd_bf16_opus_gate",
+    "_fmha_bwd_bf16_opus_dot",
+    "_fmha_bwd_bf16_opus_bwd",
 ]
 
 

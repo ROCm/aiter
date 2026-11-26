@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Public OPUS GEMM/BMM interfaces backed by shared exact-kid launchers."""
+"""Public OPUS interfaces: GEMM/BMM backed by shared exact-kid launchers, and the gated MHA
+backward."""
 
 from __future__ import annotations
 
@@ -8,6 +9,10 @@ import torch
 from torch import Tensor
 
 from .dispatch import _opus_dispatch
+
+# The function takes the name of its module in this package: aiter.ops.opus.gated_mha_bwd and
+# aiter.gated_mha_bwd are the op, the module stays importable by its full name.
+from .gated_mha_bwd import gated_mha_bwd
 
 
 def opus_gemm(
@@ -103,6 +108,7 @@ def gemm_a16w16_opus(
 
 
 __all__ = [
+    "gated_mha_bwd",
     "gemm_a16w16_opus",
     "opus_bmm",
     "opus_gemm",

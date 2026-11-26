@@ -1657,6 +1657,38 @@ namespace py = pybind11;
           py::arg("window_size_left") = -1,           \
           py::arg("sink")             = std::nullopt);
 
+#define FMHA_BWD_BF16_OPUS_PYBIND                     \
+    m.def("fmha_bwd_bf16_opus_gate",                  \
+          &fmha_bwd_bf16_opus_gate,                   \
+          py::arg("dout"),                            \
+          py::arg("out"),                             \
+          py::arg("gate"),                            \
+          py::arg("d_o"),                             \
+          py::arg("dgate"),                           \
+          py::arg("d"));                              \
+    m.def("fmha_bwd_bf16_opus_dot",                   \
+          &fmha_bwd_bf16_opus_dot,                    \
+          py::arg("dout"),                            \
+          py::arg("out"),                             \
+          py::arg("d"));                              \
+    m.def("fmha_bwd_bf16_opus_bwd",                   \
+          &fmha_bwd_bf16_opus_bwd,                    \
+          py::arg("q"),                               \
+          py::arg("k"),                               \
+          py::arg("v"),                               \
+          py::arg("d_o"),                             \
+          py::arg("lse"),                             \
+          py::arg("d"),                               \
+          py::arg("dq"),                              \
+          py::arg("dk"),                              \
+          py::arg("dv"),                              \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_q"),                    \
+          py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"));
+
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
           &layernorm2d,                            \
