@@ -163,6 +163,29 @@ def _get_flydsl_moe_kernels():
 _SILU_VALUE = int(ActivationType.Silu)
 
 
+# Extra tuned-row tiers below a power-of-two bucket: M in (p / 2, T] for a listed
+# T < p = nextPow2(M) looks up the row tuned at token = T, and the bucket's row
+# (token = p) when the table has no row at T for that shape. Comma-separated;
+# empty turns it off. 3584 by default: Kimi-K3.1's A4W4 table has a bm64 row
+# there that is bit-identical to its 4096 row and faster at 2049-3584 tokens.
+_EXTRA_M_TIERS = tuple(
+    sorted(
+        int(t)
+        for t in os.environ.get("AITER_MOE_EXTRA_M_TIERS", "3584").split(",")
+        if t.strip()
+    )
+)
+
+
+def _tuned_M(M):
+    """The token the tuned-row lookup keys on for M (get_padded_M or an extra tier)."""
+    padded = get_padded_M(M)
+    for tier in _EXTRA_M_TIERS:
+        if M <= tier < padded and tier > padded // 2:
+            return tier
+    return padded
+
+
 def swiglu_limit_tag(swiglu_limit):
     """`_tag` value of tuned fmoe rows that were tuned with this swiglu_limit."""
     swiglu_limit = normalize_swiglu_limit(swiglu_limit)
@@ -1613,7 +1636,7 @@ def _fused_moe_impl(
 
     def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe=False):
         metadata = get_2stage_cfgs(
-            get_padded_M(config_M),
+            _tuned_M(config_M),
             model_dim,
             inter_dim,
             E,
@@ -4721,6 +4744,17 @@ def get_2stage_cfgs(
         fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
         keys += fhmoe_keys
         keys_disabled += fhmoe_keys
+    # An extra tier (_EXTRA_M_TIERS) serves only shapes whose table has a row at
+    # it. Any other shape is looked up and configured at its power-of-two bucket,
+    # as if the tier were not listed.
+    if token in _EXTRA_M_TIERS and nextPow2(token) != token:
+        primary, fallback = active_cfg_2stages or ({}, {})
+        if primary.get(keys[:7] + (str(activation),) + keys[8:]) is None and (
+            config_file is not None or fallback.get(keys_disabled) is None
+        ):
+            token = nextPow2(token)
+            keys = keys[:2] + (token,) + keys[3:]
+            keys_disabled = keys_disabled[:2] + (token,) + keys_disabled[3:]
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -6271,7 +6305,7 @@ def fused_moe_2stages(
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        _tuned_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
