@@ -293,10 +293,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
      aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     bool kv_dma_layout,
      hipStream_t stream),
     (q_nope, q_rope, unified_kv_nope, unified_kv_rope, kv_indices_prefix, kv_indptr_prefix,
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
-     num_splits, partial_o, partial_max, partial_sum, stream))
+     num_splits, partial_o, partial_max, partial_sum, kv_dma_layout, stream))
 {
     // The head layout every a8w8 variant shares: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
@@ -374,6 +375,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const opus_mla_prefill_split_args split =
         opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
 
+#if !defined(OPUS_MLA_V4_DMA)
+    AITER_CHECK(!kv_dma_layout,
+                "kv_dma_layout=True requires module_mla_prefill_opus built with -DOPUS_MLA_V4_DMA=1");
+#endif
+
     if(N == 0)
         return;
 
@@ -413,49 +419,65 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     HipDeviceGuard guard(q_nope->device_id);
 
-    if(num_splits > 1)
-    {
-        const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs> split_kargs{kargs, split};
+    auto launch_v4_fp8 = [&](auto dma_tag) {
+        constexpr bool DMA = decltype(dma_tag)::value;
+        if(num_splits > 1)
+        {
+            const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs> split_kargs{kargs, split};
+            if(H <= 32)
+            {
+                using KTraits = opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<
+                    16, 64, 4, fp8_t, bf16_t, bf16_t, true, DMA>;
+                dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+                opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<KTraits>
+                    <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+            }
+            else
+            {
+                using KTraits = opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<
+                    16, 32, 8, fp8_t, bf16_t, bf16_t, true, DMA>;
+                dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+                opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<KTraits>
+                    <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+            }
+            HIP_CALL_LAUNCH(hipGetLastError());
+            opus_mla_prefill_split_reduce<__hip_bfloat16>(
+                split, kargs.attn_sink_ptr, out, N, H, stream);
+            return;
+        }
+
         if(H <= 32)
         {
-            using KTraits =
-                opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t, true>;
-            dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+            using KTraits = opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<
+                16, 64, 4, fp8_t, bf16_t, bf16_t, false, DMA>;
+            const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);
+            dim3 grid(N, num_h_blocks, 1);
+            dim3 block(KTraits::BLOCK_SIZE);
             opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<KTraits>
-                <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+                <<<grid, block, 0, stream>>>(kargs);
+            HIP_CALL_LAUNCH(hipGetLastError());
         }
         else
         {
-            using KTraits =
-                opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t, true>;
-            dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+            using KTraits = opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<
+                16, 32, 8, fp8_t, bf16_t, bf16_t, false, DMA>;
+            const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);
+            dim3 grid(N, num_h_blocks, 1);
+            dim3 block(KTraits::BLOCK_SIZE);
             opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<KTraits>
-                <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+                <<<grid, block, 0, stream>>>(kargs);
+            HIP_CALL_LAUNCH(hipGetLastError());
         }
-        HIP_CALL_LAUNCH(hipGetLastError());
-        opus_mla_prefill_split_reduce<__hip_bfloat16>(
-            split, kargs.attn_sink_ptr, out, N, H, stream);
-        return;
-    }
+    };
 
-#define LAUNCH_OPUS_MLA_V4_PREFILL_FP8(KERNEL, TRAITS, KV_TILE, NUM_WARPS)         \
-    do {                                                                          \
-        using KTraits = TRAITS<16, KV_TILE, NUM_WARPS, fp8_t, bf16_t, bf16_t>;    \
-        const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);\
-        dim3 grid(N, num_h_blocks, 1);                                            \
-        dim3 block(KTraits::BLOCK_SIZE);                                          \
-        KERNEL<KTraits><<<grid, block, 0, stream>>>(kargs);                       \
-        HIP_CALL_LAUNCH(hipGetLastError());                                       \
-    } while(0)
-
-    if(H <= 32)
-        LAUNCH_OPUS_MLA_V4_PREFILL_FP8(opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel,
-                                       opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits, 64, 4);
+#if defined(OPUS_MLA_V4_DMA)
+    if(kv_dma_layout)
+        launch_v4_fp8(std::true_type{});
     else
-        LAUNCH_OPUS_MLA_V4_PREFILL_FP8(opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel,
-                                       opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits, 32, 8);
-
-#undef LAUNCH_OPUS_MLA_V4_PREFILL_FP8
+        launch_v4_fp8(std::false_type{});
+#else
+    launch_v4_fp8(std::false_type{});
+#endif
 }
 
 // ============================================================================

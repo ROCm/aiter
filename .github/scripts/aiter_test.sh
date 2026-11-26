@@ -122,6 +122,12 @@ for file in "${sharded_files[@]}"; do
             # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_mla_sparse_prefill.py)
+            # Correctness and regression cases (including SWA, split-sink, CSR
+            # boundaries, and DMA layout checks) are pytest functions; the CLI
+            # entry point is a benchmark/sweep driver.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"

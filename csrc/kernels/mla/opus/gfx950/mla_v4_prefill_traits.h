@@ -165,13 +165,15 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
           typename D_OUT_   = bf16_t,
-          bool SPLIT_       = false>
+          bool SPLIT_       = false,
+          bool DMA_         = false>
 struct opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
+    static constexpr bool DMA         = DMA_;
     using kargs_type =
         std::conditional_t<SPLIT_,
                            opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
@@ -270,13 +272,15 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
           typename D_OUT_   = bf16_t,
-          bool SPLIT_       = false>
+          bool SPLIT_       = false,
+          bool DMA_         = false>
 struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
+    static constexpr bool DMA         = DMA_;
     using kargs_type =
         std::conditional_t<SPLIT_,
                            opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
@@ -329,32 +333,37 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     static constexpr int VEC_P    = 4;
     static constexpr int VEC_O    = 4;
 
-#if defined(OPUS_MLA_V4_FP8_PV) || defined(OPUS_MLA_V4_DMA)
+#if defined(OPUS_MLA_V4_FP8_PV)
     // V and P are staged in LDS as flat fp8 and P*V runs on the fp8 MFMA.
-    using D_V  = D_NOPE_;  // LDS V tile
-    using D_P  = D_NOPE_;  // cross-wave P exchange
-    using D_PV = D_NOPE_;  // P*V MFMA operands
-    // P <= 1 after the online-softmax max subtraction, so one constant exponent
-    // packs it into e4m3's range. Any gain up to 2^8 measures identical (a
-    // power-of-two scale only moves the underflow floor); 2^2 leaves headroom
-    // under the 448 limit should the running max ever be stale. Folded into
-    // the exp2 argument, so l_row carries it too and it cancels in O/l -- only
-    // the sink term has to be scaled to match.
-    static constexpr int P_PACK_LOG2 = 2;
+    using D_V_BASE  = D_NOPE_;  // LDS V tile
+    using D_P_BASE  = D_NOPE_;  // cross-wave P exchange
+    using D_PV_BASE = D_NOPE_;  // P*V MFMA operands
+    static constexpr int P_PACK_LOG2_BASE = 2;
 #elif defined(OPUS_MLA_V4_FP8_V_ONLY)
     // Isolation build: fp8 V tile read back with ds_read_b64_tr_b8, converted
     // to bf16 immediately after the read so P and the P*V MFMA stay exactly as
     // they are. Exercises the new transposed-read layout and nothing else.
-    using D_V  = D_NOPE_;
-    using D_P  = D_ROPE_;
-    using D_PV = D_ROPE_;
-    static constexpr int P_PACK_LOG2 = 0;
+    using D_V_BASE  = D_NOPE_;
+    using D_P_BASE  = D_ROPE_;
+    using D_PV_BASE = D_ROPE_;
+    static constexpr int P_PACK_LOG2_BASE = 0;
 #else
-    using D_V  = D_ROPE_;
-    using D_P  = D_ROPE_;
-    using D_PV = D_ROPE_;
-    static constexpr int P_PACK_LOG2 = 0;
+    using D_V_BASE  = D_ROPE_;
+    using D_P_BASE  = D_ROPE_;
+    using D_PV_BASE = D_ROPE_;
+    static constexpr int P_PACK_LOG2_BASE = 0;
 #endif
+    // When DMA is enabled, V and P are staged in LDS as flat fp8 and P*V runs
+    // on the fp8 MFMA. P <= 1 after the online-softmax max subtraction, so one
+    // constant exponent packs it into e4m3's range. Any gain up to 2^8 measures
+    // identical (a power-of-two scale only moves the underflow floor); 2^2
+    // leaves headroom under the 448 limit should the running max ever be stale.
+    // Folded into the exp2 argument, so l_row carries it too and it cancels in
+    // O/l -- only the sink term has to be scaled to match.
+    using D_V  = std::conditional_t<DMA_, D_NOPE_, D_V_BASE>;
+    using D_P  = std::conditional_t<DMA_, D_NOPE_, D_P_BASE>;
+    using D_PV = std::conditional_t<DMA_, D_NOPE_, D_PV_BASE>;
+    static constexpr int P_PACK_LOG2 = DMA_ ? 2 : P_PACK_LOG2_BASE;
     // DS_READ_B64_TR moves 8 bytes/lane whatever the element width, so an fp8
     // tile yields 8 elements per instruction instead of 4. LANE_LO_V halves to
     // keep make_layout_rv's grp_n = W_N / (LANE_LO_V * VEC_TR_V) equal to 1.
@@ -369,23 +378,21 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     static constexpr int SMEM_KV_PAD = 8;
     static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
 
-#if defined(OPUS_MLA_V4_DMA)
-    // DMA-staged tile. global_load_lds writes one wave-uniform, lane-contiguous
-    // 64 x 16 B = 1024 B block per instruction (M0 + lane*16), so the tile is a
-    // sequence of such chunks, each holding 8 rows x 128 B of one D slice, plus
-    // 32 B of padding so successive chunks start on different banks.
-    static constexpr int DMA_CHUNK_STRIDE = WARP_SIZE * 16 + 32;            // 1056
+    // DMA-staged tile geometry (used when DMA_ is true). global_load_lds writes
+    // one wave-uniform, lane-contiguous 64 x 16 B = 1024 B block per
+    // instruction (M0 + lane*16), so the tile is a sequence of such chunks,
+    // each holding 8 rows x 128 B of one D slice, plus 32 B of padding so
+    // successive chunks start on different banks.
+    static constexpr int DMA_CHUNK_STRIDE   = WARP_SIZE * 16 + 32;            // 1056
     static constexpr int DMA_ROWS_PER_CHUNK = 8;
-    static constexpr int DMA_D_SLICES = D_NOPE_PADDED_SIZE / 128;           // 4
-    static constexpr int DMA_HALVES = KV_TILE_SIZE / (DMA_ROWS_PER_CHUNK * NUM_WARPS); // 2
-    static constexpr int SMEM_KV_BYTES = DMA_HALVES * DMA_D_SLICES * NUM_WARPS * DMA_CHUNK_STRIDE;
+    static constexpr int DMA_D_SLICES       = D_NOPE_PADDED_SIZE / 128;       // 4
+    static constexpr int DMA_HALVES         = KV_TILE_SIZE / (DMA_ROWS_PER_CHUNK * NUM_WARPS); // 2
+    static constexpr int DMA_SMEM_KV_BYTES  = DMA_HALVES * DMA_D_SLICES * NUM_WARPS * DMA_CHUNK_STRIDE;
     // Tile n+1 streams into one buffer while tile n is read from the other.
     // 2 x 33 KB keeps two workgroups per CU inside 160 KB.
-    static constexpr int DMA_BUFFERS = 2;
-#else
-    static constexpr int SMEM_KV_BYTES = KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_V);
-    static constexpr int DMA_BUFFERS = 1;
-#endif
+    static constexpr int SMEM_KV_BYTES      = DMA_ ? DMA_SMEM_KV_BYTES
+                                                   : (KV_TILE_SIZE * SMEM_KV_ROW * static_cast<int>(sizeof(D_V)));
+    static constexpr int DMA_BUFFERS        = DMA_ ? 2 : 1;
 
     // Shared memory: kernel uses three static buffers (KV tiles, m/l, P).
     static constexpr size_t smem_size_bytes()

@@ -331,20 +331,23 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 
 template<class T, class V>
 __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx, int lane_id) {
-    using D_ROPE = typename T::D_ROPE;
-    
+    using D_PV = typename T::D_PV;
+
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
-    
+
     const int base = (lane_id / T::W_N) * T::VEC_TR_V;
     const int rel  = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - base;
 
+    // Each tr_load chunk spans (WARP_SIZE / W_N) * VEC_TR_V KV rows across
+    // the 4 lane groups: 16 rows for bf16 (VEC_TR_V=4), 32 for fp8 (VEC_TR_V=8).
+    constexpr int k_step    = (T::WARP_SIZE / T::W_N) * T::VEC_TR_V;
     constexpr int en_stride = opus::vector_traits<V>::size() / T::GEMM1_E_N;
     opus::static_for<en_stride>([&](auto ik) {
         constexpr int k   = ik.value;
-        constexpr int thr = (k / T::VEC_TR_V) * (T::W_K_ROPE / 2) + (k % T::VEC_TR_V);
+        constexpr int thr = (k / T::VEC_TR_V) * k_step + (k % T::VEC_TR_V);
         bool mask = thr > rel;
         opus::static_for<T::GEMM1_E_N>([&](auto e) {
-            v_v[e.value * en_stride + k] = mask ? static_cast<D_ROPE>(0) : v_v[e.value * en_stride + k];
+            v_v[e.value * en_stride + k] = mask ? static_cast<D_PV>(0) : v_v[e.value * en_stride + k];
         });
     });
 }
@@ -746,7 +749,7 @@ __device__ inline int dma_tile_offset(int t, int d) {
 
 // DMA-staged variant. Expects a cache re-based upstream to a unit per-D-block
 // scale with RoPE folded into slots [448, 512) of the NoPE row
-// (aiter/ops/triton/mla_v4_kv_rescale.py), so each NoPE row is the complete
+// (aiter/ops/triton/attention/mla_v4_kv_rescale.py), so each NoPE row is the complete
 // 512-wide fp8 row -- V for P*V, and K's NoPE for QK^T -- and one DMA stages all
 // of it without touching VGPRs. QK^T's RoPE stays bf16, from the RoPE source.
 // K keeps the logical rows make_layout_kv_indices assigns and V keeps the
@@ -973,12 +976,6 @@ __device__ void mla_v4_prefill_accum_dma(
 
 } // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
 
-#if defined(OPUS_MLA_V4_DMA)
-#define OPUS_MLA_V4_FP8_ACCUM mla_v4_prefill_accum_dma
-#else
-#define OPUS_MLA_V4_FP8_ACCUM mla_v4_prefill_accum_pipelined
-#endif
-
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type args) {
     const opus_mla_v4_prefill_fp8_kargs kargs = opus_mla_prefill_base(args);
@@ -1058,12 +1055,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
         }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        OPUS_MLA_V4_FP8_ACCUM<Traits>(
-            kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
-            page_idx_begin, valid_kv_len, num_kv_tiles,
-            smem_kv, smem_ml, smem_p,
-            v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-            temperature_scale);
+        if constexpr (T::DMA) {
+#if defined(OPUS_MLA_V4_DMA)
+            mla_v4_prefill_accum_dma<Traits>(
+                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
+                page_idx_begin, valid_kv_len, num_kv_tiles,
+                smem_kv, smem_ml, smem_p,
+                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+                temperature_scale);
+#endif
+        } else {
+            mla_v4_prefill_accum_pipelined<Traits>(
+                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
+                page_idx_begin, valid_kv_len, num_kv_tiles,
+                smem_kv, smem_ml, smem_p,
+                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+                temperature_scale);
+        }
     }
 
     __builtin_amdgcn_s_barrier();
@@ -1079,12 +1087,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
         }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        OPUS_MLA_V4_FP8_ACCUM<Traits>(
-            kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
-            page_idx_begin, valid_kv_len, num_kv_tiles,
-            smem_kv, smem_ml, smem_p,
-            v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-            temperature_scale);
+        if constexpr (T::DMA) {
+#if defined(OPUS_MLA_V4_DMA)
+            mla_v4_prefill_accum_dma<Traits>(
+                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
+                page_idx_begin, valid_kv_len, num_kv_tiles,
+                smem_kv, smem_ml, smem_p,
+                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+                temperature_scale);
+#endif
+        } else {
+            mla_v4_prefill_accum_pipelined<Traits>(
+                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
+                page_idx_begin, valid_kv_len, num_kv_tiles,
+                smem_kv, smem_ml, smem_p,
+                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+                temperature_scale);
+        }
     }
 
     if constexpr (T::SPLIT) {

@@ -236,7 +236,7 @@ def mla_sparse_prefill_fp8_asm(
 
 @functools.cache
 def fp8_kv_dma_layout_enabled(gfx: str) -> bool:
-    """Whether the fp8 kernel for ``gfx`` reads the DMA KV layout.
+    """Whether the fp8 kernel for ``gfx`` supports the opt-in DMA KV layout.
 
     Only the gfx950 kernel has the DMA path, and only when the module is built
     with ``-DOPUS_MLA_V4_DMA`` (its ``flags_extra_hip`` in optCompilerConfig.json),
@@ -464,14 +464,12 @@ def _opus_sparse_prefill_v4(
         )
     gfx = get_gfx_runtime()
     fwd = _opus_fwd(gfx, *kernels)
+    if kv_dma_layout and not fp8_kv_dma_layout_enabled(gfx):
+        raise RuntimeError(
+            f"kv_dma_layout=True requires gfx950 built with -DOPUS_MLA_V4_DMA, got {gfx}"
+        )
     if q_rope.dtype != torch.bfloat16:
         raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
-    if fp8_kv_dma_layout_enabled(gfx) and not kv_dma_layout:
-        from .triton.mla_v4_kv_rescale import to_dma_kv_layout
-
-        # Can be fused into SGLang's upstream KV quantization, which would then write this layout directly.
-        unified_kv_nope = to_dma_kv_layout(unified_kv_nope, unified_kv_rope)
-        kv_nope = to_dma_kv_layout(kv_nope, kv_rope)
     n, h, _ = q_nope.shape
     out = _out_bf16(n, h, q_nope.device, out)
     args = (
@@ -490,12 +488,17 @@ def _opus_sparse_prefill_v4(
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
     fit = _opus_split_fit(gfx, "v4_a8w8", h)
     num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
-    fwd(
-        *args,
-        out,
-        float(softmax_scale),
-        *_split_args(n, num_kv_splits, h, q_nope.device),
-    )
+    split_args = _split_args(n, num_kv_splits, h, q_nope.device)
+    if kv_dma_layout:
+        fwd(
+            *args,
+            out,
+            float(softmax_scale),
+            *(split_args or (1, None, None, None)),
+            True,
+        )
+    else:
+        fwd(*args, out, float(softmax_scale), *split_args)
     return out
 
 
@@ -711,15 +714,16 @@ def mla_sparse_prefill_v4(
     """MLA sparse prefill over the v4 layout: NoPE rows holding their own E8M0
     scales, plus bf16 RoPE. Supported NoPE dtypes: fp8.
 
-    Where :func:`fp8_kv_dma_layout_enabled` holds, the opus kernel reads the KV
-    caches in the DMA layout (one 512 B fp8 row per position: NoPE at scale 2^0,
-    fp8 RoPE in [448, 512)). Caches in the served layout are converted to it on
-    every call, into new tensors, by
-    :func:`aiter.ops.triton.mla_v4_kv_rescale.to_dma_kv_layout`; callers whose
-    caches are already in that layout pass ``kv_dma_layout=True`` to skip it.
-    QK^T takes its RoPE in bf16 from ``q_rope`` and ``unified_kv_rope`` /
-    ``kv_rope``, so those must hold the rows' real RoPE; the rows' fp8 RoPE feeds
-    only P*V.
+    By default (``kv_dma_layout=False``), the opus kernel consumes the served
+    MXFP8 layout directly and preserves arbitrary E8M0 scales. Where
+    :func:`fp8_kv_dma_layout_enabled` holds, callers whose KV caches are already
+    in the bounded unit-scale DMA layout (one 512 B fp8 row per position: NoPE
+    at scale 2^0 in ``[0, 448)``, fp8 RoPE in ``[448, 512)``, as emitted by
+    :func:`aiter.ops.triton.attention.mla_v4_kv_rescale.to_dma_kv_layout` or an
+    upstream KV writer for values within ``[-448, 448]``) can opt in via
+    ``kv_dma_layout=True``. QK^T takes its RoPE in bf16 from ``q_rope`` and
+    ``unified_kv_rope`` / ``kv_rope``, so those must hold the rows' real RoPE;
+    the rows' fp8 RoPE feeds only P*V.
 
     Args:
       q_nope:            ``[T, H, 512]`` NoPE (fp8: 448 values, 14 E8M0 scales, pad).
@@ -740,8 +744,10 @@ def mla_sparse_prefill_v4(
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
       backend:           ``"asm"``, ``"opus"`` or ``None``.
-      kv_dma_layout:     the KV caches are already in the DMA layout; ignored
-        where the kernel reads the served layout.
+      kv_dma_layout:     opt-in flag indicating the KV caches are in the
+        unit-scale DMA layout (values bounded to e4m3 range ``[-448, 448]``).
+        Raises RuntimeError when the selected backend or build does not support
+        the DMA path.
 
     Returns:
       ``out``.
@@ -764,11 +770,14 @@ def mla_sparse_prefill_v4(
     )
     unsplit = num_kv_splits in (None, 1)
     if backend == "asm":
+        if kv_dma_layout:
+            raise RuntimeError("the asm backend does not support kv_dma_layout=True")
         if not unsplit:
             raise RuntimeError("the asm backend has no split-K")
         return _asm_sparse_prefill_v4(*args)
     if (
         backend is None
+        and not kv_dma_layout
         and unsplit
         and attn_sink is not None
         and get_gfx_runtime() == "gfx1250"

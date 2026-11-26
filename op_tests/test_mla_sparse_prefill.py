@@ -29,9 +29,9 @@ Both are gfx1250-only here and drop out of the sweep elsewhere.
 
 ``a16w16`` (``v4_fp8``) is the path served today: the fp8 inputs dequantized to
 bf16 (not timed) and run through ``mla_sparse_prefill``. The fp8 ``opus`` output
-is also checked against it directly. On gfx950 the fp8 ``opus`` path converts the
-KV caches to the DMA layout on every call; ``opus_dma`` runs the same kernel on
-caches converted once up front (the kernel alone), and ``run_kv_dma_layout``
+is also checked against it directly. On gfx950, ``opus`` runs the served-layout
+scaled-cache kernel directly, while ``opus_dma`` runs the opt-in DMA kernel on
+caches converted up front (``kv_dma_layout=True``), and ``run_kv_dma_layout``
 checks that conversion on its own.
 
 ``--mode`` picks the page table: ``topk`` (above), or the DeepSeek-V4.1-Flash
@@ -76,7 +76,7 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
-from aiter.ops.triton.mla_v4_kv_rescale import to_dma_kv_layout
+from aiter.ops.triton.attention.mla_v4_kv_rescale import to_dma_kv_layout
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -811,8 +811,8 @@ def run_mla_sparse_prefill(
                 )
             )
         if "opus_dma" in wanted and fp8_kv_dma_layout_enabled(_get_gpu_arch()):
-            # The kernel alone: caches converted once up front, as a KV writer
-            # emitting the DMA layout would leave them. ``opus`` converts per call.
+            # The opt-in DMA path: caches converted once up front, as a KV writer
+            # emitting the DMA layout would leave them. ``opus`` reads the served layout.
             dma_inputs = dict(
                 kernel_inputs,
                 unified_kv_nope=to_dma_kv_layout(
@@ -1105,17 +1105,29 @@ def test_kv_dma_layout(rows):
 
 # A heavy sink against 8 keys per token makes the sink's weight visible: split-K's
 # partial sums must be on the scale the reduce folds the sink against.
-def test_mla_sparse_prefill_v4_split_sink():
+@pytest.mark.parametrize("kv_dma_layout", [False, True], ids=["served", "dma"])
+def test_mla_sparse_prefill_v4_split_sink(kv_dma_layout):
     if _skip_if_unsupported(d=512):
         return
+    if kv_dma_layout and not fp8_kv_dma_layout_enabled(_get_gpu_arch()):
+        pytest.skip("kv_dma_layout=True requires gfx950 with -DOPUS_MLA_V4_DMA")
     data = _make_inputs_fp8(64, 16, 4096, 64, topk=8, seed=1)
     kernel = dict(
         data["kernel"], attn_sink=torch.full_like(data["kernel"]["attn_sink"], 3.0)
     )
+    if kv_dma_layout:
+        kernel["unified_kv_nope"] = to_dma_kv_layout(
+            kernel["unified_kv_nope"], kernel["unified_kv_rope"]
+        )
+        kernel["kv_nope"] = to_dma_kv_layout(kernel["kv_nope"], kernel["kv_rope"])
     scale = 512**-0.5
     whole, split = (
         mla_sparse_prefill_v4(
-            **kernel, softmax_scale=scale, num_kv_splits=s, backend="opus"
+            **kernel,
+            softmax_scale=scale,
+            num_kv_splits=s,
+            backend="opus",
+            kv_dma_layout=kv_dma_layout,
         )
         for s in (1, 4)
     )
@@ -1125,9 +1137,183 @@ def test_mla_sparse_prefill_v4_split_sink():
         rtol=_RTOL,
         atol=_ATOL,
         tol_err_ratio=_ERR_TOL,
-        msg="v4 split-K vs unsplit, heavy sink",
+        msg=f"v4 split-K vs unsplit, heavy sink (kv_dma_layout={kv_dma_layout})",
     )
     assert err <= _ERR_TOL, f"split-K differs from unsplit on {err:.3%} of values"
+
+
+# Default served-layout path must preserve scaled KV values beyond e4m3's +-448
+# unit-scale ceiling (e.g., payload 448 with E8M0 byte 128 -> 896.0).
+def test_mla_sparse_prefill_v4_preserves_scaled_kv():
+    if _skip_if_unsupported(d=512):
+        return
+    device = torch.device("cuda")
+    n, h = 1, 16
+    q_nope = torch.zeros(
+        (n, h, _FP8_D_NOPE_PADDED), dtype=torch.float8_e4m3fn, device=device
+    )
+    q_nope.view(torch.uint8)[..., _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = 127
+    q_rope = torch.zeros((n, h, _FP8_D_ROPE), dtype=torch.bfloat16, device=device)
+
+    ukv_nope = torch.zeros(
+        (1, _FP8_D_NOPE_PADDED), dtype=torch.float8_e4m3fn, device=device
+    )
+    ukv_nope[:, :_FP8_D_NOPE] = 448.0
+    ukv_nope.view(torch.uint8)[:, _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = 128
+    ukv_rope = torch.zeros((1, _FP8_D_ROPE), dtype=torch.bfloat16, device=device)
+
+    kv_nope = torch.zeros(
+        (0, _FP8_D_NOPE_PADDED), dtype=torch.float8_e4m3fn, device=device
+    )
+    kv_rope = torch.zeros((0, _FP8_D_ROPE), dtype=torch.bfloat16, device=device)
+    ip_p = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    ix_p = torch.tensor([0], dtype=torch.int32, device=device)
+    ip_e = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    ix_e = torch.empty((0,), dtype=torch.int32, device=device)
+
+    out = mla_sparse_prefill_v4(
+        q_nope,
+        q_rope,
+        ukv_nope,
+        ukv_rope,
+        ix_p,
+        ip_p,
+        kv_nope,
+        kv_rope,
+        ix_e,
+        ip_e,
+        None,
+        1.0 / math.sqrt(512),
+        backend="opus",
+    )
+    expected = torch.zeros((n, h, _FP8_D_HEAD), dtype=torch.bfloat16, device=device)
+    expected[..., :_FP8_D_NOPE] = 896.0
+    assert torch.isfinite(out).all()
+    err = checkAllclose(out, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=0.0)
+    assert err == 0.0, (
+        f"scaled KV values clipped/mismatched ({err:.3%}): max={out.max().item()}"
+    )
+
+
+# Partial DMA tile (< 64 keys) with an unreferenced fallback row 0 poisoned with
+# NaN (0xFF): the FP8 value mask must zero out-of-bounds slots at the 32-row step.
+def test_mla_sparse_prefill_v4_dma_partial_tile_poisoned_row():
+    if _skip_if_unsupported(d=512):
+        return
+    if not fp8_kv_dma_layout_enabled(_get_gpu_arch()):
+        pytest.skip("kv_dma_layout=True requires gfx950 with -DOPUS_MLA_V4_DMA")
+    device = torch.device("cuda")
+    valid_kv_len = 20
+    total_pages = valid_kv_len + 1
+    data = _make_inputs_fp8(1, 16, total_pages, 0, topk=valid_kv_len, seed=7)
+    kernel = dict(data["kernel"])
+    ref = dict(data["ref"])
+
+    # Reference rows 1..20 so fallback row 0 is strictly unused.
+    ix_p = torch.arange(1, valid_kv_len + 1, dtype=torch.int32, device=device)
+    ip_p = torch.tensor([0, valid_kv_len], dtype=torch.int32, device=device)
+    kernel["kv_indices_prefix"] = ix_p
+    kernel["kv_indptr_prefix"] = ip_p
+    ref["kv_indices_prefix"] = ix_p
+    ref["kv_indptr_prefix"] = ip_p
+
+    # Re-generate clean rows 1..20, convert to DMA layout, then poison row 0 directly.
+    gen = make_generator(7, device=device)
+    ukn_clean, udeq = _quantize_nope(
+        fill(
+            (total_pages, _FP8_D_NOPE),
+            "norm",
+            gen,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.5
+    )
+    ukr_clean = (
+        fill(
+            (total_pages, _FP8_D_ROPE),
+            "norm",
+            gen,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.5
+    ).to(torch.bfloat16)
+    ref["ukv_fp32"] = torch.cat([udeq, ukr_clean.to(torch.float32)], dim=1)
+
+    dma_ukn = to_dma_kv_layout(ukn_clean, ukr_clean)
+    dma_ukn.view(torch.uint8)[0] = 0xFF  # e4m3 NaN in fallback row 0
+    ukr_poisoned = ukr_clean.clone()
+    ukr_poisoned[0] = math.nan
+    kernel["unified_kv_nope"] = dma_ukn
+    kernel["unified_kv_rope"] = ukr_poisoned
+    kernel["kv_nope"] = to_dma_kv_layout(kernel["kv_nope"], kernel["kv_rope"])
+
+    scale = 1.0 / math.sqrt(512)
+    expected = _ref_mla_sparse_prefill_fp8(**ref, softmax_scale=scale)
+    actual = mla_sparse_prefill_v4(
+        **kernel,
+        softmax_scale=scale,
+        num_kv_splits=1,
+        backend="opus",
+        kv_dma_layout=True,
+    )
+    assert torch.isfinite(actual).all(), "poisoned unused row leaked NaN into output"
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL, (
+        f"partial DMA tile mismatch ratio {err:.3%} exceeds {_ERR_TOL:.1%}"
+    )
+
+
+def test_mla_sparse_prefill_v4_rejects_unavailable_dma(monkeypatch):
+    import aiter.ops.mla_sparse_prefill as msp
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
+
+    q_nope = torch.empty((1, 128, _FP8_D_NOPE_PADDED), dtype=dtypes.fp8)
+    q_rope = torch.empty((1, 128, _FP8_D_ROPE), dtype=torch.bfloat16)
+    kv_nope = torch.empty((1, _FP8_D_NOPE_PADDED), dtype=dtypes.fp8)
+    kv_rope = torch.empty((1, _FP8_D_ROPE), dtype=torch.bfloat16)
+    idx = torch.zeros((1,), dtype=torch.int32)
+    indptr = torch.tensor([0, 1], dtype=torch.int32)
+    sink = torch.zeros((128,), dtype=torch.float32)
+    args = (
+        q_nope,
+        q_rope,
+        kv_nope,
+        kv_rope,
+        idx,
+        indptr,
+        kv_nope,
+        kv_rope,
+        idx,
+        indptr,
+        sink,
+        1.0 / math.sqrt(512),
+    )
+
+    # ASM never supports DMA layout.
+    with pytest.raises(RuntimeError, match="kv_dma_layout"):
+        mla_sparse_prefill_v4(*args, backend="asm", kv_dma_layout=True)
+
+    # gfx1250 has no DMA path: auto (H=128), explicit opus, and shim must reject.
+    monkeypatch.setattr(msp, "get_gfx_runtime", lambda: "gfx1250")
+    for fn, kwargs in (
+        (mla_sparse_prefill_v4, {"backend": None, "kv_dma_layout": True}),
+        (mla_sparse_prefill_v4, {"backend": "opus", "kv_dma_layout": True}),
+        (pa_sparse_prefill_fp8_opus, {"kv_dma_layout": True}),
+    ):
+        with pytest.raises(RuntimeError, match="kv_dma_layout"):
+            fn(*args, **kwargs)
+
+    # gfx950 built without -DOPUS_MLA_V4_DMA must also reject.
+    monkeypatch.setattr(msp, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(msp, "fp8_kv_dma_layout_enabled", lambda _gfx: False)
+    with pytest.raises(RuntimeError, match="kv_dma_layout"):
+        mla_sparse_prefill_v4(*args, backend="opus", kv_dma_layout=True)
+    with pytest.raises(RuntimeError, match="kv_dma_layout"):
+        pa_sparse_prefill_fp8_opus(*args, kv_dma_layout=True)
 
 
 # Cover the unsplit cases not exercised by the common BF16/FP8 matrix.

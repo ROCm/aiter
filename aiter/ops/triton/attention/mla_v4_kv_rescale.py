@@ -23,80 +23,26 @@ holding the same values in every row, so the consuming kernel's scale load does
 not move.
 
 :func:`to_dma_kv_layout` does the unit-scale re-base and the RoPE fold in one
-out-of-place pass; it is what ``pa_sparse_prefill_fp8_opus`` runs. All of this is
-a placeholder for the KV cache writer emitting the layout directly.
+out-of-place pass for callers opting into ``kv_dma_layout=True`` in
+``mla_sparse_prefill_v4`` / ``pa_sparse_prefill_fp8_opus``. All of this is a
+placeholder for the KV cache writer emitting the layout directly.
 """
 
 import torch
 import triton
-import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.attention.mla_v4_kv_rescale import (
+    _blockwise_amax_kernel,
+    _fold_rope_kernel,
+    _rebase_kernel,
+    _to_dma_layout_kernel,
+)
 
 _D_NOPE = 448
 _D_PADDED = 512
 _BLK = 32
 _NBLK = _D_NOPE // _BLK  # 14
 _FP8_MAX = 448.0
-
-
-@triton.jit
-def _blockwise_amax_kernel(
-    data_ptr,
-    byte_ptr,
-    amax_ptr,
-    n_rows,
-    stride_row,
-    BLOCK_ROWS: tl.constexpr,
-    NBLK: tl.constexpr,
-    BLK: tl.constexpr,
-    D_NOPE: tl.constexpr,
-):
-    """Per-D-block max of |dequantized value| over every row."""
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    row_ok = rows < n_rows
-
-    for b in tl.range(0, NBLK):
-        cols = b * BLK + tl.arange(0, BLK)
-        off = rows[:, None] * stride_row + cols[None, :]
-        q = tl.load(data_ptr + off, mask=row_ok[:, None], other=0.0).to(tl.float32)
-        # The E8M0 bytes share storage with the fp8 payload, so they have to be
-        # read through a uint8 view -- an fp8 load would decode them as floats.
-        e = tl.load(byte_ptr + rows * stride_row + D_NOPE + b, mask=row_ok, other=0)
-        scale = tl.exp2(e.to(tl.float32) - 127.0)
-        tl.atomic_max(amax_ptr + b, tl.max(tl.abs(q * scale[:, None])))
-
-
-@triton.jit
-def _rebase_kernel(
-    data_ptr,
-    byte_ptr,
-    exp_ptr,
-    n_rows,
-    stride_row,
-    BLOCK_ROWS: tl.constexpr,
-    NBLK: tl.constexpr,
-    BLK: tl.constexpr,
-    D_NOPE: tl.constexpr,
-):
-    """Requantize each row onto the shared per-D-block exponents."""
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    row_ok = rows < n_rows
-
-    for b in tl.range(0, NBLK):
-        cols = b * BLK + tl.arange(0, BLK)
-        off = rows[:, None] * stride_row + cols[None, :]
-        q = tl.load(data_ptr + off, mask=row_ok[:, None], other=0.0).to(tl.float32)
-        e_old = tl.load(byte_ptr + rows * stride_row + D_NOPE + b, mask=row_ok, other=0)
-        e_new = tl.load(exp_ptr + b)
-        # Both scales are powers of two, so re-basing is an exponent difference.
-        ratio = tl.exp2(e_old.to(tl.float32) - e_new.to(tl.float32))
-        tl.store(
-            data_ptr + off, (q * ratio[:, None]).to(tl.float8e4nv), mask=row_ok[:, None]
-        )
-        # The trailer is not rewritten here: warps of this program read a row's
-        # old exponent on their own schedule, so writing it in the same pass
-        # races. The caller writes the new exponents afterwards.
 
 
 def rebase_kv_nope_to_dblock_scale(
@@ -165,33 +111,6 @@ def rebase_kv_nope_to_dblock_scale(
     return exps
 
 
-@triton.jit
-def _fold_rope_kernel(
-    data_ptr,
-    rope_ptr,
-    n_rows,
-    stride_row,
-    stride_rope,
-    BLOCK_ROWS: tl.constexpr,
-    D_NOPE: tl.constexpr,
-    D_ROPE: tl.constexpr,
-):
-    """Quantize the bf16 RoPE tail to fp8 and park it in slots [448, 512)."""
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    row_ok = rows < n_rows
-    cols = tl.arange(0, D_ROPE)
-    r = tl.load(
-        rope_ptr + rows[:, None] * stride_rope + cols[None, :],
-        mask=row_ok[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(
-        data_ptr + rows[:, None] * stride_row + D_NOPE + cols[None, :],
-        r.to(tl.float8e4nv),
-        mask=row_ok[:, None],
-    )
-
 
 def fold_rope_into_nope(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> None:
     """Pack the fp8 RoPE tail into the NoPE row's trailing slots, in place.
@@ -218,55 +137,6 @@ def fold_rope_into_nope(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> None:
         BLOCK_ROWS=64,
         D_NOPE=_D_NOPE,
         D_ROPE=64,
-    )
-
-
-@triton.jit
-def _to_dma_layout_kernel(
-    src_ptr,
-    src_byte_ptr,
-    rope_ptr,
-    dst_ptr,
-    n_rows,
-    stride_src,
-    stride_rope,
-    BLOCK_ROWS: tl.constexpr,
-    NBLK: tl.constexpr,
-    BLK: tl.constexpr,
-    D_NOPE: tl.constexpr,
-    D_PADDED: tl.constexpr,
-    D_ROPE: tl.constexpr,
-):
-    """Re-base each row to unit scale and fold its fp8 RoPE, into a new tensor."""
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    row_ok = rows < n_rows
-    for b in tl.range(0, NBLK):
-        cols = b * BLK + tl.arange(0, BLK)
-        q = tl.load(
-            src_ptr + rows[:, None] * stride_src + cols[None, :],
-            mask=row_ok[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        e = tl.load(
-            src_byte_ptr + rows * stride_src + D_NOPE + b, mask=row_ok, other=127
-        )
-        v = q * tl.exp2(e.to(tl.float32) - 127.0)[:, None]
-        tl.store(
-            dst_ptr + rows[:, None] * D_PADDED + cols[None, :],
-            tl.clamp(v, -448.0, 448.0).to(tl.float8e4nv),
-            mask=row_ok[:, None],
-        )
-    rc = tl.arange(0, D_ROPE)
-    r = tl.load(
-        rope_ptr + rows[:, None] * stride_rope + rc[None, :],
-        mask=row_ok[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(
-        dst_ptr + rows[:, None] * D_PADDED + D_NOPE + rc[None, :],
-        tl.clamp(r, -448.0, 448.0).to(tl.float8e4nv),
-        mask=row_ok[:, None],
     )
 
 
