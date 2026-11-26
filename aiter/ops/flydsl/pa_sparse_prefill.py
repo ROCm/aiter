@@ -5,9 +5,8 @@
 
 The prefill counterpart of ``pa_decode``'s NVFP4 wave tile for MiniMax-M3.1's
 block-sparse attention (16 query heads per KV head, head_dim 128, 128-token
-NVFP4 pages, top-16 pages a token): a CTA takes ``tile_rows`` consecutive tokens
-and walks the union of their selected pages once. See
-``kernels.pa_sparse_prefill_nvfp4``.
+NVFP4 pages, top-16 pages a token): a CTA takes two consecutive tokens and walks
+the union of their selected pages once. See ``kernels.pa_sparse_prefill_nvfp4``.
 """
 
 import flydsl.compiler as flyc
@@ -21,13 +20,8 @@ from .kernels.pa_sparse_prefill_nvfp4 import (
     GROUP,
     HEAD_DIM,
     PAGE,
-    TILE_ROWS,
     TOPK,
     compile_pa_sparse_prefill_nvfp4,
-)
-from .kernels.pa_sparse_prefill_nvfp4_v2 import (
-    TILE_ROWS as TILE_ROWS_V2,
-    compile_pa_sparse_prefill_nvfp4_v2,
 )
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
@@ -59,17 +53,9 @@ def pa_sparse_prefill_nvfp4(
     softmax_scale: float,
     *,
     kv_heads: int = 1,
-    tile_rows: int = 4,
-    nvfp4_buffers: int = 3,
-    q_regs: bool = False,
-    row_group: int = 1,
-    skip_rescale: bool = False,
-    fma_exp: bool = False,
     quantized_output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     quantized_pad_rows: int = 0,
-    impl: str = "v1",
-    v2: dict | None = None,
 ) -> None:
     """Sparse prefill attention of every sequence over its compacted page table.
 
@@ -77,7 +63,7 @@ def pa_sparse_prefill_nvfp4(
     ``nvfp4_page_table`` or the selector's emission): row ``s`` lists its pages,
     full pages first and the partially visible tail page last, and attends
     ``context[s]`` tokens of them. Rows ``row * kv_heads + h`` for consecutive
-    ``row`` share a CTA (``tile_rows`` of them), so ``kv_heads`` must be the
+    ``row`` share a CTA (two of them), so ``kv_heads`` must be the
     number of KV heads interleaved in the flattened rows. A row of length 0
     stores zeros. Equal to ``pa_decode`` to rounding (each row's pages are
     accumulated in the tile's union order). Page ids outside the cache select
@@ -89,8 +75,6 @@ def pa_sparse_prefill_nvfp4(
     group-32 quant of the BF16 rows; the padded rows get FP8 zeros and unit
     scales. One KV head.
     """
-    if tile_rows not in (TILE_ROWS_V2 if impl == "v2" else TILE_ROWS):
-        raise ValueError(f"tile_rows {tile_rows} is not served by impl {impl}")
     seqs = query.shape[0]
     dev = query.device
     if query.shape[1:] != (GROUP, HEAD_DIM) or query.dtype != torch.bfloat16:
@@ -166,25 +150,9 @@ def pa_sparse_prefill_nvfp4(
             )
     if seqs == 0 and quant_rows == 0:
         return
-    if impl == "v2":
-        compiled = compile_pa_sparse_prefill_nvfp4_v2(
-            tile_rows=tile_rows,
-            softmax_scale=softmax_scale,
-            nvfp4_buffers=nvfp4_buffers,
-            quant_mx=quant,
-            **(v2 or {}),
-        )
-    else:
-        compiled = compile_pa_sparse_prefill_nvfp4(
-            tile_rows=tile_rows,
-            softmax_scale=softmax_scale,
-            nvfp4_buffers=nvfp4_buffers,
-            q_regs=q_regs,
-            row_group=row_group,
-            skip_rescale=skip_rescale,
-            fma_exp=fma_exp,
-            quant_mx=quant,
-        )
+    compiled = compile_pa_sparse_prefill_nvfp4(
+        softmax_scale=softmax_scale, quant_mx=quant
+    )
     _run_compiled(
         compiled["launch"],
         ptr_arg(query, fx.BFloat16),

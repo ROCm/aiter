@@ -3,33 +3,27 @@
 
 """gfx1250 NVFP4 sparse-prefill attention that reuses K/V across query tokens.
 
-MiniMax-M3.1 sparse attention prefill: 16 query heads per KV head, head_dim 128,
+MiniMax-M3.1 block-sparse attention: 16 query heads per KV head, head_dim 128,
 NVFP4 K/V pages of 128 tokens, 16 selected pages a token. ``pa_decode``'s NVFP4
-wave tile serves every prefill token as its own length-1 sequence, so every
-token gathers its own 16 pages (18 KB each) and widens its own V: at the 14K-token
-prefill that is 4.2 GB a layer of L2 traffic and 229K page dequantizations.
+wave tile serves every prefill token as its own sequence and gathers its own 16
+pages. Here a CTA takes two consecutive rows (tokens) of one KV head, merges
+their compacted page tables into a union of distinct pages in LDS (with each
+(page, row) in-page bound: 128 for a full page, the tail's visible count, 0 when
+the row did not select it) and walks the union once:
 
-Here one CTA takes ``TQ`` consecutive rows (tokens) of one KV head. Its rows'
-compacted page tables (the selector's emission: full pages in selection order,
-the partial tail page last, ``context`` the rows' compacted lengths) are merged
-into a union of distinct pages in LDS, together with each (union page, row) in-page
-bound (128 for a full page, the tail's visible count, 0 when the row did not select
-the page). The page loop then walks the union once:
+* wave w DMAs tokens [32 w, 32 w + 32) of the page (K, V payload and scale rows)
+  into a wave-private ring three pages deep, as the decode wave tile does;
+* the rows run in one basic block when both selected the page ``[QK a, QK b,
+  maxima] | rare rebase branches | [V dequant, P, PV a, PV b]`` and alone when
+  one did. V is dequantized and transposed by the 32x16x128 e2m1 WMMA against a
+  selector; the rows' query terms sit in VGPRs.
 
-* each wave DMAs its 32 tokens of the page (K, V payload and scale rows) into a
-  wave-private ring, exactly as the decode wave tile does; tokens at or past the
-  largest bound of the page arrive zero-filled;
-* V is dequantized and transposed once per page (the scaled WMMA against the
-  1.0 selector), K's raw e2m1 rows feed QK straight from LDS;
-* every row that selected the page (a wave-uniform branch: rows that did not
-  keep their state bitwise) runs the decode tile's per-page arithmetic: QK with
-  its query split into FP8 terms, the in-page causal bound as the -inf start
-  value of the QK accumulator, online softmax, BF16 PV.
-
-After the loop the four waves merge each row through LDS and store the BF16
-rows. A row's pages are accumulated in the union's order (first occurrence over
-the tile's rows), not in its own table order, so the result matches the decode
-tile to rounding (online softmax order), not bit for bit.
+After the walk the four waves merge each row through LDS and store BF16 rows (or
+o_proj's MXFP8 input). Numerics as the decode tile: QK in FP32 over the exact
+NVFP4 K and the BF16 query split into two FP8 terms, BF16 P and V operands of PV,
+FP32 accumulation, the running maximum as softmax reference. A row accumulates
+its pages in the union's order, so the result equals the decode tile's to
+rounding, not bit for bit.
 
 Inputs follow ATOM's flattened view (``sparse_attn_nvfp4._flydsl_attention``):
 sequence ``s = row * kv_heads + kv_head`` has query ``[s, 16, 128]``, table row
@@ -44,8 +38,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp, T
 
 from .pa_decode.op_gemm import Gfx1250Gemm
-from .pa_decode.op_mxfp8 import E8M0_ONE, MxFp8Groups
 from .pa_decode.op_lds import Gfx1250Memory, _gptr
+from .pa_decode.op_mxfp8 import E8M0_ONE, MxFp8Groups
 from .pa_decode.pipeline_nvfp4 import (
     _E4M3_ONE,
     _MERGE_OUT,
@@ -57,6 +51,7 @@ from .pa_decode.pipeline_nvfp4 import (
     _SROW,
     _TOKENS,
     WAVE_SLOT_BYTES,
+    _attr,
     _e8m0_pow2,
     _f32_bits,
     _pow2,
@@ -72,11 +67,15 @@ GROUP = 16  # query heads per KV head: the WMMA's 16 rows
 HEAD_DIM = 128
 PAGE = 128
 TOPK = 16
-# Query rows a CTA: the union build gives one (row, slot) entry to a thread.
-TILE_ROWS = (2, 3, 4, 6, 8)
-# Query split of a BF16 query (pipeline_nvfp4._query): two FP8 terms.
-QUERY_TERMS = 2
+TQ = 2  # rows a CTA
+RING = 3  # pages in flight a wave
+WAVES_PER_EU = 3
+QUERY_TERMS = 2  # the BF16 query split into FP8 terms (pipeline_nvfp4._query)
 Q_LANE_BYTES = 80
+ENTRIES = TQ * TOPK  # (row, slot) entries of the union build, one a thread
+BOUND_STRIDE = 4  # bytes of a union page's row bounds: whole dwords
+
+_CACHE = {}
 
 
 class _Lds(Gfx1250Memory):
@@ -86,115 +85,66 @@ class _Lds(Gfx1250Memory):
     class _T:
         kv_dtype = fx.BFloat16
 
-    def __init__(self, base):  # noqa: D107 -- no PaDecodeContext here
+    def __init__(self, base):
         self.base = base
         self.t = self._T
 
 
-def _bound_stride(tq):
-    """Bytes of one union page's (row) bound row: whole dwords."""
-    return (tq + 3) // 4 * 4
-
-
-def _layout(tq, nb):
+def _layout():
     """Byte offsets of the CTA's LDS regions."""
-    ring = nb * NWARP * WAVE_SLOT_BYTES
+    ring = RING * NWARP * WAVE_SLOT_BYTES
     merge = NWARP * (_MERGE_OUT + 16 * 8)
-    entries = tq * TOPK
     keys = max(ring, merge)
-    uidx = keys + 4 * entries
-    upage = uidx + 4 * entries
-    ubound = upage + 4 * entries
-    counts = ubound + (entries * _bound_stride(tq) + 15) // 16 * 16
+    uidx = keys + 4 * ENTRIES
+    upage = uidx + 4 * ENTRIES
+    ubound = upage + 4 * ENTRIES
+    counts = ubound + (ENTRIES * BOUND_STRIDE + 15) // 16 * 16
     # Per (row, term, lane): the FP8 query operand (16 dwords) and its i64 block
     # scales (2 dwords), padded to 80 B so the operand reads stay 16 B aligned.
     qterms = counts + 16
-    total = qterms + tq * QUERY_TERMS * WAVE * Q_LANE_BYTES
-    return dict(
-        ring=ring,
-        merge=merge,
-        keys=keys,
-        uidx=uidx,
-        upage=upage,
-        ubound=ubound,
-        counts=counts,
-        qterms=qterms,
-        total=(total + 15) // 16 * 16,
+    total = qterms + TQ * QUERY_TERMS * WAVE * Q_LANE_BYTES
+    return {
+        "keys": keys,
+        "uidx": uidx,
+        "upage": upage,
+        "ubound": ubound,
+        "counts": counts,
+        "qterms": qterms,
+        "total": (total + 15) // 16 * 16,
+    }
+
+
+def _wmma_scale16_32x16(a, b, scale_a, scale_b):
+    """32x16x128 e2m1 x e2m1 WMMA, E4M3 scales per 16 (raw ROCDL: no FlyDSL atom
+    takes E4M3 block scales)."""
+    return fx.Vector(
+        fx.rocdl.wmma_scale16_f32_32x16x128_f4(
+            fx.Vector.make_type(16, fx.Float32),
+            fx.as_ir_value(a),
+            fx.as_ir_value(b),
+            fx.as_ir_value(fx.Vector.filled(16, 0.0, fx.Float32)),
+            fx.as_ir_value(scale_a),
+            fx.as_ir_value(scale_b),
+            modC=_attr("#rocdl<wmma_c_modifier none>"),
+            scaleAType=_attr("#rocdl<wmma_matrix_scale row0>"),
+            fmtScaleA=_attr("#rocdl<wmma_matrix_scale_format e4m3>"),
+            scaleBType=_attr("#rocdl<wmma_matrix_scale row0>"),
+            fmtScaleB=_attr("#rocdl<wmma_matrix_scale_format e4m3>"),
+            reuseA=False,
+            reuseB=False,
+        ).result
     )
 
 
-_CACHE = {}
-
-
-def kernel_name(
-    tq, nb, q_regs, row_group, skip_rescale=False, fma_exp=False, quant_mx=False
-):
-    name = f"pa_sparse_prefill_nvfp4_qbf16_d128_bs128_gqa16_top16_tq{tq}"
-    if quant_mx:
-        name += "_mxfp8only"
-    if skip_rescale:
-        name += "_sr"
-    if fma_exp:
-        name += "_fe"
-    if nb != 3:
-        name += f"_ring{nb}"
-    if not q_regs:
-        name += "_qlds"
-    if row_group != 1:
-        name += f"_rg{row_group}"
-    return name
-
-
-def compile_pa_sparse_prefill_nvfp4(
-    *,
-    tile_rows=4,
-    softmax_scale,
-    nvfp4_buffers=3,
-    q_regs=True,
-    row_group=1,
-    skip_rescale=False,
-    fma_exp=False,
-    quant_mx=False,
-):
-    """Compile (cached) the reuse kernel for ``tile_rows`` query rows a CTA.
-
-    ``q_regs``: every row's query terms stay in VGPRs through the page loop
-    (else each row's are reread from LDS for every page it selected: fewer
-    VGPRs, 4.6 KB of LDS reads a wave per (row, page)). ``row_group`` R: rows run
-    in groups of R behind one wave-uniform branch (taken when any row of the
-    group selected the page); inside a group every row runs, a row that did not
-    select the page against an all -inf bias, which leaves its state bitwise
-    unchanged, so the grouping changes speed only, never the result.
-    ``skip_rescale``: skip the accumulator rescale when no row maximum of the
-    wave grew (bitwise alike). ``fma_exp``: P = exp2(fma(s, c, -m)) without the
-    rounded s * c (the maxima are unchanged; P differs by that rounding) and a
-    pairwise row sum. ``quant_mx``: write o_proj's MXFP8 input instead of the
-    BF16 rows (``op_mxfp8``: E4M3 values of the BF16 output and one E8M0 scale per
-    32, bit for bit ``quantize_fp8`` of it; one KV head), rows past ``rows`` up
-    to ``quant_rows`` (a padded token bucket) as FP8 zeros with unit scales.
-
-    Returns ``{"launch", "kernel"}``; ``launch(query, key, value, ks, vs, table,
-    context, output, rows, kv_heads, table_stride, scale_page_stride, sq_row,
-    sq_head, pages, quantized_output, output_scale, quant_rows, stream)`` runs grid
-    ``(ceil(max(rows, quant_rows) / tile_rows), kv_heads)``.
-    """
-    tq, nb, rg = int(tile_rows), int(nvfp4_buffers), int(row_group)
-    q_regs = bool(q_regs)
-    if tq not in TILE_ROWS:
-        raise ValueError(f"tile_rows must be one of {TILE_ROWS}")
-    if nb not in (2, 3, 4):
-        raise ValueError("nvfp4_buffers must be 2, 3 or 4")
-    if rg < 1 or tq % rg:
-        raise ValueError("row_group must divide tile_rows")
+def compile_pa_sparse_prefill_nvfp4(*, softmax_scale, quant_mx=False):
+    """Compile (cached) the reuse kernel. ``quant_mx``: write o_proj's MXFP8 input
+    (``op_mxfp8``'s group-32 quant of the BF16 rows) instead of BF16 rows."""
     scale = float(softmax_scale)
-    skip_rescale, fma_exp, quant_mx = bool(skip_rescale), bool(fma_exp), bool(quant_mx)
-    key = (tq, nb, scale, q_regs, rg, skip_rescale, fma_exp, quant_mx)
+    key = (scale, bool(quant_mx))
     if key in _CACHE:
         return _CACHE[key]
-    lay = _layout(tq, nb)
-    entries = tq * TOPK
-    ub = _bound_stride(tq)
-    assert lay["total"] <= 327680
+    lay = _layout()
+    assert ENTRIES <= THREADS and lay["total"] <= 327680
     # A name, not lay["total"]: linters read a string in an annotation as a
     # forward reference.
     lds_words = lay["total"] // 4
@@ -206,7 +156,6 @@ def compile_pa_sparse_prefill_nvfp4(
     unit = scale * LOG2E
 
     def query_block(mem, values):
-        """``Gfx1250Nvfp4WavePipeline._query_block`` of a live row."""
         block = values.to(fx.Float32)
         amax = fx.math.absf(block).reduce(ReductionOp.MAX)
         exponent = ((_f32_bits(amax) >> 23) & 0xFF) - 127
@@ -255,7 +204,6 @@ def compile_pa_sparse_prefill_nvfp4(
         return out
 
     def query_scales(half, scale_words):
-        """``Gfx1250Nvfp4WavePipeline._query_scales``."""
         result = []
         lower = half == 0
         for mine in scale_words:
@@ -280,7 +228,6 @@ def compile_pa_sparse_prefill_nvfp4(
         return result
 
     def query_terms(mem, loaded, half):
-        """Per term (operand, i64 scales) of one row (``_query``)."""
         operands = [[] for _ in range_constexpr(QUERY_TERMS)]
         scale_words = [fx.Int32(0) for _ in range_constexpr(QUERY_TERMS)]
         for j in range_constexpr(4):
@@ -293,18 +240,15 @@ def compile_pa_sparse_prefill_nvfp4(
             for i in range_constexpr(QUERY_TERMS)
         ]
 
-    def rows_operand(load, base, plane, n, lane16, half):
-        """``Gfx1250Nvfp4WavePipeline._rows``: e2m1 rows (lane16 = token) of token
-        tile ``n`` and the token's eight E4M3 block scales."""
+    def rows_operand(load, base, plane, scale_plane, n, lane16, half):
         token = n * 16 + lane16
         row = base + plane + token * _ROW + half * 16
         words = []
         for j in range_constexpr(2):
             frag = load(row + j * 32, fx.Int32, 4)
             words.extend([frag[i] for i in range_constexpr(4)])
-        scale_plane = _PLANE_KS if plane == _PLANE_K else _PLANE_VS
-        scale = load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
-        return fx.Vector.from_elements(words, dtype=fx.Int32), scale
+        sc = load(base + scale_plane + token * _SROW, fx.Int64, 1)[0]
+        return fx.Vector.from_elements(words, dtype=fx.Int32), sc
 
     def selector_operand(lane16):
         one = fx.Int32(2) << ((lane16 % 8) * 4)
@@ -313,7 +257,6 @@ def compile_pa_sparse_prefill_nvfp4(
         return fx.Vector.from_elements([even, odd] * 4, dtype=fx.Int32)
 
     def bound_mask(bound, warp, half):
-        """0 for this lane's in-page tokens below ``bound``, -inf at or past it."""
         out = []
         for i in range_constexpr(16):
             n, r = i // 8, i % 8
@@ -323,87 +266,24 @@ def compile_pa_sparse_prefill_nvfp4(
             )
         return fx.Vector.from_elements(out, dtype=fx.Float32)
 
-    def row_softmax(m, l, q, k_tiles, bias):  # noqa: E741 -- the softmax sum
-        """One row's online-softmax step over this wave's 32 tokens of the page
-        (the decode wave tile's arithmetic): (new max, rescale, P operand, sum)."""
+    def qk(q, k_tiles):
+        """Raw scores (16 a lane: tokens 8 half + r of both 16-token tiles)."""
         raw = []
         for n in range_constexpr(2):
             k_rows, k_scale = k_tiles[n]
-            scores = fx.Vector.from_elements(
-                [bias[n * 8 + r] for r in range_constexpr(8)], dtype=fx.Float32
-            )
+            s = fx.Vector.filled(8, 0.0, fx.Float32)
             for operand, qscale in q:
-                scores = _wmma_scale16(
-                    k_rows,
-                    operand,
-                    scores,
-                    k_scale,
-                    qscale,
-                    "fp4_e2m1",
-                    "fp8_e4m3",
-                    "e8",
+                s = _wmma_scale16(
+                    k_rows, operand, s, k_scale, qscale, "fp4_e2m1", "fp8_e4m3", "e8"
                 )
-            raw.extend([scores[r] for r in range_constexpr(8)])
-        if const_expr(fma_exp):
-            # max(s) * c == max(s * c) (rounding is monotone, c > 0); P takes the
-            # unrounded product: exp2(fma(s, c, -m)).
-            tile_max = fx.Vector.from_elements(raw, dtype=fx.Float32).reduce(
-                ReductionOp.MAX
-            )
-            tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, WAVE))
-            tile_max = tile_max * fx.Float32(unit)
-        else:
-            scores = fx.Vector.from_elements(
-                [x * fx.Float32(unit) for x in raw], dtype=fx.Float32
-            )
-            tile_max = scores.reduce(ReductionOp.MAX)
-            tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, WAVE))
-        new_max = fx.maxnumf(m, tile_max)
-        safe_max = (new_max > fx.Float32(float("-inf"))).select(
-            new_max, fx.Float32(0.0)
-        )
-        corr = fx.Float32(fx.exp2(m - safe_max, fastmath="afn"))
-        if const_expr(fma_exp):
-            probs = fx.Vector(
-                fx.exp2(
-                    fx.math.fma(
-                        fx.Vector.from_elements(raw, dtype=fx.Float32),
-                        fx.Vector.filled(16, unit, fx.Float32),
-                        fx.Vector.from_elements(
-                            [-safe_max], dtype=fx.Float32
-                        ).broadcast_to(16),
-                    ),
-                    fastmath="afn",
-                )
-            )
-        else:
-            probs = fx.Vector(
-                fx.exp2(
-                    scores
-                    - fx.Vector.from_elements(
-                        [safe_max], dtype=fx.Float32
-                    ).broadcast_to(16),
-                    fastmath="afn",
-                )
-            )
-        if const_expr(fma_exp):
-            # Pairwise (packed) instead of a 16-add chain.
-            part = probs
-            width = 16
-            while width > 2:
-                width //= 2
-                part = fx.Vector.from_elements(
-                    [part[i] for i in range_constexpr(width)], dtype=fx.Float32
-                ) + fx.Vector.from_elements(
-                    [part[width + i] for i in range_constexpr(width)], dtype=fx.Float32
-                )
-            tile_sum = part[0] + part[1]
-        else:
-            tile_sum = probs.reduce(ReductionOp.ADD)
-        tile_sum = tile_sum + tile_sum.shuffle_xor(16, WAVE)
-        p_operand = probs.to(fx.BFloat16)
-        l_new = l * corr + tile_sum
-        return new_max, corr, p_operand, l_new
+            raw.extend([s[r] for r in range_constexpr(8)])
+        return fx.Vector.from_elements(raw, dtype=fx.Float32)
+
+    def head_max(raw):
+        """This lane's head maximum over the wave's 32 tokens, in log2 units."""
+        m = raw.reduce(ReductionOp.MAX)
+        m = fx.maxnumf(m, m.shuffle_xor(16, WAVE))
+        return m * fx.Float32(unit)
 
     def rescale(acc, corr):
         scaled = fx.Vector.from_elements(
@@ -417,17 +297,38 @@ def compile_pa_sparse_prefill_nvfp4(
             for b in range_constexpr(8)
         ]
 
-    def row_pv(acc, p_operand, v_ops):
-        return [
-            Gfx1250Gemm.mma(v_ops[b], p_operand, acc[b], 32, True)
-            for b in range_constexpr(8)
-        ]
+    def probs(raw, ref):
+        """(BF16 P operand, its lane sum over both halves) relative to ``ref``."""
+        safe = (ref > fx.Float32(float("-inf"))).select(ref, fx.Float32(0.0))
+        p = fx.Vector(
+            fx.exp2(
+                fx.math.fma(
+                    raw,
+                    fx.Vector.filled(16, unit, fx.Float32),
+                    fx.Vector.from_elements([-safe], dtype=fx.Float32).broadcast_to(16),
+                ),
+                fastmath="afn",
+            )
+        )
+        part = p
+        width = 16
+        while width > 2:
+            width //= 2
+            part = fx.Vector.from_elements(
+                [part[i] for i in range_constexpr(width)], dtype=fx.Float32
+            ) + fx.Vector.from_elements(
+                [part[width + i] for i in range_constexpr(width)], dtype=fx.Float32
+            )
+        total = part[0] + part[1]
+        total = total + total.shuffle_xor(16, WAVE)
+        return p.to(fx.BFloat16), total
 
-    @flyc.kernel(
-        name=kernel_name(tq, nb, q_regs, rg, skip_rescale, fma_exp, quant_mx),
-        known_block_size=(THREADS, 1, 1),
-    )
-    def pa_sparse_prefill_kernel(
+    name = "pa_sparse_prefill_nvfp4_d128_bs128_gqa16_top16_tq2"
+    if quant_mx:
+        name += "_mxfp8only"
+
+    @flyc.kernel(name=name, known_block_size=(THREADS, 1, 1))
+    def kernel(
         query: fx.Pointer,
         key: fx.Pointer,
         value: fx.Pointer,
@@ -456,8 +357,6 @@ def compile_pa_sparse_prefill_nvfp4(
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         mem = _Lds(fx.recast_iter(fx.Uint8, storage.buf.ptr))
 
-        # Plain closures, not ``mem.`` calls: FlyDSL's rewriter carries a local
-        # object whose method a runtime branch calls as that branch's state.
         def lds_load(offset, dtype, n=1):
             return mem.load(offset, dtype, n)
 
@@ -467,30 +366,42 @@ def compile_pa_sparse_prefill_nvfp4(
         table_i32 = fx.recast_iter(fx.Int32, table)
         context_i32 = fx.recast_iter(fx.Int32, context)
 
-        # ---- the union of the tile's page tables -------------------------
-        # Entry e = (row e // 16, slot e % 16); one entry a thread.
+        # The query rows' global loads issue first: their latency overlaps the
+        # page-table loads and the union build. Wave t < TQ loads row t.
+        query_bf16 = fx.recast_iter(fx.BFloat16, query)
+        row = tile * TQ + warp
+        seq = ((row < rows) & (warp < TQ)).select(row * kv_heads + kvh, fx.Int32(0))
+        qbase = fx.Int64(seq) * sq_row + lane16 * sq_head
+        q_loaded = [
+            fx.Vector(
+                fx.ptr_load(
+                    fx.add_offset(query_bf16, qbase + j * 32 + half * 16),
+                    result_type=fx.Vector.make_type(16, fx.BFloat16),
+                )
+            )
+            for j in range_constexpr(4)
+        ]
+
+        # ---- the union of the tile's page tables ----
         e_row = tid // TOPK
         e_slot = tid % TOPK
-        g_row = tile * tq + e_row
-        e_live = (tid < entries) & (g_row < rows)
+        g_row = tile * TQ + e_row
+        e_live = (tid < ENTRIES) & (g_row < rows)
         e_seq = e_live.select(g_row * kv_heads + kvh, fx.Int32(0))
         e_ctx = fx.Int32(context_i32[e_seq])
         e_page = fx.Int32(table_i32[e_seq * table_stride + e_slot])
         e_bound = fx.max(fx.Int32(0), fx.min(fx.Int32(PAGE), e_ctx - e_slot * PAGE))
-        # A page id outside the cache (an unwritten padding row's table) selects
-        # nothing: no DMA ever leaves the cache.
         e_live = e_live & (e_page >= 0) & (e_page < pages)
         e_bound = e_live.select(e_bound, fx.Int32(0))
         e_valid = e_bound > 0
         e_key = e_valid.select(e_page, fx.Int32(-1))
-        if tid < entries:
+        if tid < ENTRIES:
             lds_store(
                 lay["keys"] + tid * 4,
                 fx.Vector.from_elements([e_key], dtype=fx.Int32),
                 fx.Int32,
             )
-        # The (union page, row) bounds start at zero: rows without the page.
-        zero_words = entries * ub // 4
+        zero_words = ENTRIES * BOUND_STRIDE // 4
         for i in range_constexpr((zero_words + THREADS - 1) // THREADS):
             w = i * THREADS + tid
             if w < zero_words:
@@ -500,12 +411,11 @@ def compile_pa_sparse_prefill_nvfp4(
                     fx.Int32,
                 )
         gpu.barrier()
-        # First occurrence of this entry's page over the tile's entries.
-        first = fx.Int32(entries)
-        for c in range_constexpr(entries // 4):
+        first = fx.Int32(ENTRIES)
+        for c in range_constexpr(ENTRIES // 4):
             keys4 = lds_load(lay["keys"] + c * 16, fx.Int32, 4)
             for e in range_constexpr(4):
-                hit = (keys4[e] == e_key) & (first == fx.Int32(entries))
+                hit = (keys4[e] == e_key) & (first == fx.Int32(ENTRIES))
                 first = hit.select(fx.Int32(c * 4 + e), first)
         is_rep = e_valid & (first == tid)
         rep_mask = fx.Int32(fx.rocdl.ballot(T.i32, is_rep))
@@ -544,37 +454,30 @@ def compile_pa_sparse_prefill_nvfp4(
         if e_valid:
             u_entry = lds_load(lay["uidx"] + first * 4, fx.Int32, 1)[0]
             lds_store(
-                lay["ubound"] + u_entry * ub + e_row,
+                lay["ubound"] + u_entry * BOUND_STRIDE + e_row,
                 fx.Vector.from_elements([e_bound.to(fx.Int8)], dtype=fx.Int8),
                 fx.Int8,
             )
         gpu.barrier()
 
-        # ---- page DMA ----------------------------------------------------
+        # ---- page DMA ----
+        # The union's page ids and bound words in VGPRs (lane i: union entry i):
+        # the page loop reads them with v_readlane, no LDS round trip on its
+        # critical path.
+        page_reg = lds_load(lay["upage"] + lane * 4, fx.Int32, 1)[0]
+        bound_reg = lds_load(lay["ubound"] + lane * BOUND_STRIDE, fx.Int32, 1)[0]
+
         def bounds_of(u):
-            """The tile rows' in-page bounds of union page ``u`` (wave-uniform)."""
-            words = lds_load(lay["ubound"] + u * ub, fx.Int32, ub // 4)
-            out = []
-            for t in range_constexpr(tq):
-                word = fx.Int32(fx.rocdl.readfirstlane(T.i32, words[t // 4]))
-                out.append((word >> (8 * (t % 4))) & 0xFF)
-            return out
+            word = fx.Int32(fx.rocdl.readlane(T.i32, bound_reg, u % WAVE))
+            return [(word >> (8 * t)) & 0xFF for t in range_constexpr(TQ)]
 
         def slot_base(slot):
             return (slot * NWARP + warp) * WAVE_SLOT_BYTES
 
         def stage(u, slot):
-            """DMA this wave's 32 tokens of union page ``u`` into ``slot``; tokens
-            at or past every row's bound arrive zero-filled."""
-            page = fx.Int32(
-                fx.rocdl.readfirstlane(
-                    T.i32, lds_load(lay["upage"] + u * 4, fx.Int32, 1)[0]
-                )
-            )
+            page = fx.Int32(fx.rocdl.readlane(T.i32, page_reg, u % WAVE))
             bounds = bounds_of(u)
-            top = bounds[0]
-            for t in range_constexpr(1, tq):
-                top = fx.max(top, bounds[t])
+            top = fx.max(bounds[0], bounds[1])
             valid = fx.max(fx.Int32(0), fx.min(fx.Int32(_TOKENS), top - warp * _TOKENS))
             base = slot_base(slot)
             payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(
@@ -606,49 +509,28 @@ def compile_pa_sparse_prefill_nvfp4(
                     8,
                 )
 
-        if n_union > 0:
-            stage(fx.Int32(0), fx.Int32(0))
-        for ahead in range_constexpr(1, nb - 1):
+        for ahead in range_constexpr(RING - 1):
             if ahead < n_union:
                 stage(fx.Int32(ahead), fx.Int32(ahead))
 
-        # ---- queries: split once a CTA into LDS ------------------------------
-        # Wave w splits rows w, w + 4, ... (every wave reads the same operands).
-        query_bf16 = fx.recast_iter(fx.BFloat16, query)
-        for t0 in range_constexpr(0, tq, NWARP):
-            t_mine = t0 + warp
-            row = tile * tq + t_mine
-            seq = ((row < rows) & (t_mine < tq)).select(
-                row * kv_heads + kvh, fx.Int32(0)
-            )
-            qbase = fx.Int64(seq) * sq_row + lane16 * sq_head
-            loaded = [
-                fx.Vector(
-                    fx.ptr_load(
-                        fx.add_offset(query_bf16, qbase + j * 32 + half * 16),
-                        result_type=fx.Vector.make_type(16, fx.BFloat16),
-                    )
+        # ---- queries: split once a CTA into LDS, then into VGPRs ----
+        terms = query_terms(mem, q_loaded, half)
+        if warp < TQ:
+            for i in range_constexpr(QUERY_TERMS):
+                operand, qscale = terms[i]
+                at = (
+                    lay["qterms"]
+                    + ((warp * QUERY_TERMS + i) * WAVE + lane) * Q_LANE_BYTES
                 )
-                for j in range_constexpr(4)
-            ]
-            terms = query_terms(mem, loaded, half)
-            if t_mine < tq:
-                for i in range_constexpr(QUERY_TERMS):
-                    operand, qscale = terms[i]
-                    at = (
-                        lay["qterms"]
-                        + ((t_mine * QUERY_TERMS + i) * WAVE + lane) * Q_LANE_BYTES
-                    )
-                    lds_store(at, operand, fx.Int32)
-                    lds_store(
-                        at + 64,
-                        fx.Vector.from_elements([qscale], dtype=fx.Int64),
-                        fx.Int64,
-                    )
+                lds_store(at, operand, fx.Int32)
+                lds_store(
+                    at + 64,
+                    fx.Vector.from_elements([qscale], dtype=fx.Int64),
+                    fx.Int64,
+                )
         gpu.barrier()
 
         def q_row(t):
-            """Row ``t``'s query terms (operand, i64 scales) from LDS."""
             out = []
             for i in range_constexpr(QUERY_TERMS):
                 at = (
@@ -667,138 +549,126 @@ def compile_pa_sparse_prefill_nvfp4(
             return out
 
         selector = selector_operand(lane16)
-        zeros = fx.Vector.filled(8, 0.0, fx.Float32)
-        zeros16 = fx.Vector.filled(16, 0.0, fx.Float32)
         initial = []
-        for t in range_constexpr(tq):
+        for t in range_constexpr(TQ):
             initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
             initial.extend(
                 [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)]
             )
         lo = warp * _TOKENS
         hi = lo + _TOKENS
-        q_resident = [q_row(t) for t in range_constexpr(tq)] if q_regs else None
-        neg16 = fx.Vector.filled(16, float("-inf"), fx.Float32)
+        q_resident = [q_row(t) for t in range_constexpr(TQ)]
 
-        def row_bias(bound):
-            """The QK start value of a row on this wave's 32 tokens: 0 when all
-            are visible, -inf past the row's in-page bound (all -inf when the row
-            did not select the page)."""
-            bias = zeros16
-            if bound < hi:
-                bias = neg16
-                if bound > lo:
-                    bias = bound_mask(bound, warp, half)
-            return bias
+        def tail_mask(raw, bound):
+            """-inf past the row's in-page bound (its tail page: rare)."""
+            if (bound < hi) & (bound > lo):
+                raw = raw + bound_mask(bound, warp, half)
+            return raw
 
-        # ---- the union walk -------------------------------------------------
+        def rebase(ref, l, acc, m):
+            """Move the reference to the head maximum ``m`` where it grew."""
+            grow = m > ref
+            moved = fx.Int32(fx.rocdl.ballot(T.i32, grow))
+            if moved != fx.Int32(0):
+                new_ref = grow.select(m, ref)
+                safe = (new_ref > fx.Float32(float("-inf"))).select(
+                    new_ref, fx.Float32(0.0)
+                )
+                corr = fx.Float32(fx.exp2(ref - safe, fastmath="afn"))
+                acc = rescale(acc, corr)
+                l = l * corr
+                ref = new_ref
+            return ref, l, acc
+
+        # ---- the union walk ----
         for u_i, state in range(fx.Int32(0), n_union, fx.Int32(1), init=initial):
             u = fx.Int32(u_i)
-            slot = u % nb
-            if const_expr(nb == 2):
-                tdm_ops.tensor_wait(0)
-            elif const_expr(nb == 3):
-                if u + 1 < n_union:
-                    tdm_ops.tensor_wait(4)
-                else:
-                    tdm_ops.tensor_wait(0)
+            slot = u % RING
+            # Four DMAs a page: page u is done when at most the next page's remain.
+            if u + 1 < n_union:
+                tdm_ops.tensor_wait(4)
             else:
-                if u + 2 < n_union:
-                    tdm_ops.tensor_wait(8)
-                else:
-                    if u + 1 < n_union:
-                        tdm_ops.tensor_wait(4)
-                    else:
-                        tdm_ops.tensor_wait(0)
-            if u + (nb - 1) < n_union:
-                stage(u + (nb - 1), (u + (nb - 1)) % nb)
+                tdm_ops.tensor_wait(0)
+            if u + (RING - 1) < n_union:
+                stage(u + (RING - 1), (u + (RING - 1)) % RING)
             base = slot_base(slot)
             bounds = bounds_of(u)
             k_tiles = [
-                rows_operand(lds_load, base, _PLANE_K, n, lane16, half)
+                rows_operand(lds_load, base, _PLANE_K, _PLANE_KS, n, lane16, half)
                 for n in range_constexpr(2)
             ]
-            v_raw = [
-                rows_operand(lds_load, base, _PLANE_V, n, lane16, half)
-                for n in range_constexpr(2)
-            ]
-            # VGPR block scales of the selector (pipeline_nvfp4: a uniform i64 is
-            # read wrongly as an inline constant or SGPR pair); OR a lane-varying
-            # zero the compiler cannot fold. Built per page from the loop index:
-            # hoisted out of the loop, the i64 pairs (which the WMMA reads from
-            # the low 256 VGPRs) were spilled to scratch past 256 VGPRs.
+            # VGPR block scales of the selector, built per page.
             lane_zero = fx.Int64((lane + u) >> 31)
-            selector_scales = [
-                fx.Int64(_E4M3_ONE << (8 * b)) | lane_zero for b in range_constexpr(8)
-            ]
-            v_ops = []
-            for b in range_constexpr(8):
-                pair = [
-                    _wmma_scale16(
-                        v_raw[n][0],
-                        selector,
-                        zeros,
-                        v_raw[n][1],
-                        selector_scales[b],
-                        "fp4_e2m1",
-                        "fp4_e2m1",
-                    )
+
+            def v_tile(v_raw, b, lane_zero=lane_zero):
+                """PV A operand of dims 16 b..: V^T dequantized by the selector WMMA."""
+                sel_scale = fx.Int64(_E4M3_ONE << (8 * b)) | lane_zero
+                a32 = fx.Vector.from_elements(
+                    [v_raw[0][0][e] for e in range_constexpr(8)]
+                    + [v_raw[1][0][e] for e in range_constexpr(8)],
+                    dtype=fx.Int32,
+                )
+                return _wmma_scale16_32x16(a32, selector, v_raw[2], sel_scale).to(
+                    fx.BFloat16
+                )
+
+            def run_rows(rows_state, ts, base=base, k_tiles=k_tiles, bounds=bounds):
+                """One step of rows ``ts`` (all selected the page for this wave):
+                [QK, maxima] | per row a rare rebase branch | [V dequant, P, PV].
+                rows_state: per row [ref, l, acc x 8]."""
+                # Issued first: the LDS latency hides under QK.
+                v_raw = [
+                    rows_operand(lds_load, base, _PLANE_V, _PLANE_VS, n, lane16, half)
                     for n in range_constexpr(2)
                 ]
-                v_ops.append(
-                    fx.Vector.from_elements(
-                        [pair[0][e] for e in range_constexpr(8)]
-                        + [pair[1][e] for e in range_constexpr(8)],
-                        dtype=fx.Float32,
-                    ).to(fx.BFloat16)
-                )
-            next_state = []
-            for g in range_constexpr(tq // rg):
-                group = list(state[g * rg * 10 : (g + 1) * rg * 10])
-                top = bounds[g * rg]
-                for t in range_constexpr(1, rg):
-                    top = fx.max(top, bounds[g * rg + t])
-                if top > lo:
-                    updated = []
-                    for i in range_constexpr(rg):
-                        t = g * rg + i
-                        m_old = group[i * 10]
-                        m_t, corr, p_operand, l_t = row_softmax(
-                            m_old,
-                            group[i * 10 + 1],
-                            q_resident[t] if q_regs else q_row(t),
-                            k_tiles,
-                            row_bias(bounds[t]),
-                        )
-                        acc_t = group[i * 10 + 2 : i * 10 + 10]
-                        if const_expr(skip_rescale):
-                            # The rescale is exactly 1 unless a row maximum of
-                            # this wave grew (or 0 on a still-empty row, whose
-                            # accumulator is 0): skip it then, bitwise alike.
-                            grew = fx.Int32(fx.rocdl.ballot(T.i32, m_t != m_old))
-                            if grew != fx.Int32(0):
-                                acc_t = rescale(acc_t, corr)
-                        else:
-                            acc_t = rescale(acc_t, corr)
-                        acc_t = row_pv(acc_t, p_operand, v_ops)
-                        updated.extend([m_t, l_t])
-                        updated.extend(acc_t)
-                    group = updated
-                next_state.extend(group)
-            final = yield next_state
+                v_raw.append(lds_load(base + _PLANE_VS + lane * _SROW, fx.Int64, 1)[0])
+                raws, maxes = [], []
+                for t in ts:
+                    raw = tail_mask(qk(q_resident[t], k_tiles), bounds[t])
+                    raws.append(raw)
+                    maxes.append(head_max(raw))
+                cur = []
+                for i, t in enumerate(ts):
+                    ref, l = rows_state[i * 10], rows_state[i * 10 + 1]
+                    acc = list(rows_state[i * 10 + 2 : i * 10 + 10])
+                    ref, l, acc = rebase(ref, l, acc, maxes[i])
+                    cur.append([ref, l, acc])
+                ps, totals = [], []
+                for i in range_constexpr(len(ts)):
+                    p, total = probs(raws[i], cur[i][0])
+                    ps.append(p)
+                    totals.append(total)
+                accs = [cur[i][2] for i in range_constexpr(len(ts))]
+                for b in range_constexpr(8):
+                    vt = v_tile(v_raw, b)
+                    for i in range_constexpr(len(ts)):
+                        accs[i][b] = Gfx1250Gemm.mma(vt, ps[i], accs[i][b], 32, True)
+                res = []
+                for i in range_constexpr(len(ts)):
+                    res.extend([cur[i][0], cur[i][1] + totals[i]])
+                    res.extend(accs[i])
+                return res
 
-        # ---- merge the waves' partials row by row, store BF16 rows ---------
+            grp = list(state)
+            b0, b1 = bounds[0], bounds[1]
+            if (b0 > lo) & (b1 > lo):
+                grp = run_rows(grp, (0, 1))
+            if (b0 > lo) & (b1 <= lo):
+                grp = run_rows(grp[:10], (0,)) + grp[10:]
+            if (b0 <= lo) & (b1 > lo):
+                grp = grp[:10] + run_rows(grp[10:], (1,))
+            final = yield grp
+
+        # ---- merge the waves' partials row by row, store ----
         tdm_ops.tensor_wait(0)
         out_bf16 = fx.recast_iter(fx.BFloat16, output)
         groups = MxFp8Groups(quantized_output, output_scale)
 
         def mx_store(values, offsets):
-            # A lane pair (row, half 0 / 1) holds one 32-element group.
             groups.store(values, offsets, (16,), WAVE)
 
         def pad_row(row):
-            """A padded bucket row: FP8 zeros and unit E8M0 scales."""
-            per = GROUP * HEAD_DIM // THREADS  # 16 bytes a thread
+            per = GROUP * HEAD_DIM // THREADS
             target = fx.recast_iter(
                 fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
                 fx.add_offset(
@@ -807,14 +677,14 @@ def compile_pa_sparse_prefill_nvfp4(
                 ),
             )
             fx.ptr_store(fx.Vector.filled(per // 4, 0, fx.Int32), target)
-            scales = fx.recast_iter(fx.Int8, output_scale)
+            sc = fx.recast_iter(fx.Int8, output_scale)
             if tid < GROUP * HEAD_DIM // 32:
-                scales[fx.Int64(row) * (GROUP * HEAD_DIM // 32) + tid] = fx.Int32(
+                sc[fx.Int64(row) * (GROUP * HEAD_DIM // 32) + tid] = fx.Int32(
                     E8M0_ONE
                 ).to(fx.Int8)
 
         stats = NWARP * _MERGE_OUT
-        for t in range_constexpr(tq):
+        for t in range_constexpr(TQ):
             gpu.barrier()
             for b in range_constexpr(8):
                 lds_store(
@@ -841,6 +711,7 @@ def compile_pa_sparse_prefill_nvfp4(
             safe_max = (row_max > fx.Float32(float("-inf"))).select(
                 row_max, fx.Float32(0.0)
             )
+            # Each wave's (O, l) is relative to its own reference (-inf: zeros, weight 0).
             weights = [
                 fx.Float32(fx.exp2(wave_stats[w][0] - safe_max, fastmath="afn"))
                 for w in range_constexpr(NWARP)
@@ -849,16 +720,15 @@ def compile_pa_sparse_prefill_nvfp4(
             for w in range_constexpr(NWARP):
                 denom = denom + weights[w] * wave_stats[w][1]
             inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            row = tile * tq + t
+            row = tile * TQ + t
             if row < rows:
                 seq = row * kv_heads + kvh
                 values, offsets = [], []
                 for vh in range_constexpr(2):
-                    # MXFP8: wave w holds whole 32-dim groups (dims 32 w + 16 vh).
                     b = warp * 2 + vh if quant_mx else vh * 4 + warp
-                    out = fx.Vector.filled(8, 0.0, fx.Float32)
+                    o = fx.Vector.filled(8, 0.0, fx.Float32)
                     for w in range_constexpr(NWARP):
-                        out = out + lds_load(
+                        o = o + lds_load(
                             w * _MERGE_OUT + (b * 32 + lane) * 32, fx.Float32, 8
                         ) * fx.Vector.from_elements(
                             [weights[w]], dtype=fx.Float32
@@ -866,7 +736,7 @@ def compile_pa_sparse_prefill_nvfp4(
                             8
                         )
                     value_out = (
-                        out
+                        o
                         * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
                             8
                         )
@@ -878,8 +748,12 @@ def compile_pa_sparse_prefill_nvfp4(
                             fx.Int64(seq) * (GROUP * HEAD_DIM) + lane16 * HEAD_DIM + d
                         )
                     else:
-                        offset = fx.Int64(seq) * sq_row + lane16 * sq_head + d
-                        fx.ptr_store(value_out, fx.add_offset(out_bf16, offset))
+                        fx.ptr_store(
+                            value_out,
+                            fx.add_offset(
+                                out_bf16, fx.Int64(seq) * sq_row + lane16 * sq_head + d
+                            ),
+                        )
                 if const_expr(quant_mx):
                     mx_store(values, offsets)
             elif const_expr(quant_mx):
@@ -908,7 +782,7 @@ def compile_pa_sparse_prefill_nvfp4(
         quant_rows: fx.Int32,
         stream: fx.Stream,
     ):
-        pa_sparse_prefill_kernel(
+        kernel(
             query,
             key,
             value,
@@ -927,12 +801,13 @@ def compile_pa_sparse_prefill_nvfp4(
             quantized_output,
             output_scale,
             quant_rows,
+            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
         ).launch(
-            grid=((fx.max(rows, quant_rows) + tq - 1) // tq, kv_heads, 1),
+            grid=((fx.max(rows, quant_rows) + TQ - 1) // TQ, kv_heads, 1),
             block=(THREADS, 1, 1),
             stream=stream,
         )
 
-    compiled = {"launch": launch, "kernel": pa_sparse_prefill_kernel, "lds": lay}
+    compiled = {"launch": launch, "kernel": kernel}
     _CACHE[key] = compiled
     return compiled

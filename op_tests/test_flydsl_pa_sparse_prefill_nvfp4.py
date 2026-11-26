@@ -87,8 +87,7 @@ def test_pa_sparse_prefill_nvfp4(case):
     pa_kw = {"key_scale": ks, "value_scale": vs, "work_plan": plan}
     candidates = {  # pa_decode: the per-token path the reuse kernel replaces
         "pa_decode": lambda o: pa_decode(o, *pa_args, **pa_kw),
-        "reuse_v1": lambda o: reuse(o, *args),
-        "reuse_v2": lambda o: reuse(o, *args, tile_rows=2, impl="v2"),  # ATOM's
+        "reuse": lambda o: reuse(o, *args),
     }
     ref, ret = run_torch(*host), {}
     for name, fn in candidates.items():
@@ -102,12 +101,10 @@ def test_pa_sparse_prefill_nvfp4(case):
     codes = torch.full((rows + pad, GROUP, D), 0x55, **u8)
     scales = torch.full((rows + pad, GROUP * D // 32), 0x33, **u8)
     out = torch.empty_like(q)
-    reuse(out, *args, tile_rows=2, impl="v2")
+    reuse(out, *args)
     reuse(
         torch.empty_like(q),
         *args,
-        tile_rows=2,
-        impl="v2",
         quantized_output=codes,
         output_scale=scales,
         quantized_pad_rows=pad,
