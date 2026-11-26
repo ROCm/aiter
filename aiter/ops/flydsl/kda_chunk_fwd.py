@@ -117,8 +117,18 @@ def chunk_kda_fwd_prepare_flydsl(
     store_qkb=True,
     cu_seqlens=None,
     chunks=None,
+    chunk_size=BT,
+    chunk_indices=None,
+    safe_gate=False,
+    disable_recompute=True,
 ):
     """``(q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)``, as the Triton prepare.
+
+    Takes the Triton ``chunk_delta_attn_fwd_prepare`` keywords as well, so it
+    can replace it: ``chunk_size`` must be 64; ``chunk_indices`` is rebuilt
+    from ``cu_seqlens``; ``safe_gate`` and ``disable_recompute`` change
+    nothing here (the decay is exact or split per block, and every output is
+    always written).
 
     q/k/beta come back after their activations (``None`` when
     ``store_qkb=False``). g_cumsum, Aqk and Akk (the inverse) are fp32;
@@ -128,6 +138,8 @@ def chunk_kda_fwd_prepare_flydsl(
     B, T, H, K = q.shape
     V = v.shape[-1]
     dev = q.device
+    if chunk_size not in (None, BT):
+        raise ValueError(f"FlyDSL KDA prepare needs chunk_size {BT}, got {chunk_size}.")
     if chunks is None:
         chunks = _Chunks(B, T, dev, cu_seqlens)
     varlen = chunks.varlen
