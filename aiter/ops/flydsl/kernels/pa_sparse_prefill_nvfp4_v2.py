@@ -603,7 +603,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         ]
 
         def meta_lane(regs, u):
-            idx = u % WAVE
+            idx = u & (WAVE - 1)  # u >= 0: a mask, not a signed remainder
             v = fx.Int32(fx.rocdl.readlane(T.i32, regs[0], idx))
             for k in range_constexpr(1, meta_regs):
                 v = (u >= k * WAVE).select(
@@ -632,6 +632,11 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         else:
             P_K, P_V, P_KS, P_VS = _PLANE_K, _PLANE_V, _PLANE_KS, _PLANE_VS
 
+        # A page of a scale plane in BF16 elements (the TDM's unit). The wrapper
+        # keeps the stride a multiple of 16 B, so halving it first is exact and
+        # spares the page step a 64-bit floor division.
+        scale_page = fx.Int64(sk_block >> 1)
+
         def slot_base(slot):
             if const_expr(cta_dma):
                 return slot * (NWARP * WAVE_SLOT_BYTES)
@@ -650,12 +655,17 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             top = bounds[0]
             for t in range_constexpr(1, tq):
                 top = fx.max(top, bounds[t])
-            valid = fx.max(fx.Int32(0), fx.min(fx.Int32(_TOKENS), top - warp * _TOKENS))
+            # The quarter's tokens to fetch (the rest zero-fill). No upper clamp:
+            # an extent past the tile reads the same tile (the copy reads the tile
+            # only), and a min/max pair of this uniform value becomes v_med3_i32
+            # (no SALU form) that drags every descriptor word through VGPRs and
+            # back with v_readfirstlane; a single max keeps the descriptor in SALU.
+            valid = fx.max(fx.Int32(0), top - warp * _TOKENS)
             base = slot_base(slot)
             payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(
                 warp * (_TOKENS * _ROW // 2)
             )
-            scales = fx.Int64(page) * fx.Int64(sk_block) // 2 + fx.Int64(
+            scales = fx.Int64(page) * scale_page + fx.Int64(
                 warp * (_TOKENS * _SROW // 2)
             )
             for ptr, plane in (
@@ -729,7 +739,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 src = (
                     fx.Int64(page) * (PAGE * _ROW // 2)
                     if row == _ROW
-                    else fx.Int64(page) * fx.Int64(sk_block) // 2
+                    else fx.Int64(page) * scale_page
                 )
                 if warp == w:
                     tdm(
@@ -891,7 +901,9 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                         tdm_ops.tensor_wait(0)
             if const_expr(dbg != 3):
                 if u + (nb - 1) < n_union:
-                    stage(u + (nb - 1), (u + (nb - 1)) % nb)
+                    # The slot nb - 1 pages ahead, from this page's (no remainder).
+                    ahead = slot + (nb - 1)
+                    stage(u + (nb - 1), (ahead >= nb).select(ahead - nb, ahead))
             base = slot_base(slot)
             bounds = bounds_of(u)
             k_tiles = [
