@@ -148,6 +148,18 @@ def list_test_files(repo_root: Path, test_type: str) -> list[str]:
         ):
             if (repo_root / rel_path).is_file():
                 files.add(rel_path)
+        # aiter.moev2's regression suite; must match split_tests.sh. aiter.moev2 is
+        # under development (not graduated): coordinate changes with its owners
+        # (@qli88), see aiter/moev2/README.md.
+        files.update(
+            str(p.relative_to(repo_root))
+            for pattern in (
+                "tests/test_moev2_*.py",
+                "tests/test_moe_dispatch_snapshot.py",
+            )
+            for p in repo_root.glob(pattern)
+            if p.is_file()
+        )
         return sorted(files)
 
     return sorted(
