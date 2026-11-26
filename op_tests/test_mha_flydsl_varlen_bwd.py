@@ -345,7 +345,9 @@ def test_fmha_varlen_bwd(case, nheads, d_qk, d_v, deterministic):
 # `can_impl_fmha_bwd_flydsl` in aiter/ops/mha.py.  (case, nheads, d_qk, d_v,
 # deterministic, whether the gate is expected to pick FlyDSL.)
 _ROUTE_CASES = [
-    ("small", 2, 192, 128, False, True),  # no v3 kernel for d_qk != d_v
+    # Non-deterministic 192 / 128 runs the ASM v3 hd192_128 pssk kernels; FlyDSL
+    # takes it only when deterministic, which the v3 gate rejects.
+    ("small", 2, 192, 128, False, False),
     ("small", 2, 192, 128, True, True),
     # d_qk == d_v stays on the existing ASM / CK backwards.
     ("small", 2, 96, 96, False, False),
