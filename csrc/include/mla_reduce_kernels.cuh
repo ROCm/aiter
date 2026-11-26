@@ -1689,19 +1689,14 @@ __launch_bounds__(Traits::kNumThreads) __global__
     }
 }
 
-// Select the row-parallel Dv512 reducer; AITER_MLA_REDUCE_ROWS=0 disables it.
+// Select the row-parallel Dv512 reducer on gfx1250.
 inline bool mla_reduce_use_rows(const MlaReduceKernelV1Params& params,
                                 const hipDeviceProp_t& dev_prop)
 {
-    static const bool rows_off = []() {
-        const char* v = std::getenv("AITER_MLA_REDUCE_ROWS");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) == 0;
-    }();
     const char* arch      = dev_prop.gcnArchName;
     const bool is_gfx1250 = std::strncmp(arch, "gfx1250", 7) == 0 &&
                             (arch[7] == '\0' || arch[7] == ':');
-    return !rows_off && is_gfx1250 && (dev_prop.warpSize == 32) &&
-           (params.max_seqlen_q >= 1) &&
+    return is_gfx1250 && (dev_prop.warpSize == 32) && (params.max_seqlen_q >= 1) &&
            (params.max_seqlen_q <= MlaReduceRowsConfig::kMaxRows);
 }
 

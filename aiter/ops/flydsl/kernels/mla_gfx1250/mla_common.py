@@ -3,8 +3,6 @@
 
 """Helpers shared by the gfx1250 MLA kernels."""
 
-import os
-
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
@@ -15,12 +13,11 @@ _XOR16_SEL_HI = 0xFEDCBA98 - (1 << 32)
 # FlyDSL 0.5 moved the register-placement API into rocdl.experimental. Older
 # pins are a no-op, so a kernel that asks for one still builds and runs.
 sched_vgpr = getattr(getattr(rocdl, "experimental", rocdl), "sched_vgpr", None)
-_VGPR_PINNING_ENABLED = os.environ.get("AITER_MLA_PIN_VGPR", "1") != "0"
 
 
 def pin_vgpr(value, reg, soft=True):
     """Request a VGPR placement, or return *value* when pinning is unavailable."""
-    if sched_vgpr is None or not _VGPR_PINNING_ENABLED:
+    if sched_vgpr is None:
         return value
     return sched_vgpr(value, reg, soft=soft)
 
