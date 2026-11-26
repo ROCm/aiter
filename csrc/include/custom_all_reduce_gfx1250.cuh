@@ -1378,7 +1378,7 @@ __global__ void __launch_bounds__(1024, 1) dcp_merge_ll_gfx1250(
  *
  * The grid covers whole rows. The sum of squares of a row is reduced
  *   - row:     one block a row (blockDim = hidden / 8), on chip.
- *   - cluster: the blocks of a row are one workgroup cluster (2 to 16 blocks);
+ *   - cluster: the blocks of a row are one workgroup cluster (2 to 8 blocks);
  *              the wave partials go through rank-local memory, ordered by the
  *              cluster barrier (the FP8 amax the same way, after a second
  *              barrier). Spreads a row over more CUs while the rows do not
@@ -1388,7 +1388,10 @@ constexpr int kLamportBuffers           = 3;
 constexpr int kLamportWave              = 32;   // = gfx1250 warpSize
 constexpr int kLamportRowMaxThreads     = 1024; // a row is one block: hidden <= 8192
 constexpr int kLamportClusterMaxThreads = 256;
-constexpr int kLamportMaxClusterBlocks  = 16;
+// gfx1250 advertises clusters of up to 16 workgroups, but a 9-block cluster
+// never completes (hidden 2304, 9 x 32 threads, hung at TP4); those rows take a
+// block a row.
+constexpr int kLamportMaxClusterBlocks  = 8;
 // Rows of at most this many packs stay in one block: splitting them measured
 // no faster at any row count (hidden 2048, TP2/TP4).
 constexpr int kLamportMinClusterRowPacks = 256;

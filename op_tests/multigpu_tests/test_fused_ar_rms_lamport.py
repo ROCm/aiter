@@ -64,9 +64,10 @@ EPS = 1e-6
 CALLS = 10
 REPLAYS = 20
 # (n, m) of the mixed sequence: hidden 256 to 8192 in whole waves of packs, row
-# counts on both sides of the CU count (256), where a row stops being a cluster
-STRESS_NS = [2048, 7168, 256, 4096, 6144, 8192, 5120]
-STRESS_MS = [1, 300, 3, 255, 256, 17, 1]
+# counts on both sides of the CU count (256), where a row stops being a cluster;
+# 2304 would be a cluster of 9 blocks, past the 8 a cluster takes
+STRESS_NS = [2048, 7168, 256, 4096, 6144, 8192, 5120, 2304]
+STRESS_MS = [1, 300, 3, 255, 256, 17, 1, 1]
 GRAPH_CASES = [(7168, 4), (4096, 300), (2048, 64)]
 
 
