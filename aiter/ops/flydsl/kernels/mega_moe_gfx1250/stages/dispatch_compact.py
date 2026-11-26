@@ -81,7 +81,8 @@ def _compact_gemm_tiles(
     before it clamps both tiles to the plan alignment.
 
     Same precedence as ``grouped_gemm_gfx1250_a8w4``: the grouped-GEMM CSV row
-    for ``_get_padded_m(recv_bound)`` (64 / 64 / 1 when it misses), then
+    for ``_get_padded_m(recv_bound)``, or a row that splits that bucket at a
+    token >= recv_bound (64 / 64 / 1 when it misses), then
     ``AITER_TDM_TILE_M{,2}`` and ``AITER_TDM_M_WARP{,2}``, the stage-2 value
     following the stage-1 one when only that is set. The stage-1 kernel's
     verdict and its launcher key are computed from this, so it has to name the
@@ -95,10 +96,10 @@ def _compact_gemm_tiles(
 
     row = None
     if config.dispatch_wire in ("fp4", "fp8"):
+        csv_m = config.max_recv if recv_bound is None else int(recv_bound)
         row = _find_grouped_config(
-            token_num=_get_padded_m(
-                config.max_recv if recv_bound is None else int(recv_bound)
-            ),
+            token_num=_get_padded_m(csv_m),
+            split_m=int(csv_m),
             model_dim=config.hidden_dim,
             inter_dim=config.geometry.inter_dim,
             experts=config.experts_per_rank,
