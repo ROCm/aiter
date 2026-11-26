@@ -178,8 +178,98 @@ def mla_nvfp4_update_cache(
     _mla_nvfp4_update_cache(tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux)
 
 
+# Its own HIP module (csrc/kernels/mla/nvfp4/decode_prep.cu): it needs no ASM
+# code object, and editing it leaves the decoder's module alone.
+@compile_ops(
+    "module_mla_nvfp4_decode_prep", fc_name="mla_nvfp4_decode_prep", develop=True
+)
+def _mla_nvfp4_decode_prep(
+    q_rope: torch.Tensor,
+    q_aux: torch.Tensor,
+    ring: torch.Tensor,
+    req_ids: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    cos_cache: torch.Tensor | None = None,
+    sin_cache: torch.Tensor | None = None,
+) -> None: ...
+
+
+def mla_nvfp4_decode_prep(
+    q_rope: torch.Tensor,
+    q_aux: torch.Tensor,
+    ring: torch.Tensor,
+    req_ids: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+    cos_cache: torch.Tensor | None = None,
+    sin_cache: torch.Tensor | None = None,
+) -> None:
+    """One decode step's Q RoPE quantization and KV cache append, one launch.
+
+    For each of the B tokens (one per request), with BF16 q_rope[B,128,64],
+    k_nope[B,512] and k_rope[B,64]:
+
+    * q_aux[B,128,128] bytes 0..63 and 96..127 as mla_nvfp4_quantize_q writes
+      them; bytes 64..95 (the NoPE scales) are left as written.
+    * The token's row ``positions % 16`` of its request's BF16 tail tile
+      ``ring[req_ids, :, :]`` ([R,16,576]: 512 NoPE then 64 rotated RoPE
+      channels) is set, and the tile's rows 0..row are requantized into page
+      ``slots // 64``, tile ``positions % 64 // 16`` of kv_nope / kv_aux, as
+      mla_nvfp4_update_cache writes it (N16 AUX). A tile's first token also
+      writes the zero codes and 0x7F scales of its later rows.
+
+    With BF16 cos_cache/sin_cache [max_position,32] (GPT-J pairs, as aiter's
+    rotary embedding caches them), q_rope and k_rope are rotated here at
+    ``positions`` with the rounding of aiter's Triton RoPE
+    (``RotaryEmbedding.forward_triton``, AITER_ROPE_TRITON_BACKEND=1); without
+    them they are already rotated.
+    A padding row (slot -1) gets zero Q codes and 0x7F scales and writes no
+    KV; nor does a token whose page or request lies outside the cache or ring.
+
+    q_rope rows must be 128 head strides apart (contiguous, or the RoPE slice
+    of a [B,128,D] Q); req_ids is int32, positions and slots int64, all [B]. The
+    caller owns the tail tiles and their recycling (a request's first token of
+    a tile overwrites row 0) and must not repeat a request within a batch.
+    The written tensors (q_aux, ring, kv_nope, kv_aux) must not overlap each
+    other or the inputs; ring rows that overlap one another are rejected.
+    gfx1250 only. Graph-safe; warm up before capture.
+    """
+    if (cos_cache is None) != (sin_cache is None):
+        raise ValueError("cos_cache and sin_cache come together")
+    if cos_cache is not None:
+        # The rotary embedding's caches may carry singleton dims.
+        cos_cache = cos_cache.reshape(cos_cache.shape[0], -1)
+        sin_cache = sin_cache.reshape(sin_cache.shape[0], -1)
+    # The launch takes the current device's stream.
+    with torch.cuda.device(q_rope.device):
+        _mla_nvfp4_decode_prep(
+            q_rope,
+            q_aux,
+            ring,
+            req_ids,
+            k_nope,
+            k_rope,
+            positions,
+            slots,
+            kv_nope,
+            kv_aux,
+            cos_cache,
+            sin_cache,
+        )
+
+
 __all__ = [
     "mla_decode_nvfp4_fwd",
+    "mla_nvfp4_decode_prep",
     "mla_nvfp4_quantize_q",
     "mla_nvfp4_update_cache",
     "prepare_mla_nvfp4_params",

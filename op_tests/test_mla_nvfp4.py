@@ -495,6 +495,27 @@ def test_quantize_q():
     np.testing.assert_array_equal(qa.cpu().numpy(), ref[1])
 
 
+def test_quantize_q_saturates_large_values():
+    # Blocks up to 1e30 saturate their scale at 448, so the quotients run far
+    # past 6, and past 2**25 where FP32 distances to 4.0 and 6.0 round alike.
+    rng = np.random.default_rng(23)
+    mag = 10.0 ** rng.uniform(0, 30, (1, 128, 36, 1))
+    x = rng.normal(0, 1, (1, 128, 36, 16)) * mag
+    raw = torch.from_numpy(x.reshape(1, 128, 576).astype(np.float32)).to(torch.bfloat16)
+    x = raw.float().numpy()
+    nc, ns = quant_rows(x[..., :512], 6.72)
+    rc, rs, ec, es = quant_rope(x[..., 512:], 6.72)
+    qc, qs = np.concatenate((nc, rc, ec), axis=-1), np.concatenate(
+        (ns, rs, es), axis=-1
+    )
+    qn, qa = mla_nvfp4_quantize_q(raw.cuda())
+    ref = pack(
+        qc, qs, np.zeros((1, 64, 640), np.uint8), np.zeros((1, 64, 40), np.uint8)
+    )
+    np.testing.assert_array_equal(qn.cpu().numpy(), ref[0])
+    np.testing.assert_array_equal(qa.cpu().numpy(), ref[1])
+
+
 def cpu_cache(raw, valid):
     cc = np.zeros((2, 64, 640), np.uint8)
     cs = np.full((2, 64, 40), 127, np.uint8)
