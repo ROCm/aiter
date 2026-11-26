@@ -352,10 +352,17 @@ def _fallback_order(choice):
 def _chunk_fwd_triton():
     from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-    def run(q, k, v, g, beta, scale, chunk_size):
+    def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
         bf = torch.bfloat16
         o, _ = chunk_kimi_delta_attn(
-            q.to(bf), k.to(bf), v.to(bf), g, beta, scale=scale, chunk_size=chunk_size
+            q.to(bf),
+            k.to(bf),
+            v.to(bf),
+            g,
+            beta,
+            scale=scale,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
         )
         return o.float()
 
@@ -365,7 +372,9 @@ def _chunk_fwd_triton():
 def _chunk_fwd_flydsl():
     from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
 
-    def run(q, k, v, g, beta, scale, chunk_size):
+    def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
+        if cu_seqlens is not None:
+            raise NotImplementedError("the FlyDSL KDA forward has no varlen")
         bf = torch.bfloat16
         o, _ = chunk_kda_fwd_flydsl(
             q.to(bf), k.to(bf), v.to(bf), g, beta, scale, chunk_size
@@ -478,24 +487,80 @@ def _piece(impl):
     return module.rsplit(".", 1)[-1]
 
 
-def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None):
+def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None, cu_seqlens=None):
     """Chunk forward by the selected backend; a kernel that rejects the call
     (``ValueError``) or fails to build falls through to the next choice."""
     for backend, fn in _resolve("chunk_fwd", q.is_cuda, dtype):
         if fn is None:
             break
         try:
-            o = fn(q, k, v, g, beta, scale, chunk_size)
+            o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens)
         except (ValueError, NotImplementedError, RuntimeError) as err:
             LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
             continue
         LAST_PIECES["chunk_fwd"] = backend
         return o
     LAST_PIECES["chunk_fwd"] = "torch"
-    return chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
+    return _chunk_torch_varlen(q, k, v, g, beta, scale, chunk_size, cu_seqlens)
 
 
-def conv_silu_bwd(a, w, dq, dk, dv, fn=None):
+def _bounds(cu_seqlens, T):
+    return [0, T] if cu_seqlens is None else [int(b) for b in cu_seqlens.tolist()]
+
+
+def _chunk_torch_varlen(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
+    """``chunk_kda_torch`` restarting the state at every ``cu_seqlens`` boundary."""
+    if cu_seqlens is None:
+        return chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
+    parts = [
+        chunk_kda_torch(*(t[:, s:e] for t in (q, k, v, g, beta)), scale, chunk_size)
+        for s, e in itertools.pairwise(_bounds(cu_seqlens, q.shape[1]))
+    ]
+    return torch.cat(parts, 1)
+
+
+def _short_conv_varlen(a, w, cu_seqlens=None):
+    """``_short_conv`` restarting the causal window at every boundary."""
+    if cu_seqlens is None:
+        return _short_conv(a, w)
+    parts = [
+        _short_conv(a[:, s:e], w)
+        for s, e in itertools.pairwise(_bounds(cu_seqlens, a.shape[1]))
+    ]
+    return torch.cat(parts, 1)
+
+
+def _compute_dtype(x):
+    """GEMM input dtype: the layer's own 16-bit dtype, else fp32."""
+    return x.dtype if x.dtype in (torch.bfloat16, torch.float16) else torch.float32
+
+
+_MM_OUT_DTYPE_OK = True
+
+
+def _mm(a, b, cd):
+    """2-D a @ b with inputs rounded to ``cd`` and an fp32 result.
+
+    16-bit inputs accumulate and store in fp32 (``torch.mm(out_dtype=)`` on
+    GPU), so the output is not rounded to 16 bits before the L2 norm and the
+    gates that follow.
+    """
+    global _MM_OUT_DTYPE_OK
+    if cd == torch.float32:
+        return a.float() @ b.float()
+    a, b = a.to(cd), b.to(cd)
+    if not a.is_cuda:
+        return a.float() @ b.float()
+    if _MM_OUT_DTYPE_OK:
+        try:
+            return torch.mm(a, b, out_dtype=torch.float32)
+        except (RuntimeError, TypeError):
+            _MM_OUT_DTYPE_OK = False
+    # no fp32-output GEMM in this torch build: round the output to 16 bits
+    return (a @ b).float()
+
+
+def conv_silu_bwd(a, w, dq, dk, dv, fn=None, cu_seqlens=None):
     """Backward of ``silu(causal_depthwise_conv(a, w))`` split into q/k/v.
 
     a: [B, T, C] conv input; w: [C, W]; dq, dk: [B, T, HK]; dv: [B, T, HV].
@@ -511,8 +576,12 @@ def conv_silu_bwd(a, w, dq, dk, dv, fn=None):
         with torch.enable_grad():
             a = a.detach().float().requires_grad_(True)
             w = w.detach().float().requires_grad_(True)
-            return torch.autograd.grad(_short_conv(a, w), [a, w], dc)
-    qsl = torch.arange(B + 1, device=a.device, dtype=torch.int32) * T
+            return torch.autograd.grad(_short_conv_varlen(a, w, cu_seqlens), [a, w], dc)
+    if cu_seqlens is None:
+        qsl = torch.arange(B + 1, device=a.device, dtype=torch.int32) * T
+    else:
+        assert B == 1, "varlen packs the sequences into one row"
+        qsl = cu_seqlens.to(device=a.device, dtype=torch.int32)
     da, dw, _, _ = fn(
         *(t.float().reshape(B * T, -1) for t in (dq, dk, dv)),
         a.float().reshape(B * T, C).t(),
@@ -618,61 +687,63 @@ def _kda_layer_fused_fwd(
     chunk_graph=False,
     for_backward=True,
     lower_bound=None,
+    cu_seqlens=None,
 ):
-    """Forward that keeps what the hand-written backward needs (fp32).
+    """Forward that keeps what the hand-written backward needs.
 
+    Large GEMMs take their inputs in the layer's 16-bit dtype (fp32 for fp32
+    layers) and return fp32; the element-wise stages run in fp32.
     ``conv_graph`` / ``chunk_graph`` record autograd graphs for the conv and
     chunk stages, so their PyTorch fallbacks differentiate the activations of
     this pass instead of recomputing the stage. With ``for_backward=False``
-    the output gate is fused into the g_proj GEMM and only ``y`` is meaningful.
+    the output gate is fused into the g_proj GEMM and only ``y`` is meaningful;
+    with ``for_backward=True`` ``y`` is not computed.
     """
-    B, T, _ = x.shape
-    xf = x.float()
-    w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).float()
+    B, T, D = x.shape
+    cd = _compute_dtype(x)
+    xc = x.to(cd).reshape(B * T, D)
+    w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).to(cd)
     conv_qkv = torch.cat([w.conv_q, w.conv_k, w.conv_v]).float()
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
-    a = xf @ w_qkv.t()  # [B, T, 2HK + HV]
+    a = _mm(xc, w_qkv.t(), cd).view(B, T, -1)  # [B, T, 2HK + HV]
     conv_in = None
     with torch.set_grad_enabled(conv_graph):
         if conv_graph:
             conv_in = [a.requires_grad_(True), conv_qkv.requires_grad_(True)]
-        c = _short_conv(a, conv_qkv)
+        c = _short_conv_varlen(a, conv_qkv, cu_seqlens)
     if conv_graph:
         a, conv_qkv = a.detach(), conv_qkv.detach()
     q_pre, k_pre, v = c.split([hk, hk, hv], -1)
     q_pre, k_pre, v = (t.reshape(B, T, H, -1) for t in (q_pre, k_pre, v))
     q, k = F.normalize(q_pre, dim=-1, eps=eps), F.normalize(k_pre, dim=-1, eps=eps)
     proj = _proj_ops(x, w)
-    lr = xf @ w.f_a.float().t()
-    g = proj.kda_gate_proj(
-        lr.reshape(B * T, -1), w.f_b, w.dt_bias, w.A_log, H, lower_bound
-    )
+    lr = _mm(xc, w.f_a.t(), cd)
+    g = proj.kda_gate_proj(lr, w.f_b, w.dt_bias, w.A_log, H, lower_bound)
     g = g.view(B, T, H, -1)
-    braw = xf @ w.w_beta.float().t()
+    braw = _mm(xc, w.w_beta.t(), cd).view(B, T, H)
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
     chunk_in = None
     with torch.set_grad_enabled(chunk_graph):
         if chunk_graph:
             chunk_in = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
-            o = chunk_kda_torch(*chunk_in, scale, chunk_size)
+            o = _chunk_torch_varlen(*chunk_in, scale, chunk_size, cu_seqlens)
             LAST_PIECES["chunk_fwd"] = "torch(autograd)"
         else:
-            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size, x.dtype)
+            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size, x.dtype, cu_seqlens)
     o_graph = o if chunk_graph else None
     o = o.detach()
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
-    gp = None
+    gp, y = None, None
     if for_backward:
-        gp = (xf @ w.g_proj.float().t()).view_as(o)
-        on = (normed * torch.sigmoid(gp)).reshape(B, T, -1)
+        gp = _mm(xc, w.g_proj.t(), cd).view_as(o)
+        on = (normed * torch.sigmoid(gp)).reshape(B * T, -1)
     else:
-        aux = normed.reshape(B * T, -1)
-        on = proj.sigmoid_gate_proj(x.reshape(B * T, -1), w.g_proj, aux)
-        on = on.view(B, T, -1)
-    y = (on @ w.w_o.float().t()).to(x.dtype)
+        on = proj.sigmoid_gate_proj(xc, w.g_proj, normed.reshape(B * T, -1))
+        y = _mm(on, w.w_o.t(), cd).view(B, T, D).to(x.dtype)
     saved = {
-        "xf": xf,
+        "xc": xc,
+        "cd": cd,
         "w_qkv": w_qkv,
         "conv_qkv": conv_qkv,
         "a": a,
@@ -705,7 +776,25 @@ def _accepts(fn, name):
     return any(p.name == name or p.kind is p.VAR_KEYWORD for p in params)
 
 
-def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
+def _chunk_bwd_varlen(chunk_bwd, cu_seqlens, do, q, k, v, g, beta, scale, cs, **kw):
+    """Call ``chunk_bwd`` natively with ``cu_seqlens`` when it takes them, else
+    once per sequence (gradients concatenated, dA_log / ddt_bias summed)."""
+    if cu_seqlens is None:
+        return chunk_bwd(do, q, k, v, g, beta, scale, cs, **kw)
+    if _accepts(chunk_bwd, "cu_seqlens"):
+        return chunk_bwd(do, q, k, v, g, beta, scale, cs, cu_seqlens=cu_seqlens, **kw)
+    outs = [
+        chunk_bwd(*(t[:, s:e] for t in (do, q, k, v, g, beta)), scale, cs, **kw)
+        for s, e in itertools.pairwise(_bounds(cu_seqlens, q.shape[1]))
+    ]
+    grads = [torch.cat([o[i] for o in outs], 1) for i in range(5)]
+    tail = [None if outs[0][i] is None else sum(o[i] for o in outs) for i in (5, 6)]
+    return (*grads, *tail)
+
+
+def _kda_layer_fused_bwd(
+    dy, x, w, H, chunk_size, eps, ops, lower_bound=None, cu_seqlens=None
+):
     LAST_PIECES.clear()
     if _chunk_bwd_impl is not None:
         chunk_impl, fuses = _chunk_bwd_impl, _chunk_bwd_fuses
@@ -738,24 +827,27 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
         conv_graph=conv_kernel is None,
         chunk_graph=chunk_impl is None,
         lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
     )
     B, T, D = x.shape
-    xf = s["xf"].reshape(B * T, D)
-    dy = dy.float().reshape(B * T, D)
+    xc, cd = s["xc"], s["cd"]
+    dyc = dy.reshape(B * T, D).to(cd)
 
-    d_wo = dy.t() @ s["on"].reshape(B * T, -1)
-    d_on = (dy @ w.w_o.float()).view_as(s["o"])
+    d_wo = _mm(dyc.t(), s["on"], cd)
+    d_on = _mm(dyc, w.w_o, cd).view_as(s["o"])
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
-    dx, d_gproj = _proj_ops(x, w).gate_proj_bwd_gemms(
-        dgp, x.reshape(B * T, D), w.g_proj
-    )
+    dx, d_gproj = _proj_ops(x, w).gate_proj_bwd_gemms(dgp, xc, w.g_proj)
 
     if chunk_impl is None:
 
         def chunk_bwd(do, *_, **__):
             grads = torch.autograd.grad(s["o_graph"], s["chunk_in"], do.float())
             return (*grads, None, None)
+
+        chunk_bwd.__signature__ = inspect.Signature(
+            [inspect.Parameter("cu_seqlens", inspect.Parameter.KEYWORD_ONLY)]
+        )
 
     else:
         chunk_bwd = chunk_impl
@@ -773,8 +865,18 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
     if "beta_sigmoid" in fuses:
         b_in = s["braw"]
         kw["use_beta_sigmoid_in_kernel"] = True
-    dq, dk, dv, dg, dbeta, dA_log, ddt = chunk_bwd(
-        do, q_in, k_in, s["v"], g_in, b_in, s["scale"], chunk_size, **kw
+    dq, dk, dv, dg, dbeta, dA_log, ddt = _chunk_bwd_varlen(
+        chunk_bwd,
+        cu_seqlens,
+        do,
+        q_in,
+        k_in,
+        s["v"],
+        g_in,
+        b_in,
+        s["scale"],
+        chunk_size,
+        **kw,
     )
     dz = dg.float().reshape(B * T, -1)
     if "gate" not in fuses:
@@ -792,9 +894,9 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
         ddt = dz.sum(0)
     d_fb = dz.t() @ lr
     dlr = dz @ w.f_b.float()
-    d_fa = dlr.t() @ xf
-    dx = dx + dlr @ w.f_a.float() + db @ w.w_beta.float()
-    d_wbeta = db.t() @ xf
+    d_fa = _mm(dlr.t(), xc, cd)
+    dx = dx + _mm(dlr, w.f_a, cd) + _mm(db, w.w_beta, cd)
+    d_wbeta = _mm(db.t(), xc, cd)
 
     if "qk_l2norm" not in fuses:
         dq = ops.l2norm_bwd(s["q_pre"], dq.float(), eps)
@@ -804,10 +906,12 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
         dc = torch.cat(dqkv, -1).float()
         da, d_conv = torch.autograd.grad(s["c"], s["conv_in"], dc)
     else:
-        da, d_conv = conv_silu_bwd(s["a"], s["conv_qkv"], *dqkv, fn=conv_kernel)
+        da, d_conv = conv_silu_bwd(
+            s["a"], s["conv_qkv"], *dqkv, fn=conv_kernel, cu_seqlens=cu_seqlens
+        )
     da = da.reshape(B * T, -1)
-    d_wqkv = da.t() @ xf
-    dx = dx + da @ s["w_qkv"]
+    d_wqkv = _mm(da.t(), xc, cd)
+    dx = dx + _mm(da, s["w_qkv"], cd)
 
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
     dwq, dwk, dwv = d_wqkv.split([hk, hk, hv])
@@ -831,15 +935,20 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
     grads = KDALayerWeights.from_tensors(
         [gr.to(p.dtype) for gr, p in zip(grads.tensors(), w.tensors())]
     )
+    LAST_PIECES["gemm"] = (
+        "fp32"
+        if cd == torch.float32
+        else f"{cd}->fp32" if _MM_OUT_DTYPE_OK else str(cd)
+    )
     return dx.view(B, T, D).to(x.dtype), grads
 
 
 class _KDALayerFused(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, num_heads, chunk_size, eps, lower_bound, *ws):
+    def forward(ctx, x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *ws):
         ctx.save_for_backward(x, *ws)
         ctx.cfg = (num_heads, chunk_size, eps)
-        ctx.lower_bound = lower_bound
+        ctx.lower_bound, ctx.cu_seqlens = lower_bound, cu_seqlens
         y, _ = _kda_layer_fused_fwd(
             x,
             KDALayerWeights.from_tensors(ws),
@@ -848,6 +957,7 @@ class _KDALayerFused(torch.autograd.Function):
             eps,
             for_backward=False,
             lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
         )
         return y
 
@@ -861,8 +971,9 @@ class _KDALayerFused(torch.autograd.Function):
             *ctx.cfg,
             _row_ops(x),
             lower_bound=ctx.lower_bound,
+            cu_seqlens=ctx.cu_seqlens,
         )
-        return (dx, None, None, None, None, *dw.tensors())
+        return (dx, None, None, None, None, None, *dw.tensors())
 
 
 def _segments(x, cu_seqlens):
@@ -899,6 +1010,10 @@ def kda_layer_fwd(
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
+    if backend == "fused":
+        return _KDALayerFused.apply(
+            x, num_heads, chunk_size, eps, lower_bound, cu_seqlens, *w.tensors()
+        )
     if segments is not None:
         return torch.cat(
             [
@@ -909,11 +1024,7 @@ def kda_layer_fwd(
             ],
             1,
         )
-    if backend == "torch":
-        return _kda_layer_torch(x, w, num_heads, chunk_size, eps, lower_bound)
-    return _KDALayerFused.apply(
-        x, num_heads, chunk_size, eps, lower_bound, *w.tensors()
-    )
+    return _kda_layer_torch(x, w, num_heads, chunk_size, eps, lower_bound)
 
 
 def kda_layer_bwd(
@@ -937,6 +1048,18 @@ def kda_layer_bwd(
     if backend not in KDA_BACKENDS:
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     segments = _segments(x, cu_seqlens)
+    if backend == "fused":
+        return _kda_layer_fused_bwd(
+            dy,
+            x,
+            w,
+            num_heads,
+            chunk_size,
+            eps,
+            _row_ops(x),
+            lower_bound,
+            cu_seqlens if segments is not None else None,
+        )
     if segments is not None:
         dxs, dw = [], None
         for s, e in segments:
@@ -956,10 +1079,6 @@ def kda_layer_bwd(
             dw = parts if dw is None else [a + b for a, b in zip(dw, parts)]
         dw = [d.to(p.dtype) for d, p in zip(dw, w.tensors())]
         return torch.cat(dxs, 1), KDALayerWeights.from_tensors(dw)
-    if backend == "fused":
-        return _kda_layer_fused_bwd(
-            dy, x, w, num_heads, chunk_size, eps, _row_ops(x), lower_bound
-        )
     with torch.enable_grad():
         xs = x.detach().requires_grad_(True)
         ws = [t.detach().requires_grad_(True) for t in w.tensors()]
