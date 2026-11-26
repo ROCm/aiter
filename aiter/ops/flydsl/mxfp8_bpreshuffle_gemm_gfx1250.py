@@ -567,7 +567,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             fuse_quant,
             ragged_n,
             int(l2_prefetch),
-            specialization_key=specialization + (fuse_quant, ragged_n, int(l2_prefetch)),
+            specialization_key=specialization
+            + (fuse_quant, ragged_n, int(l2_prefetch)),
         )
     else:
         rank0_splitk = fused and not small_native

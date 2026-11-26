@@ -9,8 +9,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import cluster
 from flydsl.expr.primitive import to_llvm_ptr
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -467,7 +467,9 @@ def launch_gemm_a8w8_256x256(
                     row = (row < i32_m).select(row, i32_m - 1)
                     _pf_hint(
                         gA_base,
-                        fx.Int64(row) * lda64 + k_pf + fx.Int64((idx % a_lpr) * PF_LINE),
+                        fx.Int64(row) * lda64
+                        + k_pf
+                        + fx.Int64((idx % a_lpr) * PF_LINE),
                     )
             b_lpg = PF_SPAN * 16 // PF_LINE
             b_me = fx.Int32(local_x) if const_expr(use_cluster) else fx.Int32(0)
