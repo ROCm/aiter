@@ -16,7 +16,17 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from . import common as fxh
 from .common import _ptr
 
-_SORTED_SUM_AOT_CACHE = FlyDSLAotCache("moe_gfx942_sorted_sum")
+_SORTED_SUM_AOT_CACHE = FlyDSLAotCache(
+    "moe_gfx942_sorted_sum",
+    sources=[
+        "kernels/moe_gemm_2stage/gfx9_fp8",
+    ],
+    # Read by common.py.
+    env=[
+        "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+        "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+    ],
+)
 
 
 @functools.cache
