@@ -1437,11 +1437,17 @@ def build_mega_moe_bundle_plan(
 # large-input kernel one config per capacity.
 
 
-def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
-    # The ring GEMM cores: 64-row m-tiles and 256-wide GEMM1 units on 4 waves.
+def _small_m_block_m(bucket: int, world_size: int) -> int:
+    # Up to 128 tokens an EP group, 32-row m-tiles: a kernel of the 32-row ring bodies alone, and twice the GEMM
+    # units of the experts that hold every token of a skewed launch, still one round of the grid.
+    return 32 if bucket * world_size <= 128 else 64
+
+
+def _small_m_stage1(bucket: int, block_m: int, expert_waves: int) -> Stage1Config:
+    # The ring GEMM cores: 256-wide GEMM1 units on 4 waves.
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
-        sort_block_m=64,
+        sort_block_m=block_m,
         tile_n=256,
         num_waves=4,
         grid_mult=grid_mult,
@@ -1456,10 +1462,14 @@ def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
     )
 
 
-def _small_m_stage2() -> Stage2Config:
-    # GEMM2 runs in the kernel's own grid on the ring GEMM cores' 64 x 256 tiles.
+def _small_m_stage2(block_m: int) -> Stage2Config:
+    # GEMM2 runs in the kernel's own grid on the ring GEMM cores' 256-wide tiles of the GEMM1 m-tiles.
     return Stage2Config(
-        block_m=64, block_n=256, persist=False, persist_cu=0, use_nt=True
+        block_m=block_m,
+        block_n=256,
+        persist=False,
+        persist_cu=0,
+        use_nt=True,
     )
 
 
@@ -1831,9 +1841,10 @@ def _fused_config(
         elif layout == V41_FLASH_EP8_LAYOUT:
             config = _tune_v41_flash_ep8_large(config)
         return _tune_a4w4_large(config, layout, bucket) if quant == "a4w4" else config
+    block_m = _small_m_block_m(bucket, world_size)
     config = MegaMoEConfig(
-        stage1=_small_m_stage1(bucket, expert_waves),
-        stage2=_small_m_stage2(),
+        stage1=_small_m_stage1(bucket, block_m, expert_waves),
+        stage2=_small_m_stage2(block_m),
         p2p_quant="none",
     )
     if layout == V41_FLASH_EP4_LAYOUT:

@@ -823,8 +823,10 @@ def compile_mega_moe_stage1(
     NUM_WAVES = int(num_waves)
     assert NUM_WAVES > 1, "planner needs one communication wave and at least one grouping wave"
     assert 1 <= waves_per_eu_hint <= 4
-    # The ring GEMM cores: 64-row m-tiles, each wave 64 GEMM1 columns (32 intermediate) and 64 GEMM2 columns.
-    assert sort_block_m == 64 and tile_n == 64 * NUM_WAVES
+    # The ring GEMM cores: 32- or 64-row m-tiles, each wave 64 GEMM1 columns (32 intermediate) and 64 GEMM2 columns.
+    # A 64-row m-tile of at most 32 rows runs the half-height bodies.
+    assert sort_block_m in (32, 64) and tile_n == 64 * NUM_WAVES
+    half_rows = sort_block_m // 2 if sort_block_m == 64 else 0
     assert (2 * inter_dim) % tile_n == 0, "2*inter_dim must tile evenly by tile_n"
     N_TILES = (2 * inter_dim) // tile_n
     GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
@@ -1099,12 +1101,12 @@ def compile_mega_moe_stage1(
             swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
         # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
         ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-            nw=NUM_WAVES, bm=sort_block_m // 2, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
-            q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m)
+            nw=NUM_WAVES, bm=half_rows, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
+            q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m) if half_rows else None
         ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m,
             bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
-        _, ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m // 2,
-            bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2, tile_rows=sort_block_m)
+        ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=half_rows, bn=g2_bn,
+            nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2, tile_rows=sort_block_m)[1] if half_rows else None
         ring_srcmap = ptr_buf_tensor(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(DispatchSlot.G2_STIDS))),
             fx.Int32)
         lds_i8 = fx.recast_iter(fx.Int8, lds.pool.ptr)
@@ -1234,15 +1236,22 @@ def compile_mega_moe_stage1(
                     expert=expert, m_tile=m_tile, n_tile=n_tile, tile_row_base=tile_row_base, rows=rows,
                     row_stride=row_stride)
 
-            if rows <= fx.Int32(sort_block_m // 2):
-                run(ring_g1_half)
-            elif const_expr(b_cache_modifier != 0):
-                if cached_w != fx.Int32(0):
-                    run(ring_g1[0])
+            def run_full():
+                if const_expr(b_cache_modifier != 0):
+                    if cached_w != fx.Int32(0):
+                        run(ring_g1[0])
+                    else:
+                        run(ring_g1[b_cache_modifier])
                 else:
-                    run(ring_g1[b_cache_modifier])
+                    run(ring_g1[0])
+
+            if const_expr(half_rows):
+                if rows <= fx.Int32(half_rows):
+                    run(ring_g1_half)
+                else:
+                    run_full()
             else:
-                run(ring_g1[0])
+                run_full()
 
         while consumer_active:
             if tid == fx.Int32(0):
@@ -1362,12 +1371,19 @@ def compile_mega_moe_stage1(
                 comm_ops.spin_from_until_eq_i32(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch, got)
             fx.barrier()
             # As in GEMM1, a rank that receives many rows reads W2 through the cache.
-            if rows <= fx.Int32(sort_block_m // 2):
-                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2, half=True)
-            elif cached_w != fx.Int32(0):
-                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
+            def run_full():
+                if cached_w != fx.Int32(0):
+                    _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
+                else:
+                    _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)
+
+            if const_expr(half_rows):
+                if rows <= fx.Int32(half_rows):
+                    _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2, half=True)
+                else:
+                    run_full()
             else:
-                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)
+                run_full()
 
         # GEMM2 waits for the plan CTA's flag (its first unit drops the L1 after its ready wait).
         if tid == fx.Int32(0):
@@ -1645,8 +1661,10 @@ class SmallMRuntime:
         op = self.comb_op._gm
         assert op is not None, "combine op was built without enable_group_major"
         self._s1_op = op
-        # Metadata of one block an m-tile.
+        # Metadata of one block an m-tile. The 32-row m-tiles of the small buckets (at most one per 32 routed rows
+        # and one more per expert) fit it too.
         metadata_blocks = (op.num_valid_max + self.sort_block_m - 1) // self.sort_block_m
+        assert ceildiv(self.world_size * self.mtpr * self.topk, 32) + self.epr <= metadata_blocks
         if metadata_blocks > op.max_blocks:
             op.max_blocks = metadata_blocks
             op.sorted_expert_ids = torch.zeros(metadata_blocks, dtype=torch.int32, device=self.dev)

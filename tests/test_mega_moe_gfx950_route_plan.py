@@ -377,7 +377,7 @@ _FUSED_CASES = (
     (8192, 8192),
     (16384, 16384),
 )
-_FUSED_DIGEST = "b9958a851e581db95a0f9f84f6a49a7c39f84c4152ed030a0b7db21b2d46f951"
+_FUSED_DIGEST = "579ba7f2e5c54b2169d3aefa502f80441c1a1b9c1720ca406803b03a9c31afc1"
 
 
 def test_fused_configs_unchanged():
@@ -451,7 +451,7 @@ def _knob_table(config):
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
 # small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
 # table.
-_EP4_FUSED_DIGEST = "ba2a80d69cab07e8120c30d292bdd7a14118feb2a3e414e39c7a52bc5075f931"
+_EP4_FUSED_DIGEST = "77fc702c58e28362362fb1b6d2c66fb4bfd97d77e66d5ac340e6b0c04816becb"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -508,7 +508,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table. Pinned with the ring GEMM cores at every small-input bucket.
 _V41EP8_FUSED_DIGEST = (
-    "3fd42b93b26b68f978c21d8564c1175eaec6e054a3b99f590028db67caaa8c4c"
+    "ca30aacb098c495302e26a8bebefabf5dac90d944734a399d4dda50e6668004d"
 )
 
 
@@ -550,13 +550,16 @@ def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
     ids=("v4_pro_ep8", "v41_flash_ep8", "v41_flash_ep4", "v41_flash_ep2"),
 )
 def test_small_m_ring_geometry(shape, quant):
-    """Every small-input kernel runs the ring GEMM cores (64-row m-tiles, 256-wide GEMM1 units and GEMM2 tiles)
-    on a co-resident grid: two CTAs a CU need two waves a SIMD."""
+    """Every small-input kernel runs the ring GEMM cores (32-row m-tiles up to 128 tokens an EP group, else 64;
+    256-wide GEMM1 units and GEMM2 tiles) on a co-resident grid: two CTAs a CU need two waves a SIMD.
+    """
+    world_size = shape.get("world_size", 8)
     for mtpr in (256, 512):
         for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
             config = select_fused_config(bucket, mtpr, quant=quant, **shape)
             s1, s2 = config.stage1, config.stage2
-            assert s1.sort_block_m == s2.block_m == 64, (mtpr, bucket)
+            block_m = 32 if bucket * world_size <= 128 else 64
+            assert s1.sort_block_m == s2.block_m == block_m, (mtpr, bucket)
             assert s1.tile_n == 64 * s1.num_waves and s2.block_n == 256, (mtpr, bucket)
             grid_mult = min(s1.grid_mult, 2)
             assert grid_mult == 1 or s1.waves_per_eu_hint >= 2, (mtpr, bucket)
@@ -748,7 +751,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "37631231269610919ed8705252e9e81283b65a413788d0a9d97c5014fc939426"
+_EP2_FUSED_DIGEST = "2d5d0fa6e04bec44db1aa0b122f5a1fbe7b9723406ad0d1d9fe0e77190b6ce19"
 
 
 def test_ep2_fused_configs_unchanged():
@@ -1055,10 +1058,10 @@ _A4W4_DIGEST_LARGE_MTPRS = {
     "v41_flash_ep2": (8192, 16384),
 }
 _A4W4_FUSED_DIGESTS = {
-    "v4_pro_ep8": "a42f736ad2bcc38bf70bcc35f85e1803f68141e344754eeabb0b3aa112449aa4",
-    "v41_flash_ep8": "488e187984fe82dd10c28e323f3704bce087adff749ef638c3e8867487f56157",
-    "v41_flash_ep4": "ab65022143342d3237e5eeb2cbe8ae4d3d04e9e89d39d289620b1f016acb48f5",
-    "v41_flash_ep2": "a1473a928a6cac8f19c9d16f093f8850fbff7136c9635078f01e3866d9ac75f1",
+    "v4_pro_ep8": "43b1c8f1dcde8f25e84301615feb6897572b7134840855eeb0135e2c5ab09d2e",
+    "v41_flash_ep8": "b1942f52f21381f187d5c4a7695e199139ffa089f534dae229257f90c515223d",
+    "v41_flash_ep4": "d77b83a12dd5863ad87f2b195e0274a4a96e10c27c331271c27d9b7e620ec9ce",
+    "v41_flash_ep2": "8cd5791530cd5ef0f6ee28483fe5c30b845be2002e90c9928dd396f46d9767d1",
 }
 
 
