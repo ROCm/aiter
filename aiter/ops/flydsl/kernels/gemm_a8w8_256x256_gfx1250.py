@@ -5,9 +5,12 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
+from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
+from flydsl.expr.primitive import to_llvm_ptr
 from flydsl.expr.typing import Constexpr, T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -93,6 +96,7 @@ def launch_gemm_a8w8_256x256(
     batch: fx.Int32 = 1,
     fuse_quant_out: Constexpr[bool] = False,
     ragged_n: Constexpr[bool] = False,
+    l2_prefetch: Constexpr[int] = 0,
 ):
     """A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
     compiled in; ``use_cluster`` is False only for a launch of one workgroup.
@@ -147,6 +151,10 @@ def launch_gemm_a8w8_256x256(
     assert (
         not (early_a or early_b) or split_k == 1
     ), "early A/B merge currently requires split_k=1"
+    assert l2_prefetch in (0, 1, 2), f"l2_prefetch must be 0, 1 or 2, got {l2_prefetch}"
+    assert not l2_prefetch or (
+        not batched and persistent_n_tiles == 1
+    ), "l2_prefetch needs a non-batched, non-persistent launch"
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
@@ -333,6 +341,7 @@ def launch_gemm_a8w8_256x256(
         + ("_mbn" if batched else "")
         + ("_fq" if fuse_quant_out else "")
         + ("_rn" if ragged_n else "")
+        + (f"_pf{l2_prefetch}" if l2_prefetch else "")
     )
 
     def _run_tile(
@@ -431,6 +440,61 @@ def launch_gemm_a8w8_256x256(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
+
+        # L2 prefetch (l2_prefetch = D): each steady rev hints the A rows and B column
+        # groups the TDM refills will read D revs later, so those refills hit L2. CTAs
+        # of a cluster that share an operand split its lines. Hints only: no data,
+        # order or result changes.
+        PF_SPAN = num_buffers * SUPER_K  # K bytes one steady rev covers
+        PF_LINE = 128
+
+        def _pf_hint(base_iter, off64):
+            rocdl_dialect.global_prefetch(
+                to_llvm_ptr(fx.add_offset(base_iter, off64)),
+                cache_policy=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 8),
+            )
+
+        def _l2_prefetch_k(k_pf):
+            k_hi = fx.Int64(kt_base * tile_k) + fx.Int64(K_TILES * tile_k - PF_SPAN)
+            k_pf = (k_pf < k_hi).select(k_pf, k_hi)
+            if const_expr(not a_preshuffle):
+                a_lpr = PF_SPAN // PF_LINE
+                a_share = cluster_n if const_expr(use_cluster) else 1
+                a_me = fx.Int32(local_y) if const_expr(use_cluster) else fx.Int32(0)
+                for j in range_constexpr(tile_m * a_lpr // (block * a_share)):
+                    idx = (tid + j * block) * a_share + a_me
+                    row = blk_m + idx // a_lpr
+                    row = (row < i32_m).select(row, i32_m - 1)
+                    _pf_hint(
+                        gA_base,
+                        fx.Int64(row) * lda64 + k_pf + fx.Int64((idx % a_lpr) * PF_LINE),
+                    )
+            b_lpg = PF_SPAN * 16 // PF_LINE
+            b_me = fx.Int32(local_x) if const_expr(use_cluster) else fx.Int32(0)
+
+            def _pf_b(share):
+                for j in range_constexpr((tile_n // 16) * b_lpg // (block * share)):
+                    idx = (tid + j * block) * share + b_me
+                    grp = blk_n // 16 + idx // b_lpg
+                    grp = (grp < i32_n // 16).select(grp, i32_n // 16 - 1)
+                    _pf_hint(
+                        gB_base,
+                        fx.Int64(grp) * Kp16
+                        + k_pf * 16
+                        + fx.Int64((idx % b_lpg) * PF_LINE),
+                    )
+
+            if const_expr(use_cluster):
+                # B is shared by the cluster_m CTAs of a cluster column (1, 2 or 4).
+                if i32_cm == 4:
+                    _pf_b(4)
+                else:
+                    if i32_cm == 2:
+                        _pf_b(2)
+                    else:
+                        _pf_b(1)
+            else:
+                _pf_b(1)
 
         k_elem0 = kt_base * tile_k
         a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
@@ -1571,6 +1635,11 @@ def launch_gemm_a8w8_256x256(
         def _run_steady(owner_parity):
             for rev in range(n_full):
                 rev_delta = (rev * num_buffers) * tdm_global_step
+                if const_expr(l2_prefetch > 0):
+                    _l2_prefetch_k(
+                        fx.Int64(kt_base * tile_k)
+                        + fx.Int64(rev + 1 + l2_prefetch) * fx.Int64(PF_SPAN)
+                    )
                 do_sync = (rev % cluster_sync_revs) == (cluster_sync_revs - 1)
 
                 def _first_refill(rev=rev):
@@ -1604,6 +1673,9 @@ def launch_gemm_a8w8_256x256(
                 has_side_effects=True,
             )
         )
+        if const_expr(l2_prefetch > 0):
+            for pf_rev in range_constexpr(1, l2_prefetch + 1):
+                _l2_prefetch_k(fx.Int64(kt_base * tile_k) + fx.Int64(pf_rev * PF_SPAN))
         if wave_parity == 0:
             _run_steady(0)
         else:
