@@ -109,9 +109,9 @@ def _check_layouts(tp, rank, world, device, rows, width, dtype):
             assert _same(out, ref), f"layout gather_dim={gather_dim} differs, iter {it}"
             if gather_dim == -1:
                 rccl = _rccl_unpack(tp, x, world)
-                assert torch.equal(out.view(torch.uint8), rccl.view(torch.uint8)), (
-                    "differs from RCCL + transpose"
-                )
+                assert torch.equal(
+                    out.view(torch.uint8), rccl.view(torch.uint8)
+                ), "differs from RCCL + transpose"
     ca = tp.device_communicator.ca_comm
     assert ca.should_custom_a2a(x), "fast path not taken for a 16-byte-row matrix"
 
@@ -152,16 +152,16 @@ def _check_registered(tp, rank, world, device, rows, d):
         bc.copy_(codes)
         bs.copy_(scales)
         outs.append(tp.all_to_all(bc, 0, -1, scales=bs, registered=True))
-        expect.append((codes.cpu(), scales.cpu()))
+        expect.append((codes, scales))  # stay on the GPU: no host wait inside the loop
     torch.cuda.synchronize()
     for it, ((oc, os_), (c, s)) in enumerate(zip(outs, expect)):
-        peers_c, peers_s = _gather_host(c), _gather_host(s)
-        assert _same(oc, _reference(peers_c, rank, world, 0, -1)), (
-            f"registered codes differ, iter {it}"
-        )
-        assert _same(os_, _reference(peers_s, rank, world, 0, -1)), (
-            f"registered scales differ, iter {it}"
-        )
+        peers_c, peers_s = _gather_host(c.cpu()), _gather_host(s.cpu())
+        assert _same(
+            oc, _reference(peers_c, rank, world, 0, -1)
+        ), f"registered codes differ, iter {it}"
+        assert _same(
+            os_, _reference(peers_s, rank, world, 0, -1)
+        ), f"registered scales differ, iter {it}"
 
 
 def _check_graph(tp, rank, world, device, rows, d):
@@ -196,12 +196,12 @@ def _check_graph(tp, rank, world, device, rows, d):
             graph.replay()
         torch.cuda.synchronize()
         for name, (oc, os_) in (("staged", staged), ("registered", reg)):
-            assert _same(oc, _reference(peers_x, rank, world, 0, -1)), (
-                f"graph {name} codes differ, gen {gen_i}"
-            )
-            assert _same(os_, _reference(peers_s, rank, world, 0, -1)), (
-                f"graph {name} scales differ, gen {gen_i}"
-            )
+            assert _same(
+                oc, _reference(peers_x, rank, world, 0, -1)
+            ), f"graph {name} codes differ, gen {gen_i}"
+            assert _same(
+                os_, _reference(peers_s, rank, world, 0, -1)
+            ), f"graph {name} scales differ, gen {gen_i}"
 
 
 def _check_fallback(tp, rank, world, device):
@@ -220,9 +220,9 @@ def _check_fallback(tp, rank, world, device):
     for shape, dtype, sd, gd in cases:
         x = _data(gen, shape, dtype, device)
         out = tensor_model_parallel_all_to_all(x, sd, gd)
-        assert _same(out, _reference(_all_inputs(x), rank, world, sd, gd)), (
-            f"fallback {shape} {sd}->{gd}"
-        )
+        assert _same(
+            out, _reference(_all_inputs(x), rank, world, sd, gd)
+        ), f"fallback {shape} {sd}->{gd}"
     # explicit NCCL on a fast-path shape
     x = _data(gen, (world * 8, 64), torch.bfloat16, device)
     out = tensor_model_parallel_all_to_all(x, 0, -1, use_custom=False)

@@ -1421,9 +1421,9 @@ class GroupCoordinator:
         if world_size == 1:
             return input_ if scales is None else (input_, scales)
         ndim = input_.dim()
-        assert -ndim <= scatter_dim < ndim and -ndim <= gather_dim < ndim, (
-            f"Invalid dims ({scatter_dim}, {gather_dim}) for shape {tuple(input_.shape)}"
-        )
+        assert (
+            -ndim <= scatter_dim < ndim and -ndim <= gather_dim < ndim
+        ), f"Invalid dims ({scatter_dim}, {gather_dim}) for shape {tuple(input_.shape)}"
         scatter_dim %= ndim
         gather_dim %= ndim
         assert input_.shape[scatter_dim] % world_size == 0, (
