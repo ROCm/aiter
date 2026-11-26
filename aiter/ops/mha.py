@@ -3482,12 +3482,16 @@ def _flash_attn_varlen_forward(
         # one cu_seqlens for both. Contents are not compared, which would sync every call; equal
         # totals and maxima do not imply equal lengths, so a separate cu_seqlens_k stays off
         # these rows. is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu checks the same pointers.
+        # The rows take no mask or a causal one only: get_cfg_mask_type rejects any other
+        # window, and fmha_v3_varlen_fwd has no CK fallback, so such a GQA call must stay on CK.
         return (
             get_gfx() == "gfx950"
             and q.dtype == dtypes.bf16
             and hdim_q == 256
             and hdim_v == 256
             and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
+            and window_size_left == -1
+            and window_size_right in (-1, 0)
             and cu_seqlens_q_padded is None
             and cu_seqlens_k_padded is None
             and block_table is None
