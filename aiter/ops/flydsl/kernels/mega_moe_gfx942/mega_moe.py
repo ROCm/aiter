@@ -74,7 +74,6 @@ from contextlib import nullcontext
 
 import torch
 
-from ..mega_moe import envs
 from . import weights as _weights
 
 _EP = 8
@@ -117,10 +116,9 @@ class MegaMoEGfx942:
     """One rank's EP8 a8w4 / a8w8 MoE layer. Construction is collective: every rank
     builds the same instances in the same order after MORI shmem is initialized.
 
-    ``small_m_mtprs``, ``small_m_enabled`` and ``large_m_enabled`` are MegaMoEV2's
-    arguments (None: the ``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M`` flags).
-    small_M takes up to max(``small_m_mtprs``) tokens per rank. With large_M enabled,
-    ``forward`` runs it and the main path is not built."""
+    ``small_m_enabled`` builds small_M, which takes up to max(``small_m_mtprs``)
+    tokens per rank. With ``large_m_enabled``, ``forward`` runs large_M and the main
+    path is not built. Both are off by default."""
 
     def __init__(
         self,
@@ -140,8 +138,8 @@ class MegaMoEGfx942:
         act="silu",
         swiglu_limit=0.0,
         small_m_mtprs=(128,),
-        small_m_enabled=None,
-        large_m_enabled=None,
+        small_m_enabled=False,
+        large_m_enabled=False,
         x_quant="per_1x128",
     ):
         if not eligible(
@@ -190,10 +188,6 @@ class MegaMoEGfx942:
         self._W = self._weight_dict(w1, w1_scale, w2, w2_scale)
         if quant != "a8w4" and x_quant != "per_1x128":
             raise ValueError("a8w8 quantizes x per 1x128 (x_quant='per_1x128')")
-        if large_m_enabled is None:
-            large_m_enabled = envs.AITER_MEGA_LARGE_M
-        if small_m_enabled is None:
-            small_m_enabled = envs.AITER_MEGA_SMALL_M
         # large_M quantizes x per 1x128 only.
         large_on = bool(large_m_enabled) and x_quant == "per_1x128"
         small_mtpr = max(int(m) for m in small_m_mtprs) if small_m_enabled else 0
@@ -398,8 +392,8 @@ class MegaMoEGfx942:
         path asked for is the one built."""
         if enabled and self._large is None:
             raise RuntimeError(
-                "the large-input path is not built (large_m_enabled or "
-                "AITER_MEGA_LARGE_M, x_quant='per_1x128')"
+                "the large-input path is not built (large_m_enabled, "
+                "x_quant='per_1x128')"
             )
         if not enabled and self._main is None:
             raise RuntimeError(
@@ -509,9 +503,7 @@ class MegaMoEGfx942:
         small-input capacity (a8w8). ``max_tokens``: the most rows of this call on any
         EP rank, the same on every rank."""
         if self._small is None:
-            raise RuntimeError(
-                "the small-input path is off (small_m_enabled, AITER_MEGA_SMALL_M)"
-            )
+            raise RuntimeError("the small-input path is off (small_m_enabled)")
         if x_bf16.dtype != torch.bfloat16:
             raise TypeError(f"x is {x_bf16.dtype}, forward_small_m takes bfloat16")
         need = int(max_tokens)
