@@ -688,10 +688,10 @@ def make_s1f_stage1(
         raise ValueError(
             f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
-    if SUB > 1 and not POLL:
+    if SUB > 1 and npes > 8:
         raise ValueError(
-            "an m-tile of several flag tiles reads one b128 of flags per flag "
-            f"tile, which holds 4 sources, not npes={npes}"
+            "an m-tile of several flag tiles joins tile_info's 8-bit source "
+            f"masks, not npes={npes}"
         )
     if row_stride > 0xFFFF:
         raise ValueError("TDM row width is 16-bit")
@@ -1837,15 +1837,30 @@ def make_s1f_stage1(
                 on = lane < fx.Int32(SUB)
                 if const_expr(live is not None):
                     on = on & live
-                return fx.Vector(
-                    buffer_load(
-                        rsrc_flag,
-                        (m * fx.Int32(SUB) + lane) * fx.Int32(FLAG_STRIDE // 4),
-                        vec_width=4,
-                        dtype=T.i32,
-                        mask=on,
-                        cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                fbase = (m * fx.Int32(SUB) + lane) * fx.Int32(FLAG_STRIDE // 4)
+
+                def _chunk(i):
+                    return fx.Vector(
+                        buffer_load(
+                            rsrc_flag,
+                            fbase + fx.Int32(4 * i),
+                            vec_width=4,
+                            dtype=T.i32,
+                            mask=on,
+                            cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                        )
                     )
+
+                if const_expr(int(npes) <= 4):
+                    return _chunk(0)
+                # npes <= 8: two b128s per lane (one per 4 sources).
+                lo = _chunk(0)
+                hi = _chunk(1)
+                return fx.Vector.from_elements(
+                    [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]][
+                        : int(npes)
+                    ],
+                    dtype=fx.Int32,
                 )
 
             def ready_sub(fv, ts):
