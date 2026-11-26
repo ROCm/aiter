@@ -93,7 +93,9 @@ def load_config(path=None):
 
 
 def random_weights(cfg, dtype, seed=0):
-    D, H, K, W, R = (cfg[n] for n in ("hidden", "heads", "head_dim", "conv", "gate_rank"))
+    D, H, K, W, R = (
+        cfg[n] for n in ("hidden", "heads", "head_dim", "conv", "gate_rank")
+    )
     g = torch.Generator(device="cpu").manual_seed(seed)
 
     def p(*shape, std):
@@ -140,7 +142,9 @@ def _read(path, wmap, names):
     return out
 
 
-def load_kda_layer(layer, path=None, dtype=torch.bfloat16, device="cuda", cfg=None, a_log="error"):
+def load_kda_layer(
+    layer, path=None, dtype=torch.bfloat16, device="cuda", cfg=None, a_log="error"
+):
     """KDALayerWeights for 0-indexed decoder ``layer`` of Tiny-L13.
 
     The published K3 checkpoints store ``A_log`` as [head_dim] (128), while
@@ -151,7 +155,9 @@ def load_kda_layer(layer, path=None, dtype=torch.bfloat16, device="cuda", cfg=No
     """
     cfg = cfg or load_config(path)
     if layer not in cfg["kda_layers"]:
-        raise ValueError(f"layer {layer} is not a KDA layer; KDA layers are {cfg['kda_layers']}")
+        raise ValueError(
+            f"layer {layer} is not a KDA layer; KDA layers are {cfg['kda_layers']}"
+        )
     path = checkpoint_path(path)
     if path is None:
         w = random_weights(cfg, dtype, seed=layer)
