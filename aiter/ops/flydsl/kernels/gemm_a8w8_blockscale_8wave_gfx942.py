@@ -293,8 +293,8 @@ def compile_gemm_fp8_blockscale_gfx942(
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
         ### Register tensors.
-        # a_prefetch_reg: four A packets; b_prefetch_reg: two B slots (packet % 2). Both hold
-        # the next K tile in VGPRs until its LDS packet is free.
+        # a_prefetch_reg: four A packets; b_prefetch_reg: two B slots (packet % 2).
+        # Both hold the next K tile in VGPRs until its LDS packet is free.
         # frag_B column quadrant_n * 4 + n0 * 2 + half_k: all B operands of a
         # K tile, read in stage 0.
         a_prefetch_reg = fx.make_rmem_tensor(
@@ -370,7 +370,7 @@ def compile_gemm_fp8_blockscale_gfx942(
                 scaleA_rsrc,
                 fx.Int32(scaleA_src_offsets[packet * PHASE_M_REP + m0]).ir_value(),
                 fx.Int32(ki * M * 4).ir_value(),
-                fx.Int32(0).ir_value(),
+                0,
             )
             return Vec.from_elements([fx.Float32(value)], fx.Float32)
 
