@@ -716,7 +716,12 @@ def fused_moe(
     # Entry "api": an enabled path may run this call on aiter.moev2.
     # aiter.moev2.api.op_call copies how this function calls fused_moe_; mirror
     # changes to those arguments there.
-    if not torch.compiler.is_compiling() and moev2_paths.any_active():
+    # No v2 path rotates the SwiGLU output yet, so inter_hadamard stays legacy.
+    if (
+        not inter_hadamard
+        and not torch.compiler.is_compiling()
+        and moev2_paths.any_active()
+    ):
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "api")
         if v2_path is not None:
@@ -1197,7 +1202,7 @@ def fused_moe_(
     # (@qli88). See aiter/moev2/README.md.
     # Entry "op": an enabled path may run this call on aiter.moev2 instead of
     # _fused_moe_impl; DECLINED hands it back.
-    if moev2_paths.any_active():
+    if not inter_hadamard and moev2_paths.any_active():
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "op")
         if v2_path is not None:
@@ -1539,7 +1544,7 @@ def _fused_moe_impl(
             "gate_mode=INTERLEAVE)"
         )
 
-    if _can_use_bf16_g1u1_small_m_direct(
+    if not inter_hadamard and _can_use_bf16_g1u1_small_m_direct(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -1801,6 +1806,11 @@ def _fused_moe_impl(
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "whole-graph MoE never exposes the SwiGLU output."
+            )
         request = FusedMoeRequest(
             hidden_states=hidden_states,
             w1=w1,

@@ -189,6 +189,7 @@ def op_call(call) -> dict | None:
         "deterministic": call["deterministic"],
         "w1_global_scale": call["w1_global_scale"],
         "w2_global_scale": call["w2_global_scale"],
+        "inter_hadamard": call["inter_hadamard"],
     }
 
 
@@ -236,8 +237,14 @@ def fused_moe(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    inter_hadamard: int = 0,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
+    if inter_hadamard:
+        raise NotImplementedError(
+            "no aiter.moev2 path rotates the SwiGLU output (inter_hadamard); "
+            "use aiter.fused_moe.fused_moe (the legacy code)"
+        )
     call = dict(locals())
     op = None
     for path in paths.registered().values():
