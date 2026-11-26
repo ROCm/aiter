@@ -257,6 +257,8 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
                                                              bool gemma,
                                                              int maxit)
 {
+// gfx1250-only instructions (async global -> LDS); the other device passes get an empty body.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     __shared__ __align__(16) float partial[2][32];
     __shared__ uint32_t s_base;
     extern __shared__ __align__(16) u32x4 ar2s_pf[]; // [2][NG + 1][rp]
@@ -477,6 +479,7 @@ __global__ void __launch_bounds__(1024, 16) ar2s_rms_kernel(Peers peers,
     }
     if(t == 0)
         my_flags->counter[b] = base + S;
+#endif // defined(__gfx1250__) || defined(__gfx1250_strict__)
 }
 
 struct Ctx
