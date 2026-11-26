@@ -43,7 +43,7 @@ serve this call.
 
 Beyond the window: 2048 rows iface 263.8 / custom 2-stage 263.7 / unfused 252.9 us, 4096 rows 511.4 / 512.9 / 493.5
 (graph, 16 calls); eager prefill calls (no graph): 1024 rows iface 147.6 / unfused 140.3 us, 2048 275.2 / 264.7, 4096
-537.2 / 511.2. The unfused pair is 3.6-5% faster than the custom fused kernel there (and at every row count of
+537.2 / 511.2. The unfused pair is 3.6-5% faster than the custom fused kernel there (and 2.5-15% faster at every row count of
 the table above); the custom fused kernel is never the fastest candidate for Gemma at hidden 6144 on this platform.
 
 ## Fit of the pull ladder (each kernel forced on every row, same protocol)
