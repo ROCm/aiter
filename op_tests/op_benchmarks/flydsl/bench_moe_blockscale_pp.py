@@ -13,7 +13,8 @@ replayed alternately for 21 rounds, and the median per call is reported.
   hk      aiter.ops.hk_fp8_moe (PR 6742), when importable
 
 Every output is checked against the FP32 reference (relative L2 < 0.06), and
-the kernels each candidate launched are recorded by name. For stable numbers,
+the kernels each candidate launched are recorded by name. ``flydsl speedup`` is
+a candidate's time over FlyDSL's for the same case (above 1: FlyDSL is faster). For stable numbers,
 run one case per process on an idle GPU:
 
   python op_tests/op_benchmarks/flydsl/bench_moe_blockscale_pp.py -t 8192 -k 8
@@ -153,6 +154,7 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
 
     routed = int((ids >= 0).logical_and(ids < E).sum())
     flops = routed * 2 * (4096 * 2 * 1024 + 1024 * 4096)
+    fly_us = statistics.median(samples["flydsl"])
     result = []
     for name, v in samples.items():
         err = info[name]["err"]
@@ -163,6 +165,7 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
                 "topk": topk,
                 "candidate": name,
                 "us": statistics.median(v),
+                "flydsl speedup": statistics.median(v) / fly_us,
                 "min us": min(v),
                 "TFLOPS": flops / statistics.median(v) / 1e6,
                 "err": err,
