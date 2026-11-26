@@ -46,6 +46,10 @@ from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     run_gemm_a8w8_mxfp8_32_stream_gfx1250,
 )
+from .mxfp8_decode_gemm_gfx1250 import (
+    MX32_DECODE_NAME_PREFIX,
+    run_gemm_a8w8_mxfp8_32_decode_gfx1250,
+)
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -547,16 +551,23 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
     )
     if name.startswith(MX32_STREAM_NAME_PREFIX + "_"):
-        # Decode weight-streaming kernel: B = 1, row-major A and A scale, 1x32 B scale.
+        run_b1 = run_gemm_a8w8_mxfp8_32_stream_gfx1250
+    elif name.startswith(MX32_DECODE_NAME_PREFIX + "_"):
+        run_b1 = run_gemm_a8w8_mxfp8_32_decode_gfx1250
+    else:
+        run_b1 = None
+    if run_b1 is not None:
+        # The streaming and decode kernels: B = 1, row-major A and A scale, 1x32
+        # B scale.
         if b != 1 or fused or w_scale_32x32:
             raise ValueError(
-                f"[FlyDSL gfx1250 bmm] stream kernel {name!r} needs B=1, a 1x32 "
-                "w_scale and no fused output quant"
+                f"[FlyDSL gfx1250 bmm] {name!r} needs B=1, a 1x32 w_scale and no "
+                "fused output quant"
             )
         if m:
             from aiter.utility import dtypes
 
-            run_gemm_a8w8_mxfp8_32_stream_gfx1250(
+            run_b1(
                 XQ[:, 0],
                 WQ[0],
                 x_scale[:, 0].view(dtypes.fp8_e8m0),

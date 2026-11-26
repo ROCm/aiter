@@ -1,67 +1,71 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 decode GEMM on the native-MXFP8 path:
-kernels/mxfp8_decode_gemm_gfx1250.py.
+"""Decode-shaped gfx1250 MXFP8 1x32 GEMM (kernels/mxfp8_decode_gemm_gfx1250.py) as
+a tuned kernel.
 
-Same operands and bf16 output as ``gemm_a8w8_blockscale(isBpreshuffled=True)``;
-the values differ from the tuned GEMM's only by the FP32 K order (rare one-ulp
-bf16 flips). Callers check ``mxfp8_decode_gemm_supported`` and keep the tuned
-GEMM for the shapes it declines.
+A tuned row selects it by kernelName (``flydsl_mxfp8_32_bpreshuffle_decode_*``)
+and the B = 1 batched runner launches it, as it does the streaming kernel. The
+name carries the tile: ``t`` rows a workgroup, ``nb`` 16-column blocks, ``ks``
+split-K workgroups, ``kw`` K-waves, ``wn`` N-waves and ``d`` K steps of weight
+loads in flight. Weight loads are non-temporal and the activation goes to LDS by
+TDM. The values differ from the other kernels' only by the FP32 K order.
 """
 
 from __future__ import annotations
 
 import functools
+import re
 
 import torch
 
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-# Decode token counts only: past 32 rows the tuned GEMM is as fast or faster.
-_MAX_ROWS = 32
-# K-waves of a workgroup: with one 128-wide K step each, every weight load of
-# the workgroup is in flight at once.
+MX32_DECODE_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_decode"
+_KERNEL_NAME_RE = re.compile(
+    rf"^{re.escape(MX32_DECODE_NAME_PREFIX)}_t(?P<tile_m>\d+)_nb(?P<nb>\d+)"
+    r"_ks(?P<ks>\d+)_kw(?P<kw>\d+)_wn(?P<wn>\d+)_d(?P<wdepth>\d+)$"
+)
+# Tuner candidates: decode token counts, and at most 16 K-waves (with one 128-wide
+# K step each, every weight load of a workgroup is in flight at once).
+_CANDIDATE_MAX_M = 128
 _MAX_K_WAVES = 16
 
 
-@functools.cache
-def mxfp8_decode_gemm_config(m: int, n: int, k: int):
-    """The kernel config for ``m`` rows of an (n, k) GEMM, or None (not served).
+def mxfp8_32_decode_kernel_name(tile_m, nb, ks, kw, wn, wdepth) -> str:
+    return f"{MX32_DECODE_NAME_PREFIX}_t{tile_m}_nb{nb}_ks{ks}_kw{kw}_wn{wn}_d{wdepth}"
 
-    One M tile (16 rows up to 16 rows, else 32); one K-wave per 128-wide K step
-    (at most 16, each taking an equal share of the K steps); and the fewest
-    16-column blocks per workgroup that keep the grid within one workgroup per
-    CU. Weight loads are non-temporal and the activation goes to LDS by TDM.
-    """
-    from aiter.jit.utils.chip_info import get_cu_num
 
+def parse_mxfp8_32_decode_kernel_name(name: str) -> dict | None:
+    m = _KERNEL_NAME_RE.fullmatch(name)
+    return {key: int(v) for key, v in m.groupdict().items()} if m else None
+
+
+@functools.lru_cache(maxsize=4096)
+def mxfp8_32_decode_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
+    cfg = parse_mxfp8_32_decode_kernel_name(kernel_name)
+    if cfg is None or M <= 0 or N % 32 or K % 128:
+        return False
     from .kernels.mxfp8_decode_gemm_gfx1250 import decode_gemm_config_error
 
-    if not 0 < m <= _MAX_ROWS or n % 32 or k % 128:
-        return None
-    tile_m = 16 if m <= 16 else 32
-    steps = k // 128
+    return decode_gemm_config_error(N, K, **cfg, atdm=1) is None
+
+
+def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
+    """Decode kernelNames the tuner times: 16- or 32-row tiles, 1 to 8 column
+    blocks, the most K-waves (up to 16) that split the K steps evenly, and one
+    K step or all of a wave's K steps of weight loads in flight."""
+    if not 0 < M <= _CANDIDATE_MAX_M or N % 32 or K % 128:
+        return []
+    steps = K // 128
     kw = max(w for w in range(1, _MAX_K_WAVES + 1) if steps % w == 0)
-    n_blocks = n // 16
-    nb = next(
-        nb
-        for nb in range(1, n_blocks + 1)
-        if n_blocks % nb == 0 and n_blocks // nb <= get_cu_num()
-    )
-    # (tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
-    cfg = (tile_m, nb, 1, kw, 1, 1, 1, 1)
-    if decode_gemm_config_error(n, k, tile_m, nb, 1, kw, 1, 1, atdm=1):
-        return None
-    return cfg
-
-
-def mxfp8_decode_gemm_supported(m: int, n: int, k: int) -> bool:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return (
-        get_gfx_runtime() == "gfx1250" and mxfp8_decode_gemm_config(m, n, k) is not None
-    )
+    names = [
+        mxfp8_32_decode_kernel_name(tile_m, nb, 1, kw, 1, wdepth)
+        for tile_m in (16, 32)
+        for nb in (1, 2, 3, 4, 6, 8)
+        for wdepth in sorted({1, steps // kw})
+    ]
+    return [name for name in names if mxfp8_32_decode_kernel_launchable(name, M, N, K)]
 
 
 @functools.cache
@@ -84,59 +88,58 @@ def _slab(device, numel):
     return _slab_cached(device, torch.cuda.current_stream(device).cuda_stream, bucket)
 
 
-def mxfp8_decode_gemm(
-    x: torch.Tensor,
+def run_gemm_a8w8_mxfp8_32_decode_gfx1250(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
     x_scale: torch.Tensor,
-    w: torch.Tensor,
     w_scale: torch.Tensor,
-    out: torch.Tensor | None = None,
-    *,
-    config: tuple | None = None,
+    Out: torch.Tensor,
+    kernel_name: str,
 ) -> torch.Tensor:
-    """out[M, N] bf16 = x [M, K] (e4m3, unit column stride, 16-byte row stride) with
-    x_scale [M, K / 32] (e8m0, row-major) times w [N, K] ((16, 16)-preshuffled e4m3)
-    with w_scale (32x4-shuffled e8m0, shuffle_mxfp8_bpreshuffle_scale)."""
+    """Out [M, N] bf16 = XQ [M, K] (e4m3, unit column stride, 16-byte row stride)
+    with x_scale [M, K / 32] (e8m0, row-major) times WQ [N, K] ((16, 16)-preshuffled
+    e4m3) with w_scale [N, K / 32] (32x4-shuffled e8m0)."""
     import flydsl.expr as fx
 
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
-    m, k = x.shape
-    n = w.shape[0]
-    cfg = config or mxfp8_decode_gemm_config(m, n, k)
-    if cfg is None:
-        raise ValueError(f"mxfp8_decode_gemm: no config for M={m} N={n} K={k}")
+    m, k = XQ.shape
+    n = WQ.shape[0]
+    if not mxfp8_32_decode_kernel_launchable(kernel_name, max(m, 1), n, k):
+        raise ValueError(
+            f"[FlyDSL gfx1250 decode] {kernel_name!r} cannot run N={n} K={k}"
+        )
+    cfg = parse_mxfp8_32_decode_kernel_name(kernel_name)
     if (
-        x.dtype != torch.float8_e4m3fn
-        or tuple(w.shape) != (n, k)
-        or x.stride(1) != 1
-        or x.stride(0) % 16
+        XQ.element_size() != 1
+        or tuple(WQ.shape) != (n, k)
+        or XQ.stride(1) != 1
+        or XQ.stride(0) % 16
         or tuple(x_scale.shape) != (m, k // 32)
         or not x_scale.is_contiguous()
         or tuple(w_scale.shape) != (n, k // 32)
-        or not (w.is_contiguous() and w_scale.is_contiguous())
+        or not (WQ.is_contiguous() and w_scale.is_contiguous())
+        or Out.dtype != torch.bfloat16
+        or tuple(Out.shape) != (m, n)
+        or not Out.is_contiguous()
     ):
-        raise ValueError("mxfp8_decode_gemm: operand shapes / strides")
-    if out is None:
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    elif (
-        out.dtype != torch.bfloat16
-        or tuple(out.shape) != (m, n)
-        or not out.is_contiguous()
-    ):
-        raise ValueError("mxfp8_decode_gemm: out must be a contiguous bf16 [M, N]")
+        raise ValueError(
+            "[FlyDSL gfx1250 decode] needs an fp8 A with a 16-byte row stride, "
+            "contiguous B and scales, and a contiguous bf16 C"
+        )
     if m == 0:
-        return out
-    cfg = tuple(cfg) + (0,) * (8 - len(cfg))
-    tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm = cfg
+        return Out
+    tile_m, ks = cfg["tile_m"], cfg["ks"]
     mpad = (m + tile_m - 1) // tile_m * tile_m
-    slab = _slab(x.device, ks * mpad * n) if ks > 1 else out
-    stream = torch.cuda.current_stream(x.device)
-    spec = (n, k, tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
+    slab = _slab(XQ.device, ks * mpad * n) if ks > 1 else Out
+    stream = torch.cuda.current_stream(XQ.device)
+    # (N, K, tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
+    spec = (n, k, tile_m, cfg["nb"], ks, cfg["kw"], cfg["wn"], cfg["wdepth"], 1, 1)
     _run_compiled(
         _launcher(),
-        ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(out), ptr_arg(slab),
-        m, x.stride(0), mpad, fx.Stream(stream),
+        ptr_arg(XQ), ptr_arg(x_scale), ptr_arg(WQ), ptr_arg(w_scale), ptr_arg(Out), ptr_arg(slab),
+        m, XQ.stride(0), mpad, fx.Stream(stream),
         *spec,
-        specialization_key=("mxfp8_decode_gemm", x.device.index) + spec,
+        specialization_key=("mxfp8_32_decode", XQ.device.index) + spec,
     )  # fmt: skip
-    return out
+    return Out

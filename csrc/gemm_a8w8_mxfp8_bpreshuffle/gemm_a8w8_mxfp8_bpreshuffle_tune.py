@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Tune gemm_a8w8_mxfp8_bpreshuffle (FP8 GEMM, e8m0 microscales).
 
-On gfx1250, 1x32 tuning searches every legal direct, dedicated-small-M, and
-B=1 batched FlyDSL candidate with CUDA Graph timing, then keeps a replacement
-only after paired stable confirmation clears the configured gain threshold.
+On gfx1250, 1x32 tuning searches every legal direct, dedicated-small-M, B=1
+batched, weight-streaming and decode FlyDSL candidate with CUDA Graph timing,
+then keeps a replacement only after paired stable confirmation clears the
+configured gain threshold.
 
 gfx950 runs two FlyDSL pipelines on unshuffled row-major scales (x_scale
 [M, K/32], w_scale [N, K/32]): the mxpsh kernel and the 8-wave 256x256 one
@@ -582,6 +583,9 @@ KERNEL_ID_BASE_BMM = 3_000_000
 # Decode weight-streaming mxfp8_32 kernels (flydsl_mxfp8_32_bpreshuffle_stream_*),
 # run through the same B = 1 bmm dispatch.
 KERNEL_ID_BASE_STREAM = 3_900_000  # inside the bmm id range: rows get kernelId "bmm"
+# Decode mxfp8_32 kernels (flydsl_mxfp8_32_bpreshuffle_decode_*), also run through
+# the B = 1 bmm dispatch.
+KERNEL_ID_BASE_DECODE = 3_950_000
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
@@ -671,7 +675,7 @@ def gfx1250_candidates(m, n, k):
 
 
 def gfx1250_1x32_runs(m, n, k):
-    """Every legal direct and B=1 batched 1x32 candidate."""
+    """Every legal direct, B=1 batched, streaming and decode 1x32 candidate."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
         bmm_candidates as gfx1250_bmm_candidates,
     )
@@ -711,6 +715,12 @@ def gfx1250_1x32_runs(m, n, k):
 
     for index, name in enumerate(mxfp8_32_stream_candidates(m, n, k)):
         runs.append((KERNEL_ID_BASE_STREAM + index, 1, name, run_bmm_flydsl))
+    from aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250 import (
+        mxfp8_32_decode_candidates,
+    )
+
+    for index, name in enumerate(mxfp8_32_decode_candidates(m, n, k)):
+        runs.append((KERNEL_ID_BASE_DECODE + index, 1, name, run_bmm_flydsl))
     return list({entry[2]: entry for entry in runs}.values())
 
 

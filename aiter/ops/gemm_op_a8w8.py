@@ -2961,6 +2961,18 @@ _MXFP8_W_SCALE_BLOCK = "1x32"
 # here so loading this module does not import FlyDSL).
 _BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 _BMM_MX32_NAME_PREFIX = "flydsl_bmm_mxfp8_32_wmma"
+# gfx1250 runs these rows through the B = 1 batched runner: batched, streaming
+# and decode kernels (the decode kernel writes bf16 only).
+_MX32_STREAM_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_stream"
+_MX32_DECODE_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_decode"
+_MX32_B1_NAME_PREFIXES = tuple(
+    prefix + "_"
+    for prefix in (
+        _BMM_MX32_NAME_PREFIX,
+        _MX32_STREAM_NAME_PREFIX,
+        _MX32_DECODE_NAME_PREFIX,
+    )
+)
 _MXFP8_TUNED_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
 
@@ -2982,10 +2994,19 @@ def _mxfp8_32_tuned_name_launchable(kernel_name: str, M: int, N: int, K: int) ->
         )
 
         return bmm_mx32_kernel_launchable(kernel_name, M, N, K)
+    if kernel_name.startswith(_MX32_DECODE_NAME_PREFIX + "_"):
+        from .flydsl.mxfp8_decode_gemm_gfx1250 import (
+            mxfp8_32_decode_kernel_launchable,
+        )
+
+        return mxfp8_32_decode_kernel_launchable(kernel_name, M, N, K)
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
         mxfp8_32_kernel_launchable,
+        mxfp8_32_stream_kernel_launchable,
     )
 
+    if kernel_name.startswith(_MX32_STREAM_NAME_PREFIX + "_"):
+        return mxfp8_32_stream_kernel_launchable(kernel_name, M, N, K)
     return mxfp8_32_kernel_launchable(kernel_name, M, N, K)
 
 
@@ -3145,9 +3166,15 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     )
 
-    if kernel_name.startswith("flydsl_bmm_mxfp8_32_wmma_"):
+    if kernel_name.startswith(_MX32_B1_NAME_PREFIXES):
         bmm_layout_ok = (
-            not a_scale_preshuffled and XQ.stride() == (K, 1) and Y.stride() == (N, 1)
+            not a_scale_preshuffled
+            and XQ.stride() == (K, 1)
+            and Y.stride() == (N, 1)
+            and (
+                Y.dtype == dtypes.bf16
+                or not kernel_name.startswith(_MX32_DECODE_NAME_PREFIX)
+            )
         )
         if bmm_layout_ok:
             from .flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
