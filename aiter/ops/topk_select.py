@@ -1505,7 +1505,11 @@ def _dispatch(
                 nan_high=True,
             )
     elif backend == "small_k":
-        topk_per_row_small_k(input, row_lens, idx, topk)
+        # `tie=` and `deterministic` promise a selection that is a function of the row alone: the
+        # one-wave build everywhere it serves, not only at the row counts where it is faster.
+        topk_per_row_small_k(
+            input, row_lens, idx, topk, exact=deterministic or tie is not None
+        )
     elif backend == "plain":
         # plain takes a [start, end) pair, not a length, and an empty
         # `rowStarts` with a real `rowEnds` reads as "no range" -- silently over

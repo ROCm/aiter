@@ -34,6 +34,9 @@ from aiter.ops.flydsl.kernels.topk.topk_per_row_small_k import (
     build_topk_per_row_small_k_module,
 )
 from aiter.ops.flydsl.kernels.topk.topk_per_row_small_k_wave import (
+    MAX_WIDTH as WAVE_MAX_WIDTH,
+)
+from aiter.ops.flydsl.kernels.topk.topk_per_row_small_k_wave import (
     build_topk_per_row_small_k_wave_module,
     wave_strips,
 )
@@ -221,7 +224,8 @@ def test_topk_per_row_small_k_ragged(rows, width, k, init_blocks, local_blocks):
 
 def exact_ids(scores, row_lens, k, init_blocks, local_blocks):
     """The contract in torch, exact: int64 keys of the order-preserving fp32 bits (NaN as -inf), the forced blocks
-    at the bits of 1e30 / 1e29, then the larger column first. Row lengths past the width are clamped to it."""
+    at the bits of 1e30 / 1e29, then the larger column first. Row lengths past the width are clamped to it.
+    """
     rows, width = scores.shape
     s = torch.where(scores.isnan(), scores.new_full((), float("-inf")), scores)
     bits = s.view(torch.int32).to(torch.int64)
@@ -309,7 +313,8 @@ def test_topk_per_row_small_k_exact(
 ):
     """Exact ids against the contract. One case of the grid in `exact_cases`: the one-wave kernel is checked
     directly at every width it builds for, and the op through its dispatch -- exact ids where the op takes the
-    one-wave build, the selected scores where it takes the chunked one (it may keep another tied column)."""
+    one-wave build, the selected scores where it takes the chunked one (it may keep another tied column).
+    """
     scores = make_kind(kind, rows, width, 0)
     g = torch.Generator(device="cuda").manual_seed(1)
     if ragged:
@@ -352,11 +357,26 @@ def test_topk_per_row_small_k_exact(
             printLog=False,
         )
 
-    if gfx950 and k == 16:
-        # the kernel itself, at widths the dispatch may leave to the chunked build
+    if gfx950 and k == 16 and width <= WAVE_MAX_WIDTH:
+        # the kernel itself, at widths the dispatch may leave to the chunked build (never past its 13-bit
+        # column limit, which the op's own dispatch enforces). Every fourth row gets a negative length: a pad
+        # row with no live column, whose ids are all -1 (the exact reference clamps lengths to 0..width).
         direct = torch.full((rows, k), -7, dtype=dtypes.i32)
-        launch_wave(scores, row_lens, direct, init_blocks, local_blocks)
-        ret["err"] += check(direct, True, "one-wave kernel exact ids: ") != 0
+        neg = torch.arange(rows) % 4 == 0
+        direct_lens = torch.where(neg, -1 - torch.arange(rows), row_lens).to(dtypes.i32)
+        launch_wave(scores, direct_lens, direct, init_blocks, local_blocks)
+        direct_ref = exact_ids(scores, direct_lens, k, init_blocks, local_blocks)
+        ret["err"] += (
+            checkAllclose(
+                direct_ref.float(),
+                direct.float(),
+                rtol=0,
+                atol=0,
+                msg="one-wave kernel exact ids: ",
+                printLog=False,
+            )
+            != 0
+        )
     # The chunked build ranks a NaN above +inf (what `topk_select` documents); the one-wave build treats it as -inf
     # (the Triton selector's contract), so NaN rows compare only where the op takes the one-wave build.
     nan_policy_differs = kind == "special" and not wave
@@ -377,9 +397,27 @@ def test_topk_per_row_small_k_exact(
     return ret
 
 
+def test_topk_select_batch_invariant():
+    """`topk_select(deterministic=True)` selects a row's columns whatever the batch it sits in: an all-zero
+    2048-column row at k=16 has every column tied, and the one-wave build (taken with many rows) and the
+    chunked build (taken with one) keep different ones unless `exact` pins the one-wave build for both.
+    """
+    from aiter.ops.topk_select import topk_select
+
+    err = 0
+    for kw in ({"deterministic": True}, {"tie": "high"}):
+        alone = topk_select(torch.zeros(1, 2048), 16, sorted_index=True, **kw)[1]
+        batched = topk_select(torch.zeros(4096, 2048), 16, sorted_index=True, **kw)[1]
+        same = bool((batched == alone).all())
+        aiter.logger.info("topk_select %s: alone vs batched rows equal: %s", kw, same)
+        err += not same
+    return err
+
+
 def exact_cases():
     """The 76 cases of the one-wave build (4 kinds x 6 widths x 3 forced-block settings + one dense multi-row case
-    each), the widest rows (NaN mixes only where the one-wave build serves), then the chunked build's geometries: k=8 and rows wider than 8192."""
+    each), the widest rows (NaN mixes only where the one-wave build serves), then the chunked build's geometries: k=8 and rows wider than 8192.
+    """
     cases = []
     for kind in ("normal", "ties", "special", "neginf_most"):
         for width in (9, 40, 300, 1000, 1700, 3000):
@@ -424,12 +462,16 @@ def test_topk_per_row_small_k_prefill(
     )
     exact = ret["one-wave"]
     ret["err"] = checkAllclose(
-        ref.float()
-        if exact
-        else selected_scores(scores, row_lens, ref, init_blocks, local_blocks),
-        got.float()
-        if exact
-        else selected_scores(scores, row_lens, got, init_blocks, local_blocks),
+        (
+            ref.float()
+            if exact
+            else selected_scores(scores, row_lens, ref, init_blocks, local_blocks)
+        ),
+        (
+            got.float()
+            if exact
+            else selected_scores(scores, row_lens, got, init_blocks, local_blocks)
+        ),
         rtol=0,
         atol=0,
         msg=f"rows{rows} prefix{prefix} {kind}: ",
@@ -499,6 +541,7 @@ def main():
 
     fails = 0
     if get_gfx_runtime() == "gfx950":
+        fails += test_topk_select_batch_invariant()
         exact = [test_topk_per_row_small_k_exact(*case) for case in exact_cases()]
         fails += sum(r["err"] != 0 for r in exact)
         aiter.logger.info("exact ids: %d/%d cases PASS", len(exact) - fails, len(exact))

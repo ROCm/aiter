@@ -187,6 +187,8 @@ def row_top16(
     head = load_strips(srs, fx.Int32(0), 0, FIRST)
     row_len = len_fn()
     nlive = (row_len < width).select(row_len, width)
+    # a negative length is a pad row: no live column, and no negative buffer bound or candidate count
+    nlive = (nlive > fx.Int32(0)).select(nlive, fx.Int32(0))
     # later windows: the row's live columns only (no dead-tail reads)
     live_end = nlive
     srs_live = _rsrc(score_row, live_end.to(fx.Int64) * 4)

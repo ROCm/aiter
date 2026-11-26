@@ -59,7 +59,9 @@ _WAVE_WIDTH_RAGGED = ((2048, 8192), (1024, 3072), (0, 1408))
 _WAVE_WIDTH_FULL_ROWS = ((32768, 6144), (4096, 4096), (0, 1408))
 
 
-def _wave_width_limit(rows: int, full_rows: bool) -> int:
+def _wave_width_limit(rows: int, full_rows: bool, exact: bool = False) -> int:
+    if exact:  # the one-wave build wherever it serves, whatever the row count
+        return _WAVE_MAX_WIDTH
     table = _WAVE_WIDTH_FULL_ROWS if full_rows else _WAVE_WIDTH_RAGGED
     return next(w for r, w in table if rows >= r)
 
@@ -207,6 +209,7 @@ def topk_per_row_small_k(
     k: int,
     init_blocks: int = 0,
     local_blocks: int = 0,
+    exact: bool = False,
 ) -> None:
     """Write each row's top-k column ids, descending by score.
 
@@ -220,6 +223,10 @@ def topk_per_row_small_k(
         init_blocks: leading columns forced into the selection.
         local_blocks: trailing columns (relative to each row's length) forced
             into the selection, outranking ``init_blocks``.
+        exact: take the one-wave build wherever it serves (k=16, gfx950, up to
+            8192 columns), not only where it is faster. Its tied columns are
+            exact, so the selection of a row no longer depends on how many rows
+            the call has (``topk_select`` sets it for ``tie=`` / ``deterministic``).
 
     Ties go to the larger column. Rows of k=16 on gfx950 that the table above says it wins (up to 1408
     columns, wider as the row count grows) are served by a one-wave-per-row build that follows that rule exactly (the order key is the score's bits, NaN as -inf, -0 below +0, then the
@@ -228,6 +235,12 @@ def topk_per_row_small_k(
     check is what the cached plan already does; the tensor contract above is
     the caller's, and :func:`topk_per_row_small_k_supported` is how to ask.
     """
+    # The launcher is built, cached and dispatched on the current device: run on the scores' own.
+    if scores.device.index != torch.cuda.current_device():
+        with torch.cuda.device(scores.device):
+            return topk_per_row_small_k(
+                scores, row_lens, indices, k, init_blocks, local_blocks, exact
+            )
     rows, width = scores.shape
     launcher, wave = _plan(
         k,
@@ -235,7 +248,7 @@ def topk_per_row_small_k(
         wave_size_of(scores.device.index),
         bool(init_blocks or local_blocks),
         row_lens is None,
-        _wave_width_limit(rows, row_lens is None),
+        _wave_width_limit(rows, row_lens is None, exact),
     )
     stream = torch.cuda.current_stream(scores.device)
     if wave:
