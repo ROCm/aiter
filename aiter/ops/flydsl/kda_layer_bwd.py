@@ -63,45 +63,56 @@ def _gemm(a, b, layout, **kw):
     )
 
 
-def kda_gate_proj(lr, f_b, dt_bias, A_log):
-    """g = -exp(A_log[h]) * softplus(lr @ f_b^T + dt_bias), fused in the GEMM.
+def _gate_params(f_b, dt_bias, A_log, num_heads, lower_bound):
+    """fp32 [A_log[:H] | lower_bound | dt_bias] read by the KDA GEMM epilogues."""
+    lb = torch.tensor(
+        [0.0 if lower_bound is None else float(lower_bound)], device=f_b.device
+    )
+    return torch.cat([_f32(A_log)[:num_heads], lb, _f32(dt_bias)])
 
-    lr: [M, R]; f_b: [H*K, R]; dt_bias: [H*K]; A_log: [H]. Returns fp32 [M, H*K].
+
+def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
+    """Decay gate fused in the f_b GEMM, with z = lr @ f_b^T + dt_bias (fp32):
+    ``-exp(A_log[h]) * softplus(z)``, or ``lower_bound * sigmoid(exp(A_log[h]) * z)``.
+
+    lr: [M, R]; f_b: [H*K, R]; dt_bias: [H*K]; A_log: [>= H] (first H used).
+    Returns fp32 [M, H*K].
     """
-    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE
+    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_SAFE_GATE
 
-    dtype = f_b.dtype
+    mode = GEMM_EPI_KDA_GATE if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE
     return _proj_gemm(
-        lr.to(dtype),
+        lr.to(f_b.dtype),
         f_b,
-        bias=dt_bias.to(dtype),
-        epilogue=GEMM_EPI_KDA_GATE,
-        epi_group=f_b.shape[0] // A_log.numel(),
-        a_log=_f32(A_log),
+        epilogue=mode,
+        epi_group=f_b.shape[0] // num_heads,
+        a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
     )
 
 
-def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, dg):
-    """Recompute z = lr @ f_b^T + dt_bias in the GEMM and apply the gate backward.
+def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
+    """Recompute z in the f_b GEMM and apply the gate backward.
 
-    dg: [M, H*K]. Returns (dz, dg * g), fp32 [M, H*K]; dA_log is the per-head
-    sum of the second.
+    dg: [M, H*K]. Returns (dz, per-element dA_log terms), fp32 [M, H*K]; dA_log
+    is the per-head sum of the second.
     """
-    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE_BWD
-
-    dtype = f_b.dtype
-    dgg = torch.empty(dg.shape, device=dg.device, dtype=torch.float32)
-    dz = _proj_gemm(
-        lr.to(dtype),
-        f_b,
-        bias=dt_bias.to(dtype),
-        epilogue=GEMM_EPI_KDA_GATE_BWD,
-        epi_group=f_b.shape[0] // A_log.numel(),
-        a_log=_f32(A_log),
-        aux=dg.float().contiguous(),
-        out2=dgg,
+    from .kernels.gemm_a16w16_gfx950 import (
+        GEMM_EPI_KDA_GATE_BWD,
+        GEMM_EPI_KDA_SAFE_GATE_BWD,
     )
-    return dz, dgg
+
+    mode = GEMM_EPI_KDA_GATE_BWD if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE_BWD
+    dterm = torch.empty(dg.shape, device=dg.device, dtype=torch.float32)
+    dz = _proj_gemm(
+        lr.to(f_b.dtype),
+        f_b,
+        epilogue=mode,
+        epi_group=f_b.shape[0] // num_heads,
+        a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
+        aux=dg.float().contiguous(),
+        out2=dterm,
+    )
+    return dz, dterm
 
 
 def sigmoid_gate_proj(x, g_proj, aux=None):

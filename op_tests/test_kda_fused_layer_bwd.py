@@ -30,25 +30,36 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 K3_HEADS, K3_HEAD_DIM, K3_CONV, K3_HIDDEN = 96, 128, 4, 7168
 
 
+# Kimi-K3 checkpoints store A_log padded to 128 entries (96 real heads, zeros after)
+K3_A_LOG_LEN = 128
+
+
 def make_weights(D, H, K, W, R, dtype):
-    def p(*shape, std):
-        return (torch.randn(*shape) * std).to(dtype)
+    """Weights laid out like the Kimi-K3 checkpoint: projections in ``dtype``;
+    conv, A_log, dt_bias and the norm weight in fp32."""
+
+    def p(*shape, std, dt=dtype):
+        return (torch.randn(*shape) * std).to(dt)
+
+    f32 = torch.float32
+    a_log = torch.zeros(max(H, K3_A_LOG_LEN))
+    # distinct per-head decay rates so a head/channel mix-up shows
+    a_log[:H] = torch.linspace(-0.5, 1.2, H)
 
     return KDALayerWeights(
         w_q=p(H * K, D, std=D**-0.5),
         w_k=p(H * K, D, std=D**-0.5),
         w_v=p(H * K, D, std=D**-0.5),
-        conv_q=p(H * K, W, std=0.5),
-        conv_k=p(H * K, W, std=0.5),
-        conv_v=p(H * K, W, std=0.5),
+        conv_q=p(H * K, W, std=0.5, dt=f32),
+        conv_k=p(H * K, W, std=0.5, dt=f32),
+        conv_v=p(H * K, W, std=0.5, dt=f32),
         f_a=p(R, D, std=D**-0.5),
         f_b=p(H * K, R, std=R**-0.5),
-        # distinct per-head decay rates so a head/channel mix-up shows
-        A_log=torch.linspace(-2.0, 1.0, H).to(dtype),
-        dt_bias=p(H * K, std=1.0),
+        A_log=a_log,
+        dt_bias=p(H * K, std=1.0, dt=f32),
         w_beta=p(H, D, std=D**-0.5),
         g_proj=p(H * K, D, std=D**-0.5),
-        norm_w=(1.0 + torch.randn(K) * 0.1).to(dtype),
+        norm_w=1.0 + torch.randn(K) * 0.1,
         w_o=p(D, H * K, std=(H * K) ** -0.5),
     )
 
@@ -67,12 +78,12 @@ def recurrent_kda_ref(q, k, v, g, beta, scale):
     return torch.stack(out, 1)
 
 
-def run_torch(dy, x, w, num_heads, eps=1e-6):
+def run_torch(dy, x, w, num_heads, lb=None, eps=1e-6):
     """Reference layer backward: recurrent fwd + autograd, fp32."""
     xs = x.detach().float().requires_grad_(True)
     ws = [t.detach().float().requires_grad_(True) for t in w.tensors()]
     wr = KDALayerWeights.from_tensors(ws)
-    q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps)
+    q, k, v, g, beta = kda_layer_preprocess(xs, wr, num_heads, eps, lb)
     o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
     y = kda_layer_postprocess(o, xs, wr, eps)
     grads = torch.autograd.grad(y, [xs, *ws], dy.float())
@@ -89,20 +100,22 @@ def layer_flops(b, t, d, h, k, w, r, c):
 
 
 @benchmark()
-def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, dtype):
+def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, lb, dtype):
     x = torch.randn(b, t, d).to(dtype)
     dy = torch.randn(b, t, d).to(dtype)
     wt = make_weights(d, h, k, w, r, dtype)
-    ref_dx, ref_dw = run_torch(dy, x, wt, h)
+    ref_dx, ref_dw = run_torch(dy, x, wt, h, lb)
 
     candidates = {
         "torch_chunk": lambda: kda_layer_bwd(
-            dy, x, wt, h, chunk_size=chunk, backend="torch"
+            dy, x, wt, h, chunk_size=chunk, backend="torch", lower_bound=lb
         ),
         # gfx950 bf16: FlyDSL GEMM epilogues for f_b/g_proj, FlyDSL l2norm,
         # #8741 RMSNorm; conv (#8726) and chunk (#8740) bwd are torch until
         # those land.
-        "fused": lambda: kda_layer_bwd(dy, x, wt, h, chunk_size=chunk, backend="fused"),
+        "fused": lambda: kda_layer_bwd(
+            dy, x, wt, h, chunk_size=chunk, backend="fused", lower_bound=lb
+        ),
     }
 
     flops = layer_flops(b, t, d, h, k, w, r, chunk)
@@ -139,7 +152,7 @@ def test_kda_layer_bwd(b, t, d, h, k, w, r, chunk, dtype):
 ORACLE_MAX_TOKENS = 512
 
 
-def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, eps=1e-6):
+def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, lb=None, eps=1e-6):
     """Reference block: recurrent forward output and all gradients, fp32.
 
     With ``cu_seqlens`` each packed sequence is run on its own.
@@ -151,7 +164,7 @@ def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, eps=1e-6):
     ys = []
     for s, e in itertools.pairwise(bounds):
         xseg = xs[:, s:e]
-        q, k, v, g, beta = kda_layer_preprocess(xseg, wr, num_heads, eps)
+        q, k, v, g, beta = kda_layer_preprocess(xseg, wr, num_heads, eps, lb)
         o = recurrent_kda_ref(q, k, v, g, beta, q.shape[-1] ** -0.5)
         ys.append(kda_layer_postprocess(o, xseg, wr, eps))
     y = torch.cat(ys, 1)
@@ -160,7 +173,7 @@ def run_torch_block(dy, x, w, num_heads, cu_seqlens=None, eps=1e-6):
 
 
 @benchmark()
-def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, dtype):
+def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     """End to end: kda_layer_fwd + autograd backward of the whole layer.
 
     ``nseq > 1`` packs ``nseq`` equal sequences into one row (b must be 1) and
@@ -185,6 +198,7 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, dtype):
                 chunk,
                 backend=backend,
                 cu_seqlens=cu,
+                lower_bound=lb,
             )
             return y, torch.autograd.grad(y, [xs, *ws], dy)
 
@@ -192,7 +206,7 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, dtype):
 
     if b * t <= ORACLE_MAX_TOKENS:
         ref_name = "recurrent"
-        ref_y, ref_g = run_torch_block(dy, x, wt, h, cu)
+        ref_y, ref_g = run_torch_block(dy, x, wt, h, cu, lb)
     else:
         ref_name = "torch_chunk"
         ref_y, ref_g = block("torch")()
@@ -230,43 +244,56 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, dtype):
     return ret
 
 
-def run_torch_proj(lr, f_b, dt_bias, A_log, dg, x, g_proj, aux):
-    """Reference for the fused projections, fp32."""
-    H = A_log.numel()
-    z = lr.float() @ f_b.float().t() + dt_bias.float()
-    neg_a = -A_log.float().exp().repeat_interleave(f_b.shape[0] // H)
-    sp, sig = torch.nn.functional.softplus(z), torch.sigmoid(z)
+def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
+    """Reference for the fused projections, fp32 (A_log: first h entries)."""
+    with torch.enable_grad():
+        zr = (lr.float() @ f_b.float().t()).requires_grad_(True)
+        a_log = A_log[:h].float().requires_grad_(True)
+        z = zr + dt_bias.float()
+        a = a_log.exp().repeat_interleave(f_b.shape[0] // h)
+        if lb is None:
+            gate = -a * torch.nn.functional.softplus(z)
+        else:
+            gate = lb * torch.sigmoid(a * z)
+        dz, da = torch.autograd.grad(gate, [zr, a_log], dg)
+    # the kernel returns per-element dA_log terms; compare their per-head sums
     gate_out = torch.sigmoid(x.float() @ g_proj.float().t())
     return {
-        "gate": neg_a * sp,
-        "gate_bwd": (dg * neg_a * sig, dg * neg_a * sp),
+        "gate": gate.detach(),
+        "gate_bwd": (dz, da),
         "sigmoid_mul": gate_out * aux,
         "gproj_bwd": (aux @ g_proj.float(), aux.t() @ x.float()),
     }
 
 
 @benchmark()
-def test_kda_proj(m, d, h, k, r, dtype):
+def test_kda_proj(m, d, h, k, r, lb, dtype):
     from aiter.ops.flydsl import kda_layer_bwd as fk
 
     hk = h * k
     lr = torch.randn(m, r).to(dtype)
     f_b = (torch.randn(hk, r) * r**-0.5).to(dtype)
-    dt_bias = torch.randn(hk).to(dtype)
-    A_log = torch.linspace(-2.0, 1.0, h)
+    dt_bias = torch.randn(hk)
+    A_log = torch.zeros(max(h, K3_A_LOG_LEN))
+    A_log[:h] = torch.linspace(-0.5, 1.2, h)
     dg = torch.randn(m, hk)
     x = torch.randn(m, d).to(dtype)
     g_proj = (torch.randn(hk, d) * d**-0.5).to(dtype)
     aux = torch.randn(m, hk)
-    ref = run_torch_proj(lr, f_b, dt_bias, A_log, dg, x, g_proj, aux)
+    ref = run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux)
+
+    def gate_bwd():
+        dz, dterm = fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
+        return dz, dterm.view(m, h, k).sum((0, 2))
+
     candidates = {
         "gate": (
-            lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log),
+            lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
             2 * m * r * hk,
             (m * r + hk * r) * 2 + m * hk * 4,
         ),
         "gate_bwd": (
-            lambda: fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, dg),
+            gate_bwd,
             2 * m * r * hk,
             (m * r + hk * r) * 2 + 3 * m * hk * 4,
         ),
@@ -359,23 +386,32 @@ def main():
         help="block fwd+bwd rows: batch,tokens,num_seqs; num_seqs > 1 packs\n"
         "equal sequences into one row and passes cu_seqlens, e.g. -l 1,16384,8",
     )
+    parser.add_argument(
+        "-g",
+        "--gate_lb",
+        type=lambda v: None if v.lower() == "none" else float(v),
+        nargs="*",
+        default=[-5.0],
+        help="decay gate lower bound (Kimi-K3 gate_lower_bound=-5, safe gate);\n"
+        "none = the softplus gate, e.g. -g -5 none",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
         df = []
-        for b, t, (d, h, k, w, r), c in itertools.product(
-            args.batch, args.seqlen, args.shape, args.chunk
+        for b, t, (d, h, k, w, r), c, lb in itertools.product(
+            args.batch, args.seqlen, args.shape, args.chunk, args.gate_lb
         ):
-            df.append(test_kda_layer_bwd(b, t, d, h, k, w, r, c, dtype))
+            df.append(test_kda_layer_bwd(b, t, d, h, k, w, r, c, lb, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda fused layer bwd summary (markdown):\n%s", df.to_markdown(index=False)
         )
         df = []
-        for (b, t, nseq), (d, h, k, w, r), c in itertools.product(
-            args.block, args.shape, args.chunk
+        for (b, t, nseq), (d, h, k, w, r), c, lb in itertools.product(
+            args.block, args.shape, args.chunk, args.gate_lb
         ):
-            df.append(test_kda_block(b, t, nseq, d, h, k, w, r, c, dtype))
+            df.append(test_kda_block(b, t, nseq, d, h, k, w, r, c, lb, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda block fwd+bwd summary (markdown):\n%s", df.to_markdown(index=False)
@@ -390,10 +426,10 @@ def main():
         return
     for dtype in proj_dtypes:
         df = []
-        for b, t, (d, h, k, _, r) in itertools.product(
-            args.batch, args.seqlen, args.shape
+        for b, t, (d, h, k, _, r), lb in itertools.product(
+            args.batch, args.seqlen, args.shape, args.gate_lb
         ):
-            df.append(test_kda_proj(b * t, d, h, k, r, dtype))
+            df.append(test_kda_proj(b * t, d, h, k, r, lb, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda projection fusion summary (markdown):\n%s",
