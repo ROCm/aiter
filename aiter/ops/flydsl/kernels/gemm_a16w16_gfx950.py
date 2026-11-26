@@ -256,8 +256,8 @@ def make_gemm_a16w16_gfx950_param(
             raise ValueError("KDA epilogues need fixed columns per thread")
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     c_tile_bytes = k_waves * block_m * block_n * c_dbytes
-    if use_half_tile_interleaved and split_k == 1:
-        # the unsplit HTI store reuses two quarter tiles of shared C
+    if use_half_tile_interleaved and split_k == 1 and c_fp32:
+        # the unsplit fp32-C HTI store reuses two quarter tiles of shared C
         c_tile_bytes //= 2
     smem_bytes = max(smem_bytes, c_tile_bytes)
     arch = get_rocm_arch()
@@ -1297,8 +1297,13 @@ def gemm_a16w16_hti_gfx950_kernel(
         else elem_dtype
     )
     c_dtype = fx.Float32 if const_expr(param.c_fp32) else global_output_dtype
-    # unsplit, the second half of the store reuses the first half's quarters
-    c_quarters = 4 if const_expr(is_split_k) else 2
+    # An fp32 C quarter (64 KB at 256x256) spans both A stages (or both B
+    # stages) of the ring the last MMAs still read, so the unsplit fp32-C store
+    # runs after every MMA and a fenced barrier, and its second half reuses the
+    # first half's two quarters. 16-bit C keeps the interleaved four-quarter
+    # store, whose first quarters fit in the A stage no wave reads any more.
+    late_c_store = param.c_fp32 and not is_split_k
+    c_quarters = 2 if const_expr(late_c_store) else 4
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -1705,15 +1710,36 @@ def gemm_a16w16_hti_gfx950_kernel(
     a1 = load_a_fragment(1, 1)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
-    store_half_tile_to_lds(0, 0, c00)
-    consume(c10, a1, b0, False)
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-    store_half_tile_to_lds(0, 1, c01)
-    consume(c11, a1, b1, False)
-    rocdl.sched_barrier(0)
-    if const_expr(is_split_k):
+
+    def interleaved_first_half():
+        store_half_tile_to_lds(0, 0, c00)
+        consume(c10, a1, b0, False)
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier()
+        rocdl.sched_barrier(0)
+        store_half_tile_to_lds(0, 1, c01)
+        consume(c11, a1, b1, False)
+        rocdl.sched_barrier(0)
+
+    if const_expr(late_c_store):
+        consume(c10, a1, b0, False)
+        consume(c11, a1, b1, False)
+        # every wave's fragment reads have landed (its MMAs consumed them)
+        gpu.barrier()
+        store_half_tile_to_lds(0, 0, c00)
+        store_half_tile_to_lds(0, 1, c01)
+        gpu.barrier()
+        store_half_tile_to_global(0, 0)
+        store_half_tile_to_global(0, 1)
+        # fenced: the reads of quarters 0/1 before their reuse by half 1
+        gpu.barrier()
+        store_half_tile_to_lds(1, 0, c10)
+        store_half_tile_to_lds(1, 1, c11)
+        gpu.barrier()
+        store_half_tile_to_global(1, 0)
+        store_half_tile_to_global(1, 1)
+    elif const_expr(is_split_k):
+        interleaved_first_half()
         if wid // n_waves == 0:
             rocdl.s_barrier()
         rocdl.s_barrier()
@@ -1725,6 +1751,7 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
+        interleaved_first_half()
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)

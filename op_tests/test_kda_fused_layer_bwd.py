@@ -600,7 +600,7 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     from aiter.tuned_gemm import tgemm
 
     hk = h * k
-    lr = torch.randn(m, r).to(dtype)
+    lr = torch.randn(m, r)  # fp32, as the layer passes it
     f_b = (torch.randn(hk, r) * r**-0.5).to(dtype)
     dt_bias = torch.randn(hk)
     A_log = torch.zeros(max(h, K3_A_LOG_LEN))
@@ -618,20 +618,23 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
         return tgemm.mm(a, w, otype=torch.float32).float()
 
     aux16 = aux.to(dtype)
-    gate_bytes = (m * r + hk * r) * 2 + m * hk * 4
+    # the gate GEMMs run on lr split into bf16 hi + lo: K = 2R; the unfused
+    # baselines get the same split and a pre-built [f_b | f_b]
+    f_b2 = torch.cat([f_b, f_b], -1)
+    gate_bytes = (m * 2 * r + hk * r) * 2 + m * hk * 4
     sig_bytes = (m * d + hk * d) * 2 + m * hk * (4 + 2)
     candidates = {
         "gate": (
             {
                 "fused": lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
                 "unfused_torch": lambda: _gate_unfused(
-                    mm32(lr, f_b.t()), dt_bias, A_log, h, lb
+                    mm32(fk._split_lowrank(lr, f_b), f_b2.t()), dt_bias, A_log, h, lb
                 ),
                 "unfused_tgemm": lambda: _gate_unfused(
-                    tmm32(lr, f_b), dt_bias, A_log, h, lb
+                    tmm32(fk._split_lowrank(lr, f_b), f_b2), dt_bias, A_log, h, lb
                 ),
             },
-            2 * m * r * hk,
+            2 * m * 2 * r * hk,
             gate_bytes,
         ),
         "gate_bwd": (
@@ -640,13 +643,18 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
                     lr, f_b, dt_bias, A_log, h, dg, lb
                 ),
                 "unfused_torch": lambda: _gate_bwd_unfused(
-                    mm32(lr, f_b.t()), dt_bias, A_log, h, lb, dg
+                    mm32(fk._split_lowrank(lr, f_b), f_b2.t()),
+                    dt_bias,
+                    A_log,
+                    h,
+                    lb,
+                    dg,
                 ),
                 "unfused_tgemm": lambda: _gate_bwd_unfused(
-                    tmm32(lr, f_b), dt_bias, A_log, h, lb, dg
+                    tmm32(fk._split_lowrank(lr, f_b), f_b2), dt_bias, A_log, h, lb, dg
                 ),
             },
-            2 * m * r * hk,
+            2 * m * 2 * r * hk,
             gate_bytes + m * hk * 4,
         ),
         "sigmoid_mul": (
@@ -678,8 +686,8 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     }
     ret = {"gfx": get_gfx_runtime()}
     tiles = {
-        "gate": (m, hk, r, "nt", 1 if lb is None else 5, dtypes.fp32),
-        "gate_bwd": (m, hk, r, "nt", 2 if lb is None else 6, dtypes.fp32),
+        "gate": (m, hk, 2 * r, "nt", 1 if lb is None else 5, dtypes.fp32),
+        "gate_bwd": (m, hk, 2 * r, "nt", 2 if lb is None else 6, dtypes.fp32),
         "sigmoid_mul": (m, hk, d, "nt", 4, dtype),
         "gproj_bwd": (hk, d, m, "tn", 0, dtypes.fp32),
     }
@@ -708,6 +716,94 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
             ret[f"{key} TFLOPS"] = flops / us / 1e6
             ret[f"{key} TB/s"] = nbytes / us / 1e6
             ret[f"{key} err"] = worst
+    return ret
+
+
+# split_k of the dW_g bit-exactness sweep (each run where the tile count allows)
+WGRAD_SPLITS = (1, 2, 4)
+
+
+@benchmark()
+def test_kda_wgrad_split(m, hk, d, dtype):
+    """dW_g = dgp^T @ x (tn, K = m tokens) on every split_k and kernel.
+
+    Integer inputs in [-2, 2] keep every partial sum exact in fp32, so every
+    split, the HTI kernel and the dispatcher's pick must equal the reference
+    and each other bit for bit; the output is NaN-filled, so a tile left
+    unwritten fails. m = 300 runs the K tail.
+    """
+    from aiter.ops.flydsl import kda_layer_bwd as fk
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        GEMM_A16W16_DTYPE_FP32,
+        gemm_a16w16,
+    )
+
+    dgp = torch.randint(-2, 3, (m, hk)).to(dtype)
+    x = torch.randint(-2, 3, (m, d)).to(dtype)
+    ref = dgp.float().t() @ x.float()
+    selected, source = fk.proj_config(hk, d, m, "tn", 0, torch.float32, dtype)
+
+    def ft(split_k):
+        return {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": split_k,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+        }
+
+    configs = {f"selected_{source}": selected}
+    configs.update({f"ft_sk{sk}": ft(sk) for sk in WGRAD_SPLITS})
+    configs["hti256"] = {
+        **ft(1),
+        "block_m": 256,
+        "block_n": 256,
+        "n_waves": 4,
+        "group_m": 4,
+        "use_half_tile_interleaved": True,
+    }
+    legal = fk._validate(
+        hk,
+        d,
+        m,
+        "tn",
+        {"out_dtype_id": GEMM_A16W16_DTYPE_FP32, "epilogue": 0, "epi_group": 1},
+    )
+    ret = {"gfx": get_gfx_runtime(), "selected": config_name_of(selected)}
+    flops = 2 * m * hk * d
+    nbytes = (m * hk + m * d) * dgp.element_size() + hk * d * 4
+    for name, cfg in configs.items():
+        # split-K takes at most 2048 output tiles and HTI an even count of K
+        # tiles (no K tail): such a config is not launchable, not wrong
+        if not legal(cfg):
+            continue
+        out = torch.full((hk, d), float("nan"))
+
+        def run(cfg=cfg, out=out):
+            return gemm_a16w16(
+                dgp.t(),
+                x,
+                out=out,
+                user_kwargs=dict(cfg),
+                layout="tn",
+                out_dtype=torch.float32,
+            )
+
+        _, us = run_perftest(run, num_iters=10, num_warmup=1)
+        bad = (out != ref).float().mean().item()
+        assert torch.equal(out, ref), (
+            f"dW_g {name} ({config_name_of(cfg)}): {bad:.2%} of elements differ "
+            f"from the exact result, {out.isnan().float().mean().item():.2%} NaN"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = bad
     return ret
 
 
@@ -793,6 +889,22 @@ def main():
         # 300: K tail of dW_g; 16384: the varlen 8x2048 batch
         default=[256, 300, 1024, 4096, 16384],
         help="tokens of the fused projection table (Kimi-K3 tuned CSV range)",
+    )
+    parser.add_argument(
+        "--wgrad_tokens",
+        type=int,
+        nargs="*",
+        # 300: K tail
+        default=[256, 300],
+        help="tokens of the dW_g split_k bit-exactness table",
+    )
+    parser.add_argument(
+        "--wgrad_tp",
+        type=int,
+        nargs="*",
+        # TP8 (H*K = 1536) keeps split-K under its 2048-tile limit
+        default=[1, 8],
+        help="tensor-parallel ranks sharding H*K in the dW_g table",
     )
     parser.add_argument(
         "-p",
@@ -949,6 +1061,20 @@ def main():
                 )
             ],
             {"proj_tokens": args.proj_tokens, "shape": args.shape},
+        )
+        summarize(
+            "kda dW_g split_k bit-exactness summary",
+            [
+                test_kda_wgrad_split(m, h * k // tp, d, dtype)
+                for m, tp, (d, h, k, _, _) in itertools.product(
+                    args.wgrad_tokens, args.wgrad_tp, args.shape
+                )
+            ],
+            {
+                "wgrad_tokens": args.wgrad_tokens,
+                "wgrad_tp": args.wgrad_tp,
+                "shape": args.shape,
+            },
         )
 
 

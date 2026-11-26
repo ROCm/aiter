@@ -93,12 +93,15 @@ def proj_config(m, n, k, layout, epilogue, out_dtype, dtype=torch.bfloat16):
 
 def _gemm(a, b, layout, out_dtype=torch.float32, config=None, epilogue=0, **kw):
     """a @ b on the gfx950 GEMM, tiles from ``config`` or the tuned table."""
+    from .gemm_epilogue_configs import ENV_NO_KTAIL, disabled, gemm_path
     from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
 
     m, k = a.shape
     n = b.shape[1]
     if config is None:
         config, _ = proj_config(m, n, k, layout, epilogue, out_dtype, a.dtype)
+    if k % config["block_k"] and disabled(ENV_NO_KTAIL, gemm_path(layout, epilogue)):
+        raise ValueError(f"K tail ({k} % {config['block_k']}) off by {ENV_NO_KTAIL}")
     return gemm_a16w16(
         a,
         b,

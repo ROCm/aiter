@@ -12,9 +12,19 @@ on the untuned columns ``M, N, K, layout, epilogue, dtype, outdtype`` plus
 gradient; a lookup takes the row of the smallest tuned token count at or above
 it (else the largest), so one sweep covers every batch. Shapes without a row,
 or whose row the kernel cannot run, get ``default_config``.
+
+Bisection switches, each a comma list of paths (``gate``, ``gate_bwd``,
+``sigmoid``, ``fwd``, ``dgrad``, ``wgrad``) or ``all``, read per call and
+applied after the lookup:
+
+* ``AITER_KDA_GEMM_NO_SPLITK``: split_k = 1.
+* ``AITER_KDA_GEMM_NO_HTI``: the full-tile kernel (128x256) instead of HTI.
+* ``AITER_KDA_GEMM_NO_KTAIL``: a K tail raises ``ValueError``, so
+  ``kda_layer_bwd.proj_gemm`` takes its torch fallback.
 """
 
 import functools
+import os
 
 import torch
 
@@ -52,6 +62,43 @@ _SPLIT_K_MAX_TILES = 2048
 
 def _ceil(a, b):
     return (a + b - 1) // b
+
+
+ENV_NO_SPLITK = "AITER_KDA_GEMM_NO_SPLITK"
+ENV_NO_HTI = "AITER_KDA_GEMM_NO_HTI"
+ENV_NO_KTAIL = "AITER_KDA_GEMM_NO_KTAIL"
+
+
+def gemm_path(layout, epilogue):
+    """Name of a projection GEMM for the bisection switches."""
+    if epilogue in (1, 5):
+        return "gate"
+    if epilogue in (2, 6):
+        return "gate_bwd"
+    if epilogue in (3, 4):
+        return "sigmoid"
+    return {"nt": "fwd", "nn": "dgrad", "tn": "wgrad"}.get(layout, layout)
+
+
+@functools.lru_cache(maxsize=64)
+def _paths(value):
+    return frozenset(p.strip() for p in value.split(",") if p.strip())
+
+
+def disabled(env, path):
+    paths = _paths(os.environ.get(env, ""))
+    return "all" in paths or path in paths
+
+
+def apply_switches(kw, layout, epilogue):
+    path = gemm_path(layout, epilogue)
+    kw = dict(kw)
+    if disabled(ENV_NO_SPLITK, path):
+        kw["split_k"] = 1
+    if kw["use_half_tile_interleaved"] and disabled(ENV_NO_HTI, path):
+        kw.update(use_half_tile_interleaved=False, block_m=128, block_n=256)
+        kw.update(m_waves=2, n_waves=4, k_waves=1)
+    return kw
 
 
 def token_axis(layout):
@@ -187,6 +234,7 @@ def select_config(m, n, k, layout, epilogue, dtype, outdtype, validate):
         cfg = None
     if cfg is not None:
         kw = _sanitize(to_user_kwargs(cfg), m, n, k, layout, epilogue)
+        kw = apply_switches(kw, layout, epilogue)
         if validate(kw):
             return kw, "tuned"
     kw = _sanitize(
@@ -197,7 +245,7 @@ def select_config(m, n, k, layout, epilogue, dtype, outdtype, validate):
         layout,
         epilogue,
     )
-    return kw, "default"
+    return apply_switches(kw, layout, epilogue), "default"
 
 
 def _sanitize(kw, m, n, k, layout, epilogue):
