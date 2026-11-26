@@ -80,6 +80,18 @@ PIPELINES_BY_W_SCALE_BLOCK = {
 }
 
 
+# Bytes of weight one timed replay reads, enough to leave the cache.
+_COLD_WEIGHT_BYTES = 1.2e9
+
+
+def _cold_weight_run_kwargs(n, k, iters):
+    """run_perftest arguments that time a gfx1250 1x32 GEMM with its weight not
+    cache-resident: each timed iteration uses its own copy of the inputs, and
+    the copies read about _COLD_WEIGHT_BYTES of weight (2 to 256 copies)."""
+    copies = max(2, min(256, math.ceil(_COLD_WEIGHT_BYTES / (n * k * 33 / 32))))
+    return {"num_rotate_args": copies, "num_iters": max(iters, copies)}
+
+
 def generate_data(m, n, k, seed, w_scale_block=W_SCALE_BLOCK, device="cuda"):
     """fp8 operands with e8m0 scales around 2^-3..2^3, unshuffled, per
     w_scale_block: 1x32 x_scale [m, k/32] with a 1x32 [n, k/32] or 32x32
@@ -980,10 +992,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         confirm_tasks = []
         rounds = max(1, int(args.confirm_rounds))
         for shape, by_name in tasks_by_shape.items():
-            baseline_name, stored_us, stored_err = baselines[shape]
+            baseline_name = baselines[shape][0]
             valid = sorted(coarse_by_shape.get(shape, ()), key=lambda result: result[1])
             candidate_name = valid[0][0][3] if valid else baseline_name
-            choices[shape] = (baseline_name, candidate_name, stored_us, stored_err)
+            choices[shape] = (baseline_name, candidate_name)
             for round_index in range(rounds):
                 order = (
                     (baseline_name, candidate_name)
@@ -1001,12 +1013,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
         selected = []
         min_speedup = 1.0 + float(args.min_gain_pct) / 100.0
-        for shape, (
-            baseline_name,
-            candidate_name,
-            stored_us,
-            stored_err,
-        ) in choices.items():
+        for shape, (baseline_name, candidate_name) in choices.items():
             baseline = measured[(shape, baseline_name)]
             candidate = measured[(shape, candidate_name)]
             if len(baseline) != rounds or len(candidate) != rounds:
@@ -1022,27 +1029,20 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 for base, cand in zip(baseline_us, candidate_us)
                 if base > 0 and cand > 0
             ]
-            candidate_median = statistics.median(candidate_us)
             keep = (
                 candidate_name != baseline_name
                 and len(paired) == rounds
                 and min(paired) > 1.0
                 and statistics.median(paired) >= min_speedup
-                and (stored_us is None or stored_us / candidate_median >= min_speedup)
             )
+            # The stored us may come from another session or from cache-resident
+            # weights, so only this session's paired rounds decide, and the row
+            # records what they measured.
             name = candidate_name if keep else baseline_name
             values = candidate if keep else baseline
             info = tasks_by_shape[shape][name][0]
-            selected_us = (
-                float(stored_us)
-                if not keep and stored_us is not None
-                else statistics.median(value[0] for value in values)
-            )
-            selected_err = (
-                float(stored_err)
-                if not keep and stored_err is not None
-                else max(value[1] for value in values)
-            )
+            selected_us = statistics.median(value[0] for value in values)
+            selected_err = max(value[1] for value in values)
             selected.append(
                 (
                     info,
@@ -1095,7 +1095,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                         f"{block} production validation requires --mxscale_table"
                     )
                 data = generate_data(m, n, k, 0, block)
-                if self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK:
+                gfx1250_1x32 = self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK
+                if gfx1250_1x32:
                     from aiter.ops.shuffle import shuffle_mxfp8fp4_scale
 
                     data["w_scale"] = shuffle_mxfp8fp4_scale(data["w_scale"])
@@ -1107,9 +1108,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     data["w_scale"],
                     out=data["out"],
                     num_warmup=args.warmup,
-                    num_iters=args.iters,
-                    testGraph=(self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK),
-                    num_rotate_args=1,
+                    testGraph=gfx1250_1x32,
+                    # gfx1250 1x32 rows are tuned with weights not cache-resident.
+                    **(
+                        _cold_weight_run_kwargs(n, k, args.iters)
+                        if gfx1250_1x32
+                        else {"num_iters": args.iters, "num_rotate_args": 1}
+                    ),
                 )
                 if not math.isfinite(us) or us <= 0:
                     raise RuntimeError(f"invalid production timing {us}")
@@ -1199,7 +1204,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 runs = gfx1250_1x32_runs(M, N, K)
                 data_generator = generate_data_gfx1250_1x32
                 data_args = (M, N, K, seed)
-                candidate_run_kwargs.update(testGraph=True, num_rotate_args=1)
+                # Weights not cache-resident, as in a model forward: a cached
+                # weight favours shallow pipelines that stall cold.
+                candidate_run_kwargs.update(
+                    testGraph=True, **_cold_weight_run_kwargs(N, K, args.iters)
+                )
             elif gfx == "gfx1250":
                 cands = gfx1250_candidates(M, N, K)
                 runs = [
