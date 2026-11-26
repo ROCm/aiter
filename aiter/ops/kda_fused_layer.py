@@ -904,12 +904,16 @@ class MXFP8ProjGemm:
     def gemm(self, a, w, kind, out16_ok=False):
         """The MXFP8 product; fp32, or with ``out16_ok`` (and the fast path) the
         bf16 fprop / dgrad result itself, whose values are the same."""
-        from aiter.ops.mxfp8_linear import mxfp8_fastpath, mxfp8_mm
+        from aiter.ops.mxfp8_linear import (
+            mxfp8_fastpath,
+            mxfp8_mm,
+            mxfp8_weight_reuse_active,
+        )
 
         # quantized-operand cache: the layer input X is reused, rowwise by every
         # fprop and columnwise by every wgrad; weights only when asked to
-        # (AITER_MXFP8_WEIGHT_CACHE=1 keeps one fp8 copy per weight and layout)
-        weights = os.environ.get("AITER_MXFP8_WEIGHT_CACHE", "0") == "1"
+        # (inside mxfp8_weight_reuse(): one fp8 copy per weight and layout)
+        weights = mxfp8_weight_reuse_active()
         wa = _weight_anchor(w) if weights and kind != "wgrad" else None
         anchors = {
             "fwd": (a, 1, wa, 1, True),

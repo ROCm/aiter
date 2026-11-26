@@ -87,11 +87,52 @@ def mxfp8_fastpath():
 
 
 # Quantized operands keyed by (id(tensor), axis, op), each entry validated by a
-# weakref, the tensor's version counter and data pointer: the per-call cache is
-# live inside ``mxfp8_quant_cache()``; ``AITER_MXFP8_WEIGHT_CACHE=1`` keeps
-# weight operands across calls too (one fp8 copy per weight and layout).
+# weakref, the tensor's version counter and data pointer. The per-call cache is
+# live inside ``mxfp8_quant_cache()``. Weight operands outlive the call only
+# inside ``mxfp8_weight_reuse()``, which the caller opens when it knows the
+# weights are unchanged (TE's ``is_first_microbatch``): a version counter does
+# not see ``param.data.copy_()`` or a write through a parameter buffer, so it
+# cannot tell on its own. ``drop_weight_cache`` invalidates.
 _call_cache = None
 _weight_cache: dict = {}
+_weight_reuse_depth = 0
+
+
+class mxfp8_weight_reuse:
+    """Context in which weight operands are cached across calls (one fp8 copy
+    per weight and layout), until ``drop_weight_cache``."""
+
+    def __enter__(self):
+        global _weight_reuse_depth
+        _weight_reuse_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _weight_reuse_depth
+        _weight_reuse_depth -= 1
+
+
+def mxfp8_weight_reuse_active():
+    return _weight_reuse_depth > 0
+
+
+def drop_weight_cache(tensors=None):
+    """Forget the cached weight operands of ``tensors`` (all when None)."""
+    if tensors is None:
+        _weight_cache.clear()
+        return
+    ids = {id(t) for t in tensors}
+    for key in [k for k in _weight_cache if k[0] in ids]:
+        del _weight_cache[key]
+
+
+def mxfp8_weight_cache_bytes():
+    """Device bytes held by the cross-call weight-operand cache."""
+    total = 0
+    for *_, val in _weight_cache.values():
+        for t in val if isinstance(val, tuple) else (val,):
+            total += t.numel() * t.element_size()
+    return total
 
 
 class mxfp8_quant_cache:
@@ -125,7 +166,7 @@ def _cached(anchor, key, fn, weight=False):
     if anchor is None or not mxfp8_fastpath():
         return fn()
     cache = _call_cache
-    if weight and os.environ.get("AITER_MXFP8_WEIGHT_CACHE", "0") == "1":
+    if weight and mxfp8_weight_reuse_active():
         cache = _weight_cache
         for k in [k for k, v in cache.items() if v[0]() is None]:
             del cache[k]
