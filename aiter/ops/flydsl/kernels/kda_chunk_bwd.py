@@ -2017,7 +2017,54 @@ def compile_dhu_mfma(
             else:
                 init.append(_zero())
 
-        for i, st in range(0, NT, 1, init=init):
+        # The kg / qg / w tiles of the next chunk (in time order, the previous
+        # one) are loaded into registers while the current chunk computes, so
+        # the serial chunk chain does not wait on their global loads.
+        NVT = BT * (K // 8) // NUM_THREADS  # 128-bit loads per thread per tile
+        cp8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+        def tile_regs(tensor, it_):
+            t0_, nv_ = _chunk(it_, T_loc)
+            v3 = _view3(
+                tensor,
+                (fx.Int64(row0 + t0_) * H + fx.Int64(h)) * K,
+                BT,
+                H * K,
+                K,
+                fx.BFloat16,
+            )
+            out = []
+            for e in range_constexpr(NVT):
+                i_ = tid + e * NUM_THREADS
+                t_ = i_ // (K // 8)
+                out.append(
+                    _load_vec(
+                        cp8,
+                        fx.slice(v3, (_sel(t_ < nv_, t_, 0), i_ % (K // 8), None)),
+                        8,
+                        fx.BFloat16,
+                    )
+                )
+            return out
+
+        def tile_store(vecs, it_, dst, ld_dst, transpose):
+            _, nv_ = _chunk(it_, T_loc)
+            for e in range_constexpr(NVT):
+                i_ = tid + e * NUM_THREADS
+                t_ = i_ // (K // 8)
+                ok = t_ < nv_
+                vals = fx.Vector(vecs[e])
+                for p in range_constexpr(8):
+                    c_ = (i_ % (K // 8)) * 8 + p
+                    x = _sel(ok, vals[p].to(fx.Float32), _zero())
+                    lds_st(
+                        dst, c_ * ld_dst + t_ if transpose else t_ * ld_dst + c_, x, BF
+                    )
+
+        def prefetch(it_):
+            return tile_regs(kg, it_) + tile_regs(qg, it_) + tile_regs(w, it_)
+
+        for i, st in range(0, NT, 1, init=init + prefetch(NT - 1)):
             it = NT - 1 - fx.Int32(i)
             t0, nvalid = _chunk(it, T_loc)
             tok = fx.Int64(row0 + t0)
@@ -2029,33 +2076,12 @@ def compile_dhu_mfma(
                 c = sc + 2 * e
                 stg(dh_v, kr * V + v0 + c, st[e], KN)
                 lds_st(s_dhT, c * LDK + kr, st[e], BF)
-            _stage(_src(kg, hk), H * K, s_kg, LDK, BT, K, nvalid, tid, KN, BF)
-            _stage(
-                _src(qg, hk),
-                H * K,
-                s_qgT,
-                LDT,
-                BT,
-                K,
-                nvalid,
-                tid,
-                KN,
-                BF,
-                transpose=True,
-            )
-            _stage(
-                _src(w, hk),
-                H * K,
-                s_wT,
-                LDT,
-                BT,
-                K,
-                nvalid,
-                tid,
-                KN,
-                BF,
-                transpose=True,
-            )
+            pf = st[NE:]
+            tile_store(pf[0:NVT], it, s_kg, LDK, False)
+            tile_store(pf[NVT : 2 * NVT], it, s_qgT, LDT, True)
+            tile_store(pf[2 * NVT :], it, s_wT, LDT, True)
+            it_next = (it > 0).select(it - 1, 0)
+            pf_next = prefetch(it_next)
             dov = _src(do, hv + fx.Int64(v0))
             _stage(dov, H * V, s_doT, LDT, BT, bv, nvalid, tid, VN, BF, transpose=True)
             if tid < K:
@@ -2121,8 +2147,8 @@ def compile_dhu_mfma(
                     u = part[e] - lds_ld(s_cq, klc * ldb + sc + 2 * e)
                     upd[e] = _sel(mine, u, upd[e])
                 gpu.barrier()
-            res = yield [st[e] * decay + upd[e] for e in range(NE)]
-        final = _results(res, NE)
+            res = yield [st[e] * decay + upd[e] for e in range(NE)] + pf_next
+        final = _results(res, NE + 3 * NVT)[:NE]
         if const_expr(use_initial_state):
             for e in range_constexpr(NE):
                 stg(h0_v, state_idx(kr, v0 + sc + 2 * e), final[e], fx.Float32)
