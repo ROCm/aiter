@@ -76,6 +76,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
 )
 from aiter.ops.triton.attention.sol_tilt import (
+    sol_jensen_cap,
     sol_q_abs_max,
     sol_tilt_planes,
     sol_tilt_scaled_params,
@@ -4114,6 +4115,68 @@ def test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance(name):
     )
     torch.cuda.synchronize()
     assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_reads_the_capped_jensen_variance(name):
+    """sol_jensen_cap's variance reaches the hd256 rows at its gain. For MXFP6 and MXFP8 it is a
+    new pack, whose scales ride in the records. The old records with only the scale image moved
+    match the uncapped reference instead, which this tells apart.
+
+    The routed MXFP4 row sits near its oracle floor on these wide blocks, so that floor and the
+    factor of two are left to test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance."""
+    q_tile, kv_tile = _HD256_SOL_TILE
+    heads = 2
+    torch.manual_seed(4)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    # Wide and narrow blocks in turn, so the cap damps about half of them and leaves the rest.
+    spread = torch.tensor([0.5, 1.5], device="cuda").repeat_interleave(kv_tile)
+    k = torch.randn((1, 64 * kv_tile, heads, 256), device="cuda")
+    k = (k * spread.repeat(32)[None, :, None, None]).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=1.0, k_variance=True)
+    var, var_scale, gain = sol_jensen_cap(
+        q,
+        None,
+        None,
+        plan["mean_k_var"],
+        _HD256_SOFTMAX_SCALE,
+        kv_tile,
+        block_attn_mask=plan["block_attn_mask"],
+        q_tile=q_tile,
+        q_abs_max=sol_q_abs_max(q, q_tile, rotate=case["rotated"]),
+        mean_k_var_scale=plan["mean_k_var_scale"],
+        mean_k_var_pooled=plan["mean_k_var_pooled"],
+    )
+    assert (gain < 1).any() and (gain == 1).any(), gain
+    capped_plan = {**plan, "mean_k_var": var, "mean_k_var_scale": var_scale}
+    uncapped = _hd256_sol_launch(case, plan, jensen=True)
+    capped, capped_lse = _hd256_sol_launch(
+        case, capped_plan, jensen=True, return_lse=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(uncapped, capped)
+
+    q_rot, k_rot = (_sol_attn_rotate(x) for x in (q, k)) if case["rotated"] else (q, k)
+    var_rot = _sol_attn_block_variance(k_rot.float(), kv_tile)
+    ref_args = (
+        q,
+        case["k_real"],
+        case["v_real"],
+        plan["block_attn_mask"],
+        *_hd256_sol_pooled_real(case, plan),
+        _HD256_SOL_TILE,
+        _HD256_SOFTMAX_SCALE,
+    )
+    reference, reference_lse = _sol_attn_jensen_ref(
+        *ref_args, (q_rot, var_rot * gain.unsqueeze(-1))
+    )
+    uncapped_reference = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[0]
+    # Measured: 0.034 (bf16) to 0.047 (mxfp8) apart.
+    cosine = (_cosine(capped, reference), _cosine(capped, uncapped_reference))
+    assert cosine[0] > cosine[1] + 0.02, (name, cosine)
+    assert (capped_lse - reference_lse).abs().max() < 0.15
 
 
 def _planted_low_rank_kv(batch, sequence_k, heads, head_dim, rank=2):
