@@ -2953,6 +2953,9 @@ void fused_qknorm_idxrqknorm(
 // aiter_tensor_t marshalling. One entry for every token count: the launcher picks the prefill
 // variant from pfMinTokens() tokens and the generic (decode) kernel below that. The head set is the
 // TP4 one (16 q / 1 kv / 1 index heads, rotary 64, block_size 128), bf16 qkv, e4m3 index_q_out.
+// This entry itself only checks num_tokens and the device arch below: it does NOT re-validate
+// dtypes, shapes, strides, alignment or devices, so a call that bypasses the Python front
+// (_nvfp4_raw_front in aiter/ops/fused_qknorm_idxrqknorm.py) with unvalidated pointers is unsafe.
 void fused_qknorm_nvfp4_raw(int64_t qkv,
                             int64_t q_out,
                             int64_t index_q_out,

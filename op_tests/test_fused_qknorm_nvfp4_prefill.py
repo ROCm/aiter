@@ -3,7 +3,8 @@
 
 """The NVFP4 prefill insert of fused_qknorm_idxrqknorm (MiniMax-M3 TP4 head set, gfx950) against the generic kernel.
 
-The prefill path takes a call of at least AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS (512) tokens; any slot
+The prefill path takes a call of at least AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS tokens (default 2,
+kPfDefaultMinTokens); any slot
 pattern with distinct slots must give the bytes of the generic kernel in every buffer (pages that already hold data
 included: a V octet shares nibbles and scales between tokens). The parent runs this file twice, once with the
 prefill path forced on from 2 tokens and once with it off, and compares the SHA-256 of every output buffer.
