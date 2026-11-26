@@ -486,3 +486,21 @@ def chunk_kda_fwd_flydsl(
         torch.cuda.current_stream(),
     )
     return o, fs
+
+
+def register_with_kda_bwd(name: str = "flydsl") -> bool:
+    """Offer ``chunk_kda_fwd_prepare_flydsl`` to the FlyDSL chunk backward.
+
+    Opt-in: the backward still recomputes with Triton unless it is called with
+    ``prepare=name`` or ``AITER_KDA_BWD_PREPARE=name``. Aqk and Akk come back
+    fp32 (Triton's are bf16); the backward stages are compiled per dtype.
+    """
+    try:
+        from .kda_chunk_bwd import register_fwd_prepare
+    except ImportError:
+        return False
+    register_fwd_prepare(name, chunk_kda_fwd_prepare_flydsl)
+    return True
+
+
+register_with_kda_bwd()
