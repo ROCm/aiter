@@ -3,8 +3,8 @@
 # ruff: noqa: SIM102
 """MegaMoEV2 small-input path: quant, dispatch, GEMM1, GEMM2 and combine fused into one kernel.
 
-Dispatch publishes each route into its expert's fixed slot on the destination rank (with dedup_rows the
-row itself goes once per token and destination into a token-row region). The runtime serves up to 512
+Dispatch publishes each route into its expert's fixed slot on the destination rank; the row itself goes once
+per token and destination into a token-row region. The runtime serves up to 512
 tokens per rank and owns its protocol state and combine output; inside MegaMoEV2 its payload,
 GEMM1-output and combine-input storage are views of the instance's shared arenas.
 """
@@ -34,7 +34,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     group_major_capacity,
 )
 from ..kernels_common import ceildiv
-from ..mxfp4_gemm_common import kStages, lds_typed_ptr
+from ..mxfp4_gemm_common import lds_typed_ptr
 from ..quant_utils import emit_mx_e8m0_scale
 from ..tensor_shim import (
     _preload_compiled,
@@ -44,8 +44,7 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
-from .gemm1 import _LA_CM, _LdsF32View, build_fused_gemm1
-from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
+from .gemm1 import _LA_CM
 from .gemm_ring import (
     gemm1_ring_lds_bytes,
     gemm2_ring_lds_bytes,
@@ -66,13 +65,11 @@ from .mega_moe_config import (
 from .mega_moe_fused_gemm import AddrBuffer, load_at, store_at
 from .mega_moe_stage1 import (
     _dispatch_dtype,
-    _validate_dispatch_capacity,
     stage1_output_buffers,
 )
 from .mega_moe_stage2 import (
     _SC0_SC1_CACHE,
     Stage2Meta,
-    _stage2_lds_bytes,
     p2p_scatter_epilog,
 )
 from .quant import pack_mx_fp4_words
@@ -126,7 +123,7 @@ class DispatchSlot(IntEnum):
     XCD_ACQ = (
         35  # per-XCD i64 copy of PLAN_NV, republished after that XCD's L2 invalidation
     )
-    # dedup_rows: byte offsets of the token-row regions (one row per source rank and token) from the payload rows
+    # Byte offsets of the token-row regions (one row per source rank and token) from the payload rows
     # and from their scales; the same on every rank (symmetric heap).
     TOKEN_ROWS = 36
     TOKEN_SCALES = 37
@@ -230,14 +227,14 @@ def _readlane_i64(v, lane):
     return fx.Int64((fx.Uint64(hi) << 32) | fx.Uint64(lo))
 
 
-# dedup_rows: a launch of at most this many tokens a rank spreads each token over every wave of its producer CTA
+# A launch of at most this many tokens a rank spreads each token over every wave of its producer CTA
 # (_spread_token): the waves send to the destinations of their own top-k slots, so a token's rows leave from all of
 # them instead of one wave.
 _SPREAD_MAX_TOKENS = 4
 
 
 def _spread_token(i32_cur_tok, dispatch_blocks):
-    """dedup_rows: whether the producers spread each token over their waves (few tokens: one a producer CTA)."""
+    """Whether the producers spread each token over their waves (few tokens: one a producer CTA)."""
     return i32_cur_tok <= fx.Int32(min(_SPREAD_MAX_TOKENS, dispatch_blocks))
 
 
@@ -259,14 +256,16 @@ def prefetch_direct_fixed_slot_token(
     uniform=False,
     fz_fp4=False,
 ):
-    """dedup_rows: load what the token of this wave needs ahead of the payload loop, its row quantized once
-    (MXFP8, or MXFP4 with fz_fp4: as prefetch_direct_fixed_slot_route's).
+    """Load what the token of this wave needs ahead of the payload loop, its row quantized once to MXFP8, or MXFP4
+    with fz_fp4 (1x32 E8M0 scales, bit-identical to quant.per_1x32_mx_quant).
 
     The wave's token is producer_slot + dispatch_blocks * warp + token_offset (one wave a CTA first), or with few
     tokens (_spread_token) producer_slot + token_offset on every wave of the CTA; lane j < fz_k holds the token's
     route j: its expert, the destination's remote pointers and its weight. ``send``: the lane is the token's first
     route to its destination, which sends the row to the destination's token-row region.
-    Straight-line, with the token clamped as in prefetch_direct_fixed_slot_route.
+    Straight-line (no device branches) so it can run ahead of the payload loop; the token is clamped so waves
+    without one read valid memory. ``uniform``: the table and remote pointers move to SGPRs, so their buffer stores
+    need no waterfall loop.
     """
     assert fz_k <= 64, "one lane a route"
     tables, dp = _dispatch_tables(addr_disp, uniform)
@@ -321,149 +320,43 @@ def prefetch_direct_fixed_slot_token(
     }
 
 
-def prefetch_direct_fixed_slot_route(
-    *,
-    num_waves,
-    fz_npes,
-    fz_epr,
-    fz_k,
-    fz_mtpr,
-    fz_total_experts,
-    fz_dim,
-    fz_scale_n_i32,
-    addr_disp,
-    addr_in_tok,
-    addr_in_idx,
-    addr_in_wts,
-    addr_in_sc,
-    i32_cur_tok,
-    dispatch_blocks,
-    producer_slot,
-    route_offset=0,
-    dedup=False,
-    uniform=False,
-    fz_fp4=False,
-):
-    """Load everything the (single) route of this wave needs that does not depend on the launch epoch.
-
-    ``dedup``: the wave handles a token instead (prefetch_direct_fixed_slot_token; route_offset counts tokens).
-
-    addr_in_tok holds the bf16 rows of fz_dim values; the wave quantizes its row to MXFP8, or MXFP4 with fz_fp4
-    (1x32 E8M0 scales, bit-identical to quant.per_1x32_mx_quant). addr_in_sc is unused.
-
-    Straight-line (no device branches) so it can run ahead of the payload loop: the route's expert, the
-    destination's remote pointers, the token row, its scales and its weight. Indices are clamped so waves
-    without a route read valid memory; emit_direct_fixed_slot_payload ignores their values.
-    ``uniform``: the table and remote pointers move to SGPRs, so their buffer stores need no waterfall loop.
-    """
-    if const_expr(dedup):
-        return prefetch_direct_fixed_slot_token(
-            fz_k=fz_k,
-            fz_epr=fz_epr,
-            fz_total_experts=fz_total_experts,
-            fz_dim=fz_dim,
-            fz_scale_n_i32=fz_scale_n_i32,
-            addr_disp=addr_disp,
-            addr_in_tok=addr_in_tok,
-            addr_in_idx=addr_in_idx,
-            addr_in_wts=addr_in_wts,
-            i32_cur_tok=i32_cur_tok,
-            dispatch_blocks=dispatch_blocks,
-            producer_slot=producer_slot,
-            token_offset=route_offset,
-            uniform=uniform,
-            fz_fp4=fz_fp4,
-        )
-    tables, _ = _dispatch_tables(addr_disp, uniform)
-    in_idx = ptr_buf_tensor(addr_in_idx, fx.Int32)
-    as_ptr = (
-        (lambda v: fx.Int64(comm_ops.wave_uniform_i64(v)))
-        if const_expr(uniform)
-        else (lambda v: v)
-    )
-    tid = fx.thread_idx.x
-    lane = tid & fx.Int32(63)
-    warp = tid >> fx.Int32(6)
-    # route_offset selects a later round of this wave's routes (emit_direct_fixed_slot_payload route_rounds).
-    route = producer_slot * fx.Int32(num_waves) + warp + fx.Int32(route_offset)
-    route_limit = i32_cur_tok * fx.Int32(fz_k)
-    wk = ((route >= fx.Int32(0)) & (route < route_limit)).select(route, fx.Int32(0))
-    source_token = wk // fx.Int32(fz_k)
-    global_expert = fx.Int32(
-        fx.rocdl.readfirstlane(
-            T.i32,
-            in_idx[wk],
-        )
-    )
-    valid_expert = (global_expert >= fx.Int32(0)) & (
-        global_expert < fx.Int32(fz_total_experts)
-    )
-    destination = valid_expert.select(global_expert, fx.Int32(0)) // fx.Int32(fz_epr)
-    remote = {
-        name: as_ptr(ptr_buf_tensor(tables[name], fx.Int64)[destination])
-        for name in ("rx", "sc", "wts", "sm", "running")
-    }
-    assert fz_dim % 1024 == 0, "rows must be whole 1024-value wave chunks"
-    row_values, scale = _quantize_row_mx(
-        AddrBuffer(addr_in_tok + fx.Int64(source_token) * fx.Int64(2 * fz_dim)),
-        lane,
-        fz_dim // 1024,
-        fz_scale_n_i32,
-        fz_fp4,
-    )
-    weight = load_at(AddrBuffer(addr_in_wts), wk, fx.Float32, 1)
-    return {
-        "tables": tables,
-        "global_expert": global_expert,
-        "remote": remote,
-        "row_values": row_values,
-        "scale": scale,
-        "weight": weight,
-    }
-
-
 # fmt: off
 @flyc.jit
 def emit_direct_fixed_slot_payload(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes,
-    fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
+    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_nbytes, fz_scale_n_i32, fz_enable_scales,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0, running_half=None,
+    direct_done=0, running_half=None,
 ):
 # fmt: on
-    """Allocate and publish routes directly into destination fixed slots.
+    """Allocate and publish routes directly into destination fixed slots: each token's row once to every
+    destination of its routes, into the token-row region there.
 
     ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one,
     and their srcmap and weight go to the same half of the destinations' two halves of fz_epr * fz_cap slots.
     """
-    # prefetch_direct_fixed_slot_route loaded this wave's first len(prefetched) routes ahead of the loop.
+    # prefetch_direct_fixed_slot_token loaded this wave's first len(prefetched) tokens ahead of the loop.
     p_source_done = prefetched[0]["tables"]["source_done"]
     a_producer_done = prefetched[0]["tables"]["producer_done"]
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
-    route = producer_slot * fx.Int32(num_waves) + warp
-    route_stride = fx.Int32(dispatch_blocks * num_waves)
-    route_limit = i32_cur_tok * fx.Int32(fz_k)
 
-    # A wave owns routes route + r * route_stride for r < route_rounds (dedup: tokens, see
-    # prefetch_direct_fixed_slot_token); each round is a loop of at most one trip, and rounds past the prefetched
-    # ones load their route in the loop.
-    if const_expr(dedup):
-        # Few tokens (_spread_token): every wave of the producer takes its token and sends, counts and publishes
-        # the routes of its own top-k slots (slot j: wave j % num_waves).
-        spread = _spread_token(i32_cur_tok, dispatch_blocks)
-        warp_u = fx.Int32(fx.rocdl.readfirstlane(T.i32, warp))
-        own_lane = ~spread | ((lane % fx.Int32(num_waves)) == warp)
-    for rr in range_constexpr(route_rounds if dedup else 0):
+    # A wave owns tokens (see prefetch_direct_fixed_slot_token) in route_rounds rounds; each round is a loop of at
+    # most one trip, and rounds past the prefetched ones load their token in the loop.
+    # Few tokens (_spread_token): every wave of the producer takes its token and sends, counts and publishes
+    # the routes of its own top-k slots (slot j: wave j % num_waves).
+    spread = _spread_token(i32_cur_tok, dispatch_blocks)
+    warp_u = fx.Int32(fx.rocdl.readfirstlane(T.i32, warp))
+    own_lane = ~spread | ((lane % fx.Int32(num_waves)) == warp)
+    for rr in range_constexpr(route_rounds):
         token = spread.select(producer_slot, producer_slot + fx.Int32(dispatch_blocks) * warp) + fx.Int32(
             rr * dispatch_blocks * num_waves)
         for source_token in range(token, i32_cur_tok, fx.Int32(fz_mtpr)):
             if const_expr(rr < len(prefetched)):
                 rpf = prefetched[rr]
             else:
-                rpf = prefetch_direct_fixed_slot_route(**prefetch_args, route_offset=rr * dispatch_blocks * num_waves)
+                rpf = prefetch_direct_fixed_slot_token(**prefetch_args, token_offset=rr * dispatch_blocks * num_waves)
             # The token row goes once to each destination, into its token-row region; its place does not depend
             # on the expert offsets, so it is sent before the counter atomics and overlaps their round trip.
             token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
@@ -506,57 +399,6 @@ def emit_direct_fixed_slot_payload(
                 source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (lane << fx.Int32(24))
                 comm_ops.store_i32_global(rpf["remote"]["wts"] + fx.Int64(meta_row) * fx.Int64(4), weight_bits)
                 comm_ops.store_i32_global(rpf["remote"]["sm"] + fx.Int64(meta_row) * fx.Int64(4), source_encoding)
-    for rr in range_constexpr(0 if dedup else route_rounds):
-        for wk in range(route + fx.Int32(rr) * route_stride, route_limit, fx.Int32(fz_mtpr * fz_k)):
-            if const_expr(rr < len(prefetched)):
-                rpf = prefetched[rr]
-            else:
-                rpf = prefetch_direct_fixed_slot_route(**prefetch_args, route_offset=rr * dispatch_blocks * num_waves)
-            source_token = wk // fx.Int32(fz_k)
-            topk_slot = wk - source_token * fx.Int32(fz_k)
-            row_values = rpf["row_values"]
-            lane_i32 = len(row_values[0])
-            global_expert = rpf["global_expert"]
-            valid_expert = (global_expert >= fx.Int32(0)) & (global_expert < fx.Int32(fz_total_experts))
-            safe_expert = valid_expert.select(global_expert, fx.Int32(0))
-            destination = safe_expert // fx.Int32(fz_epr)
-            local_expert = safe_expert - destination * fx.Int32(fz_epr)
-            running_slot = local_expert
-            if const_expr(running_half is not None):
-                running_slot = running_slot + running_half * fx.Int32(fz_epr)
-            offset_lane = fx.Int32(0)
-            if lane == fx.Int32(0):
-                if valid_expert:
-                    offset_lane = fx.Int32(
-                        comm_ops.atomic_add_system(
-                            rpf["remote"]["running"] + fx.Int64(running_slot) * fx.Int64(4), fx.Int32(1)
-                        )
-                    )
-            expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
-            publish = valid_expert & (expert_offset < fx.Int32(fz_cap))
-            payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
-            meta_row = payload_row
-            if const_expr(running_half is not None):
-                meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
-
-            if publish:
-                destination_row = ptr_buf_tensor(
-                    rpf["remote"]["rx"] + fx.Int64(payload_row) * fx.Int64(fz_nbytes), fx.Int32, unit_elems=lane_i32)
-                for i in range_constexpr(len(row_values)):
-                    buf_copy_store(destination_row, lane + fx.Int32(i * 64), row_values[i], fx.Int32,
-                        unit_elems=lane_i32)
-
-                if const_expr(fz_enable_scales):
-                    if lane < fx.Int32(fz_scale_n_i32):
-                        ptr_buf_tensor(rpf["remote"]["sc"], fx.Int32)[
-                            payload_row * fx.Int32(fz_scale_n_i32) + lane] = rpf["scale"]
-
-                if lane == fx.Int32(0):
-                    weight_bits = fx.Vector.from_elements([rpf["weight"]], fx.Float32).bitcast(fx.Int32)[0]
-                    source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (topk_slot << fx.Int32(24))
-                    ptr_buf_tensor(rpf["remote"]["wts"], fx.Int32)[meta_row] = weight_bits
-                    ptr_buf_tensor(rpf["remote"]["sm"], fx.Int32)[meta_row] = source_encoding
-
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     # direct_done: producers 0..active-1 carry every route; when there are few of them, each adds its share of
@@ -564,9 +406,8 @@ def emit_direct_fixed_slot_payload(
     # destination right after its drain.
     publish_last = warp == fx.Int32(0)
     if const_expr(direct_done):
-        # dedup: a token on each producer's wave 0 first.
-        active = i32_cur_tok if const_expr(dedup) else (route_limit + fx.Int32(num_waves - 1)) // fx.Int32(num_waves)
-        active = (active < fx.Int32(dispatch_blocks)).select(active, fx.Int32(dispatch_blocks))
+        # A token on each producer's wave 0 first.
+        active = (i32_cur_tok < fx.Int32(dispatch_blocks)).select(i32_cur_tok, fx.Int32(dispatch_blocks))
         active = (active > fx.Int32(1)).select(active, fx.Int32(1))
         direct = active <= fx.Int32(direct_done)
         if direct:
@@ -600,8 +441,6 @@ def emit_direct_fixed_slot_payload(
 # of them landed. Every bucket of such a runtime uses direct_done, as the ranks of a launch may run different
 # buckets.
 _DIRECT_DONE_INC = 64
-# g1_split_tail: bit of the GEMM1 work word that carries the unit's piece (0: whole, 1 / 2: first / second half).
-_PIECE_SHIFT = 28
 
 
 def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
@@ -948,109 +787,15 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     return fused_combine_tail
 
 
-def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False, compute_bytes=None):
-    """Absolute LDS offsets of the stage2 tile (compute slab, packed srcmap, weights, peer table, fc scratch);
-    ``compute_bytes`` overrides the compute slab."""
-    compute = _stage2_lds_bytes(BM, BN, BK, a_dtype, kStages + 1, g2_bf16_lds)
-    if compute_bytes is not None:
-        compute = compute_bytes
-    packed = compute
+def g2_lds_layout(*, BM, npes, compute_bytes):
+    """Absolute LDS offsets of the GEMM2 tile past its ``compute_bytes`` compute slab (packed srcmap, weights, peer
+    table, fc scratch)."""
+    packed = compute_bytes
     weight = packed + BM * 4
     peer = weight + BM * 4
     fc = peer + npes * 8
     # fc: ticket (4 B), flag (8 B at +8), one format word per peer (at +16).
     return {"packed": packed, "weight": weight, "peer": peer, "fc": fc, "bytes": fc + 16 + npes * 4}
-
-
-# fmt: off
-def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
-    npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, row_stride=False):
-# fmt: on
-    """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
-
-    Uses the absolute LDS layout of ``g2_lds_layout`` (the caller's LDS pool must start at address 0); the peer
-    table at ``layout['peer']`` must be loaded by the caller. Same numerics as the stage2 kernel.
-    ``row_mask``: rows past the tile's valid count are dropped here, so the plan need not pad their srcmap.
-    ``uniform``: the pointer arguments move to SGPRs (no waterfall loops around the tile's buffer loads).
-    ``epi_lean`` / ``tok_done`` (with the tile's ``i64_tok_off``) / ``bf16_head_tokens``: p2p_scatter_epilog's
-    ``lean`` / ``tok_off`` / ``bf16_head_tokens``.
-    ``row_stride``: the tile's rows word carries in its high half the stride of its srcmap slots (interleaved
-    m-tiles of emit_direct_fixed_slot_finalize).
-    """
-    assert clamp_a or not row_mask
-    assert not row_stride or (clamp_a and BM == SBM)
-    lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
-    # BF16 launches store their rows with every lane (p2p_scatter_epilog wide_bf16); the lean / tok_done epilogues
-    # keep their per-wave rows.
-    wide_bf16 = p2p_quant_type == "dynamic" and not epi_lean and not tok_done
-    is_f8 = a_dtype == "fp8"
-    aStages = kStages + 1
-    KH_TILE_A = BK // (1 if is_f8 else 2)
-    # gemm2_compute_v2's 1-stage B path: each K-step's B loads go ahead of the barrier and an unconditional A copy,
-    # so the MFMAs' wait for them leaves that copy in flight.
-    one_stage = BM == 64 and BN == 256
-    log2_max_tok = max_tok.bit_length() - 1
-
-    # fmt: off
-    @flyc.jit
-    def g2_tile(lds_base_i32: fx.Int32, tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, m_block: fx.Int32,
-        n_block: fx.Int32, arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
-        arg_eids: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_tile_rows: fx.Int64,
-        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32,
-        i64_tok_off: fx.Int64):
-    # fmt: on
-        # The pointers come from the dispatch table (VGPR loads): keep them in SGPRs so the tile's buffer
-        # resources need no waterfall loop around every load.
-        if const_expr(uniform):
-            arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_stids, arg_sweights, arg_trb, arg_tile_rows = (
-                fx.Int64(comm_ops.wave_uniform_i64(a)) for a in (arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids,
-                    arg_stids, arg_sweights, arg_trb, arg_tile_rows))
-            i32_max_m_blocks = fx.Int32(rocdl.readfirstlane(T.i32, i32_max_m_blocks))
-        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
-        k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
-        vrows = None
-        if const_expr(clamp_a):
-            vrows = rocdl.readfirstlane(T.i32, load_at(AddrBuffer(arg_tile_rows), m_block, fx.Int32, 1))
-            if const_expr(row_stride):
-                slot_stride = fx.Int32(vrows) >> fx.Int32(16)
-                vrows = fx.Int32(vrows) & fx.Int32(0xFFFF)
-        m_row0 = m_block * fx.Int32(BM)
-        for slot in range_constexpr(kStages):
-            issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A, k_bytes,
-                BM=BM, valid_rows=vrows)
-        rocdl.sched_barrier(0)
-        if const_expr(row_stride):
-            srcmap_row_base = load_at(AddrBuffer(arg_trb), m_block, fx.Int32, 1)
-        else:
-            sort_block_idx = m_row0 // fx.Int32(SBM)
-            srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (
-                m_row0 - sort_block_idx * fx.Int32(SBM))
-        if tx_i32 < fx.Int32(BM):
-            sorted_pos = srcmap_row_base + (tx_i32 * slot_stride if const_expr(row_stride) else tx_i32)
-            packed = load_at(AddrBuffer(arg_stids), sorted_pos, fx.Int32, 1)
-            if const_expr(row_mask):
-                packed = (tx_i32 < vrows).select(packed, fx.Int32(npes * max_tok))
-            weight = load_at(AddrBuffer(arg_sweights), sorted_pos, fx.Float32, 1)
-            fx.ptr_store(packed, lds_typed_ptr(fx.Int32(lay["packed"]) + tx_i32 * fx.Int32(4), T.i32, align=4))
-            fx.ptr_store(weight, lds_typed_ptr(fx.Int32(lay["weight"]) + tx_i32 * fx.Int32(4), T.f32, align=4))
-        unit_bx = m_block * num_n_blocks + n_block
-        # fmt: off
-        accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
-            arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
-            fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
-            a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows, early_b_load=one_stage, a_dma_uniform=one_stage)
-        p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
-            topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
-            comb_inp_nbytes=comb_inp_nbytes, meta=Stage2Meta(lds_base_i32, lay["packed"], lay["weight"], lay["peer"]),
-            g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, store_cm=store_cm,
-            fp8_store_cm=2, fp8_rows=i32_fp8_rows, elem_view_stores=True, lean=epi_lean,
-            tok_off=i64_tok_off if const_expr(tok_done) else None, bf16_head_tokens=bf16_head_tokens,
-            wide_bf16=wide_bf16)
-        # fmt: on
-
-    return g2_tile, lay
 
 
 def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, tile_m):
@@ -1065,17 +810,12 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
 @functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
-    fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fused: tuple, sort_block_m: int = 32,
-    tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 8,
-    pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
-    async_a_copy: bool = False, use_tile_resource: bool = True,
-    waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_wt: bool = False,
-    plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
-    g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
-    tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False, a_dtype: str = "fp8", g1_split_tail: int = 0,
-    pair_tiles: bool = False, ring_core: tuple = (),
+    fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fused: tuple, sort_block_m: int = 64,
+    tile_n: int = 256, num_waves: int = 4, grid_mult: int = 2, waves_per_eu_hint: int = 2, num_cu: int = 256,
+    num_dispatch_cu: int = 32, b_nt: int = 3, swiglu_limit: float = 0.0, plan_wt: bool = False,
+    g2_early: tuple = (0, 0), head_uniform: bool = False, g2_epi_lean: int = 0, direct_done: int = 0,
+    tok_done: bool = False, tok_counters: bool = False, bf16_head_tokens: int = 0, stream_w: bool = False,
+    a_dtype: str = "fp8",
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1083,8 +823,8 @@ def compile_mega_moe_stage1(
     NUM_WAVES = int(num_waves)
     assert NUM_WAVES > 1, "planner needs one communication wave and at least one grouping wave"
     assert 1 <= waves_per_eu_hint <= 4
-    assert tile_n % NUM_WAVES == 0
-    n_per_wave = tile_n // NUM_WAVES
+    # The ring GEMM cores: 64-row m-tiles, each wave 64 GEMM1 columns (32 intermediate) and 64 GEMM2 columns.
+    assert sort_block_m == 64 and tile_n == 64 * NUM_WAVES
     assert (2 * inter_dim) % tile_n == 0, "2*inter_dim must tile evenly by tile_n"
     N_TILES = (2 * inter_dim) // tile_n
     GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
@@ -1098,25 +838,10 @@ def compile_mega_moe_stage1(
     assert grid_x > 0, "consumer grid must remain positive"
     launch_grid_x = planner_blocks + dispatch_blocks + grid_x
     assert launch_grid_x <= num_cu * 33 + 1
-    M_REPEAT = sort_block_m // 16
-    NUM_ACC_N = n_per_wave // 16
-    assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
 
-    assert tile_k == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
     assert a_dtype in ("fp8", "fp4")
     a_fp4 = a_dtype == "fp4"
-    A_K_STEP_BYTES = tile_k // (2 if a_fp4 else 1)
-    K_ITERS = model_dim // tile_k
     TOTAL_THREADS = NUM_WAVES * 64
-
-    a_lds_size = sort_block_m * A_K_STEP_BYTES
-    a_lds_i32 = a_lds_size // 4
-    cs_tile_n = tile_n // 2
-    cs_size = sort_block_m * cs_tile_n
-    # pair_tiles: a unit may run two m-tiles as one tile of twice the rows (A and its scales staged for both).
-    tile_rows_max = sort_block_m * (2 if pair_tiles else 1)
-    lds_pool_bytes = max(2 * tile_rows_max * A_K_STEP_BYTES, cs_size * 4)
-    n_scale_bytes = tile_rows_max * (model_dim // 32)
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
@@ -1129,11 +854,10 @@ def compile_mega_moe_stage1(
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
         raise ValueError("small-input stage1 needs the EP8/48-, EP4/96- or EP2/192-expert fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
-    # Producers load their route (expert, remote pointers, row, scales, weight) ahead of the payload loop and
-    # quantize the bf16 input row to MXFP8 (MXFP4 for a_dtype fp4). A producer wave sends pre_rounds routes (one
-    # per round) so that npes groups of mtpr * topk routes fit; with dedup_rows a wave sends a token's routes and
-    # quantizes its row once.
-    pre_rounds = ceildiv(fz_mtpr * (1 if dedup_rows else fz_k), dispatch_blocks * NUM_WAVES)
+    # Producers load their token (experts, remote pointers, row, scales, weights) ahead of the payload loop and
+    # quantize the bf16 input row to MXFP8 (MXFP4 for a_dtype fp4) once; a producer wave sends pre_rounds tokens
+    # (one per round) so that the mtpr tokens fit.
+    pre_rounds = ceildiv(fz_mtpr, dispatch_blocks * NUM_WAVES)
     assert 0 <= direct_done <= _DIRECT_DONE_INC
     # Per-launch step of the expected source-flag value (see _DIRECT_DONE_INC); every bucket of a runtime and every
     # rank use the same direct_done setting, so they agree on it.
@@ -1145,96 +869,55 @@ def compile_mega_moe_stage1(
     # one a peer can add to it is launch N + 2, which needs this rank's launch N + 1 sources, so launch N is over.
     # The routes' srcmap and weight slots follow the same halves: the offsets restart at 0 in every launch, so a
     # rank's launch N + 1 routes would otherwise overwrite the slots of launch N routes a peer's GEMM1 / GEMM2 still
-    # reads (that peer's sources are not done with launch N).
-    assert not tok_counters or plan_local, "the double-buffered expert counters are zeroed by the combine"
-    # Only the dedup token rows (indexed by source token) leave the slot-indexed payload rows unused; those
-    # rows are single-buffered, so a run-ahead launch would overwrite them as it did the srcmap.
-    assert not tok_counters or dedup_rows, "a runtime with tok_done buckets must send dedup token rows"
-    # Small batches stream B; large batches cache it across M tiles.
-    b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
+    # reads (that peer's sources are not done with launch N). The token rows, indexed by source token, are
+    # single-buffered: a run-ahead launch would overwrite them as it did the srcmap.
+    b_cache_modifier = int(b_nt)
     fz_nbytes = model_dim // (2 if a_fp4 else 1)
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
     if fz_scale_n_i32 > 64:
         raise ValueError("direct fixed-slot dispatch supports at most 64 packed scale columns")
     fz_enable_scales = fz_scale_bytes > 0
-    _validate_dispatch_capacity(
-        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim, use_tile_resource
-    )
 
     # fused = (BN, BK, recv_cap, fc_reducers): after its GEMM1 tiles every CTA runs GEMM2 + P2P scatter tiles
     # of its XCD's m-tiles (each gated on that m-tile's GEMM1 completion) and then the fused combine tail.
-    # Finalize publishes per-tile valid rows that clamp the GEMM1 A loads and epilogue stores, and each XCD
-    # drains a contiguous slice of the m-major work space.
-    g2_bn, g2_bk, g2_recv_cap, fused_reducers = fused
+    # Each XCD drains a contiguous slice of the m-major work space.
+    g2_bn, _g2_bk, g2_recv_cap, fused_reducers = fused
     assert fused_reducers > 0, "the fused combine needs reducers"
-    assert model_dim % g2_bn == 0 and NUM_WAVES == 4 and fz_npes <= 47
+    assert model_dim % g2_bn == 0 and NUM_WAVES == 4 and fz_npes <= 47 and g2_bn == 256
     g2_n_blocks = model_dim // g2_bn
     # The P2P row stores go to the uncached shmem heap; non-temporal stores there are slower (store_cm=0).
     # GEMM2 masks the padding rows of each tile itself, so the plan leaves their srcmap unwritten.
-    # interleave: an expert's slots go round-robin over its m-tiles (slots arrive grouped by source rank, so
-    # contiguous m-tiles would send each GEMM2 tile's rows to one or two ranks). GEMM1 and GEMM2 reach every slot
-    # through the srcmap (dedup_rows) and the m-tile's rows from the local plan / the finalize's rows word.
-    interleave = dedup_rows and plan_local
-    assert not interleave or fz_cap // fz_tile_m < 1 << 15, "the rows word keeps the m-tile count in its high half"
-    # pair_tiles: the GEMM1 units of an expert with more m-tiles than one each run a pair of them (2j, 2j + 1), one
-    # 2 x sort_block_m row tile that reads each W1 slab once for both (the last of an odd count runs alone). The
-    # GEMM1 unit space is then N_TILES units per pair or lone m-tile; GEMM2 keeps its m-tile units. The paired body
-    # is register-checked with the default lookahead. A pair reads W1 through the cache, so with streamed W1 only the
-    # ranks whose plan already picks the cached-weight bodies (_PLAN_CACHED_W_BIT) pair; the others keep their
-    # streamed m-tile units (cached pairs among streamed tiles crowd the L2 and lose to them under skewed routing).
-    assert not pair_tiles or (interleave and g1_lookahead == 1 and g1_a_ahead == 1)
-    g2_tile, g2_lay = make_g2_tile_runner(
-        BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
-        a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
-        npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
-        recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, row_stride=interleave,
-    )
-    g2_tile_cached, _ = make_g2_tile_runner(
-        BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
-        a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
-        npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
-        recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, row_stride=interleave,
-    )
-    # ring_core = (pf1, nbuf1, pf2, nbuf2): GEMM1 units and GEMM2 tiles run the gemm_ring cores, their weights pf
-    # 128-K steps ahead and their activation rows through an nbuf-stage LDS DMA ring; each wave owns 64 rows x 32
-    # intermediate (GEMM1) or 64 hidden (GEMM2) columns. GEMM2 reads the m-tile's rows from the CTA's own plan.
-    RING = bool(ring_core)
-    if RING:
-        ring_pf1, ring_nb1, ring_pf2, ring_nb2 = (int(v) for v in ring_core)
-        assert sort_block_m == 64 and tile_n == 64 * NUM_WAVES and g2_bn == 256 and interleave
-        assert not pair_tiles and not g1_split_tail and g1_lookahead == 1 and g1_a_ahead == 1
-        g1_a_bytes = gemm1_ring_lds_bytes(a_fp4=a_fp4, model_dim=model_dim, bm=sort_block_m, nw=NUM_WAVES,
-            nbuf=ring_nb1)
-        g2_lay = g2_lds_layout(BM=sort_block_m, BN=g2_bn, BK=g2_bk, a_dtype="fp8", npes=int(fuse_npes),
-            compute_bytes=max(sort_block_m * (g2_bn + 4) * 4, gemm2_ring_lds_bytes(inter_dim=inter_dim,
-            bm=sort_block_m, nw=NUM_WAVES, nbuf=ring_nb2)))
-        lds_pool_bytes = g1_a_bytes
-        n_scale_bytes = 16
-    else:
-        g1_a_bytes = 2 * tile_rows_max * A_K_STEP_BYTES
+    # An expert's slots go round-robin over its m-tiles (slots arrive grouped by source rank, so contiguous m-tiles
+    # would send each GEMM2 tile's rows to one or two ranks). GEMM1 and GEMM2 reach every slot through the srcmap
+    # and the m-tile's rows from the CTA's local plan.
+    assert fz_cap // fz_tile_m < 1 << 15, "the rows word keeps the m-tile count in its high half"
+    # GEMM1 units and GEMM2 tiles run the gemm_ring cores: their weights pf 128-K steps ahead and their activation
+    # rows through an nbuf-stage LDS DMA ring; each wave owns 64 rows x 32 intermediate (GEMM1) or 64 hidden (GEMM2)
+    # columns. At V4-Pro's model dim the GEMM2 weights go one step ahead (two spill).
+    ring_pf1, ring_nb1, ring_pf2, ring_nb2 = 2, 4, (2 if model_dim <= 5120 else 1), 6
+    g1_a_bytes = gemm1_ring_lds_bytes(a_fp4=a_fp4, model_dim=model_dim, bm=sort_block_m, nw=NUM_WAVES,
+        nbuf=ring_nb1)
+    g2_lay = g2_lds_layout(BM=sort_block_m, npes=int(fuse_npes), compute_bytes=max(sort_block_m * (g2_bn + 4) * 4,
+        gemm2_ring_lds_bytes(inter_dim=inter_dim, bm=sort_block_m, nw=NUM_WAVES, nbuf=ring_nb2)))
     # The combine's last WG zeroes the expert counters one per thread.
-    assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
+    assert fz_epr <= TOTAL_THREADS, "the combine resets at most one expert counter per thread"
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
-        reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
+        reset_running=fz_epr, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
         n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
     # The GEMM2 scratch words (the claim result, the plan word) are written while GEMM1 runs: past its A buffers.
     g2_scratch_off = max(g2_lay["bytes"], g1_a_bytes)
-    lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
+    lds_pool_bytes = max(g1_a_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
     # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS, the
     # SharedStorage below).
     plan_chunks = (fz_epr + 63) // 64
-    plan_tables = (2 if plan_local else 0) + (1 if pair_tiles else 0)
-    lds_bytes = lds_pool_bytes + (n_scale_bytes + 15) // 16 * 16 + 16 + plan_tables * plan_chunks * 64 * 4
+    lds_bytes = lds_pool_bytes + 16 + 2 * plan_chunks * 64 * 4
     assert grid_mult <= 2 and 2 * lds_bytes <= 160 * 1024, (grid_mult, lds_bytes)
+    assert grid_mult == 1 or waves_per_eu_hint >= 2, "two CTAs a CU need two waves a SIMD"
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1242,9 +925,8 @@ def compile_mega_moe_stage1(
     #    ticket, when every CTA is past its reads of them) zeroed the counters and left its epoch, parity and
     #    expected words, which every CTA reads past L2 and advances itself (stream order puts that launch's stores
     #    before this launch's loads);
-    #  - the plan flag is one i64 (launch_epoch << 32 | num_valid), and the first work fetch overlaps its wait;
-    #  - only the CTA holding an XCD's first work unit invalidates that XCD's L2 for the plan; the others wait for
-    #    its republished flag and drop their L1.
+    #  - every CTA waits for the sources and builds the plan in its own LDS; the plan CTA's flag is one i64
+    #    (launch_epoch << 32 | num_valid).
     # Launches of every grid size share one epoch word: the plan, G2-ready and combine flags compare epochs, and
     # per-grid-size epochs would let a flag left by a launch of the other grid size pass (or block) the wait.
     entry_slot = len(GRID_MULT_VALUES)
@@ -1255,68 +937,39 @@ def compile_mega_moe_stage1(
     # the GEMM1 units on the GEMM1 counter.
     G2_EARLY_K, G2_EARLY_P = (int(v) for v in g2_early)
     assert G2_EARLY_K == 0 or (G2_EARLY_K >= 2 and 0 < G2_EARLY_P < 16)
-    # g1_split_tail = S > 0: the partial last round of an XCD slice's GEMM1 units (at most S of them, and no more
-    # than the slice's CTAs left idle in that round) runs as two half-width units each, so the round's tail is
-    # spread over more CTAs. GEMM2 readiness then counts half-width units (a whole unit counts 2).
-    SPLIT_TAIL = int(g1_split_tail)
-    assert SPLIT_TAIL >= 0 and not (SPLIT_TAIL and pair_tiles)
-    if SPLIT_TAIL:
-        assert (tile_n // 2) % NUM_WAVES == 0 and (tile_n // 2 // NUM_WAVES // 16) % 2 == 0, tile_n
 
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
-        A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
-        # Work-unit broadcast word, kept out of the pool: a fast wave's next A / C-shuffle store must not race the
-        # slower waves' read of the unit it starts.
+        # Work-unit broadcast word, kept out of the pool: a fast wave's next ring copy must not race the slower
+        # waves' read of the unit it starts.
         work_word: fx.Array[fx.Int8, 16, 16]
-        if plan_local:
-            # Per expert slot (64-expert chunks): its inclusive tile count and its row count.
-            plan_incl: fx.Array[fx.Int32, plan_chunks * 64, 16]
-            plan_count: fx.Array[fx.Int32, plan_chunks * 64, 16]
-        if pair_tiles:
-            # Per expert slot: its inclusive GEMM1 unit-group count (m-tile pairs and lone m-tiles).
-            plan_gincl: fx.Array[fx.Int32, plan_chunks * 64, 16]
+        # Per expert slot (64-expert chunks): its inclusive tile count and its row count.
+        plan_incl: fx.Array[fx.Int32, plan_chunks * 64, 16]
+        plan_count: fx.Array[fx.Int32, plan_chunks * 64, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
-        f"megamoe_small_stage1_t{sort_block_m}x{tile_n}x{tile_k}"
-        f"_w{NUM_WAVES}_gm{grid_mult}"
-        f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
-        f"aa{int(async_a_copy)}"
-        f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}"
-        f"{swiglu_suffix}"
+        f"megamoe_small_stage1_w{NUM_WAVES}_gm{grid_mult}_dcu{dispatch_blocks}_wpe{waves_per_eu_hint}"
+        f"_bnt{b_cache_modifier}{swiglu_suffix}"
         f"_fused{'_'.join(str(v) for v in fused)}"
-        f"{'_dd' if dedup_rows else ''}"
         f"{'_pw' if plan_wt else ''}"
-        f"{'_pl' if plan_local else ''}"
-        f"{'_g2u' if g2_uniform else ''}{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
-        f"{'_hu' if head_uniform else ''}{f'_la{g1_lookahead}' if g1_lookahead != 1 else ''}"
-        f"{f'_ga{g1_a_ahead}' if g1_a_ahead != 1 else ''}{f'_dn{direct_done}' if direct_done else ''}"
+        f"{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
+        f"{'_hu' if head_uniform else ''}{f'_dn{direct_done}' if direct_done else ''}"
         f"{'_td' if tok_done else ''}"
-        f"{f'_ev{epi_evec}' if epi_evec != 2 else ''}{f'_el{epi_lean}' if epi_lean else ''}"
-        f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
-        f"{f'_spt{g1_split_tail}' if g1_split_tail else ''}"
         f"{'_afp4' if a_fp4 else ''}"
-        f"{'_pt' if pair_tiles else ''}"
-        f"{'_rc' + ''.join(str(v) for v in ring_core) if RING else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
     def kernel(
-        out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor,
-        sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, out_scale: fx.Tensor,
-        tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
-        addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64,
+        out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor, out_scale: fx.Tensor,
+        addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64, addr_in_idx: fx.Int64,
+        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        a_buf = lds.pool
-        a_scale_lds = lds.A_scale
-        c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
         disp_t = ptr_buf_tensor(addr_disp, fx.Int64)
         parity_t = ptr_buf_tensor(addr_parity, fx.Int32)
         expected_t = ptr_buf_tensor(addr_expected, fx.Int32)
@@ -1332,8 +985,7 @@ def compile_mega_moe_stage1(
             return fx.Int64(comm_ops.wave_uniform_i64(_disp_ptr(slot)))
 
         a_work_head = _sgpr_ptr(DispatchSlot.WORK_HEAD)
-        if const_expr(dedup_rows):
-            token_offsets = (_disp_ptr(DispatchSlot.TOKEN_ROWS), _disp_ptr(DispatchSlot.TOKEN_SCALES))
+        token_offsets = (_disp_ptr(DispatchSlot.TOKEN_ROWS), _disp_ptr(DispatchSlot.TOKEN_SCALES))
 
         # Roles by block id. The previous launch's last WG left the entry state (_retire): its epoch, parity and
         # expected source value, read past L2 here, and zeroed work and producer counters.
@@ -1385,211 +1037,87 @@ def compile_mega_moe_stage1(
 
         if producer:
             prefetch_args = dict(  # noqa: C408
-                num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr,
-                fz_total_experts=fz_total_experts, fz_dim=model_dim,
+                fz_k=fz_k, fz_epr=fz_epr, fz_total_experts=fz_total_experts, fz_dim=model_dim,
                 fz_scale_n_i32=fz_scale_n_i32, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
-                addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
-                i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
-                dedup=dedup_rows, uniform=head_uniform, fz_fp4=a_fp4,
+                addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, i32_cur_tok=i32_cur_tok,
+                dispatch_blocks=dispatch_blocks, producer_slot=producer_slot, uniform=head_uniform, fz_fp4=a_fp4,
             )
             # Only the first round loads ahead; the payload loop loads the later rounds itself.
-            prefetched = [prefetch_direct_fixed_slot_route(**prefetch_args, route_offset=0)]
+            prefetched = [prefetch_direct_fixed_slot_token(**prefetch_args)]
             emit_direct_fixed_slot_payload(
                 num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
-                fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
-                fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
-                addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
-                i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
-                parity=payload_parity, expected=payload_expected, prefetched=prefetched, route_rounds=pre_rounds,
-                prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
+                fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_nbytes=fz_nbytes, fz_scale_n_i32=fz_scale_n_i32,
+                fz_enable_scales=fz_enable_scales, i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks,
+                producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
+                prefetched=prefetched, route_rounds=pre_rounds, prefetch_args=prefetch_args,
+                direct_done=direct_done, running_half=running_half,
             )
         if owner:
             emit_direct_fixed_slot_finalize(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch),
-                plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w, interleave=interleave,
+                plan_wt=plan_wt, keep_running=True, uniform=head_uniform, running_half=running_half,
+                stream_w=stream_w, interleave=True,
             )
-        wave_id = fx.thread_idx.x // 64
+        # The rows sit in the token-row region (row source rank * mtpr + token) and GEMM1 maps its tile rows through
+        # the srcmap; the region offsets are read past the plan. A constant bound keeps the A buffer resource scalar.
+        x_bytes = fx.Int32(_TOKEN_REGION_END)
+        # i32 LDS bases of the typed fields: indexing the fields' typed pointers directly changes the GEMM1
+        # schedule of the hu/la2 tok_done kernels (+15 waits); lds_typed_ptr keeps the old addressing.
+        incl_base = fx.Int32(fx.ptrtoint(lds.plan_incl.ptr))
+        count_base = fx.Int32(fx.ptrtoint(lds.plan_count.ptr))
 
-        w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
-        sx_rsrc = ptr_buf_tensor(fx.get_iter(scale_x), fx.Int32, unit_elems=4)
-        sw_rsrc = ptr_buf_tensor(fx.get_iter(scale_w), fx.Int32)
-        trb_rsrc = ptr_buf_tensor(fx.get_iter(sorted_token_ids), fx.Int32)
-        expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
-        scale_cols = (inter_dim // 32 + 7) // 8 * 8
-        os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
-        if const_expr(use_tile_resource):
-            out_rsrc = None
-        else:
-            out_nbytes = tokens * fx.Int32(inter_dim)
-            out_rsrc = ptr_buf_tensor(fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes)
-        os_rsrc = ptr_buf_tensor(fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes)
+        def plan_ptr(base, i):
+            return lds_typed_ptr(base + i * fx.Int32(4), T.i32, align=4)
 
-        # dedup_rows: the rows sit in the token-row region (row source rank * mtpr + token) and GEMM1 maps its tile
-        # rows through the srcmap; the region offsets are read past the plan.
-        row_map = None
-        if const_expr(dedup_rows):
-            row_map = {
-                "srcmap": ptr_buf_tensor(_slot_meta_ptr(DispatchSlot.G2_STIDS), fx.Int32),
-                # A constant bound keeps the A buffer resource scalar.
-                "x_bytes": fx.Int32(_TOKEN_REGION_END),
-            }
-        plan_lookup = None
-        if const_expr(plan_local):
-            # i32 LDS bases of the typed fields: indexing the fields' typed pointers directly changes the GEMM1
-            # schedule of the hu/la2 tok_done kernels (+15 waits); lds_typed_ptr keeps the old addressing.
-            incl_base = fx.Int32(fx.ptrtoint(lds.plan_incl.ptr))
-            count_base = fx.Int32(fx.ptrtoint(lds.plan_count.ptr))
+        def expert_ballot(base, index):
+            # The number of experts whose inclusive count (the LDS table at base) is <= index: one lane an
+            # expert slot, a ballot per 64 slots. Raw ballot / readfirstlane: FlyDSL has no wave vote API.
+            lane = tid & fx.Int32(63)
+            expert = fx.Int32(0)
+            for chunk in range_constexpr(plan_chunks):
+                incl = fx.ptr_load(plan_ptr(base, fx.Int32(chunk * 64) + lane))
+                mask = rocdl.ballot(T.i64, incl <= index)
+                expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
+            return fx.Int32(rocdl.readfirstlane(T.i32, expert))
 
-            def plan_ptr(base, i):
-                return lds_typed_ptr(base + i * fx.Int32(4), T.i32, align=4)
+        def plan_lookup(m_tile):
+            # The tile's expert = the experts whose inclusive tile count is <= m_tile; the finalize's interleaved
+            # m-tile: its first slot, rows and slot stride.
+            expert = expert_ballot(incl_base, m_tile)
+            incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
+            count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
+            tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+            tile = m_tile - incl_e + tiles_e
+            rows_q, rows_r = _interleaved_rows(count_e, tiles_e)
+            rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
+            return expert, expert * fx.Int32(fz_cap) + tile, rows, tiles_e
 
-            def expert_ballot(base, index):
-                # The number of experts whose inclusive count (the LDS table at base) is <= index: one lane an
-                # expert slot, a ballot per 64 slots. Raw ballot / readfirstlane: FlyDSL has no wave vote API.
-                lane = tid & fx.Int32(63)
-                expert = fx.Int32(0)
-                for chunk in range_constexpr(plan_chunks):
-                    incl = fx.ptr_load(plan_ptr(base, fx.Int32(chunk * 64) + lane))
-                    mask = rocdl.ballot(T.i64, incl <= index)
-                    expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
-                return fx.Int32(rocdl.readfirstlane(T.i32, expert))
-
-            def plan_lookup(m_tile):
-                # The tile's expert = the experts whose inclusive tile count is <= m_tile.
-                expert = expert_ballot(incl_base, m_tile)
-                incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
-                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
-                tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-                if const_expr(interleave):
-                    # The finalize's interleaved m-tile: its first slot, rows and slot stride.
-                    tile = m_tile - incl_e + tiles_e
-                    rows_q, rows_r = _interleaved_rows(count_e, tiles_e)
-                    rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
-                    plan = (expert, expert * fx.Int32(fz_cap) + tile, rows, tiles_e)
-                else:
-                    tile_rows_base = (m_tile - incl_e + tiles_e) * fx.Int32(fz_tile_m)
-                    rows = count_e - tile_rows_base
-                    rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
-                    plan = (expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows)
-                return plan
-        group_lookup = None
-        if const_expr(pair_tiles):
-            gincl_base = fx.Int32(fx.ptrtoint(lds.plan_gincl.ptr))
-
-            def _expert_at(base, index):
-                # The expert whose inclusive count (table at base) passes index; past the last: the last expert.
-                expert = expert_ballot(base, index)
-                return (expert < fx.Int32(fz_epr)).select(expert, fx.Int32(fz_epr - 1))
-
-            def _expert_groups(expert):
-                # The expert's inclusive m-tile and unit-group counts, rows, m-tiles and unit groups (pair_shift:
-                # whether this rank pairs, as its plan grouped the m-tiles).
-                gincl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(gincl_base, expert))))
-                incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
-                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
-                tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-                return incl_e, gincl_e, count_e, tiles_e, (tiles_e + pair_shift) >> pair_shift
-
-            def group_lookup(group):
-                # The unit group's plan (build_fused_gemm1 pair_tiles): an expert's m-tile pair (2j, 2j + 1), or its
-                # last m-tile when alone. Its expert = the experts whose inclusive group count is <= group; a group
-                # past the last gets the last expert's (meaningless) plan.
-                expert = _expert_at(gincl_base, group)
-                incl_e, gincl_e, count_e, tiles_e, groups_e = _expert_groups(expert)
-                # The group's first m-tile in the expert, and the rows of its m-tiles as the finalize interleaves them.
-                tile = (group - gincl_e + groups_e) << pair_shift
-                rows_q, rows_r = _interleaved_rows(count_e, tiles_e)
-                rows = tuple(rows_q + (tile + fx.Int32(h) < rows_r).select(fx.Int32(1), fx.Int32(0)) for h in range(2))
-                paired = tile + fx.Int32(1) < tiles_e * pair_shift
-                return (expert, incl_e - tiles_e + tile, paired, expert * fx.Int32(fz_cap) + tile, rows, tiles_e)
-        def _build_gemm1(**overrides):
-            # build_fused_gemm1 with this kernel's GEMM1 arguments; each build creates its own rows resource (at
-            # the build, so a build inside a branch keeps its setup there).
-            kwargs = dict(  # noqa: C408
-                x_tensor=x, w_rsrc=w_rsrc,
-                sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
-                trb_rsrc=trb_rsrc, tib_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
-                a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
-                model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
-                tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
-                m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_k_step_bytes=A_K_STEP_BYTES,
-                total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
-                n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
-                swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
-                async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False, evec=epi_evec,
-                swiglu_limit=swiglu_limit,
-                rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
-                lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype,
-            )
-            kwargs.update(overrides)
-            return build_fused_gemm1(**kwargs)
-
-        if const_expr(RING):
-            ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-                nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, sw_cm=_LA_CM, q_cm=_LA_CM,
-                swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
-            # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
-            ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-                nw=NUM_WAVES, bm=sort_block_m // 2, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
-                q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m)
-            ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m, bn=g2_bn,
-                nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
-            _, ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m // 2,
-                bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2, tile_rows=sort_block_m)
-            ring_srcmap = ptr_buf_tensor(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(DispatchSlot.G2_STIDS))),
-                fx.Int32)
-            lds_i8 = fx.recast_iter(fx.Int8, lds.pool.ptr)
-        else:
-            # pair_tiles: each build also returns its pair runner.
-            _, _do_scheduled_tile, *pair_runner = _build_gemm1(pair_tiles=pair_tiles)
-            # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
-            # reuse it, while the other ranks keep streaming W1 once per tile.
-            if const_expr(b_cache_modifier != 0):
-                _, _do_cached_tile, *pair_runner = _build_gemm1(b_cache_modifier=0, pair_tiles=pair_tiles)
-            # pair_tiles: a pair reads W1 through the cache (the cached build's pair runner), as its expert has more
-            # than one m-tile reading each slab; a streamed pair body as well would make four GEMM1 bodies, which
-            # spill.
-            _do_paired_tile = pair_runner[0] if const_expr(pair_tiles) else None
-
-        def _run_half_tile(flat):
-            # g1_split_tail: a half-width unit (flat index over 2 * N_TILES n-tiles of tile_n // 2), streaming W1.
-            # Built at its call, in the half-unit branch, so its setup is not live through the kernel; its K loop
-            # stays rolled (a second unrolled body spills).
-            _, do_half = _build_gemm1(tile_n=tile_n // 2, n_per_wave=n_per_wave // 2, num_acc_n=NUM_ACC_N // 2,
-                n_tiles=2 * N_TILES)
-            do_half(flat)
+        ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
+            nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, sw_cm=_LA_CM, q_cm=_LA_CM,
+            swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
+        # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
+        ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
+            nw=NUM_WAVES, bm=sort_block_m // 2, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
+            q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m)
+        ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m,
+            bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
+        _, ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m // 2,
+            bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2, tile_rows=sort_block_m)
+        ring_srcmap = ptr_buf_tensor(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(DispatchSlot.G2_STIDS))),
+            fx.Int32)
+        lds_i8 = fx.recast_iter(fx.Int8, lds.pool.ptr)
 
         a_g2_cnt = _sgpr_ptr(DispatchSlot.G2_CNT)
         a_g2_ready = _sgpr_ptr(DispatchSlot.G2_READY)
-        # GEMM2 setup is loaded before GEMM1 so the GEMM1 -> GEMM2 switch costs no memory round trip.
         g2_lane = tid % fx.Int32(64)
         g2_wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.pool.ptr))
-        g2_aq = _disp_ptr(DispatchSlot.G2_AQ)
-        g2_ascale = _disp_ptr(DispatchSlot.G2_ASCALE)
-        g2_bq = _disp_ptr(DispatchSlot.G2_BQ)
-        g2_bscale = _disp_ptr(DispatchSlot.G2_BSCALE)
-        g2_eids = _disp_ptr(DispatchSlot.G2_EIDS)
-        g2_stids = _slot_meta_ptr(DispatchSlot.G2_STIDS)
-        g2_sweights = _slot_meta_ptr(DispatchSlot.G2_SWEIGHTS)
-        g2_trb = _disp_ptr(DispatchSlot.G2_TRB)
-        g2_rows = _disp_ptr(DispatchSlot.TILE_ROWS)
-        g2_max_m_blocks = fx.Int32(_disp_ptr(DispatchSlot.G2_MAX_M_BLOCKS))
         g2_scratch = lds_typed_ptr(fx.Int32(g2_scratch_off), T.i32, align=4)
 
         first_local = fx.Int32(0)
         nv_ptr = lds_typed_ptr(fx.Int32(g2_scratch_off + 4), T.i32, align=4)
-
-        def _pair_shift(plan_low):
-            # pair_tiles: 1 when the rank pairs its experts' m-tiles, 0 when it runs them as m-tile units. With
-            # streamed W1 only the cached-weight ranks pair; with cached W1 every rank does.
-            if const_expr(b_cache_modifier != 0):
-                return (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
-            return fx.Int32(1)
 
         def _local_plan():
             # Wave 0: wait for every source as the plan CTA does, then build this CTA's plan table in LDS. The
@@ -1608,64 +1136,30 @@ def compile_mega_moe_stage1(
                 a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=_SC0_SC1_CACHE)
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
             plan_low = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
-            group_total = fx.Int32(0)
             for chunk in range_constexpr(plan_chunks):
                 _valid, _expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
                 slot = fx.Int32(chunk * 64) + lane
                 fx.ptr_store(metadata_base + num_expert_tiles, plan_ptr(incl_base, slot))
                 fx.ptr_store(safe_count, plan_ptr(count_base, slot))
-                if const_expr(pair_tiles):
-                    # The expert's unit groups: its m-tile pairs and a lone last m-tile, or its m-tiles when the rank
-                    # does not pair.
-                    shift = _pair_shift(plan_low)
-                    groups = _wave_inclusive_scan_i32((num_expert_tiles + shift) >> shift, lane)
-                    groups = groups + group_total
-                    fx.ptr_store(groups, plan_ptr(gincl_base, slot))
-                    # Raw v_readlane: the scan total in an SGPR (no FlyDSL lane-read API with a scalar result).
-                    group_total = fx.Int32(fx.rocdl.readlane(T.i32, groups, 63))
             return plan_low
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The previous launch left the counters zeroed: the first work fetch overlaps the plan wait.
             first_local = fx.Int32(
                 comm_ops.atomic_add_agent(a_work_head + fx.Int64(xcd) * fx.Int64(64), fx.Int32(1)))
-            if const_expr(not plan_local):
-                a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
-                plan_word = fx.Int64(0)
-                # Match this launch's epoch in the high word exactly: a >= wait breaks when the 32-bit epoch wraps.
-                if first_local == fx.Int32(0):
-                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
-                        _disp_ptr(DispatchSlot.PLAN_NV), launch_epoch, shift=32))
-                    comm_ops.fence_agent_acquire()
-                    comm_ops.store_i64_global_system(a_xcd_acq, plan_word)
-                else:
-                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(a_xcd_acq, launch_epoch, shift=32))
-                    comm_ops.invalidate_l1()
-                fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
-        if const_expr(plan_local):
-            if tid < fx.Int32(64):
-                plan_low_local = _local_plan()
-                if tid == fx.Int32(0):
-                    fx.ptr_store(plan_low_local, nv_ptr)
+        if tid < fx.Int32(64):
+            plan_low_local = _local_plan()
+            if tid == fx.Int32(0):
+                fx.ptr_store(plan_low_local, nv_ptr)
         fx.barrier()
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
         num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
-        if const_expr(dedup_rows):
-            row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0])))
-            row_map["scale_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16))))
+        x_token = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0])))
+        scale_token = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16))))
         cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
-        # pair_tiles: 1 when this rank pairs its m-tiles (group_lookup), as _local_plan grouped them.
-        pair_shift = _pair_shift(plan_low)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
-        num_groups = num_m_tiles
-        if const_expr(pair_tiles):
-            # A pairing rank's unit groups (no groups without a plan: an overflow leaves num_valid 0 with the other
-            # experts' counts in the table); the other ranks' are their m-tiles.
-            if (pair_shift != fx.Int32(0)) & (num_m_tiles > fx.Int32(0)):
-                num_groups = fx.Int32(rocdl.readfirstlane(
-                    T.i32, fx.ptr_load(plan_ptr(gincl_base, fx.Int32(fz_epr - 1)))))
-        # The GEMM1 unit space: N_TILES units per m-tile, or with pair_tiles per unit group.
-        total_work = num_groups * fx.Int32(N_TILES)
+        # The GEMM1 unit space: N_TILES units per m-tile.
+        total_work = num_m_tiles * fx.Int32(N_TILES)
 
         # Control CTAs join the work pool after dispatch.
         consumer_active = fx.Int32(1) == fx.Int32(1)
@@ -1679,29 +1173,9 @@ def compile_mega_moe_stage1(
         # (2 n-tiles of tile_n 256 cover the same 256 output columns when N_TILES is not a multiple of 4.)
         cut_tiles = 4 if const_expr(N_TILES % 4 == 0) else 2
         assert N_TILES % cut_tiles == 0 and tile_n * cut_tiles >= 512
-        # pair_tiles: the slices are equal in the m-tile unit space (a pair's units weigh two m-tiles' units), so an XCD
-        # holding a paired expert does not get more rows than the others.
-        tile_work = num_m_tiles * fx.Int32(N_TILES)
-        pos_lo = ((work_shard * tile_work) // fx.Int32(8)) & fx.Int32(-cut_tiles)
-        pos_hi = ((work_shard + fx.Int32(1)) * tile_work) // fx.Int32(8) & fx.Int32(-cut_tiles)
+        pos_lo = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-cut_tiles)
+        pos_hi = ((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-cut_tiles)
         shard_base, shard_end = pos_lo, pos_hi
-        if const_expr(pair_tiles):
-
-            def group_unit_pos(pos):
-                # The GEMM1 unit position at m-tile unit position pos (past the plan: the end): a pair's N_TILES units
-                # stand for its two m-tiles' 2 * N_TILES, rounded down to cut_tiles.
-                m_tile = pos // fx.Int32(N_TILES)
-                n_off = pos - m_tile * fx.Int32(N_TILES)
-                incl_e, gincl_e, _count_e, tiles_e, groups_e = _expert_groups(_expert_at(incl_base, m_tile))
-                tile = m_tile - incl_e + tiles_e
-                group = gincl_e - groups_e + (tile >> pair_shift)
-                paired = (tile | fx.Int32(1)) < tiles_e * pair_shift
-                pair_off = (((tile & fx.Int32(1)) * fx.Int32(N_TILES) + n_off) >> fx.Int32(1)) & fx.Int32(-cut_tiles)
-                unit = group * fx.Int32(N_TILES) + paired.select(pair_off, n_off)
-                return (m_tile < num_m_tiles).select(unit, total_work)
-
-            if pair_shift != fx.Int32(0):
-                shard_base, shard_end = group_unit_pos(pos_lo), group_unit_pos(pos_hi)
         shard_work = shard_end - shard_base
 
         # The m-tiles at this XCD slice's ends that the slice cuts (-1: the end is on an m-tile boundary).
@@ -1713,21 +1187,8 @@ def compile_mega_moe_stage1(
         def _cut_own(m):
             return (m == cut_lo) | (m == cut_hi)
 
-        # End of the slice's GEMM1 claim space (units, and with SPLIT_TAIL the halves of its split units).
-        claim_end = split_start = shard_work
-        if const_expr(SPLIT_TAIL):
-            # Every CTA of an XCD joins its GEMM1 pool: the slice's last round leaves rem units on xcd_ctas CTAs,
-            # and up to xcd_ctas - rem of them run as two halves.
-            xcd_ctas = fx.Int32(launch_grid_x // 8)
-            rem = shard_work - (shard_work // xcd_ctas) * xcd_ctas
-            split_n = (rem < xcd_ctas - rem).select(rem, xcd_ctas - rem)
-            split_n = (split_n < fx.Int32(SPLIT_TAIL)).select(split_n, fx.Int32(SPLIT_TAIL))
-            split_start = shard_work - split_n
-            claim_end = shard_work + split_n
-        # The pending unit's m-tile (pair_tiles: its unit group), its first m-tile and whether it is a pair.
+        # The pending unit's m-tile.
         pend_m = fx.Int32(-1)
-        pend_ready = fx.Int32(0)
-        pend_paired = fx.Int32(0)
         g1_fetch = fx.Int32(0)
         g1_leave = fx.Int32(0)
         early_thr = shard_work
@@ -1735,18 +1196,11 @@ def compile_mega_moe_stage1(
             early_cta = ((fx.block_idx.x >> fx.Int32(3)) % fx.Int32(G2_EARLY_K)) == fx.Int32(0)
             early_thr = early_cta.select(shard_work * fx.Int32(G2_EARLY_P) // fx.Int32(16), shard_work)
 
-        # Count of a finished m-tile: N_TILES units, or 2 * N_TILES half-width units with SPLIT_TAIL.
-        M_TILE_COUNT = N_TILES * (2 if SPLIT_TAIL else 1)
-
-        def _count_tile(m, piece_inc=None, ready_m=None, paired=None):
+        def _count_tile(m):
             # Count a finished tile of m-tile m (its stores completed before the loop-end barrier); the last of
             # the m-tile's N_TILES tiles raises its GEMM2 ready epoch. A cut m-tile runs on two XCDs: each counts
             # its part once, by its last own unit, after writing its L2 back for the other XCD's GEMM2 tiles.
-            # SPLIT_TAIL: the counts are in half-width units (piece_inc 2 for a whole unit, 1 for a half).
-            # pair_tiles: m is a unit group, whose last unit raises m-tile ready_m and, if paired, the next one.
             inc = fx.Int32(1)
-            if const_expr(SPLIT_TAIL):
-                inc = piece_inc
             if _cut_own(m):
                 side = (m == cut_lo).select(fx.Int32(4), fx.Int32(8))
                 own_hi = (shard_end < (m + fx.Int32(1)) * fx.Int32(N_TILES)).select(
@@ -1754,44 +1208,31 @@ def compile_mega_moe_stage1(
                 own_lo = (shard_base > m * fx.Int32(N_TILES)).select(shard_base, m * fx.Int32(N_TILES))
                 old_own = fx.Int32(comm_ops.atomic_add_agent(
                     a_work_head + fx.Int64(work_shard) * fx.Int64(64) + fx.Int64(side), fx.Int32(1)))
-                if const_expr(SPLIT_TAIL):
-                    # The side word counts this XCD's pieces of the m-tile: its units from split_start on are two.
-                    own_units = own_hi - own_lo
-                    split_lo = shard_base + split_start
-                    split_own = own_hi - (own_lo > split_lo).select(own_lo, split_lo)
-                    own_pieces = own_units + (split_own > fx.Int32(0)).select(split_own, fx.Int32(0))
-                    inc = (old_own + fx.Int32(1) == own_pieces).select(own_units * fx.Int32(2), fx.Int32(0))
-                else:
-                    inc = (old_own + fx.Int32(1) == own_hi - own_lo).select(own_hi - own_lo, fx.Int32(0))
+                inc = (old_own + fx.Int32(1) == own_hi - own_lo).select(own_hi - own_lo, fx.Int32(0))
                 if inc != fx.Int32(0):
                     comm_ops.fence_agent_release()
             if inc != fx.Int32(0):
                 cnt_addr = a_g2_cnt + fx.Int64(m) * fx.Int64(4)
                 old_cnt = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, inc))
-                if old_cnt + inc == fx.Int32(M_TILE_COUNT):
+                if old_cnt + inc == fx.Int32(N_TILES):
                     # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
                     # (a max would stick at 0xffffffff).
-                    ready_tile = m if const_expr(ready_m is None) else ready_m
-                    comm_ops.store_i32_global_agent_release(
-                        a_g2_ready + fx.Int64(ready_tile) * fx.Int64(4), launch_epoch)
-                    if const_expr(paired is not None):
-                        if paired != fx.Int32(0):
-                            comm_ops.store_i32_global_agent_release(
-                                a_g2_ready + fx.Int64(ready_tile + fx.Int32(1)) * fx.Int64(4), launch_epoch)
-                    # All counts of this launch are in: rewind to 0, since the next launch's config may use another
-                    # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
-                    comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-M_TILE_COUNT))
+                    comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), launch_epoch)
+                    # All counts of this launch are in: rewind to 0 for the next launch.
+                    comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
 
-        def _run_ring_unit(work):
+        def _run_tile(work):
+            # A GEMM1 unit of one m-tile: the half-height body (at most half the rows), else the streamed or
+            # (cached_w) the cached-weight body.
             m_tile = fx.Int32(rocdl.readfirstlane(T.i32, work // fx.Int32(N_TILES)))
             n_tile = fx.Int32(rocdl.readfirstlane(T.i32, work)) - m_tile * fx.Int32(N_TILES)
             expert, tile_row_base, rows, row_stride = plan_lookup(m_tile)
 
             def run(body):
                 body(lds_base=lds_base_i32, lds_i8=lds_i8, x=x, sx=scale_x, w=w, sw=scale_w, q=out,
-                    qs=out_scale, srcmap=ring_srcmap, x_token=row_map["x_token"], scale_token=row_map["scale_token"],
-                    x_bytes=row_map["x_bytes"], expert=expert, m_tile=m_tile, n_tile=n_tile,
-                    tile_row_base=tile_row_base, rows=rows, row_stride=row_stride)
+                    qs=out_scale, srcmap=ring_srcmap, x_token=x_token, scale_token=scale_token, x_bytes=x_bytes,
+                    expert=expert, m_tile=m_tile, n_tile=n_tile, tile_row_base=tile_row_base, rows=rows,
+                    row_stride=row_stride)
 
             if rows <= fx.Int32(sort_block_m // 2):
                 run(ring_g1_half)
@@ -1803,24 +1244,12 @@ def compile_mega_moe_stage1(
             else:
                 run(ring_g1[0])
 
-        def _run_tile(unit):
-            # A GEMM1 unit of one m-tile, through the streamed or (cached_w) the cached-weight body.
-            if const_expr(RING):
-                _run_ring_unit(unit[0])
-            elif const_expr(b_cache_modifier != 0):
-                if cached_w != fx.Int32(0):
-                    _do_cached_tile(*unit)
-                else:
-                    _do_scheduled_tile(*unit)
-            else:
-                _do_scheduled_tile(*unit)
-
         while consumer_active:
             if tid == fx.Int32(0):
                 local_work = first_local
                 if g1_fetch != fx.Int32(0):
                     if const_expr(G2_EARLY_K > 0):
-                        local_work = claim_end
+                        local_work = shard_work
                         if g1_leave == fx.Int32(0):
                             local_work = fx.Int32(comm_ops.atomic_add_agent(
                                 a_work_head + fx.Int64(work_shard) * fx.Int64(64), fx.Int32(1)))
@@ -1833,66 +1262,22 @@ def compile_mega_moe_stage1(
                 # Count the previous tile of this CTA (its stores completed before the loop-end barrier)
                 # next to the work fetch, so the two atomics share one round trip.
                 if pend_m >= fx.Int32(0):
-                    if const_expr(SPLIT_TAIL):
-                        # pend_m = 2 * m-tile + 1 for a half unit (it counts 1 of the m-tile's 2 * N_TILES).
-                        _count_tile(pend_m >> fx.Int32(1), fx.Int32(2) - (pend_m & fx.Int32(1)))
-                    elif const_expr(pair_tiles):
-                        _count_tile(pend_m, None, pend_ready, pend_paired)
-                    else:
-                        _count_tile(pend_m)
-                if const_expr(SPLIT_TAIL):
-                    # A claim past split_start is half (index - split_start) & 1 of unit split_start + its half.
-                    in_slice = local_work < claim_end
-                    half_index = local_work - split_start
-                    is_half = in_slice & (half_index >= fx.Int32(0))
-                    unit = is_half.select(split_start + (half_index >> fx.Int32(1)), local_work)
-                    piece = is_half.select((half_index & fx.Int32(1)) + fx.Int32(1), fx.Int32(0))
-                    work = in_slice.select((shard_base + unit) | (piece << fx.Int32(_PIECE_SHIFT)), total_work)
-                else:
-                    work = (local_work < shard_work).select(shard_base + local_work, total_work)
+                    _count_tile(pend_m)
+                work = (local_work < shard_work).select(shard_base + local_work, total_work)
                 # The shard's GEMM2 units follow its GEMM1 units on the same counter: the fetch that ends
                 # GEMM1 is this CTA's first GEMM2 unit.
-                fx.ptr_store(local_work - claim_end, g2_scratch)
+                fx.ptr_store(local_work - shard_work, g2_scratch)
                 fx.ptr_store(Vec.from_elements([work], fx.Int32), work_scratch)
             fx.barrier()
             work = Vec(work_scratch_view.load())[0]
-            if const_expr(SPLIT_TAIL):
-                piece = work >> fx.Int32(_PIECE_SHIFT)
-                work = work & fx.Int32((1 << _PIECE_SHIFT) - 1)
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
-            if const_expr(SPLIT_TAIL):
-                if (has_work != fx.Int32(0)) & (piece != fx.Int32(0)):
-                    _run_half_tile(work * fx.Int32(2) + piece - fx.Int32(1))
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    fx.barrier()
-                if (has_work != fx.Int32(0)) & (piece == fx.Int32(0)):
-                    _run_tile((work,))
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    fx.barrier()
-            else:
-                # pair_tiles: the unit's plan (every lane: the lookup ballots), which its GEMM1 body and count take.
-                unit = (work, group_lookup(work // fx.Int32(N_TILES))) if const_expr(pair_tiles) else (work,)
-                if has_work != fx.Int32(0):
-                    if const_expr(pair_tiles):
-                        if unit[1][2]:
-                            _do_paired_tile(*unit)
-                        else:
-                            _run_tile(unit)
-                    else:
-                        _run_tile(unit)
-                    # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
-                    # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    fx.barrier()
-            if const_expr(SPLIT_TAIL):
-                pend_m = (has_work != fx.Int32(0)).select(
-                    (work // fx.Int32(N_TILES)) * fx.Int32(2) + (piece != fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)),
-                    fx.Int32(-1))
-            else:
-                pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
-                if const_expr(pair_tiles):
-                    pend_ready = unit[1][1]
-                    pend_paired = unit[1][2].select(fx.Int32(1), fx.Int32(0))
+            if has_work != fx.Int32(0):
+                _run_tile(work)
+                # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
+                # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                fx.barrier()
+            pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
             consumer_active = has_work != fx.Int32(0)
             g1_fetch = fx.Int32(1)
             if const_expr(G2_EARLY_K > 0):
@@ -1911,7 +1296,7 @@ def compile_mega_moe_stage1(
         g2_head = a_work_head + fx.Int64(work_shard) * fx.Int64(64)
         g2_active = fx.Int32(1) == fx.Int32(1)
         g2_fetch = fx.Int32(0)
-        g2_claim_base = claim_end
+        g2_claim_base = shard_work
         if const_expr(G2_EARLY_K > 0):
             g2_head = g2_head + fx.Int64(12)
             g2_fetch = fx.Int32(1)
@@ -1928,104 +1313,81 @@ def compile_mega_moe_stage1(
             tok_par = fx.Int64(launch_epoch & fx.Int32(1))
             tok_off = tok_base + tok_par * fx.Int64(fz_mtpr * 4)
             tok_reset = tok_base + (fx.Int64(1) - tok_par) * fx.Int64(fz_mtpr * 4)
-        if const_expr(RING):
-            # The other GEMM2 pointers in SGPRs, loaded past GEMM1: held through its K loop, they spill it.
-            g2_ring_args = (*(_sgpr_ptr(slot) for slot in (DispatchSlot.G2_AQ, DispatchSlot.G2_ASCALE, DispatchSlot.G2_BQ,
-                DispatchSlot.G2_BSCALE)), *(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(slot))) for slot in (
-                DispatchSlot.G2_STIDS, DispatchSlot.G2_SWEIGHTS)), a_g2_ready)
+        # The other GEMM2 pointers in SGPRs, loaded past GEMM1: held through its K loop, they spill it.
+        g2_ring_args = (*(_sgpr_ptr(slot) for slot in (DispatchSlot.G2_AQ, DispatchSlot.G2_ASCALE, DispatchSlot.G2_BQ,
+            DispatchSlot.G2_BSCALE)), *(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(slot))) for slot in (
+            DispatchSlot.G2_STIDS, DispatchSlot.G2_SWEIGHTS)), a_g2_ready)
 
-            def _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm, half=False):
-                aq_u, ascale_u = g2_ring_args[:2]
-                acc = (ring_g2_run_half if const_expr(half) else ring_g2_run)(ctx, w_ring, lds_base=lds_base_i32,
-                    lds_i8=lds_i8, m_tile=g2_m, aq=aq_u, ascale=ascale_u, w_cm=w_cm)
-                if const_expr(half):
-                    acc = acc + [[fx.full(4, 0.0, fx.Float32) for _ in acc[0]] for _ in acc]
-                if tid < fx.Int32(sort_block_m):
-                    packed = (tid < rows).select(packed, fx.Int32(fz_npes * fz_mtpr))
-                    fx.ptr_store(packed, lds_typed_ptr(fx.Int32(g2_lay["packed"]) + tid * fx.Int32(4), T.i32, align=4))
-                    fx.ptr_store(weight, lds_typed_ptr(fx.Int32(g2_lay["weight"]) + tid * fx.Int32(4), T.f32, align=4))
-                # fmt: off
-                p2p_scatter_epilog(lds_base_i32, acc, g2_n, g2_wave, g2_lane, N_OUT=model_dim, BM=sort_block_m,
-                    BN=g2_bn, npes=fz_npes, topk=fz_k, log2_max_tok=fz_mtpr.bit_length() - 1,
-                    mask_max_tok=fz_mtpr - 1, recv_cap=int(g2_recv_cap),
-                    comb_inp_nbytes=fz_mtpr * fz_k * model_dim * 2,
-                    meta=Stage2Meta(lds_base_i32, g2_lay["packed"], g2_lay["weight"], g2_lay["peer"]),
-                    p2p_quant_type="dynamic", store_cm=0, fp8_store_cm=2, fp8_rows=fp8_rows, elem_view_stores=True,
-                    lean=g2_epi_lean, tok_off=tok_off if const_expr(tok_done) else None,
-                    bf16_head_tokens=bf16_head_tokens, wide_bf16=not g2_epi_lean and not tok_done, acc_t=True)
-                # fmt: on
+        def _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm, half=False):
+            aq_u, ascale_u = g2_ring_args[:2]
+            acc = (ring_g2_run_half if const_expr(half) else ring_g2_run)(ctx, w_ring, lds_base=lds_base_i32,
+                lds_i8=lds_i8, m_tile=g2_m, aq=aq_u, ascale=ascale_u, w_cm=w_cm)
+            if const_expr(half):
+                acc = acc + [[fx.full(4, 0.0, fx.Float32) for _ in acc[0]] for _ in acc]
+            if tid < fx.Int32(sort_block_m):
+                packed = (tid < rows).select(packed, fx.Int32(fz_npes * fz_mtpr))
+                fx.ptr_store(packed, lds_typed_ptr(fx.Int32(g2_lay["packed"]) + tid * fx.Int32(4), T.i32, align=4))
+                fx.ptr_store(weight, lds_typed_ptr(fx.Int32(g2_lay["weight"]) + tid * fx.Int32(4), T.f32, align=4))
+            # fmt: off
+            p2p_scatter_epilog(lds_base_i32, acc, g2_n, g2_wave, g2_lane, N_OUT=model_dim, BM=sort_block_m,
+                BN=g2_bn, npes=fz_npes, topk=fz_k, log2_max_tok=fz_mtpr.bit_length() - 1,
+                mask_max_tok=fz_mtpr - 1, recv_cap=int(g2_recv_cap),
+                comb_inp_nbytes=fz_mtpr * fz_k * model_dim * 2,
+                meta=Stage2Meta(lds_base_i32, g2_lay["packed"], g2_lay["weight"], g2_lay["peer"]),
+                p2p_quant_type="dynamic", store_cm=0, fp8_store_cm=2, fp8_rows=fp8_rows, elem_view_stores=True,
+                lean=g2_epi_lean, tok_off=tok_off if const_expr(tok_done) else None,
+                bf16_head_tokens=bf16_head_tokens, wide_bf16=not g2_epi_lean and not tok_done, acc_t=True)
+            # fmt: on
 
-            def _run_ring_g2(g2_m, g2_n):
-                g2_m = fx.Int32(rocdl.readfirstlane(T.i32, g2_m))
-                g2_n = fx.Int32(rocdl.readfirstlane(T.i32, g2_n))
-                expert, tile_row_base, rows, row_stride = plan_lookup(g2_m)
-                # The m-tile's GEMM1 output is complete at its ready epoch. Thread 0's first read of it goes ahead of
-                # the first weight steps (streamed in both bodies), which do not depend on it: a plain load past the
-                # caches whose value differs per lane (the other lanes read out of bounds), so neither a volatile /
-                # atomic access nor a scalar copy waits for it at once. The rows' route ids and weights are loaded
-                # ahead too and reach LDS after the K loop.
-                _aq, _ascale, bq_u, bscale_u, stids_u, sweights_u, ready_u = g2_ring_args
-                got = buf_copy_load(ptr_buf_tensor(ready_u, fx.Int32, num_records_bytes=1 << 30),
-                    (tid == fx.Int32(0)).select(g2_m, fx.Int32(1 << 28)), cache_modifier=_SC0_SC1_CACHE)
-                pos = tile_row_base + (tid & fx.Int32(sort_block_m - 1)) * row_stride
-                packed = ptr_buf_tensor(stids_u, fx.Int32)[pos]
-                weight = ptr_buf_tensor(sweights_u, fx.Float32)[pos]
-                ctx, w_ring = ring_g2_start(expert=expert, n_block=g2_n,
-                    unit_zero=(g2_m < fx.Int32(0)).select(g2_m, fx.Int32(0)), w=bq_u, sw=bscale_u, w_cm=2)
-                # The wait's first compare (and so the wait for the first read) stays below the weight loads.
-                rocdl.sched_barrier(0)
-                if (tid == fx.Int32(0)) & (got != launch_epoch):
-                    comm_ops.spin_from_until_eq_i32(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch, got)
-                fx.barrier()
-                if rows <= fx.Int32(sort_block_m // 2):
-                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2, half=True)
-                elif cached_w != fx.Int32(0):
-                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
-                else:
-                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)
+        def _run_g2(g2_m, g2_n):
+            g2_m = fx.Int32(rocdl.readfirstlane(T.i32, g2_m))
+            g2_n = fx.Int32(rocdl.readfirstlane(T.i32, g2_n))
+            expert, tile_row_base, rows, row_stride = plan_lookup(g2_m)
+            # The m-tile's GEMM1 output is complete at its ready epoch. Thread 0's first read of it goes ahead of
+            # the first weight steps (streamed in both bodies), which do not depend on it: a plain load past the
+            # caches whose value differs per lane (the other lanes read out of bounds), so neither a volatile /
+            # atomic access nor a scalar copy waits for it at once. The rows' route ids and weights are loaded
+            # ahead too and reach LDS after the K loop.
+            _aq, _ascale, bq_u, bscale_u, stids_u, sweights_u, ready_u = g2_ring_args
+            got = buf_copy_load(ptr_buf_tensor(ready_u, fx.Int32, num_records_bytes=1 << 30),
+                (tid == fx.Int32(0)).select(g2_m, fx.Int32(1 << 28)), cache_modifier=_SC0_SC1_CACHE)
+            pos = tile_row_base + (tid & fx.Int32(sort_block_m - 1)) * row_stride
+            packed = ptr_buf_tensor(stids_u, fx.Int32)[pos]
+            weight = ptr_buf_tensor(sweights_u, fx.Float32)[pos]
+            ctx, w_ring = ring_g2_start(expert=expert, n_block=g2_n,
+                unit_zero=(g2_m < fx.Int32(0)).select(g2_m, fx.Int32(0)), w=bq_u, sw=bscale_u, w_cm=2)
+            # The wait's first compare (and so the wait for the first read) stays below the weight loads.
+            rocdl.sched_barrier(0)
+            if (tid == fx.Int32(0)) & (got != launch_epoch):
+                comm_ops.spin_from_until_eq_i32(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch, got)
+            fx.barrier()
+            # As in GEMM1, a rank that receives many rows reads W2 through the cache.
+            if rows <= fx.Int32(sort_block_m // 2):
+                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2, half=True)
+            elif cached_w != fx.Int32(0):
+                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
+            else:
+                _g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)
 
-        if const_expr(plan_local):
-            # GEMM2 reads the plan CTA's metadata (its first unit drops the L1 after its ready wait).
-            if tid == fx.Int32(0):
-                comm_ops.spin_until_shifted_eq_i64(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch, shift=32)
+        # GEMM2 waits for the plan CTA's flag (its first unit drops the L1 after its ready wait).
+        if tid == fx.Int32(0):
+            comm_ops.spin_until_shifted_eq_i64(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch, shift=32)
         while g2_active:
             fx.barrier()
             if tid == fx.Int32(0):
                 if g2_fetch != fx.Int32(0):
                     fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - g2_claim_base,
                         g2_scratch)
-                if const_expr(RING):
-                    # GEMM1 wrote the unit's m-tile through this XCD's L2 (a cut m-tile: the other XCD wrote it back
-                    # to memory): only the CU's L1 can be stale, and no load of this CU reaches the m-tile before its
-                    # ready epoch, so the L1 is dropped here, before the unit's loads.
-                    comm_ops.invalidate_l1()
+                # GEMM1 wrote the unit's m-tile through this XCD's L2 (a cut m-tile: the other XCD wrote it back
+                # to memory): only the CU's L1 can be stale, and no load of this CU reaches the m-tile before its
+                # ready epoch, so the L1 is dropped here, before the unit's loads.
+                comm_ops.invalidate_l1()
             fx.barrier()
             g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
-            if const_expr(RING):
-                if g2_local < g2_units:
-                    g2_u = g2_base + g2_local
-                    g2_m = g2_u // fx.Int32(g2_n_blocks)
-                    _run_ring_g2(g2_m, g2_u - g2_m * fx.Int32(g2_n_blocks))
-            elif g2_local < g2_units:
+            if g2_local < g2_units:
                 g2_u = g2_base + g2_local
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
-                g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
-                if tid == fx.Int32(0):
-                    comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch)
-                fx.barrier()
-                # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back
-                # to memory by the other XCD into lines this XCD has not cached, before it was counted: only the
-                # CU's L1 can be stale.
-                comm_ops.invalidate_l1()
-                # As in GEMM1, a rank that receives many rows reads W2 through the cache.
-                if cached_w != fx.Int32(0):
-                    g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
-                        g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
-                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
-                else:
-                    g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
-                        g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
-                        fx.Int32(model_dim), fp8_rows, tok_off)
+                _run_g2(g2_m, g2_u - g2_m * fx.Int32(g2_n_blocks))
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
 
@@ -2042,20 +1404,17 @@ def compile_mega_moe_stage1(
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
-            fx.Int32(launch_grid_x), fp8_rows,
-            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset, retire=_retire)
+            fx.Int32(launch_grid_x), fp8_rows, reset_running_addr(), tok_off, tok_reset, retire=_retire)
 
     @flyc.jit
     def launch(
-        out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor,
-        sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, out_scale: fx.Tensor,
-        tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
-        addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64, stream: fx.Stream,
+        out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor, out_scale: fx.Tensor,
+        addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64, addr_in_idx: fx.Int64,
+        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64, stream: fx.Stream,
     ):
         kernel(
-            out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, out_scale, tokens,
-            addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
+            out, x, w, scale_x, scale_w, out_scale, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts,
+            addr_parity, addr_expected,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -2086,7 +1445,7 @@ _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
 # The word the combine leaves in the rows of the bf16_head_tokens tokens (FusedStage1Knobs) once it summed them.
 _ROW_POISON = -1
-# dedup_rows: byte offset (from the payload / scale buffer base) that the token-row regions end below.
+# Byte offset (from the payload / scale buffer base) that the token-row regions end below.
 _TOKEN_REGION_END = (1 << 31) - (1 << 16)
 
 
@@ -2095,13 +1454,9 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     k1, k2 = config.fused_stage1, config.fused_stage2
     # fmt: off
     return dict(  # noqa: C408
-        dedup_rows=k1.dedup_rows, plan_wt=k1.plan_wt, plan_local=k1.plan_local,
-        g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), g2_uniform=k1.g2_uniform,
-        head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
-        g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
-        bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, g1_split_tail=k1.g1_split_tail,
-        pair_tiles=k1.pair_tiles, ring_core=k1.ring_core,
+        plan_wt=k1.plan_wt, g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), head_uniform=k1.head_uniform,
+        g2_epi_lean=k1.g2_epi_lean, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
+        bf16_head_tokens=k1.bf16_head_tokens, stream_w=k1.stream_w,
     )
     # fmt: on
 
@@ -2114,8 +1469,8 @@ class SmallMRuntime:
     serves every layer.
     """
 
-    # Group-major dispatch layout of the fused kernel: fixed slots of 32 rows.
-    GM_UNIT_SIZE = 32
+    # Group-major dispatch layout of the fused kernel: fixed slots of 64 rows (the kernel's m-tile).
+    GM_UNIT_SIZE = 64
     GM_COMPACT = False
 
     @classmethod
@@ -2132,8 +1487,8 @@ class SmallMRuntime:
     ):
         """group_major_capacity() of this runtime's dispatch, for a shared payload arena.
 
-        A layout with dedup_rows dispatch also keeps its token-row regions (one row and its scales per source
-        rank and token) in the arena, right past the fixed slots.
+        The token-row regions (one row and its scales per source rank and token) live in the arena too, right
+        past the fixed slots.
         """
         nvm, rows, row_bytes, scale_n_i32 = group_major_capacity(
             world_size=world_size,
@@ -2146,18 +1501,7 @@ class SmallMRuntime:
             scale_dim=model_dim // 32,
             compact=cls.GM_COMPACT,
         )
-        config = select_fused_config(
-            1,
-            max_tok_per_rank,
-            world_size=world_size,
-            experts_per_rank=experts // world_size,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            quant=fused_quant(a_dtype),
-        )
-        if config.fused_stage1.dedup_rows:
-            rows += world_size * max_tok_per_rank
-        return nvm, rows, row_bytes, scale_n_i32
+        return nvm, rows + world_size * max_tok_per_rank, row_bytes, scale_n_i32
 
     @classmethod
     def ends_all_ranks(
@@ -2243,7 +1587,7 @@ class SmallMRuntime:
             if bucket <= self.mtpr
         }
         protocols = {
-            (k.dedup_rows, k.plan_local, bool(k.direct_done), k.tok_counters, k.bf16_head_tokens)
+            (bool(k.direct_done), k.tok_counters, k.bf16_head_tokens)
             for k in (config.fused_stage1 for config in self._configs.values())
         }
         assert len(protocols) == 1, f"buckets disagree on the launch protocol: {protocols}"
@@ -2272,7 +1616,7 @@ class SmallMRuntime:
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme="fixedslot", gm_compact=self.GM_COMPACT, max_total_recv_tokens=self.world_size)
         # fmt: on
-        if payload_arena is None and self._protocol.dedup_rows:
+        if payload_arena is None:
             # The token-row regions live past the fixed slots of the payload arena (payload_capacity).
             payload_arena = GroupMajorPayloadArena([
                 self.payload_capacity(world_size=self.world_size, model_dim=self.model_dim,
@@ -2295,13 +1639,13 @@ class SmallMRuntime:
         self._build(w1, w1_scale)
 
     def _build(self, w1, w1_scale):
-        self.sort_block_m = 32
+        self.sort_block_m = 64
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
         assert op is not None, "combine op was built without enable_group_major"
         self._s1_op = op
-        # Payload capacity follows the largest SBM; metadata covers the smallest candidate.
+        # Metadata of one block an m-tile.
         metadata_blocks = (op.num_valid_max + self.sort_block_m - 1) // self.sort_block_m
         if metadata_blocks > op.max_blocks:
             op.max_blocks = metadata_blocks
@@ -2318,21 +1662,19 @@ class SmallMRuntime:
         # The kernel reads the FP4 rows as bytes.
         self._s1_rx = v["rx_em"].view(torch.uint8) if self._a_dtype == "fp4" else v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
-        # dedup_rows dispatch sends one row per (source rank, token) and destination to the token-row regions past
-        # the fixed slots of the payload arena (payload_capacity); GEMM1 reads them through u32 buffer offsets
-        # from the payload / scale bases, the same on every rank.
-        self._s1_token_offsets = (0, 0)
-        if self._protocol.dedup_rows:
-            arena = op.payload_arena
-            token_rows = self.world_size * self.mtpr
-            rows_off = op.rx_em.numel() * op.rx_em.element_size()
-            scales_off = op.scale_em.numel() * op.scale_em.element_size()
-            rows_end = rows_off + token_rows * op.row_bytes
-            scales_end = scales_off + token_rows * op.scale_n_i32 * 4
-            assert arena is not None and rows_end <= arena.rx_bytes and scales_end <= arena.scale_i32 * 4
-            assert rows_off % 16 == 0 and scales_off % 16 == 0
-            assert max(rows_end, scales_end) <= _TOKEN_REGION_END, "token rows past the u32 buffer offsets"
-            self._s1_token_offsets = (rows_off, scales_off)
+        # Dispatch sends one row per (source rank, token) and destination to the token-row regions past the fixed
+        # slots of the payload arena (payload_capacity); GEMM1 reads them through u32 buffer offsets from the
+        # payload / scale bases, the same on every rank.
+        arena = op.payload_arena
+        token_rows = self.world_size * self.mtpr
+        rows_off = op.rx_em.numel() * op.rx_em.element_size()
+        scales_off = op.scale_em.numel() * op.scale_em.element_size()
+        rows_end = rows_off + token_rows * op.row_bytes
+        scales_end = scales_off + token_rows * op.scale_n_i32 * 4
+        assert arena is not None and rows_end <= arena.rx_bytes and scales_end <= arena.scale_i32 * 4
+        assert rows_off % 16 == 0 and scales_off % 16 == 0
+        assert max(rows_end, scales_end) <= _TOKEN_REGION_END, "token rows past the u32 buffer offsets"
+        self._s1_token_offsets = (rows_off, scales_off)
 
         self._s1_out, self._s1_osd = stage1_output_buffers(
             self._s1_nvm, self.inter_dim, self.dev, arena=self._s1_output_arena
@@ -2486,13 +1828,8 @@ class SmallMRuntime:
             model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
             experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
-            fused=fused, num_cu=self._s1_num_cu,
-            sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n, tile_k=stage1.tile_k,
-            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2),
-            pipe_weights=stage1.pipe_weights,
-            mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
-            async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
-            use_tile_resource=stage1.use_tile_resource,
+            fused=fused, num_cu=self._s1_num_cu, sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n,
+            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2), num_dispatch_cu=stage1.num_dispatch_cu,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
             a_dtype=self._a_dtype, **_kernel_knobs(config))
         # fmt: on
@@ -2500,15 +1837,13 @@ class SmallMRuntime:
         return launch
 
     def _launch(self, config: MegaMoEConfig, run_tokens, x_bf16, topk_ids, wts, stream, *, preload=False):
-        op = self._s1_op
         # preload: compile and load without dispatching (AOT bundles).
         # fmt: off
         (_preload_compiled if preload else _run_compiled)(
             self._launcher(config), self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
-            op.tile_row_base, op.sorted_expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
-            fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
-            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(x_bf16.data_ptr()),
-            fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()), stream)
+            self._s1_osd, fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
+            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(self._s1_epoch_parity.data_ptr()),
+            fx.Int64(self._s1_epoch_expected.data_ptr()), stream)
         # fmt: on
 
     def preload_aot_bundle(self):

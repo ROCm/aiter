@@ -377,7 +377,7 @@ _FUSED_CASES = (
     (8192, 8192),
     (16384, 16384),
 )
-_FUSED_DIGEST = "dca5c59c7370db22340e5da4d807cd0f3e2e50e54cc59b50687b3fe0d25fd033"
+_FUSED_DIGEST = "b9958a851e581db95a0f9f84f6a49a7c39f84c4152ed030a0b7db21b2d46f951"
 
 
 def test_fused_configs_unchanged():
@@ -418,19 +418,16 @@ def test_max_tokens_is_the_route_switch():
 
 
 def test_ep8_fused_configs_keep_fused_knobs_off():
-    """The EP8 V4-Pro large-input kernels are the ones before the EP4 tune: every fused knob off."""
+    """The EP8 V4-Pro fused kernels are the ones before the EP4 tune: every fused knob off."""
     for mtpr, tokens in _FUSED_CASES:
-        if mtpr not in LARGE_M_MTPRS:
-            continue
         config = select_fused_config(tokens, mtpr)
         assert config.fused_stage1 == FusedStage1Knobs(), (mtpr, tokens)
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune, pair_tiles with
-# the EP8 V4.1-Flash GEMM1 pairing, g1_split_tail with the A4W4 tunes, ring_core with the EP8 V4.1-Flash ring GEMM
-# cores): they enter the table only when set, so a pinned digest changes only where a config sets one.
-_LATE_KNOBS = ("stream_w", "pair_tiles", "g1_split_tail", "ring_core")
+# Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune): they enter the
+# table only when set, so a pinned digest changes only where a config sets one.
+_LATE_KNOBS = ("stream_w",)
 
 
 def _knob_table(config):
@@ -454,7 +451,7 @@ def _knob_table(config):
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
 # small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
 # table.
-_EP4_FUSED_DIGEST = "2d54491461140360610b7636fbc8c2e4982be9843d55155bab6509b3de4b2241"
+_EP4_FUSED_DIGEST = "ba2a80d69cab07e8120c30d292bdd7a14118feb2a3e414e39c7a52bc5075f931"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -480,8 +477,6 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
         ).fused_stage1
         protocols.add(
             (
-                k.dedup_rows,
-                k.plan_local,
                 bool(k.direct_done),
                 k.tok_counters,
                 k.bf16_head_tokens,
@@ -489,11 +484,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
         )
         # tok_done adds to the per-token counters every bucket clears.
         assert not k.tok_done or k.tok_counters
-        # The runtime's tok_counters also double-buffer the expert counters, which the plan_local combine zeroes.
-        assert not k.tok_counters or k.plan_local
-        # ... and the srcmap / weight slots, so the payload must go to the source-indexed dedup token rows.
-        assert not k.tok_counters or k.dedup_rows
-    assert protocols == {(True, True, True, True, 4)}
+    assert protocols == {(True, True, 4)}
     # A tok_done bucket (1 and 4 tokens) and one without it run on the same counters.
     assert select_fused_config(
         1, mtpr, quant=quant, **V41_FLASH_EP4_SHAPE
@@ -517,7 +508,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table. Pinned with the ring GEMM cores at every small-input bucket.
 _V41EP8_FUSED_DIGEST = (
-    "740532705b075e9e3fedd21c8f8a983d0f3dbf748ed0beff0ba5316e58ee4a44"
+    "3fd42b93b26b68f978c21d8564c1175eaec6e054a3b99f590028db67caaa8c4c"
 )
 
 
@@ -543,18 +534,13 @@ def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
         k = config.fused_stage1
         protocols.add(
             (
-                k.dedup_rows,
-                k.plan_local,
                 bool(k.direct_done),
                 k.tok_counters,
                 k.bf16_head_tokens,
             )
         )
         assert not k.tok_done or (k.tok_counters and config.stage2.block_n == 256)
-        assert not k.tok_counters or (k.plan_local and k.dedup_rows)
-        # The unrolled A-ahead GEMM1 hung at grid_mult 2 (8 tokens) on gfx950: only grids of one CTA a CU take it.
-        assert k.g1_a_ahead == 1 or config.stage1.grid_mult == 1
-    assert protocols == {(True, True, True, True, 4)}
+    assert protocols == {(True, True, 4)}
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
@@ -569,12 +555,9 @@ def test_small_m_ring_geometry(shape, quant):
     for mtpr in (256, 512):
         for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
             config = select_fused_config(bucket, mtpr, quant=quant, **shape)
-            s1, s2, k = config.stage1, config.stage2, config.fused_stage1
+            s1, s2 = config.stage1, config.stage2
             assert s1.sort_block_m == s2.block_m == 64, (mtpr, bucket)
             assert s1.tile_n == 64 * s1.num_waves and s2.block_n == 256, (mtpr, bucket)
-            assert k.ring_core and k.dedup_rows and k.plan_local, (mtpr, bucket)
-            assert not k.pair_tiles and not k.g1_split_tail, (mtpr, bucket)
-            assert k.g1_lookahead == 1 and k.g1_a_ahead == 1, (mtpr, bucket)
             grid_mult = min(s1.grid_mult, 2)
             assert grid_mult == 1 or s1.waves_per_eu_hint >= 2, (mtpr, bucket)
 
@@ -595,7 +578,7 @@ def test_ep4_dispatch_cus_cover_two_expert_waves():
 
 @pytest.mark.parametrize("mtpr", (256, 512))
 def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
-    """dedup_rows token rows sit past the fixed slots of the payload arena, inside u32 buffer offsets."""
+    """The token rows sit past the fixed slots of the payload arena, inside u32 buffer offsets."""
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
         _TOKEN_REGION_END,
         SmallMRuntime,
@@ -669,21 +652,18 @@ def test_ep2_small_m_buckets_share_one_protocol(mtpr, quant):
         k = config.fused_stage1
         protocols.add(
             (
-                k.dedup_rows,
-                k.plan_local,
                 bool(k.direct_done),
                 k.tok_counters,
                 k.bf16_head_tokens,
             )
         )
         assert not k.tok_done or k.tok_counters
-        assert not k.tok_counters or (k.plan_local and k.dedup_rows)
         # Producers are split evenly over the 2 destinations and leave consumers.
         assert 0 < config.stage1.num_dispatch_cu < 256, bucket
         assert config.stage1.num_dispatch_cu % 2 == 0, bucket
         if k.tok_done:
             tok_done_block_n.add(config.stage2.block_n)
-    assert protocols == {(True, True, True, True, 4)}
+    assert protocols == {(True, True, 4)}
     assert len(tok_done_block_n) == 1
 
 
@@ -768,7 +748,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "c3bcd0c297fae138c88a0a6f1a1e0858d698b018fac08caec378423da4572b98"
+_EP2_FUSED_DIGEST = "37631231269610919ed8705252e9e81283b65a413788d0a9d97c5014fc939426"
 
 
 def test_ep2_fused_configs_unchanged():
@@ -1064,18 +1044,6 @@ def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
                 assert config == capacity, (mtpr, bucket)
 
 
-def test_small_m_split_tail_reaches_the_kernel():
-    """g1_split_tail is passed to the small-input kernel build (0, off, by default)."""
-    from dataclasses import replace
-
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import _kernel_knobs
-
-    base = select_fused_config(16, 512)
-    assert _kernel_knobs(base)["g1_split_tail"] == 0
-    config = replace(base, fused_stage1=replace(base.fused_stage1, g1_split_tail=24))
-    assert _kernel_knobs(config)["g1_split_tail"] == 24
-
-
 # The A4W4 fused configs (_tune_a4w4_small / _tune_a4w4_large on each layout's A8W4 tune): every small-input bucket
 # at MTPR 256 and 512, and every large-input capacity pinned with them (_A4W4_DIGEST_LARGE_MTPRS; the others launch
 # the configs of 16384, test_large_m_capacities_share_one_tune) at each of its token buckets. On a mismatch the
@@ -1087,10 +1055,10 @@ _A4W4_DIGEST_LARGE_MTPRS = {
     "v41_flash_ep2": (8192, 16384),
 }
 _A4W4_FUSED_DIGESTS = {
-    "v4_pro_ep8": "4fd983428af70d58ad55e17574df65cda76d301c50c15eda5f10073011e9cbce",
-    "v41_flash_ep8": "220b20cfca512343b3834315d4c0d0b1c8502ea566221b64c89b76d7dd5933b2",
-    "v41_flash_ep4": "9e2586d1c681527aedacd72a44a6573de5300716df75b32fdfd30b0672ebc3f0",
-    "v41_flash_ep2": "1ae956683b6b2355723775d08c7b4c38e375f1af617107ccf70c8ae2bfbdd53d",
+    "v4_pro_ep8": "a42f736ad2bcc38bf70bcc35f85e1803f68141e344754eeabb0b3aa112449aa4",
+    "v41_flash_ep8": "488e187984fe82dd10c28e323f3704bce087adff749ef638c3e8867487f56157",
+    "v41_flash_ep4": "ab65022143342d3237e5eeb2cbe8ae4d3d04e9e89d39d289620b1f016acb48f5",
+    "v41_flash_ep2": "a1473a928a6cac8f19c9d16f093f8850fbff7136c9635078f01e3866d9ac75f1",
 }
 
 
