@@ -749,14 +749,20 @@ def compile_intra(
                     lds_st(s_x, _swz(I * 16 + lk + vi, dbase + lr, BT), -acc[vi])
             gpu.barrier()
 
-        akk_v = _flat(Akk, hb * BT)
         # Every column of a valid row is written, the upper triangle as +0 like
-        # Triton's Akk (the solve can leave -0 there).
+        # Triton's Akk (the solve can leave -0 there); thread (r, seg) stores
+        # columns 16 seg .. 16 seg + 15 in 128-bit pieces.
         if rv:
-            for e in range_constexpr(16):
-                j = seg + 4 * e
-                x = _sel(j <= r, lds_ld(s_x, _swz(r, j, BT)), _zero())
-                stg(akk_v, r * (H * BT) + j, x, fx.Float32)
+            akk_v4 = _vflat(Akk, hb * BT, 4)
+            for m in range_constexpr(4):
+                j0 = seg * 16 + 4 * m
+                x4 = lds_ld4(s_x4, _swz(r, j0, BT))
+                stg_n(
+                    akk_v4,
+                    r * (H * BT) + j0,
+                    [_sel(j0 + vi <= r, x4[vi], _zero()) for vi in range_constexpr(4)],
+                    fx.Float32,
+                )
 
         # w = X (beta k exp2(g)), u = X (beta v) on MFMA: wave I owns rows
         # 16I..16I+15; X is lower triangular, so its upper tiles add zeros.
@@ -764,8 +770,7 @@ def compile_intra(
             _bf4(list(lds_ld4(s_x4, _swz(ia, jt * 16 + lk, BT))))
             for jt in range_constexpr(BT // 16)
         ]
-        w_v = _flat(w, hk)
-        u_v = _flat(u, hk)
+        accs_w, accs_u = [], []
         for nt in range_constexpr(K // 16):
             c = nt * 16 + lr
             acc_w = _zero4()
@@ -778,11 +783,27 @@ def compile_intra(
                 acc_u = _mfma(
                     xa[jt], _bf4(list(lds_ld4(s_k4, _swz(c, tj, BT), BF))), acc_u
                 )
+            accs_w.append(acc_w)
+            accs_u.append(acc_u)
+        # Stage w / u row-major in the (now dead) kb / vb tiles for 128-bit stores.
+        gpu.barrier()
+        for nt in range_constexpr(K // 16):
             for vi in range_constexpr(4):
-                i = wave * 16 + lk + vi
-                if i < nvalid:
-                    stg(w_v, i * (H * K) + nt * 16 + lr, acc_w[vi], BF)
-                    stg(u_v, i * (H * V) + nt * 16 + lr, acc_u[vi], BF)
+                o = _swz(wave * 16 + lk + vi, nt * 16 + lr, K)
+                lds_st(s_q, o, accs_w[nt][vi], BF)
+                lds_st(s_k, o, accs_u[nt][vi], BF)
+        gpu.barrier()
+        if rv:
+            w_v8 = _vflat(w, hk, 8)
+            u_v8 = _vflat(u, hk, 8)
+            for m in range_constexpr(NE // 8):
+                xw, xu = [], []
+                for hf in range_constexpr(2):
+                    o = _swz(r, c0 + 8 * m + 4 * hf, K)
+                    xw += lds_ld_n(s_q4, o, 4, BF)
+                    xu += lds_ld_n(s_k4, o, 4, BF)
+                stg_n(w_v8, r * (H * K) + c0 + 8 * m, xw, BF)
+                stg_n(u_v8, r * (H * V) + c0 + 8 * m, xu, BF)
 
     @flyc.jit
     def launch(
