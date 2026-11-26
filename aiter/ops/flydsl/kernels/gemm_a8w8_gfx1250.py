@@ -79,6 +79,9 @@ def launch_gemm_a8w8(
     k_tail: Constexpr[bool] = False,
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
+    c_pad: Constexpr[int] = -1,
+    quad_early: Constexpr[bool] = False,
+    no_loop_cbar: Constexpr[bool] = False,
 ):
     # i32_cm: runtime cluster_m; use_cluster is False only for a one-workgroup launch.
     # fused_splitk: the K splits of a tile are one cluster along grid.z and reduce
@@ -261,7 +264,7 @@ def launch_gemm_a8w8(
     out_elem = fx.Float16 if out_is_f16 else fx.BFloat16
     out_cls = fx.Float32 if split_k > 1 else out_elem
     c_bytes = 4 if split_k > 1 else 2
-    C_PAD = 8 if tile_n >= 128 else 0
+    C_PAD = c_pad if c_pad >= 0 else (8 if tile_n >= 128 else 0)
     C_LDS_ROW = tile_n + C_PAD
     C_STORE_B = (tile_m * C_LDS_ROW * c_bytes + 127) // 128 * 128
     ARENA_B = max(PANEL_OFF + PANEL_A + PANEL_B, C_STORE_B)
@@ -275,12 +278,17 @@ def launch_gemm_a8w8(
             f"limit is {lds_cap} bytes"
         )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
+    if quad_early and not use_quadrant:
+        raise ValueError("quad_early applies to the quadrant kernels only")
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
     kernel_name = format_kernel_name(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
         f"_cn{cluster_n}"
+        + (f"_cp{c_pad}" if c_pad >= 0 else "")
+        + ("_qe" if quad_early else "")
+        + ("_nlb" if no_loop_cbar else "")
         + ("_fsk" if fused_splitk else "")
         + ("" if use_cluster else "_plain")
         + ("_mbn" if batched else "")
@@ -798,34 +806,39 @@ def launch_gemm_a8w8(
                 return wt, sb_k, sa_k
             return wt, None, None
 
-        def _kstep(buf, sbuf, ks, state, nxt_ks, prefetch_kt=None):
+        def _kstep(buf, sbuf, ks, cur, nxt_ks, prefetch_kt=None):
+            # Issue the next sub-step's loads before this sub-step's WMMAs; with a single
+            # A row, prefetch the next A row too (with two, the longer queue costs more).
+            state, act_f = cur
             wt, sb_k, sa_k = state
-            act_f = [_rmem(16, load_a(buf, wm, ks)) for wm in _FRONT]
-            if const_expr(len(_BACK) > 0):
-                act_b = [_rmem(16, load_a(buf, wm, ks)) for wm in _BACK]
-                rocdl.s_wait_dscnt(len(_BACK) * DS_A)
-            else:
-                rocdl.s_wait_dscnt(0)
+            if const_expr(act_f is None):
+                act_f = [_rmem(16, load_a(buf, wm, ks)) for wm in _FRONT]
+            act_b = [_rmem(16, load_a(buf, wm, ks)) for wm in _BACK]
+            nxt, ahead = None, 0
+            if const_expr(nxt_ks is not None):
+                n_state = _load_state(buf, sbuf, nxt_ks)
+                n_f = None
+                if const_expr(len(_BACK) == 0):
+                    n_f = [_rmem(16, load_a(buf, wm, nxt_ks)) for wm in _FRONT]
+                nxt = (n_state, n_f)
+                ahead = _BS_DS + (len(_FRONT) * DS_A if n_f is not None else 0)
+            rocdl.s_wait_dscnt(len(_BACK) * DS_A + ahead)
             _mma_rows(_FRONT, act_f, wt, sa_k, sb_k)
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
             if const_expr(len(_BACK) > 0):
-                rocdl.s_wait_dscnt(0)
+                rocdl.s_wait_dscnt(ahead)
                 _mma_rows(_BACK, act_b, wt, sa_k, sb_k)
-            return (
-                _load_state(buf, sbuf, nxt_ks)
-                if const_expr(nxt_ks is not None)
-                else None
-            )
+            return nxt
 
         def compute_ktile_row(buf, sbuf, prefetch_kt):
-            state = _load_state(buf, sbuf, 0)
+            cur = (_load_state(buf, sbuf, 0), None)
             for ks in range_constexpr(K_WS):
                 nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
                 pk = prefetch_kt if const_expr(ks == 0) else None
-                state = _kstep(buf, sbuf, ks, state, nxt_ks, prefetch_kt=pk)
+                cur = _kstep(buf, sbuf, ks, cur, nxt_ks, prefetch_kt=pk)
             _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
             for _ks in range_constexpr(K_WS):
                 rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
@@ -922,9 +935,54 @@ def launch_gemm_a8w8(
                 if const_expr(nxt_ks is not None):
                     b_left, sb_k, sa_k = nxt_b_left, nxt_sb_k, nxt_sa_k
 
+        def compute_ktile_quad_early(buf, sbuf, prefetch_kt):
+            # _qe: issue the next sub-step's B and scale loads after this sub-step's A
+            # loads. Queue: a_top, a_bot, b_right, next b_left, next scales; each wait
+            # leaves only the loads the following block does not need.
+            if const_expr(not is_mxscale):
+                raise ValueError(
+                    "quad_early applies to the mxscale quadrant kernel only"
+                )
+            b_left = _load_b_half(buf, 0, 0)
+            sb_k, sa_k = _load_scales(buf, sbuf, 0)
+            for ks in range_constexpr(K_WS):
+                nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
+                pf = ks == 0 and prefetch_kt is not None
+                a_top = [
+                    _rmem(16, load_a(buf, wm, ks)) for wm in range_constexpr(HALF_M)
+                ]
+                a_bot = [
+                    _rmem(16, load_a(buf, HALF_M + wm, ks))
+                    for wm in range_constexpr(HALF_M)
+                ]
+                b_right = _load_b_half(buf, HALF_N, ks)
+                n_nxt = 0
+                if const_expr(nxt_ks is not None):
+                    nxt_b_left = _load_b_half(buf, 0, nxt_ks)
+                    nxt_sb_k, nxt_sa_k = _load_scales(buf, sbuf, nxt_ks)
+                    n_nxt = HALF_N * DS_B + sb_loads + sa_loads
+                rocdl.s_wait_dscnt(DS_A * HALF_M + DS_B * HALF_N + n_nxt)
+                rocdl.sched_barrier(0)
+                _emit_block(0, 0, a_top, b_left, sa_k, sb_k)
+                rocdl.s_wait_dscnt(DS_B * HALF_N + n_nxt)
+                _emit_block(HALF_M, 0, a_bot, b_left, sa_k, sb_k)
+                if const_expr(pf):
+                    rocdl.sched_barrier(0)
+                    issue(prefetch_kt % num_buffers, prefetch_kt)
+                    rocdl.sched_barrier(0)
+                rocdl.s_wait_dscnt(n_nxt)
+                _emit_block(0, HALF_N, a_top, b_right, sa_k, sb_k)
+                _emit_block(HALF_M, HALF_N, a_bot, b_right, sa_k, sb_k)
+                rocdl.sched_barrier(0)
+                if const_expr(nxt_ks is not None):
+                    b_left, sb_k, sa_k = nxt_b_left, nxt_sb_k, nxt_sa_k
+
         def compute_ktile(buf, sbuf, prefetch_kt):
             if const_expr(use_quadrant):
-                compute_ktile_quad(buf, sbuf, prefetch_kt)
+                if const_expr(quad_early):
+                    compute_ktile_quad_early(buf, sbuf, prefetch_kt)
+                else:
+                    compute_ktile_quad(buf, sbuf, prefetch_kt)
             else:
                 compute_ktile_row(buf, sbuf, prefetch_kt)
 
@@ -1000,7 +1058,10 @@ def launch_gemm_a8w8(
             buf = _bidx(pbuf)
             pipeline_fence(outstanding=(num_buffers - 2), use_cluster=False)
             compute_ktile(buf, _scale_buf(pbuf, kt), kt + (num_buffers - 1))
-            if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
+            if (
+                const_expr(use_cluster and not no_loop_cbar)
+                and kt % num_buffers == num_buffers - 1
+            ):
                 cluster.cluster_barrier()
         scale_regs = None
         for j in range_constexpr(num_buffers - 1):

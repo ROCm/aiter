@@ -60,6 +60,13 @@ _CLUSTERS_POW2 = tuple(
 )
 _GENERIC_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c != (1, 1))
 _COMPUTE_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c not in _COMPUTE_CLUSTERS)
+# Clusters of 3 M-tiles (a cluster_m that is not a power of two), so the
+# M-tiles of a decode GEMM share each weight read; only the opt-in K3 candidates
+# at the end of kernels_list use them.
+_COMPUTE_CLUSTERS_NPOT = ((3, 1), (3, 4))
+_COMPUTE_CLUSTERS_ALL = (
+    _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA + _COMPUTE_CLUSTERS_NPOT
+)
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _MAX_CLUSTER = 16  # workgroups of a gfx1250 cluster
 _PERSISTENT_N_TILES = (2, 4, 8)
@@ -83,12 +90,20 @@ class WmmaKernelInstance:
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
     fused_splitk: bool = False
+    # LDS row pad (elements) of the C staging tile; -1 = default.
+    c_pad: int = -1
+    # Opt-in schedules: _qe (quadrant early loads), _nlb (no in-loop cluster barrier).
+    quad_early: bool = False
+    no_loop_cbar: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + (f"_cp{self.c_pad}" if self.c_pad >= 0 else "")
+            + ("_qe" if self.quad_early else "")
+            + ("_nlb" if self.no_loop_cbar else "")
             + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
@@ -239,6 +254,96 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     extra += [
         ki for ki in wide if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
     ]
+    # Single opt-in candidates used by K3 rows, appended last.
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=64,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=2,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            fused_splitk=True,
+            c_pad=4,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=512,
+            num_buffers=3,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            quad_early=True,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=128,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            quad_early=True,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            fused_splitk=True,
+            quad_early=True,
+            no_loop_cbar=True,
+        )
+    )
+    # K3 TP1 decode rows whose cluster_m (3 or 5) is the M-tile count of their
+    # bucket, so every M-tile of an output column shares each weight read.
+    # (tile_m, tile_n, tile_k, num_buffers, split_k, cluster_m, cluster_n,
+    #  m_warp, n_warp, compute, fused_splitk, quad_early)
+    for tm, tn, tk, nb, sk, cm, cn, mw, nw, compute, fsk, qe in (
+        (128, 128, 128, 4, 1, 3, 4, 2, 2, True, False, False),
+        (128, 256, 128, 3, 1, 3, 1, 2, 2, True, False, False),
+        (128, 256, 128, 3, 2, 3, 1, 2, 2, True, True, False),
+        (128, 256, 128, 4, 1, 3, 1, 2, 2, True, False, False),
+        (32, 128, 128, 2, 1, 5, 1, 2, 2, False, False, False),
+        (64, 128, 256, 3, 1, 3, 1, 2, 2, False, False, False),
+        (64, 128, 256, 3, 1, 5, 2, 2, 2, False, False, False),
+        (64, 128, 512, 3, 1, 3, 1, 1, 4, False, False, True),
+    ):
+        extra.append(
+            WmmaKernelInstance(
+                tm,
+                tn,
+                tk,
+                nb,
+                sk,
+                cm,
+                cn,
+                mw,
+                nw,
+                name_prefix=COMPUTE_NAME_PREFIX if compute else NAME_PREFIX,
+                fused_splitk=fsk,
+                quad_early=qe,
+            )
+        )
     return dict(enumerate([*base, *extra]))
 
 
@@ -287,7 +392,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if (
             ki.cluster_m,
             ki.cluster_n,
-        ) not in _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA:
+        ) not in _COMPUTE_CLUSTERS_ALL:
             return False
         # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
         # must not launch when M < tile_m (cluster barrier hang on decode M).
