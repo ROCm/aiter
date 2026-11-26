@@ -3914,9 +3914,7 @@ def _flash_attn_varlen_backward(
         # sliding window kernels are hd128 only
         ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
-            ret &= not causal
-            ret &= window_size_left == -1 and window_size_right == -1
-            ret &= nhead_q == nhead_k
+            ret &= window_size_left == -1 and (causal or window_size_right == -1)
             ret &= q.dtype == dtypes.bf16
 
         return ret
