@@ -485,6 +485,41 @@ def test_mha_forward_out(
         forward(out=buf[..., :-1])
     with pytest.raises(ValueError, match="out must be"):
         forward(out=buf.to(torch.float32 if ref.dtype != torch.float32 else dtype))
+    if q.dtype == ref.dtype:
+        with pytest.raises(ValueError, match="overlap"):
+            forward(out=q)
+
+
+def test_mha_forward_out_varlen_tail():
+    """The default kernel leaves out rows past cu_seqlens_q[-1] unchanged."""
+    SEQLEN, PAD, NUM_HEADS, HEAD_SZ = 256, 64, 4, 64
+    q = torch.randn(
+        (2 * SEQLEN + PAD, NUM_HEADS, HEAD_SZ), device="cuda", dtype=torch.bfloat16
+    )
+    cu = torch.tensor([0, SEQLEN, 2 * SEQLEN], device="cuda", dtype=torch.int32)
+    out = torch.full_like(q, 7.0)
+    _flash_attn_forward(
+        q,
+        q,
+        q,
+        dropout_p=0.0,
+        softmax_scale=HEAD_SZ**-0.5,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        bias=None,
+        alibi_slopes=None,
+        return_lse=False,
+        return_softmax=False,
+        max_seqlen_q=SEQLEN,
+        max_seqlen_k=SEQLEN,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        implementation="default",
+        out=out,
+    )
+    assert torch.all(out[2 * SEQLEN :] == 7.0), "rows past cu_seqlens_q[-1] changed"
+    assert not torch.any(out[: 2 * SEQLEN] == 7.0), "valid rows were not written"
 
 
 # Short K (fewer than 8 key tiles) runs the one-tile loop; long K, the pipeline.

@@ -246,6 +246,20 @@ def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
     return max(int(window_size[0]), 0)
 
 
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+
+    def span(t: torch.Tensor) -> tuple[int, int]:
+        last = sum((s - 1) * st for s, st in zip(t.shape, t.stride()))
+        return t.data_ptr(), t.data_ptr() + (last + 1) * t.element_size()
+
+    (a0, a1), (b0, b1) = span(a), span(b)
+    return a0 < b1 and b0 < a1
+
+
 def gluon_forward_unsupported_reason(
     *,
     dropout_p: float = 0.0,
@@ -676,12 +690,14 @@ def _flash_attn_forward(
     if out is None:
         o = torch.zeros(o_shape, dtype=out_dtype, device=q.device)
     else:
-        # Rows past cu_seqlens_q[-1] keep the caller's values.
+        # dao_ai zeroes out; the default kernel keeps rows past cu_seqlens_q[-1].
         if out.shape != o_shape or out.dtype != out_dtype or out.device != q.device:
             raise ValueError(
                 f"out must be {tuple(o_shape)} {out_dtype} on {q.device}, "
                 f"got {tuple(out.shape)} {out.dtype} on {out.device}"
             )
+        if any(_overlaps(out, x) for x in (q, k, v)):
+            raise ValueError("out must not overlap q, k or v")
         o = out
     if is_varlen:
         # Layout is thd.
