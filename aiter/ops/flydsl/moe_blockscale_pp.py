@@ -33,7 +33,6 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
     return ((bits >> 23) & 0xFF).to(torch.uint8)
 
 
-@functools.lru_cache(maxsize=64)
 def _compile(
     K,
     N,
@@ -44,6 +43,18 @@ def _compile(
     weighted=True,
     swiglu_clamp=True,
     half_skip=False,
+):
+    # One cache key whichever way the arguments are passed (lru_cache keys
+    # keyword and positional calls apart, so a positional lookup of a launcher
+    # moe_bs_gemm compiled by keyword got a fresh, never-compiled one).
+    return _compile_cached(
+        K, N, gather, gate_up_inter, epilogue, topk, weighted, swiglu_clamp, half_skip
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_cached(
+    K, N, gather, gate_up_inter, epilogue, topk, weighted, swiglu_clamp, half_skip
 ):
     from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
 
