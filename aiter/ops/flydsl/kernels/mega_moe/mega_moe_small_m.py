@@ -1525,8 +1525,14 @@ def compile_mega_moe_stage1(
             ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
                 nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, sw_cm=_LA_CM, q_cm=_LA_CM,
                 swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
+            # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
+            ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
+                nw=NUM_WAVES, bm=sort_block_m // 2, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
+                q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m)
             ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m, bn=g2_bn,
                 nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
+            _, ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m // 2,
+                bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2, tile_rows=sort_block_m)
             ring_srcmap = ptr_buf_tensor(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(DispatchSlot.G2_STIDS))),
                 fx.Int32)
             lds_i8 = fx.recast_iter(fx.Int8, lds.pool.ptr)
@@ -1771,24 +1777,31 @@ def compile_mega_moe_stage1(
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-M_TILE_COUNT))
 
-        def _run_ring_tile(work, w_cm):
+        def _run_ring_unit(work):
             m_tile = fx.Int32(rocdl.readfirstlane(T.i32, work // fx.Int32(N_TILES)))
             n_tile = fx.Int32(rocdl.readfirstlane(T.i32, work)) - m_tile * fx.Int32(N_TILES)
             expert, tile_row_base, rows, row_stride = plan_lookup(m_tile)
-            ring_g1[w_cm](lds_base=lds_base_i32, lds_i8=lds_i8, x=x, sx=scale_x, w=w, sw=scale_w, q=out,
-                qs=out_scale, srcmap=ring_srcmap, x_token=row_map["x_token"], scale_token=row_map["scale_token"],
-                x_bytes=row_map["x_bytes"], expert=expert, m_tile=m_tile, n_tile=n_tile,
-                tile_row_base=tile_row_base, rows=rows, row_stride=row_stride)
+
+            def run(body):
+                body(lds_base=lds_base_i32, lds_i8=lds_i8, x=x, sx=scale_x, w=w, sw=scale_w, q=out,
+                    qs=out_scale, srcmap=ring_srcmap, x_token=row_map["x_token"], scale_token=row_map["scale_token"],
+                    x_bytes=row_map["x_bytes"], expert=expert, m_tile=m_tile, n_tile=n_tile,
+                    tile_row_base=tile_row_base, rows=rows, row_stride=row_stride)
+
+            if rows <= fx.Int32(sort_block_m // 2):
+                run(ring_g1_half)
+            elif const_expr(b_cache_modifier != 0):
+                if cached_w != fx.Int32(0):
+                    run(ring_g1[0])
+                else:
+                    run(ring_g1[b_cache_modifier])
+            else:
+                run(ring_g1[0])
 
         def _run_tile(unit):
             # A GEMM1 unit of one m-tile, through the streamed or (cached_w) the cached-weight body.
-            if const_expr(RING and b_cache_modifier != 0):
-                if cached_w != fx.Int32(0):
-                    _run_ring_tile(unit[0], 0)
-                else:
-                    _run_ring_tile(unit[0], b_cache_modifier)
-            elif const_expr(RING):
-                _run_ring_tile(unit[0], 0)
+            if const_expr(RING):
+                _run_ring_unit(unit[0])
             elif const_expr(b_cache_modifier != 0):
                 if cached_w != fx.Int32(0):
                     _do_cached_tile(*unit)
@@ -1913,10 +1926,12 @@ def compile_mega_moe_stage1(
             g2_ring_args = tuple(fx.Int64(comm_ops.wave_uniform_i64(a))
                 for a in (g2_aq, g2_ascale, g2_bq, g2_bscale, g2_stids, g2_sweights, a_g2_ready))
 
-            def _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm):
+            def _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm, half=False):
                 aq_u, ascale_u = g2_ring_args[:2]
-                acc = ring_g2_run(ctx, w_ring, lds_base=lds_base_i32, lds_i8=lds_i8, m_tile=g2_m, aq=aq_u,
-                    ascale=ascale_u, w_cm=w_cm)
+                acc = (ring_g2_run_half if const_expr(half) else ring_g2_run)(ctx, w_ring, lds_base=lds_base_i32,
+                    lds_i8=lds_i8, m_tile=g2_m, aq=aq_u, ascale=ascale_u, w_cm=w_cm)
+                if const_expr(half):
+                    acc = acc + [[fx.full(4, 0.0, fx.Float32) for _ in acc[0]] for _ in acc]
                 if tid < fx.Int32(sort_block_m):
                     packed = (tid < rows).select(packed, fx.Int32(fz_npes * fz_mtpr))
                     fx.ptr_store(packed, lds_typed_ptr(fx.Int32(g2_lay["packed"]) + tid * fx.Int32(4), T.i32, align=4))
@@ -1954,7 +1969,9 @@ def compile_mega_moe_stage1(
                 if (tid == fx.Int32(0)) & (got != launch_epoch):
                     comm_ops.spin_from_until_eq_i32(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), launch_epoch, got)
                 fx.barrier()
-                if cached_w != fx.Int32(0):
+                if rows <= fx.Int32(sort_block_m // 2):
+                    _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2, half=True)
+                elif cached_w != fx.Int32(0):
                     _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 0)
                 else:
                     _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, 2)

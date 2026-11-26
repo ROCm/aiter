@@ -91,7 +91,13 @@ class _Ring:
         self.pf, self.nbuf = pf, nbuf
         self.slots = mr * a_bytes // 64
         self.pitch = self.slots * _SLOT
-        assert self.slots % nw == 0
+        assert self.slots % nw == 0 or nw % self.slots == 0
+
+    def slot_ids(self, wave, nw):
+        """The ring slots a wave issues each stage (waves share a slot when there are fewer slots than waves)."""
+        if self.slots < nw:
+            return [wave & fx.Int32(self.slots - 1)]
+        return [wave + fx.Int32(nw * j) for j in range(self.slots // nw)]
 
     @property
     def atom(self):
@@ -194,10 +200,13 @@ def make_ring_gemm1(
     w_cm,
     sw_cm,
     q_cm,
-    swiglu_limit
+    swiglu_limit,
+    tile_rows=None
 ):
     """GEMM1 + SwiGLU + MXFP8 quant of one unit (``bm`` rows x ``tile_n // 2``
-    intermediate columns), traced in the kernel by the returned ``tile``."""
+    intermediate columns), traced in the kernel by the returned ``tile``; its output
+    m-tiles are ``tile_rows`` (default ``bm``) rows apart."""
+    tile_rows = tile_rows or bm
     n_wave = tile_n // nw
     ni = n_wave // 32
     assert n_wave % 64 == 0 and model_dim % 512 == 0
@@ -259,8 +268,7 @@ def make_ring_gemm1(
         swbuf = ptr_buf_tensor(sw, fx.Int32)
 
         a_rows = []
-        for j in range(ring.slots // nw):
-            d = wave + fx.Int32(nw * j)
+        for d in ring.slot_ids(wave, nw):
             if a_fp4:
                 a_rows.append((d, d * 16 + l16, q16 * 16))
             else:
@@ -406,12 +414,12 @@ def make_ring_gemm1(
         )
 
         q_tile = ptr_buf_tensor(
-            buf_base_i64(q) + fx.Int64(m_tile) * fx.Int64(bm * inter_dim),
+            buf_base_i64(q) + fx.Int64(m_tile) * fx.Int64(tile_rows * inter_dim),
             fx.Int32,
             num_records_bytes=bm * inter_dim,
         )
         qs_tile = ptr_buf_tensor(
-            buf_base_i64(qs) + fx.Int64(m_tile) * fx.Int64(bm * inter_dim // 32),
+            buf_base_i64(qs) + fx.Int64(m_tile) * fx.Int64(tile_rows * inter_dim // 32),
             fx.Int8,
             num_records_bytes=bm * inter_dim // 32,
         )
@@ -475,8 +483,9 @@ def make_ring_gemm1(
     return tile
 
 
-def make_ring_gemm2(*, model_dim, inter_dim, bm, bn, nw, pf, nbuf):
-    """GEMM2 of one unit (``bm`` rows x ``bn`` hidden columns), traced in the kernel.
+def make_ring_gemm2(*, model_dim, inter_dim, bm, bn, nw, pf, nbuf, tile_rows=None):
+    """GEMM2 of one unit (``bm`` rows x ``bn`` hidden columns of an m-tile of
+    ``tile_rows``, default ``bm``), traced in the kernel.
 
     Returns ``(start, run)``: ``start`` issues the first ``pf`` steps' weight loads
     (they do not depend on GEMM1), ``run`` the rest, each with its weight cache
@@ -494,6 +503,7 @@ def make_ring_gemm2(*, model_dim, inter_dim, bm, bn, nw, pf, nbuf):
         nbuf=nbuf,
     )
     kc = inter_dim // 256
+    tile_rows = tile_rows or bm
     sc_bytes = bm * inter_dim // 32
     sc_rounds = _rounds(sc_bytes, nw)
     sc_base = nbuf * ring.pitch
@@ -552,15 +562,16 @@ def make_ring_gemm2(*, model_dim, inter_dim, bm, bn, nw, pf, nbuf):
         lane, l16, q16, wave, load_w, sw_pairs = ctx
         sw_pairs = list(sw_pairs)
         a_view = _dma_view(
-            buf_base_i64(aq) + fx.Int64(m_tile) * fx.Int64(bm * inter_dim),
+            buf_base_i64(aq) + fx.Int64(m_tile) * fx.Int64(tile_rows * inter_dim),
             bm * inter_dim,
         )
         s_view = _dma_view(
-            buf_base_i64(ascale) + fx.Int64(m_tile) * fx.Int64(sc_bytes), sc_bytes
+            buf_base_i64(ascale)
+            + fx.Int64(m_tile) * fx.Int64(tile_rows * inter_dim // 32),
+            sc_bytes,
         )
         a_src = []
-        for j in range(ring.slots // nw):
-            d = wave + fx.Int32(nw * j)
+        for d in ring.slot_ids(wave, nw):
             a_src.append(
                 (
                     d,
