@@ -314,6 +314,7 @@ def flash_attn_onekernel_backward(
             PE_HEAD_DIM=pe_head_dim,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
+            IS_MHA=num_q_heads == num_k_heads,
             USE_ALIBI=use_alibi,
             USE_EXP2=True,
             IS_FP8=IS_FP8,

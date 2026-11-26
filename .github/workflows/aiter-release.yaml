@@ -453,8 +453,8 @@ jobs:
                 export ROCM_PATH="${ROCM_HOME}"
                 export PATH="$(python -m rocm_sdk path --bin):${PATH}"
                 echo "Using pip ROCm SDK: ROCM_HOME=${ROCM_HOME}"
-                # install_triton.sh has no triton builds for pip ROCm SDKs; keep
-                # the triton that torch pins (e.g. 3.8.0+git...rocm10.0.0).
+                # Keep the triton that the SDK's torch pins (e.g. 3.8.0+git...rocm10.0.0)
+                # instead of replacing it with the aiter triton build.
                 export AITER_USE_SYSTEM_TRITON=1
               fi
               python --version

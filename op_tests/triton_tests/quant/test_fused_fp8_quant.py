@@ -478,6 +478,10 @@ def run_torch_reduce_act_mul_fp8_group_quant(
         x = F.silu(x) * x_mul
     elif activation == "gelu":
         x = F.gelu(x) * x_mul
+    elif activation == "gelu_tanh":
+        x = F.gelu(x, approximate="tanh") * x_mul
+    else:
+        raise ValueError(f"unknown activation {activation}")
 
     y_q, y_s = per_token_fp8_group_quant(x, dtype_quant, group_size)
 

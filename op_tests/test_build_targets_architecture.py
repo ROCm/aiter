@@ -204,6 +204,51 @@ class TestRuntimeArchitecture(unittest.TestCase):
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
 
+    def test_selected_device_ignores_build_targets_and_tracks_current_device(self):
+        current = 0
+        devices = []
+        architectures = ("gfx942:sramecc+", "GFX1250-strict:xnack-")
+
+        def properties(device):
+            devices.append(device)
+            index = (
+                device if isinstance(device, int) else getattr(device, "index", None)
+            )
+            index = current if index is None else index
+            return type("Properties", (), {"gcnArchName": architectures[index]})()
+
+        with (
+            mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx950"}),
+            mock.patch.object(self.torch.cuda, "get_device_properties", properties),
+            mock.patch.object(
+                self.chip_info,
+                "_detect_native",
+                side_effect=AssertionError("node probe"),
+            ),
+        ):
+            query = self.chip_info.get_gfx_runtime_for_device
+            self.assertEqual(query(1), "gfx1250-strict")
+            self.assertEqual(query(0), "gfx942")
+            for current in (0, 1, 0):
+                expected = ("gfx942", "gfx1250-strict")[current]
+                self.assertEqual(query(), expected)
+                self.assertEqual(query(self.torch.device("cuda")), expected)
+            device = self.torch.device("cuda:1")
+            self.assertEqual(query(device), "gfx1250-strict")
+        self.assertEqual(devices[:2], [1, 0])
+        self.assertEqual(devices[-1], device)
+
+    def test_selected_device_query_errors_propagate(self):
+        with (
+            mock.patch.object(
+                self.torch.cuda,
+                "get_device_properties",
+                side_effect=RuntimeError("device query failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "device query failed"),
+        ):
+            self.chip_info.get_gfx_runtime_for_device(1)
+
     def test_native_detection_preserves_strict_identity(self):
         # Regression lock: _detect_native must return the exact ROCr-reported
         # identity, NOT fold gfx1250-strict (A0) to gfx1250. Folding here makes
