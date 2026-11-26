@@ -1419,6 +1419,34 @@ def flash_kda_fwd(
     else:
         seqs = tuple((b * T, b * T + T) for b in range(B))
 
+    # Checked here, like `out` and the paged cache above, so that a bad
+    # snapshot argument raises before a workspace is allocated or K1 launched.
+    snap_args = {}
+    if snapshot_targets is None and snapshot_out is not None:
+        raise ValueError(
+            "snapshot_out is given without snapshot_targets, so nothing would write it"
+        )
+    if snapshot_targets:
+        if snapshot_out is None:
+            raise ValueError("snapshot_targets needs snapshot_out")
+        targets = tuple((int(n), int(off)) for n, off in snapshot_targets)
+        want = (len(targets), H, V, K) if state_v_first else (len(targets), H, K, V)
+        if (
+            tuple(snapshot_out.shape) != want
+            or not snapshot_out.is_contiguous()
+            or not snapshot_out.dtype.is_floating_point
+            or snapshot_out.device != dev
+        ):
+            raise ValueError(
+                f"snapshot_out must be a contiguous floating-point {want} tensor "
+                f"on {dev}, got {snapshot_out.dtype} {tuple(snapshot_out.shape)} "
+                f"on {snapshot_out.device}"
+            )
+        snap_args = {
+            "snap_out": snapshot_out,
+            "chunk_snap_row": _build_snapshots(seqs, C, targets, dev),
+        }
+
     # Longest sequence in chunks: segmentation is judged per sequence, and
     # passing it as the segment length is what disables segmentation. Resolved
     # here rather than next to _build_segments because K1 launches first and the
@@ -1555,32 +1583,6 @@ def flash_kda_fwd(
         seqs, C, chunks_per_seg, dev
     )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
-
-    snap_args = {}
-    if snapshot_targets is None and snapshot_out is not None:
-        raise ValueError(
-            "snapshot_out is given without snapshot_targets, so nothing would write it"
-        )
-    if snapshot_targets:
-        if snapshot_out is None:
-            raise ValueError("snapshot_targets needs snapshot_out")
-        targets = tuple((int(n), int(off)) for n, off in snapshot_targets)
-        want = (len(targets), H, V, K) if state_v_first else (len(targets), H, K, V)
-        if (
-            tuple(snapshot_out.shape) != want
-            or not snapshot_out.is_contiguous()
-            or not snapshot_out.dtype.is_floating_point
-            or snapshot_out.device != dev
-        ):
-            raise ValueError(
-                f"snapshot_out must be a contiguous floating-point {want} tensor "
-                f"on {dev}, got {snapshot_out.dtype} {tuple(snapshot_out.shape)} "
-                f"on {snapshot_out.device}"
-            )
-        snap_args = {
-            "snap_out": snapshot_out,
-            "chunk_snap_row": _build_snapshots(seqs, C, targets, dev),
-        }
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
     # once here instead of carrying the layout through three passes.

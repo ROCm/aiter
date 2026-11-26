@@ -1377,23 +1377,35 @@ def test_snapshot_arguments_are_checked():
     # Rejected, not packed by `input_guard` into a clone the caller never sees.
     strided = torch.empty(1, 4, K_DIM, 2 * K_DIM, device=device)[..., :K_DIM]
     assert not strided.is_contiguous()
-    for targets, out in (
-        (((0, 128),), None),  # no destination
-        (None, good),  # a destination nothing would write
-        (((0, 128),), torch.empty(2, 4, K_DIM, K_DIM, device=device)),
-        (((0, 128),), torch.empty(1, 4, K_DIM, K_DIM)),  # on the CPU
-        (((0, 128),), as_int),  # not floating point
-        (((0, 128),), strided),  # not contiguous
-        (((0, 100),), good),  # off the chunk grid
-        (((0, 256),), good),  # the final state
-    ):
-        with pytest.raises(ValueError):
-            flash_kda_fwd(
-                *args,
-                lower_bound=LOWER_BOUND,
-                snapshot_targets=targets,
-                snapshot_out=out,
-            )
+    # Each is rejected before K1 is launched. K1 is pinned to its Triton kernel
+    # so that its launcher is the one counted.
+    with _route(k1=False), _count_launches(_flash_kda, ["_prepare_fast"]) as k1:
+        for targets, out in (
+            (((0, 128),), None),  # no destination
+            (None, good),  # a destination nothing would write
+            (((0, 128),), torch.empty(2, 4, K_DIM, K_DIM, device=device)),
+            (((0, 128),), torch.empty(1, 4, K_DIM, K_DIM)),  # on the CPU
+            (((0, 128),), as_int),  # not floating point
+            (((0, 128),), strided),  # not contiguous
+            (((0, 100),), good),  # off the chunk grid
+            (((0, 256),), good),  # the final state
+        ):
+            with pytest.raises(ValueError):
+                flash_kda_fwd(
+                    *args,
+                    lower_bound=LOWER_BOUND,
+                    snapshot_targets=targets,
+                    snapshot_out=out,
+                )
+        assert k1["_prepare_fast"] == 0, "a bad snapshot argument launched K1"
+        # A valid call, to show that the count does see a K1 launch.
+        flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            snapshot_targets=((0, 128),),
+            snapshot_out=good,
+        )
+        assert k1["_prepare_fast"] == 1
     # Off the FlashKDA path: targets it cannot store, and a destination alone.
     for targets in (((0, 128),), None):
         with _force_default_pipeline(), pytest.raises(ValueError):
