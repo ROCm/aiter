@@ -31,7 +31,7 @@ from aiter.ops.triton.utils.conv_config_utils import get_conv_config, has_conv_c
 __all__ = ["causal_conv1d_split_qkv_bwd_triton_fn"]
 
 _BWD_CONFIG_NAME = "CAUSAL_CONV1D_SPLIT_QKV_BWD"
-_DEFAULT_BWD_CONFIG = {"BLOCK_M": 64, "BLOCK_N": 64, "num_warps": 4}
+_DEFAULT_BWD_CONFIG = {"BLOCK_M": 64, "BLOCK_N": 128, "num_warps": 1}
 
 
 def _bwd_config(cu_seqlen: int) -> dict:
@@ -97,7 +97,7 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
 
     Args:
         dq, dk, dv: gradients of q, k, v. ``[cu_seqlen, k_dim]``,
-            ``[cu_seqlen, k_dim]``, ``[cu_seqlen, v_dim]``. Any strides.
+            ``[cu_seqlen, k_dim]``, ``[cu_seqlen, v_dim]``, one dtype. Any strides.
         x: forward input ``[dim, cu_seqlen]``. Any strides.
         weight: ``[dim, width]``, width in {2, 3, 4}.
         bias: ``[dim]`` or None.
@@ -146,6 +146,8 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         raise ValueError("dq and dk must be [cu_seqlen, k_dim]")
     if dv.shape != (cu_seqlen, v_dim):
         raise ValueError("dv must be [cu_seqlen, v_dim]")
+    if not dq.dtype == dk.dtype == dv.dtype:
+        raise ValueError("dq, dk and dv must have the same dtype")
     has_init = has_initial_state is not None
     if has_init and initial_states is None:
         raise ValueError("has_initial_state needs initial_states")
@@ -175,18 +177,20 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         dbias = torch.zeros_like(bias) if bias is not None else None
         return dx, dweight, dbias, dinit
 
-    if cache_indices is None:
-        cache_indices = torch.arange(n_seqs, dtype=torch.int32, device=x.device)
+    has_cache_indices = cache_indices is not None
+    if not has_cache_indices:
+        cache_indices = query_start_loc
     if has_init:
         states = initial_states
         st_seq, st_dim, st_tok = initial_states.stride()
         di_seq, di_dim, di_tok = dinit.stride()
     else:
-        states, has_initial_state = x, cache_indices
+        states, has_initial_state = x, query_start_loc
         st_seq = st_dim = st_tok = di_seq = di_dim = di_tok = 0
 
+    # [chunk, channel, tap]: summed over chunks it is already the dweight layout.
     n_rows = width + (1 if bias is not None else 0)
-    partial = torch.empty((n_rows, tot, dim), dtype=torch.float32, device=x.device)
+    partial = torch.empty((tot, dim, n_rows), dtype=torch.float32, device=x.device)
 
     grid = (tot, triton.cdiv(dim, block_n))
     _causal_conv1d_bwd_split_qkv_kernel[grid](
@@ -208,7 +212,7 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         dim,
         k_dim,
         v_dim,
-        tot * dim,
+        n_rows,
         x.stride(0),
         x.stride(1),
         weight.stride(0),
@@ -233,12 +237,22 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ("silu", "swish"),
         HAS_INITIAL_STATES=has_init,
+        HAS_CACHE_INDICES=has_cache_indices,
         USE_PAD_SLOT=pad_slot_id is not None,
+        X_UNIT_DIM=x.stride(0) == 1 and dx.stride(0) == 1,
+        G_UNIT_DIM=dq.stride(1) == 1 and dk.stride(1) == 1 and dv.stride(1) == 1,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=config["num_warps"],
     )
-    sums = partial.sum(dim=1)
-    dweight = sums[:width].t().contiguous().to(weight.dtype)
-    dbias = sums[width].to(bias.dtype) if bias is not None else None
+    if tot >= 256 and tot % 16 == 0:
+        # A single reduction over many chunks is slow on gfx950 (52 vs 28 us at 512 x 4608 x 4).
+        sums = partial.view(tot // 16, 16, dim, n_rows).sum(dim=1).sum(dim=0)
+    else:
+        sums = partial.sum(dim=0)
+    if bias is None:
+        dweight, dbias = sums.to(weight.dtype), None
+    else:
+        dweight = sums[:, :width].contiguous().to(weight.dtype)
+        dbias = sums[:, width].to(bias.dtype)
     return dx, dweight, dbias, dinit

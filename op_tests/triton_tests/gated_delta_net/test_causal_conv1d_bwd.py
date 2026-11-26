@@ -79,6 +79,7 @@ def _make_inputs(
     sd_layout=False,
     pad_seqs=(),
     packed_dout=False,
+    channel_major=False,
     tail=0,
     seed=0,
 ):
@@ -100,6 +101,10 @@ def _make_inputs(
         dq = dout[:, :k_dim].contiguous()
         dk = dout[:, k_dim : 2 * k_dim].contiguous()
         dv = dout[:, 2 * k_dim :].contiguous()
+    if channel_major:
+        # Token-contiguous x and gradients: no unit channel stride anywhere.
+        x = x.contiguous()
+        dq, dk, dv = (g.t().contiguous().t() for g in (dq, dk, dv))
     qsl = torch.tensor(
         [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device="cuda"
     )
@@ -249,6 +254,10 @@ def test_pad_slots():
 def test_packed_dout_and_tail_tokens():
     # dq, dk, dv as column views of one [T, dim] buffer; tokens after the last sequence get zero.
     _check([300, 2, 129], packed_dout=True, tail=17)
+
+
+def test_channel_major_strides():
+    _check([300, 2, 129], has_init=[True, False, True], channel_major=True)
 
 
 @pytest.mark.parametrize("k_dim,v_dim", [(256, 512), (100, 260)])
