@@ -147,8 +147,9 @@ def _check_flydsl_decode_row(
     if reason is None:
         return config
     logger.warning(
-        f"FlyDSL kernel '{name}' from tuned config {reason}; "
-        "falling back to next candidate."
+        "FlyDSL kernel '%s' from tuned config %s; falling back to next candidate.",
+        name,
+        reason,
     )
     return None
 
