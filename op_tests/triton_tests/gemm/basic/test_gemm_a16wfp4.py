@@ -212,14 +212,11 @@ def test_gemm_a16wfp4(
 def test_gemm_a16wfp4_scale_tail_mask():
     """Regression for the b_scales K-tail mask.
 
-    A ragged-K tile loads scale groups past the end of ``w_scales``. The
-    kernel must mask that tail (``other=127``), else an out-of-bounds ``0xFF``
-    e8m0 scale is NaN and ``tl.dot_scaled`` turns the whole output tile NaN,
-    even though the masked data is zero (``0 * NaN = NaN``). The ordinary test
-    generator lays scale rows back to back, so an unmasked tail reads the next
-    row's valid scales and the bug stays hidden. Here ``w_scales`` sits at the
-    head of a buffer whose per-row K tail is ``0xFF``, so a missing mask fails
-    deterministically instead of reading whatever memory follows.
+    A ragged-K tile reads scale groups past the end of ``w_scales``. The kernel
+    must mask that tail with ``other=127``; an unmasked ``0xFF`` e8m0 scale is
+    NaN and ``tl.dot_scaled`` makes the whole output tile NaN. The test puts the
+    real scales at the head of a buffer whose K tail is ``0xFF`` and asserts a
+    finite output that agrees with the torch reference.
     """
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
