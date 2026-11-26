@@ -21,7 +21,12 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.flydsl.gdn_decode import (
+    fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl,
+    fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl,
+    gdn_fused_decode_supported,
+)
 from aiter.ops.flydsl.kernels.gdn_decode_verify import (
     create_gdn_decode_verify_kernel,
 )
@@ -43,6 +48,12 @@ GDN_VARLEN_GFX = ["gfx950"]
 _gdn_varlen_only = pytest.mark.skipif(
     get_gfx() not in GDN_VARLEN_GFX,
     reason="FlyDSL GDN packed decode/verify is validated on gfx950 only",
+)
+# The fused decode/verify kernels (in_proj outputs in) serve gfx942 with an fp32 state.
+GDN_FUSED_GFX = ["gfx942"]
+_gdn_fused_only = pytest.mark.skipif(
+    get_gfx_runtime() not in GDN_FUSED_GFX,
+    reason="FlyDSL fused GDN decode/verify is gfx942 only",
 )
 GDN_HEAD_K_DIM = 128
 _PERF_ROTATION_BUDGET = 1024**3
@@ -812,6 +823,407 @@ def test_flydsl_gdn_decode_varlen_validate_data_rejects_ragged_offsets():
         flydsl_gdn_decode_varlen(**inputs, validate_data=True)
 
 
+def _bf16_round(x):
+    return x.to(dtypes.bf16).to(dtypes.fp32)
+
+
+def _ref_conv_silu(window, weight):
+    """window [4, C] (oldest first), weight [C, 4]: SiLU of the bf16-rounded products."""
+    acc = torch.zeros_like(window[0])
+    for j in range(4):
+        acc = acc + _bf16_round(window[j] * weight[:, j].float())
+    return _bf16_round(acc * torch.sigmoid(acc))
+
+
+def ref_gdn_fused(
+    qkvz,
+    ba,
+    conv_w,
+    conv_state,
+    state,
+    idx,
+    irow,
+    win,
+    inter,
+    A_log,
+    dt_bias,
+    H,
+    HV,
+    tps,
+):
+    """Unpack + causal conv + gated delta rule from the in_proj outputs.
+
+    tps == 1 is decode: the conv and SSM states are updated in place, and beta is
+    rounded to bf16 like the Triton packed decode. tps > 1 is chain target verify:
+    each step's conv window and state go to ``win`` / ``inter`` row ``irow``, and the
+    SSM state is only read. Returns o [batch * tps, HV, V] in fp32.
+    """
+    D, rep = GDN_HEAD_K_DIM, HV // H
+    qk = 2 * H * D
+    out = torch.zeros(qkvz.shape[0], HV, D, dtype=dtypes.fp32)
+    for n in range(qkvz.shape[0] // tps):
+        slot = int(idx[n])
+        if slot < 0:
+            continue
+        rows = qkvz[n * tps : (n + 1) * tps, : qk + HV * D].float()
+        seq = torch.cat([conv_state[slot].float().t(), rows], 0)
+        h = state[slot].clone()
+        for t in range(tps):
+            mixed = _ref_conv_silu(seq[t : t + 4], conv_w)
+            q = F.normalize(mixed[: H * D].view(H, D), dim=-1, eps=0) * D**-0.5
+            k = F.normalize(mixed[H * D : qk].view(H, D), dim=-1, eps=0)
+            v = mixed[qk:].view(HV, D)
+            b, a = ba[n * tps + t, :HV].float(), ba[n * tps + t, HV:].float()
+            g = -torch.exp(A_log.float()) * F.softplus(a + dt_bias.float())
+            beta = torch.sigmoid(b)
+            if tps == 1:
+                beta = _bf16_round(beta)
+            kk, qq = k.repeat_interleave(rep, 0), q.repeat_interleave(rep, 0)
+            h = h * torch.exp(g)[:, None, None]
+            v_new = (v - (h * kk[:, None, :]).sum(-1)) * beta[:, None]
+            h = h + v_new[:, :, None] * kk[:, None, :]
+            out[n * tps + t] = (h * qq[:, None, :]).sum(-1)
+            if tps > 1:
+                win[irow[n], t] = seq[t + 1 : t + 4].t().to(win.dtype)
+                inter[irow[n], t] = h
+        conv_state[slot] = seq[-3:].t().to(conv_state.dtype)
+        if tps == 1:
+            state[slot] = h
+    return out
+
+
+@benchmark()
+def test_flydsl_gdn_fused(batch, tps, num_k_heads, num_v_heads, pad):
+    """tps=1: fused decode; tps>1: fused chain target verify (in_proj outputs in)."""
+    H, HV, D = num_k_heads, num_v_heads, GDN_HEAD_K_DIM
+    C = 2 * H * D + HV * D
+    slots = 2 * batch + 3
+    rows_n = batch + 2
+    torch.manual_seed(batch * 31 + tps * 7 + H)
+    qkvz = torch.randn(batch * tps, C + HV * D, dtype=dtypes.bf16)
+    ba = torch.randn(batch * tps, 2 * HV, dtype=dtypes.bf16)
+    conv_w = (torch.randn(C, 4, dtype=dtypes.fp32) * 0.5).to(dtypes.bf16)
+    conv0 = torch.randn(slots, C, 3, dtype=dtypes.fp32).to(dtypes.bf16)
+    state0 = torch.randn(slots, HV, D, D, dtype=dtypes.fp32) * 0.1
+    idx = (torch.randperm(slots - 1)[:batch] + 1).to(torch.int32)
+    if pad:
+        idx[-pad:] = -1
+    irow = torch.randperm(rows_n)[:batch].to(torch.int32)
+    A_log = torch.rand(HV, dtype=dtypes.fp32) * 2 - 1
+    dt_bias = torch.rand(HV, dtype=dtypes.fp32).to(dtypes.bf16)
+    assert gdn_fused_decode_supported(
+        qkvz, ba, conv0, conv_w, A_log, dt_bias, state0, H
+    )
+
+    def scratch():
+        # Overlapping sliding-window conv scratch (step t = columns t..t+2) as SGLang's
+        # MambaPool allocates it, and per-step fp32 states.
+        phys = torch.zeros(rows_n, C, tps + 2, dtype=dtypes.bf16)
+        st = phys.stride()
+        win = phys.as_strided((rows_n, tps, C, 3), (st[0], st[2], st[1], st[2]))
+        return phys, win, torch.zeros(rows_n, tps, HV, D, D, dtype=dtypes.fp32)
+
+    conv_ref, state_ref = conv0.clone(), state0.clone()
+    phys_ref, win_ref, inter_ref = scratch()
+    out_ref = ref_gdn_fused(
+        qkvz,
+        ba,
+        conv_w,
+        conv_ref,
+        state_ref,
+        idx,
+        irow,
+        win_ref,
+        inter_ref,
+        A_log,
+        dt_bias,
+        H,
+        HV,
+        tps,
+    )
+    conv, state = conv0.clone(), state0.clone()
+    phys, win, inter = scratch()
+    # NaN sentinel: a row the kernel leaves unwritten fails the checks below
+    out = torch.full((batch * tps, HV, D), float("nan"), dtype=dtypes.bf16)
+    z = torch.empty(batch * tps, HV, D, dtype=dtypes.bf16)
+
+    def run():
+        if tps == 1:
+            fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
+                qkvz,
+                ba,
+                conv,
+                conv_w,
+                A_log,
+                dt_bias,
+                D**-0.5,
+                state,
+                out.view(batch, 1, HV, D),
+                idx,
+                H,
+                z_out=z,
+            )
+        else:
+            fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl(
+                qkvz,
+                ba,
+                conv,
+                conv_w,
+                A_log,
+                dt_bias,
+                D**-0.5,
+                state,
+                out,
+                idx,
+                inter,
+                irow,
+                win,
+                H,
+                tps,
+                z,
+            )
+        return out
+
+    run()
+    live = (idx >= 0).repeat_interleave(tps)
+    live_rows = irow[idx >= 0].long()
+    errs = [
+        checkAllclose(
+            out_ref[live],
+            out[live].float(),
+            rtol=2e-2,
+            atol=2e-2,
+            msg="flydsl: GDN fused output ",
+        ),
+        checkAllclose(
+            conv_ref.float(),
+            conv.float(),
+            rtol=0,
+            atol=0,
+            msg="flydsl: GDN fused conv state ",
+        ),
+        checkAllclose(
+            qkvz[:, C:].reshape(-1, HV, D).float(),
+            z.float(),
+            rtol=0,
+            atol=0,
+            msg="flydsl: GDN fused z ",
+        ),
+    ]
+    if not live.all():
+        errs.append(
+            checkAllclose(
+                torch.zeros_like(out[~live], dtype=torch.float32),
+                out[~live].float(),
+                rtol=0,
+                atol=0,
+                msg="flydsl: GDN fused pad rows are zero ",
+            )
+        )
+    if tps == 1:
+        errs.append(
+            checkAllclose(
+                state_ref, state, rtol=1e-4, atol=1e-4, msg="flydsl: GDN fused state "
+            )
+        )
+    else:
+        errs += [
+            checkAllclose(
+                state0,
+                state,
+                rtol=0,
+                atol=0,
+                msg="flydsl: GDN verify state is read only ",
+            ),
+            checkAllclose(
+                inter_ref[live_rows],
+                inter[live_rows],
+                rtol=1e-4,
+                atol=1e-4,
+                msg="flydsl: GDN verify intermediate states ",
+            ),
+            checkAllclose(
+                phys_ref[live_rows].float(),
+                phys[live_rows].float(),
+                rtol=0,
+                atol=0,
+                msg="flydsl: GDN verify conv windows ",
+            ),
+        ]
+    assert (
+        max(errs) <= _TOL_ERR_RATIO
+    ), f"mismatch ratio exceeds {_TOL_ERR_RATIO:g}: {errs}"
+
+    _, us = run_perftest(run)
+    tokens = batch * tps
+    state_bytes = batch * HV * D * D * 4
+    nbytes = (
+        state_bytes * (2 if tps == 1 else 1 + tps) + tokens * (C + 2 * HV * D) * 2 * 2
+    )
+    flops = tokens * HV * 8 * D * D
+    return {
+        "gfx": get_gfx_runtime(),
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": max(errs),
+    }
+
+
+# Driven by main(); pytest collects the fixed cases below.
+test_flydsl_gdn_fused.__test__ = False
+
+
+@_gdn_fused_only
+@pytest.mark.parametrize("batch,pad", [(1, 0), (8, 1), (32, 0)])
+@pytest.mark.parametrize("tps", [1, 2, 4])
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 48), (8, 24), (4, 12)])
+def test_flydsl_gdn_fused_matches_reference(batch, pad, tps, num_k_heads, num_v_heads):
+    result = test_flydsl_gdn_fused(batch, tps, num_k_heads, num_v_heads, pad)
+    assert result["flydsl err"] <= _TOL_ERR_RATIO
+
+
+@_gdn_fused_only
+def test_gdn_fused_decode_supported_rejects_bf16_state():
+    H, HV, D = 8, 24, GDN_HEAD_K_DIM
+    C = 2 * H * D + HV * D
+    args = [
+        torch.empty(4, C + HV * D, dtype=dtypes.bf16),
+        torch.empty(4, 2 * HV, dtype=dtypes.bf16),
+        torch.empty(9, C, 3, dtype=dtypes.bf16),
+        torch.empty(C, 4, dtype=dtypes.bf16),
+        torch.empty(HV, dtype=dtypes.fp32),
+        torch.empty(HV, dtype=dtypes.bf16),
+    ]
+    assert gdn_fused_decode_supported(
+        *args, torch.empty(9, HV, D, D, dtype=dtypes.fp32), H
+    )
+    assert not gdn_fused_decode_supported(
+        *args, torch.empty(9, HV, D, D, dtype=dtypes.bf16), H
+    )
+
+
+@_gdn_fused_only
+def test_gdn_fused_rejects_non_qwen38_heads():
+    """Same layout and dtypes, other head counts (Qwen3-Next TP2: 8/16): unfused path."""
+    H, HV, D, B = 8, 16, GDN_HEAD_K_DIM, 2
+    C = 2 * H * D + HV * D
+    args = [
+        torch.empty(B, C + HV * D, dtype=dtypes.bf16),
+        torch.empty(B, 2 * HV, dtype=dtypes.bf16),
+        torch.zeros(4, C, 3, dtype=dtypes.bf16),
+        torch.zeros(C, 4, dtype=dtypes.bf16),
+        torch.zeros(HV, dtype=dtypes.fp32),
+        torch.zeros(HV, dtype=dtypes.bf16),
+    ]
+    state = torch.zeros(4, HV, D, D, dtype=dtypes.fp32)
+    assert not gdn_fused_decode_supported(*args, state, H)
+    with pytest.raises(ValueError, match="Qwen3.8 head counts"):
+        fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
+            *args,
+            D**-0.5,
+            state,
+            torch.empty(B, 1, HV, D, dtype=dtypes.bf16),
+            torch.arange(B, dtype=torch.int32),
+            H,
+        )
+
+
+@_gdn_fused_only
+def test_gdn_fused_rejects_other_arch(monkeypatch):
+    """Off gfx942 the probe says no and both ops raise, even with Qwen3.8 shapes."""
+    from aiter.jit.utils import chip_info
+
+    H, HV, D, B, T = 8, 24, GDN_HEAD_K_DIM, 2, 2
+    C = 2 * H * D + HV * D
+    conv_states = torch.zeros(4, C, 3, dtype=dtypes.bf16)
+    conv_weights = torch.zeros(C, 4, dtype=dtypes.bf16)
+    A_log = torch.zeros(HV, dtype=dtypes.fp32)
+    dt_bias = torch.zeros(HV, dtype=dtypes.bf16)
+    state = torch.zeros(4, HV, D, D, dtype=dtypes.fp32)
+    idx = torch.arange(B, dtype=torch.int32)
+
+    def rows(n):
+        return (
+            torch.empty(n, C + HV * D, dtype=dtypes.bf16),
+            torch.empty(n, 2 * HV, dtype=dtypes.bf16),
+        )
+
+    qkvz, ba = rows(B)
+    args = [qkvz, ba, conv_states, conv_weights, A_log, dt_bias]
+    assert gdn_fused_decode_supported(*args, state, H)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    assert not gdn_fused_decode_supported(*args, state, H)
+    with pytest.raises(ValueError, match="gfx942"):
+        fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
+            *args, D**-0.5, state, torch.empty(B, 1, HV, D, dtype=dtypes.bf16), idx, H
+        )
+    qkvz, ba = rows(B * T)
+    with pytest.raises(ValueError, match="gfx942"):
+        fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl(
+            qkvz,
+            ba,
+            conv_states,
+            conv_weights,
+            A_log,
+            dt_bias,
+            D**-0.5,
+            state,
+            torch.empty(B * T, HV, D, dtype=dtypes.bf16),
+            idx,
+            torch.zeros(B, T, HV, D, D, dtype=dtypes.fp32),
+            idx,
+            torch.zeros(B, T, C, 3, dtype=dtypes.bf16),
+            H,
+            T,
+            torch.empty(B * T, HV, D, dtype=dtypes.bf16),
+        )
+
+
+@_gdn_fused_only
+def test_gdn_fused_rejects_interleaved_qkvz_layout():
+    # Qwen3-Next packs qkvz per k-head group: same shapes, other element order.
+    H, HV, D, B = 8, 24, GDN_HEAD_K_DIM, 2
+    C = 2 * H * D + HV * D
+    qkvz = torch.empty(B, C + HV * D, dtype=dtypes.bf16)
+    ba = torch.empty(B, 2 * HV, dtype=dtypes.bf16)
+    conv_states = torch.zeros(4, C, 3, dtype=dtypes.bf16)
+    conv_weights = torch.zeros(C, 4, dtype=dtypes.bf16)
+    A_log = torch.zeros(HV, dtype=dtypes.fp32)
+    dt_bias = torch.zeros(HV, dtype=dtypes.bf16)
+    state = torch.zeros(4, HV, D, D, dtype=dtypes.fp32)
+    args = [qkvz, ba, conv_states, conv_weights, A_log, dt_bias]
+    assert gdn_fused_decode_supported(*args, state, H, qkvz_layout="flat")
+    assert not gdn_fused_decode_supported(*args, state, H, qkvz_layout="interleaved")
+    out = torch.empty(B, 1, HV, D, dtype=dtypes.bf16)
+    idx = torch.arange(B, dtype=torch.int32)
+    with pytest.raises(ValueError, match="flat"):
+        fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
+            *args, D**-0.5, state, out, idx, H, qkvz_layout="interleaved"
+        )
+    T = 2
+    with pytest.raises(ValueError, match="flat"):
+        fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl(
+            torch.empty(B * T, C + HV * D, dtype=dtypes.bf16),
+            torch.empty(B * T, 2 * HV, dtype=dtypes.bf16),
+            conv_states,
+            conv_weights,
+            A_log,
+            dt_bias,
+            D**-0.5,
+            state,
+            torch.empty(B * T, HV, D, dtype=dtypes.bf16),
+            idx,
+            torch.zeros(B, T, HV, D, D, dtype=dtypes.fp32),
+            idx,
+            torch.zeros(B, T, C, 3, dtype=dtypes.bf16),
+            H,
+            T,
+            torch.empty(B * T, HV, D, dtype=dtypes.bf16),
+            qkvz_layout="interleaved",
+        )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("FlyDSL GDR decode unsupported on %s; skipping", get_gfx())
@@ -879,6 +1291,15 @@ def main():
         help="Packed GDN head configs as num_k_heads,num_v_heads,head_v_dim "
         "(head_k_dim is fixed at 128). Default: Qwen3.8 at TP1.",
     )
+    parser.add_argument(
+        "--gdn-fused-heads",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(8, 24), (4, 12)],
+        metavar="NKH,NVH",
+        help="Fused GDN decode/verify head configs (gfx942) as num_k_heads,num_v_heads "
+        "(K = V = 128). Default: Qwen3.8 at TP2 and TP4.",
+    )
     args = parser.parse_args()
 
     rows = []
@@ -925,6 +1346,18 @@ def main():
     aiter.logger.info(
         "FlyDSL GDR decode summary (markdown):\n%s", df.to_markdown(index=False)
     )
+
+    if get_gfx_runtime() in GDN_FUSED_GFX:
+        rows = [
+            test_flydsl_gdn_fused(batch, tps, *heads, 0)
+            for batch, tps, heads in itertools.product(
+                args.batch, args.tps, args.gdn_fused_heads
+            )
+        ]
+        aiter.logger.info(
+            "FlyDSL GDN fused decode/verify summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
 
     if get_gfx() not in GDN_VARLEN_GFX:
         aiter.logger.warning(
