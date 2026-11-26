@@ -1483,7 +1483,8 @@ def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
         async_a_copy=False,
         use_tile_resource=bucket <= 16,
         b_nt=0 if bucket == 1 else 3,
-        waves_per_eu_hint=1 if bucket == 16 else 2,
+        # One CTA a CU (grid_mult 1): one wave a SIMD.
+        waves_per_eu_hint=1 if grid_mult == 1 else 2,
     )
 
 
@@ -1722,19 +1723,28 @@ def _tune_v41_flash_ep8_small_both(config: MegaMoEConfig, bucket: int) -> MegaMo
             stage1=replace(config.stage1, use_tile_resource=True),
             fused_stage1=replace(config.fused_stage1, epi_evec=8, epi_lean=1),
         )
-    if bucket in (64, 128, 256, 512):
-        # The ring GEMM cores (the amd-kernels PR #12 GEMM core) on 64-row m-tiles without m-tile pairs and
-        # 256-wide GEMM1 units: GEMM1 / GEMM2 weight loads 2 steps ahead of their MFMAs, activation rows through a
-        # 4 / 6-stage LDS DMA ring.
-        config = replace(
-            config,
-            stage1=replace(config.stage1, sort_block_m=64, tile_n=256),
-            stage2=replace(config.stage2, block_m=64),
-            fused_stage1=replace(
-                config.fused_stage1, pair_tiles=False, ring_core=(2, 4, 2, 6)
-            ),
-        )
     return config
+
+
+def _ring_cores(config: MegaMoEConfig, model_dim: int) -> MegaMoEConfig:
+    """The ring GEMM cores (the amd-kernels PR #12 GEMM core) of every small-input kernel: 64-row interleaved
+    m-tiles of the local plan, 256-wide GEMM1 units and GEMM2 tiles; at V4-Pro's dims the GEMM2 weights go one
+    step ahead (two spill)."""
+    return replace(
+        config,
+        stage1=replace(config.stage1, sort_block_m=64, tile_n=256),
+        stage2=replace(config.stage2, block_m=64, block_n=256),
+        fused_stage1=replace(
+            config.fused_stage1,
+            dedup_rows=True,
+            plan_local=True,
+            pair_tiles=False,
+            g1_split_tail=0,
+            g1_lookahead=1,
+            g1_a_ahead=1,
+            ring_core=(2, 4, 1 if model_dim == V4_MODEL_DIM else 2, 6),
+        ),
+    )
 
 
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
@@ -1988,7 +1998,7 @@ def _fused_config(
         config = _tune_a4w4_small(config, layout, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         config = _tune_v41_flash_ep8_small_both(config, bucket)
-    return config
+    return _ring_cores(config, model_dim)
 
 
 def select_fused_config(

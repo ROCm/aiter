@@ -1327,7 +1327,11 @@ def compile_mega_moe_stage1(
                 v = fx.Int64(comm_ops.wave_uniform_i64(v))
             return v
 
-        a_work_head = _disp_ptr(DispatchSlot.WORK_HEAD)
+        def _sgpr_ptr(slot):
+            # A pointer the consumer loops hold across the GEMMs: in SGPRs, as a VGPR pair it spills the K loops.
+            return fx.Int64(comm_ops.wave_uniform_i64(_disp_ptr(slot)))
+
+        a_work_head = _sgpr_ptr(DispatchSlot.WORK_HEAD)
         if const_expr(dedup_rows):
             token_offsets = (_disp_ptr(DispatchSlot.TOKEN_ROWS), _disp_ptr(DispatchSlot.TOKEN_SCALES))
 
@@ -1336,7 +1340,7 @@ def compile_mega_moe_stage1(
         cta = fx.Int32(fx.block_idx.x)
         old_epoch = buf_copy_load(ptr_buf_tensor(_disp_ptr(DispatchSlot.LAUNCH_EPOCH), fx.Int32), fx.Int32(entry_slot),
             cache_modifier=_SC0_SC1_CACHE)
-        launch_epoch = old_epoch + fx.Int32(1)
+        launch_epoch = fx.Int32(rocdl.readfirstlane(T.i32, old_epoch)) + fx.Int32(1)
 
         def _next_epoch():
             # This launch's parity and expected source value: the previous launch's, advanced.
@@ -1559,14 +1563,12 @@ def compile_mega_moe_stage1(
                 n_tiles=2 * N_TILES)
             do_half(flat)
 
-        a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
-        a_g2_ready = _disp_ptr(DispatchSlot.G2_READY)
+        a_g2_cnt = _sgpr_ptr(DispatchSlot.G2_CNT)
+        a_g2_ready = _sgpr_ptr(DispatchSlot.G2_READY)
         # GEMM2 setup is loaded before GEMM1 so the GEMM1 -> GEMM2 switch costs no memory round trip.
         g2_lane = tid % fx.Int32(64)
         g2_wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.pool.ptr))
-        g2_peer_base = ptr_buf_tensor(_disp_ptr(DispatchSlot.G2_P2P_COMB_INP), fx.Int64)[
-            (tid < fx.Int32(fz_npes)).select(tid, fx.Int32(0))]
         g2_aq = _disp_ptr(DispatchSlot.G2_AQ)
         g2_ascale = _disp_ptr(DispatchSlot.G2_ASCALE)
         g2_bq = _disp_ptr(DispatchSlot.G2_BQ)
@@ -1898,6 +1900,7 @@ def compile_mega_moe_stage1(
                     fx.Int32(1), fx.Int32(0))
 
         if tid < fx.Int32(fz_npes):
+            g2_peer_base = ptr_buf_tensor(_disp_ptr(DispatchSlot.G2_P2P_COMB_INP), fx.Int64)[tid]
             fx.ptr_store(g2_peer_base, lds_typed_ptr(fx.Int32(g2_lay["peer"]) + tid * fx.Int32(8), T.i64, align=8))
         # The XCD's slice of the GEMM2 unit space, at the same place in the m-tiles as its GEMM1 slice: an m-tile
         # that GEMM1 did not cut keeps its GEMM2 on the XCD whose L2 holds its GEMM1 output (an independent
@@ -1926,8 +1929,10 @@ def compile_mega_moe_stage1(
             tok_off = tok_base + tok_par * fx.Int64(fz_mtpr * 4)
             tok_reset = tok_base + (fx.Int64(1) - tok_par) * fx.Int64(fz_mtpr * 4)
         if const_expr(RING):
-            g2_ring_args = tuple(fx.Int64(comm_ops.wave_uniform_i64(a))
-                for a in (g2_aq, g2_ascale, g2_bq, g2_bscale, g2_stids, g2_sweights, a_g2_ready))
+            # The other GEMM2 pointers in SGPRs, loaded past GEMM1: held through its K loop, they spill it.
+            g2_ring_args = (*(_sgpr_ptr(slot) for slot in (DispatchSlot.G2_AQ, DispatchSlot.G2_ASCALE, DispatchSlot.G2_BQ,
+                DispatchSlot.G2_BSCALE)), *(fx.Int64(comm_ops.wave_uniform_i64(_slot_meta_ptr(slot))) for slot in (
+                DispatchSlot.G2_STIDS, DispatchSlot.G2_SWEIGHTS)), a_g2_ready)
 
             def _ring_g2_tail(g2_m, g2_n, ctx, w_ring, rows, packed, weight, w_cm, half=False):
                 aq_u, ascale_u = g2_ring_args[:2]
@@ -2054,6 +2059,9 @@ def compile_mega_moe_stage1(
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
+                # No AGPRs: with them the registers split 128 / 128 and the ring K loops spill their VGPRs or copy
+                # operands between the halves.
+                "llvm.passthrough": [["amdgpu-agpr-alloc", "0"]],
             },
         ).launch(grid=(launch_grid_x, 1, 1), block=(TOTAL_THREADS, 1, 1), stream=stream)
 

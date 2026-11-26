@@ -16,7 +16,7 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib
-from dataclasses import astuple, fields, replace
+from dataclasses import astuple, fields
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -377,7 +377,7 @@ _FUSED_CASES = (
     (8192, 8192),
     (16384, 16384),
 )
-_FUSED_DIGEST = "f8cb680aa7ec3e668f98ed9a71a485c0bdbe703735cbf6477622cb4ae36b0666"
+_FUSED_DIGEST = "dca5c59c7370db22340e5da4d807cd0f3e2e50e54cc59b50687b3fe0d25fd033"
 
 
 def test_fused_configs_unchanged():
@@ -418,8 +418,10 @@ def test_max_tokens_is_the_route_switch():
 
 
 def test_ep8_fused_configs_keep_fused_knobs_off():
-    """The EP8 V4-Pro fused kernels are the ones before the EP4 tune: every fused knob off."""
+    """The EP8 V4-Pro large-input kernels are the ones before the EP4 tune: every fused knob off."""
     for mtpr, tokens in _FUSED_CASES:
+        if mtpr not in LARGE_M_MTPRS:
+            continue
         config = select_fused_config(tokens, mtpr)
         assert config.fused_stage1 == FusedStage1Knobs(), (mtpr, tokens)
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
@@ -452,7 +454,7 @@ def _knob_table(config):
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
 # small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
 # table.
-_EP4_FUSED_DIGEST = "bc90461aa6bf712787a59363f7f54b6d9cc79b9b20027ffad260c2d8ea4ec7f7"
+_EP4_FUSED_DIGEST = "2d54491461140360610b7636fbc8c2e4982be9843d55155bab6509b3de4b2241"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -513,10 +515,9 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 
 
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
-# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and the ring GEMM cores from
-# 64 tokens.
+# current table. Pinned with the ring GEMM cores at every small-input bucket.
 _V41EP8_FUSED_DIGEST = (
-    "d2a5222beb2757396e9d61479ab4a96b564c698b7c63b793f478051dc080fe59"
+    "740532705b075e9e3fedd21c8f8a983d0f3dbf748ed0beff0ba5316e58ee4a44"
 )
 
 
@@ -530,16 +531,6 @@ def test_v41ep8_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _V41EP8_FUSED_DIGEST, table
-
-
-@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
-def test_pair_tiles_requires_32_row_m_tiles(quant):
-    """A pair of 64-row m-tiles would leave one small-input CTA a CU, so its grid would not be co-resident."""
-    config = select_fused_config(32, 256, quant=quant, **V41_FLASH_EP8_SHAPE)
-    paired = replace(config, fused_stage1=replace(config.fused_stage1, pair_tiles=True))
-    assert paired.stage1.sort_block_m == 32
-    with pytest.raises(ValueError):
-        replace(paired, stage1=replace(paired.stage1, sort_block_m=64))
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
@@ -567,24 +558,25 @@ def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
-def test_v41ep8_small_m_ring_core(quant):
-    """EP8 V4.1-Flash, A8W4 and A4W4 alike: from 64 tokens the small-input kernel runs the ring GEMM cores, on the
-    64-row interleaved m-tiles of the local plan, 256-wide GEMM1 units and 256-wide GEMM2 tiles they need.
-    """
+@pytest.mark.parametrize(
+    "shape",
+    ({}, V41_FLASH_EP8_SHAPE, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE),
+    ids=("v4_pro_ep8", "v41_flash_ep8", "v41_flash_ep4", "v41_flash_ep2"),
+)
+def test_small_m_ring_geometry(shape, quant):
+    """Every small-input kernel runs the ring GEMM cores (64-row m-tiles, 256-wide GEMM1 units and GEMM2 tiles)
+    on a co-resident grid: two CTAs a CU need two waves a SIMD."""
     for mtpr in (256, 512):
         for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
-            config = select_fused_config(
-                bucket, mtpr, quant=quant, **V41_FLASH_EP8_SHAPE
-            )
-            k = config.fused_stage1
-            assert bool(k.ring_core) == (bucket >= 64), (mtpr, bucket)
-            if k.ring_core:
-                s1 = config.stage1
-                assert s1.sort_block_m == config.stage2.block_m == 64
-                assert s1.tile_n == 64 * s1.num_waves and config.stage2.block_n == 256
-                assert k.dedup_rows and k.plan_local and not k.pair_tiles
-                assert k.g1_lookahead == 1 and k.g1_a_ahead == 1
-                assert not k.g1_split_tail
+            config = select_fused_config(bucket, mtpr, quant=quant, **shape)
+            s1, s2, k = config.stage1, config.stage2, config.fused_stage1
+            assert s1.sort_block_m == s2.block_m == 64, (mtpr, bucket)
+            assert s1.tile_n == 64 * s1.num_waves and s2.block_n == 256, (mtpr, bucket)
+            assert k.ring_core and k.dedup_rows and k.plan_local, (mtpr, bucket)
+            assert not k.pair_tiles and not k.g1_split_tail, (mtpr, bucket)
+            assert k.g1_lookahead == 1 and k.g1_a_ahead == 1, (mtpr, bucket)
+            grid_mult = min(s1.grid_mult, 2)
+            assert grid_mult == 1 or s1.waves_per_eu_hint >= 2, (mtpr, bucket)
 
 
 def test_ep4_dispatch_cus_cover_two_expert_waves():
@@ -621,12 +613,12 @@ def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
 
     ep8 = rows(8, 7168, 3072)
     ep4 = rows(4, 5120, 2304)
-    # EP8 keeps the plain fixed-slot payload; EP4 adds one row per (source rank, token).
-    assert ep8[1] == 48 * (8 * mtpr) + 256
+    # Every layout adds one row per (source rank, token) to the fixed slots.
+    assert ep8[1] == 48 * (8 * mtpr) + 256 + 8 * mtpr
+    assert ep8[1] * ep8[2] <= _TOKEN_REGION_END
     assert ep4[1] == 96 * (4 * mtpr) + 256 + 4 * mtpr
     assert ep4[1] * ep4[2] <= _TOKEN_REGION_END
     ep8f = rows(8, 5120, 2304)
-    # EP8 V4.1-Flash takes EP4's dedup rows: one more row per (source rank, token).
     assert ep8f[1] == 48 * (8 * mtpr) + 256 + 8 * mtpr
     assert ep8f[1] * ep8f[2] <= _TOKEN_REGION_END
 
@@ -670,8 +662,7 @@ def test_route_payload_sharing():
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("mtpr", (256, 512))
 def test_ep2_small_m_buckets_share_one_protocol(mtpr, quant):
-    """EP2 V4.1-Flash: one launch protocol over every bucket, 32-row expert tiles everywhere (8-16 rows an expert
-    at 256-512 tokens), and one GEMM2 block_n over the tok_done buckets."""
+    """EP2 V4.1-Flash: one launch protocol over every bucket and one GEMM2 block_n over the tok_done buckets."""
     protocols, tok_done_block_n = set(), set()
     for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
         config = select_fused_config(bucket, mtpr, quant=quant, **V41_FLASH_EP2_SHAPE)
@@ -687,7 +678,6 @@ def test_ep2_small_m_buckets_share_one_protocol(mtpr, quant):
         )
         assert not k.tok_done or k.tok_counters
         assert not k.tok_counters or (k.plan_local and k.dedup_rows)
-        assert config.stage1.sort_block_m == config.stage2.block_m == 32, bucket
         # Producers are split evenly over the 2 destinations and leave consumers.
         assert 0 < config.stage1.num_dispatch_cu < 256, bucket
         assert config.stage1.num_dispatch_cu % 2 == 0, bucket
@@ -778,7 +768,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "654385c77002fe9ae5fbbab22e2d4a9e4638fcf4cb534af0120810a447de51b7"
+_EP2_FUSED_DIGEST = "c3bcd0c297fae138c88a0a6f1a1e0858d698b018fac08caec378423da4572b98"
 
 
 def test_ep2_fused_configs_unchanged():
@@ -1097,10 +1087,10 @@ _A4W4_DIGEST_LARGE_MTPRS = {
     "v41_flash_ep2": (8192, 16384),
 }
 _A4W4_FUSED_DIGESTS = {
-    "v4_pro_ep8": "8f1f921b1bccce23c0709b0682bbee047f5893bbceb0497ee8c517f6a3d82b04",
-    "v41_flash_ep8": "0d40d9be40cfa1671b0e12b8c716c7405240f95ee72898e665f67c2d50c775f6",
-    "v41_flash_ep4": "edabac3b4dd3e9bf40a9c179427829b95c2eaf195f64b05d2ff37fc251e29498",
-    "v41_flash_ep2": "4dedfdc6d0b32d049fbe45590be738063657d4341ac83929c268f434cb7a3044",
+    "v4_pro_ep8": "4fd983428af70d58ad55e17574df65cda76d301c50c15eda5f10073011e9cbce",
+    "v41_flash_ep8": "220b20cfca512343b3834315d4c0d0b1c8502ea566221b64c89b76d7dd5933b2",
+    "v41_flash_ep4": "9e2586d1c681527aedacd72a44a6573de5300716df75b32fdfd30b0672ebc3f0",
+    "v41_flash_ep2": "1ae956683b6b2355723775d08c7b4c38e375f1af617107ccf70c8ae2bfbdd53d",
 }
 
 
