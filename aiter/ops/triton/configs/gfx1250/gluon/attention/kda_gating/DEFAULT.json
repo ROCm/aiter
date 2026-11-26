@@ -1,0 +1,91 @@
+{
+  "one_token": {
+    "SEQ_HEADS_LEQ_180": {
+      "BV": 32,
+      "TK": 32,
+      "VEC": 4,
+      "num_warps": 4,
+      "LOAD_CACHE": ".cs",
+      "STORE_CACHE": ".cs",
+      "GATE_DIST": 2,
+      "INPLACE_TK": 32,
+      "INPLACE_VEC": 0,
+      "INPLACE_LOAD_CACHE": "",
+      "INPLACE_STORE_CACHE": "",
+      "INPLACE_GATE_DIST": 0,
+      "INPLACE_BURST": false,
+      "INPLACE_FAST_DIV": false,
+      "MULTI_PRE": 0
+    },
+    "SEQ_HEADS_LEQ_4596": {
+      "BV": 32,
+      "TK": 32,
+      "VEC": 4,
+      "num_warps": 4,
+      "LOAD_CACHE": ".cs",
+      "STORE_CACHE": ".cs",
+      "GATE_DIST": 2,
+      "INPLACE_TK": 16,
+      "INPLACE_VEC": 2,
+      "INPLACE_LOAD_CACHE": "",
+      "INPLACE_STORE_CACHE": "",
+      "INPLACE_GATE_DIST": 0,
+      "INPLACE_BURST": false,
+      "INPLACE_FAST_DIV": false,
+      "MULTI_PRE": 0
+    },
+    "any": {
+      "BV": 32,
+      "TK": 32,
+      "VEC": 4,
+      "num_warps": 4,
+      "LOAD_CACHE": ".cs",
+      "STORE_CACHE": ".cs",
+      "GATE_DIST": 2,
+      "INPLACE_TK": 16,
+      "INPLACE_VEC": 2,
+      "INPLACE_LOAD_CACHE": "",
+      "INPLACE_STORE_CACHE": "",
+      "INPLACE_GATE_DIST": 2,
+      "INPLACE_BURST": true,
+      "INPLACE_FAST_DIV": true,
+      "MULTI_PRE": 0
+    }
+  },
+  "multi_token": {
+    "SEQ_HEADS_LEQ_96": {
+      "BV": 32,
+      "TK": 16,
+      "VEC": 4,
+      "num_warps": 2,
+      "LOAD_CACHE": "",
+      "STORE_CACHE": ".cs",
+      "GATE_DIST": 0,
+      "INPLACE_TK": 16,
+      "INPLACE_VEC": 0,
+      "INPLACE_LOAD_CACHE": "",
+      "INPLACE_STORE_CACHE": "",
+      "INPLACE_GATE_DIST": 0,
+      "INPLACE_BURST": false,
+      "INPLACE_FAST_DIV": false,
+      "MULTI_PRE": 0
+    },
+    "any": {
+      "BV": 128,
+      "TK": 16,
+      "VEC": 4,
+      "num_warps": 8,
+      "LOAD_CACHE": "",
+      "STORE_CACHE": ".cs",
+      "GATE_DIST": 0,
+      "INPLACE_TK": 16,
+      "INPLACE_VEC": 0,
+      "INPLACE_LOAD_CACHE": "",
+      "INPLACE_STORE_CACHE": "",
+      "INPLACE_GATE_DIST": 0,
+      "INPLACE_BURST": false,
+      "INPLACE_FAST_DIV": false,
+      "MULTI_PRE": 8
+    }
+  }
+}
