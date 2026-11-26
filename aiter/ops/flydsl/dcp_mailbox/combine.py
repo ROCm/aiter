@@ -55,6 +55,7 @@ class CombineBuild:
     debug: bool
     token_tile: int
     row_mask: bool
+    gated: bool = False
 
 
 def peer_layout(ranks, max_tokens, heads, dim):
@@ -83,6 +84,9 @@ ABI = KernelAbi(
         "res_sb",
         "res_sh",
         "res_lse",
+        "gate",
+        "gate_sb",
+        "gate_sh",
         "seq_lens",
         "qsl",
         "row_counts",
@@ -107,6 +111,7 @@ def build(key: CombineBuild):
         f"aiter_dcp_lse_combine_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
         f"_g{int(key.debug)}_r{int(key.row_mask)}_bt{tile}"
+        + ("_sig" if key.gated else "")
     )
 
     combine = make_combine_kernel(key, name, threads, lay, half, epoch_offset(lay))
@@ -126,6 +131,9 @@ def _jit(key, combine, threads):
         res_sb: Int32,
         res_sh: Int32,
         res_lse: Int64,
+        gate: Int64,
+        gate_sb: Int32,
+        gate_sh: Int32,
         seq_lens: Int64,
         qsl: Int64,
         row_counts: Int64,
@@ -147,6 +155,9 @@ def _jit(key, combine, threads):
             res_sb,
             res_sh,
             res_lse,
+            gate,
+            gate_sb,
+            gate_sh,
             seq_lens,
             qsl,
             row_counts,
@@ -222,6 +233,7 @@ def dcp_lse_combine(
     query_start_loc: torch.Tensor | None = None,
     row_counts: torch.Tensor | None = None,
     res: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ):
     """Combine ``out`` [tokens, ranks * heads, dim] bf16 and ``lse`` [tokens, ranks * heads].
 
@@ -230,6 +242,10 @@ def dcp_lse_combine(
     ``seq_lens`` with ``query_start_loc`` masks empty requests. ``row_counts``
     masks rows with no locally owned keys. ``dim`` must be a multiple of 4 with
     ``4 * ranks <= dim <= 4 * MAX_THREADS``.
+
+    ``gate`` [tokens, heads * dim] (or [tokens, heads, dim]) bf16 with a dense
+    last dimension multiplies the combined heads by ``sigmoid(gate)`` in fp32
+    before their one bf16 rounding: an attention output gate in the combine.
 
     Every rank must issue the identical call sequence. One extra call can
     silently misalign every later result.
@@ -260,6 +276,9 @@ def dcp_lse_combine(
         or not row_counts.is_contiguous()
     ):
         raise ValueError("row_counts must be contiguous int32 with shape [tokens]")
+    gate_sb = gate_sh = 0
+    if gate is not None:
+        gate_sb, gate_sh = _gate_strides(gate, tokens, heads, dim, out.device)
     _prepare_debug(ws)
     if res is None:
         res = out.new_empty((tokens, heads, dim))
@@ -279,6 +298,7 @@ def dcp_lse_combine(
         debug=ws.debug,
         token_tile=tile,
         row_mask=row_counts is not None,
+        gated=gate is not None,
     )
     # flyc.jit traces the kernel again on every call (tens of ms); the handle
     # flyc.compile returns does not. Its arguments are all scalars and
@@ -295,6 +315,9 @@ def dcp_lse_combine(
         res.stride(0),
         res.stride(1),
         res_lse.data_ptr(),
+        0 if gate is None else gate.data_ptr(),
+        gate_sb,
+        gate_sh,
         0 if seq_lens is None else seq_lens.data_ptr(),
         0 if query_start_loc is None else query_start_loc.data_ptr(),
         0 if row_counts is None else row_counts.data_ptr(),
@@ -310,6 +333,25 @@ def dcp_lse_combine(
     if return_lse:
         return res, res_lse
     return res
+
+
+def _gate_strides(gate, tokens, heads, dim, device):
+    """(row, head) strides in elements of a gate laid out like the result."""
+    if gate.dtype != torch.bfloat16 or gate.device != device:
+        raise ValueError("gate must be bf16 on the output device")
+    if gate.dim() == 2 and gate.shape == (tokens, heads * dim) and gate.stride(1) == 1:
+        strides = gate.stride(0), dim
+    elif gate.dim() == 3 and gate.shape == (tokens, heads, dim) and gate.stride(2) == 1:
+        strides = gate.stride(0), gate.stride(1)
+    else:
+        raise ValueError(
+            f"gate must be [tokens, heads * dim] or [tokens, heads, dim] with a dense "
+            f"last dimension, got {tuple(gate.shape)} strides {gate.stride()}"
+        )
+    # Each thread loads its four values as two 32-bit words.
+    if gate.data_ptr() % 4 or any(s % 2 for s in strides):
+        raise ValueError("gate rows and heads must start on 32-bit boundaries")
+    return strides
 
 
 def _prepare_debug(ws) -> None:

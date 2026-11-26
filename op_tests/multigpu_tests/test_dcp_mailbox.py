@@ -34,7 +34,7 @@ class _Group:
         self.world_size = world
 
 
-def _reference(parts, lses, base_e):
+def _reference(parts, lses, base_e, dtype=torch.bfloat16):
     stacked = torch.stack(parts, 0).float()
     lse = torch.stack(lses, 0).float()
     lse = torch.where(torch.isnan(lse) | torch.isposinf(lse), float("-inf"), lse)
@@ -44,17 +44,26 @@ def _reference(parts, lses, base_e):
     g = log(exp(lse - m).sum(0)) + m
     w = exp(lse - g)
     w = torch.where(torch.isnan(w), 0.0, w)
-    return (stacked * w[..., None]).sum(0).to(torch.bfloat16), g
+    return (stacked * w[..., None]).sum(0).to(dtype), g
 
 
-def _gathered_reference(out, lse, rank, world, hl, base_e):
+def _gathered_reference(out, lse, rank, world, hl, base_e, dtype=torch.bfloat16):
     """This rank's expected combine of every rank's ``out`` / ``lse``."""
     go = [torch.empty_like(out) for _ in range(world)]
     gl = [torch.empty_like(lse) for _ in range(world)]
     dist.all_gather(go, out)
     dist.all_gather(gl, lse)
     sl = slice(rank * hl, (rank + 1) * hl)
-    return _reference([g[:, sl] for g in go], [g[:, sl] for g in gl], base_e)
+    return _reference([g[:, sl] for g in go], [g[:, sl] for g in gl], base_e, dtype)
+
+
+def _assert_rounded_once(got, want):
+    """bf16 ``got`` is fp32 ``want`` rounded once: within half a bf16 ulp,
+    give or take the fp32 accumulation order."""
+    _, exponent = torch.frexp(want)
+    half_ulp = torch.ldexp(torch.ones_like(want), exponent - 9)
+    excess = (got.float() - want).abs() - (half_ulp * 1.001 + 1e-5)
+    assert excess.max().item() <= 0, f"{int((excess > 0).sum())} values off by more"
 
 
 def _assert_rearmed(ws, group):
@@ -72,6 +81,65 @@ def _row_empty(tokens, seq_lens, qsl):
     rows = torch.arange(tokens, device=seq_lens.device)
     seq = torch.searchsorted(qsl[1:], rows, right=True).clamp(max=seq_lens.numel() - 1)
     return (rows >= qsl[-1]) | (seq_lens[seq] == 0)
+
+
+def _check_gated_combine(group, hl, dim, tokens, max_tokens, row_counts, gen):
+    """An output gate: the combined heads times sigmoid(gate), rounded to bf16
+    once, eager and replayed. The gate is a slice of a wider projection, as it
+    is in a model; the ungated build of the same workspace is left as it was."""
+    rank, world = group.rank_in_group, group.world_size
+    ws = CombineWorkspace(group, torch.device("cuda"), hl, dim, max_tokens)
+    out = torch.empty(tokens, world * hl, dim, device="cuda", dtype=torch.bfloat16)
+    lse = torch.randn(
+        tokens, world * hl, device="cuda", dtype=torch.float32, generator=gen
+    )
+    wide = torch.empty(tokens, hl * dim + 64, device="cuda", dtype=torch.bfloat16)
+    gate = wide[:, : hl * dim]
+    masked = lse.masked_fill((row_counts == 0)[:, None], float("-inf"))
+
+    def draw():
+        out.copy_(torch.randn(out.shape, device="cuda", generator=gen))
+        gate.copy_(2 * torch.randn(gate.shape, device="cuda", generator=gen))
+
+    def expected():
+        plain, _ = _gathered_reference(
+            out, masked, rank, world, hl, True, torch.float32
+        )
+        return plain * torch.sigmoid(gate.float()).view(tokens, hl, dim)
+
+    draw()
+    got = dcp_lse_combine(ws, out, lse, row_counts=row_counts, gate=gate)
+    torch.cuda.synchronize()
+    _assert_rounded_once(got, expected())
+    again = dcp_lse_combine(
+        ws, out, lse, row_counts=row_counts, gate=gate.view(tokens, hl, dim)
+    )
+    torch.testing.assert_close(again, got, rtol=0, atol=0)
+    plain = dcp_lse_combine(ws, out, lse, row_counts=row_counts)
+    exp, _ = _gathered_reference(out, masked, rank, world, hl, True)
+    torch.testing.assert_close(plain.float(), exp.float(), rtol=1e-2, atol=1e-2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = dcp_lse_combine(ws, out, lse, row_counts=row_counts, gate=gate)
+    for _ in range(2):
+        draw()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_rounded_once(captured, expected())
+    del graph
+    for bad, why in (
+        (gate.float(), "bf16"),
+        (wide, "dense last dimension"),
+        (wide[:, 1 : hl * dim + 1], "32-bit"),
+    ):
+        try:
+            dcp_lse_combine(ws, out, lse, gate=bad)
+        except ValueError as error:
+            assert why in str(error), error
+        else:
+            raise AssertionError(f"a gate that is not {why} must be rejected")
+    _assert_rearmed(ws, group)
+    ws.close()
 
 
 def worker(rank, world, tokens):
@@ -486,6 +554,9 @@ def worker(rank, world, tokens):
         finally:
             IpcHeap.alloc_uncached = alloc
         dist.barrier(group=group.cpu_group)
+
+        for dim in (128, 512):
+            _check_gated_combine(group, hl, dim, tokens, max_tokens, row_counts, gen)
 
         if rank == 0:
             print("DCP_MAILBOX OK", flush=True)

@@ -48,6 +48,11 @@ def _row_empty(row, seqs, seq_lens, query_start_loc):
     return (row >= rows) | (buffer_load_i32(seq_lens, seq_index) == 0)
 
 
+def _sigmoid(value):
+    """fp32 sigmoid, written as aiter's Triton gate kernels write it."""
+    return fx.Float32(1.0) / (fx.Float32(1.0) + fx.exp2(value * fx.Float32(-LOG2E)))
+
+
 @flyc.jit
 def _poll_combine(
     poll,
@@ -67,9 +72,21 @@ def _poll_combine(
     result_stride_batch,
     result_stride_head,
     result_lse,
+    gated,
+    gate,
+    gate_stride_batch,
+    gate_stride_head,
 ):
     """Poll one head from all ranks, store its LSE combine, and rearm the slots."""
     word = tid * 2
+    if const_expr(gated):
+        # Issued ahead of the poll, which hides its latency.
+        gate_words = buf_copy_load(
+            ptr_buf_tensor(gate, fx.Int32, unit_elems=2, unit_stride=1),
+            (row * gate_stride_batch + local_head * gate_stride_head) // 2 + word,
+            fx.Int32,
+            unit_elems=2,
+        )
     own_slot = [
         (source * max_tokens + row) * heads + local_head for source in range(ranks)
     ]
@@ -123,6 +140,11 @@ def _poll_combine(
             accumulator[2 * index + 1] = accumulator[2 * index + 1] + zero.select(
                 fx.Float32(0.0), high * weights[source]
             )
+    if const_expr(gated):
+        for index in range_constexpr(2):
+            low, high = bf2_f32(gate_words[index])
+            accumulator[2 * index] = accumulator[2 * index] * _sigmoid(low)
+            accumulator[2 * index + 1] = accumulator[2 * index + 1] * _sigmoid(high)
     result_words = fx.Vector.from_elements(
         [
             bf16_pair(accumulator[0], accumulator[1]).bitcast(fx.Int32),
@@ -171,6 +193,9 @@ def make_kernel(key, name, threads, layout, half_span, epoch_base):
         res_sb: Int32,
         res_sh: Int32,
         res_lse: Int64,
+        gate: Int64,
+        gate_sb: Int32,
+        gate_sh: Int32,
         seq_lens: Int64,
         qsl: Int64,
         row_counts: Int64,
@@ -293,6 +318,10 @@ def make_kernel(key, name, threads, layout, half_span, epoch_base):
                     res_sb,
                     res_sh,
                     res_lse,
+                    key.gated,
+                    gate,
+                    gate_sb,
+                    gate_sh,
                 )
         finish(tid, state, epoch, nblk)
 
