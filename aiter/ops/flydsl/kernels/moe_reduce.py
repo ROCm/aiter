@@ -251,15 +251,7 @@ def _pick_reduce_block(model_dim: int, V: int) -> int:
     return block
 
 
-@aot_factory(
-    "moe_reduction",
-    sources=[
-        "kernels/mxfp4_gemm_common.py",
-        "kernels/act.py",
-        "kernels/dpp_utils.py",
-        "kernels/layout_utils.py",
-    ],
-)
+@aot_factory("moe_reduction")
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
     *,
