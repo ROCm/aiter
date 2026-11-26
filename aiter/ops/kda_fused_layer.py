@@ -932,7 +932,8 @@ class MXFP8ProjGemm:
             return self.gemm(a, w, kind, out16_ok)
         if _fusion_on("mxfp8_epilogue"):
             return self._fused_epilogue(a, w, kind, epilogue, ops, epi)
-        raw = self.gemm(a, w, kind)
+        # the gate adds fp32 dt_bias first, which promotes a bf16 result exactly
+        raw = self.gemm(a, w, kind, out16_ok=epilogue != "sigmoid_mul")
         lb = epi.get("lower_bound")
         if epilogue == "kda_gate":
             gate = (epi["dt_bias"], epi["A_log"], epi["num_heads"])
@@ -941,7 +942,7 @@ class MXFP8ProjGemm:
             gate = (epi["dt_bias"], epi["A_log"], epi["num_heads"], epi["dg"])
             return _TorchProj.gate_bwd_from_raw(raw, *gate, lb)
         if epilogue == "sigmoid_mul":
-            out = torch.sigmoid(raw)
+            out = torch.sigmoid(raw.float())
             return out if epi.get("aux") is None else out * epi["aux"].float()
         raise ValueError(f"unknown projection epilogue {epilogue!r}")
 
@@ -1112,14 +1113,15 @@ class _TorchProj:
 
     @staticmethod
     def gate_from_raw(raw, dt_bias, A_log, num_heads, lower_bound=None):
-        """Decay gate of the f_b GEMM output ``raw`` [M, H*K], fp32."""
-        z = (raw.float() + dt_bias.float()).unflatten(-1, (num_heads, -1))
+        """Decay gate of the f_b GEMM output ``raw`` [M, H*K] (fp32, or bf16
+        promoted exactly by the add), fp32."""
+        z = (raw + dt_bias.float()).unflatten(-1, (num_heads, -1))
         return kda_gate(z, A_log, lower_bound).flatten(-2)
 
     @staticmethod
     def gate_bwd_from_raw(raw, dt_bias, A_log, num_heads, dg, lower_bound=None):
         """(dz, per-element dA_log terms), fp32 [M, H*K]."""
-        z = (raw.float() + dt_bias.float()).unflatten(-1, (num_heads, -1))
+        z = (raw + dt_bias.float()).unflatten(-1, (num_heads, -1))
         return _TorchProj.gate_bwd_from_z(z, A_log, num_heads, dg, lower_bound)
 
     @staticmethod
@@ -1332,7 +1334,7 @@ def _kda_layer_fused_fwd(
         gp = gp.reshape(o.shape)
         on = _rb(normed * torch.sigmoid(gp)).reshape(B * T, -1)
         if not for_backward:
-            y = _rb(_proj_gemm(on, w.w_o, "fwd", cd, name="w_o"))
+            y = _rb(_proj_gemm(on, w.w_o, "fwd", cd, name="w_o", out16_ok=True))
             y = y.view(B, T, D).to(x.dtype)
     else:
         on = _proj_gemm(
@@ -1345,7 +1347,8 @@ def _kda_layer_fused_fwd(
             name="g_proj",
             aux=normed.reshape(B * T, -1),
         )
-        y = _proj_gemm(on, w.w_o, "fwd", cd, name="w_o").view(B, T, D).to(x.dtype)
+        y = _proj_gemm(on, w.w_o, "fwd", cd, name="w_o", out16_ok=True)
+        y = y.view(B, T, D).to(x.dtype)
     saved = {
         "xc": xc,
         "cd": cd,
@@ -1652,7 +1655,7 @@ class _KDALayerFused(torch.autograd.Function):
             )
             ctx.saved_state = (plan, s)
             B, T, D = x.shape
-            y = _proj_gemm(s["on"], w.w_o, "fwd", s["cd"], name="w_o")
+            y = _proj_gemm(s["on"], w.w_o, "fwd", s["cd"], name="w_o", out16_ok=True)
             return y.view(B, T, D).to(x.dtype)
         y, _ = _kda_layer_fused_fwd(
             x,
