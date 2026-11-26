@@ -163,19 +163,23 @@ def _per_element(
     """A per-block value broadcast to the [BLOCK_M, BLOCK_N] elements of its block."""
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    # one return: code after a constexpr-taken early return is still compiled,
+    # and the 1-D broadcast does not type-check on 2-D block scales
     if IS_2D_BLOCK:
-        return (
+        out = (
             v.expand_dims(axis=(1, 3))
             .broadcast_to(
                 SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, QUANT_BLOCK_SIZE
             )
             .reshape(BLOCK_M, BLOCK_N)
         )
-    return (
-        v.expand_dims(axis=2)
-        .broadcast_to(BLOCK_M, SCALE_BLOCK_N, QUANT_BLOCK_SIZE)
-        .reshape(BLOCK_M, BLOCK_N)
-    )
+    else:
+        out = (
+            v.expand_dims(axis=2)
+            .broadcast_to(BLOCK_M, SCALE_BLOCK_N, QUANT_BLOCK_SIZE)
+            .reshape(BLOCK_M, BLOCK_N)
+        )
+    return out
 
 
 @triton.jit
