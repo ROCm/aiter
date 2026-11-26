@@ -79,6 +79,12 @@ TILE_ROWS = (2, 4, 6, 8)
 QUERY_TERMS = 2
 Q_LANE_BYTES = 80
 
+# A page step's DMA extent (tokens, <= 128) sits in the union's bound words at
+# this bit: there it reads as the codes' extent in BF16 elements (tokens x 32)
+# at bit 16 of the tensor DMA descriptor word that holds it.
+_EXT_SHIFT = 21
+_EXT_MASK = 0xFF << _EXT_SHIFT
+
 _CACHE = {}
 
 
@@ -398,7 +404,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
     if tdm_fold and (async_dma or cta_dma or dbg in (4, 5)):
         raise ValueError("tdm_fold stages every plane with tensor DMAs")
     # The per-wave tensor DMA ring always holds nb - 1 pages' DMAs (zero-extent
-    # ones past the union's end): one unconditional tensor wait a page step.
+    # ones past the union's end): one unconditional tensor wait a page step,
+    # and a page's descriptors built from operands prepared once a CTA.
     full_ring = not (async_dma or cta_dma or dbg == 3)
     pairs = tq // 2
     all_rows = bool(all_rows)
@@ -662,6 +669,8 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         # keeps the stride a multiple of 16 B, so halving it first is exact and
         # spares the page step a 64-bit floor division.
         scale_page = fx.Int64(sk_block >> 1)
+        # The same in bytes, its low 4 bits known zero (see the ring's stage).
+        scale_bytes = fx.Int64(sk_block & -16)
 
         if const_expr(tdm_fold):
             # A folded pair's lower-addressed plane leads its 2-D DMA and lands
@@ -683,7 +692,43 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 return slot * (NWARP * WAVE_SLOT_BYTES)
             return (slot * NWARP + warp) * WAVE_SLOT_BYTES
 
-        def stage(u, slot):
+        # This wave's quarter of a page plane, in BF16 elements from the page.
+        quarter = {_ROW: _TOKENS * _ROW // 2, _SROW: _TOKENS * _SROW // 2}
+        if const_expr(full_ring):
+            # The ring's DMA operands, prepared once a CTA so that a page step
+            # builds its descriptors with a few SALU and no dependent chain:
+            # entries past the union's end read page 0 (an in-bounds address)
+            # with no tokens, and every union entry carries this wave's DMA
+            # extent (its tokens [32 w, top), top the tile's largest in-page
+            # bound) at bit _EXT_SHIFT of its bound word. A page step reads it
+            # with one v_readlane and an AND: its range is then known, so the
+            # descriptor's extent clamp and high word fold away.
+            for k in range_constexpr(meta_regs):
+                live = k * WAVE + lane < n_union
+                page_regs[k] = live.select(page_regs[k], fx.Int32(0))
+                bound_regs[k] = [live.select(w, fx.Int32(0)) for w in bound_regs[k]]
+            ext_regs = []
+            for k in range_constexpr(meta_regs):
+                top = fx.Int32(0)
+                for t in range_constexpr(tq):
+                    top = fx.max(top, (bound_regs[k][t // 4] >> (8 * (t % 4))) & 0xFF)
+                ext = fx.max(fx.Int32(0), top - warp * _TOKENS) << _EXT_SHIFT
+                if const_expr(meta_regs == 1):
+                    # The prologue stages entries 0..nb-2 (from their bounds);
+                    # a page step reads them again only past the union's end,
+                    # where the lane index wraps: no tokens.
+                    ext = (lane < nb - 1).select(fx.Int32(0), ext)
+                if const_expr(tq % 4):
+                    # The rows' bounds take the word's low tq % 4 bytes (all
+                    # bounds_of reads); the extent goes in its top bits.
+                    bound_regs[k][-1] = bound_regs[k][-1] | ext
+                    ext_regs.append(bound_regs[k][-1])
+                else:
+                    ext_regs.append(ext)
+
+        def stage_ring(u, base, step=False):
+            """Stage union page u into the slot at LDS ``base`` (the per-wave
+            tensor DMA ring); ``step``: a page step's (the prepared extent)."""
             page = page_of(u)
             if const_expr(dbg == 6):
                 # Debug: every DMA fetches the tile's first union page (L2-hot).
@@ -692,61 +737,65 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                         T.i32, lds_load(lay["upage"], fx.Int32, 1)[0]
                     )
                 )
-            bounds = bounds_of(u)
-            top = bounds[0]
-            for t in range_constexpr(1, tq):
-                top = fx.max(top, bounds[t])
-            # The quarter's tokens to fetch (the rest zero-fill). No upper clamp:
-            # an extent past the tile reads the same tile (the copy reads the tile
-            # only), and a min/max pair of this uniform value becomes v_med3_i32
-            # (no SALU form) that drags every descriptor word through VGPRs and
-            # back with v_readfirstlane; a single max keeps the descriptor in SALU.
-            if const_expr(full_ring):
-                # Past the union's end: no fetch (zero extent; the DMA zero-fills
-                # a slot no later page uses) from page 0, whatever the stale
-                # metadata reads.
-                live = u < n_union
-                page = live.select(page, fx.Int32(0))
-                top = live.select(top, fx.Int32(0))
-            valid = fx.max(fx.Int32(0), top - warp * _TOKENS)
-            base = slot_base(slot)
-            payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(
-                warp * (_TOKENS * _ROW // 2)
-            )
-            scales = fx.Int64(page) * scale_page + fx.Int64(
-                warp * (_TOKENS * _SROW // 2)
-            )
+            if const_expr(step):
+                word = meta_lane(ext_regs, u)
+                if const_expr(meta_regs > 1):
+                    # Past the union's end the lane index wraps onto live entries.
+                    word = (u < n_union).select(word, fx.Int32(0))
+                bits = word & _EXT_MASK
+                # Extents in BF16 elements: tokens x 32 (codes), x 4 (scales).
+                extent = {_ROW: bits >> 16, _SROW: bits >> 19}
+            else:
+                bounds = bounds_of(u)
+                top = bounds[0]
+                for t in range_constexpr(1, tq):
+                    top = fx.max(top, bounds[t])
+                # The quarter's tokens to fetch (the rest zero-fill). No upper
+                # clamp: an extent past the tile reads the same tile (the copy
+                # reads the tile only), and a min/max pair of this uniform value
+                # becomes v_med3_i32 (no SALU form) that drags every descriptor
+                # word through VGPRs and back with v_readfirstlane.
+                valid = fx.max(fx.Int32(0), top - warp * _TOKENS)
+                extent = {_ROW: valid * (_ROW // 2), _SROW: valid * (_SROW // 2)}
+            # The copy doubles the halved byte offset back; the low bits known
+            # zero fold the pair away (a page of scales is a multiple of 16 B).
+            src = {
+                _ROW: fx.Int64(page) * (PAGE * _ROW // 2),
+                _SROW: (fx.Int64(page) * scale_bytes) >> 1,
+            }
+
+            def gptr(p, row):
+                # The plane's pointer at this wave's quarter (loop-invariant).
+                return fx.add_offset(_gptr(p, fx.BFloat16, 16), warp * quarter[row])
+
             if const_expr(tdm_fold):
                 # A page's staging costs per tensor DMA it issues: one 2-D DMA
                 # moves both planes of a folded pair (the same rows and bytes).
-                for (ptr, far, plane, row, src), lead, (near, stride) in zip(
-                    (
-                        (key, value, _PLANE_K, _ROW, payload),
-                        (ks, vs, _PLANE_KS, _SROW, scales),
-                    ),
+                for (ptr, far, plane, row), lead, (near, stride) in zip(
+                    ((key, value, _PLANE_K, _ROW), (ks, vs, _PLANE_KS, _SROW)),
                     tdm_fold,
                     fold,
                 ):
                     if const_expr(lead == "-"):
                         for p, at in ((ptr, plane), (far, plane + _TOKENS * row)):
                             mem.tdm_copy(
-                                _gptr(p, fx.BFloat16, 16),
-                                src,
+                                gptr(p, row),
+                                src[row],
                                 base + at,
                                 (_TOKENS * row // 2,),
                                 (1,),
-                                (valid * (row // 2),),
+                                (extent[row],),
                                 8,
                                 8,
                             )
                     else:
                         mem.tdm_copy(
-                            _gptr(near, fx.BFloat16, 16),
-                            src,
+                            gptr(near, row),
+                            src[row],
                             base + plane,
                             (2, _TOKENS * row // 2),
                             (stride, 1),
-                            (None, valid * (row // 2)),
+                            (None, extent[row]),
                             8,
                             8,
                         )
@@ -755,23 +804,23 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 ((key, _PLANE_K),) if dbg == 5 else ((key, _PLANE_K), (value, _PLANE_V))
             ):
                 mem.tdm_copy(
-                    _gptr(ptr, fx.BFloat16, 16),
-                    payload,
+                    gptr(ptr, _ROW),
+                    src[_ROW],
                     base + plane,
                     (_TOKENS * _ROW // 2,),
                     (1,),
-                    (valid * (_ROW // 2),),
+                    (extent[_ROW],),
                     8,
                     8,
                 )
             for ptr, plane in (() if dbg == 4 else ((ks, _PLANE_KS), (vs, _PLANE_VS))):
                 mem.tdm_copy(
-                    _gptr(ptr, fx.BFloat16, 16),
-                    scales,
+                    gptr(ptr, _SROW),
+                    src[_SROW],
                     base + plane,
                     (_TOKENS * _SROW // 2,),
                     (1,),
-                    (valid * (_SROW // 2),),
+                    (extent[_SROW],),
                     8,
                     8,
                 )
@@ -836,16 +885,14 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                         8,
                     )
 
-        if const_expr(async_dma):
-            stage = stage_async  # noqa: F811
-        if const_expr(cta_dma):
-            stage = stage_cta  # noqa: F811
+        # async_dma and cta_dma stage with their own (dbg 3 stages nothing).
+        stage = stage_cta if cta_dma else stage_async
 
         if const_expr(full_ring):
             # The ring always holds nb - 1 pages' DMAs, so the walk's waits need
             # no bound checks.
             for ahead in range_constexpr(nb - 1):
-                stage(fx.Int32(ahead), fx.Int32(ahead))
+                stage_ring(fx.Int32(ahead), slot_base(fx.Int32(ahead)))
         elif const_expr(dbg != 3):
             if n_union > 0:
                 stage(fx.Int32(0), fx.Int32(0))
@@ -903,6 +950,11 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         lo = warp * _TOKENS
         hi = lo + _TOKENS
         q_resident = [q_row(t) for t in range_constexpr(tq)] if q_regs else None
+        if const_expr(full_ring):
+            # The slot a page step stages (nb - 1 pages ahead), its LDS base
+            # carried in an SGPR: slots nb - 1, 0, 1, ..., nb - 1, 0, ... (no
+            # remainder and no slot arithmetic ahead of the step's DMAs).
+            initial.append(slot_base(fx.Int32(nb - 1)))
 
         def tail_mask(raw, bound):
             """-inf past the row's in-page bound (its tail page: rare)."""
@@ -934,6 +986,9 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         for u_i, state in range(fx.Int32(0), n_union, fx.Int32(1), init=initial):
             u = fx.Int32(u_i)
             slot = u % nb
+            if const_expr(full_ring):
+                ahead_base = state[-1]
+                state = list(state)[:-1]
             if const_expr(dbg == 3):
                 # Debug: the attention math on whatever the ring holds (no DMA).
                 pass
@@ -979,8 +1034,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 # (the ring is always full: no bound checks, no branches).
                 tdm_ops.tensor_wait((nb - 2) * page_dmas)
             if const_expr(full_ring):
-                ahead = slot + (nb - 1)
-                stage(u + (nb - 1), (ahead >= nb).select(ahead - nb, ahead))
+                stage_ring(u + (nb - 1), ahead_base, True)
                 # The page's DMAs issue together at the step head (spread over
                 # the step they measured slower).
                 fx.rocdl.sched_barrier(0)
@@ -1186,6 +1240,12 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 if (b0 <= lo) & (b1 > lo):
                     grp = grp[:10] + run_rows(grp[10:], (r1,))
                 next_state.extend(grp)
+            if const_expr(full_ring):
+                next_state.append(
+                    (ahead_base >= slot_base(fx.Int32(nb - 1))).select(
+                        slot_base(fx.Int32(0)), ahead_base + NWARP * WAVE_SLOT_BYTES
+                    )
+                )
             final = yield next_state
 
         # ---- merge the waves' partials row by row, store (as pa_sparse_prefill_nvfp4) ----
