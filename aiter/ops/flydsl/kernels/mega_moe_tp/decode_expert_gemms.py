@@ -183,7 +183,7 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
         topk_ids, topk_w: (n, 4) int32 ids / float32 weights.
 
     Returns:
-        ``(slots, shared_out)``: (n, 4, H) BF16 weighted routed slot rows (zero for an id outside [0, E)) and (n, H) BF16
+        ``(slots, shared_out)``: (n, 4, H) BF16 weighted routed slot rows (rows of ids outside [0, E) are not written) and (n, H) BF16
         shared-expert output, for the caller's slot + shared reduction.
     """
     n, dev = plan.n, xq.device
@@ -198,9 +198,9 @@ def decode_expert_gemms(plan, xq, xs, q8, s8, w, shared, topk_ids, topk_w):
     nv = torch.empty(rows, device=dev, dtype=torch.int32)
     q = torch.empty((rows, 384), device=dev, dtype=torch.uint8)
     s = torch.empty((rows, 24), device=dev, dtype=torch.uint8)
-    # zeros, not empty: GEMM2 writes only the slots of routed ids in [0, E); an id outside it (a dropped route) must
-    # read as a zero row in the caller's slot reduction, not as uninitialized memory
-    out = torch.zeros((n, 4, H), device=dev, dtype=torch.bfloat16)
+    # a slot row is written only for an id in [0, E): the caller's reduction masks dropped routes
+    # (``moe_slots_shared_reduce(..., topk_ids=, num_experts=)``); zero-filling here costs ~2-4 us per layer
+    out = torch.empty((n, 4, H), device=dev, dtype=torch.bfloat16)
     hq = torch.empty((n, 768), device=dev, dtype=torch.uint8)
     hs = torch.empty((n, 24), device=dev, dtype=torch.uint8)
     sh_out = torch.empty((n, H), device=dev, dtype=torch.bfloat16)
