@@ -18,6 +18,8 @@ import torch
 from torch import Tensor
 
 BLOCK_M = 256
+# The kernels' scale staging is laid out for these (GLM-5.3-Flash) dimensions.
+HIDDEN, INTER = 4096, 1024
 # Stage 2's [T * topk, D] bf16 slot buffer is addressed through 32-bit buffer
 # ranges: moe_bs_forward runs larger T in token chunks no bigger than the
 # largest validated buffer (T 32768, top-k 9, D 4096).
@@ -36,7 +38,7 @@ def e8m0_from_pow2(scale: Tensor) -> Tensor:
 @functools.lru_cache(maxsize=64)
 def _compile(K, N, gather, topk, swiglu_clamp, half_skip):
     # Call positionally: lru_cache keys keyword and positional calls apart.
-    from .kernels.moe_blockscale_pp.gemm import compile_moe_bs_gemm_8w
+    from .kernels.moe_blockscale_pp import compile_moe_bs_gemm_8w
 
     return compile_moe_bs_gemm_8w(
         K=K,
@@ -152,8 +154,9 @@ def moe_bs_forward(
     x bf16 ``[T, D]``; topk_ids / topk_weights ``[T, topk]`` (ids outside
     ``[0, E)`` contribute nothing; a token's ids must be distinct, as from a
     top-k router: ``moe_sorting`` keeps one route of a repeated expert); w13
-    fp8 ``[E, 2I, D]`` (gate rows, then up rows) and w2 fp8 ``[E, D, I]`` in ``shuffle_weight(w, (16, 16))`` layout;
-    w13_scale / w2_scale their 128x128 block scales as e8m0 exponent bytes
+    fp8 ``[E, 2I, D]`` (gate rows, then up rows) and w2 fp8 ``[E, D, I]`` in
+    ``shuffle_weight(w, (16, 16))`` layout, D = 4096 and I = 1024; w13_scale /
+    w2_scale their 128x128 block scales as e8m0 exponent bytes
     (``e8m0_from_pow2`` of power-of-two fp32 scales). act = ``silu(min(g, L)) *
     clamp(u, -L, L)`` for ``swiglu_limit`` L > 0, else ``silu(g) * u``.
     Activations are quantized to fp8 with power-of-two 1x128 scales before
@@ -169,6 +172,11 @@ def moe_bs_forward(
     E, I2, _ = w13.shape
     inter = I2 // 2
     topk = topk_ids.shape[1]
+    if (D, inter) != (HIDDEN, INTER) or w13.shape[2] != D or w2.shape != (E, D, inter):
+        raise ValueError(
+            f"moe_bs_forward supports D {HIDDEN} / I {INTER}: x {tuple(x.shape)}, "
+            f"w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}"
+        )
     if out is None:
         out = torch.empty_like(x)
     if T == 0:
@@ -191,7 +199,8 @@ def moe_bs_forward(
             )
         return out
     # The sort and the reduction both skip ids outside [0, E): no masking pass.
-    ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+    # Clamp before narrowing: an int64 id such as 2**32 + 5 must not become expert 5.
+    ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.clamp(-1, E).int()
     sorted_ids, _, sorted_eids, num_valid, _ = moe_sorting(
         ids, topk_weights.float(), E, D, x.dtype, BLOCK_M, accumulate=False
     )
@@ -305,7 +314,7 @@ def run_moe_bs_pp_impl(request, config_string: str) -> Tensor:
         unsupported = "weights other than fp8 e4m3"
     elif not (getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
         unsupported = "weights not marked is_shuffled"
-    elif w1.shape[1] != 2 * w2.shape[2] or w1.shape[2] != w2.shape[1]:
+    elif w1.shape[1:] != (2 * INTER, HIDDEN) or w2.shape[1:] != (HIDDEN, INTER):
         unsupported = f"weight shapes {tuple(w1.shape)} / {tuple(w2.shape)}"
     elif request.expert_mask is not None:
         unsupported = "expert parallelism (expert_mask)"

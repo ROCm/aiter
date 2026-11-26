@@ -8,7 +8,8 @@ candidate is captured into a warm HIP graph of 10 calls, the graphs are
 replayed alternately for 21 rounds, and the median per call is reported.
 
   flydsl  fused_moe on a one-row tuned table naming impl__flydsl_bspp__default
-  main    fused_moe on the GLM-5.3-Flash tuned tables at --main-ref
+  main    fused_moe on the GLM-5.3-Flash tuned tables at --main-ref (default: the
+          merge-base with origin/main); dropped when those tables run FlyDSL too
   hk      aiter.ops.hk_fp8_moe (PR 6742), when importable
 
 Every output is checked against the FP32 reference (relative L2 < 0.06), and
@@ -39,7 +40,6 @@ from op_tests.test_moe_blockscale_pp import (  # noqa: E402
     ROUTED_EXPERTS,
     TOL,
     bspp_row,
-    dequant,
     make_routing,
     rel_l2,
     run_torch,
@@ -53,11 +53,12 @@ GLM_CSV = {
 }
 
 
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True)
+
+
 def main_rows(ref, topk):
-    text = subprocess.check_output(
-        ["git", "-C", str(ROOT), "show", f"{ref}:{GLM_CSV[topk]}"], text=True
-    )
-    return list(csv.DictReader(io.StringIO(text)))
+    return list(csv.DictReader(io.StringIO(git("show", f"{ref}:{GLM_CSV[topk]}"))))
 
 
 def capture(call, reps):
@@ -97,9 +98,7 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
     w13s.is_shuffled = w2s.is_shuffled = True
     x, ids, tw = make_routing(tokens, E, topk, seed=1)
     rows = torch.linspace(0, tokens - 1, min(tokens, 256)).long()
-    ref = run_torch(
-        x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], 0.0
-    )
+    ref = run_torch(x[rows], (w13, s13, w2, s2), tw[rows], ids[rows], 0.0)
 
     def aiter_call(out):
         return lambda: fused_moe(
@@ -125,6 +124,13 @@ def bench_case(tokens, topk, main_ref, reps, rounds):
             info[name] = {"kernels": kernels(call)}
         info[name]["err"] = rel_l2(out[rows], ref)
     assert any(k.startswith("flydsl_moe_bs") for k in info["flydsl"]["kernels"])
+    if any(k.startswith("flydsl_moe_bs") for k in info["main"]["kernels"]):
+        aiter.logger.warning(
+            "%s already runs FlyDSL at T=%d; dropping main (pass an older --main-ref)",
+            main_ref,
+            tokens,
+        )
+        del graphs["main"], info["main"]
     try:
         from aiter.ops.hk_fp8_moe import hk_fp8_moe
     except ImportError:
@@ -177,8 +183,8 @@ def main():
     parser.add_argument("-k", "--topk", type=int, nargs="*", default=[8, 9])
     parser.add_argument(
         "--main-ref",
-        default="origin/main",
-        help="git ref whose GLM-5.3-Flash tuned tables define the main candidate",
+        help="git ref whose GLM-5.3-Flash tuned tables define the main candidate "
+        "(default: the merge-base of HEAD and origin/main)",
     )
     parser.add_argument("--reps", type=int, default=10, help="calls per graph")
     parser.add_argument("--rounds", type=int, default=21, help="alternating replays")
@@ -186,11 +192,12 @@ def main():
     args = parser.parse_args()
     torch.set_grad_enabled(False)
     torch.set_default_device("cuda")
+    main_ref = args.main_ref or git("merge-base", "HEAD", "origin/main").strip()
 
     result = []
     for topk in args.topk:
         for tokens in args.tokens:
-            result += bench_case(tokens, topk, args.main_ref, args.reps, args.rounds)
+            result += bench_case(tokens, topk, main_ref, args.reps, args.rounds)
     if args.json:
         args.json.write_text(json.dumps(result, indent=1) + "\n")
     df = pd.DataFrame(result).drop(columns=["samples", "kernels"])
