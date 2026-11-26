@@ -36,6 +36,7 @@ _convert_to_mxfp8_kernel_repr = make_kernel_repr(
         "USE_SR",
         "USE_ASM",
         "TE_SCALE",
+        "DEQUANT_OUT",
     ],
 )
 _convert_from_mxfp8_kernel_repr = make_kernel_repr(
@@ -149,6 +150,32 @@ def _generate_randval(m, n, philox_seed, philox_offset):
 
 
 @triton.jit
+def _per_element(
+    v,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    IS_2D_BLOCK: tl.constexpr,
+):
+    """A per-block value broadcast to the [BLOCK_M, BLOCK_N] elements of its block."""
+    SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    if IS_2D_BLOCK:
+        return (
+            v.expand_dims(axis=(1, 3))
+            .broadcast_to(
+                SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, QUANT_BLOCK_SIZE
+            )
+            .reshape(BLOCK_M, BLOCK_N)
+        )
+    return (
+        v.expand_dims(axis=2)
+        .broadcast_to(BLOCK_M, SCALE_BLOCK_N, QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_M, BLOCK_N)
+    )
+
+
+@triton.jit
 def _pack_fp8(
     x,
     scales,
@@ -180,21 +207,13 @@ def _pack_fp8(
         e = scales.to(tl.int32)
         rcp_bits = tl.where(e == 254, 0x00400000, (254 - e) << 23)
         rcp_bits = tl.where(e == 255, 0x7FC00000, rcp_bits)
-        rcp = rcp_bits.to(tl.float32, bitcast=True)
-        if IS_2D_BLOCK:
-            rcp = (
-                rcp.expand_dims(axis=(1, 3))
-                .broadcast_to(
-                    SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, QUANT_BLOCK_SIZE
-                )
-                .reshape(BLOCK_M, BLOCK_N)
-            )
-        else:
-            rcp = (
-                rcp.expand_dims(axis=2)
-                .broadcast_to(BLOCK_M, SCALE_BLOCK_N, QUANT_BLOCK_SIZE)
-                .reshape(BLOCK_M, BLOCK_N)
-            )
+        rcp = _per_element(
+            rcp_bits.to(tl.float32, bitcast=True),
+            BLOCK_M,
+            BLOCK_N,
+            QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK,
+        )
         y = tl.clamp(x.to(tl.float32) * rcp, -max_pos, max_pos)
         return y.to(float8_dtype, fp_downcast_rounding="rtne")
 
@@ -410,6 +429,7 @@ def _convert_to_mxfp8_kernel(
     USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
     TE_SCALE: tl.constexpr = False,
+    DEQUANT_OUT: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -431,7 +451,12 @@ def _convert_to_mxfp8_kernel(
         x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16
     )
 
-    float8_dtype = y_ptr.type.element_ty
+    if DEQUANT_OUT:
+        # y receives the dequantized values (TE scaling, e4m3)
+        tl.static_assert(TE_SCALE)
+        float8_dtype: tl.constexpr = tl.float8e4nv
+    else:
+        float8_dtype: tl.constexpr = y_ptr.type.element_ty
     tl.static_assert(float8_dtype == tl.float8e4nv or float8_dtype == tl.float8e5)
 
     x = tl.load(x_ptr + offs_x)
@@ -459,6 +484,19 @@ def _convert_to_mxfp8_kernel(
         float8_dtype=float8_dtype,
         TE_SCALE=TE_SCALE,
     )
+    if DEQUANT_OUT:
+        # TE exp2f(byte): 2^(byte - 127), 2^-127 as a subnormal, 255 -> NaN
+        e = scales.to(tl.int32)
+        sc_bits = tl.where(e == 0, 0x00400000, e << 23)
+        sc_bits = tl.where(e == 255, 0x7FC00000, sc_bits)
+        sc = _per_element(
+            sc_bits.to(tl.float32, bitcast=True),
+            BLOCK_M,
+            BLOCK_N,
+            QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK,
+        )
+        y = y.to(tl.float32) * sc
 
     offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
     tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))

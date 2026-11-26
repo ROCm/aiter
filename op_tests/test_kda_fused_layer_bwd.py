@@ -760,6 +760,11 @@ def test_kda_mxfp8_gemm(proj, kind, m, d, h, k, r, dtype):
     mxfp8_linear.LAST_IMPLS.clear()
     out, us = run_perftest(hook.gemm, a, wt, kind, num_iters=10, num_warmup=2)
     impl = ",".join(sorted(mxfp8_linear.LAST_IMPLS))
+    mxfp8_linear.set_mxfp8_fastpath(False)
+    try:
+        plain = hook.gemm(a, wt, kind)
+    finally:
+        mxfp8_linear.set_mxfp8_fastpath(None)
     sc_ = ref.abs().max().clamp_min(1e-6)
     err = checkAllclose(
         (ref / sc_).to(dtypes.fp32),
@@ -780,6 +785,8 @@ def test_kda_mxfp8_gemm(proj, kind, m, d, h, k, r, dtype):
         "rel l2": _rel_l2(out, ref),
         "quant bitexact": bitexact,
         "hip quant bitexact": hip_bitexact,
+        # the numerics-neutral fast paths against the plain path, bit for bit
+        "fastpath bitwise": torch.equal(out, plain),
     }
 
 
@@ -870,6 +877,19 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
         "mxfp8 TFLOPS": flops / us / 1e6,
         "bwd gemms": gemms,
     }
+    mxfp8_linear.set_mxfp8_fastpath(False)
+    try:
+        plain = block("fused", "mxfp8")()
+    finally:
+        mxfp8_linear.set_mxfp8_fastpath(None)
+    differ = [
+        gname
+        for gname, o, pl in zip(names, [out[0], *out[1]], [plain[0], *plain[1]])
+        if not torch.equal(o, pl)
+    ]
+    ret["fastpath bitwise"] = not differ
+    if differ:
+        failed.append("fast path not bit-identical: " + ",".join(differ))
     rel, frac, delta = grade(out, emulated, "emulated")
     ret.update({"rel l2": rel, "err": frac, "max delta": delta})
     if b * t <= ORACLE_MAX_TOKENS:
@@ -1098,9 +1118,21 @@ def main():
                 ],
                 layer_axes,
             )
-            bad_gemm = gemm_df[(gemm_df["err"] != 0) | ~gemm_df["quant bitexact"]]
+            bad_gemm = gemm_df[
+                (gemm_df["err"] != 0)
+                | ~gemm_df["quant bitexact"]
+                | ~gemm_df["fastpath bitwise"]
+            ]
             assert bad_gemm.empty, "mxfp8 GEMMs off the emulation:\n" + bad_gemm[
-                ["proj", "kind", "m", "impl", "err", "quant bitexact"]
+                [
+                    "proj",
+                    "kind",
+                    "m",
+                    "impl",
+                    "err",
+                    "quant bitexact",
+                    "fastpath bitwise",
+                ]
             ].to_string(index=False)
             mx_rows = []
             for combo in args.fusions:
