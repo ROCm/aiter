@@ -533,14 +533,17 @@ def test_tilt_scaled_params_carry_the_value_shift_and_score_multiplier():
     assert sol_tilt._TILT_W_MAX / 2 < sigma / u2 <= sol_tilt._TILT_W_MAX * (1 + 1e-6)
 
 
-def make_q_abs_max_inputs(kind, *, batch=2, seqlen=600, heads=3, q_tile=256):
+def make_q_abs_max_inputs(
+    kind, *, batch=2, seqlen=600, heads=3, q_tile=256, head_dim=HEAD_DIM
+):
     """(keyword arguments of sol_q_abs_max, Q as the kernel decodes it in fp32) for one Q kind.
 
     kind is "fp8" or "bf16" for a Q read as stored, "mxfp8" for E8M0-scaled codes, or "rotated"
-    for a BF16 source Q that a packer takes through the hd128 rotation.
+    for a BF16 source Q that a packer takes through the hd128 rotation, on each 128-channel half
+    at head dim 256.
     """
     q = torch.randn(
-        (batch, seqlen, heads, HEAD_DIM), dtype=torch.float32, device="cuda"
+        (batch, seqlen, heads, head_dim), dtype=torch.float32, device="cuda"
     )
     kwargs = {"q_tile": q_tile, "q_scale": None, "rotate": kind == "rotated"}
     if kind == "fp8":
@@ -553,9 +556,10 @@ def make_q_abs_max_inputs(kind, *, batch=2, seqlen=600, heads=3, q_tile=256):
         q = q.to(torch.bfloat16)
         real = q.float()
         if kind == "rotated":
-            rotated = torch.empty_like(q)
-            rotate_activation_hd128(rotated, q)
-            real = rotated.float()
+            halves = q.unflatten(-1, (-1, HEAD_DIM)).flatten(2, 3)
+            rotated = torch.empty_like(halves)
+            rotate_activation_hd128(rotated, halves)
+            real = rotated.view(q.shape).float()
     return {"q": q, **kwargs}, real
 
 
@@ -593,9 +597,19 @@ def test_rotated_hd256_q_abs_max_rotates_each_half():
     assert torch.equal(heads, tiles.amax(dim=1))
 
 
-@pytest.mark.parametrize("kind", ["fp8", "bf16", "mxfp8", "rotated"])
-def test_q_abs_max_compiles_fullgraph_and_matches_eager(kind):
-    kwargs, _ = make_q_abs_max_inputs(kind, q_tile=64)
+@pytest.mark.parametrize(
+    "kind, head_dim",
+    [
+        ("fp8", HEAD_DIM),
+        ("bf16", HEAD_DIM),
+        ("mxfp8", HEAD_DIM),
+        ("rotated", HEAD_DIM),
+        ("mxfp8", 256),
+        ("rotated", 256),
+    ],
+)
+def test_q_abs_max_compiles_fullgraph_and_matches_eager(kind, head_dim):
+    kwargs, _ = make_q_abs_max_inputs(kind, q_tile=64, head_dim=head_dim)
     _assert_same(
         sol_q_abs_max(**kwargs), _compiled(sol_q_abs_max)(**kwargs), "q_abs_max"
     )
@@ -907,23 +921,27 @@ def _compiled(fn):
 
 
 @pytest.mark.parametrize(
-    "k_format, v_format",
+    "k_format, v_format, head_dim",
     [
-        ("e4m3", "e4m3"),
-        ("int8", "e4m3"),
-        ("bf16", "bf16"),
-        ("mxfp8", "e4m3"),
-        pytest.param("mxfp6", "mxfp6_fp6_p", marks=requires_gfx950),
-        pytest.param("mxfp4", "mxfp4_fp6_p", marks=requires_gfx950),
-        pytest.param("e4m3", "mxfp6_fp6_p", marks=requires_gfx950),
+        ("e4m3", "e4m3", HEAD_DIM),
+        ("int8", "e4m3", HEAD_DIM),
+        ("bf16", "bf16", HEAD_DIM),
+        ("mxfp8", "e4m3", HEAD_DIM),
+        pytest.param("mxfp6", "mxfp6_fp6_p", HEAD_DIM, marks=requires_gfx950),
+        pytest.param("mxfp4", "mxfp4_fp6_p", HEAD_DIM, marks=requires_gfx950),
+        pytest.param("e4m3", "mxfp6_fp6_p", HEAD_DIM, marks=requires_gfx950),
+        ("bf16", "bf16", 256),
+        pytest.param("mxfp8", "e4m3", 256, marks=requires_gfx950),
+        pytest.param("mxfp6", "mxfp6_fp6_p", 256, marks=requires_gfx950),
+        pytest.param("mxfp4", "mxfp4_fp6_p", 256, marks=requires_gfx950),
     ],
 )
-def test_tilt_planes_compile_fullgraph_and_match_eager(k_format, v_format):
-    inputs = make_tilt_inputs(k_format, v_format)
+def test_tilt_planes_compile_fullgraph_and_match_eager(k_format, v_format, head_dim):
+    inputs = make_tilt_inputs(k_format, v_format, head_dim=head_dim)
     eager = sol_tilt_planes(**inputs)
     compiled = _compiled(sol_tilt_planes)(**inputs)
     # A packer leaves its data slack as allocated, so only the planes themselves must agree.
-    packed = k_format in PACKED_K or v_format in PACKED_V
+    packed = _k_packed(k_format, head_dim) or v_format in PACKED_V
     _assert_same(tuple(eager), tuple(compiled), "planes", tails=not packed)
     for name in ("k", "v", "k_scale", "v_scale"):
         view = getattr(eager, f"mean_{name}")
@@ -957,19 +975,29 @@ def test_tilt_factors_compile_fullgraph_and_match_eager():
 
 
 @pytest.mark.parametrize(
-    "kind",
+    "kind, head_dim",
     [
-        "fp8",
-        "bf16",
-        "mxfp8",
-        pytest.param("mxfp4", marks=requires_gfx950),
-        pytest.param("mxfp6", marks=requires_gfx950),
+        ("fp8", HEAD_DIM),
+        ("bf16", HEAD_DIM),
+        ("mxfp8", HEAD_DIM),
+        pytest.param("mxfp4", HEAD_DIM, marks=requires_gfx950),
+        pytest.param("mxfp6", HEAD_DIM, marks=requires_gfx950),
+        pytest.param("mxfp8", 256, marks=requires_gfx950),
+        pytest.param("mxfp6", 256, marks=requires_gfx950),
+        pytest.param("mxfp4", 256, marks=requires_gfx950),
     ],
 )
-def test_jensen_cap_compiles_fullgraph_and_matches_eager(kind):
-    kwargs, prep = make_jensen_inputs(kind)
+def test_jensen_cap_compiles_fullgraph_and_matches_eager(kind, head_dim):
+    """At head dim 256 the MXFP6 and MXFP8 caps rotate and pack the variance again inside the
+    graph; that pack leaves the slack of its records and scale as allocated."""
+    kv_tile = 64 if head_dim == 256 else SOL_ATTN_TS_KV
+    kwargs, prep = make_jensen_inputs(kind, kv_tile=kv_tile, head_dim=head_dim)
     _cap_most(kind, kwargs, prep)
-    _assert_same(sol_jensen_cap(**kwargs), _compiled(sol_jensen_cap)(**kwargs), "cap")
+    eager = sol_jensen_cap(**kwargs)
+    compiled = _compiled(sol_jensen_cap)(**kwargs)
+    repack = head_dim == 256 and kind != "mxfp4"
+    _assert_same(eager[:2], compiled[:2], "cap", tails=not repack)
+    _assert_same(eager[2], compiled[2], "cap gain")
 
 
 @pytest.mark.parametrize("path", ["factors", "planes"])
