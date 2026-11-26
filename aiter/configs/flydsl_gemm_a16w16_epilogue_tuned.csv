@@ -1,0 +1,1 @@
+gfx,cu_num,M,N,K,layout,epilogue,dtype,outdtype,libtype,block_m,block_n,block_k,stages,split_k,m_waves,n_waves,k_waves,group_m,hti,us,kernelName,err_ratio,tflops,bw

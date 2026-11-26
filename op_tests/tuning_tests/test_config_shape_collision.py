@@ -92,6 +92,7 @@ FAMILIES = [
         "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
     ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A16W16_EPILOGUE", "flydsl_gemm_a16w16_epilogue_tuned"),
     ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "tuned_swiglu_limit_fmoe"),
@@ -466,6 +467,11 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_conv3d_bf16(self):
         self._check_family("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d")
+
+    def test_gemm_a16w16_epilogue(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A16W16_EPILOGUE", "flydsl_gemm_a16w16_epilogue_tuned"
+        )
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
