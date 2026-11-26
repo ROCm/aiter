@@ -808,6 +808,7 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     flops = layer_flops(b, t, d, h, k, w, r, chunk) * 4 // 3
     ret = {
         "gfx": get_gfx_runtime(),
+        "precision": kda_fused_layer.kda_precision(),
         "mxfp8 us": us,
         "mxfp8 TFLOPS": flops / us / 1e6,
         "err": grade(out, emulated, MXFP8_TIGHT_TOL, "mxfp8 aiter vs emulated"),
