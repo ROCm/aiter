@@ -768,8 +768,9 @@ def test_kda_wgrad_split(m, hk, d, dtype):
         "use_half_tile_interleaved": True,
     }
     # (config, output dtype); the bf16 rows round the exact sums once, so
-    # they are bit-exact too. hti256 bf16 is #8739's HTI path as it was (its
-    # fp32-C variant is rejected: C does not fit next to the A/B stages).
+    # they are bit-exact too. hti256 bf16 runs the HTI store as #8739 has it
+    # (each wave row reads back its own C rows); hti256 fp32 runs the
+    # realigned, fenced store that fp32 C needs.
     configs = {f"selected_{source}": (selected, torch.float32)}
     configs.update({f"ft_sk{sk}": (ft(sk), torch.float32) for sk in WGRAD_SPLITS})
     configs["hti256"] = (hti256, torch.float32)
@@ -794,9 +795,8 @@ def test_kda_wgrad_split(m, hk, d, dtype):
                 "epi_group": 1,
             },
         )
-        # split-K takes at most 2048 output tiles, HTI an even count of K
-        # tiles and a C that fits next to the A/B stages: such a config is not
-        # launchable, not wrong
+        # split-K takes at most 2048 output tiles and HTI an even count of K
+        # tiles: such a config is not launchable, not wrong
         if not legal(cfg):
             continue
         out = torch.full((hk, d), float("nan"), dtype=out_dtype)

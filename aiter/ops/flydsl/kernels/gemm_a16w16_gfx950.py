@@ -256,6 +256,9 @@ def make_gemm_a16w16_gfx950_param(
             raise ValueError("KDA epilogues need fixed columns per thread")
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     c_tile_bytes = k_waves * block_m * block_n * c_dbytes
+    if use_half_tile_interleaved and split_k == 1 and c_fp32:
+        # the unsplit fp32-C HTI store reuses two quarters of shared C
+        c_tile_bytes //= 2
     smem_bytes = max(smem_bytes, c_tile_bytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
@@ -1294,6 +1297,18 @@ def gemm_a16w16_hti_gfx950_kernel(
         else elem_dtype
     )
     c_dtype = fx.Float32 if const_expr(param.c_fp32) else global_output_dtype
+    # The two wave rows (wid // n_waves) run one barrier apart from the
+    # prologue on, and only the split-K store realigns them. The unsplit store
+    # is safe out of step only if each row reads back the C it wrote: MMA rows
+    # alternate between the two in 16-row blocks, so a store pass must cover
+    # 2 * 16 rows. Otherwise (and for fp32 C, whose two quarters alias every
+    # A and B stage) the store realigns the rows and fences its barriers.
+    c_rows_per_pass = block_threads * cshuffle_r2g_vec_size // half_block_n
+    aligned_c_store = not is_split_k and (
+        param.c_fp32 or c_rows_per_pass != 2 * param.mma_m
+    )
+    # fp32 C reuses two quarters; it does not fit beside the stages otherwise
+    c_quarters = 2 if const_expr(param.c_fp32 and not is_split_k) else 4
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -1332,7 +1347,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[c_dtype, block_m * block_n, 16]
+        c: fx.Array[c_dtype, c_quarters * half_block_m * half_block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -1499,7 +1514,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             rocdl.sched_barrier(0)
 
     def half_c_base(m_part, n_part):
-        tile_idx = m_part * 2 + n_part
+        tile_idx = (m_part * 2 + n_part) % c_quarters
         return smem_c + tile_idx * half_block_m * half_block_n
 
     def store_half_tile_to_lds(m_part, n_part, frag_C):
@@ -1700,36 +1715,55 @@ def gemm_a16w16_hti_gfx950_kernel(
     a1 = load_a_fragment(1, 1)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
-
-    store_half_tile_to_lds(0, 0, c00)
-    consume(c10, a1, b0, False)
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-    store_half_tile_to_lds(0, 1, c01)
-    consume(c11, a1, b1, False)
-    rocdl.sched_barrier(0)
-    if const_expr(is_split_k):
+    if const_expr(aligned_c_store):
+        consume(c10, a1, b0, False)
+        consume(c11, a1, b1, False)
+        rocdl.sched_barrier(0)
         if wid // n_waves == 0:
+            # the row one barrier behind catches up
             rocdl.s_barrier()
-        rocdl.s_barrier()
-        store_half_tile_to_lds(1, 0, c10)
-        store_half_tile_to_lds(1, 1, c11)
-        splitk_protocol.wait_until_initialized(expected_signal)
+        gpu.barrier()
+        store_half_tile_to_lds(0, 0, c00)
+        store_half_tile_to_lds(0, 1, c01)
+        gpu.barrier()
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
+        gpu.barrier()
+        store_half_tile_to_lds(1, 0, c10)
+        store_half_tile_to_lds(1, 1, c11)
+        gpu.barrier()
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
-        wait_vmcnt_and_barrier(0)
-        store_half_tile_to_global(0, 0)
-        store_half_tile_to_global(0, 1)
-        wait_vmcnt_and_barrier(0)
-        store_half_tile_to_lds(1, 0, c10)
-        store_half_tile_to_lds(1, 1, c11)
-        wait_vmcnt_and_barrier(0)
-        store_half_tile_to_global(1, 0)
-        store_half_tile_to_global(1, 1)
+        store_half_tile_to_lds(0, 0, c00)
+        consume(c10, a1, b0, False)
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier()
+        rocdl.sched_barrier(0)
+        store_half_tile_to_lds(0, 1, c01)
+        consume(c11, a1, b1, False)
+        rocdl.sched_barrier(0)
+        if const_expr(is_split_k):
+            if wid // n_waves == 0:
+                rocdl.s_barrier()
+            rocdl.s_barrier()
+            store_half_tile_to_lds(1, 0, c10)
+            store_half_tile_to_lds(1, 1, c11)
+            splitk_protocol.wait_until_initialized(expected_signal)
+            store_half_tile_to_global(0, 0)
+            store_half_tile_to_global(0, 1)
+            store_half_tile_to_global(1, 0)
+            store_half_tile_to_global(1, 1)
+        else:
+            wait_vmcnt_and_barrier(0)
+            store_half_tile_to_global(0, 0)
+            store_half_tile_to_global(0, 1)
+            wait_vmcnt_and_barrier(0)
+            store_half_tile_to_lds(1, 0, c10)
+            store_half_tile_to_lds(1, 1, c11)
+            wait_vmcnt_and_barrier(0)
+            store_half_tile_to_global(1, 0)
+            store_half_tile_to_global(1, 1)
 
 
 @flyc.jit
