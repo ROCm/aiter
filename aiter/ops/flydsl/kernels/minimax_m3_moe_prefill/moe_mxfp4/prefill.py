@@ -54,7 +54,11 @@ def _get_gemm1(hidden_size: int, intermediate_size: int, num_experts: int, bm: i
 
 @functools.cache
 def _get_gemm2(
-    hidden_size: int, intermediate_size: int, num_experts: int, topk: int, bm: int
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    bm: int,
 ):
     from .gemm2_prefill import compile_moe_gemm2
 
@@ -110,101 +114,105 @@ def a4w4_prefill_moe(
     assert all(
         t.is_cuda and t.device == a_q.device for t in (w13, w13_scale, w2, w2_scale)
     )
-    # shortcut: guards only the 2^32 wrap; whether the descriptor reads 2^31..2^32 as
-    # unsigned is unmeasured above 32K tokens, so verify on gfx950 before relying on it.
+    # The buffer offsets are read as unsigned 32-bit (op test: 65536 tokens at topk 4, 3.2e9
+    # bytes); shortcut: this only rules out the 2^32 wrap, so re-measure to raise it.
     assert n_tokens * topk * hidden * 2 < 2**32, (n_tokens, topk, hidden)
     if out is not None:
         assert out.shape == (n_tokens, hidden) and out.dtype == torch.bfloat16
         assert out.is_contiguous() and out.device == a_q.device
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.to(torch.float32).contiguous()
-    device = topk_ids.device
-    stream = torch.cuda.current_stream()
-    bm = block_m_for(n_tokens)
+    device = a_q.device
+    assert topk_ids.device == device
+    # shortcut: FlyDSL loads a compiled kernel on the first device that runs it and a later
+    # device gets hipErrorInvalidDevice, so one process drives one GPU; upgrade with FlyDSL.
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream()
+        bm = block_m_for(n_tokens)
 
-    bufs = SortBuffers.allocate(n_tokens, num_experts, topk, bm, device)
-    run_compiled(
-        _get_sort(num_experts, topk, bm),
-        *bufs.launch_args(topk_ids, topk_weights, n_tokens),
-    )
-    a_s = torch.empty(
-        ((bufs.sorted_ids.shape[0] + 31) // 32 * 32, (hidden // 32 + 7) // 8 * 8),
-        dtype=dtypes.fp8_e8m0,
-        device=device,
-    )
-    mxfp4_moe_sort_hip(
-        a_s,
-        x_s.view(dtypes.fp8_e8m0),
-        bufs.sorted_ids,
-        bufs.num_valid_ids,
-        n_tokens,
-        hidden,
-    )
-    num_m_blocks = bufs.max_sorted // bm
-    rows = num_m_blocks * bm
-    grid1 = tile_map_grid(num_m_blocks, inter)
-    tile_map = torch.empty((grid1 + 1,), dtype=torch.int32, device=device)
-    run_compiled(
-        _get_tile_map(inter, bm),
-        bufs.sorted_expert_ids,
-        bufs.num_valid_ids,
-        tile_map,
-        grid1,
-        stream,
-    )
-    h_q = torch.empty((rows, inter // 2), dtype=torch.uint8, device=device)
-    h_s = torch.empty((rows * (inter // 32),), dtype=torch.uint8, device=device)
-    run_compiled(
-        _get_gemm1(hidden, inter, num_experts, bm),
-        _u8_flat(a_q),
-        _u8_flat(w13),
-        h_q.view(-1),
-        _u8_flat(a_s),
-        _u8_flat(w13_scale),
-        h_s,
-        bufs.sorted_ids,
-        bufs.sorted_expert_ids,
-        n_tokens,
-        num_m_blocks,
-        int(a_s.numel() * a_s.element_size()),
-        tile_map,
-        grid1,
-        stream,
-    )
+        bufs = SortBuffers.allocate(n_tokens, num_experts, topk, bm, device)
+        run_compiled(
+            _get_sort(num_experts, topk, bm),
+            *bufs.launch_args(topk_ids, topk_weights, n_tokens),
+        )
+        a_s = torch.empty(
+            ((bufs.sorted_ids.shape[0] + 31) // 32 * 32, (hidden // 32 + 7) // 8 * 8),
+            dtype=dtypes.fp8_e8m0,
+            device=device,
+        )
+        mxfp4_moe_sort_hip(
+            a_s,
+            x_s.view(dtypes.fp8_e8m0),
+            bufs.sorted_ids,
+            bufs.num_valid_ids,
+            n_tokens,
+            hidden,
+        )
+        num_m_blocks = bufs.max_sorted // bm
+        rows = num_m_blocks * bm
+        grid1 = tile_map_grid(num_m_blocks, inter)
+        tile_map = torch.empty((grid1 + 1,), dtype=torch.int32, device=device)
+        run_compiled(
+            _get_tile_map(inter, bm),
+            bufs.sorted_expert_ids,
+            bufs.num_valid_ids,
+            tile_map,
+            grid1,
+            stream,
+        )
+        h_q = torch.empty((rows, inter // 2), dtype=torch.uint8, device=device)
+        h_s = torch.empty((rows * (inter // 32),), dtype=torch.uint8, device=device)
+        run_compiled(
+            _get_gemm1(hidden, inter, num_experts, bm),
+            _u8_flat(a_q),
+            _u8_flat(w13),
+            h_q.view(-1),
+            _u8_flat(a_s),
+            _u8_flat(w13_scale),
+            h_s,
+            bufs.sorted_ids,
+            bufs.sorted_expert_ids,
+            n_tokens,
+            num_m_blocks,
+            int(a_s.numel() * a_s.element_size()),
+            tile_map,
+            grid1,
+            stream,
+        )
 
-    partial = torch.empty(
-        (n_tokens * topk, hidden), dtype=torch.bfloat16, device=device
-    )
-    # read only by gemm2's fp8-partial mode
-    partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
-    num_m_blocks2 = rows // 128
-    run_compiled(
-        _get_gemm2(hidden, inter, num_experts, topk, bm),
-        h_q.view(-1),
-        _u8_flat(w2),
-        partial.view(-1),
-        h_s,
-        _u8_flat(w2_scale),
-        partial_scale,
-        bufs.sorted_ids,
-        bufs.sorted_expert_ids,
-        bufs.sorted_weights,
-        bufs.num_valid_ids,
-        n_tokens,
-        num_m_blocks2,
-        gemm2_grid(num_m_blocks2, GEMM2_N_SPLIT),
-        stream,
-    )
-    if out is None:
-        out = torch.empty((n_tokens, hidden), dtype=torch.bfloat16, device=device)
-    run_compiled(
-        _get_reduce_bf16(hidden, topk),
-        partial.view(-1),
-        out.view(-1),
-        n_tokens,
-        stream,
-    )
-    return out
+        partial = torch.empty(
+            (n_tokens * topk, hidden), dtype=torch.bfloat16, device=device
+        )
+        # read only by gemm2's fp8-partial mode
+        partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
+        num_m_blocks2 = rows // 128
+        run_compiled(
+            _get_gemm2(hidden, inter, num_experts, topk, bm),
+            h_q.view(-1),
+            _u8_flat(w2),
+            partial.view(-1),
+            h_s,
+            _u8_flat(w2_scale),
+            partial_scale,
+            bufs.sorted_ids,
+            bufs.sorted_expert_ids,
+            bufs.sorted_weights,
+            bufs.num_valid_ids,
+            n_tokens,
+            num_m_blocks2,
+            gemm2_grid(num_m_blocks2, GEMM2_N_SPLIT),
+            stream,
+        )
+        if out is None:
+            out = torch.empty((n_tokens, hidden), dtype=torch.bfloat16, device=device)
+        run_compiled(
+            _get_reduce_bf16(hidden, topk),
+            partial.view(-1),
+            out.view(-1),
+            n_tokens,
+            stream,
+        )
+        return out
 
 
 def mxfp4_quant(

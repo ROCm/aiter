@@ -148,11 +148,6 @@ def _fabs(v):
     return fx.math.absf(v)
 
 
-def _maxf(a, b):
-    """v_max_f32 (arith.maxnumf), not the select-based gemm1 helper"""
-    return fx.Float32(fx.arith.maxnumf(fx.as_ir_value(a), fx.as_ir_value(b)))
-
-
 def _permlane32_swap(d_a, d_b):
     pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
     res = _rocdl.permlane32_swap(
@@ -167,9 +162,12 @@ def _maxf_nn(a, b):
     """v_max_f32 with nnan. Without the flag LLVM canonicalizes both inputs first
     (``v_max x, x, x``, maxnum must quiet sNaNs): 2 extra VALU per max in the
     epilogue."""
-    fm = _ir.Attribute.parse("#arith.fastmath<nnan>")
     return fx.Float32(
-        _arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=fm).result
+        fx.arith.maxnumf(
+            fx.as_ir_value(a),
+            fx.as_ir_value(b),
+            fastmath=fx.arith.FastMathFlags.nnan,
+        )
     )
 
 
@@ -192,6 +190,7 @@ def _undef_i32():
 
 
 def _lds_store_i16(v_i32, addr_i32):
+    # no typed fx op truncates i32 -> i16 yet, so this stays a raw arith op
     h = _arith.TruncIOp(_ir.IntegerType.get_signless(16), fx.as_ir_value(v_i32)).result
     _llvm.StoreOp(h, _lds_ptr(addr_i32), alignment=2)
 

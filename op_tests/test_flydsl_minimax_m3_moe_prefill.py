@@ -17,6 +17,9 @@ Run:
     pytest op_tests/test_flydsl_minimax_m3_moe_prefill.py
 """
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -75,23 +78,23 @@ def _reference(x_q, x_s, w13, w2, topk_ids, topk_weights):
     return out
 
 
-def _make_inputs(n_tokens, seed=0):
+def _make_inputs(n_tokens, seed=0, device="cuda"):
     from aiter.ops.shuffle import shuffle_scale
 
-    g = torch.Generator(device="cuda").manual_seed(seed)
+    g = torch.Generator(device=device).manual_seed(seed)
 
     def randn(*shape, scale):
-        return (torch.randn(*shape, device="cuda", generator=g) * scale).to(
+        return (torch.randn(*shape, device=device, generator=g) * scale).to(
             torch.bfloat16
         )
 
     x = randn(n_tokens, HIDDEN, scale=1.0)
     w13 = _quant(randn(EXPERTS, 2 * INTER, HIDDEN, scale=HIDDEN**-0.5))
     w2 = _quant(randn(EXPERTS, HIDDEN, INTER, scale=INTER**-0.5))
-    logits = torch.rand(n_tokens, EXPERTS, device="cuda", generator=g)
+    logits = torch.rand(n_tokens, EXPERTS, device=device, generator=g)
     topk_ids = logits.topk(TOPK, dim=1).indices.to(torch.int32)
     topk_weights = torch.softmax(
-        torch.rand(n_tokens, TOPK, device="cuda", generator=g), dim=1
+        torch.rand(n_tokens, TOPK, device=device, generator=g), dim=1
     )
 
     def kernel_form(w):  # the layouts of the kernel docstrings
@@ -104,15 +107,14 @@ def _make_inputs(n_tokens, seed=0):
     return x, w13, w2, topk_ids, topk_weights, kernel_form(w13), kernel_form(w2)
 
 
-@pytest.mark.parametrize(
-    "n_tokens", [3072, 5000, 16384, 65536]
-)  # 16384: block_m 256; 65536: the max
-def test_a4w4_prefill_moe(n_tokens):
+def _check(n_tokens, device="cuda"):
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
         a4w4_prefill_moe,
     )
 
-    x, w13, w2, ids, wts, (w13_k, w13_ks), (w2_k, w2_ks) = _make_inputs(n_tokens)
+    x, w13, w2, ids, wts, (w13_k, w13_ks), (w2_k, w2_ks) = _make_inputs(
+        n_tokens, device=device
+    )
     x_q, x_s = _quant(x)
     got = a4w4_prefill_moe(
         (x_q, x_s),
@@ -126,16 +128,34 @@ def test_a4w4_prefill_moe(n_tokens):
         intermediate_size=INTER,
         num_experts=EXPERTS,
     )
-    torch.cuda.synchronize()
-    ref = _reference(x_q, x_s, w13, w2, ids, wts)
+    torch.cuda.synchronize(device)
+    # the kernel returns bf16: round the reference the same way before comparing
+    ref = _reference(x_q, x_s, w13, w2, ids, wts).to(torch.bfloat16).float()
 
     assert got.shape == (n_tokens, HIDDEN) and got.dtype == torch.bfloat16
+    assert got.device == x.device
     got = got.float()
     rel = ((got - ref).norm() / ref.norm()).item()
     cos = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0)
-    print(f"\nn_tokens {n_tokens}: rel L2 err {rel:.5f}, cos {cos.item():.6f}")
+    print(f"\n{device} n_tokens {n_tokens}: rel L2 err {rel:.5f}, cos {cos.item():.6f}")
     assert rel < 0.03, rel
     assert cos > 0.999, cos
+
+
+@pytest.mark.parametrize("n_tokens", [3072, 5000, 16384, 65536])  # 16384: block_m 256
+def test_a4w4_prefill_moe(n_tokens):
+    _check(n_tokens)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_a4w4_prefill_moe_non_current_device():
+    # tensors on cuda:1 while cuda:0 is current: a fresh process, as FlyDSL binds a
+    # compiled kernel to the first device that runs it
+    code = (
+        "import sys; sys.path.insert(0, 'op_tests'); "
+        "import test_flydsl_minimax_m3_moe_prefill as t; t._check(3072, 'cuda:1')"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_a4w4_prefill_moe_rejects_bad_inputs():

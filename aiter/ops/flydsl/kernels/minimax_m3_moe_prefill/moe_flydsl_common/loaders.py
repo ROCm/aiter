@@ -8,7 +8,6 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
-from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -137,54 +136,6 @@ class G2SLoaderAsm:
 
     def load_one(self, lds_dst, k_offset, step):
         self._emit(lds_dst, k_offset, step)
-
-
-class S2RLoader128B:
-    """LDS -> registers: two 16-byte halves of a swizzled 128-byte row."""
-
-    def __init__(self, wave_idx, n_tiles):
-        self.lane_id = fx.thread_idx.x % 64
-        self.wave_idx = wave_idx
-        self.n_tiles = n_tiles
-
-    def _vec_load_16xf8(self, lds_src, dyn_offset, const_offset):
-        total_off = lds_src.byte_off + const_offset
-        window_base = (total_off // 0x10000) * 0x10000
-        imm = total_off - window_base
-        assert 0 <= imm <= 0xFFFF
-        vaddr = fx.Int32(fx.ptrtoint(lds_src.base_ptr)) + fx.Int32(
-            window_base + dyn_offset
-        )
-        lds_ptr = _llvm.inttoptr(_lds_ptr_t(), fx.as_ir_value(vaddr))
-        if imm != 0:
-            lds_ptr = _gep(lds_ptr, static_byte_offset=imm)
-        vec_i32 = _ir.VectorType.get([4], fx.Int32.ir_type)
-        return Vec(_llvm.LoadOp(vec_i32, lds_ptr, alignment=16).result)
-
-    def _offset(self, unit, preshuffled):
-        row = self.wave_idx * (self.n_tiles * 16) + self.lane_id % 16
-        if const_expr(preshuffled):
-            return (row // 8) * 1024 + (row % 8) * 16 + unit * 128
-        row_swz, col_swz = swizzle_128(row, unit * 16)
-        return row_swz * 128 + col_swz
-
-    def _dyn_offset(self, step, preshuffled):
-        return self._offset(self.lane_id // 16 + step * 4, preshuffled)
-
-    def load(self, lds_src, preshuffled=False):
-        frag = []
-        for i in range_constexpr(self.n_tiles):
-            halves = []
-            for step in range_constexpr(2):
-                dyn = self._dyn_offset(step, preshuffled)
-                v = self._vec_load_16xf8(lds_src, dyn, i * 2048)
-                halves.append(v.bitcast(fx.Int32))
-            frag.append(halves)
-        return frag
-
-    def load_one(self, lds_src, i, ksub, preshuffled=False):
-        dyn = self._dyn_offset(ksub, preshuffled)
-        return self._vec_load_16xf8(lds_src, dyn, i * 2048).bitcast(fx.Int32)
 
 
 def _flat_frag(frag):

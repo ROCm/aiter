@@ -4,7 +4,6 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
@@ -52,14 +51,6 @@ def _cvt_pk_fp8(old, a, b, scale_f32, hi: bool):
         [],
     )
     return fx.Int32(_llvm.bitcast(_T.i32, res))
-
-
-def _maxf_nn(a, b):
-    """Max with nnan: else LLVM canonicalizes both inputs first (2 extra VALU)."""
-    fm = _ir.Attribute.parse("#arith.fastmath<nnan>")
-    return fx.Float32(
-        _arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=fm).result
-    )
 
 
 def _undef_i32():
