@@ -45,8 +45,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-dpx-1
+            label: MI350X-DPX
           - runner: linux-aiter-oci-mi300x-1
             label: MI300X
     runs-on: ${{ matrix.runner }}

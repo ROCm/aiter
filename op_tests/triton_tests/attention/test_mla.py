@@ -363,13 +363,14 @@ def test_mla_decode_fwd(
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         # gfx1250 -> Gluon
         # gfx950 -> Triton
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
+        if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
             pytest.skip(f"NVFP4 requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 requires shuffled KV cache")
@@ -513,7 +514,7 @@ def test_mla_decode_fwd(
 def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
     monkeypatch, output_kind: str, num_kv_heads: int
 ):
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("LDS pipeline requires gfx1250")
 
     import aiter.ops.triton.attention.mla as mla_module
@@ -666,7 +667,7 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
 def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
     monkeypatch, kv_lora_rank, block_size, dtype
 ):
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
     import aiter.ops.triton.attention.mla as mla_module
@@ -933,7 +934,16 @@ def test_mla_prefill_fwd(
 
 
 def _mla_gluon_decode(
-    mla_gluon, kv_c, kv_indices, kv_indptr, q_nope, q_pe, batch, nhead, min_kv
+    mla_gluon,
+    kv_c,
+    kv_indices,
+    kv_indptr,
+    q_nope,
+    q_pe,
+    batch,
+    nhead,
+    min_kv,
+    kv_split_info=None,
 ):
     kv_lora_rank = q_nope.shape[-1]
     o = torch.empty(
@@ -952,6 +962,7 @@ def _mla_gluon_decode(
         use_2d_view=False,
         kv_scale=1.0,
         min_kv_seq_len=min_kv,
+        kv_split_info=kv_split_info,
     )
     torch.cuda.synchronize()
     return o
@@ -1019,6 +1030,421 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     assert torch.isfinite(o_big.float()).all(), "NaN/Inf in the >2 GB global_load path"
     # the two load paths read identical KV and reduce identically -> exact parity
     torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)
+
+    # the same parity with the split rebalance (kv_split_info)
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon_split_metadata
+
+    info = mla_gluon_split_metadata(kv_indptr, nhead, dtype, use_2d_view=False)
+    assert info is not None
+    o_ref = _mla_gluon_decode(
+        mla_gluon, kv_data, idx_ref, kv_indptr, q_nope, q_pe, batch, nhead, ctx, info
+    )
+    o_big = _mla_gluon_decode(
+        mla_gluon, kv_big, idx_big, kv_indptr, q_nope, q_pe, batch, nhead, ctx, info
+    )
+    torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)
+
+
+def _mla_gluon_ref(
+    q_nope, q_pe, kv_c, seq_lens, token_idx, sm_scale, kv_scale, attn_sink=None
+):
+    """fp32 MLA decode; query position i of qlen attends KV [0, len - qlen + i].
+    attn_sink [nhead] adds one logit with no value to each softmax."""
+    batch, qlen, nhead, kv_lora_rank = q_nope.shape
+    out = torch.zeros(
+        (batch, qlen, nhead, kv_lora_rank), dtype=torch.float32, device=q_nope.device
+    )
+    lse = torch.full(
+        (batch, qlen, nhead), float("-inf"), dtype=torch.float32, device=q_nope.device
+    )
+    q = torch.cat([q_nope, q_pe], dim=-1).float()
+    q_off = torch.arange(qlen, device=q_nope.device)[:, None]
+    for b, seq_len in enumerate(seq_lens):
+        if seq_len == 0:
+            if attn_sink is not None:
+                lse[b] = attn_sink.float()
+            continue
+        kv = kv_c[token_idx[b][:seq_len].long()].float() * kv_scale
+        s = torch.einsum("qhd,ld->qhl", q[b], kv) * sm_scale
+        pos = torch.arange(seq_len, device=q_nope.device)[None, :]
+        s = s.masked_fill(~(pos <= seq_len - qlen + q_off)[:, None, :], float("-inf"))
+        if attn_sink is None:
+            lse[b] = torch.logsumexp(s, dim=-1)
+        else:
+            sink = attn_sink.float()[None, :, None].expand(qlen, nhead, 1)
+            lse[b] = torch.logsumexp(torch.cat([s, sink], dim=-1), dim=-1)
+        out[b] = torch.exp(s - lse[b][..., None]) @ kv[:, :kv_lora_rank]
+    return out, lse
+
+
+def _split_rebalance_inputs(batch, qlen, nhead, kv_dtype, max_len, kv_lora_rank=512):
+    """Q and a paged KV pool where each (batch, position) has its own random row."""
+    head_dim = kv_lora_rank + 64
+    kv_c = torch.randn(
+        (batch * max_len, head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(kv_dtype)
+    block_table = (
+        torch.randperm(batch * max_len, device="cuda")
+        .to(torch.int32)
+        .view(batch, max_len)
+    )
+    q_nope = torch.randn(
+        (batch, qlen, nhead, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    q_pe = torch.randn((batch, qlen, nhead, 64), dtype=torch.bfloat16, device="cuda")
+    return kv_c, block_table, q_nope, q_pe
+
+
+def _paged_seq_info(block_table, seq_lens, use_2d_view):
+    """(page_table, seq_info): the block table and cache_seqlens (2-D view), or
+    kv_indices and kv_indptr (1-D view)."""
+    if use_2d_view:
+        return block_table, seq_lens
+    lens = seq_lens.tolist()
+    page_table = torch.cat([block_table[b, :n] for b, n in enumerate(lens)])
+    seq_info = torch.zeros(len(lens) + 1, dtype=torch.int32, device="cuda")
+    seq_info[1:] = torch.cumsum(seq_lens, 0)
+    return page_table, seq_info
+
+
+def _mla_gluon_paged(
+    mla_gluon, q_nope, q_pe, kv_c, page_table, seq_info, use_2d_view, kv_scale, info
+):
+    """mla_gluon with q [batch, qlen, nhead, d]; returns (o, lse) in that shape."""
+    batch, qlen, nhead, kv_lora_rank = q_nope.shape
+    if qlen == 1:
+        q_nope, q_pe = q_nope[:, 0], q_pe[:, 0]
+    o = torch.empty(q_nope.shape, dtype=torch.bfloat16, device="cuda")
+    o, lse = mla_gluon(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_c=kv_c,
+        o=o,
+        page_table=page_table,
+        seq_info=seq_info,
+        sm_scale=1.0 / (kv_c.shape[-1] ** 0.5),
+        k_pe=None,
+        kv_pe_offset=kv_lora_rank,
+        use_2d_view=use_2d_view,
+        kv_scale=kv_scale,
+        return_lse=True,
+        kv_split_info=info,
+    )
+    return o.view(batch, qlen, nhead, kv_lora_rank), lse.view(batch, qlen, nhead)
+
+
+def _check_split_partition(info, lens, block_n, indptr=None):
+    """The work items cut each sequence's KV once, in BLOCK_N-aligned segments of
+    one length (the last one of a sequence can be shorter), and split_meta lists
+    each sequence's work items."""
+    work_info, split_meta = info
+    rows = work_info[:, :5].tolist()
+    meta = split_meta.tolist()
+    live = [(w, r) for w, r in enumerate(rows) if r[1] < r[2]]
+    assert meta[len(lens)] == len(live) <= len(rows), "work item count"
+    seg_lens, last_lens = set(), []
+    for b, seq_len in enumerate(lens):
+        mine = [(w, r) for w, r in live if r[0] == b]
+        assert [w for w, _ in mine] == list(range(meta[b], meta[b + 1])), b
+        if seq_len == 0:
+            assert not mine, b
+            continue
+        starts = [r[1] for _, r in mine]
+        ends = [r[2] for _, r in mine]
+        assert starts == [0] + ends[:-1] and ends[-1] == seq_len, b
+        assert all(s % block_n == 0 for s in starts), b
+        assert all(r[3] == seq_len for _, r in mine), b
+        if indptr is not None:
+            assert all(r[4] == indptr[b] for _, r in mine), b
+        seg_lens.update(e - s for s, e in zip(starts[:-1], ends[:-1]))
+        last_lens.append(ends[-1] - starts[-1])
+    assert len(seg_lens) <= 1, f"segments of different lengths: {sorted(seg_lens)}"
+    if seg_lens:
+        assert max(last_lens) <= seg_lens.pop(), "a last segment is the longest"
+
+
+def _assert_mla_close(o, o_ref, o_base):
+    """o is within 2**-6 of the largest output of the fp32 reference, and not
+    more than twice as far from it as o_base (today's split)."""
+    scale = o_ref.abs().max().item()
+    err = (o.float() - o_ref).abs().max().item()
+    err_base = (o_base.float() - o_ref).abs().max().item()
+    torch.testing.assert_close(o.float(), o_ref, atol=2**-6 * scale, rtol=2**-6)
+    assert (
+        err <= 2 * err_base + 2**-9 * scale
+    ), f"max err {err:.3e}, today's split {err_base:.3e} (scale {scale:.3e})"
+
+
+# Uneven lengths: one sequence far longer than the rest (it gets most of the
+# work items) and, for qlen 1, an empty one (no work item, zero output).
+@pytest.mark.parametrize("batch", [1, 60])
+@pytest.mark.parametrize("qlen", [1, 2])
+@pytest.mark.parametrize(
+    "nhead, kv_dtype",
+    [
+        (8, torch.float8_e4m3fn),
+        (16, torch.float8_e4m3fn),
+        (8, torch.bfloat16),
+        (32, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("use_2d_view", [True, False])
+def test_mla_gluon_decode_split_rebalance(batch, qlen, nhead, kv_dtype, use_2d_view):
+    """kv_split_info against an fp32 reference and today's split."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
+
+    random.seed(0)
+    torch.manual_seed(0)
+    if batch == 1:
+        lens = [7000]
+    else:
+        lens = [random.randint(qlen, 3000) for _ in range(batch)]
+        lens[1] = 12000
+        if qlen == 1:
+            lens[2] = 0
+    kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
+        batch, qlen, nhead, kv_dtype, max(lens)
+    )
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    page_table, seq_info = _paged_seq_info(block_table, seq_lens, use_2d_view)
+    kv_scale = 0.5 if kv_dtype == torch.float8_e4m3fn else 1.0
+
+    info = mla_gluon_split_metadata(
+        seq_info, nhead, kv_dtype, qlen=qlen, use_2d_view=use_2d_view
+    )
+    assert info is not None
+    _check_split_partition(
+        info,
+        lens,
+        128 if kv_dtype == torch.float8_e4m3fn else 64,
+        indptr=None if use_2d_view else seq_info.tolist(),
+    )
+    args = (mla_gluon, q_nope, q_pe, kv_c, page_table, seq_info, use_2d_view, kv_scale)
+    o, lse = _mla_gluon_paged(*args, info)
+    o_base, _ = _mla_gluon_paged(*args, None)
+    o_ref, lse_ref = _mla_gluon_ref(
+        q_nope, q_pe, kv_c, lens, block_table, 1.0 / (kv_c.shape[-1] ** 0.5), kv_scale
+    )
+    _assert_mla_close(o, o_ref, o_base)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("qlen", [1, 2])
+@pytest.mark.parametrize(
+    "nhead, kv_dtype", [(8, torch.float8_e4m3fn), (16, torch.bfloat16)]
+)
+def test_mla_gluon_decode_split_rebalance_attn_sink(qlen, nhead, kv_dtype):
+    """With kv_split_info, a sequence has several segments; the sink is in the
+    softmax once for each sequence, not once for each segment."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
+
+    random.seed(0)
+    torch.manual_seed(0)
+    lens = [random.randint(qlen, 3000) for _ in range(60)]
+    lens[1] = 12000
+    if qlen == 1:
+        lens[2] = 0
+    kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
+        len(lens), qlen, nhead, kv_dtype, max(lens)
+    )
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    kv_scale = 0.5 if kv_dtype == torch.float8_e4m3fn else 1.0
+    sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
+    # sinks near the logits, so that they change the softmax
+    attn_sink = torch.randn(nhead, dtype=torch.float32, device="cuda") + 4.0
+    info = mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, qlen=qlen)
+    q_n, q_p = (q_nope[:, 0], q_pe[:, 0]) if qlen == 1 else (q_nope, q_pe)
+    o, lse = mla_gluon(
+        q_nope=q_n,
+        q_pe=q_p,
+        kv_c=kv_c,
+        o=torch.empty(q_n.shape, dtype=torch.bfloat16, device="cuda"),
+        page_table=block_table,
+        seq_info=seq_lens,
+        sm_scale=sm_scale,
+        kv_pe_offset=512,
+        kv_scale=kv_scale,
+        return_lse=True,
+        attn_sink=attn_sink,
+        kv_split_info=info,
+    )
+    o_ref, lse_ref = _mla_gluon_ref(
+        q_nope, q_pe, kv_c, lens, block_table, sm_scale, kv_scale, attn_sink
+    )
+    scale = o_ref.abs().max().item()
+    torch.testing.assert_close(
+        o.view(o_ref.shape).float(), o_ref, atol=2**-6 * scale, rtol=2**-6
+    )
+    torch.testing.assert_close(lse.view(lse_ref.shape), lse_ref, atol=1e-3, rtol=0)
+
+
+def test_mla_gluon_split_metadata_not_applicable():
+    """None where the split rebalance does not apply."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import (
+        mla_gluon_split_metadata,
+        mla_gluon_split_metadata_info,
+    )
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
+    lens = torch.full((64,), 1000, dtype=torch.int32, device="cuda")
+    assert mla_gluon_split_metadata(lens, 128, torch.bfloat16) is None  # bh64
+    assert mla_gluon_split_metadata_info(64, 128, torch.bfloat16) is None
+    # one work item for each CU: no more work items than sequences
+    full = torch.full((get_num_sms(),), 1000, dtype=torch.int32, device="cuda")
+    assert mla_gluon_split_metadata(full, 8, torch.float8_e4m3fn) is None
+    assert mla_gluon_split_metadata(lens, 8, torch.float8_e4m3fn, qlen=4) is None
+
+
+@pytest.mark.parametrize(
+    "nhead, kv_dtype, qlen",
+    [
+        (8, torch.float8_e4m3fn, 1),
+        (16, torch.float8_e4m3fn, 2),
+        (32, torch.bfloat16, 1),
+        (96, torch.bfloat16, 1),
+    ],
+)
+def test_mla_gluon_split_metadata_info(nhead, kv_dtype, qlen):
+    """Buffers from mla_gluon_split_metadata_info, for a larger batch, give the
+    partition of the allocating call; wrong buffers and sizes raise."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import (
+        mla_gluon_split_metadata,
+        mla_gluon_split_metadata_info,
+    )
+
+    random.seed(0)
+    batch, max_batch = 8, 32
+    lens = [random.randint(1, 5000) for _ in range(batch)]
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    (work_shape, work_dtype), (meta_shape, meta_dtype) = mla_gluon_split_metadata_info(
+        max_batch, nhead, kv_dtype, qlen=qlen
+    )
+    assert work_dtype == meta_dtype == torch.int32
+    assert meta_shape == (max_batch + 1,)
+
+    ref_work, ref_meta = mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, qlen=qlen)
+    assert tuple(ref_work.shape) == work_shape
+    assert ref_meta.numel() == batch + 1
+
+    work = torch.empty(work_shape, dtype=work_dtype, device="cuda")
+    meta = torch.empty(meta_shape, dtype=meta_dtype, device="cuda")
+    got_work, got_meta = mla_gluon_split_metadata(
+        seq_lens, nhead, kv_dtype, qlen=qlen, out=(work, meta)
+    )
+    assert got_work is work and got_meta.numel() == batch + 1
+    assert got_meta.data_ptr() == meta.data_ptr()
+    # columns 5..7 of work_info are not written
+    torch.testing.assert_close(got_work[:, :5], ref_work[:, :5], atol=0, rtol=0)
+    torch.testing.assert_close(got_meta, ref_meta, atol=0, rtol=0)
+
+    with pytest.raises(AssertionError):
+        mla_gluon_split_metadata_info(0, nhead, kv_dtype, qlen=qlen)
+    with pytest.raises(AssertionError):  # dtype
+        mla_gluon_split_metadata(
+            seq_lens, nhead, kv_dtype, qlen=qlen, out=(work.long(), meta)
+        )
+    with pytest.raises(AssertionError):  # split_meta smaller than batch + 1
+        mla_gluon_split_metadata(
+            seq_lens, nhead, kv_dtype, qlen=qlen, out=(work, meta[:batch])
+        )
+    with pytest.raises(AssertionError):  # work_info shape
+        mla_gluon_split_metadata(
+            seq_lens, nhead, kv_dtype, qlen=qlen, out=(work[1:], meta)
+        )
+
+
+def test_mla_gluon_split_metadata_cuda_graph():
+    """The metadata launch follows the live lengths when a CUDA graph replays,
+    into preallocated buffers from mla_gluon_split_metadata_info for a larger
+    batch."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import (
+        mla_gluon,
+        mla_gluon_split_metadata,
+        mla_gluon_split_metadata_info,
+    )
+
+    random.seed(0)
+    torch.manual_seed(0)
+    batch, nhead, kv_dtype, kv_scale = 64, 8, torch.float8_e4m3fn, 0.5
+    lens_a = [2048] * batch
+    lens_b = [random.randint(64, 3000) for _ in range(batch)]
+    lens_b[5] = 12000
+    kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
+        batch, 1, nhead, kv_dtype, max(lens_a + lens_b)
+    )
+    seq_lens = torch.tensor(lens_a, dtype=torch.int32, device="cuda")
+    q_nope, q_pe = q_nope[:, 0].contiguous(), q_pe[:, 0].contiguous()
+    o = torch.empty((batch, nhead, 512), dtype=torch.bfloat16, device="cuda")
+    work_spec, meta_spec = mla_gluon_split_metadata_info(2 * batch, nhead, kv_dtype)
+    work_info = torch.empty(work_spec[0], dtype=work_spec[1], device="cuda")
+    split_meta = torch.empty(meta_spec[0], dtype=meta_spec[1], device="cuda")
+    # buffers for 2 * batch; the metadata call writes and returns batch + 1 of split_meta
+    bufs = (work_info, split_meta)
+
+    def run():
+        info = mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, out=bufs)
+        mla_gluon(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_c=kv_c,
+            o=o,
+            page_table=block_table,
+            seq_info=seq_lens,
+            sm_scale=1.0 / (kv_c.shape[-1] ** 0.5),
+            kv_pe_offset=512,
+            use_2d_view=True,
+            kv_scale=kv_scale,
+            kv_split_info=info,
+        )
+        return info
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        info = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    assert info[0] is work_info and info[1].numel() == batch + 1
+    assert info[1].data_ptr() == split_meta.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for lens in (lens_a, lens_b):
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_split_partition(info, lens, 128)
+        o_base, _ = _mla_gluon_paged(
+            mla_gluon,
+            q_nope[:, None],
+            q_pe[:, None],
+            kv_c,
+            block_table,
+            seq_lens,
+            True,
+            kv_scale,
+            None,
+        )
+        o_ref, _ = _mla_gluon_ref(
+            q_nope[:, None],
+            q_pe[:, None],
+            kv_c,
+            lens,
+            block_table,
+            1.0 / (kv_c.shape[-1] ** 0.5),
+            kv_scale,
+        )
+        _assert_mla_close(o, o_ref[:, 0], o_base[:, 0])
 
 
 @pytest.mark.parametrize(

@@ -556,7 +556,7 @@ def test_route_g2l(numel, E_global, n_buckets, variant, w_dtype):
     # keeps the pre-ep_rowmap signature. Null tensor hoisted out of fn() so nothing
     # allocates under CUDA-graph capture.
     _ep_null = torch.empty(0, dtype=I32)
-    _ep_tail = (ptr_arg(_ep_null), 0) if variant == "lds" else ()
+    _ep_tail = (ptr_arg(_ep_null), 0, ptr_arg(_ep_null), 0) if variant == "lds" else ()
 
     def fn():
         launch(

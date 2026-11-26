@@ -36,6 +36,19 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_add(
+    _fa: int,
+    inp: torch.Tensor,
+    addend: torch.Tensor,
+    out: torch.Tensor,
+    use_new: bool,
+    open_fp8_quant: bool,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce_residual(
     _fa: int,
     inp: torch.Tensor,
@@ -44,6 +57,14 @@ def all_reduce_residual(
     reg_inp_ptr: int,
     reg_inp_bytes: int,
 ) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_one_shot(
+    _fa: int,
+    inp: torch.Tensor,
+    registered_input: bool,
+) -> bool: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -412,6 +433,25 @@ def fused_allreduce_rmsnorm_lamport_gfx1250(
     w: torch.Tensor,
     eps: float,
     gemma_norm: bool = False,
+) -> None: ...
+
+
+# The same with the per-token FP8 quant of fused_allreduce_rmsnorm_quant_gfx1250:
+# out FP8, one fp32 scale a row, and the bf16/fp16 output at bf16_out_ptr unless 0.
+@compile_ops(
+    GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant_lamport", develop=True
+)
+def fused_allreduce_rmsnorm_quant_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
 ) -> None: ...
 
 

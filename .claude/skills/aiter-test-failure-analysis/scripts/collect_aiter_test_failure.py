@@ -104,6 +104,28 @@ def normalize_run(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def public_run_url(repo: str, run: dict[str, Any]) -> str:
+    run_id = run_id_of(run)
+    if not run_id:
+        return run.get("url", "")
+    return f"https://github.com/{repo}/actions/runs/{run_id}"
+
+
+def run_summary(repo: str, run: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not run:
+        return None
+    return {
+        "id": run_id_of(run),
+        "url": public_run_url(repo, run),
+        "created_at": run.get("createdAt", ""),
+        "event": run.get("event", ""),
+        "head_branch": run.get("headBranch", ""),
+        "head_sha": run.get("headSha", ""),
+        "status": run.get("status", ""),
+        "conclusion": run.get("conclusion", ""),
+    }
+
+
 def list_runs(repo: str, lookback: int) -> list[dict[str, Any]]:
     data = gh_json(
         [
@@ -182,6 +204,20 @@ def classify_job(job: dict[str, Any]) -> str:
     if is_aggregate_job(name):
         return "Aggregate"
     return "Test/unknown"
+
+
+def job_summary(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": job.get("id"),
+        "name": job.get("name", ""),
+        "type": classify_job(job),
+        "status": job.get("status", ""),
+        "conclusion": job.get("conclusion", ""),
+        "url": job.get("html_url", ""),
+        "started_at": job.get("started_at", ""),
+        "completed_at": job.get("completed_at", ""),
+        "failed_steps": failed_steps(job),
+    }
 
 
 def parse_standard_job(name: str) -> tuple[str, str, str, str] | None:
@@ -388,6 +424,7 @@ def build_failure_profile(
 ) -> dict[str, Any]:
     text_parts: list[str] = []
     failed_test_files: set[str] = set()
+    failed_shard_test_files: set[str] = set()
     hardware: set[str] = set()
     categories: set[str] = set()
     for job in failed_jobs:
@@ -400,7 +437,7 @@ def build_failure_profile(
             hardware.add(label.lower())
             categories.add("standard")
             for file_path in shard_lists.get(shard, []):
-                failed_test_files.add(file_path)
+                failed_shard_test_files.add(file_path)
         elif "multi-gpu" in name.lower():
             categories.add("multigpu")
             if "MI350" in name or "MI35" in name:
@@ -413,7 +450,7 @@ def build_failure_profile(
         test = snippet.get("test", "")
         if test.startswith("op_tests/") or test.startswith("tests/"):
             failed_test_files.add(test)
-    token_text = "\n".join(text_parts + sorted(failed_test_files))
+    token_text = "\n".join(text_parts + sorted(failed_test_files) + sorted(failed_shard_test_files))
     tokens = words_from_text(token_text)
     for special in (
         "moe",
@@ -439,8 +476,9 @@ def build_failure_profile(
         if special in token_text.lower():
             tokens.add(special)
     return {
-        "tokens": tokens,
+        "tokens": sorted(tokens),
         "failed_test_files": sorted(failed_test_files),
+        "failed_shard_test_files": sorted(failed_shard_test_files),
         "hardware": sorted(hardware),
         "categories": sorted(categories),
     }
@@ -451,8 +489,9 @@ def score_commit(commit: dict[str, Any], profile: dict[str, Any]) -> tuple[int, 
     files = commit["files"]
     file_text = "\n".join(files).lower()
     haystack = subject + "\n" + file_text
-    tokens: set[str] = profile["tokens"]
+    tokens: set[str] = set(profile["tokens"])
     failed_files: set[str] = set(profile["failed_test_files"])
+    failed_shard_files: set[str] = set(profile.get("failed_shard_test_files", []))
     categories: set[str] = set(profile["categories"])
     hardware: set[str] = set(profile["hardware"])
     score = 0
@@ -467,6 +506,10 @@ def score_commit(commit: dict[str, Any], profile: dict[str, Any]) -> tuple[int, 
     exact = sorted(set(files) & failed_files)
     if exact:
         add(14, "changes failed test file(s): " + ", ".join(exact[:3]))
+
+    shard_matches = sorted((set(files) & failed_shard_files) - set(exact))
+    if shard_matches:
+        add(5, "changes test file(s) from failed shard(s): " + ", ".join(shard_matches[:3]))
 
     matched_tokens = sorted(token for token in tokens if token in haystack)
     if matched_tokens:
@@ -552,6 +595,138 @@ def table_candidates(candidates: list[dict[str, Any]], repo: str) -> str:
     return "\n".join(rows)
 
 
+def commit_summary(commit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sha": commit["sha"],
+        "short": commit["short"],
+        "date": commit["date"],
+        "author": commit["author"],
+        "subject": commit["subject"],
+        "files": commit.get("files", []),
+        "score": commit.get("score"),
+        "reasons": commit.get("reasons", []),
+    }
+
+
+def build_evidence_json(
+    repo: str,
+    target: dict[str, Any] | None,
+    newer_runs: list[dict[str, Any]],
+    previous_success: dict[str, Any] | None,
+    failed_jobs: list[dict[str, Any]],
+    root_failed_jobs: list[dict[str, Any]],
+    snippets: list[dict[str, str]],
+    shard_lists: dict[str, list[str]],
+    commits: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    profile: dict[str, Any],
+    download_messages: list[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "repo": repo,
+        "target_run": run_summary(repo, target),
+        "newer_runs": [run_summary(repo, run) for run in newer_runs],
+        "previous_success": run_summary(repo, previous_success),
+        "failed_jobs": [job_summary(job) for job in failed_jobs],
+        "root_failed_jobs": [job_summary(job) for job in root_failed_jobs],
+        "failure_profile": profile,
+        "snippets": snippets,
+        "shard_lists": shard_lists,
+        "commit_window": [commit_summary(commit) for commit in commits],
+        "candidates": [commit_summary(commit) for commit in candidates],
+        "download_messages": download_messages,
+    }
+
+
+def select_culprit(
+    candidates: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+    previous_success: dict[str, Any] | None,
+    profile: dict[str, Any],
+    snippets: list[dict[str, str]],
+    shard_lists: dict[str, list[str]],
+    download_messages: list[str],
+) -> dict[str, Any]:
+    if not candidates:
+        return {
+            "schema_version": 1,
+            "status": "no_candidate",
+            "confidence": "none",
+            "auto_revert_ready": False,
+            "candidate": None,
+            "reasons": ["no commit candidate scored above zero"],
+            "blockers": [],
+        }
+
+    top = candidates[0]
+    second_score = candidates[1]["score"] if len(candidates) > 1 else 0
+    margin = top["score"] - second_score
+    has_specific_evidence = bool(snippets or shard_lists or profile.get("failed_test_files"))
+    changed_failed_test = any(reason.startswith("changes failed test file") for reason in top.get("reasons", []))
+    blockers: list[str] = []
+    warnings: list[str] = []
+    reasons = list(top.get("reasons", []))
+
+    if not previous_success:
+        blockers.append("previous successful Aiter Test run was not found")
+    if not has_specific_evidence:
+        blockers.append("no shard list, failed test file, or log snippet was available")
+    if download_messages:
+        warnings.append("some logs or artifacts were unavailable")
+
+    confidence = "low"
+    if previous_success and has_specific_evidence:
+        if len(commits) == 1:
+            confidence = "high"
+            reasons.append("the last-success to first-failure window contains a single commit")
+        elif top["score"] >= 30 and margin >= 10:
+            confidence = "high"
+            reasons.append(f"top candidate leads the next candidate by {margin} points")
+        elif changed_failed_test and top["score"] >= 24 and margin >= 5:
+            confidence = "high"
+            reasons.append("top candidate changes a failed test file and has a clear score margin")
+        elif top["score"] >= 20 and margin >= 5:
+            confidence = "medium"
+            reasons.append(f"top candidate leads the next candidate by {margin} points")
+        else:
+            reasons.append("top candidate did not separate enough from the rest of the window")
+    else:
+        reasons.append("candidate ranking is report-only until failure-specific evidence is available")
+
+    return {
+        "schema_version": 1,
+        "status": "selected" if confidence in {"high", "medium"} else "weak_candidate",
+        "confidence": confidence,
+        "auto_revert_ready": confidence == "high" and not blockers,
+        "candidate": commit_summary(top),
+        "second_score": second_score,
+        "score_margin": margin,
+        "commit_window_size": len(commits),
+        "reasons": reasons,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
+def render_culprit_summary(culprit: dict[str, Any], repo: str) -> str:
+    candidate = culprit.get("candidate")
+    lines = ["### Culprit Assessment", ""]
+    lines.append(f"- Confidence: `{culprit.get('confidence', 'none')}`")
+    lines.append(f"- Auto-revert ready: `{str(culprit.get('auto_revert_ready', False)).lower()}`")
+    if candidate:
+        url = f"https://github.com/{repo}/commit/{candidate['sha']}"
+        lines.append(f"- Top candidate: [`{candidate['short']}`]({url}) {candidate['subject']}")
+        lines.append(f"- Score: `{candidate.get('score')}`; margin: `{culprit.get('score_margin')}`")
+    for reason in culprit.get("reasons", [])[:6]:
+        lines.append(f"- Reason: {reason}")
+    for blocker in culprit.get("blockers", [])[:6]:
+        lines.append(f"- Blocker: {blocker}")
+    for warning in culprit.get("warnings", [])[:6]:
+        lines.append(f"- Warning: {warning}")
+    return "\n".join(lines)
+
+
 def render_evidence(
     repo: str,
     target: dict[str, Any] | None,
@@ -593,7 +768,7 @@ def render_evidence(
             "## Target run",
             "",
             f"- Run: {run_id_of(target)}",
-            f"- URL: {target.get('url', '')}",
+            f"- URL: {public_run_url(repo, target)}",
             f"- Created: {target.get('createdAt', '')}",
             f"- Event: {target.get('event', '')}",
             f"- Head SHA: {target.get('headSha', '')}",
@@ -662,7 +837,13 @@ def render_evidence(
     return "\n".join(lines)
 
 
-def render_fallback_report(evidence: str, target: dict[str, Any] | None, candidates: list[dict[str, Any]], repo: str) -> str:
+def render_fallback_report(
+    evidence: str,
+    target: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    culprit: dict[str, Any],
+    repo: str,
+) -> str:
     if not target:
         return (
             "## Aiter Test Failure Report\n\n"
@@ -672,6 +853,7 @@ def render_fallback_report(evidence: str, target: dict[str, Any] | None, candida
             "</details>\n"
         )
     run_url = target.get("url", "")
+    run_url = public_run_url(repo, target)
     lines = [
         "## Aiter Test Failure Report",
         "",
@@ -680,6 +862,7 @@ def render_fallback_report(evidence: str, target: dict[str, Any] | None, candida
         "This fallback report is generated from deterministic GitHub Actions metadata, downloaded logs/artifacts when available, and git history. The configured analysis agent can rewrite it with more narrative detail.",
         "",
     ]
+    lines.extend([render_culprit_summary(culprit, repo), ""])
     candidate_table = table_candidates(candidates, repo)
     lines.extend(["### Candidate Commits", "", candidate_table, ""])
     lines.extend(["### Evidence", "", "<details><summary>Collected evidence</summary>", "", evidence, "", "</details>", ""])
@@ -695,6 +878,7 @@ def render_prompt(evidence: str) -> str:
         "- Separate root failures from aggregate failures such as Aiter Test Gate.\n"
         "- Explain the most likely failure reason from logs/artifacts. If logs are missing, say exactly what is missing.\n"
         "- Rank suspicious commits by evidence strength, not just recency. Include SHA, PR number from subject when present, and why it is suspicious.\n"
+        "- Use the structured culprit assessment as the starting point. If it says low confidence, explain what evidence is missing.\n"
         "- Do not claim certainty when the evidence only supports a hypothesis.\n"
         "- Keep the report readable in a GitHub summary.\n\n"
         "<evidence>\n"
@@ -774,6 +958,13 @@ def main() -> int:
     shard_lists: dict[str, list[str]] = {}
     commits: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
+    profile: dict[str, Any] = {
+        "tokens": [],
+        "failed_test_files": [],
+        "failed_shard_test_files": [],
+        "hardware": [],
+        "categories": [],
+    }
 
     if target:
         run_id = run_id_of(target)
@@ -796,6 +987,16 @@ def main() -> int:
             commits = commit_range("", target.get("headSha", ""))
         candidates = rank_candidates(commits, profile)
 
+    culprit = select_culprit(
+        candidates,
+        commits,
+        previous_success,
+        profile,
+        snippets,
+        shard_lists,
+        download_messages,
+    )
+
     evidence = render_evidence(
         args.repo,
         target,
@@ -809,13 +1010,36 @@ def main() -> int:
         candidates,
         download_messages,
     )
+    evidence_json = build_evidence_json(
+        args.repo,
+        target,
+        newer_runs,
+        previous_success,
+        failed_jobs,
+        root_failed_jobs,
+        snippets,
+        shard_lists,
+        commits,
+        candidates,
+        profile,
+        download_messages,
+    )
     (work_dir / "evidence.md").write_text(evidence + "\n", encoding="utf-8")
+    (work_dir / "evidence.json").write_text(json.dumps(evidence_json, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (work_dir / "culprit.json").write_text(json.dumps(culprit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (work_dir / "fallback_report.md").write_text(
-        render_fallback_report(evidence, target, candidates, args.repo),
+        render_fallback_report(evidence, target, candidates, culprit, args.repo),
         encoding="utf-8",
     )
     if target:
-        (work_dir / "prompt.md").write_text(render_prompt(evidence), encoding="utf-8")
+        structured = (
+            "# Structured culprit assessment\n\n"
+            "```json\n"
+            f"{json.dumps(culprit, indent=2, sort_keys=True)}\n"
+            "```\n\n"
+            f"{evidence}"
+        )
+        (work_dir / "prompt.md").write_text(render_prompt(structured), encoding="utf-8")
     return 0
 
 
