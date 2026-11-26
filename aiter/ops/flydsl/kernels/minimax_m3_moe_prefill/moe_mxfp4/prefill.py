@@ -92,8 +92,10 @@ def a4w4_prefill_moe(
     from aiter import dtypes
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import (
         SortBuffers,
+        max_sorted_rows,
     )
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.tile_map import (
+        _MAX_BLOCKS,
         tile_map_grid,
     )
     from aiter.ops.quant import mxfp4_moe_sort_hip
@@ -104,8 +106,20 @@ def a4w4_prefill_moe(
     n_tokens = a_q.shape[0]
     hidden = hidden_size
     assert MIN_PREFILL_TOKENS <= n_tokens <= MAX_PREFILL_TOKENS, n_tokens
-    assert a_q.shape == (n_tokens, hidden // 2) and a_q.is_contiguous()
-    assert x_s.shape == (n_tokens, hidden // 32) and x_s.is_contiguous()
+    assert a_q.shape == (n_tokens, hidden // 2) and x_s.shape == (
+        n_tokens,
+        hidden // 32,
+    )
+    # byte-wise views below: reject other dtypes (a bf16 tensor would be read as raw bytes)
+    # and strided views (the kernels address them flat)
+    codes, scales = (torch.uint8, dtypes.fp4x2), (torch.uint8, dtypes.fp8_e8m0)
+    assert all(t.dtype in codes for t in (a_q, w13, w2)), (
+        a_q.dtype,
+        w13.dtype,
+        w2.dtype,
+    )
+    assert all(t.dtype in scales for t in (x_s, w13_scale, w2_scale))
+    assert all(t.is_contiguous() for t in (a_q, x_s, w13, w13_scale, w2, w2_scale))
     inter = intermediate_size
     topk = topk_ids.shape[1]
     assert supports_shapes(hidden, inter), (hidden, inter)
@@ -122,6 +136,9 @@ def a4w4_prefill_moe(
     # The buffer offsets are read as unsigned 32-bit (op test: 65536 tokens at topk 4, 3.2e9
     # bytes); shortcut: this only rules out the 2^32 wrap, so re-measure to raise it.
     assert n_tokens * topk * hidden * 2 < 2**32, (n_tokens, topk, hidden)
+    # the tile map and the m-block search cover _MAX_BLOCKS blocks
+    bm = block_m_for(n_tokens)
+    assert max_sorted_rows(n_tokens, num_experts, topk, bm) // bm <= _MAX_BLOCKS
     if out is not None:
         assert out.shape == (n_tokens, hidden) and out.dtype == torch.bfloat16
         assert out.is_contiguous() and out.device == a_q.device
@@ -133,7 +150,6 @@ def a4w4_prefill_moe(
     # device gets hipErrorInvalidDevice, so one process drives one GPU; upgrade with FlyDSL.
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream()
-        bm = block_m_for(n_tokens)
 
         bufs = SortBuffers.allocate(n_tokens, num_experts, topk, bm, device)
         run_compiled(

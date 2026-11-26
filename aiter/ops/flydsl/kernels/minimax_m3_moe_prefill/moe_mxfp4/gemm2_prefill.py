@@ -787,6 +787,16 @@ def compile_moe_gemm2(
                             )
                 return ts
 
+            def _drop_if(off, mask):
+                # An unsigned offset of 0xFFFFFFFF is past the end of any buffer below
+                # 4 GiB, so the store is dropped. buffer_ops' own `mask=` uses 0x7FFFFFFF,
+                # which lands inside a buffer above 2 GiB and overwrites real rows.
+                if const_expr(mask is None):  # a plain `if` is rewritten into scf.if
+                    return off
+                return fx.Boolean(buffer_ops._unwrap_value(mask)).select(
+                    off, fx.Int32(-1)
+                )
+
             def _flush_thunks(h, nt, mask):
                 """The wave's staged 32 x 128 outputs -> token-major rows, full lines"""
                 col_wave = (
@@ -802,8 +812,7 @@ def compile_moe_gemm2(
                         buffer_ops.buffer_store(
                             data,
                             out_rsrc,
-                            out_off[h][k] + col_wave + chunk * 16,
-                            mask=mask,
+                            _drop_if(out_off[h][k] + col_wave + chunk * 16, mask),
                             offset_is_bytes=True,
                             cache_modifier=_STORE_CPOL,
                         )
@@ -817,8 +826,7 @@ def compile_moe_gemm2(
                         buffer_ops.buffer_store(
                             scv,
                             osc_rsrc,
-                            sc_off[h] + sc_col,  # type: ignore[index]
-                            mask=mask,
+                            _drop_if(sc_off[h] + sc_col, mask),  # type: ignore[index]
                             offset_is_bytes=True,
                             cache_modifier=_STORE_CPOL_SC,
                         )

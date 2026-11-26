@@ -19,7 +19,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders i
 )
 
 _THREADS = 256
-_MAX_BLOCKS = 4096  # >= max_sorted / BM (1409 at 65536 tokens, BM 256)
+_MAX_BLOCKS = 4096  # >= max_sorted / BM (1151 at 65536 tokens, topk 4, BM 256)
 _SEARCH_STEPS = 13  # 2^13 > _MAX_BLOCKS
 
 

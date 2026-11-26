@@ -13,28 +13,38 @@ test. Weights and activations are quantized by aiter's `per_1x32_f4_quant`
 x @ W13^T -> SwiGLU-OAI (alpha 1.702, limit 7) -> bf16 -> MXFP4 round trip (the
 kernel requantizes the intermediate) -> @ W2^T, weighted by the routing weight.
 
+Every case is checked element-wise against that reference (a fraction of the
+elements outside rtol/atol fails the run, so a few corrupted rows are caught) and
+timed. The kernel writes into an output buffer pre-filled with NaN, as the model
+passes one, so rows it leaves unwritten fail the comparison.
+
 Run:
-    pytest op_tests/test_flydsl_minimax_m3_moe_prefill.py
+    python3 op_tests/test_flydsl_minimax_m3_moe_prefill.py
 """
 
+import argparse
 import os
 import subprocess
 import sys
 
-import pytest
+import pandas as pd
 import torch
 
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
-pytestmark = pytest.mark.skipif(
-    get_gfx_runtime() != "gfx950", reason="MXFP4 MFMA prefill kernels need gfx950"
-)
+SUPPORTED_GFX = ["gfx950"]  # the MXFP4 MFMA prefill kernels need gfx950
 
 HIDDEN, INTER, EXPERTS, TOPK = 6144, 768, 128, 4
 ALPHA, LIMIT = 1.702, 7.0
+TOKENS = [3072, 5000, 16383, 16384, 65536]  # block_m 128 below 16384, 256 from it
+# bf16 output, so one rounding step (2^-8 relative) separates two correct answers; the
+# largest difference seen on the reference at 3072-16384 tokens is 0.016
+RTOL, ATOL = 0.05, 0.05
 
 
 def _quant(x):
@@ -108,7 +118,8 @@ def _make_inputs(n_tokens, seed=0, device="cuda"):
     return x, w13, w2, topk_ids, topk_weights, kernel_form(w13), kernel_form(w2)
 
 
-def _check(n_tokens, device="cuda"):
+def _setup(n_tokens, device="cuda"):
+    """-> (call, out, ref): the kernel call into a NaN-filled `out`, and the reference."""
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
         a4w4_prefill_moe,
     )
@@ -117,45 +128,77 @@ def _check(n_tokens, device="cuda"):
         n_tokens, device=device
     )
     x_q, x_s = _quant(x)
-    got = a4w4_prefill_moe(
-        (x_q, x_s),
-        w13_k,
-        w13_ks,
-        w2_k,
-        w2_ks,
-        wts,
-        ids,
-        hidden_size=HIDDEN,
-        intermediate_size=INTER,
-        num_experts=EXPERTS,
-    )
-    torch.cuda.synchronize(device)
+    out = torch.full((n_tokens, HIDDEN), float("nan"), dtype=dtypes.bf16, device=device)
+
+    def call():
+        return a4w4_prefill_moe(
+            (x_q, x_s),
+            w13_k,
+            w13_ks,
+            w2_k,
+            w2_ks,
+            wts,
+            ids,
+            hidden_size=HIDDEN,
+            intermediate_size=INTER,
+            num_experts=EXPERTS,
+            out=out,
+        )
+
     # the kernel returns bf16: round the reference the same way before comparing
-    ref = _reference(x_q, x_s, w13, w2, ids, wts).to(torch.bfloat16).float()
-
-    assert got.shape == (n_tokens, HIDDEN) and got.dtype == torch.bfloat16
-    assert got.device == x.device
-    got = got.float()
-    rel = ((got - ref).norm() / ref.norm()).item()
-    cos = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0)
-    print(f"\n{device} n_tokens {n_tokens}: rel L2 err {rel:.5f}, cos {cos.item():.6f}")
-    assert rel < 0.03, rel
-    assert cos > 0.999, cos
+    ref = _reference(x_q, x_s, w13, w2, ids, wts).to(dtypes.bf16)
+    return call, out, ref
 
 
-@pytest.mark.parametrize(
-    "n_tokens", [3072, 5000, 16383, 16384, 65536]
-)  # block_m 128 below 16384, 256 from it
+def _check(n_tokens, device="cuda"):
+    call, out, ref = _setup(n_tokens, device)
+    assert call() is out
+    torch.cuda.synchronize(device)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg=f"{device} n_tokens {n_tokens}: ",
+    )
+    assert err == 0, f"{err:.2e} of the elements are outside rtol/atol"
+    return call, err
+
+
+@benchmark()
 def test_a4w4_prefill_moe(n_tokens):
-    _check(n_tokens)
+    call, err = _check(n_tokens)
+    _, us = run_perftest(call)
+    # gemm1 (gate and up, 2 * H * 2I) and gemm2 (2 * I * H) per routed token
+    flops = n_tokens * TOPK * (4 * HIDDEN * INTER + 2 * INTER * HIDDEN)
+    # activations, every expert's weights and scales read once, the bf16 partials written
+    # by gemm2 and read by the reduce, the output
+    nbytes = (
+        n_tokens * (HIDDEN // 2 + HIDDEN // 32)
+        + EXPERTS * 3 * INTER * HIDDEN // 2 * (1 + 1 / 16)
+        + 2 * n_tokens * TOPK * HIDDEN * 2
+        + n_tokens * HIDDEN * 2
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": nbytes / us / 1e6,
+        "err": err,
+    }
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_a4w4_prefill_moe_non_current_device():
+    if torch.cuda.device_count() < 2:
+        aiter.logger.warning("non-current device check needs two GPUs; skipping")
+        return
     # tensors on cuda:1 while cuda:0 is current: a fresh process, as FlyDSL binds a
     # compiled kernel to the first device that runs it
-    code = f"import importlib; importlib.import_module({__name__!r})._check(3072, 'cuda:1')"
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    here, name = os.path.split(
+        os.path.splitext(__file__)[0]
+    )  # __name__ is __main__ here
+    code = f"import importlib; importlib.import_module({name!r})._check(3072, 'cuda:1')"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([here, *sys.path])}
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
@@ -189,6 +232,15 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
     bad = {
         "out of the wrong length": {"out": zeros(n - 1, HIDDEN, dtype=torch.bfloat16)},
         "out of the wrong dtype": {"out": zeros(n, HIDDEN, dtype=torch.float32)},
+        "w13 of another dtype, same shape": {
+            "w13": zeros(EXPERTS, 2 * INTER, HIDDEN // 2, dtype=torch.bfloat16)
+        },
+        "w2_scale of another dtype": {
+            "w2_scale": zeros(EXPERTS * HIDDEN, INTER // 32, dtype=torch.float32)
+        },
+        "strided w13_scale": {
+            "w13_scale": zeros(EXPERTS * 2 * INTER, HIDDEN // 16)[:, ::2]
+        },
         "w13 without its last expert": {"w13": good["w13"][:-1]},
         "w2 without its last expert": {"w2": good["w2"][:-1]},
         "undersized w13_scale": {"w13_scale": good["w13_scale"][:-1]},
@@ -201,6 +253,32 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
         },
     }
     for name, change in bad.items():
-        with pytest.raises(AssertionError):
+        try:
             a4w4_prefill_moe(**{**good, **change})
-            pytest.fail(name)
+        except AssertionError:
+            continue
+        raise RuntimeError(f"accepted: {name}")
+
+
+def main():
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "minimax_m3 prefill moe unsupported on %s; skipping", get_gfx_runtime()
+        )
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument("-t", "--tokens", type=int, nargs="*", default=TOKENS)
+    args = parser.parse_args()
+    df = pd.DataFrame([test_a4w4_prefill_moe(n) for n in args.tokens])
+    aiter.logger.info(
+        "minimax_m3 prefill moe summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    test_a4w4_prefill_moe_rejects_bad_inputs()
+    test_a4w4_prefill_moe_non_current_device()
+
+
+if __name__ == "__main__":
+    main()
