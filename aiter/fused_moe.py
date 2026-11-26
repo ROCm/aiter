@@ -4866,10 +4866,14 @@ def _a16w4_w1_layout_unsupported(activation, gate_mode, gate_up_interleave):
     """Why the a16w-mix port cannot read this w1, or None.
 
     The SiTUv2 port reads separated gate/up (GGUU) w1, the layout of
-    shuffle_weight_a16w4(w1, 16, False). It ignores gate_mode. The rule
-    follows the port's w_layout, so it stays right if that layout becomes
-    guinterleave for SiTUv2. An untagged w1 (gate_up_interleave None) with
-    SEPARATED keeps running: the bytes of a GUGU shuffle are not detectable.
+    shuffle_weight_a16w4(w1, 16, False). It ignores gate_mode. An untagged w1
+    (gate_up_interleave None) with SEPARATED keeps running: the bytes of a GUGU
+    shuffle are not detectable.
+
+    caller_gugu below is true if either signal says GUGU. That is right for
+    the separated port only. A port that reads GUGU would have to accept a w1
+    only when gate_mode is INTERLEAVE and gate_up_interleave is True, so the
+    port_gugu branch is not a ready-made rule for it.
     """
     layout = _a16w4_port_w_layout(activation)
     if layout is None:
