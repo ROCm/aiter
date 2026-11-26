@@ -3011,6 +3011,17 @@ def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
                 )
 
 
+@skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+@parametrize("head_dim", [96, 192])
+def test_mha_v4_sol_rejects_unsupported_head_dims(head_dim):
+    """K smoothing sees K before the head dimension is checked, so it has to raise, not abort."""
+    fp8 = native_fp8_format()
+    dummy = torch.zeros((1, 256, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    with expect_raises(ValueError, match="head dimension 64, 128 or 256"):
+        mha_v4_sol(dummy, dummy, dummy, fp8, fp8, fp8)
+
+
 def _e8m0_operand(batch, seqlen, heads, head_dim, decades=12.0, seed=0):
     """(raw, data, scale) for an E8M0 operand whose exponent changes from token to token.
 

@@ -161,7 +161,7 @@ struct MegaMHCQuantOutput
             const unsigned bits = __float_as_uint(amax * (1.0f / 448.0f));
             const int exponent  = min(max(static_cast<int>((bits + 0x7fffff) >> 23), 1), 254);
             const float scale   = __uint_as_float(exponent << 23);
-            using u16x2         = unsigned short __attribute__((ext_vector_type(2)));
+            using bf16x2        = __bf16 __attribute__((ext_vector_type(2)));
             using i16x2         = short __attribute__((ext_vector_type(2)));
             opus::vector_t<unsigned, 2> packed;
 #pragma unroll
@@ -172,9 +172,9 @@ struct MegaMHCQuantOutput
                 // on an ext_vector subscript by using the first element instead.
                 const unsigned lo = words[2 * d], hi = words[2 * d + 1];
                 pair = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
-                    pair, __builtin_bit_cast(u16x2, lo), scale, false);
+                    pair, __builtin_bit_cast(bf16x2, lo), scale, false);
                 pair = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
-                    pair, __builtin_bit_cast(u16x2, hi), scale, true);
+                    pair, __builtin_bit_cast(bf16x2, hi), scale, true);
                 packed[d] = __builtin_bit_cast(unsigned, pair);
             }
             const auto bytes = __builtin_bit_cast(opus::vector_t<uint8_t, 8>, packed);
