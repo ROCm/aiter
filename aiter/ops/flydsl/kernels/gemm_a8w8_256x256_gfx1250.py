@@ -28,6 +28,9 @@ from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+    buf_copy_store,
+    ptr_buf_tensor,
 )
 
 # ── VGPR pins (mxfp4 partition; no env knobs) ───────────────────────────
@@ -109,6 +112,7 @@ def launch_gemm_a8w8_256x256(
     b_scale_32x32: Constexpr[bool] = False,
     batched: Constexpr[bool] = False,
     m_run_cap: Constexpr[int] = 32,
+    c_vmem_store: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
 ):
     """N must be a multiple of ``tile_n`` (of ``tile_n * cluster_n`` when
@@ -122,7 +126,9 @@ def launch_gemm_a8w8_256x256(
     ``batched``: A ``[M, batch, K]``, A scale ``[M, batch, K/32]``, B and its
     scale ``[batch, ...]``, C ``[M, batch, N]``.
     ``m_run_cap``: the most M tiles one grid.x run spans before the rest of M
-    moves to grid.z (a power of two; the M-tile count must split into runs)."""
+    moves to grid.z (a power of two; the M-tile count must split into runs).
+    ``c_vmem_store`` (persistent nb2 C relocation only): C leaves LDS through
+    ``ds_load`` + ``buffer_store`` instead of a TDM store."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -301,6 +307,15 @@ def launch_gemm_a8w8_256x256(
     )
     if c_relocate:
         ARENA_B = max(ARENA_B, Q_END)
+    # C goes LDS -> VGPR -> buffer_store, so the next tile's slot-1 refill waits
+    # only for the LDS reads, not for C to land in memory. Barriers on this path
+    # are raw s_barrier_signal/wait: gpu.barrier()'s fence would make every wave
+    # wait for its C stores.
+    C_VMEM = c_vmem_store
+    assert not C_VMEM or (
+        c_relocate and num_buffers == 2 and not batched
+    ), "c_vmem_store needs persistent nb2 C relocation without batching"
+    C_STORE_TH_NT = 1  # keeps C from evicting the next tile's A/B in L2
     # Drain K-steps whose freed slot takes the next tile's matching K-step, and how
     # many of those loads are already in flight when each drain K-step fences.
     DRAIN_PREF = [
@@ -329,6 +344,7 @@ def launch_gemm_a8w8_256x256(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
         + (f"_mr{m_run_cap}" if m_run_cap != 32 else "")
+        + ("_cv" if c_vmem_store else "")
     )
 
     def _run_tile(
@@ -1629,13 +1645,22 @@ def launch_gemm_a8w8_256x256(
 
         for i in range_constexpr(num_buffers):
             if const_expr(c_relocate and i == C_EARLY_SLOTS):  # noqa: SIM102
-                # Slots from here on hold the previous tile's C until its TDM
-                # store, and every peer's, has read it out of LDS.
+                # Slots from here on hold the previous tile's C until its store
+                # (ds_load for C_VMEM, TDM otherwise), and every peer's, has read
+                # it out of LDS.
                 if tile_idx > 0:  # noqa: SIM102
                     if defer == 0:
                         rocdl.sched_barrier(0)
-                        tdm_ops.tensor_wait(0)
-                        workgroup_barrier(use_cluster=False)
+                        if const_expr(C_VMEM):
+                            rocdl.s_wait_dscnt(0)
+                            rocdl.s_barrier_signal(-1)
+                            rocdl.s_barrier_wait(-1)
+                            if const_expr(use_cluster):
+                                cluster.cluster_signal_once_per_wg()
+                                cluster.cluster_wait()
+                        else:
+                            tdm_ops.tensor_wait(0)
+                            workgroup_barrier(use_cluster=False)
             seed_delta = _seed_delta(i)
             if const_expr(c_relocate and i < C_EARLY_SLOTS):
                 if fx.Int32(i) >= prev_pref:
@@ -1660,7 +1685,12 @@ def launch_gemm_a8w8_256x256(
                 rocdl.sched_barrier(0)
                 _zero_accs()
                 rocdl.sched_barrier(0)
-        pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
+        if const_expr(C_VMEM):
+            tdm_ops.tensor_wait(num_buffers - 1)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+        else:
+            pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
 
         def _deferred_slots():
             """First refill of a deferring tile: wait out every wave's C store in the
@@ -1781,7 +1811,11 @@ def launch_gemm_a8w8_256x256(
             for c in range_constexpr(C_EARLY_SLOTS + 1):
                 if n_out == c:
                     tdm_ops.tensor_wait(c)
-            workgroup_barrier(use_cluster=False)
+            if const_expr(C_VMEM):
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
+            else:
+                workgroup_barrier(use_cluster=False)
         else:
             pipeline_fence(outstanding=0, use_cluster=use_cluster)
         gC_base = fx.recast_iter(
@@ -1815,6 +1849,33 @@ def launch_gemm_a8w8_256x256(
             q_rows = c_rows - wmb
             q_rows = (q_rows < warp_tile_m).select(q_rows, fx.Int32(warp_tile_m))
             q_rows = (q_rows > 0).select(q_rows, fx.Int32(0))
+            if const_expr(C_VMEM):
+                row_b = Q_LDS_ROW * 2
+                c_base = buf_base_i64(arg_c) + (
+                    (blk_m64 + fx.Int64(wmb)) * ldc64 + blk_n64 + fx.Int64(wnb)
+                ) * fx.Int64(partial_bytes)
+                c_rec = fx.Int32(rocdl.readfirstlane(T.i32, q_rows)) * (
+                    i32_ldc * partial_bytes
+                )
+                cbuf = ptr_buf_tensor(
+                    c_base, elem=fx.Int32, unit_elems=4, num_records_bytes=c_rec
+                )
+                lrow, lc16 = lane // 16, lane % 16
+                q_lds = fx.index_cast(T.index, fx.ptrtoint(q_ptrs[0])) + fx.index_cast(
+                    T.index, lrow * row_b + lc16 * 16
+                )
+                ldc16 = i32_ldc * partial_bytes // 16
+                for it in range_constexpr(warp_tile_m // 2):
+                    v = lds_load_b128(q_lds, it * 2 * row_b)
+                    buf_copy_store(
+                        cbuf,
+                        (fx.Int32(it * 2) + lrow) * ldc16 + lc16,
+                        v,
+                        elem=fx.Int32,
+                        unit_elems=4,
+                        cache_modifier=C_STORE_TH_NT,
+                    )
+        if const_expr(c_relocate and not C_VMEM):
             for part, row0, n_rows in (
                 (0, 0, Q_SPLIT),
                 (1, Q_SPLIT, warp_tile_m - Q_SPLIT),
@@ -1851,7 +1912,7 @@ def launch_gemm_a8w8_256x256(
                     atomQ, 0, fx.make_layout(1, 1), sQ, blkQ
                 )
                 fx.copy(atomQ, tQs[None, 0], tQg[None, 0])
-        else:
+        elif const_expr(not c_relocate):
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
                 if const_expr(cluster_splitk):

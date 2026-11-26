@@ -1473,7 +1473,9 @@ def _flydsl_mxfp8_fallback_kernel(
         # Short-K mx32 nb2 is the exception: four tiles per CTA let the C store
         # overlap the next tile's loads, while the grid still fills every CU.
         # From N=32768 on, 4-tile M runs also beat 32 (16384x32768x1280: 260 ->
-        # 246 us); at N<=16384 they lose up to 5%.
+        # 246 us); at N<=16384 they lose up to 5%. From N=32768 on, a VMEM C
+        # store (_cv) also frees the next tile from waiting on C
+        # (16384x32768x2048: 379 -> 323 us cold).
         if (
             mx32
             and best.split_k == 1
@@ -1483,7 +1485,7 @@ def _flydsl_mxfp8_fallback_kernel(
             ps4 = dataclasses.replace(best, persistent_n_tiles=4)
             if ps4 in compute and compute_grid_ctas(ps4, m, n) >= 2 * get_cu_num():
                 if n >= 32768:
-                    return dataclasses.replace(ps4, m_run_cap=4)
+                    return dataclasses.replace(ps4, m_run_cap=4, c_vmem_store=True)
                 return ps4
         # Long-K mx32: four one-K-tile slots keep more of K in flight than two
         # two-K-tile slots, which hides the TDM latency the nb2 loop waits on.
@@ -1783,10 +1785,10 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     """Fall back to the bpreshuffle winner for a shape with no A-preshuffle row.
 
     The two kernel families differ only by an ``_apre`` marker, which sits before
-    any ``_ps<n>`` persistent-tile and ``_mr<n>`` M-run suffix. Those bpreshuffle
-    rows are the e8m0 2D-GEMM rows of the mxscale table -- the very ones the
-    non-A-preshuffled gfx1250 path reads -- not the fp32 blockscale-bpreshuffle
-    table.
+    any ``_ps<n>`` persistent-tile, ``_mr<n>`` M-run and ``_cv`` suffix. Those
+    bpreshuffle rows are the e8m0 2D-GEMM rows of the mxscale table -- the very
+    ones the non-A-preshuffled gfx1250 path reads -- not the fp32
+    blockscale-bpreshuffle table.
     """
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
 
@@ -1796,7 +1798,7 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     borrowed = None
     if config is not None and config.get("libtype") == "flydsl":
         name = re.sub(
-            r"((?:_ps\d+)?(?:_mr\d+)?(?:_aspre)?)$",
+            r"((?:_ps\d+)?(?:_mr\d+)?(?:_cv)?(?:_aspre)?)$",
             r"_apre\1",
             str(config["kernelName"]),
             count=1,

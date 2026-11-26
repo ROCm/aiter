@@ -147,6 +147,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     w_scale_32x32: bool = False,
     batch: int = 1,
     m_run_cap: int = 32,
+    c_vmem_store: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -169,11 +170,24 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
 
     ``m_run_cap`` (compute kernels, kernelName ``_mr<n>``): the most M tiles
     one launch-grid row spans; 32 by default.
+
+    ``c_vmem_store`` (kernelName ``_cv``; compute, nb2, ``_ps``, batch 1): the
+    persistent C store goes through VMEM instead of TDM.
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     if m_run_cap != 32 and not compute_bound:
         raise RuntimeError(
             "[FlyDSL gfx1250 mxfp8] m_run_cap (_mr) needs a compute-bound kernel"
+        )
+    if c_vmem_store and not (
+        compute_bound
+        and int(num_buffers) == 2
+        and persistent_n_tiles > 1
+        and batch == 1
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] c_vmem_store (_cv) needs a compute-bound nb2 "
+            "persistent (_ps) kernel with batch 1"
         )
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
@@ -430,6 +444,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,
             batch > 1,
             m_run_cap,
+            c_vmem_store,
         )
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
@@ -490,6 +505,7 @@ NAME_SUFFIX_RE = (
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
     r"(?:_mr(?P<m_run_cap>\d+))?"
+    r"(?P<c_vmem_store>_cv)?"
 )
 MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -511,6 +527,7 @@ def _parse_name(match):
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
+    c_vmem_store = groups.pop("c_vmem_store", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     m_run_cap = groups.pop("m_run_cap", None)
     cfg = {key: int(value) for key, value in groups.items()}
@@ -519,6 +536,7 @@ def _parse_name(match):
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     cfg["m_run_cap"] = int(m_run_cap) if m_run_cap else 32
+    cfg["c_vmem_store"] = c_vmem_store
     return cfg
 
 
@@ -688,6 +706,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
         m_run_cap=cfg["m_run_cap"],
+        c_vmem_store=cfg["c_vmem_store"],
     )
 
 
@@ -738,6 +757,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
         m_run_cap=cfg["m_run_cap"],
+        c_vmem_store=cfg["c_vmem_store"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,
