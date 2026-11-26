@@ -22,20 +22,14 @@ def _mxfp4_intermediate_enabled():
     return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
 
 
-def a16wmix_w_layout(act: str) -> str:
-    """Layout the a16w-mix gemm1 port reads for this activation.
+def a16wmix_w_layout() -> str:
+    """Layout the a16w-mix gemm1 port reads, for every activation.
 
     ``standard`` is the separated GGUU preshuffle
-    (``shuffle_weight_a16w4(w1, 16, False)``). ``guinterleave`` is the GUGU
-    preshuffle. SiTUv2 is ``standard``; the port ignores ``gate_mode``.
-    ``fused_moe`` rejects a caller layout that does not match this, so a
-    follow-up that teaches SiTUv2 to read GUGU changes the return value here
-    and the guard follows.
+    (``shuffle_weight_a16w4(w1, 16, False)``). Every activation the port
+    supports reads this layout. The port ignores ``gate_mode``.
+    Make this take the activation once one of them needs another layout.
     """
-    if act == "situv2":
-        return "standard"
-    # Silu and Swiglu on this port are GGUU as well. A Silu INTERLEAVE reader
-    # would return "guinterleave" for that activation only.
     return "standard"
 
 

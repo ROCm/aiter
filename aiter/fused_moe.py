@@ -4859,7 +4859,7 @@ def _a16w4_port_w_layout(activation):
     """
     if ActivationType(activation) != ActivationType.Situv2:
         return None
-    return a16wmix_w_layout("situv2")
+    return a16wmix_w_layout()
 
 
 def _a16w4_w1_layout_unsupported(activation, gate_mode, gate_up_interleave):
