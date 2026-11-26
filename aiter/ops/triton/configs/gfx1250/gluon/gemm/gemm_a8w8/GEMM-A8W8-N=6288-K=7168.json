@@ -17,7 +17,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "M_LEQ_16": {
         "BLOCK_M": 16,
@@ -36,7 +37,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "M_LEQ_32": {
         "BLOCK_M": 32,
@@ -55,7 +57,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "M_LEQ_64": {
         "BLOCK_M": 64,
@@ -74,7 +77,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "M_LEQ_128": {
         "BLOCK_M": 64,
@@ -93,7 +97,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_256": {
         "BLOCK_M": 128,
@@ -112,7 +117,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_512": {
         "BLOCK_M": 128,
@@ -131,7 +137,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_1024": {
         "BLOCK_M": 512,
@@ -150,7 +157,8 @@
         "NUM_KSUB": 2,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_2048": {
         "BLOCK_M": 256,
@@ -169,7 +177,8 @@
         "NUM_KSUB": 2,
         "CTAS_M": 1,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_4096": {
         "BLOCK_M": 256,
@@ -188,7 +197,8 @@
         "NUM_KSUB": 2,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "M_LEQ_8192": {
         "BLOCK_M": 1024,
@@ -207,7 +217,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     },
     "any": {
         "BLOCK_M": 1024,
@@ -226,6 +237,7 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 1
+        "PRE_NEG": 1,
+        "B2B_WMMA": 0
     }
 }

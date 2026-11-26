@@ -16,7 +16,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "M_LEQ_512": {
         "BLOCK_M": 64,
@@ -35,7 +36,8 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     },
     "any": {
         "BLOCK_M": 256,
@@ -54,6 +56,7 @@
         "NUM_KSUB": 1,
         "CTAS_M": 0,
         "SCALE_TDM": 1,
-        "PRE_NEG": 0
+        "PRE_NEG": 0,
+        "B2B_WMMA": 0
     }
 }
