@@ -249,7 +249,7 @@ KV_PRODUCER_WARPS = NUM_WAVES // 2
 # live at 4 VGPR each, num_prefetch = RING - 2*LAG in flight, instead of bursting a whole
 # tile before the first wmma. Keep RING a multiple of 4 -- an odd wrap flips slot parity,
 # costing a cycle on half the wmma.
-PVQK_RING = 24
+PVQK_RING = 20
 PVQK_LAG = 2
 # Ring-head loads issued at the END of a body (under the softmax VALU) and carried across
 # the back edge, instead of at the top of the body that consumes them. Clamped to
@@ -1795,11 +1795,14 @@ def _attention_core_multi_kv_tiles(
             prefetch_desc.async_load()
             for _mask, _count in _hi_tdm_pipeline(prefetch_desc.tensorcnt):
                 rocdl.sched_group_barrier(_mask, _count, 0)
-            p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
-            # Pin the LDS addresses here: they are v_add results feeding a ds_load, so
-            # the `s_wait_alu va_vdst(0)` they force must not sink into the wmma stream,
-            # where it waits on the wmma. A USE anchors; sched_barrier does not.
+            # Pin the LDS addresses AHEAD of softmax: they are v_add results feeding a
+            # ds_load, so they force an `s_wait_alu va_vdst(0)`, and that wait drains the
+            # whole VALU counter. Anchored after softmax it waits on softmax's own tail,
+            # right where the head's ds_loads want to issue. Here the only outstanding
+            # VALU is the previous body's, and softmax covers the address latency.
+            # A USE anchors; sched_barrier does not.
             _keepalive(v_curr + k_curr)
+            p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
             pvqk_head = _pvqk_head()
@@ -1825,6 +1828,13 @@ def _attention_core_multi_kv_tiles(
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             head_next = []
         else:
+            # Pin the LDS addresses first, ahead of the narrowing and the drain: they are
+            # v_add results feeding a ds_load, so they force an `s_wait_alu va_vdst(0)`
+            # that drains the whole VALU counter. Anchored just above the head it waits on
+            # the narrowing's v_cvt run, right where the head's ds_loads want to issue;
+            # here the conversion covers the address latency instead. A USE anchors;
+            # sched_barrier does not.
+            _keepalive(v_curr + k_curr)
             # Past the latch: the carry crosses the back edge as f32, so the exit test
             # sits between the producing softmax and this narrowing. _keepalive anchors
             # it ahead of the drain -- MachineSink would otherwise push it into the gemm.
@@ -1832,10 +1842,6 @@ def _attention_core_multi_kv_tiles(
             _keepalive([v for pt in carry_prev for v in pt])
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
-            # Pin the LDS addresses here: they are v_add results feeding a ds_load, so
-            # the `s_wait_alu va_vdst(0)` they force must not sink into the wmma stream,
-            # where it waits on the wmma. A USE anchors; sched_barrier does not.
-            _keepalive(v_curr + k_curr)
             pvqk_head = _pvqk_head()
             _tap, _tap_data = _tdm_tap(prefetch_desc)
             if _tap is None:
