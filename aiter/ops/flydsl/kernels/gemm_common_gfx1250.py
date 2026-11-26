@@ -302,7 +302,18 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     return results
 
 
-def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+def batched_silu_swiglu(
+    pairs,
+    *,
+    swiglu,
+    limit_f32,
+    neg_limit_f32,
+    range_constexpr,
+    chunk=4,
+    gate_fma=False,
+    sigmoid_fma=False,
+    clamp_chunk=0,
+):
     """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
 
     Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
@@ -322,15 +333,33 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     Returns:
         list of activated f32 values, same length as *pairs*.
     """
+    if clamp_chunk and len(pairs) > clamp_chunk:
+        return [
+            value
+            for begin in range_constexpr(0, len(pairs), clamp_chunk)
+            for value in batched_silu_swiglu(
+                pairs[begin : begin + clamp_chunk],
+                swiglu=swiglu,
+                limit_f32=limit_f32,
+                neg_limit_f32=neg_limit_f32,
+                range_constexpr=range_constexpr,
+                chunk=chunk,
+                gate_fma=gate_fma,
+                sigmoid_fma=sigmoid_fma,
+            )
+        ]
     _one = fx.Float32(1.0)
     _half = fx.Float32(0.5)
     _half_scale = fx.Float32((1.702 * 0.5) if swiglu else 0.5)
     N = len(pairs)
-    CHUNK = 4
+    assert not gate_fma or not swiglu
+    CHUNK = chunk
     # Stage 1: clamp all pairs
     gs, us = [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
+        if gate_fma:
+            g = g * _half
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         gs.append(g)
         us.append(u)
@@ -344,23 +373,37 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
         hi = min(lo + CHUNK, N)
         for i in range_constexpr(lo, hi):
             tanh_vals[i] = fx.Float32(
-                rocdl.tanh(T.f32, as_ir_value(gs[i] * _half_scale))
+                rocdl.tanh(
+                    T.f32, as_ir_value(gs[i] if gate_fma else gs[i] * _half_scale)
+                )
             )
         rocdl.sched_barrier(0)
         prev_lo = (c - 1) * CHUNK if c > 0 else None
         prev_hi = lo if c > 0 else None
         if prev_lo is not None:
             for i in range_constexpr(prev_lo, prev_hi):
-                sig = _half * (_one + tanh_vals[i])
-                if swiglu:
+                sig = (
+                    fx.Float32(fx.fma(_half, tanh_vals[i], _half))
+                    if sigmoid_fma
+                    else _half * (_one + tanh_vals[i])
+                )
+                if gate_fma:
+                    results[i] = fx.Float32(fx.fma(gs[i], tanh_vals[i], gs[i])) * us[i]
+                elif swiglu:
                     results[i] = gs[i] * sig * (us[i] + _one)
                 else:
                     results[i] = gs[i] * sig * us[i]
     # Drain last chunk's VALU
     drain_lo = (n_chunks - 1) * CHUNK
     for i in range_constexpr(drain_lo, N):
-        sig = _half * (_one + tanh_vals[i])
-        if swiglu:
+        sig = (
+            fx.Float32(fx.fma(_half, tanh_vals[i], _half))
+            if sigmoid_fma
+            else _half * (_one + tanh_vals[i])
+        )
+        if gate_fma:
+            results[i] = fx.Float32(fx.fma(gs[i], tanh_vals[i], gs[i])) * us[i]
+        elif swiglu:
             results[i] = gs[i] * sig * (us[i] + _one)
         else:
             results[i] = gs[i] * sig * us[i]

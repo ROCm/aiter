@@ -103,18 +103,6 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
-def _bounded_buffer_arg(tensor, dtype=None, tensor_abi=False):
-    """Keep persistent launch Tensor metadata bounded, without copying buffers."""
-    if not tensor_abi:
-        return ptr_arg(tensor, dtype)
-    if dtype is fx.Int32:
-        size = tensor.element_size()
-        if tensor.numel() * size < 4 or (tensor.storage_offset() * size) % 4:
-            return ptr_arg(tensor, dtype)
-        return tensor.as_strided((max(1, 4 // size),), (1,)).view(torch.int32)
-    return tensor.as_strided((min(tensor.numel(), 1),), (1,))
-
-
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -234,7 +222,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # Optional arguments may reuse the output as an unused address placeholder.
+    # These arguments only supply base addresses. Pass pointers below so large
+    # buffers do not cross the C ABI with signed 32-bit tensor dimensions.
     quant_scale_tensor = out if quant_scale is None else quant_scale
     out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
     if stage1_quant_out:
@@ -257,9 +246,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
-    persistent_prefill = bool(
-        persistent_workers
-        and _supports_clustered_persistent(
+    if persistent_workers:
+        if cluster_m != 1 and not _supports_clustered_persistent(
             (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers),
             a_is_fp4,
             a_preshuffled,
@@ -267,10 +255,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             stage1_quant_out,
             cluster_n,
             cluster_m,
-        )
-    )
-    if persistent_workers:
-        if cluster_m != 1 and not persistent_prefill:
+        ):
             raise ValueError("clustered persistent workers require pinned A4W4 prefill")
         if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
@@ -356,30 +341,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     # The cache key owns N, so every task can use constant output strides.
     launch_spec = (int(quant_payload_preshuffled), int(N))
-    # Paired gfx1250 profiling favors Tensor packing for clustered workers.
-    # Only the base address reaches the kernel; extents use the explicit sizes.
-    # Small views retain main's large-buffer ABI and pitched/offset support.
-    c_arg, sa_arg, sb_arg, qs_arg, ep_arg = buffer_args = tuple(
-        _bounded_buffer_arg(tensor, dtype, persistent_prefill)
-        for tensor, dtype in (
-            (out, out_dtype),
-            (a_scales, fx.Int32),
-            (w_scales, fx.Int32),
-            (quant_scale_tensor, None),
-            (ep_row_map_tensor, fx.Int32),
-        )
-    )
-    buffer_spec = tuple(
-        (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
-        for value in buffer_args
-    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        c_arg,
+        ptr_arg(out, out_dtype),
         ptr_arg(a),
         ptr_arg(w),
-        sa_arg,
-        sb_arg,
+        ptr_arg(a_scales, fx.Int32),
+        ptr_arg(w_scales, fx.Int32),
         contiguous_m,
         stream,
         N,
@@ -389,10 +357,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         bias_ptr,
         float(swiglu_limit),
         *quant_spec,
-        qs_arg,
+        ptr_arg(quant_scale_tensor),
         *tdm_spec,
         *ep_spec,
-        ep_arg,
+        ptr_arg(ep_row_map_tensor, fx.Int32),
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
@@ -406,7 +374,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             layout_spec,
             launch_spec,
             out.device,
-            buffer_spec,
         ),
     )
     return out

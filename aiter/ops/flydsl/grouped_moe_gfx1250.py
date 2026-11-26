@@ -896,18 +896,12 @@ def _grouped_a8w4_tdm_moe(
             contiguous_m = min(_compact_rows, contiguous_m)
         max_m = contiguous_m
 
-    # Compact GEMM1 reads the original pitched wire; only its quantized output
-    # adopts GEMM2's native M16/K32 payload layout. Keep unsupported shapes on
-    # the existing compact output layout.
+    # Compact GEMM1 keeps its pitch; eligible quant output uses native M16/K32.
     a2_preshuffled = a_preshuffled or bool(
         _compact
         and _a_preshuffle_requested
-        and inter_dim % 128 == 0
-        and tile_n % 64 == 0
-        and tile_m % 16 == 0
-        and tile_m2 % 16 == 0
-        and tile_k2 % 128 == 0
-        and contiguous_m % 16 == 0
+        and inter_dim % 128 == tile_k2 % 128 == tile_n % 64 == 0
+        and tile_m % 16 == tile_m2 % 16 == contiguous_m % 16 == 0
     )
 
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
@@ -935,8 +929,7 @@ def _grouped_a8w4_tdm_moe(
     _fused_tp_route = (
         not herd_topk
         and not _compact
-        # APRE quantization consumes the inverse row_to_token map. This fused
-        # helper only builds topids_to_rows; the ordinary remapper fills both.
+        # APRE needs row_to_token; only the ordinary remapper fills both maps.
         and not a_preshuffled
         and not _is_ep
         and not enable_ep_scatter
