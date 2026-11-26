@@ -23,7 +23,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
+from aiter import (
+    dtypes,
+    gemm_a16w16_asm,
+    getHipblasltKernelName,
+    hipb_create_extension,
+    hipb_mm,
+    logger,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -84,6 +91,33 @@ def get_GEMM_A16W16_config_():
             ]
         ).to_dict("index")
     return gemm_dict
+
+
+@functools.cache
+def _hipblaslt_solution_matches(solidx: int, kernel_name: str) -> bool:
+    """Whether the installed hipBLASLt has ``kernel_name`` at index ``solidx``.
+
+    A solution index is valid only for the hipBLASLt version that the row was
+    tuned with. Another version can map it to another kernel, which writes a
+    wrong result. A row without a kernel name cannot be checked.
+    """
+    if kernel_name in ("", "nan", "None"):
+        return True
+    global extensions_created
+    if not extensions_created:
+        hipb_create_extension()
+        extensions_created = True
+    try:
+        live_name = getHipblasltKernelName(solidx)
+    except RuntimeError:
+        live_name = None
+    if live_name != kernel_name:
+        logger.warning(
+            f"hipBLASLt solution {solidx} is {live_name!r} in the installed "
+            f"hipBLASLt, not the tuned {kernel_name!r}; ignoring its tuned rows"
+        )
+        return False
+    return True
 
 
 def is_skinny_default_shape(
@@ -190,6 +224,13 @@ def get_GEMM_A16W16_tuned_config(
                         "recognized by the current catalog; falling back to next candidate."
                     )
                     config = None
+            if config is not None and (
+                config["libtype"] == "hipblaslt"
+                and not _hipblaslt_solution_matches(
+                    int(config["solidx"]), str(config["kernelName"])
+                )
+            ):
+                config = None
             if config is None:
                 continue
             # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250

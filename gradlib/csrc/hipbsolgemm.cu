@@ -2326,8 +2326,14 @@ std::string getHipblasltKernelName(int solution_index)
     std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
     std::vector<int> algoIndex(1);
     algoIndex[0] = solution_index;
-    CHECK_HIPBLAS_ERROR(
-        hipblaslt_ext::getAlgosFromIndex(hipblaslt_handle, algoIndex, heuristicResult));
+    aiter_detail::AiterThrowGuard guard;
+    const hipblasStatus_t status =
+        hipblaslt_ext::getAlgosFromIndex(hipblaslt_handle, algoIndex, heuristicResult);
+    AITER_CHECK(status == HIPBLAS_STATUS_SUCCESS && !heuristicResult.empty(),
+                "hipBLASLt has no solution ",
+                solution_index,
+                ": ",
+                hipblasStatusToString(status));
     return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
 }
 
