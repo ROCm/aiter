@@ -43,6 +43,9 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 KDA_BACKENDS = ("torch", "fused")
+# q/k L2-norm epsilon: fixed, because the chunk kernels that fuse the L2 norm
+# (FLA / #6498 / #8740) hard-code it; ``eps`` arguments are the RMSNorm's.
+L2NORM_EPS = 1e-6
 
 
 @dataclass
@@ -105,8 +108,8 @@ def kda_layer_preprocess(x, w: KDALayerWeights, num_heads, eps=1e-6, lower_bound
     q = _short_conv(xf @ w.w_q.float().t(), w.conv_q.float()).view(B, T, H, -1)
     k = _short_conv(xf @ w.w_k.float().t(), w.conv_k.float()).view(B, T, H, -1)
     v = _short_conv(xf @ w.w_v.float().t(), w.conv_v.float()).view(B, T, H, -1)
-    q = F.normalize(q, dim=-1, eps=eps)
-    k = F.normalize(k, dim=-1, eps=eps)
+    q = F.normalize(q, dim=-1, eps=L2NORM_EPS)
+    k = F.normalize(k, dim=-1, eps=L2NORM_EPS)
     gl = (xf @ w.f_a.float().t()) @ w.f_b.float().t() + w.dt_bias.float()
     g = kda_gate(gl.view(B, T, H, -1), w.A_log, lower_bound)
     beta = torch.sigmoid(xf @ w.w_beta.float().t())
@@ -277,7 +280,7 @@ def chunk_kda_bwd_torch(
     dt_bias=None,
     use_beta_sigmoid_in_kernel=False,
     lower_bound=None,
-    eps=1e-6,
+    eps=L2NORM_EPS,
 ):
     """Reference chunk backward with the ``register_chunk_bwd`` contract."""
     with torch.enable_grad():
@@ -364,8 +367,8 @@ def _token_major(*ts, dtype=None):
 def _chunk_fwd_triton():
     from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-    def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None):
-        q, k, v = _token_major(q, k, v, dtype=torch.bfloat16)
+    def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None, compute_dtype=None):
+        q, k, v = _token_major(q, k, v, dtype=compute_dtype or torch.bfloat16)
         g, beta = _token_major(g, beta)
         o, _ = chunk_kimi_delta_attn(
             q,
@@ -406,11 +409,23 @@ def _chunk_bwd_triton():
         chunk_delta_attn_bwd,
     )
 
-    def run(do, q, k, v, g, beta, scale, chunk_size, lower_bound=None, **kw):
+    def run(
+        do,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        chunk_size,
+        lower_bound=None,
+        compute_dtype=None,
+        **kw,
+    ):
         if lower_bound is not None:
             kw.update(safe_gate=True, lower_bound=lower_bound)
         dtypes_in = [t.dtype for t in (q, k, v, g, beta)]
-        q, k, v, do = (t.to(torch.bfloat16).contiguous() for t in (q, k, v, do))
+        q, k, v, do = _token_major(q, k, v, do, dtype=compute_dtype or torch.bfloat16)
         out = chunk_delta_attn_bwd(
             do,
             None,
@@ -511,7 +526,10 @@ def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None, cu_seqlens=None)
         if fn is None:
             break
         try:
-            o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens)
+            kw = {}
+            if _has_param(fn, "compute_dtype"):
+                kw["compute_dtype"] = _compute_dtype_of(dtype)
+            o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens, **kw)
         except (ValueError, NotImplementedError, RuntimeError) as err:
             LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
             continue
@@ -558,23 +576,21 @@ _MM_OUT_DTYPE_OK = True
 def _mm(a, b, cd):
     """2-D a @ b with inputs rounded to ``cd`` and an fp32 result.
 
-    16-bit inputs accumulate and store in fp32 (``torch.mm(out_dtype=)`` on
-    GPU), so the output is not rounded to 16 bits before the L2 norm and the
-    gates that follow.
+    16-bit inputs accumulate and store in fp32, so the output is never rounded
+    to 16 bits before the L2 norm and the gates that follow:
+    ``torch.mm(out_dtype=)`` where the build has it, else an fp32 GEMM on the
+    rounded inputs (the same numbers, slower).
     """
     global _MM_OUT_DTYPE_OK
     if cd == torch.float32:
         return a.float() @ b.float()
     a, b = a.to(cd), b.to(cd)
-    if not a.is_cuda:
-        return a.float() @ b.float()
-    if _MM_OUT_DTYPE_OK:
+    if a.is_cuda and _MM_OUT_DTYPE_OK:
         try:
             return torch.mm(a, b, out_dtype=torch.float32)
         except (RuntimeError, TypeError):
             _MM_OUT_DTYPE_OK = False
-    # no fp32-output GEMM in this torch build: round the output to 16 bits
-    return (a @ b).float()
+    return a.float() @ b.float()
 
 
 def conv_silu_bwd(a, w, dq, dk, dv, fn=None, cu_seqlens=None):
@@ -734,7 +750,8 @@ def _kda_layer_fused_fwd(
         a, conv_qkv = a.detach(), conv_qkv.detach()
     q_pre, k_pre, v = c.split([hk, hk, hv], -1)
     q_pre, k_pre, v = (t.reshape(B, T, H, -1) for t in (q_pre, k_pre, v))
-    q, k = F.normalize(q_pre, dim=-1, eps=eps), F.normalize(k_pre, dim=-1, eps=eps)
+    q = F.normalize(q_pre, dim=-1, eps=L2NORM_EPS)
+    k = F.normalize(k_pre, dim=-1, eps=L2NORM_EPS)
     proj = _proj_ops(x, w)
     lr = _mm(xc, w.f_a.t(), cd)
     g = proj.kda_gate_proj(lr, w.f_b, w.dt_bias, w.A_log, H, lower_bound)
@@ -785,6 +802,19 @@ def _kda_layer_fused_fwd(
         "chunk_in": chunk_in,
     }
     return y, saved
+
+
+def _has_param(fn, name):
+    """``fn`` names ``name`` explicitly (``**kwargs`` does not count)."""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _compute_dtype_of(dtype):
+    """Kernel input dtype for a layer of ``dtype``: its own 16-bit type, else fp32."""
+    return dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
 
 
 def _accepts(fn, name):
@@ -884,6 +914,8 @@ def _kda_layer_fused_bwd(
     if "beta_sigmoid" in fuses:
         b_in = s["braw"]
         kw["use_beta_sigmoid_in_kernel"] = True
+    if chunk_impl is not None and _has_param(chunk_impl, "compute_dtype"):
+        kw["compute_dtype"] = _compute_dtype_of(x.dtype)
     dq, dk, dv, dg, dbeta, dA_log, ddt = _chunk_bwd_varlen(
         chunk_bwd,
         cu_seqlens,
@@ -918,8 +950,8 @@ def _kda_layer_fused_bwd(
     d_wbeta = _mm(db.t(), xc, cd)
 
     if "qk_l2norm" not in fuses:
-        dq = ops.l2norm_bwd(s["q_pre"], dq.float(), eps)
-        dk = ops.l2norm_bwd(s["k_pre"], dk.float(), eps)
+        dq = ops.l2norm_bwd(s["q_pre"], dq.float(), L2NORM_EPS)
+        dk = ops.l2norm_bwd(s["k_pre"], dk.float(), L2NORM_EPS)
     dqkv = [t.reshape(B, T, -1) for t in (dq, dk, dv)]
     if conv_kernel is None:
         dc = torch.cat(dqkv, -1).float()
@@ -957,7 +989,7 @@ def _kda_layer_fused_bwd(
     LAST_PIECES["gemm"] = (
         "fp32"
         if cd == torch.float32
-        else f"{cd}->fp32" if _MM_OUT_DTYPE_OK else str(cd)
+        else f"{cd}->fp32" if _MM_OUT_DTYPE_OK else f"{cd} inputs, fp32 GEMM"
     )
     return dx.view(B, T, D).to(x.dtype), grads
 
