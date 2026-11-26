@@ -29,8 +29,8 @@ from .gemm_util import _e8m0_scale, _group_absmax, silu_mul_f32
 
 _STEP_K = 128
 _SLOT = 1024
-# Cache policy (sc0|nt) of the small-input kernel's GEMM1 weight-scale loads and output stores.
-_LA_CM = 3
+# Cache policy (sc0|nt) of GEMM1's weight-scale loads and output stores.
+_G1_CM = 3
 
 
 def _load_w(buf, unit, soff_dw, cm, width=4):
@@ -76,7 +76,7 @@ def _mfma(atom, acc, w, a, sw, sa):
     return cf.load()
 
 
-def _lane_ids(unit_zero, nw):
+def _lane_ids(unit_zero):
     tx = fx.thread_idx.x + unit_zero
     lane = tx % 64
     wave = fx.Int32(rocdl.readfirstlane(T.i32, tx // 64))
@@ -200,8 +200,6 @@ def make_ring_gemm1(
     pf,
     nbuf,
     w_cm,
-    sw_cm,
-    q_cm,
     swiglu_limit,
     tile_rows=None
 ):
@@ -263,7 +261,7 @@ def make_ring_gemm1(
         ``srcmap``: the slot words; ``q`` / ``qs``: the GEMM1 output and scales. Tile
         row r is slot ``tile_row_base + r * row_stride``, real below ``rows``."""
         unit_zero = (m_tile < fx.Int32(0)).select(m_tile, fx.Int32(0))
-        lane, l16, q16, wave = _lane_ids(unit_zero, nw)
+        lane, l16, q16, wave = _lane_ids(unit_zero)
         x_view = _dma_view(x, x_bytes)
         sx_view = _dma_view(sx, x_bytes)
         wbuf = ptr_buf_tensor(w, fx.Int32, unit_elems=4)
@@ -335,7 +333,7 @@ def make_ring_gemm1(
 
                 def scales():
                     sw_pairs[k // 2] = [
-                        _load_w(swbuf, sw_unit[j], (k // 2) * 64, sw_cm, 1)
+                        _load_w(swbuf, sw_unit[j], (k // 2) * 64, _G1_CM, 1)
                         for j in range(ni)
                     ]
 
@@ -463,7 +461,7 @@ def make_ring_gemm1(
                         ok.select(off, fx.Int32(bm * inter_dim // 4)),
                         pk,
                         fx.Int32,
-                        cache_modifier=q_cm,
+                        cache_modifier=_G1_CM,
                     )
                 sg = (c16_0 >> fx.Int32(1)) + fx.Int32(g)
                 s_off = (
@@ -479,7 +477,7 @@ def make_ring_gemm1(
                     ),
                     e8m0.to(fx.Int8),
                     fx.Int8,
-                    cache_modifier=q_cm,
+                    cache_modifier=_G1_CM,
                 )
 
     return tile
@@ -519,7 +517,7 @@ def make_ring_gemm2(*, model_dim, inter_dim, bm, bn, nw, pf, nbuf, tile_rows=Non
     ]
 
     def start(*, expert, n_block, unit_zero, w, sw, w_cm):
-        lane, l16, q16, wave = _lane_ids(unit_zero, nw)
+        lane, l16, q16, wave = _lane_ids(unit_zero)
         wbuf = ptr_buf_tensor(w, fx.Int32, unit_elems=4)
         swbuf = ptr_buf_tensor(sw, fx.Int32)
         blk0 = (

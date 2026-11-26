@@ -998,7 +998,7 @@ class SiluQuantEpilogue:
         gpu.barrier()
 
         if const_expr(self._evec == 8 and self._fused_v8):
-            self._store_quant_vec8_fused(cptr, tile_i32, n_tile_base_i32, cbase, store_cm)
+            self._store_quant_vec8_fused(cptr, tile_i32, n_tile_base_i32, cbase)
             return
         if const_expr(self._evec == 8):
             assert store_cm == 0
@@ -1149,10 +1149,10 @@ class SiluQuantEpilogue:
             self._out_scale_rsrc[byte_off] = e8m0_v.to(fx.Int8)
         wait_lds_barrier()
 
-    def _store_quant_vec8_fused(self, cptr, tile_i32, n_tile_base_i32, cbase, store_cm):
+    def _store_quant_vec8_fused(self, cptr, tile_i32, n_tile_base_i32, cbase):
         """The fused kernels' store pass with 8 columns per lane: 4 lanes share a 32-column scale group.
 
-        Unlike _store_quant_vec8 it takes the store cache policy and stores only
+        Unlike _store_quant_vec8 it applies the output cache policy and stores only
         the tile's leading ``tile_rows`` rows.
         """
         tx = fx.thread_idx.x
@@ -1213,7 +1213,7 @@ class SiluQuantEpilogue:
                     T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
             out_byte = row * fx.Int32(self._inter_dim) + gcol
             buf_copy_store(out_vec, out_byte // fx.Int32(8), Vec.from_elements(words, fx.Int32), fx.Int32,
-                unit_elems=2, cache_modifier=store_cm)
+                unit_elems=2, cache_modifier=self._out_cache_modifier)
             d0 = row_g >> fx.Int32(5)
             d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
             d2 = row_g & fx.Int32(15)
@@ -1222,5 +1222,5 @@ class SiluQuantEpilogue:
             d5 = col_s & fx.Int32(3)
             byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
             byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
-            buf_copy_store(self._out_scale_rsrc, byte_off, e8m0_v.to(fx.Int8), fx.Int8, cache_modifier=store_cm)
+            buf_copy_store(self._out_scale_rsrc, byte_off, e8m0_v.to(fx.Int8), fx.Int8, cache_modifier=self._out_cache_modifier)
         wait_lds_barrier()

@@ -45,7 +45,6 @@ from ..tensor_shim import (
 )
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm_ring import (
-    _LA_CM,
     gemm1_ring_lds_bytes,
     gemm2_ring_lds_bytes,
     make_ring_gemm1,
@@ -501,7 +500,7 @@ def _interleaved_rows(count, num_tiles):
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, interleave=False,
+    plan_wt=False, uniform=False, running_half=None, stream_w=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -509,8 +508,8 @@ def emit_direct_fixed_slot_finalize(
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
     ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
-    ``interleave``: m-tile t of an expert with nt m-tiles takes its slots t, t + nt, ... (_interleaved_rows);
-    the tile's rows word carries nt in its high half.
+    M-tile t of an expert with nt m-tiles takes its slots t, t + nt, ... (_interleaved_rows); the tile's rows
+    word carries nt in its high half.
     """
     assert 0 < fz_epr <= 256, "direct fixed-slot finalize requires 1..256 experts per rank"
     disp = ptr_buf_tensor(addr_disp, fx.Int64)
@@ -543,8 +542,7 @@ def emit_direct_fixed_slot_finalize(
         chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow = _plan_counts(
             a_running, lane, fz_epr, fz_cap, fz_tile_m)
         hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-        se_t, trb_t, nv_t, running_t, tile_rows_t = (
-            ptr_buf_tensor(a, fx.Int32) for a in (a_se, a_trb, a_nv, a_running, a_tile_rows))
+        se_t, trb_t, nv_t, tile_rows_t = (ptr_buf_tensor(a, fx.Int32) for a in (a_se, a_trb, a_nv, a_tile_rows))
 
         for chunk in range_constexpr(len(chunks)):
             valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
@@ -552,23 +550,14 @@ def emit_direct_fixed_slot_finalize(
                 if no_overflow:
                     global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
                     payload_base = safe_expert * fx.Int32(fz_cap)
-                    if const_expr(interleave):
-                        rows_q, rows_r = _interleaved_rows(safe_count, num_expert_tiles)
+                    rows_q, rows_r = _interleaved_rows(safe_count, num_expert_tiles)
                     for tile in range(fx.Int32(0), num_expert_tiles, 1):
                         metadata_index = metadata_base + tile
                         buf_copy_store(se_t, metadata_index, global_expert, cache_modifier=wt_cm)
-                        if const_expr(interleave):
-                            buf_copy_store(trb_t, metadata_index, payload_base + tile, cache_modifier=wt_cm)
-                            rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
-                            rows = rows | (num_expert_tiles << fx.Int32(16))
-                        else:
-                            buf_copy_store(trb_t, metadata_index, payload_base + tile * fx.Int32(fz_tile_m),
-                                cache_modifier=wt_cm)
-                            rows = safe_count - tile * fx.Int32(fz_tile_m)
-                            rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
+                        buf_copy_store(trb_t, metadata_index, payload_base + tile, cache_modifier=wt_cm)
+                        rows = rows_q + (tile < rows_r).select(fx.Int32(1), fx.Int32(0))
+                        rows = rows | (num_expert_tiles << fx.Int32(16))
                         buf_copy_store(tile_rows_t, metadata_index, rows, cache_modifier=wt_cm)
-                if const_expr(not keep_running):
-                    buf_copy_store(running_t, safe_expert, fx.Int32(0), cache_modifier=wt_cm)
 
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
@@ -895,8 +884,8 @@ def compile_mega_moe_stage1(
     # and the m-tile's rows from the CTA's local plan.
     assert fz_cap // fz_tile_m < 1 << 15, "the rows word keeps the m-tile count in its high half"
     # GEMM1 units and GEMM2 tiles run the gemm_ring cores: their weights pf 128-K steps ahead and their activation
-    # rows through an nbuf-stage LDS DMA ring; each wave owns 64 rows x 32 intermediate (GEMM1) or 64 hidden (GEMM2)
-    # columns. At V4-Pro's model dim the GEMM2 weights go one step ahead (two spill).
+    # rows through an nbuf-stage LDS DMA ring; each wave owns the m-tile's rows x 32 intermediate (GEMM1) or 64 hidden
+    # (GEMM2) columns. At V4-Pro's model dim the GEMM2 weights go one step ahead (two spill).
     ring_pf1, ring_nb1, ring_pf2, ring_nb2 = 2, 4, (2 if model_dim <= 5120 else 1), 6
     g1_a_bytes = gemm1_ring_lds_bytes(a_fp4=a_fp4, model_dim=model_dim, bm=sort_block_m, nw=NUM_WAVES,
         nbuf=ring_nb1)
@@ -1059,14 +1048,12 @@ def compile_mega_moe_stage1(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), launch_epoch),
-                plan_wt=plan_wt, keep_running=True, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w, interleave=True,
+                plan_wt=plan_wt, uniform=head_uniform, running_half=running_half, stream_w=stream_w,
             )
         # The rows sit in the token-row region (row source rank * mtpr + token) and GEMM1 maps its tile rows through
         # the srcmap; the region offsets are read past the plan. A constant bound keeps the A buffer resource scalar.
         x_bytes = fx.Int32(_TOKEN_REGION_END)
-        # i32 LDS bases of the typed fields: indexing the fields' typed pointers directly changes the GEMM1
-        # schedule of the hu/la2 tok_done kernels (+15 waits); lds_typed_ptr keeps the old addressing.
+        # i32 LDS bases of the plan tables; plan_ptr addresses their entries.
         incl_base = fx.Int32(fx.ptrtoint(lds.plan_incl.ptr))
         count_base = fx.Int32(fx.ptrtoint(lds.plan_count.ptr))
 
@@ -1097,12 +1084,12 @@ def compile_mega_moe_stage1(
             return expert, expert * fx.Int32(fz_cap) + tile, rows, tiles_e
 
         ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-            nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, sw_cm=_LA_CM, q_cm=_LA_CM,
-            swiglu_limit=swiglu_limit) for cm in {b_cache_modifier, 0}}
+            nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, swiglu_limit=swiglu_limit)
+            for cm in {b_cache_modifier, 0}}
         # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
         ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-            nw=NUM_WAVES, bm=half_rows, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier, sw_cm=_LA_CM,
-            q_cm=_LA_CM, swiglu_limit=swiglu_limit, tile_rows=sort_block_m) if half_rows else None
+            nw=NUM_WAVES, bm=half_rows, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier,
+            swiglu_limit=swiglu_limit, tile_rows=sort_block_m) if half_rows else None
         ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m,
             bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
         ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=half_rows, bn=g2_bn,
