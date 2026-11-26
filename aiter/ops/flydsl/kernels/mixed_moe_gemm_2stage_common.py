@@ -660,10 +660,11 @@ def compile_mixed_moe_gemm1_common(
                 body_lds_x_ping = lds_x_ping
                 body_b_has_full_operand = is_f8_b or shared_b
                 body_b_load_mult = 2 if body_b_has_full_operand else 1
-                # Leave only the previous half's B loads in flight. On gfx950 an
-                # A LDS-DMA can retire on vmcnt before its LDS write is visible to
-                # other waves' ds_read; also waiting for the scale loads issued
-                # after it closes that window (vmcnt one higher still races).
+                # Leave only the previous half's B loads in flight. B loads are
+                # issued in phases >= 1, behind sched_barrier(0), so they are
+                # always younger than the A LDS-DMA. The scale loads share the
+                # DMA's scheduling region and LLVM may place them between the
+                # A DMAs, so counting them in vmcnt can leave a DMA in flight.
                 body_vmcnt_before_barrier = tile_n // 32 * gui_ratio * body_b_load_mult
                 expert_off_idx = expert_idx * (2 * inter_dim)
                 if const_expr(shared_b):
