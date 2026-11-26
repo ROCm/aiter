@@ -17,16 +17,14 @@ when ``split_k`` is that of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` runs:
 Each 16-row tile is one cluster of ``split_k * n_groups`` (<= 16) workgroups,
 one per (K split, expert group). Partials go to a cluster-private workspace;
 after the cluster barrier (~0.1 us on MI455X, a grid barrier ~2.5 us), wave
-``w`` of member ``c`` reduces and gates row ``c + C * w``. ``with_counts`` also
-writes each 8-row group's routes per expert (for the grouped MoE's A1 route),
-after a second cluster barrier.
+``w`` of member ``c`` reduces and gates row ``c + C * w``.
 """
 
 import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Int32, T
 
@@ -36,7 +34,6 @@ EXPERTS = 128
 WAVE = 32
 TILE = 16
 WMMA_K = 32
-GROUP = 8  # rows per route-count group: the A1 route/quant block's tokens
 MAX_CLUSTER = 16
 LOG2E = 1.4426950408889634
 RENORM_SUM_FLOOR = 1e-20
@@ -75,12 +72,10 @@ def build_moe_router_topk_module(
     routed_scaling_factor: float = 1.0,
     has_bias: bool = True,
     prefetch: int = 8,
-    with_counts: bool = False,
 ):
-    """Launcher ``(x, w, bias, num_valid_rows, ws, topk_weights, topk_ids,
-    group_counts, m, lda, has_nvr, stream)``; ``ws`` holds
-    ``ceil(m/16) * split_k * 16 * 128`` fp32; ``group_counts`` int32
-    ``[2 * ceil(m/16), 128]`` (ids outside [0, 128), rows >= m count nowhere)."""
+    """Launcher ``(x, w, bias, num_valid_rows, ws, topk_weights, topk_ids, m,
+    lda, has_nvr, stream)``; ``ws`` holds ``ceil(m/16) * split_k * 16 * 128``
+    fp32."""
     if K % (split_k * WMMA_K):
         raise ValueError(f"K {K} is not a multiple of split_k * 32")
     if not 1 <= topk <= 4:
@@ -96,7 +91,7 @@ def build_moe_router_topk_module(
     scale_tag = format(struct.unpack("<I", struct.pack("<f", scale))[0], "08x")
     name = (
         f"moe_router_topk_k{K}_s{split_k}_t{topk}_r{int(need_renorm)}"
-        f"_b{int(has_bias)}_pf{pf}_sc{scale_tag}{'_cnt' if with_counts else ''}"
+        f"_b{int(has_bias)}_pf{pf}_sc{scale_tag}"
     )
     neg_inf = float("-inf")
 
@@ -109,7 +104,6 @@ def build_moe_router_topk_module(
         ws: fx.Pointer,
         topk_weights: fx.Pointer,
         topk_ids: fx.Pointer,
-        group_counts: fx.Pointer,
         m: Int32,
         lda: Int32,
         has_nvr: Int32,
@@ -205,34 +199,6 @@ def build_moe_router_topk_module(
                 if lane < topk:
                     buffer_ops.buffer_store(out_w, tw_rsrc, row * topk + lane)
                     buffer_ops.buffer_store(out_id, ti_rsrc, row * topk + lane)
-
-        if const_expr(with_counts):
-            fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
-            cluster.cluster_barrier()
-            fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
-            if (c < 2) & (wave == 0):
-                grow0 = mt * TILE + c * GROUP
-                route_row = grow0 + lane // topk
-                live = (lane < GROUP * topk) & (route_row < m)
-                rid = buffer_ops.buffer_load(
-                    ti_rsrc,
-                    live.select(grow0 * topk + lane, fx.Int32(0)),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-                rid = live.select(fx.Int32(rid), fx.Int32(-1))
-                cnts = [fx.Int32(0)] * 4
-                for r in range_constexpr(GROUP * topk):
-                    e_r = fx.Int32(rocdl.readlane(T.i32, rid, r))
-                    for j in range_constexpr(4):
-                        cnts[j] = cnts[j] + (e_r == lane * 4 + j).select(
-                            fx.Int32(1), fx.Int32(0)
-                        )
-                buffer_ops.buffer_store(
-                    fx.Vector.from_elements(cnts, fx.Int32),
-                    _rsrc(group_counts),
-                    (mt * 2 + c) * EXPERTS + lane * 4,
-                )
 
     def _gate_row(ws_rsrc, ws_row, bias_rsrc, nvr_rsrc, has_nvr, row, lane):
         """(weight, id) of top-k slot ``lane`` (lanes < topk) of one row."""
@@ -345,7 +311,6 @@ def build_moe_router_topk_module(
         ws: fx.Pointer,
         topk_weights: fx.Pointer,
         topk_ids: fx.Pointer,
-        group_counts: fx.Pointer,
         m: fx.Int32,
         lda: fx.Int32,
         has_nvr: fx.Int32,
@@ -360,7 +325,6 @@ def build_moe_router_topk_module(
             ws,
             topk_weights,
             topk_ids,
-            group_counts,
             m,
             lda,
             has_nvr,

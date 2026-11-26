@@ -40,16 +40,11 @@ def _tuned_rows() -> dict:
 
 
 @functools.lru_cache(maxsize=4096)
-def router_topk_config(
-    m: int, n: int, k: int, topk: int, with_counts: bool = False
-) -> dict | None:
+def router_topk_config(m: int, n: int, k: int, topk: int) -> dict | None:
     """``split_k`` / ``prefetch`` of ``flydsl_moe_router_topk`` for this call, or
     None to keep ``tgemm.mm`` + ``topk_gating``: the tuned table
-    (``AITER_CONFIG_MOE_ROUTER_TOPK``, padded M) has no fused row, a bitexact
-    row's split_k is no longer the router GEMM's, or ``with_counts`` (rows are
-    tuned without ``group_counts``)."""
-    if with_counts:
-        return None
+    (``AITER_CONFIG_MOE_ROUTER_TOPK``, padded M) has no fused row, or a bitexact
+    row's split_k is no longer the router GEMM's."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.gemm_op_common import find_padded_m_row
 
@@ -107,12 +102,6 @@ def _router_launcher(*args):
     return build_moe_router_topk_module(*args)
 
 
-def router_group_counts_shape(m: int) -> tuple[int, int]:
-    """``group_counts`` of ``flydsl_moe_router_topk``: one int32 row of 128
-    per 8 token rows, two per 16-row tile."""
-    return (2 * ((m + _TILE - 1) // _TILE), ROUTER_EXPERTS)
-
-
 def flydsl_moe_router_topk(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -125,13 +114,10 @@ def flydsl_moe_router_topk(
     num_valid_rows: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
-    group_counts: torch.Tensor | None = None,
     prefetch: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(topk_weights fp32 [M, topk], topk_ids int32 [M, topk])`` of
-    ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``.
-    ``group_counts`` (``router_group_counts_shape(M)`` int32) also receives
-    each 8-row group's routes per expert."""
+    ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``."""
     m, k = x.shape
     assert (
         w.shape == (ROUTER_EXPERTS, k) and w.is_contiguous()
@@ -156,13 +142,6 @@ def flydsl_moe_router_topk(
             correction_bias.dtype == torch.float32
             and correction_bias.numel() == ROUTER_EXPERTS
         )
-    with_counts = group_counts is not None
-    if with_counts:
-        assert (
-            group_counts.dtype == torch.int32
-            and group_counts.is_contiguous()
-            and tuple(group_counts.shape) == router_group_counts_shape(m)
-        ), "group_counts must be a contiguous int32 router_group_counts_shape(M)"
     launch = _router_launcher(
         k,
         split_k,
@@ -171,7 +150,6 @@ def flydsl_moe_router_topk(
         float(routed_scaling_factor),
         has_bias,
         prefetch,
-        with_counts,
     )
     _run_compiled(
         launch,
@@ -182,7 +160,6 @@ def flydsl_moe_router_topk(
         ptr_arg(ws),
         ptr_arg(topk_weights),
         ptr_arg(topk_ids),
-        ptr_arg(group_counts if with_counts else ws),
         m,
         x.stride(0),
         int(num_valid_rows is not None),
@@ -191,4 +168,4 @@ def flydsl_moe_router_topk(
     return topk_weights, topk_ids
 
 
-__all__ = ["flydsl_moe_router_topk", "router_group_counts_shape", "router_topk_config"]
+__all__ = ["flydsl_moe_router_topk", "router_topk_config"]
