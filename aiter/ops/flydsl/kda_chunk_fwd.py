@@ -176,6 +176,9 @@ def chunk_kda_fwd_prepare_flydsl(
             use_beta_sigmoid_in_kernel,
             store_qkb,
             varlen,
+            # The lower_bound gate bounds the per-token decay, which the MFMA
+            # diagonal tiles need; any other gate keeps them in fp32.
+            use_gate_in_kernel and lower_bound is not None,
         ),
         q,
         k,

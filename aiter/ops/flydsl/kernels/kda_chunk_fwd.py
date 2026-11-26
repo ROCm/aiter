@@ -141,6 +141,63 @@ def _row_sum(x):
     return x + x.shuffle_xor(fx.Int32(2), fx.Int32(64))
 
 
+def _vflat(tensor, base, n):
+    """Element view of ``tensor`` from ``base`` addressed in groups of ``n``."""
+    it = fx.add_offset(
+        fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True)), base
+    )
+    return fx.Tensor(fx.make_view(it, fx.make_layout((_EXTENT // n, n), (n, 1))))
+
+
+def _bits(num):
+    return 16 if num is fx.BFloat16 else 32
+
+
+def ldg_n(view_n, i, n, num):
+    """``n`` contiguous elements at element ``i`` (a multiple of ``n``), as fp32."""
+    frag = fx.make_rmem_tensor(n, num)
+    fx.copy(
+        fx.make_copy_atom(fx.rocdl.BufferCopy(n * _bits(num)), num),
+        fx.slice(view_n, (i // n, None)),
+        frag,
+    )
+    vec = fx.Vector(frag.load())
+    return [vec[e] if num is fx.Float32 else vec[e].to(fx.Float32) for e in range(n)]
+
+
+def stg_n(view_n, i, vals, num):
+    frag = fx.make_rmem_tensor(len(vals), num)
+    frag.store(
+        fx.Vector.from_elements(
+            [
+                fx.Float32(x) if num is fx.Float32 else fx.Float32(x).to(num)
+                for x in vals
+            ],
+            dtype=num,
+        )
+    )
+    fx.copy(
+        fx.make_copy_atom(fx.rocdl.BufferCopy(len(vals) * _bits(num)), num),
+        frag,
+        fx.slice(view_n, (i // len(vals), None)),
+    )
+
+
+def _row_ld(view_n, row, c0, rv, num):
+    """Columns ``c0 .. c0 + NE`` of ``row`` in 128-bit loads, zero when ``not rv``."""
+    n = 128 // _bits(num)
+    out = []
+    for m in range_constexpr(NE // n):
+        out += ldg_n(view_n, row + c0 + m * n, n, num)
+    return [_sel(rv, x, _zero()) for x in out]
+
+
+def _row_st(view_n, row, c0, vals, num):
+    n = 128 // _bits(num)
+    for m in range_constexpr(NE // n):
+        stg_n(view_n, row + c0 + m * n, vals[m * n : (m + 1) * n], num)
+
+
 def _lds4(arr, n):
     """LDS view addressed in aligned groups of 4 elements."""
     return arr.view(fx.make_layout((n // 4, 4), (4, 1)))
@@ -198,6 +255,16 @@ def _mfma_f32(a, b, acc):
         fb[0] = b[p]
         fx.gemm(mma, fc, fa, fb, fc)
     return fx.Vector(fc.load())
+
+
+def lds_st4(view4, i, vals):
+    frag = fx.make_rmem_tensor(4, fx.Float32)
+    frag.store(fx.Vector.from_elements([fx.Float32(x) for x in vals], dtype=fx.Float32))
+    fx.copy(
+        fx.make_copy_atom(fx.UniversalCopy(128), fx.Float32),
+        frag,
+        fx.slice(view4, (i // 4, None)),
+    )
 
 
 def _zero4():
@@ -345,7 +412,11 @@ def compile_intra(
     beta_sigmoid: bool,
     store_qkb: bool,
     varlen: bool = False,
+    diag_mfma: bool = False,
 ):
+    """``diag_mfma``: the diagonal tiles also run on MFMA, with the decay split
+    at the block's middle row. Needs a per-token log2 decay bounded well under
+    127 / 8 (the ``lower_bound`` gate: at most 5 / ln 2), else fp32."""
     QN = _num(qk_dtype)
     VN = _num(v_dtype)
     BN = _num(beta_dtype)
@@ -404,13 +475,12 @@ def compile_intra(
         s_x = _lds(lds.x, BT * BT)
         s_b = _lds(lds.beta, BT)
 
-        q_v = _flat(q, hk)
-        k_v = _flat(k, hk)
-        g_v = _flat(g, hk)
-        cols = [seg + 4 * e for e in range_constexpr(NE)]
-        q_r = [_sel(rv, ldg(q_v, row + c, QN), _zero()) for c in cols]
-        k_r = [_sel(rv, ldg(k_v, row + c, QN), _zero()) for c in cols]
-        g_r = [_sel(rv, ldg(g_v, row + c, fx.Float32), _zero()) for c in cols]
+        # Thread (r, seg) owns the contiguous columns seg * NE .. seg * NE + NE.
+        c0 = seg * NE
+        cols = [c0 + e for e in range_constexpr(NE)]
+        q_r = _row_ld(_vflat(q, hk, 128 // _bits(QN)), row, c0, rv, QN)
+        k_r = _row_ld(_vflat(k, hk, 128 // _bits(QN)), row, c0, rv, QN)
+        g_r = _row_ld(_vflat(g, hk, 4), row, c0, rv, fx.Float32)
         if const_expr(l2norm_qk):
             q_r = _l2norm(q_r)
             k_r = _l2norm(k_r)
@@ -419,19 +489,20 @@ def compile_intra(
             beta_r = _sigmoid(beta_r)
         beta_r = _sel(rv, beta_r, _zero())
 
-        for e in range_constexpr(NE):
-            lds_st(s_q, r * K + cols[e], q_r[e])
-            lds_st(s_k, r * K + cols[e], k_r[e])
-            lds_st(s_g, r * K + cols[e], g_r[e])
+        s_q4 = _lds4(lds.q, BT * K)
+        s_k4 = _lds4(lds.k, BT * K)
+        s_g4 = _lds4(lds.g, BT * K)
+        for m in range_constexpr(NE // 4):
+            o4 = r * K + c0 + 4 * m
+            lds_st4(s_q4, o4, q_r[4 * m : 4 * m + 4])
+            lds_st4(s_k4, o4, k_r[4 * m : 4 * m + 4])
+            lds_st4(s_g4, o4, g_r[4 * m : 4 * m + 4])
         if seg == 0:
             lds_st(s_b, r, beta_r)
         if const_expr(store_qkb):  # noqa: SIM102 (compile-time vs runtime branch)
             if rv:
-                qn_v = _flat(qn, hk)
-                kn_v = _flat(kn, hk)
-                for e in range_constexpr(NE):
-                    stg(qn_v, r * (H * K) + cols[e], q_r[e], QN)
-                    stg(kn_v, r * (H * K) + cols[e], k_r[e], QN)
+                _row_st(_vflat(qn, hk, 128 // _bits(QN)), r * (H * K), c0, q_r, QN)
+                _row_st(_vflat(kn, hk, 128 // _bits(QN)), r * (H * K), c0, k_r, QN)
                 if seg == 0:
                     stg(_flat(bn, hb), r * H, beta_r, fx.Float32)
         gpu.barrier()
@@ -441,9 +512,6 @@ def compile_intra(
         lr = lane % 16
         lk = (lane // 16) * 4
         aqk_v = _flat(Aqk, hb * BT)
-        s_q4 = _lds4(lds.q, BT * K)
-        s_k4 = _lds4(lds.k, BT * K)
-        s_g4 = _lds4(lds.g, BT * K)
         s_x4 = _lds4(lds.x, BT * BT)
 
         # Off-diagonal 16x16 tiles (I = wave > J) on MFMA. The decay splits at
@@ -484,38 +552,84 @@ def compile_intra(
                     if i < nvalid:
                         stg(aqk_v, i * (H * BT) + j, acc_q[vi] * scale, fx.Float32)
 
-        # Diagonal tiles in fp32 with the exact pairwise decay: wave I, row
-        # 16I + lane // 4, columns 16I + lane % 4 + 4p.
-        di_r = wave * 16 + lane // 4
-        for kk, st in range(0, K, 1, init=[_zero()] * 8):
-            kq = fx.Int32(kk)
-            qx = lds_ld(s_q, di_r * K + kq)
-            kx = lds_ld(s_k, di_r * K + kq)
-            gx = lds_ld(s_g, di_r * K + kq)
-            acc_q, acc_k = [], []
+        if const_expr(diag_mfma):
+            # Diagonal tiles on MFMA, decay split at the block's middle row:
+            # |g_i - g_ref| <= 8 tokens of bounded decay, so no bf16 overflow.
+            # min(., 64) only bites on padded rows (g = 0), which are dropped.
+            jb = wave * 16 + lr
+            ref = _min(wave * 16 + 7, nvalid - 1)
+            cap = fx.Float32(64.0)
+            acc_q = _zero4()
+            acc_k = _zero4()
+            for kt in range_constexpr(K // 16):
+                kc = kt * 16 + lk
+                gr = lds_ld4(s_g4, ref * K + kc)
+                gi = lds_ld4(s_g4, ia * K + kc)
+                qi = lds_ld4(s_q4, ia * K + kc)
+                ki = lds_ld4(s_k4, ia * K + kc)
+                gj = lds_ld4(s_g4, jb * K + kc)
+                kj = lds_ld4(s_k4, jb * K + kc)
+                di = [_exp2(_min(gi[vi] - gr[vi], cap)) for vi in range_constexpr(4)]
+                bj = _bf4(
+                    [
+                        kj[vi] * _exp2(_min(gr[vi] - gj[vi], cap))
+                        for vi in range_constexpr(4)
+                    ]
+                )
+                acc_q = _mfma(
+                    _bf4([qi[vi] * di[vi] for vi in range_constexpr(4)]), bj, acc_q
+                )
+                acc_k = _mfma(
+                    _bf4([ki[vi] * di[vi] for vi in range_constexpr(4)]), bj, acc_k
+                )
+            for vi in range_constexpr(4):
+                i = wave * 16 + lk + vi
+                j = wave * 16 + lr
+                lds_st(
+                    s_l, i * BT + j, _sel(j < i, acc_k[vi] * lds_ld(s_b, i), _zero())
+                )
+                if i < nvalid:
+                    stg(
+                        aqk_v,
+                        i * (H * BT) + j,
+                        _sel(j <= i, acc_q[vi] * scale, _zero()),
+                        fx.Float32,
+                    )
+        else:
+            # Diagonal tiles in fp32 with the exact pairwise decay: wave I, row
+            # 16I + lane // 4, columns 16I + lane % 4 + 4p.
+            di_r = wave * 16 + lane // 4
+            for kk, st in range(0, K, 1, init=[_zero()] * 8):
+                kq = fx.Int32(kk)
+                qx = lds_ld(s_q, di_r * K + kq)
+                kx = lds_ld(s_k, di_r * K + kq)
+                gx = lds_ld(s_g, di_r * K + kq)
+                acc_q, acc_k = [], []
+                for p in range_constexpr(4):
+                    j = wave * 16 + lane % 4 + 4 * p
+                    ex = _exp2(
+                        _sel(
+                            j <= di_r,
+                            _min(gx - lds_ld(s_g, j * K + kq), _zero()),
+                            _zero(),
+                        )
+                    )
+                    kj = lds_ld(s_k, j * K + kq) * ex
+                    acc_q.append(st[p] + qx * kj)
+                    acc_k.append(st[4 + p] + kx * kj)
+                res = yield acc_q + acc_k
+            acc = _results(res, 8)
+            beta_d = lds_ld(s_b, di_r)
             for p in range_constexpr(4):
                 j = wave * 16 + lane % 4 + 4 * p
-                ex = _exp2(
-                    _sel(
-                        j <= di_r, _min(gx - lds_ld(s_g, j * K + kq), _zero()), _zero()
+                lds_st(s_l, di_r * BT + j, _sel(j < di_r, acc[4 + p] * beta_d, _zero()))
+                if di_r < nvalid:
+                    stg(
+                        aqk_v,
+                        di_r * (H * BT) + j,
+                        _sel(j <= di_r, acc[p] * scale, _zero()),
+                        fx.Float32,
                     )
-                )
-                kj = lds_ld(s_k, j * K + kq) * ex
-                acc_q.append(st[p] + qx * kj)
-                acc_k.append(st[4 + p] + kx * kj)
-            res = yield acc_q + acc_k
-        acc = _results(res, 8)
-        beta_d = lds_ld(s_b, di_r)
-        for p in range_constexpr(4):
-            j = wave * 16 + lane % 4 + 4 * p
-            lds_st(s_l, di_r * BT + j, _sel(j < di_r, acc[4 + p] * beta_d, _zero()))
-            if di_r < nvalid:
-                stg(
-                    aqk_v,
-                    di_r * (H * BT) + j,
-                    _sel(j <= di_r, acc[p] * scale, _zero()),
-                    fx.Float32,
-                )
         # Aqk above the diagonal tiles is zero.
         if rv:
             for e in range_constexpr(16):
@@ -523,19 +637,22 @@ def compile_intra(
                 if j // 16 > r // 16:
                     stg(aqk_v, r * (H * BT) + j, _zero(), fx.Float32)
 
-        qg_v = _flat(qg, hk)
-        kg_v = _flat(kg, hk)
-        kb_r = []
-        for e in range_constexpr(NE):
-            c = cols[e]
-            ge = _exp2(g_r[e])
-            gl = lds_ld(s_g, (nvalid - 1) * K + c)
-            kb_r.append(k_r[e] * beta_r * ge)
-            if rv:
-                stg(qg_v, r * (H * K) + c, q_r[e] * ge, BF)
-                stg(kg_v, r * (H * K) + c, k_r[e] * _exp2(gl - g_r[e]), BF)
-        v_v = _flat(v, hk)
-        vb_r = [_sel(rv, ldg(v_v, row + c, VN), _zero()) * beta_r for c in cols]
+        kb_r, qg_r, kg_r = [], [], []
+        for m in range_constexpr(NE // 4):
+            gl4 = lds_ld4(s_g4, (nvalid - 1) * K + c0 + 4 * m)
+            for vi in range_constexpr(4):
+                e = 4 * m + vi
+                ge = _exp2(g_r[e])
+                kb_r.append(k_r[e] * beta_r * ge)
+                qg_r.append(q_r[e] * ge)
+                kg_r.append(k_r[e] * _exp2(gl4[vi] - g_r[e]))
+        if rv:
+            _row_st(_vflat(qg, hk, 8), r * (H * K), c0, qg_r, BF)
+            _row_st(_vflat(kg, hk, 8), r * (H * K), c0, kg_r, BF)
+        vb_r = [
+            x * beta_r
+            for x in _row_ld(_vflat(v, hk, 128 // _bits(VN)), row, c0, rv, VN)
+        ]
         gpu.barrier()
 
         # Transposed ([col][token]) so each MFMA B operand is 4 contiguous tokens.
