@@ -7,10 +7,10 @@ gfx1250,256,256,7168,16384,1x32,flydsl,1686,2,26.4791,flydsl_mxfp8_32_bpreshuffl
 gfx1250,256,512,7168,16384,1x32,flydsl,38,2,27.797,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk2_cm4_cn2_fsk,4326.39,4932.30,0.0
 gfx1250,256,1024,7168,16384,1x32,flydsl,-1,1,48.453,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm4_cn4,4963.99,3159.63,0.0
 gfx1250,256,2048,7168,16384,1x32,flydsl,-1,1,87.731,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4,5483.06,2109.55,0.0
-gfx1250,256,4096,7168,16384,1x32,flydsl,-1,1,157.576,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4,6105.45,1580.42,0.0
-gfx1250,256,8192,7168,16384,1x32,flydsl,-1,1,310.8363,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2,6190.22,1187.44,0.0108
+gfx1250,256,4096,7168,16384,1x32,flydsl,-1,1,153.8150,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn4_eb_pf1,6254.74,1581.57,0.0
+gfx1250,256,8192,7168,16384,1x32,flydsl,-1,1,280.7465,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_eab_pf1,6853.68,1314.70,0.0108
 gfx1250,256,16384,7168,16384,1x32,flydsl,-1,1,549.378,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4,7004.82,1151.88,0.0
-gfx1250,256,32768,7168,16384,1x32,flydsl,-1,1,1083.613,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn4,7102.71,1056.21,0.0
+gfx1250,256,32768,7168,16384,1x32,flydsl,-1,1,1215.8580,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn4_eb_pf1,6330.16,924.51,0.0
 gfx1250,256,16,8192,1536,1x32,flydsl,134,1,4.942,flydsl_mxfp8_32_bpreshuffle_wmma_t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1,81.47,2683.65,0.0
 gfx1250,256,32,8192,1536,1x32,flydsl,134,1,4.987,flydsl_mxfp8_32_bpreshuffle_wmma_t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1,161.46,2717.01,0.0
 gfx1250,256,64,8192,1536,1x32,flydsl,-1,1,5.303,flydsl_mxfp8_32_bpreshuffle_wmma_t64x64x256_mw2_nw2_nb4_sk1_cm1_cn1,303.72,2663.79,0.0
