@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 import torch
 import triton
@@ -28,6 +29,18 @@ _WS_MAX_MB = 1024
 _WORKSPACES: dict = {}
 _PLANS: dict = {}
 _NUM_CUS: dict = {}
+# Opt-in decode schedule (bitwise the same outputs): AITER_ROUTER_SHARED_PREFETCH=1
+# prefetches the gate / up and router weights into L2 over all programs at the
+# start; AITER_ROUTER_SHARED_LATE_USE=1 issues a down tile's h loads before its
+# counting atomic.
+_SCHED = {
+    k: 1
+    for k, env in (
+        ("PREFETCH", "AITER_ROUTER_SHARED_PREFETCH"),
+        ("LATE_USE", "AITER_ROUTER_SHARED_LATE_USE"),
+    )
+    if os.environ.get(env, "0") == "1"
+}
 
 
 def _get_config(M: int):
@@ -115,6 +128,7 @@ def _plan(M: int, nr: int, ngu: int, nd: int, config: dict, num_cus: int):
         "num_warps": num_warps,
         "waves_per_eu": config.get("waves_per_eu", 0),
         "H_CACHE": config.get("H_CACHE", ".cg"),
+        **_SCHED,
     }
     return _gemm_a16w16_router_shared_expert_kernel, programs, num_mb, meta
 
