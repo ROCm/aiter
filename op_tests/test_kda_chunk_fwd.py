@@ -243,6 +243,64 @@ def test_kda_chunk_fwd(b, t, h, d, dtype, mode, varlen, layout):
     return ret
 
 
+INTERMEDIATES = ("g_cumsum", "w", "u", "qg", "kg", "Aqk", "Akk")
+
+
+@benchmark()
+def test_kda_chunk_fwd_intermediates(b, t, h, d, mode, varlen):
+    """``return_intermediates`` (save_fwd) vs Triton's ``disable_recompute`` ones.
+
+    Each is graded by max |diff| / max |triton|, since their scales differ.
+    """
+    from aiter.ops.flydsl.kda_chunk_fwd import chunk_kda_fwd_flydsl
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+
+    x, kw = make_inputs(b, t, h, d, dtypes.bf16, mode)
+    x.pop("initial_state", None)
+    kw.pop("state_v_first")
+    cu = None
+    if varlen:
+        x = {n: x[n].reshape(1, b * t, *x[n].shape[2:]) for n in x}
+        cu = torch.arange(0, b * t + 1, t, dtype=torch.int64)
+    scale = d**-0.5
+    o, _, inter = chunk_kda_fwd_flydsl(
+        **x, scale=scale, cu_seqlens=cu, return_intermediates=True, **kw
+    )
+    o_plain, _ = chunk_kda_fwd_flydsl(**x, scale=scale, cu_seqlens=cu, **kw)
+    assert torch.equal(o, o_plain), "return_intermediates changed o"
+    _, _, *ref = chunk_delta_attn_fwd(
+        **x,
+        scale=scale,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=cu,
+        chunk_size=CHUNK,
+        safe_gate=kw.get("use_gate_in_kernel", False),
+        disable_recompute=True,
+        **kw,
+    )
+    # Triton returns (g_cumsum, Aqk, Akk, w, u, qg, kg).
+    ref = dict(zip(("g_cumsum", "Aqk", "Akk", "w", "u", "qg", "kg"), ref))
+    got = dict(zip(INTERMEDIATES, inter[3:]))
+    assert inter[0].shape == x["q"].shape and inter[2].shape == x["beta"].shape
+    # Aqk / Akk are defined on j <= the token's position in its chunk; Triton
+    # need not write the rest.
+    T = x["q"].shape[1]
+    pos = torch.arange(T) % t if varlen else torch.arange(T)
+    pos = pos % CHUNK
+    tri = (torch.arange(CHUNK)[None, :] <= pos[:, None])[None, :, None, :]
+    ret = {"gfx": get_gfx_runtime()}
+    for n in INTERMEDIATES:
+        a, r = got[n].float(), ref[n].float()
+        assert a.shape == r.shape, f"{n}: {tuple(a.shape)} vs {tuple(r.shape)}"
+        if n in ("Aqk", "Akk"):
+            a, r = a * tri, r * tri
+        rel = ((a - r).abs().max() / r.abs().max().clamp_min(1e-6)).item()
+        assert rel < 2e-2, f"{n}: max rel err {rel:.3g}"
+        ret[f"{n} rel"] = rel
+    return ret
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -324,6 +382,19 @@ def main():
         df = pd.DataFrame(df)
         aiter.logger.info(
             "kda chunk fwd summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+    # save_fwd intermediates; FlyDSL needs gfx950.
+    if HAS_FLYDSL and get_gfx_runtime() == "gfx950":
+        df = [
+            test_kda_chunk_fwd_intermediates(b, t, h, d, m, varlen)
+            for m, (b, t, varlen), h, d in itertools.product(
+                args.mode, shapes, args.heads, args.head_dim
+            )
+            if t <= 8192
+        ]
+        aiter.logger.info(
+            "kda chunk fwd intermediates (markdown):\n%s",
+            pd.DataFrame(df).to_markdown(index=False),
         )
 
 

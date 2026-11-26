@@ -424,8 +424,14 @@ def chunk_kda_fwd_flydsl(
     state_v_first=False,
     cu_seqlens=None,
     config=None,
+    return_intermediates=False,
 ):
     """FlyDSL KDA chunk forward: ``(o, final_state)``.
+
+    ``return_intermediates=True`` returns ``(o, final_state, fwd_intermediates)``
+    with ``fwd_intermediates = (q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)``
+    (q / k / beta after their in-kernel activations), the tuple the FlyDSL
+    chunk backward takes as ``fwd_intermediates`` in ``save_fwd`` mode.
 
     ``config`` (``{"k5_bv": ..., "diag_mfma": ...}``, see ``TUNABLES``)
     overrides the tuned-CSV lookup, which falls back to ``default_config``.
@@ -474,7 +480,7 @@ def chunk_kda_fwd_flydsl(
         )
 
     timer = _Timer()
-    *_, gc, w, u, qg, kg, Aqk, _ = chunk_kda_fwd_prepare_flydsl(
+    qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_prepare_flydsl(
         q,
         k,
         v,
@@ -487,7 +493,7 @@ def chunk_kda_fwd_flydsl(
         lower_bound=lower_bound,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-        store_qkb=False,
+        store_qkb=return_intermediates,
         chunks=chunks,
         diag_mfma=config.get("diag_mfma"),
     )
@@ -525,6 +531,8 @@ def chunk_kda_fwd_flydsl(
     )
     timer.mark("output")
     timer.report(f"B={B} T={T} H={H} N={chunks.N}")
+    if return_intermediates:
+        return o, fs, (qn, kn, bn, gc, w, u, qg, kg, Aqk, Akk)
     return o, fs
 
 
