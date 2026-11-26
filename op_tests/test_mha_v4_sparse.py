@@ -624,7 +624,7 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(
     _assert_sparse_matches_dense(sparse, dense)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 rows are ragged")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 rows are ragged")
 @parametrize("tail", [44, 5])
 @parametrize(
     ("q_format", "v_format", "kwargs", "block_tile"), _sparse_recipe_tile_params()
@@ -695,7 +695,7 @@ def _sparse_lse_format_params(names, *extra):
     ]
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format", "tol"),
     [
@@ -760,7 +760,7 @@ def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
     assert error < tol, f"sparse LSE off by {error:.4f} nats for tiles {kept}"
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format"),
     _sparse_lse_format_params(["bf16", "bf16fp8", "fp8", "mxfp6"]),
@@ -806,7 +806,7 @@ def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(q_format, v_
     assert torch.isfinite(lse[:, 1:].float()).all()
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format"), _sparse_lse_format_params(["bf16", "fp8", "mxfp6"])
 )
@@ -1412,9 +1412,9 @@ def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
         )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 BF16 sparse")
 def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
-    max_tiles = 8192
+    max_tiles = 7871 if get_gfx() == "gfx942" else 8192
     bf16 = AttentionFormat.BF16
     kv_tile = _default_kv_tile(bf16, bf16)
     q = torch.zeros((1, 1, 1, 128), device="cuda", dtype=torch.bfloat16)
@@ -1423,7 +1423,7 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
     indices = torch.zeros(1, device="cuda", dtype=torch.int32)
     row = torch.zeros(1, device="cuda", dtype=torch.int32)
 
-    with expect_raises(RuntimeError, match="holds 8192 LUT entries"):
+    with expect_raises(RuntimeError, match=f"holds {max_tiles} LUT entries"):
         mha_v4_packed(
             q,
             kv,
@@ -2088,8 +2088,8 @@ _SOL_ATTN_RAW_RECIPES = [
 ]
 
 
-# gfx942 carries no mode-2 rows, so every recipe skips itself there on the per-recipe manifest
-# check below. Everything else in this section reads its geometry from
+# gfx942 carries mode-2 rows for the per-tensor and BF16 Q/K recipes only; the MX ones skip
+# themselves on the per-recipe manifest check below. Everything else in this section reads its geometry from
 # its recipe's own geometry, so it retiles from 256x128 to 256x64 without further arch branching.
 _MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 
@@ -3011,6 +3011,17 @@ def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
                 )
 
 
+@skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+@parametrize("head_dim", [96, 192])
+def test_mha_v4_sol_rejects_unsupported_head_dims(head_dim):
+    """K smoothing sees K before the head dimension is checked, so it has to raise, not abort."""
+    fp8 = native_fp8_format()
+    dummy = torch.zeros((1, 256, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    with expect_raises(ValueError, match="head dimension 64, 128 or 256"):
+        mha_v4_sol(dummy, dummy, dummy, fp8, fp8, fp8)
+
+
 def _e8m0_operand(batch, seqlen, heads, head_dim, decades=12.0, seed=0):
     """(raw, data, scale) for an E8M0 operand whose exponent changes from token to token.
 
@@ -3195,21 +3206,26 @@ _LSE_FP6_P_IDS = ("mxfp4_fp6p", "mxfp6_fp6p", "f8f6_fp6p", "f6f4_fp6p")
 _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "f6f8", *_LSE_FP6_P_IDS)
 
 
-_LSE_OFF_ARCH = get_gfx() != "gfx950"
+# gfx942 has no MX rows; every row it does have carries the store, as every gfx950 row does.
+_LSE_GFX942_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8")
+
+
+def _lse_off_arch(row_id, block_tile=None):
+    stored = row_id in _LSE_GFX942_IDS or block_tile == _MHA_V4_FINE_TILE
+    return get_gfx() != "gfx950" and not (get_gfx() == "gfx942" and stored)
 
 
 def _lse_ids(ids):
-    """MHA v4 exports a validated LSE on gfx950 only."""
-    return [param(i, skip=_LSE_OFF_ARCH, id=i) for i in ids]
+    return [param(i, skip=_lse_off_arch(i), id=i) for i in ids]
 
 
 def _lse_sparse_tile_params():
     """(row id, block_tile) for every sparse LSE row: None for its default tile, then 64x64."""
-    return [param(i, None, skip=_LSE_OFF_ARCH, id=i) for i in _LSE_SPARSE_IDS] + [
+    return [param(i, None, skip=_lse_off_arch(i), id=i) for i in _LSE_SPARSE_IDS] + [
         param(
             i,
             _MHA_V4_FINE_TILE,
-            skip=_LSE_OFF_ARCH
+            skip=_lse_off_arch(i, _MHA_V4_FINE_TILE)
             or _lacks_sparse_row(i.removesuffix("_fp6p"), _MHA_V4_FINE_TILE),
             id=f"{i}-64x64",
         )
@@ -3340,13 +3356,45 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id, block_tile):
     assert (torch.logsumexp(scores, dim=-1) - lse).min() > 0.1
 
 
+def _sol_attn_row_declares(recipe, block_tile, capability: str) -> bool:
+    """Whether the Sol-Attn row `recipe` dispatches at `block_tile` declares a manifest column.
+
+    Read from the CSV for the reason _mha_v4_lut_capacity gives: the launcher enforces these
+    capabilities, and there is no Python accessor to ask.
+    """
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    manifest = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    wanted = {
+        "q_format": recipe.qk_format,
+        "k_format": recipe.qk_format,
+        "v_format": recipe.v_format,
+        "v_pack": recipe.v_pack,
+        "q_scale_mode": recipe.qk_scale_mode,
+        "k_scale_mode": recipe.qk_scale_mode,
+        "v_scale_mode": recipe.v_scale_mode,
+        "mode": MHA_V4_SOL_MODE,
+        "ts_qo": q_tile,
+        "ts_kv": kv_tile,
+    }
+    with open(manifest, newline="") as handle:
+        for row in csv.DictReader(
+            filter(lambda line: not line.startswith("#"), handle)
+        ):
+            if all(int(row[column]) == int(value) for column, value in wanted.items()):
+                return bool(int(row[capability]))
+    raise LookupError(f"no Sol-Attn row for {recipe.id} at {q_tile}x{kv_tile}")
+
+
 def _sol_attn_lse_param(recipe_id, tolerance, gfx950_only=False):
     recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
     missing = _sol_attn_row_missing(recipe) is not None
     return param(
         recipe_id,
         tolerance,
-        skip=missing or (gfx950_only and get_gfx() != "gfx950"),
+        skip=missing
+        or (gfx950_only and get_gfx() != "gfx950")
+        or not _sol_attn_row_declares(recipe, None, "lse"),
         id=recipe_id,
     )
 
@@ -3408,7 +3456,7 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     assert (lse - reference.float()).abs().max() < tolerance
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 rows declare sorted")
 @parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
 def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
     """Heavy-first dispatch reorders the workgroups, never their work.
@@ -3451,41 +3499,9 @@ def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
         assert torch.equal(launched[1], raster[1])
 
 
-# Every gfx950 Sol row declares the Jensen term, and all but the BF16 ones take KV ranges.
-_SOL_ATTN_GFX950_PARAMS = [
-    param(*p.values, skip=p.skip or get_gfx() != "gfx950", id=p.id)
-    for p in _sol_attn_geometry_params()
-]
-
-
-def _sol_attn_row_declares(recipe, block_tile, capability: str) -> bool:
-    """Whether the Sol-Attn row `recipe` dispatches at `block_tile` declares a manifest column.
-
-    Read from the CSV for the reason _mha_v4_lut_capacity gives: the launcher enforces these
-    capabilities, and there is no Python accessor to ask.
-    """
-    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
-    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
-    manifest = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd", "fmha_v4_fwd.csv")
-    wanted = {
-        "q_format": recipe.qk_format,
-        "k_format": recipe.qk_format,
-        "v_format": recipe.v_format,
-        "v_pack": recipe.v_pack,
-        "q_scale_mode": recipe.qk_scale_mode,
-        "k_scale_mode": recipe.qk_scale_mode,
-        "v_scale_mode": recipe.v_scale_mode,
-        "mode": MHA_V4_SOL_MODE,
-        "ts_qo": q_tile,
-        "ts_kv": kv_tile,
-    }
-    with open(manifest, newline="") as handle:
-        for row in csv.DictReader(
-            filter(lambda line: not line.startswith("#"), handle)
-        ):
-            if all(int(row[column]) == int(value) for column, value in wanted.items()):
-                return bool(int(row[capability]))
-    raise LookupError(f"no Sol-Attn row for {recipe.id} at {q_tile}x{kv_tile}")
+# Capability tests select deployed rows below, so they cover gfx942's Sol-Attn rows as well as
+# gfx950's larger set without teaching the tests an architecture-specific recipe list.
+_SOL_ATTN_CAPABILITY_PARAMS = _sol_attn_geometry_params()
 
 
 def _rotated(x):
@@ -3529,7 +3545,7 @@ def _sol_attn_jensen_ref(
     return out, torch.logsumexp(joint, dim=-1)
 
 
-@parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+@parametrize(("recipe", "block_tile"), _SOL_ATTN_CAPABILITY_PARAMS)
 def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
     """KV ranges split the softmax, not the result: each range's exact and pooled columns are
     normalized on their own and merged by LSE, which is the joint softmax again. So the ranged
@@ -3539,8 +3555,9 @@ def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
 
     heads = 2
     q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    tail = 37 if _sol_attn_row_declares(recipe, block_tile, "ragged_kv") else 0
     operands = recipe.operands(
-        sequence_k=80 * kv_tile + 37, heads=heads, sequence_q=512, seed=3
+        sequence_k=80 * kv_tile + tail, heads=heads, sequence_q=512, seed=3
     )
     plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
     launch = functools.partial(
@@ -3571,7 +3588,7 @@ def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
     assert (ranged_lse - reference_lse.float()).abs().max() < 0.2
 
 
-@parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+@parametrize(("recipe", "block_tile"), _SOL_ATTN_CAPABILITY_PARAMS)
 def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     """sol_prepare(k_variance=True) hands the kernel the block variance of K in the basis the
     kernel holds K in: rotated for the FP8 and MX recipes, as stored for BF16 and INT8. The kernel
@@ -3595,6 +3612,10 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     launch = functools.partial(
         _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
     )
+    if not _sol_attn_row_declares(recipe, block_tile, "jensen"):
+        with expect_raises(RuntimeError, match="has no second-order pooled correction"):
+            launch(jensen=True)
+        return
 
     plain = launch()
     corrected, corrected_lse = launch(jensen=True, return_lse=True)
@@ -3640,11 +3661,12 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     everything = {"jensen": True, "return_lse": True}
     if _sol_attn_row_declares(recipe, block_tile, "kv_range"):
         everything["kv_range_tokens"] = 32 * kv_tile
-    raster = launch(sorted_dispatch=False, **everything)
-    ordered = launch(sorted_dispatch=True, **everything)
-    torch.cuda.synchronize()
-    assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
-    assert _cosine(ordered[0], corrected) > 0.999
+    if _sol_attn_row_declares(recipe, block_tile, "sorted"):
+        raster = launch(sorted_dispatch=False, **everything)
+        ordered = launch(sorted_dispatch=True, **everything)
+        torch.cuda.synchronize()
+        assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+        assert _cosine(ordered[0], corrected) > 0.999
 
 
 def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed=0):
@@ -3678,7 +3700,11 @@ def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed
 
 @parametrize(
     ("recipe", "block_tile"),
-    [p for p in _SOL_ATTN_GFX950_PARAMS if p.values[0].v_format == native_fp8_format()],
+    [
+        p
+        for p in _sol_attn_geometry_params()
+        if p.values[0].v_format == native_fp8_format()
+    ],
 )
 def test_mha_v4_sol_fp8_p_keeps_pooled_mass_far_below_the_exact_max(recipe, block_tile):
     """FP8-V rows quantize P to e4m3 against the exact pass's max. A pooled block's P carries the
@@ -3720,7 +3746,7 @@ def test_mha_v4_sol_fp8_p_keeps_pooled_mass_far_below_the_exact_max(recipe, bloc
 def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
     """Insisting on sorted dispatch fails loudly where it cannot be honoured.
 
-    Every gfx950 Sol row declares it, so only a non-Sol launch has none to honour.
+    Every gfx942 and gfx950 Sol row declares it, so only a non-Sol launch has none to honour.
     """
     q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
     bf16, none = AttentionFormat.BF16, AttentionScaleMode.NONE
@@ -3791,11 +3817,20 @@ def test_mha_v4_ragged_kv_answers_per_row(q_format, k_format, v_format, mode, ex
 
 
 @skipif(get_gfx() != "gfx942", reason="gfx942 manifest")
-def test_mha_v4_ragged_kv_is_false_on_gfx942():
+def test_mha_v4_ragged_kv_on_gfx942_is_every_block_sparse_row():
     fp8 = native_fp8_format()
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
     operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
-    assert not mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    none = AttentionScaleMode.NONE
+    bf16 = AttentionFormat.BF16
+    operands = mha_v4_operands(bf16, bf16, bf16, none, none, none)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    operands = mha_v4_operands(bf16, bf16, fp8, none, none, per_tensor)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
 
 
 @skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
@@ -3863,9 +3898,25 @@ def test_mha_v4_sparse_64x64_follows_the_lut():
             assert not torch.equal(out, outs[j]), f"blocks {i} and {j} gave one result"
 
 
-@_requires_sparse_row("fp8", _MHA_V4_FINE_TILE)
+@parametrize(
+    ("qkv_format", "floor"),
+    [
+        param(
+            fmt,
+            floor,
+            skip=_lacks_sparse_row(name, _MHA_V4_FINE_TILE),
+            id=name,
+        )
+        for name, fmt, floor in (
+            ("bf16", AttentionFormat.BF16, 0.999),
+            ("fp8", FP8, 0.995),
+        )
+    ],
+)
 @parametrize("reversed_order", [False, True])
-def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_order):
+def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(
+    reversed_order, qkv_format, floor
+):
     """Every other sparse case here names one block set and gives it to every query tile, which
     is the one shape of mask that cannot separate the two KV pointers: if K ignored the LUT and
     stayed on block 0 while V followed it, a mask whose blocks are all block 0 still reads the
@@ -3891,9 +3942,9 @@ def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_
         q,
         k,
         v,
-        AttentionFormat.BF16,
-        AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        qkv_format,
+        qkv_format,
+        qkv_format,
         block_mask=mask,
         block_tile=_MHA_V4_FINE_TILE,
     )
@@ -3906,7 +3957,7 @@ def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_
     reference = torch.einsum("bhqk,bhkd->bhqd", weights, vf).transpose(1, 2)
 
     assert torch.isfinite(out).all()
-    assert _cosine(out, reference) > 0.999
+    assert _cosine(out, reference) > floor
 
 
 @_requires_sol_row(_SOL_ATTN_FP8, _MHA_V4_FINE_TILE)

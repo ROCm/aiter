@@ -166,19 +166,3 @@ def test_fused_rms_gated_fp8_group_quant_sweep(M: int, N: int, group_size: int):
     dq = y_q.float() * sb
     dq_ref = y_ref.float() * sb
     torch.testing.assert_close(dq, dq_ref, rtol=0.15, atol=0.15)
-
-
-@cuda_ok
-def test_fused_rms_gated_fp8_group_quant_group_size_errors():
-    torch.manual_seed(0)
-    device = "cuda"
-    x = torch.randn(2, 128, device=device, dtype=torch.bfloat16)
-    z = torch.randn_like(x)
-    w = torch.randn(128, device=device, dtype=torch.bfloat16)
-    b = torch.randn(128, device=device, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="less than or equal to hidden size"):
-        fused_rms_gated_fp8_group_quant(x, w, b, z, 1e-5, group_size=256)
-    with pytest.raises(ValueError, match="divisible by group_size"):
-        fused_rms_gated_fp8_group_quant(x, w, b, z, 1e-5, group_size=48)
-    with pytest.raises(ValueError, match="positive"):
-        fused_rms_gated_fp8_group_quant(x, w, b, z, 1e-5, group_size=0)

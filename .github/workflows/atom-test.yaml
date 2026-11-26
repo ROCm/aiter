@@ -330,6 +330,21 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Check GPU visibility
+        if: ${{ endsWith(matrix.runner, '-8') && (matrix.run_on_pr == true || github.event_name != 'pull_request') }}
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -e AITER_GPU_VISIBILITY_CHECK_XGMI=1 \
+            -w /app/aiter-test \
+            atom_aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
+
       - name: Check shm size
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |

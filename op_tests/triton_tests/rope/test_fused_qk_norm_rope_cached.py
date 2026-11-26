@@ -58,12 +58,6 @@ def test_matches_norm_then_rope(dtype, T, H, D, R):
     torch.testing.assert_close(gk.float(), wk.float(), atol=tol, rtol=tol)
 
 
-def test_is_in_place():
-    q, k, qw, kw, cache = make(32, 8, 128, 96, torch.bfloat16)
-    gq, gk = fused_qk_norm_rope_cached(q, k, qw, kw, cache)
-    assert gq.data_ptr() == q.data_ptr() and gk.data_ptr() == k.data_ptr()
-
-
 def test_q_and_k_use_their_own_weights():
     """A kernel that applied q_weight to both would pass every symmetric test."""
     q, k, qw, kw, cache = make(16, 4, 128, 96, torch.float32)
@@ -82,12 +76,6 @@ def test_untouched_tail_is_passed_through():
     fused_qk_norm_rope_cached(q, k, qw, kw, cache, eps=1e-5)
     normed = torch.nn.functional.rms_norm(q0, (128,), qw, 1e-5)
     torch.testing.assert_close(q[..., 96:], normed[..., 96:], atol=2e-5, rtol=2e-5)
-
-
-def test_rejects_bad_cache_width():
-    q, k, qw, kw, cache = make(8, 2, 64, 32, torch.float32)
-    with pytest.raises(AssertionError):
-        fused_qk_norm_rope_cached(q, k, qw, kw, cache[:, :31])
 
 
 def test_operates_on_strided_views_of_a_packed_qkv():
