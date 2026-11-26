@@ -962,6 +962,27 @@ copy of the shared expert per GPU at TP4 (not measured in the budget).
 
 ## Quality against MXFP4
 
+**1,024 entries with LDLQ, full SWE-bench Lite.** All 300 tasks
+(`princeton-nlp/SWE-bench_Lite`, test split), one attempt per task per arm,
+both arms at the same time on one host with 8 MI350X (IQ2R on 4 GPUs, MXFP4
+A4W4 on the other 4, TP4 each), the same aiter and ATOM code, FP8 KV cache,
+standard kernels. ATOM's `run_swebench_lite.sh` settings (mini-swe-agent
+2.4.5, SWE-bench harness 4.1.0, temperature 0, 150 steps, 32 agents per arm),
+with three changes applied to both arms so that no setting other than the
+262,144-token context decides an outcome: the task containers have no network
+access (`--network none`; with network the agents fetched upstream fixes), the
+task limit is 2 hours, and each request allows up to 65,536 new tokens (the
+server default is 8,192):
+
+| | IQ2R, 1,024 entries + LDLQ | MXFP4 A4W4 |
+|---|---|---|
+| Resolved | 194 / 300 (64.7%) | 197 / 300 (65.7%) |
+| Resolved by both / only this arm | 182 / 12 | 182 / 15 |
+| Harness errors | 0 | 0 |
+
+- On par with MXFP4: the arms agree on 273 of 300 tasks and split the other
+  27 by 12 to 15, within run-to-run noise (exact McNemar test p = 0.70).
+
 **1,024 entries with LDLQ, full Terminal-Bench 2.0.** All 89 tasks, one
 attempt per task per arm, both arms at the same time on one host with 8
 MI350X (IQ2R on 4 GPUs, MXFP4 A4W4 on the other 4, TP4 each), the same aiter
@@ -1007,8 +1028,8 @@ then the LDLQ arm, on one day:
   thinking (median output 15K vs 23K tokens, as MXFP4) and lifts the 15 SWE
   tasks from 10 to 15 of 30.
 - These are small, hard-case subsets: 15-task SWE runs move by a few tasks, the
-  Terminal-Bench tasks by about +-4 of 15. Full SWE-bench Lite was not run on
-  this recipe; the 512-entry recipe below trailed MXFP4 on it.
+  Terminal-Bench tasks by about +-4 of 15. The full benchmarks above replace
+  them as the comparison of record.
 - The MXFP4 arm here is A4W4; the 512-entry comparison below used A8W4
   (9, 11, 12 on the same 15 tasks).
 - No degenerate output in any arm (no `</think>` collapses, no runaway
@@ -1070,7 +1091,7 @@ What the numbers say:
 
 ## Not measured
 
-- The full SWE-bench Lite and GSM8K on the 1,024-entry LDLQ recipe; Terminal-Bench 2.0 with several attempts per task.
+- GSM8K on the 1,024-entry LDLQ recipe; SWE-bench Lite and Terminal-Bench 2.0 with several attempts per task.
 - Serving of the 1,024-entry checkpoint on MI355X (the serving tables are MI350X); its per-GPU memory budget.
 - Longer inputs and outputs than 1024/1024; MTP.
 - Variation across GPUs and nodes; token counts between tuned rows; M > 4096; power.
