@@ -158,12 +158,15 @@ def _a8w8_blockscale_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
+    dtype = _dtype(job["outdtype"])
+    # Passing out= skips the routed op, whose fake would run under the dry run.
     gemm_a8w8_blockscale_bpreshuffle(
         _empty(m, k, dtype=dtypes.fp8),
         _empty(n, k, dtype=dtypes.fp8),
         _empty(m, k // 128, dtype=dtypes.fp32),
         _empty(-(-n // 128), k // 128, dtype=dtypes.fp32),
-        dtype=_dtype(job["outdtype"]),
+        dtype=dtype,
+        out=_empty(m, n, dtype=dtype),
     )
 
 
@@ -214,22 +217,29 @@ def _a8w8_blockscale_mxscale_bpreshuffle(job: dict) -> None:
         _empty(m, k // x_block, dtype=dtypes.fp8_e8m0),
         _empty(-(-n // rows), k // cols, dtype=dtypes.fp8_e8m0),
         dtype=dtypes.bf16,
+        out=_empty(m, n, dtype=dtypes.bf16),  # skips the routed op, as above
     )
 
 
 def _batched_a8w8_mxscale_bpreshuffle(job: dict) -> None:
-    from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+    """The bf16 entry, or with ``fused_quant`` the entry that fuses the
+    output's group-32 MXFP8 quant into the epilogue: another kernel of the
+    same row."""
+    from aiter.ops import batched_gemm_op_a8w8 as ops
     from aiter.utility import dtypes
 
     b, m, n, k = job["b"], job["m"], job["n"], job["k"]
     rows, cols = _blocks(job["w_scale_block"], "128x128")
-    batched_gemm_a8w8_mxscale_bpreshuffle(
+    tensors = (
         _empty(m, b, k, dtype=dtypes.fp8),
         _empty(b, n, k, dtype=dtypes.fp8),
         _empty(m, b, k // cols, dtype=dtypes.fp8_e8m0),
         _empty(b, n // rows, k // cols, dtype=dtypes.fp8_e8m0),
-        dtype=dtypes.bf16,
     )
+    if job.get("fused_quant"):
+        ops.batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(*tensors)
+    else:
+        ops.batched_gemm_a8w8_mxscale_bpreshuffle(*tensors, dtype=dtypes.bf16)
 
 
 def _a16w16(job: dict) -> None:
@@ -394,7 +404,8 @@ def _column(row: dict, name: str) -> str:
 
 
 def parse_csv(csv_path: str) -> list[dict]:
-    """One job per FlyDSL row of a tuned GEMM table: its shape and key cells,
+    """One job per FlyDSL row of a tuned GEMM table and variant of its caller
+    (:func:`_variants`): its shape and key cells,
     ``m`` its tuned M, ``m_low`` the smallest M it serves (the previous
     tuned M of its shape, plus one) and ``tuned``, every tuned M of its shape
     with its kernel's (tile_m, cluster_m)."""
@@ -414,12 +425,11 @@ def parse_csv(csv_path: str) -> list[dict]:
     jobs = []
     for row in rows:
         kernel_name = _column(row, "kernelName")
-        if not table.all_rows and not (
+        flydsl = table.all_rows or (
             kernel_name.startswith(table.kernel_prefix)
             if table.kernel_prefix
             else _column(row, "libtype") == "flydsl"
-        ):
-            continue
+        )
         key = tuple(_column(row, c) for c in table.keys)
         m = _int(_column(row, "M"))
         smaller = [other for other in shapes[key] if other < m]
@@ -438,16 +448,23 @@ def parse_csv(csv_path: str) -> list[dict]:
             job.setdefault(name, _column(row, name))
         if "b" in table.keys:
             job["b"] = _int(job["b"])
-        jobs += [{**job, **variant} for variant in _variants(table, job)]
+        jobs += [{**job, **variant} for variant in _variants(table, job, flydsl)]
     return jobs
 
 
-def _variants(table: Table, job: dict) -> list[dict]:
+def _variants(table: Table, job: dict, flydsl: bool) -> list[dict]:
     """Caller-side choices a row leaves open: the x_scale block of an e8m0
     blockscale GEMM, which pairs with the weight's (1x128 blockscale with
-    128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones), and the output
+    128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones), the output
     dtype of an FP32-scale blockscale GEMM, whose rows serve bf16 and fp16
-    alike and whose FlyDSL kernels specialize on it."""
+    alike and whose FlyDSL kernels specialize on it, and the fused output
+    quant of a batched GEMM. That entry runs FlyDSL at every row, ``flydsl``
+    (one the table's own entry runs with FlyDSL) or not; any other row has
+    no variant."""
+    if table.caller is _batched_a8w8_mxscale_bpreshuffle:
+        return ([{}] if flydsl else []) + [{"fused_quant": True}]
+    if not flydsl:
+        return []
     if table.caller is _a8w8_blockscale_mxscale_bpreshuffle:
         _, cols = _blocks(job["w_scale_block"], "128x128")
         return [{"x_block": 128 if cols == 128 else 32}]
@@ -567,6 +584,7 @@ def describe(job: dict) -> str:
         for name in (
             "w_scale_block",
             "x_block",
+            "fused_quant",
             "dtype",
             "outdtype",
             "bias",

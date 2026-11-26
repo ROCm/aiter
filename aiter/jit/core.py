@@ -21,6 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -278,6 +279,12 @@ AITER_CONFIG_MEGA_MOE_TP = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
 )
 
+# the small-M schedule's per-batch launch configs (row tile, CTAs, two-shot all-reduce)
+AITER_CONFIG_MEGA_MOE_TP_SM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_SM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_sm_tuned.csv",
+)
+
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP_BIGM",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
@@ -509,6 +516,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_SM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_SM",
+            AITER_CONFIG_MEGA_MOE_TP_SM,
+            "mega_moe_tp_sm_tuned",
         )
 
     @property
@@ -1614,6 +1629,19 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]

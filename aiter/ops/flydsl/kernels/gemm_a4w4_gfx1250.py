@@ -464,15 +464,19 @@ def launch_gemm_a4w4(
                                         + fx.Int64(col + j),
                                     )
 
-            # Whole tiles go out through TDM with bounds equal to the tile, so no
-            # out-of-range clamp is relied on; edge tiles keep the guarded stores.
+            # Tiles with whole N go out through TDM. The view holds only the rows below
+            # m, so an M-tail tile is clipped by the TDM bound as the compute kernel's
+            # store is; the per-vector guarded stores of a tail tile run serially and
+            # made it the slowest workgroup. Edge-N tiles keep the guarded stores.
             if const_expr(tile_m % waves == 0):
-                if (bm + tile_m <= m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
+                if (bm < m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
                     C_TILE = (tile_m, c_lds_row)
                     tile_out = fx.Tensor(
                         fx.make_view(
                             out + fx.Int64(bm) * fx.Int64(ld_c) + fx.Int64(bn),
-                            fx.make_layout((tile_m, tile_n), (fx.Int64(ld_c), 1)),
+                            fx.make_layout(
+                                (fx.min(m - bm, tile_m), tile_n), (fx.Int64(ld_c), 1)
+                            ),
                         )
                     )
                     store_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(

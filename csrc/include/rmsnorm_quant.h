@@ -42,4 +42,16 @@ void rmsnorm(aiter_tensor_t& out,
              double epsilon,
              bool gemma_norm = false);
 
+// DeepSeek MLA q_a (MXFP4 out, m32k4 e8m0 scale) + kv_a (bf16 out) RMSNorm in one launch.
+void qkv_a_rmsnorm_fp4(aiter_tensor_t& q_out,
+                       aiter_tensor_t& q_scale,
+                       aiter_tensor_t& kv_out,
+                       aiter_tensor_t& q_in,
+                       aiter_tensor_t& kv_in,
+                       aiter_tensor_t& q_weight,
+                       aiter_tensor_t& kv_weight,
+                       double q_eps,
+                       double kv_eps,
+                       bool gemma_norm = false);
+
 } // namespace aiter
