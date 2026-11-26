@@ -34,13 +34,13 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.act import clamp_gate_up, sigmoid_f32
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
     swizzle_128,
 )
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.mxfp8_gemm_8wave import MxMfma
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtypeInt
@@ -1218,20 +1218,16 @@ def compile_moe_bs_gemm_8w(
                     # real-or-dummy choice is taken around the whole burst, so
                     # each arm is one block the scheduler can interleave.
                     rocdl.s_setprio(1)
-                    c01_in = c01
+                    c01_ops = (b1_frag, a0_frag, c01, sb1, sa0)
 
-                    def c01_with_c10():
-                        c = mfma.call(
-                            b1_frag, a0_frag, c01_in, sb1, sa0, k_pack=0, set_prio=False
-                        )
+                    def c01_with_c10(ops=c01_ops):
+                        c = mfma.call(*ops, k_pack=0, set_prio=False)
                         store_c.store(store_c.pack(prev_acc[2]), prev_offs[1], pcols[0])
                         _interleave_store_burst(N_TILES_A)
                         return c
 
-                    def c01_with_dummy():
-                        c = mfma.call(
-                            b1_frag, a0_frag, c01_in, sb1, sa0, k_pack=0, set_prio=False
-                        )
+                    def c01_with_dummy(ops=c01_ops):
+                        c = mfma.call(*ops, k_pack=0, set_prio=False)
                         store_c.store_dummy()
                         return c
 
@@ -1495,9 +1491,7 @@ def compile_moe_bs_gemm_8w(
             first_mask = pad_mask(pad_rows(first_tile))
             first = make_ctx(first_tile, first_expert, first_mask)
             first["sc"](0)
-            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
-                LDS_BUFS
-            )
+            a_cur0, a_cur1, a_next0, _, b_cur0, b_cur1, b_next0, b_next1 = LDS_BUFS
             first["b"](0, b_cur0, 0)
             first["a"](0, a_cur0, 0)
             first["b"](1, b_cur1, 0)
@@ -1571,9 +1565,7 @@ def compile_moe_bs_gemm_8w(
             first_mask = s1_pad_mask(fx.Int32(0)) if half_skip else fx.Int32(0)
             first = make_ctx_s1(first_tile, first_expert, fx.Int32(0), False)
             first["sc"]()
-            a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1 = (
-                LDS_BUFS
-            )
+            a_cur0, a_cur1, a_next0, _, b_cur0, b_cur1, b_next0, b_next1 = LDS_BUFS
             first["b"](0, b_cur0, 0)
             first["a"](0, a_cur0, 0)
             first["b"](1, b_cur1, 0)
