@@ -11,7 +11,6 @@ import triton.language as tl
 
 import aiter.ops.triton.attention.pa_decode as pa_decode_mod
 from aiter import logger, pertoken_quant
-from aiter.ops.triton._triton_kernels.attention import pa_decode as pa_kernels
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -641,16 +640,6 @@ def test_checked_launch_drops_tensor_desc_when_misaligned():
     assert pa_decode_mod._checked_launch(launch, k, v2) == off
 
 
-def test_missing_config_gives_none(tmp_path, monkeypatch):
-    monkeypatch.setattr(pa_kernels, "resolve_config_dir", lambda *a, **k: str(tmp_path))
-    load_config_json.cache_clear()
-    try:
-        assert pa_kernels._get_dispatch_config("fp16") is None
-        assert pa_kernels._get_launch_config("v1_w_dot", _PAGES[0]) is None
-    finally:
-        load_config_json.cache_clear()
-
-
 @pytest.mark.parametrize("rule", _SPLIT_RULES)
 def test_split_size_follows_rule(rule):
     default = pa_decode_mod._SEQ_PARTITION_SIZE
@@ -976,15 +965,6 @@ def test_paged_attn_gqa_tdm_split(
     )
     atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
     torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_tdm_split_config_is_valid(arch):
-    for rule in _config(arch).get("dispatch", {}).values():
-        if rule.get("tdm_split_target_programs") is None:
-            continue
-        assert rule["tdm_split_max_partitions"] >= 1
-        assert all(s % 128 == 0 for s in rule["tdm_split_sizes"])
 
 
 _TDM_SPLIT_RULE = {

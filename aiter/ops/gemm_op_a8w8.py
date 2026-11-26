@@ -1437,6 +1437,22 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
             n,
             k,
         )
+    if row is not None and row.get("libtype") == "flydsl":
+        from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+            is_compute_wmma_kernel_name,
+            parse_wmma_kernel_name,
+        )
+
+        kernel_name = str(row["kernelName"])
+        wmma_config = parse_wmma_kernel_name(kernel_name)
+        # A padded row must not send a decode M below a compute kernel's
+        # full M tile; kernel_fits_shape rejects that cluster-barrier case.
+        if (
+            wmma_config is not None
+            and is_compute_wmma_kernel_name(kernel_name)
+            and m < wmma_config["tile_m"]
+        ):
+            row = None
     if row is None:
         report_key = (gfx, n, k, w_scale_block)
         if report_key not in _MXSCALE_UNTUNED_REPORTED:
@@ -1602,9 +1618,14 @@ def gemm_a8w8_blockscale(
             # tensors: tracing uses gemm_a8w8_blockscale_fake), so the nested
             # op's body is called directly instead of dispatching
             # torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle a second time.
-            # A rebound module attribute (e.g. monkeypatched) is still called.
-            bpreshuffle = gemm_a8w8_blockscale_bpreshuffle
-            bpreshuffle = getattr(bpreshuffle, "_eager_body", bpreshuffle)
+            #
+            # The target is the native body rather than the public spelling:
+            # with no output buffer named, the public one now routes, and a
+            # provider serving this nested call would be both the second
+            # dispatch this avoids and a different kernel inside what the
+            # caller asked AITER to compute. A rebound module attribute (e.g.
+            # monkeypatched) is still called.
+            bpreshuffle = _gemm_a8w8_blockscale_bpreshuffle_native
             return bpreshuffle(XQ, WQ, x_scale.view(e8m0), w_scale.view(e8m0), dtype)
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -1764,9 +1785,7 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
 # independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
 # E8M0 route. Whether they should converge is #7150's question, not this one's;
 # routing them as they are keeps this pilot out of a public API change.
-@_route(op="gemm_a8w8_blockscale_bpreshuffle")
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
-def gemm_a8w8_blockscale_bpreshuffle(
+def _gemm_a8w8_blockscale_bpreshuffle_native(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -2041,6 +2060,94 @@ def gemm_a8w8_blockscale_bpreshuffle(
             f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+def _gemm_a8w8_blockscale_bpreshuffle_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """The tensor the routed form returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason the
+    routed contract carries no output buffer: see
+    :func:`gemm_a8w8_blockscale_bpreshuffle`.
+    """
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@_route(
+    op="gemm_a8w8_blockscale_bpreshuffle",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_gemm_a8w8_blockscale_bpreshuffle_fake,
+    mutates_args=[],
+)
+def _gemm_a8w8_blockscale_bpreshuffle_routed(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Block-scaled A8W8 GEMM on a preshuffled weight -- the routed contract.
+
+    v2 drops the ``out=`` buffer v1 carried, which is what lets this op be
+    registered as a custom op at all. Everything else is unchanged; the math
+    is :func:`_gemm_a8w8_blockscale_bpreshuffle_native`.
+
+    Returns a newly allocated ``[M, N]`` tensor of ``dtype``. It writes
+    through none of its arguments: a provider serving this contract must
+    allocate its result too, and a caller that wants the result in a buffer
+    it owns calls :func:`gemm_a8w8_blockscale_bpreshuffle` with ``out=``,
+    which does not route.
+    """
+    return _gemm_a8w8_blockscale_bpreshuffle_native(
+        XQ, WQ, x_scale, w_scale, dtype, None
+    )
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
+def gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Block-scaled A8W8 GEMM whose weight is already in MFMA-fragment order.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_gemm_a8w8_blockscale_bpreshuffle_routed`.
+
+    ``out`` is a pre-allocated output buffer, and passing it bypasses
+    routing. The reason is a schema one rather than a policy one: with a
+    buffer this function RETURNS the tensor it was given, while the schema a
+    custom op is registered under declares that its results do not alias its
+    inputs. `opcheck` reports the contradiction, and under compile both ways
+    of resolving it are wrong. Measured: a fake that allocates leaves the
+    caller's buffer UNWRITTEN while still returning the right value -- no
+    error, stale buffer, and nothing says so. A fake that hands the argument
+    back happens to work, but only by asserting the aliasing its own schema
+    denies.
+
+    Leaving the buffer out of the contract removes the contradiction instead
+    of picking a side of it: the tensor the routed form returns is one it
+    allocated.
+
+    A provider therefore serves the allocating form only. The buffered form
+    runs AITER's own kernel, which is what naming the buffer asked for -- and
+    what pins the result to a FIXED address, so this GEMM's consumer can be
+    captured into a cudagraph without a per-step input copy.
+    """
+    if out is None:
+        return _gemm_a8w8_blockscale_bpreshuffle_routed(XQ, WQ, x_scale, w_scale, dtype)
+    return _gemm_a8w8_blockscale_bpreshuffle_native(
+        XQ, WQ, x_scale, w_scale, dtype, out
+    )
 
 
 def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> dict:
@@ -2982,6 +3089,11 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"
         )
+        if kernel_name is None and Y.dtype == dtypes.bf16:
+            # No tuned row and no mxpsh tile runs the shape (mxpsh needs K a
+            # multiple of 128): the batched GEMM's heuristic, which takes any
+            # K that 32 divides.
+            is_bmm = True
         if is_bmm and Y.dtype != dtypes.bf16:
             # The gfx950 BMM writes bf16 only; let the mxpsh heuristic pick.
             kernel_name = None

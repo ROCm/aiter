@@ -44,11 +44,14 @@ def rail_record_layout(hidden: int, topk: int, activation_dtype: str = "fp4"):
 def build_rail_record_quant(
     hidden: int, topk: int, activation_dtype: str = "fp4", pad_tokens: int = 0
 ):
-    assert hidden % GROUP == 0
+    if hidden % GROUP:
+        raise ValueError(f"hidden must be a multiple of {GROUP}")
     if pad_tokens < 0:
         raise ValueError("pad_tokens must be nonnegative")
     scale_n = hidden // GROUP
-    assert scale_n >= 2 * topk, "ids/weights 由每 token 前 2*topk 个 group 线程顺带写"
+    if scale_n < 2 * topk:
+        # The first 2*topk group threads of each token also write its ids and weights.
+        raise ValueError(f"hidden / {GROUP} must be at least 2 * topk")
     rec, off_q, off_s, off_i, off_w = rail_record_layout(hidden, topk, activation_dtype)
 
     inv_max_bits = (
@@ -221,7 +224,6 @@ def build_rail_record_quant(
             grid=(fx.Int64(grid_blocks), 1, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
-    launch.rec_bytes = rec
     launch.layout = (rec, off_q, off_s, off_i, off_w)
     return launch
 

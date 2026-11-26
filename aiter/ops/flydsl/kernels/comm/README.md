@@ -25,7 +25,7 @@ The host classes are in `aiter/ops/flydsl/`:
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
-| `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+| `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 The dispatchers are in `aiter/dist/device_communicators/`:
 
