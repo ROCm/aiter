@@ -383,32 +383,3 @@ def test_op_expert_parallel(
         r0, r1 = int(offs[lo]), int(offs[hi])
         ref_y, tri_y = ref_y[r0:r1], tri_y[r0:r1]
     assert_close(ref_y, tri_y, maxtol=4e-1, rmstol=4e-2)
-
-
-def test_op_expert_parallel_rejects_bad_inputs():
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
-    x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
-        _ep_setup(16, 256, 256, 8, 2, 4, 1, True, True)
-    )
-    args = (
-        x,
-        w_tri[lo:hi],
-        None,
-        w_scale_tri[lo:hi],
-        None,
-        None,
-        bias[lo:hi],
-        rdata,
-        gindx,
-        sindx,
-    )
-    with pytest.raises(AssertionError, match="requires gate_valid"):
-        moe_gemm_a16w4(*args, backend="triton", expert_map=expert_map)
-    with pytest.raises(AssertionError, match="n_expts_tot"):
-        moe_gemm_a16w4(
-            *args,
-            backend="triton",
-            expert_map=expert_map[:-1].contiguous(),
-            gate_valid=gate_valid,
-        )

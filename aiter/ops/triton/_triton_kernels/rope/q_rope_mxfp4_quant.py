@@ -33,7 +33,7 @@ def _q_rope_mxfp4_quant_kernel(
     weights_ptr,  # [T, H]
     weights_stride,
     weights_scale,
-    weights_out_ptr,  # f32 [T, H]
+    weights_out_ptr,  # f32/bf16/f16 [T, H]
     weights_out_stride,
     hidden_ptr,  # [T, PROJ_IN] bf16/fp16, PROJECT input
     hidden_stride,
@@ -118,13 +118,13 @@ def _q_rope_mxfp4_quant_kernel(
         w = acc.to(tl.bfloat16).to(tl.float32)
         tl.store(
             weights_out_ptr + tok * weights_out_stride + heads,
-            w * weights_scale,
+            (w * weights_scale).to(weights_out_ptr.dtype.element_ty),
             mask=head_mask,
         )
     elif HAS_WEIGHTS:
         w = tl.load(weights_ptr + tok * weights_stride + heads, mask=head_mask)
         tl.store(
             weights_out_ptr + tok * weights_out_stride + heads,
-            w.to(tl.float32) * weights_scale,
+            (w.to(tl.float32) * weights_scale).to(weights_out_ptr.dtype.element_ty),
             mask=head_mask,
         )
