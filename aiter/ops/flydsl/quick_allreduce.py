@@ -973,8 +973,17 @@ class FlyQuickAllReduceRMSNorm:
             return contextlib.nullcontext()
         return self._registered_engine.capture()
 
-    def accepts(self, inp, residual_in, weight, gemma_norm: bool = False) -> bool:
-        """Whether ``allreduce_rmsnorm`` would serve this call now. Never raises.
+    def accepts(
+        self,
+        inp,
+        residual_in,
+        weight,
+        gemma_norm: bool = False,
+        out=None,
+        residual_out=None,
+    ) -> bool:
+        """Whether ``allreduce_rmsnorm`` would serve this call now (``out`` / ``residual_out`` are the
+        caller's destinations, if any). Never raises.
 
         The mesh and the ring serve any call their geometry has a build for. A
         registered schedule serves only ``gemma_norm`` calls recorded inside
@@ -983,7 +992,9 @@ class FlyQuickAllReduceRMSNorm:
         eng = self._registered_engine
         if eng is None:
             return True
-        return bool(gemma_norm) and eng.accepts(inp, residual_in, weight)
+        return bool(gemma_norm) and eng.accepts(
+            inp, residual_in, weight, out, residual_out
+        )
 
     # -- engine construction -------------------------------------------------
 
@@ -1568,7 +1579,13 @@ class FlyQuickAllReduceRMSNorm:
             if not gemma_norm:
                 raise ValueError("the pull schedule normalizes with Gemma's 1 + weight")
             return self._registered_engine.allreduce_rmsnorm(
-                inp, residual_in, weight, eps, out=out, residual_out=residual_out
+                inp,
+                residual_in,
+                weight,
+                eps,
+                out=out,
+                residual_out=residual_out,
+                stream=stream,
             )
         if out is None:
             out = torch.empty_like(inp)

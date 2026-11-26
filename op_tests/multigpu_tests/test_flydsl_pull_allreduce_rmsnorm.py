@@ -27,6 +27,7 @@ import torch.multiprocessing as mp
 WORLD = 4
 HIDDEN = 6144
 EPS = 1e-6
+ITERS = 50  # graph replays per timing
 # One row count per tier edge: one-shot (<= 11), pull (12-287; block / wave hand-offs
 # below / above 37 and 96), streamed (288-480 at R2, 481-640 at R4).
 ROWS = (1, 8, 11, 12, 36, 37, 96, 97, 256, 287, 288, 384, 480, 481, 640)
@@ -99,8 +100,29 @@ def _worker(rank, port):
                 out, res_out = eng.allreduce_rmsnorm(x, r, weight, EPS, gemma_norm=True)
             graphs.append((rows, x, r, graph, out, res_out))
         too_many = _data(641, 1, rank, device)
+        # destinations the kernels cannot write correctly are declined, not launched
+        x8, r8 = _data(8, 1, rank, device), _data(8, 2, rank, device)
+        other = torch.device("cuda", (rank + 1) % WORLD)
+        cpu_out = torch.empty(8, HIDDEN, dtype=torch.bfloat16)
+        far_out = torch.empty(8, HIDDEN, dtype=torch.bfloat16, device=other)
+        same = torch.empty(8, HIDDEN, dtype=torch.bfloat16, device=device)
+        a = torch.empty(2 * 8, HIDDEN, dtype=torch.bfloat16, device=device)
+        lap_a, lap_b = a[:8], a[7:15]  # rows 7 of the two views are the same memory
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             assert not eng.accepts(too_many, too_many, weight, gemma_norm=True)
+            assert not eng.accepts(x8, r8, weight, out=cpu_out, gemma_norm=True)
+            assert not eng.accepts(
+                x8, r8, weight, residual_out=far_out, gemma_norm=True
+            )
+            assert not eng.accepts(
+                x8, r8, weight, out=same, residual_out=same, gemma_norm=True
+            )
+            assert not eng.accepts(
+                x8, r8, weight, out=lap_a, residual_out=lap_b, gemma_norm=True
+            )
+            assert eng.accepts(
+                x8, r8, weight, out=a[:8], residual_out=a[8:16], gemma_norm=True
+            )
 
     bad = []
     for rows, x, r, graph, out, res_out in graphs:
@@ -122,6 +144,28 @@ def _worker(rank, port):
             ulp = (out.view(torch.int16).int() - ref_out.view(torch.int16).int()).abs()
             if d_res or int(ulp.max()) > 1 or (ulp != 0).float().mean().item() > 1e-3:
                 bad.append((rows, it, d_res, int(ulp.max()), (ulp != 0).sum().item()))
+    # graph-replay time per tier edge (all ranks replay together; rank 0 reports)
+    table = []
+    for rows, x, r, graph, out, res_out in graphs:
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(True)
+        t0.record()
+        for _ in range(ITERS):
+            graph.replay()
+        t1.record()
+        t1.synchronize()
+        table.append(
+            (
+                rows,
+                eng._registered_engine.tier_name(rows),
+                t0.elapsed_time(t1) * 1e3 / ITERS,
+            )
+        )
+    if rank == 0:
+        print("\n| rows | tier | graph replay us |\n|---|---|---|")
+        for rows, tier, us in table:
+            print(f"| {rows} | {tier} | {us:.1f} |")
     eng.close()
     dist.barrier(group)
     dist.destroy_process_group()

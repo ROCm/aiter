@@ -72,18 +72,20 @@ def _f32_bits(v: float) -> int:
     return struct.unpack("<i", struct.pack("<f", v))[0]
 
 
+# One launcher object per device: `_run_compiled` keeps a single device-bound handle in the object, so
+# engines of two GPUs in one process must not share one.
 @functools.cache
-def _oneshot_kernel():
+def _oneshot_kernel(device: int):
     return K.make_oneshot_ack_kernel()
 
 
 @functools.cache
-def _pull_kernel(wave: bool):
+def _pull_kernel(device: int, wave: bool):
     return K.make_pull_kernel(wave)
 
 
 @functools.cache
-def _stream_kernel(rpw: int, hoist: bool):
+def _stream_kernel(device: int, rpw: int, hoist: bool):
     return K.make_stream_pull_kernel(rpw, hoist)
 
 
@@ -302,7 +304,12 @@ class PullAllReduceRMSNorm:
         rows = inp.shape[0]
         if not inp.is_contiguous() or residual_in.shape != inp.shape:
             return False
-        if residual_in.stride(1) != 1 or residual_in.stride(0) % 8:
+        # the stride is an Int32 launch argument (the kernels widen it before the byte offset)
+        if (
+            residual_in.stride(1) != 1
+            or residual_in.stride(0) % 8
+            or residual_in.stride(0) >= 2**31
+        ):
             return False
         if weight.numel() != HIDDEN or not weight.is_contiguous():
             return False
@@ -312,9 +319,17 @@ class PullAllReduceRMSNorm:
         for t in (out, residual_out):
             if t is not None and (
                 t.dtype is not torch.bfloat16
+                or t.device.index != self._device_index  # a CPU tensor has no index
                 or tuple(t.shape) != (rows, HIDDEN)
                 or not t.is_contiguous()
             ):
+                return False
+        if out is not None and residual_out is not None:
+            # each kernel stores the residual and then the normalized row: overlapping destinations
+            # cannot both be returned
+            span = lambda t: (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
+            (a0, a1), (b0, b1) = span(out), span(residual_out)
+            if a0 < b1 and b0 < a1:
                 return False
         if not launcher_loaded(self._launcher(rows)[0]):
             return False  # not preloaded: a capture cannot JIT-compile
@@ -334,10 +349,14 @@ class PullAllReduceRMSNorm:
     def _launcher(self, rows: int):
         key = tier(rows)
         if key[0] == "oneshot":
-            return _oneshot_kernel(), K.ACK_OFF, 0
+            return _oneshot_kernel(self._device_index), K.ACK_OFF, 0
         if key[0] == "pull":
-            return _pull_kernel(key[1]), K.PULL_OFF, K.MAX_ROWS
-        return _stream_kernel(key[1], key[2]), K.STREAM_OFF, 2 * K.MAX_ROWS
+            return _pull_kernel(self._device_index, key[1]), K.PULL_OFF, K.MAX_ROWS
+        return (
+            _stream_kernel(self._device_index, key[1], key[2]),
+            K.STREAM_OFF,
+            2 * K.MAX_ROWS,
+        )
 
     def _args(self, bufoff, cntoff, rows, ptrs, res_stride, eps, stream):
         x, res_in, w, out, res_out = ptrs
@@ -398,6 +417,8 @@ class PullAllReduceRMSNorm:
         check_launch_outside_capture(launch, owner="PullAllReduceRMSNorm")
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
+        elif not isinstance(stream, Stream):
+            stream = Stream(stream)
         args = self._args(
             bufoff,
             cntoff,

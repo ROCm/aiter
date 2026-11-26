@@ -490,7 +490,7 @@ def make_oneshot_ack_kernel():
         rowoff = fx.Int64(rw) * ROWB
         row = _row_loader(off)
         xs = _load_ptrs(arg_x)
-        rv = row(arg_r + fx.Int64(rw) * fx.Int64(i32_sr * 2), 0, None)
+        rv = row(arg_r + fx.Int64(rw) * (fx.Int64(i32_sr) * fx.Int64(2)), 0, None)
         wv = row(arg_w, 0, None)
         pl = (me + 1 + lane) % WORLD
         wflag = fx.Int64((rw * NW + wave) * 128 + 16)
@@ -622,7 +622,8 @@ def make_pull_kernel(wave_handoffs=False):
                 for t in range_constexpr(WORLD - 1)
             ]
             rr = buffer_ops.create_buffer_resource_from_addr(
-                arg_r + fx.Int64(rw) * fx.Int64(i32_sr * 2), num_records_bytes=ROWB
+                arg_r + fx.Int64(rw) * (fx.Int64(i32_sr) * fx.Int64(2)),
+                num_records_bytes=ROWB,
             )
             rvraw = Vec(buffer_ops.buffer_load(rr, off, vec_width=4, dtype=fx.Int32))
             wv = _bf16x8(row(arg_w, 0, None))
@@ -836,7 +837,11 @@ def make_stream_pull_kernel(rpw=2, hoist_weight=False):
                         )
                     )
                     rv = _bf16x8(
-                        row(arg_r + fx.Int64(rw) * fx.Int64(i32_sr * 2), 0, ok)
+                        row(
+                            arg_r + fx.Int64(rw) * (fx.Int64(i32_sr) * fx.Int64(2)),
+                            0,
+                            ok,
+                        )
                     )
                     wv = wv_once if hoist_weight else _bf16x8(row(arg_w, 0, always))
                     s = [xv[n] + rv[n] for n in range_constexpr(8)]
