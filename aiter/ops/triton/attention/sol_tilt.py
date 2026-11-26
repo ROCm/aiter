@@ -296,15 +296,11 @@ def sol_jensen_cap(
     # packed again from mean_k_var_pooled and the kernel only finds the gain.
     repack = block_scaled and d == 256 and bits in (6 * d, 8 * d)
     if repack and mean_k_var_pooled is None:
-        raise ValueError(
-            "an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled"
-        )
+        raise ValueError("an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled")
     if block_scaled:
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
         var = mean_k_var
-        var_scale = (
-            mean_k_var_scale if repack else _backed_scale_copy(mean_k_var_scale)
-        )
+        var_scale = mean_k_var_scale if repack else _backed_scale_copy(mean_k_var_scale)
     else:
         per_nat = (
             0.5
