@@ -5,8 +5,9 @@
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
 (``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``) or by dropped routes
-(``valid[t,k] = topk_ids[t,k] >= 0``: the sort leaves dropped routes out, so
-their rows of X are never written). Epilogue of stage2
+(``valid[t,k] = topk_ids[t,k] >= 0``, or ``0 <= topk_ids[t,k] < num_experts``
+when ``num_experts`` is given: the sort leaves dropped routes out, so their
+rows of X are never written). Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
 with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
 ``Constexpr`` so flyc specializes per shape/dtype.
@@ -221,7 +222,12 @@ def _moe_reduction_body(
                 )
             if const_expr(skip_dropped):
                 # Select, not multiply: a never-written row may hold NaN.
-                vk = (tk_ptr[k] >= fx.Int32(0)).select(vk, fx.full(V, 0.0, fx.Float32))
+                if const_expr(num_experts > 0):
+                    # One unsigned compare drops ids < 0 and ids >= num_experts.
+                    ok = fx.Uint32(tk_ptr[k]) < fx.Uint32(num_experts)
+                else:
+                    ok = tk_ptr[k] >= fx.Int32(0)
+                vk = ok.select(vk, fx.full(V, 0.0, fx.Float32))
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)
@@ -302,7 +308,8 @@ def compile_moe_reduction(
 
     kernel_name = (
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
-        f"_m{int(use_mask)}e{num_experts if use_mask else 0}d{int(skip_dropped)}"
+        f"_m{int(use_mask)}e{num_experts if use_mask or skip_dropped else 0}"
+        f"d{int(skip_dropped)}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
     )
 

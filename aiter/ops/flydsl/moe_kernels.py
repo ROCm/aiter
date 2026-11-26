@@ -1206,11 +1206,13 @@ def _run_moe_reduction(
     *,
     streaming_loads=False,
     skip_dropped=False,
+    num_experts=0,
 ):
     """Topk reduction epilogue for stage2 reduce mode.
 
     skip_dropped: leave out slots whose topk_ids are negative (dropped routes),
-    whose rows of target the stage-2 GEMM never writes.
+    whose rows of target the stage-2 GEMM never writes; with ``num_experts`` > 0
+    (and no expert_mask) also those whose ids are >= num_experts.
     """
     use_mask = expert_mask is not None
     if (use_mask or skip_dropped) and topk_ids is None:
@@ -1283,7 +1285,7 @@ def _run_moe_reduction(
     if stream is None:
         stream = torch.cuda.current_stream()
     # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
-    num_experts = int(expert_mask.numel()) if use_mask else 0
+    num_experts = int(expert_mask.numel()) if use_mask else int(num_experts)
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,

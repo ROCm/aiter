@@ -239,9 +239,10 @@ def moe_bs_forward(
                 swiglu_limit=swiglu_limit,
             )
         return out
-    # The sort drops ids outside [0, E) itself; the reduction skips only
-    # negative ones, so ids >= E become -1 (their slot rows are never written).
-    ids = torch.where(topk_ids < E, topk_ids.to(torch.int32), -1)
+    # The sort drops ids outside [0, E) itself, and the reduction skips them
+    # too (their slot rows are never written): no masking pass (it was three
+    # small kernels, ~13 us, before the sort).
+    ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
     sorted_ids, _, sorted_eids, num_valid, _ = moe_sorting(
         ids, topk_weights.float(), E, D, x.dtype, BLOCK_M, accumulate=False
     )
@@ -297,6 +298,7 @@ def moe_bs_forward(
         topk_ids=ids,
         topk_weights=topk_weights,
         skip_dropped=True,
+        num_experts=E,
         streaming_loads=slots.numel() * slots.element_size() > (280 << 20),
     )
     return out
