@@ -42,6 +42,8 @@ def l2norm_bwd(x, dy, eps=1e-6):
 
 # The projections below use the gfx950 bf16 GEMM with an element-wise epilogue.
 # fp32 output needs the 128x128 tile to fit the C shuffle in LDS.
+# Every KDA GEMM uses the full-tile kernel: never the half-tile-interleaved
+# (HTI) one, whose tn path is under investigation (#8754).
 _PROJ_GEMM_KWARGS = {"block_m": 128, "block_n": 128, "use_half_tile_interleaved": False}
 
 
@@ -50,13 +52,16 @@ def _proj_gemm(a, w, **kw):
     return _gemm(a.contiguous(), w.t(), "nt", **kw)
 
 
-def _gemm(a, b, layout, **kw):
+def _gemm(a, b, layout, out=None, **kw):
     from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
 
+    kwargs = dict(_PROJ_GEMM_KWARGS)
+    assert not kwargs["use_half_tile_interleaved"]
     return gemm_a16w16(
         a,
         b,
-        user_kwargs=dict(_PROJ_GEMM_KWARGS),
+        out=out,
+        user_kwargs=kwargs,
         layout=layout,
         out_dtype=torch.float32,
         **kw,
@@ -142,24 +147,26 @@ def sigmoid_gate_proj(x, g_proj, aux=None):
     )
 
 
-def proj_gemm(a, w, kind):
+def proj_gemm(a, w, kind, out=None):
     """Plain projection GEMM on the gfx950 bf16 GEMM (fp32 output), with the
     ``_proj_gemm`` operand convention; a shape the GEMM rejects (a K tail,
-    misaligned strides) falls back to torch on the same rounded inputs."""
+    misaligned strides) falls back to torch on the same rounded inputs.
+    ``out`` (contiguous fp32) receives the result on either path."""
     dt = w.dtype
     a16 = a.to(dt).contiguous()
     w16 = w.to(dt).contiguous()
     try:
         if kind == "fwd":
-            return _gemm(a16, w16.t(), "nt")
+            return _gemm(a16, w16.t(), "nt", out=out)
         if kind == "dgrad":
-            return _gemm(a16, w16, "nn")
-        return _gemm(a16.t(), w16, "tn")
+            return _gemm(a16, w16, "nn", out=out)
+        return _gemm(a16.t(), w16, "tn", out=out)
     except (AssertionError, ValueError):
         a32, w32 = a16.float(), w16.float()
-        return {"fwd": lambda: a32 @ w32.t(), "dgrad": lambda: a32 @ w32}.get(
+        res = {"fwd": lambda: a32 @ w32.t(), "dgrad": lambda: a32 @ w32}.get(
             kind, lambda: a32.t() @ w32
         )()
+        return res if out is None else out.copy_(res)
 
 
 def gate_proj_bwd_gemms(dgp, x, g_proj):
@@ -168,15 +175,5 @@ def gate_proj_bwd_gemms(dgp, x, g_proj):
     dgp: [M, H*V]; x: [M, D]; g_proj: [H*V, D]. Shapes the GEMM cannot take
     (a K tail, misaligned strides) fall back to torch for that product.
     """
-    dt = g_proj.dtype
-    d16 = dgp.to(dt).contiguous()
-    x16 = x.to(dt).contiguous()
-    try:
-        dx = _gemm(d16, g_proj.contiguous(), "nn")
-    except (AssertionError, ValueError):
-        dx = dgp.float() @ g_proj.float()
-    try:
-        dw = _gemm(d16.t(), x16, "tn")
-    except (AssertionError, ValueError):
-        dw = dgp.float().t() @ x.float()
-    return dx, dw
+    # the torch fallback takes the same bf16-rounded dgp/x as the GEMM
+    return proj_gemm(dgp, g_proj, "dgrad"), proj_gemm(dgp, x, "wgrad")
