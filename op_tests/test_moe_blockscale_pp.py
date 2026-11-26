@@ -14,6 +14,11 @@ weights (PR 6742's):
 
 Shapes: D 4096 / I 1024, 288 routed experts (+1 shared expert, selected by
 every token, for top-k 9).
+
+Run:
+    python op_tests/test_moe_blockscale_pp.py          # full sweep, markdown tables
+    python op_tests/test_moe_blockscale_pp.py -t 4096 -k 8
+    pytest op_tests/test_moe_blockscale_pp.py -q       # reduced grid
 """
 
 import argparse
@@ -24,6 +29,7 @@ import os
 import tempfile
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -35,6 +41,9 @@ from aiter.test_common import benchmark, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx950"]
+pytestmark = pytest.mark.skipif(
+    get_gfx_runtime() not in SUPPORTED_GFX, reason="moe_blockscale_pp requires gfx950"
+)
 ROUTED_EXPERTS = 288
 TOL = 0.06
 # Per row too: one wrong row can stay under a global bound (worst seen: 0.062).
@@ -439,6 +448,56 @@ def test_moe_blockscale_dispatch(tokens, topk, swiglu_limit):
     qref = run_torch(x[rows], w, tw[rows], ids[rows], swiglu_limit, quantized=True)
     _, residual = _check("fused_moe -> flydsl_bspp", out[rows], ref, qref)
     return {"gfx": get_gfx_runtime(), "dispatched": calls[0], "residual": residual}
+
+
+# The @benchmark sweeps take shape arguments: pytest runs the wrappers below.
+for _fn in (
+    test_moe_blockscale,
+    test_moe_blockscale_graph,
+    test_moe_blockscale_inputs,
+    test_moe_blockscale_chunked,
+    test_moe_blockscale_dispatch,
+):
+    _fn.__test__ = False
+
+
+@pytest.mark.parametrize("tokens", [1, 128, 4096, 8192])
+@pytest.mark.parametrize(
+    "swiglu_limit,routing",
+    [
+        (0.0, "random"),
+        (1.0, "random"),
+        (10.0, "random"),
+        (0.0, "invalid"),
+        (0.0, "hot"),
+    ],
+)
+@pytest.mark.parametrize("topk", [8, 9])
+def test_forward(tokens, topk, swiglu_limit, routing):
+    test_moe_blockscale(tokens, topk, swiglu_limit, routing)
+
+
+@pytest.mark.parametrize("tokens", [65, 4096])
+@pytest.mark.parametrize("topk", [8, 9])
+@pytest.mark.parametrize("experts", [288, 16])
+def test_graph_replay(tokens, topk, experts):
+    test_moe_blockscale_graph(tokens, topk, experts)
+
+
+@pytest.mark.parametrize("topk", [8, 9])
+def test_inputs(topk):
+    test_moe_blockscale_inputs(topk)
+
+
+@pytest.mark.parametrize("topk", [8, 9])
+def test_chunked(topk):
+    test_moe_blockscale_chunked(4097, topk, 3)
+
+
+@pytest.mark.parametrize("swiglu_limit", [0.0, 1.0])
+@pytest.mark.parametrize("topk", [8, 9])
+def test_dispatch(topk, swiglu_limit):
+    test_moe_blockscale_dispatch(4096, topk, swiglu_limit)
 
 
 def summarize(name, rows):
