@@ -378,6 +378,8 @@ def compile_moe_gemm2(
         p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
+        # The cache holds IR of one trace, and a launcher can be traced again.
+        flyobj.clear_all()
         e_idx = fx.gpu.block_idx.y
 
         flyobj.bid = e_idx
@@ -498,18 +500,21 @@ def compile_moe_gemm2(
             frag_act = flyobj.load_tiled_mma_fragB(mm, ldsA, copy_atom_bits=128)
             fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
 
+            # The second mode (tokens, the MMA's N) broadcasts the per-channel scale
+            # with stride 0 and spans one whole N tile (16): FlyDSL >= 0.5.1 rejects
+            # a fragment view whose extent is not a multiple of the tile.
             arg_w_scale = None
             if const_expr(weight_quant_type == "per_tensor"):
                 arg_w_scale = fx.make_view(
-                    fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 1), (0, 0))
+                    fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 16), (0, 0))
                 )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 16))
             if const_expr(weight_quant_type == "ptpc"):
                 arg_w_scale = fx.make_view(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
-                    fx.make_layout((N, 1), (1, 0)),
+                    fx.make_layout((N, 16), (1, 0)),
                 )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 16))
 
             arg_a_scale = None
             if const_expr(act_quant_type == "per_tensor"):

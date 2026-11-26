@@ -284,6 +284,20 @@ def build_gemm_a8w4_tdm_task(
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
     """
+    if a_is_fp4:
+        # The fp4-activation body always emits v_wmma_scale_f32_32x16x128_f4.
+        # gfx1250-strict (MI450 A0 errata) has no wmma-f4-insts, and LLVM then
+        # only prints "requires target feature" and emits a kernel without the
+        # matmul (NaN output). Fail the build loudly instead (ROCm/aiter#8527).
+        from flydsl.runtime.device import get_rocm_arch
+
+        _target = get_rocm_arch()
+        if _target.startswith("gfx1250-"):
+            raise NotImplementedError(
+                f"fp4-activation grouped TDM GEMM cannot target {_target}: it has "
+                "no wmma-f4-insts (MI450 A0 errata, ROCm/aiter#8527). Use fp8 "
+                "activations (a8w4) on this target."
+            )
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
     if defer_c_wait:
@@ -366,7 +380,15 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # The fixed placement gives each of the two k128 prefetch slots 128 VGPRs
+    # (v256-v511) and the accumulators 512 (from v512). A warp tile that needs
+    # more, such as m_warp=1 or an a8w4 2x2 tile, keeps compiler allocation
+    # like every non-prefill tile instead of failing to build.
+    slot_vgprs = wmma_m_rep * (8 if a_is_fp4 else 16) + wmma_n_rep * (WMMA_N // 2)
+    fits_vgpr_partition = slot_vgprs <= 128 and n_acc * (WMMA_N // 2) <= 512
+    USE_EXPLICIT_VGPR_PARTITION = bool(
+        is_prefill and callable(sched_vgpr) and fits_vgpr_partition
+    )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}

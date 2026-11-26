@@ -540,6 +540,7 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "HEAD_DIM",
         "ENABLE_DROPOUT",
         "IS_VARLEN",
+        "IS_MHA",
         "USE_ALIBI",
         "USE_EXP2",
         "IS_FP8",
@@ -630,6 +631,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_MHA: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -756,7 +758,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     offs_d = tl.arange(0, HEAD_DIM)
     if HAS_PE:
         offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-    GROUP_SIZE: tl.constexpr = HQ // HK
+    # Fold the single-iteration head loops in varlen MHA to reduce register pressure.
+    GROUP_SIZE = 1 if IS_VARLEN and IS_MHA else HQ // HK
 
     # align the delta_qk
     start_n = pid * BLOCK_N1
