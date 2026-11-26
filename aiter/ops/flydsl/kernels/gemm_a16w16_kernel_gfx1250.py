@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.typing import T
+from flydsl.expr.typing import Constexpr, T
 from flydsl.runtime.device import check_smem_capacity
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -163,9 +163,13 @@ def compile_gemm_a16w16(
 
     _TDMS_PER_TILE = 2  # A + B
     n_edge = N % tile_n
+    # The split-cat arguments are compile-time zeros without split_cat, so the
+    # default kernel's ABI is unchanged.
+    SplitPtr, SplitInt = Constexpr[int], Constexpr[int]
     if split_cat is not None:
         k_size, v_size, rope_size = split_cat
         head_size = k_size + v_size
+        SplitPtr, SplitInt = fx.Pointer, fx.Int32
 
     @flyc.kernel
     def kernel_gemm_a16w16(
@@ -179,12 +183,12 @@ def compile_gemm_a16w16(
         i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldb: fx.Int32,
-        arg_v: fx.Pointer,
-        arg_rope: fx.Pointer,
-        i32_k_head_stride: fx.Int32,
-        i32_v_row_stride: fx.Int32,
-        i32_v_head_stride: fx.Int32,
-        i32_rope_row_stride: fx.Int32,
+        arg_v: SplitPtr,
+        arg_rope: SplitPtr,
+        i32_k_head_stride: SplitInt,
+        i32_v_row_stride: SplitInt,
+        i32_v_head_stride: SplitInt,
+        i32_rope_row_stride: SplitInt,
     ):
         rocdl.disable_xdl_arb_stall()
         elem_ty = _fx_elem.ir_type
@@ -805,7 +809,7 @@ def compile_gemm_a16w16(
             grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
         )
 
-    # Two signatures, so the default path takes no split-cat host arguments.
+    # Two signatures: the default path takes no split-cat arguments.
     if split_cat is None:
 
         @flyc.jit
@@ -822,8 +826,6 @@ def compile_gemm_a16w16(
             i32_ldb: fx.Int32,
             stream: fx.Stream,
         ):
-            # The kernel does not read the split-cat arguments: pass Y's.
-            unread = (arg_y, arg_y, i32_ldy, i32_ldy, i32_ldy, i32_ldy)
             _launch(
                 stream,
                 arg_y,
@@ -836,7 +838,7 @@ def compile_gemm_a16w16(
                 i32_ldy,
                 i32_lda,
                 i32_ldb,
-                *unread,
+                *(0,) * 6,  # the compile-time split-cat arguments
             )
 
     else:
