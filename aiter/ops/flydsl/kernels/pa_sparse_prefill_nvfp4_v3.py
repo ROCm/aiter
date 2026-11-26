@@ -357,12 +357,17 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                     fx.Int32,
                 )
         gpu.barrier()
+        # The first entry with this lane's key: scanned from the last entry to
+        # the first, one select a key (the last match is the lowest index).
+        # Testing "no match yet" in a forward scan puts a compare -> SGPR ->
+        # scalar AND -> select chain in every one of the 128 steps.
         first = fx.Int32(entries)
-        for c in range_constexpr(entries // 4):
+        for i in range_constexpr(entries // 4):
+            c = entries // 4 - 1 - i
             keys4 = lds_load(lay["keys"] + c * 16, fx.Int32, 4)
-            for e in range_constexpr(4):
-                hit = (keys4[e] == e_key) & (first == fx.Int32(entries))
-                first = hit.select(fx.Int32(c * 4 + e), first)
+            for j in range_constexpr(4):
+                e = 3 - j
+                first = (keys4[e] == e_key).select(fx.Int32(c * 4 + e), first)
         is_rep = e_valid & (first == tid)
         rep_mask = fx.Int32(fx.rocdl.ballot(T.i32, is_rep))
         rank = fx.Int32(
