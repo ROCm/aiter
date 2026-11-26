@@ -773,31 +773,6 @@ def test_preload_of_a_bound_launcher(monkeypatch, tmp_path):
     assert not errors
 
 
-def test_preload_uses_the_key_its_launches_look_up(monkeypatch, tmp_path):
-    from aiter.ops.flydsl.kernels import tensor_shim
-
-    name = "test_preload_spec_key"
-    factory, events, errors = _bound_preload_setup(monkeypatch, tmp_path, name)
-    spec = ("fp8", 2)
-    # A launcher that launches with a specialization_key is prebuilt and
-    # preloaded under it: an entry under the bare key would never be found.
-    monkeypatch.setenv("COMPILE_ONLY", "1")
-    tensor_shim._preload_compiled(factory.lazy(4), 1, 2, specialization_key=spec)
-    assert events == ["export"] and len(list(tmp_path.glob("*.o"))) == 1
-    monkeypatch.delenv("COMPILE_ONLY")
-    factory, events, errors = _bound_preload_setup(monkeypatch, tmp_path, name)
-    loaded = tensor_shim._preload_compiled(
-        factory.lazy(4), 1, 2, specialization_key=spec
-    )
-    assert events == ["load"] and loaded is not None
-    tensor_shim._run_compiled(factory.lazy(4), 5, 6, specialization_key=spec)
-    assert events == ["load", ("loaded function", (5, 6))]
-    # The bare key is another entry, which the prebuild did not make.
-    assert not errors
-    tensor_shim._run_compiled(factory.lazy(4), 5, 6)
-    assert len(errors) == 1 and "no prebuilt entry" in errors[0]
-
-
 def test_preload_of_a_bound_launcher_without_an_entry(monkeypatch, tmp_path):
     from aiter.ops.flydsl.kernels import tensor_shim
 

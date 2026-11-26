@@ -65,12 +65,6 @@ ENV_NOT_CODE = frozenset(
         "AITER_FLYDSL_STAGE2_FP8",
         "AITER_MXFP4_INTERMEDIATE",
         "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
-        # Read by the MegaMoE planner (mega_moe_config.py): it decides which
-        # route and tiles a call gets, which reach a kernel as factory
-        # arguments (fixed_slot_dispatch, the Stage1Config fields). Serving
-        # recipes set it, so as an input it would make every stage-1 entry
-        # miss; a route it enables must still be prebuilt with it set.
-        "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
         # A host-side argument audit of the GDN wrapper.
         "AITER_K5_OPT_CHECK",
         # FlyDSL's own cache.
@@ -278,6 +272,7 @@ AOT_CACHES = {
             "kernels/mega_moe/gemm_util.py",
             "kernels/mega_moe/mega_moe_config.py",
         ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_small_m_stage1": {
         "sources": (
@@ -298,6 +293,7 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_stage2.py",
             "kernels/mega_moe/weights.py",
         ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_large_m_stage1": {
         "sources": (
@@ -319,6 +315,7 @@ AOT_CACHES = {
             "kernels/mega_moe/quant.py",
             "kernels/mega_moe/weights.py",
         ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_stage2": {
         "sources": (
