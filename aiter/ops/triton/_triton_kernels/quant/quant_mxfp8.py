@@ -39,6 +39,7 @@ _convert_to_mxfp8_kernel_repr = make_kernel_repr(
         "DEQUANT_OUT",
         "ROUND_BF16",
         "PRESHUFFLE",
+        "MASKED",
     ],
 )
 _convert_from_mxfp8_kernel_repr = make_kernel_repr(
@@ -424,6 +425,9 @@ def _convert_to_mxfp8_kernel(
     stride_sn,
     philox_seed,
     philox_offset,
+    M,
+    N_IN,
+    N_OUT,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
@@ -434,7 +438,10 @@ def _convert_to_mxfp8_kernel(
     DEQUANT_OUT: tl.constexpr = False,
     ROUND_BF16: tl.constexpr = False,
     PRESHUFFLE: tl.constexpr = False,
+    MASKED: tl.constexpr = False,
 ):
+    # MASKED: x is [M, N_IN] and y [M, N_OUT] (N_OUT >= N_IN) with no tile
+    # alignment; elements past them read as 0, as zero padding would
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
@@ -463,7 +470,11 @@ def _convert_to_mxfp8_kernel(
         float8_dtype: tl.constexpr = y_ptr.type.element_ty
     tl.static_assert(float8_dtype == tl.float8e4nv or float8_dtype == tl.float8e5)
 
-    x = tl.load(x_ptr + offs_x)
+    if MASKED:
+        x_mask = (offs_m[:, None] < M) & (offs_xn[None, :] < N_IN)
+        x = tl.load(x_ptr + offs_x, mask=x_mask, other=0.0)
+    else:
+        x = tl.load(x_ptr + offs_x)
     if ROUND_BF16:
         # quantize the bf16 rounding of an fp32 input (as a bf16 copy would be)
         x = x.to(tl.bfloat16, fp_downcast_rounding="rtne")
@@ -518,8 +529,16 @@ def _convert_to_mxfp8_kernel(
         )
     else:
         offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
-    tl.store(s_ptr + offs_s, scales)
+    if MASKED:
+        y_mask = (offs_m[:, None] < M) & (offs_yn[None, :] < N_OUT)
+        s_mask = (offs_sm[:, None] < M) & (
+            offs_sn[None, :] < (N_OUT + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+        )
+        tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty), mask=y_mask)
+        tl.store(s_ptr + offs_s, scales, mask=s_mask)
+    else:
+        tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
+        tl.store(s_ptr + offs_s, scales)
 
 
 @triton.jit(repr=_convert_from_mxfp8_kernel_repr)

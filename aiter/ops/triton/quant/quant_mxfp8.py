@@ -37,6 +37,8 @@ def convert_to_mxfp8(
     dequant_dtype: torch.dtype | None = None,
     round_input_bf16: bool = False,
     preshuffle: bool = False,
+    allow_unaligned: bool = False,
+    out_cols: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MXFP8 format.
@@ -68,6 +70,12 @@ def convert_to_mxfp8(
         preshuffle: write the fp8 data in ``shuffle_weight(y, layout=(16, 16))``
             order (bit-identical to shuffling afterwards, without the extra
             pass); not with ``dequant_dtype`` or ``is_2d_block``.
+        allow_unaligned: take M and N that are not multiples of the tile (masked
+            loads and stores, portable path, 1-D blocks): the same bits as
+            zero-padding ``x`` to the tile, without the padded copy.
+        out_cols: with ``allow_unaligned``, the number of output columns (>= N);
+            the columns past N hold the cast of zeros, as for an ``x``
+            zero-padded to ``out_cols`` columns.
 
     Returns:
         Tuple of (quantized_tensor, scales) where quantized_tensor has fp8_dtype
@@ -109,6 +117,7 @@ def convert_to_mxfp8(
         and fp8_dtype == torch.float8_e4m3fn
         and not te_scale
     )
+    asm_auto = use_asm is None
     if use_asm is None:
         use_asm = asm_supported
     elif use_asm and not asm_supported:
@@ -121,22 +130,30 @@ def convert_to_mxfp8(
         raise ValueError("use_sr=True is not supported with use_asm=True")
     assert x.ndim == 2, "Input must be 2D"
     M, N = x.shape
-    # The kernel loads/stores full [block_m, block_n] tiles without masking and
+    n_out = N if out_cols is None else out_cols
+    masked = allow_unaligned and (M % block_m or n_out % block_n or n_out != N)
+    if out_cols is not None and (not allow_unaligned or out_cols < N):
+        raise ValueError("out_cols needs allow_unaligned and out_cols >= N")
+    if masked and use_asm and asm_auto:
+        use_asm = False
+    if masked and (use_asm or is_2d_block or use_sr):
+        raise ValueError("unaligned shapes take the portable 1-D path, without SR")
+    # Unmasked, the kernel loads/stores full [block_m, block_n] tiles and
     # reshapes each into QUANT_BLOCK_SIZE groups, so M and N must tile exactly.
-    assert M % block_m == 0 and N % block_n == 0, (
+    assert masked or (M % block_m == 0 and N % block_n == 0), (
         f"MXFP8 convert requires M,N aligned to tile ({block_m},{block_n}); "
         f"got ({M},{N})"
     )
 
-    y = torch.empty((M, N), dtype=dequant_dtype or fp8_dtype, device=x.device)
+    y = torch.empty((M, n_out), dtype=dequant_dtype or fp8_dtype, device=x.device)
     if is_2d_block:
         scale_m = triton.cdiv(M, quant_block_size)
     else:
         scale_m = M
-    scale_n = triton.cdiv(N, quant_block_size)
+    scale_n = triton.cdiv(n_out, quant_block_size)
     s = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x.device)
 
-    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    grid = (triton.cdiv(M, block_m), triton.cdiv(n_out, block_n))
     # num_warps scales with tile area so it remains valid when block_m/block_n
     # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
     # at default tile, nw≥8 regresses).
@@ -153,6 +170,9 @@ def convert_to_mxfp8(
         s.stride(1),
         0,
         0,
+        M,
+        N,
+        n_out,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         QUANT_BLOCK_SIZE=quant_block_size,
@@ -163,6 +183,7 @@ def convert_to_mxfp8(
         DEQUANT_OUT=dequant_dtype is not None,
         ROUND_BF16=round_input_bf16,
         PRESHUFFLE=preshuffle,
+        MASKED=bool(masked),
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,

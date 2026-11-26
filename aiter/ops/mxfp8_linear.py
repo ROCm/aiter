@@ -269,65 +269,53 @@ def _pad_to(x, dim, mult):
     return F.pad(x, widths)
 
 
-def _rows_triton(x2, dequant=None, round_bf16=False, preshuffle=False):
-    """TE-mode Triton cast of a 2-D tensor (any strides) along its last dim.
+def _rows_triton(x2, dequant=None, round_bf16=False, preshuffle=False, out_cols=None):
+    """TE-mode Triton cast of a 2-D tensor (any strides, any shape) along its
+    last dim, with masked loads instead of a padded copy.
 
-    Returns ``(y, scale)`` sliced from the kernel's 64x64-padded outputs:
-    ``y`` fp8, or the dequantized values in ``dequant``; ``scale`` uint8 with
-    one column per (zero-padded) block of 32. ``round_bf16`` quantizes the
-    bf16 rounding of an fp32 ``x2``. ``preshuffle`` returns the fp8 data as
-    ``shuffle_weight(q, layout=(16, 16))`` (rows a multiple of 16, the last dim
-    of 64).
+    Returns ``(y, scale)``: ``y`` fp8, or the dequantized values in
+    ``dequant``, with ``out_cols`` columns (default: those of ``x2``; columns
+    past them hold the cast of zeros); ``scale`` uint8 with one column per
+    (zero-padded) block of 32. ``round_bf16`` quantizes the bf16 rounding of an
+    fp32 ``x2``. ``preshuffle`` returns the fp8 data as
+    ``shuffle_weight(q, layout=(16, 16))`` (rows a multiple of 16, columns of 32).
     """
     from aiter.ops.triton.quant.quant_mxfp8 import convert_to_mxfp8
 
     rows, n = x2.shape
-    xp = _pad_to(_pad_to(x2, 0, 64), 1, 64)
-    y, s = convert_to_mxfp8(
-        xp,
+    if preshuffle and (rows % 16 or n % MXFP8_BLOCK):
+        raise ValueError(f"preshuffled rows need [16k, 32j], got {x2.shape}")
+    return convert_to_mxfp8(
+        x2,
         torch.float8_e4m3fn,
         scale_mode="te",
         dequant_dtype=dequant,
-        round_input_bf16=round_bf16 and xp.dtype == torch.float32,
+        round_input_bf16=round_bf16 and x2.dtype == torch.float32,
         preshuffle=preshuffle,
+        allow_unaligned=True,
+        out_cols=out_cols,
     )
-    s = s[:rows, : -(-n // MXFP8_BLOCK)]
-    if preshuffle:
-        if rows % 16 or n % 64:
-            raise ValueError(f"preshuffled rows need [16k, 64j], got {x2.shape}")
-        # whole 16-row tiles: the first rows of the padded output, in order
-        q = y.view(-1)[: rows * n].view(rows, n)
-        for attr in (
-            "is_shuffled",
-            "aiter_shuffle_layout",
-            "aiter_shuffle_is_guinterleave",
-        ):
-            setattr(q, attr, getattr(y, attr))
-        return q, s
-    return y[:rows, :n], s
 
 
-def _qdq_triton(x, dim, dtype, round_bf16=False):
+def _qdq_triton(x, dim, dtype, round_bf16=False, keep_pad=False):
     """One-pass Triton ``mxfp8_qdq`` of a 2-D tensor, in the memory layout the
     plain path produces (row-major along ``dim``, rows of the length padded to
-    32), so a GEMM on it sees the same operand."""
+    32), so a GEMM on it sees the same operand. ``keep_pad`` returns the
+    zero-padded length too, as the plain path does on a padded input."""
     xt = x.movedim(dim, -1)
     n = xt.shape[-1]
     n32 = -(-n // MXFP8_BLOCK) * MXFP8_BLOCK
-    y, _ = _rows_triton(
-        _pad_to(xt, 1, MXFP8_BLOCK), dequant=dtype, round_bf16=round_bf16
-    )
-    if y.stride(0) != n32:
-        y = y.contiguous()
-    return y[:, :n].movedim(-1, dim)
+    y, _ = _rows_triton(xt, dequant=dtype, round_bf16=round_bf16, out_cols=n32)
+    return (y if keep_pad else y[:, :n]).movedim(-1, dim)
 
 
-def mxfp8_qdq(x, dim=-1, dtype=torch.float32, round_bf16=False):
+def mxfp8_qdq(x, dim=-1, dtype=torch.float32, round_bf16=False, keep_pad=False):
     """``x`` quantized to MXFP8 along ``dim`` and dequantized (in ``dtype``).
 
     A ragged ``dim`` is zero-padded to a multiple of 32 for the quantization
     and cut back: the zeros leave the last block's amax unchanged.
     ``round_bf16`` quantizes ``x.bfloat16()`` (in-kernel on the fast path).
+    ``keep_pad`` returns ``dim`` zero-padded to 32 instead of cut back.
     """
     if (
         mxfp8_fastpath()
@@ -337,13 +325,15 @@ def mxfp8_qdq(x, dim=-1, dtype=torch.float32, round_bf16=False):
         and x.dtype in (torch.float32, torch.bfloat16)
     ):
         try:
-            out = _qdq_triton(x, dim, dtype, round_bf16)
+            out = _qdq_triton(x, dim, dtype, round_bf16, keep_pad)
             LAST_IMPLS["qdq:triton_te"] += 1
             return out
         except _TRITON_ERRORS as err:
             LAST_IMPLS[f"qdq:torch({type(err).__name__})"] += 1
     if round_bf16:
         x = x.to(torch.bfloat16)
+    if keep_pad:
+        x = _pad_to(x, dim, MXFP8_BLOCK)
     n = x.shape[dim]
     xp = _pad_to(x, dim, MXFP8_BLOCK)
     out = mxfp8_dequantize(*mxfp8_quantize(xp, dim), dim=dim, dtype=dtype)
@@ -374,7 +364,7 @@ def _quant_rows(x2, round_bf16=False):
         try:
             q, s = _rows_triton(x2, round_bf16=round_bf16)
             LAST_IMPLS["quant:triton_te"] += 1
-            return q.contiguous(), s.contiguous()
+            return q, s
         except _TRITON_ERRORS as err:
             LAST_IMPLS[f"quant:torch({type(err).__name__})"] += 1
     if round_bf16:
@@ -422,7 +412,7 @@ def _native_mm(a, b, anchors=None, round_bf16=False):
                 LAST_IMPLS["quant:triton_te_preshuffled"] += 1
                 if bq.dtype != dtypes.fp8:
                     bq = bq.view(dtypes.fp8)
-                return bq, b_s.contiguous().view(dtypes.fp8_e8m0)
+                return bq, b_s.view(dtypes.fp8_e8m0)
             except _TRITON_ERRORS as err:
                 LAST_IMPLS[f"quant:preshuffle_skipped({type(err).__name__})"] += 1
         bq, b_s = _quant_rows(bt, round_bf16)
@@ -506,6 +496,8 @@ def mxfp8_mm(a, b, out16=False, impl=None, anchors=None, round_to=None):
     od = da if out16 and da in (torch.bfloat16, torch.float16) else None
     if impl != "emulate" and not (a.is_cuda and bf16):
         impl = "emulate"
+    # the fast qdq reads the unpadded operands and writes the padded layout
+    a0, b0 = a, b
     a, b = _pad_to(a, 1, MXFP8_BLOCK), _pad_to(b, 0, MXFP8_BLOCK)
     if impl == "auto" and od is not None:
         try:
@@ -525,11 +517,15 @@ def mxfp8_mm(a, b, out16=False, impl=None, anchors=None, round_to=None):
     LAST_IMPLS[impl] += 1
     dt = mxfp8_qdq_dtype(da) if impl == "qdq" else torch.float32
     ta, xa, tb, xb, b_weight = anchors or (None,) * 5
-    aq = _cached(ta, (xa, "qdq", dt, in_kernel), lambda: mxfp8_qdq(a, 1, dt, in_kernel))
+    aq = _cached(
+        ta,
+        (xa, "qdq", dt, in_kernel),
+        lambda: mxfp8_qdq(a0, 1, dt, in_kernel, keep_pad=True),
+    )
     bq = _cached(
         tb,
         (xb, "qdq", dt, in_kernel),
-        lambda: mxfp8_qdq(b, 0, dt, in_kernel),
+        lambda: mxfp8_qdq(b0, 0, dt, in_kernel, keep_pad=True),
         weight=b_weight,
     )
     out = _mm_f32(aq, bq)

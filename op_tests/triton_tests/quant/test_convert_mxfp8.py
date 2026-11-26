@@ -281,3 +281,44 @@ def test_mxfp8_fast_launch_matches_dispatch():
                 ref = convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te", **kw)
             for f, r in zip(fast, ref):
                 assert torch.equal(f.view(torch.uint8), r.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "M, N, out_cols", [(100, 96, 96), (100, 100, 128), (37, 256, 256), (130, 70, 96)]
+)
+@pytest.mark.parametrize("mode", ["fp8", "dequant", "round", "preshuffle"])
+def test_mxfp8_unaligned_matches_zero_padding(M, N, out_cols, mode):
+    """allow_unaligned (masked loads/stores) gives the bits of the zero-padded cast."""
+    import torch.nn.functional as F
+
+    if mode == "preshuffle" and (M % 16 or N != out_cols or N % 32):
+        pytest.skip("preshuffle needs 16-row tiles and 32-column blocks")
+    torch.manual_seed(6)
+    x = torch.randn(M, N, device="cuda") * 5
+    kw = {
+        "fp8": {},
+        "dequant": {"dequant_dtype": torch.bfloat16},
+        "round": {"round_input_bf16": True},
+        "preshuffle": {"preshuffle": True},
+    }[mode]
+    if mode != "round":
+        x = x.bfloat16()
+    y, s = convert_to_mxfp8(
+        x,
+        torch.float8_e4m3fn,
+        scale_mode="te",
+        allow_unaligned=True,
+        out_cols=out_cols,
+        **kw,
+    )
+    xp = F.pad(x, (0, -(-out_cols // 64) * 64 - N, 0, (-M) % 64))
+    yp, sp = convert_to_mxfp8(xp, torch.float8_e4m3fn, scale_mode="te", **kw)
+    if mode == "preshuffle":
+        # whole 16-row tiles: the prefix of the padded output
+        assert torch.equal(
+            y.view(torch.uint8).flatten(), yp.view(torch.uint8).flatten()[: M * N]
+        )
+    else:
+        bits = torch.int16 if y.element_size() == 2 else torch.uint8
+        assert torch.equal(y.view(bits), yp[:M, :out_cols].contiguous().view(bits))
+    assert torch.equal(s, sp[:M, : -(-out_cols // 32)])
