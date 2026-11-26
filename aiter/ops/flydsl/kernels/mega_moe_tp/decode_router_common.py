@@ -116,20 +116,16 @@ def _as_f32(i):
 
 
 def _cvt_pk_fp4(old, a, b, scale_f32, sel):
-    """v_cvt_scalef32_pk_fp4_f32: two f32 / scale -> 2 e2m1 into byte ``sel``."""
+    """v_cvt_scalef32_pk_fp4_f32: two f32 / scale -> 2 e2m1 into byte ``sel`` (FlyDSL's rocdl wrapper, as
+    ``decode_tile_primitives._fp4``)."""
     return fx.Int32(
-        _llvm.call_intrinsic(
+        fx.rocdl.cvt_scalef32_pk_fp4_f32(
             _T.i32,
-            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
-            [
-                fx.as_ir_value(old),
-                fx.as_ir_value(a),
-                fx.as_ir_value(b),
-                fx.as_ir_value(scale_f32),
-                fx.as_ir_value(fx.Int32(sel)),
-            ],
-            [],
-            [],
+            fx.as_ir_value(old),
+            fx.as_ir_value(a),
+            fx.as_ir_value(b),
+            fx.as_ir_value(scale_f32),
+            sel,
         )
     )
 

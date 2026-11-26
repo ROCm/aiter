@@ -24,6 +24,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from .decode_router_common import (
     DPP_TREE,
+    MAX_BUFFER_BYTES,
     NEG_LOG2E,
     NW,
     PRELOAD_HINTS,
@@ -373,6 +374,13 @@ def splitk_biased_topk_mxfp4_mxfp8_quant(
         and topk_weights.stride(1) == 1
         and topk_ids.stride(1) == 1
         and topk_weights.stride(0) == topk_ids.stride(0) >= TOPK
+        # the kernels address the output rows and the partials through 32-bit buffer descriptors, and a span of
+        # 2**31 - 1 bytes is the masked-store sentinel: bound both
+        and m * topk_ids.stride(0) * 4 <= MAX_BUFFER_BYTES
+        and (
+            ((m - 1) * partials.stride(0) + (split_k - 1) * partials.stride(1) + E) * 4
+            <= MAX_BUFFER_BYTES
+        )
         and on_supported_device(x, partials, correction_bias, topk_weights, topk_ids)
     ):
         raise ValueError(
