@@ -1236,13 +1236,52 @@ LDT = BT + 4  # rows of 64 (token) columns
 LDC = 64 + 4  # fp32 [64, 64] accumulator staging
 
 
+def _src(tensor, base):
+    """A global tile for ``_stage``'s 128-bit loads: ``tensor`` from element ``base``."""
+    return tensor, base
+
+
+def _load_vec(atom, tile, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    fx.copy(atom, tile, frag)
+    return frag.load()
+
+
 def _stage(
     view, ld_stride, dst, ld_dst, rows, cols, nvalid, tid, num, dst_num, transpose=False
 ):
     """Stage a ``[rows, cols]`` token tile into LDS at row stride ``ld_dst``.
 
     ``transpose`` writes it as ``[cols, rows]``. Rows ``>= nvalid`` are zeroed.
+    With ``view = _src(tensor, base)`` each thread loads 16 contiguous bytes
+    per instruction (8 bf16 or 4 fp32); row starts must be 16-byte aligned.
     """
+    if isinstance(view, tuple):
+        tensor, base = view
+        vec = 8 if num is fx.BFloat16 else 4
+        cv = cols // vec
+        assert (rows * cv) % NUM_THREADS == 0
+        it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+        if base is not None:
+            it = fx.add_offset(it, base)
+        v3 = fx.Tensor(
+            fx.make_view(it, fx.make_layout((rows, cv, vec), (ld_stride, vec, 1)))
+        )
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
+        for e in range_constexpr(rows * cv // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // cv
+            c0 = (i % cv) * vec
+            ok = t < nvalid
+            vals = _load_vec(
+                atom, fx.slice(v3, (_sel(ok, t, 0), i % cv, None)), vec, num
+            )
+            for p in range_constexpr(vec):
+                x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
+                x = _sel(ok, x, _zero())
+                c = c0 + p
+                lds_st(dst, c * ld_dst + t if transpose else t * ld_dst + c, x, dst_num)
+        return
     for e in range_constexpr(rows * cols // NUM_THREADS):
         i = tid + e * NUM_THREADS
         t = i // cols
@@ -1432,20 +1471,16 @@ def compile_wy_dqkg_mfma(
             return out
 
         # -- stage h as [k][v] (the K5 snapshot is [v][k]), do, v_new, dv, dv^T, Akk
-        h_v = _flat(hs, state)
-        for e in range_constexpr(K * V // NUM_THREADS):
-            i = tid + e * NUM_THREADS
-            vv = i // K
-            kk = i % K
-            lds_st(s_hd, kk * LDK + vv, ldg(h_v, i, HN), BF)
-        do_v = _flat(do, hv)
-        dv_v = _flat(dv, hv)
-        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        # h is the K5 snapshot [v][k]: a transposed stage writes it as [k][v].
+        _stage(_src(hs, state), K, s_hd, LDK, V, K, V, tid, HN, BF, transpose=True)
+        do_v = _src(do, hv)
+        dv_v = _src(dv, hv)
+        vn_v = _src(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
         _stage(do_v, H * V, s_do, LDK, BT, V, nvalid, tid, VN, BF)
         _stage(vn_v, V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
         _stage(dv_v, H * V, s_dv, LDK, BT, V, nvalid, tid, VN, BF)
         _stage(dv_v, H * V, s_dvT, LDT, BT, V, nvalid, tid, VN, BF, transpose=True)
-        a_v = _flat(A, a_off)
+        a_v = _src(A, a_off)
         _stage(a_v, H * BT, s_a, LDT, BT, BT, nvalid, tid, AN, BF)
         _stage(a_v, H * BT, s_aT, LDT, BT, BT, nvalid, tid, AN, BF, transpose=True)
         beta_v = _flat(beta, tok * H + fx.Int64(h))
@@ -1464,15 +1499,21 @@ def compile_wy_dqkg_mfma(
         # dh replaces h in place: thread pair (k = tid // 2) walks half a row
         # each, so dgk[k] = sum_v h[k, v] dh[k, v] accumulates from the h still
         # in LDS without a serial chain of global loads.
-        dh_v = _flat(dh, state)
+        it_dh = fx.add_offset(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(dh, max_size=True)), state
+        )
+        dh3 = fx.Tensor(fx.make_view(it_dh, fx.make_layout((K, V // 8, 8), (V, 8, 1))))
+        cp_dh = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), HN)
         kr = tid // 2
         v_base = (tid % 2) * (V // 2)
         part = _zero()
-        for e in range_constexpr(V // 2):
-            vv = v_base + e
-            x = ldg(dh_v, kr * V + vv, HN)
-            part = part + lds_ld(s_hd, kr * LDK + vv, BF) * x
-            lds_st(s_hd, kr * LDK + vv, x, BF)
+        for e8 in range_constexpr(V // 16):
+            vals = _load_vec(cp_dh, fx.slice(dh3, (kr, v_base // 8 + e8, None)), 8, HN)
+            for p in range_constexpr(8):
+                vv = v_base + e8 * 8 + p
+                x = vals[p].to(fx.Float32)
+                part = part + lds_ld(s_hd, kr * LDK + vv, BF) * x
+                lds_st(s_hd, kr * LDK + vv, x, BF)
         part = part + part.shuffle_xor(fx.Int32(1), fx.Int32(64))
         if tid % 2 == 0:
             lds_st(s_dgk, kr, part)
@@ -1485,7 +1526,7 @@ def compile_wy_dqkg_mfma(
             b_dk += to_regs(run(s_vn, LDK, hb, LDK, V), half, 16)
 
         # v replaces v_new; dA = dv v^T (kept in registers), dvb = A^T dv
-        _stage(_flat(v, hv), H * V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(_src(v, hv), H * V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
         gpu.barrier()
         acc_da = run(s_dv, LDK, s_vn, LDK, V)
         dvb = []
@@ -1693,9 +1734,9 @@ def compile_dav_mfma(
         seg = tid % 4
         t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
         tok = fx.Int64(b * T + t0)
-        do_v = _flat(do, (tok * H + fx.Int64(h)) * V)
+        do_v = _src(do, (tok * H + fx.Int64(h)) * V)
         dv_v = _flat(dv, (tok * H + fx.Int64(h)) * V)
-        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        vn_v = _src(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
         a_v = _flat(A, (tok * H + fx.Int64(h)) * BT)
         da_v = _flat(dA, (tok * H + fx.Int64(h)) * BT)
 
@@ -1900,9 +1941,9 @@ def compile_dhu_mfma(
                 c = sc + 2 * e
                 stg(dh_v, kr * V + v0 + c, st[e], KN)
                 lds_st(s_dhT, c * LDK + kr, st[e], BF)
-            _stage(_flat(kg, hk), H * K, s_kg, LDK, BT, K, nvalid, tid, KN, BF)
+            _stage(_src(kg, hk), H * K, s_kg, LDK, BT, K, nvalid, tid, KN, BF)
             _stage(
-                _flat(qg, hk),
+                _src(qg, hk),
                 H * K,
                 s_qgT,
                 LDT,
@@ -1915,7 +1956,7 @@ def compile_dhu_mfma(
                 transpose=True,
             )
             _stage(
-                _flat(w, hk),
+                _src(w, hk),
                 H * K,
                 s_wT,
                 LDT,
@@ -1927,7 +1968,7 @@ def compile_dhu_mfma(
                 BF,
                 transpose=True,
             )
-            dov = _flat(do, hv + fx.Int64(v0))
+            dov = _src(do, hv + fx.Int64(v0))
             _stage(dov, H * V, s_doT, LDT, BT, BV, nvalid, tid, VN, BF, transpose=True)
             if tid < K:
                 gl = ldg(_flat(g, hk), (nvalid - 1) * (H * K) + tid, fx.Float32)
@@ -2140,13 +2181,14 @@ def compile_intra_mfma(
         s_ak = _lds(lds.ak, BT * BT)
         s_b = _lds(lds.beta, BT)
         s_s = _lds(lds.s, BT * LDK)
-        _load_tile(_flat(q, hk), H * K, s_q, BT, K, nvalid, tid, KN, fx.BFloat16)
-        _load_tile(_flat(k, hk), H * K, s_k, BT, K, nvalid, tid, KN, fx.BFloat16)
-        _load_tile(_flat(g, hk), H * K, s_g, BT, K, nvalid, tid, fx.Float32, fx.Float32)
-        _load_tile(
-            _flat(dAqk, hb * BT),
+        _stage(_src(q, hk), H * K, s_q, K, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(k, hk), H * K, s_k, K, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(g, hk), H * K, s_g, K, BT, K, nvalid, tid, fx.Float32, fx.Float32)
+        _stage(
+            _src(dAqk, hb * BT),
             H * BT,
             s_aq,
+            BT,
             BT,
             BT,
             nvalid,
@@ -2154,10 +2196,11 @@ def compile_intra_mfma(
             fx.Float32,
             fx.Float32,
         )
-        _load_tile(
-            _flat(dAkk, hb * BT),
+        _stage(
+            _src(dAkk, hb * BT),
             H * BT,
             s_ak,
+            BT,
             BT,
             BT,
             nvalid,
