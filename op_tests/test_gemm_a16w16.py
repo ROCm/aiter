@@ -384,6 +384,128 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
+SKINNY_GFX = ("gfx90a", "gfx942", "gfx950")
+
+
+def test_skinny_gemm_strided_input(n=32, k=2880, pad=192):
+    """Strided `inp` or `weights` views through the skinny path must match dense copies.
+
+    The skinny kernels take no row stride: they read row m of `inp` and row n of
+    `weights` at m * K and n * K, so `skinny_gemm` makes both contiguous first.
+    The router cases are the gpt-oss MoE router shape: a [M, 2880] slice of a
+    [M, 3072] buffer, which the dispatcher sends to skinny solution 2. Without the copy, rows 1 and up are
+    computed from the wrong memory and no error is raised. The direct cases call
+    `skinny_gemm` for solutions 0 (wvSpltK), 1 (LLMM1) and 2, with strided
+    weights, and with `out=`, so a refactor that narrows the copy is caught. The
+    router cases record the route `tgemm.mm` resolves; only a skinny route is
+    held to bit-equality with the dense call (all cases are checked vs torch).
+    """
+    gfx = get_gfx()
+    if gfx not in SKINNY_GFX:
+        print(f"skip skinny_strided: skinny kernels are not used on {gfx}")
+        return []
+    rows = []
+
+    def record(case, out, dense, ref, route="skinny (direct)", exact=True):
+        err = (out.float() - ref).abs().amax(dim=1).max().item()
+        rows.append(
+            {
+                "case": case,
+                "route": route,
+                "exact": exact,
+                "max |out - dense|": (out.float() - dense.float()).abs().max().item(),
+                "max row err vs torch": err,
+            }
+        )
+
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        w = (torch.randn(n, k, device="cuda") * 0.02).to(dtype)
+        b = (torch.randn(n, device="cuda") * 0.1).to(dtype)
+
+        # Router path: with no tuned row, tgemm.mm picks skinny solution 2 for
+        # these shapes. A tuned CSV row, AITER_CONFIG_GEMM_BF16 or a small CU
+        # count can route them elsewhere; the route is recorded, and only a
+        # skinny route is held to bit-equality with the contiguous call.
+        for m in range(2, 9):
+            # Same query as tgemm.mm: it resolves otype=None to inp's dtype.
+            cfg = get_GEMM_A16W16_config(
+                M=m, N=n, K=k, bias=True, dtype=str(dtype), otype=str(dtype)
+            )
+            route = (cfg["libtype"], cfg["solidx"])
+            x = torch.randn(m, k + pad, device="cuda").to(dtype)[:, :k]
+            assert not x.is_contiguous()
+            ref = F.linear(x.float(), w.float(), b.float())
+            record(
+                f"tgemm.mm strided {dtype} M={m} N={n} K={k}",
+                tgemm.mm(x, w, b),
+                tgemm.mm(x.contiguous(), w, b),
+                ref,
+                route=f"{route[0]}:{route[1]}",
+                exact=cfg["libtype"] == "skinny",
+            )
+
+        # Direct calls: every skinny solution, within each kernel's row limit
+        # (wvSpltK: 1..4 rows, LLMM1: 1 row, wv_splitk_small: 1..16 rows).
+        # A single padded row is still contiguous, so LLMM1 gets a column stride.
+        # LLMM1 runs at K=4096: it launches K/8 threads, and its cross-warp
+        # reduction is only exact for a power-of-two warp count (K=2880 gives 6
+        # warps and wrong sums even on a contiguous input; K=4096 gives 8).
+        k1 = 4096
+        w1 = (torch.randn(n, k1, device="cuda") * 0.02).to(dtype)
+        b1 = (torch.randn(n, device="cuda") * 0.1).to(dtype)
+        direct = [(0, m, "rows", k, w, b) for m in (2, 3, 4)]
+        direct += [(1, 1, "cols", k1, w1, b1)]
+        direct += [(2, m, "rows", k, w, b) for m in (2, 5, 8)]
+        for solidx, m, kind, kk, ww, bb in direct:
+            if kind == "rows":
+                x = torch.randn(m, kk + pad, device="cuda").to(dtype)[:, :kk]
+            else:
+                x = torch.randn(m, 2 * kk, device="cuda").to(dtype)[:, ::2]
+            assert not x.is_contiguous()
+            dense = skinny_gemm(x.contiguous(), ww, solidx, bb)
+            record(
+                f"skinny_gemm solidx={solidx} strided {kind} {dtype} M={m} K={kk}",
+                skinny_gemm(x, ww, solidx, bb),
+                dense,
+                F.linear(x.float(), ww.float(), bb.float()),
+            )
+
+        # Strided weights: the kernels also read row m of weights at m * K, so
+        # a [N, K] slice of a wider buffer must be made dense as well.
+        ws = (torch.randn(n, k + pad, device="cuda") * 0.02).to(dtype)[:, :k]
+        assert not ws.is_contiguous()
+        for solidx, m in [(0, 2), (0, 4), (2, 2), (2, 6), (2, 8)]:
+            x = torch.randn(m, k, device="cuda").to(dtype)
+            record(
+                f"skinny_gemm solidx={solidx} strided weights {dtype} M={m} K={k}",
+                skinny_gemm(x, ws, solidx, b),
+                skinny_gemm(x, ws.contiguous(), solidx, b),
+                F.linear(x.float(), ws.float(), b.float()),
+            )
+
+        # out= of the input dtype is the kernels' own output buffer.
+        m = 6
+        x = torch.randn(m, k + pad, device="cuda").to(dtype)[:, :k]
+        out = torch.full((m, n), float("nan"), dtype=dtype, device="cuda")
+        ret = skinny_gemm(x, w, 2, b, out=out)
+        assert ret.data_ptr() == out.data_ptr()
+        record(
+            f"skinny_gemm solidx=2 strided out= {dtype} M={m}",
+            out,
+            skinny_gemm(x.contiguous(), w, 2, b),
+            F.linear(x.float(), w.float(), b.float()),
+        )
+
+    bad = [
+        r
+        for r in rows
+        if (r["exact"] and r["max |out - dense|"] != 0)
+        or r["max row err vs torch"] > 0.05
+    ]
+    assert not bad, f"strided inp/weights through skinny_gemm is wrong: {bad}"
+    return rows
+
+
 def test_skinny_gemm():
     df = []
     # seed = 8779
@@ -434,6 +556,8 @@ def test_skinny_gemm():
                 for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
                     ret = test_gemm(dtype, m, n, k, otype=otype)
                     df.append(ret)
+    # After the sweep, so a strided failure does not hide sweep results.
+    df.extend(test_skinny_gemm_strided_input())
     return df
 
 
@@ -696,11 +820,13 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "skinny_strided", "out", "compile"],
+    default=["normal", "skinny_strided"],
     help="""Select test to run.
-    e.g.: -t normal    # default
-          or -t skinny
+    e.g.: -t normal skinny_strided    # default (what CI runs)
+          or -t normal
+          or -t skinny    # also runs skinny_strided
+          or -t skinny_strided    # strided inp/weights through skinny_gemm and tgemm.mm (skipped off gfx90a/gfx942/gfx950)
           or -t out    # tgemm.mm(out=) on every backend
           or -t compile    # torch.compile with weights/biases in one storage""",
 )
@@ -788,6 +914,9 @@ for test in args.test:
     elif test == "skinny":
         ret = test_skinny_gemm()
         df += ret
+    elif test == "skinny_strided":
+        if "skinny" not in args.test:  # test_skinny_gemm already runs it
+            df += test_skinny_gemm_strided_input()
     elif test == "out":
         df += test_gemm_out()
     elif test == "compile":
