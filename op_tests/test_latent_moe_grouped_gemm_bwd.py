@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from itertools import pairwise
+
 import pytest
 import torch
 
@@ -21,7 +23,7 @@ def _reference(x, weight, dy, offsets):
     dx = torch.empty_like(x, dtype=torch.float32)
     dw = torch.zeros_like(weight, dtype=torch.float32)
     bounds = offsets.tolist()
-    for e, (start, end) in enumerate(zip(bounds, bounds[1:])):
+    for e, (start, end) in enumerate(pairwise(bounds)):
         if start != end:
             grad = dy[start:end].float()
             dx[start:end] = grad @ weight[e].float()

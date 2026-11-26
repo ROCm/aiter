@@ -2,11 +2,11 @@
 """Build the gfx950 latent MoE backward images from the pinned OPUS grouped kernels."""
 import argparse
 import hashlib
-from pathlib import Path
 import shutil
 import struct
 import subprocess
 import tempfile
+from pathlib import Path
 
 import yaml
 
