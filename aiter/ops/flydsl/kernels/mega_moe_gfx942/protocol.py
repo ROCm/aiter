@@ -15,7 +15,9 @@ def qx_of(x_quant):
 
 
 # ---- main path: workspace / sched of comm.py and main.py (layout: comm.py) ----------
-NPES = 8
+# The EP sizes (ranks, NPES) the kernels take: powers of two of at most 8 (a rank is a
+# lane mask into a peer table, and a route's source id keeps 3 bits for its rank).
+EP_SIZES = (4, 8)
 QUEUES = 8
 QSTRIDE = 16  # i32 between two ticket counters (separate cache lines)
 SCHED_EXPECTED = QUEUES * QSTRIDE
@@ -28,10 +30,11 @@ BUFFER_BYTES_MAX = 1 << 31
 STATUS_EPOCH = 2
 
 
-def ws_layout(E_LOCAL):
-    """(E_GLOBAL, CFLAG, FFLAG, ARRIVED) with ``E_LOCAL`` experts per rank: the experts
-    of all ranks and the i32 offsets of the main path's workspace regions after the
-    count matrix [NPES][E_GLOBAL] (see comm.py)."""
+def ws_layout(E_LOCAL, NPES):
+    """(E_GLOBAL, CFLAG, FFLAG, ARRIVED) with ``E_LOCAL`` experts on each of ``NPES``
+    ranks: the experts of all ranks and the i32 offsets of the main path's workspace
+    regions after the count matrix [NPES][E_GLOBAL] (see comm.py)."""
+    assert NPES in EP_SIZES, NPES
     E_GLOBAL = NPES * E_LOCAL
     CFLAG = NPES * E_GLOBAL
     return E_GLOBAL, CFLAG, CFLAG + NPES, CFLAG + 2 * NPES
@@ -48,13 +51,15 @@ def row_bits(E_GLOBAL):
 SMALL_LINE = 64  # bytes per cross-rank flag / counter (one cache line each)
 
 
-def small_sym_layout(H, TOPK, TMAX, E_LOCAL):
-    """(byte offset of each region, total bytes) of a rank's symmetric buffer: fixed slots
+def small_sym_layout(H, TOPK, TMAX, E_LOCAL, NPES):
+    """(byte offset of each region, total bytes) of a rank's symmetric buffer (``NPES``
+    ranks): fixed slots
     of TMAX rows per local expert (``rx`` fp8 rows, ``rs`` f32 scale per (row, 128 cols),
     ``rw`` route weight, ``rid`` source id), ``run`` (rows the sources took per expert,
     their atomics), ``done`` (source rank s's producers' count of finished calls, in
     DONE_UNIT steps), ``cin`` (bf16 rows the experts send back, per (token, topk slot) of
     this rank), ``cflag`` (rank s sent all its rows back: the epoch)."""
+    assert NPES in EP_SIZES, NPES
     rows = E_LOCAL * TMAX
     sizes = (
         ("rx", rows * H),

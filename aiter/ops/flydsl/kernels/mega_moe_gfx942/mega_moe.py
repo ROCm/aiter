@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MegaMoEGfx942: the EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X / MI325X, MI308X),
-shaped like MegaMoEV2, with its three paths:
+"""MegaMoEGfx942: the EP4 / EP8 a8w4 / a8w8 MegaMoE layer for gfx942 (MI300X / MI325X,
+MI308X), shaped like MegaMoEV2, with its three paths:
 
 - main (``forward`` / ``forward_prequant`` while large_M is off; ``main.py``, ``comm.py``):
   five kernels per call. ``comm.py`` quantizes x, exchanges the route counts and plans
@@ -28,22 +28,26 @@ one. ``x_quant="per_token"`` runs every call on the main path.
 
 Layers (``eligible``): DeepSeek-V4-Flash's (H 4096, I 2048, 256 experts, top-6),
 MiMo-V2.6-Flash's (the same with top-8) and DeepSeek-V4.1-Flash's (H 5120, I 2304, 384
-experts, top-6), on every path.
+experts, top-6), on every path, over 8 or 4 EP ranks (EP4: twice the local experts, 96
+on DeepSeek-V4.1-Flash; a8w8 only where a rank's fp8 w1 stays below 2 GiB, which
+DeepSeek-V4.1-Flash's EP4 does not).
 
 Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
-receives at most every route of every rank (8 x max_tok_per_rank x topk rows plus one
-partial block per expert), so no route is dropped. The main path's buffers at
-max_tok_per_rank 2048 / 4096 / 8192 / 16384: 0.42 / 0.82 / 1.63 / 3.24 GiB of the MORI
-symmetric heap (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 / 1.62 GiB of device
-memory (top-6; top-8 takes about 4/3 of it); the largest is 16384 (the plan kernels'
-slices). From 2 GiB of receive rows on (past 8192 at top-6, 4096 at top-8) the kernels
-address them and a2 from a 64-bit base per block, as their i32 offsets cannot (the
-kernels' wide variants, built only for such capacities).
+receives at most every route of every rank (world_size x max_tok_per_rank x topk rows
+plus one partial block per expert), so no route is dropped. The main path's buffers at
+max_tok_per_rank 2048 / 4096 / 8192 / 16384 (EP8; EP4 about half): 0.42 / 0.82 / 1.63 /
+3.24 GiB of the MORI symmetric heap (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 /
+1.62 GiB of device memory (top-6; top-8 takes about 4/3 of it); the largest is 16384
+(the plan kernels' slices). From 2 GiB of receive rows on (EP8: past 8192 at top-6 and
+4096 at top-8; EP4: past 8192 at top-8) the kernels address them and a2 from a 64-bit
+base per block, as their i32 offsets cannot (the kernels' wide variants, built only for
+such capacities).
 large_M takes about the same, small_M at 128 tokens per rank 0.18 GiB of the heap; its
-fixed slots (8 x small-input tokens per rank, per local expert) stay below 2 GiB up to
-2040 tokens per rank (1088 on DeepSeek-V4.1-Flash's layer). A capacity past these is
-refused before any symmetric allocation.
+fixed slots (world_size x small-input tokens per rank, per local expert: the same rows
+for EP4 and EP8) stay below 2 GiB up to 2040 tokens per rank (1088 on
+DeepSeek-V4.1-Flash's layer). A capacity past these is refused before any symmetric
+allocation.
 
 Weights: the standard aiter a16w4 preshuffle (``shuffle_weight_a16w4(w, 16, False)``,
 ``shuffle_scale_a16w4``), converted once per layer by ``prepare_weights`` into the fd2
@@ -75,8 +79,8 @@ from contextlib import nullcontext
 import torch
 
 from . import weights as _weights
+from .protocol import BUFFER_BYTES_MAX, EP_SIZES
 
-_EP = 8
 # The gfx942 GPUs this build runs, CUs -> XCDs: MI300X / MI325X (8 XCDs of 38 CUs) and
 # MI308X (4 XCDs of 20 CUs). The kernels size their persistent grids by the CUs and map
 # their 8 per-XCD task queues onto the XCDs (atomic._home_queue).
@@ -93,17 +97,21 @@ def eligible(
     *, world_size, model_dim, inter_dim, experts, topk, quant="a8w4", act="silu"
 ):
     """Whether this build runs the layer: gfx942 with 304 CUs (MI300X / MI325X) or 80
-    (MI308X), EP8 and the MoE layer of DeepSeek-V4-Flash (H 4096, I 2048, 256 experts,
-    top-6), MiMo-V2.6-Flash (the same with top-8) or DeepSeek-V4.1-Flash (H 5120, I 2304,
-    384 experts, top-6), a8w4 or a8w8."""
+    (MI308X), EP4 or EP8 and the MoE layer of DeepSeek-V4-Flash (H 4096, I 2048, 256
+    experts, top-6), MiMo-V2.6-Flash (the same with top-8) or DeepSeek-V4.1-Flash (H 5120,
+    I 2304, 384 experts, top-6), a8w4 or a8w8 (a8w8: a rank's fp8 w1 below 2 GiB, the
+    GEMM cores address W with i32 offsets)."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
+    if world_size not in EP_SIZES or experts % world_size:
+        return False
+    w1_bytes = experts // world_size * 2 * inter_dim * model_dim
     return (
         get_gfx_runtime() == "gfx942"
         and get_cu_num() in _XCDS
-        and world_size == _EP
         and topk in _LAYERS.get((model_dim, inter_dim, experts), ())
         and quant in _WQ
+        and (quant == "a8w4" or w1_bytes < BUFFER_BYTES_MAX)
         and act == "silu"
     )
 
@@ -113,7 +121,7 @@ def _on(stream):
 
 
 class MegaMoEGfx942:
-    """One rank's EP8 a8w4 / a8w8 MoE layer. Construction is collective: every rank
+    """One rank's EP4 / EP8 a8w4 / a8w8 MoE layer. Construction is collective: every rank
     builds the same instances in the same order after MORI shmem is initialized.
 
     ``small_m_enabled`` builds small_M, which takes up to max(``small_m_mtprs``)
@@ -152,9 +160,10 @@ class MegaMoEGfx942:
             act=act,
         ):
             raise ValueError(
-                "MegaMoEGfx942 runs gfx942 (304 or 80 CUs), EP8, a8w4 or a8w8 silu, H "
-                "4096, I 2048, 256 experts, top-6 or top-8, or H 5120, I 2304, 384 "
-                f"experts, top-6; got world_size={world_size} "
+                "MegaMoEGfx942 runs gfx942 (304 or 80 CUs), EP4 or EP8, a8w4 or a8w8 "
+                "silu, H 4096, I 2048, 256 experts, top-6 or top-8, or H 5120, I 2304, "
+                "384 experts, top-6 (a8w8: a rank's fp8 w1 below 2 GiB); got "
+                f"world_size={world_size} "
                 f"model_dim={model_dim} inter_dim={inter_dim} experts={experts} "
                 f"topk={topk} quant={quant} act={act}"
             )

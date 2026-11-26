@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 EP8 MoE mega kernel: dispatch, GateUp and Down (with the combine) in one launch.
+"""gfx942 EP4 / EP8 MoE mega kernel: dispatch, GateUp and Down (with the combine) in one launch.
 
 ep_prep and ep_plan (comm.py) run first and build the plan.
 Workgroups take task tickets from per-XCD queues (persistent: one workgroup per CU taking tickets until the queues
@@ -33,7 +33,7 @@ from ..atomic import _atomic_add_at, _atomic_load_at, _home_queue, _latomic_add
 from ..host import launcher
 from ..hw import _readlane
 from ..hw import _u as _uniform
-from .comm import NPES, SCHED_EXPECTED, layout, row_bits
+from .comm import SCHED_EXPECTED, layout, row_bits
 from .down import down_task_emitter
 from .gateup import (
     OOB_OFFSET,
@@ -69,12 +69,13 @@ def compile_ep_mega(
     wq="fp8",
     *,
     xcds,
+    npes,
     wide=False,
 ):
     """The mega kernel's launcher. lag counts units (block pairs) of one queue; e_local: experts per rank; xcds: XCDs of
-    the GPU, 8 (MI300X) or 4 (MI308X); wide: receive rows or a2 past 2 GiB (LargeMRuntime.wide), addressed from a 64-bit
-    base per block (GateUp and Down A, a2 stores) and per route row (the producers' x stores), with send_info's wide
-    row field (comm.row_bits).
+    the GPU, 8 (MI300X) or 4 (MI308X); npes: EP ranks, 4 or 8; wide: receive rows or a2 past 2 GiB
+    (LargeMRuntime.wide), addressed from a 64-bit base per block (GateUp and Down A, a2 stores) and per route row (the
+    producers' x stores), with send_info's wide row field (comm.row_bits).
 
     One task queue per XCD (producers split evenly; two queues per XCD on 4 XCDs), so the tiles of a block share that
     XCD's L2; a workgroup whose queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks,
@@ -93,8 +94,8 @@ def compile_ep_mega(
     H, I = hidden_dim, inter_dim
     # A closure value: FlyDSL's cache key holds closure scalars but not the module globals that nested functions read,
     # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
-    info_row_bits = row_bits(NPES * e_local, wide)
-    ARRIVED = layout(e_local)["ARRIVED"]
+    info_row_bits = row_bits(npes * e_local, wide)
+    ARRIVED = layout(e_local, npes)["ARRIVED"]
     KB = H // 128
     gateup = gateup_task_emitter(I, H, topk, e_local, float(swiglu_limit), wq, wide)
     down = down_task_emitter(H, I, topk, e_local, token_shift, wq, wide)
@@ -259,11 +260,11 @@ def compile_ep_mega(
             info_rsrc = _rsrc_of(pSendInfo, num_routes * 4)
             oob = fx.Int32(OOB_OFFSET)
             scale_lane = lane < scale_lanes
-            # Lane r < NPES holds the (lo, hi) halves of rank r's buffer bases.
-            peer_lane = (lane & (NPES - 1)) * 8
+            # Lane r < npes holds the (lo, hi) halves of rank r's buffer bases.
+            peer_lane = (lane & (npes - 1)) * 8
             bases = []
             for table in (pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs):
-                table_rsrc = _rsrc_of(table, NPES * 8)
+                table_rsrc = _rsrc_of(table, npes * 8)
                 bases.append(
                     (
                         _load_i32(table_rsrc, peer_lane),
@@ -401,7 +402,7 @@ def compile_ep_mega(
                     )
                 rocdl.s_waitcnt(vmcnt=0)
                 expert = infos >> info_row_bits
-                source = expert_rank(expert) & (NPES - 1)
+                source = expert_rank(expert) & (npes - 1)
                 ws_lo, ws_hi = [
                     fx.Uint32(fx.gpu.shuffle_idx(half, source, 64)) for half in bases[4]
                 ]
@@ -541,7 +542,7 @@ def compile_ep_mega(
                 pW2Scale,
                 pDownIds,
                 pRecvW,
-                NPES << token_shift,
+                npes << token_shift,
                 num_blocks,
                 True,
                 lambda: (block, tile, expert),
@@ -831,6 +832,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         swiglu_limit=op.swiglu_limit,
         wq=op.wq,
         xcds=op.xcds,
+        npes=op.world,
         wide=op.wide,
     )
     # Persistent: about one workgroup per CU.

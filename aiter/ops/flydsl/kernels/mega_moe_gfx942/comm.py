@@ -41,7 +41,6 @@ from .mem import (
 )
 from .protocol import (
     BLOCK_M,
-    NPES,
     SCHED_EXPECTED,
     STATUS_EPOCH,
     row_bits,
@@ -55,10 +54,10 @@ from .protocol import (
 PLAN_TOTAL = 0
 
 
-def plan_layout(E_LOCAL):
+def plan_layout(E_LOCAL, NPES):
     """(PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, PLAN_INTS) with ``E_LOCAL``
-    experts per rank: the i32 offsets of the plan tables after the totals and their
-    size."""
+    experts on each of ``NPES`` ranks: the i32 offsets of the plan tables after the
+    totals and their size."""
     E_GLOBAL = NPES * E_LOCAL
     PLAN_MIN = E_GLOBAL
     PLAN_BASE = 2 * E_GLOBAL
@@ -248,17 +247,17 @@ def mega_quant_kernel(*, H, QX=1):
 # =============================================================================
 
 
-def mega_prep_kernel(*, E_LOCAL):
+def mega_prep_kernel(*, E_LOCAL, NPES):
     """route_idx [T*TOPK]: rank of each route among this rank's routes to its global
     expert (a negative id is no route: padding, not counted, route_idx not written).
     Writes this rank's count row to every rank, waits for all rows, and fills
     ``plan``, num_valid [1] (rows this rank receives, capped at s_cap) and status[1] (rows
     needed). Zeroes this rank's arrived counters (before its count flag: no source adds to
     them before it has seen the flag) and the mega kernel's ticket and done counters.
-    ``E_LOCAL``: experts per rank."""
+    ``E_LOCAL``: experts per rank; ``NPES``: ranks."""
     NT = 1024
-    E_GLOBAL, CFLAG, _, ARRIVED = ws_layout(E_LOCAL)
-    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL)
+    E_GLOBAL, CFLAG, _, ARRIVED = ws_layout(E_LOCAL, NPES)
+    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL, NPES)
     # a destination's experts in one wave: a shuffle scan of each power-of-two segment
     WAVE_SCAN = E_LOCAL & (E_LOCAL - 1) == 0 and E_LOCAL <= 64
     L_HIST = 0
@@ -267,13 +266,19 @@ def mega_prep_kernel(*, E_LOCAL):
     L_TOT = L_BASE + E_GLOBAL + NPES
     L_MIN = L_TOT + E_GLOBAL
     LDS_INTS = L_MIN + E_GLOBAL
-    assert NPES * E_GLOBAL % NT == 0 and E_GLOBAL <= NT and SCHED_EXPECTED <= NT
+    # the count matrix in passes of NT entries (the last one partial unless NT divides it)
+    COUNTS = NPES * E_GLOBAL
+    COUNT_PASSES = -(-COUNTS // NT)
+    assert E_GLOBAL <= NT and SCHED_EXPECTED <= NT and NPES * 9 <= NT
 
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, LDS_INTS * 4, 16]
 
-    @flyc.kernel(name=f"a8w4_megamoe_prep_e{E_LOCAL}", known_block_size=[NT, 1, 1])
+    @flyc.kernel(
+        name=f"a8w4_megamoe_prep_e{E_LOCAL}" + ("" if NPES == 8 else f"_n{NPES}"),
+        known_block_size=[NT, 1, 1],
+    )
     def kernel(
         topk_ids: fx.Int64,
         route_idx: fx.Int64,
@@ -326,15 +331,16 @@ def mega_prep_kernel(*, E_LOCAL):
                         ridx_p, r, _latomic_add(lds_i32, fx.Int32(L_HIST) + gs[j], 1)
                     )
         gpu.barrier()
-        for k in range_constexpr(NPES * E_GLOBAL // NT):
+        for k in range_constexpr(COUNT_PASSES):
             i = tid + fx.Int32(k * NT)
-            peer = i // fx.Int32(E_GLOBAL)
-            e = i % fx.Int32(E_GLOBAL)
-            _sys_store_at(
-                fx.Int64(tab[peer])
-                + fx.Int64((me * fx.Int32(E_GLOBAL) + e) * fx.Int32(4)),
-                lds[fx.Int32(L_HIST) + e],
-            )
+            if i < fx.Int32(COUNTS):
+                peer = i // fx.Int32(E_GLOBAL)
+                e = i % fx.Int32(E_GLOBAL)
+                _sys_store_at(
+                    fx.Int64(tab[peer])
+                    + fx.Int64((me * fx.Int32(E_GLOBAL) + e) * fx.Int32(4)),
+                    lds[fx.Int32(L_HIST) + e],
+                )
         # this thread's count row stores and arrived zeroing landed
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
@@ -347,11 +353,12 @@ def mega_prep_kernel(*, E_LOCAL):
                 fx.Int64(ws) + fx.Int64((fx.Int32(CFLAG) + tid) * fx.Int32(4)), epoch
             )
         gpu.barrier()
-        for k in range_constexpr(NPES * E_GLOBAL // NT):
+        for k in range_constexpr(COUNT_PASSES):
             i = tid + fx.Int32(k * NT)
-            c = _sys_load_at(fx.Int64(ws) + fx.Int64(i * fx.Int32(4)))
-            _store(lds, fx.Int32(L_CNT) + i, c)
-            _store(plan_p, fx.Int32(PLAN_COUNTS) + i, c)
+            if i < fx.Int32(COUNTS):
+                c = _sys_load_at(fx.Int64(ws) + fx.Int64(i * fx.Int32(4)))
+                _store(lds, fx.Int32(L_CNT) + i, c)
+                _store(plan_p, fx.Int32(PLAN_COUNTS) + i, c)
         gpu.barrier()
         # per global expert: routes from all sources and the fewest from one source
         if tid < fx.Int32(E_GLOBAL):
@@ -460,7 +467,7 @@ def mega_prep_kernel(*, E_LOCAL):
 # =============================================================================
 
 
-def mega_plan_kernel(*, E_LOCAL):
+def mega_plan_kernel(*, E_LOCAL, NPES):
     """send_route / send_info [T*TOPK]: workgroup j sorts routes [j S, (j + 1) S) (S =
     ceil(routes / grid)) by when the destination's mega-kernel queues need them (block
     position in the queue) into the same range; the producer wave j sends that range in
@@ -469,10 +476,10 @@ def mega_plan_kernel(*, E_LOCAL):
     expert_ids [s_cap / BLOCK_M] / sched expected rows per block: this rank's sorted
     blocks; down_ids (symmetric, local view): padding rows set to -1 (producers fill the
     valid ones). The rows of an expert interleave the sources: source s's i-th route sits
-    at virtual position 8 i + s (compacted where sources run out). ``E_LOCAL``: experts
-    per rank."""
+    at virtual position NPES i + s (compacted where sources run out). ``E_LOCAL``:
+    experts per rank; ``NPES``: ranks."""
     NT = PLAN_THREADS
-    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL)
+    PLAN_MIN, PLAN_BASE, PLAN_QSTART, PLAN_COUNTS, _ = plan_layout(E_LOCAL, NPES)
     E_GLOBAL = NPES * E_LOCAL
     ROW_BITS = row_bits(E_GLOBAL)
     L_KC = PLAN_COUNTS
@@ -483,7 +490,10 @@ def mega_plan_kernel(*, E_LOCAL):
     class SharedStorage:
         raw: fx.Array[fx.Uint8, LDS_INTS * 4, 16]
 
-    @flyc.kernel(name=f"a8w4_megamoe_plan_e{E_LOCAL}", known_block_size=[NT, 1, 1])
+    @flyc.kernel(
+        name=f"a8w4_megamoe_plan_e{E_LOCAL}" + ("" if NPES == 8 else f"_n{NPES}"),
+        known_block_size=[NT, 1, 1],
+    )
     def kernel(
         topk_ids: fx.Int64,
         route_idx: fx.Int64,
@@ -630,13 +640,16 @@ def mega_plan_kernel(*, E_LOCAL):
 # =============================================================================
 
 
-def mega_finish_kernel(*, E_LOCAL):
+def mega_finish_kernel(*, E_LOCAL, NPES):
     """After the mega kernel (same stream): tell every rank this rank's remote adds are
     done, wait for all ranks, then advance the epoch (status[STATUS_EPOCH]).
-    ``E_LOCAL``: experts per rank (the workspace layout)."""
-    _, _, FFLAG, _ = ws_layout(E_LOCAL)
+    ``E_LOCAL``: experts per rank, ``NPES``: ranks (the workspace layout)."""
+    _, _, FFLAG, _ = ws_layout(E_LOCAL, NPES)
 
-    @flyc.kernel(name=f"a8w4_megamoe_finish_e{E_LOCAL}", known_block_size=[64, 1, 1])
+    @flyc.kernel(
+        name=f"a8w4_megamoe_finish_e{E_LOCAL}" + ("" if NPES == 8 else f"_n{NPES}"),
+        known_block_size=[64, 1, 1],
+    )
     def kernel(ws: fx.Int64, ws_tab: fx.Int64, status: fx.Int64, me: fx.Int32):
         tid = fx.Int32(gpu.thread_id("x"))
         status_p = global_typed_ptr(status, T.i32)

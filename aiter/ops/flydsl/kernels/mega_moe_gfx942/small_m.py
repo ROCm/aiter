@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The small path's kernel (gfx942): the EP8 a8w4 MoE layer for decode-sized batches
-as ONE kernel launch per call: x quant + dispatch, gemm1, gemm2 and the combine.
+"""The small path's kernel (gfx942): the EP4 / EP8 a8w4 MoE layer for decode-sized
+batches as ONE kernel launch per call: x quant + dispatch, gemm1, gemm2 and the combine.
 
 Design: aiter ``ops/flydsl/kernels/mega_moe/mega_moe_small_m.py`` (the MegaMoEV2
 small-input path, gfx950), on the GEMM tiles of ``kloop._make_core`` (fd2 mxfp4 W
@@ -84,7 +84,6 @@ from .mem import (
 )
 from .protocol import (
     BUFFER_BYTES_MAX,
-    NPES,
     SC_EPOCH,
     SC_HEAD,
     SC_SUB,
@@ -125,6 +124,7 @@ def ep_mega_small_kernel(
     TMAX,
     NUM_CU,
     XCDS,
+    NPES,
     BM=64,
     NO=256,
     ARB=256,
@@ -136,8 +136,8 @@ def ep_mega_small_kernel(
     BCM1=2,
     BCM2=2,
 ):
-    """The small megamoe kernel for (H, I, top-k), ``E_LOCAL`` experts per rank and
-    batches of <= TMAX tokens over all
+    """The small megamoe kernel for (H, I, top-k), ``E_LOCAL`` experts on each of ``NPES``
+    ranks (4 or 8) and batches of <= TMAX tokens over all
     ranks (fixed slots of TMAX rows per expert). ``NUM_CU`` / ``XCDS``: CUs and XCDs of
     the GPU, 304 / 8 (MI300X) or 80 / 4 (MI308X). ``BM``: rows of an m-tile (row variants
     16 .. BM); ``NO``: gemm2 output cols per unit; ``ARB`` / ``PF``: K bytes per A tile /
@@ -167,14 +167,16 @@ def ep_mega_small_kernel(
     VW = NO // 128  # gemm2 scatter: i32 per lane of a row's NO bf16
     UNITS = H // 8  # combine: a bf16 row in 16 B units, NT per pass
     LINE = SMALL_LINE
-    off, _ = small_sym_layout(H, TOPK, TMAX, E_LOCAL)
+    off, _ = small_sym_layout(H, TOPK, TMAX, E_LOCAL, NPES)
     O_RX, O_RS, O_RW, O_RID = off["rx"], off["rs"], off["rw"], off["rid"]
     O_RUN, O_DONE, O_CIN, O_CFLAG = off["run"], off["done"], off["cin"], off["cflag"]
     assert BM in (16, 32, 64) and CAP % BM == 0 and TMAX <= 1 << 16, (BM, TMAX)
     assert H % 1024 == 0 and G1N == 8 * CH and I % NI == 0 and NIW % 16 == 0
     assert H % NO == 0 and NO % 128 == 0 and NOW % 16 == 0, NO
-    # a lane per row scale (producers) and per local expert (plan) in one wave
-    assert G1N <= 64 and E_LOCAL <= 64, (G1N, E_LOCAL)
+    # a lane per row scale (producers) in one wave; the plan takes the local experts 64
+    # (a wave) at a time
+    assert G1N <= 64, G1N
+    PLAN_PASSES = -(-E_LOCAL // 64)
     assert 1 <= TOPK <= 8 and 0 < P <= GRID and WPC in (1, 2), (TOPK, P, WPC)
     # done[s] on every rank: each of source s's P producers adds DONE_UNIT / P, so a call
     # adds DONE_UNIT whatever P (the call with epoch k is complete at k DONE_UNIT)
@@ -201,6 +203,7 @@ def ep_mega_small_kernel(
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
         + ("" if (NUM_CU, XCDS) == (304, 8) else f"_cu{NUM_CU}_x{XCDS}")
+        + ("" if NPES == 8 else f"_n{NPES}")
     )
 
     @fx.struct
@@ -521,24 +524,34 @@ def ep_mega_small_kernel(
         # -------------------------------------------------------------- plan
         def plan():
             """wave 0: rows of each local expert -> LDS cnt[e], tb[e] (its first m-tile),
-            tb[32] (m-tiles in all)."""
+            tb[E_LOCAL] (m-tiles in all). Lane l takes experts l, l + 64, ...: a scan per
+            64 experts, each pass offset by the m-tiles of the passes before."""
             if wave0 == fx.Int32(0):
-                e = fx.min(lane0, fx.Int32(E_LOCAL - 1))
-                c = _sys_load_at(sym0 + fx.Int64(O_RUN) + fx.Int64(e * fx.Int32(LINE)))
-                c = (lane0 < fx.Int32(E_LOCAL)).select(
-                    fx.min(c, fx.Int32(CAP)), fx.Int32(0)
-                )
-                nt = (c + fx.Int32(BM - 1)) // fx.Int32(BM)
-                inc = nt
-                for bit in range_constexpr(6):
-                    d = 1 << bit
-                    other = _bcast_lane(inc, fx.max(lane0 - fx.Int32(d), fx.Int32(0)))
-                    inc = inc + (lane0 >= fx.Int32(d)).select(other, fx.Int32(0))
-                if lane0 < fx.Int32(E_LOCAL):
-                    _store(lds, fx.Int32(L_CNT) + lane0, c)
-                    _store(lds, fx.Int32(L_TB) + lane0, inc - nt)
-                if lane0 == fx.Int32(E_LOCAL - 1):
-                    _store(lds, fx.Int32(L_TB + E_LOCAL), inc)
+                before = fx.Int32(0)
+                for p in range_constexpr(PLAN_PASSES):
+                    le = lane0 + fx.Int32(p * 64)
+                    e = fx.min(le, fx.Int32(E_LOCAL - 1))
+                    c = _sys_load_at(
+                        sym0 + fx.Int64(O_RUN) + fx.Int64(e * fx.Int32(LINE))
+                    )
+                    c = (le < fx.Int32(E_LOCAL)).select(
+                        fx.min(c, fx.Int32(CAP)), fx.Int32(0)
+                    )
+                    nt = (c + fx.Int32(BM - 1)) // fx.Int32(BM)
+                    inc = nt
+                    for bit in range_constexpr(6):
+                        d = 1 << bit
+                        other = _bcast_lane(
+                            inc, fx.max(lane0 - fx.Int32(d), fx.Int32(0))
+                        )
+                        inc = inc + (lane0 >= fx.Int32(d)).select(other, fx.Int32(0))
+                    if le < fx.Int32(E_LOCAL):
+                        _store(lds, fx.Int32(L_CNT) + le, c)
+                        _store(lds, fx.Int32(L_TB) + le, before + inc - nt)
+                    if le == fx.Int32(E_LOCAL - 1):
+                        _store(lds, fx.Int32(L_TB + E_LOCAL), before + inc)
+                    if const_expr(p + 1 < PLAN_PASSES):
+                        before = before + _readlane(inc, 63)
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
 
@@ -1319,7 +1332,7 @@ class SmallMRuntime:
         e_local = int(experts) // int(world_size)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.sym = host.symmetric(
-            (small_sym_layout(H, topk, tmax, e_local)[1],), torch.uint8
+            (small_sym_layout(H, topk, tmax, e_local, int(world_size))[1],), torch.uint8
         )
         torch.cuda.synchronize()
         import mori.shmem as ms
@@ -1343,6 +1356,7 @@ class SmallMRuntime:
             TMAX=self.tmax,
             NUM_CU=int(num_cu),
             XCDS=int(xcds),
+            NPES=int(world_size),
             ACT=act,
             QX=qx_of(x_quant),
             **SMALL_KEY,
