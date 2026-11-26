@@ -317,6 +317,11 @@ class FusedStage1Knobs:
     # The pair reads W1 through the cache: with streamed W1 (b_nt) only a rank whose plan picks the cached-weight
     # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ.
     pair_tiles: bool = False
+    # Small-input kernel unit order (local plan): bit 1 the GEMM1 units (m-tile units: not with pair_tiles), bit 2
+    # the GEMM2 units of the run of one expert's m-tiles that lies wholly in an XCD's slice go in (expert, n)-major
+    # order, so the run's m-tiles read each weight tile at about the same time; bit 4: such grouped units read their
+    # weights through the cache. Only the order changes, not what a tile computes (0: m-major).
+    en_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1693,6 +1698,89 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+# Per-bucket small-input knobs of EP8 DeepSeek-V4.1-Flash on top of _tune_v41_flash_ep8_small: group -> field ->
+# value; the buckets not listed keep that tune. They read each weight tile once for more rows (en_order, 256-wide
+# GEMM1 tiles and cached W1 at 256 and 512 tokens), take the lean GEMM1 / GEMM2 epilogues and set the dispatch CUs
+# and waves per EU. At 64 and 128 tokens en_order's GEMM1 order replaces the m-tile pairs (it runs on single
+# m-tiles). None of them changes what ranks and launches exchange or what a tile computes: the outputs are those of
+# the tune without them, bit for bit (test_mega_moe_v2.py --suite routes --compare-untuned checks it on 8 GPUs).
+_V41_FLASH_EP8_SMALL_KNOBS = {
+    8: {
+        "stage1": {"grid_mult": 1, "num_dispatch_cu": 64},
+        "fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2},
+    },
+    16: {"fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2}},
+    32: {
+        "stage1": {"use_tile_resource": True, "num_dispatch_cu": 64, "b_nt": 1},
+        "stage2": {"block_n": 256},
+        "fused_stage1": {"en_order": 7, "epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 1},
+    },
+    64: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 128,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    128: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 160,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    256: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+    },
+    512: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+        "fused_stage2": {"early_k": 0},
+    },
+}
+
+
+def _with_bucket_knobs(config: MegaMoEConfig, knobs: dict | None) -> MegaMoEConfig:
+    """``config`` with one bucket's entry of a per-bucket knob table (group -> field -> value)."""
+    if not knobs:
+        return config
+    stage1 = replace(config.stage1, **knobs.get("stage1", {}))
+    return replace(
+        config,
+        stage1=stage1,
+        stage2=replace(
+            config.stage2, block_m=stage1.sort_block_m, **knobs.get("stage2", {})
+        ),
+        fused_stage1=replace(config.fused_stage1, **knobs.get("fused_stage1", {})),
+        fused_stage2=replace(config.fused_stage2, **knobs.get("fused_stage2", {})),
+    )
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity, 1024..16384
@@ -1750,7 +1838,10 @@ def _fused_config(
     if layout == V41_FLASH_EP2_LAYOUT:
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
-        return _tune_v41_flash_ep8_small(config, bucket)
+        return _with_bucket_knobs(
+            _tune_v41_flash_ep8_small(config, bucket),
+            _V41_FLASH_EP8_SMALL_KNOBS.get(bucket),
+        )
     return config
 
 

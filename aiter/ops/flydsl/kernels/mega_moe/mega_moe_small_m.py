@@ -1014,7 +1014,7 @@ def compile_mega_moe_stage1(
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False, pair_tiles: bool = False,
+    ascale_packed: bool = False, stream_w: bool = False, pair_tiles: bool = False, en_order: int = 0,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1123,6 +1123,14 @@ def compile_mega_moe_stage1(
     # ranks whose plan already picks the cached-weight bodies (_PLAN_CACHED_W_BIT) pair; the others keep their
     # streamed m-tile units (cached pairs among streamed tiles crowd the L2 and lose to them under skewed routing).
     assert not pair_tiles or (interleave and g1_lookahead == 1 and g1_a_ahead == 1)
+    # en_order (FusedStage1Knobs.en_order): bit 1 runs the GEMM1 units, bit 2 the GEMM2 units, of the run of one
+    # expert's m-tiles that lies wholly inside an XCD's slice in (expert, n)-major order, so the m-tiles of the run
+    # read each weight tile at about the same time (same L2) instead of a row of n-tiles apart; bit 4 reads the
+    # weights of such grouped units through the cache. A reordering of the units: every tile computes as before. It
+    # looks the experts up in the local plan, and its GEMM1 order is over m-tile units (pair_tiles groups them).
+    assert 0 <= en_order < 8, "en_order takes bits 1, 2 and 4"
+    assert not en_order or plan_local, "en_order reads the local plan"
+    assert not (en_order & 1) or not pair_tiles, "en_order's GEMM1 order runs on m-tile units"
     g2_tile, g2_lay = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
@@ -1211,6 +1219,7 @@ def compile_mega_moe_stage1(
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
         f"{'_pt' if pair_tiles else ''}"
+        f"{f'_en{en_order}' if en_order else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1381,6 +1390,34 @@ def compile_mega_moe_stage1(
                     rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
                     plan = (expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows)
                 return plan
+
+            def expert_span(m_tile):
+                # [first m-tile, end m-tile) of the expert holding m_tile (the plan_lookup ballot).
+                expert = expert_ballot(incl_base, m_tile)
+                incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(incl_base, expert))))
+                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(plan_ptr(count_base, expert))))
+                tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+                return incl_e - tiles_e, incl_e
+
+            def en_remap(w, lo_flat, hi_flat, n_per_m):
+                # en_order: (expert, n)-major order inside the run of one expert's m-tiles that lies wholly in the
+                # slice [lo_flat, hi_flat) of the m-major unit space (n_per_m units an m-tile). A bijection on the
+                # run's units: the slice owns the same units and the m-tiles its ends cut keep their place.
+                # Returns (unit, m-tiles in the run or 1 outside one).
+                m = w // fx.Int32(n_per_m)
+                e_lo, e_hi = expert_span(m)
+                full_lo = (lo_flat + fx.Int32(n_per_m - 1)) // fx.Int32(n_per_m)
+                full_hi = hi_flat // fx.Int32(n_per_m)
+                a = (e_lo > full_lo).select(e_lo, full_lo)
+                b = (e_hi < full_hi).select(e_hi, full_hi)
+                g = b - a
+                inside = (m >= a) & (m < b) & (g >= fx.Int32(2))
+                gs = inside.select(g, fx.Int32(1))
+                ab = inside.select(a, m)
+                p = w - ab * fx.Int32(n_per_m)
+                n2 = p // gs
+                m2 = ab + p - n2 * gs
+                return inside.select(m2 * fx.Int32(n_per_m) + n2, w), gs
         group_lookup = None
         if const_expr(pair_tiles):
             gincl_base = fx.Int32(fx.ptrtoint(lds.plan_gincl.ptr))
@@ -1649,10 +1686,13 @@ def compile_mega_moe_stage1(
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
 
-        def _run_tile(unit):
-            # A GEMM1 unit of one m-tile, through the streamed or (cached_w) the cached-weight body.
+        def _run_tile(unit, use_cached=None):
+            # A GEMM1 unit of one m-tile, through the streamed or (cached_w; en_order bit 4: use_cached) the
+            # cached-weight body.
+            if const_expr(use_cached is None):
+                use_cached = cached_w
             if const_expr(b_cache_modifier != 0):
-                if cached_w != fx.Int32(0):
+                if use_cached != fx.Int32(0):
                     _do_cached_tile(*unit)
                 else:
                     _do_scheduled_tile(*unit)
@@ -1689,6 +1729,14 @@ def compile_mega_moe_stage1(
             fx.barrier()
             work = Vec(work_scratch_view.load())[0]
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
+            g1_cached = None
+            if const_expr(en_order & 1):
+                # (A CTA without work looks up a unit of its slice and keeps its own.)
+                work_r, g1_grp = en_remap((has_work != fx.Int32(0)).select(work, shard_base), shard_base,
+                    shard_end, N_TILES)
+                work = (has_work != fx.Int32(0)).select(work_r, work)
+                if const_expr(en_order & 4):
+                    g1_cached = cached_w | (g1_grp >= fx.Int32(2)).select(fx.Int32(1), fx.Int32(0))
             # pair_tiles: the unit's plan (every lane: the lookup ballots), which its GEMM1 body and count take.
             unit = (work, group_lookup(work // fx.Int32(N_TILES))) if const_expr(pair_tiles) else (work,)
             if has_work != fx.Int32(0):
@@ -1698,7 +1746,7 @@ def compile_mega_moe_stage1(
                     else:
                         _run_tile(unit)
                 else:
-                    _run_tile(unit)
+                    _run_tile(unit, g1_cached)
                 # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
                 # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -1755,6 +1803,11 @@ def compile_mega_moe_stage1(
             g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
             if g2_local < g2_units:
                 g2_u = g2_base + g2_local
+                g2_cw = cached_w
+                if const_expr(en_order & 2):
+                    g2_u, g2_grp = en_remap(g2_u, g2_base, g2_base + g2_units, g2_n_blocks)
+                    if const_expr(en_order & 4):
+                        g2_cw = cached_w | (g2_grp >= fx.Int32(2)).select(fx.Int32(1), fx.Int32(0))
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
                 if tid == fx.Int32(0):
@@ -1765,7 +1818,7 @@ def compile_mega_moe_stage1(
                 # CU's L1 can be stale.
                 comm_ops.invalidate_l1()
                 # As in GEMM1, a rank that receives many rows reads W2 through the cache.
-                if cached_w != fx.Int32(0):
+                if g2_cw != fx.Int32(0):
                     g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
                         g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
                         fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
@@ -1844,7 +1897,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, pair_tiles=k1.pair_tiles,
+        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, pair_tiles=k1.pair_tiles, en_order=k1.en_order,
     )
     # fmt: on
 
