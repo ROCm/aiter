@@ -570,5 +570,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             )
 
     _launch.compile = _compile
+    # The @flyc.jit launcher _launch runs, for binding to the AOT cache.
+    _launch.launcher = launch_flash_attn_dualwave_swp
 
     return _launch
