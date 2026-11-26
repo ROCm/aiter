@@ -5,13 +5,13 @@
 
 Stages:
 
-1. ``gate_cumsum`` -- chunk-local log2 cumsum, optionally through the in-kernel
-   gate (``A_log`` / ``dt_bias``, softplus or the ``lower_bound`` sigmoid);
-2. ``intra`` -- in-kernel q/k l2norm and beta sigmoid, ``Aqk``, the
+1. ``intra`` -- the gate's chunk-local log2 cumsum (optionally through the
+   in-kernel ``A_log`` / ``dt_bias`` softplus or ``lower_bound`` sigmoid),
+   in-kernel q/k l2norm and beta sigmoid, ``Aqk``, the
    ``(I + Akk)^-1`` solve and ``w`` / ``u`` / ``qg`` / ``kg``;
-3. ``h`` / ``v_new`` recurrence -- the GDN K5 kernel (``chunk_gated_delta_h``,
+2. ``h`` / ``v_new`` recurrence -- the GDN K5 kernel (``chunk_gated_delta_h``,
    per-channel ``USE_GK``, token-major ``w`` / ``u``);
-4. ``output`` -- ``o = scale * qg h + Aqk v_new``.
+3. ``output`` -- ``o = scale * qg h + Aqk v_new``.
 
 Inputs and outputs are token-major ``[B, T, H, *]`` (fla ``chunk_kda``), the
 layout of the fused KDA layer (#8739) and of the FlyDSL chunk backward
@@ -25,7 +25,6 @@ import torch
 
 from .kernels.kda_chunk_fwd import (
     BT,
-    compile_gate_cumsum,
     compile_intra,
     compile_output,
 )
@@ -139,22 +138,6 @@ def chunk_kda_fwd_prepare_flydsl(
 
     gc = torch.empty(B, T, H, K, **f32)
     use_bias = use_gate_in_kernel and dt_bias is not None
-    _run_compiled(
-        compile_gate_cumsum(
-            H, g.dtype, use_gate_in_kernel, use_bias, lower_bound is not None, varlen
-        ),
-        g,
-        A_log.float().contiguous() if use_gate_in_kernel else dummy,
-        dt_bias.float().contiguous() if use_bias else dummy,
-        gc,
-        chunks.cbos,
-        chunks.clen,
-        T,
-        0.0 if lower_bound is None else float(lower_bound),
-        chunks.grid_t,
-        B * H,
-        stream,
-    )
 
     qn = torch.empty_like(q) if store_qkb else None
     kn = torch.empty_like(k) if store_qkb else None
@@ -179,10 +162,17 @@ def chunk_kda_fwd_prepare_flydsl(
             # The lower_bound gate bounds the per-token decay, which the MFMA
             # diagonal tiles need; any other gate keeps them in fp32.
             use_gate_in_kernel and lower_bound is not None,
+            g.dtype,
+            use_gate_in_kernel,
+            use_bias,
+            lower_bound is not None,
         ),
         q,
         k,
         v,
+        g,
+        A_log.float().contiguous() if use_gate_in_kernel else dummy,
+        dt_bias.float().contiguous() if use_bias else dummy,
         gc,
         beta,
         qn if store_qkb else dummy,
@@ -198,6 +188,7 @@ def chunk_kda_fwd_prepare_flydsl(
         chunks.clen,
         T,
         float(scale),
+        0.0 if lower_bound is None else float(lower_bound),
         chunks.grid_t,
         B * H,
         stream,
@@ -341,6 +332,9 @@ def chunk_kda_fwd_flydsl(
     if not use_gate_in_kernel:
         lower_bound = None
     chunks = _Chunks(B, T, q.device, cu_seqlens)
+    # The kernels index token-major [B, T, H, D]; channel-major views (a
+    # fused layer's projections) must be packed first.
+    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
 
     *_, gc, w, u, qg, kg, Aqk, _ = chunk_kda_fwd_prepare_flydsl(
         q,
