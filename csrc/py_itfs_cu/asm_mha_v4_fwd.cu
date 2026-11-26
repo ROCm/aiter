@@ -576,16 +576,25 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
 // backing hands them codes from the wrong rows and scales from whatever follows. The last record's
 // scale read runs past it, into the zeroed slack the packer reserves after the buffer. Mirrors
 // FP6_K_TILE_BYTES and FP6_K_BUFFER_SLACK_BYTES in aiter.ops.triton.quant.mxfp6_fmha_pack, and
-// MHA_V4_MXFP6_HD256_K_TILE_BYTES in aiter.ops.mha_v4_quant.
-constexpr int64_t kMxfp6KBufferSlack = 256;
+// MHA_V4_MXFP6_HD256_K_TILE_TOKENS and MHA_V4_MXFP6_HD256_K_TILE_BYTES in aiter.ops.mha_v4_quant.
+constexpr int64_t kMxfp6KTileRows       = 128;
+constexpr int64_t kMxfp6KTileBytes      = 17408;
+constexpr int64_t kMxfp6Hd256KTileRows  = 64;
+constexpr int64_t kMxfp6Hd256KTileBytes = 13312;
+constexpr int64_t kMxfp6KBufferSlack    = 256;
 
 void check_mxfp6_k_record_storage(const at::Tensor& packed,
                                   int64_t rows,
                                   int64_t head_dim,
                                   const char* name)
 {
-    const int64_t tile_rows  = head_dim == 256 ? 64 : 128;
-    const int64_t tile_bytes = head_dim == 256 ? 13312 : 17408;
+    TORCH_CHECK(head_dim == 128 || head_dim == 256,
+                name,
+                " is an MXFP6 K record buffer, which is packed for head dim 128 or 256; got ",
+                head_dim);
+    const bool hd256         = head_dim == 256;
+    const int64_t tile_rows  = hd256 ? kMxfp6Hd256KTileRows : kMxfp6KTileRows;
+    const int64_t tile_bytes = hd256 ? kMxfp6Hd256KTileBytes : kMxfp6KTileBytes;
     const int64_t row_stride = tile_bytes / tile_rows;
     const int64_t records    = (rows + tile_rows - 1) / tile_rows;
     TORCH_CHECK(packed.stride(3) == 1 && packed.stride(1) == row_stride &&
