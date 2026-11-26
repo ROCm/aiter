@@ -492,6 +492,25 @@ class SwigluFp8Epilogue:
                 )
 
 
+def _interleave_store_burst(n_row_tiles):
+    """Schedule an 8-MFMA burst that also packs and stores one quadrant.
+
+    Per 16-row tile: MFMA, its 4 bf16 converts + 2 permlane swaps, MFMA, its
+    4 ds_bpermutes, then the previous tile's store (one tile behind, so the
+    store's lgkmcnt finds its bpermutes done). Raw
+    ``rocdl.sched_group_barrier``: flydsl 0.5.3 has no ``fx`` scheduling API.
+    """
+    mfma, valu, ds, vmem_w = 8, 2, 128, 64
+    for t in range_constexpr(n_row_tiles):
+        rocdl.sched_group_barrier(mfma, 1, 0)
+        rocdl.sched_group_barrier(valu, 6, 0)
+        rocdl.sched_group_barrier(mfma, 1, 0)
+        rocdl.sched_group_barrier(ds, 4, 0)
+        if const_expr(t > 0):
+            rocdl.sched_group_barrier(vmem_w, 1, 0)
+    rocdl.sched_group_barrier(vmem_w, 1, 0)
+
+
 def _opaque_vgpr(value):
     """``value`` in a VGPR the compiler cannot fold constants through.
 
@@ -1334,6 +1353,15 @@ def compile_moe_bs_gemm_8w(
             else:
                 otherwise()
 
+        def either_val(flag, if_zero, otherwise, init):
+            """``either`` whose arms return a value: each arm is one straight-line block."""
+            out = init
+            if flag == 0:
+                out = if_zero()
+            else:
+                out = otherwise()
+            return out
+
         def mfma_skip(skip, burst, c):
             """``burst()`` unless ``skip``: a wave-uniform branch around an MFMA burst."""
             out = c
@@ -1364,9 +1392,14 @@ def compile_moe_bs_gemm_8w(
             k % 4 == 0, which at k = K - 4 is the next tile's chunk 0. Step 0
             also fetches this tile's routes, loads the next tile's expert and
             converts and stores the previous tile's accumulators ``prev_acc``,
-            each just before its registers start accumulating again (HK's
-            stage-2 epilogue): the conversion then runs while the other
-            group's MFMAs do. Returns (accumulators, next expert, next skip).
+            each before its registers start accumulating again (HK's stage-2
+            epilogue). c00 and c11 go in the V part of their own phase; c01
+            and c10 are interleaved into the c00 and c01 bursts, one phase
+            early. A step-0 V part is ~5x its burst, so the two groups' V parts
+            otherwise ran back to back while the MFMA pipe idled (ATT), and in
+            a burst the pack overlaps the other group's V part (stage 2 -1.5% /
+            -2.3% at T = 4096 / 16384). Returns (accumulators, next expert,
+            next skip).
             """
             valid = prev_tile >= 0
             pcols = slot_cols(_pow2_mod(prev_tile, NB))
@@ -1441,33 +1474,70 @@ def compile_moe_bs_gemm_8w(
                 if const_expr(sc_dma):
                     nxt["sc"](1 - parity)
 
-                c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
+                if const_expr(k == 0):
+                    # The previous tile's c01 rides in this burst.
+                    rocdl.s_setprio(1)
+                    c00 = mfma.call(
+                        b0_frag, a0_frag, c00, sb0, sa0, k_pack=0, set_prio=False
+                    )
+                    store_prev(1)
+                    _interleave_store_burst(N_TILES_A)
+                    rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                else:
+                    c00 = mfma.call(b0_frag, a0_frag, c00, sb0, sa0, k_pack=0)
 
                 sb1 = sc_read(k, "b1")
                 b1_frag = b_s2r.load(b_cur1)
                 ctx, kk = src(k + 2)
                 ctx["b"](0, b_cur0, kk)
                 if const_expr(k == 0):
-                    store_prev(1)
+                    rows1 = store_c.rows_half(wave_m, prev_slot, 1)
+                    prev_rows[1] = (rows1, store_c.quad_offsets(rows1, valid))
                 rocdl.s_barrier()
 
-                c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
+                if const_expr(k == 0):
+                    # The previous tile's c10 rides in this burst. Its
+                    # real-or-dummy choice is taken around the whole burst, so
+                    # each arm is one block the scheduler can interleave.
+                    rocdl.s_setprio(1)
+                    c01_in = c01
+
+                    def c01_with_c10():
+                        c = mfma.call(
+                            b1_frag, a0_frag, c01_in, sb1, sa0, k_pack=0, set_prio=False
+                        )
+                        rows, offs = prev_rows[1]
+                        store_c.store(store_c.pack(prev_acc[2], rows), offs, pcols[0])
+                        _interleave_store_burst(N_TILES_A)
+                        return c
+
+                    def c01_with_dummy():
+                        c = mfma.call(
+                            b1_frag, a0_frag, c01_in, sb1, sa0, k_pack=0, set_prio=False
+                        )
+                        store_c.store_dummy()
+                        return c
+
+                    c01 = either_val(prev_skip_h1, c01_with_c10, c01_with_dummy, c01)
+                    rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                else:
+                    c01 = mfma.call(b1_frag, a0_frag, c01, sb1, sa0, k_pack=0)
 
                 sa1 = sc_read(k, "a1")
                 a1_frag = a_s2r.load(a_cur1)
                 ctx["a"](0, a_cur0, kk)
-                if const_expr(k == 0):
-                    store_prev(2)
                 n_sc = 2 if sc_dma else 0
                 # vmcnt is in order: a store is drained by the first wait for a
                 # load issued after it, so step 0's stores stay in flight
-                # through its own waits; step 1's middle wait drains the
-                # quadrant (0, *) ones.
+                # through its own waits. Step 1's middle wait drains c00, c01
+                # and c10, all issued before A0 of step 2; only c11 may fly.
                 wait_barrier(
                     4 * N_LDS_STEPS
                     + n_sc
                     + (7 + store_c.n_fetch + 3 * QUAD_STORES if k == 0 else 0)
-                    + (2 * QUAD_STORES if k == 1 else 0)
+                    + (QUAD_STORES if k == 1 else 0)
                 )
 
                 c10 = mfma_q(b0_frag, a1_frag, c10, sb0, sa1, skip_h1)
