@@ -302,15 +302,7 @@ def _constexprs(
     return bound.args[_RUNTIME_PARAMS:]
 
 
-@aot_factory(
-    "bmm_a8w8_mxscale_gfx950",
-    sources=[
-        "kernels/bmm_a8w8_mxscale_gfx950.py",
-        "kernels/mfma_preshuffle_pipeline.py",
-        "../../utility/mx_types.py",
-        "kernels/quant_utils.py",
-    ],
-)
+@aot_factory("bmm_a8w8_mxscale_gfx950")
 @functools.cache
 def _bound_launcher(constexprs: tuple):
     """launch_bmm_a8w8_mxscale with its Constexprs bound, so that every
