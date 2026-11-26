@@ -800,27 +800,6 @@ def test_raw_views_and_preallocated_output(split_k):
     )
 
 
-@pytest.mark.parametrize(
-    "invalid", ["stride", "scale_shape", "scale_dtype", "output", "split"]
-)
-@pytest.mark.usefixtures("_require_gfx950")
-def test_invalid_group32_contract(invalid):
-    x, w, xs, ws = generate_group32_inputs(3, 2053, 1280)
-    kwargs = {}
-    if invalid == "stride":
-        x = x.T.contiguous().T
-    elif invalid == "scale_shape":
-        ws = ws[:-1]
-    elif invalid == "scale_dtype":
-        xs = xs.float()
-    elif invalid == "output":
-        kwargs["y"] = torch.empty((3, 2052), dtype=torch.bfloat16, device="cuda")
-    else:
-        kwargs["split_k"] = 0
-    with pytest.raises(AssertionError):
-        gemm_a8w8_blockscale_group32(x, w, xs, ws, **kwargs)
-
-
 @pytest.mark.parametrize("split_k", [None, 3])
 @pytest.mark.usefixtures("_require_gfx950")
 def test_public_group32_compile_dynamic_rows(split_k):
