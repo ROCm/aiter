@@ -22,6 +22,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.utility import dtypes
 
 from .. import communication_ops_utils as comm_ops
@@ -1846,6 +1847,7 @@ def _wave_uniform_i64(addr):
 
 
 # fmt: off
+@aot_factory("mega_moe_large_m_stage1")
 @functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
@@ -2987,7 +2989,8 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     """The persistent kernel's launcher and its fused Stage2/Combine launch arguments.
 
     Returns ``(launch, fused, combine_cur_tok, combine_row_nbytes)``: ``fused`` are the i64 addresses that
-    follow ``addr_expected``; the two Combine i32 follow them.
+    follow ``addr_expected``; the two Combine i32 follow them. ``launch`` is compile_mega_moe_stage1's
+    ``lazy`` handle: pass it to ``_run_compiled`` or ``_preload_compiled`` only.
     """
     if len(fused_args) != 14:
         raise ValueError("fused Stage2 needs (mtile_ctr, 13 Stage2 runtime addresses)")
@@ -2995,7 +2998,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     c_args = tuple(fused_combine_args)
     if len(c_args) != 7:
         raise ValueError("fused Combine needs 7 runtime args")
-    launch = compile_mega_moe_stage1(
+    launch = compile_mega_moe_stage1.lazy(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
         fuse_scale_dim=fuse_scale_dim, fused_stage2=tuple(fused_stage2), fused_combine=tuple(fused_combine),
@@ -3022,6 +3025,10 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         addr_parity, addr_expected, *fused, fx.Int32(c_cur_tok), c_row_nbytes, stream,
     )
 # fmt: on
+
+
+# Bound launches kept per runtime: every (config, layer slot, weights) a model cycles through.
+_LAUNCH_CACHE_MAX = 1024
 
 
 class LargeMRuntime:
@@ -3159,7 +3166,9 @@ class LargeMRuntime:
         self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
         w1, w1_scale, w2, w2_scale = self._construction_weights
         self._weight_spec = weight_spec(self._construction_weights)
-        # (MegaMoEConfig, layer slot) -> bound persistent-kernel launch (_bind_fused_launch).
+        # (MegaMoEConfig, layer slot, W1 / W1 scale / W2 / W2 scale pointers) -> bound persistent-kernel
+        # launch (_bind_fused_launch). MegaMoEV2 rebinds weights by assigning the weight attributes, not
+        # through bind_weights(), so the key carries the pointers the cached launch captured.
         self._launch_cache = {}
         self._active_layer_slot = 0
         self.w2 = w2
@@ -3429,10 +3438,17 @@ class LargeMRuntime:
             raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
         if not preload and self._s1_mega is run_mega_moe_stage1:
             # Launch fast path: the launcher and every argument but the inputs and the token count are fixed
-            # for a (config, layer slot) under the bound weights (bind_weights clears the cache).
-            key = (config, self._active_layer_slot)
+            # for a (config, layer slot, weight pointers). Weights may have been reassigned since the last call
+            # (see MegaMoEV2's weight attributes), so the pointers are part of the key.
+            key = (
+                config, self._active_layer_slot, self._s1_w1.data_ptr(), self._s1_w1_scale.data_ptr(),
+                self.w2.data_ptr(), self.w2_scale.data_ptr(),
+            )
             bound = self._launch_cache.get(key)
             if bound is None:
+                if len(self._launch_cache) >= _LAUNCH_CACHE_MAX:
+                    # Cached launches hold their W1 tensors; drop the old bindings.
+                    self._launch_cache.clear()
                 bound = self._launch_cache[key] = self._bind_fused_launch(config)
             launch, head, tail, c_row_nbytes, tile_m = bound
             _run_compiled(

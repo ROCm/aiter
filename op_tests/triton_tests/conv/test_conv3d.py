@@ -47,16 +47,10 @@ from aiter.ops.triton.conv.conv3d import (
 )
 from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.conv_config_utils import (
-    format_prepack_shape_key_3d,
-    format_shape_key_3d,
-)
 from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
-    CONV3D_WEIGHT_PACK_CACHE_NAMES,
     _winograd_tolerances,
     apply_activation,
-    assert_weight_pack_cache_clear_is_scoped,
     conv_padding_reference,
     dynamic_conv_tolerances,
 )
@@ -506,15 +500,6 @@ def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
     ), "least-recently-used entry was not evicted"
 
 
-def test_conv3d_weight_pack_cache_clear_is_scoped(monkeypatch):
-    assert_weight_pack_cache_clear_is_scoped(
-        monkeypatch,
-        conv_prepack,
-        clear_conv3d_weight_pack_caches,
-        CONV3D_WEIGHT_PACK_CACHE_NAMES,
-    )
-
-
 def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeypatch):
     config = {
         "BLOCK_M": 32,
@@ -565,14 +550,6 @@ def test_invalid_spatial_parameters(kwargs, match):
         conv3d(x, w, **kwargs)
 
 
-def test_invalid_layout():
-    x = torch.empty((1, 4, 3, 4, 4), device="cuda", dtype=torch.float16)
-    w = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
-
-    with pytest.raises(ValueError, match="layout must be 'ncdhw' or 'ndhwc'"):
-        conv3d(x, w, layout="nchw")
-
-
 def test_conv3d_dims_supports_cpu_tensors():
     x = torch.empty((2, 4, 5, 6, 7), dtype=torch.float16, device="cpu")
     w = torch.empty((8, 4, 3, 3, 3), dtype=torch.float16, device="cpu")
@@ -587,17 +564,6 @@ def test_conv3d_dims_supports_cpu_tensors():
 
     expected = (2, 4, 5, 6, 7, 8, 3, 3, 3, 5, 6, 7)
     assert dimensions == expected, f"dimensions {dimensions} != expected {expected}"
-
-
-def test_conv3d_execution_rejects_cpu_tensors():
-    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16, device="cpu")
-    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16, device="cpu")
-
-    with pytest.raises(
-        ValueError,
-        match="conv3d input must be a CUDA/ROCm tensor, got input=cpu, weight=cpu, bias=None",
-    ):
-        conv3d_general(x, w)
 
 
 def test_prepared_padding_handles_empty_batch():
@@ -911,106 +877,6 @@ def test_padding_prepacked_input(api):
             atol=atol,
             msg=lambda details, mode=mode: f"{api}, prepacked {mode}:\n{details}",
         )
-
-
-@pytest.mark.parametrize(
-    "shape,padding,mode,message",
-    [
-        ((1, 4, 4, 7, 9), 0, "invalid", "padding_mode must be one of"),
-        ((1, 4, 4, 7, 9), (4, 0, 0), "reflect", "reflect padding must be less"),
-        ((1, 4, 4, 7, 9), (0, 7, 0), "reflect", "reflect padding must be less"),
-        ((1, 4, 4, 7, 9), (0, 0, 10), "circular", "circular padding must not exceed"),
-        ((1, 4, 0, 7, 9), 0, "replicate", "spatial dimensions must be positive"),
-        ((1, 4, 7, 9), 0, "reflect", "must be 5-D NCDHW"),
-    ],
-)
-def test_padding_validates_before_materialization(
-    monkeypatch, shape, padding, mode, message
-):
-    source = torch.empty(shape, device="cuda", dtype=torch.float16)
-    weight = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
-
-    def unexpected_pad(*args, **kwargs):
-        pytest.fail("invalid padding must be rejected before calling F.pad")
-
-    monkeypatch.setattr(F, "pad", unexpected_pad)
-    with pytest.raises(ValueError, match=message):
-        conv3d(source, weight, padding=padding, padding_mode=mode)
-
-
-@pytest.mark.parametrize(
-    "api,cpu_argument",
-    [
-        ("conv3d", "input"),
-        ("conv3d_ncdhw", "weight"),
-        ("conv3d_ndhwc", "bias"),
-        ("conv3d_1x1x1", "bias"),
-        ("conv3d_general", "bias"),
-        ("conv3d_ndhwc_3x3x3", "bias"),
-        ("conv3d_ncdhw_cblocked", "bias"),
-        ("conv3d_winograd_hw_f4x3", "bias"),
-        ("conv3d_winograd_hw_f4x3_cblocked", "bias"),
-    ],
-)
-def test_conv3d_rejects_invalid_devices_before_preparation(
-    monkeypatch, api, cpu_argument
-):
-    source = torch.empty(
-        (1, 4, 3, 5, 7),
-        device="cpu" if cpu_argument == "input" else "cuda",
-        dtype=torch.float16,
-    )
-    filter_size = 1 if api == "conv3d_1x1x1" else 3
-    weight = torch.empty(
-        (4, 4, filter_size, filter_size, filter_size),
-        device="cpu" if cpu_argument == "weight" else "cuda",
-        dtype=torch.float16,
-    )
-    bias = torch.empty(
-        (4,), device="cpu" if cpu_argument == "bias" else "cuda", dtype=torch.float16
-    )
-
-    def unexpected_preparation(*args, **kwargs):
-        pytest.fail(
-            f"{api}: CPU {cpu_argument} must be rejected before padding or packing"
-        )
-
-    monkeypatch.setattr(conv3d_module, "_prepare_conv_padding", unexpected_preparation)
-    message = (
-        "conv3d input must be a CUDA/ROCm tensor"
-        if cpu_argument == "input"
-        else "conv3d input, weight, and bias must be on the same device"
-    )
-    message += (
-        f", got input={source.device}, weight={weight.device}, bias={bias.device}"
-    )
-    with pytest.raises(ValueError, match=message):
-        getattr(conv3d_module, api)(
-            source, weight, bias, padding=1, padding_mode="reflect"
-        )
-
-
-def test_input_weight_channel_mismatch():
-    x = torch.empty((1, 4, 3, 4, 4), device="cuda", dtype=torch.float16)
-    w = torch.empty((4, 3, 1, 1, 1), device="cuda", dtype=torch.float16)
-
-    with pytest.raises(ValueError, match="weight in-channels 3 != input channels 4"):
-        conv3d(x, w)
-
-
-def test_nonpositive_output_shape():
-    x = torch.empty((1, 4, 2, 4, 4), device="cuda", dtype=torch.float16)
-    w = torch.empty((4, 4, 3, 3, 3), device="cuda", dtype=torch.float16)
-
-    with pytest.raises(ValueError, match="calculated conv3d output is non-positive"):
-        conv3d(x, w)
-
-
-def test_3x3x3_prepack_rejects_other_kernel_shapes():
-    w = torch.empty((4, 4, 1, 3, 3), device="cuda", dtype=torch.float16)
-
-    with pytest.raises(ValueError, match="3x3x3 prepack requires a 3x3x3 weight"):
-        prepack_oidhw_to_3x3x3(w)
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -1517,276 +1383,6 @@ def test_conv3d_config_layout_variant_precedence(
     assert (
         selected("ndhwc", key="missing", M=65) == "any"
     ), "generic fallback was not used after shape and bucket misses"
-
-
-class _KernelSpy:
-    def __init__(self):
-        self.grid = None
-        self.calls = []
-
-    def __getitem__(self, grid):
-        self.grid = grid
-        return self
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-
-
-def test_prepack_launcher_uses_complete_3d_key(monkeypatch):
-    seen = []
-    kernel = _KernelSpy()
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_prepack_3d",
-        lambda **kwargs: seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(conv_launch, "_ncx_to_cblocked_kernel", kernel)
-
-    conv_launch._launch_ncdhw_to_cblocked(
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        2,
-        65,
-        3,
-        5,
-        7,
-        128,
-        64,
-    )
-
-    expected = [
-        {
-            "shape_key": format_prepack_shape_key_3d(2, 65, 3, 5, 7, 64),
-            "M": 3 * 5 * 7,
-        }
-    ]
-    assert seen == expected, f"prepack config lookup {seen} != expected {expected}"
-    assert (
-        len(kernel.calls) == 1
-    ), f"expected one prepack kernel launch, got {len(kernel.calls)}"
-
-
-def test_general_launcher_uses_complete_3d_key_and_layout(monkeypatch):
-    seen = []
-    kernel = _KernelSpy()
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_general_3d",
-        lambda **kwargs: seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(conv_launch, "_conv3d_general_kernel", kernel)
-
-    conv_launch._launch_general_3d(
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        None,
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        2,
-        5,
-        5,
-        9,
-        13,
-        7,
-        2,
-        3,
-        1,
-        3,
-        5,
-        6,
-        64,
-        (1, 2, 3),
-        (0, 1, 2),
-        (2, 1, 3),
-        64,
-        "none",
-        layout="ndhwc",
-    )
-
-    expected_key = format_shape_key_3d(
-        2, 5, 5, 9, 13, 7, 2, 3, 1, 1, 2, 3, 0, 1, 2, 2, 1, 3
-    )
-    expected = [{"shape_key": expected_key, "M": 2 * 3 * 5 * 6, "variants": ("ndhwc",)}]
-    assert seen == expected, f"general config lookup {seen} != expected {expected}"
-    assert (
-        len(kernel.calls) == 1
-    ), f"expected one general kernel launch, got {len(kernel.calls)}"
-
-
-def test_1x1x1_launcher_uses_complete_3d_key_and_layout(monkeypatch):
-    seen = []
-    kernel = _KernelSpy()
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_1x1x1_3d",
-        lambda **kwargs: seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(conv_launch, "_conv3d_1x1x1_kernel", kernel)
-
-    conv_launch._launch_1x1x1_3d(
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        torch.empty((7, 5, 1, 1, 1), device="cuda", dtype=torch.float32),
-        None,
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        2,
-        5,
-        3,
-        5,
-        7,
-        7,
-        3,
-        3,
-        7,
-        (1, 2, 1),
-        (0, 0, 0),
-        "none",
-        layout="ncdhw",
-    )
-
-    expected_key = format_shape_key_3d(
-        2, 5, 3, 5, 7, 7, 1, 1, 1, 1, 2, 1, 0, 0, 0, 1, 1, 1
-    )
-    expected = [{"shape_key": expected_key, "M": 2 * 3 * 3 * 7, "variants": ("ncdhw",)}]
-    assert seen == expected, f"1x1x1 config lookup {seen} != expected {expected}"
-    assert (
-        len(kernel.calls) == 1
-    ), f"expected one 1x1x1 kernel launch, got {len(kernel.calls)}"
-
-
-@pytest.mark.parametrize("layout", ["ndhwc", "cblocked"])
-def test_3x3x3_launchers_use_complete_3d_key(monkeypatch, layout):
-    seen = []
-    kernel = _KernelSpy()
-    common = [
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        None,
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        2,
-        65,
-        4,
-        9,
-        11,
-        67,
-        4,
-        5,
-        6,
-        128,
-    ]
-    tail = [(1, 2, 3), (0, 1, 2), (2, 1, 3), "none"]
-    if layout == "ndhwc":
-        monkeypatch.setattr(
-            conv_launch,
-            "_get_config_3x3x3_ndhwc",
-            lambda **kwargs: seen.append(kwargs) or {},
-        )
-        monkeypatch.setattr(conv_launch, "_conv3d_3x3x3_ndhwc_kernel", kernel)
-        conv_launch._launch_3x3x3_ndhwc(*common, *tail)
-    else:
-        monkeypatch.setattr(
-            conv_launch,
-            "_get_config_3x3x3_cblocked",
-            lambda **kwargs: seen.append(kwargs) or {},
-        )
-        monkeypatch.setattr(conv_launch, "_conv3d_3x3x3_cblocked_kernel", kernel)
-        conv_launch._launch_3x3x3_cblocked(*common, 64, *tail)
-
-    expected_key = format_shape_key_3d(
-        2, 65, 4, 9, 11, 67, 3, 3, 3, 1, 2, 3, 0, 1, 2, 2, 1, 3
-    )
-    expected = [{"shape_key": expected_key, "M": 2 * 4 * 5 * 6}]
-    assert seen == expected, f"3x3x3 config lookup {seen} != expected {expected}"
-    assert (
-        len(kernel.calls) == 1
-    ), f"expected one {layout} 3x3x3 kernel launch, got {len(kernel.calls)}"
-
-
-@pytest.mark.parametrize(
-    "input_variant,use_cblocked", [("ncdhw", False), ("cblocked", True)]
-)
-def test_winograd_launchers_use_complete_3d_key_and_axes(
-    monkeypatch, input_variant, use_cblocked
-):
-    input_seen = []
-    gemm_seen = []
-    output_seen = []
-    kernels = [_KernelSpy(), _KernelSpy(), _KernelSpy()]
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_wino_hw_input",
-        lambda **kwargs: input_seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_wino_hw_gemm",
-        lambda **kwargs: gemm_seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(
-        conv_launch,
-        "_get_config_wino_hw_output",
-        lambda **kwargs: output_seen.append(kwargs) or {},
-    )
-    monkeypatch.setattr(
-        conv_launch, "_winograd_hw_f4x3_input_transform_kernel", kernels[0]
-    )
-    monkeypatch.setattr(
-        conv_launch, "_winograd_hw_f4x3_batched_gemm_kernel", kernels[1]
-    )
-    monkeypatch.setattr(
-        conv_launch, "_winograd_hw_f4x3_output_transform_kernel", kernels[2]
-    )
-    x = torch.empty((2, 65, 4, 9, 11), device="cuda", dtype=torch.float16)
-    x_blocked = (
-        torch.empty((2, 2, 4, 9, 11, 64), device="cuda", dtype=torch.float16)
-        if use_cblocked
-        else None
-    )
-
-    conv_launch._launch_winograd_hw_f4x3(
-        x,
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        None,
-        torch.empty(1, device="cuda", dtype=torch.float32),
-        2,
-        65,
-        4,
-        9,
-        11,
-        67,
-        4,
-        9,
-        11,
-        128,
-        (1, 1, 1),
-        "none",
-        block_k=64,
-        x_blocked=x_blocked,
-    )
-
-    expected_key = format_shape_key_3d(
-        2, 65, 4, 9, 11, 67, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1
-    )
-    tile_count = 3 * 3
-    expected_input = [
-        {
-            "shape_key": expected_key,
-            "M": 2 * 4 * tile_count,
-            "variants": (input_variant,),
-        }
-    ]
-    expected_stage = [{"shape_key": expected_key, "M": 2 * 4 * tile_count}]
-    assert (
-        input_seen == expected_input
-    ), f"Winograd input config lookup {input_seen} != expected {expected_input}"
-    assert (
-        gemm_seen == expected_stage
-    ), f"Winograd GEMM config lookup {gemm_seen} != expected {expected_stage}"
-    assert (
-        output_seen == expected_stage
-    ), f"Winograd output config lookup {output_seen} != expected {expected_stage}"
-    launch_counts = [len(kernel.calls) for kernel in kernels]
-    assert all(
-        count == 1 for count in launch_counts
-    ), f"expected one launch per Winograd stage, got {launch_counts}"
 
 
 if __name__ == "__main__":

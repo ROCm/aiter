@@ -29,6 +29,17 @@ version below.
   FlyDSL 0.4.0 and 0.4.1, MI355X: a handle reused on a view without the
   unit-stride axis it was compiled for writes outside the view, and one reused on
   another device does not launch.
+- **AOT cache.** A launch goes through the `export_to_c` cache when its launcher
+  factory is an `aot_factory` (or its launcher is bound with `bind_aot`) and the
+  wrapper launches `factory.lazy(...)`. Every constexpr is a factory argument or
+  in `_run_compiled`'s `specialization_key`. What each cache is built from is
+  declared in one table, `aiter/aot/flydsl/sources.py`: every file the kernel's
+  code comes from (besides the common sources) and every variable those files
+  read; an edit to a file that is not declared leaves stale entries. Only a prebuild (`COMPILE_ONLY`,
+  the replays in `aiter/aot/flydsl`) builds entries; a launch with none logs an
+  error and traces on the JIT path. Follow
+  `.claude/skills/flydsl-aot-export/SKILL.md` to convert or review one;
+  `docs/flydsl_aot_cache.md` has the design.
 - **Legacy `buffer_ops`.** `aiter/ops/flydsl/kernels/buffer_ops.py` exists for
   older kernels. New code uses FlyDSL buffer tensors and `fx.copy`.
 - **Raw ops.** A raw `rocdl`, `llvm`, `arith` or inline-asm call stays only with

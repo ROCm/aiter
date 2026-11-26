@@ -39,15 +39,20 @@ __device__ __forceinline__ uint8_t f4_code(float v)
 {
     float x = fabsf(v), best = x;
     int code = 0;
-    for(int i = 1; i < 8; ++i)
-    {
-        float d = fabsf(x - f4_value(i));
-        if(d < best || (d == best && !(i & 1)))
+    // Finite values past 5 are nearest to 6.0. From 2**25 up the FP32 distances
+    // to 4.0 and 6.0 below round alike, and the even-code tie would keep 4.0.
+    if(x > 5.0f && x <= 3.40282347e38f)
+        code = 7;
+    else
+        for(int i = 1; i < 8; ++i)
         {
-            best = d;
-            code = i;
+            float d = fabsf(x - f4_value(i));
+            if(d < best || (d == best && !(i & 1)))
+            {
+                best = d;
+                code = i;
+            }
         }
-    }
     return code | ((__float_as_uint(v) >> 28) & 8);
 }
 __device__ __forceinline__ uint8_t quantize16(float (&v)[16], float gain, uint8_t (&codes)[16])

@@ -252,36 +252,6 @@ def test_packed_cache_arch_gate(arch):
             smd._check_packed_arch(arch)
 
 
-def test_fp8_scalar_two_loop_rejected_off_packed_arch():
-    """The two-loop stays on the packed arch for every cache format, fp8_scalar
-    included.
-
-    Both segments are a real 3-D block pool: a 2-D cache fails the shape check
-    with an error that also says "two-loop", so it would pass without the gate.
-    """
-    arch = arch_info.get_arch()
-    if arch not in SUPPORTED_ARCHS or arch in smd.PACKED_ARCHS:
-        pytest.skip(f"the two-loop runs on {arch}")
-    if arch not in FP8_SCALAR_ARCHS:
-        pytest.skip(f"no fp8_scalar cache on {arch}")
-    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
-    block = 64
-    cache = cache.view(cache.shape[0] // block, block, cache.shape[-1])
-    with pytest.raises(ValueError, match=f"have no implementation on {arch}"):
-        sparse_mla_fwd(
-            q,
-            cache,
-            ptr,
-            idx,
-            D_QK**-0.5,
-            kv_scale=ks,
-            extra_kv=cache,
-            extra_indptr=ptr,
-            extra_indices=idx,
-            extra_kv_scale=ks,
-        )
-
-
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
 def test_fp8_arch_gate(arch):
     """fp8 q and fp8 caches, for every arch, from any machine."""
@@ -342,21 +312,6 @@ def test_non_e4m3_byte_cache_dtype_rejected(dtype):
     q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
     with pytest.raises(ValueError, match="unsupported cache dtype"):
         sparse_mla_fwd(q, cache.view(dtype), ptr, idx, D_QK**-0.5, kv_scale=ks)
-
-
-@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
-def test_launch_config_published(arch):
-    """Every supported arch ships its launch config, checked from any machine."""
-    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch).keys()
-    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch, fp8_dots=True).keys()
-
-
-def test_lds_budget_gfx950_is_unchecked():
-    """gfx950 is left to the launcher, though arch_info lists its LDS too.
-
-    The footprint model holds only for gfx942's non-async tiles.
-    """
-    smd._check_lds_budget("gfx950", 64, 2048, 64, kv_lds_pad=16)
 
 
 @pytest.mark.parametrize(

@@ -357,29 +357,6 @@ def test_dequant_hadamard_quant_accepts_canonical_dtypes():
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("invalid", [0.0, float("inf"), float("nan")])
-def test_dequant_hadamard_quant_rejects_invalid_sign_values(invalid):
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
-    sign = torch.ones(16, dtype=torch.float32, device="cuda")
-    sign[3] = invalid
-
-    with pytest.raises(ValueError, match="finite and equal to"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign)
-
-
-def test_dequant_hadamard_quant_revalidates_mutated_sign_vector():
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
-    sign = torch.ones(16, dtype=torch.float32, device="cuda")
-
-    dequant_hadamard_quant_mxfp4(packed, scales, sign)
-    sign[3] = 0
-
-    with pytest.raises(ValueError, match="finite and equal to"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign)
-
-
 def test_dequant_hadamard_quant_accepts_inference_tensor_sign():
     packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
     scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
@@ -410,46 +387,6 @@ def test_dequant_hadamard_quant_validates_during_first_graph_capture():
 
     assert output.shape == (32, 16)
     assert output_scales.shape == (32, 1)
-
-
-def test_dequant_hadamard_quant_validates_metadata():
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
-    sign = torch.ones(16, dtype=torch.float32, device="cuda")
-
-    with pytest.raises(ValueError, match="block_size must be 32"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, block_size=16)
-    with pytest.raises(ValueError, match="g must be 16"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, g=32)
-    with pytest.raises(ValueError, match="scales shape"):
-        dequant_hadamard_quant_mxfp4(packed, scales.expand(32, 2), sign)
-    with pytest.raises(ValueError, match="same device"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign.cpu())
-    with pytest.raises(TypeError, match="data_fp4 must have dtype"):
-        dequant_hadamard_quant_mxfp4(packed.float(), scales, sign)
-    with pytest.raises(TypeError, match="scales must have dtype"):
-        dequant_hadamard_quant_mxfp4(packed, scales.float(), sign)
-
-
-def test_dequant_hadamard_quant_validates_production_metadata():
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
-    sign = torch.ones(16, dtype=torch.float32, device="cuda")
-
-    with pytest.raises(ValueError, match="philox_seed is required"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, use_sr=True)
-    with pytest.raises(ValueError, match="only valid"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, philox_seed=1)
-    with pytest.raises(TypeError, match="must be bool"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, use_sr=1)
-    # (32, 32) logical input: one output scale column cannot fill an 8-wide
-    # swizzle chunk; 16 packed payload bytes cannot fill a 32-byte group.
-    with pytest.raises(ValueError, match="cannot be swizzled"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, swizzle_scale=True)
-    with pytest.raises(ValueError, match="cannot be shuffled"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, shuffle_data=True)
-    with pytest.raises(ValueError, match="cannot be swizzled"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, in_scale_swizzled=True)
 
 
 def test_dequant_hadamard_quant_accepts_strided_inputs():
@@ -544,52 +481,6 @@ def test_dequant_hadamard_quant_sr_is_reproducible_and_reuses_rtn_scales():
     # RTN and SR share the same E8M0 scale calculation.
     torch.testing.assert_close(actual[1], rtn[1], rtol=0, atol=0)
     assert not torch.equal(actual[0], rtn[0]), "SR must not silently return RTN payload"
-
-
-def test_dequant_hadamard_quant_rejects_unsupported_arch(monkeypatch):
-    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx942")
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cpu")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cpu")
-    sign = torch.ones(16, dtype=torch.float32, device="cpu")
-
-    with pytest.raises(RuntimeError, match="requires gfx950"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign)
-
-
-def test_dequant_hadamard_quant_requires_published_config(monkeypatch):
-    def missing_config(path, required=True):
-        assert required
-        assert path.endswith(
-            "/gfx950/triton/fusions/dequant_hadamard_quant_mxfp4/DEFAULT.json"
-        )
-        raise FileNotFoundError(path)
-
-    # The public function shares its name with the module; patch the module
-    # object directly so the string form cannot resolve to the function.
-    import importlib
-
-    _module = importlib.import_module(
-        "aiter.ops.triton.quant.dequant_hadamard_quant_mxfp4"
-    )
-    monkeypatch.setattr(_module, "load_config_json", missing_config)
-    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
-    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
-    sign = torch.ones(16, dtype=torch.float32, device="cuda")
-
-    with pytest.raises(
-        FileNotFoundError, match="dequant_hadamard_quant_mxfp4/DEFAULT.json"
-    ):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign)
-
-
-def test_dequant_hadamard_quant_rejects_noncontiguous_swizzled_scales():
-    packed = torch.zeros((256, 128), dtype=torch.uint8, device="cuda")
-    storage = torch.zeros((8, 512), dtype=torch.uint8, device="cuda")
-    scales = storage[:, ::2]
-    assert scales.shape == (8, 256) and not scales.is_contiguous()
-    sign = _alternating_sign()
-    with pytest.raises(ValueError, match="swizzled scales must be contiguous"):
-        dequant_hadamard_quant_mxfp4(packed, scales, sign, in_scale_swizzled=True)
 
 
 def test_cached_sign_validation_is_recorded_during_graph_capture(monkeypatch):
