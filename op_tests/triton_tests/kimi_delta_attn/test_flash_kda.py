@@ -1185,6 +1185,14 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
 
 # State snapshots (`snapshot_targets`). Where pass C puts them is tested on the
 # CPU in `TestSnapshotMap`, at the end of this file; these run the kernel.
+# K2 tunes at run time only with CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1, and in these
+# tests only if AITER_UT_TRITON_AUTOTUNE=1 also lifts the one-config pin of
+# op_tests/triton_tests/__init__.py. It then benchmarks trial configs on the
+# first call of a new specialization, so with the first flag set the bitwise
+# comparisons below are made on a second call. Otherwise K2 runs one config and
+# tunes nothing, as in CI, and one call is enough.
+_K2_TUNES = _flash_kda.CHUNK_DELTA_ATTN_TRITON_AUTOTUNE
+_SETTLING_CALLS = 2 if _K2_TUNES else 1
 
 
 def _interior_targets(lens, every=1):
@@ -1241,17 +1249,21 @@ def test_snapshots_are_the_states_of_their_prefixes(
         assert rel_err(snaps[i], gold[0]) < 2e-2, (n, off)
         if chunks_per_seg == 0:
             # The same Triton K2 walk that ends at `off`, its state cast to
-            # `snap_dtype`. The two calls have separate tuned K2 configs, and
-            # different tiles round differently, so this allows for rounding
-            # instead of asserting bit equality.
+            # `snap_dtype`. With one K2 config both calls run the same tile, so
+            # an fp32 snapshot holds that state bit for bit. A tuning build can
+            # give the two calls different tiles, which round differently.
             with _route(k2=False):
-                _, ht = run_flash(
+                _, ht_head = run_flash(
                     *head,
                     output_final_state=True,
                     state_v_first=state_v_first,
                     chunks_per_seg=0,
                 )
-            assert rel_err(snaps[i], ht[0].to(snap_dtype)) < 1e-4, (n, off)
+            want = ht_head[0].to(snap_dtype)
+            if snap_dtype == torch.float32 and not _K2_TUNES:
+                assert torch.equal(snaps[i], want), (n, off)
+            else:
+                assert rel_err(snaps[i], want) < 1e-4, (n, off)
 
 
 @pytest.mark.parametrize("state_v_first", [False, True])
@@ -1262,7 +1274,7 @@ def test_snapshots_leave_the_forward_unchanged(state_v_first):
     kw = {"state_v_first": state_v_first, "cu_seqlens": _varlen(lens)}
     targets = _interior_targets(lens, every=2)
     with _route(k2=False):
-        for _ in range(2):  # the second call of each runs a settled config
+        for _ in range(_SETTLING_CALLS):
             o_ref, ht_ref = run_flash(*args, output_final_state=True, **kw)
             o, ht, _snaps = _snapshot_run(args, targets, **kw)
     assert torch.equal(o, o_ref)
@@ -1300,7 +1312,7 @@ def test_paged_snapshots_match_dense(chunks_per_seg):
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
     }
-    for _ in range(2):  # the first call of a new specialization autotunes
+    for _ in range(_SETTLING_CALLS):
         _o, _ht, dense = _snapshot_run(args, targets, initial_state=h0, **kw)
         cache[indices] = h0
         _o, _ht, from_cache = _snapshot_run(
@@ -1316,7 +1328,7 @@ def test_snapshot_table_survives_graph_replay():
     graph's pool."""
     args = make_inputs(1, 512, 4)
     targets = ((0, 128), (0, 320), (0, 480))
-    for _ in range(2):  # the first call of a new specialization autotunes
+    for _ in range(_SETTLING_CALLS):
         _o, _ht, ref = _snapshot_run(args, targets)
     snaps = torch.full_like(ref, float("nan"))
     seqs = ((0, 512),)
@@ -1352,11 +1364,14 @@ def test_snapshot_table_survives_graph_replay():
 
 
 def test_no_targets_take_no_snapshot_path(monkeypatch):
+    """``snapshot_targets=()`` builds no table and leaves ``snapshot_out`` alone."""
+
     def refuse(*args, **kwargs):
         raise AssertionError("an empty target list built a snapshot map")
 
     monkeypatch.setattr(_flash_kda, "_build_snapshots", refuse)
     args = make_inputs(1, 256, 4)
+    unused = torch.full((1, 4, K_DIM, K_DIM), float("nan"), device=device)
     with _route(k2=False):
         o_ref, ht_ref = run_flash(*args, output_final_state=True)
         o, ht = flash_kda_fwd(
@@ -1364,10 +1379,11 @@ def test_no_targets_take_no_snapshot_path(monkeypatch):
             lower_bound=LOWER_BOUND,
             output_final_state=True,
             snapshot_targets=(),
-            snapshot_out=None,
+            snapshot_out=unused,
         )
     assert torch.equal(o, o_ref)
     assert torch.equal(ht, ht_ref)
+    assert torch.isnan(unused).all()
 
 
 def test_snapshot_out_must_be_contiguous():
@@ -1564,7 +1580,7 @@ class TestSnapshotMap:
             [(0, 128)],  # past the end
             [(1, 32)],  # a 20-token sequence has no interior boundary
             [(2, 32)],  # no such sequence
-            [(-1, 32)],
+            [(-2, 32)],  # nor a negative one: it must not wrap to sequence 0
             [(0, 32), (0, 64), (0, 32)],  # the same position twice
         ],
     )
