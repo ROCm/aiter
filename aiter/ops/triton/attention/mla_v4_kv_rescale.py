@@ -111,7 +111,6 @@ def rebase_kv_nope_to_dblock_scale(
     return exps
 
 
-
 def fold_rope_into_nope(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> None:
     """Pack the fp8 RoPE tail into the NoPE row's trailing slots, in place.
 
