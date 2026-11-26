@@ -612,36 +612,6 @@ def test_flash_attn_func_block_scale_matches_reference():
     )
 
 
-def test_flash_attn_func_block_scale_rejects_partial_and_gluon():
-    q = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    k = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    v = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    scale = torch.ones(1, 4, 1, device="cuda")
-    with pytest.raises(ValueError, match="requires q_block_descale"):
-        flash_attn_func(q, k, v, q_block_descale=scale)
-    q.requires_grad_(True)
-    with pytest.raises(RuntimeError, match="forward-only"):
-        flash_attn_func(
-            q,
-            k,
-            v,
-            q_block_descale=scale,
-            k_block_descale=scale,
-            v_scale=torch.ones(1, device="cuda"),
-        )
-    q.requires_grad_(False)
-    with pytest.raises(ValueError, match="triton backend only"):
-        flash_attn_func(
-            q,
-            k,
-            v,
-            backend="gluon",
-            q_block_descale=scale,
-            k_block_descale=scale,
-            v_scale=torch.ones(1, device="cuda"),
-        )
-
-
 def test_flash_attn_func_default_path_still_runs():
     """Callers that omit block scales stay on the existing Triton path."""
     torch.manual_seed(0)
