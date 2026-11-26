@@ -38,6 +38,75 @@ from .linear_attention_prefill_kernels import (
     _resolve_prologue,
 )
 
+# Tunables, by name: ``k5_bv`` -- the K5 recurrence's V block (16 / 32 / 64);
+# ``diag_mfma`` -- the intra diagonal tiles on MFMA (only honoured for the
+# ``lower_bound`` gate, whose bounded decay it needs).
+TUNABLES = {"k5_bv": (16, 32, 64), "diag_mfma": (False, True)}
+_TUNED_TABLE = None
+
+
+def _truthy(x) -> bool:
+    return str(x).strip().lower() in ("1", "true")
+
+
+def _load_tuned_table() -> dict:
+    """``(gfx, cu_num, H, T, N, is_varlen, lower_bound_gate) -> config``.
+
+    Merged from ``aiter/configs/kda_chunk_fwd_flydsl_tuned.csv`` and every
+    ``model_configs/*kda_chunk_fwd_flydsl_tuned*.csv``. A missing or bad file
+    means no tuned rows, and every call uses ``default_config``.
+    """
+    import pandas as pd
+
+    from aiter.jit.core import AITER_CONFIGS
+
+    table = {}
+    try:
+        df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_KDA_CHUNK_FWD_FLYDSL_FILE)
+        for row in df.to_dict("records"):
+            key = (
+                str(row["gfx"]).strip(),
+                int(row["cu_num"]),
+                int(row["H"]),
+                int(row["T"]),
+                int(row["N"]),
+                _truthy(row["is_varlen"]),
+                _truthy(row["lower_bound_gate"]),
+            )
+            table[key] = {
+                "k5_bv": int(row["k5_bv"]),
+                "diag_mfma": _truthy(row["diag_mfma"]),
+            }
+    except (OSError, KeyError, ValueError, RuntimeError):
+        return {}
+    return table
+
+
+def reload_tuned_table() -> None:
+    """Re-read the tuned CSVs, e.g. after ``AITER_CONFIG_KDA_CHUNK_FWD_FLYDSL`` changes."""
+    global _TUNED_TABLE
+    _TUNED_TABLE = None
+
+
+def default_config(*, H, total_chunks, max_seq_chunks, lower_bound_gate, device):
+    return {
+        "k5_bv": _hipeq_select_bv(device, H, total_chunks, max_seq_chunks),
+        "diag_mfma": bool(lower_bound_gate),
+    }
+
+
+def lookup_config(*, H, T, N, is_varlen, lower_bound_gate):
+    """The tuned config of this shape on this GPU, or ``None``."""
+    global _TUNED_TABLE
+    if _TUNED_TABLE is None:
+        _TUNED_TABLE = _load_tuned_table()
+    if not _TUNED_TABLE:
+        return None
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+    key = (get_gfx_runtime(), get_cu_num(), H, T, N, is_varlen, lower_bound_gate)
+    return _TUNED_TABLE.get(key)
+
 
 def kda_fwd_flydsl_supported(
     *, H: int, HV: int, K: int, V: int, chunk_size, dtype, is_varlen: bool = False
@@ -121,6 +190,7 @@ def chunk_kda_fwd_prepare_flydsl(
     chunk_indices=None,
     safe_gate=False,
     disable_recompute=True,
+    diag_mfma=None,
 ):
     """``(q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk)``, as the Triton prepare.
 
@@ -173,7 +243,9 @@ def chunk_kda_fwd_prepare_flydsl(
             varlen,
             # The lower_bound gate bounds the per-token decay, which the MFMA
             # diagonal tiles need; any other gate keeps them in fp32.
-            use_gate_in_kernel and lower_bound is not None,
+            use_gate_in_kernel
+            and lower_bound is not None
+            and (diag_mfma is None or bool(diag_mfma)),
             g.dtype,
             use_gate_in_kernel,
             use_bias,
@@ -218,6 +290,7 @@ def kda_fwd_h_flydsl(
     state_v_first,
     cu_seqlens=None,
     chunks=None,
+    bv=None,
 ):
     """K5 recurrence: ``h``, ``v_new [B, H, T, V]`` and the final state.
 
@@ -241,7 +314,9 @@ def kda_fwd_h_flydsl(
             h0 = h0.transpose(-1, -2)
         h0 = h0.contiguous()
     total_chunks = chunks.NT if chunks.varlen else B * chunks.NT
-    BV = _hipeq_select_bv(kg.device, H, total_chunks, chunks.max_seq_chunks)
+    BV = bv or _hipeq_select_bv(kg.device, H, total_chunks, chunks.max_seq_chunks)
+    if BV not in TUNABLES["k5_bv"]:
+        raise ValueError(f"k5_bv must be one of {TUNABLES['k5_bv']}, got {BV}.")
     launch_fn = _get_or_compile_opt(
         K,
         V,
@@ -315,8 +390,12 @@ def chunk_kda_fwd_flydsl(
     output_final_state=False,
     state_v_first=False,
     cu_seqlens=None,
+    config=None,
 ):
     """FlyDSL KDA chunk forward: ``(o, final_state)``.
+
+    ``config`` (``{"k5_bv": ..., "diag_mfma": ...}``, see ``TUNABLES``)
+    overrides the tuned-CSV lookup, which falls back to ``default_config``.
 
     q, k, g ``[B, T, H, 128]``; v ``[B, T, H, 128]``; beta ``[B, T, H]``; all
     token-major, same flags as ``chunk_kimi_delta_attn``. With ``cu_seqlens``
@@ -347,6 +426,19 @@ def chunk_kda_fwd_flydsl(
     # The kernels index token-major [B, T, H, D]; channel-major views (a
     # fused layer's projections) must be packed first.
     q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    lb_gate = bool(use_gate_in_kernel and lower_bound is not None)
+    if config is None:
+        config = lookup_config(
+            H=H, T=T, N=chunks.N, is_varlen=chunks.varlen, lower_bound_gate=lb_gate
+        )
+    if config is None:
+        config = default_config(
+            H=H,
+            total_chunks=chunks.NT if chunks.varlen else B * chunks.NT,
+            max_seq_chunks=chunks.max_seq_chunks,
+            lower_bound_gate=lb_gate,
+            device=q.device,
+        )
 
     *_, gc, w, u, qg, kg, Aqk, _ = chunk_kda_fwd_prepare_flydsl(
         q,
@@ -363,6 +455,7 @@ def chunk_kda_fwd_flydsl(
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         store_qkb=False,
         chunks=chunks,
+        diag_mfma=config.get("diag_mfma"),
     )
     h, v_new, fs = kda_fwd_h_flydsl(
         kg,
@@ -373,6 +466,7 @@ def chunk_kda_fwd_flydsl(
         output_final_state,
         state_v_first,
         chunks=chunks,
+        bv=config.get("k5_bv"),
     )
     # Not empty_like(v): a permuted v view would hand the kernel its strides.
     o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
