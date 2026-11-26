@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.mxfp8_decode_gemm_gfx1250 import (
     mxfp8_decode_gemm,
@@ -54,12 +55,18 @@ def main():
         return
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", type=int, nargs="*", default=[1, 8, 16, 24, 33, 64, 128])
-    ap.add_argument("-nk", type=int, nargs=2, default=[6144, 2048])
+    ap.add_argument(
+        "-nk", type=dtypes.str2tuple, nargs="*", default=[(6144, 2048), (2304, 6144)]
+    )
     args = ap.parse_args()
-    n, k = args.nk
-    ms = [m for m in args.m if mxfp8_decode_gemm_supported(m, n, k)]
-    assert ms, "no M is served by mxfp8_decode_gemm"
-    df = pd.DataFrame([test_mxfp8_decode_gemm(m, n, k) for m in ms])
+    shapes = [
+        (m, n, k)
+        for n, k in args.nk
+        for m in args.m
+        if mxfp8_decode_gemm_supported(m, n, k)
+    ]
+    assert shapes, "no shape is served by mxfp8_decode_gemm"
+    df = pd.DataFrame([test_mxfp8_decode_gemm(*mnk) for mnk in shapes])
     aiter.logger.info("mxfp8_decode_gemm:\n%s", df.to_markdown(index=False))
 
 
