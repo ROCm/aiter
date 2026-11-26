@@ -96,6 +96,8 @@ def chain_shape_error(nq, nkv, niq, head_dim, rot, k_dim):
 def chain_config_error(k_dim, tile_m, ns, ks, kw, wm, wn, depth, astage=1):
     steps_total = k_dim // WMMA_K
     nb = D // 16  # 16-column blocks of a head
+    if min(tile_m, ns, ks, kw, wm, wn) < 1:
+        return "tile_m, ns, ks, kw, wm and wn must be >= 1"
     if nb % ns or ns * ks > 16 or ns * ks < 2:
         return f"ns={ns} x ks={ks} must be a 2..16 cluster, ns dividing {nb}"
     if steps_total % (ks * kw):
