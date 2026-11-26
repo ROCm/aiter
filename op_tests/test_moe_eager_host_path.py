@@ -21,6 +21,7 @@ import argparse
 import contextlib
 import dataclasses
 import itertools
+import os
 import threading
 import time
 from unittest import mock
@@ -162,10 +163,18 @@ def _original_path():
     return mock.patch.object(fm, "_plain_eager", lambda *t: False)
 
 
+def _plan_check(enabled):
+    return mock.patch.dict(os.environ, {"AITER_MOE_PLAN_CHECK": str(int(enabled))})
+
+
+def _checking_plan():
+    return os.environ.get("AITER_MOE_PLAN_CHECK", "0") == "1"
+
+
 @contextlib.contextmanager
 def _resolutions():
     """Yields a list that gets one entry per call that resolves a plan (a cache
-    hit resolves nothing)."""
+    hit resolves again when CHECK=1)."""
     calls = []
     original = fm.resolve_activation_dtype
 
@@ -219,7 +228,7 @@ def test_fused_moe_host_path(quant_type, tokens, ep, pad):
         # another shape in between: a different shape resolves another plan
         _call(quant_type, *_routes(37, ep, seed=1))
         hit = run().clone()
-    assert len(resolved) == 1  # the 37-token call resolved; the repeat did not
+    assert len(resolved) == 1 + int(_checking_plan())
     torch.cuda.synchronize()
     assert torch.equal(miss[:rows], ref[:rows])
     assert torch.equal(hit[:rows], ref[:rows])
@@ -240,7 +249,8 @@ def test_fused_moe_host_path(quant_type, tokens, ep, pad):
     # Names instead of the enum's int and pandas' NaN in the table.
     ret = {"quant_type": str(quant_type), "pad": str(pad), "gfx": get_gfx_runtime()}
     for name, path in (("op", _original_path), ("eager", contextlib.nullcontext)):
-        with path():
+        # Correctness above checks fresh plans. Timings measure production hits.
+        with path(), _plan_check(False):
             out, us = run_perftest(run)
             host_us = _host_us(run)
         err = _row_err(out[:rows], expected)
@@ -268,10 +278,10 @@ def test_plan_key_separates_what_resolution_reads():
     with _resolutions() as resolved:
         _call(qt, x, w, ids, mask, ntok=300)
         _call(qt, x, w, ids, None)
-        assert not resolved
+        assert len(resolved) == 2 * int(_checking_plan())
         out = torch.empty_like(x)
         assert _call(qt, x, w, ids, mask, output=out) is out
-        assert not resolved  # a caller output is checked per call, not keyed
+        assert len(resolved) == 3 * int(_checking_plan())
 
 
 def test_plan_cache_is_bounded():
@@ -282,6 +292,74 @@ def test_plan_cache_is_bounded():
             x, w, ids, mask = _routes(M, False, seed=M)
             _call(qt, x, w, ids, mask)
     assert len(fm._MOE_PLANS) == 1
+
+
+def test_unchecked_hit_skips_resolution():
+    _fresh()
+    inputs = _routes(300, True, seed=61)
+    with _plan_check(False), _resolutions() as resolved:
+        ref = _call(QuantType.per_Token, *inputs).clone()
+        hit = _call(QuantType.per_Token, *inputs)
+    assert len(resolved) == 1
+    assert torch.equal(hit, ref)
+
+
+def test_dynamic_plan_cache_disable():
+    _fresh()
+    inputs = _routes(300, True, seed=62)
+    ref = _call(QuantType.per_Token, *inputs).clone()
+    plans = dict(fm._MOE_PLANS)
+    assert len(plans) == 1
+    with mock.patch.dict(os.environ, {"AITER_MOE_PLAN_CACHE": "0"}):
+        with _resolutions() as resolved:
+            for _ in range(2):
+                assert torch.equal(_call(QuantType.per_Token, *inputs), ref)
+        assert len(resolved) == 2
+        assert fm._MOE_PLANS == plans
+    with _plan_check(False), _resolutions() as resolved:
+        assert torch.equal(_call(QuantType.per_Token, *inputs), ref)
+    assert not resolved
+
+
+def test_checked_hit_runs_once_and_mismatch_never_runs():
+    _fresh()
+    inputs = _routes(300, True, seed=63)
+    ref = _call(QuantType.per_Token, *inputs).clone()
+    ((key, plan),) = fm._MOE_PLANS.items()
+    with _plan_check(True):
+        with mock.patch.object(fm, "_fused_moe_run", wraps=fm._fused_moe_run) as run:
+            assert torch.equal(_call(QuantType.per_Token, *inputs), ref)
+            assert run.call_count == 1
+        poisoned = plan._replace(model_dim=plan.model_dim + 1)
+        fm._MOE_PLANS[key] = poisoned
+        try:
+            with mock.patch.object(
+                fm, "_fused_moe_run", side_effect=AssertionError("unexpected launch")
+            ):
+                try:
+                    _call(QuantType.per_Token, *inputs)
+                except RuntimeError as exc:
+                    assert "model_dim" in str(exc) and repr(key) in str(exc)
+                else:
+                    raise AssertionError("a poisoned plan was accepted")
+            assert fm._MOE_PLANS[key] is poisoned
+        finally:
+            fm._MOE_PLANS[key] = plan
+
+
+def test_profiler_keeps_one_fused_moe_event():
+    inputs = _routes(300, True, seed=64)
+    for path in (contextlib.nullcontext, _original_path):
+        with path():
+            _call(QuantType.per_Token, *inputs)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as prof:
+                _call(QuantType.per_Token, *inputs)
+                torch.cuda.synchronize()
+        events = [e for e in prof.events() if e.name == "aiter::fused_moe_"]
+        assert len(events) == 1, [e.name for e in prof.events()]
 
 
 def test_wrapped_get_2stage_cfgs_is_asked_every_call():
@@ -303,8 +381,8 @@ def test_wrapped_get_2stage_cfgs_is_asked_every_call():
         for _ in range(3):
             assert _stage_names(lambda: _call(qt, x, w, ids, mask)) == ["stage1"]
     # The first call finds the cached plan stale (one lookup) and resolves
-    # again (another); the next two reuse the new plan after one lookup each.
-    assert len(tokens_asked) == 4
+    # again (another); verified hits additionally resolve from current inputs.
+    assert len(tokens_asked) == 4 + 2 * int(_checking_plan())
     assert _stage_names(lambda: _call(qt, x, w, ids, mask)) == ["stage1", "stage2"]
 
     # A wrapper that builds a new config object per call is never served a plan.
@@ -347,7 +425,7 @@ def test_swiglu_limit_calls_resolve_every_time():
     with _resolutions() as resolved:
         outs = [_call(qt, x, w, ids, mask, swiglu_limit=7.0) for _ in range(2)]
     if fm._MOE_PLANS:  # a 2-stage row took the clamp: the second call hit
-        assert len(resolved) == 1
+        assert len(resolved) == 1 + int(_checking_plan())
     else:
         assert len(resolved) == 2
     torch.cuda.synchronize()
@@ -750,6 +828,10 @@ def main():
         test_row_err,
         test_plan_key_separates_what_resolution_reads,
         test_plan_cache_is_bounded,
+        test_unchecked_hit_skips_resolution,
+        test_dynamic_plan_cache_disable,
+        test_checked_hit_runs_once_and_mismatch_never_runs,
+        test_profiler_keeps_one_fused_moe_event,
         test_wrapped_get_2stage_cfgs_is_asked_every_call,
         test_get_2stage_cfgs_cache_clear_is_honored,
         test_swiglu_limit_calls_resolve_every_time,
@@ -764,7 +846,8 @@ def main():
         test_workspace_size_is_the_ops,
     ]
     for check in checks:
-        check()
+        with _plan_check(True):
+            check()
         aiter.logger.info("fused_moe eager host path: %s passed", check.__name__)
 
     df = []
@@ -773,7 +856,8 @@ def main():
         if quant_type == QuantType.per_Tensor and pad is not None:
             # per_tensor_quant_hip takes no num_rows (num_local_tokens).
             continue
-        df.append(test_fused_moe_host_path(*case))
+        with _plan_check(True):
+            df.append(test_fused_moe_host_path(*case))
     df = pd.DataFrame(df)
     aiter.logger.info(
         "fused_moe eager host path summary (markdown):\n%s",

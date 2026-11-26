@@ -631,7 +631,17 @@ def _plain_eager(x, *tensors):
 
 def _op_or_eager_body(op, x, *tensors):
     """Keep the custom op where a tracer, mode or tensor subclass handles it."""
-    return getattr(op, "_eager_body", op) if _plain_eager(x, *tensors) else op
+    body = getattr(op, "_eager_body", op) if _plain_eager(x, *tensors) else op
+    if body is op or not torch.autograd._profiler_enabled():
+        return body
+
+    # The dispatcher supplies this event itself. Only the direct eager body
+    # needs a scope, and an unprofiled call creates neither a scope nor a wrapper.
+    def profiled(*args, **kwargs):
+        with torch.profiler.record_function("aiter::fused_moe_"):
+            return body(*args, **kwargs)
+
+    return profiled
 
 
 @drop_presort_after
@@ -1311,11 +1321,58 @@ _MOE_PLANS: dict = {}
 _MOE_PLANS_MAX = 1024
 
 
+def _prepare_moe_input(
+    hidden_states, output=None, shape=None, dtype=None, *, validate=True, finalize=False
+):
+    """Per-call checks shared by resolution and cached plans.
+
+    Resolution validates first, then finalizes after inline-sort eligibility is
+    known. Cached plans exclude inline sort and do both in one call. Preserve
+    copy-before-overlap for non-row-major input, and overlap-before-final-copy
+    for row-major views.
+    """
+    if validate:
+        if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
+            hidden_states = hidden_states.contiguous()
+        _validate_output_buffer_metadata(output, shape, dtype, hidden_states.device)
+        _validate_output_buffer_no_overlap(output, hidden_states)
+    if finalize and not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    return hidden_states
+
+
+def _check_moe_plan(plan_key, cached, fresh):
+    differing = [
+        name
+        for name in _MoePlan._fields
+        if (
+            getattr(cached, name) is not getattr(fresh, name)
+            if name in ("metadata", "stage1_func")
+            else getattr(cached, name) != getattr(fresh, name)
+        )
+    ]
+    if differing:
+        raise RuntimeError(
+            f"MoE plan mismatch for key {plan_key!r}: {', '.join(differing)}"
+        )
+
+
+def _check_moe_plan_route(plan_key, checked_plan, route):
+    if checked_plan is not None:
+        raise RuntimeError(f"MoE plan mismatch for key {plan_key!r}: route {route}")
+
+
 # NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic: the
 # validation and derived values, the get_2stage_cfgs key and the launches, in
 # aiter/moev2/execute/executor.py (prologue, run_two_stage, run_whole_graph) and
 # aiter/moev2/api.py (dispatch_key). Mirror changes there or coordinate with the moev2
 # owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
+# When resolution changes, update plan_key, cache eligibility/store conditions,
+# and the hit path together. Keep the parameter partition in
+# tests/test_moe_plan_cache.py complete and run its signature/control-flow checks
+# plus MoE correctness with AITER_MOE_PLAN_CHECK=1. That mode resolves each valid
+# hit afresh and checks every plan field before execution. AITER_MOE_PLAN_CACHE=0
+# dynamically disables both cache reads and stores (including key construction).
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1369,10 +1426,13 @@ def _fused_moe_impl(
     # Everything resolved below, up to the sort, follows from these, so a call
     # can take the plan of an earlier one with the same key.
     plan_key = None
+    checked_plan = None
     if (
-        presorted_aux is None
+        os.environ.get("AITER_MOE_PLAN_CACHE", "1") != "0"
+        and presorted_aux is None
         and not deterministic
         and not herd_topk
+        and not splitk
         and stage2_scatter is None
         and _q_dtype_a is None
         and _metadata_transform is None
@@ -1441,41 +1501,41 @@ def _fused_moe_impl(
             plan is not None
             and get_2stage_cfgs(*plan.cfg_args, **plan.cfg_kwargs) is plan.metadata
         ):
-            # The per-call steps of the resolution below, in its order.
-            if not hidden_states.is_contiguous() and not _is_row_major_2d(
-                hidden_states
-            ):
-                hidden_states = hidden_states.contiguous()
-            if output is not None:
-                _validate_output_buffer_metadata(
-                    output, (plan.M, plan.model_dim), plan.dtype, hidden_states.device
+            if os.environ.get("AITER_MOE_PLAN_CHECK", "0") == "1":
+                # Fall through with this call's untouched inputs. Do not prepare
+                # twice, recurse, or run a reference MoE to validate the plan.
+                checked_plan = plan
+            else:
+                hidden_states = _prepare_moe_input(
+                    hidden_states,
+                    output,
+                    (plan.M, plan.model_dim),
+                    plan.dtype,
+                    finalize=True,
                 )
-                _validate_output_buffer_no_overlap(output, hidden_states)
-            if not hidden_states.is_contiguous():
-                hidden_states = hidden_states.contiguous()
-            return _fused_moe_run(
-                plan,
-                hidden_states,
-                w1,
-                w2,
-                topk_weight,
-                topk_ids,
-                expert_mask,
-                doweight_stage1,
-                w1_scale,
-                w2_scale,
-                a1_scale,
-                a2_scale,
-                num_local_tokens,
-                moe_sorting_dispatch_policy,
-                hidden_pad,
-                intermediate_pad,
-                bias1,
-                bias2,
-                beta,
-                linear_beta,
-                output,
-            )
+                return _fused_moe_run(
+                    plan,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weight,
+                    topk_ids,
+                    expert_mask,
+                    doweight_stage1,
+                    w1_scale,
+                    w2_scale,
+                    a1_scale,
+                    a2_scale,
+                    num_local_tokens,
+                    moe_sorting_dispatch_policy,
+                    hidden_pad,
+                    intermediate_pad,
+                    bias1,
+                    bias2,
+                    beta,
+                    linear_beta,
+                    output,
+                )
     # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
     # pybind enum comparisons are much slower than int compares.
     silu_limit = (
@@ -1529,8 +1589,6 @@ def _fused_moe_impl(
         topk = herd_topk
     config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
-        hidden_states = hidden_states.contiguous()
 
     assert w1.shape[1] in [
         inter_dim,
@@ -1563,10 +1621,7 @@ def _fused_moe_impl(
             "route-weighted results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
-    _validate_output_buffer_metadata(
-        output, (M, model_dim), dtype, hidden_states.device
-    )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    hidden_states = _prepare_moe_input(hidden_states, output, (M, model_dim), dtype)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     if (w1_global_scale is not None or w2_global_scale is not None) and (
@@ -1651,6 +1706,7 @@ def _fused_moe_impl(
     # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
     # weights fall through to the generic MoE below.
     if gate_mode == GateMode.INTERLEAVE:
+        _check_moe_plan_route(plan_key, checked_plan, "grouped_gemm_gfx1250_a8w4")
         grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
             hidden_states,
             w1,
@@ -1725,6 +1781,7 @@ def _fused_moe_impl(
         stage2_scatter=stage2_scatter,
         splitk=splitk,
     ):
+        _check_moe_plan_route(plan_key, checked_plan, "gfx1201_small_m_direct")
         return fused_moe_g1u1_bf16_small_m_direct(
             hidden_states,
             w1,
@@ -1919,8 +1976,9 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
-    if not use_inline_sort and not hidden_states.is_contiguous():
-        hidden_states = hidden_states.contiguous()
+    hidden_states = _prepare_moe_input(
+        hidden_states, validate=False, finalize=not use_inline_sort
+    )
 
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
@@ -1969,6 +2027,7 @@ def _fused_moe_impl(
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
+        _check_moe_plan_route(plan_key, checked_plan, "metadata.full_impl")
         request = FusedMoeRequest(
             hidden_states=hidden_states,
             w1=w1,
@@ -2051,6 +2110,8 @@ def _fused_moe_impl(
         stage1_func,
         need_local_topk_ids,
     )
+    if checked_plan is not None:
+        _check_moe_plan(plan_key, checked_plan, plan)
     # Kept only where the plan is a function of plan_key: one plain config
     # lookup, and none of the paths that decide per call -- the gfx1201
     # small-M direct path (on arguments the key leaves out), the gfx1250
