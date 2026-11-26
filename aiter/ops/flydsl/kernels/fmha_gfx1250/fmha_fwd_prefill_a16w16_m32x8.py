@@ -1453,12 +1453,30 @@ def _attention_core_multi_kv_tiles(
     d_tiles = v_hdim // WMMA_M
     num_q_tiles = num_q_tiles_per_wave
     num_kv_frags = n_block // WMMA_N
-    # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. The lagging half
-    # carries the f32 s_acc in the P slots instead of bf16 P; the slot count is the same.
+    # Compile-time class. The gemm issues one wmma per fragment per q-tile: PV over
+    # d_tiles x num_contract_tiles, QK over num_kv_frags x num_k_tiles. At or below the
+    # threshold the body is paced by softmax rather than the wmma stream, so the
+    # orderings that keep that stream clean are not worth their register cost.
+    _wmma_per_kv_tile = num_q_tiles * (
+        d_tiles * (n_block // (v_mgr.loads_per_frag * WMMA_N))
+        + num_kv_frags * (qk_hdim // WMMA_K)
+    )
+    # Against the KV block width: above it the wmma stream paces the body, at or below
+    # it softmax does. qk_hdim and n_block move oppositely (pick_n_block), so this
+    # compares the two gemms' work with the block they contract over, not with a
+    # constant. The leading half's narrow carry and the head orderings ride on it.
+    _is_wmma_bound = _wmma_per_kv_tile > n_block
+    # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. The leading half
+    # carries P already narrowed to elem_dtype; the lagging half carries the f32 s_acc in
+    # those slots instead. Same slot count, different width -- each half is traced on its
+    # own, so the two cores' iter_arg types need not agree.
     # O travels the back edge as ONE tuple (see _o_pack); the P slots do not, because the
     # gemm ring produces and consumes them one at a time.
     _q_state_slots = 2 + 1 + num_kv_frags
     _is_lagging_softmax = not warp_type.is_lo
+    # Only a wmma-paced leading half carries P already narrowed; everything else keeps
+    # the f32 carry and narrows at the top of the consuming body.
+    _carry_narrow = _is_wmma_bound and not _is_lagging_softmax
     if _is_lagging_softmax:
         # Barrier-count filler: re-pairs the two halves' barrier streams.
         _copy_fence(*_kv_drain)
@@ -1483,9 +1501,9 @@ def _attention_core_multi_kv_tiles(
             + [_raw(fx.full(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
-                    fx.full(
-                        8, float("-inf") if _is_lagging_softmax else 0.0, fx.Float32
-                    )
+                    fx.full(8, float("-inf"), fx.Float32)
+                    if _is_lagging_softmax
+                    else fx.full(8, 0.0, elem_dtype if _carry_narrow else fx.Float32)
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1520,6 +1538,9 @@ def _attention_core_multi_kv_tiles(
     # The lagging half opens its body with softmax, so its ring head is issued there and
     # consumed after the barrier -- within one body, nothing to carry.
     # The carry is issued a body early, where only V is resident, so it cannot run past V.
+    # wmma-bound: the leading half stops carrying its ring head, so the head is issued
+    # after the latch (top of the next body) instead of ahead of it, and its ds_loads no
+    # longer land in the tail of a body that is still draining its wmma stream.
     _num_head_carry = (
         0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch, _num_vld)
     )
@@ -1831,14 +1852,20 @@ def _attention_core_multi_kv_tiles(
             # A USE anchors; sched_barrier does not.
             _keepalive(v_curr + k_curr)
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
-            # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
-            # issuing it first puts the conversion in its shadow rather than behind it.
-            pvqk_head = _pvqk_head()
-            p_list = _convert_vectors(p_f32, elem_dtype)
-            # Anchor the conversion in THIS block. Its only real use is past the barrier,
-            # so MachineSink (which ignores sched_barrier) would otherwise sink every
-            # v_cvt_pk_bf16_f32 into the gemm and interleave it with the WMMA.
-            _keepalive([v for pt in p_list for v in pt])
+            # softmax-paced: head first, so the narrowing runs in its shadow rather
+            # than behind it. wmma-paced: narrow first, so the head's ds_loads are the
+            # last thing before the barrier and do not sit across the v_cvt run.
+            if _is_wmma_bound:
+                p_list = _convert_vectors(p_f32, elem_dtype)
+                _keepalive([v for pt in p_list for v in pt])
+                pvqk_head = _pvqk_head()
+            else:
+                pvqk_head = _pvqk_head()
+                p_list = _convert_vectors(p_f32, elem_dtype)
+                # Anchor the conversion in THIS block. Its only real use is past the
+                # barrier, so MachineSink (which ignores sched_barrier) would otherwise
+                # sink every v_cvt_pk_bf16_f32 into the gemm and interleave it with WMMA.
+                _keepalive([v for pt in p_list for v in pt])
             _phase_barrier()
             o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
@@ -1863,11 +1890,13 @@ def _attention_core_multi_kv_tiles(
             # here the conversion covers the address latency instead. A USE anchors;
             # sched_barrier does not.
             _keepalive(v_curr + k_curr)
-            # Past the latch: the carry crosses the back edge as f32, so the exit test
-            # sits between the producing softmax and this narrowing. _keepalive anchors
-            # it ahead of the drain -- MachineSink would otherwise push it into the gemm.
-            carry_prev = _convert_vectors(carry_prev, elem_dtype)
-            _keepalive([v for pt in carry_prev for v in pt])
+            if not _carry_narrow:
+                # Past the latch: the carry crosses the back edge as f32, so the exit
+                # test sits between the producing softmax and this narrowing. _keepalive
+                # anchors it ahead of the drain -- MachineSink would otherwise push it
+                # into the gemm.
+                carry_prev = _convert_vectors(carry_prev, elem_dtype)
+                _keepalive([v for pt in carry_prev for v in pt])
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
@@ -1899,15 +1928,23 @@ def _attention_core_multi_kv_tiles(
             carry_f32, m_new_list, d_new_list, o_out = _softmax_phase(
                 s_list, o_acc, anchor=kv_state_next
             )
-            # Next body's ring head: V(tile_idx) from the slot this body read K from, resident
-            # and already fenced. Mirrors the lagging half -- both issue the head just
-            # before the barrier preceding the gemm that consumes it, ahead of the
-            # narrowing for the same reason.
-            _v_next = v_mgr.ds_ptrs_from_addrs(_vaddr_gen[1])
-            head_next = _issue_head(
-                lambda j: v_mgr.load_one_to_reg(_v_next, j), 0, _num_head_carry
-            )
-            carry_next = carry_f32
+            if _carry_narrow:
+                # Narrow P here and carry bf16 over the back edge. _keepalive anchors it
+                # in THIS block -- its only use is past the edge, so MachineSink would
+                # push it into the next body's gemm.
+                carry_next = _convert_vectors(carry_f32, elem_dtype)
+                _keepalive([v for pt in carry_next for v in pt])
+            else:
+                carry_next = carry_f32
+            # Next body's ring head, issued here only when it is carried. wmma-bound
+            # drops the carry (_num_head_carry == 0) so the head lands after the latch,
+            # at the top of the next body, instead of in this body's tail.
+            head_next = []
+            if _num_head_carry:
+                _v_next = v_mgr.ds_ptrs_from_addrs(_vaddr_gen[1])
+                head_next = _issue_head(
+                    lambda j: v_mgr.load_one_to_reg(_v_next, j), 0, _num_head_carry
+                )
 
         # Yield: num_q_tiles updated (m, d, O, P) groups, then the ds pointers and slot bases
         # left-rotated by one so slot 0 holds tile tile_idx (next body's PV) and the oldest
