@@ -1152,14 +1152,16 @@ def test_flydsl_fmha_gfx11_varlen_qkv_rope_falls_through():
 
 def test_flydsl_fmha_gfx11_varlen_rope_config():
     """128 rows under 512 tokens; else 512 rows when they pad at most 3% more
-    than 192 rows (and leave >= 64 blocks), else 192; 32 keys only for many
-    short sequences."""
+    than 192 rows (and leave >= 64 blocks), else 256 rows from 3000 tokens and
+    192 below; 32 keys only for many short sequences."""
     config = flydsl_fmha_kernels._gfx11_varlen_rope_config
     assert config(8160, 16, 3) == (32, 64)
     assert config(6392, 16, 3) == (32, 64)
-    assert config(4624, 16, 3) == (12, 64)
-    assert config(4216, 16, 3) == (12, 64)
-    assert config(3264, 16, 3) == (12, 64)
+    assert config(4624, 16, 3) == (16, 64)
+    assert config(4216, 16, 3) == (16, 64)
+    assert config(3264, 16, 3) == (16, 64)
+    assert config(3100, 16, 3) == (16, 64)  # 3584 padded rows: not the 512 branch
+    assert config(2700, 16, 3) == (12, 64)
     assert config(2400, 16, 3) == (32, 64)
     assert config(1440, 16, 3) == (32, 64)
     assert config(1292, 16, 3) == (12, 64)

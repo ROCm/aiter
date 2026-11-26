@@ -314,7 +314,9 @@ def _get_varlen_kernel_gfx11(
         sm_scale=softmax_scale,
         num_waves=num_waves,
         block_n=block_n,
-        vt_rows=4 if block_n >= 64 else 2,
+        # With RoPE in the loop, 2 keys per V transpose write measured faster
+        # than 4 at 64 keys (see _gfx11_varlen_rope_config).
+        vt_rows=2 if rope is not None else (4 if block_n >= 64 else 2),
         head_group=head_group,
         q_token_stride=token_strides[0],
         k_token_stride=token_strides[1],
@@ -410,16 +412,21 @@ def _gfx11_varlen_rope_config(
 
     Every query block rotates the K tiles it walks, so fewer, larger query
     blocks pay less for it than in the plain varlen kernel. Measured on gfx1151
-    with a 16-head, head_dim-64 ViT (3-12 images of 224-8160 tokens; 256-row
-    tiles were never the fastest):
+    with 16-head and 12-head head_dim-64 ViTs on the 863 cu_seqlens patterns of
+    a recorded vLLM video workload (1-16 images of 144-8160 tokens), weighted by
+    call count:
 
-    - query tile: 128 rows (8 waves) for sequences under 512 tokens. Longer
-      ones take 512 rows (32 waves) when that pads the longest sequence at most
-      3% more than 192 rows (12 waves) and still gives at least 64 workgroups,
-      else 192 rows. 512 rows won for 1008, 1440, 2400, 6392 and 8160 tokens
-      (up to 7%), 192 rows for 576-4624 tokens otherwise (up to 10%).
+    - query tile: 128 rows (8 waves) for sequences under 512 tokens (192 and
+      256 rows lost 1-7% there). Longer ones take 512 rows (32 waves) when that
+      pads the longest sequence at most 3% more than 192 rows (12 waves) and
+      still gives at least 64 workgroups; otherwise 256 rows (16 waves) from
+      3000 tokens, which gained 2% over 192 rows, and 192 rows below.
     - KV tile: 64 keys (4-12% faster than 32) unless there are more than four
       sequences of under 512 tokens, where 32 keys keep more blocks resident.
+
+    The caller builds this kernel with ``vt_rows=2``: with the rotation in the
+    loop, 2 keys per V transpose write beat 4 by 0.3-0.6% at 64 keys on every
+    tile, and by 2-3% on the short sequences.
     """
     block_n = 32 if max_seqlen < 512 and batch > 4 else 64
     if max_seqlen < 512:
@@ -431,7 +438,7 @@ def _gfx11_varlen_rope_config(
     big_blocks = -(-max_seqlen // 512) * num_heads * batch
     if padded(512) <= 1.03 * padded(192) and big_blocks >= 64:
         return 32, block_n
-    return 12, block_n
+    return (16 if max_seqlen >= 3000 else 12), block_n
 
 
 def _gfx11_thd_direct(t: torch.Tensor) -> bool:
