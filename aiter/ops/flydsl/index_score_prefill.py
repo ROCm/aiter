@@ -16,12 +16,7 @@ from .kernels.index_score_prefill_nvfp4_gfx1250 import (
     compile_index_score_prefill_nvfp4,
     sm_scale_log2e,
 )
-from .kernels.minimax_m3_index_score import (
-    DATA_BYTES,
-    HEAD_DIM,
-    NVFP4_SCALE_BYTES,
-    PAGE,
-)
+from .kernels.minimax_m3_index_score import HEAD_DIM, PAGE
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 
@@ -58,8 +53,8 @@ def index_score_prefill_nvfp4_supported(
         and idx_q.dtype == torch.bfloat16
         and idx_q.shape[2:] == (HEAD_DIM,)
         and idx_q.stride(2) == 1
-        and _byte_pages(payload, DATA_BYTES)
-        and _byte_pages(scale, NVFP4_SCALE_BYTES)
+        and _byte_pages(payload, HEAD_DIM // 2)
+        and _byte_pages(scale, HEAD_DIM // 16)
         and all(t.device == idx_q.device for t in (payload, scale, score) + meta)
         and all(t.dtype == torch.int32 and t.stride(-1) == 1 for t in meta)
         and min(block_table.shape[0], seq_lens.shape[0], prefix_lens.shape[0]) >= batch
@@ -99,26 +94,18 @@ def index_score_prefill_nvfp4(
                            dot(e4m3(clamp(idx_q[r, h], +-448)), dequant(K[k]))
                            * (sm_scale * log2(e))
 
-    ``-inf`` for a block past the row's own. Written for every block up to the
-    block of the last row of r's ``block_q``-row tile; later entries of ``score``
-    are left as they are. A CTA scores at most ``CHUNK_MAX`` blocks
-    (``chunk_blocks`` is clamped to ``[1, CHUNK_MAX]``; the scores do not depend on
-    it).
+    ``-inf`` for a block past the row's own. Written for the blocks up to that of
+    the last row of r's ``block_q``-row tile; later entries are left as they are.
+    ``chunk_blocks`` (blocks a CTA scores) is clamped to ``[1, CHUNK_MAX]``; the
+    scores do not depend on it.
 
     What only the device can see is the caller's to guarantee: ``cu_seqlens_q``
     ends at ``total_q``, ``max_query_len`` covers every request, and
     ``block_table`` and ``score`` hold ``ceil(seq_len / 128)`` blocks of each
     request (pages inside the cache)."""
+    meta = (block_table, cu_seqlens_q, seq_lens, prefix_lens)
     if not index_score_prefill_nvfp4_supported(
-        idx_q,
-        payload,
-        scale,
-        score,
-        block_table,
-        cu_seqlens_q,
-        seq_lens,
-        prefix_lens,
-        sm_scale,
+        idx_q, payload, scale, score, *meta, sm_scale
     ):
         raise ValueError(
             "index_score_prefill_nvfp4: unsupported device, dtype, layout or scale"
