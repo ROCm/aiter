@@ -128,7 +128,6 @@ def make_inputs(b, t, h, d, dtype, mode, seed=0):
     return x, kw
 
 
-@benchmark()
 def _channel_major(x):
     """Same values as ``x`` (``[B, T, ...]``) as a dense view with token stride 1.
 
@@ -140,6 +139,7 @@ def _channel_major(x):
     return x.permute(perm).contiguous().permute(inv)
 
 
+@benchmark()
 def test_kda_chunk_fwd(b, t, h, d, dtype, mode, varlen, layout):
     """``varlen``: the ``b`` sequences of ``t`` tokens are packed into one
     ``[1, b * t]`` batch with ``cu_seqlens``; the fp32 reference still runs
