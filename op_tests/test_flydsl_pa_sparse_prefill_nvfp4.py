@@ -175,6 +175,10 @@ def test_pa_sparse_prefill_nvfp4(case, kv_heads):
         "reuse_v3_tq4": lambda o: reuse(
             o, *args, tile_rows=4, impl="v3", v3={"min_ctas": 0}, **kv
         ),
+        # a CTA ring of 2: the B rings get their own LDS frames
+        "reuse_v3_nb2": lambda o: reuse(
+            o, *args, tile_rows=8, impl="v3", nvfp4_buffers=2, v3={"min_ctas": 0}, **kv
+        ),
     }
     ref, ret = run_torch(*host), {}
     for name, fn in candidates.items():

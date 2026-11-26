@@ -15,17 +15,21 @@ goes to one of two phases, by how many waves select it:
 
 * phase A, ``share_min`` or more waves: a CTA ring of whole pages. Wave w DMAs
   plane w of the page (K, V, K scales, V scales: one tensor DMA a page and wave),
-  and one CTA barrier a page publishes the planes and frees the oldest slot.
-  Every wave passes every A page's barrier; it computes only the 32-token
-  quarters its rows reach.
+  and a CTA barrier a page publishes the planes and frees the oldest slot. Wave
+  w then dequantizes the page's V quarter w once for the CTA (the 32x16x128
+  selector WMMA, to BF16 in the PV A operand's order) into a shared V buffer,
+  and a second barrier publishes it. Every wave passes every A page's barriers;
+  it computes only the 32-token quarters its rows reach, its PV operands read
+  from the shared V (V_AHEAD blocks in flight).
 * phase B, the rest: each wave alone, over the 32-token quarters of its own
   pages, through a wave-private ring of v2's quarter slots (v2's four DMAs a
-  quarter, no barrier).
+  quarter, no barrier, V dequantized by the wave). With room, the B rings take
+  A ring frames the A walk has freed.
 
-Each wave walks one list of (page, quarter) items from LDS, A's first; the page
-step on a quarter is v2's (rows paired when both selected the page, V
-dequantized by the 32x16x128 selector WMMA, the query terms in VGPRs). A row
-has one owner, so the epilogue scales and stores without a cross-wave merge.
+Each wave walks a list of (page, quarter) items from LDS, A's in one loop and
+B's in a second; the page step on a quarter is v2's (rows paired when both
+selected the page, the query terms in VGPRs). A row has one owner, so the
+epilogue scales and stores without a cross-wave merge.
 
 Numerics are v2's per (row, page); a row's pages are accumulated in A-then-B
 order, so the result matches v2 to rounding. BF16 output only: the wrapper
@@ -49,6 +53,7 @@ from .pa_sparse_prefill_nvfp4_v2 import (
     _ROW,
     _SROW,
     _TOKENS,
+    HEAD_DIM,
     LOG2E,
     NWARP,
     PAGE,
@@ -76,20 +81,36 @@ A_SLOT = NWARP * WAVE_SLOT_BYTES
 A_PLANE_V = PAGE * _ROW
 A_PLANE_KS = 2 * PAGE * _ROW
 A_PLANE_VS = A_PLANE_KS + PAGE * _SROW
+# The shared V of an A page: BF16 in the PV A operand's VGPR order, quarter q
+# (32 tokens, dequantized by wave q), dims block b, lane half j at
+# q * V_QUARTER + b * 1024 + j * 512, 16 B a lane.
+V_QUARTER = _TOKENS * HEAD_DIM * 2
+# Shared V blocks a wave keeps in flight: 5 issued before QK, then each 5 ahead of
+# its PV (4: 0.958x, 6 and 8 spill in the loop; paired A/B on the M3.1 chunks).
+V_AHEAD = 5
 # Item word: bounds of the wave's rows (8 bits each), the token quarter, A's page
-# head flag, the LDS frame and quarter slot it is read from, and the A page's
-# index in the A list.
+# head flag, the LDS frame and quarter slot it is read from, the A page's index
+# in the A list and (A items) "this wave dequantizes its quarter of the V".
 _Q_SHIFT, _HEAD_SHIFT, _SLOT_SHIFT, _FRAME_SHIFT, _IDX_SHIFT = 16, 18, 19, 21, 24
+_DQ_SHIFT = 31
 
 _CACHE = {}
+
+
+def _b_alias(nb_a, nb_b):
+    """The B rings fit the A frames the last A page leaves free."""
+    return nb_b < nb_a
 
 
 def _layout_v3(tq, nb_a, nb_b):
     """Byte offsets of the CTA's LDS regions."""
     entries = tq * TOPK
-    # Frames 0 .. nb_a - 1: the A ring. Then the B rings: wave w's slot j is
-    # quarter slot g % 4 of frame nb_a + g // 4, g = w * nb_b + j.
-    keys = (nb_a + nb_b) * A_SLOT
+    # Frames 0 .. nb_a - 1: the A ring. The B rings: wave w's slot j is quarter
+    # slot g % 4 of frame b0 + g // 4, g = w * nb_b + j, where b0 is the first A
+    # frame free at the last A page (``b_slot``) or, without room there, nb_a.
+    frames = nb_a if _b_alias(nb_a, nb_b) else nb_a + nb_b
+    vbuf = frames * A_SLOT
+    keys = vbuf + QUARTERS * V_QUARTER
     uidx = keys + 4 * entries
     upage = uidx + 4 * entries
     ubound = upage + 4 * entries
@@ -102,6 +123,7 @@ def _layout_v3(tq, nb_a, nb_b):
     # + 16: the loop reads an item with the one it stages, past the last.
     total = items + NWARP * per_wave * 8 + 16
     return {
+        "vbuf": vbuf,
         "keys": keys,
         "uidx": uidx,
         "upage": upage,
@@ -143,7 +165,8 @@ def compile_pa_sparse_prefill_nvfp4_v3(
     ``tile_rows``: 8 (two rows a wave) or 4 (one). ``share_min``: waves that must
     select a page for the CTA ring (phase A); 1 runs every page there, 5 none.
     ``nvfp4_buffers`` / ``nb_b``: depth of the CTA ring / of each wave's quarter
-    ring. ``waves_per_eu``: the occupancy hint (0: none).
+    ring (``nb_b < nvfp4_buffers``: the B rings take A frames the A walk has
+    freed). ``waves_per_eu``: the occupancy hint (0: none).
     """
     tq, nb_a, nb_b = int(tile_rows), int(nvfp4_buffers), int(nb_b)
     share_min, dbg = int(share_min), int(dbg)
@@ -402,6 +425,9 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             a_count = is_a.select(fx.max(quarters, fx.Int32(1)), fx.Int32(0))
             # A page a_idx's quarter t: frame a_idx % nb_a, slot t.
             a_frame = ((a_idx % nb_a) << _FRAME_SHIFT) | (a_idx << _IDX_SHIFT)
+            # Wave w dequantizes quarter w if some row of the tile reaches it.
+            dq = (top_all > warp * _TOKENS).select(fx.Int32(1), fx.Int32(0))
+            a_frame = a_frame | (dq << _DQ_SHIFT)
             n_ai = put_items(
                 a_count,
                 n_ai,
@@ -413,10 +439,21 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             is_b = live & (count < share_min)
             b_pending.append((is_b.select(quarters, fx.Int32(0)), page, bounds_info))
 
+        # The B rings' first frame: with room, the frames of A pages n_a - nb_a
+        # onward, free once every wave passed the last A page's barrier, where
+        # the first B items are staged.
+        if const_expr(_b_alias(nb_a, nb_b)):
+            b_frame = n_a % nb_a
+        else:
+            b_frame = fx.Int32(nb_a)
+
         def b_slot(t, pos):
             """B item ``pos``: ring slot (pos - n_ai) % nb_b of this wave."""
             g = warp * nb_b + (pos - n_ai) % nb_b
-            return ((nb_a + (g >> 2)) << _FRAME_SHIFT) | ((g & 3) << _SLOT_SHIFT)
+            frame = b_frame + (g >> 2)
+            if const_expr(_b_alias(nb_a, nb_b)):
+                frame = frame % nb_a
+            return (frame << _FRAME_SHIFT) | ((g & 3) << _SLOT_SHIFT)
 
         n_items = n_ai
         for b_count, page, bounds_info in b_pending:
@@ -570,17 +607,61 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 raw = raw + _bound_mask(bound, quarter, half)
             return raw
 
-        def run_rows(rows_state, ts, at):
-            """One quarter of rows ``ts`` (all selected it): v2's [QK, maxima] |
-            per row a rare rebase branch | [V dequant, P, PV]. rows_state: per
-            row [ref, l, acc x 8]; ``at``: the quarter's operands and bounds."""
-            k_tiles, p_v, p_vs, bounds, quarter, lane_zero = at
-            # Issued first: the LDS latency hides under QK.
+        def v_private(p_v, p_vs):
+            """V codes and scales of a quarter (the selector WMMA's operands)."""
             v_raw = [
                 _rows_operand(lds_load, 0, p_v, p_vs, n, lane16, half)
                 for n in range_constexpr(2)
             ]
             v_raw.append(lds_load(p_vs + lane * _SROW, fx.Int64, 1)[0])
+            return v_raw
+
+        def v_shared(vq, b):
+            """PV A operand of dims 16 b.. from the shared V quarter at ``vq``."""
+            at = vq + b * 1024 + lane * 16
+            lo, hi = lds_load(at, fx.Int32, 4), lds_load(at + 512, fx.Int32, 4)
+            return fx.Vector.from_elements(
+                [lo[e] for e in range_constexpr(4)]
+                + [hi[e] for e in range_constexpr(4)],
+                dtype=fx.Int32,
+            ).bitcast(fx.BFloat16)
+
+        def share_v(idx, k):
+            """Dequantize quarter ``warp`` of A page ``idx``'s V into the shared
+            V (the operands ``v_tile`` gives each wave in the private walk)."""
+            if const_expr(dbg == 1):
+                # Debug: no attention math, the shared V included.
+                return
+            frame = (idx % nb_a) * A_SLOT
+            v_raw = v_private(
+                frame + A_PLANE_V + warp * (_TOKENS * _ROW),
+                frame + A_PLANE_VS + warp * (_TOKENS * _SROW),
+            )
+            lane_zero = fx.Int64((lane + k) >> 31)
+            dst = lay["vbuf"] + warp * V_QUARTER + lane * 16
+            for b in range_constexpr(8):
+                words = v_tile(v_raw, b, lane_zero).bitcast(fx.Int32)
+                for j in range_constexpr(2):
+                    lds_store(
+                        dst + b * 1024 + j * 512,
+                        fx.Vector.from_elements(
+                            [words[j * 4 + e] for e in range_constexpr(4)],
+                            dtype=fx.Int32,
+                        ),
+                        fx.Int32,
+                    )
+
+        def run_rows(rows_state, ts, at):
+            """One quarter of rows ``ts`` (all selected it): v2's [QK, maxima] |
+            per row a rare rebase branch | [V operand, P, PV]. rows_state: per
+            row [ref, l, acc x 8]; ``at``: the quarter's operands and bounds;
+            its V source is ("private", p_v, p_vs, lane_zero) or ("lds", vq)."""
+            k_tiles, v_src, bounds, quarter = at
+            # Issued first: the LDS latency hides under QK.
+            if const_expr(v_src[0] == "private"):
+                v_raw = v_private(v_src[1], v_src[2])
+            else:
+                vts = [v_shared(v_src[1], b) for b in range_constexpr(V_AHEAD)]
             raws, maxes = [], []
             for t in ts:
                 raw = tail_mask(_qk(q_resident[t], k_tiles), bounds[t], quarter)
@@ -600,7 +681,13 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 totals.append(total)
             accs = [cur[i][2] for i in range_constexpr(len(ts))]
             for b in range_constexpr(8):
-                vt = v_tile(v_raw, b, lane_zero)
+                if const_expr(v_src[0] == "private"):
+                    vt = v_tile(v_raw, b, v_src[3])
+                else:
+                    # Block b + V_AHEAD loads while block b's PV runs.
+                    if const_expr(b + V_AHEAD < 8):
+                        vts.append(v_shared(v_src[1], b + V_AHEAD))
+                    vt = vts[b]
                 for i in range_constexpr(len(ts)):
                     accs[i][b] = Gfx1250Gemm.mma(vt, ps[i], accs[i][b], 32, True)
             res = []
@@ -609,49 +696,9 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 res.extend(accs[i])
             return res
 
-        # ---- the walk: this wave's A items (CTA ring), then its B items ----
-        for k_i, state in range(fx.Int32(0), n_items, fx.Int32(1), init=initial):
-            k = fx.Int32(k_i)
-            # Item k and the item it stages (k + nb_b - 1) in one LDS read.
-            entry = lds_load(items_w + k * 8, fx.Int32, 2 * nb_b)
-            info = uniform(entry[1])
+        def run_item(grp, info, k, shared):
+            """The rows of this wave that reach item (info)'s quarter."""
             quarter = (info >> _Q_SHIFT) & (QUARTERS - 1)
-            idx = info >> _IDX_SHIFT
-            in_a = k < n_ai
-            if in_a:
-                if ((info >> _HEAD_SHIFT) & 1) != 0:
-                    # Page idx: this wave's plane landed (only later A pages'
-                    # DMAs may be in flight; B's start after the last wait), the
-                    # barrier publishes every plane and frees page idx - 1's slot.
-                    if const_expr(dbg != 3):
-                        if const_expr(nb_a == 3):
-                            if idx + 1 < n_a:
-                                tdm_ops.tensor_wait(1)
-                            else:
-                                tdm_ops.tensor_wait(0)
-                        else:
-                            tdm_ops.tensor_wait(0)
-                    gpu.barrier()
-                    if const_expr(dbg != 3):
-                        if idx + (nb_a - 1) < n_a:
-                            stage_a(idx + (nb_a - 1))
-                        if idx + 1 == n_a:
-                            stage_b_head()
-            else:
-                if const_expr(dbg != 3):
-                    # Four DMAs an item: item k is done when at most the later
-                    # in-flight items' remain.
-                    if const_expr(nb_b == 3):
-                        if k + 1 < n_items:
-                            tdm_ops.tensor_wait(4)
-                        else:
-                            tdm_ops.tensor_wait(0)
-                    else:
-                        tdm_ops.tensor_wait(0)
-                    if k + (nb_b - 1) < n_items:
-                        stage_b(
-                            uniform(entry[2 * nb_b - 2]), uniform(entry[2 * nb_b - 1])
-                        )
             p_k, p_v, p_ks, p_vs = planes(info)
             bounds = [(info >> (8 * r)) & 0xFF for r in range_constexpr(rpw)]
             lo = quarter * _TOKENS
@@ -659,10 +706,12 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                 _rows_operand(lds_load, 0, p_k, p_ks, n, lane16, half)
                 for n in range_constexpr(2)
             ]
-            # VGPR block scales of the selector (see pa_sparse_prefill_nvfp4_v2).
-            lane_zero = fx.Int64((lane + k) >> 31)
-            at = (k_tiles, p_v, p_vs, bounds, quarter, lane_zero)
-            grp = list(state)
+            if const_expr(shared):
+                v_src = ("lds", lay["vbuf"] + quarter * V_QUARTER)
+            else:
+                # VGPR block scales of the selector (see pa_sparse_prefill_nvfp4_v2).
+                v_src = ("private", p_v, p_vs, fx.Int64((lane + k) >> 31))
+            at = (k_tiles, v_src, bounds, quarter)
             if const_expr(dbg == 1):
                 # Debug: the walk and its DMA only (no attention math).
                 pass
@@ -677,7 +726,58 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             else:
                 if bounds[0] > lo:
                     grp = run_rows(grp, (0,), at)
-            final = yield grp
+            return grp
+
+        # ---- the walk: this wave's A items (CTA ring), then its B items ----
+        for k_i, state in range(fx.Int32(0), n_ai, fx.Int32(1), init=initial):
+            k = fx.Int32(k_i)
+            info = uniform(lds_load(items_w + k * 8 + 4, fx.Int32, 1)[0])
+            if ((info >> _HEAD_SHIFT) & 1) != 0:
+                idx = (info >> _IDX_SHIFT) & 0x7F
+                # Page idx: this wave's plane landed (only later A pages' DMAs
+                # may be in flight; B's start after the last wait), the barrier
+                # publishes every plane and frees page idx - 1's slot (and the
+                # shared V).
+                if const_expr(dbg != 3):
+                    if const_expr(nb_a == 3):
+                        if idx + 1 < n_a:
+                            tdm_ops.tensor_wait(1)
+                        else:
+                            tdm_ops.tensor_wait(0)
+                    else:
+                        tdm_ops.tensor_wait(0)
+                gpu.barrier()
+                if const_expr(dbg != 3):
+                    if idx + (nb_a - 1) < n_a:
+                        stage_a(idx + (nb_a - 1))
+                    if idx + 1 == n_a:
+                        stage_b_head()
+                if ((info >> _DQ_SHIFT) & 1) != 0:
+                    share_v(idx, k)
+                # Publishes page idx's V quarters.
+                gpu.barrier()
+            grp_a = run_item(list(state), info, k, True)
+            final_a = yield grp_a
+
+        for k_i, state in range(n_ai, n_items, fx.Int32(1), init=list(final_a)):
+            k = fx.Int32(k_i)
+            # Item k and the item it stages (k + nb_b - 1) in one LDS read.
+            entry = lds_load(items_w + k * 8, fx.Int32, 2 * nb_b)
+            info = uniform(entry[1])
+            if const_expr(dbg != 3):
+                # Four DMAs an item: item k is done when at most the later
+                # in-flight items' remain.
+                if const_expr(nb_b == 3):
+                    if k + 1 < n_items:
+                        tdm_ops.tensor_wait(4)
+                    else:
+                        tdm_ops.tensor_wait(0)
+                else:
+                    tdm_ops.tensor_wait(0)
+                if k + (nb_b - 1) < n_items:
+                    stage_b(uniform(entry[2 * nb_b - 2]), uniform(entry[2 * nb_b - 1]))
+            grp_b = run_item(list(state), info, k, False)
+            final = yield grp_b
 
         # ---- epilogue: one owner a row, no merge ----
         tdm_ops.tensor_wait(0)
