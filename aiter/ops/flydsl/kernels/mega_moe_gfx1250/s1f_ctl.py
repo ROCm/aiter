@@ -308,9 +308,12 @@ class _Stage1Fusion:
                 f"stage-1 tile {align_m} does not fit model_dim "
                 f"{self.d.config.hidden_dim} on {self.cu} CUs"
             )
-        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4:
+        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 8:
+            # An m-tile of several flag tiles keeps its flags in one lane per
+            # flag tile, up to two b128s (8 sources); tile_info's 16-bit mask
+            # (npes > 8) is not joined across flag tiles.
             reasons.append(
-                f"step tile_m {align_m} with {self.d.config.world_size} ranks > 4"
+                f"step tile_m {align_m} with {self.d.config.world_size} ranks > 8"
             )
         if int(self.d.config.experts_per_rank) > 255:
             reasons.append(f"{self.d.config.experts_per_rank} experts per rank > 255")
