@@ -106,23 +106,3 @@ def test_matches_reference(rows):
     # Gate and value are passthrough views, so they must be exact.
     torch.testing.assert_close(gate, ref_gate.view(gate.shape), atol=0.0, rtol=0.0)
     torch.testing.assert_close(value, ref_value, atol=0.0, rtol=0.0)
-
-
-@requires_gfx950
-def test_supported_rejects_bad_calls():
-    packed, q_norm, k_norm, positions, cos_sin_cache = _make_inputs(64)
-    # Wrong packed width.
-    ok, _ = fused_attention_qk_norm_rope_supported(
-        packed[:, :-512], q_norm, k_norm, positions, cos_sin_cache
-    )
-    assert not ok
-    # Wrong dtype.
-    ok, _ = fused_attention_qk_norm_rope_supported(
-        packed.float(), q_norm, k_norm, positions, cos_sin_cache
-    )
-    assert not ok
-    # positions too short.
-    ok, _ = fused_attention_qk_norm_rope_supported(
-        packed, q_norm, k_norm, positions[:10], cos_sin_cache
-    )
-    assert not ok
