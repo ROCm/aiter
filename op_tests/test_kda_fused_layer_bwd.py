@@ -675,6 +675,58 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     return ret
 
 
+def test_kda_save_fwd_matches_recompute(dtype, cu_seqlens=None, lower_bound=-5.0):
+    """save_fwd=1 (the forward keeps its activations and, for a chunk backward
+    that takes ``fwd_intermediates``, the chunk forward's intermediates) must
+    give the default recompute's y and gradients. On gfx950 bf16 the chunk
+    backward is FlyDSL, so this covers the #8740 ``fwd_intermediates`` path."""
+    D, H, K, W, R = 256, 2, 128, 4, 16
+    total = 128
+    cu = None if cu_seqlens is None else torch.tensor(cu_seqlens, dtype=torch.int32)
+    saved = dict(kda_fused_layer._fusion_overrides)
+    pieces = dict(kda_fused_layer._piece_overrides)
+    flydsl = dtype == torch.bfloat16 and get_gfx_runtime() == "gfx950"
+    if flydsl:
+        kda_fused_layer.set_kda_pieces(chunk_bwd="flydsl")
+    try:
+        w = make_weights(D, H, K, W, R, dtype)
+        x = torch.randn(1, total, D).to(dtype)
+        dy = torch.randn(1, total, D).to(dtype)
+        outs = {}
+        for mode in ("0", "1"):
+            kda_fused_layer.set_kda_fusions(save_fwd=mode)
+            xs = x.clone().requires_grad_(True)
+            ws = kda_fused_layer.KDALayerWeights.from_tensors(
+                [t.detach().clone().requires_grad_(True) for t in w.tensors()]
+            )
+            y = kda_fused_layer.kda_layer_fwd(
+                xs, ws, H, backend="fused", cu_seqlens=cu, lower_bound=lower_bound
+            )
+            y.backward(dy)
+            outs[mode] = [y.detach(), xs.grad, *(t.grad for t in ws.tensors())]
+            pieces_used = dict(kda_fused_layer.LAST_PIECES)
+        tol = 2e-2 if dtype != torch.float32 else 1e-5
+        errs = [
+            (
+                (a.float() - b.float()).abs().max()
+                / b.float().abs().max().clamp_min(1e-6)
+            ).item()
+            for a, b in zip(outs["1"], outs["0"])
+        ]
+        assert max(errs) <= tol, f"save_fwd=1 vs recompute: max rel err {max(errs):.2e}"
+        return {
+            "max rel err": max(errs),
+            "chunk_fwd": pieces_used.get("chunk_fwd"),
+            "chunk_bwd": pieces_used.get("chunk_bwd"),
+            "fwd_intermediates": pieces_used.get("chunk_bwd_fwd_intermediates", "-"),
+        }
+    finally:
+        kda_fused_layer._fusion_overrides.clear()
+        kda_fused_layer._fusion_overrides.update(saved)
+        kda_fused_layer._piece_overrides.clear()
+        kda_fused_layer._piece_overrides.update(pieces)
+
+
 def test_kda_weight_cache_update(dtype=torch.float32, concat_proj=False):
     """Optimizer updates that keep data_ptr and _version (p.data.copy_, a
     distributed optimizer's shared flat buffer) must reach the next call:
@@ -858,6 +910,16 @@ def main():
         )
     for concat_proj in (False, True):
         test_kda_weight_cache_update(torch.float32, concat_proj)
+    print(
+        pd.DataFrame(
+            [
+                {"dtype": str(dt), "cu_seqlens": cu}
+                | test_kda_save_fwd_matches_recompute(dt, cu)
+                for dt in (torch.float32, torch.bfloat16)
+                for cu in (None, [0, 48, 128])
+            ]
+        ).to_markdown(index=False)
+    )
 
     def summarize(title, rows, axes):
         if not rows:
