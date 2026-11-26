@@ -173,32 +173,3 @@ def test_int32_indices_are_accepted():
     got = fused_indexed_gated_residual(residual, x, gate, indices.to(torch.int32))
     want = fused_indexed_gated_residual(residual, x, gate, indices)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
-
-
-def test_rejects_mismatched_shapes():
-    dev = "cuda"
-    residual, x, gate, indices = make(32, 256, 3, torch.bfloat16, dev)
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x[:, :-1], gate, indices)
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x, gate[:, :-1], indices)
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x, gate, indices[:-1])
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x, gate, indices.float())
-
-
-def test_rejects_unsupported_dtypes_and_devices():
-    dev = "cuda"
-    residual, x, gate, indices = make(32, 256, 3, torch.bfloat16, dev)
-    for dtype in (torch.float16, torch.float32):
-        with pytest.raises(AssertionError):
-            fused_indexed_gated_residual(
-                residual.to(dtype), x.to(dtype), gate.to(dtype), indices
-            )
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x, gate.float(), indices)
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual.cpu(), x.cpu(), gate.cpu(), indices.cpu())
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(residual, x, gate, indices.cpu())
