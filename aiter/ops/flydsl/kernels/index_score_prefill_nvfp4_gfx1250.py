@@ -112,7 +112,10 @@ def compile_index_score_prefill_nvfp4(
     padding a 64-byte row, by the tensor DMA). A wave reads the A operand with
     16-byte loads, lane l16 at row l16: 64 bytes apart, the 16 lanes of a half
     hit only 4 of the 16 four-bank groups (a 4-way bank conflict); 80 bytes
-    apart they hit all 16. Same scores; 2 KB more LDS a ring slot.
+    apart they hit all 16. Same scores; 2 KB more LDS a ring slot. The rows of
+    the staged scores (128 bytes) and of the select build's lists (128 bytes)
+    get 8 bytes of padding too: at 128 bytes, half the banks' period, the 32
+    lanes of a pass (a row each) alias.
 
     ``_probe``: debug builds that write wrong scores, for timing only.
     ``_nostore``: no score stores. ``_acc``: an unmasked page's dots of a query
@@ -161,8 +164,12 @@ def compile_index_score_prefill_nvfp4(
     prow = ROW + 16 if pad_lds else ROW
     page_bytes = PAGE * prow + PAGE * SROW
     ring_bytes = ring * page_bytes
-    list_base = ring_bytes + block_q * chunk_max * 4
-    total = list_base + (block_q * TOPK * 8 if select else 0)
+    # Pitch of a row's staged scores and of its list (pad_lds: 8 bytes over the
+    # 128, half the 64 banks' period, at which rows alias every other bank group).
+    srow_b = chunk_max * 4 + (8 if pad_lds and chunk_max else 0)
+    lrow_b = TOPK * 8 + (8 if pad_lds else 0)
+    list_base = ring_bytes + block_q * srow_b
+    total = list_base + (block_q * lrow_b if select else 0)
     if total > get_lds_capacity_bytes("gfx1250"):
         raise ValueError(f"{total} bytes of LDS are over the workgroup's limit")
 
@@ -332,7 +339,7 @@ def compile_index_score_prefill_nvfp4(
                 # An entry: (score order << 32) | (block + 1) << 4 | its place.
                 for i in range_constexpr(rows_per_wave * TOPK // WAVE):
                     lds_store(
-                        list_base + (wave_row * TOPK + i * WAVE + lane) * 8,
+                        list_base + (wave_row + i * 2 + half) * lrow_b + lane16 * 8,
                         fx.Vector.from_elements(
                             [fx.Int64(EMPTY) | fx.Int64(lane16)], dtype=fx.Int64
                         ),
@@ -341,9 +348,9 @@ def compile_index_score_prefill_nvfp4(
 
                 def lowest(rl):
                     """The lowest entry of row ``rl``'s list."""
-                    low = lds_load(list_base + rl * TOPK * 8, fx.Int64, 1)[0]
+                    low = lds_load(list_base + rl * lrow_b, fx.Int64, 1)[0]
                     for p in range_constexpr(1, TOPK):
-                        entry = lds_load(list_base + (rl * TOPK + p) * 8, fx.Int64, 1)[0]
+                        entry = lds_load(list_base + rl * lrow_b + p * 8, fx.Int64, 1)[0]
                         low = (entry < low).select(entry, low)
                     return low
 
@@ -396,6 +403,8 @@ def compile_index_score_prefill_nvfp4(
                             k_rows, k_scale = ahead
                             if const_expr(kt + 1 < PAGE // 16):
                                 ahead = key_tile(kt + 1)
+                            # Keep tile kt+1's loads where they are: ahead of tile kt's
+                            # WMMAs, not hoisted with the page's other tiles.
                             fx.rocdl.sched_barrier(0)
                         else:
                             k_rows, k_scale = key_tile(kt)
@@ -458,7 +467,7 @@ def compile_index_score_prefill_nvfp4(
                             at = at % chunk_max
                         if half == 0:
                             lds_store(
-                                ring_bytes + ((r - pid_q * block_q) * chunk_max + at) * 4,
+                                ring_bytes + (r - pid_q * block_q) * srow_b + at * 4,
                                 fx.Vector.from_elements([m * scale], dtype=fx.Float32),
                                 fx.Float32,
                             )
@@ -495,7 +504,7 @@ def compile_index_score_prefill_nvfp4(
                             for c in range_constexpr(chunk_max):
                                 under = (
                                     lds_load(
-                                        ring_bytes + (rl * chunk_max + c) * 4,
+                                        ring_bytes + rl * srow_b + c * 4,
                                         fx.Float32,
                                         1,
                                     )[0]
@@ -538,7 +547,7 @@ def compile_index_score_prefill_nvfp4(
                                 enter = enter & (enter - 1)
                                 col = first + c
                                 value = lds_load(
-                                    ring_bytes + (rl * chunk_max + c) * 4, fx.Float32, 1
+                                    ring_bytes + rl * srow_b + c * 4, fx.Float32, 1
                                 )[0]
                                 if const_expr(init_blocks):
                                     value = (col < init_blocks).select(
@@ -554,13 +563,14 @@ def compile_index_score_prefill_nvfp4(
                                 if has & (entry > low):
                                     place = fx.Int32(low) & (TOPK - 1)
                                     lds_store(
-                                        list_base + (rl * TOPK + place) * 8,
+                                        list_base + rl * lrow_b + place * 8,
                                         fx.Vector.from_elements(
                                             [entry | fx.Int64(place)], dtype=fx.Int64
                                         ),
                                         fx.Int64,
                                     )
-                                low = lowest(rl)
+                                    # Only a row that took a place has a new lowest.
+                                    low = lowest(rl)
                             # (A row past the request keeps an empty list.)
                             if fx.Int32(low >> 32) > floor:
                                 floors[cell] = fx.Int32(low >> 32)
@@ -570,7 +580,7 @@ def compile_index_score_prefill_nvfp4(
                 keys = fx.recast_iter(fx.Int64, score_ptr)
                 for i in range(fx.Int32(0), n_rows, fx.Int32(1)):
                     rl = wave_row + i
-                    entry = lds_load(list_base + (rl * TOPK + lane16) * 8, fx.Int64, 1)[0]
+                    entry = lds_load(list_base + rl * lrow_b + lane16 * 8, fx.Int64, 1)[0]
                     block1 = (entry & 0xFFFFFFFF) >> 4
                     ordered = ((entry >> 32) ^ INT32_MIN) & 0xFFFFFFFF
                     if lane < TOPK:
@@ -593,7 +603,7 @@ def compile_index_score_prefill_nvfp4(
                             + fx.Int64(seq_start + r) * stride_s_n
                             + blk_lo
                             + lane
-                        ] = lds_load(ring_bytes + (rl * chunk_max + lane) * 4, fx.Float32, 1)[0]
+                        ] = lds_load(ring_bytes + rl * srow_b + lane * 4, fx.Float32, 1)[0]
 
     @flyc.jit
     def launch(
