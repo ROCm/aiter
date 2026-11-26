@@ -764,7 +764,8 @@ def test_kda_wgrad_split(m, hk, d, dtype):
 
     Integer inputs in [-2, 2] keep every partial sum exact in fp32, so every
     split, kernel and the dispatcher's pick must equal the exact result bit
-    for bit; the output is NaN-filled, so a tile left unwritten fails.
+    for bit; the output is NaN-filled, so a tile left unwritten fails. Split-K
+    rows run the deterministic partial reduction the KDA dispatch uses.
     m = 300 runs the K tail. The HTI rows show whether the HTI kernel takes
     the tn layout; the KDA dispatcher no longer picks it.
     """
@@ -792,6 +793,8 @@ def test_kda_wgrad_split(m, hk, d, dtype):
             "k_waves": 1,
             "group_m": 0,
             "use_half_tile_interleaved": False,
+            # the KDA dispatch reduces split-K partials in split order
+            "split_reduce": split_k if split_k > 1 else 0,
         }
 
     hti256 = {

@@ -103,7 +103,7 @@ def apply_switches(kw, layout, epilogue):
     if kw["use_half_tile_interleaved"] and not hti_ok:
         kw.update(use_half_tile_interleaved=False, block_m=128, block_n=256)
         kw.update(m_waves=2, n_waves=4, k_waves=1)
-    return kw
+    return _deterministic_split(kw)
 
 
 def token_axis(layout):
@@ -159,6 +159,13 @@ def default_config(m, n, k, layout, epilogue, cu_num):
 def to_user_kwargs(cfg):
     kw = {c: int(cfg[c]) for c in TILE_COLUMNS if c != "hti"}
     kw["use_half_tile_interleaved"] = bool(int(cfg["hti"]))
+    return _deterministic_split(kw)
+
+
+def _deterministic_split(kw):
+    # KDA split-K reduces fp32 partials in split order (no atomics), so a
+    # gradient is the same on every run
+    kw["split_reduce"] = kw["split_k"] if kw["split_k"] > 1 else 0
     return kw
 
 
