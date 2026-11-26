@@ -645,10 +645,20 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
 
 
 # MXFP8 recipe (Megatron-LM Kimi-K3 / TE MXFP8BlockScaling): the aiter path
-# against the fp32 emulation of the same quantized operands. Native FP8 GEMMs
-# and the emulation differ only in summation order and in which side of a bf16
-# rounding a value lands, hence the tight tolerance.
+# against the fp32 emulation of the same quantized operands. One GEMM differs
+# only in summation order and in which side of a bf16 rounding a value lands,
+# hence the tight elementwise tolerance there.
 MXFP8_TIGHT_TOL = 1e-2
+# Through the whole layer a bf16 rounding that lands differently can move a
+# later fp8 rounding, or a block's amax across a power of two (rescaling its 32
+# values), so a few elements of a gradient move by about one fp8 step while the
+# tensor stays close. A layer comparison is therefore graded per tensor by
+# (rel-L2 bound, elementwise tol, outlier fraction bound, max |delta| / max|ref|).
+# An unquantized operand puts rel-L2 at 0.06-0.15.
+MXFP8_BLOCK_GRADES = {
+    "emulated": (3e-2, 1e-2, 2e-2, 0.1),
+    "torch": (5e-2, 5e-2, 1e-2, 0.2),
+}
 MXFP8_PROJS = ("qkv", "f_a", "f_b", "w_beta", "g_proj", "w_o")
 MXFP8_KINDS = ("fwd", "dgrad", "wgrad")
 
@@ -746,10 +756,12 @@ def test_kda_mxfp8_gemm(proj, kind, m, d, h, k, r, dtype):
 def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     """kda_layer_fwd + autograd backward with ``gemm_precision="mxfp8"``.
 
-    * ``err``: the fused layer on aiter's MXFP8 GEMMs against the same fused
-      layer with every projection GEMM emulated in fp32 (tight);
-    * ``vs torch err``: against the torch backend's MXFP8 emulation (chunked
+    * ``rel l2`` / ``err`` / ``max delta`` (worst tensor): the fused layer on
+      aiter's MXFP8 GEMMs against the same fused layer with every projection
+      GEMM emulated in fp32;
+    * ``vs torch ...``: against the torch backend's MXFP8 emulation (chunked
       recurrence in fp32, every GEMM emulated), up to ORACLE_MAX_TOKENS;
+    * ``failed``: tensors past ``MXFP8_BLOCK_GRADES``, asserted after the table;
     * ``vs bf16``: how far the MXFP8 recipe moves y and each gradient from the
       bf16 fused layer (reported, not asserted).
     """
@@ -783,19 +795,33 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
         f.name for f in KDALayerWeights.__dataclass_fields__.values()
     ]
 
-    def grade(out, ref, tol, msg):
-        worst = 0.0
+    failed = []
+
+    def grade(out, ref, against):
+        """(worst rel-L2, worst outlier fraction, worst max delta); tensors past
+        a bound are collected in ``failed`` (asserted after the table)."""
+        rel_max, tol, frac_max, delta_max = MXFP8_BLOCK_GRADES[against]
+        worst = [0.0, 0.0, 0.0]
         for gname, rf, o in zip(names, [ref[0], *ref[1]], [out[0], *out[1]]):
             sc = rf.float().abs().max().clamp_min(1e-6)
-            err = checkAllclose(
-                (rf.float() / sc).to(dtypes.fp32),
-                (o.float() / sc).to(dtypes.fp32),
+            rf_n = (rf.float() / sc).to(dtypes.fp32)
+            o_n = (o.float() / sc).to(dtypes.fp32)
+            frac = checkAllclose(
+                rf_n,
+                o_n,
                 rtol=tol,
                 atol=tol,
-                msg=f"{msg}: {gname}",
+                tol_err_ratio=frac_max,
+                msg=f"mxfp8 vs {against}: {gname}",
             )
-            assert err == 0, f"{msg}: {gname} {err:.2%} outside tolerance"
-            worst = max(worst, err)
+            rel = _rel_l2(o_n, rf_n)
+            delta = (o_n - rf_n).abs().max().item()
+            if rel > rel_max or frac > frac_max or delta > delta_max:
+                failed.append(
+                    f"vs {against} {gname}: rel l2 {rel:.2e}, "
+                    f"{frac:.2e} outside, max {delta:.2e}"
+                )
+            worst = [max(a, b) for a, b in zip(worst, (rel, frac, delta))]
         return worst
 
     mxfp8_linear.set_mxfp8_gemm_impl("emulate")
@@ -811,12 +837,15 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
         "precision": kda_fused_layer.kda_precision(),
         "mxfp8 us": us,
         "mxfp8 TFLOPS": flops / us / 1e6,
-        "err": grade(out, emulated, MXFP8_TIGHT_TOL, "mxfp8 aiter vs emulated"),
         "bwd gemms": gemms,
     }
+    rel, frac, delta = grade(out, emulated, "emulated")
+    ret.update({"rel l2": rel, "err": frac, "max delta": delta})
     if b * t <= ORACLE_MAX_TOKENS:
-        ref = block("torch", "mxfp8")()
-        ret["vs torch err"] = grade(out, ref, 5e-2, "mxfp8 fused vs torch")
+        rel, frac, delta = grade(out, block("torch", "mxfp8")(), "torch")
+        ret.update(
+            {"vs torch rel l2": rel, "vs torch err": frac, "vs torch max": delta}
+        )
     bf16, bf16_us = run_perftest(block("fused", "bf16"), num_iters=3, num_warmup=1)
     ret["bf16 us"] = bf16_us
     dev = {
@@ -830,6 +859,7 @@ def test_kda_mxfp8_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     ret["vs bf16 rel l2 (y)"] = dev["y"][0]
     ret["vs bf16 rel l2 (dx)"] = dev["dx"][0]
     ret["vs bf16 worst"] = f"{worst} {dev[worst][0]:.3g} (max {dev[worst][1]:.3g})"
+    ret["failed"] = "; ".join(failed) or "-"
     return ret
 
 
@@ -1060,11 +1090,15 @@ def main():
                         mx_rows.append(row)
                 finally:
                     kda_fused_layer.set_kda_fusions(**dict.fromkeys(spec))
-            summarize(
+            mx_df = summarize(
                 "kda mxfp8 block fwd+bwd summary",
                 mx_rows,
                 {"block": args.block, "shape": args.shape, "fusions": args.fusions},
             )
+            bad_mx = mx_df[mx_df["failed"] != "-"]
+            assert bad_mx.empty, "mxfp8 block outside its bounds:\n" + bad_mx[
+                ["t", "nseq", "fusion combo", "failed"]
+            ].to_string(index=False)
         bad_stage = stage_df[stage_df["failed"] != "-"]
         assert bad_stage.empty, "GPU-only stages outside tolerance:\n" + bad_stage[
             ["stage", "m", "lb", "failed"]
