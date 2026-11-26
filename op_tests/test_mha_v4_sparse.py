@@ -4220,6 +4220,117 @@ def test_mha_v4_sol_head_dim_256_tilt_reaches_the_pooled_values(name):
     ), f"{name}: the tilt reached exact blocks"
 
 
+def _hd256_capped_tilt(case, q, plan, rank):
+    """(plan with sol_jensen_cap's variance, sol_tilt_planes' planes at the cap's gain).
+
+    The cap damps a block's Jensen term by h, and its tilt by sqrt(h) to match, so the planes
+    take the cap's gain as block_gain.
+    """
+    q_tile, kv_tile = _HD256_SOL_TILE
+    var, var_scale, gain = sol_jensen_cap(
+        q,
+        None,
+        None,
+        plan["mean_k_var"],
+        _HD256_SOFTMAX_SCALE,
+        kv_tile,
+        block_attn_mask=plan["block_attn_mask"],
+        q_tile=q_tile,
+        q_abs_max=sol_q_abs_max(q, q_tile, rotate=case["rotated"]),
+        mean_k_var_scale=plan["mean_k_var_scale"],
+        mean_k_var_pooled=plan["mean_k_var_pooled"],
+    )
+    planes = sol_tilt_planes(
+        q_abs_max=sol_q_abs_max(q, q_tile),
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        rank=rank,
+        kv_tile=kv_tile,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        mean_k_pooled=plan["mean_k_pooled"],
+        mean_v_pooled=plan["mean_v_pooled"],
+        block_gain=gain,
+        **case["tilt"],
+    )
+    return {**plan, "mean_k_var": var, "mean_k_var_scale": var_scale}, planes, gain
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_tilt_and_capped_jensen_run_together(name):
+    """The capped Jensen term and the tilt at the cap's gain in one launch: both reach the row,
+    the tilt still moves the routed output toward exact attention, and under an all-exact
+    selection neither moves anything."""
+    q_tile, kv_tile = _HD256_SOL_TILE
+    batch, heads, sequence_q, sequence_k, rank = 1, 2, 512, 32 * kv_tile, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(batch, sequence_k, heads, 256, rank)
+    # At full strength the planted K's Jensen terms cap nearly every block to a gain of about
+    # 0.03, which leaves the tilt at sqrt(h) almost nothing to do; at a quarter the cap still
+    # damps most blocks, to about 0.5.
+    k = (k.float() * 0.25).to(torch.bfloat16)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=True)
+    capped, planes, gain = _hd256_capped_tilt(case, q, plan, rank)
+    assert (gain[gain > 0] < 1).any(), f"{name}: the cap damped no block"
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float())
+    exact = torch.einsum(
+        "bhqk,bkhd->bqhd",
+        torch.softmax(scores * _HD256_SOFTMAX_SCALE, dim=-1),
+        v.float(),
+    )
+
+    def error(out):
+        return ((out.float() - exact).norm() / exact.norm()).item()
+
+    tilted = _hd256_sol_launch(case, plan, planes)
+    jensen = _hd256_sol_launch(case, capped, jensen=True)
+    both = _hd256_sol_launch(case, capped, planes, jensen=True)
+    all_exact = _select_all_plan(
+        capped, batch, heads, sequence_q // q_tile, sequence_k // kv_tile, q.device
+    )
+    exact_plain = _hd256_sol_launch(case, all_exact)
+    exact_both = _hd256_sol_launch(case, all_exact, planes, jensen=True)
+    torch.cuda.synchronize()
+    assert torch.isfinite(both).all()
+    assert not torch.equal(both, tilted) and not torch.equal(both, jensen)
+    # Measured: 0.51 -> 0.14 for BF16, 0.48 -> 0.24 for MXFP8 and MXFP6, 0.49 -> 0.26 for MXFP4.
+    assert error(both) < 0.75 * error(jensen), (name, error(jensen), error(both))
+    assert torch.equal(
+        exact_plain, exact_both
+    ), f"{name}: pooled terms reached exact blocks"
+
+
+@parametrize("pooled", ["mean", "capped_tilt"])
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_packed_compile_parity(name, pooled):
+    """As test_mha_v4_sol_packed_compile_parity at hd256, whose recipes quantize at hd128:
+    sol_prepare and the launch trace as one graph, with the Jensen cap's re-pack and the tilt
+    planes in it for "capped_tilt", and match eager bitwise."""
+    kv_tile = _HD256_SOL_TILE[1]
+    heads, rank = 2, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(1, 16 * kv_tile, heads, 256, rank)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    case = _hd256_sol_case(name, q, k, v)
+
+    def call():
+        plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=pooled == "capped_tilt")
+        if pooled == "mean":
+            return _hd256_sol_launch(case, plan)
+        capped, planes, _ = _hd256_capped_tilt(case, q, plan, rank)
+        return _hd256_sol_launch(case, capped, planes, jensen=True)
+
+    eager = call()
+    compiled = torch.compile(call, fullgraph=True)()
+    torch.cuda.synchronize()
+    assert torch.equal(eager, compiled)
+
+
 class _DeviceBytes:
     """A raw device range in the form torch.as_tensor takes."""
 
