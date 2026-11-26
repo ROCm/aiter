@@ -14,7 +14,7 @@ Each K tile of A, W and both e8m0 scales moves global -> LDS by TDM, then LDS
   per (M tile, K tile) so each K tile is one contiguous TDM run (see
   preshuffle_act_scale; production's m16k4 layout serves the same purpose),
 * m_warp x n_warp waves per workgroup (each owns one sub-tile of the output,
-  the four TDM copies are spread over the waves), num_buffers LDS stages with
+  every wave issues its share of each of the four TDM copies), num_buffers LDS stages with
   TDM running num_buffers-1 K tiles ahead of the WMMAs, no split-K, no
   clusters / multicast; only A's LDS rows are padded (16 B, bank conflicts),
 * one V_WMMA_SCALE per (16-row M, 32/16-row N) block, two register slots so
@@ -141,9 +141,9 @@ def build_naive_grouped_gemm(
     # bf16 C tile, reusing the stages; +16 columns spread the ds_store_b128 banks.
     C_PITCH = tile_n + 16
     LDS_BYTES = max(NB * STAGE_BYTES, tile_m * C_PITCH * 2)
-    # TDM copies per wave per K tile; s_wait_tensorcnt counts this wave's own.
-    assert 4 % NUM_WAVES == 0 or NUM_WAVES >= 4, "every issuing wave owns the same count"
-    COPIES = ceildiv(4, NUM_WAVES)
+    # TDM copies per wave per K tile (its share of A, W and both scales);
+    # s_wait_tensorcnt counts this wave's own.
+    COPIES = 4
 
     fmt = "a4w4" if a_is_fp4 else "a8w4"
     name = (
@@ -195,7 +195,8 @@ def build_naive_grouped_gemm(
         )
 
         def tdm_k_tile(src, first_row, rows, row_bytes, tile_bytes, lds_offset, lds_pitch=None):
-            """One TDM descriptor; copy(kt, stage) moves K tile kt into a stage.
+            """One TDM descriptor; copy(kt, stage) moves this wave's share of K tile
+            kt into a stage (the atom splits the box over all NUM_WAVES waves).
 
             A wider lds_pitch leaves slack after every row; the atom turns it into
             the descriptor's pad interval / amount.
@@ -207,7 +208,8 @@ def build_naive_grouped_gemm(
             )
             box = (rows, tile_bytes)
             atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(), g, fx.make_layout(box, (lds_pitch, 1)), box
+                fx.rocdl.TensorLoad(), g, fx.make_layout(box, (lds_pitch, 1)), box,
+                num_warps=NUM_WAVES,
             )
             s = fx.Tensor(
                 fx.make_view(
@@ -217,7 +219,7 @@ def build_naive_grouped_gemm(
             )
             g_tiles = fx.zipped_divide(coord, box)[None, (0, None)]  # (box, K_TILES)
             s_part, g_part = fx.rocdl.cdna5.tdm_partition(
-                atom, 0, fx.make_layout(1, 1), s, g_tiles
+                atom, wave, fx.make_layout(NUM_WAVES, 1), s, g_tiles
             )
             return lambda kt, stage: fx.copy(atom, g_part[None, kt], s_part[None, stage])
 
@@ -290,11 +292,9 @@ def build_naive_grouped_gemm(
             off = WS_LDS + (row // 32) * SB_TILE_BYTES + ks * 128 + (row % 32) * 4
             return ld32(base, off)
 
-        def issue(kt, stage):
-            for i, tdm_load in enumerate(tdm_loads):
-                if wave == i % NUM_WAVES:  # wave i issues copy i
-                    tdm_load(kt, stage)
-                    rocdl.s_nop(0)  # gfx1250: no branch right after a TDM issue
+        def issue(kt, stage):  # no owner branch, so no s_nop for the TDM-then-branch hazard
+            for tdm_load in tdm_loads:
+                tdm_load(kt, stage)
 
         def wait_oldest(newer_tiles):
             """The oldest K tile in flight has landed; `newer_tiles` may still fly."""
