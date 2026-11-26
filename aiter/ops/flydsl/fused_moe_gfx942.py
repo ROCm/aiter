@@ -11,6 +11,7 @@ from aiter import ActivationType, QuantType
 from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -208,6 +209,17 @@ def get_tune_space():
     return [config.to_string() for config in configs]
 
 
+@aot_factory(
+    "moe_gfx942_gemm",
+    sources=[
+        "kernels/moe_gemm_2stage/gfx9_fp8",
+    ],
+    # Read by gfx9_fp8/common.py.
+    env=[
+        "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
+        "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
+    ],
+)
 @cache
 def _get_compiled_kernel(
     N,
@@ -363,7 +375,7 @@ def _run_prefill(
     if quant_type == QuantType.per_Tensor:
         # Gate/Up skips routes sorting drops, but the Down absmax reads every row.
         gemm1_out.zero_()
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_compiled_kernel.lazy(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -420,7 +432,7 @@ def _run_prefill(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_compiled_kernel.lazy(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -511,7 +523,7 @@ def _run_batch1(
     )
     route_count = problem.batch * problem.topk
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_compiled_kernel.lazy(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -539,7 +551,7 @@ def _run_batch1(
         route_count,
     )
 
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_compiled_kernel.lazy(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -600,7 +612,7 @@ def _run_decode(
     block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gemm1_out = _gateup_output(hidden_states, problem)
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    gateup_kernel = _get_compiled_kernel(
+    gateup_kernel = _get_compiled_kernel.lazy(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -628,7 +640,7 @@ def _run_decode(
         grid,
     )
 
-    down_kernel = _get_compiled_kernel(
+    down_kernel = _get_compiled_kernel.lazy(
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,

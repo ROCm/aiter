@@ -80,6 +80,8 @@ class KernelSpec:
     gluon_candidates: dict = field(default_factory=dict)
     # (config) -> (ctas_m, ctas_n): how the kernel splits BLOCK_SIZE_M/N over a CTA cluster
     cta_split: Callable | None = None
+    # True: a path without tl.dot takes BLOCK_SIZE_M/N below space.MIN_DOT_TILE
+    vector_tiles: bool = False
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -493,6 +495,38 @@ def gemm_a16w16_atomic(shape, backend):
         return gemm(x, w, dtype=torch.bfloat16, y=y, config=config)
 
     return call, (x, w, y), None
+
+
+@kernel("GEMM-A16W32", bits=(16, 48), backend_kwarg=False, vector_tiles=True)
+def gemm_a16w32(shape, backend):
+    from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w32 import (
+        generate_gemm_a16w32_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    # the bf16x3 kernel keeps three bf16 weight tiles in LDS, hence bits=(16, 48)
+    x, w, w_bf16x3, y = generate_gemm_a16w32_inputs(M, N, K, output=True)
+
+    def call(config, x, w, w_bf16x3, y):
+        return gemm(x, w, w_bf16x3, y=y, config=config)
+
+    def should_skip(config):
+        if config.get("kernel_type") != "bandwidth_bound":
+            # tl.dot in the bf16x3 kernel needs blocks of 16 or more in each dimension.
+            return min(config[f"BLOCK_SIZE_{d}"] for d in "MNK") < 16
+        # The fp32 FMA kernel computes one row of W in each program (BLOCK_SIZE_N 1),
+        # with no split-K and no tile swizzle. It keeps a BLOCK_SIZE_M x BLOCK_SIZE_K
+        # fp32 sum: at most 256 values per thread of a wave64, as exceeds_registers.
+        return (
+            config["BLOCK_SIZE_N"] != 1
+            or config.get("NUM_KSPLIT", 1) != 1
+            or config.get("GROUP_SIZE_M", 1) != 1
+            or config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_K"]
+            > 256 * 64 * config["num_warps"]
+        )
+
+    return call, (x, w, w_bf16x3, y), should_skip
 
 
 @kernel("GEMM-A16W16-gated", backend_kwarg=False, bounds=(64, 128, 256, 512, 2048))
