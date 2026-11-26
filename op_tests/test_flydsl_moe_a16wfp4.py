@@ -36,6 +36,7 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     fused_moe,
+    fused_moe_2stages,
     fused_topk,
     moe_sorting,
     swiglu,
@@ -1013,6 +1014,52 @@ def test_a16w4_situv2_rejects_tagged_gugu_w1():
     assert case["w1"].gate_up_interleave is True
     with pytest.raises(NotImplementedError, match="gate/up-interleaved"):
         _call_fused(case, GateMode.SEPARATED.value)
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "gate_up, gate_mode",
+    [
+        (False, GateMode.INTERLEAVE.value),
+        (True, GateMode.SEPARATED.value),
+    ],
+    ids=["gguu_bytes_interleave_mode", "tagged_gugu_separated_mode"],
+)
+def test_a16w4_situv2_2stages_rejects_unsupported_layout(gate_up, gate_mode):
+    """fused_moe_2stages called directly raises on its own, without fused_moe.
+
+    fused_moe rejects these layouts earlier, so the tests above never reach the
+    check in fused_moe_2stages. The check runs before routing metadata is read,
+    so the sorted_* arguments can be empty.
+    """
+    case = _layout_case(gate_up=gate_up)
+    moe_out = torch.empty(
+        (case["token"], case["w2"].shape[1]), dtype=case["dtype"], device="cuda"
+    )
+    with pytest.raises(NotImplementedError, match="gate/up-interleaved"):
+        fused_moe_2stages(
+            case["inp"],
+            case["w1"],
+            case["w2"],
+            case["topk"],
+            None,
+            None,
+            None,
+            None,
+            moe_out,
+            True,
+            32,
+            activation=ActivationType.Situv2,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            q_dtype_a=dtypes.bf16,
+            q_dtype_w=dtypes.fp4x2,
+            w1_scale=case["w1_scale"],
+            w2_scale=case["w2_scale"],
+            gate_mode=gate_mode,
+            beta=4.0,
+            linear_beta=25.0,
+        )
 
 
 @_SKIP
