@@ -162,20 +162,34 @@ def _get_launcher(n: int, quant_mode: str):
     return launcher
 
 
-def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
-    """Quantize BF16 rows to MXFP4 or MXFP8 payloads with E8M0 scales."""
+def per_1x32_mx_quant(x, quant_mode="fp4", stream=None, out=None):
+    """Quantize BF16 rows to MXFP4 or MXFP8 payloads with E8M0 scales.
+
+    ``out``: contiguous (payload, scales) to write instead of allocating; the
+    FP4 payload is passed as uint8 bytes.
+    """
     assert x.dtype == torch.bfloat16, f"x must be bf16, got {x.dtype}"
     x = x.contiguous()
     m, n = x.shape
     assert n % GROUP == 0, f"n={n} must be divisible by {GROUP}"
     scale_n = n // GROUP
     if quant_mode == "fp4":
-        y = torch.empty((m, n // 2), dtype=torch.uint8, device=x.device)
+        y_shape, y_dtype = (m, n // 2), torch.uint8
     elif quant_mode == "fp8":
-        y = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+        y_shape, y_dtype = (m, n), torch.float8_e4m3fn
     else:
         raise ValueError(f"quant_mode must be fp4|fp8, got {quant_mode!r}")
-    scale = torch.empty((m, scale_n), dtype=torch.uint8, device=x.device)
+    if out is None:
+        y = torch.empty(y_shape, dtype=y_dtype, device=x.device)
+        scale = torch.empty((m, scale_n), dtype=torch.uint8, device=x.device)
+    else:
+        y, scale = out
+        assert y.shape == y_shape and y.dtype == y_dtype and y.is_contiguous()
+        assert (
+            scale.shape == (m, scale_n)
+            and scale.dtype == torch.uint8
+            and scale.is_contiguous()
+        )
     grid_blocks = (m * scale_n + BLOCK - 1) // BLOCK
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
