@@ -67,7 +67,7 @@ def validate_parameters(hidden_dim, inter_dim, topk, num_experts):
 
 @functools.cache
 def down_task_emitter(
-    hidden_dim, inter_dim, topk, num_experts, remote_token_shift, wq="fp8"
+    hidden_dim, inter_dim, topk, num_experts, remote_token_shift, wq="fp8", wide=False
 ):
     """One Down task (256 sorted rows x 256 hidden columns) for use inside a kernel.
 
@@ -77,6 +77,7 @@ def down_task_emitter(
     of the ranks' out bases; a sorted ID's token holds its source rank above bit remote_token_shift.
     rows: the block's valid rows (its first rows; wave uniform). The MFMAs of the 64-row A packets past them are
     skipped (a uniform branch per stage).
+    wide: pA (a2) of 2 GiB or more, read through a descriptor per block (from a 64-bit base).
     """
     validate_parameters(hidden_dim, inter_dim, topk, num_experts)
     assert remote_token_shift > 0
@@ -180,7 +181,7 @@ def down_task_emitter(
             ]
             for row, fused in zip(copy_rows, route_ids(copy_rows)):
                 _, a_valid = decode(fused)
-                a_row = block * SORT_BLOCK_M + row
+                a_row = row if wide else block * SORT_BLOCK_M + row
                 a_offsets.append(
                     a_valid.select(a_row * K + copy_col * 16, fx.Int32(OOB_OFFSET))
                 )
@@ -189,11 +190,22 @@ def down_task_emitter(
                 sa_row = block * SORT_BLOCK_M + row
                 sa_offsets.append(sa_valid.select(sa_row * 4, fx.Int32(OOB_OFFSET)))
 
-            a_tensor = fx.rocdl.make_buffer_tensor(
-                fx.make_view(pA, fx.make_layout(1, 1)),
-                max_size=False,
-                num_records_bytes=a2_rows * K,
-            )
+            if const_expr(wide):
+                # a2 from the block's first row on (pA holds i32 words)
+                a_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        pA + fx.Int64(block * SORT_BLOCK_M) * (K // 4),
+                        fx.make_layout(1, 1),
+                    ),
+                    max_size=False,
+                    num_records_bytes=SORT_BLOCK_M * K,
+                )
+            else:
+                a_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(pA, fx.make_layout(1, 1)),
+                    max_size=False,
+                    num_records_bytes=a2_rows * K,
+                )
             a_packet = BufferTensor(
                 fx.make_view(fx.get_iter(a_tensor), fx.make_layout(4, 1))
             )

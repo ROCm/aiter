@@ -38,6 +38,14 @@ PLAN_TOTAL = 0
 # send_info: destination row in bits [0, 19), global expert above.
 ROW_BITS = 19
 
+
+def row_bits(e_global, wide):
+    """send_info's row bits: ROW_BITS, or with wide receive rows (past 2 GiB,
+    LargeMRuntime.wide) every bit the global expert and the sign (-1: not sent) leave.
+    """
+    return 31 - (e_global - 1).bit_length() if wide else ROW_BITS
+
+
 PREP_THREADS = 1024
 PLAN_THREADS = 256
 FINISH_THREADS = 64
@@ -439,12 +447,13 @@ def _compile_ep_prep(E_LOCAL):
     return launch
 
 
-def _compile_ep_plan(E_LOCAL):
+def _compile_ep_plan(E_LOCAL, wide=False):
     """Routing plan, one workgroup of 256 threads per slice of this rank's routes:
     send_route / send_info [T*TOPK]: all routes sorted by when the destinations' mega-kernel queues need them (block
     position in the queue, the send key): workgroup j places the routes of slice j at their key's base (ep_prep) plus
     a range reserved with an atomic on the key's cursor, so the order within a key varies from call to call. The
-    producers send this array chunk by chunk. info = destination row | global expert << ROW_BITS, -1 past s_cap.
+    producers send this array chunk by chunk. info = destination row | global expert << row_bits(E_GLOBAL, wide), -1
+    past s_cap.
     Slots without a route (expert id outside [0, E_GLOBAL)) go last, with info -1: ep_prep counted only the routed
     ones into the keys' bases, so they fill [routed, num_routes) and the producers skip them.
     gu_ids [s_cap] / expert_ids [s_cap/256] / sched expected rows per block: this rank's sorted blocks.
@@ -457,6 +466,8 @@ def _compile_ep_plan(E_LOCAL):
     PLAN_KEY_CURSOR, PLAN_INTS = o["PLAN_KEY_CURSOR"], o["PLAN_INTS"]
     L_KEY_COUNT, L_KEY_NEXT, L_INTS = o["L_KEY_COUNT"], o["L_KEY_NEXT"], o["L_INTS"]
     _mega_row = _mega_row_fn(E_GLOBAL, o["P_COUNTS"])
+    # A closure value, in FlyDSL's cache key (module globals are not).
+    info_row_bits = row_bits(E_GLOBAL, wide)
 
     @fx.struct
     class Shared:
@@ -511,7 +522,9 @@ def _compile_ep_plan(E_LOCAL):
                         _lds_load(lds, PLAN_BASE + g),
                         ws=pWs,
                     )
-                    info = (row < s_cap).select(row | (g << ROW_BITS), fx.Int32(-1))
+                    info = (row < s_cap).select(
+                        row | (g << info_row_bits), fx.Int32(-1)
+                    )
                     key = _route_key(g, row, s_cap, lds, PLAN_QSTART, E_LOCAL)
                 rank = _lds_add(lds, L_KEY_COUNT + key, 1)
             routes.append(route)
@@ -685,9 +698,10 @@ def ep_plan(
     down_ids,
     expert_ids,
     sched,
+    wide=False,
 ):
     _run_compiled(
-        launcher(_compile_ep_plan, topk_ids.device.index, E_LOCAL=e_local),
+        launcher(_compile_ep_plan, topk_ids.device.index, E_LOCAL=e_local, wide=wide),
         _ptr(topk_ids),
         _ptr(route_idx),
         _ptr(plan),

@@ -112,6 +112,7 @@ def ep_mega_kernel(
     BCM1=2,
     BCM2=2,
     WQ="fp4",
+    WIDE=False,
 ):
     """The mega kernel for (H, I, top-k) and ``E_LOCAL`` experts per rank;
     ``token_shift``: bits of the source
@@ -120,7 +121,9 @@ def ep_mega_kernel(
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``WQ``: "fp4" fd2 mxfp4 W
     (a8w4), "fp8" fp8 W in aiter's (16, 16) preshuffle with f32 128x128 block scales
-    (a8w8)."""
+    (a8w8). ``WIDE``: receive rows or a2 of 2 GiB or more (``MainRuntime.wide``): a
+    64-bit base per block (A of both GEMMs, a2 stores) and per route row (the
+    producers' x stores), so every i32 byte offset stays inside one block or row."""
     assert ACT in ("silu", "silu_clamped", "situv2") and QX in (0, 1), (ACT, QX)
     assert WQ in ("fp4", "fp8"), WQ
     FP8W = WQ == "fp8"
@@ -177,6 +180,7 @@ def ep_mega_kernel(
         + ("" if QX else "_xrow")
         + ("" if ACT == "silu" else f"_{ACT}")
         + ("" if XCDS == 8 else f"_x{XCDS}")
+        + ("_wide" if WIDE else "")
     )
 
     @fx.struct
@@ -473,11 +477,14 @@ def ep_mega_kernel(
             def lane_value(values, j):
                 return fx.Int32(fx.gpu.shuffle_idx(fx.Int32(values), fx.Int32(j), 64))
 
-            def peer_rsrc(which, rank, nbytes):
+            def peer_rsrc(which, rank, nbytes, row=None):
+                """rank's buffer ``which``; with ``row`` (wave uniform), from that row
+                of H bytes on."""
                 lo, hi = [fx.Uint32(_readlane(h, rank)) for h in bases[which]]
-                return _rsrc(
-                    fx.Int64((fx.Uint64(hi) << fx.Uint64(32)) | fx.Uint64(lo)), nbytes
-                )
+                base = fx.Int64((fx.Uint64(hi) << fx.Uint64(32)) | fx.Uint64(lo))
+                if const_expr(row is not None):
+                    base = base + fx.Int64(row) * fx.Int64(H)
+                return _rsrc(base, nbytes)
 
             per_slice = (n_routes + fx.Int32(producers * 8 - 1)) // fx.Int32(
                 producers * 8
@@ -526,17 +533,27 @@ def ep_mega_kernel(
                 for rt, inf, ok, token, data, scales, weight in pending:
                     row = inf & fx.Int32(ROW_MASK)
                     dest = ok.select(dest_rank(inf), fx.Int32(0))
-                    a_dst = peer_rsrc(0, dest, fx.Int64(rows_cap) * fx.Int64(H))
+                    if const_expr(WIDE):
+                        # a route not sent: an empty descriptor drops the stores, so
+                        # their offsets are the same for every route
+                        nbytes = _u(ok.select(fx.Int32(H), fx.Int32(0)))
+                        a_dst = peer_rsrc(0, dest, nbytes, row=_u(row))
+                    else:
+                        a_dst = peer_rsrc(0, dest, fx.Int64(rows_cap) * fx.Int64(H))
                     for part in range_constexpr(H // 1024):
-                        buffer_store(
-                            data[part],
-                            a_dst,
-                            lane * fx.Int32(4)
-                            + fx.Int32(part * 256)
-                            + row * fx.Int32(H // 4),
-                            mask=ok,
-                            cache_modifier=P2P_AUX,
-                        )
+                        a_off = lane * fx.Int32(4) + fx.Int32(part * 256)
+                        if const_expr(WIDE):
+                            buffer_store(
+                                data[part], a_dst, a_off, cache_modifier=P2P_AUX
+                            )
+                        else:
+                            buffer_store(
+                                data[part],
+                                a_dst,
+                                a_off + row * fx.Int32(H // 4),
+                                mask=ok,
+                                cache_modifier=P2P_AUX,
+                            )
                     buffer_store(
                         scales,
                         peer_rsrc(
@@ -653,8 +670,10 @@ def ep_mega_kernel(
                 NT=NT,
                 arg_w=a["w1"],
                 arg_ws=a["w1s"],
-                arg_a=a["ra"],
-                a_num_bytes=fx.Int64(rows_cap) * fx.Int64(H),
+                arg_a=(a["ra"] + fx.Int64(bx_m) * fx.Int64(H) if WIDE else a["ra"]),
+                a_num_bytes=(
+                    fx.Int64(BM * H) if WIDE else fx.Int64(rows_cap) * fx.Int64(H)
+                ),
                 ARB=ARB,
                 acm=2,
                 TR=True,
@@ -664,6 +683,10 @@ def ep_mega_kernel(
             def row_base16(
                 row,
             ):  # sorted rows of the block; padding -> past the end (zeros)
+                if const_expr(WIDE):  # A's descriptor starts at the block
+                    return (row < n_valid).select(
+                        row * fx.Int32(H // 16), fx.Int32(BM * (H // 16))
+                    )
                 return (row < n_valid).select(
                     (bx_m + row) * fx.Int32(H // 16), rows_cap * fx.Int32(H // 16)
                 )
@@ -781,7 +804,10 @@ def ep_mega_kernel(
                     am = fx.max(am, am.shuffle_xor(32, 64))
                     lds[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
                 gpu.barrier()
-                out_rs = _rsrc(a["a2"], fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I))
+                if const_expr(WIDE):  # a2's descriptor starts at the block
+                    out_rs = _rsrc(a["a2"] + fx.Int64(bx_m) * fx.Int64(I), BM * I)
+                else:
+                    out_rs = _rsrc(a["a2"], fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I))
                 os_rs = _rsrc(
                     a["a2s"], fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(G2N * 4)
                 )
@@ -806,12 +832,13 @@ def ep_mega_kernel(
                     with fx.fastmath("afn"):  # v_rcp_f32, not an IEEE division
                         inv = fx.Float32(1.0) / s
                     srow = bx_m + rows[mi]
+                    arow = rows[mi] if WIDE else srow
                     for c in range_constexpr(NC1):
                         q = _fp8x4_pack(*[ys[mi, c][v] * inv for v in range(4)])
                         buffer_store(
                             q,
                             out_rs,
-                            (srow * fx.Int32(I) + col + fx.Int32(c * 16))
+                            (arow * fx.Int32(I) + col + fx.Int32(c * 16))
                             // fx.Int32(4),
                             mask=valid[mi],
                             cache_modifier=WT_AUX,
@@ -921,8 +948,10 @@ def ep_mega_kernel(
                 NT=NT,
                 arg_w=a["w2"],
                 arg_ws=a["w2s"],
-                arg_a=a["a2"],
-                a_num_bytes=fx.Int64(rows_cap) * fx.Int64(I),
+                arg_a=(a["a2"] + fx.Int64(bx_m) * fx.Int64(I) if WIDE else a["a2"]),
+                a_num_bytes=(
+                    fx.Int64(BM * I) if WIDE else fx.Int64(rows_cap) * fx.Int64(I)
+                ),
                 ARB=ARB,
                 acm=2,
                 TR=False,
@@ -930,6 +959,8 @@ def ep_mega_kernel(
             )
 
             def row_base16(row):
+                if const_expr(WIDE):  # A's descriptor starts at the block
+                    return row * fx.Int32(I // 16)
                 return (bx_m + row) * fx.Int32(I // 16)
 
             def build_ratios(R):
@@ -1256,16 +1287,27 @@ class MainRuntime:
     def check_capacity(*, world_size, model_dim, experts, topk, mtpr):
         """-> the receive rows for up to ``mtpr`` tokens per rank: every route of every
         rank (the real top-k; the padding slots take no row) plus one partial block per
-        local expert. Refuses an ``mtpr`` whose rows the kernels cannot address."""
+        local expert. Refuses an ``mtpr`` whose rows overflow a send info's row field or
+        whose routes overflow the plan kernel's slices."""
         tcap = 1 << max((int(mtpr) - 1).bit_length(), 1)
-        e_local, H = int(experts) // int(world_size), int(model_dim)
+        e_local = int(experts) // int(world_size)
         s_cap = -(-(NPES * tcap * int(topk) + e_local * BLOCK_M) // BLOCK_M) * BLOCK_M
-        if s_cap >= 1 << row_bits(int(experts)) or s_cap * H >= BUFFER_BYTES_MAX:
+        if s_cap >= 1 << row_bits(int(experts)):
             raise ValueError(
-                f"max_tok_per_rank={mtpr}: {s_cap} receive rows of {H} bytes pass "
-                "the 2 GiB the kernels address with i32 offsets"
+                f"max_tok_per_rank={mtpr}: {s_cap} receive rows pass the send info's "
+                f"{row_bits(int(experts))}-bit row field"
             )
+        # the plan kernel: one workgroup per producer wave, up to 1024 routes each
+        if tcap * KERNEL_TOPK > _PRODUCERS * 8 * 1024:
+            raise ValueError(f"max_tok_per_rank={mtpr}: too many routes per call")
         return s_cap
+
+    @staticmethod
+    def is_wide(s_cap, model_dim, inter_dim):
+        """Whether the receive rows or a2 take 2 GiB or more: past the i32 byte offsets
+        (and a masked lane's 0x7FFFFFFF) of one descriptor, so the mega kernel addresses
+        them per block (``ep_mega_kernel``'s WIDE)."""
+        return s_cap * max(int(model_dim), int(inter_dim)) >= BUFFER_BYTES_MAX
 
     def __init__(
         self,
@@ -1326,10 +1368,7 @@ class MainRuntime:
         self.plan = torch.empty(comm.plan_layout(e_local)[-1], **i32)
         self.expert_ids = torch.zeros(self.nblk, **i32)
         self.sched = torch.zeros(SCHED_EXPECTED + 2 * self.nblk, **i32)
-        # the plan kernel: one workgroup per producer wave, up to 1024 routes each
         self.slices = _PRODUCERS * 8
-        if tcap * kt > self.slices * 1024:
-            raise ValueError(f"max_tok_per_rank={mtpr}: too many routes per call")
         self.a2 = torch.empty((s_cap, I), dtype=torch.uint8, device=dev)
         self.a2_scale = torch.empty((s_cap, I // 128), dtype=torch.float32, device=dev)
         self.x8 = torch.empty((tcap, H), dtype=torch.uint8, device=dev)
@@ -1353,6 +1392,9 @@ class MainRuntime:
             key["QX"] = 0
         if wq != "fp4":
             key["WQ"] = wq
+        self.wide = self.is_wide(s_cap, H, I)
+        if self.wide:
+            key["WIDE"] = True
         d = dev.index
         self.mega_k = host.launcher(ep_mega_kernel, d, **key)
         # From BLOCK_M * E_LOCAL / topk tokens on this rank (uniform routing: an

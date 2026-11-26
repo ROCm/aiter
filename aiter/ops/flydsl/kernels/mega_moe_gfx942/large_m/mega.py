@@ -33,7 +33,7 @@ from ..atomic import _atomic_add_at, _atomic_load_at, _home_queue, _latomic_add
 from ..host import launcher
 from ..hw import _readlane
 from ..hw import _u as _uniform
-from .comm import NPES, ROW_BITS, SCHED_EXPECTED, layout
+from .comm import NPES, SCHED_EXPECTED, layout, row_bits
 from .down import down_task_emitter
 from .gateup import (
     OOB_OFFSET,
@@ -69,9 +69,12 @@ def compile_ep_mega(
     wq="fp8",
     *,
     xcds,
+    wide=False,
 ):
     """The mega kernel's launcher. lag counts units (block pairs) of one queue; e_local: experts per rank; xcds: XCDs of
-    the GPU, 8 (MI300X) or 4 (MI308X).
+    the GPU, 8 (MI300X) or 4 (MI308X); wide: receive rows or a2 past 2 GiB (LargeMRuntime.wide), addressed from a 64-bit
+    base per block (GateUp and Down A, a2 stores) and per route row (the producers' x stores), with send_info's wide
+    row field (comm.row_bits).
 
     One task queue per XCD (producers split evenly; two queues per XCD on 4 XCDs), so the tiles of a block share that
     XCD's L2; a workgroup whose queue is empty takes tasks from the next queues. Queue q holds an eighth of the blocks,
@@ -90,11 +93,11 @@ def compile_ep_mega(
     H, I = hidden_dim, inter_dim
     # A closure value: FlyDSL's cache key holds closure scalars but not the module globals that nested functions read,
     # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
-    row_bits = ROW_BITS
+    info_row_bits = row_bits(NPES * e_local, wide)
     ARRIVED = layout(e_local)["ARRIVED"]
     KB = H // 128
-    gateup = gateup_task_emitter(I, H, topk, e_local, float(swiglu_limit), wq)
-    down = down_task_emitter(H, I, topk, e_local, token_shift, wq)
+    gateup = gateup_task_emitter(I, H, topk, e_local, float(swiglu_limit), wq, wide)
+    down = down_task_emitter(H, I, topk, e_local, token_shift, wq, wide)
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
     NG, ND = gateup.n_tiles, down.n_tiles
@@ -268,9 +271,13 @@ def compile_ep_mega(
                     )
                 )
 
-            def peer_rsrc(which, rank, num_bytes):
+            def peer_rsrc(which, rank, num_bytes, row=None):
+                """rank's buffer `which`; with `row` (wave uniform), from that row of H bytes on."""
                 lo, hi = [fx.Uint32(_readlane(half, rank)) for half in bases[which]]
-                return buffer_rsrc_at((fx.Uint64(hi) << 32) | fx.Uint64(lo), num_bytes)
+                base = (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+                if const_expr(row is not None):
+                    base = base + fx.Uint64(row) * H
+                return buffer_rsrc_at(base, num_bytes)
 
             def lane_value(values, j):
                 return _readlane(values, fx.Int32(j))
@@ -352,14 +359,22 @@ def compile_ep_mega(
                         )
                     )
                 for route, info, ok, token, slot, data, scales, weight in pending:
-                    row = info & ((1 << row_bits) - 1)
-                    dest = ok.select(expert_rank(info >> row_bits), fx.Int32(0))
-                    a_dst = peer_rsrc(0, dest, rows_cap * H)
+                    row = info & ((1 << info_row_bits) - 1)
+                    dest = ok.select(expert_rank(info >> info_row_bits), fx.Int32(0))
+                    if const_expr(wide):
+                        # a route not sent: an empty descriptor drops the stores, so
+                        # their offsets are the same for every route
+                        a_dst = peer_rsrc(
+                            0, dest, ok.select(fx.Int32(H), fx.Int32(0)), row=row
+                        )
+                    else:
+                        a_dst = peer_rsrc(0, dest, rows_cap * H)
                     for part in range_constexpr(H // 1024):
+                        a_off = lane * 16 + part * 1024
                         buffer_store(
                             data[part],
                             a_dst,
-                            ok.select(lane * 16 + part * 1024 + row * H, oob),
+                            a_off if wide else ok.select(a_off + row * H, oob),
                             aux=P2P_AUX,
                         )
                     buffer_store(
@@ -385,12 +400,12 @@ def compile_ep_mega(
                         aux=P2P_AUX,
                     )
                 rocdl.s_waitcnt(vmcnt=0)
-                expert = infos >> row_bits
+                expert = infos >> info_row_bits
                 source = expert_rank(expert) & (NPES - 1)
                 ws_lo, ws_hi = [
                     fx.Uint32(fx.gpu.shuffle_idx(half, source, 64)) for half in bases[4]
                 ]
-                block_of_row = (infos & ((1 << row_bits) - 1)) // SORT_BLOCK_M
+                block_of_row = (infos & ((1 << info_row_bits) - 1)) // SORT_BLOCK_M
                 arrived = fx.Int64(
                     (fx.Uint64(ws_hi) << 32) | fx.Uint64(ws_lo)
                 ) + fx.Int64((ARRIVED + block_of_row) * 4)
@@ -816,6 +831,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers, lag):
         swiglu_limit=op.swiglu_limit,
         wq=op.wq,
         xcds=op.xcds,
+        wide=op.wide,
     )
     # Persistent: about one workgroup per CU.
     grid = min(

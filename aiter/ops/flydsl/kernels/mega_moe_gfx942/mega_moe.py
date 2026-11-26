@@ -34,9 +34,12 @@ Every rank builds the same instances in the same order (after MORI shmem is
 initialized) and makes the same calls in the same order, as with MegaMoEV2. Each rank
 receives at most every route of every rank (8 x max_tok_per_rank x topk rows plus one
 partial block per expert), so no route is dropped. The main path's buffers at
-max_tok_per_rank 2048 / 4096 / 8192: 0.42 / 0.82 / 1.63 GiB of the MORI symmetric heap
-(``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 GiB of device memory (top-6); the
-largest is 8192 at top-6 and 4096 at top-8 (the receive buffer stays below 2 GiB).
+max_tok_per_rank 2048 / 4096 / 8192 / 16384: 0.42 / 0.82 / 1.63 / 3.24 GiB of the MORI
+symmetric heap (``MORI_SHMEM_HEAP_SIZE``) plus 0.21 / 0.41 / 0.81 / 1.62 GiB of device
+memory (top-6; top-8 takes about 4/3 of it); the largest is 16384 (the plan kernels'
+slices). From 2 GiB of receive rows on (past 8192 at top-6, 4096 at top-8) the kernels
+address them and a2 from a 64-bit base per block, as their i32 offsets cannot (the
+kernels' wide variants, built only for such capacities).
 large_M takes about the same, small_M at 128 tokens per rank 0.18 GiB of the heap; its
 fixed slots (8 x small-input tokens per rank, per local expert) stay below 2 GiB up to
 2040 tokens per rank (1088 on DeepSeek-V4.1-Flash's layer). A capacity past these is

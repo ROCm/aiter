@@ -83,7 +83,7 @@ def _lds_dwords(row, column):
 
 @functools.cache
 def gateup_task_emitter(
-    inter_dim, hidden_dim, topk, num_experts, swiglu_limit=0.0, wq="fp8"
+    inter_dim, hidden_dim, topk, num_experts, swiglu_limit=0.0, wq="fp8", wide=False
 ):
     """One GateUp task (256 sorted rows x 128 gate + 128 up columns) for use inside a kernel.
 
@@ -93,6 +93,8 @@ def gateup_task_emitter(
     swiglu_limit > 0: SiLU(min(gate, limit)) * clamp(up, -limit, limit), as DeepSeek-V4 and aiter's silu_clamped.
     rows: the block's valid rows (its first rows; wave uniform). The MFMAs of the 64-row A packets past them are
     skipped (a uniform branch per stage).
+    wide: pA and pC (a2) of 2 GiB or more, read and written through a descriptor per block (from a 64-bit base); a
+    block's sorted IDs are then its own rows.
     """
     validate_parameters(inter_dim, hidden_dim, topk, num_experts)
     I, K = inter_dim, hidden_dim
@@ -203,25 +205,43 @@ def gateup_task_emitter(
                 a_offsets, sa_offsets = [], []
                 for fused in a_ids:
                     token, _, valid = decode(fused)
+                    a_row = token - a_row0 if wide else token
                     a_offsets.append(
-                        valid.select(token * K + tid % 8 * 16, fx.Int32(OOB_OFFSET))
+                        valid.select(a_row * K + tid % 8 * 16, fx.Int32(OOB_OFFSET))
                     )
                 for fused in sa_ids:
                     token, _, valid = decode(fused)
                     sa_offsets.append(valid.select(token * 4, fx.Int32(OOB_OFFSET)))
                 return a_offsets, sa_offsets
 
-            a_tensor = fx.rocdl.make_buffer_tensor(
-                fx.make_view(pA, fx.make_layout(1, 1)),
-                max_size=False,
-                num_records_bytes=num_tokens * K,
-            )
+            if const_expr(wide):
+                # A from the block's first row on (pA holds i32 words)
+                a_row0 = coords()[0] * SORT_BLOCK_M
+                a_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        pA + fx.Int64(a_row0) * (K // 4), fx.make_layout(1, 1)
+                    ),
+                    max_size=False,
+                    num_records_bytes=SORT_BLOCK_M * K,
+                )
+            else:
+                a_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(pA, fx.make_layout(1, 1)),
+                    max_size=False,
+                    num_records_bytes=num_tokens * K,
+                )
             a_packet = BufferTensor(
                 fx.make_view(fx.get_iter(a_tensor), fx.make_layout(4, 1))
             )
             scale_a_rsrc = rsrc_of(pScaleA, num_tokens * (KB * 4))
             scale_b_rsrc = rsrc_of(pScaleB, num_experts * scale_rows_b * (KB * 4))
-            fp8_rsrc = rsrc_of(pC, num_blocks * (SORT_BLOCK_M * I))
+            if const_expr(wide):
+                fp8_rsrc = rsrc_of(
+                    pC + fx.Int64(coords()[0] * SORT_BLOCK_M) * (I // 4),
+                    SORT_BLOCK_M * I,
+                )
+            else:
+                fp8_rsrc = rsrc_of(pC, num_blocks * (SORT_BLOCK_M * I))
             fp8_scale_rsrc = rsrc_of(
                 pScaleC, num_blocks * (SORT_BLOCK_M * (I // 128) * 4)
             )
@@ -696,7 +716,7 @@ def gateup_task_emitter(
                     buffer_store(
                         Vec(lds_view(_lds_dwords(out_row, tid % 8)).load()).ir_value(),
                         fp8_rsrc,
-                        (block * SORT_BLOCK_M + out_row) * I
+                        (out_row if wide else block * SORT_BLOCK_M + out_row) * I
                         + n_tile * TILE_N
                         + tid % 8 * 16,
                         aux=STORE_AUX,

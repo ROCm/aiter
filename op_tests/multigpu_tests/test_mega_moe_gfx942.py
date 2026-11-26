@@ -25,7 +25,9 @@ and linear_beta 25). A layer that ``eligible()`` does not take is skipped.
   except on large_M's ``forward``, whose x quant (aiter's per_1x128) drops a NaN.
 - test_mega_moe_gfx942_capacity: every rank brings max_tok_per_rank rows. With
   "all_to_one" routing every route of every rank goes to rank 0, which must receive
-  all of them (8 x the uniform average; past 2^18 rows at max_tok_per_rank 8192).
+  all of them (8 x the uniform average). At max_tok_per_rank 16384 its receive rows
+  take 3 to 4 GiB (the kernels' wide addressing), and all_to_one fills them past 2 GiB
+  (on MiMo-V2.6-Flash's top-8, past 4 GiB).
 - test_nan_rows_in_two_stage_block: NaN rows in a block of 128 rows must not reach its
   finite rows (large_M's stages of 64 rows).
 - test_small_m_below_one_m_tile: small_M with ``small_m_mtprs=(1,)``, fewer fixed slots
@@ -49,7 +51,8 @@ import socket
 import threading
 import time
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "8G")
+# max_tok_per_rank 16384: two layers of up to 4.3 GiB of the heap each (top-8).
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 import pandas as pd
 import torch
@@ -575,11 +578,12 @@ def test_capacity_checked_before_allocation(weights):
     """A capacity whose buffers the kernels cannot address is refused before the first
     symmetric allocation: small_M at 2048 tokens per rank (a8w4: its fixed slots, 8 x
     2048 rows per local expert, reach 2 GiB; a8w8 runs the main path there, refused at
-    16384), and max_tok_per_rank 16384 (large_M's receive rows)."""
+    32768), and max_tok_per_rank 32768 on the main path and large_M (more routes than
+    the plan kernels' slices hold)."""
     import mori.shmem as ms
 
     rank = _STATE["rank"]
-    small = 2048 if _STATE["quant"] == "a8w4" else 16384
+    small = 2048 if _STATE["quant"] == "a8w4" else 32768
     cases = {
         f"small_m_mtprs=({small},)": {
             "mtpr": MTPR,
@@ -587,7 +591,8 @@ def test_capacity_checked_before_allocation(weights):
             "large": True,
             "small_mtpr": small,
         },
-        "max_tok_per_rank=16384": {"mtpr": 16384, "small": False, "large": True},
+        "main max_tok_per_rank=32768": {"mtpr": 32768, "small": False, "large": False},
+        "large max_tok_per_rank=32768": {"mtpr": 32768, "small": False, "large": True},
     }
     created, create = [], ms.mori_shmem_create_tensor
     ms.mori_shmem_create_tensor = lambda *a: created.append(a) or create(*a)
@@ -762,7 +767,7 @@ def main():
         nargs="*",
         default=None,
         help="max_tok_per_rank of the full-capacity layers (default: 2048 and the "
-        "largest, 8192 at top-6, 4096 at top-8)",
+        "largest, 16384)",
     )
     parser.add_argument(
         "-r",
@@ -774,8 +779,8 @@ def main():
     )
     args = parser.parse_args()
     _use_model(args.model)
-    # The worst-case receive buffer (8 x max_tok_per_rank x top-k rows) stays below 2 GiB.
-    args.mtpr = args.mtpr or [2048, 8192 if TOPK <= 6 else 4096]
+    # 16384: the plan kernels' limit; receive rows past 2 GiB (wide addressing).
+    args.mtpr = args.mtpr or [2048, 16384]
     reason = _skip_reason(args.quant, args.model)
     if reason:
         aiter.logger.warning("test_mega_moe_gfx942 skipped: %s", reason)

@@ -29,6 +29,7 @@ from .comm import (
     ep_plan,
     ep_prep,
     layout,
+    row_bits,
 )
 from .gateup import OOB_OFFSET, SORT_BLOCK_M
 from .mega import ep_mega
@@ -67,21 +68,28 @@ class LargeMRuntime:
     def check_capacity(*, world_size, model_dim, experts, topk, max_tok_per_rank):
         """-> the worst-case receive rows: every route of every rank to this rank, plus one
         partial block per local expert. Refuses a max_tok_per_rank whose rows overflow
-        send_info's row field or reach the buffer descriptors' OOB_OFFSET (a masked lane's
-        offset must stay out of range), or whose routes overflow an ep_plan slice."""
+        send_info's (wide) row field or whose routes overflow an ep_plan slice."""
         tcap = 1 << max(int(max_tok_per_rank - 1).bit_length(), 1)
         rows = world_size * tcap * topk + experts // world_size * SORT_BLOCK_M
         s_cap = -(-rows // SORT_BLOCK_M) * SORT_BLOCK_M
-        if s_cap > 1 << ROW_BITS or s_cap * model_dim >= OOB_OFFSET:
+        bits = row_bits(experts, wide=True)
+        if s_cap > 1 << bits:
             raise ValueError(
-                f"max_tok_per_rank={max_tok_per_rank}: the worst-case receive buffer of {s_cap} rows x "
-                f"{model_dim} B exceeds the kernels' 2 GiB / 2^{ROW_BITS}-row bound"
+                f"max_tok_per_rank={max_tok_per_rank}: the worst-case receive buffer of {s_cap} rows exceeds "
+                f"send_info's {bits}-bit row field"
             )
         if tcap * topk > _PRODUCERS * 8 * 1024:
             raise ValueError(
                 f"max_tok_per_rank={max_tok_per_rank}: too many routes per ep_plan slice"
             )
         return s_cap
+
+    @staticmethod
+    def is_wide(s_cap, model_dim, inter_dim):
+        """Whether the receive rows or a2 reach OOB_OFFSET bytes (past the i32 offsets of one descriptor, whose
+        masked lanes must stay out of range) or send_info's 19-bit row field: the kernels then address them per
+        block and the plan packs wide rows (``compile_ep_mega``'s wide)."""
+        return s_cap > 1 << ROW_BITS or s_cap * max(model_dim, inter_dim) >= OOB_OFFSET
 
     def __init__(
         self,
@@ -138,6 +146,7 @@ class LargeMRuntime:
             topk=topk,
             max_tok_per_rank=max_tok_per_rank,
         )
+        self.wide = self.is_wide(self.s_cap, model_dim, inter_dim)
         self.slices = _PRODUCERS * 8
         self.dev = torch.device("cuda", torch.cuda.current_device())
         H, I, S, dev = model_dim, inter_dim, self.s_cap, self.dev
@@ -315,6 +324,7 @@ class LargeMRuntime:
             self.down_ids,
             self.expert_ids,
             self.sched,
+            wide=self.wide,
         )
         ep_mega(self, x_q, x_scale, w, _PRODUCERS, _LAG)
         ep_finish(self.e_local, self.rank, self.epoch, self.ws, t["ws"])
