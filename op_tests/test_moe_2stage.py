@@ -2852,7 +2852,8 @@ def test_glm5_tp8_decode(token):
         a2_scale=ys.view(token, topk, -1),
         doweight=True,
     )
-    out = fused_moe(
+    out, us = run_perftest(
+        fused_moe,
         x,
         w["w1_sh"],
         w["w2_sh"],
@@ -2862,13 +2863,31 @@ def test_glm5_tp8_decode(token):
         w2_scale=w["w2_scale"],
         quant_type=aiter.QuantType.per_128x128,
         activation=aiter.ActivationType.Silu,
+        num_iters=20,
+        num_warmup=3,
     )
     # Elementwise tolerance does not separate a correct FP8 MoE from a broken
     # one here; the bad token-16 kernel shows up as a logits difference of ~1.
     a, b = ref.double(), out.double()
     logits_diff = float(1 - 2 * (a * b).sum() / (a.square() + b.square()).sum())
-    assert logits_diff < 0.01, f"glm5 tp8 decode token={token}: {logits_diff=}"
-    return {"gfx": get_gfx_runtime(), "logits_diff": logits_diff}
+    row_err = ((b - a).norm(dim=1) / a.norm(dim=1)).nan_to_num(float("inf"))
+    worst_row = float(row_err.max())
+    msg = f"glm5 tp8 decode token={token}"
+    assert logits_diff < 0.01, f"{msg}: {logits_diff=}"
+    assert worst_row < 0.05, f"{msg}: row error {worst_row}"
+    flops = 6 * token * topk * model_dim * inter_dim
+    nbytes = (
+        ids.unique().numel() * 3 * inter_dim * model_dim * w["w1"].element_size()
+        + 2 * token * model_dim * x.element_size()
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": nbytes / us / 1e6,
+        "logits_diff": logits_diff,
+        "row err": worst_row,
+    }
 
 
 def run_glm5_decode_cases():
