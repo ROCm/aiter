@@ -456,6 +456,30 @@ def _mhc_fused_prefill_config_gfx950_256(m, hidden_size):
     return split_k, 32, 32, 64
 
 
+# gfx950, 256 CUs, FP32 projection weights: up to this row count mhc_fused_post_pre
+# runs post + pre with regular stores in mhc_post. mhc_post on its own switches to
+# non-temporal stores above 8 * cu_num rows; mhc_pre reads that residual back at
+# once, and up to this row count it reads it faster after regular stores on both
+# MI350X and MI355X (1.02x to 1.13x for hidden sizes 4096, 5120 and 7168). Above it
+# the two devices disagree and MI355X no longer gains. The results are the same bits.
+MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 8192
+
+
+def _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend) -> bool:
+    """Whether the unfused post + pre of mhc_fused_post_pre keeps regular stores."""
+    return (
+        not w_preshuffle_bf16
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and 8 * 256 < m <= MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950
+        and get_cu_num() == 256
+        and not any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    )
+
+
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
     tile_k = 64 if m >= 2 * hidden_size else 32
     if hidden_size % tile_k != 0:
@@ -1411,6 +1435,9 @@ def mhc_fused_post_pre(
     from ``MHC_FUSED_PREFILL_M_MIN_GFX950`` to ``MHC_FUSED_PREFILL_M_MAX_GFX950``
     and ``hidden_size`` in ``MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950``, where it is
     the faster one with 32-row, 64-wide tiles.
+    With FP32 weights on the same device, that ``mhc_post`` + ``mhc_pre`` runs with
+    regular stores in ``mhc_post`` for ``m`` from 8 * 256 + 1 to
+    ``MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950``; the results are the same bits.
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
@@ -1689,12 +1716,19 @@ def _mhc_fused_post_pre_native(
         )
     ):
         next_residual = torch.empty_like(residual_in)
+        # -1 leaves the store policy to mhc_post, 0 keeps regular stores.
+        store_nt = (
+            0
+            if _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend)
+            else -1
+        )
         mhc_post(
             next_residual,
             layer_input,
             residual_in,
             post_layer_mix,
             comb_res_mix,
+            store_nt,
         )
         post_mix, comb_mix, layer_input_out = mhc_pre(
             next_residual,
