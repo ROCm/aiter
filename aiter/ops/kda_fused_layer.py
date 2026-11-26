@@ -433,13 +433,29 @@ _PIECE_LOADERS = {
 }
 
 
-def _resolve(name, on_gpu):
-    """[(backend, impl), ...] to try in order for ``name``; torch is ``None``."""
+# Layer dtypes each FlyDSL piece is built for; other dtypes fall back to the
+# next choice instead of feeding the kernel inputs it does not take.
+FLYDSL_PIECE_DTYPES = {
+    "chunk_fwd": (torch.bfloat16,),
+    "chunk_bwd": (torch.bfloat16,),
+    "conv_bwd": (torch.bfloat16, torch.float16, torch.float32),
+}
+
+
+def _resolve(name, on_gpu, dtype=None):
+    """[(backend, impl), ...] to try in order for ``name``; torch is ``None``.
+
+    ``dtype`` is the layer's input dtype; a FlyDSL piece is skipped (recorded as
+    ``<name>_flydsl_skipped``) when it is not one the kernel is built for.
+    """
     order = _fallback_order(kda_piece_choices()[name]) if on_gpu else ("torch",)
     found = []
     for backend in order:
         if backend == "torch":
             found.append(("torch", None))
+            continue
+        if backend == "flydsl" and dtype not in FLYDSL_PIECE_DTYPES[name]:
+            LAST_PIECES[f"{name}_flydsl_skipped"] = f"dtype {dtype}"
             continue
         try:
             found.append((backend, _PIECE_LOADERS[(name, backend)]()))
@@ -448,8 +464,8 @@ def _resolve(name, on_gpu):
     return found
 
 
-def _conv_bwd_kernel(on_gpu):
-    backend, fn = _resolve("conv_bwd", on_gpu)[0]
+def _conv_bwd_kernel(on_gpu, dtype=None):
+    backend, fn = _resolve("conv_bwd", on_gpu, dtype)[0]
     LAST_PIECES["conv_bwd"] = backend
     return fn
 
@@ -462,10 +478,10 @@ def _piece(impl):
     return module.rsplit(".", 1)[-1]
 
 
-def _chunk_fwd(q, k, v, g, beta, scale, chunk_size):
+def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None):
     """Chunk forward by the selected backend; a kernel that rejects the call
     (``ValueError``) or fails to build falls through to the next choice."""
-    for backend, fn in _resolve("chunk_fwd", q.is_cuda):
+    for backend, fn in _resolve("chunk_fwd", q.is_cuda, dtype):
         if fn is None:
             break
         try:
@@ -479,7 +495,7 @@ def _chunk_fwd(q, k, v, g, beta, scale, chunk_size):
     return chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
 
 
-def conv_silu_bwd(a, w, dq, dk, dv):
+def conv_silu_bwd(a, w, dq, dk, dv, fn=None):
     """Backward of ``silu(causal_depthwise_conv(a, w))`` split into q/k/v.
 
     a: [B, T, C] conv input; w: [C, W]; dq, dk: [B, T, HK]; dv: [B, T, HV].
@@ -488,7 +504,8 @@ def conv_silu_bwd(a, w, dq, dk, dv):
     """
     B, T, C = a.shape
     hk, hv = dq.shape[-1], dv.shape[-1]
-    fn = _conv_bwd_kernel(a.is_cuda)
+    if fn is None:
+        fn = _conv_bwd_kernel(a.is_cuda)
     if fn is None:
         dc = torch.cat([dq, dk, dv], -1).float()
         with torch.enable_grad():
@@ -641,7 +658,7 @@ def _kda_layer_fused_fwd(
             o = chunk_kda_torch(*chunk_in, scale, chunk_size)
             LAST_PIECES["chunk_fwd"] = "torch(autograd)"
         else:
-            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size)
+            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size, x.dtype)
     o_graph = o if chunk_graph else None
     o = o.detach()
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
@@ -694,7 +711,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
         chunk_impl, fuses = _chunk_bwd_impl, _chunk_bwd_fuses
         LAST_PIECES["chunk_bwd"] = f"registered:{_piece(chunk_impl)}"
     else:
-        backend, impl = _resolve("chunk_bwd", x.is_cuda)[0]
+        backend, impl = _resolve("chunk_bwd", x.is_cuda, x.dtype)[0]
         chunk_impl, fuses = impl if impl is not None else (None, frozenset())
         LAST_PIECES["chunk_bwd"] = backend
     if (
@@ -704,7 +721,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
     ):
         # the kernel cannot apply the safe gate; feed it the finished decay
         fuses = fuses - {"gate"}
-    conv_kernel = _conv_bwd_kernel(x.is_cuda)
+    conv_kernel = _conv_bwd_kernel(x.is_cuda, x.dtype)
     rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
     LAST_PIECES.update(
         proj_gemms=_piece(_proj_ops(x, w)),
@@ -787,7 +804,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops, lower_bound=None):
         dc = torch.cat(dqkv, -1).float()
         da, d_conv = torch.autograd.grad(s["c"], s["conv_in"], dc)
     else:
-        da, d_conv = conv_silu_bwd(s["a"], s["conv_qkv"], *dqkv)
+        da, d_conv = conv_silu_bwd(s["a"], s["conv_qkv"], *dqkv, fn=conv_kernel)
     da = da.reshape(B * T, -1)
     d_wqkv = da.t() @ xf
     dx = dx + da @ s["w_qkv"]

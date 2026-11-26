@@ -244,6 +244,61 @@ def test_kda_block(b, t, nseq, d, h, k, w, r, chunk, lb, dtype):
     return ret
 
 
+@benchmark()
+def test_kda_piece(piece, b, t, d, h, k, w, r, chunk, lb, dtype):
+    """Fused layer backward with one stage on FlyDSL and the rest on Triton, so a
+    wrong FlyDSL piece shows up on its own row."""
+    x = torch.randn(b, t, d).to(dtype)
+    dy = torch.randn(b, t, d).to(dtype)
+    wt = make_weights(d, h, k, w, r, dtype)
+    if b * t <= ORACLE_MAX_TOKENS:
+        ref_name = "recurrent"
+        ref_dx, ref_dw = run_torch(dy, x, wt, h, lb)
+    else:
+        ref_name = "torch_chunk"
+        rdx, rdw = kda_layer_bwd(dy, x, wt, h, chunk, backend="torch", lower_bound=lb)
+        ref_dx, ref_dw = rdx, rdw.tensors()
+    choice = dict.fromkeys(kda_fused_layer.KDA_PIECE_DEFAULTS, "triton")
+    choice[piece] = "flydsl"
+    kda_fused_layer.set_kda_pieces(**choice)
+    try:
+        (dx, dw), us = run_perftest(
+            lambda: kda_layer_bwd(dy, x, wt, h, chunk, backend="fused", lower_bound=lb),
+            num_iters=3,
+            num_warmup=1,
+        )
+        pieces = dict(kda_fused_layer.LAST_PIECES)
+    finally:
+        kda_fused_layer.set_kda_pieces(**dict.fromkeys(choice))
+    tol = 2e-2 if dtype == dtypes.fp32 else 5e-2
+    names = ["x"] + [f.name for f in KDALayerWeights.__dataclass_fields__.values()]
+    worst, failed = 0.0, []
+    for gname, ref, out in zip(names, [ref_dx, *ref_dw], [dx, *dw.tensors()]):
+        sc = ref.abs().max().clamp_min(1e-6)
+        err = checkAllclose(
+            (ref / sc).to(dtypes.fp32),
+            (out.float() / sc).to(dtypes.fp32),
+            rtol=tol,
+            atol=tol,
+            msg=f"{piece}=flydsl: d{gname}",
+        )
+        if err:
+            failed.append(f"d{gname}")
+        worst = max(worst, err)
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "ref": ref_name,
+        # the backend that actually served the stage (flydsl may be skipped)
+        "used": pieces.get(piece),
+        "skipped": pieces.get(f"{piece}_flydsl_skipped", "-"),
+        "us": us,
+        "err": worst,
+        "failed grads": ",".join(failed) or "-",
+    }
+    # asserted in main() after the table, so every piece's row is reported
+    return ret
+
+
 def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
     """Reference for the fused projections, fp32 (A_log: first h entries)."""
     with torch.enable_grad():
@@ -258,11 +313,14 @@ def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
         dz, da = torch.autograd.grad(gate, [zr, a_log], dg)
     # the kernel returns per-element dA_log terms; compare their per-head sums
     gate_out = torch.sigmoid(x.float() @ g_proj.float().t())
+    aux16 = aux.to(g_proj.dtype).float()
     return {
         "gate": gate.detach(),
         "gate_bwd": (dz, da),
         "sigmoid_mul": gate_out * aux,
-        "gproj_bwd": (aux @ g_proj.float(), aux.t() @ x.float()),
+        # the layer feeds dgp to these GEMMs in the weight dtype; grade them on
+        # the same rounded input so only the GEMM itself is measured
+        "gproj_bwd": (aux16 @ g_proj.float(), aux16.t() @ x.float()),
     }
 
 
@@ -395,6 +453,13 @@ def main():
         help="decay gate lower bound (Kimi-K3 gate_lower_bound=-5, safe gate);\n"
         "none = the softplus gate, e.g. -g -5 none",
     )
+    parser.add_argument(
+        "-p",
+        "--pieces",
+        nargs="*",
+        default=list(kda_fused_layer.KDA_PIECE_DEFAULTS),
+        help="stages to run on FlyDSL one at a time (the rest on Triton)",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
@@ -416,6 +481,19 @@ def main():
         aiter.logger.info(
             "kda block fwd+bwd summary (markdown):\n%s", df.to_markdown(index=False)
         )
+        df = []
+        for piece, b, t, (d, h, k, w, r), c, lb in itertools.product(
+            args.pieces, args.batch, args.seqlen, args.shape, args.chunk, args.gate_lb
+        ):
+            df.append(test_kda_piece(piece, b, t, d, h, k, w, r, c, lb, dtype))
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "kda per-piece flydsl summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        bad = df[df["failed grads"] != "-"]
+        assert bad.empty, "flydsl pieces outside tolerance:\n" + bad[
+            ["piece", "t", "used", "failed grads"]
+        ].to_string(index=False)
 
     # the fused projections are the gfx950 bf16/fp16 GEMM with an epilogue
     proj_dtypes = [dt for dt in args.dtype if dt in (dtypes.bf16, dtypes.fp16)]
