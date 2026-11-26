@@ -311,6 +311,20 @@ def build_gemm_a8w4_tdm_task(
       3-D [rows, pair, row] tensor.
     - ``loc_sched``: only tags the kernel name (the launcher's schedule).
     """
+    if a_is_fp4:
+        # The fp4-activation body always emits v_wmma_scale_f32_32x16x128_f4.
+        # gfx1250-strict (MI450 A0 errata) has no wmma-f4-insts, and LLVM then
+        # only prints "requires target feature" and emits a kernel without the
+        # matmul (NaN output). Fail the build loudly instead (ROCm/aiter#8527).
+        from flydsl.runtime.device import get_rocm_arch
+
+        _target = get_rocm_arch()
+        if _target.startswith("gfx1250-"):
+            raise NotImplementedError(
+                f"fp4-activation grouped TDM GEMM cannot target {_target}: it has "
+                "no wmma-f4-insts (MI450 A0 errata, ROCm/aiter#8527). Use fp8 "
+                "activations (a8w4) on this target."
+            )
     # Capture the helper in the launcher's dependency key as well as in the
     # nested kernel closure. Accessor changes must invalidate compiled code.
     pin_rmem_vgpr = place_vgpr
