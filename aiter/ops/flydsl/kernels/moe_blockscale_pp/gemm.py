@@ -40,6 +40,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.act import clamp_gate_up, sigmoid_f32
@@ -447,18 +448,6 @@ class SwigluFp8Epilogue:
         a = g4 * u4 * r
         return [a[v] for v in range_constexpr(4)]
 
-    def _q448(self, x):
-        """``x`` clamped to +-448 as one v_med3_f32 (num min / max).
-
-        A value can exceed 448 by an ulp: the scale's ``amax / 448`` is a
-        product with a rounded reciprocal.
-        """
-        if const_expr(self.clamp):
-            return x.maximumf(fx.Float32(-448.0)).minimumf(fx.Float32(448.0))
-        return fx.Float32(
-            fx.arith.minnumf(fx.arith.maxnumf(x, fx.Float32(-448.0)), fx.Float32(448.0))
-        )
-
     def store(self, gate_up, row0, nb):
         """``gate_up[h] = (gate accs, up accs)`` of row half h; acc ``j * N_TILES_A + i``."""
         lane = _fresh_lane()
@@ -500,34 +489,32 @@ class SwigluFp8Epilogue:
                         dtype=MxDtypeInt.FP8_E4M3,
                     )
                 )
-                inv = ((254 - e) << 23).bitcast(fx.Float32)
+                # One v_cvt_scalef32_pk_fp8_f32 a value pair: it divides by the
+                # scale 2^(e - 127) and rounds anything below 464 to 448 (the
+                # pow2 scale's 1-ulp overflow; measured on gfx950), so it
+                # replaces the multiply by the inverse, a +-448 clamp,
+                # v_cvt_pk_fp8_f32 and the moves pairing packed multiplies'
+                # operands: bitwise the same output, ~140 fewer VALU a wave a
+                # tile (stage 1 -1 to -1.6%). Raw rocdl: no fx-level scaled
+                # fp8 convert.
+                scale = (e << 23).bitcast(fx.Float32)
+                i16x2 = T.vec(2, T.i16)
                 words = []
                 for j in range_constexpr(2):
                     vals = acts[(h, i, j)]
-                    q8 = []
+                    w = Vec.from_elements([0, 0], fx.Int16)
                     for p in range_constexpr(2):
-                        lo = self._q448(vals[2 * p] * inv)
-                        hi = self._q448(vals[2 * p + 1] * inv)
-                        q8.append((lo, hi))
-                    w = fx.Int32(
-                        rocdl.cvt_pk_fp8_f32(
-                            fx.Int32.ir_type,
-                            q8[0][0].ir_value(),
-                            q8[0][1].ir_value(),
-                            fx.Int32(0).ir_value(),
-                            False,
+                        w = Vec(
+                            rocdl.cvt_scalef32_pk_fp8_f32(
+                                i16x2,
+                                w.ir_value(),
+                                fx.Float32(vals[2 * p]).ir_value(),
+                                fx.Float32(vals[2 * p + 1]).ir_value(),
+                                scale.ir_value(),
+                                p == 1,
+                            )
                         )
-                    )
-                    w = fx.Int32(
-                        rocdl.cvt_pk_fp8_f32(
-                            fx.Int32.ir_type,
-                            q8[1][0].ir_value(),
-                            q8[1][1].ir_value(),
-                            w.ir_value(),
-                            True,
-                        )
-                    )
-                    words.append(w)
+                    words.append(w.bitcast(fx.Int32)[0])
                 pair = _swap_pair(words[0], words[1])
                 fx.memref_store_vec(Vec.from_elements(pair, fx.Int32), self.reg)
                 row = row0 + h * LDS_BLOCK_M + self.wave_m * A_GRP_ROWS + i * 16
