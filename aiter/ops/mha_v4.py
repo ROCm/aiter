@@ -456,8 +456,9 @@ def mha_v4_kv_tile_for_q_tile(
     geometry (MXFP6 Q/K with an FP8 V has a 256x128 sorted-sparse row and no Sol-Attn one), so a
     caller narrowing by operands has committed to one mode and should name it.
 
-    head_dim is not a filter that may be left out: an hd256 row runs its own tile (MXFP8 routes
-    hd128 on 128 keys at this Q tile and hd256 on 64), so the query is always for one head dim.
+    head_dim is not a filter: the query is always for one head dim, since an hd256 row runs its
+    own tile (MXFP8 routes hd128 on 128 keys at this Q tile and hd256 on 64). Left out, it is 128,
+    the head dim these accessors answered for before hd256 rows existed; it never means any.
     """
     return _mha_v4_kv_tile_for_q_tile_from_manifest(
         q_tile,
@@ -2123,7 +2124,11 @@ def mha_v4_packed(
                 and _is_fp8_format(k_format)
                 and (q_tile, kv_tile) == (64, 64)
             ):
-                mean_k_scale = _backed_pooled_k_scale(mean_k_scale)
+                # Under the tilt mean_k_scale is plane 0 of sol_tilt_planes' K scales, whose
+                # planes 1..rank the kernel reaches through a byte stride past it; a copy of
+                # the view would drop them. That allocation carries the lookahead rows itself.
+                if sol_tilt is None:
+                    mean_k_scale = _backed_pooled_k_scale(mean_k_scale)
                 mean_k_var_scale = _backed_pooled_k_scale(mean_k_var_scale)
             _mha_v4_fwd_sol_launch(
                 *launch_args,

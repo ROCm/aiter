@@ -3145,6 +3145,82 @@ def test_mha_v4_mxfp8_sol_64x64_reads_backed_pooled_k_scales(kv_blocks, jensen):
         assert not tail[:backed].any(), f"{name}: backing past its tile is not zeroed"
 
 
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+@parametrize(
+    "kv_blocks", [param(8, id="padded-tile"), param(SOL_ATTN_TS_KV, id="full-tile")]
+)
+def test_mha_v4_mxfp8_sol_64x64_tilt_reads_its_own_k_scale_planes(kv_blocks):
+    """Under the tilt, mean_k_scale is plane 0 of sol_tilt_planes' K scales, and the kernel
+    reaches planes 1..rank through a byte stride past it. The planes must reach the kernel as
+    they are: a copy of the view backs plane 0 alone and moves the others out of reach.
+    """
+    recipe, heads = _SOL_ATTN_MXFP8, 2
+    q, k, v = recipe.operands(sequence_k=kv_blocks * _MHA_V4_FINE_TILE[1], heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads, block_tile=_MHA_V4_FINE_TILE)
+    q_real = _e8m0_dequantize(q.quantized, q.descale).to(torch.bfloat16)
+    planes = sol_tilt_planes(
+        _e8m0_dequantize(k.quantized, k.descale).to(torch.bfloat16),
+        v.quantized,
+        sol_q_abs_max(q_real, _MHA_V4_FINE_TILE[0]),
+        plan["mean_k"],
+        plan["mean_v"],
+        0.125,
+        2,
+        _MHA_V4_FINE_TILE[1],
+        k_format="mxfp8",
+        v_format="e4m3",
+        v_descale=v.descale,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+    )
+    tilt = (
+        planes.rank,
+        planes.k_plane_stride,
+        sol_tilt_scaled_params(planes, planes.k_scale_plane_stride),
+    )
+    native = aiter.ops.mha_v4._fmha_v4_fwd_sol
+    signature = inspect.signature(native)
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen.update(signature.bind(*args, **kwargs).arguments)
+        return native(*args, **kwargs)
+
+    def launch():
+        return mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            recipe.qk_format,
+            recipe.qk_format,
+            recipe.v_format,
+            recipe.qk_scale_mode,
+            recipe.qk_scale_mode,
+            recipe.v_scale_mode,
+            kv_block_indices=plan["kv_block_indices"],
+            lut_start=plan["lut_start"],
+            lut_count=plan["lut_count"],
+            mean_k=planes.mean_k,
+            mean_v=planes.mean_v,
+            block_bitmap=plan["block_bitmap"],
+            mean_k_scale=planes.mean_k_scale,
+            mean_v_scale=planes.mean_v_scale,
+            block_tile=_MHA_V4_FINE_TILE,
+            v_pack=recipe.v_pack,
+            sol_tilt=tilt,
+        )
+
+    with mock.patch.object(aiter.ops.mha_v4, "_fmha_v4_fwd_sol", capture):
+        out = launch()
+    assert seen["mean_k_scale"].data_ptr() == planes.mean_k_scale.data_ptr()
+    with mock.patch.object(aiter.ops.mha_v4, "_backed_pooled_k_scale", lambda s: s):
+        unguarded = launch()
+    assert torch.equal(out, unguarded)
+
+
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
     """A missing mode-2 row is a Python error, including on an arch whose MX quantizer aborts.
 
