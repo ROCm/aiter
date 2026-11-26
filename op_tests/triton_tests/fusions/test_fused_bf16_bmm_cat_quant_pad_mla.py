@@ -261,3 +261,138 @@ def test_fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     check_against_ref(out, ref, num_padded_heads, QH)
     # The cache is pure data movement too; padded tokens leave their bytes alone.
     assert torch.equal(kv_cache, ref_cache)
+
+
+@pytest.mark.parametrize(
+    "M,QH,heads,d_nope,scale,tail,layout",
+    [
+        (1, 96, 96, 128, 1.0, 64, "dense"),
+        (33, 8, 16, 192, 0.37, 64, "strided"),
+        (33, 96, 96, 128, 0.37, 64, "atom"),
+        (257, 8, 16, 128, 1e-3, 64, "dense"),
+        (1, 8, 16, 128, 0.37, 0, "dense"),
+        (0, 8, 16, 128, 1.0, 64, "dense"),
+        (8192, 96, 96, 128, 0.37, 64, "dense"),
+    ],
+)
+def test_fused_bf16_bmm_nope_only(
+    M, QH, heads, d_nope, scale, tail, layout, monkeypatch
+):
+    if get_arch() not in SUPPORTED_ARCHS:
+        pytest.skip(f"NoPE-only MLA has no config for {get_arch()}")
+    torch.manual_seed(0)
+    q_nope, w_uk_t, q_pe = generate_inputs(M, QH, d_nope=d_nope)
+    q_scale = torch.tensor(scale, dtype=torch.float32, device="cuda")
+    fp8_max = 64.0 if scale == 1e-3 else fp8_quant_max()
+    width = KV_LORA + tail
+    strided = layout == "strided"
+    if layout == "atom":
+        w_uk_t = w_uk_t.transpose(1, 2).contiguous().transpose(1, 2)
+        storage = torch.zeros((M, 128, width), dtype=torch.uint8, device="cuda")
+    else:
+        shape = (M + 2, heads + 1, 2 * width + 1) if strided else (M, heads, width)
+        storage = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+    view = storage[1:-1, :heads, 1 : 2 * width : 2] if strided else storage[:, :heads]
+    if tail:
+        # Include NaN encodings and distinct bytes for each duplicated head.
+        view[..., KV_LORA] = 0x7F
+        view[..., KV_LORA + 1] = 0x80
+        view[..., -1] = torch.arange(heads, device="cuda", dtype=torch.uint8)
+    out = view.view(get_fp8_e4m3_dtype())
+    expected_storage = storage.clone()
+    if M == 0:
+        monkeypatch.setattr(
+            "aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla._get_config",
+            lambda *args: pytest.fail("empty input reached config selection"),
+        )
+    result = fused_bf16_bmm_cat_quant_pad_mla(
+        q_nope, w_uk_t, None, q_scale, heads, out=out, fp8_max=fp8_max
+    )
+    assert result is out and result.data_ptr() == out.data_ptr()
+    if M:
+        full = fused_bf16_bmm_cat_quant_pad_mla(
+            q_nope, w_uk_t, q_pe, q_scale, heads, fp8_max=fp8_max
+        )
+        expected_view = (
+            expected_storage[1:-1, :heads, 1 : 2 * width : 2]
+            if strided
+            else expected_storage[:, :heads]
+        )
+        expected_view[..., :KV_LORA].copy_(full[..., :KV_LORA].view(torch.uint8))
+        # Bound the torch reference for the serving-sized case.
+        rows = slice(None) if M < 8192 else slice(None, None, 257)
+        ref = ref_bmm_cat_quant_pad(
+            q_nope[:, rows], w_uk_t, q_pe[rows], q_scale, heads, fp8_max
+        )
+        check_against_ref(out[rows, :, :KV_LORA], ref[..., :KV_LORA], heads, QH)
+        if scale == 1e-3:
+            assert (out[..., :KV_LORA].float() == fp8_max).any()
+            assert (out[..., :KV_LORA].float() == -fp8_max).any()
+    assert torch.equal(storage, expected_storage)
+    if strided:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_bf16_bmm_cat_quant_pad_mla(
+                q_nope, w_uk_t, None, q_scale, heads, out=out, fp8_max=fp8_max
+            )
+        view[..., :KV_LORA] = 0x7F
+        graph.replay()
+        assert torch.equal(storage, expected_storage)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing", "width", "rows", "heads", "rank", "dtype", "padding", "scale"],
+)
+def test_fused_bf16_bmm_nope_only_rejects(invalid, monkeypatch):
+    if get_arch() not in SUPPORTED_ARCHS:
+        pytest.skip(f"NoPE-only MLA has no config for {get_arch()}")
+    q_nope, w_uk_t, _ = generate_inputs(1, 8)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    heads = 16
+    out = torch.empty(
+        (1, heads, KV_LORA + D_ROPE), dtype=get_fp8_e4m3_dtype(), device="cuda"
+    )
+    if invalid == "missing":
+        out = None
+    elif invalid == "width":
+        out = out[..., : KV_LORA - 1]
+    elif invalid == "rows":
+        out = out[:0]
+    elif invalid == "heads":
+        out = out[:, :8]
+    elif invalid == "rank":
+        out = out[0]
+    elif invalid == "dtype":
+        out = out.view(torch.uint8)
+    elif invalid == "padding":
+        heads = 15
+    elif invalid == "scale":
+        q_scale = torch.ones((2,), dtype=torch.float32, device="cuda")
+
+    def unexpected_config(*args):
+        pytest.fail("invalid input reached config selection")
+
+    monkeypatch.setattr(
+        "aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla._get_config",
+        unexpected_config,
+    )
+    with pytest.raises(AssertionError):
+        fused_bf16_bmm_cat_quant_pad_mla(q_nope, w_uk_t, None, q_scale, heads, out=out)
+
+
+def test_fused_bf16_bmm_benchmark_cli():
+    from op_tests.op_benchmarks.triton import (
+        bench_fused_bf16_bmm_cat_quant_pad_mla as bench,
+    )
+
+    assert bench.parse_args([]).providers == ["unfused", "fused"]
+    assert bench.parse_args(["--rope-cache"]).providers == [
+        "unfused",
+        "fused_rope_cache",
+    ]
+    assert bench.parse_args(["--providers", "fused_nope_only"]).providers == [
+        "fused_nope_only"
+    ]
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--rope-cache", "--providers", "fused_nope_only"])

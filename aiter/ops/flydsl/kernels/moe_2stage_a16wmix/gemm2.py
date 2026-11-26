@@ -9,6 +9,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     global_typed_ptr,
     lds_typed_ptr,
@@ -467,6 +468,16 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, shared_t
     return total_work
 
 
+@aot_factory(
+    "moe_a16wmix_gemm2",
+    sources=[
+        "kernels/moe_2stage_a16wmix",
+        "kernels/act.py",
+        "kernels/dpp_utils.py",
+        "kernels/layout_utils.py",
+        "kernels/mxfp4_gemm_common.py",
+    ],
+)
 @functools.cache
 def compile_gemm2_a16w4_port(
     BM=32,
