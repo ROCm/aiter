@@ -18,6 +18,7 @@ from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
     AsmMoeMode,
+    _can_reroute_mxfp4_to_flydsl,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -1070,6 +1071,23 @@ def _iter_csv_cases():
             or kernel_name2.startswith("opus_")
             or kwargs["disable_stage1_bias"]
         )
+        if kwargs["inter_dim"] % 256 != 0 and _can_reroute_mxfp4_to_flydsl(
+            model_dim=kwargs["model_dim"],
+            inter_dim=kwargs["inter_dim"],
+            dtype=kwargs["dtype"],
+            q_dtype_a=kwargs["AQDType"],
+            q_dtype_w=kwargs["WQDType"],
+            q_type=kwargs["qType"],
+            activation=kwargs["actType"],
+            is_shuffled=kwargs["preshuffle"],
+            use_g1u1=kwargs["use_g1u1"],
+            doweight_stage1=kwargs["doweight_stage1"],
+            gate_mode=GateMode(kwargs["gateMode"]),
+        ):
+            # Same guard fused_moe uses to reroute a row onto the a16w4 FlyDSL
+            # kernels, which take no per-expert bias.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
         if is_swiglu_oai_asm:
             # The asm FLAT kernels take no per-expert bias; with one, fused_moe
             # discards the row. Run bias-free and require the row's kernel.

@@ -126,10 +126,13 @@ def test_gemm_a16w32_one_hot_rows_are_exact(M, N, K):
     _assert_equal(gemm_a16w32(x, w, y=y), expected, "one-hot rows")
 
 
-@pytest.mark.parametrize("M", [1, 33, 256, 2048, 4096])
-def test_gemm_a16w32_takes_w_bf16x3(M):
-    # vLLM gives the terms as the third argument. The result has the same bits.
-    x, w, w_bf16x3, _ = generate_gemm_a16w32_inputs(M, 128, 6144, output=False)
+@pytest.mark.parametrize("M", [1, 33, 256, 512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize("N, K", [(128, 6144), (256, 3072)])
+def test_gemm_a16w32_takes_w_bf16x3(M, N, K):
+    # vLLM gives the terms as the third argument. The result has the same bits. The
+    # terms use more LDS than the fp32 weight, so each M bucket of the tuned file
+    # (128, 6144) and of DEFAULT.json (256, 3072) must fit with them.
+    x, w, w_bf16x3, _ = generate_gemm_a16w32_inputs(M, N, K, output=False)
     _assert_equal(gemm_a16w32(x, w, w_bf16x3), gemm_a16w32(x, w), "with w_bf16x3")
 
 
