@@ -6,8 +6,8 @@
 ``pa_sparse_prefill_nvfp4_v2`` splits a page's 128 tokens over the CTA's four
 waves, so every wave keeps every row's softmax state and O; the tile stops at
 two rows. Here a CTA takes ``tile_rows`` (8) consecutive rows of one KV head and
-wave w owns ``tile_rows // 4`` of them (rows 2w and 2w + 1 at 8: v2 tq2's state
-a wave), walking every token of the pages its rows selected. A row of the
+wave w owns ``tile_rows // 4`` of them (two at 8: v2 tq2's state a wave),
+walking every token of the pages its rows selected. A row of the
 synthetic M3.1 picks then walks 3.0-3.5 union pages instead of v2's 8.8-9.4.
 
 The union of the tile's page tables is built as in v1/v2. Each union page then
@@ -27,6 +27,11 @@ goes to one of two phases, by how many waves select it:
   the scales) stages with one 2-D tensor DMA, its row stride the distance
   between the two pointers (``tdm_fold``), or two. With room, the B rings take
   A ring frames the A walk has freed.
+
+A row's phase-B pages run on the wave that holds its softmax state, and a CTA
+lasts until its slowest wave's B walk ends. At tile_rows 8 the rows are paired
+in the prologue (largest-first): by each row's pages too few rows select for
+phase A, the fewest with the most, so the waves' B walks are even.
 
 Each wave walks a list of (page, quarter) items from LDS, A's in one loop and
 B's in a second; the page step on a quarter is v2's (rows paired when both
@@ -116,6 +121,30 @@ _DQ_SHIFT = 31
 P_MAX_LOG2 = 15
 REBASE_LOG2 = 8
 P_SHIFT = P_MAX_LOG2 - REBASE_LOG2
+
+# Sorting network for the 8 rows' keys (Batcher's odd-even merge, 19
+# compare-exchanges, uniform values: SALU min/max).
+_SORT8 = (
+    (0, 1),
+    (2, 3),
+    (4, 5),
+    (6, 7),
+    (0, 2),
+    (1, 3),
+    (4, 6),
+    (5, 7),
+    (1, 2),
+    (5, 6),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+    (2, 4),
+    (3, 5),
+    (1, 2),
+    (3, 4),
+    (5, 6),
+)
 
 _CACHE = {}
 
@@ -308,31 +337,32 @@ def compile_pa_sparse_prefill_nvfp4_v3(
         table_i32 = fx.recast_iter(fx.Int32, table)
         context_i32 = fx.recast_iter(fx.Int32, context)
 
-        # This wave's query rows load first: their latency overlaps the
-        # page-table loads and the union build.
-        query_bf16 = fx.recast_iter(fx.BFloat16, query)
-        q_loaded = []
-        for r in range_constexpr(rpw):
-            row = tile * tq + warp * rpw + r
-            seq = (row < rows).select(row * kv_heads + kvh, fx.Int32(0))
-            qbase = fx.Int64(seq) * sq_row + lane16 * sq_head
-            q_loaded.append(
-                [
-                    fx.Vector(
-                        fx.ptr_load(
-                            fx.add_offset(query_bf16, qbase + j * 32 + half * 16),
-                            result_type=fx.Vector.make_type(16, fx.BFloat16),
+        def load_q(tile_rows_of_wave):
+            """This wave's query rows (tile rows ``tile_rows_of_wave``)."""
+            query_bf16 = fx.recast_iter(fx.BFloat16, query)
+            q_loaded = []
+            for r in range_constexpr(rpw):
+                row = tile * tq + tile_rows_of_wave[r]
+                seq = (row < rows).select(row * kv_heads + kvh, fx.Int32(0))
+                qbase = fx.Int64(seq) * sq_row + lane16 * sq_head
+                q_loaded.append(
+                    [
+                        fx.Vector(
+                            fx.ptr_load(
+                                fx.add_offset(query_bf16, qbase + j * 32 + half * 16),
+                                result_type=fx.Vector.make_type(16, fx.BFloat16),
+                            )
                         )
-                    )
-                    for j in range_constexpr(4)
-                ]
-            )
+                        for j in range_constexpr(4)
+                    ]
+                )
+            return q_loaded
 
         def union_barrier():
             """Publishes the union's LDS words with a fence over LDS only:
             gpu.barrier()'s workgroup fence also waits for every global load
-            and store in flight (s_wait_loadcnt / storecnt 0), the query rows
-            above included, which only the query terms read."""
+            and store in flight (s_wait_loadcnt / storecnt 0), which none of
+            the union's words depends on."""
             gpu.barrier(address_spaces=_attr("[#gpu.address_space<workgroup>]"))
 
         # ---- the union of the tile's page tables (as pa_sparse_prefill_nvfp4_v2) ----
@@ -416,11 +446,6 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             )
         union_barrier()
 
-        # ---- the A list (shared) and this wave's item list ----
-        # Every wave derives the same A list from the union (and writes the same
-        # words), so no barrier publishes it; the items are the wave's own.
-        items_w = lay["items"] + warp * (per_wave * 8)
-
         def ballot(cond):
             return fx.Int32(fx.rocdl.ballot(T.i32, cond))
 
@@ -431,6 +456,94 @@ def compile_pa_sparse_prefill_nvfp4_v3(
                     fx.Int32.ir_type, mask.ir_value(), fx.Int32(0).ir_value()
                 )
             )
+
+        # Union page k * WAVE + lane's row bounds (one byte a tile row).
+        n_chunks = (entries + WAVE - 1) // WAVE
+        bounds_w = []
+        for k in range_constexpr(n_chunks):
+            u = k * WAVE + lane
+            raw = lds_load(lay["ubound"] + u * ub, fx.Int32, ub // 4)
+            bounds_w.append(
+                [
+                    (u < n_union).select(raw[i], fx.Int32(0))
+                    for i in range_constexpr(ub // 4)
+                ]
+            )
+
+        def row_bound(bw, t):
+            """Tile row ``t``'s bound on this lane's page (``t`` constant or
+            uniform)."""
+            if const_expr(isinstance(t, int)):
+                return (bw[t // 4] >> (8 * (t % 4))) & 0xFF
+            word = bw[0]
+            for i in range_constexpr(1, ub // 4):
+                word = (t >= 4 * i).select(bw[i], word)
+            return (word >> ((t & 3) << 3)) & 0xFF
+
+        # ---- the row -> wave pairing (tile_rows 8) ----
+        # A row's softmax state lives in one wave, so its phase-B quarters (on
+        # pages fewer than share_min waves select) run there, and the CTA lasts
+        # until its slowest wave's B walk ends. The rows are paired so that the
+        # waves' B walks are even: by each row's pages that fewer than
+        # share_min rows select (B under any pairing), wave w takes the w-th
+        # fewest and the w-th most (LPT). On a union of more than 2 * WAVE
+        # pages (picks too spread for phase A) the pairing gains nothing and
+        # its count would only lengthen the prologue: rows w and 7 - w. Every
+        # wave derives the same map from the same bounds (no barrier); it
+        # lives in SGPRs. Padded rows count 0 and are never stored.
+        if const_expr(rpw == 1):
+            pairs = None
+            my_rows = [warp]
+        else:
+            assert tq == 8
+
+            def add_private_pages(bw, totals):
+                """totals[t] + row t's pages on this chunk that fewer than
+                share_min rows select."""
+                rb = [row_bound(bw, t) for t in range_constexpr(tq)]
+                nz = [rb[t] != 0 for t in range_constexpr(tq)]
+                n_rows = fx.Int32(0)
+                for t in range_constexpr(tq):
+                    n_rows = n_rows + nz[t].select(fx.Int32(1), fx.Int32(0))
+                private = n_rows < share_min
+                return [
+                    totals[t] + fx.Int32(fx.ctpop(ballot(private & nz[t])))
+                    for t in range_constexpr(tq)
+                ]
+
+            def lpt_order():
+                """The rows by their private pages (then by index)."""
+                counts_r = [fx.Int32(0) for _ in range_constexpr(tq)]
+                for k in range_constexpr(2):
+                    if n_union > k * WAVE:
+                        counts_r = add_private_pages(bounds_w[k], counts_r)
+                keys_r = [(counts_r[t] << 3) | t for t in range_constexpr(tq)]
+                for i, j in _SORT8:
+                    keys_r[i], keys_r[j] = (
+                        fx.min(keys_r[i], keys_r[j]),
+                        fx.max(keys_r[i], keys_r[j]),
+                    )
+                return [key_r & 7 for key_r in keys_r]
+
+            srt = [fx.Int32(t) for t in range_constexpr(tq)]
+            if n_union <= 2 * WAVE:
+                srt = lpt_order()
+            pairs = [(srt[w], srt[tq - 1 - w]) for w in range_constexpr(NWARP)]
+            my_rows = []
+            for r in range_constexpr(rpw):
+                row_r = pairs[0][r]
+                for w in range_constexpr(1, NWARP):
+                    row_r = (warp == w).select(pairs[w][r], row_r)
+                my_rows.append(uniform(row_r))
+
+        # The query rows load after the pairing (the wave's rows are known only
+        # then); the list build covers their latency.
+        q_loaded = load_q(my_rows)
+
+        # ---- the A list (shared) and this wave's item list ----
+        # Every wave derives the same A list from the union (and writes the same
+        # words), so no barrier publishes it; the items are the wave's own.
+        items_w = lay["items"] + warp * (per_wave * 8)
 
         def put_items(count, at, page, info, slot_of):
             """Items ``at + t`` = (page, info | t << _Q_SHIFT | slot_of(t, at +
@@ -462,22 +575,29 @@ def compile_pa_sparse_prefill_nvfp4_v3(
             u = k * WAVE + lane
             live = u < n_union
             page = lds_load(lay["upage"] + u * 4, fx.Int32, 1)[0]
-            raw = lds_load(lay["ubound"] + u * ub, fx.Int32, ub // 4)
-            bw = [live.select(raw[i], fx.Int32(0)) for i in range_constexpr(ub // 4)]
+            bw = bounds_w[k]
             count = fx.Int32(0)
-            for w in range_constexpr(NWARP):
-                at = w * rpw
-                mask = (1 << (8 * rpw)) - 1
-                sel = ((bw[at // 4] >> (8 * (at % 4))) & mask) != 0
-                count = count + sel.select(fx.Int32(1), fx.Int32(0))
+            if const_expr(pairs is None):
+                for w in range_constexpr(NWARP):
+                    at = w * rpw
+                    mask = (1 << (8 * rpw)) - 1
+                    sel = ((bw[at // 4] >> (8 * (at % 4))) & mask) != 0
+                    count = count + sel.select(fx.Int32(1), fx.Int32(0))
+            else:
+                for a, b in pairs:
+                    sel = (row_bound(bw, a) | row_bound(bw, b)) != 0
+                    count = count + sel.select(fx.Int32(1), fx.Int32(0))
             top_all = fx.Int32(0)
             for t in range_constexpr(tq):
                 top_all = fx.max(top_all, (bw[t // 4] >> (8 * (t % 4))) & 0xFF)
-            word = bw[0]
-            for i in range_constexpr(1, ub // 4):
-                word = (warp * rpw >= 4 * i).select(bw[i], word)
-            shift = (warp * rpw % 4) * 8
-            mine = [(word >> (shift + 8 * r)) & 0xFF for r in range_constexpr(rpw)]
+            if const_expr(pairs is None):
+                word = bw[0]
+                for i in range_constexpr(1, ub // 4):
+                    word = (warp * rpw >= 4 * i).select(bw[i], word)
+                shift = (warp * rpw % 4) * 8
+                mine = [(word >> (shift + 8 * r)) & 0xFF for r in range_constexpr(rpw)]
+            else:
+                mine = [row_bound(bw, my_rows[r]) for r in range_constexpr(rpw)]
             top_mine = mine[0]
             for r in range_constexpr(1, rpw):
                 top_mine = fx.max(top_mine, mine[r])
@@ -966,7 +1086,7 @@ def compile_pa_sparse_prefill_nvfp4_v3(
         tdm_ops.tensor_wait(0)
         out_bf16 = fx.recast_iter(fx.BFloat16, output)
         for r in range_constexpr(rpw):
-            row = tile * tq + warp * rpw + r
+            row = tile * tq + my_rows[r]
             l_sum = final[r * 10 + 1]
             # A row without a visible key keeps O = 0: store zeros.
             inv = fx.Float32(rcp_f32((l_sum > 0.0).select(l_sum, fx.Float32(1.0))))
