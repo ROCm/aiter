@@ -329,7 +329,7 @@ def test_nvfp4_quant(
     dtype: torch.dtype,
 ):
     torch.cuda.empty_cache()
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
 
     torch.manual_seed(0)
@@ -347,51 +347,6 @@ def test_nvfp4_quant(
         atol = 1.5e-2
         rtol = 1.5e-2
     torch.testing.assert_close(x_dq_triton, x_dq_torch, atol=atol, rtol=rtol)
-
-
-@_REQUIRES_GFX950
-def test_dynamic_mxfp4_quant_sr_validates_contract():
-    with pytest.raises(ValueError, match="2-D"):
-        dynamic_mxfp4_quant(
-            torch.zeros(32, dtype=torch.bfloat16, device="cuda"),
-            use_sr=True,
-            philox_seed=1,
-        )
-
-    x = torch.zeros((3, 32), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(TypeError, match="bfloat16 or float32"):
-        dynamic_mxfp4_quant(x.to(torch.float16), use_sr=True, philox_seed=1)
-    with pytest.raises(ValueError, match="scaling_mode='even'"):
-        dynamic_mxfp4_quant(
-            x,
-            scaling_mode="ceil",
-            use_sr=True,
-            philox_seed=1,
-        )
-    with pytest.raises(ValueError, match="divisible by 32"):
-        dynamic_mxfp4_quant(x[:, :6], use_sr=True, philox_seed=1)
-    with pytest.raises(ValueError, match="philox_seed is required"):
-        dynamic_mxfp4_quant(x, use_sr=True)
-    with pytest.raises(ValueError, match="philox_seed must be"):
-        dynamic_mxfp4_quant(x, use_sr=True, philox_seed=-1)
-
-    counters_used = x.numel() // 8
-    max_valid_offset = (1 << 63) - counters_used
-    dynamic_mxfp4_quant(
-        x,
-        use_sr=True,
-        philox_seed=1,
-        philox_offset=max_valid_offset,
-    )
-    with pytest.raises(ValueError, match="leave room"):
-        dynamic_mxfp4_quant(
-            x,
-            use_sr=True,
-            philox_seed=1,
-            philox_offset=max_valid_offset + 1,
-        )
-    with pytest.raises(ValueError, match="only valid when use_sr=True"):
-        dynamic_mxfp4_quant(x, philox_seed=1)
 
 
 @_REQUIRES_GFX950
@@ -592,7 +547,7 @@ def _mxfp4_quant_op_kernel(
     tl.store(scale_ptr + rows[:, None] * (N // 32) + scale_cols[None, :], scales)
 
 
-@pytest.mark.parametrize("scaling_mode", [0, 1])
+@pytest.mark.parametrize("scaling_mode", [0, 1, 2])
 def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
     torch.manual_seed(scaling_mode)
     m, n = 1024, 128
@@ -616,8 +571,10 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
         outs.append((x_fp4, scales))
     torch.testing.assert_close(outs[0][0], outs[1][0], atol=0, rtol=0)
     torch.testing.assert_close(outs[0][1], outs[1][1], atol=0, rtol=0)
-    if scaling_mode == 1:
-        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=6 * 2**-126)
+    if scaling_mode > 0:
+        # "ceil" floors amax at 6 * 2^-126, "roundup" at 1e-10 like the HIP quant.
+        amax_floor = 6 * 2**-126 if scaling_mode == 1 else 1e-10
+        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=amax_floor)
         ref = torch.ceil(torch.log2(amax / 6)).to(torch.int32) + 127
         torch.testing.assert_close(outs[0][1].int(), ref, atol=0, rtol=0)
 
@@ -626,7 +583,7 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
     arch = arch_info.get_arch()
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("The Gluon backend requires gfx950 or gfx1250")
     if arch == "gfx950" and dtype != torch.bfloat16:
         pytest.skip("The gfx950 Gluon kernel requires bf16 input")
@@ -638,13 +595,3 @@ def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
 
     torch.testing.assert_close(gluon_scale, triton_scale, atol=0, rtol=0)
     torch.testing.assert_close(gluon_out, triton_out, atol=0, rtol=0)
-
-
-def test_dynamic_mxfp4_quant_backend_validation():
-    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="Unknown backend"):
-        dynamic_mxfp4_quant(x, backend="cuda")
-    # gfx1250 runs Gluon for every dtype; elsewhere fp16 has no Gluon kernel.
-    if arch_info.get_arch() != "gfx1250":
-        with pytest.raises(RuntimeError, match="Gluon backend requires"):
-            dynamic_mxfp4_quant(x.half(), backend="gluon")

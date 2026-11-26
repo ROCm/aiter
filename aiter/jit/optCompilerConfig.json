@@ -131,7 +131,7 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_mla_nvfp4": {
+    "module_mla_nvfp4_v7": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_nvfp4.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/quantize.cuh'"
@@ -140,6 +140,23 @@
         "flags_extra_hip": ["'-DENABLE_CK=0'", "'-ffp-contract=off'"],
         "extra_ldflags": "None",
         "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_nvfp4_decode_prep": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_nvfp4_decode_prep_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/nvfp4/decode_prep.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
@@ -1274,6 +1291,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_kpool_compress": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kpool_compress_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/kpool_compress.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_sample": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",
@@ -1752,6 +1782,26 @@
             ],
             "*pa_mqa_logits_mxfp4_gfx1250.cu": [
                 "-fno-honor-nans",
+                "-mllvm -enable-post-misched=1"
+            ]
+        },
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_mqa_topk_bf16_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_topk_bf16/mqa_topk_bf16.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_topk_bf16/mqa_topk_bf16_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_topk_bf16/mqa_topk_bf16_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-honor-nans'"
+        ],
+        "flags_extra_hip_per_source": {
+            "*mqa_topk_bf16_gfx950.cu": [
                 "-mllvm -enable-post-misched=1"
             ]
         },
@@ -2249,7 +2299,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gfx950.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

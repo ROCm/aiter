@@ -12,12 +12,12 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row. Entries clamp to the padded
-  key extent, and a null pointer lets one object serve dense and varlen. Sorted sparse and GFX942
-  reject it.
-- Log-sum-exp via `return_lse` on GFX950, wherever the selected manifest row declares `lse`, which
-  today is every dense, sparse and Sol-Attn row. GFX942 rejects it until its exported value is
-  measured. The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
+- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row and the dense `BF16 Q/K` rows
+  of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve dense
+  and varlen. Every other GFX942 recipe and the sorted-sparse path reject it.
+- Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 and
+  GFX942 that is every row.
+  The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
   format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
   nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
   mixed recipes.
@@ -42,7 +42,7 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 | MXFP6 | MXFP4 | dense, sparse, Sol-Attn |
 | MXFP4 | MXFP4 | dense, sparse, Sol-Attn |
 
-GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-Attn rows.
+GFX942 ships BF16/BF16, BF16/FP8, and per-tensor FP8/FP8 and INT8/FP8, each in all three modes.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
@@ -199,7 +199,8 @@ Raw callers pass an optional boolean `block_mask`:
 - geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
 - gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8,
-  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8.
+  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8;
+- gfx942 ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16 and BF16/FP8.
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
 arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the
