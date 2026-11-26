@@ -720,10 +720,13 @@ def compile_intra(
             gpu.barrier()
 
         akk_v = _flat(Akk, hb * BT)
+        # Every column of a valid row is written, the upper triangle as +0 like
+        # Triton's Akk (the solve can leave -0 there).
         if rv:
             for e in range_constexpr(16):
                 j = seg + 4 * e
-                stg(akk_v, r * (H * BT) + j, lds_ld(s_x, r * BT + j), fx.Float32)
+                x = _sel(j <= r, lds_ld(s_x, r * BT + j), _zero())
+                stg(akk_v, r * (H * BT) + j, x, fx.Float32)
 
         # w = X (beta k exp2(g)), u = X (beta v) on MFMA: wave I owns rows
         # 16I..16I+15; X is lower triangular, so its upper tiles add zeros.
