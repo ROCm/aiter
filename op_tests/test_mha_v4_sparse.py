@@ -4147,7 +4147,8 @@ def test_mha_v4_sol_head_dim_256_reads_the_capped_jensen_variance(name):
     match the uncapped reference instead, which this tells apart.
 
     The routed MXFP4 row sits near its oracle floor on these wide blocks, so that floor and the
-    factor of two are left to test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance."""
+    factor of two are left to test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance.
+    """
     q_tile, kv_tile = _HD256_SOL_TILE
     heads = 2
     torch.manual_seed(4)
@@ -4299,7 +4300,8 @@ _END_OF_MAPPING_KEEP = []
 
 def _at_end_of_mapping(x, image_bytes):
     """A copy of x's first image_bytes from its first element, ending at the last mapped byte of
-    a VMM mapping whose next granule is reserved and unmapped, so any read past it faults."""
+    a VMM mapping whose next granule is reserved and unmapped, so any read past it faults.
+    """
     import ctypes
 
     from aiter.dist.device_communicators import vmm_allocator as vmm
@@ -4336,7 +4338,8 @@ def _at_end_of_mapping(x, image_bytes):
 
 def _image_bytes(x, planes=1, plane_stride=0):
     """What x's layout spans from its first element: each batch at x's batch stride, or the
-    view's extent where that reaches further, over `planes` planes plane_stride bytes apart."""
+    view's extent where that reaches further, over `planes` planes plane_stride bytes apart.
+    """
     extent = sum((n - 1) * s for n, s in zip(x.shape, x.stride())) + 1
     plane = max(x.shape[0] * x.stride(0), extent) * x.element_size()
     return (planes - 1) * plane_stride + plane
@@ -4471,9 +4474,9 @@ def test_mha_v4_sol_head_dim_256_reads_stop_at_each_image():
         check=False,
     )
     placed = [line for line in result.stdout.splitlines() if line.startswith("placed")]
-    assert result.returncode == 0 and "done" in result.stdout.splitlines(), (
-        f"stopped with {placed[-1:]} at the end of a mapping:\n{result.stderr[-3000:]}"
-    )
+    assert (
+        result.returncode == 0 and "done" in result.stdout.splitlines()
+    ), f"stopped with {placed[-1:]} at the end of a mapping:\n{result.stderr[-3000:]}"
 
 
 @skipif(get_gfx() != "gfx950", reason="the gfx950 hd256 block-sparse rows")
