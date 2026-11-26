@@ -689,7 +689,7 @@ class GTensor(TensorBase):
         if vec_size == 1:
             return t[offset]
         frag = fx.make_fragment_like(fx.slice(t, (0, None)))
-        atom = buf_copy_atom(vec_size * (elem.width // 8), elem, self.cache_modifier)
+        atom = buf_copy_atom(vec_size * (elem.width // 8), elem)
         fx.copy(atom, fx.slice(t, (offset, None)), frag)
         return fx.memref_load_vec(frag)
 
