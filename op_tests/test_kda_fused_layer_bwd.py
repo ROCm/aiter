@@ -358,7 +358,7 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
             return "FlyDSL GEMM epilogues need gfx950 and bf16/fp16"
         from aiter.ops.flydsl import kda_layer_bwd as fk
 
-        lr = torch.randn(m, r).to(dtype)
+        lr = torch.randn(m, r)  # fp32, as the layer passes it
         f_b = (torch.randn(hk, r) * r**-0.5).to(dtype)
         dt_bias = torch.randn(hk)
         dg = torch.randn(m, hk)

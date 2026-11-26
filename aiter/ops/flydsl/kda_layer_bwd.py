@@ -71,6 +71,17 @@ def _gate_params(f_b, dt_bias, A_log, num_heads, lower_bound):
     return torch.cat([_f32(A_log)[:num_heads], lb, _f32(dt_bias)])
 
 
+def _split_lowrank(lr, f_b):
+    """[hi | lo] @ [f_b | f_b]^T with lr = hi + lo in 16 bits: the gate's
+    pre-activation keeps ~fp32 accuracy (the safe gate's derivative amplifies
+    an input rounding by exp(A_log)), for a K of 2R = 256 instead of 128."""
+    dt = f_b.dtype
+    lr = lr.float()
+    hi = lr.to(dt)
+    lo = (lr - hi.float()).to(dt)
+    return torch.cat([hi, lo], -1), torch.cat([f_b, f_b], -1)
+
+
 def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
     """Decay gate fused in the f_b GEMM, with z = lr @ f_b^T + dt_bias (fp32):
     ``-exp(A_log[h]) * softplus(z)``, or ``lower_bound * sigmoid(exp(A_log[h]) * z)``.
@@ -81,9 +92,10 @@ def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
     from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_SAFE_GATE
 
     mode = GEMM_EPI_KDA_GATE if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE
+    lr2, f_b2 = _split_lowrank(lr, f_b)
     return _proj_gemm(
-        lr.to(f_b.dtype),
-        f_b,
+        lr2,
+        f_b2,
         epilogue=mode,
         epi_group=f_b.shape[0] // num_heads,
         a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
@@ -103,9 +115,10 @@ def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
 
     mode = GEMM_EPI_KDA_GATE_BWD if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE_BWD
     dterm = torch.empty(dg.shape, device=dg.device, dtype=torch.float32)
+    lr2, f_b2 = _split_lowrank(lr, f_b)
     dz = _proj_gemm(
-        lr.to(f_b.dtype),
-        f_b,
+        lr2,
+        f_b2,
         epilogue=mode,
         epi_group=f_b.shape[0] // num_heads,
         a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
@@ -127,6 +140,26 @@ def sigmoid_gate_proj(x, g_proj, aux=None):
         epilogue=GEMM_EPI_SIGMOID_MUL,
         aux=aux.float().contiguous(),
     )
+
+
+def proj_gemm(a, w, kind):
+    """Plain projection GEMM on the gfx950 bf16 GEMM (fp32 output), with the
+    ``_proj_gemm`` operand convention; a shape the GEMM rejects (a K tail,
+    misaligned strides) falls back to torch on the same rounded inputs."""
+    dt = w.dtype
+    a16 = a.to(dt).contiguous()
+    w16 = w.to(dt).contiguous()
+    try:
+        if kind == "fwd":
+            return _gemm(a16, w16.t(), "nt")
+        if kind == "dgrad":
+            return _gemm(a16, w16, "nn")
+        return _gemm(a16.t(), w16, "tn")
+    except (AssertionError, ValueError):
+        a32, w32 = a16.float(), w16.float()
+        return {"fwd": lambda: a32 @ w32.t(), "dgrad": lambda: a32 @ w32}.get(
+            kind, lambda: a32.t() @ w32
+        )()
 
 
 def gate_proj_bwd_gemms(dgp, x, g_proj):

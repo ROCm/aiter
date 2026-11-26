@@ -665,6 +665,66 @@ def _mm(a, b, cd):
     return a.float() @ b.float()
 
 
+ProjGemmHook = Callable[..., object]
+_proj_gemm_hook: ProjGemmHook | None = None
+
+
+def register_proj_gemm(fn: ProjGemmHook | None):
+    """Install a projection-GEMM implementation (e.g. an MXFP8 recipe).
+
+    ``fn(a, w, *, kind, cd, epilogue, name, **epilogue_args)`` gets every
+    projection GEMM of the fused path, forward, dgrad and wgrad, including the
+    concatenated projection and the epilogue-fused ones (see ``_proj_gemm`` for
+    the operand convention). It returns the fp32 result, or ``NotImplemented``
+    to leave that call to the default path. ``None`` uninstalls it.
+    """
+    global _proj_gemm_hook
+    _proj_gemm_hook = fn
+
+
+def _proj_gemm(a, w, kind, cd, epilogue=None, ops=None, name=None, **epi):
+    """The single entry point for every projection GEMM of the fused path.
+
+    kind  "fwd":   a [M, K] @ w[N, K]^T   (w a weight)
+          "dgrad": a [M, N] @ w[N, K]     (a an output grad, w a weight)
+          "wgrad": a[M, N]^T @ w[M, K]    (a an output grad, w the input)
+    ``cd`` is the input dtype (fp32 accumulation and output). ``epilogue``
+    ("kda_gate", "kda_gate_bwd", "sigmoid_mul"; ``kind="fwd"``) runs on
+    ``ops`` (FlyDSL GEMM epilogues or ``_TorchProj``) with ``epi`` as its
+    arguments. ``name`` labels the projection (qkv, f_a, f_b, w_beta, g_proj,
+    w_o, ...) for an installed hook.
+    """
+    if _proj_gemm_hook is not None:
+        out = _proj_gemm_hook(
+            a, w, kind=kind, cd=cd, epilogue=epilogue, name=name, **epi
+        )
+        if out is not NotImplemented:
+            return out
+    if epilogue is not None:
+        ops = ops or _TorchProj
+        lb = epi.get("lower_bound")
+        if epilogue == "kda_gate":
+            return ops.kda_gate_proj(
+                a, w, epi["dt_bias"], epi["A_log"], epi["num_heads"], lb
+            )
+        if epilogue == "kda_gate_bwd":
+            return ops.kda_gate_proj_bwd(
+                a, w, epi["dt_bias"], epi["A_log"], epi["num_heads"], epi["dg"], lb
+            )
+        if epilogue == "sigmoid_mul":
+            return ops.sigmoid_gate_proj(a, w, epi.get("aux"))
+        raise ValueError(f"unknown projection epilogue {epilogue!r}")
+    if ops is not None and hasattr(ops, "proj_gemm"):
+        return ops.proj_gemm(a, w, kind)
+    if kind == "fwd":
+        return _mm(a, w.t(), cd)
+    if kind == "dgrad":
+        return _mm(a, w, cd)
+    if kind == "wgrad":
+        return _mm(a.t(), w, cd)
+    raise ValueError(f"unknown projection GEMM kind {kind!r}")
+
+
 def conv_silu_bwd(a, w, dq, dk, dv, fn=None, cu_seqlens=None):
     """Backward of ``silu(causal_depthwise_conv(a, w))`` split into q/k/v.
 
@@ -818,11 +878,12 @@ def _kda_layer_fused_fwd(
     if _fusion_on("concat_proj"):
         # one pass over x for every projection that has no epilogue of its own
         extra = [w.f_a, w.w_beta] + ([w.g_proj] if for_backward else [])
-        full = _mm(xc, torch.cat([w_qkv, *(t.to(cd) for t in extra)]).t(), cd)
+        w_all = torch.cat([w_qkv, *(t.to(cd) for t in extra)])
+        full = _proj_gemm(xc, w_all, "fwd", cd, name="concat")
         a, *side = full.split([w_qkv.shape[0], *(t.shape[0] for t in extra)], -1)
         a = a.contiguous().view(B, T, -1)
     else:
-        a = _mm(xc, w_qkv.t(), cd).view(B, T, -1)  # [B, T, 2HK + HV]
+        a = _proj_gemm(xc, w_qkv, "fwd", cd, name="qkv").view(B, T, -1)
     conv_in = None
     with torch.set_grad_enabled(conv_graph):
         if conv_graph:
@@ -835,10 +896,23 @@ def _kda_layer_fused_fwd(
     q = F.normalize(q_pre, dim=-1, eps=L2NORM_EPS)
     k = F.normalize(k_pre, dim=-1, eps=L2NORM_EPS)
     proj = _proj_ops(x, w)
-    lr = side[0].contiguous() if side else _mm(xc, w.f_a.t(), cd)
-    g = proj.kda_gate_proj(lr, w.f_b, w.dt_bias, w.A_log, H, lower_bound)
+    lr = side[0].contiguous() if side else _proj_gemm(xc, w.f_a, "fwd", cd, name="f_a")
+    g = _proj_gemm(
+        lr,
+        w.f_b,
+        "fwd",
+        cd,
+        epilogue="kda_gate",
+        ops=proj,
+        name="f_b",
+        dt_bias=w.dt_bias,
+        A_log=w.A_log,
+        num_heads=H,
+        lower_bound=lower_bound,
+    )
     g = g.view(B, T, H, -1)
-    braw = (side[1] if side else _mm(xc, w.w_beta.t(), cd)).reshape(B, T, H)
+    braw = side[1] if side else _proj_gemm(xc, w.w_beta, "fwd", cd, name="w_beta")
+    braw = braw.reshape(B, T, H)
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
     chunk_in = None
@@ -856,11 +930,21 @@ def _kda_layer_fused_fwd(
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
     gp, y = None, None
     if for_backward:
-        gp = (side[2] if side else _mm(xc, w.g_proj.t(), cd)).reshape(o.shape)
+        gp = side[2] if side else _proj_gemm(xc, w.g_proj, "fwd", cd, name="g_proj")
+        gp = gp.reshape(o.shape)
         on = (normed * torch.sigmoid(gp)).reshape(B * T, -1)
     else:
-        on = proj.sigmoid_gate_proj(xc, w.g_proj, normed.reshape(B * T, -1))
-        y = _mm(on, w.w_o.t(), cd).view(B, T, D).to(x.dtype)
+        on = _proj_gemm(
+            xc,
+            w.g_proj,
+            "fwd",
+            cd,
+            epilogue="sigmoid_mul",
+            ops=proj,
+            name="g_proj",
+            aux=normed.reshape(B * T, -1),
+        )
+        y = _proj_gemm(on, w.w_o, "fwd", cd, name="w_o").view(B, T, D).to(x.dtype)
     saved = {
         "xc": xc,
         "cd": cd,
@@ -999,11 +1083,13 @@ def _kda_layer_fused_bwd(
     xc, cd = s["xc"], s["cd"]
     dyc = dy.reshape(B * T, D).to(cd)
 
-    d_wo = _mm(dyc.t(), s["on"], cd)
-    d_on = _mm(dyc, w.w_o, cd).view_as(s["o"])
+    d_wo = _proj_gemm(dyc, s["on"], "wgrad", cd, name="w_o")
+    d_on = _proj_gemm(dyc, w.w_o, "dgrad", cd, name="w_o").view_as(s["o"])
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
-    dx, d_gproj = _proj_ops(x, w).gate_proj_bwd_gemms(dgp, xc, w.g_proj)
+    proj = _proj_ops(x, w)
+    dx = _proj_gemm(dgp, w.g_proj, "dgrad", cd, ops=proj, name="g_proj")
+    d_gproj = _proj_gemm(dgp, xc, "wgrad", cd, ops=proj, name="g_proj")
 
     if chunk_impl is None:
 
@@ -1024,7 +1110,7 @@ def _kda_layer_fused_bwd(
         q_in, k_in = s["q_pre"], s["k_pre"]
         kw["use_qk_l2norm_in_kernel"] = True
     if "gate" in fuses:
-        g_in = (lr @ w.f_b.float().t()).view_as(s["g"])
+        g_in = _proj_gemm(lr, w.f_b, "fwd", torch.float32, name="f_b").view_as(s["g"])
         kw.update(use_gate_in_kernel=True, A_log=w.A_log[:H], dt_bias=w.dt_bias)
         if lower_bound is not None:
             kw["lower_bound"] = lower_bound
@@ -1054,8 +1140,19 @@ def _kda_layer_fused_bwd(
     )
     dz = dg.float().reshape(B * T, -1)
     if "gate" not in fuses:
-        dz, dterm = _proj_ops(x, w).kda_gate_proj_bwd(
-            lr, w.f_b, w.dt_bias, w.A_log, H, dz, lower_bound
+        dz, dterm = _proj_gemm(
+            lr,
+            w.f_b,
+            "fwd",
+            cd,
+            epilogue="kda_gate_bwd",
+            ops=proj,
+            name="f_b",
+            dt_bias=w.dt_bias,
+            A_log=w.A_log,
+            num_heads=H,
+            dg=dz,
+            lower_bound=lower_bound,
         )
         dA_log = dterm.view(-1, *s["g"].shape[-2:]).sum((0, 2))
     # padded A_log entries get a zero gradient
@@ -1066,11 +1163,13 @@ def _kda_layer_fused_bwd(
     db = db.reshape(B * T, -1)
     if ddt is None:
         ddt = dz.sum(0)
-    d_fb = dz.t() @ lr
-    dlr = dz @ w.f_b.float()
-    d_fa = _mm(dlr.t(), xc, cd)
-    dx = dx + _mm(dlr, w.f_a, cd) + _mm(db, w.w_beta, cd)
-    d_wbeta = _mm(db.t(), xc, cd)
+    # the low-rank f_b side stays fp32 (K = 128, negligible cost)
+    d_fb = _proj_gemm(dz, lr, "wgrad", torch.float32, name="f_b")
+    dlr = _proj_gemm(dz, w.f_b, "dgrad", torch.float32, name="f_b")
+    d_fa = _proj_gemm(dlr, xc, "wgrad", cd, name="f_a")
+    dx = dx + _proj_gemm(dlr, w.f_a, "dgrad", cd, name="f_a")
+    dx = dx + _proj_gemm(db, w.w_beta, "dgrad", cd, name="w_beta")
+    d_wbeta = _proj_gemm(db, xc, "wgrad", cd, name="w_beta")
 
     if "qk_l2norm" not in fuses:
         dq = ops.l2norm_bwd(s["q_pre"], dq.float(), L2NORM_EPS)
@@ -1084,8 +1183,8 @@ def _kda_layer_fused_bwd(
             s["a"], s["conv_qkv"], *dqkv, fn=conv_kernel, cu_seqlens=cu_seqlens
         )
     da = da.reshape(B * T, -1)
-    d_wqkv = _mm(da.t(), xc, cd)
-    dx = dx + _mm(da, s["w_qkv"], cd)
+    d_wqkv = _proj_gemm(da, xc, "wgrad", cd, name="qkv")
+    dx = dx + _proj_gemm(da, s["w_qkv"], "dgrad", cd, name="qkv")
 
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
     dwq, dwk, dwv = d_wqkv.split([hk, hk, hv])
@@ -1132,7 +1231,8 @@ class _KDALayerFused(torch.autograd.Function):
             )
             ctx.saved_state = (plan, s)
             B, T, D = x.shape
-            return _mm(s["on"], w.w_o.t(), s["cd"]).view(B, T, D).to(x.dtype)
+            y = _proj_gemm(s["on"], w.w_o, "fwd", s["cd"], name="w_o")
+            return y.view(B, T, D).to(x.dtype)
         y, _ = _kda_layer_fused_fwd(
             x,
             w,
