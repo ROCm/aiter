@@ -256,6 +256,18 @@ def chunk_kda_bwd_torch(
     return (*grads[:5], *(grads[5:] or (None, None)))
 
 
+def _conv_bwd_kernel(on_gpu):
+    if not on_gpu:
+        return None
+    try:
+        from aiter.ops.triton.gated_delta_net import (
+            causal_conv1d_split_qkv_bwd_triton_fn,
+        )
+    except ImportError:
+        return None
+    return causal_conv1d_split_qkv_bwd_triton_fn
+
+
 def conv_silu_bwd(a, w, dq, dk, dv):
     """Backward of ``silu(causal_depthwise_conv(a, w))`` split into q/k/v.
 
@@ -265,13 +277,8 @@ def conv_silu_bwd(a, w, dq, dk, dv):
     """
     B, T, C = a.shape
     hk, hv = dq.shape[-1], dv.shape[-1]
-    try:
-        from aiter.ops.triton.gated_delta_net import (
-            causal_conv1d_split_qkv_bwd_triton_fn as fn,
-        )
-    except ImportError:
-        fn = None
-    if fn is None or not a.is_cuda:
+    fn = _conv_bwd_kernel(a.is_cuda)
+    if fn is None:
         dc = torch.cat([dq, dk, dv], -1).float()
         with torch.enable_grad():
             a = a.detach().float().requires_grad_(True)
@@ -330,15 +337,26 @@ class _TorchOps:
             return torch.autograd.grad(out, [o, gp, w], dy.float())
 
 
-def _kda_layer_fused_fwd(x, w, H, chunk_size, eps):
-    """Forward that keeps what the hand-written backward needs (fp32)."""
+def _kda_layer_fused_fwd(x, w, H, chunk_size, eps, conv_graph=False, chunk_graph=False):
+    """Forward that keeps what the hand-written backward needs (fp32).
+
+    ``conv_graph`` / ``chunk_graph`` record autograd graphs for the conv and
+    chunk stages, so their PyTorch fallbacks differentiate the activations of
+    this pass instead of recomputing the stage.
+    """
     B, T, _ = x.shape
     xf = x.float()
     w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).float()
     conv_qkv = torch.cat([w.conv_q, w.conv_k, w.conv_v]).float()
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
     a = xf @ w_qkv.t()  # [B, T, 2HK + HV]
-    c = _short_conv(a, conv_qkv)
+    conv_in = None
+    with torch.set_grad_enabled(conv_graph):
+        if conv_graph:
+            conv_in = [a.requires_grad_(True), conv_qkv.requires_grad_(True)]
+        c = _short_conv(a, conv_qkv)
+    if conv_graph:
+        a, conv_qkv = a.detach(), conv_qkv.detach()
     q_pre, k_pre, v = c.split([hk, hk, hv], -1)
     q_pre, k_pre, v = (t.reshape(B, T, H, -1) for t in (q_pre, k_pre, v))
     q, k = F.normalize(q_pre, dim=-1, eps=eps), F.normalize(k_pre, dim=-1, eps=eps)
@@ -348,7 +366,15 @@ def _kda_layer_fused_fwd(x, w, H, chunk_size, eps):
     braw = xf @ w.w_beta.float().t()
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
-    o = chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
+    chunk_in = None
+    with torch.set_grad_enabled(chunk_graph):
+        if chunk_graph:
+            chunk_in = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
+            o = chunk_kda_torch(*chunk_in, scale, chunk_size)
+        else:
+            o = chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
+    o_graph = o if chunk_graph else None
+    o = o.detach()
     ga = xf @ w.g_a.float().t()
     gp = (ga @ w.g_b.float().t()).view_as(o)
     on = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
@@ -374,12 +400,25 @@ def _kda_layer_fused_fwd(x, w, H, chunk_size, eps):
         "gp": gp,
         "on": on,
         "scale": scale,
+        "c": c if conv_graph else None,
+        "conv_in": conv_in,
+        "o_graph": o_graph,
+        "chunk_in": chunk_in,
     }
     return y, saved
 
 
 def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
-    _, s = _kda_layer_fused_fwd(x, w, H, chunk_size, eps)
+    conv_kernel = _conv_bwd_kernel(x.is_cuda)
+    _, s = _kda_layer_fused_fwd(
+        x,
+        w,
+        H,
+        chunk_size,
+        eps,
+        conv_graph=conv_kernel is None,
+        chunk_graph=_chunk_bwd_impl is None,
+    )
     B, T, D = x.shape
     xf = s["xf"].reshape(B * T, D)
     dy = dy.float().reshape(B * T, D)
@@ -395,7 +434,14 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
     d_ga = dga.t() @ xf
     dx = dga @ w.g_a.float()
 
-    chunk_bwd = _chunk_bwd_impl or chunk_kda_bwd_torch
+    if _chunk_bwd_impl is None:
+
+        def chunk_bwd(do, *_, **__):
+            grads = torch.autograd.grad(s["o_graph"], s["chunk_in"], do.float())
+            return (*grads, None, None)
+
+    else:
+        chunk_bwd = _chunk_bwd_impl
     fuses = _chunk_bwd_fuses
     H_, K_ = s["z"].shape[-2:]
     kw = {}
@@ -432,9 +478,12 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
     if "qk_l2norm" not in fuses:
         dq = ops.l2norm_bwd(s["q_pre"], dq.float(), eps)
         dk = ops.l2norm_bwd(s["k_pre"], dk.float(), eps)
-    da, d_conv = conv_silu_bwd(
-        s["a"], s["conv_qkv"], *(t.reshape(B, T, -1) for t in (dq, dk, dv))
-    )
+    dqkv = [t.reshape(B, T, -1) for t in (dq, dk, dv)]
+    if conv_kernel is None:
+        dc = torch.cat(dqkv, -1).float()
+        da, d_conv = torch.autograd.grad(s["c"], s["conv_in"], dc)
+    else:
+        da, d_conv = conv_silu_bwd(s["a"], s["conv_qkv"], *dqkv)
     da = da.reshape(B * T, -1)
     d_wqkv = da.t() @ xf
     dx = dx + da @ s["w_qkv"]
