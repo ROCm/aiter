@@ -112,18 +112,10 @@ from flydsl.expr.typing import Constexpr
 from flydsl.utils import env as fly_env
 
 from aiter import logger
-from aiter.aot.flydsl.sources import (
-    AOT_CACHES,
-)
-from aiter.aot.flydsl.sources import (
-    COMMON_ENV as _COMMON_ENV,
-)
-from aiter.aot.flydsl.sources import (
-    COMMON_SOURCES as _COMMON_SOURCES,
-)
-from aiter.aot.flydsl.sources import (
-    ENV_NOT_CODE as _ENV_NOT_CODE,
-)
+from aiter.aot.flydsl.sources import AOT_CACHES
+from aiter.aot.flydsl.sources import COMMON_ENV as _COMMON_ENV
+from aiter.aot.flydsl.sources import COMMON_SOURCES as _COMMON_SOURCES
+from aiter.aot.flydsl.sources import ENV_NOT_CODE as _ENV_NOT_CODE
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
@@ -149,7 +141,7 @@ def _flydsl_cache_env() -> tuple | None:
 
 # The fingerprint holds the variables that change what the toolchain makes of
 # any kernel: FlyDSL's own list, and these. A variable that kernel code reads
-# is not here: the cache of that kernel declares it (``env=``), so setting it
+# is not here: the cache of that kernel declares it (``sources.py``), so setting it
 # makes that cache miss and no other.
 _FLYDSL_ENV = _flydsl_cache_env()
 _ENV_FINGERPRINT = frozenset(
@@ -812,7 +804,7 @@ def _is_object(path: Path) -> bool:
 
 
 class _SourceListError(RuntimeError):
-    """A cache's ``sources=`` names a file that is not there. A launch takes
+    """A cache's source list names a file that is not there. A launch takes
     the JIT path; a prebuild fails."""
 
 
@@ -868,6 +860,14 @@ class FlyDSLAotCache:
                     f"aiter/aot/flydsl/sources.py; do not pass sources= or env="
                 )
             sources, env = declared.get("sources", ()), declared.get("env", ())
+        elif _creation_file().startswith(os.path.dirname(__file__) + os.sep):
+            # A name that was not entered there (or was misspelled here) would
+            # quietly depend on its own file and the common ones only.
+            raise ValueError(
+                f"FlyDSL AOT cache {name!r} is not declared in "
+                f"aiter/aot/flydsl/sources.py (AOT_CACHES): add what it is "
+                f"built from there"
+            )
         sources = () if sources is None else sources
         env = () if env is None else env
         if isinstance(sources, (str, os.PathLike)):

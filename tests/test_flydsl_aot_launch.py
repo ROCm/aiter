@@ -905,13 +905,21 @@ def test_every_cache_declares_the_kernel_files_its_sources_import(monkeypatch):
     assert set(real) == set(AOT_CACHES), sorted(set(real) ^ set(AOT_CACHES))
     with pytest.raises(ValueError, match="declared in"):
         aot_cache.FlyDSLAotCache(next(iter(real)), sources=["kernels/act.py"])
+    # A cache of aiter's own that is not in the table (or whose name is
+    # misspelled where it is created) would depend on its own file only.
+    in_tree = str(base / "kernels" / "act.py")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(aot_cache, "_creation_file", lambda: in_tree)
+        with pytest.raises(ValueError, match="not declared in"):
+            aot_cache.FlyDSLAotCache("mixed_moe_gemm")
     missing = {
         name: [os.path.relpath(f, base) for f in undeclared]
         for name, cache in real.items()
         if (undeclared := aot_cache._undeclared_imports(cache._files))
     }
     assert not missing, "\n".join(
-        f"cache {name!r} must also declare sources={files}"
+        f'cache {name!r} must also list {files} under its "sources" in '
+        f"aiter/aot/flydsl/sources.py"
         for name, files in sorted(missing.items())
     )
     # And the variables its sources read.
@@ -921,7 +929,8 @@ def test_every_cache_declares_the_kernel_files_its_sources_import(monkeypatch):
         if (names := aot_cache._undeclared_env(cache._files, cache._env))
     }
     assert not unread, "\n".join(
-        f"cache {name!r} must also declare env={names}"
+        f'cache {name!r} must also list {names} under its "env" in '
+        f"aiter/aot/flydsl/sources.py"
         for name, names in sorted(unread.items())
     )
 

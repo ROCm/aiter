@@ -20,8 +20,8 @@ declared file under ``kernels/`` that imports an undeclared one, and a
 variable a declared file reads by a literal name that is neither declared
 here, nor in the cache's fingerprint, nor in ``ENV_NOT_CODE``.
 
-This module is data only and imports nothing, so that the kernel modules can
-import it.
+This module is data only (tuples, so that no cache can change another's
+list) and imports nothing: ``aot_cache`` reads it when a cache is created.
 """
 
 # Sources of every cache: the helpers nearly every kernel is built with, and
@@ -75,73 +75,71 @@ ENV_NOT_CODE = frozenset(
 )
 
 # Lists that several caches share.
-_A16WMIX_MOE = [
+_A16WMIX_MOE = (
     "kernels/moe_2stage_a16wmix",
     "kernels/act.py",
     "kernels/dpp_utils.py",
     "kernels/layout_utils.py",
     "kernels/mxfp4_gemm_common.py",
-]
-_GFX942_MOE = [
-    "kernels/moe_gemm_2stage/gfx9_fp8",
-]
-_MXSCALE_GEMM = [
+)
+_GFX942_MOE = ("kernels/moe_gemm_2stage/gfx9_fp8",)
+_MXSCALE_GEMM = (
     "gemm_a8w8_mxfp8_8wave.py",
     "gemm_tune/flydsl_gemm_mxscale_preshuffle_common.py",
     "kernels/gemm",
     "kernels/mfma_preshuffle_pipeline.py",
     "kernels/communication_ops_utils.py",
-]
-_MX_MOE = [
+)
+_MX_MOE = (
     "kernels/mixed_moe_gemm_2stage_common.py",
     "kernels/act.py",
     "kernels/layout_utils.py",
     "kernels/mfma_epilogues.py",
     "kernels/mfma_preshuffle_pipeline.py",
     "moe_common.py",
-]
-_GFX942_MOE_ENV = [
+)
+_GFX942_MOE_ENV = (
     "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
     "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
-]
+)
 
-# Cache name -> {"sources": [...], "env": [...]}; either may be left out.
+# Cache name -> {"sources": (...), "env": (...)}; either may be left out.
 AOT_CACHES = {
     # GEMM
     "preshuffle_gemm_a8": {
-        "sources": [
+        "sources": (
             "kernels/preshuffle_gemm.py",
             "kernels/mfma_preshuffle_pipeline.py",
             "kernels/splitk_epilogue.py",
             "kernels/communication_ops_utils.py",
             "kernels/gemm_a16w16_gfx950_utils.py",
-        ],
+        ),
     },
     "gemm_a8w8_blockscale": {
-        "sources": [
+        "sources": (
             "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
             "kernels/gemm_a8w8_blockscale_8wave.py",
-        ],
+        ),
     },
     "gemm_a8w8_mxfp8_8wave": {
-        "sources": [
+        "sources": (
             "kernels/mxfp8_gemm_8wave.py",
             "kernels/gemm_a8w8_8wave.py",
             "kernels/mfma_preshuffle_pipeline.py",
-        ],
+        ),
     },
     "gemm_a8w8_fp8_8wave": {
-        "sources": [
+        "sources": (
             "kernels/gemm_a8w8_8wave.py",
             "kernels/mfma_preshuffle_pipeline.py",
-        ],
+        ),
     },
     "gemm_a8w8_int8_4wave": {
-        "sources": [
+        "sources": (
             "kernels/gemm_a8w8_8wave.py",
             "kernels/mfma_preshuffle_pipeline.py",
             "kernels/gemm_a8w8_int8_4wave.py",
-        ],
+        ),
     },
     "mxscale_preshuffle_gemm": {
         "sources": _MXSCALE_GEMM,
@@ -153,17 +151,15 @@ AOT_CACHES = {
         "sources": _MXSCALE_GEMM,
     },
     "bmm_a8w8_mxscale_gfx950": {
-        "sources": [
+        "sources": (
             "kernels/bmm_a8w8_mxscale_gfx950.py",
             "kernels/mfma_preshuffle_pipeline.py",
             "../../utility/mx_types.py",
             "kernels/quant_utils.py",
-        ],
+        ),
     },
     "gemm_a16w16_gfx950": {
-        "sources": [
-            "kernels/gemm_a16w16_gfx950_utils.py",
-        ],
+        "sources": ("kernels/gemm_a16w16_gfx950_utils.py",),
     },
     "gemm_a16w16_band_gfx950": {},
     "gemm_a16w16_skinny_gfx950": {},
@@ -203,77 +199,71 @@ AOT_CACHES = {
         "sources": _MX_MOE,
     },
     "mxfp4_moe_gemm1": {
-        "sources": [
+        "sources": (
             "kernels/mxfp4_gemm1.py",
             "kernels/mxfp4_gemm_common.py",
             "kernels/act.py",
             "kernels/dpp_utils.py",
             "kernels/layout_utils.py",
-        ],
+        ),
     },
     "mxmoe_gemm2": {
-        "sources": [
+        "sources": (
             "kernels/mxmoe_gemm_v2.py",
             "kernels/mxfp4_gemm_common.py",
             "kernels/dpp_utils.py",
             "kernels/act.py",
             "kernels/layout_utils.py",
-        ],
-        "env": [
+        ),
+        "env": (
             "MXFP4_G2_ASCALE_PF",
             "MXFP4_G2_BF16_LDS",
             "MXFP4_G2_BHOIST",
             "MXFP4_G2_PREFETCH_IDS",
             "MXFP4_G2_SPART",
-        ],
+        ),
     },
     "moe_reduction": {
-        "sources": [
+        "sources": (
             "kernels/mxfp4_gemm_common.py",
             "kernels/act.py",
             "kernels/dpp_utils.py",
             "kernels/layout_utils.py",
-        ],
+        ),
     },
     # Attention, GDN, conv3d
     "pa_decode_plan": {},
     "chunk_gated_delta_h": {
-        "sources": [
+        "sources": (
             "kernels/gdr_prefill/chunk_gated_delta_h.py",
             "kernels/gdr_common.py",
-        ],
-        "env": [
-            "FLYDSL_K5_OPT_BV",
-        ],
+        ),
+        "env": ("FLYDSL_K5_OPT_BV",),
     },
     "gdn_fused_prefill": {},
     "flash_attn_fp8_gfx950": {
-        "sources": [
-            "kernels/fmha_gfx950",
-        ],
+        "sources": ("kernels/fmha_gfx950",),
     },
     "conv3d_implicit_gfx950": {
-        "sources": [
+        "sources": (
             "kernels/conv/conv3d_gfx950_utils.py",
             "kernels/conv/conv3d_im2col.py",
-        ],
+        ),
     },
     "conv3d_transpose_ncdhw_ndhwc": {
-        "sources": [
-            "kernels/conv/conv3d_gfx950_utils.py",
-        ],
+        "sources": ("kernels/conv/conv3d_gfx950_utils.py",),
     },
     # gfx950 intranode MegaMoE
     "mega_moe_prepare": {
-        "sources": [
+        "sources": (
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
             "kernels/mega_moe/dispatch.py",
             "kernels/mega_moe/quant.py",
-        ],
+        ),
     },
     "mega_moe_stage1_bundle": {
-        "sources": [
+        "sources": (
             "kernels/act.py",
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
@@ -281,13 +271,11 @@ AOT_CACHES = {
             "kernels/mega_moe/gemm1.py",
             "kernels/mega_moe/gemm_util.py",
             "kernels/mega_moe/mega_moe_config.py",
-        ],
-        "env": [
-            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
-        ],
+        ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_small_m_stage1": {
-        "sources": [
+        "sources": (
             "kernels/act.py",
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
@@ -304,13 +292,11 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_stage1.py",
             "kernels/mega_moe/mega_moe_stage2.py",
             "kernels/mega_moe/weights.py",
-        ],
-        "env": [
-            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
-        ],
+        ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_large_m_stage1": {
-        "sources": [
+        "sources": (
             "kernels/act.py",
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
@@ -328,13 +314,11 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_stage2.py",
             "kernels/mega_moe/quant.py",
             "kernels/mega_moe/weights.py",
-        ],
-        "env": [
-            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
-        ],
+        ),
+        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
     },
     "mega_moe_stage2": {
-        "sources": [
+        "sources": (
             "kernels/act.py",
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
@@ -342,10 +326,10 @@ AOT_CACHES = {
             "kernels/mxfp4_gemm_common.py",
             "kernels/mega_moe/gemm2.py",
             "kernels/mega_moe/gemm_util.py",
-        ],
+        ),
     },
     "mega_moe_stage2_aligned_pair": {
-        "sources": [
+        "sources": (
             "kernels/act.py",
             "kernels/communication_ops_utils.py",
             "kernels/dpp_utils.py",
@@ -354,13 +338,13 @@ AOT_CACHES = {
             "kernels/mega_moe/gemm2.py",
             "kernels/mega_moe/gemm_util.py",
             "kernels/mega_moe/mega_moe_stage2.py",
-        ],
+        ),
     },
     "mega_moe_mx_quant": {},
     "mega_moe_combine": {
-        "sources": [
+        "sources": (
             "kernels/communication_ops_utils.py",
             "kernels/flydsl_dispatch_combine_intranode_kernel.py",
-        ],
+        ),
     },
 }
