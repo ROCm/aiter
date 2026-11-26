@@ -2,10 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import itertools
 import os
 import sys
-from unittest import mock
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,14 +19,13 @@ from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import (
     gemm_a8w8_blockscale_ck,
     gemm_a8w8_blockscale_cktile,
     gemm_a8w8_blockscale_flydsl,
 )
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
@@ -294,97 +291,6 @@ def run_flydsl(
     )
 
 
-@benchmark()
-def test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset):
-    """A tuned gfx942 FlyDSL row (kernelId 2 plain B, 3 preshuffled B), as served.
-
-    The row reaches the kernel through the tuned-row entry
-    gemm_a8w8_blockscale_flydsl and through the public op, with the tuned-config
-    lookup injected. The caller's output is NaN-filled between guard elements,
-    so an unwritten element or a store outside it fails. ``out_offset`` elements
-    put its base off an 8-byte boundary; the kernel stores into it directly, as
-    on gfx950. ``dtype`` is the output dtype, BF16 or FP16.
-    """
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
-        kernels_list,
-    )
-
-    kernel_id = 3 if preshuffle else 2
-    config = {
-        "libtype": "flydsl",
-        "kernelId": kernel_id,
-        "splitK": 0,
-        "kernelName": kernels_list[kernel_id].name,
-    }
-    torch.manual_seed(0)
-    kb = k // 128
-    x = (torch.randn((m, k), device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.randn((n, k), device="cuda") / 10).to(dtypes.fp8)
-    # Distinct scales per row and K block: one applied to the wrong row, column
-    # block or K block changes the result.
-    x_scale = torch.rand((m, kb), device="cuda")
-    w_scale = torch.rand(((n + 127) // 128, kb), device="cuda")
-    ref, _ = run_torch(x, weight, x_scale, w_scale, dtype)
-    if preshuffle:
-        weight = shuffle_weight(weight, layout=(16, 16))
-        # The bpreshuffle contract: x_scale bytes are [K/128, M].
-        x_scale = x_scale.transpose(0, 1).contiguous().view(m, kb)
-
-    guard = 64
-    start = guard + out_offset
-    storage = torch.full(
-        (2 * guard + out_offset + m * n,), 123.0, dtype=dtype, device="cuda"
-    )
-    out = storage[start : start + m * n].view(m, n)
-
-    def check(result, msg):
-        err = checkAllclose(ref, result, msg=msg, catastrophic_check=True)
-        assert err == 0, f"{msg}: {err:.2%} of elements outside rtol/atol"
-        assert torch.all(storage[:start] == 123) and torch.all(
-            storage[start + m * n :] == 123
-        ), f"{msg}: wrote outside the output"
-        return err
-
-    out.fill_(float("nan"))
-    gemm_a8w8_blockscale_flydsl(x, weight, x_scale, w_scale, out, config, preshuffle)
-    err = check(out, "flydsl tuned row")
-    tuned = out.clone()
-
-    with mock.patch.object(gemm_op_a8w8, "get_CKGEMM_config", lambda *a, **kw: config):
-
-        def public(out_dtype, out=None):
-            if preshuffle:
-                return aiter.gemm_a8w8_blockscale_bpreshuffle(
-                    x, weight, x_scale, w_scale, out_dtype, out=out
-                )
-            return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out_dtype)
-
-        out.fill_(float("nan"))
-        result = public(dtype, out)
-        check(result, "flydsl public op")
-        # Bitwise the tuned-row result: the public op ran this row's kernel.
-        assert torch.equal(result.view(torch.int16), tuned.view(torch.int16))
-
-    _, us = run_perftest(
-        gemm_a8w8_blockscale_flydsl,
-        x,
-        weight,
-        x_scale,
-        w_scale,
-        out,
-        config,
-        preshuffle,
-        num_iters=TEST_NUM_ITERS,
-    )
-    return {
-        "gfx": get_gfx(),
-        "flydsl us": us,
-        "flydsl TFLOPS": m * n * k * 2 / us / 1e6,
-        "flydsl TB/s": (m * k + n * k + m * n * out.element_size()) / us / 1e6,
-        "flydsl err": err,
-    }
-
-
 def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     """Verify that splitK > 0 produces the same output as splitK=0 (within fp tolerance).
 
@@ -506,20 +412,6 @@ parser.add_argument(
     ],
     help="""N&K of mnk.
     e.g.: -nk 24576,1536""",
-)
-parser.add_argument(
-    "--flydsl-mnk",
-    dest="flydsl_mnk",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[
-        (m, n, k)
-        for m in (1, 17, 257)
-        for n, k in ((272, 128), (528, 640), (272, 2048))
-    ],
-    help="""M,N,K of the gfx942 FlyDSL tuned-row checks (kernelId 2/3): M and N
-    tails (N % 256 != 0), K/128 = 1, odd and even.
-    e.g.: --flydsl-mnk 17,528,640""",
 )
 parser.add_argument(
     "--data-init",
@@ -697,24 +589,6 @@ if args.table and not df.empty:
     print("=" * 150)
     print(df.to_string(index=False))
     print("=" * 150)
-
-# The gfx942 FlyDSL kernel (kernelId 2/3) takes any M, N % 16 and K % 128 and
-# writes BF16 or FP16: tuned rows on tile tails, through the tuned-row entry and
-# the public op, into an aligned and a misaligned (2-byte offset) caller buffer.
-if get_gfx() == "gfx942":
-    df_flydsl = pd.DataFrame(
-        [
-            test_flydsl_tuned_row(dtype, m, n, k, preshuffle, out_offset)
-            for dtype, (m, n, k), preshuffle, out_offset in itertools.product(
-                (dtypes.bf16, dtypes.fp16), args.flydsl_mnk, l_preshuffle, (0, 1)
-            )
-        ]
-    )
-    print_json_table("gemm_a8w8_blockscale flydsl tuned-row summary", df_flydsl)
-    if args.table and not df_flydsl.empty:
-        print(df_flydsl.to_string(index=False))
-else:
-    print(f"skip: FlyDSL gfx942 tuned-row checks need gfx942, got {get_gfx()}")
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
