@@ -147,17 +147,16 @@ class MoeRouterTopkTuner(TunerCommon):
         gemm_split_k = router_gemm_split_k(M, N, K)
         fused = {}
         for sk, pf in _candidates(M, N, K, gemm_split_k):
-            tw, ti = fused_topk(x, w, bias, topk, sk, num_valid_rows=nvr, prefetch=pf)
+            cfg = {"split_k": sk, "prefetch": pf}
+            tw, ti = fused_topk(x, w, topk, bias, num_valid_rows=nvr, **cfg)
             if sk == gemm_split_k:
                 assert torch.equal(rw.view(torch.int32), tw.view(torch.int32))
                 assert torch.equal(ri, ti)
             elif not _matches(rw, ri, tw, ti):
                 logger.warning(f"M={M} K={K} split_k={sk}: routes differ, skipped")
                 continue
-            out = {"num_valid_rows": nvr, "topk_weights": tw, "topk_ids": ti}
-            fused[sk, pf] = functools.partial(
-                fused_topk, x, w, bias, topk, sk, prefetch=pf, **out
-            )
+            cfg.update(num_valid_rows=nvr, topk_weights=tw, topk_ids=ti)
+            fused[sk, pf] = functools.partial(fused_topk, x, w, topk, bias, **cfg)
 
         unfused = functools.partial(_unfused, x, w, bias, nvr, topk)
         arms = [unfused, *fused.values(), unfused]

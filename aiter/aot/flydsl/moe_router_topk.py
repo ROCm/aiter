@@ -4,8 +4,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """AOT for the gfx1250 MoE router top-k: each fused row of the tuned table,
-replayed through ``router_topk_config`` + ``flydsl_moe_router_topk``
-(``replay.py``) with and without expert bias and renorm, which are compiled in."""
+replayed through ``flydsl_moe_router_topk`` (``replay.py``) with and without
+expert bias and renorm, which are compiled in."""
 
 from __future__ import annotations
 
@@ -47,22 +47,20 @@ def replay(job: dict) -> None:
     front.router_topk_config.cache_clear()
     front.router_gemm_split_k.cache_clear()
     m, n, k, topk = job["M"], job["N"], job["K"], job["topk"]
-    cfg = front.router_topk_config(m, n, k, topk)
-    if cfg is None:
-        return
 
     def empty(*shape, dtype=torch.bfloat16):
         return torch.empty(shape, dtype=dtype, device="cuda")
 
-    front.flydsl_moe_router_topk(
+    args = (
         empty(m, k),
         empty(n, k),
-        empty(n, dtype=torch.float32) if job["has_bias"] else None,
         topk,
-        **cfg,
-        need_renorm=job["need_renorm"],
-        num_valid_rows=empty(1, dtype=torch.int32),
+        empty(n, dtype=torch.float32) if job["has_bias"] else None,
+        job["need_renorm"],
     )
+    nvr = empty(1, dtype=torch.int32)
+    if front.flydsl_moe_router_topk_supported(*args, num_valid_rows=nvr):
+        front.flydsl_moe_router_topk(*args, num_valid_rows=nvr)
 
 
 def describe(job: dict) -> str:

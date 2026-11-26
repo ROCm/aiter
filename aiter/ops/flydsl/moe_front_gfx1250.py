@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """gfx1250 decode MoE front: ``flydsl_moe_router_topk`` runs ``topk_gating(
-tgemm.mm(x, w), bias, score_func="sigmoid")`` in one FlyDSL launch, where the
-tuned table says it is faster (``router_topk_config``).
+tgemm.mm(x, w), ...)`` in one FlyDSL launch. Callers check
+``flydsl_moe_router_topk_supported`` (same arguments) and otherwise keep
+``tgemm.mm`` + ``topk_gating``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_arg,
 )
 
-ROUTER_EXPERTS = 128
 _TILE = 16
 
 
@@ -65,7 +65,7 @@ def router_gemm_split_k(m: int, n: int, k: int) -> int | None:
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     gfx = get_gfx_runtime()
-    if gfx != "gfx1250" or n != ROUTER_EXPERTS:
+    if gfx != "gfx1250":
         return None
     from aiter.tuned_gemm import get_GEMM_A16W16_config
 
@@ -93,63 +93,174 @@ def router_gemm_split_k(m: int, n: int, k: int) -> int | None:
     return p["split_k"]
 
 
+def _unsupported_reason(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    topk: int,
+    correction_bias: torch.Tensor | None,
+    score_func: str,
+    num_valid_rows: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    tuned: bool,
+) -> str | None:
+    """Why ``flydsl_moe_router_topk`` cannot take this call, or None."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return "gfx1250 only"
+    from aiter.ops.flydsl.kernels.moe_router_topk_gfx1250 import (
+        EXPERT_COUNTS,
+        MAX_TOPK,
+        SCORE_FUNCS,
+    )
+
+    if score_func not in SCORE_FUNCS:
+        return f"score_func {score_func!r} is not one of {SCORE_FUNCS}"
+    if x.dim() != 2 or w.dim() != 2 or x.shape[1] != w.shape[1]:
+        return f"x {tuple(x.shape)} and w {tuple(w.shape)} are not [M, K] and [E, K]"
+    m, k = x.shape
+    experts = w.shape[0]
+    if experts not in EXPERT_COUNTS:
+        return f"{experts} experts is not one of {EXPERT_COUNTS}"
+    if not 1 <= topk <= MAX_TOPK:
+        return f"topk {topk} is not in [1, {MAX_TOPK}]"
+    if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
+        return "x and w must be bfloat16"
+    if x.stride(1) != 1 or x.stride(0) % 8 or not w.is_contiguous():
+        return "x needs unit column stride and an 8-element row stride; w contiguous"
+    tensors = [x, w]
+    if correction_bias is not None:
+        if (
+            correction_bias.dtype != torch.float32
+            or correction_bias.shape != (experts,)
+            or not correction_bias.is_contiguous()
+        ):
+            return f"correction_bias must be a contiguous float32 [{experts}]"
+        tensors.append(correction_bias)
+    if num_valid_rows is not None:
+        if num_valid_rows.dtype != torch.int32 or num_valid_rows.numel() < 1:
+            return "num_valid_rows must be an int32 tensor"
+        tensors.append(num_valid_rows)
+    for out, dtype in ((topk_weights, torch.float32), (topk_ids, torch.int32)):
+        if out is not None:
+            if out.shape != (m, topk) or out.dtype != dtype or not out.is_contiguous():
+                return f"topk outputs must be contiguous [{m}, {topk}] float32 / int32"
+            tensors.append(out)
+    if not x.is_cuda or any(t.device != x.device for t in tensors):
+        return "every tensor must be on the same GPU"
+    if tuned and router_topk_config(m, experts, k, topk) is None:
+        return (
+            f"no fused row for M {m}, E {experts}, K {k}, top-{topk} in "
+            "AITER_CONFIG_MOE_ROUTER_TOPK"
+        )
+    return None
+
+
+def flydsl_moe_router_topk_supported(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    topk: int,
+    correction_bias: torch.Tensor | None = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+    score_func: str = "sigmoid",
+    *,
+    num_valid_rows: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> bool:
+    """Whether ``flydsl_moe_router_topk`` takes these arguments (the op's own):
+    implemented (score_func, expert count, topk, dtypes, layouts, gfx1250) and
+    tuned faster than ``tgemm.mm`` + ``topk_gating`` for this shape on this
+    GPU. False means keep the unfused pair."""
+    return (
+        _unsupported_reason(
+            x,
+            w,
+            topk,
+            correction_bias,
+            score_func,
+            num_valid_rows,
+            topk_weights,
+            topk_ids,
+            tuned=True,
+        )
+        is None
+    )
+
+
 @functools.lru_cache(maxsize=256)
-def _router_launcher(*args):
+def _router_launcher(**kwargs):
     from aiter.ops.flydsl.kernels.moe_router_topk_gfx1250 import (
         build_moe_router_topk_module,
     )
 
-    return build_moe_router_topk_module(*args)
+    return build_moe_router_topk_module(**kwargs)
 
 
 def flydsl_moe_router_topk(
     x: torch.Tensor,
     w: torch.Tensor,
-    correction_bias: torch.Tensor | None,
     topk: int,
-    split_k: int,
-    *,
+    correction_bias: torch.Tensor | None = None,
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
+    score_func: str = "sigmoid",
+    *,
     num_valid_rows: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
-    prefetch: int = 8,
+    split_k: int | None = None,
+    prefetch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(topk_weights fp32 [M, topk], topk_ids int32 [M, topk])`` of
-    ``topk_gating(tgemm.mm(x, w), correction_bias, score_func="sigmoid")``."""
+    """``topk_gating(topk_weights, topk_ids, tgemm.mm(x, w), correction_bias,
+    need_renorm, routed_scaling_factor, score_func,
+    num_valid_rows=num_valid_rows)`` in one launch: returns ``(topk_weights
+    fp32 [M, topk], topk_ids int32 [M, topk])``, allocated when not given.
+
+    x is [M, K] and w [E, K], both bfloat16. Raises ValueError where
+    ``flydsl_moe_router_topk_supported`` is False. ``split_k`` / ``prefetch``
+    replace the tuned launch (the tuner); then no tuned row is needed."""
+    reason = _unsupported_reason(
+        x,
+        w,
+        topk,
+        correction_bias,
+        score_func,
+        num_valid_rows,
+        topk_weights,
+        topk_ids,
+        tuned=split_k is None,
+    )
+    if reason is not None:
+        raise ValueError(f"flydsl_moe_router_topk: {reason}")
     m, k = x.shape
-    assert (
-        w.shape == (ROUTER_EXPERTS, k) and w.is_contiguous()
-    ), f"router weight {tuple(w.shape)}"
-    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
-    assert x.stride(1) == 1 and x.stride(0) % 8 == 0
+    experts = w.shape[0]
+    if split_k is None:
+        cfg = router_topk_config(m, experts, k, topk)
+        split_k = cfg["split_k"]
+        prefetch = cfg["prefetch"] if prefetch is None else prefetch
     dev = x.device
     if topk_weights is None:
         topk_weights = torch.empty((m, topk), dtype=torch.float32, device=dev)
     if topk_ids is None:
         topk_ids = torch.empty((m, topk), dtype=torch.int32, device=dev)
-    assert topk_weights.is_contiguous() and topk_ids.is_contiguous()
     if m == 0:
         return topk_weights, topk_ids
     tiles = (m + _TILE - 1) // _TILE
-    ws = torch.empty(
-        tiles * split_k * _TILE * ROUTER_EXPERTS, dtype=torch.float32, device=dev
-    )
+    ws = torch.empty(tiles * split_k * _TILE * experts, dtype=torch.float32, device=dev)
     has_bias = correction_bias is not None
-    if has_bias:
-        assert (
-            correction_bias.dtype == torch.float32
-            and correction_bias.numel() == ROUTER_EXPERTS
-        )
     launch = _router_launcher(
-        k,
-        split_k,
-        topk,
-        need_renorm,
-        float(routed_scaling_factor),
-        has_bias,
-        prefetch,
+        K=k,
+        split_k=split_k,
+        topk=topk,
+        need_renorm=bool(need_renorm),
+        routed_scaling_factor=float(routed_scaling_factor),
+        has_bias=has_bias,
+        prefetch=8 if prefetch is None else prefetch,
+        score_func=score_func,
+        experts=experts,
     )
     _run_compiled(
         launch,
@@ -168,4 +279,4 @@ def flydsl_moe_router_topk(
     return topk_weights, topk_ids
 
 
-__all__ = ["flydsl_moe_router_topk", "router_topk_config"]
+__all__ = ["flydsl_moe_router_topk", "flydsl_moe_router_topk_supported"]

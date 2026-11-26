@@ -12,20 +12,20 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_front_gfx1250 import (
     flydsl_moe_router_topk,
+    flydsl_moe_router_topk_supported,
     router_gemm_split_k,
-    router_topk_config,
 )
 from aiter.ops.topk import topk_gating
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import tgemm
 
 torch.set_default_device("cuda")
-E, TOPK = 128, 4
+E = 128
 
 
-def run_unfused(x, w, bias, nvr):
-    tw = torch.empty(x.shape[0], TOPK, dtype=torch.float32)
-    ti = torch.empty(x.shape[0], TOPK, dtype=torch.int32)
+def run_unfused(x, w, topk, bias, nvr):
+    tw = torch.empty(x.shape[0], topk, dtype=torch.float32)
+    ti = torch.empty(x.shape[0], topk, dtype=torch.int32)
     logits = tgemm.mm(x, w, None, otype=torch.bfloat16)
     topk_gating(
         tw, ti, logits, bias, True, 1.0, score_func="sigmoid", num_valid_rows=nvr
@@ -34,7 +34,7 @@ def run_unfused(x, w, bias, nvr):
 
 
 @benchmark()
-def test_moe_router_topk(m, k, case):
+def test_moe_router_topk(m, k, topk, case):
     x = torch.randn(m, k).to(torch.bfloat16)
     w = (torch.randn(E, k) * 0.02).to(torch.bfloat16)
     bias = torch.randn(E) * 0.05
@@ -44,10 +44,12 @@ def test_moe_router_topk(m, k, case):
             w[b], bias[b] = w[a], bias[a]
     elif case == "saturate":  # sigmoid == 1.0 on many experts
         x, bias = (x.float() * 60).to(torch.bfloat16), bias.zero_()
+    # The router GEMM's own split_k: the fused launch then gives its bytes.
     split_k = router_gemm_split_k(m, E, k)
-    (ref_w, ref_i), us_ref = run_perftest(run_unfused, x, w, bias, nvr)
-    fused = (flydsl_moe_router_topk, x, w, bias, TOPK, split_k)
-    (out_w, out_i), us = run_perftest(*fused, num_valid_rows=nvr)
+    (ref_w, ref_i), us_ref = run_perftest(run_unfused, x, w, topk, bias, nvr)
+    (out_w, out_i), us = run_perftest(
+        flydsl_moe_router_topk, x, w, topk, bias, num_valid_rows=nvr, split_k=split_k
+    )
     err = max(
         checkAllclose(ref_w.view(torch.int32), out_w.view(torch.int32), 0, 0),
         checkAllclose(ref_i, out_i, 0, 0, msg="ids"),
@@ -56,15 +58,26 @@ def test_moe_router_topk(m, k, case):
     return {"split_k": split_k, "unfused us": us_ref, "fused us": us, "err": err}
 
 
-def check_tuned_rows():
-    """Each row of this GPU resolves: a fused row to its config (a router GEMM
-    retune can kill one), an unfused row to None (tgemm.mm + topk_gating)."""
+def check_supported():
+    """Every tuned row of this GPU: supported where it is fused (a router GEMM
+    retune can kill one), not where it is not. Unimplemented arguments are
+    unsupported, and the op raises on them."""
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_MOE_ROUTER_TOPK_FILE)
     df = df[(df.gfx == get_gfx_runtime()) & (df.cu_num == get_cu_num())]
     for r in df.itertuples():
-        cfg = router_topk_config(r.M, r.N, r.K, r.topk)
-        want = {"split_k": r.split_k, "prefetch": r.prefetch} if r.fused else None
-        assert cfg == want, f"row {r} resolves to {cfg}"
+        x = torch.empty(r.M, r.K, dtype=torch.bfloat16)
+        w = torch.empty(r.N, r.K, dtype=torch.bfloat16)
+        ok = flydsl_moe_router_topk_supported(x, w, r.topk, torch.empty(r.N))
+        assert ok == bool(r.fused), f"row {r}: supported {ok}"
+    x = torch.empty(16, 6144, dtype=torch.bfloat16)
+    w = torch.empty(E, 6144, dtype=torch.bfloat16)
+    for args in ((x, w, 4, None, True, 1.0, "softmax"), (x, w[:96], 4)):
+        assert not flydsl_moe_router_topk_supported(*args)
+        try:
+            flydsl_moe_router_topk(*args)
+        except ValueError:
+            continue
+        raise AssertionError(f"no ValueError for {args[2:]}")
 
 
 def main():
@@ -74,14 +87,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", type=int, nargs="*", default=[1, 16, 33, 256])
     ap.add_argument("-k", type=int, nargs="*", default=[6144])
+    ap.add_argument("--topk", type=int, nargs="*", default=[1, 4, 8, 32])
     ap.add_argument(
         "--case", nargs="*", default=["rand", "ties", "saturate", "pad_rows"]
     )
     args = ap.parse_args()
-    check_tuned_rows()
+    check_supported()
     df = [
-        test_moe_router_topk(m, k, case)
-        for m, k, case in itertools.product(args.m, args.k, args.case)
+        test_moe_router_topk(m, k, topk, case)
+        for m, k, topk, case in itertools.product(args.m, args.k, args.topk, args.case)
         if router_gemm_split_k(m, E, k) is not None
     ]
     assert df, "no shape runs on the FlyDSL router GEMM"

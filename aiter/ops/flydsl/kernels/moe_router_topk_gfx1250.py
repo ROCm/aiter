@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE router GEMM + biased sigmoid top-k in one gfx1250 launch (FlyDSL), as
-``tgemm.mm(x, w)`` + ``topk_gating(..., score_func="sigmoid")``; bitwise equal
-when ``split_k`` is that of the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` runs:
+"""MoE router GEMM + top-k gating in one gfx1250 launch (FlyDSL), as
+``tgemm.mm(x, w)`` + ``topk_gating``; bitwise equal when ``split_k`` is that of
+the gfx1250 FlyDSL A16W16 GEMM ``tgemm.mm`` runs:
 
 * Logits: each 16x16 (expert, token) block is ``split_k`` WMMA chains over
   consecutive K chunks from a zero accumulator (weight as operand A, activation
   as B, the GEMM's fragment slots), summed in split order, rounded to bf16.
-* Top-k: as ``topk_gating_kernel_opt`` (SCORE_SIGMOID): lane L holds experts
-  L + 32i; score ``rcp(1 + exp2(-x*log2e))`` with denormals flushed (the
-  reference builds with -fgpu-flush-denormals-to-zero), selection value
-  ``score + bias`` (NaN -> -inf), the same 5-comparator network per lane,
-  ``topk`` wave-argmax rounds with ties to the lowest lane, the same renorm.
+* Top-k: as ``topk_gating_kernel_opt``: lane L holds experts L + 32i, scored
+  by ``score_func`` (``SCORE_FUNCS``); selection value ``score + bias`` (NaN ->
+  -inf), the reference's sorting network per lane (``EXPERT_COUNTS``), ``topk``
+  wave-argmax rounds with ties to the lowest lane, the same renorm.
 
 Each 16-row tile is one cluster of ``split_k * n_groups`` (<= 16) workgroups,
 one per (K split, expert group). Partials go to a cluster-private workspace;
@@ -30,7 +29,6 @@ from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-EXPERTS = 128
 WAVE = 32
 TILE = 16
 WMMA_K = 32
@@ -39,18 +37,38 @@ LOG2E = 1.4426950408889634
 RENORM_SUM_FLOOR = 1e-20
 FLT_MIN = 1.1754943508222875e-38
 CHAINS = 1  # 16-expert slices per wave
+MAX_TOPK = WAVE  # lane k holds top-k slot k
+
+# Experts per lane -> topk_gating's sort_network_desc for that count (descending,
+# ties kept in place); an expert count is WAVE times a key.
+_SORT_NETWORKS = {4: ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2))}
+EXPERT_COUNTS = tuple(WAVE * n for n in _SORT_NETWORKS)
 
 
-def router_topk_geometry(split_k: int):
+def _sigmoid(logit):
+    """topk_gating's SCORE_SIGMOID: ``rcp(1 + exp2(-x*log2e))``, denormals
+    flushed (the reference builds with -fgpu-flush-denormals-to-zero)."""
+    e2 = fx.exp2((-logit) * fx.Float32(LOG2E))
+    score = fx.Float32(rocdl.rcp(T.f32, fx.Float32(1.0) + e2))
+    return (score < fx.Float32(FLT_MIN)).select(fx.Float32(0.0), score)
+
+
+# score_func -> score of one bf16-rounded logit. A row-wise one (softmax) would
+# also need the row's max and sum in _gate_row.
+_SCORES = {"sigmoid": _sigmoid}
+SCORE_FUNCS = tuple(_SCORES)
+
+
+def router_topk_geometry(split_k: int, experts: int = 128):
     """(expert groups, experts per workgroup, waves per workgroup, cluster size)."""
-    n_groups = min(EXPERTS // TILE, MAX_CLUSTER // split_k)
-    while n_groups & (n_groups - 1):  # a power of two divides the 8 expert slices
+    n_groups = min(experts // TILE, MAX_CLUSTER // split_k)
+    while n_groups & (n_groups - 1):  # a power of two divides the expert slices
         n_groups -= 1
     if n_groups < 1:
         raise ValueError(
             f"split_k {split_k} exceeds the {MAX_CLUSTER}-workgroup cluster"
         )
-    tile_n = EXPERTS // n_groups
+    tile_n = experts // n_groups
     return n_groups, tile_n, tile_n // TILE, split_k * n_groups
 
 
@@ -67,20 +85,28 @@ def _rmem_vec(v, n, dtype):
 def build_moe_router_topk_module(
     K: int,
     split_k: int,
-    topk: int = 4,
+    topk: int,
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     has_bias: bool = True,
     prefetch: int = 8,
+    score_func: str = "sigmoid",
+    experts: int = 128,
 ):
     """Launcher ``(x, w, bias, num_valid_rows, ws, topk_weights, topk_ids, m,
-    lda, has_nvr, stream)``; ``ws`` holds ``ceil(m/16) * split_k * 16 * 128``
-    fp32."""
+    lda, has_nvr, stream)``; ``ws`` holds ``ceil(m/16) * split_k * 16 *
+    experts`` fp32."""
+    if score_func not in SCORE_FUNCS:
+        raise ValueError(f"score_func {score_func!r} is not one of {SCORE_FUNCS}")
+    if experts not in EXPERT_COUNTS:
+        raise ValueError(f"{experts} experts is not one of {EXPERT_COUNTS}")
+    if not 1 <= topk <= MAX_TOPK:
+        raise ValueError(f"topk {topk} is not in [1, {MAX_TOPK}]")
     if K % (split_k * WMMA_K):
         raise ValueError(f"K {K} is not a multiple of split_k * 32")
-    if not 1 <= topk <= 4:
-        raise ValueError("topk must be in [1, 4] (one slot per merge round)")
-    n_groups, _, slices, csize = router_topk_geometry(split_k)
+    score_fn = _SCORES[score_func]
+    network = _SORT_NETWORKS[experts // WAVE]
+    n_groups, _, slices, csize = router_topk_geometry(split_k, experts)
     waves = slices // CHAINS
     chunk = K // split_k
     k_steps = chunk // WMMA_K
@@ -90,8 +116,8 @@ def build_moe_router_topk_module(
     scale = float(routed_scaling_factor)
     scale_tag = format(struct.unpack("<I", struct.pack("<f", scale))[0], "08x")
     name = (
-        f"moe_router_topk_k{K}_s{split_k}_t{topk}_r{int(need_renorm)}"
-        f"_b{int(has_bias)}_pf{pf}_sc{scale_tag}"
+        f"moe_router_topk_{score_func}_e{experts}_k{K}_s{split_k}_t{topk}"
+        f"_r{int(need_renorm)}_b{int(has_bias)}_pf{pf}_sc{scale_tag}"
     )
     neg_inf = float("-inf")
 
@@ -167,7 +193,7 @@ def build_moe_router_topk_module(
         ws_rsrc = _rsrc(ws)
         for ch in range_constexpr(CHAINS):
             ws_off = (
-                ((mt * split_k + s) * TILE + lane16) * EXPERTS
+                ((mt * split_k + s) * TILE + lane16) * experts
                 + (ntile0 + ch) * TILE
                 + kgrp * 8
             )
@@ -189,7 +215,7 @@ def build_moe_router_topk_module(
             if (row_local < TILE) & (row < m):
                 out_w, out_id = _gate_row(
                     ws_rsrc,
-                    (mt * split_k) * TILE * EXPERTS + row_local * EXPERTS,
+                    (mt * split_k) * TILE * experts + row_local * experts,
                     bias_rsrc,
                     nvr_rsrc,
                     has_nvr,
@@ -202,13 +228,13 @@ def build_moe_router_topk_module(
 
     def _gate_row(ws_rsrc, ws_row, bias_rsrc, nvr_rsrc, has_nvr, row, lane):
         """(weight, id) of top-k slot ``lane`` (lanes < topk) of one row."""
-        ept = EXPERTS // WAVE
+        ept = experts // WAVE
         parts = [
             [
                 fx.Float32(
                     buffer_ops.buffer_load(
                         ws_rsrc,
-                        ws_row + sidx * TILE * EXPERTS + lane + WAVE * i,
+                        ws_row + sidx * TILE * experts + lane + WAVE * i,
                         vec_width=1,
                         dtype=T.f32,
                     )
@@ -237,11 +263,7 @@ def build_moe_router_topk_module(
             total = parts[0][i]
             for sidx in range_constexpr(1, split_k):
                 total = total + parts[sidx][i]
-            logit = total.to(fx.BFloat16).to(fx.Float32)
-            e2 = fx.exp2((-logit) * fx.Float32(LOG2E))
-            score = fx.Float32(rocdl.rcp(T.f32, fx.Float32(1.0) + e2))
-            # The reference flushes denormals (score >= 0 or NaN).
-            score = (score < fx.Float32(FLT_MIN)).select(fx.Float32(0.0), score)
+            score = score_fn(total.to(fx.BFloat16).to(fx.Float32))
             is_nan = score != score  # noqa: PLR0124 -- traced value: the NaN test
             orig.append(is_nan.select(fx.Float32(0.0), score))
             v = score
@@ -257,7 +279,7 @@ def build_moe_router_topk_module(
             orig[a], orig[b] = sw.select(orig[b], orig[a]), sw.select(orig[a], orig[b])
             idxs[a], idxs[b] = sw.select(idxs[b], idxs[a]), sw.select(idxs[a], idxs[b])
 
-        for a, b in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
+        for a, b in network:
             cas(a, b)
 
         cursor = fx.Int32(0)
@@ -338,4 +360,10 @@ def build_moe_router_topk_module(
     return launch
 
 
-__all__ = ["build_moe_router_topk_module", "router_topk_geometry"]
+__all__ = [
+    "EXPERT_COUNTS",
+    "MAX_TOPK",
+    "SCORE_FUNCS",
+    "build_moe_router_topk_module",
+    "router_topk_geometry",
+]
