@@ -718,6 +718,142 @@ def bench_mxfp8_output(shape, rows, query_dtype=torch.bfloat16):
     return ret
 
 
+# MiniMax-M3.1 D = DP4 x EP4, attention TP1 (64 q heads on 4 KV heads a rank),
+# DSpark K=7: 8 verify rows a request, request-major. Per rank: the decoding
+# requests' context lengths, the batch the step is padded to (padding rows have
+# length 0), and the D trace's median us a layer (AgentX C192, MI455X; None:
+# not traced). Contexts: the 10/25/50/50/75/90th percentiles of the run's prompts.
+M31_MIX = [23300, 42749, 84504, 84504, 148135, 295585]
+M31_DECODE = {
+    "b2-pad16": ([84504, 148135], 16, 10.6),
+    "b6-pad12": (M31_MIX, 12, 11.2),
+    "b12-pad16": (M31_MIX * 2, 16, 18.8),
+    "b20-pad20": ((M31_MIX * 4)[:20], 20, None),
+    "b40-pad40": ((M31_MIX * 7)[:40], 40, None),
+}
+M31_KV_HEADS, M31_ROWS = 4, 8
+
+
+def m31_decode_inputs(contexts, padded, device, swap=0.1):
+    """ATOM's TP1 decode call: q [padded * 8, 64, D] viewed [rows * 4, 16, D]
+    (sequence ``row * 4 + h``), the [pages * 4, 1, 128, ..] cache view (page
+    ``p * 4 + h``) and the compacted top-16 tables. A row attends its own block
+    and 15 earlier ones: a request-wide set per KV head, a slot swapped for a
+    random earlier block with probability ``swap`` (the indexer's pattern)."""
+    H, R = M31_KV_HEADS, M31_ROWS
+    g = torch.Generator().manual_seed(0)
+    nbs = [(c + PAGE - 1) // PAGE for c in contexts]
+    perm = torch.randperm(sum(nbs) + 1, generator=g)
+    table = torch.zeros(padded * R, H, 16, dtype=torch.long)
+    lengths = torch.zeros(padded * R, H, dtype=torch.long)
+    start, tails = 0, []
+    for b, (ctx, nb) in enumerate(zip(contexts, nbs)):
+        bt = perm[start : start + nb]
+        start += nb
+        pos = torch.arange(ctx - R, ctx)  # each verify row's last token
+        cur = pos // PAGE
+        for h in range(H):
+            base = torch.randperm(max(int(cur[0]), 15), generator=g)[:15]
+            alt = (torch.rand(R, 15, generator=g) * cur.clamp(min=1)[:, None]).long()
+            cand = torch.where(torch.rand(R, 15, generator=g) < swap, alt, base)
+            cand = torch.where(cand < cur[:, None], cand, -1)
+            cand = cand.masked_fill(
+                (cand[:, :, None] == cand[:, None]).tril(-1).any(-1), -1
+            )
+            cand = cand.gather(1, (cand < 0).int().sort(dim=1, stable=True).indices)
+            n = (cand >= 0).sum(1)
+            row = torch.where(cand >= 0, bt[cand.clamp(min=0)] * H + h, 0)
+            row = torch.nn.functional.pad(row, (0, 1))
+            table[b * R : (b + 1) * R, h] = row.scatter(
+                1, n[:, None], bt[cur, None] * H + h
+            )
+            lengths[b * R : (b + 1) * R, h] = n * PAGE + pos % PAGE + 1
+            tails.append((int(bt[-1]) * H + h, ctx % PAGE))
+    pages = (sum(nbs) + 1) * H
+    torch.manual_seed(0)
+    kp, vp = torch.randint(0, 256, (2, pages, 1, PAGE, D // 2), dtype=torch.uint8)
+    ks, vs = (torch.rand(2, pages, 1, PAGE, D // 16) * 0.5 + 0.01).to(
+        torch.float8_e4m3fn
+    )
+    for page, tail in tails:  # never-written slots: the kernel must not read them
+        if tail:
+            for t in (ks, vs):
+                t[page, :, tail:] = float("nan")
+    q = torch.randn(padded * R, H * 16, D).to(torch.bfloat16).view(-1, 16, D)
+    host = (q, kp, ks, vp, vs, table.flatten(0, 1).int(), lengths.flatten().int())
+    return tuple(t.to(device) for t in host)
+
+
+def m31_decode_call(output, query, kp, ks, vp, vs, table, lengths):
+    """``sparse_attn_nvfp4._flydsl_attention``'s decode call (one length-1
+    sequence a row and KV head, ATOM's default split, planned scratch)."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    seqs = query.shape[0]
+    plan = pa.plan_pa_decode(
+        lengths, 1, max_partitions=get_recommended_splits(seqs, 1), query_length=1
+    )
+    want = (int(plan.num_kv_heads), int(plan.capacity), 16)
+    exp_sums, max_logits = (torch.empty(want, device=query.device) for _ in "em")
+    partials = torch.empty(*want, D, dtype=query.dtype, device=query.device)
+
+    def call():
+        pa.pa_decode(
+            output, query, kp, vp, lengths, table, D**-0.5, 1,
+            key_scale=ks, value_scale=vs, exp_sums=exp_sums, max_logits=max_logits,
+            temporary_output=partials, work_plan=plan, max_context_length=16 * PAGE,
+        )  # fmt: skip
+
+    return call
+
+
+def check_m31(output, inputs):
+    query, kp, ks, vp, vs, table, lengths = inputs
+    expected = reference(query, (kp, ks, vp, vs), table, lengths, D**-0.5)
+    assert torch.isfinite(output).all(), "non-finite output"
+    err = (output.float() - expected).abs()
+    bad = err > 2e-2 + 2e-2 * expected.abs()
+    assert (
+        not bad.any()
+    ), f"max abs err {err.max().item():.4g} at {torch.nonzero(bad)[:4].tolist()}"
+    return bad.float().mean().item()
+
+
+def test_pa_decode_nvfp4_m31_tp1(device):
+    """M3.1 TP1 decode: 4 interleaved KV heads, 8 verify rows a request, a
+    padded batch (length-0 rows), against the FP32 reference."""
+    inputs = m31_decode_inputs([1000, 300, 4096 + 7], 4, device)
+    output = torch.full_like(inputs[0], float("nan"))
+    m31_decode_call(output, *inputs)()
+    torch.cuda.synchronize()
+    check_m31(output, inputs)
+
+
+@benchmark()
+def bench_m31_decode(case):
+    from aiter.test_common import run_perftest
+
+    contexts, padded, trace_us = M31_DECODE[case]
+    inputs = m31_decode_inputs(contexts, padded, torch.device("cuda"))
+    output = torch.full_like(inputs[0], float("nan"))
+    _, us = run_perftest(m31_decode_call(output, *inputs))
+    err = check_m31(output, inputs)
+    lengths = inputs[-1].long()
+    kv_bytes = (
+        ((lengths + PAGE - 1) // PAGE).sum().item() * PAGE * 2 * (D // 2 + D // 16)
+    )
+    return {
+        "reqs": len(contexts),
+        "rows": inputs[0].shape[0],
+        "trace us": trace_us,
+        "us": us,
+        "TFLOPS": 4 * 16 * D * lengths.sum().item() / us / 1e6,  # QK + PV
+        "TB/s": (kv_bytes + 2 * inputs[0].nbytes) / us / 1e6,
+        "err": err,
+    }
+
+
 def main():
     import argparse
 
@@ -732,7 +868,15 @@ def main():
     parser.add_argument(
         "--shape", nargs="*", default=list(BENCH_SHAPES), choices=list(BENCH_SHAPES)
     )
+    parser.add_argument(
+        "-m", "--m31", nargs="*", default=list(M31_DECODE), choices=list(M31_DECODE)
+    )
     args = parser.parse_args()
+    if args.m31:
+        df = pd.DataFrame([bench_m31_decode(c) for c in args.m31])
+        aiter.logger.info(
+            "M3.1 TP1 decode (4 KV heads):\n%s", df.to_markdown(index=False)
+        )
     from aiter.ops.flydsl.kernels import pa_decode_kernel as kernels
 
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
