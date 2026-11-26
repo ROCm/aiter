@@ -132,15 +132,23 @@ def _gemm_a16wfp4_kernel(
         )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                # Mask the scale tail too, not only the data. An OOB e8m0 scale
+                # can be 0xFF (NaN) and propagates through dot_scaled even when
+                # the masked data is zero (0 * NaN = NaN). other=127 is e8m0 1.0.
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                 a_bf16 = tl.load(
                     a_ptrs,
                     mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
