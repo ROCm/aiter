@@ -112,6 +112,9 @@ _CASES = {
     ),
     # Enough states that fwd_h and dhu take their wide tiles and launch apart.
     "wide_recurrences": (4, 128, 32, 32, 128, 128, False, "h0", _FLASH),
+    # Kimi-K3: 96 heads x 128, a head count that is not a power of two.
+    "k3_96_heads": (1, 200, 96, 96, 128, 128, False, "h0", _FLASH),
+    "k3_96_heads_varlen": (2, 260, 96, 96, 128, 128, True, "h0", _SOFTPLUS),
 }
 
 
