@@ -45,7 +45,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_weight_scale
 from aiter.utility import dtypes, fp4_utils
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
@@ -490,26 +490,20 @@ def _run_grouped_via_fused_moe(
     bias1_phys = _gguu_to_gugu_rows(bias1)
     gate_mode = GateMode.INTERLEAVE
 
-    # moe_shuffle_weight interleaves gate/up rows internally, so it takes the
-    # logical GGUU weight.
-    w1_grouped = moe_shuffle_weight(
+    # Built the production way from the logical GGUU weight and RAW GGUU
+    # scale: moe_shuffle_weight_scale(is_guinterleave=True) interleaves the
+    # gate/up rows of both, then WMMA-shuffles the weight and folds the scale
+    # n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4 end to end).
+    w1_grouped, w1_scale = moe_shuffle_weight_scale(
         w1_logical,
-        experts_cnt=experts,
-        is_guinterleave=True,
-        gate_up=True,
-    )
-    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
-    # GUGU B-scale is built the production way: feed the RAW GGUU scale to
-    # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
-    # then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4 end to end) --
-    # the weights/bias are row-interleaved above.
-    w1_scale = moe_shuffle_scale(
         w1_scale_raw.contiguous(),
-        experts_cnt=experts,
+        experts,
         is_guinterleave=True,
         gate_up=True,
     )
-    w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
+    w2_grouped, w2_scale = moe_shuffle_weight_scale(
+        w2_logical, w2_scale_raw.contiguous(), experts
+    )
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)

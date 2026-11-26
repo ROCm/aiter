@@ -97,7 +97,7 @@ from aiter import (
 from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_weight_scale
 from aiter.utility import fp4_utils
 
 try:
@@ -129,6 +129,7 @@ _DEFAULT_SCALE_INIT = "constant"
 # and where rank 0 of the profiling pass left its kernel tables.
 _PASS_ENV = "_BENCH_MEGA_MOE_PASS"
 _PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
+_PROF_FLUSH_S = float(os.environ.get("BENCH_MEGA_MOE_PROF_FLUSH_S", "1.0"))
 
 
 def _import_mori_comm():
@@ -249,14 +250,6 @@ def _mxfp4_dequant(w_qt, w_scale, orig_shape):
     return (wf * sf).to(torch.float32)
 
 
-def _gguu_to_gugu_rows(t):
-    """`(E, 2*I, ...)` GGUU [g..,u..] -> GUGU [g0,u0,g1,u1,...]."""
-    _E, two_inter = t.shape[:2]
-    inter = two_inter // 2
-    g, u = t[:, :inter], t[:, inter:]
-    return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
-
-
 def raw_quant_weights(w1, w2):
     """Quantize (unshuffled) a group of routed-expert weights."""
     w1_qt, w1_s = _mxfp4_quant(w1)
@@ -273,16 +266,16 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
     uint8 selects the fp8-activation (a8w4) kernel and fp4x2 the fp4-activation
     (a4w4) one. See ``grouped_moe_gfx1250._grouped_a8w4_tdm_moe``.
     """
-    w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
-    w1_a = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_a = shuffle_weight(w2_qt.view(torch.uint8), layout=(16, 16))
-    w1_ss = moe_shuffle_scale(
+    w1_a, w1_ss = moe_shuffle_weight_scale(
+        w1_qt.view(torch.uint8),
         w1_s.contiguous(),
-        experts_cnt=n_experts,
+        n_experts,
         is_guinterleave=True,
         gate_up=True,
     )
-    w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
+    w2_a, w2_ss = moe_shuffle_weight_scale(
+        w2_qt.view(torch.uint8), w2_s.contiguous(), n_experts
+    )
     if spec["key"] == "a4w4_mxfp4":
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)
@@ -866,6 +859,9 @@ class DeviceMoEPipeline:
             for _ in range(prof_replays):
                 self.graph.replay()
             torch.cuda.synchronize()
+            # Kineto's roctracer backend segfaults in processActivities when
+            # the trace stops while its buffer thread still delivers records.
+            time.sleep(_PROF_FLUSH_S)
         self.comm.barrier()
         self._prof = prof
         return sum(_event_device_us(e) for e in prof.key_averages())

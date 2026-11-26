@@ -480,6 +480,41 @@ def moe_shuffle_scale(
     )
 
 
+def moe_shuffle_weight_scale(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    experts_cnt: int | None = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+    allow_relayout: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``moe_shuffle_weight`` and ``moe_shuffle_scale`` of one MoE stage's
+    weight and scale (same arguments): returns both, shuffled.
+
+    On gfx1250 with ``AITER_MOE_LOC`` set it then re-lays the pair (the GUGU
+    stage1 weight, or the stage2 down weight) IOD-placed in their own storage,
+    no memory added, so that each workgroup of that GEMM reads its own IOD's
+    memory (``aiter.ops.flydsl.iod_locality``); from then on only the gfx1250
+    grouped MoE reads them. A pair it cannot place keeps the shuffled layout.
+    ``allow_relayout=False`` always keeps it, for a caller that also reads the
+    weights another way (other kernels' views, expert migration). Call at
+    weight-load time, outside CUDA graph capture.
+    """
+    weight = moe_shuffle_weight(
+        weight, experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
+    weight_scale = moe_shuffle_scale(
+        weight_scale, experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
+    if allow_relayout and (is_guinterleave or not gate_up):
+        from aiter.ops.flydsl import iod_locality
+
+        if iod_locality.mode():
+            place = iod_locality.place_w13 if gate_up else iod_locality.place_w2
+            place(weight, weight_scale, experts_cnt)
+    return weight, weight_scale
+
+
 def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool
 ) -> torch.Tensor:

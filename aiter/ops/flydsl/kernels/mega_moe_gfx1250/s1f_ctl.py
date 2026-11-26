@@ -54,13 +54,13 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: * 32 rows (EP2 tpr 256 / 512): its own flag tile too, with the 16-row
 #:   layout; the tuned GEMM1 picks tile 32 there.
 #: * 64 rows: ~230 VGPRs, 133,632 B of arena, two CTAs per CU.
+#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
+#:   tiles are 32 rows (``s1f_flag_m``).
 #: * 128 rows: twice the accumulators (398 VGPRs, no spills) in 162,816 B.
 #:   Two still fit: 2 x 163,840 B is exactly the 320 KB of LDS and two waves
 #:   of 398 VGPRs a SIMD.
 #: * 256 rows: ~800 VGPRs leave one wave per SIMD, so the CTA has the CU to
 #:   itself; 3 buffers (221,184 B) beat 4 at tpr 1536.
-#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
-#:   tiles are 32 rows (``s1f_flag_m``).
 #:
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
@@ -86,11 +86,14 @@ _S1F_MAX_RECV = 4096
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+#: DSR1 EP4 with its shared expert fused (top-9) runs the 256-tile S1F past
+#: 4096 as well: 798 vs 899 us/layer at 4096 tokens/rank, 384 vs 422 at 1536.
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
+    (4, 9): 1 << 30,
 }
 
 
@@ -104,6 +107,41 @@ def s1f_max_recv(world_size: int, topk: int) -> int:
         cap = int(env)
         return cap if cap > 0 else 1 << 30
     return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+
+
+#: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m;
+#: 0 keeps them off. They cut the XCCs reading each decode m-tile's A, yet the
+#: stage-1 kernel ran 5-9 us slower with them at tile_m 32-96 (EP4, DSV4.1
+#: Flash and DeepSeek-R1).
+_S1F_XCC_QUEUE_MAX_TILE_M = 0
+#: Placed W1: per-IOD-domain GEMM1 queues from this tile_m on. At tile_m 32
+#: they ran the stage-1 kernel ~7% slower than the global order on unplaced
+#: weights, so smaller tiles keep the global order.
+_S1F_LOC_QUEUE_MIN_TILE_M = 128
+
+
+def _s1f_mode(name: str) -> str:
+    mode = os.environ.get(name, "auto").strip() or "auto"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"{name} must be auto, 0 or 1, got {mode!r}")
+    return mode
+
+
+def _s1f_xcc_queues(tile_m: int) -> int:
+    """``AITER_MEGA_S1F_XCC_QUEUE``: auto (default), 0 or 1."""
+    mode = _s1f_mode("AITER_MEGA_S1F_XCC_QUEUE")
+    if mode == "auto":
+        return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
+    return int(mode)
+
+
+def _s1f_loc_queues(tile_m: int, xcc_queues: int) -> int:
+    """``AITER_MEGA_S1F_LOC_QUEUE``: auto (default), 0 or 1. Auto keeps the
+    per-XCC queues domain-aware."""
+    mode = _s1f_mode("AITER_MEGA_S1F_LOC_QUEUE")
+    if mode == "auto":
+        return int(bool(xcc_queues) or int(tile_m) >= _S1F_LOC_QUEUE_MIN_TILE_M)
+    return int(mode)
 
 
 def read_s1f_mode() -> bool:
@@ -478,9 +516,12 @@ class _Stage1Fusion:
         block_runs,
         tdm_b_th=0,
         tdm_as_in_prologue=0,
+        iod_loc=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
+        xcc_queues = _s1f_xcc_queues(tile_m)
+        loc_queues = _s1f_loc_queues(tile_m, xcc_queues) if iod_loc else 0
         key = (
             tile_m,
             producers,
@@ -490,6 +531,9 @@ class _Stage1Fusion:
             block_runs,
             tdm_b_th,
             tdm_as_in_prologue,
+            xcc_queues,
+            iod_loc,
+            loc_queues,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -498,6 +542,9 @@ class _Stage1Fusion:
             launch = make_s1f_stage1(
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
+                xcc_queues=xcc_queues,
+                iod_loc=iod_loc,
+                loc_queues=loc_queues,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
@@ -545,6 +592,7 @@ class _Stage1Fusion:
         quant_wmma_rep,
         tdm_b_th=0,
         tdm_as_in_prologue=0,
+        iod_loc=0,
     ):
         from .compact_plan import compact_run_buffer_dwords
 
@@ -577,6 +625,7 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
+                iod_loc=iod_loc,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -669,6 +718,11 @@ class _Stage1Fusion:
         bufs = {**self.d._slot_bufs(step["slot"])}
         if stream is None:
             stream = torch.cuda.current_stream()
+        # A W1 placed by moe_shuffle_weight_scale at load time is read placed,
+        # the GEMM1 queues handing each XCC its IOD's n-tiles.
+        from aiter.ops.flydsl.iod_locality import lookup
+
+        loc_phase, _, loc_group = lookup(w, w_scales, N, K, _S1F_TILE_N, _S1F_TILE_K)
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
             return (
@@ -678,6 +732,7 @@ class _Stage1Fusion:
                 a_scales.view(torch.int32),
                 w_scales.view(torch.int32),
                 quant_scale.view(torch.uint8),
+                quant_scale.view(torch.uint8) if loc_phase is None else loc_phase,
                 ptr_arg(psum_t),
                 self.d.res.arena.handle,
                 step["payload_ptr"],
@@ -693,10 +748,15 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
-        # The CSV's GEMM1 TDM knobs the stage-1 kernel can embed.
+        # The GEMM1 knobs the stage-1 kernel embeds. The CSV's TDM ones tune the
+        # unfused GEMM1: the tile_m 32 row's B hint and A-scale prologue ran
+        # the stage-1 kernel ~1.5 us slower (DSV4.1 Flash EP4), so it keeps its
+        # own, both off.
         g1_opts = {
-            "tdm_b_th": int(tdm_b_th),
-            "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
+            "tdm_b_th": 0,
+            "tdm_as_in_prologue": 0,
+            # The placed W1's domain group; 0: not placed.
+            "iod_loc": int(loc_group),
         }
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
