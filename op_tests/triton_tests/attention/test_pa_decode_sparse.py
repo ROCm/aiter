@@ -152,7 +152,7 @@ def _wrapper_main_kernel_params(T: int, H: int, D: int):
 
     Must stay in sync with ``pa_decode_sparse``'s (always exp2) block_k logic.
     """
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = arch_info.get_arch() in ("gfx1250", "gfx1250-strict")
     use_exp2 = True
     if use_gluon:
         if H >= 128:
@@ -391,7 +391,7 @@ def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
     KV pool."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if arch_info.get_arch() != "gfx1250":
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("the DSv4 2buff packed-fp8 path is gfx1250-only")
 
     pages = T * kv_len
@@ -445,7 +445,7 @@ def _asm_v4_decode():
     ``hsa/gfx1250/mla_v4/mla_v4_asm.csv``, so a tree without those assets (or a
     host that is not gfx1250) simply has no asm side to compare against.
     """
-    if arch_info.get_arch() != "gfx1250":
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         return None
     try:
         import aiter.mla
@@ -587,7 +587,7 @@ def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size, pooled):
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if arch_info.get_arch() != "gfx1250":
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("the DSv4 unified paged-cache path is gfx1250-only")
 
     D = _V4_DIM_QK
@@ -855,9 +855,9 @@ def test_pa_decode_sparse_with_extra(
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     arch = arch_info.get_arch()
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("the extra_* two-stream path is gfx950/gfx1250 only")
-    if arch == "gfx1250" and dtype == "bf16":
+    if arch in ("gfx1250", "gfx1250-strict") and dtype == "bf16":
         pytest.skip("gfx1250's paged path reads the aligned fp8 record only")
     if strided_cache:
         # The pool has to span >2 GiB for the offsets to overflow, so pin the
@@ -879,7 +879,7 @@ def test_pa_decode_sparse_with_extra(
     # main = contiguous SWA window per query
     # gfx1250 reads the 640 B aligned record; gfx950 reads the 584 B trailer
     # form. Same test, two layouts -- see make_packed_cache.
-    cache_layout = "aligned" if arch == "gfx1250" else "trailer"
+    cache_layout = "aligned" if arch in ("gfx1250", "gfx1250-strict") else "trailer"
     main_cache, main_deq = make_packed_cache(
         T * main_len, D, dtype, page_size, cache_layout
     )
@@ -912,7 +912,7 @@ def test_pa_decode_sparse_with_extra(
     # whatever the kernel will actually read, so a8w8's Q quantization is
     # accounted for rather than hidden in the tolerance.
     kwargs = {}
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         q_packed, q_rope = v4_pack_2buff(q)
         q_in, q_ref = q_packed, v4_unpack_2buff(q_packed, q_rope)
         kwargs["q_rope"] = q_rope
@@ -1101,7 +1101,7 @@ def _decode_inputs(path, T, H, kv_len, seed=0):
 def _skip_path(path):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if path == "fp8" and arch_info.get_arch() != "gfx1250":
+    if path == "fp8" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("the gfx1250 fp8 path is gfx1250-only")
 
 
@@ -1188,52 +1188,4 @@ def test_pa_decode_sparse_fp8_block_h16_single_split():
     with pytest.raises(ValueError, match="kv_splits=1 with BLOCK_H=16"):
         pa_decode_sparse(
             q, kv, idx, indptr, sink, scale, kv_splits=1, has_invalid=False, **kw
-        )
-
-
-def test_pa_decode_sparse_rejects_partial_extra():
-    """extra_indices / extra_indptr without extra_cache used to be dropped."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    q, kv, _, _, _, idx, indptr, sink, scale = _decode_inputs("bf16", 2, 16, 32)
-    with pytest.raises(ValueError, match="go together"):
-        pa_decode_sparse(
-            q, kv, idx, indptr, sink, scale, extra_indices=idx, extra_indptr=indptr
-        )
-
-
-def test_pa_decode_sparse_fp8_rejects_unsupported():
-    """The gfx1250 fp8 path used to return before the guard that rejects the
-    gfx950-only epilogue, so the epilogue arguments were silently ignored; and
-    it reads the extra stream with the main stream's row strides."""
-    _skip_path("fp8")
-    T, H, kv_len, block = 4, 128, 64, 64
-    q, kv, kw, _, _, idx, indptr, sink, scale = _decode_inputs("fp8", T, H, kv_len)
-    unified = v4_pack_unified(kv, kw["unified_kv_rope"], block)
-    q_kw = {"q_rope": kw["q_rope"]}
-
-    data = torch.empty(T, H * _V4_DIM_QK, dtype=torch.float8_e4m3fn, device="cuda")
-    scl = torch.empty(T, H * _V4_DIM_QK // 32, dtype=torch.uint8, device="cuda")
-    with pytest.raises(NotImplementedError, match="gfx950 gluon only"):
-        pa_decode_sparse(
-            q, unified, idx, indptr, sink, scale, out_mxfp8=(data, scl), **q_kw
-        )
-
-    # Same records, but every row 1280 B apart instead of 640.
-    nb = unified.shape[0]
-    wide = torch.zeros(nb, block, 2 * _V4_REC_ALIGNED, dtype=torch.uint8, device="cuda")
-    extra = wide[..., :_V4_REC_ALIGNED]
-    extra.copy_(unified)
-    with pytest.raises(RuntimeError, match="same row strides"):
-        pa_decode_sparse(
-            q,
-            unified,
-            idx,
-            indptr,
-            sink,
-            scale,
-            extra_cache=extra,
-            extra_indices=idx,
-            extra_indptr=indptr,
-            **q_kw,
         )

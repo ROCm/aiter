@@ -83,6 +83,155 @@ class TestFastScanCliSafety(unittest.TestCase):
                 tuner.parse_args()
 
 
+class TestMxfp4ActivationPrecision(unittest.TestCase):
+    def setUp(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune as moe
+
+        self.moe = moe
+        self.row = {
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "token": 64,
+            "model_dim": 512,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+            "dtype": str(moe.dtypes.bf16),
+            "q_dtype_a": "torch.float8_e4m3fn",
+            "q_dtype_w": str(moe.dtypes.fp4x2),
+            "q_type": str(moe.QuantType.per_1x32),
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+        }
+        self.tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
+        self.tuner.keys = list(self.row)
+        self.tuner._configuration = {"swiglu_limit": None}
+
+    def test_pairs_match_csv_precision_and_sort_block(self):
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+        for dtype, precision in (
+            (str(self.moe.dtypes.fp4x2), "fp4"),
+            ("torch.float8_e4m3fn", "fp8"),
+        ):
+            row = dict(self.row, q_dtype_a=dtype)
+            self.assertIsNone(self.tuner._unsupported_row_reason(row))
+            for full in (False, True):
+                with self.subTest(precision=precision, full=full):
+                    candidates = self.tuner._candidate_rows(row, full_search=full)
+                    self.assertTrue(candidates)
+                    # BM16 has no FP8 variant, so A8W4 keeps every larger BM.
+                    if precision == "fp8":
+                        self.assertEqual(
+                            {c["block_m"] for c in candidates}, {32, 64, 128}
+                        )
+                    if not full:
+                        plan = self.tuner._staged_candidate_plan(row)
+                        self.assertEqual(len(plan.pairs), len(candidates))
+                    for candidate in candidates:
+                        g1 = self.moe._parse_mxfp4_g1_kname(candidate["kernelName1"])
+                        g2 = parse_flydsl_v2_gemm2_kernel(candidate["kernelName2"])
+                        self.assertEqual(
+                            (g1["a_dtype"], g1["out_dtype"]), (precision,) * 2
+                        )
+                        self.assertEqual(
+                            (g2["a_dtype"], g2["b_dtype"]), (precision, "fp4")
+                        )
+                        self.assertEqual(g1["BM"], g2["tile_m"])
+                        self.assertEqual(g1["BM"], g2["sort_block_m"])
+
+    def test_a8w4_validates_activation_and_weight_layout(self):
+        self.assertIsNone(
+            self.tuner._unsupported_row_reason(dict(self.row, gate_mode="interleave"))
+        )
+        for column, value in (
+            ("gate_mode", "separated"),
+            ("q_dtype_a", "torch.float16"),
+            ("q_dtype_w", "torch.float8_e4m3fn"),
+        ):
+            with self.subTest(column=column):
+                reason = self.tuner._unsupported_row_reason(
+                    dict(self.row, **{column: value})
+                )
+                self.assertIn(column, reason)
+
+        candidate = self.tuner._candidate_rows(self.row)[0]
+        candidate["kernelName2"] = candidate["kernelName2"].replace("afp8", "afp4")
+        with self.assertRaisesRegex(ValueError, "GEMM2 a_dtype must be fp8"):
+            self.moe.build_staged_candidate_plan(self.row, [candidate])
+
+    def test_ep_drops_scatter_and_partial_dispatch_buffers(self):
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+        situv2 = dict(self.row, act_type="ActivationType.Situv2")
+
+        def epilogs(tuner):
+            return {
+                parse_flydsl_v2_gemm2_kernel(c["kernelName2"])["epilog"]
+                for c in tuner._candidate_rows(situv2)
+            }
+
+        self.assertIn("scatter", epilogs(self.tuner))
+        self.tuner._configuration = {"swiglu_limit": None, "ep_size": 32}
+        self.assertEqual(epilogs(self.tuner), {"atomic", "reduce"})
+        self.assertIsNone(self.tuner._unsupported_row_reason(situv2))
+        self.assertIn(
+            "multiple of 32",
+            self.tuner._unsupported_row_reason(dict(situv2, token=48)),
+        )
+        self.assertIn("SiTUv2", self.tuner._unsupported_row_reason(self.row))
+        self.assertEqual(self.moe.Mxfp4FlydslTuner._stage2_ep_args({}), {})
+        ep_data = {"expert_mask": "mask", "topk_ids": "ids"}
+        self.assertEqual(
+            self.moe.Mxfp4FlydslTuner._stage2_ep_args(ep_data),
+            {"expert_mask": "mask", "topk_ids": "ids", "use_valid_token_count": True},
+        )
+
+    def test_ep_drops_bm16_for_both_precisions(self):
+        a8w4 = dict(self.row, act_type="ActivationType.Situv2")
+        a4w4 = dict(a8w4, q_dtype_a=str(self.moe.dtypes.fp4x2))
+
+        def block_ms(row):
+            return {c["block_m"] for c in self.tuner._candidate_rows(row)}
+
+        self.assertIn(16, block_ms(dict(a4w4, token=4)))
+        self.tuner._configuration = {"swiglu_limit": None, "ep_size": 32}
+        # Rank 0 gets about 4 local routes over 8 experts, so M_est is 1, which
+        # the M_est rules hand to BM16 only.
+        self.assertLess(self.tuner._m_est(a4w4), 4)
+        for row in (a4w4, a8w4):
+            with self.subTest(q_dtype_a=row["q_dtype_a"]):
+                self.assertIsNone(self.tuner._unsupported_row_reason(row))
+                self.assertEqual(block_ms(row), {32, 64, 128})
+
+    def test_fast_scan_prepares_mxfp8_shared_fixture(self):
+        args = SimpleNamespace(
+            fast_scan=True, timeout=0, warmup=1, iters=2, errRatio=0.1
+        )
+        candidate = self.tuner._candidate_rows(self.row)[0]
+
+        def run_candidate(row, result, args, **kwargs):
+            self.assertEqual(kwargs["data"], "mxfp8 fixture")
+            self.assertEqual(kwargs["reference"], "mxfp8 reference")
+            result.update(us=1.0, _err=0.01)
+            return 1.0
+
+        with (
+            mock.patch.object(self.tuner, "_candidate_rows", return_value=[candidate]),
+            mock.patch.object(self.tuner, "_precompile_candidates"),
+            mock.patch.object(
+                self.tuner, "_prepare_case", return_value="mxfp8 fixture"
+            ) as prepare,
+            mock.patch.object(self.tuner, "_torch_ref", return_value="mxfp8 reference"),
+            mock.patch.object(self.tuner, "_run_candidate", side_effect=run_candidate),
+        ):
+            winner = self.tuner._tune_one_shape(self.row, args)
+
+        self.assertEqual(prepare.call_args.kwargs["a_dtype"], "fp8")
+        self.assertEqual(winner["kernelName1"], candidate["kernelName1"])
+
+
 class TestMxfp4AccuracyFunnel(unittest.TestCase):
     @staticmethod
     def _candidate(name):
@@ -1436,6 +1585,89 @@ class TestPowerTableSeparation(unittest.TestCase):
         # busy is about 0.5, so 300 + (400 - 300) / 0.5 = 500.
         self.assertGreater(corrected, 430.0)
         self.assertLess(corrected, 620.0)
+
+    def test_gpu_fault_in_power_pass_is_raised(self):
+        from aiter.utility import package_power
+
+        class AcceleratorError(RuntimeError):
+            pass
+
+        def faulting_launch():
+            raise AcceleratorError("illegal memory access")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            self.assertRaises(AcceleratorError),
+        ):
+            package_power.measure_kernel(faulting_launch, device_index=0)
+
+    def test_error_that_breaks_synchronize_is_raised_as_the_fault(self):
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+
+        def launch():
+            raise ValueError("kernel rejected its arguments")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_gpu_fault", return_value=lost),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            package_power.measure_kernel(launch, device_index=0)
+        self.assertIs(raised.exception, lost)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+
+    def test_non_fault_error_in_power_pass_reads_as_nan(self):
+        import math
+
+        from aiter.utility import package_power
+
+        def launch():
+            raise ValueError("kernel rejected its arguments")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_gpu_fault", return_value=None),
+        ):
+            watts = package_power.measure_kernel(launch, device_index=0)
+        self.assertTrue(math.isnan(watts))
+
+    def test_gpu_fault_check_uses_synchronize(self):
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.is_initialized", return_value=True),
+            mock.patch("torch.cuda.synchronize", side_effect=lost),
+        ):
+            self.assertIs(package_power._gpu_fault(ValueError("x")), lost)
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.is_initialized", return_value=True),
+            mock.patch("torch.cuda.synchronize"),
+        ):
+            self.assertIsNone(package_power._gpu_fault(ValueError("x")))
+
+    def test_failed_synchronize_stops_the_sampling_thread(self):
+        import threading
+
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+        before = threading.active_count()
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_read_watts", return_value=400.0),
+            mock.patch.object(
+                package_power, "_sync_cuda", side_effect=[None, None, lost]
+            ),
+            mock.patch.object(package_power._InFlight, "mark"),
+            self.assertRaises(RuntimeError),
+        ):
+            package_power.measure_package_watts(lambda: None, seconds=0.05)
+        self.assertEqual(threading.active_count(), before)
 
     def test_a16w16_hands_its_policy_to_hipblaslt(self):
         from csrc.gemm_a16w16 import gemm_a16w16_tune

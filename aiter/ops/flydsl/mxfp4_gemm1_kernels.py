@@ -7,9 +7,20 @@ import functools
 import torch
 
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
 
+@aot_factory(
+    "mxfp4_moe_gemm1",
+    sources=[
+        "kernels/mxfp4_gemm1.py",
+        "kernels/mxfp4_gemm_common.py",
+        "kernels/act.py",
+        "kernels/dpp_utils.py",
+        "kernels/layout_utils.py",
+    ],
+)
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
     BM,
@@ -216,6 +227,7 @@ def flydsl_mxfp4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
+    hidden_row_stride_bytes=None,
     BN=256,
     BK=256,
     interleave=False,
@@ -253,6 +265,9 @@ def flydsl_mxfp4_gemm1(
         k_wave=k_wave,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
+
+    if hidden_row_stride_bytes is None:
+        hidden_row_stride_bytes = hidden_states.stride(0) * hidden_states.element_size()
 
     launch = _get_compiled_mxfp4_gemm1_port(
         BM,
@@ -293,6 +308,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            int(hidden_row_stride_bytes),
             0 if bias is None else bias.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
         ),
