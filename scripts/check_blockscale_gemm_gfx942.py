@@ -419,7 +419,7 @@ def run_baseline(shape: Shape, x, weight, x_scale, w_scale, out):
     from aiter import dtypes
     from aiter.ops import gemm_op_a8w8
 
-    cu_num, libtype, kernel_id, split_k, kernel_name, _src = shape.base
+    _cu_num, libtype, kernel_id, split_k, kernel_name, _src = shape.base
     config = {
         "libtype": libtype,
         "kernelId": int(float(kernel_id)) if kernel_id else 0,
@@ -492,7 +492,7 @@ def run_case(shape: Shape, m_max: int, args, state: dict) -> dict:
             )
             torch.cuda.synchronize(device)
             base_status = "OK"
-        except Exception as exc:  # noqa: BLE001 - record and keep FlyDSL's result
+        except Exception as exc:  # record and keep FlyDSL's result
             base_status = "ERROR"
             base_error = f"baseline: {type(exc).__name__}: {exc}"[:500]
             if "HIP" in str(exc) or "hipError" in str(exc):

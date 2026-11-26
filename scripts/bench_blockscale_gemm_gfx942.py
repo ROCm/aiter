@@ -36,6 +36,10 @@ import time
 import traceback
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 FAMILIES = (
@@ -158,6 +162,7 @@ def bench_row(row: dict, args) -> dict:
     from unittest import mock
 
     import torch
+    from check_blockscale_gemm_gfx942 import compare
 
     import aiter
     from aiter import dtypes
@@ -167,7 +172,6 @@ def bench_row(row: dict, args) -> dict:
         kernels_list,
     )
     from aiter.test_common import checkAllclose, run_perftest
-    from check_blockscale_gemm_gfx942 import compare
 
     m, n, k, ps = row["M"], row["N"], row["K"], bool(row["preshuffle"])
     fly_id = 3 if ps else 2
@@ -207,7 +211,9 @@ def bench_row(row: dict, args) -> dict:
         for tag, config in configs.items():
             out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
             with mock.patch.object(
-                gemm_op_a8w8, "get_CKGEMM_config", lambda *a, **kw: config
+                gemm_op_a8w8,
+                "get_CKGEMM_config",
+                lambda *a, _config=config, **kw: _config,
             ):
                 res, us = run_perftest(
                     op,
