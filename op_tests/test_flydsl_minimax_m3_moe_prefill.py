@@ -120,11 +120,16 @@ def _make_inputs(n_tokens, seed=0, device="cuda"):
 
 
 @contextlib.contextmanager
-def _rejects(name):
-    """The body must raise AssertionError (an input check), not run."""
+def _rejects(name, first_arg=None):
+    """The body must raise AssertionError (an input check), not run. With `first_arg`,
+    the failed check must be the one whose message starts with it, so an earlier check
+    cannot mask the one under test."""
     try:
         yield
-    except AssertionError:
+    except AssertionError as e:
+        got = e.args[0][0] if e.args and isinstance(e.args[0], tuple) else None
+        if first_arg is not None and got != first_arg:
+            raise RuntimeError(f"{name}: rejected by another check: {e.args}") from e
         return
     raise RuntimeError(f"accepted: {name}")
 
@@ -199,6 +204,36 @@ def test_a4w4_prefill_moe(n_tokens):
     }
 
 
+def test_mxfp4_quant():
+    """`mxfp4_quant` prepares the chain's activations: its codes and scales must equal
+    the independent `_quant` reference, into a fresh buffer and a caller-provided one.
+    """
+    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
+        mxfp4_quant,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(1)
+    for n_tokens in (3072, 5000):
+        x = (torch.randn(n_tokens, HIDDEN, device="cuda", generator=g) * 2).to(
+            torch.bfloat16
+        )
+        ref_q, ref_s = _quant(x)
+
+        q, s = mxfp4_quant(x, None, None)
+        assert q.shape == (n_tokens, HIDDEN // 2) and q.dtype == torch.uint8
+        assert s.shape == (n_tokens, HIDDEN // 32) and s.dtype == torch.uint8
+        assert torch.equal(q, ref_q), f"allocated codes differ at {n_tokens} tokens"
+        assert torch.equal(s, ref_s), f"allocated scales differ at {n_tokens} tokens"
+
+        # caller-provided buffers, pre-filled so unwritten bytes show up
+        q_buf = torch.full_like(q, 0xA5)
+        s_buf = torch.full_like(s, 0xA5)
+        q2, s2 = mxfp4_quant(x, q_buf, s_buf)
+        assert q2 is q_buf and s2 is s_buf
+        assert torch.equal(q_buf, ref_q), f"provided codes differ at {n_tokens} tokens"
+        assert torch.equal(s_buf, ref_s), f"provided scales differ at {n_tokens} tokens"
+
+
 def test_a4w4_prefill_moe_non_current_device():
     if torch.cuda.device_count() < 2:
         aiter.logger.warning("non-current device check needs two GPUs; skipping")
@@ -217,6 +252,7 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
         MIN_PREFILL_TOKENS,
         a4w4_prefill_moe,
+        supports_shapes,
     )
 
     n = MIN_PREFILL_TOKENS
@@ -283,19 +319,41 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
             continue
         raise RuntimeError(f"accepted: {name}")
 
-    # hidden 65536 passes the shape rules, but w13 is 6.4e9 bytes: its offsets would wrap
-    wide_h = 65536
+    # the scale sort takes rows up to 16384 wide: supports_shapes stops at that ceiling
+    # (17408 satisfies every other shape rule) and the launcher refuses the shape
+    assert supports_shapes(16384, INTER) and not supports_shapes(17408, INTER)
+    assert not supports_shapes(65536, INTER)
+    sort_h = 17408
+    too_wide = {
+        **good,
+        "hidden_size": sort_h,
+        "x_quant": (zeros(n, sort_h // 2), zeros(n, sort_h // 32)),
+        "w13": empty(EXPERTS, 2 * INTER, sort_h // 2),
+        "w13_scale": empty(EXPERTS * 2 * INTER, sort_h // 32),
+        "w2": empty(EXPERTS, sort_h, INTER // 2),
+        "w2_scale": empty(EXPERTS * sort_h, INTER // 32),
+    }
+    with _rejects("hidden past the scale sort's 16384", first_arg=sort_h):
+        a4w4_prefill_moe(**too_wide)
+    del too_wide
+
+    # hidden 16384 (the widest the scale sort takes) with 512 experts passes every shape
+    # rule, but w13 is 6.4e9 bytes: its offsets would wrap. first_arg checks that it is
+    # the byte bound that rejects, not the hidden-size guard above.
+    wide_h, wide_e = 16384, 512
     wide = {
         **good,
         "hidden_size": wide_h,
+        "num_experts": wide_e,
         "x_quant": (zeros(n, wide_h // 2), zeros(n, wide_h // 32)),
-        "w13": empty(EXPERTS, 2 * INTER, wide_h // 2),
-        "w13_scale": empty(EXPERTS * 2 * INTER, wide_h // 32),
-        "w2": empty(EXPERTS, wide_h, INTER // 2),
-        "w2_scale": empty(EXPERTS * wide_h, INTER // 32),
+        "w13": empty(wide_e, 2 * INTER, wide_h // 2),
+        "w13_scale": empty(wide_e * 2 * INTER, wide_h // 32),
+        "w2": empty(wide_e, wide_h, INTER // 2),
+        "w2_scale": empty(wide_e * wide_h, INTER // 32),
     }
-    with _rejects("w13 bytes past 2^32"):
+    with _rejects("w13 bytes past 2^32", first_arg="w13"):
         a4w4_prefill_moe(**wide)
+    del wide
 
     # only gfx950 has this kernel's LDS and MFMA; the rest of the inputs are valid
     from unittest import mock
@@ -323,6 +381,7 @@ def main():
     aiter.logger.info(
         "minimax_m3 prefill moe summary (markdown):\n%s", df.to_markdown(index=False)
     )
+    test_mxfp4_quant()
     test_a4w4_prefill_moe_rejects_bad_inputs()
     test_a4w4_prefill_moe_non_current_device()
 

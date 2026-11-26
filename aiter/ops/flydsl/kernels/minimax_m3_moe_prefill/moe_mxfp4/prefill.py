@@ -26,13 +26,17 @@ GEMM1_SWIGLU_LIMIT = 7.0
 _GEMM1_BLOCK_K = 256
 # gemm2's K pipeline is written for 3 K-steps of 256
 _GEMM2_INTERMEDIATE = 768
+# aiter's scale sort (`mxfp4_moe_sort_hip`, csrc/kernels/quant_kernels.cu) rejects wider rows
+_MAX_SORT_HIDDEN = 16384
 
 
 def supports_shapes(hidden_size: int, intermediate_size: int) -> bool:
-    """gemm1 peels 4 K-steps of 256 and unrolls the rest by 4."""
+    """gemm1 peels 4 K-steps of 256 and unrolls the rest by 4; the scale sort takes
+    hidden sizes up to 16384."""
     k_iters = hidden_size // _GEMM1_BLOCK_K
     return (
         hidden_size % _GEMM1_BLOCK_K == 0
+        and hidden_size <= _MAX_SORT_HIDDEN
         and k_iters >= 8
         and (k_iters - 4) % 4 == 0
         and intermediate_size == _GEMM2_INTERMEDIATE
