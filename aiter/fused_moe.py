@@ -101,6 +101,7 @@ from aiter.moev2.segments.sort import (  # noqa: F401
     _aux_uses_opus,
     _empty_bf16,
     _flydsl_moe_sorting,
+    _flydsl_moe_sorting_onewg,
     _moe_prepare_unsorted_input,
     _moe_sorting_impl,
     _mxfp4_aux_instance_supported,

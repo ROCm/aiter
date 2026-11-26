@@ -195,6 +195,77 @@ def _onewg_pair_keys(ids, weights, eids, num_rows, block_size, topk, M, topk_wei
     return (expert[real].long() << 32) | rows[real].long()
 
 
+def _check_onewg(gen, topk, block_size, M, case):
+    """One (topk, block_size, M, routing case): the one-workgroup table equals the reference up to the pair order
+    inside an expert."""
+    E = 128
+    score = torch.rand(M, E, device="cuda", generator=gen)
+    if case == "skewed":
+        score[:, :8] += 2.0
+    elif case == "one_expert_set":
+        score[:, :] = torch.rand(1, E, device="cuda", generator=gen)
+    topk_ids = score.topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
+    topk_weights = torch.rand(M, topk, device="cuda", generator=gen)
+    ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+    out = moe_sorting(
+        topk_ids,
+        topk_weights,
+        E,
+        4096,
+        torch.bfloat16,
+        block_size,
+        accumulate=False,
+        unordered=True,
+    )
+    used = fm._flydsl_moe_sorting_onewg(topk_ids, topk_weights, E, block_size)
+    if (
+        used is None
+    ):  # topk=8 at the largest M does not fit one workgroup's LDS: normal path, exact
+        errs = _compare_moe_sorting_outputs(ref, out, topk, M)
+        assert not any(errs.values()), errs
+        return False
+    ids, w, eids, nv = out[:4]
+    assert (
+        nv.tolist() == ref[3].tolist()
+    ), f"num_valid_ids {nv.tolist()} vs {ref[3].tolist()}"
+    n = nv[0].item()
+    assert ids.shape == ref[0].shape and eids.shape == ref[2].shape
+    assert torch.equal(eids[: n // block_size], ref[2][: n // block_size])
+    got = _onewg_pair_keys(ids, w, eids, n, block_size, topk, M, topk_weights)
+    want = _onewg_pair_keys(
+        ref[0],
+        torch.where(ref[0] != (topk << 24 | M), 1.0, 0.0),
+        ref[2],
+        n,
+        block_size,
+        topk,
+        M,
+        torch.ones(M + 1, topk, device="cuda"),
+    )
+    assert torch.equal(
+        got.sort().values, want.sort().values
+    ), f"pairs differ: topk={topk} bm={block_size} M={M} {case}"
+    assert not (ids[:n] == (topk << 24 | M)).all() or M == 0
+    return True
+
+
+def test_moe_sorting_onewg_table_boundary():
+    """Configs whose block -> sorted-row bound fills whole 16 B tiles (the table needs one more row for the invalid
+    pairs): topk 1 / 2 at the 64-token tier, topk 3 at 384, topk 6 at 192 used to fail the compile-time assert.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    for topk, block_size, M in (
+        (1, 16, 1),
+        (1, 32, 64),
+        (1, 64, 100),
+        (2, 16, 1),
+        (2, 32, 33),
+        (3, 16, 300),
+        (6, 16, 150),
+    ):
+        assert _check_onewg(gen, topk, block_size, M, "random"), (topk, block_size, M)
+
+
 def test_moe_sorting_onewg():
     """One-workgroup sort (``moe_sorting(unordered=True)``): same table as the reference up to the pair order
     inside an expert, for E=128 up to 512 tokens."""
@@ -206,52 +277,7 @@ def test_moe_sorting_onewg():
         (1, 2, 8, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512),
         ("random", "skewed", "one_expert_set"),
     ):
-        score = torch.rand(M, E, device="cuda", generator=gen)
-        if case == "skewed":
-            score[:, :8] += 2.0
-        elif case == "one_expert_set":
-            score[:, :] = torch.rand(1, E, device="cuda", generator=gen)
-        topk_ids = score.topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
-        topk_weights = torch.rand(M, topk, device="cuda", generator=gen)
-        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
-        out = moe_sorting(
-            topk_ids,
-            topk_weights,
-            E,
-            4096,
-            torch.bfloat16,
-            block_size,
-            accumulate=False,
-            unordered=True,
-        )
-        used = fm._flydsl_moe_sorting_onewg(topk_ids, topk_weights, E, block_size)
-        if (
-            used is None
-        ):  # topk=8 at the largest M does not fit one workgroup's LDS: normal path, exact
-            _compare_moe_sorting_outputs(ref, out, topk, M)
-            continue
-        ids, w, eids, nv = out[:4]
-        assert (
-            nv.tolist() == ref[3].tolist()
-        ), f"num_valid_ids {nv.tolist()} vs {ref[3].tolist()}"
-        n = nv[0].item()
-        assert ids.shape == ref[0].shape and eids.shape == ref[2].shape
-        assert torch.equal(eids[: n // block_size], ref[2][: n // block_size])
-        got = _onewg_pair_keys(ids, w, eids, n, block_size, topk, M, topk_weights)
-        want = _onewg_pair_keys(
-            ref[0],
-            torch.where(ref[0] != (topk << 24 | M), 1.0, 0.0),
-            ref[2],
-            n,
-            block_size,
-            topk,
-            M,
-            torch.ones(M + 1, topk, device="cuda"),
-        )
-        assert torch.equal(
-            got.sort().values, want.sort().values
-        ), f"pairs differ: topk={topk} bm={block_size} M={M} {case}"
-        assert not (ids[:n] == (topk << 24 | M)).all() or M == 0
+        _check_onewg(gen, topk, block_size, M, case)
     # CUDA-graph capture + replay with fresh routing
     topk_ids = (
         torch.rand(48, E, device="cuda")

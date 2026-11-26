@@ -146,9 +146,11 @@ def compile_moe_sorting_onewg(
     # the sorted table in LDS (ids rows, then weight bits): padding everywhere first, the pairs on top, then
     # [0, num_valid) leaves in 16 B stores
     MS = max_sorted_rows(max_tokens, E, topk, block_m)
-    CH = (MS // 4 + threads - 1) // threads  # 16 B tiles per thread and array
+    # 16 B tiles per thread and array; row MS takes the invalid pairs, so the table holds MS + 1 rows (MS alone
+    # fills whole tiles when MS / 4 is a multiple of the thread count, e.g. topk=1, block_m=16, 64 tokens)
+    CH = ((MS + 4) // 4 + threads - 1) // threads
     TAB = CH * threads * 4  # rows per array
-    assert TAB > MS  # row MS takes the invalid pairs
+    assert TAB > MS
     NB = MS // block_m  # blocks of the bound: one block -> expert entry per thread
     assert NB <= threads
 
