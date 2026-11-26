@@ -90,6 +90,7 @@ def a4w4_prefill_moe(
     """``x_quant`` = (fp4 ``[M, H/2]``, e8m0 ``[M, H/32]``) of aiter's per-token
     MXFP4 quant -> ``[M, H]`` bf16, on ``AiterMxfp4Experts``' weights."""
     from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx_runtime
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.sort import (
         SortBuffers,
         max_sorted_rows,
@@ -102,6 +103,8 @@ def a4w4_prefill_moe(
 
     from .gemm2_prefill import gemm2_grid
 
+    # the GEMM2 pipeline needs 156 KiB of LDS and gfx950's scaled FP4 MFMA; gfx942 has neither
+    assert get_gfx_runtime() == "gfx950", get_gfx_runtime()
     a_q, x_s = x_quant
     n_tokens = a_q.shape[0]
     hidden = hidden_size
@@ -133,9 +136,18 @@ def a4w4_prefill_moe(
         t.is_cuda and t.device == a_q.device
         for t in (x_s, topk_weights, w13, w13_scale, w2, w2_scale)
     )
-    # The buffer offsets are read as unsigned 32-bit (op test: 65536 tokens at topk 4, 3.2e9
-    # bytes); shortcut: this only rules out the 2^32 wrap, so re-measure to raise it.
-    assert n_tokens * topk * hidden * 2 < 2**32, (n_tokens, topk, hidden)
+    # Buffer offsets are unsigned 32-bit and a store past 2^32 wraps to offset 0, inside the
+    # buffer. The partial rows end with the padding sentinel (token n_tokens, row n_tokens *
+    # topk), so the last byte is (n_tokens * topk + 1) * hidden * 2 - 1. Op test: 65536 tokens
+    # at topk 4 is 3.2e9 bytes. shortcut: this only rules out the wrap; re-measure to raise it.
+    assert (n_tokens * topk + 1) * hidden * 2 <= 2**32, (n_tokens, topk, hidden)
+    for name, t in (
+        ("w13", w13),
+        ("w13_scale", w13_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        assert t.numel() * t.element_size() < 2**32, (name, t.numel())
     # the tile map and the m-block search cover _MAX_BLOCKS blocks
     bm = block_m_for(n_tokens)
     assert max_sorted_rows(n_tokens, num_experts, topk, bm) // bm <= _MAX_BLOCKS

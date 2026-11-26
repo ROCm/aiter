@@ -23,6 +23,7 @@ Run:
 """
 
 import argparse
+import contextlib
 import os
 import subprocess
 import sys
@@ -116,6 +117,16 @@ def _make_inputs(n_tokens, seed=0, device="cuda"):
         )
 
     return x, w13, w2, topk_ids, topk_weights, kernel_form(w13), kernel_form(w2)
+
+
+@contextlib.contextmanager
+def _rejects(name):
+    """The body must raise AssertionError (an input check), not run."""
+    try:
+        yield
+    except AssertionError:
+        return
+    raise RuntimeError(f"accepted: {name}")
 
 
 def _setup(n_tokens, device="cuda"):
@@ -214,6 +225,14 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
     def zeros(*shape, dtype=torch.uint8, device=dev):
         return torch.zeros(*shape, dtype=dtype, device=device)
 
+    def empty(
+        *shape, dtype=torch.uint8, device=dev
+    ):  # the checks never read the contents
+        return torch.empty(*shape, dtype=dtype, device=device)
+
+    # 31775 tokens at topk 11: the padding sentinel's partial row ends past 2^32 bytes
+    m = 31775
+
     good = {
         "x_quant": (zeros(n, HIDDEN // 2), zeros(n, HIDDEN // 32)),
         "w13": zeros(EXPERTS, 2 * INTER, HIDDEN // 2),
@@ -248,6 +267,11 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
         "routing weights on the CPU": {
             "topk_weights": zeros(n, TOPK, dtype=torch.float32, device="cpu")
         },
+        "partial rows past 2^32 bytes": {
+            "x_quant": (zeros(m, HIDDEN // 2), zeros(m, HIDDEN // 32)),
+            "topk_ids": zeros(m, 11, dtype=torch.int32),
+            "topk_weights": zeros(m, 11, dtype=torch.float32),
+        },
         "too few tokens": {
             "x_quant": (zeros(n - 1, HIDDEN // 2), zeros(n - 1, HIDDEN // 32))
         },
@@ -258,6 +282,29 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
         except AssertionError:
             continue
         raise RuntimeError(f"accepted: {name}")
+
+    # hidden 65536 passes the shape rules, but w13 is 6.4e9 bytes: its offsets would wrap
+    wide_h = 65536
+    wide = {
+        **good,
+        "hidden_size": wide_h,
+        "x_quant": (zeros(n, wide_h // 2), zeros(n, wide_h // 32)),
+        "w13": empty(EXPERTS, 2 * INTER, wide_h // 2),
+        "w13_scale": empty(EXPERTS * 2 * INTER, wide_h // 32),
+        "w2": empty(EXPERTS, wide_h, INTER // 2),
+        "w2_scale": empty(EXPERTS * wide_h, INTER // 32),
+    }
+    with _rejects("w13 bytes past 2^32"):
+        a4w4_prefill_moe(**wide)
+
+    # only gfx950 has this kernel's LDS and MFMA; the rest of the inputs are valid
+    from unittest import mock
+
+    arch = mock.patch(
+        "aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx942"
+    )
+    with arch, _rejects("gfx942"):
+        a4w4_prefill_moe(**good)
 
 
 def main():
