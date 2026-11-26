@@ -67,8 +67,6 @@ _COMPUTE_MIN_K_PER_SPLIT = 512
 _SMALL_PROFILES = ((64, 128, 128, 2, 2, 2),)
 _PERSISTENT_N_TILES = (2, 4, 8)
 
-_CLUSTER_MIN_DIM = 8192
-_CLUSTER_MIN_TILES = 32
 _LARGE_M_TILE_MIN = 256
 _MAX_M_BLOCKS = 32
 
@@ -458,11 +456,10 @@ def kernel_fits_shape(
             return False
         if profile not in (*_COMPUTE_PROFILES, *_NARROW_N_COMPUTE_PROFILES):
             return False
-        if (ki.cluster_m, ki.cluster_n) not in (
-            *_COMPUTE_CLUSTERS,
-            *_COMPUTE_UNCLUSTERED,
-            *_NARROW_N_COMPUTE_CLUSTERS,
-        ):
+        # The tuning lists (_COMPUTE_CLUSTERS, ...) only bound what the tuner
+        # enumerates; the launch takes any cluster of at most 16 workgroups
+        # whose grid divides (checked below).
+        if not _cluster_valid(ki.cluster_m, ki.cluster_n):
             return False
         if ki.fused_splitk and (
             ki.split_k <= 1
@@ -540,17 +537,11 @@ def kernel_fits_shape(
     n_blocks = N // ki.tile_n
     if ki.tile_m < _LARGE_M_TILE_MIN and m_blocks > _MAX_M_BLOCKS:
         return False
-    if ki.cluster_m > 1:
-        if M < _CLUSTER_MIN_DIM or m_blocks < _CLUSTER_MIN_TILES:
-            return False
-        if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
-            return False
-    if ki.cluster_n > 1:
-        if N < _CLUSTER_MIN_DIM or n_blocks < _CLUSTER_MIN_TILES:
-            return False
-        if n_blocks % ki.cluster_n != 0:
-            return False
-    return True
+    # The direct candidates are unclustered; a clustered direct kernel (a tuned
+    # row's) launches whenever its grid divides into whole clusters.
+    if ki.cluster_m > 1 and not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
+        return False
+    return ki.cluster_n == 1 or n_blocks % ki.cluster_n == 0
 
 
 def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:

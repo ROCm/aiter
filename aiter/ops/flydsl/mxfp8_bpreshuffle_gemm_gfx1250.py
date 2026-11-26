@@ -707,6 +707,10 @@ def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool
         return False
 
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        COMPUTE_NAME_PREFIX,
+        NAME_PREFIX,
+        SMALL_NAME_PREFIX,
+        WmmaKernelInstance,
         kernels_list,
         mxfp8_32_kernel_fits_shape,
     )
@@ -714,17 +718,40 @@ def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool
     if cfg["k_pipe"] and not mxfp8_32_k_pipe_ok(cfg):
         return False
     base_name = re.sub(r"_pd\d+$", "", kernel_name).removesuffix("_aspre")
-    for instance in kernels_list.values():
-        if instance.name.replace("mxfp8_128", "mxfp8_32") == base_name:
-            # The launch fits cluster_m to M (_resolved_wmma_config); check that.
-            cluster_m = resolve_cluster_m(M, instance.tile_m, instance.cluster_m)
-            instance = dataclasses.replace(
-                instance, cluster_m=cluster_m or instance.cluster_m
-            )
-            return not instance.a_preshuffle and mxfp8_32_kernel_fits_shape(
-                instance, M, N, K
-            )
-    return False
+    instance = next(
+        (
+            ki
+            for ki in kernels_list.values()
+            if ki.name.replace("mxfp8_128", "mxfp8_32") == base_name
+        ),
+        None,
+    )
+    if instance is None:
+        # A tuned row may name a configuration the candidate list does not build
+        # (a clustered direct kernel, say): rebuild it from the name.
+        prefix = next(
+            p
+            for p in (COMPUTE_NAME_PREFIX, SMALL_NAME_PREFIX, NAME_PREFIX)
+            if base_name.startswith(p.replace("mxfp8_128", "mxfp8_32") + "_t")
+        )
+        instance = WmmaKernelInstance(
+            **{
+                key: cfg[key]
+                for key in (
+                    "tile_m", "tile_n", "tile_k", "num_buffers", "split_k",
+                    "cluster_m", "cluster_n", "m_warp", "n_warp",
+                    "persistent_n_tiles", "early_a", "early_b", "fused_splitk",
+                    "l2_prefetch",
+                )
+            },
+            name_prefix=prefix,
+        )  # fmt: skip
+        if instance.name.replace("mxfp8_128", "mxfp8_32") != base_name:
+            return False
+    # The launch fits cluster_m to M (_resolved_wmma_config); check that.
+    cluster_m = resolve_cluster_m(M, instance.tile_m, instance.cluster_m)
+    instance = dataclasses.replace(instance, cluster_m=cluster_m or instance.cluster_m)
+    return not instance.a_preshuffle and mxfp8_32_kernel_fits_shape(instance, M, N, K)
 
 
 def ragged_n_ok(

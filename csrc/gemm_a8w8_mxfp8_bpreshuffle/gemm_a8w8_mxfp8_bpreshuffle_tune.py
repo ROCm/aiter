@@ -599,6 +599,7 @@ KERNEL_ID_BASE_STREAM = 3_900_000  # inside the bmm id range: rows get kernelId 
 # the B = 1 bmm dispatch.
 KERNEL_ID_BASE_DECODE = 3_950_000
 KERNEL_ID_BASE_PIPE = 5_000_000  # direct kernels with k_pipe 2 (``_pd2``)
+KERNEL_ID_BASE_SEED = 6_000_000  # tuned rows' direct / compute kernels outside the list
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
@@ -687,8 +688,10 @@ def gfx1250_candidates(m, n, k):
     ]
 
 
-def gfx1250_1x32_runs(m, n, k):
-    """Every legal direct, B=1 batched, streaming and decode 1x32 candidate."""
+def gfx1250_1x32_runs(m, n, k, seeds=()):
+    """Every legal direct, B=1 batched, streaming and decode 1x32 candidate, plus
+    ``seeds`` (tuned rows' direct / compute kernelNames of this N and K) that
+    launch at this shape, so a retune can keep or reproduce any tuned row."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
         bmm_candidates as gfx1250_bmm_candidates,
     )
@@ -701,6 +704,7 @@ def gfx1250_1x32_runs(m, n, k):
     )
     from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
         mxfp8_32_k_pipe_ok,
+        mxfp8_32_kernel_launchable,
         parse_mxfp8_32_wmma_kernel_name,
     )
 
@@ -749,6 +753,18 @@ def gfx1250_1x32_runs(m, n, k):
 
     for index, name in enumerate(mxfp8_32_decode_candidates(m, n, k)):
         runs.append((KERNEL_ID_BASE_DECODE + index, 1, name, run_bmm_flydsl))
+    known = {entry[2] for entry in runs}
+    for index, name in enumerate(sorted(set(seeds) - known)):
+        cfg = parse_mxfp8_32_wmma_kernel_name(name)
+        if cfg is not None and mxfp8_32_kernel_launchable(name, m, n, k):
+            runs.append(
+                (
+                    KERNEL_ID_BASE_SEED + index,
+                    cfg["split_k"],
+                    name,
+                    run_gemm_flydsl_gfx1250_1x32,
+                )
+            )
     return list({entry[2]: entry for entry in runs}.values())
 
 
@@ -907,6 +923,39 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 if not is_mxfp8:
                     pool.append(seed)
         return by_nk, pool
+
+    def _gfx1250_1x32_seeds(self):
+        """{(N, K): [kernelName]} of the direct / compute kernels that this
+        device's gfx1250 1x32 rows name, in this op's table and in
+        gemm_a8w8_blockscale_bpreshuffle's (the B = 1 path); gfx1250_1x32_runs
+        adds those that launch at a shape to its candidates."""
+        from aiter.jit.core import AITER_CONFIGS
+        from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+            parse_mxfp8_32_wmma_kernel_name,
+        )
+
+        gfx, cu_num = self.get_gfx(), self.get_cu_num()
+        by_nk = {}
+        for path in (
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
+        ):
+            try:
+                df = pd.read_csv(path)
+            except (OSError, pd.errors.EmptyDataError):
+                continue
+            if "w_scale_block" not in df.columns:
+                continue
+            df = df[
+                (df["gfx"] == gfx)
+                & (df["cu_num"] == cu_num)
+                & (df["w_scale_block"] == W_SCALE_BLOCK)
+            ]
+            for r in df.itertuples():
+                name = str(r.kernelName)
+                if parse_mxfp8_32_wmma_kernel_name(name) is not None:
+                    by_nk.setdefault((int(r.N), int(r.K)), []).append(name)
+        return by_nk
 
     def _bmm_seeds(self):
         """{(N, K, w_scale_block): [(M, bmm kernelName)]} of the tuned
@@ -1196,6 +1245,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         # This op's gfx950 1x32 table: bmm joins the mxpsh / 8-wave kernels too.
         self._bmm_1x32 = gfx == "gfx950" and not self._mxscale_table
         seeds_nk, seed_pool = self._bmm_seeds_mxfp8() if self._bmm_1x32 else ({}, [])
+        wmma_seeds = self._gfx1250_1x32_seeds() if self._gfx1250_1x32 else {}
         opus_by_shape = {}
         if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
@@ -1217,7 +1267,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             data_args = (M, N, K, seed, block)
             candidate_run_kwargs = dict(run_kwargs)
             if self._gfx1250_1x32:
-                runs = gfx1250_1x32_runs(M, N, K)
+                runs = gfx1250_1x32_runs(M, N, K, wmma_seeds.get((N, K), ()))
                 data_generator = generate_data_gfx1250_1x32
                 data_args = (M, N, K, seed)
                 # Weights not cache-resident, as in a model forward: a cached
