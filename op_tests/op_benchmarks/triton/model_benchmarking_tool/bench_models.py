@@ -432,7 +432,7 @@ class MhaKernelHandler(KernelHandler):
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
             f"-d {shape['dqk']} -dv {shape['dv']} "
             f"--window-size-left {window_left} --window-size-right {window_right} "
-            f"-metric {self._metric}"
+            f"--metric {self._metric}"
         )
         if fn == "fwd_varlen":
             args += " -equal_seqlens"
