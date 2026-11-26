@@ -2490,3 +2490,185 @@ class Gfx1250Memory:
                 if shard == 0:
                     # Temporary query scales live in the unused Q row padding.
                     self.store(shared_row * t.q_stride + t.head_dim, scale, fx.Float32)
+
+
+class Gfx1250Mxfp4Loader:
+    """MXFP4 K/V rows of one wave's 64 tokens of a 256-token tile, in WMMA order.
+
+    Wave w owns page w // 2 of the tile, rows (w % 2) * 64 + 16 c + lane16 for
+    chunk c. Lane (lane16, half) loads its row's E8M0 scale dword and bytes
+    [16 half, +16) and [32 + 16 half, +16) of its 64-byte E2M1 row: the A operand
+    of a 16x16x128 scaled WMMA whose K is the head dimension. K and V data and
+    scale views share page and head strides.
+    """
+
+    CHUNKS = 4
+    CHUNK_WORDS = 9  # the scale dword, then 8 data dwords
+
+    def __init__(self, ctx, warp, lane16, half):
+        self.ctx = ctx
+        self.lane16, self.half = lane16, half
+        self.page_slot = warp // 2
+        row = (warp % 2) * 64 + lane16
+        self.data_off = row * 64 + half * 16
+        self.scale_off = row * 4
+        self.ptr = {
+            name: _gptr(p, fx.Int32, align)
+            for name, p, align in (
+                ("kd", ctx.key_cache_ptr, 16),
+                ("vd", ctx.value_cache_ptr, 16),
+                ("ks", ctx.key_scale_ptr, 4),
+                ("vs", ctx.value_scale_ptr, 4),
+            )
+        }
+        self.table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        self.num_pages = (ctx.planned_context + 127) // 128
+
+    def pair_rows(self, part):
+        """Wave pairs: this wave reads rows [64 part, +64) of each page."""
+        row = part * 64 + self.lane16
+        self.data_off = row * 64 + self.half * 16
+        self.scale_off = row * 4
+
+    def step_page_id(self, step):
+        """Page of 128-token step ``step`` (wave pairs); pages past the context
+        read the sequence's first page, whose tokens are masked."""
+        page = (step < self.num_pages).select(step, fx.Int32(0))
+        return fx.Int32(
+            self.table[self.ctx.planned_seq * self.ctx.max_blocks_per_seq + page]
+        )
+
+    def tile_pages(self, tt):
+        """Both page ids of tile ``tt`` (wave dims), past the context the
+        sequence's first page as in ``page_id``."""
+        row = self.ctx.planned_seq * self.ctx.max_blocks_per_seq
+        pages = []
+        for slot in range_constexpr(2):
+            page = tt * 2 + slot
+            page = (page < self.num_pages).select(page, fx.Int32(0))
+            pages.append(fx.Int32(self.table[row + page]))
+        return pages
+
+    def first_tile_pages(self, tt):
+        """``tile_pages(tt)`` of a CTA's first tile, from the pages a cluster
+        run preloads with the context length when it has them."""
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.ctx.traits.cluster_runs):
+            return self.tile_pages(tt)
+        return [
+            (tt * 2 + slot < self.num_pages).select(stage_pages[slot], stage_pages[-1])
+            for slot in range_constexpr(2)
+        ]
+
+    def load_dims(self, bases, block):
+        """V of dim block ``block`` for the tile's four 64-token packs (pack p on
+        page p // 2, rows 64 (p % 2) + [0, 64)), as the E2M1 A operand of one
+        scaled WMMA a pack: lane (r, h) holds the block's 16 bytes of pack rows
+        16 h + r and 32 + 16 h + r (K blocks h and 2 + h), so K block q of row r
+        is pack row 16 q + r. Per pack: the two rows' scale dwords, then the 8
+        data dwords. Scales issue first."""
+        rows = [16 * self.half + self.lane16, 32 + 16 * self.half + self.lane16]
+        scales, words = [], []
+        for p in range_constexpr(4):
+            base = bases[p // 2]
+            scale = fx.add_offset(self.ptr["vs"], base // 4)
+            for row in rows:
+                scales.append(
+                    fx.ptr_load(fx.add_offset(scale, fx.Uint32(64 * (p % 2) + row)))
+                )
+        for p in range_constexpr(4):
+            data = fx.add_offset(self.ptr["vd"], bases[p // 2] // 4)
+            for row in rows:
+                words.append(
+                    fx.ptr_load(
+                        fx.add_offset(
+                            data,
+                            fx.Uint32(((64 * (p % 2) + row) * 64 + 16 * block) // 4),
+                        ),
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+        raw = []
+        for p in range_constexpr(4):
+            raw.extend([scales[2 * p], scales[2 * p + 1]])
+            for part in range_constexpr(2):
+                raw.extend([words[2 * p + part][i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(raw, dtype=fx.Int32)
+
+    DIMS_WORDS = 10  # per pack: two scale dwords, then 8 data dwords
+
+    @staticmethod
+    def dims_pack(raw, p):
+        """(scale dword of pack row 16 h + r, of row 32 + 16 h + r, A operand) of
+        pack ``p`` of a ``load_dims`` result."""
+        base = p * Gfx1250Mxfp4Loader.DIMS_WORDS
+        return (
+            fx.Int32(raw[base]),
+            fx.Int32(raw[base + 1]),
+            fx.Vector.from_elements(
+                [fx.Int32(raw[base + 2 + i]) for i in range_constexpr(8)],
+                dtype=fx.Int32,
+            ),
+        )
+
+    def page_id(self, tt):
+        """This wave's page of tile ``tt``. Pages past the context (the second
+        page of a short last tile) read the sequence's first page instead: the
+        table may hold anything there, and those tokens are masked."""
+        page = tt * 2 + self.page_slot
+        page = (page < self.num_pages).select(page, fx.Int32(0))
+        return fx.Int32(
+            self.table[self.ctx.planned_seq * self.ctx.max_blocks_per_seq + page]
+        )
+
+    def first_page_id(self, tt):
+        """``page_id(tt)`` of a CTA's first tile. Cluster runs preload the first
+        tile's page ids with the context length (``ctx.stage_pages``: its two
+        pages, then token 0's), so they need not wait for it."""
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.ctx.traits.cluster_runs):
+            return self.page_id(tt)
+        page = (self.page_slot == 0).select(stage_pages[0], stage_pages[1])
+        return (tt * 2 + self.page_slot < self.num_pages).select(page, stage_pages[-1])
+
+    def base(self, page_id):
+        """Byte offset of this wave's page and KV head (wave-uniform)."""
+        page = fx.Int32(fx.rocdl.readfirstlane(T.i32, page_id))
+        return fx.Int64(page) * fx.Int64(self.ctx.stride_ks_block) + fx.Int64(
+            self.ctx.kv_h
+        ) * fx.Int64(self.ctx.stride_ks_head)
+
+    def load(self, kind, base):
+        """Rows of K (``kind`` "k") or V ("v"): per chunk [scale, 8 data dwords].
+        Scales issue first, so waiting for them does not wait for the data."""
+        # Uniform base + unsigned 32-bit lane offset (the saddr form of the load).
+        data = fx.add_offset(self.ptr[kind + "d"], base // 4)
+        scale = fx.add_offset(self.ptr[kind + "s"], base // 4)
+        scales = [
+            fx.ptr_load(fx.add_offset(scale, fx.Uint32(self.scale_off // 4 + 16 * c)))
+            for c in range_constexpr(self.CHUNKS)
+        ]
+        words = [
+            fx.ptr_load(
+                fx.add_offset(
+                    data, fx.Uint32((self.data_off + 1024 * c + 32 * part) // 4)
+                ),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            for c in range_constexpr(self.CHUNKS)
+            for part in range_constexpr(2)
+        ]
+        raw = []
+        for c in range_constexpr(self.CHUNKS):
+            raw.append(scales[c])
+            for part in range_constexpr(2):
+                raw.extend([words[2 * c + part][i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(raw, dtype=fx.Int32)
+
+    @staticmethod
+    def chunk(raw, c):
+        """(scale dword, A operand) of chunk ``c`` of a ``load`` result."""
+        base = c * Gfx1250Mxfp4Loader.CHUNK_WORDS
+        return fx.Int32(raw[base]), fx.Vector.from_elements(
+            [fx.Int32(raw[base + 1 + i]) for i in range_constexpr(8)], dtype=fx.Int32
+        )
