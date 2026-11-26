@@ -520,10 +520,10 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr, quant):
 
 
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
-# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and pair_tiles at 64 and 128
-# tokens.
+# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and the ring GEMM cores from
+# 64 tokens.
 _V41EP8_FUSED_DIGEST = (
-    "f20f206479a3a34490dcd14c869c7c321f9933e29c50b1d4204149a019475f4a"
+    "d2a5222beb2757396e9d61479ab4a96b564c698b7c63b793f478051dc080fe59"
 )
 
 
@@ -564,9 +564,9 @@ def test_v41ep8_small_m_buckets_share_one_protocol(mtpr, quant):
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
-def test_v41ep8_small_m_pairs_m_tiles(quant):
-    """EP8 V4.1-Flash, A8W4 and A4W4 alike: the small-input GEMM1 pairs an expert's interleaved 32-row m-tiles at
-    64 and 128 tokens (the A4W4 tune keeps the A8W4 one there), on the interleaved local plan it needs.
+def test_v41ep8_small_m_ring_core(quant):
+    """EP8 V4.1-Flash, A8W4 and A4W4 alike: from 64 tokens the small-input kernel runs the ring GEMM cores, on the
+    64-row interleaved m-tiles of the local plan, 256-wide GEMM1 units and 256-wide GEMM2 tiles they need.
     """
     for mtpr in (256, 512):
         for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
@@ -574,11 +574,12 @@ def test_v41ep8_small_m_pairs_m_tiles(quant):
                 bucket, mtpr, quant=quant, **V41_FLASH_EP8_SHAPE
             )
             k = config.fused_stage1
-            assert k.pair_tiles == (bucket in (64, 128)), (mtpr, bucket)
-            if k.pair_tiles:
-                assert (
-                    config.stage1.sort_block_m == 32 and k.dedup_rows and k.plan_local
-                )
+            assert bool(k.ring_core) == (bucket >= 64), (mtpr, bucket)
+            if k.ring_core:
+                s1 = config.stage1
+                assert s1.sort_block_m == config.stage2.block_m == 64
+                assert s1.tile_n == 64 * s1.num_waves and config.stage2.block_n == 256
+                assert k.dedup_rows and k.plan_local and not k.pair_tiles
                 assert k.g1_lookahead == 1 and k.g1_a_ahead == 1
                 assert not k.g1_split_tail
 
@@ -1094,7 +1095,7 @@ _A4W4_DIGEST_LARGE_MTPRS = {
 }
 _A4W4_FUSED_DIGESTS = {
     "v4_pro_ep8": "8f1f921b1bccce23c0709b0682bbee047f5893bbceb0497ee8c517f6a3d82b04",
-    "v41_flash_ep8": "d513fe824c500f5f1b5b4f8f8d050c492702875f57e859d59e19a52c11f42da3",
+    "v41_flash_ep8": "0d40d9be40cfa1671b0e12b8c716c7405240f95ee72898e665f67c2d50c775f6",
     "v41_flash_ep4": "edabac3b4dd3e9bf40a9c179427829b95c2eaf195f64b05d2ff37fc251e29498",
     "v41_flash_ep2": "4dedfdc6d0b32d049fbe45590be738063657d4341ac83929c268f434cb7a3044",
 }

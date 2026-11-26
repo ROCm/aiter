@@ -1720,6 +1720,18 @@ def _tune_v41_flash_ep8_small_both(config: MegaMoEConfig, bucket: int) -> MegaMo
             stage1=replace(config.stage1, use_tile_resource=True),
             fused_stage1=replace(config.fused_stage1, epi_evec=8, epi_lean=1),
         )
+    if bucket in (64, 128, 256, 512):
+        # The ring GEMM cores (the amd-kernels PR #12 GEMM core) on 64-row m-tiles without m-tile pairs and
+        # 256-wide GEMM1 units: GEMM1 / GEMM2 weight loads 2 steps ahead of their MFMAs, activation rows through a
+        # 4 / 6-stage LDS DMA ring.
+        config = replace(
+            config,
+            stage1=replace(config.stage1, sort_block_m=64, tile_n=256),
+            stage2=replace(config.stage2, block_m=64),
+            fused_stage1=replace(
+                config.fused_stage1, pair_tiles=False, ring_core=(2, 4, 2, 6)
+            ),
+        )
     return config
 
 
