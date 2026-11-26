@@ -7,7 +7,7 @@ recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile 
 the union kernel (queries of a tile share one compact block list with exact
 per-query membership) or to the direct kernel (one query per wave over its own
 blocks), and writes O in place. Plans and scratch are private. K/V may also be a
-token pool read in place through a slot table.
+token pool read in place through a slot table, and FP8 (E4M3FNUZ) with FP32 scales.
 """
 
 import math
@@ -22,8 +22,10 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.qsa import sparse_prefill_direct as direct
+from .kernels.qsa import sparse_prefill_direct_fp8 as direct_fp8
 from .kernels.qsa import sparse_prefill_prepare as prepare
 from .kernels.qsa import sparse_prefill_union as union
+from .kernels.qsa import sparse_prefill_union_fp8 as union_fp8
 from .kernels.qsa.sparse_prefill_common import (
     ARENA_GROWTH_PERCENT,
     SCRATCH_ALIGN,
@@ -39,9 +41,14 @@ __all__ = [
     "flydsl_qsa_sparse_prefill_supports_selection",
 ]
 
+# The FP8 kernels run E4M3FNUZ, gfx942's FP8 (aiter's dtypes.fp8 there).
+FP8 = torch.float8_e4m3fnuz
+
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
 _MAX_SPAN = 2**32 - 2**20
+# Slot-table pools past this span take raw direct's 64-bit loads (WIDE).
+_WIDE_SPAN = _MAX_SPAN
 
 # Selection widths 4T + 3 for the per-row block budgets T the kernels take.
 SELECTION_WIDTHS = tuple(4 * topk + 3 for topk in (256, 512, 768, 1024))
@@ -64,8 +71,8 @@ def flydsl_qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
     return width in SELECTION_WIDTHS and 0 <= rows * width * 4 <= _MAX_SELECTION_BYTES
 
 
-def _union_min_rows(group):
-    config = platform()
+def _union_min_rows(group, fp8=None):
+    config = platform(fp8)
     return max(config.union_min_rows, config.union_min_rows_per_head * group)
 
 
@@ -100,7 +107,11 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, kv_slots, invariant):
+    def __init__(
+        self, q, k, v, indices, query_lens, prefix_lens, kv_slots, invariant, fp8
+    ):
+        # fp8: None for BF16 K/V, else "tensor" / "token" for FP8 K/V and its scale layout.
+        self.fp8 = fp8
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -108,7 +119,7 @@ class _Workspace:
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
         slotted = kv_slots is not None
         # Past this pool span raw direct byte offsets no longer reach every row.
-        wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
+        wide = slotted and k.numel() * k.element_size() > _WIDE_SPAN
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
@@ -129,7 +140,7 @@ class _Workspace:
             **self.metadata,
         )
         self.union = None
-        minimum = _union_min_rows(q.shape[1] // k.shape[1])
+        minimum = _union_min_rows(q.shape[1] // k.shape[1], fp8)
         # Batch-invariant layouts plan union tiles only for requests of at least minimum rows.
         if (max(query_lens) if invariant else q.shape[0]) >= minimum:
             plan = prepare.allocate_plan(
@@ -138,6 +149,7 @@ class _Workspace:
                 scratch=False,
                 slotted=slotted,
                 min_request_rows=minimum if invariant else None,
+                fp8=fp8,
             )
             # Union scratch grows with tiles x their block capacity.
             needed = sum(
@@ -146,15 +158,25 @@ class _Workspace:
             )
             if needed <= UNION_SCRATCH_LIMIT:
                 self.union = plan
-        self.direct = direct.prepare(inputs=inputs, union=self.union, scratch=False)
         self.specs = [(self, "block_indices", (q.shape[0], topk), torch.int32)]
+        if fp8 is None:
+            self.direct = direct.prepare(inputs=inputs, union=self.union, scratch=False)
+            direct_specs = direct.scratch_specs(self.direct)
+        else:
+            self.direct = direct_fp8.prepare(
+                inputs=inputs, union=self.union, per_token=fp8 == "token", scratch=False
+            )
+            direct_specs = direct_fp8.scratch_specs(self.direct)
+            # FP8 Q of the pack launch, read by both FP8 kernels.
+            self.specs += [
+                (self, "q8", tuple(q.shape), torch.uint8),
+                (self, "qs", tuple(q.shape[:2]), torch.float32),
+            ]
         if self.union is not None:
             self.specs += [
                 (self.union, *spec) for spec in prepare.scratch_specs(self.union)
             ]
-        self.specs += [
-            (self.direct, *spec) for spec in direct.scratch_specs(self.direct)
-        ]
+        self.specs += [(self.direct, *spec) for spec in direct_specs]
         size = sum(
             _aligned(math.prod(shape) * dtype.itemsize)
             for *_, shape, dtype in self.specs
@@ -192,9 +214,9 @@ class _Workspace:
             # Graph pointers must outlive arena growth.
             self.pinned = tuple(self.arena.buffers)
 
-    def bind(self, q, k, v, indices, kv_slots, scale_log2):
+    def bind(self, q, k, v, indices, kv_slots, scale_log2, k_scale=None, v_scale=None):
         self.attach()
-        return SimpleNamespace(
+        inputs = SimpleNamespace(
             q=q,
             k=k,
             v=v,
@@ -204,6 +226,10 @@ class _Workspace:
             scale_log2=scale_log2,
             **self.metadata,
         )
+        if self.fp8 is not None:
+            inputs.k_scale, inputs.v_scale = k_scale, v_scale
+            inputs.q8, inputs.qs = self.q8, self.qs
+        return inputs
 
 
 class _Hot:
@@ -211,11 +237,48 @@ class _Hot:
     Building it performs the current call through the normal paths.
     """
 
-    def __init__(self, workspace, q, k, v, indices, out, kv_slots, scale_log2):
-        inputs = workspace.bind(q, k, v, indices, kv_slots, scale_log2)
+    def __init__(
+        self,
+        workspace,
+        q,
+        k,
+        v,
+        indices,
+        out,
+        kv_slots,
+        scale_log2,
+        k_scale=None,
+        v_scale=None,
+    ):
+        inputs = workspace.bind(
+            q, k, v, indices, kv_slots, scale_log2, k_scale, v_scale
+        )
         prepare.run(inputs=inputs, plan=workspace.union)
         self.prepare = prepare.launchers(inputs=inputs, plan=workspace.union)
         self.compute = []
+        self.fp8 = workspace.fp8 is not None
+        if self.fp8:
+            # Q8/QS stay bound to this hot's scratch views.
+            self.q8, self.qs = inputs.q8.view(-1), inputs.qs.view(-1)
+            # The FP8 pack (and Q quantization in its launch) precedes the union kernel,
+            # which reads its Q8.
+            direct_fp8.run(
+                inputs=inputs, prepared=workspace.direct, out=out, stage="pack"
+            )
+            self.union_fp8 = None
+            if workspace.union is not None:
+                union_fp8.run(inputs=inputs, plan=workspace.union, out=out)
+                self.union_fp8 = union_fp8.launcher(
+                    inputs=inputs, plan=workspace.union, out=out
+                )
+            direct_fp8.run(
+                inputs=inputs, prepared=workspace.direct, out=out, stage="direct"
+            )
+            launches = direct_fp8.launchers(
+                inputs=inputs, prepared=workspace.direct, out=out
+            )
+            self.pack_fp8, self.direct_fp8 = launches or (None, None)
+            return
         if workspace.union is not None:
             union.run(inputs=inputs, plan=workspace.union, out=out)
             self.compute.append(
@@ -233,11 +296,64 @@ class _Hot:
         for launch in rest:
             launch(kv_slots)
 
-    def compute_call(self, q, k, v, out, kv_slots, scale_log2):
+    def compute_call(self, q, k, v, out, kv_slots, scale_log2, k_scale, v_scale):
         # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
+        if self.fp8:
+            scales = (k_scale.view(-1), v_scale.view(-1))
+            if self.pack_fp8 is not None:
+                self.pack_fp8(q.view(-1), k, v, *scales, kv_slots)
+            if self.union_fp8 is not None:
+                self.union_fp8(
+                    self.q8, self.qs, k, v, out.view(-1), *scales, scale_log2
+                )
+            if self.direct_fp8 is not None:
+                self.direct_fp8(
+                    self.q8, self.qs, k, v, out.view(-1), *scales, kv_slots, scale_log2
+                )
+            return
         views = (q.view(-1), k, v, out.view(-1), kv_slots, scale_log2)
         for launch in self.compute:
             launch(*views)
+
+
+def _fp8_layout(k, v, k_scale, v_scale):
+    """None for BF16 K/V; "tensor" or "token" for FP8 K/V with valid scales."""
+    if k.dtype != FP8 and v.dtype != FP8:
+        if k_scale is not None or v_scale is not None:
+            raise ValueError("k_scale/v_scale apply only to FP8 K/V")
+        return None
+    per_tensor = (1,)
+    per_token = tuple(k.shape[:2])
+    for scale in (k_scale, v_scale):
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.dtype != torch.float32
+            or scale.device != k.device
+            or not scale.is_contiguous()
+            or tuple(scale.shape) not in (per_tensor, per_token)
+        ):
+            raise ValueError(
+                "FP8 K/V require contiguous FP32 k_scale/v_scale on their device, of "
+                f"shape [1] or {list(per_token)} (K's [N, HK], or [P, HK] for a pool)"
+            )
+    if k_scale.shape != v_scale.shape:
+        raise ValueError("k_scale and v_scale must both be per tensor or per token")
+    return "tensor" if tuple(k_scale.shape) == per_tensor else "token"
+
+
+def _dequantize(k, v, k_scale, v_scale, kv_slots):
+    """BF16 K/V of the packed context (gathered through kv_slots) for compute="bf16"."""
+    result = []
+    for x, scale in ((k, k_scale), (v, v_scale)):
+        if kv_slots is not None:
+            index = kv_slots.long()
+            x = x.view(torch.uint8).index_select(0, index).view(FP8)
+            if scale.ndim == 2:
+                scale = scale.index_select(0, index)
+        # FP8 -> BF16 is exact; the FP32 scale product rounds once to BF16.
+        x = x.to(torch.bfloat16)
+        result.append(x.mul_(scale[..., None] if scale.ndim == 2 else scale))
+    return result
 
 
 _workspaces = OrderedDict()
@@ -257,6 +373,9 @@ def flydsl_qsa_sparse_prefill(
     out=None,
     kv_slots=None,
     batch_invariant=False,
+    k_scale=None,
+    v_scale=None,
+    compute="fp8",
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].
 
@@ -303,10 +422,30 @@ def flydsl_qsa_sparse_prefill(
     (a call-wide budget) does not change the bits. Tuning targets MI308X (gfx942,
     80 CUs) only: other gfx942 parts log a warning and reuse the 80-CU MI308X
     settings; plans and routes follow the CU count, performance may not be optimal.
+
+    K/V may also be FP8 (gfx942's E4M3FNUZ, torch.float8_e4m3fnuz: aiter's dtypes.fp8)
+    with FP32 dequantization scales k_scale / v_scale, both per token and KV head
+    ([N,HK], with kv_slots [P,HK]) or both per tensor ([1]); K/V values are K8 * k_scale
+    and V8 * v_scale. compute="fp8" (default) runs FP8 MFMA kernels: Q is quantized per
+    (query, head) row with scale max(amax, 2**-118) / 240 and the probabilities in FP8
+    (relative output error of a few percent on random data), and per-token V scales are
+    clamped to [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct
+    rows read the context repacked per call while it fits a budget, else the raw K/V.
+    Its union plans may split a short prefill's longest tasks into two key ranges merged
+    at the end, and keep only a core of an H12/H6 union tile, the rows' other blocks
+    running direct and merging by log-sum-exp; whether a task splits depends on the whole
+    call, so batch_invariant=True does not split. compute="bf16" dequantizes the
+    request tokens to BF16 (each value the FP32 product rounded once) and runs the BF16
+    kernels (BF16 accuracy, temporary BF16 K/V of the packed context). Workspaces are
+    kept per K/V dtype and scale layout too; the scale tensors are read on every call,
+    also under graph replay.
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
+    if compute not in ("fp8", "bf16"):
+        raise ValueError('compute must be "fp8" or "bf16"')
+    fp8 = _fp8_layout(k, v, k_scale, v_scale)
     if isinstance(softmax_scale, (torch.Tensor, bool)):
         raise TypeError("softmax_scale must be a host scalar or None")
     scale = 0.0625 if softmax_scale is None else float(softmax_scale)
@@ -350,15 +489,18 @@ def flydsl_qsa_sparse_prefill(
         raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
     if q.device.type != "cuda" or torch.version.hip is None:
         raise ValueError("QSA sparse attention requires ROCm gfx942")
-    for tensor in (q, k, v):
+    kv_dtype = torch.bfloat16 if fp8 is None else FP8
+    for tensor, dtype in ((q, torch.bfloat16), (k, kv_dtype), (v, kv_dtype)):
         if (
-            tensor.dtype != torch.bfloat16
+            tensor.dtype != dtype
             or tensor.device != q.device
             or tensor.layout != torch.strided
             or not tensor.is_contiguous()
             or tensor.shape[-1] != 256
         ):
-            raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
+            raise ValueError(
+                "Q/K/V must be contiguous BF16 [tokens, heads, 256] (K/V may be FP8)"
+            )
         if tensor.data_ptr() % 16:
             raise ValueError("Q/K/V require 16-byte alignment")
     if (
@@ -406,14 +548,29 @@ def flydsl_qsa_sparse_prefill(
         raise ValueError("out must be aligned, contiguous and match Q")
     begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
     sources = (q, k, v, indices) + (() if kv_slots is None else (kv_slots,))
+    if fp8 is not None:
+        sources += (k_scale, v_scale)
     for source in sources:
         if (
             begin < source.data_ptr() + source.numel() * source.element_size()
             and source.data_ptr() < end
         ):
-            raise ValueError("out must not overlap Q/K/V, indices or kv_slots")
+            raise ValueError("out must not overlap Q/K/V, indices, kv_slots or scales")
     if q.shape[0] == 0:
         return out
+    if fp8 is not None and compute == "bf16":
+        k, v = _dequantize(k, v, k_scale, v_scale, kv_slots)
+        return flydsl_qsa_sparse_prefill(
+            q,
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+            softmax_scale=softmax_scale,
+            out=out,
+            batch_invariant=batch_invariant,
+        )
     with _lock, torch.cuda.device(q.device):
         if _device is not None and _device != q.device:
             raise ValueError("QSA sparse attention supports one GPU per process")
@@ -430,6 +587,8 @@ def flydsl_qsa_sparse_prefill(
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
             batch_invariant,
+            # FP8 K/V and their scale layout: None, "tensor" or "token".
+            fp8,
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -438,7 +597,15 @@ def flydsl_qsa_sparse_prefill(
                     "Warm attention on this stream and layout before graph capture"
                 )
             workspace = _Workspace(
-                q, k, v, indices, query_lens, prefix_lens, kv_slots, batch_invariant
+                q,
+                k,
+                v,
+                indices,
+                query_lens,
+                prefix_lens,
+                kv_slots,
+                batch_invariant,
+                fp8,
             )
             _workspaces[key] = workspace
             for stale in list(_workspaces):
@@ -452,7 +619,18 @@ def flydsl_qsa_sparse_prefill(
         hot = workspace.hot
         if hot is not None:
             hot.prepare_call(indices, kv_slots)
-            hot.compute_call(q, k, v, out, kv_slots, scale_log2)
+            hot.compute_call(q, k, v, out, kv_slots, scale_log2, k_scale, v_scale)
         else:
-            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots, scale_log2)
+            workspace.hot = _Hot(
+                workspace,
+                q,
+                k,
+                v,
+                indices,
+                out,
+                kv_slots,
+                scale_log2,
+                k_scale,
+                v_scale,
+            )
     return out

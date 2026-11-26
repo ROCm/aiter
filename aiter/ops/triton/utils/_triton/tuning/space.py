@@ -18,8 +18,8 @@ import math
 from _utils import cdiv, next_pow2
 
 SEARCH_SPACE = {
-    "BLOCK_SIZE_M": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
-    "BLOCK_SIZE_N": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    "BLOCK_SIZE_M": [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    "BLOCK_SIZE_N": [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
     "BLOCK_SIZE_K": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
     "GROUP_SIZE_M": [1, 4, 8, 16],
     "num_warps": [1, 2, 4, 8],
@@ -55,6 +55,10 @@ ALIASES = {
 
 # The gluon compiler ignores these launch options, so under gluon they stay at the default.
 TRITON_ONLY_KEYS = {"matrix_instr_nonkdim", "kpack"}
+
+# BLOCK_SIZE_M/N values below this are vector tiles (no tl.dot): only a kernel with
+# spec.vector_tiles sweeps them.
+MIN_DOT_TILE = 8
 
 
 class UnknownConfigKey(Exception):
@@ -127,6 +131,8 @@ def candidate_values(spec, backend, keys, defaults, default_path):
                 "add it to SEARCH_SPACE in space.py first"
             )
         candidates = SEARCH_SPACE[name]
+        if name in ("BLOCK_SIZE_M", "BLOCK_SIZE_N") and not spec.vector_tiles:
+            candidates = [v for v in candidates if v >= MIN_DOT_TILE]
         if backend == "gluon" and key in spec.gluon_candidates:
             candidates = spec.gluon_candidates[key]
         gluon_never_reads = backend == "gluon" and (
@@ -186,8 +192,14 @@ def should_skip_generic(shape, config, backend):
     if block_k >= 2 * k_per_split:
         return True  # the K tile is more than double the K each split works on
     if backend == "triton" and num_stages is not None:
-        # triton pipelines (num_stages > 1) exactly when there are several K iterations
-        return (num_stages > 1) != (block_k < k_per_split)
+        several_k_steps = block_k < k_per_split
+        if not several_k_steps:
+            return num_stages > 1  # one K step: num_stages makes no other kernel
+        # triton pipelines (num_stages > 1) a dot kernel when there are several K steps;
+        # a vector tile (no tl.dot, BLOCK_SIZE_N below MIN_DOT_TILE) is swept both ways
+        block_n = config.get("BLOCK_SIZE_N", config.get("BLOCK_N"))
+        vector_tile = block_n is not None and block_n < MIN_DOT_TILE
+        return num_stages == 1 and not vector_tile
     return False
 
 

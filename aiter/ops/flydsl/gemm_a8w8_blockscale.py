@@ -8,7 +8,7 @@ import functools
 import torch
 from torch import Tensor
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
     TILE_M,
@@ -17,8 +17,6 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernelInstance,
     kernels_by_name,
 )
-
-_AOT_CACHE = FlyDSLAotCache("gemm_a8w8_blockscale")
 
 
 def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
@@ -80,12 +78,19 @@ def _prepare_scales(
     return sa, w_scale.contiguous().view(-1)
 
 
+@aot_factory(
+    "gemm_a8w8_blockscale",
+    sources=[
+        "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
+        "kernels/gemm_a8w8_blockscale_8wave.py",
+    ],
+)
 @functools.lru_cache(maxsize=1024)
 def _compile_gemm(
     N: int,
     K: int,
     kernel_name: str,
-    device_index: int,
+    device: torch.device,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
@@ -133,7 +138,7 @@ def run_gemm_a8w8_blockscale(
     if x_scale.device != XQ.device or w_scale.device != XQ.device:
         raise ValueError("FlyDSL blockscale scales must be on the input device")
 
-    from .kernels.tensor_shim import current_stream_arg
+    from .kernels.tensor_shim import _run_compiled, current_stream_arg
 
     M, K = XQ.shape
     N = WQ.shape[0]
@@ -142,14 +147,12 @@ def run_gemm_a8w8_blockscale(
         out_contiguous = Out.contiguous()
         # Every tensor is contiguous and only Out's dtype varies, so the
         # compile arguments determine the launcher's argument signature. The
-        # device keeps one launcher per device on the JIT path, as
-        # _compile_gemm does; on disk the entry is shared by every device.
-        key = (N, K, kernel_name, Out.dtype, XQ.device)
+        # device keeps one launcher per device on the JIT path; on disk the
+        # entry is shared by every device.
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
-        _AOT_CACHE.launch(
-            key,
-            lambda: _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype),
+        _run_compiled(
+            _compile_gemm.lazy(N, K, kernel_name, XQ.device, Out.dtype),
             XQ.contiguous().view(torch.int8),
             WQ.contiguous().view(torch.int8),
             out_contiguous,

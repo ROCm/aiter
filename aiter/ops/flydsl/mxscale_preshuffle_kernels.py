@@ -30,7 +30,7 @@ import torch
 
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 
 # gemm_a8w8_mxfp8_bpreshuffle's gfx950 scales per w_scale block (row-major 1x32
 # x_scale; 1x32 or 32x32 w_scale), defined next to its tune pipelines;
@@ -60,12 +60,6 @@ def _reduce_exe():
     # flyc.jit(.func) starts with empty compile_hints, so the hint on
     # launch_splitk_reduce itself never reaches this reduction.
     return set_slp_vectorize_once_used(flyc.jit(launch_splitk_reduce.func), False)
-
-
-# One cache per launcher: the plain and the fused GEMM ABIs and the reduction.
-_GEMM_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_gemm")
-_GEMM_FUSED_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_gemm_fused")
-_REDUCE_AOT_CACHE = FlyDSLAotCache("mxscale_preshuffle_splitk_reduce")
 
 
 @functools.cache
@@ -135,6 +129,31 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
     return launch
 
 
+# One AOT cache per launcher: the plain and the fused GEMM ABIs and the
+# reduction. Each launcher's constexprs are its key.
+# What the launchers below are built from, besides this file.
+_AOT_SOURCES = [
+    "gemm_a8w8_mxfp8_8wave.py",
+    "gemm_tune/flydsl_gemm_mxscale_preshuffle_common.py",
+    "kernels/gemm",
+    "kernels/mfma_preshuffle_pipeline.py",
+    "kernels/communication_ops_utils.py",
+]
+
+
+@aot_factory("mxscale_preshuffle_gemm", sources=_AOT_SOURCES)
+@functools.cache
+def _gemm_launcher(constexprs: tuple):
+    return _bound_gemm_exe(False, constexprs)
+
+
+@aot_factory("mxscale_preshuffle_gemm_fused", sources=_AOT_SOURCES)
+@functools.cache
+def _gemm_fused_launcher(constexprs: tuple):
+    return _bound_gemm_exe(True, constexprs)
+
+
+@aot_factory("mxscale_preshuffle_splitk_reduce", sources=_AOT_SOURCES)
 @functools.cache
 def _bound_reduce_exe(split_k: int, out_dtype: str, strided: bool):
     """``_reduce_exe()`` with its Constexprs bound; see ``_bound_gemm_exe``."""
@@ -246,7 +265,7 @@ def flydsl_mxscale_preshuffle_gemm(
         SCALE_BLOCKS_B,
         SCALE_LAYOUTS,
     )
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
     if a_dtype not in ("fp4", "fp6", "fp8"):
@@ -416,9 +435,8 @@ def flydsl_mxscale_preshuffle_gemm(
 
     if split_k == 1:
         constexprs = (*spec, False, *pf_tail)
-        _GEMM_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(False, constexprs),
+        _run_compiled(
+            _gemm_launcher.lazy(constexprs),
             out_ptr,
             a_ptr,
             b_ptr,
@@ -427,6 +445,7 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st_arg,
+            specialization_key=A.device,
         )
         return Out
 
@@ -457,9 +476,8 @@ def flydsl_mxscale_preshuffle_gemm(
             l2_reduce = -(-num_tiles // 8) * split_k <= _GFX950_CUS_PER_XCD
         fused_tail = (depth, bool(b_nt), True) if fused_f32 and l2_reduce else pf_tail
         constexprs = (*spec, fused_f32, *fused_tail)
-        _GEMM_FUSED_AOT_CACHE.launch(
-            (constexprs, A.device),
-            lambda: _bound_gemm_exe(True, constexprs),
+        _run_compiled(
+            _gemm_fused_launcher.lazy(constexprs),
             ptr_arg(workspace),
             a_ptr,
             b_ptr,
@@ -470,6 +488,7 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st_arg,
+            specialization_key=A.device,
         )
         return Out
 
@@ -479,9 +498,8 @@ def flydsl_mxscale_preshuffle_gemm(
         tmp.record_stream(st)
     tmp_ptr = ptr_arg(tmp)
     constexprs = (*spec, False, *pf_tail)
-    _GEMM_AOT_CACHE.launch(
-        (constexprs, A.device),
-        lambda: _bound_gemm_exe(False, constexprs),
+    _run_compiled(
+        _gemm_launcher.lazy(constexprs),
         tmp_ptr,
         a_ptr,
         b_ptr,
@@ -490,10 +508,10 @@ def flydsl_mxscale_preshuffle_gemm(
         M,
         N,
         st_arg,
+        specialization_key=A.device,
     )
-    _REDUCE_AOT_CACHE.launch(
-        (split_k, out_dtype, False, A.device),
-        lambda: _bound_reduce_exe(split_k, out_dtype, False),
+    _run_compiled(
+        _bound_reduce_exe.lazy(split_k, out_dtype, False),
         tmp_ptr,
         out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
@@ -501,6 +519,7 @@ def flydsl_mxscale_preshuffle_gemm(
         N // 2,  # row_dw
         N // 2,  # ldc_dw (contiguous Out)
         st_arg,
+        specialization_key=A.device,
     )
     return Out
 
@@ -572,9 +591,10 @@ def run_gemm_a8w8_mxfp8_gfx950(
     padding): the kernel stages them through LDS itself. w_scale is
     [N, K // 32] for a 1x32 ``w_scale_block`` or [N // 32, K // 32] for 32x32;
     None reads the block off its shape. ``kernel_name`` is a tuned
-    row's mxpsh or 8-wave kernelName, else the heuristic picks an mxpsh tile.
+    row's mxpsh, 8-wave or 4-wave kernelName, else the heuristic picks an mxpsh tile.
     """
     from ..gemm_op_common import mxscale_w_scale_block
+    from .gemm_a8w8_mxfp8_4wave import NAME_PREFIX as MXFP8_4WAVE_PREFIX
     from .gemm_a8w8_mxfp8_8wave import NAME_PREFIX as MXFP8_8WAVE_PREFIX
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
 
@@ -589,7 +609,27 @@ def run_gemm_a8w8_mxfp8_gfx950(
             f"supported: {sorted(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK)}"
         )
 
-    if kernel_name is not None and kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
+    warn_untuned = False
+    if kernel_name is not None and kernel_name.startswith(f"{MXFP8_4WAVE_PREFIX}_"):
+        from .gemm_a8w8_mxfp8_4wave import fits_shape as fits_4wave
+
+        # A padded-M lookup can hand a row to an M the kernel does not take (32-bit
+        # buffer sizes): that call runs the heuristic tile like any other non-4-wave call.
+        if (
+            Out.dtype == torch.bfloat16
+            and w_scale_block == "1x32"
+            and fits_4wave(int(XQ.shape[0]), int(WQ.shape[0]), int(XQ.shape[1]))
+        ):
+            from .gemm_a8w8_mxfp8_4wave import run_gemm_a8w8_mxfp8_4wave
+
+            return run_gemm_a8w8_mxfp8_4wave(
+                XQ, WQ, x_scale, w_scale, Out, kernel_name, w_scale_block
+            )
+        # The 4-wave kernel writes bf16, reads 1x32 w_scales only and takes the shapes of
+        # ``fits_shape``; any other call runs the mxpsh heuristic tile for this (tuned)
+        # shape instead.
+        kernel_name = None
+    elif kernel_name is not None and kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
         if Out.dtype == torch.bfloat16:
             from .gemm_a8w8_mxfp8_8wave import run_gemm_a8w8_mxfp8_8wave
 
@@ -599,7 +639,6 @@ def run_gemm_a8w8_mxfp8_gfx950(
         # The 8-wave kernel writes bf16 only; any other Out runs the mxpsh
         # heuristic tile for this (tuned) shape instead.
         kernel_name = None
-        warn_untuned = False
     else:
         warn_untuned = kernel_name is None
 

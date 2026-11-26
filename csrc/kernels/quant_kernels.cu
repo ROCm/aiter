@@ -65,13 +65,6 @@ constexpr float kMxFp8Max = 240.0f;
 constexpr float kMxFp8Max = 448.0f;
 #endif
 
-// A group holding an Inf (the amax skips NaN) gets the largest finite scale, 2^127 (0xFE).
-// The unclamped convert then turns its Inf into NaN and its finite elements mostly to 0.
-__device__ __forceinline__ float mxfp8_cap_scale(float scale)
-{
-    return fminf(scale, 0x1.0p127f);
-}
-
 // |f| as an MX amax operand, f widened from a DTYPE_I value. A bf16 sNaN widens to an fp32 sNaN,
 // and gfx9's v_max_f32 returns it quieted instead of the other operand, which restarts the amax;
 // quieted first, it is skipped.
@@ -496,13 +489,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         if constexpr (use_e8m0_scale)
         {
             constexpr aiter::MxDtype kMxDtype =
-                std::is_same_v<DTYPE_O, opus::fp4_t>
-                    ? aiter::MxDtype::FP4_E2M1
-#if defined(__gfx942__)
-                    : aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-                    : aiter::MxDtype::FP8_E4M3;
-#endif
+                std::is_same_v<DTYPE_O, opus::fp4_t> ? aiter::MxDtype::FP4_E2M1 : aiter::kHwFp8MxDtype;
             inverted_scale =
                 aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
             if constexpr(kMxFp8)
@@ -1830,13 +1817,8 @@ dynamic_per_group_quant_m32k4_kernel(std::conditional_t<std::is_same_v<DTYPE_O, 
     static constexpr bool kScaleMayClip =
         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
-#if defined(__gfx942__)
     static constexpr aiter::MxDtype kMxDtype =
-        kFp4 ? aiter::MxDtype::FP4_E2M1 : aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-    static constexpr aiter::MxDtype kMxDtype =
-        kFp4 ? aiter::MxDtype::FP4_E2M1 : aiter::MxDtype::FP8_E4M3;
-#endif
+        kFp4 ? aiter::MxDtype::FP4_E2M1 : aiter::kHwFp8MxDtype;
 
     const int lane     = threadIdx.x % 32;
     const int slice    = threadIdx.x / 32;
@@ -3207,19 +3189,6 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     const float inverted_DTYPE_MAX =
         1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max());
 
-    // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240),
-    // gfx950+ ships OCP e4m3fn (max_pos=448). The legacy
-    // ``fp_f32_to_e8m0_scale<RoundUp, FP4>(absMax) * 1/floor_pow2(MAX)`` formula here used
-    // to over-scale the FP8 working value by ~2x (factor*amax > max_pos),
-    // saturating the high tail; emit_mx_e8m0_scale<RoundUp, dtype> picks the
-    // correct ``ceil_pow2(amax / max_pos)`` per arch instead.
-    constexpr aiter::MxDtype kHwFp8Dtype =
-#if defined(__gfx942__)
-        aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-        aiter::MxDtype::FP8_E4M3;
-#endif
-
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
 
@@ -3302,7 +3271,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
             {
                 row_scale = mxfp8_cap_scale(
-                    aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kHwFp8Dtype>(
+                    aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::kHwFp8MxDtype>(
                         absMax));
             }
             else

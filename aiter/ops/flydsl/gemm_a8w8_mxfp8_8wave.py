@@ -13,7 +13,7 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .aot_cache import FlyDSLAotCache
+from .aot_launch import aot_factory
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, one
 # 256x256 block tile, and scales staged a 256-K pair at a time.
@@ -31,19 +31,20 @@ _I32_MAX = 2**31
 # Lazily bound flydsl symbols (kept out of the import path when flydsl is absent).
 _compile_mxfp8_gemm_8w = None
 _current_stream_arg = None
-
-_AOT_CACHE = FlyDSLAotCache("gemm_a8w8_mxfp8_8wave")
+_run_compiled = None
 
 
 def _lazy_import() -> None:
-    global _compile_mxfp8_gemm_8w, _current_stream_arg
+    global _compile_mxfp8_gemm_8w, _current_stream_arg, _run_compiled
     if _compile_mxfp8_gemm_8w is not None:
         return
     from .kernels.mxfp8_gemm_8wave import compile_mxfp8_gemm_8w
+    from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import current_stream_arg
 
     _compile_mxfp8_gemm_8w = compile_mxfp8_gemm_8w
     _current_stream_arg = current_stream_arg
+    _run_compiled = run_compiled
 
 
 def lds_bytes(scale_preshuffled: bool = False) -> int:
@@ -100,6 +101,14 @@ def _validate(
             )
 
 
+@aot_factory(
+    "gemm_a8w8_mxfp8_8wave",
+    sources=[
+        "kernels/mxfp8_gemm_8wave.py",
+        "kernels/gemm_a8w8_8wave.py",
+        "kernels/mfma_preshuffle_pipeline.py",
+    ],
+)
 @functools.lru_cache(maxsize=1024)
 def compile_mxfp8_8wave_gemm(
     *,
@@ -285,13 +294,11 @@ def flydsl_mxfp8_8wave_gemm(
     # Every tensor is a flat unit-stride uint8 or bf16 view, so the compile
     # arguments determine the launcher's argument signature. The device keeps
     # the JIT path's handles apart; entries on disk are shared.
-    key = (tuple(sorted(compile_kwargs.items())), XQ.device)
     # The 8-wave launcher takes (A, B_T, C, A_scale, B_scale, c_m, c_n, ldc,
     # stream) -- A first and C *third*, as gemm_a8w8_bpreshuffle_8wave. C is
     # passed as the flat span from Out's first element to its last.
-    _AOT_CACHE.launch(
-        key,
-        lambda: compile_mxfp8_8wave_gemm(**compile_kwargs),
+    _run_compiled(
+        compile_mxfp8_8wave_gemm.lazy(**compile_kwargs),
         _as_u8(XQ.contiguous()).view(-1),
         _as_u8(WQ.contiguous()).view(-1),
         out_c.as_strided(((M - 1) * ldc + N,), (1,)),
@@ -301,6 +308,7 @@ def flydsl_mxfp8_8wave_gemm(
         N,
         ldc,
         _current_stream_arg(XQ.device),
+        specialization_key=XQ.device,
     )
     if out_c is not Out:
         Out.copy_(out_c)
@@ -345,7 +353,7 @@ def _run_tail_split(
     ``n_split`` ways into an fp32 [n_split, M, N - n1] workspace, then summed
     into Out[:, n1:] by the mxpsh split-K reduce (in split order)."""
     from .kernels.tensor_shim import ptr_arg
-    from .mxscale_preshuffle_kernels import _REDUCE_AOT_CACHE, _bound_reduce_exe
+    from .mxscale_preshuffle_kernels import _bound_reduce_exe
 
     M, K = XQ.shape
     N = WQ.shape[0]
@@ -375,9 +383,8 @@ def _run_tail_split(
         "k_split": n_split,
     }
     stream = _current_stream_arg(XQ.device)
-    _AOT_CACHE.launch(
-        (tuple(sorted(compile_kwargs.items())), XQ.device),
-        lambda: compile_mxfp8_8wave_gemm(**compile_kwargs),
+    _run_compiled(
+        compile_mxfp8_8wave_gemm.lazy(**compile_kwargs),
         _as_u8(XQ.contiguous()).view(-1),
         _as_u8(WQ[n1:].contiguous()).view(-1),
         ws.view(-1),
@@ -387,12 +394,12 @@ def _run_tail_split(
         n2,
         n2,  # ldc: unused by the split kernel
         stream,
+        specialization_key=XQ.device,
     )
     tail = Out[:, n1:]
     ldc = int(tail.stride(0))
-    _REDUCE_AOT_CACHE.launch(
-        (n_split, "bf16", True, XQ.device),
-        lambda: _bound_reduce_exe(n_split, "bf16", True),
+    _run_compiled(
+        _bound_reduce_exe.lazy(n_split, "bf16", True),
         ptr_arg(ws),
         ptr_arg(tail),
         M * n2 // 2,  # n_out_dw
@@ -400,6 +407,7 @@ def _run_tail_split(
         n2 // 2,  # row_dw
         ldc // 2,  # ldc_dw
         stream,
+        specialization_key=XQ.device,
     )
     return Out
 

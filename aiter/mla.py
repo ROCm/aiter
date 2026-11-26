@@ -992,7 +992,9 @@ def mla_decode_prepare_page_csr(
 # backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
 # contract is the whole signature, schedule metadata included: a provider with
 # its own schedule reads what it needs from it and ignores the rest.
-@_route(op="mla_decode_fwd", version=1)
+# v2 adds has_partials, a hint that only permits skipping work: a v1 provider
+# that ignores it still computes the v2 result, so v1 stays accepted.
+@_route(op="mla_decode_fwd", version=2, supersedes={1: "a later aiter release"})
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -1038,8 +1040,16 @@ def mla_decode_fwd(
     kv_aux=None,
     nvfp4_params=None,
     nvfp4_lse=None,
+    has_partials=True,
 ):
     """MLA decode with explicit KV byte-layout selection.
+
+    ``has_partials=False`` declares that the persistent work plan has no split
+    rows (``reduce_indptr[-1] == 0``, e.g. ``kv_granularity`` covers each row).
+    The split buffers are then left empty and the reduce launch is skipped;
+    stage 1 writes every row to ``o`` directly. The planner output lives on the
+    GPU, so only the caller can know this; passing False for a plan that has
+    split rows makes stage 1 write past the empty split buffers.
 
     ``token_major`` preserves the existing segmented page64 dispatch.
     ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O and page64.
@@ -1075,8 +1085,9 @@ def mla_decode_fwd(
     ``nvfp4_n128`` uses separate packed q/q_aux and kv_buffer/kv_aux tensors,
     page CSR, H128 and one query per request. Provide nvfp4_params prepared by
     prepare_mla_nvfp4_params; it owns the softmax scale and fixed NVFP4 gains,
-    so leave sm_scale/q_scale/kv_scale unset. nvfp4_lse is reusable scratch
-    even when return_lse=False. No planner, split-K, CP or implicit conversion.
+    so leave sm_scale/q_scale/kv_scale unset. This backend requires
+    return_lse=False; nvfp4_lse is optional and remains untouched.
+    No planner, split-K, CP or implicit conversion.
 
     Output: the attention is written in place into ``o``, and ``o`` is the
     result. The call returns ``(logits, lse)``. With ``return_logits=False``,
@@ -1604,13 +1615,14 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
+        split_rows = reduce_partial_map.size(0) * max_seqlen_q if has_partials else 0
         logits = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+            (split_rows, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
         attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            (split_rows, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
         )
@@ -1762,17 +1774,18 @@ def mla_decode_fwd(
                 causal,
             )
 
-        _mla_decode_reduce_v1_dispatch(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            num_kv_splits,
-            o,
-            final_lse,
-        )
+        if has_partials:
+            _mla_decode_reduce_v1_dispatch(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                num_kv_splits,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:
