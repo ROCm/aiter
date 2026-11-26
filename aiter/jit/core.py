@@ -239,6 +239,15 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Tiles of the gfx950 FlyDSL gemm_a16w16 with a fused epilogue (KDA projections).
+# Per-model tuned rows live under model_configs/
+# (kimik3_flydsl_gemm_a16w16_epilogue_tuned.csv, ...); the canonical file ships
+# header-only.
+AITER_CONFIG_GEMM_A16W16_EPILOGUE = os.getenv(
+    "AITER_CONFIG_GEMM_A16W16_EPILOGUE",
+    f"{AITER_ROOT_DIR}/aiter/configs/flydsl_gemm_a16w16_epilogue_tuned.csv",
+)
+
 # Per-model tuned rows live under model_configs/
 # (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
 # get merged into this canonical file by get_config_file. It ships header-only.
@@ -474,6 +483,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A16W16_EPILOGUE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A16W16_EPILOGUE",
+            AITER_CONFIG_GEMM_A16W16_EPILOGUE,
+            "flydsl_gemm_a16w16_epilogue_tuned",
         )
 
     @property

@@ -371,18 +371,10 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
                 lambda: P.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
             )
         if stage == "gate_proj_bwd":
-
-            def per_head(out):
-                dz, dterm = out
-                return dz, dterm.view(m, h, k).sum((0, 2))
-
+            # (dz, dA_log, d dt_bias)
             return (
-                lambda: per_head(
-                    fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
-                ),
-                lambda: per_head(
-                    P.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
-                ),
+                lambda: fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb),
+                lambda: P.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb),
             )
         x = torch.randn(m, d).to(dtype)
         g_proj = (torch.randn(hk, d) * d**-0.5).to(dtype)
@@ -596,12 +588,12 @@ def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
         else:
             gate = lb * torch.sigmoid(a * z)
         dz, da = torch.autograd.grad(gate, [zr, a_log], dg)
-    # the kernel returns per-element dA_log terms; compare their per-head sums
     gate_out = torch.sigmoid(x.float() @ g_proj.float().t())
     aux16 = aux.to(g_proj.dtype).float()
     return {
         "gate": gate.detach(),
-        "gate_bwd": (dz, da),
+        # dz, dA_log, d dt_bias
+        "gate_bwd": (dz, da, dz.sum(0)),
         "sigmoid_mul": gate_out * aux,
         # the layer feeds dgp to these GEMMs in the weight dtype; grade them on
         # the same rounded input so only the GEMM itself is measured
@@ -609,12 +601,41 @@ def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
     }
 
 
+def _gate_unfused(z, dt_bias, A_log, h, lb):
+    """The decay gate as separate torch element-wise ops on an fp32 GEMM output."""
+    a = A_log[:h].float().exp().repeat_interleave(z.shape[-1] // h)
+    zb = z + dt_bias.float()
+    if lb is None:
+        return -a * torch.nn.functional.softplus(zb)
+    return lb * torch.sigmoid(a * zb)
+
+
+def _gate_bwd_unfused(z, dt_bias, A_log, h, lb, dg):
+    a = A_log[:h].float().exp().repeat_interleave(z.shape[-1] // h)
+    zb = z + dt_bias.float()
+    if lb is None:
+        dz = -dg * a * torch.sigmoid(zb)
+        dterm = -dg * a * torch.nn.functional.softplus(zb)
+    else:
+        sg = torch.sigmoid(a * zb)
+        dz = dg * lb * sg * (1 - sg) * a
+        dterm = dz * zb
+    return dz, dterm.view(z.shape[0], h, -1).sum((0, 2)), dz.sum(0)
+
+
 @benchmark()
 def test_kda_proj(m, d, h, k, r, lb, dtype):
+    """Fused epilogue GEMMs against the unfused GEMM + element-wise baselines.
+
+    ``unfused_torch`` is what the layer runs without the fusion (fp32-output
+    ``torch.mm`` on hipBLASLt, then torch element-wise); ``unfused_tgemm`` takes
+    the GEMM from aiter's tuned bf16 dispatch (``tgemm.mm``, weights [N, K]).
+    """
     from aiter.ops.flydsl import kda_layer_bwd as fk
+    from aiter.tuned_gemm import tgemm
 
     hk = h * k
-    lr = torch.randn(m, r).to(dtype)
+    lr = torch.randn(m, r)  # fp32, as the layer passes it
     f_b = (torch.randn(hk, r) * r**-0.5).to(dtype)
     dt_bias = torch.randn(hk)
     A_log = torch.zeros(max(h, K3_A_LOG_LEN))
@@ -625,54 +646,236 @@ def test_kda_proj(m, d, h, k, r, lb, dtype):
     aux = torch.randn(m, hk)
     ref = run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux)
 
-    def gate_bwd():
-        dz, dterm = fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
-        return dz, dterm.view(m, h, k).sum((0, 2))
+    def mm32(a, b):
+        return torch.mm(a, b, out_dtype=torch.float32)
 
+    def tmm32(a, w):
+        return tgemm.mm(a, w, otype=torch.float32).float()
+
+    aux16 = aux.to(dtype)
+    # the gate GEMMs run on lr split into bf16 hi + lo: K = 2R; the unfused
+    # baselines get the same split and a pre-built [f_b | f_b]
+    f_b2 = torch.cat([f_b, f_b], -1)
+    gate_bytes = (m * 2 * r + hk * r) * 2 + m * hk * 4
+    sig_bytes = (m * d + hk * d) * 2 + m * hk * (4 + 2)
     candidates = {
         "gate": (
-            lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
-            2 * m * r * hk,
-            (m * r + hk * r) * 2 + m * hk * 4,
+            {
+                "fused": lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
+                "unfused_torch": lambda: _gate_unfused(
+                    mm32(fk._split_lowrank(lr, f_b), f_b2.t()), dt_bias, A_log, h, lb
+                ),
+                "unfused_tgemm": lambda: _gate_unfused(
+                    tmm32(fk._split_lowrank(lr, f_b), f_b2), dt_bias, A_log, h, lb
+                ),
+            },
+            2 * m * 2 * r * hk,
+            gate_bytes,
         ),
         "gate_bwd": (
-            gate_bwd,
-            2 * m * r * hk,
-            (m * r + hk * r) * 2 + 3 * m * hk * 4,
+            {
+                "fused": lambda: fk.kda_gate_proj_bwd(
+                    lr, f_b, dt_bias, A_log, h, dg, lb
+                ),
+                "unfused_torch": lambda: _gate_bwd_unfused(
+                    mm32(fk._split_lowrank(lr, f_b), f_b2.t()),
+                    dt_bias,
+                    A_log,
+                    h,
+                    lb,
+                    dg,
+                ),
+                "unfused_tgemm": lambda: _gate_bwd_unfused(
+                    tmm32(fk._split_lowrank(lr, f_b), f_b2), dt_bias, A_log, h, lb, dg
+                ),
+            },
+            2 * m * 2 * r * hk,
+            gate_bytes + m * hk * 4,
         ),
         "sigmoid_mul": (
-            lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
+            {
+                "fused": lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
+                "unfused_torch": lambda: (torch.sigmoid(mm32(x, g_proj.t())) * aux).to(
+                    dtype
+                ),
+                "unfused_tgemm": lambda: (torch.sigmoid(tmm32(x, g_proj)) * aux).to(
+                    dtype
+                ),
+            },
             2 * m * d * hk,
-            (m * d + hk * d) * 2 + 2 * m * hk * 4,
+            sig_bytes,
         ),
-        # aux stands in for dgp: dx += dgp @ g_proj, dg_proj = dgp^T @ x
+        # aux stands in for dgp: dx += dgp @ g_proj (nn), dW_g = dgp^T @ x (tn,
+        # K = m: a token count off the 64-wide K tile exercises the K tail)
         "gproj_bwd": (
-            lambda: fk.gate_proj_bwd_gemms(aux, x, g_proj),
+            {
+                "fused": lambda: fk.gate_proj_bwd_gemms(aux, x, g_proj),
+                "unfused_torch": lambda: (
+                    mm32(aux16, g_proj),
+                    mm32(aux16.t(), x),
+                ),
+            },
             4 * m * d * hk,
-            (m * d + hk * d) * 2 * 2 + m * hk * 4 + (m * d + hk * d) * 4,
+            (m * d + hk * d) * 2 * 2 + m * hk * 2 + (m * d + hk * d) * 4,
         ),
     }
     ret = {"gfx": get_gfx_runtime()}
-    for name, (fn, flops, nbytes) in candidates.items():
-        out, us = run_perftest(fn)
-        outs = out if isinstance(out, tuple) else (out,)
+    tiles = {
+        "gate": (m, hk, 2 * r, "nt", 1 if lb is None else 5, dtypes.fp32),
+        "gate_bwd": (m, hk, 2 * r, "nt", 2 if lb is None else 6, dtypes.fp32),
+        "sigmoid_mul": (m, hk, d, "nt", 4, dtype),
+        "gproj_bwd": (hk, d, m, "tn", 0, dtypes.fp32),
+    }
+    for name, (impls, flops, nbytes) in candidates.items():
         refs = ref[name] if isinstance(ref[name], tuple) else (ref[name],)
-        worst = 0.0
-        for i, (o, rf) in enumerate(zip(outs, refs)):
-            err = checkAllclose(
-                rf.to(dtypes.fp32),
-                o.to(dtypes.fp32),
-                rtol=2e-2,
-                atol=2e-2,
-                msg=f"flydsl {name}[{i}]",
+        cfg, source = fk.proj_config(*tiles[name], dtype)
+        ret[f"{name} cfg"] = f"{source}:{config_name_of(cfg)}"
+        for impl, fn in impls.items():
+            out, us = run_perftest(fn)
+            outs = out if isinstance(out, tuple) else (out,)
+            worst = 0.0
+            for i, (o, rf) in enumerate(zip(outs, refs)):
+                # per-head and per-column sums add m * k terms of O(1)
+                atol = 2e-2 if o.dim() == 2 else 2e-2 * max(m, 64) ** 0.5
+                err = checkAllclose(
+                    rf.to(dtypes.fp32),
+                    o.to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=atol,
+                    msg=f"{impl} {name}[{i}]",
+                )
+                assert err == 0, f"{impl} {name}[{i}]: {err:.2%} outside tolerance"
+                worst = max(worst, err)
+            key = f"{name} {impl}"
+            ret[f"{key} us"] = us
+            ret[f"{key} TFLOPS"] = flops / us / 1e6
+            ret[f"{key} TB/s"] = nbytes / us / 1e6
+            ret[f"{key} err"] = worst
+    return ret
+
+
+# split_k of the dW_g bit-exactness sweep (each run where the tile count allows)
+WGRAD_SPLITS = (1, 2, 4)
+
+
+@benchmark()
+def test_kda_wgrad_split(m, hk, d, dtype):
+    """dW_g = dgp^T @ x (tn, K = m tokens) on every split_k and kernel.
+
+    Integer inputs in [-2, 2] keep every partial sum exact in fp32, so every
+    split, kernel and the dispatcher's pick must equal the exact result bit
+    for bit; the output is NaN-filled, so a tile left unwritten fails. Split-K
+    rows run the deterministic partial reduction the KDA dispatch uses.
+    m = 300 runs the K tail. The HTI rows show whether the HTI kernel takes
+    the tn layout; the KDA dispatcher no longer picks it.
+    """
+    from aiter.ops.flydsl import kda_layer_bwd as fk
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        GEMM_A16W16_DTYPE_BF16,
+        GEMM_A16W16_DTYPE_FP32,
+        gemm_a16w16,
+    )
+
+    dgp = torch.randint(-2, 3, (m, hk)).to(dtype)
+    x = torch.randint(-2, 3, (m, d)).to(dtype)
+    ref = dgp.float().t() @ x.float()
+    selected, source = fk.proj_config(hk, d, m, "tn", 0, torch.float32, dtype)
+
+    def ft(split_k):
+        return {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": split_k,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            # the KDA dispatch reduces split-K partials in split order
+            "split_reduce": split_k if split_k > 1 else 0,
+        }
+
+    hti256 = {
+        **ft(1),
+        "block_m": 256,
+        "block_n": 256,
+        "n_waves": 4,
+        "group_m": 4,
+        "use_half_tile_interleaved": True,
+    }
+    # (config, output dtype); the bf16 rows round the exact sums once, so
+    # they are bit-exact too. hti256 bf16 runs the HTI store as #8739 has it
+    # (each wave row reads back its own C rows); hti256 fp32 runs the
+    # realigned, fenced store that fp32 C needs.
+    configs = {f"selected_{source}": (selected, torch.float32)}
+    configs.update({f"ft_sk{sk}": (ft(sk), torch.float32) for sk in WGRAD_SPLITS})
+    configs["hti256"] = (hti256, torch.float32)
+    configs["ft_sk1_bf16"] = (ft(1), dtype)
+    configs["hti256_bf16"] = (hti256, dtype)
+    ret = {"gfx": get_gfx_runtime(), "selected": config_name_of(selected)}
+    flops = 2 * m * hk * d
+    failed = []
+    for name, (cfg, out_dtype) in configs.items():
+        legal = fk._validate(
+            hk,
+            d,
+            m,
+            "tn",
+            {
+                "out_dtype_id": (
+                    GEMM_A16W16_DTYPE_FP32
+                    if out_dtype == torch.float32
+                    else GEMM_A16W16_DTYPE_BF16
+                ),
+                "epilogue": 0,
+                "epi_group": 1,
+            },
+        )
+        # split-K takes at most 2048 output tiles and HTI an even count of K
+        # tiles: such a config is not launchable, not wrong
+        if not legal(cfg):
+            continue
+        out = torch.full((hk, d), float("nan"), dtype=out_dtype)
+
+        def run(cfg=cfg, out=out, out_dtype=out_dtype):
+            return gemm_a16w16(
+                dgp.t(),
+                x,
+                out=out,
+                user_kwargs=dict(cfg),
+                layout="tn",
+                out_dtype=out_dtype,
             )
-            assert err == 0, f"flydsl {name}[{i}]: {err:.2%} outside tolerance"
-            worst = max(worst, err)
+
+        _, us = run_perftest(run, num_iters=10, num_warmup=1)
+        exact = ref.to(out_dtype)
+        bad = (out != exact).float().mean().item()
+        if not torch.equal(out, exact):
+            failed.append(
+                f"{name} ({config_name_of(cfg)}, {out_dtype}): {bad:.2%} differ, "
+                f"{out.isnan().float().mean().item():.2%} NaN"
+            )
+        nbytes = (m * hk + m * d) * dgp.element_size() + hk * d * out.element_size()
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = worst
+        ret[f"{name} err"] = bad
+    # after the loop, so every config's row is in the table
+    assert not failed, "dW_g not bit-exact: " + "; ".join(failed)
     return ret
+
+
+def config_name_of(user_kwargs):
+    from aiter.ops.flydsl.gemm_epilogue_configs import config_name
+
+    return config_name(
+        {
+            **user_kwargs,
+            "hti": user_kwargs["use_half_tile_interleaved"],
+        }
+    )
 
 
 def test_kda_weight_cache_update(dtype=torch.float32, concat_proj=False):
@@ -829,6 +1032,31 @@ def main():
         default=[-5.0],
         help="decay gate lower bound (Kimi-K3 gate_lower_bound=-5, safe gate);\n"
         "none = the softplus gate, e.g. -g -5 none",
+    )
+    parser.add_argument(
+        "-m",
+        "--proj_tokens",
+        type=int,
+        nargs="*",
+        # 300: K tail of dW_g; 16384: the varlen 8x2048 batch
+        default=[256, 300, 1024, 4096, 16384],
+        help="tokens of the fused projection table (Kimi-K3 tuned CSV range)",
+    )
+    parser.add_argument(
+        "--wgrad_tokens",
+        type=int,
+        nargs="*",
+        # 300: K tail
+        default=[256, 300],
+        help="tokens of the dW_g split_k bit-exactness table",
+    )
+    parser.add_argument(
+        "--wgrad_tp",
+        type=int,
+        nargs="*",
+        # TP8 (H*K = 1536) keeps split-K under its 2048-tile limit
+        default=[1, 8],
+        help="tensor-parallel ranks sharding H*K in the dW_g table",
     )
     parser.add_argument(
         "-p",
@@ -991,12 +1219,26 @@ def main():
         summarize(
             "kda projection fusion summary",
             [
-                test_kda_proj(b * t, d, h, k, r, lb, dtype)
-                for b, t, (d, h, k, _, r), lb in itertools.product(
-                    args.batch, args.seqlen, args.shape, args.gate_lb
+                test_kda_proj(m, d, h, k, r, lb, dtype)
+                for m, (d, h, k, _, r), lb in itertools.product(
+                    args.proj_tokens, args.shape, args.gate_lb
                 )
             ],
-            {"batch": args.batch, "seqlen": args.seqlen, "shape": args.shape},
+            {"proj_tokens": args.proj_tokens, "shape": args.shape},
+        )
+        summarize(
+            "kda dW_g split_k bit-exactness summary",
+            [
+                test_kda_wgrad_split(m, h * k // tp, d, dtype)
+                for m, tp, (d, h, k, _, _) in itertools.product(
+                    args.wgrad_tokens, args.wgrad_tp, args.shape
+                )
+            ],
+            {
+                "wgrad_tokens": args.wgrad_tokens,
+                "wgrad_tp": args.wgrad_tp,
+                "shape": args.shape,
+            },
         )
 
 

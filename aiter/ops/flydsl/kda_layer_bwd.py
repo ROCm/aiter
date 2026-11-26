@@ -6,7 +6,9 @@
 ``l2norm_bwd`` launches the row kernel in ``kernels/kda_layer_bwd.py`` on flat
 contiguous fp32 tensors. ``kda_gate_proj``, ``kda_gate_proj_bwd`` and
 ``sigmoid_gate_proj`` are the gfx950 bf16 GEMM (``gemm_a16w16``) with a fused
-epilogue; they return fp32.
+epilogue, and ``gate_proj_bwd_gemms`` the same GEMM without one. Their tiles
+come from the tuned ``flydsl_gemm_a16w16_epilogue`` table
+(``gemm_epilogue_configs``); ``config=`` overrides it.
 """
 
 import torch
@@ -18,6 +20,8 @@ from .kernels.kda_layer_bwd import (
 from .kernels.tensor_shim import _run_compiled
 
 ROW_WAVES = 4
+# Head width (H*K // H) of the KDA epilogues the tuned tables validate against
+KDA_HEAD_DIM = 128
 
 
 def _f32(t):
@@ -40,11 +44,73 @@ def l2norm_bwd(x, dy, eps=1e-6):
     return dx
 
 
-# The projections below use the gfx950 bf16 GEMM with an element-wise epilogue.
-# fp32 output needs the 128x128 tile to fit the C shuffle in LDS.
-# Every KDA GEMM uses the full-tile kernel: never the half-tile-interleaved
-# (HTI) one, whose tn path is under investigation (#8754).
-_PROJ_GEMM_KWARGS = {"block_m": 128, "block_n": 128, "use_half_tile_interleaved": False}
+def _validate(m, n, k, layout, extra):
+    from .kernels.gemm_a16w16_gfx950 import (
+        GEMM_A16W16_DTYPE_BF16,
+        make_gemm_a16w16_param_and_validate,
+    )
+
+    def check(kw):
+        full = dict(kw)
+        full.update(extra)
+        full.update(
+            a_is_transposed=layout[0] == "t",
+            b_is_transposed=layout[1] == "t",
+            in_dtype_id=GEMM_A16W16_DTYPE_BF16,
+            has_bias=False,
+        )
+        if k % full["block_k"] and not full["use_half_tile_interleaved"]:
+            full["k_tail"] = True
+        return make_gemm_a16w16_param_and_validate(m, n, k, full) is not None
+
+    return check
+
+
+def proj_config(m, n, k, layout, epilogue, out_dtype, dtype=torch.bfloat16):
+    """(user_kwargs, "tuned" | "default") of one projection GEMM."""
+    from .gemm_epilogue_configs import select_config
+    from .kernels.gemm_a16w16_gfx950 import (
+        GEMM_A16W16_DTYPE_BF16,
+        GEMM_A16W16_DTYPE_FP32,
+        GEMM_EPI_KDA_MODES,
+    )
+
+    extra = {
+        "out_dtype_id": (
+            GEMM_A16W16_DTYPE_FP32
+            if out_dtype == torch.float32
+            else GEMM_A16W16_DTYPE_BF16
+        ),
+        "epilogue": epilogue,
+        "epi_group": KDA_HEAD_DIM if epilogue in GEMM_EPI_KDA_MODES else 1,
+        # the gate GEMMs read f_b once per half of the hi/lo split lr
+        "b_k_repeat": 2 if epilogue in GEMM_EPI_KDA_MODES else 1,
+    }
+    return select_config(
+        m, n, k, layout, epilogue, dtype, out_dtype, _validate(m, n, k, layout, extra)
+    )
+
+
+def _gemm(a, b, layout, out_dtype=torch.float32, config=None, epilogue=0, **kw):
+    """a @ b on the gfx950 GEMM, tiles from ``config`` or the tuned table."""
+    from .gemm_epilogue_configs import ENV_NO_KTAIL, disabled, gemm_path
+    from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
+
+    m, k = a.shape
+    n = b.shape[1]
+    if config is None:
+        config, _ = proj_config(m, n, k, layout, epilogue, out_dtype, a.dtype)
+    if k % config["block_k"] and disabled(ENV_NO_KTAIL, gemm_path(layout, epilogue)):
+        raise ValueError(f"K tail ({k} % {config['block_k']}) off by {ENV_NO_KTAIL}")
+    return gemm_a16w16(
+        a,
+        b,
+        user_kwargs=dict(config),
+        layout=layout,
+        out_dtype=out_dtype,
+        epilogue=epilogue,
+        **kw,
+    )
 
 
 def _proj_gemm(a, w, **kw):
@@ -52,42 +118,28 @@ def _proj_gemm(a, w, **kw):
     return _gemm(a.contiguous(), w.t(), "nt", **kw)
 
 
-def _gemm(a, b, layout, out=None, **kw):
-    from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
-
-    kwargs = dict(_PROJ_GEMM_KWARGS)
-    assert not kwargs["use_half_tile_interleaved"]
-    return gemm_a16w16(
-        a,
-        b,
-        out=out,
-        user_kwargs=kwargs,
-        layout=layout,
-        out_dtype=torch.float32,
-        **kw,
-    )
-
-
-def _gate_params(f_b, dt_bias, A_log, num_heads, lower_bound):
-    """fp32 [A_log[:H] | lower_bound | dt_bias] read by the KDA GEMM epilogues."""
-    lb = torch.tensor(
-        [0.0 if lower_bound is None else float(lower_bound)], device=f_b.device
-    )
-    return torch.cat([_f32(A_log)[:num_heads], lb, _f32(dt_bias)])
+def _gate_kwargs(f_b, dt_bias, A_log, num_heads, lower_bound):
+    return {
+        "epi_group": f_b.shape[0] // num_heads,
+        "a_log": _f32(A_log),
+        "dt_bias": _f32(dt_bias),
+        "lower_bound": lower_bound,
+    }
 
 
 def _split_lowrank(lr, f_b):
-    """[hi | lo] @ [f_b | f_b]^T with lr = hi + lo in 16 bits: the gate's
-    pre-activation keeps ~fp32 accuracy (the safe gate's derivative amplifies
-    an input rounding by exp(A_log)), for a K of 2R = 256 instead of 128."""
+    """[hi | lo] with lr = hi + lo in 16 bits, for [hi | lo] @ [f_b | f_b]^T: the
+    gate's pre-activation keeps ~fp32 accuracy (the safe gate's derivative
+    amplifies an input rounding by exp(A_log)), for a K of 2R instead of R. The
+    GEMM reads f_b once per half (``b_k_repeat=2``); it is never duplicated."""
     dt = f_b.dtype
     lr = lr.float()
     hi = lr.to(dt)
     lo = (lr - hi.float()).to(dt)
-    return torch.cat([hi, lo], -1), torch.cat([f_b, f_b], -1)
+    return torch.cat([hi, lo], -1)
 
 
-def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
+def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None, config=None):
     """Decay gate fused in the f_b GEMM, with z = lr @ f_b^T + dt_bias (fp32):
     ``-exp(A_log[h]) * softplus(z)``, or ``lower_bound * sigmoid(exp(A_log[h]) * z)``.
 
@@ -97,21 +149,24 @@ def kda_gate_proj(lr, f_b, dt_bias, A_log, num_heads, lower_bound=None):
     from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_SAFE_GATE
 
     mode = GEMM_EPI_KDA_GATE if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE
-    lr2, f_b2 = _split_lowrank(lr, f_b)
-    return _proj_gemm(
-        lr2,
-        f_b2,
+    return _gemm(
+        _split_lowrank(lr, f_b),
+        f_b.t(),
+        "nt",
         epilogue=mode,
-        epi_group=f_b.shape[0] // num_heads,
-        a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
+        config=config,
+        b_k_repeat=2,
+        **_gate_kwargs(f_b, dt_bias, A_log, num_heads, lower_bound),
     )
 
 
-def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
+def kda_gate_proj_bwd(
+    lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None, config=None
+):
     """Recompute z in the f_b GEMM and apply the gate backward.
 
-    dg: [M, H*K]. Returns (dz, per-element dA_log terms), fp32 [M, H*K]; dA_log
-    is the per-head sum of the second.
+    dg: [M, H*K]. Returns (dz fp32 [M, H*K], dA_log fp32 [H], d dt_bias fp32
+    [H*K]); the kernel sums dA_log's terms and dz per M tile.
     """
     from .kernels.gemm_a16w16_gfx950 import (
         GEMM_EPI_KDA_GATE_BWD,
@@ -119,39 +174,49 @@ def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, num_heads, dg, lower_bound=None):
     )
 
     mode = GEMM_EPI_KDA_GATE_BWD if lower_bound is None else GEMM_EPI_KDA_SAFE_GATE_BWD
-    dterm = torch.empty(dg.shape, device=dg.device, dtype=torch.float32)
-    lr2, f_b2 = _split_lowrank(lr, f_b)
-    dz = _proj_gemm(
-        lr2,
-        f_b2,
+    a = _split_lowrank(lr, f_b)
+    m, n = a.shape[0], f_b.shape[0]
+    if config is None:
+        config, _ = proj_config(m, n, a.shape[1], "nt", mode, torch.float32, a.dtype)
+    rows = (m + config["block_m"] - 1) // config["block_m"]
+    colsum = torch.empty((rows, 2, n), device=dg.device, dtype=torch.float32)
+    dz = _gemm(
+        a,
+        f_b.t(),
+        "nt",
         epilogue=mode,
-        epi_group=f_b.shape[0] // num_heads,
-        a_log=_gate_params(f_b, dt_bias, A_log, num_heads, lower_bound),
+        config=config,
         aux=dg.float().contiguous(),
-        out2=dterm,
+        colsum=colsum,
+        b_k_repeat=2,
+        **_gate_kwargs(f_b, dt_bias, A_log, num_heads, lower_bound),
     )
-    return dz, dterm
+    sums = colsum.sum(0)
+    return dz, sums[0].view(num_heads, -1).sum(1), sums[1]
 
 
-def sigmoid_gate_proj(x, g_proj, aux=None):
-    """sigmoid(x @ g_proj^T), times ``aux`` (fp32 [M, N]) when given."""
+def sigmoid_gate_proj(x, g_proj, aux=None, out_dtype=None, config=None):
+    """sigmoid(x @ g_proj^T), times ``aux`` (fp32 [M, N]) when given.
+
+    The epilogue runs on the fp32 accumulator; ``out_dtype`` (default: the
+    weight dtype, which the output projection reads) only sets the store.
+    """
     from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_SIGMOID, GEMM_EPI_SIGMOID_MUL
 
-    if aux is None:
-        return _proj_gemm(x.to(g_proj.dtype), g_proj, epilogue=GEMM_EPI_SIGMOID)
+    out_dtype = g_proj.dtype if out_dtype is None else out_dtype
+    kw = {"epilogue": GEMM_EPI_SIGMOID}
+    if aux is not None:
+        kw = {"epilogue": GEMM_EPI_SIGMOID_MUL, "aux": aux.float().contiguous()}
     return _proj_gemm(
-        x.to(g_proj.dtype),
-        g_proj,
-        epilogue=GEMM_EPI_SIGMOID_MUL,
-        aux=aux.float().contiguous(),
+        x.to(g_proj.dtype), g_proj, out_dtype=out_dtype, config=config, **kw
     )
 
 
 def proj_gemm(a, w, kind, out=None):
     """Plain projection GEMM on the gfx950 bf16 GEMM (fp32 output), with the
-    ``_proj_gemm`` operand convention; a shape the GEMM rejects (a K tail,
-    misaligned strides) falls back to torch on the same rounded inputs.
-    ``out`` (contiguous fp32) receives the result on either path."""
+    ``_proj_gemm`` operand convention; a shape the GEMM rejects (misaligned
+    strides, a K tail switched off) falls back to torch on the same rounded
+    inputs. ``out`` (contiguous fp32) receives the result on either path."""
     dt = w.dtype
     a16 = a.to(dt).contiguous()
     w16 = w.to(dt).contiguous()
@@ -172,8 +237,8 @@ def proj_gemm(a, w, kind, out=None):
 def gate_proj_bwd_gemms(dgp, x, g_proj):
     """(dgp @ g_proj, dgp^T @ x) in bf16 with fp32 output.
 
-    dgp: [M, H*V]; x: [M, D]; g_proj: [H*V, D]. Shapes the GEMM cannot take
-    (a K tail, misaligned strides) fall back to torch for that product.
+    dgp: [M, H*V]; x: [M, D]; g_proj: [H*V, D]. Any token count M: the weight
+    gradient takes its K tail in the kernel; the torch fallback takes the same
+    bf16-rounded dgp / x as the GEMM.
     """
-    # the torch fallback takes the same bf16-rounded dgp/x as the GEMM
     return proj_gemm(dgp, g_proj, "dgrad"), proj_gemm(dgp, x, "wgrad")
