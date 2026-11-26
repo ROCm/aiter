@@ -1268,37 +1268,33 @@ def _stage(
         tensor, base = view
         vec = 8 if num is fx.BFloat16 else 4
         cv = cols // vec
-        n_vec = rows * cv
-        it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
-        if base is not None:
-            it = fx.add_offset(it, base)
-        v3 = fx.Tensor(
-            fx.make_view(it, fx.make_layout((rows, cv, vec), (ld_stride, vec, 1)))
-        )
-        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
-        for e in range_constexpr((n_vec + NUM_THREADS - 1) // NUM_THREADS):
-            i = tid + e * NUM_THREADS
-            t = i // cv
-            c0 = (i % cv) * vec
-            # A tail iteration past n_vec redirects to a padded row: t >= rows
-            # also fails ok, and its LDS stores are skipped below.
-            in_tile = i < n_vec
-            ok = (t < nvalid) & in_tile
-            vals = _load_vec(
-                atom, fx.slice(v3, (_sel(ok, t, 0), i % cv, None)), vec, num
+        if (rows * cv) % NUM_THREADS != 0:
+            # A ragged tile (e.g. 64 x 16 bf16) takes the scalar path below:
+            # helpers outside the kernel body cannot branch at runtime.
+            view = _flat(tensor, base)
+        else:
+            it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+            if base is not None:
+                it = fx.add_offset(it, base)
+            v3 = fx.Tensor(
+                fx.make_view(it, fx.make_layout((rows, cv, vec), (ld_stride, vec, 1)))
             )
-            for p in range_constexpr(vec):
-                x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
-                x = _sel(ok, x, _zero())
-                c = c0 + p
-                idx = c * ld_dst + t if transpose else t * ld_dst + c
-                if const_expr(n_vec % NUM_THREADS == 0):
+            atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
+            for e in range_constexpr(rows * cv // NUM_THREADS):
+                i = tid + e * NUM_THREADS
+                t = i // cv
+                c0 = (i % cv) * vec
+                ok = t < nvalid
+                vals = _load_vec(
+                    atom, fx.slice(v3, (_sel(ok, t, 0), i % cv, None)), vec, num
+                )
+                for p in range_constexpr(vec):
+                    x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
+                    x = _sel(ok, x, _zero())
+                    c = c0 + p
+                    idx = c * ld_dst + t if transpose else t * ld_dst + c
                     lds_st(dst, idx, x, dst_num)
-                else:
-                    # Only a ragged last iteration needs the runtime guard.
-                    if in_tile:
-                        lds_st(dst, idx, x, dst_num)
-        return
+            return
     for e in range_constexpr(rows * cols // NUM_THREADS):
         i = tid + e * NUM_THREADS
         t = i // cols
@@ -1938,8 +1934,9 @@ def compile_dhu_mfma(
         doT: fx.Array[fx.BFloat16, bv * LDT, 16]  # do^T[c][t]
         dv2T: fx.Array[fx.BFloat16, bv * LDT, 16]  # dv2^T[c][t]
         dhT: fx.Array[fx.BFloat16, bv * LDK, 16]  # dh^T[c][k]
+        # One fp32 staging tile, reused by every product: it keeps LDS under
+        # 80 KB, so two workgroups fit a gfx950 CU.
         c_q: fx.Array[fx.Float32, BT * ldb, 16]
-        c_w: fx.Array[fx.Float32, BT * ldb, 16]
         gl: fx.Array[fx.Float32, K, 16]
 
     @flyc.kernel(name="kda_bwd_dhu_mfma_flydsl")
@@ -1989,10 +1986,8 @@ def compile_dhu_mfma(
         s_dv2T = _lds(lds.dv2T.peek(), bv * LDT)
         s_dhT = _lds(lds.dhT.peek(), bv * LDK)
         s_cq = _lds(lds.c_q.peek(), BT * ldb)
-        s_cw = _lds(lds.c_w.peek(), BT * ldb)
         s_gl = _lds(lds.gl.peek(), K)
         cq_tile = fx.make_view(fx.get_iter(s_cq), fx.make_layout((BT, bv), (ldb, 1)))
-        cw_tile = fx.make_view(fx.get_iter(s_cw), fx.make_layout((BT, bv), (ldb, 1)))
         mma = _Mma(tid)
 
         state_v = _flat(dht, fx.Int64(i_bh) * (K * V))
@@ -2087,7 +2082,7 @@ def compile_dhu_mfma(
                     bv,
                     BT,
                 )
-                acc_w = mma.acc(cw_tile)
+                acc_w = mma.acc(cq_tile)
                 mma.gemm(
                     acc_w,
                     _offset_view(s_wT, half * 64 * LDT, 64 * LDT),
@@ -2097,17 +2092,19 @@ def compile_dhu_mfma(
                     bv,
                     BT,
                 )
-                mma.store(acc_q, cq_tile)
-                mma.store(acc_w, cw_tile)
-                gpu.barrier()
                 mine = (kr // 64) == half
-                kl = kr - 64 * half
-                klc = _sel(mine, kl, 0)
+                klc = _sel(mine, kr - 64 * half, 0)
+                mma.store(acc_q, cq_tile)
+                gpu.barrier()
+                part = [
+                    lds_ld(s_cq, klc * ldb + sc + 2 * e) * scale
+                    for e in range_constexpr(NE)
+                ]
+                gpu.barrier()
+                mma.store(acc_w, cq_tile)
+                gpu.barrier()
                 for e in range_constexpr(NE):
-                    c = sc + 2 * e
-                    u = lds_ld(s_cq, klc * ldb + c) * scale - lds_ld(
-                        s_cw, klc * ldb + c
-                    )
+                    u = part[e] - lds_ld(s_cq, klc * ldb + sc + 2 * e)
                     upd[e] = _sel(mine, u, upd[e])
                 gpu.barrier()
             res = yield [st[e] * decay + upd[e] for e in range(NE)]
