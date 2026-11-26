@@ -432,7 +432,10 @@ class MhaKernelHandler(KernelHandler):
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
             f"-d {shape['dqk']} -dv {shape['dv']} "
             f"--window-size-left {window_left} --window-size-right {window_right} "
-            f"--metric {self._metric}"
+            f"--metric {self._metric} "
+            # Shorter CUDA graph timing: the bench_mha default (1000 kernels per
+            # graph, 3 + 10 replays) takes minutes per large shape.
+            "--graph-kernels-per-graph 20 --graph-warmup-replays 1 --graph-num-replays 3"
         )
         if fn == "fwd_varlen":
             args += " -equal_seqlens"
