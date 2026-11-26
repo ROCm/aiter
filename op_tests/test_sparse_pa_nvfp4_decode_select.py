@@ -15,21 +15,37 @@ Checks, against a torch reference of the selection contract and against the unfu
 Rows cover the window path (<= 1792 live blocks), the window loop (> 1792) and the exact
 path (fewer than 16 live blocks, constant / heavily tied rows).
 
+It ends with a fused vs unfused timing table (``test_select_perf``): the in-kernel selection
+against the scorer -> ``topk_per_row_small_k`` -> attention chain, both checked against the
+reference ids and the attention output on them.
+
 Run (exits nonzero if any check fails):
     python op_tests/test_sparse_pa_nvfp4_decode_select.py
 """
 
+import argparse
+import itertools
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
-from test_flydsl_sparse_pa_nvfp4 import BLK, SM_SCALE, make_case
+from test_flydsl_sparse_pa_nvfp4 import (
+    BLK,
+    PAGE_B,
+    SM_SCALE,
+    make_case,
+    perf_decode_inputs,
+)
 
+import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
     decode_select_supported,
     sparse_pa_nvfp4_decode,
 )
+from aiter.ops.flydsl.topk.topk_per_row_small_k import topk_per_row_small_k
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 TOPK = 16
 INIT_PIN, LOCAL_PIN = 1e30, 1e29
@@ -161,7 +177,99 @@ def check_overlap_rejected():
     return ok
 
 
+@benchmark()
+def test_select_perf(rows, query_len, ctx, kind, init_blocks=1, local_blocks=2):
+    """One decode step of ``rows`` rows (``query_len`` per request) at ``ctx`` keys, one kv head
+    of 16 q heads, scores of ``kind``: the attention kernel selecting in its own prologue
+    (``fused``) against the scorer -> ``topk_per_row_small_k`` -> attention chain (``unfused``;
+    the scorer is not timed: both start from the same score rows). Both must store the
+    reference ids and give the attention output the reference ids give."""
+    hkv, group = 1, 16
+    pool, _, _, bt, seq, kv, _, q, nblk, _ = perf_decode_inputs(
+        rows, query_len, hkv, group, ctx
+    )
+    width = nblk + 8
+    live = ((kv + BLK - 1) // BLK).cpu()
+    scores = make_scores(rows, width, live, kind, seed=rows + ctx).cuda()
+    ref_ids = reference_ids(scores.cpu(), live, init_blocks, local_blocks).cuda()
+    ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
+    live_dev = live.int().cuda()
+    ids = {n: torch.empty(rows, TOPK, dtype=torch.int32, device="cuda") for n in "fu"}
+    outs = {n: torch.empty_like(q) for n in "fu"}
+
+    def attend(topk, out):
+        sparse_pa_nvfp4_decode(
+            q, pool, topk, bt, seq, SM_SCALE, out, ks, vs, query_len=query_len
+        )
+
+    def fused():
+        sparse_pa_nvfp4_decode(
+            q, pool, ids["f"].view(1, rows, TOPK), bt, seq, SM_SCALE, outs["f"], ks, vs,
+            query_len=query_len, index_score=scores.view(1, rows, width),
+            index_max_seq_len=ctx, init_blocks=init_blocks, local_blocks=local_blocks,
+        )  # fmt: skip
+        return outs["f"], ids["f"]
+
+    def unfused():
+        topk_per_row_small_k(
+            scores, live_dev, ids["u"], TOPK, init_blocks, local_blocks
+        )
+        attend(ids["u"].view(1, rows, TOPK), outs["u"])
+        return outs["u"], ids["u"]
+
+    ref_out = torch.empty_like(q)
+    attend(
+        ref_ids.view(1, rows, TOPK), ref_out
+    )  # the unfused kernel on the reference ids
+    # roofline numerators: the keys the reference ids attend to (every block is full except the
+    # ones holding a row's last key), their pages, the score rows read, and the output written
+    pos = ref_ids.long() * BLK
+    keys = int((kv[:, None] - pos).clamp(0, BLK)[ref_ids >= 0].sum().item())
+    nbytes = (
+        int((ref_ids >= 0).sum().item()) * 2 * PAGE_B
+        + int(live.sum().item()) * 4
+        + 2 * q.numel() * q.element_size()
+    )
+    flops = 4 * group * 128 * keys
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in {"fused": fused, "unfused": unfused}.items():
+        (out, idx), us = run_perftest(fn, num_iters=20, num_warmup=3)
+        exact = torch.equal(idx, ref_ids)
+        if name == "fused":
+            assert exact, "fused: stored ids differ from the reference"
+        else:
+            # topk_per_row_small_k does not break ties at the 16th place toward the larger block
+            # (the in-kernel selection does), so the chain must pick the same scores, not
+            # necessarily the same blocks
+            got = scores.gather(1, idx.long()).sort(dim=1).values
+            want = scores.gather(1, ref_ids.long()).sort(dim=1).values
+            assert torch.equal(got, want), "unfused: selected scores differ"
+        ret[f"{name} ids exact"] = exact
+        err = 0.0
+        if exact:  # the output on the same blocks as the reference ids
+            err = checkAllclose(
+                ref_out.to(torch.float32), out.to(torch.float32), rtol=1e-2, atol=1e-2,
+                msg=f"{name}: attention output on the reference ids",
+            )  # fmt: skip
+            # (not bit-exact here: the selecting kernel caps splits at 4 and the default
+            # split count of the other two can be higher, which reorders the fp32 sums; the
+            # main sweep above checks bit-equality at equal splits)
+            assert err == 0, f"{name}: {err:.2%} of the output differs"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
 def main():
+    parser = argparse.ArgumentParser(description="in-kernel top-16 selection tests")
+    parser.add_argument("-r", "--rows", type=int, nargs="*", default=[8, 64, 256])
+    parser.add_argument(
+        "-c", "--ctx", type=int, nargs="*", default=[32768, 175000, 300000]
+    )
+    parser.add_argument("-k", "--kind", nargs="*", default=["random", "ties"])
+    args = parser.parse_args()
     if get_gfx_runtime() != "gfx950":
         print("SKIP: gfx950 only")
         return 0
@@ -192,6 +300,17 @@ def main():
             xcds=xcds,
         )
     assert decode_select_supported(8) and not decode_select_supported(512)
+    # 300K rows (width 2352 > one 1792-block window) take the windowed loop; ties put equal scores
+    # at the 16th place. A constant row is left out: it is the documented slow case (see the PR).
+    perf = [
+        test_select_perf(rows, 8, ctx, kind)
+        for rows, ctx, kind in itertools.product(args.rows, args.ctx, args.kind)
+    ]
+    df = pd.DataFrame(perf)
+    aiter.logger.info(
+        "in-kernel selection vs scorer -> small_k -> attention (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
     print("ALL PASS" if ok else "FAILED")
     return 0 if ok else 1
 

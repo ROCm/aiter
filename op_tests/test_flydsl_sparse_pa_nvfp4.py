@@ -1116,8 +1116,10 @@ def perf_pool(hkv, pages, device="cuda"):
     )
 
 
-@benchmark()
-def test_decode_perf(rows, query_len, hkv, group, ctx):
+def perf_decode_inputs(rows, query_len, hkv, group, ctx):
+    """Synthetic decode inputs of ``rows`` rows (``query_len`` per request) at ``ctx`` keys:
+    the shared pool (+ fp64 K / V of its base pages), a random block table, the per-row kv
+    length and tail block, q, the block count and the generator."""
     pool, kd, vd = perf_pool(hkv, max(8192, 16 * rows * 2))
     g = torch.Generator(device="cuda").manual_seed(1)
     reqs = rows // query_len
@@ -1130,6 +1132,12 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
         [torch.arange(ctx - query_len + 1, ctx + 1, device="cuda") for _ in range(reqs)]
     )
     sb = (kv - 1) // BLK
+    q = torch.randn(rows, hkv * group, D, generator=g, device="cuda").bfloat16()
+    return pool, kd, vd, bt, seq, kv, sb, q, nblk, g
+
+
+def perf_decode_topk(hkv, rows, nblk, sb, g):
+    """Random top-k ids per row (the first 15 random live blocks, the tail block last)."""
     sc = torch.rand(hkv, rows, nblk, generator=g, device="cuda")
     sc = torch.where(
         torch.arange(nblk, device="cuda") < sb[None, :, None],
@@ -1140,7 +1148,15 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     v, i = sc.topk(TOPK - 1, dim=-1)
     topk[..., : TOPK - 1] = torch.where(v >= 0, i.int(), torch.full_like(i.int(), -1))
     topk[..., TOPK - 1] = sb.int()[None, :]
-    q = torch.randn(rows, hkv * group, D, generator=g, device="cuda").bfloat16()
+    return topk
+
+
+@benchmark()
+def test_decode_perf(rows, query_len, hkv, group, ctx):
+    pool, kd, vd, bt, seq, kv, sb, q, nblk, g = perf_decode_inputs(
+        rows, query_len, hkv, group, ctx
+    )
+    topk = perf_decode_topk(hkv, rows, nblk, sb, g)
     out = torch.empty_like(q)
     ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
     _, us = run_perftest(
