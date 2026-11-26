@@ -2,90 +2,64 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
+# Ported from pyhip 8ff1d1de66ce247c217f74d1d074721cbaba3cd7, with an RNE epilogue.
+"""gfx942 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16/FP16 output.
 
-"""gfx942 FP8 blockscale GEMM: 2x4 wave grid, A and B staged through LDS, pf1.
-
-C[M, N] = A[M, K] @ B[N, K]^T with FP8 E4M3FNUZ A and B, FP32 block scales
-ScaleA[K/128, M] (x_scale transposed) and ScaleB[ceil(N/128), K/128], and BF16
-or FP16 output. B is plain [N, K] or aiter shuffle_weight(B, layout=(16, 16)).
+The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128,
+with FP8 E4M3FNUZ A[M, K] and B[N, K]; ScaleA is x_scale transposed.
+The kernel uses a 256x256 WG tile, eight waves on a 2x4 grid, and 64 KiB LDS.
+Optional preshuffle_b consumes aiter.shuffle_weight(B, layout=(16, 16)) directly;
+only the B load and LDS write offsets change, both scale layouts stay unchanged.
 Needs N % 16 == 0, K % 128 == 0 and K >= 128; any M >= 1 works: the raw-buffer
 range checks zero rows and columns past M/N, rows past M are outside the C
 descriptor and columns past N store at voffset 0x7FFFFFFF, which is dropped.
 
-One 256x256 tile per workgroup of 512 threads, 64 KiB LDS. wave_m = wave // 4
-owns 128 rows, wave_n = wave % 4 owns 64 columns. A and B are both copied
-cooperatively into 32 KiB of LDS each (four 64-row packets). B operands are
-read once per K block; A packet p is read in stage p. Each packet of the next
-K block is loaded during this block and written to LDS one stage later
-(one-stage load lead, "pf1"). Waves 4-7 trail waves 0-3 by one barrier.
+Only the 2x4-LDS pf1 pipeline is supported. wave_m = wave_id // 4 owns 128
+rows, wave_n = wave_id % 4 owns 64 columns. gfx942 has no 16-byte global-to-LDS
+load, so A and B are staged through VGPRs (buffer_load_dwordx4, ds_write_b128)
+into 32 KiB of LDS each: one K tile as four 64-row packets, XOR-swizzled.
+B operands are read once per K tile; A packet p is read in stage p. Each packet
+of the next K tile is loaded during this tile and written to LDS one stage
+later (one-stage load lead, "pf1"). Waves 4-7 trail waves 0-3 by one barrier,
+and each compute phase runs at s_setprio 3. ScaleA uses per-lane buffer loads;
+ScaleB retains its inline-asm scalar buffer loads.
 
 The main loop is ported unchanged from PyHIP
 src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py, the FlyDSL form
 of PyHIP's gemm_fp8_gfx942_4x2_lds.py (which names the grid in gfx950's (N, M)
 order): tile order, LDS layout and swizzle, load/ds_write/ds_read order, every
 wait, barrier, sched_barrier and s_setprio, and the MFMA/dequant order are
-PyHIP's. Only the helpers are inlined and the kernel symbol is named:
+PyHIP's. Only the helpers are inlined, the kernel symbol is named, and names
+and helpers follow the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave_gfx950.py).
 PyHIP's BufferTensor.load is _buffer_load_dwordx4 below, the same
 buffer_load_dwordx4 with byte voffset and soffset. The raw rocdl/llvm calls
 below are kept for that reason; each names the stable API it stands in for.
 
-The interface is the gfx950 8-wave kernel's (gemm_a8w8_blockscale_8wave_gfx950.py):
-compile_gemm_fp8_blockscale_gfx942(TILE_M, TILE_N, TILE_K, N, K, preshuffle_b)
-returns launch_gemm(A, B, C, scaleA, scaleB, M, stream), which takes tensors
-and rebases A, B and C per tile in i64; C's dtype selects the epilogue.
-
-At K = 128 (one K block) the two inline-asm s_buffer_load_dword of the next
-block's B scales still load values nothing reads (PyHIP design note F3).
+At K = 128 (one K tile) the two inline-asm s_buffer_load_dword of the next
+tile's B scales still load values nothing reads (PyHIP design note F3).
 PyHIP's build loads both into one SGPR, which its ISA audit flags as a WAW;
 here FlyDSL 0.5.3 gives them separate SGPRs and the audit passes.
 
 The epilogue is aiter's: it rounds the FP32 results to BF16 or FP16 to
-nearest even, as the gfx950 8-wave kernel (gemm_a8w8_blockscale_8wave_gfx950.py)
-does. PyHIP instead truncates to BF16 and has no FP16 output, so BF16 results
-differ from PyHIP's in the last bit wherever rounding goes up.
+nearest even, as the gfx950 8-wave kernel does. PyHIP instead truncates to
+BF16 and has no FP16 output, so BF16 results differ from PyHIP's in the last
+bit wherever rounding goes up.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
-TILE = 256
-TILE_K = 128
-PACKET_ROWS = 64
-PACKET_DWORDS = PACKET_ROWS * TILE_K // 4
 
-
-def _lds_dwords(row, column):
-    # XOR swizzle of the 16B column keeps MFMA-pattern ds_read_b128 conflict free.
-    return row * (TILE_K // 4) + ((row ^ column) & 7) * 4
-
-
-def _tb_swizzle(block_id, M, N, tile_m, tile_n, m01=8, group_num=8):
-    """WG id -> (block_m, block_n), as pyhip.contrib.common.loaders.tb_swizzle."""
-    m0 = (M + tile_m - 1) // tile_m
-    n0 = (N + tile_n - 1) // tile_n
-    group_size = (m0 * n0 + group_num - 1) // group_num
-    big_group_num = group_num - (group_size * group_num - m0 * n0)
-    group_id_y = block_id // group_num
-    group_id_x = block_id - group_id_y * group_num
-    remap = group_id_x * group_size + group_id_y
-    remap = (group_id_x > big_group_num).select(
-        remap + (big_group_num - group_id_x), remap
-    )
-    idx_m0 = remap // n0
-    idx_n0 = remap - idx_m0 * n0
-    m0_mod_m01 = m0 - m0 // m01 * m01
-    m01_adapt = (idx_m0 < m0 - m0_mod_m01).select(fx.Int32(m01), m0_mod_m01)
-    idx_m00 = idx_m0 // m01
-    local = idx_n0 + (idx_m0 - idx_m00 * m01) * n0
-    block_n = local // m01_adapt
-    return local - block_n * m01_adapt + idx_m00 * m01, block_n
+def _buffer_resource(tensor, num_records_bytes):
+    buffer = rocdl.make_buffer_tensor(tensor, num_records_bytes=num_records_bytes)
+    return rocdl.get_buffer_rsrc(fx.get_iter(buffer))
 
 
 def _buffer_load_dwordx4(rsrc, voffset_bytes, soffset_bytes):
@@ -93,7 +67,7 @@ def _buffer_load_dwordx4(rsrc, voffset_bytes, soffset_bytes):
     # Raw load, not fx.copy(BufferCopy128b): a copy atom addresses a layout
     # coordinate, while this pipeline issues PyHIP's precomputed tile-relative
     # voffset (row offsets, range checked so rows past M/N read zero) with the
-    # K-block offset in soffset; the raw op keeps PyHIP's instruction.
+    # K-tile offset in soffset; the raw op keeps PyHIP's instruction.
     return Vec(
         rocdl.raw_ptr_buffer_load(
             T.i32x4,
@@ -107,10 +81,10 @@ def _buffer_load_dwordx4(rsrc, voffset_bytes, soffset_bytes):
 
 def _s_buffer_load_f32(rsrc, offset_bytes):
     """Scalar s_buffer_load_dword hidden from LLVM; wait lgkmcnt(0) before use."""
-    # Inline asm, not tensor_shim.buf_scalar_load: the tracked SMEM intrinsic
-    # lacks a memory operand in this LLVM and gets conservative waits. Every use
-    # follows the pipeline's own lgkmcnt(0) waits.
-    value = llvm.inline_asm(
+    # Inline asm, as gfx950's load_scale_b_inline, not tensor_shim.buf_scalar_load:
+    # the tracked SMEM intrinsic lacks a memory operand in this LLVM and gets
+    # conservative waits. Every use follows the pipeline's own lgkmcnt(0) waits.
+    value = _llvm.inline_asm(
         T.f32,
         [rsrc, fx.Int32(offset_bytes).ir_value()],
         "s_buffer_load_dword $0, $1, $2",
@@ -128,23 +102,73 @@ def compile_gemm_fp8_blockscale_gfx942(
     K,
     preshuffle_b=False,
 ):
-    """Compile the 2x4-LDS pf1 blockscale kernel for one (N, K, B layout).
+    """Compile the 2x4-LDS pf1 blockscale kernel with VGPR-staged A/B loads.
 
-    ``launch_gemm(A, B, C, scaleA, scaleB, M, stream)`` takes A[M, K] and B
-    (plain [N, K] or shuffle_weight(B, (16, 16))) as FP8 bytes, C[M, N] in BF16
-    or FP16, and FP32 ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128], all
-    contiguous.
+    A one-stage A/B load lead, ScaleA loads one stage ahead, inline-asm scalar
+    ScaleB loads one K tile ahead, and one scalar FMA per MFMA retain PyHIP's
+    pipeline. Each compute phase raises s_setprio to 3; waves 4-7 trail waves
+    0-3 by one barrier. preshuffle_b uses the FP8 (16, 16) weight shuffle; only
+    its B load and LDS write offsets differ from the plain path.
+
+    The interface is the gfx950 8-wave kernel's: ``launch_gemm(A, B, C, scaleA,
+    scaleB, M, stream)`` takes A[M, K] and B (plain [N, K] or
+    shuffle_weight(B, (16, 16))) as FP8 bytes, C[M, N] in BF16 or FP16, and
+    FP32 ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128], all contiguous. The
+    kernel rebases A, B and C per tile in i64; C's dtype selects the epilogue.
     """
     assert (TILE_M, TILE_N, TILE_K) == (256, 256, 128)
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
-    KB = K // TILE_K
-    scale_rows_b = (N + 127) // 128
-    b_k_bytes = TILE_K * 16 if preshuffle_b else TILE_K
+    BLOCK_K = TILE_K
+    # A and B tiles are four LDS packets of 64 rows x 128 bytes (8 KiB);
+    # stage p of a K tile computes A packet p.
+    PACKET_ROWS = 64
+    NUM_PACKETS = TILE_M // PACKET_ROWS
+    PACKET_DWORDS = PACKET_ROWS * BLOCK_K // 4
+    # Per packet, each wave repeats its 16x16 MFMA tile twice along M (32 rows
+    # apart) and, per 128-column half, twice along N (64 columns apart).
+    PHASE_M_REP = 2
+    N_REP = 2
+    num_tiles = K // BLOCK_K
+    # ScaleA is [scaleA_stride, M] and ScaleB [ceil(N/128), scaleA_stride].
+    scaleA_stride = K // 128
+    # B bytes per K tile: 128 in a plain row, 2 KiB in shuffle_weight's layout.
+    b_tile_k_bytes = BLOCK_K * 16 if preshuffle_b else BLOCK_K
 
+    @flyc.jit
+    def get_pids_942(pid, M, M01, GROUP_NUM):
+        # PyHIP's tb_swizzle (pyhip.contrib.common.loaders), the counterpart of
+        # get_pids_950: pids with equal pid % GROUP_NUM take one contiguous
+        # range of tile ids (cf. NUM_XCDS), and each band of M01 M tiles is
+        # walked M first (cf. GROUP_SIZE_M).
+        num_pid_m = (M + TILE_M - 1) // TILE_M
+        num_pid_n = ceildiv(N, TILE_N)
+        group_size = (num_pid_m * num_pid_n + GROUP_NUM - 1) // GROUP_NUM
+        big_group_num = GROUP_NUM - (group_size * GROUP_NUM - num_pid_m * num_pid_n)
+        group_id_y = pid // GROUP_NUM
+        group_id_x = pid - group_id_y * GROUP_NUM
+        remap = group_id_x * group_size + group_id_y
+        remap = (group_id_x > big_group_num).select(
+            remap + (big_group_num - group_id_x), remap
+        )
+        idx_m0 = remap // num_pid_n
+        idx_n0 = remap - idx_m0 * num_pid_n
+        m0_mod_m01 = num_pid_m - num_pid_m // M01 * M01
+        m01_adapt = (idx_m0 < num_pid_m - m0_mod_m01).select(fx.Int32(M01), m0_mod_m01)
+        idx_m00 = idx_m0 // M01
+        local = idx_n0 + (idx_m0 - idx_m00 * M01) * num_pid_n
+        pid_n = local // m01_adapt
+        return local - pid_n * m01_adapt + idx_m00 * M01, pid_n
+
+    def _lds_dwords(row, chunk):
+        # XOR swizzle of the 16-byte chunk keeps MFMA-pattern ds_read_b128
+        # conflict free.
+        return row * (BLOCK_K // 4) + ((row ^ chunk) & 7) * 4
+
+    # A and B tiles use 32 KiB each (one K tile); 64 KiB in total.
     @fx.struct
-    class SharedTiles:
-        a: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
-        b: fx.Array[fx.Int32, 4 * PACKET_DWORDS, 16]
+    class LDS:
+        a: fx.Array[fx.Int32, NUM_PACKETS * PACKET_DWORDS, 16]
+        b: fx.Array[fx.Int32, NUM_PACKETS * PACKET_DWORDS, 16]
 
     @flyc.kernel(
         name=f"gemm_a8w8_blockscale_8wave_gfx942_ps{int(preshuffle_b)}_BM{TILE_M}_BN{TILE_N}_BK{TILE_K}",
@@ -159,151 +183,210 @@ def compile_gemm_fp8_blockscale_gfx942(
         M: fx.Int32,
     ):
         tid = fx.thread_idx.x
-        lane = tid % 64
-        wave = tid // 64
+        lane_id = tid % 64
+        wave_id = tid // 64
         # No fx op makes a value wave-uniform: readfirstlane keeps wave_m/wave_n
         # in SGPRs, so the staggered `if wave_m == ...` barriers branch on scalars.
-        wave_m = fx.Int32(rocdl.readfirstlane(T.i32, (tid // 256).ir_value()))
-        wave_n = fx.Int32(rocdl.readfirstlane(T.i32, (wave % 4).ir_value()))
-        block_m, block_n = _tb_swizzle(fx.block_idx.x, M, N, TILE, TILE)
-        row_base = block_m * TILE
-        col_base = block_n * TILE
-        rows_left = M - row_base
-        rows = (rows_left < TILE).select(rows_left, TILE)
-        cols_left = N - col_base
-        cols = (cols_left < TILE).select(cols_left, TILE)
+        wave_m = fx.Int32(rocdl.readfirstlane(T.i32, (wave_id // 4).ir_value()))
+        wave_n = fx.Int32(rocdl.readfirstlane(T.i32, (wave_id % 4).ir_value()))
+        bid_x, bid_y = get_pids_942(fx.block_idx.x, M, 8, 8)
+        row_base = bid_x * TILE_M
+        col_base = bid_y * TILE_N
+        a_rows_left = M - row_base
+        a_rows = (a_rows_left < TILE_M).select(a_rows_left, TILE_M)
+        b_rows_left = N - col_base
+        b_rows = (b_rows_left < TILE_N).select(b_rows_left, TILE_N)
 
-        # Rebase A, B and C in i64 per tile, in their own element types (no
-        # recast claims more alignment than a view has); all descriptor
-        # offsets below are tile-local bytes.
-        a_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(argA), fx.Int64(row_base) * K),
-                fx.make_layout(TILE * K, 1),
-            ),
-            max_size=False,
-            num_records_bytes=rows * K,
+        # Rebase A, B and C in i64 per tile before building buffer descriptors,
+        # in their own element types: no recast claims more alignment than a
+        # view has. All load/store offsets below are local to this WG; the
+        # ScaleA/ScaleB descriptors cover the whole matrices.
+        a_iter = fx.add_offset(fx.get_iter(argA), fx.Int64(row_base) * K)
+        a_rsrc = _buffer_resource(
+            fx.make_view(a_iter, fx.make_layout(TILE_M * K, 1)),
+            num_records_bytes=a_rows * K,
         )
-        b_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(argB), fx.Int64(col_base) * K),
-                fx.make_layout(TILE * K, 1),
-            ),
-            max_size=False,
-            num_records_bytes=cols * K,
+        b_iter = fx.add_offset(fx.get_iter(argB), fx.Int64(col_base) * K)
+        b_rsrc = _buffer_resource(
+            fx.make_view(b_iter, fx.make_layout(TILE_N * K, 1)),
+            num_records_bytes=b_rows * K,
         )
-        c_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(argC), fx.Int64(row_base) * N),
-                fx.make_layout(TILE * N, 1),
-            ),
-            max_size=False,
-            num_records_bytes=rows * (N * 2),
+        c_iter = fx.add_offset(fx.get_iter(argC), fx.Int64(row_base) * N)
+        c_store_rsrc = _buffer_resource(
+            fx.make_view(c_iter, fx.make_layout(TILE_M * N, 1)),
+            num_records_bytes=a_rows * (N * 2),
         )
-        scale_a_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(fx.get_iter(argScaleA), fx.make_layout(M * KB, 1)),
-            max_size=False,
-            num_records_bytes=M * (KB * 4),
+        scaleA_rsrc = _buffer_resource(
+            argScaleA, num_records_bytes=M * (scaleA_stride * 4)
         )
-        scale_b_tensor = fx.rocdl.make_buffer_tensor(
-            fx.make_view(fx.get_iter(argScaleB), fx.make_layout(scale_rows_b * KB, 1)),
-            max_size=False,
-            num_records_bytes=scale_rows_b * KB * 4,
+        scaleB_rsrc = _buffer_resource(
+            argScaleB, num_records_bytes=ceildiv(N, 128) * scaleA_stride * 4
         )
-        a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_tensor))
-        b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_tensor))
-        scale_a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(scale_a_tensor))
-        scale_b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(scale_b_tensor))
-        c_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(c_tensor))
 
-        # Row offsets stay in voffset so raw-buffer range checks zero rows/columns
-        # past M/N.
-        copy_row = tid // 8
-        copy_col = tid % 8
-        a_voffsets = [
-            (copy_row + packet * PACKET_ROWS) * K + copy_col * 16
-            for packet in range_constexpr(4)
+        ### Per-lane global and LDS offsets.
+        # pyhip g2r mapping: 512 threads = 64 rows x 8 16-byte chunks per packet.
+        # Row offsets stay in voffset so raw-buffer range checks zero rows past
+        # M/N; the K-tile offset goes in soffset.
+        a_lane_row = tid // 8
+        a_lane_chunk = tid % 8
+        a_src_offsets = [
+            (a_lane_row + packet * PACKET_ROWS) * K + a_lane_chunk * 16
+            for packet in range_constexpr(NUM_PACKETS)
         ]
-        a_write = _lds_dwords(copy_row, copy_col)
+        ldsA_wr = _lds_dwords(a_lane_row, a_lane_chunk)
         if const_expr(preshuffle_b):
-            b_voffsets = [
-                (wave // 2 + packet * 4) * (16 * K) + wave % 2 * 1024 + lane * 16
-                for packet in range_constexpr(4)
+            # shuffle_weight's [N/16, K/128, 4k2, 2k1, 16n0, 16k0] layout: each
+            # wave copies a contiguous 16x64-byte block per packet.
+            b_src_offsets = [
+                (wave_id // 2 + packet * 4) * (16 * K)
+                + wave_id % 2 * 1024
+                + lane_id * 16
+                for packet in range_constexpr(NUM_PACKETS)
             ]
-            b_write = _lds_dwords(wave // 2 * 16 + lane % 16, wave % 2 * 4 + lane // 16)
+            ldsB_wr = _lds_dwords(
+                wave_id // 2 * 16 + lane_id % 16, wave_id % 2 * 4 + lane_id // 16
+            )
         else:
-            b_voffsets = a_voffsets
-            b_write = a_write
-        local_row = wave_m * 16 + lane % 16
-        a_read = [
+            b_src_offsets = a_src_offsets
+            ldsB_wr = ldsA_wr
+        # MFMA operand rows: lane_id % 16 selects the row, lane_id // 16 the
+        # 16-byte chunk of each 64-byte K half. A and B share this K order,
+        # which leaves each K128 dot product unchanged.
+        local_row = wave_m * 16 + lane_id % 16
+        ldsA_rd = [
             [
-                _lds_dwords(local_row + rep_m * 32, lane // 16 + half_k * 4)
+                _lds_dwords(local_row + m0 * 32, lane_id // 16 + half_k * 4)
                 for half_k in range_constexpr(2)
             ]
-            for rep_m in range_constexpr(2)
+            for m0 in range_constexpr(PHASE_M_REP)
         ]
-        b_read = [
+        ldsB_rd = [
             [
                 _lds_dwords(
-                    wave_n * 16 + rep_n * 64 + lane % 16, lane // 16 + half_k * 4
+                    wave_n * 16 + n0 * 64 + lane_id % 16, lane_id // 16 + half_k * 4
                 )
                 for half_k in range_constexpr(2)
             ]
-            for rep_n in range_constexpr(2)
+            for n0 in range_constexpr(N_REP)
         ]
+        ### ScaleA rows of this lane and the tile's two ScaleB rows.
         last_row = M - 1
-        scale_a_voffsets = []
-        for packet in range_constexpr(4):
-            for rep_m in range_constexpr(2):
-                row = row_base + local_row + (packet * PACKET_ROWS + rep_m * 32)
-                # Rows past M are never stored; clamping keeps the K-block soffset
+        scaleA_src_offsets = []
+        for packet in range_constexpr(NUM_PACKETS):
+            for m0 in range_constexpr(PHASE_M_REP):
+                scale_row = row_base + local_row + (packet * PACKET_ROWS + m0 * 32)
+                # Rows past M are never stored; clamping keeps the K-tile soffset
                 # in bounds.
-                scale_a_voffsets.append((row < last_row).select(row, last_row) * 4)
-        scale_b_offsets = [
-            col_base // 128 * (KB * 4),
-            (col_base // 128 + 1) * (KB * 4),
+                scaleA_src_offsets.append(
+                    (scale_row < last_row).select(scale_row, last_row) * 4
+                )
+        scaleB_offsets = [
+            col_base // 128 * (scaleA_stride * 4),
+            (col_base // 128 + 1) * (scaleA_stride * 4),
         ]
-        last_scale_b = (N - 1) // 128 * (KB * 4)
-        scale_b_offsets[1] = (scale_b_offsets[1] < last_scale_b).select(
-            scale_b_offsets[1], last_scale_b
+        last_scaleB_offset = (N - 1) // 128 * (scaleA_stride * 4)
+        scaleB_offsets[1] = (scaleB_offsets[1] < last_scaleB_offset).select(
+            scaleB_offsets[1], last_scaleB_offset
         )
 
-        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+        ### Allocate LDS.
+        lds = fx.SharedAllocator().allocate(LDS).peek()
+
+        ### Register tensors.
+        # a_stage: four A packets; b_stage: two B slots (packet % 2). Both hold
+        # the next K tile in VGPRs until its LDS packet is free.
+        # frag_B column quadrant_n * 4 + n0 * 2 + half_k: all B operands of a
+        # K tile, read in stage 0.
+        a_stage = fx.make_rmem_tensor(
+            fx.make_layout((4, NUM_PACKETS), (1, 4)), fx.Int32
+        )
+        b_stage = fx.make_rmem_tensor(fx.make_layout((4, 2), (1, 4)), fx.Int32)
+        frag_B = fx.make_rmem_tensor(fx.make_layout((4, 8), (1, 4)), fx.Int32)
+        # mfma_scaleA column slot * 2 + m0 (slot = packet % 2);
+        # mfma_scaleB column slot * 2 + quadrant_n (slot = K tile % 2).
+        mfma_scaleA = fx.make_rmem_tensor(fx.make_layout((1, 4), (1, 1)), fx.Float32)
+        mfma_scaleB = fx.make_rmem_tensor(fx.make_layout((1, 4), (1, 1)), fx.Float32)
+        # frag_C column (packet * 2 + quadrant_n) * 4 + m0 * 2 + n0: the wave's
+        # 128x64 C tile. frag_P column m0 * 2 + n0: one 16-f32 FIFO of unscaled
+        # K128 partials. fifo_dq_scale column m0: ScaleA * ScaleB of FIFO pair m0.
+        frag_C = fx.make_rmem_tensor(fx.make_layout((4, 32), (1, 4)), fx.Float32)
+        frag_P = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Float32)
+        fifo_dq_scale = fx.make_rmem_tensor(fx.make_layout((1, 2), (1, 1)), fx.Float32)
 
         def lds_view(base, dwords):
             return fx.make_view(base + dwords, fx.make_layout(4, 1))
 
-        def write_a(packet):
-            lds_view(lds.a.ptr, a_write + packet * PACKET_DWORDS).store(
+        def lds_wr_A(packet):
+            lds_view(lds.a.ptr, ldsA_wr + packet * PACKET_DWORDS).store(
                 a_stage[None, packet].load()
             )
 
-        def write_b(packet):
-            lds_view(lds.b.ptr, b_write + packet * PACKET_DWORDS).store(
+        def lds_wr_B(packet):
+            lds_view(lds.b.ptr, ldsB_wr + packet * PACKET_DWORDS).store(
                 b_stage[None, packet % 2].load()
             )
 
-        def read_a(packet, rep_m, half_k):
-            return lds_view(
-                lds.a.ptr, a_read[rep_m][half_k] + packet * PACKET_DWORDS
-            ).load()
+        def lds_rd_B():
+            # Both 128-column B halves (two packets each) of the K tile.
+            for quadrant_n in range_constexpr(2):
+                for n0 in range_constexpr(N_REP):
+                    for half_k in range_constexpr(2):
+                        frag_B[None, quadrant_n * 4 + n0 * 2 + half_k].store(
+                            lds_view(
+                                lds.b.ptr,
+                                ldsB_rd[n0][half_k] + quadrant_n * 2 * PACKET_DWORDS,
+                            ).load()
+                        )
 
-        def read_b(side, rep_n, half_k):
-            return lds_view(
-                lds.b.ptr, b_read[rep_n][half_k] + side * 2 * PACKET_DWORDS
-            ).load()
+        def lds_rd_A(packet):
+            # A packet p as i64 MFMA operand words: frag_A[m0][half_k][word].
+            return [
+                [
+                    Vec(
+                        lds_view(
+                            lds.a.ptr, ldsA_rd[m0][half_k] + packet * PACKET_DWORDS
+                        ).load()
+                    ).bitcast(fx.Int64)
+                    for half_k in range_constexpr(2)
+                ]
+                for m0 in range_constexpr(PHASE_M_REP)
+            ]
 
-        def load_scale_a(k_block, packet, rep_m):
+        def load_A(packet, ki):
+            a_stage[None, packet].store(
+                _buffer_load_dwordx4(a_rsrc, a_src_offsets[packet], ki * BLOCK_K)
+            )
+
+        def load_B(packet, ki):
+            b_stage[None, packet % 2].store(
+                _buffer_load_dwordx4(b_rsrc, b_src_offsets[packet], ki * b_tile_k_bytes)
+            )
+
+        def load_scale_a(packet, m0, ki):
             # Raw load for the same reason as _buffer_load_dwordx4: a clamped
-            # per-lane row voffset with the K-block offset in soffset.
+            # per-lane row voffset with the K-tile offset in soffset.
             value = rocdl.raw_ptr_buffer_load(
                 T.f32,
-                scale_a_rsrc,
-                fx.Int32(scale_a_voffsets[packet * 2 + rep_m]).ir_value(),
-                fx.Int32(k_block * M * 4).ir_value(),
+                scaleA_rsrc,
+                fx.Int32(scaleA_src_offsets[packet * PHASE_M_REP + m0]).ir_value(),
+                fx.Int32(ki * M * 4).ir_value(),
                 fx.Int32(0).ir_value(),
             )
             return Vec.from_elements([fx.Float32(value)], fx.Float32)
+
+        def load_scale_b(slot, ki):
+            # The two ScaleB values (quadrant_n 0/1) of K tile ki, into SGPRs.
+            for quadrant_n in range_constexpr(2):
+                mfma_scaleB[None, slot * 2 + quadrant_n].store(
+                    Vec.from_elements(
+                        [
+                            _s_buffer_load_f32(
+                                scaleB_rsrc, scaleB_offsets[quadrant_n] + ki * 4
+                            )
+                        ],
+                        fx.Float32,
+                    )
+                )
 
         def barrier():
             # A bare s_barrier between scheduling fences, as in PyHIP: the
@@ -314,238 +397,228 @@ def compile_gemm_fp8_blockscale_gfx942(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-        # a_stage: four A packets; b_stage: two B slots.
-        # b_ops column side * 4 + rep_n * 2 + half_k.
-        a_stage = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Int32)
-        b_stage = fx.make_rmem_tensor(fx.make_layout((4, 2), (1, 4)), fx.Int32)
-        b_ops = fx.make_rmem_tensor(fx.make_layout((4, 8), (1, 4)), fx.Int32)
-        # scale_a column slot * 2 + rep_m (slot = packet % 2);
-        # scale_b column slot * 2 + side (slot = block % 2).
-        scale_a = fx.make_rmem_tensor(fx.make_layout((1, 4), (1, 1)), fx.Float32)
-        scale_b = fx.make_rmem_tensor(fx.make_layout((1, 4), (1, 1)), fx.Float32)
-        # accum column (packet * 2 + side) * 4 + rep_m * 2 + rep_n;
-        # partial column rep_m * 2 + rep_n.
-        accum = fx.make_rmem_tensor(fx.make_layout((4, 32), (1, 4)), fx.Float32)
-        partial = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Float32)
-        partial_scale = fx.make_rmem_tensor(fx.make_layout((1, 2), (1, 1)), fx.Float32)
+        def begin_compute_phase():
+            # The stage's ds_write/ds_read complete before the barrier. No fx API
+            # sets wave priority: the compute phase runs at priority 3 against
+            # the other wave group's memory phase.
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            barrier()
+            rocdl.s_setprio(3)
 
-        def load_scale_b(slot, k_block):
-            for side in range_constexpr(2):
-                scale_b[None, slot * 2 + side].store(
-                    Vec.from_elements(
-                        [
-                            _s_buffer_load_f32(
-                                scale_b_rsrc, scale_b_offsets[side] + k_block * 4
-                            )
-                        ],
-                        fx.Float32,
-                    )
+        def end_compute_phase():
+            rocdl.s_setprio(0)
+            barrier()
+
+        def do_gemm(packet, tick, frag_A):
+            # One compute phase: A packet p against both B halves, 32 MFMA
+            # (2 quadrant_n x PHASE_M_REP x 4 K steps x N_REP), A and B swapped
+            # (D[n][m]). A half-phase is one quadrant_n (16 MFMA). frag_P holds
+            # its unscaled K128 partials; each MFMA is followed by one FP32 FMA
+            # that retires one element of an older partial into frag_C:
+            #   MFMA 0-7 (m0 = 0) retire FIFO pair 1 (partials 2-3) of the
+            #   previous half-phase before m0 = 1 overwrites it;
+            #   MFMA 8-15 (m0 = 1) retire this half-phase's pair 0.
+            # The last half-phase's pair 1 is drained after the K loop.
+            # Compiler-only sched_barrier fences keep 1 MFMA -> 1 FMA; the
+            # launch's -packed-fp32-ops keeps the FMAs scalar.
+            for quadrant_n in range_constexpr(2):
+                b_slot = tick * 2 + quadrant_n
+                previous_packet = (
+                    (packet - 1) % NUM_PACKETS if quadrant_n == 0 else packet
                 )
-
-        def run_k(slot, k_block):
-            # The last block re-fetches clamped blocks so it stays inside the loop body.
-            k_next = (k_block + 1 < KB).select(k_block + 1, KB - 1)
-            for packet in range_constexpr(4):
-                if const_expr(packet == 0):
-                    write_a(3)
-                else:
-                    write_a(packet - 1)
-                    write_b(packet - 1)
-                    if const_expr(packet == 3):
-                        write_b(3)
-                rocdl.sched_barrier(0)
-                if const_expr(packet == 0):
-                    for side in range_constexpr(2):
-                        for rep_n in range_constexpr(2):
-                            for half_k in range_constexpr(2):
-                                b_ops[None, side * 4 + rep_n * 2 + half_k].store(
-                                    read_b(side, rep_n, half_k)
+                for m0 in range_constexpr(PHASE_M_REP):
+                    a_slot = packet % 2 * 2 + m0
+                    for k_step in range_constexpr(4):
+                        half_k, word = divmod(k_step, 2)
+                        for n0 in range_constexpr(N_REP):
+                            p_col = m0 * N_REP + n0
+                            mfma_idx = m0 * 8 + k_step * 2 + n0
+                            b_value = Vec(
+                                frag_B[None, quadrant_n * 4 + n0 * 2 + half_k].load()
+                            ).bitcast(fx.Int64)[word]
+                            accumulator = (
+                                Vec.filled(4, 0.0, fx.Float32)
+                                if k_step == 0
+                                else Vec(frag_P[None, p_col].load())
+                            )
+                            # Raw MFMA, not an MMA atom with fx.gemm: one
+                            # instruction at a time on i64 words of the LDS
+                            # fragments with A and B swapped (D[n][m]), each
+                            # followed by one scale FMA under sched_barrier.
+                            frag_P[None, p_col].store(
+                                Vec(
+                                    rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                        T.f32x4,
+                                        [
+                                            b_value,
+                                            frag_A[m0][half_k][word],
+                                            accumulator,
+                                            0,
+                                            0,
+                                            0,
+                                        ],
+                                    )
                                 )
-                a_ops = [
-                    [
-                        Vec(read_a(packet, rep_m, half_k)).bitcast(fx.Int64)
-                        for half_k in range_constexpr(2)
-                    ]
-                    for rep_m in range_constexpr(2)
-                ]
+                            )
+                            # Keep MFMA -> FMA order: the FMA's partial then has
+                            # two MFMAs of XDL latency cover.
+                            rocdl.sched_barrier(0)
+                            if const_expr(mfma_idx == 0 or mfma_idx == 8):
+                                dq_scale_a = Vec(mfma_scaleA[None, a_slot].load())[0]
+                                dq_scale_b = Vec(mfma_scaleB[None, b_slot].load())[0]
+                                dq_scale = dq_scale_a * dq_scale_b
+                                fifo_dq_scale[None, m0].store(
+                                    Vec.from_elements([dq_scale], fx.Float32)
+                                )
+                            if const_expr(m0 == 0):
+                                retire_col, retire_pair = 2 + mfma_idx // 4, 1
+                                c_col = (
+                                    previous_packet * 2 + 1 - quadrant_n
+                                ) * 4 + retire_col
+                            else:
+                                retire_col, retire_pair = (mfma_idx - 8) // 4, 0
+                                c_col = (packet * 2 + quadrant_n) * 4 + retire_col
+                            sub_frag_C = frag_C[None, c_col]
+                            elem = mfma_idx % 4
+                            sub_frag_C[elem] = fx.fma(
+                                Vec(frag_P[None, retire_col].load())[elem],
+                                Vec(fifo_dq_scale[None, retire_pair].load())[0],
+                                sub_frag_C[elem],
+                            )
+                            rocdl.sched_barrier(0)
+
+        def run_k_tile(tick, ki):
+            # One K128 tile k in four stages; stage p computes A packet p.
+            # t = tick (k % 2) and u = tock select the ScaleB slots; SA = ScaleA
+            # (packet), SB = ScaleB. Each stage's memory phase writes the packets
+            # staged one stage earlier (pf1), reads its operands and issues its
+            # loads; then its compute phase runs do_gemm.
+            # | Stage | ds_write (tile)    | ds_read | loads issued (tile)          |
+            # |-------|--------------------|---------|------------------------------|
+            # | 0     | A3 (k)             | B, A0   | SA1 (k), A0 B0 (k+1)         |
+            # | 1     | A0 B0 (k+1)        | A1      | SA2 (k), A1 B1 (k+1)         |
+            # | 2     | A1 B1 (k+1)        | A2      | SA3 (k), A2 B2 B3 (k+1)      |
+            # | 3     | A2 B2 B3 (k+1)     | A3      | SA0 (k+1), A3 (k+1)          |
+            # Every stage: ds_write -> ds_read -> loads -> lgkmcnt(0) ->
+            # s_barrier -> s_setprio 3 -> do_gemm -> s_setprio 0 -> s_barrier.
+            # Stage 0's compute phase first loads SB (u, k+1) into two SGPRs.
+            # The last tile re-fetches clamped tiles so it stays inside the loop body.
+            ki_next = (ki + 1 < num_tiles).select(ki + 1, num_tiles - 1)
+            tock = 1 - tick
+            for packet in range_constexpr(NUM_PACKETS):
+                if const_expr(packet == 0):
+                    lds_wr_A(3)
+                else:
+                    lds_wr_A(packet - 1)
+                    lds_wr_B(packet - 1)
+                    if const_expr(packet == 3):
+                        lds_wr_B(3)
                 rocdl.sched_barrier(0)
-                for rep_m in range_constexpr(2):
+                if const_expr(packet == 0):
+                    lds_rd_B()
+                frag_A = lds_rd_A(packet)
+                rocdl.sched_barrier(0)
+                for m0 in range_constexpr(PHASE_M_REP):
                     if const_expr(packet < 3):
-                        scale_a[None, (packet + 1) % 2 * 2 + rep_m].store(
-                            load_scale_a(k_block, packet + 1, rep_m)
+                        mfma_scaleA[None, (packet + 1) % 2 * 2 + m0].store(
+                            load_scale_a(packet + 1, m0, ki)
                         )
                     else:
-                        scale_a[None, rep_m].store(load_scale_a(k_next, 0, rep_m))
-                a_stage[None, packet].store(
-                    _buffer_load_dwordx4(a_rsrc, a_voffsets[packet], k_next * TILE_K)
-                )
+                        mfma_scaleA[None, m0].store(load_scale_a(0, m0, ki_next))
+                load_A(packet, ki_next)
                 if const_expr(packet < 3):
-                    b_stage[None, packet % 2].store(
-                        _buffer_load_dwordx4(
-                            b_rsrc, b_voffsets[packet], k_next * b_k_bytes
-                        )
-                    )
+                    load_B(packet, ki_next)
                 if const_expr(packet == 2):
-                    b_stage[None, 1].store(
-                        _buffer_load_dwordx4(b_rsrc, b_voffsets[3], k_next * b_k_bytes)
-                    )
-                rocdl.sched_barrier(0)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                barrier()
-                # No fx API sets wave priority: this group's MFMA phase runs at
-                # priority 3 against the other group's memory phase.
-                rocdl.s_setprio(3)
+                    load_B(3, ki_next)
+                begin_compute_phase()
                 if const_expr(packet == 0):
-                    # Next block's B scales; consumed after several lgkmcnt(0) waits.
-                    load_scale_b(1 - slot, k_next)
+                    # Next tile's B scales; consumed after several lgkmcnt(0) waits.
+                    load_scale_b(tock, ki_next)
                     rocdl.sched_barrier(0)
-                for side in range_constexpr(2):
-                    previous_packet = (packet - 1) % 4 if side == 0 else packet
-                    for pair_begin in range_constexpr(0, 4, 2):
-                        rep_m = pair_begin // 2
-                        for k_step in range_constexpr(4):
-                            half_k, word = divmod(k_step, 2)
-                            for rep_n in range_constexpr(2):
-                                partial_index = pair_begin + rep_n
-                                index = pair_begin * 4 + k_step * 2 + rep_n
-                                b_value = Vec(
-                                    b_ops[None, side * 4 + rep_n * 2 + half_k].load()
-                                ).bitcast(fx.Int64)[word]
-                                accumulator = (
-                                    Vec.filled(4, 0.0, fx.Float32)
-                                    if k_step == 0
-                                    else Vec(partial[None, partial_index].load())
-                                )
-                                # Raw MFMA, not an MMA atom with fx.gemm: one
-                                # instruction at a time on i64 words of the LDS
-                                # fragments with A and B swapped (D[n][m]), each
-                                # followed by one scale FMA under sched_barrier.
-                                partial[None, partial_index].store(
-                                    Vec(
-                                        rocdl.mfma_f32_16x16x32_fp8_fp8(
-                                            T.f32x4,
-                                            [
-                                                b_value,
-                                                a_ops[rep_m][half_k][word],
-                                                accumulator,
-                                                0,
-                                                0,
-                                                0,
-                                            ],
-                                        )
-                                    )
-                                )
-                                # Keep MFMA -> FMA order: the FMA's partial then has
-                                # two MFMAs of XDL latency cover.
-                                rocdl.sched_barrier(0)
-                                if const_expr(index == 0 or index == 8):
-                                    scale = (
-                                        Vec(
-                                            scale_a[
-                                                None, packet % 2 * 2 + index // 8
-                                            ].load()
-                                        )[0]
-                                        * Vec(scale_b[None, slot * 2 + side].load())[0]
-                                    )
-                                    partial_scale[None, index // 8].store(
-                                        Vec.from_elements([scale], fx.Float32)
-                                    )
-                                if const_expr(index < 8):
-                                    source, source_scale = 2 + index // 4, 1
-                                    column = (
-                                        previous_packet * 2 + 1 - side
-                                    ) * 4 + source
-                                else:
-                                    source, source_scale = (index - 8) // 4, 0
-                                    column = (packet * 2 + side) * 4 + source
-                                target = accum[None, column]
-                                element = index % 4
-                                target[element] = fx.fma(
-                                    Vec(partial[None, source].load())[element],
-                                    Vec(partial_scale[None, source_scale].load())[0],
-                                    target[element],
-                                )
-                                rocdl.sched_barrier(0)
-                rocdl.s_setprio(0)
-                barrier()
+                do_gemm(packet, tick, frag_A)
+                end_compute_phase()
 
-        for packet in range_constexpr(4):
-            a_stage[None, packet].store(
-                _buffer_load_dwordx4(a_rsrc, a_voffsets[packet], 0)
-            )
-        for pair_begin in range_constexpr(0, 4, 2):
+        ### Prologue: K tile 0 and its scales; zero C and the FIFO.
+        for packet in range_constexpr(NUM_PACKETS):
+            load_A(packet, 0)
+        for pair_begin in range_constexpr(0, NUM_PACKETS, 2):
             for packet in range_constexpr(pair_begin, pair_begin + 2):
-                b_stage[None, packet % 2].store(
-                    _buffer_load_dwordx4(b_rsrc, b_voffsets[packet], 0)
-                )
+                load_B(packet, 0)
             for packet in range_constexpr(pair_begin, pair_begin + 2):
-                write_b(packet)
+                lds_wr_B(packet)
             rocdl.sched_barrier(0)
-        for rep_m in range_constexpr(2):
-            scale_a[None, rep_m].store(load_scale_a(0, 0, rep_m))
+        for m0 in range_constexpr(PHASE_M_REP):
+            mfma_scaleA[None, m0].store(load_scale_a(0, m0, 0))
         load_scale_b(0, 0)
-        for packet in range_constexpr(4):
-            write_a(packet)
-        accum.fill(0)
-        # The first stage retires these zeros as the "previous" side.
-        for index in range_constexpr(4):
-            partial[None, index].store(Vec.filled(4, 0.0, fx.Float32))
-        for index in range_constexpr(2):
-            partial_scale[None, index].store(Vec.filled(1, 0.0, fx.Float32))
+        for packet in range_constexpr(NUM_PACKETS):
+            lds_wr_A(packet)
+        frag_C.fill(0)
+        # The first stage retires these zeros as the "previous" half-phase.
+        frag_P.fill(0)
+        fifo_dq_scale.fill(0)
         rocdl.s_waitcnt(lgkmcnt=0)
         barrier()
-        # Waves 4-7 trail by one barrier so their memory phase overlaps waves 0-3
-        # compute.
+        # Offset the two groups of four waves by one stage: waves 4-7 trail by
+        # one barrier, so each group's memory phase overlaps the other group's
+        # compute phase. The lower group closes this unmatched barrier after the
+        # final FIFO drain.
         if wave_m == 1:
             barrier()
 
-        # Two blocks per iteration alternate the B-scale slots; odd KB peels block 0.
-        if const_expr(KB % 2):
-            run_k(0, fx.Int32(0))
-        for pair in range(KB // 2):
-            k_block = fx.Int32(pair) * 2 + KB % 2
-            run_k(KB % 2, k_block)
-            run_k(1 - KB % 2, k_block + 1)
+        # Two K tiles per iteration alternate the ScaleB slots (tick/tock); an
+        # odd num_tiles peels tile 0.
+        if const_expr(num_tiles % 2):
+            run_k_tile(0, fx.Int32(0))
+        for kidx in range(num_tiles // 2):
+            kiter = fx.Int32(kidx) * 2 + num_tiles % 2
+            run_k_tile(num_tiles % 2, kiter)
+            run_k_tile(1 - num_tiles % 2, kiter + 1)
 
-        # The final side's partials 2-3 have no later MFMA shadow.
-        final_scale = Vec(partial_scale[None, 1].load())[0]
-        for source in range_constexpr(2, 4):
-            target = accum[None, (3 * 2 + 1) * 4 + source]
-            values = Vec(partial[None, source].load())
-            for element in range_constexpr(4):
-                target[element] = fx.fma(values[element], final_scale, target[element])
+        # Drain the final FIFO pair: partials 2-3 of the last half-phase
+        # (packet 3, quadrant_n 1) have no later MFMA shadow.
+        dq_scale = Vec(fifo_dq_scale[None, 1].load())[0]
+        for p_col in range_constexpr(2, 4):
+            sub_frag_C = frag_C[None, ((NUM_PACKETS - 1) * 2 + 1) * 4 + p_col]
+            partial = Vec(frag_P[None, p_col].load())
+            for elem in range_constexpr(4):
+                sub_frag_C[elem] = fx.fma(partial[elem], dq_scale, sub_frag_C[elem])
         if wave_m == 0:
             barrier()
 
         # ---- epilogue store ----
         out_dtype = argC.dtype
         assert out_dtype in (fx.BFloat16, fx.Float16)
-        output_col = col_base + wave_n * 16 + lane // 16 * 4
-        for packet in range_constexpr(4):
-            for side in range_constexpr(2):
-                for rep_m in range_constexpr(2):
-                    for rep_n in range_constexpr(2):
-                        column = output_col + (side * 128 + rep_n * 64)
-                        row = local_row + (packet * PACKET_ROWS + rep_m * 32)
-                        offset = (column < N).select(
-                            row * (N * 2) + column * 2, fx.Int32(0x7FFFFFFF)
+        # In physical C, lane_id % 16 selects a row of the MFMA tile and
+        # lane_id // 16 four consecutive columns in that row.
+        output_col = col_base + wave_n * 16 + lane_id // 16 * 4
+        for packet in range_constexpr(NUM_PACKETS):
+            for quadrant_n in range_constexpr(2):
+                for m0 in range_constexpr(PHASE_M_REP):
+                    for n0 in range_constexpr(N_REP):
+                        col = output_col + (quadrant_n * (TILE_N // 2) + n0 * 64)
+                        row = local_row + (packet * PACKET_ROWS + m0 * 32)
+                        # N % 16 == 0: each four-element store is fully in or out.
+                        byte_offset = (col < N).select(
+                            row * (N * 2) + col * 2, fx.Int32(0x7FFFFFFF)
                         )
-                        values = Vec(
-                            accum[
+                        acc = Vec(
+                            frag_C[
                                 None,
-                                (packet * 2 + side) * 4 + rep_m * 2 + rep_n,
+                                (packet * 2 + quadrant_n) * 4 + m0 * N_REP + n0,
                             ].load()
                         )
                         # Round to nearest even, as the gfx950 8-wave kernel's
                         # epilogue does; gfx942 has no v_cvt_pk_bf16_f32, so
                         # LLVM expands the BF16 conversion.
-                        packed = values.to(out_dtype).bitcast(fx.Int32)
+                        packed = acc.to(out_dtype).bitcast(fx.Int32)
                         # Raw store, not fx.copy(BufferCopy64b): columns past N
                         # need the explicit out-of-range voffset 0x7FFFFFFF.
+                        # vector<2xi32> -> buffer_store_dwordx2: C[row, col:col+4].
                         rocdl.raw_ptr_buffer_store(
                             packed.ir_value(),
-                            c_rsrc,
-                            offset.ir_value(),
+                            c_store_rsrc,
+                            byte_offset.ir_value(),
                             fx.Int32(0).ir_value(),
                             aux=ir.IntegerAttr.get(T.i32, 0),
                         )
