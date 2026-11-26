@@ -194,12 +194,13 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(32, 4, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     assert support(32, 4, flydsl_ps1=True).fold_factor == 1
     assert support(16, 5, flydsl_ps1=True).backend is MlaBackend.ASM
-    # Past 128 rows, 32/64 heads take the query as several planner qo tiles
-    # (64 x 4 -> two 2-row tiles) up to qlen 8, unfolded and on FlyDSL JIT (no
-    # code object at those head counts); qlen 9 is past the kernel's bound.
-    for n, q in ((64, 3), (64, 4), (64, 8), (32, 5), (32, 8)):
-        s = support(n, q, flydsl_ps1=True)
-        assert (s.backend, s.fold_factor) == (MlaBackend.FLYDSL_PS1, 1), (n, q)
+    # QH64 has exact-length code objects; QH32 remains on JIT.
+    for q in (3, 4, 8):
+        s = support(64, q, flydsl_ps1=True)
+        assert (s.backend, s.fold_factor) == (MlaBackend.PS1_FP8_ASM, 1), q
+    for q in (5, 8):
+        s = support(32, q, flydsl_ps1=True)
+        assert (s.backend, s.fold_factor) == (MlaBackend.FLYDSL_PS1, 1), q
     assert support(64, 9, flydsl_ps1=True).backend is MlaBackend.ASM
     bf16 = torch.bfloat16
     for n in (64, 128):
@@ -379,7 +380,7 @@ def test_cp_world_size_matches_launch(monkeypatch):
         assert query.backend is _MLA_BACKENDS[launch.backend], (world, rr)
         backends[world, rr] = query.backend
     assert backends == {
-        (1, False): MlaBackend.FLYDSL_PS1,
+        (1, False): MlaBackend.PS1_FP8_ASM,
         (4, False): MlaBackend.ASM,
         (4, True): MlaBackend.FLYDSL_PS1,
     }

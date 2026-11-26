@@ -22,6 +22,7 @@
 #include "mla_reduce_cases.h"
 #include "opus/opus.hpp"
 #include <cstdio>
+#include <cstring>
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>
 struct MlaReduceKernelV1Traits
@@ -2197,6 +2198,341 @@ bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
     return can_run && ((env == 1) || enough_waves);
 }
 
+// Row-parallel reducer with one workgroup per (tile, head).
+struct MlaReduceRowsConfig
+{
+    // (row, split) partials kept in flight per thread.
+    static constexpr int32_t kInFlight = 8;
+    static constexpr int32_t kWgPerCu  = 16;
+    static constexpr int32_t kMaxRows  = 16;
+};
+
+struct MlaReduceRowsTile
+{
+    int32_t head;
+    int32_t start;     // the tile's first split in reduce_partial_map
+    int32_t n;         // splits
+    int32_t slot_lane; // lane m: partial row of split m (m < wave size)
+    int32_t q_start;   // the tile's first final-output row
+};
+
+template <typename Traits>
+__device__ auto mla_reduce_rows_load(const MlaReduceKernelV1Params& params,
+                                     const int32_t slot,
+                                     const int32_t row,
+                                     const int32_t head)
+{
+    constexpr int32_t kH  = Traits::kNumHeadQ;
+    constexpr int32_t kDV = Traits::kSizeDV;
+    // The slot offset can pass 2^31 bytes, so it goes into the 64-bit base and
+    // only the row, head and lane into the 32-bit buffer offset.
+    auto g = opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_output) +
+                                    int64_t(slot) * kH * kDV);
+    return buf_load_vec<Traits::kVecWidth>(
+        g, ((row * kH + head) * kDV + threadIdx.x * Traits::kVecWidth) * int32_t(sizeof(float)));
+}
+
+template <typename Traits>
+__device__ float mla_reduce_rows_lse(const MlaReduceKernelV1Params& params,
+                                     const MlaReduceRowsTile& t,
+                                     const int32_t slot,
+                                     const int32_t split,
+                                     const int32_t row)
+{
+    const float* p_part_lse = reinterpret_cast<const float*>(params.p_partial_lse);
+    return (split < t.n) ? p_part_lse[int64_t(slot + row) * Traits::kNumHeadQ + t.head]
+                         : -INFINITY;
+}
+
+// Merge the LSE values held by the wave's lanes.
+__device__ __forceinline__ float mla_reduce_rows_global_lse(const float max_lse,
+                                                            const float sum_lse)
+{
+    return (max_lse > -INFINITY) ? (logf(sum_lse) + max_lse) : -INFINITY;
+}
+
+template <typename Traits, typename lse_t, typename out_t>
+__device__ void mla_reduce_rows_store(const MlaReduceKernelV1Params& params,
+                                      const MlaReduceRowsTile& t,
+                                      const int32_t row,
+                                      const opus::vector_t<float, Traits::kVecWidth>& acc,
+                                      const float global_lse)
+{
+    const int32_t seq = t.q_start + row;
+    auto g_out = opus::make_gmem<out_t>(reinterpret_cast<out_t*>(params.p_final_output) +
+                                        int64_t(seq) * params.stride_s_o +
+                                        int64_t(t.head) * params.stride_h_o);
+    buf_store_vec<Traits::kVecWidth>(g_out,
+                                     opus::cast<out_t>(acc),
+                                     threadIdx.x * Traits::kVecWidth * int32_t(sizeof(out_t)));
+    if(params.output_lse && threadIdx.x == 0)
+    {
+        reinterpret_cast<lse_t*>(params.p_final_lse)[int64_t(seq) * Traits::kNumHeadQ + t.head] =
+            opus::cast<lse_t>(global_lse);
+    }
+}
+
+// Reduce up to kRows rows and kSplits splits with all partials in flight.
+template <typename Traits, typename lse_t, typename out_t, int32_t kRows, int32_t kSplits>
+__device__ void mla_reduce_rows_few(const MlaReduceKernelV1Params& params,
+                                    const MlaReduceRowsTile& t,
+                                    const int32_t row0,
+                                    const int32_t num_rows)
+{
+    constexpr int32_t kWave = Traits::kWaveSize;
+    constexpr int32_t kVec  = Traits::kVecWidth;
+    static_assert(kRows * kSplits <= MlaReduceRowsConfig::kInFlight && kSplits <= kWave);
+    using vec_f32_t = opus::vector_t<float, kVec>;
+    const int32_t lane = threadIdx.x % kWave;
+
+    vec_f32_t data[kRows][kSplits];
+#pragma unroll
+    for(int32_t r = 0; r < kRows; ++r)
+    {
+        if(row0 + r < num_rows)
+        {
+#pragma unroll
+            for(int32_t s = 0; s < kSplits; ++s)
+            {
+                if(s < t.n)
+                {
+                    data[r][s] = mla_reduce_rows_load<Traits>(
+                        params, __builtin_amdgcn_readlane(t.slot_lane, s), row0 + r, t.head);
+                }
+            }
+        }
+    }
+    float lse[kRows];
+#pragma unroll
+    for(int32_t r = 0; r < kRows; ++r)
+    {
+        lse[r] = (row0 + r < num_rows)
+                     ? mla_reduce_rows_lse<Traits>(params, t, t.slot_lane, lane, row0 + r)
+                     : -INFINITY;
+    }
+#pragma unroll
+    for(int32_t r = 0; r < kRows; ++r)
+    {
+        if(row0 + r < num_rows)
+        {
+            const float max_lse = aiter::warpReduce<aiter::MaxFunctor, float, kWave>(lse[r]);
+            const float sum_lse = aiter::warpReduce<aiter::AddFunctor, float, kWave>(
+                (lane < t.n) ? expf(lse[r] - max_lse) : 0.f);
+            const float global_lse = mla_reduce_rows_global_lse(max_lse, sum_lse);
+            const float scale =
+                (global_lse > -INFINITY && lane < t.n) ? expf(lse[r] - global_lse) : 0.f;
+            vec_f32_t acc = {0};
+#pragma unroll
+            for(int32_t s = 0; s < kSplits; ++s)
+            {
+                if(s < t.n)
+                {
+                    const float w =
+                        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(scale), s));
+                    opus::static_for<kVec>(
+                        [&](auto i) { acc[i.value] += w * data[r][s][i.value]; });
+                }
+            }
+            mla_reduce_rows_store<Traits, lse_t, out_t>(params, t, row0 + r, acc, global_lse);
+        }
+    }
+}
+
+// Reduce one row with kInFlight partials at a time.
+template <typename Traits, typename lse_t, typename out_t>
+__device__ void mla_reduce_rows_many(const MlaReduceKernelV1Params& params,
+                                     const MlaReduceRowsTile& t,
+                                     const int32_t row)
+{
+    constexpr int32_t kWave     = Traits::kWaveSize;
+    constexpr int32_t kVec      = Traits::kVecWidth;
+    constexpr int32_t kInFlight = MlaReduceRowsConfig::kInFlight;
+    static_assert(kWave % kInFlight == 0);
+    using vec_f32_t       = opus::vector_t<float, kVec>;
+    const int32_t lane    = threadIdx.x % kWave;
+    const int32_t* p_pmap = params.p_reduce_partial_map;
+    auto slot_of          = [&](const int32_t c) {
+        return (c + lane < t.n) ? p_pmap[t.start + c + lane] : 0;
+    };
+
+    // The first group of partials needs only the slots, so it loads while the
+    // LSEs are reduced.
+    vec_f32_t data[kInFlight];
+#pragma unroll
+    for(int32_t u = 0; u < kInFlight; ++u)
+    {
+        if(u < t.n)
+        {
+            data[u] = mla_reduce_rows_load<Traits>(
+                params, __builtin_amdgcn_readlane(t.slot_lane, u), row, t.head);
+        }
+    }
+    const float lse_c0 = mla_reduce_rows_lse<Traits>(params, t, t.slot_lane, lane, row);
+    float max_lse      = lse_c0;
+    for(int32_t c = kWave; c < t.n; c += kWave)
+    {
+        max_lse =
+            opus::max(max_lse, mla_reduce_rows_lse<Traits>(params, t, slot_of(c), c + lane, row));
+    }
+    max_lse       = aiter::warpReduce<aiter::MaxFunctor, float, kWave>(max_lse);
+    float sum_lse = (lane < t.n) ? expf(lse_c0 - max_lse) : 0.f;
+    for(int32_t c = kWave; c < t.n; c += kWave)
+    {
+        if(c + lane < t.n)
+        {
+            sum_lse +=
+                expf(mla_reduce_rows_lse<Traits>(params, t, slot_of(c), c + lane, row) - max_lse);
+        }
+    }
+    sum_lse                = aiter::warpReduce<aiter::AddFunctor, float, kWave>(sum_lse);
+    const float global_lse = mla_reduce_rows_global_lse(max_lse, sum_lse);
+    const bool has_mass    = global_lse > -INFINITY;
+
+    vec_f32_t acc  = {0};
+    int32_t slot_c = t.slot_lane;
+    float scale_c  = (has_mass && lane < t.n) ? expf(lse_c0 - global_lse) : 0.f;
+    for(int32_t j0 = 0; j0 < t.n; j0 += kInFlight)
+    {
+        const int32_t c = j0 - j0 % kWave;
+        if(j0 > 0)
+        {
+            if(j0 == c)
+            {
+                slot_c  = slot_of(c);
+                scale_c = has_mass ? expf(mla_reduce_rows_lse<Traits>(
+                                              params, t, slot_c, c + lane, row) -
+                                          global_lse)
+                                   : 0.f;
+            }
+#pragma unroll
+            for(int32_t u = 0; u < kInFlight; ++u)
+            {
+                if(j0 + u < t.n)
+                {
+                    data[u] = mla_reduce_rows_load<Traits>(
+                        params, __builtin_amdgcn_readlane(slot_c, j0 - c + u), row, t.head);
+                }
+            }
+        }
+#pragma unroll
+        for(int32_t u = 0; u < kInFlight; ++u)
+        {
+            if(j0 + u < t.n)
+            {
+                const float w = __int_as_float(
+                    __builtin_amdgcn_readlane(__float_as_int(scale_c), j0 - c + u));
+                opus::static_for<kVec>([&](auto i) { acc[i.value] += w * data[u][i.value]; });
+            }
+        }
+    }
+    mla_reduce_rows_store<Traits, lse_t, out_t>(params, t, row, acc, global_lse);
+}
+
+template <typename Traits, typename lse_t, typename out_t>
+__launch_bounds__(Traits::kNumThreads) __global__
+    void kn_mla_reduce_v1_rows(const MlaReduceKernelV1Params params)
+{
+    constexpr int32_t kWave = Traits::kWaveSize;
+    constexpr int32_t kH    = Traits::kNumHeadQ;
+
+    const int32_t lane      = threadIdx.x % kWave;
+    const int32_t num_tiles = params.num_reduce_tile;
+    const int32_t* p_indptr = params.p_reduce_indptr;
+    const int32_t* p_pmap   = params.p_reduce_partial_map;
+    // The planner pads the reduce_indptr tail with its total, so a tile that
+    // starts at `last` and every tile after it are empty.
+    const int32_t last = __builtin_amdgcn_readfirstlane(p_indptr[num_tiles]);
+
+    // Units go tile by tile, so past the first empty tile every unit is empty.
+    for(int32_t unit = blockIdx.x;; unit += gridDim.x)
+    {
+        MlaReduceRowsTile t;
+        t.head           = unit % kH;
+        const int32_t tile = unit / kH;
+        if(tile >= num_tiles)
+        {
+            break;
+        }
+        t.start = __builtin_amdgcn_readfirstlane(p_indptr[tile]);
+        if(t.start == last)
+        {
+            break;
+        }
+        t.n = __builtin_amdgcn_readfirstlane(p_indptr[tile + 1]) - t.start;
+        if(t.n <= 0)
+        {
+            continue;
+        }
+        t.slot_lane         = (lane < t.n) ? p_pmap[t.start + lane] : 0;
+        const int32_t slot0 = __builtin_amdgcn_readlane(t.slot_lane, 0);
+        // -1 marks a v1_0 tile whose only split already wrote the final output.
+        if(t.n == 1 && slot0 == -1)
+        {
+            continue;
+        }
+        int32_t num_rows = 0;
+        if(params.use_reduce_final_map)
+        {
+            const MlaPartialTileInfo loc = params.p_reduce_final_map[tile];
+            t.q_start                    = loc.q_start;
+            num_rows                     = loc.q_end - loc.q_start;
+        }
+        else
+        {
+            // Same qo_len rule as kn_mla_reduce_v1: one split means no rows.
+            const int32_t qo_len =
+                (t.n > 1) ? (__builtin_amdgcn_readlane(t.slot_lane, 1) - slot0) : 0;
+            t.q_start = tile * qo_len;
+            num_rows  = qo_len;
+        }
+
+        // Rows x splits per pass, every partial of a pass in flight at once.
+        constexpr int32_t kInFlight = MlaReduceRowsConfig::kInFlight;
+        if(t.n <= 2)
+        {
+            for(int32_t r0 = 0; r0 < num_rows; r0 += kInFlight / 2)
+            {
+                mla_reduce_rows_few<Traits, lse_t, out_t, kInFlight / 2, 2>(
+                    params, t, r0, num_rows);
+            }
+        }
+        else if(t.n <= 4)
+        {
+            for(int32_t r0 = 0; r0 < num_rows; r0 += kInFlight / 4)
+            {
+                mla_reduce_rows_few<Traits, lse_t, out_t, kInFlight / 4, 4>(
+                    params, t, r0, num_rows);
+            }
+        }
+        else if(t.n <= 8)
+        {
+            for(int32_t r0 = 0; r0 < num_rows; r0 += kInFlight / 8)
+            {
+                mla_reduce_rows_few<Traits, lse_t, out_t, kInFlight / 8, 8>(
+                    params, t, r0, num_rows);
+            }
+        }
+        else
+        {
+            for(int32_t row = 0; row < num_rows; ++row)
+            {
+                mla_reduce_rows_many<Traits, lse_t, out_t>(params, t, row);
+            }
+        }
+    }
+}
+
+// Select the row-parallel Dv512 reducer on gfx1250.
+inline bool mla_reduce_use_rows(const MlaReduceKernelV1Params& params,
+                                const hipDeviceProp_t& dev_prop)
+{
+    const char* arch      = dev_prop.gcnArchName;
+    const bool is_gfx1250 = std::strncmp(arch, "gfx1250", 7) == 0 &&
+                            (arch[7] == '\0' || arch[7] == ':');
+    return is_gfx1250 && (dev_prop.warpSize == 32) && (params.max_seqlen_q >= 1) &&
+           (params.max_seqlen_q <= MlaReduceRowsConfig::kMaxRows);
+}
+
 // Whether a launch takes kn_mla_reduce_v1_wide. AITER_MLA_REDUCE_WIDE=0 keeps
 // kn_mla_reduce_v1 everywhere, =1 drops the size and split-count heuristics; read once.
 template <typename WideTraits>
@@ -2324,6 +2660,19 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
         // block dim and LDS spill boundary from the runtime warpSize instead.
         const int32_t wave_size = dev_prop.warpSize;
         const int32_t block_dim = Traits::kNumWarps * wave_size;
+
+        if constexpr(Traits::kSizeDV == 512)
+        {
+            if(mla_reduce_use_rows(params, dev_prop))
+            {
+                using RowsTraits = MlaReduceKernelV1Traits<Traits::kSizeDV, Traits::kNumHeadQ, 1>;
+                const int32_t units = params.num_reduce_tile * Traits::kNumHeadQ;
+                const dim3 grid = dim3(min(units, num_cu * MlaReduceRowsConfig::kWgPerCu));
+                kn_mla_reduce_v1_rows<RowsTraits, lse_t, out_t>
+                    <<<grid, block_dim, 0, stream>>>(params);
+                return;
+            }
+        }
 
         // The wide kernel's traits follow the device wave size (see
         // MlaReduceWideTraits), so pick the instance from the runtime warpSize.
