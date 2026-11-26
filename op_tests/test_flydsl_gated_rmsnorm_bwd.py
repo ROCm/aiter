@@ -37,7 +37,8 @@ def test_gated_rmsnorm_bwd(T, H, D, dtype):
     ref = run_torch(o, gp, w, dy)
 
     candidates = {"flydsl": gated_rmsnorm_bwd}
-    nbytes = 4 * o.numel() * o.element_size() + 2 * o.numel() * 4
+    # read o, gp, dy; write fp32 do, dgp
+    nbytes = 3 * o.numel() * o.element_size() + 2 * o.numel() * 4
     flops = 12 * o.numel()
     ret = {}
     for name, fn in candidates.items():
@@ -67,7 +68,9 @@ def main():
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
-    parser.add_argument("-t", "--tokens", type=int, nargs="*", default=[1000, 2048])
+    parser.add_argument(
+        "-t", "--tokens", type=int, nargs="*", default=[1000, 1001, 2048]
+    )
     parser.add_argument("--heads", type=int, nargs="*", default=[96, 48])
     parser.add_argument("--head_dim", type=int, nargs="*", default=[128])
     args = parser.parse_args()

@@ -5,49 +5,58 @@
 
 import torch
 
-from .kernels.gated_rmsnorm_bwd import WAVE, create_gated_rmsnorm_bwd_kernel
+from .kernels.gated_rmsnorm_bwd import (
+    EPL,
+    create_gated_rmsnorm_bwd_kernel,
+    supported_dim,
+)
 from .kernels.tensor_shim import _run_compiled
 
-ROW_WAVES = 4
-RMSNORM_ROWS_PER_WAVE = 16
-
-
-def _f32(t):
-    return t.detach().to(torch.float32).contiguous().view(-1)
+BLOCK = 256
+PASSES = 4
+_IN_DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
 def gated_rmsnorm_bwd(o, gp, w, dy, eps=1e-6):
     """Backward of ``rmsnorm(o) * w * sigmoid(gp)`` over the last dim.
 
-    o, gp, dy: [..., V] (any float dtype, read as fp32); w: [V]; V % 64 == 0.
-    gp is the gate pre-activation. Returns (do, dgp, dw), fp32.
+    o, gp, dy: [..., V], read in their own dtype when all three share bf16, fp16
+    or fp32 (anything else goes through fp32); w: [V]. V / 8 must be a power of
+    two up to 64 (V in 8..512). gp is the gate pre-activation.
+    Returns (do, dgp, dw), fp32.
     """
     dim = o.shape[-1]
-    if dim % WAVE:
-        raise ValueError(
-            f"gated rmsnorm row length must be a multiple of {WAVE}, got {dim}"
-        )
-    rows = o.numel() // dim
-    n_groups = (rows + RMSNORM_ROWS_PER_WAVE - 1) // RMSNORM_ROWS_PER_WAVE
+    if not supported_dim(dim):
+        raise ValueError(f"gated rmsnorm row length must be 8 * 2^k <= 512, got {dim}")
+    in_dtype = _IN_DTYPES.get(o.dtype)
+    if in_dtype is None or gp.dtype != o.dtype or dy.dtype != o.dtype:
+        in_dtype = "f32"
+    cast = torch.float32 if in_dtype == "f32" else o.dtype
+    o_, gp_, dy_ = (t.detach().to(cast).contiguous().view(-1) for t in (o, gp, dy))
+    numel = o_.numel()
+    if numel * 4 >= 2**31:
+        raise ValueError(f"too many elements for 32-bit buffer offsets: {numel}")
+    rows = numel // dim
+    rows_per_block = BLOCK // (dim // EPL) * PASSES
+    n_blocks = max(1, (rows + rows_per_block - 1) // rows_per_block)
     do = torch.empty(o.shape, device=o.device, dtype=torch.float32)
     dgp = torch.empty_like(do)
-    dw_part = torch.empty(n_groups, dim, device=o.device, dtype=torch.float32)
+    dw_part = torch.empty(n_blocks, dim, device=o.device, dtype=torch.float32)
     launch = create_gated_rmsnorm_bwd_kernel(
-        dim, float(eps), ROW_WAVES, RMSNORM_ROWS_PER_WAVE, o.device.index
+        dim, float(eps), in_dtype, BLOCK, PASSES, o.device.index
     )
     _run_compiled(
         launch,
-        _f32(o),
-        _f32(gp),
-        _f32(w),
-        _f32(dy),
+        o_,
+        gp_,
+        w.detach().to(torch.float32).contiguous(),
+        dy_,
         do.view(-1),
         dgp.view(-1),
         dw_part.view(-1),
         rows,
-        n_groups,
-        o.numel(),
-        dw_part.numel(),
+        n_blocks,
+        numel,
     )
     return do, dgp, dw_part.sum(0)
 
