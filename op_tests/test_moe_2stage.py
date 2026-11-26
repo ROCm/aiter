@@ -40,6 +40,7 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.moev2.segments import sort as moev2_sort
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -1606,7 +1607,7 @@ def test_presorted_moe_hook():
         }
 
     real_fused_moe = fused_moe
-    real_sorting = fm.moe_sorting
+    real_sorting = moev2_sort.moe_sorting
     sort_calls = []
 
     def counting_sorting(*a, **kw):
@@ -1690,7 +1691,7 @@ def test_presorted_moe_hook():
     candidates = {"moe_sorting": real_fused_moe, "presorted": presorted_fused_moe}
     rows = []
     try:
-        fm.moe_sorting = counting_sorting
+        moev2_sort.moe_sorting = counting_sorting
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
@@ -1779,7 +1780,7 @@ def test_presorted_moe_hook():
                 rows.append(row)
     finally:
         fused_moe = real_fused_moe
-        fm.moe_sorting = real_sorting
+        moev2_sort.moe_sorting = real_sorting
         fm.register_presorted_moe(None)
     aiter.logger.info(
         "moe_2stage presorted MoE hook summary (markdown):\n%s",
@@ -1791,7 +1792,7 @@ def test_presorted_moe_hook():
     hidden, topk_weights, topk_ids = route(token)
 
     try:
-        fm.moe_sorting = counting_sorting
+        moev2_sort.moe_sorting = counting_sorting
         ref = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
 
         # Without output=, the buffer fused_moe allocates is zeroed even when it
@@ -1872,7 +1873,7 @@ def test_presorted_moe_hook():
             getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
         ), "not consumed on error"
     finally:
-        fm.moe_sorting = real_sorting
+        moev2_sort.moe_sorting = real_sorting
         fm.register_presorted_moe(None)
     torch.cuda.synchronize()
     aiter.logger.info("moe_2stage: presorted MoE hook contract passed")
