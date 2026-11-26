@@ -33,6 +33,7 @@ from ..triton._triton_kernels.gated_delta_net.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+from .aot_launch import aot_factory
 from .kernels.gdr_prefill import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
@@ -402,6 +403,7 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
+@aot_factory("chunk_gated_delta_h")
 @functools.cache
 def _get_or_compile_opt(
     K,
@@ -780,7 +782,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     # SCHED_GFX942 is only enabled on gfx942; other arches (incl. gfx950) pass
     # False, keeping their emitted code byte-identical, and it joins the
     # lru_cache key as a distinct compiled product.
-    launch_fn = _get_or_compile_opt(
+    launch_fn = _get_or_compile_opt.lazy(
         K,
         V,
         BT,
@@ -790,16 +792,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         use_g,
         use_gk,
         use_h0,
-        output_final_state,
-        save_new_value,
+        bool(output_final_state),
+        bool(save_new_value),
         is_varlen,
         True,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
         use_state_indices=use_state_indices,
         sched_gfx942=_is_gfx942(),
-        g_head_major=g_head_major,
-        bf16_convert_trunc=bf16_convert_trunc,
+        g_head_major=bool(g_head_major),
+        bf16_convert_trunc=bool(bf16_convert_trunc),
         snapshot_bf16=snapshot_bf16,
     )
 

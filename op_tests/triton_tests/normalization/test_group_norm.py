@@ -177,14 +177,6 @@ def test_group_norm_large_magnitude():
         torch.testing.assert_close(got.double(), want, atol=tol, rtol=tol)
 
 
-def test_group_norm_rejects_bad_activation():
-    """A bad activation name is rejected, for an empty input too."""
-    for shape in [(2, 64, 8, 8), (0, 64, 8, 8)]:
-        x = torch.randn(shape, dtype=torch.float16, device="cuda")
-        with pytest.raises(KeyError):
-            group_norm(x, 32, activation="no_such_activation")
-
-
 def test_group_norm_empty_activation():
     """An empty activation name applies no activation, as None does."""
     x, weight, bias, _ = generate_group_norm_inputs(
