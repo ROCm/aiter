@@ -716,15 +716,22 @@ def launch_gemm_a8w8_256x256(
                 )
             )
             acc_zero = Vec.from_elements([zf] * 8, fx.Float32)
-        for cf_i, cf in enumerate(c_frags):
-            z = (
-                fx.constant_vector(0.0, T.vec(8, T.f32))
-                if const_expr(acc_zero is None)
-                else acc_zero
-            )
-            if const_expr(_HAS_SCHED_VGPR):
-                z = _pin_acc_vec(z, cf_i)
-            cf.store(z)
+        def _zero_accs():
+            for cf_i, cf in enumerate(c_frags):
+                z = (
+                    fx.constant_vector(0.0, T.vec(8, T.f32))
+                    if const_expr(acc_zero is None)
+                    else acc_zero
+                )
+                if const_expr(_HAS_SCHED_VGPR):
+                    z = _pin_acc_vec(z, cf_i)
+                cf.store(z)
+
+        # A single tile zeroes its accumulators behind the prologue TDMs, while the
+        # TDM queue is full; left in place they land after the first-stage wait.
+        ZERO_IN_PROLOGUE = persistent_n_tiles == 1
+        if const_expr(not ZERO_IN_PROLOGUE):
+            _zero_accs()
 
         def _rmem(n, v, *, kind=None, slot=0, phase=0):
             del phase
@@ -1649,6 +1656,10 @@ def launch_gemm_a8w8_256x256(
                 )
             else:
                 tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            if const_expr(ZERO_IN_PROLOGUE and i == max(num_buffers - 2, 0)):
+                rocdl.sched_barrier(0)
+                _zero_accs()
+                rocdl.sched_barrier(0)
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
 
         def _deferred_slots():
