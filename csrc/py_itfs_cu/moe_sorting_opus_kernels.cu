@@ -69,7 +69,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
-    moe_sorting_opus(
+    const float status = moe_sorting_opus(
         {
             dtype_str,
             "fp32",
@@ -96,6 +96,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          static_cast<int>(moe_buf.size(-1)),
          static_cast<int>(moe_buf.element_size())},
         {stream});
+    // a negative status means no kernel was launched: the outputs are unwritten
+    AITER_CHECK(status >= 0, "moe_sorting_opus: unsupported configuration (tokens ", num_tokens,
+                ", experts ", num_experts, ", topk ", topk, ", index type ", dtype_str, ")");
 }
 
 namespace aiter::mxfp4_moe {

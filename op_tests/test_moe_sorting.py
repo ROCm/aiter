@@ -613,27 +613,52 @@ def test_moe_sorting_opus_repeated_experts():
 
 
 def test_moe_sorting_opus_topk_limit():
-    """Top-k above 256 does not fit the sorted ids' 8-bit slot field: the binding raises."""
-    m, E, topk, unit = 2048, 512, 257, 32
-    topk_ids = torch.rand((m, E)).topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
-    topk_weights = torch.rand((m, topk), dtype=dtypes.fp32)
-    padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
-    try:
-        aiter.moe_sorting_opus_fwd(
-            topk_ids,
-            topk_weights,
-            torch.empty((padded,), dtype=dtypes.i32),
-            torch.empty((padded,), dtype=dtypes.fp32),
-            torch.empty((padded // unit,), dtype=dtypes.i32),
-            torch.empty((2,), dtype=dtypes.i32),
-            torch.empty((m, 256), dtype=dtypes.bf16),
-            E,
-            unit,
+    """What the sort cannot serve raises instead of leaving the outputs unwritten.
+
+    Top-k above 256 does not fit the sorted ids' 8-bit slot field; top-k 255 and 256
+    are served by the chunk kernels only, so below 2048 tokens the multi-phase path
+    has no kernel for them.
+    """
+    device = torch.device("cuda")
+    # token capacity, experts, topk, tile height, expected message
+    cases = (
+        (2048, 512, 257, 32, "topk 257"),
+        (1024, 512, 255, 32, "unsupported configuration"),
+        (1024, 512, 256, 32, "unsupported configuration"),
+    )
+    for m, E, topk, unit, message in cases:
+        topk_ids = (
+            torch.rand((m, E), device=device)
+            .topk(topk, dim=1)
+            .indices.to(dtypes.i32)
+            .contiguous()
         )
-    except RuntimeError as e:
-        assert "topk 257" in str(e), f"unexpected error: {e}"
-    else:
-        raise AssertionError("moe_sorting_opus_fwd accepted topk 257")
+        topk_weights = torch.rand((m, topk), dtype=dtypes.fp32, device=device)
+        padded = (m * topk + E * unit - topk + unit - 1) // unit * unit
+        # always multi-phase, so that the token count alone picks the kernels
+        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+            m, E, topk, 2, topk_ids.get_device()
+        )
+        try:
+            aiter.moe_sorting_opus_fwd(
+                topk_ids,
+                topk_weights,
+                torch.empty((padded,), dtype=dtypes.i32, device=device),
+                torch.empty((padded,), dtype=dtypes.fp32, device=device),
+                torch.empty((padded // unit,), dtype=dtypes.i32, device=device),
+                torch.empty((2,), dtype=dtypes.i32, device=device),
+                torch.empty((m, 256), dtype=dtypes.bf16, device=device),
+                E,
+                unit,
+                None,
+                None,
+                torch.empty(ws_size, dtype=torch.uint8, device=device),
+                2,
+            )
+        except RuntimeError as e:
+            assert message in str(e), f"unexpected error at M={m}, topk={topk}: {e}"
+        else:
+            raise AssertionError(f"moe_sorting_opus_fwd accepted M={m}, topk={topk}")
 
 
 def _build_moe_sorting_inputs(
