@@ -284,6 +284,20 @@ def build_gemm_a8w4_tdm_task(
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
     """
+    if a_is_fp4:
+        # The fp4-activation body always emits v_wmma_scale_f32_32x16x128_f4.
+        # gfx1250-strict (MI450 A0 errata) has no wmma-f4-insts, and LLVM then
+        # only prints "requires target feature" and emits a kernel without the
+        # matmul (NaN output). Fail the build loudly instead (ROCm/aiter#8527).
+        from flydsl.runtime.device import get_rocm_arch
+
+        _target = get_rocm_arch()
+        if _target.startswith("gfx1250-"):
+            raise NotImplementedError(
+                f"fp4-activation grouped TDM GEMM cannot target {_target}: it has "
+                "no wmma-f4-insts (MI450 A0 errata, ROCm/aiter#8527). Use fp8 "
+                "activations (a8w4) on this target."
+            )
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
     if defer_c_wait:
