@@ -37,6 +37,14 @@ from .tensor_shim import (
 )
 
 GEMM_A16W16_DTYPE_FP32 = 1
+# Element-wise epilogues on the unsplit store path. z is the fp32 accumulator
+# (bias included); aux / out2 are fp32 [M, N]; group maps a column to its
+# A_log entry (col // group).
+GEMM_EPI_NONE = 0
+GEMM_EPI_KDA_GATE = 1  # out = -exp(A_log[col // group]) * softplus(z)
+GEMM_EPI_KDA_GATE_BWD = 2  # out = aux * -exp(A_log) * sigmoid(z); out2 = aux * gate(z)
+GEMM_EPI_SIGMOID = 3  # out = sigmoid(z)
+GEMM_EPI_SIGMOID_MUL = 4  # out = sigmoid(z) * aux
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP16 = 3
 
@@ -61,6 +69,8 @@ class GemmA16W16Gfx950Param:
     a_is_transposed: fx.Constexpr[bool]
     b_is_transposed: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
+    epilogue: fx.Constexpr[int]
+    epi_group: fx.Constexpr[int]
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
@@ -118,6 +128,8 @@ def make_gemm_a16w16_gfx950_param(
     a_is_transposed: bool = False,
     b_is_transposed: bool = True,
     has_bias: bool = False,
+    epilogue: int = GEMM_EPI_NONE,
+    epi_group: int = 1,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -129,6 +141,10 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("AITER preshuffle requires transposed BF16 B")
     if bpreshuffle and (use_half_tile_interleaved or split_k != 1 or k_waves != 1):
         raise ValueError("AITER preshuffle currently requires unsplit full-tile GEMM")
+    if epilogue != GEMM_EPI_NONE and (split_k != 1 or use_half_tile_interleaved):
+        raise ValueError("epilogues need split_k == 1 and the full-tile kernel")
+    if epilogue not in range(GEMM_EPI_SIGMOID_MUL + 1) or epi_group <= 0:
+        raise ValueError(f"unsupported epilogue={epilogue}, epi_group={epi_group}")
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
@@ -305,6 +321,8 @@ def make_gemm_a16w16_gfx950_param(
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
         has_bias=has_bias,
+        epilogue=epilogue,
+        epi_group=epi_group,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -335,6 +353,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_bnt" if param.b_non_temporal else ""
     name += "_bshuffle" if param.bpreshuffle else ""
     name += f"_bias{int(param.has_bias)}"
+    if param.epilogue != GEMM_EPI_NONE:
+        name += f"_epi{param.epilogue}g{param.epi_group}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
@@ -550,6 +570,43 @@ def write_cshuffle_vec_to_global(
         fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
 
 
+def apply_epilogue(c_vec, global_row, global_col, n, a_log_buf, aux, out2, param):
+    """Apply ``param.epilogue`` to one stored vector (columns contiguous)."""
+    vec = c_vec.numel
+    z = c_vec.to(fx.Float32)
+    one = fx.Float32(1.0)
+    offset = global_row * n + global_col
+    f32_vec = fx.Vector.make_type(vec, fx.Float32)
+    neg_a = one
+    if const_expr(param.epilogue in (GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_GATE_BWD)):
+        # epi_group is a multiple of the store vector, so one head per vector
+        neg_a = -fx.exp(a_log_buf[global_col // param.epi_group].to(fx.Float32))
+    aux_v = z
+    if const_expr(param.epilogue in (GEMM_EPI_KDA_GATE_BWD, GEMM_EPI_SIGMOID_MUL)):
+        aux_v = fx.Vector(fx.ptr_load(fx.get_iter(aux) + offset, result_type=f32_vec))
+    res, res2 = [], []
+    for e in range_constexpr(vec):
+        x = z[e]
+        sig = one / (one + fx.exp(-x))
+        if const_expr(param.epilogue == GEMM_EPI_SIGMOID):
+            res.append(sig)
+        elif const_expr(param.epilogue == GEMM_EPI_SIGMOID_MUL):
+            res.append(sig * aux_v[e])
+        else:
+            # softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+            sp = fx.max(x, fx.Float32(0.0)) + fx.log(one + fx.exp(-fx.max(x, -x)))
+            if const_expr(param.epilogue == GEMM_EPI_KDA_GATE):
+                res.append(neg_a * sp)
+            else:
+                res.append(aux_v[e] * neg_a * sig)
+                res2.append(aux_v[e] * neg_a * sp)
+    if const_expr(param.epilogue == GEMM_EPI_KDA_GATE_BWD):
+        fx.ptr_store(
+            fx.Vector.from_elements(res2, fx.Float32), fx.get_iter(out2) + offset
+        )
+    return fx.Vector.from_elements(res, fx.Float32).to(c_vec.dtype)
+
+
 @flyc.kernel
 def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
@@ -567,6 +624,9 @@ def gemm_a16w16_gfx950_kernel(
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
+    epi0: fx.Tensor,
+    epi1: fx.Tensor,
+    epi2: fx.Tensor,
 ):
     is_split_k = param.is_split_k
     is_slice_k = param.k_waves > 1
@@ -653,6 +713,9 @@ def gemm_a16w16_gfx950_kernel(
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
+    a_log_buf = None
+    if const_expr(param.epilogue in (GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_GATE_BWD)):
+        a_log_buf = fx.rocdl.make_buffer_tensor(epi0, max_size=True)
 
     if const_expr(is_split_k):
         splitk_protocol.init(
@@ -929,6 +992,10 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
+                if const_expr(param.epilogue != GEMM_EPI_NONE):
+                    c_vec = apply_epilogue(
+                        c_vec, global_row, global_col, n, a_log_buf, epi1, epi2, param
+                    )
                 global_offset = global_row * n + global_col
                 write_cshuffle_vec_to_global(
                     out,
@@ -1398,6 +1465,9 @@ def gemm_a16w16_gfx950(
     signal: fx.Tensor,
     split_k: fx.Int32,
     param: GemmA16W16Gfx950Param,
+    epi0: fx.Tensor,
+    epi1: fx.Tensor,
+    epi2: fx.Tensor,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008
 ):
     m = fx.Int32(fx.get_scalar(a.shape[0]))
@@ -1445,7 +1515,7 @@ def gemm_a16w16_gfx950(
     )
     gemm_a16w16_kernel_impl._known_block_size = [param.block_threads, 1, 1]
     gemm_a16w16_kernel_impl._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
-    gemm_a16w16_kernel_impl(
+    args = [
         out,
         a,
         b,
@@ -1461,6 +1531,12 @@ def gemm_a16w16_gfx950(
         b_leading_stride,
         tiled_mma,
         param,
+    ]
+    # only the full-tile kernel has epilogues; the HTI kernel keeps its kernargs
+    if const_expr(not param.use_half_tile_interleaved):
+        args += [epi0, epi1, epi2]
+    gemm_a16w16_kernel_impl(
+        *args,
     ).launch(
         grid=(num_pid_m * num_pid_n, split_k, 1),
         block=(param.block_threads, 1, 1),
@@ -1623,6 +1699,11 @@ def gemm_a16w16(
     stream: torch.cuda.Stream | None = None,
     layout: str = "nt",
     out_dtype: torch.dtype | None = None,
+    epilogue: int = GEMM_EPI_NONE,
+    epi_group: int = 1,
+    a_log: torch.Tensor | None = None,
+    aux: torch.Tensor | None = None,
+    out2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute C[M, N] = A[M, K] @ B[K, N].
 
@@ -1632,6 +1713,9 @@ def gemm_a16w16(
     Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     ``out_dtype`` may be the input dtype or ``torch.float32``.
+    ``epilogue`` (a ``GEMM_EPI_*``) transforms the accumulator before the store;
+    it forces the unsplit full-tile kernel. ``a_log`` is fp32 ``[N // epi_group]``;
+    ``aux`` and ``out2`` are contiguous fp32 ``[M, N]``.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1743,6 +1827,13 @@ def gemm_a16w16(
         GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
     )
     kwargs["has_bias"] = bias is not None
+    if epilogue != GEMM_EPI_NONE:
+        kwargs.update(
+            epilogue=epilogue,
+            epi_group=epi_group,
+            split_k=1,
+            use_half_tile_interleaved=False,
+        )
     split_k = kwargs["split_k"]
     assert_no_k_tail(k, kwargs)
 
@@ -1757,6 +1848,23 @@ def gemm_a16w16(
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    epi_args = []
+    for t, need, rank in (
+        (a_log, epilogue in (GEMM_EPI_KDA_GATE, GEMM_EPI_KDA_GATE_BWD), 1),
+        (aux, epilogue in (GEMM_EPI_KDA_GATE_BWD, GEMM_EPI_SIGMOID_MUL), 2),
+        (out2, epilogue == GEMM_EPI_KDA_GATE_BWD, 2),
+    ):
+        if not need:
+            epi_args.append(a_arg)
+            continue
+        assert t is not None and t.dtype == torch.float32 and t.is_contiguous()
+        if rank == 1:
+            assert t.numel() * epi_group == n and n % param.cshuffle_r2g_vec_size == 0
+            assert epi_group % param.cshuffle_r2g_vec_size == 0
+            epi_args.append(_dynamic_tensor_arg(t, 0))
+        else:
+            assert t.shape == (m, n)
+            epi_args.append(_dynamic_tensor_arg(t, 1))
     _run_compiled(
         gemm_a16w16_gfx950,
         out_arg,
@@ -1767,6 +1875,7 @@ def gemm_a16w16(
         signal,
         split_k,
         param,
+        *epi_args,
         stream,
         specialization_key=(_PARAM_ITEMS[id(param)], device),
     )

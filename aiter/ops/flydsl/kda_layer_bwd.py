@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL backward kernels of the Kimi Delta Attention layer (launch wrappers).
+"""FlyDSL kernels of the Kimi Delta Attention layer (launch wrappers).
 
-Kernels are in ``kernels/kda_layer_bwd.py``. Each wrapper takes and returns fp32
-tensors; inputs are made contiguous and flattened, which is what the compiled
-handles are specialized for.
+``l2norm_bwd`` launches the row kernel in ``kernels/kda_layer_bwd.py`` on flat
+contiguous fp32 tensors. ``kda_gate_proj``, ``kda_gate_proj_bwd`` and
+``sigmoid_gate_proj`` are the gfx950 bf16 GEMM (``gemm_a16w16``) with a fused
+epilogue; they return fp32.
 """
 
 import torch
 
 from .kernels.kda_layer_bwd import (
     WAVE,
-    create_gate_beta_bwd_kernel,
     create_l2norm_bwd_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
 
 ROW_WAVES = 4
-GATE_BLOCK = 256
 
 
 def _f32(t):
@@ -41,31 +40,74 @@ def l2norm_bwd(x, dy, eps=1e-6):
     return dx
 
 
-def gate_beta_bwd(z, A_log, dg, braw, dbeta):
-    """Backward of the F-decay gate and the beta gate.
+# The projections below use the gfx950 bf16 GEMM with an element-wise epilogue.
+# fp32 output needs the 128x128 tile to fit the C shuffle in LDS.
+_PROJ_GEMM_KWARGS = {"block_m": 128, "block_n": 128, "use_half_tile_interleaved": False}
 
-    z (= f_b(f_a(x)) + dt_bias), dg: [B, T, H, K]; A_log: [H];
-    braw (= x @ w_beta^T), dbeta: [B, T, H].
-    Returns (dz [B, T, H, K], dA_log [H], db [B, T, H]), fp32. ``dz`` is also the
-    gradient of the pre-bias projection; ``ddt_bias = dz.sum((0, 1))``.
-    """
-    H, K = z.shape[-2:]
-    n_gate, n_beta = z.numel(), braw.numel()
-    dz = torch.empty(z.shape, device=z.device, dtype=torch.float32)
-    dgg = torch.empty_like(dz)
-    db = torch.empty(braw.shape, device=z.device, dtype=torch.float32)
-    launch = create_gate_beta_bwd_kernel(H, K, GATE_BLOCK, z.device.index)
-    _run_compiled(
-        launch,
-        _f32(z),
-        _f32(A_log),
-        _f32(dg),
-        _f32(braw),
-        _f32(dbeta),
-        dz.view(-1),
-        dgg.view(-1),
-        db.view(-1),
-        n_gate,
-        n_beta,
+
+def _proj_gemm(a, w, **kw):
+    from .kernels.gemm_a16w16_gfx950 import gemm_a16w16
+
+    return gemm_a16w16(
+        a.contiguous(),
+        w.t(),
+        user_kwargs=dict(_PROJ_GEMM_KWARGS),
+        layout="nt",
+        out_dtype=torch.float32,
+        **kw,
     )
-    return dz, dgg.view(-1, H, K).sum((0, 2)), db
+
+
+def kda_gate_proj(lr, f_b, dt_bias, A_log):
+    """g = -exp(A_log[h]) * softplus(lr @ f_b^T + dt_bias), fused in the GEMM.
+
+    lr: [M, R]; f_b: [H*K, R]; dt_bias: [H*K]; A_log: [H]. Returns fp32 [M, H*K].
+    """
+    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE
+
+    dtype = f_b.dtype
+    return _proj_gemm(
+        lr.to(dtype),
+        f_b,
+        bias=dt_bias.to(dtype),
+        epilogue=GEMM_EPI_KDA_GATE,
+        epi_group=f_b.shape[0] // A_log.numel(),
+        a_log=_f32(A_log),
+    )
+
+
+def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, dg):
+    """Recompute z = lr @ f_b^T + dt_bias in the GEMM and apply the gate backward.
+
+    dg: [M, H*K]. Returns (dz, dg * g), fp32 [M, H*K]; dA_log is the per-head
+    sum of the second.
+    """
+    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_KDA_GATE_BWD
+
+    dtype = f_b.dtype
+    dgg = torch.empty(dg.shape, device=dg.device, dtype=torch.float32)
+    dz = _proj_gemm(
+        lr.to(dtype),
+        f_b,
+        bias=dt_bias.to(dtype),
+        epilogue=GEMM_EPI_KDA_GATE_BWD,
+        epi_group=f_b.shape[0] // A_log.numel(),
+        a_log=_f32(A_log),
+        aux=dg.float().contiguous(),
+        out2=dgg,
+    )
+    return dz, dgg
+
+
+def sigmoid_gate_proj(x, g_proj, aux=None):
+    """sigmoid(x @ g_proj^T), times ``aux`` (fp32 [M, N]) when given."""
+    from .kernels.gemm_a16w16_gfx950 import GEMM_EPI_SIGMOID, GEMM_EPI_SIGMOID_MUL
+
+    if aux is None:
+        return _proj_gemm(x.to(g_proj.dtype), g_proj, epilogue=GEMM_EPI_SIGMOID)
+    return _proj_gemm(
+        x.to(g_proj.dtype),
+        g_proj,
+        epilogue=GEMM_EPI_SIGMOID_MUL,
+        aux=aux.float().contiguous(),
+    )

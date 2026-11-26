@@ -13,19 +13,20 @@ One KDA layer, token-major (packed varlen is not supported yet):
     S_t     = diag(exp(g_t)) S_{t-1}
     S_t    += k_t (beta_t (v_t - S_t^T k_t))^T        # gated delta rule
     o_t     = scale * S_t^T q_t
-    o       = rmsnorm(o) * norm_w * sigmoid(g_b(g_a(x)))     # gated RMSNorm, per head
+    o       = rmsnorm(o) * norm_w * sigmoid(x @ g_proj^T)    # gated RMSNorm, per head
     y       = o @ W_o
 
 ``kda_layer_fwd`` / ``kda_layer_bwd`` are the training entry points. Backends:
 
 * ``"torch"``: chunked (WY / triangular-solve) PyTorch implementation, gradients
   from autograd. Slow; it is the reference the fused path is graded against.
-* ``"fused"``: hand-written backward. q/k L2 norm and decay/beta gates run as
-  FlyDSL kernels (``aiter.ops.flydsl.kda_layer_bwd``); gated RMSNorm goes through
-  ``register_gated_rmsnorm_bwd``; conv1d + SiLU reuses the Triton split-q/k/v
-  conv backward; projections are GEMMs; the chunk delta-rule backward goes
-  through ``register_chunk_bwd`` (which can also absorb the L2 norm and gate
-  stages). Unregistered stages fall back to PyTorch.
+* ``"fused"``: hand-written backward. The f_b and g_proj projections run as
+  gfx950 FlyDSL GEMMs with fused epilogues (decay gate fwd/bwd, sigmoid output
+  gate); the q/k L2 norm is a FlyDSL kernel (``aiter.ops.flydsl.kda_layer_bwd``);
+  gated RMSNorm goes through ``register_gated_rmsnorm_bwd``; conv1d + SiLU
+  reuses the Triton split-q/k/v conv backward; the chunk delta-rule backward
+  goes through ``register_chunk_bwd`` (which can also absorb the L2 norm and
+  gate stages). Unregistered or unsupported stages fall back to PyTorch.
 """
 
 from collections.abc import Callable
@@ -53,8 +54,7 @@ class KDALayerWeights:
     A_log: torch.Tensor  # [H]
     dt_bias: torch.Tensor  # [H*K]
     w_beta: torch.Tensor  # [H, D]
-    g_a: torch.Tensor  # [R, D]      output gate down-proj
-    g_b: torch.Tensor  # [H*V, R]    output gate up-proj
+    g_proj: torch.Tensor  # [H*V, D]    output gate proj
     norm_w: torch.Tensor  # [V]
     w_o: torch.Tensor  # [D, H*V]
 
@@ -96,7 +96,7 @@ def kda_layer_postprocess(o, x, w: KDALayerWeights, eps=1e-6):
     """Gated RMSNorm + output projection. o: [B,T,H,V] fp32."""
     B, T, H, V = o.shape
     xf = x.float()
-    gate = torch.sigmoid((xf @ w.g_a.float().t()) @ w.g_b.float().t()).view(B, T, H, V)
+    gate = torch.sigmoid(xf @ w.g_proj.float().t()).view(B, T, H, V)
     o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float() * gate
     return (o.reshape(B, T, H * V) @ w.w_o.float().t()).to(x.dtype)
 
@@ -304,6 +304,10 @@ def _flydsl_ops():
     return kda_layer_bwd
 
 
+def _row_ops(x):
+    return _flydsl_ops() if x.is_cuda else _TorchOps
+
+
 class _TorchOps:
     """Torch versions of the kernel stages: fallbacks and CPU stand-ins."""
 
@@ -314,15 +318,6 @@ class _TorchOps:
             return torch.autograd.grad(F.normalize(x, dim=-1, eps=eps), x, dy.float())[
                 0
             ]
-
-    @staticmethod
-    def gate_beta_bwd(z, A_log, dg, braw, dbeta):
-        H = z.shape[-2]
-        neg_a = -A_log.float().exp().view(H, 1)
-        dz = dg * neg_a * torch.sigmoid(z)
-        dA_log = (dg * neg_a * F.softplus(z)).reshape(-1, *z.shape[-2:]).sum((0, 2))
-        bt = torch.sigmoid(braw)
-        return dz, dA_log, dbeta * bt * (1 - bt)
 
     @staticmethod
     def gated_rmsnorm_bwd(o, gp, w, dy, eps=1e-6):
@@ -337,12 +332,51 @@ class _TorchOps:
             return torch.autograd.grad(out, [o, gp, w], dy.float())
 
 
-def _kda_layer_fused_fwd(x, w, H, chunk_size, eps, conv_graph=False, chunk_graph=False):
+class _TorchProj:
+    """Torch versions of the fused projection GEMMs (``aiter.ops.flydsl.kda_layer_bwd``)."""
+
+    @staticmethod
+    def _gate_z(lr, f_b, dt_bias, A_log):
+        z = lr.float() @ f_b.float().t() + dt_bias.float()
+        neg_a = -A_log.float().exp().repeat_interleave(f_b.shape[0] // A_log.numel())
+        return z, neg_a
+
+    @staticmethod
+    def kda_gate_proj(lr, f_b, dt_bias, A_log):
+        z, neg_a = _TorchProj._gate_z(lr, f_b, dt_bias, A_log)
+        return neg_a * F.softplus(z)
+
+    @staticmethod
+    def kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, dg):
+        z, neg_a = _TorchProj._gate_z(lr, f_b, dt_bias, A_log)
+        dg = dg.float()
+        return dg * neg_a * torch.sigmoid(z), dg * neg_a * F.softplus(z)
+
+    @staticmethod
+    def sigmoid_gate_proj(x, g_proj, aux=None):
+        out = torch.sigmoid(x.float() @ g_proj.float().t())
+        return out if aux is None else out * aux.float()
+
+
+def _proj_ops(x, w):
+    """FlyDSL GEMM-with-epilogue projections on gfx950 for 16-bit weights."""
+    if x.is_cuda and w.f_b.dtype in (torch.bfloat16, torch.float16):
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if get_gfx_runtime() == "gfx950":
+            return _flydsl_ops()
+    return _TorchProj
+
+
+def _kda_layer_fused_fwd(
+    x, w, H, chunk_size, eps, conv_graph=False, chunk_graph=False, for_backward=True
+):
     """Forward that keeps what the hand-written backward needs (fp32).
 
     ``conv_graph`` / ``chunk_graph`` record autograd graphs for the conv and
     chunk stages, so their PyTorch fallbacks differentiate the activations of
-    this pass instead of recomputing the stage.
+    this pass instead of recomputing the stage. With ``for_backward=False``
+    the output gate is fused into the g_proj GEMM and only ``y`` is meaningful.
     """
     B, T, _ = x.shape
     xf = x.float()
@@ -360,9 +394,10 @@ def _kda_layer_fused_fwd(x, w, H, chunk_size, eps, conv_graph=False, chunk_graph
     q_pre, k_pre, v = c.split([hk, hk, hv], -1)
     q_pre, k_pre, v = (t.reshape(B, T, H, -1) for t in (q_pre, k_pre, v))
     q, k = F.normalize(q_pre, dim=-1, eps=eps), F.normalize(k_pre, dim=-1, eps=eps)
+    proj = _proj_ops(x, w)
     lr = xf @ w.f_a.float().t()
-    z = (lr @ w.f_b.float().t() + w.dt_bias.float()).view(B, T, H, -1)
-    g = -w.A_log.float().exp().view(H, 1) * F.softplus(z)
+    g = proj.kda_gate_proj(lr.reshape(B * T, -1), w.f_b, w.dt_bias, w.A_log)
+    g = g.view(B, T, H, -1)
     braw = xf @ w.w_beta.float().t()
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
@@ -375,10 +410,15 @@ def _kda_layer_fused_fwd(x, w, H, chunk_size, eps, conv_graph=False, chunk_graph
             o = chunk_kda_torch(q, k, v, g, beta, scale, chunk_size)
     o_graph = o if chunk_graph else None
     o = o.detach()
-    ga = xf @ w.g_a.float().t()
-    gp = (ga @ w.g_b.float().t()).view_as(o)
-    on = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
-    on = (on * torch.sigmoid(gp)).reshape(B, T, -1)
+    normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
+    gp = None
+    if for_backward:
+        gp = (xf @ w.g_proj.float().t()).view_as(o)
+        on = (normed * torch.sigmoid(gp)).reshape(B, T, -1)
+    else:
+        aux = normed.reshape(B * T, -1)
+        on = proj.sigmoid_gate_proj(x.reshape(B * T, -1), w.g_proj, aux)
+        on = on.view(B, T, -1)
     y = (on @ w.w_o.float().t()).to(x.dtype)
     saved = {
         "xf": xf,
@@ -391,12 +431,10 @@ def _kda_layer_fused_fwd(x, w, H, chunk_size, eps, conv_graph=False, chunk_graph
         "k": k,
         "v": v,
         "lr": lr,
-        "z": z,
         "g": g,
         "braw": braw,
         "beta": beta,
         "o": o,
-        "ga": ga,
         "gp": gp,
         "on": on,
         "scale": scale,
@@ -428,11 +466,8 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
     rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
     do, dgp, d_norm = rms_bwd(s["o"], s["gp"], w.norm_w, d_on, eps)
     dgp = dgp.reshape(B * T, -1)
-    ga = s["ga"].reshape(B * T, -1)
-    d_gb = dgp.t() @ ga
-    dga = dgp @ w.g_b.float()
-    d_ga = dga.t() @ xf
-    dx = dga @ w.g_a.float()
+    d_gproj = dgp.t() @ xf
+    dx = dgp @ w.g_proj.float()
 
     if _chunk_bwd_impl is None:
 
@@ -443,14 +478,14 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
     else:
         chunk_bwd = _chunk_bwd_impl
     fuses = _chunk_bwd_fuses
-    H_, K_ = s["z"].shape[-2:]
+    lr = s["lr"].reshape(B * T, -1)
     kw = {}
     q_in, k_in, g_in, b_in = s["q"], s["k"], s["g"], s["beta"]
     if "qk_l2norm" in fuses:
         q_in, k_in = s["q_pre"], s["k_pre"]
         kw["use_qk_l2norm_in_kernel"] = True
     if "gate" in fuses:
-        g_in = s["z"] - w.dt_bias.float().view(H_, K_)
+        g_in = (lr @ w.f_b.float().t()).view_as(s["g"])
         kw.update(use_gate_in_kernel=True, A_log=w.A_log, dt_bias=w.dt_bias)
     if "beta_sigmoid" in fuses:
         b_in = s["braw"]
@@ -458,18 +493,17 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
     dq, dk, dv, dg, dbeta, dA_log, ddt = chunk_bwd(
         do, q_in, k_in, s["v"], g_in, b_in, s["scale"], chunk_size, **kw
     )
-    dz, db = dg.float(), dbeta.float()
-    if not {"gate", "beta_sigmoid"} <= fuses:
-        dz_k, dA_k, db_k = ops.gate_beta_bwd(s["z"], w.A_log, dz, s["braw"], db)
-        if "gate" not in fuses:
-            dz, dA_log = dz_k, dA_k
-        if "beta_sigmoid" not in fuses:
-            db = db_k
-    dz = dz.reshape(B * T, -1)
+    dz = dg.float().reshape(B * T, -1)
+    if "gate" not in fuses:
+        dz, dgg = _proj_ops(x, w).kda_gate_proj_bwd(lr, w.f_b, w.dt_bias, w.A_log, dz)
+        dA_log = dgg.view(-1, *s["g"].shape[-2:]).sum((0, 2))
+    db = dbeta.float()
+    if "beta_sigmoid" not in fuses:
+        db = db * s["beta"] * (1 - s["beta"])
     db = db.reshape(B * T, -1)
     if ddt is None:
         ddt = dz.sum(0)
-    d_fb = dz.t() @ s["lr"].reshape(B * T, -1)
+    d_fb = dz.t() @ lr
     dlr = dz @ w.f_b.float()
     d_fa = dlr.t() @ xf
     dx = dx + dlr @ w.f_a.float() + db @ w.w_beta.float()
@@ -503,8 +537,7 @@ def _kda_layer_fused_bwd(dy, x, w, H, chunk_size, eps, ops):
         A_log=dA_log,
         dt_bias=ddt,
         w_beta=d_wbeta,
-        g_a=d_ga,
-        g_b=d_gb,
+        g_proj=d_gproj,
         norm_w=d_norm,
         w_o=d_wo,
     )
@@ -520,7 +553,12 @@ class _KDALayerFused(torch.autograd.Function):
         ctx.save_for_backward(x, *ws)
         ctx.cfg = (num_heads, chunk_size, eps)
         y, _ = _kda_layer_fused_fwd(
-            x, KDALayerWeights.from_tensors(ws), num_heads, chunk_size, eps
+            x,
+            KDALayerWeights.from_tensors(ws),
+            num_heads,
+            chunk_size,
+            eps,
+            for_backward=False,
         )
         return y
 
@@ -528,7 +566,7 @@ class _KDALayerFused(torch.autograd.Function):
     def backward(ctx, dy):
         x, *ws = ctx.saved_tensors
         dx, dw = _kda_layer_fused_bwd(
-            dy, x, KDALayerWeights.from_tensors(ws), *ctx.cfg, _flydsl_ops()
+            dy, x, KDALayerWeights.from_tensors(ws), *ctx.cfg, _row_ops(x)
         )
         return (dx, None, None, None, *dw.tensors())
 
@@ -551,10 +589,10 @@ def kda_layer_bwd(
 
     Returns (dx, dw) where dw is a KDALayerWeights holding the gradient of every
     weight (q/k/v proj, short conv, F-decay low-rank gate + A_log/dt_bias, beta
-    proj, output gate, norm weight, output proj). The forward is recomputed.
+    proj, output gate proj, norm weight, output proj). The forward is recomputed.
     """
     if backend == "fused":
-        return _kda_layer_fused_bwd(dy, x, w, num_heads, chunk_size, eps, _flydsl_ops())
+        return _kda_layer_fused_bwd(dy, x, w, num_heads, chunk_size, eps, _row_ops(x))
     if backend != "torch":
         raise ValueError(f"unknown backend {backend!r}, expected one of {KDA_BACKENDS}")
     with torch.enable_grad():
