@@ -12,8 +12,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -165,10 +165,6 @@ def g_or_agent(addr, v):
     fx.atomic_or(gptr(addr), i32(v), syncscope="agent")
 
 
-def g_ld_i32(addr):
-    return i32(fx.generic_load(gptr(addr), dtype=fx.Int32))
-
-
 def uni(v):
     return i32(rocdl.readfirstlane(T.i32, i32(v)))
 
@@ -217,8 +213,8 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     )
 
 
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
+def dma16(lds_addr, rs, voff, soff, nt=False, aux=None):
+    _dma(lds_addr, rs, voff, soff, 16, aux if aux is not None else (2 if nt else 0))
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
@@ -367,12 +363,15 @@ def widen(v4):
 
 
 # Scaled MFMA with per-lane E8M0 scales read from LDS: no MMA-atom form.
-def mfma(a4, b4, cacc, sa, sb, b8=False):
+def mfma(a4, b4, cacc, sa, sb, b8=False, opa=0, opb=0, a8=False):
+    """opa / opb: the byte of sa / sb that holds the scale (opsel); a8: the first (weight)
+    operand MXFP8 (8 dwords, e4m3) instead of MXFP4"""
+    ax = a4 if a8 else widen(a4)
     bx = b4 if b8 else widen(b4)
     return fx.Vector(
         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             _ty(V4F),
-            [widen(a4), bx, cacc, 4, 0 if b8 else 4, 0, i32(sa), 0, i32(sb)],
+            [ax, bx, cacc, 0 if a8 else 4, 0 if b8 else 4, opa, i32(sa), opb, i32(sb)],
         )
     )
 
@@ -399,17 +398,17 @@ def alive(t0):
 
 
 @flyc.jit
-def spin_lds_ge(L, off, target):
+def spin_lds_ge(L, off, target, nap=0):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(0)
+        rocdl.s_sleep(nap)
         cur = lds_ld_acq(L, off)
 
 
 @flyc.jit
-def spin0(L, lane, off, target):
+def spin0(L, lane, off, target, nap=0):
     if lane == i32(0):
-        spin_lds_ge(L, off, target)
+        spin_lds_ge(L, off, target, nap)
     rocdl.sched_barrier(0)
 
 
@@ -484,20 +483,20 @@ def tuned_rows(path: str, key: dict, tokens_col: str) -> dict:
     return {
         int(r[tokens_col]): r
         for r in _read(path, mtime)
-        if all(r.get(k) == v for k, v in want.items())
+        if all((r.get(k) or "") == v for k, v in want.items())
     }
 
 
 def nearest(rows: dict, tokens: int, clamp: bool = False):
-    """The row of the nearest tuned count <= tokens inside [min, max] of rows; outside it
-    None, or (clamp) the row of the nearer end."""
+    """The row of tokens, else of the nearest tuned count above it (a batch between two tuned
+    ones takes the larger one's config); beyond the largest: None, or (clamp) its row.
+    """
     if not rows:
         return None
-    if not min(rows) <= tokens <= max(rows):
-        if not clamp:
-            return None
-        tokens = min(max(tokens, min(rows)), max(rows))
-    return rows[max(t for t in rows if t <= tokens)]
+    above = [t for t in rows if t >= tokens]
+    if above:
+        return rows[min(above)]
+    return rows[max(rows)] if clamp else None
 
 
 def device_key(device=None) -> dict:
@@ -508,3 +507,30 @@ def device_key(device=None) -> dict:
 
     props = torch.cuda.get_device_properties(device or torch.cuda.current_device())
     return {"gfx": get_gfx(), "cu_num": int(props.multi_processor_count)}
+
+
+# (debug) AITER_MEGAMOE_TP_TRACE_PTR: the address of a device int32 [grid, TRACE_SLOTS]
+# buffer (0: off, nothing compiled in); the small-engine kernel stores the low 32 bits of
+# s_memrealtime (100 MHz) at its phase points. The kernel name carries "_trace".
+TRACE_SLOTS = 32
+
+
+def trace_ptr() -> int:
+    return int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+
+
+def make_trace(who: int = 0):
+    """tr(tid, slot, who=who): thread who of every CTA stores now() into its trace slot"""
+    ptr = trace_ptr()
+
+    @flyc.jit
+    def _tr(tid, slot, w):
+        if tid == i32(w):
+            i = i32(gpu.block_id("x")) * i32(TRACE_SLOTS) + i32(slot)
+            g_st_sys(fx.Int64(ptr) + fx.Int64(i * i32(4)), fx.Int32(now()))
+
+    def tr(tid, slot, w=who):
+        if ptr:
+            _tr(tid, slot, w)
+
+    return tr
