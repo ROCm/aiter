@@ -1,0 +1,58 @@
+{
+    "chunk_fwd_kernel_o_opt_vk": {
+        "dispatch": [
+            {
+                "H": 48,
+                "Hg": 16,
+                "K": 128,
+                "V": 128,
+                "BT": 64,
+                "config": {
+                    "BK": 64,
+                    "BV": 128,
+                    "num_warps": 4,
+                    "num_stages": 1
+                }
+            },
+            {
+                "H": 24,
+                "Hg": 8,
+                "K": 128,
+                "V": 128,
+                "BT": 64,
+                "config": {
+                    "BK": 64,
+                    "BV": 128,
+                    "num_warps": 4,
+                    "num_stages": 1
+                }
+            },
+            {
+                "H": 12,
+                "Hg": 4,
+                "K": 128,
+                "V": 128,
+                "BT": 64,
+                "config": {
+                    "BK": 64,
+                    "BV": 128,
+                    "num_warps": 4,
+                    "num_stages": 1
+                }
+            },
+            {
+                "H": 6,
+                "Hg": 2,
+                "K": 128,
+                "V": 128,
+                "BT": 64,
+                "config": {
+                    "BK": 64,
+                    "BV": 128,
+                    "num_warps": 4,
+                    "num_stages": 1
+                }
+            }
+        ]
+    }
+}
