@@ -213,11 +213,13 @@ def test_backward_matches_fla():
         assert _err_ratio(grads[1][n], grads[0][n]) < _ERR_RATIO, n
 
 
+@pytest.mark.parametrize("T", [100, 1000])
 @pytest.mark.parametrize("state", ["none", "h0", "h0_vfirst"])
-def test_backward_flydsl_matches_triton(state):
+def test_backward_flydsl_matches_triton(state, T):
     """bwd_backend="flydsl" (FlyDSL state recurrence) agrees with the Triton backward."""
     pytest.importorskip("flydsl")
-    x, _ = _inputs(2, 1000, 96, 96, 128, 128, False, state, precomputed_gate=False)
+    # T=100 is one full chunk and a 36-token tail, as in #8739's layer test.
+    x, _ = _inputs(2, T, 96, 96, 128, 128, False, state, precomputed_gate=False)
     opts = dict(_FLASH, chunk_size=64, state_v_first=state == "h0_vfirst")
     grads = []
     for backend in ("triton", "flydsl"):
@@ -242,6 +244,9 @@ def test_chunk_bwd_contract_flydsl(l2norm, gate, sigmoid):
     )
 
     x, _ = _inputs(1, 1000, 96, 96, 128, 128, False, "none", precomputed_gate=not gate)
+    if not l2norm:
+        # Unnormalized keys make the delta rule diverge over 1000 tokens.
+        x["q"], x["k"] = (F.normalize(x[n].float(), dim=-1).bfloat16() for n in "qk")
     if not sigmoid:
         x["beta"] = torch.sigmoid(x["beta"])
     gen = torch.Generator(device="cuda").manual_seed(3)

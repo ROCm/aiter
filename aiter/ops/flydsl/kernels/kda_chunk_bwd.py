@@ -125,6 +125,15 @@ def _exp2(x):
     return fx.exp2(x, fastmath="afn")
 
 
+def _decay(x):
+    """``exp2(x)`` of a log2 gate difference, which is <= 0 for every causal pair.
+
+    Clamping keeps a masked or padded pair from overflowing to inf, which a
+    zeroed operand would turn into NaN (0 * inf).
+    """
+    return _exp2(_min(x, fx.Float32(0.0)))
+
+
 def _sigmoid(x):
     return fx.Float32(1.0) / (fx.Float32(1.0) + _exp2(-x * _LOG2E))
 
@@ -390,7 +399,7 @@ def compile_dhu(
             gpu.barrier()
 
             # dh = dh * exp2(g_last) + scale * qg^T do - w^T dv2
-            decay = _exp2(lds_ld(s_gl, kr))
+            decay = _decay(lds_ld(s_gl, kr))
             for t, st3 in range(0, BT, 1, init=[_zero()] * NE):
                 tt = fx.Int32(t)
                 q_ = lds_ld(s_qg, tt * K + kr) * scale
@@ -623,13 +632,13 @@ def compile_wy_dqkg(
             gg = ldg(g_v, rc * (H * K) + kk, fx.Float32)
             gl = ldg(g_v, last * (H * K) + kk, fx.Float32)
             kx = _sel(rv, ldg(k_v, rc * (H * K) + kk, KN), _zero())
-            ge = _exp2(gg)
+            ge = _decay(gg)
             gexp.append(ge)
             gn.append(gl)
             k_r.append(kx)
             kg_r.append(kx * ge)
             b_dq[e] = b_dq[e] * ge * scale
-            b_dk[e] = _sel(rv, b_dk[e] * _exp2(gl - gg), _zero())
+            b_dk[e] = _sel(rv, b_dk[e] * _decay(gl - gg), _zero())
             b_dw[e] = -b_dw[e]
         gpu.barrier()
         for e in range_constexpr(32):
@@ -681,7 +690,7 @@ def compile_wy_dqkg(
                 + lds_ld(s_col, 2 * K + kk)
                 + lds_ld(s_col, 3 * K + kk)
             )
-            dgk = lds_ld(s_dgk, kk) * _exp2(gn[e]) + col
+            dgk = lds_ld(s_dgk, kk) * _decay(gn[e]) + col
             qx = _sel(rv, ldg(q_v, rc * (H * K) + kk, KN), _zero())
             dgv = (
                 qx * b_dq[e]
@@ -902,13 +911,13 @@ def compile_intra(
         # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j])
         for j, st in range(0, BT, 1, init=[_zero()] * 64):
             jq = fx.Int32(j)
-            ok = jq <= r
+            ok = (jq <= r) & (jq < nvalid)
             aq = _sel(ok, lds_ld(s_aq, r * BT + jq), _zero())
             ak = _sel(ok, lds_ld(s_ak, r * BT + jq), _zero())
             acc_q, acc_k = [], []
             for e in range_constexpr(32):
                 kk = seg + 4 * e
-                ex = _exp2(_sel(ok, g_r[e] - lds_ld(s_g, jq * K + kk), _zero()))
+                ex = _decay(_sel(ok, g_r[e] - lds_ld(s_g, jq * K + kk), _zero()))
                 kx = lds_ld(s_k, jq * K + kk) * ex
                 acc_q.append(st[e] + aq * kx)
                 acc_k.append(st[32 + e] + ak * kx)
@@ -955,13 +964,14 @@ def compile_intra(
         # dkt = sum_{j >= r} (dAqk[j, r] q[j] + dAkk[j, r] beta[j] k[j]) exp2(g[j] - g[r])
         for j, st in range(0, BT, 1, init=[_zero()] * 32):
             jq = fx.Int32(j)
-            ok = jq >= r
+            # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
+            ok = (jq >= r) & (jq < nvalid)
             aq = _sel(ok, lds_ld(s_aq, jq * BT + r), _zero())
             ak = _sel(ok, lds_ld(s_ak, jq * BT + r) * lds_ld(s_b, jq), _zero())
             acc = []
             for e in range_constexpr(32):
                 kk = seg + 4 * e
-                ex = _exp2(_sel(ok, lds_ld(s_g, jq * K + kk) - g_r[e], _zero()))
+                ex = _decay(_sel(ok, lds_ld(s_g, jq * K + kk) - g_r[e], _zero()))
                 acc.append(
                     st[e]
                     + (aq * lds_ld(s_q, jq * K + kk) + ak * lds_ld(s_k, jq * K + kk))

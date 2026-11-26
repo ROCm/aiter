@@ -27,6 +27,8 @@ contract; ``CHUNK_BWD_FUSES`` names the prologues it handles in kernel.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels.kda_chunk_bwd import (
@@ -46,6 +48,22 @@ from .linear_attention_prefill_kernels import (
 )
 
 CHUNK_BWD_FUSES = frozenset({"qk_l2norm", "gate", "beta_sigmoid"})
+
+# AITER_KDA_FLYDSL_CHECK=1 synchronizes after each stage and raises on the first
+# non-finite output, naming the stage. A debugging aid, off by default.
+_CHECK = os.environ.get("AITER_KDA_FLYDSL_CHECK", "0") == "1"
+
+
+def _check(stage, **tensors):
+    if not _CHECK:
+        return
+    for name, t in tensors.items():
+        if t is not None and not torch.isfinite(t).all():
+            bad = (~torch.isfinite(t)).nonzero()
+            raise FloatingPointError(
+                f"KDA FlyDSL backward: {stage} wrote non-finite {name} "
+                f"{tuple(t.shape)}: {bad.shape[0]} entries, first at {bad[0].tolist()}"
+            )
 
 
 def kda_bwd_flydsl_supported(
@@ -188,7 +206,9 @@ def chunk_kda_bwd_flydsl_full(
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         disable_recompute=True,
     )
+    _check("fwd_prepare (Triton)", q=qn, k=kn, g=gc, w=w, u=u, qg=qg, kg=kg, Akk=Akk)
     h, v_new = kda_bwd_fwd_h_flydsl(kg, w, u, gc, initial_state, state_v_first)
+    _check("fwd_h", h=h, v_new=v_new)
     do = do.contiguous()
 
     dAqk = torch.empty(B, T, H, BT, **f32)
@@ -206,6 +226,7 @@ def chunk_kda_bwd_flydsl_full(
         B * H,
         stream,
     )
+    _check("dav", dAqk=dAqk, dv=dv)
 
     dh = q.new_empty(B, NT, H, K, V)
     dh0 = (
@@ -238,6 +259,7 @@ def chunk_kda_bwd_flydsl_full(
         B * H,
         stream,
     )
+    _check("dhu", dh=dh, dh0=dh0, dv2=dv2)
 
     dq = torch.empty(B, T, H, K, **f32)
     dk = torch.empty_like(dq)
@@ -270,6 +292,7 @@ def chunk_kda_bwd_flydsl_full(
         B * H,
         stream,
     )
+    _check("wy_dqkg", dq=dq, dk=dk, dv=dv, dg=dg, db=db, dAkk=dAkk)
 
     dq2 = torch.empty_like(q)
     dk2 = torch.empty_like(k)
@@ -309,6 +332,7 @@ def chunk_kda_bwd_flydsl_full(
         B * H,
         stream,
     )
+    _check("intra", dq=dq2, dk=dk2, dg=dg2, db=db2)
 
     use_bias = use_gate_in_kernel and dt_bias is not None
     dA_part = torch.empty(NT, B, H, K, **f32) if use_gate_in_kernel else None
@@ -331,6 +355,7 @@ def chunk_kda_bwd_flydsl_full(
         B * H,
         stream,
     )
+    _check("gate_cumsum", dg=dg_out, dA_part=dA_part, db_part=db_part)
     dA_log = dA_part.sum((0, 1, 3)).to(A_log.dtype) if use_gate_in_kernel else None
     ddt_bias = db_part.sum((0, 1)).reshape(-1).to(dt_bias.dtype) if use_bias else None
     return (
