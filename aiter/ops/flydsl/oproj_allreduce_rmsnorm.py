@@ -99,13 +99,17 @@ class OprojAllreduceRmsnorm:
         c = self._compiled
         dev = self.device
         with torch.cuda.device(dev):
-            # x in MFMA-order chunks (and, quantizing, its row scales), handed
-            # between CTAs past the caches.
+            # x in MFMA-order chunks (and, quantizing, its row scales, armed
+            # with the sentinel), handed between CTAs past the caches.
             self._xs = IpcHeap.alloc(
                 max_rows * row_k, IpcHeap._HIP_DEVICE_MALLOC_UNCACHED
             )
             self._x_scale = (
-                IpcHeap.alloc(max_rows * 4, IpcHeap._HIP_DEVICE_MALLOC_UNCACHED)
+                IpcHeap.alloc(
+                    c["x_scale_words"] * 4,
+                    IpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
+                    fill=SENTINEL_FILL_BYTE,
+                )
                 if self.quantize
                 else 0
             )
