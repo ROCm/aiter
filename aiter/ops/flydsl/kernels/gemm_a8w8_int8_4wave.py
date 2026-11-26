@@ -23,28 +23,43 @@ gfx950 serves a ds_read_b128 in four phases of 16 lanes: lane groups
 layouts give each phase 16 distinct 16-byte bank groups.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# The LLVM dialect is used only for inline assembly at instructions FlyDSL 0.4
-# cannot represent through its stable surface: M0 ownership, signed-offset LDS
-# DMA, the scheduled scale loads, K64 INT8 MFMA, and the accumulator hazard
-# boundary.
+# The LLVM dialect is used only for inline assembly where FlyDSL 0.5's stable
+# surface and LLVM's intrinsics fall short: M0 ownership, signed-offset LDS DMA
+# and the K64 INT8 MFMA.
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
-from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
-    S2RLoader,
-    StoreC,
-    _xcd_swizzle_any,
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+    make_4wave_kernel_name,
+    validate_4wave_config,
+)
+from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import S2RLoader, _xcd_swizzle_any
+from aiter.ops.flydsl.kernels.gemm_hooks import (
+    GemmHooks,
+    make_host_steps,
+    name_suffix,
+    role_block_coords,
+    validate_roles,
 )
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
+    format_kernel_name,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
+from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
+from aiter.ops.flydsl.kernels.qk_prep_epilogue import (
+    Int32Source,
+    StoreCRows,
+    mfma_drain,
+)
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -138,9 +153,11 @@ class G2SGlobal:
     four M0 changes per K tile, this one two.
 
     The loads are inline asm because LLVM asserts on the intrinsic's negative
-    LDS memory-operand offset. LLVM does not count them in vmcnt, so the K
-    loop waits for them explicitly, and the epilogue's scale loads, which
-    persistent workgroups issue before the next block's, are asm as well.
+    LDS memory-operand offset, and with non-negative offsets it cannot tell
+    the stages apart: it drains vmcnt before LDS reads that follow a load.
+    LLVM does not count the asm loads in vmcnt, so the K loop waits for them
+    explicitly, and the epilogue's scale loads, which persistent workgroups
+    issue before the next block's, are asm as well.
     M0 is written by ``set_m0`` ops, placed an MFMA slot ahead of the loads
     so the write and its hazard ``s_nop`` stay off the loads' slots. LLVM
     does not see M0 in use, so nothing else in the kernel may use it.
@@ -158,7 +175,7 @@ class G2SGlobal:
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) - self.CENTER
         wave_off = wave_id * (LOADS_PER_REGION // 2) * block_stride + self.CENTER
         # M0 is written from an SGPR, so the wave-uniform LDS address is read
-        # from lane 0. FlyDSL 0.4 exports no stable readfirstlane.
+        # from lane 0. FlyDSL 0.5 exports no stable readfirstlane.
         self.m0 = [
             fx.rocdl.readfirstlane(
                 fx.Int32.ir_type,
@@ -174,7 +191,7 @@ class G2SGlobal:
     def set_m0(self, buf):
         """Point M0 at LDS buffer ``buf`` for the ``ops`` that follow.
 
-        FlyDSL 0.4 has no stable M0 setter. Remove this boundary when a setter
+        FlyDSL 0.5 has no stable M0 setter. Remove this boundary when a setter
         with an explicit post-write hazard is exported.
         """
         _llvm.inline_asm(
@@ -186,9 +203,9 @@ class G2SGlobal:
         )
 
     def _load(self, voffset, k_offset, step):
-        # FlyDSL 0.4 cannot encode this signed LDS memory-operand offset; its
-        # intrinsic path reaches an LLVM assertion. Keep the raw instruction
-        # until signed-offset global_load_lds is supported.
+        # On this signed LDS memory-operand offset, FlyDSL 0.5's global_load_lds
+        # reaches an LLVM assertion ("Negative MachineMemOperand offset"). Keep
+        # the raw instruction until signed-offset global_load_lds is supported.
         _llvm.inline_asm(
             res=None,
             operands_=[
@@ -208,105 +225,15 @@ class G2SGlobal:
         ]
 
 
-class StoreCInt8Rows(StoreC):
-    """Scale and store the wave's INT32 accumulators as BF16 rows.
-
-    Lane ``l`` of MFMA tile (i, j) holds row ``16 i + 4 (l // 16) + r`` in
-    register ``r`` and column ``8 (l % 16) + j``, so register ``r`` of the
-    eight j tiles is one 16-byte store and 16 lanes cover a 256-byte row.
-    Preshuffled B has N % 16 == 0: a store is fully inside C or past column N.
-    """
-
-    SCALE_LOADS = WAVE_TILES + 2
-
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, *args):
-        super().__init__(A_scale, B_scale, C, c_rows, c_cols, *args)
-        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        sa_tensor = fx.rocdl.make_buffer_tensor(
-            A_scale, num_records_bytes=fx.Int64(c_rows) * 4
-        )
-        sb_tensor = fx.rocdl.make_buffer_tensor(
-            B_scale, num_records_bytes=fx.Int64(c_cols) * 4
-        )
-        self.sa_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sa_tensor))
-        self.sb_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sb_tensor))
-
-    @staticmethod
-    def _load_f32x4(rsrc, byte_offset):
-        # A stable copy atom would enter LLVM's vmcnt accounting, but these
-        # loads must be ordered beside opaque LDS-DMA loads that LLVM cannot
-        # count. Retain the scheduled raw load until both operations share one
-        # stable dependency model.
-        return _llvm.inline_asm(
-            res=fx.Vector.make_type(4, fx.Float32),
-            operands_=[fx.Int32(byte_offset).ir_value(), rsrc],
-            asm_string="buffer_load_dwordx4 $0, $1, $2, 0 offen",
-            constraints="=v,v,s",
-            has_side_effects=True,
-        )
-
-    def scale_load_ops(self, row_base, col_base):
-        """Return scheduled scale-load operations for ``store_tiles``.
-
-        The loads are asm, so LLVM leaves them out of its vmcnt waits: an LLVM
-        wait for them would also wait for the LDS-DMA loads that follow them,
-        which it cannot count. The caller waits before the stores.
-        """
-
-        def op(rsrc, element):
-            return lambda: self._load_f32x4(rsrc, element() * 4)
-
-        def row(i):
-            return row_base + (self.lane_id // 16) * 4 + i * TILE
-
-        def col(half):
-            return col_base + (self.lane_id % 16) * 8 + half * 4
-
-        return [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)] + [
-            op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)
-        ]
-
-    def _store_bf16x8(self, values, c_index):
-        fx.memref_store_vec(values, self.reg_bf16_8)
-        fx.copy(
-            self.out_atom_8,
-            self.reg_bf16_8,
-            fx.slice(self.c_div, (None, fx.Int32(c_index))),
-        )
-
-    def store_tiles(self, accs, row_base, col_base, scales):
-        """``scales`` comes from ``scale_load_ops`` and must have landed."""
-        row0 = row_base + (self.lane_id // 16) * 4
-        col = col_base + (self.lane_id % 16) * 8
-        a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
-        b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES:])
-        b_scales = Vec.from_elements(
-            [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
-        )
-        oob = fx.Int32(self.c_rows * self.c_cols)
-        col_valid = col < self.c_cols
-        for i in range_constexpr(WAVE_TILES):
-            for r in range_constexpr(4):
-                acc = Vec.from_elements(
-                    [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Int32
-                )
-                a_scale = Vec.filled(WAVE_TILES, a_scales[i][r], fx.Float32)
-                scaled = (acc.to(fx.Float32) * (a_scale * b_scales)).to(fx.BFloat16)
-                c_index = (row0 + i * TILE + r) * self.c_cols + col
-                self._store_bf16x8(scaled, col_valid.select(c_index, oob))
-
-
 def _mfma_i8(a, b, c):
     """``c is None`` starts the accumulation from an inline zero.
 
     The accumulators are pinned to AGPRs like hipBLASLt's: with the LLVM
     intrinsic, the allocator keeps them in VGPRs and the operands in AGPRs,
-    leaving too few VGPRs and adding accumulator copies inside the loop.
-    FlyDSL 0.4 has no gfx950 K64 INT8 MMA atom. LLVM does not see this as an
-    MFMA, so ``_mfma_drain`` must separate the last one from any read of its
-    result outside another MFMA. Remove both boundaries together once a stable
-    K64 atom is available.
+    leaving too few VGPRs, so it spills and adds accumulator copies inside the
+    loop. LLVM does not see this as an MFMA, so ``mfma_drain`` must separate
+    the last one from any read of its result outside another MFMA. Remove both
+    boundaries together once the intrinsic keeps the accumulators in AGPRs.
     """
     res_t = fx.Vector.make_type(4, fx.Int32)
     operands = [Vec(a).ir_value(), Vec(b).ir_value()]
@@ -324,63 +251,92 @@ def _mfma_i8(a, b, c):
     )
 
 
-def _mfma_drain(accs):
-    """Return ``accs`` readable after the XDL-write -> v_accvgpr_read wait states.
-
-    LLVM copies an accumulator out of its AGPRs right at the defining asm, so
-    each one passes through an empty asm placed after the nops. This is paired
-    with the opaque K64 MFMA above and is removable only with that boundary.
-    """
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_nop 7\ns_nop 7\ns_nop 7",
-        constraints="",
-        has_side_effects=True,
-    )
-    return [
-        [
-            _llvm.inline_asm(
-                res=Vec(acc).ir_value().type,
-                operands_=[Vec(acc).ir_value()],
-                asm_string="",
-                constraints="=a,0",
-                has_side_effects=True,
-            )
-            for acc in row
-        ]
-        for row in accs
-    ]
-
-
+@functools.cache
 def compile_int8_gemm_4w(
     *,
     K: int,
     xcd_swizzle: int = 8,
     num_cu: int = 0,
     num_xcds: int | None = None,
+    bias: bool = False,
+    prep: PrepSpec | None = None,
+    amax: bool = False,
+    roles: int = 1,
+    role_cols: int = 0,
+    hooks: GemmHooks | None = None,
+    col_amax_offset: int | None = None,
 ):
-    """``num_cu > 0`` makes the kernel persistent over that many workgroups.
+    """Compile, once per configuration, the launcher of one 4-wave INT8 kernel.
+
+    ``num_cu > 0`` makes the kernel persistent over that many workgroups.
+
+    ``bias`` adds a per-column FP32 bias in the epilogue. The column operand then holds
+    the N column scales followed by the N biases.
+
+    ``prep``, a ``PrepSpec``, applies a Q/K prep in the epilogue; its ``bias`` replaces
+    ``bias``. The column operand then also holds the spec's column vectors after the
+    scales and biases (``PrepSpec.pack_columns``). The launcher takes the spec's FP32
+    tables (``PrepSpec.pack_tables``) and writes FP32 ``[2, M, N // 128]``: the row-factor
+    op's per-head partials, then per-head maxima of the stored output. With a row-factor
+    op the caller scales each row by the op's factor of the sum of the row's partials. All
+    three are flat: FlyDSL indexes a 2-D tensor argument column-major. N is a multiple of
+    128, one head per 128 columns.
+
+    ``amax`` (without ``prep``) writes the same ``[2, M, N // 128]`` buffer but only its
+    maxima half, for a projection the consumer quantizes as it is, such as V.
+
+    ``roles > 1`` (with ``prep``, ``hooks`` and ``num_cu``) runs a fused weight of ``roles``
+    blocks of ``role_cols`` columns, Q/K/V for 3, and stores C planar,
+    ``[roles, M, role_cols]``. The prep applies to every role but the last. ``hooks`` are
+    ``GemmHooks``, code run inside the GEMM under the contract in ``gemm_hooks``, and
+    ``aux`` starts with the block counters. ``col_amax_offset`` makes the last role's
+    epilogue also write FP32 ``[ceil(M / 128), role_cols]`` per-column maxima of its stored
+    output to ``aux`` plus that many bytes, one row per 128 rows of C; they land before
+    the block is counted.
 
     A persistent workgroup loads the first two K tiles of its next output
     block during the last two of the current one, so the next block's K loop
     starts while the epilogue runs. That needs an even number of K tiles, so
     the next block's first tile lands in LDS buffer 0; otherwise each
     workgroup takes one block.
+
+    The launcher takes ``(A, B_T, C, A_scale, Columns, c_m, c_n, stream)``; with a prep
+    or ``amax`` also ``Tables`` and ``Partials`` after ``Columns`` (any tensor serves as
+    tables without them), and with ``roles > 1`` also ``aux`` and the hooks' six Int64
+    values after ``Partials``. The plain launcher takes no placeholders for them: every
+    tensor argument adds host time to each op call.
     """
-    assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
+    if prep is not None and not isinstance(prep, PrepSpec):
+        raise TypeError(f"prep must be a PrepSpec or None, got {prep!r}")
+    if prep is not None and bias and not prep.bias:
+        raise ValueError("bias=True conflicts with a PrepSpec without bias")
+    if prep is not None and amax:
+        raise ValueError("amax is for an output without a prep, which writes its own")
+    if prep is not None:
+        bias = prep.bias
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
     num_xcds = int(num_xcds)
-    if num_xcds <= 0 or num_xcds > 8:
-        raise ValueError(f"num_xcds must be in [1, 8], got {num_xcds}")
+    validate_4wave_config(
+        K=K, xcd_swizzle=xcd_swizzle, num_cu=num_cu, num_xcds=num_xcds
+    )
+    validate_roles(
+        roles=roles,
+        role_cols=role_cols,
+        block_n=BLOCK_N,
+        hooks=hooks,
+        prep=prep,
+        num_cu=num_cu,
+        num_xcds=num_xcds,
+        xcd_swizzle=xcd_swizzle,
+        col_amax_offset=col_amax_offset,
+    )
     K_ITERS = K // BLOCK_K
     B_K_STEP = 16 * BLOCK_K  # bytes per K128 tile inside a preshuffled 16-row strip
     HALF = WAVE_TILES // 2
-    if num_cu > 0 and K_ITERS % 2:
-        raise ValueError(f"persistent mode requires an even K128 tile count, got K={K}")
     persistent = num_cu > 0
-    assert not persistent or num_cu == num_xcds * 32
+    if roles > 1:
+        after_block, end_role = make_host_steps(hooks)
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -421,19 +377,26 @@ def compile_int8_gemm_4w(
     # the next block's LDS-DMA loads, and add to that tile's phase 3 wait.
     # Tile K_ITERS - 1's phase 3 wait, or with no next block tile
     # K_ITERS - 2's wait for everything, then covers them.
-    SCALE_LOADS = StoreCInt8Rows.SCALE_LOADS
-    assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
+    assert P3_VMCNT_TILE0 + StoreCRows.load_count(Int32Source, bias, prep) <= 63
     # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
     # before the phase's barrier. Phase 2's A loads do not count against that
     # wait and run to the end of the phase.
     P1_READS_END = len(PHASE_MFMAS[0]) - 6
     P2_READS_END = len(PHASE_MFMAS[1]) - 6
 
-    _kname = (
-        f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_I8_I8_B16_"
-        f"1x{xcd_swizzle}_k{K}"
-        + (f"_p{num_cu}" if persistent else "")
-        + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
+    _kname = format_kernel_name(
+        make_4wave_kernel_name(
+            K=K, xcd_swizzle=xcd_swizzle, num_cu=num_cu, num_xcds=num_xcds
+        )
+        + ("_bias" if bias else "")
+        + ("_prep" + prep.suffix if prep is not None else "")
+        + ("_amax" if amax else "")
+        + name_suffix(
+            roles=roles,
+            role_cols=role_cols,
+            hooks=hooks,
+            col_amax_offset=col_amax_offset,
+        )
     )
 
     @fx.struct
@@ -449,9 +412,18 @@ def compile_int8_gemm_4w(
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
+        Tables: fx.Tensor,
+        Partials: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
+        aux: fx.Int64,
+        h0: fx.Int64,
+        h1: fx.Int64,
+        h2: fx.Int64,
+        h3: fx.Int64,
+        h4: fx.Int64,
+        h5: fx.Int64,
     ):
         m_blocks = ceildiv(c_m, BLOCK_M)
         n_blocks = ceildiv(c_n, BLOCK_N)
@@ -466,7 +438,17 @@ def compile_int8_gemm_4w(
         wave_m = wave_id // 2
         wave_n = wave_id % 2
 
-        def block_coords(block):
+        def block_coords(block, role=0):
+            if const_expr(roles > 1):
+                return role_block_coords(
+                    block,
+                    role,
+                    m_blocks=m_blocks,
+                    role_cols=role_cols,
+                    block_n=BLOCK_N,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
+                )
             # A persistent grid is a multiple of num_xcds workgroups or
             # covers all blocks, so block b stays on its workgroup's XCD.
             if const_expr(xcd_swizzle > 0):
@@ -620,7 +602,7 @@ def compile_int8_gemm_4w(
             ``wait`` (vmcnt, lgkmcnt) goes before the last MFMA so the MFMA
             pipe stays busy while the following barrier resolves.
             ``sched_barrier(0)`` keeps LLVM from moving any op off its slot;
-            FlyDSL 0.4 does not export it as a stable API.
+            FlyDSL 0.5 does not export it as a stable API.
             """
             for idx, (i, j, kk) in enumerate(mfmas):
                 if const_expr(wait is not None and idx == len(mfmas) - 1):
@@ -736,7 +718,7 @@ def compile_int8_gemm_4w(
             # The stable fx.barrier is gpu.barrier, which also makes prior
             # memory accesses visible and so would wait for the LDS-DMA loads
             # this schedule keeps in flight across barriers. The bare
-            # s_barrier is not a stable FlyDSL 0.4 export.
+            # s_barrier is not a stable FlyDSL 0.5 export.
             fx.rocdl.s_barrier()
             p2_placed = spread(b_hi_reads, 0, P2_READS_END)
             p2_placed += spread(p2_loads, 1, len(PHASE_MFMAS[1]) - 1)
@@ -877,230 +859,174 @@ def compile_int8_gemm_4w(
             a_values, b_values = unpack_lo_state(values, a_values, b_values)
             return acc_values, a_values, b_values
 
-        store_c = StoreCInt8Rows(
-            A_scale, B_scale, C, c_m, c_n, None, WAVE_TILES, WAVE_TILES
+        store_c = StoreCRows(
+            Int32Source(A_scale, c_m),
+            Columns,
+            C,
+            c_m,
+            c_n,
+            bias=bias,
+            prep=prep,
+            tables=Tables,
+            partials=Partials,
+            amax=amax,
+            planar_cols=role_cols if roles > 1 else 0,
         )
 
-        # Prologue: the first block's K tiles 0 and 1 in flight, wait for
-        # tile 0, read its lo operands. Tile 0's phase 3 wait in a persistent
-        # workgroup counts on an epilogue before it, so the first block also
-        # waits for tile 1 here.
-        block0 = fx.Int32(fx.block_idx.x)
-        coords = list(block_coords(block0))
-        voffsets = ([], [])
-        for _, operand, emit in voffset_ops():
-            voffsets[operand].append(emit(coords))
-        for t in range_constexpr(2):
-            a_loads, b_loads = tile_loads(voffsets, t)
-            for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
-                g2s.set_m0(t)
-                for op in loads:
-                    op()
-        fx.rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
-        fx.rocdl.s_barrier()
-        for read in lo_reads(0):
-            a_ops, b_ops = apply_read(a_ops, b_ops, read)
+        for role in range_constexpr(roles):
+            if const_expr(roles > 1):
+                block_end = m_blocks * (role_cols // BLOCK_N)
+            else:
+                block_end = num_blocks
+            # Prologue: the first block's K tiles 0 and 1 in flight, wait for
+            # tile 0, read its lo operands. Tile 0's phase 3 wait in a persistent
+            # workgroup counts on an epilogue before it, so the first block also
+            # waits for tile 1 here.
+            block0 = fx.Int32(fx.block_idx.x)
+            coords = list(block_coords(block0, role))
+            voffsets = ([], [])
+            for _, operand, emit in voffset_ops():
+                voffsets[operand].append(emit(coords))
+            for t in range_constexpr(2):
+                a_loads, b_loads = tile_loads(voffsets, t)
+                for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
+                    g2s.set_m0(t)
+                    for op in loads:
+                        op()
+            fx.rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
+            fx.rocdl.s_barrier()
+            for read in lo_reads(0):
+                a_ops, b_ops = apply_read(a_ops, b_ops, read)
 
-        # Values live across an output block boundary: its coordinates and
-        # offsets, and the lo operands of its first K tile.
-        def block_state(coord_values, offset_values, a_values, b_values):
-            return (
-                coord_values
-                + offset_values[0]
-                + offset_values[1]
-                + lo_state(a_values, b_values)
-            )
+            # Values live across an output block boundary: its coordinates and
+            # offsets, and the lo operands of its first K tile.
+            def block_state(coord_values, offset_values, a_values, b_values):
+                return (
+                    coord_values
+                    + offset_values[0]
+                    + offset_values[1]
+                    + lo_state(a_values, b_values)
+                )
 
-        def unpack_block_state(values, a_values, b_values):
-            values = list(values)
-            coord_values = [values.pop(0) for _ in range(2)]
-            offset_values = (
-                [values.pop(0) for _ in range(LOADS_PER_REGION)],
-                [values.pop(0) for _ in range(LOADS_PER_REGION)],
-            )
-            a_values, b_values = unpack_lo_state(values, a_values, b_values)
-            return coord_values, offset_values, a_values, b_values
+            def unpack_block_state(values, a_values, b_values):
+                values = list(values)
+                coord_values = [values.pop(0) for _ in range(2)]
+                offset_values = (
+                    [values.pop(0) for _ in range(LOADS_PER_REGION)],
+                    [values.pop(0) for _ in range(LOADS_PER_REGION)],
+                )
+                a_values, b_values = unpack_lo_state(values, a_values, b_values)
+                return coord_values, offset_values, a_values, b_values
 
-        def static_tile(
-            acc_values,
-            a_values,
-            b_values,
-            scale_values,
-            next_coord_values,
-            next_offset_values,
-            t,
-            next_voffsets,
-            next_ops,
-            scale_ops,
-        ):
-            """K tile ``t`` of a block, outside the runtime K loop.
-
-            The last two refill from the next block at ``next_voffsets``;
-            tile 0 spreads ``next_ops`` over phase 3 and tile K_ITERS - 2
-            issues ``scale_ops``.
-            """
-            refill = None
-            if const_expr(t + 2 < K_ITERS):
-                refill = (voffsets, t + 2)
-            elif const_expr(persistent):
-                refill = (next_voffsets, t + 2 - K_ITERS)
-            p3_vmcnt = P3_VMCNT_TILE0 if t == 0 else P3_VMCNT
-            p1_ops = []
-            if const_expr(t == K_ITERS - 2):
-                p1_ops = scale_ops
-                p3_vmcnt += SCALE_LOADS
-            has_next = t + 1 < K_ITERS or persistent
-            p3_ops = next_ops if t == 0 else ()
-            return k_tile(
+            def static_tile(
                 acc_values,
                 a_values,
                 b_values,
                 scale_values,
                 next_coord_values,
                 next_offset_values,
-                t % 2,
-                refill,
-                has_next,
-                p3_vmcnt,
-                p1_ops,
-                p3_ops,
-            )
-
-        n_pairs = max(0, (K_ITERS - 4) // 2)
-        grid = fx.Int32(fx.grid_dim.x)
-        for block, bstate in range(
-            block0,
-            num_blocks,
-            grid,
-            init=block_state(coords, voffsets, a_ops, b_ops),
-        ):
-            coords, voffsets, a_ops, b_ops = unpack_block_state(bstate, a_ops, b_ops)
-            accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
-
-            # The next block's coordinates and offsets, computed during tile
-            # 0's phase 3 unless tile 0 already loads that block. The last
-            # block reloads itself; nothing reads those loads.
-            next_coords, next_voffsets, next_ops = [], ([], []), []
-            scales = []
-            if const_expr(persistent):
-                this_block = fx.Int32(block)
-
-                def next_coords_op(this_block=this_block):
-                    nxt = this_block + grid
-                    nxt = (nxt < num_blocks).select(nxt, this_block)
-                    return list(block_coords(nxt))
-
-                next_ops = [("coords", next_coords_op)] + voffset_ops()
-                if const_expr(K_ITERS == 2):
-                    for op in next_ops:
-                        (
-                            a_ops,
-                            b_ops,
-                            scales,
-                            next_coords,
-                            next_voffsets,
-                        ) = apply_scheduled_op(
-                            a_ops,
-                            b_ops,
-                            scales,
-                            next_coords,
-                            next_voffsets,
-                            op,
-                        )
-                    next_ops = []
-
-            row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
-            col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
-            scale_ops = [
-                ("scale", op) for op in store_c.scale_load_ops(row_base, col_base)
-            ]
-            # Tiles 0 and 1 start the accumulators. A runtime loop then takes
-            # the tiles that refill from this block, two per trip so the
-            # buffer parity is static; a fully unrolled K loop overflows the
-            # instruction cache.
-            (
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-            ) = static_tile(
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-                0,
+                t,
                 next_voffsets,
                 next_ops,
                 scale_ops,
-            )
-            (
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-            ) = static_tile(
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-                1,
-                next_voffsets,
-                next_ops,
-                scale_ops,
-            )
-            if const_expr(n_pairs > 0):
-                for pair, state in range(
-                    0, n_pairs, 1, init=live_state(accs, a_ops, b_ops)
-                ):
-                    accs, a_ops, b_ops = unpack_state(state, a_ops, b_ops)
-                    t0 = fx.Int32(pair) * 2 + 2
-                    (
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                    ) = k_tile(
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                        0,
-                        (voffsets, t0 + 2),
-                        True,
-                    )
-                    (
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                    ) = k_tile(
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                        1,
-                        (voffsets, t0 + 3),
-                        True,
-                    )
-                    results = yield live_state(accs, a_ops, b_ops)
-                accs, a_ops, b_ops = unpack_state(results, a_ops, b_ops)
-            for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
+            ):
+                """K tile ``t`` of a block, outside the runtime K loop.
+
+                The last two refill from the next block at ``next_voffsets``;
+                tile 0 spreads ``next_ops`` over phase 3 and tile K_ITERS - 2
+                issues ``scale_ops``.
+                """
+                refill = None
+                if const_expr(t + 2 < K_ITERS):
+                    # The current block's offsets, read when the tile is traced.
+                    refill = (voffsets, t + 2)  # noqa: B023
+                elif const_expr(persistent):
+                    refill = (next_voffsets, t + 2 - K_ITERS)
+                p3_vmcnt = P3_VMCNT_TILE0 if t == 0 else P3_VMCNT
+                p1_ops = []
+                if const_expr(t == K_ITERS - 2):
+                    p1_ops = scale_ops
+                    p3_vmcnt += len(scale_ops)
+                has_next = t + 1 < K_ITERS or persistent
+                p3_ops = next_ops if t == 0 else ()
+                return k_tile(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    t % 2,
+                    refill,
+                    has_next,
+                    p3_vmcnt,
+                    p1_ops,
+                    p3_ops,
+                )
+
+            n_pairs = max(0, (K_ITERS - 4) // 2)
+            if const_expr(roles > 1):
+                grid = fx.Int32(num_cu)
+            else:
+                grid = fx.Int32(fx.grid_dim.x)
+            for block, bstate in range(
+                block0,
+                block_end,
+                grid,
+                init=block_state(coords, voffsets, a_ops, b_ops),
+            ):
+                coords, voffsets, a_ops, b_ops = unpack_block_state(
+                    bstate, a_ops, b_ops
+                )
+                accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
+
+                # The next block's coordinates and offsets, computed during tile
+                # 0's phase 3 unless tile 0 already loads that block. The last
+                # block reloads itself; nothing reads those loads.
+                next_coords, next_voffsets, next_ops = [], ([], []), []
+                scales = []
+                if const_expr(persistent):
+                    this_block = fx.Int32(block)
+
+                    def next_coords_op(
+                        this_block=this_block, grid=grid, block_end=block_end, role=role
+                    ):
+                        nxt = this_block + grid
+                        nxt = (nxt < block_end).select(nxt, this_block)
+                        return list(block_coords(nxt, role))
+
+                    next_ops = [("coords", next_coords_op)] + voffset_ops()
+                    if const_expr(K_ITERS == 2):
+                        for op in next_ops:
+                            (
+                                a_ops,
+                                b_ops,
+                                scales,
+                                next_coords,
+                                next_voffsets,
+                            ) = apply_scheduled_op(
+                                a_ops,
+                                b_ops,
+                                scales,
+                                next_coords,
+                                next_voffsets,
+                                op,
+                            )
+                        next_ops = []
+
+                # The wave's tile of the block; WaveTile maps its lanes.
+                tile = store_c.tile(
+                    coords[0] * BLOCK_M + wave_m * WAVE_ROWS,
+                    coords[1] * BLOCK_N + wave_n * WAVE_ROWS,
+                )
+                # In a roles kernel the last role applies no prep and loads none of its
+                # column vectors.
+                apply_prep = role < roles - 1 if roles > 1 else None
+                scale_ops = [("scale", op) for op in store_c.load_ops(tile, apply_prep)]
+                # Tiles 0 and 1 start the accumulators. A runtime loop then takes
+                # the tiles that refill from this block, two per trip so the
+                # buffer parity is static; a fully unrolled K loop overflows the
+                # instruction cache.
                 (
                     accs,
                     a_ops,
@@ -1115,24 +1041,138 @@ def compile_int8_gemm_4w(
                     scales,
                     next_coords,
                     next_voffsets,
-                    t,
+                    0,
                     next_voffsets,
                     next_ops,
                     scale_ops,
                 )
-
-            store_c.store_tiles(_mfma_drain(accs), row_base, col_base, scales)
-            if const_expr(persistent):
-                coords = list(next_coords)
-                voffsets = (
-                    list(next_voffsets[0]),
-                    list(next_voffsets[1]),
+                (
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                ) = static_tile(
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                    1,
+                    next_voffsets,
+                    next_ops,
+                    scale_ops,
                 )
-            _ = yield block_state(coords, voffsets, a_ops, b_ops)
+                if const_expr(n_pairs > 0):
+                    for pair, state in range(
+                        0, n_pairs, 1, init=live_state(accs, a_ops, b_ops)
+                    ):
+                        accs, a_ops, b_ops = unpack_state(state, a_ops, b_ops)
+                        t0 = fx.Int32(pair) * 2 + 2
+                        (
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                        ) = k_tile(
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                            0,
+                            (voffsets, t0 + 2),
+                            True,
+                        )
+                        (
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                        ) = k_tile(
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                            1,
+                            (voffsets, t0 + 3),
+                            True,
+                        )
+                        results = yield live_state(accs, a_ops, b_ops)
+                    accs, a_ops, b_ops = unpack_state(results, a_ops, b_ops)
+                for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
+                    (
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                    ) = static_tile(
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                        t,
+                        next_voffsets,
+                        next_ops,
+                        scale_ops,
+                    )
 
+                if const_expr(roles > 1):
+                    col_max = None
+                    if const_expr(col_amax_offset is not None and role == roles - 1):
+                        col_max = aux + col_amax_offset
+                    store_c.store_tiles(
+                        mfma_drain(accs), tile, scales, apply_prep, col_max=col_max
+                    )
+                    after_block(
+                        role,
+                        aux,
+                        (h0, h1, h2, h3, h4, h5),
+                        c_m,
+                        tile.row_base,
+                        tile.col_base,
+                        block,
+                        block0,
+                    )
+                else:
+                    store_c.store_tiles(mfma_drain(accs), tile, scales)
+                if const_expr(persistent):
+                    coords = list(next_coords)
+                    voffsets = (
+                        list(next_voffsets[0]),
+                        list(next_voffsets[1]),
+                    )
+                _ = yield block_state(coords, voffsets, a_ops, b_ops)
+
+            if const_expr(persistent):
+                # LDS-DMA must not land in LDS that a later workgroup owns.
+                fx.rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(roles > 1):
+                end_role(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
+
+    value_attrs = {
+        "rocdl.waves_per_eu": 1,
+        "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
+    }
+
+    def grid_size(c_m, c_n):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         if const_expr(persistent):
-            # LDS-DMA must not land in LDS that a later workgroup owns.
-            fx.rocdl.s_waitcnt(vmcnt=0)
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        return grid_x
 
     @flyc.jit
     def launch_gemm(
@@ -1140,26 +1180,111 @@ def compile_int8_gemm_4w(
         B_T: fx.Tensor,
         C: fx.Tensor,
         A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
+        Columns: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
-        if const_expr(persistent):
-            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        grid_x = grid_size(c_m, c_n)
+        # Without a prep or maxima the kernel reads neither tables nor partials.
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
-            B_scale,
+            Columns,
+            A_scale,
+            A_scale,
             c_m,
             c_n,
-            value_attrs={
-                "rocdl.waves_per_eu": 1,
-                "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
-            },
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
-    return set_slp_vectorize_once_used(launch_gemm, False)
+    @flyc.jit
+    def launch_gemm_epilogue(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        Columns: fx.Tensor,
+        Tables: fx.Tensor,
+        Partials: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        grid_x = grid_size(c_m, c_n)
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            Columns,
+            Tables,
+            Partials,
+            c_m,
+            c_n,
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
+        ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    @flyc.jit
+    def launch_gemm_roles(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        Columns: fx.Tensor,
+        Tables: fx.Tensor,
+        Partials: fx.Tensor,
+        aux: fx.Int64,
+        h0: fx.Int64,
+        h1: fx.Int64,
+        h2: fx.Int64,
+        h3: fx.Int64,
+        h4: fx.Int64,
+        h5: fx.Int64,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            Columns,
+            Tables,
+            Partials,
+            c_m,
+            c_n,
+            aux,
+            h0,
+            h1,
+            h2,
+            h3,
+            h4,
+            h5,
+            value_attrs=value_attrs,
+        ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    if roles > 1:
+        launcher = launch_gemm_roles
+    elif prep is not None or amax:
+        launcher = launch_gemm_epilogue
+    else:
+        launcher = launch_gemm
+    return set_slp_vectorize_once_used(launcher, False)

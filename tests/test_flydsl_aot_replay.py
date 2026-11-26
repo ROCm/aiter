@@ -503,7 +503,8 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
     run_4wave = four_wave.run_gemm_a8w8_bpreshuffle_4wave
 
     def record(*args, **kwargs):
-        launched.append(args[5])
+        bias = args[6] if len(args) > 6 else kwargs.get("bias")
+        launched.append((args[5], bias is not None))
         return run_4wave(*args, **kwargs)
 
     monkeypatch.setattr(four_wave, "run_gemm_a8w8_bpreshuffle_4wave", record)
@@ -517,4 +518,7 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
                 assert kernels, job
     finally:
         gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
-    assert launched == [job["kernel_name"] for job in jobs]
+    # Each INT8 row packages its kernel without and with a fused bias.
+    assert launched == [
+        (job["kernel_name"], bias) for job in jobs for bias in (False, True)
+    ]
