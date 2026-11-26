@@ -2726,6 +2726,7 @@ def fused_moe_1stage(
 cfg_2stages = None
 cfg_2stages_by_file = {}
 cfg_2stages_by_limit_tag = {}
+cfg_2stages_stage2_fp8 = None
 
 # Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
 # SiLU and GELU are the same length, so swapping the tag keeps the mangled
@@ -4624,7 +4625,7 @@ def get_2stage_cfgs(
             tune_file, _INDEX_COLS, config_file is not None, tag
         )
 
-    global cfg_2stages
+    global cfg_2stages, cfg_2stages_stage2_fp8
     tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     config_path = os.path.dirname(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
@@ -4699,10 +4700,12 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def _lookup_cfg(c2s):
+        """Return the row for `keys` and the token tier of that row."""
         if not c2s:
-            return None
+            return None, None
         primary, fallback = c2s
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        tier = token
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
@@ -4710,6 +4713,7 @@ def get_2stage_cfgs(
         if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                tier = fallback_tier
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
@@ -4720,9 +4724,9 @@ def get_2stage_cfgs(
                     result = fallback.get(keys_fb_disabled, None)
                 if result is not None:
                     break
-        return result
+        return result, tier
 
-    cfg = _lookup_cfg(active_cfg_2stages)
+    cfg, cfg_tier = _lookup_cfg(active_cfg_2stages)
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
@@ -4737,7 +4741,7 @@ def get_2stage_cfgs(
         if limit_cfgs is None:
             limit_cfgs = get_cfg_2stages(limit_tune_file, tag=limit_tag)
             cfg_2stages_by_limit_tag[(limit_tune_file, limit_tag)] = limit_cfgs
-        limit_cfg = _lookup_cfg(limit_cfgs)
+        limit_cfg, _ = _lookup_cfg(limit_cfgs)
         if limit_cfg is not None:
             if (
                 limit_cfg.get("run_1stage", False)
@@ -4754,6 +4758,23 @@ def get_2stage_cfgs(
             logger.info(
                 f"[fused_moe] no row for {keys} with {limit_tag}; using default config"
             )
+    if config_file is None and not limit_tag and _flydsl_stage2_fp8_enabled():
+        # Rows that are fastest when stage 2 writes FP8 route rows, e.g. a
+        # FlyDSL `reduce` row for a shape whose main row is a one-stage kernel.
+        if cfg_2stages_stage2_fp8 is None:
+            # Exact act_type only: through the act_type-agnostic dict, a Silu row
+            # would replace the main row of another activation.
+            cfg_2stages_stage2_fp8 = (
+                get_cfg_2stages(AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE)[0],
+                {},
+            )
+        fp8_cfg, fp8_tier = _lookup_cfg(cfg_2stages_stage2_fp8)
+        # A row of a smaller token tier does not replace a row of this tier.
+        if fp8_cfg is not None and (cfg is None or fp8_tier >= cfg_tier):
+            logger.info(
+                f"[fused_moe] AITER_FLYDSL_STAGE2_FP8=1: using the stage2 FP8 row for {keys}"
+            )
+            cfg = fp8_cfg
     if (
         cfg is None
         and config_file is None
@@ -4763,7 +4784,7 @@ def get_2stage_cfgs(
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = _lookup_cfg(cfg_2stages)
+        cfg, _ = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
 

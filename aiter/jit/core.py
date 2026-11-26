@@ -168,6 +168,11 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_STAGE2_FP8 = os.getenv(
+    "AITER_CONFIG_FMOE_STAGE2_FP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_stage2_fp8_fmoe.csv",
+)
+
 # NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
 AITER_CONFIG_MOE_NVFP4 = os.getenv(
     "AITER_CONFIG_MOE_NVFP4",
@@ -406,6 +411,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
             AITER_CONFIG_FMOE_SWIGLU_LIMIT,
             "tuned_swiglu_limit_fmoe",
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_STAGE2_FP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_STAGE2_FP8",
+            AITER_CONFIG_FMOE_STAGE2_FP8,
+            "tuned_stage2_fp8_fmoe",
         )
 
     @property
