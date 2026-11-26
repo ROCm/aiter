@@ -269,13 +269,15 @@ def _pad_to(x, dim, mult):
     return F.pad(x, widths)
 
 
-def _rows_triton(x2, dequant=None, round_bf16=False):
+def _rows_triton(x2, dequant=None, round_bf16=False, preshuffle=False):
     """TE-mode Triton cast of a 2-D tensor (any strides) along its last dim.
 
     Returns ``(y, scale)`` sliced from the kernel's 64x64-padded outputs:
     ``y`` fp8, or the dequantized values in ``dequant``; ``scale`` uint8 with
     one column per (zero-padded) block of 32. ``round_bf16`` quantizes the
-    bf16 rounding of an fp32 ``x2``.
+    bf16 rounding of an fp32 ``x2``. ``preshuffle`` returns the fp8 data as
+    ``shuffle_weight(q, layout=(16, 16))`` (rows a multiple of 16, the last dim
+    of 64).
     """
     from aiter.ops.triton.quant.quant_mxfp8 import convert_to_mxfp8
 
@@ -287,8 +289,22 @@ def _rows_triton(x2, dequant=None, round_bf16=False):
         scale_mode="te",
         dequant_dtype=dequant,
         round_input_bf16=round_bf16 and xp.dtype == torch.float32,
+        preshuffle=preshuffle,
     )
-    return y[:rows, :n], s[:rows, : -(-n // MXFP8_BLOCK)]
+    s = s[:rows, : -(-n // MXFP8_BLOCK)]
+    if preshuffle:
+        if rows % 16 or n % 64:
+            raise ValueError(f"preshuffled rows need [16k, 64j], got {x2.shape}")
+        # whole 16-row tiles: the first rows of the padded output, in order
+        q = y.view(-1)[: rows * n].view(rows, n)
+        for attr in (
+            "is_shuffled",
+            "aiter_shuffle_layout",
+            "aiter_shuffle_is_guinterleave",
+        ):
+            setattr(q, attr, getattr(y, attr))
+        return q, s
+    return y[:rows, :n], s
 
 
 def _qdq_triton(x, dim, dtype, round_bf16=False):
@@ -390,7 +406,26 @@ def _native_mm(a, b, anchors=None, round_bf16=False):
         return aq.view(dtypes.fp8), a_s.view(dtypes.fp8_e8m0)
 
     def quant_b():
-        bq, b_s = _quant_rows(_pad_to(_pad_to(b.t(), 1, 128), 0, 16), round_bf16)
+        bt = _pad_to(_pad_to(b.t(), 1, 128), 0, 16)
+        if (
+            mxfp8_fastpath()
+            and bt.is_cuda
+            and bt.dtype
+            in (
+                torch.float32,
+                torch.bfloat16,
+            )
+        ):
+            try:
+                # cast and shuffle in one pass
+                bq, b_s = _rows_triton(bt, round_bf16=round_bf16, preshuffle=True)
+                LAST_IMPLS["quant:triton_te_preshuffled"] += 1
+                if bq.dtype != dtypes.fp8:
+                    bq = bq.view(dtypes.fp8)
+                return bq, b_s.contiguous().view(dtypes.fp8_e8m0)
+            except _TRITON_ERRORS as err:
+                LAST_IMPLS[f"quant:preshuffle_skipped({type(err).__name__})"] += 1
+        bq, b_s = _quant_rows(bt, round_bf16)
         bq = shuffle_weight(bq.view(dtypes.fp8), layout=(16, 16))
         return bq, b_s.view(dtypes.fp8_e8m0)
 

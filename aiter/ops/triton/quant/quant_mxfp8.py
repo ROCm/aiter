@@ -31,6 +31,7 @@ def convert_to_mxfp8(
     scale_mode: str = "torchao",
     dequant_dtype: torch.dtype | None = None,
     round_input_bf16: bool = False,
+    preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MXFP8 format.
@@ -59,6 +60,9 @@ def convert_to_mxfp8(
         round_input_bf16: quantize the round-to-nearest-even bf16 value of each
             fp32 input element, bit-identical to quantizing ``x.bfloat16()``
             without materializing it.
+        preshuffle: write the fp8 data in ``shuffle_weight(y, layout=(16, 16))``
+            order (bit-identical to shuffling afterwards, without the extra
+            pass); not with ``dequant_dtype`` or ``is_2d_block``.
 
     Returns:
         Tuple of (quantized_tensor, scales) where quantized_tensor has fp8_dtype
@@ -87,6 +91,8 @@ def convert_to_mxfp8(
         te_scale and fp8_dtype == torch.float8_e4m3fn
     ):
         raise ValueError("dequant_dtype needs scale_mode='te' and float8_e4m3fn")
+    if preshuffle and (dequant_dtype is not None or is_2d_block):
+        raise ValueError("preshuffle writes 1-D-block fp8 data only")
     if round_input_bf16 and x.dtype != torch.float32:
         raise ValueError("round_input_bf16 needs an fp32 input")
     if te_scale and (use_asm or use_sr):
@@ -151,10 +157,16 @@ def convert_to_mxfp8(
         TE_SCALE=te_scale,
         DEQUANT_OUT=dequant_dtype is not None,
         ROUND_BF16=round_input_bf16,
+        PRESHUFFLE=preshuffle,
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,
     )
+    if preshuffle:
+        # the attributes shuffle_weight sets
+        y.is_shuffled = True
+        y.aiter_shuffle_layout = (16, 16)
+        y.aiter_shuffle_is_guinterleave = False
     return y, s
 
 

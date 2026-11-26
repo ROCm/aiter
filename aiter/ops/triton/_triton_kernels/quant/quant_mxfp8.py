@@ -38,6 +38,7 @@ _convert_to_mxfp8_kernel_repr = make_kernel_repr(
         "TE_SCALE",
         "DEQUANT_OUT",
         "ROUND_BF16",
+        "PRESHUFFLE",
     ],
 )
 _convert_from_mxfp8_kernel_repr = make_kernel_repr(
@@ -432,6 +433,7 @@ def _convert_to_mxfp8_kernel(
     TE_SCALE: tl.constexpr = False,
     DEQUANT_OUT: tl.constexpr = False,
     ROUND_BF16: tl.constexpr = False,
+    PRESHUFFLE: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -503,7 +505,19 @@ def _convert_to_mxfp8_kernel(
         )
         y = y.to(tl.float32) * sc
 
-    offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
+    if PRESHUFFLE:
+        # the bytes aiter's shuffle_weight(y, layout=(16, 16)) would produce for
+        # a contiguous fp8 [M, N] (row stride stride_ym): 16-row blocks of
+        # [N / 32, 2, 16 rows, 16] tiles
+        offs_y = (
+            (offs_m[:, None] // 16) * (16 * stride_ym)
+            + (offs_yn[None, :] // 32) * 512
+            + ((offs_yn[None, :] % 32) // 16) * 256
+            + (offs_m[:, None] % 16) * 16
+            + offs_yn[None, :] % 16
+        )
+    else:
+        offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
     tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
     tl.store(s_ptr + offs_s, scales)
 

@@ -241,3 +241,22 @@ def test_mxfp8_te_scale_mode_rejects_asm_and_sr():
     for kw in ({"use_asm": True}, {"use_sr": True}):
         with pytest.raises(ValueError):
             convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te", **kw)
+
+
+@pytest.mark.parametrize("M, N", [(64, 128), (192, 256), (128, 7168)])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_mxfp8_preshuffle_matches_shuffle_weight(M, N, transposed):
+    """preshuffle=True writes exactly shuffle_weight(convert_to_mxfp8(x), (16, 16))."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(4)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 7
+    if transposed:
+        x = x.t().contiguous().t()  # a strided view, as a transposed weight
+    y, s = convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te")
+    y_pre, s_pre = convert_to_mxfp8(
+        x, torch.float8_e4m3fn, scale_mode="te", preshuffle=True
+    )
+    ref = shuffle_weight(y, layout=(16, 16))
+    assert torch.equal(y_pre.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(s_pre, s)
