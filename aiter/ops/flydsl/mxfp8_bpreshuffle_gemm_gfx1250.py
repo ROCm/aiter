@@ -13,6 +13,7 @@ mxfp8_32: A scales are row-major ``(M, K//32)`` by default, optionally
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
 
@@ -678,6 +679,11 @@ def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool
     base_name = kernel_name.removesuffix("_aspre")
     for instance in kernels_list.values():
         if instance.name.replace("mxfp8_128", "mxfp8_32") == base_name:
+            # The launch fits cluster_m to M (_resolved_wmma_config); check that.
+            cluster_m = resolve_cluster_m(M, instance.tile_m, instance.cluster_m)
+            instance = dataclasses.replace(
+                instance, cluster_m=cluster_m or instance.cluster_m
+            )
             return not instance.a_preshuffle and mxfp8_32_kernel_fits_shape(
                 instance, M, N, K
             )
