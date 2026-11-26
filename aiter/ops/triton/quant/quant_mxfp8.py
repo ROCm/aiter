@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _convert_to_mxfp8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
@@ -17,6 +18,10 @@ __all__ = [
 ]
 
 _LOGGER = AiterTritonLogger()
+
+# repeated small casts (e.g. one per projection GEMM) skip Triton's per-call
+# argument binding; sizes are keyed by Triton's specialization classes
+_convert_to_mxfp8_launch = fast_launch(_convert_to_mxfp8_kernel, by_specialization=True)
 
 
 def convert_to_mxfp8(
@@ -136,7 +141,7 @@ def convert_to_mxfp8(
     # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
     # at default tile, nw≥8 regresses).
     num_warps = min(16, max(1, block_m * block_n // 1024))
-    _convert_to_mxfp8_kernel[grid](
+    _convert_to_mxfp8_launch[grid](
         x,
         y,
         s,

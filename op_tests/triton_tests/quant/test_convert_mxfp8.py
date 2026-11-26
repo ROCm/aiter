@@ -260,3 +260,24 @@ def test_mxfp8_preshuffle_matches_shuffle_weight(M, N, transposed):
     ref = shuffle_weight(y, layout=(16, 16))
     assert torch.equal(y_pre.view(torch.uint8), ref.view(torch.uint8))
     assert torch.equal(s_pre, s)
+
+
+def test_mxfp8_fast_launch_matches_dispatch():
+    """The cached launcher gives the same bits as Triton's ordinary dispatch,
+    across repeated shapes and the TE-mode options."""
+    from aiter.ops.triton.utils import fast_launch
+
+    torch.manual_seed(5)
+    cases = [
+        (torch.randn(64, 128, device="cuda"), {}),
+        (torch.randn(128, 256, device="cuda").bfloat16(), {"preshuffle": True}),
+        (torch.randn(192, 64, device="cuda"), {"round_input_bf16": True}),
+        (torch.randn(64, 192, device="cuda").t(), {"dequant_dtype": torch.bfloat16}),
+    ]
+    for _ in range(2):  # the second pass hits the launcher cache
+        for x, kw in cases:
+            fast = convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te", **kw)
+            with fast_launch.bypassed():
+                ref = convert_to_mxfp8(x, torch.float8_e4m3fn, scale_mode="te", **kw)
+            for f, r in zip(fast, ref):
+                assert torch.equal(f.view(torch.uint8), r.view(torch.uint8))
