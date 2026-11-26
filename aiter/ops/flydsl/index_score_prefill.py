@@ -11,7 +11,7 @@ cache, and the same scorer fused with the top-16 block selection; see
 import flydsl.expr as fx
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels.index_score_prefill_nvfp4_gfx1250 import (
     CHUNK_MAX,
@@ -129,10 +129,35 @@ def index_score_prefill_nvfp4(
 
 
 # Blocks a workgroup of the fused scorer + top-16 owns: a row hands on ``TOPK``
-# keys a chunk. A guess, not measured on a GPU yet: a longer chunk tries fewer
-# blocks (a list restarts with its chunk) and leaves the merge fewer keys, a
-# shorter one gives a long context more workgroups.
-TOPK_CHUNK_BLOCKS = 256
+# keys a chunk. A longer chunk loads its query tile and fills its page ring
+# fewer times, tries fewer blocks (a list restarts with its chunk) and leaves
+# the merge fewer keys; a shorter one gives a short prefill more workgroups.
+# The default is the longest power of two in [TOPK_CHUNK_MIN, TOPK_CHUNK_MAX]
+# that still gives each CU TOPK_WORKGROUPS_PER_CU workgroups (a guess: 3-4 are
+# resident, the rest balance the tail), and never so short that a row hands the
+# merge more than TOPK_MERGE_MAX keys. Not measured on a GPU yet.
+TOPK_CHUNK_MIN, TOPK_CHUNK_MAX = 32, 1024
+TOPK_WORKGROUPS_PER_CU = 16
+TOPK_MERGE_MAX = 1024
+
+
+def index_topk_prefill_chunk_blocks(
+    idx_q, max_query_len, batch, max_block, *, block_q=256, **_launch
+) -> int:
+    """The default ``chunk_blocks`` of :func:`index_topk_prefill_nvfp4` for this
+    grid (the other launch keywords are accepted and do not matter). A power of
+    two, so a caller compiling per chunk sees few values."""
+    tiles = batch * idx_q.shape[1] * -(-max_query_len // block_q)
+    floor = TOPK_CHUNK_MIN
+    while floor < TOPK_CHUNK_MAX and -(-max_block // floor) * TOPK > TOPK_MERGE_MAX:
+        floor *= 2
+    chunk = TOPK_CHUNK_MAX
+    while (
+        chunk > floor
+        and tiles * -(-max_block // chunk) < TOPK_WORKGROUPS_PER_CU * get_cu_num()
+    ):
+        chunk //= 2
+    return chunk
 
 
 def index_topk_prefill_nvfp4_supported(idx_q, payload, scale, topk, max_block) -> bool:
@@ -159,7 +184,7 @@ def index_topk_prefill_nvfp4(
     init_blocks: int,
     local_blocks: int,
     *,
-    chunk_blocks: int = TOPK_CHUNK_BLOCKS,
+    chunk_blocks: int | None = None,
     block_q: int = 256,
     waves: int = 4,
     ring: int = 4,
@@ -181,6 +206,10 @@ def index_topk_prefill_nvfp4(
     total_q, heads, _ = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
     assert block_table.stride(1) == 1
+    if chunk_blocks is None:
+        chunk_blocks = index_topk_prefill_chunk_blocks(
+            idx_q, max_query_len, batch, max_block, block_q=block_q
+        )
     if chunk_blocks < 1:
         raise ValueError(f"chunk_blocks must be positive, got {chunk_blocks}")
     chunks = (max_block + chunk_blocks - 1) // chunk_blocks
