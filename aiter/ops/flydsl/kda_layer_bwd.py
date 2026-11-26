@@ -212,35 +212,33 @@ def sigmoid_gate_proj(x, g_proj, aux=None, out_dtype=None, config=None):
     )
 
 
-def proj_gemm(a, w, kind):
+def proj_gemm(a, w, kind, out=None):
     """Plain projection GEMM on the gfx950 bf16 GEMM (fp32 output), with the
     ``_proj_gemm`` operand convention; a shape the GEMM rejects (misaligned
-    strides) falls back to torch on the same rounded inputs."""
+    strides, a K tail switched off) falls back to torch on the same rounded
+    inputs. ``out`` (contiguous fp32) receives the result on either path."""
     dt = w.dtype
     a16 = a.to(dt).contiguous()
     w16 = w.to(dt).contiguous()
     try:
         if kind == "fwd":
-            return _gemm(a16, w16.t(), "nt")
+            return _gemm(a16, w16.t(), "nt", out=out)
         if kind == "dgrad":
-            return _gemm(a16, w16, "nn")
-        return _gemm(a16.t(), w16, "tn")
+            return _gemm(a16, w16, "nn", out=out)
+        return _gemm(a16.t(), w16, "tn", out=out)
     except (AssertionError, ValueError):
         a32, w32 = a16.float(), w16.float()
-        return {"fwd": lambda: a32 @ w32.t(), "dgrad": lambda: a32 @ w32}.get(
+        res = {"fwd": lambda: a32 @ w32.t(), "dgrad": lambda: a32 @ w32}.get(
             kind, lambda: a32.t() @ w32
         )()
+        return res if out is None else out.copy_(res)
 
 
-def gate_proj_bwd_gemms(dgp, x, g_proj, dw_dtype=torch.float32):
-    """(dgp @ g_proj fp32, dgp^T @ x in ``dw_dtype``), bf16 inputs.
+def gate_proj_bwd_gemms(dgp, x, g_proj):
+    """(dgp @ g_proj, dgp^T @ x) in bf16 with fp32 output.
 
     dgp: [M, H*V]; x: [M, D]; g_proj: [H*V, D]. Any token count M: the weight
-    gradient takes its K tail in the kernel.
+    gradient takes its K tail in the kernel; the torch fallback takes the same
+    bf16-rounded dgp / x as the GEMM.
     """
-    dt = g_proj.dtype
-    d16 = dgp.to(dt).contiguous()
-    x16 = x.to(dt).contiguous()
-    dx = _gemm(d16, g_proj.contiguous(), "nn")
-    dw = _gemm(d16.t(), x16, "tn", out_dtype=dw_dtype)
-    return dx, dw
+    return proj_gemm(dgp, g_proj, "dgrad"), proj_gemm(dgp, x, "wgrad")

@@ -356,6 +356,8 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
     if stage in ("gate_proj", "gate_proj_bwd", "sigmoid_gate_proj"):
         if dtype not in (dtypes.bf16, dtypes.fp16) or get_gfx_runtime() != "gfx950":
             return "FlyDSL GEMM epilogues need gfx950 and bf16/fp16"
+        if any(n % 8 for n in (k, r, d)):
+            return f"GEMM rows need multiples of 8 (k={k}, r={r}, d={d})"
         from aiter.ops.flydsl import kda_layer_bwd as fk
 
         lr = torch.randn(m, r)  # fp32, as the layer passes it
@@ -381,6 +383,8 @@ def _stage_case(stage, m, h, k, d, r, lb, dtype):
             lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
             lambda: P.sigmoid_gate_proj(x, g_proj, aux),
         )
+    if stage in ("l2norm_bwd", "rmsnorm_bwd") and k % 64:
+        return f"FlyDSL row kernels need a head dim multiple of 64 (k={k})"
     if stage == "l2norm_bwd":
         from aiter.ops.flydsl import kda_layer_bwd as fk
 
@@ -538,6 +542,37 @@ def test_kda_chunk_bwd_backends(b, t, h, k, lb, dtype):
             worst = max(worst, err)
         ret[f"{backend} us"] = us
         ret[f"{backend} err"] = worst
+    return ret
+
+
+@benchmark()
+def test_kda_gproj_bwd_exact(m, d, h, k, dtype):
+    """g_proj backward GEMMs (dx = dgp @ g_proj, nn; dW_g = dgp^T @ x, tn) on
+    small-integer inputs, so the fp32 result is exact, into NaN-filled outputs:
+    any wrong, racy or unwritten element shows up bit for bit."""
+    from aiter.ops.flydsl import kda_layer_bwd as fk
+
+    hk = h * k
+    dgp = torch.randint(-3, 4, (m, hk)).to(dtype)
+    x = torch.randint(-3, 4, (m, d)).to(dtype)
+    g_proj = torch.randint(-3, 4, (hk, d)).to(dtype)
+    want_dx = dgp.float() @ g_proj.float()
+    want_dw = dgp.float().t() @ x.float()
+    ret = {"gfx": get_gfx_runtime()}
+    for name, kind, w, want in (
+        ("dx_nn", "dgrad", g_proj, want_dx),
+        ("dW_tn", "wgrad", x, want_dw),
+    ):
+        out = torch.full(want.shape, float("nan"))
+        _, us = run_perftest(fk.proj_gemm, dgp, w, kind, out, num_iters=3)
+        bad = (out != want) | out.isnan()
+        n_bad = int(bad.sum())
+        assert n_bad == 0, (
+            f"{name}: {n_bad} of {out.numel()} elements differ "
+            f"(max {(out - want).abs().nan_to_num(float('inf')).max().item()})"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} wrong"] = n_bad
     return ret
 
 
@@ -1074,6 +1109,16 @@ def main():
         )
         return
     for dtype in proj_dtypes:
+        summarize(
+            "kda g_proj bwd GEMM bit-exact summary",
+            [
+                test_kda_gproj_bwd_exact(b * t, d, h, k, dtype)
+                for b, t, (d, h, k, _, _) in itertools.product(
+                    args.batch, args.seqlen, args.shape
+                )
+            ],
+            {"batch": args.batch, "seqlen": args.seqlen, "shape": args.shape},
+        )
         summarize(
             "kda projection fusion summary",
             [
