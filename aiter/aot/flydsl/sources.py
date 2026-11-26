@@ -206,6 +206,8 @@ AOT_CACHES = {
             "kernels/dpp_utils.py",
             "kernels/layout_utils.py",
         ),
+        # Selects act "situv2f" for situv2 at beta 4 (flydsl_mxfp4_gemm1).
+        "env": ("AITER_MOE_SITUV2_FAST",),
     },
     "mxmoe_gemm2": {
         "sources": (

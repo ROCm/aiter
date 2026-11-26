@@ -3,12 +3,18 @@
 
 
 import functools
+import os
 
 import torch
 
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
 from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
+
+# SiTUv2 with beta 4 runs the shared-exponential epilogue (act "situv2f"):
+# 3 transcendentals per output instead of 6, small numeric change. 0 keeps
+# the situv2 epilogue.
+_SITUV2_FAST = os.environ.get("AITER_MOE_SITUV2_FAST", "1") == "1"
 
 
 @aot_factory("mxfp4_moe_gemm1")
@@ -92,12 +98,14 @@ def _assert_supported(
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires out_dtype in ('fp4', 'fp8'), got {out_dtype!r}"
         )
-    if act not in ("silu", "swiglu", "situv2"):
+    if act not in ("silu", "swiglu", "situv2", "situv2f"):
         raise NotImplementedError(
             "flydsl mxfp4 gemm1 requires act in "
-            f"('silu', 'swiglu', 'situv2'), got {act!r}"
+            f"('silu', 'swiglu', 'situv2', 'situv2f'), got {act!r}"
         )
-    if act == "situv2":
+    if act == "situv2f" and situ_beta != 4.0:
+        raise NotImplementedError(f"situv2f needs situ_beta == 4, got {situ_beta!r}")
+    if act in ("situv2", "situv2f"):
         if situ_beta <= 0.0:
             raise NotImplementedError(
                 f"flydsl mxfp4 gemm1 requires situ_beta > 0, got {situ_beta!r}"
@@ -236,6 +244,8 @@ def flydsl_mxfp4_gemm1(
     k_wave=1,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
+    if _SITUV2_FAST and act == "situv2" and float(situ_beta) == 4.0:
+        act = "situv2f"
     _assert_supported(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
