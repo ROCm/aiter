@@ -177,12 +177,14 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
 
 
 def _flydsl_s1_tile_n_forced(a_dtype, b_dtype, inter_dim, tile_n) -> bool:
-    """True if flydsl_moe_stage1 would replace ``tile_n`` for this shape.
+    """True if this shape cannot run ``tile_n`` as a stage-1 tile under its own name.
 
-    Mirrors resolve_flydsl_stage1_tile_n (a16w4 / a8w4 only): such a candidate
-    runs as its tile_n=pick_flydsl_stage1_tile_n(inter_dim) twin, which is in
-    the candidate set under its own name, so tuning it only times that kernel
-    twice and can record it under a tile it does not run.
+    Same condition as resolve_flydsl_stage1_tile_n. a8w4 runs such a candidate
+    as its tile_n=pick_flydsl_stage1_tile_n(inter_dim) twin, which is in the
+    candidate set under its own name, so tuning it only times that kernel twice
+    and can record it under a tile it does not run. a16w4 takes the a16w-mix
+    port, which raises NotImplementedError for a tile_n that does not divide
+    inter_dim.
     """
     if b_dtype != "fp4" or a_dtype not in ("bf16", "fp8"):
         return False
@@ -787,13 +789,24 @@ V2_E2E_MAX_FINALISTS = 4
 
 
 def _v2_e2e_finalists(pairs):
-    """Index of the 2-stage v2 pairs within the gate of the best stage sum."""
+    """Index of the 2-stage v2 pairs within the gate of the best stage sum.
+
+    Raises ValueError when there are several and another pair is within the
+    gate too: it is not re-timed, so dropping the v2 leader could hand it the
+    row on its stage sum alone.
+    """
     total = pairs["us1"] + pairs["us2"].fillna(0)
     v2 = (_numeric_column(pairs, "v2", 0).fillna(0) == 1) & (
         _numeric_column(pairs, "run_1stage", 0).fillna(0) == 0
     )
-    close = v2 & (total <= total.min() * (1 + V2_E2E_FINALIST_GATE))
-    return list(total[close].sort_values().index[:V2_E2E_MAX_FINALISTS])
+    close = total <= total.min() * (1 + V2_E2E_FINALIST_GATE)
+    finalists = list(total[close & v2].sort_values().index[:V2_E2E_MAX_FINALISTS])
+    if len(finalists) > 1 and (close & ~v2).any():
+        raise ValueError(
+            "a pair other than a 2-stage v2 one is within "
+            f"{V2_E2E_FINALIST_GATE:.0%} of the best stage sum"
+        )
+    return finalists
 
 
 def _v2_e2e_scores(kernel_us):
@@ -801,9 +814,17 @@ def _v2_e2e_scores(kernel_us):
 
     ``kernel_us`` maps finalist -> {kernel name: median us per call}. A kernel
     every finalist launches under the same name is left out: it cannot separate
-    the finalists, and its time varies with the buffers it is handed.
+    the finalists, and its time varies with the buffers it is handed. Raises
+    ValueError when a finalist launched no other kernel, as when fused_moe did
+    not pick up its one-row config.
     """
     shared = set.intersection(*(set(k) for k in kernel_us.values()))
+    missed = [i for i, kernels in kernel_us.items() if not set(kernels) - shared]
+    if missed:
+        raise ValueError(
+            f"finalists {missed} launched only the kernels every finalist "
+            "launched; fused_moe did not run their configs"
+        )
     return {
         i: sum(us for name, us in kernels.items() if name not in shared)
         for i, kernels in kernel_us.items()
@@ -1042,17 +1063,12 @@ class FmoeTuner(TunerCommon):
         from aiter.jit import core as jit_core
 
         old_env = os.environ.get("AITER_CONFIG_FMOE")
-        old_tempdir = tempfile.tempdir
-        # get_config_file writes its merged copy under tempfile.gettempdir(),
-        # which other processes on the host read; keep it beside config_file.
-        tempfile.tempdir = os.path.dirname(config_file)
         os.environ["AITER_CONFIG_FMOE"] = config_file
         jit_core.AITER_CONFIGS.get_config_file.cache_clear()
         self._clear_op_caches()
         try:
             yield
         finally:
-            tempfile.tempdir = old_tempdir
             if old_env is None:
                 os.environ.pop("AITER_CONFIG_FMOE", None)
             else:
@@ -1069,6 +1085,8 @@ class FmoeTuner(TunerCommon):
         """
         from torch.autograd import DeviceType
         from torch.profiler import ProfilerActivity, profile
+
+        from aiter.ops.flydsl.moe_common import GateMode
 
         (
             _,
@@ -1099,6 +1117,13 @@ class FmoeTuner(TunerCommon):
         )
         topk_weights, topk_ids = tuning_routing(inputs["hidden"], expert, topk)
         situv2 = act_type == ActivationType.Situv2
+        # Left to itself fused_moe picks the activation dtype from the gate mode
+        # and the token count (bf16 below AITER_BF16_FP8_MOE_BOUND, for one) and
+        # looks up a key the one-row config does not hold. fp8 activations
+        # read the gate/up-interleaved W1 that _fmoe_inputs builds for them.
+        gate_mode = (
+            GateMode.INTERLEAVE if q_dtype_a == dtypes.fp8 else GateMode.SEPARATED
+        )
 
         def call():
             return fused_moe(
@@ -1115,6 +1140,8 @@ class FmoeTuner(TunerCommon):
                 w1_scale=inputs["w1_scale_fmoe"],
                 w2_scale=inputs["w2_scale_fmoe"],
                 dtype=dtype,
+                gate_mode=gate_mode.value,
+                quant_dtype_a=q_dtype_a,
             )
 
         launches = {i: {} for i in pairs.index}
@@ -6963,35 +6990,38 @@ class FmoeTuner(TunerCommon):
                     )
 
             # Only latency is re-measured; the one-row config cannot carry the
-            # swiglu_limit tag, which fused_moe looks up in another table.
+            # swiglu_limit tag, which fused_moe looks up in another table, and
+            # fused_moe here routes densely, not as --ep-size tunes.
             if (
                 "v2" in profileDF.columns
                 and not policy.measures_power
                 and not self.swiglu_limit_tag
                 and not getattr(args, "no_fused_moe_rerank", False)
+                and not getattr(args, "ep_size", 0)
             ):
-                finalists = _v2_e2e_finalists(profileDF)
-                if len(finalists) > 1:
-                    try:
+                finalists, scores = [], {}
+                try:
+                    finalists = _v2_e2e_finalists(profileDF)
+                    if len(finalists) > 1:
                         scores = _v2_e2e_scores(
                             self._time_pairs_in_fused_moe(key, profileDF.loc[finalists])
                         )
-                    except Exception as err:  # noqa: BLE001
-                        print(f"  fused_moe re-rank skipped ({err})", flush=True)
-                    else:
-                        fastest = min(scores, key=scores.get)
-                        losers = [i for i in finalists if i != fastest]
-                        for i in finalists:
-                            pair = profileDF.loc[i]
-                            print(
-                                f"  fused_moe re-rank: block_m={pair['block_m']} "
-                                f"{pair['kernelName1']} / {pair['kernelName2']}: "
-                                f"stage sum {pair['us1'] + pair['us2']:.1f} us, "
-                                f"fused_moe unshared kernels {scores[i]:.1f} us"
-                                + (" (dropped)" if i in losers else ""),
-                                flush=True,
-                            )
-                        profileDF = profileDF.drop(index=losers)
+                except Exception as err:  # noqa: BLE001
+                    print(f"  fused_moe re-rank skipped ({err})", flush=True)
+                if scores:
+                    fastest = min(scores, key=scores.get)
+                    losers = [i for i in finalists if i != fastest]
+                    for i in finalists:
+                        pair = profileDF.loc[i]
+                        print(
+                            f"  fused_moe re-rank: block_m={pair['block_m']} "
+                            f"{pair['kernelName1']} / {pair['kernelName2']}: "
+                            f"stage sum {pair['us1'] + pair['us2']:.1f} us, "
+                            f"fused_moe unshared kernels {scores[i]:.1f} us"
+                            + (" (dropped)" if i in losers else ""),
+                            flush=True,
+                        )
+                    profileDF = profileDF.drop(index=losers)
 
             # v2 is a transient tuning-time pairing marker; the persistent layout
             # marker is kernelName2's ``_moe2_layout_`` segment. Drop it before the
