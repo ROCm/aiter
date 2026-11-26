@@ -284,7 +284,8 @@ def test_mxfp8_fast_launch_matches_dispatch():
 
 
 @pytest.mark.parametrize(
-    "M, N, out_cols", [(100, 96, 96), (100, 100, 128), (37, 256, 256), (130, 70, 96)]
+    "M, N, out_cols",
+    [(100, 96, 96), (100, 100, 128), (37, 256, 256), (130, 70, 96), (48, 128, 128)],
 )
 @pytest.mark.parametrize("mode", ["fp8", "dequant", "round", "preshuffle"])
 def test_mxfp8_unaligned_matches_zero_padding(M, N, out_cols, mode):
