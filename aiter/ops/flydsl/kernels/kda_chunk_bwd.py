@@ -605,7 +605,15 @@ def compile_wy_dqkg(
         )
         _load_tile(_flat(dv, hv), H * V, s_dv, BT, V, nvalid, tid, VN, BF)
         a_off = (tok * H + fx.Int64(h)) * BT
-        _load_tile(_flat(A, a_off), H * BT, s_a, BT, BT, nvalid, tid, AN, fx.Float32)
+        # Akk is lower triangular; its upper triangle is not guaranteed written.
+        a_v = _flat(A, a_off)
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // BT
+            sc_ = i % BT
+            ok = (t < nvalid) & (sc_ <= t)
+            x = _sel(ok, ldg(a_v, _sel(t < nvalid, t, 0) * (H * BT) + sc_, AN), _zero())
+            lds_st(s_a, i, x)
         beta_v = _flat(beta, tok * H + fx.Int64(h))
         if tid < BT:
             bb = ldg(beta_v, _sel(tid < nvalid, tid, 0) * H, BN)
@@ -1489,9 +1497,17 @@ def compile_wy_dqkg_mfma(
         _stage(vn_v, V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
         _stage(dv_v, H * V, s_dv, LDK, BT, V, nvalid, tid, VN, BF)
         _stage(dv_v, H * V, s_dvT, LDT, BT, V, nvalid, tid, VN, BF, transpose=True)
-        a_v = _src(A, a_off)
-        _stage(a_v, H * BT, s_a, LDT, BT, BT, nvalid, tid, AN, BF)
-        _stage(a_v, H * BT, s_aT, LDT, BT, BT, nvalid, tid, AN, BF, transpose=True)
+        a_v = _flat(A, a_off)
+        # Akk is lower triangular; its upper triangle is not guaranteed written
+        # (Triton zero-fills it, other prepare backends may not), so mask it.
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // BT
+            sc_ = i % BT
+            ok = (t < nvalid) & (sc_ <= t)
+            x = _sel(ok, ldg(a_v, _sel(t < nvalid, t, 0) * (H * BT) + sc_, AN), _zero())
+            lds_st(s_a, t * LDT + sc_, x, BF)
+            lds_st(s_aT, sc_ * LDT + t, x, BF)
         beta_v = _flat(beta, tok * H + fx.Int64(h))
         if tid < BT:
             bb = ldg(beta_v, _sel(tid < nvalid, tid, 0) * H, BN)

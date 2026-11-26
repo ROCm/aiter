@@ -363,3 +363,84 @@ def test_flydsl_fwd_prepare_hook(monkeypatch):
     assert calls == [64, 64]
     with pytest.raises(ValueError, match="not registered"):
         fb.chunk_kda_bwd_flydsl(*args, prepare="missing", **kw)
+
+
+_K3_CONTRACT = {
+    "use_qk_l2norm_in_kernel": True,
+    "use_gate_in_kernel": True,
+    "use_beta_sigmoid_in_kernel": True,
+    "lower_bound": -5.0,
+}
+
+
+def _contract_args(varlen, T=1000):
+    x, cu = _inputs(3, T, 96, 96, 128, 128, varlen, "none", precomputed_gate=False)
+    do = torch.randn(
+        x["v"].shape,
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(5),
+    ).to(torch.bfloat16)
+    kw = dict(_K3_CONTRACT, A_log=x["A_log"], dt_bias=x["dt_bias"], cu_seqlens=cu)
+    return (do, x["q"], x["k"], x["v"], x["g"], x["beta"], 128**-0.5, 64), kw
+
+
+def _assert_grads_close(ref, got):
+    for name, a, b in zip(("dq", "dk", "dv", "dg", "dbeta", "dA_log", "ddt"), ref, got):
+        assert torch.isfinite(b).all(), name
+        assert _err_ratio(a, b) < _ERR_RATIO, name
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+def test_flydsl_fp32_prepare_outputs(monkeypatch, varlen):
+    """fp32 Aqk/Akk with an unwritten upper triangle (as #8744's prepare returns)."""
+    pytest.importorskip("flydsl")
+    from aiter.ops.flydsl import kda_chunk_bwd as fb
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+        chunk_delta_attn_fwd_prepare,
+    )
+
+    def fp32_prepare(**kw):
+        *rest, Aqk, Akk = chunk_delta_attn_fwd_prepare(**kw)
+        upper = torch.ones(64, 64, dtype=torch.bool, device="cuda").triu(1)
+
+        pos = torch.arange(kw["q"].shape[1], device="cuda")
+        cu = kw["cu_seqlens"]
+        if cu is not None:  # chunks restart at every sequence start
+            cu = cu.long()
+            pos = pos - cu[torch.searchsorted(cu[1:], pos, right=True)]
+        t_in_chunk = pos % 64
+
+        def poison(A):
+            # Aqk/Akk are [B, T, H, BT]; mark A[t, s] with s > t inside each chunk.
+            A = A.float().clone()
+            mask = upper[t_in_chunk][None, :, None, :]
+            return A.masked_fill(mask, float("nan"))
+
+        return (*rest, poison(Aqk), poison(Akk))
+
+    monkeypatch.setitem(fb._PREPARE_IMPLS, "fp32_test", fp32_prepare)
+    args, kw = _contract_args(varlen)
+    ref = fb.chunk_kda_bwd_flydsl(*args, **kw)
+    got = fb.chunk_kda_bwd_flydsl(*args, prepare="fp32_test", **kw)
+    _assert_grads_close(ref, got)
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+def test_backward_flydsl_prepare_flydsl(varlen):
+    """prepare="flydsl" (#8744's FlyDSL prepare) agrees with the Triton backward."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter.ops.flydsl.kda_chunk_fwd")  # registers "flydsl"
+    from aiter.ops.flydsl import kda_chunk_bwd as fb
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_bwd import (
+        chunk_delta_attn_bwd,
+    )
+
+    if "flydsl" not in fb._PREPARE_IMPLS:
+        pytest.skip("no FlyDSL prepare registered")
+    args, kw = _contract_args(varlen)
+    do, q, k, v, g, beta, scale, bt = args
+    ref = chunk_delta_attn_bwd(
+        do, None, q, k, v, g, beta, scale, chunk_size=bt, safe_gate=True, **kw
+    )[:7]
+    got = fb.chunk_kda_bwd_flydsl(*args, prepare="flydsl", **kw)
+    _assert_grads_close(ref, got)
