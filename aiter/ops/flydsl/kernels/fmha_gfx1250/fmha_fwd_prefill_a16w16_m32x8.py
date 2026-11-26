@@ -1524,6 +1524,21 @@ def _attention_core_multi_kv_tiles(
         0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch, _num_vld)
     )
     assert _num_head_carry <= _num_vld, "carried head must be V loads only"
+
+    # TWO generations: the body reads slot p for its own PV and issues slot p+1 for the
+    # next body's ring head, so one generation only moves the hazard from the first burst
+    # to the second. With both carried the body computes slot p+2, which nothing here
+    # loads -- a full body of distance before its use. The lagging half carries no head,
+    # so its second generation is pure pass-through; it keeps one shape for both halves.
+    _num_vaddr_gens = 2
+    _vaddr_idx = len(_init)
+    for _g in range(_num_vaddr_gens):
+        _init = _init + [
+            _raw(a)
+            for a in v_mgr.ds_load_addrs(
+                ptr_lds=_v_lds_bufs(_PHYSICAL_SLOT[_g]), lane_idx=lane_idx
+            )
+        ]
     _head_carry_idx = len(_init)
     _seed_head = []
     for j in range(_num_head_carry):
@@ -1602,11 +1617,6 @@ def _attention_core_multi_kv_tiles(
                 ptr_lds=_split_bufs(_phys_base(i)), lane_idx=lane_idx
             )
 
-        def _v_slot(i):
-            return v_mgr.ds_load_ptrs(
-                ptr_lds=_split_bufs(_phys_base(i) + fx.Int32(LDS_CHUNK_BYTES)),
-                lane_idx=lane_idx,
-            )
         head_carry = [
             fx.Vector(state[_head_carry_idx + i]) for i in range(_num_head_carry)
         ]
@@ -1614,9 +1624,27 @@ def _attention_core_multi_kv_tiles(
             state[_kv_state_idx : _kv_state_idx + kv_policy.num_state_slots]
         )
         # The ring's LDS base pointers: banked with the fragments they feed.
+        # Carried V bases, one list per generation: [0] is this body's PV slot, [1] (when
+        # a head is carried) the slot this body issues the next body's head from.
+        _vaddr_gen = [
+            [
+                fx.Int32(state[_vaddr_idx + g * KV_LDS_SPLITS + i])
+                for i in range(KV_LDS_SPLITS)
+            ]
+            for g in range(_num_vaddr_gens)
+        ]
         v_curr = [
-            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in _v_slot(0)
-        ]  # tile tile_idx-1: this body's PV
+            schedule_bank(p, bank=1, reason="ring_lds_addr")
+            for p in v_mgr.ds_ptrs_from_addrs(_vaddr_gen[0])
+        ]  # tile tile_idx-1: this body's PV, addressed two bodies ago
+        # The one slot this body computes: consumed a body (or two) from now, so the wait
+        # its v_adds force has the whole body to drain into.
+        v_far_addrs = v_mgr.ds_load_addrs(
+            ptr_lds=_split_bufs(
+                _phys_base(_num_vaddr_gens) + fx.Int32(LDS_CHUNK_BYTES)
+            ),
+            lane_idx=lane_idx,
+        )
         k_curr = [
             schedule_bank(p, bank=1, reason="ring_lds_addr") for p in _k_slot(1)
         ]  # tile tile_idx:   this body's QK
@@ -1875,8 +1903,9 @@ def _attention_core_multi_kv_tiles(
             # and already fenced. Mirrors the lagging half -- both issue the head just
             # before the barrier preceding the gemm that consumes it, ahead of the
             # narrowing for the same reason.
+            _v_next = v_mgr.ds_ptrs_from_addrs(_vaddr_gen[1])
             head_next = _issue_head(
-                lambda j: v_mgr.load_one_to_reg(_v_slot(1), j), 0, _num_head_carry
+                lambda j: v_mgr.load_one_to_reg(_v_next, j), 0, _num_head_carry
             )
             carry_next = carry_f32
 
@@ -1891,6 +1920,9 @@ def _attention_core_multi_kv_tiles(
                 + [_raw(cv) for cv in carry_next[q_tile_idx]]
             )
         out += [_raw((phase + fx.Int32(1)) & fx.Int32(N_KV_PP - 1))]
+        for _g in range(1, _num_vaddr_gens):
+            out += [_raw(a) for a in _vaddr_gen[_g]]
+        out += [_raw(a) for a in v_far_addrs]
         out += [_raw(h) for h in head_next]
         out += [_raw(v) for v in kv_state_next]
         return out

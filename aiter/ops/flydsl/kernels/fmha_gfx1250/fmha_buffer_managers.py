@@ -1333,18 +1333,28 @@ class KManagerV1(_AsyncTransport):
     # Returns a PURE ``BufferOpDescriptor`` that declares which counter its copies land on
     # (``asynccnt``/``tensorcnt``), so one fence can serve a mixed pair.
     # ------------------------------------------------------------------
+    def ds_load_addrs(self, *, ptr_lds, lane_idx):
+        """``ds_load_ptrs`` before the pointer cast: the plain i32 LDS byte addresses, so
+        a caller can carry them across a loop as loop state."""
+        return [
+            base
+            + (lane_idx % _WMMA_M) * fx.Int32(self.padded_row_bytes)
+            + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
+            for base in _as_bases(ptr_lds)
+        ]
+
+    @staticmethod
+    def ds_ptrs_from_addrs(addrs):
+        """The ``ds_load_ptrs`` result for addresses from ``ds_load_addrs``."""
+        return [_lds_ptr_b128(a) for a in addrs]
+
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane ds_load base pointer per LDS split; lane ``l`` fetches at row
         ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, group)`` is its split's
         base plus a lane-independent compile-time immediate."""
-        return [
-            _lds_ptr_b128(
-                base
-                + (lane_idx % _WMMA_M) * fx.Int32(self.padded_row_bytes)
-                + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
-            )
-            for base in _as_bases(ptr_lds)
-        ]
+        return self.ds_ptrs_from_addrs(
+            self.ds_load_addrs(ptr_lds=ptr_lds, lane_idx=lane_idx)
+        )
 
     def _rows_per_split(self, num_splits):
         """kv rows per LDS sub-buffer; each must hold whole 16-row WMMA tiles."""
@@ -1452,9 +1462,10 @@ class VManagerV1(_AsyncTransport):
 
     # ``load_descriptor`` comes from the transport mixin; see ``KManagerV1`` for the
     # argument contract (``ptr_src`` is the V tensor here).
-    def ds_load_ptrs(self, *, ptr_lds, lane_idx):
-        """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
-        base plus a lane-independent compile-time immediate.
+    def ds_load_addrs(self, *, ptr_lds, lane_idx):
+        """One per-lane transpose-load base ADDRESS per LDS split (``ds_load_ptrs``
+        before the pointer cast, so a caller can carry it as loop state); the crossbar
+        fetch sits base plus a lane-independent compile-time immediate.
 
         Both widths must land lane ``l`` on column ``l%16`` with 8 consecutive rows, but
         the two transpose loads do NOT share a crossbar. tr16_b128 transposes over eight
@@ -1474,14 +1485,22 @@ class VManagerV1(_AsyncTransport):
             )
             lane_d = ((lane_idx // fx.Int32(4)) % fx.Int32(2)) * fx.Int32(8)
         return [
-            create_llvm_ptr(
-                base
-                + lane_kv * fx.Int32(self.padded_row_bytes)
-                + lane_d * fx.Int32(self.elem_bytes),
-                address_space=3,
-            )
+            base
+            + lane_kv * fx.Int32(self.padded_row_bytes)
+            + lane_d * fx.Int32(self.elem_bytes)
             for base in _as_bases(ptr_lds)
         ]
+
+    @staticmethod
+    def ds_ptrs_from_addrs(addrs):
+        """The ``ds_load_ptrs`` result for addresses from ``ds_load_addrs``."""
+        return [create_llvm_ptr(a, address_space=3) for a in addrs]
+
+    def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+        """``ds_load_addrs`` cast to LDS pointers."""
+        return self.ds_ptrs_from_addrs(
+            self.ds_load_addrs(ptr_lds=ptr_lds, lane_idx=lane_idx)
+        )
 
     def _rows_per_split(self, num_splits):
         """kv rows per LDS sub-buffer; each must hold whole 32-kv contraction tiles."""
