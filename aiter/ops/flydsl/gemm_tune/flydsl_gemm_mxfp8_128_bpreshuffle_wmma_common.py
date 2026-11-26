@@ -327,7 +327,7 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                 fused_splitk=True,
             )
             idx += 1
-    # Retained by the M3.1 graph-replay screen.  The generic four-owner TDM
+    # Retained by a graph-replay screen.  The generic four-owner TDM
     # pipeline needs at least two waves; do not add one-wave variants.
     kl[idx] = WmmaKernelInstance(
         tile_m=16,

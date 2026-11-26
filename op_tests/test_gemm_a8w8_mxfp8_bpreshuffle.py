@@ -114,6 +114,46 @@ def test_w_scale_layout(n=64, kb=16):
     aiter.logger.info("shuffle_mxfp8_bpreshuffle_scale layout: OK")
 
 
+def test_gfx1250_bmm_row_dispatch(m=16, n=32, k=128):
+    """gfx1250: a B=1 BMM row runs the batched GEMM; preshuffled A scales, which
+    it cannot read, take the direct kernel instead. CPU only (mocked launches)."""
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+
+    name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    x, w = (torch.empty((r, k), dtype=torch.uint8, device="cpu") for r in (m, n))
+    xs, ws = (
+        torch.empty((r, k // 32), dtype=torch.uint8, device="cpu") for r in (m, n)
+    )
+    calls = []
+
+    def run_bmm(xq, wq, x_scale, w_scale, out, kernel_name=None, **_kwargs):
+        calls.append(("bmm", tuple(xq.shape), kernel_name))
+        return out
+
+    def run_direct(*args, **kwargs):
+        calls.append(("direct", kwargs["a_scale_preshuffled"], args[5]))
+        return args[4]
+
+    with (
+        mock.patch.object(op, "get_gfx", return_value="gfx1250"),
+        mock.patch.object(
+            op, "_get_mxfp8_bpreshuffle_config", return_value=("flydsl", name, 1)
+        ),
+        mock.patch.object(op, "_mxfp8_32_fallback_kernel_name", return_value="dk"),
+        mock.patch.object(bmm, "run_bmm_a8w8_mxfp8", run_bmm),
+        mock.patch.object(
+            direct, "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250", run_direct
+        ),
+    ):
+        gemm = op.gemm_a8w8_mxfp8_bpreshuffle.__wrapped__
+        assert gemm(x, w, xs, ws, dtype=dtypes.bf16).shape == (m, n)
+        gemm(x, w, xs, ws, dtype=dtypes.bf16, a_scale_preshuffled=True)
+    assert calls == [("bmm", (m, 1, k), name), ("direct", True, "dk_aspre")], calls
+    aiter.logger.info("gfx1250 B=1 BMM row dispatch: OK")
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -139,6 +179,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     test_w_scale_layout()
+    test_gfx1250_bmm_row_dispatch()
     if get_gfx() not in ("gfx950", "gfx1250"):
         print(f"skip: gfx950 / gfx1250 only, got {get_gfx()}")
     else:

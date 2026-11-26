@@ -39,9 +39,9 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_byte
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
     MX32_COMPUTE_WMMA_NAME_PREFIX,
+    MX32_STREAM_NAME_PREFIX,
     compute_kernel_k_pair,
     is_compute_wmma_kernel_name,
-    MX32_STREAM_NAME_PREFIX,
     parse_mxfp8_32_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     run_gemm_a8w8_mxfp8_32_stream_gfx1250,

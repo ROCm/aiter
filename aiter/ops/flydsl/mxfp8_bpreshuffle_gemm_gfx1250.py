@@ -1081,7 +1081,7 @@ def mxfp8_32_stream_candidates(M: int, N: int, K: int) -> list[str]:
 
     Only M <= 16 is offered: one 16-row tile, the whole K inside the workgroup
     (``wk`` K-waves, no cross-workgroup split), which is where the kernel beats
-    the TDM kernels on gfx1250 (M 1-8: 1.1-1.4x on the MiniMax-M3.1 shapes).
+    the TDM kernels on gfx1250.
     """
     from .kernels.gemm_a8w8_mx32_stream_gfx1250 import stream_k_steps_per_wave
 
