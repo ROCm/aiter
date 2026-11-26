@@ -1062,13 +1062,17 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
         const float scale = (amax_bits == 0)
                                 ? 1.0f
                                 : __builtin_bit_cast(float, static_cast<uint32_t>(E) << 23);
-        typedef unsigned short ush2 __attribute__((ext_vector_type(2)));
+        typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
         typedef short s2 __attribute__((ext_vector_type(2)));
         s2 a0{0, 0}, a1{0, 0};
-        a0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(a0, __builtin_bit_cast(ush2, p[0]), scale, false);
-        a0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(a0, __builtin_bit_cast(ush2, p[1]), scale, true);
-        a1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(a1, __builtin_bit_cast(ush2, p[2]), scale, false);
-        a1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(a1, __builtin_bit_cast(ush2, p[3]), scale, true);
+        a0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            a0, __builtin_bit_cast(bf16x2, p[0]), scale, false);
+        a0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            a0, __builtin_bit_cast(bf16x2, p[1]), scale, true);
+        a1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            a1, __builtin_bit_cast(bf16x2, p[2]), scale, false);
+        a1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            a1, __builtin_bit_cast(bf16x2, p[3]), scale, true);
         const uint32_t w0 = __builtin_bit_cast(uint32_t, a0);
         const uint32_t w1 = __builtin_bit_cast(uint32_t, a1);
         uint8_t* rowp = out_base + static_cast<int64_t>(route_row) * row_stride_bytes;
