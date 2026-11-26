@@ -7538,6 +7538,17 @@ class DecodeChainTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_SHARED_FMOE",
     }
 
+    def parse_args(self) -> argparse.Namespace:
+        args = super().parse_args()
+        if args.run_config or args.compare:
+            self.parser.error(
+                "--decode-chain does not support --run_config or --compare: both inherit "
+                "FmoeTuner.run_config(), which calls the routed-only fused_moe and supplies "
+                "neither the shared expert nor the router, so their benchmark and reference "
+                "would not measure the shared-folded chain this tuner searches"
+            )
+        return args
+
     def _clear_op_caches(self):
         super()._clear_op_caches()
         import aiter.fused_moe as fmoe_module

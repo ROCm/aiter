@@ -182,12 +182,12 @@ def public_path(x, L, gate_bf16, bias):
     )
     routed = routed * SCALE
     quant = get_hip_quant(QuantType.per_1x32)
-    xq, xs = quant(x, quant_dtype=dtypes.fp8)
+    xq, xs = quant(x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
     gu = aiter.gemm_a8w8_mxfp8_bpreshuffle(
         xq, L["shared_w1"].view(2 * I, H), xs, L["shared_w1_scale"], dtype=dtypes.bf16
     )
     h = _swiglu_oai(gu)
-    hq, hs = quant(h, quant_dtype=dtypes.fp8)
+    hq, hs = quant(h, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
     sh = aiter.gemm_a8w8_mxfp8_bpreshuffle(
         hq, L["shared_w2"].view(H, I), hs, L["shared_w2_scale"], dtype=dtypes.bf16
     )
