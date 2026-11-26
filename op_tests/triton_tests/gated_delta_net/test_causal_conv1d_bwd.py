@@ -296,4 +296,4 @@ def test_nums_dict_schedule():
     assert len(metadata.nums_dict) == 1
     got = causal_conv1d_split_qkv_bwd_triton_fn(**inp, metadata=metadata)
     for g, r in zip(got, ref):
-        assert torch.equal(g, r)
+        assert (g is None and r is None) or torch.equal(g, r)
