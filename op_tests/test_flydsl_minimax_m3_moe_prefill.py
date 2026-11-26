@@ -17,6 +17,7 @@ Run:
     pytest op_tests/test_flydsl_minimax_m3_moe_prefill.py
 """
 
+import os
 import subprocess
 import sys
 
@@ -24,12 +25,12 @@ import pytest
 import torch
 
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
 
 pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="MXFP4 MFMA prefill kernels need gfx950"
+    get_gfx_runtime() != "gfx950", reason="MXFP4 MFMA prefill kernels need gfx950"
 )
 
 HIDDEN, INTER, EXPERTS, TOPK = 6144, 768, 128, 4
@@ -151,11 +152,9 @@ def test_a4w4_prefill_moe(n_tokens):
 def test_a4w4_prefill_moe_non_current_device():
     # tensors on cuda:1 while cuda:0 is current: a fresh process, as FlyDSL binds a
     # compiled kernel to the first device that runs it
-    code = (
-        "import sys; sys.path.insert(0, 'op_tests'); "
-        "import test_flydsl_minimax_m3_moe_prefill as t; t._check(3072, 'cuda:1')"
-    )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    code = f"import importlib; importlib.import_module({__name__!r})._check(3072, 'cuda:1')"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
 def test_a4w4_prefill_moe_rejects_bad_inputs():
