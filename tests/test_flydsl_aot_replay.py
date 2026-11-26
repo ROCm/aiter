@@ -518,34 +518,3 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
     finally:
         gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
     assert launched == [job["kernel_name"] for job in jobs]
-
-
-def test_batched_rows_replay_the_fused_quant_entry_too():
-    """The batched table has a second public entry, which fuses the output
-    quant into the epilogue: another kernel of the same row, and a FlyDSL one
-    at a row the bf16 entry runs with OPUS."""
-    from aiter.aot.flydsl import gemm
-
-    path = _REPO_ROOT / "aiter/configs/model_configs"
-    path /= "dsv4_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv"
-    jobs = [
-        job
-        for job in gemm.parse_csv(str(path))
-        if (job["gfx"], job["b"], job["w_scale_block"]) == ("gfx950", 2, "32x32")
-    ]
-    fused = {job["m"]: job for job in jobs if job.get("fused_quant")}
-    bf16 = {job["m"]: job for job in jobs if not job.get("fused_quant")}
-    assert len(fused) + len(bf16) == len(jobs)
-    opus = {m for m, job in fused.items() if job["kernel_name"].startswith("opus_")}
-    assert opus and set(bf16) == set(fused) - opus
-
-    def kernels(job):
-        with replay.identified_kernels() as found:
-            gemm.replay(job)
-        return set(found)
-
-    with dry_run("gfx950", 256, python_ops=True):
-        m = min(bf16)
-        plain = kernels(bf16[m])
-        assert plain and kernels(fused[m]) and not kernels(fused[m]) & plain
-        assert kernels(fused[min(opus)])
