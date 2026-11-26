@@ -3,9 +3,9 @@
 """Tuner for ``router_topk_config``: per shape, the tuned router GEMM (tuned into
 ``--gemm_tuned_file`` first if missing) + ``topk_gating`` against the fused
 launch at each split_k of the FlyDSL GEMM catalog and prefetch depth, interleaved
-with an A/A band. ``fused`` = the best (the GEMM's own split_k, ``bitexact``,
-unless beaten by more than the band and ``--min_improvement_pct``) beats the
-unfused path by more than the band."""
+with an A/A band. ``fused`` = the best candidate beats the unfused path by more
+than the band; where the router GEMM is the FlyDSL kernel, only its own split_k
+(``bitexact``: the unfused bytes) is a candidate."""
 
 import functools
 import statistics
@@ -137,7 +137,7 @@ class MoeRouterTopkTuner(TunerCommon):
         tuned_gemm.get_GEMM_A16W16_config.cache_clear()
         router_gemm_split_k.cache_clear()
 
-    def tune_shape(self, M, N, K, topk, min_gain_pct):
+    def tune_shape(self, M, N, K, topk):
         g = torch.Generator(device="cuda").manual_seed(M)
         x = torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16)
         w = (torch.randn(N, K, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
@@ -165,10 +165,8 @@ class MoeRouterTopkTuner(TunerCommon):
         base = statistics.median(t for r in runs for t in (r[0], r[-1]))
         band = max(abs(r[0] - r[-1]) for r in runs)
         us = {c: statistics.median(r[i] for r in runs) for i, c in enumerate(fused, 1)}
-        best = min(us, key=us.get)
-        tol = max(band, us[best] * min_gain_pct / 100)
-        own = [c for c in us if c[0] == gemm_split_k and us[c] - us[best] <= tol]
-        best = min(own, key=us.get) if own else best
+        own = [c for c in us if c[0] == gemm_split_k]
+        best = min(own or us, key=us.get)
         logger.info(
             f"M={M} N={N} K={K} topk={topk}: unfused {base:.2f} us, A/A {band:.3f}, "
             f"fused {', '.join(f'{s}/{p}:{t:.2f}' for (s, p), t in us.items())}"
@@ -184,7 +182,7 @@ class MoeRouterTopkTuner(TunerCommon):
 
     def tune(self, untunedf, tunedf, args):
         return [
-            {**r._asdict(), **self.tune_shape(*r[2:], args.min_improvement_pct)}
+            {**r._asdict(), **self.tune_shape(*r[2:])}
             for r in untunedf.itertuples(index=False)
         ]
 
