@@ -233,6 +233,36 @@ def test_mxfp4_quant():
         assert torch.equal(q_buf, ref_q), f"provided codes differ at {n_tokens} tokens"
         assert torch.equal(s_buf, ref_s), f"provided scales differ at {n_tokens} tokens"
 
+    # the kernel writes as many rows as x has, whatever the buffers hold: each bad buffer
+    # must be refused before the launch, by the check on that argument
+    m = 3072
+    x = torch.zeros(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    q = torch.empty(m, HIDDEN // 2, dtype=torch.uint8, device="cuda")
+    s = torch.empty(m, HIDDEN // 32, dtype=torch.uint8, device="cuda")
+    bad = {
+        "q_out one row short": ("q_out", {"q_out": q[:-1]}),
+        "scale_out one row short": ("scale_out", {"scale_out": s[:-1]}),
+        "q_out of bf16, same shape": (
+            "q_out",
+            {"q_out": torch.empty_like(q, dtype=torch.bfloat16)},
+        ),
+        "strided q_out": (
+            "q_out",
+            {"q_out": torch.empty(m, HIDDEN, dtype=torch.uint8, device="cuda")[:, ::2]},
+        ),
+        "scale_out on the CPU": (
+            "scale_out",
+            {"scale_out": torch.empty_like(s, device="cpu")},
+        ),
+        "x with strided columns": (
+            "x",
+            {"x": torch.zeros(HIDDEN, m, dtype=torch.bfloat16, device="cuda").t()},
+        ),
+    }
+    for name, (arg, change) in bad.items():
+        with _rejects(f"mxfp4_quant {name}", first_arg=arg):
+            mxfp4_quant(**{"x": x, "q_out": q, "scale_out": s, **change})
+
 
 def test_a4w4_prefill_moe_non_current_device():
     if torch.cuda.device_count() < 2:

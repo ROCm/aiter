@@ -262,6 +262,17 @@ def mxfp4_quant(
     from aiter.ops.quant import dynamic_per_group_scaled_quant
 
     m, h = x.shape
+    # the kernel reads x row by row through stride(-2) only
+    assert x.is_cuda and x.stride(-1) == 1, ("x", x.device, x.stride())
+    # the kernel sizes its stores by x, not by q_out / scale_out: a smaller caller buffer
+    # is written past its end
+    for name, t, cols, dts in (
+        ("q_out", q_out, h // 2, (torch.uint8, dtypes.fp4x2)),
+        ("scale_out", scale_out, h // 32, (torch.uint8, dtypes.fp8_e8m0)),
+    ):
+        if t is not None:
+            assert t.shape == (m, cols) and t.dtype in dts, (name, t.shape, t.dtype)
+            assert t.is_contiguous() and t.device == x.device, (name, t.device)
     if q_out is None:
         q_out = torch.empty((m, h // 2), dtype=torch.uint8, device=x.device)
     if scale_out is None:
