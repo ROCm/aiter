@@ -1356,6 +1356,64 @@ def check_tdm_contracts(dtype):
         )
 
 
+# MLA kv_b_proj heads of k_size + v_size columns, stored as K = [k_nope, k_rope]
+# and V: (m, heads, k_size, v_size, rope_size, k, pad, split_k). The first three
+# are DeepSeek-R1 (128 heads, 128 + 128, rope 64, kv_lora_rank 512); pad > 0
+# leaves pad elements after every K/V head and row.
+_SPLIT_CAT = [
+    (1, 128, 128, 128, 64, 512, 0, 1),
+    (1024, 128, 128, 128, 64, 512, 8, 1),
+    (9424, 128, 128, 128, 64, 512, 0, 1),
+    (37, 3, 64, 32, 16, 256, 8, 2),
+]
+_SPLIT_CAT_TILE = {"block_m": 128, "block_n": 256, "block_k": 64, "n_waves": 4}
+
+
+@benchmark()
+def test_hgemm_split_cat(m, heads, k_size, v_size, rope_size, k, pad, split_k, dtype):
+    torch.manual_seed(SEED)
+    a = torch.randn(m, k, device="cuda", dtype=dtype)
+    w = torch.randn(heads * (k_size + v_size), k, device="cuda", dtype=dtype)
+    # [m, 1, rope] column slice of a wider row, like MLA's k_pe
+    rope = torch.randn(m, 8 + rope_size, device="cuda", dtype=dtype)[:, None, 8:]
+
+    def pitched(width):  # NaN-filled, so an element left unwritten fails
+        row = heads * (width + pad) + pad
+        out = torch.full((m, row), float("nan"), device="cuda", dtype=dtype)
+        return out.as_strided((m, heads, width), (row, width + pad, 1))
+
+    k_out, v_out = pitched(k_size + rope_size), pitched(v_size)
+    cfg = dict(_SPLIT_CAT_TILE, split_k=split_k)
+
+    def run_gemm_cat():  # the path split-cat replaces
+        kv = flydsl_hgemm(a, w, **cfg).view(m, heads, k_size + v_size)
+        k_nope, v = kv.split((k_size, v_size), dim=-1)
+        return torch.cat((k_nope, rope.expand(-1, heads, -1)), dim=-1), v
+
+    def run_split_cat():
+        return flydsl_hgemm(
+            a,
+            w,
+            k_out=k_out,
+            v_out=v_out,
+            k_rope=rope,
+            split_sizes=(k_size, v_size),
+            **cfg,
+        )
+
+    (ref_k, ref_v), ref_us = run_perftest(run_gemm_cat)
+    (out_k, out_v), us = run_perftest(run_split_cat)
+    err = checkAllclose(
+        torch.cat((ref_k, ref_v), dim=-1),
+        torch.cat((out_k, out_v), dim=-1),
+        rtol=0,
+        atol=0,
+        msg="split-cat vs GEMM + split + cat",
+    )
+    assert err == 0, f"split-cat differs from GEMM + split + cat in {err:.2%}"
+    return {"gemm+cat us": ref_us, "split_cat us": us, "err": err}
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1450,6 +1508,10 @@ def main():
             ]
             summarize(f"TDM tuned dispatch {dtype}", dispatch_rows)
             check_tdm_contracts(dtype)
+            summarize(
+                f"split-cat HGEMM {dtype}",
+                [test_hgemm_split_cat(*case, dtype) for case in _SPLIT_CAT],
+            )
         return
     torch.set_default_device("cuda")
     wanted = set(args.mnk)

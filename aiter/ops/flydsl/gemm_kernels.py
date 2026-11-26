@@ -241,7 +241,11 @@ def flydsl_hgemm(
     k_stagger: int = 0,
     b_non_temporal: bool = False,
     bpreshuffle: bool = False,
-) -> torch.Tensor:
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    split_sizes: tuple[int, int] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
 
     On gfx950 ft/ht/hti, ``k_stagger`` rotates each workgroup's K traversal
@@ -264,6 +268,9 @@ def flydsl_hgemm(
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
     A/B are made contiguous before launch. Other unsupported inputs raise
     rather than silently selecting a different kernel.
+    On gfx1250 ft/ht/hti, ``split_sizes=(k_size, v_size)`` stores the output
+    into ``k_out`` and ``v_out`` heads, with ``k_rope`` in every K head's tail,
+    and returns ``(k_out, v_out)``; see ``gemm_a16w16_gfx1250.gemm_a16w16``.
     """
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
@@ -284,6 +291,10 @@ def flydsl_hgemm(
         raise ValueError("BF16 preshuffle requires gfx950 sk or unsplit ft policy")
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    if split_sizes is not None and (
+        gfx not in ("gfx1250", "gfx1250-strict") or policy not in ("ft", "ht", "hti")
+    ):
+        raise ValueError("split-cat outputs require a gfx1250 FT/HT HGEMM policy")
     if policy in TDM_POLICIES:
         if gfx != "gfx1250":
             raise RuntimeError("TDM HGEMM policies require gfx1250")
@@ -391,6 +402,10 @@ def flydsl_hgemm(
                 num_buffers=stages,
                 split_k=split_k,
                 main_loop_unroll=policy in ("ht", "hti"),
+                k_out=k_out,
+                v_out=v_out,
+                k_rope=k_rope,
+                split_sizes=split_sizes,
             )
     if gfx != "gfx950":
         raise RuntimeError(

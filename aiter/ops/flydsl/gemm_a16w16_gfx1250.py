@@ -72,6 +72,7 @@ _CFG_KEYS = (
     "sched_strategy",
     "main_loop_unroll",
     "variant",
+    "split_cat",
 )
 
 
@@ -108,8 +109,19 @@ def gemm_a16w16(
     sched_strategy: str | None = None,
     main_loop_unroll: bool = False,
     variant: str = "bandwidth_bound",
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    split_sizes: tuple[int, int] | None = None,
 ):
-    """Compute Y = X @ W^T + bias. Auto-detects physical layout from strides."""
+    """Compute Y = X @ W^T + bias. Auto-detects physical layout from strides.
+
+    With ``split_sizes=(k_size, v_size)``, Y's N columns are heads of
+    ``k_size + v_size`` columns, as in MLA's ``kv_b_proj`` output. They are
+    stored into ``k_out[M, heads, k_size + rope]`` and ``v_out[M, heads,
+    v_size]`` instead of Y, with ``k_rope`` ([M, rope] or [M, 1, rope]) in the
+    tail of every K head, and ``(k_out, v_out)`` is returned.
+    """
     _lazy_import()
     _half = (torch.float16, torch.bfloat16)
     assert x.dtype in _half, f"x must be fp16/bf16, got {x.dtype}"
@@ -129,7 +141,34 @@ def gemm_a16w16(
     in_dtype_str = "fp16" if x.dtype == torch.float16 else "bf16"
     out_dtype_str = {torch.float16: "f16", torch.bfloat16: "bf16"}.get(dtype, "f32")
 
-    if y is not None:
+    split_cat, split_cat_args = None, ()
+    if split_sizes is not None:
+        # The kernel stores K through Y and takes V and k_rope as extra arguments.
+        k_size, v_size = split_sizes
+        heads, rope_size = k_out.shape[1], k_rope.shape[-1]
+        assert y is None and dtype in _half, "split-cat stores fp16/bf16 K/V, not y"
+        assert N == heads * (k_size + v_size), f"N={N} is not heads * sum(split_sizes)"
+        assert k_out.shape == (M, heads, k_size + rope_size), "bad k_out shape"
+        assert v_out.shape == (M, heads, v_size), "bad v_out shape"
+        assert k_rope.shape[0] == M and k_rope.numel() == M * rope_size, "bad k_rope"
+        assert all(
+            t.dtype == dtype and t.device == x.device and t.stride(-1) == 1
+            for t in (k_out, v_out, k_rope)
+        ), "k_out, v_out and k_rope need y's dtype and device and a unit last stride"
+        assert rope_size <= v_size and all(
+            size % 8 == 0 for size in (k_size, v_size, rope_size)
+        ), "split-cat needs sizes that are multiples of 8 and rope <= v_size"
+        split_cat = (k_size, v_size, rope_size)
+        y_buf, ldy = k_out, k_out.stride(0)
+        split_cat_args = (
+            _p(v_out),
+            _p(k_rope),
+            k_out.stride(1),
+            v_out.stride(0),
+            v_out.stride(1),
+            k_rope.stride(0),
+        )
+    elif y is not None:
         assert (
             y.shape[0] == M and y.shape[1] == N
         ), f"y must be ({M}, {N}), got {tuple(y.shape)}"
@@ -140,8 +179,9 @@ def gemm_a16w16(
         y_buf = y
     else:
         y_buf = torch.empty((M, N), device=x.device, dtype=dtype)
-    ldy = y_buf.stride(0) if M > 1 else N
-    assert ldy >= N, f"gemm_a16w16: y row stride {ldy} < N {N}"
+    if split_cat is None:
+        ldy = y_buf.stride(0) if M > 1 else N
+        assert ldy >= N, f"gemm_a16w16: y row stride {ldy} < N {N}"
 
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=dtype)
@@ -182,6 +222,7 @@ def gemm_a16w16(
         sched_strategy,
         main_loop_unroll,
         variant,
+        split_cat,
     )
 
     if physical_mk:
@@ -204,9 +245,10 @@ def gemm_a16w16(
         ldy,
         lda,
         ldb,
+        *split_cat_args,
         _fx.Stream(stream.cuda_stream),
     )
-    return y_buf
+    return y_buf if split_cat is None else (k_out, v_out)
 
 
 __all__ = ["gemm_a16w16"]
