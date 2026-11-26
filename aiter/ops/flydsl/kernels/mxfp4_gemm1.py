@@ -4,11 +4,14 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.compiler.mlir_utils import convert_to_mlir_attr
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_gemm1_kernels import _assert_supported
 from . import buffer_ops, dpp_utils
+from .hadamard import block_hadamard_f32
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
     _buffer_rsrc,
@@ -97,6 +100,7 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    inter_hadamard=0,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -1333,6 +1337,12 @@ def _gemm1_body(
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=swiglu_limit,
             )
+            if const_expr(inter_hadamard):
+                # Lane l % 16 holds output columns [8 * (l % 16), +8) of the
+                # tile, so one block spans inter_hadamard // 8 adjacent lanes.
+                result = block_hadamard_f32(
+                    result, lane, (inter_hadamard // 8).bit_length() - 1
+                )
             if const_expr(out_dtype == "fp8"):
                 # Match the existing two-stage path: activation is materialized
                 # as BF16 before the inter-stage MXFP8 quantization.
@@ -1590,8 +1600,13 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    inter_hadamard=0,
 ):
-    """Compile GEMM1 with expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output.
+
+    ``inter_hadamard`` rotates each block of that many activation columns by
+    a normalized Hadamard matrix before the output quantization.
+    """
     try:
         _assert_supported(
             D_HIDDEN=D_HIDDEN,
@@ -1611,6 +1626,7 @@ def compile_gemm1_a4w4_port(
             num_waves=num_waves,
             native_scale_layout=native_scale_layout,
             k_wave=k_wave,
+            inter_hadamard=inter_hadamard,
         )
     except NotImplementedError as exc:
         raise AssertionError(str(exc)) from exc
@@ -1687,6 +1703,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if inter_hadamard:
+        name_suffix += f"_had{inter_hadamard}"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1787,6 +1805,7 @@ def compile_gemm1_a4w4_port(
                 k_wave=k_wave,
                 epi_splits=epi_splits,
                 k_stages=k_stages,
+                inter_hadamard=inter_hadamard,
             )
 
     @flyc.jit
@@ -1808,7 +1827,7 @@ def compile_gemm1_a4w4_port(
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
-        gemm1_kernel(
+        launcher = gemm1_kernel(
             arg_aq,
             arg_ascale,
             arg_bq,
@@ -1822,11 +1841,19 @@ def compile_gemm1_a4w4_port(
             arg_hidden,
             i32_hidden_row_stride_bytes,
             arg_bias,
-        ).launch(
+        )
+        launcher.launch(
             grid=(grid_x, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
+        if const_expr(inter_hadamard):
+            # The plain kernel already sits at 256 VGPRs; the rotation's few
+            # extra registers would otherwise halve occupancy to one wave.
+            ctx = CompilationContext.get_current()
+            for op in ctx.gpu_module_body.operations:
+                if getattr(op, "OPERATION_NAME", None) == "gpu.func":
+                    op.attributes["rocdl.waves_per_eu"] = convert_to_mlir_attr(2)
 
     if k_stages == 1:
         launch_gemm1.compile_hints = {

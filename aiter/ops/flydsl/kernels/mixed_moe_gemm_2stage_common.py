@@ -40,6 +40,7 @@ from aiter.ops.flydsl.kernels.act import (
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
+from .hadamard import block_hadamard_f32
 from .layout_utils import crd2idx, idx2crd
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
 from .mfma_preshuffle_pipeline import (
@@ -139,8 +140,13 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
+    inter_hadamard: int = 0,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    ``inter_hadamard`` rotates each block of that many activation columns by a
+    normalized Hadamard matrix before the fused fp4/fp8 output quantization.
+    """
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -266,6 +272,7 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
+    had_tag = f"_had{inter_hadamard}" if inter_hadamard else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -281,7 +288,7 @@ def compile_mixed_moe_gemm1_common(
     )
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{shared_clamp_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{had_tag}{heterogeneous_tag}{shared_clamp_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -355,6 +362,38 @@ def compile_mixed_moe_gemm1_common(
         shuffle_dists_s1.append(sh_val)
         sh_val *= 2
     num_shuffle_steps_s1 = len(shuffle_dists_s1)
+
+    had_lane_bits = 0
+    if inter_hadamard:
+        # store_pair sees e_vec consecutive columns per lane, and a run of
+        # cshuffle lanes covers whole rows of the LDS slab, so a block has to
+        # sit inside one such run for the cross-lane butterflies to stay in it.
+        if not need_quant or is_splitk or heterogeneous_b:
+            raise ValueError(
+                "inter_hadamard needs the fused fp4/fp8 output without split-K "
+                "or a heterogeneous shared expert"
+            )
+        if inter_hadamard & (inter_hadamard - 1) or inter_hadamard % e_vec_s1:
+            raise ValueError(
+                f"inter_hadamard={inter_hadamard} must be a power of two and a "
+                f"multiple of e_vec={e_vec_s1}"
+            )
+        if (inter_dim - inter_dim_pad) % inter_hadamard:
+            raise ValueError(
+                f"inter_hadamard={inter_hadamard} must divide the unpadded "
+                f"inter_dim={inter_dim - inter_dim_pad}"
+            )
+        had_seg_n = tile_n // 2 if gate_up_interleave else tile_n
+        if split_lds_out and not gate_up_interleave:
+            had_seg_n //= 2
+        had_run_n = min(32, had_seg_n // e_vec_s1) * e_vec_s1
+        if had_run_n % inter_hadamard:
+            raise ValueError(
+                f"inter_hadamard={inter_hadamard} does not fit the {had_run_n} "
+                f"output columns a lane run covers with tile_n={tile_n}"
+                f"{' (gate/up interleaved)' if gate_up_interleave else ''}"
+            )
+        had_lane_bits = (inter_hadamard // e_vec_s1).bit_length() - 1
 
     pipe_m_repeat = tile_m // 16
     pipe_k_unroll = tile_k_bytes // 128
@@ -2205,6 +2244,10 @@ def compile_mixed_moe_gemm1_common(
                         frag_vals = []
                         for i in range_constexpr(e_vec):
                             frag_vals.append(fx.Vector(frag)[i])
+                        if const_expr(inter_hadamard):
+                            frag_vals = block_hadamard_f32(
+                                frag_vals, fx.Int32(tx), had_lane_bits
+                            )
 
                         local_max = c0_f32
                         for i in range_constexpr(e_vec):

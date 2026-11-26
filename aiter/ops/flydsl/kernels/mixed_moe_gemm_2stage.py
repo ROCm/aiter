@@ -31,6 +31,8 @@ __all__ = [
 _AOT_SOURCES = [
     "kernels/mixed_moe_gemm_2stage_common.py",
     "kernels/act.py",
+    "kernels/dpp_utils.py",
+    "kernels/hadamard.py",
     "kernels/layout_utils.py",
     "kernels/mfma_epilogues.py",
     "kernels/mfma_preshuffle_pipeline.py",
@@ -76,6 +78,7 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    inter_hadamard: int = 0,
 ):
     """Compile an ordinary stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
@@ -105,6 +108,7 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        inter_hadamard=inter_hadamard,
     )
 
 
