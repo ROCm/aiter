@@ -207,17 +207,35 @@ def _check_onewg(gen, topk, block_size, M, case):
     topk_ids = score.topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
     topk_weights = torch.rand(M, topk, device="cuda", generator=gen)
     ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
-    out = moe_sorting(
-        topk_ids,
-        topk_weights,
-        E,
-        4096,
-        torch.bfloat16,
-        block_size,
-        accumulate=False,
-        unordered=True,
-    )
-    used = fm._flydsl_moe_sorting_onewg(topk_ids, topk_weights, E, block_size)
+    # record what the public unordered branch itself returns (no separate launch)
+    import aiter.moev2.segments.sort as sort_mod
+    from aiter.ops.flydsl.kernels.moe_sorting_onewg import onewg_supported
+
+    calls = []
+    orig = sort_mod._flydsl_moe_sorting_onewg
+
+    def recording(*args, **kwargs):
+        calls.append(orig(*args, **kwargs))
+        return calls[-1]
+
+    sort_mod._flydsl_moe_sorting_onewg = recording
+    try:
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            4096,
+            torch.bfloat16,
+            block_size,
+            accumulate=False,
+            unordered=True,
+        )
+    finally:
+        sort_mod._flydsl_moe_sorting_onewg = orig
+    used = calls[0] if calls else None
+    if get_gfx_runtime() == "gfx950" and onewg_supported(M, E, topk, block_size):
+        assert used is not None, "unordered=True did not take the one-workgroup sort"
+        assert all(a is b for a, b in zip(out[:4], used)), "result is not its output"
     if (
         used is None
     ):  # topk=8 at the largest M does not fit one workgroup's LDS: normal path, exact
@@ -253,6 +271,8 @@ def test_moe_sorting_onewg_table_boundary():
     """Configs whose block -> sorted-row bound fills whole 16 B tiles (the table needs one more row for the invalid
     pairs): topk 1 / 2 at the 64-token tier, topk 3 at 384, topk 6 at 192 used to fail the compile-time assert.
     """
+    if get_gfx_runtime() != "gfx950":  # the one-workgroup path is gfx950-only
+        return
     gen = torch.Generator(device="cuda").manual_seed(11)
     for topk, block_size, M in (
         (1, 16, 1),
