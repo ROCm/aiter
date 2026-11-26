@@ -822,7 +822,10 @@ def compile_output(
     vn_dtype: torch.dtype,
     o_dtype: torch.dtype,
     varlen: bool = False,
+    OV: int = V,
 ):
+    """``OV``: V columns per program (V / OV programs per chunk and head)."""
+    assert V % OV == 0 and OV % 64 == 0
     HN = _num(h_dtype)
     VN = _num(vn_dtype)
     ON = _num(o_dtype)
@@ -830,9 +833,9 @@ def compile_output(
 
     @fx.struct
     class Smem:
-        h: fx.Array[fx.BFloat16, V * K, 16]  # K5 snapshot h[v][k]
-        qg: fx.Array[fx.BFloat16, BT * K, 16]
-        vn: fx.Array[fx.BFloat16, V * BT, 16]  # v_new^T [v][t]
+        h: fx.Array[fx.BFloat16, OV * K, 16]  # K5 snapshot rows h[v0 + v][k]
+        qg: fx.Array[fx.BFloat16, BT * K, 16]  # qg, later the o tile
+        vn: fx.Array[fx.BFloat16, OV * BT, 16]  # v_new^T [v][t]
         a: fx.Array[fx.BFloat16, BT * BT, 16]
 
     @flyc.kernel(name="kda_fwd_output_flydsl")
@@ -849,6 +852,7 @@ def compile_output(
     ):
         i_t = fx.block_idx.x
         i_bh = fx.block_idx.y
+        v0 = fx.block_idx.z * OV
         b = i_bh // H
         h = i_bh % H
         tid = fx.thread_idx.x
@@ -859,11 +863,11 @@ def compile_output(
         state = (fx.Int64(b * NT + i_t) * H + fx.Int64(h)) * (K * V)
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
-        s_vn = _lds(lds.vn, V * BT)
+        s_vn = _lds(lds.vn, OV * BT)
         # 128-bit staging; rows past nvalid read row 0 and are zeroed.
-        s_h8 = _lds_n(lds.h, V * K, 8)
-        h_v = _vflat(hs, state, 8)
-        for e in range_constexpr(V * K // 8 // NUM_THREADS):
+        s_h8 = _lds_n(lds.h, OV * K, 8)
+        h_v = _vflat(hs, state + fx.Int64(v0 * K), 8)
+        for e in range_constexpr(OV * K // 8 // NUM_THREADS):
             i8 = (tid + e * NUM_THREADS) * 8
             lds_st_n(s_h8, i8, ldg_n(h_v, i8, 8, HN), BF)
         s_qg8 = _lds_n(lds.qg, BT * K, 8)
@@ -883,13 +887,13 @@ def compile_output(
             x = ldg_n(a_v, _sel(ok, t, 0) * (H * BT) + i4 % BT, 4, fx.Float32)
             lds_st_n(s_a4b, i4, [_sel(ok, y, _zero()) for y in x], BF)
         vn_v = _vflat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V, 8)
-        for e in range_constexpr(BT * V // 8 // NUM_THREADS):
+        for e in range_constexpr(BT * OV // 8 // NUM_THREADS):
             i8 = (tid + e * NUM_THREADS) * 8
-            t = i8 // V
+            t = i8 // OV
             ok = t < nvalid
-            x = ldg_n(vn_v, _sel(ok, t, 0) * V + i8 % V, 8, VN)
+            x = ldg_n(vn_v, _sel(ok, t, 0) * V + v0 + i8 % OV, 8, VN)
             for m in range_constexpr(8):
-                lds_st(s_vn, (i8 % V + m) * BT + t, _sel(ok, x[m], _zero()), BF)
+                lds_st(s_vn, (i8 % OV + m) * BT + t, _sel(ok, x[m], _zero()), BF)
         gpu.barrier()
 
         # o = scale * qg h + Aqk v_new on MFMA; wave I owns rows 16I..16I+15.
@@ -898,9 +902,9 @@ def compile_output(
         lr = lane % 16
         lk = (lane // 16) * 4
         ia = wave * 16 + lr
-        s_h4 = _lds4(lds.h, V * K)
+        s_h4 = _lds4(lds.h, OV * K)
         s_qg4 = _lds4(lds.qg, BT * K)
-        s_vn4 = _lds4(lds.vn, V * BT)
+        s_vn4 = _lds4(lds.vn, OV * BT)
         s_a4 = _lds4(lds.a, BT * BT)
         qa = [
             lds_ld4(s_qg4, ia * K + kt * 16 + lk, BF) for kt in range_constexpr(K // 16)
@@ -910,7 +914,7 @@ def compile_output(
             for jt in range_constexpr(BT // 16)
         ]
         s_qg = _lds(lds.qg, BT * K)
-        for nt in range_constexpr(V // 16):
+        for nt in range_constexpr(OV // 16):
             c = nt * 16 + lr
             acc_h = _zero4()
             for kt in range_constexpr(K // 16):
@@ -928,11 +932,11 @@ def compile_output(
                 )
         gpu.barrier()
         r = tid // 4
-        c0 = (tid % 4) * NE
+        c0 = (tid % 4) * (OV // 4)
         if r < nvalid:
             s_o8 = _lds_n(lds.qg, BT * K, 8)
-            o_vn = _vflat(o, hb * V, 8)
-            for m in range_constexpr(NE // 8):
+            o_vn = _vflat(o, hb * V + fx.Int64(v0), 8)
+            for m in range_constexpr(OV // 32):
                 x = lds_ld_n(s_o8, r * K + c0 + 8 * m, 8, BF)
                 stg_n(o_vn, r * (H * V) + c0 + 8 * m, x, ON)
 
@@ -952,7 +956,7 @@ def compile_output(
         stream: fx.Stream,
     ):
         kernel(qg, hs, vnew, Aqk, o, cbos, clen, T, scale).launch(
-            grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+            grid=(NT, NBH, V // OV), block=(NUM_THREADS, 1, 1), stream=stream
         )
 
     return launch
