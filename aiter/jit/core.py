@@ -576,6 +576,11 @@ class AITER_CONFIG:
 
         # Numeric columns compare as numbers, so 256 and 256.0 are one shape.
         comparable = merge_df.apply(as_numbers)
+        # A blank pad means no pad, as in fused_moe.
+        if "intermediate_pad" in comparable.columns:
+            comparable["intermediate_pad"] = pd.to_numeric(
+                comparable["intermediate_pad"], errors="coerce"
+            ).fillna(0)
         duplicated_mask = comparable.duplicated(subset=dedup_keys, keep=False)
         if not duplicated_mask.any():
             return
@@ -718,6 +723,9 @@ class AITER_CONFIG:
             keys.append("gfx")
         if "_tag" in merge_df.columns:
             keys.append("_tag")
+        # fused_moe matches rows with a nonzero intermediate_pad only to that pad.
+        if "intermediate_pad" in merge_df.columns and "intermediate_pad" not in keys:
+            keys.append("intermediate_pad")
         # Only key on columns actually present in the merged frame. Most
         # families carry cu_num, but some (e.g. the mxscale batched-GEMM
         # table) key on gfx and never carry cu_num; keeping a missing column

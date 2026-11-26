@@ -10,11 +10,11 @@ Please do not modify this code without coordinating with the moev2 owners (@qli8
 aiter/moev2/README.md.
 """
 
-from aiter import ActivationType, dtypes
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe_registry import FusedMoeImplResolutionError, resolve_fused_moe_impl
 from aiter.ops.flydsl.moe_common import GateMode
 
-from ..dispatch import kernel_names
+from ..dispatch import kernel_names, tuned
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec
@@ -53,7 +53,10 @@ class WholeGraph(Segment):
                 unsupported = "prequantized activations"
             elif "num_local_tokens" in p.features:
                 unsupported = "num_local_tokens"
-            elif p.layout.hidden_pad or p.layout.intermediate_pad:
+            elif p.layout.hidden_pad or (
+                p.layout.intermediate_pad
+                and not kernel_name1.startswith("impl__flydsl_gfx942__")
+            ):
                 unsupported = "hidden/intermediate padding"
             elif p.gate_mode is not GateMode.SEPARATED:
                 unsupported = f"gate mode {p.gate_mode.value!r}"
@@ -62,10 +65,20 @@ class WholeGraph(Segment):
                 ActivationType.Swiglu,
             ):
                 unsupported = f"activation {p.activation.activation}"
+            if unsupported is None and p.layout.intermediate_pad:
+                from aiter.ops.flydsl.fused_moe_gfx942 import intermediate_pad_reason
+
+                unsupported = intermediate_pad_reason(
+                    kernel_name1.removeprefix("impl__flydsl_gfx942__"),
+                    p.shape.inter_dim,
+                    p.layout.intermediate_pad,
+                    p.quant_type == QuantType.No and p.w1.dtype == dtypes.bf16,
+                )
             if unsupported is not None:
                 return RowRejection(
                     f"[fused_moe] discarding FlyDSL whole-graph config for "
-                    f"{p.log_keys()}: unsupported {unsupported}; using default heuristics"
+                    f"{tuned.log_keys(p, row)}: unsupported {unsupported}; "
+                    "using default heuristics"
                 )
         if p.is_ep:
             return RowRejection(None)

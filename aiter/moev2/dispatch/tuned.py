@@ -83,7 +83,10 @@ DEDICATED_INDEX_COLUMNS = (
 
 
 def index_columns(dedicated: bool) -> list:
-    return list(INDEX_COLUMNS + (DEDICATED_INDEX_COLUMNS if dedicated else ()))
+    # A default-table row with a nonzero intermediate_pad only matches calls with
+    # that pad; rows with 0 match any pad.
+    extra = DEDICATED_INDEX_COLUMNS if dedicated else ("intermediate_pad",)
+    return list(INDEX_COLUMNS + extra)
 
 
 def ensure_gfx_column(df):
@@ -122,6 +125,11 @@ def read_table(tune_file, _INDEX_COLS, dedicated, tag=None):
         df = df[tags.fillna("").astype(str) == tag]
     elif "_tag" in df.columns:
         df = df[df["_tag"].fillna("") != "flydsl_fallback"]
+    if not dedicated:
+        # A missing or blank pad is 0.
+        pad = df["intermediate_pad"] if "intermediate_pad" in df.columns else 0
+        df = df.assign(intermediate_pad=pd.to_numeric(pad, errors="coerce"))
+        df["intermediate_pad"] = df["intermediate_pad"].fillna(0).astype(int)
 
     # Primary dict: keep original act_type for exact-match lookup.
     df_primary = df.copy()
@@ -219,22 +227,52 @@ def table_for(problem):
     return _default_table() if tune_file is None else _dedicated_table(tune_file)
 
 
-def lookup_keys(problem):
-    """`(keys, keys_disabled)` the legacy lookup uses; `keys` is also the log key."""
+def lookup_keys(problem, pad=0):
+    """`(keys, keys_disabled)` the legacy lookup uses for rows keyed on `pad`."""
     keys = problem.log_keys()
+    if problem.extras.get("tuned_table") is None:
+        keys += (pad,)
     keys_disabled = keys[:7] + (_ACT_TYPE_DISABLED_KEY,) + keys[8:]
     return keys, keys_disabled
+
+
+def lookup_padded(problem, tables=None):
+    """The default-table row keyed on the call's nonzero intermediate_pad, or None."""
+    pad = problem.layout.intermediate_pad
+    if not pad or problem.extras.get("tuned_table") is not None:
+        return None
+    c2s = table_for(problem) if tables is None else tables
+    if not c2s:
+        return None
+    primary, fallback = c2s
+    keys, keys_disabled = lookup_keys(problem, pad)
+    result = primary.get(keys[:7] + (str(problem.activation.activation),) + keys[8:])
+    if result is None:
+        result = fallback.get(keys_disabled)
+    return result
+
+
+def log_keys(problem, row):
+    """`problem.log_keys()`, plus the pad when `row` is the call's pad-keyed row."""
+    keys = problem.log_keys()
+    if row is not None and row is lookup_padded(problem):
+        keys += (problem.layout.intermediate_pad,)
+    return keys
 
 
 def lookup(problem, tables=None):
     """The tuned row for `problem` (the legacy `_lookup_cfg`), or None.
 
-    Exact key first, then the activation-agnostic table (default table only), then, for a
-    token count above the smallest tier, the smaller tiers in descending order.
+    A row keyed on the call's pad first, then the exact key, then the
+    activation-agnostic table (default table only), then, for a token count above the
+    smallest tier, the smaller tiers in descending order.
     """
     c2s = table_for(problem) if tables is None else tables
     if not c2s:
         return None
+    result = lookup_padded(problem, c2s)
+    if result is not None:
+        return result
     keys, keys_disabled = lookup_keys(problem)
     dedicated = problem.extras.get("tuned_table") is not None
     token = problem.shape.m

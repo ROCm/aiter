@@ -35,8 +35,16 @@ def compile_moe_gemm2(
     down_path="default",
     down_output_padding_bytes=0,
     has_num_local_tokens=False,
+    K_VALID=None,
 ):
-    TILE_K = 64
+    # K is the row length of the input and weight; split-K and batch1 stop at
+    # K_VALID, skipping a padded intermediate tail.
+    if K_VALID is None:
+        K_VALID = K
+    if K_VALID != K and alg not in ("splitk", "batch1"):
+        raise ValueError("K_VALID < K needs the split-K or batch1 kernels")
+    # A BF16 MFMA K block is 32 wide, so BF16 split-K and batch1 can step by 32.
+    TILE_K = 32 if weight_dtype == "bf16" and (K % 64 != 0 or K_VALID % 64 != 0) else 64
     act_quant_type, swiglu_limit = validate_gemm_options(
         weight_dtype,
         weight_quant_type,
@@ -47,7 +55,7 @@ def compile_moe_gemm2(
         swiglu_limit,
     )
     if alg == "batch1":
-        assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
+        assert K % TILE_K == 0, f"batch1 Down requires K divisible by {TILE_K}"
     # The sorted algorithms bound the rows in moe_sorting.
     assert not has_num_local_tokens or alg == "batch1"
     if alg == "prefill_1x4":
@@ -94,7 +102,7 @@ def compile_moe_gemm2(
         weight_dtype = fx.Float8E4M3FNUZ
 
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
-        K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK
+        K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK, K_VALID
     )
 
     def _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale):

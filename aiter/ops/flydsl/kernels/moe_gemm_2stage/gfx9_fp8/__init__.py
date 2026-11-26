@@ -41,7 +41,10 @@ def compile_gemm(
     down_output_padding_bytes=0,
     fused_down_clear=False,
     has_num_local_tokens=False,
+    inter_valid=None,
 ):
+    # inter_valid < inter_dim: the weights end in a padded intermediate tail
+    # that Gate/Up does not compute and Down does not read.
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
             raise ValueError("Down-specific options cannot be used for Gate/Up")
@@ -61,6 +64,7 @@ def compile_gemm(
             swiglu_limit=swiglu_limit,
             fused_down_clear=fused_down_clear,
             has_num_local_tokens=has_num_local_tokens,
+            N_VALID=None if inter_valid is None else 2 * inter_valid,
         )
     return compile_moe_gemm2(
         N=N,
@@ -80,4 +84,5 @@ def compile_gemm(
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         has_num_local_tokens=has_num_local_tokens,
+        K_VALID=inter_valid,
     )

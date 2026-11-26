@@ -380,6 +380,17 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertNotIn("10.5", canonical)
         self.assertIn("9.5", model)
 
+    def test_merge_reads_blank_intermediate_pad_as_zero(self):
+        """fused_moe reads a blank intermediate_pad as no pad, so the shape in a
+        table without the column and in one with a blank cell is one shape."""
+        err, _, canonical, model = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,10.0\n",
+            "gfx,cu_num,M,N,K,intermediate_pad,us\ngfx950,256,1,64,128,,9.0\n",
+        )
+        self.assertIn("duplicate shape", (err or "").lower())
+        self.assertNotIn("10.0", canonical)
+        self.assertIn("9.0", model)
+
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
 
