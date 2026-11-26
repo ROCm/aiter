@@ -339,7 +339,101 @@ def _topk_topp_sample_stats_gluon_kernel(
             gl.store(rng_state_ptr, gl.load(rng_state_ptr) + gl.num_programs(0))
 
 
-@gluon.jit(repr=_select_repr)
+# --------------------------------------------------------------------------- #
+# ADV (atom ATOM_MTP_ADVANCE_IN_SELECT): the draft pass's advance in the select #
+# --------------------------------------------------------------------------- #
+@gluon.jit
+def _adv_floor_div(a, b: gl.constexpr):
+    """``a // b`` rounded toward minus infinity (torch's) for ``b > 0``."""
+    q = a // b
+    return q - ((q * b != a) & (a < 0)).to(q.dtype)
+
+
+@gluon.jit
+def _adv_meta(
+    pos_ptr,
+    ctx_ptr,
+    rej_ptr,
+    indptr_ptr,
+    bt_ptr,
+    bt_stride,
+    slot_ptr,
+    cuq_ptr,
+    rowids_ptr,
+    possrc_ptr,
+    anchors_ptr,
+    tiles_ptr,
+    num_slot_rows,
+    scheduled_bs,
+    running_bs,
+    FIRST: gl.constexpr,
+    HAS_REJECT: gl.constexpr,
+    BLOCK: gl.constexpr,
+    KV_PAGE: gl.constexpr,
+    SLOT_PAGE: gl.constexpr,
+    SPLIT_TILE: gl.constexpr,
+    SPLIT_HEADS: gl.constexpr,
+    SPLIT_PROGRAMS: gl.constexpr,
+    SPLIT_MIN: gl.constexpr,
+    SPLIT_MAX: gl.constexpr,
+    NW: gl.constexpr,
+):
+    """atom eagle_fused_glue._advance_draft_pass_kernel's program 0 (the
+    one-row-per-sequence metadata a drafted token on), the same values."""
+    LA: gl.constexpr = gl.BlockedLayout([1], [32], [NW], [0])
+    r = gl.arange(0, BLOCK, layout=LA)
+    live = r < running_bs
+    real = r < scheduled_bs
+    if FIRST:
+        gl.store(
+            cuq_ptr + r,
+            gl.load(rowids_ptr + r, mask=r <= running_bs),
+            mask=r <= running_bs,
+        )
+        anchor = gl.load(anchors_ptr + gl.minimum(r, scheduled_bs - 1), mask=live)
+        pos = gl.load(possrc_ptr + anchor, mask=live)
+    else:
+        pos = gl.load(pos_ptr + r, mask=live)
+    gl.store(pos_ptr + r, pos + 1, mask=live)
+    ctx = gl.load(ctx_ptr + r, mask=live, other=0) + 1
+    if HAS_REJECT:
+        ctx = ctx - gl.load(rej_ptr + r, mask=real, other=0).to(ctx.dtype)
+    gl.store(ctx_ptr + r, ctx, mask=live)
+    counts = gl.where(real, (ctx + KV_PAGE - 1) // KV_PAGE, 0)
+    gl.store(
+        indptr_ptr + 1 + r,
+        gl.cumsum(counts, axis=0).to(indptr_ptr.dtype.element_ty),
+        mask=live,
+    )
+    gl.store(indptr_ptr + r, gl.zeros_like(r).to(indptr_ptr.dtype.element_ty), mask=r == 0)
+    if SPLIT_TILE > 0:
+        tiles = _adv_floor_div(ctx + (SPLIT_TILE - 1), SPLIT_TILE).to(gl.int64)
+        want = gl.sum(gl.where(live, tiles, 0), axis=0) * SPLIT_HEADS
+        want = _adv_floor_div(want + (SPLIT_PROGRAMS - 1), SPLIT_PROGRAMS)
+        want = gl.minimum(gl.maximum(want, SPLIT_MIN), SPLIT_MAX)
+        gl.store(tiles_ptr, want.to(gl.int32))
+    last = gl.maximum(ctx.to(gl.int64) - 1, 0)
+    col = last // SLOT_PAGE
+    page = gl.load(
+        bt_ptr + r.to(gl.int64) * bt_stride + col,
+        mask=r < num_slot_rows,
+        other=0,
+    ).to(gl.int64)
+    slot = gl.where(r < num_slot_rows, page * SLOT_PAGE + (last - col * SLOT_PAGE), -1)
+    gl.store(slot_ptr + r, slot, mask=live)
+
+
+# the advance's runtime counts and metadata views (any offset): one compiled
+# variant a configuration, as atom's advance kernel
+_ADV_NO_SPEC = ["adv_col", "adv_sbs", "adv_rbs", "adv_n", "adv_nslot", "adv_rec_bs"]
+_ADV_NO_ALIGN = [
+    "adv_ids_ptr", "adv_draft_ptr", "adv_pos_ptr", "adv_ctx_ptr", "adv_rej_ptr", "adv_indptr_ptr",
+    "adv_bt_ptr", "adv_slot_ptr", "adv_cuq_ptr", "adv_rowids_ptr", "adv_possrc_ptr", "adv_anchors_ptr",
+    "adv_tiles_ptr", "adv_rec_ptr", "adv_rtok_ptr", "adv_rslot_ptr",
+]
+
+
+@gluon.jit(repr=_select_repr, do_not_specialize=_ADV_NO_SPEC, do_not_specialize_on_alignment=_ADV_NO_ALIGN)
 def _topk_topp_sample_select_gluon_kernel(
     logits_ptr,
     stride_row,
@@ -400,6 +494,54 @@ def _topk_topp_sample_select_gluon_kernel(
     CAP1_: gl.constexpr = 0,
     CAP2_: gl.constexpr = 0,
     NP_P2: gl.constexpr = 0,
+    # ADV (atom ATOM_MTP_ADVANCE_IN_SELECT, default 0): 1 = a mid draft pass's
+    # advance (eagle_fused_glue._advance_draft_pass_kernel: program adv_n the
+    # metadata, program r its row's next ids / hidden / draft id / records), 2
+    # = the last pass's tail (_last_draft_pass_kernel: draft id and records)
+    adv_ids_ptr=None,
+    adv_hsrc_ptr=None,
+    adv_hsrc_stride=None,
+    adv_hdst_ptr=None,
+    adv_hdst_stride=None,
+    adv_draft_ptr=None,
+    adv_draft_stride=None,
+    adv_col=None,
+    adv_sbs=None,
+    adv_rbs=None,
+    adv_n=None,
+    adv_pos_ptr=None,
+    adv_ctx_ptr=None,
+    adv_rej_ptr=None,
+    adv_indptr_ptr=None,
+    adv_bt_ptr=None,
+    adv_bt_stride=None,
+    adv_slot_ptr=None,
+    adv_cuq_ptr=None,
+    adv_rowids_ptr=None,
+    adv_possrc_ptr=None,
+    adv_anchors_ptr=None,
+    adv_tiles_ptr=None,
+    adv_nslot=None,
+    adv_rec_ptr=None,
+    adv_rtok_ptr=None,
+    adv_rslot_ptr=None,
+    adv_rec_slot_stride=None,
+    adv_rec_col_stride=None,
+    adv_rtok_slot_stride=None,
+    adv_rec_bs=None,
+    ADV: gl.constexpr = 0,
+    ADV_FIRST: gl.constexpr = False,
+    ADV_REJECT: gl.constexpr = False,
+    ADV_REC: gl.constexpr = False,
+    ADV_BLOCK: gl.constexpr = 16,
+    ADV_H: gl.constexpr = 0,
+    ADV_KV_PAGE: gl.constexpr = 1,
+    ADV_SLOT_PAGE: gl.constexpr = 1,
+    ADV_SPLIT_TILE: gl.constexpr = 0,
+    ADV_SPLIT_HEADS: gl.constexpr = 1,
+    ADV_SPLIT_PROGRAMS: gl.constexpr = 1,
+    ADV_SPLIT_MIN: gl.constexpr = 1,
+    ADV_SPLIT_MAX: gl.constexpr = 1,
 ):
     # FAST: the pairwise ranks take up to CAP1_ groups / CAP2_ columns before
     # the exact first-k searches (realistic rows often bound 64-200 groups)
@@ -414,10 +556,29 @@ def _topk_topp_sample_select_gluon_kernel(
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
     r = gl.program_id(0)
+    if ADV == 1:
+        if r == adv_n:
+            # the advance's metadata: one more program, no token needed
+            _adv_meta(
+                adv_pos_ptr, adv_ctx_ptr, adv_rej_ptr, adv_indptr_ptr, adv_bt_ptr,
+                adv_bt_stride, adv_slot_ptr, adv_cuq_ptr, adv_rowids_ptr, adv_possrc_ptr,
+                adv_anchors_ptr, adv_tiles_ptr, adv_nslot, adv_sbs, adv_rbs,
+                ADV_FIRST, ADV_REJECT, ADV_BLOCK, ADV_KV_PAGE, ADV_SLOT_PAGE,
+                ADV_SPLIT_TILE, ADV_SPLIT_HEADS, ADV_SPLIT_PROGRAMS, ADV_SPLIT_MIN,
+                ADV_SPLIT_MAX, NW,
+            )
+            return
     src, req = _row_source(
         r, verify_idx_ptr, bonus_idx_ptr, cu_ptr, n_verify, n_cu, ROW_MAP, BLOCK_BS, L1
     )
     t = gl.load(temp_ptr + req)
+    if ADV == 1:
+        # the next pass's hidden row r (row min(r, sbs - 1) of this pass's),
+        # loaded now, stored at the end
+        HL: gl.constexpr = gl.BlockedLayout([8], [32], [NW], [0])
+        hc = gl.arange(0, ADV_H, layout=HL)
+        h_src = gl.minimum(r, adv_sbs - 1).to(gl.int64)
+        h_row = gl.load(adv_hsrc_ptr + h_src * adv_hsrc_stride + hc, mask=(hc >= 0) & (r < adv_rbs))
 
     lane = gl.arange(0, 32 * NW, layout=L1)
     # softmax statistics of the row
@@ -591,7 +752,10 @@ def _topk_topp_sample_select_gluon_kernel(
     if RNG_STATE:
         # _draft_uniform_kernel's draw: tl.rand(seed, state + r), the state
         # already advanced by the rows (the stats kernel)
-        st = gl.load(rng_state_ptr) - gl.num_programs(0)
+        if ADV == 1:
+            st = gl.load(rng_state_ptr) - adv_n  # the grid has one more program
+        else:
+            st = gl.load(rng_state_ptr) - gl.num_programs(0)
         u = _rand_at(seed_lo, seed_hi, st + r, offs)
     elif PHILOX:
         u = _philox_uniform(r, seed_lo, seed_hi, off_lo, off_hi, offs)
@@ -648,3 +812,39 @@ def _topk_topp_sample_select_gluon_kernel(
         gl.store(dbg + 2 * KB + offs, pk.to(gl.int32, bitcast=True), mask=kmask)
         gl.store(dbg + 3 * KB, top_p.to(gl.int32, bitcast=True))
         gl.store(dbg + 3 * KB + 1, Z.to(gl.int32, bitcast=True))
+    if ADV > 0:
+        if r < adv_sbs:
+            gl.store(
+                adv_draft_ptr + r.to(gl.int64) * adv_draft_stride + adv_col,
+                token.to(adv_draft_ptr.dtype.element_ty),
+            )
+        if ADV_REC:
+            # DraftRejectionSampler.store_step: the row's record (the words the
+            # debug row holds) and token into its slot, column adv_col
+            if r < adv_rec_bs:
+                rslot = gl.load(adv_rslot_ptr + r).to(gl.int64)
+                arec = adv_rec_ptr + rslot * adv_rec_slot_stride + adv_col * adv_rec_col_stride
+                gl.store(arec + offs, col, mask=kmask)
+                gl.store(arec + KB + offs, p.to(gl.int32, bitcast=True), mask=kmask)
+                gl.store(arec + 2 * KB + offs, pk.to(gl.int32, bitcast=True), mask=kmask)
+                gl.store(arec + 3 * KB, top_p.to(gl.int32, bitcast=True))
+                gl.store(arec + 3 * KB + 1, Z.to(gl.int32, bitcast=True))
+                gl.store(adv_rtok_ptr + rslot * adv_rtok_slot_stride + adv_col, token)
+    if ADV == 1:
+        # the next pass's ids: row r its token, the pad rows (sbs .. rbs - 1)
+        # row sbs - 1's
+        if r < adv_sbs:
+            gl.store(adv_ids_ptr + r, token.to(adv_ids_ptr.dtype.element_ty))
+        if r == adv_sbs - 1:
+            for p0 in range(adv_sbs, adv_rbs, 32 * NW):
+                pr = p0 + lane
+                gl.store(
+                    adv_ids_ptr + pr,
+                    (token + lane * 0).to(adv_ids_ptr.dtype.element_ty),
+                    mask=pr < adv_rbs,
+                )
+        gl.store(
+            adv_hdst_ptr + r.to(gl.int64) * adv_hdst_stride + hc,
+            h_row,
+            mask=(hc >= 0) & (r < adv_rbs),
+        )

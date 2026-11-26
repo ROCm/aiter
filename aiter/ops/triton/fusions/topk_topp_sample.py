@@ -104,6 +104,7 @@ def topk_topp_sample(
     out2: torch.Tensor | None = None,
     record: tuple[torch.Tensor, torch.Tensor, int] | None = None,
     stats: torch.Tensor | None = None,
+    advance: dict | None = None,
 ) -> torch.Tensor:
     """Sample one token a row from ``softmax(logits / t)`` under top-k and top-p.
 
@@ -159,6 +160,11 @@ def topk_topp_sample(
             keys (int16), the softmax partial max / t (f32 word 4) and sum
             of exp(x / t - max / t) (word 5). No stats kernel.
             With ``rng_state``, ``state[0]`` was advanced by n with them.
+        advance: gluon_select without row maps only (atom
+            ATOM_MTP_ADVANCE_IN_SELECT): a draft pass's advance in the select
+            kernel, as atom ``eagle_fused_glue`` builds it (`select_advance_args`):
+            ``{"kw": kernel keyword args, "mid": bool}``; ``mid`` adds one
+            program (the metadata) to the grid.
         record: ``(ctx, pos, width)``, gluon_select only: after the draw,
             ``ctx[r * width + 1 + pos[r]] = token`` (when ``pos[r] < width -
             1``) and ``pos[r] += 1`` (atom ``DraftPresencePenalty.record``).
@@ -282,7 +288,14 @@ def topk_topp_sample(
             seed, offset = int(rng_state[1]), 0
         else:
             seed, offset = philox if philox is not None else (0, 0)
-        _topk_topp_sample_select_gluon_kernel[(n,)](
+        adv_kw = {}
+        grid_n = n
+        if advance is not None:
+            assert not row_map and debug is not None, "advance: one row a request"
+            adv_kw = advance["kw"]
+            assert adv_kw["adv_n"] == n
+            grid_n = n + (1 if advance["mid"] else 0)
+        _topk_topp_sample_select_gluon_kernel[(grid_n,)](
             logits,
             logits.stride(0),
             verify_rows,
@@ -335,6 +348,7 @@ def topk_topp_sample(
             num_warps=nw,
             **({"CAP1_": _CAP1, "CAP2_": _CAP2} if _SELECT_FAST else {}),
             NP_P2=triton.next_power_of_2(np_) if stats is not None else 0,
+            **adv_kw,
         )
         return out
     cpp = stats_cfg["CHUNKS_PER_PROGRAM"]
