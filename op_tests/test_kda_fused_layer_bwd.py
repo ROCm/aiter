@@ -333,6 +333,160 @@ def test_kda_chunk_fwd_backends(b, t, h, k, lb, dtype):
     return ret
 
 
+KDA_STAGES = (
+    "gate_proj",
+    "gate_proj_bwd",
+    "sigmoid_gate_proj",
+    "l2norm_bwd",
+    "rmsnorm_bwd",
+    "chunk_bwd_triton",
+    "chunk_bwd_flydsl",
+)
+
+
+def _stage_case(stage, m, h, k, d, r, lb, dtype):
+    """(kernel fn, torch fn, inputs) for one GPU-only stage, or a skip reason.
+
+    Both sides get the same (rounded) inputs; the torch side is fp32 math."""
+    from aiter.ops import kda_fused_layer as L
+
+    hk = h * k
+    A_log = torch.zeros(max(h, K3_A_LOG_LEN))
+    A_log[:h] = torch.linspace(-0.5, 1.2, h)
+    if stage in ("gate_proj", "gate_proj_bwd", "sigmoid_gate_proj"):
+        if dtype not in (dtypes.bf16, dtypes.fp16) or get_gfx_runtime() != "gfx950":
+            return "FlyDSL GEMM epilogues need gfx950 and bf16/fp16"
+        from aiter.ops.flydsl import kda_layer_bwd as fk
+
+        lr = torch.randn(m, r).to(dtype)
+        f_b = (torch.randn(hk, r) * r**-0.5).to(dtype)
+        dt_bias = torch.randn(hk)
+        dg = torch.randn(m, hk)
+        P = L._TorchProj
+        if stage == "gate_proj":
+            return (
+                lambda: fk.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
+                lambda: P.kda_gate_proj(lr, f_b, dt_bias, A_log, h, lb),
+            )
+        if stage == "gate_proj_bwd":
+
+            def per_head(out):
+                dz, dterm = out
+                return dz, dterm.view(m, h, k).sum((0, 2))
+
+            return (
+                lambda: per_head(
+                    fk.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
+                ),
+                lambda: per_head(
+                    P.kda_gate_proj_bwd(lr, f_b, dt_bias, A_log, h, dg, lb)
+                ),
+            )
+        x = torch.randn(m, d).to(dtype)
+        g_proj = (torch.randn(hk, d) * d**-0.5).to(dtype)
+        aux = torch.randn(m, hk)
+        return (
+            lambda: fk.sigmoid_gate_proj(x, g_proj, aux),
+            lambda: P.sigmoid_gate_proj(x, g_proj, aux),
+        )
+    if stage == "l2norm_bwd":
+        from aiter.ops.flydsl import kda_layer_bwd as fk
+
+        xx = torch.randn(m, h, k).to(dtype).float()
+        dy = torch.randn(m, h, k).to(dtype).float()
+        return (
+            lambda: fk.l2norm_bwd(xx, dy, L.L2NORM_EPS),
+            lambda: L._TorchOps.l2norm_bwd(xx, dy, L.L2NORM_EPS),
+        )
+    if stage == "rmsnorm_bwd":
+        try:
+            from aiter.ops.flydsl.gated_rmsnorm_bwd import gated_rmsnorm_bwd
+        except ImportError as err:
+            return f"#8741 missing: {err}"
+        o = torch.randn(1, m, h, k)
+        gp = torch.randn(1, m, h, k)
+        w = 1.0 + torch.randn(k) * 0.1
+        dy = torch.randn(1, m, h, k)
+        return (
+            lambda: gated_rmsnorm_bwd(o, gp, w, dy, 1e-6),
+            lambda: L._TorchOps.gated_rmsnorm_bwd(o, gp, w, dy, 1e-6),
+        )
+    # chunk backward with the layer's fused prologue (raw q/k, raw gate, beta logit)
+    backend = stage.rsplit("_", 1)[1]
+    try:
+        impl, fuses = L._PIECE_LOADERS[("chunk_bwd", backend)]()
+    except ImportError as err:
+        return f"{backend} chunk bwd missing: {err}"
+    if backend == "flydsl" and dtype != dtypes.bf16:
+        return "FlyDSL chunk bwd is bf16-only"
+    q = torch.randn(1, m, h, k).to(dtype)
+    kk = torch.randn(1, m, h, k).to(dtype)
+    v = torch.randn(1, m, h, k).to(dtype)
+    g = torch.randn(1, m, h, k)
+    beta = torch.randn(1, m, h)
+    do = torch.randn(1, m, h, k)
+    kw = {
+        "use_qk_l2norm_in_kernel": "qk_l2norm" in fuses,
+        "use_beta_sigmoid_in_kernel": "beta_sigmoid" in fuses,
+    }
+    if not kw["use_qk_l2norm_in_kernel"]:
+        q, kk = (torch.nn.functional.normalize(t.float(), dim=-1) for t in (q, kk))
+    if not kw["use_beta_sigmoid_in_kernel"]:
+        beta = torch.sigmoid(beta)
+    if "gate" in fuses and (lb is None or L._accepts(impl, "lower_bound")):
+        kw.update(use_gate_in_kernel=True, A_log=A_log[:h], dt_bias=torch.randn(hk))
+        if lb is not None:
+            kw["lower_bound"] = lb
+    else:
+        g = L.kda_gate(g, A_log, lb)
+    extra = {}
+    if L._has_param(impl, "compute_dtype"):
+        extra["compute_dtype"] = L._compute_dtype_of(dtype)
+    scale = k**-0.5
+
+    def grads(out):
+        return [t for t in out if t is not None]
+
+    return (
+        lambda: grads(impl(do, q, kk, v, g, beta, scale, 64, **kw, **extra)),
+        lambda: grads(L.chunk_kda_bwd_torch(do, q, kk, v, g, beta, scale, 64, **kw)),
+    )
+
+
+@benchmark()
+def test_kda_stage(stage, m, h, k, d, r, lb, dtype):
+    """One GPU-only stage of the fused path vs its torch math on identical
+    inputs, so a mismatch is pinned to that stage."""
+    case = _stage_case(stage, m, h, k, d, r, lb, dtype)
+    if isinstance(case, str):
+        return {"gfx": get_gfx_runtime(), "status": f"skip: {case}", "failed": "-"}
+    kernel, ref = case
+    out, us = run_perftest(kernel, num_iters=3, num_warmup=1)
+    want = ref()
+    out = out if isinstance(out, (tuple, list)) else (out,)
+    want = want if isinstance(want, (tuple, list)) else (want,)
+    errs, failed = [], []
+    for i, (o, rf) in enumerate(zip(out, want)):
+        sc = rf.float().abs().max().clamp_min(1e-6)
+        err = checkAllclose(
+            (rf.float() / sc).to(dtypes.fp32),
+            (o.float() / sc).to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"stage {stage}[{i}]",
+        )
+        errs.append(err)
+        if err:
+            failed.append(str(i))
+    return {
+        "gfx": get_gfx_runtime(),
+        "status": "ran",
+        "us": us,
+        "err": max(errs),
+        "failed": ",".join(failed) or "-",
+    }
+
+
 def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
     """Reference for the fused projections, fp32 (A_log: first h entries)."""
     with torch.enable_grad():
@@ -571,6 +725,20 @@ def main():
                 ],
                 layer_axes,
             )
+        stage_df = summarize(
+            "kda GPU-only stage diff summary",
+            [
+                test_kda_stage(stage, b * t, h, k, d, r, lb, dtype)
+                for stage, b, t, (d, h, k, _, r), lb in itertools.product(
+                    KDA_STAGES, args.batch, args.seqlen, args.shape, args.gate_lb
+                )
+            ],
+            layer_axes,
+        )
+        bad_stage = stage_df[stage_df["failed"] != "-"]
+        assert bad_stage.empty, "GPU-only stages outside tolerance:\n" + bad_stage[
+            ["stage", "m", "lb", "failed"]
+        ].to_string(index=False)
         bad = df[df["failed grads"] != "-"]
         assert bad.empty, "flydsl pieces outside tolerance:\n" + bad[
             ["piece", "t", "used", "failed grads"]

@@ -367,9 +367,27 @@ def _token_major(*ts, dtype=None):
 def _chunk_fwd_triton():
     from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-    def run(q, k, v, g, beta, scale, chunk_size, cu_seqlens=None, compute_dtype=None):
+    def run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        chunk_size,
+        cu_seqlens=None,
+        compute_dtype=None,
+        lower_bound=None,
+    ):
         q, k, v = _token_major(q, k, v, dtype=compute_dtype or torch.bfloat16)
         g, beta = _token_major(g, beta)
+        # same gate mode as the backward: a bounded (safe) gate when the layer
+        # has a lower bound; g is already the finished log decay
+        kw = (
+            {}
+            if lower_bound is None
+            else {"safe_gate": True, "lower_bound": lower_bound}
+        )
         o, _ = chunk_kimi_delta_attn(
             q,
             k,
@@ -379,6 +397,7 @@ def _chunk_fwd_triton():
             scale=scale,
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
+            **kw,
         )
         return o.float()
 
@@ -500,8 +519,9 @@ def _resolve(name, on_gpu, dtype=None):
             continue
         try:
             found.append((backend, _PIECE_LOADERS[(name, backend)]()))
-        except ImportError:
-            pass
+        except ImportError as err:
+            # recorded, not hidden: a selected kernel that is not in the tree
+            LAST_PIECES[f"{name}_{backend}_missing"] = f"ImportError: {err}"
     return found
 
 
@@ -519,7 +539,9 @@ def _piece(impl):
     return module.rsplit(".", 1)[-1]
 
 
-def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None, cu_seqlens=None):
+def _chunk_fwd(
+    q, k, v, g, beta, scale, chunk_size, dtype=None, cu_seqlens=None, lower_bound=None
+):
     """Chunk forward by the selected backend; a kernel that rejects the call
     (``ValueError``) or fails to build falls through to the next choice."""
     for backend, fn in _resolve("chunk_fwd", q.is_cuda, dtype):
@@ -529,6 +551,8 @@ def _chunk_fwd(q, k, v, g, beta, scale, chunk_size, dtype=None, cu_seqlens=None)
             kw = {}
             if _has_param(fn, "compute_dtype"):
                 kw["compute_dtype"] = _compute_dtype_of(dtype)
+            if lower_bound is not None and _has_param(fn, "lower_bound"):
+                kw["lower_bound"] = lower_bound
             o = fn(q, k, v, g, beta, scale, chunk_size, cu_seqlens, **kw)
         except (ValueError, NotImplementedError, RuntimeError) as err:
             LAST_PIECES[f"chunk_fwd_{backend}_skipped"] = type(err).__name__
@@ -766,7 +790,9 @@ def _kda_layer_fused_fwd(
             o = _chunk_torch_varlen(*chunk_in, scale, chunk_size, cu_seqlens)
             LAST_PIECES["chunk_fwd"] = "torch(autograd)"
         else:
-            o = _chunk_fwd(q, k, v, g, beta, scale, chunk_size, x.dtype, cu_seqlens)
+            o = _chunk_fwd(
+                q, k, v, g, beta, scale, chunk_size, x.dtype, cu_seqlens, lower_bound
+            )
     o_graph = o if chunk_graph else None
     o = o.detach()
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
