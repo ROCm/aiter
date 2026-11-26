@@ -10,8 +10,9 @@ Each K tile of A, W and both e8m0 scales moves global -> LDS by TDM, then LDS
 -> registers in the WMMA lane layout. Everything else is still stripped:
 
 * weights in the production layouts ((16,16)-preshuffled fp4, n32k4 e8m0; see
-  preshuffle_weights), activations and their scales plain row-major (no m16k4
-  activation-scale shuffle),
+  preshuffle_weights), activations plain row-major, activation scales grouped
+  per (M tile, K tile) so each K tile is one contiguous TDM run (see
+  preshuffle_act_scale; production's m16k4 layout serves the same purpose),
 * m_warp x n_warp waves per workgroup (each owns one sub-tile of the output,
   the four TDM copies are spread over the waves), num_buffers LDS stages with
   TDM running num_buffers-1 K tiles ahead of the WMMAs, no split-K, no
@@ -114,6 +115,8 @@ def build_naive_grouped_gemm(
     A_TILE_BYTES = A_ROW_BYTES // K_TILES  # one row inside one K tile
     W_TILE_BYTES = W_ROW_BYTES // K_TILES
     SC_TILE_BYTES = SC_ROW_BYTES // K_TILES  # one dword per WMMA K step
+    AS_BLOCK_BYTES = tile_m * SC_TILE_BYTES  # A scales of one (M tile, K tile)
+    AS_ROW_BYTES = K_TILES * AS_BLOCK_BYTES  # ... of one M tile, every K tile
     A_STEP_BYTES = A_TILE_BYTES // K_STEPS  # one row inside one WMMA K step
     W_STEP_BYTES = W_TILE_BYTES // K_STEPS
     A_DWORDS = A_ROWS * A_STEP_BYTES // (4 * WAVE)  # 8 (fp4) or 16 (fp8)
@@ -153,7 +156,7 @@ def build_naive_grouped_gemm(
         c: fx.Pointer,  # [M, N] bf16
         a: fx.Pointer,  # [M, A_ROW_BYTES]
         w: fx.Pointer,  # [E, N, K/2]
-        a_scale: fx.Pointer,  # [M, K/32] e8m0
+        a_scale: fx.Pointer,  # [M/tile_m, K_TILES, tile_m, SC_TILE_BYTES] e8m0
         w_scale: fx.Pointer,  # [E, N, K/32] e8m0
         psum: fx.Pointer,  # [E] int32
     ):
@@ -224,7 +227,8 @@ def build_naive_grouped_gemm(
         tdm_loads = [
             tdm_k_tile(a, m_row0, tile_m, A_ROW_BYTES, A_TILE_BYTES, A_LDS, A_LDS_PITCH),
             tdm_k_tile(w, w_grp0, tile_n // 16, WG_ROW_BYTES, WG_TILE_BYTES, W_LDS),
-            tdm_k_tile(a_scale, m_row0, tile_m, SC_ROW_BYTES, SC_TILE_BYTES, AS_LDS),
+            # one row per M tile; K tile kt is its kt-th contiguous block
+            tdm_k_tile(a_scale, fx.Int64(fx.block_idx.x), 1, AS_ROW_BYTES, AS_BLOCK_BYTES, AS_LDS),
             tdm_k_tile(w_scale, ws_grp0, tile_n // 32, SB_ROW_BYTES, SB_TILE_BYTES, WS_LDS),
         ]
 
@@ -435,6 +439,22 @@ def preshuffle_weights(w, w_scale, tile_k):
     return shuffle_weight(w, layout=(16, 16)), shuffle_scale_n32k4(w_scale)
 
 
+def preshuffle_act_scale(a_scale, tile_m, tile_k):
+    """[M, K/32] e8m0 -> [M/tile_m, Kp/tile_k, tile_m, tile_k/32] (Kp = K rounded up).
+
+    Row-major scales cost the A-scale TDM one tile_k/32-byte run per row; grouped
+    by (M tile, K tile) they are one run per K tile. A real pipeline has the
+    quantizer write this layout, so it stays outside the GEMM like the weights'.
+    """
+    a_scale = a_scale.view(torch.uint8)
+    M = a_scale.shape[0]
+    assert M % tile_m == 0, f"M={M} must be a multiple of tile_m={tile_m}"
+    kp = ceildiv(32 * a_scale.shape[-1], tile_k) * tile_k
+    a_scale = _pad_last_dim(a_scale, kp // 32, 127)
+    blocks = a_scale.view(M // tile_m, tile_m, kp // tile_k, tile_k // 32)
+    return blocks.permute(0, 2, 1, 3).contiguous()
+
+
 def naive_grouped_gemm_mxfp4(
     a,
     a_scale,
@@ -453,8 +473,9 @@ def naive_grouped_gemm_mxfp4(
     """Grouped MXFP4 GEMM on the contiguous-M routed layout.
 
     a        [M, K/2] two fp4 per byte (low nibble first)  -> a4w4
-             [M, K]   fp8 e4m3fn                           -> a8w4
-    a_scale  [M, K/32] e8m0
+             [M, K]   torch.float8_e4m3fn                  -> a8w4
+    a_scale  [M/tile_m, Kp/tile_k, tile_m, tile_k/32] e8m0 from
+             preshuffle_act_scale(a_scale, tile_m, tile_k)
     w        [E, N, Kp/2] fp4 and w_scale [E, N/32, Kp/128*128] e8m0, both from
              preshuffle_weights(..., tile_k) (Kp = K rounded up to tile_k)
     psum     [E] int32, expert e owns rows [starts[e], psum[e]); starts must be
@@ -463,19 +484,22 @@ def naive_grouped_gemm_mxfp4(
 
     Returns ``out``.
     """
+    a_is_fp4 = a.dtype != torch.float8_e4m3fn
     a, a_scale = a.view(torch.uint8), a_scale.view(torch.uint8)
     w, w_scale = w.view(torch.uint8), w_scale.view(torch.uint8)
     n_experts, N, k_half = w.shape
     Kp = 2 * k_half
     assert Kp % tile_k == 0, "weights must come from preshuffle_weights(..., tile_k)"
     assert tuple(w_scale.shape) == (n_experts, N // 32, Kp // WMMA_K * 128)
-    K = 32 * a_scale.shape[-1]
-    a_is_fp4 = a.shape[-1] == K // 2
-    assert a_is_fp4 or a.shape[-1] == K, f"a has {a.shape[-1]} bytes per row, K={K}"
     M = a.shape[0]
+    assert tuple(a_scale.shape) == (M // tile_m, Kp // tile_k, tile_m, tile_k // 32), (
+        "a_scale must come from preshuffle_act_scale(a_scale, tile_m, tile_k)"
+    )
+    a_bytes = Kp // 2 if a_is_fp4 else Kp
+    assert a.shape[-1] <= a_bytes, f"a has {a.shape[-1]} bytes per row, Kp={Kp}"
 
-    a = _pad_last_dim(a, Kp // 2 if a_is_fp4 else Kp, 0).contiguous()
-    a_scale = _pad_last_dim(a_scale, Kp // 32, 127).contiguous()
+    a = _pad_last_dim(a, a_bytes, 0).contiguous()
+    a_scale = a_scale.contiguous()
     w, w_scale = w.contiguous(), w_scale.contiguous()
     psum = psum.to(torch.int32).contiguous()
     assert psum.numel() == n_experts

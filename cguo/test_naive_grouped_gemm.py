@@ -19,7 +19,11 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
-from naive_grouped_gemm_mxfp4 import naive_grouped_gemm_mxfp4, preshuffle_weights
+from naive_grouped_gemm_mxfp4 import (
+    naive_grouped_gemm_mxfp4,
+    preshuffle_act_scale,
+    preshuffle_weights,
+)
 
 
 def build_layout(rows_per_expert, tile_m):
@@ -64,8 +68,9 @@ def run_case(fmt, E, N, K, max_rows, tile_m, tile_n, tile_k, m_warp, n_warp, nb,
 
     out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
     w_shuf, w_scale_shuf = preshuffle_weights(w, w_scale, tile_k)
+    a_scale_shuf = preshuffle_act_scale(a_scale, tile_m, tile_k)
     naive_grouped_gemm_mxfp4(
-        a, a_scale, w_shuf, w_scale_shuf, psum, out=out,
+        a, a_scale_shuf, w_shuf, w_scale_shuf, psum, out=out,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, m_warp=m_warp, n_warp=n_warp,
         num_buffers=nb,
     )  # fmt: skip

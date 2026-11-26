@@ -12,8 +12,8 @@ gemm1 N=1152 K=5120, gemm2 N=5120 K=576, balanced routing like the tuner.
   production layouts ((16,16) weight preshuffle, n32k4 B scale, preshuffled A
   scale, unpadded K; see the K-tail note in run() for the A pitch and weight tail).
 * naive: the same tile_m/tile_n/tile_k/m_warp/n_warp/num_buffers and routed
-  layout as the production row (it has no split-K or clusters); K padding is
-  done outside the timing.
+  layout as the production row (it has no split-K or clusters); K padding and
+  the A-scale grouping (preshuffle_act_scale) are done outside the timing.
 
 Both outputs are checked against a torch reference on a few experts and against
 each other on every valid row before timing (profiler device time).
@@ -40,6 +40,7 @@ from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from naive_grouped_gemm_mxfp4 import (
     ceildiv,
     naive_grouped_gemm_mxfp4,
+    preshuffle_act_scale,
     preshuffle_weights,
 )
 
@@ -207,7 +208,7 @@ def run(tokens, stage, check_experts=3):
     tile = {k: kw[k] for k in keys}
     kp = ceildiv(K, kw["tile_k"]) * kw["tile_k"]
     a_n = pad_k(lay_p.place(a), kp // 2, 0)
-    as_n = pad_k(lay_p.place(a_s), kp // 32, 127)
+    as_n = preshuffle_act_scale(lay_p.place(a_s), kw["tile_m"], kw["tile_k"])
     w_n, ws_n = preshuffle_weights(w, w_s, kw["tile_k"])
     out_n = torch.empty((lay_p.m, N), dtype=torch.bfloat16, device="cuda")
 
