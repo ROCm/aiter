@@ -15,7 +15,7 @@ Each K tile of A, W and both e8m0 scales moves global -> LDS by TDM, then LDS
 * m_warp x n_warp waves per workgroup (each owns one sub-tile of the output,
   the four TDM copies are spread over the waves), num_buffers LDS stages with
   TDM running num_buffers-1 K tiles ahead of the WMMAs, no split-K, no
-  clusters / multicast, no input LDS padding,
+  clusters / multicast; only A's LDS rows are padded (16 B, bank conflicts),
 * one V_WMMA_SCALE per (16-row M, 32/16-row N) block, two register slots so
   each K step's WMMAs overlap the next step's LDS reads (across K tiles too),
 * bf16 epilogue staged in LDS and written by TDM (no bias, no activation, no
@@ -125,8 +125,11 @@ def build_naive_grouped_gemm(
     SB_ROW_BYTES, SB_TILE_BYTES = 128 * (K // WMMA_K), 128 * K_STEPS
 
     # ---- LDS: NB stages, each one K tile of every operand, row-major ----------
+    # A rows get 16 B of slack: with a power-of-two pitch the 16 rows one
+    # ds_load_b128 reads start on only 1-4 distinct banks (same as LDS_PAD_A).
+    A_LDS_PITCH = A_TILE_BYTES + 16
     A_LDS = 0
-    W_LDS = A_LDS + tile_m * A_TILE_BYTES
+    W_LDS = A_LDS + tile_m * A_LDS_PITCH
     AS_LDS = W_LDS + tile_n * W_TILE_BYTES
     WS_LDS = AS_LDS + tile_m * SC_TILE_BYTES
     STAGE_BYTES = WS_LDS + tile_n * SC_TILE_BYTES
@@ -188,20 +191,25 @@ def build_naive_grouped_gemm(
             fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, 16), lds
         )
 
-        def tdm_k_tile(src, first_row, rows, row_bytes, tile_bytes, lds_offset):
-            """One TDM descriptor; copy(kt, stage) moves K tile kt into a stage."""
+        def tdm_k_tile(src, first_row, rows, row_bytes, tile_bytes, lds_offset, lds_pitch=None):
+            """One TDM descriptor; copy(kt, stage) moves K tile kt into a stage.
+
+            A wider lds_pitch leaves slack after every row; the atom turns it into
+            the descriptor's pad interval / amount.
+            """
+            lds_pitch = lds_pitch or tile_bytes
             g_ptr = fx.recast_iter(fx.Int8, src) + first_row * row_bytes
             g = fx.Tensor(
                 fx.make_view(g_ptr, fx.make_layout((rows, row_bytes), (row_bytes, 1)))
             )
             box = (rows, tile_bytes)
             atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(), g, fx.make_layout(box, (tile_bytes, 1)), box
+                fx.rocdl.TensorLoad(), g, fx.make_layout(box, (lds_pitch, 1)), box
             )
             s = fx.Tensor(
                 fx.make_view(
                     lds_i8 + lds_offset,
-                    fx.make_layout((box, NB), ((tile_bytes, 1), STAGE_BYTES)),
+                    fx.make_layout((box, NB), ((lds_pitch, 1), STAGE_BYTES)),
                 )
             )
             g_tiles = fx.zipped_divide(coord, box)[None, (0, None)]  # (box, K_TILES)
@@ -214,7 +222,7 @@ def build_naive_grouped_gemm(
         w_grp0 = fx.Int64(expert) * (N // 16) + fx.Int64(blk_n // 16)  # 16-row groups
         ws_grp0 = fx.Int64(expert) * (N // 32) + fx.Int64(blk_n // 32)  # 32-row groups
         tdm_loads = [
-            tdm_k_tile(a, m_row0, tile_m, A_ROW_BYTES, A_TILE_BYTES, A_LDS),
+            tdm_k_tile(a, m_row0, tile_m, A_ROW_BYTES, A_TILE_BYTES, A_LDS, A_LDS_PITCH),
             tdm_k_tile(w, w_grp0, tile_n // 16, WG_ROW_BYTES, WG_TILE_BYTES, W_LDS),
             tdm_k_tile(a_scale, m_row0, tile_m, SC_ROW_BYTES, SC_TILE_BYTES, AS_LDS),
             tdm_k_tile(w_scale, ws_grp0, tile_n // 32, SB_ROW_BYTES, SB_TILE_BYTES, WS_LDS),
@@ -249,7 +257,7 @@ def build_naive_grouped_gemm(
         #     fp8 (128 B / step): bytes h*16 + 32*j + [0, 16), j = 0..3
         def load_act(base, wm, ks):
             row = wm_base + wm * A_ROWS + row16
-            off = A_LDS + row * A_TILE_BYTES + ks * A_STEP_BYTES + khalf * 16
+            off = A_LDS + row * A_LDS_PITCH + ks * A_STEP_BYTES + khalf * 16
             return _concat(
                 [ld128(base, off + 32 * j) for j in range_constexpr(A_STEP_BYTES // 32)]
             )

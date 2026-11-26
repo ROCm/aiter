@@ -81,25 +81,38 @@ shape：E=384，topk=6，gemm1 N=1152 K=5120，gemm2 N=5120 K=576；均衡路由
    加上 `sched_barrier` 后恢复原样。逐段数据见「epilogue 能否和最后的 WMMA 重叠」。
 - 效果：大 M 的 gemm2 从慢 2.7–2.8 倍降到 1.12–1.13 倍。
 
+### step6：A 的 LDS 行补 16 B（对应线上 `LDS_PAD_A = 16`）
+- **问题**：A 在 LDS 里每行是一个 K tile，行距是 2 的幂（fp4 下 tile_k=128 为 64 B，256 为 128 B）。一条 `ds_load_b128` 里 16 个 lane 读 16 行，起始 bank 只有 1–4 种，因此有 4–16 路冲突。
+- **做法**：`A_LDS_PITCH = A_TILE_BYTES + 16`，行距变成 80 B、144 B……，16 个 lane 的起始 bank 两两不同。
+  - `tdm_k_tile` 加了一个 `lds_pitch` 参数：LDS 布局按 `(lds_pitch, 1)` 做 stride，atom 自动生成描述符的 pad 字段。
+  - `load_act` 按新的行距读。W 已经是 preshuffle 布局，本来就没有冲突，scale 也不需要处理。
+- **验证（只编译）**：A 描述符 group1 的第一个字段从 `0` 变成 `0x06D00000`，即 pad_enable=1，每 16 dword（64 B）补 4 dword（16 B）。VGPR 变化在 ±5 以内。每个 stage 的 LDS 多出 `tile_m × 16 B`，例如 T=8192 gemm1 从 68 涨到 72 KB，和线上相同。
+- **效果**：收益和 A 在 LDS 读取中的占比一致。
+  - T=8192 gemm1（w1×2，每个 wave 128 行）：每步 A 16 条、W 8 条 `ds_load_b128`，快了 14%（1.57 → 1.34 倍）。
+  - T=32768 gemm1（w2×2）：A 8 条、W 24 条，快了 8.5%（1.13 → 1.04 倍）。
+  - 大 M 的 gemm2 快 3–4%；decode 基本不变。
+
 ## 性能进度
 
-单位 us，naive 版；最后两列是线上 kernel 和当前的 naive/线上比值（step5 那次 benchmark）。
+单位 us，naive 版；最后两列是线上 kernel 和当前的 naive/线上比值（step6 那次 benchmark）。
 step3 用的是 naive 自己扫出来的 tile，和线上不可比，所以表从 step2 开始。
 
-| T | gemm | 配置 | step2 | step4 | step4b | step1 | step5 | 线上 | naive/线上 |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 1 | 16x64x256 w1x1 b2（线上 sk4） | 10.6 | 8.2 | 8.0 | 7.1 | 7.1 | 4.2 | 1.69 |
-| 1 | 2 | 16x128x128 w1x2 b2 | 3.9 | 3.3 | 3.7 | 3.4 | 3.6 | 3.4 | 1.07 |
-| 16 | 1 | 16x384x128 w1x2 b3 | 78.8 | 77.5 | 78.4 | 25.0 | 24.8 | 23.6 | 1.05 |
-| 16 | 2 | 16x64x128 w1x1 b2 | 19.0 | 18.7 | 19.5 | 10.6 | 10.4 | 9.3 | 1.12 |
-| 128 | 1 | 16x128x512 w1x2 b4 | 188.6 | 161.1 | 148.4 | 83.2 | 83.1 | 74.5 | 1.12 |
-| 128 | 2 | 16x128x128 w1x2 b3 | 82.3 | 69.9 | 71.9 | 45.8 | 45.3 | 38.9 | 1.17 |
-| 1024 | 1 | 32x128x256 w1x2 b2 | 179.0 | 164.3 | 162.3 | 91.1 | 90.3 | 81.1 | 1.11 |
-| 1024 | 2 | 32x128x128 w1x2 b3 | 107.7 | 96.5 | 98.6 | 69.0 | 51.3 | 47.1 | 1.09 |
-| 8192 | 1 | 128x128x256 w1x2 b2 | 328.5 | 313.7 | 322.9 | 239.1 | 203.7 | 129.5 | 1.57 |
-| 8192 | 2 | 128x128x128 w1x2 b2 | 307.7 | 283.6 | 292.7 | 308.2 | 130.6 | 115.9 | 1.13 |
-| 32768 | 1 | 128x384x256 w2x2 b4 | 1406.3 | 1003.8 | 966.7 | 566.2 | 428.0 | 377.1 | 1.13 |
-| 32768 | 2 | 128x256x128 w2x2 b4 | 1050.7 | 891.6 | 893.1 | 928.8 | 366.3 | 327.5 | 1.12 |
+| T | gemm | 配置 | step2 | step4 | step4b | step1 | step5 | step6 | 线上 | naive/线上 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 16x64x256 w1x1 b2（线上 sk4） | 10.6 | 8.2 | 8.0 | 7.1 | 7.1 | 7.0 | 4.2 | 1.67 |
+| 1 | 2 | 16x128x128 w1x2 b2 | 3.9 | 3.3 | 3.7 | 3.4 | 3.6 | 3.6 | 3.4 | 1.07 |
+| 16 | 1 | 16x384x128 w1x2 b3 | 78.8 | 77.5 | 78.4 | 25.0 | 24.8 | 25.0 | 22.7 | 1.10 |
+| 16 | 2 | 16x64x128 w1x1 b2 | 19.0 | 18.7 | 19.5 | 10.6 | 10.4 | 10.3 | 9.3 | 1.11 |
+| 128 | 1 | 16x128x512 w1x2 b4 | 188.6 | 161.1 | 148.4 | 83.2 | 83.1 | 79.3 | 72.2 | 1.10 |
+| 128 | 2 | 16x128x128 w1x2 b3 | 82.3 | 69.9 | 71.9 | 45.8 | 45.3 | 45.4 | 39.7 | 1.14 |
+| 1024 | 1 | 32x128x256 w1x2 b2 | 179.0 | 164.3 | 162.3 | 91.1 | 90.3 | 86.9 | 79.8 | 1.09 |
+| 1024 | 2 | 32x128x128 w1x2 b3 | 107.7 | 96.5 | 98.6 | 69.0 | 51.3 | 50.6 | 46.2 | 1.09 |
+| 8192 | 1 | 128x128x256 w1x2 b2 | 328.5 | 313.7 | 322.9 | 239.1 | 203.7 | 175.7 | 131.2 | 1.34 |
+| 8192 | 2 | 128x128x128 w1x2 b2 | 307.7 | 283.6 | 292.7 | 308.2 | 130.6 | 125.3 | 115.3 | 1.09 |
+| 32768 | 1 | 128x384x256 w2x2 b4 | 1406.3 | 1003.8 | 966.7 | 566.2 | 428.0 | 391.5 | 376.7 | 1.04 |
+| 32768 | 2 | 128x256x128 w2x2 b4 | 1050.7 | 891.6 | 893.1 | 928.8 | 366.3 | 350.2 | 328.5 | 1.07 |
+
+T=16 gemm1 的比值从 1.05 变成 1.10，是因为线上这次测得快一些（23.6 → 22.7 us），naive 没变，属于测量噪声。
 
 ## 过程中的发现
 
@@ -146,7 +159,7 @@ LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每
 多走一步 LDS 代价小：
 - 每个 CU 的 LDS 带宽远高于它能分到的 HBM 带宽；
 - 行距补 16 列，`ds_store_b128` 达到 b128 写入的下限（不补是 16 路冲突）；
-- C 复用输入 stage，只有 C 比 stage 大时 LDS 才变大（128×128：34 → 36 KB）。
+- C 复用输入 stage，只有 C 比 stage 大时 LDS 才变大。step5 时 128×128 从 34 涨到 36 KB；step6 给 A 补 padding 后，stage 本身变成 38 KB（和线上相同），C 不再额外占 LDS。
 
 实测：T=32768 gemm2 写回 2.01 GB，kernel 929 → 366 us，按写回量算的带宽下限 2.17 → 5.5 TB/s。
 收益和"输出字节 / 计算量"成正比：
@@ -157,26 +170,26 @@ LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每
 | gemm1（N=1152，K=5120） | 次之 |
 | decode | 基本不变 |
 
-### 代码分段（`naive_grouped_gemm_mxfp4.py` 第 349–391 行）
+### 代码分段（`naive_grouped_gemm_mxfp4.py` 第 357–399 行）
 例子：128×256×128，w2×2，`WM_REP = WN_REP = 4`，`ACC_LEN = 16`，`C_PITCH = 272`。
 
-1. **第 350–353 行，`sched_barrier(0)` + 第一次 barrier。**
+1. **第 358–361 行，`sched_barrier(0)` + 第一次 barrier。**
    - 累加器布局：lane l 是第 l%16 行；值 v 是第 `(v//8)*16 + (l//16)*8 + v%8` 列。
    - `sched_barrier` 只约束编译器的调度，不生成指令。
    - barrier 保证所有 wave 读完输入 stage 后，C 才覆盖它：C 占 128×272×2 = 68 KB，落在 102 KB 的 stage 区开头。
-2. **第 354–361 行，寄存器 → LDS。**
+2. **第 362–369 行，寄存器 → LDS。**
    - 每个 WMMA 块：fp32 → bf16（8 条 `v_cvt_pk_bf16_f32`）；按 f=0/1 各取 8 个值，`ds_store_b128` 写到 `(row*C_PITCH + col)*2`。
    - 例：wave 3、lane 21，`wm=1, wn=2, f=1` → row 85，col 216，字节偏移 46672。
    - 每个 wave 32 条 `ds_store_b128`。padding 行也照写，没有分支。
-3. **第 362 行，第二次 barrier。** TDM 按行分给各 wave（wave w 负责第 32w–32w+31 行、全部 256 列），和计算时的 2×2 分块不同，所以必须等所有 wave 写完。
-4. **第 364–374 行，全局 view。**
+3. **第 370 行，第二次 barrier。** TDM 按行分给各 wave（wave w 负责第 32w–32w+31 行、全部 256 列），和计算时的 2×2 分块不同，所以必须等所有 wave 写完。
+4. **第 372–382 行，全局 view。**
    - `bf16_ptr`：`ptr_arg` 传进来的指针只按 1 B 对齐，所以显式造一个 16 B 对齐的 bf16 指针。
    - view 形状是 `(rows_end - blk_m, tile_n)`，行数是运行时值：decode 时为 1，prefill 时 ≥128。
    - 列数 256 小于 LDS 行宽 272，所以 pad 列会被丢弃。
-5. **第 375–379 行，TDM store atom。** box 为 `(tile_m, C_PITCH)`；LDS 布局是紧密的，不需要 TDM pad 字段；`num_warps=NUM_WAVES` 让每个 wave 负责 32 行。
-6. **第 380–385 行，LDS view。** 从 LDS 偏移 0 开始，带一个长度为 1 的 stage 维，形状和读取路径的 `(box, NB)` 一致。
-7. **第 386–389 行，`tdm_partition`。** 用 `wave` 选出本 wave 的 32 行：全局地址和 LDS 地址都按 32 行偏移，每个 wave 的有效行上限是 `max(0, rows_end − blk_m − 32·wave)`。
-8. **第 390–391 行，发 store + 等待。**
+5. **第 383–387 行，TDM store atom。** box 为 `(tile_m, C_PITCH)`；LDS 布局是紧密的，不需要 TDM pad 字段；`num_warps=NUM_WAVES` 让每个 wave 负责 32 行。
+6. **第 388–393 行，LDS view。** 从 LDS 偏移 0 开始，带一个长度为 1 的 stage 维，形状和读取路径的 `(box, NB)` 一致。
+7. **第 394–397 行，`tdm_partition`。** 用 `wave` 选出本 wave 的 32 行：全局地址和 LDS 地址都按 32 行偏移，每个 wave 的有效行上限是 `max(0, rows_end − blk_m − 32·wave)`。
+8. **第 398–399 行，发 store + 等待。**
    - 每个 wave 1 条 `tensor_store_from_lds`。
    - `s_wait_tensorcnt(0)`：TDM 读完 LDS 前 wave 不能退出。这条等待紧跟在 TDM 后面，也顺带满足了"TDM 后不能紧跟分支"的 hazard。
 
@@ -235,24 +248,18 @@ LDS 在这里起换布局的作用：把 WMMA 累加器布局（lane = 行，每
 
 ## 后续优化方案
 
-按预期收益和依据排序：
+按预期收益和依据排序（A 的 LDS padding 已在 step6 完成）：
 
-1. **A 的 LDS padding（线上 `LDS_PAD_A = 16`）。** A 在 LDS 里每行是一个 K tile，16 个 lane 读 16 行时：
-   - tile_k=128（行距 64 B）：起始 bank 只有 4 种，4 路冲突；
-   - tile_k=256（行距 128 B）：起始 bank 只有 2 种，8 路冲突。
-
-   每行补 16 B（行距 80 B 或 144 B）后 16 个 lane 的起始 bank 互不相同。
-   - 用 TDM 的 LDS 布局 stride 实现即可（`make_layout(box, (tile_bytes + 16, 1))`，atom 会自动生成 padInterval / padAmount）。
-2. **kernel 内处理 K tail，去掉 host 端补零。** gemm2 的 K=576 补到 640 白白多了 11% 的 WMMA 和读取。
+1. **kernel 内处理 K tail，去掉 host 端补零。** gemm2 的 K=576 补到 640 白白多了 11% 的 WMMA 和读取。
    - 最后一个 K tile 只做 `ceil(K_TAIL/128)` 个 WMMA K step，TDM 用正确的 extent 做越界保护，避免重蹈线上的越界读。
-3. **split-K（线上 `k_waves`）。** T=1 的 gemm1 线上用 sk4，naive 还差 1.69 倍。
+2. **split-K（线上 `k_waves`）。** T=1 的 gemm1 线上用 sk4，naive 还差 1.67 倍。
    - 每组 wave 算一段 K，部分和经 LDS 归约（线上的 `K_PARTIAL_B` / `GROUP_ARENA_B`）。
-4. **T=8192 gemm1（1.57 倍）。** 先用 rocprof 定位，候选包括：
+3. **T=8192 gemm1（1.34 倍）。** 先用 rocprof 定位，候选包括：
    - A scale 的 TDM 行太短：tile_k=256 时每行只有 8 B，远低于 128 B 下限（A 每行 128 B，刚好在下限）；
    - 线上的 A scale 预排布 `_grouped_a8w4_preshuffle_e8m0_scale`；
    - WMMA 和 ds_load 的交错调度（`sched_group_barrier`）。
-5. **A / A scale 预排布。** 线上 `a_preshuffled`：gemm1 的 epilogue 直接按 K32/M16 块写出 fp4，A scale 用 m16k4 布局。这样 A 的 TDM 行变长，LDS 也不需要 padding。
-6. **cluster + B multicast。** 同一专家的多个 M tile 共享同一块 W，prefill 阶段可以减少 L2/HBM 流量。
-7. **融合 epilogue。** bias、SwiGLU / SiTUv2、gemm1 输出的 MX 量化（`stage1_quant_out`，可直接写成 gemm2 要的预排布 A）、gemm2 的 EP scatter。
-8. **epilogue 和最后一个 K step 交错。** 把第一次 barrier 提前，用 `sched_group_barrier` 让 cvt/`ds_store` 和最后的 WMMA 交错（见上面「epilogue 能否和最后的 WMMA 重叠」）。收益有限，先测 T=8192 / 32768 的 gemm2。
-9. **persistent kernel / tile 调度。** 解决小 M 填不满 GPU、大 M 尾轮不均的问题；顺带可以让 TDM store 和下一个 tile 的主循环重叠（线上 `defer_c_wait`）。
+4. **A / A scale 预排布。** 线上 `a_preshuffled`：gemm1 的 epilogue 直接按 K32/M16 块写出 fp4，A scale 用 m16k4 布局。这样 A 的 TDM 行变长，LDS 也不需要 padding。
+5. **cluster + B multicast。** 同一专家的多个 M tile 共享同一块 W，prefill 阶段可以减少 L2/HBM 流量。
+6. **融合 epilogue。** bias、SwiGLU / SiTUv2、gemm1 输出的 MX 量化（`stage1_quant_out`，可直接写成 gemm2 要的预排布 A）、gemm2 的 EP scatter。
+7. **epilogue 和最后一个 K step 交错。** 把第一次 barrier 提前，用 `sched_group_barrier` 让 cvt/`ds_store` 和最后的 WMMA 交错（见上面「epilogue 能否和最后的 WMMA 重叠」）。收益有限，先测 T=8192 / 32768 的 gemm2。
+8. **persistent kernel / tile 调度。** 解决小 M 填不满 GPU、大 M 尾轮不均的问题；顺带可以让 TDM store 和下一个 tile 的主循环重叠（线上 `defer_c_wait`）。
