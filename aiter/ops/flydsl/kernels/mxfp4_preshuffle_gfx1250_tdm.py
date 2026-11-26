@@ -19,12 +19,14 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .communication_ops_utils import atomic_add_agent
 from .gemm_common_gfx1250 import (
+    INST_PREFETCH,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
+    prefetch_kernel_code,
     situv2_consts,
     workgroup_barrier,
 )
@@ -91,6 +93,8 @@ def _mma_tensor(storage):
 _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
+#: Let a persistent bf16 EP scatter defer its final TDM wait (defer_c_wait).
+_EP_DEFER_C_WAIT = os.environ.get("AITER_FLYDSL_EP_DEFER_C_WAIT", "1") == "1"
 INTERLEAVED_LDS_LOAD = os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD")
 if INTERLEAVED_LDS_LOAD is not None:
     INTERLEAVED_LDS_LOAD = int(INTERLEAVED_LDS_LOAD)
@@ -246,6 +250,7 @@ def build_gemm_a8w4_tdm_task(
     defer_output_store_wait=0,
     ds_first_n=-1,  # -1: per-shape HYPER_PARAMS default
     mma_prio=0,
+    out_preshuffled=None,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -295,6 +300,8 @@ def build_gemm_a8w4_tdm_task(
       retire in issue order and the prologue writes only its first
       ``prologue_stages`` stages; ``gpu.barrier`` waits storecnt). The caller
       must drain tensorcnt and storecnt before reusing the arena or exiting.
+      A persistent bf16 EP scatter turns it on by itself when the scatter
+      rows fit the last stage; the persistent launcher then drains.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
     """
@@ -429,13 +436,20 @@ def build_gemm_a8w4_tdm_task(
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
     # The fixed placement gives each of the two k128 prefetch slots 128 VGPRs
-    # (v256-v511) and the accumulators 512 (from v512). A warp tile that needs
-    # more, such as m_warp=1 or an a8w4 2x2 tile, keeps compiler allocation
+    # (v256-v511) and the accumulators 512 (from v512). The pinned map
+    # (v256-v511 operands, v512-v767 accumulators) is two 128-dword slots.
+    # FP4 256x256 is 128 dwords at 2x2 (8*8 + 4*16) and 160 at 1x4
+    # (16*8 + 2*16); placing the wider slot asserts in make_rmem_slot, and an
+    # a8w4 2x2 tile does not fit either. Such tiles keep compiler allocation
     # like every non-prefill tile instead of failing to build.
-    slot_vgprs = wmma_m_rep * (8 if a_is_fp4 else 16) + wmma_n_rep * (WMMA_N // 2)
-    fits_vgpr_partition = slot_vgprs <= 128 and n_acc * (WMMA_N // 2) <= 512
+    # Same formula as that assert (ACT_NDW, WMMA_VECTOR_DWORDS = WMMA_N // 2).
+    _pin_slot = wmma_m_rep * (8 if a_is_fp4 else 16) + wmma_n_rep * (WMMA_N // 2)
     USE_EXPLICIT_VGPR_PARTITION = bool(
-        is_prefill and callable(sched_vgpr) and fits_vgpr_partition
+        is_prefill
+        and callable(sched_vgpr)
+        and m_warp == n_warp == 2
+        and _pin_slot <= 128
+        and n_acc * (WMMA_N // 2) <= 512
     )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
@@ -651,14 +665,33 @@ def build_gemm_a8w4_tdm_task(
         if _mid_compute
         else num_buffers
     )
-    C_EP_OFF = 0
-    # fp4 stage-1 output staging (tile_m x tile_n/4 B): the last pipeline stage
-    # with defer_c_wait, so the next tile's prologue cannot overwrite it.
-    C_Q_OFF = (num_buffers - 1) * PITCH if defer_c_wait else 0
+    # With defer_c_wait the output is staged in the last pipeline stage, which
+    # the next tile's prologue does not write: tile_m x tile_n/4 B of fp4 for
+    # stage 1, the padded bf16 scatter rows for stage 2. A persistent bf16 EP
+    # scatter defers on its own whenever its rows fit there: the remote
+    # gather-store then retires under the next tile's prologue instead of
+    # stalling every wave (DSV4.1-Flash EP4 tpr 512: GEMM2 57.4 -> 54.9 us).
+    if (
+        _EP_DEFER_C_WAIT
+        and enable_ep_scatter
+        and not ep_quant_bits
+        and persistent_workers
+        and _mid_compute
+        and not planar_lds_on
+        and not tdm_as_in_prologue
+        and k_waves == 1
+        and _pro_stages <= num_buffers - 1
+        and num_buffers * PITCH - PITCH + C_STORE_B <= ARENA_B
+    ):
+        defer_c_wait = 1
+    _defer_off = (num_buffers - 1) * PITCH if defer_c_wait else 0
+    C_EP_OFF = _defer_off if enable_ep_scatter else 0
+    C_Q_OFF = 0 if enable_ep_scatter else _defer_off
     if defer_c_wait:
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
-        assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
-        assert C_Q_OFF + tile_m * (tile_n // 4) <= ARENA_B, "C staging past arena"
+        assert _pro_stages * PITCH <= _defer_off, "C staging overlaps the prologue"
+        _c_bytes = C_STORE_B if enable_ep_scatter else tile_m * (tile_n // 4)
+        assert _defer_off + _c_bytes <= ARENA_B, "C staging past arena"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -671,7 +704,13 @@ def build_gemm_a8w4_tdm_task(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    # The fp4 stage-1 output layout; defaults to the A input's.
+    if out_preshuffled is None:
+        out_preshuffled = a_preshuffled
+    out_preshuffled = bool(out_preshuffled and stage1_quant_out and stage1_act)
     _a_layout = "_apre" if a_preshuffled else ""
+    if out_preshuffled != bool(a_preshuffled and stage1_quant_out and stage1_act):
+        _a_layout += "_cpre" if out_preshuffled else "_crm"
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     assert has_bias in (0, 1, 2, 3), "has_bias: 0 none, 1 bf16, 2 fp32, 3 fp16"
@@ -721,6 +760,7 @@ def build_gemm_a8w4_tdm_task(
     )
     _row_align = f"_ra{ROW_ALIGNMENT}" if ROW_ALIGNMENT > tile_m else ""
     _direct_expert_map = f"_demap{expert_tile_m}" if direct_expert_map else ""
+    _malign += "_dcw" if (defer_c_wait and enable_ep_scatter) else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -738,6 +778,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_packed_expert_map}"
         f"{_direct_expert_map}{_row_align}{_malign}{_kwaves}"
         f"{f'_kg{k_grid}' if k_grid > 1 else ''}"
+        f"{'_ipf' if INST_PREFETCH else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -787,6 +828,9 @@ def build_gemm_a8w4_tdm_task(
         arg_splitk_ws: splitk_arg_type = 0,
         arg_splitk_sem: splitk_arg_type = 0,
     ):
+        # A persistent task runs inside a kernel that has already prefetched.
+        if const_expr(INST_PREFETCH and not persistent_workers):
+            prefetch_kernel_code(block // WAVE)
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
         # Scale dwords per 32-row B super-row: one per k128, padded K included.
@@ -2651,7 +2695,7 @@ def build_gemm_a8w4_tdm_task(
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
 
                 def quant_byte_offset(row, col):
-                    if const_expr(a_preshuffled):
+                    if const_expr(out_preshuffled):
                         # TDM reads dense LDS tiles. Stage each K32 slab as
                         # contiguous M16 x 16B, without row padding.
                         return (
@@ -3112,7 +3156,10 @@ def build_gemm_a8w4_tdm_task(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                # defer_c_wait: the next tile's first fence (or the drain after the
+                # persistent loop) retires the gather-stores, which complete in order.
+                if const_expr(not defer_c_wait):
+                    tdm_ops.tensor_wait(0)
             else:
 
                 def store_tile(gt, tile, lds_ptr, lds_row):
@@ -3136,7 +3183,7 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
-                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                if const_expr(out_preshuffled):
                     # M is allocated in complete M16 blocks. The final block's
                     # padding rows are unused, so transfer whole K32/M16 slabs.
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
@@ -3202,6 +3249,7 @@ def build_gemm_a8w4_tdm_task(
         "prologue_stages": _pro_stages,
         "c_ep_off": C_EP_OFF,
         "c_q_off": C_Q_OFF,
+        "defer_c_wait": int(bool(defer_c_wait)),
     }
     return gemm_task, block, _kname, cluster_m, layout
 
@@ -3375,6 +3423,9 @@ def launch_gemm_a8w4_tdm(
         arg_splitk_ws: fx.Pointer,
         arg_splitk_sem: fx.Pointer,
     ):
+        if const_expr(INST_PREFETCH):
+            prefetch_kernel_code(block // 32)
+
         def run_task(task_id, rows, needs_persistent_fence):
             # i32_m remains the allocation capacity: the scale buffer's
             # descriptor must include the padding in its shuffled layout.
@@ -3436,6 +3487,8 @@ def launch_gemm_a8w4_tdm(
                     run_task(task_id, rows, task_id != fx.block_idx.x)
                 if const_expr(defer_output_store_wait_on):
                     tdm_ops.tensor_wait(0)
+            if const_expr(layout["defer_c_wait"]):
+                tdm_ops.tensor_wait(0)
         else:
             run_task(fx.block_idx.x, i32_m, 0)
 

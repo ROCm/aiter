@@ -168,6 +168,11 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_STAGE2_FP8 = os.getenv(
+    "AITER_CONFIG_FMOE_STAGE2_FP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_stage2_fp8_fmoe.csv",
+)
+
 # NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
 AITER_CONFIG_MOE_NVFP4 = os.getenv(
     "AITER_CONFIG_MOE_NVFP4",
@@ -277,6 +282,12 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
 AITER_CONFIG_MEGA_MOE_TP = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+# the small-M schedule's per-batch launch configs (row tile, CTAs, two-shot all-reduce)
+AITER_CONFIG_MEGA_MOE_TP_SM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_SM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_sm_tuned.csv",
 )
 
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
@@ -403,6 +414,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_STAGE2_FP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_STAGE2_FP8",
+            AITER_CONFIG_FMOE_STAGE2_FP8,
+            "tuned_stage2_fp8_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -510,6 +529,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_SM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_SM",
+            AITER_CONFIG_MEGA_MOE_TP_SM,
+            "mega_moe_tp_sm_tuned",
         )
 
     @property

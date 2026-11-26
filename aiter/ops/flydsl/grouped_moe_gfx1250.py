@@ -12,6 +12,7 @@ Set AITER_FLYDSL_DISABLE_GEMM1_ACT=1 to move gate/up activation out of GEMM1
 into the separate quant/preshuffle kernel (also disables GEMM1 requantization).
 """
 
+import contextlib
 import csv
 import functools
 import os
@@ -45,6 +46,63 @@ kernel_bench_callable = None
 # fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
 # (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
 _MEGA_DISPATCH_TLS = threading.local()
+
+
+class MoeOutputEpilogue:
+    """A pending ``out = out * scale + addend`` for the next grouped MoE call's
+    gather-reduce (see ``moe_output_epilogue``)."""
+
+    __slots__ = ("addend", "before", "consumed", "scale")
+
+    def __init__(self, addend: torch.Tensor, scale: float, before):
+        self.addend = addend
+        self.scale = float(scale)
+        self.before = before
+        self.consumed = False
+
+
+_OUTPUT_EPILOGUE_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def moe_output_epilogue(addend: torch.Tensor, scale: float = 1.0, before=None):
+    """Fold ``out = out * scale + addend`` into the gather-reduce of the grouped
+    MoE call run inside the block, e.g. a routed scale and a shared expert's
+    output added to the routed output. Each step is rounded to the output dtype,
+    so the bytes are those of ``moe_out * scale`` then ``+ addend`` as separate
+    torch ops (the multiply is skipped at scale 1.0). ``before`` runs right
+    before that launch, e.g. the wait for the stream producing ``addend``.
+
+    Yields the epilogue; ``consumed`` says whether a gather-reduce took it. A
+    call that ends elsewhere (EP scatter, other MoE paths) leaves it unconsumed
+    and the caller applies it itself. Python-side state: use it in eager code
+    (an opaque custom op), not under torch.compile tracing.
+    """
+    epi = MoeOutputEpilogue(addend, scale, before)
+    prev = getattr(_OUTPUT_EPILOGUE_TLS, "value", None)
+    _OUTPUT_EPILOGUE_TLS.value = epi
+    try:
+        yield epi
+    finally:
+        _OUTPUT_EPILOGUE_TLS.value = prev
+
+
+def _take_output_epilogue(
+    token_num: int, model_dim: int, dtype
+) -> MoeOutputEpilogue | None:
+    epi = getattr(_OUTPUT_EPILOGUE_TLS, "value", None)
+    if epi is None or epi.consumed:
+        return None
+    a = epi.addend
+    if (
+        a.shape != (token_num, model_dim)
+        or a.dtype != dtype
+        or not a.is_contiguous()
+        or dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return None
+    epi.consumed = True
+    return epi
 
 
 def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
@@ -1913,6 +1971,10 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
+    # A caller's pending `* scale + addend` (shared expert add) rides along.
+    epi = None if _is_ep else _take_output_epilogue(token_num, model_dim, moe_out.dtype)
+    if epi is not None and epi.before is not None:
+        epi.before()
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
@@ -1921,6 +1983,8 @@ def _grouped_a8w4_tdm_moe(
         num_valid_tokens=(_ep_nvt if _is_ep else None),
         setprio=bool(gather_setprio),
         batch_loads=bool(gather_batch_loads),
+        addend=None if epi is None else epi.addend,
+        addend_scale=1.0 if epi is None else epi.scale,
     )
     return moe_out
 
@@ -2406,6 +2470,7 @@ def _get_compiled_gather_reduce(
     setprio: bool = False,
     batch_loads: bool = False,
     wave_metadata: bool = False,
+    addend_scale: float | None = None,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -2423,6 +2488,7 @@ def _get_compiled_gather_reduce(
         setprio,
         batch_loads,
         wave_metadata,
+        addend_scale,
     )
 
 
@@ -2725,8 +2791,14 @@ def flydsl_moe_gather_reduce(
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
     setprio: bool = False,
     batch_loads: bool = False,
+    addend: torch.Tensor | None = None,  # (token_num, model_dim), out's dtype
+    addend_scale: float = 1.0,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
+
+    With ``addend``, ``out[t] = out[t] * addend_scale + addend[t]`` folded into
+    the same pass, rounded to the output dtype after the reduce, after the
+    scale and after the add -- the bytes of the three separate torch ops.
 
     ``gather_w`` may be f32 (native route weights, no host-side cast) or match
     ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way. Slots
@@ -2763,6 +2835,12 @@ def flydsl_moe_gather_reduce(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
+    if addend is not None:
+        assert (
+            addend.shape == (token_num, model_dim)
+            and addend.dtype == grouped_out.dtype
+            and addend.is_contiguous()
+        ), f"addend must be a contiguous ({token_num}, {model_dim}) {grouped_out.dtype}"
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
     gather_threads = int(
         os.environ.get(
@@ -2785,6 +2863,7 @@ def flydsl_moe_gather_reduce(
         bool(setprio),
         bool(batch_loads),
         wave_metadata,
+        None if addend is None else float(addend_scale),
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
@@ -2808,6 +2887,8 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
+        # Without an addend the kernel never reads this pointer; pass null.
+        ptr_arg(addend if addend is not None else torch.empty(0, device=device)),
         current_stream_arg(),
     )
     return out
