@@ -1638,6 +1638,54 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
+#define MQA_TOPK_BF16_PYBIND                             \
+    m.def("mqa_topk_bf16_instances",                     \
+          &mqa_topk_bf16_instances,                      \
+          py::arg("device_id"),                          \
+          py::arg("out"));                               \
+    m.def("mqa_topk_bf16_workspace_bytes",               \
+          &mqa_topk_bf16_workspace_bytes,                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("fb_slots"));                          \
+    m.def("mqa_topk_bf16_launch",                        \
+          &mqa_topk_bf16_launch,                         \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("indices"),                            \
+          py::arg("values"),                             \
+          py::arg("workspace"),                          \
+          py::arg("workspace_bytes"),                    \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("topk"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("chunk_keys"),                         \
+          py::arg("fb_slots"),                           \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));                            \
+    m.def("mqa_logits_bf16_launch",                      \
+          &mqa_logits_bf16_launch,                       \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("out"),                                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("chunk_keys"),                         \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));
+
 #define FMHA_FWD_BF16_OPUS_PYBIND                     \
     m.def("fmha_fwd_bf16_opus_fwd",                   \
           &fmha_fwd_bf16_opus_fwd,                    \
@@ -2316,6 +2364,22 @@ namespace py = pybind11;
           py::arg("num_groups"),                       \
           py::arg("quant_group_size") = 128,           \
           py::arg("scale_layout")     = 0);
+
+#define MLA_NVFP4_DECODE_PREP_PYBIND                 \
+    m.def("mla_nvfp4_decode_prep",                   \
+          &aiter::mla_nvfp4_decode_prep,             \
+          py::arg("q_rope"),                         \
+          py::arg("q_aux"),                          \
+          py::arg("ring"),                           \
+          py::arg("req_ids"),                        \
+          py::arg("k_nope"),                         \
+          py::arg("k_rope"),                         \
+          py::arg("positions"),                      \
+          py::arg("slots"),                          \
+          py::arg("kv_nope"),                        \
+          py::arg("kv_aux"),                         \
+          py::arg("cos_cache") = std::nullopt,       \
+          py::arg("sin_cache") = std::nullopt);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

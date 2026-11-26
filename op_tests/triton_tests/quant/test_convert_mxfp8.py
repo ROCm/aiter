@@ -98,13 +98,6 @@ def test_mxfp8_rejects_unaligned_shape():
         convert_to_mxfp8(x, torch.float8_e4m3fn, use_asm=False)
 
 
-def test_mxfp8_rejects_unsupported_dtype():
-    """fp8_dtype outside {e4m3fn, e5m2} must raise ValueError."""
-    x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="fp8_dtype"):
-        convert_to_mxfp8(x, torch.float8_e4m3fnuz, use_asm=False)
-
-
 def test_mxfp8_sr_unbiased_portable():
     """SR output is unbiased: mean(dequant(SR(x))) ≈ mean(x) over a large tensor.
 

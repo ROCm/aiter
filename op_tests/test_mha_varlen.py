@@ -964,6 +964,7 @@ if __name__ == "__main__":
             (128, 128),
             (160, 160),
             (192, 192),
+            (256, 256),
         ],
         help="""Dimension of query and key. Default is None.
         e.g.: -qk_v 256,256""",
@@ -1028,8 +1029,8 @@ if __name__ == "__main__":
         "--gqa_ratio",
         type=int,
         nargs="+",
-        choices=[1, 8],
-        default=[1, 8],
+        choices=[1, 2, 4, 6, 8],
+        default=[1, 4, 8],
         help="""gqa ratio.
     e.g. -gr 1""",
     )

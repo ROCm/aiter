@@ -32,7 +32,23 @@ BACKENDS = ("hip", "flydsl", "triton")
 OUT_DTYPES = ("bf16", "mxfp8")
 # M covers decode through prefill; the ragged prefill sizes cover the split tail.
 # 1152 and 1280 (72 and 80 token tiles) take the gfx1250 three-way split.
-DECODE_TOKEN_COUNTS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1152, 1280, 2048)
+DECODE_TOKEN_COUNTS = (
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    192,
+    256,
+    512,
+    768,
+    1024,
+    1152,
+    1280,
+    2048,
+)
 PREFILL_TOKEN_COUNTS = (4096, 4097, 4160, 4224, 6000, 8192, 8200, 8320, 9000, 16384)
 TOKEN_COUNTS = DECODE_TOKEN_COUNTS + PREFILL_TOKEN_COUNTS
 HIDDEN_SIZES = (5120, 7168)

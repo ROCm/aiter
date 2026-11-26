@@ -3,12 +3,16 @@
 # ruff: noqa: B023, I001
 """Fused GEMM2 and weighted cross-rank P2P scatter."""
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import construct_from_ir_values, extract_to_ir_values
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from .. import communication_ops_utils as comm_ops
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
@@ -565,6 +569,8 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 
 
 # fmt: off
+@aot_factory("mega_moe_stage2")
+@functools.cache
 def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
     max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,
     BK: int = 256, use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8",
@@ -881,17 +887,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     return launch
 
 
-_G2_LAUNCH_CACHE = {}
-
-
 def _get_g2_launch(**compile_kw):
-    """Get-or-compile a fused-stage2 launcher for a full compile-param set (cached)."""
-    key = tuple(sorted(compile_kw.items()))
-    launch = _G2_LAUNCH_CACHE.get(key)
-    if launch is None:
-        launch = compile_mega_moe_stage2(**compile_kw)
-        _G2_LAUNCH_CACHE[key] = launch
-    return launch
+    """The launch handle of a fused-stage2 launcher for a full compile-param set
+    (compile_mega_moe_stage2.lazy): pass it to _run_compiled or _preload_compiled."""
+    return compile_mega_moe_stage2.lazy(**compile_kw)
 
 
 # fmt: off
