@@ -150,8 +150,7 @@ def compile_gemm2_a4w4_port(
 
     g2_es=num_experts: persist-es, a fixed grid (i32_grid_blocks: as many workgroups per CU
     as fit) over (expert x BN) panels of the sort's expert table (passed as arg_out_scale);
-    a panel's W2 stays in registers across its row chunks, and its first two chunks load
-    the next panel's."""
+    a panel's W2 stays in registers across its row chunks."""
     SBM = _norm_sbm(SBM, BM)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
@@ -324,7 +323,7 @@ def compile_gemm2_a4w4_port(
             raise AssertionError(
                 "g2_es needs a4w4 epilog='reduce', cu_num>0 and INTER_MAX <= 2 * BK"
             )
-        persist_tag = f"_pes_cu{cu_num}_ne{g2_es}_w2n"
+        persist_tag = f"_pes_cu{cu_num}_ne{g2_es}"
     elif persist_flat:
         persist_tag = f"_pflat_cu{cu_num}"
     elif persist:
@@ -508,86 +507,43 @@ def compile_gemm2_a4w4_port(
         elif const_expr(g2_es is not None):
             # persist-es: a fixed grid over (expert x BN) panels in the order of the sort's
             # expert table (arg_out_scale: [first sorted row, rows, expert, 0] per expert,
-            # then [experts with rows, 0, 0, 0]). Each BM-row chunk of a panel is a v2 tile.
-            # A panel's W2 stays in registers over its chunks. Its first two chunks load
-            # the next panel's W2, one K tile each, where v2 would load the panel's own;
-            # only the first panel loads its own W2.
+            # then [experts with rows, 0, 0, 0]). Each BM-row chunk of a panel is a v2 tile;
+            # its first chunk loads the panel's W2 and the rest reuse it.
             einfo = global_typed_ptr(arg_out_scale, T.i32)
             n_act = fx.Int32(rocdl.readfirstlane(T.i32, einfo[g2_es * 4]))
+            # gemm2_body_v2's B double buffer (fragments, scale slots), kept across a
+            # panel's chunks: K <= 2 tiles, so it holds the panel's whole W2.
             n_acc, k_halves = BN // 64, BK // 128
-
-            def w2_regs():
-                # gemm2_body_v2's B double buffer (fragments, scale slots): K <= 2 tiles,
-                # so it holds a panel's whole W2.
-                bq = [
-                    [
-                        [
-                            fx.make_rmem_tensor(4, Int32)
-                            for _ in range_constexpr(k_halves)
-                        ]
-                        for _ in range_constexpr(n_acc)
-                    ]
-                    for _ in range_constexpr(2)
+            bq = [
+                [
+                    [fx.make_rmem_tensor(4, Int32) for _ in range_constexpr(k_halves)]
+                    for _ in range_constexpr(n_acc)
                 ]
-                bs = [
-                    [fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(n_acc // 2)]
-                    for _ in range_constexpr(2)
-                ]
-                return bq, bs
-
-            (bq, bs), (bq_n, bs_n) = w2_regs(), w2_regs()
-
-            def es_chunk(base, n_block, c, load_w2=None, w2n=None):
-                m_block = _udiv(base, BM) + c
-                gpu.barrier()  # the last chunk's epilogue LDS reads before A lands
-                issue_all_a_loads(m_block * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-                es = types.SimpleNamespace(bq=bq, bs=bs, load_w2=load_w2, w2n=w2n)
-                run_unit(fx.Int32(0), mn_idx=(m_block, n_block), es=es)
-
-            n_wg = fx.Int32(gpu.grid_dim.x)
-            n_panels = n_act * num_n_blocks
+                for _ in range_constexpr(2)
+            ]
+            bs = [
+                [fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(n_acc // 2)]
+                for _ in range_constexpr(2)
+            ]
             # A workgroup's XCD (bx % 8) neighbours take consecutive panels.
+            n_wg = fx.Int32(gpu.grid_dim.x)
             p0 = (bx_i32 % 8) * _udiv(n_wg, 8) + bx_i32 // 8
-            for p in range(p0, n_panels, gpu.grid_dim.x):
+            for p in range(p0, n_act * num_n_blocks, gpu.grid_dim.x):
                 row = _udiv(fx.Int32(p), num_n_blocks)
                 base = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4]))
                 rows = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4 + 1]))
                 n_block = fx.Int32(p) - row * num_n_blocks
-                # This workgroup's next panel (the last one re-reads its own).
-                pn = fx.Int32(p) + n_wg
-                pn = (pn < n_panels).select(pn, fx.Int32(p))
-                row_n = _udiv(pn, num_n_blocks)
-                e_n = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row_n * 4 + 2]))
-                nb_n = pn - row_n * num_n_blocks
-                # The previous panel loaded this one's W2.
-                for s in range_constexpr(2):
-                    for j in range_constexpr(n_acc):
-                        for h in range_constexpr(k_halves):
-                            bq[s][j][h].store(bq_n[s][j][h].load())
-                    for m in range_constexpr(n_acc // 2):
-                        bs[s][m].store(bs_n[s][m].load())
-                es_chunk(
-                    base,
-                    n_block,
-                    fx.Int32(0),
-                    load_w2=fx.Int32(p) == p0,
-                    w2n=types.SimpleNamespace(
-                        e=e_n, n_block=nb_n, bq=bq_n, bs=bs_n, kt=0
-                    ),
-                )
-                # Chunk 1 runs even past a one-chunk panel's rows (SBM >= 2 * BM keeps it
-                # inside the panel's padded sort block, so it stores nothing).
-                es_chunk(
-                    base,
-                    n_block,
-                    fx.Int32(1),
-                    w2n=types.SimpleNamespace(
-                        e=e_n, n_block=nb_n, bq=bq_n, bs=bs_n, kt=1
-                    ),
-                )
-                for c in range(fx.Int32(2), (rows + BM - 1) // BM, fx.Int32(1)):
-                    es_chunk(base, n_block, fx.Int32(c))
+                for c in range(fx.Int32(0), (rows + BM - 1) // BM, fx.Int32(1)):
+                    m_block = _udiv(base, BM) + fx.Int32(c)
+                    gpu.barrier()  # the last chunk's epilogue LDS reads before A lands
+                    issue_all_a_loads(m_block * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    es = types.SimpleNamespace(
+                        bq=bq,
+                        bs=bs,
+                        load_w2=fx.Int32(c) == fx.Int32(0),
+                    )
+                    run_unit(fx.Int32(0), mn_idx=(m_block, n_block), es=es)
         elif const_expr(persist_flat):
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             bound = _udiv(cumsum0, BM) * num_n_blocks
@@ -1039,7 +995,6 @@ def mxfp4_moe_gemm2(
         and not is_ep
         and D_INTER == 512
         and SBM % 32 == 0
-        and SBM >= 64
     ):
         # persist-es over the sort's expert table (fused_moe._moe_sorting_impl).
         g2_es, persist, out_scale = NE, True, expert_info

@@ -1,6 +1,6 @@
 # mxmoe_gemm_v2 persist-es 对齐 `.bak`：实验记录与后续计划
 
-> 来源：v3-110（zhimding）上的 Cursor 会话「vLLM ROCm aiter MoE test」，2026-11-24 ~ 11-25；11-26 在 v3-169 上复现了 3.1，提交了路线 1b（2/2/0/0），并记下了路线 1c 的设计（见 3.10、3.11 和第 6 节）。
+> 来源：v3-110（zhimding）上的 Cursor 会话「vLLM ROCm aiter MoE test」，2026-11-24 ~ 11-25；11-26 在 v3-169 上复现了 3.1，提交了路线 1b（2/2/0/0），并记下了路线 1c 的设计（见 3.10、3.11 和第 6 节）；11-26 下午在 v3-058 上实测了路线 1b，并实现、实测了路线 1c（见 3.12、3.13）。
 > 除特别说明外，数字都是 GEMM2 kernel 单独计时、cold cache、MI355X GPU0，单位 us。
 > 术语：**panel** = 一个 expert × 256 列（BN）× 整个 K；**tile / chunk** = panel 内的 32 行（BM=32）；W2 一个 panel 共 20 条 load（16 条 value + 4 条 e8m0 scale）。
 
@@ -13,8 +13,11 @@
 - **同步 LDS DMA 的保守等待**：LLVM 会在后续任何 LDS 访问前插 vmcnt 等待，把提前发出的 A DMA 等掉。flydsl 0.5.3 的 async LDS DMA（`BufferLoadAsyncLDS128b` + `asyncmark` / `wait_asyncmark`）可以绕开，已实测可行。所以路线 1 的"A 跨 tile 预取"重新可行，不必像 `.bak` 那样让 A 先进 VGPR。
 - **推荐下一步**：路线 1 + async DMA（见第 6 节）。备选是直接沿用 `.bak` 的 ES 分支（性能已经达标，但代码量大）。
 - **v3-169 复现（11-26）**：3.1 那张表在 v3-169 上重跑，三个变体在 2k/4k 下都和原值相差 1 us 以内（3.10）。
-- **路线 1b：2/2/0/0（11-26，已提交，未测试）**：只复用 v2 tile 里原本 load W2 的 K 循环槽位，A 不变。panel 的 chunk 0、chunk 1 各发下一个 panel 的一个 K-tile（各 10 条），chunk 2 以后不发。commit `0286007b4`，分支 `cguo/gemm2es_pf22`（第 6 节）。因为 A 仍然每个 tile 自己读，每份 W2' 大约只能在途 1 个 chunk（3.11）。
-- **路线 1c（11-26，只有设计，代码没改）**：开 ES 时也用 v2 的 BK=128 流水线，每个 tile 有 4 个 B 槽位。W2 分成前后两个半块（各 6+4 条）。每个 tile 的 kt1、kt2 槽位按顺序发一个半块：先补当前 panel 缺的后半块，再发下一个 panel 的前半块、后半块。pre-loop、kt0 只在当前 panel 的前半块不在寄存器里时照 v2 发。任何槽位里的 B load 都不多于 v2；每个 expert 只有一个 tile 时完全退回 v2（第 6 节）。
+- **路线 1b：2/2/0/0（11-26，已提交，已实测）**：只复用 v2 tile 里原本 load W2 的 K 循环槽位，A 不变。panel 的 chunk 0、chunk 1 各发下一个 panel 的一个 K-tile（各 10 条），chunk 2 以后不发。commit `0286007b4`，分支 `cguo/gemm2es_pf22`（第 6 节）；代码现在在 `mxmoe_dispatcher_route1b.py` / `mxmoe_gemm_v2_route1b.py`（第 5 节）。因为 A 仍然每个 tile 自己读，每份 W2' 大约只能在途 1 个 chunk（3.11）。实测（v3-058 GPU1）2k 107.3、4k 157.8，HEAD 是 106.4 / 146.6；降到 2 WG/CU 之后，2k 和 HEAD 打平，4k 慢 11 us（3.13）。
+- **路线 1c（11-26，已实现、已实测，代码在 `mxmoe_dispatcher_route1c.py` / `mxmoe_gemm_v2_route1c.py`）**：开 ES 时也用 v2 的 BK=128 流水线，每个 tile 有 4 个 B 槽位。W2 分成前后两个半块（各 6+4 条）。每个 tile 的 kt1、kt2 槽位按顺序发一个半块：先补当前 panel 缺的后半块，再发下一个 panel 的前半块、后半块。pre-loop、kt0 只在当前 panel 的前半块不在寄存器里时照 v2 发（第 6 节）。实测 2k 126.8、4k 194.7，比 HEAD 和 1b 都慢，甚至比强制 2 WG/CU、完全不预取的 HEAD（123.9 / 177.8）还慢（3.13）。
+- **1b / 1c 的教训（3.13）**：
+  - W2' 能不能藏住，取决于等待精不精确，不取决于放在哪个槽位。1c 保留 v2 的 `vmcnt(0)`，W2' 在发出它的那个 tile 里就被等完了；1b 用精确的 `vmcnt(10)`，同样 2 WG/CU 下比不预取的 HEAD 快 17–20 us。
+  - 不要在 load 外面包"目的寄存器不同"的运行时分支。即使两边条数相同，CFG 结构化之后汇合点也会让一条路径去等另一条路径的 load。要选的是来源地址，不是分支。
 
 ---
 
@@ -40,7 +43,7 @@ HEAD 的 ES 路径被 dispatcher 强制成 BM=32、BN=BK=256，所以 KT=2，并
   - 路由用 `torch.randn` 生成 gating，再经 `fused_topk`。
   - 每次 launch 前读一遍 1 GiB 的 buffer，冲掉 L2 和 MALL。
   - 用 profiler 只统计 GEMM2 kernel 的 device 时间。
-  - 选项：`--stage2` 时间通过 `kernel_bench_callable` 统计（GEMM2 加上后面的 reduce）；`--dump-dir` 保存 route rows 用于逐字节比对；`--es-wg-per-cu` 强制每 CU 的 WG 数。
+  - 选项：`--stage2` 时间通过 `kernel_bench_callable` 统计（GEMM2 加上后面的 reduce）；`--dump-dir` 保存 route rows 用于逐字节比对；`--es-wg-per-cu` 强制每 CU 的 WG 数；`--dispatcher <模块名>` 用 `aiter.ops.flydsl.kernels.<模块名>` 的 `mxfp4_moe_gemm2` 替换 `mxmoe_dispatcher` 的（测路线 1b、1c 用）。
 - ISA：`FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 FLYDSL_DUMP_DIR=...` 导出，再用 `isa_stats.py` 和 `isa_condense.py` 统计。
 - 注意：这个 harness 不是 commit 作者的。2k 的绝对值比 commit message 高 3–8%，4k 基本吻合。大部分实验只在 GPU0 上跑了一次（8 张卡之间差异在 1% 以内）。
 
@@ -187,6 +190,52 @@ s_waitcnt vmcnt(1)                     s_waitcnt vmcnt(10)
   - A 每个 tile 自己读（HEAD、路线 1b）：在途时间就是发出它的那个 tile 剩下的部分，不到 1 个 tile。
   - tile c 开头先发 A(c+1)，再发 W2'（路线 1 的第 1 步，以及 `.bak`）：大约 2 个 tile。这时如果 W2' 只在前两个 tile 发（2/2/0/0），最后一个 tile 期间这个 WG 就没有 W2' 在途了。3.3 里 4k "只分 3 份"（131.1）比分 5 份（123.1）慢，就是这种情况。
 
+### 3.12 在 v3-058 上复现 3.1（11-26 下午，GPU1）
+
+| 变体 | 2k v3-058 | 2k 3.1 | 4k v3-058 | 4k 3.1 |
+|---|---|---|---|---|
+| 原版 v2 + tuned tile | 118.2 | 118.8 | 157.2 | 160.8 |
+| HEAD persist-es | 106.5 | 110.3 | 147.0 | 149.4 |
+| `.bak` 完整 ES | 94.9 | 100.6 | 121.0 | 122.2 |
+
+- 只用 GPU1，3 轮交替跑，取 cold mean 的平均。三个变体的 kernel 名和 3.1 的日志完全一致。
+- 环境：容器 `cguo_gemm2es`，用本机的 `vllm/vllm-openai-rocm:latest` 镜像（torch 2.13 + ROCm 10.0）。HEAD 和 v2 用 `aiter_head` 加 flydsl 0.5.3（装在 `/opt/flydsl053`，通过 `PYTHONPATH` 引入）；`.bak` 用 `aiter_f209cd555` 加 flydsl 0.5.0。没有做 editable 安装。
+- **这台机器 2k 的 ES kernel 卡间差异大**：`.bak` 2k 在 GPU0、GPU4 上稳定是约 100，在 GPU2/3/5/6/7 上是 95–97；GPU1 前三轮约 100、后两轮约 95，状态会变。warm 也有同样的差距，各卡 HBM 带宽（5.0–5.3 TB/s）、功耗上限和频率范围都一样，原因没查到。4k 和原版 v2 不受影响。所以 2k 的两个 ES 变体比 3.1 快了 4–6 us，而 v2 没变。3.13 里 HEAD 的 2k 也是 106 左右，说明 GPU1 当时同样处在"快"的状态；各变体在同一轮里交替跑，彼此可比。
+
+### 3.13 路线 1b、1c 实测（11-26 下午，v3-058 GPU1）
+
+| 变体 | 每 CU 的 WG 数 | 2k | 4k |
+|---|---|---|---|
+| HEAD persist-es | 3 | 106.4 | 146.6 |
+| HEAD，强制 2 WG/CU（`--es-wg-per-cu 2`） | 2 | 123.9 | 177.8 |
+| 路线 1b（`0286007b4`） | 2 | 107.3 | 157.8 |
+| 路线 1c（最终版） | 2 | 126.8 | 194.7 |
+
+- 3 轮交替跑，取 cold mean 的平均，轮间差异在 1 us 以内。1b、1c 的 route rows 在 2k、4k 下都和 HEAD **逐字节一致**。
+- **降到 2 WG/CU 本身的代价**：HEAD 从 3 WG/CU 强制降到 2，2k 慢 17.5 us，4k 慢 31 us。1b 和 1c 都多带一套 W2 寄存器，都只能放 2 个 WG。
+- **1b**：和同样 2 WG/CU 的 HEAD 比，2k 快 16.6 us、4k 快 20 us，预取是有效的。2k 基本抵消了 occupancy 的损失；4k 每个 panel 约 5 个 tile，W2' 只在前两个 chunk 发、每份在途不到 1 个 chunk，抵消不了。
+- **1c**：比同样 2 WG/CU、完全不预取的 HEAD 还慢 3 us（2k）和 17 us（4k）。VGPR 234，无 spill，4 份 tile 代码（128 条 MFMA）。
+
+**1c 为什么慢（看最终版的 ISA）**
+
+- 非 lag 的 tile 0，各槽位已经和设计图一致：kt1 发 6 条 B 加 1 条 A scale，`ds_read` 之前是 `vmcnt(7)`；kt2 发 4 条，`ds_read` 之前是 `vmcnt(4)`。问题在后面：
+  - kt3 在 C 复用 A 的 LDS 之前是 `vmcnt(0)`，把这个 tile 发的 10 条 W2' 全部等完，W2' 只和 MFMA k1、k2（共 16 条 MFMA）重叠；
+  - epilogue 读 token id 之后是 `vmcnt(0)`；
+  - 下一个 tile 开头读 `sorted_expert_ids` 之后也是 `vmcnt(0)`。
+- 所以 W2' 的在途时间不到一个 tile。稳态下 HEAD 每个 panel 只在 tile 0 暴露一次（20 条并行发出）W2 延迟；1c 在 tile 0 和 tile 1 各暴露一次（各 10 条），延迟反而多一次。设计里"代价和 v2 在 kt1、kt2 load 自己的 k2、k3 一样"说的就是这个代价，但它在 HBM 延迟面前并不小。
+- BK=128 在 BM=32 下，每个 kt 只有 8 条 MFMA。同步 LDS DMA 的保守等待（3.9）让 kt1 的 `ds_read` 等 kt0 才发的 A k2，kt2 等 kt1 才发的 A k3，A 的延迟一个 tile 暴露 3 次（HEAD 的 BK=256 是 1 次）。临时叠上 `async_a_v2_experiment.patch`（`AITER_V2_ASYNC_A=1`）只到 2k 128.0、4k 190.7，基本没变，所以这不是主因。
+
+**实现过程中对设计的两处更正**
+
+- **设计里"运行时分支最坏相当于 v2 的等待"不成立。** 第一版按设计在 kt1、kt2 用 `if/else` 选"当前 panel 的 h1 / W2' h0"等，两边条数相同：2k 134.8、4k 198.1（VGPR 229）。ISA 里 W2' 那条路径发完 6 条 load 之后，紧跟着 `vmcnt(9)`、`(8)`、`(7)`、`(6)`，kt2 发完 4 条之后是 `vmcnt(7)` 到 `(4)`，刚发的 load 立刻被等完。原因：
+  - 两个分支往不同的寄存器里 load，汇合点要做 phi 拷贝；
+  - AMDGPU 的 CFG 结构化把 if/else 变成"then 块 → 汇合块 → else 块"，else 块继承了 then 块的在途 load；
+  - 所以 else 块里的拷贝要按 then 块的 load 计算等待（WAW）。
+  另外，`SIInsertWaitcnts` 在汇合处取各条路径里更紧的等待，"一条路径发 load、另一条不发"时，发 load 的那条路径会被等到和不发的一样紧。
+- **第二版**：load 总是进固定的暂存寄存器，来源地址在运行时选；当前 panel 缺后半块时，先把 h1 load 进暂存区，再在 MFMA k2、k3 之前用一个只做拷贝的 `if lag` 搬进 `bq[2..3]`。结果 2k 129.2、4k 196.2（VGPR 216）。LLVM 把这个拷贝部分改成了 `v_cndmask`，并把刚 load 的暂存寄存器提前拷贝，kt2 的 `ds_read` 之后多出一个 `vmcnt(0)`。
+- **最终版**：在 panel 层面按 lag 分成两份 tile 0 代码，tile 内就不需要搬运了（见第 6 节 1c 的"实现"）。
+- 规则：不要在 load 外面包"目的寄存器不同"的运行时分支，也不要在刚 load 的寄存器上做条件拷贝；要选的是来源地址，目的寄存器保持固定。分支汇合前要保证在途 load 已经被等完（比如放在 tile 之间）。
+
 ## 4. 你的假设和实验结论对照
 
 | 你的判断 | 结论 |
@@ -199,6 +248,8 @@ s_waitcnt vmcnt(1)                     s_waitcnt vmcnt(10)
 | 只在第二个 tile 预取 k0/k1 这一半（折中方案） | 只收回 14–22% |
 | 第二个 tile 一次性预取整块 W2 | 约等于不预取（116.5）。在 v2 上还会把 occupancy 降到 2 WG/CU |
 | async 能不能只等 kt0、让 kt1 的 DMA 继续在途 | 能。被等的是 vmcnt，不是 lgkmcnt；flydsl 0.5.3 的 async LDS DMA 已验证 |
+| tile 开头 pre-loop 和 kt0 连着发的 8 条 B value load 是瓶颈（路线 1c 的出发点） | 没有单独验证（设计里的对照变体没做）。1c 稳态下 pre-loop、kt0 已经没有 B load，但整体更慢：主因是 W2' 在发出它的 tile 内就被 `vmcnt(0)` 等完，再加上 2 WG/CU（3.13） |
+| 路线 1c 里任何槽位的 B load 不多于 v2，所以最坏也是 v2 的等待 | 不对。目的寄存器不同的运行时分支会让一条路径去等另一条路径的 load；就算没有分支，保留 v2 的 `vmcnt(0)` 也会让 W2' 每个 tile 暴露一次延迟（3.13） |
 
 ## 5. 当前状态和文件位置
 
@@ -247,13 +298,35 @@ docker exec -w $PWD "${E[@]}" -e PYTHONPATH=$D/aiter_f209cd555 zhimding_cguo_rep
 docker exec -w $PWD "${E[@]}" -e PYTHONPATH=$D/aiter_pf22 zhimding_cguo_repro python3 bench_gemm2es.py -t 2048 4096 --iters 100 --label pes_w2n
 ```
 
+### v3-058（11-26 下午）
+
+直接用 `/shared_nfs/cguo/`（cguo 可写），worktree 已经 repair 过：
+
+- `aiter_pf22/`：worktree，分支 `cguo/gemm2es_pf22`。JIT `.so` 从 `aiter_head` 拷了过来。11-26 下午的提交（作者 `charlieguo1106 <cguo@amd.com>`，没有 co-author，**没有 push**）：
+  - 路线 1b、1c 各自是一对新文件：`mxmoe_dispatcher_route1b.py` + `mxmoe_gemm_v2_route1b.py`（`0286007b4` 的代码），`mxmoe_dispatcher_route1c.py` + `mxmoe_gemm_v2_route1c.py`（1c 最终版）。新 dispatcher 只 import 自己的 gemm 文件，`fused_moe` 不会调用它们。
+  - `mxmoe_dispatcher.py`、`mxmoe_gemm_v2.py` 恢复成 `4040a7109`，所以这个分支上 `AITER_MXFP4_G2_ES=1` 跑的是 HEAD persist-es。
+  - 这份 test.md 的 3.12、3.13 以及相关更新。
+  - 用 bench 的 `--dispatcher mxmoe_dispatcher_route1b`（或 `_route1c`）测，kernel 名分别带 `_w2n`、`_w2h`；提交前三条路径都重新编译测过，route rows 和 HEAD 逐字节一致。
+- `gemm2es_bench/`：
+  - `route1c_w2_halves_on_pf22.patch`：拆成新文件之前的 1c，直接改 `b1d9301d3` 的原文件（会去掉 1b 的改动）；`route1c_w2_halves_vs_4040a7109.patch`：同一份代码相对 `4040a7109` 的 diff。
+  - `repro_v3058/`：3.12、3.13 的日志（`gpu1_r*_*.log`、`final_*.log`、`gpu1_pf22_1c*.log`），8 卡 `.bak` 的日志（`all_gpu*`、`r*_gpu*`、`seq_gpu*`），ISA（`isa/`），route rows（`dump/`），以及 1c 的一键脚本 `run1c.sh`（GPU1：测速、和 HEAD 的 dump 逐字节比对、ISA 统计）。
+- 容器 `cguo_gemm2es`：镜像是本机的 `vllm/vllm-openai-rocm:latest`，site-packages 里装的是 flydsl 0.5.0（给 `.bak`），0.5.3 装在 `/opt/flydsl053`。容器以 root 写出的文件要在容器里 `chown` 回来，否则宿主机上删不掉。
+
+```bash
+cd /shared_nfs/cguo/gemm2es_bench
+E=(-e HIP_VISIBLE_DEVICES=1 -e AITER_MXFP4_INTERMEDIATE=1 -e AITER_MXFP4_G2_ES=1 -e FLYDSL_RUNTIME_CACHE_DIR=/root/.flydsl/cache053)
+docker exec -w $PWD "${E[@]}" -e PYTHONPATH=/opt/flydsl053:/shared_nfs/cguo/aiter_head cguo_gemm2es python3 bench_gemm2es.py -t 2048 4096 --iters 100 --label head
+docker exec -w $PWD "${E[@]}" -e PYTHONPATH=/opt/flydsl053:/shared_nfs/cguo/aiter_pf22 cguo_gemm2es python3 bench_gemm2es.py -t 2048 4096 --iters 100 --label 1c --dispatcher mxmoe_dispatcher_route1c
+docker exec -w $PWD -e HIP_VISIBLE_DEVICES=1 -e AITER_MXFP4_INTERMEDIATE=1 -e AITER_MXFP4_G2_ES=1 -e PYTHONPATH=/shared_nfs/cguo/aiter_f209cd555 cguo_gemm2es python3 bench_gemm2es.py -t 2048 4096 --iters 100 --label es_full
+```
+
 ## 6. 后续修改与优化计划
 
-会话最后在问"路线 2 接下来怎么走"时你取消了，所以这一步还没定。下面按推荐程度排列。11-26 先按你的思路实现了路线 1b。
+会话最后在问"路线 2 接下来怎么走"时你取消了，所以这一步还没定。下面按推荐程度排列。11-26 先按你的思路实现了路线 1b；下午实测了 1b，并实现、实测了路线 1c，1c 结果不好，暂时搁置（3.13）。
 
-### 路线 1b：2/2/0/0（11-26 已实现，未测试）
+### 路线 1b：2/2/0/0（11-26 已实现，已实测，见 3.13）
 
-出发点是代码简单：只复用 v2 tile 里原本 load W2 的 K 循环槽位，A 的发射位置不变。commit `0286007b4`（分支 `cguo/gemm2es_pf22`），只改了 `mxmoe_dispatcher.py` 和 `mxmoe_gemm_v2.py`，+140/−57 行。
+出发点是代码简单：只复用 v2 tile 里原本 load W2 的 K 循环槽位，A 的发射位置不变。commit `0286007b4`（分支 `cguo/gemm2es_pf22`），只改了 `mxmoe_dispatcher.py` 和 `mxmoe_gemm_v2.py`，+140/−57 行。之后这份代码挪到了 `mxmoe_dispatcher_route1b.py` / `mxmoe_gemm_v2_route1b.py`，原文件恢复成 `4040a7109`。
 
 - **寄存器**：WG 多带一套 W2 寄存器（`bq_n` / `bs_n`，约 68 个 VGPR）。
 - **发射位置**：panel 的 chunk 0 在 v2 预取 W2 的那个槽位（kt0 开头，`bhoist` 的位置），发下一个 panel 的 K-tile 0（8 条 value + 2 条 e8m0，即 G0 G1）。chunk 1 在同一个位置发 K-tile 1（G2 G3）。chunk 2 以后不发。下一个 panel 开头把 `bq_n` 拷到 `bq`，只有 WG 的第一个 panel 的 chunk 0 自己 load W2。
@@ -271,8 +344,9 @@ docker exec -w $PWD "${E[@]}" -e PYTHONPATH=$D/aiter_pf22 zhimding_cguo_repro py
   1. 用 `--dump-dir` 把 route rows 和 HEAD 的逐字节比对。W2 的值和累加顺序都没变，应该逐字节一致。
   2. 8 卡跑 2k/4k（8k 要用 `glm5_reduce_large.csv`）。
   3. 看 ISA：VGPR 和每 CU 的 WG 数；chunk 0、1 的 kt1 处和 epilogue 是不是 `vmcnt(10)`；下一个 chunk 第一个 ds_read 之前的 vmcnt 是多少。
+- **实测**（v3-058 GPU1，3.13）：route rows 和 HEAD 逐字节一致；2 WG/CU；2k 107.3、4k 157.8（HEAD 106.4 / 146.6，强制 2 WG/CU 的 HEAD 123.9 / 177.8）。比预期的好：同样 2 WG/CU 下预取省了 17–20 us，2k 和 3 WG/CU 的 HEAD 打平。ISA 和 8k 还没看。
 
-### 路线 1c：ES 也用 v2 的 BK=128 流水线，W2 按半块放进 kt1、kt2 的槽位（11-26 设计，代码未改）
+### 路线 1c：ES 也用 v2 的 BK=128 流水线，W2 按半块放进 kt1、kt2 的槽位（11-26 设计；已实现、已实测，见 3.13；代码在 `mxmoe_*_route1c.py`，暂时搁置）
 
 出发点：
 
@@ -363,14 +437,42 @@ panel 的 tile 不够时，后面的行就不存在，没发出去的半块就�
 - 稳态下 panel 开头不用再等自己的 W2。HEAD 是在 chunk 0 开头发 20 条，紧接着就要等。
 - 每个槽位的 B load 不多于 v2。稳态下 pre-loop、kt0 只剩 A scale，tile 2 以后没有 B load。
 - 等待保持 v2 原样时，W2' 会在发出它的那个 tile 的 kt3（`vmcnt(0)`）被等完，只和 MFMA k1、k2 重叠。代价和 v2 在 kt1、kt2 load 自己的 k2、k3 一样。
-- 运行时分支会让 LLVM 在分支汇合后用更保守的 vmcnt。因为槽位里的 load 不多于 v2，最坏也相当于这些 load 都发了，也就是 v2 的等待。
+- 运行时分支会让 LLVM 在分支汇合后用更保守的 vmcnt。~~因为槽位里的 load 不多于 v2，最坏也相当于这些 load 都发了，也就是 v2 的等待。~~ **这一条是错的**：汇合处取的是各条路径里更紧的等待，目的寄存器不同时还会让一条路径去等另一条路径的 load，刚发出的 W2' 会被立刻等完（3.13）。最终实现里 tile 0、tile 1 的 load 外面没有分支。
 - VGPR 多出约 68 个，预计和路线 1、1b 一样降到 2 WG/CU。
 
 待验证：
 
 - **"开头 8 条 B load 是瓶颈"这个假设**：做一个对照变体，把 W2' 的半块放在 pre-loop、kt0 槽位，其余不变，直接比。HEAD 的 ES（BK=256）在非首个 chunk 里本来就不发 B load，也可以拿来对照。
 - **VGPR 和每 CU 的 WG 数**；tile 0、1 的槽位内容和 vmcnt 是否和上面的图一致。
-- **正确性**：BK=128 和 BK=256 对每个累加器都是按 k0 → k3 的顺序做 128-K 的 MFMA，e8m0 word 也相同，所以 route rows 应该和 HEAD 逐字节一致，需要用 `--dump-dir` 确认。
+- **正确性**：BK=128 和 BK=256 对每个累加器都是按 k0 → k3 的顺序做 128-K 的 MFMA，e8m0 word 也相同，所以 route rows 应该和 HEAD 逐字节一致，需要用 `--dump-dir` 确认。（已确认：2k、4k 逐字节一致。）
+
+**实现（最终版，`mxmoe_dispatcher_route1c.py` / `mxmoe_gemm_v2_route1c.py`）**
+
+- **dispatcher**：
+  - ES 改成 BM=32、BN=256、BK=128（`use_nt` 不变）；断言改成 BK=128 且 INTER_MAX=512；去掉 1b 的 `SBM >= 64`；
+  - kernel 名里是 `_bn256_bk128` 和 `_pes_cu256_ne257_w2h`。
+- **寄存器**：
+  - 当前 panel 的 W2：`bq[4]`（每个 K tile 一块）和 `bs[2]`（每个半块一组 scale）；
+  - W2' 一套：`bq_n` / `bs_n`，分成两个暂存半块，A = (`bq_n[0..1]`, `bs_n[0]`)，B = (`bq_n[2..3]`, `bs_n[1]`)。
+- **panel 循环的携带变量**：
+  - `res`：当前 panel 已在寄存器里的半块数；
+  - `res_lag`：上一个 panel 是否 lag，决定 A、B 里两个半块的顺序。
+  - panel 开头按 `res_lag` 把 A、B 拷进 `bq` / `bs`；`lag = res < 2`。
+- **chunk 0**：在 panel 层面分成两份代码，汇合点在 tile 之间，那时 kt3 和 epilogue 已经 `vmcnt(0)`。
+  - lag 时就是 v2 的 tile：kt1、kt2 直接把自己的 h1 load 进 `bq[2..3]`；`res == 0` 时 pre-loop、kt0 还要 load h0（这里有个 `if`，只在 WG 的第一个 panel 或者跟在单 tile panel 后面时走到）。
+  - 不 lag 时：kt1、kt2 把 W2' h0 load 进 A，没有分支。
+- **chunk 1**（`n_chunks > 1` 时）：把 W2' 的半块 1 − lag load 进 B。半块号是运行时值，只影响地址，没有分支。
+- **chunk 2 以后**（运行时循环）：只有 `c − lag == 1`（也就是 lag 且 c = 2）时，才把 W2' h1 load 进 A（A 里自己的 h1 那时已经用完）。这是唯一一处包在 load 外面的分支，发 load 的是少见路径。
+- **panel 结束**：`res = clamp(n_chunks − lag, 0, 2)`，`res_lag = lag`。
+- **WG 的最后一个 panel**：W2' 的 buffer 描述符 `num_records = 0`，load 照常发出（等待计数不变）但不访存，不再像 1b 那样重读自己的 W2。
+- **A 和等待**：保持 v2 原样，去掉了 1b 的 `vmcnt(10)` 和提前读 token id。
+
+**结论**：2k 126.8、4k 194.7，比不预取的 HEAD（同样 2 WG/CU）还慢。这个方向先搁置。要让 W2' 真正藏住，它必须跨过三个 `vmcnt(0)`：kt3 的、epilogue 读 token id 的、下一个 tile 开头读 `sorted_expert_ids` 的。对应的办法：
+- token id 在 W2' 之前读，kt3 和 epilogue 用精确的 vmcnt（1b 已经做了）；
+- expert id 直接用 expert table 里的值（下面路线 1 + async DMA 的第 3 步）；
+- 下一个 tile 的 A 在 W2' 之前发（同一节的第 1 步）。
+
+这些做完之前，调整 W2' 放在哪个槽位意义不大。
 
 ### 路线 1 + async DMA（推荐：最贴近现有 v2，改动可控）
 

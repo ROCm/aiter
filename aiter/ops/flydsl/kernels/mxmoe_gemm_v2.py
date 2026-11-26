@@ -443,7 +443,7 @@ def gemm2_body_v2(
     # b128 weight copy atom; cache modifier 2=nontemporal, 0=default.
     b_catom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if use_nt else 0), 32)
 
-    def make_bq_view(j, e=e, n_block_idx=n_block_idx):
+    def make_bq_view(j):
         col = n_block_idx * BN + wave * (BN // 4) + j * 16
         if const_expr(is_f8_b):
             return bq_view_fp8(
@@ -463,19 +463,16 @@ def gemm2_body_v2(
 
     bq_views = [make_bq_view(j) for j in range_constexpr(numAccN)]
 
-    def make_bscale_views(e=e, n_block_idx=n_block_idx):
-        mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
-        return [
-            scale_view(
-                arg_bscale,
-                e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
-                K_SCALE_CHUNKS_MAX,
-                k0_stride_dw=kBS_stride_k0_dw,
-            )
-            for mw in range_constexpr(nPairs)
-        ]
-
-    bscale_views = make_bscale_views()
+    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
+    bscale_views = [
+        scale_view(
+            arg_bscale,
+            e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
+            K_SCALE_CHUNKS_MAX,
+            k0_stride_dw=kBS_stride_k0_dw,
+        )
+        for mw in range_constexpr(nPairs)
+    ]
 
     frag_tmpl = (
         None
@@ -484,18 +481,18 @@ def gemm2_body_v2(
     )
     # B-scale word template shares the A-scale layout (sc_frag_tmpl).
 
-    def issue_b_value_load(dst, j, half, kt_rt, views=bq_views):
+    def issue_b_value_load(dst, j, half, kt_rt):
         if const_expr(is_f8_b):
             lo = fx.make_rmem_tensor(4, Int32)
             hi = fx.make_rmem_tensor(4, Int32)
             fx.copy(
                 b_catom,
-                views[j][lane_div_16, lane_mod_16, kt_rt, half, 0, None],
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 0, None],
                 lo,
             )
             fx.copy(
                 b_catom,
-                views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
                 hi,
             )
             lo_v = fx.memref_load_vec(lo)
@@ -504,24 +501,24 @@ def gemm2_body_v2(
         else:
             fx.copy(
                 b_catom,
-                views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
                 dst,
             )
 
-    def issue_bscale_into(bsf, chunk_kt, views=bscale_views):
+    def issue_bscale_into(bsf, chunk_kt):
         for mw in range_constexpr(nPairs):
             fx.copy(
                 sc_copy_atom,
-                views[mw][lane_div_16, lane_mod_16, chunk_kt, None],
+                bscale_views[mw][lane_div_16, lane_mod_16, chunk_kt, None],
                 bsf[mw],
             )
 
-    def issue_b_load_into(bqf, bsf, kt_rt, views=bq_views, sviews=bscale_views):
+    def issue_b_load_into(bqf, bsf, kt_rt):
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
-                issue_b_value_load(bqf[j][half], j, half, kt_rt, views)
+                issue_b_value_load(bqf[j][half], j, half, kt_rt)
         if const_expr(bsf is not None):
-            issue_bscale_into(bsf, scale_chunk_tile(kt_rt), sviews)
+            issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
 
     def make_bq_fragments():
         if const_expr(is_f8_b):
@@ -766,34 +763,8 @@ def gemm2_body_v2(
         bsf_slots = [make_scale_fragments(nPairs) for _ in range_constexpr(n_slots)]
         if const_expr(es is not None):
             # persist-es: the B double buffer holds the panel's whole W2 (K <= 2 tiles) and
-            # lives across its row chunks; only the first panel's first chunk loads it.
+            # lives across its row chunks; only the panel's first chunk loads it.
             (cur_bqf, nxt_bqf), bsf_slots = es.bq, es.bs
-        w2n = getattr(es, "w2n", None)
-        w2n_vm = 0  # vmem instructions of the next panel's W2 issued so far
-        if const_expr(w2n is not None):
-            # persist-es: in the K-loop slot where v2 prefetches W2, this chunk loads K tile
-            # w2n.kt of the next panel's W2 (expert w2n.e, N block w2n.n_block), after the
-            # route ids so that waiting for them leaves that W2 in flight.
-            assert KT == 2 and g2_interleave
-            w2n_bq_views = [
-                make_bq_view(j, w2n.e, w2n.n_block) for j in range_constexpr(numAccN)
-            ]
-            w2n_bs_views = make_bscale_views(w2n.e, w2n.n_block)
-
-        def _ks_load_w2n():
-            ids = load_epilog_ids()
-            rocdl.sched_barrier(0)
-            kt = w2n.kt
-            issue_b_load_into(
-                w2n.bq[kt],
-                w2n.bs[chunk_of[kt] % n_slots],
-                fx.Int32(kt),
-                w2n_bq_views,
-                w2n_bs_views,
-            )
-            rocdl.sched_barrier(0)
-            return ids, numAccN * kHalves + nPairs
-
         saf_slots = None
         if const_expr(g2_ascale_pf):
             saf_slots = [
@@ -807,11 +778,10 @@ def gemm2_body_v2(
 
         def _ks_load_b(load):
             # A compile-time and a runtime condition: not one if.
-            if const_expr(es is None):
+            if const_expr(es is None):  # noqa: SIM114
                 load()
-            elif const_expr(es.load_w2 is not None):  # noqa: SIM102
-                if es.load_w2:
-                    load()
+            elif es.load_w2:
+                load()
 
         def _ks_issue_scales(kt):
             slot = chunk_of[kt] % n_slots
@@ -841,8 +811,6 @@ def gemm2_body_v2(
             cur_bsf = bsf_slots[chunk_of[kt] % n_slots]
             if const_expr(g2_bhoist) and const_expr(kt + 1 < KT):
                 _ks_prefetch(kt + 1)
-                if const_expr(w2n is not None):
-                    prefetched_ids, w2n_vm = _ks_load_w2n()
             if const_expr(not a_all_resident):
                 gpu.barrier()
             issue_a_ds_read(fx.Int32(kt % aStages))
@@ -862,16 +830,12 @@ def gemm2_body_v2(
                 sa = load_a_scale_tile(kt_rt)
             if const_expr(not g2_bhoist) and const_expr(kt + 1 < KT):
                 _ks_prefetch(kt + 1)
-                if const_expr(w2n is not None):
-                    prefetched_ids, w2n_vm = _ks_load_w2n()
             _il = epi_thunks if const_expr(kt == KT - 1) else None
             if const_expr(g2_interleave and kt == KT - 1):
-                # The A LDS DMA must land before C reuses its LDS; the next panel's W2
-                # loads are the newest and stay in flight.
-                rocdl.s_waitcnt(vmcnt=w2n_vm, lgkmcnt=0)
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                 gpu.barrier()
             rocdl.sched_barrier(0)
-            if const_expr(g2_prefetch_ids and kt == KT - 1 and prefetched_ids is None):
+            if const_expr(g2_prefetch_ids and kt == KT - 1):
                 prefetched_ids = load_epilog_ids()
                 rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
@@ -927,7 +891,7 @@ def gemm2_body_v2(
     elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
-        _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids, ids_vmcnt=w2n_vm)
+        _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids)
     else:
         _epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
@@ -970,9 +934,7 @@ def atomic_bf16_epilog(
     output_width=None,
     reduce_store_cache_modifier=None,
     write_limit=None,
-    ids_vmcnt=0,
 ):
-    """ids_vmcnt: vmem instructions issued after prefetched_ids that may stay in flight."""
     if SBM is None:
         SBM = BM
     EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
@@ -1405,7 +1367,7 @@ def atomic_bf16_epilog(
         ]
 
     if const_expr(prefetched_ids is not None or (use_reduce and route_out_q)):
-        rocdl.s_waitcnt(vmcnt=ids_vmcnt)
+        rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
