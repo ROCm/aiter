@@ -41,14 +41,7 @@ def _block_threads(capacity):
     return max(64, min(1024, 1 << (capacity - 1).bit_length()))
 
 
-@aot_factory(
-    "pa_decode_plan",
-    sources=[
-        "kernels/tensor_shim.py",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
-    ],
-)
+@aot_factory("pa_decode_plan")
 @cache
 def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
     """Compile a batch bucket and block size for dense or windowed plans.

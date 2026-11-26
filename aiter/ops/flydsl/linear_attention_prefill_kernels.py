@@ -408,7 +408,6 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     sources=[
         "kernels/gdr_prefill/chunk_gated_delta_h.py",
         "kernels/gdr_common.py",
-        "kernels/kernels_common.py",
     ],
     # Read in this file; the BV override also reaches the key as BV.
     env=["AITER_K5_OPT_CHECK", "FLYDSL_K5_OPT_BV"],

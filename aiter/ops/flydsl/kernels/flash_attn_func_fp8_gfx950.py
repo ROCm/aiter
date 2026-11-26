@@ -229,9 +229,6 @@ _FP8_AOT_CACHE = FlyDSLAotCache(
     "flash_attn_fp8_gfx950",
     sources=[
         "kernels/fmha_gfx950",
-        "kernels/buffer_ops.py",
-        "kernels/kernels_common.py",
-        "kernels/tensor_shim.py",
     ],
 )
 
