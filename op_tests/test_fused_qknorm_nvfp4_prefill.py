@@ -230,6 +230,10 @@ def prefill_launched(n):
     )
 
 
+# the dispatch receipt is taken at one fixed, supported size, whatever correctness sizes -n names
+# (1 and above 419430 tokens legitimately select the generic kernel)
+DISPATCH_PROBE_N = 2
+
 # the prefill kernel reads qkv through a 32-bit byte extent: 2**31 // (ROW * 2) = 419430 tokens is
 # its largest call, the generic kernel takes the one above it
 BIG_N = (419430, 419431)
@@ -249,7 +253,7 @@ def child(args):
             k: dig(v) for k, v in run(c, n, marshalled=True).items()
         }
         del c
-    res["_prefill_launched"] = prefill_launched(max(args.n))
+    res["_prefill_launched"] = prefill_launched(DISPATCH_PROBE_N)
     with open(args.child, "w") as f:
         json.dump(res, f)
 

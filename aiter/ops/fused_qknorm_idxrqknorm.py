@@ -192,12 +192,20 @@ def _nvfp4_raw_front(
     if not _nv_pf_gfx950:
         return False
     if _nv_pf_mod is None:
-        try:
-            from ..jit.core import get_module
+        from ..jit import core as jit_core
 
-            _nv_pf_mod = get_module("module_fused_qknorm_idxrqknorm")
+        if (
+            jit_core.AITER_REBUILD
+            and "module_fused_qknorm_idxrqknorm" not in jit_core.rebuilded_list
+        ):
+            return False  # the generic call below does the requested rebuild first
+        try:
+            module = jit_core.get_module("module_fused_qknorm_idxrqknorm")
         except ModuleNotFoundError:
             return False  # not built yet: the generic call below builds it
+        if not hasattr(module, "fused_qknorm_nvfp4_raw"):
+            return False  # a build older than the raw entry: the generic call serves it
+        _nv_pf_mod = module
     _nv_pf_mod.fused_qknorm_nvfp4_raw(
         qkv.data_ptr(),
         q_out.data_ptr(),
