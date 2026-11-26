@@ -397,6 +397,9 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         raise ValueError("tdm_fold must be a bool or two of 'k'/'v'/'-'")
     if tdm_fold and (async_dma or cta_dma or dbg in (4, 5)):
         raise ValueError("tdm_fold stages every plane with tensor DMAs")
+    # The per-wave tensor DMA ring always holds nb - 1 pages' DMAs (zero-extent
+    # ones past the union's end): one unconditional tensor wait a page step.
+    full_ring = not (async_dma or cta_dma or dbg == 3)
     pairs = tq // 2
     all_rows = bool(all_rows)
     v_hoist = (pairs > 1 and not all_rows) if v_hoist is None else bool(v_hoist)
@@ -698,6 +701,13 @@ def compile_pa_sparse_prefill_nvfp4_v2(
             # only), and a min/max pair of this uniform value becomes v_med3_i32
             # (no SALU form) that drags every descriptor word through VGPRs and
             # back with v_readfirstlane; a single max keeps the descriptor in SALU.
+            if const_expr(full_ring):
+                # Past the union's end: no fetch (zero extent; the DMA zero-fills
+                # a slot no later page uses) from page 0, whatever the stale
+                # metadata reads.
+                live = u < n_union
+                page = live.select(page, fx.Int32(0))
+                top = live.select(top, fx.Int32(0))
             valid = fx.max(fx.Int32(0), top - warp * _TOKENS)
             base = slot_base(slot)
             payload = fx.Int64(page) * (PAGE * _ROW // 2) + fx.Int64(
@@ -831,7 +841,12 @@ def compile_pa_sparse_prefill_nvfp4_v2(
         if const_expr(cta_dma):
             stage = stage_cta  # noqa: F811
 
-        if const_expr(dbg != 3):
+        if const_expr(full_ring):
+            # The ring always holds nb - 1 pages' DMAs, so the walk's waits need
+            # no bound checks.
+            for ahead in range_constexpr(nb - 1):
+                stage(fx.Int32(ahead), fx.Int32(ahead))
+        elif const_expr(dbg != 3):
             if n_union > 0:
                 stage(fx.Int32(0), fx.Int32(0))
             for ahead in range_constexpr(1, nb - 1):
@@ -959,22 +974,17 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                             fx.rocdl.s_wait_asynccnt(10)
                         else:
                             fx.rocdl.s_wait_asynccnt(0)
-            elif const_expr(nb == 2):
-                tdm_ops.tensor_wait(0)
-            elif const_expr(nb == 3):
-                if u + 1 < n_union:
-                    tdm_ops.tensor_wait(page_dmas)
-                else:
-                    tdm_ops.tensor_wait(0)
             else:
-                if u + 2 < n_union:
-                    tdm_ops.tensor_wait(2 * page_dmas)
-                else:
-                    if u + 1 < n_union:
-                        tdm_ops.tensor_wait(page_dmas)
-                    else:
-                        tdm_ops.tensor_wait(0)
-            if const_expr(dbg != 3):
+                # Page u is done when only the nb - 2 later pages' DMAs remain
+                # (the ring is always full: no bound checks, no branches).
+                tdm_ops.tensor_wait((nb - 2) * page_dmas)
+            if const_expr(full_ring):
+                ahead = slot + (nb - 1)
+                stage(u + (nb - 1), (ahead >= nb).select(ahead - nb, ahead))
+                # The page's DMAs issue together at the step head (spread over
+                # the step they measured slower).
+                fx.rocdl.sched_barrier(0)
+            elif const_expr(dbg != 3):
                 if u + (nb - 1) < n_union:
                     # The slot nb - 1 pages ahead, from this page's (no remainder).
                     ahead = slot + (nb - 1)
