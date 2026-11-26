@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -36,6 +37,16 @@ static_assert(offsetof(fmha_fwd_v3_args, ptr_kseq_padding) - offsetof(fmha_fwd_v
                                                                        ptr_qseq_padding) ==
                   sizeof(FmhaFwdV3ThdKvSplit),
               "THD KV-split descriptor fills ptr_qseq_padding's slot");
+
+// The THD objects address every token through a 64-bit product, so a pack may pass 4 GiB, but
+// they take each stride as a 32-bit byte count. Strides are computed in 64 bits and a call whose
+// stride does not fit stays off them.
+constexpr int64_t kThdMaxStrideBytes = UINT32_MAX;
+
+uint32_t thd_stride_bytes(int64_t elements, int64_t bytes_per_element)
+{
+    return static_cast<uint32_t>(elements * bytes_per_element);
+}
 
 // mha_v4(kv_splits="auto") takes at most this many slices: past it the merge outweighs the
 // work-groups it adds.
@@ -120,9 +131,10 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
 
 // gfx950 BF16 hd256 THD rows (the fmha_v4 THD objects): varlen self-attention, every document
 // has the same length for Q and K. The objects read only ptr_qseq and take each document's K/V
-// rows from Q's offsets, so cu_seqlens_k must equal cu_seqlens_q. That is the caller's contract,
-// as the rest of cu_seqlens' contents are: checking it here would synchronize every launch. What
-// is checked is host-visible: no padding and the same token count for Q and K.
+// rows from Q's offsets, so cu_seqlens_k must equal cu_seqlens_q. Equal totals and maxima do not
+// imply that, and comparing contents here would synchronize every launch, so Q and K must share
+// one seqstart array: flash_attn_varlen_func compares a separate cu_seqlens_k and passes
+// cu_seqlens_q for both when they are equal.
 // AITER_FMHA_V3_FWD_THD=0 keeps these calls on the hd256 group rows (MHA only).
 bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
 {
@@ -131,7 +143,7 @@ bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
         return false;
     if(const char* env = std::getenv("AITER_FMHA_V3_FWD_THD"); env && std::strcmp(env, "0") == 0)
         return false;
-    if(a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr)
+    if(a.seqstart_q_ptr == nullptr || a.seqstart_q_ptr != a.seqstart_k_ptr)
         return false;
     if(a.cu_seqlen_q_ptr || a.cu_seqlen_k_ptr || a.seqlen_q_ptr || a.seqlen_k_ptr)
         return false;
@@ -142,6 +154,20 @@ bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
     if(a.bias_type != 0 || a.p_drop > 0.f || a.logits_soft_cap > 0.f || a.has_sink ||
        a.qscale_type != 0)
         return false;
+    // The output's strides are checked at FP32 width, which KV-slice partials are written in.
+    for(const int64_t bytes : {int64_t(a.stride_q) * 2,
+                               int64_t(a.nhead_stride_q) * 2,
+                               int64_t(a.stride_k) * 2,
+                               int64_t(a.nhead_stride_k) * 2,
+                               int64_t(a.stride_v) * 2,
+                               int64_t(a.nhead_stride_v) * 2,
+                               int64_t(a.stride_o) * 4,
+                               int64_t(a.nhead_stride_o) * 4,
+                               a.has_lse ? int64_t(a.nhead_stride_lse) * 4 : int64_t(0)})
+    {
+        if(bytes < 0 || bytes > kThdMaxStrideBytes)
+            return false;
+    }
     return true;
 }
 
@@ -190,9 +216,11 @@ int fmha_fwd_v3_thd_kv_splits(const mha_fwd_args& a)
     }
     if(splits <= 1)
         return 1;
-    // The kernel steps between slices through 32-bit byte strides.
-    const int64_t slice_bytes = static_cast<int64_t>(a.seqlen_q) * a.nhead_q * a.hdim_v * 4;
-    if(slice_bytes > static_cast<int64_t>(UINT32_MAX))
+    // The kernel steps between slices through 32-bit byte strides, and the merge launches one
+    // block per (token, head) row.
+    const int64_t rows        = static_cast<int64_t>(a.seqlen_q) * a.nhead_q;
+    const int64_t slice_bytes = rows * a.hdim_v * 4;
+    if(slice_bytes > kThdMaxStrideBytes || rows > std::numeric_limits<int32_t>::max())
         return 1;
     return static_cast<int>(splits);
 }
@@ -211,18 +239,18 @@ void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a, ui
     args.scalar        = a.scale_s;
     args.s_seq_len     = a.max_seqlen_q;
     args.s_kv_seq_len  = a.max_seqlen_q;
-    args.s_Seqs        = a.stride_q * bpe;
-    args.s_Hs          = a.nhead_stride_q * bpe;
+    args.s_Seqs        = thd_stride_bytes(a.stride_q, bpe);
+    args.s_Hs          = thd_stride_bytes(a.nhead_stride_q, bpe);
     args.s_gqa         = a.nhead_q / a.nhead_k;
-    args.s_k_Seqs      = a.stride_k * bpe;
-    args.s_k_Hs        = a.nhead_stride_k * bpe;
+    args.s_k_Seqs      = thd_stride_bytes(a.stride_k, bpe);
+    args.s_k_Hs        = thd_stride_bytes(a.nhead_stride_k, bpe);
     args.s_qk_head_dim = a.hdim_q;
     args.s_v_head_dim  = a.hdim_v;
     args.s_q_head_num  = a.nhead_q;
-    args.s_v_Seqs      = a.stride_v * bpe;
-    args.s_v_Hs        = a.nhead_stride_v * bpe;
-    args.s_o_Seqs      = a.stride_o * out_bpe;
-    args.s_o_Hs        = a.nhead_stride_o * out_bpe;
+    args.s_v_Seqs      = thd_stride_bytes(a.stride_v, bpe);
+    args.s_v_Hs        = thd_stride_bytes(a.nhead_stride_v, bpe);
+    args.s_o_Seqs      = thd_stride_bytes(a.stride_o, out_bpe);
+    args.s_o_Hs        = thd_stride_bytes(a.nhead_stride_o, out_bpe);
     args.ptr_qseq      = a.seqstart_q_ptr;
     args.ptr_kseq      = a.seqstart_k_ptr;
     if(a.has_lse)
@@ -230,13 +258,13 @@ void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a, ui
         // [nhead_q, total_tokens] float32 per slice; head h's rows start at ptr_lse + h * s_lse_Hs.
         args.ptr_lse  = a.lse_ptr;
         args.s_lse    = 1;
-        args.s_lse_Hs = a.nhead_stride_lse * 4;
+        args.s_lse_Hs = thd_stride_bytes(a.nhead_stride_lse, 4);
     }
     if(a.kv_splits > 1)
     {
         const FmhaFwdV3ThdKvSplit split{static_cast<uint32_t>(a.kv_splits),
-                                        static_cast<uint32_t>(a.kv_split_stride_o * 4),
-                                        static_cast<uint32_t>(a.kv_split_stride_lse * 4),
+                                        thd_stride_bytes(a.kv_split_stride_o, 4),
+                                        thd_stride_bytes(a.kv_split_stride_lse, 4),
                                         cu_budget};
         std::memcpy(reinterpret_cast<char*>(&args) + offsetof(fmha_fwd_v3_args, ptr_qseq_padding),
                     &split,
@@ -401,7 +429,9 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
     // FP32 KV-slice partials exist only on the THD rows.
-    if(a.kv_splits > 1 && (!thd || !a.has_lse))
+    if(a.kv_splits > 1 &&
+       (!thd || !a.has_lse || a.kv_split_stride_o * 4 > kThdMaxStrideBytes ||
+        a.kv_split_stride_lse * 4 > kThdMaxStrideBytes))
     {
         return -1;
     }

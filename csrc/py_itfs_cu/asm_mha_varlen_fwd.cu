@@ -572,8 +572,11 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         if (kv_splits > 1 && total_q > 0) {
             TORCH_CHECK(head_size_v % 4 == 0 && head_size_v / 4 <= 1024,
                         "THD KV-split merge needs head_size_v a multiple of 4, at most 4096");
+            const int64_t merge_rows = int64_t(total_q) * num_heads;
+            TORCH_CHECK(merge_rows <= std::numeric_limits<int32_t>::max(),
+                        "THD KV-split merge launches one block per (token, head) row");
             hipLaunchKernelGGL(thd_kv_split_merge_kernel,
-                               dim3(static_cast<unsigned int>(int64_t(total_q) * num_heads)),
+                               dim3(static_cast<unsigned int>(merge_rows)),
                                dim3(head_size_v / 4),
                                0,
                                stream,

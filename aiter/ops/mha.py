@@ -3475,12 +3475,18 @@ def _flash_attn_varlen_forward(
         )
         return ret
 
+    thd_decision = []
+
     def is_fmha_v3_thd_bf16_hd256():
         # gfx950 BF16 hd256 THD rows, which take GQA: varlen self-attention where every document
         # has the same length for Q and K. The kernels take K/V offsets from cu_seqlens_q, so
-        # cu_seqlens_k must equal it; only host-visible conditions are checked here, to avoid a
-        # sync. Mirrors is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu.
-        return (
+        # cu_seqlens_k must hold the same lengths, which equal totals and maxima do not imply.
+        # A separate cu_seqlens_k tensor is compared on the device, one sync per call, and not
+        # under graph capture; the call then passes cu_seqlens_q for both, which is what
+        # is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu requires.
+        if thd_decision:
+            return thd_decision[0]
+        ok = (
             get_gfx() == "gfx950"
             and q.dtype == dtypes.bf16
             and hdim_q == 256
@@ -3492,6 +3498,14 @@ def _flash_attn_varlen_forward(
             and q.shape[0] == k.shape[0]
             and max_seqlen_q == max_seqlen_k
         )
+        if ok and cu_seqlens_q.data_ptr() != cu_seqlens_k.data_ptr():
+            ok = (
+                not torch.cuda.is_current_stream_capturing()
+                and cu_seqlens_q.shape == cu_seqlens_k.shape
+                and torch.equal(cu_seqlens_q, cu_seqlens_k)
+            )
+        thd_decision.append(ok)
+        return ok
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -3725,7 +3739,8 @@ def _flash_attn_varlen_forward(
             k,
             v,
             cu_seqlens_q,
-            cu_seqlens_k,
+            # The THD rows need one cu_seqlens for Q and K (checked equal above).
+            cu_seqlens_q if is_fmha_v3_thd_bf16_hd256() else cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
             min_seqlen_q,
