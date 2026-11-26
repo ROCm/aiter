@@ -79,9 +79,7 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if (
-                int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event
-            ) and not testGraph:
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -117,30 +115,15 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
-                if use_cuda_event:
-                    graph.replay()
-                    torch.cuda.synchronize()
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                    graph.replay()
-                    end_event.record()
-                    end_event.synchronize()
-                    avg = start_event.elapsed_time(end_event) * 1000 / num_iters
-                    logger.info(f"avg: {avg} us/iter with hipgraph cuda.Event")
-                else:
-                    with tpf.profile(
-                        activities=[
-                            tpf.ProfilerActivity.CPU,
-                            tpf.ProfilerActivity.CUDA,
-                        ],
-                        profile_memory=True,
-                        with_stack=True,
-                        with_modules=True,
-                    ) as prof:
-                        run_iters(1, graph.replay)
-                    avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
-                    logger.info(f"avg: {avg} us/iter with hipgraph")
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    with_stack=True,
+                    with_modules=True,
+                ) as prof:
+                    run_iters(1, graph.replay)
+                avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
+                logger.info(f"avg: {avg} us/iter with hipgraph")
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
                 # Import lazily: normal library/test use has no amdsmi dependency.

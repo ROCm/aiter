@@ -984,6 +984,29 @@ def run_int8_4wave_ci_correctness():
 
 
 @torch.no_grad()
+def run_gfx1250_fp8_ptpc_ci_correctness(n=2112, k=7168):
+    """gfx1250 FP8 per-token GEMM: M=16 and M=32 tune to one FlyDSL kernel, so
+    the later launches reuse its compiled handle and must still be correct."""
+    if get_gfx() != "gfx1250":
+        aiter.logger.info("gfx1250 FP8 ptpc correctness: skipped, requires gfx1250")
+        return
+    weight, w_scale = aiter.pertoken_quant(
+        torch.randn((n, k), dtype=dtypes.bf16, device="cuda"),
+        quant_dtype=dtypes.fp8,
+    )
+    weightshuffle = shuffle_weight(weight, layout=(16, 16))
+    for m in (16, 32, 16):
+        x, x_scale = aiter.pertoken_quant(
+            torch.randn((m, k), dtype=dtypes.bf16, device="cuda"),
+            quant_dtype=dtypes.fp8,
+        )
+        out = aiter.gemm_a8w8_bpreshuffle(x, weightshuffle, x_scale, w_scale)
+        torch.cuda.synchronize()
+        ref = reference_gemm(x, weight, x_scale, w_scale)
+        err = checkAllclose(ref, out, msg=f"gfx1250 ptpc M={m}: ")
+        assert err == 0, f"gfx1250 ptpc M={m}: {err:.2%} of outputs mismatch"
+
+
 def run_int8_4wave_dispatch_checks():
     """INT8 routing decisions, checked with fake tuned rows and launches."""
     if get_gfx() != "gfx950":
@@ -1329,6 +1352,7 @@ args = parser.parse_args()
 
 run_int8_4wave_ci_correctness()
 run_int8_4wave_dispatch_checks()
+run_gfx1250_fp8_ptpc_ci_correctness()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
