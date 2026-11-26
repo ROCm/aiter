@@ -219,9 +219,9 @@ def test_decode_expert_gemms_matches_torch(n):
 
 
 @pytest.mark.parametrize("case", ["all_dropped", "mixed"])
-def test_decode_expert_gemms_dropped_routes_are_zero(case):
-    """An id outside [0, E) (a dropped route) leaves a zero slot row, not uninitialized memory; the valid slots and
-    the shared expert are unaffected."""
+def test_decode_expert_gemms_dropped_routes(case):
+    """Ids outside [0, E) (dropped routes) are ignored: the valid slots and the shared expert are unaffected. The
+    dropped slots' rows are not written (the caller's reduction masks them)."""
     n = 16
     dev = torch.device("cuda")
     g = torch.Generator().manual_seed(99)
@@ -235,12 +235,8 @@ def test_decode_expert_gemms_dropped_routes_are_zero(case):
         ids[3, 2] = 2**20
     valid = (ids >= 0) & (ids < E)
     ref, ref_sh = _reference(n, logical, ids, wt)
-    # poison the allocator: a torch.empty slot buffer would come back holding NaNs
-    poison = torch.full((n, TOPK, H), float("nan"), dtype=torch.bfloat16, device=dev)
-    del poison
     out, sh_out = D.decode_expert_gemms(D.get_plan(n), *args)
     torch.cuda.synchronize()
-    assert (out[~valid] == 0).all(), "dropped slots must be exactly zero"
     if valid.any():
         assert _rel(out[valid], ref[valid]) < TOL
     assert _rel(sh_out, ref_sh) < TOL
