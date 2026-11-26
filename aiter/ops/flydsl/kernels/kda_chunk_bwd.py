@@ -1340,6 +1340,23 @@ def _stv(view3, row, col0, values, num):
         fx.copy(atom, frag, fx.slice(view3, (row, col0 // vec + j, None)))
 
 
+def _lds_row(view, off, n, num):
+    """``n`` contiguous LDS elements from ``off`` (16-byte aligned), as fp32, in b128 reads."""
+    vec = 8 if num is fx.BFloat16 else 4
+    atom = fx.make_copy_atom(fx.UniversalCopy128b(), num)
+    v2 = fx.make_view(
+        fx.get_iter(view) + off, fx.make_layout((n // vec, vec), (vec, 1))
+    )
+    out = []
+    for j in range_constexpr(n // vec):
+        frag = fx.make_rmem_tensor(vec, num)
+        fx.copy(atom, fx.slice(v2, (j, None)), frag)
+        vals = frag.load()
+        for p in range_constexpr(vec):
+            out.append(vals[p] if num is fx.Float32 else vals[p].to(fx.Float32))
+    return out
+
+
 class _Mma:
     """``C[64, N] += A[64, Kd] @ B[N, Kd]^T`` on bf16 LDS operands (K contiguous).
 
@@ -2289,7 +2306,8 @@ def compile_intra_mfma(
             lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
         gpu.barrier()
 
-        g_r = [lds_ld(s_g, r * K + seg * 32 + e) for e in range_constexpr(32)]
+        # Rows are read as b128: each thread owns 32 contiguous columns.
+        g_r = _lds_row(s_g, r * K + seg * 32, 32, fx.Float32)
 
         # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j]), sub-chunks apart
         lane = tid % 64
@@ -2370,22 +2388,19 @@ def compile_intra_mfma(
             aq = _sel(ok, lds_ld(s_aq, r * BT + jq), _zero())
             ak = _sel(ok, lds_ld(s_ak, r * BT + jq), _zero())
             acc_q, acc_k = [], []
+            g_j = _lds_row(s_g, jq * K + seg * 32, 32, fx.Float32)
+            k_j = _lds_row(s_k, jq * K + seg * 32, 32, fx.BFloat16)
             for e in range_constexpr(32):
-                kk = seg * 32 + e
-                ex = _decay(_sel(ok, g_r[e] - lds_ld(s_g, jq * K + kk), _zero()))
-                kx = lds_ld(s_k, jq * K + kk, fx.BFloat16) * ex
+                ex = _decay(_sel(ok, g_r[e] - g_j[e], _zero()))
+                kx = k_j[e] * ex
                 acc_q.append(st[e] + aq * kx)
                 acc_k.append(st[32 + e] + ak * kx)
             res = yield acc_q + acc_k
         acc = _results(res, 64)
         b_dq2, b_dk2 = acc[:32], acc[32:]
 
-        k_r = [
-            lds_ld(s_k, r * K + seg * 32 + e, fx.BFloat16) for e in range_constexpr(32)
-        ]
-        q_r = [
-            lds_ld(s_q, r * K + seg * 32 + e, fx.BFloat16) for e in range_constexpr(32)
-        ]
+        k_r = _lds_row(s_k, r * K + seg * 32, 32, fx.BFloat16)
+        q_r = _lds_row(s_q, r * K + seg * 32, 32, fx.BFloat16)
         beta_r = lds_ld(s_b, r)
         db_r = _zero()
         for e in range_constexpr(32):
@@ -2426,17 +2441,12 @@ def compile_intra_mfma(
             aq = _sel(ok, lds_ld(s_aq, jq * BT + r), _zero())
             ak = _sel(ok, lds_ld(s_ak, jq * BT + r) * lds_ld(s_b, jq), _zero())
             acc = []
+            g_j = _lds_row(s_g, jq * K + seg * 32, 32, fx.Float32)
+            q_j = _lds_row(s_q, jq * K + seg * 32, 32, fx.BFloat16)
+            k_j = _lds_row(s_k, jq * K + seg * 32, 32, fx.BFloat16)
             for e in range_constexpr(32):
-                kk = seg * 32 + e
-                ex = _decay(_sel(ok, lds_ld(s_g, jq * K + kk) - g_r[e], _zero()))
-                acc.append(
-                    st[e]
-                    + (
-                        aq * lds_ld(s_q, jq * K + kk, fx.BFloat16)
-                        + ak * lds_ld(s_k, jq * K + kk, fx.BFloat16)
-                    )
-                    * ex
-                )
+                ex = _decay(_sel(ok, g_j[e] - g_r[e], _zero()))
+                acc.append(st[e] + (aq * q_j[e] + ak * k_j[e]) * ex)
             res = yield acc
         dkt = _results(res, 32)
 
