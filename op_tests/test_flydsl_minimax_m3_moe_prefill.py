@@ -143,7 +143,9 @@ def _check(n_tokens, device="cuda"):
     assert cos > 0.999, cos
 
 
-@pytest.mark.parametrize("n_tokens", [3072, 5000, 16384, 65536])  # 16384: block_m 256
+@pytest.mark.parametrize(
+    "n_tokens", [3072, 5000, 16383, 16384, 65536]
+)  # block_m 128 below 16384, 256 from it
 def test_a4w4_prefill_moe(n_tokens):
     _check(n_tokens)
 
@@ -165,22 +167,40 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
 
     n = MIN_PREFILL_TOKENS
     dev = "cuda"
-    q = torch.zeros(n, HIDDEN // 2, dtype=torch.uint8, device=dev)
-    s = torch.zeros(n, HIDDEN // 32, dtype=torch.uint8, device=dev)
-    w13 = torch.zeros(EXPERTS, 2 * INTER, HIDDEN // 2, dtype=torch.uint8, device=dev)
-    w2 = torch.zeros(EXPERTS, HIDDEN, INTER // 2, dtype=torch.uint8, device=dev)
-    sc = torch.zeros(1, dtype=torch.uint8, device=dev)
-    ids = torch.zeros(n, TOPK, dtype=torch.int32, device=dev)
-    wts = torch.zeros(n, TOPK, dtype=torch.float32, device=dev)
-    kw = {"hidden_size": HIDDEN, "intermediate_size": INTER, "num_experts": EXPERTS}
-    args = ((q, s), w13, sc, w2, sc, wts, ids)
 
-    short_out = torch.empty(n - 1, HIDDEN, dtype=torch.bfloat16, device=dev)
-    with pytest.raises(AssertionError):
-        a4w4_prefill_moe(*args, **kw, out=short_out)
-    with pytest.raises(AssertionError):
-        a4w4_prefill_moe(
-            *args, **kw, out=torch.empty(n, HIDDEN, dtype=torch.float32, device=dev)
-        )
-    with pytest.raises(AssertionError):
-        a4w4_prefill_moe(*args[:3], w2[:-1], *args[4:], **kw)
+    def zeros(*shape, dtype=torch.uint8, device=dev):
+        return torch.zeros(*shape, dtype=dtype, device=device)
+
+    good = {
+        "x_quant": (zeros(n, HIDDEN // 2), zeros(n, HIDDEN // 32)),
+        "w13": zeros(EXPERTS, 2 * INTER, HIDDEN // 2),
+        "w13_scale": zeros(EXPERTS * 2 * INTER, HIDDEN // 32),
+        "w2": zeros(EXPERTS, HIDDEN, INTER // 2),
+        "w2_scale": zeros(EXPERTS * HIDDEN, INTER // 32),
+        "topk_weights": zeros(n, TOPK, dtype=torch.float32),
+        "topk_ids": zeros(n, TOPK, dtype=torch.int32),
+        "hidden_size": HIDDEN,
+        "intermediate_size": INTER,
+        "num_experts": EXPERTS,
+    }
+    # control: all-zero inputs of the right sizes are accepted and give zeros
+    assert not a4w4_prefill_moe(**good).any()
+
+    bad = {
+        "out of the wrong length": {"out": zeros(n - 1, HIDDEN, dtype=torch.bfloat16)},
+        "out of the wrong dtype": {"out": zeros(n, HIDDEN, dtype=torch.float32)},
+        "w13 without its last expert": {"w13": good["w13"][:-1]},
+        "w2 without its last expert": {"w2": good["w2"][:-1]},
+        "undersized w13_scale": {"w13_scale": good["w13_scale"][:-1]},
+        "undersized w2_scale": {"w2_scale": good["w2_scale"][:-1]},
+        "routing weights on the CPU": {
+            "topk_weights": zeros(n, TOPK, dtype=torch.float32, device="cpu")
+        },
+        "too few tokens": {
+            "x_quant": (zeros(n - 1, HIDDEN // 2), zeros(n - 1, HIDDEN // 32))
+        },
+    }
+    for name, change in bad.items():
+        with pytest.raises(AssertionError):
+            a4w4_prefill_moe(**{**good, **change})
+            pytest.fail(name)

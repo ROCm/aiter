@@ -110,9 +110,14 @@ def a4w4_prefill_moe(
     topk = topk_ids.shape[1]
     assert supports_shapes(hidden, inter), (hidden, inter)
     assert topk_ids.shape == topk_weights.shape == (n_tokens, topk)
-    assert w2.shape == (num_experts, hidden, inter // 2) and w13.shape[0] == num_experts
+    assert w13.shape == (num_experts, 2 * inter, hidden // 2)
+    assert w2.shape == (num_experts, hidden, inter // 2)
+    # the scale buffers are bounded by these sizes, not by the tensors (preshuffling may pad)
+    assert w13_scale.numel() >= num_experts * 2 * inter * (hidden // 32)
+    assert w2_scale.numel() >= num_experts * hidden * (inter // 32)
     assert all(
-        t.is_cuda and t.device == a_q.device for t in (w13, w13_scale, w2, w2_scale)
+        t.is_cuda and t.device == a_q.device
+        for t in (x_s, topk_weights, w13, w13_scale, w2, w2_scale)
     )
     # The buffer offsets are read as unsigned 32-bit (op test: 65536 tokens at topk 4, 3.2e9
     # bytes); shortcut: this only rules out the 2^32 wrap, so re-measure to raise it.
