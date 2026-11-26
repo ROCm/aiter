@@ -159,10 +159,10 @@ def compile_gemm_fp8_blockscale_gfx942(
         pid_n = local // m01_adapt
         return local - pid_n * m01_adapt + idx_m00 * M01, pid_n
 
-    def _lds_dwords(row, chunk):
+    def _lds_dwords(row, dwordx4_chunk):
         # XOR swizzle of the 16-byte chunk keeps MFMA-pattern ds_read_b128
         # conflict free.
-        return row * (BLOCK_K // 4) + ((row ^ chunk) & 7) * 4
+        return row * (BLOCK_K // 4) + ((row ^ dwordx4_chunk) & 7) * 4
 
     # A and B tiles use 32 KiB each (one K tile); 64 KiB in total.
     @fx.struct
@@ -293,14 +293,14 @@ def compile_gemm_fp8_blockscale_gfx942(
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
         ### Register tensors.
-        # a_stage: four A packets; b_stage: two B slots (packet % 2). Both hold
+        # a_prefetch_reg: four A packets; b_prefetch_reg: two B slots (packet % 2). Both hold
         # the next K tile in VGPRs until its LDS packet is free.
         # frag_B column quadrant_n * 4 + n0 * 2 + half_k: all B operands of a
         # K tile, read in stage 0.
-        a_stage = fx.make_rmem_tensor(
+        a_prefetch_reg = fx.make_rmem_tensor(
             fx.make_layout((4, NUM_PACKETS), (1, 4)), fx.Int32
         )
-        b_stage = fx.make_rmem_tensor(fx.make_layout((4, 2), (1, 4)), fx.Int32)
+        b_prefetch_reg = fx.make_rmem_tensor(fx.make_layout((4, 2), (1, 4)), fx.Int32)
         frag_B = fx.make_rmem_tensor(fx.make_layout((4, 8), (1, 4)), fx.Int32)
         # mfma_scaleA column slot * 2 + m0 (slot = packet % 2);
         # mfma_scaleB column slot * 2 + quadrant_n (slot = K tile % 2).
@@ -318,12 +318,12 @@ def compile_gemm_fp8_blockscale_gfx942(
 
         def lds_wr_A(packet):
             lds_view(lds.a.ptr, ldsA_wr + packet * PACKET_DWORDS).store(
-                a_stage[None, packet].load()
+                a_prefetch_reg[None, packet].load()
             )
 
         def lds_wr_B(packet):
             lds_view(lds.b.ptr, ldsB_wr + packet * PACKET_DWORDS).store(
-                b_stage[None, packet % 2].load()
+                b_prefetch_reg[None, packet % 2].load()
             )
 
         def lds_rd_B():
@@ -353,12 +353,12 @@ def compile_gemm_fp8_blockscale_gfx942(
             ]
 
         def load_A(packet, ki):
-            a_stage[None, packet].store(
+            a_prefetch_reg[None, packet].store(
                 _buffer_load_dwordx4(a_rsrc, a_src_offsets[packet], ki * BLOCK_K)
             )
 
         def load_B(packet, ki):
-            b_stage[None, packet % 2].store(
+            b_prefetch_reg[None, packet % 2].store(
                 _buffer_load_dwordx4(b_rsrc, b_src_offsets[packet], ki * b_tile_k_bytes)
             )
 
