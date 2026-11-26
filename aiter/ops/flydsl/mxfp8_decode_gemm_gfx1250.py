@@ -18,8 +18,8 @@ import torch
 
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
-# Decode token counts only: past this the tuned GEMM's tiles are as fast.
-_MAX_ROWS = 128
+# Decode token counts only: past 32 rows the tuned GEMM is as fast or faster.
+_MAX_ROWS = 32
 # K-waves of a workgroup: with one 128-wide K step each, every weight load of
 # the workgroup is in flight at once.
 _MAX_K_WAVES = 16
@@ -29,8 +29,8 @@ _MAX_K_WAVES = 16
 def mxfp8_decode_gemm_config(m: int, n: int, k: int):
     """The kernel config for ``m`` rows of an (n, k) GEMM, or None (not served).
 
-    A 16-row tile up to 16 rows, else 32-row tiles; one K-wave per 128-wide K
-    step (at most 16, each taking an equal share of the K steps); and the fewest
+    One M tile (16 rows up to 16 rows, else 32); one K-wave per 128-wide K step
+    (at most 16, each taking an equal share of the K steps); and the fewest
     16-column blocks per workgroup that keep the grid within one workgroup per
     CU. Weight loads are non-temporal and the activation goes to LDS by TDM.
     """
@@ -43,12 +43,11 @@ def mxfp8_decode_gemm_config(m: int, n: int, k: int):
     tile_m = 16 if m <= 16 else 32
     steps = k // 128
     kw = max(w for w in range(1, _MAX_K_WAVES + 1) if steps % w == 0)
-    m_tiles = -(-m // tile_m)
     n_blocks = n // 16
     nb = next(
         nb
         for nb in range(1, n_blocks + 1)
-        if n_blocks % nb == 0 and m_tiles * (n_blocks // nb) <= get_cu_num()
+        if n_blocks % nb == 0 and n_blocks // nb <= get_cu_num()
     )
     # (tile_m, nb, ks, kw, wn, wdepth, wcpol, atdm)
     cfg = (tile_m, nb, 1, kw, 1, 1, 1, 1)

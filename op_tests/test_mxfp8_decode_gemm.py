@@ -54,7 +54,7 @@ def main():
         aiter.logger.warning("mxfp8_decode_gemm is gfx1250-only; skipping")
         return
     ap = argparse.ArgumentParser()
-    ap.add_argument("-m", type=int, nargs="*", default=[1, 8, 16, 24, 33, 64, 128])
+    ap.add_argument("-m", type=int, nargs="*", default=[1, 8, 16, 24, 32])
     ap.add_argument(
         "-nk", type=dtypes.str2tuple, nargs="*", default=[(6144, 2048), (2304, 6144)]
     )
