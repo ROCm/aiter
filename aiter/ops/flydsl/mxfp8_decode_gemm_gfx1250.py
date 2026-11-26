@@ -29,6 +29,18 @@ _KERNEL_NAME_RE = re.compile(
 # Tuner candidates: decode token counts, and at most 16 K-waves (with one 128-wide
 # K step each, every weight load of a workgroup is in flight at once).
 _CANDIDATE_MAX_M = 128
+# (nb, ks, kw, wn, wdepth) offered at 16- and 32-row tiles beside the grid above.
+_SPLIT_K_CANDIDATES = (
+    (2, 4, 3, 1, 4),
+    (2, 4, 2, 2, 6),
+    (2, 4, 3, 2, 4),
+    (3, 4, 4, 1, 1),
+    (3, 4, 4, 1, 2),
+    (6, 4, 6, 2, 2),
+    (3, 2, 8, 1, 3),
+    (2, 1, 8, 2, 2),
+    (2, 1, 8, 2, 3),
+)
 _MAX_K_WAVES = 16
 
 
@@ -83,6 +95,14 @@ def mxfp8_32_decode_candidates(M: int, N: int, K: int) -> list[str]:
         for wn in (1, 2)
         if steps % (8 * ks) == 0
         for wdepth in sorted({1, steps // (8 * ks)})
+    ]
+
+    # Heavier K splits with fewer K-waves (nb, ks, kw, wn, wdepth): with the
+    # weight not cache-resident these stream best for many M <= 32 shapes.
+    names += [
+        mxfp8_32_decode_kernel_name(tile_m, nb, ks, kw, wn, wdepth)
+        for tile_m in (16, 32)
+        for nb, ks, kw, wn, wdepth in _SPLIT_K_CANDIDATES
     ]
 
     # Interleaved K steps (``_ki``) wherever a wave owns two or more steps: the
