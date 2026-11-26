@@ -54,7 +54,12 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs):
         kwargs = dict(kwargs)
         ctx.bwd_backend = kwargs.pop("bwd_backend")
-        o, final_state, *_ = chunk_delta_attn_fwd(
+        # save_fwd keeps the forward's intermediates for the FlyDSL backward
+        # (memory for time); the Triton backward always recomputes.
+        save_fwd = kwargs.pop("save_fwd") and ctx.bwd_backend == "flydsl"
+        if save_fwd and kwargs["chunk_size"] is None:
+            kwargs["chunk_size"] = _BWD_DEFAULT_CHUNK_SIZE
+        o, final_state, *inter = chunk_delta_attn_fwd(
             q=q,
             k=k,
             v=v,
@@ -63,11 +68,22 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
             A_log=A_log,
             dt_bias=dt_bias,
             initial_state=initial_state,
-            disable_recompute=False,
+            disable_recompute=save_fwd,
             **kwargs,
         )
+        # chunk_delta_attn_fwd returns (g_cumsum, Aqk, Akk, w, u, qg, kg).
+        saved = inter if save_fwd else []
         ctx.save_for_backward(
-            q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs["cu_seqlens"]
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            kwargs["cu_seqlens"],
+            *saved,
         )
         ctx.kwargs = {
             key: val
@@ -78,7 +94,13 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, dht):
-        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens = ctx.saved_tensors
+        (q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, *inter) = (
+            ctx.saved_tensors
+        )
+        fwd_intermediates = None
+        if inter:
+            gc, Aqk, Akk, w, u, qg, kg = inter
+            fwd_intermediates = (None, None, None, gc, w, u, qg, kg, Aqk, Akk)
         kwargs = dict(ctx.kwargs)
         if kwargs["chunk_size"] is None:
             kwargs["chunk_size"] = _BWD_DEFAULT_CHUNK_SIZE
@@ -95,6 +117,7 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
             initial_state=initial_state,
             cu_seqlens=cu_seqlens,
             backend=ctx.bwd_backend,
+            fwd_intermediates=fwd_intermediates,
             **kwargs,
         )
         return (*grads, None)
@@ -126,6 +149,7 @@ def chunk_kimi_delta_attn(
     has_initial_state: torch.Tensor | None = None,
     bwd_backend: str = "triton",
     fwd_backend: str = "triton",
+    save_fwd: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention using Triton.
@@ -237,6 +261,12 @@ def chunk_kimi_delta_attn(
             `out` / `state_cache`; other calls raise. Its final state is fp32.
             When an input requires grad the forward stays on Triton.
             Default: `"triton"`.
+        save_fwd (bool):
+            Opt-in with `bwd_backend="flydsl"`: the forward keeps its
+            intermediates (`g_cumsum`, `Aqk`, `Akk`, `w`, `u`, `qg`, `kg`) for
+            the backward, which then skips the recompute (memory for time;
+            the analogue of Megatron's `recompute_gdn`, #8739's `save_fwd`).
+            Ignored by the Triton backward. Default: `False` (recompute).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -376,6 +406,7 @@ def chunk_kimi_delta_attn(
                 "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
                 "state_v_first": state_v_first,
                 "bwd_backend": bwd_backend,
+                "save_fwd": save_fwd,
             },
         )
         return o.to(q.dtype), final_state

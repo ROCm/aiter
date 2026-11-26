@@ -1831,6 +1831,7 @@ def chunk_delta_attn_bwd(
     use_beta_sigmoid_in_kernel: bool = False,
     state_v_first: bool = False,
     backend: str = "triton",
+    fwd_intermediates: tuple | None = None,
 ) -> tuple:
     """
     Backward pass for chunk_delta_attn, recomputing the forward's intermediates.
@@ -1843,7 +1844,9 @@ def chunk_delta_attn_bwd(
         the forward ran with. ``backend="flydsl"`` runs every backward stage
         on FlyDSL (``aiter.ops.flydsl.kda_chunk_bwd``) where the call allows
         it (gfx950, bf16, K = V = 128, chunk 64, no GVA), and
-        this Triton path otherwise.
+        this Triton path otherwise. ``fwd_intermediates`` (the forward's
+        prepare tuple, opt-in) is passed to the FlyDSL backward, which then
+        skips the recompute; this Triton path ignores it and recomputes.
 
     Returns:
         ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``, each in the dtype of
@@ -1905,6 +1908,7 @@ def chunk_delta_attn_bwd(
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
                 state_v_first=state_v_first,
+                fwd_intermediates=fwd_intermediates,
             )
     num_cus = _num_cus(q.device.index or 0)
     rec_cfg = _fused_recurrences_config(N * HV, V, num_cus)
