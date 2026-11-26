@@ -42,25 +42,19 @@ def _bwd_config(cu_seqlen: int) -> dict:
 
 
 def _schedule(query_start_loc, block_m, metadata, cu_seqlen, n_seqs):
-    """(n_chunks, sequence ids, chunk ids, tokens covered or None).
+    """(n_chunks, sequence ids, chunk ids).
 
     A plain ``metadata.nums_dict`` schedule needs no host sync, so it works in
-    graph capture; the covered token count is then unknown (None).
+    graph capture.
     """
     if isinstance(metadata, CausalConvPrefillMetadata):
         metadata.validate(query_start_loc, total_tokens=cu_seqlen, num_sequences=n_seqs)
         grid = metadata.get_chunk_grid(block_m)
-        end = sum(metadata.layout.seq_lens_cpu)
-        return grid.total_chunks, grid.sequence_ids, grid.chunk_ids, end
+        return grid.total_chunks, grid.sequence_ids, grid.chunk_ids
     nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
     if nums_dict is not None and block_m in nums_dict:
         entry = nums_dict[block_m]
-        return (
-            int(entry["tot"]),
-            entry["batch_ptr"],
-            entry["token_chunk_offset_ptr"],
-            None,
-        )
+        return int(entry["tot"]), entry["batch_ptr"], entry["token_chunk_offset_ptr"]
     tot, batch_ptr, chunk_ptr = _build_chunk_schedule(query_start_loc, block_m)
     if nums_dict is not None:
         nums_dict[block_m] = {
@@ -68,8 +62,7 @@ def _schedule(query_start_loc, block_m, metadata, cu_seqlen, n_seqs):
             "batch_ptr": batch_ptr,
             "token_chunk_offset_ptr": chunk_ptr,
         }
-    end = int(query_start_loc[-1].item()) if n_seqs > 0 else 0
-    return tot, batch_ptr, chunk_ptr, end
+    return tot, batch_ptr, chunk_ptr
 
 
 def causal_conv1d_split_qkv_bwd_triton_fn(
@@ -123,8 +116,7 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         ``(dx, dweight, dbias, dinitial_states)``.
         ``dx`` is ``[dim, cu_seqlen]`` in ``x.dtype`` with the strides of ``x``
         when ``x`` has unit channel stride, else contiguous. Tokens after the
-        last sequence get zero, except with a prefilled ``nums_dict``, where
-        they are not written.
+        last sequence get zero.
         ``dweight`` is ``[dim, width]`` in ``weight.dtype``. ``dbias`` is
         ``[dim]`` in ``bias.dtype`` or None. Both are summed in fp32 in a fixed
         order, so the result is deterministic.
@@ -167,12 +159,12 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
 
     config = _bwd_config(cu_seqlen)
     block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
-    tot, batch_ptr, chunk_ptr, end = _schedule(
+    tot, batch_ptr, chunk_ptr = _schedule(
         query_start_loc, block_m, metadata, cu_seqlen, n_seqs
     )
-    if end is not None and end < cu_seqlen:
-        dx[:, end:].zero_()
     if tot == 0:
+        # No sequence has a token, so every token is past the last sequence.
+        dx.zero_()
         dweight = torch.zeros_like(weight)
         dbias = torch.zeros_like(bias) if bias is not None else None
         return dx, dweight, dbias, dinit
@@ -212,6 +204,8 @@ def causal_conv1d_split_qkv_bwd_triton_fn(
         dim,
         k_dim,
         v_dim,
+        n_seqs,
+        cu_seqlen,
         n_rows,
         x.stride(0),
         x.stride(1),

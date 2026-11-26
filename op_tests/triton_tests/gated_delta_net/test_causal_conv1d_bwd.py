@@ -80,6 +80,7 @@ def _make_inputs(
     pad_seqs=(),
     packed_dout=False,
     channel_major=False,
+    nan_pad=False,
     tail=0,
     seed=0,
 ):
@@ -95,6 +96,12 @@ def _make_inputs(
         torch.randn((dim,), dtype=w_dtype, device="cuda") * 0.1 if with_bias else None
     )
     dout = torch.randn((T, dim), dtype=x_dtype, device="cuda")
+    if nan_pad:
+        # Padded sequences hold garbage; their gradients must still be exactly zero.
+        starts = [0, *itertools.accumulate(seqlens)]
+        for i in pad_seqs:
+            proj[starts[i] : starts[i + 1]] = float("nan")
+            dout[starts[i] : starts[i + 1]] = float("nan")
     if packed_dout:
         dq, dk, dv = dout[:, :k_dim], dout[:, k_dim : 2 * k_dim], dout[:, 2 * k_dim :]
     else:
@@ -251,6 +258,17 @@ def test_pad_slots():
     _check([40, 2, 70, 1, 33], has_init=[True] * 5, pad_seqs=(0, 3))
 
 
+def test_pad_slots_nan():
+    # NaN in the x and dout rows of padded sequences must not reach any gradient.
+    _check(
+        [40, 2, 70, 1, 33],
+        has_init=[True] * 5,
+        pad_seqs=(0, 3),
+        nan_pad=True,
+        with_bias=True,
+    )
+
+
 def test_packed_dout_and_tail_tokens():
     # dq, dk, dv as column views of one [T, dim] buffer; tokens after the last sequence get zero.
     _check([300, 2, 129], packed_dout=True, tail=17)
@@ -258,6 +276,37 @@ def test_packed_dout_and_tail_tokens():
 
 def test_channel_major_strides():
     _check([300, 2, 129], has_init=[True, False, True], channel_major=True)
+
+
+def test_large_channel_stride():
+    # Token-contiguous x inside a [36864, 65536] buffer: channel offsets from 32768
+    # on pass 2**31 elements, so they need int64 arithmetic.
+    k_dim = v_dim = KIMI_K3_DIM
+    dim, row, T = 3 * k_dim, 65536, 256
+    if torch.cuda.mem_get_info()[0] < 8 * 2**30:
+        pytest.skip("needs 8 GiB of free device memory")
+    torch.manual_seed(0)
+    buf = torch.empty((dim, row), dtype=torch.bfloat16, device="cuda")
+    x = buf[:, :T]
+    x.normal_()
+    weight = torch.randn((dim, 4), dtype=torch.float32, device="cuda") * 0.5
+    dout = torch.randn((T, dim), dtype=torch.bfloat16, device="cuda")
+    qsl = torch.tensor([0, 100, T], dtype=torch.int32, device="cuda")
+    slots = torch.arange(2, dtype=torch.int32, device="cuda")
+    dx_r, dw_r, _, _ = _reference(x, weight, None, dout, qsl, None, slots, None, "silu")
+    dx, dw, _, _ = causal_conv1d_split_qkv_bwd_triton_fn(
+        dout[:, :k_dim].contiguous(),
+        dout[:, k_dim : 2 * k_dim].contiguous(),
+        dout[:, 2 * k_dim :].contiguous(),
+        x,
+        weight,
+        None,
+        qsl,
+        k_dim,
+        v_dim,
+    )
+    _assert_close(dx, dx_r, 2e-2, "dx")
+    _assert_close(dw, dw_r, 1e-4, "dweight")
 
 
 @pytest.mark.parametrize("k_dim,v_dim", [(256, 512), (100, 260)])
@@ -297,12 +346,17 @@ def test_deterministic():
 
 def test_nums_dict_schedule():
     # The second call reuses the schedule the first one stores, with no host sync.
-    inp = _make_inputs([700, 33, 1], has_init=[True, False, True])
+    # Tokens after the last sequence must still get zero dx, whatever memory dx reuses.
+    tail = 17
+    inp = _make_inputs([700, 33, 1], has_init=[True, False, True], tail=tail)
     inp.pop("dout")
     ref = causal_conv1d_split_qkv_bwd_triton_fn(**inp)
     metadata = types.SimpleNamespace(nums_dict={})
     causal_conv1d_split_qkv_bwd_triton_fn(**inp, metadata=metadata)
     assert len(metadata.nums_dict) == 1
+    poison = torch.full_like(ref[0].t(), float("nan"))
+    del poison
     got = causal_conv1d_split_qkv_bwd_triton_fn(**inp, metadata=metadata)
+    assert not got[0][:, -tail:].any()
     for g, r in zip(got, ref):
         assert (g is None and r is None) or torch.equal(g, r)

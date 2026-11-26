@@ -35,11 +35,14 @@ def _bwd_load_x_row(
 ):
     """fp32 row of ``xe`` at the sequence position ``pos`` (may be negative).
 
-    ``n_state`` is the number of initial-state columns to read: ``width - 1`` or 0.
+    Positions at or past ``seqlen`` read as zero. ``n_state`` is the number of
+    initial-state columns to read: ``width - 1`` or 0.
     """
     in_seq = (pos >= 0) & (pos < seqlen)
     val = tl.load(
-        x_ptr + (seq_start + pos).to(tl.int64) * stride_x_token + feats * stride_x_dim,
+        x_ptr
+        + (seq_start + pos).to(tl.int64) * stride_x_token
+        + feats.to(tl.int64) * stride_x_dim,
         mask=feat_mask & in_seq,
         other=0.0,
     ).to(tl.float32)
@@ -48,7 +51,7 @@ def _bwd_load_x_row(
         val += tl.load(
             state_ptr
             + state_base
-            + feats * stride_s_dim
+            + feats.to(tl.int64) * stride_s_dim
             + (pos + KERNEL_WIDTH - 1) * stride_s_tok,
             mask=feat_mask & in_state,
             other=0.0,
@@ -88,9 +91,10 @@ def _bwd_load_dout_row(
         ck = feats - k_dim
         cv = feats - 2 * k_dim
     else:
-        cq = feats * stride_dq_dim
-        ck = (feats - k_dim) * stride_dk_dim
-        cv = (feats - 2 * k_dim) * stride_dv_dim
+        f64 = feats.to(tl.int64)
+        cq = f64 * stride_dq_dim
+        ck = (f64 - k_dim) * stride_dk_dim
+        cv = (f64 - 2 * k_dim) * stride_dv_dim
     if blk_hi <= k_dim:
         g = tl.load(dq_ptr + row * stride_dq_tok + cq, mask=mask, other=0.0)
     elif (blk_lo >= k_dim) & (blk_hi <= 2 * k_dim):
@@ -157,6 +161,8 @@ def _causal_conv1d_bwd_split_qkv_kernel(
     dim,
     k_dim,
     v_dim,
+    n_seqs,
+    cu_seqlen,
     n_part_rows,  # width, or width + 1 with a bias
     stride_x_dim,
     stride_x_token,
@@ -210,7 +216,8 @@ def _causal_conv1d_bwd_split_qkv_kernel(
         slot = tl.load(cache_indices_ptr + seq * stride_cache_indices).to(tl.int64)
     else:
         slot = seq.to(tl.int64)
-    # A padded sequence gets zero gradients: its gradient rows are masked off.
+    # A padded sequence gets zero gradients: x and the output gradient are read
+    # under live_len (0 for it), so NaN or Inf in its rows cannot leak in.
     live_len = seqlen
     if USE_PAD_SLOT:
         live_len = tl.where(slot == pad_slot_id, 0, seqlen)
@@ -245,7 +252,7 @@ def _causal_conv1d_bwd_split_qkv_kernel(
     # name only when the loop body rebinds it to a different value.
     # xd<d> = xe[u - d]; before the first row it may come from the initial state.
     xd1 = _bwd_load_x_row(
-        x_ptr, state_ptr, seq_start, c0 - 1, feats, feat_mask, seqlen, stride_x_dim,
+        x_ptr, state_ptr, seq_start, c0 - 1, feats, feat_mask, live_len, stride_x_dim,
         stride_x_token, state_base, stride_s_dim, stride_s_tok, n_state,
         KERNEL_WIDTH, HAS_INITIAL_STATES,
     )  # fmt: skip
@@ -253,13 +260,13 @@ def _causal_conv1d_bwd_split_qkv_kernel(
     xd3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
     if KERNEL_WIDTH >= 3:
         xd2 = _bwd_load_x_row(
-            x_ptr, state_ptr, seq_start, c0 - 2, feats, feat_mask, seqlen,
+            x_ptr, state_ptr, seq_start, c0 - 2, feats, feat_mask, live_len,
             stride_x_dim, stride_x_token, state_base, stride_s_dim, stride_s_tok,
             n_state, KERNEL_WIDTH, HAS_INITIAL_STATES,
         )  # fmt: skip
     if KERNEL_WIDTH >= 4:
         xd3 = _bwd_load_x_row(
-            x_ptr, state_ptr, seq_start, c0 - 3, feats, feat_mask, seqlen,
+            x_ptr, state_ptr, seq_start, c0 - 3, feats, feat_mask, live_len,
             stride_x_dim, stride_x_token, state_base, stride_s_dim, stride_s_tok,
             n_state, KERNEL_WIDTH, HAS_INITIAL_STATES,
         )  # fmt: skip
@@ -282,13 +289,13 @@ def _causal_conv1d_bwd_split_qkv_kernel(
         x_feat = feats
         dx_feat = feats
     else:
-        x_feat = feats * stride_x_dim
-        dx_feat = feats * stride_dx_dim
+        x_feat = feats.to(tl.int64) * stride_x_dim
+        dx_feat = feats.to(tl.int64) * stride_dx_dim
     row0 = (seq_start + c0).to(tl.int64)
     x_ptrs = x_ptr + row0 * stride_x_token + x_feat
     dx_ptrs = dx_ptr + (row0 - (KERNEL_WIDTH - 1)) * stride_dx_token + dx_feat
 
-    xn = tl.load(x_ptrs, mask=feat_mask & (c0 < seqlen), other=0.0)
+    xn = tl.load(x_ptrs, mask=feat_mask & (c0 < live_len), other=0.0)
     gn = _bwd_load_dout_row(
         dq_ptr, dk_ptr, dv_ptr, row0, feat_mask & (c0 < live_len), feats, blk_lo,
         k_dim, v_dim, stride_dq_tok, stride_dq_dim, stride_dk_tok, stride_dk_dim,
@@ -299,7 +306,7 @@ def _causal_conv1d_bwd_split_qkv_kernel(
         xu = xn.to(tl.float32)
         gu = gn.to(tl.float32)
         x_ptrs += stride_x_token
-        xn = tl.load(x_ptrs, mask=feat_mask & (u + 1 < seqlen), other=0.0)
+        xn = tl.load(x_ptrs, mask=feat_mask & (u + 1 < live_len), other=0.0)
         gn = _bwd_load_dout_row(
             dq_ptr, dk_ptr, dv_ptr, row0 + i + 1, feat_mask & (u + 1 < live_len),
             feats, blk_lo, k_dim, v_dim, stride_dq_tok, stride_dq_dim, stride_dk_tok,
@@ -376,8 +383,18 @@ def _causal_conv1d_bwd_split_qkv_kernel(
                 tl.store(
                     dinit_ptr
                     + seq.to(tl.int64) * stride_di_seq
-                    + feats * stride_di_dim
+                    + feats.to(tl.int64) * stride_di_dim
                     + k * stride_di_tok,
                     di.to(dinit_ptr.dtype.element_ty),
                     mask=feats < tl.where(n_state > 0, dim, 0),
                 )
+
+    # dx of the tokens after the last sequence is zero. The end is read on the
+    # device, so a reused schedule needs no host sync; the programs share the rows.
+    end = tl.load(query_start_loc_ptr + n_seqs)
+    for r in range(end + pid, cu_seqlen, tl.num_programs(0)):
+        tl.store(
+            dx_ptr + r.to(tl.int64) * stride_dx_token + dx_feat,
+            tl.zeros((BLOCK_N,), dtype=dx_ptr.dtype.element_ty),
+            mask=feat_mask,
+        )
