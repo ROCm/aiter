@@ -238,6 +238,56 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 WN_PER_MX_BLOCK_EP = 2
 
 
+def _l2_prefetch_b(addr):
+    """AITER_MOE_B_L2PF: global_prefetch of one 128-B line into L2 (no data returned, no counters)."""
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _ld
+    from flydsl._mlir.dialects import rocdl as _rd
+    from flydsl.expr.rocdl.tdm_ops import PREFETCH_SCOPE_SE, _cache_policy_attr
+
+    ptr = _ld.inttoptr(_ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr)))
+    _rd.global_prefetch(ptr, cache_policy=_cache_policy_attr(PREFETCH_SCOPE_SE))
+
+
+def _ktrace_store(base_addr, slot, v):
+    """AITER_MOE_KTRACE: block-id-indexed timeline at a fixed device address (8 x i32 per block)."""
+    a = fx.Int64(base_addr) + fx.Int64(fx.Int32(fx.block_idx.x)) * 32 + fx.Int64(slot * 4)
+    ptr = fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), a)
+    fx.generic_store(ptr, fx.Int32(v))
+
+
+def _ktrace_rt():
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _ld
+
+    t = _ld.call_intrinsic(
+        _ir.IntegerType.get_signless(64), "llvm.amdgcn.s.sendmsg.rtn.i64", [_raw(fx.Int32(131))], [], []
+    )
+    return fx.Int32(fx.Int64(t))
+
+
+def _expert_lookup_vec(tile_map, blk_m, lane, n_experts, wave_size):
+    """AITER_MOE_EXPERT_VEC: (number of map entries <= blk_m, map[that index clamped to n_experts - 1]) with one round
+    trip: each lane loads n_experts / wave_size entries at once. The map is non-decreasing, so the count is the bisect's
+    expert and the second value is tile_map[expert] (the expert's end row)."""
+    cnt = blk_m * 0
+    vals = []
+    for j in range((n_experts + wave_size - 1) // wave_size):
+        idx = lane + fx.Int32(j * wave_size)
+        ok = idx < fx.Int32(n_experts)
+        v = fx.Int32(tile_map[ok.select(idx, fx.Int32(n_experts - 1))])
+        vals.append(v)
+        le = ok & (v <= blk_m)
+        cnt = cnt + fx.ctpop(fx.Int32(rocdl.ballot(T.i32, _raw(le))))
+    cnt = fx.Int32(rocdl.readfirstlane(T.i32, _raw(cnt)))
+    ci = (cnt < fx.Int32(n_experts)).select(cnt, fx.Int32(n_experts - 1))
+    sel = vals[0]
+    for j in range(1, len(vals)):
+        sel = (ci >= fx.Int32(j * wave_size)).select(vals[j], sel)
+    end = fx.Int32(rocdl.readlane(T.i32, _raw(sel), _raw(ci % fx.Int32(wave_size))))
+    return cnt, end
+
+
 def _pack_bytes_i32(byte_vals):
     """Pack up to four i8 IR values into one i32, first value in the low byte."""
     assert 1 <= len(byte_vals) <= 4, len(byte_vals)
@@ -316,6 +366,11 @@ def launch_gemm_a8w4_tdm(
     arg_shared_c: fx.Pointer = None,
     gather_a: Constexpr[int] = 0,
     scale_prologue: Constexpr[int] = 0,
+    expert_vec: Constexpr[int] = 0,
+    b_l2pf: Constexpr[int] = 0,
+    mt_pair: Constexpr[int] = 0,
+    ktrace_addr: Constexpr[int] = 0,
+    grid_m_cap: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -425,6 +480,12 @@ def launch_gemm_a8w4_tdm(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
+    # AITER_MOE_EXPERT_VEC is validated on the plain TP grouped path only (bench_moe / test_f12 shapes): EP scatter,
+    # FHMoE shared experts, clusters and persistent workers keep the bisect.
+    expert_vec = 1 if (
+        expert_vec and not enable_ep_scatter and not shared_b and cluster_m == 1 and cluster_n == 1
+        and not persistent_workers
+    ) else 0
     # FHMoE: a shared tile covers tile_n / SH_SPLIT columns a pass. The half
     # tile must keep 32-column wave slices, whole TDM owner splits and whole MX
     # output blocks.
@@ -730,6 +791,10 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _drain += "_ev" if expert_vec else ""
+    _drain += f"_bpf{b_l2pf}" if b_l2pf else ""
+    _drain += "_mtp" if mt_pair else ""
+    _drain += "_ktr" if ktrace_addr else ""
     _shared = (
         "_shfp8"
         + (
@@ -860,6 +925,12 @@ def launch_gemm_a8w4_tdm(
         rem_tiles = m_units - group_first_tile
         group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
         m_unit = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+        if const_expr(mt_pair and cluster_m == 1 and not persistent_workers):
+            # AITER_MOE_MT_PAIR: block id % 8 (the XCD) follows the in-group m position; in full 16-tile groups give
+            # each XCD the consecutive m tiles 2x, 2x+1 (an expert's second m tile reuses the weights from that L2).
+            _ml = m_unit - group_first_tile
+            _mp = (_ml % 8) * 2 + _ml // 8
+            m_unit = (group_tiles == TILES_PER_GROUP).select(group_first_tile + _mp, m_unit)
         m_tile = m_unit * cluster_m + local_m
         blk_m = m_tile * tile_m
         n_unit = in_group // group_tiles
@@ -929,8 +1000,18 @@ def launch_gemm_a8w4_tdm(
         # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
         # result with the padding sentinel so it remains defined outside the
         # dynamic branch and the existing main-body guard stays valid.
+        if const_expr(ktrace_addr):
+            if fx.Int32(tid) == fx.Int32(0):
+                _ktrace_store(ktrace_addr, 0, _ktrace_rt())
         expert = blk_m * 0 + n_experts
-        if has_work:
+        if const_expr(expert_vec):
+            # AITER_MOE_EXPERT_VEC: the owning expert = the number of map entries <= blk_m (the map is non-decreasing,
+            # so this is the bisect's answer). Each lane loads E / WAVE entries at once (one memory round trip instead
+            # of log2(E) + 1 dependent scalar loads before the first weight load can be issued).
+            # (loads issued unconditionally, so they overlap the has_work load; the map has n_experts entries)
+            _ev_cnt, expert_end_vec = _expert_lookup_vec(tile_map, blk_m, lane, n_experts, WAVE)
+            expert = has_work.select(_ev_cnt, expert)
+        elif has_work:
             lo, hi = blk_m * 0, blk_m * 0 + n_experts
             for _ in range_constexpr(
                 max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
@@ -941,6 +1022,10 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+        if const_expr(ktrace_addr):
+            if fx.Int32(tid) == fx.Int32(0):
+                _ktrace_store(ktrace_addr, 1, _ktrace_rt() + expert * 0)
+                _ktrace_store(ktrace_addr, 5, has_work.select(fx.Int32(1), fx.Int32(0)))
         # static=False (one dyn-shared base) only where a second region is
         # needed, so the non-scatter path keeps its per-leaf static allocation.
         _smem = (
@@ -1001,9 +1086,12 @@ def launch_gemm_a8w4_tdm(
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
             # Per-expert A-data OOB: bound to the owning expert's valid-row
-            mn_oob = (
-                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
-            )
+            if const_expr(expert_vec):
+                mn_oob = expert_end_vec - blk_m
+            else:
+                mn_oob = (
+                    tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+                )
 
             b_mcast_mask = None
             full_cluster = None
@@ -1539,6 +1627,24 @@ def launch_gemm_a8w4_tdm(
                         if owns(exec_groups[g][0]):
                             for i in exec_groups[g][1]:
                                 emit(jobs[i])
+                if const_expr(b_l2pf and not SHB):
+                    # AITER_MOE_B_L2PF=D: when k tile kt goes to LDS, L2-prefetch the B (weight) k tile kt + D:
+                    # tile_n / 16 row groups x PACK_TK * 16 bytes at kt * PACK_TK * 16 in each group (stride Kp16),
+                    # spread over the block's threads (every wave issues its share).
+                    _pkt = fx.Int32(kt) + fx.Int32(b_l2pf)
+                    _lines_g = PACK_TK * 16 // 128
+                    _nl = (tile_n // 16) * _lines_g
+                    for _i in range_constexpr((_nl + block - 1) // block):
+                        _t = fx.Int32(tid) + fx.Int32(_i * block)
+                        _t = (_t < fx.Int32(_nl)).select(_t, fx.Int32(_nl - 1))
+                        _g = _t // fx.Int32(_lines_g)
+                        _l = _t - _g * fx.Int32(_lines_g)
+                        _kk = (_pkt < fx.Int32(K_TILES)).select(_pkt, fx.Int32(K_TILES - 1))
+                        _addr = (
+                            fx.Int64(fx.ptrtoint(gB_base)) + b_off0 + fx.Int64(_g) * fx.Int64(Kp16)
+                            + fx.Int64(_kk) * fx.Int64(PACK_TK * 16) + fx.Int64(_l) * fx.Int64(128)
+                        )
+                        _l2_prefetch_b(_addr)
 
             def dispatch_wave_job(fn):
                 """Run ``fn`` with the current wave's jobs."""
@@ -2151,6 +2257,9 @@ def launch_gemm_a8w4_tdm(
 
             # Skip padding tiles; uniform across every workgroup and cluster.
             if has_work:
+                if const_expr(ktrace_addr):
+                    if fx.Int32(tid) == fx.Int32(0):
+                        _ktrace_store(ktrace_addr, 2, _ktrace_rt())
                 if const_expr(enable_ep_scatter):
                     # Each lane carries one destination row in each vector. A wave32
                     # vector covers four 8-row scatter passes; larger M tiles use
@@ -2507,6 +2616,9 @@ def launch_gemm_a8w4_tdm(
                 # The epilogue restages C in this arena. Draining our own tensorcnt
                 # suffices: peer multicast loads are pairwise matched with ours.
                 pipeline_fence(outstanding=0)
+                if const_expr(ktrace_addr):
+                    if fx.Int32(tid) == fx.Int32(0):
+                        _ktrace_store(ktrace_addr, 3, _ktrace_rt())
                 is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
                 STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
                 # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
@@ -3093,6 +3205,9 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(stage1_quant_out and stage1_act):
                         rocdl.s_wait_storecnt(0)
                     tdm_ops.tensor_wait(0)
+                if const_expr(ktrace_addr):
+                    if fx.Int32(tid) == fx.Int32(0):
+                        _ktrace_store(ktrace_addr, 4, _ktrace_rt())
 
             if const_expr(persistent_workers > 0):
                 # Every wave must retire the output store before another wave
@@ -3182,6 +3297,10 @@ def launch_gemm_a8w4_tdm(
             run_task(fx.block_idx.x, i32_m)
 
     m_tiles = ceildiv(i32_m, tile_m)
+    if const_expr(grid_m_cap and not persistent_workers and cluster_m == 1 and not SH_GRID):
+        # AITER_MOE_GRID_TRIM: launch the first grid_m_cap m tiles (whole 16-tile swizzle groups; the kernel still
+        # derives its mapping from i32_m, so these blocks are the same tiles as in the full grid).
+        m_tiles = (m_tiles < grid_m_cap).select(m_tiles, grid_m_cap)
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c

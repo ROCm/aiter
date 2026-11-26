@@ -190,7 +190,7 @@ def flydsl_moe_fused12_a8w4(
         f32_situ_linear_beta=float(situ_linear_beta),
         sync_mode=int(sync_mode),
         # the kernel module reads these at import; pass them so FlyDSL's cache key sees them
-        variant=",".join(
+        variant=("ev," if os.environ.get("AITER_MOE_EXPERT_VEC", "0") == "1" else "") + ",".join(
             f"{k}={os.environ.get('AITER_MOE_FUSED12_' + k, '')}"
             for k in ("TRACE", "BFIRST", "PREFETCH_B2", "SPIN_SLEEP", "SPIN_MAX", "POLL_ONE_WAVE", "POLL_L2", "CNT_STRIDE", "FENCE")
         ),

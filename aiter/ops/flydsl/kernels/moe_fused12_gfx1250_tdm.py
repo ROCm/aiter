@@ -239,6 +239,33 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 WN_PER_MX_BLOCK_EP = 2
 
 
+# AITER_MOE_EXPERT_VEC=1 (read at import; part of the fused launcher's cache key via `variant`): one-round-trip expert
+# lookup, same as the served a8w4 kernel file's expert_vec.
+FUSED12_EXPERT_VEC = int(os.environ.get("AITER_MOE_EXPERT_VEC", "0") == "1")
+
+
+def _expert_lookup_vec(tile_map, blk_m, lane, n_experts, wave_size):
+    """AITER_MOE_EXPERT_VEC: (number of map entries <= blk_m, map[that index clamped to n_experts - 1]) with one round
+    trip: each lane loads n_experts / wave_size entries at once. The map is non-decreasing, so the count is the bisect's
+    expert and the second value is tile_map[expert] (the expert's end row)."""
+    cnt = blk_m * 0
+    vals = []
+    for j in range((n_experts + wave_size - 1) // wave_size):
+        idx = lane + fx.Int32(j * wave_size)
+        ok = idx < fx.Int32(n_experts)
+        v = fx.Int32(tile_map[ok.select(idx, fx.Int32(n_experts - 1))])
+        vals.append(v)
+        le = ok & (v <= blk_m)
+        cnt = cnt + fx.ctpop(fx.Int32(rocdl.ballot(T.i32, _raw(le))))
+    cnt = fx.Int32(rocdl.readfirstlane(T.i32, _raw(cnt)))
+    ci = (cnt < fx.Int32(n_experts)).select(cnt, fx.Int32(n_experts - 1))
+    sel = vals[0]
+    for j in range(1, len(vals)):
+        sel = (ci >= fx.Int32(j * wave_size)).select(vals[j], sel)
+    end = fx.Int32(rocdl.readlane(T.i32, _raw(sel), _raw(ci % fx.Int32(wave_size))))
+    return cnt, end
+
+
 def _pack_bytes_i32(byte_vals):
     """Pack up to four i8 IR values into one i32, first value in the low byte."""
     assert 1 <= len(byte_vals) <= 4, len(byte_vals)
@@ -935,7 +962,10 @@ def _build_a8w4_task(
         # result with the padding sentinel so it remains defined outside the
         # dynamic branch and the existing main-body guard stays valid.
         expert = blk_m * 0 + n_experts
-        if has_work:
+        if const_expr(FUSED12_EXPERT_VEC):
+            _ev_cnt, expert_end_vec = _expert_lookup_vec(tile_map, blk_m, lane, n_experts, WAVE)
+            expert = has_work.select(_ev_cnt, expert)
+        elif has_work:
             lo, hi = blk_m * 0, blk_m * 0 + n_experts
             for _ in range_constexpr(
                 max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
@@ -1009,9 +1039,12 @@ def _build_a8w4_task(
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
             # Per-expert A-data OOB: bound to the owning expert's valid-row
-            mn_oob = (
-                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
-            )
+            if const_expr(FUSED12_EXPERT_VEC):
+                mn_oob = expert_end_vec - blk_m
+            else:
+                mn_oob = (
+                    tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+                )
 
             b_mcast_mask = None
             full_cluster = None
@@ -3424,6 +3457,7 @@ def launch_moe_fused12_a8w4_tdm(
     arena = max(arena1, arena2)
     _sm = ("" if sync_mode == 1 else f"_sync{sync_mode}") + ("_trace" if FUSED12_TRACE else "")
     _sm += "" if FUSED12_BFIRST else "_nobf"
+    _sm += "_ev" if FUSED12_EXPERT_VEC else ""
     kname = f"a8w4f12_{kname1[9:]}__{kname2[9:]}{_sm}"
 
     @flyc.kernel(name=kname, known_block_size=[block, 1, 1])

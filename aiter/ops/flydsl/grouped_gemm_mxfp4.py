@@ -98,6 +98,26 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+def _grid_m_cap(max_routes, contiguous_m, tile_m):
+    """m tiles to launch (a multiple of the swizzle's 16-tile group) when that trims the worst-case grid, else 0."""
+    if max_routes is None:
+        return 0
+    all_tiles = (int(contiguous_m) + int(tile_m) - 1) // int(tile_m)
+    cap = (int(max_routes) + 15) // 16 * 16
+    return cap if cap < all_tiles else 0
+
+
+_KTRACE = {}
+
+
+def _ktrace_buffer(device, stage1):
+    """AITER_MOE_KTRACE debug buffer per (device, stage): 65536 blocks x 8 i32; returns its address."""
+    key = (str(device), int(stage1))
+    if key not in _KTRACE:
+        _KTRACE[key] = torch.zeros(65536 * 8, dtype=torch.int32, device=device)
+    return int(_KTRACE[key].data_ptr())
+
+
 @functools.cache
 def _launch_gemm_a8w4_tdm():
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -155,6 +175,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     shared_a=None,
     shared_c=None,
     a_row_map=None,
+    max_routes=None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -307,6 +328,21 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_shared_c=ptr_arg(a if shared_c is None else shared_c),
         gather_a=int(a_row_map is not None),
         scale_prologue=(_gather_scale_prologue() if a_row_map is not None else 0),
+        # AITER_MOE_EXPERT_VEC=1 (default off): one-round-trip expert lookup instead of the scalar bisect (same expert)
+        **({"expert_vec": 1} if os.environ.get("AITER_MOE_EXPERT_VEC", "0") == "1" else {}),
+        # AITER_MOE_B_L2PF=D (default off): L2-prefetch the weight k tile D ahead of the TDM pipeline
+        **({"b_l2pf": int(os.environ["AITER_MOE_B_L2PF"])} if int(os.environ.get("AITER_MOE_B_L2PF", "0") or 0) else {}),
+        # AITER_MOE_MT_PAIR=1 (default off): consecutive m tiles of a 16-tile group on one XCD (task order only)
+        **({"mt_pair": 1} if os.environ.get("AITER_MOE_MT_PAIR", "0") == "1" else {}),
+        # AITER_MOE_GRID_TRIM (via max_routes from grouped_moe): grid covers the first ceil16(routes) m tiles only
+        **(
+            {"grid_m_cap": _grid_m_cap(max_routes, contiguous_m, tile_m)}
+            if max_routes is not None and _grid_m_cap(max_routes, contiguous_m, tile_m)
+            and not persistent_workers
+            else {}
+        ),
+        # AITER_MOE_KTRACE=1 (debug): per-block timeline into a persistent buffer (_ktrace_buffer), stage-tagged
+        **({"ktrace_addr": _ktrace_buffer(out.device, int(stage1_act))} if os.environ.get("AITER_MOE_KTRACE", "0") == "1" else {}),
     )
     return out
 
