@@ -138,9 +138,10 @@ def get_GEMM_A16W16_tuned_config(
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
     # off the normal (non-strict) runtime path entirely.
-    if base_gfx_arch(gfx) != gfx and gfx not in {
+    borrowed_rows = base_gfx_arch(gfx) != gfx and gfx not in {
         k[0] for k in cfg if isinstance(k, tuple) and k
-    }:
+    }
+    if borrowed_rows:
         gfx = base_gfx_arch(gfx)
     warned_invalid_opus = set()
     for gl in [None, 0, 1]:
@@ -190,6 +191,11 @@ def get_GEMM_A16W16_tuned_config(
                     )
                     config = None
             if config is None:
+                continue
+            # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250
+            # OPUS row cannot launch on gfx1250-strict; fall through to the default.
+            if borrowed_rows and config["libtype"] == "opus":
+                config = None
                 continue
             if config["libtype"] == "opus":
                 resolved = None

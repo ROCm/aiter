@@ -6,6 +6,7 @@ import math
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.extra.hip import libdevice
+from triton.language.target_info import current_target
 
 from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 
@@ -14,6 +15,40 @@ from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 # only _reinterpret. Kernels call reinterpret; give older Tritons that name too.
 if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
     gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
+
+
+@gluon.constexpr_function
+def _use_scaled_fp8_wmma(a_dtype, b_dtype, acc_layout):
+    # gfx1250-strict has no unscaled fp8/bf8 16x16x128 WMMA, so use v_wmma_scale_f32_16x16x128_f8f6f4.
+    target = current_target()
+    if target is None or target.backend != "hip" or target.arch != "gfx1250-strict":
+        return False
+    if not (a_dtype.is_fp8() and b_dtype.is_fp8()):
+        return False
+    return list(getattr(acc_layout, "instr_shape", [])) == [16, 16, 128]
+
+
+@gluon.constexpr_function
+def _fp8_wmma_format(dtype):
+    return "e5m2" if dtype == gl.float8e5 else "e4m3"
+
+
+_wmma_native = gl.amd.gfx1250.wmma
+
+
+@gluon.jit
+def _wmma_compat(a, b, acc):
+    """gl.amd.gfx1250.wmma, but uses wmma_scaled with unit scales for fp8/bf8 16x16x128 on gfx1250-strict."""
+    if _use_scaled_fp8_wmma(a.dtype, b.dtype, acc.type.layout):
+        return gl.amd.gfx1250.wmma_scaled(
+            a, None, _fp8_wmma_format(a.dtype), b, None, _fp8_wmma_format(b.dtype), acc
+        )
+    return _wmma_native(a, b, acc)
+
+
+gl.amd.gfx1250.wmma = _wmma_compat
+if hasattr(gl.amd, "cdna5"):
+    gl.amd.cdna5.wmma = _wmma_compat
 
 
 @gluon.jit
@@ -55,13 +90,18 @@ def l2norm(x):
 
 @gluon.jit
 def mx_e8m0_scale(amax, EXP_OFFSET: gl.constexpr):
-    """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3."""
-    amax = amax.to(gl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(gl.float32, bitcast=True)
-    scale_unbiased = gl.log2(amax).floor() - EXP_OFFSET
-    scale_unbiased = gl.maximum(-127, gl.minimum(scale_unbiased, 127))
-    return (scale_unbiased.to(gl.int32) + 127).to(gl.uint8)
+    """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3.
+    Integer math only: the exponent of amax rounded to a power of two (up from
+    1.75 x 2^k), minus EXP_OFFSET, at least 0. For every fp32 input, NaN included, the
+    byte is the same as with the former log2 formula."""
+    gl.static_assert(EXP_OFFSET >= 0)
+    # Round the mantissa up from 1.75. For some NaNs the add wraps or sets the sign bit.
+    r = amax.to(gl.uint32, bitcast=True) + 0x200000
+    e = (r >> 23) & 0xFF
+    scale = gl.maximum(e.to(gl.int32) - EXP_OFFSET, 0)
+    # +inf and values below -0 (log2 is +inf or NaN) give 254. +0 and -0 give 0.
+    sat = (r >= 0x7F800000) & (e != 0)
+    return gl.where(sat, 254, scale).to(gl.uint8)
 
 
 @gluon.jit

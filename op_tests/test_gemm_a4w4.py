@@ -12,7 +12,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import _FLYDSL_AVAILABLE, gemm_a4w4
@@ -35,7 +35,8 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 # leave a partial M tile of a general kernel, 2049 one of the compute kernel. 129 and 255 are
 # below the 256-row compute tile of N=36864 and reach it through the padded M, as one partial
 # tile. Together they reach the masked-M stores and partial-tile cluster reduction of both
-# kernel families.
+# kernel families. The last three leave 19 / 33 / 19 M tiles on compute kernels with cluster_m
+# 2 / 4 / 2: cluster_m shrinks to the largest power-of-two divisor of the tile count (1 / 1 / 1).
 OFF_GRID_SHAPES = {
     (1, 7168, 16384): False,
     (17, 7168, 16384): False,
@@ -43,6 +44,9 @@ OFF_GRID_SHAPES = {
     (2049, 7168, 16384): True,
     (129, 36864, 7168): True,
     (255, 36864, 7168): True,
+    (4609, 3584, 7168): True,
+    (8321, 3584, 7168): True,
+    (4609, 7168, 3584): True,
 }
 # (M, N, K, kernelName, other kernelName): two compute kernels that do not fit the instruction cache
 # together. Each prefetches its own code, so it must run as fast right after the other as back to back:
@@ -316,6 +320,129 @@ def test_gemm(dtype, M, N, K):
         )
 
     return ret
+
+
+def _asm_f4_kernels():
+    """Rows of this arch's asm kernel table, the table the launcher reads,
+    that take preshuffled B and are not persistent (ps=0)."""
+    path = os.path.join(
+        AITER_ASM_DIR, get_gfx(), "f4gemm", "f4gemm_bf16_per1x32Fp4.csv"
+    )
+    if not os.path.isfile(path):
+        return []
+    table = pd.read_csv(path, comment="#")
+    rows = table[(table["bpreshuffle"] == 1) & (table["ps"] == 0)]
+    return list(rows.itertuples(index=False))
+
+
+def _quant_rows(rows, k, chunk=65536):
+    """Random MXFP4 rows, quantized in chunks so no bf16 copy of the whole
+    tensor is needed. Returns data, plain scales and shuffled scales."""
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    q, s, s_sh = [], [], []
+    for r0 in range(0, rows, chunk):
+        t = torch.randn((min(chunk, rows - r0), k), dtype=dtypes.bf16)
+        _, scales = quant_func(t, shuffle=False)
+        tq, scales_sh = quant_func(t, shuffle=True)
+        q.append(tq)
+        s.append(scales.view(torch.uint8)[: t.shape[0]])
+        s_sh.append(scales_sh[: t.shape[0]])
+    return torch.cat(q), torch.cat(s), torch.cat(s_sh)
+
+
+def _check_asm_f4_exact(
+    x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, name, case
+):
+    """Run one asm kernel by name; every element of out must match the
+    reference."""
+    out.fill_(float("nan"))
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    aiter.gemm_a4w4_asm(
+        x, wshuffle, x_scales_sh, w_scales_sh, out, name, log2_k_split=0
+    )
+    m, n = out.shape
+    rb = max(1, (1 << 28) // max(n, x.shape[1] * 2))
+    bad = 0
+    for r0 in range(0, m, rb):
+        rows = slice(r0, r0 + rb)
+        ref = run_torch(x[rows], w, x_scales[rows], w_scales, dtypes.bf16).float()
+        got = out[rows].float()
+        bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
+    assert bad == 0, f"a4w4 asm {name} {case}: {bad} of {m * n} elements wrong"
+    aiter.logger.info(f"a4w4 asm {name} {case}: exact")
+
+
+def check_asm_4gib_operands():
+    """A or out of 4 GiB or more must be exact, for every kernel that
+    _asm_f4_kernels() selects.
+
+    Each operand's buffer descriptor holds a 32-bit size; the kernels give
+    every tile its own 64-bit base.
+    """
+    kernels = _asm_f4_kernels()
+    for operand, m, n, k in (
+        ("out", 20192, 106496, 512),
+        ("A", (1 << 33) // 8192 + 256, 512, 8192),
+    ):
+        x, x_scales, x_scales_sh = _quant_rows(m, k)
+        w, w_scales, w_scales_sh = _quant_rows(n, k)
+        out = torch.empty((m, n), dtype=dtypes.bf16)
+        case = f"{operand} > 4 GiB {(m, n, k)}"
+        for kn in kernels:
+            _check_asm_f4_exact(
+                x,
+                w,
+                x_scales,
+                w_scales,
+                x_scales_sh,
+                w_scales_sh,
+                out,
+                kn.knl_name,
+                case,
+            )
+        del x, w, out
+
+
+def check_asm_last_tile_at_allocation_end():
+    """A ends an allocation and the last M tile has 1 row, at small K.
+
+    The kernels lower each tile's descriptor size by a fixed step per K step
+    they prefetch, also past the end of K; it must stop at zero there. If it
+    wrapped, those prefetches would read past the end of A, which faults
+    (aborting the process) when A ends the allocation.
+    """
+    # A fresh 64 MiB block is a whole caching-allocator segment, so the memory
+    # after it is normally unmapped; empty the cache so it is not cut from a
+    # larger one.
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    torch.cuda.empty_cache()
+    buf = torch.empty(64 << 20, dtype=torch.uint8)
+    n = 512
+    for kn in _asm_f4_kernels():
+        m = kn.tile_M + 1
+        for k in (256, 512):
+            xb = torch.randn((m, k), dtype=dtypes.bf16)
+            wb = torch.randn((n, k), dtype=dtypes.bf16)
+            x, x_scales_sh = quant_func(xb, shuffle=True)
+            w, w_scales_sh = quant_func(wb, shuffle=True)
+            x_scales = quant_func(xb, shuffle=False)[1].view(torch.uint8)
+            w_scales = quant_func(wb, shuffle=False)[1].view(torch.uint8)
+            nbytes = x.numel() * x.element_size()
+            xa = buf[buf.numel() - nbytes :].view(x.dtype).view(x.shape)
+            xa.copy_(x)
+            out = torch.empty((m, n), dtype=dtypes.bf16)
+            case = f"A at allocation end {(m, n, k)}"
+            _check_asm_f4_exact(
+                xa,
+                w,
+                x_scales,
+                w_scales,
+                x_scales_sh,
+                w_scales_sh,
+                out,
+                kn.knl_name,
+                case,
+            )
 
 
 @benchmark()
@@ -777,6 +904,13 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
+    if (
+        get_gfx() == "gfx950"
+        and args.csv is None
+        and args.shape is parser.get_default("shape")
+    ):
+        check_asm_last_tile_at_allocation_end()
+        check_asm_4gib_operands()
 
     if gfx1250:
         return  # the split-K test runs the gfx950 256x256 kernels

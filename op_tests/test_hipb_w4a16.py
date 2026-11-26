@@ -148,7 +148,8 @@ def test_hipb_w4a16_mm_signed_encoding(dtype, group_size, has_zp, m):
 @pytest.mark.usefixtures("requires_w4a16")
 @pytest.mark.parametrize("has_zp", [False, True])
 @pytest.mark.parametrize("int4_encoding", list(aiter.HipblasLtInt4Encoding))
-def test_hipb_w4a16_mm_out_op_contract(has_zp, int4_encoding):
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_hipb_w4a16_mm_out_op_contract(has_zp, int4_encoding, has_bias):
     """The registered op writes a row-padded `out` in place and aliases nothing."""
     q = torch.randint(0, 16, (N, K), device="cuda")
     zp = torch.randint(0, 16, (N, K // 128), device="cuda")
@@ -158,9 +159,19 @@ def test_hipb_w4a16_mm_out_op_contract(has_zp, int4_encoding):
     )
     x = torch.randn(7, K + 64, device="cuda", dtype=dtypes.bf16)[:, :K]
     out = torch.empty(7, N + 64, device="cuda", dtype=dtypes.bf16)[:, :N]
+    bias = torch.randn(N, device="cuda", dtype=dtypes.bf16) if has_bias else None
     torch.library.opcheck(
         torch.ops.aiter.hipb_w4a16_mm_out.default,
-        (x, pack_int4_k_order(q, 128), scale, out, 128, has_zp, int(int4_encoding)),
+        (
+            x,
+            pack_int4_k_order(q, 128),
+            scale,
+            out,
+            bias,
+            128,
+            has_zp,
+            int(int4_encoding),
+        ),
     )
 
 
@@ -222,6 +233,17 @@ def test_hipb_w4a16_mm_rejects_unsupported_group_size():
 
 
 @pytest.mark.usefixtures("requires_w4a16")
+def test_hipb_w4a16_mm_rejects_bias_in_another_dtype():
+    """hipBLASLt's epilogue reads the bias in the activation dtype."""
+    x = torch.randn(4, K, device="cuda", dtype=dtypes.bf16)
+    w_q = torch.zeros(N, K // 2, device="cuda", dtype=torch.uint8)
+    scale = torch.full((N, K // 128), 0.01, device="cuda", dtype=dtypes.bf16)
+    bias = torch.zeros(N, device="cuda", dtype=dtypes.fp32)
+    with pytest.raises(RuntimeError, match="bias must be a contiguous"):
+        aiter.hipb_w4a16_mm(x, w_q, scale, 128, bias=bias)
+
+
+@pytest.mark.usefixtures("requires_w4a16")
 def test_hipb_w4a16_mm_concurrent_streams_with_workspace():
     """Launches on two streams, each needing a workspace, do not share scratch."""
     from aiter.ops.gradlib import _hipb_w4a16_workspace_size
@@ -248,7 +270,9 @@ def test_hipb_w4a16_mm_concurrent_streams_with_workspace():
         )
     out0 = torch.empty(m, n, device="cuda", dtype=dtype)
     if (
-        _hipb_w4a16_workspace_size(problems[0][0], problems[0][1], out0, g, True, 1)
+        _hipb_w4a16_workspace_size(
+            problems[0][0], problems[0][1], out0, g, True, 1, False
+        )
         == 0
     ):
         pytest.skip("this hipBLASLt picks no workspace-using kernel for the shape")

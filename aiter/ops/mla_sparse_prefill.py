@@ -32,6 +32,7 @@ from .. import logger
 from .. import plugin as _plugin
 from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from ..jit.utils.build_targets import is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..plugin import route as _route
@@ -525,7 +526,7 @@ def _v41_runtime_arch(device: torch.device | str) -> str | None:
     if not 0 <= index < torch.cuda.device_count():
         raise ValueError(f"CUDA device index is out of range: {index}")
     gfx = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0].lower()
-    if gfx not in ("gfx950", "gfx1250"):
+    if gfx not in ("gfx950", "gfx1250", "gfx1250-strict"):
         return None
     # Native dispatch currently uses a node-wide cached architecture. Do not
     # promise support for a different target on a heterogeneous node.
@@ -543,7 +544,7 @@ def _v41_asm_eligible(gfx, shape, dtypes_, layout, scale):
         kv_scale_dtype,
     ) = dtypes_
     return (
-        gfx == "gfx1250"
+        is_gfx1250_family(gfx)
         and h == 64
         and d == 512
         and n <= 65536
