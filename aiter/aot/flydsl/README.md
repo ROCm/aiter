@@ -15,6 +15,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
+| `unified_attention.py` | gfx950 BF16 unified attention (ping-pong, planner, query map, reducers, optimized varlen), by replaying `unified_attention_flydsl` per KV-cache shape in `DEFAULT_SHAPES` and for 128/256 CUs (see below); intentionally manual because its model-specific grid is too large for every `PREBUILD_KERNELS` build |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -275,6 +276,23 @@ window are passed at launch, and `max_batch_size` only bounds the batch.
 python -m aiter.aot.flydsl.pa_decode_plan
 # one arch
 GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
+```
+
+BF16 unified attention specializes its reducer on the partition count, which
+follows `max_seqlen_k` exactly up to the device's CU count. Its planner and
+query map specialize on power-of-two batch buckets, and its ping-pong kernel
+on the query length and pairing. `unified_attention` replays the router over
+query lengths 1 to 8, batches and every reachable reducer partition count for
+each `DEFAULT_SHAPES` entry (`page:kv_heads[:window[:sink]]`) on the 128-CU
+MI350P and 256-CU MI350X/MI355X. With
+`AITER_UNIFIED_ATTN_FLYDSL_TUNING` pointing at a rung file such as
+`aiter/ops/flydsl/configs/unified_attention/bf16_gfx950_pow2.json`, set the
+same way at build and serve time, only those configured reducer rungs compile.
+
+```bash
+python -m aiter.aot.flydsl.unified_attention
+python -m aiter.aot.flydsl.unified_attention --shape 64:1:127:f32
+python -m aiter.aot.flydsl.unified_attention --cu-num 128
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An

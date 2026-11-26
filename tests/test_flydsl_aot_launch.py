@@ -50,6 +50,31 @@ class _Cache:
     epoch = 0
 
 
+def test_lazy_launcher_resolves_before_per_device_state(monkeypatch):
+    from aiter.ops.flydsl.aot_launch import _LazyLauncher
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    launched = []
+
+    class Launcher:
+        pass
+
+    launcher = Launcher()
+    launcher._cf = lambda value: launched.append(value)
+
+    class Binding:
+        def __call__(self, args, specialization_key):
+            assert args == (7,) and specialization_key is None
+            return False
+
+        def launcher(self):
+            return launcher
+
+    monkeypatch.setattr("torch.cuda.current_device", lambda: 0)
+    _run_compiled(_LazyLauncher(Binding()), 7)
+    assert launched == [7]
+
+
 @pytest.mark.skipif(
     os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
     reason="mode 0 binds nothing",

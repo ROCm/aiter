@@ -16,7 +16,7 @@ from aiter.ops.topk_decode_gate import (
 from aiter.utility import graph_alloc
 
 from ..kernels.kernels_common import get_warp_size
-from ..kernels.tensor_shim import _run_compiled
+from ..kernels.tensor_shim import _launcher_on, _run_compiled
 from ..kernels.topk import topk_per_row_decode_adaptive as _adaptive
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
@@ -26,7 +26,7 @@ from ..kernels.topk.radix_topk_one_block import (
     _row_cache_enabled,
     build_radix_topk_one_block_module,
 )
-from ..kernels.topk.topk_launch import _launcher_on, run_topk_launcher
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
     clear_topk_per_row_decode_workspace_cache as _clear_split_workspace_cache,
 )

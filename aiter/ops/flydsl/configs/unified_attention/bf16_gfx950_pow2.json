@@ -1,0 +1,4 @@
+{
+  "reduce_partitions": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+  "min_uniform_work": 49152
+}
