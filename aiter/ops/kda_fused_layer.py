@@ -406,9 +406,9 @@ def _token_major(*ts, dtype=None):
     chunk kernels index them token-major, and a dtype cast alone keeps the
     strides of a dense view.
     """
-    return [
-        t.to(dtype=dtype or t.dtype, memory_format=torch.contiguous_format) for t in ts
-    ]
+    # .to() returns a same-dtype tensor unchanged even with memory_format set,
+    # so the layout is forced separately (a no-op when already contiguous)
+    return [t.to(dtype or t.dtype).contiguous() for t in ts]
 
 
 def _chunk_fwd_triton():
@@ -492,14 +492,15 @@ def _chunk_bwd_triton():
             kw.update(safe_gate=True, lower_bound=lower_bound)
         dtypes_in = [t.dtype for t in (q, k, v, g, beta)]
         q, k, v, do = _token_major(q, k, v, do, dtype=compute_dtype or torch.bfloat16)
+        g, beta = _token_major(g, beta)
         out = chunk_delta_attn_bwd(
             do,
             None,
             q,
             k,
             v,
-            g.contiguous(),
-            beta.contiguous(),
+            g,
+            beta,
             scale,
             chunk_size=chunk_size,
             **kw,
@@ -1032,13 +1033,19 @@ def _kda_layer_fused_bwd(
         kw["use_beta_sigmoid_in_kernel"] = True
     if chunk_impl is not None and _has_param(chunk_impl, "compute_dtype"):
         kw["compute_dtype"] = _compute_dtype_of(x.dtype)
+    v_in = s["v"]
+    if chunk_impl is not None:
+        # every chunk kernel indexes token-major; q/k/v are channel-major views
+        do, q_in, k_in, v_in, g_in, b_in = _token_major(
+            do, q_in, k_in, v_in, g_in, b_in
+        )
     dq, dk, dv, dg, dbeta, dA_log, ddt = _chunk_bwd_varlen(
         chunk_bwd,
         cu_seqlens,
         do,
         q_in,
         k_in,
-        s["v"],
+        v_in,
         g_in,
         b_in,
         s["scale"],

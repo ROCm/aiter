@@ -487,6 +487,68 @@ def test_kda_stage(stage, m, h, k, d, r, lb, dtype):
     }
 
 
+@benchmark()
+def test_kda_chunk_bwd_backends(b, t, h, k, lb, dtype):
+    """Chunk backward backends on channel-major q/k/v views (as the layer builds
+    them) with the fused prologue, in fp32 and bf16, against chunk_kda_bwd_torch."""
+    a = torch.randn(b, t, 3 * h * k)
+    c = kda_fused_layer._short_conv(a, torch.randn(3 * h * k, 4) * 0.5)
+    q, kk, v = (x.reshape(b, t, h, k) for x in c.split(h * k, -1))
+    q, kk, v = (x.to(dtype) for x in (q, kk, v))
+    a_log = torch.zeros(K3_A_LOG_LEN)
+    a_log[:h] = torch.linspace(-0.5, 1.2, h)
+    g = torch.randn(b, t, h, k)
+    beta = torch.randn(b, t, h)
+    do = torch.randn(b, t, h, k)
+    kw = {
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "A_log": a_log[:h],
+        "dt_bias": torch.randn(h * k),
+        "use_beta_sigmoid_in_kernel": True,
+    }
+    if lb is not None:
+        kw["lower_bound"] = lb
+    scale = k**-0.5
+    ref = kda_fused_layer.chunk_kda_bwd_torch(do, q, kk, v, g, beta, scale, 64, **kw)
+    ret = {"gfx": get_gfx_runtime(), "q contiguous": q.is_contiguous()}
+    for backend in ("triton", "flydsl"):
+        try:
+            impl, _fuses = kda_fused_layer._PIECE_LOADERS[("chunk_bwd", backend)]()
+        except ImportError:
+            ret[f"{backend} err"] = "n/a"
+            continue
+        if backend == "flydsl" and dtype != dtypes.bf16:
+            ret[f"{backend} err"] = "bf16 only"
+            continue
+        call_kw = dict(kw)
+        if lb is not None and not kda_fused_layer._accepts(impl, "lower_bound"):
+            ret[f"{backend} err"] = "no lower_bound"
+            continue
+        if kda_fused_layer._has_param(impl, "compute_dtype"):
+            call_kw["compute_dtype"] = kda_fused_layer._compute_dtype_of(dtype)
+        out, us = run_perftest(
+            impl, do, q, kk, v, g, beta, scale, 64, **call_kw, num_iters=3
+        )
+        worst = 0.0
+        for i, (o, rf) in enumerate(zip(out, ref)):
+            if rf is None:
+                continue
+            sc = rf.float().abs().max().clamp_min(1e-6)
+            err = checkAllclose(
+                (rf.float() / sc).to(dtypes.fp32),
+                (o.float() / sc).to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"chunk bwd {backend}[{i}]",
+            )
+            assert err == 0, f"chunk bwd {backend}[{i}]: {err:.2%} outside tolerance"
+            worst = max(worst, err)
+        ret[f"{backend} us"] = us
+        ret[f"{backend} err"] = worst
+    return ret
+
+
 def run_torch_proj(lr, f_b, dt_bias, A_log, h, lb, dg, x, g_proj, aux):
     """Reference for the fused projections, fp32 (A_log: first h entries)."""
     with torch.enable_grad():
@@ -750,6 +812,16 @@ def main():
                 ],
                 layer_axes,
             )
+        summarize(
+            "kda chunk bwd backends (channel-major inputs) summary",
+            [
+                test_kda_chunk_bwd_backends(b, t, h, k, lb, dtype)
+                for b, t, (_, h, k, _, _), lb in itertools.product(
+                    args.batch, args.seqlen, args.shape, args.gate_lb
+                )
+            ],
+            layer_axes,
+        )
         stage_df = summarize(
             "kda GPU-only stage diff summary",
             [
