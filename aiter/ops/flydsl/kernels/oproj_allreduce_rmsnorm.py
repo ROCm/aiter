@@ -30,7 +30,8 @@ order:
 Phases 1 and 2 are mega paged attention's phases 3 and 4, unchanged: the same
 tiles, reductions, inbox layout and rank-order bf16 rounding. On gfx942 o_proj
 runs in 32-row passes and each wave stages its fp32 partial in its own LDS
-region; the push adds them in the same order (the same sums).
+region; the push adds them in the same order (the same sums). A pass's first
+K steps of x go out before the previous pass's wave reduce and push.
 
 ``xs`` (and ``x_scale`` when quantizing) must be uncached memory
 (``IpcHeap`` uncached), like mega paged attention's hand-off buffers; rows of
@@ -247,6 +248,13 @@ def compile_oproj_allreduce_rmsnorm(
     # for it before phase 0's x loads and a launch-time claim go out: only the
     # counts, the claim's k and the parity resets use it.
     launch_order = staged_x and max_rows <= LAUNCH_ORDER_ROWS
+    # gfx942, several passes: a wave issues pass p + 1's first x_ahead K steps
+    # of x right after pass p's gemm, so they are not queued behind the peer
+    # stores of its push (vector memory returns in issue order, stores
+    # included). All of them with 4+ ranks; 2 with fewer remote stores or
+    # when every tile starts at launch (early_claim), where all of them lose.
+    cross_x = gfx942 and len(passes) > 1
+    x_ahead = prefetch if world_size >= 4 and not early_claim else min(2, prefetch)
     # ``sync`` words.
     x_done_at = 0
     tile_claim_at = x_done_at + 2 * x_groups * SYNC_LINE
@@ -653,28 +661,42 @@ def compile_oproj_allreduce_rmsnorm(
         rocdl.sched_barrier(0)
         return ws
 
-    def _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count):
+    def _x_step(x_rsrc, lane_off, base, tile, m0, m_count, s):
+        """A wave's x loads of K step s for rows [16 m0, 16 (m0 + m_count))."""
+        return [
+            _bload(
+                x_rsrc,
+                lane_off,
+                4,
+                _BYPASS,
+                soffset=base + ((m0 + m) * (row_k // 64) + _k_step(tile, s)) * X_CHUNK,
+            )
+            for m in range_constexpr(m_count)
+        ]
+
+    def _issue_x(x_rsrc, lane, warp, tile, m0, m_count, steps):
+        """The first ``steps`` K steps of a pass's x, issued ahead of its gemm."""
+        lane_off = _x_lane(lane)
+        base = _uniform(warp * (k_steps * X_CHUNK))
+        return [
+            _x_step(x_rsrc, lane_off, base, tile, m0, m_count, s) for s in range(steps)
+        ]
+
+    def _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count, pre=()):
+        """``pre``: the first K steps' x, already issued (``_issue_x``)."""
         lane_off = _x_lane(lane)
         base = _uniform(warp * (k_steps * X_CHUNK))
 
         def issue_x(s):
-            return [
-                _bload(
-                    x_rsrc,
-                    lane_off,
-                    4,
-                    _BYPASS,
-                    soffset=base
-                    + ((m0 + m) * (row_k // 64) + _k_step(tile, s)) * X_CHUNK,
-                )
-                for m in range_constexpr(m_count)
-            ]
+            return _x_step(x_rsrc, lane_off, base, tile, m0, m_count, s)
 
         acc = [
             [fx.full(4, 0.0, fx.Float32) for _j in range(n_sub)]
             for _m in range(m_count)
         ]
-        pending = [issue_x(s) for s in range(min(prefetch, k_steps))]
+        pending = list(pre) + [
+            issue_x(s) for s in range(len(pre), min(prefetch, k_steps))
+        ]
         for s in range_constexpr(k_steps):
             if s + prefetch < k_steps:
                 pending.append(issue_x(s + prefetch))
@@ -1082,6 +1104,71 @@ def compile_oproj_allreduce_rmsnorm(
             m_count,
         )
 
+    @flyc.jit
+    def _pass_chain(
+        p,
+        pre,
+        tile,
+        ws,
+        col_scales,
+        w_scale_base,
+        x_rsrc,
+        x_scale_ptr,
+        num_rows,
+        gemm_base,
+        peers,
+        buf,
+        lane,
+        warp,
+        tid,
+    ):
+        """``cross_x``: ``_tile_pass`` of pass p, which issues the next pass's
+        first ``x_ahead`` K steps of x after its gemm, then the next pass if it
+        has live rows (nested in this one, so those loads reach it)."""
+        m0, m_count = passes[p]
+        row0 = 16 * m0
+        x_scales = _row_scales(tid, x_scale_ptr, row0, num_rows)
+        acc = _gemm_tile(ws, x_rsrc, lane, warp, tile, m0, m_count, pre)
+        nxt = ()
+        if const_expr(p + 1 < len(passes)):
+            # Pinned: in flight during the wave reduce and the push.
+            rocdl.sched_barrier(0)
+            nxt = _issue_x(x_rsrc, lane, warp, tile, *passes[p + 1], x_ahead)
+            rocdl.sched_barrier(0)
+        _stage_col_scales(col_scales, tid, w_scale_base)
+        _reduce_waves(acc, warp, lane, gemm_base)
+        _push_tile(
+            tile,
+            num_rows,
+            tid,
+            gemm_base,
+            x_scales,
+            w_scale_base,
+            peers,
+            buf,
+            row0,
+            m_count,
+        )
+        if const_expr(p + 1 < len(passes)):  # noqa: SIM102
+            if 16 * passes[p + 1][0] < num_rows:
+                _pass_chain(
+                    p + 1,
+                    nxt,
+                    tile,
+                    ws,
+                    col_scales,
+                    w_scale_base,
+                    x_rsrc,
+                    x_scale_ptr,
+                    num_rows,
+                    gemm_base,
+                    peers,
+                    buf,
+                    lane,
+                    warp,
+                    tid,
+                )
+
     kernel_name = (
         f"oproj_allreduce_rmsnorm_k{row_k}_r{max_rows}_n{hidden}_bn{block_n}"
         f"_w{world_size}r{rank}_pf{prefetch}_o{occupancy}"
@@ -1190,28 +1277,28 @@ def compile_oproj_allreduce_rmsnorm(
             ws = _load_w_slice(tile, w_rsrc, lane, warp)
             _wait_x(sync_ptr, x_done, num_rows, tid)
             _stamp(trace_ptr, bid, 2, tid)
-            for p in range_constexpr(len(passes)):
-                m0, m_count = passes[p]
-                if const_expr(p == 0):
-                    _tile_pass(
-                        tile,
-                        m0,
-                        m_count,
-                        ws,
-                        col_scales,
-                        w_scale_base,
-                        xs_rsrc,
-                        x_scale_ptr,
-                        num_rows,
-                        gemm_base,
-                        peers,
-                        parity,
-                        lane,
-                        warp,
-                        tid,
-                    )
-                else:
-                    if 16 * m0 < num_rows:
+            if const_expr(cross_x):
+                _pass_chain(
+                    0,
+                    (),
+                    tile,
+                    ws,
+                    col_scales,
+                    w_scale_base,
+                    xs_rsrc,
+                    x_scale_ptr,
+                    num_rows,
+                    gemm_base,
+                    peers,
+                    parity,
+                    lane,
+                    warp,
+                    tid,
+                )
+            else:
+                for p in range_constexpr(len(passes)):
+                    m0, m_count = passes[p]
+                    if const_expr(p == 0):
                         _tile_pass(
                             tile,
                             m0,
@@ -1229,6 +1316,25 @@ def compile_oproj_allreduce_rmsnorm(
                             warp,
                             tid,
                         )
+                    else:
+                        if 16 * m0 < num_rows:
+                            _tile_pass(
+                                tile,
+                                m0,
+                                m_count,
+                                ws,
+                                col_scales,
+                                w_scale_base,
+                                xs_rsrc,
+                                x_scale_ptr,
+                                num_rows,
+                                gemm_base,
+                                peers,
+                                parity,
+                                lane,
+                                warp,
+                                tid,
+                            )
             if const_expr(grid < n_tiles):
                 tile = _claim_tile(sync_ptr, claim, word_base, tid)
             else:
