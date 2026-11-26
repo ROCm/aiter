@@ -2855,6 +2855,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    inter_hadamard: int = 0,
     fused_shared_w1=None,
     fused_shared_w1_scale=None,
     shared_inter_bf16=None,
@@ -2913,6 +2914,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        inter_hadamard=inter_hadamard,
         fused_shared_w1=fused_shared_w1,
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
@@ -3054,6 +3056,7 @@ def _mxfp4_a4w4_stage1(
     k_wave=1,
     prefetch_hidden=False,
     prequantized=False,
+    inter_hadamard=0,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -3174,6 +3177,7 @@ def _mxfp4_a4w4_stage1(
         bias=bias1,
         num_waves=num_waves,
         k_wave=k_wave,
+        inter_hadamard=inter_hadamard,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -3425,6 +3429,7 @@ def _mxfp4_a4w4_stage1_fw(
         k_wave=p1.get("k_wave", 1),
         prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
+        inter_hadamard=p1.get("inter_hadamard", 0),
     )
     return inter_sorted_quant, inter_sorted_scale
 

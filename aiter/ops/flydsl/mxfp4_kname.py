@@ -8,6 +8,7 @@ _MXMOE_NUMERIC_TOKENS = {
     "SK": "kSplitK",
     "KW": "k_wave",
     "XCD": "xcd_swizzle",
+    "HAD": "inter_hadamard",
 }
 _MXMOE_G1_FLAG_TOKENS = {
     "NT",
@@ -124,6 +125,7 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "act": act,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
+        "inter_hadamard": nums.get("inter_hadamard", 0),
     }
 
 
@@ -135,6 +137,8 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
 def _parse_mxfp4_g2_kname_cached(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 2, _MXMOE_G2_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
+    if "inter_hadamard" in nums:
+        raise ValueError(f"bad mxmoe g2 name {kname!r}: _had is a GEMM1 option")
     atomic = "ATOMIC" in flags
     mxfp4out = "F4OUT" in flags
     cshuffle = "CSHUFFLE" in flags
