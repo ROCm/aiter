@@ -368,7 +368,8 @@ def chunk_kda_fwd_flydsl(
         state_v_first,
         chunks=chunks,
     )
-    o = torch.empty_like(v)
+    # Not empty_like(v): a permuted v view would hand the kernel its strides.
+    o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
     _run_compiled(
         compile_output(H, h.dtype, v_new.dtype, o.dtype, chunks.varlen),
         qg,
