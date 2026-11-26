@@ -62,6 +62,14 @@ SWITCH_CASES = tuple(
     for k in (7168, 3584, 7936)
 )
 SWITCH_RATIO_MAX = 1.15
+# M for gemm_a4w4(deterministic=True): partial 32-row blocks, and enough rows for the
+# heuristic to move between tiles.
+DETERMINISTIC_M = (1, 17, 32, 64, 255, 256, 1000, 2048, 4096)
+# N % 256 != 0. On 256 CUs the heuristic picked full_tile_N kernels in this M sweep
+# before it skipped them: at N=2176, 192x256 from M=4128, and without the persistent
+# kernel 224x256 from 5472 and 256x256 from 6304.
+N_TAIL_NK = ((2112, 1024), (2176, 1024), (2240, 1024))
+N_TAIL_M = tuple(range(32, 16385, 32))
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
@@ -470,6 +478,163 @@ def test_gemm_splitk(dtype, M, N, K, log2_k_split):
     return ret
 
 
+def bpreshuffle_kernels():
+    """(kernel name, tile_N, splitK, ps, full_tile_N) of the gfx950 BpreShuffle
+    kernels."""
+    table = pd.read_csv(
+        os.path.join(AITER_ASM_DIR, get_gfx(), "f4gemm", "f4gemm_bf16_per1x32Fp4.csv"),
+        comment="#",
+    )
+    table = table[table["bpreshuffle"] == 1]
+    columns = ["knl_name", "tile_N", "splitK", "ps", "full_tile_N"]
+    return list(table[columns].itertuples(index=False, name=None))
+
+
+def operands_by_m(dtype, M_max, N, K):
+    """The gemm_a4w4 operands of the first M of M_max rows, quantized for that M, and
+    the torch reference of all M_max rows."""
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M_max, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+
+    def args(M):
+        xq, xs = quant_func(x[:M], shuffle=True)
+        return xq, wshuffle, xs, w_scales_shuffle
+
+    ref = run_torch(
+        args(M_max)[0], w, x_scales.view(torch.uint8), w_scales.view(torch.uint8), dtype
+    )
+    return args, ref
+
+
+@benchmark()
+def test_ps0_tiles_bitwise(dtype, M, N, K):
+    """Every kernel the deterministic mode may pick at this N sums K in one order,
+    so all give the bits of 256x128."""
+    _, x, wshuffle, x_scales, w_scales = quantize(dtype, M, N, K)
+
+    def run(name):
+        out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+        aiter.gemm_a4w4_asm(x, wshuffle, x_scales, w_scales, out, name, log2_k_split=0)
+        return out[:M]
+
+    ref = run("_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x128E")
+    kernels = 0
+    for name, tile_N, _, ps, full_tile_N in bpreshuffle_kernels():
+        if ps or (full_tile_N and N % tile_N):
+            continue  # not picked here; full_tile_N: see test_gemm_n_tail
+        rows = int((run(name) != ref).any(1).sum())
+        assert (
+            rows == 0
+        ), f"{name}: {rows}/{M} rows differ from 256x128, M={M} N={N} K={K}"
+        kernels += 1
+    return {"gfx": get_gfx(), "kernels": kernels}
+
+
+@benchmark()
+def test_gemm_deterministic(dtype, N, K):
+    """gemm_a4w4(deterministic=True) gives a row the same bits whatever M, and from
+    run to run."""
+    M_max = max(DETERMINISTIC_M)
+    args, ref_torch = operands_by_m(dtype, M_max, N, K)
+
+    def run(M):
+        return gemm_a4w4(*args(M), dtype=dtype, deterministic=True)
+
+    ref = run(M_max)
+    err = checkAllclose(
+        ref_torch.float(),
+        ref.float(),
+        msg="deterministic a4w4",
+        catastrophic_check=True,
+    )
+    assert torch.equal(run(M_max), ref), f"N={N} K={K}: differs from run to run"
+    for M in DETERMINISTIC_M:
+        rows = int((run(M) != ref[:M]).any(1).sum())
+        assert rows == 0, f"M={M} N={N} K={K}: {rows}/{M} rows differ from M={M_max}"
+
+    ret = {"gfx": get_gfx(), "err": err}
+    for M in (64, 1024, M_max):
+        a = args(M)
+        _, ret[f"M={M} default us"] = run_perftest(gemm_a4w4, *a, dtype=dtype)
+        _, ret[f"M={M} deterministic us"] = run_perftest(
+            gemm_a4w4, *a, dtype=dtype, deterministic=True
+        )
+    return ret
+
+
+@benchmark()
+def test_gemm_n_tail(dtype, N, K):
+    """At N % 256 != 0 the asm heuristic, with and without the persistent kernel,
+    picks for every M a kernel that stores nothing past column N and gets the
+    product right. A full_tile_N kernel stores the whole last N tile, so by name
+    it is refused without split K; with split K that tile only adds 0, so it gives
+    the bits of B zero-padded to whole tiles."""
+    args, ref = operands_by_m(dtype, max(N_TAIL_M), N, K)
+    ref = ref.float()
+    tol = 1e-2 * ref.abs().max()
+    for M in N_TAIL_M:
+        a = args(M)
+        for allow_ps in (True, False):
+            buf = torch.full(((M + 31) // 32 * 32, N + 512), float("nan"), dtype=dtype)
+            aiter.gemm_a4w4_asm(*a, buf[:, :N], log2_k_split=0, allow_ps=allow_ps)
+            past_N = int((~buf[:, N:].isnan()).sum())
+            wrong = int(((buf[:M, :N].float() - ref[:M]).abs() > tol).sum())
+            assert past_N == 0 and wrong == 0, (
+                f"M={M} N={N} K={K} allow_ps={allow_ps}: {past_N} stores past "
+                f"column N, {wrong} wrong"
+            )
+
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    xq, _, xs, _ = args(256)
+    w = torch.randn((N, K), dtype=dtype)
+
+    def run(name, N_out, log2_k_split):
+        wq, ws = quant_func(torch.cat([w, w.new_zeros(N_out - N, K)]), shuffle=True)
+        out = torch.empty(256, N_out, dtype=dtype)
+        aiter.gemm_a4w4_asm(
+            xq,
+            shuffle_weight(wq, layout=(16, 16)),
+            xs,
+            ws,
+            out,
+            name,
+            log2_k_split=log2_k_split,
+        )
+        return out[:, :N]
+
+    refused = split_k = 0
+    for name, tile_N, splitK, _, full_tile_N in bpreshuffle_kernels():
+        if not full_tile_N or N % tile_N == 0:
+            continue
+        for log2_k_split in (0, 1):
+            if splitK and log2_k_split:
+                N_pad = (N + tile_N - 1) // tile_N * tile_N
+                assert torch.equal(run(name, N, 1), run(name, N_pad, 1)), (
+                    f"{name} N={N} K={K}: split K differs from B zero-padded to "
+                    f"N={N_pad}"
+                )
+                split_k += 1
+                continue
+            try:
+                run(name, N, log2_k_split)
+            except RuntimeError as e:
+                assert "needs N %" in str(e), str(e)
+                refused += 1
+            else:
+                raise AssertionError(f"{name} ran at N={N} log2_k_split={log2_k_split}")
+    return {
+        "gfx": get_gfx(),
+        "M": len(N_TAIL_M),
+        "refused": refused,
+        "split K bitwise": split_k,
+    }
+
+
 @benchmark()
 def test_compute_switch_penalty(
     M, N, K, kernel_name, other_kernel_name, dtype=dtypes.bf16
@@ -668,6 +833,21 @@ def main():
         help="""Shapes of mnk for split K (log2_k_split 1..3) with the 256x256 kernels.
     e.g. -mnk_splitk 256,256,8192""",
     )
+    parser.add_argument(
+        "-mnk_det",
+        "--shape_deterministic",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (2048, 8192, 1024),
+            (2048, 8192, 14336),
+            (64, 7168, 2048),
+            (512, 2112, 7168),
+        ],
+        help="""Shapes of mnk for the non-persistent kernels against 256x256 (bitwise);
+    each N,K also runs gemm_a4w4(deterministic=True) over M.
+    e.g. -mnk_det 2048,8192,1024""",
+    )
     args = parser.parse_args()
 
     gfx1250 = get_gfx() == "gfx1250"
@@ -726,6 +906,22 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 split K summary (markdown):\n%s", df_md)
+
+    df = []
+    for dtype in args.dtype:
+        for m, n, k in args.shape_deterministic:
+            test_ps0_tiles_bitwise(dtype, m, n, k)
+            df.append(test_gemm_deterministic(dtype, n, k))
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a4w4 deterministic summary (markdown):\n%s", df_md)
+
+    df = pd.DataFrame(
+        [test_gemm_n_tail(dtype, n, k) for dtype in args.dtype for n, k in N_TAIL_NK]
+    )
+    aiter.logger.info(
+        "gemm_a4w4 N tail summary (markdown):\n%s", df.to_markdown(index=False)
+    )
 
 
 if __name__ == "__main__":

@@ -93,6 +93,22 @@ static bool ps_supported(const f4gemmConfig& cfg,
            N * b_row < lim && int64_t(cfg.tile_M) * out->stride(0) * 2 < lim / 2;
 }
 
+// Workgroups along K of a split-K launch: K / split, rounded up to 256, per workgroup
+static int k_slices(int K, int split)
+{
+    int k_per_tg = (K / split + 255) / 256 * 256;
+    return (K + k_per_tg - 1) / k_per_tg;
+}
+
+// full_tile_N=1 kernels store all tile_N columns of the last N tile; past row N of B they read 0,
+// so those columns hold 0. When N % tile_N != 0 a plain store of them overwrites the start of the
+// next output row, racing with the tile that owns it. With K slices > 1 the output is zeroed and
+// accumulated into, so they only add 0.
+static bool full_tile_N_ok(const f4gemmConfig& cfg, int64_t N, int slices)
+{
+    return !cfg.full_tile_N || N % cfg.tile_N == 0 || slices > 1;
+}
+
 static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
 {
     if((inp_dtype == AITER_DTYPE_fp4x2 || inp_dtype == AITER_DTYPE_u8) &&
@@ -154,37 +170,35 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(cfg.bpreshuffle == bpreshuffle_en &&
            (cfg.splitK >= log2_k_split_en))
         {
-            // tile128x512 may not support N % cfg.tile_N != 0
-            if(cfg.tile_M != 128 || cfg.tile_N != 512 || (N % cfg.tile_N) == 0)
+            std::vector<int> splitK_list =
+                (log2_k_split >= 0 && cfg.splitK)
+                    ? std::vector<int>{1 << log2_k_split}
+                    : (cfg.splitK ? std::vector<int>{2, 4, 8, 16} : std::vector<int>{1});
+
+            for(auto& splitK : splitK_list)
             {
-                std::vector<int> splitK_list =
-                    (log2_k_split >= 0 && cfg.splitK)
-                        ? std::vector<int>{1 << log2_k_split}
-                        : (cfg.splitK ? std::vector<int>{2, 4, 8, 16} : std::vector<int>{1});
+                // Workaround until full_tile_N kernels mask their stores at N: see full_tile_N_ok
+                if(!full_tile_N_ok(cfg, N, k_slices(K, splitK)))
+                    continue;
+                int tg_num_M         = (M + cfg.tile_M - 1) / cfg.tile_M;
+                int tg_num_N         = (N + cfg.tile_N - 1) / cfg.tile_N;
+                tg_num               = tg_num_M * tg_num_N * splitK;
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
 
-                for(auto& splitK : splitK_list)
+                float local_compute2mem_effi = cfg.tile_M * cfg.tile_N / (cfg.tile_M + cfg.tile_N);
+
+                bool is_earlier_round        = (local_round < round);
+                bool is_same_round           = (local_round == round);
+                bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
+                bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
+                if(is_earlier_round ||
+                   (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
                 {
-                    int tg_num_M         = (M + cfg.tile_M - 1) / cfg.tile_M;
-                    int tg_num_N         = (N + cfg.tile_N - 1) / cfg.tile_N;
-                    tg_num               = tg_num_M * tg_num_N * splitK;
-                    uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-
-                    float local_compute2mem_effi =
-                        cfg.tile_M * cfg.tile_N / (cfg.tile_M + cfg.tile_N);
-
-                    bool is_earlier_round        = (local_round < round);
-                    bool is_same_round           = (local_round == round);
-                    bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
-                    bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
-                    if(is_earlier_round ||
-                       (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
-                    {
-                        round              = local_round;
-                        empty_cu           = local_round * num_cu - tg_num;
-                        compute2mem_effi   = local_compute2mem_effi;
-                        selectedKernelName = el.first;
-                        selectedsplitK     = splitK;
-                    }
+                    round              = local_round;
+                    empty_cu           = local_round * num_cu - tg_num;
+                    compute2mem_effi   = local_compute2mem_effi;
+                    selectedKernelName = el.first;
+                    selectedsplitK     = splitK;
                 }
             }
         }
@@ -215,8 +229,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     float        beta,
     int          bpreshuffle,
     int          log2_k_split,
+    int          allow_ps, // 0: ps=1 kernels are not picked and may not be named
     hipStream_t  stream),
-    (A, B, A_scale, B_scale, out, kernelName, bias, alpha, beta, bpreshuffle, log2_k_split, stream))
+    (A, B, A_scale, B_scale, out, kernelName, bias, alpha, beta, bpreshuffle, log2_k_split,
+     allow_ps, stream))
 {
     AITER_CHECK(
         out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
@@ -270,7 +286,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
     if(kname.empty())
     {
-        bool ps_ok = true; // every ps=1 kernel of this arch takes the call
+        bool ps_ok = allow_ps; // and every ps=1 kernel of this arch takes the call
         for(const auto& el : *config_map)
             if(el.first.find(arch_id) == 0 && el.second.ps)
                 ps_ok =
@@ -300,6 +316,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
         if(cfg.ps)
         {
+            AITER_CHECK(allow_ps, __func__, " ", kname, ": persistent kernels not allowed");
             AITER_CHECK(bias == nullptr || beta == 0.f,
                         __func__,
                         " ",
@@ -319,22 +336,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             AITER_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
-            auto k_slices = [&](int split) {
-                int k_per_tg = Kdim / split;
-                k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
-                return (Kdim + k_per_tg - 1) / k_per_tg;
-            };
             // ps=1 kernels drop K slices until each work item has a CU; same rule here
             const int64_t tiles = int64_t((Mdim + SUBM - 1) / SUBM) * ((Ndim + SUBN - 1) / SUBN);
-            while(cfg.ps && k_num > 1 && tiles * k_slices(k_num) > num_cu)
+            while(cfg.ps && k_num > 1 && tiles * k_slices(Kdim, k_num) > num_cu)
             {
                 k_num /= 2;
                 --args.log2_k_split;
             }
-            if(k_num > 1)
-                hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream);
-            gdz = k_slices(k_num);
+            gdz = k_slices(Kdim, k_num);
         }
+        AITER_CHECK(full_tile_N_ok(cfg, Ndim, gdz),
+                    __func__,
+                    " ",
+                    kname,
+                    ": stores the whole last N tile, needs N % ",
+                    SUBN,
+                    " == 0 or split K, got N = ",
+                    Ndim);
+        if(args.log2_k_split > 0)
+            hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream);
 
         impl_ptr =
             &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
