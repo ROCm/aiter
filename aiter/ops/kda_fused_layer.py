@@ -317,6 +317,53 @@ KDA_PIECE_CHOICES = ("triton", "flydsl", "torch")
 _piece_overrides: dict = {}
 
 
+# Fusion combinations, A/B-able in one run (``set_kda_fusions`` or
+# ``AITER_KDA_FUSIONS``, e.g. ``save_fwd=1,concat_proj=1,chunk_fuse=qk_l2norm+gate``):
+#   save_fwd       1: the training forward keeps its activations and the backward
+#                  skips the recompute (memory for time); 0: recompute
+#   concat_proj    1: one GEMM for x @ [w_q; w_k; w_v; f_a; w_beta (; g_proj)]^T
+#   proj_epilogue  0: plain torch GEMMs instead of the FlyDSL GEMM epilogues
+#   chunk_fuse     auto (the kernel's own set), none, or a "+"-joined subset of
+#                  qk_l2norm / gate / beta_sigmoid handed to the chunk backward
+KDA_FUSION_DEFAULTS = {
+    "save_fwd": "0",
+    "concat_proj": "0",
+    "proj_epilogue": "1",
+    "chunk_fuse": "auto",
+}
+_fusion_overrides: dict = {}
+
+
+def set_kda_fusions(**choices):
+    """Override fusion switches, e.g. ``set_kda_fusions(save_fwd=1)``; ``None`` drops one."""
+    for name, value in choices.items():
+        if name not in KDA_FUSION_DEFAULTS:
+            raise ValueError(
+                f"unknown KDA fusion {name!r}, expected {sorted(KDA_FUSION_DEFAULTS)}"
+            )
+        if value is None:
+            _fusion_overrides.pop(name, None)
+        else:
+            _fusion_overrides[name] = str(
+                int(value) if isinstance(value, bool) else value
+            )
+
+
+def kda_fusion_choices():
+    """Current fusion switches: overrides, then ``AITER_KDA_FUSIONS``, then defaults."""
+    out = dict(KDA_FUSION_DEFAULTS)
+    for item in filter(None, os.environ.get("AITER_KDA_FUSIONS", "").split(",")):
+        name, _, value = item.strip().partition("=")
+        if name in out and value:
+            out[name] = value
+    out.update(_fusion_overrides)
+    return out
+
+
+def _fusion_on(name):
+    return kda_fusion_choices()[name] not in ("0", "false", "off", "")
+
+
 def set_kda_pieces(**choices):
     """Select the implementation per stage, e.g. ``set_kda_pieces(chunk_bwd="flydsl")``.
 
@@ -728,6 +775,8 @@ class _TorchProj:
 
 def _proj_ops(x, w):
     """FlyDSL GEMM-with-epilogue projections on gfx950 for 16-bit weights."""
+    if not _fusion_on("proj_epilogue"):
+        return _TorchProj
     if x.is_cuda and w.f_b.dtype in (torch.bfloat16, torch.float16):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -764,7 +813,15 @@ def _kda_layer_fused_fwd(
     w_qkv = torch.cat([w.w_q, w.w_k, w.w_v]).to(cd)
     conv_qkv = torch.cat([w.conv_q, w.conv_k, w.conv_v]).float()
     hk, hv = w.w_q.shape[0], w.w_v.shape[0]
-    a = _mm(xc, w_qkv.t(), cd).view(B, T, -1)  # [B, T, 2HK + HV]
+    side = None
+    if _fusion_on("concat_proj"):
+        # one pass over x for every projection that has no epilogue of its own
+        extra = [w.f_a, w.w_beta] + ([w.g_proj] if for_backward else [])
+        full = _mm(xc, torch.cat([w_qkv, *(t.to(cd) for t in extra)]).t(), cd)
+        a, *side = full.split([w_qkv.shape[0], *(t.shape[0] for t in extra)], -1)
+        a = a.contiguous().view(B, T, -1)
+    else:
+        a = _mm(xc, w_qkv.t(), cd).view(B, T, -1)  # [B, T, 2HK + HV]
     conv_in = None
     with torch.set_grad_enabled(conv_graph):
         if conv_graph:
@@ -777,10 +834,10 @@ def _kda_layer_fused_fwd(
     q = F.normalize(q_pre, dim=-1, eps=L2NORM_EPS)
     k = F.normalize(k_pre, dim=-1, eps=L2NORM_EPS)
     proj = _proj_ops(x, w)
-    lr = _mm(xc, w.f_a.t(), cd)
+    lr = side[0].contiguous() if side else _mm(xc, w.f_a.t(), cd)
     g = proj.kda_gate_proj(lr, w.f_b, w.dt_bias, w.A_log, H, lower_bound)
     g = g.view(B, T, H, -1)
-    braw = _mm(xc, w.w_beta.t(), cd).view(B, T, H)
+    braw = (side[1] if side else _mm(xc, w.w_beta.t(), cd)).reshape(B, T, H)
     beta = torch.sigmoid(braw)
     scale = q.shape[-1] ** -0.5
     chunk_in = None
@@ -798,7 +855,7 @@ def _kda_layer_fused_fwd(
     normed = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * w.norm_w.float()
     gp, y = None, None
     if for_backward:
-        gp = _mm(xc, w.g_proj.t(), cd).view_as(o)
+        gp = (side[2] if side else _mm(xc, w.g_proj.t(), cd)).reshape(o.shape)
         on = (normed * torch.sigmoid(gp)).reshape(B * T, -1)
     else:
         on = proj.sigmoid_gate_proj(xc, w.g_proj, normed.reshape(B * T, -1))
@@ -867,9 +924,8 @@ def _chunk_bwd_varlen(chunk_bwd, cu_seqlens, do, q, k, v, g, beta, scale, cs, **
     return (*grads, *tail)
 
 
-def _kda_layer_fused_bwd(
-    dy, x, w, H, chunk_size, eps, ops, lower_bound=None, cu_seqlens=None
-):
+def _fused_plan(x, w, ops, lower_bound):
+    """Pick the backward's kernels: (chunk_impl, fuses, conv_kernel, rms_bwd)."""
     LAST_PIECES.clear()
     if _chunk_bwd_impl is not None:
         chunk_impl, fuses = _chunk_bwd_impl, _chunk_bwd_fuses
@@ -885,6 +941,11 @@ def _kda_layer_fused_bwd(
     ):
         # the kernel cannot apply the safe gate; feed it the finished decay
         fuses = fuses - {"gate"}
+    wanted = kda_fusion_choices()["chunk_fuse"]
+    if wanted != "auto":
+        fuses = (
+            fuses & frozenset() if wanted == "none" else fuses & set(wanted.split("+"))
+        )
     conv_kernel = _conv_bwd_kernel(x.is_cuda, x.dtype)
     rms_bwd = _gated_rmsnorm_bwd_impl or _default_gated_rmsnorm_bwd(x.is_cuda)
     LAST_PIECES.update(
@@ -892,18 +953,47 @@ def _kda_layer_fused_bwd(
         rmsnorm_bwd=_piece(rms_bwd),
         chunk_bwd_fuses=",".join(sorted(fuses)) or "-",
         l2norm_bwd="fused" if "qk_l2norm" in fuses else _piece(ops),
+        fusions=",".join(f"{k}={v}" for k, v in sorted(kda_fusion_choices().items())),
     )
-    _, s = _kda_layer_fused_fwd(
-        x,
-        w,
-        H,
-        chunk_size,
-        eps,
-        conv_graph=conv_kernel is None,
-        chunk_graph=chunk_impl is None,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
-    )
+    return chunk_impl, frozenset(fuses), conv_kernel, rms_bwd
+
+
+def _fused_saved_fwd(x, w, H, chunk_size, eps, plan, lower_bound, cu_seqlens):
+    chunk_impl, _, conv_kernel, _ = plan
+    with torch.enable_grad():
+        return _kda_layer_fused_fwd(
+            x,
+            w,
+            H,
+            chunk_size,
+            eps,
+            conv_graph=conv_kernel is None,
+            chunk_graph=chunk_impl is None,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+        )[1]
+
+
+def _kda_layer_fused_bwd(
+    dy,
+    x,
+    w,
+    H,
+    chunk_size,
+    eps,
+    ops,
+    lower_bound=None,
+    cu_seqlens=None,
+    saved=None,
+):
+    """``saved`` = (plan, state) from a ``save_fwd`` forward skips the recompute."""
+    if saved is None:
+        plan = _fused_plan(x, w, ops, lower_bound)
+        s = _fused_saved_fwd(x, w, H, chunk_size, eps, plan, lower_bound, cu_seqlens)
+    else:
+        plan, s = saved
+    LAST_PIECES["recompute"] = "no (save_fwd)" if saved is not None else "yes"
+    chunk_impl, fuses, conv_kernel, rms_bwd = plan
     B, T, D = x.shape
     xc, cd = s["xc"], s["cd"]
     dyc = dy.reshape(B * T, D).to(cd)
@@ -1026,9 +1116,19 @@ class _KDALayerFused(torch.autograd.Function):
         ctx.save_for_backward(x, *ws)
         ctx.cfg = (num_heads, chunk_size, eps)
         ctx.lower_bound, ctx.cu_seqlens = lower_bound, cu_seqlens
+        w = KDALayerWeights.from_tensors(ws)
+        ctx.saved_state = None
+        if _fusion_on("save_fwd"):
+            plan = _fused_plan(x, w, _row_ops(x), lower_bound)
+            s = _fused_saved_fwd(
+                x, w, num_heads, chunk_size, eps, plan, lower_bound, cu_seqlens
+            )
+            ctx.saved_state = (plan, s)
+            B, T, D = x.shape
+            return _mm(s["on"], w.w_o.t(), s["cd"]).view(B, T, D).to(x.dtype)
         y, _ = _kda_layer_fused_fwd(
             x,
-            KDALayerWeights.from_tensors(ws),
+            w,
             num_heads,
             chunk_size,
             eps,
@@ -1049,7 +1149,9 @@ class _KDALayerFused(torch.autograd.Function):
             _row_ops(x),
             lower_bound=ctx.lower_bound,
             cu_seqlens=ctx.cu_seqlens,
+            saved=ctx.saved_state,
         )
+        ctx.saved_state = None
         return (dx, None, None, None, None, None, *dw.tensors())
 
 

@@ -649,6 +649,14 @@ def main():
         help="stages to run on FlyDSL one at a time (the rest on Triton);\n"
         "a bare -p means all of them",
     )
+    parser.add_argument(
+        "-f",
+        "--fusions",
+        nargs="*",
+        default=["default"],
+        help="fusion combos for the block table, AITER_KDA_FUSIONS syntax;\n"
+        "e.g. -f default save_fwd=1 save_fwd=1,concat_proj=1",
+    )
     args = parser.parse_args()
     # argparse turns a bare `-p` (nargs="*") into [], which would sweep nothing
     if not args.pieces:
@@ -689,15 +697,32 @@ def main():
             ],
             layer_axes,
         )
-        summarize(
-            "kda block fwd+bwd summary",
-            [
-                test_kda_block(b, t, nseq, d, h, k, w, r, c, lb, dtype)
+        block_rows = []
+        for combo in args.fusions:
+            spec = (
+                {}
+                if combo == "default"
+                else dict(item.split("=", 1) for item in combo.split(",") if item)
+            )
+            kda_fused_layer.set_kda_fusions(**spec)
+            try:
                 for (b, t, nseq), (d, h, k, w, r), c, lb in itertools.product(
                     args.block, args.shape, args.chunk, args.gate_lb
-                )
-            ],
-            {"block": args.block, "shape": args.shape, "chunk": args.chunk},
+                ):
+                    row = test_kda_block(b, t, nseq, d, h, k, w, r, c, lb, dtype)
+                    row["fusion combo"] = combo
+                    block_rows.append(row)
+            finally:
+                kda_fused_layer.set_kda_fusions(**dict.fromkeys(spec))
+        summarize(
+            "kda block fwd+bwd summary",
+            block_rows,
+            {
+                "block": args.block,
+                "shape": args.shape,
+                "chunk": args.chunk,
+                "fusions": args.fusions,
+            },
         )
         df = summarize(
             "kda per-piece flydsl summary",
