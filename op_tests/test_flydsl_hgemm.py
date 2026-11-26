@@ -851,6 +851,85 @@ def test_hgemm_tuned_strides(m, n, k, dtype, layout):
     return ret
 
 
+# HTI tiles of the C-store bit-exactness check. The kernel's two wave rows
+# run one barrier apart through the unsplit store, which reads back only the
+# C rows a row wrote itself when block_threads * vec == 32 * (block_n / 2):
+# 256x256 w2x4 bf16 does, 64x256 w2x2 bf16 (a tuned row) and fp32 C do not.
+_HTI_STORE_TILES = {
+    "256x256_w2x4": {"block_m": 256, "block_n": 256, "m_waves": 2, "n_waves": 4},
+    "64x256_w2x2": {"block_m": 64, "block_n": 256, "m_waves": 2, "n_waves": 2},
+    "128x128_w2x2": {"block_m": 128, "block_n": 128, "m_waves": 2, "n_waves": 2},
+}
+_HTI_STORE_MNK = (2048, 2048, 512)
+# a race shows in some launches only
+_HTI_STORE_LAUNCHES = 20
+
+
+@benchmark()
+def test_hgemm_hti_store_exact(m, n, k, layout, out_dtype, tile):
+    """Plain gemm_a16w16 on the HTI kernel, bit-exact on every launch.
+
+    Integer inputs in [-2, 2] make every sum exact in fp32 (and one rounding
+    in bf16), so each launch must equal the exact result; the output is
+    NaN-filled before each, so a C element read before it was written fails.
+    """
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        gemm_a16w16 as gemm_a16w16_gfx950,
+    )
+
+    torch.manual_seed(SEED)
+    if layout[0] == "t":
+        a = torch.randint(-2, 3, (k, m)).to(dtypes.bf16).t()
+    else:
+        a = torch.randint(-2, 3, (m, k)).to(dtypes.bf16)
+    if layout[1] == "t":
+        b = torch.randint(-2, 3, (n, k)).to(dtypes.bf16).t()
+    else:
+        b = torch.randint(-2, 3, (k, n)).to(dtypes.bf16)
+    exact = (a.float() @ b.float()).to(out_dtype)
+    config = {
+        "block_k": 64,
+        "stages": 2,
+        "split_k": 1,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": True,
+        **_HTI_STORE_TILES[tile],
+    }
+    out = torch.full((m, n), float("nan"), dtype=out_dtype)
+
+    def run():
+        return gemm_a16w16_gfx950(
+            a, b, out=out, user_kwargs=dict(config), layout=layout, out_dtype=out_dtype
+        )
+
+    ret = {"gfx": get_gfx_runtime()}
+    try:
+        run()
+    except (AssertionError, ValueError) as err:
+        # a tile the kernel rejects (C does not fit in LDS) is not a failure
+        ret["skipped"] = str(err)[:60]
+        return ret
+    bad_launches, worst = 0, 0.0
+    for _ in range(_HTI_STORE_LAUNCHES):
+        out.fill_(float("nan"))
+        run()
+        bad = (out != exact).float().mean().item()
+        bad_launches += bad > 0
+        worst = max(worst, bad)
+    _, us = run_perftest(run, num_iters=10, num_warmup=1)
+    ret["us"] = us
+    ret["TFLOPS"] = 2 * m * n * k / us / 1e6
+    ret["TB/s"] = ((m * k + n * k) * 2 + m * n * out.element_size()) / us / 1e6
+    ret["err"] = worst
+    ret["bad launches"] = f"{bad_launches}/{_HTI_STORE_LAUNCHES}"
+    assert bad_launches == 0, (
+        f"HTI {tile} {layout} -> {out_dtype}: {bad_launches} of "
+        f"{_HTI_STORE_LAUNCHES} launches wrong, worst {worst:.2%} of elements"
+    )
+    return ret
+
+
 def check_band_rejects():
     config = band_stream_config(16, 18432, 1536)
     config.pop("use_half_tile_interleaved")
@@ -1517,6 +1596,16 @@ def main():
             )
         ],
     )
+    if get_gfx_runtime() == "gfx950":
+        summarize(
+            "HTI C store bit-exactness",
+            [
+                test_hgemm_hti_store_exact(*_HTI_STORE_MNK, layout, out_dtype, tile)
+                for layout, out_dtype, tile in itertools.product(
+                    ("nt", "tn"), (dtypes.bf16, dtypes.fp32), _HTI_STORE_TILES
+                )
+            ],
+        )
     check_band_rejects()
     check_hgemm_memory_options()
     check_skinny_rejects()
