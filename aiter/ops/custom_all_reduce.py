@@ -744,3 +744,43 @@ def launch_fused_allreduce_mhc_post_split(
         reg_ptr=reg_ptr,
         reg_bytes=reg_bytes,
     )
+
+
+# ---- gfx1250 pushed two-shot all-reduce + residual add + RMSNorm (prefill sizes) ----
+# Every rank allocates ar2s_rms_buffer_size_gfx1250 data bytes and
+# ar2s_rms_flags_size_gfx1250 flag bytes (cached, IPC), maps every rank's
+# buffers, calls init_ar2s_rms_gfx1250 once and barriers before the first call.
+AR2S_MD_NAME = "module_ar_2shot_rms_gfx1250"
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_buffer_size", develop=True)
+def ar2s_rms_buffer_size_gfx1250(world_size: int, max_bytes: int) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_flags_size", develop=True)
+def ar2s_rms_flags_size_gfx1250() -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="init_ar2s_rms", develop=True)
+def init_ar2s_rms_gfx1250(
+    rank: int, data_ptrs: list[int], flag_ptrs: list[int], max_bytes: int, grid: int
+) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms_max_rows", develop=True)
+def ar2s_rms_max_rows_gfx1250(ctx: int, hidden: int) -> int: ...
+
+
+@compile_ops(AR2S_MD_NAME, fc_name="ar2s_rms", develop=True)
+def ar2s_rms_gfx1250(
+    ctx: int,
+    inp: int,
+    res_inp: int,
+    w: int,
+    out: int,
+    res_out: int,
+    rows: int,
+    hidden: int,
+    eps: float,
+    gemma_norm: bool,
+) -> None: ...

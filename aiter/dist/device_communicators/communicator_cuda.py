@@ -81,6 +81,15 @@ def _gluon_ar_norm(comm, input_, res_inp_, weight_, eps, gemma_norm, quant):
     )
 
 
+# gfx1250: fused_allreduce_rmsnorm takes the pushed two-shot AR + RMSNorm
+# (CustomAllreduce.ar2s_fused_ar_rms) for inputs in this byte range, where RCCL +
+# a separate norm ran. Hidden 6144 bf16, TP4, 4x MI455X: 1.3-1.9x faster than
+# RCCL + norm above 32 MiB (below, a Lamport two-shot + split norm is level or
+# ahead); RCCL + norm wins from 384 MiB (624.6 vs 686.2 us).
+_AR2S_RMS_MIN_BYTES = (32 << 20) + 1
+_AR2S_RMS_MAX_TOTAL_BYTES = 288 << 20
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
     _ar_1stage_override = {"1": True, "0": False}.get(
@@ -456,6 +465,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 *self.gluon_ar,
             )
         ca_comm = self.ca_comm
+        if (
+            _AR2S_RMS_MIN_BYTES <= total_bytes <= _AR2S_RMS_MAX_TOTAL_BYTES
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and ca_comm is not None
+            and ca_comm.should_ar2s_rms(input_, res_inp_, weight_, _AR2S_RMS_MIN_BYTES)
+        ):
+            return ca_comm.ar2s_fused_ar_rms(input_, res_inp_, weight_, eps, gemma_norm)
         # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
         # it beats the routes below up to its size cap (see
         # _LAMPORT_AR_RMS_MAX_BYTES).

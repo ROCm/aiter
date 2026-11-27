@@ -288,6 +288,12 @@ _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 # gfx1250, CUDA graphs, bf16 and fp16 alike). Unmeasured world sizes take the
 # one-shot up to the cap, as the other Lamport ops do.
 _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
+# gfx1250 pushed two-shot AR + residual add + RMSNorm (ar2s_rms_gfx1250), by world
+# size: the largest input one launch takes (larger inputs are split by rows into
+# balanced launches; the per-rank inbox is twice this). Only TP4 is measured, so
+# only TP4 takes it: 160 MiB holds 12288 tokens of hidden 6144, 246 us against
+# 289 us in two launches (4x MI455X).
+_AR2S_RMS_MAX_BYTES = {4: 160 * 1024 * 1024}
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -1363,6 +1369,9 @@ class CustomAllreduce:
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         # Lamport fused AR + RMSNorm size cap; 0 until its inbox is set up.
         self._lamport_max_bytes = 0
+        # pushed two-shot AR + RMSNorm (gfx1250): context, 0 until set up
+        self._ar2s_ctx = 0
+        self._ar2s_max_rows = {}
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
@@ -2115,6 +2124,7 @@ class CustomAllreduce:
         )
         if self._is_gfx1250:
             self._init_lamport_ar_rms(world_size)
+            self._init_ar2s_rms(world_size)
         else:
             self._initLamport(world_size)
 
@@ -2156,6 +2166,105 @@ class CustomAllreduce:
             max_bytes,
             size,
         )
+
+    def _init_ar2s_rms(self, world_size: int):
+        """Set up the pushed two-shot AR + RMSNorm (gfx1250, IPC transport):
+        an RS + AG inbox of 2 x the per-launch cap and a flag buffer, both
+        cached raw memory. The cap must be the same on every rank."""
+        max_bytes = _AR2S_RMS_MAX_BYTES.get(world_size, 0)
+        if max_bytes <= 0:
+            return
+        _COARSE_GRAIN = 2 * 1024 * 1024
+
+        def rnd(n):
+            return (n + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+
+        self._pool.create(
+            "ar2s",
+            rnd(ops.ar2s_rms_buffer_size_gfx1250(world_size, max_bytes)),
+            raw_cached=True,
+        )
+        self._pool.create(
+            "ar2s_flags", rnd(ops.ar2s_rms_flags_size_gfx1250()), raw_cached=True
+        )
+        data_ptrs = self._pool.open_peer_buffers("ar2s")
+        flag_ptrs = self._pool.open_peer_buffers("ar2s_flags")
+        # two blocks a CU: a row a block, a block waits only for its peers' twin
+        grid = 2 * torch.cuda.get_device_properties(self.device).multi_processor_count
+        self._ar2s_ctx = ops.init_ar2s_rms_gfx1250(
+            self.rank, data_ptrs, flag_ptrs, max_bytes, grid
+        )
+        # every rank's flag buffer is clear before any rank's first push
+        dist.barrier(group=self.group)
+        logger.info(
+            "Custom allreduce gfx1250 two-shot AR + RMSNorm: up to %d bytes a launch",
+            max_bytes,
+        )
+
+    def should_ar2s_rms(
+        self, inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, min_bytes: int
+    ) -> bool:
+        """Whether ar2s_fused_ar_rms takes this call: bf16, contiguous, a hidden
+        of whole 256-element groups up to 8192, at least min_bytes. Shapes,
+        dtypes and sizes only, so every rank decides the same."""
+        if self.disabled or not self._ar2s_ctx:
+            return False
+        hidden = w.numel()
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype == torch.bfloat16
+            and res_inp.dtype == w.dtype == inp.dtype
+            and inp.dim() == 2
+            and inp.shape[-1] == res_inp.shape[-1] == hidden
+            and res_inp.shape == inp.shape
+            and inp.is_contiguous()
+            and res_inp.is_contiguous()
+            and w.is_contiguous()
+            and hidden % 256 == 0
+            and hidden <= 8192
+            and nbytes >= min_bytes
+        )
+
+    def ar2s_fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pushed two-shot all-reduce + residual add + RMSNorm. Returns (out,
+        residual_out). Rows beyond one launch's inbox are split into balanced
+        launches. Runs the same eager and in a captured graph."""
+        rows, hidden = inp.shape
+        inp = _lamport_aligned(inp)
+        res_inp = _lamport_aligned(res_inp)
+        w = _lamport_aligned(w)
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        mr = self._ar2s_max_rows.get(hidden)
+        if mr is None:
+            mr = self._ar2s_max_rows[hidden] = ops.ar2s_rms_max_rows_gfx1250(
+                self._ar2s_ctx, hidden
+            )
+        n_launch = -(-rows // mr)
+        step = -(-rows // n_launch)
+        # 16-byte aligned sub-launches: hidden is a multiple of 256
+        for s in range(0, rows, step):
+            e = min(rows, s + step)
+            ops.ar2s_rms_gfx1250(
+                self._ar2s_ctx,
+                inp[s:e].data_ptr(),
+                res_inp[s:e].data_ptr(),
+                w.data_ptr(),
+                out[s:e].data_ptr(),
+                res_out[s:e].data_ptr(),
+                e - s,
+                hidden,
+                eps,
+                gemma_norm,
+            )
+        return out, res_out
 
     # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
     # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above
