@@ -16,7 +16,11 @@ struct PlanArgs {
 #if defined(COMPACT_PLAN)
 extern "C" __global__ void opus_gemm_gfx950_bf16_latent_moe_bwd_plan(PlanArgs a) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= a.experts) return;
+    if (e >= a.experts) {
+        // The final workgroup pair may have no second expert.
+        if (e == a.experts && (e & 1)) a.table[e] = {-1, 0, 0, 0};
+        return;
+    }
     const int first = a.offsets[e], rows = a.offsets[e+1] - first;
     a.counts[e] = rows;
     a.table[e] = {e, first, rows, 1 << 16};

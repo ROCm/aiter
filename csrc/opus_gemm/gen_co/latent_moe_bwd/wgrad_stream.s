@@ -311,6 +311,12 @@
     s_endpgm
     .incbin "body.bin", 15992, 4488
 .Lrecord:
+    // Adjacent workgroups visit the same output tile in a pair of experts.
+    s_and_b32 s4, s2, 1
+    s_lshr_b32 s5, s2, 1
+    s_lshl_b32 s6, s3, 1
+    s_add_u32 s3, s6, s4
+    s_mov_b32 s2, s5
     s_load_dwordx2 s[4:5], s[0:1], 0x20
     s_lshl_b32 s6, s3, 4
     s_waitcnt lgkmcnt(0)
@@ -318,6 +324,8 @@
     s_waitcnt lgkmcnt(0)
     s_cmp_eq_u32 s10, 0
     s_cbranch_scc0 .Lactive
+    s_cmp_lt_i32 s8, 0
+    s_cbranch_scc1 .Ldone
     s_load_dwordx2 s[4:5], s[0:1], 0x10
     s_mul_i32 s6, s8, 0x2a00000
     s_mul_hi_u32 s7, s8, 0x2a00000
@@ -336,6 +344,7 @@
     global_store_dwordx4 v6, v[2:5], s[4:5] sc0 sc1
     v_add_u32_e32 v6, 0x1000, v6
     .endr
+.Ldone:
     s_endpgm
 .Lactive:
     s_mul_i32 s6, s3, 168

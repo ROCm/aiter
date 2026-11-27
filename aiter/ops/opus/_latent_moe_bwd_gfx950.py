@@ -97,7 +97,8 @@ def backward(x, weight, dy, offsets):
         return dx, dw
 
     counts = torch.empty(e, dtype=torch.int32, device=x.device)
-    table = torch.empty((e, 4), dtype=torch.int32, device=x.device)
+    expert_pairs = (e + 1) // 2
+    table = torch.empty((2 * expert_pairs, 4), dtype=torch.int32, device=x.device)
     plan = _PlanArgs(offsets.data_ptr(), counts.data_ptr(), table.data_ptr(), e)
     launch(_PLAN, ((e + 255) // 256, 1, 1), 256, plan)
 
@@ -136,6 +137,6 @@ def backward(x, weight, dy, offsets):
         1,
     )
     tiles = columns * (n // 256)
-    launch(_TN + "_stream", (tiles, e, 1), 256, tn)
+    launch(_TN + "_stream", (2 * tiles, expert_pairs, 1), 256, tn)
     launch(_NN + "_compact", (columns * capacity, 1, 1), 256, nn)
     return dx, dw
