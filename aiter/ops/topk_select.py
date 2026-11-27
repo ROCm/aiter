@@ -1245,6 +1245,19 @@ def topk_select(
             DeepSelect does, and lets every backend run. ``'low'`` and ``'high'``
             promise the smallest or largest column and restrict the backend set,
             which can cost up to 1.9x. Either implies ``deterministic``.
+
+            ``'high'`` is served by ``small_k``, but the column-aware tie-break
+            that actually returns the larger tied column lives only in its
+            one-wave k=16 build (gfx950, width <= 8192). For ``k != 16``, a
+            non-gfx950 part, or width > 8192, ``small_k`` falls through to its
+            chunked build, which keeps the right multiset of scores but drops
+            tied chunks by lane id, so the tied column it returns is not
+            guaranteed to be the largest. The selected *set* of scores is the
+            same either way; only which equal-scored column is kept can differ.
+            On those same one-wave shapes ``small_k`` also ranks NaN lowest (an
+            accepted divergence from the ``nan_high`` order the other backends
+            document): a NaN-scored entry is never pulled ahead of a valid one,
+            and is selected only when fewer than ``k`` valid entries exist.
         deterministic: the *set* of selected columns is a function of the row
             alone -- the same input selects the same columns on every call, and a
             row selects the same columns wherever it sits in the batch. The order
