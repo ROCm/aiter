@@ -3,6 +3,7 @@
 
 import functools
 import importlib.util
+import os
 import re
 
 import pandas as pd
@@ -12,7 +13,12 @@ from torch import Tensor
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
+from ..jit.core import (
+    AITER_CONFIGS,
+    AITER_LOG_TUNED_CONFIG,
+    compile_ops,
+    get_asm_dir,
+)
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_cu_num
@@ -44,6 +50,97 @@ def _log_a4w4_fallback(m, n, k, dtype, selected, fallback):
         dtype,
         selected,
         fallback or "default ASM",
+    )
+
+
+# Shape legality of the gfx950 preshuffled a4w4 CK and ASM kernels. The a4w4 tuner
+# (gemm_a4w4_blockscale_tune.py) and gemm_a4w4 below share these rules, so a candidate
+# the tuner skips is never selected at run time.
+_CK_A4W4_NAME = re.compile(r"a4w4_blockscale_(\d+)x(\d+)x(\d+)x(\d+)_")
+
+
+def a4w4_ck_shape_legal(
+    N: int, K: int, n_per_block: int, log2_k_split: int = 0
+) -> bool:
+    """Whether a CK a4w4 instance with this N tile can run (N, K).
+
+    The instances use GemmSpecialization::Default and a preshuffled B (MFMA layout):
+    CK checks neither N % NPerBlock nor N padding for that layout, so the last N tile
+    reads rows past the end of B whenever N % NPerBlock != 0. Whether that read faults
+    depends on what follows B in memory, so this predicate only rejects the tile wider
+    than N (N < NPerBlock, the N=96 tuner fault). Known gap: a partial last tile at
+    N >= NPerBlock still over-reads (an isolated probe faulted every instance at
+    N=192, K=5120, and ran N=224, 288, 800 and 7168 correctly), and the committed rows
+    with N % NPerBlock != 0 (N >= 5120) rely on that slack. B is preshuffled in
+    16-row groups (N % 16), and CK requires K % (KBatch * 256), where 256 is the
+    instance K tile in elements and KBatch = 2 ** log2_k_split.
+    """
+    return N % 16 == 0 and N >= n_per_block and K % (256 << log2_k_split) == 0
+
+
+def a4w4_asm_shape_legal(
+    N: int, K: int, tile_n: int, full_n_tile: bool, log2_k_split: int = 0
+) -> bool:
+    """Whether an ASM f4gemm kernel with this N tile can run (N, K).
+
+    N % 16 and K % 64 are what the launcher requires (ps_supported), and K must split
+    into 2 ** log2_k_split slices. A kernel flagged full_n_tile in
+    hsa/<arch>/f4gemm/f4gemm_bf16_per1x32Fp4.csv gives wrong results for a partial last
+    N tile, so it needs N % tile_n == 0 (gfx950: 192x256 and 224x256). The other
+    kernels handle N < tile_n (measured on gfx950 for N = 32..1536).
+    """
+    return (
+        N % 16 == 0
+        and K % 64 == 0
+        and K % (1 << log2_k_split) == 0
+        and (not full_n_tile or N % tile_n == 0)
+    )
+
+
+@functools.lru_cache(maxsize=4)
+def f4gemm_asm_kernels(csv_path: str | None = None) -> dict:
+    """{knl_name: (tile_N, full_n_tile)} of the f4gemm kernel table of this arch."""
+    path = csv_path or os.path.join(
+        get_asm_dir(), "f4gemm", "f4gemm_bf16_per1x32Fp4.csv"
+    )
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_csv(path, comment="#")
+    full = df["full_n_tile"] if "full_n_tile" in df.columns else [0] * len(df)
+    return {
+        str(name): (int(tile_n), bool(flag))
+        for name, tile_n, flag in zip(df["knl_name"], df["tile_N"], full)
+    }
+
+
+def a4w4_kernel_shape_legal(
+    kernel_name: str,
+    N: int,
+    K: int,
+    log2_k_split: int = 0,
+    asm_csv: str | None = None,
+) -> bool:
+    """Shape legality of a CSV kernelName; names that are not CK or ASM (Triton, FlyDSL,
+    empty) and unknown ASM names pass, they are checked where they launch."""
+    name = str(kernel_name)
+    if name.startswith("_ZN"):
+        meta = f4gemm_asm_kernels(asm_csv).get(name)
+        return meta is None or a4w4_asm_shape_legal(N, K, *meta, log2_k_split)
+    match = _CK_A4W4_NAME.match(name)
+    if match is None:
+        return True
+    return a4w4_ck_shape_legal(N, K, int(match.group(3)), log2_k_split)
+
+
+@functools.lru_cache(maxsize=1024)
+def _warn_a4w4_skipped(n, k, selected, reason):
+    logger.warning(
+        "gemm_a4w4 N:%s K:%s: not using configured kernel %s (%s); "
+        "using the default ASM selection",
+        n,
+        k,
+        selected,
+        reason,
     )
 
 
@@ -537,6 +634,14 @@ def gemm_a4w4(
                 m, n, k, dtype, ck_config["kernelName"], fallback["kernelName"]
             )
         ck_config = fallback
+    if ck_config is not None:
+        split = ck_config.get("splitK", 0)
+        split = 0 if split is None or pd.isna(split) else int(split)
+        if not a4w4_kernel_shape_legal(ck_config["kernelName"], n, k, split):
+            _warn_a4w4_skipped(
+                n, k, ck_config["kernelName"], "illegal for this N and K"
+            )
+            ck_config = None
     # splitK = None
     splitK = 0
     kernelName = ""
@@ -550,15 +655,23 @@ def gemm_a4w4(
         # or bias is None
     ):
         splitK = 0 if splitK is None else splitK
-        return gemm_a4w4_blockscale(
-            A.view(m, k // 2),
-            B,
-            A_scale,
-            B_scale,
-            out,
-            splitK=splitK,
-            kernelName=kernelName,
-        )[:m]
+        try:
+            return gemm_a4w4_blockscale(
+                A.view(m, k // 2),
+                B,
+                A_scale,
+                B_scale,
+                out,
+                splitK=splitK,
+                kernelName=kernelName,
+            )[:m]
+        except RuntimeError as e:
+            # The prebuilt module only holds the CK instances of the wheel-time tuned
+            # file; a CK row tuned later names an instance that was not compiled.
+            if "not present in the compiled registry" not in str(e):
+                raise
+            _warn_a4w4_skipped(n, k, kernelName, "not compiled into this build")
+            splitK, kernelName = 0, ""
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
