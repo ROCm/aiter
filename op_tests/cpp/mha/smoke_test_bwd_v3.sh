@@ -237,6 +237,25 @@ run_gfx950_swa_tests() {
     done
 }
 
+# gfx1250 hdim 256 kernels: bf16, atomic32, no mask or bottom-right causal. -init=0, because at the
+# default init most of their dQ/dK/dV values are below the bf16 atol and a halved dQ can still pass.
+run_gfx1250_hd256_bwd_v3() {
+    for mode in 0 1 ; do
+    for perm in 0 1 ; do
+    for mask in 0 "b" ; do
+    for sq in 65 256 301 ; do
+    for sk in 63 256 700 ; do
+
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=256 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=1 -init=0 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=3 -d=256 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=1 -init=0 -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+}
+
 # usage: smoke_test_bwd_v3.sh [arch], arch defaults to the gfx target of the first GPU
 ARCH=${1:-$(rocminfo 2>/dev/null | grep -m1 -oE "gfx[0-9a-f]+")}
 case "$ARCH" in
@@ -252,8 +271,11 @@ case "$ARCH" in
         run_gfx950_hd192_128_bwd_v3
         run_gfx950_swa_tests
         ;;
+    gfx1250)
+        run_gfx1250_hd256_bwd_v3
+        ;;
     *)
-        echo "unsupported arch '$ARCH', expected gfx942 or gfx950"
+        echo "unsupported arch '$ARCH', expected gfx942, gfx950 or gfx1250"
         exit 1
         ;;
 esac

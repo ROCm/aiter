@@ -139,9 +139,7 @@ def get_gfx_runtime() -> str:
 
             if torch.version.hip is None or not torch.cuda.is_available():
                 raise
-            gfx_arch = (
-                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-            )
+            gfx_arch = get_gfx_runtime_for_device(0)
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -149,6 +147,18 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+def get_gfx_runtime_for_device(device=None) -> str:
+    """Return the selected Torch device's exact runtime architecture.
+
+    None (or an unindexed CUDA device) follows the current device each call,
+    so this query must not use the node-wide get_gfx_runtime cache. Device
+    errors propagate. Build-time GPU_ARCHS does not affect this query.
+    """
+    import torch
+
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0].lower()
 
 
 def _parse_asic_revision(value: str) -> int:

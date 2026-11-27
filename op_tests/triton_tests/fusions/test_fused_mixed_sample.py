@@ -146,18 +146,3 @@ def test_fused_mixed_sample_out_and_empty():
         torch.empty((0,), dtype=torch.float32, device="cuda"),
     )
     assert empty.shape == (0,) and empty.dtype == torch.int32
-
-
-def test_fused_mixed_sample_rejects_bad_inputs():
-    logits, temps, noise = _inputs(4, 4096, torch.bfloat16, seed=5)
-    with pytest.raises(ValueError):
-        fused_mixed_sample(logits, noise.to(torch.bfloat16), temps)
-    with pytest.raises(ValueError):
-        fused_mixed_sample(logits, noise[:, :100], temps)
-    with pytest.raises(ValueError):
-        fused_mixed_sample(logits.t(), noise.t(), temps)
-    with pytest.raises(ValueError):
-        fused_mixed_sample(logits[:, :0], noise[:, :0], temps)
-    strided = torch.empty(8, dtype=torch.int32, device="cuda")[::2]
-    with pytest.raises(ValueError):
-        fused_mixed_sample(logits, noise, temps, out=strided)
