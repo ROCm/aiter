@@ -1356,6 +1356,108 @@ def check_tdm_contracts(dtype):
         )
 
 
+def check_tdm_swiglu(dtype):
+    """The fused SwiGLU epilogue must match running the GEMM and SwiGLU apart.
+
+    ``swiglu_col`` splits B's columns into a plain block and (gate, up) pairs,
+    so the plain block has to stay bit-identical to the unfused GEMM, and the
+    activated block has to match ``silu(gate) * up`` of those same rounded
+    products. ``swiglu_col == 0`` activates every column.
+    """
+    from aiter.ops.flydsl import flydsl_gemm_a16w16_tdm as gemm
+
+    m, k, plain, pairs = 256, 512, 256, 256
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=dtype) / k**0.5
+    w = torch.randn(plain + 2 * pairs, k, device="cuda", dtype=dtype) / k**0.5
+    # (gate, up) pairs, the layout the epilogue reads, from [... | gate | up]
+    interleaved = w.clone()
+    interleaved[plain:] = torch.stack(
+        (w[plain : plain + pairs], w[plain + pairs :]), dim=1
+    ).flatten(0, 1)
+    cfg = {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 128,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "interleave": True,
+    }
+    reference = gemm(a, w.t(), **cfg)
+    expected = (
+        torch.nn.functional.silu(reference[:, plain : plain + pairs].float())
+        * reference[:, plain + pairs :].float()
+    )
+
+    out = torch.empty(m, plain, device="cuda", dtype=dtype)
+    activated = torch.empty(m, pairs, device="cuda", dtype=dtype)
+    gemm(a, interleaved.t(), out, swiglu_col=plain, out2=activated, **cfg)
+    assert torch.equal(out, reference[:, :plain]), "swiglu changed the plain columns"
+    assert (
+        checkAllclose(
+            expected,
+            activated.float(),
+            # one BF16 ulp: the epilogue's exp2/rcp sigmoid is not torch's
+            atol=2**-7,
+            rtol=2**-7,
+            msg="fused swiglu epilogue",
+        )
+        == 0
+    )
+
+    all_activated = torch.empty(m, pairs, device="cuda", dtype=dtype)
+    gemm(a, interleaved[plain:].t(), swiglu_col=0, out2=all_activated, **cfg)
+    assert torch.equal(all_activated, activated), "swiglu_col 0 disagrees with a split"
+
+    calls = {
+        "no out2": lambda: gemm(a, interleaved.t(), out, swiglu_col=plain, **cfg),
+        "out at swiglu_col 0": lambda: gemm(
+            a, interleaved[plain:].t(), out, swiglu_col=0, out2=all_activated, **cfg
+        ),
+        "out2 without swiglu_col": lambda: gemm(
+            a, w.t(), out, out2=all_activated, **cfg
+        ),
+        "partial N tile": lambda: gemm(
+            a, interleaved[:-2].t(), out, swiglu_col=plain, out2=activated, **cfg
+        ),
+        "swiglu_col off the tile grid": lambda: gemm(
+            a, interleaved.t(), out, swiglu_col=plain + 2, out2=activated, **cfg
+        ),
+        "swiglu without interleave": lambda: gemm(
+            a,
+            interleaved.t(),
+            out,
+            swiglu_col=plain,
+            out2=activated,
+            **{**cfg, "interleave": False},
+        ),
+        "swiglu with split-K": lambda: gemm(
+            a,
+            interleaved.t(),
+            out,
+            swiglu_col=plain,
+            out2=activated,
+            **{**cfg, "split_k": 2},
+        ),
+        "swiglu with bias": lambda: gemm(
+            a,
+            interleaved.t(),
+            out,
+            torch.zeros(plain + 2 * pairs, device="cuda", dtype=dtype),
+            swiglu_col=plain,
+            out2=activated,
+            **cfg,
+        ),
+    }
+    for reason, call in calls.items():
+        try:
+            call()
+        except (ValueError, RuntimeError):
+            continue
+        raise AssertionError(f"TDM swiglu accepted {reason}")
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1450,6 +1552,7 @@ def main():
             ]
             summarize(f"TDM tuned dispatch {dtype}", dispatch_rows)
             check_tdm_contracts(dtype)
+            check_tdm_swiglu(dtype)
         return
     torch.set_default_device("cuda")
     wanted = set(args.mnk)

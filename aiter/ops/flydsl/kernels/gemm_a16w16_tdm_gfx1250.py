@@ -10,6 +10,7 @@ from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
+from .act import silu_mul_batch
 from .gemm_a16w16_gfx950_utils import BlockSwizzle
 
 WAVE_SIZE = 32
@@ -193,10 +194,11 @@ def make_gemm_a16w16_gfx1250_kernel_name(
     split_k,
     interleave=False,
     split_k_atomic=False,
+    swiglu=False,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
-    return f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}{('_interleave' if interleave else '')}{('_atomic' if split_k_atomic else '')}"
+    return f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}{('_interleave' if interleave else '')}{('_atomic' if split_k_atomic else '')}{('_swiglu' if swiglu else '')}"
 
 
 @functools.lru_cache(maxsize=128)
@@ -218,7 +220,14 @@ def build_gemm_gfx1250(
     interleave: bool = False,
     split_k_atomic: bool = False,
     device_id: int = 0,
+    swiglu: bool = False,
 ):
+    # swiglu: N columns from swiglu_col on are (gate, up) pairs; those tiles store
+    # silu(gate) * up, half as wide, to out2 instead of out.
+    if swiglu and not (
+        interleave and split_k == 1 and not has_bias and block_n % 32 == 0
+    ):
+        raise ValueError("swiglu needs interleave, split_k == 1 and no bias")
     # device_id participates in this cached factory's identity: a compiled
     # HIP module cannot be reused by a different device in the same process.
     elem_dtype = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(
@@ -285,6 +294,9 @@ def build_gemm_gfx1250(
         a_leading_stride: fx.Int32,
         b_leading_stride: fx.Int32,
         c_leading_stride: fx.Int32,
+        out2: fx.Pointer,
+        c2_leading_stride: fx.Int32,
+        swiglu_col: fx.Int32,
     ):
         rocdl.disable_xdl_arb_stall()
         tid = fx.thread_idx.x
@@ -825,19 +837,55 @@ def build_gemm_gfx1250(
                     )
                     for ni in range_constexpr(n_steps)
                 ]
-            for mi in range_constexpr(m_steps):
-                for ni in range_constexpr(n_steps):
-                    row = wave_row + mi * mma_m + lane % 16
-                    col = wave_col + ni * mma_n + lane // 16 * acc_elems
-                    values = accumulators[mi * n_steps + ni].load()
-                    values = values.to(out_dtype)
-                    if const_expr(has_bias and split_k == 1):
+
+            def stage_plain_outputs():
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane % 16
+                        col = wave_col + ni * mma_n + lane // 16 * acc_elems
+                        values = accumulators[mi * n_steps + ni].load()
+                        values = values.to(out_dtype)
+                        if const_expr(has_bias and split_k == 1):
+                            values = (
+                                values.to(fx.Float32)
+                                + bias_fragments[ni].to(fx.Float32)
+                            ).to(out_dtype)
+                        fx.make_view(
+                            shared_out + row * c_pitch + col,
+                            fx.make_layout(acc_elems, 1),
+                        ).store(values)
+
+            def stage_swiglu_outputs():
+                pairs = acc_elems // 2
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane % 16
+                        col = (wave_col + ni * mma_n) // 2 + lane // 16 * pairs
+                        # Round to the output dtype first: the unfused reference
+                        # applies SwiGLU to the rounded projection.
                         values = (
-                            values.to(fx.Float32) + bias_fragments[ni].to(fx.Float32)
-                        ).to(out_dtype)
-                    fx.make_view(
-                        shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
-                    ).store(values)
+                            accumulators[mi * n_steps + ni]
+                            .load()
+                            .to(out_dtype)
+                            .to(fx.Float32)
+                        )
+                        activated = silu_mul_batch(
+                            [values[2 * i] for i in range_constexpr(pairs)],
+                            [values[2 * i + 1] for i in range_constexpr(pairs)],
+                        )
+                        fx.make_view(
+                            shared_out + row * c_pitch + col, fx.make_layout(pairs, 1)
+                        ).store(
+                            fx.Vector.from_elements(activated, fx.Float32).to(out_dtype)
+                        )
+
+            if const_expr(swiglu):
+                if col_start >= swiglu_col:
+                    stage_swiglu_outputs()
+                else:
+                    stage_plain_outputs()
+            else:
+                stage_plain_outputs()
         else:
             for mi in range_constexpr(m_steps):
                 for ni in range_constexpr(n_steps):
@@ -971,29 +1019,46 @@ def build_gemm_gfx1250(
                                     ).store(values)
         elif const_expr(interleave and split_k == 1):
             c_tile = (block_m, c_pitch)
-            atom_c, coords_c = tdm_operand(
-                out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
-                (
-                    fx.max(0, fx.min(block_m, m - row_start)),
-                    fx.max(0, fx.min(block_n, n - col_start)),
-                ),
-                (c_leading_stride, 1),
-                c_tile,
-                (c_pitch, 1),
-                store=True,
+
+            def store_tile(destination, columns, leading_stride):
+                atom_c, coords_c = tdm_operand(
+                    destination,
+                    (fx.max(0, fx.min(block_m, m - row_start)), columns),
+                    (leading_stride, 1),
+                    c_tile,
+                    (c_pitch, 1),
+                    store=True,
+                )
+                shared_c = fx.make_view(
+                    shared_out,
+                    fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
+                )
+                src, dst = rocdl.cdna5.tdm_partition(
+                    atom_c,
+                    wave,
+                    fx.make_layout(waves, 1),
+                    shared_c,
+                    coords_c[None, (0, None)],
+                )
+                fx.copy(atom_c, src[None, 0], dst[None, 0])
+
+            tile_columns = fx.max(0, fx.min(block_n, n - col_start))
+            plain_destination = (
+                out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start
             )
-            shared_c = fx.make_view(
-                shared_out,
-                fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
-            )
-            src, dst = rocdl.cdna5.tdm_partition(
-                atom_c,
-                wave,
-                fx.make_layout(waves, 1),
-                shared_c,
-                coords_c[None, (0, None)],
-            )
-            fx.copy(atom_c, src[None, 0], dst[None, 0])
+            if const_expr(swiglu):
+                if col_start >= swiglu_col:
+                    store_tile(
+                        out2
+                        + fx.Int64(row_start) * fx.Int64(c2_leading_stride)
+                        + (col_start - swiglu_col) // 2,
+                        tile_columns // 2,
+                        c2_leading_stride,
+                    )
+                else:
+                    store_tile(plain_destination, tile_columns, c_leading_stride)
+            else:
+                store_tile(plain_destination, tile_columns, c_leading_stride)
             tdm_ops.tensor_wait(0)
         elif const_expr(split_k == 1):
             for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
@@ -1058,6 +1123,9 @@ def build_gemm_gfx1250(
         a_leading_stride: fx.Int32,
         b_leading_stride: fx.Int32,
         c_leading_stride: fx.Int32,
+        out2: fx.Pointer,
+        c2_leading_stride: fx.Int32,
+        swiglu_col: fx.Int32,
         stream: fx.Stream,
     ):
         mn_tiles = (m + block_m - 1) // block_m * ((n + block_n - 1) // block_n)
@@ -1074,6 +1142,9 @@ def build_gemm_gfx1250(
                 a_leading_stride,
                 b_leading_stride,
                 c_leading_stride,
+                out2,
+                c2_leading_stride,
+                swiglu_col,
             ).launch(grid=(mn_tiles, 1, 1), block=(threads, 1, 1), stream=stream)
         else:
             kernel(
@@ -1088,6 +1159,9 @@ def build_gemm_gfx1250(
                 a_leading_stride,
                 b_leading_stride,
                 c_leading_stride,
+                out2,
+                c2_leading_stride,
+                swiglu_col,
                 value_attrs={"rocdl.cluster_dims": f"1,{split_k},1"},
             ).launch(
                 grid=(mn_tiles, split_k, 1),
@@ -1113,6 +1187,7 @@ def build_gemm_gfx1250(
         split_k,
         interleave,
         split_k_atomic,
+        swiglu,
     )
     if interleave:
         launch.compile_hints["llvm_options"] = {
