@@ -45,9 +45,11 @@ def _sol_q_tile_absmax_kernel(
 ):
     """max |q| per (tile, head, dim), stored in out_ptr's dtype.
 
-    HAS_SCALE dequantizes by an E8M0 byte per 32 dims first; ROTATE takes |q R| for R = rot_gain
-    times the MX packers' hd128 Hadamard matrix, H[i, j] = (-1)^popcount(i & j), instead of |q|.
+    HAS_SCALE dequantizes by an E8M0 byte per 32 dims; ROTATE takes |q R| for R = rot_gain times
+    the MX packers' hd128 Hadamard matrix, H[i, j] = (-1)^popcount(i & j), instead of |q|. The
+    rotation mixes the 32-dim scale groups, so the two cannot be combined.
     """
+    tl.static_assert(not (HAS_SCALE and ROTATE))
     rot_gain = tl.cast(rot_gain, tl.float32)
     t = tl.program_id(0)
     h = tl.program_id(1)
