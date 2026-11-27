@@ -16,7 +16,11 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
 from aiter.ops.flydsl.aot_launch import bind_aot
-from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
+from aiter.utility.graph_alloc import (
+    capture_scoped_cache,
+    is_capturing,
+    persistent_alloc,
+)
 
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
@@ -1906,6 +1910,38 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     return arg
 
 
+# Largest cached split-K workspace bucket, in fp32 elements (1 GiB). It keeps
+# SplitKReduction.SKIP, the offset of the groups past M, outside the buffer.
+SPLIT_K_WORKSPACE_MAX_BUCKET = 2**28
+
+
+@capture_scoped_cache
+def _split_k_workspace(stream, device, numel):
+    # fp32 partials of the split-K reduction. They need no initial value: every
+    # split stores its slots before it counts in, and the reducer reads them
+    # only after every split arrived. One buffer per (stream, device, size)
+    # serves every launch on that stream, since a launch finishes before the
+    # next one starts. It is never freed: a captured graph keeps its address.
+    with persistent_alloc(torch.device(device)):
+        workspace = torch.empty((numel,), dtype=torch.float32, device=device)
+    return workspace, _dynamic_tensor_arg(workspace, 0)
+
+
+def get_split_k_workspace(stream, device, numel):
+    """Cached fp32 workspace of at least ``numel`` elements and its launch
+    argument. Sizes round up to a power of two, so a stream keeps less than four
+    times its largest workspace. None when ``stream`` is capturing and has no
+    buffer of that size from an eager launch: one cached there would outlive
+    its graph, so that launch takes its workspace from the graph's pool."""
+    bucket = 1 << (numel - 1).bit_length()
+    if bucket > SPLIT_K_WORKSPACE_MAX_BUCKET:
+        bucket = numel
+    cached = _split_k_workspace.eager_cached(stream, device, bucket)
+    if cached is None and not is_capturing(stream):
+        cached = _split_k_workspace(stream, device, bucket)
+    return cached
+
+
 def gemm_a16w16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2052,12 +2088,13 @@ def gemm_a16w16(
     if split_k > 1:
         # One fp32 partial tile per (output tile, split), reduced by the last split.
         tiles = -(-m // param.block_m) * -(-n // param.block_n)
-        workspace = torch.empty(
-            (split_k * tiles * param.block_m * param.block_n,),
-            dtype=torch.float32,
-            device=device,
-        )
-        workspace_arg = _dynamic_tensor_arg(workspace, 0)
+        numel = split_k * tiles * param.block_m * param.block_n
+        cached = get_split_k_workspace(stream, device, numel)
+        if cached is None:
+            workspace = torch.empty((numel,), dtype=torch.float32, device=device)
+            workspace_arg = _dynamic_tensor_arg(workspace, 0)
+        else:
+            workspace_arg = cached[1]
     else:
         workspace_arg = out_arg
     _run_compiled(

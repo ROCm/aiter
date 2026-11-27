@@ -84,7 +84,10 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     is skipped, and it names any site that loses its persistent_alloc."""
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
-    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        get_split_k_buffers,
+        get_split_k_workspace,
+    )
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import _fused_splitk_buffers
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
@@ -96,6 +99,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     sites = {
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev),
+        "a16w16_gfx950_workspace": get_split_k_workspace(s, dev, 4096)[0],
         "a16w16_gfx1250": _split_k_counters(dev, s),
         "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
@@ -328,3 +332,94 @@ def test_fused_split_k_gemm_whose_counters_are_first_used_inside_a_capture():
     for i, (x, out) in enumerate(zip(inputs, outs)):
         err = checkAllclose(ref(*x), out.float(), msg=f"graph {i}: ", printLog=False)
         assert err == 0, (i, err)
+
+
+def test_gfx950_split_k_workspace_is_cached_per_stream_and_size():
+    """The fp32 split-K workspace of the gfx950 A16W16 GEMM needs no initial
+    value, so one buffer per stream and size bucket serves every eager launch
+    and every graph captured on a stream that already has it. Two streams must
+    not share partials. A capture on a stream without the buffer must not cache
+    one: it would outlive its graph. Integer inputs keep every fp32 partial
+    exact, so each output must be the exact product, bit for bit."""
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        _split_k_workspace,
+        get_split_k_workspace,
+    )
+
+    if get_gfx() != "gfx950":
+        pytest.skip("FlyDSL a16w16 split-K kernel is gfx950-only")
+    dev = torch.device("cuda:0")
+    stream, other = torch.cuda.current_stream(dev), torch.cuda.Stream(dev)
+    small, _ = get_split_k_workspace(stream, dev, 3000)
+    assert small.numel() == 4096 and small.dtype == torch.float32
+    assert get_split_k_workspace(stream, dev, 4096)[0] is small
+    assert get_split_k_workspace(stream, dev, 4097)[0].numel() == 8192
+    assert get_split_k_workspace(other, dev, 4096)[0].data_ptr() != small.data_ptr()
+
+    cfg = {
+        "block_m": 32,
+        "block_n": 32,
+        "block_k": 128,
+        "stages": 5,
+        "split_k": 8,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "policy": "ft",
+    }
+    m, n, k = 64, 96, 5120
+    gen = torch.Generator(device=dev).manual_seed(0)
+
+    def ints(shape):
+        return torch.randint(-16, 17, shape, generator=gen, device=dev).to(
+            torch.bfloat16
+        )
+
+    def exact(x, w):
+        return (x.double() @ w.double().t()).to(torch.bfloat16)
+
+    w, xs = ints((n, k)), [ints((m, k)) for _ in range(3)]
+    numel = 8 * -(-m // 32) * -(-n // 32) * 32 * 32
+    workspace, _ = get_split_k_workspace(stream, dev, numel)
+    for x in xs[:2]:  # eager launches reuse the cached buffer
+        workspace.fill_(float("nan"))  # stale partials must never reach C
+        assert torch.equal(flydsl_hgemm(x, w, **cfg), exact(x, w))
+        assert get_split_k_workspace(stream, dev, numel)[0] is workspace
+    if not ROUTES_INSIDE_CAPTURE:
+        return
+
+    # A graph captured on a stream that has the buffer replays against it.
+    with torch.cuda.stream(other):
+        assert torch.equal(flydsl_hgemm(xs[0], w, **cfg), exact(xs[0], w))
+    shared, _ = get_split_k_workspace(other, dev, numel)
+    x = xs[0].clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=other):
+        out = flydsl_hgemm(x, w, **cfg)
+        assert get_split_k_workspace(other, dev, numel)[0] is shared
+    for new in xs[1:]:
+        x.copy_(new)
+        shared.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, exact(new, w))
+
+    # torch.cuda.graph captures on its own stream by default, which has no
+    # buffer from an eager launch. That launch takes its workspace from the
+    # graph's pool, and nothing is cached for the capture.
+    for _ in range(2):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            capturing = torch.cuda.current_stream(dev)
+            first = get_split_k_workspace(capturing, dev, numel)
+            out = flydsl_hgemm(x, w, **cfg)
+        assert first is None
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, exact(x, w))
+        assert (
+            _split_k_workspace.eager_cached(capturing, dev, workspace.numel()) is None
+        )

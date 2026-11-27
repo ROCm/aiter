@@ -73,6 +73,11 @@ def _capture_id(stream: int) -> int | None:
     return capture_id.value if status.value != 0 else None
 
 
+def is_capturing(stream: torch.cuda.Stream) -> bool:
+    """Whether ``stream`` itself, not the current stream, is part of a capture."""
+    return _capture_id(stream.cuda_stream) is not None
+
+
 def capture_scoped_cache(fn):
     """``functools.cache`` for scratch buffers a kernel initializes, e.g. zeroed
     semaphores built with ``torch.zeros`` under ``persistent_alloc``.
