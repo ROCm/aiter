@@ -10,6 +10,8 @@ constexpr int32_t kPaMetadataSharedMaxWaves = kPaMetadataSharedMaxBatches / opus
 constexpr int32_t kPaMetadataMaxParallelBatches = 32768;
 // Larger pages leave few tasks, where the serial generator is faster than the parallel launch.
 constexpr int32_t kPaMetadataParallelPageSize = 16;
+// Per-work setup and epilogue cost of the page16 MTP4 PS kernel, in 256-token tiles.
+constexpr int32_t kPaMetadataWorkSwitchTiles = 3;
 
 struct PaMetadataV12ChunkRecord
 {
@@ -275,15 +277,36 @@ __device__ __forceinline__ int32_t pa_metadata_v1_2_wave_upper_bound(
     return upper;
 }
 
+// Inclusive wave64 sum: row_shr 1/2/4/8 scan each 16-lane row, then
+// row_bcast 15/31 carry row totals. Needs all 64 lanes active.
 __device__ __forceinline__ int32_t pa_metadata_v1_2_prefix_sum32(int32_t value)
 {
+#if defined(__gfx950__)
+    value += __builtin_amdgcn_update_dpp(0, value, 0x111, 0xf, 0xf, false);
+    value += __builtin_amdgcn_update_dpp(0, value, 0x112, 0xf, 0xf, false);
+    value += __builtin_amdgcn_update_dpp(0, value, 0x114, 0xf, 0xf, false);
+    value += __builtin_amdgcn_update_dpp(0, value, 0x118, 0xf, 0xf, false);
+    value += __builtin_amdgcn_update_dpp(0, value, 0x142, 0xa, 0xf, false);
+    value += __builtin_amdgcn_update_dpp(0, value, 0x143, 0xc, 0xf, false);
+#else
     for(int32_t offset = 1; offset < opus::get_warp_size(); offset <<= 1)
     {
         const int32_t previous = __shfl_up(value, offset);
         if(opus::lane_id() >= offset)
             value += previous;
     }
+#endif
     return value;
+}
+
+// Number of lanes below count whose nondecreasing prefix is <= key.
+__device__ __forceinline__ int32_t pa_metadata_v1_2_lane_count_le(
+    int32_t prefix, int32_t key, int32_t count)
+{
+    int32_t lanes = 0;
+    for(int32_t lane = 0; lane < count; ++lane)
+        lanes += __builtin_amdgcn_readlane(prefix, lane) <= key ? 1 : 0;
+    return lanes;
 }
 
 template <int32_t Workers>
@@ -355,6 +378,35 @@ __device__ __forceinline__ int32_t pa_metadata_v1_2_worker32(
     return min(static_cast<int32_t>(worker), workers - 1);
 }
 
+// Wave sum of per-lane values below 512 from per-bit ballots, without LDS shuffles.
+__device__ __forceinline__ int32_t pa_metadata_v1_2_wave_sum9(int32_t value)
+{
+    int32_t sum = 0;
+    for(int32_t bit = 0; bit < 9; ++bit)
+        sum += __popcll(__ballot((value >> bit) & 1)) << bit;
+    return sum;
+}
+
+// Smallest per-worker tile bound whose one-segment-per-worker split of every
+// sequence fits Workers; one lane per sequence, inactive lanes hold 0 tiles.
+// Requires batch < Workers; each lane's segment count then stays below 512.
+template <int32_t Workers>
+__device__ __forceinline__ int32_t pa_metadata_v1_2_segment_bound(
+    int32_t tiles, int32_t total_tiles, int32_t batch)
+{
+    int32_t low = max((total_tiles + Workers - 1) / Workers, 1);
+    int32_t high = max((total_tiles + Workers - batch - 1) / (Workers - batch), low);
+    while(low < high)
+    {
+        const int32_t bound = (low + high) / 2;
+        if(pa_metadata_v1_2_wave_sum9((tiles + bound - 1) / bound) <= Workers)
+            high = bound;
+        else
+            low = bound + 1;
+    }
+    return low;
+}
+
 template <int32_t Workers, int32_t NumHeads>
 __launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
 void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
@@ -378,22 +430,28 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
         return;
     const int32_t tile_prefix = pa_metadata_v1_2_prefix_sum32(tiles);
     const int32_t tiles_before = tile_prefix - tiles;
-    const int32_t total_tiles = max(__shfl(tile_prefix, wave_size - 1), 1);
+    const int32_t total_tiles = max(__builtin_amdgcn_readlane(tile_prefix, 63), 1);
     const int32_t average = total_tiles / workers;
     const int32_t remainder = total_tiles - average * workers;
-    const bool sequence_partitions = NumHeads == 1 && Workers == 256 &&
-        (params.num_batches == 4 || params.num_batches == 8) &&
-        params.qhead_granularity == 16 && total_tiles >= workers &&
+    const bool segment_layout = NumHeads == 1 && Workers == 256 &&
+        params.qhead_granularity == 16 &&
         __all(!active || (qo_length == 4 && tiles > 0));
+    const int32_t segment_bound = segment_layout
+        ? pa_metadata_v1_2_segment_bound<Workers>(tiles, total_tiles, params.num_batches)
+        : 0;
+    // One segment per worker unless sharing workers is cheaper. A shared worker
+    // pays a switch at a sequence boundary plus one per shorter sequence.
+    const int32_t shared_tiles = average + (remainder > 0 ? 1 : 0);
+    const int32_t short_sequences = __popcll(__ballot(active && tiles < shared_tiles));
+    const bool sequence_partitions = segment_layout &&
+        segment_bound <= shared_tiles + kPaMetadataWorkSwitchTiles * (1 + short_sequences);
     const int32_t first_worker = pa_metadata_v1_2_worker32(tiles_before, average, remainder, workers);
     const int32_t last_worker = pa_metadata_v1_2_worker32(max(tile_prefix - 1, 0), average, remainder, workers);
-    const int32_t extra = workers - params.num_batches;
     const int32_t parts = sequence_partitions
-        ? min(tiles, 1 + static_cast<int32_t>(static_cast<int64_t>(tile_prefix) * extra / total_tiles -
-                                             static_cast<int64_t>(tiles_before) * extra / total_tiles))
+        ? (tiles + segment_bound - 1) / segment_bound
         : (tiles > 0 ? last_worker - first_worker + 1 : 0);
     const int32_t task_prefix = pa_metadata_v1_2_prefix_sum32(parts);
-    const int32_t total_tasks = __shfl(task_prefix, wave_size - 1);
+    const int32_t total_tasks = __builtin_amdgcn_readlane(task_prefix, 63);
     const int32_t reductions = parts > 1 ? parts : 0;
     const uint64_t lane_mask = ~uint64_t{0} >> (wave_size - lane - 1);
     const uint64_t single_parts = __ballot(parts == 1);
@@ -404,7 +462,7 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
         : pa_metadata_v1_2_prefix_sum32(reductions * qo_length);
     const int32_t group_prefix = __popcll(reduce_groups & lane_mask);
     const int32_t groups = __popcll(reduce_groups);
-    const int32_t total_reduce = __shfl(reduce_prefix, wave_size - 1);
+    const int32_t total_reduce = __builtin_amdgcn_readlane(reduce_prefix, 63);
     if(thread == 0)
     {
         params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
@@ -427,7 +485,7 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
     for(int32_t task_base = 0; task_base < total_tasks; task_base += thread_count)
     {
         const int32_t task = task_base + thread;
-        const int32_t sequence = pa_metadata_v1_2_wave_upper_bound(task_prefix, task, params.num_batches);
+        const int32_t sequence = pa_metadata_v1_2_lane_count_le(task_prefix, task, params.num_batches);
         const int32_t source_lane = min(sequence, params.num_batches - 1);
         const int32_t sequence_parts = __shfl(parts, source_lane);
         const int32_t tasks_before = __shfl(task_prefix - parts, source_lane);
@@ -436,10 +494,10 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
         const int32_t sequence_begin = __shfl(tiles_before, source_lane);
         const int32_t sequence_end = __shfl(tile_prefix, source_lane);
         const int32_t begin = sequence_partitions
-            ? sequence_begin + static_cast<int64_t>(part) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            ? sequence_begin + static_cast<int32_t>(static_cast<uint32_t>(part) * static_cast<uint32_t>(sequence_end - sequence_begin) / static_cast<uint32_t>(max(sequence_parts, 1)))
             : max(sequence_begin, worker * average + min(worker, remainder));
         const int32_t end = sequence_partitions
-            ? sequence_begin + static_cast<int64_t>(part + 1) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            ? sequence_begin + static_cast<int32_t>(static_cast<uint32_t>(part + 1) * static_cast<uint32_t>(sequence_end - sequence_begin) / static_cast<uint32_t>(max(sequence_parts, 1)))
             : min(sequence_end, (worker + 1) * average + min(worker + 1, remainder));
         const int32_t query_begin = __shfl(qo_start, source_lane);
         const int32_t query_end = __shfl(qo_end, source_lane);
@@ -478,7 +536,7 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
     }
     const int32_t local_worker = thread % workers;
     const int32_t tile_start = local_worker * average + min(local_worker, remainder);
-    const int32_t sequence = pa_metadata_v1_2_wave_upper_bound(tile_prefix, tile_start, params.num_batches);
+    const int32_t sequence = pa_metadata_v1_2_lane_count_le(tile_prefix, tile_start, params.num_batches);
     const int32_t source_lane = min(sequence, params.num_batches - 1);
     const int32_t tasks_before = __shfl(task_prefix - parts, source_lane);
     const int32_t sequence_first_worker = __shfl(first_worker, source_lane);

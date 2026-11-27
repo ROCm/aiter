@@ -37,4 +37,24 @@ void fused_qknorm_idxrqknorm(
     bool asm_layout = false,
     bool skip_index_branch = false);
 
+void fused_qknorm_nvfp4_raw(int64_t qkv,
+                                    int64_t q_out,
+                                    int64_t index_q_out,
+                                    int64_t q_norm_weight,
+                                    int64_t k_norm_weight,
+                                    int64_t index_q_norm_weight,
+                                    int64_t index_k_norm_weight,
+                                    int64_t cos_sin_cache,
+                                    int64_t positions,
+                                    int64_t slot_mapping,
+                                    int64_t index_slot_mapping,
+                                    int64_t kv_cache,
+                                    int64_t index_cache,
+                                    int64_t k_scale,
+                                    int64_t v_scale,
+                                    int64_t num_tokens,
+                                    int64_t kv_page_stride_bytes,
+                                    double eps,
+                                    int64_t stream);
+
 } // namespace aiter

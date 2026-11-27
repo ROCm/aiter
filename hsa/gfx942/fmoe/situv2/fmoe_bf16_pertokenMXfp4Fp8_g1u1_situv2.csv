@@ -1,0 +1,3 @@
+knl_name,co_name,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n,flat,dim_align,dim_min,max_tokens,max_assignments,max_experts
+_ZN5aiter50fmoe_bf16_pertokenMXfp4Fp8_g1u1_novs_situv2_32x256E,fmoe_bf16_pertokenMXfp4Fp8_g1u1_novs_situv2_32x256.co,0,0,0,1,0,32,256,0,256,256,0,0,0
+_ZN5aiter50fmoe_bf16_pertokenMXfp4Fp8_g1u1_novs_situv2_32x192E,fmoe_bf16_pertokenMXfp4Fp8_g1u1_novs_situv2_32x192.co,0,0,0,1,0,32,192,0,256,256,0,0,0
