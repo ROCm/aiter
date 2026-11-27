@@ -1502,9 +1502,15 @@ __global__ __launch_bounds__(kPfBlockWaves * 64) void fusedNvfp4InsertPrefillKer
             {
                 const int pi   = min(tok0 + 2 * t, pn);
                 const uint4 pp = *reinterpret_cast<const uint4*>(sm + pi);
-                asm volatile("" ::"s"(pp.y), "s"(pp.w));
                 const int e    = min(tok0 + 2 * t + h2 - pi, 1);
-                slot_t[t]      = static_cast<int>(e ? pp.z : pp.x);
+                // sm is int64: pp.x/pp.z are the low words of the two slots, pp.y/pp.w the high
+                // words. A negative int64 slot is padding and must be skipped exactly as the
+                // generic kernel does (slot_mapping[token_idx] < 0); its sign lives entirely in
+                // the high word, so a slot is "skip" iff its high word is negative. Keep the low
+                // word as the (int32) slot index only for non-negative slots.
+                const int lo   = e ? pp.z : pp.x;
+                const int hi   = e ? pp.w : pp.y;
+                slot_t[t]      = (hi < 0) ? -1 : lo;
             }
         }
         else
@@ -1643,8 +1649,12 @@ __global__ __launch_bounds__(kPfBlockWaves * 64) void fusedNvfp4InsertPrefillKer
         const int tok  = tok0 + 2 * (s - kPfNR) + h2;
         const int widx = tok - 1 + hl;
         const bool wv  = (hl < 9) & (widx >= 0) & (widx < n);
-        int a          = reinterpret_cast<const int*>(slot_mapping)[(wv ? widx : 0) * 2];
-        a              = wv ? a : -1;
+        // slot_mapping is int64: read the full slot so a negative (padding) slot is skipped exactly
+        // as the generic kernel does (slot_mapping[token_idx] < 0). `a` stays a 32-bit low word for
+        // the DPP run-length exchange below, but is forced to -1 when the token is out of range or
+        // the full int64 slot is negative (its sign lives in the high word).
+        const int64_t a64 = slot_mapping[wv ? widx : 0];
+        int a             = (!wv || a64 < 0) ? -1 : static_cast<int>(a64);
         const int ap   = __builtin_amdgcn_update_dpp(-1, a, 0x111, 0xF, 0xF, false); // row_shr:1
         const bool cont =
             (hl >= 1) & (hl <= 8) & (a >= 0) & (ap >= 0) & (a == ap + 1) & ((a & 7) != 0);

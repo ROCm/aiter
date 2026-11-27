@@ -250,6 +250,102 @@ DISPATCH_PROBE_N = 2
 # its largest call, the generic kernel takes the one above it
 BIG_N = (419430, 419431)
 
+# Regression (junhaha666, #8472): int64 slots whose magnitude is >= 2**32 have a nonzero low 32-bit
+# word (e.g. -4294967295 = 0xFFFFFFFF00000001 -> low word 1), so reading the slot as a 32-bit int
+# treats the padding slot as a valid (positive) slot and writes the KV / index cache. The generic
+# kernel keys off the full int64 (slot_mapping[token_idx] < 0) and skips it; the prefill insert must
+# skip it too. -1 (low word also -1) is included to keep the common padding value covered.
+BIGNEG_SLOTS = [-1, -4294967295, -4294967294, -(2**40), -(2**32) - 123]
+
+
+def bigneg_make(n, mode):
+    """A valid baseline case (real qkv / positions / weights, aligned slots) whose slot_mapping and
+    index_slot_mapping carry large-magnitude negative int64 slots. mode 'all': every token is
+    padding (both kernels write nothing); 'mix': even tokens padding, odd tokens keep their valid
+    slot; 'junhaha': exactly the two-token pattern [-4294967295, -4294967294] from the report.
+    """
+    c = make(n, "aligned", 0)
+    slot = c["slot"].clone()
+    neg = torch.tensor(BIGNEG_SLOTS, dtype=torch.int64, device=slot.device)
+    if mode == "junhaha":
+        slot = torch.tensor(
+            [-4294967295, -4294967294], dtype=torch.int64, device=slot.device
+        )
+    else:
+        idx = (
+            torch.arange(n, device=slot.device)
+            if mode == "all"
+            else torch.arange(0, n, 2, device=slot.device)
+        )
+        slot[idx] = neg[torch.arange(idx.numel(), device=slot.device) % neg.numel()]
+    c["slot"], c["islot"] = slot, slot.clone()
+    return c
+
+
+def bigneg_child(path):
+    """Runs the raw-pointer entry on the large-magnitude-negative slot patterns and records, per
+    case, the input KV / index digests and the digests of every output buffer."""
+    res = {}
+    specs = [(f"{n}/{m}", n, m) for n in (2, 3, 8, 17, 64) for m in ("all", "mix")]
+    specs.append(("2/junhaha", 2, "junhaha"))
+    for name, n, mode in specs:
+        c = bigneg_make(n, mode)
+        res[name] = {
+            "in": {"kv": dig(c["kv"]), "idx": dig(c["idx"])},
+            "out": {k: dig(v) for k, v in run(c, n).items()},
+        }
+        del c
+    res["_prefill_launched"] = prefill_launched(DISPATCH_PROBE_N)
+    with open(path, "w") as f:
+        json.dump(res, f)
+
+
+def test_bigneg_slots_skipped():
+    """The prefill insert must skip large-magnitude negative int64 slots exactly as the generic
+    kernel does (junhaha666, #8472). Forces the prefill path on in one child and off in another and
+    asserts every output buffer is byte-identical between the two, and that the all-padding patterns
+    leave the KV and index caches byte-for-byte unchanged (nothing written) in both kernels.
+    """
+    import pytest
+
+    pytest.importorskip("aiter")
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("the NVFP4 prefill insert is gfx950 only")
+
+    out = {}
+    for tag, floor in (("generic", "999999999"), ("prefill", "2")):
+        path = os.path.join(tempfile.mkdtemp(), tag + ".json")
+        env = dict(os.environ, AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS=floor)
+        subprocess.run(
+            [sys.executable, __file__, "--bigneg-child", path], env=env, check=True
+        )
+        with open(path) as f:
+            out[tag] = json.load(f)
+    # dispatch sanity: only the forced child may launch the prefill kernel, or the comparison below
+    # proves nothing about the prefill path
+    assert out["prefill"].pop("_prefill_launched") is True
+    assert out["generic"].pop("_prefill_launched") is False
+    # the prefill insert leaves every buffer byte-identical to the generic kernel
+    for name, g in out["generic"].items():
+        for buf, h in g["out"].items():
+            assert out["prefill"][name]["out"][buf] == h, (
+                f"{name}/{buf}: prefill insert differs from the generic kernel on "
+                "large-magnitude negative slots"
+            )
+    # every slot of the 'all' and 'junhaha' cases is padding: both kernels write nothing, so the KV
+    # and index caches come back equal to the input
+    for tag, cases in out.items():
+        for name, case in cases.items():
+            if name.endswith(("/all", "/junhaha")):
+                assert (
+                    case["out"]["kv"] == case["in"]["kv"]
+                ), f"[{tag}] {name}: KV changed"
+                assert (
+                    case["out"]["idx"] == case["in"]["idx"]
+                ), f"[{tag}] {name}: index cache changed"
+
 
 def child(args):
     res = {}
@@ -289,6 +385,11 @@ def main():
         "--child", default=None, help="(internal) write the digests to this file"
     )
     ap.add_argument(
+        "--bigneg-child",
+        default=None,
+        help="(internal) write the large-magnitude-negative-slot digests to this file",
+    )
+    ap.add_argument(
         "-n",
         type=int,
         nargs="*",
@@ -319,6 +420,9 @@ def main():
     ap.add_argument("--kinds", nargs="*", default=KINDS)
     ap.add_argument("--seeds", type=int, default=2)
     args = ap.parse_args()
+    if args.bigneg_child:
+        bigneg_child(args.bigneg_child)
+        return
     if args.child:
         child(args)
         return
