@@ -339,6 +339,48 @@ def test_automatic_budget_is_capped_by_cpu_and_memory(
         assert "AITER_MAX_JOBS" not in os.environ
 
 
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        (0, 1),
+        (limits.EST_FORK_POOL_RESERVE_BYTES, 1),
+        (
+            limits.EST_FORK_POOL_RESERVE_BYTES + 5 * limits.EST_FORK_WORKER_BYTES,
+            5,
+        ),
+        (16 * 10**9, 28),
+    ],
+    ids=["zero-memory", "reserve-only", "five-workers", "sixteen-gb"],
+)
+def test_fork_pool_budget_reserves_parents_and_counts_private_memory(
+    available, expected
+):
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch.object(limits, "get_cpu_worker_budget", return_value=64),
+        patch.object(limits, "_host_available_memory_bytes", return_value=available),
+        patch.object(limits, "_cgroup_memory_bound", return_value=(None, None)),
+    ):
+        assert limits.get_fork_worker_count_for(1000) == expected
+        # The general estimate is unchanged.
+        assert limits.get_worker_count_for(1000) == max(
+            1, available // limits.EST_WORKER_RSS_BYTES
+        )
+
+
+def test_fork_pool_budget_honors_ceilings_and_work():
+    with (
+        patch.dict(os.environ, {"AITER_MAX_JOBS": "7"}, clear=True),
+        patch.object(limits, "get_cpu_worker_budget", return_value=64),
+        patch.object(limits, "_host_available_memory_bytes", return_value=64 * GiB),
+        patch.object(limits, "_cgroup_memory_bound", return_value=(None, None)),
+    ):
+        assert limits.get_fork_worker_count_for(1000) == 7
+        assert limits.get_fork_worker_count_for(3) == 3
+        assert limits.get_fork_worker_count_for(1000, 2) == 2
+        assert limits.get_fork_worker_count_for(1000, 0) == 1
+
+
 # --- ceilings --------------------------------------------------------------
 
 

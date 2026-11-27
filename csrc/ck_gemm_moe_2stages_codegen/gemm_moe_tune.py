@@ -8545,7 +8545,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         job["swiglu_limit"] = runtime_swiglu_limit(
                             swiglu_limit, job["act"]
                         )
-            worker_count = get_max_workers(len(jobs))
+            # Fork-server workers load aiter themselves: budget them as such.
+            worker_count = get_max_workers(len(jobs), "forkserver")
             batches = [jobs[index::worker_count] for index in range(worker_count)]
             batch_results = run_jobs_parallel(
                 compile_job_batch,

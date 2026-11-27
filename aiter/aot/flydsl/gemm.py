@@ -421,6 +421,12 @@ def parse_csv(csv_path: str) -> list[dict]:
     for row in rows:
         key = tuple(_column(row, c) for c in table.keys)
         shapes.setdefault(key, {})[_int(_column(row, "M"))] = _column(row, "kernelName")
+    # One tuple per shape, shared by its rows: built per row, a shape of n rows
+    # holds n**2 entries, which every replay process and its workers then carry.
+    tuned = {
+        key: tuple((tm, *_tiling(name)) for tm, name in by_m.items())
+        for key, by_m in shapes.items()
+    }
 
     jobs = []
     for row in rows:
@@ -440,7 +446,7 @@ def parse_csv(csv_path: str) -> list[dict]:
             "cu_num": _int(_column(row, "cu_num"), _DEFAULT_CU_NUM),
             "m": m,
             "m_low": max(smaller, default=0) + 1,
-            "tuned": tuple((tm, *_tiling(name)) for tm, name in shapes[key].items()),
+            "tuned": tuned[key],
             "n": _int(_column(row, "N")),
             "k": _int(_column(row, "K")),
         }

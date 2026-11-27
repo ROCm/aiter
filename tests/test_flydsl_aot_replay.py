@@ -574,3 +574,76 @@ def test_4wave_mxfp8_csv_rows_reach_flydsl_through_public_replay(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_gemm_jobs_of_a_shape_share_its_tuned_sizes():
+    """A table of n rows per shape must not hold n**2 tuned sizes: every
+    replay process holds the jobs, and every worker forked from it."""
+    from aiter.aot.flydsl import gemm
+
+    path = (
+        _REPO_ROOT
+        / "aiter/configs/model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv"
+    )
+    jobs = gemm.parse_csv(str(path))
+    by_shape = {}
+    for job in jobs:
+        by_shape.setdefault((job["n"], job["k"], job["gfx"]), []).append(job)
+    assert any(len(shape_jobs) > 1 for shape_jobs in by_shape.values())
+    for shape_jobs in by_shape.values():
+        tuned = shape_jobs[0]["tuned"]
+        assert {job["m"] for job in shape_jobs} <= {m for m, _, _ in tuned}
+        assert all(job["tuned"] is tuned for job in shape_jobs)
+
+
+def _collects_and_reports(**_job):
+    import gc
+
+    gc.collect()
+    return {"kernel_name": "k", "compile_time": 0.0, "frozen": gc.get_freeze_count()}
+
+
+def test_fork_pool_workers_inherit_a_frozen_heap_and_the_parent_gets_it_back():
+    import gc
+
+    from aiter.aot.flydsl import common
+
+    assert gc.get_freeze_count() == 0
+    with mock.patch.object(common, "get_max_workers", return_value=2):
+        results = common.run_jobs_parallel(
+            _collects_and_reports, [{"kernel_name": "k"}] * 3
+        )
+    assert [r["compile_time"] for r in results] == [0.0] * 3
+    assert all(r["frozen"] > 0 for r in results)
+    assert gc.get_freeze_count() == 0
+
+
+def test_fork_pool_leaves_a_caller_s_frozen_heap_frozen():
+    import gc
+
+    from aiter.aot.flydsl import common
+
+    gc.freeze()
+    try:
+        with common._lean_fork_parent("fork"):
+            assert gc.get_freeze_count() > 0
+        assert gc.get_freeze_count() > 0
+    finally:
+        gc.unfreeze()
+
+
+def test_only_a_fork_pool_freezes_or_takes_the_fork_budget():
+    import gc
+
+    from aiter.aot.flydsl import common
+
+    with common._lean_fork_parent("forkserver"):
+        assert gc.get_freeze_count() == 0
+    with (
+        mock.patch.object(common, "get_fork_worker_count_for", return_value=9),
+        mock.patch.object(common, "get_worker_count_for", return_value=4),
+    ):
+        assert common.get_max_workers(100) == 9
+        assert common.get_max_workers(100, "fork") == 9
+        assert common.get_max_workers(100, "forkserver") == 4
+        assert common.get_max_workers(100, "spawn") == 4

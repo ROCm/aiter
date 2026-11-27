@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import multiprocessing
 import os
@@ -18,7 +20,11 @@ from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
+from aiter_worker_limits import (
+    configure_worker_subprocesses,
+    get_fork_worker_count_for,
+    get_worker_count_for,
+)
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_RETRIES = 2
@@ -237,7 +243,12 @@ def get_max_retries() -> int:
         ) from e
 
 
-def get_max_workers(num_jobs: int) -> int:
+def get_max_workers(num_jobs: int, start_method: str = "fork") -> int:
+    """Workers of a FlyDSL AOT pool. Forked ones are budgeted by what each adds
+    to the process it shares its loaded modules and jobs with; those of another
+    start method load their own, and take the general per-worker estimate."""
+    if start_method == "fork":
+        return get_fork_worker_count_for(num_jobs)
     return get_worker_count_for(num_jobs)
 
 
@@ -262,6 +273,45 @@ def worker_waves(workers: int, jobs_per_arch: dict[str, int]) -> list[dict[str, 
             shares[arch] += 1
         waves.append(shares)
     return waves
+
+
+def _trim_heap() -> None:
+    """Return the allocator's free memory to the OS (glibc; a no-op elsewhere)."""
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
+@contextmanager
+def _lean_fork_parent(start_method: str) -> Iterator[None]:
+    """Keep what forked workers inherit shared with this process, and small.
+
+    A worker copies every page it writes to. A garbage collection writes to
+    the header of each object it tracks, so the first one in a worker copies
+    most of the inherited heap: freezing the objects alive now keeps them out
+    of the workers' collections (a worker's median private memory from 0.34 GB
+    to 0.23 GB for MegaMoE, from 0.17 GB to 0.09 GB for MoE). The heap also
+    still holds what collecting and batching the jobs freed, which each
+    worker's RSS would count again: trimming returns it (GEMM: 0.6 GB off this
+    process, 0.4 GB off each worker's RSS).
+
+    The fork-pool worker estimate (``EST_FORK_WORKER_BYTES``) was measured
+    with both in place."""
+    if start_method != "fork":
+        yield
+        return
+    # A caller that froze its own objects keeps them frozen: unfreezing is
+    # all or nothing.
+    owns_freeze = gc.get_freeze_count() == 0
+    gc.collect()
+    gc.freeze()
+    _trim_heap()
+    try:
+        yield
+    finally:
+        if owns_freeze:
+            gc.unfreeze()
 
 
 def _run_file_pool(
@@ -403,7 +453,7 @@ def run_jobs_parallel(
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
-    max_workers = get_max_workers(len(jobs))
+    max_workers = get_max_workers(len(jobs), start_method)
     print(
         f"[aiter] FlyDSL AOT: {len(jobs)} kernels, {max_workers} worker processes",
         flush=True,
@@ -411,14 +461,16 @@ def run_jobs_parallel(
     result_dir = tempfile.mkdtemp(prefix="aot_results_")
     try:
         specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
-        raw = _run_file_pool(
-            specs,
-            max_workers,
-            get_kernel_timeout(),
-            get_max_retries(),
-            result_dir,
-            start_method,
-        )
+        # For the whole run: workers start as others finish.
+        with _lean_fork_parent(start_method):
+            raw = _run_file_pool(
+                specs,
+                max_workers,
+                get_kernel_timeout(),
+                get_max_retries(),
+                result_dir,
+                start_method,
+            )
     finally:
         shutil.rmtree(result_dir, ignore_errors=True)
     out: list[dict[str, Any]] = []
