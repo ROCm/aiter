@@ -628,8 +628,9 @@ def test_capacity_checked_before_allocation(weights):
 
 def test_input_checks():
     """Calls the layer refuses before it launches anything: one row more than
-    max_tok_per_rank on forward / forward_prequant, and x of another width or dtype on
-    forward_small_m."""
+    max_tok_per_rank on forward / forward_prequant, x of another width or dtype on
+    forward_small_m, and a current device other than the layer's (the kernels launch on
+    the current device's stream)."""
     mega = _STATE["layers"]["large"]
     n = MTPR + 1
     ids = torch.zeros((n, TOPK), dtype=torch.int32, device="cuda")
@@ -638,6 +639,12 @@ def test_input_checks():
     x_q = x.to(dtypes.fp8)
     x_scale = torch.ones((n, H // 128), dtype=torch.float32, device="cuda")
     small = {"max_tokens": SMALL_MTPR}
+    other = (torch.cuda.current_device() + 1) % torch.cuda.device_count()
+
+    def elsewhere(call):
+        with torch.cuda.device(other):
+            return call()
+
     cases = {
         "forward past max_tok_per_rank": (
             ValueError,
@@ -654,6 +661,16 @@ def test_input_checks():
         "forward_small_m with f32 x": (
             TypeError,
             lambda: mega.forward_small_m(x[:1].float(), wts[:1], ids[:1], **small),
+        ),
+        "forward with another current device": (
+            ValueError,
+            lambda: elsewhere(lambda: mega.forward(x[:1], wts[:1], ids[:1])),
+        ),
+        "forward_small_m with another current device": (
+            ValueError,
+            lambda: elsewhere(
+                lambda: mega.forward_small_m(x[:1], wts[:1], ids[:1], **small)
+            ),
         ),
     }
     for name, (error, call) in cases.items():

@@ -123,6 +123,8 @@ def _on(stream):
 class MegaMoEGfx942:
     """One rank's EP4 / EP8 a8w4 / a8w8 MoE layer. Construction is collective: every rank
     builds the same instances in the same order after MORI shmem is initialized.
+    A call runs on the current stream (or ``stream``) of the layer's device: a call made
+    while another device is current is refused.
 
     ``small_m_enabled`` builds small_M, which takes up to max(``small_m_mtprs``)
     tokens per rank. With ``large_m_enabled``, ``forward`` runs large_M and the main
@@ -416,7 +418,13 @@ class MegaMoEGfx942:
     def _routes(self, x, topk_ids, wts, main=None):
         """The routes as int32 ids (out-of-range ids -1) and f32 weights: padded to the
         main kernel's top-k in ``main``'s buffers, else as they are."""
-        # The kernels take raw pointers: every input must be on this layer's device.
+        # The kernels take raw pointers and launch on the current device's stream: the
+        # current device and every input must be this layer's.
+        if torch.cuda.current_device() != self.dev.index:
+            raise ValueError(
+                f"the current device is cuda:{torch.cuda.current_device()}, the layer "
+                f"is on {self.dev}"
+            )
         T = x.shape[0]
         for name, t in (("x", x), ("topk_ids", topk_ids), ("wts", wts)):
             if t.device != self.dev:
