@@ -14,7 +14,8 @@ layout is a new dtype case, not a new entry.
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
   (q, kv fp8), the prefix source fp8 or NVFP4 with ``[*, 32]`` e4m3 scales: opus on gfx950,
-  and with an fp8 prefix on gfx1250; asm for H64 NVFP4 on gfx1250.
+  and with an fp8 prefix on gfx1250. H64 NVFP4 ASM on gfx1250 now uses
+  :func:`_asm_sparse_prefill_v41`, with raw BF16 Q and quantized Q/O output.
 
 ``backend`` forces one backend. A configuration no backend serves raises RuntimeError;
 a bad argument raises ValueError.
@@ -537,7 +538,7 @@ def _v41_asm_eligible(gfx, shape, dtypes_, layout, scale):
     n, h, d = shape
     (
         q_dtype,
-        q_scale_dtype,
+        _q_scale_dtype,
         prefix_dtype,
         prefix_scale_dtype,
         kv_dtype,
@@ -547,10 +548,10 @@ def _v41_asm_eligible(gfx, shape, dtypes_, layout, scale):
         is_gfx1250_family(gfx)
         and h == 64
         and d == 512
-        and n <= 65536
+        and n <= 65535
         and layout == "contiguous"
-        and q_dtype == kv_dtype == dtypes.fp8
-        and q_scale_dtype in _E8M0
+        and q_dtype == torch.bfloat16
+        and kv_dtype == dtypes.fp8
         and kv_scale_dtype in _E8M0
         and prefix_dtype in (torch.uint8, dtypes.fp4x2)
         and prefix_scale_dtype in (torch.uint8, dtypes.fp8)
@@ -596,11 +597,16 @@ def get_mla_sparse_prefill_v41_backend(
     kv_scale_dtype: torch.dtype = torch.uint8,
     layout: str = "contiguous",
 ) -> str | None:
-    """Query the native v4.1 backend before preparing/quantizing Q.
+    """Query the native v4.1 backend before preparing Q.
+
+    "asm" describes the BF16-Q/FP8-O Q/O contract of
+    _asm_sparse_prefill_v41, not the attention-only public function below.
+    "opus" retains FP8 Q plus Q scales and returns BF16 attention output.
+    q_scale_dtype applies only to OPUS; the ASM entry has no Q scale input.
 
     Returns ``"asm"``, ``"opus"`` or ``None`` when the intended configuration
     is unsupported. ``q_shape`` is the concrete host shape ``(N, H, D)``;
-    dtypes describe the intended quantized tensors, not the BF16 Q producer.
+    dtypes describe the intended tensors: raw BF16 Q for ASM, quantized Q for OPUS.
     No tensors are allocated, quantized or read, and no kernel is compiled.
 
     ``layout="contiguous"`` describes separate dense Q/KV/scale arrays.
@@ -1269,12 +1275,13 @@ def mla_sparse_prefill_v41(
     or fp8_e8m0, one per 32 values). Same argument order as
     :func:`mla_sparse_prefill_v4`, with the RoPE tensors replaced by the scales.
     Supported (q, unified_kv, kv) dtypes: (fp8, fp8, fp8) on gfx950 and gfx1250, and
-    (fp8, fp4x2, fp8) on gfx950 (opus) and gfx1250 H64 (asm), with an NVFP4
+    (fp8, fp4x2, fp8) on gfx950 (opus), with an NVFP4
     prefix source: e2m1 pairs (fp4x2 or uint8, the even value in the low nibble)
-    with an e4m3 scale (fp8 or uint8) per 16 values. The asm backend requires
-    contiguous, separate data and scale arrays; it does not unpack interleaved
-    288-byte CSA rows. Its fixed sink path requires softmax_scale to have the
-    same FP32 value as 1/sqrt(512). CSR indices define all visibility, including
+    with an e4m3 scale (fp8 or uint8) per 16 values. The separate
+    _asm_sparse_prefill_v41 entry consumes unrotated BF16 Q plus coefficients
+    and positions and returns FP8 output and scales; it is not a backend of
+    this FP8-Q/BF16-O contract. Its CO is no longer compatible with the old
+    120B launch interface. CSR indices define all visibility, including
     causal masks.
 
     Args:
@@ -1298,17 +1305,11 @@ def mla_sparse_prefill_v41(
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
       num_kv_splits:     opus: as in :func:`mla_sparse_prefill`; on gfx1250,
-        2, 4, 8 or 16 fold in the same launch. asm: an integer in [1, 16].
-        With ``None``, asm uses 1 split for N > 64. For N <= 64, an average of
-        512 prefix rows uses 1 split; 1024 prefix rows use 4 splits at N <= 32
-        and 2 otherwise. Other prefix lengths use the ASM fallback heuristic.
-        Extend rows do not count toward the prefix average. asm fuses reduction
-        in the same launch and allocates workspace internally.
-      backend:           ``"asm"``, ``"opus"`` or ``None``. Default selects asm
-        for a supported gfx1250 H64 NVFP4 prefix, otherwise opus. Use
-        :func:`get_mla_sparse_prefill_v41_backend` before quantizing Q to check
-        native eligibility. Explicit backends retain their validation/errors.
-        Enabled plugins are tried first and do not receive this native pin.
+        2, 4, 8 or 16 fold in the same launch.
+      backend:           "opus" or None. The historical "asm" pin raises a
+        migration error: use _asm_sparse_prefill_v41 for the fused Q/O ABI.
+        Plugin routing and preallocated output behavior retain this function's
+        FP8-Q/BF16-O contract.
 
     Returns:
       ``out`` (``[T, H, 512]`` bf16).
@@ -1337,10 +1338,13 @@ def mla_sparse_prefill_v41(
                     "mla_sparse_prefill_v41: no native backend supports the "
                     "requested device, shape, quantized dtypes, layout and scale"
                 )
-        implementation = (
-            _asm_sparse_prefill_v41 if selected == "asm" else _opus_sparse_prefill_v41
-        )
-        return implementation(*native_args, **native_kwargs)
+        if selected == "asm":
+            raise RuntimeError(
+                "mla_sparse_prefill_v41: ASM now consumes raw BF16 q_nope, "
+                "cos/sin and int64 positions and returns (FP8 out, E8M0 bytes); "
+                "call _asm_sparse_prefill_v41 with the 144B Q/O interface"
+            )
+        return _opus_sparse_prefill_v41(*native_args, **native_kwargs)
 
     # `out` is a pre-allocated output buffer, and passing it bypasses routing.
     # The reason is a schema one rather than a policy one: with a buffer this op
@@ -1431,6 +1435,7 @@ def mla_sparse_prefill_v41(
 
 
 __all__ = [
+    "_asm_sparse_prefill_v41",
     "get_mla_sparse_prefill_v41_backend",
     "mla_sparse_prefill",
     "mla_sparse_prefill_fp8_asm",
