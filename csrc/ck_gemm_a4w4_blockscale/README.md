@@ -28,8 +28,13 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 
 ### Triton / FlyDSL preshuffle candidates (gfx950)
 
-Add `--backends ck,asm,triton,flydsl -k` to the existing tuner command to compare
-all four backends. The default remains `ck,asm`. Winners use the same CSV schema;
+Add `--libtype ck,asm,triton,flydsl -k` (or `--libtype all -k`) to the existing tuner
+command to compare all four backends. `--libtype` picks which backends to enumerate,
+for example `--libtype asm` tunes only the ASM kernels and does not enumerate the CK
+candidates. The default remains `ck,asm`. `--backends` is kept as an alias of
+`--libtype` (comma-separated names, no `all`); the two cannot be combined. `cktile` is
+rejected: a4w4 has no CK Tile runtime dispatch (`gemm_a4w4` dispatches on
+the kernel name), so such rows could not be used. Winners use the same CSV schema;
 `triton_preshuffle_*` and `flydsl_mxpsh_*` kernel names encode their launch settings.
 Triton cache modifiers are explicit: `_cmcg` selects `.cg`, `_cmca` selects `.ca`,
 and `_cmnone` or no `_cm` suffix uses the Triton default (`None`).

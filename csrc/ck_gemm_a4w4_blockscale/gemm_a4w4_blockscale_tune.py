@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
 import itertools
 import os
 from typing import Any, ClassVar
@@ -22,6 +23,41 @@ torch.set_printoptions(sci_mode=False)
 torch.random.manual_seed(0)
 SCALE_GROUP_SIZE = 32
 block_shape = (128, 128)
+
+# Backends (libtypes) this tuner can enumerate; every row they produce is dispatched
+# by kernelName in aiter/ops/gemm_op_a4w4.py. "all" selects every entry.
+A4W4_LIBTYPES = ("ck", "asm", "triton", "flydsl")
+# Candidate set when neither --libtype nor --backends is given.
+DEFAULT_LIBTYPES = ("ck", "asm")
+
+
+def libtype_list(string):
+    values = string.split(",")
+    for value in values:
+        if value == "cktile":
+            raise argparse.ArgumentTypeError(
+                "Invalid libtype: cktile (a4w4 has no CK Tile runtime dispatch, "
+                f"so its rows could not be used; supported: all, {', '.join(A4W4_LIBTYPES)})"
+            )
+        if value != "all" and value not in A4W4_LIBTYPES:
+            raise argparse.ArgumentTypeError(
+                f"Invalid libtype: {value} (supported: all, {', '.join(A4W4_LIBTYPES)})"
+            )
+    return values
+
+
+def resolve_libtypes(libtype=None, backends=None):
+    """Set of backends to enumerate from --libtype (list) or its --backends alias (str)."""
+    if libtype is not None and backends is not None:
+        raise ValueError("--libtype and --backends are mutually exclusive")
+    if libtype is not None:
+        return set(A4W4_LIBTYPES) if "all" in libtype else set(libtype)
+    if backends is None:
+        return set(DEFAULT_LIBTYPES)
+    selected = set(backends.split(","))
+    if not selected <= set(A4W4_LIBTYPES):
+        raise ValueError(f"Unknown --backends: {backends}")
+    return selected
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -202,10 +238,26 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
-            "--backends",
-            default="ck,asm",
-            help="Comma-separated candidates: ck,asm,triton,flydsl (gfx950 preshuffle)",
+            "--libtype",
+            type=libtype_list,
+            default=None,
+            help="Comma-separated backends to tune, any of ['all', 'ck', 'asm', 'triton', "
+            "'flydsl'] (triton/flydsl: gfx950 preshuffle). Default: ck,asm",
         )
+        self.parser.add_argument(
+            "--backends",
+            default=None,
+            help="Alias of --libtype (comma-separated ck,asm,triton,flydsl); "
+            "cannot be combined with --libtype",
+        )
+
+    def parse_args(self):
+        args = super().parse_args()
+        try:
+            resolve_libtypes(args.libtype, args.backends)
+        except ValueError as e:
+            self.parser.error(str(e))
+        return args
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
@@ -320,9 +372,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         ]
         ref_keys = ["x", "w", "x_scales", "w_scales"]
         seed = 0
-        backends = set(args.backends.split(","))
-        if not backends or not backends <= {"ck", "asm", "triton", "flydsl"}:
-            raise ValueError(f"Unknown --backends: {args.backends}")
+        backends = resolve_libtypes(args.libtype, args.backends)
         for shape_idx in range(len(untunedf)):
             row = untunedf.iloc[shape_idx]
             # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
@@ -379,7 +429,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             ### asm kernels
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
-            asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
+            asm_kernels = (
+                self.get_asm_kernels(asm_kernel_list_csv) if "asm" in backends else {}
+            )
             asm_tiles = [key for key in asm_kernels]
             for key in asm_tiles if "asm" in backends else ():
                 tile_m, tile_n, splitk, _ps = key
