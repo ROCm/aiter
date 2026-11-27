@@ -1100,10 +1100,6 @@ def atomic_bf16_epilog(
     if const_expr(uncond_stores):
         assert use_reduce and not route_out_fp8 and not enable_bias
         assert reduce_store_cache_modifier is None
-    if const_expr(uncond_stores and not route_out_fp4):
-        u_end = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(output_width)
-        out_4b = _global_i32_buffer_tiles(arg_out, u_end * 2, 1)
-        st_4b = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     if const_expr(uncond_stores and route_out_fp4):
         u_pitch = val_width + _udiv(output_width, fx.Int32(g2_scale_blk))
         if const_expr(g2_out_pitch_align > 0):
@@ -1242,12 +1238,12 @@ def atomic_bf16_epilog(
                     al = fx.Int32(g2_out_pitch_align)
                     row_pitch = ((row_pitch + al - fx.Int32(1)) // al) * al
                 row_base_addr = out_row * fx.Int64(row_pitch)
+                if const_expr(uncond_stores):
+                    row_base_addr = valid.select(row_base_addr, u_end)
             else:
                 row_base_addr = out_row * fx.Int64(output_width) + fx.Int64(
                     n_block_idx * BN + col_start - output_n_base
                 )
-            if const_expr(uncond_stores):
-                row_base_addr = valid.select(row_base_addr, u_end)
         else:
             out_row = token_id
             row_base_addr = out_row * N_OUT + n_block_idx * BN + col_start
@@ -1494,12 +1490,7 @@ def atomic_bf16_epilog(
                 out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
                 out_frag.store(pk)
                 out_off = row_base_addr + fx.Int64(s * store_group_n)
-                if const_expr(uncond_stores):
-                    pk4 = fx.make_rmem_tensor(1, Int32)
-                    pk4.store(Vec(pk).bitcast(Int32))
-                    dw = fx.Int32(out_off >> fx.Int64(1))
-                    fx.copy(st_4b, pk4, fx.slice(out_4b, (None, dw)))
-                elif const_expr(use_reduce):
+                if const_expr(use_reduce):
                     fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
@@ -1557,7 +1548,7 @@ def atomic_bf16_epilog(
             if valid:
                 store_one_mr(mr)
 
-        if const_expr(uncond_stores):
+        if const_expr(uncond_stores and route_out_fp4):
             token_limit = i32_M if const_expr(write_limit is None) else write_limit
             store_one_mr(mr, (token_id < token_limit) & (route_slot < fx.Int32(topk)))
         else:
