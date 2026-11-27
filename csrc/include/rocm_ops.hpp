@@ -2555,6 +2555,20 @@ namespace py = pybind11;
           py::arg("k"),                          \
           py::arg("device_id") = -1);
 
+#define M3_FUSED_INDEX_TOPK_PYBIND                \
+    m.def("m3_fused_index_topk_partial",          \
+          &aiter::m3_fused_index_topk_partial,    \
+          py::arg("idx_q"),                       \
+          py::arg("index_cache"),                 \
+          py::arg("partial"),                     \
+          py::arg("block_table"),                 \
+          py::arg("cu_seqlens_q"),                \
+          py::arg("prefix_lens"),                 \
+          py::arg("max_query_len"),               \
+          py::arg("nchunks"),                     \
+          py::arg("chunk_blocks"),                \
+          py::arg("scale"));
+
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
     m.def("get_mla_decode_head_plan_v1",                 \

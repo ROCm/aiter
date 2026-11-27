@@ -2120,6 +2120,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_m3_fused_index_topk": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/m3_fused_index_topk_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_sparse_prefill/fused_index_topk.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_metadata_pybind.cu'",
