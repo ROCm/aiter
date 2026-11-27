@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ctypes
 import itertools
 import logging
 import os
@@ -29,6 +30,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -1107,6 +1109,42 @@ def _test_prefill_quant_case(rank, shape, dtype, gemma_norm):
     return ret
 
 
+def _two_stage_barrier_case(rank, calls=64):
+    """Two-stage fused AR + RMSNorm has no end barrier, so back-to-back calls
+    rewrite each rank's staged shard right after peers read it. Every 4th call
+    one rank, in turn, lags, so peers run ahead of it. Each call must still
+    equal the one-stage path bit for bit, also once the barrier epochs wrap."""
+    ca = get_tp_group().device_communicator.ca_comm
+    torch.manual_seed(100 + rank)
+    xs = torch.randn(2, 4536, 6144, dtype=torch.bfloat16, device="cuda") * 0.1
+    res = torch.randn(4536, 6144, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(6144, dtype=torch.bfloat16, device="cuda") * 0.1
+    for near_wrap in (False, True):
+        if near_wrap:  # Signal: start, end uint32[512][64], then _flag uint32[512]
+            barrier_before_teardown()
+            ptr = ca._pool["meta"].data_ptr
+            words = ctypes.c_size_t(512 * 64 * 2 + 512)  # all set to 2**32 - 256
+            hip = load_hip_runtime()
+            assert hip.hipMemsetD32(ctypes.c_void_p(ptr), -256, words) == 0
+            barrier_before_teardown()
+        for m, quant in itertools.product((400, 2517, 4536), (False, True)):
+
+            def run(i, one_stage, m=m, quant=quant):  # alternate the two inputs
+                kw = {"use_1stage": one_stage, "post_per_token_quant": quant}
+                return ca.fused_ar_rms(
+                    xs[i % 2, :m], res[:m], w=w, eps=1e-6, gemma_norm=True, **kw
+                )
+
+            refs = [run(i, True) for i in range(2)]
+            bad = torch.zeros((), dtype=torch.int64, device="cuda")
+            for i in range(calls):  # back to back: no host sync until the end
+                if i % 4 == 0 and rank == i // 4 % 4:
+                    torch.cuda._sleep(1_000_000)  # longer than a few calls
+                for a, b in zip(run(i, False), refs[i % 2]):
+                    bad += (a.view(torch.uint8) != b.view(torch.uint8)).sum()
+            assert bad.item() == 0, f"{m=} {quant=} {near_wrap=}: {bad.item()} bytes"
+
+
 def _prefill_quant_worker(rank, shapes, distributed_init_method):
     torch.cuda.set_device(rank)
     set_custom_all_reduce(True)
@@ -1129,6 +1167,7 @@ def _prefill_quant_worker(rank, shapes, distributed_init_method):
             rank,
             pd.DataFrame(rows).to_markdown(index=False),
         )
+        _two_stage_barrier_case(rank)
         return rows
     finally:
         if dist.is_initialized():
@@ -1162,10 +1201,12 @@ try:
         _run_prefill_quant_regression(
             [
                 (12, 6144),
+                (400, 6144),
                 (511, 6144),
                 (512, 6144),
                 (513, 6144),
                 (2517, 6144),
+                (4536, 6144),
                 (513, 6176),
                 (513, 6160),
                 (2048, 8192),

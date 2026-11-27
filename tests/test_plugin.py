@@ -211,7 +211,14 @@ def test_run_error_propagates_without_native_fallback(monkeypatch):
 
 
 def test_enable_list_order_is_the_preference_order(monkeypatch):
-    """The enable order must beat alphabetical order, or it is not covered."""
+    """The enable order must beat alphabetical order, or it is not covered.
+
+    Both providers are asked. Selection compares reported measurements, and a
+    comparison needs every offer in hand -- there is no asking the first and
+    stopping, because whether a later provider reports a faster kernel is not
+    knowable without asking it. Neither of these reports anything, so the
+    enable order decides, which is what this test is about.
+    """
 
     zebra = _Provider("zebra", _candidate("zebra", 200))
     alpha = _Provider("alpha", _candidate("alpha", 100))
@@ -224,7 +231,7 @@ def test_enable_list_order_is_the_preference_order(monkeypatch):
 
     assert _route_add([])(2, 3) == 200
     assert zebra.select_calls == 1
-    assert alpha.select_calls == 0
+    assert alpha.select_calls == 1
 
 
 def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
@@ -704,12 +711,16 @@ def test_a_latency_that_cannot_mean_anything_is_refused(bad):
         )
 
 
-def test_a_reported_latency_does_not_influence_routing(monkeypatch):
-    """Observation, not input. The enable list is still the only preference.
+def test_a_bare_latency_does_not_influence_routing(monkeypatch):
+    """A number on its own is not a comparison, and does not decide anything.
 
-    If this ever became an input, a provider could win by reporting a small
-    number, and the enable list -- the one place that names an owner for the
-    decision -- would stop deciding.
+    Selection reads a *comparison*: a latency together with the AITER baseline
+    it was measured against, and the conditions. Without those, a provider
+    could win by reporting a small number -- and the enable list, the one place
+    that names an owner for the decision, would stop deciding. So a bare
+    `latency_us` is recorded, handed back, and ignored for routing, which is
+    what this asserts: 99999us is selected over 1.0us because the enable list
+    says so and neither report is comparable.
     """
 
     def candidate_at(name, latency, result):
@@ -731,7 +742,7 @@ def test_a_reported_latency_does_not_influence_routing(monkeypatch):
     plugin.configure(enable=("slowpoke", "speedy"), source="test")
     add = _route_add([])
 
-    assert add(2, 3) == 1, "the enable list decides, not the reported number"
+    assert add(2, 3) == 1, "the enable list decides; neither report is comparable"
     assert plugin.last_decision().provider == "slowpoke"
     assert plugin.last_decision().latency_us == 99999.0
 
@@ -1103,7 +1114,13 @@ def test_status_lists_what_is_deprecated_and_when_it_goes(monkeypatch):
     def add(left: int, right: int = 1) -> int:
         return left + right
 
-    assert plugin.status()["deprecations"] == (
+    # AITER's own routed ops now declare superseded op versions of their own, so
+    # select the two subjects this test creates rather than asserting that the
+    # whole registry holds nothing else.
+    owned = ("test.add", "aklr")
+    assert tuple(
+        entry for entry in plugin.status()["deprecations"] if entry["subject"] in owned
+    ) == (
         {
             "kind": "op-version",
             "subject": "test.add",
@@ -1721,3 +1738,570 @@ def test_the_kill_switch_hides_a_decision_taken_before_it(monkeypatch):
     monkeypatch.delenv("AITER_PLUGINS")
     plugin.reload_config()
     assert plugin.last_decision().provider == "aklr", "and it was not destroyed"
+
+
+# ---------------------------------------------------------------------------
+# Measured selection (RFC #7240 Change 1)
+#
+# Eligibility is still the enable list. What a report can do is decide which of
+# the already-enabled providers serves a call -- and only a report carrying all
+# four comparison fields, because a latency without a baseline says a kernel
+# took some microseconds and leaves open what it beat.
+# ---------------------------------------------------------------------------
+
+
+def _measured(provider: str, result: int, latency: float, baseline: float):
+    """A candidate whose report is complete enough to be compared."""
+
+    return plugin.KernelCandidate(
+        provider=provider,
+        kernel_id=f"{provider}-kernel",
+        artifact_digest="sha256:abc",
+        run=lambda *args, **kwargs: result,
+        latency_us=latency,
+        baseline_us=baseline,
+        baseline_path="aiter tuned row",
+        measured_under={"mode": "graph replay", "rounds": 3},
+        measurement_ref="benchmarks/run.py",
+    )
+
+
+def _enable(monkeypatch, *providers, exclude=()):
+    plugin.configure(
+        enable=tuple(p.name for p in providers), source="test", exclude=exclude
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: tuple(_EntryPoint(f"{p.name}-entry", p) for p in providers),
+    )
+
+
+def test_a_faster_report_outranks_enable_order(monkeypatch):
+    first = _Provider("first", _measured("first", 1, latency=9.0, baseline=10.0))
+    second = _Provider("second", _measured("second", 2, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, first, second)
+
+    assert _route_add([])(2, 3) == 2
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "second")
+    assert decision.reason == plugin.PROVIDER_FASTER
+    assert decision.baseline_us == 10.0
+    assert "4.0us" in decision.selected_over
+
+
+def test_a_report_that_does_not_beat_its_own_baseline_does_not_compete(monkeypatch):
+    """Faster than nothing is not a reason to route; the claim is the baseline."""
+
+    slower = _Provider("slower", _measured("slower", 1, latency=12.0, baseline=10.0))
+    plain = _Provider("plain", _candidate("plain", 2))
+    _enable(monkeypatch, slower, plain)
+
+    # The one that reported losing drops out; the one that reported nothing is
+    # still selectable, because nobody measured it either way.
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "plain"
+    assert plugin.last_decision().reason == "selected"
+
+
+def test_an_incomplete_report_falls_back_to_enable_order(monkeypatch):
+    """A latency without a baseline is not a comparison, and is not treated as one."""
+
+    partial = plugin.KernelCandidate(
+        provider="partial",
+        kernel_id="k",
+        artifact_digest="sha256:abc",
+        run=lambda *args, **kwargs: 1,
+        latency_us=1.0,  # no baseline_us, no conditions, no reference
+    )
+    first = _Provider("partial", partial)
+    second = _Provider("second", _measured("second", 2, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, first, second)
+
+    # The complete report wins -- not because the other is slower, which nobody
+    # measured, but because it is the only offer carrying a comparison.
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_a_single_provider_is_asked_once_and_never_compared(monkeypatch):
+    """The shape of every deployment so far: one provider, unchanged behaviour."""
+
+    only = _Provider("only", _measured("only", 7, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, only)
+
+    assert _route_add([])(2, 3) == 7
+    # Asked once: a lone provider has nothing to be compared against, so there
+    # is no second select() to pay for.
+    assert only.select_calls == 1
+    # It is still selected on its own report, which is what it reported for.
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_explain_reports_the_route_dispatch_would_take(monkeypatch):
+    """A diagnostic that disagrees with dispatch is worse than no diagnostic."""
+
+    first = _Provider("first", _measured("first", 1, latency=9.0, baseline=10.0))
+    second = _Provider("second", _measured("second", 2, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, first, second)
+
+    routed = _route_add([])
+    explained = plugin.explain("test.add", 2, 3)
+    routed(2, 3)
+    actual = plugin.last_decision()
+
+    assert explained.decision.provider == actual.provider
+    assert explained.decision.reason == actual.reason == plugin.PROVIDER_FASTER
+    assert explained.decision.selected_over == actual.selected_over
+
+
+def test_a_provider_failure_names_the_provider(monkeypatch):
+    """Containment is a framework excluding one kernel; it has to know whose."""
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("kernel exploded")
+
+    broken = plugin.KernelCandidate(
+        provider="broken",
+        kernel_id="broken-kernel",
+        artifact_digest="sha256:def",
+        run=explode,
+    )
+    _enable(monkeypatch, _Provider("broken", broken))
+
+    with pytest.raises(RuntimeError) as caught:
+        _route_add([])(2, 3)
+
+    # The failure is not caught, retried or replaced -- only labelled.
+    assert str(caught.value) == "kernel exploded"
+    assert caught.value.__aiter_provider__ == "broken"
+    assert caught.value.__aiter_kernel_id__ == "broken-kernel"
+
+
+# ---------------------------------------------------------------------------
+# Per-op exclusion (RFC #7240 Change 2)
+#
+# The environment controls this interface removed failed for one reason: they
+# accepted input and did nothing with it. Every rejection below is therefore an
+# exception, not a skip -- an exclusion that is accepted and does not exclude
+# is the same failure wearing a different name.
+# ---------------------------------------------------------------------------
+
+
+def _installed(monkeypatch, *providers):
+    """Install providers without enabling them, so exclude can be parsed."""
+
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: tuple(_EntryPoint(f"{p.name}-entry", p) for p in providers),
+    )
+
+
+def test_an_excluded_op_leaves_the_provider_serving_its_others(monkeypatch):
+    served = _Provider("multi", _candidate("multi", 5))
+    served.op_versions = {"test.add": {1}, "other.op": {1}}
+    _installed(monkeypatch, served)
+
+    plugin.configure(enable=("multi",), source="test", exclude=("multi:test.add",))
+    native: list[tuple[int, int]] = []
+    assert _route_add(native)(2, 3) == 5  # the native result, not the provider's
+    # The op was excluded, so the provider was never even asked.
+    assert served.select_calls == 0
+    assert plugin.last_decision().route == "native"
+    assert plugin.last_decision().reason == "provider-excluded"
+
+
+def test_exclusion_outranks_enable(monkeypatch):
+    """Enabled and excluded is excluded: one rule, no precedence table."""
+
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    plugin.configure(enable=("p",), source="test", exclude=("p:test.add",))
+    # 2 + 3 is also 5, so the value cannot tell the paths apart -- the native
+    # call being recorded can.
+    native: list[tuple[int, int]] = []
+    _route_add(native)(2, 3)
+    assert native == [(2, 3)]
+    assert served.select_calls == 0
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "test.add",  # bare op: cannot say whose
+        "p",  # bare provider: drop it from enable instead
+        "a:b:c",  # two separators
+        "",  # empty
+        ":test.add",  # no provider
+        "p:",  # no op
+    ],
+)
+def test_a_malformed_exclusion_raises(monkeypatch, entry):
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    with pytest.raises(ValueError):
+        plugin.configure(enable=("p",), source="test", exclude=(entry,))
+
+
+def test_an_unknown_provider_in_exclude_raises(monkeypatch):
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    with pytest.raises(ValueError, match="not installed"):
+        plugin.configure(enable=("p",), source="test", exclude=("ghost:test.add",))
+
+
+def test_excluding_an_op_a_provider_does_not_serve_raises(monkeypatch):
+    """Silently accepting it would leave a framework believing it had acted."""
+
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    with pytest.raises(ValueError, match="does not serve"):
+        plugin.configure(enable=("p",), source="test", exclude=("p:nonexistent",))
+
+
+def test_changing_only_the_exclusions_takes_effect(monkeypatch):
+    """A configure() that is accepted and does not apply is the failure to avoid."""
+
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    # One registration: route() refuses a second for the same op, and the same
+    # callable is what a long-lived process would be holding anyway.
+    native: list[tuple[int, int]] = []
+    add = _route_add(native)
+
+    plugin.configure(enable=("p",), source="test")
+    add(2, 3)
+    assert native == []  # the provider served it
+
+    plugin.configure(enable=("p",), source="test", exclude=("p:test.add",))
+    add(2, 3)
+    assert native == [(2, 3)]  # the exclusion took effect without a restart
+
+
+def test_an_empty_exclude_does_not_force_discovery(monkeypatch):
+    """Discovery stays lazy for every caller that does not exclude anything."""
+
+    calls = []
+
+    def counted():
+        calls.append(1)
+        return ()
+
+    monkeypatch.setattr(plugin, "_entry_points", counted)
+    plugin.configure(enable=("p",), source="test")
+    assert calls == []
+
+
+def test_status_lists_the_exclusions_in_the_form_configure_accepts(monkeypatch):
+    served = _Provider("p", _candidate("p", 5))
+    served.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, served)
+
+    plugin.configure(enable=("p",), source="test", exclude=("p:test.add",))
+    assert plugin.status()["excluded"] == ("p:test.add",)
+
+
+# ---------------------------------------------------------------------------
+# validate() / check_report(): what a provider author can check before shipping
+#
+# Without these, the first sign that a provider is wired up wrongly is a
+# routing decision that quietly went native, which looks the same as a
+# provider correctly declining.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_passes_a_correctly_declared_provider(monkeypatch):
+    good = _Provider("good", _candidate("good"))
+    good.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, good)
+    _route_add([])  # registering the op is what makes the name known
+
+    report = plugin.validate("good")
+    assert report.installed and report.problems == ()
+    assert report.ops == {"test.add": "ok"}
+    assert bool(report) is True
+
+
+def test_validate_names_an_op_aiter_does_not_route(monkeypatch):
+    """The typo a provider author cannot otherwise see: nothing happens."""
+
+    wrong = _Provider("wrong", _candidate("wrong"))
+    wrong.op_versions = {"test.addd": {1}}
+    _installed(monkeypatch, wrong)
+    _route_add([])
+
+    report = plugin.validate("wrong")
+    assert not report
+    assert "not an op AITER routes" in report.ops["test.addd"]
+    # The message carries what the names actually are, so the fix does not
+    # require reading AITER's source.
+    assert "test.add" in report.ops["test.addd"]
+
+
+def test_validate_catches_a_version_the_contract_does_not_accept(monkeypatch):
+    stale = _Provider("stale", _candidate("stale"))
+    stale.op_versions = {"test.add": {99}}
+    _installed(monkeypatch, stale)
+    _route_add([])
+
+    report = plugin.validate("stale")
+    assert not report
+    assert "does not accept" in report.ops["test.add"]
+
+
+def test_validate_reports_an_uninstalled_provider_rather_than_raising(monkeypatch):
+    _installed(monkeypatch)
+    report = plugin.validate("absent")
+    assert not report.installed
+    assert "not discovered" in report.problems[0]
+
+
+def test_validate_says_why_a_provider_was_skipped_at_discovery(monkeypatch):
+    """Discovery reads op_versions, so a provider that throws never arrives.
+
+    Without this the author sees an installed wheel and no routing, with
+    nothing connecting the two: status() lists it under skipped_providers, but
+    only for somebody who already suspects discovery is where to look.
+    """
+
+    class Hostile:
+        name = "hostile"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+
+        @property
+        def op_versions(self):
+            raise RuntimeError("backend gone")
+
+        def select(self, op, args, kwargs):
+            return None
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("hostile-ep", Hostile()),)
+    )
+    report = plugin.validate("hostile")
+    assert not report.installed
+    # The reason discovery rejected it, not a generic "not found".
+    assert any("backend gone" in problem for problem in report.problems)
+
+
+def test_check_report_says_exactly_what_a_measurement_is_missing():
+    complete = _measured("p", 1, latency=4.0, baseline=10.0)
+    assert plugin.check_report(complete) == ()
+
+    silent = _candidate("p")
+    assert plugin.check_report(silent) == (
+        "latency_us is not reported, so nothing is compared",
+    )
+
+    partial = plugin.KernelCandidate(
+        provider="p",
+        kernel_id="k",
+        artifact_digest="sha",
+        run=lambda *a, **k: None,
+        latency_us=4.0,
+    )
+    missing = plugin.check_report(partial)
+    assert len(missing) == 4
+    assert any("baseline_us" in item for item in missing)
+    assert any("measurement_ref" in item for item in missing)
+
+
+# ---------------------------------------------------------------------------
+# Mixed fields, and more than two providers
+#
+# A deployment can have many providers on one contract, each reporting or not
+# independently. The rules are small, but their combinations are where a
+# provider learns whether declining to report costs it anything, so each one is
+# pinned rather than left to follow from the others.
+# ---------------------------------------------------------------------------
+
+
+def _silent(name, result):
+    """A candidate that reports nothing: unmeasured, not slow."""
+
+    return plugin.KernelCandidate(
+        provider=name,
+        kernel_id=f"{name}-kernel",
+        artifact_digest="sha256:abc",
+        run=lambda *args, **kwargs: result,
+    )
+
+
+def test_a_comparable_report_outranks_a_provider_that_reported_nothing(monkeypatch):
+    """Evidence beats enable order, even when the silent one is listed first."""
+
+    quiet = _Provider("quiet", _silent("quiet", 1))
+    loud = _Provider("loud", _measured("loud", 2, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, quiet, loud)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_reporting_nothing_still_wins_over_reporting_a_loss(monkeypatch):
+    """Silence is "unmeasured", not "slow" -- a measured loss is worse.
+
+    The provider that measured itself against AITER and lost has said
+    something; the one that said nothing may well be faster and simply has not
+    checked. Treating silence as a loss would punish the provider that declines
+    to publish a number it cannot stand behind.
+    """
+
+    lost = _Provider("lost", _measured("lost", 1, latency=12.0, baseline=10.0))
+    quiet = _Provider("quiet", _silent("quiet", 2))
+    _enable(monkeypatch, lost, quiet)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "quiet"
+    assert plugin.last_decision().reason == "selected"
+
+
+def test_everyone_silent_is_exactly_the_old_behaviour(monkeypatch):
+    """Three providers, none reporting: enable order, unchanged."""
+
+    first = _Provider("first", _silent("first", 1))
+    second = _Provider("second", _silent("second", 2))
+    third = _Provider("third", _silent("third", 3))
+    _enable(monkeypatch, first, second, third)
+
+    assert _route_add([])(2, 3) == 1
+    assert plugin.last_decision().provider == "first"
+    assert plugin.last_decision().reason == "selected"
+
+
+def test_three_providers_one_of_each_kind(monkeypatch):
+    """Reported-and-faster, reported-and-slower, and silent, together."""
+
+    lost = _Provider("lost", _measured("lost", 1, latency=12.0, baseline=10.0))
+    quiet = _Provider("quiet", _silent("quiet", 2))
+    won = _Provider("won", _measured("won", 3, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, lost, quiet, won)
+
+    # Listed last and still selected: only it carries a comparison it wins.
+    assert _route_add([])(2, 3) == 3
+    decision = plugin.last_decision()
+    assert decision.provider == "won"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    assert all(p.select_calls == 1 for p in (lost, quiet, won))
+
+
+def test_the_fastest_of_several_comparable_reports_serves(monkeypatch):
+    """Absolute reported time, not the largest margin over its own baseline."""
+
+    # "wide" claims the bigger improvement (10x) but is slower in absolute
+    # terms; the offers answer the same call, so absolute time is what compares.
+    wide = _Provider("wide", _measured("wide", 1, latency=5.0, baseline=50.0))
+    quick = _Provider("quick", _measured("quick", 2, latency=3.0, baseline=4.0))
+    middle = _Provider("middle", _measured("middle", 3, latency=4.0, baseline=9.0))
+    _enable(monkeypatch, wide, quick, middle)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "quick"
+
+
+def test_excluding_the_fastest_hands_the_call_to_the_next_comparable(monkeypatch):
+    """What a framework does when one kernel is fast and wrong."""
+
+    fast = _Provider("fast", _measured("fast", 1, latency=3.0, baseline=10.0))
+    fast.op_versions = {"test.add": {1}}
+    slower = _Provider("slower", _measured("slower", 2, latency=6.0, baseline=10.0))
+    slower.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, fast, slower)
+
+    plugin.configure(
+        enable=("fast", "slower"), source="test", exclude=("fast:test.add",)
+    )
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "slower"
+    # Excluded before being asked, not after being compared.
+    assert fast.select_calls == 0
+
+
+def test_one_provider_raising_does_not_disturb_the_comparison(monkeypatch):
+    """Isolation holds while comparing, not only while asking one at a time."""
+
+    class Exploding:
+        name = "exploding"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.add": {1}}
+
+        def select(self, op, args, kwargs):
+            raise RuntimeError("select is broken")
+
+    good = _Provider("good", _measured("good", 7, latency=4.0, baseline=10.0))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("x", Exploding()), _EntryPoint("g", good)),
+    )
+    plugin.configure(enable=("exploding", "good"), source="test")
+
+    assert _route_add([])(2, 3) == 7
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_most_providers_declining_is_the_partitioned_case(monkeypatch):
+    """Many providers on one contract, each serving its own slice.
+
+    A deployment can place several providers on one op and have each decline
+    everything outside the shapes it owns. Only one offers, so there is nothing
+    to compare and the reason says so -- the comparison machinery costs such a
+    deployment nothing.
+    """
+
+    declining = [_Provider(f"slice{i}", None) for i in range(5)]
+    owner = _Provider("owner", _silent("owner", 9))
+    _enable(monkeypatch, *declining, owner)
+
+    assert _route_add([])(2, 3) == 9
+    assert plugin.last_decision().provider == "owner"
+    assert plugin.last_decision().reason == "selected"
+    assert all(p.select_calls == 1 for p in declining)
+
+
+def test_explain_says_why_each_offer_was_not_taken(monkeypatch):
+    """A provider that offered and lost must not look like one that declined.
+
+    explain() exists to answer "why is this not running mine". Reporting only
+    the providers that returned nothing leaves the ones that offered and were
+    not chosen invisible -- installed, enabled, offering, not running, and no
+    line about it anywhere.
+    """
+
+    won = _Provider("won", _measured("won", 1, latency=3.0, baseline=10.0))
+    outbid = _Provider("outbid", _measured("outbid", 2, latency=6.0, baseline=10.0))
+    lost = _Provider("lost", _measured("lost", 3, latency=12.0, baseline=10.0))
+    partial = _Provider(
+        "partial",
+        plugin.KernelCandidate(
+            provider="partial",
+            kernel_id="k",
+            artifact_digest="sha",
+            run=lambda *a, **k: 4,
+            latency_us=1.0,  # no baseline: not comparable
+        ),
+    )
+    quiet = _Provider("quiet", None)  # declines outright
+    _enable(monkeypatch, won, outbid, lost, partial, quiet)
+
+    _route_add([])
+    explained = plugin.explain("test.add", 2, 3)
+
+    assert explained.decision.provider == "won"
+    assert "won" not in explained.declines
+    # Each of the other four gets a line, and the lines say different things.
+    assert "another candidate was faster" in explained.declines["outbid"]
+    assert "against its own baseline" in explained.declines["lost"]
+    assert "report is incomplete" in explained.declines["partial"]
+    assert explained.declines["quiet"] == "declined"

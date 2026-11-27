@@ -57,6 +57,9 @@ _STREAM_VARIANTS = (
     "gfx1250_split5",
     "gfx1250_split10",
     "gfx1250_split14",
+    "gfx1250_split3",
+    "mid768",  # gfx950, H=5120, T=513..768: five column splits.
+    "post192",  # gfx950, H=5120, T=129..256: register-local post-mix, ten waves.
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -72,6 +75,8 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "mid512",
         "mid1024",
         "mid2048",
+        "mid768",
+        "post192",
         "gfx1250_split32",
         "gfx1250_split16",
         "gfx1250_split8",
@@ -80,6 +85,7 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "gfx1250_split5",
         "gfx1250_split10",
         "gfx1250_split14",
+        "gfx1250_split3",
     )
 )
 
@@ -93,9 +99,11 @@ _GFX1250_SPLITS = (32, 16, 8, 4, 2)
 # On 256 CUs, (split, most token tiles) per hidden size from a gfx1250 sweep
 # of all split counts that divide H / 32. Splits 10 and 14 fill up to 240 and
 # 252 CUs where 16 or 8 would leave a third idle; clusters of 5 (three per
-# 16-WGP shader engine) hold up to 48 tiles.
+# 16-WGP shader engine) hold up to 48 tiles. Split 3 deals 128-column units
+# (1792/1664/1664 for H = 5120) and fills up to 240 CUs from 65 to 80 tiles;
+# 81..128 tiles stay on split 2.
 _GFX1250_SPLIT_TABLE = {
-    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (2, 128)),
+    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (3, 80), (2, 128)),
     7168: ((32, 8), (14, 18), (8, 32), (4, 64), (2, 128)),
 }
 
@@ -103,6 +111,13 @@ _GFX1250_SPLIT_TABLE = {
 def _select_stream_variant(tokens, hidden=5120):
     if tokens == 0:
         return "generic", 1
+    # H=5120 specializations: post192 replaces mid256 over 9..16 token tiles
+    # (no-post shares mid256's kernel), and mid768 replaces mid1024 over
+    # 33..48 tiles, where five splits keep the grid within 240 CUs.
+    if 128 < tokens <= 256 and hidden == 5120:
+        return "post192", 16
+    if 512 < tokens <= 768 and hidden == 5120:
+        return "mid768", 5
     if tokens == 4:
         return "decode4", 32
     if tokens < 4:
@@ -120,7 +135,8 @@ def _select_stream_variant(tokens, hidden=5120):
             if limit == 384 and hidden != 5120:
                 split = 8
             return f"mid{limit}", split
-    if tokens == 4160:
+    # One to eight tiles past whole rounds of 256 CUs: split them over H.
+    if tokens > 4096 and 1 <= (tokens + 15) // 16 % 256 <= 8:
         return "tail", 1
     return "large", 1
 
@@ -346,10 +362,13 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             variant, selected_split, distributed = "generic", 1, False
         tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
+        # Split 3 deals whole 128-column units (ragged for H = 5120).
         if (
             not isinstance(split_k, int)
             or not 1 <= split_k <= 32
-            or hidden % (32 * split_k)
+            or (
+                hidden % 128 if variant == "gfx1250_split3" else hidden % (32 * split_k)
+            )
         ):
             raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
         # The distributed kernels have a bounded wait and handoff path;
@@ -452,8 +471,15 @@ def mega_mhc(
     capture stream with sufficient scratch capacity before graph capture.
     Calls and graphs sharing that scratch must execute serially. The read-only
     pack can be shared across streams after the loading stream has finished.
-    Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
-    not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
+    Pass an explicit workspace to own private scratch instead.
+
+    w_preshuffle_bf16=False takes the raw FP32 fn (24, 4*H) instead. On gfx942
+    with H=5120, post-mix and BF16 output it runs the ASM seam kernels
+    (aiter.mhc_fused_post_pre_delayed) and aiter.rms_norm, writing into
+    residual_out; workspace is unused there. The norm then rounds the layer
+    input to BF16 before RMSNorm, so it can differ by one BF16 ulp. Elsewhere
+    fn is packed with mega_mhc_shuffle_fn on every call before the HIP kernel;
+    pack once and pass w_preshuffle_bf16=True to avoid that cost.
     H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
     other positive repeat counts use the generic stream kernel with the same
     pack.
@@ -483,7 +509,6 @@ def mega_mhc(
     resS[k // 32][stream][token][k % 32] in the same (T, 4, H) shape.
     sublayer_out and the layer input stay plain.
     """
-    assert w_preshuffle_bf16, "mega_mhc requires w_preshuffle_bf16=True"
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
         raise ValueError("residual must be a GPU (T, 4, H) tensor")
     t, _, h = residual.shape
@@ -491,7 +516,10 @@ def mega_mhc(
     if out_dtype not in ("bf16", "mxfp8"):
         raise ValueError("out_dtype must be 'bf16' or 'mxfp8'")
     _require_tensor(residual, "residual", (t, 4, h), torch.bfloat16, device)
-    _require_tensor(fn, "fn", (h // 32, 4, 3, 4, 16, 4), torch.int32, device)
+    if w_preshuffle_bf16:
+        _require_tensor(fn, "fn", (h // 32, 4, 3, 4, 16, 4), torch.int32, device)
+    else:
+        _require_tensor(fn, "fn", (24, 4 * h), torch.float32, device)
     _require_tensor(hc_scale, "hc_scale", (3,), torch.float32, device)
     _require_tensor(hc_base, "hc_base", (24,), torch.float32, device)
     _require_tensor(norm_weight, "norm_weight", (h,), torch.bfloat16, device)
@@ -541,6 +569,33 @@ def mega_mhc(
             raise ValueError("Mega-MHC mxfp8 on gfx1250 requires H divisible by 128")
         if res_preshuffle and arch != "gfx1250":
             raise RuntimeError("Mega-MHC res_preshuffle requires gfx1250")
+        if not w_preshuffle_bf16:
+            from .mhc import mhc_fused_post_pre_delayed_asm_supported
+
+            if (
+                has_post
+                and out_dtype == "bf16"
+                and mhc_fused_post_pre_delayed_asm_supported(h, 4, arch)
+            ):
+                return _mega_mhc_asm(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    pre_mix,
+                    sublayer_out,
+                    post_layer_mix,
+                    comb_res_mix,
+                    norm_weight,
+                    norm_eps,
+                    residual_out,
+                )
+            fn = mega_mhc_shuffle_fn(fn)
         if workspace is None:
             scratch = _prepare_scratch(device, t, h)
         else:
@@ -570,12 +625,23 @@ def mega_mhc(
             layer_input = (norm, quant_out, quant_scale)
         partials, counters = scratch.partials, scratch.counters
         variant = scratch.variant
+        split_k = scratch.split_k
         if sinkhorn_repeat != 20:
             variant = "generic"
             partials, counters = (
                 scratch.generic_partials,
                 scratch.generic_counters,
             )
+            # The generic kernel needs a split that divides H / 32; split 3
+            # scratch holds more than two splits.
+            if h % (32 * split_k):
+                split_k = 2
+                partials = partials[:split_k]
+        elif res_preshuffle and variant == "gfx1250_split3":
+            # The shuffled residual has no ragged split; split 2 fits the same
+            # tagged scratch and one workgroup per CU.
+            variant, split_k = "gfx1250_split2", 2
+            partials = partials[: split_k * t * 32]
         launch = _native_launcher(h if h in _STREAM_HIDDEN_SIZES else 0)
         launch(
             residual_out,
@@ -602,7 +668,7 @@ def mega_mhc(
             hc_post_mult_value,
             norm_eps,
             sinkhorn_repeat,
-            scratch.split_k,
+            split_k,
             has_post,
             pre_mix is None,
             _STREAM_VARIANTS.index(variant),
@@ -611,6 +677,61 @@ def mega_mhc(
             scale_row_major,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre
+
+
+def _mega_mhc_asm(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    pre_mix,
+    sublayer_out,
+    post_layer_mix,
+    comb_res_mix,
+    norm_weight,
+    norm_eps,
+    residual_out,
+):
+    """gfx942 H=5120 path of mega_mhc: ASM seam kernels, then aiter.rms_norm."""
+    from .mhc import _mhc_seam_asm_launch
+    from .rmsnorm import rms_norm
+
+    t, _, h = residual.shape
+    device = residual.device
+    post_out = torch.empty((t, 4, 1), device=device, dtype=torch.float32)
+    comb_out = torch.empty((t, 4, 4), device=device, dtype=torch.float32)
+    next_pre = torch.empty((t, 4), device=device, dtype=torch.float32)
+    if not t:
+        norm = torch.empty((0, h), device=device, dtype=torch.bfloat16)
+        return residual_out, post_out, comb_out, norm, next_pre
+    layer_input = torch.empty((t, h), device=device, dtype=torch.bfloat16)
+    _mhc_seam_asm_launch(
+        residual_out,
+        layer_input,
+        post_out,
+        comb_out,
+        next_pre,
+        residual,
+        sublayer_out,
+        post_layer_mix.view(t, 4),
+        comb_res_mix,
+        pre_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    norm = rms_norm(layer_input, norm_weight, norm_eps)
+    return residual_out, post_out, comb_out, norm, next_pre
 
 
 # ---------------------------------------------------------------------------

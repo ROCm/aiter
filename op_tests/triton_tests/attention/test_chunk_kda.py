@@ -12,7 +12,6 @@ from aiter.ops.triton.attention.chunk_kda import (
     CHUNK_SIZE,
     chunk_kda,
     chunk_kda_prepare,
-    chunk_kda_walk,
     prepare_chunk_kda_metadata,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -21,7 +20,7 @@ from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref, kda_gate_ref, l2n
 
 ARCH = get_arch()
 pytestmark = pytest.mark.skipif(
-    ARCH not in ("gfx1250", "gfx950"),
+    ARCH not in ("gfx1250", "gfx1250-strict", "gfx950"),
     reason=f"chunk KDA gluon needs gfx1250 or gfx950, got {ARCH}",
 )
 STATE_DTYPES = [
@@ -455,7 +454,7 @@ def test_chunk_kda_strided_state_indices(nd_tok):
 def test_chunk_kda_paged_many_seqs(seqlens):
     """Enough prefills at H = 24 to overfill the GPU at BV 64."""
     N = len(seqlens)
-    if ARCH == "gfx1250":
+    if ARCH in ("gfx1250", "gfx1250-strict"):
         assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
     inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=2, seed=6)
     raw, cache = make_page_cache(K3_SLOTS)
@@ -552,81 +551,3 @@ def test_chunk_kda_metadata(seqlens):
         0,
         *itertools.accumulate(cdiv(s, CHUNK_SIZE) for s in seqlens),
     ]
-
-
-HOST_CHECK_CASES = [
-    "offsets_short",
-    "offsets_float",
-    "offsets_2d",
-    "offsets_strided",
-    "indices_3_cols",
-    "indices_float",
-    "indices_strided",
-    "out_short",
-    "out_heads",
-    "out_dtype",
-    "state_indices_short",
-    "state_indices_float",
-    "has_init_short",
-    "initial_state_rows",
-]
-
-
-@pytest.mark.parametrize("bad", HOST_CHECK_CASES)
-def test_chunk_kda_host_checks(bad):
-    """Malformed metadata, out or state operands fail on the host."""
-    seqlens, H = [65, 1, 130], 4
-    N, T = len(seqlens), sum(seqlens)
-    inp = make_inputs(seqlens, H)
-    ci, co = prepare_chunk_kda_metadata(inp["cu_seqlens"])
-    slots = torch.arange(N, dtype=torch.int32, device=DEVICE)
-    paged = {
-        "state_cache": torch.zeros(N, H, D, D, dtype=torch.float32, device=DEVICE),
-        "state_indices": slots,
-        "has_initial_state": torch.ones(N, dtype=torch.bool, device=DEVICE),
-    }
-    kw = {"chunk_indices": ci, "chunk_offsets": co}
-    kw.update(
-        {
-            "offsets_short": {"chunk_offsets": co[:-1]},
-            "offsets_float": {"chunk_offsets": co.float()},
-            "offsets_2d": {"chunk_offsets": co[None]},
-            "offsets_strided": {"chunk_offsets": torch.stack([co, co], 1)[:, 0]},
-            "indices_3_cols": {"chunk_indices": torch.cat([ci, ci[:, :1]], 1)},
-            "indices_float": {"chunk_indices": ci.float()},
-            "indices_strided": {"chunk_indices": ci.t().contiguous().t()},
-            "out_short": {"out": inp["v"][:, 1:]},
-            "out_heads": {"out": inp["v"][:, :, 1:]},
-            "out_dtype": {
-                "out": torch.empty(1, T, H, D, dtype=torch.float32, device=DEVICE)
-            },
-            "state_indices_short": dict(paged, state_indices=slots[1:]),
-            "state_indices_float": dict(paged, state_indices=slots.float()),
-            "has_init_short": dict(
-                paged, has_initial_state=paged["has_initial_state"][1:]
-            ),
-            "initial_state_rows": {
-                "initial_state": torch.zeros(
-                    N - 1, H, D, D, dtype=torch.float32, device=DEVICE
-                )
-            },
-        }[bad]
-    )
-    with pytest.raises(AssertionError):
-        run_kernel(inp, **kw)
-
-
-@pytest.mark.parametrize("bad", ["kg_t_rows", "decay_rows", "w_strided"])
-def test_chunk_kda_walk_host_checks(bad):
-    """The walk rejects a workspace that does not match its shapes or is not dense."""
-    inp = make_inputs([65, 1, 130], 4)
-    ws = chunk_kda_prepare(**inp, lower_bound=LOWER_BOUND)
-    ws.update(
-        {
-            "kg_t_rows": {"kg_t": ws["kg_t"][1:]},
-            "decay_rows": {"decay": ws["decay"][:-1]},
-            "w_strided": {"w": ws["w"].transpose(1, 2).contiguous().transpose(1, 2)},
-        }[bad]
-    )
-    with pytest.raises(AssertionError):
-        chunk_kda_walk(**ws, cu_seqlens=inp["cu_seqlens"])

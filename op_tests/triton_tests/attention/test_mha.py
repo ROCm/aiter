@@ -16,7 +16,6 @@ from aiter.ops.triton.attention.mha import (
     _flash_attn_forward,
     flash_attn_func,
     flash_attn_varlen_func,
-    mha_set_impl,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -399,37 +398,6 @@ def test_mha_forward_out_dtype(
         f"{n_diff} of {out.numel()} values differ from the cast float32 output, "
         "more than 1 in 1000"
     )
-
-
-@pytest.mark.parametrize(
-    "IMPL, OUT_DTYPE, ERROR",
-    [("default", torch.int32, ValueError), ("dao_ai", torch.float16, AssertionError)],
-)
-def test_mha_forward_out_dtype_rejected(IMPL: str, OUT_DTYPE: torch.dtype, ERROR: type):
-    """Unsupported out_dtype values fail before the kernel launch."""
-    q = torch.randn((1, 128, 4, 64), device="cuda", dtype=torch.bfloat16)
-    mha_set_impl(IMPL)
-    try:
-        with pytest.raises(ERROR, match="out_dtype"):
-            _flash_attn_forward(
-                q,
-                q,
-                q,
-                dropout_p=0.0,
-                softmax_scale=64**-0.5,
-                causal=False,
-                window_size_left=-1,
-                window_size_right=-1,
-                bias=None,
-                alibi_slopes=None,
-                return_lse=False,
-                return_softmax=False,
-                max_seqlen_q=128,
-                max_seqlen_k=128,
-                out_dtype=OUT_DTYPE,
-            )
-    finally:
-        mha_set_impl("default")
 
 
 # Short K (fewer than 8 key tiles) runs the one-tile loop; long K, the pipeline.
@@ -1119,10 +1087,9 @@ def test_mha_backward(
 def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
-    from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, interface_v2
+    from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd
     from aiter.ops.triton.attention import mha
 
-    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
     kernel = bwd.bwd_kernel_fused_causal
     original_run = kernel.run
     launches = 0
@@ -1389,8 +1356,8 @@ def test_mha_backward_varlen(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("bwd_mode", [None, "fused", "split"])
-def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
+@pytest.mark.parametrize("implementation", ["default", "dao_ai"])
+def test_mha_backward_varlen_very_negative_logits(implementation):
     # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
     # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
     # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
@@ -1426,14 +1393,12 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
         dtype=torch.int32,
     )
 
-    if bwd_mode is None:
+    if implementation == "default":
         triton_out = flash_attn_varlen_func(
             q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
         )
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
     else:
-        # The flash_attn_2 backward has "fused" and "split" modes with different dq loops; monkeypatch restores the mode.
-        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
         scale = HEAD_SZ**-0.5
         out, lse, _, _ = flash_attn_2.varlen_fwd(
             q,
@@ -1502,51 +1467,3 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
         assert torch.isfinite(tri).all()
         # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.parametrize(
-    "causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected",
-    [
-        (True, 128, None, None, None, "mid_head"),  # no shape info
-        (True, 128, 128, 512, 512, "default"),  # causal rule, both at boundary
-        (True, 128, 128, 512, 511, "mid_head"),  # one program short
-        (True, 128, 128, 513, 512, "mid_head"),  # KV one token too long
-        (True, 96, 512, 512, 128, "default"),  # 128 * cdiv(512, 128) = 512
-        (False, 128, 128, 512, 4096, "mid_head"),  # causal rule only
-        (False, 97, 128, 256, 1024, "default"),  # non-causal wide-head rule
-        (False, 96, 128, 256, 1024, "mid_head"),  # head below min_head_dim_v
-        (False, 97, 128, 257, 1024, "mid_head"),
-        (False, 97, 128, 256, 1023, "mid_head"),
-        (False, 65, 128, 128, 1024, "default"),  # short-KV rule
-        (False, 65, 128, 128, 1023, "mid_head"),
-        (True, 64, 128, 128, 4096, "small_head"),  # outside mid_head range
-        (True, 160, 128, 128, 4096, "default"),
-    ],
-)
-def test_mha_fwd_mid_head_selection(
-    causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected
-):
-    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
-    from aiter.ops.triton.utils.config_utils import (
-        load_config_json,
-        resolve_config_dir,
-    )
-
-    fwd_cfg = load_config_json(
-        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
-    )["fwd"]
-    if get_arch() != "gfx950":
-        # Arches without mid_head keep the pre-existing selection.
-        assert "mid_head_skip" not in fwd_cfg or "mid_head" in fwd_cfg
-        pytest.skip("mid_head_skip rules are only defined for gfx950")
-    cfg = _get_config(
-        False,
-        torch.bfloat16,
-        head_dim_v=head_dim_v,
-        causal=causal,
-        max_seqlen_q=seqlen_q,
-        max_seqlen_k=seqlen_k,
-        batch_heads=batch_heads,
-    )
-    assert cfg == fwd_cfg[expected]

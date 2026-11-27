@@ -146,6 +146,36 @@ def apply_activation(y: torch.Tensor, activation: str):
     return y
 
 
+def conv_padding_reference(
+    source,
+    weight,
+    bias=None,
+    stride=1,
+    padding=0,
+    dilation=1,
+    padding_mode="zeros",
+):
+    """Reference convolution without using production padding preparation."""
+    if source.ndim == 4:
+        convolution = F.conv2d
+    elif source.ndim == 5:
+        convolution = F.conv3d
+    else:
+        raise ValueError(
+            f"convolution reference requires a 4-D or 5-D input, got {source.ndim}-D"
+        )
+    if padding_mode != "zeros":
+        spatial_padding = (
+            (padding,) * (source.ndim - 2) if isinstance(padding, int) else padding
+        )
+        pad = tuple(
+            value for amount in reversed(spatial_padding) for value in (amount, amount)
+        )
+        source = F.pad(source, pad, mode=padding_mode)
+        padding = 0
+    return convolution(source, weight, bias, stride, padding, dilation)
+
+
 # -- Architecture gating ------------------------------------------------------
 # NOTE: CDNA configs are not tuned at all - these are included only so
 # correctness tests can run on CDNA hardware without being skipped.
@@ -159,6 +189,7 @@ SUPPORTED_ARCHS = {
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
     },
     "CDNA": {"gfx942", "gfx950"},
 }

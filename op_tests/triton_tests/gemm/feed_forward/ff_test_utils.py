@@ -176,5 +176,7 @@ def ff_gated_test(
     """
     Note: There's a small distinction between Triton and Torch's implementations of silu
     (due to tl.sigmoid() vs torch.sigmoid()). The gated outputs can differ by as much as 3%.
+    The bf16 output is accumulated with atomic adds, whose order changes the rounding.
     """
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    atol = 2e-1 if dtype == torch.bfloat16 else 1e-1
+    torch.testing.assert_close(triton_out, torch_out, atol=atol, rtol=1e-1)
