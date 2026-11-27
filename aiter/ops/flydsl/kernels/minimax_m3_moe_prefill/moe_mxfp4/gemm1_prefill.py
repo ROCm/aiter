@@ -35,6 +35,9 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels import (
     buffer_ops,
 )
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.tile_map import (
+    tile_n_bits,
+)
 
 _N_WAVES = 4
 
@@ -258,8 +261,6 @@ def _divmod_nonneg(a, b):
 
 
 # ── FP4 scaled MFMA ──────────────────────────────────────────────────────────
-_FP4_CBSZ = 4
-_FP4_BLGP = 4
 _FP4_PACK = 2  # pack_M = pack_N = pack_K = 2
 
 
@@ -584,8 +585,8 @@ def compile_moe_gemm1(
 
     Block order comes from an int32 table built on the GPU by ``tile_map.py``
     (one small kernel; ``tile_map[grid_size]`` holds the number of valid entries,
-    so no host sync): ``tile_map[remapped block] = m_tile << 3 | n_tile`` (-1 =
-    nothing to do), laid out expert by expert and n-slab-major inside an expert,
+    so no host sync): ``tile_map[remapped block] = m_tile << tile_n_bits(I) | n_tile``
+    (-1 = nothing to do), laid out expert by expert and n-slab-major inside an expert,
     so the 32 CUs of one XCD chew through one expert with the same 768 KB
     gate/up slab of W13 in L2. The hardware deals
     consecutive block ids round-robin over the 8 XCDs, so block id b is first
@@ -601,7 +602,9 @@ def compile_moe_gemm1(
     N_TILES_B = LDS_BLOCK_N // 2 // 16  # = 4
 
     assert BLOCK_M in (128, 256)
-    assert K % BLOCK_K == 0 and I % LDS_BLOCK_N == 0 and (2 * I) % 256 == 0
+    # I % 256: an output scale row is whole 256-B blocks of 8 32-column groups
+    assert K % BLOCK_K == 0 and I % 256 == 0, (K, I)
+    N_BITS = tile_n_bits(I)
     K_ITERS = K // BLOCK_K
     UNROLL = 4 if (K_ITERS - 4) % 4 == 0 else 2
     assert K_ITERS >= 4 and (K_ITERS - 4) % UNROLL == 0, K_ITERS
@@ -686,8 +689,8 @@ def compile_moe_gemm1(
             )
         )
         entry = in_chunk.select(entry, fx.Int32(-1))
-        tile_i = entry >> 3
-        tile_j = entry & 7
+        tile_i = entry >> N_BITS
+        tile_j = entry & ((1 << N_BITS) - 1)
         block_valid = entry >= 0
         # ---- routing: this m-tile's expert ----
         expert = fx.Int32(

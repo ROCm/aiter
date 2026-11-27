@@ -14,7 +14,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 
-from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.loaders import (
+from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_flydsl_common.utils import (
     _min,
 )
 
@@ -23,9 +23,14 @@ _MAX_BLOCKS = 4096  # >= max_sorted / BM (1151 at 65536 tokens, topk 4, BM 256)
 _SEARCH_STEPS = 13  # 2^13 > _MAX_BLOCKS
 
 
+def tile_n_bits(I: int) -> int:
+    """N_BITS of the entries: gemm1 decodes them with the same width."""
+    return (I // 128 - 1).bit_length()
+
+
 def compile_tile_map(*, I: int, BM: int = 128):
     NB_N = I // 128
-    N_BITS = (NB_N - 1).bit_length()
+    N_BITS = tile_n_bits(I)
     N_CTAS = _MAX_BLOCKS // _THREADS
     TAIL_ITERS = (_MAX_BLOCKS * NB_N + 8) // (_THREADS * N_CTAS) + 1
 

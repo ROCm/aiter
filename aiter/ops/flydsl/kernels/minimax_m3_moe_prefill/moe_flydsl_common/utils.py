@@ -5,6 +5,7 @@
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
+from flydsl.expr.typing import Vector as Vec
 
 # launch.compile_hints: preload kernel arguments into SGPRs (the first 56 bytes)
 PRELOAD_HINTS = {
@@ -32,3 +33,16 @@ def _lds_atomic_add_i32(ptr, value):
             alignment=4,
         ).result
     )
+
+
+def _min(a, b):
+    return (a < b).select(a, b)
+
+
+def _as_f32(i):
+    return fx.Int32(i).bitcast(fx.Float32)
+
+
+def _bf16x2(a, b):
+    """Two f32 -> one i32 of 2 bf16 (RNE, v_cvt_pk_bf16_f32)."""
+    return Vec.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]

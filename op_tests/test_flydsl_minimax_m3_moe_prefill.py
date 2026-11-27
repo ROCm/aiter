@@ -276,6 +276,11 @@ def test_a4w4_prefill_moe_non_current_device():
     code = f"import importlib; importlib.import_module({name!r})._check(3072, 'cuda:1')"
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([here, *sys.path])}
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
+    # main() ran the kernels on cuda:0 in this process: cuda:1 is rejected before a launch
+    call, out, _ = _setup(3072, "cuda:1")
+    with _rejects("a second device in one process", first_arg="device"):
+        call()
+    assert out.isnan().all()
 
 
 def test_a4w4_prefill_moe_rejects_bad_inputs():

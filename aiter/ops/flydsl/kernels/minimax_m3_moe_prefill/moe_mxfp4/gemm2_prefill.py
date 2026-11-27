@@ -4,9 +4,9 @@
 """MiniMax-M3 prefill MoE stage 2 (a4w4, down projection), token-major output.
 
     y[tok, slot, :] = h[row, :] @ W2[e]^T            row = sorted row of (tok, slot)
+    out[tok*topk + slot, :] = bf16(y[tok, slot, :] * sorted_weights[row])
 
-``out_dtype`` "bf16": out[tok*topk + slot, :] = bf16(y * sorted_weights[row]), summed
-by the bf16 reduce; "fp8": MXFP8 rows with the routing weights left to the reduce.
+summed over the slots by the bf16 reduce.
 
 One CTA owns an m-tile of 128 sorted rows and sweeps ``NT`` n-tiles of 256 columns:
 K = I = 768 is only 3 K-steps, so the A tile stays in AGPRs for the whole sweep and
@@ -19,15 +19,13 @@ Layouts (bytes):
   A_scale   [num_m_blocks*BM, I/32]       sorted rows, e8m0-shuffled (gemm1 OUT_sc)
   W2        [E, H, I/2]                   aiter shuffle_weight(layout=(16,16))
   W2_sc     [E*H, I/32]                   aiter e8m0_shuffle
-  sorted_w  [num_m_blocks*BM]             f32 routing weight per sorted row (bf16 mode)
-  OUT       [n_tokens*topk, H]            bf16, or fp8 e4m3 (OCP)
-  OUT_sc    [n_tokens*topk, H/32]         e8m0 (fp8 mode; any buffer in bf16 mode)
+  sorted_w  [num_m_blocks*BM]             f32 routing weight per sorted row
+  OUT       [n_tokens*topk, H]            bf16
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
@@ -43,13 +41,11 @@ from .gemm1_prefill import (
     S2RLoaderFp4,
     _as_f32,
     _asm_void,
-    _bits,
     _Buf,
     _divmod_nonneg,
     _g2s_thunks,
     _lds_ptr_t,
     _min,
-    _permlane16_swap,
     _s2r_thunks,
     _swizzled_col,
     _uniform_i32,
@@ -114,85 +110,6 @@ def _bf16x2(a, b):
     """Two f32 -> one i32 of 2 bf16 (RNE, v_cvt_pk_bf16_f32: the same conversion as
     production's arith.truncf)"""
     return Vec.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
-
-
-def _cvt_pk_fp8(old, a, b, scale_f32, hi: bool):
-    """v_cvt_scalef32_pk_fp8_f32: (a, b) / scale -> 2 x e4m3 into the low (hi=False)
-    or high 16 bits of ``old`` (the intrinsic works on <2 x i16>; i32 in/out here)."""
-    v2i16 = _ir.VectorType.get([2], _ir.IntegerType.get_signless(16))
-    old_v = _llvm.bitcast(v2i16, fx.as_ir_value(old))
-    res = _llvm.call_intrinsic(
-        v2i16,
-        "llvm.amdgcn.cvt.scalef32.pk.fp8.f32",
-        [
-            old_v,
-            fx.as_ir_value(a),
-            fx.as_ir_value(b),
-            fx.as_ir_value(scale_f32),
-            fx.Boolean(hi).ir_value(),
-        ],
-        [],
-        [],
-    )
-    return fx.Int32(_llvm.bitcast(_T.i32, res))
-
-
-def _e8m0_fp8(amax):
-    """floor(log2 amax) - 7, floored at 0: amax / 2^(e-127) lands in [128, 256),
-    inside e4m3 (max 448) with one bit of headroom, never saturates."""
-    e = (_bits(amax) >> 23) - fx.Int32(7)
-    return (e > fx.Int32(0)).select(e, fx.Int32(0))
-
-
-def _fabs(v):
-    return fx.math.absf(v)
-
-
-def _permlane32_swap(d_a, d_b):
-    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
-    res = _rocdl.permlane32_swap(
-        pair_ty, fx.as_ir_value(d_a), fx.as_ir_value(d_b), False, False
-    )
-    return fx.Int32(_llvm.extractvalue(_T.i32, res, [0])), fx.Int32(
-        _llvm.extractvalue(_T.i32, res, [1])
-    )
-
-
-def _maxf_nn(a, b):
-    """v_max_f32 with nnan. Without the flag LLVM canonicalizes both inputs first
-    (``v_max x, x, x``, maxnum must quiet sNaNs): 2 extra VALU per max in the
-    epilogue."""
-    return fx.Float32(
-        fx.arith.maxnumf(
-            fx.as_ir_value(a),
-            fx.as_ir_value(b),
-            fastmath=fx.arith.FastMathFlags.nnan,
-        )
-    )
-
-
-def _xlane_max4_pair(x, y):
-    """4-lane max (lanes L, L^16, L^32, L^48) of two values at once, both broadcast to
-    every lane, in 3 permlane swaps (2 x 2 done separately, plus 2 copies):
-    swap32(x, y) -> [x_lo|y_lo], [x_hi|y_hi]; max -> m = [X2 | Y2];
-    swap16(m, m) + max -> M = [X4 X4 | Y4 Y4]; swap32(M, M) -> [X4|X4], [Y4|Y4]."""
-    a, b = _permlane32_swap(_bits(x), _bits(y))
-    m = _bits(_maxf_nn(_as_f32(a), _as_f32(b)))
-    a, b = _permlane16_swap(m, m)
-    big = _bits(_maxf_nn(_as_f32(a), _as_f32(b)))
-    a, b = _permlane32_swap(big, big)
-    return _as_f32(a), _as_f32(b)
-
-
-def _undef_i32():
-    """Cvt destination whose other half is overwritten anyway: no v_mov 0 for it"""
-    return _llvm.mlir_undef(_T.i32)
-
-
-def _lds_store_i16(v_i32, addr_i32):
-    # no typed fx op truncates i32 -> i16 yet, so this stays a raw arith op
-    h = _arith.TruncIOp(_ir.IntegerType.get_signless(16), fx.as_ir_value(v_i32)).result
-    _llvm.StoreOp(h, _lds_ptr(addr_i32), alignment=2)
 
 
 def _ld_dword_asm(rsrc, voff_bytes):
@@ -277,9 +194,8 @@ class _BScaleGather:
         )
 
 
-# non-temporal row stores (3-8% faster); the 4-B scale stores need L2 write combining
+# non-temporal row stores (3-8% faster)
 _STORE_CPOL = 0x2
-_STORE_CPOL_SC = 0
 
 
 def compile_moe_gemm2(
@@ -289,7 +205,6 @@ def compile_moe_gemm2(
     E: int,
     topk: int,
     n_split: int = 2,
-    out_dtype: str = "bf16",
     sort_block_m: int = 128,
 ):
     """fp4 grouped down-projection with token-major output (see the module doc).
@@ -297,8 +212,6 @@ def compile_moe_gemm2(
     block size of the sort that produced the rows: with 256, ``sorted_expert_ids``
     has one entry per 256 rows (index ``tile_i >> 1``) and a 128-row tile that
     starts with a padding sentinel is all padding and is skipped."""
-    assert out_dtype in ("bf16", "fp8"), out_dtype
-    FP8 = out_dtype == "fp8"
     BM = 128
     assert sort_block_m in (128, 256), sort_block_m
     EID_SHIFT = (sort_block_m // BM).bit_length() - 1  # 0 or 1
@@ -321,9 +234,8 @@ def compile_moe_gemm2(
     N_ACCUMS = N_TILES_A * N_TILES_B
     SC_COLS = K // 32  # 24 e8m0 per A row
     SC_BLOCKS_PER_G = SC_COLS // 8  # 3 blocks of 256 B per 32-row group
-    OUT_ELEM = 1 if FP8 else 2
+    OUT_ELEM = 2  # bf16
     OUT_ROW_BYTES = H * OUT_ELEM
-    OUT_SC_COLS = H // 32
     WAVE_COLS = BN // 2  # 128 output columns per wave per n-tile
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K_BYTES  # 8 KB
@@ -338,21 +250,19 @@ def compile_moe_gemm2(
     B_SC_SLOTS = 4
     SC_LDS_BYTES = A_SC_BYTES + B_SC_SLOTS * B_SC_SLOT  # 12 KB
     B_SC_OFF = A_SC_BYTES
-    # staging: per wave 32 rows x 128 columns of the output element (+ fp8 scale bytes)
-    STG_ROW = WAVE_COLS * OUT_ELEM  # 128 (fp8) / 256 (bf16) B per staged row
-    CH = STG_ROW // 16  # 16-B chunks per row: 8 / 16
-    STG_DATA = 32 * STG_ROW
-    STG_SC = 32 * 4 if FP8 else 0  # 4 e8m0 per row per wave
-    STG_WAVE = (STG_DATA + STG_SC + 255) // 256 * 256
+    # staging: per wave 32 rows x 128 bf16 columns
+    STG_ROW = WAVE_COLS * OUT_ELEM  # 256 B per staged row
+    CH = STG_ROW // 16  # 16 16-B chunks per row
+    STG_WAVE = 32 * STG_ROW
     STG_LDS_BYTES = _N_WAVES * STG_WAVE
-    ROWS_PER_ST = 64 // CH  # rows covered by one dwordx4 wave store: 8 / 4
-    N_ST = 32 // ROWS_PER_ST  # data stores per flushed row half: 4 / 8
+    ROWS_PER_ST = 64 // CH  # rows covered by one dwordx4 wave store: 4
+    N_ST = 32 // ROWS_PER_ST  # data stores per flushed row half: 8
     assert LDS_TILES_BYTES + SC_LDS_BYTES + STG_LDS_BYTES <= 160 * 1024
 
     NB = N_TILES_B
     NG = 2  # gather loads per wave per step
     P_STEP = 2 * NB + NG  # loads per lane per step
-    ST = N_ST + (1 if FP8 else 0)  # stores per lane per flush
+    ST = N_ST  # stores per lane per flush
 
     B_TILE_BYTES = BN * K_BYTES  # W2 bytes per n-tile
     B_K_STEP = 2 * 1024  # preshuffled: 128 B of K = 2 x (16 rows x 64 B)
@@ -370,7 +280,6 @@ def compile_moe_gemm2(
         OUT: fx.Tensor,
         A_scale: fx.Tensor,
         W2_scale: fx.Tensor,
-        OUT_scale: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -591,21 +500,17 @@ def compile_moe_gemm2(
                 _wave_row(h, lane_id // CH + ROWS_PER_ST * k)
                 for h in range(2)
                 for k in range(N_ST)
-            ] + ([_wave_row(h, lane_id % 32) for h in range(2)] if FP8 else [])
+            ]
             _raw_ids = [
                 _ld_dword_asm(ids_rsrc, (m_base + r) * fx.Int32(4)) for r in _id_rows
             ]
-            _raw_w = (
-                [
-                    _ld_dword_asm(
-                        sw_rsrc, (m_base + _wave_row(h, ti * 16 + r16)) * fx.Int32(4)
-                    )
-                    for h in range(2)
-                    for ti in range(N_TILES_A)
-                ]
-                if not FP8
-                else []
-            )
+            _raw_w = [
+                _ld_dword_asm(
+                    sw_rsrc, (m_base + _wave_row(h, ti * 16 + r16)) * fx.Int32(4)
+                )
+                for h in range(2)
+                for ti in range(N_TILES_A)
+            ]
 
             # ---- prologue: A (12) + A scales (1), g(0), B(0), B(1), g(1) ----
             for kb in range_constexpr(K_ITERS):
@@ -664,11 +569,6 @@ def compile_moe_gemm2(
             out_rsrc = buffer_ops.create_buffer_resource(
                 OUT, max_size=False, num_records_bytes=n_tokens * (topk * OUT_ROW_BYTES)
             )
-            osc_rsrc = buffer_ops.create_buffer_resource(
-                OUT_scale,
-                max_size=False,
-                num_records_bytes=n_tokens * (topk * OUT_SC_COLS),
-            )
 
             _pinned = _wait_pin(_raw_ids + _raw_w, 2 * NB + NG + NG + 2 * NB)
             _pid, _pw = _pinned[: len(_raw_ids)], _pinned[len(_raw_ids) :]
@@ -688,24 +588,13 @@ def compile_moe_gemm2(
                 ]
                 for h in range(2)
             ]
-            # conditional expressions: the DSL rewriter drops non-IR values set in an if
-            sc_off = (
-                [_orow(_pid[2 * N_ST + h]) * fx.Int32(OUT_SC_COLS) for h in range(2)]
-                if FP8
-                else None
-            )
-            # bf16: routing weight of the lane's accumulator rows (ti*16 + r16)
-            wA = (
-                [
-                    [_as_f32(_pw[h * N_TILES_A + ti]) for ti in range(N_TILES_A)]
-                    for h in range(2)
-                ]
-                if not FP8
-                else None
-            )
+            # routing weight of the lane's accumulator rows (ti*16 + r16)
+            wA = [
+                [_as_f32(_pw[h * N_TILES_A + ti]) for ti in range(N_TILES_A)]
+                for h in range(2)
+            ]
 
             stg_base = fx.Int32(fx.ptrtoint(_stg_ptr)) + wave_id * fx.Int32(STG_WAVE)
-            stg_sc_base = stg_base + fx.Int32(STG_DATA)
 
             def _stg_addr(row, chunk, half):
                 """Staged (row, 16-B chunk, 8-B half); chunks XOR-swizzled by the row so
@@ -721,7 +610,7 @@ def compile_moe_gemm2(
                 """One 16x16 tile: 4 f32 -> bf16(v * w_row), 8 B into the staging
                 buffer"""
                 cv = Vec(_pin_vec4(cq[mfma.idx(ti, tj)]))
-                w = wA[h][ti]  # type: ignore[index]
+                w = wA[h][ti]
                 v = [fx.Float32(cv[k]) * w for k in range_constexpr(4)]
                 row = ti * 16 + r16
                 chunk = (
@@ -733,58 +622,13 @@ def compile_moe_gemm2(
                     2,
                 )
 
-            def _stage_fp8_pair(cq, hb, ti):
-                """The two 16-row x 32-col groups of (ti, hb) -- tiles (0, 1) and (2,
-                3) --
-                at once. The fp8 epilogue is VALU-issue bound (1 wave / SIMD; the ATT
-                showed ~35 sequential instructions per group between two MFMAs), so: one
-                amax butterfly serves both groups (3 swaps, not 4), nnan maxes (no
-                canonicalizing self-max), undef cvt destinations (no v_mov 0), the two
-                e8m0 bytes of a row go out as one 16-bit LDS write. Per group: amax over
-                the row's 4 lanes, e8m0, 8 fp8 per lane after a permlane16 swap."""
-                v = []
-                for p in range_constexpr(2):
-                    cv = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p)]))
-                    cw = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p + 1)]))
-                    v.append(
-                        [fx.Float32(cv[k]) for k in range_constexpr(4)]
-                        + [fx.Float32(cw[k]) for k in range_constexpr(4)]
-                    )
-                am = []
-                for p in range_constexpr(2):
-                    a = _maxf_nn(_fabs(v[p][0]), _fabs(v[p][1]))
-                    for k in range_constexpr(2, 8):
-                        a = _maxf_nn(a, _fabs(v[p][k]))
-                    am.append(a)
-                amax = _xlane_max4_pair(am[0], am[1])
-                row = ti * 16 + r16
-                e8s = []
-                for p in range_constexpr(2):
-                    e8 = _e8m0_fp8(amax[p])
-                    sf = _as_f32(e8 << 23)
-                    da = _cvt_pk_fp8(_undef_i32(), v[p][0], v[p][1], sf, False)
-                    da = _cvt_pk_fp8(da, v[p][2], v[p][3], sf, True)
-                    db = _cvt_pk_fp8(_undef_i32(), v[p][4], v[p][5], sf, False)
-                    db = _cvt_pk_fp8(db, v[p][6], v[p][7], sf, True)
-                    da, db = _permlane16_swap(da, db)
-                    # lane group g now holds tile (2p + g%2), cols (g//2)*8 .. +8
-                    chunk = hb * 4 + 2 * p + g4 % 2
-                    _lds_store_vec(_v2i32(da, db), _stg_addr(row, chunk, g4 // 2), 2)
-                    e8s.append(e8)
-                _lds_store_i16(
-                    e8s[0] | (e8s[1] << 8), stg_sc_base + row * fx.Int32(4) + hb * 2
-                )
-
             def _stage_thunks(cq, h, hb):
                 ts = []
                 for ti in range_constexpr(N_TILES_A):
-                    if const_expr(FP8):
-                        ts.append(lambda ti=ti: _stage_fp8_pair(cq, hb, ti))
-                    else:
-                        for tj in range_constexpr(NB):
-                            ts.append(
-                                lambda ti=ti, tj=tj: _stage_bf16(cq, h, hb, ti, tj)  # type: ignore[misc]
-                            )
+                    for tj in range_constexpr(NB):
+                        ts.append(
+                            lambda ti=ti, tj=tj: _stage_bf16(cq, h, hb, ti, tj)  # type: ignore[misc]
+                        )
                 return ts
 
             def _drop_if(off, mask):
@@ -818,20 +662,6 @@ def compile_moe_gemm2(
                         )
 
                     ts.append(_st)
-                if const_expr(FP8):
-
-                    def _st_sc():
-                        scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
-                        sc_col = (chunk_n0 + _pn(nt)) * fx.Int32(BN // 32) + wave_j * 4
-                        buffer_ops.buffer_store(
-                            scv,
-                            osc_rsrc,
-                            _drop_if(sc_off[h] + sc_col, mask),  # type: ignore[index]
-                            offset_is_bytes=True,
-                            cache_modifier=_STORE_CPOL_SC,
-                        )
-
-                    ts.append(_st_sc)  # type: ignore[arg-type]
                 return ts
 
             def _wb2(first, c_first, c_other):
@@ -1057,7 +887,6 @@ def compile_moe_gemm2(
         OUT: fx.Tensor,
         A_scale: fx.Tensor,
         W2_scale: fx.Tensor,
-        OUT_scale: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -1073,7 +902,6 @@ def compile_moe_gemm2(
             OUT,
             A_scale,
             W2_scale,
-            OUT_scale,
             sorted_ids,
             sorted_expert_ids,
             sorted_weights,

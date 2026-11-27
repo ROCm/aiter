@@ -21,13 +21,13 @@ MIN_PREFILL_TOKENS = 3072
 MAX_PREFILL_TOKENS = 65536
 BM256_FROM_TOKENS = 16384
 GEMM2_N_SPLIT = 2
-GEMM1_SWIGLU_ALPHA = 1.702
-GEMM1_SWIGLU_LIMIT = 7.0
 _GEMM1_BLOCK_K = 256
 # gemm2's K pipeline is written for 3 K-steps of 256
 _GEMM2_INTERMEDIATE = 768
 # aiter's scale sort (`mxfp4_moe_sort_hip`, csrc/kernels/quant_kernels.cu) rejects wider rows
 _MAX_SORT_HIDDEN = 16384
+# the device of this process's first a4w4_prefill_moe
+_DEVICE: list[torch.device] = []
 
 
 def supports_shapes(hidden_size: int, intermediate_size: int) -> bool:
@@ -72,7 +72,6 @@ def _get_gemm2(
         E=num_experts,
         topk=topk,
         n_split=GEMM2_N_SPLIT,
-        out_dtype="bf16",
         sort_block_m=bm,
     )
 
@@ -164,6 +163,9 @@ def a4w4_prefill_moe(
     assert topk_ids.device == device
     # shortcut: FlyDSL loads a compiled kernel on the first device that runs it and a later
     # device gets hipErrorInvalidDevice, so one process drives one GPU; upgrade with FlyDSL.
+    if not _DEVICE:
+        _DEVICE.append(device)
+    assert device == _DEVICE[0], ("device", device, "kernels loaded on", _DEVICE[0])
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream()
 
@@ -220,8 +222,6 @@ def a4w4_prefill_moe(
         partial = torch.empty(
             (n_tokens * topk, hidden), dtype=torch.bfloat16, device=device
         )
-        # read only by gemm2's fp8-partial mode
-        partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
         num_m_blocks2 = rows // 128
         run_compiled(
             _get_gemm2(hidden, inter, num_experts, topk, bm),
@@ -230,7 +230,6 @@ def a4w4_prefill_moe(
             partial.view(-1),
             h_s,
             _u8_flat(w2_scale),
-            partial_scale,
             bufs.sorted_ids,
             bufs.sorted_expert_ids,
             bufs.sorted_weights,
