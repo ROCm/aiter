@@ -352,6 +352,40 @@ def test_packed_path_compiles_fullgraph_and_matches_eager(
     assert slack >= 512, f"only {slack} bytes of slack behind the pooled V scale"
 
 
+def test_hd256_rejects_a_stored_k_scale():
+    """An hd256 MXFP8 K is packed, so pooling its codes through k_scale gives rows no hd256 row
+    reads; it has to be pooled from its source."""
+    batch, seqlen_k, nhead = 1, 2 * SOL_ATTN_TS_KV, 2
+    q, k, v = _operands(batch, 256, seqlen_k, nhead, nhead, d=256)
+    scale = torch.full(
+        (batch, seqlen_k, nhead, 8), 127, dtype=torch.uint8, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match='k_packed_format \\("mxfp8"'):
+        sol_prepare(q, k, v, BETA, k_scale=scale)
+
+
+def test_packed_k_rejects_a_scaled_q():
+    """A packed K routes on its unrotated source, while an MXFP8 Q's codes are rotated, so routing
+    needs Q's pre-quantization tensor rather than its codes and q_scale."""
+    batch, seqlen, nhead = 1, 2 * SOL_ATTN_TS_KV, 2
+    q, k, v = _operands(batch, seqlen, seqlen, nhead, nhead, d=256)
+    q_scale = torch.full(
+        (batch, seqlen, nhead, 8), 127, dtype=torch.uint8, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match="without q_scale"):
+        sol_prepare(
+            q,
+            k,
+            v,
+            BETA,
+            k_source=k.to(torch.bfloat16),
+            k_packed_format="mxfp8",
+            q_scale=q_scale,
+        )
+
+
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
 def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
     batch, seqlen_q, seqlen_k, nhead_q, nhead_kv

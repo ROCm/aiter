@@ -52,12 +52,14 @@ _E8M0_BIAS = 127
 _E8M0_MAX_CODE = 254
 _E8M0_GROUP = 32
 
-# Packed formats whose stored codes are not element addressable, so a pooled operand has to be
-# built from the tensor the packer was given rather than from the codes it produced. The name says
-# which packer the pooled operand goes through, so it has to be the one the row reads: a V named
-# *_fp6_p is packed in the token order an FP6 P operand contracts over (AttentionPack.V_FOR_FP6_P),
-# which is the only packed V order a Sol-Attn row reads.
-SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6")
+# Packed formats: an operand stored in one has codes that are not element addressable, so its
+# pooled operand is built from the tensor the packer was given rather than from the codes it
+# produced. The name says which packer the pooled operand goes through, so it has to be the one
+# the row reads: a V named *_fp6_p is packed in the token order an FP6 P operand contracts over
+# (AttentionPack.V_FOR_FP6_P), which is the only packed V order a Sol-Attn row reads. MXFP8 is a
+# packed K format at head dim 256 only, where its records carry their scales; an hd128 MXFP8 K
+# is addressable and pools from its codes through k_scale.
+SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6", "mxfp8")
 SOL_ATTN_PACKED_V_FORMATS = ("mxfp4_fp6_p", "mxfp6_fp6_p")
 SOL_ATTN_PACKED_FORMATS = tuple(
     dict.fromkeys(SOL_ATTN_PACKED_K_FORMATS + SOL_ATTN_PACKED_V_FORMATS)
@@ -568,19 +570,36 @@ def _sol_attn_pack_k(
     from aiter.ops.mha_v4_quant import (
         mxfp4_k_view,
         mxfp6_k_view,
+        mxfp6_k_view_hd256,
+        mxfp8_k_view_hd256,
         quantize_mxfp4_k,
+        quantize_mxfp4_k_hd256,
         quantize_mxfp6_k,
+        quantize_mxfp6_k_hd256,
+        quantize_mxfp8_k_hd256,
     )
 
     blocks = x.shape[1]
+    hd256 = x.shape[-1] == 256
+    if fmt == "mxfp8" and not hd256:
+        raise ValueError(
+            "an hd128 MXFP8 K is addressable: pool it from its codes by passing k_scale"
+        )
     padded = _sol_attn_pad_to_tile(x, BLOCK_N)
     if fmt == "mxfp4":
-        raw, scale = quantize_mxfp4_k(padded)
+        raw, scale = (quantize_mxfp4_k_hd256 if hd256 else quantize_mxfp4_k)(padded)
         return mxfp4_k_view(raw, scale[:, :blocks]), scale
-    raw, scale_raw = quantize_mxfp6_k(padded)
-    view, scale = mxfp6_k_view(
-        raw, scale_raw, padded.shape[0], padded.shape[1], padded.shape[2]
+    if fmt == "mxfp8":
+        records, scale = quantize_mxfp8_k_hd256(padded)
+        view = mxfp8_k_view_hd256(records, *padded.shape[:3])
+        return view[:, :blocks], scale
+    quantize, k_view = (
+        (quantize_mxfp6_k_hd256, mxfp6_k_view_hd256)
+        if hd256
+        else (quantize_mxfp6_k, mxfp6_k_view)
     )
+    raw, scale_raw = quantize(padded)
+    view, scale = k_view(raw, scale_raw, *padded.shape[:3])
     return view[:, :blocks], scale
 
 
@@ -614,23 +633,36 @@ def _sol_attn_pool_packed_k(
     result = (*_sol_attn_pack_k(pooled, fmt, BLOCK_N), pooled)
     if not variance:
         return result
-    from aiter.ops.mha_v4_quant import rotate_activation_hd128
-
-    def rotate(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        rotate_activation_hd128(out, x)
-        return out
-
     rotated_var = _sol_attn_block_variance(
-        rotate(k_source.contiguous()).float(), BLOCK_N
+        _sol_attn_rotate(k_source.contiguous()).float(), BLOCK_N
     )
     return (
         *result,
-        *_sol_attn_pack_k(
-            rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
-        ),
+        *_sol_attn_pack_k_variance(rotated_var, fmt, BLOCK_N),
         rotated_var,
     )
+
+
+def _sol_attn_rotate(x: torch.Tensor) -> torch.Tensor:
+    """x through the K packers' rotation: hd128, on each 128-channel half at hd256."""
+    from aiter.ops.mha_v4_quant import rotate_activation_hd128
+
+    rows = x.reshape(*x.shape[:2], -1, 128)
+    out = torch.empty_like(rows)
+    rotate_activation_hd128(out, rows)
+    return out.view(x.shape)
+
+
+def _sol_attn_pack_k_variance(
+    rotated_var: torch.Tensor, fmt: str, BLOCK_N: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a pooled variance taken in the rotated basis through `fmt`'s K packer.
+
+    It is rotated back first, so the packer's own rotation lands it where the kernel reads it; the
+    normalized Hadamard is its own inverse.
+    """
+    unrotated = _sol_attn_rotate(rotated_var.to(torch.bfloat16).contiguous())
+    return _sol_attn_pack_k(unrotated, fmt, BLOCK_N)
 
 
 def _sol_attn_pool_fp6_p_v(
@@ -644,16 +676,21 @@ def _sol_attn_pool_fp6_p_v(
     from aiter.ops.mha_v4_quant import (
         mxfp4_v_view,
         quantize_v_mxfp4_fp6_p,
+        quantize_v_mxfp4_fp6_p_hd256,
         quantize_v_mxfp6_fp6_p,
+        quantize_v_mxfp6_fp6_p_hd256,
     )
 
     pooled = _sol_attn_block_mean(v_source.float(), BLOCK_N).to(torch.bfloat16)
     blocks = pooled.shape[1]
     padded = _sol_attn_pad_to_tile(pooled, BLOCK_N)
+    hd256 = pooled.shape[-1] == 256
     if fmt == "mxfp4_fp6_p":
-        raw, scale = quantize_v_mxfp4_fp6_p(padded)
+        quantize = quantize_v_mxfp4_fp6_p_hd256 if hd256 else quantize_v_mxfp4_fp6_p
+        raw, scale = quantize(padded)
         return mxfp4_v_view(raw, scale, blocks), scale, pooled
-    view, scale = quantize_v_mxfp6_fp6_p(padded)
+    quantize = quantize_v_mxfp6_fp6_p_hd256 if hd256 else quantize_v_mxfp6_fp6_p
+    view, scale = quantize(padded)
     return view[:, :blocks], scale, pooled
 
 
@@ -820,12 +857,14 @@ def sol_prepare(
     Sol-Attn without wrapping the routing in its own opaque custom op.
 
     q: (batch, seqlen_q, nheads_q, d), any dtype; only used for routing, which is scale invariant,
-        so the stored fp8 Q can be passed directly. A Q stored in one of SOL_ATTN_PACKED_FORMATS
-        cannot: its codes are neither element addressable nor even d wide, so pass its
-        pre-quantization tensor. Scale invariance is what makes the two interchangeable, and the
-        MXFP4 and MXFP8 packers' Hadamard rotation is orthogonal, so it leaves the proxy alone too.
-        An E8M0-scaled Q's codes are addressable but not proportional to Q, since the scale
-        varies per token and channel group; pass its scale as q_scale.
+        so the stored fp8 Q can be passed directly. A packed MXFP4 or MXFP6 Q cannot: its codes
+        are neither element addressable nor even d wide, so pass its pre-quantization tensor.
+        Scale invariance is what makes the two interchangeable. Q and K must still be in one
+        basis, and the MX quantizers rotate before they quantize: an addressable MX K routes on
+        its rotated codes, a packed K on its unrotated k_source. So with an addressable MXFP8 K,
+        pass the MXFP8 Q's codes and its scale as q_scale, since the E8M0 scale varies per token
+        and channel group and the codes alone are not proportional to Q. With a packed K, hd256
+        MXFP8 included, pass Q's unrotated pre-quantization tensor and no q_scale.
     k_quant: (batch, seqlen_k, nheads_kv, d) already quantized, typically fp8 e4m3.
     v_quant: (batch, seqlen_k, nheads_kv, d_v) already quantized.
     beta: routing threshold, tau = mean_j(proxy) + beta * population_std_j(proxy). Pass this to
@@ -884,7 +923,8 @@ def sol_prepare(
         softmax_scale / m for an MXFP8 Q quantized with the multiplier m folded in. A float or a
         one-element tensor, so a device-side descale needs no host read.
     q_scale: Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32) uint8, for an
-        MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q.
+        MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q. Not with
+        k_packed_format: the dequantized codes are rotated and a packed K's routing is not.
     k_shift: (batch, nheads_kv, d), the vector a packed K's quantizer subtracted from every token
         (the `mean` its quantize_*_k took, for K smoothing). The stored codes are of
         k_source - k_shift, so pooling subtracts it from k_source's block means to match; the
@@ -897,9 +937,10 @@ def sol_prepare(
             unless the matching *_scale argument was given.
         mean_k_scale, mean_v_scale: the pooled operand's own E8M0 scale, same layout as the input
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
-            reused. These go in the mode-2 kernarg's pooled scale slots, except an MXFP6 K's:
-            its packer also stores the scales inside mean_k's tile records, which is where the
-            kernel reads them, so this image is only the readable copy for the host-side helpers.
+            reused. These go in the mode-2 kernarg's pooled scale slots, except where K's packer
+            also stores the scales inside mean_k's records, which is where the kernel reads them:
+            an MXFP6 K at either head dim and an hd256 MXFP8 K. There this image is only the
+            readable copy for the host-side helpers.
         mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
             when k_variance is set; otherwise None. For an 8-bit K it is stored divided by
             SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With
@@ -965,6 +1006,11 @@ def sol_prepare(
             raise ValueError(
                 f"{name}_source must share (batch, seqlen_k, nheads_kv) with k_quant"
             )
+    if k_scale is not None and k_quant.shape[-1] == 256:
+        raise ValueError(
+            "k_scale pools an addressable block-scaled K, and every hd256 row reads a packed one: "
+            'pass k_source with k_packed_format ("mxfp8" for an MXFP8 K) instead'
+        )
 
     if router not in ("mean", "error"):
         raise ValueError(f"router must be 'mean' or 'error', got {router!r}")
@@ -986,6 +1032,11 @@ def sol_prepare(
     if q_scale is not None and (q_scale.dim() != 4 or q_scale.shape[:3] != q.shape[:3]):
         raise ValueError(
             "q_scale must be Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32)"
+        )
+    if q_scale is not None and k_packed_format is not None:
+        raise ValueError(
+            "q_scale dequantizes an MXFP8 Q's codes, which its quantizer rotated, and a packed K "
+            "routes on its unrotated k_source: pass Q's pre-quantization tensor without q_scale"
         )
     if k_shift is not None:
         if k_packed_format is None:

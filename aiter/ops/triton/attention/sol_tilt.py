@@ -145,12 +145,18 @@ def sol_q_abs_max(
     reads the first and sol_tilt_factors the second; build them once and pass the pair to both.
     For the block-scaled rows the maxima are taken in the kernel's basis: q_scale, (batch, seqlen,
     heads, d / 32) E8M0, dequantizes an MXFP8 Q's codes, and rotate takes a packed row's unrotated
-    source Q through the packers' hd128 rotation.
+    source Q through the packers' rotation: hd128, on each 128-channel half at hd256. The two
+    exclude each other: an MXFP8 Q's codes are already rotated.
     """
     _check_unit_stride("q", q)
     batch, seqlen, heads, d = q.shape
-    if rotate and d != 128:
-        raise ValueError(f"the packers' rotation is hd128, got head dim {d}")
+    if rotate and q_scale is not None:
+        raise ValueError(
+            "q_scale dequantizes an MXFP8 Q's codes, which its quantizer already rotated; rotate "
+            "takes an unrotated BF16 source: pass one or the other"
+        )
+    if rotate and d not in (128, 256):
+        raise ValueError(f"the packers' rotation is hd128 or hd256, got head dim {d}")
     if q_scale is not None and (
         tuple(q_scale.shape) != (batch, seqlen, heads, d // 32)
         or q_scale.stride(-1) != 1
@@ -158,6 +164,11 @@ def sol_q_abs_max(
         raise ValueError(
             f"q_scale must be ({batch}, {seqlen}, {heads}, {d // 32}) with unit-stride groups"
         )
+    if rotate and d == 256:
+        halves = sol_q_abs_max(
+            q.unflatten(-1, (2, 128)).flatten(2, 3), q_tile, rotate=True
+        )
+        return halves[0].view(batch, -1, heads, d), halves[1].view(batch, heads, d)
     tiles = -(-seqlen // q_tile)
     out = torch.empty(batch, tiles, heads, d, dtype=torch.bfloat16, device=q.device)
     head = torch.empty(batch, heads, d, dtype=torch.bfloat16, device=q.device)
@@ -230,7 +241,9 @@ def sol_jensen_cap(
     q_multiplier, the factor its quantizer folds in. MXFP8 decodes mean_k_var by its scale; a
     packed K, whose codes are not addressable, passes sol_prepare's mean_k_var_pooled. The gain
     goes into the variance's scale bytes as 2^floor(log2 h), and for MXFP6 also into the scale
-    tails of a copy of its records, which is what that kernel reads.
+    tails of a copy of its records, which is what that kernel reads. The hd256 MXFP6 and MXFP8
+    records hold their scales inline, so their capped variance is packed again from
+    mean_k_var_pooled.
 
     Returns (mean_k_var, mean_k_var_scale, gain): the damped variance and, for a block-scaled K, its
     new scale (else None), and the per-block gain h in (0, 1] as applied, (batch, blocks, heads)
@@ -281,9 +294,16 @@ def sol_jensen_cap(
     else:
         mask, mask_strides = q_tile_max, (0, 0, 0, 0)
 
+    bits = mean_k_var.shape[-1] * mean_k_var.element_size() * 8
+    # The hd256 MXFP6 and MXFP8 records hold their scales inline, so their capped variance is
+    # packed again from mean_k_var_pooled and the kernel only finds the gain.
+    repack = block_scaled and d == 256 and bits in (6 * d, 8 * d)
+    if repack and mean_k_var_pooled is None:
+        raise ValueError("an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled")
     if block_scaled:
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
-        var, var_scale = mean_k_var, _backed_scale_copy(mean_k_var_scale)
+        var = mean_k_var
+        var_scale = mean_k_var_scale if repack else _backed_scale_copy(mean_k_var_scale)
     else:
         per_nat = (
             0.5
@@ -322,10 +342,19 @@ def sol_jensen_cap(
             HAS_DESCALE=q_descale is not None,
             HAS_VAR_SCALE=block_scaled and mean_k_var_pooled is None,
             EXPONENT_GAIN=block_scaled,
+            STORE_SCALE=block_scaled and not repack,
             TILE_CHUNK=32,
             HEAD_DIM=d,
         )
-    if block_scaled and mean_k_var.shape[-1] * mean_k_var.element_size() * 8 == 6 * d:
+    if repack:
+        from aiter.ops.triton.attention.utils import _sol_attn_pack_k_variance
+
+        var, var_scale = _sol_attn_pack_k_variance(
+            mean_k_var_pooled.float() * gain.unsqueeze(-1),
+            "mxfp6" if bits == 6 * d else "mxfp8",
+            kv_tile,
+        )
+    elif block_scaled and bits == 6 * d:
         var = _refill_mxfp6_scale_tails(mean_k_var, var_scale)
     return var, var_scale, gain
 
@@ -585,33 +614,42 @@ def _as_descale(
 
 
 def _stack_planes(
-    plane0: torch.Tensor, planes: torch.Tensor, row_tile: int = 1
+    plane0: torch.Tensor, planes: torch.Tensor, row_tile: int = 1, tail_rows: int = 0
 ) -> tuple[torch.Tensor, int]:
     """plane0 and planes as one contiguous (1 + rank)-plane allocation: (plane 0 view, stride in bytes).
 
     With row_tile > 1 each plane is followed by zeroed rows (dim 1, BSHD) taking the last batch's
-    up to a multiple of it; plane 0's strides are contiguous either way.
+    up to a multiple of it, and the last plane by tail_rows more, for a reader that runs past its
+    last tile; plane 0's strides are contiguous either way.
 
     A kernel writes every plane: the Sol kernel reaches planes 1..rank only through the byte
     stride, so under torch.compile torch ops building them would be cut down to plane 0.
     """
     plane0 = plane0.contiguous()
     size = plane0.numel()
-    pad = (-plane0.shape[1] % row_tile) * plane0[0, 0].numel()
+    row = plane0[0, 0].numel()
+    pad = (-plane0.shape[1] % row_tile) * row
     shape = (1 + planes.shape[0], size + pad)
-    ext = plane0.new_zeros(shape) if pad else plane0.new_empty(shape)
+    stacked = shape[0] * shape[1]
+    # The kernel writes the whole allocation, tail included: handed a view of it, torch.compile
+    # gives the kernel a buffer of the view's size and drops the tail.
+    flat = plane0.new_empty(stacked + tail_rows * row)
+    if pad:
+        flat[:stacked].view(shape)[:, size:].zero_()
+    if tail_rows:
+        flat[stacked:].zero_()
     block = 1024
     _sol_tilt_stack_kernel[(triton.cdiv(size, block), shape[0])](
         plane0,
         planes.to(plane0.dtype).contiguous(),
-        ext,
+        flat,
         size,
         shape[1],
         BLOCK=block,
     )
     return (
-        ext.as_strided(plane0.shape, plane0.stride()),
-        ext.stride(0) * ext.element_size(),
+        flat.as_strided(plane0.shape, plane0.stride()),
+        shape[1] * flat.element_size(),
     )
 
 
@@ -653,11 +691,12 @@ def sol_tilt_planes(
     """A rank-`rank` tilt's planes encoded in K's and V's own formats, for any recipe.
 
     k and v are K and V in the basis and units the factors are taken in, BSHD: the stored codes
-    for a per-tensor or BF16 operand, the dequantized codes for MXFP8 K (rotated, as stored), and
-    the BF16 source for a packed one, which its packer rotates. q_abs_max is sol_q_abs_max of the
-    Q in that same basis, q_x; q_descale, k_descale and v_descale take q_x, k and v to real units,
-    and Q as the kernel decodes it is q_multiplier times the real Q (mha_v4_q_multiplier for the MX
-    rows, which fold it into Q, else 1). The mean_* arguments are sol_prepare's:
+    for a per-tensor or BF16 operand, the dequantized codes for an hd128 MXFP8 K (rotated, as
+    stored), and the BF16 source for a packed one, which its packer rotates: MXFP6 and MXFP4 K, and
+    an hd256 MXFP8 K, whose packer stores its scales with the codes. q_abs_max is sol_q_abs_max of
+    the Q in that same basis, q_x; q_descale, k_descale and v_descale take q_x, k and v to real
+    units, and Q as the kernel decodes it is q_multiplier times the real Q (mha_v4_q_multiplier for
+    the MX rows, which fold it into Q, else 1). The mean_* arguments are sol_prepare's:
     the pooled K/V and their scales, and for a packed format the pooled BF16 rows it packed,
     which become plane 0 through the same packer.
 
@@ -674,18 +713,17 @@ def sol_tilt_planes(
         raise ValueError(
             f"v_format must be one of {SOL_TILT_V_FORMATS}, got {v_format!r}"
         )
-    batch, _, heads, _ = k.shape
+    batch, _, heads, d = k.shape
     if v.shape[2] != heads or q_abs_max[1].shape[1] != heads:
         raise ValueError("the tilt needs one K/V head per query head")
     k_mx = k_format in ("mxfp8", "mxfp6", "mxfp4")
+    k_packed = k_format in ("mxfp6", "mxfp4") or (k_format == "mxfp8" and d == 256)
     v_mx = v_format.endswith("_fp6_p")
     if k_mx != (mean_k_scale is not None) or v_mx != (mean_v_scale is not None):
         raise ValueError(
             "a block-scaled format needs its pooled scale, and only it takes one"
         )
-    if (k_format in ("mxfp6", "mxfp4") and mean_k_pooled is None) or (
-        v_mx and mean_v_pooled is None
-    ):
+    if (k_packed and mean_k_pooled is None) or (v_mx and mean_v_pooled is None):
         raise ValueError(
             "a packed format needs the pooled BF16 rows sol_prepare packed"
         )
@@ -750,11 +788,13 @@ def sol_tilt_planes(
         _sol_attn_pad_to_tile,
     )
 
-    if k_format == "mxfp8":
+    if k_format == "mxfp8" and not k_packed:
+        from aiter.ops.mha_v4_quant import MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+
         data, scale = _e8m0_quantize(planes_a, mean_k.dtype)
         ext_k, k_stride = _stack_planes(mean_k, data)
         k_scale, k_scale_stride = _stack_planes(
-            mean_k_scale, scale, _TILT_SCALE_ROW_TILE
+            mean_k_scale, scale, _TILT_SCALE_ROW_TILE, MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
         )
     elif k_mx:
         x = torch.cat(
@@ -773,16 +813,21 @@ def sol_tilt_planes(
         from aiter.ops.mha_v4_quant import (
             mxfp4_v_view,
             quantize_v_mxfp4_fp6_p,
+            quantize_v_mxfp4_fp6_p_hd256,
             quantize_v_mxfp6_fp6_p,
+            quantize_v_mxfp6_fp6_p_hd256,
         )
 
         x = torch.cat([mean_v_pooled.unsqueeze(0), b.to(torch.bfloat16)]).flatten(0, 1)
         padded = _sol_attn_pad_to_tile(x, kv_tile)
+        hd256 = x.shape[-1] == 256
         if v_format == "mxfp4_fp6_p":
-            raw, scale = quantize_v_mxfp4_fp6_p(padded)
+            quantize = quantize_v_mxfp4_fp6_p_hd256 if hd256 else quantize_v_mxfp4_fp6_p
+            raw, scale = quantize(padded)
             view = mxfp4_v_view(raw, scale, blocks)
         else:
-            view, scale = quantize_v_mxfp6_fp6_p(padded)
+            quantize = quantize_v_mxfp6_fp6_p_hd256 if hd256 else quantize_v_mxfp6_fp6_p
+            view, scale = quantize(padded)
             view = view[:, :blocks]
         ext_v, v_scale, v_stride, v_scale_stride = _plane0_of_packed(view, scale, batch)
     else:
