@@ -111,6 +111,7 @@ class DispatchSlot(IntEnum):
     FC_OUT = 32
     FC_TRECV = 33
     PLAN_NV = 34  # i64 (launch_epoch << 32 | row-count bits | num_valid): plan flag that carries num_valid
+    FC_XDB_OFF = 35  # byte offset of this rank's word in every peer's FC_XDB (rank * 8)
     # Byte offsets of the token-row regions (one row per source rank and token) from the payload rows
     # and from their scales; the same on every rank (symmetric heap).
     TOKEN_ROWS = 36
@@ -311,7 +312,7 @@ def prefetch_direct_fixed_slot_token(
 # fmt: off
 @flyc.jit
 def emit_direct_fixed_slot_payload(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_nbytes, fz_scale_n_i32, fz_enable_scales,
+    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, rank, fz_nbytes, fz_scale_n_i32, fz_enable_scales,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
     direct_done=0, running_half=None,
 ):
@@ -347,7 +348,7 @@ def emit_direct_fixed_slot_payload(
                 rpf = prefetch_direct_fixed_slot_token(**prefetch_args, token_offset=rr * dispatch_blocks * num_waves)
             # The token row goes once to each destination, into its token-row region; its place does not depend
             # on the expert offsets, so it is sent before the counter atomics and overlaps their round trip.
-            token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+            token_row = fx.Int64(rank * fx.Int32(fz_mtpr) + source_token)
             # A lane's payload words per 1024-value chunk (FP8: 4, FP4: 2).
             lane_i32 = len(rpf["row_values"][0])
             for j in range_constexpr(fz_k):
@@ -384,7 +385,7 @@ def emit_direct_fixed_slot_payload(
                 meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
             if valid_expert & own_lane & (expert_offset < fx.Int32(fz_cap)):
                 weight_bits = fx.Vector.from_elements([rpf["weight"]], fx.Float32).bitcast(fx.Int32)[0]
-                source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (lane << fx.Int32(24))
+                source_encoding = (rank * fx.Int32(fz_mtpr) + source_token) | (lane << fx.Int32(24))
                 comm_ops.store_i32_global(rpf["remote"]["wts"] + fx.Int64(meta_row) * fx.Int64(4), weight_bits)
                 comm_ops.store_i32_global(rpf["remote"]["sm"] + fx.Int64(meta_row) * fx.Int64(4), source_encoding)
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -406,7 +407,7 @@ def emit_direct_fixed_slot_payload(
                         share = (producer_slot == fx.Int32(0)).select(
                             fx.Int32(_DIRECT_DONE_INC + 1) - active, fx.Int32(1))
                         remote_done = ptr_buf_tensor(p_source_done, fx.Int64)[lane]
-                        done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                        done_index = parity * fx.Int32(fz_npes) + rank
                         comm_ops.atomic_add_system(remote_done + fx.Int64(done_index) * fx.Int64(4), share)
         publish_last = publish_last & ~direct
     # The last producer publishes; one lane per destination, so the remote release stores overlap.
@@ -420,7 +421,7 @@ def emit_direct_fixed_slot_payload(
             comm_ops.fence_agent_acquire()
             if lane < fx.Int32(fz_npes):
                 remote_done = load_at(AddrBuffer(p_source_done), lane, fx.Int64, 1)
-                done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                done_index = parity * fx.Int32(fz_npes) + rank
                 comm_ops.store_i32_system(remote_done, done_index, expected)
 
 
@@ -529,7 +530,7 @@ def emit_direct_fixed_slot_finalize(
     fx.barrier()
 
 
-def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
+def make_fused_combine_tail(*, lds_fc_off, reducers, npes, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
     n_blocks=1, bf16_head_tokens=0):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
@@ -565,7 +566,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     def fused_combine_tail(tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, arg_cnt: fx.Int64, arg_flag: fx.Int64,
         arg_xdb: fx.Int64, arg_p2p_xdb: fx.Int64, arg_inp: fx.Int64, arg_out: fx.Int64, arg_trecv: fx.Int64,
         arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32, arg_running: fx.Int64,
-        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64, retire=None):
+        arg_tok_off: fx.Int64, arg_tok_reset: fx.Int64, arg_xdb_off: fx.Int64, retire=None):
     # fmt: on
         ticket_ptr = lds_typed_ptr(fx.Int32(lds_fc_off), T.i32, align=4)
         flag_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 8), T.i64, align=8)
@@ -605,7 +606,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                 comm_ops.fence_system_acquire()
                 comm_ops.fence_system_release()
                 remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
-                comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
+                comm_ops.store_i64_global_system(fx.Int64(remote) + arg_xdb_off, flag)
             fx.barrier()
             if tx_i32 == fx.Int32(0):
                 if const_expr(not flag_is_value):
@@ -752,7 +753,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
 @aot_factory("mega_moe_small_m_stage1")
 @functools.cache
 def compile_mega_moe_stage1(
-    *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
+    *, model_dim: int, inter_dim: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fused: tuple, sort_block_m: int = 64,
     tile_n: int = 256, num_waves: int = 4, grid_mult: int = 2, waves_per_eu_hint: int = 2, num_cu: int = 256,
     num_dispatch_cu: int = 32, b_nt: int = 3, swiglu_limit: float = 0.0,
@@ -789,7 +790,7 @@ def compile_mega_moe_stage1(
     TOTAL_THREADS = NUM_WAVES * 64
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
-    fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
+    fz_cap, fz_mtpr = int(fuse_cap), int(fuse_mtpr)
     if fz_npes * fz_mtpr > 1 << 24:
         raise ValueError("MegaMoE v2 source-token encoding exceeds 24 bits")
     if fz_k > 1 << 8:
@@ -849,7 +850,7 @@ def compile_mega_moe_stage1(
     assert fz_epr <= TOTAL_THREADS, "the combine resets at most one expert counter per thread"
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
-        npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
+        npes=int(fuse_npes), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
         n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
@@ -910,7 +911,7 @@ def compile_mega_moe_stage1(
     def kernel(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor, out_scale: fx.Tensor,
         addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64, addr_in_idx: fx.Int64,
-        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64,
+        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64, i32_rank: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -990,7 +991,7 @@ def compile_mega_moe_stage1(
             prefetched = [prefetch_direct_fixed_slot_token(**prefetch_args)]
             emit_direct_fixed_slot_payload(
                 num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
-                fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_nbytes=fz_nbytes, fz_scale_n_i32=fz_scale_n_i32,
+                fz_mtpr=fz_mtpr, rank=i32_rank, fz_nbytes=fz_nbytes, fz_scale_n_i32=fz_scale_n_i32,
                 fz_enable_scales=fz_enable_scales, i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks,
                 producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
                 prefetched=prefetched, route_rounds=pre_rounds, prefetch_args=prefetch_args,
@@ -1360,17 +1361,19 @@ def compile_mega_moe_stage1(
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
-            fx.Int32(launch_grid_x), fp8_rows, reset_running_addr(), tok_off, tok_reset, retire=_retire)
+            fx.Int32(launch_grid_x), fp8_rows, reset_running_addr(), tok_off, tok_reset,
+            _disp_ptr(DispatchSlot.FC_XDB_OFF), retire=_retire)
 
     @flyc.jit
     def launch(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor, out_scale: fx.Tensor,
         addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64, addr_in_idx: fx.Int64,
-        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64, stream: fx.Stream,
+        addr_in_wts: fx.Int64, addr_parity: fx.Int64, addr_expected: fx.Int64, i32_rank: fx.Int32,
+        stream: fx.Stream,
     ):
         kernel(
             out, x, w, scale_x, scale_w, out_scale, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts,
-            addr_parity, addr_expected,
+            addr_parity, addr_expected, i32_rank,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -1708,6 +1711,7 @@ class SmallMRuntime:
         table[DispatchSlot.FC_CNT] = comb_op.comb_bar.data_ptr()
         table[DispatchSlot.FC_XDB] = comb_op.shmem_xdev_bar_mem.data_ptr()
         table[DispatchSlot.FC_P2P_XDB] = comb_op._p2p_xdb_mem.data_ptr()
+        table[DispatchSlot.FC_XDB_OFF] = self.rank * 8
         table[DispatchSlot.FC_INP] = comb_op.shmem_comb_inp_tok.data_ptr()
         table[DispatchSlot.FC_OUT] = comb_op.shmem_comb_out_tok.data_ptr()
         table[DispatchSlot.FC_TRECV] = comb_op.total_recv.data_ptr()
@@ -1771,7 +1775,7 @@ class SmallMRuntime:
         fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
         # fmt: off
         launch = compile_mega_moe_stage1.lazy(
-            model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
+            model_dim=self.model_dim, inter_dim=self.inter_dim,
             experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
             fused=fused, num_cu=self._s1_num_cu, sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n,
@@ -1789,7 +1793,7 @@ class SmallMRuntime:
             self._launcher(config), self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
             self._s1_osd, fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(self._s1_epoch_parity.data_ptr()),
-            fx.Int64(self._s1_epoch_expected.data_ptr()), stream)
+            fx.Int64(self._s1_epoch_expected.data_ptr()), fx.Int32(self.rank), stream)
         # fmt: on
 
     def preload_aot_bundle(self):
