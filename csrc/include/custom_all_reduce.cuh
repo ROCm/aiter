@@ -4514,6 +4514,25 @@ DINLINE V lamportPollSlot(const V* slot_ptr)
     return slot_val;
 }
 
+// Pack idx of input, or with ADD of input + other: each element added in
+// fp32 and rounded to T, the bits of materializing input + other first (as
+// torch adds 2-byte floats), so the all-reduce of the sum keeps the bits of
+// all_reduce(input + other).
+template <bool ADD, typename T, typename P>
+DINLINE P lamportLoadPack(const P* __restrict__ input, const P* __restrict__ other, int64_t idx)
+{
+    P x = input[idx];
+    if constexpr(ADD)
+    {
+        constexpr int n = sizeof(P) / sizeof(T);
+        const P y       = other[idx];
+#pragma unroll
+        for(int j = 0; j < n; ++j)
+            x[j] = downcast_s<T>(upcast_s(x[j]) + upcast_s(y[j]));
+    }
+    return x;
+}
+
 /*
  * One-shot: wave w loads the block's packs, pushes them into slot[rank] of the
  * inbox of rank peer = (rank + w) % ngpus, polls slot[peer] of its own inbox
@@ -4521,9 +4540,10 @@ DINLINE V lamportPollSlot(const V* slot_ptr)
  * there. After one __syncthreads wave 0 sums in rank order and writes the
  * output while the other waves re-arm their slot.
  */
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool ADD = false>
 __global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceWaveSplit(
     const T* __restrict__ input,
+    const T* __restrict__ other, // ADD: all-reduce input + other, else unused
     T* __restrict__ result,
     LamportPeers peers,
     uint32_t* __restrict__ round_counter, // [kLamportMaxBlocks], rank-local
@@ -4564,7 +4584,8 @@ __global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceW
     {
         // every wave loads the same packs, the repeats mostly hit the cache
         pack pack_val;
-        pack_val.data = *(reinterpret_cast<const P*>(input) + pack_id);
+        pack_val.data = lamportLoadPack<ADD, T>(
+            reinterpret_cast<const P*>(input), reinterpret_cast<const P*>(other), pack_id);
 #pragma unroll
         for(int j = 0; j < 4; ++j)
             pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
@@ -4629,9 +4650,10 @@ __global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceW
  * sent everything of round c-1, so the peer's re-arm at the end of round c is
  * still safe.
  */
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool ADD = false>
 __global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceTwoShotWaveSplit(
     const T* __restrict__ input,
+    const T* __restrict__ other, // ADD: all-reduce input + other, else unused
     T* __restrict__ result,
     LamportPeers peers,
     uint32_t* __restrict__ round_counter, // [lamportTwoShotMaxBlocks(ngpus)], rank-local
@@ -4678,7 +4700,9 @@ __global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceT
     if(is_active)
     {
         pack pack_val;
-        pack_val.data = *(reinterpret_cast<const P*>(input) + (int64_t)peer * part + pos);
+        pack_val.data = lamportLoadPack<ADD, T>(reinterpret_cast<const P*>(input),
+                                                reinterpret_cast<const P*>(other),
+                                                (int64_t)peer * part + pos);
 #pragma unroll
         for(int j = 0; j < 4; ++j)
             pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
@@ -4772,8 +4796,10 @@ struct LamportState
     static constexpr int64_t twoShotMaxBytes() { return kLamportTwoShotMaxBytes; }
 
     // the message must be whole 16B packs, at most oneShotMaxBytes()
+    // other: all-reduce input + other (same numel), nullptr for input alone
     template <typename T>
-    void runOneShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    void runOneShot(
+        hipStream_t stream, const T* input, T* output, int64_t numel, const T* other = nullptr)
     {
         const int64_t bytes     = numel * (int64_t)sizeof(T);
         const int64_t num_packs = bytes / 16;
@@ -4784,13 +4810,14 @@ struct LamportState
         if(num_packs == 0)
             return;
         const int num_blocks = (int)((num_packs + kLamportWaveSize - 1) / kLamportWaveSize);
-        launch<T>(true, stream, input, output, num_blocks, (int)num_packs);
+        launch<T>(true, stream, input, other, output, num_blocks, (int)num_packs);
     }
 
     // the message must split into world_size chunks of whole 16B packs, at
     // most twoShotMaxBytes()
     template <typename T>
-    void runTwoShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    void runTwoShot(
+        hipStream_t stream, const T* input, T* output, int64_t numel, const T* other = nullptr)
     {
         const int64_t bytes = numel * (int64_t)sizeof(T);
         const int64_t part  = bytes / 16 / world_size;
@@ -4802,7 +4829,7 @@ struct LamportState
         if(part == 0)
             return;
         const int num_blocks = (int)((part + kLamportWaveSize - 1) / kLamportWaveSize);
-        launch<T>(false, stream, input, output, num_blocks, (int)part);
+        launch<T>(false, stream, input, other, output, num_blocks, (int)part);
     }
 
     private:
@@ -4810,20 +4837,30 @@ struct LamportState
     void launch(bool is_one_shot,
                 hipStream_t stream,
                 const T* input,
+                const T* other,
                 T* output,
                 int num_blocks,
                 int count)
     {
-#define LAUNCH_LAMPORT(NGPUS)                                                           \
-    case NGPUS:                                                                         \
-        if(is_one_shot)                                                                 \
-            lamportAllReduceWaveSplit<T, NGPUS>                                         \
-                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
-                    input, output, one_shot_peers, d_one_shot_round, rank, count);      \
-        else                                                                            \
-            lamportAllReduceTwoShotWaveSplit<T, NGPUS>                                  \
-                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
-                    input, output, two_shot_peers, d_two_shot_round, rank, count);      \
+#define LAUNCH_LAMPORT_KERNELS(NGPUS, ADD)                                            \
+    if(is_one_shot)                                                                   \
+        lamportAllReduceWaveSplit<T, NGPUS, ADD>                                      \
+            <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                    \
+                input, other, output, one_shot_peers, d_one_shot_round, rank, count); \
+    else                                                                              \
+        lamportAllReduceTwoShotWaveSplit<T, NGPUS, ADD>                               \
+            <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                    \
+                input, other, output, two_shot_peers, d_two_shot_round, rank, count);
+#define LAUNCH_LAMPORT(NGPUS)                    \
+    case NGPUS:                                  \
+        if(other != nullptr)                     \
+        {                                        \
+            LAUNCH_LAMPORT_KERNELS(NGPUS, true)  \
+        }                                        \
+        else                                     \
+        {                                        \
+            LAUNCH_LAMPORT_KERNELS(NGPUS, false) \
+        }                                        \
         break;
 
         switch(world_size)
@@ -4836,6 +4873,7 @@ struct LamportState
                                      std::to_string(world_size));
         }
 #undef LAUNCH_LAMPORT
+#undef LAUNCH_LAMPORT_KERNELS
     }
 };
 
@@ -5617,16 +5655,23 @@ class CustomAllreduce
         return ll_bs || ll128_bs;
     }
 
-    // Runs one lamport kernel; LamportKernel::none does nothing.
+    // Runs one lamport kernel; LamportKernel::none does nothing. With other
+    // (numel elements too) it all-reduces input + other, adding as it loads
+    // (lamportLoadPack), bit for bit all-reducing the materialized sum.
     template <typename T>
-    void runLamport(hipStream_t stream, const T* input, T* output, int64_t numel, LamportKernel kernel)
+    void runLamport(hipStream_t stream,
+                    const T* input,
+                    T* output,
+                    int64_t numel,
+                    LamportKernel kernel,
+                    const T* other = nullptr)
     {
         if(kernel != LamportKernel::none && !lamport_)
             throw std::runtime_error("runLamport: initLamport was not called");
         if(kernel == LamportKernel::one_shot)
-            lamport_->runOneShot<T>(stream, input, output, numel);
+            lamport_->runOneShot<T>(stream, input, output, numel, other);
         else if(kernel == LamportKernel::two_shot)
-            lamport_->runTwoShot<T>(stream, input, output, numel);
+            lamport_->runTwoShot<T>(stream, input, output, numel, other);
     }
 
     template <typename T>

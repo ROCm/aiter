@@ -758,6 +758,13 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("kernel"));                                                        \
+    m.def("lamportAllReduceAdd",                                                     \
+          &aiter::lamportAllReduceAdd,                                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("other"),                                                          \
+          py::arg("out"),                                                            \
+          py::arg("kernel"));                                                        \
     m.def("register_input_buffer",                                                   \
           &aiter::register_input_buffer,                                             \
           py::arg("_fa"),                                                            \

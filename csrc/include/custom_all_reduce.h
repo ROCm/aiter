@@ -196,6 +196,11 @@ void initLamport(fptr_t _fa,
                  const std::vector<int64_t>& offsets);
 int64_t lamportKernel(fptr_t _fa, int64_t numel);
 void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel);
+void lamportAllReduceAdd(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& other,
+                         const aiter_tensor_t& out,
+                         int64_t kernel);
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
                            const std::vector<int64_t>& ipc_handle_ptrs,

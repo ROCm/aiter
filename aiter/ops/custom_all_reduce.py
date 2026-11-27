@@ -281,6 +281,12 @@ def lamportAllReduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def lamportAllReduceAdd(
+    _fa: int, inp: torch.Tensor, other: torch.Tensor, out: torch.Tensor, kernel: int
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def register_input_buffer(
     _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...

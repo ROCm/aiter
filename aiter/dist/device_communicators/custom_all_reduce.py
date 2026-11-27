@@ -2111,11 +2111,12 @@ class CustomAllreduce:
             size,
         )
 
-    # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
-    # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above
-    # _init_lamport_ar_rms.
+    # TODO: the gfx9 lamport init, lamport all_reduce (and all_reduce_add, the
+    # same kernels and inboxes) only for now; it also sets up lamport AR +
+    # RMSNorm once gfx9 has it, see the TODO above _init_lamport_ar_rms.
     def _initLamport(self, world_size: int):
-        """Set up the lamport one-shot / two-shot path of all_reduce.
+        """Set up the lamport one-shot / two-shot path of all_reduce, which
+        all_reduce_add also takes with the add fused (lamportAllReduceAdd).
 
         On by default on the gfx9 archs in _LAMPORT_GFX with 2, 4 or 8 ranks;
         AITER_CUSTOM_AR_DISABLE_LAMPORT=1 keeps the original dispatch there.
@@ -2162,6 +2163,79 @@ class CustomAllreduce:
             "Custom allreduce lamport path on (%d MiB buffer); set %s=1 to disable",
             size >> 20,
             _DISABLE_LAMPORT_ENV,
+        )
+
+    def lamportAllReduceAdd(
+        self, inp: torch.Tensor, other: torch.Tensor, kernel: int = 0
+    ) -> torch.Tensor:
+        """gfx9: all-reduce of inp + other with the add fused into the lamport
+        kernel (each pack loaded as inp + other rounded to the dtype), bit for
+        bit all_reduce(inp + other). all_reduce_add takes it with kernel 0 where
+        all_reduce(inp + other) would run a lamport kernel (see
+        CudaCommunicator.shouldLamportAllReduceAdd). kernel 0 takes the kernel
+        all_reduce would pick for this size (raises outside the lamport
+        ranges); 1 one-shot (up to 640KB) and 2 two-shot (up to 2MB, whole 16B
+        packs per rank) force one, for tests and tuning. Every rank must make
+        the same call; neither operand needs IPC registration, so it runs the
+        same eager, in warmup and in a captured graph."""
+        if not self.lamport_enabled:
+            raise RuntimeError(
+                "lamportAllReduceAdd needs the lamport path (_initLamport)"
+            )
+        if other.shape != inp.shape or other.dtype != inp.dtype:
+            raise ValueError(
+                "lamportAllReduceAdd: other must match inp's shape and dtype"
+            )
+        out = torch.empty_like(inp)
+        ops.lamportAllReduceAdd(
+            self._ptr,
+            _lamport_aligned(inp.contiguous()),
+            _lamport_aligned(other.contiguous()),
+            out,
+            kernel,
+        )
+        return out
+
+    def shouldLamportAllReduceAdd(
+        self,
+        inp: torch.Tensor,
+        other: torch.Tensor,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> bool:
+        """gfx9: whether custom_all_reduce(inp + other), reached through
+        should_custom_plain_ar, would run a lamport kernel, so that
+        lamportAllReduceAdd(inp, other) runs that same kernel with the add
+        fused. CudaCommunicator.shouldLamportAllReduceAdd adds the paths
+        all_reduce tries before this one.
+
+        Shapes, dtypes, sizes and flags only, so every rank decides the same:
+        the kernel waits for its peers, a rank taking another path would hang
+        them.
+        """
+        if self.disabled or not self.lamport_enabled:
+            return False
+        if not (
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and other.dtype == inp.dtype
+            and other.shape == inp.shape
+            and inp.is_contiguous()
+            and other.is_contiguous()
+        ):
+            return False
+        # the lamport kernels run only with use_new; with open_fp8_quant an
+        # fp16 message may take the fp8 kernel instead (useFp8Quant in
+        # custom_all_reduce.cu), so fp16 with it is left to all_reduce
+        if not use_new or (open_fp8_quant and inp.dtype == torch.float16):
+            return False
+        # The FlyDSL gates look at the address. all_reduce would see the sum,
+        # a fresh 16B-aligned tensor, so they see one too.
+        probe = inp if inp.data_ptr() % 16 == 0 else torch.empty_like(inp)
+        return (
+            self.should_custom_plain_ar(probe, prefill_support)
+            and not self._should_fly_oneshot(probe, use_new, open_fp8_quant)
+            and ops.lamportKernel(self._ptr, inp.numel()) != 0
         )
 
     @property
