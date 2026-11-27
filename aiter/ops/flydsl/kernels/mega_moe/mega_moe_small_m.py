@@ -1267,7 +1267,9 @@ def compile_mega_moe_stage1(
         # routed tiles are. The host launches this kernel only for row counts whose units all find a consumer
         # workgroup (shared_in_fits); here: at least one m-tile's worth.
         sh_n1, sh_n2 = (2 * inter_dim) // 256, model_dim // 256
-        assert NUM_WAVES == 4 and sort_block_m == 32 and swiglu_limit > 0 and fz_mtpr <= 16 * 32
+        # The routed tiles may be 32 or 64 rows (the 256 / 512 buckets): the pre-phase ends before the routed work
+        # keeps anything in LDS, so only the budget below ties the two.
+        assert NUM_WAVES == 4 and sort_block_m in (32, 64) and swiglu_limit > 0 and fz_mtpr <= 16 * 32
         assert max(sh_n1, sh_n2) <= launch_grid_x - 1 - dispatch_blocks, (
             "shared_in: too few consumer workgroups", launch_grid_x, dispatch_blocks)
         # Pool: the shared GEMM2 epilogue's 32 x 256 fp32 tile (the pre-phase ends before the kernel keeps any
@@ -1521,7 +1523,7 @@ def compile_mega_moe_stage1(
             sh_epoch = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(gate_epoch).ir_value()))
             sh_sync = _sh_ptr(DispatchSlot.SH_SYNC)
             sh_act, sh_act_scale = _sh_ptr(DispatchSlot.SH_ACT), _sh_ptr(DispatchSlot.SH_ACT_SCALE)
-            sh_tiles = (i32_cur_tok + fx.Int32(sort_block_m - 1)) // fx.Int32(sort_block_m)
+            sh_tiles = (i32_cur_tok + fx.Int32(_se.SORT_BLOCK_M - 1)) // fx.Int32(_se.SORT_BLOCK_M)
             sh_lds_out = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
             sh_partial_lds = None
             if const_expr(shared_in == 2 and not sh_split_wg):
@@ -2312,8 +2314,9 @@ def shared_in_fits(
     config: MegaMoEConfig, rows: int, num_cu: int, model_dim: int, inter_dim: int
 ) -> bool:
     """Whether the fused kernel of ``config`` can also run the shared expert of a ``rows``-row call
-    (compile_mega_moe_stage1's shared_in): its own plan in every CTA, 4 waves, 32-row routed tiles (the LDS the
-    two workgroups of a CU share), and a consumer workgroup for each of the call's shared GEMM1 / GEMM2 units.
+    (compile_mega_moe_stage1's shared_in): its own plan in every CTA, 4 waves, 32- or 64-row routed tiles (the
+    shared units are 32-row tiles of their own either way; the kernel's LDS, two workgroups a CU, is checked where it
+    is built), and a consumer workgroup for each of the call's shared GEMM1 / GEMM2 units.
     """
     stage1, knobs = config.stage1, config.fused_stage1
     consumers = num_cu * min(stage1.grid_mult, 2) - 1 - stage1.num_dispatch_cu
@@ -2322,7 +2325,7 @@ def shared_in_fits(
         and knobs.plan_local
         and not knobs.tok_done
         and stage1.num_waves == 4
-        and stage1.sort_block_m == 32
+        and stage1.sort_block_m in (32, 64)
         and ceildiv(rows, 32) * max((2 * inter_dim) // 256, model_dim // 256)
         <= consumers
     )
