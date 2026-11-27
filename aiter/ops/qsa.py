@@ -9,8 +9,12 @@ modules directly.
 """
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from aiter.ops.qsa_indexer import qsa_decode_indexer, qsa_prefill_indexer
 
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
@@ -293,3 +297,17 @@ __all__ = [
     "qsa_sparse_prefill_widths",
     "qsa_store_quantized_rows",
 ]
+
+if _HAS_FLYDSL:
+    __all__ += ["qsa_decode_indexer", "qsa_prefill_indexer"]
+
+
+def __getattr__(name):
+    # Keep the other QSA operators importable without the FlyDSL indexer.
+    if name in ("qsa_prefill_indexer", "qsa_decode_indexer"):
+        from aiter.ops import qsa_indexer
+
+        op = getattr(qsa_indexer, name)
+        globals()[name] = op
+        return op
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
