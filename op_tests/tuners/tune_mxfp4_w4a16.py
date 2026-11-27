@@ -9,7 +9,9 @@ The default search crosses every launch knob. Tile M/N and stage K use
 16, 32, 64, and 128. Traversal covers every
 distinct group width for the shape. Use --space to replace any axis (for
 example, --space stage_k=16-256:16). This can be a long sweep. Use --max-trials
-to run it in batches and reuse --csv to resume. --continue-from imports a
+to run it in batches and reuse --csv to resume. Use --slow-cutoff to screen
+slow configs after the first timing batch and --trial-timeout to bound each
+trial's wall time. --continue-from imports a
 previous CSV when continuing into a different output file. Progress requires
 tqdm in the tuning environment. --output accepts a selector JSON path named
 GEMM-MXFP4-W4A16-N=<N>-K=<K>.json.
@@ -22,10 +24,12 @@ import hashlib
 import json
 import math
 import os
+import signal
 import statistics
 from contextlib import nullcontext
 from dataclasses import asdict, fields, replace
 from itertools import product
+from multiprocessing import get_context
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -68,7 +72,15 @@ _TRAVERSAL = "traversal_group_m"
 _BOOL_FIELDS = {f.name for f in fields(MXFP4W4A16Config) if f.type is bool}
 _CONFIG_FIELDS = [f.name for f in fields(MXFP4W4A16Config)]
 _RESULT_FIELDS = ["status", "median_us", "detail"]
-_TRIAL_STATUSES = ("ok", "compile_error", "invalid", "incorrect", "out_of_memory")
+_TRIAL_STATUSES = (
+    "ok",
+    "compile_error",
+    "invalid",
+    "incorrect",
+    "out_of_memory",
+    "screened_slow",
+    "timed_out",
+)
 
 
 def _integers(text):
@@ -157,7 +169,9 @@ def _identity(device, n, k, args):
     }
 
 
-def _read_csv(handle, columns, identity, history, *, repair_tail=False, copy_to=None):
+def _read_csv(
+    handle, columns, identity, history, args, *, repair_tail=False, copy_to=None
+):
     """Restore matching trials and optionally copy new rows into a checkpoint."""
     handle.seek(0)
     offset = 0
@@ -201,13 +215,28 @@ def _read_csv(handle, columns, identity, history, *, repair_tail=False, copy_to=
                 latency is not None and (not math.isfinite(latency) or latency <= 0)
             ):
                 raise ValueError("Invalid trial result")
-            if copy_to is not None:
-                if config in history[m]:
+            if status == "screened_slow":
+                screen = json.loads(row["detail"])
+                if not (
+                    args.slow_cutoff
+                    and screen["space"] == args.screen_space
+                    and screen["batch_us"] > args.slow_cutoff * screen["best_us"]
+                ):
                     continue
+            if status == "timed_out" and not (
+                0 < args.trial_timeout <= json.loads(row["detail"])["timeout_seconds"]
+            ):
+                continue
+            if config in history[m] and (
+                copy_to is not None
+                or (latency is None and history[m][config] is not None)
+            ):
+                continue
+            if copy_to is not None:
                 copy_to.writerow(row)
             history[m][config] = latency
             loaded += 1
-        except (ValueError, csv.Error) as error:
+        except (ValueError, TypeError, KeyError, csv.Error) as error:
             raise ValueError(
                 f"Invalid tuning CSV {handle.name} line {line_number}: {error}"
             ) from error
@@ -244,7 +273,7 @@ def _make_problem(shape, device, packed, scales):
     return a, torch.empty_like(expected), expected
 
 
-def _measure(a, prepared, out, expected, config, args):
+def _measure(a, prepared, out, expected, config, args, best_us):
     def run():
         gemm.flydsl_gemm_mxfp4_w4a16(a, prepared, out=out, config=config)
 
@@ -262,25 +291,34 @@ def _measure(a, prepared, out, expected, config, args):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     samples = []
-    for _ in range(args.batches):
+    for batch in range(args.batches):
         start.record()
         for _ in range(args.replays):
             graph.replay()
         end.record()
         end.synchronize()
-        samples.append(
-            start.elapsed_time(end) * 1000 / (args.replays * args.graph_gemms)
-        )
-    return statistics.median(samples)
-
-
-def _trial(shape, problem, prepared, config, args):
-    a, out, expected = problem
-    try:
-        latency = _measure(a, prepared, out, expected, config, args)
+        latency = start.elapsed_time(end) * 1000 / (args.replays * args.graph_gemms)
         if not math.isfinite(latency) or latency <= 0:
             raise RuntimeError(f"Invalid measured latency: {latency}")
-        return "ok", latency, ""
+        if (
+            batch == 0
+            and args.batches > 1
+            and args.slow_cutoff
+            and best_us is not None
+            and latency > args.slow_cutoff * best_us
+        ):
+            detail = json.dumps(
+                {"batch_us": latency, "best_us": best_us, "space": args.screen_space}
+            )
+            return "screened_slow", None, detail
+        samples.append(latency)
+    return "ok", statistics.median(samples), ""
+
+
+def _trial(shape, problem, prepared, config, args, best_us):
+    a, out, expected = problem
+    try:
+        return _measure(a, prepared, out, expected, config, args, best_us)
     except (DSLCompileError, ExternalLLVMError) as error:
         return "compile_error", None, " ".join(str(error).split())[:500]
     except ValueError as error:
@@ -301,24 +339,125 @@ def _trial(shape, problem, prepared, config, args):
         gemm._eager_workspace.cache_clear()
 
 
-def _restored_count(history, geometries, schedule):
+def _trial_worker(connection, device, args):
+    # Include any external compiler children in the watchdog's process group.
+    os.setsid()
+    with connection, torch.cuda.device(device), torch.inference_mode():
+        weights = _make_weights(args.n, args.k, device)
+        problem = None
+        while True:
+            try:
+                shape, config, best_us = connection.recv()
+            except EOFError:
+                return
+            if config is None:
+                problem = _make_problem(shape, device, *weights[:2])
+                torch.cuda.synchronize(device)
+                connection.send(None)
+            else:
+                connection.send(
+                    _trial(shape, problem, weights[2], config, args, best_us)
+                )
+
+
+class _TimedTrials:
+    """Keep HIP compilation in a worker that can be replaced after a timeout."""
+
+    def __init__(self, device, args):
+        self.device = device
+        self.args = args
+        self.context = get_context("spawn")
+        self.process = None
+        self.connection = None
+        self.shape = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, _exc, _traceback):
+        self._close(force=exc_type is not None)
+
+    def _close(self, *, force=False):
+        if self.process is None:
+            return
+        self.connection.close()
+        if not force:
+            self.process.join(timeout=2)
+        if self.process.is_alive():
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                self.process.kill()
+        self.process.join()
+        self.process.close()
+        self.process = self.connection = self.shape = None
+
+    def _receive(self):
+        try:
+            return self.connection.recv()
+        except EOFError as error:
+            raise RuntimeError(
+                "The tuning worker exited before returning a result"
+            ) from error
+
+    def run(self, shape, config, best_us):
+        if self.process is None:
+            parent, child = self.context.Pipe()
+            process = self.context.Process(
+                target=_trial_worker, args=(child, self.device, self.args)
+            )
+            try:
+                process.start()
+            except BaseException:
+                parent.close()
+                raise
+            finally:
+                child.close()
+            self.process, self.connection = process, parent
+        if self.shape != shape:
+            self.connection.send((shape, None, None))
+            if not self.connection.poll(max(120, self.args.trial_timeout)):
+                raise RuntimeError(
+                    f"The tuning worker timed out preparing inputs for {shape}"
+                )
+            self._receive()
+            self.shape = shape
+
+        self.connection.send((shape, config, best_us))
+        if self.connection.poll(self.args.trial_timeout):
+            return self._receive()
+        self._close(force=True)
+        return (
+            "timed_out",
+            None,
+            json.dumps({"timeout_seconds": self.args.trial_timeout}),
+        )
+
+
+def _restore_summary(history, geometries, schedule):
     if not history:
-        return 0
+        return 0, None
     widths_by_geometry = {
         tuple(getattr(config, name) for name in _GEOMETRY): widths
         for config, widths in geometries
     }
-    return sum(
-        config.traversal_group_m
-        in widths_by_geometry.get(
+    count = 0
+    best = None
+    for config, latency in history.items():
+        widths = widths_by_geometry.get(
             tuple(getattr(config, name) for name in _GEOMETRY), ()
         )
-        and all(getattr(config, name) in values for name, values in schedule.items())
-        for config in history
-    )
+        if config.traversal_group_m not in widths or any(
+            getattr(config, name) not in values for name, values in schedule.items()
+        ):
+            continue
+        count += 1
+        if latency is not None and (best is None or latency < best[0]):
+            best = (latency, config)
+    return count, best
 
 
-def _sweep(args, device, identity, writer, handle, history):
+def _sweep(args, device, identity, writer, handle, history, worker):
     winners = {}
     weights = None
     new_trials = 0
@@ -330,10 +469,10 @@ def _sweep(args, device, identity, writer, handle, history):
         shape = (m, args.n, args.k)
         geometries = list(_legal_geometries(shape, geometry, args.axes.get(_TRAVERSAL)))
         total = schedules_per_width * sum(len(widths) for _, widths in geometries)
-        restored = _restored_count(history[m], geometries, schedule)
+        restored, best = _restore_summary(history[m], geometries, schedule)
         problem = None
-        best = None
         tested = skipped = rejected = 0
+        screened = timed_out = 0
         last_error = ""
         complete = True
         with tqdm(
@@ -342,7 +481,7 @@ def _sweep(args, device, identity, writer, handle, history):
             desc=f"M={m} N={args.n} K={args.k}",
             unit="cfg",
             dynamic_ncols=True,
-            postfix=f"resumed={restored:,}",
+            postfix=f"resumed={restored:,}, slow=0, timeout=0",
         ) as progress:
             for config in _configs(geometries, schedule):
                 if config in history[m]:
@@ -352,13 +491,17 @@ def _sweep(args, device, identity, writer, handle, history):
                     if args.max_trials is not None and new_trials >= args.max_trials:
                         complete = False
                         break
-                    if weights is None:
-                        weights = _make_weights(args.n, args.k, device)
-                    if problem is None:
-                        problem = _make_problem(shape, device, *weights[:2])
-                    status, latency, detail = _trial(
-                        shape, problem, weights[2], config, args
-                    )
+                    best_us = best[0] if best is not None else None
+                    if worker is not None:
+                        status, latency, detail = worker.run(shape, config, best_us)
+                    else:
+                        if weights is None:
+                            weights = _make_weights(args.n, args.k, device)
+                        if problem is None:
+                            problem = _make_problem(shape, device, *weights[:2])
+                        status, latency, detail = _trial(
+                            shape, problem, weights[2], config, args, best_us
+                        )
                     if detail:
                         last_error = detail
                     if writer is not None:
@@ -375,6 +518,13 @@ def _sweep(args, device, identity, writer, handle, history):
                         handle.flush()
                     tested += 1
                     new_trials += 1
+                    if status in ("screened_slow", "timed_out"):
+                        screened += status == "screened_slow"
+                        timed_out += status == "timed_out"
+                        progress.set_postfix_str(
+                            f"resumed={restored:,}, slow={screened:,}, timeout={timed_out:,}",
+                            refresh=False,
+                        )
                     progress.update()
                 if latency is None:
                     rejected += 1
@@ -453,6 +603,20 @@ def _parse_args():
     parser.add_argument(
         "--max-trials", type=int, help="Limit new trials per invocation"
     )
+    parser.add_argument(
+        "--slow-cutoff",
+        type=float,
+        default=0,
+        metavar="RATIO",
+        help="Skip remaining batches if the first exceeds RATIO times the best verified config (0 disables)",
+    )
+    parser.add_argument(
+        "--trial-timeout",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="Wall-time limit per trial, including compilation (0 disables)",
+    )
     parser.add_argument("--batches", type=int, default=5)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--graph-gemms", type=int, default=4)
@@ -473,6 +637,19 @@ def _parse_args():
         args.max_trials is not None and args.max_trials <= 0
     ):
         parser.error("Timing and trial counts must be positive")
+    if not math.isfinite(args.slow_cutoff) or (
+        args.slow_cutoff != 0 and args.slow_cutoff <= 1
+    ):
+        parser.error("--slow-cutoff must be 0 or a finite ratio greater than 1")
+    if not math.isfinite(args.trial_timeout) or args.trial_timeout < 0:
+        parser.error("--trial-timeout must be finite and non-negative")
+    if args.slow_cutoff:
+        search_space = _GEOMETRY | _SCHEDULE | args.axes
+        args.screen_space = hashlib.sha256(
+            json.dumps(search_space, sort_keys=True).encode()
+        ).hexdigest()
+    else:
+        args.screen_space = None
     if args.continue_from is not None:
         if not args.continue_from.is_file():
             parser.error(f"Previous tuning CSV does not exist: {args.continue_from}")
@@ -510,7 +687,10 @@ def main():
         if args.csv
         else nullcontext(None)
     )
-    with torch.cuda.device(device), csv_file as handle:
+    timed_trials = (
+        _TimedTrials(device, args) if args.trial_timeout else nullcontext(None)
+    )
+    with torch.cuda.device(device), csv_file as handle, timed_trials as worker:
         writer = None
         if handle is not None:
             try:
@@ -518,7 +698,7 @@ def main():
             except BlockingIOError as error:
                 raise SystemExit(f"Another tuner is using {args.csv}") from error
             has_header, loaded = _read_csv(
-                handle, columns, identity, history, repair_tail=True
+                handle, columns, identity, history, args, repair_tail=True
             )
             writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
             if not has_header:
@@ -537,13 +717,15 @@ def main():
                             f"Another tuner is writing {args.continue_from}"
                         ) from error
                     _, copied = _read_csv(
-                        source, columns, identity, history, copy_to=writer
+                        source, columns, identity, history, args, copy_to=writer
                     )
                 handle.flush()
                 print(
                     f"Imported {copied:,} trials from {args.continue_from}", flush=True
                 )
-        winners, failed = _sweep(args, device, identity, writer, handle, history)
+        winners, failed = _sweep(
+            args, device, identity, writer, handle, history, worker
+        )
         if args.output is not None and winners:
             _write_winners(args.output, winners)
     return int(failed)
