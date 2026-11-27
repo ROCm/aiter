@@ -1353,9 +1353,8 @@ def _mla_gluon_launch(
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
-        # split rebalance: a sequence has several segments, so the reduce adds
-        # the sink once instead
-        HAS_ATTN_SINK=has_attn_sink and not split_rebalance,
+        # with several KV splits, the reduce adds the sink once for each sequence
+        HAS_ATTN_SINK=has_attn_sink and NUM_KV_SPLITS == 1,
         SPLIT_REBALANCE=split_rebalance,
     )
 
@@ -1405,7 +1404,7 @@ def _mla_gluon_launch(
         BLOCK_S=reduce_block_s,
         BLOCK_N=BLOCK_N,
         SPLIT_REBALANCE=split_rebalance,
-        HAS_ATTN_SINK=has_attn_sink and split_rebalance,
+        HAS_ATTN_SINK=has_attn_sink,
         num_warps=reduce_num_warps,
     )
 

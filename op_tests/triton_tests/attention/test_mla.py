@@ -1231,13 +1231,59 @@ def test_mla_gluon_decode_split_rebalance(batch, qlen, nhead, kv_dtype, use_2d_v
     torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=0)
 
 
+def test_mla_gluon_prefill_attn_sink():
+    """Prefill mode with 64 heads (bh64): 64 queries get 4 KV splits; the sink is
+    in the softmax once for each query, not once for each split."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+    random.seed(0)
+    torch.manual_seed(0)
+    nhead = 64
+    # bh64 needs more than 3 * BLOCK_N keys in each split
+    lens = [random.randint(1000, 3000) for _ in range(64)]
+    kv_c, block_table, q_nope, _ = _split_rebalance_inputs(
+        len(lens), 1, nhead, torch.bfloat16, max(lens)
+    )
+    # one 512-wide row is the key and the value
+    kv_c = kv_c[:, :512].contiguous()
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    page_table, seq_info = _paged_seq_info(block_table, seq_lens, use_2d_view=False)
+    sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
+    attn_sink = torch.randn(nhead, dtype=torch.float32, device="cuda") + 4.0
+    o, lse = mla_gluon(
+        q_nope=q_nope[:, 0],
+        q_pe=None,
+        kv_c=kv_c,
+        o=torch.empty(q_nope[:, 0].shape, dtype=torch.bfloat16, device="cuda"),
+        page_table=page_table,
+        seq_info=seq_info,
+        sm_scale=sm_scale,
+        min_kv_seq_len=min(lens),
+        return_lse=True,
+        has_pe=False,
+        attn_sink=attn_sink,
+    )
+    o_ref, lse_ref = _mla_gluon_ref(
+        q_nope, q_nope[..., :0], kv_c, lens, block_table, sm_scale, 1.0, attn_sink
+    )
+    scale = o_ref.abs().max().item()
+    torch.testing.assert_close(
+        o.view(o_ref.shape).float(), o_ref, atol=2**-6 * scale, rtol=2**-6
+    )
+    torch.testing.assert_close(lse.view(lse_ref.shape), lse_ref, atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("split_rebalance", [True, False])
 @pytest.mark.parametrize("qlen", [1, 2])
 @pytest.mark.parametrize(
     "nhead, kv_dtype", [(8, torch.float8_e4m3fn), (16, torch.bfloat16)]
 )
-def test_mla_gluon_decode_split_rebalance_attn_sink(qlen, nhead, kv_dtype):
-    """With kv_split_info, a sequence has several segments; the sink is in the
-    softmax once for each sequence, not once for each segment."""
+def test_mla_gluon_decode_attn_sink(split_rebalance, qlen, nhead, kv_dtype):
+    """A sequence has several KV splits (60 sequences: 2 or 4 each by default,
+    more for the long ones with kv_split_info); the sink is in the softmax once
+    for each sequence, not once for each split."""
     if DEVICE_ARCH != "gfx950":
         pytest.skip("Gluon MLA decode is gfx950-only")
     from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
@@ -1256,7 +1302,11 @@ def test_mla_gluon_decode_split_rebalance_attn_sink(qlen, nhead, kv_dtype):
     sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
     # sinks near the logits, so that they change the softmax
     attn_sink = torch.randn(nhead, dtype=torch.float32, device="cuda") + 4.0
-    info = mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, qlen=qlen)
+    info = (
+        mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, qlen=qlen)
+        if split_rebalance
+        else None
+    )
     q_n, q_p = (q_nope[:, 0], q_pe[:, 0]) if qlen == 1 else (q_nope, q_pe)
     o, lse = mla_gluon(
         q_nope=q_n,
