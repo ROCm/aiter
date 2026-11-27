@@ -768,10 +768,14 @@ def asm_gemm(
     config: dict | None = None,
     out: Tensor | None = None,
 ):
-    gfx = get_gfx_runtime()
+    # The arch of the tensor's device, not the node-wide one: the launcher runs
+    # on `inp.device` (a mixed-arch node can differ from `get_gfx_runtime()`).
+    from aiter.ops.opus._arch import _device_arch
+
+    gfx = _device_arch(inp.device)
     if not asm_a16w16_supported(gfx):
         raise RuntimeError(
-            f"gemm_a16w16_asm has no bf16gemm kernels on {gfx}; "
+            f"gemm_a16w16_asm has no bf16gemm kernels on {gfx} ({inp.device}); "
             "choose another backend (e.g. triton, torch)."
         )
     kernelName = config.get("kernelName") if config else None

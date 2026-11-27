@@ -21,15 +21,22 @@ def _default_asm_root() -> str:
 
 @functools.cache
 def _has_asm_kernels(family: str, gfx: str, asm_root: str) -> bool:
+    # Recursive, like the `**/*.csv` glob of hsa/codegen.py: some families keep
+    # their CSVs in subdirectories (e.g. hsa/gfx950/fmoe/silu/).
     family_dir = os.path.join(asm_root, gfx, family)
     try:
-        return any(name.endswith(".csv") for name in os.listdir(family_dir))
+        return any(
+            name.endswith(".csv")
+            for _dir, _subdirs, names in os.walk(family_dir)
+            for name in names
+        )
     except OSError:
         return False
 
 
 def has_asm_kernels(family: str, gfx: str, asm_root: str | None = None) -> bool:
-    """True when ``hsa/<gfx>/<family>/`` lists kernels, e.g. ``("bf16gemm", "gfx950")``.
+    """True when ``hsa/<gfx>/<family>/`` (or a subdirectory) lists kernels, e.g.
+    ``("bf16gemm", "gfx950")``.
 
     ``gfx`` is the exact arch: a variant such as ``gfx1250-strict`` has its own
     directory or none, never its base arch's.
