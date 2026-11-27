@@ -25,7 +25,7 @@ import pandas as pd
 _TUNER_DIR = Path(__file__).resolve().parents[2] / "csrc" / "ck_gemm_a4w4_blockscale"
 sys.path.insert(0, str(_TUNER_DIR))  # the tuner imports its sibling by bare name
 
-import gemm_a4w4_blockscale_tune as tune_mod  # noqa: E402
+import gemm_a4w4_blockscale_tune as tune_mod
 
 ASM_NAMES = {
     (256, 256, 1, 0): "_ZN5aiter_fake_256x256_sk",
@@ -96,10 +96,12 @@ class TestLibtypeArgs(unittest.TestCase):
             ["--libtype", "cktile"],
         ):
             tuner = tune_mod.GemmA4W4BlockScaleTuner("t", description="t")
-            with mock.patch.object(sys, "argv", ["tune.py", *argv]):
-                with contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit) as ctx:
-                        tuner.parse_args()
+            with (
+                mock.patch.object(sys, "argv", ["tune.py", *argv]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as ctx,
+            ):
+                tuner.parse_args()
             self.assertEqual(ctx.exception.code, 2, argv)
 
 
@@ -112,19 +114,26 @@ class TestCandidateSets(unittest.TestCase):
         asm_dir = Path(self.tmp.name, "f4gemm")
         asm_dir.mkdir()
         rows = [
-            dict(tile_M=m, tile_N=n, splitK=sk, bpreshuffle=1, ps=ps, knl_name=name)
+            {
+                "tile_M": m,
+                "tile_N": n,
+                "splitK": sk,
+                "bpreshuffle": 1,
+                "ps": ps,
+                "knl_name": name,
+            }
             for (m, n, sk, ps), name in ASM_NAMES.items()
         ]
         # A non-preshuffle row must stay excluded.
         rows.append(
-            dict(
-                tile_M=64,
-                tile_N=64,
-                splitK=0,
-                bpreshuffle=0,
-                ps=0,
-                knl_name="_ZN5aiter_fake_nobps",
-            )
+            {
+                "tile_M": 64,
+                "tile_N": 64,
+                "splitK": 0,
+                "bpreshuffle": 0,
+                "ps": 0,
+                "knl_name": "_ZN5aiter_fake_nobps",
+            }
         )
         pd.DataFrame(rows).to_csv(asm_dir / "f4gemm_bf16_per1x32Fp4.csv", index=False)
         self.asm_dir = self.tmp.name
