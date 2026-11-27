@@ -2146,7 +2146,28 @@ namespace py = pybind11;
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
           py::arg("asm_layout")        = false,        \
-          py::arg("skip_index_branch") = false)
+          py::arg("skip_index_branch") = false);        \
+    m.def("fused_qknorm_nvfp4_raw",                   \
+          &aiter::fused_qknorm_nvfp4_raw,             \
+          py::arg("qkv"), \
+          py::arg("q_out"), \
+          py::arg("index_q_out"), \
+          py::arg("q_norm_weight"), \
+          py::arg("k_norm_weight"), \
+          py::arg("index_q_norm_weight"), \
+          py::arg("index_k_norm_weight"), \
+          py::arg("cos_sin_cache"), \
+          py::arg("positions"), \
+          py::arg("slot_mapping"), \
+          py::arg("index_slot_mapping"), \
+          py::arg("kv_cache"), \
+          py::arg("index_cache"), \
+          py::arg("k_scale"), \
+          py::arg("v_scale"), \
+          py::arg("num_tokens"), \
+          py::arg("kv_page_stride_bytes"), \
+          py::arg("eps"), \
+          py::arg("stream"))
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \

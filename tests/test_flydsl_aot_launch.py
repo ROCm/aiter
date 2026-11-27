@@ -13,7 +13,8 @@ output is not bitwise reproducible):
   does, and writes nothing; a ``COMPILE_ONLY`` run then prebuilds the entries.
 * ``aot hit``: ``=1`` again. Every launch loads its object, nothing builds.
 
-All modes must produce bitwise identical outputs.
+All modes must produce bitwise identical outputs. The GDN hidden-state kernel
+and the paged-attention decode planner are checked the same way.
 """
 
 import argparse
@@ -695,6 +696,107 @@ def test_preload_and_bad_source_list_under_compile_only(monkeypatch, tmp_path):
     assert isinstance(bad._kernel(("k",), make_exe, ()), aot_cache._JitKernel)
 
 
+def _bound_preload_setup(monkeypatch, tmp_path, name):
+    """A cached factory bound to a cache in ``tmp_path``, a FlyDSL whose
+    compile and load record what they do, and the error log."""
+    import functools
+
+    from aiter.ops.flydsl import aot_cache
+    from aiter.ops.flydsl.aot_launch import aot_factory
+
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "directory", lambda self: tmp_path)
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    events = []
+
+    def launch(a, b):
+        pass
+
+    def compile(exe, *args, compile_only=False):
+        assert exe is launch, exe  # the launcher, never a lazy handle
+        if compile_only:  # the export's compile
+            events.append("export")
+            return _FakeCompiled()
+        if "COMPILE_ONLY" in os.environ:
+            events.append("jit compile-only")
+            return None
+        events.append("jit launch")
+        return lambda *a: events.append("jit function")
+
+    def load_module(path):
+        events.append("load")
+        return lambda *a: events.append(("loaded function", a))
+
+    monkeypatch.setattr(aot_cache.flyc, "compile", compile)
+    monkeypatch.setattr(aot_cache, "_load_module", load_module)
+
+    @aot_factory(name)
+    @functools.cache
+    def factory(n):
+        return launch
+
+    return factory, events, _errors(monkeypatch, aot_cache)
+
+
+def test_preload_of_a_bound_launcher(monkeypatch, tmp_path):
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound"
+    )
+    # A prebuild builds the entry, as a launch does, and dispatches nothing.
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    assert tensor_shim._preload_compiled(factory.lazy(4), 1, 2) is None
+    assert events == ["export"] and len(list(tmp_path.glob("*.o"))) == 1
+    # Its entry on disk: FlyDSL's own compile-only launch, which an AOT replay
+    # watches, and no second build.
+    events.clear()
+    assert tensor_shim._preload_compiled(factory.lazy(4), 1, 2) is None
+    assert events == ["jit compile-only"] and len(list(tmp_path.glob("*.o"))) == 1
+
+    # A process that serves (another cache state: the factory of a new
+    # process) loads the entry and launches nothing; the function it returns
+    # takes the launcher's arguments, and so do later launches of the key.
+    monkeypatch.delenv("COMPILE_ONLY")
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound"
+    )
+    loaded = tensor_shim._preload_compiled(factory.lazy(4), 1, 2)
+    assert events == ["load"]
+    loaded(3, 4)
+    tensor_shim._run_compiled(factory.lazy(4), 5, 6)
+    assert events == ["load", ("loaded function", (3, 4)), ("loaded function", (5, 6))]
+    # A caller that keeps the function gets the loaded one, launched.
+    events.clear()
+    kept = tensor_shim._compile_and_keep(factory.lazy(4), 7, 8)
+    assert events == [("loaded function", (7, 8))] and kept is not None
+    assert not errors
+
+
+def test_preload_of_a_bound_launcher_without_an_entry(monkeypatch, tmp_path):
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_preload_bound_miss"
+    )
+    # No entry: one error, and the launcher (not the handle) is preloaded on
+    # the JIT path; nothing is written.
+    assert tensor_shim._preload_compiled(factory.lazy(5), 1, 2) is None
+    assert events == ["jit compile-only"]
+    assert len(errors) == 1 and "no prebuilt entry" in errors[0], errors
+    assert not list(tmp_path.iterdir())
+    # The key's launches take the JIT path, without another error.
+    tensor_shim._run_compiled(factory.lazy(5), 3, 4)
+    assert events == ["jit compile-only", "jit launch"] and len(errors) == 1
+    # A caller that keeps the function gets the JIT one, launched.
+    events.clear()
+    kept = tensor_shim._compile_and_keep(factory.lazy(6), 7, 8)
+    assert events == ["jit launch"] and len(errors) == 2
+    kept()
+    assert events == ["jit launch", "jit function"]
+    assert not list(tmp_path.iterdir())
+
+
 def test_deleted_source_is_not_hashed(tmp_path):
     from aiter.ops.flydsl import aot_cache
 
@@ -762,14 +864,25 @@ def test_cache_names_are_unique_per_file(monkeypatch, tmp_path):
     os.environ.get("AITER_FLYDSL_AOT_CACHE", "1").strip() == "0",
     reason="mode 0 binds nothing",
 )
-def test_every_cache_declares_the_kernel_files_its_sources_import():
+def test_every_cache_declares_the_kernel_files_its_sources_import(monkeypatch):
     """Sources are declared by hand. A forgotten one is found here, and by the
     cache when it builds an entry: a declared file under ``kernels/`` imports
     a file under ``kernels/`` that is not declared."""
     import importlib
+    import importlib.util
     import re
+    import types
 
     from aiter.ops.flydsl import aot_cache
+
+    if "mori" not in sys.modules and importlib.util.find_spec("mori") is None:
+        # The MegaMoE modules import mori at module level, and only use it
+        # at run time: a stand-in, as the MegaMoE AOT replay has.
+        package, shmem = types.ModuleType("mori"), types.ModuleType("mori.shmem")
+        package.shmem = shmem
+        shmem.mori_shmem_create_tensor = None
+        monkeypatch.setitem(sys.modules, "mori", package)
+        monkeypatch.setitem(sys.modules, "mori.shmem", shmem)
 
     base = Path(aot_cache.__file__).resolve().parent
     creates = re.compile(r"^(@aot_factory\(|.*\bFlyDSLAotCache\()", re.MULTILINE)
@@ -786,13 +899,27 @@ def test_every_cache_declares_the_kernel_files_its_sources_import():
         if not name.startswith("test_")
     }
     assert len(real) >= 20, sorted(real)
+    # What each one is built from is declared in one table, and nowhere else.
+    from aiter.aot.flydsl.sources import AOT_CACHES
+
+    assert set(real) == set(AOT_CACHES), sorted(set(real) ^ set(AOT_CACHES))
+    with pytest.raises(ValueError, match="declared in"):
+        aot_cache.FlyDSLAotCache(next(iter(real)), sources=["kernels/act.py"])
+    # A cache of aiter's own that is not in the table (or whose name is
+    # misspelled where it is created) would depend on its own file only.
+    in_tree = str(base / "kernels" / "act.py")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(aot_cache, "_creation_file", lambda: in_tree)
+        with pytest.raises(ValueError, match="not declared in"):
+            aot_cache.FlyDSLAotCache("mixed_moe_gemm")
     missing = {
         name: [os.path.relpath(f, base) for f in undeclared]
         for name, cache in real.items()
         if (undeclared := aot_cache._undeclared_imports(cache._files))
     }
     assert not missing, "\n".join(
-        f"cache {name!r} must also declare sources={files}"
+        f'cache {name!r} must also list {files} under its "sources" in '
+        f"aiter/aot/flydsl/sources.py"
         for name, files in sorted(missing.items())
     )
     # And the variables its sources read.
@@ -802,7 +929,8 @@ def test_every_cache_declares_the_kernel_files_its_sources_import():
         if (names := aot_cache._undeclared_env(cache._files, cache._env))
     }
     assert not unread, "\n".join(
-        f"cache {name!r} must also declare env={names}"
+        f'cache {name!r} must also list {names} under its "env" in '
+        f"aiter/aot/flydsl/sources.py"
         for name, names in sorted(unread.items())
     )
 
@@ -1036,7 +1164,73 @@ def child():
     print("STATE " + json.dumps(state), flush=True)
 
 
-def run_mode(mode, cache_dir, extra_env=None):
+def child_gdn_h_and_pa_plan():
+    """Two configs each of the GDN hidden-state kernel and the paged-attention
+    decode planner, through ``_run_compiled`` as their public ops launch them."""
+    import torch
+
+    from aiter.ops.flydsl import linear_attention_prefill_kernels as gdn
+    from aiter.ops.flydsl.aot_cache import _JitKernel
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    def digest(*tensors):
+        h = hashlib.sha256()
+        for t in tensors:
+            if t is not None:
+                h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        return h.hexdigest()
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(0)
+    H, Hg, K = 4, 2, 128
+    for name, seqs in (("dense", None), ("varlen", (100, 157))):
+        T = 256 if seqs is None else sum(seqs)
+        k = torch.randn(1, T, Hg, K, generator=gen, device=device) * 0.1
+        w = torch.randn(1, H, T, K, generator=gen, device=device) * 0.1
+        u = torch.randn(1, H, T, K, generator=gen, device=device) * 0.1
+        g = -torch.rand(1, T, H, generator=gen, device=device).cumsum(1) * 0.05
+        kwargs = {"g": g, "use_exp2": False}
+        if seqs is not None:
+            n = len(seqs)
+            offsets = [0, *torch.tensor(seqs).cumsum(0).tolist()]
+            kwargs.update(
+                cu_seqlens=torch.tensor(offsets, dtype=torch.int32, device=device),
+                seq_lens_cpu=list(seqs),
+                initial_state=torch.randn(n, H, K, K, generator=gen, device=device),
+                output_final_state=True,
+            )
+        h, v_new, final = gdn.chunk_gated_delta_rule_fwd_h_flydsl_opt(
+            k.bfloat16(), w.bfloat16(), u.bfloat16(), **kwargs
+        )
+        torch.cuda.synchronize()
+        print("RESULT " + json.dumps([f"gdn_h/{name}", digest(h, v_new, final)]))
+    for batch, window in ((7, 0), (300, 512)):
+        lengths = torch.randint(
+            -5, 70000, (batch,), generator=gen, device=device, dtype=torch.int32
+        )
+        plan = planner.plan_pa_decode(lengths, 2, sliding_window=window)
+        torch.cuda.synchronize()
+        print(
+            "RESULT "
+            + json.dumps(
+                [f"pa_plan/{batch}/{window}", digest(plan.work_info, plan.reduce_info)]
+            )
+        )
+    state = {}
+    for cache in (
+        gdn._get_or_compile_opt.aot_cache,
+        planner.compile_pa_decode_plan.aot_cache,
+    ):
+        kernels = list(cache._mem.values())
+        state[cache.name] = {
+            "entries": len(kernels),
+            "jit": sum(isinstance(k, _JitKernel) for k in kernels),
+            "builds": cache._builds,
+        }
+    print("STATE " + json.dumps(state), flush=True)
+
+
+def run_mode(mode, cache_dir, extra_env=None, child="--child"):
     env = {
         **os.environ,
         "AITER_FLYDSL_AOT_CACHE": mode,
@@ -1044,7 +1238,7 @@ def run_mode(mode, cache_dir, extra_env=None):
         **(extra_env or {}),
     }
     proc = subprocess.run(
-        [sys.executable, __file__, "--child"],
+        [sys.executable, __file__, child],
         env=env,
         capture_output=True,
         text=True,
@@ -1059,7 +1253,7 @@ def run_mode(mode, cache_dir, extra_env=None):
             outs[name] = digest
         elif line.startswith("STATE "):
             state = json.loads(line[len("STATE ") :])
-    assert outs or "COMPILE_ONLY" in env, f"mode {mode} ran no prefill row"
+    assert outs or "COMPILE_ONLY" in env, f"mode {mode} ran no case"
     return outs, state
 
 
@@ -1107,8 +1301,49 @@ def test_moe_gfx942_through_aot_cache():
     assert jit == miss == hit, f"outputs differ:\n{jit}\n{miss}\n{hit}"
 
 
+def test_gdn_h_and_pa_plan_through_aot_cache():
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        pytest.skip(f"the GDN hidden-state kernel is not run on {get_gfx_runtime()}")
+    if not hasattr(flyc, "load_module"):
+        pytest.skip("FlyDSL has no flyc.load_module, so every mode would run the JIT")
+
+    child = "--child-gdn-h-pa-plan"
+    with tempfile.TemporaryDirectory() as cache_dir:
+        jit, state = run_mode("0", cache_dir, child=child)
+        assert all(s["entries"] == 0 for s in state.values()), state
+        assert not any(Path(cache_dir).rglob("*.o")), "mode 0 wrote the AOT cache"
+
+        # A launch never builds: with no entry it traces, as mode 0 does.
+        miss, state = run_mode("1", cache_dir, child=child)
+        for name, s in state.items():
+            assert s["entries"] == s["jit"] == 2, f"{name}: two misses: {s}"
+            assert s["builds"] == 0, f"{name} built at a launch: {s}"
+        assert not any(Path(cache_dir).rglob("*.o")), "a launch wrote the AOT cache"
+
+        # The prebuild: the same calls under COMPILE_ONLY export every entry.
+        _, state = run_mode("1", cache_dir, {"COMPILE_ONLY": "1"}, child=child)
+        for name, s in state.items():
+            assert s["builds"] == 2, f"{name} prebuild: {s}"
+        built = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
+
+        hit, state = run_mode("1", cache_dir, child=child)
+        for name, s in state.items():
+            assert s["entries"] == 2, f"{name} skipped the cache: {s}"
+            assert s["jit"] == 0 and s["builds"] == 0, f"{name} traced: {s}"
+        after = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
+        assert after == built, "aot hit rewrote the AOT cache"
+
+    assert jit == miss == hit, f"outputs differ:\n{jit}\n{miss}\n{hit}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--child", action="store_true", required=True)
-    parser.parse_args()
-    child()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--child", action="store_true")
+    group.add_argument("--child-gdn-h-pa-plan", action="store_true")
+    if parser.parse_args().child:
+        child()
+    else:
+        child_gdn_h_and_pa_plan()
