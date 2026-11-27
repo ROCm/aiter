@@ -126,12 +126,14 @@ def _check_dtypes(tp, rank, world, device):
 
     ca = tp.device_communicator.ca_comm
     # (dtype, width) with 16-byte rows. Each of these raised before the fix:
-    # e5m2 and bool/uint16 on any arch, e4m3fn on gfx942 where native fp8 is fnuz.
+    # e5m2 / bool / uint16 / float64 on any arch, e4m3fn on gfx942 where native
+    # fp8 is fnuz. Both 1-byte and multi-byte element sizes are covered.
     cases = [
         ("float8_e5m2", 32),
         ("float8_e4m3fn", 32),  # non-native (fnuz) fp8 on gfx942
         ("bool", 64),
         ("uint16", 16),
+        ("float64", 4),
     ]
     gen = torch.Generator(device=device)
     for name, width in cases:
@@ -143,8 +145,14 @@ def _check_dtypes(tp, rank, world, device):
             x = _data(gen, (world * 8, width), dtype, device)
             assert ca.should_custom_a2a(x), f"{name}: fast path not taken"
             out = tensor_model_parallel_all_to_all(x, 0, -1)
-            assert _same(
-                out, _reference(_all_inputs(x), rank, world, 0, -1)
+            # Compare in raw bytes: gather the uint8 view, since all_gather_object
+            # cannot serialize the newer typed storages (e.g. uint16 / float8) --
+            # that is a torch limitation, unrelated to the kernel under test.
+            ref = _reference(
+                _gather_host(x.view(torch.uint8).cpu()), rank, world, 0, -1
+            )
+            assert torch.equal(
+                out.cpu().view(torch.uint8), ref
             ), f"{name}: custom byte-view all-to-all differs from reference"
 
 
