@@ -195,8 +195,12 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
     def _clear_op_caches(self):
         from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+        from aiter.utility.mxfp4_tuning import _reset_mxfp4_tuning_for_tuner
 
+        _reset_mxfp4_tuning_for_tuner()
         get_GEMM_config.cache_clear()
+        if hasattr(get_GEMM_config, "has_gfx"):
+            del get_GEMM_config.has_gfx
         if hasattr(get_GEMM_config, "gemm_dict"):
             del get_GEMM_config.gemm_dict
 

@@ -1,0 +1,20 @@
+{
+  "baseline_revision": "162173e89c8b058901625bc7dd518fb9cf6f1438",
+  "baseline_sources": [
+    "aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/dsv3_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/gemma4_31b_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/kimik3_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/q3vl_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/qwen38_27b_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/qwen38_2p4t_a4w4_blockscale_tuned_gemm.csv",
+    "aiter/configs/model_configs/qwen3_235b_a4w4_blockscale_tuned_gemm.csv"
+  ],
+  "default_keys": 3011,
+  "exact_lookup_checks": 3011,
+  "default_differences": 0,
+  "gfx950_128_cu_exact_checks": 375,
+  "legacy_cu_only_checks": 2,
+  "scope": "Production get_GEMM_config function executed with pandas and substituted device metadata; exact-key checks only, no GPU execution or padded-M validation."
+}

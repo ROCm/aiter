@@ -3,6 +3,7 @@
 
 import functools
 import importlib
+import importlib.util
 import json
 import logging
 import multiprocessing
@@ -316,6 +317,18 @@ def _runtime_power_selection() -> bool:
     return "aiter" in sys.modules
 
 
+@functools.lru_cache(maxsize=1)
+def _prebuild_mxfp4_tuning():
+    # setup.py must resolve tuning sources without bootstrapping the aiter package.
+    spec = importlib.util.spec_from_file_location(
+        "_aiter_mxfp4_tuning_prebuild",
+        os.path.join(AITER_ROOT_DIR, "aiter", "utility", "mxfp4_tuning.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def model_config_files(tuned_file_name: str) -> list[str]:
     """Per-model tuned CSVs merged with the default one when no env var is set."""
     from pathlib import Path
@@ -331,11 +344,12 @@ def model_config_files(tuned_file_name: str) -> list[str]:
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GEMM_A4W4",
-            AITER_CONFIG_GEMM_A4W4,
-            "a4w4_blockscale_tuned_gemm",
-        )
+        if "aiter" in sys.modules:
+            from aiter.utility import mxfp4_tuning
+        else:
+            mxfp4_tuning = _prebuild_mxfp4_tuning()
+
+        return mxfp4_tuning.get_mxfp4_config_file()
 
     @property
     def AITER_CONFIG_GEMM_A6W6_FILE(self):

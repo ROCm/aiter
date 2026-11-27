@@ -14,6 +14,9 @@ from build_targets import (
     get_build_targets_env,
     torch_processor_count_to_cu,
 )
+from build_targets import (
+    gfx_from_cu_num as _gfx_from_cu_num,
+)
 from cpp_extension import executable_path
 from hip_runtime import (
     get_current_hip_device,
@@ -254,12 +257,6 @@ def get_asic_revision() -> int:
 # Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
 # are always written with their real arch by the tuner, so they never rely on
 # this backfill.
-_LEGACY_CU_NUM_TO_GFX = {
-    256: "gfx950",
-    80: "gfx942",
-    228: "gfx942",
-    304: "gfx942",
-}
 
 
 def gfx_from_cu_num(cu_num) -> str:
@@ -268,17 +265,7 @@ def gfx_from_cu_num(cu_num) -> str:
     Used to migrate old tuned CSVs (keyed on cu_num only) to the new
     (gfx, cu_num, ...) schema. Unknown cu_num falls back to the live GPU arch.
     """
-    try:
-        cu_num = int(cu_num)
-    except (TypeError, ValueError):
-        return get_gfx_runtime()
-    gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
-    if gfx is not None:
-        return gfx
-    try:
-        return get_gfx_runtime()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
+    return _gfx_from_cu_num(cu_num, get_gfx_runtime)
 
 
 @functools.lru_cache(maxsize=1)
