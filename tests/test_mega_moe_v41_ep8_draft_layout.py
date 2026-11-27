@@ -5,9 +5,11 @@
 The layout is a fused layout without a large-input kernel: calls up to SMALL_M_MAX_MTPR rows a rank take the
 small-input route, larger ones the staged route. Every route returns BF16 rows (BF16_RETURN_LAYOUTS): the
 small-input configs are the 48-expert EP8 tune with a BF16 GEMM2 return on every rank, and the staged route's
-p2p_quant "auto" resolves to "none" at every capacity. The 48-expert layout keeps its returns. The multi-GPU
-check (outputs against the staged route and the fp32 reference) is op_tests/multigpu_tests/test_mega_moe_v2.py
---suite routes --network v41_flash_draft --staged-rtol 0.005.
+p2p_quant "auto" resolves to "none" at every capacity. The draft MoE on 1, 2 or 4 ranks (128 / 64 / 32 experts a
+rank) has no fused route; its staged route returns BF16 rows the same way. The target-model layouts keep their
+returns. The multi-GPU check (outputs against the staged route and the fp32 reference) is
+op_tests/multigpu_tests/test_mega_moe_v2.py --suite routes --network v41_flash_draft --staged-rtol 0.005 on 8
+ranks (both routes) or 4 / 2 ranks (the staged route).
 """
 
 from contextlib import contextmanager
@@ -52,6 +54,19 @@ DRAFT_SHAPE = {
 }
 V41_FLASH_EP8_SHAPE = dict(DRAFT_SHAPE, experts_per_rank=48)
 SMALL_MTPRS = (256, 512)
+# The draft MoE (128 experts) on 1, 2 and 4 ranks: staged route only.
+STAGED_DRAFT_SHAPES = [
+    dict(DRAFT_SHAPE, world_size=world, experts_per_rank=128 // world)
+    for world in (1, 2, 4)
+]
+# The target model (384 experts) on 8, 4 and 2 ranks, V4-Pro, and V4.1-Flash EP8 with EPLB redundant experts.
+TARGET_SHAPES = [
+    {},
+    V41_FLASH_EP8_SHAPE,
+    dict(V41_FLASH_EP8_SHAPE, world_size=4, experts_per_rank=96),
+    dict(V41_FLASH_EP8_SHAPE, world_size=2, experts_per_rank=192),
+    dict(V41_FLASH_EP8_SHAPE, experts_per_rank=49),
+]
 
 
 def _buckets(mtpr):
@@ -192,14 +207,10 @@ def test_staged_route_explicit_p2p_quant_kept():
 def test_other_layouts_keep_their_returns(mtpr):
     """bf16_rows_always and the BF16 staged return are the draft layout's: every other fused layout keeps the
     rows-received choice and the "auto" staged return."""
-    shapes = (
-        {},
-        V41_FLASH_EP8_SHAPE,
-        dict(V41_FLASH_EP8_SHAPE, world_size=4, experts_per_rank=96),
-        dict(V41_FLASH_EP8_SHAPE, world_size=2, experts_per_rank=192),
+    assert cfg.BF16_RETURN_LAYOUTS == frozenset(
+        {(8, 16, 5120, 2304), (4, 32, 5120, 2304), (2, 64, 5120, 2304), (1, 128, 5120, 2304)}
     )
-    assert cfg.BF16_RETURN_LAYOUTS == frozenset({(8, 16, 5120, 2304)})
-    for shape in shapes:
+    for shape in TARGET_SHAPES:
         for bucket in _buckets(mtpr):
             assert not select_fused_config(
                 bucket, mtpr, **shape
@@ -209,6 +220,41 @@ def test_other_layouts_keep_their_returns(mtpr):
                 select_mega_moe_config(64, big, **shape).p2p_quant
                 == "fp8_blockwise_1x32"
             )
+
+
+@pytest.mark.parametrize("shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}")
+def test_staged_draft_layouts_have_no_fused_route(shape):
+    layout = dict(DRAFT, world_size=shape["world_size"])
+    assert not fused_layout_supported(**layout)
+    for mtpr in (256, 512, 16384):
+        plan = build_mega_moe_bundle_plan(mtpr, **shape)
+        assert plan.small_m_mtprs == () and not plan.large_m
+        assert plan.route_for(min(10, mtpr))[0] == ROUTE_STAGED
+
+
+@pytest.mark.parametrize("shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}")
+@pytest.mark.parametrize("mtpr", [b for b in TOKEN_BUCKETS if b >= 16])
+def test_staged_draft_layouts_return_bf16_at_every_capacity(shape, mtpr):
+    """The draft MoE on 1 / 2 / 4 ranks (the DEP4 / DEP2 draft instance has a 16384-token capacity, where "auto"
+    picked FP8 rows) returns BF16 rows on its staged route; only the return format and the FP8-only aligned-pair
+    Stage2 differ from what "auto" picked before."""
+    plan = build_mega_moe_bundle_plan(mtpr, **shape)
+    assert {entry.config.p2p_quant for entry in plan.entries} == {"none"}
+    assert {key.p2p_quant for key in plan.stage2_variants} == {"none"}
+    assert not any(entry.config.stage2.aligned_pair for entry in plan.entries)
+    for entry in plan.entries:
+        bucket = entry.token_bucket
+        assert entry.config == select_mega_moe_config(
+            bucket, mtpr, p2p_quant="none", **shape
+        ), bucket
+        fp8 = select_mega_moe_config(
+            bucket, mtpr, p2p_quant="fp8_blockwise_1x32", **shape
+        )
+        assert entry.config.stage1 == fp8.stage1, bucket
+        if not fp8.stage2.aligned_pair:
+            assert entry.config.stage2 == fp8.stage2, bucket
+        # An explicit p2p_quant is the caller's.
+        assert fp8.p2p_quant == "fp8_blockwise_1x32"
 
 
 def test_knob_defaults_off():

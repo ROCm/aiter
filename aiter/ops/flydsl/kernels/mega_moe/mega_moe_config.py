@@ -57,11 +57,17 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
-# EP8 DeepSeek-V4.1-Flash DSpark draft MoE (the shared expert computed apart): 16 routed experts a rank, topk 3.
-# The small-input kernel only; larger calls keep the staged route. Every route of it returns BF16 rows
-# (BF16_RETURN_LAYOUTS).
-V41_FLASH_EP8_DRAFT_LAYOUT = (8, 16, 5120, 2304)
+# DeepSeek-V4.1-Flash DSpark draft MoE (the shared expert computed apart): 128 routed experts
+# (dspark_n_routed_experts), topk 3, the target model's dims.
+V41_FLASH_DRAFT_EXPERTS = 128
 V41_FLASH_DRAFT_TOPK = 3
+# Its EP8 layout, 16 experts a rank: the small-input kernel only; larger calls keep the staged route.
+V41_FLASH_EP8_DRAFT_LAYOUT = (8, 16, 5120, 2304)
+# The draft MoE on every expert-parallel width (1, 2, 4 or 8 ranks); the EP1 / EP2 / EP4 ones take the staged
+# route only. Every route of each returns BF16 rows (BF16_RETURN_LAYOUTS).
+V41_FLASH_DRAFT_LAYOUTS = frozenset(
+    (world, V41_FLASH_DRAFT_EXPERTS // world, 5120, 2304) for world in (1, 2, 4, 8)
+)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
 # serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
@@ -88,8 +94,9 @@ SMALL_M_ONLY_LAYOUTS = frozenset({V41_FLASH_EP8_DRAFT_LAYOUT})
 # (world_size, experts_per_rank, model_dim, inter_dim) of the layouts whose expert outputs go back to their source
 # rank as BF16 rows on every route: the staged route's p2p_quant "auto" resolves to "none" at every MTPR, and the
 # small-input kernel sends BF16 rows on every rank (bf16_rows_always). The DSpark draft MoE's precision is that of
-# the default (non-mega) MoE backend, whose MoRI combine returns BF16.
-BF16_RETURN_LAYOUTS = frozenset({V41_FLASH_EP8_DRAFT_LAYOUT})
+# the default (non-mega) MoE backend, whose MoRI combine returns BF16: every V4.1-Flash draft layout, whatever
+# its expert-parallel width.
+BF16_RETURN_LAYOUTS = V41_FLASH_DRAFT_LAYOUTS
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -1914,6 +1921,8 @@ def _fused_config(
         )
     if layout == V41_FLASH_EP8_DRAFT_LAYOUT:
         return _tune_v41_flash_ep8_draft_small(config, bucket)
+    if layout in BF16_RETURN_LAYOUTS:
+        return replace(config, fused_stage1=replace(config.fused_stage1, bf16_rows_always=True))
     return config
 
 
