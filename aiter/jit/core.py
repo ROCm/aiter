@@ -22,6 +22,11 @@ from packaging.version import Version, parse
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from build_targets import base_gfx_arch
+from build_failures import (  # noqa: E402
+    JitCompileError,
+    format_failure_summary,
+    isolate_failed_instances,
+)
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -1745,25 +1750,61 @@ def build_module(
                     require_blob_generation(staged_blob_dir, staged_token)
 
             validate_generation()
-            _jit_compile(
-                md_name,
-                sorted(set(sources)),
-                extra_cflags=flags_cc,
-                extra_cuda_cflags=flags_hip,
-                extra_ldflags=extra_ldflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=opbd_dir,
-                verbose=verbose or AITER_LOG_MORE > 0,
-                with_cuda=True,
-                is_python_module=is_python_module,
-                is_standalone=is_standalone,
-                torch_exclude=torch_exclude,
-                hipify=hipify,
-                extra_cuda_cflags_per_source=flags_extra_hip_per_source,
-                # We install a stable module name. Let Ninja check incremental
-                # dependencies and retry failures, not the Python loader cache.
-                use_versioner=False,
-            )
+            # A tuner module holds one translation unit per candidate kernel.
+            # Build all of them, so that one candidate that cannot compile
+            # does not take the others down with it (see below).
+            tolerate_bad_candidates = md_name.endswith("_tune")
+
+            def compile_module():
+                _jit_compile(
+                    md_name,
+                    sorted(set(sources)),
+                    extra_cflags=flags_cc,
+                    extra_cuda_cflags=flags_hip,
+                    extra_ldflags=extra_ldflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=opbd_dir,
+                    verbose=verbose or AITER_LOG_MORE > 0,
+                    with_cuda=True,
+                    is_python_module=is_python_module,
+                    is_standalone=is_standalone,
+                    torch_exclude=torch_exclude,
+                    hipify=hipify,
+                    extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                    # We install a stable module name. Let Ninja check incremental
+                    # dependencies and retry failures, not the Python loader cache.
+                    use_versioner=False,
+                    keep_going=tolerate_bad_candidates,
+                )
+
+            try:
+                compile_module()
+            except JitCompileError as compile_error:
+                isolated = (
+                    isolate_failed_instances(
+                        compile_error.failures, sorted(set(sources))
+                    )
+                    if tolerate_bad_candidates
+                    else None
+                )
+                if not isolated:
+                    raise
+                # Replace each failed candidate by a stub that throws a
+                # RuntimeError naming it and the compiler error, then link.
+                # Ninja reuses the objects that already built.
+                names = {
+                    failure.target: item.name
+                    for failure, item in zip(compile_error.failures, isolated)
+                }
+                logger.error(
+                    "\033[31m%d tune candidate(s) of [%s] failed to compile\033[0m; "
+                    "they are replaced by stubs that fail when called, and the "
+                    "other candidates are built normally.\n%s",
+                    len(isolated),
+                    md_name,
+                    format_failure_summary(compile_error.failures, names),
+                )
+                compile_module()
             validate_generation()
             if is_python_module and not is_standalone:
                 artifact_path = f"{get_user_jit_dir()}/{target_name}"

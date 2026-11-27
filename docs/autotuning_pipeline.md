@@ -54,3 +54,7 @@ Based on this, we provide two CI paths: one for generating tuned CSVs on demand,
     3. The workflow uploads unittest logs and `/tmp/tuning_test_reports/` as artifacts so manual failures can be diagnosed without regenerating tuned CSVs.
 
     4. Unlike the manual tuning pipeline, this workflow does not call `op_tune.sh`, does not mutate tracked CSV files, and is intended only to verify that the tuning stack and existing tuned configs remain healthy in CI.
+
+## Candidates that do not compile
+
+A tuning module (`module_*_tune`) holds one translation unit per candidate kernel. If one candidate cannot compile, for example a CK Tile instance whose LDS need exceeds the arch limit, the JIT build keeps compiling the others, logs `N tune candidate(s) of [module] failed to compile` with each instance name and its compiler error, replaces only the failed instance with a stub, and links the module. The failed candidate then raises `RuntimeError: [aiter] tune candidate '<name>' failed to compile: <error>` when called; `mp_tuner` reports it as `compile_failed` and prints the list again at the end of the run, and every other candidate is measured as usual. The build still fails, with a summary of the failed units at the end of the error, when a non-candidate unit fails or when every candidate fails. Normal (non-tuning) modules still stop at the first compile error.

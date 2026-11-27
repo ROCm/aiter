@@ -10,7 +10,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_arch_resolution.py` | 1 | No | GPU SKU resolution: `get_device_name` (MI300X/MI300A/MI308X), `_get_pci_chip_id`, `gfx_from_cu_num`, `get_build_targets` CU-count handling, `normalize_fp8_dtype` |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results`, auto-select removal, stale rows retuned |
-| `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize |
+| `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize, a candidate stubbed out by the JIT build is labelled `compile_failed` |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
 | `test_dispatch_verification.py` | 1 | No | `dispatch_verification` against a stub family: verified, wrong selection, wrong output, unchecked, other-GPU rows; `TunerCommon.run_config` against the config file's row, unchecked-row warning, model_configs merge |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |

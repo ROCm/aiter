@@ -496,6 +496,41 @@ class TestZeroTiming(unittest.TestCase):
         self.assertEqual(result.status, "zero_time")
 
 
+class TestCompileFailedCandidate(unittest.TestCase):
+    """A candidate stubbed out by the JIT build fails alone, with its name."""
+
+    ERROR = (
+        "[aiter] tune candidate 'cktile_256x256x512' failed to compile: "
+        "error: local memory (262144) exceeds limit (163840)"
+    )
+
+    def test_worker_labels_the_candidate_and_keeps_the_error(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+        with (
+            patch(
+                "aiter.test_common.run_perftest",
+                side_effect=RuntimeError(self.ERROR),
+            ),
+            patch.object(tuner.torch.cuda, "set_device"),
+            patch.object(tuner.torch.cuda, "synchronize"),
+        ):
+            result = tuner.worker(0, "candidate", lambda: None, [], {})
+
+        self.assertEqual(result[:3], ("candidate", -1, 1.0))
+        self.assertEqual(result.status, "compile_failed")
+        self.assertIn("cktile_256x256x512", result.detail)
+        self.assertIn("262144", result.detail)
+
+    def test_other_runtime_errors_keep_their_status(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        self.assertEqual(
+            tuner._candidate_failure_status(RuntimeError("kernel not supported")),
+            "unsupported",
+        )
+        self.assertEqual(tuner._candidate_failure_status(RuntimeError("boom")), "crash")
+
+
 class TestShapeGroupedContract(unittest.TestCase):
 
     def test_declared_kernel_count_must_match_group_size(self):

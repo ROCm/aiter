@@ -23,6 +23,11 @@ from pathlib import Path
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
+from build_failures import (
+    JitCompileError,
+    format_failure_summary,
+    parse_ninja_failures,
+)
 from file_baton import FileBaton
 from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
@@ -1308,6 +1313,7 @@ def _jit_compile(
     hipify=True,
     extra_cuda_cflags_per_source=None,
     use_versioner=True,
+    keep_going=False,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1421,6 +1427,7 @@ def _jit_compile(
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
                         extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
+                        keep_going=keep_going,
                     )
             elif verbose:
                 print(
@@ -1502,6 +1509,7 @@ def _write_ninja_file_and_build_library(
     is_standalone: bool = False,
     torch_exclude: bool = False,
     extra_cuda_cflags_per_source=None,
+    keep_going: bool = False,
 ) -> None:
     verify_ninja_availability()
 
@@ -1538,6 +1546,7 @@ def _write_ninja_file_and_build_library(
         build_directory,
         verbose,
         error_prefix=f"Error building extension '{name}'",
+        keep_going=keep_going,
     )
 
 
@@ -1788,10 +1797,19 @@ def _rocm_header_build_hint(output: str) -> str:
     )
 
 
-def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
+def _run_ninja_build(
+    build_directory: str,
+    verbose: bool,
+    error_prefix: str,
+    keep_going: bool = False,
+) -> None:
     # Stream compiler progress without changing the application logger format.
     verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
     command = ["ninja", "-v"]
+    if keep_going:
+        # Build every unit that can be built, so the caller learns about all
+        # failed units at once instead of only the first.
+        command.extend(["-k", "0"])
     num_workers = _get_num_workers(verbose)
     command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
@@ -1828,6 +1846,7 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
                 )
     except subprocess.CalledProcessError as e:
         message = error_prefix
+        failures = []
         if e.output:
             output = e.output.decode(*SUBPROCESS_DECODE_ARGS, errors="replace")
             message += f": {output}"
@@ -1836,7 +1855,15 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
             except Exception:  # noqa: BLE001,S110
                 # Optional diagnostics must never replace the compiler error.
                 pass
-        raise RuntimeError(message) from e
+            try:
+                failures = parse_ninja_failures(output)
+                if failures:
+                    # The log can be thousands of lines of warnings; put the
+                    # failed units and their errors where the reader looks.
+                    message += "\n" + format_failure_summary(failures)
+            except Exception:  # noqa: BLE001,S110
+                failures = []
+        raise JitCompileError(message, failures) from e
 
 
 def _get_exec_path(module_name, path):

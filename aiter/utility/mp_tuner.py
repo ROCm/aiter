@@ -12,6 +12,10 @@ from typing import Any, NamedTuple
 import torch
 
 from aiter import dtypes, logger
+from aiter.jit.utils.build_failures import (
+    COMPILE_FAILED_MARKER,
+    summarize_compile_failures,
+)
 from aiter.test_common import checkAllclose
 from aiter.utility.tune_result import TuneResult
 from aiter_worker_limits import configure_worker_subprocesses
@@ -126,6 +130,9 @@ def _merge_error_ratio(current, observed):
 
 def _candidate_failure_status(exc: BaseException) -> str:
     # Labels a failure only; kernels signal unsupported via RuntimeError text.
+    if COMPILE_FAILED_MARKER in str(exc):
+        # A tune candidate whose kernel the JIT build had to stub out.
+        return "compile_failed"
     message = str(exc).lower()
     if isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in message:
         return "oom_runtime"
@@ -617,9 +624,10 @@ def mp_tuner(
         otherwise. With return_status, ``(results, statuses)``: statuses holds
         one (status, detail) per result, in the same order, where status is
         one of ok, mismatch, unsupported, crash, timeout, zero_time,
-        oom_runtime, oom_preflight (outside a candidate's run, e.g. generating
-        inputs) or not_run (never run: its group kept faulting before
-        measuring anything).
+        oom_runtime, compile_failed (the candidate's kernel did not compile and
+        was stubbed by the JIT build; the others still ran), oom_preflight
+        (outside a candidate's run, e.g. generating inputs) or not_run (never
+        run: its group kept faulting before measuring anything).
     """
     from aiter.utility.selection_policy import LATENCY, active_policy
 
@@ -1025,6 +1033,11 @@ def mp_tuner(
             f"{'=' * 60}"
         )
         logger.warning(summary)
+
+    compile_summary = summarize_compile_failures(c.detail for c in result)
+    if compile_summary:
+        # Last thing printed, so it is not buried under the run's warnings.
+        logger.error(compile_summary)
 
     results = [TuneResult(c.info, c.us, c.err_ratio, c.watts) for c in result]
     if return_status:
