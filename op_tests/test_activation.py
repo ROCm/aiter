@@ -9,7 +9,12 @@ from torch import Tensor, nn
 
 import aiter
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    assertAllclose,
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
 
 
@@ -290,6 +295,144 @@ def test_relu2_bounds(numel, dtype):
     ref = torch_relu2_ref(input).to(dtype)
     ret["err"] = checkAllclose(ref, out)
     return ret
+
+
+_GUARD = 64  # elements around a guarded tensor
+_SENTINEL = 12288.0  # exact in bf16 and fp16
+_DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+
+
+def torch_swiglu_and_mul(gate: torch.Tensor, linear: torch.Tensor) -> torch.Tensor:
+    # swiglu_and_mul has alpha 1.702 and clamps both halves at 7.
+    gate = gate.clamp(max=7.0)
+    return gate * torch.sigmoid(1.702 * gate) * (linear.clamp(-7.0, 7.0) + 1.0)
+
+
+# fp32 references of the gate ops; a *_bias op adds its bias and uses the same one.
+_GATE_REFS = {
+    "silu_and_mul": lambda a, b: F.silu(a) * b,
+    "gelu_and_mul": lambda a, b: F.gelu(a) * b,
+    "gelu_tanh_and_mul": lambda a, b: F.gelu(a, approximate="tanh") * b,
+    "swiglu_and_mul": torch_swiglu_and_mul,
+}
+_GATE_OPS = [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swiglu_and_mul",
+    "silu_and_mul_bias",
+    "swiglu_and_mul_bias",
+    "gelu_and_mul_bias",
+]
+
+
+def _guarded(shape, dtype, fill):
+    """A tensor of ``shape`` that is a view inside a larger buffer filled with
+    ``fill``. Returns the buffer and the view."""
+    numel = math.prod(shape)
+    buf = torch.full((numel + 2 * _GUARD,), fill, dtype=dtype, device="cuda")
+    return buf, buf[_GUARD : _GUARD + numel].view(*shape)
+
+
+def _guard_changed(buf, numel, fill):
+    """How many elements around a guarded tensor no longer hold ``fill``."""
+    pad = torch.cat([buf[:_GUARD], buf[_GUARD + numel :]])
+    return int((pad != fill).sum())
+
+
+def _assert_close_16bit(ref, out, atol, msg):
+    """Fails unless every element of ``out`` is within one unit in the last
+    place of its 16-bit type, plus ``atol``, of the fp32 reference."""
+    return assertAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=torch.finfo(out.dtype).eps,
+        atol=atol,
+        tol_err_ratio=0.0,
+        msg=msg,
+    )
+
+
+def _perf_columns(us, read_bytes, write_bytes):
+    return {
+        "us": us,
+        "TB/s": (read_bytes + write_bytes) / us / 1e6,
+        "RD TB/s": read_bytes / us / 1e6,
+        "WR TB/s": write_bytes / us / 1e6,
+    }
+
+
+@benchmark()
+def test_gelu_fast_bounds(numel, dtype):
+    """gelu_fast on ``numel`` elements whose output sits inside a guarded buffer:
+    the result matches the reference and nothing around the output changes,
+    whether or not the tensor ends on a whole vector."""
+    _, x = _guarded((1, numel), dtype, 100.0)
+    x.copy_((3.0 * torch.randn(1, numel, device="cuda")).to(dtype))
+    buf, out = _guarded((1, numel), dtype, _SENTINEL)
+    _, us = run_perftest(aiter.gelu_fast, out, x)
+    changed = _guard_changed(buf, numel, _SENTINEL)
+    assert changed == 0, f"gelu_fast wrote {changed} elements outside its output"
+    # The kernel's tanh is within 1e-3 of tanh: at most 1.7e-3 in the result.
+    ref = torch_gelu_ref(x.to(dtypes.fp32))
+    err = _assert_close_16bit(ref, out, 2e-3, f"gelu_fast {numel=}")
+    ret = {"dtype": _DTYPE_NAMES.get(dtype, str(dtype))}
+    ret.update(_perf_columns(us, x.nbytes, out.nbytes))
+    ret["err"] = err
+    return ret
+
+
+def _gate_case(op, dtype, m, d):
+    """A gate op on [m, 2 * d] with its output inside a guarded buffer: the
+    buffer, the output, the op's arguments, the fp32 reference and the bytes
+    the op reads. Three sigma inputs reach past the SwiGLU clamp."""
+    _, x = _guarded((m, 2 * d), dtype, 100.0)
+    x.copy_((3.0 * torch.randn(m, 2 * d, device="cuda")).to(dtype))
+    buf, out = _guarded((m, d), dtype, _SENTINEL)
+    call_args = [out, x]
+    x32 = x.to(dtypes.fp32)
+    read_bytes = x.nbytes
+    if op.endswith("_bias"):
+        expert_ids = (torch.arange(m, device="cuda") % 3).to(torch.int32)
+        bias = 0.1 * torch.randn(3, 2 * d, dtype=dtypes.fp32, device="cuda")
+        call_args += [expert_ids, bias]
+        x32 = x32 + bias[expert_ids.long()]
+        read_bytes += expert_ids.nbytes + m * bias[0].nbytes
+    ref = _GATE_REFS[op.replace("_bias", "")](*x32.split([d, d], dim=-1))
+    return buf, out, call_args, ref, read_bytes
+
+
+@benchmark()
+def test_act_and_mul_row_bound(op, dtype, m, d):
+    """A gate op on half rows of whole 4-byte words: the result matches the
+    fp32 reference and nothing around the output changes."""
+    buf, out, call_args, ref, read_bytes = _gate_case(op, dtype, m, d)
+    _, us = run_perftest(getattr(aiter, op), *call_args)
+    changed = _guard_changed(buf, m * d, _SENTINEL)
+    assert changed == 0, f"{op} wrote {changed} elements outside its output"
+    err = _assert_close_16bit(ref, out, 1e-5, f"{op} {m=} {d=}")
+    ret = {"dtype": _DTYPE_NAMES.get(dtype, str(dtype))}
+    ret.update(_perf_columns(us, read_bytes, out.nbytes))
+    ret["err"] = err
+    return ret
+
+
+@benchmark()
+def test_act_and_mul_split_word_refused(op, dtype, m, d):
+    """Half rows that are not whole 4-byte words (an odd d with 16-bit elements)
+    make the kernel reach one element past every row, so the op has to refuse
+    the call and leave the output alone. No kernel runs: nothing to time."""
+    buf, out, call_args, _, _ = _gate_case(op, dtype, m, d)
+    try:
+        getattr(aiter, op)(*call_args)
+    except RuntimeError as e:
+        assert "whole 4-byte words" in str(e), str(e)
+    else:
+        raise AssertionError(f"{op} accepted half rows of {d} {dtype} elements")
+    torch.cuda.synchronize()
+    assert bool((out == _SENTINEL).all()), f"{op} wrote into a refused output"
+    assert _guard_changed(buf, m * d, _SENTINEL) == 0
+    return {"dtype": _DTYPE_NAMES.get(dtype, str(dtype)), "refused": True}
 
 
 def _dequant_fp8_group(q, s, group_size):
@@ -703,3 +846,28 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("relu2_bounds summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for numel in [1, 2, 7, 8, 9, 15, 16, 17, 255, 1001, 4095, 4101]:
+        ret = test_gelu_fast_bounds(numel, dtype)
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gelu_fast_bounds summary (markdown):\n%s", df_md)
+
+df = []
+df_refused = []
+for op in _GATE_OPS:
+    for dtype in args.dtype:
+        for m in [4, 257]:
+            for d in [255, 256, 1001, 1002]:
+                if d * dtype.itemsize % 4 == 0:
+                    df.append(test_act_and_mul_row_bound(op, dtype, m, d))
+                else:
+                    ret = test_act_and_mul_split_word_refused(op, dtype, m, d)
+                    df_refused.append(ret)
+df_md = pd.DataFrame(df).to_markdown(index=False)
+aiter.logger.info("act_and_mul row bound summary (markdown):\n%s", df_md)
+df_md = pd.DataFrame(df_refused).to_markdown(index=False)
+aiter.logger.info("act_and_mul split word refusal summary (markdown):\n%s", df_md)

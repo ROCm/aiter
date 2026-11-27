@@ -1439,6 +1439,23 @@ static int64_t scaled_act_row_stride(const aiter_tensor_t& t, const char* name)
 
 namespace aiter {
 
+// The gate kernels (act_and_mul_kernel and its swiglu and bias variants) bound every half row
+// with a buffer descriptor and move it in 4-byte words, and the bound is rounded up to a whole
+// word (ooba_i / ooba_o). A half row whose byte length is not a multiple of 4 therefore has its
+// last word reach past the row: with 16-bit elements an odd d reads element d of the gate and of
+// the up half, and a 16-bit output gets element d written. That is the first element of the next
+// row, which the block of that row writes too, or memory past the tensor. Refuse those widths.
+static inline void check_row_words(const char* func, const aiter_tensor_t& input,
+                                   const aiter_tensor_t& out)
+{
+    const int64_t d             = input.size(-1) / 2;
+    const int64_t in_row_bytes  = d * static_cast<int64_t>(input.element_size());
+    const int64_t out_row_bytes = d * static_cast<int64_t>(out.element_size());
+    AITER_CHECK(in_row_bytes % 4 == 0 && out_row_bytes % 4 == 0, func,
+                " needs half rows of whole 4-byte words, got d = ", d, " (", in_row_bytes,
+                " input bytes, ", out_row_bytes, " output bytes)");
+}
+
 // Flexible type conversion:
 // - fp32 input can output as fp32/bf16/fp16 (determined by out.dtype)
 // - bf16 input must output as bf16
@@ -1447,6 +1464,10 @@ void silu_and_mul(const aiter_tensor_t& out,   // [..., d]
                   const aiter_tensor_t& input, // [..., 2 * d]
                   float limit)
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     AITER_CHECK(limit >= 0.0f, "silu_and_mul: limit must be >= 0");
     if(limit > 0.0f)
     {
@@ -1461,6 +1482,10 @@ void silu_and_mul(const aiter_tensor_t& out,   // [..., d]
 void swiglu_and_mul(const aiter_tensor_t& out,   // [..., d]
                     const aiter_tensor_t& input) // [..., 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     LAUNCH_SWIGLU_GATE_KERNEL();
 }
 
@@ -1469,6 +1494,10 @@ void silu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                        const aiter_tensor_t& expert_ids, // [...]
                        const aiter_tensor_t& bias)       // [expert, 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     COMPUTE_ACTIVATION_KERNEL_PARAMS
     AITER_CHECK(input.size(-1) % 2 == 0, "silu_and_mul_bias expects an even last dimension");
     AITER_CHECK(out.numel() == num_tokens * d, "silu_and_mul_bias output shape mismatch");
@@ -1546,6 +1575,10 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                          const aiter_tensor_t& expert_ids, // [...]
                          const aiter_tensor_t& bias)       // [expert, 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     COMPUTE_ACTIVATION_KERNEL_PARAMS
     AITER_CHECK(input.size(-1) % 2 == 0,
                 "swiglu_and_mul_bias expects an even last dimension");
@@ -1636,6 +1669,10 @@ void gelu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                        const aiter_tensor_t& expert_ids, // [...]
                        const aiter_tensor_t& bias)       // [expert, 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     COMPUTE_ACTIVATION_KERNEL_PARAMS
     AITER_CHECK(input.size(-1) % 2 == 0, "gelu_and_mul_bias expects an even last dimension");
     AITER_CHECK(out.numel() == num_tokens * d, "gelu_and_mul_bias output shape mismatch");
@@ -2054,12 +2091,20 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
                   const aiter_tensor_t& input) // [..., 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     LAUNCH_ACTIVATION_GATE_KERNEL(aiter::gelu_kernel);
 }
 
 void gelu_tanh_and_mul(const aiter_tensor_t& out,   // [..., d]
                        const aiter_tensor_t& input) // [..., 2 * d]
 {
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter: this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_row_words(__func__, input, out);
     LAUNCH_ACTIVATION_GATE_KERNEL(aiter::gelu_tanh_kernel);
 }
 
@@ -2248,7 +2293,19 @@ __device__ __forceinline__ float gelu_fast_kernel(const T& x)
 void gelu_fast(const aiter_tensor_t& out,   // [..., d]
                const aiter_tensor_t& input) // [..., d]
 {
-    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
+    // activation_kernel_vec loads and stores whole vectors, so a tensor that does not end on a
+    // vector pair is read and written up to VEC_SIZE - 1 elements past its end. Such a tensor
+    // takes the kernel that guards both vectors and finishes with a scalar tail (relu2 runs it
+    // for every size). A multiple of 2 * max_vec_size is a whole number of pairs for every
+    // vector size the launch picks, and keeps the kernel it had.
+    if(input.numel() % (2 * max_vec_size) == 0)
+    {
+        LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
+    }
+    else
+    {
+        LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::gelu_fast_kernel);
+    }
 }
 
 // Float-returning plain ReLU^2 (no gating multiply): relu(x)^2.
