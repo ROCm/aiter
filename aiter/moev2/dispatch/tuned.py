@@ -20,9 +20,14 @@ module with the moev2 owners (@qli88). See aiter/moev2/README.md.
 """
 
 import functools
+import itertools
 
 from aiter import logger
-from aiter.jit.utils.chip_info import gfx_from_cu_num
+from aiter.jit.utils.chip_info import (
+    get_tuned_cu_nums,
+    gfx_from_cu_num,
+    log_tuned_cu_fallback,
+)
 from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
 
 from ..shapes import _PADDED_M_TIERS
@@ -230,7 +235,9 @@ def lookup(problem, tables=None):
     """The tuned row for `problem` (the legacy `_lookup_cfg`), or None.
 
     Exact key first, then the activation-agnostic table (default table only), then, for a
-    token count above the smallest tier, the smaller tiers in descending order.
+    token count above the smallest tier, the smaller tiers in descending order. For each
+    token tier, the CU counts of `get_tuned_cu_nums` are tried in turn, so a compute
+    partition also finds the rows of its full chip.
     """
     c2s = table_for(problem) if tables is None else tables
     if not c2s:
@@ -240,19 +247,22 @@ def lookup(problem, tables=None):
     token = problem.shape.m
     primary, fallback = c2s
     lookup_keys_ = keys[:7] + (str(problem.activation.activation),) + keys[8:]
-    result = primary.get(lookup_keys_, None)
-    if result is None and not dedicated:
-        result = fallback.get(keys_disabled, None)
+    tokens = [token]
     # Tier fallback: if current tier not found, try smaller tiers in descending order
-    if result is None and not dedicated and token > _PADDED_M_TIERS[0]:
+    if not dedicated and token > _PADDED_M_TIERS[0]:
         tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-        for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-            # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-            keys_fb = lookup_keys_[:2] + (fallback_tier,) + lookup_keys_[3:]
-            keys_fb_disabled = keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
-            result = primary.get(keys_fb, None)
-            if result is None:
-                result = fallback.get(keys_fb_disabled, None)
-            if result is not None:
-                break
-    return result
+        tokens += reversed(_PADDED_M_TIERS[:tier_idx])
+    for tier, tuned_cu in itertools.product(tokens, get_tuned_cu_nums(problem.cu_num)):
+        # keys layout: (gfx, cu_num, token, ...); replace cu_num and token.
+        result = primary.get(lookup_keys_[:1] + (tuned_cu, tier) + lookup_keys_[3:])
+        if result is None and not dedicated:
+            result = fallback.get(
+                keys_disabled[:1] + (tuned_cu, tier) + keys_disabled[3:]
+            )
+        if result is not None:
+            if tuned_cu != problem.cu_num:
+                log_tuned_cu_fallback(
+                    "fused_moe", problem.arch, problem.cu_num, tuned_cu
+                )
+            return result
+    return None
