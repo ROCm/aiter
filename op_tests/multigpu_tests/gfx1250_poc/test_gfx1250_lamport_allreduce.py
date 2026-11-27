@@ -5,20 +5,20 @@ production route runs, and how fast.
 
 Each rank all-reduces its [m, n] tensor. Candidates:
   prod           tensor_model_parallel_all_reduce, the route production takes:
-                 the Lamport one-shot / two-shot for fp16/bf16 up to tp x the
-                 Lamport cap, else up to the plain all-reduce cutoff the LL
-                 one-shot, LL two-shot or barrier kernel, else RCCL
+                 the Lamport one-shot (fp16/bf16) or two-shot (fp32 too) up to
+                 tp x the Lamport cap, else up to the plain all-reduce cutoff the
+                 LL one-shot or the barrier kernel, else RCCL
   lamport_1shot  CustomAllreduce.lamport_all_reduce: every rank pushes its whole
                  input to every peer (lamport_ar_1shot_gfx1250)
   lamport_2shot  CustomAllreduce.lamport_all_reduce(two_shot=True): a pushed
-                 reduce-scatter, then a pushed all-gather (lamport_ar_2shot_gfx1250);
-                 up to tp x the one-shot cap
-  car            CustomAllreduce.custom_all_reduce with the Lamport cap at 0, the
-                 custom kernels without Lamport, called directly (so past the
-                 plain all-reduce cutoff too): the LL one-shot, at TP4/TP8 the
-                 LL two-shot from 1 MiB (TP8 512 KiB) to 8 MiB, the barrier
-                 kernel above (registered input in a graph); "car route" is the
-                 kernel it launched
+                 reduce-scatter, then a pushed all-gather (lamport_ar_2shot_gfx1250),
+                 a lane all three steps of a pack; up to tp x the one-shot cap
+  lamport_split  the same with split=True: the steps in wave groups
+  car            CustomAllreduce.custom_all_reduce with the Lamport caps at 0,
+                 the custom kernels without Lamport, called directly (so past the
+                 plain all-reduce cutoff too): the LL one-shot up to 4 MiB, the
+                 barrier kernel above (registered input in a graph); "car route"
+                 is the kernel it launched
   rccl           dist.all_reduce, in place on its own buffer
 
 Without Lamport, prod is car up to the plain all-reduce cutoff and rccl above.
@@ -85,11 +85,16 @@ MIXED_RMS = [(4, 7168), (300, 4096)]
 MIXED_AG = [((4, 64, 32), torch.int32, 0), ((48, 7168), torch.bfloat16, -1)]
 GRAPH_AR = [(48, 7168, True), (7, 1000, False), (288, 5120, True), (1, 8, True)]
 # restated from custom_all_reduce.py / custom_all_reduce_gfx1250.cuh
-LAMPORT_1SHOT_MAX_BYTES = {2: 9 << 20, 4: 1280 << 10}
+LAMPORT_1SHOT_MAX_BYTES = {2: 9 << 20, 4: 1280 << 10, 8: 768 << 10}
+# fp32 takes the LL one-shot up to here instead, the two-shot above
+LAMPORT_FP32_LL_MAX_BYTES = {2: 1 << 20, 4: 0, 8: 0}
+# the two-shot is split in (lo, hi], fused elsewhere
+LAMPORT_SPLIT_BYTES = {
+    2: (2 << 20, 4 << 20),
+    4: (4 << 20, 8 << 20),
+    8: (0, 4 << 20),
+}
 LL_AR_MAX_BYTES = 4 << 20
-# the LL two-shot's size range (ar2sMinBytes, ar2sMaxBytes), TP4/TP8 only
-LL2S_MIN_BYTES = {4: 1 << 20, 8: 512 << 10}
-LL2S_MAX_BYTES = 8 << 20
 
 
 def parse_size(s):
@@ -100,31 +105,40 @@ def parse_size(s):
 
 @contextlib.contextmanager
 def lamport_off(ca):
-    """The routes as they were before Lamport: the Lamport cap at 0, what
+    """The routes as they were before Lamport: the Lamport caps at 0, what
     AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE=0 sets."""
-    cap = ca._lamport_max_bytes
-    ca._lamport_max_bytes = 0
+    caps = ca._lamport_max_bytes, ca._lamport_ar_max_bytes
+    ca._lamport_max_bytes = ca._lamport_ar_max_bytes = 0
     try:
         yield
     finally:
-        ca._lamport_max_bytes = cap
+        ca._lamport_max_bytes, ca._lamport_ar_max_bytes = caps
 
 
 def expect_route(x, tp, cap, car_max, plain_max):
     """The all-reduce kernel the routing rules give, restated from where they
     live: CudaCommunicator.all_reduce, should_custom_plain_ar,
-    select_lamport_ar, then the C++ allreduce (the LL two-shot in its range,
-    the LL one-shot up to 4 MiB, else the barrier kernel)."""
+    select_lamport_ar (cap: the plain all-reduce's Lamport cap), then the C++
+    allreduce (the LL one-shot up to 4 MiB, else the barrier kernel)."""
     nbytes = x.numel() * x.element_size()
     if nbytes % 16 != 0 or nbytes > car_max:
         return "rccl"
     if (
-        x.dtype in (torch.float16, torch.bfloat16)
+        x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.is_contiguous()
         and 0 < nbytes <= tp * cap
     ):
         one_shot_max = min(LAMPORT_1SHOT_MAX_BYTES.get(tp, cap), cap)
-        return "1shot" if nbytes <= one_shot_max else "2shot"
+        if x.dtype == torch.float32:
+            ll_max = LAMPORT_FP32_LL_MAX_BYTES.get(tp, one_shot_max)
+            one_shot = None if nbytes <= min(ll_max, LL_AR_MAX_BYTES) else False
+        else:
+            one_shot = nbytes <= one_shot_max
+        if one_shot is not None:
+            if one_shot:
+                return "1shot"
+            lo, hi = LAMPORT_SPLIT_BYTES.get(tp, (0, 0))
+            return "split" if lo < nbytes <= hi else "2shot"
     if nbytes > plain_max:
         return "rccl"
     return car_route(nbytes, tp)
@@ -132,11 +146,6 @@ def expect_route(x, tp, cap, car_max, plain_max):
 
 def car_route(nbytes, tp):
     """The kernel the C++ allreduce picks without Lamport."""
-    if (
-        LL2S_MIN_BYTES.get(tp, LL2S_MAX_BYTES + 1) <= nbytes <= LL2S_MAX_BYTES
-        and nbytes % (8 * tp) == 0
-    ):
-        return "ll2s"
     return "ll" if nbytes <= LL_AR_MAX_BYTES else "barrier"
 
 
@@ -153,10 +162,11 @@ def launched(fn):
         if e.device_type != torch.autograd.DeviceType.CUDA:
             continue
         name = e.name
-        if m := re.search(r"lamport_ar_(1shot|2shot)_gfx1250", name):
+        if m := re.search(r"lamport_ar_2shot_gfx1250<[^>]*,\s*(\d+)\s*>", name):
+            # the last template argument is ROLES: 1 fused, 2 or 3 split
+            k = "2shot" if m.group(1) == "1" else "split"
+        elif m := re.search(r"lamport_ar_(1shot|2shot)_gfx1250", name):
             k = m.group(1)
-        elif "ar_2s_ll_gfx1250" in name:
-            k = "ll2s"
         elif "ar_ll_gfx1250" in name:
             k = "ll"
         elif "ar_gfx1250_naive" in name:
@@ -231,6 +241,9 @@ def run_case(ca, tp, rank, m, n, dtype):
         cands["lamport_1shot"] = lambda: ca.lamport_all_reduce(x)
     if ca.should_lamport_ar(x, two_shot=True):
         cands["lamport_2shot"] = lambda: ca.lamport_all_reduce(x, two_shot=True)
+        cands["lamport_split"] = lambda: ca.lamport_all_reduce(
+            x, two_shot=True, split=True
+        )
     if ca.should_custom_ar(x):
 
         def car():
@@ -245,7 +258,7 @@ def run_case(ca, tp, rank, m, n, dtype):
 
     ret = {"tp": tp, "m": m, "n": n, "dtype": str(dtype)[6:], "KB": nbytes / 1024}
     ret["expect"] = expect_route(
-        x, tp, ca._lamport_max_bytes, ca._car_max_size, ca._plain_ar_max_size
+        x, tp, ca._lamport_ar_max_bytes, ca._car_max_size, ca._plain_ar_max_size
     )
     ret["route"] = launched(cands["prod"])
     ret["route ok"] = ret["route"] == ret["expect"]
@@ -271,11 +284,12 @@ def check_mixed_sequence(ca, tp, rank):
     g = torch.Generator(device="cuda").manual_seed(4321)
     bf16 = torch.bfloat16
 
-    def ar(seed, m, n, two_shot, nan=False):
+    def ar(seed, m, n, two_shot, nan=False, split=False, dtype=bf16):
         nonlocal worst, calls
-        x, ref = make_inputs(tp, rank, seed, m, n, bf16, nan=nan)
-        assert ca.should_lamport_ar(x, two_shot), (m, n, two_shot)
-        worst = max(worst, bit_mismatch(ca.lamport_all_reduce(x, two_shot), ref))
+        x, ref = make_inputs(tp, rank, seed, m, n, dtype, nan=nan)
+        assert ca.should_lamport_ar(x, two_shot), (m, n, two_shot, dtype)
+        out = ca.lamport_all_reduce(x, two_shot, split and two_shot)
+        worst = max(worst, bit_mismatch(out, ref))
         calls += 1
 
     def add(m, n):
@@ -299,27 +313,36 @@ def check_mixed_sequence(ca, tp, rank):
         calls += 1
 
     for i, (m, n) in enumerate(MIXED_AR * 4):
-        ar(i, m, n, two_shot=i % 2 == 1, nan=i % 5 == 0)
+        # one-shot, fused and split two-shots, every fourth two-shot fp32
+        ar(
+            i,
+            m,
+            n,
+            two_shot=i % 2 == 1,
+            nan=i % 5 == 0,
+            split=i % 3 == 1,
+            dtype=torch.float32 if i % 4 == 3 else bf16,
+        )
         if i % 3 == 0:
             add(*MIXED_ADD[i % len(MIXED_ADD)])
         if i % 4 == 1:
             rms(*MIXED_RMS[i % len(MIXED_RMS)])
         if i % 5 == 2:
             ag(i, *MIXED_AG[i % len(MIXED_AG)])
-    # the two-shot back to back, the same and then other sizes
+    # the two-shot back to back, the same and then other sizes, fused and split
     for i in range(6):
-        ar(200 + i, *MIXED_AR[i // 2], two_shot=True)
+        ar(200 + i, *MIXED_AR[i // 2], two_shot=True, split=i % 2 == 1)
     # the two-shot above the one-shot cap, up to tp x the cap: just over it
     # (the last chunks short or empty), the full size, sizes in between; each
     # followed by a one-shot at the cap, which takes every wave of the inbox
-    cap = ca._lamport_max_bytes // 2  # bf16 values
+    cap = ca._lamport_ar_max_bytes // 2  # bf16 values
     mid = (tp + 1) * cap // 2 // 8 * 8 + 8 * 5
     big = [(1, cap + 8), (1, tp * cap), (1, tp * cap - 8 * 33), (1, mid)]
     for i, (m, n) in enumerate(big):
-        ar(300 + i, m, n, two_shot=True, nan=i == 0)
+        ar(300 + i, m, n, two_shot=True, nan=i == 0, split=i % 2 == 0)
         ar(310 + i, 1, cap, two_shot=False)
         rms(*MIXED_RMS[i % len(MIXED_RMS)])
-        ar(320 + i, m, n, two_shot=True)
+        ar(320 + i, m, n, two_shot=True, split=i % 2 == 1)
         ag(330 + i, *MIXED_AG[i % len(MIXED_AG)])
         add(*MIXED_ADD[i % len(MIXED_ADD)])
 
@@ -358,7 +381,8 @@ def worker(tp, rank, cases, init_method):
     ensure_model_parallel_initialized(tp, 1)
     ca = get_tp_group().device_communicator.ca_comm
     assert ca is not None and not ca.disabled, "custom allreduce is disabled"
-    assert ca._lamport_max_bytes > 0, "the Lamport inbox is off"
+    assert ca._lamport_max_bytes > 0, "the Lamport AR + RMSNorm inbox is off"
+    assert ca._lamport_ar_max_bytes > 0, "the Lamport all-reduce is off"
     dist.all_reduce(torch.zeros(1, device="cuda"), group=get_tp_group().device_group)
 
     mixed = check_mixed_sequence(ca, tp, rank)
