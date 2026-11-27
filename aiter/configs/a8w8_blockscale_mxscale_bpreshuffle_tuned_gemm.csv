@@ -2,6 +2,6 @@ gfx,cu_num,M,N,K,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,e
 gfx1250,256,4096,4096,4096,32x32,flydsl,bmm,0,24.1,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn4,5702.86,1.39,0.0
 gfx1250,256,8192,8192,8192,32x32,flydsl,bmm,0,134.3,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn4_ps4,8186.98,1.00,0.0
 gfx1250,256,16384,5120,4224,32x32,flydsl,bmm,0,104.0,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm4_cn4,6814.13,0.87,0.0
-gfx1250,256,16384,5120,4352,32x32,flydsl,bmm,0,98.5,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn2_ps5,7412.63,0.95,0.0
+gfx1250,256,16384,5120,4352,32x32,flydsl,bmm,0,108.0,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm4_cn4,6762.94,0.87,0.0
 gfx1250,256,16384,16384,16384,32x32,flydsl,bmm,0,1110.4,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm4_cn4_ps8,7921.55,0.48,0.0
 gfx1250,256,16384,32768,8192,32x32,flydsl,bmm,0,1022.5,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm4_cn4,8602.54,0.39,0.0
