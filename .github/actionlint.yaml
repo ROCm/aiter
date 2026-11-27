@@ -12,6 +12,8 @@ self-hosted-runner:
     - linux-aiter-do-mi350x-2
     - linux-aiter-do-mi350x-4
     - linux-aiter-do-mi350x-8
+    - linux-aiter-do-mi350x-dpx-1
+    - linux-aiter-do-mi350x-dpx-8
     - linux-aiter-mi300x-1
     - linux-aiter-mi300x-2
     - linux-aiter-mi300x-4
@@ -20,7 +22,10 @@ self-hosted-runner:
     - linux-aiter-mi35x-8
     - linux-aiter-mi355-1
     - linux-aiter-mi355-8
+    - radeon-r9700
+    - xsj-dispatch
     - box308
+    - box308-pr-revert
 
 config-variables: null
 

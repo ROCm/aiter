@@ -7,6 +7,8 @@ through ``_MoriCapabilities``."""
 import functools
 from dataclasses import dataclass
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 # The combine wires mori offers, as its quant_type names.
 # "fp4_blockwise" is MXFP4 -- e2m1 plus one e8m0 per 32 -- the same format the
 # fused reduce calls "mxfp4". It has no MXFP8.
@@ -32,9 +34,22 @@ _MORI_REGION_NAMES = {
 }
 
 
-# What mori's describe() resolves a request against: MegaMoE runs only here, and
-# naming it keeps the sizing off the GPU.
-_MORI_ARCH = "gfx1250"
+_MORI_ARCHS = ("gfx1250", "gfx1250-strict")
+
+
+@functools.lru_cache(maxsize=1)
+def _mori_arch() -> str:
+    """The arch mori's describe() resolves a request against.
+
+    describe(arch=...) pins mori's JIT target for the whole process, so it must
+    be the arch the runtime reports: gfx1250-strict on MI450 A0 loads only
+    gfx1250-strict code objects.
+    """
+    try:
+        arch = get_gfx_runtime()
+    except Exception:  # noqa: BLE001
+        return "gfx1250"
+    return arch if arch in _MORI_ARCHS else "gfx1250"
 
 
 @dataclass(frozen=True)
@@ -94,12 +109,12 @@ class _MoriCapabilities:
         """What mori reports for each dispatch plan request -- its arena regions,
         staging bytes and scale stride -- without building or compiling one."""
         plan = self.ep_plans.EpDispatchPlan
-        return [plan.describe(arch=_MORI_ARCH, **request) for request in requests]
+        return [plan.describe(arch=_mori_arch(), **request) for request in requests]
 
     def describe_combine(self, requests) -> list[dict]:
         """What mori reports for each combine plan request."""
         plan = self.ep_plans.EpCombinePlan
-        return [plan.describe(arch=_MORI_ARCH, **request) for request in requests]
+        return [plan.describe(arch=_mori_arch(), **request) for request in requests]
 
     def region_sizes(self, infos) -> dict:
         """The arena regions ``infos`` ask for, under this package's names."""

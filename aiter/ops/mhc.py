@@ -3,6 +3,8 @@
 
 import functools
 import math
+import os
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -12,6 +14,7 @@ from aiter import dtypes
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 
 
 @compile_ops("module_mhc", develop=True)
@@ -37,7 +40,7 @@ def mhc_fn_kb(arch: str | None = None) -> int:
     """
     if arch is None:
         arch = get_gfx_runtime()
-    return 16 if arch == "gfx1250" else 8
+    return 16 if arch in ("gfx1250", "gfx1250-strict") else 8
 
 
 def mhc_shuffle_fn(fn: torch.Tensor, arch: str | None = None) -> torch.Tensor:
@@ -236,7 +239,7 @@ def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
     if arch is None:
         arch = get_gfx_runtime()
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
-    return arch == "gfx1250" and 0 < m < fused_m_upper_bound
+    return arch in ("gfx1250", "gfx1250-strict") and 0 < m < fused_m_upper_bound
 
 
 # Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Flash 4096,
@@ -280,7 +283,7 @@ def mhc_res_ks(
 
 
 def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
-    if shuffled and arch != "gfx1250":
+    if shuffled and arch not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"res_preshuffle=1 is only supported on gfx1250, got {arch}; "
             "use res_preshuffle=0 (BF16 compute is controlled independently)"
@@ -364,7 +367,7 @@ def get_mhc_pre_splitk(
     prefill_tg_factor = (
         8
         if w_preshuffle_bf16
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and m >= 2048
         and hc_hidden_size in (4 * 4096, 4 * 7168)
@@ -424,6 +427,57 @@ def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
     """
     ideal = max(1.0, 32.0 * num_cu / m)
     return min(valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk))
+
+
+# gfx950, 256 CUs, packed BF16 hi/lo projection: in this row range the fused
+# post+pre GEMM with 32-row, 64-wide tiles is faster than standalone mhc_post +
+# mhc_pre (measured on MI350X for these hidden sizes, up to the upper row count).
+# The range starts above 8 * 256 rows, where mhc_post switches to non-temporal
+# stores. With the tiles _mhc_fused_config_gfx950_256 selects otherwise, the fused
+# GEMM is slower than post + pre there.
+MHC_FUSED_PREFILL_M_MIN_GFX950 = 2049
+MHC_FUSED_PREFILL_M_MAX_GFX950 = 65536
+MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950 = (4096, 7168)
+
+
+def _mhc_fused_prefill_config_gfx950_256(m, hidden_size):
+    """(split_k, tile_m, tile_n, tile_k) of the fused GEMM at prefill row counts,
+    or None where post + pre is kept."""
+    if (
+        hidden_size not in MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950
+        or not MHC_FUSED_PREFILL_M_MIN_GFX950 <= m <= MHC_FUSED_PREFILL_M_MAX_GFX950
+    ):
+        return None
+    # 448 (hidden 7168) or 512 (hidden 4096) K elements per split; 16 splits for
+    # both below 2816 rows, where 8 would leave the grid short of two rounds.
+    split_k = 16 if hidden_size == 7168 or m < 2816 else 8
+    if hidden_size % (split_k * 64) != 0:
+        return None
+    return split_k, 32, 32, 64
+
+
+# gfx950, 256 CUs, FP32 projection weights: up to this row count mhc_fused_post_pre
+# runs post + pre with regular stores in mhc_post. mhc_post on its own switches to
+# non-temporal stores above 8 * cu_num rows; mhc_pre reads that residual back at
+# once, and up to this row count it reads it faster after regular stores on both
+# MI350X and MI355X (1.02x to 1.13x for hidden sizes 4096, 5120 and 7168). Above it
+# the two devices disagree and MI355X no longer gains. The results are the same bits.
+MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 8192
+
+
+def _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend) -> bool:
+    """Whether the unfused post + pre of mhc_fused_post_pre keeps regular stores."""
+    return (
+        not w_preshuffle_bf16
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and 8 * 256 < m <= MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950
+        and get_cu_num() == 256
+        and not any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    )
 
 
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
@@ -594,12 +648,64 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
     return selected_splitk, tile_m, tile_n, selected_tile_k
 
 
+# gfx950, 256 CUs: settings of the fused post+pre GEMM for the decode and mixed row
+# counts at which another setting than the computed one measured faster on MI350X,
+# with the inputs in cache and with rotating inputs. The computed setting is the one
+# of _mhc_fused_config_gfx950_256, for FP32 fn with the tile_m of
+# _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256. Keyed by (hidden_size, w_preshuffle_bf16);
+# a row is (first m, last m, split_k, tile_m, tile_k) and tile_n is 32. Row counts in
+# no row keep the computed setting. No row overlaps a row of
+# MHC_GRAM_CONFIG_GFX950_256: the default call with fused RMSNorm takes the Gram
+# route at those row counts and never asks for a setting of the fused GEMM.
+MHC_FUSED_DECODE_CONFIG_GFX950_256 = {
+    (4096, True): (
+        (625, 768, 32, 32, 64),
+        (769, 992, 16, 32, 64),
+    ),
+    (7168, False): (
+        (705, 768, 32, 32, 32),
+        (775, 864, 28, 32, 32),
+        (865, 1023, 16, 32, 32),
+    ),
+    (7168, True): (
+        (353, 416, 56, 32, 64),
+        (417, 464, 16, 32, 32),
+        (513, 576, 28, 32, 64),
+        (641, 864, 28, 32, 64),
+        (865, 1023, 16, 32, 64),
+    ),
+}
+
+
+def _mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16):
+    """(split_k, tile_m, tile_n, tile_k) of MHC_FUSED_DECODE_CONFIG_GFX950_256 for m
+    rows, or None where the computed setting is kept."""
+    key = (hidden_size, bool(w_preshuffle_bf16))
+    rows = MHC_FUSED_DECODE_CONFIG_GFX950_256.get(key, ())
+    for m_first, m_last, split_k, tile_m, tile_k in rows:
+        if m_first <= m <= m_last:
+            return split_k, tile_m, 32, tile_k
+    return None
+
+
 # Per-chip tuned config registry, keyed by (gfx_arch, cu_num).
 # Each entry: (m, hidden_size, num_cu) -> (splitk, tile_m, tile_n, tile_k).
 _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx950", 256): _mhc_fused_config_gfx950_256,
     ("gfx942", 80): _mhc_fused_config_gfx942_80,
     ("gfx1250", 256): _mhc_fused_config_gfx1250_256,
+}
+
+
+# gfx950, 256 CUs, FP32 fn, m <= 1024, keyed by hidden_size: m ranges that keep the
+# policy's tile_m=32. Elsewhere tile_m=16 at the policy's split_k measured faster for
+# the complete call (MI355X). Each range is one (split_k, ceil(m/32)) segment of the
+# policy. Other hidden sizes and packed BF16 fn keep the policy. tile_m does not
+# change the outputs.
+_MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256 = {
+    4096: ((97, 128), (993, 1024)),
+    5120: ((481, 512), (993, 1024)),
+    7168: ((97, 103), (481, 512), (993, 1024)),
 }
 
 
@@ -613,8 +719,9 @@ def get_mhc_fused_post_pre_config(
     """Select (split_k, tile_m, tile_n, tile_k) for the fused post+pre GEMM.
 
     Looks up a per-chip tuned policy keyed by (gfx_arch, cu_num); falls back to a
-    conservative default for untuned chips. Packed BF16 with shuffled residuals
-    has separate GEMM + reduction tuning. K = hidden_size per stream.
+    conservative default for untuned chips. On gfx950 with 256 CUs the measured rows
+    of MHC_FUSED_DECODE_CONFIG_GFX950_256 come first. Packed BF16 with shuffled
+    residuals has separate GEMM + reduction tuning. K = hidden_size per stream.
     """
     num_cu = get_cu_num()
     try:
@@ -622,12 +729,24 @@ def get_mhc_fused_post_pre_config(
     except Exception:  # noqa: BLE001
         arch = "unknown"
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
+    if w_preshuffle_bf16 and not res_preshuffle and (arch, num_cu) == ("gfx950", 256):
+        prefill = _mhc_fused_prefill_config_gfx950_256(m, hidden_size)
+        if prefill is not None:
+            return prefill
+    if (arch, num_cu) == ("gfx950", 256) and not res_preshuffle:
+        decode = _mhc_fused_decode_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+        if decode is not None:
+            return decode
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if (arch, num_cu) == ("gfx950", 256) and not w_preshuffle_bf16 and m <= 1024:
+        keep = _MHC_FUSED_FP32_KEEP_TILE_M_GFX950_256.get(hidden_size)
+        if keep is not None and not any(lo <= m <= hi for lo, hi in keep):
+            tile_m = 16
     if (
         w_preshuffle_bf16
         and res_preshuffle
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and 1 <= m <= 1024
     ):
@@ -637,7 +756,12 @@ def get_mhc_fused_post_pre_config(
             tile_m = 16
         elif hidden_size == 4096 and 960 < m:
             split_k = 16
-    if w_preshuffle_bf16 and res_preshuffle and arch == "gfx1250" and num_cu == 256:
+    if (
+        w_preshuffle_bf16
+        and res_preshuffle
+        and arch in ("gfx1250", "gfx1250-strict")
+        and num_cu == 256
+    ):
         return _mhc_fused_bf16_shuffled_config_gfx1250_256(
             m, hidden_size, (split_k, tile_m, tile_n, tile_k)
         )
@@ -671,6 +795,7 @@ def mhc_pre_fake(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_fake)
+@_route(op="mhc_pre", version=1)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -687,6 +812,18 @@ def mhc_pre(
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
     res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The pre half of MHC: normalise, score the heads, and mix.
+
+    Returns ``(post_mix, comb_mix, layer_input)`` -- three newly allocated
+    tensors. Nothing is written through the arguments, which is what the
+    ``mutates_args=[]`` on the guard above already declares; a provider
+    serving this contract allocates its own outputs and returns them.
+
+    ``sinkhorn_repeat=0`` runs the pre step for the hc head only.
+    ``w_preshuffle_bf16`` and ``res_preshuffle`` say that ``fn`` and
+    ``residual`` already arrive packed, so a provider must read them as given
+    rather than assume row-major.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     m = residual.size(0)
@@ -779,6 +916,7 @@ def _mhc_post(
 
 
 @torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+@_route(op="mhc_post", version=1)
 def mhc_post(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -788,9 +926,123 @@ def mhc_post(
     store_nt: int = -1,
     res_preshuffle: bool = False,
 ) -> None:
+    """The post half of MHC: combine the mixed heads back into ``out``.
+
+    Returns nothing. ``out`` is the result and is written in place, which the
+    ``mutates_args=["out"]`` on the guard above declares; a provider serving
+    this contract must leave it fully written, since a caller has no return
+    value to tell a skipped row from a correct one.
+
+    ``res_preshuffle`` says ``residual`` arrives packed; it is unshuffled here
+    when the row count makes that layout active.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
+
+
+@compile_ops("module_mhc", fc_name="mhc_post_reduce", develop=True)
+def _mhc_post_reduce(
+    out: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor | None = None,
+    store_nt: int = -1,
+) -> None: ...
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def mhc_post_reduce(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor | None = None,
+    store_nt: int = -1,
+) -> None:
+    """`mhc_post` with its ``hc_mult`` output streams reduced in the epilogue.
+
+    Writes ``out`` (m, hidden_size), contiguous, in place; the
+    (m, hc_mult, hidden_size) result of `mhc_post` is never stored. Each stream
+    is computed and rounded to the input dtype exactly as `mhc_post` writes it,
+    then the streams are summed in FP32 with ``h`` ascending:
+
+    - ``pre_mix`` (m, hc_mult) FP32: ``sum_h pre_mix[:, h] * stream_h``, each
+      product and each sum rounded on its own (no FMA);
+    - ``pre_mix=None``: ``(sum_h stream_h) / hc_mult``, the mean.
+
+    The result is bit-identical to `mhc_post` followed by that reduction in
+    FP32 and a cast back to the input dtype. ``residual`` is the plain
+    (m, hc_mult, hidden_size) layout: this op has no ``res_preshuffle``.
+    Coverage is `mhc_post_reduce_supported`; anything else raises, as do
+    operands on different devices and an ``out`` that overlaps an input.
+    """
+    # The launch takes the current stream: make it residual's device's.
+    with torch.cuda.device(residual.device):
+        _mhc_post_reduce(
+            out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt
+        )
+
+
+def _mhc_post_tile(hidden_size: int, arch: str, with_256: bool) -> int:
+    """The residual tile `mhc_post` takes for ``hidden_size``, 0 for none.
+
+    The widest of 1024 / 512 / 256 columns that divides ``hidden_size`` and fits
+    at least twice -- a dispatch rule kept from the launch's old check (the
+    kernels also run one tile per work-group), which leaves every shape that ran
+    before on its old tile; gfx942 has no 1024-column tile, and the reduce
+    epilogue no 256-column body (``with_256=False``).
+
+    MUST stay in lockstep with ``mhc_post_tile`` in csrc/kernels/mhc_kernels.cu,
+    which every `mhc_post` / `mhc_post_reduce` launch dispatches on;
+    ``op_tests/test_mhc.py`` sweeps hidden sizes and checks the two agree.
+    """
+    for tile in (1024, 512, 256):
+        if (tile == 1024 and arch == "gfx942") or (tile == 256 and not with_256):
+            continue
+        if hidden_size % tile == 0 and hidden_size >= 2 * tile:
+            return tile
+    return 0
+
+
+def mhc_post_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post` runs: ``hc_mult`` 4, BF16 or FP16, and a
+    ``hidden_size`` with a residual tile on ``arch`` (default: the live GPU).
+    Elsewhere it raises; callers check this first and keep their own path."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=True) != 0
+    )
+
+
+def mhc_post_reduce_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post_reduce` runs: as :func:`mhc_post_supported`,
+    without the 256-column tile. So hidden sizes a multiple of 256 but not of
+    512 are refused, and so is 512 itself (its 512-column tile does not fit
+    twice); 1024 runs on 512-column tiles."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=False) != 0
+    )
 
 
 def get_mhc_pre_splitk_large_m(
@@ -987,6 +1239,304 @@ def _mhc_fused_post_pre_gluon(
     )
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_post_pre_gram_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    next_residual: Tensor,
+    partials: Tensor,  # (split_k, m, 48) scratch
+    layer_input: Tensor,
+    residual_in: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,  # fp32, or pre-packed BF16 hi/lo (int32) from mhc_shuffle_fn
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    parts: int = 4,  # hidden segments of a row in the finisher
+) -> None: ...
+
+
+# gfx950, 256 CUs: decode row counts at which mhc_fused_post_pre with fused RMSNorm
+# takes the Gram-statistics route (csrc/kernels/mhc_post_pre_gram.cu) instead of the
+# fused GEMM and mhc_pre_big_fuse_rmsnorm. Keyed by (hidden_size, w_preshuffle_bf16);
+# a row (first m, last m, split_k, parts) gives the producer's hidden slabs and the
+# finisher's hidden segments per row for those row counts. Every row is a measurement
+# on MI350X against the fastest setting of the existing path, with the inputs in the
+# cache and with rotating inputs; row counts in no row keep the existing path. The
+# launcher has kernels with the sizes of these rows at compile time.
+MHC_GRAM_M_MAX_GFX950 = 1023
+MHC_GRAM_CONFIG_GFX950_256 = {
+    (4096, False): (
+        (1, 128, 64, 2),
+        (129, 640, 32, 2),
+        (641, 768, 16, 1),
+        (769, 1008, 32, 1),
+    ),
+    (4096, True): (
+        (65, 400, 32, 2),
+        (401, 512, 16, 2),
+        (513, 624, 32, 2),
+    ),
+    (7168, False): (
+        (1, 32, 112, 4),
+        (33, 704, 56, 2),
+    ),
+    (7168, True): (
+        (33, 208, 56, 4),
+        (257, 352, 56, 2),
+        (577, 640, 56, 2),
+    ),
+}
+
+
+def _mhc_gram_config_gfx950_256(m, hidden_size, w_preshuffle_bf16):
+    """(split_k, parts) of the Gram route for m rows, or None where the existing
+    path is kept."""
+    rows = MHC_GRAM_CONFIG_GFX950_256.get((hidden_size, bool(w_preshuffle_bf16)), ())
+    for m_first, m_last, split_k, parts in rows:
+        if m_first <= m <= m_last:
+            return split_k, parts
+    return None
+
+
+def _mhc_gram_gfx950(
+    layer_input, residual_in, post_mix, comb_mix, fn, hc_scale, hc_base, weight, packed
+):
+    """(split_k, parts) when these tensors take the Gram route on gfx950 (256 CUs
+    without a CU mask, a row count of ``MHC_GRAM_CONFIG_GFX950_256``), else None."""
+    if weight is None or residual_in.dim() != 3:
+        return None
+    m, hc_mult, hidden_size = residual_in.shape
+    config = _mhc_gram_config_gfx950_256(m, hidden_size, packed)
+    if (
+        config is None
+        or hc_mult != 4
+        # The configurations are tuned for the whole device.
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return None
+    # The kernels take contiguous, 16-byte aligned tensors of these shapes and
+    # types; every other input keeps the existing path.
+    bf16, fp32 = torch.bfloat16, torch.float32
+    expected = (
+        (layer_input, (m, hidden_size), bf16),
+        (residual_in, (m, 4, hidden_size), bf16),
+        (post_mix, (m, 4, 1) if post_mix.dim() == 3 else (m, 4), fp32),
+        (comb_mix, (m, 4, 4), fp32),
+        (fn, (24, 4 * hidden_size), torch.int32 if packed else fp32),
+        (hc_scale, (3,), fp32),
+        (hc_base, (24,), fp32),
+        (weight, (hidden_size,), bf16),
+    )
+    device = layer_input.device
+    if device.type == "cuda" and all(
+        tensor.device == device
+        and tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    ):
+        return config
+    return None
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_post_project_gfx950(
+    projection: Tensor,
+    sq: Tensor,
+    next_residual: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    packed_fn: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_finalize_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    projection: Tensor,
+    sq: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    repeats: int,
+) -> None: ...
+
+
+# Row counts of the gfx950 two-kernel prefill route (hidden size 7168, fused
+# RMSNorm). Below 4096 rows the fused GEMM path of mhc_fused_post_pre is as fast;
+# 16384 is the largest row count the route is validated for.
+MHC_GFX950_PREFILL_M_MIN = 4096
+MHC_GFX950_PREFILL_M_MAX = 16384
+
+
+def _mhc_post_pre_gfx950_supported(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    norm_weight: Tensor | None,
+) -> bool:
+    # The caller has tested the row count and the packed weights.
+    m = layer_input.shape[0]
+    # Fixed launch tuning is qualified only for an unmasked 256-CU device.
+    if (
+        norm_weight is None
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return False
+    # Other shapes, dtypes and views keep the existing dispatch.
+    expected = (
+        (layer_input, (m, 7168), torch.bfloat16),
+        (residual, (m, 4, 7168), torch.bfloat16),
+        (post_mix, (m, 4, 1) if post_mix.ndim == 3 else (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (fn, (24, 28672), torch.int32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (7168,), torch.bfloat16),
+    )
+    device = layer_input.device
+    return device.type == "cuda" and all(
+        tensor.device == device
+        and tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    )
+
+
+def _mhc_post_pre_gfx950(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    post_mult: float,
+    repeats: int,
+    norm_weight: Tensor,
+    norm_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    m = layer_input.shape[0]
+    splits = 4
+    device = layer_input.device
+    projection_pad = torch.empty((splits, m, 32), dtype=torch.float32, device=device)
+    sq = torch.empty((splits, m), dtype=torch.float32, device=device)
+    next_residual = torch.empty_like(residual)
+    # Consume the caller's explicit mhc_shuffle_fn layout on every call.
+    mhc_post_project_gfx950(
+        projection_pad,
+        sq,
+        next_residual,
+        layer_input,
+        residual,
+        fn,
+        post_mix.reshape(m, 4),
+        comb_mix,
+    )
+    # The finalizer's outputs are allocated while the producer runs.
+    post = torch.empty((m, 4, 1), dtype=torch.float32, device=device)
+    comb = torch.empty((m, 4, 4), dtype=torch.float32, device=device)
+    out = torch.empty_like(layer_input)
+    mhc_finalize_gfx950(
+        post,
+        comb,
+        out,
+        projection_pad,
+        sq,
+        scale,
+        base,
+        next_residual,
+        norm_weight,
+        rms_eps,
+        pre_eps,
+        sink_eps,
+        norm_eps,
+        post_mult,
+        repeats,
+    )
+    return post, comb, out, next_residual
+
+
+def _mhc_fused_prefill_gfx950(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    sinkhorn_repeat: int,
+    w_preshuffle_bf16: bool,
+    backend: str | None,
+    arch: str,
+) -> bool:
+    """Whether a call at or above the fused bound keeps the fused GEMM (gfx950,
+    256 CUs without a CU mask, packed weights, see
+    ``_mhc_fused_prefill_config_gfx950_256``)."""
+    if not w_preshuffle_bf16 or arch != "gfx950" or backend not in (None, "hip"):
+        return False
+    if residual_in.dim() != 3:
+        return False
+    m, hc_mult, hidden_size = residual_in.shape
+    if (
+        hc_mult != 4
+        or sinkhorn_repeat <= 0
+        or _mhc_fused_prefill_config_gfx950_256(m, hidden_size) is None
+        # The tiles are tuned for the whole device.
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+        # The fused branch asserts these shapes; post + pre reads the tensors as
+        # they are.
+        or layer_input.shape != (m, hidden_size)
+        or post_layer_mix.shape not in ((m, hc_mult), (m, hc_mult, 1))
+        or comb_res_mix.shape != (m, hc_mult, hc_mult)
+        or fn.shape != (hc_mult * (hc_mult + 2), hc_mult * hidden_size)
+    ):
+        return False
+    # The fused GEMM takes contiguous BF16 tensors; other inputs keep post + pre.
+    return layer_input.dtype == residual_in.dtype == dtypes.bf16 and all(
+        tensor.is_contiguous()
+        for tensor in (layer_input, residual_in, post_layer_mix, comb_res_mix, fn)
+    )
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
@@ -1021,7 +1571,14 @@ def mhc_fused_post_pre(
     ``force_fused``: when True, select the fused HIP path, except for the existing
     gfx950 large-M post+pre specialization with plain residuals. When False
     (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
-    ``mhc_pre`` (threshold depends on the detected GPU arch).
+    ``mhc_pre`` (threshold depends on the detected GPU arch). On gfx950 with 256
+    CUs, packed weights (``w_preshuffle_bf16=True``) keep the fused path for ``m``
+    from ``MHC_FUSED_PREFILL_M_MIN_GFX950`` to ``MHC_FUSED_PREFILL_M_MAX_GFX950``
+    and ``hidden_size`` in ``MHC_FUSED_PREFILL_HIDDEN_SIZES_GFX950``, where it is
+    the faster one with 32-row, 64-wide tiles.
+    With FP32 weights on the same device, that ``mhc_post`` + ``mhc_pre`` runs with
+    regular stores in ``mhc_post`` for ``m`` from 8 * 256 + 1 to
+    ``MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950``; the results are the same bits.
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
@@ -1032,6 +1589,15 @@ def mhc_fused_post_pre(
 
     Both flags are boolean, default to False, and are controlled independently.
 
+    On unmasked 256-CU gfx950 devices, BF16 plain-layout prefill calls with
+    hidden size 7168, four residual streams, RMSNorm, explicit
+    w_preshuffle_bf16=True and fn from mhc_shuffle_fn fuse post with projection
+    and finalize whole rows. This applies when M is between
+    ``MHC_GFX950_PREFILL_M_MIN`` and ``MHC_GFX950_PREFILL_M_MAX``. Other row
+    counts, default FP32 projection and explicit force_fused requests keep the
+    other paths. Unsupported tensor layouts and dtypes keep the existing
+    implementation.
+
     A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
     ``MHC_GLUON_POST_PRE_HIDDEN_SIZES`` runs the gfx1250 Gluon kernels
     (``aiter.ops.triton.fusions.mhc.mhc_post_pre``) and uses ``MHC_RES_KS_GLUON``
@@ -1040,11 +1606,188 @@ def mhc_fused_post_pre(
     residuals and other hidden sizes keep the HIP kernels. The fuse/unfuse
     boundary is unchanged.
 
+    On gfx950 with 256 CUs, a call with fused RMSNorm (``norm_weight``), four BF16
+    residual streams and 20 Sinkhorn iterations takes the Gram-statistics route at
+    the decode row counts of ``MHC_GRAM_CONFIG_GFX950_256`` (at most
+    ``MHC_GRAM_M_MAX_GFX950`` rows), with FP32 ``fn`` and with packed weights. Its
+    producer computes the new residual, the projection of the rounded residual
+    with BF16 hi/lo weights (FP32 ``fn`` is split in the kernel) and the Gram
+    matrix ``G`` of the four streams. Its finisher folds the streams as
+    ``mhc_pre_big_fuse_rmsnorm`` does, normalises the fold by ``p.T @ G @ p`` of
+    the pre mix ``p`` and rounds to BF16 once. Where that quadratic is at most
+    1e-3 of its diagonal part (cancelling streams) or not finite, the norm is
+    summed from the fold itself. ``force_fused``, inputs that are not contiguous,
+    16-byte aligned tensors of the documented shapes and types, and devices with
+    another CU count or a CU mask keep the existing path.
+
     ``backend``: None (default) picks as above; ``"hip"`` / ``"gluon"`` force the
     implementation of the fused path (tests, benchmarks). A shuffled residual must
     then be in that backend's blocks (``mhc_res_ks(..., backend=backend)``).
     ``"gluon"`` needs gfx1250 and inputs the Gluon kernels take, or raises.
+
+    Without either pin (``force_fused=False``, ``backend=None``) the call enters
+    the routed op ``mhc_fused_post_pre``, and enabled plugins are asked first.
+    A pin picks AITER's own implementation, so a pinned call is not routed.
     """
+    if not force_fused and backend is None:
+        return _mhc_fused_post_pre_routed(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+            w_preshuffle_bf16,
+            res_preshuffle,
+        )
+    return _mhc_fused_post_pre_native(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        force_fused,
+        w_preshuffle_bf16,
+        res_preshuffle,
+        backend,
+    )
+
+
+def _mhc_fused_post_pre_routed_fake(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shapes only: the four results are new tensors, and neither pin moves a
+    shape, so this is :func:`mhc_fused_post_pre_fake` under the routed
+    signature."""
+    return mhc_fused_post_pre_fake(
+        layer_input, residual_in, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base
+    )
+
+
+# Routed below the two pins, as `mla_sparse_prefill_v41` is below `backend`:
+# `backend` and `force_fused` choose among AITER's own implementations, a
+# choice a provider with one kernel cannot honour. The public signature, which
+# vLLM probes with inspect.signature, does not change.
+#
+# Registered with a fake, as `per_group_quant` is, because the guard sits on
+# the public function, not on this one. `mutates_args=[]` is true here: all
+# four results are allocated, and nothing is written through an argument.
+@_route(
+    op="mhc_fused_post_pre",
+    version=1,
+    fake=_mhc_fused_post_pre_routed_fake,
+    mutates_args=[],
+)
+def _mhc_fused_post_pre_routed(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mhc_post of the previous layer fused with mhc_pre of the next.
+
+    Shapes and meanings are those of :func:`mhc_fused_post_pre`, minus its
+    ``force_fused`` and ``backend`` pins. Returns ``(post_mix, comb_mix,
+    layer_input_out, next_residual)`` -- four newly allocated tensors, the
+    next pre's ``(m, hc, 1)`` and ``(m, hc, hc)`` mixes, its ``(m, hidden)``
+    layer input and the ``(m, hc, hidden)`` residual stream the next post
+    reads. Nothing is written through the arguments.
+
+    ``post_layer_mix`` is ``(m, hc, 1)`` or ``(m, hc)``. ``w_preshuffle_bf16``
+    says ``fn`` comes from ``mhc_shuffle_fn``; ``res_preshuffle`` says
+    ``residual_in`` is in the shuffled layout when ``mhc_res_shuffle_enabled``
+    holds for ``m``, and ``next_residual`` is then returned in it too. A
+    provider must read both as given rather than assume row-major. With a
+    plain residual and ``m`` at or above the fused bound, this runs
+    ``mhc_post`` then ``mhc_pre``, both routed in turn.
+    """
+    return _mhc_fused_post_pre_native(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        False,
+        w_preshuffle_bf16,
+        res_preshuffle,
+        None,
+    )
+
+
+def _mhc_fused_post_pre_native(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    force_fused: bool,
+    w_preshuffle_bf16: bool,
+    res_preshuffle: bool,
+    backend: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AITER's implementations of :func:`mhc_fused_post_pre`, pins honoured."""
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
@@ -1054,15 +1797,107 @@ def mhc_fused_post_pre(
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
 
-    # At the shared bound the input is already in ordinary layout.
-    if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
+    gram = None
+    if (
+        arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and sinkhorn_repeat == 20
+    ):
+        gram = _mhc_gram_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            w_preshuffle_bf16,
+        )
+    if gram is not None:
+        split_k, parts = gram
+        device = layer_input.device
+        # Per split and row: the projection (24 sums in 32 floats) and the ten
+        # Gram entries of the streams (in 16 floats).
+        partials = torch.empty((split_k, m, 48), dtype=dtypes.fp32, device=device)
         next_residual = torch.empty_like(residual_in)
+        post_mix = torch.empty((m, 4, 1), dtype=dtypes.fp32, device=device)
+        comb_mix = torch.empty((m, 4, 4), dtype=dtypes.fp32, device=device)
+        layer_input_out = torch.empty_like(layer_input)
+        mhc_post_pre_gram_gfx950(
+            post_mix,
+            comb_mix,
+            layer_input_out,
+            next_residual,
+            partials,
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            parts,
+        )
+        return post_mix, comb_mix, layer_input_out, next_residual
+
+    # The row test comes first: decode and FP32 calls leave after one or two
+    # comparisons.
+    if (
+        w_preshuffle_bf16
+        and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and not res_preshuffle
+        and sinkhorn_repeat > 0
+    ):
+        tensors = (layer_input, residual_in, post_layer_mix, comb_res_mix, fn)
+        tensors += (hc_scale, hc_base)
+        if _mhc_post_pre_gfx950_supported(*tensors, norm_weight):
+            scalars = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value)
+            return _mhc_post_pre_gfx950(
+                *tensors, *scalars, sinkhorn_repeat, norm_weight, norm_eps
+            )
+
+    # At the shared bound the input is already in ordinary layout.
+    if (
+        not force_fused
+        and not res_preshuffle
+        and m >= fused_m_upper_bound
+        and not _mhc_fused_prefill_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            sinkhorn_repeat,
+            w_preshuffle_bf16,
+            backend,
+            arch,
+        )
+    ):
+        next_residual = torch.empty_like(residual_in)
+        # -1 leaves the store policy to mhc_post, 0 keeps regular stores.
+        store_nt = (
+            0
+            if _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend)
+            else -1
+        )
         mhc_post(
             next_residual,
             layer_input,
             residual_in,
             post_layer_mix,
             comb_res_mix,
+            store_nt,
         )
         post_mix, comb_mix, layer_input_out = mhc_pre(
             next_residual,
@@ -1228,3 +2063,368 @@ def mhc_fused_post_pre(
         )
 
     return post_mix, comb_mix, layer_input_out, next_residual
+
+
+# ---- delayed mHC seam, with gfx942 ASM kernels (hsa/gfx942/mhc_seam/) ----
+#
+# The delayed seam of the DeepSeek-V4 family: the post-mix of the previous sub-layer,
+# the stream collapse with the carried pre gate and the gates of the next pre
+# projection, as ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton) computes them, without
+# its RMSNorm. The ASM kernels exist for gfx942, hc_mult = 4 and hidden_size = 5120
+# (DeepSeek-V4.1-Flash) only; the op has no other path and raises outside that
+# configuration (probe: mhc_fused_post_pre_delayed_asm_supported). Other configurations
+# use ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm) or ``mhc_post``
+# + ``mhc_pre``.
+
+MHC_SEAM_HC_MULT = 4
+MHC_SEAM_HIDDEN_SIZE = 5120
+# Below this many tokens the few-token kernel runs (one short wave per 128-column slice
+# and token: post, collapse and the pre GEMM partials); from it the persistent fused
+# kernel (512-column chunks, ~11 us fixed cost). Every wave of the few-token kernel reads
+# its fn slice, so its time grows with T; on MI300X / MI325X (304 CUs) the two cross at
+# about 60 tokens. Both are followed by the ASM gates. The fused kernel's fixed time does
+# not depend on the CU count while the few-token kernel's time per CU does, so with fewer
+# CUs the switch moves down with them: on 80-CU MI308X the two cross between 16 and 17
+# tokens (see _mhc_seam_small_max_t). The fused grid (CUs / 10 token ranges, one
+# workgroup per CU) is fastest on both: more token ranges each reload their fn chunk.
+MHC_SEAM_SMALL_MAX_T = 60
+MHC_SEAM_SMALL_SLICE = 128
+MHC_SEAM_FUSED_CHUNK = 512
+# From this many tokens the new residual no longer fits in the 256 MB MALL, and
+# nontemporal stores are about 1 % faster. With fewer than 304 CUs (MI308X) they are
+# never slower and up to 3 % faster from 40 to 512 tokens, so they are always used.
+MHC_SEAM_STORE_NT_MIN_T = 8192
+# Tokens per launch: keeps every tensor under 4 GiB (the kernels use 32-bit offsets).
+MHC_SEAM_MAX_T_PER_LAUNCH = 65536
+
+
+def _mhc_seam_small_max_t(num_cu: int) -> int:
+    """Tokens per launch below which the few-token kernel runs: MHC_SEAM_SMALL_MAX_T on
+    304-CU parts, about one token per 5 CUs with fewer (17 on 80-CU MI308X)."""
+    return MHC_SEAM_SMALL_MAX_T if num_cu >= 304 else num_cu // 5 + 1
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_fused_asm", ffi_type="ctypes")
+def mhc_seam_fused_asm(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    part: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor,
+    fn: Tensor,
+    workers: int = 0,
+    store_nt: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_small_asm", ffi_type="ctypes")
+def mhc_seam_small_asm(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    part: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor,
+    fn: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_gates_asm", ffi_type="ctypes")
+def mhc_seam_gates_asm(
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    pre_mix: Tensor,
+    part: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    hc_hidden_size: int,
+) -> None: ...
+
+
+def mhc_fused_post_pre_delayed_asm_supported(
+    hidden_size: int, hc_mult: int, arch: Optional[str] = None  # noqa: UP045
+) -> bool:
+    """True where :func:`mhc_fused_post_pre_delayed` runs: gfx942, hc_mult 4,
+    hidden_size 5120. Elsewhere the op raises NotImplementedError; callers check
+    this first and keep their own path otherwise."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        arch == "gfx942"
+        and hc_mult == MHC_SEAM_HC_MULT
+        and hidden_size == MHC_SEAM_HIDDEN_SIZE
+    )
+
+
+_MHC_IDENTITY_PRE: dict = {}
+
+
+def _mhc_identity_pre(n: int, hc_mult: int, device) -> torch.Tensor:
+    """(n, hc_mult) fp32 rows [1, 0, ..., 0]: the identity pre gate of one launch
+    (n <= MHC_SEAM_MAX_T_PER_LAUNCH). Built once per device with
+    MHC_SEAM_MAX_T_PER_LAUNCH rows and never replaced, so the identity costs no kernels
+    and a CUDA graph that captured a slice of it keeps reading live memory. The first
+    fill is synchronised once, so calls on other streams never read it half written.
+    Built per call while a CUDA graph is being captured before the buffer exists (the
+    cached buffer must not be initialised inside a graph)."""
+    key = (str(device), hc_mult)
+    buf = _MHC_IDENTITY_PRE.get(key)
+    if buf is None:
+        capturing = torch.cuda.is_current_stream_capturing()
+        rows = n if capturing else MHC_SEAM_MAX_T_PER_LAUNCH
+        buf = torch.zeros(rows, hc_mult, dtype=dtypes.fp32, device=device)
+        buf[:, 0] = 1.0
+        if capturing:
+            return buf
+        torch.cuda.current_stream(device).synchronize()
+        _MHC_IDENTITY_PRE[key] = buf
+    return buf[:n]
+
+
+def _mhc_seam_check(name: str, t: torch.Tensor, device, dtype, *shapes) -> None:
+    if t.device != device:
+        raise ValueError(
+            f"mhc_fused_post_pre_delayed: {name} is on {t.device}, expected {device}"
+        )
+    if t.dtype != dtype:
+        raise TypeError(
+            f"mhc_fused_post_pre_delayed: {name} has dtype {t.dtype}, expected {dtype}"
+        )
+    if tuple(t.shape) not in shapes:
+        raise ValueError(
+            f"mhc_fused_post_pre_delayed: {name} has shape {tuple(t.shape)}, expected "
+            + " or ".join(str(s) for s in shapes)
+        )
+
+
+def mhc_fused_post_pre_delayed_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: Optional[torch.Tensor],  # noqa: UP045
+    sublayer_out: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    return (
+        # the op makes residual contiguous, so residual_out is contiguous too
+        torch.empty(residual.shape, dtype=residual.dtype, device=device),
+        torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
+        torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device),
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_delayed_fake)
+def mhc_fused_post_pre_delayed(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: Optional[torch.Tensor],  # noqa: UP045
+    sublayer_out: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Delayed mHC seam: post-mix, collapse with the carried pre gate, next gates.
+
+    Same arguments and results as ``mhc_fused_post_pre_delayed_rmsnorm`` without the
+    RMSNorm, with the post block always applied:
+
+        residual_out[t, j] = sum_i comb_res_mix[t, i, j] residual[t, i]
+                             + post_layer_mix[t, j] sublayer_out[t]
+        layer_input[t]     = sum_j pre_mix[t, j] residual_out[t, j]
+        post_mix, comb_mix, next_pre_mix = the gates of residual_out (as ``mhc_pre``)
+
+    residual_out reproduces ``mhc_post`` bit for bit (its fp32 order and bf16
+    truncation); layer_input is the fp32 sum over streams 0..3 rounded to nearest even.
+
+    Runs the ASM kernels of hsa/gfx942/mhc_seam in two launches: one kernel for the
+    post, the collapse and the split-K partials of the pre GEMM (below
+    _mhc_seam_small_max_t tokens one short wave per 128-column slice and token, from it a
+    persistent kernel over 512-column chunks), then the gates from the partials.
+
+    Supported only on gfx942 with 4 residual streams and hidden_size 5120
+    (DeepSeek-V4.1-Flash); anything else raises NotImplementedError. Check with
+    ``mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult)`` first. Other
+    configurations: ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm)
+    or ``mhc_post`` + ``mhc_pre``. Tensors with another shape or device raise
+    ValueError, another dtype TypeError; inputs need not be contiguous. The kernel
+    switch and grid were timed on 304-CU parts (MI300X, MI325X) and 80-CU MI308X.
+
+    Args:
+        residual: (T, 4, H) bf16 residual streams entering the seam.
+        fn: (24, 4 * H) fp32 gate projection; hc_scale (3,), hc_base (24,) fp32.
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat:
+            the model's hc constants.
+        pre_mix: (T, 4) fp32 pre gate carried from the previous seam; None means the
+            identity gate (the collapse is stream 0).
+        sublayer_out: (T, H) bf16 output of the previous sub-layer.
+        post_layer_mix / comb_res_mix: (T, 4[, 1]) / (T, 4, 4) fp32 gates of the
+            previous seam.
+
+    Returns:
+        (residual_out (T, 4, H) bf16, post_mix (T, 4, 1), comb_mix (T, 4, 4),
+         layer_input (T, H) bf16, next_pre_mix (T, 4)); the gates are fp32.
+    """
+    if residual.dim() != 3 or not residual.is_cuda:
+        raise ValueError(
+            "mhc_fused_post_pre_delayed: residual must be a (T, 4, H) GPU tensor, got "
+            f"shape {tuple(residual.shape)} on {residual.device}"
+        )
+    if residual.dtype != dtypes.bf16:
+        raise TypeError(
+            f"mhc_fused_post_pre_delayed: residual must be bf16, got {residual.dtype}"
+        )
+    m, hc_mult, hidden_size = residual.shape
+    arch = get_gfx_runtime()
+    if not mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult, arch):
+        raise NotImplementedError(
+            "mhc_fused_post_pre_delayed runs on gfx942 with 4 residual streams and "
+            f"hidden size {MHC_SEAM_HIDDEN_SIZE}; got {arch}, {hc_mult} streams, hidden "
+            f"size {hidden_size}. Check with mhc_fused_post_pre_delayed_asm_supported() "
+            "first. Other configurations: mhc_fused_post_pre_delayed_rmsnorm (Triton, "
+            "folds the RMSNorm) or mhc_post + mhc_pre."
+        )
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    hc_hidden_size = hc_mult * hidden_size
+    device = residual.device
+    fp32, bf16 = dtypes.fp32, dtypes.bf16
+    _mhc_seam_check("fn", fn, device, fp32, (hc_mult3, hc_hidden_size))
+    _mhc_seam_check("hc_scale", hc_scale, device, fp32, (3,))
+    _mhc_seam_check("hc_base", hc_base, device, fp32, (hc_mult3,))
+    _mhc_seam_check("sublayer_out", sublayer_out, device, bf16, (m, hidden_size))
+    gate_shapes = ((m, hc_mult), (m, hc_mult, 1))
+    _mhc_seam_check("post_layer_mix", post_layer_mix, device, fp32, *gate_shapes)
+    _mhc_seam_check("comb_res_mix", comb_res_mix, device, fp32, (m, hc_mult, hc_mult))
+    if pre_mix is not None:
+        _mhc_seam_check("pre_mix", pre_mix, device, fp32, *gate_shapes)
+    if sinkhorn_repeat < 1:
+        raise ValueError(
+            "mhc_fused_post_pre_delayed: sinkhorn_repeat must be >= 1, got "
+            f"{sinkhorn_repeat}"
+        )
+    residual = residual.contiguous()
+    sublayer_out = sublayer_out.contiguous()
+    fn = fn.contiguous()
+    hc_scale = hc_scale.contiguous()
+    hc_base = hc_base.contiguous()
+    post_2d = post_layer_mix.reshape(m, hc_mult).contiguous()
+    comb_3d = comb_res_mix.contiguous()
+    pre_2d = None if pre_mix is None else pre_mix.reshape(m, hc_mult).contiguous()
+
+    residual_out = torch.empty_like(residual)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    next_pre_mix = torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device)
+    _mhc_seam_asm_launch(
+        residual_out,
+        layer_input,
+        post_mix,
+        comb_mix,
+        next_pre_mix,
+        residual,
+        sublayer_out,
+        post_2d,
+        comb_3d,
+        pre_2d,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix
+
+
+def _mhc_seam_asm_launch(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    next_pre_mix: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_2d: Tensor,
+    comb_3d: Tensor,
+    pre_2d: Optional[Tensor],  # noqa: UP045
+    fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> None:
+    """Launch the gfx942 ASM seam kernels into preallocated outputs.
+
+    Callers check support (mhc_fused_post_pre_delayed_asm_supported) and that all
+    tensors are contiguous on one device: post_2d (T, 4), comb_3d (T, 4, 4), pre_2d
+    (T, 4) or None for the identity gate, outputs as mhc_fused_post_pre_delayed.
+    """
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    num_cu = get_cu_num()
+    small_max = _mhc_seam_small_max_t(num_cu)
+    gate_args = (
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        hc_mult * hidden_size,
+    )
+    for t0 in range(0, m, MHC_SEAM_MAX_T_PER_LAUNCH):
+        t1 = min(m, t0 + MHC_SEAM_MAX_T_PER_LAUNCH)
+        n = t1 - t0
+        seam_in = (
+            residual[t0:t1],
+            sublayer_out[t0:t1],
+            post_2d[t0:t1],
+            comb_3d[t0:t1],
+            _mhc_identity_pre(n, hc_mult, device) if pre_2d is None else pre_2d[t0:t1],
+        )
+        gates_out = (post_mix[t0:t1], comb_mix[t0:t1], next_pre_mix[t0:t1])
+        # part[s, t, 0:24]: the mixes of column slice s, part[s, t, 24]: its sum of
+        # squares; slices of 128 columns (few-token kernel) or 512 (fused kernel)
+        small = n < small_max
+        sl = MHC_SEAM_SMALL_SLICE if small else MHC_SEAM_FUSED_CHUNK
+        part = torch.empty(hidden_size // sl, n, 32, dtype=dtypes.fp32, device=device)
+        seam_out = (residual_out[t0:t1], layer_input[t0:t1], part)
+        if small:
+            mhc_seam_small_asm(*seam_out, *seam_in, fn)
+        else:
+            store_nt = n >= MHC_SEAM_STORE_NT_MIN_T or num_cu < 304
+            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, store_nt)
+        mhc_seam_gates_asm(*gates_out, part, *gate_args)

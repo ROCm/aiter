@@ -209,7 +209,8 @@ extern "C" void __hipRegisterFunction(void* module,
 // ---- gfx1250 asm B0-only gate ------------------------------------------------
 // Gates the shipped asm code objects only; the OPUS .co path is not gated.
 
-// Soft (non-aborting): false only when a gfx1250 A0 (asicRevision 0) is seen.
+// Soft (non-aborting): false when gfx1250-strict or a legacy gfx1250 A0
+// (asicRevision 0) is seen.
 // Undeterminable arch -> true (the load-site gate is the hard stop). Callers
 // also use it to pick a fallback path (e.g. fmha_v3_bwd -> CK).
 //
@@ -217,9 +218,20 @@ extern "C" void __hipRegisterFunction(void* module,
 // aiter/jit/utils/chip_info.py: every visible device is scanned and the lowest
 // stepping wins, so the answer does not depend on which device is current when
 // a kernel happens to be loaded (asm kernels are cached process-wide by name).
+static inline bool gfx1250_a0_asm_allowed()
+{
+    static const bool allowed = [] {
+        const char* e = std::getenv("AITER_GFX1250_A0_ALLOW_ASM");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return allowed;
+}
+
 static inline bool is_gfx1250_asm_supported()
 {
     static const bool supported = [] {
+        if(gfx1250_a0_asm_allowed())
+            return true;
         int count = 0;
         if(hipGetDeviceCount(&count) != hipSuccess)
             return true; // cannot tell -> do not over-block
@@ -232,6 +244,8 @@ static inline bool is_gfx1250_asm_supported()
             size_t colon_pos = arch.find(':');
             if(colon_pos != std::string::npos)
                 arch = arch.substr(0, colon_pos);
+            if(arch == "gfx1250-strict")
+                return false; // strict is the compiler/runtime identity for A0
             if(arch != "gfx1250")
                 continue;
             if(prop.asicRevision < 1) // gfx1250: shipped asm is B0+ only
@@ -272,7 +286,7 @@ static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
     if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
         return;
     std::string msg = std::string(kernel_name ? kernel_name : "<unknown>") +
-                      " asm code object targets gfx1250 B0+; running device is gfx1250 A0.";
+                      " asm code object targets gfx1250 B0+; running device is MI450 A0 (gfx1250-strict, or gfx1250 asicRevision 0).";
     std::cerr << "[AITER] " << msg << std::endl;
     throw std::runtime_error(std::move(msg));
 }
@@ -586,14 +600,12 @@ static const std::string get_gpu_arch()
 
     std::string arch_full = dev_prop.gcnArchName;
     size_t colon_pos      = arch_full.find(':');
-    if(colon_pos != std::string::npos)
-    {
-        return arch_full.substr(0, colon_pos);
-    }
-    else
-    {
-        return arch_full;
-    }
+    std::string arch =
+        colon_pos != std::string::npos ? arch_full.substr(0, colon_pos) : arch_full;
+    // With the A0 opt-in, gfx1250-strict loads the gfx1250 asm code objects.
+    if(arch == "gfx1250-strict" && gfx1250_a0_asm_allowed())
+        return "gfx1250";
+    return arch;
 }
 
 static inline bool is_fp8_ocp_arch()

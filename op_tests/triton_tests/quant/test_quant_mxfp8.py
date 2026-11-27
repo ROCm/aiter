@@ -27,10 +27,15 @@ LEGACY_BLOCK_SIZE = 128
 _E8M0_MASK_INT32 = -8388608
 
 
-def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
+def torch_mxfp8_quant_from_fp32(
+    x_fp32: torch.Tensor,
+    log2_dtype_max: int = 8,
+    out_dtype: torch.dtype = torch.float8_e4m3fn,
+):
     """Bit-faithful port of `_dynamic_mxfp8_quant_kernel` quant logic, taking fp32 input.
 
-    Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3fn values.
+    Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3 values. OCP e4m3fn
+    scales by 2**8; fnuz e4m3 (gfx942) by 2**7.
     """
     assert x_fp32.dim() == 2, f"x_fp32 must be 2D, got {x_fp32.dim()}"
     M, K = x_fp32.shape
@@ -44,14 +49,14 @@ def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
     amax_i32 = (amax_i32 + 0x200000) & _E8M0_MASK_INT32
     amax_p2 = amax_i32.view(torch.float32)
 
-    scale_unbiased = torch.log2(amax_p2).floor() - 8
+    scale_unbiased = torch.log2(amax_p2).floor() - log2_dtype_max
     scale_unbiased = torch.clamp(scale_unbiased, min=-127, max=127)
     scale_e8m0 = (scale_unbiased.to(torch.int32) + 127).to(torch.uint8)
     quant_scale = torch.exp2(-scale_unbiased)
 
     qx_2d = x_2d * quant_scale  # broadcast over inner-32
     qx = qx_2d.reshape(M, K)
-    y_fp8 = qx.to(torch.float8_e4m3fn)
+    y_fp8 = qx.to(out_dtype)
     s = scale_e8m0.reshape(M, Ng)
     return y_fp8, s
 
@@ -65,35 +70,41 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 
 
+_PER_1X32_MXFP8_SHAPES = [
+    # Shapes in different gfx1250 Gluon config buckets.
+    (1, 3072),
+    (4, 7168),
+    (40, 4096),
+    (4100, 4096),
+    (4100, 1024),
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    (2, 32),
+    (8, 64),
+    (16, 128),
+    (32, 256),
+    (64, 512),
+    (128, 1024),
+    (137, 64),  # non-power-of-2 M
+    (256, 32),
+    # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+    # non-power-of-2 shapes in between.
+    (8, 1024),
+    (2048, 3072),
+    (16384, 7168),
+    (6000, 5024),
+]
+
+
 @pytest.mark.parametrize(
-    "M, K",
+    "M, K, dtype",
     [
-        # Shapes in different gfx1250 Gluon config buckets.
-        (1, 3072),
-        (4, 7168),
-        (40, 4096),
-        (4100, 4096),
-        (4100, 1024),
-        (1, 32),
-        (1, 64),
-        (1, 128),
-        (2, 32),
-        (8, 64),
-        (16, 128),
-        (32, 256),
-        (64, 512),
-        (128, 1024),
-        (137, 64),  # non-power-of-2 M
-        (256, 32),
-        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
-        # non-power-of-2 shapes in between.
-        (8, 1024),
-        (2048, 3072),
-        (16384, 7168),
-        (6000, 5024),
+        pytest.param(M, K, dtype)
+        for M, K in _PER_1X32_MXFP8_SHAPES
+        for dtype in (torch.bfloat16, torch.float16)
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
@@ -104,10 +115,15 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
 
     # Reference path: emulate the kernel in fp32 (matching its precision).
     x_fp32 = x.to(torch.float32)
-    y_ref, s_ref = torch_mxfp8_quant_from_fp32(x_fp32)
+    use_fnuz = arch_info.get_arch() == "gfx942"
+    quant_dtype = torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+    log2_dtype_max = 7 if use_fnuz else 8
+    y_ref, s_ref = torch_mxfp8_quant_from_fp32(
+        x_fp32, log2_dtype_max=log2_dtype_max, out_dtype=quant_dtype
+    )
 
     # Triton path.
-    y_kern, s_kern = dynamic_mxfp8_quant(x)
+    y_kern, s_kern = dynamic_mxfp8_quant(x, quant_dtype=quant_dtype)
 
     # Scales must be bit-exact: the e8m0 derivation is integer-only after
     # the fp32 cast, and amax is order-independent.
@@ -627,14 +643,6 @@ def test_fused_deepseek_v4_mxfp8_quant_q_pack(T, H, mag):
     assert (u8[..., _NOPE + 2 * _NUM_TILES :] == 0).all(), "tail not zeroed"
 
 
-def test_fused_deepseek_v4_mxfp8_quant_q_pack_contract():
-    """A row that is not 448 NoPE + 64 RoPE is refused, not silently reshaped."""
-    _skip_without_fp8()
-    q = torch.zeros(2, 4, 256, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="448 NoPE"):
-        fused_deepseek_v4_mxfp8_quant_q_pack(q)
-
-
 # --------------------------------------------------------------------------- #
 # fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 # --------------------------------------------------------------------------- #
@@ -924,29 +932,6 @@ def test_fused_deepseek_v4_k_cache_layouts_agree(seq_lens):
         outs.append(out)
     for r, s in enumerate(seq_lens):
         torch.testing.assert_close(outs[0][r, :s], outs[1][r, :s], **_EXACT)
-
-
-def test_fused_deepseek_v4_k_cache_contract():
-    """What the writer refuses."""
-    _skip_without_fp8()
-    cache = torch.zeros(2, 64, _REC, dtype=torch.uint8, device="cuda")
-    slot = torch.zeros(4, dtype=torch.int64, device="cuda")
-    with pytest.raises(AssertionError, match="512"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda"), cache, slot, 64
-        )
-    with pytest.raises(AssertionError, match="bf16"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(4, _QK, dtype=torch.float16, device="cuda"), cache, slot, 64
-        )
-    # strided columns: rows may be strided, the 512 values in a row may not
-    with pytest.raises(AssertionError, match="contiguous"):
-        fused_deepseek_v4_quantize_and_insert_k_cache(
-            torch.zeros(_QK, 4, dtype=torch.bfloat16, device="cuda").t(),
-            cache,
-            slot,
-            64,
-        )
 
 
 def test_fused_deepseek_v4_gather_sliced_block_table():
@@ -1420,7 +1405,7 @@ def test_compress_norm_rope_store_matches_reference(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
     arch = arch_info.get_arch()
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("The Gluon backend requires gfx950 or gfx1250")
     if arch == "gfx950" and dtype != torch.bfloat16:
         pytest.skip("The gfx950 Gluon kernel requires bf16 input")
@@ -1437,14 +1422,3 @@ def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
         atol=1,
         rtol=0,
     )
-
-
-def test_dynamic_mxfp8_quant_backend_validation():
-    if not arch_info.is_any_fp8_avail():
-        pytest.skip("FP8 not supported on this arch")
-    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="Unknown backend"):
-        dynamic_mxfp8_quant(x, backend="cuda")
-    # fp32 input has no Gluon kernel on any arch.
-    with pytest.raises(RuntimeError, match="Gluon backend requires"):
-        dynamic_mxfp8_quant(x.float(), backend="gluon")

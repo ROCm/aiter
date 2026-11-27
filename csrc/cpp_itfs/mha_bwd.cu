@@ -274,9 +274,34 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
-       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && arch_id != "gfx1250") ||
+       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && (arch_id != "gfx1250" && arch_id != "gfx1250-strict")) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")) ||
        (!is_gfx1250_asm_supported()))
+    {
+        return -1;
+    }
+    // The asm kernels take no sink, so d_sink would be left unwritten.
+    if(a.sink_ptr != nullptr || a.d_sink_ptr != nullptr)
+    {
+        return -1;
+    }
+    // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
+    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  These 7-GEMM (g7) kernels run
+    // dK/dV workgroups (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in
+    // one dispatch and write dq / dk / dv once, without atomics, so they are atomic32 = 0 rows
+    // without dq_acc or post kernel.  They write dq with q's strides, whose batch stride only
+    // matters in batch mode with batch > 1.  Other hdim_q 192 calls keep the requested kernels:
+    // psskddv for a32 at hdim_v 192, none for a16, the g7 rows being the only atomic32 = 0
+    // hdim_q 192 ones.
+    const bool gfx942_g7_hd192 =
+        arch_id == "gfx942" && a.hdim_q == 192 && (a.hdim_v == 192 || a.hdim_v == 128) &&
+        a.stride_dq == a.stride_q && a.nhead_stride_dq == a.nhead_stride_q &&
+        (a.is_group_mode || a.batch == 1 || a.batch_stride_dq == a.batch_stride_q);
+    if(gfx942_g7_hd192)
+    {
+        a.v3_atomic_fp32 = false;
+    }
+    else if(arch_id == "gfx942" && a.hdim_q == 192 && !a.v3_atomic_fp32)
     {
         return -1;
     }
@@ -285,7 +310,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // 0: no mask
     // 1: top-left triangular
     // 2: bottom-right triangular
-    // 3: window mask
+    // 3: window mask (top-left window on gfx950)
+    // 4: bottom-right window mask (gfx950 only)
     // -1: unsupported (e.g., ck generic mask)
     auto asm_mask_type = [&]() {
         if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::no_mask))
@@ -308,6 +334,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             else if(a.window_size_left == -1 && a.window_size_right == -1)
             {
                 return 0;
+            }
+            else if(arch_id == "gfx950" &&
+                    a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_bottom_right))
+            {
+                return 4;
             }
             else
             {
@@ -346,7 +377,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }();
 
     bool need_post_processing =
-        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || (arch_id == "gfx1250");
+        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || ((arch_id == "gfx1250" || arch_id == "gfx1250-strict"));
 
     int mt = asm_mask_type();
 
@@ -355,23 +386,25 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
-    // gfx950 hd256: non-causal only, no GQA/MQA
-    if(arch_id == "gfx950" && a.hdim_q == 256 && (mt != 0 || a.nhead_q != a.nhead_k))
+    // gfx950 hd256: non-causal and bottom-right causal only
+    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0 && mt != 2)
     {
         return -1;
     }
-    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
-    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // On gfx942, the a16 (atomic32=0) hd64 / hd128 kernels have no mask_type=2 (bottom-right
+    // causal), only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
-    // existing a16 causal kernels.
+    // existing a16 causal kernels. Group mode is left out: there a batch's seqlen_q and
+    // seqlen_k can differ.
     // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
-    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && !a.is_group_mode &&
+       a.seqlen_q == a.seqlen_k)
     {
         mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
     }
     // gfx1250 only has bottom-right causal kernels, so the same equivalence runs the other way.
     // Group mode is left out: there a batch's seqlen_q and seqlen_k can differ.
-    if(arch_id == "gfx1250" && mt == 1 && !a.is_group_mode && a.seqlen_q == a.seqlen_k)
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict") && mt == 1 && !a.is_group_mode && a.seqlen_q == a.seqlen_k)
     {
         mt = 2;  // top-left → bottom-right (equivalent when sq == sk)
     }
@@ -398,7 +431,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     if(need_post_processing && (post_kernel == ""))
     {
         // gfx1250 dqdkdv only ever writes dq_acc, so dq is unusable without dq_convert.
-        if(arch_id == "gfx1250")
+        if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
         {
             return -1;
         }
@@ -484,14 +517,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
     odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
+    odo_args.head_dim        = a.hdim_v;
     odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
     odo_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
         arg_size = sizeof(odo_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
@@ -520,7 +553,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     size_t dq_acc_plane        = 0; // bytes, also the stride between deterministic planes
     uint32_t nsplit            = 1;
 
-    if(need_post_processing && arch_id == "gfx1250")
+    if(need_post_processing && (arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         constexpr size_t kTileRows = 32;
         dq_acc_rows         = a.is_group_mode ? a.seqlen_q + kTileRows * a.batch
@@ -556,6 +589,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                 // Planes are the only parallelism left along kv, so aim at one workgroup per CU.
                 const uint32_t wg_per_plane = a.batch * a.nhead_q;
                 want = (get_num_cu_func() + wg_per_plane - 1) / wg_per_plane;
+                // A causal dqdkdv saturates at half the planes while dq_convert still folds
+                // every one of them, so a split capped by the kv blocks is halved. Below 16
+                // planes the fold is at its launch floor and the cap is kept.
+                if(mt != 0 && want >= kv_blocks && kv_blocks >= 16)
+                    want = (kv_blocks + 1) / 2;
             }
             nsplit = std::clamp(want, 1u, std::max(kv_blocks, 1u));
         }
@@ -584,6 +622,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dq_acc_ptr = a.workspace_alloc(dq_acc_bytes, /*zero_init=*/true);
     }
 
+    uint32_t gqa_ratio = a.nhead_q/a.nhead_k;
+    uint32_t gqa_ratio_magic_const = gqa_ratio > 1 ? (uint32_t)(((1ULL << 32) + gqa_ratio - 1) / gqa_ratio) : 0;
+
     fmha_bwd_dqdkdv_args dqdkdv_args{};
     dqdkdv_args.ptr_dq     = need_post_processing ? dq_acc_ptr : a.dq_ptr;
     dqdkdv_args.ptr_dk     = a.dk_ptr;
@@ -596,9 +637,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.ptr_d      = a.d_ptr;
     dqdkdv_args.scalar     = a.scale;
     dqdkdv_args.log2e      = ck_tile::log2e_v<float>;
-    dqdkdv_args.ratio      = a.nhead_q / a.nhead_k;
+    dqdkdv_args.ratio      = gqa_ratio;
     dqdkdv_args.seqlen_q   = a.seqlen_q;
-    dqdkdv_args.seqlen_k   = a.seqlen_k;
+    dqdkdv_args.seqlen_k   = a.is_group_mode ? a.max_seqlen_k : a.seqlen_k;
     dqdkdv_args.head_dim_q = a.hdim_q;
     dqdkdv_args.head_dim_v = a.hdim_v;
     dqdkdv_args.nhead_q    = a.nhead_q;
@@ -622,6 +663,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.BAs_dv     = a.batch_stride_dv * 2;
     dqdkdv_args.Seqs_dv    = a.stride_dv * 2;
     dqdkdv_args.Hs_lsed    = a.nhead_stride_lsed * 4;
+    dqdkdv_args.gqa_ratio_magic_const = gqa_ratio_magic_const;
 
     if(a.cu_seqlen_k_ptr && a.seqstart_k_ptr)
     {
@@ -645,14 +687,21 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dqdkdv_args.ptr_qseq_padded = a.seqstart_q_ptr;
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         dqdkdv_args.max_seqlen_dq = dq_acc_rows;
         dqdkdv_args.nsplit        = a.is_deterministic ? nsplit : 0;
         dqdkdv_args.split_stride  = a.is_deterministic ? dq_acc_plane : 0;
     }
 
-    if(mt == 3)
+    if(arch_id == "gfx950" && (mt == 3 || mt == 4))
+    {
+        // the gfx950 window kernels take the FA style left/right (negative is unbounded) and
+        // align the window to each batch themselves
+        dqdkdv_args.mask_y = a.window_size_left;
+        dqdkdv_args.mask_x = a.window_size_right;
+    }
+    else if(mt == 3)
     {
 #if !ENABLE_CK
         bool is_top_left = (a.mask_type == static_cast<int>(mask_enum::mask_top_left) ||
@@ -677,11 +726,17 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
+    if(gfx942_g7_hd192 && a.is_group_mode)
+    { // the g7 kernels size their job lists from seqlen_q / seqlen_k
+        dqdkdv_args.seqlen_q = a.max_seqlen_q;
+        dqdkdv_args.seqlen_k = a.max_seqlen_k;
+    }
+
     auto dqdkdv_kernel_launch = [&]() {
         arg_size = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q == 256 ? 512 : 256);
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : (a.hdim_q == 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
-        if (a.hdim_q == 256) {
+        if (arch_id == "gfx950" && a.hdim_q == 256) {
             int gdx_q = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
             gdx = std::max(gdx, gdx_q);
         }
@@ -692,9 +747,24 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         { // each workgroup walks its own share of the kv blocks
             gdx = nsplit;
         }
-        else if((mt == 1) || (mt == 2))
+        else if(((mt == 1) || (mt == 2)) && !(arch_id == "gfx950" && a.hdim_q == 256))
         { // mask kb
             gdx = (gdx + 1) / 2;
+        }
+        if(gfx942_g7_hd192)
+        { // ceil(max_seqlen_k / 128) dK/dV + ceil(max_seqlen_q / 128) dQ ranks per (head, batch).
+          // Rank-major (nhead_q, batch, ranks) hands the longest jobs out first.  Once one batch
+          // alone fills the GPU, batch-major (nhead_q * ranks, batch, 1) keeps the running
+          // workgroups on a few sequences whose Q / K / V / dO stay in L2 / MALL.  The kernel
+          // reads either as head = x % nhead_q, rank = z + x / nhead_q (fp32, exact below 2^22).
+            const int ranks =
+                (a.max_seqlen_k + ts_kv - 1) / ts_kv + (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+            const bool batch_major = a.batch > 1 &&
+                                     4 * a.nhead_q * ranks >= 5 * get_num_cu_func() &&
+                                     a.nhead_q * ranks < (1 << 22);
+            gdx = batch_major ? a.nhead_q * ranks : a.nhead_q;
+            gdy = a.batch;
+            gdz = batch_major ? 1 : ranks;
         }
 
         impl_ptr_dqdkdv->launch_kernel(
@@ -724,7 +794,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     post_args.ptr_qseq_padded = a.seqstart_q_ptr;
     post_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         post_args.max_seqlen_dq = a.max_seqlen_q;
         post_args.nsplit        = a.is_deterministic ? nsplit : 0;
@@ -733,7 +803,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto post_kernel_launch = [&]() {
         arg_size = sizeof(post_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
         int gdz = a.batch;

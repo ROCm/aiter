@@ -123,7 +123,7 @@ def pa_prefill_sparse(
         assert (
             out.is_contiguous()
         ), f"out must be contiguous, got strides {out.stride()}"
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         if not q.is_cuda:
             raise RuntimeError("pa_prefill_sparse requires CUDA/HIP tensors")
         if q.dtype not in (torch.bfloat16, torch.float16):

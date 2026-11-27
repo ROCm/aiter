@@ -19,12 +19,19 @@ the MoE replay this one runs in a process of its own, started with
 ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
 ``GPU_ARCHS`` names targets without gfx950.
 
+The instance builds every route its plan has (the staged path, and the small-
+and large-input kernels where the layout and MTPR support them), and
+``preload_aot_bundles()`` loads the kernels of all of them.
+
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, DeepSeek-V4.1-Flash EP4, EP2 and EP8)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
     python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192
+
+    # Check that a cache holds every kernel of the same jobs (compiles nothing)
+    python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192 --check
 """
 
 from __future__ import annotations
@@ -71,6 +78,22 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
+# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
+# the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
+# (128: staged + small-input 256) and prefill (8192 and 16384: staged +
+# small-input + large-input; the EP4 large-input route exists only there).
+V41_FLASH_WORLD_SIZE = 4
+V41_FLASH_EXPERTS_PER_RANKS = (96,)
+V41_FLASH_MODEL_DIM = 5120
+V41_FLASH_INTER_DIM = 2304
+V41_FLASH_MTPRS = (128, 8192, 16384)
+V41_FLASH_QUANTS = ("a8w4",)
+# DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
+V41_FLASH_EP2_WORLD_SIZE = 2
+V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
+# DeepSeek-V4.1-Flash EP8 deployment profile (epr48, the EP4 shape and MTPRs).
+V41_FLASH_EP8_WORLD_SIZE = 8
+V41_FLASH_EP8_EXPERTS_PER_RANKS = (48,)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -135,10 +158,12 @@ def production_jobs(
     quants=DEFAULT_QUANTS,
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
+    v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
+    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
 
-    Used by the default build so both profiles are AOT-covered and neither
+    Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
     """
     jobs = default_jobs(
@@ -157,6 +182,20 @@ def production_jobs(
         situ_beta=K3_SITU_BETA,
         situ_linear_beta=K3_SITU_LINEAR_BETA,
     )
+    for flash_world_size, flash_experts_per_ranks in (
+        (V41_FLASH_WORLD_SIZE, V41_FLASH_EXPERTS_PER_RANKS),
+        (V41_FLASH_EP2_WORLD_SIZE, V41_FLASH_EP2_EXPERTS_PER_RANKS),
+        (V41_FLASH_EP8_WORLD_SIZE, V41_FLASH_EP8_EXPERTS_PER_RANKS),
+    ):
+        jobs += default_jobs(
+            v41_flash_mtprs,
+            flash_experts_per_ranks,
+            quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
+            world_size=flash_world_size,
+            model_dim=V41_FLASH_MODEL_DIM,
+            inter_dim=V41_FLASH_INTER_DIM,
+            swiglu_limit=swiglu_limit,
+        )
     return jobs
 
 
@@ -225,7 +264,10 @@ def compile_one_config(**job):
     started = time.time()
     try:
         device = torch.device("cuda", job["rank"])
-        with dry_run(ARCH, NUM_CU, name=DEVICE_NAME), _fake_shmem(device):
+        with (
+            dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
+            _fake_shmem(device),
+        ):
             # Imported only now: without mori, its stand-in must be in place.
             from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
@@ -242,11 +284,12 @@ def compile_one_config(**job):
                 act=job["act"],
                 situ_beta=job["situ_beta"],
                 situ_linear_beta=job["situ_linear_beta"],
+                routed=True,
                 **_weights(job, device),
             )
             moe.preload_aot_bundles()
-            # preload_aot_bundles() leaves out quantize(), which fixed-slot
-            # forward and the per-stage benchmarks call.
+            # preload_aot_bundles() leaves out the input quant kernel, which
+            # fixed-slot forward, quantize() and the per-stage benchmarks launch.
             moe.quantize(
                 torch.empty((2, job["model_dim"]), dtype=torch.bfloat16, device=device)
             )
@@ -293,7 +336,15 @@ def main():
         choices=DEFAULT_QUANTS,
         default=list(DEFAULT_QUANTS),
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compile nothing; fail on any kernel the replay needs but the cache lacks",
+    )
     args = parser.parse_args()
+    if args.check:
+        # Every launch the replay reaches must load from the cache instead of compiling.
+        os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
     if os.environ.get("AITER_AOT_REPLAY") != "1":
         raise SystemExit(run(sys.argv[1:]))
     check_replay_process(ARCH)
@@ -304,12 +355,15 @@ def main():
         and args.inter_dim == INTER_DIM
     )
     if default_shape:
-        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
+        # Default build ships V4-Pro, Kimi-K3 and V4.1-Flash EP4 / EP2 / EP8 so none
+        # JITs online. An explicit --mtpr applies to the V4.1-Flash profiles as well.
+        default_mtprs = list(args.mtpr) == list(DEFAULT_MTPRS)
         jobs = production_jobs(
             tuple(args.mtpr),
             quants=tuple(args.quant),
             world_size=args.world_size,
             swiglu_limit=args.swiglu_limit,
+            v41_flash_mtprs=V41_FLASH_MTPRS if default_mtprs else tuple(args.mtpr),
         )
     else:
         jobs = default_jobs(
@@ -328,7 +382,8 @@ def main():
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(
-        f"[aiter] FlyDSL MegaMoE replay: {len(results) - failed} ok, {failed} failed",
+        f"[aiter] FlyDSL MegaMoE {'cache check' if args.check else 'replay'}: "
+        f"{len(results) - failed} ok, {failed} failed",
         flush=True,
     )
     raise SystemExit(1 if failed else 0)

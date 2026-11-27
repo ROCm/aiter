@@ -286,7 +286,7 @@ def _select_nm_kernel(arch, q_type, kv_type, gqa_ratio, max_seqlen_q):
         )
     )
     csv_gqa, csv_qseqlen = gqa_ratio, max_seqlen_q
-    if arch != "gfx1250" and supported:
+    if arch not in ("gfx1250", "gfx1250-strict") and supported:
         csv_gqa, csv_qseqlen = 64, 1
     cfg = _get_heuristic_kernel(arch, q_type, kv_type, csv_gqa, 0, 0, 0, csv_qseqlen, 0)
     if "sub_Q" in cfg:
@@ -349,7 +349,7 @@ def mla_decode_v4_asm_eager(
     del softmax_scale  # kernel hardcodes 1/sqrt(512)
     dev = Q.device.index
     runtime_gfx, warp_size = _device_info(dev)
-    preload = runtime_gfx == "gfx1250"
+    preload = runtime_gfx in ("gfx1250", "gfx1250-strict")
 
     out_16_nosplit = 1 if int(num_kv_splits) == 1 else 0
     if sink is None or sink.data_ptr() == 0:
@@ -698,7 +698,7 @@ def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
 
 
 def _fused_eligible(arch, Q, KV, max_seqlen_q, num_kv_splits):
-    if arch != "gfx1250":
+    if arch not in ("gfx1250", "gfx1250-strict"):
         return False
     nsplit = int(num_kv_splits)
     if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):

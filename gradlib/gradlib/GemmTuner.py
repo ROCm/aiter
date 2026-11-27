@@ -156,8 +156,12 @@ class Gemm:
         verbose=False,
         rtol=None,
         atol=None,
+        policy=None,
     ):
+        from aiter.utility.selection_policy import active_policy
+
         torch.cuda.empty_cache()
+        self.policy = active_policy() if policy is None else policy
         self.m = m
         self.k = k
         self.n = n
@@ -303,6 +307,7 @@ class Gemm:
             fast_mode == 1,
             timeout=self.timeout,
             verbose=self.verbose,
+            policy=self.policy,
         )
         if fast_mode == 1:
             self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
@@ -360,6 +365,9 @@ class Gemm:
 
     def run_solutions(self):
         self.run_fast_solutions()
+        # The fast screen keeps only topn by latency. A power winner can sit
+        # outside that window, so the accurate pass has to time every solution.
+        self.topn = self.policy.accurate_count(self.topn, len(self.hipb_sols))
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
@@ -705,6 +713,7 @@ class GemmTuner(GemmCommonTuner):
                 num_warmup=self.num_warmup,
                 timeout=args.timeout,
                 verbose=args.verbose,
+                policy=self.policy_for(args),
             )
 
             ret.extend(gemmobj.run_solutions())
@@ -716,8 +725,10 @@ class GemmTuner(GemmCommonTuner):
         return ret
 
     def processResult(self, rets, fast_mode):
+        columns = list(self.columns)
         results = []
-        for info, us, err_ratio in rets:
+        for el in rets:
+            info, us, err_ratio = el
             res_one = []
             solidx = info[1]
             splitK = info[2]
@@ -746,19 +757,26 @@ class GemmTuner(GemmCommonTuner):
             )
             res_one.append(tflops)
             res_one.append(bw)
+            extra, _watt_text = self.policy.result_metrics(el, tflops)
+            for name, values in extra.items():
+                if name not in columns:
+                    columns.append(name)
+                res_one.extend(values)
 
             results.append(res_one)
-        gtimedf = pd.DataFrame(results, columns=self.columns)
-        gtimedf = gtimedf.sort_values(by="us")
+        gtimedf = pd.DataFrame(results, columns=columns)
+        gtimedf = self.policy.sort_frame(gtimedf)
         return gtimedf
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         from collections import defaultdict
 
+        policy = self.policy_for(args)
         grouped_rets = defaultdict(list)
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info, us, max_err_ratio))
+        for el in rets:
+            info, _us, _max_err_ratio = el
+            grouped_rets[info[0]].append(el)
 
         grouped_results = list(grouped_rets.items())
         gtimedf_dic = {}
@@ -770,6 +788,7 @@ class GemmTuner(GemmCommonTuner):
                 gtimedf_dic.values(),
                 ignore_index=True,
             )
+            resultsdf = self.power_metrics(resultsdf)
         else:
             resultsdf = pd.DataFrame(self.columns)
         self.save_profile(resultsdf, args.profile_file)
@@ -777,7 +796,7 @@ class GemmTuner(GemmCommonTuner):
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():
             gtimedf_dic[key] = df[df["err_ratio"] < args.errRatio]
-            best_gtimedf = gtimedf_dic[key].sort_values(by="us")
+            best_gtimedf = policy.sort_frame(gtimedf_dic[key])
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No valid hipblaslt solutions found!", flush=True)
@@ -792,7 +811,10 @@ class GemmTuner(GemmCommonTuner):
             else:
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
-            print(f"{key} >>> Fastest Solution is \n {resultdf1}", flush=True)
+            print(
+                f"{key} >>> selected ({policy.name}) solution is \n {resultdf1}",
+                flush=True,
+            )
         return best_gtimedfs
 
     def save_profile(self, timedf, profile_file):

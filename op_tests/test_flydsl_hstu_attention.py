@@ -10,6 +10,7 @@ import itertools
 import pandas as pd
 import pytest
 import torch
+from flydsl.runtime.device import get_rocm_arch
 
 import aiter
 import aiter.ops.flydsl.hstu_attention as hstu_kernels
@@ -445,7 +446,7 @@ def test_validate_inputs_rejects_num_targets_length_mismatch():
 
 def _row(**overrides) -> dict:
     row = {
-        "arch": hstu_kernels._GPU_ARCH,
+        "arch": get_rocm_arch(),
         "dtype": "bf16",
         "num_heads": 4,
         "head_dim": 128,

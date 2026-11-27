@@ -68,14 +68,7 @@ static inline bool is_cdna_arch()
 }
 
 // The tensor engine the payload staging below rides on is gfx1250-only.
-static inline bool has_tdm_arch() { return get_gpu_arch() == "gfx1250"; }
-
-static constexpr MxDtype kHwFp8E4m3 =
-#if defined(__gfx942__)
-    MxDtype::FP8_E4M3_FNUZ;
-#else
-    MxDtype::FP8_E4M3;
-#endif
+static inline bool has_tdm_arch() { return (get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"); }
 
 template <int N>
 using ic = std::integral_constant<int, N>;
@@ -151,7 +144,7 @@ __device__ __forceinline__ float group_reduce_max_dpp(float v)
 // of them, which is what keeps the 2-element slice on the general path.
 template <int N>
 inline constexpr bool kHwScaledFp8 =
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     (N % 8) == 0;
 #elif defined(__gfx950__)
     (N % 4) == 0;
@@ -164,7 +157,7 @@ __device__ __forceinline__ opus::vector_t<opus::fp8_t, N>
     scaled_cast_fp8_hw(const float (&v)[N], float dq_scale)
 {
     opus::vector_t<opus::fp8_t, N> out;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     using f32x8 = float __attribute__((ext_vector_type(8)));
     using u32x2 = unsigned int __attribute__((ext_vector_type(2)));
 #pragma unroll
@@ -204,7 +197,7 @@ __device__ __forceinline__ opus::vector_t<opus::fp8_t, N>
 // widened values and so keeps the general path.
 template <typename scalar_t, int N>
 inline constexpr bool kNativeQuant =
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     (N % 8) == 0 && (std::is_same_v<scalar_t, opus::bf16_t> ||
                      std::is_same_v<scalar_t, opus::fp16_t>);
 #else
@@ -280,7 +273,7 @@ __device__ __forceinline__ opus::vector_t<opus::fp8_t, N>
     scaled_cast_fp8_native(const opus::vector_t<scalar_t, N>& v, float dq_scale)
 {
     opus::vector_t<opus::fp8_t, N> out;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     using bf16x8 = __bf16 __attribute__((ext_vector_type(8)));
     using fp16x8 = _Float16 __attribute__((ext_vector_type(8)));
     using u32x2  = unsigned int __attribute__((ext_vector_type(2)));
@@ -602,7 +595,7 @@ __global__ void inverse_rope_group_quant_kernel(
     // give the wave that many requests in flight for latency hiding.
     vec_i in_vec[K_PER_THREAD];
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // Prefetch each pass as one TDM tile into LDS.
     //   untiered   dim0 = slots*GS,        dim1 = 1
     //   run 4      dim0 = 4*GS,            dim1 = slots/4
@@ -895,7 +888,7 @@ __global__ void inverse_rope_group_quant_kernel(
             group_of(k, slot0 + k * k_pass_stride, segment_of_pass(k));
         const int d_base = k_group * GROUP_SIZE + group_elem_base;
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr(kTdmOk)
         {
             // Undo the tile layout: the slot's run picks the row, its position
@@ -950,7 +943,7 @@ __global__ void inverse_rope_group_quant_kernel(
                     fmaxf(native_amax, aiter::kAmaxFloor));
                 const E8m0BlockScale s8 =
                     fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp,
-                                               kHwFp8E4m3>(amax);
+                                               kHwFp8MxDtype>(amax);
                 store_scale(k_group, s8.byte);
                 store_vector<opus::fp8_t, opus::fp8_t, THREAD_DATA_SIZE, 0, false,
                              WARP_SIZE, 1, opus::fp8_t>(
@@ -1115,7 +1108,7 @@ __global__ void inverse_rope_group_quant_kernel(
 
         // --- E8M0 block scale ---
         const E8m0BlockScale s8 =
-            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kHwFp8E4m3>(amax);
+            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kHwFp8MxDtype>(amax);
         store_scale(k_group, s8.byte);
 
         // --- Quantize and store ---

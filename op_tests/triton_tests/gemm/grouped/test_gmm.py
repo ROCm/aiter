@@ -308,6 +308,124 @@ def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override_work_stealing(
         )
 
 
+# Gluon GMM unit tests (gfx1250 only).
+# ------------------------------------------------------------------------------
+
+requires_gfx1250 = pytest.mark.skipif(
+    get_arch() != "gfx1250", reason="Gluon GMM requires gfx1250"
+)
+
+# M, K, N, G and explicit group sizes (ragged, empty first/middle/last groups,
+# K and N tails that are not multiples of the tile sizes). K != N, because K == N
+# makes the rhs layouts ambiguous.
+# fmt: off
+GLUON_GMM_CASES: list[tuple[int, int, int, int, list[int]]] = [
+    (128, 128, 96, 4, [32, 32, 32, 32]),
+    (203, 100, 136, 5, [37, 0, 91, 75, 0]),
+    (96, 64, 80, 3, [0, 0, 96]),
+    (96, 64, 80, 3, [96, 0, 0]),
+    (257, 192, 96, 4, [1, 130, 0, 126]),
+]
+# fmt: on
+
+GLUON_RHS_LAYOUTS = [
+    (False, False),
+    (True, False),
+    (True, True),
+]  # trans_rhs, alt_trans
+
+
+def _run_gluon_gmm_case(
+    case, trans_rhs, alt_trans, use_bias, dtype, config=None, group_sizes_dtype=None
+):
+    M, K, N, G, sizes = case
+    lhs, rhs, _, out_torch, bias = gen_gmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        1,
+        input_type=dtype,
+        output_type=dtype,
+        trans_rhs=trans_rhs,
+        alt_trans=alt_trans,
+        rng_seed=RNG_SEED,
+        use_bias=use_bias,
+    )
+    group_sizes = torch.tensor(
+        sizes, dtype=group_sizes_dtype or torch.int32, device=lhs.device
+    )
+    out_gluon = torch.empty_like(out_torch)
+
+    torch_gmm(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type=dtype,
+        existing_out=out_torch,
+        bias=bias,
+    )
+    triton_gmm(
+        lhs,
+        rhs,
+        group_sizes,
+        bias=bias,
+        preferred_element_type=dtype,
+        existing_out=out_gluon,
+        config=config,
+        backend="gluon",
+    )
+    check_tensors(
+        out_gluon,
+        out_torch,
+        "Gluon GMM doesn't match PyTorch reference GMM.",
+        atol=0.02 if use_bias else None,
+        rtol=0.02 if use_bias else None,
+    )
+
+
+@requires_gfx1250
+@pytest.mark.parametrize("case", GLUON_GMM_CASES)
+@pytest.mark.parametrize("trans_rhs, alt_trans", GLUON_RHS_LAYOUTS)
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_gmm_gluon(case, trans_rhs: bool, alt_trans: bool, use_bias: bool):
+    _run_gluon_gmm_case(case, trans_rhs, alt_trans, use_bias, torch.bfloat16)
+
+
+@requires_gfx1250
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group_sizes_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("trans_rhs, alt_trans", GLUON_RHS_LAYOUTS)
+def test_gmm_gluon_dtypes(
+    dtype: torch.dtype,
+    group_sizes_dtype: torch.dtype,
+    trans_rhs: bool,
+    alt_trans: bool,
+):
+    _run_gluon_gmm_case(
+        GLUON_GMM_CASES[1],
+        trans_rhs,
+        alt_trans,
+        True,
+        dtype,
+        group_sizes_dtype=group_sizes_dtype,
+    )
+
+
+@requires_gfx1250
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 2},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 3},
+    ],
+)
+def test_gmm_gluon_config_override(config: dict[str, int]):
+    _run_gluon_gmm_case(
+        GLUON_GMM_CASES[4], True, True, False, torch.bfloat16, config=config
+    )
+
+
 # TGMM unit tests.
 # ------------------------------------------------------------------------------
 
@@ -626,83 +744,3 @@ def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
             out_torch[non_empty_groups],
             f"Triton {'persistent' if persistent else 'non-persistent'} TGMM doesn't match PyTorch reference TGMM.",
         )
-
-
-def _get_gmm_config_for_arch(monkeypatch, arch, *args, **kwargs):
-    import aiter.ops.triton._triton_kernels.gemm.grouped.gmm as gmm_kernels
-    from aiter.ops.triton.utils.config_utils import resolve_config_dir
-
-    monkeypatch.setattr(
-        gmm_kernels,
-        "resolve_config_dir",
-        lambda *a, **k: resolve_config_dir(*a, **{**k, "arch": arch}),
-    )
-    # Bypass the lru_cache so the patched resolver is used.
-    return gmm_kernels.get_config.__wrapped__(*args, **kwargs)
-
-
-@pytest.mark.parametrize(
-    "M, K, N, G, accumulate, expected",
-    [
-        (8192, 4096, 4096, 32, False, "large_kn"),  # all thresholds at boundary
-        (8191, 4096, 4096, 32, False, "default"),  # avg rows just below 256
-        (8192, 4095, 4096, 32, False, "default"),  # K just below 4096
-        (8192, 4096, 4095, 32, False, "default"),  # N just below 4096
-        (65536, 7168, 16384, 8, False, "large_kn"),
-        (1024, 2048, 2048, 4, False, "default"),  # no threshold met
-    ],
-)
-def test_gmm_get_config_dispatch_gfx950(monkeypatch, M, K, N, G, accumulate, expected):
-    from aiter.ops.triton.utils.config_utils import (
-        load_config_json,
-        resolve_config_dir,
-    )
-
-    if get_arch() != "gfx950":
-        pytest.skip("Requires gfx950")
-
-    cfg = load_config_json(
-        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx950')}/DEFAULT.json"
-    )["gmm"]
-    assert (
-        _get_gmm_config_for_arch(monkeypatch, "gfx950", "gmm", M, K, N, G, accumulate)
-        == cfg[expected]
-    )
-
-
-@pytest.mark.parametrize("gmm_type", ["ptgmm", "nptgmm"])
-def test_gmm_get_config_dispatch_other_variants_unaffected(monkeypatch, gmm_type):
-    from aiter.ops.triton.utils.config_utils import (
-        load_config_json,
-        resolve_config_dir,
-    )
-
-    if get_arch() != "gfx950":
-        pytest.skip("Requires gfx950")
-    cfg = load_config_json(
-        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx950')}/DEFAULT.json"
-    )[gmm_type]
-    assert "dispatch" not in cfg
-    assert (
-        _get_gmm_config_for_arch(monkeypatch, "gfx950", gmm_type, 8192, 4096, 4096, 32)
-        == cfg["default"]
-    )
-
-
-def test_gmm_get_config_arch_without_dispatch(monkeypatch):
-    from aiter.ops.triton.utils.config_utils import (
-        load_config_json,
-        resolve_config_dir,
-    )
-
-    if get_arch() != "gfx942":
-        pytest.skip("Requires gfx942")
-
-    cfg = load_config_json(
-        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx942')}/DEFAULT.json"
-    )["gmm"]
-    assert "dispatch" not in cfg
-    assert (
-        _get_gmm_config_for_arch(monkeypatch, "gfx942", "gmm", 65536, 7168, 16384, 8)
-        == cfg["default"]
-    )

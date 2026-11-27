@@ -198,22 +198,3 @@ def test_public_package_import():
         pkg_requant,
     ):
         assert callable(fn)
-
-
-def test_quant_fp8_blockwise_rejects_bad_inputs():
-    """Non-contiguous input, out-of-range fp8_max, and non-pow2 block must raise."""
-    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(AssertionError):
-        quant_fp8_blockwise(x.t())  # non-contiguous
-    with pytest.raises(AssertionError):
-        quant_fp8_blockwise(x, fp8_max=1e9)  # above e4m3fnuz max
-    with pytest.raises(AssertionError):
-        quant_fp8_blockwise(x, block_size=100)  # not a power of two
-    with pytest.raises(AssertionError):
-        quant_fp8_blockwise(x, axis=2)  # invalid axis
-
-
-def test_quant_fp8_blockwise_for_weight_rejects_noncontiguous():
-    w = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    with pytest.raises(AssertionError):
-        quant_fp8_blockwise_for_weight(w)

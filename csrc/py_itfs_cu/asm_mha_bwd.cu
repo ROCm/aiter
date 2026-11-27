@@ -249,7 +249,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 false,  // use_dbias
                                 false,  // has_dropout
                                 false,  // store_randval
-                                false,  // deterministic
+                                deterministic,
 
                                 q.data_ptr(),
                                 k.data_ptr(),
