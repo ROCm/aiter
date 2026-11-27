@@ -397,13 +397,19 @@ def block_scale_storage(
     row of a tile, plus any producer lookahead, so the final tiles read past the
     logical sequence. Keep those reads inside mapped, zeroed memory without
     changing the tensor's logical shape or strides.
+
+    The view is taken over the whole allocation rather than a slice of it: torch.compile cuts a
+    slice that is written through down to the slice's own size, dropping the slack.
     """
     elements = batch * sequence * heads * blocks
     padded = -(-sequence // tile_rows) * tile_rows + lookahead_rows
     slack = (padded - sequence) * heads * blocks + extra
     storage = input.new_empty((elements + slack,), dtype=torch.uint8)
     storage[elements:].zero_()
-    return storage[:elements].view(batch, sequence, heads, blocks)
+    return storage.as_strided(
+        (batch, sequence, heads, blocks),
+        (sequence * heads * blocks, heads * blocks, blocks, 1),
+    )
 
 
 def query_block_scale(

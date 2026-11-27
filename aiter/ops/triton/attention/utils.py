@@ -428,19 +428,30 @@ _SOL_ATTN_SCALE_ROW_TILE = SOL_ATTN_TS_KV
 
 
 def _sol_attn_pad_scale_rows(scale: torch.Tensor) -> torch.Tensor:
-    """`scale` as a contiguous view over an allocation zeroed up to a whole scale-row tile.
+    """A contiguous copy of a pooled E8M0 scale, backed by zeroed rows past its end.
 
     The rows past the last pooled block are read but never used, so their value only has to be
-    finite: E8M0 0 is 2^-127, where uninitialized bytes can decode to inf. Only the tail past the
-    last batch is padded, so the view keeps `scale`'s own strides.
+    finite: E8M0 0 is 2^-127, where uninitialized bytes can decode to inf. The Sol rows read the
+    scale a whole scale-row tile at a time, the 64x64 MXFP8 row reads on into the producer's
+    lookahead rows past that tile, and the MXFP4 K reader runs the producer's slack past those, so
+    the backing covers all three. Only the tail past the last batch is padded, so the copy keeps
+    `scale`'s contiguous strides.
     """
-    pad = (-scale.shape[1] % _SOL_ATTN_SCALE_ROW_TILE) * scale[0, 0].numel()
-    if pad == 0:
-        return scale
-    size = scale.numel()
-    storage = scale.new_zeros(size + pad)
-    storage[:size].copy_(scale.reshape(-1))
-    return storage[:size].view(scale.shape)
+    from aiter.ops.mha_v4_quant import (
+        MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+        block_scale_storage,
+    )
+
+    backed = block_scale_storage(
+        scale,
+        *scale.shape,
+        _SOL_ATTN_SCALE_ROW_TILE,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    backed.copy_(scale)
+    return backed
 
 
 def _e2m3_decode(code: torch.Tensor) -> torch.Tensor:
