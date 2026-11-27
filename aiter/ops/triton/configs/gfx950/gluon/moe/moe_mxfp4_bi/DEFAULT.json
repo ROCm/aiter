@@ -1,0 +1,71 @@
+{
+    "block_m": {
+        "block_m_small": 16,
+        "block_m_large": 64,
+        "rows_small": 28,
+        "token_block": 16384
+    },
+    "gemm": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "gu_bm16": {
+        "block_n": 64,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "num_buffers": 2,
+        "n_first": true,
+        "w_swz": true
+    },
+    "gu_bm64": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "num_buffers": 2,
+        "n_first": true,
+        "w_swz": true
+    },
+    "w2_bm16": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "num_buffers": 2,
+        "n_first": true,
+        "mma_k": 128,
+        "w_swz": true,
+        "zero_rows": 16
+    },
+    "w2_bm64": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "num_buffers": 3,
+        "n_first": true,
+        "w_swz": true,
+        "zero_rows": 16
+    },
+    "route": {
+        "bs": 128,
+        "blk": 512,
+        "max_slots_one_program": 512,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "combine": {
+        "bh": 256,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "tree8": {
+        "br": 8,
+        "bn": 512,
+        "num_warps": 4,
+        "num_stages": 1
+    }
+}

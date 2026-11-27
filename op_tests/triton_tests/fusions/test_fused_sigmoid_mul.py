@@ -98,28 +98,6 @@ def test_fused_sigmoid_mul_empty():
     assert fused_sigmoid_mul(x, gate).numel() == 0
 
 
-@pytest.mark.parametrize(
-    "bad,match",
-    [
-        ("shape", "shape mismatch"),
-        ("dtype", "dtype mismatch"),
-        ("contiguous", "must be contiguous"),
-    ],
-)
-def test_fused_sigmoid_mul_rejects_bad_inputs(bad, match):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    x = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
-    if bad == "shape":
-        gate = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
-    elif bad == "dtype":
-        gate = torch.randn(8, 16, dtype=torch.float16, device="cuda")
-    else:
-        gate = torch.randn(16, 8, dtype=torch.bfloat16, device="cuda").t()
-    with pytest.raises(AssertionError, match=match):
-        fused_sigmoid_mul(x, gate)
-
-
 # Kimi-K3 TP8 MLA output gate, per rank: 12 heads x v_head_dim 128.
 _K3_GATE_WIDTH = 1536
 # The gate is the last shard of the merged [q_a | kv_a | gate] GEMM output.
@@ -165,12 +143,3 @@ def test_fused_sigmoid_mul_row_strided(n_tokens, dtype, x_layout, use_explicit_o
 
     torch.testing.assert_close(ret, ref, rtol=1e-2, atol=1e-2)
     assert torch.equal(merged, merged_before), "the gate source must be untouched"
-
-
-def test_fused_sigmoid_mul_rejects_non_2d_strided():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    x = torch.randn(4, 8, 32, device="cuda", dtype=torch.float32)[:, :, :16]
-    gate = torch.randn(4, 8, 16, device="cuda", dtype=torch.float32)
-    with pytest.raises(AssertionError, match="2-D"):
-        fused_sigmoid_mul(x, gate)

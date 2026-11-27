@@ -13,7 +13,7 @@ from aiter.ops.triton.conv._launch import (
     _launch_3x3_nhwc,
     _launch_general,
     _launch_winograd_f4x3,
-    _prepare_conv2d_padding,
+    _prepare_conv_padding,
 )
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack,
@@ -34,7 +34,7 @@ from aiter.ops.triton.conv._utils import (
     _out_hw,
     _prep_bias,
     _require_winograd_2d_eligible,
-    _validate_conv2d_devices,
+    _validate_conv_devices,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     conv_config_uses_exact_routes,
@@ -263,9 +263,9 @@ def conv2d_winograd_f4x3(
     Supports the same padding modes as conv2d. Raises ValueError for
     non-eligible convolutions.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     _require_winograd_2d_eligible("conv2d_winograd_f4x3", R, S, stride, dilation, C)
 
@@ -312,9 +312,11 @@ def conv2d_winograd_f4x3_cblocked(
     Supports the same padding modes as conv2d. When a nonzero mode materializes
     padding, x_blocked must be omitted so the padded input is packed instead.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, x_blocked=x_blocked)
+    x, padding = _prepare_conv_padding(
+        x, padding, padding_mode, layout="nchw", x_blocked=x_blocked
+    )
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     _require_winograd_2d_eligible(
         "conv2d_winograd_f4x3_cblocked", R, S, stride, dilation, C
@@ -368,9 +370,9 @@ def conv2d_1x1(
 
     Supports the same padding modes as conv2d.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_1x1_conv(R, S, dilation):
         raise ValueError(f"conv2d_1x1 requires 1x1 kernel, got {R}x{S}")
@@ -413,9 +415,9 @@ def conv2d_general(
 
     Supports the same padding modes as conv2d.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
@@ -461,9 +463,9 @@ def conv2d_nhwc_3x3(
 
     Supports the same padding modes as conv2d.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout="nhwc")
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout="nhwc")
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
         raise ValueError(f"conv2d_nhwc_3x3 requires 3x3 kernel, got {R}x{S}")
@@ -506,7 +508,7 @@ def _route_and_run(
     padding_mode="zeros",
 ):
     """Resolve and execute one route, including required input preparation."""
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
     x = _ensure_layout(x, layout)
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
@@ -611,7 +613,7 @@ def conv2d_nchw(
     Nonzero modes pre-pad once before routing and activation packing.
     Preparation and convolution run on the input tensor's device.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     with torch.cuda.device(x.device):
         return _route_and_run(
@@ -648,7 +650,7 @@ def conv2d_nhwc(
     pre-pad once before routing and activation packing. Preparation and
     convolution run on the input tensor's device.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     with torch.cuda.device(x.device):
         return _route_and_run(
@@ -680,9 +682,9 @@ def conv2d_nchw_3x3_direct(
 
     Supports the same padding modes as conv2d.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode)
+    x, padding = _prepare_conv_padding(x, padding, padding_mode, layout="nchw")
     x = _ensure_layout(x, "nchw")
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
@@ -732,9 +734,11 @@ def conv2d_nchw_cblocked(
     Supports the same padding modes as conv2d. When a nonzero mode materializes
     padding, x_blocked must be omitted so the padded input is packed instead.
     """
-    _validate_conv2d_devices(x, w_oihw, bias)
+    _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, x_blocked=x_blocked)
+    x, padding = _prepare_conv_padding(
+        x, padding, padding_mode, layout="nchw", x_blocked=x_blocked
+    )
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     if not _is_3x3_conv(R, S):

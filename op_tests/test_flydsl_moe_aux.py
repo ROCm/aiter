@@ -556,7 +556,7 @@ def test_route_g2l(numel, E_global, n_buckets, variant, w_dtype):
     # keeps the pre-ep_rowmap signature. Null tensor hoisted out of fn() so nothing
     # allocates under CUDA-graph capture.
     _ep_null = torch.empty(0, dtype=I32)
-    _ep_tail = (ptr_arg(_ep_null), 0) if variant == "lds" else ()
+    _ep_tail = (ptr_arg(_ep_null), 0, ptr_arg(_ep_null), 0) if variant == "lds" else ()
 
     def fn():
         launch(
@@ -654,11 +654,15 @@ def test_scatter_copy_token(num_dst, row_bytes):
 
 
 @benchmark()
-def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
-    """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)]."""
+def test_gather_reduce(
+    tokens, model_dim, topk, vec_dwords, dtype, w_dtype, addend_scale=None
+):
+    """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)].
+    With addend_scale, out = out * addend_scale + addend in the same pass: the
+    bytes of the plain reduce followed by those two torch ops."""
     out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
     launch = build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
+        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype, addend_scale
     )
     wdt = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[w_dtype]
     rows_total = max(64, tokens * topk)
@@ -669,8 +673,9 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
     nvt = torch.tensor([tokens], dtype=I32)
     ref = run_torch_gather_reduce(grouped, rmap, w, dtype)
     out = torch.full((tokens, model_dim), 7.0, dtype=dtype)
+    addend = torch.empty(0)  # no addend: null pointer
 
-    def fn():
+    def fn(launch=launch):
         launch(
             ptr_arg(grouped),
             ptr_arg(rmap),
@@ -679,8 +684,23 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
             tokens,
             rows_total * (model_dim // 2),
             ptr_arg(nvt),
+            ptr_arg(addend),
             stream=torch.cuda.current_stream().cuda_stream,
         )
+
+    if addend_scale is not None:
+        fn(
+            build_moe_gather_reduce_module(
+                model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
+            )
+        )
+        ref = out.clone()
+        addend = (torch.randn(tokens, model_dim) * 0.5).to(dtype)
+        ref = ref * addend_scale + addend
+        fn()
+        assert torch.equal(
+            out.view(torch.int16), ref.view(torch.int16)
+        ), f"gather_reduce addend x{addend_scale}: not the bytes of the torch ops"
 
     esz = grouped.element_size()
     # topk source rows read + one row written per token, plus the (t,k) maps
@@ -1218,6 +1238,15 @@ def main():
             # Route weights arrive as native f32, or already cast to the output
             # dtype by the EP route kernel.
             if wd in ("f32", d)
+        ],
+    )
+    summarize(
+        "moe_gather_reduce + addend",
+        [
+            test_gather_reduce(t, md, 4, v, dmap[d], "f32", s)
+            for d, s, t, md, v in itertools.product(
+                args.dtype, (1.0, 0.5), args.tokens, args.model_dim, args.vec
+            )
         ],
     )
     # Real decode shape (model_dim=7168) at both vector widths -- swept apart from
