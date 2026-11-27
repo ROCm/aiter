@@ -994,14 +994,27 @@ if multiprocessing.current_process().name == "MainProcess":
 # CK_DIR = f"{bd_dir}/ck"
 
 
-def validate_and_update_archs():
+def validate_and_update_archs(resolve_native: bool = False):
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
 
     # clang's `--offload-arch=native` shells out to offload-arch, which cannot
     # detect the GPU on Windows, so resolve the arch ourselves instead.
-    if IS_WINDOWS and archs == ["native"]:
-        archs = _detect_native()
+    if IS_WINDOWS:
+        resolve_native = True
+
+    if resolve_native and "native" in archs:
+        try:
+            detected = _detect_native()
+            archs = list(
+                dict.fromkeys(
+                    r for a in archs for r in (detected if a == "native" else [a])
+                )
+            )
+        except RuntimeError:
+            # No GPU visible: keep "native" so that merely evaluating the
+            # config (e.g. listing modules) does not fail without a GPU.
+            pass
 
     # List of allowed architectures
     allowed_archs = [
