@@ -21,6 +21,7 @@ from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import (
     _e8m0_from_amax,
+    _global_i32_buffer_tiles,
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
     _udiv,
@@ -42,6 +43,8 @@ _FP4_E8M0_SHIFT = 2
 
 _G2_EPI_LANES = 32
 
+ES_TAIL_BYTES = 1024
+
 
 def bq_view(
     arg_bq,
@@ -49,6 +52,7 @@ def bq_view(
     KH4,
     K_TILES_TOTAL,
     K_HALVES,
+    num_records_bytes=None,
 ):
     """Layout view over preshuffled B for one N-row tile."""
     col_base = rocdl.readfirstlane(T.i32, _raw(row_elems) * fx.Int32(KH4))
@@ -66,6 +70,8 @@ def bq_view(
             fx.make_layout(shape, (64, 4, K_HALVES * 256, 256, 1)),
         )
     )
+    if num_records_bytes is not None:
+        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
@@ -169,6 +175,7 @@ def issue_a_load_lds_dt(
     K_BYTES,
     BM=32,
     resolved_rows=(),
+    atom=None,
 ):
     """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -184,7 +191,7 @@ def issue_a_load_lds_dt(
         gather_base_row = wave * rows_per_wave
         n_row_groups = rows_per_wave // rows_per_call
     lane_col = (lane % lanes_per_row) * 16
-    atom = lds_dma_atom_128()
+    atom = lds_dma_atom_128() if atom is None else atom
     src = flat_buffer_view(
         arg_aq,
         None,
@@ -309,7 +316,9 @@ def gemm2_body_v2(
         n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
     m_row = m_block_idx * BM
-    if const_expr(SBM == BM):
+    if const_expr(es is not None):
+        e = es.e
+    elif const_expr(SBM == BM):
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
     else:
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
@@ -317,7 +326,7 @@ def gemm2_body_v2(
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
 
-    s_aq_base = lds_base_i32
+    s_aq_base = lds_base_i32 if const_expr(es is None) else lds_base_i32 + es.a_off
     lds_acc_base = lds_base_i32
     mma_atoms = scale_mma_atoms(a_dtype, b_dtype)
 
@@ -331,11 +340,11 @@ def gemm2_body_v2(
         for _ in range_constexpr(kMChunks)
     ]
 
-    def issue_a_load_lds(slot, kt):
+    def issue_a_load_lds(slot, kt, base=s_aq_base, m_row=m_row, atom=None):
         issue_a_load_lds_dt(
             arg_aq,
             aq_num_records,
-            s_aq_base,
+            base,
             slot,
             kt,
             m_row,
@@ -346,6 +355,7 @@ def gemm2_body_v2(
             K_BYTES,
             BM=BM,
             resolved_rows=resolved_input_rows,
+            atom=atom,
         )
 
     def issue_a_ds_read(slot):
@@ -658,7 +668,15 @@ def gemm2_body_v2(
     prefetched_ids = None
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
-        _epilog(c_frags, emit_thunks=epi_thunks)
+        _epilog(
+            c_frags,
+            emit_thunks=epi_thunks,
+            route_w_lds=(
+                None
+                if const_expr(es is None)
+                else s_aq_base + fx.Int32(K_TILES_MAX * slot_bytes + 768)
+            ),
+        )
 
     if const_expr(nonatomic):
         KT = K_TILES_MAX
@@ -751,6 +769,143 @@ def gemm2_body_v2(
                     issued = kt + kStages
                 mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
                 cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
+    elif const_expr(es is not None):
+        KT = K_TILES_MAX
+        assert KT == 4 and kHalves == 1 and kScaleSubBlocks == 1 and BM <= 64
+        assert g2_interleave and not is_f8_a and not is_f8_b and not g2_prefetch_ids
+        epi_lanes = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
+        epi_rows = 256 // epi_lanes
+        a_tail = KT * slot_bytes
+        async_a = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
+        async_w = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
+
+        def issue_chunk(m_row_x, a_off_x):
+            m_row_x = fx.Int32(rocdl.readfirstlane(T.i32, _raw(m_row_x)))
+            a_off_x = fx.Int32(rocdl.readfirstlane(T.i32, _raw(a_off_x)))
+            for k in range_constexpr(KT):
+                issue_a_load_lds(k, k, lds_base_i32 + a_off_x, m_row_x, async_a)
+            is_sc = wave < fx.Int32(2)
+            sc_dw = (m_row_x // fx.Int32(32)) * kAS_per_chunk_dw
+            sc_dw = sc_dw + wave * fx.Int32(64)
+            rows_src = (wave == fx.Int32(2)).select(
+                fx.Int64(arg_stids), fx.Int64(arg_sweights)
+            )
+            src = flat_buffer_view(
+                is_sc.select(
+                    fx.Int64(arg_ascale) + fx.Int64(sc_dw) * 4,
+                    rows_src + fx.Int64(m_row_x) * 4,
+                ),
+                None,
+                T.i32,
+                align=4,
+                elem_bytes=4,
+                fold=False,
+                num_records_bytes=is_sc.select(
+                    asc_num - fx.Int64(sc_dw) * 4,
+                    fx.Int64(i32_max_m_blocks) * fx.Int64(BM * 4)
+                    - fx.Int64(m_row_x) * 4,
+                ),
+            )
+            fx.copy(
+                async_w,
+                src[lane, None],
+                lds_dma_dst(
+                    lds_base_i32 + a_off_x,
+                    fx.Int32(a_tail) + wave * fx.Int32(256),
+                    elem_ty=T.i32,
+                    align=4,
+                ),
+            )
+            rocdl.asyncmark()
+
+        if const_expr(es.first is not None):
+            if es.first:
+                issue_chunk(m_row, es.a_off)
+                for kt in range_constexpr(KT):
+                    issue_b_load_into(
+                        es.bq[kt],
+                        es.bs[kt // 2] if const_expr(kt % 2 == 0) else None,
+                        fx.Int32(kt),
+                    )
+        issue_chunk(es.m_row_n, es.a_off_n)
+        rocdl.sched_barrier(0)
+        rocdl.wait_asyncmark(1)
+        gpu.barrier()
+        m_lane = fx.Int32(gpu.thread_id("x")) // epi_lanes
+        es_sa = [
+            fx.Int32(
+                lds_vec_load(
+                    s_aq_base, fx.Int32(a_tail + h * 256) + lane * 4, T.i32, Int32
+                )
+            )
+            for h in range_constexpr(2)
+        ]
+        prefetched_ids = [
+            fx.Int32(
+                lds_vec_load(
+                    s_aq_base,
+                    fx.Int32(a_tail + 512 + mr * epi_rows * 4) + m_lane * 4,
+                    T.i32,
+                    Int32,
+                )
+            )
+            for mr in range_constexpr(BM // epi_rows)
+        ]
+        st = es.stage
+        if const_expr(st is not None):
+            st_col = st.n_block * BN + wave * (BN // 4)
+            st_bq = [
+                bq_view(
+                    arg_bq,
+                    st.e * N_OUT_rt + st_col + j * 16,
+                    KH4,
+                    KT,
+                    kHalves,
+                    num_records_bytes=st.nbytes,
+                )
+                for j in range_constexpr(numAccN)
+            ]
+            st_mni = st.n_block * (BN // 16 // 2) + wave * (BN // 64 // 2)
+            st_bs = [
+                scale_view(
+                    arg_bscale,
+                    st.e * kbs_per_expert_dw + (st_mni + mw) * kBS_stride_n0_dw,
+                    K_SCALE_CHUNKS_MAX,
+                    k0_stride_dw=kBS_stride_k0_dw,
+                    num_records_bytes=st.nbytes,
+                )
+                for mw in range_constexpr(nPairs)
+            ]
+        for kt in range_constexpr(KT):
+            issue_a_ds_read(fx.Int32(kt))
+            if const_expr(st is not None and kt in (1, 2)):
+                st_kt = st.h * fx.Int32(2) + fx.Int32(kt - 1)
+                for j in range_constexpr(numAccN):
+                    fx.copy(
+                        b_catom,
+                        st_bq[j][lane_div_16, lane_mod_16, st_kt, 0, None],
+                        st.bq[kt - 1][j][0],
+                    )
+                if const_expr(kt == 1):
+                    for mw in range_constexpr(nPairs):
+                        fx.copy(
+                            sc_copy_atom,
+                            st_bs[mw][
+                                lane_div_16, lane_mod_16, scale_chunk_tile(st_kt), None
+                            ],
+                            st.bs[mw],
+                        )
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            mfma_cluster(
+                es.bq[kt],
+                es.bs[kt // 2],
+                [es_sa[kt // 2]],
+                fx.Int32(kt),
+                interleave=epi_thunks if const_expr(kt == KT - 1) else None,
+            )
+            rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
     else:
         KT = K_TILES_MAX
         for i in range_constexpr(kMChunks):
@@ -761,10 +916,6 @@ def gemm2_body_v2(
         chunk_of = [kt // tilesPerScaleChunk for kt in range(KT)]
         n_slots = min(2, chunk_of[-1] + 1)
         bsf_slots = [make_scale_fragments(nPairs) for _ in range_constexpr(n_slots)]
-        if const_expr(es is not None):
-            # persist-es: the B double buffer holds the panel's whole W2 (K <= 2 tiles) and
-            # lives across its row chunks; only the panel's first chunk loads it.
-            (cur_bqf, nxt_bqf), bsf_slots = es.bq, es.bs
         saf_slots = None
         if const_expr(g2_ascale_pf):
             saf_slots = [
@@ -776,29 +927,18 @@ def gemm2_body_v2(
             for sub in range_constexpr(kScaleSubBlocks):
                 saf[sub].store(Vec.from_elements([sa_t[sub]], Int32))
 
-        def _ks_load_b(load):
-            # A compile-time and a runtime condition: not one if.
-            if const_expr(es is None):  # noqa: SIM114
-                load()
-            elif es.load_w2:
-                load()
-
         def _ks_issue_scales(kt):
             slot = chunk_of[kt] % n_slots
-            _ks_load_b(
-                lambda: issue_bscale_into(
-                    bsf_slots[slot], scale_chunk_tile(fx.Int32(kt))
-                )
-            )
+            issue_bscale_into(bsf_slots[slot], scale_chunk_tile(fx.Int32(kt)))
             if const_expr(g2_ascale_pf):
                 _ks_issue_ascale(saf_slots[slot], fx.Int32(kt))
 
         def _ks_prefetch(kt):
-            _ks_load_b(lambda: issue_b_load_into(nxt_bqf, None, fx.Int32(kt)))
+            issue_b_load_into(nxt_bqf, None, fx.Int32(kt))
             if const_expr(kt == 0 or chunk_of[kt] != chunk_of[kt - 1]):
                 _ks_issue_scales(kt)
 
-        _ks_load_b(lambda: issue_b_load_into(cur_bqf, None, fx.Int32(0)))
+        issue_b_load_into(cur_bqf, None, fx.Int32(0))
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
@@ -891,7 +1031,12 @@ def gemm2_body_v2(
     elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
-        _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids)
+        _epilog(
+            None,
+            lds_ready=True,
+            prefetched_ids=prefetched_ids,
+            uncond_stores=es is not None,
+        )
     else:
         _epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
@@ -934,6 +1079,8 @@ def atomic_bf16_epilog(
     output_width=None,
     reduce_store_cache_modifier=None,
     write_limit=None,
+    uncond_stores=False,
+    route_w_lds=None,
 ):
     if SBM is None:
         SBM = BM
@@ -993,6 +1140,35 @@ def atomic_bf16_epilog(
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
     out_i8_ptr = global_typed_ptr(arg_out, T.i8, align=1)
+    if const_expr(uncond_stores):
+        assert use_reduce and not route_out_fp8 and not enable_bias
+        assert reduce_store_cache_modifier is None
+    if const_expr(uncond_stores and not route_out_fp4):
+        u_end = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(output_width)
+        out_4b = _global_i32_buffer_tiles(arg_out, u_end * 2, 1)
+        st_4b = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
+    if const_expr(uncond_stores and route_out_fp4):
+        u_pitch = val_width + _udiv(output_width, fx.Int32(g2_scale_blk))
+        if const_expr(g2_out_pitch_align > 0):
+            al = fx.Int32(g2_out_pitch_align)
+            u_pitch = ((u_pitch + al - fx.Int32(1)) // al) * al
+        u_end = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(u_pitch)
+        out_8b = _global_i32_buffer_tiles(arg_out, u_end, 2)
+        out_1b = fx.logical_divide(
+            fx.rocdl.make_buffer_tensor(
+                fx.Tensor(
+                    fx.make_view(
+                        global_typed_ptr(arg_out, T.i8, align=1),
+                        fx.make_layout(u_end, 1),
+                    )
+                ),
+                max_size=False,
+                num_records_bytes=u_end,
+            ),
+            fx.make_layout(1, 1),
+        )
+        st_8b = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), Int32)
+        st_1b = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), Int8)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
@@ -1042,6 +1218,12 @@ def atomic_bf16_epilog(
                     if const_expr(defer_w)
                     else [
                         load_scalar(load_f32, sweights, m_row + row_base + v, Float32)
+                        if const_expr(route_w_lds is None)
+                        else fx.Float32(
+                            lds_vec_load(
+                                route_w_lds, (row_base + v) * 4, T.f32, Float32
+                            )
+                        )
                         for v in range_constexpr(4)
                     ]
                 )
@@ -1087,7 +1269,7 @@ def atomic_bf16_epilog(
             return
         gpu.barrier()
 
-    def store_one_mr(mr):
+    def store_one_mr(mr, valid=None):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if const_expr(use_reduce):
@@ -1103,6 +1285,8 @@ def atomic_bf16_epilog(
                 row_base_addr = out_row * fx.Int64(output_width) + fx.Int64(
                     n_block_idx * BN + col_start - output_n_base
                 )
+            if const_expr(uncond_stores):
+                row_base_addr = valid.select(row_base_addr, u_end)
         else:
             out_row = token_id
             row_base_addr = out_row * N_OUT + n_block_idx * BN + col_start
@@ -1240,6 +1424,24 @@ def atomic_bf16_epilog(
                         if const_expr(route_out_fp4)
                         else output_col
                     )
+                    if const_expr(uncond_stores):
+                        assert len(words) == 2
+                        w8 = fx.make_rmem_tensor(2, Int32)
+                        w8.store(Vec.from_elements([Vec(w)[0] for w in words], Int32))
+                        fx.copy(
+                            st_8b,
+                            w8,
+                            fx.slice(
+                                out_8b, (None, fx.Int32(row_val_off >> fx.Int64(3)))
+                            ),
+                        )
+                        s_off = row_base_addr + fx.Int64(
+                            val_width + _udiv(output_col, fx.Int32(g2_scale_blk))
+                        )
+                        s1 = fx.make_rmem_tensor(1, Int8)
+                        s1.store(Vec.from_elements([e8m0.to(Int8)], Int8))
+                        fx.copy(st_1b, s1, fx.slice(out_1b, (None, fx.Int32(s_off))))
+                        return
                     for d in range_constexpr(len(words)):
                         fx.ptr_store(
                             Vec(words[d]).bitcast(Int8),
@@ -1257,7 +1459,11 @@ def atomic_bf16_epilog(
                     if col_lane8 < fx.Int32(BN):
                         store_route_group(col_lane8)
 
-                store_route_group_if_valid(col_lane8)
+                if const_expr(uncond_stores):
+                    assert n_rg * route_group_n == BN
+                    store_route_group(col_lane8)
+                else:
+                    store_route_group_if_valid(col_lane8)
         elif const_expr(reduce_store_cache_modifier is not None):
             for s in range_constexpr(BN // store_group_n):
                 idx0 = row_in_block * BN + col_start + s * store_group_n
@@ -1327,7 +1533,12 @@ def atomic_bf16_epilog(
                 out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
                 out_frag.store(pk)
                 out_off = row_base_addr + fx.Int64(s * store_group_n)
-                if const_expr(use_reduce):
+                if const_expr(uncond_stores):
+                    pk4 = fx.make_rmem_tensor(1, Int32)
+                    pk4.store(Vec(pk).bitcast(Int32))
+                    dw = fx.Int32(out_off >> fx.Int64(1))
+                    fx.copy(st_4b, pk4, fx.slice(out_4b, (None, dw)))
+                elif const_expr(use_reduce):
                     fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
@@ -1366,7 +1577,10 @@ def atomic_bf16_epilog(
             for mr in range_constexpr(M_REPS)
         ]
 
-    if const_expr(prefetched_ids is not None or (use_reduce and route_out_q)):
+    if const_expr(
+        (prefetched_ids is not None or (use_reduce and route_out_q))
+        and not uncond_stores
+    ):
         rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):
@@ -1382,7 +1596,11 @@ def atomic_bf16_epilog(
             if valid:
                 store_one_mr(mr)
 
-        store_if_valid(token_id, route_slot, mr)
+        if const_expr(uncond_stores):
+            token_limit = i32_M if const_expr(write_limit is None) else write_limit
+            store_one_mr(mr, (token_id < token_limit) & (route_slot < fx.Int32(topk)))
+        else:
+            store_if_valid(token_id, route_slot, mr)
 
 
 def nonatomic_bf16_epilog(

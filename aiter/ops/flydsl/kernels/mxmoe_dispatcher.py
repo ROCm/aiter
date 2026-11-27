@@ -12,8 +12,9 @@ from flydsl.expr.typing import Int8, Int32, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .mxfp4_gemm_common import _udiv
+from .mxfp4_gemm_common import _global_i32_buffer_tiles, _udiv
 from .mxmoe_gemm_v2 import (
+    ES_TAIL_BYTES,
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
@@ -146,11 +147,7 @@ def compile_gemm2_a4w4_port(
     g2_scatter_lds_pairs=False,
     g2_es=None,
 ):
-    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical.
-
-    g2_es=num_experts: persist-es, a fixed grid (i32_grid_blocks: as many workgroups per CU
-    as fit) over (expert x BN) panels of the sort's expert table (passed as arg_out_scale);
-    a panel's W2 stays in registers across its row chunks."""
+    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
@@ -253,6 +250,9 @@ def compile_gemm2_a4w4_port(
         aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    if g2_es is not None:
+        es_a_bytes = (INTER_MAX // BK) * slot_bytes + ES_TAIL_BYTES
+        lds_bytes = c_lds_bytes + 2 * es_a_bytes
     # _ldspa: the bf16 scatter epilogue writes C through LDS with 16-byte nt stores.
     g2_scatter_lds_pairs = bool(g2_scatter_lds_pairs)
     if g2_scatter_lds_pairs:
@@ -318,10 +318,11 @@ def compile_gemm2_a4w4_port(
             and not is_f8
             and b_dtype == "fp4"
             and cu_num > 0
-            and INTER_MAX // BK <= 2
+            and BK == 128
+            and INTER_MAX == 512
         ):
             raise AssertionError(
-                "g2_es needs a4w4 epilog='reduce', cu_num>0 and INTER_MAX <= 2 * BK"
+                "g2_es needs a4w4 epilog='reduce', cu_num>0, BK=128 and INTER_MAX=512"
             )
         persist_tag = f"_pes_cu{cu_num}_ne{g2_es}"
     elif persist_flat:
@@ -505,45 +506,116 @@ def compile_gemm2_a4w4_port(
             rocdl.sched_barrier(0)
             run_unit(fx.Int32(0), mn_idx=mn_idx)
         elif const_expr(g2_es is not None):
-            # persist-es: a fixed grid over (expert x BN) panels in the order of the sort's
-            # expert table (arg_out_scale: [first sorted row, rows, expert, 0] per expert,
-            # then [experts with rows, 0, 0, 0]). Each BM-row chunk of a panel is a v2 tile;
-            # its first chunk loads the panel's W2 and the rest reuse it.
             einfo = global_typed_ptr(arg_out_scale, T.i32)
             n_act = fx.Int32(rocdl.readfirstlane(T.i32, einfo[g2_es * 4]))
-            # gemm2_body_v2's B double buffer (fragments, scale slots), kept across a
-            # panel's chunks: K <= 2 tiles, so it holds the panel's whole W2.
-            n_acc, k_halves = BN // 64, BK // 128
-            bq = [
-                [
-                    [fx.make_rmem_tensor(4, Int32) for _ in range_constexpr(k_halves)]
-                    for _ in range_constexpr(n_acc)
+            n_acc, k_tiles = BN // 64, INTER_MAX // BK
+
+            def w2_regs():
+                bq = [
+                    [[fx.make_rmem_tensor(4, Int32)] for _ in range_constexpr(n_acc)]
+                    for _ in range_constexpr(k_tiles)
                 ]
-                for _ in range_constexpr(2)
-            ]
-            bs = [
-                [fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(n_acc // 2)]
-                for _ in range_constexpr(2)
-            ]
-            # A workgroup's XCD (bx % 8) neighbours take consecutive panels.
+                bs = [
+                    [fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(n_acc // 2)]
+                    for _ in range_constexpr(2)
+                ]
+                return bq, bs
+
+            (bq, bs), (bq_n, bs_n) = w2_regs(), w2_regs()
+            stage_a = types.SimpleNamespace(bq=bq_n[0:2], bs=bs_n[0])
+            stage_b = types.SimpleNamespace(bq=bq_n[2:4], bs=bs_n[1])
+
+            def place_half(h, st):
+                for i in range_constexpr(2):
+                    for j in range_constexpr(n_acc):
+                        bq[2 * h + i][j][0].store(st.bq[i][j][0].load())
+                for m in range_constexpr(n_acc // 2):
+                    bs[h][m].store(st.bs[m].load())
+
+            def es_chunk(pc, c, t, st=None, first=None):
+                m_block = _udiv(pc.base, BM) + c
+                gpu.barrier()
+                par = t & fx.Int32(1)
+                es = types.SimpleNamespace(
+                    e=pc.e,
+                    bq=bq,
+                    bs=bs,
+                    stage=(
+                        None
+                        if st is None
+                        else types.SimpleNamespace(
+                            bq=st.bq,
+                            bs=st.bs,
+                            e=pc.e_n,
+                            n_block=pc.nb_n,
+                            h=c,
+                            nbytes=pc.nxt_bytes,
+                        )
+                    ),
+                    a_off=fx.Int32(c_lds_bytes) + par * fx.Int32(es_a_bytes),
+                    a_off_n=fx.Int32(c_lds_bytes + es_a_bytes)
+                    - par * fx.Int32(es_a_bytes),
+                    m_row_n=(c + fx.Int32(1) < pc.n_run).select(
+                        (m_block + fx.Int32(1)) * fx.Int32(BM), pc.m_row_n
+                    ),
+                    first=first,
+                )
+                run_unit(fx.Int32(0), mn_idx=(m_block, pc.n_block), es=es)
+
             n_wg = fx.Int32(gpu.grid_dim.x)
+            n_panels = n_act * num_n_blocks
             p0 = (bx_i32 % 8) * _udiv(n_wg, 8) + bx_i32 // 8
-            for p in range(p0, n_act * num_n_blocks, gpu.grid_dim.x):
-                row = _udiv(fx.Int32(p), num_n_blocks)
-                base = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4]))
-                rows = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4 + 1]))
-                n_block = fx.Int32(p) - row * num_n_blocks
-                for c in range(fx.Int32(0), (rows + BM - 1) // BM, fx.Int32(1)):
-                    m_block = _udiv(base, BM) + fx.Int32(c)
-                    gpu.barrier()  # the last chunk's epilogue LDS reads before A lands
-                    issue_all_a_loads(m_block * fx.Int32(BM))
-                    rocdl.sched_barrier(0)
-                    es = types.SimpleNamespace(
-                        bq=bq,
-                        bs=bs,
-                        load_w2=fx.Int32(c) == fx.Int32(0),
-                    )
-                    run_unit(fx.Int32(0), mn_idx=(m_block, n_block), es=es)
+            ein_tiles = _global_i32_buffer_tiles(
+                arg_out_scale, fx.Int64((g2_es + 1) * 16), 4
+            )
+            ein_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Int32)
+
+            def ein_load(pp):
+                pp = (pp < n_panels).select(pp, n_panels - fx.Int32(1))
+                frag = fx.make_rmem_tensor(4, Int32)
+                fx.copy(
+                    ein_copy, fx.slice(ein_tiles, (None, _udiv(pp, num_n_blocks))), frag
+                )
+                return frag
+
+            def ein_row(frag):
+                v = frag.load()
+                return [fx.Int32(rocdl.readfirstlane(T.i32, v[i])) for i in range(3)]
+
+            base, rows, e = ein_row(ein_load(p0))
+            base_n, rows_n, e_n = ein_row(ein_load(p0 + n_wg))
+            t0 = fx.Int32(0)
+            for p in range(p0, n_panels, gpu.grid_dim.x):
+                ein_nn = ein_load(fx.Int32(p) + n_wg + n_wg)
+                n_block = fx.Int32(p) - _udiv(fx.Int32(p), num_n_blocks) * num_n_blocks
+                n_chunks = (rows + BM - 1) // BM
+                n_run = fx.max(n_chunks, fx.Int32(2))
+                pn = fx.Int32(p) + n_wg
+                has_next = pn < n_panels
+                pn = has_next.select(pn, fx.Int32(p))
+                pc = types.SimpleNamespace(
+                    base=base,
+                    e=e,
+                    n_block=n_block,
+                    n_run=n_run,
+                    m_row_n=_udiv(base_n, BM) * fx.Int32(BM),
+                    e_n=e_n,
+                    nb_n=pn - _udiv(pn, num_n_blocks) * num_n_blocks,
+                    nxt_bytes=has_next.select(fx.Int64(1 << 30), fx.Int64(0)),
+                )
+                place_half(0, stage_a)
+                place_half(1, stage_b)
+                es_chunk(pc, fx.Int32(0), t0, stage_a, first=fx.Int32(p) == p0)
+                es_chunk(pc, fx.Int32(1), t0 + fx.Int32(1), stage_b)
+                if n_chunks > fx.Int32(2):
+                    es_chunk(pc, fx.Int32(2), t0 + fx.Int32(2))
+                for c in range(fx.Int32(3), n_chunks, fx.Int32(1)):
+                    es_chunk(pc, fx.Int32(c), t0 + fx.Int32(c))
+                t0 = t0 + n_run
+                base = base_n
+                rows = rows_n
+                e = e_n
+                base_n, rows_n, e_n = ein_row(ein_nn)
         elif const_expr(persist_flat):
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             bound = _udiv(cumsum0, BM) * num_n_blocks
@@ -775,8 +847,6 @@ def compile_gemm2_a4w4_port(
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     if g2_es is not None:
-        # No spills (<= 256 VGPRs); the launch fits as many workgroups per CU as the
-        # registers allow (mxfp4_moe_gemm2).
         launch_gemm2.compile_hints = {"waves_per_eu": 2}
     return launch_gemm2
 
@@ -995,11 +1065,10 @@ def mxfp4_moe_gemm2(
         and not is_ep
         and D_INTER == 512
         and SBM % 32 == 0
+        and SBM >= 64
     ):
-        # persist-es over the sort's expert table (fused_moe._moe_sorting_impl).
         g2_es, persist, out_scale = NE, True, expert_info
-        # W2 streams once per panel: nontemporal.
-        BM, BN, BK, use_nt = 32, 256, 256, True
+        BM, BN, BK, use_nt = 32, 256, 128, True
         if cu_num <= 0:
             cu_num = get_cu_num()
     if epilog == "scatter":
@@ -1043,8 +1112,6 @@ def mxfp4_moe_gemm2(
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if g2_es is not None:
-        # Resident workgroups per CU, known once the kernel is compiled (2 fit by its
-        # waves_per_eu); the persistent loop strides by the grid.
         grid_blocks = getattr(launch, "es_wg_per_cu", 2) * cu_num
     elif persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
