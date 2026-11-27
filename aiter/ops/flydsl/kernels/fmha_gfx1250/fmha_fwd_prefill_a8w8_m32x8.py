@@ -41,6 +41,7 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import arith as _fx_arith
 from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
@@ -311,6 +312,45 @@ def _wmma(a, b, c, *, a_dtype, b_dtype):
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
+_B8_WMMA128 = {
+    (fx.Float8E4M3FN, fx.Float8E4M3FN): rocdl.wmma_f32_16x16x128_fp8_fp8,
+    (fx.Float8E4M3FN, fx.Float8E5M2): rocdl.wmma_f32_16x16x128_fp8_bf8,
+    (fx.Float8E5M2, fx.Float8E4M3FN): rocdl.wmma_f32_16x16x128_bf8_fp8,
+    (fx.Float8E5M2, fx.Float8E5M2): rocdl.wmma_f32_16x16x128_bf8_bf8,
+}
+# Fuse each pair of adjacent 64-deep contraction steps into one 16x16x128 WMMA (A/B = the
+# two 16x16x64 operands concatenated -- HW-checked bit-identical to the chained pair).
+# Halves the PV WMMA count and drops QK from 3 to 2 per (kv frag, q tile).
+# AITER_FMHA_A8W8_W128=0 restores the 16x16x64 stream.
+USE_W128 = os.environ.get("AITER_FMHA_A8W8_W128", "1") != "0"
+# Softmax pass 2 in vector form: contracted v8 fma (v_pk_fma_f32 on the WMMA output
+# pairs), all fmas -> one uninterrupted exp run -> sums, sched_barrier-separated so no
+# TRANS result feeds the next VALU (no v_nop hazard padding).
+# AITER_FMHA_A8W8_VEC_SOFTMAX=0 restores the scalar path.
+USE_VSM = os.environ.get("AITER_FMHA_A8W8_VEC_SOFTMAX", "1") != "0"
+# Softmax row sum by WMMA (all-ones A against the FP8 P that also feeds PV) instead of
+# a VALU add tree, on calls without band masking. O is normalized by the sum of the P
+# it actually used; LSE then carries P's FP8 rounding (same as the ASM FP8 kernel).
+# AITER_FMHA_A8W8_WMMA_ROWSUM=0 restores the f32 VALU row sum everywhere.
+USE_WSUM = os.environ.get("AITER_FMHA_A8W8_WMMA_ROWSUM", "1") != "0"
+_VSM_NO_REASSOC = (
+    _fx_arith.FastMathFlags.nnan
+    | _fx_arith.FastMathFlags.ninf
+    | _fx_arith.FastMathFlags.nsz
+    | _fx_arith.FastMathFlags.contract
+    | _fx_arith.FastMathFlags.afn
+)
+
+
+def _wmma128(a, b, c, *, a_dtype, b_dtype):
+    """One 16x16x128 WMMA; a/b are v16 i32 (two 16x16x64 operands concatenated)."""
+    v8f32 = fx.Vector.make_type(8, fx.Float32)
+    r = _B8_WMMA128[(a_dtype, b_dtype)](
+        v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False
+    )
+    return r.result if hasattr(r, "result") else r
+
+
 _B8_PK8_CVT = {
     fx.Float8E4M3FN: rocdl.cvt_scalef32_pk8_fp8_f32,
     fx.Float8E5M2: rocdl.cvt_scalef32_pk8_bf8_f32,
@@ -343,6 +383,7 @@ def _softmax(
     q_min_list=None,
     kv_len=None,
     s_scale,
+    need_sum=True,
 ):
     """Online-softmax update for one KV tile, for ALL num_q_tiles q-WMMA-tiles this wave owns.
 
@@ -491,28 +532,79 @@ def _softmax(
     # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
     # exp2_fastmath(c*S - m) as one fma: the scale's only consumer, so it contracts.
     neg_m = [fsub_fastmath(fx.Float32(0.0), m_new_list[r]) for r in range(num_q_tiles)]
-    # fx.fma, no ninf fast-math: masked s is -inf and must stay -inf, and
-    # -inf * (positive finite) + finite is still -inf.
-    diff_list = [
-        [fx.fma(sv, s_scale, neg_m[r]) for sv in s_masked_list[r]]
-        for r in range(num_q_tiles)
-    ]
-    p_flat_list = [[exp2_fastmath(d) for d in diff] for diff in diff_list]
-    p_list = [
-        [
-            fx.Vector.from_elements(
-                p_flat[kv_frag_idx * 8 : (kv_frag_idx + 1) * 8], fx.Float32
+    if USE_VSM:
+        # Vector form: one v8f32 per kv frag. All rows' contracted v8 fmas (4 v_pk_fma_f32
+        # each, on the WMMA output's aligned register pairs -- no regalloc moves), then one
+        # uninterrupted exp run, then the sums; the sched_barriers keep a TRANS result from
+        # being the very next VALU's operand, so no v_nop hazard padding.
+        _fm_c = _fx_arith.FastMathFlags.contract
+        p_list, local_sum_list = [], []
+        d8_all = []
+        for r in range(num_q_tiles):
+            sc8 = fx.Vector.from_elements([s_scale], fx.Float32).broadcast_to(8)
+            nm8 = fx.Vector.from_elements([neg_m[r]], fx.Float32).broadcast_to(8)
+            row = []
+            for f in range(num_kv_frags):
+                s8 = fx.Vector.from_elements(
+                    s_masked_list[r][f * 8 : (f + 1) * 8], fx.Float32
+                )
+                # contract only (no ninf): masked -inf must stay -inf.
+                with _fx_arith.fastmath(_fm_c):
+                    row.append(s8 * sc8 + nm8)
+            d8_all.append(row)
+        rocdl.sched_barrier(0)
+        for r in range(num_q_tiles):
+            p_list.append(
+                [
+                    fx.Vector.from_elements(
+                        [exp2_fastmath(fx.Float32(d8[i])) for i in range(8)],
+                        fx.Float32,
+                    )
+                    for d8 in d8_all[r]
+                ]
             )
-            for kv_frag_idx in range(num_kv_frags)
+        rocdl.sched_barrier(0)
+        # Row sum: balanced v8 add tree across the frags (v_pk_add_f32), then 8 -> 1.
+        for r in range(num_q_tiles if need_sum else 0):
+            cur = list(p_list[r])
+            with _fx_arith.fastmath(_VSM_NO_REASSOC):
+                while len(cur) > 1:
+                    nxt = [cur[i] + cur[i + 1] for i in range(0, len(cur) - 1, 2)]
+                    if len(cur) % 2:
+                        nxt.append(cur[-1])
+                    cur = nxt
+                v = cur[0]
+                v4 = v.shuffle(v, [0, 1, 2, 3]) + v.shuffle(v, [4, 5, 6, 7])
+                v2 = v4.shuffle(v4, [0, 1]) + v4.shuffle(v4, [2, 3])
+            local_sum_list.append(fadd_no_reassoc(fx.Float32(v2[0]), fx.Float32(v2[1])))
+    else:
+        # fx.fma, no ninf fast-math: masked s is -inf and must stay -inf, and
+        # -inf * (positive finite) + finite is still -inf.
+        diff_list = [
+            [fx.fma(sv, s_scale, neg_m[r]) for sv in s_masked_list[r]]
+            for r in range(num_q_tiles)
         ]
-        for p_flat in p_flat_list
-    ]
+        p_flat_list = [[exp2_fastmath(d) for d in diff] for diff in diff_list]
+        p_list = [
+            [
+                fx.Vector.from_elements(
+                    p_flat[kv_frag_idx * 8 : (kv_frag_idx + 1) * 8], fx.Float32
+                )
+                for kv_frag_idx in range(num_kv_frags)
+            ]
+            for p_flat in p_flat_list
+        ]
 
-    # ---- Row sum: interleaved balanced sum-trees. fadd_t drops reassoc so LLVM's
-    # Reassociate does not re-linearize the tree into a serial chain. ----
-    add3 = lambda a, b, c: fadd_no_reassoc(fadd_no_reassoc(a, b), c)
-    local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_no_reassoc)
+        # ---- Row sum: interleaved balanced sum-trees. fadd_t drops reassoc so LLVM's
+        # Reassociate does not re-linearize the tree into a serial chain. ----
+        add3 = lambda a, b, c: fadd_no_reassoc(fadd_no_reassoc(a, b), c)
+        local_sum_list = (
+            _tree_reduce_multi(p_flat_list, add3, fadd_no_reassoc) if need_sum else None
+        )
 
+    if not need_sum:
+        # WSUM: the row sum rides the O accumulator (rescaled with it); d is unused.
+        return p_list, m_new_list, list(d_prev_list), corr_list, rescale_masks
     d_new_list = []
     for r in range(num_q_tiles):
         d_new_list.append(
@@ -593,13 +685,37 @@ def _pv_qk_gemm(
     num_k_frags = num_kv_frags * num_k_tiles if do_qk else 0
     num_vld = vld_per_frag * num_v_frags
 
-    out_list = [[None] * d_tiles for _ in range(num_q_tiles)]
+    # WSUM: an extra trailing O tile carries the softmax row sum, accumulated by
+    # WMMA against an all-ones A (every element of the tile = sum_kv P8[kv, q]).
+    _wsum = o_acc_list is not None and len(o_acc_list[0]) == d_tiles + 1 and do_pv
+    out_list = [[None] * (d_tiles + int(_wsum)) for _ in range(num_q_tiles)]
     if not do_pv:
         out_list = [list(row) for row in o_acc_list]
+    _ones8 = None
+    if _wsum:
+        _one_byte = 0x38 if kv_dtype == fx.Float8E4M3FN else 0x3C
+        _ones8 = fx.Vector.filled(8, _one_byte * 0x01010101, fx.Int32)
     s_acc_list = [[None] * num_kv_frags for _ in range(num_q_tiles)]
     p_frags = (
         {}
     )  # (q_tile_idx, k_tile_idx) -> B operand, handed to _ring_drive on its last fragment
+
+    _w128_pv = USE_W128 and num_contract_tiles % 2 == 0
+    _w128_qk = USE_W128 and num_k_tiles >= 2
+    _qk_pairs = num_k_tiles // 2
+    _pend_v = {}
+    _pend_k = {}
+    _q128 = (
+        [
+            [
+                _concat([q_frags_list[q][2 * j], q_frags_list[q][2 * j + 1]])
+                for j in range(_qk_pairs)
+            ]
+            for q in range(num_q_tiles)
+        ]
+        if _w128_qk
+        else None
+    )
 
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
@@ -608,6 +724,49 @@ def _pv_qk_gemm(
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
             v_frag = _concat(parts)
+            if _w128_pv:
+                if k_tile_idx % 2 == 0:
+                    _pend_v[d_tile_idx] = v_frag
+                    return
+                v_frag = _concat([_pend_v.pop(d_tile_idx), v_frag])
+                for q_tile_idx in range(num_q_tiles):
+                    acc = out_list[q_tile_idx][d_tile_idx]
+                    if acc is None:
+                        acc = (
+                            o_acc_list[q_tile_idx][d_tile_idx]
+                            if o_acc_list is not None
+                            else fx.Vector.filled(8, 0.0, fx.Float32)
+                        )
+                    p = p_list[q_tile_idx]
+                    kt0 = k_tile_idx - 1
+                    p_frag = _concat(
+                        [p[num_p_parts * kt0 + t] for t in range(2 * num_p_parts)]
+                    )
+                    p_frags[(q_tile_idx, k_tile_idx)] = p_frag
+                    out_list[q_tile_idx][d_tile_idx] = _wmma128(
+                        v_frag, p_frag, acc, a_dtype=kv_dtype, b_dtype=P_DTYPE
+                    )
+                    rocdl.sched_barrier(0)
+                if _wsum and i == num_v_frags - 1:
+                    for q_tile_idx in range(num_q_tiles):
+                        p = p_list[q_tile_idx]
+                        sacc = o_acc_list[q_tile_idx][d_tiles]
+                        for kt in range(num_contract_tiles):
+                            sacc = _wmma(
+                                _ones8,
+                                _concat(
+                                    [
+                                        p[num_p_parts * kt + t]
+                                        for t in range(num_p_parts)
+                                    ]
+                                ),
+                                sacc,
+                                a_dtype=kv_dtype,
+                                b_dtype=P_DTYPE,
+                            )
+                        out_list[q_tile_idx][d_tiles] = sacc
+                        rocdl.sched_barrier(0)
+                return
             for q_tile_idx in range(num_q_tiles):
                 acc = out_list[q_tile_idx][d_tile_idx]
                 if acc is None:
@@ -628,6 +787,26 @@ def _pv_qk_gemm(
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
         k_frag = _concat(parts)
+        if _w128_qk and d_tile_idx < _qk_pairs * 2:
+            if d_tile_idx % 2 == 0:
+                _pend_k[0] = k_frag
+                return
+            a128 = _concat([_pend_k.pop(0), k_frag])
+            for q_tile_idx in range(num_q_tiles):
+                acc = (
+                    s_acc_list[q_tile_idx][kv]
+                    if d_tile_idx > 1
+                    else fx.Vector.filled(8, 0.0, fx.Float32)
+                )
+                s_acc_list[q_tile_idx][kv] = _wmma128(
+                    a128,
+                    _q128[q_tile_idx][d_tile_idx // 2],
+                    acc,
+                    a_dtype=kv_dtype,
+                    b_dtype=q_dtype,
+                )
+                rocdl.sched_barrier(0)
+            return
         for q_tile_idx in range(num_q_tiles):
             acc = (
                 s_acc_list[q_tile_idx][kv]
@@ -651,6 +830,8 @@ def _pv_qk_gemm(
             return ()
         d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
         if d_tile_idx != d_tiles - 1:
+            return ()
+        if _w128_pv and k_tile_idx % 2 == 0:
             return ()
         return [
             p_frags.pop((q_tile_idx, k_tile_idx)) for q_tile_idx in range(num_q_tiles)
@@ -1280,6 +1461,16 @@ def _attention_core_multi_kv_tiles(
     d_tiles = v_hdim // WMMA_M
     num_q_tiles = num_q_tiles_per_wave
     num_kv_frags = n_block // WMMA_N
+    # WSUM: one extra O tile holds the row sum (needs the 128-deep PV pairing).
+    # Band-masked (causal / windowed) calls keep the f32 VALU row sum: their short rows (a
+    # handful of keys) would carry the fp8 rounding of P into the LSE (up to ~2e-2 measured).
+    _WS = int(
+        USE_WSUM
+        and USE_W128
+        and (n_block // (v_mgr.loads_per_frag * WMMA_N)) % 2 == 0
+        and not mask_left
+        and not mask_right
+    )
     # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. The lagging half
     # carries the f32 s_acc in the P slots instead of bf16 P; the slot count is the same.
     # O travels the back edge as ONE tuple (see _o_pack); the P slots do not, because the
@@ -1305,7 +1496,13 @@ def _attention_core_multi_kv_tiles(
         _init += (
             [
                 _raw(m_init[q_tile_idx]),
-                _raw(d_init[q_tile_idx]),
+                _raw(
+                    fx.Vector.from_elements(
+                        [d_init[q_tile_idx]], fx.Float32
+                    ).broadcast_to(8)
+                    if _WS
+                    else d_init[q_tile_idx]
+                ),
             ]
             + [_raw(fx.Vector.filled(8 * d_tiles, 0.0, fx.Float32))]
             + [
@@ -1405,11 +1602,16 @@ def _attention_core_multi_kv_tiles(
             for q_tile_idx in range(num_q_tiles)
         ]
         d_prev = [
-            fx.Float32(state[q_tile_idx * _q_state_slots + 1])
+            (
+                fx.Float32(0.0)
+                if _WS
+                else fx.Float32(state[q_tile_idx * _q_state_slots + 1])
+            )
             for q_tile_idx in range(num_q_tiles)
         ]
         o_acc = [
             _o_unpack(fx.Vector(state[q_tile_idx * _q_state_slots + 2]), d_tiles)
+            + ([fx.Vector(state[q_tile_idx * _q_state_slots + 1])] if _WS else [])
             for q_tile_idx in range(num_q_tiles)
         ]
         # Carried gemm/softmax hand-off: P(tile_idx-1) on the leading half, S(tile_idx-1) on the
@@ -1533,6 +1735,7 @@ def _attention_core_multi_kv_tiles(
                 q_min_list=q_min_list,
                 kv_len=kv_len,
                 s_scale=_s_scale,
+                need_sum=not _WS,
             )
 
             # Rescale each q-tile's running O by this tile's corr. The leading half
@@ -1552,7 +1755,7 @@ def _attention_core_multi_kv_tiles(
             o_vecs = [
                 [
                     fx.Vector(_ir(o_in[q_tile_idx][d_tile_idx]))
-                    for d_tile_idx in range(d_tiles)
+                    for d_tile_idx in range(len(o_in[q_tile_idx]))
                 ]
                 for q_tile_idx in range(num_q_tiles)
             ]
@@ -1585,13 +1788,17 @@ def _attention_core_multi_kv_tiles(
                         [
                             corr_vecs[q_tile_idx]
                             for q_tile_idx in range(num_q_tiles)
-                            for _ in range(d_tiles)
+                            for _ in range(d_tiles + _WS)
                         ],
                         mask_any != fx.Int32(0),
                     )
                 )
                 o_resc_list = [
-                    o_flat[q_tile_idx * d_tiles : (q_tile_idx + 1) * d_tiles]
+                    o_flat[
+                        q_tile_idx
+                        * (d_tiles + _WS) : (q_tile_idx + 1)
+                        * (d_tiles + _WS)
+                    ]
                     for q_tile_idx in range(num_q_tiles)
                 ]
             return p_list, m_new_list, d_new_list, o_resc_list
@@ -1684,8 +1891,11 @@ def _attention_core_multi_kv_tiles(
         out = []
         for q_tile_idx in range(num_q_tiles):
             out += (
-                [_raw(m_new_list[q_tile_idx]), _raw(d_new_list[q_tile_idx])]
-                + [_raw(_o_pack(o_out[q_tile_idx]))]
+                [
+                    _raw(m_new_list[q_tile_idx]),
+                    _raw(o_out[q_tile_idx][d_tiles] if _WS else d_new_list[q_tile_idx]),
+                ]
+                + [_raw(_o_pack(o_out[q_tile_idx][:d_tiles]))]
                 + [_raw(cv) for cv in carry_next[q_tile_idx]]
             )
         rotation = list(range(1, N_KV_PP)) + [0]
@@ -1753,28 +1963,125 @@ def _attention_core_multi_kv_tiles(
             final_state = yield next_state
         return final_state
 
-    state = _init
-    if mask_left:
+    def _busy_tiles(state):
+        if mask_left:
+            state = _run_tiles(
+                state,
+                start_tile_idx,
+                clean_lo_idx,
+                mask_left=mask_left,
+                mask_right=mask_right,
+                kv_len=None,
+            )
         state = _run_tiles(
             state,
-            start_tile_idx,
             clean_lo_idx,
-            mask_left=mask_left,
-            mask_right=mask_right,
+            clean_hi_idx,
+            mask_left=None,
+            mask_right=None,
             kv_len=None,
         )
-    state = _run_tiles(
-        state, clean_lo_idx, clean_hi_idx, mask_left=None, mask_right=None, kv_len=None
-    )
-    state = _run_tiles(
-        state,
-        clean_hi_idx,
-        fx.Int32(num_tiles) + fx.Int32(1),
-        mask_left=mask_left,
-        mask_right=mask_right,
-        kv_len=kv_len,
-    )
-    final = state
+        state = _run_tiles(
+            state,
+            clean_hi_idx,
+            fx.Int32(num_tiles) + fx.Int32(1),
+            mask_left=mask_left,
+            mask_right=mask_right,
+            kv_len=kv_len,
+        )
+        return state
+
+    if IDLE_WAVES and paged is None and qk_hdim < 256:
+        # IDLE_WAVES: a wave whose whole 16*num_q_tiles-row Q span lies past q_len (the tail of a
+        # partial m-tile) skips the gemm/softmax entirely and only keeps its producer duty
+        # (its K or V band copy) and the per-body barriers -- same barrier count, same slot
+        # rotation, state left at the seed. Its SIMD partner then has the issue port alone.
+        def idle_loop(tile_idx, state):
+            slot_of = [fx.Int32(state[_slot_bases_idx + i]) for i in range(N_KV_PP)]
+            write_slot = slot_of[N_KV_PP - 1]
+            prefetch_tile_idx = tile_idx + fx.Int32(1)
+            kv_state_prev = list(
+                state[_kv_state_idx : _kv_state_idx + kv_policy.num_state_slots]
+            )
+            desc = _get_kv_desc(
+                write_slot,
+                _tile_row0(prefetch_tile_idx),
+                _kv_valid(prefetch_tile_idx),
+                kv_policy.indices(kv_state_prev),
+            )
+            kv_state_next = kv_policy.advance(prefetch_tile_idx)
+            # qk_hdim < 256 only: no in-loop phase wall, one fence per body per half.
+            if _is_lagging_softmax:
+                desc.async_load()
+                rocdl.sched_barrier(0)
+                _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
+            else:
+                _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
+                desc.async_load()
+                rocdl.sched_barrier(0)
+            out = list(state[:_k_bases_idx])
+            rotation = list(range(1, N_KV_PP)) + [0]
+            for i in rotation:
+                out += list(
+                    state[
+                        _k_bases_idx
+                        + i * _num_k_bases : _k_bases_idx
+                        + (i + 1) * _num_k_bases
+                    ]
+                )
+            for i in rotation:
+                out += list(
+                    state[
+                        _v_bases_idx
+                        + i * _num_v_bases : _v_bases_idx
+                        + (i + 1) * _num_v_bases
+                    ]
+                )
+            out += [_raw(slot_of[i]) for i in rotation]
+            out += list(state[_head_carry_idx : _head_carry_idx + _num_head_carry])
+            out += [_raw(v) for v in kv_state_next]
+            return out
+
+        @flyc.jit
+        def _idle_tiles(state, lo_i32, hi_i32):
+            final_state = state
+            for tile, carried in range(
+                fx.Index(lo_i32), fx.Index(hi_i32), 1, init=state
+            ):
+                next_state = idle_loop(fx.Int32(tile), list(carried))
+                final_state = yield next_state
+            return final_state
+
+        _wave_row0 = (
+            m_tile_idx * fx.Int32(BLOCK_M) + warp_idx * fx.Int32(WMMA_M * num_q_tiles)
+        ) // fx.Int32(gqa_ratio)
+
+        # The ds_load base pointers (llvm.ptr<3>) cannot cross the scf.if: they are not
+        # read after the loop, so only the rest of the state is yielded out of it.
+        def _strip_ptrs(s):
+            return list(s[:_k_bases_idx]) + list(s[_slot_bases_idx:])
+
+        @flyc.jit
+        def _busy_or_idle(busy):
+            final_state = _strip_ptrs(_init)
+            if busy:
+                final_state = _strip_ptrs(_busy_tiles(_init))
+            else:
+                final_state = _strip_ptrs(
+                    _idle_tiles(
+                        _init, start_tile_idx, fx.Int32(num_tiles) + fx.Int32(1)
+                    )
+                )
+            return final_state
+
+        _nonptr = list(_busy_or_idle(_wave_row0 < q_len))
+        final = (
+            _nonptr[:_k_bases_idx]
+            + list(_init[_k_bases_idx:_slot_bases_idx])
+            + _nonptr[_k_bases_idx:]
+        )
+    else:
+        final = _busy_tiles(_init)
     if not _is_lagging_softmax:
         # Partner for the lagging half's prologue filler -- without it the two halves
         # disagree on the barrier count. It also orders this half's O stores against its
@@ -1800,19 +2107,27 @@ def _attention_core_multi_kv_tiles(
     # ``_attention_epilogue`` supplies, since a wave only retires its own copies and O's
     # chunk halves are shared by wave pairs.
     _copy_wait(*_kv_drain)
+    _o_fin = [
+        _o_unpack(fx.Vector(final[q_tile_idx * _q_state_slots + 2]), d_tiles)
+        for q_tile_idx in range(num_q_tiles)
+    ]
+    if _WS:
+        _d_fin = [
+            fx.Float32(fx.Vector(final[q * _q_state_slots + 1])[0])
+            for q in range(num_q_tiles)
+        ]
+    else:
+        _d_fin = [
+            fx.Float32(final[q_tile_idx * _q_state_slots + 1])
+            for q_tile_idx in range(num_q_tiles)
+        ]
     return _epi_state(
         m_list=[
             fx.Float32(final[q_tile_idx * _q_state_slots + 0])
             for q_tile_idx in range(num_q_tiles)
         ],
-        d_list=[
-            fx.Float32(final[q_tile_idx * _q_state_slots + 1])
-            for q_tile_idx in range(num_q_tiles)
-        ],
-        o_list=[
-            _o_unpack(fx.Vector(final[q_tile_idx * _q_state_slots + 2]), d_tiles)
-            for q_tile_idx in range(num_q_tiles)
-        ],
+        d_list=_d_fin,
+        o_list=[o[:d_tiles] for o in _o_fin],
         o_lds_warp=o_lds_warp,
     )
 
@@ -2591,6 +2906,9 @@ def pick_n_block(qk_hdim, v_hdim, kv_dtype):
 # scope). Kept as a knob: the persistent launch maps units to WGs (and XCDs) per call.
 CARRY_LOAD_CPOL = int(os.environ.get("FMHA_CARRY_LOAD_CPOL", "0"))
 
+# Waves whose whole Q span lies past q_len skip gemm + softmax (producer duty only).
+# AITER_FMHA_A8W8_IDLE_WAVES=0 makes them compute the dead rows as before.
+IDLE_WAVES = os.environ.get("AITER_FMHA_A8W8_IDLE_WAVES", "1") != "0"
 PS_MAX_BATCH = (
     32  # cu_seqlens entries decoded in SGPRs (unrolled); larger batches use the grid
 )
