@@ -504,3 +504,111 @@ panel 的 tile 不够时，后面的行就不存在，没发出去的半块就�
 - 大 token 的进一步优化（还没验证）：fp4 下 W2 预取只值 4–5%，可以把下一个 panel 的 W2 占的约 68 个寄存器腾出来给第二套累加器，让 chunk c 的 epilogue 和 chunk c+1 的 MFMA 重叠。按每个 panel 的 tile 数选两套配置。
 - `mxmoe_gemm_v2.py.bak` 会随 merge 一起进入历史，正式提交前要决定是否删掉。
 
+## 7. 路线 1d 的做法里，哪些可以用到非 ES 的 v2 layout（11-27，只记录，v2 代码没改、没测）
+
+### 7.1 背景：路线 1d（11-27，v3-111 单卡）
+
+路线 1d 是在 1c 上把等 W2' 的 `vmcnt(0)` 都去掉。代码在 `mxmoe_dispatcher_route1d.py` / `mxmoe_gemm_v2_route1d.py`（kernel 名带 `_w2hd`，用 bench 的 `--dispatcher mxmoe_dispatcher_route1d` 测），**还没提交**。
+
+环境：v3-111 的 Spur 作业只分到一张卡（PCI `0002:00:03.0`）；容器 `cguo_gemm2es_v033`，镜像 `vllm/vllm-openai-rocm:v0.33.0`（torch 2.13 + ROCm 10.0，自带 flydsl 0.4.0），只透传这张卡，容器里 `HIP_VISIBLE_DEVICES=0`。flydsl 0.5.3 装在 `/opt/flydsl053`（HEAD、1b、1c、1d 用），0.5.0 装在 `/opt/flydsl050`（`.bak` 用），都通过 `PYTHONPATH` 引入。日志、ISA、`run1d.sh`（测速 + 和 HEAD 的 dump 逐字节比对 + ISA 统计）在 `gemm2es_bench/repro_v3111/`。
+
+3 轮交替跑，取 cold mean 的平均（轮间差异不超过 ±0.7 us）：
+
+| 变体 | 每 CU 的 WG 数 | 2k | 4k |
+|---|---|---|---|
+| HEAD persist-es | 3 | 106.2 | 146.9 |
+| HEAD，强制 2 WG/CU | 2 | 124.0 | 179.2 |
+| 路线 1b | 2 | 106.7 | 158.6 |
+| 路线 1c | 2 | 127.6 | 196.4 |
+| 路线 1d | 2 | **98.2** | **131.1** |
+| `.bak` 完整 ES | 2 | 94.8 | 119.9 |
+
+逐步的改动（单次测量，2k / 4k，从 1c 的 127.5 / 196.7 出发；下文用"1d 第 N 步"引用）。route rows 每一步都和 HEAD 逐字节一致：
+
+1. kt1 先发 A k3 的 DMA 和 A scale，再发 W2'；token id 在 W2' 之前读；kt3、epilogue 的 vmcnt 用编译期算出的条数：111.5 / 170.6。
+2. expert id 用 expert table 里的值，去掉 lag tile 开头读 `sorted_expert_ids` 之后的 `vmcnt(0)`：111.4 / 170.1。
+3. 下一个 chunk 的 A（4 个 K-tile）、A scale、token id，在当前 chunk 开头、W2' 之前，用 async LDS DMA 发到另一块 LDS buffer；C staging 有自己的 16 KB，kt3 不再需要 vmcnt 和 barrier：101.7 / 147.0。
+4. 去掉 lag：chunk 0、1 总是执行（同 1b，要求 `SBM >= 64`），chunk 0、1、2 之间没有分支；WG 第一个 panel 自己的 W2 在 chunk 0 开头、预取之前 load：99.7 / 144.4。原因是分支汇合时 LLVM 要拷贝在途的 W2' 寄存器，拷贝前插 `vmcnt(0)`（ISA 里是 `v_accvgpr_write` 前的 `vmcnt(0)`）。试过按"不 lag 且 ≥ 3 个 chunk"另开一条无分支路径：tile 代码变成 9 份，VGPR 256、spill 84 个，188 / 236，放弃。
+5. chunk 循环的两个代码生成问题：从循环变量算出的地址在 VGPR 里，A scale 的 buffer 描述符被编成 waterfall 循环（`v_cmp_eq_u64` + `s_cbranch_execnz`，加 `readfirstlane` 解决）；循环的回边从 epilogue 的分歧 store 分支里出来，整个循环成了分歧循环（`s_andn2_b64 exec`）：99.2 / 138.7。
+6. A scale 和 token id 也走 LDS DMA，和 A 同一组：不再有跨迭代携带的在途寄存器（它们在回边上被拷贝，拷贝前 `vmcnt(0)`，连 store 一起等）：97.5 / 133.2。
+7. route row 的 store 改成无条件的 buffer store，无效行的地址指到 route rows 末尾之后、被丢弃：各路径的 vm 指令条数一样，汇合后的等待不再多等 W2' 的前 4 条：97.1 / 131.5。
+8. expert table 的行提前一个 panel 读，在循环体末尾 `readfirstlane`：panel 开头不再等刚发出的 global load（那里会连带等完上一个 chunk 的 store）：约 97.5 / 130.9。
+
+最终 ISA：VGPR 214（1c 是 234）、LDS 34 KB，没有 spill，没有 exec 分支；只有 panel 循环之前还有一个 `vmcnt(0)`。chunk 1、2 开头是 `vmcnt(19)`（10 条 W2'、4 条 store、5 条预取都在途），W2' h0 在途到 chunk 2 开头，h1 在途到 chunk 3 开头或 panel 结束。和 `.bak` 的差距主要在 4k（11 us）：4k 每个 panel 约 5 个 chunk，W2' 只在 chunk 0、1 里发；`.bak` 是 8/3/3/3/3 分到 5 个 chunk。下一步可以按每个 expert 的行数在编译期选份数（比如 2k 分 2 份、4k 分 4 份）。
+
+### 7.2 非 ES v2 tuned 的现状（v3-111，`AITER_MXFP4_G2_ES=0`，`aiter_head`）
+
+- kernel：`…bm64_bn256_bk128_reduce_tk9_sbm128_persist_cu256…`（4k 没有 `_sbm128`）。2k 117.8、4k 156.2（单次）。ISA 在 `repro_v3111/isa/v2_tuned*`。
+- VGPR 138、LDS 32 KB（C staging 32 KB，A 的 3 个槽位和它共用），每 CU 3 个 WG（3 WG 的 VGPR 上限是 168；LDS 每 CU 160 KB）。没有 spill，没有 waterfall 循环；persist 循环是 uniform 的，4 个 exec 分支都是 epilogue 的 store。
+- persist-m：网格 256 × 24 = 6144 个 WG，同时驻留 768 个。每个 WG 固定一个 N-block，按 m 步长 256 处理 m-tile；按 sort 的填充估算，2k 每个 WG 约 2 个 m-tile，4k 约 3 个。
+- 每个 tile 的执行顺序和等待（2k、4k 的 ISA 结构相同）：
+
+```
+tile start  BAR | A k0, A k1 (LDS DMA) | if m_block < total | sorted_expert_ids (global_load), A scale
+            vmcnt(1)                  <- waits the expert id and both A DMAs
+            readfirstlane e | B scales, A scale, B k0 (x4), B k1 (x4)
+kt0         BAR | ds_read A k0 | A k2 | vmcnt(8..5) MFMA k0   <- B k0 latency, after the expert id's
+kt1         B k2, scales c1 | vmcnt(8) BAR | ds_read A k1 | A k3 | MFMA k1
+kt2         B k3 | vmcnt(4) BAR | ds_read A k2 | MFMA k2
+kt3         BAR | ds_read A k3 | vmcnt(0) lgkmcnt(0) BAR | MFMA k3 + C ds_write
+epilogue    BAR | token ids (buffer_load x4) | vmcnt(0) | 4 x (if valid: global_store x2)
+```
+
+- 每个 tile 暴露三段访存延迟：tile 开头 expert id 和 B k0 串行两段（A 和 expert id 并行），epilogue 的 token id 一段。只靠同一 CU 上另外 2 个 WG 掩盖。
+
+### 7.3 可以尝试的改动
+
+**A. 不改流水线结构，不增加 LDS**
+
+1. **expert id 提前一个 tile 读**（对应 1d 第 2、8 步）。persist-m 下一个 tile 的 m_block 已知（当前 + 256，越界时 clamp）。在当前 tile 里发它的 `sorted_expert_ids` load，到循环体末尾再 `readfirstlane`，作为 SGPR 带进下一轮。下一个 tile 开头 B scale、B k0、B k1 可以和 A 同时发，关键路径少一段 expert id 的延迟。
+   - `readfirstlane` 要放在循环体末尾。放在循环头的话，循环头汇合时按 prologue 那条路径算（load 刚发出），每一轮都会变成 `vmcnt(0)`（1d 第 8 步就是这么处理的）。
+   - 最小版本：只把 expert id 的读挪到 A DMA 之前（现在 A DMA 由 dispatcher 先发，body 里才读 expert id）。等 expert id 时不再连带等 A 的 DMA，但 expert id 到 B k0 还是串行的。
+   - 也可以看能不能让 LLVM 把它编成 scalar load（走 lgkmcnt，完全不碰 vmcnt）。现在循环里是 `global_load`，因为编译器不能证明它和 store 不别名；flydsl 有没有办法强制，没查。
+2. **token id 提前读**（1b、1d 第 1 步）。把 epilogue 的 4 条 token id load 挪到 tile 前段（比如 kt0 发完 B 之后），epilogue 只剩 LDS 读和 store。多 4 个 VGPR（138 → 约 142），仍是 3 WG/CU。发在 B k(t) 之后的话，会在 MFMA k(t+1) 处被顺带等完；它和 B 同时在途，不额外暴露延迟。
+3. **去掉 persist 循环里多余的 `if m_block < total_m_blocks`**：`n_iters` 已经保证 m_block 在范围内。现在无害（tile 之间没有在途的 load），但只要做了下面任何一种跨 tile 预取，这个包住整个 tile 的分支就会在汇合点让 LLVM 取更紧的等待，并可能拷贝在途寄存器（3.13、1d 第 4 步）。
+4. **store 改成无条件的 buffer store**（1d 第 7 步）：无效行的地址指到 route rows 末尾之后，靠 buffer 的 num_records 丢弃。v2 的 fp4 route row 和 ES 一样是每行 8 字节值加 1 字节 e8m0，可以直接照搬 `mxmoe_gemm_v2_route1d.py` 里 `atomic_bf16_epilog` 的 `uncond_stores`。单独做也能去掉 epilogue 的 4 个分歧分支（每个 tile 4 次 exec 切换，BM=64 时 M_REPS=4）；做了跨 tile 预取以后，它还保证各路径的 vm 指令条数一致，汇合后的等待不会多等在途的 load。
+
+**B. 跨 tile 预取**
+
+5. **下一个 tile 的 B k0（加 B scale c0、A scale c0）放到当前 tile 的 kt3 槽位**（1b 的思路用在 v2 上）。v2 在 kt3 没有 B load（`kt + 1 < KT` 不成立），这时 `nxt_bqf`、`bsf_slots[0]`、`saf_slots[0]` 都已经用完，不增加 VGPR。前提是 1（下一个 tile 的 expert id 已知）。要让它跨过 tile 边界在途：
+   - kt3 的 `vmcnt(0)` 改成精确计数：它只是为了等 A 的 DMA 落地，B k0' 在 A k3 之后发。
+   - token id 已经提前读（2），epilogue 不再 `vmcnt(0)`。
+   - B 的 cur/nxt 双缓冲在 tile 之间的角色要固定（kt3 发进 nxt，下一个 tile 的 kt0 从它读），类似 ES 的 `es.bq`。
+   - 单独做 5 时，下一个 tile 开头等 A k0/k1 的那个等待会把 B k0' 一起等完（A 排在它后面发），所以 B k0' 只在途"MFMA k3 + epilogue"这一段。ES 上类似的 1d 第 1 步把 127.5 降到 111.5。要它在途更久，需要 6。
+6. **下一个 tile 的 A（整块 4 个 K-tile）、A scale、token id 用 async LDS DMA 提前一个 tile 发**（1d 第 3、6 步）。tile 开头只用 `wait_asyncmark(1)` 等本 tile 那一组（上一个 tile 发的），K 循环里不再有 A 的 DMA 和逐 kt 的 barrier。
+   - LDS：BM=64 时一块 A 是 16 KB，C staging 是 32 KB。照搬 1d（C 独立加两块 A）要约 66 KB，每 CU 只能放 2 个 WG，丢掉第 3 个 WG 很可能不划算（3.13 里 HEAD 从 3 降到 2 WG/CU 慢了 17–31 us）。
+   - 可以让 C 复用当前 tile 的 A buffer：三块 16 KB 的 R0、R1、R2。偶数 tile 的 A 在 R0，C 写 R0+R1，下一个 tile 的 A 发到 R2；奇数 tile 的 A 在 R2，C 写 R1+R2，下一个发到 R0。A scale、token id 的尾部（BM=64 时 1 KB + 256 B）放在这三块之外，两份。总共约 51 KB，3 个 WG 约 152 KB，160 KB 放得下。kt3 仍要 barrier（C 覆盖本 tile 的 A），但不需要 `vmcnt(0)`。
+   - 收益受每个 WG 的 tile 数限制：2k 约 2 个、4k 约 3 个，只有第 2 个 tile 起才受益。可以同时试更大的 m 步长（每个 WG 处理更多 m-tile、网格更小），这是另一个调度旋钮，要实测。
+   - 做了 6 之后，5 的 B k0' 可以一直在途到下一个 tile 的 MFMA k0；再往后，B k1' 也可以放进 epilogue 之前的槽位（相当于 v2 版的"下一个 panel 的 W2 一半"）。
+
+**C. 做了跨 tile 预取之后要检查的 LLVM 行为**（1d 的教训；每一步都看 ISA 的 vmcnt 列表，确认想留在途的 load 没在某处被等完）
+
+7. **分支汇合点**：有 load 在途时，汇合处可能拷贝它的目的寄存器（拷贝前插等待），而且等待取各条路径里更紧的那个（3.13、1d 第 4 步）。稳态的 tile 代码里不要有包住 load 的运行时分支；必须有的（比如 WG 的第一个 tile），就把分支里的 load 放在其他 load 之前发。
+8. **循环的回边不要从分歧分支里出来**（1d 第 5 步）：否则整个循环成了分歧循环，循环携带的寄存器在回边上拷贝、`vmcnt(0)`。ISA 里出现 `s_andn2_b64 exec` 就是这个问题。做了 4 之后 epilogue 没有分歧分支，这个问题也就不会出现。
+9. **从循环变量算出的地址、buffer 描述符要 `readfirstlane`**（1d 第 5 步）：否则 buffer load 会被编成 waterfall 循环。v2 现在没有，但加了"下一个 tile"的地址计算之后可能出现。
+10. **跨迭代携带的在途寄存器**（下一个 tile 的 A scale、token id、expert id）会在回边上被拷贝并等完：要么放进 LDS（和 A 同一组 DMA，1d 第 6 步），要么在循环体末尾就 `readfirstlane` 或用掉。
+
+**D. 已经测过的**
+
+11. tile 内的 A 改用 async LDS DMA（3.9）：v2 tuned 快约 1%（2k 121.3 → 120.0，4k 164.0 → 162.4）。6 需要它。
+
+### 7.4 只适用于 ES、v2 用不上的
+
+- W2 在 panel 的各个 chunk 之间常驻、预取下一个 panel 的 W2：v2 的连续 m-tile 一般是不同的 expert，B 不能复用。
+- 按 panel 顺序的调度、`place_half`、"chunk 0、1 总是执行"（`SBM >= 64`）。
+- expert table：v2 的 sort 不输出 `aiter_expert_info`（bench 里 `expert_info=False`），对应的做法是 1，提前读 `sorted_expert_ids`。
+
+### 7.5 建议顺序和测法
+
+- 顺序：1、2、3、4 互相独立，不改流水线、不增加 LDS，风险最小，先做；然后 5；最后 6（需要 3、4 和 C 里的检查）。
+- 改 `mxmoe_gemm_v2.py` 会同时影响 v2 和 HEAD 的 ES 路径（共用 tile 代码）；kernel 名不变时要加 `-e FLYDSL_RUNTIME_ENABLE_CACHE=0`。改之前先用原代码 dump 一份 v2 的 route rows 做基准（这次没有存 v2 的 dump）：
+
+```bash
+cd /shared_nfs/cguo/gemm2es_bench
+E=(-e HIP_VISIBLE_DEVICES=0 -e AITER_MXFP4_INTERMEDIATE=1 -e AITER_MXFP4_G2_ES=0 -e FLYDSL_RUNTIME_CACHE_DIR=/root/.flydsl/cache053)
+docker exec -w $PWD "${E[@]}" -e PYTHONPATH=/opt/flydsl053:/shared_nfs/cguo/aiter_pf22 cguo_gemm2es_v033 \
+  python3 bench_gemm2es.py -t 2048 4096 --iters 100 --label v2_ref --dump-dir repro_v3111/dump
+```
+
+- ISA 用 `FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 FLYDSL_DUMP_DIR=...` 导出，看 VGPR、每 CU 的 WG 数（`es_wg_per_cu` 只对 ES 有效；v2 看 VGPR ≤ 168、LDS ≤ 53 KB 才能 3 WG/CU）和 vmcnt 列表。`repro_v3111/run1d.sh` 可以改一下 dispatcher 和 `G2_ES` 直接用。容器以 root 写出的文件（包括 `__pycache__`）要在容器里 `chown` 回来。
+
