@@ -11,6 +11,7 @@ from torch import Tensor
 
 from aiter import dtypes
 from aiter.jit.core import compile_ops
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -77,12 +78,31 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
 def _rotate_activation_hd128(
     out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor
 ) -> None:
-    """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
+    """Apply normalized Walsh-Hadamard rotation to hd128 rows."""
 
 
 def _or_empty(input: Tensor, mean: Optional[Tensor]) -> Tensor:  # noqa: UP045
     """The quantizer kernels read an empty tensor as "no K mean"."""
     return input.new_empty((0,), dtype=torch.float32) if mean is None else mean
+
+
+def _rotate_activation_hd128_checked_fake(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor, operation: str
+) -> None:
+    del out, input, mean, partial_amax, operation
+
+
+# The row layout depends on data_ptr(), which only a real tensor has, so the check runs in an op.
+# It is the op that launches: one with neither outputs nor mutations is dead code to torch.compile.
+@torch_compile_guard(
+    mutates_args=["out", "partial_amax"], gen_fake=_rotate_activation_hd128_checked_fake
+)
+def _rotate_activation_hd128_checked(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor, operation: str
+) -> None:
+    _validate_hip_row_layout(input, operation)
+    rotate = getattr(_rotate_activation_hd128, "_eager_body", _rotate_activation_hd128)
+    rotate(out, input, mean, partial_amax)
 
 
 def rotate_activation_hd128(
@@ -96,8 +116,12 @@ def rotate_activation_hd128(
     Pass `partial_amax` to have the kernel also emit a per-block amax of the rotated values,
     which saves a per-tensor quantizer the full extra read its own amax pass would cost.
     """
-    _rotate_activation_hd128(
-        out, input, _or_empty(input, mean), _or_empty(input, partial_amax)
+    _rotate_activation_hd128_checked(
+        out,
+        input,
+        _or_empty(input, mean),
+        _or_empty(input, partial_amax),
+        "hd128 rotation",
     )
 
 
@@ -212,15 +236,38 @@ def _validate_hd128_last_dimension(input: Tensor, operation: str) -> None:
         )
 
 
+def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
+    _validate_hd128_last_dimension(input, operation)
+    if input.is_contiguous():
+        # Dense rows are read as one buffer range, which takes any element-aligned start.
+        return
+    if input.data_ptr() % 16:
+        raise ValueError(f"{operation} input must start on a 16-byte boundary")
+    if input.dim() == 4:
+        element_size = input.element_size()
+        if any(
+            input.shape[dimension] != 1 and input.stride(dimension) * element_size % 16
+            for dimension in range(3)
+        ):
+            raise ValueError(
+                f"{operation} input batch, sequence and head strides must be "
+                "multiples of 16 bytes"
+            )
+    else:
+        raise ValueError(f"{operation} input that is not BSHD must be contiguous")
+
+
 def _validate_bshd_hd128(
     input: Tensor, operation: str, hip_rows: bool = True
 ) -> tuple[int, int, int, int]:
-    # The HIP producers read contiguous rows; the Triton ones take any pointer and strides.
+    # The HIP producers read strided rows as 16-byte vectors; the Triton ones take any pointer and
+    # strides.
     if input.dim() != 4:
         raise ValueError(f"{operation} requires hd128 BSHD input")
-    _validate_hd128_last_dimension(input, operation)
-    if hip_rows and not input.is_contiguous():
-        raise ValueError(f"{operation} requires a contiguous BSHD input")
+    if hip_rows:
+        _validate_hip_row_layout(input, operation)
+    else:
+        _validate_hd128_last_dimension(input, operation)
     return input.shape
 
 
@@ -411,12 +458,12 @@ def quantize_fp8_rotated(
     The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
     rather than three.
     """
-    if input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
-    rotated = torch.empty_like(input)
+    rotated = input.new_empty(input.shape)
     blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
     partial = input.new_empty((blocks,), dtype=torch.float32)
-    rotate_activation_hd128(rotated, input, mean, partial)
+    _rotate_activation_hd128_checked(
+        rotated, input, _or_empty(input, mean), partial, "rotated FP8 quantization"
+    )
     return _quantize_per_tensor(
         rotated, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0, partial
     )

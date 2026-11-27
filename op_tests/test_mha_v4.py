@@ -56,6 +56,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_QUERY_TILE_ROWS,
     k_smooth_mean,
     mha_v4_q_multiplier,
+    mxfp4_k_raw_buffer_size,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
@@ -75,7 +76,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
+    rotate_activation_mxfp4_quant_k,
     rotate_activation_mxfp6_quant,
+    rotate_activation_mxfp6_quant_k,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
@@ -585,11 +588,11 @@ def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
     ), f"scale {scale.item():.9e} vs expected {expected_scale.item():.9e}"
 
 
-def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
+def test_mha_v4_rotated_fp8_quantization_rejects_a_strided_last_dimension():
     value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(-1, -2)
 
-    with expect_raises(ValueError, match="requires contiguous hd128 input"):
+    with expect_raises(ValueError, match="contiguous last dimension"):
         quantize_fp8_rotated(value)
 
 
@@ -612,6 +615,29 @@ def _strided_bshd_views(batch, sequence, heads):
     }
 
 
+def _zero_filled_k_pack(packer, value, mean):
+    """Run a raw K packer into zeroed buffers: its tile padding is never written, so only a
+    zeroed allocation makes two runs comparable byte for byte."""
+    batch, sequence, heads, _ = value.shape
+    mean = value.new_empty((0,), dtype=torch.float32) if mean is None else mean
+    if packer is quantize_mxfp4_k:
+        raw = torch.zeros(
+            mxfp4_k_raw_buffer_size(batch, sequence, heads),
+            dtype=torch.uint8,
+            device=value.device,
+        )
+        scale = torch.zeros(
+            (batch, sequence, heads, 4), dtype=torch.uint8, device=value.device
+        )
+        rotate_activation_mxfp4_quant_k(raw, scale, value, mean)
+    else:
+        data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
+        raw = torch.zeros(data_size, dtype=torch.uint8, device=value.device)
+        scale = torch.zeros(scale_size, dtype=torch.uint8, device=value.device)
+        rotate_activation_mxfp6_quant_k(raw, scale, value, mean)
+    return raw, scale
+
+
 def _bitwise_equal(actual, expected):
     if isinstance(actual, tuple):
         return all(_bitwise_equal(a, e) for a, e in zip(actual, expected))
@@ -621,38 +647,69 @@ def _bitwise_equal(actual, expected):
 
 
 _STRIDED_QUANTIZERS = {
-    "int8": quantize_int8,
-    "fp8": quantize_fp8,
-    "v_fp8": quantize_v_fp8,
-    "v_mxfp6": quantize_v_mxfp6,
+    "int8": lambda x, mean: quantize_int8(x),
+    "fp8": lambda x, mean: quantize_fp8(x),
+    "fp8_rotated": lambda x, mean: quantize_fp8_rotated(x, mean),
+    "mxfp8_q": lambda x, mean: quantize_mxfp8_q(x, 0.127),
+    "mxfp8_k": lambda x, mean: quantize_mxfp8_k(x, mean),
+    "mxfp4_q": lambda x, mean: quantize_mxfp4_q(x, 0.127),
+    "mxfp4_k": lambda x, mean: _zero_filled_k_pack(quantize_mxfp4_k, x, mean),
+    "mxfp6_q": lambda x, mean: quantize_mxfp6_q(x, 0.127),
+    "mxfp6_k": lambda x, mean: _zero_filled_k_pack(quantize_mxfp6_k, x, mean),
+    "v_fp8": lambda x, mean: quantize_v_fp8(x),
+    "v_mxfp4_fp6_p": lambda x, mean: quantize_v_mxfp4_fp6_p(x),
+    "v_mxfp6": lambda x, mean: quantize_v_mxfp6(x),
+    "v_mxfp6_fp6_p": lambda x, mean: quantize_v_mxfp6_fp6_p(x),
+}
+_HIP_ROW_LAYOUT_QUANTIZERS = {
+    "rotate_hd128": lambda x: rotate_activation_hd128(torch.empty_like(x), x),
+    "fp8_rotated": lambda x: quantize_fp8_rotated(x),
+    "mxfp8_q": lambda x: quantize_mxfp8_q(x, 0.127),
+    "mxfp8_k": lambda x: quantize_mxfp8_k(x),
+    "mxfp4_q": lambda x: quantize_mxfp4_q(x, 0.127),
+    "mxfp4_k": lambda x: quantize_mxfp4_k(x),
+    "mxfp6_q": lambda x: quantize_mxfp6_q(x, 0.127),
+    "mxfp6_k": lambda x: quantize_mxfp6_k(x),
+    "v_mxfp4_fp6_p": quantize_v_mxfp4_fp6_p,
+    "v_mxfp6_fp6_p": quantize_v_mxfp6_fp6_p,
 }
 _TRITON_V_QUANTIZERS = {"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}
-_GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "v_fp8"}
-# Off gfx950 the MX quantizers abort rather than raise, so they are skipped there rather than run.
+_GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "fp8_rotated", "v_fp8"}
+# Only the K quantizers take a mean. Off gfx950 the MX quantizers abort rather than raise, so
+# they are skipped there rather than run.
 _STRIDED_QUANTIZER_CASES = [
     param(
         quantizer,
+        with_mean,
         skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
     )
     for quantizer in _STRIDED_QUANTIZERS
+    for with_mean in (
+        (False, True)
+        if quantizer.endswith("_k") or quantizer == "fp8_rotated"
+        else (False,)
+    )
 ]
 
 
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
-@parametrize("quantizer", _STRIDED_QUANTIZER_CASES)
+@parametrize("quantizer,with_mean", _STRIDED_QUANTIZER_CASES)
 @parametrize("batch,sequence,heads", [(2, 1001, 5), (1, 129, 2)])
 def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
-    quantizer, batch, sequence, heads
+    quantizer, batch, sequence, heads, with_mean
 ):
     """A view whose rows alone are dense quantizes exactly as its contiguous copy does.
 
     The crop is NaN outside its rows, so a read past them would surface in the codes or scales.
     """
     torch.manual_seed(41)
-    quantize = _STRIDED_QUANTIZERS[quantizer]
     for value in _strided_bshd_views(batch, sequence, heads).values():
         assert not value.is_contiguous()
-        assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
+        dense = value.contiguous()
+        mean = dense.float().mean(dim=1).contiguous() + 0.25 if with_mean else None
+        expected = _STRIDED_QUANTIZERS[quantizer](dense, mean)
+        actual = _STRIDED_QUANTIZERS[quantizer](value, mean)
+        assert _bitwise_equal(actual, expected)
 
 
 def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
@@ -662,6 +719,78 @@ def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
         (batch, sequence, heads, row), device="cuda", dtype=torch.bfloat16
     )
     return storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
+
+
+@parametrize("quantizer", list(_HIP_ROW_LAYOUT_QUANTIZERS))
+@parametrize(
+    "layout,message",
+    [
+        ("misaligned_pointer", "start on a 16-byte boundary"),
+        ("misaligned_outer_stride", "strides must be multiples of 16 bytes"),
+    ],
+)
+def test_mha_v4_hip_quantizers_reject_unsupported_bshd_layouts(
+    quantizer, layout, message
+):
+    value = _misaligned_bshd_view(layout)
+
+    with expect_raises(ValueError, match=message):
+        _HIP_ROW_LAYOUT_QUANTIZERS[quantizer](value)
+
+
+def _rotate_hd128(value):
+    out = torch.empty(value.shape, device=value.device, dtype=value.dtype)
+    rotate_activation_hd128(out, value)
+    return out
+
+
+def _rotate_mxfp6(value):
+    batch, sequence, heads, _ = value.shape
+    out = value.new_empty((batch, sequence, heads, 96), dtype=torch.uint8)
+    scale = value.new_empty((batch, sequence, heads, 4), dtype=torch.uint8)
+    rotate_activation_mxfp6_quant(out, scale, value, 1.0)
+    return out, scale
+
+
+_HIP_DENSE_ENTRY_POINTS = {
+    "rotate_hd128": _rotate_hd128,
+    "rotate_mxfp6": _rotate_mxfp6,
+    **{
+        name: lambda x, quantize=_STRIDED_QUANTIZERS[name]: quantize(x, None)
+        for name in _HIP_ROW_LAYOUT_QUANTIZERS
+        if name in _STRIDED_QUANTIZERS
+    },
+}
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize(
+    "entry_point",
+    [
+        param(
+            name,
+            skip=get_gfx() != "gfx950" and name not in ("rotate_hd128", "fp8_rotated"),
+        )
+        for name in _HIP_DENSE_ENTRY_POINTS
+    ],
+)
+@parametrize("offset", [1, 4])
+def test_mha_v4_hip_quantizers_take_contiguous_input_at_any_element_offset(
+    entry_point, offset
+):
+    """Contiguous rows are read as one buffer range, which needs no 16-byte start: only strided
+    rows do. A contiguous view off that grid quantizes exactly as an aligned copy does.
+    """
+    torch.manual_seed(47)
+    shape = (2, 257, 3, 128)
+    storage = torch.randn(
+        math.prod(shape) + offset, device="cuda", dtype=torch.bfloat16
+    )
+    value = storage[offset:].view(shape)
+    assert value.is_contiguous() and value.data_ptr() % 16
+    quantize = _HIP_DENSE_ENTRY_POINTS[entry_point]
+
+    assert _bitwise_equal(quantize(value), quantize(value.clone()))
 
 
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
@@ -677,7 +806,7 @@ def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
 )
 @parametrize("layout", ["misaligned_pointer", "misaligned_outer_stride"])
 def test_mha_v4_triton_v_quantizers_accept_misaligned_bshd_views(quantizer, layout):
-    """The Triton V producers take any pointer and strides."""
+    """The Triton V producers have no 16-byte row requirement, unlike the HIP ones."""
     torch.manual_seed(43)
     value = _misaligned_bshd_view(layout, batch=2, sequence=257, heads=3)
     quantize = _TRITON_V_QUANTIZERS[quantizer]
@@ -767,6 +896,61 @@ def test_mha_v4_per_tensor_quantization_addresses_past_2_31_elements(layout):
 
     assert finished.returncode == 0, finished.stderr[-2000:]
     assert "matched" in finished.stdout
+
+
+def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
+    value = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
+    value = value.transpose(0, 1)
+
+    with expect_raises(ValueError, match="not BSHD must be contiguous"):
+        quantize_fp8_rotated(value)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+@parametrize(
+    "caller,operation",
+    [
+        ("quantize_fp8_rotated", "rotated FP8 quantization"),
+        ("rotate", "hd128 rotation"),
+    ],
+)
+def test_mha_v4_rotation_keeps_its_row_layout_check_under_torch_compile(
+    caller, operation
+):
+    """torch.compile drops an op with neither outputs nor mutations, so a row-layout check of
+    its own let a misaligned view through to the HIP check.
+
+    Out of process because that check aborts rather than raises.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_fp8_rotated, rotate_activation_hd128
+
+        def rotate(value):
+            out = torch.empty_like(value)
+            rotate_activation_hd128(out, value)
+            return out
+
+        storage = torch.randn((1, 128, 2, 136), device="cuda", dtype=torch.bfloat16)
+        torch.compile({caller}, fullgraph=True)(storage[..., 1:129])
+        torch.cuda.synchronize()
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode != 0
+    assert (
+        f"ValueError: {operation} input must start on a 16-byte boundary"
+        in finished.stderr
+    ), finished.stderr[-2000:]
 
 
 # The MX quantizers AITER_CHECK on gfx950, and that check aborts rather than raising.
