@@ -9,9 +9,9 @@ Reference, on the same explicit noise:
     mixed_sample_outer_exponential + topk_select(.., 1, tie="low") + where
 
 Greedy rows must match exactly. Sampled rows run the same device function on
-the same noise and must match too; the count of exact-tie flips of the Gumbel
-score (which a different inlining could round differently) is reported and
-bounded.
+the same noise and must match too, bit for bit: no sampled row may differ from
+the chain on these seeded inputs (measured 0 on MI355X over every dtype,
+vocabulary, concurrency and pitch here).
 
 Perf (-p): the fused op vs the chain an inference engine runs today, with the
 noise drawn outside the timed region in both: the Triton chain
@@ -150,9 +150,7 @@ def check_accuracy(l_dtype, l_conc, l_v, max_draft):
                     g_bad, s_bad, n = _mismatch(args, run_fused(*args))
                     tag = f"{dtype} {V=} {conc=} {pitch=}"
                     assert g_bad == 0, f"greedy mismatch {tag}: {g_bad}/{n}"
-                    assert s_bad <= max(
-                        1, n // 100
-                    ), f"sampled flips {tag}: {s_bad}/{n}"
+                    assert s_bad == 0, f"sampled mismatch {tag}: {s_bad}/{n}"
     aiter.logger.info("spec_verify_pick accuracy passed")
 
 
