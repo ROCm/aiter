@@ -238,6 +238,9 @@ def launch_gemm_a8w8_256x256(
     SA_PANEL_ROW = SA_PANEL_WIDTH + SA_PANEL_PAD
     # A-scale panel slots; a panel is loaded (SA_RING - 1) panels ahead of use.
     SA_RING = 2 if SA_PANEL_STAGES >= 16 else num_buffers
+    # A panel spanning whole K-loop revolutions is read by every K-step of a
+    # revolution, so its slot, base address and refill state are per revolution.
+    SA_REV_PANEL = SA_PANEL_STAGES > 1 and SA_PANEL_STAGES % num_buffers == 0
     LDS_PAD_A = 16
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
@@ -1019,43 +1022,50 @@ def launch_gemm_a8w8_256x256(
             """
             return fx.Int32(rocdl.perm_b32(word, word, sel))
 
-        def _stage_load_sa_raw(stage, sm, sa_super):
+        # An A-scale K-step is (rev, local): K-step rev * num_buffers + local, with
+        # rev a runtime K-loop revolution and local a constant.
+        def _sa_next(sa_pos, inc):
+            rev, local = sa_pos
+            if const_expr(local + inc == num_buffers):
+                return rev + 1, 0
+            return rev, local + inc
+
+        def _sa_panel(sa_pos):
+            """(panel, runtime K-step in panel, constant K-step in panel)."""
+            rev, local = sa_pos
+            if const_expr(SA_REV_PANEL):
+                revs = SA_PANEL_STAGES // num_buffers
+                return rev // revs, (rev % revs) * num_buffers, local
+            flat = rev * num_buffers + local
+            return flat // SA_PANEL_STAGES, flat % SA_PANEL_STAGES, 0
+
+        def _panel_scale_addr(sa_pos, stage, plane, stride, lane_byte):
+            """LDS base of a panel scale read and its constant byte offset."""
+            panel, step, step_c = _sa_panel(sa_pos)
+            addr = (
+                _planar_base(plane, stride, fx.index_cast(T.index, panel % SA_RING))
+                + lane_byte
+                + fx.index_cast(T.index, step * (SUPER_K // 32))
+            )
+            return addr, step_c * (SUPER_K // 32) + (stage % KPAIR) * (tile_k // 32)
+
+        def _stage_load_sa_raw(stage, sm, sa_pos):
             if const_expr(mx32):
                 if const_expr(SA_PANEL_STAGES > 1):
-                    panel = sa_super // SA_PANEL_STAGES
-                    panel_slot = panel % SA_RING
-                    panel_k = (sa_super % SA_PANEL_STAGES) * (SUPER_K // 32)
-                    addr = (
-                        _planar_base(
-                            PLANAR_SA_BASE,
-                            STAGE_SA,
-                            fx.index_cast(T.index, panel_slot),
-                        )
-                        + sa_byte
-                        + fx.index_cast(T.index, panel_k)
-                        + (stage % KPAIR) * (tile_k // 32)
+                    addr, off = _panel_scale_addr(
+                        sa_pos, stage, PLANAR_SA_BASE, STAGE_SA, sa_byte
                     )
-                    return lds_load_b32(addr, sm * 32 * SA_PANEL_ROW)[0]
+                    return lds_load_b32(addr, off + sm * 32 * SA_PANEL_ROW)[0]
                 # sm advances 32 A rows: 32 * (SUPER_K/32) bytes in row-major LDS.
                 return lds_load_b32(stage_sa_addr[stage], sm * SUPER_K)[0]
             return lds_load_b32(stage_sa_addr[stage], sm * 32)[0]
 
-        def _stage_load_sb_raw(stage, sn, sa_super):
+        def _stage_load_sb_raw(stage, sn, sa_pos):
             if const_expr(SB_PANEL):
-                panel = sa_super // SA_PANEL_STAGES
-                addr = (
-                    _planar_base(
-                        PLANAR_SB_BASE,
-                        STAGE_SB,
-                        fx.index_cast(T.index, panel % SA_RING),
-                    )
-                    + sb_byte
-                    + fx.index_cast(
-                        T.index, (sa_super % SA_PANEL_STAGES) * (SUPER_K // 32)
-                    )
-                    + (stage % KPAIR) * (tile_k // 32)
+                addr, off = _panel_scale_addr(
+                    sa_pos, stage, PLANAR_SB_BASE, STAGE_SB, sb_byte
                 )
-                return lds_load_b32(addr, sn * SB_ROW)[0]
+                return lds_load_b32(addr, off + sn * SB_ROW)[0]
             if const_expr(mx32):
                 return lds_load_b32(stage_sb_addr[stage], sn * SB_ROW)[0]
             return lds_load_b32(stage_sb_addr[stage], 0)[0]
@@ -1162,17 +1172,24 @@ def launch_gemm_a8w8_256x256(
 
             def _prep():
                 if const_expr(SA_PANEL_STAGES > 1):
-                    sa_next_panel = sa_super // SA_PANEL_STAGES + SA_RING
-                    sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
-                        sa_next_panel
-                        < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
-                    )
+                    panel, step, step_c = _sa_panel(sa_super)
+                    sa_next_panel = panel + SA_RING
+                    if const_expr(SA_REV_PANEL and step_c != num_buffers - 1):
+                        sa_refill = fx.Int32(0)
+                    else:
+                        sa_refill = (
+                            (step + step_c == SA_PANEL_STAGES - 1)
+                            & (
+                                sa_next_panel
+                                < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
+                            )
+                        ).select(fx.Int32(1), fx.Int32(0))
                     if const_expr(refill):
                         prep_box[0] = _prepare_tdm(
                             future_slot,
                             future_kt,
                             sa_next_panel,
-                            sa_refill.select(fx.Int32(1), fx.Int32(0)),
+                            sa_refill,
                         )
                 elif const_expr(refill):
                     prep_box[0] = _prepare_tdm(future_slot, future_kt)
@@ -1368,7 +1385,7 @@ def launch_gemm_a8w8_256x256(
                     return out
 
                 def _seed_scales():
-                    sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
+                    sa_next = _sa_next(sa_super, int(stage % KPAIR == KPAIR - 1))
                     for sm in range_constexpr(N_SA):
                         w = _stage_load_sa_raw(next_stage, sm, sa_next)
                         if const_expr(PIN_SCALE_ACTIVE):
@@ -1548,7 +1565,7 @@ def launch_gemm_a8w8_256x256(
                 _seed_thunks(
                     next_stage,
                     parity,
-                    sa_super + int(stage % KPAIR == KPAIR - 1),
+                    _sa_next(sa_super, int(stage % KPAIR == KPAIR - 1)),
                 )
                 if const_expr(has_next)
                 else ([], [])
@@ -1766,7 +1783,7 @@ def launch_gemm_a8w8_256x256(
                 tdm_ops.tensor_load_2d(_prepare_tdm(s, _seed_delta(s)))
             rocdl.sched_barrier(0)
 
-        for group in _seed_thunks(0, 0, fx.Int32(0)):
+        for group in _seed_thunks(0, 0, (fx.Int32(0), 0)):
             for thunk in group:
                 thunk()
         if const_expr(WAR_SCHED):
@@ -1816,7 +1833,7 @@ def launch_gemm_a8w8_256x256(
                         True,
                         boundary,
                         owner_parity,
-                        rev * num_buffers + g // KPAIR,
+                        (rev, g // KPAIR),
                         first_hook=(
                             _first_refill if const_expr(BB_OK and g == 0) else None
                         ),
@@ -1860,7 +1877,7 @@ def launch_gemm_a8w8_256x256(
                     False,
                     g % KPAIR == KPAIR - 1,
                     0,
-                    n_full * num_buffers + g // KPAIR,
+                    (fx.Int32(n_full), g // KPAIR),
                     prefetch=const_expr(DRAIN_PREF[g] or (BB_OK and g == BB_SLOT)),
                     fence_extra=DRAIN_PREF_BEFORE[g],
                     pref_gate=pref_bb if const_expr(BB_OK and g == BB_SLOT) else None,
