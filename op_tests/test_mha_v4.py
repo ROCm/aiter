@@ -675,6 +675,10 @@ _HIP_ROW_LAYOUT_QUANTIZERS = {
 }
 _TRITON_V_QUANTIZERS = {"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}
 _GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "fp8_rotated", "v_fp8"}
+_GFX942_DENSE_ROWS = {
+    (AttentionFormat.FP8,) * 3,
+    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+}
 # Only the K quantizers take a mean. Off gfx950 the MX quantizers abort rather than raise, so
 # they are skipped there rather than run.
 _STRIDED_QUANTIZER_CASES = [
@@ -951,6 +955,97 @@ def test_mha_v4_rotation_keeps_its_row_layout_check_under_torch_compile(
         f"ValueError: {operation} input must start on a 16-byte boundary"
         in finished.stderr
     ), finished.stderr[-2000:]
+
+
+_PACKED_QKV_CROP_FORMATS = [
+    # The gfx942 INT8 kernel is not yet run-to-run deterministic, so its output cannot be
+    # compared bit for bit there; drop that skip once it is. Its strided Q/K reads are still
+    # covered by the int8 rows of the quantizer test above.
+    param(
+        formats,
+        skip=(get_gfx() != "gfx950" and formats not in _GFX942_DENSE_ROWS)
+        or (get_gfx() == "gfx942" and formats[0] == AttentionFormat.INT8),
+        id="-".join(f.name for f in formats),
+    )
+    for formats in [
+        (AttentionFormat.BF16,) * 3,
+        (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
+        (AttentionFormat.FP8,) * 3,
+        (AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP4,) * 3,
+        (AttentionFormat.MXFP6,) * 3,
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.FP8),
+    ]
+]
+_PACKED_QKV_CROP_START, _PACKED_QKV_CROP_SEQUENCE = 37, 1001
+
+
+def _packed_qkv(batch=2, heads=5):
+    """A packed QKV tensor that is NaN outside its crop, so a read past the crop shows."""
+    start, sequence = _PACKED_QKV_CROP_START, _PACKED_QKV_CROP_SEQUENCE
+    qkv = torch.randn(
+        (batch, sequence + 2 * start, 3, heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv[:, :start] = float("nan")
+    qkv[:, start + sequence :] = float("nan")
+    return qkv
+
+
+def _crop_qkv(qkv):
+    start, sequence = _PACKED_QKV_CROP_START, _PACKED_QKV_CROP_SEQUENCE
+    return qkv[:, start : start + sequence].unbind(2)
+
+
+def _native_formats(formats):
+    return tuple(
+        native_fp8_format() if f == AttentionFormat.FP8 else f for f in formats
+    )
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 rows")
+@parametrize("formats", _PACKED_QKV_CROP_FORMATS)
+def test_mha_v4_runs_on_a_sequence_crop_of_packed_qkv(formats):
+    """Q, K and V taken as views of a cropped packed QKV need no copy and change nothing."""
+    formats = _native_formats(formats)
+    torch.manual_seed(43)
+    q, k, v = _crop_qkv(_packed_qkv())
+
+    expected = mha_v4(q.contiguous(), k.contiguous(), v.contiguous(), *formats)
+    actual = mha_v4(q, k, v, *formats)
+
+    assert not torch.isnan(actual).any()
+    assert torch.equal(actual, expected)
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 rows")
+@parametrize("formats", _PACKED_QKV_CROP_FORMATS)
+@parametrize("views", ["inputs", "in_graph"])
+def test_mha_v4_compile_parity_on_a_sequence_crop_of_packed_qkv(formats, views):
+    """Under torch.compile(fullgraph=True) the strided quantizer paths match eager, whether the
+    views are graph inputs or cut from the packed QKV inside the graph."""
+    formats = _native_formats(formats)
+    torch._dynamo.reset()
+    torch.manual_seed(43)
+    qkv = _packed_qkv()
+
+    if views == "inputs":
+        q, k, v = _crop_qkv(qkv)
+        expected = mha_v4(q, k, v, *formats)
+        actual = torch.compile(mha_v4, fullgraph=True)(q, k, v, *formats)
+    else:
+
+        def attend(qkv):
+            return mha_v4(*_crop_qkv(qkv), *formats)
+
+        expected = attend(qkv)
+        actual = torch.compile(attend, fullgraph=True)(qkv)
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(actual).any()
+    assert torch.equal(actual, expected)
 
 
 # The MX quantizers AITER_CHECK on gfx950, and that check aborts rather than raising.
