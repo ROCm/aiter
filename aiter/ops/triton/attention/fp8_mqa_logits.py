@@ -1,3 +1,4 @@
+import functools
 import inspect
 
 import torch
@@ -8,6 +9,7 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -15,11 +17,13 @@ TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
+_gluon_fp8_mqa_logits_rows8_kernel = None
 if TRITON_GE_36:
     try:
         if arch == "gfx950":
             from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
+                _gluon_fp8_mqa_logits_rows8_kernel,
             )
         elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
@@ -27,6 +31,7 @@ if TRITON_GE_36:
             )
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
+        _gluon_fp8_mqa_logits_rows8_kernel = None
 
 
 # Hacks to see if we can use some newer features
@@ -80,6 +85,41 @@ def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
         target_wgs // num_blocks,
         max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
     )
+
+
+@functools.lru_cache(maxsize=1024)
+def _gfx950_rows8_launch(seq_len, seq_len_kv, check_min_programs=True):
+    """Return ``(kernel_config, num_kv_splits)`` for the eight-row path, or None.
+
+    A grid below ``min_programs`` does not fill the GPU, and the existing path
+    is faster. Tests pass ``check_min_programs=False`` to use small shapes.
+
+    The blocks of one batch walk very different numbers of keys (a resumed
+    request next to fresh ones, a block with rows of two requests), and a block
+    of eight rows is a coarse unit: with few programs per compute unit the
+    longest ones set the end time. So this path has its own split rule, with
+    shorter programs than the two-row path: ``min_split_kv`` keys each, up to
+    ``split_rounds`` rounds of the GPU.
+    """
+    config_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
+    config = dict(load_config_json(f"{config_dir}/DEFAULT.json")["rows8"])
+    min_seq_len_kv = config.pop("min_seq_len_kv")
+    min_programs = config.pop("min_programs")
+    min_split_kv = config.pop("min_split_kv")
+    split_rounds = config.pop("split_rounds")
+    if seq_len_kv < min_seq_len_kv:
+        return None
+    num_blocks = max(seq_len // config["BLOCK_M"], 1)
+    # One round is one workgroup for each wave slot of the 256 compute units.
+    round_wgs = config["WAVES_PER_EU"] * 256 * 4 // config["NUM_WARPS"]
+    num_kv_splits = min(
+        max(split_rounds * round_wgs // num_blocks, 1),
+        triton.cdiv(seq_len_kv, min_split_kv),
+    )
+    programs = (seq_len // config["BLOCK_M"]) * num_kv_splits
+    if check_min_programs and programs < min_programs:
+        return None
+    return config, num_kv_splits
 
 
 def _gfx942_tile_fits_lds(
@@ -199,6 +239,65 @@ def fp8_mqa_logits(
     stride_logits_s, stride_logits_k = (0, 1) if packed else logits.stride()
     if seq_len == 0:
         return logits
+
+    # The eight-row kernel writes dense rows with relaxed store masks. It reads
+    # contiguous KV, scales and windows.
+    rows8_launch = (
+        not packed
+        and not clean_logits
+        and use_gluon
+        and arch == "gfx950"
+        and _gluon_fp8_mqa_logits_rows8_kernel is not None
+        and FOLDED_REDUCTED_SUPPORT
+        and ASYNC_COPY_SUPPORTS_DISTRIBUTED
+        and num_heads == 32
+        and head_size == 128
+        and seq_len % 8 == 0
+        and Q.dtype == torch.float8_e4m3fn
+        and KV.dtype == torch.float8_e4m3fn
+        and kv_scales.dtype == torch.float32
+        and KV.is_contiguous()
+        and kv_scales.is_contiguous()
+        and cu_starts.is_contiguous()
+        and cu_ends.is_contiguous()
+        and _gfx950_rows8_launch(seq_len, seq_len_kv)
+    )
+    if rows8_launch:
+        config, num_kv_splits = rows8_launch
+        block_m = config["BLOCK_M"]
+        # The 32-bit store offsets span one eight-row output tile.
+        store_span = 4 * ((block_m - 1) * stride_logits_s + config["BLOCK_KV"] // 2)
+        if store_span > 2**31 - 1:
+            rows8_launch = None
+    if rows8_launch:
+        _gluon_fp8_mqa_logits_rows8_kernel[(seq_len // block_m, num_kv_splits)](
+            Q_ptr=Q,
+            KV_ptr=KV,
+            kv_scales_ptr=kv_scales,
+            weights_ptr=weights,
+            cu_start_ptr=cu_starts,
+            cu_end_ptr=cu_ends,
+            logits_ptr=logits,
+            seq_len_kv=seq_len_kv,
+            NUM_HEADS=num_heads,
+            HEAD_SIZE=head_size,
+            stride_q_s=stride_q_s,
+            stride_q_h=stride_q_h,
+            stride_q_d=stride_q_d,
+            stride_kv_s=stride_kv_s,
+            stride_kv_d=stride_kv_d,
+            stride_w_s=stride_w_s,
+            stride_w_h=stride_w_h,
+            stride_logits_s=stride_logits_s,
+            stride_logits_k=stride_logits_k,
+            USE_PADDED_SHARED_LAYOUT=ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+            num_warps=config["NUM_WARPS"],
+            waves_per_eu=config["WAVES_PER_EU"],
+            enable_fp_fusion=True,
+            **config,
+        )
+        return logits
+
     if not use_gluon:
         # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
         # the default (128, 2) tile would not fit two co-resident workgroups
