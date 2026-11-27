@@ -23,6 +23,7 @@ from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_w4a16_rdna import (
     ROW_PATH_MAX_TOKENS,
+    TILE_N,
     flydsl_rdna_moe,
     flydsl_rdna_moe_path,
     flydsl_rdna_moe_supported,
@@ -171,6 +172,8 @@ def test_flydsl_moe_w4a16_rdna(
     routed = min(int((topk_ids >= 0).sum()), experts)
     weight_bytes = routed * 3 * hidden * inter // 2
     flops = 2 * tokens * top_k * 3 * hidden * inter
+    # The mismatch allowance is for rounding; rows the op misses stay NaN.
+    assert out.isfinite().all(), "flydsl_rdna_moe: non-finite output"
     err = checkAllclose(
         ref,
         out.to(dtypes.fp32),
@@ -199,19 +202,28 @@ def check_rejects_raw_pointer_misuse():
     order = gate_up_tile_order(2 * inter, "cuda")
     w1, c1 = pack_w4a16_weights(q1[:, order], s1[:, order], None)
     w2, c2 = pack_w4a16_weights(q2, s2, None)
-    x = torch.randn((2, 2 * hidden), dtype=dtypes.bf16, device="cuda")[:, :hidden]
+    x = torch.randn((2, hidden), dtype=dtypes.bf16, device="cuda")
     ids = torch.zeros((2, top_k), dtype=torch.int32, device="cuda")
     weights = torch.ones((2, top_k), dtype=torch.float32, device="cuda")
     out = torch.empty((2, hidden), dtype=dtypes.bf16, device="cuda")
     ws = torch.empty(2 * top_k * (3 * inter + hidden), dtype=dtypes.bf16, device="cuda")
     args = (w1, c1, w2, c2, weights, ids, ws, group, experts, inter)
-    for bad_x, msg in ((x, "contiguous"), (x.contiguous().cpu(), "one device")):
+    strided = torch.randn((2, 2 * hidden), dtype=x.dtype, device="cuda")[:, :hidden]
+    cases = (
+        ("contiguous", out, strided, ws),
+        ("one device", out, x.cpu(), ws),
+        ("dtype", out, x.half(), ws),
+        ("workspace dtype", out.half(), x.half(), ws),
+        ("shape", out[:, :TILE_N].contiguous(), x, ws),
+    )
+    for msg, bad_out, bad_x, bad_ws in cases:
+        bad_args = args[:6] + (bad_ws,) + args[7:]
         try:
-            flydsl_rdna_moe(out, bad_x, *args)
+            flydsl_rdna_moe(bad_out, bad_x, *bad_args)
         except AssertionError as e:
             assert msg in str(e), e
         else:
-            raise AssertionError(f"flydsl_rdna_moe accepted x that is not {msg}")
+            raise AssertionError(f"flydsl_rdna_moe accepted: {msg}")
 
 
 def main():

@@ -51,12 +51,27 @@ __all__ = [
 ]
 
 
+# gfx115x targets with a known LDS capacity; the kernels are tested on gfx1151.
+_SUPPORTED_GFX = ("gfx1150", "gfx1151")
+
+
 def flydsl_rdna_moe_supported() -> bool:
-    return get_gfx_runtime().startswith("gfx115")
+    return get_gfx_runtime() in _SUPPORTED_GFX
 
 
 # Buffer offsets are 32-bit, so a tensor must span less than this.
 _MAX_SPAN_BYTES = 2**31
+
+
+def _check_act(out: torch.Tensor, x: torch.Tensor) -> None:
+    """The kernels store the activation dtype without a conversion."""
+    assert x.dtype in (torch.bfloat16, torch.float16), "bf16 or fp16 activations"
+    assert out.dtype == x.dtype, "output dtype must match the activations"
+
+
+def _check_packed(w: torch.Tensor, coef: torch.Tensor, n_cols: int) -> None:
+    assert w.size(1) * TILE_N == n_cols, "packed weights do not match the width"
+    assert coef.shape[:2] == w.shape[:2], "weights and coefficients do not match"
 
 
 def _check_args(dense, packed) -> None:
@@ -134,8 +149,12 @@ def flydsl_rdna_moe_gemm_reduce(
     _check_coef(coef, x.shape[1], group_size, coef_pairs)
     _check_w(w, x.shape[1])
     _check_args((out, x, expert_ids, weights), (w, coef))
+    _check_act(out, x)
     assert weights.dtype == torch.float32
     n_tokens, top_k = weights.shape
+    assert out.size(0) == n_tokens, "one output row per token"
+    assert x.size(0) == expert_ids.numel() == weights.numel(), "routed rows"
+    _check_packed(w, coef, out.size(1))
     launch = _build_gemm_reduce(
         x.shape[1],
         out.shape[1],
@@ -177,9 +196,16 @@ def flydsl_rdna_moe_gemm(
     _check_w(w, x.shape[1])
     route = [t for t in (sorted_ids, expert_ids, num_valid) if t is not None]
     _check_args((out, x, *route), (w, coef))
+    _check_act(out, x)
     n_rows, N = out.shape
     if silu_mul:
         N *= 2
+    _check_packed(w, coef, N)
+    assert -(-n_rows // x_row_div) <= x.size(0), "x has too few rows"
+    if sorted_ids is None:
+        assert expert_ids.numel() == n_rows, "one expert id per row"
+    else:
+        assert sorted_ids.numel() == expert_ids.numel() * BLOCK_M, "sorted ids"
     build_args = (
         x.shape[1],
         N,
@@ -310,9 +336,9 @@ def flydsl_rdna_moe(
     layout. ``activation(out, gate_up)`` is applied between the GEMMs; when
     it is None, ``w1`` is in ``gate_up_tile_order`` and GEMM1 applies
     SiLU-and-multiply itself. ``N`` is the width of the activation output.
-    Routes with expert id -1 contribute nothing.
-    ``workspace`` holds the intermediates, bf16 ``M * top_k * (gate_up + N +
-    K)`` elements.
+    Routes with expert id -1 contribute nothing; other ids must be below
+    ``num_experts``. ``workspace`` holds the intermediates, ``M * top_k *
+    (gate_up + N + K)`` elements of the activation dtype.
     """
     silu_mul = activation is None
     M, K = x.shape
@@ -321,20 +347,30 @@ def flydsl_rdna_moe(
     rows = M * top_k
     widths = (gate_up, N, K)
     sizes = [rows * n for n in widths]
+    _check_args((output, x, topk_weights, topk_ids, workspace), ())
+    _check_act(output, x)
+    assert workspace.dtype == x.dtype, "workspace dtype must match the activations"
+    assert output.shape == x.shape, "output shape must match x"
+    assert topk_weights.shape == topk_ids.shape, "top-k weights and ids shape"
+    assert topk_ids.size(0) == M, "one top-k row per token"
+    assert workspace.numel() >= sum(sizes), "workspace too small"
+    assert w1.size(0) == w2.size(0) == num_experts, "expert count"
+    _check_packed(w2, coef2, K)
+    assert not silu_mul or gate_up == 2 * N, "fused SiLU needs gate_up = 2 N"
     gate_up_out, act_out, down_out = (
         t.view(rows, n)
         for t, n in zip(workspace.view(-1)[: sum(sizes)].split(sizes), widths)
     )
-    _check_args((output, x, topk_weights, topk_ids), ())
+    ids = topk_ids.to(torch.int32)
     path = flydsl_rdna_moe_path(M, K, N, top_k, group_size, topk_weights.dtype)
     if path != "grouped":
         # Few tokens seldom share an expert, so every row is its own block
         # and the alignment kernel is not needed.
-        route = (None, topk_ids.to(torch.int32).view(-1), None)
+        route = (None, ids.view(-1), None)
     else:
         # The alignment indexes per-expert arrays with the ids: send routes
         # without an expert (-1) to expert 0; the top-k sum drops them.
-        route = moe_align_block_size_rows(topk_ids.clamp(min=0), BLOCK_M, num_experts)
+        route = moe_align_block_size_rows(ids.clamp(min=0), BLOCK_M, num_experts)
     flydsl_rdna_moe_gemm(
         act_out if silu_mul else gate_up_out,
         x,
