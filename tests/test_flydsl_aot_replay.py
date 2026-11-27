@@ -588,7 +588,8 @@ def test_gemm_jobs_of_a_shape_share_its_tuned_sizes():
     jobs = gemm.parse_csv(str(path))
     by_shape = {}
     for job in jobs:
-        by_shape.setdefault((job["n"], job["k"], job["gfx"]), []).append(job)
+        shape = (job["n"], job["k"], job["gfx"], job["cu_num"])
+        by_shape.setdefault(shape, []).append(job)
     assert any(len(shape_jobs) > 1 for shape_jobs in by_shape.values())
     for shape_jobs in by_shape.values():
         tuned = shape_jobs[0]["tuned"]
@@ -625,9 +626,13 @@ def test_fork_pool_leaves_a_caller_s_frozen_heap_frozen():
 
     gc.freeze()
     try:
+        frozen = gc.get_freeze_count()
+        made_after = [[] for _ in range(1000)]
         with common._lean_fork_parent("fork"):
-            assert gc.get_freeze_count() > 0
-        assert gc.get_freeze_count() > 0
+            # Nothing more is frozen: it could not be unfrozen on its own.
+            assert gc.get_freeze_count() == frozen
+        assert gc.get_freeze_count() == frozen
+        del made_after
     finally:
         gc.unfreeze()
 

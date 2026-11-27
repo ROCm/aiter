@@ -301,17 +301,18 @@ def _lean_fork_parent(start_method: str) -> Iterator[None]:
     if start_method != "fork":
         yield
         return
-    # A caller that froze its own objects keeps them frozen: unfreezing is
-    # all or nothing.
-    owns_freeze = gc.get_freeze_count() == 0
     gc.collect()
-    gc.freeze()
     _trim_heap()
+    if gc.get_freeze_count():
+        # The caller froze objects of its own. Unfreezing is all or nothing,
+        # so freezing here could not be undone without undoing the caller's.
+        yield
+        return
+    gc.freeze()
     try:
         yield
     finally:
-        if owns_freeze:
-            gc.unfreeze()
+        gc.unfreeze()
 
 
 def _run_file_pool(

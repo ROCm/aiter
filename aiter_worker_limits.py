@@ -20,8 +20,11 @@ EST_WORKER_RSS_BYTES = 1_500_000_000
 # worker 0.49 GB (GEMM). A pool holds the sum, so 0.5 GB each is about twice
 # what its workers hold together.
 EST_FORK_WORKER_BYTES = 500_000_000
-# What a fork pool holds besides its workers: the driver and one replay process
-# per target arch, about 0.5 GB private each.
+# Set aside for what a fork pool holds besides its workers: the driver and the
+# replay processes of the target archs, about 0.5 GB private each. A fixed
+# allowance for three archs side by side, not scaled by their number. A
+# process that is already running when it asks is counted twice, as available
+# memory already excludes it.
 EST_FORK_POOL_RESERVE_BYTES = 2_000_000_000
 # Concurrent GPU-executing workers allowed per visible device. Tasks that run
 # kernels during AITER compilation are bounded by device contexts and device
