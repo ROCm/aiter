@@ -1857,7 +1857,7 @@ def _attention_core_multi_kv_tiles(
             # last thing before the barrier and do not sit across the v_cvt run.
             if _is_wmma_bound:
                 p_list = _convert_vectors(p_f32, elem_dtype)
-                _keepalive([v for pt in p_list for v in pt])
+                # _keepalive([v for pt in p_list for v in pt])
                 pvqk_head = _pvqk_head()
             else:
                 pvqk_head = _pvqk_head()
