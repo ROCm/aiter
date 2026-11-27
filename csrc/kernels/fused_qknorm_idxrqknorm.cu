@@ -11,6 +11,10 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
+#include <stdexcept>
+#include <type_traits>
+
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_opus_plus.h"
@@ -23,25 +27,87 @@ namespace fused_qknorm_idxrqknorm_ops {
 constexpr int kHeadDim = 128;
 constexpr int kNumLanes = 32;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
+constexpr int kBlockSize = 256; // every launch of the kernel
+// A launch of kMultiRowMinRowsPerCu or more (token, slot) rows per CU runs faster with
+// kMultiRows rows per warp (more rows in flight per wave) than with a warp per row (gfx1250).
+constexpr int kMultiRows = 4;
+constexpr int64_t kMultiRowMinRowsPerCu = 128;
+
+// The multi-row kernels and the fused split-K partials load are built for gfx1250 only.
+static bool isGfx1250()
+{
+    static const bool is_gfx1250 = get_gpu_arch() == "gfx1250"; // queries the driver
+    return is_gfx1250;
+}
+
+// On gfx12 a 32-lane warp is a whole wave32 wave, so what depends only on the warp
+// index is wave-uniform: readfirstlane keeps it in SGPRs (scalar loads of the
+// per-token tables, scalar branches on the slot kind). A wave64 wave holds two warps.
+__device__ __forceinline__ int warpUniform(int v)
+{
+#if defined(__GFX12__)
+    return __builtin_amdgcn_readfirstlane(v);
+#else
+    return v;
+#endif
+}
+
+// __shfl_xor(v, kMask, 32) for a warp whose lanes are all active.
+template <int kMask>
+__device__ __forceinline__ float shflXor(float v)
+{
+#if defined(__GFX12__)
+    static_assert(kMask == 1 || kMask == 2 || kMask == 4 || kMask == 8 || kMask == 16);
+    if constexpr(kMask == 16)
+    {
+        return warp_permlanex16(v); // lane L reads lane L of the other 16-lane row
+    }
+    else
+    {
+        // DPP row_xmask: lane L reads lane L ^ kMask of its row. No lane reads outside
+        // its row, so bound_ctrl changes nothing; it lets the compiler fold the move
+        // into the add or max that consumes it.
+        return opus::mov_dpp(v, opus::number<0x160 | kMask>{});
+    }
+#else
+    return __shfl_xor(v, kMask, 32);
+#endif
+}
 
 __device__ __forceinline__ float warpReduceSum(float val)
 {
-#pragma unroll
-    for(int mask = 16; mask > 0; mask >>= 1)
-    {
-        val += __shfl_xor(val, mask, 32);
-    }
+    val += shflXor<16>(val);
+    val += shflXor<8>(val);
+    val += shflXor<4>(val);
+    val += shflXor<2>(val);
+    val += shflXor<1>(val);
     return val;
 }
 
 __device__ __forceinline__ float warpReduceMax(float val)
 {
-#pragma unroll
-    for(int mask = 16; mask > 0; mask >>= 1)
-    {
-        val = fmaxf(val, __shfl_xor(val, mask, 32));
-    }
+    val = fmaxf(val, shflXor<16>(val));
+    val = fmaxf(val, shflXor<8>(val));
+    val = fmaxf(val, shflXor<4>(val));
+    val = fmaxf(val, shflXor<2>(val));
+    val = fmaxf(val, shflXor<1>(val));
     return val;
+}
+
+// slot / block_size and slot % block_size for slot >= 0 (block_size, and x where the
+// V layout splits by it, is a power of two in every cache layout in use).
+__device__ __forceinline__ void splitSlot(int64_t slot, int block_size, int64_t& b, int64_t& t)
+{
+    if((block_size & (block_size - 1)) == 0)
+    {
+        b = slot >> __builtin_ctz(block_size);
+        t = slot & (block_size - 1);
+    }
+    else
+    {
+        b = slot / block_size;
+        t = slot % block_size;
+    }
 }
 
 // Per-token dynamic quant scale = amax / fp8_max so the largest |value| maps to the
@@ -65,37 +131,262 @@ __device__ __forceinline__ void loadElems(const scalar_t* __restrict__ src,
     }
 }
 
+// A lane's kElemsPerLane 16-bit elements as the 8 bytes they occupy in memory.
 template <typename scalar_t>
-__device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
-                                           const float (&elems)[kElemsPerLane])
+__device__ __forceinline__ uint2 packRawElems(const scalar_t (&raw)[kElemsPerLane])
 {
+    static_assert(sizeof(scalar_t) == 2 && kElemsPerLane == 4, "four 16-bit elements");
+    uint32_t w[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        dst[i] = static_cast<scalar_t>(elems[i]);
+        w[i] = __builtin_bit_cast(uint16_t, raw[i]);
+    }
+    return make_uint2(w[0] | (w[1] << 16), w[2] | (w[3] << 16));
+}
+
+// The inverse of packRawElems: four 16-bit elements from the 8 bytes they occupy.
+template <typename scalar_t>
+__device__ __forceinline__ void unpackRawElems(uint2 w, scalar_t (&raw)[kElemsPerLane])
+{
+    static_assert(sizeof(scalar_t) == 2 && kElemsPerLane == 4, "four 16-bit elements");
+    const uint32_t h[kElemsPerLane] = {w.x & 0xffffu, w.x >> 16, w.y & 0xffffu, w.y >> 16};
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = __builtin_bit_cast(scalar_t, static_cast<uint16_t>(h[i]));
     }
 }
 
+// Four packed 16-bit elements (one 8-byte load), widened to float.
 template <typename scalar_t>
-__device__ __forceinline__ void copyRawElems(const scalar_t* __restrict__ src,
-                                             scalar_t* __restrict__ dst)
+__device__ __forceinline__ void unpackElems(uint2 w, float (&elems)[kElemsPerLane])
 {
-    *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(src);
+    scalar_t raw[kElemsPerLane];
+    unpackRawElems(w, raw);
+    loadElems(raw, elems);
 }
 
+// static_cast<scalar_t> of each element (round to nearest even), as the 8 bytes the
+// results occupy in memory.
+template <typename scalar_t>
+__device__ __forceinline__ uint2 roundPackElems(const float (&elems)[kElemsPerLane])
+{
+#if defined(__gfx1250__)
+    if constexpr(std::is_same_v<scalar_t, hip_bfloat16>)
+    {
+        // hip_bfloat16 rounds in software; the hardware rounds two floats per instruction
+        // to the same bits. Only a NaN can differ (in its payload): every float rounded
+        // here is an FP32 result, which this module flushes, so none is subnormal.
+        typedef float f32x2 __attribute__((ext_vector_type(2)));
+        typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
+        const auto round2 = [](float lo, float hi) {
+            return __builtin_bit_cast(uint32_t,
+                                      __builtin_convertvector(f32x2{lo, hi}, bf16x2));
+        };
+        return make_uint2(round2(elems[0], elems[1]), round2(elems[2], elems[3]));
+    }
+#endif
+    scalar_t v[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        v[i] = static_cast<scalar_t>(elems[i]);
+    }
+    return packRawElems(v);
+}
+
+template <typename scalar_t, bool kSplitStore = false>
+__device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
+                                           const float (&elems)[kElemsPerLane])
+{
+    const uint2 packed = roundPackElems<scalar_t>(elems);
+#if defined(__gfx1250__)
+    if constexpr(kSplitStore)
+    {
+        // Two 32-bit stores: with one 64-bit store per lane, the one-row non-insert kernel
+        // runs 0.3-0.7 us longer per call on gfx1250 (HIP graph, M <= 64). The compiler merges
+        // plain stores back into one 64-bit store; the empty asm, which takes the address
+        // as an operand and so may read dst, keeps them apart.
+        uint32_t* const words = reinterpret_cast<uint32_t*>(dst);
+        words[0] = packed.x;
+        asm volatile("" : : "v"(words) : "memory");
+        words[1] = packed.y;
+        return;
+    }
+#endif
+    *reinterpret_cast<uint2*>(dst) = packed;
+}
+
+// FP32 split-K partials of a bf16 qkv that a split-K GEMM left unreduced:
+// [num_splits, >= num_tokens, row], the splits split_stride elements apart.
+// num_splits == 0 means qkv holds the row.
+struct QkvPartials
+{
+    const float* ptr     = nullptr;
+    int num_splits       = 0;
+    int64_t split_stride = 0;
+};
+
+// The reduce kernel adds with f32 denormals; this module flushes them
+// (-fgpu-flush-denormals-to-zero). A lane whose partials or running sums leave the
+// normal range redoes its sum here exactly: each fp32 add is exact in double (both
+// operands are fp32, and where they are 2^29 apart the smaller one cannot change
+// the rounding), then rounded to fp32 with gradual underflow. It keeps the result
+// bitwise for every input; besides subnormals it also runs for a sum that is exactly
+// zero (a zero row, cancelling partials), which reads as |acc| < 2^-126.
+__device__ __forceinline__ double exactF32ToDouble(float f)
+{
+    const uint32_t u   = __builtin_bit_cast(uint32_t, f);
+    const uint32_t mag = u & 0x7fffffffu;
+    if(mag != 0 && mag < 0x00800000u) // subnormal: the conversion would flush it
+    {
+        const double v = static_cast<double>(mag) * 0x1p-149;
+        return (u >> 31) ? -v : v;
+    }
+    return static_cast<double>(f);
+}
+
+__device__ __forceinline__ double roundToF32(double x)
+{
+    if(fabs(x) < 0x1p-126) // fp32 subnormals are the multiples of 2^-149
+    {
+        return rint(x * 0x1p149) * 0x1p-149;
+    }
+    return static_cast<double>(static_cast<float>(x));
+}
+
+__device__ __forceinline__ uint16_t bf16BitsOfF32(double x)
+{
+    if(fabs(x) < 0x1p-126) // round the subnormal's fp32 bits to nearest even
+    {
+        const uint32_t mag = static_cast<uint32_t>(fabs(x) * 0x1p149);
+        __builtin_assume(mag < 0x00800000u); // a subnormal: not inf/NaN, as the helper checks
+        return opus::fp32_to_bf16_rtn_raw(
+            __builtin_bit_cast(float, (signbit(x) ? 0x80000000u : 0u) | mag));
+    }
+    return __builtin_bit_cast(uint16_t, static_cast<__bf16>(static_cast<float>(x)));
+}
+
+__device__ __forceinline__ bool isSubnormalF32(float f)
+{
+    const uint32_t mag = __builtin_bit_cast(uint32_t, f) & 0x7fffffffu;
+    return mag != 0 && mag < 0x00800000u;
+}
+
+// One lane's kElemsPerLane qkv elements reduced from kSplits partials as the gfx1250
+// split-K GEMM's reduce kernel (gemm_a8w8_splitk_reduce) does it: every load first,
+// an FP32 sum in split order,
+// then one round-to-nearest-even to bf16 (the same fptrunc the reduce kernel
+// emits), so the result matches the reduced qkv bit for bit.
+template <int kSplits>
+__device__ __forceinline__ void reducePartials(const float* __restrict__ src,
+                                               int64_t split_stride,
+                                               uint16_t (&raw)[kElemsPerLane])
+{
+    static_assert(kElemsPerLane == 4, "one float4 per split and lane");
+    float4 parts[kSplits];
+#pragma unroll
+    for(int s = 0; s < kSplits; ++s)
+    {
+        parts[s] = *reinterpret_cast<const float4*>(src + s * split_stride);
+    }
+    const auto part = [&](int s, int i) {
+        return i == 0 ? parts[s].x : i == 1 ? parts[s].y : i == 2 ? parts[s].z : parts[s].w;
+    };
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        float acc       = part(0, i);
+        bool subnormals = isSubnormalF32(acc);
+#pragma unroll
+        for(int s = 1; s < kSplits; ++s)
+        {
+            acc += part(s, i);
+            // A sum flushed to zero reads as |acc| < 2^-126 too (a NaN does not).
+            subnormals |= isSubnormalF32(part(s, i)) || fabsf(acc) < 0x1p-126f;
+        }
+        raw[i] = __builtin_bit_cast(uint16_t, static_cast<__bf16>(acc));
+        if(subnormals && isfinite(acc))
+        {
+            double exact = exactF32ToDouble(part(0, i));
+#pragma unroll
+            for(int s = 1; s < kSplits; ++s)
+            {
+                exact = roundToF32(exact + exactF32ToDouble(part(s, i)));
+            }
+            raw[i] = bf16BitsOfF32(exact);
+        }
+    }
+}
+
+// The lane's kElemsPerLane bf16 qkv elements, reduced from the split-K partials and
+// written back to the row, so qkv ends up as the standalone reduce leaves it.
+__device__ __forceinline__ void reduceRawElems(hip_bfloat16* __restrict__ row,
+                                               const QkvPartials& partials,
+                                               int64_t partial_off,
+                                               hip_bfloat16 (&raw)[kElemsPerLane])
+{
+    uint16_t bits[kElemsPerLane];
+    const float* src = partials.ptr + partial_off;
+    switch(partials.num_splits)
+    {
+    case 2: reducePartials<2>(src, partials.split_stride, bits); break;
+    case 4: reducePartials<4>(src, partials.split_stride, bits); break;
+    default: reducePartials<8>(src, partials.split_stride, bits); break;
+    }
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = __builtin_bit_cast(hip_bfloat16, bits[i]);
+    }
+    *reinterpret_cast<uint2*>(row) = packRawElems(raw);
+}
+
+// A call whose mode does not sum the partials in its own pass (see
+// fused_qknorm_idxrqknorm_impl) reduces them into qkv with this kernel first, the same
+// sum, and then runs as on a reduced qkv. qkv is dense [num_tokens, row], the partials
+// rows have the same stride.
+__global__ void reduceQkvPartialsKernel(hip_bfloat16* __restrict__ qkv,
+                                        QkvPartials partials,
+                                        int64_t num_elems)
+{
+    const int64_t off =
+        (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * kElemsPerLane;
+    if(off < num_elems)
+    {
+        hip_bfloat16 raw[kElemsPerLane];
+        reduceRawElems(qkv + off, partials, off, raw);
+    }
+}
+
+// The lane's kElemsPerLane elements are contiguous in dst: one store.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
                                                 const float (&elems)[kElemsPerLane],
                                                 float scale)
 {
-#pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
+    if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
     {
-        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+        storeElems(dst, elems);
+    }
+    else if constexpr(sizeof(cache_t) == 1 && sizeof(scalar_t) == 2 && kElemsPerLane == 4)
+    {
+        float rounded[kElemsPerLane];
+        unpackElems<scalar_t>(roundPackElems<scalar_t>(elems), rounded);
+        uint32_t packed = 0;
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
-            dst[i] = static_cast<cache_t>(elems[i]);
+            const cache_t q = opus::cast<cache_t>(rounded[i] / scale);
+            packed |= static_cast<uint32_t>(__builtin_bit_cast(uint8_t, q)) << (8 * i);
         }
-        else
+        *reinterpret_cast<uint32_t*>(dst) = packed;
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
         {
             const scalar_t rounded = static_cast<scalar_t>(elems[i]);
             dst[i] = opus::cast<cache_t>(static_cast<float>(rounded) / scale);
@@ -105,7 +396,7 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
 
 // index_q gather: qkv dtype, or unit-scale e4m3 (4787's q_idx contract; no scale tensor).
 // When neither gather buffer is provided, write the packed qkv index-Q row (inplace).
-template <typename scalar_t>
+template <typename scalar_t, bool kSplitStore = false>
 __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_out,
                                                  opus::fp8_t* __restrict__ index_q_fp8_out,
                                                  scalar_t* __restrict__ fallback_ptr,
@@ -124,22 +415,22 @@ __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_
     }
     else if(index_q_out != nullptr)
     {
-        storeElems(index_q_out + off, elems);
+        storeElems<scalar_t, kSplitStore>(index_q_out + off, elems);
     }
     else if(fallback_ptr != nullptr)
     {
-        storeElems(fallback_ptr, elems);
+        storeElems<scalar_t, kSplitStore>(fallback_ptr, elems);
     }
 }
 
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
-__device__ __forceinline__ void copyOrQuantizeCacheElems(const scalar_t* __restrict__ src,
+__device__ __forceinline__ void copyOrQuantizeCacheElems(const scalar_t (&src)[kElemsPerLane],
                                                          cache_t* __restrict__ dst,
                                                          float scale)
 {
     if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
     {
-        copyRawElems(src, dst);
+        *reinterpret_cast<uint2*>(dst) = packRawElems(src);
     }
     else
     {
@@ -173,58 +464,124 @@ __device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restric
     }
 }
 
-template <typename scalar_t>
-__device__ __forceinline__ void normAndRope(
-    float (&elems)[kElemsPerLane],
-    int lane_id,
-    float eps,
-    const scalar_t* __restrict__ weight,
-    bool do_rope,
-    int rotary_dim,
-    const scalar_t* __restrict__ cos_ptr,
-    bool apply_norm)
+// What normAndRope reads besides the row: the lane's norm weights, cos and sin, four
+// 16-bit values each. Loaded before the row is used, so their latency overlaps the row
+// load; kept packed until normAndRope widens them.
+struct NormRopeInputs
 {
-    if(apply_norm)
+    uint2 w;
+    uint2 c;
+    uint2 s;
+};
+
+// The lane's cos and sin (dims dim0.. of the row's rotation); lanes past rotary_dim load
+// element 0 and do not use it.
+template <typename scalar_t>
+__device__ __forceinline__ void loadCosSin(NormRopeInputs& in,
+                                           int dim0,
+                                           int rotary_dim,
+                                           const scalar_t* __restrict__ cos_ptr)
+{
+    const int half   = rotary_dim / 2;
+    const int i_base = dim0 >= rotary_dim ? 0 : dim0 < half ? dim0 : dim0 - half;
+    in.c = *reinterpret_cast<const uint2*>(cos_ptr + i_base);
+    in.s = *reinterpret_cast<const uint2*>(cos_ptr + half + i_base);
+}
+
+// NeoX rotation of the lane's elements (dims dim0..) on the lanes below rotary_dim;
+// partner holds each element's rotate-half partner (dim +- rotary_dim / 2).
+template <typename scalar_t>
+__device__ __forceinline__ void rotateElems(float (&elems)[kElemsPerLane],
+                                            const float (&partner)[kElemsPerLane],
+                                            const NormRopeInputs& in,
+                                            int dim0,
+                                            int rotary_dim)
+{
+    float c[kElemsPerLane];
+    float s[kElemsPerLane];
+    unpackElems<scalar_t>(in.c, c);
+    unpackElems<scalar_t>(in.s, s);
+    const bool rotate     = dim0 < rotary_dim;
+    const bool first_half = dim0 < rotary_dim / 2;
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
     {
-        float sumsq = 0.0f;
+        const float rotated = first_half ? elems[i] * c[i] - partner[i] * s[i]
+                                         : elems[i] * c[i] + partner[i] * s[i];
+        elems[i] = rotate ? rotated : elems[i];
+    }
+}
+
+// Rotary embedding of the lane's elements. The partner of dim0 lives rotary_dim / 8
+// lanes away; every lane of the warp runs this.
+template <typename scalar_t>
+__device__ __forceinline__ void ropeElems(float (&elems)[kElemsPerLane],
+                                          const NormRopeInputs& in,
+                                          int lane_id,
+                                          int rotary_dim)
+{
+    const int dim0 = lane_id * kElemsPerLane;
+    float partner[kElemsPerLane];
+#if defined(__GFX12__)
+    // A power-of-two lane distance d pairs lane L < d with L + d == L ^ d, so the
+    // partner is a cross-lane xor (shflXor) instead of an LDS permute (__shfl).
+    switch(rotary_dim)
+    {
+#define ROPE_XOR(DIM, MASK)                                          \
+    case DIM:                                                        \
+        _Pragma("unroll") for(int i = 0; i < kElemsPerLane; ++i)     \
+        {                                                            \
+            partner[i] = shflXor<MASK>(elems[i]);                    \
+        }                                                            \
+        rotateElems<scalar_t>(elems, partner, in, dim0, DIM);        \
+        return;
+        ROPE_XOR(8, 1)
+        ROPE_XOR(16, 2)
+        ROPE_XOR(32, 4)
+        ROPE_XOR(64, 8)
+        ROPE_XOR(128, 16)
+#undef ROPE_XOR
+    default: break;
+    }
+#endif
+    const int half         = rotary_dim / 2;
+    const int partner_lane = dim0 < half ? (dim0 + half) / kElemsPerLane
+                                         : (dim0 - half) / kElemsPerLane;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            sumsq += elems[i] * elems[i];
-        }
-        sumsq = warpReduceSum(sumsq);
-        const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        partner[i] = __shfl(elems[i], partner_lane, 32);
+    }
+    rotateElems<scalar_t>(elems, partner, in, dim0, rotary_dim);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
+                                            int lane_id,
+                                            float eps,
+                                            const NormRopeInputs& in,
+                                            bool do_rope,
+                                            int rotary_dim)
+{
+    float w[kElemsPerLane];
+    unpackElems<scalar_t>(in.w, w);
+    float sumsq = 0.0f;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            const int dim = lane_id * kElemsPerLane + i;
-            elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(weight[dim]));
-        }
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        sumsq += elems[i] * elems[i];
+    }
+    sumsq = warpReduceSum(sumsq);
+    const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        elems[i] = elems[i] * rms_rcp * (1.0f + w[i]);
     }
 
     if(do_rope)
     {
-        const int half = rotary_dim / 2;
-        const int dim0 = lane_id * kElemsPerLane;
-        const bool in_rope = dim0 < rotary_dim;
-
-        if(in_rope)
-        {
-            const bool first_half = dim0 < half;
-            const int i_base = first_half ? dim0 : dim0 - half;
-            const int partner_lane = first_half ? (dim0 + half) / kElemsPerLane
-                                                : (dim0 - half) / kElemsPerLane;
-            const scalar_t* sin_ptr = cos_ptr + half;
-#pragma unroll
-            for(int i = 0; i < kElemsPerLane; ++i)
-            {
-                const float c = static_cast<float>(cos_ptr[i_base + i]);
-                const float s = static_cast<float>(sin_ptr[i_base + i]);
-                const float partner = __shfl(elems[i], partner_lane, 32);
-                elems[i] = first_half ? elems[i] * c - partner * s
-                                      : elems[i] * c + partner * s;
-            }
-        }
+        ropeElems<scalar_t>(elems, in, lane_id, rotary_dim);
     }
 }
 
@@ -489,7 +846,9 @@ template <typename scalar_t,
           bool kIndexFp4,
           bool kKvFp4,
           bool kNvfp4,
-          bool kQFp8>
+          bool kQFp8,
+          bool kPartials,
+          int kRows>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
@@ -533,390 +892,461 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_token,
     int64_t v_s_head,
     // Main Q as unit-scale e4m3 (kQFp8 only; replaces the q_out row).
-    opus::fp8_t* __restrict__ q_fp8_out)
+    opus::fp8_t* __restrict__ q_fp8_out,
+    // Unreduced split-K partials of qkv (kPartials only).
+    QkvPartials partials)
 {
     // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
     static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
-    const int warps_per_block = blockDim.x / 32;
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
+    static_assert(kRows == 1 && !kPartials,
+                  "several rows per warp and the partials load are compiled for gfx1250 only");
+#endif
+    constexpr int warps_per_block = kBlockSize / kNumLanes;
     const int lane_id = threadIdx.x % 32;
-    const int global_warp_idx = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    const int global_warp_idx = blockIdx.x * warps_per_block + warpUniform(threadIdx.x / 32);
 
     const int v_slots = kInsertKV ? nkv : 0;
     const int idx_slots = kProcessIndex ? niq + 1 : 0;
     const int slots_per_token = nq + nkv + v_slots + idx_slots;
-    const int token_idx = global_warp_idx / slots_per_token;
-    const int slot = global_warp_idx % slots_per_token;
-    if(token_idx >= num_tokens)
+
+    // A warp takes kRows consecutive (token, slot) rows; a row past the last token
+    // (last warp only) loads from the last token and is not processed.
+    static_assert(kRows == 1 || !kPartials, "one row per warp with partials");
+    int row_token[kRows];
+    int row_slot[kRows];
+    row_token[0] = global_warp_idx * kRows / slots_per_token;
+    row_slot[0] = global_warp_idx * kRows % slots_per_token;
+    if(row_token[0] >= num_tokens)
     {
         return;
+    }
+#pragma unroll
+    for(int r = 1; r < kRows; ++r)
+    {
+        const bool wrap = row_slot[r - 1] + 1 == slots_per_token;
+        row_token[r] = row_token[r - 1] + (wrap ? 1 : 0);
+        row_slot[r] = wrap ? 0 : row_slot[r - 1] + 1;
     }
 
     const int k_begin = nq;
     const int v_begin = nq + nkv;
     const int iq_begin = nq + nkv + v_slots;
     const int ik_slot = iq_begin + niq;
-    const bool is_q = slot < k_begin;
-    const bool is_k = slot >= k_begin && slot < v_begin;
-    bool is_v = false;
-    if constexpr(kInsertKV)
-    {
-        is_v = slot >= v_begin && slot < v_begin + nkv;
-    }
-    bool is_iq = false;
-    bool is_ik = false;
-    if constexpr(kProcessIndex)
-    {
-        is_iq = slot >= iq_begin && slot < ik_slot;
-        is_ik = slot == ik_slot;
-    }
-
     const int dim_base = lane_id * kElemsPerLane;
     const int qkv_row = (nq + 2 * nkv + (kIsSparse ? (niq + 1) : 0)) * kHeadDim;
 
-    scalar_t* row_ptr = nullptr;
-    const scalar_t* norm_w = nullptr;
-    bool do_rope = true;
-    int head = 0;
+    // Slots are [Q | K | V (insert) | IQ | IK (index)]; qkv rows hold [Q | K | V | IQ | IK]
+    // heads, so a slot's head column is the slot itself, past the V heads it lacks.
+    // No helper here selects between captured pointers: the compiler can turn that
+    // into a load through a select of the captures' addresses, which keeps them in
+    // scratch (gfx942, where the warp index is not wave-uniform).
+    const auto is_ik_slot = [=](int slot) { return kProcessIndex && slot == ik_slot; };
+    const auto row_of = [=](int token, int slot) {
+        const int column = (kProcessIndex && slot >= iq_begin) ? slot + nkv - v_slots : slot;
+        return qkv + static_cast<int64_t>(token) * qkv_row + column * kHeadDim;
+    };
 
-    if(is_q)
-    {
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        norm_w = q_norm_w;
-    }
-    else if(is_k)
-    {
-        head = slot - k_begin;
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        norm_w = k_norm_w;
-    }
-    else if(is_v)
-    {
-        head = slot - v_begin;
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + slot * kHeadDim;
-        do_rope = false;
-    }
-    else if constexpr(kProcessIndex)
-    {
-        if(is_iq)
+    // Every load of every row goes out before anything waits: the row, its norm weight
+    // and its position, then the lane's cos/sin, then the cache slot. Scalar loads
+    // return out of order, so the wait for the positions (which the cos/sin addresses
+    // need) waits for every scalar load issued before it: the cache slot goes out after
+    // the cos/sin loads, except with partials, whose split loads wait for kernel
+    // arguments anyway. A V slot loads the norm inputs too, from valid addresses, and
+    // uses none; a Q or IQ slot loads a cache slot (insert mode always has both
+    // mappings) and stores nothing with it.
+    int load_token[kRows];
+    int64_t row_pos[kRows];
+    scalar_t row_raw[kRows][kElemsPerLane];
+    NormRopeInputs row_nri[kRows];
+    int64_t row_cache_slot[kRows];
+    const auto cache_slot_of = [](const int64_t* kv_map,
+                                  const int64_t* index_map,
+                                  bool ik,
+                                  int token) -> int64_t {
+        if constexpr(kInsertKV)
         {
-            const int ih = slot - iq_begin;
-            row_ptr =
-                qkv + static_cast<int64_t>(token_idx) * qkv_row +
-                (nq + 2 * nkv + ih) * kHeadDim;
-            norm_w = iq_norm_w;
+            return (ik ? index_map : kv_map)[token];
         }
-        else
-        {
-            row_ptr =
-                qkv + static_cast<int64_t>(token_idx) * qkv_row +
-                (nq + 2 * nkv + niq) * kHeadDim;
-            norm_w = ik_norm_w;
-        }
-    }
-
-    scalar_t* store_ptr = row_ptr;
-    if(is_q && q_out != nullptr)
+        return -1;
+    };
+#pragma unroll
+    for(int r = 0; r < kRows; ++r)
     {
-        store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
-    }
-
-    int64_t mapped_slot = -1;
-    if constexpr(kInsertKV)
-    {
-        if constexpr(kProcessIndex)
+        load_token[r]  = r == 0 ? row_token[0] : min(row_token[r], num_tokens - 1);
+        const int slot = row_slot[r];
+        if constexpr(!kPartials)
         {
-            mapped_slot = is_ik ? index_slot_mapping[token_idx]
-                                : ((is_k || is_v) ? slot_mapping[token_idx] : -1);
+            unpackRawElems(*reinterpret_cast<const uint2*>(row_of(load_token[r], slot) + dim_base),
+                           row_raw[r]);
         }
-        else
+        // A V slot (v_begin <= slot < iq_begin) has no norm weight: it loads q's.
+        const scalar_t* const norm_w = slot < k_begin    ? q_norm_w
+                                       : slot < v_begin  ? k_norm_w
+                                       : slot < iq_begin ? q_norm_w
+                                       : slot == ik_slot ? ik_norm_w
+                                                         : iq_norm_w;
+        row_nri[r].w = *reinterpret_cast<const uint2*>(norm_w + dim_base);
+        row_pos[r] = positions[load_token[r]];
+        if constexpr(kPartials)
         {
-            mapped_slot = (is_k || is_v) ? slot_mapping[token_idx] : -1;
+            row_cache_slot[r] =
+                cache_slot_of(slot_mapping, index_slot_mapping, is_ik_slot(slot), load_token[r]);
         }
     }
-
-    if constexpr(kInsertKV)
+    // Left alone, the scheduler puts the loads above after the wait for the positions,
+    // which only the cos/sin loads below need.
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for(int r = 0; r < kRows; ++r)
     {
-        if(is_v)
+        loadCosSin(row_nri[r], dim_base, rotary_dim, cos_sin_cache + row_pos[r] * rotary_dim);
+    }
+    if constexpr(kPartials)
+    {
+        // Last: the split loads branch on the split count, and their sum waits for them.
+        scalar_t* row_ptr = row_of(row_token[0], row_slot[0]);
+        reduceRawElems(row_ptr + dim_base, partials, (row_ptr - qkv) + dim_base, row_raw[0]);
+    }
+    else
+    {
+#pragma unroll
+        for(int r = 0; r < kRows; ++r)
         {
-            if constexpr(kKvFp4)
+            row_cache_slot[r] = cache_slot_of(
+                slot_mapping, index_slot_mapping, is_ik_slot(row_slot[r]), load_token[r]);
+        }
+    }
+
+    const auto process_row = [&](const int token_idx,
+                                 const int slot,
+                                 scalar_t (&raw)[kElemsPerLane],
+                                 const NormRopeInputs& nri,
+                                 const int64_t mapped_slot) {
+        const bool is_q = slot < k_begin;
+        const bool is_k = slot >= k_begin && slot < v_begin;
+        const bool is_v = kInsertKV && slot >= v_begin && slot < v_begin + nkv;
+        const bool is_iq = kProcessIndex && slot >= iq_begin && slot < ik_slot;
+        const bool is_ik = is_ik_slot(slot);
+        const bool do_rope = !is_v;
+        const int head = is_k ? slot - k_begin : is_v ? slot - v_begin : 0;
+        scalar_t* store_ptr = row_of(token_idx, slot);
+        if(is_q && q_out != nullptr)
+        {
+            store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
+        }
+
+        if constexpr(kInsertKV)
+        {
+            if(is_v)
             {
-                if constexpr(kNvfp4)
+                if constexpr(kKvFp4)
                 {
-                    if(mapped_slot >= 0)
+                    if constexpr(kNvfp4)
                     {
-                        // NVFP4 main V: the raw row, its nibbles of the octet's words by atomic
-                        // and/or (the other tokens of the octet, in any warp, share the words).
-                        // Caller contract: no two tokens of one step write the same slot.
-                        uint8_t* page = reinterpret_cast<uint8_t*>(kv_cache_v) +
-                                        (mapped_slot / kNvTokens) * v_s_block;
-                        storeNvfp4VToken<scalar_t>(page,
-                                                   nkv,
-                                                   head,
-                                                   static_cast<int>(mapped_slot % kNvTokens),
-                                                   *v_scale,
-                                                   row_ptr,
-                                                   lane_id);
+                        if(mapped_slot >= 0)
+                        {
+                            // NVFP4 main V: the raw row, its nibbles of the octet's words by atomic
+                            // and/or (the other tokens of the octet, in any warp, share the words).
+                            // Caller contract: no two tokens of one step write the same slot.
+                            uint8_t* page = reinterpret_cast<uint8_t*>(kv_cache_v) +
+                                            (mapped_slot / kNvTokens) * v_s_block;
+                            storeNvfp4VToken<scalar_t>(page,
+                                                       nkv,
+                                                       head,
+                                                       static_cast<int>(mapped_slot % kNvTokens),
+                                                       *v_scale,
+                                                       row_of(token_idx, slot),
+                                                       lane_id);
+                        }
+                    }
+                    else if(mapped_slot >= 0)
+                    {
+                        // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
+                        float velems[kElemsPerLane];
+                        loadElems(raw, velems);
+                        storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
+                                                mapped_slot,
+                                                v_s_block,
+                                                static_cast<int64_t>(head) * v_s_head,
+                                                velems,
+                                                lane_id);
                     }
                 }
                 else if(mapped_slot >= 0)
                 {
-                    // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
-                    float velems[kElemsPerLane];
-                    loadElems(row_ptr + dim_base, velems);
-                    storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
-                                            mapped_slot,
-                                            v_s_block,
-                                            static_cast<int64_t>(head) * v_s_head,
-                                            velems,
-                                            lane_id);
-                }
-            }
-            else if(mapped_slot >= 0)
-            {
-                // Per-token dynamic quant: amax over the lane's raw V elems, then a
-                // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
-                float v_scale_val = 1.0f;
-                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
-                             kPerTokenKVScale)
-                {
-                    float local_amax = 0.0f;
+                    // Per-token dynamic quant: amax over the lane's raw V elems, then a
+                    // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
+                    float v_scale_val = 1.0f;
+                    if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
+                                 kPerTokenKVScale)
+                    {
+                        float local_amax = 0.0f;
 #pragma unroll
-                    for(int i = 0; i < kElemsPerLane; ++i)
-                    {
-                        local_amax = fmaxf(local_amax,
-                                           fabsf(static_cast<float>(row_ptr[dim_base + i])));
+                        for(int i = 0; i < kElemsPerLane; ++i)
+                        {
+                            local_amax = fmaxf(local_amax, fabsf(static_cast<float>(raw[i])));
+                        }
+                        const float amax = warpReduceMax(local_amax);
+                        v_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
+                        if(lane_id == 0)
+                        {
+                            int64_t b, t;
+                            splitSlot(mapped_slot, block_size, b, t);
+                            const int64_t scale_idx =
+                                kAsmLayout
+                                    ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                       static_cast<int64_t>(head) * block_size + t)
+                                    : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                            v_scale[scale_idx] = v_scale_val;
+                        }
                     }
-                    const float amax = warpReduceMax(local_amax);
-                    v_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
-                    if(lane_id == 0)
+                    else if constexpr(kStaticKVScale)
                     {
-                        const int64_t b = mapped_slot / block_size;
-                        const int64_t t = mapped_slot % block_size;
-                        const int64_t scale_idx =
-                            kAsmLayout
-                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
-                                   static_cast<int64_t>(head) * block_size + t)
-                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
-                        v_scale[scale_idx] = v_scale_val;
+                        v_scale_val = *v_scale;
                     }
-                }
-                else if constexpr(kStaticKVScale)
-                {
-                    v_scale_val = *v_scale;
-                }
-                if constexpr(kAsmLayout)
-                {
-                    // V SHUFFLE: [num_blocks, num_kv_heads, block_size/x, head_dim, x]
-                    //   off(d) = b*(nkv*hd*bs) + h*(hd*bs) + (t/x)*(hd*x) + d*x + (t%x)
-                    // The kElemsPerLane elements of a lane (consecutive d) are x apart.
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int64_t v_base =
-                        b * (static_cast<int64_t>(nkv) * kHeadDim * block_size) +
-                        static_cast<int64_t>(head) * kHeadDim * block_size +
-                        (t / x) * (static_cast<int64_t>(kHeadDim) * x) +
-                        static_cast<int64_t>(dim_base) * x + (t % x);
-                    storeCacheElemsStrided<scalar_t, cache_t, kv_dt>(
-                        row_ptr + dim_base, kv_cache_v + v_base, x, v_scale_val);
-                }
-                else
-                {
-                    // page-128 V cache [num_blocks, block_size, num_kv_heads, head_dim]
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int64_t off =
-                        b * v_s_block + t * v_s_token + head * v_s_head;
-                    copyOrQuantizeCacheElems<scalar_t, cache_t, kv_dt>(
-                        row_ptr + dim_base, kv_cache_v + off + dim_base, v_scale_val);
-                }
-            }
-            return;
-        }
-    }
-
-    float elems[kElemsPerLane];
-    loadElems(row_ptr + dim_base, elems);
-    const int64_t pos = positions[token_idx];
-    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    normAndRope(elems, lane_id, eps, norm_w, do_rope, rotary_dim, cos_ptr, norm_w != nullptr);
-
-    if constexpr(kInsertKV)
-    {
-        if(is_q)
-        {
-            if constexpr(kQFp8)
-            {
-                // Saturate (+-inf too); the compares keep NaN a NaN.
-                const float fp8_max = fp8Max<opus::fp8_t>();
-#pragma unroll
-                for(int i = 0; i < kElemsPerLane; ++i)
-                {
-                    elems[i] = elems[i] > fp8_max    ? fp8_max
-                               : elems[i] < -fp8_max ? -fp8_max
-                                                     : elems[i];
-                }
-                storeCacheElems<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
-                    q_fp8_out + static_cast<int64_t>(token_idx) * nq * kHeadDim +
-                        slot * kHeadDim + dim_base,
-                    elems,
-                    1.0f);
-            }
-            else
-            {
-                storeElems(store_ptr + dim_base, elems);
-            }
-        }
-        if constexpr(kProcessIndex)
-        {
-            if(is_iq)
-            {
-                storeIndexQElems(index_q_out,
-                                 index_q_fp8_out,
-                                 store_ptr + dim_base,
-                                 elems,
-                                 token_idx,
-                                 niq,
-                                 slot - iq_begin,
-                                 dim_base);
-            }
-        }
-
-        if(mapped_slot >= 0)
-        {
-            if constexpr(kProcessIndex)
-            {
-                if(is_ik)
-                {
-                    if constexpr(kNvfp4)
+                    if constexpr(kAsmLayout)
                     {
-                        storeNvfp4IndexRow<scalar_t>(reinterpret_cast<uint8_t*>(index_cache) +
-                                                         (mapped_slot / kNvTokens) * kNvIndexPage,
-                                                     static_cast<int>(mapped_slot % kNvTokens),
-                                                     elems,
-                                                     lane_id);
-                    }
-                    else if constexpr(kIndexFp4)
-                    {
-                        storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(index_cache),
-                                                mapped_slot,
-                                                kFp4PageBytes,
-                                                0,
-                                                elems,
-                                                lane_id);
+                        // V SHUFFLE: [num_blocks, num_kv_heads, block_size/x, head_dim, x]
+                        //   off(d) = b*(nkv*hd*bs) + h*(hd*bs) + (t/x)*(hd*x) + d*x + (t%x)
+                        // The kElemsPerLane elements of a lane (consecutive d) are x apart.
+                        int64_t b, t, t_group, t_lane;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        splitSlot(t, x, t_group, t_lane); // t / x, t % x
+                        const int64_t v_base =
+                            b * (static_cast<int64_t>(nkv) * kHeadDim * block_size) +
+                            static_cast<int64_t>(head) * kHeadDim * block_size +
+                            t_group * (static_cast<int64_t>(kHeadDim) * x) +
+                            static_cast<int64_t>(dim_base) * x + t_lane;
+                        storeCacheElemsStrided<scalar_t, cache_t, kv_dt>(
+                            raw, kv_cache_v + v_base, x, v_scale_val);
                     }
                     else
                     {
-                        storeCacheElems<scalar_t, index_cache_t, index_dt>(
-                            index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
+                        // page-128 V cache [num_blocks, block_size, num_kv_heads, head_dim]
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        const int64_t off =
+                            b * v_s_block + t * v_s_token + head * v_s_head;
+                        copyOrQuantizeCacheElems<scalar_t, cache_t, kv_dt>(
+                            raw, kv_cache_v + off + dim_base, v_scale_val);
                     }
                 }
-            }
-            if constexpr(kKvFp4)
-            {
-                if(is_k)
-                {
-                    if constexpr(kNvfp4)
-                    {
-                        storeNvfp4KRow<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k) +
-                                                     (mapped_slot / kNvTokens) * k_s_block,
-                                                 nkv,
-                                                 head,
-                                                 static_cast<int>(mapped_slot % kNvTokens),
-                                                 *k_scale,
-                                                 elems,
-                                                 lane_id);
-                    }
-                    else
-                    {
-                        storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k),
-                                                mapped_slot,
-                                                k_s_block,
-                                                static_cast<int64_t>(head) * k_s_head,
-                                                elems,
-                                                lane_id);
-                    }
-                }
-            }
-            else if(is_k)
-            {
-                // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
-                // then a full-warp max -> the (token, head) head-dim amax.
-                float k_scale_val = 1.0f;
-                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
-                             kPerTokenKVScale)
-                {
-                    float local_amax = 0.0f;
-#pragma unroll
-                    for(int i = 0; i < kElemsPerLane; ++i)
-                    {
-                        local_amax = fmaxf(local_amax, fabsf(elems[i]));
-                    }
-                    const float amax = warpReduceMax(local_amax);
-                    k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
-                    if(lane_id == 0)
-                    {
-                        const int64_t b = mapped_slot / block_size;
-                        const int64_t t = mapped_slot % block_size;
-                        const int64_t scale_idx =
-                            kAsmLayout
-                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
-                                   static_cast<int64_t>(head) * block_size + t)
-                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
-                        k_scale[scale_idx] = k_scale_val;
-                    }
-                }
-                else if constexpr(kStaticKVScale)
-                {
-                    k_scale_val = *k_scale;
-                }
-                if constexpr(kAsmLayout)
-                {
-                    // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
-                    //   off(d) = b*(nkv*(hd/x)*bs*x) + h*((hd/x)*bs*x)
-                    //            + (d/x)*(bs*x) + t*x + (d%x)
-                    // kElemsPerLane <= x, so a lane's elements share d/x and (d%x) runs
-                    // contiguously -> a contiguous run of kElemsPerLane in the cache.
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int d0 = dim_base;  // = lane_id * kElemsPerLane
-                    const int64_t k_off =
-                        b * (static_cast<int64_t>(nkv) * (kHeadDim / x) * block_size * x) +
-                        static_cast<int64_t>(head) * ((kHeadDim / x) * block_size * x) +
-                        static_cast<int64_t>(d0 / x) * (static_cast<int64_t>(block_size) * x) +
-                        t * x + (d0 % x);
-                    storeCacheElems<scalar_t, cache_t, kv_dt>(
-                        kv_cache_k + k_off, elems, k_scale_val);
-                }
-                else
-                {
-                    // page-128 K cache [num_blocks, block_size, num_kv_heads, head_dim]
-                    const int64_t b = mapped_slot / block_size;
-                    const int64_t t = mapped_slot % block_size;
-                    const int64_t off = b * k_s_block + t * k_s_token + head * k_s_head;
-                    storeCacheElems<scalar_t, cache_t, kv_dt>(
-                        kv_cache_k + off + dim_base, elems, k_scale_val);
-                }
-            }
-        }
-    }
-    else
-    {
-        if constexpr(kProcessIndex)
-        {
-            if(is_iq)
-            {
-                storeIndexQElems(index_q_out,
-                                 index_q_fp8_out,
-                                 store_ptr + dim_base,
-                                 elems,
-                                 token_idx,
-                                 niq,
-                                 slot - iq_begin,
-                                 dim_base);
                 return;
             }
         }
-        storeElems(store_ptr + dim_base, elems);
+
+        // Every slot past here has a norm weight (the host requires each one).
+        float elems[kElemsPerLane];
+        loadElems(raw, elems);
+        normAndRope<scalar_t>(elems, lane_id, eps, nri, do_rope, rotary_dim);
+
+        if constexpr(kInsertKV)
+        {
+            if(is_q)
+            {
+                if constexpr(kQFp8)
+                {
+                    // Saturate (+-inf too); the compares keep NaN a NaN.
+                    const float fp8_max = fp8Max<opus::fp8_t>();
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        elems[i] = elems[i] > fp8_max    ? fp8_max
+                                   : elems[i] < -fp8_max ? -fp8_max
+                                                         : elems[i];
+                    }
+                    storeCacheElems<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
+                        q_fp8_out + static_cast<int64_t>(token_idx) * nq * kHeadDim +
+                            slot * kHeadDim + dim_base,
+                        elems,
+                        1.0f);
+                }
+                else
+                {
+                    storeElems(store_ptr + dim_base, elems);
+                }
+            }
+            if constexpr(kProcessIndex)
+            {
+                if(is_iq)
+                {
+                    storeIndexQElems(index_q_out,
+                                     index_q_fp8_out,
+                                     store_ptr + dim_base,
+                                     elems,
+                                     token_idx,
+                                     niq,
+                                     slot - iq_begin,
+                                     dim_base);
+                }
+            }
+
+            if(mapped_slot >= 0)
+            {
+                if constexpr(kProcessIndex)
+                {
+                    if(is_ik)
+                    {
+                        if constexpr(kNvfp4)
+                        {
+                            storeNvfp4IndexRow<scalar_t>(reinterpret_cast<uint8_t*>(index_cache) +
+                                                             (mapped_slot / kNvTokens) * kNvIndexPage,
+                                                         static_cast<int>(mapped_slot % kNvTokens),
+                                                         elems,
+                                                         lane_id);
+                        }
+                        else if constexpr(kIndexFp4)
+                        {
+                            storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(index_cache),
+                                                    mapped_slot,
+                                                    kFp4PageBytes,
+                                                    0,
+                                                    elems,
+                                                    lane_id);
+                        }
+                        else
+                        {
+                            storeCacheElems<scalar_t, index_cache_t, index_dt>(
+                                index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
+                        }
+                    }
+                }
+                if constexpr(kKvFp4)
+                {
+                    if(is_k)
+                    {
+                        if constexpr(kNvfp4)
+                        {
+                            storeNvfp4KRow<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k) +
+                                                         (mapped_slot / kNvTokens) * k_s_block,
+                                                     nkv,
+                                                     head,
+                                                     static_cast<int>(mapped_slot % kNvTokens),
+                                                     *k_scale,
+                                                     elems,
+                                                     lane_id);
+                        }
+                        else
+                        {
+                            storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k),
+                                                    mapped_slot,
+                                                    k_s_block,
+                                                    static_cast<int64_t>(head) * k_s_head,
+                                                    elems,
+                                                    lane_id);
+                        }
+                    }
+                }
+                else if(is_k)
+                {
+                    // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
+                    // then a full-warp max -> the (token, head) head-dim amax.
+                    float k_scale_val = 1.0f;
+                    if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
+                                 kPerTokenKVScale)
+                    {
+                        float local_amax = 0.0f;
+#pragma unroll
+                        for(int i = 0; i < kElemsPerLane; ++i)
+                        {
+                            local_amax = fmaxf(local_amax, fabsf(elems[i]));
+                        }
+                        const float amax = warpReduceMax(local_amax);
+                        k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
+                        if(lane_id == 0)
+                        {
+                            int64_t b, t;
+                            splitSlot(mapped_slot, block_size, b, t);
+                            const int64_t scale_idx =
+                                kAsmLayout
+                                    ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                       static_cast<int64_t>(head) * block_size + t)
+                                    : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                            k_scale[scale_idx] = k_scale_val;
+                        }
+                    }
+                    else if constexpr(kStaticKVScale)
+                    {
+                        k_scale_val = *k_scale;
+                    }
+                    if constexpr(kAsmLayout)
+                    {
+                        // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+                        //   off(d) = b*(nkv*(hd/x)*bs*x) + h*((hd/x)*bs*x)
+                        //            + (d/x)*(bs*x) + t*x + (d%x)
+                        // kElemsPerLane <= x, so a lane's elements share d/x and (d%x) runs
+                        // contiguously -> a contiguous run of kElemsPerLane in the cache.
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        const int d0 = dim_base;  // = lane_id * kElemsPerLane
+                        const int64_t k_off =
+                            b * (static_cast<int64_t>(nkv) * (kHeadDim / x) * block_size * x) +
+                            static_cast<int64_t>(head) * ((kHeadDim / x) * block_size * x) +
+                            static_cast<int64_t>(d0 / x) * (static_cast<int64_t>(block_size) * x) +
+                            t * x + (d0 % x);
+                        storeCacheElems<scalar_t, cache_t, kv_dt>(
+                            kv_cache_k + k_off, elems, k_scale_val);
+                    }
+                    else
+                    {
+                        // page-128 K cache [num_blocks, block_size, num_kv_heads, head_dim]
+                        int64_t b, t;
+                        splitSlot(mapped_slot, block_size, b, t);
+                        const int64_t off = b * k_s_block + t * k_s_token + head * k_s_head;
+                        storeCacheElems<scalar_t, cache_t, kv_dt>(
+                            kv_cache_k + off + dim_base, elems, k_scale_val);
+                    }
+                }
+            }
+        }
+        else
+        {
+            // No insert, one row per warp: two 32-bit row stores on gfx1250 (see storeElems).
+            if constexpr(kProcessIndex)
+            {
+                if(is_iq)
+                {
+                    storeIndexQElems<scalar_t, kRows == 1>(index_q_out,
+                                                           index_q_fp8_out,
+                                                           store_ptr + dim_base,
+                                                           elems,
+                                                           token_idx,
+                                                           niq,
+                                                           slot - iq_begin,
+                                                           dim_base);
+                    return;
+                }
+            }
+            storeElems<scalar_t, kRows == 1>(store_ptr + dim_base, elems);
+        }
+    };
+
+    // One copy of the row code: process row 0, then shift the next row down.
+    for(int r = 0;;)
+    {
+        process_row(row_token[0], row_slot[0], row_raw[0], row_nri[0], row_cache_slot[0]);
+        if constexpr(kRows > 1)
+        {
+            if(++r < kRows && row_token[1] < num_tokens)
+            {
+#pragma unroll
+                for(int i = 0; i + 1 < kRows; ++i)
+                {
+                    row_token[i]      = row_token[i + 1];
+                    row_slot[i]       = row_slot[i + 1];
+                    row_cache_slot[i] = row_cache_slot[i + 1];
+                    row_nri[i]        = row_nri[i + 1];
+#pragma unroll
+                    for(int e = 0; e < kElemsPerLane; ++e)
+                    {
+                        row_raw[i][e] = row_raw[i + 1][e];
+                    }
+                }
+                continue;
+            }
+        }
+        break;
     }
 }
 
@@ -968,21 +1398,39 @@ void launchFusedQKNormIdxrQKNorm(
     bool static_kv_scale,
     bool asm_layout,
     hipStream_t stream,
-    opus::fp8_t* q_fp8_out = nullptr)
+    opus::fp8_t* q_fp8_out = nullptr,
+    QkvPartials partials   = {})
 {
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
     const int slots_per_token = nq + nkv + v_slots + idx_slots;
-    constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    const int64_t total_warps = static_cast<int64_t>(num_tokens) * slots_per_token;
+    const int64_t total_rows = static_cast<int64_t>(num_tokens) * slots_per_token;
+    // Several rows per warp, and the split-K partials load, on gfx1250 only. The fp4 caches,
+    // which run on gfx950 only (the Python op refuses them elsewhere), have no multi-row
+    // instantiation, nor does the split-K partials load. Only the host and gfx1250 passes
+    // instantiate these kernels: the other device passes skip them, so other archs do not
+    // build kernels that never run there (their host-side launch is not taken off gfx1250).
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
+    constexpr int kMultiRowsCfg = 1;
+    constexpr bool kPartialsCfg = false;
+#else
+    constexpr int kMultiRowsCfg = kKvFp4 || kIndexFp4 ? 1 : kMultiRows;
+    constexpr bool kPartialsCfg = true;
+#endif
+    static const int64_t multi_row_min_rows = kMultiRowMinRowsPerCu * get_num_cu_func();
+    const int rows_per_warp = kMultiRowsCfg > 1 && isGfx1250() && partials.num_splits == 0 &&
+                                      total_rows >= multi_row_min_rows
+                                  ? kMultiRowsCfg
+                                  : 1;
+    const int64_t total_warps = (total_rows + rows_per_warp - 1) / rows_per_warp;
     const int grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
     if(grid == 0)
     {
         return;
     }
 
-#define LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8)      \
+#define LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, PARTIALS, ROWS) \
     fusedQKNormIdxrQKNormKernel<scalar_t,                                                    \
                                 cache_t,                                                     \
                                 index_cache_t,                                               \
@@ -997,7 +1445,9 @@ void launchFusedQKNormIdxrQKNorm(
                                 kIndexFp4,                                                   \
                                 kKvFp4,                                                      \
                                 kNvfp4,                                                      \
-                                QFP8>                                                        \
+                                QFP8,                                                        \
+                                PARTIALS,                                                    \
+                                ROWS>                                                        \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
@@ -1030,10 +1480,26 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_block,                                         \
                                           v_s_token,                                         \
                                           v_s_head,                                          \
-                                          q_fp8_out)
+                                          q_fp8_out,                                         \
+                                          partials)
+
+#define LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8)      \
+    do                                                                                       \
+    {                                                                                        \
+        if(rows_per_warp > 1)                                                                \
+        {                                                                                    \
+            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, false, kMultiRowsCfg); \
+        }                                                                                    \
+        else                                                                                 \
+        {                                                                                    \
+            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, false, 1); \
+        }                                                                                    \
+    } while(0)
 
 // The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
-// instantiations are unchanged.
+// instantiations are unchanged. So is the split-K partials load: gfx1250, bf16 insert modes
+// that cover every qkv column, one row per warp (the host reduces the partials of any other
+// call first).
 #define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
     do                                                                                       \
     {                                                                                        \
@@ -1041,16 +1507,24 @@ void launchFusedQKNormIdxrQKNorm(
         {                                                                                    \
             if(q_fp8_out != nullptr)                                                         \
             {                                                                                \
-                LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, true); \
+                LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, true); \
+            }                                                                                \
+            else if(partials.num_splits > 0)                                                 \
+            {                                                                                \
+                if constexpr(kPartialsCfg && std::is_same_v<scalar_t, hip_bfloat16> &&       \
+                             (!(IS_SPARSE) || (PROCESS_INDEX)) && !kKvFp4 && !kIndexFp4)     \
+                {                                                                            \
+                    LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false, true, 1); \
+                }                                                                            \
             }                                                                                \
             else                                                                             \
             {                                                                                \
-                LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
+                LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
             }                                                                                \
         }                                                                                    \
         else                                                                                 \
         {                                                                                    \
-            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
+            LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
         }                                                                                    \
     } while(0)
 
@@ -1136,6 +1610,7 @@ void launchFusedQKNormIdxrQKNorm(
 #undef LAUNCH_ASM
 #undef LAUNCH_SCALE
 #undef LAUNCH
+#undef LAUNCH_R
 #undef LAUNCH_Q
 }
 
@@ -1167,11 +1642,15 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> qkv_partials,
+    bool check_only)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
     AITER_CHECK(qkv.is_gpu() && qkv.is_contiguous(), "qkv must be contiguous CUDA");
+    AITER_CHECK(qkv.dtype() == AITER_DTYPE_bf16 || qkv.dtype() == AITER_DTYPE_fp16,
+                "qkv must be bf16 or fp16");
     AITER_CHECK(positions.is_gpu() && positions.is_contiguous() &&
                     positions.dtype() == AITER_DTYPE_i64,
                 "positions must be contiguous int64 CUDA");
@@ -1196,7 +1675,8 @@ static void fused_qknorm_idxrqknorm_impl(
     const int nq = static_cast<int>(num_heads);
     const int nkv = static_cast<int>(num_kv_heads);
     const int niq = static_cast<int>(num_index_heads);
-    AITER_CHECK(nq > 0 && nkv > 0 && niq >= 0, "num_heads/num_kv_heads must be positive");
+    AITER_CHECK(nq > 0 && nkv > 0 && niq >= 0,
+                "num_heads/num_kv_heads must be positive, num_index_heads non-negative");
     const bool has_index = niq > 0;
     AITER_CHECK(!skip_index_branch || has_index,
                 "skip_index_branch requires num_index_heads > 0");
@@ -1406,12 +1886,6 @@ static void fused_qknorm_idxrqknorm_impl(
             // distinct pages.
             AITER_CHECK(kv_cache_k->size(0) <= 1 || kv_cache_k->stride(0) >= kv_cache_k->size(1),
                         "nvfp4 kv_cache page stride must be at least the page size");
-            // The launch runs on qkv's device and reads these through raw pointers.
-            AITER_CHECK(kv_cache_k->device_id == qkv.device_id &&
-                            k_scale->device_id == qkv.device_id &&
-                            v_scale->device_id == qkv.device_id &&
-                            (!process_index || index_cache->device_id == qkv.device_id),
-                        "nvfp4 kv_cache, k_scale, v_scale and index_cache must be on qkv's device");
             k_s_block = kv_cache_k->stride(0);
             v_s_block = k_s_block;
             if(process_index)
@@ -1582,8 +2056,78 @@ static void fused_qknorm_idxrqknorm_impl(
                     "index_q_out must have num_tokens * num_index_heads * 128 elements");
     }
 
+    // The launches run on qkv's device and read or write every tensor of the call they use
+    // through a raw pointer.
+    const auto on_qkv_device = [&](const std::optional<aiter_tensor_t>& t) {
+        return !t.has_value() || t->device_id == qkv.device_id;
+    };
+    const bool kv_scaled = fp8_kv_per_token || fp8_kv_static || nvfp4_kv_cache;
+    AITER_CHECK(q_norm_weight.device_id == qkv.device_id &&
+                    k_norm_weight.device_id == qkv.device_id &&
+                    cos_sin_cache.device_id == qkv.device_id &&
+                    positions.device_id == qkv.device_id && on_qkv_device(q_out) &&
+                    on_qkv_device(qkv_partials) &&
+                    (!process_index ||
+                     (on_qkv_device(index_q_out) && on_qkv_device(index_q_norm_weight) &&
+                      on_qkv_device(index_k_norm_weight))) &&
+                    (!insert_kv ||
+                     (on_qkv_device(slot_mapping) && on_qkv_device(kv_cache_k) &&
+                      on_qkv_device(kv_cache_v) &&
+                      (!kv_scaled || (on_qkv_device(k_scale) && on_qkv_device(v_scale))) &&
+                      (!process_index || (on_qkv_device(index_slot_mapping) &&
+                                          on_qkv_device(index_cache))))),
+                "every tensor the call reads or writes must be on qkv's device");
+
+    QkvPartials partials{};
+    if(qkv_partials.has_value())
+    {
+        AITER_CHECK(qkv.dtype() == AITER_DTYPE_bf16, "qkv_partials requires a bf16 qkv");
+        const aiter_tensor_t& qp = *qkv_partials;
+        AITER_CHECK(qp.is_gpu() && qp.dtype() == AITER_DTYPE_fp32 && qp.dim() == 3,
+                    "qkv_partials must be a float32 CUDA [num_splits, rows, row] tensor");
+        const int64_t splits = qp.size(0);
+        AITER_CHECK(splits == 2 || splits == 4 || splits == 8,
+                    "qkv_partials supports 2, 4 or 8 splits");
+        AITER_CHECK(qp.size(1) >= num_tokens && qp.size(2) == expected_row &&
+                        qp.stride(2) == 1 && qp.stride(1) == expected_row &&
+                        qp.stride(0) >= qp.size(1) * expected_row,
+                    "qkv_partials must hold num_tokens dense qkv rows per split");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(qp.data_ptr()) % 16 == 0 &&
+                        qp.stride(0) % 4 == 0,
+                    "qkv_partials must be 16-byte aligned per split");
+        partials = {reinterpret_cast<const float*>(qp.data_ptr()),
+                    static_cast<int>(splits),
+                    qp.stride(0)};
+    }
+
+    // check_only: every check above passed, the call would run.
+    if(check_only)
+    {
+        return;
+    }
+
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // The main kernel sums the partials as it reads qkv where it writes every qkv column
+    // back: on gfx1250, the insert mode with every slot processed, no fp4 cache and no
+    // e4m3 q. Any other call reduces them into qkv first.
+    const bool fuse_partials = isGfx1250() && insert_kv && (!has_index || process_index) &&
+                               !fp4_kv_cache && !fp4_index_cache && !q_is_fp8;
+    if(partials.num_splits > 0 && !fuse_partials)
+    {
+        // expected_row is a multiple of 128: whole lanes of kElemsPerLane elements
+        const int64_t num_elems = static_cast<int64_t>(num_tokens) * expected_row;
+        constexpr int kReduceBlock = 256;
+        const int blocks = static_cast<int>(
+            (num_elems / kElemsPerLane + kReduceBlock - 1) / kReduceBlock);
+        if(blocks > 0)
+        {
+            reduceQkvPartialsKernel<<<blocks, kReduceBlock, 0, stream>>>(
+                reinterpret_cast<hip_bfloat16*>(qkv.data_ptr()), partials, num_elems);
+        }
+        partials = {};
+    }
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(qkv.dtype(), "fused_qknorm_idxrqknorm", [&] {
         using T = scalar_t;
@@ -1604,7 +2148,6 @@ static void fused_qknorm_idxrqknorm_impl(
         {
             // FP4 (MXFP4/NVFP4) main K/V and/or index K (sparse insert only); the other cache
             // keeps its type.
-            const bool kv_scaled = fp8_kv_per_token || fp8_kv_static || nvfp4_kv_cache;
             auto launch_fp4 = [&]<typename CacheT,
                                   typename IndexT,
                                   vllm::Fp8KVCacheDataType kv_dt,
@@ -1656,7 +2199,8 @@ static void fused_qknorm_idxrqknorm_impl(
                     fp8_kv_static,
                     asm_layout,
                     stream,
-                    q_fp8_ptr);
+                    q_fp8_ptr,
+                    partials);
             };
             using Dt = vllm::Fp8KVCacheDataType;
             if(nvfp4_kv_cache)
@@ -1749,7 +2293,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
             else
             {
@@ -1807,7 +2352,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
         }
         else
@@ -1864,7 +2410,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
             else
             {
@@ -1918,7 +2465,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
         }
     });
@@ -1950,34 +2498,54 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> qkv_partials,
+    bool check_only)
 {
-    fused_qknorm_idxrqknorm_impl(qkv,
-                                                q_norm_weight,
-                                                k_norm_weight,
-                                                cos_sin_cache,
-                                                positions,
-                                                num_heads,
-                                                num_kv_heads,
-                                                rotary_dim,
-                                                eps,
-                                                index_q_norm_weight,
-                                                index_k_norm_weight,
-                                                num_index_heads,
-                                                slot_mapping,
-                                                kv_cache_k,
-                                                kv_cache_v,
-                                                index_cache,
-                                                block_size,
-                                                q_out,
-                                                index_q_out,
-                                                index_slot_mapping,
-                                                kv_cache_dtype,
-                                                index_cache_dtype,
-                                                k_scale,
-                                                v_scale,
-                                                asm_layout,
-                                                skip_index_branch);
+    // A refused argument raises (RuntimeError in Python) before anything launches. Under
+    // check_only a refusal is the answer, not an error: it is not printed, and it raises
+    // std::invalid_argument (ValueError) so that the query can tell it from a build or
+    // load failure. check_only runs the checks only, so any error here is a refusal.
+    aiter_detail::AiterThrowGuard throw_guard(/*quiet=*/check_only);
+    try
+    {
+        fused_qknorm_idxrqknorm_impl(qkv,
+                                     q_norm_weight,
+                                     k_norm_weight,
+                                     cos_sin_cache,
+                                     positions,
+                                     num_heads,
+                                     num_kv_heads,
+                                     rotary_dim,
+                                     eps,
+                                     index_q_norm_weight,
+                                     index_k_norm_weight,
+                                     num_index_heads,
+                                     slot_mapping,
+                                     kv_cache_k,
+                                     kv_cache_v,
+                                     index_cache,
+                                     block_size,
+                                     q_out,
+                                     index_q_out,
+                                     index_slot_mapping,
+                                     kv_cache_dtype,
+                                     index_cache_dtype,
+                                     k_scale,
+                                     v_scale,
+                                     asm_layout,
+                                     skip_index_branch,
+                                     qkv_partials,
+                                     check_only);
+    }
+    catch(const std::runtime_error& e)
+    {
+        if(!check_only)
+        {
+            throw;
+        }
+        throw std::invalid_argument(e.what());
+    }
 }
 
 } // namespace aiter

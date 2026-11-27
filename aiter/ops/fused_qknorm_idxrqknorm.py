@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_gfx_runtime
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
@@ -21,8 +22,16 @@ _FP8_E4M3_DTYPES = tuple(
 )
 
 
+_FP4 = ("mxfp4", "nvfp4")
+
 # Targets with opus::fp32_to_fp8 (opus.hpp).
 _FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+
+
+# The live arch, a constant to torch.compile (no graph break on the driver query).
+@torch.compiler.assume_constant_result
+def _gfx() -> str:
+    return base_gfx_arch(get_gfx_runtime())
 
 
 def _is_fp8_e4m3_tensor(t: Tensor | None) -> bool:
@@ -61,6 +70,8 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
+    check_only: bool = False,
 ) -> None:
     pass
 
@@ -92,6 +103,8 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
+    check_only: bool = False,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -116,6 +129,18 @@ def fused_qknorm_idxrqknorm(
     #   arithmetic, not a hardware convert, but nvfp4 (like mxfp4) is refused off gfx950.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
+    # qkv_partials: the FP32 [num_splits (2, 4 or 8), >= num_tokens, row] split-K partials of
+    #   a bf16 qkv its GEMM left unreduced, any mode. They are summed as the gfx1250 split-K
+    #   GEMM's reduce kernel does (FP32, split order, one round to nearest even) and the
+    #   reduced row is written back into qkv: on gfx1250 only, in the op's own pass in insert
+    #   mode with every qkv slot processed (no skip_index_branch), no fp4 cache and no fp8
+    #   q_out; by a reduce kernel launched first otherwise (off gfx1250, every call).
+    # Refused arguments raise RuntimeError before anything is launched; the C++ entry
+    #   checks the dtype, layout and device of every tensor the kernels read or write, and
+    #   the size of each but the asm_layout index_cache (its capacity is the caller's, as
+    #   are the slot_mapping and positions values).
+    # check_only: run every check of the call, launch nothing; a refusal raises ValueError
+    #   (see fused_qknorm_idxrqknorm_supports).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -124,43 +149,33 @@ def fused_qknorm_idxrqknorm(
         )
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
-    # stores would silently write zeros.
-    fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
-    if fp4_dtypes and get_gfx_runtime() != "gfx950":
-        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
+    # stores would silently write zeros. The arch is looked up only for such a store.
+    refused = ValueError if check_only else RuntimeError
+    if (kv_cache_dtype in _FP4 or index_cache_dtype in _FP4) and _gfx() != "gfx950":
+        raise refused("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
+    # The index cache and index_q_out are written only with the index branch processed,
+    # the index cache in insert mode only. Per call: "auto" first (cheaper than startswith),
+    # qkv.dtype read once.
+    index_branch = num_index_heads > 0 and not skip_index_branch
+    dt = qkv.dtype
     if (
-        q_out is not None
-        and q_out.dtype != qkv.dtype
-        and get_gfx_runtime() not in _FP8_CVT_GFX
-    ):
-        raise RuntimeError(f"an fp8 q_out requires one of {_FP8_CVT_GFX}")
-
-    use_fp8_kv_cache = (
-        kv_cache_k is not None
-        and isinstance(kv_cache_dtype, str)
-        and kv_cache_dtype.startswith("fp8")
-    )
-    use_per_token_kv_scale = use_fp8_kv_cache and kv_cache_dtype in (
-        "fp8",
-        "fp8_e4m3",
-    )
-    use_static_kv_scale = use_fp8_kv_cache and kv_cache_dtype == "fp8_e4m3_static"
-    if use_fp8_kv_cache:
-        if not skip_index_branch and index_slot_mapping is None:
-            index_slot_mapping = slot_mapping
-        assert slot_mapping is not None
-        assert kv_cache_v is not None
-        if not skip_index_branch:
-            assert index_q_norm_weight is not None
-            assert index_k_norm_weight is not None
-            assert index_cache is not None
-            assert index_slot_mapping is not None
-        if use_per_token_kv_scale or use_static_kv_scale:
-            assert k_scale is not None
-            assert v_scale is not None
-        else:
-            assert k_scale is None
-            assert v_scale is None
+        (
+            kv_cache_k is not None
+            and (
+                (kv_cache_dtype != "auto" and kv_cache_dtype.startswith("fp8"))
+                or (
+                    index_branch
+                    and index_cache_dtype != "auto"
+                    and index_cache_dtype.startswith("fp8")
+                )
+            )
+        )
+        or (q_out is not None and q_out.dtype != dt)
+        or (index_branch and index_q_out is not None and index_q_out.dtype != dt)
+    ) and _gfx() not in _FP8_CVT_GFX:
+        raise refused(
+            f"an fp8 cache, q_out or index_q_out requires one of {_FP8_CVT_GFX}"
+        )
 
     _fused_qknorm_idxrqknorm_hip(
         qkv,
@@ -189,4 +204,20 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        qkv_partials,
+        check_only,
     )
+
+
+def fused_qknorm_idxrqknorm_supports(*args, **kwargs) -> bool:
+    """Whether fused_qknorm_idxrqknorm takes this call: the op's own checks, run with
+    the same arguments, without launching anything (host only, no sync, no output). A
+    caller that has another path asks this instead of restating the op's limits. Only a
+    refusal answers False; a JIT build or module load failure raises. Eager only: under
+    torch.compile (FakeTensor) the C++ checks do not run, so it can answer True for a
+    call the op refuses."""
+    try:
+        fused_qknorm_idxrqknorm(*args, **kwargs, check_only=True)
+    except ValueError:
+        return False
+    return True

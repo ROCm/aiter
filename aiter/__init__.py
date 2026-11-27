@@ -179,6 +179,7 @@ else:
         FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q,
         FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE,
         fused_qknorm_idxrqknorm,
+        fused_qknorm_idxrqknorm_supports,
     )
     from .ops.fused_qk_norm_rope_cache_quant import *
     from .ops.fused_qk_rmsnorm_group_quant import *
