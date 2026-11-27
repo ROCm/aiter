@@ -464,3 +464,90 @@ def test_without_amdsmi_rocminfo_gives_the_cu_count(node, monkeypatch):
     )
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-c84490c587b21daa")
     assert chip_info.get_cu_num() == 128
+
+
+MI300A_SPX = _gpu("gfx942", 228, "SPX", 1)
+MI350P_SPX = _gpu("gfx950", 128, "SPX", 1)
+
+
+@pytest.fixture
+def tuned_node(node, monkeypatch):
+    monkeypatch.delenv("GPU_ARCHS", raising=False)
+
+    def install(gpus):
+        node(gpus)
+        chip_info._tuned_cu_nums_of_device.cache_clear()
+        chip_info._shared_tuned_cu_nums.cache_clear()
+
+    yield install
+    chip_info._tuned_cu_nums_of_device.cache_clear()
+    chip_info._shared_tuned_cu_nums.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "gpus, cu_nums",
+    [
+        (MI300X_DPX, (152, 304)),
+        (MI300X_CPX, (38, 304)),
+        (MI355X_DPX, (128, 256)),
+        ([MI355X_DPX_VF], (128, 256)),
+        (SECONDARY_ONLY_ID, (152, 304)),
+        (MI300X_SPX, (304,)),
+        (MI308X_SPX, (80,)),
+        (MI300A_SPX, (228,)),
+        (MI350P_SPX, (128,)),
+        (MI210, (104,)),
+        (SECONDARY_ONLY, (152,)),
+    ],
+)
+def test_only_partitions_use_full_chip_rows(tuned_node, gpus, cu_nums):
+    """A partition falls back to the rows of its full chip; other GPUs match exactly."""
+    tuned_node(gpus)
+    assert chip_info.get_tuned_cu_nums() == cu_nums
+    assert chip_info.get_tuned_cu_nums(cu_nums[0]) == cu_nums
+    assert chip_info.get_tuned_cu_nums(cu_nums[0] + 1) == (cu_nums[0] + 1,)
+
+
+def test_each_device_uses_its_own_partition(tuned_node, monkeypatch):
+    tuned_node(MIXED)
+    assert chip_info.get_tuned_cu_nums(device=0) == (304,)
+    assert chip_info.get_tuned_cu_nums(152, device=2) == (152, 304)
+    assert chip_info.get_tuned_cu_nums(152, device=0) == (152,)
+    monkeypatch.setattr(chip_info, "_current_device", lambda: 2)
+    assert chip_info.get_tuned_cu_nums(152) == (152, 304)
+
+
+def test_same_gpus_need_no_device_query(tuned_node, monkeypatch):
+    """Tuned lookups run per call; on a node of one GPU kind they query no device."""
+    tuned_node(MI300X_DPX)
+    calls = []
+    monkeypatch.setattr(chip_info, "_current_device", lambda: calls.append(0) or 0)
+    for _ in range(3):
+        assert chip_info.get_tuned_cu_nums(152) == (152, 304)
+    assert calls == []
+
+
+def test_cu_mask_emulation_is_not_a_partition(tuned_node, monkeypatch):
+    tuned_node(MI300X_SPX)
+    monkeypatch.setenv("CU_NUM", "152")
+    assert chip_info.get_tuned_cu_nums() == (152,)
+
+
+def test_partition_builds_full_chip_rows(tuned_node, monkeypatch):
+    tuned_node(MI300X_DPX)
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx942")
+    assert chip_info.get_build_targets() == [("gfx942", 152), ("gfx942", 304)]
+
+
+def test_find_tuned_cu_row_prefers_the_own_cu_count(tuned_node):
+    tuned_node(MI300X_DPX)
+    table = {
+        ("gfx942", 152, 1): "own",
+        ("gfx942", 304, 1): "full",
+        ("gfx942", 304, 2): "full",
+    }
+    key = lambda shape: lambda cu: ("gfx942", cu, shape)
+    assert chip_info.find_tuned_cu_row(table, key(1), "gfx942", 152, "t") == "own"
+    assert chip_info.find_tuned_cu_row(table, key(2), "gfx942", 152, "t") == "full"
+    assert chip_info.find_tuned_cu_row(table, key(3), "gfx942", 152, "t") is None
+    assert chip_info.find_tuned_cu_row(table, key(2), "gfx942", 80, "t") is None

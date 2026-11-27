@@ -679,9 +679,100 @@ def get_cu_num() -> int:
 def _clear_cu_num_cache() -> None:
     _shared_cu_num.cache_clear()
     _cu_num.cache_clear()
+    _tuned_cu_nums_of_device.cache_clear()
+    _shared_tuned_cu_nums.cache_clear()
 
 
 get_cu_num.cache_clear = _clear_cu_num_cache
+
+
+@functools.cache
+def _tuned_cu_nums_of_device(device: int) -> tuple[int, ...]:
+    """get_tuned_cu_nums() of one HIP device; empty without partition info."""
+    try:
+        info = get_partition_info(device)
+    except Exception as e:  # noqa: BLE001  no partition info: exact rows only
+        logger.debug("no partition info for GPU %d (%s)", device, e)
+        return ()
+    if (info.num_partitions or 0) > 1 and info.full_chip_cu_num not in (
+        None,
+        info.cu_num,
+    ):
+        return (info.cu_num, info.full_chip_cu_num)
+    return (info.cu_num,)
+
+
+@functools.lru_cache(maxsize=1)
+@assume_constant_result
+def _shared_tuned_cu_nums() -> tuple[int, ...] | None:
+    """The tuned CU counts of every visible GPU, or None if they differ."""
+    try:
+        num_gpus = len(_visible_gpus())
+    except Exception:  # noqa: BLE001  no GPU info: the current device decides
+        return None
+    cu_nums = {_tuned_cu_nums_of_device(device) for device in range(num_gpus)}
+    return cu_nums.pop() if len(cu_nums) == 1 else None
+
+
+def get_tuned_cu_nums(
+    cu_num: int | None = None, device: int | None = None
+) -> tuple[int, ...]:
+    """CU counts whose tuned rows serve a lookup for cu_num, in lookup order.
+
+    A compute partition (DPX, QPX, CPX) has an equal share of the CUs of its
+    chip. Its lookups use its own CU count, then the CU count of the full
+    chip, which has the same gfx. Other GPUs, such as MI308X or MI300A, use
+    only their own CU count. A cu_num other than the CU count of the device
+    also uses only itself.
+
+    device is a HIP ordinal and defaults to the current device, as for
+    get_cu_num(). When all visible GPUs have the same CU counts, a lookup
+    does not query the device.
+
+    The CU counts are the inner loop of a lookup. For each shape that a table
+    tries, in its own order (exact shape, then padded or nearest shapes), the
+    lookup tries these CU counts in turn. Thus an exact-shape row of the full
+    chip comes before a padded-shape row of the partition. Tables whose rows
+    set CU or CTA counts of cross-GPU kernels (MegaMoE, comm_fused_moe) keep
+    the exact CU count.
+    """
+    if device is not None:
+        cu_nums = _tuned_cu_nums_of_device(int(device))
+    else:
+        cu_nums = _shared_tuned_cu_nums()
+        if cu_nums is None:
+            cu_nums = _tuned_cu_nums_of_device(_current_device())
+    if cu_num is None:
+        return cu_nums or (get_cu_num(),)
+    if cu_nums and int(cu_num) == cu_nums[0]:
+        return cu_nums
+    return (int(cu_num),)
+
+
+def find_tuned_cu_row(
+    tuned, key, gfx: str, cu_num: int, source: str, device: int | None = None
+):
+    """tuned[key(cu)] for the first CU count of get_tuned_cu_nums() that has one.
+
+    For tables with one shape key. source names the table in the log line of
+    a fallback. None when no CU count has a row.
+    """
+    for tuned_cu in get_tuned_cu_nums(cu_num, device):
+        row = tuned.get(key(tuned_cu))
+        if row is not None:
+            if tuned_cu != cu_num:
+                log_tuned_cu_fallback(source, gfx, cu_num, tuned_cu)
+            return row
+    return None
+
+
+@functools.cache
+def log_tuned_cu_fallback(source: str, gfx: str, cu_num: int, tuned_cu: int):
+    """Log once that source serves a gfx partition of cu_num CUs with tuned_cu rows."""
+    logger.info(
+        f"{source}: no row for some shapes on the {cu_num}-CU {gfx} partition; "
+        f"using the rows tuned for the full chip ({tuned_cu} CUs)"
+    )
 
 
 _CDNA4_CUS_PER_XCD = 32
@@ -739,8 +830,9 @@ def get_build_targets() -> list[tuple[str, int]]:
          every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
-         unset) and get_cu_num(), which correctly reflect partition mode and
-         binned variants.
+         unset) and get_tuned_cu_nums(), which correctly reflect partition
+         mode and binned variants. A compute partition also gets the full
+         chip, whose rows its lookups fall back to.
       3. Neither -> raise RuntimeError with a clear message.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
@@ -751,7 +843,8 @@ def get_build_targets() -> list[tuple[str, int]]:
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
         # would fail in CI environments without a live GPU.
-        return [(get_gfx(), get_cu_num())]
+        gfx = get_gfx()
+        return [(gfx, cu_num) for cu_num in get_tuned_cu_nums(get_cu_num())]
     except Exception as e:
         raise RuntimeError(
             "No GPU detected and GPU_ARCHS is not set to an explicit target. "
