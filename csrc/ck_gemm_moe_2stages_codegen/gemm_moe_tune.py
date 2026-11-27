@@ -979,6 +979,10 @@ class FmoeTuner(TunerCommon):
 
         if hasattr(fmoe_module, "cfg_2stages"):
             fmoe_module.cfg_2stages = None
+        # --run_config times the rows of the given table, also with
+        # AITER_FLYDSL_STAGE2_FP8=1: no row of the stage2 FP8 table replaces them.
+        if hasattr(fmoe_module, "cfg_2stages_stage2_fp8"):
+            fmoe_module.cfg_2stages_stage2_fp8 = ({}, {})
         if hasattr(fmoe_module, "get_2stage_cfgs"):
             fmoe_module.get_2stage_cfgs.cache_clear()
 

@@ -13,6 +13,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
+from . import ar_route_trace
 from ._all_reduce_config import get_ar_1stage_max_bytes
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
@@ -28,6 +29,12 @@ _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 # op (bf16 or per-token FP8 out) up to about this many rows: TP4 graph replay, hidden
 # 2048 to 8192. The Lamport kernel takes more rows where it can.
 _GLUON_AR_NORM_MAX_TOKENS = 128
+
+
+def _route(op, backend, inp, gemma=None):
+    """Record which backend served a fused all-reduce call (AITER_AR_ROUTE_TRACE)."""
+    if ar_route_trace.ENABLED:
+        ar_route_trace.note(op, backend, inp, gemma=gemma)
 
 
 def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
@@ -435,6 +442,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 all_reduce_rmsnorm_quant,
             )
 
+            _route(
+                "fused_allreduce_rmsnorm", "gluon_triton_ar_norm", input_, gemma_norm
+            )
             return all_reduce_rmsnorm_quant(
                 input_,
                 res_inp_,
@@ -457,10 +467,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
         ):
+            _route("fused_allreduce_rmsnorm", "gluon_ar_norm", input_, gemma_norm)
             return _gluon_ar_norm(
                 self, input_, res_inp_, weight_, eps, gemma_norm, quant=False
             )
         if lamport:
+            _route("fused_allreduce_rmsnorm", "lamport", input_, gemma_norm)
             return ca_comm.lamport_fused_ar_rms(
                 input_, res_inp_, weight_, eps, gemma_norm
             )
@@ -486,6 +498,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         qr_comm = self.qr_comm
 
+        # Gemma on the exact bf16 pull schedule (AITER_FLY_AR_PULL=1): graph
+        # captures entered through ``capture()`` only; any other call falls
+        # through to the paths below.
+        if (
+            gemma_norm
+            and not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_fly_pull_rmsnorm(input_, res_inp_, weight_)
+        ):
+            if ar_route_trace.ENABLED:
+                _route(
+                    "fused_allreduce_rmsnorm",
+                    ca_comm._fly_pull._engine.variant(n, total_bytes),
+                    input_,
+                    gemma_norm,
+                )
+            return ca_comm.fly_pull_rmsnorm(input_, res_inp_, weight_, eps)
+
         # FlyDSL fused first when enabled. Try first the quantized kernels,
         # then exact one-shot.
         if (
@@ -500,6 +533,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     and not comm.disabled
                     and comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
                 ):
+                    _route(
+                        "fused_allreduce_rmsnorm", "flydsl_fused", input_, gemma_norm
+                    )
                     return comm.fly_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
 
         if (
@@ -512,6 +548,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce_rmsnorm(input_, res_inp_, weight_, n)
         ):
+            _route("fused_allreduce_rmsnorm", "quick_reduce_fused", input_, gemma_norm)
             out, res_out = qr_comm.quick_all_reduce_rmsnorm(
                 input_, res_inp_, weight_, eps, n
             )
@@ -524,6 +561,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and can_use_custom_ar
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
+            _route(
+                "fused_allreduce_rmsnorm",
+                (
+                    "custom_fused_ar_rms_1stage"
+                    if use_1stage
+                    else "custom_fused_ar_rms_2stage"
+                ),
+                input_,
+                gemma_norm,
+            )
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_,
                 res_inp_,
@@ -544,6 +591,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and can_pack_2d_last_dim_slice(input_)
             and ca_comm.should_custom_ar_bytes(input_, prefill_support)
         ):
+            _route(
+                "fused_allreduce_rmsnorm",
+                "custom_fused_ar_rms_packed",
+                input_,
+                gemma_norm,
+            )
             out, res_out = ca_comm.custom_fused_ar_rms_packed_input(
                 input_,
                 res_inp_,
@@ -576,6 +629,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 fused_add_rmsnorm_pad,
             )
 
+            _route(
+                "fused_allreduce_rmsnorm",
+                "unfused_all_reduce+triton_rmsnorm_pad",
+                input_,
+                gemma_norm,
+            )
             ar_out_2d = ar_out.reshape(-1, ar_out.shape[-1])
             res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
             norm_weight = weight_ + 1.0 if gemma_norm else weight_
@@ -591,6 +650,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return out, residual_out
 
         # call split kernel
+        _route(
+            "fused_allreduce_rmsnorm",
+            "unfused_all_reduce+rmsnorm2d_fwd_with_add",
+            input_,
+            gemma_norm,
+        )
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
@@ -680,12 +745,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if not emit_bf16 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
         ):
+            _route(
+                "fused_allreduce_rmsnorm_quant",
+                "gluon_ar_norm_quant",
+                input_,
+                gemma_norm,
+            )
             out, res_out, scale_out = _gluon_ar_norm(
                 self, input_, res_inp_, weight_, eps, gemma_norm, quant=True
             )
         elif lamport:
             # The Lamport one-shot of fused_allreduce_rmsnorm with the per-token
             # quant in the same kernel: one launch, the bits of the two below.
+            _route("fused_allreduce_rmsnorm_quant", "lamport_quant", input_, gemma_norm)
             result = ca_comm.lamport_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, gemma_norm, emit_bf16
             )
@@ -718,6 +790,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= total_bytes_limit)
             )
+            _route(
+                "fused_allreduce_rmsnorm_quant",
+                (
+                    "custom_fused_ar_rms_quant_1stage"
+                    if use_1stage
+                    else "custom_fused_ar_rms_quant_2stage"
+                ),
+                input_,
+                gemma_norm,
+            )
             result = ca_comm.custom_fused_ar_rms_quant(
                 input_,
                 res_inp_,
@@ -733,6 +815,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else:
                 out, res_out, scale_out = result
         else:
+            # the norm half is routed (and traced) as fused_allreduce_rmsnorm; the
+            # quantization after it is a separate kernel
+            _route(
+                "fused_allreduce_rmsnorm_quant",
+                "fused_allreduce_rmsnorm+hip_quant",
+                input_,
+                gemma_norm,
+            )
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_,
                 res_inp_,
@@ -969,6 +1059,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and (can_1stage or can_2stage)
         )
         if use_kernel:
+            _route(
+                "fused_allreduce_rmsnorm_mxfp4_quant",
+                "custom_fused_ar_rms_mxfp4_quant",
+                input_,
+                gemma_norm,
+            )
             result = ca_comm.custom_fused_ar_rms_mxfp4_quant(
                 input_,
                 res_inp_,
@@ -991,9 +1087,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if hadamard_rotate:
                 from aiter.ops.quant import per_1x32_f4_quant_hip
 
-                out_fp4, scale_out = per_1x32_f4_quant_hip(
-                    normed, hadamard_rotate=True
-                )
+                out_fp4, scale_out = per_1x32_f4_quant_hip(normed, hadamard_rotate=True)
             else:
                 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
