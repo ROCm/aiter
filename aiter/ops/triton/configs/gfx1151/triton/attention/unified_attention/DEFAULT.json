@@ -115,6 +115,12 @@
       "num_stages": 1,
       "waves_per_eu": 2
     },
+    "D_LEQ_256.DT_any_bf16": {
+      "BLOCK_M": 16,
+      "num_warps": 4,
+      "num_stages": 1,
+      "waves_per_eu": 0
+    },
     "D_LEQ_1024.DT_any_bf16": {
       "BLOCK_M": 16,
       "num_warps": 8,
@@ -139,10 +145,18 @@
     "SEGMENT_TILE_MAX": 64
   },
   "kv_split": {
-    "D_LEQ_256.DT_any_bf16": {
+    "D_LEQ_128.DT_any_bf16": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 2,
       "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 16,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 16
+    },
+    "D_LEQ_256.DT_any_bf16": {
+      "MIN_SEGMENTS": 4,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 32,
       "SEGMENT_TILE_MAX": 16,
       "TILE_SIZE_MIN": 16,
       "TILE_SIZE_MAX": 16
