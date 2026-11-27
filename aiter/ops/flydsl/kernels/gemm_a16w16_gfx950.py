@@ -473,11 +473,34 @@ def async_load_to_lds(
     elem_bytes = tile.src_base.dtype.width // 8
     lds_ptr = tile.lds_base + fx.Int32(context.wave_offset) // elem_bytes
     g2s_copy_layout = fx.make_layout(async_load_vec_size, 1)
+    tile_elems = tile.outer_tile_size * block_k
+
+    def emit_load(lds_ptr, global_offset):
+        src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
+        dst = fx.make_view(lds_ptr, g2s_copy_layout)
+        rocdl.sched_barrier(0)
+        if const_expr(tile.non_temporal):
+            # The async copy atom has no cache-policy operand. Keep the raw
+            # load async too, so the existing asyncmark/wait_asyncmark groups
+            # still track its completion. src_base is the buffer origin;
+            # lds_ptr is wave-uniform and hardware adds the lane offset.
+            rocdl.raw_ptr_buffer_load_async_lds(
+                fx.rocdl.get_buffer_rsrc(tile.src_base),
+                fx.to_llvm_ptr(lds_ptr),
+                fx.Int32(GFX950_DMA_BYTES).ir_value(),
+                fx.Int32(global_offset * elem_bytes).ir_value(),
+                fx.Int32(0).ir_value(),
+                fx.Int32(0).ir_value(),
+                aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 2),
+            )
+        else:
+            fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
+        rocdl.sched_barrier(0)
+
     for i in range_constexpr(load_iters):
         global_tid = block_threads * i + tid
-        valid_local_load = (
-            global_tid * async_load_vec_size < tile.outer_tile_size * block_k
-        )
+        # Only an iteration that reaches past the tile needs the per-thread check.
+        all_threads_load = block_threads * (i + 1) * async_load_vec_size <= tile_elems
         if const_expr(tile.bpreshuffle):
             outer_local_idx = global_tid % 16 + global_tid // (block_k * 2) * 16
             k_local_idx = (
@@ -524,27 +547,10 @@ def async_load_to_lds(
                 + row % 16 * 8
                 + col % 8
             )
-        src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
-        dst = fx.make_view(lds_ptr, g2s_copy_layout)
-        if valid_local_load:
-            rocdl.sched_barrier(0)
-            if const_expr(tile.non_temporal):
-                # The async copy atom has no cache-policy operand. Keep the raw
-                # load async too, so the existing asyncmark/wait_asyncmark groups
-                # still track its completion. src_base is the buffer origin;
-                # lds_ptr is wave-uniform and hardware adds the lane offset.
-                rocdl.raw_ptr_buffer_load_async_lds(
-                    fx.rocdl.get_buffer_rsrc(tile.src_base),
-                    fx.to_llvm_ptr(lds_ptr),
-                    fx.Int32(GFX950_DMA_BYTES).ir_value(),
-                    fx.Int32(global_offset * elem_bytes).ir_value(),
-                    fx.Int32(0).ir_value(),
-                    fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 2),
-                )
-            else:
-                fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
-            rocdl.sched_barrier(0)
+        if const_expr(all_threads_load):  # noqa: SIM114
+            emit_load(lds_ptr, global_offset)
+        elif global_tid * async_load_vec_size < tile_elems:
+            emit_load(lds_ptr, global_offset)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
@@ -609,7 +615,6 @@ def write_cshuffle_vec_to_global(
 @flyc.kernel
 def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
-    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -711,7 +716,9 @@ def gemm_a16w16_gfx950_kernel(
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
-    workspace_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
+    if const_expr(param.use_split_k_workspace):
+        # A workspace launch has no bias: its bias slot is the workspace.
+        workspace_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -1191,7 +1198,6 @@ def gemm_a16w16_gfx950_kernel(
 @flyc.kernel
 def gemm_a16w16_hti_gfx950_kernel(
     out: fx.Tensor,
-    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -1285,7 +1291,9 @@ def gemm_a16w16_hti_gfx950_kernel(
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
-    workspace_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
+    if const_expr(param.use_split_k_workspace):
+        # A workspace launch has no bias: its bias slot is the workspace.
+        workspace_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -1672,7 +1680,6 @@ def gemm_a16w16_hti_gfx950_kernel(
 @flyc.jit
 def gemm_a16w16_gfx950(
     out: fx.Tensor,
-    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -1747,7 +1754,6 @@ def gemm_a16w16_gfx950(
     gemm_a16w16_kernel_impl._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
     kernel_call = gemm_a16w16_kernel_impl(
         out,
-        workspace,
         a,
         b,
         bias,
@@ -2148,14 +2154,14 @@ def gemm_a16w16(
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
-    workspace_arg = (
-        _dynamic_tensor_arg(workspace, 0) if use_split_k_workspace else out_arg
-    )
-    bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    if use_split_k_workspace:
+        # No bias with a workspace: the bias slot passes the workspace.
+        bias_arg = _dynamic_tensor_arg(workspace, 0)
+    else:
+        bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
     _run_compiled(
         gemm_a16w16_gfx950,
         out_arg,
-        workspace_arg,
         a_arg,
         b_arg,
         bias_arg,
