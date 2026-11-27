@@ -568,6 +568,19 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
+def _tp_route_limits() -> tuple[int, int]:
+    """(experts, routes) the A1 quant can route itself: one LDS counter per
+    thread of its block, and the ids its one build loads. The quant refuses
+    more, so the gate checks both. Cached so the per-call gate pays no import."""
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        TP_ROUTE_MAX_EXPERTS,
+        TP_ROUTE_MAX_NUMEL,
+    )
+
+    return TP_ROUTE_MAX_EXPERTS, TP_ROUTE_MAX_NUMEL
+
+
+@functools.cache
 def _get_compiled_g2l_lut(max_experts: int = 512, clear_counter: bool = True):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
@@ -976,9 +989,10 @@ def _grouped_a8w4_tdm_moe(
     _fuse_ep_route_quant = False
     ep_rowmap = None
     # Small TP batches: one workgroup counts, scans and remaps every route, in
-    # place of the counter fill, route and psum-remap launches; it runs where the
-    # psum is built below. HERD routes carry K+1 candidates per row and are
-    # dropped to K by herd_route_psum, which this kernel does not do.
+    # place of the counter fill, route and psum-remap launches. By default the
+    # activation quant does this itself (_fuse_tp_route_quant below); otherwise
+    # it runs where the psum is built below. HERD routes carry K+1 candidates
+    # per row and are dropped to K by herd_route_psum, which this does not do.
     _fused_tp_route = (
         not herd_topk
         and not _compact
@@ -1135,6 +1149,56 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
+    _is_fp4 = data_format == "fp4"
+    _quant_mode = "fp4" if _is_fp4 else "fp8"
+    _a_is_fp4 = 1 if _is_fp4 else 0
+
+    # Bound once, because the quant pass below rebinds a1_scale to the
+    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
+    # shape, so nothing downstream could tell which one it was handed.
+    src_a1_scale = a1_scale
+    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
+        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
+        # exponent bytes; reinterpret their storage without converting values.
+        src_a1_scale = src_a1_scale.view(torch.uint8)
+
+    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
+    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
+    # for this pair.
+    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
+        dtypes.fp8,
+        torch.uint8,
+        dtypes.fp4x2,
+    )
+    # Local quant instead writes one compact row-major row per token and rebuilds
+    # the interleaved layout gemm1 reads in a second pass, so neither write lands
+    # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
+    # dummy topk_ids, so its token count cannot size a per-token scale buffer.
+    _compact_ascale = (
+        not _compact
+        and not _prequantized
+        and not a_preshuffled
+        and _ep_nvr is None
+        and _use_fused_quant_preshuffle(
+            model_dim, wmma_rep, _quant_mode, token_num, topk
+        )
+    )
+    # The fused TP route then rides the activation quant: each quant workgroup
+    # re-derives the counts and prefix in LDS, so the route launch disappears
+    # without a grid-wide wait. bf16 in, no A-preshuffle, and not the batches
+    # that take the compact-scale quant pair. AITER_TDM_FUSE_TP_ROUTE_QUANT=0 is
+    # a temporary kill-switch back to the separate route launch.
+    _fuse_tp_route_quant = (
+        _fused_tp_route
+        and topk <= int(E) <= _tp_route_limits()[0]
+        and token_num * topk <= _tp_route_limits()[1]
+        and a1_scale is None
+        and hidden_states.dtype == torch.bfloat16
+        and not _a_preshuffle_requested
+        and not _compact_ascale
+        and os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1")
+        in ("1", "true", "True")
+    )
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
@@ -1147,12 +1211,27 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
+    tp_route_params = None
     if _compact:
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
     elif herd_psum is not None:
         psum = herd_psum
+    elif _fuse_tp_route_quant:
+        # Written by the quant launch below, which owns the route.
+        _masked_m = torch.empty(int(E), dtype=torch.int32, device=device)
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        topids_to_rows = torch.empty(
+            (token_num, topk), dtype=torch.int32, device=device
+        )
+        tp_route_params = {
+            "topk_ids": topk_ids,
+            "masked_m": _masked_m,
+            "psum": psum,
+            "experts": int(E),
+            "tile_m": int(_align_m),
+        }
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
@@ -1240,27 +1319,6 @@ def _grouped_a8w4_tdm_moe(
 
     _b1 = bias1.contiguous() if bias1 is not None and bias1.numel() > 0 else None
     _b2 = bias2.contiguous() if bias2 is not None and bias2.numel() > 0 else None
-    _is_fp4 = data_format == "fp4"
-    _quant_mode = "fp4" if _is_fp4 else "fp8"
-    _a_is_fp4 = 1 if _is_fp4 else 0
-
-    # Bound once, because the quant pass below rebinds a1_scale to the
-    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
-    # shape, so nothing downstream could tell which one it was handed.
-    src_a1_scale = a1_scale
-    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
-        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
-        # exponent bytes; reinterpret their storage without converting values.
-        src_a1_scale = src_a1_scale.view(torch.uint8)
-
-    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
-    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
-    # for this pair.
-    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
-        dtypes.fp8,
-        torch.uint8,
-        dtypes.fp4x2,
-    )
     _row_gather = _compact and bool(getattr(_compact_ctx, "compact_row_gather", False))
     if _row_gather and not _prequantized:
         raise ValueError(
@@ -1309,19 +1367,6 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
     _row_major_ascale = (_compact and _prequantized) or _row_major_a1
-    # Local quant instead writes one compact row-major row per token and rebuilds
-    # the interleaved layout gemm1 reads in a second pass, so neither write lands
-    # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
-    # dummy topk_ids, so its token count cannot size a per-token scale buffer.
-    _compact_ascale = (
-        not _compact
-        and not _prequantized
-        and not a_preshuffled
-        and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
-    )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
     if _compact_ascale:
@@ -1399,6 +1444,7 @@ def _grouped_a8w4_tdm_moe(
             clear_counter=(
                 _g2l_counter if _apre_route_fold and _direct_ep_mask else None
             ),
+            tp_route_params=tp_route_params,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1601,6 +1647,7 @@ def _grouped_a8w4_tdm_moe(
                     row_to_token=_apre_row_to_token,
                     row_major_scale=_row_major_a1,
                     payload_preshuffled=a_preshuffled,
+                    tp_route_params=tp_route_params,
                 ),
             )
         )
@@ -2293,7 +2340,8 @@ def _get_compiled_route_psum_fused():
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
 # grid-stride, so a larger count is correct but stops being worth fusing; on
-# gfx1250 the split launches catch up at about 2.5K routes.
+# gfx1250 the split launches catch up at about 2.5K routes. The route-in-quant
+# path has its own hard route limit (TP_ROUTE_MAX_NUMEL), checked in its gate.
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
