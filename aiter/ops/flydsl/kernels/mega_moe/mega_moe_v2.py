@@ -61,10 +61,19 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
         large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
-        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False):
+        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False, combine_wire: str = "auto"):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
+        # combine_wire="bf16": every route this instance builds sends its combine rows as BF16; a route that
+        # cannot is not built. "auto": each route's own choice (stage2_p2p_quant, the tuned configs).
+        if combine_wire not in ("auto", "bf16"):
+            raise ValueError(f"combine_wire must be 'auto' or 'bf16', got {combine_wire!r}")
+        self.combine_wire = combine_wire
+        if combine_wire == "bf16":
+            if stage2_p2p_quant not in ("auto", "none"):
+                raise ValueError(f"combine_wire='bf16' conflicts with stage2_p2p_quant={stage2_p2p_quant!r}")
+            stage2_p2p_quant = "none"
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
@@ -126,6 +135,18 @@ class MegaMoEV2:
             fanout_masks=self._initial_fanout_masks,
         )
         num_cu = torch.cuda.get_device_properties(self.dev).multi_processor_count
+        large_m = (
+            fused
+            and large_m_enabled
+            and self.mtpr
+            in large_m_mtprs_for(
+                world_size=self.world_size,
+                model_dim=self.model_dim,
+                inter_dim=self.inter_dim,
+            )
+        )
+        # The large-input kernel sends FP8 combine rows only.
+        self.large_m_dropped = bool(large_m) and combine_wire == "bf16"
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
             a_dtype=self._a_dtype,
@@ -137,16 +158,7 @@ class MegaMoEV2:
             small_m_mtprs=(
                 tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
             ),
-            large_m=(
-                fused
-                and large_m_enabled
-                and self.mtpr
-                in large_m_mtprs_for(
-                    world_size=self.world_size,
-                    model_dim=self.model_dim,
-                    inter_dim=self.inter_dim,
-                )
-            ),
+            large_m=large_m and not self.large_m_dropped,
         )
         self._active_bundle_entry = None
         self.max_recv = self.world_size * self.mtpr
@@ -239,6 +251,7 @@ class MegaMoEV2:
                     payload_arena=self._payload_arena if m in self._small_m_shared else None,
                     s1_output_arena=self._s1_output_arena,
                     combine_input=self._combine_input if m in self._small_m_shared else None,
+                    bf16_wire=combine_wire == "bf16",
                 )
                 for m in self._bundle_plan.small_m_mtprs
             ]
@@ -251,6 +264,8 @@ class MegaMoEV2:
                 f", small-input capacities {plan.small_m_mtprs}" if plan.small_m_mtprs else "",
                 ", large-input route" if plan.large_m else "",
             )
+            if self.large_m_dropped:
+                logger.info("MegaMoEV2 combine_wire='bf16': large-input route not built (FP8 combine only)")
 
     @property
     def small_m_mtpr(self) -> int:

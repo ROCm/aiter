@@ -1312,6 +1312,7 @@ def _routes_instance(args, rank, world, device):
         large_m_state_slots=args.large_m_state_slots,
         small_m_mtprs=tuple(args.small_m_mtprs),
         routed=True,
+        combine_wire=args.combine_wire,
         **net,
     )
     if moe.small_m_mtpr != max(args.small_m_mtprs):
@@ -1352,6 +1353,24 @@ def _routes_instance(args, rank, world, device):
         large_m=moe._large_m is not None,
         failures=[],
     )
+
+
+def _non_bf16_wire_routes(moe):
+    """Routes of the instance that can send a non-BF16 combine row (each token bucket they may launch)."""
+    bad = [
+        f"staged bucket {e.token_bucket} ({e.config.p2p_quant})"
+        for e in moe._bundle_plan.entries
+        if e.config.p2p_quant != "none"
+    ]
+    bad += [
+        f"small-input mtpr {rt.mtpr} bucket {bucket}"
+        for rt in moe._small_m_runtimes
+        for bucket, config in rt._configs.items()
+        if not (config.fused_stage1.bf16_wire or config.fused_stage1.tok_done)
+    ]
+    if moe._large_m is not None:
+        bad.append("large-input (FP8 combine only)")
+    return bad
 
 
 def _routes_accuracy(ctx, args):
@@ -1718,9 +1737,18 @@ def _run_routes(args, rank, world, device):
     if rank == 0:
         print(
             f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
-            f"large_m={ctx.large_m} world={world}",
+            f"large_m={ctx.large_m} world={world} combine_wire={moe.combine_wire}"
+            f"{' (large-input route not built)' if moe.large_m_dropped else ''}",
             flush=True,
         )
+    if args.combine_wire == "bf16":
+        bad = _non_bf16_wire_routes(moe)
+        if rank == 0:
+            print(
+                f"[WIRE] non-bf16 routes={bad} {'FAIL' if bad else 'PASS'}", flush=True
+            )
+        if bad:
+            ctx.failures.append("combine wire")
     if not args.time_only:
         outputs = _routes_accuracy(ctx, args)
         _routes_edges(ctx, args)
@@ -1945,6 +1973,12 @@ def main():
         type=_int_list,
         default=[256, 512],
         help="small-input runtime MTPRs",
+    )
+    routes.add_argument(
+        "--combine-wire",
+        choices=("auto", "bf16"),
+        default="auto",
+        help="MegaMoEV2(combine_wire=...); bf16 also checks no built route sends a non-BF16 combine row",
     )
     routes.add_argument("--alt-steps", type=int, default=600)
     routes.add_argument("--graph-layers", type=int, default=8)

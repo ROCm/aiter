@@ -10,6 +10,7 @@ GEMM1-output and combine-input storage are views of the instance's shared arenas
 """
 
 import functools
+from dataclasses import replace
 from enum import IntEnum
 
 import flydsl.compiler as flyc
@@ -1689,9 +1690,11 @@ class SmallMRuntime:
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, swiglu_limit: float = 0.0, act: str = "silu", payload_arena=None, s1_output_arena=None,
-        combine_input=None):
+        combine_input=None, bf16_wire: bool = False):
     # fmt: on
-        """``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
+        """``bf16_wire``: every token bucket sends BF16 combine rows, whatever its tuned config says.
+
+        ``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
         the routes of one MegaMoEV2 (see GroupMajorPayloadArena, stage1_output_buffers and
         FlyDSLDispatchCombineIntraNodeOp); None allocates."""
         if quant not in ("a4w4", "a8w4"):
@@ -1740,6 +1743,11 @@ class SmallMRuntime:
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= self.mtpr
         }
+        if bf16_wire:
+            self._configs = {
+                bucket: replace(config, fused_stage1=replace(config.fused_stage1, bf16_wire=True))
+                for bucket, config in self._configs.items()
+            }
         protocols = {
             (k.dedup_rows, k.plan_local, bool(k.direct_done), k.tok_counters, k.bf16_head_tokens)
             for k in (config.fused_stage1 for config in self._configs.values())
