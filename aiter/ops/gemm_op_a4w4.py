@@ -23,30 +23,6 @@ from ..utility import dtypes
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
-def _a4w4_fallback_config(row):
-    # Optional CSV columns retain the old choice for unsupported calls / padded M.
-    name = row.get("fallbackKernelName", "")
-    name = name if isinstance(name, str) and name != "0" else ""
-    if name.startswith(("triton_", "flydsl_")):
-        raise ValueError("A4W4 fallbackKernelName must select CK or ASM")
-    split = row.get("fallbackSplitK", 0)
-    return {"kernelName": name, "splitK": 0 if pd.isna(split) else int(split)}
-
-
-@functools.lru_cache(maxsize=1024)
-def _log_a4w4_fallback(m, n, k, dtype, selected, fallback):
-    logger.info(
-        "gemm_a4w4 M:%s N:%s K:%s dtype:%s cannot use configured kernel %s "
-        "for this call or backend availability; using %s",
-        m,
-        n,
-        k,
-        dtype,
-        selected,
-        fallback or "default ASM",
-    )
-
-
 @functools.lru_cache(maxsize=1024)
 def _parse_triton_a4w4_kernel(name):
     match = re.fullmatch(
@@ -141,14 +117,6 @@ def get_GEMM_config(M: int, N: int, K: int):
         )
         config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
-            # New backends are qualified at exact M; keep the old bucket choice.
-            # OPUS rows are exempt on purpose: every OPUS kid bounds M (a nob row
-            # runs its bounded twin, see _gemm_a4w4_opus), so the row tuned at the
-            # padded M also serves this M.
-            if padded_M != M and str(config["kernelName"]).startswith(
-                ("triton_", "flydsl_")
-            ):
-                config = _a4w4_fallback_config(config)
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
@@ -596,12 +564,8 @@ def gemm_a4w4(
             )
             if result is not None:
                 return result
-        fallback = _a4w4_fallback_config(ck_config)
-        if AITER_LOG_TUNED_CONFIG:
-            _log_a4w4_fallback(
-                m, n, k, dtype, ck_config["kernelName"], fallback["kernelName"]
-            )
-        ck_config = fallback
+        # The preshuffle backend declined this call; use the default ASM kernel.
+        ck_config = {"kernelName": "", "splitK": 0}
     # splitK = None
     splitK = 0
     kernelName = ""

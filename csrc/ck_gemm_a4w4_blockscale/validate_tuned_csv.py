@@ -37,15 +37,9 @@ EXPECTED_COLUMNS = [
     "errRatio",
 ]
 
-# Optional: the CK/ASM choice a row of another backend keeps for unsupported calls.
-OPTIONAL_COLUMNS = ["fallbackKernelName", "fallbackSplitK"]
-
-OPUS_KERNEL_PATTERN = "opus_gemm_gfx950_a4w4"  # OPUS kernels (gfx950)
-
 KNOWN_KERNEL_PATTERNS = [
     "f4gemm_bf16_per1x32Fp4",  # ASM kernels
     "a4w4_blockscale",  # CK-Tile kernels
-    OPUS_KERNEL_PATTERN,
 ]
 
 
@@ -64,7 +58,7 @@ def validate(csv_path, verbose=False):
     missing_cols = set(EXPECTED_COLUMNS) - set(df.columns)
     if missing_cols:
         errors.append(f"Missing columns: {missing_cols}")
-    extra_cols = set(df.columns) - set(EXPECTED_COLUMNS) - set(OPTIONAL_COLUMNS)
+    extra_cols = set(df.columns) - set(EXPECTED_COLUMNS)
     if extra_cols:
         warnings.append(f"Extra columns (ignored): {extra_cols}")
     if errors:
@@ -146,8 +140,7 @@ def validate(csv_path, verbose=False):
 
     # Summary
     n_asm = df["kernelName"].str.contains("f4gemm_bf16", na=False).sum()
-    n_opus = df["kernelName"].str.contains(OPUS_KERNEL_PATTERN, na=False).sum()
-    n_cktile = len(df) - n_asm - n_opus
+    n_cktile = len(df) - n_asm
     unique_nk = df[["N", "K"]].drop_duplicates()
 
     print("\n=== Summary ===")
@@ -158,7 +151,6 @@ def validate(csv_path, verbose=False):
     print(f"  K range:            [{df['K'].min()}, {df['K'].max()}]")
     print(f"  ASM kernels:        {n_asm} ({100*n_asm/len(df):.1f}%)")
     print(f"  CK-Tile kernels:    {n_cktile} ({100*n_cktile/len(df):.1f}%)")
-    print(f"  OPUS kernels:       {n_opus} ({100*n_opus/len(df):.1f}%)")
     print(
         f"  TFLOPS:             min={df['tflops'].min():.1f},"
         f" max={df['tflops'].max():.1f},"
