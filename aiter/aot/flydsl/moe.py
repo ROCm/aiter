@@ -79,6 +79,7 @@ from aiter.aot.flydsl.common import (
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
+    shared_worker_slots,
     worker_waves,
 )
 from aiter.aot.flydsl.replay import requested_kernels
@@ -768,18 +769,21 @@ def run(
     if prepared is not None:
         prepared()
     failed = 0
-    for wave in worker_waves(workers, jobs_per_arch):
-        replays = []
-        for arch, share in wave.items():
-            command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
-            command += ["--csv"]
-            command += csv_paths
-            if not edges:
-                command.append("--row-tokens-only")
-            if check:
-                command.append("--check")
-            replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
-        failed += sum(replay.wait() != 0 for replay in replays)
+    # The archs' pools share the budget worker by worker, so that an arch that
+    # finishes leaves its workers to the others.
+    with shared_worker_slots(workers):
+        for wave in worker_waves(workers, jobs_per_arch):
+            replays = []
+            for arch, share in wave.items():
+                command = [sys.executable, "-m", "aiter.aot.flydsl.moe"]
+                command += ["--arch", arch, "--csv"]
+                command += csv_paths
+                if not edges:
+                    command.append("--row-tokens-only")
+                if check:
+                    command.append("--check")
+                replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
+            failed += sum(replay.wait() != 0 for replay in replays)
     return failed
 
 

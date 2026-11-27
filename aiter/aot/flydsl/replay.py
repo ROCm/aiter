@@ -90,6 +90,7 @@ from aiter.aot.flydsl.common import (
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
+    shared_worker_slots,
     worker_waves,
 )
 
@@ -566,15 +567,18 @@ def run(
     if not archs:
         return 0
     failed = 0
-    waves = worker_waves(get_max_workers(total), dict(target_of))
-    for wave in waves:
-        replays = []
-        for arch, share in wave.items():
-            command = [sys.executable, "-m", module_name, "--arch", arch, *argv]
-            process_env = replay_env(arch, share)
-            process_env.update(env or {})
-            replays.append(subprocess.Popen(command, env=process_env))
-        failed += sum(replay.wait() != 0 for replay in replays)
+    workers = get_max_workers(total)
+    # The archs' pools share the budget worker by worker, so that an arch that
+    # finishes leaves its workers to the others.
+    with shared_worker_slots(workers):
+        for wave in worker_waves(workers, dict(target_of)):
+            replays = []
+            for arch, share in wave.items():
+                command = [sys.executable, "-m", module_name, "--arch", arch, *argv]
+                process_env = replay_env(arch, share)
+                process_env.update(env or {})
+                replays.append(subprocess.Popen(command, env=process_env))
+            failed += sum(replay.wait() != 0 for replay in replays)
     return failed
 
 

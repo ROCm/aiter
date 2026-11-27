@@ -16,12 +16,14 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_stages
 from contextlib import contextmanager
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
@@ -210,7 +212,9 @@ def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
 
 def check_replay_process(arch: str) -> None:
     """Raise unless this process started with ``replay_env(arch)``, so that
-    what aiter fixed at import belongs to ``arch``."""
+    what aiter fixed at import belongs to ``arch``. Such a process is started
+    by a build, and ends with it (:func:`die_with_parent`)."""
+    die_with_parent()
     from aiter.utility import dtypes
 
     if os.environ.get("AITER_AOT_REPLAY") != "1" or os.environ.get("GPU_ARCHS") != arch:
@@ -226,9 +230,36 @@ def check_replay_process(arch: str) -> None:
         )
 
 
+def die_with_parent(sig: int = signal.SIGTERM, parent_pid: int | None = None) -> None:
+    """Have the kernel send this process ``sig`` when its parent dies (Linux;
+    a no-op elsewhere), and exit now if ``parent_pid`` is given and is already
+    gone.
+
+    A replay process supervises its workers (deadlines, retries) and a build
+    its replay processes. Without this, killing one of them (an OOM kill, a
+    cancelled build) leaves what it started running unsupervised, and a worker
+    left so keeps its worker slot from every other pool of the build."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(
+            1, int(sig), 0, 0, 0
+        )  # PR_SET_PDEATHSIG
+    except (AttributeError, OSError):
+        return
+    if parent_pid is not None and os.getppid() != parent_pid:
+        os._exit(1)
+
+
 def _run_one_to_file(
-    worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
+    worker: Callable[..., dict[str, Any]],
+    kwargs: dict[str, Any],
+    out_path: str,
+    parent_pid: int | None = None,
 ) -> None:
+    if parent_pid is not None:  # forked by the pool, which supervises it
+        die_with_parent(signal.SIGKILL, parent_pid)
+    # A pool this worker starts is its own: it must not wait for a slot of the
+    # build's, of which the worker holds one.
+    os.environ.pop(_SLOTS_ENV, None)
     configure_worker_subprocesses()
     result = worker(**kwargs)
     tmp_path = out_path + ".tmp"
@@ -343,6 +374,18 @@ def worker_slots(count: int) -> Iterator[str]:
         shutil.rmtree(slot_dir, ignore_errors=True)
 
 
+@contextmanager
+def shared_worker_slots(count: int) -> Iterator[str]:
+    """The worker slots this process already shares (an enclosing build's),
+    else ``count`` new ones for what it starts."""
+    slot_dir = _slot_dir()
+    if slot_dir is not None:
+        yield slot_dir
+        return
+    with worker_slots(count) as slot_dir:
+        yield slot_dir
+
+
 def stages_side_by_side(workers: int, stages: int) -> int:
     """How many of ``stages`` replay at once on a budget of ``workers``."""
     return max(1, min(int(stages), int(workers) // _WORKERS_PER_STAGE))
@@ -431,7 +474,8 @@ def _run_file_pool(
     queue.reverse()  # pop() from the tail -> submission order; retries appended
     running: dict[Any, tuple[int, float | None]] = {}  # proc -> (idx, deadline)
     # Slots shared with other pools; only a forked worker inherits one.
-    slot_dir = _slot_dir() if start_method == "fork" else None
+    forked = start_method == "fork"
+    slot_dir = _slot_dir() if forked else None
     slot_count = _slot_count() if slot_dir else 0
 
     def launch() -> bool:
@@ -454,7 +498,10 @@ def _run_file_pool(
             os.remove(out_path)  # clear any stale file from a prior attempt
         except OSError:
             pass
-        proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
+        proc = ctx.Process(
+            target=_run_one_to_file,
+            args=(worker, kwargs, out_path, os.getpid() if forked else None),
+        )
         proc.start()
         deadline = (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
         running[proc] = (idx, deadline)
@@ -785,12 +832,28 @@ def run_aot(cache_dir: str) -> None:
     )
     with fail_build_on_missing_target_feature():
         # Every stage runs to its end, also after another failed: the pools of
-        # a stage cannot be stopped from here. Then the first error is raised.
-        with worker_slots(workers), ThreadPoolExecutor(side_by_side) as pool:
-            outcomes = [pool.submit(stage) for stage in stages]
-        errors = [outcome.result() for outcome in outcomes]
-        errors = [error for error in errors if error]
+        # a stage cannot be stopped from here. Then every failure is reported.
+        with shared_worker_slots(workers):
+            pool = ThreadPoolExecutor(side_by_side)
+            try:
+                outcomes = [pool.submit(stage) for stage in stages]
+                wait_for_stages(outcomes)
+            finally:
+                # Reached before all are done only when interrupted: the stages
+                # not yet started must not start then.
+                pool.shutdown(wait=True, cancel_futures=True)
+        errors, first_error = [], None
+        for outcome in outcomes:
+            try:
+                error = outcome.result()
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+                first_error = first_error or e
+            if error:
+                errors.append(error)
         if errors:
-            raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
+            raise AssertionError(
+                f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}"
+            ) from first_error
 
     assert_no_strict_errata_products(cache_dir)
