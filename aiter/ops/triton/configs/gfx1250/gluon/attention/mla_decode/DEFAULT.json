@@ -4,7 +4,9 @@
   },
   "pipelined_unshuffled": {
     "fp8_fp8": {
-      "H_LEQ_32": {},
+      "H_LEQ_32": {
+        "TDM_PARTIAL_STORE": 1
+      },
       "H_LEQ_64.B_LEQ_14": {},
       "H_LEQ_64.B_LEQ_15.KV_LEQ_131072": {},
       "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {

@@ -624,9 +624,31 @@ def mla_decode_fwd(
                 and out.stride(1) % 8 == 0
             ),
         )
+    split_meta = None
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache or use_pipelined_unshuffled:
             impl = gluon_mla_decode_fwd_kernel
+            # Split rebalance, as in unified attention: all segments cover the same
+            # number of KV tiles, so a long sequence gets more segments. The grid and
+            # the partial buffers do not change.
+            if total_num_tokens == num_seqs and NUM_SEGMENTS > 1 and not skip_reduce:
+                split_meta = torch.empty(
+                    2, num_seqs, dtype=torch.int32, device=q.device
+                )
+                attn_config.update(
+                    split_meta_ptr=split_meta,
+                    SEQ_BLOCK=max(WARP_SIZE, triton.next_power_of_2(num_seqs)),
+                )
+                # The reduce loads SPLIT_CHUNK work items in one round trip. Fewer
+                # sequences (more segments each) leave room for more of them.
+                split_chunk = min(max(NUM_SEGMENTS, 16), 128)
+                reduce_config["SPLIT_CHUNK"] = split_chunk
+                # At most 128 fp32 values of a chunk in each lane. With more, the
+                # compiler waits for each row before it loads the next one.
+                reduce_config["num_warps"] = max(
+                    reduce_config["num_warps"],
+                    triton.cdiv(split_chunk * kv_lora_rank, 128 * WARP_SIZE),
+                )
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 
@@ -744,6 +766,7 @@ def mla_decode_fwd(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
+        split_meta_ptr=split_meta,
         **reduce_config,
     )
     return out

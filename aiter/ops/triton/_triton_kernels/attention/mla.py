@@ -653,6 +653,72 @@ def _mla_decode_fwd_kernel(
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
+@triton.jit
+def _split_rebalance_slots(
+    first,
+    count,
+    start,
+    query_head_idx,
+    num_query_heads: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Partial slots of work items first + start, ..., first + start + BLOCK - 1 of
+    one head, and the mask of those before first + count. Work item w of the split
+    rebalance holds slot (w // NUM_SEGMENTS_PER_SEQ, w % NUM_SEGMENTS_PER_SEQ)."""
+    work = first + start + tl.arange(0, BLOCK)
+    # Unsigned, so that the division by the power of 2 is one shift.
+    group = (work.to(tl.uint32) // NUM_SEGMENTS_PER_SEQ).to(tl.int64)
+    slot = (
+        work.to(tl.int64)
+        + group * ((num_query_heads - 1) * NUM_SEGMENTS_PER_SEQ)
+        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+    )
+    return slot, work < first + count
+
+
+@triton.jit
+def _split_rebalance_load_outputs(
+    segm_output_ptr,
+    segm_max_ptr,
+    first,
+    count,
+    start,
+    query_head_idx,
+    num_query_heads: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    SPLIT_CHUNK: tl.constexpr,
+):
+    """Partial outputs and maxima of SPLIT_CHUNK work items. The maxima are used only
+    as weights of the output rows, so they get the row layout of the outputs."""
+    slot, mask = _split_rebalance_slots(
+        first,
+        count,
+        start,
+        query_head_idx,
+        num_query_heads,
+        NUM_SEGMENTS_PER_SEQ,
+        SPLIT_CHUNK,
+    )
+    segm_max = tl.load(segm_max_ptr + slot, mask=mask, other=0.0)
+    segm_output = tl.load(
+        segm_output_ptr
+        + slot[:, None] * KV_LORA_RANK
+        + tl.arange(0, KV_LORA_RANK)[None, :],
+        mask=mask[:, None],
+        other=0.0,
+    )
+    return segm_max, mask, segm_output
+
+
+@triton.jit
+def _split_rebalance_weighted_sum(segm_max, mask, segm_output, overall_max):
+    # A masked row has weight 0 whatever its loaded maximum.
+    weight = tl.where(mask, tl.math.exp2(segm_max - overall_max), 0.0)
+    return tl.sum(segm_output * weight[:, None], axis=0)
+
+
 _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
     "_mla_decode_fwd_reduce_kernel",
     [
@@ -661,6 +727,7 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "KV_LORA_RANK",
         "NUM_SEGMENTS_PER_SEQ",
         "ALL_DECODE",
+        "SPLIT_CHUNK",
     ],
 )
 
@@ -687,6 +754,9 @@ def _mla_decode_fwd_reduce_kernel(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # int
+    split_meta_ptr=None,  # int32 [2, num_seqs], split rebalance (gfx1250 Gluon)
+    SPLIT_CHUNK: tl.constexpr = 0,  # split rebalance: work items in one merge step
+    SPLIT_STATS: tl.constexpr = 512,  # split rebalance: maxima in one max step
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -704,6 +774,79 @@ def _mla_decode_fwd_reduce_kernel(
     out_scale = None
     if out_scale_ptr is not None:
         out_scale = 1 / tl.load(out_scale_ptr)
+
+    if split_meta_ptr is not None:
+        first = tl.load(split_meta_ptr + seq_idx)
+        count = tl.load(split_meta_ptr + num_seqs + seq_idx)
+        # The first SPLIT_CHUNK outputs go out with the statistics: up to
+        # SPLIT_CHUNK work items then take one round trip.
+        segm_max, mask, segm_output = _split_rebalance_load_outputs(
+            segm_output_ptr,
+            segm_max_ptr,
+            first,
+            count,
+            0,
+            query_head_idx,
+            num_query_heads,
+            KV_LORA_RANK,
+            NUM_SEGMENTS_PER_SEQ,
+            SPLIT_CHUNK,
+        )
+        # Pass 1: the overall max and exp sum.
+        overall_max = float("-inf")
+        overall_expsum = 0.0
+        for c in range(0, count, SPLIT_STATS):
+            slot, stats_mask = _split_rebalance_slots(
+                first,
+                count,
+                c,
+                query_head_idx,
+                num_query_heads,
+                NUM_SEGMENTS_PER_SEQ,
+                SPLIT_STATS,
+            )
+            stats_max = tl.load(
+                segm_max_ptr + slot, mask=stats_mask, other=float("-inf")
+            )
+            stats_expsum = tl.load(segm_expsum_ptr + slot, mask=stats_mask, other=0.0)
+            new_max = tl.maximum(overall_max, tl.max(stats_max))
+            overall_expsum = overall_expsum * tl.math.exp2(
+                overall_max - new_max
+            ) + tl.sum(stats_expsum * tl.math.exp2(stats_max - new_max))
+            overall_max = new_max
+        # Pass 2: the weighted sum of the outputs. A weight needs only the overall
+        # max, so all loads of a chunk go out before the first use.
+        acc_sum = _split_rebalance_weighted_sum(
+            segm_max, mask, segm_output, overall_max
+        )
+        for c in range(SPLIT_CHUNK, count, SPLIT_CHUNK):
+            segm_max, mask, segm_output = _split_rebalance_load_outputs(
+                segm_output_ptr,
+                segm_max_ptr,
+                first,
+                count,
+                c,
+                query_head_idx,
+                num_query_heads,
+                KV_LORA_RANK,
+                NUM_SEGMENTS_PER_SEQ,
+                SPLIT_CHUNK,
+            )
+            acc_sum += _split_rebalance_weighted_sum(
+                segm_max, mask, segm_output, overall_max
+            )
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+        if out_scale_ptr is not None:
+            acc = acc * out_scale
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        output_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + tl.arange(0, KV_LORA_RANK)
+        )
+        tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
+        return
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ

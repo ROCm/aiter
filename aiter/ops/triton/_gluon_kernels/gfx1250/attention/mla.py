@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import sum_combine
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -1666,11 +1667,12 @@ class MLAProgram:
             dtype=tl.float32,
             layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
         )
-        k_lora = self.tdm_shared_load_kv_lora(LORA_WAIT, buffer_id)
-        S = self.compute_qk_lora(k_lora, None, None, S)
+        gl.amd.gfx1250.tdm.async_wait(LORA_WAIT)
         if FILL:
             self.tdm_load_global_to_shared_kv_lora(fill_row, fill_slot)
             self.tdm_load_global_to_shared_k_rope(fill_row, fill_slot)
+        k_lora = self.lds_unshuffle_kv_lora(buffer_id).load(layout=cfg.K_DOT_LAYOUT)
+        S = self.compute_qk_lora(k_lora, None, None, S)
         k_rope = self.tdm_shared_load_k_rope(ROPE_WAIT, buffer_id)
         S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
 
@@ -1727,6 +1729,68 @@ def _find_seq_idx(
             right = mid
 
     return left - 1
+
+
+@gluon.jit
+def _split_rebalance_work(
+    seq_lens_ptr,
+    split_meta_ptr,
+    num_seqs,
+    work_idx,
+    store_meta,
+    TILE_SIZE: gl.constexpr,
+    NUM_SEGMENTS: gl.constexpr,
+    SEQ_BLOCK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """Split rebalance: all segments of the batch cover the same number of KV
+    tiles, the least that gives at most num_seqs * NUM_SEGMENTS segments. Work
+    items are the segments in sequence order. Returns (seq_idx, segm_idx,
+    tiles_per_segment, seq_len, num_work) for work item work_idx.
+    """
+    gl.static_assert(SEQ_BLOCK >= WARP_SIZE and NUM_SEGMENTS > 1)
+    work_items = num_seqs * NUM_SEGMENTS
+    # Each warp holds all lengths, so the sums and the scan stay in the warp.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [SEQ_BLOCK // WARP_SIZE], [WARP_SIZE], [NUM_WARPS], [0]
+    )
+    offs = gl.arange(0, SEQ_BLOCK, layout=layout)
+    in_batch = offs < num_seqs
+    lens = gl.load(seq_lens_ptr + offs, mask=in_batch, other=0)
+    tiles = cdiv_fn(lens, TILE_SIZE)
+    total = gl.sum(tiles, axis=0)
+    tiles_per_segment = gl.maximum(cdiv_fn(total, work_items), 1)
+    if gl.sum(cdiv_fn(tiles, tiles_per_segment), axis=0) > work_items:
+        # A sequence of t > 0 tiles has cdiv(t, T) <= (t - 1) / T + 1 segments, so
+        # hi gives at most work_items segments. Find the least such value.
+        nonempty = gl.sum((tiles > 0).to(gl.int32), axis=0)
+        lo = tiles_per_segment + 1
+        hi = gl.minimum(
+            gl.max(tiles, axis=0),
+            cdiv_fn(total - nonempty, work_items - nonempty),
+        )
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if gl.sum(cdiv_fn(tiles, mid), axis=0) > work_items:
+                lo = mid + 1
+            else:
+                hi = mid
+        tiles_per_segment = hi
+    num_segments = cdiv_fn(tiles, tiles_per_segment)
+    ends = gl.associative_scan(num_segments, 0, sum_combine)
+    starts = ends - num_segments
+    # For the reduce: the first work item and the segment count of each sequence.
+    meta_mask = in_batch & store_meta
+    gl.store(split_meta_ptr + offs, starts, mask=meta_mask)
+    gl.store(split_meta_ptr + num_seqs + offs, num_segments, mask=meta_mask)
+    # The sequence of work item w is the number of sequences that end at or before w.
+    seq_idx = gl.sum((ends <= work_idx).to(gl.int32), axis=0)
+    is_seq = offs == seq_idx
+    segm_idx = work_idx - gl.sum(gl.where(is_seq, starts, 0), axis=0)
+    seq_len = gl.sum(gl.where(is_seq, lens, 0), axis=0)
+    num_work = gl.sum(num_segments, axis=0)
+    return seq_idx, segm_idx, tiles_per_segment, seq_len, num_work
 
 
 @gluon.jit
@@ -1889,7 +1953,7 @@ def _mla_decode_kv_ring(
     # Keeps NUM_STAGES - 1 tiles of this segment in flight. Each tile is two
     # TDM loads, LoRA then RoPE, and the wait counts below rely on that order.
     # Like the two-stage loop, a tile waits for its LoRA, issues the next fill
-    # behind the LoRA QK, then waits for its RoPE.
+    # right after that wait, then waits for its RoPE.
     PREFETCH: gl.constexpr = NUM_STAGES - 1
     num_tiles = pgm.tile_end - pgm.tile_start
     # Prime unconditionally, re-reading the last tile in a short segment: the
@@ -1975,6 +2039,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "KV_CACHE_DTYPE",
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
+        "SEQ_BLOCK",
     ],
 )
 
@@ -2031,6 +2096,8 @@ def _mla_decode_fwd_kernel(
     output_stride_1: gl.int32 = 0,
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
+    split_meta_ptr=None,
+    SEQ_BLOCK: gl.constexpr = 0,  # power of 2, >= num_seqs and >= WARP_SIZE
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2100,22 +2167,44 @@ def _mla_decode_fwd_kernel(
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
-    if USE_LDS_PIPELINE:
+    if USE_LDS_PIPELINE or split_meta_ptr is not None:
         # The wrapper guarantees one packed query row per sequence.
         q_start_idx = seq_idx
     else:
         q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+    out_token_idx = q_start_idx
+    out_segm_idx = segm_idx
 
     token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
     head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
     head_offset = head_block_idx * BLOCK_M
 
-    # sequence len for this particular sequence
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if split_meta_ptr is not None:
+        gl.static_assert(ALL_DECODE)
+        num_seqs = gl.num_programs(0) // NUM_HEAD_BLOCKS
+        work_idx = seq_idx * NUM_SEGMENTS_PER_SEQ + segm_idx
+        seq_idx, segm_idx, tiles_per_segment, seq_len, num_work = _split_rebalance_work(
+            seq_lens_ptr,
+            split_meta_ptr,
+            num_seqs,
+            work_idx,
+            (q_block_global_idx == 0) & (kv_head_idx == 0) & (out_segm_idx == 0),
+            TILE_SIZE,
+            NUM_SEGMENTS_PER_SEQ,
+            SEQ_BLOCK,
+            num_warps,
+            WARP_SIZE,
+        )
+        if work_idx >= num_work:
+            return
+        q_start_idx = seq_idx
+    else:
+        # sequence len for this particular sequence
+        seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # number of segments for this particular sequence
+        num_segments = NUM_SEGMENTS_PER_SEQ
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
@@ -2140,6 +2229,10 @@ def _mla_decode_fwd_kernel(
 
     context_len = seq_len - num_tokens_per_seq
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
+    if not USE_LDS_PIPELINE and num_stages <= 2:
+        first_physical_block_idx = gl.load(
+            block_tables_ptr_shifted + segm_idx * tiles_per_segment
+        )
 
     e4m3_dtype = gl.float8e4nv
     if QUERY_DTYPE == "nvfp4":
@@ -2200,11 +2293,6 @@ def _mla_decode_fwd_kernel(
         ),
         other=None if USE_LDS_PIPELINE else 0.0,
     )
-    q_lora_shared.store(Q_lora_load)
-    if Q_FROM_LDS:
-        Q_lora = q_lora_shared
-    else:
-        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     query_pos_rope = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
@@ -2232,6 +2320,13 @@ def _mla_decode_fwd_kernel(
         ),
         other=None if USE_LDS_PIPELINE else 0.0,
     )
+
+    q_lora_shared.store(Q_lora_load)
+    if Q_FROM_LDS:
+        Q_lora = q_lora_shared
+    else:
+        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+
     q_rope_shared.store(Q_rope_load)
     if Q_FROM_LDS:
         Q_rope = q_rope_shared
@@ -2317,7 +2412,7 @@ def _mla_decode_fwd_kernel(
     query_pos_qk = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_0_qk = q_start_idx + query_pos_qk
+    query_offset_0_qk = out_token_idx + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * cfg.NUM_QUERIES_PER_KV
         + head_offset
@@ -2417,9 +2512,8 @@ def _mla_decode_fwd_kernel(
         j_hbm: gl.int32 = 0
         buffer_id: gl.int32 = 0
 
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start
-        )
+        physical_block_idx = first_physical_block_idx
+        j_hbm += 1
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
@@ -2439,20 +2533,25 @@ def _mla_decode_fwd_kernel(
                 layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
             )
 
+            next_buffer_id = pgm.get_next_buffer_id(buffer_id)
+            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
             if KV_CACHE_DTYPE == "nvfp4":
                 kv_lora = pgm.tdm_shared_load_kv_lora(3, buffer_id)
                 kv_lora_scales = pgm.tdm_shared_load_kv_lora_scales(
                     wait_count=2, buffer_id=buffer_id
                 ).to(e4m3_dtype, bitcast=True)
+                S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
+                pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
+                pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
             else:
-                kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
+                gl.amd.gfx1250.tdm.async_wait(1)
+                pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
+                pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
+                kv_lora = pgm.lds_unshuffle_kv_lora(buffer_id).load(
+                    layout=cfg.K_DOT_LAYOUT
+                )
                 kv_lora_scales = None
-            S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
-
-            next_buffer_id = pgm.get_next_buffer_id(buffer_id)
-            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
-            pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
+                S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
 
             if KV_CACHE_DTYPE == "nvfp4":
                 k_rope = pgm.tdm_shared_load_k_rope(5, buffer_id)
@@ -2581,7 +2680,7 @@ def _mla_decode_fwd_kernel(
             acc1,
             M,
             L,
-            segm_idx,
+            out_segm_idx,
         )
     else:
         acc = acc * out_factor
@@ -2603,8 +2702,8 @@ def _mla_decode_fwd_kernel(
                 acc,
                 M,
                 L,
-                segm_idx,
-                q_start_idx + token_q_block_local_idx,
+                out_segm_idx,
+                out_token_idx + token_q_block_local_idx,
                 kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset,
             )
         else:
@@ -2612,7 +2711,7 @@ def _mla_decode_fwd_kernel(
                 acc,
                 M,
                 L,
-                segm_idx,
+                out_segm_idx,
             )
 
 

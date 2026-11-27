@@ -815,6 +815,170 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
     )
 
 
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, block_size, shuffled_kv_cache, num_query_heads",
+    [
+        # vLLM DeepSeek-R1 decode at TP4: unshuffled fp8 cache, 64-token pages.
+        (e4m3_dtype, e4m3_dtype, 64, False, 32),
+        (torch.bfloat16, torch.bfloat16, 64, False, 16),
+        (e4m3_dtype, e4m3_dtype, 64, True, 16),
+        (e4m3_dtype, torch.uint8, 128, True, 16),
+    ],
+)
+@pytest.mark.parametrize("one_long", [True, False])
+@torch.inference_mode()
+def test_mla_decode_fwd_split_rebalance(
+    monkeypatch,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    block_size: int,
+    shuffled_kv_cache: bool,
+    num_query_heads: int,
+    one_long: bool,
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("split rebalance requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+    # Four segments per sequence (128 work items). The 883-page sequence then
+    # needs the search for the tiles per segment.
+    select_config = mla_module.select_3d_config
+
+    def four_segments(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        attn["NUM_SEGMENTS_PER_SEQ"] = 4
+        reduce["NUM_SEGMENTS_PER_SEQ"] = 4
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", four_segments)
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                assert kwargs["split_meta_ptr"] is not None
+                assert kwargs["NUM_SEGMENTS_PER_SEQ"] == 4
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+    random.seed(0)
+    torch.manual_seed(0)
+    batch_size, kv_lora_rank, num_blocks = 32, 512, 1024
+    qk_head_dim = kv_lora_rank + 64
+    if one_long:
+        # 30 sequences of 4 pages and one of 883 pages.
+        lengths = [
+            4 * block_size - random.randrange(block_size) for _ in range(batch_size)
+        ]
+        lengths[-1] = 883 * block_size - random.randrange(block_size)
+    else:
+        # Random lengths and the page edges.
+        lengths = [random.randint(1, 10000) for _ in range(batch_size)]
+        lengths[2:6] = [block_size - 1, block_size, block_size + 1, 2 * block_size + 1]
+    lengths[1] = 0  # no KV, so no work item
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, (max(lengths) + block_size - 1) // block_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, 1, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(q_dtype)
+    if shuffled_kv_cache:
+        if kv_dtype == torch.uint8:
+            maybe_shuffled_kv_buffer = dynamic_nvfp4_quant_kv_buffer(
+                kv_buffer, kv_lora_rank
+            )
+            kv_buffer = kv_buffer.to(e4m3_dtype)
+        else:
+            kv_buffer = kv_buffer.to(kv_dtype)
+            maybe_shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+    else:
+        kv_buffer = kv_buffer.to(kv_dtype)
+        maybe_shuffled_kv_buffer = kv_buffer
+
+    q_descale = None
+    kv_descale = None
+    if q_dtype != torch.bfloat16:
+        q_descale = torch.tensor([0.3], dtype=torch.float32, device="cuda")
+    if kv_dtype != torch.bfloat16:
+        kv_descale = torch.tensor([0.4], dtype=torch.float32, device="cuda")
+    output_scale = torch.tensor([0.7], dtype=torch.float32, device="cuda")
+    output = torch.full(
+        (batch_size, num_query_heads, kv_lora_rank),
+        16.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=maybe_shuffled_kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=0,  # unknown, as under CUDA graph capture
+        block_tables=block_tables,
+        softmax_scale=qk_head_dim**-0.5,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    assert len(launches) == 1
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        qk_head_dim**-0.5,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        o_dtype=torch.float32,
+    )
+    assert torch.isfinite(output).all()
+    # The sequence without KV gets zeros.
+    assert (output[1] == 0).all()
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.float(),
+            ref_output,
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd split rebalance output",
+        )
+        <= tol_err_ratio
+    )
+    # Many outputs are smaller than atol, so also compare the error of each sequence
+    # with its norm. NVFP4 has about 10% error: the reference reads the e4m3 cache.
+    max_rel_err = 0.25 if kv_dtype == torch.uint8 else 0.05
+    err = (output.float() - ref_output).flatten(1).norm(dim=1)
+    ref_norm = ref_output.flatten(1).norm(dim=1)
+    assert (err <= max_rel_err * ref_norm).all(), err / ref_norm
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
@@ -1460,6 +1624,7 @@ def test_mla_gluon_split_metadata_cuda_graph():
         (512, 2048, False, "output", 0, False),
         (512, 2048, False, "block_tables", 0, False),
         (512, 2048, False, None, 1, False),
+        (128, 2048, False, None, 1, False),
     ],
 )
 def test_mla_decode_fwd_lds_pipeline_eligibility(
@@ -1534,6 +1699,9 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
     )
     assert len(launches) == 1
     assert launches[0].get("USE_LDS_PIPELINE", False) == expected_pipeline
+    # The split rebalance is on for a split with a reduce and one query row per sequence.
+    split = launches[0]["NUM_SEGMENTS_PER_SEQ"] > 1 and not skip_reduce
+    assert ("split_meta_ptr" in launches[0]) == (split and extra_tokens == 0)
     if expected_pipeline:
         assert launches[0]["num_stages"] == 4
     else:
