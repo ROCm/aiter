@@ -423,7 +423,9 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool RuntimeSwigluLimit = false>
+          bool RuntimeSwigluLimit = false,
+          // Pad N and K in CK, so the template is defined for shapes that no tile divides.
+          bool PadK = false>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -459,7 +461,11 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          // Pad N and K in CK, so the template is defined for shapes that no tile divides.
+          bool PadK = false,
+          // The FP8 weights are preshuffled in 8-element K vectors.
+          bool KVec8 = false>
 void ck_moe_stage2_gemm(
     const hipStream_t& stream,
     int tokens,

@@ -24,6 +24,8 @@ const bool Nswizzle = {Nswizzle};
 const bool PerTensorQuant = {Quant} == static_cast<int>(QuantType::per_Tensor);
 const bool MulRoutedWeight = {MulRoutedWeight};
 const int ActOP = {ActOP};
+const bool PadK = {PadK};
+const bool KVec8 = {KVec8};
 CK_MOE_STAGE{Stage}_GEMM_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
 """
 
@@ -38,7 +40,7 @@ LOOKUP_head = """#pragma once
 
 LOOKUP_template = """
        {{"{kernel_tag}",                                                                                                       \\
-        ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}{RuntimeSwigluLimitArg}>}},                       \\"""
+        ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}{RuntimeSwigluLimitArg}{PadKArg}>}},                       \\"""
 
 LOOKUP_end = """
    }
@@ -51,7 +53,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
+MoeKernel moe_stage1_heuristic_dispatch(int block_m, int inter_dim, int model_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -60,7 +62,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, int model_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -80,33 +82,105 @@ A16W16_A8W8_gemm1_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // The 64-wide N tiles need an inter_dim that is a multiple of 64. Otherwise use the
+        // narrower tiles, which only the FP8 kernels define.
+        if constexpr (sizeof({A0DataType}) == 1)
+        {{
+            if (inter_dim % 64 != 0)
+            {{
+                const bool pad_k = model_dim % (128/sizeof({A0DataType})) != 0;
+                if (inter_dim % 32 != 0)
+                {{
+                    // The padded copies also pad N, for an inter_dim that is not a multiple of 16.
+                    const bool pad = pad_k || inter_dim % 16 != 0;
+                    if (block_m == 32)
+                    {{
+                        return pad ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                    }}
+                    if (block_m == 64)
+                    {{
+                        return pad ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                    }}
+                    if (block_m == 128)
+                    {{
+                        return pad ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 128, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 128, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                    }}
+                    if (block_m == 256)
+                    {{
+                        return pad ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 256, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 256, 16, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                    }}
+                }}
+                if (block_m == 32)
+                {{
+                    return pad_k ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                }}
+                if (block_m == 64)
+                {{
+                    return pad_k ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 64, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 64, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                }}
+                if (block_m == 128)
+                {{
+                    return pad_k ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 128, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 128, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                }}
+                if (block_m == 256)
+                {{
+                    return pad_k ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 256, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 256, 32, 128/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+                }}
+            }}
+        }}
+        // For block_m 128 and 256, the 128-wide N tiles need an inter_dim that is a
+        // multiple of 128. Otherwise use the 64-wide ones.
         if (block_m == 32)
         {{
+            if (model_dim % (128/sizeof({A0DataType})) != 0)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+            }}
             return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
         }}
         else if (block_m == 64)
         {{
+            if (model_dim % (128/sizeof({A0DataType})) != 0)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+            }}
             return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
         }}
         else if (block_m == 128)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 || inter_dim % 128 != 0)
             {{
+                if (model_dim % (128/sizeof({A0DataType})) != 0)
+                {{
+                    return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                }}
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
             else
             {{
+                if (model_dim % (128/sizeof({A0DataType})) != 0)
+                {{
+                    return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                }}
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
         }}
         else if (block_m == 256)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 || inter_dim % 128 != 0)
             {{
+                if (model_dim % (128/sizeof({A0DataType})) != 0)
+                {{
+                    return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                }}
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
             else
             {{
+                if (model_dim % (128/sizeof({A0DataType})) != 0)
+                {{
+                    return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                }}
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
         }}
@@ -187,17 +261,73 @@ A8W8_gemm1_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // The 128-wide N tiles need an inter_dim above 192 that is a multiple of 128.
+        // Otherwise use the 64-wide ones.
+        const bool n64 = inter_dim <= 192 || inter_dim % 128 != 0;
+        // The KPerBlock 128 tiles need a model_dim that is a multiple of 128.
+        // Otherwise use the KPerBlock 64 ones.
+        const bool k64 = model_dim % 128 != 0;
+        // The 64-wide N tiles need an inter_dim that is a multiple of 64.
+        // Otherwise use the 32-wide ones.
+        const bool n32 = inter_dim % 64 != 0;
+        // Use the 16-wide N tiles when inter_dim is not a multiple of 32.
+        const bool n16 = inter_dim % 32 != 0;
+        // Pad N and K when inter_dim is not a multiple of 16.
+        const bool padn = inter_dim % 16 != 0;
         if (block_m == 16)
         {{
+            if (n16)
+            {{
+                if (padn) return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n32)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 32, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (k64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (model_dim % 256 != 0)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 64, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
             return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 64, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
         }}
         else if (block_m == 32)
         {{
+            if (n16)
+            {{
+                if (padn) return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n32)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 32, 64/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (k64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 64, 64/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
             return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
         }}
         else if (block_m == 64)
         {{
-            if (inter_dim <= 192)
+            if (n16)
+            {{
+                if (padn) return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 16, 64/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n32)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 64, 32, 64/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (k64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n64)
             {{
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
@@ -208,7 +338,14 @@ A8W8_gemm1_heuristic_dispatch = """
         }}
         else if (block_m == 128)
         {{
-            if (inter_dim <= 192)
+            // The narrow N tiles are slow at this block_m, so pad N to the 64-wide tile instead.
+            if (n32)
+                return k64 ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+            if (k64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n64)
             {{
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
@@ -219,7 +356,14 @@ A8W8_gemm1_heuristic_dispatch = """
         }}
         else if (block_m == 256)
         {{
-            if (inter_dim <= 192)
+            // The narrow N tiles are slow at this block_m, so pad N to the 64-wide tile instead.
+            if (n32)
+                return k64 ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}, true>;
+            if (k64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
+            }}
+            else if (n64)
             {{
                 return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {RuntimeSwigluLimit}>;
             }}
@@ -443,39 +587,101 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        // One gfx950 fp8 16x16 MFMA consumes 128 K elements. Two fit in 256.
-        const int k128 = 128 / sizeof({A0DataType});
-        const int k256 = 256 / sizeof({A0DataType});
-        TORCH_CHECK(
-            inter_dim % k128 == 0,
-            "gfx950 a8w8 stage2 requires inter_dim to be a multiple of ",
-            k128,
-            ", got ",
-            inter_dim);
-        const bool k_is_256 = inter_dim % k256 == 0;
+        // An inter_dim that is not a multiple of 16 uses the KVec8 instances.
+        // They need the single-rate FP8 MFMA, so int8 does not have them.
+        if constexpr (ck::is_same_v<{A0DataType}, F8>)
+        {{
+            if (inter_dim % 16 != 0)
+            {{
+                if (block_m == 32)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 64)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 128)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 256)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+            }}
+        }}
+        // The 128-wide N tiles need a model_dim that is a multiple of 128.
+        // Otherwise use the 64-wide ones.
+        if (model_dim % 128 != 0)
+        {{
+            const bool pad_k = inter_dim % (128/sizeof({A0DataType})) != 0;
+            if (block_m == 32)
+            {{
+                return pad_k ? ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            if (block_m == 64)
+            {{
+                return pad_k ? ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            if (block_m == 128)
+            {{
+                return pad_k ? ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            if (block_m == 256)
+            {{
+                return pad_k ? ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+        }}
         if (block_m == 32)
         {{
-            if (k_is_256)
+            constexpr int k256 = 256/sizeof({A0DataType});
+            constexpr int k128 = 128/sizeof({A0DataType});
+            // Prefer the largest tile that divides K. Pad only when none does.
+            if (inter_dim % k256 == 0)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, k256, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            if (inter_dim % k128 == 0)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
         }}
         else if (block_m == 64)
         {{
-            if (k_is_256)
+            constexpr int k256 = 256/sizeof({A0DataType});
+            constexpr int k128 = 128/sizeof({A0DataType});
+            // Prefer the largest tile that divides K. Pad only when none does.
+            if (inter_dim % k256 == 0)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, k256, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            if (inter_dim % k128 == 0)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
         }}
         else if (block_m == 128)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            constexpr int k128 = 128/sizeof({A0DataType});
+            // This is the smallest tile, so pad only when it does not divide K.
+            if (inter_dim % k128 == 0)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
         }}
         else if (block_m == 256)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            constexpr int k128 = 128/sizeof({A0DataType});
+            // This is the smallest tile, so pad only when it does not divide K.
+            if (inter_dim % k128 == 0)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
         }}
         else
         {{
@@ -555,14 +761,31 @@ A8W8_gemm2_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // The 128-wide tiles need inter_dim and model_dim to be multiples of 128.
+        // Otherwise use the 64-wide ones.
+        const bool tile64 = inter_dim <= 192 || inter_dim % 128 != 0 || model_dim % 128 != 0;
+        // An inter_dim that is not a multiple of 64 uses the 64-wide tiles with K padded.
+        const bool padk = inter_dim % 64 != 0;
+        // An inter_dim that is not a multiple of 16 uses the KVec8 instances.
+        const bool kvec8 = inter_dim % 16 != 0;
         if (block_m == 16)
         {{
+            if (kvec8)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+            }}
+            if (padk) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
             return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 32)
         {{
-            if (inter_dim <= 192)
+            if (kvec8)
             {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+            }}
+            if (tile64)
+            {{
+                if (padk) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
             else
@@ -572,8 +795,13 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 64)
         {{
-            if (inter_dim <= 192)
+            if (kvec8)
             {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+            }}
+            if (tile64)
+            {{
+                if (padk) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
             else
@@ -583,8 +811,13 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 128)
         {{
-            if (inter_dim <= 192)
+            if (kvec8)
             {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+            }}
+            if (tile64)
+            {{
+                if (padk) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
             else
@@ -594,8 +827,13 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 256)
         {{
-            if (inter_dim <= 192)
+            if (kvec8)
             {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+            }}
+            if (tile64)
+            {{
+                if (padk) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
             else
@@ -1022,6 +1260,8 @@ class ck_moe_2stage_gemm_codegen:
                             MulRoutedWeight=str(
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
+                            PadK=str(kernel.PadK).lower(),
+                            KVec8=str(kernel.KVec8).lower(),
                         )
                         if "FP4" in self.b_dtype:
                             stage_instance = (
@@ -1035,6 +1275,11 @@ class ck_moe_2stage_gemm_codegen:
 
                 ## generate lookUpTable
                 lookup_ele = LOOKUP_template.format(
+                    PadKArg=(
+                        ", true, true"
+                        if kernel.KVec8
+                        else ", true" if kernel.PadK else ""
+                    ),
                     RuntimeSwigluLimitArg=(
                         ", AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT"
                         if kernel.stage == 1

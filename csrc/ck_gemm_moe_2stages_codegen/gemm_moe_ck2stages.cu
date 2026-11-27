@@ -38,7 +38,7 @@ static inline int map_activation_to_ck_stage1(int activation)
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
-MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled, bool require_exact = false)
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, int model_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled, bool require_exact = false)
 {
     static const auto lookup = []
     {
@@ -59,11 +59,11 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     if constexpr (stage == 1)
     {
-        return moe_stage1_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight, is_shuffled);
+        return moe_stage1_heuristic_dispatch(block_m, inter_dim, model_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight, is_shuffled);
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, model_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
     }
 }
 
@@ -149,7 +149,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     activation = map_activation_to_ck_stage1(activation);
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, clamp_enabled);
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, K, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, clamp_enabled);
 
     // Narrow a finite positive limit to float without it becoming 0 (disabled)
     // or inf (rejected by CK).
@@ -221,7 +221,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     }
 
     // stage2 does not apply an activation.
-    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, N, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
