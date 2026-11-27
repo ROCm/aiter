@@ -141,12 +141,17 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
 from aiter.plugin import route as _route
-from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
+from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe, plain_sort_block_m, forget_ep_mask are public
     aux_sort_capacity,
     bytes_overlap,
     drop_presort_after,
     drop_presort_on_error,
+    forget_ep_mask,
+    is_plain_presort,
+    match_plain_presorted_moe,
     match_presorted_moe,
+    note_plain_sort_block_m,
+    plain_sort_block_m,
     pop_presorted_moe,
     presorted_moe_ignored,
     register_presorted_moe,
@@ -1775,7 +1780,11 @@ def _fused_moe_impl(
         metadata.run_1stage or metadata.full_impl is not None
     ):
         raise RuntimeError("_stage2_override requires a two-stage MoE config")
-    if presorted_aux and not metadata.output_aux:
+    if (
+        presorted_aux
+        and not metadata.output_aux
+        and not is_plain_presort(presorted_aux)
+    ):
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
@@ -2026,22 +2035,70 @@ def _fused_moe_impl(
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
             sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
-        sorting_ret = moe_sorting(
-            topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=not runtime_stage2_reduce
-            and asm_mode is not AsmMoeMode.POST_REDUCE,
-            flat=asm_mode,
-            output=sort_output,
+        # A caller's general-layout sort stands in only where moe_sorting would
+        # emit just the four sort tensors plus a zeroed accumulation buffer.
+        plain_presorted = None
+        plain_presort_ok = (
+            asm_mode is AsmMoeMode.SORTED
+            and not need_local_topk_ids
+            and not runtime_stage2_reduce
         )
+        if plain_presort_ok:
+            note_plain_sort_block_m(topk_ids.shape[0], global_E, topk, block_size_M)
+        if is_plain_presort(presorted_aux) and plain_presort_ok:
+            plain_presorted = match_plain_presorted_moe(
+                presorted_aux,
+                topk_ids,
+                topk_weight,
+                block_m=block_size_M,
+                num_experts=global_E,
+                topk=topk,
+                expert_mask=expert_mask,
+                num_local_tokens=num_local_tokens,
+                output=sort_output,
+            )
+        elif is_plain_presort(presorted_aux):
+            presorted_moe_ignored(
+                "the general sort path needs local ids, FLAT or no accumulation here"
+            )
+        if plain_presorted is not None:
+            moe_buf = (
+                sort_output
+                if sort_output is not None
+                else torch.empty((M, model_dim), dtype=dtype, device=topk_ids.device)
+            )
+            # Same rule as the BM=16 presort: only the exact caller output the
+            # caller zeroed may skip the zeroing.
+            if not (
+                sort_output is not None
+                and plain_presorted.get("moe_buf_zeroed")
+                and int(plain_presorted.get("moe_buf_ptr", 0)) == sort_output.data_ptr()
+            ):
+                moe_buf.zero_()
+            sorting_ret = (
+                plain_presorted["sorted_token_ids"],
+                plain_presorted["sorted_weights"],
+                plain_presorted["sorted_expert_ids"],
+                plain_presorted["num_valid_ids"],
+                moe_buf,
+            )
+        else:
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=not runtime_stage2_reduce
+                and asm_mode is not AsmMoeMode.POST_REDUCE,
+                flat=asm_mode,
+                output=sort_output,
+            )
         if need_local_topk_ids:
             (
                 sorted_ids,

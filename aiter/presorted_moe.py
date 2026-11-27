@@ -8,6 +8,7 @@ rather than in fused_moe.py, which the other two can only import lazily.
 
 import functools
 import threading
+import weakref
 
 import torch
 
@@ -126,6 +127,9 @@ def match_presorted_moe(
     """
     if not aux:
         return None
+    if is_plain_presort(aux):
+        presorted_moe_ignored("a general-layout sort cannot replace the BM=16 aux sort")
+        return None
     if int(block_m) != PRESORTED_MOE_BLOCK_M:
         presorted_moe_ignored(f"block_m={block_m}")
         return None
@@ -215,6 +219,219 @@ def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
         and reverse.numel() == topk_ids.shape[0] * topk
         and num_valid.numel() >= 2
     )
+
+
+# A caller sort in the layout of fused_moe's general moe_sorting path (any
+# block_m, optionally under an EP expert_mask), registered with
+# aux["layout"] = PRESORTED_MOE_LAYOUT_PLAIN. It carries no m_indices or
+# reverse_sorted, so only the plain sort path takes it.
+PRESORTED_MOE_LAYOUT_PLAIN = "plain"
+_PLAIN_SORT_KEYS = (
+    "sorted_token_ids",
+    "sorted_weights",
+    "sorted_expert_ids",
+    "num_valid_ids",
+)
+# id(mask) -> (weakref to the mask, (version, data_ptr, numel, ep_layout) when
+# checked, whether it matched). An entry is dropped when its mask is freed.
+_EP_MASK_CHECKED = {}
+# (M, num_experts, topk) -> block_m of the last general-path sort for that shape.
+_PLAIN_SORT_BLOCK_M = {}
+
+
+def note_plain_sort_block_m(M, num_experts, topk, block_m):
+    _PLAIN_SORT_BLOCK_M[(int(M), int(num_experts), int(topk))] = int(block_m)
+
+
+def plain_sort_block_m(M, num_experts, topk):
+    """block_m of fused_moe's last general-path sort for this shape, or None.
+
+    The block size comes from fused_moe's kernel selection, which a caller sorting
+    ahead of it cannot see; a caller whose layers share one MoE configuration
+    can register with what the previous call used, and a stale guess only costs
+    that call its presort (match_plain_presorted_moe checks block_m)."""
+    return _PLAIN_SORT_BLOCK_M.get((int(M), int(num_experts), int(topk)))
+
+
+def plain_sort_capacity(M, topk, num_experts, block_m):
+    """Rows fused_moe's general moe_sorting allocates for this call."""
+    padded = M * topk + num_experts * block_m - topk
+    return (padded + block_m - 1) // block_m * block_m
+
+
+def is_plain_presort(aux):
+    return bool(aux) and aux.get("layout") == PRESORTED_MOE_LAYOUT_PLAIN
+
+
+def forget_ep_mask(expert_mask=None):
+    """Drop the cached EP-mask check of ``expert_mask``, or of every mask if None.
+
+    Updates through torch ops on the mask (or a view of it) and a new mask tensor
+    are detected without this. Call it after writing a mask's memory any other
+    way: a raw-pointer kernel, a write through ``.data``, or a peer's IPC handle.
+    """
+    if expert_mask is None:
+        _EP_MASK_CHECKED.clear()
+        return
+    entry = _EP_MASK_CHECKED.get(id(expert_mask))
+    if entry is not None and entry[0]() is expert_mask:
+        del _EP_MASK_CHECKED[id(expert_mask)]
+
+
+def _forget_freed_mask(ref, key):
+    entry = _EP_MASK_CHECKED.get(key)
+    if entry is not None and entry[0] is ref:
+        del _EP_MASK_CHECKED[key]
+
+
+def _tensor_version(t):
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors have no version counter
+        return None
+
+
+def _ep_mask_matches(expert_mask, num_experts, ep_layout):
+    """Whether expert_mask selects exactly the experts ep_layout describes.
+
+    ep_layout = (routed_begin, num_routed, shared_begin, num_shared): the rank
+    owns global experts [routed_begin, routed_begin + num_routed) and
+    [shared_begin, shared_begin + num_shared), shared after routed, so local ids
+    are g - routed_begin and num_routed + g - shared_begin.
+
+    The comparison reads the mask back to the host, so its result is cached per
+    mask tensor and reused while the tensor is alive and its version counter,
+    data_ptr and numel are unchanged. Writes that bypass the version counter
+    need forget_ep_mask(). An inference tensor has no version counter, so its
+    mask is compared on every eager call. Under graph capture, where the
+    read-back cannot run, a mask with no valid cached result returns None (not
+    checked). A captured graph keeps the decision made at capture.
+    """
+    layout = tuple(int(v) for v in ep_layout)
+    version = _tensor_version(expert_mask)
+    state = (version, expert_mask.data_ptr(), expert_mask.numel(), layout)
+    key = id(expert_mask)
+    entry = _EP_MASK_CHECKED.get(key)
+    if (
+        version is not None
+        and entry is not None
+        and entry[0]() is expert_mask
+        and entry[1] == state
+    ):
+        return entry[2]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    routed_begin, num_routed, shared_begin, num_shared = layout
+    ok = (
+        expert_mask.numel() == num_experts
+        and 0 <= routed_begin
+        and routed_begin + num_routed <= shared_begin
+        and shared_begin + num_shared <= num_experts
+    )
+    if ok:
+        want = torch.zeros(num_experts, dtype=torch.int32, device="cpu")
+        want[routed_begin : routed_begin + num_routed] = 1
+        want[shared_begin : shared_begin + num_shared] = 1
+        ok = torch.equal(expert_mask.detach().to("cpu", torch.int32), want)
+    if version is not None:
+        ref = weakref.ref(expert_mask, lambda r, k=key: _forget_freed_mask(r, k))
+        _EP_MASK_CHECKED[key] = (ref, state, ok)
+    return ok
+
+
+def match_plain_presorted_moe(
+    aux,
+    topk_ids,
+    topk_weight,
+    *,
+    block_m,
+    num_experts,
+    topk,
+    expert_mask=None,
+    num_local_tokens=None,
+    output=None,
+):
+    """Return ``aux`` if it can replace the general moe_sorting of this call, else None.
+
+    ``aux`` must hold what moe_sorting would return for (topk_ids, topk_weight,
+    num_experts, block_m, expert_mask): sorted_token_ids, sorted_weights,
+    sorted_expert_ids and num_valid_ids in its layout, sized as it allocates,
+    with local expert ids under a mask. ``ep_layout`` describes the mask the
+    sort applied (None for none) and is checked against ``expert_mask``.
+    """
+    if not aux:
+        return None
+    if not is_plain_presort(aux):
+        presorted_moe_ignored("a BM=16 aux sort cannot replace the general sort")
+        return None
+    if num_local_tokens is not None:
+        presorted_moe_ignored("num_local_tokens is set")
+        return None
+    for key, expected in (
+        ("topk_ids_ptr", topk_ids.data_ptr()),
+        ("topk_weights_ptr", topk_weight.data_ptr()),
+        ("M", topk_ids.shape[0]),
+        ("block_m", block_m),
+        ("num_experts", num_experts),
+        ("topk", topk),
+    ):
+        if key not in aux:
+            presorted_moe_ignored(f"no {key}")
+            return None
+        if int(aux[key]) != int(expected):
+            presorted_moe_ignored(f"{key} does not match the call")
+            return None
+    ep_layout = aux.get("ep_layout")
+    if (expert_mask is None) != (ep_layout is None):
+        presorted_moe_ignored("expert_mask and the sort's ep_layout disagree")
+        return None
+    if expert_mask is not None:
+        matches = _ep_mask_matches(expert_mask, num_experts, ep_layout)
+        if matches is None:
+            presorted_moe_ignored(
+                "expert_mask was not checked before graph capture (new, updated "
+                "or inference tensor)"
+            )
+            return None
+        if not matches:
+            presorted_moe_ignored("expert_mask does not match the sort's ep_layout")
+            return None
+    try:
+        ids, weights, experts, num_valid = (aux[k] for k in _PLAIN_SORT_KEYS)
+    except KeyError:
+        presorted_moe_ignored("sort tensors missing")
+        return None
+    device = topk_ids.device
+    for t, dtype in (
+        (ids, dtypes.i32),
+        (weights, dtypes.fp32),
+        (experts, dtypes.i32),
+        (num_valid, dtypes.i32),
+    ):
+        if (
+            not isinstance(t, torch.Tensor)
+            or t.ndim != 1
+            or t.dtype != dtype
+            or t.device != device
+            or not t.is_contiguous()
+        ):
+            presorted_moe_ignored("sort tensors break the general sort layout")
+            return None
+    max_sorted = ids.numel()
+    if not (
+        max_sorted == plain_sort_capacity(topk_ids.shape[0], topk, num_experts, block_m)
+        and experts.numel() * int(block_m) == max_sorted
+        and weights.numel() >= max_sorted
+        and num_valid.numel() >= 2
+    ):
+        presorted_moe_ignored("sort tensors are not sized as moe_sorting sizes them")
+        return None
+    if output is not None and any(
+        bytes_overlap(output, aux[k]) for k in _PLAIN_SORT_KEYS
+    ):
+        presorted_moe_ignored("output overlaps the sort tensors")
+        return None
+    return aux
 
 
 def drop_presort_on_error(fn):

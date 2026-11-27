@@ -2272,6 +2272,503 @@ def test_presorted_moe_ignored_is_logged():
     aiter.logger.info("moe_2stage: presorted MoE ignored-registration log passed")
 
 
+def _plain_presort_stub(ids, weights, E, block_m, ep_layout=None):
+    """A plain-layout registration sized as moe_sorting sizes it; contents unset."""
+    M, topk = ids.shape
+    max_sorted = presorted_moe.plain_sort_capacity(M, topk, E, block_m)
+    i32 = dtypes.i32
+    return {
+        "layout": presorted_moe.PRESORTED_MOE_LAYOUT_PLAIN,
+        "sorted_token_ids": torch.empty(max_sorted, dtype=i32, device=ids.device),
+        "sorted_weights": torch.empty(max_sorted, dtype=dtypes.fp32, device=ids.device),
+        "sorted_expert_ids": torch.empty(
+            max_sorted // block_m, dtype=i32, device=ids.device
+        ),
+        "num_valid_ids": torch.empty(2, dtype=i32, device=ids.device),
+        "topk_ids_ptr": ids.data_ptr(),
+        "topk_weights_ptr": weights.data_ptr(),
+        "M": M,
+        "block_m": block_m,
+        "num_experts": E,
+        "topk": topk,
+        "ep_layout": ep_layout,
+    }
+
+
+def test_plain_presorted_moe_ep_mask():
+    """A plain presort's EP-mask check follows the mask tensor, not its address.
+
+    The check reads the mask back once and caches the result, so a cached True
+    must not survive an in-place update of the mask (directly or through a view)
+    nor carry over to another tensor that reuses the address. Writes that bypass
+    the version counter need forget_ep_mask(); inference tensors (no version
+    counter) are checked on every eager call; under graph capture a mask without
+    a valid cached check is not trusted. Checks the matcher fused_moe uses; no
+    MoE kernel launches.
+    """
+    check = presorted_moe._ep_mask_matches
+    cache = presorted_moe._EP_MASK_CHECKED
+    layout = (0, 2, 4, 0)
+    E = 4
+    presorted_moe.forget_ep_mask()
+
+    mask = torch.tensor([1, 1, 0, 0], dtype=torch.int32)
+    assert check(mask, E, layout) is True
+    assert check(mask, E, layout) is True, "cached check changed"
+    mask.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+    assert check(mask, E, layout) is False, "in-place mask update kept the cached True"
+    mask.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int32))
+    assert check(mask, E, layout) is True, "restored mask still rejected"
+    mask[2:].fill_(1)
+    assert check(mask, E, layout) is False, "update through a view kept the cached True"
+    mask[2:].fill_(0)
+    assert check(mask, E, layout) is True
+
+    # Allocator reuse: a new tensor at the freed mask's address is checked anew.
+    # Handing the freed address straight back is not an allocator contract, so
+    # take the first of a few allocations that lands on it and skip only the
+    # reused-address case when none does. Dropping the entry with the mask is
+    # checked either way.
+    ptr = mask.data_ptr()
+    del mask
+    assert not cache, "a freed mask's entry was kept"
+    spares = []
+    reused = None
+    for _ in range(16):
+        candidate = torch.empty(E, dtype=torch.int32)
+        if candidate.data_ptr() == ptr:
+            reused = candidate
+            break
+        spares.append(candidate)
+    del spares
+    if reused is None:
+        aiter.logger.info(
+            "skipping the reused-address case: no allocation returned %#x", ptr
+        )
+        reused = torch.empty(E, dtype=torch.int32)
+    else:
+        reused.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+        assert (
+            check(reused, E, layout) is False
+        ), "a new tensor at a reused address was trusted"
+    another = reused.view(E)
+    reused.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int32))
+    assert check(another, E, layout) is True
+    del reused, another
+
+    # A write through .data does not bump the version counter: forget_ep_mask.
+    mask = torch.tensor([1, 1, 0, 0], dtype=torch.int32)
+    assert check(mask, E, layout) is True
+    mask.data.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+    presorted_moe.forget_ep_mask(mask)
+    assert check(mask, E, layout) is False, "forget_ep_mask kept the cached True"
+
+    # Inference tensors: not cached, so every eager call reads the mask.
+    with torch.inference_mode():
+        frozen = torch.tensor([1, 1, 0, 0], dtype=torch.int32)
+        assert check(frozen, E, layout) is True
+        assert id(frozen) not in cache, "an inference-tensor mask was cached"
+        frozen.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+        assert check(frozen, E, layout) is False
+
+    # Under graph capture only a valid cached check counts.
+    mask.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int32))
+    assert check(mask, E, layout) is True
+    real_capturing = torch.cuda.is_current_stream_capturing
+    torch.cuda.is_current_stream_capturing = lambda: True
+    try:
+        assert check(mask, E, layout) is True, "cached check lost under capture"
+        mask.fill_(1)
+        assert check(mask, E, layout) is None, "updated mask trusted under capture"
+        assert (
+            check(frozen, E, layout) is None
+        ), "inference tensor trusted under capture"
+    finally:
+        torch.cuda.is_current_stream_capturing = real_capturing
+
+    # The reviewer's sequence through the matcher fused_moe calls.
+    M, topk = 2, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _plain_presort_stub(ids, weights, E, 32, ep_layout=layout)
+
+    def match(m):
+        return presorted_moe.match_plain_presorted_moe(
+            aux, ids, weights, block_m=32, num_experts=E, topk=topk, expert_mask=m
+        )
+
+    mask.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int32))
+    assert match(mask) is aux
+    mask.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+    assert match(mask) is None, "presort used after the mask changed"
+    assert match(None) is None, "presort with ep_layout used without a mask"
+    aux["ep_layout"] = None
+    assert (
+        match(torch.ones(E, dtype=torch.int32)) is None
+    ), "presort without ep_layout used with a mask"
+    del mask
+    presorted_moe.forget_ep_mask()
+    aiter.logger.info("moe_2stage: plain presorted MoE EP-mask cache passed")
+
+
+def test_plain_presorted_moe_hook():
+    """A caller's general-layout (plain) sort replaces fused_moe's moe_sorting.
+
+    GLM-5.2 MXFP4 shapes (256 routed experts + 1 shared, top-8 + shared), with
+    and without EP (rank 1 of 4: routed 64..127 + shared), at token counts the
+    tuned table runs with block_m 32 and 64. The presort is moe_sorting's own
+    output, registered the way SGLang's router does (its moe_buf as the
+    caller-zeroed output=). Every case asserts whether fused_moe's moe_sorting
+    ran and checks the output element-wise against fused_moe's own sort on the
+    same routing; test_fmoe checks the no-EP presorted path against the torch
+    reference. Covered: block_m 32/64, EP and no EP, a mask that does not match
+    the sort, an in-place mask update (eager and before graph capture), a
+    block_m mismatch, zeroing of a dirty output or reused-address moe_buf, an
+    output aliasing the sort tensors, and CUDA graph replay.
+    """
+    global fused_moe
+    fm = aiter.fused_moe
+    E, topk, model_dim, inter_dim = 257, 9, 6144, 2048
+    shared, rank_experts = 256, 64
+    dtype = dtypes.bf16
+    real_fused_moe = fused_moe
+    real_sorting = fm.moe_sorting
+    sort_calls = []
+
+    def counting_sorting(*a, **kw):
+        sort_calls.append(1)
+        return real_sorting(*a, **kw)
+
+    # Random fp4 codes with e8m0 scales; w2's are 2^4 lower so outputs sit near
+    # the hook test's magnitude (|out| <~ 1), where its bf16-atomic tolerances hold.
+    def scale(shape, low):
+        s = torch.randint(low, low + 6, shape, dtype=torch.uint8)
+        return (
+            fp4_utils.e8m0_shuffle(s.view(shape[0] * shape[1], -1))
+            .view(*shape)
+            .view(dtypes.fp8_e8m0)
+        )
+
+    def make_moe(n):
+        w1 = torch.randint(
+            0, 256, (n, 2 * inter_dim, model_dim // 2), dtype=torch.uint8
+        )
+        w2 = torch.randint(0, 256, (n, model_dim, inter_dim // 2), dtype=torch.uint8)
+        w1 = shuffle_weight(w1, (16, 16)).view(dtypes.fp4x2)
+        w2 = shuffle_weight(w2, (16, 16)).view(dtypes.fp4x2)
+        w1.is_shuffled = w2.is_shuffled = True
+        kw = {
+            "w1_scale": scale((n, 2 * inter_dim, model_dim // 32), 118),
+            "w2_scale": scale((n, model_dim, inter_dim // 32), 114),
+            "quant_type": aiter.QuantType.per_1x32,
+            "activation": aiter.ActivationType.Silu,
+            "doweight_stage1": False,
+            "gate_mode": GateMode.SEPARATED.value,
+        }
+
+        def moe(hidden, w, ids, mask, output=None, aux=None):
+            if aux is not None:
+                fm.register_presorted_moe(aux)
+            return real_fused_moe(
+                hidden, w1, w2, w, ids, expert_mask=mask, output=output, **kw
+            )
+
+        return moe
+
+    def rank_mask(rank):
+        mask = torch.zeros(E, dtype=torch.int32)
+        mask[rank * rank_experts : (rank + 1) * rank_experts] = 1
+        mask[shared] = 1
+        return mask
+
+    def rank_layout(rank):
+        return (rank * rank_experts, rank_experts, shared, 1)
+
+    def route(token, seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        hidden = (torch.randn((token, model_dim), generator=g) / 4).to(dtype)
+        gating = torch.randn((token, E - 1), generator=g).to(dtype)
+        w, ids = fused_topk(hidden, gating, topk - 1, True)
+        ids = torch.cat([ids, torch.full((token, 1), shared, dtype=ids.dtype)], 1)
+        w = torch.cat([w, torch.full((token, 1), 0.25, dtype=w.dtype)], 1)
+        return hidden, w.contiguous(), ids.contiguous()
+
+    def presort(topk_ids, topk_weights, block_m, mask, ep_layout, zeroed=True):
+        ids, wts, experts, num_valid, buf = real_sorting(
+            topk_ids, topk_weights, E, model_dim, dtype, block_m, mask
+        )[:5]
+        aux = {
+            "layout": presorted_moe.PRESORTED_MOE_LAYOUT_PLAIN,
+            "sorted_token_ids": ids,
+            "sorted_weights": wts,
+            "sorted_expert_ids": experts,
+            "num_valid_ids": num_valid,
+            "topk_ids_ptr": topk_ids.data_ptr(),
+            "topk_weights_ptr": topk_weights.data_ptr(),
+            "M": topk_ids.shape[0],
+            "block_m": block_m,
+            "num_experts": E,
+            "topk": topk,
+            "ep_layout": ep_layout,
+            "moe_buf_zeroed": zeroed,
+            "moe_buf_ptr": buf.data_ptr(),
+        }
+        return aux, buf
+
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    def check_close(ref, out, what):
+        # Stage 2 accumulates with bf16 atomics, so two runs of the own sort
+        # differ by a few bf16 steps; a buffer that was not zeroed (1e3 fill) or
+        # a sort for another mask misses by orders of magnitude.
+        mismatch = checkAllclose(
+            ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg=what, printLog=False
+        )
+        assert mismatch == 0, f"{what}: {mismatch:.2%} of elements out of tolerance"
+        diff = calc_diff(ref, out)
+        assert diff < 1e-4, f"{what}: diff {diff}"
+
+    def expect_sorts(n, what):
+        ran = len(sort_calls)
+        assert ran == n, f"{what}: moe_sorting ran {ran}x, want {n}"
+        assert (
+            getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+        ), f"{what}: registration not consumed"
+        sort_calls.clear()
+
+    def capture(step, warmup=True):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            if warmup:
+                step()
+                stream.synchronize()
+                sort_calls.clear()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out = step()
+        torch.cuda.current_stream().wait_stream(stream)
+        return graph, out
+
+    def run_case(moe, ep, token, block_m):
+        what = f"{'EP' if ep else 'no EP'} token={token} block_m={block_m}"
+        mask = rank_mask(1) if ep else None
+        layout = rank_layout(1) if ep else None
+        other_bm = 64 if block_m == 32 else 32
+        hidden, w, ids = route(token, token)
+        sort_calls.clear()
+
+        ref = moe(hidden, w, ids, mask)
+        expect_sorts(1, f"{what} own sort")
+        seen = fm.plain_sort_block_m(token, E, topk)
+        assert seen == block_m, f"{what}: the call ran block_m={seen}"
+        ref2 = moe(hidden, w, ids, mask)
+        expect_sorts(1, f"{what} own sort")
+
+        aux, buf = presort(ids, w, block_m, mask, layout)
+        out = moe(hidden, w, ids, mask, output=buf, aux=aux)
+        expect_sorts(0, f"{what} presort output=")
+        assert out is buf, f"{what}: caller output not used"
+        check_close(ref, out, f"{what} presort output=")
+        err = calc_diff(ref, out)
+
+        aux, _ = presort(ids, w, block_m, mask, layout)
+        out = moe(hidden, w, ids, mask, aux=aux)
+        expect_sorts(0, f"{what} presort")
+        check_close(ref, out, f"{what} presort")
+
+        # A dirty output the registration does not name as zeroed, or names
+        # under another address, is zeroed before accumulation.
+        for zeroed, name_other in ((False, False), (True, True)):
+            aux, _ = presort(ids, w, block_m, mask, layout, zeroed=zeroed)
+            dirty = torch.full((token, model_dim), 1e3, dtype=dtype)
+            if name_other:
+                aux["moe_buf_ptr"] = dirty.data_ptr() + 4
+            out = moe(hidden, w, ids, mask, output=dirty, aux=aux)
+            expect_sorts(0, f"{what} dirty output")
+            check_close(ref, out, f"{what} dirty output {zeroed=} {name_other=}")
+
+        # Without output=, the buffer fused_moe allocates is zeroed even when it
+        # lands at the address the registration names.
+        aux, _ = presort(ids, w, block_m, mask, layout)
+        stale = torch.full((token, model_dim), 1e3, dtype=dtype)
+        aux["moe_buf_ptr"] = stale.data_ptr()
+        real_empty = torch.empty
+        handed = []
+
+        def dirty_empty(*a, **k):
+            t = real_empty(*a, **k)
+            if not handed and t.shape == stale.shape and t.dtype == dtype:
+                handed.append(t)
+                return stale
+            return t
+
+        try:
+            torch.empty = dirty_empty
+            out = moe(hidden, w, ids, mask, aux=aux)
+        finally:
+            torch.empty = real_empty
+        expect_sorts(0, f"{what} reused-address moe_buf")
+        assert handed and out is stale, f"{what}: presort did not allocate moe_buf"
+        check_close(ref, out, f"{what} reused-address moe_buf")
+
+        # An output aliasing the sort tensors: ignored, moe_sorting runs.
+        aux, _ = presort(ids, w, block_m, mask, layout)
+        pool = torch.zeros((token, model_dim), dtype=dtype)
+        alias = pool.view(-1).view(dtypes.fp32)[: aux["sorted_weights"].numel()]
+        alias.copy_(aux["sorted_weights"])
+        aux["sorted_weights"] = alias
+        out = moe(hidden, w, ids, mask, output=pool, aux=aux)
+        expect_sorts(1, f"{what} aliased output")
+        check_close(ref, out, f"{what} aliased output")
+
+        # A sort for the other block size: ignored, moe_sorting runs.
+        aux, _ = presort(ids, w, other_bm, mask, layout)
+        out = moe(hidden, w, ids, mask, aux=aux)
+        expect_sorts(1, f"{what} block_m={other_bm} presort")
+        check_close(ref, out, f"{what} block_m={other_bm} presort")
+
+        if ep:
+            # A sort for another rank's mask, and a mask updated in place after
+            # the presort's mask was checked: both ignored.
+            aux, _ = presort(ids, w, block_m, rank_mask(2), rank_layout(2))
+            out = moe(hidden, w, ids, mask, aux=aux)
+            expect_sorts(1, f"{what} other rank's presort")
+            check_close(ref, out, f"{what} other rank's presort")
+
+            mask.copy_(rank_mask(2))
+            ref_r2 = moe(hidden, w, ids, mask)
+            expect_sorts(1, f"{what} rank-2 own sort")
+            aux, _ = presort(ids, w, block_m, rank_mask(1), rank_layout(1))
+            out = moe(hidden, w, ids, mask, aux=aux)
+            expect_sorts(1, f"{what} presort after a mask update")
+            check_close(ref_r2, out, f"{what} presort after a mask update")
+            mask.copy_(rank_mask(1))
+            aux, _ = presort(ids, w, block_m, mask, layout)
+            out = moe(hidden, w, ids, mask, aux=aux)
+            expect_sorts(0, f"{what} presort after the mask was restored")
+            check_close(ref, out, f"{what} restored mask")
+        else:
+            # ep_layout without a mask, or a mask without ep_layout.
+            aux, _ = presort(ids, w, block_m, None, (0, E, E, 0))
+            out = moe(hidden, w, ids, None, aux=aux)
+            expect_sorts(1, f"{what} presort with ep_layout")
+            check_close(ref, out, f"{what} presort with ep_layout")
+            ones = torch.ones(E, dtype=torch.int32)
+            aux, _ = presort(ids, w, block_m, None, None)
+            out = moe(hidden, w, ids, ones, aux=aux)
+            expect_sorts(1, f"{what} presort under a mask")
+            check_close(ref, out, f"{what} presort under a mask")
+
+        # CUDA graph: router sort + registration + fused_moe captured together,
+        # replayed on new routing written into the same tensors.
+        s_hidden, s_w, s_ids = hidden.clone(), w.clone(), ids.clone()
+
+        def step():
+            aux, buf = presort(s_ids, s_w, block_m, mask, layout)
+            return moe(s_hidden, s_w, s_ids, mask, output=buf, aux=aux)
+
+        def replay(graph, gout, seed, what_g):
+            hidden2, w2, ids2 = route(token, seed)
+            s_hidden.copy_(hidden2)
+            s_w.copy_(w2)
+            s_ids.copy_(ids2)
+            graph.replay()
+            graph.replay()
+            torch.cuda.synchronize()
+            gref = moe(hidden2, w2, ids2, mask)
+            sort_calls.clear()
+            check_close(gref, gout, what_g)
+            return calc_diff(gref, gout)
+
+        graph, gout = capture(step)
+        expect_sorts(0, f"{what} captured presort")
+        gerr = replay(graph, gout, 1000 + token, f"{what} graph replay")
+        if ep:
+            # Updated in place since its last check: not trusted under capture,
+            # so the graph keeps fused_moe's own sort.
+            mask.fill_(0)
+            mask.copy_(rank_mask(1))
+            graph, gout = capture(step, warmup=False)
+            expect_sorts(1, f"{what} capture after a mask update")
+            replay(graph, gout, 2000 + token, f"{what} graph after a mask update")
+        return {
+            "EP": ep,
+            "token": token,
+            "block_m": block_m,
+            "own vs own": calc_diff(ref, ref2),
+            "presort vs own": err,
+            "graph vs own": gerr,
+        }
+
+    # Torch reference: test_fmoe runs the no-EP calls with a registered plain
+    # presort, built inside each call as test_fmoe rotates its inputs.
+    def presorted_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **k):
+        block_m = fm.plain_sort_block_m(topk_ids.shape[0], E, topk)
+        if block_m is not None:
+            aux, _ = presort(topk_ids, topk_weights, block_m, None, None)
+            fm.register_presorted_moe(aux)
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **k)
+
+    # (EP, token, block_m the tuned table runs that call with)
+    cases = ((True, 16, 32), (True, 9000, 64), (False, 16, 32), (False, 200, 64))
+    rows = []
+    torch.manual_seed(0)
+    presorted_moe.forget_ep_mask()
+    try:
+        fm.moe_sorting = counting_sorting
+        for ep in (True, False):
+            moe = make_moe(65 if ep else E)
+            for _, token, block_m in (c for c in cases if c[0] == ep):
+                rows.append(run_case(moe, ep, token, block_m))
+                gc.collect()
+                torch.cuda.empty_cache()
+            del moe
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        for token, block_m in ((16, 32), (200, 64)):
+            fused_moe = presorted_fused_moe
+            sort_calls.clear()
+            torch.manual_seed(token)
+            ret = test_fmoe(
+                dtype=dtype,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=E,
+                topk=topk,
+                actType=aiter.ActivationType.Silu,
+                gateMode=GateMode.SEPARATED.value,
+                qType=aiter.QuantType.per_1x32,
+                AQDType=dtypes.fp4x2,
+                WQDType=dtypes.fp4x2,
+                use_g1u1=True,
+                check_aot_cache=False,
+            )
+            fused_moe = real_fused_moe
+            # A shape seen for the first time learns block_m with the own sort.
+            assert len(sort_calls) <= 1, f"token={token}: presort unused in test_fmoe"
+            assert fm.plain_sort_block_m(token, E, topk) == block_m
+            for row in rows:
+                if not row["EP"] and row["token"] == token:
+                    row["presort vs torch ref"] = ret["logits_diff"]
+            gc.collect()
+            torch.cuda.empty_cache()
+    finally:
+        fused_moe = real_fused_moe
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+        presorted_moe.forget_ep_mask()
+    aiter.logger.info(
+        "moe_2stage plain presorted MoE hook summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    aiter.logger.info("moe_2stage: plain presorted MoE hook contract passed")
+
+
 # Module scope: registering the op again in the same process raises.
 _CONSUMED_PRESORT_LAYERS = []
 
@@ -3255,15 +3752,18 @@ else:
     test_presorted_moe_layout_mismatch()
     test_presorted_moe_ignored_is_logged()
     test_presorted_moe_compile_order()
-    # The hook test quantizes E=896 weights and times three candidates; skip it
-    # for an explicit CLI quant sweep, like the tuned-CSV validation above.
+    test_plain_presorted_moe_ep_mask()
+    # The hook tests quantize E=896 / E=257 weights and time candidates; skip
+    # them for an explicit CLI quant sweep, like the tuned-CSV validation above.
     if args.quant is not None:
-        aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
-    elif get_gfx() == "gfx950":
+        aiter.logger.info("skipping presorted MoE hook tests for a --quant sweep")
+    elif get_gfx_runtime() == "gfx950":
         test_presorted_moe_hook()
+        test_plain_presorted_moe_hook()
     else:
         aiter.logger.warning(
-            "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
+            "%s: skipping presorted MoE hook tests (a4w4 is gfx950-only)",
+            get_gfx_runtime(),
         )
 case_iter = itertools.chain(*_case_iters)
 
