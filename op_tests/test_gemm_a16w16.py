@@ -779,6 +779,58 @@ def test_asm_last_tile_at_allocation_end():
                 )
 
 
+def test_asm_skinny_m_at_allocation_end():
+    """M = 1 or 2 (all of A is one or two rows) with A ending an allocation.
+
+    ROCm/aiter#5781: bf16gemm_fp32bf16_tn_* faulted at M=1, N=1536, K=128 (and
+    K=64). Every kernel must be exact at that size, and a split-K kernel (which
+    needs two K blocks) must be refused at K=64 instead of being launched
+    without a semaphore, which faults at address 0. The heuristic, which picks
+    from the same table, must not pick such a kernel.
+    """
+    torch.cuda.empty_cache()
+    buf = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+    n = 1536
+
+    def a_at_end(m, k):
+        x = buf[buf.numel() - m * k * 2 :].view(dtypes.bf16).view(m, k)
+        x.copy_(torch.randn(m, k, dtype=dtypes.bf16, device="cuda"))
+        return x
+
+    for m in (1, 2):
+        for k in (64, 128):
+            x = a_at_end(m, k)
+            w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+            for split_k in (False, True):
+                # Split-K adds partial sums in the output dtype: FP32 stays exact.
+                otype = dtypes.fp32 if split_k else dtypes.bf16
+                out = torch.empty(m, n, dtype=otype, device="cuda")
+                for kn in _asm_kernels(split_k):
+                    bps = bool(kn.bPreshuffle)
+                    case = f"skinny {(m, n, k)} {otype}"
+                    if split_k and k < 2 * kn.subK:
+                        for split in (None, 2):
+                            wk = shuffle_weight(w, layout=(16, 16)) if bps else w
+                            try:
+                                aiter.gemm_a16w16_asm(
+                                    x, wk, out, None, split, kn.knl_name, bps
+                                )
+                            except RuntimeError as e:
+                                assert "needs K >= 2 * subK" in str(e), str(e)
+                            else:
+                                raise AssertionError(
+                                    f"asm {kn.knl_name} {case} split={split} was launched"
+                                )
+                        continue
+                    split = 2 if split_k else 1
+                    _check_asm_exact(x, w, out, kn.knl_name, bps, split, case)
+            # No kernel name: the heuristic picks, and must pick a safe kernel.
+            out = torch.empty(m, n, dtype=dtypes.fp32, device="cuda")
+            for bps in (False, True):
+                case = f"skinny {(m, n, k)} heuristic"
+                _check_asm_exact(x, w, out, None, bps, None, case)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -796,7 +848,7 @@ parser.add_argument(
           or -t out    # tgemm.mm(out=) on every backend
           or -t compile    # torch.compile with weights/biases in one storage
           or -t asm_4g    # asm with A or out of 4 GiB, and A ending
-                          # an allocation with a 1-row last tile""",
+                          # an allocation with a 1-row last tile or M <= 2""",
 )
 parser.add_argument(
     "-d",
@@ -888,6 +940,7 @@ for test in args.test:
         df += test_gemm_compile_packed_params()
     elif test == "asm_4g":
         test_asm_last_tile_at_allocation_end()
+        test_asm_skinny_m_at_allocation_end()
         test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
