@@ -1481,12 +1481,7 @@ set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 # launches only on the device it was compiled on); entries on disk are shared.
 bind_aot(
     gemm_a16w16_gfx950,
-    FlyDSLAotCache(
-        "gemm_a16w16_gfx950",
-        sources=[
-            "kernels/gemm_a16w16_gfx950_utils.py",
-        ],
-    ),
+    FlyDSLAotCache("gemm_a16w16_gfx950"),
     (),
 )
 _PARAM_ITEMS = {}
