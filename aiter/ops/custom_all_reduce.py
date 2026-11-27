@@ -36,6 +36,19 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_add(
+    _fa: int,
+    inp: torch.Tensor,
+    addend: torch.Tensor,
+    out: torch.Tensor,
+    use_new: bool,
+    open_fp8_quant: bool,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce_residual(
     _fa: int,
     inp: torch.Tensor,
@@ -44,6 +57,14 @@ def all_reduce_residual(
     reg_inp_ptr: int,
     reg_inp_bytes: int,
 ) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_one_shot(
+    _fa: int,
+    inp: torch.Tensor,
+    registered_input: bool,
+) -> bool: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -415,6 +436,25 @@ def fused_allreduce_rmsnorm_lamport_gfx1250(
 ) -> None: ...
 
 
+# The same with the per-token FP8 quant of fused_allreduce_rmsnorm_quant_gfx1250:
+# out FP8, one fp32 scale a row, and the bf16/fp16 output at bf16_out_ptr unless 0.
+@compile_ops(
+    GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant_lamport", develop=True
+)
+def fused_allreduce_rmsnorm_quant_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
+) -> None: ...
+
+
 # Lamport one-shot all-reduce of inp + other, on the same inbox as the fused
 # AR + RMSNorm above (init_lamport_ar_rms_gfx1250).
 @compile_ops(GFX1250_MD_NAME, fc_name="allreduce_add_lamport", develop=True)
@@ -423,6 +463,19 @@ def allreduce_add_lamport_gfx1250(
     inp: torch.Tensor,
     other: torch.Tensor,
     out: torch.Tensor,
+) -> None: ...
+
+
+# Lamport all-reduce of inp, on the same inbox as the fused AR + RMSNorm above:
+# one-shot (fp16/bf16), or with two_shot a reduce-scatter and an all-gather
+# (fp16/bf16/fp32), one lane a pack, or with split in wave groups a step.
+@compile_ops(GFX1250_MD_NAME, fc_name="allreduce_lamport", develop=True)
+def allreduce_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    two_shot: bool,
+    split: bool = False,
 ) -> None: ...
 
 
@@ -464,6 +517,21 @@ def meta_size_gfx1250(world_size: int = 8) -> int: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="ll_ar_max_bytes", develop=True)
 def ll_ar_max_bytes_gfx1250(world_size: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="dcp_merge_max_rows", develop=True)
+def dcp_merge_max_rows_gfx1250(_fa: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="dcp_merge", develop=True)
+def dcp_merge_gfx1250(
+    _fa: int,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    owned_ptr: int,
+    out: torch.Tensor,
+    out_lse_ptr: int,
+) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)

@@ -144,8 +144,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-dpx-1
+            label: MI350X-DPX
           - runner: aiter-gfx1100
             label: RDNA3
             optional: true
@@ -257,9 +257,9 @@ jobs:
             |& tee benchmark_fa_triton_${{ matrix.label }}.log
 
       # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
-      # (all arches) and on push-to-main for MI35X, where the baseline is published.
+      # (all arches) and on push-to-main for MI350X DPX, where the baseline is published.
       - name: Run MHA bench (v2)
-        if: ${{ github.event_name != 'push' || matrix.label == 'MI35X' }}
+        if: ${{ github.event_name != 'push' || matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 60
         run: |
           set -o pipefail
@@ -267,7 +267,7 @@ jobs:
             |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
 
-      # Full correctness suite (output + varlen + kvcache) — runs on MI35X (and any
+      # Full correctness suite (output + varlen + kvcache) runs on MI350X DPX (and any
       # non-RDNA arch). RDNA3 has its own reduced version below.
       - name: PR correctness tests (v2)
         if: ${{ github.event_name != 'push' && matrix.label != 'RDNA3' }}
@@ -284,7 +284,7 @@ jobs:
           docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-pr-rdna3
 
       - name: Post-merge correctness tests (v2)
-        if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name == 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 360
         run: |
           docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-full
@@ -300,7 +300,7 @@ jobs:
       # Flash Attention v3 (Hopper)
       # ===========================================
       - name: Generate Dockerfile (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: |
           cat <<'EOF' > Dockerfile.triton_v3
           FROM ${{ env.BASE_IMAGE }}
@@ -328,11 +328,11 @@ jobs:
           EOF
 
       - name: Build Docker image (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: docker build -t fa_triton_v3_test:ci -f Dockerfile.triton_v3 .
 
       - name: Start CI container (v3)
-        if: ${{ matrix.label == 'MI35X' }}
+        if: ${{ matrix.label == 'MI350X-DPX' }}
         run: |
           docker ps -aq -f name=fa_triton_v3_test | xargs -r docker stop | xargs -r docker rm || true
 
@@ -357,19 +357,19 @@ jobs:
             fa_triton_v3_test:ci
 
       - name: PR correctness tests (v3)
-        if: ${{ github.event_name != 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name != 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 90
         run: |
           docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-pr
 
       - name: Post-merge correctness tests (v3)
-        if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
+        if: ${{ github.event_name == 'push' && matrix.label == 'MI350X-DPX' }}
         timeout-minutes: 360
         run: |
           docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-full
 
       - name: Clean up v3 container
-        if: ${{ always() && matrix.label == 'MI35X' }}
+        if: ${{ always() && matrix.label == 'MI350X-DPX' }}
         run: |
           docker stop fa_triton_v3_test || true
           docker rm -f fa_triton_v3_test || true
@@ -381,10 +381,10 @@ jobs:
       # The single home for the MHA bench CSV: the current-run source for the PR
       # perf compare (fa_mha_bench job) AND, on push-to-main, the baseline it diffs
       # against (fetched by commit). One artifact, 90-day retention so a baseline
-      # outlives the raw run. Uploaded on PRs (all arches) and push-to-main (MI35X,
+      # outlives the raw run. Uploaded on PRs (all arches) and push-to-main (MI350X DPX,
       # for the baseline). push only fires on main, so no ref guard is needed.
       - name: Upload benchmark results
-        if: ${{ success() && (github.event_name != 'push' || matrix.label == 'MI35X') }}
+        if: ${{ success() && (github.event_name != 'push' || matrix.label == 'MI350X-DPX') }}
         # Best-effort: the bench already ran, and GitHub's artifact backend times out
         # transiently (CreateArtifact), so an upload flake must not fail the whole bench
         # job. A missing artifact just means the PR compare warns "no baseline" (warn-only).
@@ -405,7 +405,7 @@ jobs:
   # compare_mha.py (throughput, higher=faster) and write the table to the job
   # summary. Warn-only. CPU-only (compare_mha.py is stdlib, no GPU), so it runs
   # off the GPU runner. Mirrors the tuned_op_bench job in aiter-test.yaml.
-  # CSVs come from the MI35X leg only (single arch, no cross-arch noise).
+  # CSVs come from the MI350X DPX leg only (single arch, no cross-arch noise).
   fa_mha_bench:
     name: FA MHA Bench
     if: >-
@@ -418,11 +418,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download current MHA bench CSV (MI35X)
+      - name: Download current MHA bench CSV (MI350X DPX)
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: flash-attention-triton-benchmark-MI35X
+          name: flash-attention-triton-benchmark-MI350X-DPX
           path: /tmp/current/
 
       - name: Locate current CSV
@@ -430,7 +430,7 @@ jobs:
         run: |
           csv=$(find /tmp/current -name bench_mha.csv 2>/dev/null | head -1)
           if [[ -z "$csv" ]]; then
-            echo "::warning::No current MHA bench CSV found (MI35X leg may have failed); skipping perf compare."
+            echo "::warning::No current MHA bench CSV found (MI350X DPX leg may have failed); skipping perf compare."
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -446,7 +446,7 @@ jobs:
         with:
           workflow: flash_attention_integration.yaml
           commit: ${{ github.event.pull_request.base.sha }}
-          name: flash-attention-triton-benchmark-MI35X
+          name: flash-attention-triton-benchmark-MI350X-DPX
           path: /tmp/baseline_pinned/
           # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
           # baseline. false is v6+'s default, stated so a flip cannot undo it.
@@ -461,7 +461,7 @@ jobs:
         with:
           workflow: flash_attention_integration.yaml
           branch: main
-          name: flash-attention-triton-benchmark-MI35X
+          name: flash-attention-triton-benchmark-MI350X-DPX
           path: /tmp/baseline_main/
           allow_forks: false
           if_no_artifact_found: warn
@@ -486,7 +486,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "## FA MHA Bench (vs main baseline, MI35X)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## FA MHA Bench (vs main baseline, MI350X DPX)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           python3 op_tests/op_benchmarks/triton/compare_mha.py \
             "$baseline_csv" /tmp/current.csv | tee -a "$GITHUB_STEP_SUMMARY"
@@ -587,7 +587,7 @@ jobs:
     # if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
     name: Flash Attention - CK (1 GPU)
     needs: [check-signal, prechecks, ci_config]
-    runs-on: linux-aiter-mi35x-1
+    runs-on: linux-aiter-do-mi350x-dpx-1
     env:
       BASE_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 

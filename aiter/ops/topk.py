@@ -13,6 +13,24 @@ from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
 from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
+from . import topk_decode_gate as _gate
+
+# Re-exported: callers and tests reach the gate through this module.
+from .topk_decode_gate import (
+    _ADAPTIVE_BANDS,  # noqa: F401
+    _ADAPTIVE_BANDS_BY_K_GROUP,  # noqa: F401
+    _ADAPTIVE_WIDTHS,  # noqa: F401
+    _FLYDSL_TOPK_DECODE_GATES,  # noqa: F401
+    _FLYDSL_TOPK_DECODE_KS,  # noqa: F401
+    BACKEND_ADAPTIVE,  # noqa: F401
+    BACKEND_DEFAULT,
+    BACKEND_SINGLE,  # noqa: F401
+    _decode_backend,  # noqa: F401
+    _in_bands,  # noqa: F401
+    decode_adaptive_gate_width,  # noqa: F401
+    decode_adaptive_width,  # noqa: F401
+    decode_backend_for_shape,
+)
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -353,6 +371,22 @@ def moe_fused_gate(
     return topk_weights, topk_ids
 
 
+def _biased_grouped_topk_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``topk_weights``
+    and ``topk_ids`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+# Every path below writes topk_weights and topk_ids and nothing else, so the
+# list is exact rather than "unknown" (#7926).
+@_route(
+    op="biased_grouped_topk",
+    version=1,
+    fake=_biased_grouped_topk_fake,
+    mutates_args=["topk_weights", "topk_ids"],
+)
 def biased_grouped_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -363,7 +397,30 @@ def biased_grouped_topk(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_valid_rows: torch.Tensor | None = None,  # see topk_gating
-):
+) -> None:
+    """Pick each token's top-k experts by sigmoid score plus a bias, in groups.
+
+    Writes ``topk_weights`` and ``topk_ids`` in place and returns None; no
+    other argument is written. ``topk`` is ``topk_ids.shape[1]``.
+
+    The score of an expert is ``sigmoid(gating_output)``. Experts are chosen
+    by score plus ``correction_bias``, which counts for the choice only, from
+    the ``topk_group`` best of ``num_expert_group`` equal groups of experts;
+    ``biased_grouped_topk_torch`` is the reference. The weights are the
+    unbiased scores of the chosen experts, divided by their sum when
+    ``need_renorm``, times ``routed_scaling_factor``.
+
+    ``num_valid_rows``: optional int32 device tensor whose first element is the
+    count of real rows. Rows at or past it are padding: their ids are written
+    -1 (which expert-parallel dispatch skips) and their weights 0. Read on
+    device, so a replayed CUDA graph follows each step's count.
+
+    With ``AITER_FLYDSL_USE_HERD=1``, a call with one group on gfx950 whose
+    row count and model profile HERD takes is answered by HERD routing
+    instead: top-(k+1) candidates and a drop by batch popularity, whose routes
+    are not the exact top-k above. A provider computing the exact top-k must
+    decline those calls.
+    """
     if (
         num_expert_group == 1
         and topk_group == 1
@@ -1191,57 +1248,10 @@ def _top_k_per_row_decode(
 ) -> None: ...
 
 
-_FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
-    "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
-) in ("1", "true", "True", "yes", "YES")
-
-# Dispatch uses physical width because seq_lens is device-resident; padded rows
-# with short effective lengths may therefore enter a long-row gate.
-# (minimum width, maximum width, maximum rows), with inclusive bounds.
-_FLYDSL_TOPK_DECODE_GATES = {
-    "gfx942": {
-        True: (
-            (0, 20_000, 64),
-            (131_072, None, 16),
-        ),
-        False: ((524_288, None, 32),),
-    },
-    "gfx950": {
-        True: (
-            (0, 20_000, 128),
-            (32_768, 65_535, 16),
-            (65_536, 131072, 32),
-            (131072, 200_000, 48),
-            (200_000, None, 128),
-        ),
-        False: ((131_072, None, 32),),
-    },
-}
-_FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
-
-
-@functools.lru_cache(maxsize=128)
-def _flydsl_topk_decode_shape_supported(
-    arch: str,
-    stable: bool,
-    width: int,
-    num_rows: int,
-    k: int,
-) -> bool:
-    if k not in _FLYDSL_TOPK_DECODE_KS:
-        return False
-    return any(
-        min_width <= width
-        and (max_width is None or width <= max_width)
-        and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
-    )
-
-
-def _should_use_flydsl_topk_decode(
+def decode_backend_for_call(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -1249,34 +1259,24 @@ def _should_use_flydsl_topk_decode(
     k: int,
     stable: bool,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
     *,
     width: int | None = None,
-) -> bool:
-    """Whether the call goes to the FlyDSL decode top-k: gated by the row
-    width -- the logits' own, or the plane ``width`` packed rows stand for."""
-    if (
-        _FLYDSL_TOPK_DECODE_DISABLED
-        or not isinstance(logits, torch.Tensor)
-        or logits.ndim != 2
-    ):
-        return False
+) -> str:
+    """The backend this call should run, shape rule and tensor contract together.
 
-    arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES:
-        return False
-
-    if not _flydsl_topk_decode_shape_supported(
-        arch,
-        stable,
-        logits.shape[1] if width is None else width,
-        num_rows,
-        k,
-    ):
-        return False
+    `width` is the plane width packed rows stand for, and defaults to the
+    logits' own.
+    """
+    backend = decode_backend_for_shape(
+        logits, seq_lens, num_rows, k, stable, values, max_row_len, width=width
+    )
+    if backend == BACKEND_DEFAULT:
+        return BACKEND_DEFAULT
 
     from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
-    return is_flydsl_top_k_per_row_decode_supported(
+    supported = is_flydsl_top_k_per_row_decode_supported(
         logits,
         next_n,
         seq_lens,
@@ -1287,6 +1287,7 @@ def _should_use_flydsl_topk_decode(
         k,
         values,
     )
+    return backend if supported else BACKEND_DEFAULT
 
 
 def _hip_top_k_per_row_decode(
@@ -1326,7 +1327,7 @@ def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
+@_route(op="top_k_per_row_decode", version=2, fake=_top_k_per_row_decode_fake)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -1338,12 +1339,14 @@ def top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel; the scratch
-    workspace is allocated + cached on the Python side and passed in, so the C++
+    """Per-row top-k (decode). `decode_backend_for_call` picks the kernel: the
+    one-block kernel, or a FlyDSL kernel on shapes where it is measured faster.
+    Scratch is allocated and cached on the Python side and passed in, so the C++
     side never allocates device scratch.
 
     When stable=True, the deterministic ascending-ordered, smallest-index
@@ -1355,6 +1358,16 @@ def top_k_per_row_decode(
     with -1 and the score with -inf, so the padding sorts below every real
     candidate and a consumer that ranks these scores needs no extra mask.
 
+    `max_row_len` is an upper bound on every `seqLens` entry, for a `logits`
+    buffer sized to a maximum context that decode only partly fills. Stating it
+    opts the call into the adaptive path; `None`, or a bound below 1, declines
+    that path only.
+
+    It sizes the kernel, never the read: rows are still read to `seqLens`. A
+    bound below a live row stays exact but runs slower; one far above builds a
+    larger kernel than needed. Under graph capture pass the model's maximum
+    context, since a bound that picks a new config compiles on its first call.
+
     Packed rows: ``logits`` is a flat buffer, row r's scores at element
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
     indices relative to that start. ``plane_width`` is the width of the plane
@@ -1363,9 +1376,9 @@ def top_k_per_row_decode(
     if row_starts is not None:
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,
-            row_starts, plane_width,
+            row_starts, plane_width, max_row_len,
         )  # fmt: skip
-    if _should_use_flydsl_topk_decode(
+    backend = decode_backend_for_call(
         logits,
         next_n,
         seqLens,
@@ -1376,8 +1389,12 @@ def top_k_per_row_decode(
         k,
         stable,
         values,
-    ):
-        return flydsl_top_k_per_row_decode(
+        max_row_len=max_row_len,
+    )
+    if backend != BACKEND_DEFAULT:
+        from .flydsl.topk.topk_per_row import _decode_with_backend
+
+        return _decode_with_backend(
             logits,
             next_n,
             seqLens,
@@ -1388,10 +1405,13 @@ def top_k_per_row_decode(
             k,
             stable,
             values,
+            backend,
+            max_row_len,
+            validated=True,
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
-    if not _FLYDSL_TOPK_DECODE_DISABLED:
+    if not _gate._FLYDSL_TOPK_DECODE_DISABLED:
         from .flydsl.topk.topk_per_row import (
             _is_flydsl_radix_topk_one_block_supported,
         )
@@ -1466,6 +1486,7 @@ def _top_k_per_row_decode_packed(
     values: torch.Tensor | None,
     row_starts: torch.Tensor,
     plane_width: int | None,
+    max_row_len: int | None = None,
 ) -> None:
     """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
     ``plane_width`` plane would get, reading each row at its start. The HIP
@@ -1476,40 +1497,23 @@ def _top_k_per_row_decode_packed(
         raise ValueError("packed logits must be a contiguous flat buffer")
     if row_starts.dtype != torch.int32 or row_starts.shape != (num_rows,):
         raise ValueError("row_starts must be int32 [num_rows]")
-    if _FLYDSL_TOPK_DECODE_DISABLED:
+    if _gate._FLYDSL_TOPK_DECODE_DISABLED:
         raise ValueError("packed rows need the FlyDSL decode top-k")
     from .flydsl.topk import topk_per_row as flydsl_topk
 
     # The kernels take their input as [rows, width] and validate it so; every
     # row of this view is the buffer itself, a row's start added in-kernel.
     view = flat.as_strided((num_rows, flat.numel()), (0, 1))
-    if _should_use_flydsl_topk_decode(
-        view,
-        next_n,
-        seq_lens,
-        indices,
-        num_rows,
-        0,
-        1,
-        k,
-        stable,
-        values,
-        width=plane_width,
-    ):
-        return flydsl_topk.flydsl_top_k_per_row_decode(
-            view,
-            next_n,
-            seq_lens,
-            indices,
-            num_rows,
-            0,
-            1,
-            k,
-            stable,
-            values,
-            row_starts=row_starts,
-            plane_width=plane_width,
-        )
+    backend = decode_backend_for_call(
+        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        max_row_len=max_row_len, width=plane_width,
+    )  # fmt: skip
+    if backend != BACKEND_DEFAULT:
+        return flydsl_topk._decode_with_backend(
+            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+            backend, max_row_len, row_starts=row_starts, plane_width=plane_width,
+            validated=True,
+        )  # fmt: skip
     return flydsl_topk.flydsl_radix_topk_one_block(
         view,
         row_starts,
@@ -1638,11 +1642,14 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
+
+    `top_k_per_row_decode` holds the `max_row_len` contract.
     """
     from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
@@ -1659,6 +1666,7 @@ def flydsl_top_k_per_row_decode(
         k,
         stable,
         values,
+        max_row_len,
     )
 
 

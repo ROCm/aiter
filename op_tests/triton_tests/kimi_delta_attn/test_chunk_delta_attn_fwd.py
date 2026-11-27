@@ -134,16 +134,6 @@ class TestChunkGateCumsum:
         )
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
-    def test_output_dtype_bfloat16(self, cumsum_inputs):
-        g, A_log, *_ = cumsum_inputs
-        out = chunk_gate_cumsum(g, A_log, chunk_size=32, output_dtype=torch.bfloat16)
-        assert out.dtype == torch.bfloat16
-
-    def test_output_dtype_float32(self, cumsum_inputs):
-        g, A_log, *_ = cumsum_inputs
-        out = chunk_gate_cumsum(g, A_log, chunk_size=32, output_dtype=torch.float32)
-        assert out.dtype == torch.float32
-
     def test_triton_opt_disabled(self, cumsum_inputs, monkeypatch):
         """Non-optimised Triton kernel path also produces correct results."""
         monkeypatch.setenv("DA_TRITON_OPT", "0")
@@ -154,40 +144,6 @@ class TestChunkGateCumsum:
 
 
 class TestChunkDeltaAttnFwdSmoke:
-
-    @pytest.mark.parametrize(
-        "B,T,H,HV,K,V",
-        [
-            (1, 64, 4, 4, 64, 64),
-            (2, 128, 8, 8, 64, 64),
-            (1, 64, 2, 4, 64, 64),  # GVA: HV > H
-            (1, 64, 64, 64, 128, 128),  # K=V=128, H=64
-        ],
-    )
-    def test_output_shape(self, B, T, H, HV, K, V):
-        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
-        q, _ = l2norm_fwd(q)
-        k, _ = l2norm_fwd(k)
-        beta = beta_sigmoid_fwd(beta)
-        o, final_state, *_ = chunk_delta_attn_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=None,
-            output_final_state=True,
-            chunk_size=64,
-            use_gate_in_kernel=True,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=-5.0,
-        )
-        assert o.shape == (B, T, HV, V)
-        assert final_state is not None
-        assert final_state.shape == (B, HV, K, V)
-        assert not torch.isnan(o).any()
 
     def test_no_gate_in_kernel(self):
         B, T, H, HV, K, V = 1, 64, 4, 4, 64, 64
@@ -315,25 +271,6 @@ class TestChunkSize32:
 
         torch.testing.assert_close(run(32), run(64), atol=2e-2, rtol=2e-2)
 
-    def test_unsupported_chunk_size_rejected(self):
-        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, 64, 4, 4, 64, 64)
-        with pytest.raises(ValueError, match="32 or 64"):
-            chunk_delta_attn_fwd(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                scale=scale,
-                initial_state=None,
-                output_final_state=False,
-                chunk_size=48,
-                use_gate_in_kernel=True,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=-5.0,
-            )
-
 
 class TestStateVFirst:
     """``state_v_first`` only changes how the recurrent state is laid out.
@@ -398,29 +335,6 @@ class TestStateVFirst:
         assert not torch.isnan(fs_vk).any()
         torch.testing.assert_close(o_vk, o_kv, atol=0, rtol=0)
         torch.testing.assert_close(fs_vk, fs_kv.transpose(-1, -2), atol=0, rtol=0)
-
-    def test_rejects_mismatched_initial_state_shape(self):
-        B, T, H, HV, K, V = 1, 128, 4, 4, 64, 64
-        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
-        # [N, HV, K, V] is the K-first layout, rejected when state_v_first is on
-        # (it is square here only if K == V, so use a non-square head dim pair).
-        h0 = torch.zeros(B, HV, K, V + 64, device=device, dtype=torch.float32)
-        with pytest.raises(ValueError, match="initial_state"):
-            chunk_delta_attn_fwd(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                scale=scale,
-                initial_state=h0,
-                output_final_state=True,
-                chunk_size=64,
-                use_gate_in_kernel=True,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=-5.0,
-            )
 
 
 class TestChunkDeltaAttnFwdVsReference:

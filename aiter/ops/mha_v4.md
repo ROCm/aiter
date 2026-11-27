@@ -5,22 +5,26 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4/6/8 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense BF16 and MXFP4/6/8 on
+  GFX950.
 - BF16 BSHD output.
 - Dense, sorted block-sparse, and Sol-Attn inference.
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row. Entries clamp to the padded
-  key extent, and a null pointer lets one object serve dense and varlen. Sorted sparse and GFX942
-  reject it.
-- Log-sum-exp via `return_lse` on GFX950, wherever the selected manifest row declares `lse`, which
-  today is every dense, sparse and Sol-Attn row. GFX942 rejects it until its exported value is
-  measured. The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
+- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row and the dense `BF16 Q/K` rows
+  of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve dense
+  and varlen. Every other GFX942 recipe and the sorted-sparse path reject it.
+- Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 and
+  GFX942 that is every row.
+  The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
   format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
   nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
   mixed recipes.
-- No backward, dropout, RNG state, causal, or Q-side varlen support yet.
+- Whole documents in THD via `cu_seqlens`, causal or not, for all-BF16 operands at head dimension
+  256 on GFX950: Q `[total, Hq, 256]` and K/V `[total, Hkv, 256]` for any `Hq % Hkv == 0`, one
+  `cu_seqlens` for Q and K. Token offsets are 64-bit, so a pack may exceed 4 GiB.
+- No backward, dropout, RNG state, BSHD causal mask, or separate Q and K document lengths yet.
 
 Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
 same V packing and scale modes, and every Sol-Attn row uses that packing too.
@@ -38,12 +42,13 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 | MXFP6 | MXFP4 | dense, sparse, Sol-Attn |
 | MXFP4 | MXFP4 | dense, sparse, Sol-Attn |
 
-GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-Attn rows.
+GFX942 ships BF16/BF16, BF16/FP8, and per-tensor FP8/FP8 and INT8/FP8, each in all three modes.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
-Head dimension 256 exists only for all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands, dense, on
-GFX950. Every other recipe, sorted sparse, and GFX942 reject it.
+Head dimension 256 exists only for all-BF16, all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands,
+dense, on GFX950. Every other recipe, sorted sparse, and GFX942 reject it. All-BF16 also has the
+THD rows there, which exist at no other head dimension.
 
 ## Ownership
 
@@ -128,6 +133,28 @@ storage validate a selected row; they never select one. Omitting raw scale modes
 canonical recipe from `scale_modes_for_formats()`; supplying them requires all three modes and
 selects another explicitly supported recipe such as MXFP8.
 
+Pass `cu_seqlens` to `mha_v4` for documents concatenated along the token axis (THD):
+
+```python
+output, lse = mha_v4(
+    query,  # [total_tokens, Hq, 256]
+    key,  # [total_tokens, Hkv, 256]
+    value,
+    *(AttentionFormat.BF16,) * 3,
+    cu_seqlens=cu_seqlens,  # int32 [batch + 1], shared by Q and K
+    max_seqlen=max_seqlen,  # the longest document
+    causal=True,
+    return_lse=True,  # [Hq, total_tokens]
+    kv_splits="auto",
+)
+```
+
+The manifest's `mode` 3 rows serve it, one per `mask`. `kv_splits` slices each work-group's key
+walk inside the one launch on rows declaring `kv_range`, and the slices are merged by their LSE
+like the dense key ranges; a slice keeps at least 256 keys of the longest document's walk. The
+partials are FP32. On a row declaring `pair_split`, a causal pair's 2-5 slices run on one more
+work-group than slices when that fits the device's CUs, which the launcher passes in.
+
 ## Packed Layouts
 
 MX producers return contiguous raw buffers when the ASM layout is not representable as an ordinary
@@ -172,7 +199,8 @@ Raw callers pass an optional boolean `block_mask`:
 - geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
 - gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8,
-  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8.
+  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8;
+- gfx942 ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16 and BF16/FP8.
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
 arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the

@@ -232,10 +232,12 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
                                    const int32_t partial_lse_seq_byte_offset,
                                    LocalLse& local_lse,
                                    float* p_lds_lse_scale,
-                                   gmem_final_lse_t& g_final_lse)
+                                   gmem_final_lse_t& g_final_lse,
+                                   const bool wait_for_readers)
 {
     using lse_t = typename gmem_final_lse_t::scalar_type;
 
+    float global_lse = INFINITY; // warp 0 only
     if(warp_idx == 0)
     {
         const int32_t lane_idx = opus::lane_id();
@@ -300,8 +302,21 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
             aiter::warpReduce<aiter::AddFunctor, decltype(sum_lse), opus::get_warp_size()>(sum_lse);
 
         // Get global LSE
-        float global_lse =
+        global_lse =
             ((sum_lse == 0.f) || (sum_lse != sum_lse)) ? INFINITY : (logf(sum_lse) + max_lse);
+    }
+
+    // p_lds_lse_scale still holds the previous row's scales, which the other
+    // warps may be reading: wait for them before overwriting. Computing the
+    // weights first keeps warp 0's loads in flight while they finish.
+    if(wait_for_readers)
+    {
+        __syncthreads();
+    }
+
+    if(warp_idx == 0)
+    {
+        const int32_t lane_idx = opus::lane_id();
         if(params.output_lse)
         {
             if(lane_idx == 0)
@@ -549,7 +564,8 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
                                                  partial_lse_seq_byte_offset,
                                                  local_lse,
                                                  p_lds_lse_scale,
-                                                 g_final_lse);
+                                                 g_final_lse,
+                                                 seq_idx != final_loc.q_start + block_idx);
 
         __syncthreads();
 

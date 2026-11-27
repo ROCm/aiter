@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import functools
 import itertools
 import math
 import shutil
@@ -12,15 +13,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import triton
-from triton.testing import runtime
 
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 DEVICE = "cuda"
@@ -40,6 +45,38 @@ def purge_cache() -> None:
     """Delete Triton's on-disk cache so each (M,K) recompiles once."""
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _generate_topk_pool_inputs(B: int, M: int) -> tuple[torch.Tensor]:
+    """One rotating-buffer pool entry: a fresh (B, M) fp32 input. The
+    outputs are allocated inside topk itself, so only x rotates."""
+    return (torch.rand(B, M, device=DEVICE, dtype=torch.float32),)
+
+
+_POOL_KEYS = ["x"]
+
+
+def _bench_rot(bencher: RotatingBufferBench, B: int, M: int, fn) -> float:
+    """Build a rotating pool of (B, M) inputs and time ``fn(x)`` over it.
+    Returns the mean per-call latency in ms."""
+    bencher.build_pool(
+        [functools.partial(_generate_topk_pool_inputs, B, M)], [_POOL_KEYS]
+    )
+    return bencher.bench(fn)
+
+
+def _triton_topk_fn(k: int):
+    def fn(x):
+        return triton_topk(x, k, largest=True, sorted=True)
+
+    return fn
+
+
+def _torch_topk_fn(k: int):
+    def fn(x):
+        return x.topk(k, dim=1, largest=True, sorted=True)
+
+    return fn
 
 
 def _flopmem_one_stage(B: int, M: int, K: int, val_b: int, idx_b: int = 8) -> _FlopMem:
@@ -75,28 +112,27 @@ class RoofDot:
     P: float  # FLOPs / s
 
 
-def _measure_topk(batch: int, M: int, K: int) -> tuple[float, _FlopMem]:
-    x = torch.rand(batch, M, device=DEVICE, dtype=torch.float32)
+def _measure_topk(
+    bencher: RotatingBufferBench, batch: int, M: int, K: int
+) -> tuple[float, _FlopMem]:
+    elem_size = torch.tensor([], dtype=torch.float32).element_size()
     tiny_row_thresh = 1024
     if M <= tiny_row_thresh and K <= 8:
-        fm = _flopmem_one_stage(batch, M, K, x.element_size())
+        fm = _flopmem_one_stage(batch, M, K, elem_size)
     else:
         chunk = 256 if M < 1024 else 1024
         if chunk < K:
             chunk = triton.next_power_of_2(K)
-        fm = _flopmem_two_stage(batch, M, K, chunk, x.element_size())
+        fm = _flopmem_two_stage(batch, M, K, chunk, elem_size)
 
-    runtime.driver.active.get_empty_cache_for_benchmark().zero_()
-    ms = triton.testing.do_bench(
-        lambda: triton_topk(x, K, largest=True), warmup=25, rep=100
-    )
+    ms = _bench_rot(bencher, batch, M, _triton_topk_fn(K))
     return ms / 1e3, fm
 
 
-def _collect_roof_points(M: int, K: int) -> list[RoofDot]:
+def _collect_roof_points(bencher: RotatingBufferBench, M: int, K: int) -> list[RoofDot]:
     pts: list[RoofDot] = []
     for B in BATCH_SIZES:
-        t, fm = _measure_topk(B, M, K)
+        t, fm = _measure_topk(bencher, B, M, K)
         pts.append(RoofDot(B, fm.flops / fm.bytes, fm.flops / t))
     return pts
 
@@ -162,29 +198,16 @@ def _plot_roofline(points: list[RoofDot], M: int, K: int, out_dir: Path) -> None
         args={},
     )
 )
-def bench_latency(batch, provider, *, dim2: int, k: int):
-    """Return (median, p20, p80) latency in micro-seconds."""
-    runtime.driver.active.get_empty_cache_for_benchmark().zero_()
-
-    x = torch.rand(batch, dim2, device=DEVICE, dtype=torch.float32)
-
+def bench_latency(batch, provider, *, dim2: int, k: int, bencher: RotatingBufferBench):
+    """Return mean per-call latency in micro-seconds."""
     if provider == "torch":
-
-        def fn():
-            return x.topk(k, dim=1, largest=True, sorted=True)
-
+        fn = _torch_topk_fn(k)
     elif provider == "triton":
-
-        def fn():
-            return triton_topk(x, k, largest=True, sorted=True)
-
+        fn = _triton_topk_fn(k)
     else:
         raise ValueError(provider)
 
-    ms, p20, p80 = triton.testing.do_bench(
-        fn, warmup=25, rep=100, quantiles=[0.5, 0.2, 0.8]
-    )
-    return ms * 1000, p20 * 1000, p80 * 1000
+    return _bench_rot(bencher, batch, dim2, fn) * 1000
 
 
 @triton.testing.perf_report(
@@ -231,23 +254,29 @@ def bench_memory(batch, provider, *, dim2: int, k: int):
     return (peak_mb,) * 3
 
 
-def run_roofline(args):
+def run_roofline(args, bencher: RotatingBufferBench):
     for M, K in itertools.product(DIM2S, KS):
         if args.purge_cache:
             purge_cache()
         print(f"\n=== Collecting roofline (M={M}, K={K}) ===")
-        pts = _collect_roof_points(M, K)
+        pts = _collect_roof_points(bencher, M, K)
         _plot_roofline(pts, M, K, args.save_dir)
 
 
-def run_latency_memory(args):
+def run_latency_memory(args, bencher: RotatingBufferBench):
     lat_bench = bench_latency.benchmarks
     mem_bench = bench_memory.benchmarks
     for M, K in itertools.product(DIM2S, KS):
         if args.purge_cache:
             purge_cache()
         lat_bench.plot_name = f"topk_latency_M={M}_K={K}"
-        bench_latency.run(print_data=True, save_path=str(args.save_dir), dim2=M, k=K)
+        bench_latency.run(
+            print_data=True,
+            save_path=str(args.save_dir),
+            dim2=M,
+            k=K,
+            bencher=bencher,
+        )
         if args.purge_cache:
             purge_cache()
         mem_bench.plot_name = f"topk_memory_M={M}_K={K}"
@@ -262,7 +291,7 @@ def run_latency_memory(args):
                 print(f"?  {path.name} missing")
 
 
-def run_benchmark(args, x_vals_list):
+def run_benchmark(args, x_vals_list, bencher: RotatingBufferBench):
     """
     Runs benchmark given the --model argument.
     """
@@ -290,8 +319,7 @@ def run_benchmark(args, x_vals_list):
 
     @triton.testing.perf_report([benchmark])
     def bench_topk(M, N, topk, **kwargs):
-        x = torch.rand(M, N, device=DEVICE, dtype=torch.float32)
-        ms = triton.testing.do_bench(lambda: triton_topk(x, topk), warmup=25, rep=100)
+        ms = _bench_rot(bencher, M, N, _triton_topk_fn(topk))
         if args.metric == "time":
             return ms
         else:
@@ -314,6 +342,11 @@ def parse_args():
         "--topk", type=int, default=1, help="Number of elements to select by top-K"
     )
     override_parser_action(parser, action="--metric", choices=["time"], default="time")
+    # --model sweeps go up to (16384, 128256) fp32, an ~8 GB input per pool
+    # entry; a floor of 4 entries would quadruple that. Inputs that large
+    # already exceed the last-level cache on their own, so a floor of 2 is
+    # enough to keep consecutive calls from reusing a cache-resident input.
+    override_parser_action(parser, action="--rot-bufs-min-pool-len", default=2)
     parser.add_argument(
         "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
     )
@@ -337,6 +370,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     assert (
         args.model is None or args.shape is None
     ), "Specify one of --model or --shape, not both."
@@ -349,20 +385,20 @@ def main():
             N = config["vocab_size"]
             for M in [2**i for i in range(15)]:
                 x_vals.append((M, N, args.topk))
-        run_benchmark(args, x_vals)
+        run_benchmark(args, x_vals, bencher)
     elif args.shape is not None:
         M, N = args.shape
-        run_benchmark(args, [(M, N, args.topk)])
+        run_benchmark(args, [(M, N, args.topk)], bencher)
     else:
         # Default
         M, N, K = 1024, 128256, 16
-        run_benchmark(args, [(M, N, K)])
+        run_benchmark(args, [(M, N, K)], bencher)
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     if args.roofline:
-        run_roofline(args)
+        run_roofline(args, bencher)
     if args.run_latency_memory:
-        run_latency_memory(args)
+        run_latency_memory(args, bencher)
 
 
 if __name__ == "__main__":

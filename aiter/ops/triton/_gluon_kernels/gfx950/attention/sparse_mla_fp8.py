@@ -835,7 +835,13 @@ _sparse_mla_fp8_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_sparse_mla_fp8_repr, do_not_specialize=["num_queries", "num_splits"])
+# Callers pass position slices at any offset and cache row offsets of any value;
+# specializing on them only compiles more variants of the same code.
+@gluon.jit(
+    repr=_sparse_mla_fp8_repr,
+    do_not_specialize=["num_queries", "num_splits", "main_row0", "extra_row0"],
+    do_not_specialize_on_alignment=["pos_ptr"],
+)
 def _sparse_mla_fp8(
     q_ptr,  # [C, H, 512 + ROPE_TAIL] fp8 (u8 view) or bf16
     kv_ptr,  # u8 base of the cache(s): rows of 512 + ROPE_TAIL bytes

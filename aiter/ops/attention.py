@@ -8,6 +8,7 @@ import operator as _operator
 import os as _os
 from collections import namedtuple as _namedtuple
 from dataclasses import dataclass as _dataclass
+from numbers import Real as _Real
 from typing import Any
 
 import torch
@@ -198,7 +199,83 @@ def _pa_fwd_native(
 # decline every call that passes one. They stay above this layer, where a
 # caller passing one bypasses routing entirely and gets exactly the kernel it
 # asked for. Nothing a provider cannot honour reaches the contract.
-@_route(op="pa_fwd", version=1)
+def _pa_fwd_contract_fake(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """The tensor the v2 contract returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason v2
+    carries no output buffer: see :func:`_pa_fwd_routed`.
+    """
+    return torch.empty_like(Q)
+
+
+# v2 drops the ``out_=`` buffer v1 carried. The older version stays acceptable:
+# the only change is removing an OPTIONAL output buffer, so a v1 provider handed
+# a v2 call sees ``out_=None`` and allocates -- which is v2's semantics exactly.
+# (`rmsnorm` v1 was left out of its own supersedes for the opposite reason: a v1
+# kernel handed a v2 call writes the caller's INPUT.)
+# `mutates_args=[]` here, unlike `pa_decode_bf16` above: dropping `out_` leaves
+# this contract with no scratch at all -- every remaining argument is read, and
+# the result is freshly allocated -- so the conservative default would buy an
+# `auto_functionalized_v2` wrap for nothing.
+@_route(
+    op="pa_fwd",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_pa_fwd_contract_fake,
+    mutates_args=[],
+)
+def _pa_fwd_contract(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """Paged attention forward over a block table -- the routed contract.
+
+    Arguments and meanings are those of :func:`_pa_fwd_routed`, minus its
+    output buffer.
+
+    Returns a newly allocated tensor shaped like ``Q``. It writes through none
+    of its arguments: a provider serving this contract must allocate its result
+    too, and a caller that wants the result in a buffer it owns passes ``out_``,
+    which does not route.
+    """
+    return _pa_fwd_native(
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        None,
+        qo_indptr,
+        high_precision,
+        None,
+    )
+
+
 def _pa_fwd_routed(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -229,7 +306,34 @@ def _pa_fwd_routed(
         high_precision: 0, 1 or 2 for fp8 KV, 2 being the most precise.
 
     Returns the output tensor -- ``out_`` itself when one was passed.
+
+    Passing ``out_`` bypasses routing. The reason is a schema one rather than
+    a policy one: with a buffer this op RETURNS the tensor it was given, while
+    the schema a custom op is registered under declares that its results do
+    not alias its inputs. `opcheck` reports the contradiction, and under
+    compile both ways of resolving it are wrong -- a fake that allocates
+    leaves the caller's buffer UNWRITTEN while still returning the right
+    value, with nothing to say so.
+
+    The v2 contract (:func:`_pa_fwd_contract`) leaves the buffer out instead
+    of picking a side. A provider serves the allocating form only; the
+    buffered form runs AITER's own kernel, which is what naming the buffer
+    asked for -- and what pins the result to a fixed address.
     """
+    if out_ is None:
+        return _pa_fwd_contract(
+            Q,
+            K,
+            V,
+            block_tables,
+            context_lens,
+            block_tables_stride0,
+            max_qlen,
+            K_QScale,
+            V_QScale,
+            qo_indptr,
+            high_precision,
+        )
     return _pa_fwd_native(
         Q,
         K,
@@ -680,10 +784,110 @@ def _pa_decode_bf16_native(
     return out
 
 
+def _pa_decode_bf16_contract_fake(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The tensor the v2 contract returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason v2
+    carries no output buffer: see :func:`_pa_decode_bf16_routed`.
+    """
+    return torch.empty(Q.shape, dtype=torch.bfloat16, device=Q.device)
+
+
 # Routed below the pins, as `pa_fwd` is: `kernelName` names one asm kernel and
 # `backend` one implementation, neither of which a provider has. Both stay
 # above this layer, so the contract carries nothing a provider cannot honour.
-@_route(op="pa_decode_bf16", version=1)
+#
+# v2 drops the ``out=`` buffer v1 carried. The older version stays acceptable:
+# the only change is removing an OPTIONAL output buffer, so a v1 provider handed
+# a v2 call sees ``out=None`` and allocates -- which is v2's semantics exactly.
+# (`rmsnorm` v1 was left out of its own supersedes for the opposite reason: a v1
+# kernel handed a v2 call writes the caller's INPUT.)
+# No `mutates_args=[]` here, unlike the other contracts this change touches.
+# Dropping `out` removes the buffer this op RETURNED, but `split_o`, `split_lse`
+# and `work_info` are still handed to the asm binding as split-KV scratch, and
+# nothing in the tree establishes that the kernel leaves them alone. `route()`
+# says the conservative default costs an `auto_functionalized_v2` wrap while a
+# declared list that lies is undefined behaviour, so the wrap is the cheaper of
+# the two until someone can state per buffer that it is read-only.
+@_route(
+    op="pa_decode_bf16",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_pa_decode_bf16_contract_fake,
+)
+def _pa_decode_bf16_contract(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Paged-attention decode on fp8 KV, returning bf16 -- the routed contract.
+
+    Arguments and meanings are those of :func:`_pa_decode_bf16_routed`, minus
+    its output buffer.
+
+    Returns a newly allocated bf16 tensor with ``Q``'s logical shape. It writes
+    through none of its arguments: a provider serving this contract must
+    allocate its result too, and a caller that wants the result in a buffer it
+    owns passes ``out=``, which does not route.
+    """
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        None,
+        None,
+    )
+
+
 def _pa_decode_bf16_routed(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -720,10 +924,42 @@ def _pa_decode_bf16_routed(
         it is None, making the sink a numerical no-op.
 
     ``out`` is an optional caller-owned buffer: given, it is written and
-    returned; otherwise one is allocated. The output tensor comes back either
-    way, so a provider returns what it wrote rather than leaving the caller to
-    re-read ``out``.
+    returned; otherwise one is allocated.
+
+    Passing it bypasses routing. The reason is a schema one rather than a
+    policy one: with a buffer this op RETURNS the tensor it was given, while
+    the schema a custom op is registered under declares that its results do not
+    alias its inputs. `opcheck` reports the contradiction, and under compile
+    both ways of resolving it are wrong -- a fake that allocates leaves the
+    caller's buffer UNWRITTEN while still returning the right value, with
+    nothing to say so.
+
+    The v2 contract (:func:`_pa_decode_bf16_contract`) leaves the buffer out
+    instead of picking a side. A provider serves the allocating form only; the
+    buffered form runs AITER's own kernel, which is what naming the buffer
+    asked for.
     """
+    if out is None:
+        return _pa_decode_bf16_contract(
+            Q,
+            K,
+            V,
+            kv_indices,
+            context_lens,
+            softmax_scale,
+            kv_indptr,
+            gqa,
+            mtp,
+            query_scale,
+            key_scale,
+            value_scale,
+            qo_indptr,
+            work_indptr,
+            work_info,
+            split_o,
+            split_lse,
+            sink,
+        )
     return _pa_decode_bf16_native(
         Q,
         K,
@@ -941,31 +1177,39 @@ def _attention_ps_reduce_asm(
 ) -> None:
     """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
 
-    Partial output and partial LSE must be contiguous FP32 tensors, with
-    compatible int32 reduction maps on the output device.
+    Contiguous SplitO is FP32 or BF16. BF16 requires space for
+    reduce_partial_map.numel() * max_seqlen_q rows. SplitLSE is always FP32.
     Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
-    merge_waves is 0 for the existing heuristic, or 1/8 for an explicit choice.
+    merge_waves is 0 for automatic selection, or 1/2/4/8 for an explicit choice.
     """
 
 
-def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
-    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
-
-    This is not a live split count. Callers with padded kv_indices should pass
-    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
-    """
-    if num_cu != 256 or not 1 <= batch_size <= 8:
+def _pa_ps_reduce_waves(
+    batch_size: int, kv_pages: int, num_cu: int, *, compact_partials: bool = False
+) -> int:
+    """Estimate Q4/GQA16 reduction work from packed, used 16-token KV pages."""
+    if batch_size < 1 or kv_pages < batch_size or num_cu < 1:
         return 0
-    output_rows = batch_size * 4 * 16
-    if output_rows < num_cu:
-        return 0
-    context_threshold = 32768 if output_rows <= num_cu else 65536
-    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
+    average_pages = (kv_pages + batch_size - 1) // batch_size
+    average_splits = (average_pages + 15) // 16
+    split_budget = min((num_cu + batch_size - 1) // batch_size, 256)
+    estimated_splits = max(1, min(average_splits, split_budget))
+    if estimated_splits <= 8:
+        waves = 1
+        output_rows = batch_size * 64
+        while waves < 8 and output_rows * waves < num_cu:
+            waves *= 2
+        return max(4, waves) if compact_partials else waves
+    if estimated_splits <= 16 and not compact_partials:
+        return 2
+    if estimated_splits <= 32:
+        return 4
+    return 8
 
 
-@_route(op="pa_persistent_fwd", version=1)
+@_route(op="pa_persistent_fwd", version=2)
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -990,6 +1234,7 @@ def pa_persistent_fwd(
     high_precision: int = 1,
     reduce_waves: int = 0,
     return_lse: bool = True,
+    compact_partials: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run persistent attention and merge only materialized partial outputs.
 
@@ -998,18 +1243,22 @@ def pa_persistent_fwd(
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
     reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
-    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    PA workload heuristic, while 1/2/4/8 explicitly overrides it. The Q4/GQA16
     policy expects packed kv_indices containing only used pages. Other paths
     retain the original heuristic. No tuning or device-to-host readback occurs.
     return_lse=False skips final LSE allocation and computation and returns None
     for the second result. The default preserves the existing LSE output.
-    Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
+    Split work returns FP32 partials by default. On supported gfx950 MTP calls,
+    compact_partials=True returns BF16 SplitO; SplitLSE stays FP32 in both modes.
+    Provider contract v2 includes compact_partials. Version-1 providers cannot
+    implement the BF16 return contract and are not offered this operation.
+    Use the padded WorkInfo from get_pa_metadata_info_v1. Metadata partial=-1
     selects direct output in Q's dtype without materializing a partial or LSE.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
-    if reduce_waves not in (0, 1, 8):
-        raise ValueError("reduce_waves must be 0, 1, or 8")
+    if reduce_waves not in (0, 1, 2, 4, 8):
+        raise ValueError("reduce_waves must be 0, 1, 2, 4, or 8")
     use_asm_reduce = (
         K.shape[3] == 16
         and v_head_dim == 128
@@ -1021,11 +1270,51 @@ def pa_persistent_fwd(
         raise ValueError(
             "explicit reduce_waves requires the gfx950/page16/D128 ASM reducer"
         )
+    if compact_partials:
+        scale_shape = (K.shape[0], 1, 16)
+        if not (
+            use_asm_reduce
+            and 2 <= max_qlen <= 4
+            and nhead == 16
+            and Q.shape == output.shape
+            and Q.dtype == output.dtype
+            and Q.device == K.device == V.device == output.device
+            and Q.stride(-1) == 1
+            and Q.stride(1) == v_head_dim
+            and output.is_contiguous()
+            and K.shape[1:] == (1, 8, 16, 16)
+            and V.shape == (K.shape[0], 1, 1, 128, 16)
+            and K.dtype == V.dtype == dtypes.fp8
+            and K.is_contiguous()
+            and V.is_contiguous()
+            and all(
+                scale is not None
+                and scale.dtype == torch.float32
+                and scale.device == K.device
+                and scale.is_contiguous()
+                and tuple(scale.shape) in (scale_shape, scale_shape + (1,))
+                for scale in (K_QScale, V_QScale)
+            )
+            and (
+                softmax_scale is None
+                or (
+                    isinstance(softmax_scale, _Real)
+                    and math.isclose(softmax_scale, v_head_dim**-0.5, rel_tol=1e-7)
+                )
+            )
+            and quant_type == QuantType.per_Token
+            and high_precision == 1
+            and mask in (0, 1)
+        ):
+            raise ValueError(
+                "compact_partials requires gfx950 page16/D128 GQA16 FP8 MTP "
+                "with packed buffers and the default softmax scale"
+            )
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
     logits = torch.empty(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
-        dtype=dtypes.fp32,
+        dtype=dtypes.bf16 if compact_partials else dtypes.fp32,
         device=device,
     )
     splitLse = torch.empty(
@@ -1080,6 +1369,7 @@ def pa_persistent_fwd(
             batch_size,
             kv_indices.numel(),
             torch.cuda.get_device_properties(device).multi_processor_count,
+            compact_partials=compact_partials,
         )
     reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
     reduce_args = (reduce_waves,) if use_asm_reduce else ()
@@ -1587,8 +1877,8 @@ def get_ps_metadata_v1(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
-def mla_prefill_ps_asm_fwd(
+@compile_ops(MD_NAME, fc_name="mla_prefill_ps_asm_fwd", ffi_type="ctypes")
+def _mla_prefill_ps_asm_fwd_binding(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -1607,6 +1897,75 @@ def mla_prefill_ps_asm_fwd(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None: ...
+
+
+# Routed here, on the public name SGLang's MLA prefill and aiter.mla call, with
+# the ASM binding beneath it under its own name. The op name drops the backend:
+# a provider serves the persistent-schedule prefill, not this kernel.
+@_route(op="mla_prefill_ps")
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Persistent-schedule MLA prefill (the "PS" prefill) over a paged KV.
+
+    It runs the work items of a schedule from ``get_ps_metadata_v1``: each
+    ``(query tile, kv split)`` in ``work_info_set``, grouped per worker by
+    ``work_indptr``. A query tile whose KV is not split is finished here and
+    written into ``output``; a split one leaves its partial attention in
+    ``splitData`` and its log-sum-exp in ``splitLse``, which
+    :func:`mla_reduce_v1` then merges into ``output``. So the result is the
+    pair of calls, and a provider that computes the whole prefill in this
+    call must leave ``mla_reduce_v1`` nothing to merge for it.
+
+    Args:
+        Q: ``[total_q, h, d_qk]``; K: paged ``[pages, h_kv, d_qk]``;
+            V: ``[pages, h_kv, d_v]`` (fp8 with ``q_scale``/``k_scale``/
+            ``v_scale``, else bf16).
+        qo_indptr, kv_indptr: per-sequence offsets into Q and the pages;
+            ``kv_page_indices`` lists each sequence's pages.
+        work_indptr, work_info_set: the schedule.
+        max_seqlen_q, softmax_scale, is_causal: the attention's parameters.
+        splitData, splitLse: fp32 partial-output and lse scratch.
+        output: ``[total_q, h, d_v]`` destination.
+
+    Writes ``output`` (and ``splitData``/``splitLse``) in place and returns
+    None.
+    """
+    _mla_prefill_ps_asm_fwd_binding(
+        Q,
+        K,
+        V,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        softmax_scale,
+        is_causal,
+        splitData,
+        splitLse,
+        output,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
 
 
 class MlaBackend(str, _enum.Enum):
@@ -3002,7 +3361,24 @@ def get_mla_metadata_v1(
     )
 
 
-@compile_ops("module_mla_reduce", develop=True)
+@compile_ops("module_mla_reduce", fc_name="mla_reduce_v1", develop=True)
+def _mla_reduce_v1_binding(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor | None,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None: ...
+
+
+# Routed on the public name: SGLang calls it after mla_prefill_ps_asm_fwd, and
+# AITER's own MLA decode calls it after its split-KV kernels, so both reach it.
+# The HIP binding beneath keeps its symbol under a private name.
+@_route(op="mla_reduce")
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -3046,7 +3422,21 @@ def mla_reduce_v1(
             in-place).
         final_lse: optional [bs, h] fp32. Combined LSE; written only when
             provided.
+
+    Writes ``final_output`` (and ``final_lse`` when given) in place and
+    returns None.
     """
+    _mla_reduce_v1_binding(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        final_output,
+        final_lse,
+    )
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])

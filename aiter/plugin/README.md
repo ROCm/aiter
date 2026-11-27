@@ -69,9 +69,11 @@ Declare the entry point so AITER can find it:
 mylib = "mylib.aiter_provider:MyProvider"
 ```
 
-The target may be a provider instance or a zero-argument factory. Anything with
-a `select` attribute is treated as an instance, so a class object is never
-called.
+The target may be a class (as above), a zero-argument factory, or a ready
+instance. A class is instantiated with no arguments, so give your provider an
+`__init__` that takes none — anything it needs to set up belongs in `select()`
+or behind a lazy import, since discovery happens before any framework has
+enabled you.
 
 Then a framework — not you, and not the environment — turns it on:
 
@@ -87,8 +89,18 @@ environment variable.
 
 - **Return, do not raise.** Raising is isolated and recorded, but it costs the
   call. `None` is the supported way to say no.
-- **Be pure.** `explain()` calls `select()` without running anything, so a
-  `select()` with side effects makes the dry run a lie.
+- **Be pure, and expect to be asked even when somebody else serves.** `explain()`
+  calls `select()` without running anything, so a `select()` with side effects
+  makes the dry run a lie. With more than one provider enabled, every one of
+  them is asked on every call: selection compares what they report, and whether
+  a later provider offers a faster kernel cannot be known without asking it.
+- **`run` must not call the public name that routes to it.** A provider wrapping
+  an AITER kernel reaches for the obvious spelling — `aiter.rms_norm` — and that
+  is the spelling dispatch came through, so the call re-enters routing, reaches
+  the provider again, and recurses until the stack ends. Call the binding below
+  the routed layer instead (`aiter.ops.rmsnorm.rms_norm_cu` for that example).
+  A provider shipping its own kernel never meets this; one built by wrapping
+  AITER, which is what a port tends to start as, meets it on the first call.
 - **Take the contract exactly.** AITER checks your `run` against the contract's
   arity before handing it the call, and refuses the candidate with
   `reason="contract-mismatch"` if it does not fit. That check compares argument
@@ -97,6 +109,38 @@ environment variable.
 - **Once `run()` starts, errors propagate.** AITER does not fall back mid-flight:
   retrying could repeat side effects or hide a broken kernel behind a correct
   result.
+
+## Check your provider before shipping it
+
+```python
+report = plugin.validate("mylib")
+if not report:
+    print(report.problems)   # and report.ops, per declared op
+```
+
+It runs no kernel. It answers the questions that have static answers: were you
+discovered and did you load, is your `api_versions` one this AITER accepts, is
+every name in `op_versions` an op AITER actually routes, is each declared
+version one that contract still accepts, is `select` callable. A name AITER
+does not route is the typo you cannot otherwise see — nothing raises, nothing
+is served, and the call looks exactly like a provider correctly declining.
+
+For the measurement fields:
+
+```python
+assert plugin.check_report(candidate) == ()
+```
+
+Empty means the four comparison fields are present and the candidate takes part
+in selection. Anything else is a list of what is missing, in a form you can read
+— assert on it in your own tests, because the alternative is finding out at
+runtime that your report was ignored, which looks like not being selected for
+any other reason.
+
+**What a passing report does not claim:** that `run` is correct, that `run`
+takes the contract (its arity is checked when a candidate is offered, since the
+callable is only known then), that a measurement is honest, or that `run` avoids
+calling the public name that routes to it.
 
 ## "I installed it and nothing happens"
 

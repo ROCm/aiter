@@ -98,8 +98,14 @@ is retained as historical context in [NAMED_REG_VALIDATION.md](NAMED_REG_VALIDAT
 
 ```
 gen_co/
-├── co_kernels.json        # THE source of truth (see below)
+├── co_kernels_gfx1250.json # gfx1250 source of truth (see below)
+├── co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json
 ├── build_co.py            # the producer
+├── gfx950/
+│   └── a8w8_blockscale_bpreshuffle/
+│       ├── <launcher_name>.co
+│       ├── build_info.json
+│       └── asm/           # debug listings, .gitignored
 └── gfx1250/
     ├── <launcher_name>.co  # bare amdhsa ELF, one kernel each   (tracked)
     ├── build_info.json     # compiler + flags + per-kernel metrics (tracked)
@@ -108,6 +114,15 @@ gen_co/
         ├── <launcher_name>.s    # compiler -S output
         └── <launcher_name>.dis  # llvm-objdump of the .co itself
 ```
+
+The gfx950 blockscale MXFP8 bpreshuffle manifest is
+`gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json`. Its images and
+`build_info.json` use the `gfx950/a8w8_blockscale_bpreshuffle/` directory.
+The default output of `build_co.py --arch gfx950` uses this layout.
+`OPUS_GEN_CO_DIR` points to the `gen_co/` root; Python registration and the C++
+host launcher append
+`gfx950/a8w8_blockscale_bpreshuffle/<launcher_name>.co`.
+The small-shape `direct_b` and `staged_b` families are generated through the JIT.
 
 `<launcher_name>` is the same string three times over — the `.co` filename, the
 `extern "C"` kernel symbol inside it, and the host launcher symbol — because all

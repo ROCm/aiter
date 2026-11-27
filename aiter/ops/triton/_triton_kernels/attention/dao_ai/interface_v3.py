@@ -12,7 +12,6 @@ from aiter.ops.triton._triton_kernels.attention.dao_ai.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
 from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
-    BWD_MODE,
     DEBUG,
     PHILOX_OFFSET,
     PHILOX_SEED,
@@ -524,8 +523,6 @@ def bwd(
     alibi_slopes = None
 
     # Call implementation
-    if DEBUG:
-        print(f"Using Triton implementation in {BWD_MODE} mode")
     attention_backward_triton_impl(
         do=dout,
         q=q,
@@ -550,7 +547,6 @@ def bwd(
         dropout_p=dropout_p,
         rng_state=None,
         use_exp2=USE_EXP2,
-        mode=BWD_MODE,
         window_size_left=window_size_left,
         window_size_right=window_size_right,
         q_descale=q_descale,

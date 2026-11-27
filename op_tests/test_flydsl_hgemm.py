@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness + perf for FlyDSL A16W16 HGEMM (gfx950).
+"""Correctness + perf for arch-dispatched FlyDSL A16W16 HGEMM.
 
 The model path (``tuned_gemm.flydsl_gemm``) is BF16 x BF16:
 
@@ -18,6 +18,7 @@ Run:
 
 import argparse
 import itertools
+from unittest.mock import patch
 
 import pandas as pd
 import torch
@@ -31,6 +32,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm_kernel_name,
     get_flydsl_hgemm_kernel_params,
 )
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -77,6 +79,11 @@ _TUNED = [
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
 ]
 _CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
+# GLM-5.3 / K3.1 Pro indexer wq_b: N = 32 heads * 128, K = q_lora_rank.
+_PRESHUFFLE_MNK = [(m, 4096, k) for m in (6, 32, 512) for k in (1536, 2048)] + [
+    (33, 80, 1536),
+    (513, 4112, 2048),
+]
 
 # Skinny ("sk") policy: one workgroup per block_n columns with the full K, which
 # k_waves waves split; no split_k, M/N waves or group_m.
@@ -184,6 +191,118 @@ def _tile_for(m, n, k, policy, split_k):
 def run_torch(a, w, dtype):
     # Reference only: fp32 math, cast back. Not timed, not in the table.
     return torch.mm(a.to(dtypes.fp32), w.t().to(dtypes.fp32)).to(dtype)
+
+
+@benchmark()
+def test_hgemm_preshuffle(m, n, k, dtype):
+    """One AITER weight layout for a native BF16 GEMM and a Mono indexer."""
+    torch.manual_seed(SEED)
+    a = torch.randn(m, k, dtype=dtype, device="cuda") * 0.1
+    raw = torch.randn(n, k, dtype=dtype, device=a.device) * 0.1
+    weight = shuffle_weight(raw)
+    out = torch.full((m, n), float("nan"), dtype=dtype, device=a.device)
+    config = {
+        "block_m": (8 if m <= 8 else 32) if m <= 32 else 128,
+        "block_n": 16 if m <= 32 else 128,
+        "block_k": 64,
+        "stages": 3 if m <= 32 else 2,
+        "m_waves": 1 if m <= 32 else 2,
+        "n_waves": 1 if m <= 32 else 2,
+        "k_waves": 4 if m <= 32 else 1,
+        "policy": "sk" if m <= 32 else "ft",
+    }
+
+    def eager():
+        return flydsl_hgemm(a, weight, out=out, bpreshuffle=True, **config)
+
+    eager()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        eager()
+    a.mul_(0.75)
+    out.fill_(float("nan"))
+    ref = run_torch(a, raw, dtype)
+
+    def replay():
+        graph.replay()
+        return out
+
+    ret = {"gfx": get_gfx_runtime()}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n) * 2
+    for name, fn in {"preshuffle_graph": replay, "preshuffle": eager}.items():
+        actual, us = run_perftest(fn)
+        assert actual.data_ptr() == out.data_ptr()
+        err = checkAllclose(ref.float(), actual.float(), atol=0.003, rtol=0.02)
+        assert err == 0
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": flops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": err,
+            }
+        )
+    return ret
+
+
+def check_preshuffle_compiled_dispatch():
+    """A strided 3D input must not send shuffled bytes through F.linear."""
+    from aiter import tuned_gemm as tg
+
+    a = torch.randn(2, 3, 1536, dtype=dtypes.bf16, device="cuda").transpose(0, 1)
+    raw = torch.randn(4096, 1536, dtype=a.dtype, device=a.device) * 0.02
+    weight = torch.nn.Parameter(shuffle_weight(raw), requires_grad=False)
+    weight.is_shuffled = True
+    out = torch.empty(3, 2, 4096, dtype=a.dtype, device=a.device)
+    config = {
+        "block_m": 8,
+        "block_n": 16,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 4,
+        "group_m": 0,
+        "policy": "sk",
+    }
+    name = flydsl_hgemm_kernel_name(
+        dtype=a.dtype,
+        out_dtype=a.dtype,
+        config=config,
+        has_bias=False,
+        target_gfx="gfx950",
+    )
+
+    def lookup(**kwargs):
+        assert kwargs["bpreshuffle"]
+        return {"libtype": "flydsl", "solidx": 0, "kernelName": name}
+
+    compiled = torch.compile(lambda x, w, y: tg.tgemm.mm(x, w, out=y), fullgraph=True)
+    with patch.object(tg, "get_GEMM_A16W16_config", lookup):
+        compiled(a, weight, out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compiled(a, weight, out)
+        a.neg_()
+        out.fill_(float("nan"))
+        graph.replay()
+        ref = torch.nn.functional.linear(a.float(), raw.float())
+        assert checkAllclose(ref, out.float(), rtol=0.02, atol=0.003) == 0
+    for override in ({"policy": "ht"}, {"split_k": 2}, {"k_waves": 2}):
+        try:
+            flydsl_hgemm(
+                a.reshape(6, 1536),
+                weight,
+                bpreshuffle=True,
+                **({"policy": "ft"} | override),
+            )
+        except ValueError:
+            continue
+        raise AssertionError(
+            f"preshuffle accepted unsupported configuration: {override}"
+        )
 
 
 def _atol_rtol(k, split_k, k_waves, dtype):
@@ -522,6 +641,7 @@ def test_hgemm_memory(
         )
         assert err == 0, f"K tile coverage mismatch: {err}"
 
+    captured_exact = exact.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         candidates["flydsl_memory"]()
@@ -529,15 +649,29 @@ def test_hgemm_memory(
     out.fill_(8192)
     graph.replay()
     exact = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
-    err = checkAllclose(
-        exact.float(),
-        out.float(),
-        rtol=0,
-        atol=0,
-        msg="changed-input graph",
-        tol_err_ratio=0,
-    )
-    assert err == 0, f"graph replay mismatch: {err}"
+    if out_dtype == dtypes.bf16 and split_k > 1:
+        # Packed BF16 atomic split-K may add the same partials in a different
+        # order during graph replay. Accept only the two adjacent BF16 values;
+        # the exact launches above still catch missing or repeated K tiles.
+        lower = torch.nextafter(exact, torch.full_like(exact, -float("inf")))
+        upper = torch.nextafter(exact, torch.full_like(exact, float("inf")))
+        within_one_ulp = (out == exact) | (out == lower) | (out == upper)
+        assert torch.isfinite(out).all(), "graph replay produced a non-finite value"
+        assert within_one_ulp.all(), (
+            "graph replay exceeded one BF16 ULP: "
+            f"{(~within_one_ulp).sum().item()} mismatched elements"
+        )
+    else:
+        err = checkAllclose(
+            exact.float(),
+            out.float(),
+            rtol=0,
+            atol=0,
+            msg="changed-input graph",
+            tol_err_ratio=0,
+        )
+        assert err == 0, f"graph replay mismatch: {err}"
+    assert torch.any(out != captured_exact), "graph replay reused the captured input"
     return ret
 
 
@@ -788,7 +922,20 @@ def check_hgemm_memory_options():
     aiter.logger.info("hgemm memory-option names and rejection checks passed")
 
 
-_TDM_MNK = [
+# Existing #7851 CSV keys (M is decode tokens, N=128, K=4096) and the
+# supplied short-K reference; all are ordinary --mnk sweep entries.
+_TDM_FP32_MNK = [
+    (1, 128, 4096),
+    (2, 128, 4096),
+    (4, 128, 4096),
+    (8, 128, 4096),
+    (16, 128, 4096),
+    # DSV4.1's first 12 existing gfx1250 CSV rows, in file order:
+    # decode M tokens, weight[N=32,K=5120], no preshuffle.
+    *[(m, 32, 5120) for m in (6, 12, 18, 24, 30, 36, 42, 48, 72, 96, 128, 144)],
+]
+
+_TDM_MNK = _TDM_FP32_MNK + [
     (1, 128, 128),
     (137, 144, 768),
     (131, 139, 512),
@@ -828,8 +975,8 @@ def _assert_guards(storage, cols):
 
 
 def run_torch_tdm(a, weight, bias, dtype, split_k, with_rounding_budget=False):
-    # Reference includes the specified same-dtype workspace partial rounding.
-    # Atomic has extra order-dependent rounding, checked with a dtype tolerance.
+    # Each split retains FP32 partials; round only after fixed-order reduction.
+    # Legacy tdma/tdmia names execute this same path.
     if split_k == 1:
         product = a.float() @ weight.float().t()
         torch.cuda.current_stream(a.device).synchronize()
@@ -848,22 +995,24 @@ def run_torch_tdm(a, weight, bias, dtype, split_k, with_rounding_budget=False):
             )
             torch.cuda.current_stream(a.device).synchronize()
             partial_magnitude += partial.abs()
-            product += partial.to(dtype).float()
+            product += partial
     result = product.to(dtype)
     if bias is not None:
         result = (result.float() + bias.float()).to(dtype)
     if with_rounding_budget:
-        # One output ULP per partial accounts for opposite rounding at a midpoint
-        # when independent FP32 dot-product orders differ. No batch-wide norm.
+        # Bound independent FP32 dot-product order error separately from final
+        # output rounding. No input-dtype rounding budget per split.
         magnitude = partial_magnitude + product.abs()
         if bias is not None:
             magnitude = magnitude + bias.float().abs()
+        # Retain the existing componentwise budget, without the former
+        # split_k multiplier for BF16 atomic-update rounding.
         return result, torch.finfo(dtype).eps * magnitude
     return result
 
 
 @benchmark()
-def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
+def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages, interleave):
     config = _tdm_config(m, n, k, split_k, stages)
     assert config is not None, "K must contain complete TDM tiles in every split"
     torch.manual_seed(SEED)
@@ -883,36 +1032,27 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
     ref, rounding_budget = run_torch_tdm(
         a, weight, bias, dtype, split_k, with_rounding_budget=True
     )
-    # Packed atomics require BF16, split>1 and complete pairs at the N edge.
-    policies = ["tdm"]
-    if layout == "nt":
-        policies.append("tdmi")
-    if dtype == dtypes.bf16 and split_k > 1 and n % 2 == 0:
-        policies += ["tdma"] + (["tdmia"] if layout == "nt" else [])
-    outputs = {name: _guarded_matrix(m, n, dtype) for name in policies}
+    out, storage = _guarded_matrix(m, n, dtype)
 
-    def launch(name):
+    def launch():
         if layout == "nn":
-            # Logical NN is exposed by the explicit non-arch-suffixed wrapper;
-            # tuned model dispatch uses the normal AITER weight[N,K] convention.
             from aiter.ops.flydsl import flydsl_gemm_a16w16_tdm
 
             kwargs = {key: value for key, value in config.items() if key != "k_waves"}
             return flydsl_gemm_a16w16_tdm(
-                a,
-                weight.t(),
-                outputs[name][0],
-                bias,
-                layout="nn",
-                interleave=False,
-                split_k_atomic=name == "tdma",
-                **kwargs,
+                a, weight.t(), out, bias, layout="nn", interleave=interleave, **kwargs
             )
         return flydsl_hgemm(
-            a, weight, out=outputs[name][0], bias=bias, policy=name, **config
+            a,
+            weight,
+            out=out,
+            bias=bias,
+            policy="tdmi" if interleave else "tdm",
+            **config,
         )
 
-    candidates = {name: (lambda name=name: launch(name)) for name in policies}
+    candidates = {"tdm": launch}
+    outputs = {"tdm": (out, storage)}
     flops = 2 * m * n * k
     nbytes = (m * k + n * k + m * n + (n if has_bias else 0)) * a.element_size()
     ret = {
@@ -925,13 +1065,11 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
         y = fn()
         assert y.data_ptr() == out.data_ptr()
         y, us = run_perftest(fn)
-        atomic = name in ("tdma", "tdmia")
         atol = 0.012 if dtype == dtypes.bf16 else 0.002
         rtol = 0.02 if dtype == dtypes.bf16 else 0.003
         if split_k > 1:
-            # Sequential BF16 atomic updates add at most split_k rounding steps.
-            # Grade every element, including cancellation-sensitive outputs.
-            budget = atol + rounding_budget * (split_k if atomic else 1)
+            # All policy names use the same FP32 partial reduction.
+            budget = atol + rounding_budget
             normalized_error = (ref.float() - y.float()).abs() / budget
             err = checkAllclose(
                 torch.zeros_like(normalized_error),
@@ -960,7 +1098,7 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
     _assert_guards(w_storage, k if layout == "nt" else n)
 
     # Each split contributes a distinct exact product. Repeated poisoned-output
-    # replays detect missing/reread splits, stale bias and a missing rank-0 clear.
+    # replays detect missing/reread splits, stale bias and output accumulation.
     a.zero_()
     weight.zero_()
     width = k // split_k
@@ -1015,7 +1153,7 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
 
 
 @benchmark()
-def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias):
+def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias, interleave):
     from unittest import mock
 
     import aiter.tuned_gemm as tuned
@@ -1041,9 +1179,7 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias):
         weight[:, part * (k // 3)] = col / 16
     bias = col / 8 if has_bias else None
     reference = run_torch_tdm(a, weight, bias, dtype, 3)
-    policies = (
-        ("tdm", "tdmi", "tdma", "tdmia") if dtype == dtypes.bf16 else ("tdm", "tdmi")
-    )
+    policies = ("tdmi" if interleave else "tdm",)
     outputs = {
         policy: torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
         for policy in policies
@@ -1117,6 +1253,173 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias):
     return ret
 
 
+def run_torch_tdm_fp32(a, weight, bias, dtype, policy="tdm"):
+    product = a.to(dtypes.fp32) @ weight.to(dtypes.fp32).t()
+    # Preserve each backend's public bias convention. The original FT/HT
+    # path fuses bias in FP32; TDM rounds the product before adding bias.
+    if policy in ("ft", "ht"):
+        return (product if bias is None else product + bias.float()).to(dtype)
+    product = product.to(dtype)
+    return product if bias is None else (product.float() + bias.float()).to(dtype)
+
+
+@benchmark()
+def test_hgemm_tdm_fp32(m, n, k, dtype, has_bias):
+    """Model decode outputs and the split5 short-K reference; no CSV dependency."""
+    # #7851: M=1/2/4/8/16, N=128, K=4096. The user's separate short-K
+    # reference is M=6,N=32,K=5120, with four K tiles per split.
+    split_k = 5 if k == 5120 else 8
+    block_k = 256 if k == 5120 else 128
+    cfg = {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": block_k,
+        "stages": 5,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 1,
+        "split_k": split_k,
+        "policy": "tdm",
+    }
+    a, a_store = _guarded_matrix(m, k, dtype)
+    weight, w_store = _guarded_matrix(n, k, dtype)
+    out, o_store = _guarded_matrix(m, n, dtype)
+    a.zero_()
+    weight.zero_()
+    row_sign = (1 - 2 * (torch.arange(m, device="cuda") % 2)).to(dtype)
+    col_sign = (1 - 2 * (torch.arange(n, device="cuda") % 2)).to(dtype)
+    factor_a = 1 / 16 if dtype == dtypes.bf16 else 1 / 32
+    factor_b = 1 / 16 if dtype == dtypes.bf16 else 1 / 64
+    for part in range(3):
+        a[:, part * (k // split_k)] = row_sign
+        weight[:, part * (k // split_k)] = col_sign
+        a[:, part * (k // split_k) + 1] = row_sign * factor_a
+        weight[:, part * (k // split_k) + 1] = col_sign * factor_b
+    bias = col_sign / 2 if has_bias else None
+    ref = run_torch_tdm_fp32(a, weight, bias, dtype)
+    # Mutation guard: same-dtype partial rounding MUST disagree with the
+    # independent reference for these deliberately constructed inputs.
+    # Three nonzero partitions avoid the power-of-two split8 midpoint trap.
+    old_rounding = (row_sign[:, None] * col_sign[None, :] * 3).to(dtype)
+    if bias is not None:
+        old_rounding = (old_rounding.float() + bias.float()).to(dtype)
+    assert torch.any(old_rounding != ref), "precision regression input lost sensitivity"
+
+    # Exercise the original FT/HT backend alongside cluster TDM, using the
+    # same valid tile/partition and independent reference. These names are
+    # different backends, not additional TDM split-K reduction policies.
+    candidates = {
+        name: (
+            lambda name=name: flydsl_hgemm(
+                a, weight, out=out, bias=bias, **{**cfg, "policy": name}
+            )
+        )
+        for name in ("tdm", "ft", "ht")
+    }
+    ret = {"gfx": get_gfx_runtime(), "split_k": split_k, "tile": f"16x16x{block_k}"}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n + (n if has_bias else 0)) * a.element_size()
+    for name, fn in candidates.items():
+        candidate_ref = run_torch_tdm_fp32(a, weight, bias, dtype, policy=name)
+        out.fill_(float("nan"))
+        y, us = run_perftest(fn)
+        err = checkAllclose(
+            candidate_ref.to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            atol=0,
+            rtol=0,
+            tol_err_ratio=0,
+            msg=f"{name} FP32 partials",
+        )
+        assert err == 0 and y.data_ptr() == out.data_ptr() and torch.isfinite(y).all()
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        for _ in range(6):
+            a.neg_()
+            if bias is not None:
+                bias.neg_()
+            expected = run_torch_tdm_fp32(a, weight, bias, dtype, policy=name)
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert (
+                checkAllclose(
+                    expected.float(),
+                    out.float(),
+                    atol=0,
+                    rtol=0,
+                    tol_err_ratio=0,
+                    msg=f"{name} modified-input graph",
+                )
+                == 0
+            )
+        graph.reset()
+
+    # Two captures originating on the same stream must own independent
+    # scratch when replayed concurrently on two streams.
+    capture_stream = torch.cuda.Stream()
+    graphs, slots = [], []
+    for idx in range(2):
+        aa = a.clone()
+        aa.mul_(-1 if idx else 1)
+        bb = weight.clone()
+        yy = torch.empty_like(out)
+        bias_i = None if bias is None else bias.clone()
+        expected = run_torch_tdm_fp32(aa, bb, bias_i, dtype)
+        torch.cuda.synchronize()
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr, stream=capture_stream):
+            junk = torch.empty(4096, device="cuda")
+            junk.fill_(999)
+            del junk
+            flydsl_hgemm(aa, bb, out=yy, bias=bias_i, stream=capture_stream, **cfg)
+        graphs.append(gr)
+        slots.append((aa, bb, yy, bias_i, expected))
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for _ in range(20):
+        for st, gr in zip(streams, graphs):
+            with torch.cuda.stream(st):
+                gr.replay()
+    torch.cuda.synchronize()
+    for st, slot in zip(streams, slots):
+        aa, bb, yy, bias_i, expected = slot
+        assert (
+            checkAllclose(
+                expected.float(),
+                yy.float(),
+                atol=0,
+                rtol=0,
+                tol_err_ratio=0,
+                msg="independent graph scratch",
+            )
+            == 0
+        )
+        flydsl_hgemm(aa, bb, out=yy, bias=bias_i, stream=st, **cfg)
+    torch.cuda.synchronize()
+    for _, _, yy, _, expected in slots:
+        assert (
+            checkAllclose(
+                expected.float(),
+                yy.float(),
+                atol=0,
+                rtol=0,
+                tol_err_ratio=0,
+                msg="explicit stream scratch",
+            )
+            == 0
+        )
+    for gr in graphs:
+        gr.reset()
+    for backing, cols in ((a_store, k), (w_store, k), (o_store, n)):
+        _assert_guards(backing, cols)
+    return ret
+
+
 def check_tdm_contracts(dtype):
     from aiter.ops.flydsl import flydsl_gemm_a16w16_tdm as gemm
 
@@ -1139,17 +1442,16 @@ def check_tdm_contracts(dtype):
             a, w.t(), out, torch.zeros(127, device="cuda", dtype=dtype), **cfg
         ),
         "invalid K": lambda: gemm(a[:, :767], w[:, :767].t(), out, **cfg),
-        "odd atomic N": lambda: gemm(a, w[:127].t(), split_k_atomic=True, **cfg),
+        "invalid interleave type": lambda: gemm(a, w.t(), out, interleave="yes", **cfg),
     }
-    if dtype == dtypes.fp16:
-        calls["FP16 atomic"] = lambda: gemm(a, w.t(), out, split_k_atomic=True, **cfg)
     for reason, call in calls.items():
         try:
             call()
         except (ValueError, RuntimeError):
             continue
         raise AssertionError(f"TDM accepted {reason}")
-    # Rounded partials must be stored in the input dtype, not FP32 workspace.
+    # Fractional contributions survive FP32 partial storage. Old same-dtype
+    # partials rounded each term down, changing the final answer.
     factor = 1 / 16 if dtype == dtypes.bf16 else 1 / 64
     for part in range(3):
         a[:, part * 256] = w[:, part * 256] = 1
@@ -1157,12 +1459,12 @@ def check_tdm_contracts(dtype):
     y = gemm(a, w.t(), out, **cfg)
     assert (
         checkAllclose(
-            torch.full_like(y, 3).float(),
+            torch.full_like(y, 3 * (1 + factor * factor)).float(),
             y.float(),
             atol=0,
             rtol=0,
             tol_err_ratio=0,
-            msg="same-dtype workspace rounding",
+            msg="FP32 workspace preserves partials",
         )
         == 0
     )
@@ -1185,18 +1487,14 @@ def check_tdm_contracts(dtype):
             )
             == 0
         )
-    if dtype == dtypes.bf16:
-        deterministic = torch.are_deterministic_algorithms_enabled()
-        try:
-            torch.use_deterministic_algorithms(True)
-            try:
-                gemm(a, w.t(), out, split_k_atomic=True, **cfg)
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("atomic policy accepted deterministic mode")
-        finally:
-            torch.use_deterministic_algorithms(deterministic)
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        normal = gemm(a, w.t(), **cfg)
+        again = gemm(a, w.t(), **cfg)
+        torch.testing.assert_close(again, normal, atol=0, rtol=0)
+    finally:
+        torch.use_deterministic_algorithms(deterministic)
     a.zero_()
     w.zero_()
     a[:, 0] = 1
@@ -1265,6 +1563,7 @@ def main():
                 + [row[:3] for row in _MEMORY_TILES]
                 + _TUNED_MEMORY_MNK
                 + _BAND_MNK
+                + _PRESHUFFLE_MNK
             )
         ),
         help="""Shape of mnk.
@@ -1285,6 +1584,9 @@ def main():
         "--bias", nargs="*", type=dtypes.str2bool, default=[False, True]
     )
     parser.add_argument(
+        "--interleave", nargs="*", type=dtypes.str2bool, default=[False, True]
+    )
+    parser.add_argument(
         "--split-k", nargs="*", type=int, choices=range(1, 10), default=[1, 3, 8]
     )
     parser.add_argument(
@@ -1294,9 +1596,27 @@ def main():
     if get_gfx_runtime() == "gfx1250":
         for dtype in args.dtype:
             rows = []
-            for (m, n, k), bias, layout, split_k, stages in itertools.product(
-                args.mnk, args.bias, args.layout, args.split_k, args.stages
+            for (
+                (m, n, k),
+                bias,
+                layout,
+                split_k,
+                stages,
+                interleave,
+            ) in itertools.product(
+                args.mnk,
+                args.bias,
+                args.layout,
+                args.split_k,
+                args.stages,
+                args.interleave,
             ):
+                # NN has no interleaved schedule; exclude it before launch.
+                if layout == "nn" and interleave:
+                    aiter.logger.warning(
+                        "Skipping NN interleave: TDM supports interleave only for NT"
+                    )
+                    continue
                 if _tdm_config(m, n, k, split_k, stages) is None:
                     aiter.logger.warning(
                         "Skipping unsupported TDM K partition: %s",
@@ -1304,20 +1624,40 @@ def main():
                     )
                     continue
                 rows.append(
-                    test_hgemm_tdm(m, n, k, dtype, bias, layout, split_k, stages)
+                    test_hgemm_tdm(
+                        m, n, k, dtype, bias, layout, split_k, stages, interleave
+                    )
                 )
             assert rows, "no valid TDM cases selected"
             summarize(f"TDM HGEMM {dtype}", rows)
             dispatch_rows = [
-                test_hgemm_tdm_tuned(m, n, k, dtype, bias)
-                for (m, n, k), bias in itertools.product(args.mnk, args.bias)
+                test_hgemm_tdm_tuned(m, n, k, dtype, bias, interleave)
+                for (m, n, k), bias, interleave in itertools.product(
+                    args.mnk, args.bias, args.interleave
+                )
                 if k % 384 == 0 and m <= 257 and n % 8 == 0 and n <= 512
             ]
             summarize(f"TDM tuned dispatch {dtype}", dispatch_rows)
+            precision_rows = [
+                test_hgemm_tdm_fp32(m, n, k, dtype, bias)
+                for (m, n, k), bias in itertools.product(args.mnk, args.bias)
+                if (m, n, k) in _TDM_FP32_MNK
+            ]
+            summarize(f"TDM FP32 partials {dtype}", precision_rows)
             check_tdm_contracts(dtype)
         return
     torch.set_default_device("cuda")
     wanted = set(args.mnk)
+    if get_gfx_runtime() == "gfx950" and dtypes.bf16 in args.dtype:
+        check_preshuffle_compiled_dispatch()
+        summarize(
+            "AITER BF16 preshuffle HGEMM",
+            [
+                test_hgemm_preshuffle(m, n, k, dtypes.bf16)
+                for m, n, k in _PRESHUFFLE_MNK
+                if (m, n, k) in wanted
+            ],
+        )
 
     for dtype in args.dtype:
         rows = []
