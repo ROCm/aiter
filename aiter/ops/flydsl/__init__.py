@@ -44,6 +44,8 @@ _LAZY_IMPORTS = {
     "QuickAllReduceInt4": (".quick_allreduce", "QuickAllReduceInt4"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
+    "MXFP4W4A16Config": (".gemm_mxfp4_w4a16", "MXFP4W4A16Config"),
+    "PreparedMXFP4Weight": (".gemm_mxfp4_w4a16", "PreparedMXFP4Weight"),
     "PreshuffledA16WFP4Weight": (
         ".gemm_a16wfp4",
         "PreshuffledA16WFP4Weight",
@@ -84,6 +86,7 @@ _LAZY_IMPORTS = {
         "flydsl_fp8_paged_mqa_logits_gfx1250",
     ),
     "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
+    "flydsl_gemm_mxfp4_w4a16": (".gemm_mxfp4_w4a16", "flydsl_gemm_mxfp4_w4a16"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -163,6 +166,10 @@ _LAZY_IMPORTS = {
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
         "prepare_gemm_a16wfp4_weight",
+    ),
+    "prepare_gemm_mxfp4_w4a16_weight": (
+        ".gemm_mxfp4_w4a16",
+        "prepare_gemm_mxfp4_w4a16_weight",
     ),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
@@ -249,8 +256,10 @@ __all__ = [
     "Fp4MqaPlan",
     "GateMode",
     "GatherWorkspace",
+    "MXFP4W4A16Config",
     "OneShotAllReduce",
     "PADecodePlan",
+    "PreparedMXFP4Weight",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
@@ -268,6 +277,7 @@ __all__ = [
     "flydsl_fp8_paged_mqa_logits_gfx1250",
     "flydsl_fp8_quant",
     "flydsl_gemm_a16wfp4",
+    "flydsl_gemm_mxfp4_w4a16",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
@@ -307,6 +317,7 @@ __all__ = [
     "pa_decode_nhd_max_query_length",
     "plan_pa_decode",
     "prepare_gemm_a16wfp4_weight",
+    "prepare_gemm_mxfp4_w4a16_weight",
     "prepare_pa_decode_plan",
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
