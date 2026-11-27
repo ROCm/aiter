@@ -14,6 +14,8 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
@@ -3176,3 +3178,6 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
+# One launcher for every config: each launch passes its constexprs as the
+# specialization key (grouped_gemm_mxfp4).
+bind_aot(launch_gemm_a8w4_tdm, FlyDSLAotCache("grouped_gemm_a8w4_tdm_gfx1250"), ())

@@ -19,9 +19,8 @@ import re
 import torch
 from torch import Tensor
 
-_launch_gemm_a8w8 = None
-_launch_gemm_a8w8_compute_bound = None
-_compile_splitk_reduce = None
+from .aot_launch import aot_factory
+
 _run_compiled = None
 _ptr_arg = None
 _fx = None
@@ -48,26 +47,50 @@ def _fused_splitk_ok(tile_m, cluster_m, cluster_n, split_k, compute_bound) -> bo
     )
 
 
-def _lazy_import():
-    global _launch_gemm_a8w8, _launch_gemm_a8w8_compute_bound
-    global _compile_splitk_reduce, _run_compiled, _ptr_arg, _fx
-    if _launch_gemm_a8w8 is not None:
-        return
-    import flydsl.expr as fx_mod
-
-    from .kernels.gemm_a8w8_256x256_gfx1250 import (
-        launch_gemm_a8w8_256x256,
-    )
+# AOT launcher factories, shared with the plain bpreshuffle and the batched
+# wrappers. The kernel launchers take their Constexprs as launch arguments, so
+# a factory takes none and every launch passes them in specialization_key. A
+# factory imports its kernel module, so a launch served from the AOT cache
+# (``factory.lazy()``) never does.
+@aot_factory("gemm_a8w8_gfx1250")
+@functools.cache
+def gemm_a8w8_launcher():
     from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+
+    return launch_gemm_a8w8
+
+
+@aot_factory("gemm_a8w8_256x256_gfx1250")
+@functools.cache
+def _gemm_a8w8_compute_bound_launcher():
+    from .kernels.gemm_a8w8_256x256_gfx1250 import launch_gemm_a8w8_256x256
+
+    return launch_gemm_a8w8_256x256
+
+
+@aot_factory("gemm_a8w8_splitk_reduce_gfx1250")
+@functools.cache
+def splitk_reduce_launcher(split_k: int, out_dtype_str: str, partial_dtype_str: str):
     from .kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
         compile_gemm_a8w8_splitk_reduce,
     )
+
+    return compile_gemm_a8w8_splitk_reduce(
+        split_k=split_k,
+        out_dtype_str=out_dtype_str,
+        partial_dtype_str=partial_dtype_str,
+    )
+
+
+def _lazy_import():
+    global _run_compiled, _ptr_arg, _fx
+    if _run_compiled is not None:
+        return
+    import flydsl.expr as fx_mod
+
     from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import ptr_arg
 
-    _launch_gemm_a8w8 = launch_gemm_a8w8
-    _launch_gemm_a8w8_compute_bound = launch_gemm_a8w8_256x256
-    _compile_splitk_reduce = compile_gemm_a8w8_splitk_reduce
     _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _fx = fx_mod
@@ -175,6 +198,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     fuse_quant = y_scale_out is not None
+    # Constexpr launch arguments: the AOT cache compares them by value, where
+    # False and 0 differ.
+    a_preshuffle = bool(a_preshuffle)
+    a_scale_preshuffled = bool(a_scale_preshuffled)
+    w_scale_32x32 = bool(w_scale_32x32)
+    persistent_n_tiles = int(persistent_n_tiles)
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
         raise RuntimeError(
@@ -394,7 +423,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     _lazy_import()
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
-    fused = fused_splitk and _fused_splitk_ok(
+    fused = bool(fused_splitk) and _fused_splitk_ok(
         tile_m, cluster_m, cluster_n, split_k, compute_bound
     )
     if fused:
@@ -461,7 +490,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             batch > 1,
         )
         _run_compiled(
-            _launch_gemm_a8w8_compute_bound,
+            _gemm_a8w8_compute_bound_launcher.lazy(),
             *runtime_args,
             _ptr_arg(y_scale_out) if fuse_quant else _ptr_arg(Out),
             cluster_m,
@@ -481,7 +510,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,
         )
         _run_compiled(
-            _launch_gemm_a8w8,
+            gemm_a8w8_launcher.lazy(),
             *launch_args,
             scale_block,
             split_k,
@@ -498,9 +527,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(
-                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
-            ),
+            splitk_reduce_launcher.lazy(split_k, out_dtype, "f32"),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,

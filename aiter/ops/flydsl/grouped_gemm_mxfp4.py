@@ -181,6 +181,10 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     if stream is None:
         stream = current_stream_arg()
+    if isinstance(stream, torch.cuda.Stream):
+        # Not the launcher's last argument, where the AOT cache would convert
+        # a torch stream itself.
+        stream = fx.Stream(stream)
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
@@ -275,26 +279,28 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    # Constexpr launch arguments: the AOT cache compares them by value, where
+    # True and 1 differ, so each has one type whatever the caller passed.
     gemm_spec = (
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        num_buffers,
-        a_is_fp4,
+        int(K),
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        int(m_warp),
+        int(n_warp),
+        int(out_is_f16),
+        int(num_buffers),
+        int(a_is_fp4),
     )
-    route_spec = (n_experts, stage1_act, has_bias)
-    quant_spec = (stage1_quant_out, quant_wmma_rep)
+    route_spec = (int(n_experts), int(stage1_act), int(has_bias))
+    quant_spec = (int(stage1_quant_out), int(quant_wmma_rep))
     tdm_spec = (
-        cluster_n,
-        cluster_m,
-        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
-        waves_per_tensor_tdm,
-        _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
-        _select_tdm_b_th(tdm_b_th),
+        int(cluster_n),
+        int(cluster_m),
+        int(_select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch)),
+        int(waves_per_tensor_tdm),
+        int(_select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue)),
+        int(_select_tdm_b_th(tdm_b_th)),
     )
     ep_spec = (
         int(enable_ep_scatter),
@@ -310,11 +316,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_row_stride_bytes),
         int(a_scale_row_stride_bytes),
         int(lds_soa_load_interleave),
-        persistent_workers,
-        rolled_drain,
+        int(persistent_workers),
+        int(rolled_drain),
         int(a_preshuffled),
         int(m_align),
-        k_waves,
+        int(k_waves),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
