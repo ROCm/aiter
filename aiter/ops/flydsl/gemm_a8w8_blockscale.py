@@ -100,14 +100,7 @@ def _prepare_scales(
     return sa, w_scale.contiguous().view(-1)
 
 
-@aot_factory(
-    "gemm_a8w8_blockscale",
-    sources=[
-        "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
-        "kernels/gemm_a8w8_blockscale_8wave_gfx942.py",
-        "kernels/gemm_a8w8_blockscale_8wave_gfx950.py",
-    ],
-)
+@aot_factory("gemm_a8w8_blockscale")
 @functools.lru_cache(maxsize=1024)
 def _compile_gemm(
     N: int,

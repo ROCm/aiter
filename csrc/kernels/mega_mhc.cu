@@ -1224,6 +1224,15 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
     constexpr int ACC_STREAMS    = LOCAL_STREAMS ? 1 : STREAMS;
     static_assert(!LOCAL_STREAMS || hidden % (split_k * C::groups * STREAMS * C::chunks * BK) == 0);
     constexpr int WAVES = 4 / STREAMS, GROUPS = C::groups * STREAMS;
+    // aiter#8663 finisher half (on top of aiter#8694's self-rstd): in the mid256 kernel at
+    // H = 5120 (sixteen splits, two wave groups, prefetch 4; with aiter#8694 that is the
+    // no-post T = 129..256 path, VARIANT 25, which shares mid256's tuning), no split waits on
+    // the publish, so the finisher publishes from wave 4 while waves 0-3 run the gates and
+    // Sinkhorn and waves 4-7 normalize both groups' staged columns.
+    constexpr bool FAST_FIN = (VARIANT == 6 || VARIANT == 25) && H == 5120 && STREAMS == 1 &&
+                              C::groups == 2 && !C::decode_rows && C::prefetch == 4 &&
+                              C::split == 16;
+    static_assert(!FAST_FIN || THREADS == 512);
     const int wave = wid % WAVES, wg = GROUPS == 1 ? 0 : wid / WAVES;
     const int lane                = tid % 64;
     constexpr bool ELEMENT_LAYOUT = C::segment || HAS_POST || !IDENTITY_PRE;
@@ -1648,6 +1657,31 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
             store_vector_nbytes<bf16, bf16, 8, 16>(g_norm, x, r * hidden + begin + col);
         }
     };
+    // FAST_FIN finisher: waves 4-7 normalize every group's staged columns
+    // (the arithmetic of normalize_own_columns).
+    auto normalize_all_groups = [&](int t0) {
+        constexpr int norm_store_policy =
+            C::split == 2 || (VARIANT == 24 && !HAS_POST) ? GROUP_NT : RT;
+#pragma unroll
+        for(int g2 = 0; g2 < GROUPS; ++g2)
+        {
+            const int b2 = (split * GROUPS + g2) * hidden_part;
+            for(int i = t0 * 8; i < active_rows * hidden_part; i += 256 * 8)
+            {
+                const int r = i / hidden_part, col = i % hidden_part;
+                bf16x8 x = *reinterpret_cast<const bf16x8*>(&staged_x[g2][r][col]);
+                bf16x8 w = load_vector_nbytes<bf16, 8, 16>(g_weight, b2 + col);
+                bf16x8 out;
+#pragma unroll
+                for(int e = 0; e < 8; ++e)
+                    out[e] = opus::fp32_to_bf16(static_cast<float>(x[e]) * total[r][25] *
+                                                static_cast<float>(w[e]));
+                store_vector_nbytes<bf16, bf16, 8, 16, norm_store_policy>(
+                    g_norm, out, r * hidden + b2 + col);
+                quant.store(out, r * hidden + b2 + col);
+            }
+        }
+    };
     // Kernel ordering prevents the next generation from overlapping this
     // generation's consumers. The publication counter therefore needs no
     // departure RMW or reset. Its high bits wrap safely between launches.
@@ -1845,7 +1879,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
     // Non-finishers compute rstd themselves, so publication only closes the
     // handoff window and re-arms the counter; no store needs to drain first.
     __syncthreads();
-    if(tid == 0)
+    // FAST_FIN: wave 4 publishes while waves 0-3 run the gates and Sinkhorn.
+    if(tid == (FAST_FIN ? 256 : 0))
     {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
         const unsigned next_gen = ((last >> 8) + 1u) & 0xFFFFFFu;
@@ -1860,7 +1895,13 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                                __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
     }
-    __syncthreads();
+    if constexpr(FAST_FIN)
+    {
+        if(tid >= 256)
+            normalize_all_groups(tid - 256);
+    }
+    else
+        __syncthreads();
 
     if(tid < active_rows * 16)
     {
@@ -1903,7 +1944,10 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
             comb_out[gate_token * 16 + gate_lane] = c;
     }
 
-    normalize_own_columns();
+    if constexpr(FAST_FIN)
+        __syncthreads(); // handed_mask was written by wave 4 without a barrier.
+    else
+        normalize_own_columns();
     if(handed_mask != 0)
     {
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
