@@ -226,6 +226,36 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    # The MXFP4 MoE prefill chain with everything a caller plans it with: its
+    # activation quant, block_m choice and token bounds.
+    "minimax_m3_moe_prefill_flydsl": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "a4w4_prefill_moe",
+    ),
+    "minimax_m3_moe_prefill_flydsl_supported": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "supports_shapes",
+    ),
+    "minimax_m3_moe_prefill_mxfp4_quant": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "mxfp4_quant",
+    ),
+    "minimax_m3_moe_prefill_block_m": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "block_m_for",
+    ),
+    "MINIMAX_M3_MOE_PREFILL_MIN_TOKENS": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "MIN_PREFILL_TOKENS",
+    ),
+    "MINIMAX_M3_MOE_PREFILL_MAX_TOKENS": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "MAX_PREFILL_TOKENS",
+    ),
+    "MINIMAX_M3_MOE_PREFILL_BM256_FROM_TOKENS": (
+        ".kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill",
+        "BM256_FROM_TOKENS",
+    ),
     "sparse_pa_nvfp4_decode": (
         ".kernels.sparse_pa_nvfp4_decode",
         "sparse_pa_nvfp4_decode",
@@ -243,6 +273,9 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "MINIMAX_M3_MOE_PREFILL_BM256_FROM_TOKENS",
+    "MINIMAX_M3_MOE_PREFILL_MAX_TOKENS",
+    "MINIMAX_M3_MOE_PREFILL_MIN_TOKENS",
     "CombineWorkspace",
     "DenseGemmConfig",
     "FlyQuickAllReduce",
@@ -302,6 +335,10 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "minimax_m3_moe_prefill_block_m",
+    "minimax_m3_moe_prefill_flydsl",
+    "minimax_m3_moe_prefill_flydsl_supported",
+    "minimax_m3_moe_prefill_mxfp4_quant",
     "pa_decode",
     "pa_decode_default_workgroup_budget",
     "pa_decode_nhd_max_query_length",

@@ -63,6 +63,7 @@ skip_tests=(
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
     "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
+    "op_tests/multigpu_tests/bench_fused_ar_rms_gemma.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).

@@ -1350,6 +1350,112 @@ class GroupCoordinator:
             )
         return output_tensor
 
+    def _all_to_all_nccl(
+        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int
+    ) -> torch.Tensor:
+        """NCCL all-to-all, any scatter/gather dims: all_to_all_single on the
+        scatter dim brought to the front, then the received chunks are laid
+        side by side along the gather dim."""
+        w = self.world_size
+        x = input_.movedim(scatter_dim, 0).contiguous()
+        # 1-byte float types go through NCCL as raw bytes.
+        wire = torch.uint8 if x.dtype.itemsize == 1 else x.dtype
+        out = torch.empty_like(x)
+        torch.distributed.all_to_all_single(
+            out.view(wire), x.view(wire), group=self.device_group
+        )
+        out = out.view((w, x.shape[0] // w) + tuple(x.shape[1:]))
+        if gather_dim == scatter_dim:
+            out = out.reshape((x.shape[0],) + tuple(x.shape[1:]))
+        else:
+            # x's dims are [scatter, the others in order]: the gather dim sits
+            # at gather_dim + 1 if it came before the scatter dim, else at gather_dim.
+            gx = gather_dim + 1 if gather_dim < scatter_dim else gather_dim
+            out = out.movedim(0, gx)
+            merged = list(out.shape)
+            merged[gx : gx + 2] = [merged[gx] * merged[gx + 1]]
+            out = out.reshape(merged)
+        return out.movedim(0, scatter_dim).contiguous()
+
+    def all_to_all_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype, byte_offset: int = 0
+    ) -> torch.Tensor | None:
+        """A view of the registered IPC buffer for a producer to write straight
+        into, for `all_to_all(..., registered=True)`; None if this group has no
+        custom all-to-all. See `CustomAllreduce.input_buffer` for the rules."""
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if dc is not None else None
+        if ca_comm is None or not ca_comm._a2a_transport_ok():
+            return None
+        return ca_comm.input_buffer(shape, dtype, byte_offset)
+
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int = 0,
+        gather_dim: int = -1,
+        scales: torch.Tensor | None = None,
+        use_custom: bool = True,
+        registered: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """All-to-all: split `input_` into world_size equal chunks along
+        `scatter_dim`, send chunk j to rank j, and concatenate the chunks
+        received from ranks 0..W-1, in rank order, along `gather_dim`. The
+        result has the scatter dim divided and the gather dim multiplied by
+        world_size (for scatter_dim == gather_dim the shape is unchanged: the
+        `all_to_all_single` layout). The output is a new contiguous tensor.
+
+        `scales` is a second tensor exchanged with the same scatter and gather
+        dims (its gather dim has its own length), for block-scaled payloads: the
+        codes `[rows, C]` and their scales `[rows, C / 32]` arrive as
+        `[rows / W, W * C]` and `[rows / W, W * C / 32]` in one launch. Returns
+        `(out, scales_out)` then.
+
+        Fast path (custom_all_reduce IPC kernel, gfx9, 2, 4 or 8 ranks): 2D
+        contiguous matrices, scatter_dim 0, gather_dim 0 or last, 16-byte rows;
+        anything else uses NCCL. Every rank must pass the same shapes and
+        flags. With `registered=True` the inputs are not copied: they are views
+        from `all_to_all_buffer` (written by the producer, right before the call).
+        """
+        world_size = self.world_size
+        if world_size == 1:
+            return input_ if scales is None else (input_, scales)
+        ndim = input_.dim()
+        assert (
+            -ndim <= scatter_dim < ndim and -ndim <= gather_dim < ndim
+        ), f"Invalid dims ({scatter_dim}, {gather_dim}) for shape {tuple(input_.shape)}"
+        scatter_dim %= ndim
+        gather_dim %= ndim
+        assert input_.shape[scatter_dim] % world_size == 0, (
+            f"input.shape[{scatter_dim}]={input_.shape[scatter_dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        if scales is not None:
+            assert scales.dim() == ndim and all(
+                scales.shape[d] == input_.shape[d]
+                for d in range(ndim)
+                if d == scatter_dim or d != gather_dim
+            ), "scales must match input_ in every dim but the gather dim"
+        if registered and not use_custom:
+            raise ValueError("registered inputs need use_custom=True")
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if (use_custom and dc is not None) else None
+        if (
+            ca_comm is not None
+            and scatter_dim == 0
+            and ndim == 2
+            and gather_dim in (0, 1)
+        ):
+            out = ca_comm.custom_all_to_all(input_, gather_dim == 1, scales, registered)
+            if out is not None:
+                return out
+        if registered:
+            raise ValueError("registered all-to-all is not served for these inputs")
+        out = self._all_to_all_nccl(input_, scatter_dim, gather_dim)
+        if scales is None:
+            return out
+        return out, self._all_to_all_nccl(scales, scatter_dim, gather_dim)
+
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> torch.Tensor | None:
