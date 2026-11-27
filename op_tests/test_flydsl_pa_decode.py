@@ -184,6 +184,25 @@ def test_pa_decode_plan(
     check(plan, lengths)
     assert len(calls) == compiled
     assert any(key[0] == id(plan) for key in planner._FAST_REFRESH)
+    # A strided view with the pointer and size of a cached contiguous one is
+    # still rejected, not served from the cache.
+    storage = torch.tensor(lengths * 2, dtype=torch.int32, device=device)
+    for _ in range(2):
+        planner.plan_pa_decode(
+            storage[:batch],
+            2,
+            sliding_window=window,
+            query_length=query_length,
+            plan=plan,
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        planner.plan_pa_decode(
+            storage[::2],
+            2,
+            sliding_window=window,
+            query_length=query_length,
+            plan=plan,
+        )
 
     if bucket > 1:
         # Change every runtime value inside the same batch/block-size bucket

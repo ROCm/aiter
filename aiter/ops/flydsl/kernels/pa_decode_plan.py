@@ -394,6 +394,10 @@ def plan_pa_decode(
         and max_partitions is None
         and max_batch_size is None
         and workgroup_budget is None
+        # Only the layout the full path accepts: a strided view shares the
+        # pointer and size of a contiguous one.
+        and context_lengths.ndim == 1
+        and context_lengths.is_contiguous()
     ):
         fast_key = (
             id(plan),
