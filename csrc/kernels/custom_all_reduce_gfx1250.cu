@@ -89,11 +89,11 @@ void dispose(fptr_t _fa)
 }
 
 // Shared meta buffer = Signal struct + LL staging scratch appended after it,
-// then the fused AR + RMSNorm shard and the LL two-shot's own scratch. The LL
-// fast path derives each peer's scratch base as (peer meta) + kLLScratchOffset,
-// the two-shot as + ar2sScratchOffset, reusing the existing cross-rank meta
-// exchange. The whole region is zero-initialized by the caller (which also
-// resets the LL flags). Takes world_size because the scratch is sized by it.
+// then the fused AR + RMSNorm shard. The LL fast path derives each peer's
+// scratch base as (peer meta) + kLLScratchOffset, reusing the existing
+// cross-rank meta exchange. The whole region is zero-initialized by the
+// caller (which also resets the LL flags). Takes world_size because the
+// scratch is sized by it.
 // Reserving kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks'
 // worth. Groups above kLLMaxRanks are allgather-only and never route to LL, so
 // they get no scratch (it would be 1 GiB per rank at 64).
@@ -101,22 +101,21 @@ int64_t meta_size(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
     size_t ll_bytes = world_size <= aiter::kLLMaxRanks
-                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes +
-                                aiter::ar2sScratchBytes((int)world_size)
+                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes
                           : 0;
     return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
 }
 
-// The largest all-reduce the LL kernels take at this world size: the one-shot
-// up to kLLArMaxBytes, the two-shot up to ar2sMaxBytes. Larger ones take the
-// naive kernels. The Python default cutoff for plain all-reduce stays at or
-// below it.
+// The largest all-reduce the meta-buffer kernels take at this world size: the
+// LL one-shot, up to kLLArMaxBytes. Larger ones take the naive kernels; the
+// two-shot is the Lamport one (allreduce_lamport). The Python default cutoff
+// for plain all-reduce stays at or below it.
 int64_t ll_ar_max_bytes(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
     if(world_size > aiter::kLLMaxRanks)
         return 0;
-    return (int64_t)std::max(aiter::kLLArMaxBytes, aiter::ar2sMaxBytes((int)world_size));
+    return (int64_t)aiter::kLLArMaxBytes;
 }
 
 // ---- Internal dispatch helper ----
@@ -801,10 +800,8 @@ void allreduce_add_lamport(fptr_t _fa,
 #undef RUN_LAMPORT_ADD
 }
 
-void allreduce_lamport(fptr_t _fa,
-                       const aiter_tensor_t& inp,
-                       const aiter_tensor_t& out,
-                       bool two_shot)
+void allreduce_lamport(
+    fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, bool two_shot, bool split)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -814,18 +811,21 @@ void allreduce_lamport(fptr_t _fa,
         throw std::runtime_error(
             "allreduce_lamport requires a contiguous input and a matching contiguous out");
 
-#define RUN_LAMPORT_AR(T)                                                      \
-    fa->allreduce_lamport<T>(stream,                                           \
-                             reinterpret_cast<const T*>(inp.data_ptr()),       \
-                             reinterpret_cast<T*>(out.data_ptr()),             \
-                             inp.numel(),                                      \
-                             two_shot)
+#define RUN_LAMPORT_AR(T)                                                \
+    fa->allreduce_lamport<T>(stream,                                     \
+                             reinterpret_cast<const T*>(inp.data_ptr()), \
+                             reinterpret_cast<T*>(out.data_ptr()),       \
+                             inp.numel(),                                \
+                             two_shot,                                   \
+                             split)
 
     switch(inp.dtype())
     {
     case AITER_DTYPE_fp16: RUN_LAMPORT_AR(opus::fp16_t); break;
     case AITER_DTYPE_bf16: RUN_LAMPORT_AR(opus::bf16_t); break;
-    default: throw std::runtime_error("allreduce_lamport only supports float16 and bfloat16");
+    case AITER_DTYPE_fp32: RUN_LAMPORT_AR(opus::fp32_t); break; // the two-shot only
+    default:
+        throw std::runtime_error("allreduce_lamport only supports float16, bfloat16 and float32");
     }
 #undef RUN_LAMPORT_AR
 }
