@@ -1532,7 +1532,12 @@ def _moe_gemm_a4w4_decode(
         pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
     else:
         unpadded_m = grid_m
-    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
+    if XCD_SWIZZLE == 1:
+        GRID_N: gl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
+        pid_m = pid // GRID_N
+        pid_n = pid % GRID_N
+    else:
+        pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
 
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
@@ -1573,7 +1578,7 @@ def _moe_gemm_a4w4_decode(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
         mask_idx = offs_x_m < M
-        offs_x_m = offs_x_m % M
+        offs_x_m = gl.minimum(offs_x_m, M - 1)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
@@ -1589,7 +1594,7 @@ def _moe_gemm_a4w4_decode(
             PACKED_BLOCK_M_X,
             layout=gl.SliceLayout(1, X_SCALES_OFFS_LAYOUT),
         )
-        offs_x_m_scales = offs_x_m_scales % M
+        offs_x_m_scales = gl.minimum(offs_x_m_scales, M - 1)
         if GatherIndx is not None:
             offs_x_m_scales = gl.load(GatherIndx + offs_x_m_scales) // N_EXPTS_ACT
         offs_x_k_scales = gl.arange(
