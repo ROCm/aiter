@@ -1,0 +1,18 @@
+{
+    "M_LEQ_8192": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 256,
+        "GROUP_SIZE_M": 2,
+        "num_warps": 8,
+        "kernel_type": "bandwidth_bound"
+    },
+    "any": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 256,
+        "GROUP_SIZE_M": 2,
+        "num_warps": 8,
+        "kernel_type": "compute_bound"
+    }
+}

@@ -4,6 +4,8 @@ import math
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
+from aiter.ops.triton.gemm.basic import gemm_afp4wfp4 as gemm_afp4wfp4_module
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
@@ -40,6 +42,7 @@ def bench_gemm_fn(
     layout: str,
     preshuffle: bool,
     gluon: bool,
+    compute_bound: bool = False,
 ):
     c_dtype = torch.bfloat16
 
@@ -64,8 +67,37 @@ def bench_gemm_fn(
 
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    if preshuffle:
-        kernel_fn = functools.partial(gemm_afp4wfp4_preshuffle, dtype=c_dtype)
+    if compute_bound:
+        reason = gemm_afp4wfp4_module._pingpong_env_unsupported()
+        if reason is not None:
+            raise RuntimeError(f"compute_bound kernel cannot run here: {reason}")
+        # Explicit config: the gfx950 Gluon compute_bound (ping-pong) kernel, with
+        # the tile of the gluon config.
+        config, _ = _get_config(M, N, K // 2, preshuffle, backend="gluon")
+        config["kernel_type"] = "compute_bound"
+        b = rot_bufs[0]
+        if preshuffle:
+            unsupported = gemm_afp4wfp4_module._preshuffle_pingpong_unsupported
+            gemm_fn = gemm_afp4wfp4_preshuffle
+        else:
+            unsupported = gemm_afp4wfp4_module._pingpong_unsupported
+            gemm_fn = triton_gemm_afp4wfp4
+        reason = unsupported(
+            b[x_key], b[w_key], b["x_scales"], b["w_scales"], b["y"], c_dtype, config
+        )
+        if reason is not None:
+            raise RuntimeError(
+                f"compute_bound kernel cannot run M={M} N={N} K={K}: {reason}"
+            )
+        kernel_fn = functools.partial(
+            gemm_fn, dtype=c_dtype, config=config, backend="gluon"
+        )
+    elif preshuffle:
+        kernel_fn = functools.partial(
+            gemm_afp4wfp4_preshuffle,
+            dtype=c_dtype,
+            backend="gluon" if gluon else None,
+        )
     elif gluon:
         kernel_fn = functools.partial(
             triton_gemm_afp4wfp4, dtype=c_dtype, backend="gluon"
@@ -160,6 +192,7 @@ def run_model_benchmark(args):
             args.layout,
             args.preshuffle,
             args.gluon,
+            args.compute_bound,
         )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -183,6 +216,7 @@ def run_shape_benchmark(args):
             args.layout,
             args.preshuffle,
             args.gluon,
+            args.compute_bound,
         )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -196,12 +230,21 @@ def parse_args(args: list[str] | None = None):
         "--preshuffle",
         action="store_true",
         dest="preshuffle",
-        help="Preshuffle weight and scales (gfx1250: Gluon gemm_mxfp4_preshuffle_gfx1250; else Triton).",
+        help="Preshuffle weight and scales (gfx1250: Gluon gemm_mxfp4_preshuffle_gfx1250; "
+        "gfx950: Triton, or with --gluon the kernel that the gluon config selects).",
     )
     parser.add_argument(
         "--gluon",
         action="store_true",
-        help="Use Gluon non-preshuffle kernel (ignored if --shuffle/--preshuffle is set).",
+        help="Use the Gluon backend. With --shuffle/--preshuffle on gfx950, the gluon "
+        "config selects the kernel.",
+    )
+    parser.add_argument(
+        "--compute-bound",
+        action="store_true",
+        help="Use the gfx950 Gluon compute_bound kernel through an explicit config "
+        '(kernel_type="compute_bound"), also with --shuffle/--preshuffle. Fails if '
+        "the inputs cannot use it.",
     )
     return get_ff_args(parser, args=args)
 
