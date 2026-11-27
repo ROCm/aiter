@@ -99,7 +99,7 @@ _K5_AR_FUSED_MXFP8 = os.environ.get("AITER_K5_AR_FUSED_MXFP8", "0") == "1"
 
 
 # A routed MoE output whose last launch (gather-reduce + routed scale + shared add) was deferred
-# into its consumer (aiter.ops.flydsl.moe_deferred_tail, ATOM_MINIMAX_M3_MOE_TAIL_IN_AR): the k5
+# into its consumer (aiter.ops.flydsl.moe_deferred_tail, a caller's tail-in-AR switch): the k5
 # one-shot AR computes those rows in its prologue (same bits); every other path, and every
 # other entry point here, runs the deferred launch first.
 try:
@@ -116,6 +116,36 @@ except ImportError:  # pragma: no cover - no FlyDSL
 
 def _take_tail(input_):
     return _take_deferred_tail(input_) if _has_deferred_tail() else None
+
+
+try:
+    from aiter.ops.flydsl.moe_deferred_tail import TAP_STATS as _TAP_STATS
+    from aiter.ops.flydsl.moe_deferred_tail import take_residual_tap as _take_residual_tap
+except ImportError:  # pragma: no cover - no FlyDSL
+    _take_residual_tap = lambda x: None  # noqa: E731
+    _TAP_STATS = {"written": 0}
+
+
+def _tap_written() -> None:
+    _TAP_STATS["written"] += 1
+
+
+def _with_residual_tap(fn, residual_index: int):
+    """An AR + norm entry point that also writes a residual tap registered for its input
+    (aiter.ops.flydsl.moe_deferred_tail.register_residual_tap): its residual output."""
+
+    def wrapped(self, input_, res_inp_, *args, **kwargs):
+        tap = _take_residual_tap(input_)
+        out = fn(self, input_, res_inp_, *args, **kwargs)
+        if tap is not None:
+            buf, rows = tap
+            buf[rows] = out[residual_index]
+            _tap_written()
+        return out
+
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
 
 
 def _settle_tail(tail) -> None:
@@ -1669,3 +1699,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         manager = self.get_or_create_all2all_manager()
         hidden_states = manager.combine(hidden_states, is_sequence_parallel)
         return hidden_states
+
+
+# The AR + norm entry points a MoE layer's output feeds (the next layer's input AR, the final norm's):
+# they also write that layer's residual tap, if one was registered (residual output index 1).
+CudaCommunicator.fused_allreduce_rmsnorm = _with_residual_tap(CudaCommunicator.fused_allreduce_rmsnorm, 1)
+CudaCommunicator.fused_allreduce_rmsnorm_mxfp8_quant = _with_residual_tap(
+    CudaCommunicator.fused_allreduce_rmsnorm_mxfp8_quant, 1
+)

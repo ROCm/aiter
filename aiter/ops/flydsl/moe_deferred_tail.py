@@ -41,7 +41,11 @@ class MoeDeferredTail:
     """``out[t] = bf16(sum_k gather_w[t, k] * rows_bf16[topids_to_rows[t, k]])``,
     then ``* scale`` (rounded) when ``scale != 1`` and ``+ addend`` (rounded) with an
     addend: the gather-reduce launch it stands for. ``before`` (e.g. the join of
-    the stream producing ``addend``) must run before any launch that reads it."""
+    the stream producing ``addend``) must run before any launch that reads it.
+    ``gemm2`` (``launch()``, from ``keep_gemm2``): the GEMM2 launch that writes
+    ``grouped_out``, held back for a consumer that runs it inside its own launch
+    (``CustomAllreduce.k5_fused_ar_rms_tail``); every other reader of
+    ``grouped_out`` calls ``run_gemm2`` first."""
 
     __slots__ = (
         "out",
@@ -51,9 +55,12 @@ class MoeDeferredTail:
         "addend",
         "scale",
         "before",
+        "gemm2",
     )
 
-    def __init__(self, out, grouped_out, topids_to_rows, gather_w, addend, scale, before):
+    def __init__(
+        self, out, grouped_out, topids_to_rows, gather_w, addend, scale, before, gemm2=None
+    ):
         self.out = out
         self.grouped_out = grouped_out
         self.topids_to_rows = topids_to_rows
@@ -61,6 +68,13 @@ class MoeDeferredTail:
         self.addend = addend
         self.scale = float(scale)
         self.before = before
+        self.gemm2 = gemm2
+
+    def run_gemm2(self) -> None:
+        """Launch the held-back GEMM2 (once): ``grouped_out`` is then written."""
+        gemm2, self.gemm2 = self.gemm2, None
+        if gemm2 is not None:
+            gemm2.launch()
 
     def run_before(self) -> None:
         before, self.before = self.before, None
@@ -82,6 +96,7 @@ class MoeDeferredTail:
             warn=True,
         )
 
+        self.run_gemm2()
         self.run_before()
         flydsl_moe_gather_reduce(
             self.grouped_out,
@@ -208,6 +223,54 @@ def register_deferred_moe_tail(tail: MoeDeferredTail) -> bool:
     _PENDING[tail.out.data_ptr()] = tail
     scope.deferred = tail
     return True
+
+
+# Residual taps: a caller that wants the residual stream after a MoE layer (e.g. a speculative
+# drafter's hidden-state tap) hands the all-reduce that consumes the layer's output (keyed by that
+# output's storage, like a deferred tail) the buffer rows to write with its residual output.
+_TAPS: dict[int, tuple] = {}
+TAP_STATS = {"registered": 0, "written": 0}  # host-side counts (captures included), for engagement checks
+
+
+def register_residual_tap(x: torch.Tensor, buf: torch.Tensor, rows) -> None:
+    """The all-reduce + norm consuming ``x`` writes its residual output into ``buf[rows]``."""
+    _TAPS[x.data_ptr()] = (buf, rows)
+    TAP_STATS["registered"] += 1
+
+
+def take_residual_tap(x: torch.Tensor):
+    """The (buffer, rows) registered for ``x``, removed, or None."""
+    if not _TAPS or not isinstance(x, torch.Tensor):
+        return None
+    return _TAPS.pop(x.data_ptr(), None)
+
+
+# A deferred-tail launch: a caller that can run a deferred tail's GEMM2, the tail and the all-reduce
+# that takes it as one launch registers it here; with none registered nothing below changes.
+_TAIL_LAUNCH = None
+
+
+def register_tail_launch(keep, fuse) -> None:
+    """``keep(gemm2_args, gemm2_kwargs, tp_gather, tokens)``: an object with ``launch()`` holding the
+    grouped MoE's GEMM2 back for the all-reduce, or None to launch it as usual. ``fuse(ca, tail,
+    operands, res_inp, w, eps, gemma_norm, lamport_order, fp8_out)``: the all-reduce's outputs from
+    one launch, or None (GEMM2 then runs and the all-reduce takes the tail as before)."""
+    global _TAIL_LAUNCH
+    if _TAIL_LAUNCH is not None and _TAIL_LAUNCH != (keep, fuse):
+        import logging
+
+        logging.getLogger("aiter").warning("deferred MoE tail: a different tail launch replaces the registered one")
+    _TAIL_LAUNCH = (keep, fuse)
+
+
+def keep_gemm2(args, kw, tp_gather, tokens: int):
+    return None if _TAIL_LAUNCH is None else _TAIL_LAUNCH[0](args, kw, tp_gather, tokens)
+
+
+def fused_tail(ca, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, fp8_out):
+    if _TAIL_LAUNCH is None:
+        return None
+    return _TAIL_LAUNCH[1](ca, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, fp8_out)
 
 
 def has_deferred_moe_tail() -> bool:

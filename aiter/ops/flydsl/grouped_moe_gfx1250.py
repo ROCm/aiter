@@ -2057,13 +2057,8 @@ def _grouped_a8w4_tdm_moe(
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
-        grouped_out,
-        a2_payload,
-        w2_u8,
-        a2_scale,
-        w2s_i32,
-        psum,
+    _gemm2_args = (grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum)
+    _gemm2_kw = dict(
         n_experts=E,
         contiguous_m=contiguous_m,
         N=model_dim,
@@ -2103,6 +2098,18 @@ def _grouped_a8w4_tdm_moe(
         # decode TP route: GEMM2 reads its tile map in one round trip
         **({"psum_one_trip": 1} if _tp_gather is not None and TP_ROUTE_LITE["gemm2"] else {}),
     )
+    # A registered deferred-tail launch (moe_deferred_tail.register_tail_launch)
+    # may run GEMM2 inside the all-reduce that takes this call's deferred tail;
+    # the launch is then held back for it, and runs here otherwise.
+    from aiter.ops.flydsl.moe_deferred_tail import keep_gemm2
+
+    _kept_gemm2 = (
+        None
+        if _is_ep or _fold is not None or enable_ep_scatter
+        else keep_gemm2(_gemm2_args, _gemm2_kw, _tp_gather, token_num)
+    )
+    if _kept_gemm2 is None:
+        flydsl_grouped_gemm_a8w4_masked(*_gemm2_args, **_gemm2_kw)
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -2340,9 +2347,13 @@ def _grouped_a8w4_tdm_moe(
                     epi.addend,
                     epi.scale,
                     epi.before,
+                    _kept_gemm2,
                 )
             ):
                 return moe_out
+        if _kept_gemm2 is not None:
+            # the tail was not deferred after all: GEMM2 before the gather-reduce
+            _kept_gemm2.launch()
         if epi is not None and epi.before is not None:
             epi.before()
         addend = None if epi is None else epi.addend
