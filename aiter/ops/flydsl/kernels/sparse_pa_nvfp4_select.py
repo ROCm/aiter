@@ -14,10 +14,15 @@
 score row in the first instructions of ``sparse_pa_nvfp4_decode``'s workgroup, so a
 scorer -> attention chain needs no selector launch in between.
 
-Order and ties are those of ``topk_per_row_small_k`` (the aiter selector the chain
-otherwise runs): descending score, ties to the larger block id, NaN above +inf, the
-``init_blocks`` leading and ``local_blocks`` trailing live blocks forced in (the trailing
-ones outrank the leading), ids -1 past the row's live count.
+Order and ties are the canonical selector contract: descending score, ties to the larger
+block id, NaN above +inf, the ``init_blocks`` leading and ``local_blocks`` trailing live
+blocks forced in (the trailing ones outrank the leading), ids -1 past the row's live count.
+This fused path implements that larger-id tie-break exactly. ``topk_per_row_small_k`` (the
+aiter selector the chain otherwise runs) matches it on untied rows but deviates at its chunk
+cut: when more chunks tie at the k-th place than there are places it drops chunks by lane id,
+which is not monotone in the column, so the two can return different, equally-scored blocks
+on the rows that tie at the 16th place (~0.1% of rows at 256 rows in the PR's measurement).
+Both orders are deterministic and independent of the row's place in the batch.
 
 Algorithm for a row of at most ``SELECT_BLOCKS`` (= 4 waves x 7 strips x 64) live blocks,
 all of it in registers and wave ballots, four barriers:
