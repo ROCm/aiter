@@ -3,9 +3,9 @@
 #pragma once
 
 // gfx950 MoE token permute / unpermute: the numbers of the kernels (workgroup, chunk, cache policies, the plan's
-// LDS tables). No device code. Kernel arguments: opus_moe_permute_kargs.cuh.
-#include "opus_moe_permute.h"   // OPUS_MOE_PERMUTE_GROUP_ALIGN
-#include "opus_moe_permute_kargs.cuh"
+// LDS tables). No device code. Kernel arguments: opus_moe_permute.h.
+#include "opus/opus.hpp"
+#include "opus_moe_permute.h"
 
 namespace opus_moe_permute {
 
