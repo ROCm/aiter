@@ -18,6 +18,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
+    a16w16_requires_k_aligned,
     get_kernel_instance,
     group_kids,
 )
@@ -75,8 +76,11 @@ def _supports_a16w16_shape(
             return False
         return split_k <= (K + instance.B_K - 1) // instance.B_K
 
+    if a16w16_requires_k_aligned(instance) and K % instance.B_K != 0:
+        return False
+
     if instance.kernel_tag == "a16w16_mono_tile":
-        return N % instance.B_N == 0 and K % instance.B_K == 0
+        return N % instance.B_N == 0
 
     if not instance.has_oob:
         return M % instance.B_M == 0 and N % instance.B_N == 0
@@ -350,6 +354,14 @@ def _build_a16w16_launch_plan(
         raise ValueError(
             "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
             f"batch=1; got batch={batch}"
+        )
+    if a16w16_requires_k_aligned(instance) and K % instance.B_K != 0:
+        raise ValueError(
+            f"OPUS kid {resolved_kid} ({instance.kernel_tag}) has no K-tail "
+            f"handling and requires K % {instance.B_K} == 0; got K={K}. "
+            "A partial K tile would read the bytes past logical K in each "
+            "row and return wrong results; pick a kid that masks the K tail "
+            "(for example a16w16_flatmm_splitk with OOB) or pad K."
         )
     if not _supports_a16w16_shape(instance, M=M, N=N, K=K):
         raise ValueError(

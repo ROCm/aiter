@@ -65,6 +65,7 @@ from opus_gemm_common import (
     GFX1250_SPLITK_FUSE_KIDS,
     _opus_sidecar_path,
     a16w16_flatmm_prefetch_k_iter,
+    a16w16_requires_k_aligned,
     get_registry,
     group_kids,
 )
@@ -536,9 +537,12 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
           - a16w16_flatmm:        N % 16 != 0 -> same root cause.
           - a16w16_flatmm:        K % B_K != 0 -> no K-tail mask, garbage
             accumulates at K tail iter.
-          - a16w16_flatmm_splitk: NONE. The reduce-kernel tail path + the
-            splitk main kernel's mask_va_tail cover both edge cases, so
-            splitk is safe for any (M, N, K).
+          - a16w16 split-barrier, a16w16_persistent and every no-OOB kid:
+            K % B_K != 0 -> no K-tail mask, the output depends on the bytes
+            past logical K (see a16w16_requires_k_aligned).
+          - a16w16_flatmm_splitk (OOB): NONE. The reduce-kernel tail path +
+            the splitk main kernel's mask_va_tail cover both edge cases, so
+            it is safe for any (M, N, K) with finite padding.
     """
     if k_inst.max_m is not None and M > k_inst.max_m:
         return True
@@ -591,10 +595,10 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
             return True
         if N % 16 != 0:
             return True
-        return bool(
-            not k_inst.has_oob
-            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
-        )
+        # No K-tail mask: a partial last K tile reads the bytes past logical K.
+        if a16w16_requires_k_aligned(k_inst) and K % B_K != 0:
+            return True
+        return bool(not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0))
 
     if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
         waves_per_wg = k_inst.BLOCK_SIZE // 64
@@ -612,9 +616,9 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
-        if not k_inst.has_oob and (
-            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
-        ):
+        if a16w16_requires_k_aligned(k_inst) and K % B_K != 0:
+            return True
+        if not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0):
             return True
         # Workspace + reduce buffer-resource size limit.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
@@ -725,10 +729,10 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        return bool(
-            not k_inst.has_oob
-            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
-        )
+        # No K-tail mask: a partial last K tile reads the bytes past logical K.
+        if a16w16_requires_k_aligned(k_inst) and K % B_K != 0:
+            return True
+        return bool(not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0))
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
         # mono_tile is divisible-only (has_oob=False is intrinsic; the

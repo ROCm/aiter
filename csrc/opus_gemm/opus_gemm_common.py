@@ -538,6 +538,22 @@ class OpusGemmInstance:
         return _opus_sf_shuf_sub()
 
 
+# gfx950 a16w16 pipelines whose A/B tile loads have no K-tail mask. Their buffer
+# resources are bounded by rows, not by K, so a partial last K tile reads the
+# bytes that follow logical K in each physical row (padding, or the next row)
+# and the output depends on them (ROCm/aiter#5954). They are only correct when
+# K % B_K == 0. ``a16w16_flatmm_splitk`` masks the A tail under HAS_OOB and is
+# not listed; its no-OOB variants are covered by the has_oob rule below.
+A16W16_UNMASKED_K_TAIL_TAGS = frozenset(
+    {"a16w16", "a16w16_flatmm", "a16w16_persistent", "a16w16_mono_tile"}
+)
+
+
+def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
+    """Whether the kid is only correct when K is a multiple of its B_K."""
+    return instance.kernel_tag in A16W16_UNMASKED_K_TAIL_TAGS or not instance.has_oob
+
+
 def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
 
