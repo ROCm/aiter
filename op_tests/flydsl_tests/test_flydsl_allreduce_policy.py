@@ -48,6 +48,7 @@ from aiter.ops.flydsl.allreduce_policy import (
 )
 from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
+    MAX_RELAYS,
     RELAY_MAX_DEN,
     check_relay,
     make_quick_allreduce_mesh_kernel,
@@ -281,13 +282,40 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(cell):
     # above constrains them.
 
 
-@pytest.mark.parametrize("relay", [(1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (1, 1)])
+@pytest.mark.parametrize(
+    "relay",
+    [
+        (1, 4),
+        (3, 8),
+        (1, 2),
+        (5, 8),
+        (3, 4),
+        (1, 1),
+        ((1, 4), (3, 8)),
+        ((1, 4), (1, 2)),
+        ((0, 1), (1, 1)),
+    ],
+)
 def test_check_relay_accepts_valid_fractions(relay):
     assert check_relay(relay) == relay
 
 
+def test_check_relay_normalizes_equal_asymmetric_pair():
+    assert check_relay(((1, 4), (1, 4))) == (1, 4)
+
+
 @pytest.mark.parametrize(
-    "relay", [(0, 2), (3, 2), (1, RELAY_MAX_DEN + 1), (1, 0), (-1, 2)]
+    "relay",
+    [
+        (0, 2),
+        (3, 2),
+        (1, RELAY_MAX_DEN + 1),
+        (1, 0),
+        (-1, 2),
+        ((0, 1), (0, 1)),
+        ((3, 2), (1, 2)),
+        ((1, 2), (1, RELAY_MAX_DEN + 1)),
+    ],
 )
 def test_check_relay_rejects_out_of_range(relay):
     with pytest.raises(ValueError):
@@ -297,9 +325,13 @@ def test_check_relay_rejects_out_of_range(relay):
 @pytest.mark.parametrize(
     "kw",
     [
-        {"world_size": 4, "rank": 0},
+        {"world_size": 8, "rank": 0},
         {"world_size": 2, "rank": -1},
         {"world_size": 2, "rank": 0, "inbox_memory": "finegrained"},
+        {"world_size": 4, "rank": 0, "inbox_memory": "finegrained"},
+        {"world_size": 2, "rank": 0, "n_relays": 0},
+        {"world_size": 2, "rank": 0, "n_relays": MAX_RELAYS + 1},
+        {"world_size": 4, "rank": 0, "n_relays": 2},
     ],
 )
 def test_relay_factory_rejects_unsupported_configs(kw):
@@ -309,6 +341,51 @@ def test_relay_factory_rejects_unsupported_configs(kw):
             relay=(1, 2),
             **{"inbox_memory": "uncached", "codec": "int4", **kw},
         )
+
+
+def test_relay_factory_rejects_n_relays_without_relay():
+    with pytest.raises(ValueError):
+        make_quick_allreduce_mesh_kernel(
+            grid=128,
+            world_size=2,
+            rank=0,
+            inbox_memory="uncached",
+            codec="int4",
+            n_relays=2,
+        )
+
+
+@pytest.mark.parametrize("n_relays", [1, 2, 3])
+def test_relay_factory_builds_distinct_tags_for_n_relays(n_relays):
+    spec = make_quick_allreduce_mesh_kernel(
+        grid=128,
+        block=256,
+        world_size=2,
+        rank=0,
+        inbox_memory="uncached",
+        codec="int4",
+        relay=(3, 4),
+        n_relays=n_relays,
+    )
+    assert spec["relay"] == (3, 4)
+    assert spec["n_relays"] == n_relays
+    expected_suffix = "_rly3o4" if n_relays == 1 else f"_rly3o4k{n_relays}"
+    assert spec["launch"].func.__name__.endswith(expected_suffix)
+
+
+def test_relay_factory_tp4_asymmetric_tag_and_bounce_bytes():
+    spec = make_quick_allreduce_mesh_kernel(
+        grid=128,
+        block=256,
+        world_size=4,
+        rank=0,
+        inbox_memory="uncached",
+        codec="int4",
+        relay=((1, 4), (3, 8)),
+    )
+    assert spec["relay"] == ((1, 4), (3, 8))
+    assert spec["launch"].func.__name__.endswith("_rly1o4_3o8")
+    assert spec["bounce_bytes"] > 0
 
 
 def _env(**kw):

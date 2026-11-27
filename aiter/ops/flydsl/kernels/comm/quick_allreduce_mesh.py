@@ -97,6 +97,7 @@ DEFAULT_DIVISOR = 1.0
 # Re-exported for the host, which imports its tile math from this module.
 __all__ = [
     "DEFAULT_DIVISOR",
+    "MAX_RELAYS",
     "MESH_RELAY_DEFAULTS",
     "RELAY_MAX_DEN",
     "TILE_BYTES",
@@ -182,7 +183,10 @@ def clamp_grid_cap(
 # only when the caller passes ``relay_devices``; production dispatch does not,
 # as the relay GPUs may belong to other work. An arch without an entry needs
 # both values from the caller.
-MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
+MESH_RELAY_DEFAULTS = {
+    ("xgmi", 2, "gfx950"): (480 << 10, (3, 8)),
+    ("xgmi", 4, "gfx950"): (480 << 10, ((1, 4), (3, 8))),
+}
 
 
 def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int]:
@@ -203,6 +207,10 @@ def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int
 # spreads the relay blocks over every XCD.
 RELAY_MAX_DEN = 8
 
+# Maximum relay GPUs per TP2 direction: peer0..peer7 hold 2 TP inboxes +
+# K outgoing bounces + K incoming bounces, so 2 + 2*K <= 8 => K <= 3.
+MAX_RELAYS = 3
+
 # A relay block's payload stores go out at system scope (``sc0 sc1 nt``). The
 # ``vmcnt(0)`` before the flag then means the payload is visible on the relay,
 # which the flag, landing in the peer's inbox, does not otherwise order.
@@ -219,14 +227,34 @@ _RELAY_RECV_CM = 0
 _RELAY_ACQUIRE_SCOPE = rocdl.SyncScope.AgentOneAs
 
 
-def check_relay(relay):
-    num, den = (int(x) for x in relay)
-    if not 0 < num <= den <= RELAY_MAX_DEN:
+def _check_relay_pair(pair, *, allow_zero: bool = False) -> tuple[int, int]:
+    num, den = (int(x) for x in pair)
+    lo = 0 if allow_zero else 1
+    if not (lo <= num <= den <= RELAY_MAX_DEN and den >= 1):
         raise ValueError(
-            f"relay must be (num, den) with 0 < num <= den <= {RELAY_MAX_DEN}, "
-            f"got {tuple(relay)!r}"
+            f"relay must be (num, den) with {lo} <= num <= den <= {RELAY_MAX_DEN}, "
+            f"got {tuple(pair)!r}"
         )
     return num, den
+
+
+def check_relay(relay):
+    items = tuple(relay)
+    if len(items) == 2 and all(isinstance(x, (tuple, list)) for x in items):
+        rs = _check_relay_pair(items[0], allow_zero=True)
+        ag = _check_relay_pair(items[1], allow_zero=True)
+        if rs[0] == 0 and ag[0] == 0:
+            raise ValueError(
+                f"asymmetric relay must enable at least one phase, got {items!r}"
+            )
+        return rs if rs == ag else (rs, ag)
+    return _check_relay_pair(items, allow_zero=False)
+
+
+def _relay_phases(relay) -> tuple[tuple[int, int], tuple[int, int]]:
+    if isinstance(relay[0], tuple):
+        return relay[0], relay[1]
+    return relay, relay
 
 
 def mesh_lds_bytes(
@@ -263,7 +291,8 @@ def make_quick_allreduce_mesh_kernel(
     mxfp4: bool = False,
     low_latency: bool = False,
     rank: int,
-    relay: tuple[int, int] | None = None,
+    relay: tuple[int, int] | tuple[tuple[int, int], tuple[int, int]] | None = None,
+    n_relays: int = 1,
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
     if low_latency and (fusion == "none" or super_tile != 1):
@@ -280,13 +309,22 @@ def make_quick_allreduce_mesh_kernel(
         raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
     if not 0 <= int(rank) < world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    n_relays = int(n_relays)
+    if not 1 <= n_relays <= MAX_RELAYS:
+        raise ValueError(f"n_relays must be in [1, {MAX_RELAYS}], got {n_relays}")
+    if relay is None and n_relays != 1:
+        raise ValueError("n_relays != 1 requires relay to be set")
     if relay is not None:
         relay = check_relay(relay)
-        if world_size != 2 or inbox_memory != "uncached":
+        if world_size not in (2, 4) or inbox_memory != "uncached":
             raise ValueError(
-                "relay needs world_size=2 and an uncached inbox, got "
+                "relay needs world_size in (2, 4) and an uncached inbox, got "
                 f"world_size={world_size}, "
                 f"inbox_memory={inbox_memory!r}"
+            )
+        if world_size == 4 and n_relays != 1:
+            raise ValueError(
+                f"TP4 relay uses 1 sender-owned relay per rank, got n_relays={n_relays}"
             )
 
     if fusion == "none":
@@ -443,12 +481,42 @@ def make_quick_allreduce_mesh_kernel(
         self_inbox = peers[self_rank]
         inbox = _buffer_ptr(self_inbox, T.i32, 4)
         if const_expr(relay is not None):
-            # Uniform per block, and the same on both ranks for the same tiles.
-            is_relay = (bid % fx.Int32(relay[1])) < fx.Int32(relay[0])
-            # The host passes this rank's outgoing and incoming bounce in the
-            # peer slots after the TP ranks (_StEngine.peer_args).
-            bounce_out = _buffer_ptr(peer_args[world_size], T.i32, 4)
-            bounce_in = _buffer_ptr(peer_args[world_size + 1], T.i32, 4)
+            # The host passes this rank's outgoing and incoming bounce(s) in
+            # the peer slots after the TP ranks (_StEngine.peer_args):
+            #   TP2: [peer0, peer1, out0..out{K-1}, in0..in{K-1}]
+            #   TP4: [peer0..peer3, bounce_out, bounce_in_0..bounce_in_2]
+            if const_expr(world_size == 4):
+                bounce_out = _buffer_ptr(peer_args[world_size], T.i32, 4)
+                bounce_in_list = [
+                    _buffer_ptr(peer_args[world_size + 1 + j], T.i32, 4)
+                    for j in range_constexpr(n_push)
+                ]
+            elif const_expr(n_relays == 1):
+                bounce_out = _buffer_ptr(peer_args[world_size], T.i32, 4)
+                bounce_in = _buffer_ptr(peer_args[world_size + 1], T.i32, 4)
+            else:
+                (num_rs, den_rs), (num_ag, den_ag) = _relay_phases(relay)
+                r_num, r_den = (
+                    (num_rs, den_rs) if num_rs >= num_ag else (num_ag, den_ag)
+                )
+                r_slot = bid % fx.Int32(r_den)
+                r_idx = (
+                    r_slot % fx.Int32(n_relays)
+                    if const_expr(r_num >= n_relays)
+                    else (bid // fx.Int32(r_den)) % fx.Int32(n_relays)
+                )
+                bounce_out_ptr = peer_args[world_size]
+                bounce_in_ptr = peer_args[world_size + n_relays]
+                for r_i in range_constexpr(1, n_relays):
+                    cond = r_idx == fx.Int32(r_i)
+                    bounce_out_ptr = cond.select(
+                        peer_args[world_size + r_i], bounce_out_ptr
+                    )
+                    bounce_in_ptr = cond.select(
+                        peer_args[world_size + n_relays + r_i], bounce_in_ptr
+                    )
+                bounce_out = _buffer_ptr(bounce_out_ptr, T.i32, 4)
+                bounce_in = _buffer_ptr(bounce_in_ptr, T.i32, 4)
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
@@ -526,6 +594,19 @@ def make_quick_allreduce_mesh_kernel(
                 fx.crd2idx((fx.Int32(phase), bid, src, sub), wire_slot_layout)
             )
             return fx.Int32(flags_i32) + slot
+
+        bounce_rs_stride_i32 = super_tile * rank_payload_i32
+        bounce_ag_base_i32 = grid * n_push * bounce_rs_stride_i32
+
+        def _bounce_rs_i32(j, sub):
+            return (bid * fx.Int32(n_push) + j) * fx.Int32(
+                bounce_rs_stride_i32
+            ) + sub * fx.Int32(rank_payload_i32)
+
+        def _bounce_ag_i32(sub):
+            return fx.Int32(bounce_ag_base_i32) + (
+                bid * fx.Int32(super_tile) + sub
+            ) * fx.Int32(rank_payload_i32)
 
         def _load_tile_atoms(tile):
             return [_load_atom(tile, atom) for atom in range_constexpr(ATOMS)]
@@ -615,15 +696,24 @@ def make_quick_allreduce_mesh_kernel(
                 - "peer": consecutive quads walk the sectors of one peer,
                   giving each destination a ``64 * width`` B contiguous run
                   -- ideal on PCIe.
+
+            For TP4 all-gather with *to_bounce*, all peers need the same
+            reduced chunk, so we multicast by writing once to slot 0 of the
+            AG bounce region (``fanout_push=1``).
             """
+            multicast_ag = to_bounce and world_size == 4 and phase == PHASE_ALL_GATHER
+            fanout_push = 1 if multicast_ag else n_push
             for k in range_constexpr(rank_atoms):
                 for sector_base, width in stripes:
-                    n_quads = fx.Int32(n_push * width)
+                    n_quads = fx.Int32(fanout_push * width)
                     safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
-                    if const_expr(sector_fastest):
+                    if const_expr(multicast_ag):
+                        j = fx.Int32(0)
+                        sector_in_stripe = safe
+                    elif const_expr(sector_fastest):
                         # sector fastest
-                        j = safe % fx.Int32(n_push)
-                        sector_in_stripe = safe // fx.Int32(n_push)
+                        j = safe % fx.Int32(fanout_push)
+                        sector_in_stripe = safe // fx.Int32(fanout_push)
                     else:
                         # peer fastest
                         j = safe // fx.Int32(width)
@@ -643,8 +733,18 @@ def make_quick_allreduce_mesh_kernel(
                             smem_ptr + _pack_off(pack_row, vec_idx),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
-                        wire_off = _sub_tile_i32(phase, inbox_src, sub) + wire_idx
                         if const_expr(to_bounce):
+                            if const_expr(world_size == 4):
+                                slot_base = (
+                                    _bounce_ag_i32(sub)
+                                    if phase == PHASE_ALL_GATHER
+                                    else _bounce_rs_i32(j, sub)
+                                )
+                                wire_off = slot_base + wire_idx
+                            else:
+                                wire_off = (
+                                    _sub_tile_i32(phase, inbox_src, sub) + wire_idx
+                                )
                             _buffer_store(
                                 bounce_out,
                                 wire_off,
@@ -652,6 +752,7 @@ def make_quick_allreduce_mesh_kernel(
                                 cache_modifier=_RELAY_STORE_CM,
                             )
                         else:
+                            wire_off = _sub_tile_i32(phase, inbox_src, sub) + wire_idx
                             _store_peer(j, wire_off, v4)
 
         def _publish(phase, inbox_src, color):
@@ -741,12 +842,23 @@ def make_quick_allreduce_mesh_kernel(
                     _acquire_inbox(_RELAY_ACQUIRE_SCOPE)
 
         def _recv_quantized(phase, src, sub, k, to_bounce):
-            base = _sub_tile_i32(phase, src, sub)
+            if const_expr(to_bounce and world_size == 4):
+                j_src = src if src < self_rank else src - 1
+                j_dest = self_rank if self_rank < src else self_rank - 1
+                buf = bounce_in_list[j_src]
+                bits = _RELAY_RECV_CM
+                base = (
+                    _bounce_ag_i32(sub)
+                    if phase == PHASE_ALL_GATHER
+                    else _bounce_rs_i32(fx.Int32(j_dest), sub)
+                )
+            else:
+                base = _sub_tile_i32(phase, fx.Int32(src), sub)
+                buf, bits = (
+                    (bounce_in, _RELAY_RECV_CM) if to_bounce else (inbox, recv_policy)
+                )
             if const_expr(k):
                 base = base + fx.Int32(k * c.rank_tile_i32)
-            buf, bits = (
-                (bounce_in, _RELAY_RECV_CM) if to_bounce else (inbox, recv_policy)
-            )
 
             def _get(off):
                 return _buffer_load(buf, base + off, 1, fx.Int32, bits)[0]
@@ -767,7 +879,7 @@ def make_quick_allreduce_mesh_kernel(
                             accs[k] = _add_f16(own[k], accs[k])
                     else:
                         words, scale = _recv_quantized(
-                            PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k, to_bounce
+                            PHASE_REDUCE_SCATTER, src, sub, k, to_bounce
                         )
                         if const_expr(accs[k] is None):
                             accs[k] = _codec_dequant(c, words, scale, tid)
@@ -789,7 +901,7 @@ def make_quick_allreduce_mesh_kernel(
                         gathered.append(own[k])
                     else:
                         words, scale = _recv_quantized(
-                            PHASE_ALL_GATHER, fx.Int32(src), sub, k, to_bounce
+                            PHASE_ALL_GATHER, src, sub, k, to_bounce
                         )
                         gathered.append(_codec_dequant(c, words, _ag_scale(scale), tid))
             return gathered
@@ -817,13 +929,18 @@ def make_quick_allreduce_mesh_kernel(
         # n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
 
-        def _run(to_bounce):
-            """The whole schedule, specialized for relay or direct blocks."""
+        def _run(rs_bounce, ag_bounce):
+            """The whole schedule, specialized per phase for relay or direct."""
 
-            def reused(i):
+            def reused_rs(i):
                 # One invalidate at the reduce-scatter receive covers the
                 # disjoint all-gather bounce slot for this tile or super-tile.
-                return (i > fx.Int32(0)) if to_bounce else None
+                return (i > fx.Int32(0)) if rs_bounce else None
+
+            def reused_ag(i):
+                # Hybrid block (direct RS + relay AG): no RS invalidate ran, so
+                # invalidate L1 once before reading the reused AG bounce slot.
+                return (i > fx.Int32(0)) if (ag_bounce and not rs_bounce) else None
 
             color = _load_color()
             if const_expr(super_tile == 1):
@@ -833,18 +950,18 @@ def make_quick_allreduce_mesh_kernel(
                     pre = _prefetch(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
-                    _fanout(PHASE_REDUCE_SCATTER, rank, fx.Int32(0), to_bounce)
+                    _fanout(PHASE_REDUCE_SCATTER, rank, fx.Int32(0), rs_bounce)
                     _publish(PHASE_REDUCE_SCATTER, rank, color)
 
-                    _wait_release(PHASE_REDUCE_SCATTER, color, reused(i))
-                    acc = _reduce_scattered(fx.Int32(0), _own_atoms(atoms), to_bounce)
+                    _wait_release(PHASE_REDUCE_SCATTER, color, reused_rs(i))
+                    acc = _reduce_scattered(fx.Int32(0), _own_atoms(atoms), rs_bounce)
                     own_ag = _pack_all_gather(acc)
                     gpu.barrier()
-                    _fanout(PHASE_ALL_GATHER, rank, fx.Int32(0), to_bounce)
+                    _fanout(PHASE_ALL_GATHER, rank, fx.Int32(0), ag_bounce)
                     _publish(PHASE_ALL_GATHER, rank, color)
 
-                    _wait_release(PHASE_ALL_GATHER, color)
-                    gathered = _recv_all_gather(fx.Int32(0), own_ag, to_bounce)
+                    _wait_release(PHASE_ALL_GATHER, color, reused_ag(i))
+                    gathered = _recv_all_gather(fx.Int32(0), own_ag, ag_bounce)
                     _finish_tile(tile, gathered, pre)
 
                     color = color + fx.Int32(1)
@@ -861,7 +978,7 @@ def make_quick_allreduce_mesh_kernel(
                         atoms = _load_tile_atoms(tile)
                         _pack_reduce_scatter(atoms)
                         gpu.barrier()
-                        _fanout(PHASE_REDUCE_SCATTER, rank, s, to_bounce)
+                        _fanout(PHASE_REDUCE_SCATTER, rank, s, rs_bounce)
                         if (s + fx.Int32(1)) < n_this:
                             # Drain this wave's LDS loads, then join the WG.
                             # world_size<8 leaves waves idle in fanout; without the
@@ -872,7 +989,7 @@ def make_quick_allreduce_mesh_kernel(
                             gpu.barrier()
 
                     _publish(PHASE_REDUCE_SCATTER, rank, color)
-                    _wait_release(PHASE_REDUCE_SCATTER, color, reused(i))
+                    _wait_release(PHASE_REDUCE_SCATTER, color, reused_rs(i))
 
                     for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                         # Nothing is carried from the first loop -- that would be ST
@@ -886,23 +1003,23 @@ def make_quick_allreduce_mesh_kernel(
                             _load_own_share(tile, k)
                             for k in range_constexpr(rank_atoms)
                         ]
-                        acc = _reduce_scattered(s, own_rs, to_bounce)
+                        acc = _reduce_scattered(s, own_rs, rs_bounce)
                         own_ag = _pack_all_gather(acc)
                         for k in range_constexpr(rank_atoms):
                             _stash_own(tile, self_rank * rank_atoms + k, own_ag[k])
                         gpu.barrier()
-                        _fanout(PHASE_ALL_GATHER, rank, s, to_bounce)
+                        _fanout(PHASE_ALL_GATHER, rank, s, ag_bounce)
                         if (s + fx.Int32(1)) < n_this:
                             rocdl.s_waitcnt(lgkmcnt=0)
                             gpu.barrier()
 
                     _publish(PHASE_ALL_GATHER, rank, color)
-                    _wait_release(PHASE_ALL_GATHER, color)
+                    _wait_release(PHASE_ALL_GATHER, color, reused_ag(i))
 
                     for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                         tile = bid + (i + s) * n_blocks
                         gathered = _recv_all_gather(
-                            s, _unstash_own_chunk(tile), to_bounce
+                            s, _unstash_own_chunk(tile), ag_bounce
                         )
                         _finish_tile(tile, gathered, None)
 
@@ -914,12 +1031,40 @@ def make_quick_allreduce_mesh_kernel(
             gpu.barrier()
 
         if const_expr(relay is not None):
-            if is_relay:
-                _run(True)
+            (num_rs, den_rs), (num_ag, den_ag) = _relay_phases(relay)
+            if const_expr((num_rs, den_rs) == (num_ag, den_ag)):
+                is_relay = (bid % fx.Int32(den_rs)) < fx.Int32(num_rs)
+                if is_relay:
+                    _run(True, True)
+                else:
+                    _run(False, False)
+            elif const_expr(num_rs == 0):
+                is_relay_ag = (bid % fx.Int32(den_ag)) < fx.Int32(num_ag)
+                if is_relay_ag:
+                    _run(False, True)
+                else:
+                    _run(False, False)
+            elif const_expr(num_ag == 0):
+                is_relay_rs = (bid % fx.Int32(den_rs)) < fx.Int32(num_rs)
+                if is_relay_rs:
+                    _run(True, False)
+                else:
+                    _run(False, False)
             else:
-                _run(False)
+                is_relay_rs = (bid % fx.Int32(den_rs)) < fx.Int32(num_rs)
+                is_relay_ag = (bid % fx.Int32(den_ag)) < fx.Int32(num_ag)
+                if is_relay_rs:
+                    if is_relay_ag:
+                        _run(True, True)
+                    else:
+                        _run(True, False)
+                else:
+                    if is_relay_ag:
+                        _run(False, True)
+                    else:
+                        _run(False, False)
         else:
-            _run(False)
+            _run(False, False)
 
     flat_wg = f"{block},{block}"
 
@@ -1039,7 +1184,13 @@ def make_quick_allreduce_mesh_kernel(
     tag = f"{SCALE_CODEC_TAG}_ws{world_size}_r{self_rank}_st{super_tile}_g{grid}"
     tag += f"_{inbox_memory}_{codec}_b{block}" + epilogue.tag
     if relay is not None:
-        tag += f"_rly{relay[0]}o{relay[1]}"
+        (num_rs, den_rs), (num_ag, den_ag) = _relay_phases(relay)
+        if (num_rs, den_rs) == (num_ag, den_ag):
+            tag += f"_rly{num_rs}o{den_rs}"
+        else:
+            tag += f"_rly{num_rs}o{den_rs}_{num_ag}o{den_ag}"
+        if n_relays > 1:
+            tag += f"k{n_relays}"
     launcher = (
         launch_quick_allreduce_mesh_fused
         if epilogue.takes_operands
@@ -1052,10 +1203,15 @@ def make_quick_allreduce_mesh_kernel(
         pass
     flags_bytes = flags_i32 * 4
     data_bytes = PHASES * grid * world_size * wire_tile_bytes
+    bounce_bytes = (
+        (n_push + 1) * grid * super_tile * rank_payload_i32 * 4
+        if world_size == 4
+        else flags_bytes + data_bytes
+    )
     return {
         "launch": launcher,
-        "flags_bytes": flags_i32 * 4,
-        "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
+        "flags_bytes": flags_bytes,
+        "data_bytes": data_bytes,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
         # HBM bytes one tile spans, which is what a tile *count* has to come
@@ -1078,7 +1234,8 @@ def make_quick_allreduce_mesh_kernel(
         "block": block,
         "rank": self_rank,
         "relay": relay,
-        "bounce_bytes": flags_bytes + data_bytes,
+        "n_relays": n_relays,
+        "bounce_bytes": bounce_bytes,
         "device_colors": True,
         **epilogue.spec(),
     }

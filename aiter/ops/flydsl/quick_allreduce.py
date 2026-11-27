@@ -92,6 +92,7 @@ from .kernels.comm.quick_allreduce_fusions import (
 )
 from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_DIVISOR,
+    MAX_RELAYS,
     MESH_RELAY_DEFAULTS,
     check_relay,
     clamp_grid_cap,
@@ -109,7 +110,7 @@ from .kernels.comm.transport import (
     has_release_fence,
 )
 from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_relay import open_relay_bounce
+from .quick_allreduce_relay import open_relay_bounce, open_sender_relay_bounces
 
 logger = logging.getLogger("aiter")
 
@@ -190,6 +191,7 @@ def _build_mesh(
     mxfp4=False,
     low_latency=False,
     relay=None,
+    n_relays=1,
 ):
     if rs_codec != ag_codec:
         raise ValueError(
@@ -210,6 +212,7 @@ def _build_mesh(
         mxfp4=mxfp4,
         low_latency=low_latency,
         relay=relay,
+        n_relays=n_relays,
     )
 
 
@@ -344,10 +347,13 @@ class FlyQuickAllReduce:
     tests that run other configurations. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
 
-    ``relay_devices=(r01, r10)`` routes a fraction of the mesh blocks through
-    another GPU for each TP2 direction. ``relay_fraction=(num, den)`` selects
-    that share and ``relay_min_bytes`` the payload from which relay engines
-    run. ``None`` uses the per-architecture default where one exists.
+    ``relay_devices`` routes a fraction of the mesh blocks through peer relay
+    GPUs: ``(r01, r10)`` or ``((r0_0, ...), (r1_0, ...))`` (1..3 relays per
+    direction) for TP2, or ``(r0, r1, r2, r3)`` (1 sender-owned relay per rank)
+    for TP4. ``relay_fraction`` selects that share as ``(num, den)`` or
+    ``((num_rs, den_rs), (num_ag, den_ag))``, and ``relay_min_bytes`` the
+    payload from which relay engines run. ``None`` uses the per-architecture
+    default where one exists.
     """
 
     def __init__(
@@ -364,8 +370,12 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
-        relay_devices: tuple[int, int] | None = None,
-        relay_fraction: tuple[int, int] | None = None,
+        relay_devices: (
+            tuple[int, ...] | tuple[tuple[int, ...], tuple[int, ...]] | None
+        ) = None,
+        relay_fraction: (
+            tuple[int, int] | tuple[tuple[int, int], tuple[int, int]] | None
+        ) = None,
         relay_min_bytes: int | None = None,
     ):
         check_world_size(world_size)
@@ -532,37 +542,93 @@ class FlyQuickAllReduce:
         self.wire_tile_bytes = primary.wire_tile_bytes
 
     def _init_relay(self, arch, devices, fraction, min_bytes) -> None:
-        """Validate relay arguments and make both TP ranks agree on them."""
+        """Validate relay arguments and make all TP ranks agree on them."""
         default = MESH_RELAY_DEFAULTS.get((self.link, self.world_size, arch))
         error = None
         try:
-            if self.world_size != 2 or self.algorithm != "mesh" or self.link != "xgmi":
+            if (
+                self.world_size not in (2, 4)
+                or self.algorithm != "mesh"
+                or self.link != "xgmi"
+            ):
                 raise ValueError(
-                    "relay needs world_size=2, algorithm='mesh' and link='xgmi', "
-                    f"got world_size={self.world_size}, "
+                    "relay needs world_size in (2, 4), algorithm='mesh' and "
+                    f"link='xgmi', got world_size={self.world_size}, "
                     f"algorithm={self.algorithm!r}, link={self.link!r}"
                 )
             if (fraction is None or min_bytes is None) and default is None:
                 raise ValueError(
-                    f"no relay defaults for {arch} on {self.link}: pass both "
-                    "relay_fraction and relay_min_bytes"
+                    f"no relay defaults for {arch} (world_size={self.world_size}) "
+                    f"on {self.link}: pass both relay_fraction and relay_min_bytes"
                 )
-            devices = tuple(int(d) for d in devices)
-            if len(devices) != 2:
-                raise ValueError(
-                    f"relay_devices must be one device per direction, got {devices}"
-                )
+            raw = tuple(devices)
             n_devices = torch.cuda.device_count()
-            if not all(0 <= d < n_devices for d in devices):
-                raise ValueError(
-                    f"relay_devices {devices} are not among the {n_devices} "
-                    "visible devices"
+            if self.world_size == 2:
+                if len(raw) != 2:
+                    raise ValueError(
+                        f"relay_devices must have 2 directions, got {devices!r}"
+                    )
+                is_seq = [isinstance(d, (tuple, list)) for d in raw]
+                if not any(is_seq):
+                    normalized = ((int(raw[0]),), (int(raw[1]),))
+                elif all(is_seq):
+                    d0 = tuple(int(d) for d in raw[0])
+                    d1 = tuple(int(d) for d in raw[1])
+                    if len(d0) != len(d1) or not 1 <= len(d0) <= MAX_RELAYS:
+                        raise ValueError(
+                            "relay_devices directions must be equal-length tuples "
+                            f"of 1..{MAX_RELAYS} devices, got {devices!r}"
+                        )
+                    normalized = (d0, d1)
+                else:
+                    raise ValueError(
+                        "relay_devices cannot mix scalar and tuple directions: "
+                        f"{devices!r}"
+                    )
+                k = len(normalized[0])
+                all_devs = normalized[0] + normalized[1]
+                if not all(0 <= d < n_devices for d in all_devs):
+                    raise ValueError(
+                        f"relay_devices {normalized} are not among the {n_devices} "
+                        "visible devices"
+                    )
+                if self._device_index in all_devs:
+                    raise ValueError(
+                        f"relay_devices {normalized} include this rank's own device "
+                        f"{self._device_index}"
+                    )
+                if len(set(normalized[0])) != k or len(set(normalized[1])) != k:
+                    raise ValueError(
+                        f"relay_devices {normalized} contain duplicate relays within "
+                        "a direction"
+                    )
+                relay_buses = (
+                    tuple(UncachedIpcHeap.pci_bus_id(d) for d in normalized[0]),
+                    tuple(UncachedIpcHeap.pci_bus_id(d) for d in normalized[1]),
                 )
-            if self._device_index in devices:
-                raise ValueError(
-                    f"relay_devices {devices} include this rank's own device "
-                    f"{self._device_index}"
-                )
+                if len(set(relay_buses[0])) != k or len(set(relay_buses[1])) != k:
+                    raise ValueError(
+                        f"relay_devices {normalized} alias the same PCI bus within a "
+                        "direction"
+                    )
+            else:
+                if len(raw) != self.world_size:
+                    raise ValueError(
+                        f"relay_devices must have {self.world_size} entries "
+                        f"(one per rank), got {devices!r}"
+                    )
+                normalized = tuple(int(d) for d in raw)
+                if not all(0 <= d < n_devices for d in normalized):
+                    raise ValueError(
+                        f"relay_devices {normalized} are not among the {n_devices} "
+                        "visible devices"
+                    )
+                if self._device_index in normalized:
+                    raise ValueError(
+                        f"relay_devices {normalized} include this rank's own device "
+                        f"{self._device_index}"
+                    )
+                relay_buses = tuple(UncachedIpcHeap.pci_bus_id(d) for d in normalized)
             fraction = check_relay(default[1] if fraction is None else fraction)
             min_bytes = int(default[0] if min_bytes is None else min_bytes)
             if min_bytes < 0:
@@ -571,8 +637,8 @@ class FlyQuickAllReduce:
                 )
             mine = (
                 UncachedIpcHeap.pci_bus_id(self._device_index),
-                tuple(UncachedIpcHeap.pci_bus_id(d) for d in devices),
-                devices,
+                relay_buses,
+                normalized,
                 fraction,
                 min_bytes,
             )
@@ -584,16 +650,22 @@ class FlyQuickAllReduce:
         failures = UncachedIpcHeap.rank_failures([view[0] for view in views])
         if failures:
             raise RuntimeError(failures)
-        (_, a), (_, b) = views
-        if (a[1], a[3], a[4]) != (b[1], b[3], b[4]):
+        tp_buses = [v[0] for _, v in views]
+        ref = (views[0][1][1], views[0][1][3], views[0][1][4])
+        for r_idx, (_, v) in enumerate(views[1:], start=1):
+            if (v[1], v[3], v[4]) != ref:
+                raise RuntimeError(
+                    "ranks disagree on the relay setup: "
+                    f"(relay buses, fraction, min_bytes) rank 0 {ref} vs "
+                    f"rank {r_idx} {(v[1], v[3], v[4])}"
+                )
+        all_relay_buses = (
+            set(ref[0][0]) | set(ref[0][1]) if self.world_size == 2 else set(ref[0])
+        )
+        if len(set(tp_buses)) != self.world_size or set(tp_buses) & all_relay_buses:
             raise RuntimeError(
-                "ranks disagree on the relay setup: "
-                f"(relay buses, fraction, min_bytes) {(a[1], a[3], a[4])} vs "
-                f"{(b[1], b[3], b[4])}"
-            )
-        if a[0] == b[0] or {a[0], b[0]} & set(a[1]):
-            raise RuntimeError(
-                f"relay buses {a[1]} must differ from the TP devices {(a[0], b[0])}"
+                f"relay buses {ref[0]} must differ from the TP devices "
+                f"{tuple(tp_buses)}"
             )
         own = views[self.rank][1]
         self.relay_devices = own[2]
@@ -602,22 +674,37 @@ class FlyQuickAllReduce:
 
     def _build_relay_engines(self) -> None:
         """Build relay twins for the ladder configs that can use them."""
+        n_relays = len(self.relay_devices[0]) if self.world_size == 2 else 1
         with torch.cuda.device(self._device_index):
             reachable = set(self.cfgs_for(self.relay_min_bytes, _MAX_PAYLOAD))
             for key in sorted(self._by_cfg):
                 if key not in reachable:
                     continue
                 spec = self._algo.build(
-                    **self._build_kw[key], relay=self.relay_fraction
+                    **self._build_kw[key],
+                    relay=self.relay_fraction,
+                    n_relays=n_relays,
                 )
-                bounce = open_relay_bounce(
-                    group=self.group,
-                    rank=self.rank,
-                    device=self._device_index,
-                    relay_out=self.relay_devices[self.rank],
-                    relay_in=self.relay_devices[1 - self.rank],
-                    nbytes=spec["bounce_bytes"],
-                )
+                if self.world_size == 2:
+                    bounce = open_relay_bounce(
+                        group=self.group,
+                        rank=self.rank,
+                        device=self._device_index,
+                        relay_outs=self.relay_devices[self.rank],
+                        relay_ins=self.relay_devices[1 - self.rank],
+                        nbytes=spec["bounce_bytes"],
+                    )
+                    extra_ptrs = (*bounce.out_ptrs, *bounce.in_ptrs)
+                else:
+                    bounce = open_sender_relay_bounces(
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        device=self._device_index,
+                        relay_devices=self.relay_devices,
+                        nbytes=spec["bounce_bytes"],
+                    )
+                    extra_ptrs = (bounce.out_ptr, *bounce.in_ptrs)
                 self._relay_bounces.append(bounce)
                 self._relay_by_cfg[key] = _StEngine(
                     spec=spec,
@@ -625,7 +712,7 @@ class FlyQuickAllReduce:
                     rank=self.rank,
                     world_size=self.world_size,
                     inbox_flags=self._inbox_flags,
-                    extra_ptrs=(bounce.out_ptr, bounce.in_ptr),
+                    extra_ptrs=extra_ptrs,
                 )
 
     @property
