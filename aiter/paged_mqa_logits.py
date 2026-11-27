@@ -51,7 +51,12 @@ import torch
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx_runtime,
+    get_tuned_cu_nums,
+    log_tuned_cu_fallback,
+)
 
 __all__ = ["get_paged_mqa_logits_config", "paged_mqa_logits"]
 
@@ -131,13 +136,24 @@ def get_paged_mqa_logits_config(
     kv_block_size: int,
     preshuffle: bool,
 ) -> dict:
-    """Tuned backend and knobs for one call shape on the current GPU."""
+    """Tuned backend and knobs for one call shape on the current GPU.
+
+    The rows of all CU counts of get_tuned_cu_nums() take part in the nearest
+    match. At the same batch size, the row of the device CU count wins.
+    """
     gfx, cu_num = get_gfx_runtime(), get_cu_num()
-    rows = _load_tuned_table().get(
-        (gfx, cu_num, next_n, heads, head_dim, kv_block_size, bool(preshuffle)), {}
-    )
+    table = _load_tuned_table()
+    key = (next_n, heads, head_dim, kv_block_size, bool(preshuffle))
+    rows = {}
+    for tuned_cu in reversed(get_tuned_cu_nums(cu_num)):
+        for batch, config in table.get((gfx, tuned_cu, *key), {}).items():
+            rows[batch] = (tuned_cu, config)
     tuned_batch = max((b for b in rows if b <= batch_size), default=None)
-    config = rows[tuned_batch] if tuned_batch is not None else DEFAULT_CONFIG
+    config = DEFAULT_CONFIG
+    if tuned_batch is not None:
+        tuned_cu, config = rows[tuned_batch]
+        if tuned_cu != cu_num:
+            log_tuned_cu_fallback("paged_mqa_logits", gfx, cu_num, tuned_cu)
     if AITER_LOG_TUNED_CONFIG:
         shape = dict(
             zip(

@@ -42,7 +42,12 @@ import torch
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx_runtime,
+    get_tuned_cu_nums,
+    log_tuned_cu_fallback,
+)
 
 __all__ = ["get_mqa_logits_config", "mqa_logits"]
 
@@ -91,13 +96,23 @@ def _nearest_below(values, x: int) -> int:
 def get_mqa_logits_config(
     seq_len: int, seq_len_kv: int, heads: int, head_dim: int
 ) -> dict:
-    """Tuned backend and variant for one call shape on the current GPU."""
+    """Tuned backend and variant for one call shape on the current GPU.
+
+    The rows of all CU counts of get_tuned_cu_nums() take part in the nearest
+    match. At the same sequence lengths, the row of the device CU count wins.
+    """
     gfx, cu_num = get_gfx_runtime(), get_cu_num()
-    rows = _load_tuned_table().get((gfx, cu_num, heads, head_dim), {})
+    table = _load_tuned_table()
+    rows = {}
+    for tuned_cu in reversed(get_tuned_cu_nums(cu_num)):
+        for lens, config in table.get((gfx, tuned_cu, heads, head_dim), {}).items():
+            rows[lens] = (tuned_cu, config)
     if rows:
         tuned_kv = _nearest_below({kv for kv, _ in rows}, seq_len_kv)
         tuned_q = _nearest_below({q for kv, q in rows if kv == tuned_kv}, seq_len)
-        config = rows[(tuned_kv, tuned_q)]
+        tuned_cu, config = rows[(tuned_kv, tuned_q)]
+        if tuned_cu != cu_num:
+            log_tuned_cu_fallback("mqa_logits", gfx, cu_num, tuned_cu)
         source = f"tuned row seq_len={tuned_q} seq_len_kv={tuned_kv}"
     else:
         config = DEFAULT_CONFIG
