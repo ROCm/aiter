@@ -21,6 +21,8 @@ Each K tile of A, W and both e8m0 scales moves global -> LDS by TDM, then LDS
   each K step's WMMAs overlap the next step's LDS reads (across K tiles too),
 * bf16 epilogue staged in LDS and written by TDM (no bias, no activation, no
   MX requant, no EP scatter),
+* workgroups in production's grouped swizzle order (GROUP_M M tiles per sweep
+  over N, so the workgroups sharing an A tile land on one XCD and its L2),
 * K is zero-padded on the host to a multiple of tile_k.
 
 Activations are either MXFP4 (``a4w4``) or MXFP8 e4m3 (``a8w4``); weights are
@@ -150,6 +152,12 @@ def build_naive_grouped_gemm(
         f"naive_grouped_gemm_tdm_{fmt}_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{NB}_N{N}_K{K}_E{n_experts}"
     )
+    # Workgroup order (production's TILES_PER_GROUP swizzle): linear ids walk GROUP_M
+    # M tiles for one N tile, then the same M tiles for the next one. The N_TILES
+    # workgroups that read one A tile get ids j, j + GROUP_M, ...: the same id % 8,
+    # i.e. the same XCD and L2 (workgroup w runs on XCD w % 8), and close in time.
+    GROUP_M = 16
+    N_TILES = N // tile_n
 
     @flyc.kernel(name=name, known_block_size=[BLOCK, 1, 1])
     def kernel(
@@ -159,6 +167,7 @@ def build_naive_grouped_gemm(
         a_scale: fx.Pointer,  # [M/tile_m, K_TILES, tile_m, SC_TILE_BYTES] e8m0
         w_scale: fx.Pointer,  # [E, N, K/32] e8m0
         psum: fx.Pointer,  # [E] int32
+        m_tiles: fx.Int32,  # M tiles in the launched grid
     ):
         tid = fx.Int32(fx.thread_idx.x)
         lane = tid % WAVE
@@ -167,8 +176,14 @@ def build_naive_grouped_gemm(
         wave = fx.Int32(rocdl.readfirstlane(T.i32, tid // WAVE))  # wave-uniform
         wm_base = (wave // n_warp) * WARP_M  # this wave's block inside the tile
         wn_base = (wave % n_warp) * WARP_N
-        blk_m = fx.Int32(fx.block_idx.x) * tile_m
-        blk_n = fx.Int32(fx.block_idx.y) * tile_n
+        bid = fx.Int32(fx.block_idx.x)
+        group = bid // (GROUP_M * N_TILES)
+        in_group = bid - group * (GROUP_M * N_TILES)
+        rest = m_tiles - group * GROUP_M  # the last group may hold fewer M tiles
+        group_tiles = (rest < GROUP_M).select(rest, GROUP_M)
+        m_tile = group * GROUP_M + in_group % group_tiles
+        blk_m = m_tile * tile_m
+        blk_n = (in_group // group_tiles) * tile_n
 
         # ---- 1. which expert owns rows [blk_m, blk_m + tile_m)? ------------
         # Experts start on tile_m boundaries, so the owner is the number of
@@ -230,7 +245,7 @@ def build_naive_grouped_gemm(
             tdm_k_tile(a, m_row0, tile_m, A_ROW_BYTES, A_TILE_BYTES, A_LDS, A_LDS_PITCH),
             tdm_k_tile(w, w_grp0, tile_n // 16, WG_ROW_BYTES, WG_TILE_BYTES, W_LDS),
             # one row per M tile; K tile kt is its kt-th contiguous block
-            tdm_k_tile(a_scale, fx.Int64(fx.block_idx.x), 1, AS_ROW_BYTES, AS_BLOCK_BYTES, AS_LDS),
+            tdm_k_tile(a_scale, fx.Int64(m_tile), 1, AS_ROW_BYTES, AS_BLOCK_BYTES, AS_LDS),
             tdm_k_tile(w_scale, ws_grp0, tile_n // 32, SB_ROW_BYTES, SB_TILE_BYTES, WS_LDS),
         ]
 
@@ -413,8 +428,9 @@ def build_naive_grouped_gemm(
         m_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        kernel(c, a, w, a_scale, w_scale, psum).launch(
-            grid=((m_rows + tile_m - 1) // tile_m, N // tile_n, 1),
+        m_tiles = (m_rows + tile_m - 1) // tile_m
+        kernel(c, a, w, a_scale, w_scale, psum, m_tiles).launch(
+            grid=(m_tiles * N_TILES, 1, 1),
             block=(BLOCK, 1, 1),
             stream=stream,
         )
