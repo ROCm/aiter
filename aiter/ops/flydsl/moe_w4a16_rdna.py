@@ -1,0 +1,568 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""W4A16 MoE for RDNA3.5 (gfx115x) on the FlyDSL WMMA kernels in
+``kernels/moe_w4a16_rdna.py``.
+
+Weights are int4 with a group size that is a multiple of 16, with or without
+zero points, packed by ``pack_w4a16_weights``. Activations are bfloat16 or
+float16.
+"""
+
+import functools
+
+import torch
+import triton
+import triton.language as tl
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.kernels.moe_w4a16_rdna import (
+    BLOCK_M,
+    MAX_REDUCE_ROWS,
+    ROW_PATH_MAX_TOKENS,
+    TILE_N,
+    _build_gemm,
+    _build_gemm_reduce,
+    _build_gemm_row,
+    _check_coef,
+    _check_w,
+    _expert_stride_dwords,
+    _require,
+    gate_up_tile_order,
+    lds_capacity_bytes,
+    pack_w4a16_weights,
+    pad_expert_stride,
+    reduce_lds_bytes,
+    row_lds_bytes,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, current_stream_arg
+
+__all__ = [
+    "BLOCK_M",
+    "MAX_REDUCE_ROWS",
+    "ROW_PATH_MAX_TOKENS",
+    "TILE_N",
+    "flydsl_rdna_moe",
+    "flydsl_rdna_moe_gemm",
+    "flydsl_rdna_moe_gemm_reduce",
+    "flydsl_rdna_moe_path",
+    "flydsl_rdna_moe_supported",
+    "gate_up_tile_order",
+    "moe_align_block_size_rows",
+    "pack_w4a16_weights",
+    "pad_expert_stride",
+    "topk_weighted_sum",
+]
+
+
+# gfx115x targets with a known LDS capacity; the kernels are tested on gfx1151.
+_SUPPORTED_GFX = ("gfx1150", "gfx1151")
+
+
+def flydsl_rdna_moe_supported() -> bool:
+    return get_gfx_runtime() in _SUPPORTED_GFX
+
+
+# Buffer offsets are 32-bit, so a tensor must span less than this.
+_MAX_SPAN_BYTES = 2**31
+
+
+def _check_act(out: torch.Tensor, x: torch.Tensor) -> None:
+    """The kernels store the activation dtype without a conversion."""
+    _require(x.dtype in (torch.bfloat16, torch.float16), "bf16 or fp16 activations")
+    _require(out.dtype == x.dtype, "output dtype must match the activations")
+
+
+def _check_dense(device: torch.device, *tensors) -> None:
+    """The kernels index raw data pointers: contiguous tensors on one GPU."""
+    _require(device.type == "cuda", "tensors must be on the GPU")
+    for t in tensors:
+        _require(t.device == device, "tensors must be on one device")
+        _require(t.is_contiguous(), "tensors must be contiguous")
+        _require(t.numel() * t.element_size() < _MAX_SPAN_BYTES, "tensor too large")
+
+
+def _check_packed(
+    device: torch.device,
+    w: torch.Tensor,
+    coef: torch.Tensor,
+    K: int,
+    n_cols: int,
+    group: int,
+    pairs: bool,
+) -> None:
+    """``w`` / ``coef`` packed for ``[E, n_cols, K]`` weights: ``[E, tiles,
+    tile stride]``, dense within an expert, dword aligned, on ``device``."""
+    _check_shape(K, n_cols, group)
+    _check_w(w, K)
+    _check_coef(coef, K, group, pairs)
+    _require(w.size(1) * TILE_N == n_cols, "packed weights do not match the width")
+    _require(coef.shape[:2] == w.shape[:2], "weights and coefficients do not match")
+    for t in (w, coef):
+        _require(t.device == device, "tensors must be on one device")
+        _require(
+            t.dim() == 3 and t.stride(2) == 1 and t.stride(1) == t.size(2),
+            "packed layout",
+        )
+        _require(t.stride(0) >= t.size(1) * t.size(2), "packed layout")
+        _require(
+            t.stride(0) * t.element_size() % 4 == 0 and t.data_ptr() % 4 == 0,
+            "packed weights must be dword aligned",
+        )
+        span = t.size(0) * t.stride(0) * t.element_size()
+        _require(span < _MAX_SPAN_BYTES, "packed weights too large")
+
+
+# Weight checks passed, keyed by everything they depend on. The weights of a
+# layer do not change between calls, so flydsl_rdna_moe checks them once.
+_PACKED_OK: dict = {}
+
+
+def _packed_key(t: torch.Tensor) -> tuple:
+    return (t.data_ptr(), t.shape, t.stride(), t.dtype)
+
+
+def _check_packed_cached(device, w, coef, K, n_cols, group, pairs) -> None:
+    key = (device, *_packed_key(w), *_packed_key(coef), K, n_cols, group, pairs)
+    if key in _PACKED_OK:
+        return
+    _check_packed(device, w, coef, K, n_cols, group, pairs)
+    if len(_PACKED_OK) >= 4096:
+        _PACKED_OK.clear()
+    _PACKED_OK[key] = None
+
+
+def _check_route(*tensors) -> None:
+    for t in tensors:
+        _require(t.dtype == torch.int32, "routing tensors must be int32")
+
+
+def _check_shape(K: int, N: int, group: int) -> None:
+    _require(
+        group > 0 and group % 16 == 0 and K % group == 0 and N % TILE_N == 0,
+        "group size a multiple of 16 dividing K, N a multiple of 64",
+    )
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor, b_bytes: int) -> bool:
+    a0, b0 = a.data_ptr(), b.data_ptr()
+    return a0 < b0 + b_bytes and b0 < a0 + a.numel() * a.element_size()
+
+
+def _on_input_device(fn):
+    """Run ``fn`` with the device of its first tensor argument current: FlyDSL,
+    Triton and the aiter alignment op launch on the current device."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        tensors = (a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor))
+        t = next(tensors, None)
+        if t is None or not t.is_cuda or t.get_device() == torch.cuda.current_device():
+            return fn(*args, **kwargs)
+        with torch.cuda.device(t.device):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _launch(launch, *args) -> None:
+    """Run a ``@flyc.jit`` launcher through a compiled handle cached per
+    device and tensor dtype, rank and unit-stride axis. The kernels read only
+    the data pointers of their tensors."""
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    key = (tensors[0].device,) + tuple(
+        (t.dtype, t.dim(), t.stride(-1) == 1) for t in tensors
+    )
+    stream = current_stream_arg(tensors[0].device)
+    _run_compiled(launch, *args, stream, specialization_key=key)
+
+
+# The functions with a leading underscore launch without checks; the public
+# ones validate their arguments first.
+
+
+def _align(topk_ids, block_size, num_experts):
+    from aiter.ops.moe_op import moe_align_block_size
+
+    numel = topk_ids.numel()
+    max_blocks = -(-(numel + num_experts * (block_size - 1)) // block_size)
+    device = topk_ids.device
+    sorted_ids = torch.full(
+        (max_blocks * block_size,), numel, dtype=torch.int32, device=device
+    )
+    expert_ids = torch.full((max_blocks,), -1, dtype=torch.int32, device=device)
+    token_nums = torch.empty((max_blocks,), dtype=torch.int32, device=device)
+    num_valid = torch.empty((1,), dtype=torch.int32, device=device)
+    moe_align_block_size(
+        topk_ids, num_experts, block_size, sorted_ids, expert_ids, token_nums, num_valid
+    )
+    return sorted_ids, expert_ids, num_valid
+
+
+@_on_input_device
+def moe_align_block_size_rows(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group the routed rows ``r = token * top_k + k`` by expert into blocks of
+    ``block_size`` rows: ``(sorted_ids, expert_ids, num_valid)``.
+
+    Padding rows hold ``topk_ids.numel()`` and blocks past the last expert
+    hold expert -1. ``topk_ids`` must be int32 in ``[0, num_experts)``: the
+    alignment kernel indexes per-expert arrays with them (not checked, as that
+    would need a device sync).
+    """
+    _require(topk_ids.is_cuda and topk_ids.is_contiguous(), "contiguous GPU ids")
+    _require(topk_ids.dtype == torch.int32, "routing tensors must be int32")
+    # One thread per expert in a single workgroup.
+    _require(0 < num_experts <= 1024, "num_experts must be in 1..1024")
+    return _align(topk_ids, block_size, num_experts)
+
+
+def _gemm_reduce(out, x, w, coef, expert_ids, weights, group_size, coef_pairs):
+    n_tokens, top_k = weights.shape
+    if n_tokens == 0:
+        return
+    launch = _build_gemm_reduce(
+        x.shape[1],
+        out.shape[1],
+        group_size,
+        top_k,
+        _expert_stride_dwords(w),
+        _expert_stride_dwords(coef),
+        coef_pairs,
+        x.dtype == torch.float16,
+    )
+    _launch(launch, out, x, w, coef, expert_ids, weights, n_tokens, 32)
+
+
+@_on_input_device
+def flydsl_rdna_moe_gemm_reduce(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    coef: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    group_size: int,
+    coef_pairs: bool | None = None,
+) -> None:
+    """GEMM2 with the top-k sum: ``out[t] = sum_e weights[t, e] *
+    W[expert_ids[t * top_k + e]] @ x[t * top_k + e]``.
+
+    ``weights`` is float32 ``[tokens, top_k]`` with at most
+    ``MAX_REDUCE_ROWS`` experts per token. ``coef_pairs`` (required) is
+    whether the weights were packed with zero points.
+    """
+    _require(coef_pairs is not None, "coef_pairs is required")
+    _check_dense(out.device, out, x, expert_ids, weights)
+    _check_packed(out.device, w, coef, x.shape[1], out.size(1), group_size, coef_pairs)
+    _check_route(expert_ids)
+    _check_act(out, x)
+    _require(weights.dtype == torch.float32, "top-k weights must be float32")
+    n_tokens = weights.size(0)
+    _require(out.size(0) == n_tokens, "one output row per token")
+    _require(x.size(0) == expert_ids.numel() == weights.numel(), "routed rows")
+    _gemm_reduce(out, x, w, coef, expert_ids, weights, group_size, coef_pairs)
+
+
+def _gemm(
+    out,
+    x,
+    w,
+    coef,
+    sorted_ids,
+    expert_ids,
+    num_valid,
+    x_row_div,
+    group_size,
+    silu_mul,
+    coef_pairs,
+):
+    n_rows, N = out.shape
+    if n_rows == 0:
+        return
+    if silu_mul:
+        N *= 2
+    build_args = (
+        x.shape[1],
+        N,
+        x_row_div,
+        group_size,
+        silu_mul,
+        _expert_stride_dwords(w),
+        _expert_stride_dwords(coef),
+        coef_pairs,
+        x.dtype == torch.float16,
+    )
+    if sorted_ids is None:
+        launch = _build_gemm_row(*build_args)
+        _launch(launch, out, x, w, coef, expert_ids, expert_ids.numel())
+        return
+    launch = _build_gemm(*build_args)
+    _launch(
+        launch,
+        out,
+        x,
+        w,
+        coef,
+        sorted_ids,
+        expert_ids,
+        num_valid,
+        n_rows,
+        expert_ids.numel(),
+    )
+
+
+@_on_input_device
+def flydsl_rdna_moe_gemm(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    coef: torch.Tensor,
+    sorted_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_valid: torch.Tensor | None,
+    x_row_div: int,
+    group_size: int,
+    silu_mul: bool = False,
+    coef_pairs: bool | None = None,
+) -> None:
+    """Run ``out[r] = W[expert(r)] @ x[r // x_row_div]`` for all routed rows.
+
+    ``sorted_ids`` / ``expert_ids`` / ``num_valid`` come from
+    ``moe_align_block_size`` with block size ``BLOCK_M``. When ``sorted_ids``
+    is None, ``expert_ids[r]`` is the expert of row ``r`` and no grouping is
+    needed; this is the cheap routing for a few rows with distinct experts.
+
+    With ``silu_mul`` the weights are in ``gate_up_tile_order`` and ``out``
+    receives ``silu(gate) * up``, half as many columns as the weights have.
+    ``coef_pairs`` (required) is whether the weights were packed with zero
+    points.
+    """
+    _require(coef_pairs is not None, "coef_pairs is required")
+    route = [t for t in (sorted_ids, expert_ids, num_valid) if t is not None]
+    _check_dense(out.device, out, x, *route)
+    n_rows, N = out.shape
+    if silu_mul:
+        N *= 2
+    _check_packed(out.device, w, coef, x.shape[1], N, group_size, coef_pairs)
+    _check_route(*route)
+    _check_act(out, x)
+    _require(x_row_div >= 1, "x_row_div must be positive")
+    _require(-(-n_rows // x_row_div) <= x.size(0), "x has too few rows")
+    if sorted_ids is None:
+        _require(expert_ids.numel() == n_rows, "one expert id per row")
+    else:
+        _require(sorted_ids.numel() == expert_ids.numel() * BLOCK_M, "sorted ids")
+        _require(num_valid is not None and num_valid.numel() >= 1, "num_valid")
+    _gemm(
+        out,
+        x,
+        w,
+        coef,
+        sorted_ids,
+        expert_ids,
+        num_valid,
+        x_row_div,
+        group_size,
+        silu_mul,
+        coef_pairs,
+    )
+
+
+@triton.jit
+def _topk_weighted_sum_kernel(
+    out_ptr,
+    rows_ptr,
+    weights_ptr,
+    ids_ptr,
+    K,
+    out_stride,
+    rows_stride,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_IDS: tl.constexpr,
+):
+    # Column blocks vary fastest: concurrent programs then read different
+    # 256 B DRAM channels instead of the same offset of 4 KB-strided rows.
+    t = tl.program_id(1)
+    cols = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = cols < K
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        w = tl.load(weights_ptr + t * TOP_K + k)
+        row = tl.load(rows_ptr + (t * TOP_K + k) * rows_stride + cols, mask=mask)
+        prod = w * row.to(tl.float32)
+        if HAS_IDS:
+            # Routes without an expert (id -1) add nothing, even if not finite.
+            prod = tl.where(tl.load(ids_ptr + t * TOP_K + k) >= 0, prod, 0.0)
+        acc += prod
+    tl.store(
+        out_ptr + t * out_stride + cols, acc.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def _topk_sum(out, rows, topk_weights, topk_ids):
+    M, top_k = topk_weights.shape
+    K = out.size(1)
+    block_k = 256
+    _topk_weighted_sum_kernel[(triton.cdiv(K, block_k), M)](
+        out,
+        rows,
+        topk_weights.contiguous(),
+        topk_weights if topk_ids is None else topk_ids.contiguous(),
+        K,
+        out.stride(0),
+        rows.stride(0),
+        TOP_K=top_k,
+        BLOCK_K=block_k,
+        HAS_IDS=topk_ids is not None,
+        num_warps=8,
+    )
+
+
+@_on_input_device
+def topk_weighted_sum(
+    out: torch.Tensor,
+    rows: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor | None = None,
+) -> None:
+    """``out[t] = sum_k topk_weights[t, k] * rows[t * top_k + k]``, in f32.
+    With ``topk_ids``, routes with a negative id are left out."""
+    M, top_k = topk_weights.shape
+    _require(
+        rows.stride(1) == 1 and out.stride(1) == 1,
+        "rows and out need unit column stride",
+    )
+    _require(out.is_cuda and rows.device == out.device, "tensors must be on one GPU")
+    _require(out.size(0) == M, "one output row per token")
+    _require(rows.size(0) == M * top_k and rows.size(1) >= out.size(1), "rows shape")
+    _require(
+        topk_ids is None or topk_ids.shape == topk_weights.shape, "top-k ids shape"
+    )
+    _topk_sum(out, rows, topk_weights, topk_ids)
+
+
+def flydsl_rdna_moe_path(
+    M: int, K: int, N: int, top_k: int, group_size: int, weights_dtype
+) -> str:
+    """Kernels ``flydsl_rdna_moe`` runs: ``"reduce"`` (row GEMM1, GEMM2 with
+    the top-k sum), ``"row"`` (row GEMMs, ``topk_weighted_sum``) or
+    ``"grouped"``. The row and reduce kernels need their operands in LDS."""
+    lds = lds_capacity_bytes()
+    if M > ROW_PATH_MAX_TOKENS or row_lds_bytes(K, group_size) > lds:
+        return "grouped"
+    if (
+        top_k <= MAX_REDUCE_ROWS
+        and weights_dtype == torch.float32
+        and reduce_lds_bytes(N, top_k) <= lds
+    ):
+        return "reduce"
+    return "row" if row_lds_bytes(N, group_size) <= lds else "grouped"
+
+
+@_on_input_device
+def flydsl_rdna_moe(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    coef1: torch.Tensor,
+    w2: torch.Tensor,
+    coef2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    workspace: torch.Tensor,
+    group_size: int,
+    num_experts: int,
+    N: int,
+    activation=None,
+    w1_pairs: bool | None = None,
+    w2_pairs: bool | None = None,
+) -> None:
+    """``output[t] = sum_e topk_weights[t, e] * (W2[e] @ act(W1[e] @ x[t]))``.
+
+    ``w1`` / ``w2`` and their coefficients are in the ``pack_w4a16_weights``
+    layout. ``activation(out, gate_up)`` is applied between the GEMMs; when
+    it is None, ``w1`` is in ``gate_up_tile_order`` and GEMM1 applies
+    SiLU-and-multiply itself. ``N`` is the width of the activation output.
+    Routes with expert id -1 contribute nothing; other ids must be below
+    ``num_experts``. ``workspace`` holds the intermediates, ``M * top_k *
+    (gate_up + N + K)`` elements of the activation dtype. ``w1_pairs`` /
+    ``w2_pairs`` (required) are whether ``w1`` / ``w2`` were packed with zero
+    points, and ``group_size`` must be the group they were packed with: the
+    packed layouts of group g without and of group 2 g with zero points have the
+    same size, and so can small K at different groups, so neither can be checked.
+    ``output`` may alias ``x`` but neither may overlap the used workspace.
+    """
+    _require(w1_pairs is not None and w2_pairs is not None, "w1/w2_pairs required")
+    silu_mul = activation is None
+    M, K = x.shape
+    top_k = topk_ids.size(1)
+    gate_up = w1.size(1) * TILE_N
+    rows = M * top_k
+    widths = (gate_up, N, K)
+    sizes = [rows * n for n in widths]
+    # Everything is checked here, before GEMM1; the kernels are then launched
+    # without the checks of the public GEMM functions.
+    device = output.device
+    _check_dense(device, output, x, topk_weights, topk_ids)
+    _require(workspace.device == device, "tensors must be on one device")
+    _require(workspace.is_contiguous(), "tensors must be contiguous")
+    _check_act(output, x)
+    _require(workspace.dtype == x.dtype, "workspace dtype must match the activations")
+    _require(output.shape == x.shape, "output shape must match x")
+    _require(topk_weights.shape == topk_ids.shape, "top-k weights and ids shape")
+    _require(topk_ids.size(0) == M, "one top-k row per token")
+    _require(top_k >= 1, "top_k must be at least 1")
+    _require(workspace.numel() >= sum(sizes), "workspace too small")
+    _require(w1.size(0) == w2.size(0) == num_experts, "expert count")
+    # The alignment op of the grouped path runs one thread per expert.
+    _require(0 < num_experts <= 1024, "num_experts must be in 1..1024")
+    _require(not silu_mul or gate_up == 2 * N, "fused SiLU needs gate_up = 2 N")
+    _check_packed_cached(device, w1, coef1, K, gate_up, group_size, w1_pairs)
+    _check_packed_cached(device, w2, coef2, N, K, group_size, w2_pairs)
+    widest = rows * max(widths) * workspace.element_size()
+    _require(widest < _MAX_SPAN_BYTES, "too many tokens for 32-bit offsets")
+    used = sum(sizes) * workspace.element_size()
+    _require(
+        not _overlaps(output, workspace, used) and not _overlaps(x, workspace, used),
+        "output and x must not overlap the used workspace",
+    )
+    if M == 0:
+        return
+    gate_up_out, act_out, down_out = (
+        t.view(rows, n)
+        for t, n in zip(workspace.view(-1)[: sum(sizes)].split(sizes), widths)
+    )
+    ids = topk_ids.to(torch.int32)
+    path = flydsl_rdna_moe_path(M, K, N, top_k, group_size, topk_weights.dtype)
+    if path != "grouped":
+        # Few tokens seldom share an expert, so every row is its own block
+        # and the alignment kernel is not needed.
+        route = (None, ids.view(-1), None)
+    else:
+        # The alignment indexes per-expert arrays with the ids: send routes
+        # without an expert (-1) to expert 0; the top-k sum drops them.
+        route = _align(ids.clamp(min=0), BLOCK_M, num_experts)
+    _gemm(
+        act_out if silu_mul else gate_up_out,
+        x,
+        w1,
+        coef1,
+        *route,
+        top_k,
+        group_size,
+        silu_mul,
+        w1_pairs,
+    )
+    if not silu_mul:
+        activation(act_out, gate_up_out)
+    if path == "reduce":
+        # GEMM2 also does the weighted sum over the experts of a token.
+        _gemm_reduce(
+            output, act_out, w2, coef2, route[1], topk_weights, group_size, w2_pairs
+        )
+        return
+    _gemm(down_out, act_out, w2, coef2, *route, 1, group_size, False, w2_pairs)
+    # Rows are in routing order, so the top-k sum needs no permutation.
+    _topk_sum(output, down_out, topk_weights, topk_ids)
