@@ -97,22 +97,13 @@ def backward(x, weight, dy, offsets):
         return dx, dw
 
     tuned = e in (112, 224, 448, 896) and r in (1024, 16384, 140000)
-    descriptors = tuned and (r == 1024 or (r == 16384 and e >= 448))
-    stream_tn = tuned and (
-        (r == 1024 and e == 896)
-        or (r == 16384 and (e in (112, 896) or (e == 224 and n == 3072)))
-        or r == 140000
+    descriptors = tuned and (
+        (r == 1024 and (e == 896 or (e == 112 and n == 3584)))
+        or (r == 140000 and e == 896 and n == 3072)
     )
-    descending = stream_tn and (
-        (e == 896 and r in (1024, 16384))
-        or (r == 140000 and (e <= 224 or (e == 448 and n == 3584)))
-    )
-    ascending = tuned and r == 16384 and e == 448
-    short_k = tuned and r == 16384 and e == 224 and n == 3584
-    counts = torch.empty(e, dtype=torch.int32, device=x.device)
+    stream_tn = tuned and (r != 1024 or e == 896)
     table = torch.empty((e, 4), dtype=torch.int32, device=x.device)
     capacity = (r + 255 * e) // 256
-    rows = counts.data_ptr()
     columns = k // 256
     if descriptors:
         desc = torch.empty((capacity, 128), dtype=torch.uint8, device=x.device)
@@ -130,12 +121,9 @@ def backward(x, weight, dy, offsets):
             capacity,
         )
         launch(_DESC, (1, 1, 1), 1024, args)
-    if ascending or descending:
-        args = _SortArgs(
-            offsets.data_ptr(), counts.data_ptr(), table.data_ptr(), e, descending
-        )
-        launch(_SORT, (1, 1, 1), 1024, args)
-    elif not descriptors:
+    else:
+        counts = torch.empty(e, dtype=torch.int32, device=x.device)
+        rows = counts.data_ptr()
         args = _PlanArgs(offsets.data_ptr(), rows, table.data_ptr(), e)
         launch(_PLAN, ((e + 255) // 256, 1, 1), 256, args)
 
@@ -180,9 +168,9 @@ def backward(x, weight, dy, offsets):
     wgrad = (
         (_TN + "_stream", (tiles, e, 1))
         if stream_tn
-        else (_SHORT if short_k else _TN, (tiles * e, 1, 1))
+        else (_TN, (tiles * e, 1, 1))
     )
-    if stream_tn and r == 140000:
+    if stream_tn and (r == 140000 or (r == 16384 and e == 896)):
         launch(*wgrad, 256, tn)
         launch(*dgrad, 256, nn)
     else:
