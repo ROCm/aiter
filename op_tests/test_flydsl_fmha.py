@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for gfx1201 BF16/F16/FP8 and gfx950 FP8 FlyDSL flash attention."""
+"""Tests for gfx11 BF16/F16, gfx1201 BF16/F16/FP8 and gfx950 FP8 FlyDSL flash attention."""
 
 from __future__ import annotations
 
 import argparse
 import itertools
+import math
+import os
 import warnings
 from contextlib import nullcontext
 from itertools import pairwise
@@ -466,6 +468,596 @@ def test_flydsl_fmha_rejects_device_mismatch():
     v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
     with pytest.raises(ValueError, match="same device"):
         flydsl_flash_attn_func(q, k, v)
+
+
+# gfx11 (RDNA3 / RDNA3.5) bf16/f16. Any sequence lengths, cross-attention and
+# head_dim % 8 == 0, with no host padding, so the grid leans on the tails.
+
+_gfx11_only = pytest.mark.skipif(
+    not _arch().startswith(("gfx110", "gfx115")),
+    reason="flydsl_flash_attn_func gfx11 path needs an RDNA3 / RDNA3.5 GPU",
+)
+
+# (batch, seq_q, seq_kv, num_heads, head_dim, causal, dtype). Override with
+# AITER_FLYDSL_FMHA_GFX11_SHAPES="b,sq,skv,h,d,causal,dtype;..." (dtype bf16/f16).
+_GFX11_DEFAULT_SHAPES = [
+    (1, 32760, 32760, 12, 128, False, "bf16"),  # Wan2.1 1.3B self-attn
+    (1, 32760, 512, 12, 128, False, "bf16"),  # Wan2.1 1.3B cross-attn
+    (2, 4096, 4096, 8, 128, True, "bf16"),
+    (2, 1000, 1000, 3, 128, True, "bf16"),  # tails on both q and kv
+    (1, 777, 333, 4, 64, False, "bf16"),  # cross, odd lengths
+    (2, 129, 129, 8, 128, False, "bf16"),  # one key past a tile
+    (1, 1000, 77, 2, 96, False, "bf16"),  # kv shorter than a tile
+    (2, 4096, 4096, 8, 40, False, "f16"),  # SD1.5 head_dim, padded to 48 in-kernel
+    (2, 4096, 4096, 16, 72, False, "f16"),  # PixArt head_dim, padded to 80
+    (2, 1024, 1024, 8, 80, True, "f16"),
+    (2, 1024, 1024, 8, 160, False, "f16"),
+    (1, 1024, 1024, 2, 256, False, "bf16"),  # single LDS buffer fallback
+    (3, 1, 1, 2, 64, False, "bf16"),
+]
+
+
+def _gfx11_shapes():
+    spec = os.environ.get("AITER_FLYDSL_FMHA_GFX11_SHAPES")
+    if not spec:
+        return _GFX11_DEFAULT_SHAPES
+    shapes = []
+    for cell in spec.split(";"):
+        b, sq, skv, h, d, causal, dtype = cell.split(",")
+        if dtype not in ("bf16", "f16"):
+            raise ValueError(f"bad dtype {dtype!r} in AITER_FLYDSL_FMHA_GFX11_SHAPES")
+        shapes.append(
+            (int(b), int(sq), int(skv), int(h), int(d), causal in ("1", "True"), dtype)
+        )
+    return shapes
+
+
+def _ref_head_fp32(q, k, v, b, h, causal, scale, chunk=4096):
+    """fp32 attention for one (batch, head) of BSHD inputs, in query chunks."""
+    qh, kh, vh = q[b, :, h].float(), k[b, :, h].float(), v[b, :, h].float()
+    out = torch.empty_like(qh)
+    for r0 in range(0, qh.shape[0], chunk):
+        s = (qh[r0 : r0 + chunk] @ kh.t()) * scale
+        if causal:
+            rows = torch.arange(r0, r0 + s.shape[0], device=s.device)[:, None]
+            cols = torch.arange(kh.shape[0], device=s.device)[None, :]
+            s = s.masked_fill(cols > rows, float("-inf"))
+        out[r0 : r0 + chunk] = torch.softmax(s, dim=-1) @ vh
+    return out
+
+
+def _check_lse_gfx11(lse, q, k, causal, scale, heads=None):
+    """LSE against an fp32 logsumexp on the same (batch, head) pairs as _check_gfx11."""
+    batch, seq_q, num_heads, _ = q.shape
+    assert lse.shape == (batch, num_heads, seq_q) and lse.dtype == torch.float32
+    pairs = heads or ([(batch - 1, h) for h in range(num_heads)] + [(0, 0)])
+    for b, h in pairs:
+        err = (lse[b, h] - _ref_lse_fp32(q, k, b, h, causal, scale)).abs().max().item()
+        assert err < 1e-3, f"(b={b}, h={h}) max |lse - ref| = {err:.2e}"
+
+
+def _check_gfx11(out, q, k, v, causal, scale, heads=None):
+    batch, _, num_heads, _ = q.shape
+    assert out.shape == q.shape and out.dtype == q.dtype
+    assert not torch.isnan(out).any()
+    tol = 1e-2 if q.dtype == torch.bfloat16 else 2e-3
+    # Every head of the last batch, plus head 0 of batch 0: the last batch/head
+    # is where a narrow offset would wrap first.
+    pairs = heads or ([(batch - 1, h) for h in range(num_heads)] + [(0, 0)])
+    for b, h in pairs:
+        ref = _ref_head_fp32(q, k, v, b, h, causal, scale)
+        rel = ((out[b, :, h].float() - ref).norm() / ref.norm()).item()
+        assert rel < tol, f"(b={b}, h={h}) rel_err={rel:.3e} >= {tol}"
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,head_dim,causal,dtype_str", _gfx11_shapes()
+)
+def test_flydsl_fmha_gfx11_correctness(
+    batch, seq_q, seq_kv, num_heads, head_dim, causal, dtype_str
+):
+    dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, seq_q, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    k = torch.randn(
+        batch, seq_kv, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch, seq_kv, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    out, lse = flydsl_flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    scale = 1.0 / math.sqrt(head_dim)
+    _check_gfx11(out, q, k, v, causal, scale)
+    _check_lse_gfx11(lse, q, k, causal, scale)
+    # The LSE build writes the same output as the plain one.
+    assert torch.equal(out, flydsl_flash_attn_func(q, k, v, causal=causal))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_softmax_scale():
+    q, k, v = _make_qkv(1, 1000, 4, 64, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, softmax_scale=0.05)
+    _check_gfx11(out, q, k, v, False, 0.05)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_large_batch_offset():
+    """Batch offsets past 2**32 bytes: each slice gets a 64-bit base address."""
+    batch, seq, heads, dim = 600, 1024, 32, 128  # 4.8 GiB per tensor
+    if torch.cuda.mem_get_info()[0] < 24 * 2**30:
+        pytest.skip("needs ~24 GiB of free device memory")
+    q, k, v = _make_qkv(batch, seq, heads, dim, torch.bfloat16)
+    out, lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    pairs = [(batch - 1, heads - 1), (batch // 2, 0)]
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(dim), heads=pairs)
+    _check_lse_gfx11(lse, q, k, False, 1.0 / math.sqrt(dim), heads=pairs)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_head_dim():
+    q = torch.randn(1, 256, 4, 36, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="head_dim"):
+        flydsl_flash_attn_func(q, q.clone(), q.clone())
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_causal_cross():
+    q = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(1, 128, 4, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="causal"):
+        flydsl_flash_attn_func(q, kv, kv.clone(), causal=True)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_dtype_mismatch():
+    q = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 256, 4, 64, dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="dtype"):
+        flydsl_flash_attn_func(q, k, q.clone())
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_fp8():
+    q = torch.randn(1, 256, 4, 64, device="cuda").to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="bf16/f16"):
+        flydsl_flash_attn_func(q, q.clone(), q.clone())
+
+
+def test_flydsl_fmha_gfx11_config():
+    """Long head_dim-128 attention on gfx1151 takes the measured faster config."""
+    config = flydsl_fmha_kernels._gfx11_config
+    # Wan2.1: 12 heads; head_group is the largest divisor of num_heads up to 8.
+    assert config("gfx1151", 32760, 32760, 12, 128) == (32, 32, 6)
+    assert config("gfx1151", 38181, 38181, 56, 128) == (32, 32, 8)
+    # Short K/V, small heads, short sequences and other gfx11 targets keep the default.
+    assert config("gfx1151", 32760, 512, 12, 128) == (16, 32, None)
+    assert config("gfx1151", 4096, 4096, 8, 40) == (16, 32, None)
+    assert config("gfx1151", 1024, 1024, 8, 160) == (16, 32, None)
+    # head_dim 160 / 256 measured slower with the long config.
+    assert config("gfx1151", 8192, 8192, 16, 160) == (16, 32, None)
+    assert config("gfx1151", 8192, 8192, 8, 256) == (16, 32, None)
+    assert config("gfx1100", 32760, 32760, 12, 128) == (16, 32, None)
+
+
+@_gfx11_only
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_flydsl_fmha_gfx11_out(contiguous):
+    q, k, v = _make_qkv(2, 300, 4, 64, torch.bfloat16)
+    if contiguous:
+        out = torch.empty_like(q)
+    else:
+        out = torch.empty(2, 4, 300, 64, dtype=q.dtype, device=q.device).transpose(1, 2)
+    res = flydsl_flash_attn_func(q, k, v, out=out)
+    assert res is out
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq,num_heads,head_dim,causal,dtype",
+    [
+        (2, 1000, 8, 128, False, torch.bfloat16),
+        (3, 777, 4, 72, True, torch.bfloat16),  # head_dim % 16 == 8, q/kv tails
+        (1, 4096, 16, 64, False, torch.float16),
+    ],
+)
+def test_flydsl_fmha_gfx11_packed_qkv(batch, seq, num_heads, head_dim, causal, dtype):
+    """Views of one [B, S, 3, H, D] tensor are read in place (no copy, no warning)."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch, seq, 3, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    q, k, v = qkv.unbind(2)
+    assert not q.is_contiguous()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    _check_gfx11(out, q, k, v, causal, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_packed_kv_cross():
+    """Plain Q against K/V views of one [B, S_kv, 2, H, D] tensor (cross-attention)."""
+    batch, seq_q, seq_kv, num_heads, head_dim = 2, 1000, 333, 4, 96
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    kv = torch.randn(
+        batch,
+        seq_kv,
+        2,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = kv.unbind(2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_head_interleaved_is_copied():
+    """[B, S, H, 3, D] views (heads 3*D apart) are copied first, with a warning."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        2, 500, 4, 3, 64, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    q, k, v = qkv.unbind(3)
+    with pytest.warns(UserWarning, match="materializes"):
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,num_kv_heads,head_dim,causal,dtype",
+    [
+        (2, 1000, 1000, 32, 8, 128, True, torch.bfloat16),  # Llama-3-8B, tails
+        (1, 777, 333, 28, 4, 128, False, torch.bfloat16),  # Qwen2.5-7B, cross
+        (2, 512, 512, 8, 1, 64, False, torch.float16),  # MQA
+        (1, 300, 300, 16, 2, 72, False, torch.float16),  # head_dim % 16 == 8
+    ],
+)
+def test_flydsl_fmha_gfx11_gqa(
+    batch, seq_q, seq_kv, num_heads, num_kv_heads, head_dim, causal, dtype
+):
+    """Fewer K/V heads than query heads: query head h reads K/V head h // group."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, seq_q, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_kv_heads,
+            head_dim,
+            generator=g,
+            dtype=dtype,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, causal, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_gqa_fused_qkv():
+    """Q / K / V as views of one fused projection [B, S, H + 2 * H_kv, D], in place."""
+    batch, seq, num_heads, num_kv_heads, head_dim = 2, 1000, 32, 8, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch,
+        seq,
+        num_heads + 2 * num_kv_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q, k, v = qkv.split([num_heads, num_kv_heads, num_kv_heads], dim=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v, causal=True)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, True, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_gqa_head_ratio():
+    q = torch.randn(1, 256, 6, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="num_heads"):
+        flydsl_flash_attn_func(q, kv, kv.clone())
+
+
+def _ref_lse_fp32(q, k, b, h, causal, scale, chunk=4096):
+    """fp32 natural-log logsumexp of the scaled scores of one (batch, head)."""
+    group = q.shape[2] // k.shape[2]
+    qh, kh = q[b, :, h].float(), k[b, :, h // group].float()
+    out = torch.empty(qh.shape[0], device=q.device)
+    for r0 in range(0, qh.shape[0], chunk):
+        s = (qh[r0 : r0 + chunk] @ kh.t()) * scale
+        if causal:
+            rows = torch.arange(r0, r0 + s.shape[0], device=s.device)[:, None]
+            cols = torch.arange(kh.shape[0], device=s.device)[None, :]
+            s = s.masked_fill(cols > rows, float("-inf"))
+        out[r0 : r0 + chunk] = torch.logsumexp(s, dim=-1)
+    return out
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,num_kv_heads,head_dim,causal,scale",
+    [
+        (2, 1000, 1000, 8, 8, 128, True, None),  # tails, causal
+        (1, 777, 333, 4, 4, 64, False, None),  # cross, odd lengths
+        (2, 300, 300, 32, 8, 128, False, 0.05),  # GQA, custom scale
+        (1, 129, 129, 2, 2, 72, False, None),  # head_dim % 16 == 8
+    ],
+)
+def test_flydsl_fmha_gfx11_lse(
+    batch, seq_q, seq_kv, num_heads, num_kv_heads, head_dim, causal, scale
+):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_kv_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out, lse = flydsl_flash_attn_func(
+        q, k, v, causal=causal, softmax_scale=scale, return_lse=True
+    )
+    assert lse.shape == (batch, num_heads, seq_q) and lse.dtype == torch.float32
+    # out is the same as without return_lse
+    assert torch.equal(
+        out, flydsl_flash_attn_func(q, k, v, causal=causal, softmax_scale=scale)
+    )
+    sc = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    for b, h in [(batch - 1, hh) for hh in range(num_heads)] + [(0, 0)]:
+        ref = _ref_lse_fp32(q, k, b, h, causal, sc)
+        err = (lse[b, h] - ref).abs().max().item()
+        assert err < 1e-3, f"(b={b}, h={h}) max |lse - ref| = {err:.2e}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_ring_merge():
+    """Ring-attention merge: attention over KV chunks combined with their LSEs
+    equals attention over the whole KV (as xDiT / ring flash-attn do)."""
+    batch, seq_q, seq_kv, num_heads, head_dim = 1, 1024, 3000, 8, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    full, full_lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    out, lse = None, None
+    for c in torch.arange(seq_kv).split(1000):
+        o_c, l_c = flydsl_flash_attn_func(
+            q, k[:, c[0] : c[-1] + 1], v[:, c[0] : c[-1] + 1], return_lse=True
+        )
+        o_c = o_c.float()
+        if out is None:
+            out, lse = o_c, l_c
+            continue
+        new = torch.logaddexp(lse, l_c)
+        w_old = torch.exp(lse - new).transpose(1, 2).unsqueeze(-1)
+        w_new = torch.exp(l_c - new).transpose(1, 2).unsqueeze(-1)
+        out, lse = out * w_old + o_c * w_new, new
+    assert (lse - full_lse).abs().max().item() < 5e-4
+    rel = ((out - full.float()).norm() / full.float().norm()).item()
+    assert rel < 1e-2, f"rel_err={rel:.3e}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_ring_merge_causal():
+    """Causal ring attention: Q chunk i attends KV chunks j < i without a mask and
+    its own chunk j == i causally; merging those with the LSEs equals causal
+    attention over the whole sequence."""
+    batch, seq, num_heads, head_dim, chunk = 2, 3000, 4, 128, 1000
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            batch,
+            seq,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(3)
+    )
+    full, full_lse = flydsl_flash_attn_func(q, k, v, causal=True, return_lse=True)
+    for i in range(seq // chunk):
+        qi = q[:, i * chunk : (i + 1) * chunk]
+        out, lse = None, None
+        for j in range(i + 1):
+            kj = k[:, j * chunk : (j + 1) * chunk]
+            vj = v[:, j * chunk : (j + 1) * chunk]
+            o_c, l_c = flydsl_flash_attn_func(
+                qi, kj, vj, causal=(j == i), return_lse=True
+            )
+            o_c = o_c.float()
+            if out is None:
+                out, lse = o_c, l_c
+                continue
+            new = torch.logaddexp(lse, l_c)
+            w_old = torch.exp(lse - new).transpose(1, 2).unsqueeze(-1)
+            w_new = torch.exp(l_c - new).transpose(1, 2).unsqueeze(-1)
+            out, lse = out * w_old + o_c * w_new, new
+        ref = full[:, i * chunk : (i + 1) * chunk].float()
+        assert (
+            lse - full_lse[:, :, i * chunk : (i + 1) * chunk]
+        ).abs().max().item() < 5e-4
+        rel = ((out - ref).norm() / ref.norm()).item()
+        assert rel < 1e-2, f"chunk {i}: rel_err={rel:.3e}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_with_out():
+    q, k, v = _make_qkv(1, 500, 4, 64, torch.bfloat16)
+    out = torch.empty_like(q)
+    res, lse = flydsl_flash_attn_func(q, k, v, out=out, return_lse=True)
+    assert res is out and lse.shape == (1, 4, 500)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+    _check_lse_gfx11(lse, q, k, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_seq_first_transpose():
+    """Dense but permuted inputs ([S, B, H, D].transpose(0, 1)) are read in place
+    and the output is still plain BSHD with the right values."""
+    seq, batch, num_heads, head_dim = 300, 3, 4, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            seq,
+            batch,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ).transpose(0, 1)
+        for _ in range(3)
+    )
+    out = flydsl_flash_attn_func(q, k, v)
+    assert out.is_contiguous()
+    _check_gfx11(
+        out,
+        q,
+        k,
+        v,
+        False,
+        1.0 / 8.0,
+        heads=[(b, h) for b in range(batch) for h in range(num_heads)],
+    )
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_decode_query_view():
+    """seq_q == 1 from a [B, H, 1, D] transpose: the size-1 dim's stride is ignored."""
+    batch, num_heads, seq_kv, head_dim = 2, 8, 700, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, num_heads, 1, head_dim, generator=g, dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out, lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(head_dim))
+    ref = _ref_lse_fp32(
+        q, k, batch - 1, num_heads - 1, False, 1.0 / math.sqrt(head_dim)
+    )
+    assert (lse[batch - 1, num_heads - 1] - ref).abs().max().item() < 1e-3
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_misaligned_input_is_copied():
+    """A contiguous view that does not start 16-byte aligned is copied first."""
+    batch, seq, num_heads, head_dim = 2, 256, 4, 64
+    n = batch * seq * num_heads * head_dim
+    g = torch.Generator(device="cuda").manual_seed(0)
+    buf = torch.randn(n + 1, generator=g, dtype=torch.bfloat16, device="cuda")
+    q = buf[1:].view(batch, seq, num_heads, head_dim)
+    assert q.is_contiguous() and q.data_ptr() % 16 != 0
+    k, v = _make_qkv(batch, seq, num_heads, head_dim, torch.bfloat16)[1:]
+    with pytest.warns(UserWarning, match="materializes"):
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_fused_gqa_causal_f16():
+    """LSE with f16, causal GQA and Q / K / V views of one fused projection."""
+    batch, seq, num_heads, num_kv_heads, head_dim = 2, 777, 16, 4, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch,
+        seq,
+        num_heads + 2 * num_kv_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    q, k, v = qkv.split([num_heads, num_kv_heads, num_kv_heads], dim=2)
+    out, lse = flydsl_flash_attn_func(q, k, v, causal=True, return_lse=True)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, True, 1.0 / math.sqrt(head_dim))
+    for b, h in ((0, 0), (batch - 1, num_heads - 1)):
+        ref = _ref_lse_fp32(q, k, b, h, True, 1.0 / math.sqrt(head_dim))
+        assert (lse[b, h] - ref).abs().max().item() < 1e-3
+
+
+@_gfx1201_only
+def test_flydsl_fmha_gfx1201_rejects_return_lse():
+    q, k, v = _make_qkv(1, 256, 4, 64, torch.bfloat16)
+    with pytest.raises(ValueError, match="return_lse"):
+        flydsl_flash_attn_func(q, k, v, return_lse=True)
 
 
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
