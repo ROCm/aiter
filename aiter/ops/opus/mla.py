@@ -134,6 +134,7 @@ def opus_mla_v4_prefill_a8w8_gfx950_fwd(
     partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
     partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
     partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    kv_dma_layout: bool = False,
 ) -> None: ...
 
 

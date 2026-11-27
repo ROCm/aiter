@@ -136,6 +136,12 @@ for file in "${sharded_files[@]}"; do
             # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_mla_sparse_prefill.py)
+            # Correctness and regression cases (including SWA, split-sink, CSR
+            # boundaries, and DMA layout checks) are pytest functions; the CLI
+            # entry point is a benchmark/sweep driver.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/test_mla_nvfp4.py|op_tests/test_mla_nvfp4_decode_prep.py)
             # The test cases are pytest functions; test_mla_nvfp4.py has no script
             # entry point and the decode prep's is a benchmark. Both skip off gfx1250.

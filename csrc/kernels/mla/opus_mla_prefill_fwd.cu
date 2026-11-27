@@ -482,9 +482,9 @@ namespace {
 template <bool SPLIT = false>
 using V4A16W16Traits16mx1 =
     opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, SPLIT>;
-template <bool SPLIT = false>
+template <bool SPLIT = false, bool DMA = false>
 using V4A8W8Traits16mx1 =
-    opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t, SPLIT>;
+    opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t, SPLIT, DMA>;
 constexpr const char* kV4A16W16Co32mx4 = "mla_opus/opus_mla_v4_prefill_a16w16_32mx4_32nx1.co";
 constexpr const char* kV4A8W8Co32mx4   = "mla_opus/opus_mla_v4_prefill_a8w8_32mx4_32nx1.co";
 
@@ -598,10 +598,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
      aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     bool kv_dma_layout,
      hipStream_t stream),
     (q_nope, q_rope, unified_kv_nope, unified_kv_rope, kv_indices_prefix, kv_indptr_prefix,
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
-     num_splits, partial_o, partial_max, partial_sum, stream))
+     num_splits, partial_o, partial_max, partial_sum, kv_dma_layout, stream))
 {
     const opus_mla_v4_prefill_fp8_kargs kargs = opus_mla_v4_prefill_a8w8_kargs(
         q_nope, q_rope, unified_kv_nope, unified_kv_rope, kv_indices_prefix, kv_indptr_prefix,
@@ -610,13 +611,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int H = kargs.H;
     const opus_mla_prefill_split_args split =
         opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
+#if !defined(OPUS_MLA_V4_DMA)
+    AITER_CHECK(!kv_dma_layout,
+                "kv_dma_layout=True requires module_mla_prefill_opus built with -DOPUS_MLA_V4_DMA=1");
+#endif
     if(N == 0)
         return;
 
     HipDeviceGuard guard(q_nope->device_id);
 
-    if(H <= 32)
-    {
+    auto launch_16mx1 = [&](auto dma_tag) {
+        constexpr bool DMA = decltype(dma_tag)::value;
         auto launch = [&](auto traits, const auto& args) {
             using KTraits = decltype(traits);
             const dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
@@ -624,11 +629,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(args);
         };
         if(num_splits > 1)
-            launch(V4A8W8Traits16mx1<true>{},
+            launch(V4A8W8Traits16mx1<true, DMA>{},
                    opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>{kargs, split});
         else
-            launch(V4A8W8Traits16mx1<>{}, kargs);
+            launch(V4A8W8Traits16mx1<false, DMA>{}, kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
+    };
+
+    if(kv_dma_layout)
+    {
+#if defined(OPUS_MLA_V4_DMA)
+        // The prebuilt 32mx4_32nx1 code object only consumes the served layout;
+        // route all head counts to the in-tree DMA 16mx1_16nx4 kernel.
+        launch_16mx1(std::true_type{});
+#endif
+    }
+    else if(H <= 32)
+    {
+        launch_16mx1(std::false_type{});
     }
     else
     {

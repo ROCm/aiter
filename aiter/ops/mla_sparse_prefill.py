@@ -30,7 +30,7 @@ import torch
 
 from .. import logger
 from .. import plugin as _plugin
-from ..jit.core import compile_ops
+from ..jit.core import compile_ops, get_args_of_build
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.build_targets import is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -39,6 +39,7 @@ from ..plugin import route as _route
 from ..utility import dtypes
 from .mla_sparse_prefill_v41_asm import _asm_sparse_prefill_v41
 from .opus.mla import (
+    PREFILL_MD_NAME,
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
     opus_mla_v4_prefill_a8w8_gfx1250_fwd,
     opus_mla_v4_prefill_a16w16_gfx950_fwd,
@@ -238,6 +239,20 @@ def mla_sparse_prefill_fp8_asm(
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
+def fp8_kv_dma_layout_enabled(gfx: str) -> bool:
+    """Whether the fp8 kernel for ``gfx`` supports the opt-in DMA KV layout.
+
+    Only the gfx950 kernel has the DMA path, and only when the module is built
+    with ``-DOPUS_MLA_V4_DMA`` (its ``flags_extra_hip`` in optCompilerConfig.json),
+    so the wrapper follows that flag rather than assuming it.
+    """
+    if gfx != "gfx950":
+        return False
+    flags = get_args_of_build(PREFILL_MD_NAME)["flags_extra_hip"]
+    return any("-DOPUS_MLA_V4_DMA" in f for f in flags)
+
+
 def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
     """gfx950 compiles the kernel from source; gfx1250 loads a prebuilt code object,
     as its kernel needs a scheduler that release toolchains do not ship."""
@@ -308,7 +323,9 @@ _KV_SPLIT_FIT = {
 _ASM_V41_INITIAL_SPLIT_FIT = _SplitFit(64, 64, 1, tuple(range(2, 17)), 290, 0.045)
 
 
-def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
+def _opus_split_fit(
+    gfx: str, kernel: str, h: int, *, kv_dma_layout: bool = False
+) -> _SplitFit:
     """The split-K fit of the ``kernel`` (v4_a16w16, v4_a8w8, v41_a8w8, v41_a8w4) variant that
     serves ``h`` heads, as the launcher picks it."""
     if gfx == "gfx1250" and kernel == "v41_a8w8":
@@ -317,6 +334,8 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
         tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
+    elif kv_dma_layout:
+        tile = "16mx1_16nx4"
     else:
         tile = "16mx1_16nx4" if h <= 32 else "32mx4_32nx1"
     return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
@@ -455,6 +474,7 @@ def _opus_sparse_prefill_v4(
     softmax_scale,
     out,
     num_kv_splits=None,
+    kv_dma_layout=False,
 ):
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -469,6 +489,10 @@ def _opus_sparse_prefill_v4(
         )
     gfx = get_gfx_runtime()
     fwd = _opus_fwd(gfx, *kernels)
+    if kv_dma_layout and not fp8_kv_dma_layout_enabled(gfx):
+        raise RuntimeError(
+            f"kv_dma_layout=True requires gfx950 built with -DOPUS_MLA_V4_DMA, got {gfx}"
+        )
     if q_rope.dtype != torch.bfloat16:
         raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
     n, h, _ = q_nope.shape
@@ -487,14 +511,19 @@ def _opus_sparse_prefill_v4(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    fit = _opus_split_fit(gfx, "v4_a8w8", h)
+    fit = _opus_split_fit(gfx, "v4_a8w8", h, kv_dma_layout=kv_dma_layout)
     num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
-    fwd(
-        *args,
-        out,
-        float(softmax_scale),
-        *_split_args(n, num_kv_splits, h, q_nope.device),
-    )
+    split_args = _split_args(n, num_kv_splits, h, q_nope.device)
+    if kv_dma_layout:
+        fwd(
+            *args,
+            out,
+            float(softmax_scale),
+            *(split_args or (1, None, None, None)),
+            True,
+        )
+    else:
+        fwd(*args, out, float(softmax_scale), *split_args)
     return out
 
 
@@ -998,6 +1027,7 @@ def _mla_sparse_prefill_v4_fake(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
     backend: str | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -1084,9 +1114,21 @@ def mla_sparse_prefill_v4(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
     backend: str | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     """MLA sparse prefill over the v4 layout: NoPE rows holding their own E8M0
     scales, plus bf16 RoPE. Supported NoPE dtypes: fp8.
+
+    By default (``kv_dma_layout=False``), the opus kernel consumes the served
+    MXFP8 layout directly and preserves arbitrary E8M0 scales. Where
+    :func:`fp8_kv_dma_layout_enabled` holds, callers whose KV caches are already
+    in the bounded unit-scale DMA layout (one 512 B fp8 row per position: NoPE
+    at scale 2^0 in ``[0, 448)``, fp8 RoPE in ``[448, 512)``, as emitted by
+    :func:`aiter.ops.triton.attention.mla_v4_kv_rescale.to_dma_kv_layout` or an
+    upstream KV writer for values within ``[-448, 448]``) can opt in via
+    ``kv_dma_layout=True``. QK^T takes its RoPE in bf16 from ``q_rope`` and
+    ``unified_kv_rope`` / ``kv_rope``, so those must hold the rows' real RoPE;
+    the rows' fp8 RoPE feeds only P*V.
 
     Args:
       q_nope:            ``[T, H, 512]`` NoPE (fp8: 448 values, 14 E8M0 scales, pad).
@@ -1107,7 +1149,12 @@ def mla_sparse_prefill_v4(
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
       backend:           ``"asm"``, ``"opus"`` or ``None``. Enabled plugins are
-        tried first only with ``None``; they do not receive this native pin.
+        tried first only with ``None`` (and ``kv_dma_layout=False``); they do
+        not receive this native pin.
+      kv_dma_layout:     opt-in flag indicating the KV caches are in the
+        unit-scale DMA layout (values bounded to e4m3 range ``[-448, 448]``).
+        Raises RuntimeError when the selected backend or build does not support
+        the DMA path.
 
     Returns:
       ``out``.
@@ -1128,13 +1175,15 @@ def mla_sparse_prefill_v4(
         softmax_scale,
         out,
     )
-    if backend is None:
+    if backend is None and not kv_dma_layout:
         return _mla_sparse_prefill_v4_routed(*args, num_kv_splits)
     if backend == "asm":
+        if kv_dma_layout:
+            raise RuntimeError("the asm backend does not support kv_dma_layout=True")
         if num_kv_splits not in (None, 1):
             raise RuntimeError("the asm backend has no split-K")
         return _asm_sparse_prefill_v4(*args)
-    return _opus_sparse_prefill_v4(*args, num_kv_splits)
+    return _opus_sparse_prefill_v4(*args, num_kv_splits, kv_dma_layout=kv_dma_layout)
 
 
 def _mla_sparse_prefill_v41_fake(
