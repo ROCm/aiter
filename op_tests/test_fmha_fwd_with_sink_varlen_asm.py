@@ -24,20 +24,21 @@ Layout (packed THD; batch folded into the token axis):
     cu_seqlens_q / cu_seqlens_k : int32 [batch+1] cumulative
 
 Head dims: (64, 64) and (128, 128) are the symmetric kernels; (192, 128) is the
-asymmetric D192x128 one (qk_head_dim=192, v_head_dim=128), which tiles KV by 128
-instead of 256.
+asymmetric D192x128 one (qk_head_dim=192, v_head_dim=128); (256, 256) is D256.
+D192x128 and D256 tile KV by 128 instead of 256.
 
 Sink convention (same as the fixed-batch path): `sink` ([q_head_num] fp32) is a
 per-Q-head logit in the scaled domain, a zero-value virtual KV column passed
-verbatim.  D64 kernels read it; D128 and D192x128 kernels ignore it (pass None).
+verbatim.  D64 kernels read it; D128, D192x128 and D256 kernels ignore it (pass
+None).
 
 KV-length constraint (mask=0 only): the non-causal D64/D128 kernels require
-per-sequence kv_seqlen that is a multiple of 256.  D192x128 has no such
+per-sequence kv_seqlen that is a multiple of 256.  D192x128 and D256 have no such
 constraint (sub_K=128 with the border mask compiled in).
 
-Strided inputs: D192x128 takes q/k/v/out views (e.g. v = kv[..., 128:]); they are
-checked against the reference and bit-for-bit against contiguous inputs (BF16 and
-FP8 alike).
+Strided inputs: D192x128 and D256 take q/k/v/out views (e.g. v = kv[..., 128:]);
+they are checked against the reference and bit-for-bit against contiguous inputs
+(BF16 and FP8 alike).
 """
 
 import argparse
@@ -51,7 +52,7 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -68,9 +69,14 @@ def _attn_one(q, k, v, *, is_causal, sink):
     """Single-sequence attention reference (no batch dim).
 
     q: (sq, hq, d)  k: (sk, hk, d)  v: (sk, hk, dv) -> out (sq, hq, dv), lse (sq, hq).
+    A row that sees no key (sk == 0, or causal with sq > sk) gets O = 0 and
+    LSE = -inf (unless a sink logit gives it one).
     """
     sq, hq, d = q.shape
     sk, hk, _ = k.shape
+    if sk == 0 and sink is None:
+        out = torch.zeros((sq, hq, v.shape[-1]), dtype=q.dtype, device=q.device)
+        return out, torch.full((sq, hq), float("-inf"), device=q.device)
     if hq != hk:
         k = k.repeat_interleave(hq // hk, dim=1)
         v = v.repeat_interleave(hq // hk, dim=1)
@@ -88,10 +94,15 @@ def _attn_one(q, k, v, *, is_causal, sink):
         max_total = torch.maximum(max_attn, sink_hs)
     else:
         max_total = max_attn
+    # -inf only on rows that see no key: subtract 0 there, so exp gives 0, the
+    # sum 0, O 0 and the LSE log(0) = -inf.
+    max_total = torch.where(torch.isinf(max_total), 0.0, max_total)
     denom = torch.exp(scores - max_total.unsqueeze(-1)).sum(dim=-1)
     if sink is not None:
         denom = denom + torch.exp(sink_hs - max_total)
-    probs = torch.exp(scores - max_total.unsqueeze(-1)) / denom.unsqueeze(-1)
+    probs = torch.exp(scores - max_total.unsqueeze(-1)) / torch.where(
+        denom > 0, denom, 1.0
+    ).unsqueeze(-1)
     out = torch.einsum("hqk,khd->qhd", probs, vf).to(q.dtype)
     lse = (torch.log(denom) + max_total).transpose(0, 1)
     return out, lse
@@ -162,8 +173,10 @@ def run_kernel(
     sink=None,
     via="public",
     out=None,
+    max_seqlen_k=None,
 ):
     """Return (out, lse) with lse shaped (total_q, nheads) to match run_torch.
+    max_seqlen_k defaults to max_seqlen_q (equal q/k seqlens).
 
     via="public" → aiter.flash_attn_varlen_func (the model path); lse comes back
                    (nheads, total_q) and is transposed here.
@@ -177,7 +190,7 @@ def run_kernel(
             cu_q,
             cu_k,
             max_seqlen_q,
-            max_seqlen_q,  # equal q/k seqlens in these tests
+            max_seqlen_q if max_seqlen_k is None else max_seqlen_k,
             softmax_scale=scale,
             causal=is_causal,
             return_lse=True,
@@ -217,10 +230,10 @@ def _flops_bytes(seqlens, hq, hk, d, dv, is_causal, total, esz):
 # Shape tables
 # ---------------------------------------------------------------------------
 
-# Correctness shapes (torch reference feasible).  hq=64; hk=8 (D64) / 4 (D128/D192x128).
+# Correctness shapes (torch reference feasible).  hq=64; hk=8 (D64) / 4 (others).
 # The symmetric D64/D128 kernels tile KV by 256 and their non-causal (mask=0)
-# variants require every kv_seqlen % 256 == 0 (filtered); D192x128 tiles by 128
-# with a border mask, so unaligned lengths are in scope for it too.
+# variants require every kv_seqlen % 256 == 0 (filtered); D192x128 and D256 tile
+# by 128 with a border mask, so unaligned lengths are in scope for them too.
 # (hdim_q, hdim_v, hq, hk, seqlens)
 _CORRECTNESS_SHAPES = [
     (64, 64, 64, 8, [256]),
@@ -240,6 +253,18 @@ _CORRECTNESS_SHAPES = [
     (64, 64, 64, 8, [512, 1024]),
     (128, 128, 64, 4, [512, 1024]),
     (192, 128, 64, 4, [512, 1024]),
+    (256, 256, 64, 4, [256]),
+    (256, 256, 64, 4, [128, 256, 384]),
+    (256, 256, 64, 4, [100, 200, 300]),
+    (256, 256, 64, 4, [256, 512]),
+    (256, 256, 64, 4, [512, 1024]),
+    (256, 256, 16, 16, [2048]),
+    # above the remap_xy threshold: launched without remap_xy, unequal lengths with a padded
+    # width (the shapes above all take remap_xy)
+    (192, 128, 128, 128, [2304]),
+    (192, 128, 128, 128, [1000, 2500, 1800]),
+    (256, 256, 64, 64, [2304]),
+    (256, 256, 64, 64, [1000, 3000, 2500]),
 ]
 
 # Perf-only shapes (torch ref O(s^2) infeasible at 16384/32768).
@@ -251,6 +276,13 @@ _VARLEN_PERF_SHAPES = [
     (64, 64, 64, 8, [32768]),
     (192, 128, 64, 4, [2048, 2048]),
     (192, 128, 64, 4, [16384]),
+    (256, 256, 64, 4, [2048, 2048]),
+    (256, 256, 16, 16, [16384]),
+    (256, 256, 16, 16, [32768]),
+    (256, 256, 16, 2, [4096, 4096, 4096, 4096]),
+    (256, 256, 32, 32, [16000] * 4),  # mi455x-opbench attn/uniform/B4L16000/h32d256
+    (256, 256, 32, 1, [16384]),  # MQA
+    (256, 256, 64, 64, [1024] * 16),
 ]
 
 
@@ -258,9 +290,10 @@ def _kv_alignment_ok(hdim_q, seqlens):
     """Non-causal eligibility for the per-head-dim KV tile.
 
     D64/D128 use sub_K=256 and need every kv_seqlen to be a multiple of it.
-    D192x128 uses sub_K=128 and compiles the border mask in, so any length works.
+    D192x128 and D256 use sub_K=128 and compile the border mask in, so any length
+    works.
     """
-    if hdim_q == 192:
+    if hdim_q in (192, 256):
         return True
     return all(s % 256 == 0 for s in seqlens)
 
@@ -272,12 +305,13 @@ def _kv_alignment_ok(hdim_q, seqlens):
 
 @benchmark()
 def test_fmha_fwd_with_sink_varlen_asm(
-    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init, d64_sink=True
 ):
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v, init=init)
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(hdim_q)
-    sink = _d64_sink(hq) if hdim_q == 64 else None
+    # D64 without a sink: the wrapper passes the kernel a -inf sink.
+    sink = _d64_sink(hq) if hdim_q == 64 and d64_sink else None
 
     ref_out, ref_lse = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=sink)
 
@@ -287,6 +321,8 @@ def test_fmha_fwd_with_sink_varlen_asm(
     )
 
     # The model calls the public dispatcher (flash_attn_varlen_func) → asm path.
+    # It sends D64 without a sink to another backend, so that case calls the ops.
+    via = "public" if hdim_q != 64 or d64_sink else "ops"
     candidates = {
         "asm": lambda: run_kernel(
             q,
@@ -298,7 +334,7 @@ def test_fmha_fwd_with_sink_varlen_asm(
             scale=scale,
             is_causal=is_causal,
             sink=sink,
-            via="public",
+            via=via,
         )
     }
 
@@ -308,14 +344,14 @@ def test_fmha_fwd_with_sink_varlen_asm(
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err(O)"] = checkAllclose(
+        ret[f"{name} err(O)"] = assertAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
             msg=f"{name} O d={hdim_q}x{hdim_v} c={is_causal}",
         )
-        ret[f"{name} err(LSE)"] = checkAllclose(
+        ret[f"{name} err(LSE)"] = assertAllclose(
             ref_lse.to(dtypes.fp32),
             lse.to(dtypes.fp32),
             rtol=1e-2,
@@ -386,6 +422,15 @@ _STRIDED_REPEATS = 5
 _STRIDED_VIAS = ["public", "ops"]
 
 
+def _strided_vias(q, is_causal):
+    """The candidates checked bit for bit against the ops run: `public` only when
+    flash_attn_varlen_func hands the call to the ASM kernel, i.e. not for the calls
+    it offers to FlyDSL first (e.g. D192x128 with AITER_ENABLE_EXPERIMENTAL)."""
+    if aiter.ops.mha._prefer_flydsl_over_gfx1250_bf16_varlen_asm(q, is_causal):
+        return [v for v in _STRIDED_VIAS if v != "public"]
+    return _STRIDED_VIAS
+
+
 def _same(res, dense):
     return torch.equal(res[0], dense[0]) and torch.equal(res[1], dense[1])
 
@@ -399,14 +444,14 @@ def _record(ret, name, fn, dense, ref, flops, nbytes, msg):
     ret[f"{name} TFLOPS"] = flops / us / 1e6
     ret[f"{name} TB/s"] = nbytes / us / 1e6
     ret[f"{name} == dense"] = same
-    ret[f"{name} err(O)"] = checkAllclose(
+    ret[f"{name} err(O)"] = assertAllclose(
         ref[0].to(dtypes.fp32),
         out.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
         msg=f"{msg} via={name} O",
     )
-    ret[f"{name} err(LSE)"] = checkAllclose(
+    ret[f"{name} err(LSE)"] = assertAllclose(
         ref[1].to(dtypes.fp32),
         lse.to(dtypes.fp32),
         rtol=1e-2,
@@ -415,29 +460,31 @@ def _record(ret, name, fn, dense, ref, flops, nbytes, msg):
     )
 
 
-def _strided_setup(hq, hk, seqlens, is_causal):
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
-    kw = {"scale": 1.0 / math.sqrt(192), "is_causal": is_causal}
+def _strided_setup(hdim_q, hdim_v, hq, hk, seqlens, is_causal):
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v)
+    kw = {"scale": 1.0 / math.sqrt(hdim_q), "is_causal": is_causal}
     ref = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
     dense = run_kernel(q, k, v, cu, cu, max(seqlens), via="ops", **kw)
     flops, nbytes = _flops_bytes(
-        seqlens, hq, hk, 192, 128, is_causal, q.size(0), q.element_size()
+        seqlens, hq, hk, hdim_q, hdim_v, is_causal, q.size(0), q.element_size()
     )
     return q, k, v, cu, kw, ref, dense, flops, nbytes
 
 
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layout):
-    """D192x128 with strided q/k/v views."""
+def test_fmha_fwd_with_sink_varlen_asm_strided(
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, layout
+):
+    """D192x128 / D256 with strided q/k/v views."""
     q, k, v, cu, kw, ref, dense, flops, nbytes = _strided_setup(
-        hq, hk, seqlens, is_causal
+        hdim_q, hdim_v, hq, hk, seqlens, is_causal
     )
     qs, ks, vs = _strided_inputs(layout, q, k, v)
     candidates = {
         via: functools.partial(
             run_kernel, qs, ks, vs, cu, cu, max(seqlens), via=via, **kw
         )
-        for via in _STRIDED_VIAS
+        for via in _strided_vias(q, is_causal)
     }
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
@@ -446,15 +493,17 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
 
 
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, is_causal, width):
-    """D192x128 writing into a preallocated `out` that is a [..., :128] view of a
-    wider NaN buffer (width 129: rows only 2-byte aligned)."""
+def test_fmha_fwd_with_sink_varlen_asm_strided_out(
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, width
+):
+    """D192x128 / D256 writing into a preallocated `out` that is a [..., :hdim_v]
+    view of a wider NaN buffer (width hdim_v + 1: rows only 2-byte aligned)."""
     q, k, v, cu, kw, ref, dense, flops, nbytes = _strided_setup(
-        hq, hk, seqlens, is_causal
+        hdim_q, hdim_v, hq, hk, seqlens, is_causal
     )
     wides = {
         via: torch.full((q.size(0), hq, width), float("nan"), dtype=q.dtype)
-        for via in _STRIDED_VIAS
+        for via in _strided_vias(q, is_causal)
     }
     candidates = {
         via: functools.partial(
@@ -466,7 +515,7 @@ def test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, is_causal, w
             cu,
             max(seqlens),
             via=via,
-            out=wide[..., :128],
+            out=wide[..., :hdim_v],
             **kw,
         )
         for via, wide in wides.items()
@@ -476,7 +525,7 @@ def test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, is_causal, w
         _record(ret, name, fn, dense, ref, flops, nbytes, f"strided out w={width}")
         wide = wides[name]
         in_place = fn()[0].data_ptr() == wide.data_ptr()
-        pad_untouched = bool(wide[..., 128:].isnan().all().item())
+        pad_untouched = bool(wide[..., hdim_v:].isnan().all().item())
         assert in_place and pad_untouched, f"w={width} via={name}: out not in place"
         ret[f"{name} out in place"] = in_place
         ret[f"{name} pad untouched"] = pad_untouched
@@ -484,11 +533,12 @@ def test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, is_causal, w
 
 
 def _unsupported_kv(case, k, v):
-    """k/v views the D192x128 kernel cannot address."""
+    """k/v views the D192x128 / D256 kernels cannot address."""
     if case == "k token stride 2^24 B":
         tok = (1 << 24) // k.element_size()
-        buf = torch.empty((len(k) - 1) * tok + k.size(1) * 192, dtype=k.dtype)
-        k_far = buf.as_strided(k.shape, (tok, 192, 1))
+        d = k.size(-1)
+        buf = torch.empty((len(k) - 1) * tok + k.size(1) * d, dtype=k.dtype)
+        k_far = buf.as_strided(k.shape, (tok, d, 1))
         k_far.copy_(k)
         return k_far, v
     if case == "k/v head stride 0":
@@ -498,15 +548,17 @@ def _unsupported_kv(case, k, v):
 
 
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
+def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(
+    hdim_q, hdim_v, case, is_causal
+):
     """Unsupported k/v strides: the public path must use another backend, and a
     direct op call must be refused by the C++ entry.
 
     Not timed: the backend that serves these calls is not the one under test."""
     seqlens, hq, hk = [2], 4, 2
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v)
     k, v = _unsupported_kv(case, k, v)
-    scale = 1.0 / math.sqrt(192)
+    scale = 1.0 / math.sqrt(hdim_q)
     ref_out, _ = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
 
     mha = aiter.ops.mha
@@ -538,7 +590,7 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
         "gfx": get_gfx(),
         "ops refused": ops_refused,
         "public asm calls": len(calls) - ops_calls,
-        "err(O)": checkAllclose(
+        "err(O)": assertAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=1e-2,
@@ -546,6 +598,144 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
             msg=f"{case} -> other backend, c={is_causal}",
         ),
     }
+
+
+def _visible_pairs(sq, sk, is_causal):
+    """(query, key) pairs attention computes; causal is bottom-right aligned, so
+    row i sees min(sk, max(0, i + 1 + sk - sq)) keys."""
+    if not is_causal:
+        return sq * sk
+    return sum(min(sk, max(0, i + 1 + sk - sq)) for i in range(sq))
+
+
+def _asm_calls(fn):
+    """Run fn() with a spy on the bf16 varlen ctypes entry; returns the launches."""
+    mha = aiter.ops.mha
+    asm = mha._fmha_fwd_with_sink_varlen_asm
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return asm(*args, **kwargs)
+
+    mha._fmha_fwd_with_sink_varlen_asm = spy
+    try:
+        fn()
+    finally:
+        mha._fmha_fwd_with_sink_varlen_asm = asm
+    return len(calls)
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_qk(
+    hdim_q, hdim_v, hq, hk, seqlens_q, seqlens_k, is_causal
+):
+    """D192x128 / D256 with separate q and k lengths: q < k (chunked prefill),
+    q > k (causal rows that see no key: O = 0, LSE = -inf), sequences without keys
+    or queries.  Both entries reach the ASM kernel and agree bit for bit (`public`
+    is skipped for calls flash_attn_varlen_func offers to FlyDSL first)."""
+    torch.manual_seed(0)
+    q = torch.randn(sum(seqlens_q), hq, hdim_q, dtype=dtypes.bf16)
+    k = torch.randn(sum(seqlens_k), hk, hdim_q, dtype=dtypes.bf16)
+    v = torch.randn(sum(seqlens_k), hk, hdim_v, dtype=dtypes.bf16)
+    cu_q, cu_k = _cu(seqlens_q), _cu(seqlens_k)
+    max_q, max_k = max(seqlens_q), max(seqlens_k)
+    kw = {
+        "scale": 1.0 / math.sqrt(hdim_q),
+        "is_causal": is_causal,
+        "max_seqlen_k": max_k,
+    }
+    ref = run_torch(q, k, v, cu_q, cu_k, is_causal=is_causal, sink=None)
+    dense = run_kernel(q, k, v, cu_q, cu_k, max_q, via="ops", **kw)
+    pairs = sum(_visible_pairs(a, b, is_causal) for a, b in zip(seqlens_q, seqlens_k))
+    flops = 2.0 * hq * pairs * (hdim_q + hdim_v)
+    nbytes = (q.numel() + k.numel() + v.numel() + q.size(0) * hq * hdim_v) * 2
+    candidates = {
+        via: functools.partial(run_kernel, q, k, v, cu_q, cu_k, max_q, via=via, **kw)
+        for via in _strided_vias(q, is_causal)
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        assert _asm_calls(fn) == 1, f"via={name} did not reach the ASM kernel"
+        _record(ret, name, fn, dense, ref, flops, nbytes, f"q/k lengths c={is_causal}")
+    return ret
+
+
+# (hq, hk, seqlens_q, seqlens_k): one sequence, q < k, q > k, mixed varlen, short
+# sequences, no keys at all, a sequence without queries and one without keys.
+_QK_SHAPES = [
+    (16, 4, [1000], [1000]),
+    (8, 8, [768], [2048]),
+    (8, 8, [300], [65]),
+    (16, 4, [77, 513, 256], [130, 1000, 65]),
+    (8, 2, [1, 64, 255, 257], [1, 64, 255, 257]),
+    (8, 2, [64, 300], [0, 0]),
+    (8, 8, [0, 512, 77], [100, 512, 0]),
+]
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_d64_qk(
+    hq, hk, seqlens_q, seqlens_k, is_causal, d64_sink
+):
+    """D64 through the ops wrapper with separate q and k lengths, q > k.  Causal rows
+    that see no key must give O = 0 and LSE = -inf (the sink logit with a sink) on
+    every element; without a sink the wrapper's -inf sink meets a -inf row maximum
+    there."""
+    torch.manual_seed(0)
+    q = torch.randn(sum(seqlens_q), hq, 64, dtype=dtypes.bf16)
+    k = torch.randn(sum(seqlens_k), hk, 64, dtype=dtypes.bf16)
+    v = torch.randn(sum(seqlens_k), hk, 64, dtype=dtypes.bf16)
+    cu_q, cu_k = _cu(seqlens_q), _cu(seqlens_k)
+    sink = _d64_sink(hq) if d64_sink else None
+    ref_out, ref_lse = run_torch(q, k, v, cu_q, cu_k, is_causal=is_causal, sink=sink)
+    fn = functools.partial(
+        run_kernel,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(seqlens_q),
+        scale=1.0 / math.sqrt(64),
+        is_causal=is_causal,
+        sink=sink,
+        via="ops",
+    )
+    (out, lse), us = run_perftest(fn)
+    pairs = sum(_visible_pairs(a, b, is_causal) for a, b in zip(seqlens_q, seqlens_k))
+    msg = f"D64 q/k lengths c={is_causal} sink={d64_sink}"
+    # Rows without a key by position (bottom-right aligned; every k length here is
+    # non-zero): a sink makes the reference LSE finite on them too.
+    no_key = torch.cat(
+        [
+            torch.arange(a) < (a - b if is_causal else 0)
+            for a, b in zip(seqlens_q, seqlens_k)
+        ]
+    )
+    ret = {
+        "gfx": get_gfx(),
+        "rows without a key": int(no_key.sum()),
+        "asm us": us,
+        "asm TFLOPS": 2.0 * hq * pairs * (64 + 64) / us / 1e6,
+        "asm err(O)": assertAllclose(
+            ref_out.float(), out.float(), rtol=1e-2, atol=1e-2, msg=f"{msg} O"
+        ),
+        "asm err(LSE)": assertAllclose(
+            ref_lse, lse.float(), rtol=1e-2, atol=1e-2, msg=f"{msg} LSE"
+        ),
+    }
+    # assertAllclose tolerates a few bad elements; rows without a key must match on
+    # every element
+    assert not out[no_key].any(), f"{msg}: O != 0 without keys"
+    ok = torch.isclose(lse[no_key], ref_lse[no_key], rtol=1e-2, atol=1e-2)
+    assert ok.all(), f"{msg}: LSE differs from the reference without keys"
+    return ret
+
+
+# (hq, hk, seqlens_q, seqlens_k) for test_fmha_fwd_with_sink_varlen_asm_d64_qk: two
+# sequences whose q and k offsets differ; causal, the first 44 rows of each see no key.
+_D64_QK_SHAPES = [(64, 8, [300, 300], [256, 256])]
 
 
 # Attention options _select_gfx1250_fmha_fwd_varlen_asm checks the same way for
@@ -595,7 +785,13 @@ _BF16_GATE_CASES = {
     "D64 without sink logits": False,
     "D128 with sink logits": False,
     "D192x128 with sink logits": False,
-    "head dim 256": False,
+    "D256": True,
+    "D256 with sink logits": False,
+    # Ahead of maybe_contiguous (the pre-router): a non-dense last dim is fixed
+    # later for q, but `out` is used as given.
+    "D256, q last-dim stride 2, ahead of maybe_contiguous": True,
+    "D256, out last-dim stride 2, ahead of maybe_contiguous": False,
+    "head dim 96": False,
     "fp32 descales": False,
     "zero kv heads": False,
     **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
@@ -610,13 +806,24 @@ def test_fmha_fwd_with_sink_varlen_asm_gate(case):
         d, dv = 64, 64
     elif case.startswith("D128"):
         d, dv = 128, 128
-    elif case == "head dim 256":
+    elif case.startswith("D256"):
         d, dv = 256, 256
+    elif case == "head dim 96":
+        d, dv = 96, 96
     else:
         d, dv = 192, 128
     q, k, v, _ = make_varlen_packed([2], 4, 4, d, dv)
     if case == "zero kv heads":
         k, v = k[:, :0], v[:, :0]
+    out = None
+    late = "ahead of maybe_contiguous" in case
+    if late:
+        # same shape, last-dim stride 2
+        strided2 = lambda x, dl: x.new_empty(x.size(0), x.size(1), dl, 2)[..., 0]
+        if ", q last-dim" in case:
+            q = strided2(q, d)
+        else:
+            out = strided2(q, dv)
     sink = torch.zeros(4, dtype=dtypes.fp32) if "with sink" in case else None
     descale = torch.ones(1, dtype=dtypes.fp32) if case == "fp32 descales" else None
     mha = aiter.ops.mha
@@ -624,7 +831,8 @@ def test_fmha_fwd_with_sink_varlen_asm_gate(case):
         q,
         k,
         v,
-        None,
+        out,
+        dense_last_dim_later=late,
         sink_ptr=sink,
         q_descale=descale,
         k_descale=descale,
@@ -635,14 +843,70 @@ def test_fmha_fwd_with_sink_varlen_asm_gate(case):
     return {"gfx": get_gfx(), "routed to asm": routed}
 
 
+# (hdim_q, hdim_v, is_causal, requires_grad).  A call that needs gradients goes to
+# the ASM forward only for head dims the gfx1250 ASM backward has (not D256).
+# Causal, as non-causal D64 / D128 are offered to FlyDSL first.
+_GRAD_ROUTE_CASES = [
+    (128, 128, True, False),
+    (128, 128, True, True),
+    (192, 128, True, True),
+    (256, 256, True, False),
+    (256, 256, True, True),
+    (256, 256, False, True),
+]
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_grad_route(hdim_q, hdim_v, is_causal, grad):
+    """ASM forward launches of a flash_attn_varlen_func call with and without
+    gradients; with gradients the backward must run.  Not timed."""
+    q, k, v, cu = make_varlen_packed([300, 77], 4, 4, hdim_q, hdim_v)
+    for x in (q, k, v):
+        x.requires_grad_(grad)
+    mha = aiter.ops.mha
+    has_bwd = (hdim_q, hdim_v) in mha._GFX1250_BWD_HDIMS
+    flydsl_first = mha._prefer_flydsl_over_gfx1250_bf16_varlen_asm(q, is_causal)
+    if not flydsl_first and (has_bwd or not grad):
+        expect = 1  # the pre-router hands it to the ASM forward
+    elif grad:
+        # FlyDSL takes no call that needs gradients: Triton with ENABLE_CK=0, else
+        # FlashAttnVarlenFunc, whose forward is the ASM
+        expect = 1 if mha.ENABLE_CK else 0
+    else:
+        expect = None  # offered to FlyDSL first: not checked
+    res = []
+    with torch.enable_grad():
+        calls = _asm_calls(
+            lambda: res.append(
+                run_kernel(
+                    q, k, v, cu, cu, 300, scale=hdim_q**-0.5, is_causal=is_causal
+                )
+            )
+        )
+        msg = f"D{hdim_q}x{hdim_v} causal={is_causal} grad={grad}"
+        assert expect is None or calls == expect, f"{msg}: {calls} ASM launches"
+        ret = {"gfx": get_gfx(), "ASM forward launches": calls}
+        if grad:
+            res[0][0].float().sum().backward()
+            ok = all(
+                x.grad is not None and bool(torch.isfinite(x.grad).all())
+                for x in (q, k, v)
+            )
+            assert ok, f"{msg}: backward gave no or non-finite gradients"
+            ret["backward ok"] = ok
+    return ret
+
+
 _STRIDED_LAYOUTS = [
     "kv_split",
     "fused_qkv",
     "padded",
     "odd",
 ]
-# out buffer widths for the strided-out table (129: 2-byte-aligned rows)
-_STRIDED_OUT_WIDTHS = [192, 129]
+# out buffer width minus hdim_v for the strided-out table (1: 2-byte-aligned rows)
+_STRIDED_OUT_PADS = [64, 1]
+# (hdim_q, hdim_v) of the kernels that take strided q/k/v/out
+_STRIDED_HDIMS = [(192, 128), (256, 256)]
 # (hq, hk, seqlens): GQA, unaligned and mixed lengths
 _STRIDED_SHAPES = [
     (16, 4, [129, 1000, 333]),
@@ -664,20 +928,41 @@ def test_fmha_fwd_with_sink_varlen_asm_perf(
         seqlens, hq, hk, hdim_q, hdim_v, is_causal, total, q.element_size()
     )
 
+    # asm: the ASM kernel itself (ops entry); public: what flash_attn_varlen_func
+    # runs (FlyDSL for the calls _prefer_flydsl_over_gfx1250_bf16_varlen_asm hands
+    # it); flydsl: FlyDSL's gfx1250 kernel called directly, when it takes the call.
+    run = functools.partial(
+        run_kernel,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
+    )
     candidates = {
-        "asm": lambda: run_kernel(
+        "asm": functools.partial(run, via="ops"),
+        "public": functools.partial(run, via="public"),
+    }
+    if flydsl_flash_attn_varlen_fwd is not None and sink is None:
+        fly = functools.partial(
+            flydsl_flash_attn_varlen_fwd,
             q,
             k,
             v,
             cu,
             cu,
             max_seqlen_q,
-            scale=scale,
-            is_causal=is_causal,
-            sink=sink,
-            via="public",
+            max_seqlen_q,
+            softmax_scale=scale,
+            causal=is_causal,
+            return_lse=True,
         )
-    }
+        if fly() is not None:  # None: FlyDSL does not take this configuration
+            candidates["flydsl"] = fly
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
@@ -1414,10 +1699,10 @@ def main():
         "--head_dim",
         type=int,
         nargs="*",
-        choices=[64, 128, 192],
-        default=[64, 128, 192],
+        choices=[64, 128, 192, 256],
+        default=[64, 128, 192, 256],
         help="qk head dim(s) to test; 192 selects the D192x128 kernels "
-        "(default: 64 128 192)",
+        "(default: 64 128 192 256)",
     )
     parser.add_argument(
         "-c",
@@ -1457,11 +1742,12 @@ def main():
             for is_causal, init in itertools.product(causal_modes, args.init):
                 if not is_causal and not _kv_alignment_ok(hdim_q, seqlens):
                     continue
-                df.append(
-                    test_fmha_fwd_with_sink_varlen_asm(
-                        hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+                for d64_sink in (True, False) if hdim_q == 64 else (True,):
+                    df.append(
+                        test_fmha_fwd_with_sink_varlen_asm(
+                            hdim_q, hdim_v, hq, hk, seqlens, is_causal, init, d64_sink
+                        )
                     )
-                )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
@@ -1471,37 +1757,69 @@ def main():
             "bf16 gate",
             [test_fmha_fwd_with_sink_varlen_asm_gate(c) for c in _BF16_GATE_CASES],
         )
-
-        # ---- D192x128 strided q/k/v/out ----
-        if 192 in args.head_dim:
+        summarize(
+            "bf16 routing of calls that need gradients",
+            [
+                test_fmha_fwd_with_sink_varlen_asm_grad_route(*c)
+                for c in _GRAD_ROUTE_CASES
+                if c[0] in args.head_dim
+            ],
+        )
+        if 64 in args.head_dim:
             summarize(
-                "D192x128 strided q/k/v",
+                "D64 q/k lengths",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_d64_qk(hq, hk, sq, sk, c, s)
+                    for (hq, hk, sq, sk), c, s in itertools.product(
+                        _D64_QK_SHAPES, causal_modes, (True, False)
+                    )
+                ],
+            )
+
+        # ---- D192x128 / D256: strided q/k/v/out, separate q and k lengths ----
+        strided_hdims = [hd for hd in _STRIDED_HDIMS if hd[0] in args.head_dim]
+        if strided_hdims:
+            summarize(
+                "strided q/k/v",
                 [
                     test_fmha_fwd_with_sink_varlen_asm_strided(
-                        hq, hk, seqlens, c, layout
+                        dq, dv, hq, hk, seqlens, c, layout
                     )
-                    for (hq, hk, seqlens), c, layout in itertools.product(
-                        _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
+                    for (dq, dv), (hq, hk, seqlens), c, layout in itertools.product(
+                        strided_hdims, _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
                     )
                 ],
             )
             summarize(
-                "D192x128 strided out",
+                "strided out",
                 [
                     test_fmha_fwd_with_sink_varlen_asm_strided_out(
-                        hq, hk, seqlens, c, w
+                        dq, dv, hq, hk, seqlens, c, dv + pad
                     )
-                    for (hq, hk, seqlens), c, w in itertools.product(
-                        _STRIDED_SHAPES, causal_modes, _STRIDED_OUT_WIDTHS
+                    for (dq, dv), (hq, hk, seqlens), c, pad in itertools.product(
+                        strided_hdims, _STRIDED_SHAPES, causal_modes, _STRIDED_OUT_PADS
                     )
                 ],
             )
             summarize(
-                "D192x128 unsupported stride",
+                "unsupported stride",
                 [
-                    test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, c)
-                    for case, c in itertools.product(
-                        ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
+                    test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(
+                        dq, dv, case, c
+                    )
+                    for (dq, dv), case, c in itertools.product(
+                        strided_hdims,
+                        ["k token stride 2^24 B", "k/v head stride 0"],
+                        causal_modes,
+                    )
+                ],
+            )
+            summarize(
+                "q/k lengths",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_qk(dq, dv, hq, hk, sq, sk, c)
+                    for (dq, dv), (hq, hk, sq, sk), c in itertools.product(
+                        strided_hdims, _QK_SHAPES, causal_modes
                     )
                 ],
             )

@@ -4,6 +4,7 @@
 #include "asm_pa_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstddef>
 #include <memory>
 #include <unordered_map>
 
@@ -83,7 +84,8 @@ struct __attribute__((packed)) PsKernelArgs
     void *ptr_KVPtr;
     p2 _p21;
     void *ptr_WorkPtr;
-    p2 _p22;
+    uint32_t split_o_format;
+    uint32_t reserved22;
     void *ptr_WorkInfo;
     p2 _p23;
     void *ptr_SplitO;
@@ -96,6 +98,8 @@ struct __attribute__((packed)) PsKernelArgs
     p3 _p27;
 };
 
+static_assert(sizeof(PsKernelArgs) == 368 && offsetof(PsKernelArgs, split_o_format) == 0x118);
+static_assert(offsetof(PsKernelArgs, ptr_WorkInfo) == 0x120);
 
 std::string get_heuristic_kernel(std::string q_type,
                                  std::string kv_type,
@@ -362,7 +366,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
-    PsKernelArgs args;
+    PsKernelArgs args{};
     size_t arg_size = sizeof(args);
     args.ptr_O      = out_->data_ptr();
     args.ptr_Q      = Q->data_ptr();
@@ -390,6 +394,8 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     args.ptr_QOPtr      = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
     args.ptr_KVPtr     = kv_indptr->data_ptr();
     args.ptr_WorkPtr  = (work_indptr != nullptr) ? work_indptr->data_ptr() : nullptr;
+    AITER_CHECK(!work_info || (splitData && splitLse),
+                __func__, ": persistent WorkInfo requires both split buffers");
     args.ptr_WorkInfo = (work_info != nullptr) ? work_info->data_ptr() : nullptr;
     args.ptr_SplitO   = (work_info != nullptr) ? splitData->data_ptr() : nullptr;
     args.ptr_SplitLSE = (work_info != nullptr) ? splitLse->data_ptr() : nullptr;
@@ -466,8 +472,12 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     }
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    static SynchronizedCache<std::string, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
+    const bool compact = splitData && splitData->dtype() == AITER_DTYPE_bf16;
+    args.split_o_format = compact ? 1u : 0u;
+    AITER_CHECK(!splitData || compact || splitData->dtype() == AITER_DTYPE_fp32,
+                __func__, ": split partial output must be FP32 or compact BF16");
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
         get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
     if(kernelName.empty())
@@ -482,11 +492,59 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
+        std::string name = cfg.knl_name;
+        const std::string co_name = cfg.co_name;
+        const bool has_split_format = arch_id == "gfx950" && cfg.ps &&
+            co_name == "pa/pa_" + q_type + "_pertokenFp8_gqa16_1tg_4w_mtp_msk" +
+                       std::to_string(msk) + "_ps.co";
 
-        impl_ptr =
-            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+        if(compact)
+        {
+            const auto num_cu = get_num_cu_func();
+            AITER_CHECK(has_split_format &&
+                            num_heads == 16 && num_kv_heads == 1 && head_size == 128 &&
+                            block_size == 16 && max_qlen >= 2 && max_qlen <= 4 &&
+                            K->dtype() == AITER_DTYPE_fp8 && V->dtype() == AITER_DTYPE_fp8 &&
+                            quant_type == static_cast<int>(QuantType::per_Token) && K_QScale && V_QScale,
+                        __func__, ": compact BF16 partials require the gfx950 GQA16 FP8 MTP kernel");
+            AITER_CHECK(Q->dim() == 3 && Q->stride(1) == head_size && Q->stride(2) == 1 &&
+                            out_->dtype() == q_dtype && out_->dim() == 3 && out_->is_contiguous() &&
+                            out_->size(0) == Q->size(0) && out_->size(1) == num_heads &&
+                            out_->size(2) == head_size && K->dim() == 5 && V->dim() == 5 &&
+                            K->is_contiguous() && V->is_contiguous() && K->size(2) == 8 &&
+                            K->size(4) == 16 && V->size(0) == K->size(0) && V->size(1) == 1 &&
+                            V->size(2) == 1 && V->size(3) == head_size && V->size(4) == block_size &&
+                            std::abs(softmax_scale * k_log2e - k_scalar) <= 1.e-6f * k_scalar,
+                        __func__, ": compact MTP requires packed Q rows, shuffled KV and the default scale");
+            for(const auto* scale : {K_QScale, V_QScale})
+            {
+                AITER_CHECK(scale->dtype() == AITER_DTYPE_fp32 && scale->is_contiguous() &&
+                                scale->device_id == Q->device_id &&
+                                (scale->dim() == 3 || (scale->dim() == 4 && scale->size(3) == 1)) &&
+                                scale->size(0) == K->size(0) && scale->size(1) == num_kv_heads &&
+                                scale->size(2) == block_size,
+                            __func__, ": compact MTP requires packed per-token FP32 scales");
+            }
+            AITER_CHECK(work_indptr && work_indptr->dtype() == AITER_DTYPE_i32 &&
+                            work_indptr->device_id == Q->device_id && work_indptr->is_contiguous() &&
+                            work_indptr->numel() >= size_t(num_cu) + 1 &&
+                            work_info && work_info->dtype() == AITER_DTYPE_i32 &&
+                            work_info->device_id == Q->device_id && work_info->is_contiguous() &&
+                            work_info->dim() == 2 && work_info->size(1) == 8 &&
+                            work_info->size(0) >= num_cu,
+                        __func__, ": compact WorkInfo requires one padded 32-byte record per CU");
+            AITER_CHECK(splitLse && splitLse->dtype() == AITER_DTYPE_fp32 &&
+                            splitData->device_id == Q->device_id && splitLse->device_id == Q->device_id &&
+                            splitData->is_contiguous() && splitLse->is_contiguous() &&
+                            splitData->dim() >= 3 && splitData->size(-1) == 128 &&
+                            splitData->size(-2) == num_heads && splitData->numel() / 128 == splitLse->numel(),
+                        __func__, ": compact SplitO and FP32 SplitLSE must have matching packed layouts");
+        }
+        if(has_split_format)
+            name += "_split_format";
+        impl_ptr = &impl_ptr_map.get_or_create(arch_id + ":" + co_name + ":" + name, [&]() {
+            return AiterAsmKernel(name.c_str(), co_name.c_str());
+        });
         if(cfg.ps)
         {
             gdx = get_num_cu_func();

@@ -79,8 +79,10 @@ def compile_clear_missing_routes(rows: int, row_bytes: int, payload_bytes: int):
 
     @flyc.jit
     def launch(route, validity, stream):
+        # The route scratch spans the whole bucket, so a 256-block grid
+        # leaves this memory-bound sweep far below bandwidth.
         kernel(route, validity).launch(
-            grid=(min(256, max(1, (rows * words_per_row + 255) // 256)), 1, 1),
+            grid=(min(32768, max(1, (rows * words_per_row + 255) // 256)), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )

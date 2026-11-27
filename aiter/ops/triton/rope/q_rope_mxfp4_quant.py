@@ -12,6 +12,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 _SCALE_GROUP = 32
+_WEIGHTS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
 def _launch_config(num_tokens: int, num_heads: int, head_size: int) -> tuple[int, int]:
@@ -33,30 +34,53 @@ def q_rope_mxfp4_quant(
     cos_sin_cache: torch.Tensor,
     weights: torch.Tensor | None = None,
     weights_scale: float = 1.0,
+    hidden: torch.Tensor | None = None,
+    weights_proj: torch.Tensor | None = None,
+    proj_block_k: int = 256,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """GPT-J RoPE on the last rope_dim dims -> MXFP4 query, plus scaled weights.
 
     MXFP4 is e2m1 values, two per byte (low nibble first), with one e8m0 scale
     per 32 values chosen as 2^ceil(log2(amax / 6)), so no value saturates.
 
+    The head weights are either taken pre-projected (`weights`) or projected
+    inside this launch from `hidden @ weights_proj.T` (pass both `hidden` and
+    `weights_proj`, not `weights`), so the standalone weights_proj GEMM is not
+    its own launch. Either way the result is `weights_scale`-scaled.
+
     Args:
         q: [T, H, head_size] bf16/fp16 (strided is fine, the last dim must be
             unit-stride).
         positions: [T] token positions.
         cos_sin_cache: [max_pos, rope_dim], the cos half then the sin half.
-        weights: optional [T, H] per-head weights.
+        weights: optional pre-projected [T, H] per-head weights.
         weights_scale: multiplied into the weights.
+        hidden: optional [T, K] projection input, unit last stride.
+        weights_proj: optional [H, K] head-major projection, unit last stride.
+        proj_block_k: K tile of the in-kernel projection; must divide K.
+        weights_dtype: dtype of the returned weights: float32 (default),
+            bfloat16 or float16. A projected weight is already rounded through
+            bf16 in-kernel, so bfloat16 stores it as is, with no separate cast
+            launch for a bf16 consumer; `weights_scale` is applied in fp32
+            before the store.
 
     Returns:
         (q_fp4 u8 [T, H, head_size // 2], q_scale u8 e8m0
-        [T, H, head_size // 32], weights f32 [T, H] or None).
+        [T, H, head_size // 32], weights `weights_dtype` [T, H] or None).
     """
+    project = hidden is not None or weights_proj is not None
     _LOGGER.info(
-        "Q_ROPE_MXFP4_QUANT: q=%s rope_dim=%d weights=%s",
+        "Q_ROPE_MXFP4_QUANT: q=%s rope_dim=%d weights=%s project=%s",
         tuple(q.shape),
         cos_sin_cache.shape[-1],
         None if weights is None else tuple(weights.shape),
+        project,
     )
+    if weights_dtype not in _WEIGHTS_DTYPES:
+        raise ValueError(
+            f"weights_dtype must be one of {_WEIGHTS_DTYPES}, got {weights_dtype}"
+        )
     if q.ndim != 3 or q.stride(2) != 1:
         raise ValueError(
             f"q must be [T, H, D] with unit last stride, got "
@@ -73,6 +97,10 @@ def q_rope_mxfp4_quant(
         raise ValueError(
             f"positions {tuple(positions.shape)} must cover q's T={num_tokens}"
         )
+    if project and weights is not None:
+        raise ValueError("pass pre-projected weights OR (hidden, weights_proj)")
+    if project and (hidden is None or weights_proj is None):
+        raise ValueError("projection needs both hidden and weights_proj")
     if weights is not None and (
         tuple(weights.shape) != (num_tokens, num_heads) or weights.stride(1) != 1
     ):
@@ -80,6 +108,34 @@ def q_rope_mxfp4_quant(
             f"weights {tuple(weights.shape)} must be q's [T={num_tokens}, "
             f"H={num_heads}] with unit head stride"
         )
+    proj_in = 0
+    if project:
+        proj_in = hidden.shape[-1]
+        if hidden.ndim != 2 or hidden.shape[0] != num_tokens or hidden.stride(1) != 1:
+            raise ValueError(
+                f"hidden {tuple(hidden.shape)} must be [T={num_tokens}, K] with "
+                f"unit last stride"
+            )
+        if (
+            weights_proj.ndim != 2
+            or tuple(weights_proj.shape) != (num_heads, proj_in)
+            or weights_proj.stride(1) != 1
+        ):
+            raise ValueError(
+                f"weights_proj {tuple(weights_proj.shape)} must be [H={num_heads}, "
+                f"K={proj_in}] head-major with unit last stride"
+            )
+        if proj_block_k <= 0 or proj_block_k & (proj_block_k - 1):
+            # The kernel tiles K with tl.arange(0, BLOCK_K); Triton needs a
+            # positive power of two, and <= 0 would also divide by zero below.
+            raise ValueError(
+                f"proj_block_k must be a positive power of two, got {proj_block_k}"
+            )
+        if proj_in % proj_block_k:
+            raise ValueError(
+                f"hidden width K={proj_in} must be a multiple of "
+                f"proj_block_k={proj_block_k}"
+            )
     q_fp4 = torch.empty(
         (num_tokens, num_heads, head_size // 2), dtype=torch.uint8, device=q.device
     )
@@ -89,9 +145,9 @@ def q_rope_mxfp4_quant(
         device=q.device,
     )
     weights_out = None
-    if weights is not None:
+    if weights is not None or project:
         weights_out = torch.empty(
-            (num_tokens, num_heads), dtype=torch.float32, device=q.device
+            (num_tokens, num_heads), dtype=weights_dtype, device=q.device
         )
     if num_tokens == 0:
         return q_fp4, q_scale, weights_out
@@ -115,11 +171,18 @@ def q_rope_mxfp4_quant(
         weights_scale,
         weights_out,
         0 if weights_out is None else weights_out.stride(0),
+        hidden,
+        0 if hidden is None else hidden.stride(0),
+        weights_proj,
+        0 if weights_proj is None else weights_proj.stride(0),
         num_heads,
         HEAD_SIZE=head_size,
         ROPE_DIM=rope_dim,
         BLOCK_H=block_h,
         HAS_WEIGHTS=weights is not None,
+        PROJECT=project,
+        PROJ_IN=proj_in,
+        BLOCK_K=proj_block_k,
         num_warps=num_warps,
     )
     return q_fp4, q_scale, weights_out

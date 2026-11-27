@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# gfx1250 / mi400 MLA fp8 decode test.
+# gfx1250 / mi400 MLA FP8 and NVFP4 decode test.
 #
 #   # Single public dispatch case:
 #   python3 op_tests/test_mla_decode_pagesize64.py -n 8,1
@@ -11,6 +11,12 @@
 #
 #   # QH128 automatically uses kv-shuffled PS64 (one query, no KV splitting):
 #   python3 op_tests/test_mla_decode_pagesize64.py -n 128,1
+#
+#   # NVFP4 QH128, BF16 producers + reference, decode-only GPU timing:
+#   python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 5120 6144 7168 -c 5120 8192 10240
+#
+#   # Compare the same BF16 inputs with the shipped FP8 QH128 page64 kernel:
+#   python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 --compare-fp8 -b 5120 6144 7168 -c 5120 8192 10240
 #
 #   # GPU contract tests, including graph replay and all page tails:
 #   python3 -m pytest op_tests/test_mla_decode_pagesize64.py -q
@@ -424,6 +430,350 @@ def _cosine_diff(actual, expected):
     return (1 - (numerator / denominator)).item()
 
 
+def _make_nvfp4_page64_case(lengths, init="randn", threshold=1.0):
+    """Build independent BF16 histories; GPU producers write shuffled page64 KV."""
+    device = "cuda"
+    batch = len(lengths)
+    counts = [(n + 63) // 64 for n in lengths]
+    ptr = [0, *itertools.accumulate(counts)]
+    pages = max(1, ptr[-1])
+    torch.manual_seed(20261118 + batch + sum(lengths))
+    q = torch.empty((batch, 128, 576), dtype=torch.bfloat16, device=device)
+    kv = torch.empty((pages, 64, 576), dtype=torch.bfloat16, device=device)
+    for tensor in (q, kv):
+        if init == "randn":
+            tensor.normal_()
+        else:
+            tensor.fill_(0.25)
+    page_lens = [
+        min(64, n - page * 64)
+        for n, count in zip(lengths, counts)
+        for page in range(count)
+    ] or [0]
+    valid = torch.tensor(page_lens, dtype=torch.int32, device=device)
+    kv.masked_fill_(
+        torch.arange(64, device=device)[None, :, None] >= valid[:, None, None],
+        float("nan"),
+    )
+    permutation = torch.randperm(pages, dtype=torch.int32, device=device)
+    q_nope, q_aux = aiter.mla_nvfp4_quantize_q(q)
+    kv_nope = torch.empty((pages, 16384), dtype=torch.uint8, device=device)
+    kv_aux = torch.empty((pages, 8192), dtype=torch.uint8, device=device)
+    tile_ids = torch.arange(4, dtype=torch.int32, device=device)
+    aiter.mla_nvfp4_update_cache(
+        kv.reshape(-1, 16, 576),
+        permutation.repeat_interleave(4),
+        tile_ids.repeat(pages),
+        (valid[:, None] - tile_ids[None, :] * 16).clamp(0, 16).reshape(-1),
+        kv_nope,
+        kv_aux,
+    )
+    out_storage = torch.full(
+        (batch * 128 * 512 + 256,), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    lse_storage = torch.full(
+        (batch * 128 + 256,), 12345.0, dtype=torch.float32, device=device
+    )
+    args = {
+        "q": q_nope,
+        "q_aux": q_aux,
+        "kv_buffer": kv_nope,
+        "kv_aux": kv_aux,
+        "o": out_storage[:-256].view(batch, 128, 512),
+        "nvfp4_lse": lse_storage[:-256].view(batch, 128),
+        "qo_indptr": None,
+        "kv_indptr": torch.tensor(ptr, dtype=torch.int32, device=device),
+        "kv_indices": permutation[: ptr[-1]].contiguous(),
+        "kv_last_page_lens": torch.tensor(
+            [(n - 1) % 64 + 1 if n else 0 for n in lengths],
+            dtype=torch.int32,
+            device=device,
+        ),
+        "max_seqlen_q": 1,
+        "page_size": 64,
+        "nhead_kv": 1,
+        "num_kv_splits": 1,
+        "kv_layout": "nvfp4_n128",
+        "nvfp4_params": aiter.prepare_mla_nvfp4_params(
+            device=device,
+            physical_pages=pages,
+            sm_scale=576**-0.5,
+            rebase_threshold=threshold,
+        ),
+        "return_lse": False,
+    }
+    return {
+        "args": args,
+        "q": q,
+        "kv": kv,
+        "lengths": lengths,
+        "ptr": ptr,
+        "guards": (out_storage, lse_storage),
+    }
+
+
+def _ref_nvfp4_page64_case(case):
+    """Primary operator accuracy reference: standard FP32 softmax(QK^T) V.
+
+    Uses original BF16 inputs, without N128 tiling, threshold rebasing, FP4
+    probabilities or the kernel's quantized denominator. This includes input
+    and probability quantization error; full-model accuracy needs model evals.
+    """
+    q, kv, lengths, ptr = (case[k] for k in ("q", "kv", "lengths", "ptr"))
+    out = torch.zeros((len(lengths), 128, 512), dtype=torch.float32, device=q.device)
+    lse = torch.full(
+        (len(lengths), 128), -float("inf"), dtype=torch.float32, device=q.device
+    )
+    for length in sorted(set(lengths) - {0}):
+        requests = [r for r, n in enumerate(lengths) if n == length]
+        # Bound reference scratch even for B7168/KV10240.
+        for start in range(0, len(requests), 16):
+            rows = requests[start : start + 16]
+            k = torch.stack(
+                [kv[ptr[r] : ptr[r + 1]].reshape(-1, 576)[:length] for r in rows]
+            ).float()
+            logits = (q[rows].float() @ k.transpose(1, 2)) * (576**-0.5)
+            out[rows] = torch.softmax(logits, dim=-1) @ k[..., :512]
+            lse[rows] = torch.logsumexp(logits, dim=-1)
+    return out, lse
+
+
+def _add_fp8_page64_case(case):
+    """Pack the same original BF16 inputs and physical pages for FP8 QH128."""
+    batch = len(case["lengths"])
+    device = case["q"].device
+    kv = torch.empty((case["kv"].shape[0], 1, 64, 576), dtype=dtypes.fp8, device=device)
+    indices = case["args"]["kv_indices"]
+    # Limit temporary conversions when both formats and BF16 history are live.
+    for start in range(0, case["ptr"][-1], 2048):
+        end = min(start + 2048, case["ptr"][-1])
+        packed = _pack_kv_shuffled_pages(case["kv"][start:end].to(dtypes.fp8))
+        kv.view(torch.uint8)[indices[start:end].long()] = packed.view(torch.uint8)
+    q = _make_mla_mi400_q_case(
+        q_fp8=case["q"].to(dtypes.fp8),
+        batch=batch,
+        decode_qlen=1,
+        nhead=128,
+        qk_head_dim=576,
+        v_head_dim=512,
+    )
+    max_pages = max(1, max((n + 63) // 64 for n in case["lengths"]))
+    indptr = case["args"]["kv_indptr"]
+    offsets = indptr[:-1, None] + torch.arange(max_pages, device=device)
+    offsets = torch.where(offsets < indptr[1:, None], offsets, indices.numel())
+    padded_indices = torch.cat((indices, indices.new_full((1,), -1)))
+    out = torch.full_like(case["guards"][0], float("nan"))
+    lse = torch.full_like(case["guards"][1], 12345.0)
+    one = torch.ones((1,), dtype=torch.float32, device=device)
+    case["fp8_args"] = {
+        "q": q,
+        "kv": kv,
+        "out": out[:-256].view(batch, 128, 512),
+        "lse": lse[:-256].view(batch, 128),
+        "seq_lens": torch.tensor(case["lengths"], dtype=torch.int32, device=device),
+        "page_table": padded_indices[offsets],
+        "q_scale": one,
+        "kv_scale": one,
+        "softmax_scale": 576**-0.5,
+    }
+    case["fp8_guards"] = (out, lse)
+
+
+def _check_nvfp4_page64_case(case, tolerance=0.3):
+    expected, expected_lse = _ref_nvfp4_page64_case(case)
+    live = torch.tensor(case["lengths"], device=expected.device) > 0
+    rms = expected.square().mean(dim=(1, 2)).sqrt().clamp_min(1e-8)
+    variants = [
+        (
+            "nvfp4",
+            case["args"]["o"],
+            None,
+            case["guards"],
+            tolerance,
+        )
+    ]
+    if "fp8_args" in case:
+        args = case["fp8_args"]
+        variants.append(("fp8", args["out"], args["lse"], case["fp8_guards"], 0.06))
+    metrics = {}
+    for name, out, lse, guards, tol in variants:
+        actual = out.float()
+        assert torch.isfinite(actual).all(), f"{name} produced NaN or Inf"
+        # Both formats use the same original-BF16 reference and 5% mismatch budget.
+        err = checkAllclose(expected, actual, atol=tol, rtol=tol, tol_err_ratio=0.05)
+        assert err <= 0.05, f"{name} output mismatch ratio {err:.3%} exceeds 5%"
+        if lse is not None and live.any():
+            assert torch.isfinite(lse[live]).all()
+            lse_err = checkAllclose(
+                expected_lse[live], lse[live], atol=tol, rtol=tol, tol_err_ratio=0.05
+            )
+            assert (
+                lse_err <= 0.05
+            ), f"{name} LSE mismatch ratio {lse_err:.3%} exceeds 5%"
+            metrics[f"{name}_lse_err"] = lse_err
+        # Absolute tolerance alone can accept all-zero outputs for long histories.
+        nrms = (actual - expected).square().mean(dim=(1, 2)).sqrt() / rms
+        assert (nrms <= tol).all(), f"{name} max request NRMS={nrms.max().item():.6f}"
+        assert (actual[~live] == 0).all()
+        if lse is None:
+            assert (guards[1] == 12345).all()
+        else:
+            assert torch.isneginf(lse[~live]).all()
+        assert torch.isnan(guards[0][-256:]).all()
+        assert (guards[1][-256:] == 12345).all()
+        prefix = "mi400" if name == "nvfp4" else name
+        metrics.update(
+            {
+                f"{prefix} cos_diff": _cosine_diff(actual, expected),
+                f"{prefix} err": err,
+                f"{name}_nrms": nrms.max().item(),
+                f"{name}_max_abs": (actual - expected).abs().max().item(),
+            }
+        )
+    return metrics
+
+
+def _page64_decode_calls(case):
+    calls = {"nvfp4": lambda: aiter.mla.mla_decode_fwd(**case["args"])}
+    if "fp8_args" in case:
+        calls["fp8"] = lambda: (
+            mla_decode_fwd_qh128_asm(**case["fp8_args"]),
+            case["fp8_args"]["lse"],
+        )
+    return calls
+
+
+def _time_page64_decode(calls):
+    """Graph32, 30 samples per format, AB/BA order and a same-format warm graph."""
+    graphs, outputs, expected = {}, {}, {}
+    for name, call in calls.items():
+        for _ in range(8):
+            out, lse = call()
+        expected[name] = (out.clone(), lse.clone() if lse is not None else None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(32):
+                outputs[name] = call()
+        graphs[name] = graph
+        for _ in range(5):
+            graph.replay()
+    torch.cuda.synchronize()
+    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    names = list(calls)
+    samples = {name: [] for name in names}
+    for round_id in range(30):
+        for name in names if round_id % 2 == 0 else names[::-1]:
+            graph = graphs[name]
+            graph.replay()
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end) * 1000 / 32)
+    for name in names:
+        for actual, eager in zip(outputs[name], expected[name]):
+            if eager is None:
+                assert actual is None
+            else:
+                assert torch.equal(
+                    actual, eager
+                ), f"{name} graph replay differs from eager"
+        aiter.logger.info("%s decode samples (us): %s", name, samples[name])
+    return {name: sum(values) / len(values) for name, values in samples.items()}
+
+
+@benchmark()
+def test_mla_nvfp4_page64(batch, ctx_len, init, tolerance=0.3, compare_fp8=False):
+    case = _make_nvfp4_page64_case([ctx_len] * batch, init)
+    if compare_fp8:
+        _add_fp8_page64_case(case)
+    calls = _page64_decode_calls(case)
+    for call in calls.values():
+        call()
+    metrics = _check_nvfp4_page64_case(case, tolerance)
+    times = _time_page64_decode(calls)
+    if compare_fp8:
+        metrics.update(
+            {"fp8 us": times["fp8"], "fp8 / nvfp4": times["fp8"] / times["nvfp4"]}
+        )
+    return dict(
+        nhead=128,
+        decode_qlen=1,
+        mask=1,
+        num_kv_splits=1,
+        dtype="nvfp4",
+        kv_dtype="nvfp4",
+        gfx=get_gfx(),
+        kv_layout="nvfp4_n128",
+        kv_shuffled=True,
+        **{"mi400 us": times["nvfp4"], "mi400 final_out_finite": True},
+        **metrics,
+    )
+
+
+test_mla_nvfp4_page64.__test__ = False
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() != "gfx1250",
+    reason="requires gfx1250",
+)
+class TestMlaNvfp4Page64:
+    @pytest.mark.parametrize("init", ["randn", "const0.25"])
+    def test_fp8_comparison(self, init):
+        if not aiter.is_gfx1250_asm_supported():
+            pytest.skip("requires gfx1250 B0+")
+        case = _make_nvfp4_page64_case([0, 1, 17, 65, 129, 513], init)
+        _add_fp8_page64_case(case)
+        calls = _page64_decode_calls(case)
+        for call in calls.values():
+            call()
+        _check_nvfp4_page64_case(case)
+        times = _time_page64_decode(calls)
+        assert all(math.isfinite(us) and us > 0 for us in times.values())
+        _check_nvfp4_page64_case(case)
+
+    @pytest.mark.parametrize("init", ["randn", "const0.25"])
+    @pytest.mark.parametrize(
+        "lengths",
+        [
+            list(range(65)),
+            [65, 127, 128, 129, 255, 256, 257, 511, 512, 513],
+            # Every N16/N128 tail after wrapping all four LDS slots.
+            list(range(512, 641)),
+            [1024, 2048, 3072, 4096, 5120],
+        ],
+    )
+    def test_bf16_reference(self, lengths, init):
+        if not aiter.is_gfx1250_asm_supported():
+            pytest.skip("requires gfx1250 B0+")
+        case = _make_nvfp4_page64_case(lengths, init)
+        aiter.mla.mla_decode_fwd(**case["args"])
+        _check_nvfp4_page64_case(case)
+
+    def test_graph_replay(self):
+        if not aiter.is_gfx1250_asm_supported():
+            pytest.skip("requires gfx1250 B0+")
+        case = _make_nvfp4_page64_case([0, 65, 129, 513])
+        aiter.mla.mla_decode_fwd(**case["args"])
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            aiter.mla.mla_decode_fwd(**case["args"])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                aiter.mla.mla_decode_fwd(**case["args"])
+            graph.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+        _check_nvfp4_page64_case(case)
+        case["args"]["kv_indptr"].zero_()
+        case["args"]["kv_last_page_lens"].zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (case["args"]["o"] == 0).all()
+        assert (case["guards"][1] == 12345).all()
+
+
 @benchmark()
 def test_mla(
     batch,
@@ -696,6 +1046,13 @@ def _format_summary(rows):
         "mi400 err",
         "mi400 cos_diff",
         "mi400 final_out_finite",
+        "nvfp4_nrms",
+        "nvfp4_max_abs",
+        "fp8 us",
+        "fp8 / nvfp4",
+        "fp8 err",
+        "fp8_nrms",
+        "fp8_lse_err",
     ]
     return df[[column for column in columns if column in df.columns]]
 
@@ -788,9 +1145,14 @@ def main():
     )
     parser.add_argument(
         "--kv-layout",
-        choices=["auto", "token_major", "kv_shuffled"],
+        choices=["auto", "token_major", "kv_shuffled", "nvfp4_n128"],
         default="auto",
         help="auto selects shuffled for QH128 or QH64 multiple queries; token_major uses legacy segmented PS64",
+    )
+    parser.add_argument(
+        "--compare-fp8",
+        action="store_true",
+        help="With nvfp4_n128, compare FP8 QH128 using the same BF16 inputs and graph timing.",
     )
     parser.add_argument(
         "--kv-shuffled",
@@ -798,6 +1160,25 @@ def main():
         help="Select QH64/QH128 shuffled cases; QH128 also selects it in auto mode.",
     )
     args = parser.parse_args()
+    if args.compare_fp8 and args.kv_layout != "nvfp4_n128":
+        parser.error("--compare-fp8 requires --kv-layout nvfp4_n128")
+    if args.kv_layout == "nvfp4_n128":
+        if args.nhead not in (None, [(128, 1)]) or args.split_kv not in (None, [1]):
+            parser.error("nvfp4_n128 requires -n 128,1 and --split-kv 1")
+        if args.kv_shuffled:
+            parser.error("select nvfp4_n128 without --kv-shuffled")
+        if any(b < 1 for b in args.batch) or any(n < 0 for n in args.ctxLen):
+            parser.error("NVFP4 requires positive batch sizes and nonnegative lengths")
+        torch.set_default_device("cuda")
+        rows = [
+            test_mla_nvfp4_page64(b, n, init, compare_fp8=args.compare_fp8)
+            for b, n, init in itertools.product(args.batch, args.ctxLen, args.init)
+        ]
+        aiter.logger.info(
+            "mla_decode_pagesize64 NVFP4 summary (markdown):\n%s",
+            _format_summary(rows).to_markdown(index=False),
+        )
+        return
     if args.kv_shuffled:
         if args.kv_layout == "token_major":
             parser.error("--kv-shuffled conflicts with --kv-layout token_major")

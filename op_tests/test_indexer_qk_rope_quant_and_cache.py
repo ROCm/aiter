@@ -3,6 +3,8 @@
 
 import argparse
 import itertools
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -123,11 +125,19 @@ def _rope_preamble(
     sin_cache: torch.Tensor,
     compute_all_q_rope: bool,
     is_neox: bool,
+    rope_dim: int = ROPE_DIM,
 ):
     # Shared by both oracles so the FP8 and FP4 references cannot drift apart in
     # the pre-quantization math. k_rope is zero on rows without a cache slot.
     valid = slot_mapping >= 0
     active_q = torch.ones_like(valid) if compute_all_q_rope else valid
+    if rope_dim == 0:
+        return (
+            valid,
+            active_q,
+            q,
+            _layernorm(k, norm_weight.to(k.dtype), norm_bias.to(k.dtype)),
+        )
     safe_positions = positions.clamp(0, cos_cache.shape[0] - 1)
     q_rope = _apply_rope(q, safe_positions, cos_cache, sin_cache, is_neox)
     k_rope = torch.zeros_like(k)
@@ -142,9 +152,11 @@ def _rope_preamble(
     return valid, active_q, q_rope, k_rope
 
 
-def _flops(active_q: int, num_valid: int, num_heads: int) -> int:
-    q_ops = active_q * num_heads * (ROPE_DIM * 3 + HEAD_DIM * 2 + 2)
-    k_ops = num_valid * (HEAD_DIM * 6 + ROPE_DIM * 3 + HEAD_DIM)
+def _flops(
+    active_q: int, num_valid: int, num_heads: int, rope_dim: int = ROPE_DIM
+) -> int:
+    q_ops = active_q * num_heads * (rope_dim * 3 + HEAD_DIM * 2 + 2)
+    k_ops = num_valid * (HEAD_DIM * 6 + rope_dim * 3 + HEAD_DIM)
     return q_ops + k_ops
 
 
@@ -221,6 +233,7 @@ def _make_aiter_candidate(
     compute_all_q_rope: bool | None,
     is_neox: bool,
     outs: tuple[torch.Tensor, ...],
+    **kwargs,
 ):
     # Handing over the 5-tuple from _alloc_fp4_outputs picks FP4 mode the same way
     # a real caller does. compute_all_q_rope=None omits the argument entirely.
@@ -239,6 +252,7 @@ def _make_aiter_candidate(
         if fp4:
             extra["q_scale_out"] = q_scale_out
             extra["kv_cache_scale"] = kv_cache_scale
+        extra.update(kwargs)
         aiter.indexer_qk_rope_quant_and_cache(
             q,
             q_out,
@@ -303,17 +317,28 @@ def _paged_k_fp4(
     slot_mapping: torch.Tensor,
     num_blocks: int,
     kv_block_size: int,
+    scale_layout: str = "flydsl",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Scatter dense per-token FP4 K rows into the paged preshuffle layout."""
     k_tiles = HEAD_DIM // 128
     kv_cache = torch.zeros(num_blocks, k_tiles, 4, kv_block_size, 16, dtype=torch.uint8)
     kv_scale = torch.zeros(num_blocks, k_tiles, 4, kv_block_size, dtype=torch.uint8)
+    if scale_layout == "opus":
+        kv_cache = kv_cache.view(num_blocks, 4, kv_block_size, 16)
+        kv_scale = kv_scale.view(num_blocks, 2, 32, 4)
     valid = slot_mapping >= 0
     slots = slot_mapping[valid].long()
     if slots.numel() == 0:
         return kv_cache, kv_scale
     block = slots // kv_block_size
     pos = slots % kv_block_size
+    if scale_layout == "opus":
+        kv_cache[block, :, pos, :] = packed[valid].view(-1, 4, 16)
+        for group in range(4):
+            kv_scale[block, group % 2, pos % 32, group // 2 * 2 + pos // 32] = e8m0[
+                valid, group
+            ]
+        return kv_cache, kv_scale
     kv_cache[block, :, :, pos, :] = packed[valid].view(-1, k_tiles, 4, 16)
     sflat = (pos % 16) * (kv_block_size // 16) + (pos // 16)
     kv_scale[block, :, :, sflat] = e8m0[valid].view(-1, k_tiles, 4)
@@ -333,6 +358,8 @@ def run_torch_fp4(
     num_blocks: int,
     compute_all_q_rope: bool,
     is_neox: bool,
+    scale_layout: str = "flydsl",
+    rope_dim: int = ROPE_DIM,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens, num_heads, _ = q.shape
     _, active_q, q_rope, k_rope = _rope_preamble(
@@ -346,6 +373,7 @@ def run_torch_fp4(
         sin_cache,
         compute_all_q_rope,
         is_neox,
+        rope_dim,
     )
 
     q_out = torch.zeros(num_tokens, num_heads, HEAD_DIM // 2, dtype=torch.uint8)
@@ -356,20 +384,35 @@ def run_torch_fp4(
 
     q_packed, q_e8m0 = _fp4_quant(q_rope.reshape(num_tokens * num_heads, HEAD_DIM))
     q_out[active_q] = q_packed.reshape(num_tokens, num_heads, HEAD_DIM // 2)[active_q]
-    q_scale_out[active_q] = _shuffle_q_scale(
-        q_e8m0.reshape(num_tokens, num_heads, HEAD_DIM // FP4_GROUP_SIZE), num_heads
-    )[active_q]
+    q_e8m0 = q_e8m0.reshape(num_tokens, num_heads, 4)
+    if scale_layout == "opus":
+        q_scale_out = torch.zeros(num_tokens, 2, 32, num_heads // 16, dtype=torch.uint8)
+        shuffled = q_e8m0.reshape(num_tokens, num_heads // 32, 32, 2, 2)
+        shuffled = shuffled.permute(0, 4, 2, 3, 1).reshape(q_scale_out.shape)
+    else:
+        shuffled = _shuffle_q_scale(q_e8m0, num_heads)
+    q_scale_out[active_q] = shuffled[active_q]
     weights_out[active_q] = weights[active_q]
 
     k_packed, k_e8m0 = _fp4_quant(k_rope)
     kv_cache, kv_cache_scale = _paged_k_fp4(
-        k_packed, k_e8m0, slot_mapping, num_blocks, FP4_KV_BLOCK_SIZE
+        k_packed, k_e8m0, slot_mapping, num_blocks, FP4_KV_BLOCK_SIZE, scale_layout
     )
     return q_out, q_scale_out, weights_out, kv_cache, kv_cache_scale
 
 
-def _alloc_fp4_outputs(num_tokens: int, num_heads: int, num_blocks: int, dtype):
+def _alloc_fp4_outputs(
+    num_tokens: int, num_heads: int, num_blocks: int, dtype, scale_layout="flydsl"
+):
     k_tiles = HEAD_DIM // 128
+    if scale_layout == "opus":
+        return (
+            torch.zeros(num_tokens, num_heads, HEAD_DIM // 2, dtype=torch.uint8),
+            torch.zeros(num_tokens, 2, 32, num_heads // 16, dtype=torch.uint8),
+            torch.zeros(num_tokens, num_heads, dtype=dtype),
+            torch.zeros(num_blocks, 4, 64, 16, dtype=torch.uint8),
+            torch.zeros(num_blocks, 2, 32, 4, dtype=torch.uint8),
+        )
     return (
         torch.zeros(num_tokens, num_heads, HEAD_DIM // 2, dtype=torch.uint8),
         torch.zeros(
@@ -479,22 +522,42 @@ def test_indexer_qk_rope_quant_and_cache_fp4(
     valid_fraction: float,
     compute_all_q_rope: bool,
     is_neox: bool,
+    scale_layout: str = "flydsl",
+    rope_dim: int = ROPE_DIM,
+    slot_padding: int = 0,
 ):
     *inputs, num_valid = _make_inputs(num_tokens, num_heads, dtype, valid_fraction)
     q, weights, k = inputs[:3]
     num_blocks = max(1, (num_tokens + FP4_KV_BLOCK_SIZE - 1) // FP4_KV_BLOCK_SIZE)
 
-    ref = run_torch_fp4(*inputs, num_blocks, compute_all_q_rope, is_neox)
+    if scale_layout == "opus":
+        # Nonsequential pages and rows expose scatter/permutation mistakes.
+        inputs[3][:num_valid] = torch.randperm(num_blocks * 64)[:num_valid]
+        if slot_padding:
+            inputs[3][-slot_padding:] = -1
+        if rope_dim == 0:
+            inputs[6:9] = [None, None, None]
+    ref = run_torch_fp4(
+        *inputs, num_blocks, compute_all_q_rope, is_neox, scale_layout, rope_dim
+    )
+    if slot_padding:
+        inputs[3] = inputs[3][:-slot_padding]
+        num_valid = int((inputs[3] >= 0).sum())
     candidate = _make_aiter_candidate(
         *inputs,
         compute_all_q_rope,
         is_neox,
-        _alloc_fp4_outputs(num_tokens, num_heads, num_blocks, dtype),
+        _alloc_fp4_outputs(num_tokens, num_heads, num_blocks, dtype, scale_layout),
+        **(
+            {"scale_layout": scale_layout, "rope_dim": rope_dim}
+            if scale_layout == "opus"
+            else {}
+        ),
     )
     got, us = run_perftest(candidate)
 
     active_q = num_tokens if compute_all_q_rope else num_valid
-    flops = _flops(active_q, num_valid, num_heads)
+    flops = _flops(active_q, num_valid, num_heads, rope_dim)
     nbytes = sum(t.numel() * t.element_size() for t in (q, weights, k, *ref))
 
     # The FP4 ABI is a byte contract with the pa_mqa_logits_fp4 reader, so every
@@ -510,6 +573,29 @@ def test_indexer_qk_rope_quant_and_cache_fp4(
     for name in names:
         ret[f"{name} mismatch"] = mismatch[name]
     assert all(v == 0 for v in mismatch.values()), f"fp4 byte mismatch: {mismatch}"
+    if scale_layout == "opus":
+        # Change inputs after capture: replay must not bake Q or slot values in.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate()
+        q.neg_()
+        valid_slots = inputs[3] >= 0
+        inputs[3][valid_slots] = inputs[3][valid_slots].flip(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        full_slots = torch.nn.functional.pad(inputs[3], (0, slot_padding), value=-1)
+        ref = run_torch_fp4(
+            *inputs[:3],
+            full_slots,
+            *inputs[4:],
+            num_blocks,
+            compute_all_q_rope,
+            is_neox,
+            scale_layout,
+            rope_dim,
+        )
+        for name, want, have in zip(names, ref, got):
+            assert torch.equal(want, have), f"graph replay mismatch: {name}"
     return ret
 
 
@@ -521,8 +607,9 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
     kv_block_size: int = FP4_KV_BLOCK_SIZE,
     block_k: int = 256,
     dtype: torch.dtype = dtypes.bf16,
+    scale_layout: str = "flydsl",
 ):
-    """Feed the kernel's own FP4 Q / K cache straight into the FlyDSL FP4
+    """Feed the kernel's own FP4 Q / K cache straight into a FlyDSL/OPUS FP4
     paged-MQA-logits kernel and score it against the PyTorch reference."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
@@ -565,7 +652,7 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
         tok < context_lens[bat].long(), kv_slots, torch.full_like(kv_slots, -1)
     )
     kv_positions = tok.long() % MAX_POSITION
-    kv_outs = _alloc_fp4_outputs(kv_tokens, num_heads, num_blocks, dtype)
+    kv_outs = _alloc_fp4_outputs(kv_tokens, num_heads, num_blocks, dtype, scale_layout)
     aiter.indexer_qk_rope_quant_and_cache(
         torch.randn(kv_tokens, num_heads, HEAD_DIM, dtype=dtype),
         kv_outs[0],
@@ -586,6 +673,7 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
         is_neox=True,
         q_scale_out=kv_outs[1],
         kv_cache_scale=kv_outs[4],
+        scale_layout=scale_layout,
     )
     kv_cache, kv_cache_scale = kv_outs[3], kv_outs[4]
 
@@ -594,7 +682,7 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
     q_bf16 = torch.randn(num_q, num_heads, HEAD_DIM, dtype=dtype)
     weights = (torch.randn(num_q, num_heads, dtype=torch.float32) * 0.1).to(dtype)
     q_positions = torch.arange(num_q, dtype=torch.int64) % MAX_POSITION
-    q_outs = _alloc_fp4_outputs(num_q, num_heads, num_blocks, dtype)
+    q_outs = _alloc_fp4_outputs(num_q, num_heads, num_blocks, dtype, scale_layout)
     aiter.indexer_qk_rope_quant_and_cache(
         q_bf16,
         q_outs[0],
@@ -616,6 +704,7 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
         compute_all_q_rope=True,
         q_scale_out=q_outs[1],
         kv_cache_scale=q_outs[4],
+        scale_layout=scale_layout,
     )
     q_fp4, q_scale, weights_out = q_outs[0], q_outs[1], q_outs[2]
 
@@ -643,31 +732,68 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
         weight_scale=WEIGHTS_SCALE,
     )
 
-    _safe, cta_info, total_ctas = compute_varctx_schedule(
-        context_lens, block_k, None, t_max, next_n=next_n
-    )
     out_logits = torch.full((num_q, t_max), float("-inf"), dtype=torch.float32)
-    flydsl_pa_mqa_logits_fp4(
-        q_fp4.reshape(batch, next_n, num_heads, HEAD_DIM // 2),
-        q_scale.reshape(batch, next_n, HEAD_DIM // 128, 4, MFMA_M, _qs_pad(num_heads)),
-        kv_cache,
-        kv_cache_scale,
-        block_tables,
-        weights_out,
-        context_lens,
-        t_max,
-        weight_scale=WEIGHTS_SCALE,
-        next_n=next_n,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        parallel_unit_num=total_ctas,
-        out=out_logits,
-        cta_info=cta_info,
-        total_ctas=total_ctas,
-    )
+    if scale_layout == "opus":
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+            mqa_logits_mxfp4,
+            mqa_logits_mxfp4_config,
+        )
+
+        cfg = mqa_logits_mxfp4_config(
+            q_fp4.device,
+            heads=num_heads,
+            page_size=64,
+            max_rows=num_q,
+            max_seqs=batch,
+            max_qlen=next_n,
+            max_seq_len=t_max,
+        )
+        qsl = torch.arange(batch + 1, dtype=torch.int32) * next_n
+        ends = (context_lens[:, None] - next_n + torch.arange(1, next_n + 1)).flatten()
+        mqa_logits_mxfp4(
+            q_fp4,
+            q_scale,
+            kv_cache,
+            kv_cache_scale,
+            weights_out,
+            block_tables,
+            qsl,
+            ends.to(torch.int32),
+            cfg=cfg,
+            weight_scale=WEIGHTS_SCALE,
+            out=out_logits,
+        )
+    else:
+        _safe, cta_info, total_ctas = compute_varctx_schedule(
+            context_lens, block_k, None, t_max, next_n=next_n
+        )
+        flydsl_pa_mqa_logits_fp4(
+            q_fp4.reshape(batch, next_n, num_heads, HEAD_DIM // 2),
+            q_scale.reshape(
+                batch, next_n, HEAD_DIM // 128, 4, MFMA_M, _qs_pad(num_heads)
+            ),
+            kv_cache,
+            kv_cache_scale,
+            block_tables,
+            weights_out,
+            context_lens,
+            t_max,
+            weight_scale=WEIGHTS_SCALE,
+            next_n=next_n,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+            parallel_unit_num=total_ctas,
+            out=out_logits,
+            cta_info=cta_info,
+            total_ctas=total_ctas,
+        )
     torch.cuda.synchronize()
 
     mask = ~torch.isneginf(ref_logits)
+    if scale_layout == "opus":
+        torch.testing.assert_close(
+            out_logits[mask], ref_logits[mask], atol=1e-6, rtol=1e-5
+        )
     got, want = out_logits[mask].double(), ref_logits[mask].double()
     cos = (got * want).sum() / (got.norm() * want.norm() + 1e-12)
 
@@ -692,6 +818,7 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
         "next_n": next_n,
         "ctx_len": ctx_len,
         "num_heads": num_heads,
+        "scale_layout": scale_layout,
         "cosine": cos.item(),
         f"top{topk}_overlap": topk_overlap,
         "max_abs_err": (got - want).abs().max().item(),
@@ -699,6 +826,66 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
     assert cos.item() > 0.99, f"e2e cosine {cos.item():.6f} < 0.99"
     assert topk_overlap > 0.95, f"e2e top-{topk} overlap {topk_overlap:.4f} < 0.95"
     return ret
+
+
+def test_indexer_fp4_opus_errors(case=None):
+    *inputs, _ = _make_inputs(8, 32, dtypes.bf16, 0.5)
+    q, w, k, slots, nw, nb, pos, cos, sin = inputs
+    qo, qs, wo, cache, ks = _alloc_fp4_outputs(8, 32, 1, dtypes.bf16, "opus")
+    args = {
+        "q": q,
+        "q_out": qo,
+        "weights": w,
+        "weights_out": wo,
+        "k": k,
+        "kv_cache": cache,
+        "slot_mapping": slots,
+        "norm_weight": nw,
+        "norm_bias": nb,
+        "positions": pos,
+        "cos_cache": cos,
+        "sin_cache": sin,
+        "epsilon": EPSILON,
+        "quant_block_size": 32,
+        "scale_fmt": "ue8m0",
+        "weights_scale": WEIGHTS_SCALE,
+        "q_scale_out": qs,
+        "kv_cache_scale": ks,
+        "scale_layout": "opus",
+    }
+    bad = [
+        {"scale_layout": "invalid"},
+        {"rope_dim": 32},
+        {"q_scale_out": None},
+        {"kv_cache_scale": None},
+        {"positions": None},
+        {"cos_cache": None},
+        {"preshuffle": True},
+        {"quant_block_size": 128},
+        {"slot_mapping": slots.to(torch.int32)},
+        {"slot_mapping": torch.zeros(9, dtype=torch.int64)},
+        {"q_scale_out": qs.reshape(8, 4, 16, 2)},
+        {"kv_cache_scale": ks.reshape(1, 4, 16, 4)},
+        {"weights_out": wo[:1].expand(8, -1)},
+    ]
+    if case is not None:
+        aiter.indexer_qk_rope_quant_and_cache(**(args | bad[case]))
+        return
+    # AITER_CHECK aborts the process rather than raising a Python exception.
+    for i in range(len(bad)):
+        result = subprocess.run(
+            [sys.executable, __file__, "--invalid-case", str(i)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0 and "cache_kernels.cu:" in result.stderr, (
+            i,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
+    aiter.logger.info("OPUS: %d invalid calls rejected", len(bad))
 
 
 def main():
@@ -712,6 +899,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="Test fused indexer Q/K RoPE, quantization, and cache writes",
     )
+    parser.add_argument("--invalid-case", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "-n",
         "--num_tokens",
@@ -761,11 +949,14 @@ def main():
         "--mode",
         type=str,
         nargs="*",
-        choices=["fp8", "fp4", "e2e"],
-        default=["fp8", "fp4", "e2e"],
+        choices=["fp8", "fp4", "opus", "e2e"],
+        default=["fp8", "fp4", "opus", "e2e"],
         help="Output modes to exercise. e.g.: --mode fp8 fp4",
     )
     args = parser.parse_args()
+    if args.invalid_case is not None:
+        test_indexer_fp4_opus_errors(args.invalid_case)
+        return
 
     sweep = list(
         itertools.product(
@@ -798,14 +989,31 @@ def main():
             df.to_markdown(index=False),
         )
 
+    if "opus" in args.mode and is_gfx950:
+        test_indexer_fp4_opus_errors()
+        rows = [
+            test_indexer_qk_rope_quant_and_cache_fp4(
+                *cfg, scale_layout="opus", rope_dim=rope, slot_padding=padding
+            )
+            for cfg, rope, padding in itertools.product(sweep, (0, 64), (0, 3))
+            if cfg[0] >= padding
+        ]
+        aiter.logger.info(
+            "OPUS FP4 writer:\n%s", pd.DataFrame(rows).to_markdown(index=False)
+        )
+
     if "e2e" in args.mode and is_gfx950:
         rows = [
-            test_indexer_fp4_e2e_pa_mqa_logits(batch, next_n, ctx_len)
-            for batch, next_n, ctx_len in [(2, 1, 512), (2, 4, 512), (3, 1, 1024)]
+            test_indexer_fp4_e2e_pa_mqa_logits(
+                batch, next_n, ctx_len, num_heads=heads, scale_layout=layout
+            )
+            for batch, next_n, ctx_len in [(2, 1, 512), (2, 6, 512), (3, 1, 1024)]
+            for heads in (32, 64)
+            for layout in ("flydsl", "opus")
         ]
         df = pd.DataFrame(rows)
         aiter.logger.info(
-            "indexer fp4 -> flydsl_pa_mqa_logits_fp4 summary (markdown):\n%s",
+            "indexer FP4 writer -> paged MQA summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
 

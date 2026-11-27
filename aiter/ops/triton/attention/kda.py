@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.plugin import route as _route
 
 _LOGGER = AiterTritonLogger()
 _LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
@@ -28,6 +29,10 @@ elif _ARCH == "gfx950":
     )
 
 
+# Routed on the public entry: it takes no backend pin, and the gfx950 and
+# gfx1250 Gluon kernels are chosen beneath it. `config` is AITER's tuning dict,
+# a hint a provider may ignore.
+@_route(op="fused_recurrent_kda")
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -110,6 +115,15 @@ def fused_recurrent_kda(
         state_out or a fresh [N, HV, ., .] tensor), or None when
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
         A fresh state uses initial_state's dtype, or fp32 without initial_state.
+
+    Contract for a provider: ``o`` is written into ``out`` when one is passed
+    (and that tensor is returned), else returned freshly allocated. With
+    ``inplace_final_state`` the state slabs of ``initial_state`` are updated in
+    place -- at ``ssm_state_indices`` when paged -- and with
+    ``cache_state_updates`` only a sequence's first token stores its slab; the
+    rest are the per-token replay records described above. ``conv_state`` is
+    updated in place when the short convolution is fused (``conv_weight``),
+    and ``out_gate`` with ``norm_weight`` fuses the gated RMSNorm into ``o``.
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
@@ -418,6 +432,10 @@ def fused_recurrent_kda(
     return out, final_state
 
 
+# Routed on its public entry, ahead of fused_recurrent_kda: a provider with a
+# kernel for the packed one-token decode serves it here. When none does, the
+# native body calls fused_recurrent_kda, which a provider is asked about again.
+@_route(op="fused_recurrent_kda_packed_decode")
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
     g: torch.Tensor,
@@ -435,6 +453,35 @@ def fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     config: dict | None = None,
 ) -> torch.Tensor:
+    """One decode token per sequence of Kimi Delta Attention, with q, k and v
+    packed in one row.
+
+    The computation is :func:`fused_recurrent_kda` with
+    ``use_qk_l2norm_in_kernel``, ``use_gate_in_kernel``,
+    ``use_beta_sigmoid_in_kernel`` and ``pad_slot_guard`` all set, the short
+    convolution fused (``conv_state``, ``conv_weight``) and the gated RMSNorm
+    fused (``out_gate``, ``norm_weight``, ``norm_eps``).
+
+    Args:
+        mixed_qkv: ``[n, 3 * H * K]``, one row per sequence: q, then k, then
+            v, each ``H * K`` wide (``HV == H``, ``V == K``).
+        g: ``[n, H, K]`` raw gate; the gate chain with ``A_log``, ``dt_bias``
+            and ``lower_bound`` runs in the kernel.
+        beta: ``[n, H]`` raw write strength; sigmoid runs in the kernel.
+        A_log, dt_bias, lower_bound: the gate chain's parameters.
+        initial_state: state slabs, indexed by ``ssm_state_indices``.
+        ssm_state_indices: ``[n]`` state slot per sequence; a slot ``<= 0``
+            marks a padded sequence.
+        conv_state, conv_weight: the fused short convolution's state and
+            ``[3, W, H * K]`` weight.
+        out_gate: ``[n, H, V]`` gate of the gated RMSNorm; ``norm_weight`` is
+            ``[V]``.
+        out: ``[n, H, V]`` destination.
+        config: AITER's tuning dict; a provider may ignore it.
+
+    Writes ``out`` in place and returns it; updates ``initial_state``'s slabs
+    and ``conv_state`` in place.
+    """
     n, H, K = g.shape
     s = mixed_qkv.stride(0)
 
