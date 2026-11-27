@@ -129,31 +129,19 @@ def _bound_gemm_exe(fused: bool, constexprs: tuple):
     return launch
 
 
-# One AOT cache per launcher: the plain and the fused GEMM ABIs and the
-# reduction. Each launcher's constexprs are its key.
-# What the launchers below are built from, besides this file.
-_AOT_SOURCES = [
-    "gemm_a8w8_mxfp8_8wave.py",
-    "gemm_tune/flydsl_gemm_mxscale_preshuffle_common.py",
-    "kernels/gemm",
-    "kernels/mfma_preshuffle_pipeline.py",
-    "kernels/communication_ops_utils.py",
-]
-
-
-@aot_factory("mxscale_preshuffle_gemm", sources=_AOT_SOURCES)
+@aot_factory("mxscale_preshuffle_gemm")
 @functools.cache
 def _gemm_launcher(constexprs: tuple):
     return _bound_gemm_exe(False, constexprs)
 
 
-@aot_factory("mxscale_preshuffle_gemm_fused", sources=_AOT_SOURCES)
+@aot_factory("mxscale_preshuffle_gemm_fused")
 @functools.cache
 def _gemm_fused_launcher(constexprs: tuple):
     return _bound_gemm_exe(True, constexprs)
 
 
-@aot_factory("mxscale_preshuffle_splitk_reduce", sources=_AOT_SOURCES)
+@aot_factory("mxscale_preshuffle_splitk_reduce")
 @functools.cache
 def _bound_reduce_exe(split_k: int, out_dtype: str, strided: bool):
     """``_reduce_exe()`` with its Constexprs bound; see ``_bound_gemm_exe``."""

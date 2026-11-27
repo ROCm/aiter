@@ -23,7 +23,13 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_gfx
+
+# Every get_gfx() below selects a code path or a tuned-config key at call time,
+# so it has to follow the live GPU. get_gfx() follows GPU_ARCHS and returns its
+# last entry on a multi-target build, which would both misfire the
+# gfx1250-strict a4w4 fallback on another GPU and skip it on an MI450 A0. Same
+# aliasing as aiter/ops/gemm_op_a8w8.py and aiter/ops/gemm_op_a4w4.py.
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
