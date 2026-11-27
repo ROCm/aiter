@@ -90,7 +90,7 @@ def _reference(x_q, x_s, w13, w2, topk_ids, topk_weights):
     return out
 
 
-def _make_inputs(n_tokens, seed=0, device="cuda"):
+def _make_inputs(n_tokens, seed=0, device="cuda", x_scale=1.0):
     from aiter.ops.shuffle import shuffle_scale
 
     g = torch.Generator(device=device).manual_seed(seed)
@@ -100,7 +100,7 @@ def _make_inputs(n_tokens, seed=0, device="cuda"):
             torch.bfloat16
         )
 
-    x = randn(n_tokens, HIDDEN, scale=1.0)
+    x = randn(n_tokens, HIDDEN, scale=x_scale)
     w13 = _quant(randn(EXPERTS, 2 * INTER, HIDDEN, scale=HIDDEN**-0.5))
     w2 = _quant(randn(EXPERTS, HIDDEN, INTER, scale=INTER**-0.5))
     logits = torch.rand(n_tokens, EXPERTS, device=device, generator=g)
@@ -134,14 +134,14 @@ def _rejects(name, first_arg=None):
     raise RuntimeError(f"accepted: {name}")
 
 
-def _setup(n_tokens, device="cuda"):
+def _setup(n_tokens, device="cuda", x_scale=1.0):
     """-> (call, out, ref): the kernel call into a NaN-filled `out`, and the reference."""
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
         a4w4_prefill_moe,
     )
 
     x, w13, w2, ids, wts, (w13_k, w13_ks), (w2_k, w2_ks) = _make_inputs(
-        n_tokens, device=device
+        n_tokens, device=device, x_scale=x_scale
     )
     x_q, x_s = _quant(x)
     out = torch.full((n_tokens, HIDDEN), float("nan"), dtype=dtypes.bf16, device=device)
@@ -166,16 +166,17 @@ def _setup(n_tokens, device="cuda"):
     return call, out, ref
 
 
-def _check(n_tokens, device="cuda"):
-    call, out, ref = _setup(n_tokens, device)
+def _check(n_tokens, device="cuda", x_scale=1.0):
+    call, out, ref = _setup(n_tokens, device, x_scale)
     assert call() is out
     torch.cuda.synchronize(device)
+    # the intermediate and its rounding steps grow with x, so the absolute error does too
     err = checkAllclose(
         ref.to(dtypes.fp32),
         out.to(dtypes.fp32),
         rtol=RTOL,
-        atol=ATOL,
-        msg=f"{device} n_tokens {n_tokens}: ",
+        atol=ATOL * x_scale,
+        msg=f"{device} n_tokens {n_tokens} x_scale {x_scale}: ",
     )
     assert err == 0, f"{err:.2e} of the elements are outside rtol/atol"
     return call, err
@@ -202,6 +203,24 @@ def test_a4w4_prefill_moe(n_tokens):
         "TB/s": nbytes / us / 1e6,
         "err": err,
     }
+
+
+def test_a4w4_prefill_moe_swiglu_limits():
+    """x times 8 (exact in MXFP4: only the e8m0 scales change) drives gate and up past
+    the SwiGLU limit, so dropping the gate clamp or either up clamp fails the check."""
+    n_tokens, x_scale = 3072, 8.0
+    x, w13, _, ids, *_ = _make_inputs(n_tokens, x_scale=x_scale)
+    # expert 0's gate and up, as the reference computes them
+    gu = _dequant(*_quant(x[(ids == 0).any(dim=1)])) @ _dequant(w13[0][0], w13[1][0]).T
+    g, u = gu[:, :INTER], gu[:, INTER:]
+    live = (g > 0) & (g <= LIMIT)  # a gate that leaves the up clamp's effect visible
+    for name, hit in {
+        "g > limit": g > LIMIT,
+        "u > limit, gate live": live & (u > LIMIT),
+        "u < -limit, gate live": live & (u < -LIMIT),
+    }.items():
+        assert hit.float().mean() > 0.01, (name, hit.float().mean().item())
+    _check(n_tokens, x_scale=x_scale)
 
 
 def test_mxfp4_quant():
@@ -434,6 +453,7 @@ def main():
     aiter.logger.info(
         "minimax_m3 prefill moe summary (markdown):\n%s", df.to_markdown(index=False)
     )
+    test_a4w4_prefill_moe_swiglu_limits()
     test_flydsl_exports()
     test_mxfp4_quant()
     test_a4w4_prefill_moe_rejects_bad_inputs()
