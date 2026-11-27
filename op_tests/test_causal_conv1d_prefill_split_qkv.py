@@ -17,7 +17,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 CONV_DIM = 8192
@@ -617,6 +617,227 @@ def test_prefill_split_qkv_benchmark(
 test_prefill_split_qkv_benchmark.__test__ = False
 
 
+# ---- FlyDSL GDN prefill front (gfx942): conv + split + q/k L2 norm, one launch ----
+GDN_FRONT_GFX = ["gfx942"]
+GDN_HEAD_DIM = 128
+_gdn_front_only = pytest.mark.skipif(
+    get_gfx_runtime() not in GDN_FRONT_GFX,
+    reason="FlyDSL GDN prefill front is gfx942 only",
+)
+
+
+def make_gdn_front_inputs(cu_seqlens, num_k_heads, num_v_heads, with_initial_state):
+    """In_proj rows [T, q|k|v|z] (the model layout) and a [slots, C, 3] conv pool."""
+    torch.manual_seed(len(cu_seqlens) * 7 + cu_seqlens[-1] + num_v_heads)
+    D = GDN_HEAD_DIM
+    conv_dim = (2 * num_k_heads + num_v_heads) * D
+    T, n = cu_seqlens[-1], len(cu_seqlens) - 1
+    qkvz = (
+        torch.randn(T, conv_dim + num_v_heads * D, dtype=dtypes.bf16, device="cuda")
+        * 0.1
+    )
+    weight = torch.randn(conv_dim, WIDTH, dtype=dtypes.bf16, device="cuda") * 0.1
+    conv_states = (
+        torch.randn(n + 2, conv_dim, STATE_LEN, dtype=dtypes.bf16, device="cuda") * 0.1
+    )
+    cache_indices = torch.arange(1, n + 1, dtype=torch.int32, device="cuda")
+    has_initial_state = torch.full(
+        (n,), with_initial_state, dtype=torch.bool, device="cuda"
+    )
+    qsl = torch.tensor(cu_seqlens, dtype=torch.int32, device="cuda")
+    return qkvz, weight, conv_states, cache_indices, has_initial_state, qsl
+
+
+def gdn_front_reference(
+    qkvz, weight, conv_states, qsl, ci, hi, num_k_heads, num_v_heads
+):
+    """torch_reference of the conv split, then the fp32 q/k L2 norm."""
+    D = GDN_HEAD_DIM
+    k_dim, v_dim = num_k_heads * D, num_v_heads * D
+    q, k, v, cs = torch_reference(
+        qkvz[:, : 2 * k_dim + v_dim].t(),
+        weight,
+        None,
+        conv_states.clone(),
+        qsl,
+        ci,
+        hi,
+        k_dim,
+        v_dim,
+    )
+    T = qkvz.shape[0]
+    q = q.view(1, T, num_k_heads, D)
+    k = k.view(1, T, num_k_heads, D)
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    return q, k, v.view(1, T, num_v_heads, D), cs
+
+
+@_gdn_front_only
+@pytest.mark.parametrize("cu", SHAPES)
+@pytest.mark.parametrize("with_is", [False, True])
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(8, 24), (16, 48)])
+def test_gdn_prefill_front_matches_reference(cu, with_is, num_k_heads, num_v_heads):
+    from aiter.ops.flydsl.gdn_prefill import flydsl_gdn_prefill_front
+
+    qkvz, w, cs, ci, hi, qsl = make_gdn_front_inputs(
+        cu, num_k_heads, num_v_heads, with_is
+    )
+    ref = gdn_front_reference(qkvz, w, cs, qsl, ci, hi, num_k_heads, num_v_heads)
+    cs_work = cs.clone()
+    q, k, v = flydsl_gdn_prefill_front(
+        qkvz,
+        w,
+        cs_work,
+        ci,
+        hi,
+        qsl,
+        num_k_heads,
+        num_v_heads,
+        max(qsl.diff().tolist()),
+    )
+    for name, got, want in zip(("q", "k", "v", "conv_state"), (q, k, v, cs_work), ref):
+        rel, absd = _max_abs_rel(got, want)
+        assert (
+            absd < 5e-2
+        ), f"gdn front {name} mismatch: max_abs={absd:.4f} rel={rel:.4f}"
+    # the state holds raw bf16 inputs: exact
+    assert torch.equal(
+        cs_work, ref[3].to(cs_work.dtype)
+    ), "gdn front conv_state not exact"
+
+
+@_gdn_front_only
+@pytest.mark.parametrize("with_is", [False, True])
+def test_gdn_prefill_front_pad_slot(with_is):
+    """A sequence with cache index -1 writes no state; the others are unaffected."""
+    from aiter.ops.flydsl.gdn_prefill import flydsl_gdn_prefill_front
+
+    cu = [0, 64, 100, 300]
+    qkvz, w, cs, ci, hi, qsl = make_gdn_front_inputs(cu, 8, 24, with_is)
+    ci[1] = -1
+    q_ref, k_ref, v_ref, cs_ref = gdn_front_reference(qkvz, w, cs, qsl, ci, hi, 8, 24)
+    cs_work = cs.clone()
+    q, k, v = flydsl_gdn_prefill_front(qkvz, w, cs_work, ci, hi, qsl, 8, 24, 200)
+    live = torch.ones(cu[-1], dtype=torch.bool, device="cuda")
+    live[cu[1] : cu[2]] = False
+    for name, got, want in (("q", q, q_ref), ("k", k, k_ref), ("v", v, v_ref)):
+        _, absd = _max_abs_rel(got[0, live], want[0, live])
+        assert absd < 5e-2, f"gdn front {name} mismatch with a pad slot: {absd:.4f}"
+    assert torch.equal(cs_work, cs_ref.to(cs_work.dtype)), "pad slot changed the pool"
+
+
+@_gdn_front_only
+@pytest.mark.parametrize(
+    "num_k_heads,num_v_heads", [(4, 12), (2, 6), (8, 16), (16, 32)]
+)
+def test_gdn_prefill_front_rejects_non_qwen38_heads(num_k_heads, num_v_heads):
+    """Qwen3.8 TP4 (4/12, placement-sensitive), TP8 (2/6, untested) and Qwen3-Next
+    (8/16, 16/32) keep the unfused path."""
+    from aiter.ops.flydsl.gdn_prefill import (
+        flydsl_gdn_prefill_front,
+        gdn_prefill_front_supported,
+    )
+
+    qkvz, w, cs, ci, hi, qsl = make_gdn_front_inputs(
+        [0, 64], num_k_heads, num_v_heads, False
+    )
+    assert not gdn_prefill_front_supported(qkvz, w, cs, num_k_heads, num_v_heads)
+    with pytest.raises(ValueError, match="gdn_prefill_front_supported"):
+        flydsl_gdn_prefill_front(qkvz, w, cs, ci, hi, qsl, num_k_heads, num_v_heads, 64)
+
+
+@_gdn_front_only
+def test_gdn_prefill_front_rejects_interleaved_layout():
+    from aiter.ops.flydsl.gdn_prefill import (
+        flydsl_gdn_prefill_front,
+        gdn_prefill_front_supported,
+    )
+
+    qkvz, w, cs, ci, hi, qsl = make_gdn_front_inputs([0, 64], 8, 24, False)
+    assert gdn_prefill_front_supported(qkvz, w, cs, 8, 24)
+    # Qwen3-Next packs qkvz per k-head group: same shapes, other element order.
+    assert not gdn_prefill_front_supported(
+        qkvz, w, cs, 8, 24, qkvz_layout="interleaved"
+    )
+    with pytest.raises(ValueError, match="flat"):
+        flydsl_gdn_prefill_front(
+            qkvz, w, cs, ci, hi, qsl, 8, 24, 64, qkvz_layout="interleaved"
+        )
+
+
+@benchmark()
+def test_gdn_prefill_front_benchmark(
+    batch: int = 1,
+    seqlen: int = 1024,
+    num_k_heads: int = 8,
+    num_v_heads: int = 24,
+    with_initial_state: bool = True,
+):
+    """FlyDSL GDN front vs the HIP conv split (validated on the channel-last view of
+    the in_proj rows) + the Triton q/k L2 norm."""
+    from aiter.ops.causal_conv1d_fwd_split_qkv import causal_conv1d_split_qkv_hip_fn
+    from aiter.ops.flydsl.gdn_prefill import flydsl_gdn_prefill_front
+    from aiter.ops.triton._triton_kernels.gated_delta_net.utils.l2norm import l2norm_fwd
+
+    D, H, HV = GDN_HEAD_DIM, num_k_heads, num_v_heads
+    cu = [i * seqlen for i in range(batch + 1)]
+    qkvz, w, cs, ci, hi, qsl = make_gdn_front_inputs(cu, H, HV, with_initial_state)
+    ref = gdn_front_reference(qkvz, w, cs, qsl, ci, hi, H, HV)
+    T, conv_dim = qkvz.shape[0], (2 * H + HV) * D
+
+    def l2(x):
+        y = l2norm_fwd(x)
+        return y[0] if isinstance(y, tuple) else y
+
+    def hip_l2norm(state):
+        q, k, v = causal_conv1d_split_qkv_hip_fn(
+            x=qkvz[:, :conv_dim].t(),
+            weight=w,
+            bias=None,
+            conv_states=state,
+            query_start_loc=qsl,
+            k_dim=H * D,
+            v_dim=HV * D,
+            cache_indices=ci,
+            has_initial_state=hi,
+            activation="silu",
+        )
+        return l2(q.view(1, T, H, D)), l2(k.view(1, T, H, D)), v.view(1, T, HV, D)
+
+    candidates = {
+        "flydsl_front": lambda state: flydsl_gdn_prefill_front(
+            qkvz, w, state, ci, hi, qsl, H, HV, seqlen
+        ),
+        "hip+l2norm": hip_l2norm,
+    }
+    flops = 2 * T * conv_dim * WIDTH
+    nbytes = 2 * T * conv_dim * qkvz.element_size()  # read q|k|v, write q, k, v
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        state = cs.clone()
+        got = (*fn(state), state)
+        errs = [
+            checkAllclose(
+                want.to(dtypes.fp32),
+                g.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=5e-2,
+                msg=f"{name}: {label}",
+            )
+            for label, g, want in zip(("q", "k", "v", "conv_state"), got, ref)
+        ]
+        _, us = run_perftest(fn, cs.clone())
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(errs)
+    return ret
+
+
+test_gdn_prefill_front_benchmark.__test__ = False
+
+
 def qsl_to(qsl):
     if torch.is_tensor(qsl):
         return qsl
@@ -693,6 +914,18 @@ def main():
         "causal conv1d prefill split-qkv summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
+
+    if get_gfx_runtime() in GDN_FRONT_GFX:
+        front_rows = [
+            test_gdn_prefill_front_benchmark(batch, seqlen, h, hv, True)
+            for (h, hv), batch, seqlen in itertools.product(
+                [(8, 24), (16, 48)], [1, 4], [1024, 4096]
+            )
+        ]
+        aiter.logger.info(
+            "FlyDSL GDN prefill front summary (markdown):\n%s",
+            pd.DataFrame(front_rows).to_markdown(index=False),
+        )
 
     # Preserve the mixed-varlen script coverage that existed before the
     # benchmark entrypoint was added. These direct calls retain the assertions
