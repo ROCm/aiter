@@ -2779,6 +2779,129 @@ def run_blockscale_limit_cases():
     )
 
 
+# GLM-5.x FP8 TP8 decode: model_dim, inter_dim, experts, topk of the gfx942
+# 304-CU tuned fmoe rows. The last expert is the shared one, fused into the
+# top-k slots as vLLM's AITER MoE path routes it.
+_GLM5_DECODE_SHAPE = (6144, 256, 257, 9)
+_GLM5_ROUTED_SCALING = 2.5
+_glm5_decode_weight_cache = {}
+
+
+def _glm5_decode_weights():
+    if not _glm5_decode_weight_cache:
+        model_dim, inter_dim, experts, _ = _GLM5_DECODE_SHAPE
+        torch.manual_seed(0)
+        w1, s1 = _quant_blockscale_weight(
+            torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16) / 10
+        )
+        w2, s2 = _quant_blockscale_weight(
+            torch.randn(experts, model_dim, inter_dim, dtype=dtypes.bf16) / 10
+        )
+        _glm5_decode_weight_cache.update(
+            w1=w1,
+            w1_scale=s1,
+            w2=w2,
+            w2_scale=s2,
+            w1_sh=shuffle_weight(w1, layout=(16, 16)),
+            w2_sh=shuffle_weight(w2, layout=(16, 16)),
+        )
+    return _glm5_decode_weight_cache
+
+
+def _glm5_decode_routing(token, experts, topk):
+    score = torch.randn(token, experts - 1, dtype=dtypes.bf16).softmax(-1).float()
+    weights, ids = torch.topk(score, topk - 1, dim=-1)
+    weights = weights / weights.sum(-1, keepdim=True) * _GLM5_ROUTED_SCALING
+    return (
+        torch.cat([weights, torch.ones(token, 1)], dim=1),
+        torch.cat([ids, torch.full((token, 1), experts - 1)], dim=1).to(dtypes.i32),
+    )
+
+
+@benchmark()
+def test_glm5_tp8_decode(token):
+    """GLM-5 FP8 TP8 decode fused_moe against the blockscale torch reference."""
+    model_dim, inter_dim, experts, topk = _GLM5_DECODE_SHAPE
+    w = _glm5_decode_weights()
+    torch.manual_seed(token)
+    x = torch.randn(token, model_dim, dtype=dtypes.bf16)
+    weights, ids = _glm5_decode_routing(token, experts, topk)
+    xq, xs = aiter.pertoken_quant(x.view(token, -1, 128), quant_dtype=dtypes.fp8)
+    stage1 = torch_moe_stage1(
+        xq.view_as(x),
+        w["w1"],
+        w["w2"],
+        weights,
+        ids,
+        dtype=dtypes.bf16,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.per_1x128,
+        a1_scale=xs.squeeze(-1),
+        w1_scale=w["w1_scale"],
+    )
+    yq, ys = aiter.pertoken_quant(stage1.view(token, -1, 128), quant_dtype=dtypes.fp8)
+    ref = torch_moe_stage2(
+        yq.view(token, topk, inter_dim),
+        w["w1"],
+        w["w2"],
+        weights,
+        ids,
+        dtype=dtypes.bf16,
+        quant_type=aiter.QuantType.per_1x128,
+        w2_scale=w["w2_scale"],
+        a2_scale=ys.view(token, topk, -1),
+        doweight=True,
+    )
+    out, us = run_perftest(
+        fused_moe,
+        x,
+        w["w1_sh"],
+        w["w2_sh"],
+        weights,
+        ids,
+        w1_scale=w["w1_scale"],
+        w2_scale=w["w2_scale"],
+        quant_type=aiter.QuantType.per_128x128,
+        activation=aiter.ActivationType.Silu,
+        num_iters=20,
+        num_warmup=3,
+    )
+    # Elementwise tolerance does not separate a correct FP8 MoE from a broken
+    # one here; the bad token-16 kernel shows up as a logits difference of ~1.
+    a, b = ref.double(), out.double()
+    logits_diff = float(1 - 2 * (a * b).sum() / (a.square() + b.square()).sum())
+    row_err = ((b - a).norm(dim=1) / a.norm(dim=1)).nan_to_num(float("inf"))
+    worst_row = float(row_err.max())
+    msg = f"glm5 tp8 decode token={token}"
+    assert logits_diff < 0.01, f"{msg}: {logits_diff=}"
+    assert worst_row < 0.05, f"{msg}: row error {worst_row}"
+    flops = 6 * token * topk * model_dim * inter_dim
+    nbytes = (
+        ids.unique().numel() * 3 * inter_dim * model_dim * w["w1"].element_size()
+        + 2 * token * model_dim * x.element_size()
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": nbytes / us / 1e6,
+        "logits_diff": logits_diff,
+        "row err": worst_row,
+    }
+
+
+def run_glm5_decode_cases():
+    # 9 and 16 are the edges of the token-16 tuned row.
+    rows = [test_glm5_tp8_decode(token) for token in (9, 16)]
+    _glm5_decode_weight_cache.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    aiter.logger.info(
+        "GLM-5 TP8 decode summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 # FP8 per_Token / per_Tensor SiLU limit: model_dim, inter_dim, experts, topk of
 # the shipped swiglu_limit=7 tuned rows. The tuned rows are gfx942 only; gfx950
 # runs the same cases on the default heuristic tiles.
@@ -3233,6 +3356,8 @@ else:
     test_swiglu_limit_guards()
     if get_gfx() in ("gfx942", "gfx950"):
         run_blockscale_limit_cases()
+    if get_gfx_runtime() == "gfx942":
+        run_glm5_decode_cases()
     run_plain_fp8_limit_cases()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
