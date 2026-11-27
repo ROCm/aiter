@@ -654,8 +654,14 @@ class FlyObjCache:
 
 
 def asm_mark(mark: str):
+    """Mark this point of the kernel in its assembly: a nop between two
+    scheduling barriers, with ``mark`` and the caller's file and line in a
+    comment. The file goes by its base name: the comment is part of the
+    kernel's IR, so a full path would tie the kernel's cache identity to the
+    directory it was built in, and a prebuilt kernel would not be found once
+    aiter is installed elsewhere."""
     caller_frame = inspect.currentframe().f_back
-    filename = caller_frame.f_code.co_filename
+    filename = os.path.basename(caller_frame.f_code.co_filename)
     lineno = caller_frame.f_lineno
 
     fx.rocdl.sched_barrier(0)
