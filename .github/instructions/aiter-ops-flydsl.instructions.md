@@ -11,6 +11,7 @@ file does not repeat them.
 |---|---|
 | New or changed `@flyc.kernel` / `@flyc.jit` body, layouts, copy/MMA, LDS | `.claude/skills/flydsl-kernel-authoring/SKILL.md` |
 | Migration off legacy IR (`ArithValue`, `fx.Index`, `buffer_ops`, raw dialects, `SmemPtr`), helper reuse, `_run_compiled` | `.claude/skills/flydsl-kernel-code-cleanup/SKILL.md` |
+| A launch moved to, or changed on, the `export_to_c` AOT cache (`aot_factory`, `bind_aot`, `.lazy()`, `specialization_key`) | `.claude/skills/flydsl-aot-export/SKILL.md` |
 | A FlyDSL test (`op_tests/**/*flydsl*.py`, `op_tests/flydsl_tests/**`) or any new FlyDSL test suite | `.claude/skills/aiter-op-test/SKILL.md` |
 
 Judge the kernel against aiter's pinned FlyDSL in `requirements.txt`, not a

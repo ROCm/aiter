@@ -48,6 +48,21 @@ rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
 one engine per rung.
 
 **Fused all-reduce + RMSNorm**
+
+The fused tables (``FUSED_FAMILY_POLICIES``, ``fused_allreduce_ladders.json``)
+have the same two levels, keyed by the hidden width as well, and
+``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` move their windows.
+
+**Pull (fused, Gemma only)**
+
+The exact bf16 ``pull`` schedule reads the ranks' CUDA-graph-registered inputs
+in place (``pull_allreduce_rmsnorm``). It is not an ``AllReduceAlgorithm``: it
+has no plain all-reduce and no quantized mode. Its window is
+``FamilyPolicy.pull`` (``AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES``, an empty
+window or ``MAX_BYTES=0`` switches it off) and its ladder, per hidden width and
+without a default, is ``FUSED_PULL_LADDER``: rungs of ``FusedPullRung`` that
+name the kernel a payload runs. A width with no ladder is not served.
+``AITER_FLY_AR_PULL`` is only a kill switch for building the engine.
 """
 
 from __future__ import annotations
@@ -120,6 +135,10 @@ SUPER_TILES = (1, 8)
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
+# The pull schedule moves bf16 rows as they are: its one "wire format" is the
+# identity, so it has no quantization to choose.
+PULL_CODECS = ("bf16",)
+
 # Ring algorithm.
 #
 # Super-tile values the ring accepts.
@@ -165,6 +184,7 @@ RS_INT6_MIN_WORLD = 4
 _TWO_SHOT_CODECS = {
     "mesh": (MESH_CODECS, MESH_CODECS),
     "ring": (RS_CODECS, AG_CODECS),
+    "pull": (PULL_CODECS, PULL_CODECS),
 }
 
 
@@ -299,6 +319,50 @@ class FusedTwoShotRung:
     low_latency: bool = False
 
 
+#: The kernels of the pull schedule, in payload order: the one-shot with read
+#: acks, the one-row-per-workgroup pull and the streamed pull.
+PULL_KERNELS = ("oneshot", "pull", "stream")
+
+#: The most rows of a payload each pull kernel has been run on and found exact
+#: (MI355X, TP4, hidden 6144). The one-row-per-workgroup kernels spin on their
+#: peers' flags, so every workgroup of a launch has to be resident: they hang a
+#: step above 640 rows (768 rows timed out on the pull kernel, 1024 on the
+#: one-row grid too). The one-shot's flag table holds 32 rows; 16 are checked.
+#: The streamed kernel is bounded by the kernels' flag tables (1024 rows).
+PULL_KERNEL_MAX_ROWS = {"oneshot": 16, "pull": 640, "stream": 1024}
+
+#: Rows per workgroup of the streamed pull kernel.
+PULL_STREAM_ROWS_PER_WG = (2, 4)
+
+
+@dataclass(frozen=True)
+class FusedPullRung:
+    """The pull (exact bf16 Gemma all-reduce + RMSNorm on registered inputs)
+    kernel for payloads of at least ``min_bytes``.
+
+    ``kernel`` picks the schedule. ``wave`` (``kernel="pull"``) hands the
+    reduced row over per wave instead of per workgroup. ``rows_per_wg`` and
+    ``hoist`` (``kernel="stream"``) are the rows one workgroup streams and
+    whether it keeps the weight in registers.
+    """
+
+    min_bytes: int
+    kernel: str
+    wave: bool = False
+    rows_per_wg: int = 0
+    hoist: bool = True
+
+    @property
+    def cfg(self) -> tuple:
+        """The launcher key: every field except ``min_bytes``, as the engine
+        builds its kernels from it."""
+        if self.kernel == "oneshot":
+            return ("oneshot",)
+        if self.kernel == "pull":
+            return ("pull", self.wave)
+        return ("stream", self.rows_per_wg, self.hoist)
+
+
 def select_rung(ladder, nbytes: int):
     """The rung of *ladder* that runs a payload of *nbytes*."""
     chosen = ladder[0]
@@ -390,6 +454,13 @@ class FamilyPolicy:
     oneshot: Window | None
     mesh: Window | None
     ring: Window | None
+    # The pull schedule (fused tables only): exact bf16, Gemma RMSNorm only,
+    # on the inputs of a registered CUDA graph. It is not an
+    # ``AllReduceAlgorithm``: it has no plain all-reduce, no quantized mode and
+    # no ladder by ``(arch, link, world_size)`` alone, only per hidden width
+    # (``FUSED_PULL_LADDER``). Its window is the first thing a Gemma call
+    # meets; a payload outside it goes to the other fused paths.
+    pull: Window | None = None
 
     def __post_init__(self):
         if self.arch not in SUPPORTED_ARCHS:
@@ -427,6 +498,11 @@ class FamilyPolicy:
             w = self.mesh
         else:
             w = self.ring
+        return None if w is None or w.is_empty else w
+
+    def pull_window(self) -> Window | None:
+        """The pull window, or None if the pull schedule is disabled."""
+        w = self.pull
         return None if w is None or w.is_empty else w
 
     def algorithms(self, *, quantized: bool) -> tuple[AllReduceAlgorithm, ...]:
@@ -642,7 +718,7 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #
 #   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #           Block 512 from 4 MiB.
-#         gfx950: one b256 rung per TP.
+#         gfx950: a b64 ST=1 rung below 2 MiB, then one b256 rung per TP.
 #           - TP2 ST=1 cap512
 #           - TP4 ST=1 cap1024
 #           - TP8 ST=8 cap384:
@@ -664,14 +740,18 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # Below 2 MiB block 64 (4x the workgroups of block 256) is 3-12% faster.
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=1, grid_cap=512, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=1, grid_cap=1024, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=64),
+        TwoShotRung(min_bytes=2 * MiB, super_tile=8, grid_cap=384, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
@@ -848,6 +928,7 @@ def apply_env_overrides(
         for alg, infix in _WINDOW_ENV.items()
     }
     key = (policy.arch, policy.link, policy.world_size)
+    fused = prefix == FUSED_ENV_PREFIX
     windows = {}
     for alg, field in (
         (AllReduceAlgorithm.OneShot, "oneshot"),
@@ -869,6 +950,24 @@ def apply_env_overrides(
             )
             window = getattr(policy, field)
         windows[field] = window
+    # The pull schedule exists in the fused tables only, and only where a
+    # width has a pull ladder.
+    if fused:
+        lo = _env_bound(f"{prefix}_PULL_MIN_BYTES", is_max=False)
+        hi = _env_bound(f"{prefix}_PULL_MAX_BYTES", is_max=True)
+        window = _override(policy.pull, lo, hi)
+        if (
+            window is not None
+            and not window.is_empty
+            and not any(k[:3] == key for k in FUSED_PULL_LADDER)
+        ):
+            logger.warning(
+                f"{prefix}_PULL_{{MIN,MAX}}_BYTES ignored: the pull schedule has "
+                "no tuned configuration on %s/%s/TP%d.",
+                *key,
+            )
+            window = policy.pull
+        windows["pull"] = window
     return dataclasses.replace(policy, **windows)
 
 
@@ -907,7 +1006,7 @@ def resolve_link(link: str | None) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _probe_link() -> str | None:
-    from .allreduce_host_shared import probe_xgmi_peer_links
+    from .comm_collectives_host_shared import probe_xgmi_peer_links
 
     peer_link_type = probe_xgmi_peer_links()
     return None if peer_link_type is None else "xgmi" if peer_link_type else "pcie"
@@ -1037,6 +1136,12 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         oneshot=Window(0, 384 * KiB),
         mesh=Window(1536 * KiB, None),
         ring=None,
+        # Rows 1..1024 of 6144 bf16 (the registered-input tiers of the pull
+        # kernels, ``FUSED_PULL_LADDER``); a Gemma call only. Above it the
+        # kernels' flag tables end, and the all-reduce + RMSNorm pair of the
+        # caller's next backend is as fast or faster (see
+        # docs/flydsl_pull_ar_m31.md).
+        pull=Window(0, 12300 * KiB),
     ),
     FamilyPolicy(
         arch="gfx950",
@@ -1200,6 +1305,24 @@ def _parse_rungs(raw, cls, check, where: str) -> tuple:
     return tuple(rungs)
 
 
+def _check_pull_rung(rung: FusedPullRung, where: str) -> None:
+    _check_in_str(rung.kernel, PULL_KERNELS, f"{where}.kernel")
+    for name in ("wave", "hoist"):
+        if not isinstance(getattr(rung, name), bool):
+            raise ValueError(f"{where}.{name}: must be true or false")  # noqa: TRY004
+    if rung.kernel != "pull" and rung.wave:
+        raise ValueError(f"{where}.wave: only a pull rung hands off per wave")
+    if rung.kernel == "stream":
+        _check_in(rung.rows_per_wg, PULL_STREAM_ROWS_PER_WG, f"{where}.rows_per_wg")
+    elif rung.rows_per_wg or not rung.hoist:
+        raise ValueError(f"{where}: rows_per_wg and hoist are for a stream rung")
+
+
+def _check_in_str(value, legal, where: str) -> None:
+    if value not in legal:
+        raise ValueError(f"{where}: must be one of {legal}, got {value!r}")
+
+
 def _parse_hidden(key: str, where: str) -> int:
     if not key.isdigit() or int(key) <= 0 or str(int(key)) != key:
         raise ValueError(f"{where}: a width is a positive integer, got {key!r}")
@@ -1229,6 +1352,12 @@ class FusedLadders:
     mesh: dict[tuple, tuple[FusedTwoShotRung, ...]]
     ring: dict[tuple, tuple[FusedTwoShotRung, ...]]
     row_atoms: dict[tuple, int | None]
+    # The pull ladders, by ``(arch, link, world_size, hidden)``: a width
+    # without an entry is not served by the pull schedule (there is no default
+    # ladder, its kernels are built per width).
+    pull: dict[tuple, tuple[FusedPullRung, ...]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def load_fused_ladders(path: str) -> FusedLadders:
@@ -1249,10 +1378,13 @@ def load_fused_ladders(path: str) -> FusedLadders:
         raise ValueError(f"{path}: platforms must be a list")  # noqa: TRY004
 
     tables = {family: {} for family in _FUSED_FAMILIES}
+    pull_tables = {}
     row_atoms = {}
     for i, plat in enumerate(doc["platforms"]):
         where = f"{path}: platforms[{i}]"
-        _check_keys(plat, where, ("arch", "link", "world_size", *_FUSED_FAMILIES))
+        _check_keys(
+            plat, where, ("arch", "link", "world_size", *_FUSED_FAMILIES), ("pull",)
+        )
         arch, link, ws = plat["arch"], plat["link"], plat["world_size"]
         if arch not in SUPPORTED_ARCHS:
             raise ValueError(f"{where}.arch: must be one of {SUPPORTED_ARCHS}")
@@ -1316,7 +1448,22 @@ def load_fused_ladders(path: str) -> FusedLadders:
                             f"{ew}.atoms_per_row: must divide {what}, got {apr!r}"
                         )
                     row_atoms[(*cell, family, hidden)] = apr
-    return FusedLadders(row_atoms=row_atoms, **tables)
+        if "pull" in plat:
+            pw = f"{where}.pull"
+            spec = plat["pull"]
+            _check_keys(spec, pw, ("hidden",))
+            if not isinstance(spec["hidden"], dict):
+                raise ValueError(f"{pw}.hidden: expected an object")
+            for key, entry in spec["hidden"].items():
+                if key.startswith("_"):
+                    continue
+                hidden = _parse_hidden(key, f"{pw}.hidden")
+                ew = f"{pw}.hidden.{key}"
+                _check_keys(entry, ew, ("rungs",))
+                pull_tables[(*cell, hidden)] = _parse_rungs(
+                    entry["rungs"], FusedPullRung, _check_pull_rung, ew
+                )
+    return FusedLadders(row_atoms=row_atoms, pull=pull_tables, **tables)
 
 
 def fused_ladders_path() -> str:
@@ -1339,6 +1486,7 @@ FUSED_ONESHOT_LADDER = FUSED_LADDERS.oneshot
 FUSED_MESH_ST_LADDER = FUSED_LADDERS.mesh
 FUSED_RING_ST_LADDER = FUSED_LADDERS.ring
 FUSED_QR_ROW_ATOMS = FUSED_LADDERS.row_atoms
+FUSED_PULL_LADDER = FUSED_LADDERS.pull
 
 
 def _fused_ladder(table: dict, name: str, arch, link: str, world_size: int, hidden):
@@ -1396,6 +1544,26 @@ def fused_ring_st_ladder(
     )
 
 
+def fused_pull_ladder(
+    *, world_size: int, link: str, arch: str | None = None, hidden: int
+) -> tuple[FusedPullRung, ...] | None:
+    """The pull rungs for *(arch, link, world_size)* at *hidden*, or None when
+    the width has none: the pull schedule serves only the widths with a ladder
+    of their own."""
+    arch = detect_arch() if arch is None else arch
+    _check_platform(arch, link, int(world_size))
+    return FUSED_PULL_LADDER.get((arch, link, int(world_size), int(hidden)))
+
+
+def fused_pull_hiddens(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[int, ...]:
+    """The widths with a pull ladder, sorted."""
+    arch = detect_arch() if arch is None else arch
+    cell = (arch, link, int(world_size))
+    return tuple(sorted(k[3] for k in FUSED_PULL_LADDER if k[:3] == cell))
+
+
 def fused_qr_row_atoms(
     *,
     world_size: int,
@@ -1442,6 +1610,12 @@ def fused_platform_ladders(
     """Fused ladders for this platform. Two ranks build the same
     fused engines at every width exactly when this is equal on both."""
     kw = {"world_size": world_size, "link": link, "arch": arch}
+    pull = tuple(
+        (hidden, fused_pull_ladder(**kw, hidden=hidden))
+        for hidden in fused_pull_hiddens(**kw)
+    )
+    # Cells without a pull ladder keep the shape they had before the pull
+    # schedule: a trailing ``("pull", ...)`` entry exists only where one does.
     return tuple(
         (
             hidden,
@@ -1454,7 +1628,7 @@ def fused_platform_ladders(
             ),
         )
         for hidden in (None, *fused_ladder_hiddens(**kw))
-    )
+    ) + ((("pull", pull),) if pull else ())
 
 
 # Host and environment

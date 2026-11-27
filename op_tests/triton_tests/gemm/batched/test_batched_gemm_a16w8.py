@@ -7,9 +7,11 @@ import triton
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or arch_info.get_arch() != "gfx1250",
+    not torch.cuda.is_available()
+    or arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"),
     reason="batched_gemm_a16w8 is a gfx1250 gluon kernel",
 )
 
@@ -73,24 +75,12 @@ def run_gluon(x, weight, w_scale, y, transpose_bm, config=None):
     )
 
 
-# DSR1 MLA absorbed BMMs: W_UK (N=512, K=128) and W_UV (N=128, K=512), 128 heads.
-MLA_SHAPES = [
-    (128, m, n, k)
-    for m in [1, 7, 64, 256, 1536, 3000]
-    for (n, k) in [(512, 128), (128, 512)]
-]
-GENERIC_SHAPES = [
-    (16, 1, 128, 64),
-    (16, 100, 384, 320),
-    (4, 257, 72, 1024),
-    (8, 1024, 1024, 1024),
-]
-
-
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("transpose_bm", [True, False])
 @pytest.mark.parametrize("strided_x", [True, False])
-@pytest.mark.parametrize("b, m, n, k", MLA_SHAPES + GENERIC_SHAPES)
+@pytest.mark.parametrize(
+    "b, m, n, k", get_shapes(max_size=1024 * 1024 * 1024, batch=[1, 2, 4, 8, 16])
+)
 def test_batched_gemm_a16w8(b, m, n, k, strided_x, transpose_bm, output):
     torch.cuda.empty_cache()
     x, weight, w_scale, y = generate_inputs(b, m, n, k, strided_x, transpose_bm, output)

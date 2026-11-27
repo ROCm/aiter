@@ -57,6 +57,9 @@ _STREAM_VARIANTS = (
     "gfx1250_split5",
     "gfx1250_split10",
     "gfx1250_split14",
+    "gfx1250_split3",
+    "mid768",  # gfx950, H=5120, T=513..768: five column splits.
+    "post192",  # gfx950, H=5120, T=129..256: register-local post-mix, ten waves.
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -72,6 +75,8 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "mid512",
         "mid1024",
         "mid2048",
+        "mid768",
+        "post192",
         "gfx1250_split32",
         "gfx1250_split16",
         "gfx1250_split8",
@@ -80,6 +85,7 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "gfx1250_split5",
         "gfx1250_split10",
         "gfx1250_split14",
+        "gfx1250_split3",
     )
 )
 
@@ -93,9 +99,11 @@ _GFX1250_SPLITS = (32, 16, 8, 4, 2)
 # On 256 CUs, (split, most token tiles) per hidden size from a gfx1250 sweep
 # of all split counts that divide H / 32. Splits 10 and 14 fill up to 240 and
 # 252 CUs where 16 or 8 would leave a third idle; clusters of 5 (three per
-# 16-WGP shader engine) hold up to 48 tiles.
+# 16-WGP shader engine) hold up to 48 tiles. Split 3 deals 128-column units
+# (1792/1664/1664 for H = 5120) and fills up to 240 CUs from 65 to 80 tiles;
+# 81..128 tiles stay on split 2.
 _GFX1250_SPLIT_TABLE = {
-    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (2, 128)),
+    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (3, 80), (2, 128)),
     7168: ((32, 8), (14, 18), (8, 32), (4, 64), (2, 128)),
 }
 
@@ -103,6 +111,13 @@ _GFX1250_SPLIT_TABLE = {
 def _select_stream_variant(tokens, hidden=5120):
     if tokens == 0:
         return "generic", 1
+    # H=5120 specializations: post192 replaces mid256 over 9..16 token tiles
+    # (no-post shares mid256's kernel), and mid768 replaces mid1024 over
+    # 33..48 tiles, where five splits keep the grid within 240 CUs.
+    if 128 < tokens <= 256 and hidden == 5120:
+        return "post192", 16
+    if 512 < tokens <= 768 and hidden == 5120:
+        return "mid768", 5
     if tokens == 4:
         return "decode4", 32
     if tokens < 4:
@@ -120,7 +135,8 @@ def _select_stream_variant(tokens, hidden=5120):
             if limit == 384 and hidden != 5120:
                 split = 8
             return f"mid{limit}", split
-    if tokens == 4160:
+    # One to eight tiles past whole rounds of 256 CUs: split them over H.
+    if tokens > 4096 and 1 <= (tokens + 15) // 16 % 256 <= 8:
         return "tail", 1
     return "large", 1
 
@@ -346,10 +362,13 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             variant, selected_split, distributed = "generic", 1, False
         tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
+        # Split 3 deals whole 128-column units (ragged for H = 5120).
         if (
             not isinstance(split_k, int)
             or not 1 <= split_k <= 32
-            or hidden % (32 * split_k)
+            or (
+                hidden % 128 if variant == "gfx1250_split3" else hidden % (32 * split_k)
+            )
         ):
             raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
         # The distributed kernels have a bounded wait and handoff path;
@@ -606,12 +625,23 @@ def mega_mhc(
             layer_input = (norm, quant_out, quant_scale)
         partials, counters = scratch.partials, scratch.counters
         variant = scratch.variant
+        split_k = scratch.split_k
         if sinkhorn_repeat != 20:
             variant = "generic"
             partials, counters = (
                 scratch.generic_partials,
                 scratch.generic_counters,
             )
+            # The generic kernel needs a split that divides H / 32; split 3
+            # scratch holds more than two splits.
+            if h % (32 * split_k):
+                split_k = 2
+                partials = partials[:split_k]
+        elif res_preshuffle and variant == "gfx1250_split3":
+            # The shuffled residual has no ragged split; split 2 fits the same
+            # tagged scratch and one workgroup per CU.
+            variant, split_k = "gfx1250_split2", 2
+            partials = partials[: split_k * t * 32]
         launch = _native_launcher(h if h in _STREAM_HIDDEN_SIZES else 0)
         launch(
             residual_out,
@@ -638,7 +668,7 @@ def mega_mhc(
             hc_post_mult_value,
             norm_eps,
             sinkhorn_repeat,
-            scratch.split_k,
+            split_k,
             has_post,
             pre_mix is None,
             _STREAM_VARIANTS.index(variant),

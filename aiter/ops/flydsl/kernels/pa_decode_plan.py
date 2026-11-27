@@ -11,6 +11,7 @@ import flydsl.expr as fx
 import torch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -40,6 +41,7 @@ def _block_threads(capacity):
     return max(64, min(1024, 1 << (capacity - 1).bit_length()))
 
 
+@aot_factory("pa_decode_plan")
 @cache
 def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
     """Compile a batch bucket and block size for dense or windowed plans.
@@ -376,6 +378,9 @@ def plan_pa_decode(
     specializes the block size (64--1024), and the window whether it is enabled.
     ``python -m aiter.aot.flydsl.pa_decode_plan`` precompiles every variant.
 
+    ``workgroup_budget=None`` takes twice the CU count; pass
+    ``pa_decode_default_workgroup_budget`` for the shape-aware default.
+
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
     the window and query length when decoding or refreshing. Dense plans use
@@ -480,7 +485,7 @@ def plan_pa_decode(
     # every visible range, since no length exceeds it.
     window = min(query_length - 1 + sliding_window, 2**31 - 1) if sliding_window else 0
     with torch.cuda.device(dev):
-        launch = compile_pa_decode_plan(
+        launch = compile_pa_decode_plan.lazy(
             max_batch,
             _block_threads(plan.capacity),
             sliding_window > 0,

@@ -38,6 +38,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from aiter import logger, torch_compile_guard
+from aiter.dist.device_communicators.pynccl_wrapper import ncclDataTypeEnum
 from aiter.dist.utils import env_flag
 
 
@@ -556,7 +557,6 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     # communicators are only created for world size > 1
-    pynccl_comm: Any | None  # PyNccl communicator
     ca_comm: Any | None  # Custom allreduce communicator
     qr_comm: Any | None  # Quick allreduce communicator
     mq_broadcaster: Any | None  # shared memory broadcaster
@@ -1219,6 +1219,33 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, output_, dim)
 
+    def _pynccl_comm(self, dtype: torch.dtype) -> Any | None:
+        """The PyNccl communicator for an NCCL collective on `dtype`, or None
+        to issue it through torch.distributed: while dynamo traces (it traces
+        torch.distributed collectives but not PyNccl's ctypes calls), when the
+        group has no usable PyNccl communicator, or for a dtype PyNccl does
+        not carry. Ranks pass the same dtype and so take the same path; ranks
+        on different paths would hang."""
+        if torch.compiler.is_compiling() or self.device_communicator is None:
+            return None
+        pynccl_comm = self.device_communicator.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.disabled
+            or not ncclDataTypeEnum.supports(dtype)
+        ):
+            return None
+        return pynccl_comm
+
+    def _nccl_reduce_scatter(self, output_: torch.Tensor, input_: torch.Tensor):
+        pynccl_comm = self._pynccl_comm(input_.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.reduce_scatter(output_, input_.contiguous())
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output_, input_, group=self.device_group
+            )
+
     def reduce_scatter_tensor(
         self,
         input_: torch.Tensor,
@@ -1248,7 +1275,7 @@ class GroupCoordinator:
             + input_.shape[dim + 1 :]
         )
 
-        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        output_ = input_.new_empty(out_shape)
         if use_custom:
             outplace_reduce_scatter(
                 input_, output_, group_name=self.unique_name, dim=dim
@@ -1260,14 +1287,10 @@ class GroupCoordinator:
                 tmp_output = torch.empty(
                     tmp_out_shape, dtype=input_.dtype, device=input_.device
                 )
-                torch.distributed.reduce_scatter_tensor(
-                    tmp_output, input_, group=self.device_group
-                )
+                self._nccl_reduce_scatter(tmp_output, input_)
                 output_ = tmp_output.movedim(0, dim).contiguous()
             else:
-                torch.distributed.reduce_scatter_tensor(
-                    output_, input_, group=self.device_group
-                )
+                self._nccl_reduce_scatter(output_, input_)
         return output_
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -1309,18 +1332,129 @@ class GroupCoordinator:
         if can_use_custom:
             return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
 
-        # NCCL path
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
+        # NCCL path: the ranks' inputs land one after another along dim 0.
+        output_tensor = input_.new_empty((world_size * input_size[0],) + input_size[1:])
+        pynccl_comm = self._pynccl_comm(input_.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.all_gather(output_tensor, input_.contiguous())
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+        if dim != 0:
+            output_tensor = output_tensor.view((world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim).reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
         return output_tensor
+
+    def _all_to_all_nccl(
+        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int
+    ) -> torch.Tensor:
+        """NCCL all-to-all, any scatter/gather dims: all_to_all_single on the
+        scatter dim brought to the front, then the received chunks are laid
+        side by side along the gather dim."""
+        w = self.world_size
+        x = input_.movedim(scatter_dim, 0).contiguous()
+        # 1-byte float types go through NCCL as raw bytes.
+        wire = torch.uint8 if x.dtype.itemsize == 1 else x.dtype
+        out = torch.empty_like(x)
+        torch.distributed.all_to_all_single(
+            out.view(wire), x.view(wire), group=self.device_group
+        )
+        out = out.view((w, x.shape[0] // w) + tuple(x.shape[1:]))
+        if gather_dim == scatter_dim:
+            out = out.reshape((x.shape[0],) + tuple(x.shape[1:]))
+        else:
+            # x's dims are [scatter, the others in order]: the gather dim sits
+            # at gather_dim + 1 if it came before the scatter dim, else at gather_dim.
+            gx = gather_dim + 1 if gather_dim < scatter_dim else gather_dim
+            out = out.movedim(0, gx)
+            merged = list(out.shape)
+            merged[gx : gx + 2] = [merged[gx] * merged[gx + 1]]
+            out = out.reshape(merged)
+        return out.movedim(0, scatter_dim).contiguous()
+
+    def all_to_all_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype, byte_offset: int = 0
+    ) -> torch.Tensor | None:
+        """A view of the registered IPC buffer for a producer to write straight
+        into, for `all_to_all(..., registered=True)`; None if this group has no
+        custom all-to-all. See `CustomAllreduce.input_buffer` for the rules."""
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if dc is not None else None
+        if ca_comm is None or not ca_comm._a2a_transport_ok():
+            return None
+        return ca_comm.input_buffer(shape, dtype, byte_offset)
+
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int = 0,
+        gather_dim: int = -1,
+        scales: torch.Tensor | None = None,
+        use_custom: bool = True,
+        registered: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """All-to-all: split `input_` into world_size equal chunks along
+        `scatter_dim`, send chunk j to rank j, and concatenate the chunks
+        received from ranks 0..W-1, in rank order, along `gather_dim`. The
+        result has the scatter dim divided and the gather dim multiplied by
+        world_size (for scatter_dim == gather_dim the shape is unchanged: the
+        `all_to_all_single` layout). The output is a new contiguous tensor.
+
+        `scales` is a second tensor exchanged with the same scatter and gather
+        dims (its gather dim has its own length), for block-scaled payloads: the
+        codes `[rows, C]` and their scales `[rows, C / 32]` arrive as
+        `[rows / W, W * C]` and `[rows / W, W * C / 32]` in one launch. Returns
+        `(out, scales_out)` then.
+
+        Fast path (custom_all_reduce IPC kernel, gfx9, 2, 4 or 8 ranks): 2D
+        contiguous matrices, scatter_dim 0, gather_dim 0 or last, 16-byte rows;
+        anything else uses NCCL. Every rank must pass the same shapes and
+        flags. With `registered=True` the inputs are not copied: they are views
+        from `all_to_all_buffer` (written by the producer, right before the call).
+        """
+        world_size = self.world_size
+        if world_size == 1:
+            return input_ if scales is None else (input_, scales)
+        ndim = input_.dim()
+        assert (
+            -ndim <= scatter_dim < ndim and -ndim <= gather_dim < ndim
+        ), f"Invalid dims ({scatter_dim}, {gather_dim}) for shape {tuple(input_.shape)}"
+        scatter_dim %= ndim
+        gather_dim %= ndim
+        assert input_.shape[scatter_dim] % world_size == 0, (
+            f"input.shape[{scatter_dim}]={input_.shape[scatter_dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        if scales is not None:
+            assert scales.dim() == ndim and all(
+                scales.shape[d] == input_.shape[d]
+                for d in range(ndim)
+                if d == scatter_dim or d != gather_dim
+            ), "scales must match input_ in every dim but the gather dim"
+        if registered and not use_custom:
+            raise ValueError("registered inputs need use_custom=True")
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if (use_custom and dc is not None) else None
+        if (
+            ca_comm is not None
+            and scatter_dim == 0
+            and ndim == 2
+            and gather_dim in (0, 1)
+        ):
+            out = ca_comm.custom_all_to_all(input_, gather_dim == 1, scales, registered)
+            if out is not None:
+                return out
+        if registered:
+            raise ValueError("registered all-to-all is not served for these inputs")
+        out = self._all_to_all_nccl(input_, scatter_dim, gather_dim)
+        if scales is None:
+            return out
+        return out, self._all_to_all_nccl(scales, scatter_dim, gather_dim)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
@@ -1684,9 +1818,9 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.send(tensor, dst)
+        pynccl_comm = self._pynccl_comm(tensor.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.send(tensor.contiguous(), dst)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
@@ -1699,8 +1833,8 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self._pynccl_comm(dtype)
+        if pynccl_comm is not None:
             pynccl_comm.recv(tensor, src)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
@@ -1717,6 +1851,13 @@ class GroupCoordinator:
         device_communicator; only the owner tears those down, since a second
         destroy raises and aborts teardown part-way.
         """
+        # Communicators first: their teardown may sync the ranks over cpu_group.
+        if self.device_communicator is not None:
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed below.
+            self.device_communicator = None
         if hasattr(self, "device_group"):
             if self._owns_device_group:
                 torch.distributed.destroy_process_group(self.device_group)
@@ -1725,12 +1866,6 @@ class GroupCoordinator:
             if self._owns_cpu_group:
                 torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            if self._owns_device_communicator:
-                self.device_communicator.destroy()
-            # Drop it either way: a kept reference would route collectives into
-            # process groups that are destroyed by now.
-            self.device_communicator = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster.close()
             self.mq_broadcaster = None
@@ -2018,6 +2153,7 @@ def initialize_model_parallel(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    device_communicators: bool = True,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2034,6 +2170,10 @@ def initialize_model_parallel(
               e.g. [0,1,2,3,4,5,6,7]
             - 2D List[List[int]]: multiple independent subgroups,
               e.g. [[0,1,2,3],[4,5,6,7]]
+        device_communicators: False builds the standard groups for their
+            ranks only, without a device communicator (RCCL and the all-reduce
+            buffers): for a process that needs the layout but never
+            communicates on the device, e.g. one that only loads weights.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2097,8 +2237,9 @@ def initialize_model_parallel(
 
     # When custom groups are provided, all communication goes through them
     # (standard ops assert via _assert_no_custom_group). Skip expensive
-    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
-    need_std_comm = custom_group_config is None
+    # CudaCommunicator allocation for standard TP/PP/DP/EP groups. So does a
+    # caller that asked for none.
+    need_std_comm = device_communicators and custom_group_config is None
 
     # When on, a group whose rank list matches an earlier one shares its
     # communicators instead of allocating duplicates.
@@ -2298,6 +2439,7 @@ def ensure_model_parallel_initialized(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    device_communicators: bool = True,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2313,6 +2455,7 @@ def ensure_model_parallel_initialized(
             data_parallel_size,
             prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
+            device_communicators=device_communicators,
         )
         return
 

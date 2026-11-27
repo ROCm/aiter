@@ -36,12 +36,14 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
 
 
 @gluon.constexpr_function
-def _store_blocked_layout(R, C):
+def _store_blocked_layout(R, C, num_warps=1):
     """Pick a wave32 blocked layout for an (R, C) shuffled store tile.
 
     Lanes are spread over the row dim first (one row per lane, contiguous
     ``C``-chunk per thread), matching the Triton-generated layouts:
       (64, 8) -> [1,8]/[32,1]   (8, 8) -> [1,2]/[8,4]
+    ``num_warps`` is the calling kernel's: its warps stack over the rows, and
+    a tile smaller than they cover is held (and stored) by each of them alike.
     """
     lanes_row = min(R, 32)
     lanes_col = 32 // lanes_row
@@ -49,7 +51,7 @@ def _store_blocked_layout(R, C):
     return gl.BlockedLayout(
         size_per_thread=[1, spt_col],
         threads_per_warp=[lanes_row, lanes_col],
-        warps_per_cta=[1, 1],
+        warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
 
@@ -129,6 +131,7 @@ def _store_mla_kv_cache(
     L_NOPE: gl.constexpr,
     L_PE: gl.constexpr,
     SEG_PAGE_SIZE: gl.constexpr = 0,
+    NUM_WARPS: gl.constexpr = 1,
 ):
     if SEG_PAGE_SIZE > 0:
         # Seg-packed pages of SEG_PAGE_SIZE tokens: all nope rows, then all
@@ -174,8 +177,8 @@ def _store_mla_kv_cache(
 
         R_nope: gl.constexpr = BLOCK_D_nope_STORE // K_WIDTH
         R_pe: gl.constexpr = BLOCK_D_pe_STORE // K_WIDTH
-        PARENT_NOPE: gl.constexpr = _store_blocked_layout(R_nope, K_WIDTH)
-        PARENT_PE: gl.constexpr = _store_blocked_layout(R_pe, K_WIDTH)
+        PARENT_NOPE: gl.constexpr = _store_blocked_layout(R_nope, K_WIDTH, NUM_WARPS)
+        PARENT_PE: gl.constexpr = _store_blocked_layout(R_pe, K_WIDTH, NUM_WARPS)
 
         d_nope_offs_shfl = gl.arange(0, R_nope, layout=gl.SliceLayout(1, PARENT_NOPE))
         d_pe_offs_shfl = gl.arange(0, R_pe, layout=gl.SliceLayout(1, PARENT_PE))
@@ -224,8 +227,12 @@ def _store_mla_kv_cache(
             BLOCK_D_pe_scales: gl.constexpr = BLOCK_D_pe // NVFP4_QUANT_BLOCK_SIZE
             R_ns: gl.constexpr = BLOCK_D_nope_scales // SCALE_K_WIDTH_NOPE
             R_ps: gl.constexpr = BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE
-            PARENT_NS: gl.constexpr = _store_blocked_layout(R_ns, SCALE_K_WIDTH_NOPE)
-            PARENT_PS: gl.constexpr = _store_blocked_layout(R_ps, SCALE_K_WIDTH_ROPE)
+            PARENT_NS: gl.constexpr = _store_blocked_layout(
+                R_ns, SCALE_K_WIDTH_NOPE, NUM_WARPS
+            )
+            PARENT_PS: gl.constexpr = _store_blocked_layout(
+                R_ps, SCALE_K_WIDTH_ROPE, NUM_WARPS
+            )
 
             d_nope_scales_shfl = gl.arange(0, R_ns, layout=gl.SliceLayout(1, PARENT_NS))
             d_pe_scales_shfl = gl.arange(0, R_ps, layout=gl.SliceLayout(1, PARENT_PS))

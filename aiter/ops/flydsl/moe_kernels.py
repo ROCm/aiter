@@ -2771,6 +2771,7 @@ def flydsl_moe_topids_to_rows(
     num_valid_routes: torch.Tensor | None = None,
     ep_rowmap: torch.Tensor | None = None,
     contiguous_expert_mask: bool = False,
+    row_to_token: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2792,11 +2793,17 @@ def flydsl_moe_topids_to_rows(
     When ``expert_mask`` is given (instead of ``g2l_lut``), the single-block fused
     kernel builds the LUT in LDS and zeros the counter itself -- collapsing the
     ``moe_g2l_lut`` + ``moe_route_g2l`` pair into one launch (no global LUT buffer).
+
+    ``row_to_token`` is an optional grouped-row -> token map to set to -1 before
+    the psum remap fills its kept rows; the LDS route kernel does it in place of a
+    separate fill launch.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     numel = token_num * topk
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    if row_to_token is not None and g2l_lut is None:
+        row_to_token.fill_(-1)
 
     # Dynamic EP token count (capture-safe): the dispatch buffer is padded to a
     # static token_num but only the first ``num_local_tokens`` (= total_recv) rows
@@ -2868,6 +2875,12 @@ def flydsl_moe_topids_to_rows(
             else torch.empty(0, dtype=torch.int32, device=device)
         )
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
+        _r2t_ptr = (
+            row_to_token.reshape(-1)
+            if row_to_token is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        _r2t_len = row_to_token.numel() if row_to_token is not None else 0
         # Only the LDS launcher takes the ep_rowmap (ptr, cap) tail and fuses its
         # (-1, 0) sentinel fill (fire-and-forget stores, no standalone .fill_()).
         # The plain fallback keeps the pre-ep_rowmap signature, so pass no tail and
@@ -2880,13 +2893,20 @@ def flydsl_moe_topids_to_rows(
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(
                 wdt, direct_mask=contiguous_expert_mask
             )
-            _ep_tail = (ptr_arg(_ep_rowmap_ptr), int(_ep_rowmap_cap))
+            _ep_tail = (
+                ptr_arg(_ep_rowmap_ptr),
+                int(_ep_rowmap_cap),
+                ptr_arg(_r2t_ptr),
+                int(_r2t_len),
+            )
         else:
             # The plain device-atomic kernel has no ep_rowmap operands; passing
             # them here would bind to stream.
             topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
             if ep_rowmap is not None:
                 ep_rowmap.reshape(-1).view(torch.int64).fill_(0xFFFFFFFF)
+            if row_to_token is not None:
+                row_to_token.fill_(-1)
             _ep_tail = ()
         route_args = [
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
@@ -3619,6 +3639,8 @@ def flydsl_moe_fused_quant_preshuffle(
     swiglu_limit: float = float("inf"),
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    # (n,) int32 zeroed by the A-preshuffle scatter (route counter reset).
+    clear_counter: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3648,6 +3670,22 @@ def flydsl_moe_fused_quant_preshuffle(
         )
     if payload_preshuffled and row_major_scale:
         raise ValueError("A-preshuffled payload requires M16K4 scales")
+    if clear_counter is not None and not (
+        payload_preshuffled
+        and topids_to_rows is not None
+        and row_to_token is not None
+        and row_starts is None
+        and ep_psum_params is None
+    ):
+        raise ValueError("clear_counter is only taken by the A-preshuffle scatter")
+    _clear_ptr = (
+        clear_counter.reshape(-1)
+        if clear_counter is not None
+        else torch.empty(0, dtype=torch.int32, device=grouped_in.device)
+    )
+    _clear_len = int(_clear_ptr.numel())
+    if _clear_len > 512:
+        raise ValueError("clear_counter longer than one scatter workgroup")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3893,6 +3931,8 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_num,
                 n_rows,
                 min(n_rows // 16, apre_workers),
+                ptr_arg(_clear_ptr),
+                _clear_len,
                 stream,
             )
             return out_payload, out_scale

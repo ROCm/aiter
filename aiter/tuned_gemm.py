@@ -29,6 +29,7 @@ from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.plugin import route as _route
 
 try:
     from aiter.ops.opus import opus_gemm as _opus_launch
@@ -132,13 +133,15 @@ def get_GEMM_A16W16_tuned_config(
     config = None
     if gfx is None:
         gfx = get_gfx_runtime()
+    runtime_gfx = gfx
     # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
     # off the normal (non-strict) runtime path entirely.
-    if base_gfx_arch(gfx) != gfx and gfx not in {
+    borrowed_rows = base_gfx_arch(gfx) != gfx and gfx not in {
         k[0] for k in cfg if isinstance(k, tuple) and k
-    }:
+    }
+    if borrowed_rows:
         gfx = base_gfx_arch(gfx)
     warned_invalid_opus = set()
     for gl in [None, 0, 1]:
@@ -187,7 +190,21 @@ def get_GEMM_A16W16_tuned_config(
                         "recognized by the current catalog; falling back to next candidate."
                     )
                     config = None
+                elif not _get_flydsl_gemm_kernels().flydsl_hgemm_policy_runs_on(
+                    flydsl_config["policy"], runtime_gfx
+                ):
+                    # e.g. a gfx1250-strict runtime borrowing a gfx1250 TDM row.
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config does not "
+                        f"run on {runtime_gfx}; falling back to next candidate."
+                    )
+                    config = None
             if config is None:
+                continue
+            # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250
+            # OPUS row cannot launch on gfx1250-strict; fall through to the default.
+            if borrowed_rows and config["libtype"] == "opus":
+                config = None
                 continue
             if config["libtype"] == "opus":
                 resolved = None
@@ -198,17 +215,19 @@ def get_GEMM_A16W16_tuned_config(
                         parse_integer,
                     )
 
+                    # OPUS dispatch resolves the kid under the device's exact
+                    # arch, not the gfx1250 row key a strict device reuses.
                     try:
                         kid = parse_integer(config["solidx"], name="saved kernel id")
                         instance = get_kernel_instance(
-                            gfx, "a16w16", kid, cu_num=cu_num
+                            runtime_gfx, "a16w16", kid, cu_num=cu_num
                         )
                         name = str(config.get("kernelName", ""))
                         if instance is not None and (
                             name in ("", "nan", "None") or name == instance.name
                         ):
                             resolved = resolve_a16w16_tuned_candidate(
-                                arch=gfx,
+                                arch=runtime_gfx,
                                 M=M,
                                 N=N,
                                 K=K,
@@ -235,7 +254,7 @@ def get_GEMM_A16W16_tuned_config(
                             "Ignoring invalid OPUS tuned row for gfx=%s, "
                             "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
                             "the next padded row or default backend",
-                            gfx,
+                            runtime_gfx,
                             padded_M,
                             N,
                             K,
@@ -413,9 +432,22 @@ def gemm_a16w16_out(
 ) -> None:
     """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
     for a caller whose consumer reads one fixed address."""
-    _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    result = _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    # The return value is dropped here, so a provider that answers in a tensor
+    # of its own would leave `out` unwritten; the native path asserts the same.
+    if result.data_ptr() != out.data_ptr():
+        raise RuntimeError("gemm_a16w16_out: the result was not written into out=")
 
 
+def _opus_reads_layout(operand: Tensor, k: int) -> bool:
+    """Whether the OPUS launcher accepts this 2D operand: K-contiguous rows
+    with an optional padded leading dimension. It raises on any other layout."""
+    return operand.stride(-1) == 1 and operand.stride(0) >= k
+
+
+# Routed here, beneath both guarded spellings and `tgemm.mm`, for the reason
+# `rmsnorm` is: every one of them arrives here, so this is where the op begins.
+@_route(op="gemm_a16w16", version=1)
 def _gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -426,6 +458,26 @@ def _gemm_a16w16(
     scale_c: Tensor | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Dense GEMM ``A @ B.T + bias`` in ``otype``, by the tuned backend.
+
+    Returns the ``[*A.shape[:-1], N]`` result. Without ``out`` it is a newly
+    allocated tensor and nothing is written through the arguments. With
+    ``out`` the result is written into ``out`` and ``out`` is returned, viewed
+    to that shape: a provider serving this contract must write it there, since
+    `gemm_a16w16_out` drops the return value and reads only the buffer.
+
+    Args:
+        A: ``[..., K]`` activations, bf16 or fp16 (fp8 with the scales below);
+            the leading dims are the ``M`` rows.
+        B: ``[N, K]`` weights. ``B.is_shuffled`` True says ``B`` holds the
+            preshuffled layout the asm kernels read, not row-major bytes.
+        bias: ``[N]``, added to every row, or None.
+        otype: output dtype; None is ``A``'s dtype.
+        scale_a, scale_b, scale_c: per-tensor scales of a scaled GEMM (``A``
+            and ``B`` dequant, output); all None for a plain 16-bit GEMM.
+        out: ``[M, N]`` buffer of ``otype``, or one shaped like the result;
+            None allocates the result.
+    """
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
         bpreshuffle = True
@@ -449,22 +501,40 @@ def _gemm_a16w16(
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
     from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
 
-    gfx, cu_num = _device_arch_and_cu(inp_view.device)
-    if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx = get_gfx_runtime()
-        cu_num = get_cu_num()
-    config = get_GEMM_A16W16_config(
-        M=m,
-        N=n,
-        K=k,
-        bias=use_bias,
-        dtype=str(inp_view.dtype),
-        otype=str(otype),
-        scaleAB=scale_a is not None or scale_b is not None,
-        bpreshuffle=bpreshuffle,
-        gfx=gfx,
-        cu_num=cu_num,
-    )
+    try:
+        gfx, cu_num = _device_arch_and_cu(inp_view.device)
+    except RuntimeError:
+        # The arch lookup rejects non-GPU tensors; those keep the Torch fallback.
+        if inp_view.is_cuda:
+            raise
+        config = {"libtype": "torch", "solidx": 0}
+    else:
+        if gfx not in SUPPORTED_OPUS_ARCHES:
+            gfx = get_gfx_runtime()
+            cu_num = get_cu_num()
+        config = get_GEMM_A16W16_config(
+            M=m,
+            N=n,
+            K=k,
+            bias=use_bias,
+            dtype=str(inp_view.dtype),
+            otype=str(otype),
+            scaleAB=scale_a is not None or scale_b is not None,
+            bpreshuffle=bpreshuffle,
+            gfx=gfx,
+            cu_num=cu_num,
+        )
+        if config["libtype"] == "opus" and not (
+            _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
+        ):
+            # Both backends read arbitrary strides, and an OPUS row implies no
+            # scales and no bpreshuffle, which is all Triton requires.
+            config = {
+                "libtype": (
+                    "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch"
+                ),
+                "solidx": 0,
+            }
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
@@ -644,7 +714,12 @@ def torch_gemm(
         # `out_dtype` writes the accumulator instead, which is what the tuned
         # ASM (`bf16gemm_fp32bf16_*`) and OPUS kernels do -- an untuned shape
         # must not disagree with them about what `otype` means.
-        result = torch.mm(inp, weights.t(), out_dtype=otype, out=out)
+        if inp.is_cuda:
+            result = torch.mm(inp, weights.t(), out_dtype=otype, out=out)
+        else:
+            # out_dtype is CUDA-only; CPU matmul needs FP32 operands to retain
+            # the accumulator precision requested by the caller.
+            result = torch.mm(inp.to(otype), weights.t().to(otype), out=out)
         return result if bias is None else result.add_(bias)
     if out is not None and out.dtype == inp.dtype:
         # F.linear's own form, bias added in the accumulator.
