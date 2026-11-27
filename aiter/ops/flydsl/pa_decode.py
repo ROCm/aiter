@@ -11,6 +11,7 @@ K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
 """
 
 import math
+from functools import partial
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -787,6 +788,94 @@ def _pa_decode_mxfp4(
         )
 
 
+# Launches of the gfx1250 tile kernel that writes the final output (direct or
+# cluster merge, no reducer, no fallback quant), as a checked call set them up.
+# `[_launch_options]` is a token for options and a plan that recorded a launch
+# and `[token, _launch_operands]` is the launch: a later call with both keys
+# launches on its own addresses, skipping the checks and the dispatch, and a
+# call whose options and plan recorded none builds no second key. The keys
+# hold what the checks and the dispatch read of a call: each scalar option and
+# plan field with its type, the shape, strides, dtype and device of each
+# operand and plan tensor, the partials' address modulo 8 and the current
+# device. Not keyed: the architecture, which a process has one of, the other
+# address bits and what the tensors hold. None until a checked call could
+# record a launch: no call builds a key before that, so none does on the other
+# architectures. Bounded: a full table is cleared.
+_VALIDATED_LAUNCHES: dict | None = None
+_VALIDATED_LAUNCHES_MAX = 1024
+
+
+def _tensor_signature(t):
+    if t is None:
+        return None
+    if type(t) is not torch.Tensor:
+        raise TypeError
+    return (t.shape, t.stride(), t.dtype, t.get_device())
+
+
+def _launch_options(work_plan, *scalars):
+    """First key of a call: its scalar options and its plan; no operand's
+    signature goes into it. TypeError for a plan that is not a PADecodePlan
+    of plain tensors."""
+    if type(work_plan) is not PADecodePlan:
+        raise TypeError
+    # The plan's fields, not its identity: a per-forward plan of the same shape
+    # (ATOM's sparse prefill builds one per forward) reuses the launch, which
+    # reads the plan's tensors and capacity at call time.
+    scalars += (
+        work_plan.num_kv_heads,
+        work_plan.max_partitions,
+        work_plan.sliding_window,
+        work_plan.query_length,
+        work_plan.max_batch_size,
+    )
+    return (
+        scalars,
+        # The checks tell True from 1 and 0.0 from 0, which compare equal.
+        tuple(map(type, scalars)),
+        # Its shape is the capacity, which with the operand shapes picks the
+        # cluster mode (cluster_seqs, cluster_steps, cluster_runs).
+        _tensor_signature(work_plan.work_info),
+        _tensor_signature(work_plan.reduce_info),
+        _tensor_signature(work_plan.arrival_counters),
+    )
+
+
+def _launch_operands(operands):
+    """Second key of a call: its operands, of which the partials, the output
+    and the query come first. None for operands that are never recorded."""
+    try:
+        partials, output, query = map(_tensor_signature, operands[:3])
+        if output[1] != query[1]:
+            return None  # Other strides: the reducer writes the output.
+        return (
+            partials,
+            output,
+            query,
+            *map(_tensor_signature, operands[3:]),
+            # The last-arriver merge requires 8-byte aligned partials.
+            operands[0].data_ptr() % 8,
+            torch.cuda.current_device(),
+        )
+    except (TypeError, RuntimeError):  # Not plain tensors with storage.
+        return None
+
+
+def _record_launch(options, operands, launch):
+    """Record the launch of a checked call for later calls with its keys."""
+    global _VALIDATED_LAUNCHES
+    if _VALIDATED_LAUNCHES is None:
+        # This call built no key; calls build one from now on.
+        _VALIDATED_LAUNCHES = {}
+    elif options is not None and (key := _launch_operands(operands)) is not None:
+        # Single dict operations only: calls that record at once may lose an
+        # entry to each other's clear, and nothing else.
+        if len(_VALIDATED_LAUNCHES) >= _VALIDATED_LAUNCHES_MAX:
+            _VALIDATED_LAUNCHES.clear()
+        token = _VALIDATED_LAUNCHES.setdefault(options, object())
+        _VALIDATED_LAUNCHES[token, key] = launch
+
+
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
@@ -963,6 +1052,61 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
+    options = operands = None
+    if (
+        _VALIDATED_LAUNCHES is not None
+        # Never recorded: sinks (the reducer applies them), partials that
+        # pa_decode allocates and operands it refuses.
+        and sinks is None
+        and exp_sums is not None
+        and max_logits is not None
+        and temporary_output is not None
+        and query_scale is None
+        and alibi_slopes is None
+    ):
+        operands = (
+            temporary_output,
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            max_logits,
+            exp_sums,
+            quantized_output,
+            output_scale,
+        )
+        try:
+            options = _launch_options(
+                work_plan,
+                softmax_scale,
+                query_length,
+                context_partition_size,
+                compute_type,
+                sliding_window,
+                max_context_length,
+                mask_unowned_kv,
+                store_output,
+                quantized_pad_rows,
+                # Whether the call has an FP8 output, and its kind of scales:
+                # the quant fallback and constant scales are never recorded,
+                # and so share no key with a call that is.
+                quantized_output is None,
+                type(key_scale),
+            )
+            token = _VALIDATED_LAUNCHES.get(options)
+        except (TypeError, RuntimeError):
+            # Not a PADecodePlan of plain tensors, or an unhashable option.
+            options = token = None
+        if token is not None:
+            launch = _VALIDATED_LAUNCHES.get((token, _launch_operands(operands)))
+            if launch is not None:
+                launch(torch.cuda.current_stream(), work_plan, *operands)
+                return
+
     mxfp4 = isinstance(key_cache, torch.Tensor) and key_cache.dtype in (
         torch.uint8,
         dtypes.fp4x2,
@@ -1749,59 +1893,22 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    merge_args = ()
-    if arch in ("gfx1250", "gfx1250-strict"):
-        merged = direct_output and not one_partition_output
-        merge_args = (
-            ptr_arg(output, torch_to_fx_dtype(output.dtype)),
-            ptr_arg(work_plan.reduce_info, fx.Int32),
-            (
-                ptr_arg(work_plan.arrival_counters, fx.Int32)
-                if merged
-                else flyc.from_c_void_p(fx.Int32, 0)
-            ),
-            run_tiles,
-            (
-                ptr_arg(quantized_output, torch_to_fx_dtype(quantized_output.dtype))
-                if quant_output
-                else flyc.from_c_void_p(fx.Float8E4M3FN, 0)
-            ),
-            (
-                ptr_arg(output_scale, fx.Float32)
-                if quant_output
-                else flyc.from_c_void_p(fx.Float32, 0)
-            ),
-            # Rows of the FP8 output, padded ones included.
-            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
-        )
-    with torch.cuda.device(dev):
-        s = torch.cuda.current_stream(dev)
-        _run_compiled(
-            compiled["launch"],
-            (
-                ptr_arg(work_plan.reduce_info, fx.Float32)
-                if one_partition_output
-                else ptr_arg(pmax, fx.Float32)
-            ),
-            ptr_arg(psum, fx.Float32),
-            ptr_arg(
-                output if one_partition_output else pout,
-                torch_to_fx_dtype(pout.dtype),
-            ),
-            ptr_arg(query, torch_to_fx_dtype(query.dtype)),
-            ptr_arg(key_cache, torch_to_fx_dtype(key_cache.dtype)),
-            ptr_arg(value_cache, torch_to_fx_dtype(value_cache.dtype)),
-            ptr_arg(block_tables, fx.Int32),
-            (
-                flyc.from_c_void_p(fx.Float32, 0)
-                if is_bf16_kv
-                else ptr_arg(key_scale_t, fx.Float32)
-            ),
-            (
-                flyc.from_c_void_p(fx.Float32, 0)
-                if is_bf16_kv
-                else ptr_arg(value_scale_t, fx.Float32)
-            ),
+    # What the checks and the dispatch fix of the launch, as `_tile_launch`
+    # unpacks it.
+    launch_spec = (
+        compiled["launch"],
+        arch in ("gfx1250", "gfx1250-strict"),
+        one_partition_output,
+        direct_output and not one_partition_output,  # merged
+        bool(cluster_merge),
+        quant_output,
+        is_bf16_kv,
+        # FlyDSL types: of the query, which the output and the partials share,
+        # of the caches and of the FP8 output.
+        torch_to_fx_dtype(query.dtype),
+        torch_to_fx_dtype(key_cache.dtype),
+        torch_to_fx_dtype(quantized_output.dtype) if quant_output else None,
+        (
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),
@@ -1810,14 +1917,42 @@ def pa_decode(
             int(query.stride(0)),
             int(query.stride(1)),
             *nhd_strides,
-            # Cluster grids derive their tiles from the context lengths.
-            ptr_arg(
-                (context_lengths if cluster_merge else work_plan.work_info),
-                fx.Int32,
-            ),
-            work_plan.capacity,
-            *merge_args,
+        ),
+        (
+            run_tiles,
+            # Rows of the FP8 output, padded ones included.
+            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
+        ),
+    )
+    if (
+        arch == "gfx1250"
+        and (direct_output or cluster_merge)
+        # Not recorded: the standalone-quant fallback and constant FP8 KV
+        # scales (None or host scalars), which are not operands.
+        and not quant_after_output
+        and (is_bf16_kv or isinstance(key_scale, torch.Tensor))
+        and dev.index == torch.cuda.current_device()
+    ):
+        _record_launch(options, operands, partial(_tile_launch, launch_spec))
+    with torch.cuda.device(dev):
+        s = torch.cuda.current_stream(dev)
+        _tile_launch(
+            launch_spec,
             s,
+            work_plan,
+            pout,
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale_t,
+            value_scale_t,
+            pmax,
+            psum,
+            quantized_output,
+            output_scale,
         )
         if not (direct_output or cluster_merge):
             output_5d = output.reshape(
@@ -1857,3 +1992,80 @@ def pa_decode(
             if quantized_pad_rows:
                 quantized_output[rows:].zero_()
                 output_scale[rows:].fill_(1.0)
+
+
+# Launch arguments that a specialization does not read.
+_NULL_I32 = flyc.from_c_void_p(fx.Int32, 0)
+_NULL_F32 = flyc.from_c_void_p(fx.Float32, 0)
+_NULL_FP8 = flyc.from_c_void_p(fx.Float8E4M3FN, 0)
+
+
+def _tile_launch(
+    spec,
+    stream,
+    work_plan,
+    pout,
+    output,
+    query,
+    key_cache,
+    value_cache,
+    block_tables,
+    context_lengths,
+    key_scale,
+    value_scale,
+    pmax,
+    psum,
+    quantized_output,
+    output_scale,
+):
+    """Launch the tile kernel that ``spec`` describes on these operands and
+    ``stream``. ``pa_decode`` records ``partial(_tile_launch, spec)``, so a
+    repeated gfx1250 call builds its launch arguments as the checked call
+    did."""
+    (
+        launch_fn,
+        gfx1250,
+        one_partition_output,
+        merged,
+        cluster_merge,
+        quant_output,
+        is_bf16_kv,
+        out_fx,
+        kv_fx,
+        quant_fx,
+        ints,
+        tail,
+    ) = spec
+    merge_args = ()
+    if gfx1250:
+        merge_args = (
+            ptr_arg(output, out_fx),
+            ptr_arg(work_plan.reduce_info, fx.Int32),
+            ptr_arg(work_plan.arrival_counters, fx.Int32) if merged else _NULL_I32,
+            tail[0],
+            ptr_arg(quantized_output, quant_fx) if quant_output else _NULL_FP8,
+            ptr_arg(output_scale, fx.Float32) if quant_output else _NULL_F32,
+            tail[1],
+        )
+    _run_compiled(
+        launch_fn,
+        (
+            ptr_arg(work_plan.reduce_info, fx.Float32)
+            if one_partition_output
+            else ptr_arg(pmax, fx.Float32)
+        ),
+        ptr_arg(psum, fx.Float32),
+        ptr_arg(output if one_partition_output else pout, out_fx),
+        ptr_arg(query, out_fx),
+        ptr_arg(key_cache, kv_fx),
+        ptr_arg(value_cache, kv_fx),
+        ptr_arg(block_tables, fx.Int32),
+        _NULL_F32 if is_bf16_kv else ptr_arg(key_scale, fx.Float32),
+        _NULL_F32 if is_bf16_kv else ptr_arg(value_scale, fx.Float32),
+        *ints,
+        # Cluster grids derive their tiles from the context lengths.
+        ptr_arg(context_lengths if cluster_merge else work_plan.work_info, fx.Int32),
+        work_plan.capacity,
+        *merge_args,
+        stream,
+    )
