@@ -28,8 +28,27 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 
 ### Triton / FlyDSL preshuffle candidates (gfx950)
 
-Add `--backends ck,asm,triton,flydsl -k` to the existing tuner command to compare
-all four backends. The default remains `ck,asm`. Winners use the same CSV schema;
+Add `--libtype ck,asm,triton,flydsl -k` (or `--libtype all -k`) to the existing tuner
+command to compare all four backends. `--libtype` picks which backends to enumerate,
+for example `--libtype asm` tunes only the ASM kernels and does not enumerate the CK
+candidates. `--backends` is kept as an alias of `--libtype` (comma-separated names, no
+`all`); the two cannot be combined. `cktile` is rejected: a4w4 has no CK Tile runtime
+dispatch (`gemm_a4w4` dispatches on the kernel name), so such rows could not be used.
+
+The default depends on how the tuner is started:
+
+- Run directly with neither `--libtype` nor `--backends`, it enumerates `ck,asm`
+  (unchanged).
+- Run by `aiter/utility/pretune.py`, it always gets `--libtype`, which defaults to
+  `all`. Pretune of this tuner therefore enumerates `ck,asm,triton,flydsl`. Before
+  `--libtype` existed this tuner rejected that invocation. `pretune --libtype ck`
+  selects CK only (no ASM), and `pretune --libtype cktile` is rejected by this tuner.
+
+Triton and FlyDSL add candidates only on gfx950 and only for M >= 32 with N % 16 == 0
+and K % 256 == 0, so `all` makes tuning longer. For (M, N, K) = (32, 1024, 4096) the
+FlyDSL catalog alone gives 246 candidates without split-K (1230 with `--splitK`) and
+Triton gives 5 (37 with `--splitK`), on top of the CK and ASM candidates. Pass
+`--libtype ck,asm` to the tuner to keep the smaller set. Winners use the same CSV schema;
 `triton_preshuffle_*` and `flydsl_mxpsh_*` kernel names encode their launch settings.
 Triton cache modifiers are explicit: `_cmcg` selects `.cg`, `_cmca` selects `.ca`,
 and `_cmnone` or no `_cm` suffix uses the Triton default (`None`).
