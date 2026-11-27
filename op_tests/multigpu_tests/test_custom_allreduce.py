@@ -684,12 +684,13 @@ def _allreduce_plain_cutoff(rank, tp_size, distributed_init_method):
         # above it; the fused paths keep should_custom_ar.
         sizes = [n for n in (cut - 16, cut, cut + 16) if n > 0]
         plain = [
-            ca_comm.should_custom_plain_ar(torch.empty(n, dtype=torch.uint8))
+            ca_comm.should_custom_plain_ar(torch.empty(n // 2, dtype=torch.bfloat16))
             for n in sizes
         ]
         assert plain == [n <= cut for n in sizes], (sizes, plain)
         fused = [
-            ca_comm.should_custom_ar(torch.empty(n, dtype=torch.uint8)) for n in sizes
+            ca_comm.should_custom_ar(torch.empty(n // 2, dtype=torch.bfloat16))
+            for n in sizes
         ]
         assert fused == [n <= ca_comm._car_max_size for n in sizes], (sizes, fused)
         # A rank that took the other path would leave its peers waiting.
