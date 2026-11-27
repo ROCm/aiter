@@ -70,13 +70,11 @@ def grouped_topk(
             f"n_expts_tot ({n_cols}) not divisible by num_expert_group "
             f"({num_expert_group}); pass an explicit expert_group table."
         )
-        g_size = n_cols // num_expert_group
-        expert_group = (
-            torch.arange(n_cols, device=dev, dtype=torch.int32) // g_size
-        ).to(torch.int32)
+        group_size = n_cols // num_expert_group
     else:
         assert expert_group.dim() == 1 and expert_group.shape[0] == n_cols
         assert expert_group.dtype == torch.int32
+        group_size = 0
 
     # Block sizes — single BLOCK_N pass for DeepSeek envelope. BLOCK_N must
     # cover the shared-expert columns too so their bits fit in the bitmatrix.
@@ -152,6 +150,7 @@ def grouped_topk(
         HAS_BIAS=has_bias,
         APPLY_RENORM=renorm,
         ROUTED_SCALING=routed_scaling_factor,
+        GROUP_SIZE=group_size,
         num_warps=4,
     )
 

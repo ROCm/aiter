@@ -508,6 +508,7 @@ _grouped_topk_repr = make_kernel_repr(
         "SCORE_MODE",
         "HAS_BIAS",
         "APPLY_RENORM",
+        "GROUP_SIZE",
     ],
 )
 
@@ -544,6 +545,7 @@ def _grouped_topk(
     HAS_BIAS: tl.constexpr = False,
     APPLY_RENORM: tl.constexpr = False,
     ROUTED_SCALING: tl.constexpr = 1.0,
+    GROUP_SIZE: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
 
@@ -607,7 +609,10 @@ def _grouped_topk(
         scores_for_choice = scores
 
     # -- 4. Per-group reduction over arbitrary expert→group mapping.
-    gid = tl.load(ExpertGroup + offs_n, mask=mask_n, other=0).to(tl.int32)
+    if GROUP_SIZE > 0:
+        gid = tl.where(mask_n, offs_n // GROUP_SIZE, 0).to(tl.int32)
+    else:
+        gid = tl.load(ExpertGroup + offs_n, mask=mask_n, other=0).to(tl.int32)
     g_arange = tl.arange(0, NUM_EXPERT_GROUP)
     gid_eq = gid[:, None] == g_arange[None, :]  # [BLOCK_N, NUM_EXPERT_GROUP]
 
