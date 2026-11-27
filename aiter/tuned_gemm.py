@@ -25,6 +25,7 @@ from torch import Tensor
 
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from aiter.jit.utils.asm_kernels import has_asm_kernels
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -84,6 +85,11 @@ def get_GEMM_A16W16_config_():
             ]
         ).to_dict("index")
     return gemm_dict
+
+
+def asm_a16w16_supported(gfx: str) -> bool:
+    """Whether ``gemm_a16w16_asm`` has a kernel table for ``gfx`` (``hsa/<gfx>/bf16gemm``)."""
+    return has_asm_kernels("bf16gemm", gfx)
 
 
 def is_skinny_default_shape(
@@ -162,6 +168,14 @@ def get_GEMM_A16W16_tuned_config(
             None,
         )
         if config is not None:
+            if config["libtype"] == "asm" and not asm_a16w16_supported(runtime_gfx):
+                # e.g. a user CSV row for an arch without ASM bf16 kernels.
+                logger.warning(
+                    f"ASM kernel '{config.get('kernelName')}' from tuned config has "
+                    f"no bf16gemm kernels on {runtime_gfx}; falling back to next candidate."
+                )
+                config = None
+                continue
             if config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
@@ -304,6 +318,15 @@ def get_GEMM_A16W16_config(
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1
                 default_config["kernelName"] = ""
+            elif not asm_a16w16_supported(gfx):
+                # ASM is the only backend left that reads a preshuffled B: FlyDSL
+                # reads it on gfx950 alone (see `flydsl_hgemm`), which has ASM.
+                raise RuntimeError(
+                    f"gemm_a16w16 with a preshuffled B (bpreshuffle=True) has no "
+                    f"backend on {gfx}: it has no ASM bf16gemm kernels and FlyDSL "
+                    f"reads a preshuffled B on gfx950 only. Use an unshuffled B "
+                    f"({M=} {N=} {K=} {dtype=})."
+                )
             elif (
                 eval(dtype) == dtypes.bf16
                 and N % 64 == 0
@@ -745,6 +768,12 @@ def asm_gemm(
     config: dict | None = None,
     out: Tensor | None = None,
 ):
+    gfx = get_gfx_runtime()
+    if not asm_a16w16_supported(gfx):
+        raise RuntimeError(
+            f"gemm_a16w16_asm has no bf16gemm kernels on {gfx}; "
+            "choose another backend (e.g. triton, torch)."
+        )
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
     result = _result_buffer(out, inp.shape[0], weights.shape[0], otype, inp.device)
