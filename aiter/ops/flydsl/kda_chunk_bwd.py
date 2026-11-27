@@ -419,8 +419,10 @@ def chunk_kda_bwd_flydsl_full(
     dhu_bv = dhu_bv or cfg.get("dhu_bv") or DEFAULT_DHU_BV
     fwd_h_bv = fwd_h_bv or cfg.get("fwd_h_bv")
     chunk_delta_attn_fwd_prepare = _fwd_prepare_fn(prepare, cfg.get("prepare"))
-    # Varlen tokens past cu_seqlens[-1] are never written: zero those outputs.
-    alloc = torch.zeros if varlen else torch.empty
+    # No zero fill: every stage writes all valid rows of its chunks and reads
+    # them under the chunk's valid-row mask, and varlen calls cover every token
+    # (fwd_h's prologue requires cu_seqlens[-1] == T), so no row stays unwritten.
+    alloc = torch.empty
 
     timer = _Timer()
     if fwd_intermediates is not None:
