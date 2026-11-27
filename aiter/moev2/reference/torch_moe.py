@@ -315,6 +315,9 @@ def torch_moe_stage2(
     a2_scale=None,  # [expert]]'
     w2_bias=None,
     doweight=True,
+    post_gemm2_rms_weight=None,
+    post_gemm2_rms_eps=1e-6,
+    post_gemm2_rms_zero_centered=False,
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -423,6 +426,15 @@ def torch_moe_stage2(
             out[mask] = act_input
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
+    if post_gemm2_rms_weight is not None:
+        rms_weight = post_gemm2_rms_weight.view(1, 1, model_dim).to(ctype)
+        if post_gemm2_rms_zero_centered:
+            rms_weight = rms_weight + 1.0
+        # The scaled input is rounded to bf16 once before the RMS.
+        out = (out * rms_weight).to(dtypes.bf16).to(ctype)
+        out = out * torch.rsqrt(
+            out.square().mean(dim=-1, keepdim=True) + float(post_gemm2_rms_eps)
+        )
     if doweight:
         # In-place: out and topk_weights are both fp32 (ctype), so this is
         # numerically identical to `out = out * ...` but avoids allocating a

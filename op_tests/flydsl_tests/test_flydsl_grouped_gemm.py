@@ -150,6 +150,9 @@ def _torch_moe_ref(
     swiglu_limit: float,
     situ_beta: float,
     situ_linear_beta: float,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
     if data_format not in ("a4w4", "a8w4"):
@@ -231,6 +234,9 @@ def _torch_moe_ref(
         a2_scale=a2_scale,
         w2_bias=w2_bias,
         doweight=True,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
     )
     return out
 
@@ -385,6 +391,9 @@ def _run_grouped_via_fused_moe(
     iters: int = 101,
     data_init: str = "uniform",
     scale_init: str = "auto",
+    post_gemm2_rmsnorm: bool = False,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     num_valid_tokens: int | None = None,
     shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
@@ -483,6 +492,11 @@ def _run_grouped_via_fused_moe(
         topk_id[real:] = -1
         topk_w[real:] = 0
         num_local_tokens = torch.tensor([real], dtype=torch.int32)
+    # zero-centred vs normal weight
+    post_gemm2_rms_weight = None
+    if post_gemm2_rmsnorm:
+        lo, hi = (-0.5, 0.5) if post_gemm2_rms_zero_centered else (0.5, 1.5)
+        post_gemm2_rms_weight = torch.linspace(lo, hi, model_dim, dtype=torch.bfloat16)
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
@@ -536,6 +550,9 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
             beta=situ_beta,
             linear_beta=situ_linear_beta,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
             num_local_tokens=num_local_tokens,
         )
 
@@ -595,6 +612,9 @@ def _run_grouped_via_fused_moe(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
     ).to(out.dtype)
     return out, ref, us, kernel_us
 
@@ -774,6 +794,9 @@ def run_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
     check_aot_cache: bool = True,
+    post_gemm2_rmsnorm: bool = False,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     shared_experts: int = 0,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
@@ -817,6 +840,9 @@ def run_moe(
             iters=iters,
             data_init=data_init,
             scale_init=scale_init,
+            post_gemm2_rmsnorm=post_gemm2_rmsnorm,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -924,6 +950,16 @@ def test_grouped_a4w4_silu_matches_torch_ref():
         activation=ActivationType.Silu,
         model_dim=512,
         inter_dim=512,
+    )
+
+
+def test_grouped_a4w4_post_gemm2_rmsnorm_matches_torch_ref():
+    run_moe(
+        "a4w4",
+        activation=ActivationType.Silu,
+        model_dim=512,
+        inter_dim=512,
+        post_gemm2_rmsnorm=True,
     )
 
 
@@ -1720,6 +1756,15 @@ def main() -> None:
         "load the AOT-precompiled artifact and never JIT-compile, so a cache "
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
+    parser.add_argument(
+        "--post-gemm2-rmsnorm",
+        choices=("none", "normal", "zero_centered"),
+        default="none",
+        help="post-GEMM2 RMSNorm rms(bf16(x * w)) on each route, with no gain "
+        "after: normal weight, or zero-centred weight (applies w + 1). "
+        "Default: none",
+    )
+    parser.add_argument("--post-gemm2-rms-eps", type=float, default=1e-6)
     args = parser.parse_args()
     if args.balanced_routing:
         AITER_MOE_EXPERT_BALANCE = True
@@ -1797,6 +1842,9 @@ def main() -> None:
                 seed=args.seed,
                 data_init=data_init,
                 scale_init=scale_init,
+                post_gemm2_rmsnorm=args.post_gemm2_rmsnorm != "none",
+                post_gemm2_rms_eps=args.post_gemm2_rms_eps,
+                post_gemm2_rms_zero_centered=args.post_gemm2_rmsnorm == "zero_centered",
             )
             rows.append(
                 {

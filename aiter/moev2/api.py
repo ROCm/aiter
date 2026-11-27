@@ -189,6 +189,9 @@ def op_call(call) -> dict | None:
         "deterministic": call["deterministic"],
         "w1_global_scale": call["w1_global_scale"],
         "w2_global_scale": call["w2_global_scale"],
+        "post_gemm2_rms_weight": call["post_gemm2_rms_weight"],
+        "post_gemm2_rms_eps": call["post_gemm2_rms_eps"],
+        "post_gemm2_rms_zero_centered": call["post_gemm2_rms_zero_centered"],
     }
 
 
@@ -236,6 +239,9 @@ def fused_moe(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
     call = dict(locals())

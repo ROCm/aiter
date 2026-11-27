@@ -463,6 +463,13 @@ def _replay(job: dict) -> None:
         linear_beta=job["linear_beta"],
         quant_dtype_a=_dtype(job["q_dtype_a"]),
     )
+    if _is_grouped(job):
+        # Replay above skips the post-GEMM2 RMSNorm
+        from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import (
+            preload_rmsnorm_gfx1250,
+        )
+
+        preload_rmsnorm_gfx1250(_int(job["model_dim"]), row_map=True)
 
 
 @contextmanager

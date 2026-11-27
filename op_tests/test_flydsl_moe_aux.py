@@ -26,6 +26,7 @@ capture-time allocation, stable pointers) is a correctness property.
 import argparse
 import itertools
 
+import flydsl.expr as fx
 import pandas as pd
 import torch
 
@@ -59,6 +60,7 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
 from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
+from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -726,6 +728,190 @@ def test_gather_reduce(
 
 
 @benchmark()
+def test_mega_combine_post_rmsnorm(tokens, model_dim, topk, zero_centered=False):
+    """Post-GEMM2 RMSNorm followed by MegaMoE's weighted slot reduction."""
+    # Deferred because these gfx1250 modules import MORI
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.combine import (
+        CHUNK_ELEMS,
+        _make_combine_fused_reduce,
+    )
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.config import _WAVE_SIZE
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.combine_fused import (
+        _combine_tile,
+    )
+
+    eps = 1e-6
+    # MegaMoE's peer-addressable combine arena gives each BF16 route row a
+    # power-of-two pitch. Keep that padding here so the RMSNorm benchmark covers
+    # the strided input used by the real pipeline.
+    slot_stride = 1 << (model_dim - 1).bit_length()
+    slot_storage = torch.randn(tokens * topk, slot_stride, dtype=torch.bfloat16) * 0.5
+    slots = slot_storage[:, :model_dim].view(tokens, topk, model_dim)
+    route_weights = torch.rand(tokens, topk, dtype=torch.float32)
+    route_weights /= route_weights.sum(dim=1, keepdim=True)
+    center = 1.0 if zero_centered else 0.0
+    rms_weight = torch.linspace(
+        0.5 - center, 1.5 - center, model_dim, dtype=torch.bfloat16
+    )
+    # changed to bf16 to match torch reference
+    scaled = (slots.float() * (rms_weight.float() + center)).bfloat16().float()
+    ref_slots = scaled * torch.rsqrt(scaled.square().mean(dim=-1, keepdim=True) + eps)
+    ref = (ref_slots * route_weights[..., None]).sum(dim=1).to(torch.bfloat16)
+
+    normalized = torch.empty_like(slots).view(tokens * topk, model_dim)
+    out = torch.empty((tokens, model_dim), dtype=torch.bfloat16)
+    toks_per_block, chunks_per_iter = _combine_tile(
+        topk=topk,
+        hidden_dim=model_dim,
+        quant_bits=0,
+    )
+    lanes = toks_per_block * chunks_per_iter * CHUNK_ELEMS // 16
+    combine = _make_combine_fused_reduce(
+        experts_per_token=topk,
+        hidden_dim=model_dim,
+        block_num=512,
+        warp_num_per_block=lanes // _WAVE_SIZE,
+        slot_stride_nbytes=model_dim * 2,
+        quant_bits=0,
+        tokens_per_block=toks_per_block,
+        chunks_per_iter=chunks_per_iter,
+        apply_route_weight=True,
+    )
+
+    def fn():
+        rmsnorm_flydsl_out(
+            normalized,
+            slots.view(tokens * topk, model_dim),
+            rms_weight,
+            eps,
+            zero_centered=zero_centered,
+        )
+        combine(
+            normalized.data_ptr(),
+            out.data_ptr(),
+            route_weights.data_ptr(),
+            tokens,
+            0,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+        return out
+
+    nbytes = (
+        slots.nbytes
+        + normalized.nbytes * 2
+        + route_weights.nbytes
+        + rms_weight.nbytes
+        + out.nbytes
+    )
+    ret = {"gfx": get_gfx()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        out.fill_(-99.0)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            ref.float(),
+            out.float(),
+            rtol=3e-2,
+            atol=3e-2,
+            msg=f"{name}: MegaMoE post-GEMM2 RMSNorm combine",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_rmsnorm_routed_rows(tokens, model_dim, topk, zero_centered):
+    """In-place post-GEMM2 RMSNorm on only the rows listed in the route map.
+
+    These rows must come out unchanged:
+    - padding rows;
+    - the row of the route marked -1 (dropped);
+    - rows belonging to tokens past num_valid_tokens (the unused tail on
+      the expert-parallel path).
+    """
+    eps = 1e-6
+    routes = tokens * topk
+    rows_total = 2 * routes + 64
+    grouped = (torch.randn(rows_total, model_dim) * 0.5).to(torch.bfloat16)
+    rmap = (  # topids_to_rows
+        torch.randperm(rows_total, device="cpu")[:routes]
+        .to(device=grouped.device, dtype=I32)
+        .view(tokens, topk)
+        .contiguous()
+    )
+    rmap[0, -1] = -1  # dropped route row
+    center = 1.0 if zero_centered else 0.0
+    rms_weight = torch.linspace(
+        0.5 - center, 1.5 - center, model_dim, dtype=torch.bfloat16
+    )
+
+    def check(valid_tokens):
+        work = grouped.clone()
+        rmsnorm_flydsl_out(
+            work,
+            work,
+            rms_weight,
+            eps,
+            zero_centered=zero_centered,
+            row_map=rmap,
+            num_valid_tokens=(
+                None
+                if valid_tokens == tokens
+                else torch.tensor([valid_tokens], dtype=I32)
+            ),
+        )
+        torch.cuda.synchronize()
+
+        routed = rmap[:valid_tokens].reshape(-1)
+        routed = routed[routed >= 0].long()
+        scaled = (grouped[routed].float() * (rms_weight.float() + center)).bfloat16()
+        scaled = scaled.float()
+        ref = scaled * torch.rsqrt(scaled.square().mean(dim=-1, keepdim=True) + eps)
+        err = checkAllclose(
+            ref,
+            work[routed].float(),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"routed-row RMSNorm (valid_tokens={valid_tokens})",
+        )
+        work[routed] = grouped[routed]  # restore the normalized rows
+        changed = (work != grouped).any(dim=-1).nonzero().flatten()
+        if changed.numel():
+            raise AssertionError(
+                f"norm changed {changed.numel()} row(s) it should have skipped "
+                f"(padding or tokens past num_valid_tokens={valid_tokens}): "
+                f"{changed[:8].tolist()}"
+            )
+        return err
+
+    ret = {"gfx": get_gfx()}
+    ret["err"] = check(tokens)
+    ret["dead-tail err"] = check(max(1, tokens - 2))
+
+    # grouped keeps the original data
+    grouped_copy = grouped.clone()
+
+    def fn():
+        rmsnorm_flydsl_out(
+            grouped_copy,
+            grouped_copy,
+            rms_weight,
+            eps,
+            zero_centered=zero_centered,
+            row_map=rmap,
+        )
+
+    nbytes = routes * model_dim * 2 * 2 + rmap.nbytes + rms_weight.nbytes
+    for name, run in {"eager": fn, "cudagraph": _graph_runner(fn)}.items():
+        _, us = run_perftest(run)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+    return ret
+
+
+@benchmark()
 def test_topids_to_rows(numel, E, max_m):
     """Atomic-scatter argsort. Intra-bucket order is unspecified by design, so the
     check is on the invariants (counts, own-expert band, bijection), not values."""
@@ -1260,6 +1446,31 @@ def main():
             )
         ],
     )
+    if get_gfx() == "gfx1250":
+        # (tokens, model_dim, topk), for rmsnorm
+        summarize(
+            "post-GEMM2 RMSNorm routed rows",
+            [
+                test_rmsnorm_routed_rows(t, d, k, z)
+                for (t, d, k), z in itertools.product(
+                    [(8, 512, 2), (24, 1024, 4), (64, 4096, 8)], [False, True]
+                )
+            ],
+        )
+        summarize(
+            "MegaMoE post-GEMM2 RMSNorm combine",
+            [
+                test_mega_combine_post_rmsnorm(t, d, k, z)  # z = zero-centred flag
+                for (t, d, k), z in itertools.product(
+                    [(8, 512, 2), (24, 1024, 4), (64, 4096, 8)], [False, True]
+                )
+            ],
+        )
+    else:
+        aiter.logger.warning(
+            "post-GEMM2 RMSNorm tests require gfx1250; skipping on %s",
+            get_gfx(),
+        )
     summarize(
         "moe_psum_remap_ep",
         [

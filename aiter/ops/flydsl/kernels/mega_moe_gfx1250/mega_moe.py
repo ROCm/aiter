@@ -124,6 +124,8 @@ class MegaMoEGfx1250:
         stage2_fused: bool = True,
         combine_quant: str | None = None,
         dispatch_backend: str | None = None,
+        post_gemm2_rmsnorm: bool = False,
+        post_gemm2_rms_zero_centered: bool = False,
     ):
         """Deprecated: build a ``MegaMoERecipe`` and a ``MegaMoEGeometry`` and use
         ``from_recipe``. This turns the flags into a recipe the same way
@@ -156,6 +158,8 @@ class MegaMoEGfx1250:
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             swiglu_limit=swiglu_limit,
+            post_gemm2_rmsnorm=post_gemm2_rmsnorm,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
         )
         self._build(recipe, geometry, communicator, situ_beta, situ_linear_beta)
 
@@ -317,6 +321,8 @@ class MegaMoEGfx1250:
         recv_counter_is_zero: bool = False,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        post_gemm2_rms_weight: torch.Tensor | None = None,
+        post_gemm2_rms_eps: float = 1e-6,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
 
@@ -350,6 +356,9 @@ class MegaMoEGfx1250:
         needs no separate add. ``shared_ready``, when given, is waited on by
         the current stream just before the combine: its producer may run on a
         side stream beside the dispatch and the expert GEMMs.
+
+        ``post_gemm2_rms_weight`` is this layer's post-GEMM2 RMSNorm weight.
+        It is required when the recipe enables ``post_expert_norm``.
         """
         if combine_wire is not None:
             if combine_quant is not None:
@@ -364,6 +373,7 @@ class MegaMoEGfx1250:
         self._check_inputs(
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
+        self._check_post_norm(hidden_states, post_gemm2_rms_weight, post_gemm2_rms_eps)
         ep = self._ep
         step_kw = {}
         s1f = False
@@ -409,12 +419,25 @@ class MegaMoEGfx1250:
             bias2=bias2,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
         )
         if isinstance(disp, _CompactDispatch):
             disp.fusion.finish(s1f)
         if shared_ready is not None:
             torch.cuda.current_stream().wait_event(shared_ready)
-        return ep.combine(batch.routing, quant_bits, expert_out, shared_add=shared_add)
+        post_norm = (
+            None
+            if post_gemm2_rms_weight is None
+            else (post_gemm2_rms_weight, post_gemm2_rms_eps, topk_weights)
+        )
+        return ep.combine(
+            batch.routing,
+            quant_bits,
+            expert_out,
+            shared_add=shared_add,
+            post_norm=post_norm,
+        )
 
     __call__ = forward
 
@@ -496,6 +519,30 @@ class MegaMoEGfx1250:
                 "caller-supplied one would be silently discarded"
             )
 
+    def _check_post_norm(self, hidden_states, weight, eps) -> None:
+        if not self.recipe.post_expert_norm:
+            if weight is not None:
+                raise ValueError(
+                    "post_gemm2_rms_weight needs a recipe with post_expert_norm"
+                )
+            return
+        if weight is None:
+            raise ValueError(
+                "post_gemm2_rms_weight is required: the recipe enables "
+                "post_expert_norm"
+            )
+        if weight.ndim != 1 or weight.numel() != self.model_dim:
+            raise ValueError(
+                f"post_gemm2_rms_weight must have shape ({self.model_dim},), "
+                f"got {tuple(weight.shape)}"
+            )
+        if weight.dtype != torch.bfloat16 or not weight.is_contiguous():
+            raise ValueError("post_gemm2_rms_weight must be contiguous bfloat16")
+        if weight.device != hidden_states.device:
+            raise ValueError("post_gemm2_rms_weight must be on the input device")
+        if eps <= 0:
+            raise ValueError("post_gemm2_rms_eps must be positive")
+
     def _compute(
         self,
         batch: _DispatchBatch,
@@ -509,6 +556,8 @@ class MegaMoEGfx1250:
         bias2,
         a1_scale,
         a2_scale,
+        post_gemm2_rms_weight=None,
+        post_gemm2_rms_eps=1e-6,
     ) -> torch.Tensor:
         """The expert GEMM over one dispatched batch, leaving its rows where
         ``target`` says. Knows nothing of the transport beyond those two."""
@@ -552,6 +601,8 @@ class MegaMoEGfx1250:
                 swiglu_limit=compute.swiglu_limit,
                 stage2_scatter=target.scatter,
                 output=target.output,
+                post_gemm2_rms_weight=post_gemm2_rms_weight,
+                post_gemm2_rms_eps=post_gemm2_rms_eps,
                 **extra,
             )
         finally:

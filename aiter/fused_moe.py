@@ -667,6 +667,9 @@ def fused_moe(
     # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -697,6 +700,13 @@ def fused_moe(
     gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
     ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
     the ``shuffle_scale_nvfp4_moe`` layout.
+    ``post_gemm2_rms_weight`` enables GEMM2 -> per-route RMSNorm ->
+    route-weighted reduction on the gfx1250 grouped and MegaMoE paths (bf16
+    output only). The norm is input-scaled, ``rms(bf16(x * w))`` with no gain
+    after, and only routed rows are normalized.
+    ``post_gemm2_rms_zero_centered`` treats the weight as zero-centred, so
+    ``w + 1`` is applied.
+
     """
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
@@ -731,6 +741,8 @@ def fused_moe(
             )
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
+        if post_gemm2_rms_weight is not None:
+            unsupported.append("post_gemm2_rms_weight")
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
         if quant_type_a is not None:
@@ -803,6 +815,14 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+    # GEMM2 and the combine must agree on who applies the route weights.
+    if enable_ep_scatter and (post_gemm2_rms_weight is not None) != bool(
+        stage2_scatter.post_norm_combine
+    ):
+        raise ValueError(
+            "pass post_gemm2_rms_weight only when the stage2_scatter combine "
+            "applies the post-GEMM2 RMSNorm"
+        )
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -849,6 +869,9 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
         deterministic=deterministic,
@@ -902,6 +925,9 @@ def fused_moe_fake(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -910,7 +936,7 @@ def fused_moe_fake(
     if ep_source_token_map is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
-            "route-weighted results into the peers' combine buffers and returns an "
+            "route results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
     # Unconditional: the runtime returns `output` on every path, and which kernel
@@ -1071,8 +1097,10 @@ def _can_use_bf16_g1u1_small_m_direct(
 # `w2_global_scale`, which turn fp4x2 weights from MXFP4 into NVFP4. A v1
 # provider built for 40 arguments cannot bind 42, and a forwarder that binds
 # them would serve an NVFP4 call as MXFP4, so v1 is not superseded.
+# Version 3: adds the post_gemm2_rms_* arguments; a v2 provider would skip
+# the post-GEMM2 RMSNorm, so v2 is not superseded either.
 @torch_compile_guard(gen_fake=fused_moe_fake)
-@_route(op="fused_moe", version=2)
+@_route(op="fused_moe", version=3)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1118,6 +1146,9 @@ def fused_moe_(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     """Route each token to its top-k experts, run both expert projections and
     combine them, weighted by ``topk_weight``.
@@ -1233,6 +1264,9 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
         deterministic=deterministic,
@@ -1278,6 +1312,9 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
@@ -1377,10 +1414,41 @@ def _fused_moe_impl(
         dtypes.fp16,
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
+    if post_gemm2_rms_weight is not None:
+        # route weights cannot be applied in stage1 or during scatter before normalization
+        # if enabled
+        if doweight_stage1:
+            raise ValueError(
+                "post-GEMM2 RMSNorm requires doweight_stage1=False so route "
+                "weights remain after the normalization"
+            )
+        if post_gemm2_rms_eps <= 0:
+            raise ValueError("post_gemm2_rms_eps must be positive")
+        if (
+            post_gemm2_rms_weight.ndim != 1
+            or post_gemm2_rms_weight.numel() != model_dim
+        ):
+            raise ValueError(
+                "post_gemm2_rms_weight must have shape "
+                f"({model_dim},), got {tuple(post_gemm2_rms_weight.shape)}"
+            )
+        if dtype != dtypes.bf16:
+            raise TypeError(
+                f"post-GEMM2 RMSNorm supports only bfloat16 output, got {dtype}"
+            )
+        if post_gemm2_rms_weight.dtype != dtype:
+            raise TypeError(
+                "post_gemm2_rms_weight must match the MoE output dtype "
+                f"{dtype}, got {post_gemm2_rms_weight.dtype}"
+            )
+        if post_gemm2_rms_weight.device != hidden_states.device:
+            raise ValueError("post_gemm2_rms_weight must be on the input device")
+        if not post_gemm2_rms_weight.is_contiguous():
+            raise ValueError("post_gemm2_rms_weight must be contiguous")
     if stage2_scatter is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
-            "route-weighted results into the peers' combine buffers and returns an "
+            "route results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
     _validate_output_buffer_metadata(
@@ -1504,6 +1572,9 @@ def _fused_moe_impl(
                 default_situ_linear_beta if linear_beta is None else float(linear_beta)
             ),
             stage2_scatter=stage2_scatter,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
@@ -1511,6 +1582,11 @@ def _fused_moe_impl(
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if post_gemm2_rms_weight is not None:
+        raise NotImplementedError(
+            "post-GEMM2 RMSNorm is currently drafted only for the gfx1250 "
+            "grouped FlyDSL MoE path"
+        )
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "

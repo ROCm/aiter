@@ -826,6 +826,9 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
     output=None,
@@ -1201,6 +1204,7 @@ def _grouped_a8w4_tdm_moe(
                 int(stage2_scatter.max_tokens_per_rank) * int(topk)
             ),
             "ep_row_map": ep_rowmap,
+            "post_gemm2_rmsnorm": post_gemm2_rms_weight is not None,
         }
         if enable_ep_scatter
         else {}
@@ -1755,10 +1759,29 @@ def _grouped_a8w4_tdm_moe(
         )
 
     if enable_ep_scatter:
-        # GEMM2 already P2P-wrote every route-weighted result into the peers'
-        # combine buffers, so this only satisfies the custom-op's return contract;
+        # GEMM2 already P2P-wrote every route result into the peers' combine
+        # buffers, so this only satisfies the custom-op's return contract;
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
+
+    if post_gemm2_rms_weight is not None:
+        from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
+
+        if topids_to_rows is None:
+            raise NotImplementedError(
+                "post-GEMM2 RMSNorm needs the route -> row map on this path"
+            )
+
+        grouped_rows = grouped_out.view(-1, model_dim)
+        rmsnorm_flydsl_out(
+            grouped_rows,  # norm in place
+            grouped_rows,
+            post_gemm2_rms_weight,
+            float(post_gemm2_rms_eps),
+            zero_centered=post_gemm2_rms_zero_centered,
+            row_map=topids_to_rows,
+            num_valid_tokens=_ep_nvt if _is_ep else None,
+        )
 
     moe_out = (
         torch.empty((token_num, model_dim), dtype=dtype, device=device)
@@ -1839,6 +1862,9 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
@@ -2209,6 +2235,9 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,

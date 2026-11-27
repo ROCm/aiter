@@ -98,10 +98,24 @@ class _EpDispatcher:
         return self._combine.prepare(batch, quant_bits)
 
     def combine(
-        self, routing: Routing, quant_bits: int, expert_out=None, shared_add=None
+        self,
+        routing: Routing,
+        quant_bits: int,
+        expert_out=None,
+        shared_add=None,
+        post_norm=None,
     ):
         """``shared_add``: bf16 rows added to the combined output. The fused
-        combine adds them inside its reduce; any other stage adds them after."""
+        combine adds them inside its reduce; any other stage adds them after.
+        ``post_norm``: ``(weight, eps, topk_weights)`` for the fused combine."""
+        if post_norm is not None:
+            return self._combine.finish(
+                routing,
+                quant_bits,
+                expert_out,
+                shared_add=shared_add,
+                post_norm=post_norm,
+            )
         if shared_add is None:
             return self._combine.finish(routing, quant_bits, expert_out)
         if getattr(self._combine, "adds_shared", False):

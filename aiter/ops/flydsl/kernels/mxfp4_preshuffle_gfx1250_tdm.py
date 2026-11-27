@@ -225,6 +225,7 @@ def build_gemm_a8w4_tdm_task(
     ep_destination_stride,
     ep_world_size,
     ep_quant_bits,
+    post_gemm2_rmsnorm=0,
     row_major_ascale,
     a_row_stride_bytes,
     a_scale_row_stride_bytes,
@@ -453,6 +454,11 @@ def build_gemm_a8w4_tdm_task(
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
+        if post_gemm2_rmsnorm:
+            raise ValueError(
+                "deferred route weighting is initially supported only on the "
+                "unquantized BF16 combine"
+            )
         # A tile row must be whole wire chunks, and a warp's columns must sit in
         # one chunk for the staging offsets. The tuning table only emits tile_n2
         # in {256, 512}, but env overrides (*_N2) bypass it.
@@ -653,6 +659,7 @@ def build_gemm_a8w4_tdm_task(
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    _epq += "_rmsdefer" if post_gemm2_rmsnorm else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
@@ -2583,7 +2590,11 @@ def build_gemm_a8w4_tdm_task(
                     _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
-                        _wf = _wf_rows[wm]
+                        _wf = (
+                            fx.Float32(1.0)  # scattered output is unweighted
+                            if post_gemm2_rmsnorm
+                            else _wf_rows[wm]
+                        )
                         # Past the scale lines of the chunks before this warp's.
                         _row_byte = (
                             row_rel * _lds_row_bytes
@@ -2596,8 +2607,10 @@ def build_gemm_a8w4_tdm_task(
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
                                 acc = _biased_acc(wm, wn, col_rel)
-                                # Weight before quantizing: combine sums
-                                # unweighted. It cannot ride the cvt scale
+                                # Normally weight before quantizing because combine
+                                # sums are unweighted. The post-GEMM2 RMSNorm variant
+                                # defers this multiply to its combine.
+                                # The weight cannot ride the cvt scale
                                 # operand instead -- v_cvt_scalef32 takes only
                                 # the exponent of that f32, so a weight that is
                                 # not a power of two would be rounded to one.
@@ -2711,9 +2724,15 @@ def build_gemm_a8w4_tdm_task(
                                 )
                             else:
                                 if const_expr(enable_ep_scatter):
-                                    # Weight the row BEFORE truncating to bf16; the
-                                    # combine kernel does an unweighted sum.
-                                    _wf = _wf_rows[wm]
+                                    # Normally weight before truncating to bf16.
+                                    # Post-GEMM2 RMSNorm instead scatters the
+                                    # unweighted row and applies the weight after
+                                    # normalization in combine.
+                                    _wf = (
+                                        fx.Float32(1.0)
+                                        if post_gemm2_rmsnorm
+                                        else _wf_rows[wm]
+                                    )
                                     hv = Vec.from_elements(
                                         [acc[i] * _wf for i in range_constexpr(8)],
                                         fx.Float32,
@@ -2990,6 +3009,7 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
     k_waves: Constexpr[int] = 1,
+    post_gemm2_rmsnorm: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3045,6 +3065,7 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride=ep_destination_stride,
         ep_world_size=ep_world_size,
         ep_quant_bits=ep_quant_bits,
+        post_gemm2_rmsnorm=post_gemm2_rmsnorm,
         row_major_ascale=row_major_ascale,
         a_row_stride_bytes=a_row_stride_bytes,
         a_scale_row_stride_bytes=a_scale_row_stride_bytes,
