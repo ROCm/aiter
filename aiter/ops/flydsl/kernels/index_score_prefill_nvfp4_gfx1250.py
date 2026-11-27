@@ -92,7 +92,7 @@ CHUNK_MAX = 32
 
 
 def compile_index_score_prefill_nvfp4(
-    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, lean=False, pad_lds=False, _probe=""
+    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, pad_lds=False, _probe=""
 ):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight.
@@ -102,11 +102,6 @@ def compile_index_score_prefill_nvfp4(
     handling included); the reduction leaves two-input maxnums whose operands
     LLVM quiets (``v_max_num_f32 x, x, x``), the fold is ``v_max3_num_f32``
     only: 4 VALU instructions a WMMA instead of ~5.6 on an unmasked page.
-
-    ``lean``: a key tile's A operands are loaded while the previous tile's
-    WMMAs run, with a scheduling barrier between key tiles, so two tiles' operands
-    are live instead of the page's eight: fewer VGPRs (4 query tiles a wave: 216
-    -> 175 in the scorer, 240 -> 201 in the select build), so more waves a SIMD.
 
     ``pad_lds``: the page's payload rows 80 bytes apart in LDS (16 bytes of
     padding a 64-byte row, by the tensor DMA). A wave reads the A operand with
@@ -118,7 +113,8 @@ def compile_index_score_prefill_nvfp4(
     lanes of a pass (a row each) alias.
 
     ``_probe``: debug builds that write wrong scores, for timing only.
-    ``_nostore``: no score stores. ``_acc``: an unmasked page's dots of a query
+    ``_nostore``: no score stores. ``_nosel`` / ``_nosteps`` (select build): no
+    selection pass / a pass's header without its steps. ``_acc``: an unmasked page's dots of a query
     tile summed through the WMMA's C operand and max-reduced once (the page loop
     without its max epilogue).
 
@@ -156,7 +152,7 @@ def compile_index_score_prefill_nvfp4(
         raise ValueError(
             f"select needs chunk_max = {CHUNK_MAX} and waves of whole {WAVE} rows"
         )
-    key = (block_q, waves, ring, chunk_max, select, fold_max, lean, pad_lds, _probe)
+    key = (block_q, waves, ring, chunk_max, select, fold_max, pad_lds, _probe)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
@@ -180,8 +176,6 @@ def compile_index_score_prefill_nvfp4(
     name = f"index_score_prefill_nvfp4_d128_bq{block_q}_w{waves}_ring{ring}{_probe}"
     if fold_max:
         name += "_fold"
-    if lean:
-        name += "_lean"
     if pad_lds:
         name += "_pad"
     if select:
@@ -397,17 +391,8 @@ def compile_index_score_prefill_nvfp4(
                         )
                         return k_rows, lds_load(base + PAGE * prow + key * SROW, fx.Int64, 1)[0]
 
-                    ahead = key_tile(0) if const_expr(lean) else None
                     for kt in range_constexpr(PAGE // 16):
-                        if const_expr(lean):
-                            k_rows, k_scale = ahead
-                            if const_expr(kt + 1 < PAGE // 16):
-                                ahead = key_tile(kt + 1)
-                            # Keep tile kt+1's loads where they are: ahead of tile kt's
-                            # WMMAs, not hoisted with the page's other tiles.
-                            fx.rocdl.sched_barrier(0)
-                        else:
-                            k_rows, k_scale = key_tile(kt)
+                        k_rows, k_scale = key_tile(kt)
                         for rt in range_constexpr(tiles_per_wave):
                             dots = _wmma_scale16(
                                 k_rows,
@@ -480,7 +465,10 @@ def compile_index_score_prefill_nvfp4(
                             ] = m * scale
                 if const_expr(select):
                     at = (blk - blk_lo) % chunk_max
-                    if (at == chunk_max - 1) | (blk == blk_hi - 1):
+                    # Probe ``_nosel``: no pass at all (the keys are wrong).
+                    if ((at == chunk_max - 1) | (blk == blk_hi - 1)) & (
+                        const_expr(_probe != "_nosel")
+                    ):
                         # The blocks staged since the last pass: blk - at .. blk.
                         for g in range_constexpr(rows_per_wave // WAVE):
                             rl = wave_row + g * WAVE + lane
@@ -537,6 +525,10 @@ def compile_index_score_prefill_nvfp4(
                                     steps.shuffle_xor(fx.Int32(half_wave), fx.Int32(WAVE)),
                                 )
                             # Raw readfirstlane: fx has no lane-read operation.
+                            tried = steps
+                            if const_expr(_probe == "_nosteps"):
+                                # Probe: the pass's header only (the keys are wrong).
+                                steps = fx.Int32(0)
                             for _ in range(
                                 fx.Int32(0),
                                 fx.Int32(fx.rocdl.readfirstlane(T.i32, steps)),
@@ -572,7 +564,10 @@ def compile_index_score_prefill_nvfp4(
                                     # Only a row that took a place has a new lowest.
                                     low = lowest(rl)
                             # (A row past the request keeps an empty list.)
-                            if fx.Int32(low >> 32) > floor:
+                            if const_expr(_probe == "_nosteps"):
+                                # Keeps the header live (the floor cell is in bounds).
+                                floors[cell] = tried
+                            elif fx.Int32(low >> 32) > floor:
                                 floors[cell] = fx.Int32(low >> 32)
                 final = yield [state[0]]
             tdm_ops.tensor_wait(0)

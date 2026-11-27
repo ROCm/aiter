@@ -81,7 +81,7 @@ def make(reqs, device, seed=0, heads=1, ties=False):
 @pytest.mark.parametrize(
     "reqs", [[(64, 4096)], [(300, 0)], [(77, 1000), (259, 5000)], [(1024, 30000)]]
 )
-# block_q:waves:ring[:fold][:lean][:pad] (fold_max, lean, pad_lds)
+# block_q:waves:ring[:fold][:pad] (fold_max, pad_lds)
 @pytest.mark.parametrize(
     "variant",
     [
@@ -89,9 +89,8 @@ def make(reqs, device, seed=0, heads=1, ties=False):
         "256:4:8",
         "128:2:2:fold",
         "512:8:4:fold",
-        "256:4:4:fold:lean",
         "256:4:4:pad",
-        "128:2:2:fold:lean:pad",
+        "128:2:2:fold:pad",
     ],
 )
 def test_index_score_prefill_nvfp4(reqs, variant, device):
@@ -100,7 +99,6 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
 
     bq, waves, ring = (int(x) for x in variant.split(":")[:3])
     fold_max = ":fold" in variant
-    lean = ":lean" in variant
     pad_lds = variant.endswith(":pad")
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device)
     max_block = (int(seq.max()) + 127) // 128
@@ -108,7 +106,7 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
     index_score_prefill_nvfp4(
         q, payload, scale, score, bt, cu, seq, prefix, 128**-0.5,
         max(n for n, _ in reqs), 37, block_q=bq, waves=waves, ring=ring,
-        fold_max=fold_max, lean=lean, pad_lds=pad_lds,
+        fold_max=fold_max, pad_lds=pad_lds,
     )
     torch.cuda.synchronize()
     qe = q[:, 0].float().clamp(-448, 448).to(torch.float8_e4m3fn).float()
@@ -127,6 +125,36 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
         err = ((got - ref).abs() / ref.abs().clamp(min=1e-3))[valid]
         assert torch.isfinite(got[valid]).all()
         assert err.max().item() < 5e-3, err.max().item()
+
+
+@pytest.mark.parametrize("reqs", [[(1024, 30000)], [(77, 1000), (259, 5000)]])
+@pytest.mark.parametrize(
+    "opts",
+    [
+        dict(fold_max=True),
+        dict(pad_lds=True),
+        dict(block_q=128, waves=2, ring=2, fold_max=True, pad_lds=True),
+    ],
+)
+def test_index_score_prefill_nvfp4_opts_bitwise(reqs, opts, device):
+    """fold_max / pad_lds change the schedule, not a score: the same bits as the
+    default build (NaN-free inputs)."""
+    from aiter.ops.flydsl.index_score_prefill import index_score_prefill_nvfp4
+
+    q, payload, scale, bt, cu, prefix, seq = make(reqs, device, heads=4)
+    max_q = max(n for n, _ in reqs)
+    max_block = (int(seq.max()) + 127) // 128
+    want = torch.full((4, q.shape[0], max_block), float("nan"), device=device)
+    got = want.clone()
+    args = (bt, cu, seq, prefix, 128**-0.5, max_q, 37)
+    index_score_prefill_nvfp4(q, payload, scale, want, *args)
+    index_score_prefill_nvfp4(q, payload, scale, got, *args, **opts)
+    torch.cuda.synchronize()
+    for b, (n, cached) in enumerate(reqs):
+        rows = slice(int(cu[b]), int(cu[b + 1]))
+        vb = (cached + torch.arange(n, device=device) + 128) // 128
+        valid = torch.arange(max_block, device=device)[None] < vb[:, None]
+        assert torch.equal(got[:, rows][:, valid], want[:, rows][:, valid])
 
 
 def triton_selection(score, valid_blocks, init_blocks, local_blocks, k=16):
@@ -162,7 +190,7 @@ def triton_selection(score, valid_blocks, init_blocks, local_blocks, k=16):
 @pytest.mark.parametrize("pins", [(0, 1), (2, 3), (0, 0)])
 @pytest.mark.parametrize(
     "variant",
-    # chunk_blocks:block_q:waves:ring[:fold][:lean][:pad] (the same keys)
+    # chunk_blocks:block_q:waves:ring[:fold][:pad] (the same keys)
     [
         "256:256:4:4",
         "64:128:2:2",
@@ -171,8 +199,7 @@ def triton_selection(score, valid_blocks, init_blocks, local_blocks, k=16):
         "256:256:4:4:fold",
         "1024:128:2:2:fold",
         "256:512:8:2:fold",
-        "128:512:8:2:fold:lean",
-        "256:512:8:2:fold:lean:pad",
+        "256:512:8:2:fold:pad",
         "1024:256:4:4:pad",
     ],
 )
@@ -185,7 +212,6 @@ def test_index_topk_prefill_nvfp4(reqs, pins, variant, device):
 
     chunk, bq, waves, ring = (int(x) for x in variant.split(":")[:4])
     fold_max = ":fold" in variant
-    lean = ":lean" in variant
     pad_lds = variant.endswith(":pad")
     heads = 4
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device, heads=heads, ties=True)
@@ -199,7 +225,7 @@ def test_index_topk_prefill_nvfp4(reqs, pins, variant, device):
     )
     keys = index_topk_prefill_nvfp4(
         q, payload, scale, bt, cu, seq, prefix, 128**-0.5, max_q, max_block, *pins,
-        chunk_blocks=chunk, block_q=bq, waves=waves, ring=ring, fold_max=fold_max, lean=lean, pad_lds=pad_lds,
+        chunk_blocks=chunk, block_q=bq, waves=waves, ring=ring, fold_max=fold_max, pad_lds=pad_lds,
     )  # fmt: skip
     torch.cuda.synchronize()
     assert keys.shape == (heads, q.shape[0], -(-max_block // chunk) * 16)

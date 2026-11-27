@@ -71,7 +71,6 @@ def index_score_prefill_nvfp4(
     ring: int = 4,
     lds_scores: bool = True,
     fold_max: bool = False,
-    lean: bool = False,
     pad_lds: bool = False,
     _probe: str = "",
 ) -> None:
@@ -80,7 +79,7 @@ def index_score_prefill_nvfp4(
     a CTA scores at most ``CHUNK_MAX`` blocks (``chunk_blocks`` is capped; the
     scores do not depend on the chunking) and stores each row's chunk with one
     coalesced store instead of a 4-byte store a block. ``fold_max`` (the same
-    scores, fewer VALU instructions), ``lean`` (the same scores, fewer VGPRs), ``pad_lds``
+    scores, fewer VALU instructions), ``pad_lds``
     (the same scores, no LDS bank conflicts on the key rows) and
     ``_probe`` (debug timing builds, wrong
     scores): see ``compile_index_score_prefill_nvfp4``."""
@@ -101,7 +100,6 @@ def index_score_prefill_nvfp4(
         ring=ring,
         chunk_max=CHUNK_MAX if lds_scores else 0,
         fold_max=bool(fold_max),
-        lean=bool(lean),
         pad_lds=bool(pad_lds),
         _probe=_probe,
     )
@@ -195,8 +193,8 @@ def index_topk_prefill_nvfp4(
     waves: int = 4,
     ring: int = 4,
     fold_max: bool = False,
-    lean: bool = False,
     pad_lds: bool = False,
+    _probe: str = "",
 ) -> torch.Tensor:
     """The prefill scorer and ATOM's top-16 block selection in one launch: the
     scores of :func:`index_score_prefill_nvfp4` never reach memory.
@@ -235,8 +233,8 @@ def index_topk_prefill_nvfp4(
         chunk_max=CHUNK_MAX,
         select=(init_blocks, local_blocks),
         fold_max=bool(fold_max),
-        lean=bool(lean),
         pad_lds=bool(pad_lds),
+        _probe=_probe,
     )
     dev = idx_q.device
     _run_compiled(
