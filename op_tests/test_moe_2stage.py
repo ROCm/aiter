@@ -2419,7 +2419,7 @@ def test_relu2_gate_only_regression():
     if get_gfx() != "gfx950":
         aiter.logger.info("skip Relu2 gate-only regression on %s", get_gfx())
         return
-    model_dim, inter_dim, E, topk = 7168, 256, 257, 9
+    model_dim, inter_dim, E, topk = 1024, 2688, 512, 22
     dispatched = []
     orig_ck_moe_stage1 = ck_moe_stage1
 
@@ -2431,6 +2431,7 @@ def test_relu2_gate_only_regression():
 
     for token in (1, 16, 32, 64, 128):
         dispatched.clear()
+        get_2stage_cfgs.cache_clear()
         _fused_moe_mod.ck_moe_stage1 = _tracking_ck_moe_stage1
         try:
             torch.manual_seed(0)
@@ -2452,11 +2453,63 @@ def test_relu2_gate_only_regression():
             )
         finally:
             _fused_moe_mod.ck_moe_stage1 = orig_ck_moe_stage1
+            get_2stage_cfgs.cache_clear()
         assert dispatched, (
             f"{token=}: expected the legacy ck_moe_stage1 path to be used for "
             f"gate-only no-quant BF16 Relu2, but it was never dispatched"
         )
     aiter.logger.info("moe_2stage: Relu2 gate-only multi-expert regression test passed")
+
+
+def test_relu2_stage1_rejects_unsafe_args():
+    token, model_dim, inter_dim, E, topk = 4, 64, 32, 4, 2
+    dtype = dtypes.bf16
+    hidden_states = torch.randn((token, model_dim), dtype=dtype)
+    w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)  # gate-only: N = inter_dim
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    sorted_token_ids = torch.zeros((token * topk,), dtype=torch.int32)
+    sorted_expert_ids = torch.zeros((1,), dtype=torch.int32)
+    num_valid_ids = torch.zeros((1,), dtype=torch.int32)
+    sorted_weights = torch.ones((token * topk,), dtype=torch.float32)
+
+    def expect_value_error(described, **overrides):
+        kwargs = {
+            "hidden_states": hidden_states,
+            "w1": w1,
+            "w2": w2,
+            "sorted_token_ids": sorted_token_ids,
+            "sorted_expert_ids": sorted_expert_ids,
+            "num_valid_ids": num_valid_ids,
+            "out": torch.empty((token * topk, inter_dim), dtype=dtype),
+            "topk": topk,
+            "activation": aiter.ActivationType.Relu2,
+            "quant_type": aiter.QuantType.No,
+        }
+        kwargs.update(overrides)
+        try:
+            aiter.ck_moe_stage1_fwd(**kwargs)
+        except ValueError:
+            return
+        raise AssertionError(f"ck_moe_stage1_fwd accepted {described}")
+
+    expect_value_error(
+        "a half-width output buffer (sized for a gated activation)",
+        out=torch.empty((token * topk, inter_dim // 2), dtype=dtype),
+    )
+    expect_value_error(
+        "sorted_weights in stage1",
+        sorted_weights=sorted_weights,
+    )
+    expect_value_error(
+        "FP8 activation/weight with Relu2",
+        hidden_states=hidden_states.to(dtypes.fp8),
+        w1=w1.to(dtypes.fp8),
+    )
+    expect_value_error(
+        "a quant_type other than QuantType.No",
+        quant_type=aiter.QuantType.per_Tensor,
+    )
+    aiter.logger.info("moe_2stage: Relu2 stage1 unsafe-args rejection test passed")
 
 
 def test_relu2_rejects_unsupported_quant_configs():
@@ -2469,6 +2522,7 @@ def test_relu2_rejects_unsupported_quant_configs():
         )
         return
     model_dim, inter_dim, E, topk = 7168, 256, 257, 9
+    get_2stage_cfgs.cache_clear()
 
     # per_1x128 FP8 blockscale: no ReLU2 kernel instance exists for this
     # quant/activation combination anywhere in the codegen pipeline.
@@ -3300,6 +3354,7 @@ else:
         run_blockscale_limit_cases()
     run_plain_fp8_limit_cases()
     test_relu2_gate_only_regression()
+    test_relu2_stage1_rejects_unsafe_args()
     test_relu2_rejects_unsupported_quant_configs()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()

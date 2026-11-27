@@ -647,6 +647,44 @@ def get_moe_stage_module(
     Adtype = dtype2str_dict[input_dtype]
     Bdtype = dtype2str_dict[weight_dtype]
     Cdtype = dtype2str_dict[output_dtype]
+    if activation == ActivationType.Relu2:
+        if (
+            input_dtype != dtypes.bf16
+            or weight_dtype != dtypes.bf16
+            or output_dtype != dtypes.bf16
+        ):
+            raise NotImplementedError(
+                "ck_gemm_moe_2stages ActivationType.Relu2 only supports a "
+                "BF16 input/weight/output data path; got "
+                f"input_dtype={input_dtype!r}, weight_dtype={weight_dtype!r}, "
+                f"output_dtype={output_dtype!r}. FP8 blockscale/per_1x128, "
+                "FP4, and mixed-precision ReLU2 combinations have no "
+                "validated CK ActOp=5 kernel instance."
+            )
+        if preshuffle_mode and weight_dtype == dtypes.fp4x2:
+            # preshuffle_mode only selects a distinct compiled kernel for
+            # fp4x2 weights (it adds "--preshuffle" to the codegen args
+            # below); for BF16 it is purely Python-side bookkeeping
+            # (is_shuffled) and every BF16 ck_gemm_moe_2stages instance,
+            # ReLU2 included, already requires physically pre-shuffled
+            # weight memory (see MakeBGridDescriptor_Preshuffled in CK).
+            # No validated ReLU2 + fp4x2 preshuffled CK instance exists.
+            raise NotImplementedError(
+                "ck_gemm_moe_2stages ActivationType.Relu2 does not support "
+                "fp4x2 preshuffle_mode (no validated preshuffled ReLU2 CK "
+                "instance for fp4x2 weights)."
+            )
+        if is_splitk:
+            raise NotImplementedError(
+                "ck_gemm_moe_2stages ActivationType.Relu2 does not support "
+                "splitk (the CK ReLU2 branch assumes a single-pass "
+                "reduction; no split-K ReLU2 instance exists)."
+            )
+        if runtime_swiglu_limit:
+            raise NotImplementedError(
+                "ck_gemm_moe_2stages ActivationType.Relu2 does not support "
+                "runtime_swiglu_limit (that clamp is SiLU-specific)."
+            )
 
     preshuffle_str = ""
     if preshuffle_mode and weight_dtype == dtypes.fp4x2:
@@ -656,6 +694,13 @@ def get_moe_stage_module(
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
+    if activation == ActivationType.Relu2 and quant_type != QuantType.No:
+        raise NotImplementedError(
+            "ck_gemm_moe_2stages ActivationType.Relu2 only supports "
+            f"quant_type=QuantType.No; got {quant_type!r}. No validated "
+            "CK ActOp=5 kernel instance exists for quantized (e.g. FP8 "
+            "per_1x128 blockscale, FP4) ReLU2."
+        )
     act = str(activation).split(".")[-1].lower()
     if runtime_swiglu_limit and (
         Adtype != "f8"
@@ -715,6 +760,41 @@ def ck_moe_stage1_fwd(
     dst_type: torch.dtype | None = None,
     swiglu_limit: float | None = None,
 ):
+    if activation == ActivationType.Relu2:
+        expected_n = w1.size(1)
+        if out.size(-1) != expected_n:
+            raise ValueError(
+                "ck_moe_stage1_fwd: ActivationType.Relu2 is non-gated and "
+                f"requires out.size(-1) == w1.size(1) ({expected_n}); got "
+                f"out.size(-1) == {out.size(-1)}. A half-width `out` sized "
+                "for a gated activation (w1.size(1) // 2) would cause the "
+                "CK kernel to write past the end of the buffer."
+            )
+        if sorted_weights is not None:
+            raise ValueError(
+                "ck_moe_stage1_fwd: ActivationType.Relu2 does not support "
+                "sorted_weights in stage1 (it would compute "
+                "(relu(x) * w)^2 instead of relu(x)^2 * w). Apply routed "
+                "weights in ck_moe_stage2_fwd instead."
+            )
+        _relu2_bf16 = (torch.bfloat16,)
+        if (
+            hidden_states.dtype not in _relu2_bf16
+            or w1.dtype not in _relu2_bf16
+            or out.dtype not in _relu2_bf16
+        ):
+            raise ValueError(
+                "ck_moe_stage1_fwd: ActivationType.Relu2 (legacy CK path) "
+                "only supports BF16 activation/weight/output; got "
+                f"hidden_states.dtype={hidden_states.dtype}, "
+                f"w1.dtype={w1.dtype}, out.dtype={out.dtype}."
+            )
+        if quant_type != QuantType.No:
+            raise ValueError(
+                "ck_moe_stage1_fwd: ActivationType.Relu2 (legacy CK path) "
+                f"only supports quant_type=QuantType.No; got {quant_type!r}."
+            )
+
     limit = normalize_swiglu_limit(swiglu_limit) if swiglu_limit else None
     if limit is not None:
         if quant_type == QuantType.per_128x128:
