@@ -14,6 +14,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `gather_kv_b_proj.py` | gfx1250 MLA gather + kv_b_proj (FP8 head-loop and BF16 tile kernels), by replaying `gather_kv_b_proj_flydsl` per head count in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
