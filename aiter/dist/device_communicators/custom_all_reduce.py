@@ -35,6 +35,7 @@ from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.sp_head_exchange import all_to_all as a2a_op
 from aiter.utility.dtypes import fp8
 
 from .flydsl_backends import (
@@ -3259,6 +3260,156 @@ class CustomAllreduce:
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
         return out
+
+    # ---- all-to-all -------------------------------------------------------
+    # Sync blocks of one all-to-all launch (one block per CU). Timed on MI355X
+    # TP4, see op_tests/multigpu_tests/test_custom_all_to_all.py.
+    _A2A_BLOCKS: ClassVar[int] = 32
+
+    def _a2a_transport_ok(self) -> bool:
+        """The all-to-all kernel runs on the IPC transport of gfx9 only."""
+        return (
+            not self.disabled
+            and not self._is_gfx1250
+            and not self._use_vmm
+            and not self._use_symm_mem
+            and self.world_size in CustomAllreduce._GATHER_SCATTER_WORLD_SIZES
+            and (self.world_size == 2 or self.fully_connected)
+        )
+
+    @staticmethod
+    def _a2a_matrix_ok(t: torch.Tensor, world_size: int) -> bool:
+        return (
+            t.dim() == 2
+            and t.is_contiguous()
+            and t.shape[0] % world_size == 0
+            and t.shape[1] * t.element_size() % 16 == 0
+            and t.numel() > 0
+        )
+
+    def should_custom_a2a(
+        self,
+        inp: torch.Tensor,
+        scales: torch.Tensor | None = None,
+        registered: bool = False,
+    ) -> bool:
+        """True iff `custom_all_to_all` can take (inp, scales): contiguous 2D
+        matrices of the same row count, a multiple of world_size, with 16-byte
+        rows, that fit the registered pool (staged one after the other at 16-byte
+        boundaries)."""
+        if not self._a2a_transport_ok():
+            return False
+        mats = [inp] if scales is None else [inp, scales]
+        if any(not self._a2a_matrix_ok(t, self.world_size) for t in mats):
+            return False
+        if scales is not None and scales.shape[0] != inp.shape[0]:
+            return False
+        if registered:
+            return all(t.data_ptr() % 16 == 0 for t in mats)
+        staged = sum((t.numel() * t.element_size() + 15) // 16 * 16 for t in mats)
+        return staged <= self._pool["input"].max_size
+
+    def input_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype, byte_offset: int = 0
+    ) -> torch.Tensor:
+        """A tensor over the registered IPC pool, for a producer (a quantizer or
+        a GEMM epilogue) to write straight into the buffer an all-to-all pulls
+        from: pass it to `custom_all_to_all(..., registered=True)`.
+
+        Every rank must place the same tensors at the same offsets, 16-byte
+        aligned. The view stays valid until the next collective that stages
+        through the pool (any copy-in all-reduce, all-gather, reduce-scatter or
+        all-to-all), so write it right before the all-to-all. When the call has
+        returned on a rank, no peer reads the buffer any more.
+        """
+        import types
+
+        nbytes = dtype.itemsize
+        for s in shape:
+            nbytes *= int(s)
+        pool = self._pool["input"]
+        if byte_offset < 0 or byte_offset % 16 or byte_offset + nbytes > pool.max_size:
+            raise ValueError(
+                "input_buffer view outside the registered pool or not 16-byte aligned"
+            )
+        holder = types.SimpleNamespace()
+        holder.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (pool.data_ptr + byte_offset, False),
+            "version": 3,
+        }
+        flat = torch.as_tensor(holder, device=self.device)
+        return flat.view(dtype).view(*shape)
+
+    def custom_all_to_all(
+        self,
+        inp: torch.Tensor,
+        gather_last: bool = True,
+        scales: torch.Tensor | None = None,
+        registered: bool = False,
+    ):
+        """All-to-all of the row blocks of a 2D matrix (and of `scales`, in the
+        same launch): block j of the world_size row blocks of `inp` goes to rank
+        j. Returns `out`, or `(out, scales_out)`, or None when this shape or
+        transport is not served (the caller falls back to NCCL).
+
+        gather_last=True : out[row, r * C + c] = block `rank` of rank r's inp,
+                           shape [rows, world_size * C].
+        gather_last=False: out[r * rows + row, c], shape [world_size * rows, C].
+        `registered=True`: the inputs are views from `input_buffer` (or other
+        registered tensors) and are not copied.
+        """
+        if not self.should_custom_a2a(inp, scales, registered):
+            return None
+        w = self.world_size
+        rows = inp.shape[0] // w
+
+        def out_for(t):
+            shape = (rows, w * t.shape[1]) if gather_last else (t.shape[0], t.shape[1])
+            return torch.empty(shape, dtype=t.dtype, device=t.device)
+
+        out = out_for(inp)
+        scales_out = out_for(scales) if scales is not None else None
+        stage = not registered
+        if (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and not registered
+        ):
+            # Peers read the input in place if capture() agreed on the
+            # registered path; otherwise it is staged in the pre-registered pool.
+            stage = not (
+                self._capture_registered(inp)
+                and (scales is None or self._capture_registered(scales))
+            )
+        pool = self._pool["input"]
+
+        # The kernel moves raw bytes (16-byte uint4 packs; the dtype only enters
+        # through element_size to get the row width), so pass uint8 byte views.
+        # That keeps the fast path for every dtype whose aiter-pybind id is not
+        # registered -- non arch-native fp8 (e4m3fn on gfx942), float8_e5m2,
+        # bool, float64, uint16, ... -- which torch_to_aiter_pybind would
+        # otherwise reject with "Unsupported dtype" instead of letting the caller
+        # fall back to NCCL. should_custom_a2a guarantees 16-byte rows, so the
+        # uint8 last dim stays contiguous and 16-aligned; out/scales_out are
+        # viewed back to the original dtype on return.
+        def _bytes(t):
+            return None if t is None else t.view(torch.uint8)
+
+        a2a_op(
+            self._ptr,
+            _bytes(inp),
+            _bytes(out),
+            pool.data_ptr,
+            pool.max_size,
+            stage,
+            gather_last,
+            self._A2A_BLOCKS,
+            _bytes(scales),
+            _bytes(scales_out),
+        )
+        return out if scales is None else (out, scales_out)
 
     def should_custom_dcp_merge(self, o: torch.Tensor, lse: torch.Tensor) -> bool:
         """Whether custom_dcp_merge takes these decode context parallel partials.
