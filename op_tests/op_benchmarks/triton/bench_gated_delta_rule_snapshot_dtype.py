@@ -12,6 +12,8 @@ The persistent initial/final state remains FP32 in both runs so the reported
 difference isolates the temporary chunk-snapshot policy.
 """
 
+import functools
+
 import torch
 import triton
 
@@ -21,21 +23,27 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
     chunk_fwd_o_opt_vk,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
     return "bf16" if dtype == torch.bfloat16 else "fp32"
 
 
-def benchmark_snapshot_dtype(
-    snapshot_dtype: torch.dtype,
-    batch_size: int,
-    sequence_length: int,
-    num_heads: int,
-    warmup_ms: int,
-    rep_ms: int,
-) -> tuple[float, float, float]:
+def _generate_pool_entry(batch_size, sequence_length, num_heads, snapshot_dtype):
+    """Build one full K5/K6 input set, with K6's h/v_new primed by one K5 call.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random tensors, so replaying through the pool during timing
+    defeats cache residency the same way a repeat-and-average loop would.
+    """
     device = torch.device("cuda")
     chunk_size = 64
     head_dim = 128
@@ -99,7 +107,78 @@ def benchmark_snapshot_dtype(
         dtype=torch.int32,
     )
 
-    def run_k5() -> None:
+    # Initialize K6's h/v_new through one untimed K5 call, same as the
+    # reference this benchmark is modeled on.
+    chunk_gated_delta_rule_fwd_h_hip(
+        k,
+        w,
+        u,
+        g,
+        empty_fp32,
+        initial_state,
+        empty_i32,
+        empty_i32,
+        chunk_offsets,
+        h,
+        v_new,
+        final_state,
+        64,
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
+
+    return (
+        q,
+        k,
+        w,
+        u,
+        g,
+        initial_state,
+        final_state,
+        h,
+        v_new,
+        output,
+        empty_fp32,
+        empty_i32,
+        chunk_offsets,
+    )
+
+
+_ROT_POOL_KEYS = [
+    "q",
+    "k",
+    "w",
+    "u",
+    "g",
+    "initial_state",
+    "final_state",
+    "h",
+    "v_new",
+    "output",
+    "empty_fp32",
+    "empty_i32",
+    "chunk_offsets",
+]
+
+
+def _make_kernel_fns(chunk_size=64):
+    def kernel_k5(
+        k,
+        w,
+        u,
+        g,
+        empty_fp32,
+        initial_state,
+        empty_i32,
+        chunk_offsets,
+        h,
+        v_new,
+        final_state,
+        **_,
+    ):
         chunk_gated_delta_rule_fwd_h_hip(
             k,
             w,
@@ -121,7 +200,7 @@ def benchmark_snapshot_dtype(
             True,
         )
 
-    def run_k6() -> None:
+    def kernel_k6(q, k, v_new, output, h, g, **_):
         chunk_fwd_o_opt_vk(
             q=q,
             k=k,
@@ -133,14 +212,27 @@ def benchmark_snapshot_dtype(
             use_exp2=True,
         )
 
-    # Compile/autotune before timing and initialize K6 inputs through K5.
-    run_k5()
-    run_k6()
-    torch.cuda.synchronize()
+    return kernel_k5, kernel_k6
 
-    k5_ms = triton.testing.do_bench(run_k5, warmup=warmup_ms, rep=rep_ms)
-    k6_ms = triton.testing.do_bench(run_k6, warmup=warmup_ms, rep=rep_ms)
-    snapshot_mib = h.numel() * h.element_size() / (1024**2)
+
+def benchmark_snapshot_dtype(
+    bencher: RotatingBufferBench,
+    snapshot_dtype: torch.dtype,
+    batch_size: int,
+    sequence_length: int,
+    num_heads: int,
+) -> tuple[float, float, float]:
+    _p_gen = functools.partial(
+        _generate_pool_entry, batch_size, sequence_length, num_heads, snapshot_dtype
+    )
+    rot_bufs = bencher.build_pool([_p_gen], [_ROT_POOL_KEYS])
+    kernel_k5, kernel_k6 = _make_kernel_fns()
+
+    k5_ms = bencher.bench(kernel_k5)
+    k6_ms = bencher.bench(kernel_k6)
+    snapshot_mib = (
+        rot_bufs[0]["h"].numel() * rot_bufs[0]["h"].element_size() / (1024**2)
+    )
     return k5_ms * 1000, k6_ms * 1000, snapshot_mib
 
 
@@ -149,23 +241,23 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=8192)
     parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--warmup-ms", type=int, default=25)
-    parser.add_argument("--rep-ms", type=int, default=100)
     args = parser.parse_args()
+
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     print("snapshot_dtype,k5_us,k6_us,snapshot_mib")
     for snapshot_dtype in (torch.bfloat16, torch.float32):
         k5_us, k6_us, snapshot_mib = benchmark_snapshot_dtype(
+            bencher,
             snapshot_dtype=snapshot_dtype,
             batch_size=args.batch_size,
             sequence_length=args.sequence_length,
             num_heads=args.num_heads,
-            warmup_ms=args.warmup_ms,
-            rep_ms=args.rep_ms,
         )
         print(
-            f"{_dtype_name(snapshot_dtype)},{k5_us:.3f},"
-            f"{k6_us:.3f},{snapshot_mib:.3f}"
+            f"{_dtype_name(snapshot_dtype)},{k5_us:.3f},{k6_us:.3f},{snapshot_mib:.3f}"
         )
 
 

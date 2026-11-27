@@ -16,7 +16,9 @@ Example::
 
 from __future__ import annotations
 
+import functools
 import importlib.util
+import itertools
 import statistics
 import sys
 import time
@@ -31,8 +33,13 @@ from aiter.ops.prefill_batch_metadata import (
 )
 from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 CHUNK_SIZE = 64
@@ -220,42 +227,69 @@ def _build_inputs(case, seed, with_state_pool=False):
     }
 
 
+_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "initial_state",
+    "state_pool",
+    "state_indices",
+    "cu_seqlens",
+    "metadata",
+    "total_tokens",
+    "num_seqs",
+]
+
+
+def _generate_pool_entry(case, seed, with_state_pool):
+    """Thin adapter: _build_inputs is unchanged, this just orders its dict
+    into the tuple build_pool()'s generator contract expects."""
+    built = _build_inputs(case, seed, with_state_pool=with_state_pool)
+    return tuple(built[k] for k in _POOL_FIELDS)
+
+
 def _make_callable(
-    tensors,
+    bencher,
     case,
     backend,
     snapshot_dtype,
-    prefill_metadata,
-    state_indices=None,
+    use_state_pool=False,
     *,
     cold_indices_check=False,
 ):
-    initial_state = (
-        tensors["state_pool"] if state_indices is not None else tensors["initial_state"]
-    )
-    pool_size = initial_state.shape[0] if state_indices is not None else 0
+    rot_bufs = bencher.rot_bufs
+    pool_len = len(rot_bufs)
+    counter = itertools.count()
 
     def run():
+        entry = rot_bufs[next(counter) % pool_len]
+        if use_state_pool:
+            initial_state, state_indices = entry["state_pool"], entry["state_indices"]
+        else:
+            initial_state, state_indices = entry["initial_state"], None
         if cold_indices_check and state_indices is not None:
+            pool_size = initial_state.shape[0]
             new_slots = torch.randperm(pool_size, device=state_indices.device)[
                 : state_indices.numel()
             ]
             state_indices.copy_(new_slots.to(dtype=state_indices.dtype))
         return chunk_gated_delta_rule_opt_vk(
-            q=tensors["q"],
-            k=tensors["k"],
-            v=tensors["v"],
-            g=tensors["g"],
-            beta=tensors["beta"],
+            q=entry["q"],
+            k=entry["k"],
+            v=entry["v"],
+            g=entry["g"],
+            beta=entry["beta"],
             initial_state=initial_state,
             initial_state_indices=state_indices,
             output_final_state=case.output_final_state,
-            cu_seqlens=tensors["cu_seqlens"],
+            cu_seqlens=entry["cu_seqlens"],
             use_chunk_flydsl=backend == "flydsl",
             use_chunk_hip=backend == "hip",
             state_dtype=case.ssm_state_dtype,
             snapshot_dtype=snapshot_dtype,
-            prefill_metadata=prefill_metadata,
+            prefill_metadata=entry["metadata"],
         )
 
     return run
@@ -387,32 +421,33 @@ def _print_summary(records, metrics):
             print(line)
 
 
-def _run_case(case_id, case, args):
+def _run_case(bencher, case_id, case, args):
     if not case.use_g:
         print(f"\n== {case_id}\nskipped: the block entry requires g")
         return []
 
     with_pool = args.with_state_pool and case.output_final_state
-    tensors = _build_inputs(case, args.seed, with_state_pool=with_pool)
-    state_variants = [("", None)]
+    pool_gen = functools.partial(_generate_pool_entry, case, args.seed, with_pool)
+    rot_bufs = bencher.build_pool([pool_gen], [_POOL_FIELDS])
+    sample = rot_bufs[0]
+    state_variants = [("", False)]
     if with_pool:
-        state_variants.append(("pool", tensors["state_indices"]))
+        state_variants.append(("pool", True))
         if args.with_state_pool_cold_check:
-            state_variants.append(("pool-cold", tensors["state_indices"]))
+            state_variants.append(("pool-cold", True))
 
     records = []
     labels, rows, per_kernel_rows = [], {}, {}
     for backend in args.backends:
         snapshot_dtype = case.snapshot_dtype or case.dtype
         snapshot_name = "fp32" if snapshot_dtype == torch.float32 else "bf16"
-        for state_name, state_indices in state_variants:
+        for state_name, use_state_pool in state_variants:
             run = _make_callable(
-                tensors,
+                bencher,
                 case,
                 backend,
                 snapshot_dtype,
-                prefill_metadata=tensors["metadata"],
-                state_indices=state_indices,
+                use_state_pool=use_state_pool,
                 cold_indices_check=state_name == "pool-cold",
             )
             parts = (backend, snapshot_name, state_name)
@@ -430,16 +465,16 @@ def _run_case(case_id, case, args):
 
     if not args.summary_only:
         if with_pool:
-            pool_note = f", pool={2 * tensors['num_seqs']} slots"
+            pool_note = f", pool={2 * sample['num_seqs']} slots"
         elif args.with_state_pool:
             pool_note = ", pool skipped (needs final_state=on)"
         else:
             pool_note = ""
-        layout = "dense" if not case.is_varlen else f"varlen N={tensors['num_seqs']}"
+        layout = "dense" if not case.is_varlen else f"varlen N={sample['num_seqs']}"
         print(f"\n== {case_id}")
         print(
             f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} {layout}, "
-            f"T={tensors['total_tokens']}, "
+            f"T={sample['total_tokens']}, "
             f"final_state={'on' if case.output_final_state else 'off'}{pool_note}"
         )
         _print_table(labels, rows)
@@ -562,9 +597,13 @@ def main() -> None:
         f"device = {args.prof_iters}-iter profiler self time"
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     records = []
     for case_id, case in selected:
-        records += _run_case(case_id, case, args)
+        records += _run_case(bencher, case_id, case, args)
 
     if records and (len(selected) > 1 or args.summary_only):
         _print_summary(records, args.summary_metrics)
