@@ -116,6 +116,38 @@ def _check_layouts(tp, rank, world, device, rows, width, dtype):
     assert ca.should_custom_a2a(x), "fast path not taken for a 16-byte-row matrix"
 
 
+def _check_dtypes(tp, rank, world, device):
+    """Dtypes whose aiter-pybind id is not registered must still take the custom
+    byte-view fast path, not raise. Before the byte-view fix should_custom_a2a
+    returned True for these yet custom_all_to_all raised
+    ``AssertionError: Unsupported dtype`` (torch_to_aiter_pybind only knows the
+    arch-native fp8), so the NCCL fallback the PR promises was unreachable."""
+    from aiter.dist.communication_op import tensor_model_parallel_all_to_all
+
+    ca = tp.device_communicator.ca_comm
+    # (dtype, width) with 16-byte rows. Each of these raised before the fix:
+    # e5m2 and bool/uint16 on any arch, e4m3fn on gfx942 where native fp8 is fnuz.
+    cases = [
+        ("float8_e5m2", 32),
+        ("float8_e4m3fn", 32),  # non-native (fnuz) fp8 on gfx942
+        ("bool", 64),
+        ("uint16", 16),
+    ]
+    gen = torch.Generator(device=device)
+    for name, width in cases:
+        dtype = getattr(torch, name, None)
+        if dtype is None:
+            continue
+        for it in range(2):
+            gen.manual_seed(5000 * it + rank)
+            x = _data(gen, (world * 8, width), dtype, device)
+            assert ca.should_custom_a2a(x), f"{name}: fast path not taken"
+            out = tensor_model_parallel_all_to_all(x, 0, -1)
+            assert _same(
+                out, _reference(_all_inputs(x), rank, world, 0, -1)
+            ), f"{name}: custom byte-view all-to-all differs from reference"
+
+
 def _check_scales(tp, rank, world, device, rows, d):
     """Block-scaled payload: fp8 codes [W*rows, d] and e8m0 scales [W*rows, d/32]."""
     from aiter.dist.communication_op import tensor_model_parallel_all_to_all
@@ -287,6 +319,7 @@ def _worker(rank, world, port, perf_tokens, results):
             (torch.float32, 64),
         ):
             _check_layouts(tp, rank, world, device, rows, width, dtype)
+    _check_dtypes(tp, rank, world, device)
     _check_scales(tp, rank, world, device, 1024, ATTN_D)
     _check_scales(tp, rank, world, device, 77, 512)
     _check_registered(tp, rank, world, device, 512, ATTN_D)
@@ -394,7 +427,7 @@ def _run(world, perf_tokens=()):
     return perf
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 4, 8])
 def test_custom_all_to_all(world):
     if torch.version.hip is None or torch.cuda.device_count() < world:
         pytest.skip(f"requires {world} ROCm GPUs with peer access")

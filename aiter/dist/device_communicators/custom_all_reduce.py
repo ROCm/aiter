@@ -3323,17 +3323,30 @@ class CustomAllreduce:
                 and (scales is None or self._capture_registered(scales))
             )
         pool = self._pool["input"]
+
+        # The kernel moves raw bytes (16-byte uint4 packs; the dtype only enters
+        # through element_size to get the row width), so pass uint8 byte views.
+        # That keeps the fast path for every dtype whose aiter-pybind id is not
+        # registered -- non arch-native fp8 (e4m3fn on gfx942), float8_e5m2,
+        # bool, float64, uint16, ... -- which torch_to_aiter_pybind would
+        # otherwise reject with "Unsupported dtype" instead of letting the caller
+        # fall back to NCCL. should_custom_a2a guarantees 16-byte rows, so the
+        # uint8 last dim stays contiguous and 16-aligned; out/scales_out are
+        # viewed back to the original dtype on return.
+        def _bytes(t):
+            return None if t is None else t.view(torch.uint8)
+
         a2a_op(
             self._ptr,
-            inp,
-            out,
+            _bytes(inp),
+            _bytes(out),
             pool.data_ptr,
             pool.max_size,
             stage,
             gather_last,
             self._A2A_BLOCKS,
-            scales,
-            scales_out,
+            _bytes(scales),
+            _bytes(scales_out),
         )
         return out if scales is None else (out, scales_out)
 
