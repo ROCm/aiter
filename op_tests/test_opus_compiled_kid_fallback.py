@@ -58,8 +58,21 @@ def warnings(monkeypatch):
     return messages
 
 
-def _stub_device(monkeypatch, gfx, cu):
+def _stub_device(monkeypatch, gfx, cu, live_gfx=None):
+    """One physical device. ``live_gfx`` is what rocminfo says (strict or not)."""
     monkeypatch.setattr(compiled_kids, "_device_arch_and_cu", lambda _d: (gfx, cu))
+    monkeypatch.setattr(compiled_kids, "get_gfx_runtime", lambda: live_gfx or gfx)
+
+
+def _stub_devices(monkeypatch, by_index):
+    """Several devices: ``{index: (gfx, cu)}``; the current device is cuda:0."""
+
+    def lookup(device):
+        device = torch.device(device)
+        return by_index[0 if device.index is None else device.index]
+
+    monkeypatch.setattr(compiled_kids, "_device_arch_and_cu", lookup)
+    monkeypatch.setattr(compiled_kids, "get_gfx_runtime", lambda: "gfx950")
 
 
 def _stub_compiled(monkeypatch, keys):
@@ -107,10 +120,39 @@ def test_compiled_set_is_keyed_by_family_arch_and_cu(
     assert not compiled_kids.tuned_kid_is_compiled(family, TUNED_KID)
 
 
-def test_strict_gfx1250_runtime_uses_the_gfx1250_key(monkeypatch, warnings):
+def test_strict_gfx1250_device_uses_the_strict_namespace(monkeypatch, warnings):
+    # torch reports a strict (MI450 A0) device as plain gfx1250; rocminfo knows.
+    _stub_device(monkeypatch, "gfx1250", GFX950_CU, live_gfx="gfx1250-strict")
+    # A kid listed for regular gfx1250 only has no device code for a strict device.
     _stub_compiled(monkeypatch, [_key(20007, gfx="gfx1250")])
-    _stub_device(monkeypatch, "gfx1250-strict", GFX950_CU)
+    assert not compiled_kids.tuned_kid_is_compiled("a16w16", 20007)
+    assert len(warnings) == 1 and "gfx1250-strict" in warnings[0]
+    _stub_compiled(monkeypatch, [_key(20007, gfx="gfx1250-strict")])
     assert compiled_kids.tuned_kid_is_compiled("a16w16", 20007)
+
+
+def test_regular_gfx1250_device_uses_the_regular_namespace(monkeypatch, warnings):
+    _stub_device(monkeypatch, "gfx1250", GFX950_CU, live_gfx="gfx1250")
+    _stub_compiled(monkeypatch, [_key(20007, gfx="gfx1250-strict")])
+    assert not compiled_kids.tuned_kid_is_compiled("a16w16", 20007)
+    _stub_compiled(monkeypatch, [_key(20007, gfx="gfx1250")])
+    assert compiled_kids.tuned_kid_is_compiled("a16w16", 20007)
+
+
+def test_decision_follows_the_tensor_device_not_the_current_device(
+    monkeypatch, warnings
+):
+    """cuda:0 (current) has 256 CUs, the tensor lives on cuda:1 with 128."""
+    _stub_devices(monkeypatch, {0: ("gfx950", 256), 1: ("gfx950", 128)})
+    _stub_compiled(monkeypatch, [_key(TUNED_KID, cu=256)])
+    assert compiled_kids.tuned_kid_is_compiled("a16w16", TUNED_KID)  # current
+    assert compiled_kids.tuned_kid_is_compiled(
+        "a16w16", TUNED_KID, torch.device("cuda", 0)
+    )
+    assert not compiled_kids.tuned_kid_is_compiled(
+        "a16w16", TUNED_KID, torch.device("cuda", 1)
+    )
+    assert len(warnings) == 1 and "128 CUs" in warnings[0]
 
 
 def test_decision_uses_the_physical_cu_count_not_the_cu_num_override(
@@ -264,7 +306,8 @@ def test_explicit_kernel_id_is_not_filtered(monkeypatch, warnings):
 # ---- global tuned GEMM (aiter.tuned_gemm) --------------------------------
 
 
-def _tuned_config(monkeypatch, row_cu=GFX950_CU):
+def _tuned_configs(monkeypatch, row_cu=GFX950_CU, devices=(None,)):
+    """``get_GEMM_A16W16_config`` once per device, through one shared cache."""
     try:
         import aiter.tuned_gemm as tuned
     except ImportError as exc:  # e.g. no ROCm runtime on this host
@@ -285,9 +328,16 @@ def _tuned_config(monkeypatch, row_cu=GFX950_CU):
     monkeypatch.setattr(tuned, "_opus_launch", object())
     tuned.get_GEMM_A16W16_config.cache_clear()
     try:
-        return tuned.get_GEMM_A16W16_config(M, N, K, False, bf16, bf16)
+        return [
+            tuned.get_GEMM_A16W16_config(M, N, K, False, bf16, bf16, device=device)
+            for device in devices
+        ]
     finally:
         tuned.get_GEMM_A16W16_config.cache_clear()
+
+
+def _tuned_config(monkeypatch, row_cu=GFX950_CU):
+    return _tuned_configs(monkeypatch, row_cu)[0]
 
 
 def test_global_tuned_gemm_keeps_a_compiled_opus_row(monkeypatch, warnings):
@@ -317,6 +367,50 @@ def test_global_tuned_gemm_checks_the_physical_cu_under_a_cu_num_override(
     _stub_compiled(monkeypatch, [_key(TUNED_KID, cu=256)])
     config = _tuned_config(monkeypatch, row_cu=128)
     assert (config["libtype"], config["solidx"]) == ("opus", TUNED_KID)
+
+
+def test_global_tuned_gemm_gates_on_the_tensor_device_and_caches_per_device(
+    monkeypatch, warnings
+):
+    # Same (gfx, cu_num) arguments for both calls; only the device differs.
+    _stub_devices(monkeypatch, {0: ("gfx950", 256), 1: ("gfx950", 128)})
+    _stub_compiled(monkeypatch, [_key(TUNED_KID, cu=256)])
+    cuda0, cuda1 = torch.device("cuda", 0), torch.device("cuda", 1)
+    configs = _tuned_configs(monkeypatch, devices=(cuda0, cuda1, cuda0, cuda1))
+    assert [(c["libtype"], c["solidx"]) for c in configs] == [
+        ("opus", TUNED_KID),
+        ("torch", 0),
+        ("opus", TUNED_KID),
+        ("torch", 0),
+    ]
+    assert len(warnings) == 1 and "128 CUs" in warnings[0]
+
+
+def test_gemm_a16w16_passes_the_input_device_to_the_config_lookup(monkeypatch):
+    try:
+        import aiter.tuned_gemm as tuned
+    except ImportError as exc:  # e.g. no ROCm runtime on this host
+        pytest.skip(f"aiter.tuned_gemm is not importable here: {exc}")
+    from aiter.ops.opus import _arch
+
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def lookup(*_args, **kwargs):
+        seen.append(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(_arch, "_device_arch_and_cu", lambda _d: ("gfx950", 128))
+    monkeypatch.setattr(tuned, "get_GEMM_A16W16_config", lookup)
+    M, N, K = SHAPE
+    A = torch.empty((M, K), device="meta", dtype=torch.bfloat16)
+    B = torch.empty((N, K), device="meta", dtype=torch.bfloat16)
+    with pytest.raises(Stop):
+        tuned._gemm_a16w16(A, B)
+    assert seen[0]["device"] == A.device
+    assert (seen[0]["gfx"], seen[0]["cu_num"]) == ("gfx950", 128)
 
 
 # ---- a8w8 blockscale bpreshuffle (the other subset-built family) ----------
@@ -496,29 +590,47 @@ def test_codegen_embeds_the_selected_kids_in_the_module():
     assert all(key.count("/") == 3 for key in embedded)
 
 
-def test_codegen_manifest_omits_kids_without_device_code_in_a_strict_build():
-    """gfx1250-strict compiles no ``__gfx1250__`` pass, so the non-CO gfx1250
-    device TUs are empty there; only CO kids (prebuilt images) stay launchable."""
-    regular, regular_sidecar = _run_codegen(["gfx1250/256"], "gfx1250")
-    strict, strict_sidecar = _run_codegen(["gfx1250-strict/256"], "gfx1250-strict")
+@pytest.mark.parametrize(
+    ("gpu_archs", "targets", "regular_has_device_code"),
+    (
+        ("gfx1250", ["gfx1250/256"], True),
+        ("gfx1250-strict", ["gfx1250-strict/256"], False),
+        # Mixed offload list: both device passes exist.
+        ("gfx1250;gfx1250-strict", ["gfx1250/256"], True),
+        ("gfx1250;gfx1250-strict", ["gfx1250/256", "gfx1250-strict/256"], True),
+        # The registry --targets must not override what the compiler is given.
+        ("gfx1250-strict", ["gfx1250/256"], False),
+    ),
+)
+def test_codegen_manifest_lists_gfx1250_kids_per_namespace(
+    gpu_archs, targets, regular_has_device_code
+):
+    """The gfx1250 device TUs sit behind ``__gfx1250__``: only a plain gfx1250
+    offload target gives non-CO kids device code, and a strict device (MI450 A0)
+    never runs them. CO kids (prebuilt images) are launchable on both."""
+    embedded, sidecar = _run_codegen(targets, gpu_archs)
     common = runpy.run_path(str(REPO / "csrc/opus_gemm/opus_gemm_common.py"))
     co_kids = {str(kid) for kid in common["gfx1250_4wave_co_kernels_list"]}
 
-    def non_co(keys):
-        return {
-            key
-            for key in keys
-            if key.startswith("a16w16/gfx1250/")
-            and key.rsplit("/", 1)[1] not in co_kids
-        }
+    def namespace(keys, gfx):
+        return {k for k in keys if k.startswith(f"a16w16/{gfx}/")}
 
-    # The regular build embeds everything it routes (same as the sidecar) ...
-    assert regular == regular_sidecar
-    assert non_co(regular), "the regular gfx1250 build has no non-CO a16w16 kid"
-    # ... the strict one routes the same kids but embeds no non-CO gfx1250 kid.
-    assert strict_sidecar == regular_sidecar
-    assert not non_co(strict)
-    assert strict == regular - non_co(regular)
+    def kid(key):
+        return key.rsplit("/", 1)[1]
+
+    routed = namespace(sidecar, "gfx1250")
+    non_co = {k for k in routed if kid(k) not in co_kids}
+    assert non_co, "this build routes no non-CO a16w16 gfx1250 kid"
+    regular = namespace(embedded, "gfx1250")
+    strict = namespace(embedded, "gfx1250-strict")
+    # The strict namespace never lists a kid that has no device code for it.
+    assert {kid(k) for k in strict} == {kid(k) for k in routed} - {
+        kid(k) for k in non_co
+    }
+    assert regular == (routed if regular_has_device_code else routed - non_co)
+    # Everything else is the sidecar, untouched.
+    other = {k for k in embedded if "/gfx1250" not in k}
+    assert other == {k for k in sidecar if "/gfx1250/" not in k}
 
 
 # ---- GPU: the module that is really loaded --------------------------------

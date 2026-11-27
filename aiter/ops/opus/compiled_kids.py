@@ -30,6 +30,7 @@ from aiter import logger
 
 from ...jit.core import compile_ops
 from ...jit.utils.build_targets import base_gfx_arch
+from ...jit.utils.chip_info import get_gfx_runtime
 from ._arch import _device_arch_and_cu
 
 
@@ -108,6 +109,28 @@ def _warn_uncompiled_kid(key: str) -> None:
         )
 
 
+def _device_namespace(device) -> tuple[str, int]:
+    """The (arch, CU count) the manifest is keyed by for ``device``.
+
+    The CU count is the physical one. The arch is the device's, except that a
+    gfx1250-strict (MI450 A0) device is reported by torch as plain ``gfx1250``:
+    it takes the ``gfx1250-strict`` namespace, whose manifest lists only the kids
+    that have device code for a strict device (see ``gen_compiled_kids_header``).
+    """
+    gfx, cu_num = _device_arch_and_cu(
+        torch.device("cuda") if device is None else device
+    )
+    gfx = gfx.lower()
+    if base_gfx_arch(gfx) == "gfx1250" and gfx != "gfx1250-strict":
+        try:
+            live = get_gfx_runtime().lower()
+        except Exception:  # noqa: BLE001 -- no rocminfo: keep the torch arch
+            live = gfx
+        if live == "gfx1250-strict":
+            gfx = live
+    return gfx, int(cu_num)
+
+
 def tuned_kid_is_compiled(
     family: str, kid: int, device: torch.device | str | int | None = None
 ) -> bool:
@@ -115,15 +138,20 @@ def tuned_kid_is_compiled(
 
     The key is built from the device's own arch and CU count, which is what the
     C++ dispatcher keys on, so a ``CU_NUM`` override in the tuned-row lookup
-    cannot make an uncompiled (family, gfx, cu, kid) look compiled.
+    cannot make an uncompiled (family, gfx, cu, kid) look compiled. Pass the
+    device the GEMM will run on; ``None`` means the current device, which is only
+    right for a caller that has no tensor.
     """
     compiled = compiled_opus_kids()
     if compiled is None:
         return True
-    gfx, cu_num = _device_arch_and_cu(
-        torch.device("cuda") if device is None else device
-    )
-    key = f"{family}/{base_gfx_arch(gfx.lower())}/{int(cu_num)}/{int(kid)}"
+    gfx, cu_num = _device_namespace(device)
+    # TODO(#8152, #8237): those PRs key the C++ tables by ``opus_namespace_cu``,
+    # so a compute partition (an unlisted CU count) resolves through the
+    # full-chip table. Once they merge, ``cu_num`` here must go through the same
+    # mapping, or a partition would be judged against a table C++ never reads.
+    # Coordinate with that change; not changed here.
+    key = f"{family}/{gfx}/{cu_num}/{int(kid)}"
     if key in compiled:
         return True
     _warn_uncompiled_kid(key)
