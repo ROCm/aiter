@@ -63,6 +63,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>python op_tests/op_benchmarks/<br>triton/bench_paged_attention_<br>output_gate.py \<br>--context 8192 --compare</td>
   <td>~6.47<br>TB/s</td><td>&mdash;</td><td>&mdash;</td>
 </tr>
+<tr>
+  <td><code>fused_mla_qkv_a_proj_rmsnorm</code></td><td>MLA qkv_a GEMM<br>+ q/kv RMSNorm</td><td>CDNA4</td>
+  <td nowrap>X: bf16 [M, K]<br>W: fp8_e4m3 (16,16)-preshuffled,<br>128x128 fp32 block scales<br>Out: bf16 q_lora, kv_lora, k_pe<br>M &isin; {1, 2, 4, 8, 16, 32}<br>K, q, kv multiples of 128<br>fp32 split-K partials</td>
+  <td>python op_tests/op_benchmarks/<br>triton/bench_fused_mla_qkv_a_<br>proj_rmsnorm.py --baseline</td>
+  <td>~2.8<br>TB/s</td><td>&mdash;</td><td>&mdash;</td>
+</tr>
 </table>
 </small>
 
@@ -291,3 +297,26 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | Body selection | `max_context` &le; 32768 &rarr; short-context body; above &rarr; long-context body |
 | Batch | not a kernel constant &mdash; one binary serves any batch size |
 | Support probe | `paged_attention_output_gate_supported(...) -> (bool, reason)`; callers fall back rather than fail |
+
+---
+
+## Fusion Kernels
+
+### `fused_mla_qkv_a_proj_rmsnorm.py` — MLA qkv_a Projection + q/kv RMSNorm
+
+**Function:** `fused_mla_qkv_a_proj_rmsnorm(hidden, weight, weight_scale, q_norm_weight, kv_norm_weight, *, rope_dim=64, eps=1e-5)`
+
+**Description:** One call for the MLA decode chain `per-1x128 FP8 quant -> gemm_a8w8_blockscale_bpreshuffle -> fused_qk_rmsnorm` on a fused `q_a | kv_a | k_pe` weight (GLM-5.x, DeepSeek-V3 style). A split-K producer launch quantizes the activation, multiplies with the preshuffled FP8 weight and writes fp32 partials; a finish launch adds the partials, rounds the projection to bf16, applies the two RMSNorms and copies the rope slice. One schedule per decode batch size, read from `configs/gfx950/gluon/fusions/fused_mla_qkv_a_proj_rmsnorm/DEFAULT.json`.
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only, Triton &ge; 3.8 |
+| hidden | bf16 `[M, K]`, `stride(1) == 1` |
+| weight | fp8_e4m3fn `[N, K]`, `shuffle_weight(w, layout=(16, 16))` |
+| weight_scale | fp32 `[ceil(N/128), K/128]`, row-major |
+| Norm weights | bf16 `[q_lora_rank]`, `[kv_lora_rank]` |
+| Output | bf16 `[M, q_lora_rank]`, `[M, kv_lora_rank]`, `[M, rope_dim]` |
+| Batch | M &isin; {1, 2, 4, 8, 16, 32}; other M &rarr; not supported (caller falls back) |
+| Widths | K, q_lora_rank, kv_lora_rank multiples of 128; 0 &lt; rope_dim &le; 128 |
+| Partials | fp32 (passes the cancellation draw the bf16-partial originals fail) |
+| Support probe | `fused_mla_qkv_a_proj_rmsnorm_supported(...) -> (bool, reason)`; callers fall back rather than fail |
