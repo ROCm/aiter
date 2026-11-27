@@ -400,6 +400,45 @@ def test_mha_forward_out_dtype(
     )
 
 
+def test_mha_varlen_batch_shares_one_kernel():
+    """Varlen calls with batch 1 and batch 2 reuse one compiled _attn_fwd."""
+    from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd
+
+    SEQLEN, NUM_HEADS, HEAD_SZ = 256, 4, 64
+
+    def forward(batch):
+        q = torch.randn(
+            (batch * SEQLEN, NUM_HEADS, HEAD_SZ), device="cuda", dtype=torch.bfloat16
+        )
+        cu = torch.arange(
+            0, (batch + 1) * SEQLEN, SEQLEN, device="cuda", dtype=torch.int32
+        )
+        _flash_attn_forward(
+            q,
+            q,
+            q,
+            dropout_p=0.0,
+            softmax_scale=HEAD_SZ**-0.5,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            bias=None,
+            alibi_slopes=None,
+            return_lse=False,
+            return_softmax=False,
+            max_seqlen_q=SEQLEN,
+            max_seqlen_k=SEQLEN,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+        )
+
+    _attn_fwd.device_caches.clear()
+    forward(1)
+    forward(2)
+    kernels = _attn_fwd.device_caches[torch.cuda.current_device()][0]
+    assert len(kernels) == 1, f"{len(kernels)} _attn_fwd variants for batch 1 and 2"
+
+
 # Short K (fewer than 8 key tiles) runs the one-tile loop; long K, the pipeline.
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (300, 1100)])
 @pytest.mark.parametrize("HEAD_SZ", [53, 64, 96, 128])
