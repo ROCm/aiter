@@ -126,7 +126,12 @@ def ring_supported(m: int, n: int, k: int, device=None, tiling=None) -> bool:
     )
     if index is None:
         index = torch.cuda.current_device()
-    return _device_ok(index) and fits(n, k, *(tiling or ring_tiling(m)))
+    mt, mh, r = tiling or ring_tiling(m)
+    # Reject a tile too small to hold M, as ``gemm_a16w16_ring`` does below, so this dispatch gate and the launch
+    # agree: ``fits`` only checks the N/K resources, not the row capacity. Mirrors ``cat_x_ring_supported``.
+    if mt * mh * 16 < m:
+        return False
+    return _device_ok(index) and fits(n, k, mt, mh, r)
 
 
 def shuffle_weight_ring(w: torch.Tensor) -> torch.Tensor:
@@ -161,6 +166,9 @@ def gemm_a16w16_ring(
     if x.device.type != "cuda" or w.device != x.device:
         raise ValueError("ring GEMM takes CUDA x and w on the same device")
     layout = _layout(shuffled)
+    mt, mh, r = tiling or ring_tiling(m)
+    if tiling and mt * mh * 16 < m:
+        raise ValueError(f"ring tiling {tiling} holds {mt * mh * 16} rows, not M={m}")
     if not ring_supported(m, n, k, x.device, tiling):
         raise ValueError(f"ring GEMM does not take M={m} N={n} K={k} on this device")
     if (
@@ -188,9 +196,6 @@ def gemm_a16w16_ring(
         raise ValueError(
             "out must be a contiguous 16-byte-aligned BF16 [M, N] on the device of x"
         )
-    mt, mh, r = tiling or ring_tiling(m)
-    if mt * mh * 16 < m and tiling:
-        raise ValueError(f"ring tiling {tiling} holds {mt * mh * 16} rows, not M={m}")
     # The compiled handle is device bound: key it (and launch) per device.
     with torch.cuda.device(x.device):
         exe = compile_ring(n, k, mt, mh, r, layout, torch.cuda.current_device())

@@ -454,8 +454,14 @@ def flydsl_hgemm(
         with torch.cuda.stream(launch_stream):
             if not a.is_contiguous():
                 a = a.contiguous()
+            # ``.contiguous()`` is a no-op on an already-contiguous view, so a 16-byte-misaligned base (e.g.
+            # ``buf[1:].view(...)``) survives it; the ring launcher requires an aligned base, so realign by copy.
+            if a.data_ptr() % 16:
+                a = a.clone()
             if not b.is_contiguous():
                 b = b.contiguous()
+            if b.data_ptr() % 16:
+                b = b.clone()
             return gemm_a16w16_ring(
                 a,
                 b,
@@ -497,8 +503,14 @@ def flydsl_hgemm(
             # Row-major A/B as for the legacy path; a bpreshuffled B is read in place.
             if a.stride(1) != 1 or a.stride(0) * a.element_size() % 16:
                 a = a.contiguous()
+            # A contiguous view with an aligned row stride can still have a 16-byte-misaligned base (e.g.
+            # ``buf[1:].view(...)``); the split-K ring launcher requires an aligned base, so realign by copy.
+            if a.data_ptr() % 16:
+                a = a.clone()
             if not b.is_contiguous():
                 b = b.contiguous()
+            if b.data_ptr() % 16:
+                b = b.clone()
             return gemm_a16w16_ring_splitk(
                 a,
                 b,
