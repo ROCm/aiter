@@ -6,15 +6,22 @@
 from __future__ import annotations
 
 import ctypes
+import fcntl
+import functools
 import gc
+import importlib
 import json
 import multiprocessing
 import os
+import random
 import re
 import shutil
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
@@ -28,6 +35,17 @@ from aiter_worker_limits import (
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_RETRIES = 2
+# The directory of the worker slots that the pools of one build share
+# (:func:`worker_slots`). Unset, each pool runs its own budget of workers.
+_SLOTS_ENV = "AITER_FLYDSL_AOT_SLOTS"
+# How often a pool that has work, but found every slot taken, looks again.
+_SLOT_POLL_SECONDS = 0.25
+# Workers of the shared budget per stage that replays side by side. A stage
+# brings a replay process per arch (about 0.5 GB private each, up to three),
+# which the worker estimate's margin over what a worker holds (about half of
+# it) pays for at eight workers. Below sixteen workers the stages therefore
+# run one after another.
+_WORKERS_PER_STAGE = 8
 
 
 _CU_NUM_TO_ARCH = {
@@ -246,10 +264,88 @@ def get_max_retries() -> int:
 def get_max_workers(num_jobs: int, start_method: str = "fork") -> int:
     """Workers of a FlyDSL AOT pool. Forked ones are budgeted by what each adds
     to the process it shares its loaded modules and jobs with; those of another
-    start method load their own, and take the general per-worker estimate."""
+    start method load their own, and take the general per-worker estimate.
+
+    Where the pools of a build share worker slots (:func:`worker_slots`), a
+    fork pool may run as many workers as there are slots: the slots, which
+    were budgeted once for all of them, are what bounds it."""
     if start_method == "fork":
+        slots = _slot_count()
+        if slots:
+            return max(1, min(int(num_jobs), slots))
         return get_fork_worker_count_for(num_jobs)
     return get_worker_count_for(num_jobs)
+
+
+def _slot_dir() -> str | None:
+    return os.environ.get(_SLOTS_ENV) or None
+
+
+def _slot_count() -> int:
+    """The worker slots this process shares with other pools; 0 for none."""
+    slot_dir = _slot_dir()
+    if slot_dir is None:
+        return 0
+    try:
+        return len(os.listdir(slot_dir))
+    except OSError as e:
+        raise RuntimeError(
+            f"{_SLOTS_ENV}={slot_dir} names no directory of worker slots: {e}"
+        ) from e
+
+
+def _acquire_slot(slot_dir: str, count: int) -> int | None:
+    """Take a free worker slot: an open file holding its lock, or None when
+    every slot is taken. The lock lasts as long as a process holds the file
+    open, so a worker forked with it keeps the slot until it exits, however it
+    exits, once this process has closed its own copy."""
+    first = random.randrange(count)
+    for offset in range(count):
+        path = os.path.join(slot_dir, str((first + offset) % count))
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError as e:
+            raise RuntimeError(
+                f"worker slot {path} is gone; was the build that owns "
+                f"{_SLOTS_ENV} stopped?"
+            ) from e
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    return None
+
+
+@contextmanager
+def worker_slots(count: int) -> Iterator[str]:
+    """Share ``count`` workers among every fork pool started below, in this
+    process or a child: each worker holds one slot while it runs. Pools then
+    run side by side within one budget, and a pool that finishes leaves its
+    workers to the others, where a split made up front would leave them idle."""
+    slot_dir = tempfile.mkdtemp(prefix="aot_slots_")
+    previous = os.environ.get(_SLOTS_ENV)
+    try:
+        for slot in range(max(1, int(count))):
+            with open(os.path.join(slot_dir, str(slot)), "w"):
+                pass
+        os.environ[_SLOTS_ENV] = slot_dir
+        yield slot_dir
+    finally:
+        if previous is None:
+            os.environ.pop(_SLOTS_ENV, None)
+        else:
+            os.environ[_SLOTS_ENV] = previous
+        shutil.rmtree(slot_dir, ignore_errors=True)
+
+
+def stages_side_by_side(workers: int, stages: int) -> int:
+    """How many of ``stages`` replay at once on a budget of ``workers``."""
+    return max(1, min(int(stages), int(workers) // _WORKERS_PER_STAGE))
 
 
 def worker_waves(workers: int, jobs_per_arch: dict[str, int]) -> list[dict[str, int]]:
@@ -334,22 +430,34 @@ def _run_file_pool(
     queue = list(range(n))
     queue.reverse()  # pop() from the tail -> submission order; retries appended
     running: dict[Any, tuple[int, float | None]] = {}  # proc -> (idx, deadline)
+    # Slots shared with other pools; only a forked worker inherits one.
+    slot_dir = _slot_dir() if start_method == "fork" else None
+    slot_count = _slot_count() if slot_dir else 0
 
-    def launch() -> None:
+    def launch() -> bool:
+        """Start workers; False if work is left only for want of a free slot."""
         while queue and len(running) < max_workers:
-            idx = queue.pop()
-            worker, kwargs, _label = specs[idx]
-            out_path = os.path.join(result_dir, f"k{idx}.json")
+            slot = _acquire_slot(slot_dir, slot_count) if slot_dir else None
+            if slot_dir and slot is None:
+                return False
             try:
-                os.remove(out_path)  # clear any stale file from a prior attempt
-            except OSError:
-                pass
-            proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
-            proc.start()
-            deadline = (
-                (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
-            )
-            running[proc] = (idx, deadline)
+                start(queue.pop())
+            finally:
+                if slot is not None:
+                    os.close(slot)  # the worker holds it now
+        return True
+
+    def start(idx: int) -> None:
+        worker, kwargs, _label = specs[idx]
+        out_path = os.path.join(result_dir, f"k{idx}.json")
+        try:
+            os.remove(out_path)  # clear any stale file from a prior attempt
+        except OSError:
+            pass
+        proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
+        proc.start()
+        deadline = (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
+        running[proc] = (idx, deadline)
 
     def note_done() -> None:
         """Mark one spec as finalized (succeeded or definitively failed) and emit
@@ -399,14 +507,23 @@ def _run_file_pool(
         note_done()
 
     try:
-        launch()
-        while running:
-            if kernel_timeout > 0:
+        launched = launch()
+        while running or queue:
+            wait_timeout: float | None = None
+            if kernel_timeout > 0 and running:
                 nearest = min(d for (_, d) in running.values() if d is not None)
-                wait_timeout: float | None = max(0.0, nearest - time.monotonic())
+                wait_timeout = max(0.0, nearest - time.monotonic())
+            if not launched:
+                # No worker's exit tells that another pool freed a slot.
+                wait_timeout = (
+                    _SLOT_POLL_SECONDS
+                    if wait_timeout is None
+                    else min(wait_timeout, _SLOT_POLL_SECONDS)
+                )
+            if running:
+                wait_for_sentinels([p.sentinel for p in running], timeout=wait_timeout)
             else:
-                wait_timeout = None
-            wait_for_sentinels([p.sentinel for p in running], timeout=wait_timeout)
+                time.sleep(wait_timeout or 0.0)
 
             for proc in list(running):
                 if not proc.is_alive():
@@ -426,7 +543,8 @@ def _run_file_pool(
                             f"exceeded per-kernel timeout ({kernel_timeout:.0f}s); killed",
                         )
 
-            launch()  # refill freed slots (including any just-requeued retries)
+            # Refill freed slots (including any just-requeued retries).
+            launched = launch()
     finally:
         # Kill any survivors (e.g. on an unexpected exception) so we never leave
         # orphaned compilers blocking the caller's exit.
@@ -615,7 +733,13 @@ def assert_no_strict_errata_products(cache_dir: str) -> None:
 def run_aot(cache_dir: str) -> None:
     """Build the FlyDSL AOT cache of every module, as ``setup.py`` does. Each
     replays aiter's runtime, which needs aiter fully imported for the target
-    arch, so each arch replays in a process of its own."""
+    arch, so each arch replays in a process of its own.
+
+    The modules are stages of one build. They replay side by side, as many
+    as the worker budget carries (:func:`stages_side_by_side`), and their
+    pools share that budget worker by worker (:func:`worker_slots`). The MoE
+    stage first builds the C++ modules every replay imports, so the others
+    start once it has."""
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
@@ -624,20 +748,48 @@ def run_aot(cache_dir: str) -> None:
     from .moe import run as run_moe_replay
     from .replay import run_default
 
+    # Imported here, in turn: the stage threads below would import them at once.
+    for module_name in AOT_MODULES:
+        importlib.import_module(module_name)
+
+    host_modules_built = threading.Event()
+
+    def moe_stage() -> str | None:
+        try:
+            failed = run_moe_replay(
+                [p for p in MOE_CSVS if os.path.isfile(p)],
+                prepared=host_modules_built.set,
+            )
+        finally:
+            host_modules_built.set()  # also when it failed, or had no jobs
+        return f"FlyDSL MOE replay failed for {failed} arch(es)" if failed else None
+
+    def mega_moe_stage() -> str | None:
+        host_modules_built.wait()
+        return "FlyDSL MEGA_MOE replay failed" if run_mega_moe_replay() else None
+
+    def module_stage(module_name: str) -> str | None:
+        host_modules_built.wait()
+        failed = run_default(module_name)
+        label = module_name.rsplit(".", 1)[-1].upper()
+        return f"FlyDSL {label} replay failed for {failed} arch(es)" if failed else None
+
+    stages = [moe_stage, mega_moe_stage]
+    stages += [functools.partial(module_stage, name) for name in AOT_MODULES]
+    workers = get_max_workers(sys.maxsize)
+    side_by_side = stages_side_by_side(workers, len(stages))
+    print(
+        f"[aiter] FlyDSL AOT: {len(stages)} stages, {side_by_side} side by side, "
+        f"{workers} workers in all",
+        flush=True,
+    )
     with fail_build_on_missing_target_feature():
-        errors = []
-        moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
-        if moe_failed_archs:
-            errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
-        if run_mega_moe_replay():
-            errors.append("FlyDSL MEGA_MOE replay failed")
-        for module_name in AOT_MODULES:
-            failed_archs = run_default(module_name)
-            if failed_archs:
-                label = module_name.rsplit(".", 1)[-1].upper()
-                errors.append(
-                    f"FlyDSL {label} replay failed for {failed_archs} arch(es)"
-                )
+        # Every stage runs to its end, also after another failed: the pools of
+        # a stage cannot be stopped from here. Then the first error is raised.
+        with worker_slots(workers), ThreadPoolExecutor(side_by_side) as pool:
+            outcomes = [pool.submit(stage) for stage in stages]
+        errors = [outcome.result() for outcome in outcomes]
+        errors = [error for error in errors if error]
         if errors:
             raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
 

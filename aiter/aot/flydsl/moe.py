@@ -62,6 +62,7 @@ import sys
 import time
 import zlib
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from unittest import mock
 
@@ -696,10 +697,17 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     return failed + probes_failed
 
 
-def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int:
+def run(
+    csv_paths: list[str],
+    *,
+    edges: bool = True,
+    check: bool = False,
+    prepared: Callable[[], None] | None = None,
+) -> int:
     """Replay every FlyDSL row of ``csv_paths`` whose arch ``GPU_ARCHS`` names
     (every row when it names none), one process per arch. Returns the number of
-    archs whose replay failed."""
+    archs whose replay failed. ``prepared`` is called once the C++ modules the
+    replays import are built, before the first replay starts."""
     jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
     targets = aot_target_archs()
     available = [job_arch(job) for job in jobs]
@@ -757,6 +765,8 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
             )
         command = [sys.executable, "-c", prepare]
         subprocess.run(command, env=replay_env(arch), check=True)
+    if prepared is not None:
+        prepared()
     failed = 0
     for wave in worker_waves(workers, jobs_per_arch):
         replays = []

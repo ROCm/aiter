@@ -652,3 +652,238 @@ def test_only_a_fork_pool_freezes_or_takes_the_fork_budget():
         assert common.get_max_workers(100, "fork") == 9
         assert common.get_max_workers(100, "forkserver") == 4
         assert common.get_max_workers(100, "spawn") == 4
+
+
+# --- worker slots shared by the pools of one build ---------------------------
+
+_HOLD_SLOT = (
+    "import fcntl, sys, time\n"
+    "f = open(sys.argv[1], 'r+')\n"
+    "fcntl.flock(f, fcntl.LOCK_EX)\n"
+    "print('held', flush=True)\n"
+    "time.sleep(float(sys.argv[2]))\n"
+)
+
+
+def _hold_slot(slot_dir, slot, seconds):
+    """Another pool's worker: a process that holds a slot for ``seconds``."""
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _HOLD_SLOT,
+            os.path.join(slot_dir, str(slot)),
+            str(seconds),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def _logs_its_run(log, seconds=0.2, **_job):
+    import time
+
+    with open(log, "a") as f:
+        f.write(f"start {time.monotonic()}\n")
+    time.sleep(seconds)
+    with open(log, "a") as f:
+        f.write(f"end {time.monotonic()}\n")
+    return {"kernel_name": "k", "compile_time": 0.0}
+
+
+def _most_at_once(log):
+    events = sorted(
+        (float(stamp), 1 if kind == "start" else -1)
+        for kind, stamp in (line.split() for line in open(log))
+    )
+    running = most = 0
+    for _, step in events:
+        running += step
+        most = max(most, running)
+    return most
+
+
+def test_a_pool_runs_as_many_workers_as_the_shared_slots_leave_it(tmp_path):
+    from aiter.aot.flydsl import common
+
+    log = str(tmp_path / "log")
+    jobs = [{"kernel_name": "k", "log": log}] * 4
+    with common.worker_slots(2) as slot_dir:
+        assert common.get_max_workers(100) == 2
+        assert common.get_max_workers(1) == 1
+        results = common.run_jobs_parallel(_logs_its_run, jobs)
+        assert [r["compile_time"] for r in results] == [0.0] * 4
+        assert _most_at_once(log) == 2
+
+        os.remove(log)
+        holder = _hold_slot(slot_dir, 0, 60)
+        try:
+            results = common.run_jobs_parallel(_logs_its_run, jobs)
+        finally:
+            holder.kill()
+            holder.wait()
+        assert [r["compile_time"] for r in results] == [0.0] * 4
+        assert _most_at_once(log) == 1
+    assert common._SLOTS_ENV not in os.environ
+    assert not os.path.exists(slot_dir)
+
+
+def test_a_pool_waits_for_a_slot_instead_of_dropping_its_jobs(tmp_path):
+    import time
+
+    from aiter.aot.flydsl import common
+
+    log = str(tmp_path / "log")
+    with common.worker_slots(1) as slot_dir:
+        holder = _hold_slot(slot_dir, 0, 1.0)
+        started = time.monotonic()
+        results = common.run_jobs_parallel(
+            _logs_its_run, [{"kernel_name": "k", "log": log}] * 2
+        )
+        holder.wait()
+    assert [r["compile_time"] for r in results] == [0.0] * 2
+    assert time.monotonic() - started > 0.8
+
+
+def _dies_once(marker, **_job):
+    import signal
+
+    if not os.path.exists(marker):
+        with open(marker, "w"):
+            pass
+        os.kill(os.getpid(), signal.SIGKILL)
+    return {"kernel_name": "k", "compile_time": 0.0}
+
+
+def test_a_killed_worker_gives_its_slot_back(tmp_path, monkeypatch):
+    from aiter.aot.flydsl import common
+
+    monkeypatch.setenv("AITER_FLYDSL_AOT_MAX_RETRIES", "2")
+    with common.worker_slots(1):
+        results = common.run_jobs_parallel(
+            _dies_once, [{"kernel_name": "k", "marker": str(tmp_path / "died")}]
+        )
+    assert results[0]["compile_time"] == 0.0
+
+
+def test_a_vanished_slot_directory_fails_the_pool(tmp_path, monkeypatch):
+    from aiter.aot.flydsl import common
+
+    monkeypatch.setenv(common._SLOTS_ENV, str(tmp_path / "gone"))
+    with pytest.raises(RuntimeError, match="worker slots"):
+        common.run_jobs_parallel(_logs_its_run, [{"kernel_name": "k", "log": "x"}])
+
+
+@pytest.mark.parametrize(
+    ("workers", "expected"),
+    [(1, 1), (15, 1), (16, 2), (28, 3), (63, 7), (64, 8), (500, 8)],
+)
+def test_stages_run_side_by_side_as_far_as_the_budget_carries(workers, expected):
+    from aiter.aot.flydsl import common
+
+    assert common.stages_side_by_side(workers, 8) == expected
+
+
+def _run_aot_with(monkeypatch, tmp_path, workers, moe=None, module=None):
+    """``run_aot`` over stand-in stages; returns what each saw when it ran."""
+    import threading
+    import time
+
+    from aiter.aot.flydsl import common, mega_moe
+    from aiter.aot.flydsl import moe as moe_module
+
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    seen = []
+    lock = threading.Lock()
+    built = threading.Event()
+
+    def note(stage):
+        with lock:
+            seen.append((stage, built.is_set(), os.environ.get(common._SLOTS_ENV)))
+
+    def run_moe(csv_paths, *, prepared):
+        note("moe")
+        time.sleep(0.2)
+        built.set()
+        if moe is not None:
+            return moe()
+        prepared()
+        return 0
+
+    def run_mega():
+        note("mega_moe")
+        return 0
+
+    def run_default(module_name):
+        note(module_name.rsplit(".", 1)[-1])
+        return module(module_name) if module is not None else 0
+
+    monkeypatch.setattr(moe_module, "run", run_moe)
+    monkeypatch.setattr(mega_moe, "run", run_mega)
+    monkeypatch.setattr(replay, "run_default", run_default)
+    monkeypatch.setattr(common, "get_max_workers", lambda *_: workers)
+    monkeypatch.setattr(common, "assert_no_strict_errata_products", lambda _: None)
+    error = None
+    try:
+        common.run_aot(str(tmp_path / "cache"))
+    except (AssertionError, RuntimeError) as e:
+        error = e
+    assert common._SLOTS_ENV not in os.environ
+    return seen, error
+
+
+def test_run_aot_starts_the_other_stages_once_moe_built_the_host_modules(
+    monkeypatch, tmp_path
+):
+    from aiter.aot.flydsl import common
+
+    seen, error = _run_aot_with(monkeypatch, tmp_path, workers=64)
+    assert error is None
+    stages = [stage for stage, _, _ in seen]
+    assert stages[0] == "moe"
+    assert sorted(stages[1:]) == sorted(
+        ["mega_moe", *(name.rsplit(".", 1)[-1] for name in common.AOT_MODULES)]
+    )
+    assert all(built for _, built, _ in seen[1:])
+    slot_dirs = {slots for _, _, slots in seen}
+    assert len(slot_dirs) == 1 and None not in slot_dirs
+
+
+def test_run_aot_runs_the_stages_in_turn_on_a_small_budget(monkeypatch, tmp_path):
+    from aiter.aot.flydsl import common
+
+    seen, error = _run_aot_with(monkeypatch, tmp_path, workers=8)
+    assert error is None
+    assert [stage for stage, _, _ in seen] == [
+        "moe",
+        "mega_moe",
+        *(name.rsplit(".", 1)[-1] for name in common.AOT_MODULES),
+    ]
+
+
+def test_run_aot_reports_every_failed_stage_after_all_ran(monkeypatch, tmp_path):
+    from aiter.aot.flydsl import common
+
+    seen, error = _run_aot_with(
+        monkeypatch,
+        tmp_path,
+        workers=64,
+        module=lambda name: 2 if name.endswith(".gemm") else 0,
+    )
+    assert len(seen) == 2 + len(common.AOT_MODULES)
+    assert isinstance(error, AssertionError)
+    assert "FlyDSL GEMM replay failed for 2 arch(es)" in str(error)
+    assert "CONV" not in str(error)
+
+
+def test_run_aot_lets_the_other_stages_run_when_moe_raises(monkeypatch, tmp_path):
+    from aiter.aot.flydsl import common
+
+    def moe():
+        raise RuntimeError("no toolchain")
+
+    seen, error = _run_aot_with(monkeypatch, tmp_path, workers=64, moe=moe)
+    assert len(seen) == 2 + len(common.AOT_MODULES)
+    assert isinstance(error, RuntimeError) and "no toolchain" in str(error)
