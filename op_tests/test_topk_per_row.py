@@ -2567,6 +2567,112 @@ def test_flydsl_decode_gates():
     print("[flydsl_decode_gates] PASS: every gate routes and matches torch.topk")
 
 
+def _stable_reference(logits, row_lens, top_k):
+    """Stable decode top-k, exactly: the k best of each row's first row_lens
+    columns, ties to the smaller index, in ascending column order; -1 past
+    min(k, len)."""
+    width = logits.shape[1]
+    past = torch.arange(width, device=logits.device)[None] >= row_lens[:, None]
+    keys = _ordered_keys(logits).masked_fill(past, 1 << 32)
+    ref = torch.sort(keys, dim=1, stable=True)[1][:, :top_k]
+    valid = (
+        torch.arange(top_k, device=logits.device)[None]
+        < row_lens.clamp(max=top_k)[:, None]
+    )
+    ref = torch.sort(ref.masked_fill(~valid, width), dim=1)[0]
+    return ref.masked_fill(~valid, -1).to(torch.int32), valid
+
+
+def test_flydsl_decode_stable_launch_forms():
+    """gfx950 stable decode: the launch forms this arch picks by shape give the
+    exact stable selection, and the same bytes as the form they replace.
+
+    - planes 8193..20000 wide (up to 128 rows) go to the one-block kernel, not
+      the single-launch one-workgroup kernel (`flydsl_top_k_per_row_decode`),
+      which keeps 8192 and below;
+    - the one-block kernel sorts a streaming row's selected indices from 4096
+      keys (8192 for k > 1024): row lengths around both crossovers;
+    - long rows of planes wider than 65536 split into 32768-element parts at
+      k <= 1024, any part count the CUs allow at k <= 512.
+    Data with heavy ties (64 values, one value) and lengths at k and at the
+    crossovers.
+    """
+    arch = get_gfx_runtime()
+    if arch != "gfx950" or G._FLYDSL_TOPK_DECODE_DISABLED:
+        print("[flydsl_decode_stable_launch_forms] gfx950 only; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    gen = torch.Generator(device="cuda").manual_seed(4097)
+    data = {
+        "randn": lambda r, w: torch.randn(r, w, generator=gen),
+        "ties": lambda r, w: torch.randint(0, 64, (r, w), generator=gen).float(),
+        "const": lambda r, w: torch.full((r, w), 1.5),
+    }
+    checked = 0
+
+    def lengths(rows, width, k):
+        edges = [1, k - 1, k, k + 1, 4095, 4096, 4097, 8191, 8192, 8193, width]
+        edges += [32767, 32768, 32769, 65536, 98305]
+        edges = [e for e in edges if 1 <= e <= width]
+        lens = [edges[i % len(edges)] for i in range(rows)]
+        return torch.tensor(lens, dtype=torch.int32)
+
+    # Short planes: one-block (the gate's answer) against one-workgroup.
+    for width in (8192, 8193, 12000, 16384, 20000):
+        for k in T._FLYDSL_TOPK_DECODE_KS:
+            if k >= width:
+                continue
+            for rows in (1, 6, 128):
+                for name, make in data.items():
+                    logits = make(rows, width)
+                    lens = lengths(rows, width, k)
+                    args = (logits, 1, lens)
+                    what = f"short {name} width={width} k={k} rows={rows}"
+                    want = T.BACKEND_SINGLE if width <= 8192 else T.BACKEND_DEFAULT
+                    slot = torch.empty(rows, k, dtype=torch.int32)
+                    call = (logits, 1, lens, slot, rows, width, 1, k, True)
+                    got_backend = T.decode_backend_for_call(*call)
+                    assert got_backend == want, f"routed to {got_backend}: {what}"
+                    got = torch.full((rows, k), -7, dtype=torch.int32)
+                    old = torch.full((rows, k), -7, dtype=torch.int32)
+                    aiter.top_k_per_row_decode(
+                        *args, got, rows, width, 1, k=k, stable=True
+                    )
+                    aiter.flydsl_top_k_per_row_decode(
+                        *args, old, rows, width, 1, k, True
+                    )
+                    ref, valid = _stable_reference(logits, lens, k)
+                    assert torch.equal(got[valid], ref[valid]), what
+                    assert torch.equal(got[valid], old[valid]), f"{what}: forms differ"
+                    checked += 1
+    # Long planes: the split kernel (single launch) against the one-block kernel.
+    for width, k, rows_set in (
+        (65536, 512, (1, 8, 16)),
+        (131072, 2048, (6, 24, 48)),
+        (262144, 1024, (8, 24)),
+        (524288, 512, (24, 36, 66, 90, 126)),
+        (1048576, 512, (40,)),
+    ):
+        for rows in rows_set:
+            for name, make in data.items():
+                logits = make(rows, width)
+                lens = lengths(rows, width, k)
+                what = f"split {name} width={width} k={k} rows={rows}"
+                got = torch.full((rows, k), -7, dtype=torch.int32)
+                one = torch.full((rows, k), -7, dtype=torch.int32)
+                aiter.flydsl_top_k_per_row_decode(
+                    logits, 1, lens, got, rows, width, 1, k, True
+                )
+                aiter.flydsl_radix_topk_one_block_decode(
+                    logits, 1, lens, one, rows, width, 1, k, True
+                )
+                ref, valid = _stable_reference(logits, lens, k)
+                assert torch.equal(got[valid], ref[valid]), what
+                assert torch.equal(got[valid], one[valid]), f"{what}: forms differ"
+                checked += 1
+    print(f"[flydsl_decode_stable_launch_forms] PASS: {checked} cases exact")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -2915,6 +3021,7 @@ _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
     "flydsl-decode-gates": test_flydsl_decode_gates,
+    "flydsl-decode-stable-launch-forms": test_flydsl_decode_stable_launch_forms,
     "flydsl-one-block-long-rows": test_flydsl_one_block_long_rows,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,

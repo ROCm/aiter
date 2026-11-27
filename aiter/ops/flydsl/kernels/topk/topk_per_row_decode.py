@@ -40,23 +40,52 @@ _PART_OPTIONS = (2, 4, 8, 16)
 # element, so its parts are larger.
 _PART_ELEMENTS = 32_768
 _STABLE_PART_ELEMENTS = 65_536
+# gfx950, stable, k <= 1024: parts of 32768 elements, as unstable rows take, on
+# planes wider than 65536 (on those up to 65536 a row stays whole: halving a
+# 65536-key row costs more than its merge saves). Planes of 100000..1048576
+# columns, 1..128 rows, full or mixed lengths, run 0.6-1.0x the time of parts
+# of 65536 (DeepSeek-V4.1 decode, k=512, rows of 2K-300K keys on a 524288-column
+# plane: 1-7 us faster at 24-126 rows). Larger k keeps 65536, where the merge
+# of more parts costs more than it saves on some shapes (up to 1.15x).
+_SMALL_STABLE_PART_ARCHES = ("gfx950",)
+_SMALL_STABLE_PART_MAX_K = 1024
+# There, at k <= 512, a long row also takes as many parts as the free CUs
+# allow rather than the power of two below that (3 at 65..85 rows on 256 CUs,
+# not 2): 1-7 us faster at 36-102 rows. Larger k keeps the power of two (an
+# odd count runs up to 1.6x slower at k >= 1024). The kernel takes any count up
+# to _MAX_PARTS: a row promotes to min(num_parts, option).
+_ANY_PART_COUNT_MAX_K = 512
 
 
-def _part_elements(k: int, stable: bool) -> int:
-    default = _STABLE_PART_ELEMENTS if stable else _PART_ELEMENTS
+def _small_stable_parts(k: int, stable: bool, arch: str) -> bool:
+    return (
+        stable and arch in _SMALL_STABLE_PART_ARCHES and k <= _SMALL_STABLE_PART_MAX_K
+    )
+
+
+def _part_elements(k: int, stable: bool, arch: str = "") -> int:
+    if stable and not _small_stable_parts(k, stable, arch):
+        default = _STABLE_PART_ELEMENTS
+    else:
+        default = _PART_ELEMENTS
     aligned_k = (k + _VEC - 1) // _VEC * _VEC
     return max(default, aligned_k)
 
 
 def topk_per_row_decode_parts(
-    rows: int, width: int, k: int, num_cus: int, stable: bool
+    rows: int, width: int, k: int, num_cus: int, stable: bool, arch: str = ""
 ) -> int:
     """Parts per long row: no more than fill the CUs or than the width can feed.
 
     Each row still takes as many as its own length supports, at run time.
     """
-    part_elements = _part_elements(k, stable)
-    cu_parts = 1 << (max(1, num_cus // max(1, rows)).bit_length() - 1)
+    part_elements = _part_elements(k, stable, arch)
+    small = _small_stable_parts(k, stable, arch)
+    if small and width <= _STABLE_PART_ELEMENTS:
+        return 1
+    cu_parts = max(1, num_cus // max(1, rows))
+    if not (small and k <= _ANY_PART_COUNT_MAX_K):
+        cu_parts = 1 << (cu_parts.bit_length() - 1)
     width_parts = max(1, width // part_elements)
     width_parts = 1 << (width_parts.bit_length() - 1)
     return min(_MAX_PARTS, cu_parts, width_parts)
@@ -92,7 +121,7 @@ def build_topk_per_row_decode_module(
         wave_size=wave_size,
         arch=arch,
     )
-    part_elements = _part_elements(k, stable)
+    part_elements = _part_elements(k, stable, arch)
 
     @fx.struct
     class ArrivalStorage:
@@ -337,7 +366,7 @@ def launch_topk_per_row_decode(
     full_rows: bool = False,
 ) -> None:
     """`full_rows`: every row is `width` long; `seq_lens` is a placeholder."""
-    parts = topk_per_row_decode_parts(rows, width, k, num_cus, stable)
+    parts = topk_per_row_decode_parts(rows, width, k, num_cus, stable, arch)
     if parts == 1:
         launcher = build_radix_topk_one_block_module(
             k,

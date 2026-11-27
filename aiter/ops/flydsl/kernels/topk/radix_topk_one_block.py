@@ -64,6 +64,13 @@ _HALF_BLOCK_LDS_BUDGET_BYTES = {
     "gfx1250": 78 * 1024,
 }
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
+# The streaming-row index-sort crossover by arch, where it differs from the
+# default: twice it for k > 1024. On gfx950 the sort of the selected indices
+# beats the ordered re-scan of the row from 4096 keys a row, at every row count
+# from 6 to 288 (DeepSeek-V4.1 decode top-k, stable): 16384 keys, k=512,
+# 16.3-23.0 -> 12.5-17.5 us; 131072-column rows of 2K-75K keys, k=2048, 24-38
+# -> 16-31 us. The selection and its order do not depend on it.
+_STABLE_INDEX_SORT_MIN_ROW_LEN_BY_ARCH = {"gfx950": 1 << 12}
 _STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 # Arches whose streaming rows always take the index sort: there it beats the
 # ordered re-scan of the row at every length past the cached capacity.
@@ -280,9 +287,9 @@ def build_radix_topk_one_block_body(
         stable_sort_min_row_len = stable_compact_sort_min_row_len = 0
     else:
         # Keep the crossover for a full-row gather followed by index sorting.
-        stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN * (
-            2 if k > 1024 else 1
-        )
+        stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN_BY_ARCH.get(
+            arch, _STABLE_INDEX_SORT_MIN_ROW_LEN
+        ) * (2 if k > 1024 else 1)
         # Cached output uses a fixed 48K crossover on every architecture.
         # Preserve existing configurations whose crossover is already lower.
         stable_compact_sort_min_row_len = min(

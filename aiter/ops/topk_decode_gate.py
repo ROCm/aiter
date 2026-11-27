@@ -31,7 +31,14 @@ _FLYDSL_TOPK_DECODE_GATES = {
     },
     "gfx950": {
         True: (
-            (0, 20_000, 128),
+            # Stable planes 8193..20000 wide go to the FlyDSL one-block
+            # kernel, which sorts a row's selected indices from 4096 keys
+            # (8192 for k > 1024), rather than to the one-workgroup kernel:
+            # 1..128 rows, full or mixed lengths, k=512 / 1024 / 2048 run
+            # 0.66-0.98x the time (16384 keys, k=512: 17 -> 12-13 us); k=4096
+            # 0.90-1.05x. At 8192 and below the one-workgroup kernel keeps
+            # k=2048 (up to 1.08x slower there). Same selection.
+            (0, 8_192, 128),
             (32_768, 65_535, 16),
             (65_536, 131072, 32),
             (131072, 200_000, 48),
