@@ -14,7 +14,8 @@ gfx950 also checks the OPUS MXFP8 1x32 backends: every kid of a8w8_mxfp8
 (plain NT / NN / TT / TN) and of a8w8_mxfp8_bpreshuffle (NT, shuffled B)
 (split-K kids at S = 2 / 4), the public route of a libtype "opus" tuned row
 (injected, not read from the production CSVs), outputs and operands of 4 GiB
-and more, the shapes the launchers must reject and the gemm_a8w8_mxfp8_opus API.
+and more, K that is not a multiple of 256 (or, through the API, of 32), the
+shapes the launchers must reject and the gemm_a8w8_mxfp8_opus API.
 """
 
 import argparse
@@ -124,11 +125,16 @@ def test_w_scale_layout(n=64, kb=16):
 # ---- OPUS a8w8_mxfp8 / a8w8_mxfp8_bpreshuffle (gfx950) ------------------------
 # Ragged M / N tails, an N below every tile width, and a tile-aligned shape (the
 # only one the "nob" kid runs); M % 16 and N % 16 so every layout is legal.
+# K % 256 != 0 (the "np" / persistent kids): a partial last K tile (288), an odd
+# number of whole ones (1152) and less than one (96).
 DEFAULT_OPUS_MNK = [
     (304, 400, 768),
     (1008, 4128, 2048),
     (16, 128, 256),
     (2048, 1536, 7168),
+    (304, 400, 288),
+    (1008, 528, 1152),
+    (48, 272, 96),
 ]
 # A 4 GiB C: a 32-bit buffer range over all of C wraps here, so these need the
 # kernel's per-tile 64-bit C base (and fault or drop rows without it).
@@ -469,16 +475,50 @@ def check_opus_api():
         y.data_ptr() == out.data_ptr() and err == 0
     ), f"kernelId {sk} + out: err {err}"
     rows.append({"case": "kernelId (split-K) + out", "kid": sk, "ok": True})
+    # K % 32 != 0: ceil(K / 32) scale groups, the last one over K % 32 elements
+    # (the API zero-pads the operands to whole groups).
+    m, n, k = 304, 416, 1025
+    groups = -(-k // 32)
+
+    def ragged_k(rows):
+        x = torch.zeros(rows, groups * 32, dtype=dtypes.bf16)
+        x[:, :k] = torch.randn(rows, k, dtype=dtypes.bf16)
+        return per_group_quant_hip(
+            x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+        )
+
+    (xq_k, x_scale_k), (wq_k, w_scale_k) = ragged_k(m), ragged_k(n)
+    ref = run_torch(xq_k, x_scale_k, wq_k, w_scale_k, (1, 32))
+    for layout in OPUS_LAYOUTS:
+        a_k, b_k = xq_k[:, :k].contiguous(), wq_k[:, :k].contiguous()
+        y = gemm_a8w8_mxfp8_opus(
+            a_k if layout[0] == "N" else a_k.T.contiguous().T,
+            b_k if layout[1] == "T" else b_k.T.contiguous().T,
+            x_scale_k,
+            w_scale_k,
+        )
+        err = checkAllclose(ref, y.float(), printLog=False)
+        assert err == 0, f"API {layout} K={k}: err {err}"
+        rows.append({"case": f"K={k} {layout}", "kid": None, "ok": True})
     padded = torch.empty(416, 1024 + 64, dtype=wq.dtype)[:, :1024]
     padded.copy_(wq)
+    _, x_scale_tt, _, w_scale_tt, a_tt, b_tt = opus_inputs(312, 416, 768, "TT")
     cases = {
-        "non-dense WQ": (xq, padded, "needs dense"),
+        "non-dense WQ": (xq, padded, x_scale, w_scale, "needs dense"),
         # A stored [K, M] needs M % 16; 312 % 16 = 8.
-        "TT with M % 16": (*opus_inputs(312, 416, 768, "TT")[4:], "no TT MXFP8"),
+        "TT with M % 16": (a_tt, b_tt, x_scale_tt, w_scale_tt, "no TT MXFP8"),
+        # ceil(1025 / 32) = 33 scale groups, not K // 32 = 32.
+        "K=1025 with K // 32 scale groups": (
+            xq_k[:, :k].contiguous(),
+            wq_k[:, :k].contiguous(),
+            x_scale_k[:, : k // 32].contiguous(),
+            w_scale_k,
+            "x_scale / w_scale must be",
+        ),
     }
-    for case, (aa, bb, match) in cases.items():
+    for case, (aa, bb, xs, ws, match) in cases.items():
         try:
-            gemm_a8w8_mxfp8_opus(aa, bb, x_scale, w_scale)
+            gemm_a8w8_mxfp8_opus(aa, bb, xs, ws)
             rejected = False
         except ValueError as e:
             rejected = match in str(e)

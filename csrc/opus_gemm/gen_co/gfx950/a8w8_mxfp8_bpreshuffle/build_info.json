@@ -11,7 +11,7 @@
   "hip_clang_path": "/root/llvm-project/build/bin",
   "kernels": [
     {
-      "co_sha256": "b2388dddb7bb9b5178d31d53a5e7c47c48e80f15d29e82354492d7dafea5295a",
+      "co_sha256": "053543a1dfcd9ea07f06083e7c3c9fb5e80717223df760bd3710a369c915593f",
       "device_flags": [
         "-ffast-math"
       ],
@@ -43,7 +43,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6814b839418176c2b902a1414264f0f9ac472b4352366ef1becf61062f662bb8",
+      "co_sha256": "d5821ec75a734eb56c812733dd5d787a62eeee776c5f160e07b42e08b6002114",
       "device_flags": [
         "-ffast-math"
       ],
@@ -75,7 +75,7 @@
       "vgpr_spill_count": 2
     },
     {
-      "co_sha256": "4afce123e0eda556701ac94eaf78dfdb3c191abbcbb4eebf6e3543bfa6bd5093",
+      "co_sha256": "b53899605c6434ab733f7586bfdee683681a5e386cb92b2c56f51e3263ae6724",
       "device_flags": [
         "-ffast-math"
       ],
@@ -107,7 +107,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "b29b2c144ef82dcc3d48d22f1eb3df996e8b6dabe1e628f2056f233a417ed006",
+      "co_sha256": "c17596f44f034dc475ed4d1ca264aa1889a0a5fbd242cc9dc6f202d28b5b8ed0",
       "device_flags": [
         "-ffast-math"
       ],
@@ -139,7 +139,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "a505f3f22f3b1f7469bf8b6be41645a8b535455ee407e39eeae8c89e63b3772e",
+      "co_sha256": "e0f2a505fe2eb3cfb29076efd47097dc3d700fd89db21856a035afba14ccc1c2",
       "device_flags": [
         "-ffast-math"
       ],
@@ -171,7 +171,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2b40bf727bdc915331ea70aaaf5cdd51865e62ae74b44eaf17380aeb757a5169",
+      "co_sha256": "a63a06e80db66fffffcd58924fee10405a3c1a1edbb62006649d2797c5952a6a",
       "device_flags": [
         "-ffast-math"
       ],
@@ -203,7 +203,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "cf39c0db945101c084e42d7ba1a3cfc0ed8ac2fc29ce1f877588160ca353083f",
+      "co_sha256": "0e844e593c660e7757c4b9163da24c185eee3bcccc805ca509947cb7c65f244f",
       "device_flags": [
         "-ffast-math"
       ],
@@ -235,7 +235,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "e89fc3be9100958dcb502f82a5fabd09114ffa077910b1bc4f8d7e8080114759",
+      "co_sha256": "242379541ce88e0fd7f13f7e7d6c0b3e87a8c154ab1867fb529ae19102413831",
       "device_flags": [
         "-ffast-math"
       ],
@@ -267,7 +267,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "dffa7b5493f3fb7d153ca2cab8ad80c3034900daf4e9ba606daeb9293c082e9c",
+      "co_sha256": "db424d24531bc81db262cd200c2f4ae98df06cb59a005aa3a86d3b182307a563",
       "device_flags": [
         "-ffast-math"
       ],
@@ -299,7 +299,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "38b33cbd613349145ed9bfe091e3f86e241891bd31d20ada87677a221a4465c2",
+      "co_sha256": "1c0680fe55b827bc3d7b6c7978b1a8c8856475de8140054085cae7a715825607",
       "device_flags": [
         "-ffast-math"
       ],
@@ -316,7 +316,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 3,
+      "sgpr_spill_count": 4,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_bpreshuffle_co_128x128x128",
       "tile": [
@@ -331,7 +331,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "9bf721afe7d0addf914ce6acc84a19b702bc55c082d06ea26b1127fb53c901e0",
+      "co_sha256": "1711c1f357b3664a0bd946b7789453ee1a2c60866b5b8636f4c9c5a8b51fe3bd",
       "device_flags": [
         "-ffast-math"
       ],
@@ -363,7 +363,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "b924a4471b478ed60245fdeea64090d7b73ba61eeb33bd42d8b2d76a3856a2fb",
+      "co_sha256": "0b187e616e89322722ccfe878ff94c453a37ea09958c66114c861e0eac83956b",
       "device_flags": [
         "-ffast-math"
       ],

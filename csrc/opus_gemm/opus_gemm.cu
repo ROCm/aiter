@@ -566,15 +566,18 @@ static void opus_gemm_a8w8_mxfp8_run(
               entry, ": WQ must be [batch, N, K] matching XQ");
   AITER_CHECK(Y.size(0) == batch && Y.size(1) == M && Y.size(2) == N,
               entry, ": Y must be [batch, M, N]");
+  // Scales have K/32 columns, or more: a K that is not a multiple of 256 carries the zeroed groups of its last K
+  // tiles (the kid launcher checks how many, and which K it runs).
   AITER_CHECK(K % 32 == 0 && K > 0,
               entry, ": K must be a positive multiple of 32 (got K=", K, ")");
+  const int64_t groups_k = K / 32;
   auto check_scale = [&](const aiter_tensor_t& s, int64_t rows, const char* name) {
     AITER_CHECK(s.element_size() == 1, entry, ": ", name, " must be e8m0 (1 byte)");
     AITER_CHECK((s.dim() == 2 && s.size(0) == batch * rows) ||
                     (s.dim() == 3 && s.size(0) == batch && s.size(1) == rows),
                 entry, ": ", name, " must be [batch * ", rows, ", K/32] or [batch, ",
                 rows, ", K/32]");
-    AITER_CHECK(s.size(-1) == K / 32, entry, ": ", name, " must have K/32 = ", K / 32,
+    AITER_CHECK(s.size(-1) >= groups_k, entry, ": ", name, " must have at least K/32 = ", groups_k,
                 " columns (got ", s.size(-1), ")");
   };
   check_scale(x_scale, M, "x_scale");

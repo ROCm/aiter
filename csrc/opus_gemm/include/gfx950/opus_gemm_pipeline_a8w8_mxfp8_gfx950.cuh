@@ -627,7 +627,11 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
     const int tile_in_batch = TILE_LIST ? tile_id % tiles_per_batch : static_cast<int>(block_id_x());
     const int block_m = tile_in_batch / num_tiles_n;
     const int block_n = tile_in_batch % num_tiles_n;
-    const int loops = (T::SPLITK ? kargs.k / split_k : kargs.k) / T::B_K;
+    // K tiles, in pairs.  K % 32 == 0 need not be a multiple of 2 B_K (BOUNDARY kids, no split-K): the last pair then
+    // runs past K.  An A_T / B_T operand reads zero there (its buffer range ends with K row K - 1); a row-major one
+    // reads what follows its K bytes (the next row, or zero past its range).  Either way the host passes 0x00 scales
+    // (2^-127) for the 1x32 groups past K, on A and on B, so those products underflow to exactly 0.
+    const int loops = T::SPLITK ? kargs.k / split_k / T::B_K : (kargs.k + 2 * T::B_K - 1) / (2 * T::B_K) * 2;
     const int row = block_m * T::B_M;
     const int col = block_n * T::B_N;
     const int batch_id = TILE_LIST ? tile_id / tiles_per_batch : static_cast<int>(block_id_z());
@@ -674,7 +678,9 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
     const long a_k_step = static_cast<long>(T::B_K) * kargs.stride_a, b_k_step = static_cast<long>(T::B_K) * kargs.stride_b;
     const D_AB* a_k_base = a_base + kt0 * a_k_step;
     const D_AB* b_k_base = b_base + kt0 * b_k_step;
-    long a_k_left = (kargs.k / T::B_K - kt0) * a_k_step - row, b_k_left = (kargs.k / T::B_K - kt0) * b_k_step - col;
+    // To the last K row exactly: a ragged K's rows past K are outside the range and read zero.
+    long a_k_left = static_cast<long>(kargs.k - kt0 * T::B_K) * kargs.stride_a - row;
+    long b_k_left = static_cast<long>(kargs.k - kt0 * T::B_K) * kargs.stride_b - col;
     // C: 64-bit tile base and a buffer range bounded to this output tile (as the blockscale 4wave_pin_agpr WIDE_OUTPUT), so
     // the 32-bit range and offsets cover one tile whatever the size of C; the host keeps one tile under 2 GiB.  BOUNDARY:
     // the range ends at the last valid element of the tile (rows past M start beyond it since stride_c >= cols_in).

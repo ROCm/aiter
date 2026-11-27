@@ -2849,7 +2849,8 @@ gfx1250_4wave_co_kernels_declared = {
 
 # -- gfx950 a8w8_mxfp8 / a8w8_mxfp8_bpreshuffle (MXFP8 x MXFP8, 1x32 e8m0) ----
 # x_scale [M, K/32] / w_scale [N, K/32] row-major e8m0 and bf16 C in every
-# layout; K % 256.
+# layout; K % 256, or on the "np" / persistent kids K % 32 (the scales then carry
+# the zeroed 1x32 groups of the last K tile pair, see aiter/ops/opus/gemm_op_a8w8.py).
 #   a8w8_mxfp8 (plain): NT A [M, K], B [N, K]; NN B stored [K, N]; TT A stored
 #     [K, M]; TN both.  A [K, M] needs M % 16, B [K, N] N % 16.
 #   a8w8_mxfp8_bpreshuffle: NT, B = shuffle_weight([N, K], layout=(16, 16)) (aiter

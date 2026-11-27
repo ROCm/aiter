@@ -647,7 +647,7 @@ def gemm_a8w8_blockscale_opus(
 # a8w8_mxfp8_bpreshuffle: NT, WQ = shuffle_weight(w, layout=(16, 16)) of B [N, K].
 # x_scale [M, K/32] and w_scale [N, K/32] are row-major e8m0 and Y [M, N] bf16
 # in every layout. Both families have the same kids (tiles / variants).
-_MXFP8_K_ALIGN = 256  # two K tiles of 128
+_MXFP8_K_ALIGN = 256  # two K tiles of 128: the kernels run K tiles in pairs
 
 
 def a8w8_mxfp8_kid_runs(
@@ -658,12 +658,16 @@ def a8w8_mxfp8_kid_runs(
     so they may exceed 4 GiB: the 32-bit buffer ranges bound one tile of an
     operand (B_M / B_N rows of K, or B_K rows of a stored [K, M] / [K, N]) and
     its scales, one C tile to 2 GiB (C itself may exceed 4 GiB) and the
-    split-K workspace to 4 GiB."""
+    split-K workspace to 4 GiB. K is a multiple of 32; the boundary kids
+    ("np", persistent) run one that is not a multiple of 256 on scales whose
+    1x32 groups past K are zeroed (see :func:`_a8w8_mxfp8_scale_groups`)."""
     a_t, b_t = layout.upper()[0] == "T", layout.upper()[1] == "N"
     # A stored [K, M] needs M % 16 (B stored [K, N] N % 16, as every N below).
     if a_t and M % 16:
         return False
-    if K <= 0 or K % _MXFP8_K_ALIGN:
+    if K <= 0 or K % 32:
+        return False
+    if K % _MXFP8_K_ALIGN and instance.co_variant not in ("np", ""):
         return False
     limit = (1 << 31) - 1
     for transposed, rows, tile_rows in ((a_t, M, instance.B_M), (b_t, N, instance.B_N)):
@@ -684,6 +688,27 @@ def a8w8_mxfp8_kid_runs(
             and _a8w8_mxfp8_workspace_bytes(instance, M, N, split_k) <= (1 << 32) - 1
         )
     return split_k <= 1
+
+
+def _a8w8_mxfp8_scale_groups(K: int) -> int:
+    """Scale columns a launch of K reads: K / 32, or for a K that is not a
+    multiple of 256 every 1x32 group of the K tile pairs the kernel runs
+    (ceil(K / 256) * 8). The groups past K / 32 must be 0x00 (2^-127): they
+    multiply whatever follows the operands' K bytes, and both scales being
+    zero the products underflow to exactly 0."""
+    return K // 32 if K % _MXFP8_K_ALIGN == 0 else -(-K // _MXFP8_K_ALIGN) * 8
+
+
+def _a8w8_mxfp8_scale(scale: Tensor, K: int) -> Tensor:
+    """``scale`` [rows, K / 32] with the zeroed groups of a ragged K appended
+    (a copy of K / 32 bytes per row); returned as is when K is a multiple of
+    256 or the caller already passes every group."""
+    groups = _a8w8_mxfp8_scale_groups(K)
+    if scale.shape[-1] >= groups:
+        return scale
+    padded = scale.new_zeros((*scale.shape[:-1], groups), dtype=torch.uint8)
+    padded[..., : scale.shape[-1]] = scale.view(torch.uint8)
+    return padded.view(scale.dtype)
 
 
 def _a8w8_mxfp8_workspace_bytes(instance, M: int, N: int, split_k: int) -> int:
@@ -773,8 +798,8 @@ def _launch_a8w8_mxfp8_gemm(
             XQ.unsqueeze(0),
             WQ.unsqueeze(0),
             Y.unsqueeze(0),
-            x_scale,
-            w_scale,
+            _a8w8_mxfp8_scale(x_scale, k),
+            _a8w8_mxfp8_scale(w_scale, k),
             workspace,
             resolved_kid,
             abi_split_k,
@@ -823,6 +848,19 @@ def _select_a8w8_mxfp8_kid(
     return best[1] if best_sk is None else best_sk[1]
 
 
+def _a8w8_mxfp8_pad_k(operand: Tensor, transposed: bool, K: int) -> Tensor:
+    """Logical [rows, K'] ``operand`` zero-padded to [rows, K] in the storage
+    it has ([rows, K'], or [K', rows] when ``transposed``): a copy."""
+    rows, k = operand.shape
+    shape = (K, rows) if transposed else (rows, K)
+    padded = torch.zeros(shape, dtype=torch.uint8, device=operand.device)
+    if transposed:
+        padded[:k] = operand.T.view(torch.uint8)
+        return padded.view(operand.dtype).T
+    padded[:, :k] = operand.view(torch.uint8)
+    return padded.view(operand.dtype)
+
+
 def gemm_a8w8_mxfp8_opus(
     XQ: Tensor,
     WQ: Tensor,
@@ -842,6 +880,12 @@ def gemm_a8w8_mxfp8_opus(
     x_scale [M, K/32] and w_scale [N, K/32] are row-major E8M0 in every layout.
     Output is BF16.
 
+    Any M (A stored [K, M]: M % 16), N % 16 and any K. A K that is a multiple
+    of 32 runs on the operands as they are. Any other K has ceil(K/32) scale
+    groups, the last one over its K % 32 elements; XQ and WQ are then copied
+    into zero-padded operands of the next multiple of 32, which costs their
+    size per call -- pad the weight once and pass that K to avoid it.
+
     ``kernelId`` runs that kid (split-K kids pick their split); otherwise one
     is picked by shape.
     """
@@ -857,19 +901,32 @@ def gemm_a8w8_mxfp8_opus(
         )
     M, K = map(int, XQ.shape)
     N = int(WQ.shape[0])
+    if int(WQ.shape[1]) != K:
+        raise ValueError(f"XQ is [{M}, {K}] but WQ is {tuple(WQ.shape)}")
+    groups = -(-K // 32)
+    if tuple(x_scale.shape) != (M, groups) or tuple(w_scale.shape) != (N, groups):
+        raise ValueError(
+            f"x_scale / w_scale must be [{M}, {groups}] / [{N}, {groups}] for K={K}, "
+            f"got {tuple(x_scale.shape)} / {tuple(w_scale.shape)}"
+        )
     if out is None:
         out = torch.empty((M, N), dtype=dtype, device=XQ.device)
     elif tuple(out.shape) != (M, N) or out.dtype != dtype:
         raise ValueError(
             f"out must be {dtype} [{M}, {N}], got {out.dtype} {tuple(out.shape)}"
         )
+    if K % 32:
+        # The kernels take whole 1x32 groups: zero the K % 32 tail of the last one.
+        K = groups * 32
+        XQ = _a8w8_mxfp8_pad_k(XQ, direction[0] == "T", K)
+        WQ = _a8w8_mxfp8_pad_k(WQ, direction[1] == "N", K)
     if kernelId is None:
         arch, cu_num = _device_arch_and_cu(XQ.device)
         kernelId = _select_a8w8_mxfp8_kid(direction, M, N, K, arch, cu_num)
         if kernelId is None:
             raise ValueError(
                 f"no {direction} MXFP8 1x32 kernel supports M={M}, N={N}, K={K} on "
-                f"{arch} (K % 256 and N % 16 must be 0; A stored [K, M] needs M % 16)"
+                f"{arch} (N % 16 must be 0; A stored [K, M] needs M % 16)"
             )
     return _launch_a8w8_mxfp8_gemm(XQ, WQ, out, x_scale, w_scale, kid=int(kernelId))
 

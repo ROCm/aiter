@@ -50,7 +50,8 @@ __host__ __device__ inline int opus_mxfp8_ceil_div(int a, int b) { return (a + b
 // One fp8 MFMA covers K = W_K = 128 = the whole K tile (E_K = 1): lane group
 // g = lane / 16 holds K [32g, +32) = 32 bytes = E_C = 2 chunks of 16 bytes.
 // aiter form: <BLOCK_SIZE, seq<B_M, B_N, B_K>, tuple<D_A, D_B, D_C, D_ACC, D_SF>, seq<VEC_A, VEC_B, VEC_C>, seq<GROUP_M, GROUP_N, GROUP_K>>.
-// Supported: BLOCK_SIZE 256, B_M / B_N in {256, 192, 128}, B_K 128, VEC <16, 16, 4>, GROUP <1, 1, 32>; K % 256.
+// Supported: BLOCK_SIZE 256, B_M / B_N in {256, 192, 128}, B_K 128, VEC <16, 16, 4>, GROUP <1, 1, 32>; K % 32 (BOUNDARY kids without
+// split-K; the others K % 256), the host zeroing the scales of the 1x32 groups past K of the last K tile pair.
 // MODE_: 0 = persistent (grid = min(tiles, CUs)), 1 = one tile per block (grid = tiles), 2 = split-K (one tile x K segment
 // per block, fp32 partials in a workspace, summed into C by splitk_reduce_kernel).
 // BOUNDARY_: M / N boundary handling (any M, N % 16; A_T: M % 16, B_T: N % 16); false needs M % B_M == 0 and N % B_N == 0.

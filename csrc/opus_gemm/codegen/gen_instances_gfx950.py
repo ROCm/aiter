@@ -3553,6 +3553,10 @@ def gen_a8w8_mxfp8_co_instance(
 
     variant = k.co_variant
     mode = A8W8_MXFP8_CO_MODE[variant]
+    # A K that is a multiple of 32 but not of 2 B_K runs on the boundary kids ("np", persistent): the kernel rounds
+    # its K tiles up to a pair and the caller zeroes the scales of the 1x32 groups past K (see below). "nob" has no
+    # buffer ranges and split-K splits whole tile pairs, so those need K % (2 B_K) == 0.
+    ragged_ok = variant in ("np", "")
     co_dir = a8w8_mxfp8_co_dir(k)
     symbols = dict(a8w8_mxfp8_co_images(k))
     images = ", ".join(
@@ -3565,6 +3569,21 @@ def gen_a8w8_mxfp8_co_instance(
     else:
         align_code = (
             f"""AITER_CHECK(N % 16 == 0, "{k.name} needs N % 16 == 0 (N=", N, ")");"""
+        )
+    if ragged_ok:
+        # The kernel runs ceil(K / {2 * k.B_K}) * 2 K tiles of 4 scale groups each. The groups past K / 32 multiply
+        # whatever follows the operands' K bytes (the next row, or zero past the buffer range), so their scales must
+        # be 0x00 (2^-127 each: the products underflow to 0): scales of a ragged K have every group of those tiles.
+        k_base_check = f"""AITER_CHECK(K % 32 == 0, "{k.name} needs K % 32 == 0 (K=", K, ")");
+    const int k_groups = K % {2 * k.B_K} == 0 ? K / 32 : (K + {2 * k.B_K - 1}) / {2 * k.B_K} * {2 * k.B_K // 32};
+    AITER_CHECK(x_scale.size(-1) >= k_groups && w_scale.size(-1) >= k_groups,
+                "{k.name}: K=", K, " is not a multiple of {2 * k.B_K}: x_scale / w_scale need ", k_groups,
+                " columns, those from K / 32 = ", K / 32, " on 0x00 (got ", x_scale.size(-1), " / ",
+                w_scale.size(-1), ")");"""
+    else:
+        k_base_check = (
+            f"AITER_CHECK(K % {2 * k.B_K} == 0, "
+            f'"{k.name} needs K % {2 * k.B_K} == 0 (K=", K, ")");'
         )
     if mode == 2:
         mode_code = f"""const int S = splitK < 1 ? 1 : splitK;
@@ -3620,7 +3639,7 @@ void
     const int M = XQ.size(1);
     const int K = XQ.size(2);
     const int N = WQ.size(1);
-    AITER_CHECK(K % {2 * k.B_K} == 0, "{k.name} needs K % {2 * k.B_K} == 0 (K=", K, ")");
+    {k_base_check}
     {align_code}
     // 32-bit buffer ranges: one C tile (the kernel bases C per tile in 64 bits) stays under 2 GiB.
     // C is bounded on a whole {k.B_M}-row tile whatever M is: the epilogue stores every tile row at
@@ -3682,10 +3701,11 @@ void
     kargs.stride_a_batch = batch == 1 ? 0 : M * K;
     kargs.stride_b_batch = batch == 1 ? 0 : N * K;
     kargs.stride_c_batch = batch == 1 ? 0 : M * N;
-    kargs.stride_sfa = K / 32;  // row-major [rows, K/32] e8m0
-    kargs.stride_sfb = K / 32;
-    kargs.stride_sfa_batch = batch == 1 ? 0 : M * (K / 32);
-    kargs.stride_sfb_batch = batch == 1 ? 0 : N * (K / 32);
+    // Row-major e8m0 scales; the row stride is the scale's own width (K / 32, or more for a ragged K, see above).
+    kargs.stride_sfa = (int)x_scale.size(-1);
+    kargs.stride_sfb = (int)w_scale.size(-1);
+    kargs.stride_sfa_batch = batch == 1 ? 0 : M * (int)x_scale.size(-1);
+    kargs.stride_sfb_batch = batch == 1 ? 0 : N * (int)w_scale.size(-1);
     const int tiles = ((M + {k.B_M} - 1) / {k.B_M}) * ((N + {k.B_N} - 1) / {k.B_N}) * batch;
     kargs.grid_blocks = tiles;
     kargs.split_k = 1;
