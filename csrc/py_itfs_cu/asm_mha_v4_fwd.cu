@@ -434,10 +434,11 @@ constexpr int64_t kKvScaleTrailingDwordSlack = 4;
 // The 64x64 sparse and Sol-Attn MX-V objects gather V scales through a raw pointer, 512 bytes from
 // the first token of each 64-token block. For a block in the second half of a 128-token scale
 // tile that ends 256 bytes past the tile, so the last (batch, head) reads past the tensor. The
-// dense and 256-row objects bound the gather with a buffer descriptor and need nothing. Mirrors the
-// producers' MHA_V4_MXFP4_V_SCALE_SLACK_BYTES and MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES.
+// dense and 256-row objects, the hd256 256x64 ones included, bound the gather with a buffer
+// descriptor and need nothing. Mirrors the producers' MHA_V4_MXFP4_V_SCALE_SLACK_BYTES and
+// MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES.
 constexpr int64_t kMxVScaleSlackBytes = 1024;
-constexpr int64_t kMxVUnboundedKvTile = 64;
+constexpr int64_t kMxVUnboundedTile   = 64;
 
 void check_scale_backing_storage(const at::Tensor& descale,
                                  int64_t sequence,
@@ -551,7 +552,7 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
 {
     const bool mx_v = recipe.v_format == format_id(AttentionFormat::Fp6E2M3) ||
                       recipe.v_format == format_id(AttentionFormat::Fp4E2M1);
-    if(!mx_v || cfg.ts_kv != kMxVUnboundedKvTile)
+    if(!mx_v || cfg.ts_qo != kMxVUnboundedTile || cfg.ts_kv != kMxVUnboundedTile)
         return;
     const int64_t required = v_descale.numel() + kMxVScaleSlackBytes;
     const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
@@ -570,33 +571,46 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
 }
 
 // The hd128 MXFP6 K packer writes each 128-token tile as one record of codes followed by that
-// tile's E8M0 scales, and the kernels read both from the record. So an MXFP6 K operand has to be a
-// view of such records: a tensor of the right shape with any other backing hands them codes from
-// the wrong rows and scales from whatever follows. The last record's scale read runs past it, into
-// the zeroed slack the packer reserves after the buffer. Mirrors FP6_K_TILE_BYTES and
-// FP6_K_BUFFER_SLACK_BYTES in aiter.ops.triton.quant.mxfp6_fmha_pack.
-constexpr int64_t kMxfp6KTileRows    = 128;
-constexpr int64_t kMxfp6KTileBytes   = 17408;
-constexpr int64_t kMxfp6KRowStride   = kMxfp6KTileBytes / kMxfp6KTileRows;
-constexpr int64_t kMxfp6KBufferSlack = 256;
+// tile's E8M0 scales (hd256: each 64-token tile), and the kernels read both from the record. So an
+// MXFP6 K operand has to be a view of such records: a tensor of the right shape with any other
+// backing hands them codes from the wrong rows and scales from whatever follows. The last record's
+// scale read runs past it, into the zeroed slack the packer reserves after the buffer. Mirrors
+// FP6_K_TILE_BYTES and FP6_K_BUFFER_SLACK_BYTES in aiter.ops.triton.quant.mxfp6_fmha_pack, and
+// MHA_V4_MXFP6_HD256_K_TILE_TOKENS and MHA_V4_MXFP6_HD256_K_TILE_BYTES in aiter.ops.mha_v4_quant.
+constexpr int64_t kMxfp6KTileRows       = 128;
+constexpr int64_t kMxfp6KTileBytes      = 17408;
+constexpr int64_t kMxfp6Hd256KTileRows  = 64;
+constexpr int64_t kMxfp6Hd256KTileBytes = 13312;
+constexpr int64_t kMxfp6KBufferSlack    = 256;
 
-void check_mxfp6_k_record_storage(const at::Tensor& packed, int64_t rows, const char* name)
+void check_mxfp6_k_record_storage(const at::Tensor& packed,
+                                  int64_t rows,
+                                  int64_t head_dim,
+                                  const char* name)
 {
-    const int64_t records = (rows + kMxfp6KTileRows - 1) / kMxfp6KTileRows;
-    TORCH_CHECK(packed.stride(3) == 1 && packed.stride(1) == kMxfp6KRowStride &&
-                    packed.stride(2) % kMxfp6KTileBytes == 0 &&
-                    packed.stride(2) >= records * kMxfp6KTileBytes && packed.stride(0) >= 0,
+    TORCH_CHECK(head_dim == 128 || head_dim == 256,
+                name,
+                " is an MXFP6 K record buffer, which is packed for head dim 128 or 256; got ",
+                head_dim);
+    const bool hd256         = head_dim == 256;
+    const int64_t tile_rows  = hd256 ? kMxfp6Hd256KTileRows : kMxfp6KTileRows;
+    const int64_t tile_bytes = hd256 ? kMxfp6Hd256KTileBytes : kMxfp6KTileBytes;
+    const int64_t row_stride = tile_bytes / tile_rows;
+    const int64_t records    = (rows + tile_rows - 1) / tile_rows;
+    TORCH_CHECK(packed.stride(3) == 1 && packed.stride(1) == row_stride &&
+                    packed.stride(2) % tile_bytes == 0 &&
+                    packed.stride(2) >= records * tile_bytes && packed.stride(0) >= 0,
                 name,
                 " must be a view of an MXFP6 K packer buffer: whole ",
-                kMxfp6KTileBytes,
+                tile_bytes,
                 "-byte tile records with a ",
-                kMxfp6KRowStride,
+                row_stride,
                 "-byte row stride, at least ",
                 records,
                 " per head; got strides ",
                 packed.strides());
     const int64_t required = (packed.size(0) - 1) * packed.stride(0) +
-                             (packed.size(2) - 1) * packed.stride(2) + records * kMxfp6KTileBytes +
+                             (packed.size(2) - 1) * packed.stride(2) + records * tile_bytes +
                              kMxfp6KBufferSlack;
     const int64_t backed   = static_cast<int64_t>(packed.storage().nbytes()) -
                              packed.storage_offset() * packed.element_size();
@@ -1939,7 +1953,8 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                 k_scale_mode);
     if(k_scales_inline)
     {
-        check_mxfp6_k_record_storage(mean_k, bitmap_groups * blocks_per_tile, "mean_k");
+        check_mxfp6_k_record_storage(
+            mean_k, bitmap_groups * blocks_per_tile, shapes.head_dim, "mean_k");
     }
     TORCH_CHECK(mean_v_scale.has_value() == v_needs_pooled_scale,
                 "Sol-Attn needs mean_v_scale exactly when V's scale mode is E8M0_PER_1X32; V's is ",
@@ -1972,10 +1987,11 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     {
         // The V-scale image is packed, not strided, and carries no stride slots of its own, so all
         // it needs is a base with whole tiles behind it. Hence a size check only. It is packed in
-        // V's own 128-token records whatever ts_kv is, over the pooled rows padded to a whole tile.
+        // V's own 128-token records whatever ts_kv is, over the pooled rows padded to a whole tile:
+        // one E8M0 byte per 32 channels of each row.
         const auto& vs             = mean_v_scale.value();
         const int64_t pooled_rows  = bitmap_groups * blocks_per_tile;
-        const int64_t pooled_bytes = (pooled_rows + 127) / 128 * 512;
+        const int64_t pooled_bytes = (pooled_rows + 127) / 128 * 128 * shapes.head_dim / 32;
         TORCH_CHECK(vs.is_cuda() && vs.device() == q.device(),
                     "mean_v_scale must be on the same GPU as Q");
         TORCH_CHECK(vs.scalar_type() == at::ScalarType::Byte,
@@ -1983,7 +1999,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
         TORCH_CHECK(vs.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.nhead_k, pooled_bytes}),
                     "mean_v_scale must have shape [batch, key_heads, "
-                    "ceil(ceil(num_kv_blocks / ts_kv) * ts_kv / 128) * 512], matching V's own "
+                    "ceil(ceil(num_kv_blocks / ts_kv) * ts_kv / 128) * 4 * head_dim], matching V's own "
                     "packed scale image with key_length replaced by num_kv_blocks padded to a "
                     "whole tile; expected ",
                     pooled_bytes,
@@ -2028,7 +2044,8 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                         "mean_k_var must have mean_k's dtype");
             TORCH_CHECK(kvar.strides() == mean_k.strides(),
                         "mean_k_var must have mean_k's strides");
-            check_mxfp6_k_record_storage(kvar, bitmap_groups * blocks_per_tile, "mean_k_var");
+            check_mxfp6_k_record_storage(
+                kvar, bitmap_groups * blocks_per_tile, shapes.head_dim, "mean_k_var");
         }
         else
         {

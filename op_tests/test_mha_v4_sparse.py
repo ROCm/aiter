@@ -40,6 +40,7 @@ from aiter.ops.mha_v4 import (
     mha_v4_block_tiles,
     mha_v4_kv_tile,
     mha_v4_kv_tile_for_q_tile,
+    mha_v4_mx_producers,
     mha_v4_operands,
     mha_v4_packed,
     mha_v4_ragged_kv,
@@ -54,6 +55,8 @@ from aiter.ops.mha_v4_quant import (
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
+    mxfp8_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -62,11 +65,20 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_k,
     quantize_mxfp6_q,
     quantize_mxfp8_k,
+    quantize_mxfp8_k_hd256,
     quantize_mxfp8_q,
+    quantize_mxfp8_q_hd256,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
+)
+from aiter.ops.triton.attention.sol_tilt import (
+    sol_jensen_cap,
+    sol_q_abs_max,
+    sol_tilt_planes,
+    sol_tilt_scaled_params,
+    sol_tilt_valu_params,
 )
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_KV,
@@ -77,6 +89,7 @@ from aiter.ops.triton.attention.utils import (
     _sol_attn_block_variance,
     _sol_attn_pool_mx,
     _sol_attn_pool_reuse_descale,
+    _sol_attn_rotate,
     block_attn_mask_to_ragged_lut,
     sol_prepare,
 )
@@ -1257,6 +1270,102 @@ def test_mha_v4_sparse_empty_row_writes_zeros(q_format, v_format, kwargs):
     assert torch.equal(
         out[:, :, 0], populated[:, :, 0]
     ), "empty row disturbed the live row"
+
+
+# Worst (batch, head, query tile) relative L2 error against the fp32 reference, per hd256 recipe:
+# about 1.5x the worst a 64-key single-block row shows, which averages away the least quantization.
+_HD256_SPARSE_TOLERANCE = {"bf16": 0.01, "mxfp8": 0.09, "mxfp6": 0.1, "mxfp4": 0.33}
+
+
+def _hd256_sparse_params():
+    def lacks(name):
+        if not _MHA_V4_SPARSE_ARCH:
+            return True
+        q_format, v_format, kwargs = SPARSE_RECIPES[name]
+        operands = _recipe_operands(q_format, v_format, kwargs)
+        return not mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+
+    return [
+        param(*SPARSE_RECIPES[name], name, skip=lacks(name), id=name)
+        for name in _HD256_SPARSE_TOLERANCE
+    ]
+
+
+def _masked_reference(q, k, v, mask, block_tile):
+    """fp32 attention over the selected blocks; (out, lse), zero and -inf where none is."""
+    q_tile, kv_tile = block_tile
+    sequence_q, heads, head_dim = q.shape[1:]
+    sequence_k = k.shape[1]
+    ratio = heads // k.shape[2]
+    kk = k.repeat_interleave(ratio, dim=2).float()
+    vv = v.repeat_interleave(ratio, dim=2).float()
+    s = torch.einsum("bqhd,bkhd->bhqk", q.float(), kk) * head_dim**-0.5
+    keep = mask.repeat_interleave(q_tile, 2).repeat_interleave(kv_tile, 3)
+    s = s.masked_fill(~keep[:, :, :sequence_q, :sequence_k], -math.inf)
+    p = torch.softmax(s, -1).nan_to_num(0.0)
+    return torch.einsum("bhqk,bkhd->bqhd", p, vv), torch.logsumexp(s, -1)
+
+
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@parametrize(("q_format", "v_format", "kwargs", "name"), _hd256_sparse_params())
+def test_mha_v4_sparse_head_dim_256_follows_the_lut(q_format, v_format, kwargs, name):
+    """hd256 block-sparse rows: all-selected is the dense row bit for bit, and a random LUT with
+    empty, one-block and two-block rows, a ragged last block, a partial query tile and GQA matches
+    the fp32 reference over exactly the selected blocks.
+    """
+    formats = (q_format, q_format, v_format)
+    operands = _recipe_operands(q_format, v_format, kwargs)
+    block_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+    assert block_tile == (256, 64)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE, head_dim=256)
+    q_tile, kv_tile = block_tile
+    torch.manual_seed(7)
+
+    q = torch.randn((1, 512, 2, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 1024, 2, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones((1, 2, 2, 16), device="cuda", dtype=torch.bool)
+    dense = mha_v4(q, k, v, *formats, **kwargs)
+    sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
+    torch.cuda.synchronize()
+    assert torch.equal(sparse, dense), "all-selected LUT is not the dense row"
+
+    batch, sequence_q, heads, kv_heads, sequence_k = 2, 900, 4, 2, 1000
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, kv_heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    q_tiles, kv_tiles = -(-sequence_q // q_tile), -(-sequence_k // kv_tile)
+    mask = torch.rand((batch, heads, q_tiles, kv_tiles), device="cuda") < 0.4
+    mask[0, 0, 0] = False
+    mask[0, 1, 0] = False
+    mask[0, 1, 0, 5] = True
+    mask[0, 2, 0] = False
+    mask[0, 2, 0, [0, kv_tiles - 1]] = True
+    mask[1, :, -1, -1] = True
+    out, lse = mha_v4(q, k, v, *formats, block_mask=mask, return_lse=True, **kwargs)
+    ref, ref_lse = _masked_reference(q, k, v, mask, block_tile)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out).all()
+    tol = _HD256_SPARSE_TOLERANCE[name]
+    for b, h, t in itertools.product(range(batch), range(heads), range(q_tiles)):
+        rows = slice(t * q_tile, min((t + 1) * q_tile, sequence_q))
+        got = out[b, rows, h].float()
+        if not mask[b, h, t].any():
+            assert torch.equal(
+                got, torch.zeros_like(got)
+            ), f"empty row {b, h, t} is not zero"
+            assert (lse[b, h, rows] == -math.inf).all(), f"empty row {b, h, t} LSE"
+            continue
+        want = ref[b, rows, h]
+        err = ((got - want).norm() / want.norm()).item()
+        assert err < tol, f"{name} row {b, h, t}: relative error {err:.4f} >= {tol}"
+        lse_err = (lse[b, h, rows].float() - ref_lse[b, h, rows]).abs().max().item()
+        assert lse_err < 2 * tol, f"{name} row {b, h, t}: LSE error {lse_err:.4f}"
 
 
 @skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -3015,10 +3124,11 @@ def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
 @_requires_sol_row(_SOL_ATTN_FP8)
 @parametrize("head_dim", [96, 192])
 def test_mha_v4_sol_rejects_unsupported_head_dims(head_dim):
-    """K smoothing sees K before the head dimension is checked, so it has to raise, not abort."""
+    """The tile lookup sees the head dimension before K smoothing sees K, so it has to raise, not
+    abort."""
     fp8 = native_fp8_format()
     dummy = torch.zeros((1, 256, 1, head_dim), device="cuda", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="head dimension 64, 128 or 256"):
+    with expect_raises(NotImplementedError, match=f"head-dim {head_dim} row"):
         mha_v4_sol(dummy, dummy, dummy, fp8, fp8, fp8)
 
 
@@ -3667,6 +3777,811 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
         torch.cuda.synchronize()
         assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
         assert _cosine(ordered[0], corrected) > 0.999
+
+
+# The hd256 Sol-Attn rows. _SOL_ATTN_RECIPES quantize at hd128, so these build each row's operands
+# with its own producers. The references work in real units: unscaled Q, softmax_scale 1/16, and
+# the BF16 source of every packed operand, which the packers' rotation leaves unchanged.
+_HD256_SOL_RECIPES = ("bf16", "mxfp8", "mxfp6", "mxfp4")
+_HD256_SOL_TILE = (256, 64)
+_HD256_SOFTMAX_SCALE = 256**-0.5
+# Least cosine to sol_attn_ref on its own mask: about twice the measured shortfall from 1 (bf16
+# 1.0, mxfp8 0.9990, mxfp6 0.9983, mxfp4 0.9826). Keep-or-drop sits near 0.87 on the same masks.
+_HD256_SOL_ORACLE_FLOOR = {
+    "bf16": 0.9995,
+    "mxfp8": 0.997,
+    "mxfp6": 0.996,
+    "mxfp4": 0.965,
+}
+
+
+def _hd256_sol_params():
+    def lacks(name):
+        if not _MHA_V4_SOL_ATTN_ARCH:
+            return True
+        tiles = mha_v4_block_tiles(
+            _recipe_operands(*SPARSE_RECIPES[name]), MHA_V4_SOL_MODE, head_dim=256
+        )
+        return _HD256_SOL_TILE not in tiles
+
+    return [param(name, skip=lacks(name), id=name) for name in _HD256_SOL_RECIPES]
+
+
+def _hd256_sol_case(name, q, k, v):
+    """mha_v4_packed's operands for the hd256 `name` row, and what pooling and the references take.
+
+    A packed operand pools from its BF16 source; an MXFP8 K is packed too, into 64-token records
+    with its scales, while its per-tensor FP8 V pools on its codes.
+    """
+    batch, sequence_k, heads, _ = k.shape
+    q_format, v_format, kwargs = SPARSE_RECIPES[name]
+    recipe = _resolve_raw_recipe(
+        q_format,
+        q_format,
+        v_format,
+        kwargs.get("q_scale_mode"),
+        kwargs.get("k_scale_mode"),
+        kwargs.get("v_scale_mode"),
+        sparse=True,
+    )
+    multiplier = mha_v4_q_multiplier(_HD256_SOFTMAX_SCALE)
+    case = {
+        "formats": (q_format, q_format, v_format),
+        "scale_modes": recipe.scale_modes,
+        "v_pack": recipe.v_pack,
+        "k_real": k,
+        "v_real": v,
+        "rotated": name != "bf16",
+    }
+    if name == "bf16":
+        case["packed"] = (q, k, v, q, k, v)
+        case["prepare"] = {}
+        case["tilt"] = {"k": k, "v": v, "k_format": "bf16", "v_format": "bf16"}
+        case["tilt_params"] = lambda p: sol_tilt_scaled_params(p, p.v_plane_stride)
+        return case
+    if name == "mxfp8":
+        q_quantized, q_descale = quantize_mxfp8_q_hd256(q, multiplier)
+        records, k_descale = quantize_mxfp8_k_hd256(k)
+        k_quantized = mxfp8_k_view_hd256(records, batch, sequence_k, heads)
+        v_quantized, v_descale = quantize_fp8(v)
+        case["packed"] = (
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            q_descale,
+            k_descale,
+            v_descale,
+        )
+        case["prepare"] = {"k_source": k, "k_packed_format": "mxfp8"}
+        case["v_real"] = v_quantized.float() * v_descale
+        case["v_descale"] = v_descale
+        case["tilt"] = {
+            "k": k,
+            "v": v_quantized,
+            "k_format": "mxfp8",
+            "v_format": "e4m3",
+            "v_descale": v_descale,
+            "q_multiplier": multiplier,
+        }
+        case["tilt_params"] = lambda p: sol_tilt_scaled_params(p, p.v_plane_stride)
+        return case
+    quantize_q, quantize_k, quantize_v = mha_v4_mx_producers(q_format, 256)
+    q_quantized, q_descale = quantize_q(q, multiplier)
+    k_raw, k_descale = quantize_k(k)
+    v_raw, v_descale = quantize_v(v)
+    if name == "mxfp6":
+        k_quantized, k_descale = mxfp6_k_view_hd256(
+            k_raw, k_descale, batch, sequence_k, heads
+        )
+        v_quantized = v_raw
+        k_format, v_packed = "mxfp6", "mxfp6_fp6_p"
+
+        def strides(p):
+            return (p.v_plane_stride, p.v_scale_plane_stride)
+
+    else:
+        k_quantized = mxfp4_k_view(k_raw, k_descale)
+        v_quantized = mxfp4_v_view(v_raw, v_descale, sequence_k)
+        k_format, v_packed = "mxfp4", "mxfp4_fp6_p"
+
+        def strides(p):
+            return (p.v_plane_stride, p.v_scale_plane_stride, p.k_scale_plane_stride)
+
+    case["packed"] = (
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+    )
+    case["prepare"] = {
+        "k_source": k,
+        "k_packed_format": k_format,
+        "v_source": v,
+        "v_packed_format": v_packed,
+    }
+    case["tilt"] = {
+        "k": k,
+        "v": v,
+        "k_format": k_format,
+        "v_format": v_packed,
+        "q_multiplier": multiplier,
+    }
+    case["tilt_params"] = lambda p: sol_tilt_valu_params(p, strides=strides(p))
+    return case
+
+
+def _hd256_sol_prepare(case, q, beta, k_variance=False):
+    q_tile, kv_tile = _HD256_SOL_TILE
+    return sol_prepare(
+        q,
+        case["packed"][1],
+        case["packed"][2],
+        beta=beta,
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        num_heads=q.shape[2],
+        k_variance=k_variance,
+        **case["prepare"],
+    )
+
+
+def _hd256_sol_pooled_real(case, plan):
+    """(mean_k, mean_v) in real units, as the kernel decodes them."""
+    mean_k = plan["mean_k_pooled"] if case["prepare"] else plan["mean_k"]
+    if "v_source" in case["prepare"]:
+        return mean_k, plan["mean_v_pooled"]
+    if "v_descale" in case:
+        return mean_k, plan["mean_v"].float() * case["v_descale"]
+    return mean_k, plan["mean_v"]
+
+
+def _hd256_sol_launch(case, plan, planes=None, jensen=False, **kwargs):
+    """Launch the hd256 Sol-Attn row over a plan; with `planes`, over sol_tilt_planes' instead."""
+    pooled = plan if planes is None else planes._asdict()
+    tilt = (
+        None
+        if planes is None
+        else (planes.rank, planes.k_plane_stride, case["tilt_params"](planes))
+    )
+    return mha_v4_packed(
+        *case["packed"],
+        *case["formats"],
+        *case["scale_modes"],
+        v_pack=case["v_pack"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        mean_k=pooled["mean_k"],
+        mean_v=pooled["mean_v"],
+        block_bitmap=plan["block_bitmap"],
+        mean_k_scale=pooled["mean_k_scale"],
+        mean_v_scale=pooled["mean_v_scale"],
+        block_tile=_HD256_SOL_TILE,
+        mean_k_var=plan["mean_k_var"] if jensen else None,
+        mean_k_var_scale=plan["mean_k_var_scale"] if jensen else None,
+        sol_tilt=tilt,
+        **kwargs,
+    )
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_reduces_to_dense_and_meets_the_oracle(name):
+    """hd256 Sol-Attn rows: all-exact masks the pooled pass off, which leaves the dense row (bit
+    for bit over whole blocks, to rounding over a ragged last one); routed, the row meets
+    sol_attn_ref on its own mask and beats keep-or-drop; and mha_v4_sol, which quantizes for
+    itself, is the same launch."""
+    from aiter.test_mha_common import sol_attn_ref
+
+    q_format, v_format, kwargs = SPARSE_RECIPES[name]
+    q_tile, kv_tile = _HD256_SOL_TILE
+    batch, heads, sequence_q = 1, 2, 512
+    for sequence_k in (1024, 1000):
+        torch.manual_seed(5)
+        q = torch.randn(
+            (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            (batch, sequence_k, heads, 256), device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+        case = _hd256_sol_case(name, q, k, v)
+        plan = _hd256_sol_prepare(case, q, beta=0.4)
+        all_exact = _select_all_plan(
+            plan,
+            batch,
+            heads,
+            -(-sequence_q // q_tile),
+            -(-sequence_k // kv_tile),
+            q.device,
+        )
+        exact = _hd256_sol_launch(case, all_exact)
+        dense = mha_v4(q, k, v, q_format, q_format, v_format, **kwargs)
+        routed = _hd256_sol_launch(case, plan)
+        torch.cuda.synchronize()
+        assert torch.isfinite(routed).all()
+        if sequence_k % kv_tile:
+            assert _cosine(exact, dense) > 0.9999, f"{name} sk={sequence_k}"
+            continue
+        assert torch.equal(
+            exact, dense
+        ), f"{name}: all-exact Sol-Attn is not the dense row"
+
+        reference = functools.partial(
+            sol_attn_ref,
+            q,
+            case["k_real"],
+            case["v_real"],
+            plan["block_attn_mask"],
+            *_hd256_sol_pooled_real(case, plan),
+            q_tile,
+            kv_tile,
+            softmax_scale=_HD256_SOFTMAX_SCALE,
+        )
+        oracle = _cosine(routed, reference()[0])
+        keep_or_drop = _cosine(routed, reference(correction=False)[0])
+        assert oracle > _HD256_SOL_ORACLE_FLOOR[name], (name, oracle)
+        assert oracle > keep_or_drop + 0.05, (name, oracle, keep_or_drop)
+        if name != "mxfp8":
+            # MXFP8 names FP8's formats, so mha_v4_sol cannot reach it.
+            raw = mha_v4_sol(q, k, v, q_format, q_format, v_format, beta=0.4)
+            torch.cuda.synchronize()
+            assert torch.equal(raw, routed), f"{name}: mha_v4_sol is another launch"
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance(name):
+    """As test_mha_v4_sol_jensen_term_is_the_block_k_variance, at hd256: the variance is taken in
+    the basis the kernel holds K in (each 128-channel half rotated for the packed rows), and has to
+    land at its own weight rather than at none or double it. Sorted dispatch must not move it.
+    """
+    kv_tile = _HD256_SOL_TILE[1]
+    heads = 2
+    torch.manual_seed(4)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 64 * kv_tile, heads, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=1.0, k_variance=True)
+    assert plan["mean_k_var"].shape == plan["mean_k"].shape
+
+    plain = _hd256_sol_launch(case, plan)
+    corrected, corrected_lse = _hd256_sol_launch(
+        case, plan, jensen=True, return_lse=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(plain, corrected)
+
+    q_rot, k_rot = (_sol_attn_rotate(x) for x in (q, k)) if case["rotated"] else (q, k)
+    var_rot = _sol_attn_block_variance(k_rot.float(), kv_tile)
+    ref_args = (
+        q,
+        case["k_real"],
+        case["v_real"],
+        plan["block_attn_mask"],
+        *_hd256_sol_pooled_real(case, plan),
+        _HD256_SOL_TILE,
+        _HD256_SOFTMAX_SCALE,
+    )
+    cosine = {
+        factor: _cosine(
+            corrected, _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot * factor))[0]
+        )
+        for factor in (0.0, 1.0, 2.0)
+    }
+    assert cosine[1.0] > max(cosine[0.0], cosine[2.0]), (name, cosine)
+    assert cosine[1.0] > _HD256_SOL_ORACLE_FLOOR[name], (name, cosine)
+    reference_lse = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[1]
+    assert (corrected_lse - reference_lse).abs().max() < 0.15
+
+    raster = _hd256_sol_launch(
+        case, plan, jensen=True, return_lse=True, sorted_dispatch=False
+    )
+    ordered = _hd256_sol_launch(
+        case, plan, jensen=True, return_lse=True, sorted_dispatch=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_reads_the_capped_jensen_variance(name):
+    """sol_jensen_cap's variance reaches the hd256 rows at its gain. For MXFP6 and MXFP8 it is a
+    new pack, whose scales ride in the records. The old records with only the scale image moved
+    match the uncapped reference instead, which this tells apart.
+
+    The routed MXFP4 row sits near its oracle floor on these wide blocks, so that floor and the
+    factor of two are left to test_mha_v4_sol_head_dim_256_jensen_term_is_the_block_k_variance.
+    """
+    q_tile, kv_tile = _HD256_SOL_TILE
+    heads = 2
+    torch.manual_seed(4)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    # Wide and narrow blocks in turn, so the cap damps about half of them and leaves the rest.
+    spread = torch.tensor([0.5, 1.5], device="cuda").repeat_interleave(kv_tile)
+    k = torch.randn((1, 64 * kv_tile, heads, 256), device="cuda")
+    k = (k * spread.repeat(32)[None, :, None, None]).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=1.0, k_variance=True)
+    var, var_scale, gain = sol_jensen_cap(
+        q,
+        None,
+        None,
+        plan["mean_k_var"],
+        _HD256_SOFTMAX_SCALE,
+        kv_tile,
+        block_attn_mask=plan["block_attn_mask"],
+        q_tile=q_tile,
+        q_abs_max=sol_q_abs_max(q, q_tile, rotate=case["rotated"]),
+        mean_k_var_scale=plan["mean_k_var_scale"],
+        mean_k_var_pooled=plan["mean_k_var_pooled"],
+    )
+    assert (gain < 1).any() and (gain == 1).any(), gain
+    capped_plan = {**plan, "mean_k_var": var, "mean_k_var_scale": var_scale}
+    uncapped = _hd256_sol_launch(case, plan, jensen=True)
+    capped, capped_lse = _hd256_sol_launch(
+        case, capped_plan, jensen=True, return_lse=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(uncapped, capped)
+
+    q_rot, k_rot = (_sol_attn_rotate(x) for x in (q, k)) if case["rotated"] else (q, k)
+    var_rot = _sol_attn_block_variance(k_rot.float(), kv_tile)
+    ref_args = (
+        q,
+        case["k_real"],
+        case["v_real"],
+        plan["block_attn_mask"],
+        *_hd256_sol_pooled_real(case, plan),
+        _HD256_SOL_TILE,
+        _HD256_SOFTMAX_SCALE,
+    )
+    reference, reference_lse = _sol_attn_jensen_ref(
+        *ref_args, (q_rot, var_rot * gain.unsqueeze(-1))
+    )
+    uncapped_reference = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[0]
+    # Measured: 0.034 (bf16) to 0.047 (mxfp8) apart.
+    cosine = (_cosine(capped, reference), _cosine(capped, uncapped_reference))
+    assert cosine[0] > cosine[1] + 0.02, (name, cosine)
+    assert (capped_lse - reference_lse).abs().max() < 0.15
+
+
+def _planted_low_rank_kv(batch, sequence_k, heads, head_dim, rank=2):
+    """BF16 K and V driven by `rank` shared per-token factors, so each block's Cov(v, k) has the
+    clear low-rank part the tilt stands in for; as test_sol_tilt's _planted_kv."""
+    strength = 4.0 / torch.arange(1, rank + 1, dtype=torch.float32, device="cuda")
+    z = torch.randn((batch, sequence_k, heads, rank), device="cuda") * strength
+
+    def planted():
+        directions = torch.randn((heads, rank, head_dim), device="cuda")
+        x = torch.einsum("bshr,hrd->bshd", z, directions)
+        x = x + 0.3 * torch.randn((batch, sequence_k, heads, head_dim), device="cuda")
+        x = x + torch.randn((1, 1, heads, head_dim), device="cuda")
+        # The einsum leaves its own layout, and the packers take contiguous BSHD only.
+        return x.to(torch.bfloat16).contiguous()
+
+    return planted(), planted()
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_tilt_reaches_the_pooled_values(name):
+    """The hd256 rows read sol_tilt_planes' planes: on blocks with a planted low-rank Cov(v, k)
+    the tilt moves the routed output toward exact attention, as it does at hd128 (about 10%, 7%
+    for MXFP4), and under an all-exact selection, where nothing is pooled, it moves nothing. A row
+    that ignored the tilt slots, or read the planes at the wrong stride, fails one or the other.
+    """
+    q_tile, kv_tile = _HD256_SOL_TILE
+    batch, heads, sequence_q, sequence_k, rank = 1, 2, 512, 32 * kv_tile, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(batch, sequence_k, heads, 256, rank)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=0.5)
+    planes = sol_tilt_planes(
+        q_abs_max=sol_q_abs_max(q, q_tile),
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        rank=rank,
+        kv_tile=kv_tile,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        mean_k_pooled=plan["mean_k_pooled"],
+        mean_v_pooled=plan["mean_v_pooled"],
+        **case["tilt"],
+    )
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float())
+    exact = torch.einsum(
+        "bhqk,bkhd->bqhd",
+        torch.softmax(scores * _HD256_SOFTMAX_SCALE, dim=-1),
+        v.float(),
+    )
+
+    def error(out):
+        return ((out.float() - exact).norm() / exact.norm()).item()
+
+    plain = _hd256_sol_launch(case, plan)
+    tilted = _hd256_sol_launch(case, plan, planes)
+    all_exact = _select_all_plan(
+        plan, batch, heads, sequence_q // q_tile, sequence_k // kv_tile, q.device
+    )
+    exact_plain = _hd256_sol_launch(case, all_exact)
+    exact_tilted = _hd256_sol_launch(case, all_exact, planes)
+    torch.cuda.synchronize()
+    assert torch.isfinite(tilted).all()
+    assert error(tilted) < 0.97 * error(plain), (name, error(plain), error(tilted))
+    assert torch.equal(
+        exact_plain, exact_tilted
+    ), f"{name}: the tilt reached exact blocks"
+
+
+def _hd256_capped_tilt(case, q, plan, rank):
+    """(plan with sol_jensen_cap's variance, sol_tilt_planes' planes at the cap's gain).
+
+    The cap damps a block's Jensen term by h, and its tilt by sqrt(h) to match, so the planes
+    take the cap's gain as block_gain.
+    """
+    q_tile, kv_tile = _HD256_SOL_TILE
+    var, var_scale, gain = sol_jensen_cap(
+        q,
+        None,
+        None,
+        plan["mean_k_var"],
+        _HD256_SOFTMAX_SCALE,
+        kv_tile,
+        block_attn_mask=plan["block_attn_mask"],
+        q_tile=q_tile,
+        q_abs_max=sol_q_abs_max(q, q_tile, rotate=case["rotated"]),
+        mean_k_var_scale=plan["mean_k_var_scale"],
+        mean_k_var_pooled=plan["mean_k_var_pooled"],
+    )
+    planes = sol_tilt_planes(
+        q_abs_max=sol_q_abs_max(q, q_tile),
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        rank=rank,
+        kv_tile=kv_tile,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        mean_k_pooled=plan["mean_k_pooled"],
+        mean_v_pooled=plan["mean_v_pooled"],
+        block_gain=gain,
+        **case["tilt"],
+    )
+    return {**plan, "mean_k_var": var, "mean_k_var_scale": var_scale}, planes, gain
+
+
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_tilt_and_capped_jensen_run_together(name):
+    """The capped Jensen term and the tilt at the cap's gain in one launch: both reach the row,
+    the tilt still moves the routed output toward exact attention, and under an all-exact
+    selection neither moves anything."""
+    q_tile, kv_tile = _HD256_SOL_TILE
+    batch, heads, sequence_q, sequence_k, rank = 1, 2, 512, 32 * kv_tile, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(batch, sequence_k, heads, 256, rank)
+    # At full strength the planted K's Jensen terms cap nearly every block to a gain of about
+    # 0.03, which leaves the tilt at sqrt(h) almost nothing to do; at a quarter the cap still
+    # damps most blocks, to about 0.5.
+    k = (k.float() * 0.25).to(torch.bfloat16)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=True)
+    capped, planes, gain = _hd256_capped_tilt(case, q, plan, rank)
+    assert (gain[gain > 0] < 1).any(), f"{name}: the cap damped no block"
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float())
+    exact = torch.einsum(
+        "bhqk,bkhd->bqhd",
+        torch.softmax(scores * _HD256_SOFTMAX_SCALE, dim=-1),
+        v.float(),
+    )
+
+    def error(out):
+        return ((out.float() - exact).norm() / exact.norm()).item()
+
+    tilted = _hd256_sol_launch(case, plan, planes)
+    jensen = _hd256_sol_launch(case, capped, jensen=True)
+    both = _hd256_sol_launch(case, capped, planes, jensen=True)
+    all_exact = _select_all_plan(
+        capped, batch, heads, sequence_q // q_tile, sequence_k // kv_tile, q.device
+    )
+    exact_plain = _hd256_sol_launch(case, all_exact)
+    exact_both = _hd256_sol_launch(case, all_exact, planes, jensen=True)
+    torch.cuda.synchronize()
+    assert torch.isfinite(both).all()
+    assert not torch.equal(both, tilted) and not torch.equal(both, jensen)
+    # Measured: 0.51 -> 0.14 for BF16, 0.48 -> 0.24 for MXFP8 and MXFP6, 0.49 -> 0.26 for MXFP4.
+    assert error(both) < 0.75 * error(jensen), (name, error(jensen), error(both))
+    assert torch.equal(
+        exact_plain, exact_both
+    ), f"{name}: pooled terms reached exact blocks"
+
+
+@parametrize("pooled", ["mean", "capped_tilt"])
+@parametrize("name", _hd256_sol_params())
+def test_mha_v4_sol_head_dim_256_packed_compile_parity(name, pooled):
+    """As test_mha_v4_sol_packed_compile_parity at hd256, whose recipes quantize at hd128:
+    sol_prepare and the launch trace as one graph, with the Jensen cap's re-pack and the tilt
+    planes in it for "capped_tilt", and match eager bitwise."""
+    kv_tile = _HD256_SOL_TILE[1]
+    heads, rank = 2, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(1, 16 * kv_tile, heads, 256, rank)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    case = _hd256_sol_case(name, q, k, v)
+
+    def call():
+        plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=pooled == "capped_tilt")
+        if pooled == "mean":
+            return _hd256_sol_launch(case, plan)
+        capped, planes, _ = _hd256_capped_tilt(case, q, plan, rank)
+        return _hd256_sol_launch(case, capped, planes, jensen=True)
+
+    eager = call()
+    compiled = torch.compile(call, fullgraph=True)()
+    torch.cuda.synchronize()
+    assert torch.equal(eager, compiled)
+
+
+class _DeviceBytes:
+    """A raw device range in the form torch.as_tensor takes."""
+
+    def __init__(self, pointer, nbytes):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (pointer, False),
+            "version": 2,
+        }
+
+
+def _hip_vmm_available():
+    try:
+        from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+        return hasattr(load_hip_runtime(), "hipMemAddressReserve")
+    except (ImportError, OSError):
+        return False
+
+
+_END_OF_MAPPING_KEEP = []
+
+
+def _at_end_of_mapping(x, image_bytes):
+    """A copy of x's first image_bytes from its first element, ending at the last mapped byte of
+    a VMM mapping whose next granule is reserved and unmapped, so any read past it faults.
+    """
+    import ctypes
+
+    from aiter.dist.device_communicators import vmm_allocator as vmm
+    from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+    hip = load_hip_runtime()
+    device = x.device.index or 0
+    granule = vmm._get_granularity(device)
+    size = -(-image_bytes // granule) * granule
+    physical, address = ctypes.c_void_p(), ctypes.c_void_p()
+    prop = vmm._make_prop(device)
+    vmm._check(hip.hipMemCreate(ctypes.byref(physical), size, ctypes.byref(prop), 0))
+    vmm._check(
+        hip.hipMemAddressReserve(
+            ctypes.byref(address), size + granule, granule, ctypes.c_void_p(0), 0
+        )
+    )
+    vmm._check(hip.hipMemMap(address, size, 0, physical, 0))
+    access = vmm._hipMemAccessDesc(vmm._DEVICE, device, vmm._READ_WRITE)
+    vmm._check(hip.hipMemSetAccess(address, size, ctypes.byref(access), 1))
+    # Left mapped: the child process exits after its last launch.
+    _END_OF_MAPPING_KEEP.append((physical, address))
+    source = torch.empty(0, dtype=torch.uint8, device=x.device)
+    source.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    start = x.storage_offset() * x.element_size()
+    placed = torch.as_tensor(
+        _DeviceBytes(address.value + size - image_bytes, image_bytes), device=x.device
+    )
+    placed.copy_(source[start : start + image_bytes])
+    out = torch.empty(0, dtype=x.dtype, device=x.device)
+    out.set_(placed.untyped_storage(), 0, x.shape, x.stride())
+    return out
+
+
+def _image_bytes(x, planes=1, plane_stride=0):
+    """What x's layout spans from its first element: each batch at x's batch stride, or the
+    view's extent where that reaches further, over `planes` planes plane_stride bytes apart.
+    """
+    extent = sum((n - 1) * s for n, s in zip(x.shape, x.stride())) + 1
+    plane = max(x.shape[0] * x.stride(0), extent) * x.element_size()
+    return (planes - 1) * plane_stride + plane
+
+
+# The MXFP4 K scale reader takes one dword past the last row, at either head dim.
+_MXFP4_K_SCALE_TRAILING_BYTES = 4
+
+
+def _hd256_end_of_mapping_child(rows):
+    """_hd256_end_of_mapping_row for each (name, sequence_k, mode) of rows, then `done`."""
+    for name, sequence_k, mode in rows:
+        _hd256_end_of_mapping_row(name, sequence_k, mode)
+    print("done", flush=True)
+
+
+def _hd256_end_of_mapping_row(name, sequence_k, mode):
+    """Launch the hd256 `name` row once per tensor it reads, that tensor placed at the end of a
+    mapping with only its image kept: the Sol-Attn row ("sol") with Jensen and tilt on, or the
+    block-sparse row ("sparse") over the same operands and LUT. Prints `placed <row> <tensor>`
+    before each launch; a read past an image is a fault, which ends the process.
+
+    A tensor whose backing the launcher checks is kept whole once the launcher has refused its
+    bare image: the refusal is the guard there, and the launch then checks the producer's slack.
+    """
+    heads, rank = 2, 2
+    torch.manual_seed(3)
+    k, v = _planted_low_rank_kv(1, sequence_k, heads, 256, rank)
+    q = torch.randn((1, 512, heads, 256), device="cuda", dtype=torch.bfloat16)
+    case = _hd256_sol_case(name, q, k, v)
+    plan = _hd256_sol_prepare(case, q, beta=0.5, k_variance=True)
+    operands = ("q", "k", "v", "q_descale", "k_descale", "v_descale")
+    tensors = {
+        **dict(zip(operands, case["packed"])),
+        **{key: plan[key] for key in ("kv_block_indices", "lut_start", "lut_count")},
+    }
+    plane_strides = {}
+    if mode == "sol":
+        planes = _hd256_end_of_mapping_planes(case, q, plan, rank)
+        tensors.update(
+            block_bitmap=plan["block_bitmap"],
+            **{key: getattr(planes, key) for key in ("mean_k", "mean_v")},
+            **{key: getattr(planes, key) for key in ("mean_k_scale", "mean_v_scale")},
+            **{key: plan[key] for key in ("mean_k_var", "mean_k_var_scale")},
+            sol_tilt_params=case["tilt_params"](planes),
+        )
+        plane_strides = {
+            "mean_k": planes.k_plane_stride,
+            "mean_v": planes.v_plane_stride,
+            "mean_k_scale": planes.k_scale_plane_stride,
+            "mean_v_scale": planes.v_scale_plane_stride,
+        }
+
+    def launch(tensors):
+        tilt = {}
+        if mode == "sol":
+            tilt["sol_tilt"] = (
+                planes.rank,
+                planes.k_plane_stride,
+                tensors["sol_tilt_params"],
+            )
+        return mha_v4_packed(
+            *(tensors[key] for key in operands),
+            *case["formats"],
+            *case["scale_modes"],
+            v_pack=case["v_pack"],
+            softmax_scale=_HD256_SOFTMAX_SCALE,
+            block_tile=_HD256_SOL_TILE,
+            **tilt,
+            **{
+                key: value
+                for key, value in tensors.items()
+                if key not in operands and key != "sol_tilt_params"
+            },
+        )
+
+    reference = launch(tensors)
+    torch.cuda.synchronize()
+    row = f"{mode} {name} at {sequence_k} keys"
+    for key, x in tensors.items():
+        if not torch.is_tensor(x):
+            continue
+        stride = plane_strides.get(key) or 0
+        image = _image_bytes(x, 1 + rank if stride else 1, stride)
+        if name == "mxfp4" and key in ("mean_k_scale", "mean_k_var_scale"):
+            image += _MXFP4_K_SCALE_TRAILING_BYTES
+        print(f"placed {row}: {key}", flush=True)
+        try:
+            out = launch({**tensors, key: _at_end_of_mapping(x, image)})
+        except RuntimeError as refused:
+            if "mapped bytes" not in str(refused):
+                raise
+            print(
+                f"placed {row}: {key} whole, the launcher refusing its image",
+                flush=True,
+            )
+            whole = x.untyped_storage().nbytes() - x.storage_offset() * x.element_size()
+            out = launch({**tensors, key: _at_end_of_mapping(x, whole)})
+        torch.cuda.synchronize()
+        assert torch.equal(
+            out, reference
+        ), f"{key} changed the output where it was placed"
+
+
+def _hd256_end_of_mapping_planes(case, q, plan, rank):
+    """sol_tilt_planes' rank-`rank` planes over the plan's pooled blocks."""
+    q_tile, kv_tile = _HD256_SOL_TILE
+    planes = sol_tilt_planes(
+        q_abs_max=sol_q_abs_max(q, q_tile),
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        softmax_scale=_HD256_SOFTMAX_SCALE,
+        rank=rank,
+        kv_tile=kv_tile,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        mean_k_pooled=plan["mean_k_pooled"],
+        mean_v_pooled=plan["mean_v_pooled"],
+        **case["tilt"],
+    )
+    return planes
+
+
+@skipif(not _hip_vmm_available(), reason="HIP virtual memory management")
+def test_mha_v4_head_dim_256_reads_stop_at_each_image():
+    """The hd256 rows read nothing past what each tensor lays out: every tensor of a Sol-Attn
+    launch with Jensen and tilt on, and of a block-sparse launch, in turn, ends at the last mapped
+    byte, the MXFP4 K scales one dword later, at a whole and a ragged last 128-row scale tile. A zeroed pad behind an image would hide a read
+    past it, and a read that is not used changes no output; past a mapping, either faults. A
+    fault ends the process, so the rows run in a child, all in one to start it once."""
+    kv_tile = _HD256_SOL_TILE[1]
+    rows = [
+        (row.values[-1] if mode == "sparse" else row.values[0], sequence_k, mode)
+        for mode, params in (
+            ("sol", _hd256_sol_params()),
+            ("sparse", _hd256_sparse_params()),
+        )
+        for row in params
+        if not row.skip
+        for sequence_k in (128 * kv_tile, 128 * kv_tile + 37)
+    ]
+    if not rows:
+        return
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    child = (
+        "from op_tests.test_mha_v4_sparse import _hd256_end_of_mapping_child; "
+        f"_hd256_end_of_mapping_child({rows!r})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    placed = [line for line in result.stdout.splitlines() if line.startswith("placed")]
+    assert (
+        result.returncode == 0 and "done" in result.stdout.splitlines()
+    ), f"stopped with {placed[-1:]} at the end of a mapping:\n{result.stderr[-3000:]}"
+
+
+@skipif(get_gfx() != "gfx950", reason="the gfx950 hd256 block-sparse rows")
+def test_mha_v4_head_dim_256_block_tile_is_its_own():
+    """MXFP8 tiles KV at 128 at hd128 and at 64 at hd256, so the hd128 geometry is refused at hd256
+    rather than dispatched, before anything is quantized."""
+    q_format, v_format, kwargs = SPARSE_RECIPES["mxfp8"]
+    operands = _recipe_operands(q_format, v_format, kwargs)
+    assert mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE) == (256, 128)
+    assert mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE, head_dim=256) == (256, 64)
+    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
+    mask = torch.ones((1, 1, 1, 2), device="meta", dtype=torch.bool)
+    with expect_raises(
+        ValueError, match=r"at head dim 256; those operands have \(\(256, 64\),\)"
+    ):
+        mha_v4(
+            q,
+            q,
+            q,
+            q_format,
+            q_format,
+            v_format,
+            block_mask=mask,
+            block_tile=(256, 128),
+            **kwargs,
+        )
 
 
 def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed=0):

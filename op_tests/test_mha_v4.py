@@ -3012,15 +3012,6 @@ def test_mha_v4_rejects_mixed_mxfp6_head_dim_256():
         )
 
 
-@parametrize("recipe", ["mxfp4", "mxfp6", "mxfp8"])
-def test_mha_v4_rejects_sparse_head_dim_256(recipe):
-    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    block_mask = torch.ones((1, 1, 1, 2), device="meta", dtype=torch.bool)
-    formats, scale_modes = _mx_recipe_args(recipe)
-    with expect_raises(ValueError, match="head dimension 256 is dense-only"):
-        mha_v4(q, q, q, *formats, block_mask=block_mask, **scale_modes)
-
-
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation")
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
