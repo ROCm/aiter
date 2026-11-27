@@ -258,7 +258,20 @@ bool binary_op_impl(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "binary_op_api_common.hpp"
+#include "aiter_tensor.h"
+#include <hip/hip_bfloat16.h>
+#include <string>
+
+namespace aiter {{
+struct AddOp;
+struct SubOp;
+struct MulOp;
+struct DivOp;
+}}
+
+template <typename Op, typename T0, typename T1>
+bool binary_op_impl(aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&);
+
 bool binary_op_dispatch(const std::string& op_type,
                        aiter_tensor_t &input,
                        aiter_tensor_t &other,
