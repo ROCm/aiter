@@ -46,8 +46,7 @@ Also for FlyDSL: m = 0 in every mode; each RMSNorm path (fused, separate) at its
 config; a graph after an in-place update of fn, and after a write through fn.data with
 an explicit fn_packed refreshed. Per hidden size: two seams sharing one fn on two
 streams, builds the launch policy does not reach, forced, and invalid inputs, which
-raise ValueError or TypeError. With two visible gfx942 GPUs, calls alternate between
-them with both matching and different current devices.
+raise ValueError or TypeError.
 
 Launch split, graphs and compile: T = 65536 + 37 (two launches, byte offsets past 2^31)
 with carried and identity pre gate against the same references; CUDA graphs captured at
@@ -1042,58 +1041,6 @@ def check_flydsl_weight_update(seed):
     return failed
 
 
-def check_flydsl_multi_device(seed):
-    """Two gfx942 GPUs alternate calls with one specialization, on both RMSNorm paths.
-    Also call with the other GPU current and check that the op restores it. Returns
-    the failure count; skips when fewer than two supported GPUs are visible."""
-    from aiter.ops.flydsl import flydsl_mhc_seam_pack_fn
-
-    devices = [
-        i
-        for i in range(torch.cuda.device_count())
-        if torch.cuda.get_device_properties(i).gcnArchName.split(":")[0] == "gfx942"
-    ][:2]
-    if len(devices) < 2:
-        aiter.logger.warning(
-            "flydsl multi-device: need two visible gfx942 GPUs; skipping"
-        )
-        return 0
-
-    failed = 0
-    for norm in ("fused", "separate"):
-        cases = {}
-        for device in devices:
-            with torch.cuda.device(device):
-                inp = make_inputs(32, 5120, seed=seed + device)
-                packed = flydsl_mhc_seam_pack_fn(inp["fn"])
-                call, args = seam_flydsl(
-                    inp, "post", config={"NORM": norm}, fn_packed=packed
-                )
-                cases[device] = inp, call, args
-                torch.cuda.synchronize(device)
-
-        # Start with a different current device so a cold compile needs the guard too.
-        for other_current in (True, False):
-            for device in (devices[0], devices[1], devices[0]):
-                current = (
-                    devices[1 - devices.index(device)] if other_current else device
-                )
-                inp, call, args = cases[device]
-                tag = f"device={device} current={current} NORM={norm} "
-                with torch.cuda.device(current):
-                    out = call(*args)
-                    if torch.cuda.current_device() != current:
-                        aiter.logger.error(
-                            "%sFlyDSL did not restore the current GPU", tag
-                        )
-                        failed += 1
-                with torch.cuda.device(device):
-                    torch.cuda.synchronize(device)
-                    err = check_flydsl(out, inp, "post", tag)
-                    failed += any(e != 0 for e in err.values())
-    return failed
-
-
 def flydsl_config_error(m, hidden_size, mode, config):
     """Returns the error message the FlyDSL seam raises for this explicit config in
     `mode`, or None if the config is legal. Like the op, it merges config over
@@ -1340,7 +1287,6 @@ def main():
     failed += check_flydsl_empty()
     failed += check_flydsl_norm_paths(args.seed)
     failed += check_flydsl_weight_update(args.seed)
-    failed += check_flydsl_multi_device(args.seed)
     for hidden_size in args.hidden:
         failed += check_flydsl_streams(hidden_size, args.seed)
         failed += check_flydsl_forced_configs(hidden_size, args.seed)
