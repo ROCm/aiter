@@ -1007,7 +1007,9 @@ def validate_and_update_archs(resolve_native: bool = False):
         try:
             detected = _detect_native()
             archs = list(
-                dict.fromkeys(r for a in archs for r in (detected if a == "native" else [a]))
+                dict.fromkeys(
+                    r for a in archs for r in (detected if a == "native" else [a])
+                )
             )
         except RuntimeError:
             # No GPU visible: keep "native" so that merely evaluating the
