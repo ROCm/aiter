@@ -1303,6 +1303,24 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_markov_argmax_chain": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/markov_argmax_chain.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "flags_extra_hip_per_source": {
+            "*markov_argmax_chain.cu": [
+                "-fno-gpu-flush-denormals-to-zero",
+                "-mllvm -enable-post-misched=1"
+            ]
+        },
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_sample": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",
