@@ -1054,7 +1054,9 @@ def _iter_csv_cases():
     seen_stored_rows = set()
     for _, row in rows.iterrows():
         tag = row.get("_tag", "")
-        if pd.notna(tag) and str(tag).strip():
+        # The config merge fills an absent _tag column with 0. Pandas can
+        # read that placeholder as either an integer or a float.
+        if pd.notna(tag) and str(tag).strip() not in ("", "0", "0.0"):
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
