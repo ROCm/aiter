@@ -54,6 +54,10 @@ python3 op_tests/test_gemm.py
 ```
 If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with new configs.
 
+### A GPU with no tuned rows
+
+Rows are keyed on `gfx` and `cu_num`. On a GPU whose CU count has no rows (for example a 304-CU gfx942 when the shipped gfx942 rows are for 228 CUs), every shape runs the default backend and logs `not found tuned config`, once per N/K and fallback backend. Set `AITER_LOG_TUNED_CONFIG=1` to log every miss. Logging does not change which kernel runs. To add rows for that GPU, run your workload on it with `AITER_TUNE_GEMM=1` to collect the shapes in `aiter/configs/bf16_untuned_gemm.csv`, then run `gemm_a16w16_tune.py` there as above. It writes the rows with that GPU's `cu_num`.
+
 ## Tuner-Specific Options
 
 ### `--libtype`

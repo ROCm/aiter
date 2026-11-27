@@ -28,7 +28,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.gemm_op_common import get_padded_m
+from aiter.ops.gemm_op_common import get_padded_m, log_tuned_config_miss
 from aiter.plugin import route as _route
 
 try:
@@ -348,8 +348,24 @@ def get_GEMM_A16W16_config(
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
+        log_tuned_config_miss(
+            "a16w16",
+            (
+                gfx,
+                cu_num,
+                N,
+                K,
+                bias,
+                dtype,
+                otype,
+                scaleAB,
+                bpreshuffle,
+                # The default depends on M (skinny for small M, else torch), so
+                # a different fallback for the same N/K is logged again.
+                default_config["libtype"],
+                default_config["solidx"],
+            ),
+            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config on {gfx} cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}",
         )
         return default_config
 

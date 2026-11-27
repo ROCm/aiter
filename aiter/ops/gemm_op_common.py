@@ -1,13 +1,64 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import threading
+from collections import OrderedDict
+
 from aiter import logger
 
-from ..jit.core import compile_ops
+from ..jit.core import AITER_LOG_TUNED_CONFIG, compile_ops
 
 
 @compile_ops("module_gemm_common", fc_name="getPaddedM", ffi_type="ctypes")
 def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...
+
+
+# Misses already reported, as (family, *key), least recently seen first. Per
+# process, like the lookup caches. Capped: a key that falls off the end may be
+# logged again. The lock makes the check and the insert one step.
+_MAX_REPORTED_TUNED_CONFIG_MISSES = 4096
+_REPORTED_TUNED_CONFIG_MISSES: OrderedDict = OrderedDict()
+_REPORTED_TUNED_CONFIG_MISSES_LOCK = threading.Lock()
+
+
+def _first_report_of(report_key: tuple) -> bool:
+    """True the first time ``report_key`` is seen (again after it was evicted)."""
+    with _REPORTED_TUNED_CONFIG_MISSES_LOCK:
+        if report_key in _REPORTED_TUNED_CONFIG_MISSES:
+            _REPORTED_TUNED_CONFIG_MISSES.move_to_end(report_key)
+            return False
+        _REPORTED_TUNED_CONFIG_MISSES[report_key] = None
+        while len(_REPORTED_TUNED_CONFIG_MISSES) > _MAX_REPORTED_TUNED_CONFIG_MISSES:
+            _REPORTED_TUNED_CONFIG_MISSES.popitem(last=False)
+        return True
+
+
+def log_tuned_config_miss(family: str, key: tuple, message: str) -> bool:
+    """Report a tuned-config lookup miss; True when a line was logged.
+
+    Serving sees a new M on nearly every batch, so logging each (M, N, K) miss
+    floods the log. Unless AITER_LOG_TUNED_CONFIG=1, a miss is logged once per
+    ``(family, *key)``; ``key`` is everything the tuned row is keyed on except
+    M (gfx, cu_num, N, K, dtypes, ...), plus whatever the fallback it picks
+    depends on, so a different default for the same N/K is logged again. With
+    AITER_LOG_TUNED_CONFIG=1 every miss is logged, as every hit is.
+
+    The set of reported keys holds at most ``_MAX_REPORTED_TUNED_CONFIG_MISSES``
+    entries, least recently seen dropped first, so a key can be logged again
+    after it was evicted. The check and the insert are atomic across threads.
+    Only the log line is affected: recording untuned shapes (AITER_TUNE_GEMM)
+    is done elsewhere and does not call this.
+    """
+    if AITER_LOG_TUNED_CONFIG:
+        logger.info(message)
+        return True
+    if not _first_report_of((family, *key)):
+        return False
+    logger.info(
+        f"{message} (Not repeated for other M while this N/K/default key stays "
+        "cached. Set AITER_LOG_TUNED_CONFIG=1 to log every miss.)"
+    )
+    return True
 
 
 def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int):
