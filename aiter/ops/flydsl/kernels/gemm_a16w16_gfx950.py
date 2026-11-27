@@ -1003,8 +1003,10 @@ def gemm_a16w16_gfx950_kernel(
                 for block_k_iter in range_constexpr(k_mma_iters_per_wave):
                     k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
                     compute_k_chunk(k_iter)
+        # A 256-wide tile with two stages keeps the default schedule: these
+        # hints change its time by -8% to +8%, by shape.
         if const_expr(
-            block_n in (192, 224, 256, 320)
+            (block_n in (192, 224, 320) or (block_n == 256 and stages >= 3))
             and block_k == 64
             and k_waves == 1
             and not is_split_k
