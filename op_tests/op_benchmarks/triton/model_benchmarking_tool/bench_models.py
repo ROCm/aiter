@@ -55,6 +55,7 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
 from op_tests.op_benchmarks.triton.bench_unified_attention import (
+    DEFAULT_BLOCK_SIZE,
     main as bench_unified_attention_main,
 )
 
@@ -570,6 +571,7 @@ class UnifiedAttnKernelHandler(KernelHandler):
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
+        block_size = shape.get("block_size")
         return {
             "Model": self._model,
             "Kernel": self._kernel,
@@ -580,6 +582,9 @@ class UnifiedAttnKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "sliding_window": shape.get("sliding_window", None),
+            "block_size": (
+                int(block_size) if block_size is not None else DEFAULT_BLOCK_SIZE
+            ),
             self._metric: bench_result,
         }
 
