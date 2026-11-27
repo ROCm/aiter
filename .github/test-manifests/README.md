@@ -26,8 +26,8 @@ turn a run green.
 
 | Manifest | Nodes | Contents |
 | --- | ---: | --- |
-| `mi450-gfx1250-p0.txt` | 23 | Architecture and stepping guards, gfx1250 code-object loading and dispatch, A16W16 contracts, MoE routing, DSV4 fused QK norm/RoPE |
-| `mi450-gfx1250-p1.txt` | 255 | Triton/Gluon MLA prefill and decode, sparse paged-attention prefill and decode, MXFP4 GEMM |
+| `mi450-gfx1250-p0.txt` | 38 | Architecture and stepping guards, gfx1250 code-object loading and dispatch, A16W16 contracts, MoE routing, DSV4 fused QK norm/RoPE, DCP decode top-k merge |
+| `mi450-gfx1250-p1.txt` | 229 | Triton/Gluon MLA prefill and decode, sparse paged-attention prefill and decode, MXFP4 GEMM |
 | `mi450-gfx1250-known-failures.txt` | 11 | Filed gfx1250 bugs (#7536, #7777, #7778, #7779), run with `--expect-failure` so a fix is noticed |
 
 Every P0 and P1 node passed on gfx1250 hardware, and every known failure still

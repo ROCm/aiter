@@ -16,6 +16,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
     GroupMajorPayloadArena,
+    _zeroed_sym,
     group_major_capacity,
 )
 from ..tensor_shim import torch_stream
@@ -679,20 +680,20 @@ class MegaMoEV2:
         # The full source histogram is small (392 int32 values for V4-Pro) and
         # lets every rank derive every destination offset without a base
         # push-back round trip.  The legacy compact matrix uses only the prefix.
-        workspace["bigcnt"] = op._sym(
+        workspace["bigcnt"] = _zeroed_sym(
             (self.world_size * total_segments,), torch.int32
         )
-        workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["my_base"] = op._sym((total_experts,), torch.int32)
-        workspace["group_base"] = op._sym((total_experts,), torch.int32)
-        workspace["plan_ready"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["launch_ready"] = op._sym((self.world_size,), torch.int32)
-        workspace["tile_ready"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["tile_expected"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_queue"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_epoch"] = op._sym((tile_state_blocks,), torch.int32)
-        workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
-        workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
+        workspace["count_done"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["my_base"] = _zeroed_sym((total_experts,), torch.int32)
+        workspace["group_base"] = _zeroed_sym((total_experts,), torch.int32)
+        workspace["plan_ready"] = _zeroed_sym((2 * self.world_size,), torch.int32)
+        workspace["launch_ready"] = _zeroed_sym((self.world_size,), torch.int32)
+        workspace["tile_ready"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["tile_expected"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_queue"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_epoch"] = _zeroed_sym((tile_state_blocks,), torch.int32)
+        workspace["ready_tile_tail"] = _zeroed_sym((2,), torch.int32)
+        workspace["payload_ready_rows"] = _zeroed_sym((1,), torch.int32)
         ms.shmem_barrier_all()
         for name in (
             "bigcnt",
@@ -1201,20 +1202,22 @@ class MegaMoEV2:
     ):
         """forward() on a given (route, capacity); tests pin a route through this,
         identically on every rank."""
-        check_forward_inputs(
-            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
-            topk=self.topk, device=self.dev,
-        )
         # Every launch of the call -- quantization, prepare, Stage1, Stage2 and
-        # combine -- runs on the caller's stream.
-        with torch.cuda.stream(torch_stream(stream)):
+        # combine -- runs on the caller's stream, resolved once here.
+        if stream is None:
             return self._launch_route(
-                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots,
+                torch.cuda.current_stream(),
+            )
+        launch_stream = torch_stream(stream)
+        with torch.cuda.stream(launch_stream):
+            return self._launch_route(
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, launch_stream
             )
 
-    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots):
-        # Every launch takes stream None: _forward_route has set the current stream.
-        run_tokens = int(x_bf16.shape[0])
+    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots, stream):
+        """``stream``: the current torch stream. The fused routes take stream None
+        (the current stream) and check their inputs themselves."""
         route, capacity = route
         if route == ROUTE_LARGE_M:
             return self._large_m.forward(
@@ -1225,6 +1228,10 @@ class MegaMoEV2:
             return runtime.forward(
                 x_bf16, wts, topk_ids, slice_output=slice_output
             )
+        run_tokens = check_forward_inputs(
+            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+            topk=self.topk, device=self.dev,
+        )
         if self._s1_fixed_slot:
             # Into the instance's own buffers (compact prepare quantizes in place):
             # a forward allocates nothing.
@@ -1240,17 +1247,16 @@ class MegaMoEV2:
                     ),
                 )
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, None, slice_output,
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
                 mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
-        prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         self._run_compact_prepare(
             topk_ids,
             run_tokens,
             config.stage1,
-            prepare_stream,
+            fx.Stream(stream.cuda_stream),
             quant_input=x_bf16,
         )
         x_q = self._s1_quant_x[:run_tokens]
@@ -1261,7 +1267,7 @@ class MegaMoEV2:
             wts,
             topk_ids,
             run_tokens,
-            None,
+            stream,
             slice_output,
             config=config,
             prepared=True,
@@ -1292,9 +1298,15 @@ class MegaMoEV2:
                 stream=stream,
                 slice_output=slice_output,
             )
-        with torch.cuda.stream(torch_stream(stream)):
+        launch_stream = torch_stream(stream)
+        if stream is None:
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, None, slice_output,
+                x_q, scales, wts, topk_ids, run_tokens, launch_stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
+            )
+        with torch.cuda.stream(launch_stream):
+            return self._run_joint(
+                x_q, scales, wts, topk_ids, run_tokens, launch_stream, slice_output,
                 mask_invalid_slots=mask_invalid_slots,
             )
 

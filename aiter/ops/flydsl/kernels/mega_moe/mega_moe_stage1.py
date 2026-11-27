@@ -2,6 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
+import dataclasses
 import functools
 
 import flydsl.compiler as flyc
@@ -11,6 +12,8 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from .. import communication_ops_utils as comm_ops
 from ..kernels_common import ceildiv
@@ -61,8 +64,8 @@ def _validate_fixed_slot_geometry(
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
     """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
     out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
-    prows = (rows + 255) // 256 * 256
-    pcols = ((inter_dim // 32) + 7) // 8 * 8
+    prows = ceildiv(rows, 256) * 256
+    pcols = ceildiv(inter_dim // 32, 8) * 8
     return out, prows * pcols + inter_dim
 
 
@@ -859,6 +862,31 @@ def compile_mega_moe_stage1_bundle(
     return launch
 
 
+@aot_factory("mega_moe_stage1_bundle")
+@functools.cache
+def _stage1_bundle_launcher(*, variants: tuple, **compile_kw):
+    """compile_mega_moe_stage1_bundle's launcher, with ``variants`` given as
+    the field values of each Stage1Config (_variant_fields), which the AOT
+    cache can key."""
+    return compile_mega_moe_stage1_bundle(
+        variants=tuple(Stage1Config(*fields) for fields in variants), **compile_kw
+    )
+
+
+@functools.cache
+def _variant_fields(variants: tuple) -> tuple:
+    return tuple(
+        tuple(getattr(config, f.name) for f in dataclasses.fields(config))
+        for config in variants
+    )
+
+
+def _stage1_bundle_lazy(compile_kw: dict):
+    """The launch handle of compile_mega_moe_stage1_bundle(**compile_kw)."""
+    variants = _variant_fields(tuple(compile_kw["variants"]))
+    return _stage1_bundle_launcher.lazy(**{**compile_kw, "variants": variants})
+
+
 def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
     tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     addr_parity, addr_expected, stream, *, model_dim, inter_dim, rank, experts_per_rank, fuse_npes,
@@ -915,7 +943,7 @@ def run_mega_moe_stage1_bundle(
     variants = tuple(compile_kw["variants"])
     if not 0 <= int(variant_id) < len(variants):
         raise ValueError(f"invalid Stage1 bundle variant_id={variant_id}")
-    launch = compile_mega_moe_stage1_bundle(**compile_kw)
+    launch = _stage1_bundle_lazy(compile_kw)
     _run_compiled(
         launch,
         out,
@@ -965,7 +993,7 @@ def preload_mega_moe_stage1_bundle(
     **compile_kw,
 ):
     """Compile and load the complete Stage1 bundle without dispatching it."""
-    launch = compile_mega_moe_stage1_bundle(**compile_kw)
+    launch = _stage1_bundle_lazy(compile_kw)
     return _preload_compiled(
         launch,
         out,

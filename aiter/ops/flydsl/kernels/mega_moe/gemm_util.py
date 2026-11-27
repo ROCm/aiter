@@ -4,18 +4,14 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value as _raw
 
 from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
 from ..kernels_common import LOG2E
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
-from .mega_moe_fused_gemm import _buffer_load
 
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
@@ -28,13 +24,7 @@ def _load_row_map_subgroup(row_map_rsrc, row_index, lane, subgroup_width):
     if subgroup_lane == fx.Int32(0):
         packed = row_map_rsrc[row_index]
     source_lane = lane - subgroup_lane
-    return fx.Int32(
-        fx.rocdl.ds_bpermute(
-            T.i32,
-            source_lane * fx.Int32(4),
-            packed,
-        )
-    )
+    return fx.Int32(fx.shuffle_idx(packed, source_lane, 64))
 
 
 def wait_lds_barrier(vmcnt=63):
@@ -80,6 +70,7 @@ class ATileLoader:
         swizzle=False,
         x_tensor=None,
         async_copy=False,
+        async_lds=False,
         indexed_input=False,
         row_map_rsrc=None,
         source_rows=0,
@@ -108,8 +99,16 @@ class ATileLoader:
             assert total_chunks % 64 == 0
             assert total_chunks < total_threads or total_chunks % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
+            # async_lds: the A copies are async LDS DMA, which the compiler does not make an LDS read wait for, so
+            # the K-step's A reads do not drain this step's copy into the other buffer (a read of either buffer
+            # looks alike to it). Every read of a copied buffer must then follow an explicit vmcnt wait covering
+            # the copy: do_tile's prologue / K-step closing wait_lds_barrier.
             self._dma_atom = fx.make_copy_atom(
-                fx.rocdl.BufferCopyLDS128b(),
+                (
+                    fx.rocdl.cdna4.BufferLoadAsyncLDS128b()
+                    if async_lds
+                    else fx.rocdl.BufferCopyLDS128b()
+                ),
                 128,
             )
 
@@ -220,15 +219,12 @@ class ATileLoader:
         self._group_chunks = row_map is not None
 
     def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
-        """The srcmap words of this thread's chunk rows (``for_tile`` row_map)."""
+        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``)."""
         chunks_per_row = self._k_step_bytes // 16
         return [
-            _buffer_load(
-                srcmap_rsrc,
-                tile_row_base_i32
-                + (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(chunks_per_row),
-                fx.Int32,
-            )
+            srcmap_rsrc[
+                tile_row_base_i32 + (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
+            ]
             for c in range_constexpr(
                 0, self._sort_block_m * chunks_per_row, self._total_threads
             )
@@ -334,15 +330,12 @@ class ATileLoader:
 class AS2RLoader:
     """Load one FP8/FP4 scaled-MFMA A operand from row-major LDS."""
 
-    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8", asm_reads=False):
+    def __init__(self, *, k_step_bytes, swizzle=False, a_dtype="fp8"):
         self._k_step_bytes = k_step_bytes
         self._swizzle = swizzle
         self._lane = fx.thread_idx.x % 64
         self._is_fp4 = a_dtype == "fp4"
         assert self._is_fp4 or a_dtype == "fp8"
-        # asm_reads: load_operand_in_flight reads through inline asm (see there).
-        assert not (asm_reads and self._is_fp4)
-        self.asm_reads = asm_reads
 
     def _load_16b(self, lds_src, i32_off, narrow_copy=False):
         if const_expr(narrow_copy):
@@ -382,44 +375,6 @@ class AS2RLoader:
         hi = self._load_16b(lds_src, row_i32 + _c(col_lo + 16), narrow_copy).bitcast(
             fx.Int64
         )
-        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
-            fx.Int32
-        )
-
-    def load_operand_in_flight(self, lds_src, mi, ksub, base_i32=0):
-        """load_operand while this K-step's A copy into the other LDS buffer is in flight.
-
-        With asm_reads the two ds_read_b128 (and their lgkmcnt wait) are inline asm: the compiler sees no LDS read,
-        so it does not make the first read of the K-step wait (vmcnt) for the next step's LDS DMA, which it
-        cannot tell apart from this step's buffer. The K-step's closing vmcnt wait + barrier orders the DMA.
-        """
-        if const_expr(not self.asm_reads):
-            return self.load_operand(lds_src, mi, ksub, base_i32)
-        row = fx.Int32(self._lane % 16)
-        row_i32 = row * fx.Int32(self._k_step_bytes // 4) + fx.Int32(base_i32)
-        klane4 = fx.Int32(self._lane // 16) * fx.Int32(4)
-
-        def _c(col):
-            if const_expr(self._swizzle):
-                return col ^ (row << fx.Int32(2))
-            return col
-
-        col_lo = klane4 + fx.Int32(ksub * 32)
-        lds_base = fx.Int32(fx.ptrtoint(lds_src.ptr))
-        addr_lo = lds_base + (row_i32 + _c(col_lo)) * fx.Int32(4)
-        addr_hi = lds_base + (row_i32 + _c(col_lo + fx.Int32(16))) * fx.Int32(4)
-        # Row mi * 16 + lane % 16: the swizzle only sees lane % 16, so mi is an immediate offset.
-        imm = mi * 16 * self._k_step_bytes
-        v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
-        pair = llvm.inline_asm(
-            ir.Type.parse("!llvm.struct<(vector<4xi32>, vector<4xi32>)>"),
-            [_raw(addr_lo), _raw(addr_hi)],
-            f"ds_read_b128 $0, $2 offset:{imm}\nds_read_b128 $1, $3 offset:{imm}\ns_waitcnt lgkmcnt(0)",
-            "=&v,=&v,v,v",
-            has_side_effects=True,
-        )
-        lo = Vec(llvm.extractvalue(v4, pair, [0])).bitcast(fx.Int64)
-        hi = Vec(llvm.extractvalue(v4, pair, [1])).bitcast(fx.Int64)
         return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
             fx.Int32
         )
@@ -602,7 +557,7 @@ class AScaleLoader:
                     copy_group(lin, source_group)
 
             for i, c in enumerate(range_constexpr(0, n16, self._total_threads)):
-                lin = fx.Int32(c) + fx.Int32(self._tx)
+                lin = fx.Int32(c) + self._tx
                 row = lin // fx.Int32(row_chunks)
                 row_group = _token_offset(srcs[i], row_chunks, row_map["scale_token"])
                 if const_expr(valid_rows_i32 is None):
@@ -668,11 +623,11 @@ class AScaleLoader:
         for c in range_constexpr(
             0, self._sort_block_m * row_chunks, self._total_threads
         ):
-            row = (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(row_chunks)
+            row = (fx.Int32(c) + self._tx) // fx.Int32(row_chunks)
             row = (row < fx.Int32(self._sort_block_m)).select(
                 row, fx.Int32(self._sort_block_m - 1)
             )
-            out.append(_buffer_load(srcmap_rsrc, tile_row_base_i32 + row, fx.Int32))
+            out.append(srcmap_rsrc[tile_row_base_i32 + row])
         return out
 
     def load_step(self, lds_ascale, kstep_i32):
@@ -682,7 +637,7 @@ class AScaleLoader:
         out = []
         if const_expr(self._packed):
             i32_ptr = fx.recast_iter(fx.Int32, lds_ascale.ptr)
-            base = kstep_i32 * fx.Int32(self._n_groups * 64) + fx.Int32(self._lane)
+            base = kstep_i32 * fx.Int32(self._n_groups * 64) + self._lane
             for g in range_constexpr(self._n_groups):
                 v = fx.make_view(
                     fx.add_offset(i32_ptr, base + fx.Int32(g * 64)),
@@ -1247,9 +1202,8 @@ class SiluQuantEpilogue:
             fx.get_iter(self._out_tensor),
             fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
         )
-        tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
         out_vec = ptr_buf_tensor(
-            fx.get_iter(tile_view),
+            tile_iter,
             fx.Int32,
             unit_elems=2,
             num_records_bytes=(

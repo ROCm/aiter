@@ -127,9 +127,8 @@ ROUTE_LARGE_M = "large_m"
 SMALL_M_MAX_MTPR = 512
 DEFAULT_SMALL_M_MTPRS = (256, 512)
 # Instance capacities the large-input persistent kernel is built for. At 32768
-# the staged path stays: it is faster there (large-input E2E +11.7% at 32768
-# uniform tokens) and its source-indexed payload needs 1.75 GiB per GPU where
-# the large-input route-major payload needs 10.5 GiB.
+# the staged path stays: it is faster there, and its source-indexed payload is
+# a fraction of the large-input route-major payload.
 LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 # EP4 DeepSeek-V4.1-Flash takes its large-input tune at 8192 and 16384 only: on gfx950 the kernel faults
 # (illegal memory access) at 1024, 2048 and 4096.
@@ -304,9 +303,9 @@ class FusedStage1Knobs:
     # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
     # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
     no_chunk_release: bool = False
-    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
-    # the next step's A copy (False: the compiler makes it wait).
-    a_asm_reads: bool = False
+    # Large-input GEMM1 copies A to LDS with async LDS DMA, so a K-step's first A read does not wait for the next
+    # step's A copy (False: the compiler makes it wait, as it cannot tell the two LDS buffers apart).
+    a_async_lds: bool = False
     # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
     # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
     batch_rows: bool = False
@@ -1556,19 +1555,12 @@ def _large_m_config(expert_waves: int = 1) -> MegaMoEConfig:
 
 
 def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
-    """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950."""
-    # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
-    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan CTA writes the plan through to memory and
-    # publishes the flag without an L2 writeback. Every CTA builds the plan from the expert counts itself once the
-    # sources are done, so GEMM1 starts without the plan CTA's metadata stores and flag hop, and takes its tile
-    # metadata from LDS (-3% at 1 token, -2% at 8, -1.2% at 32, -0.3..-0.6% at 128-512); GEMM2 waits on the plan
-    # flag itself, one hop instead of behind its XCD's acquire and republish (-1.8% at 1 token, neutral at 8-512).
-    # The counters' reset point moves to the combine. With at most 8 route-carrying producers (1-2 tokens), each one
-    # adds its share of the source flag to every destination after its own drain, skipping the last-producer counter
-    # hop (-1.5% at 1 token, -1% at 2, neutral at 16; 24 producers at 16 tokens: +1.3%). These change what the ranks
-    # of a launch exchange, and the ranks of a launch may pick different buckets: every bucket sets them, as it sets
-    # the runtime's per-token counters (used by the tok_done buckets, cleared by every launch) and the BF16 rows of
-    # the first tokens (sender and combine agree).
+    """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950.
+
+    Knob meanings: FusedStage1Knobs / FusedStage2Knobs; the measurements behind each choice are in the PR.
+    """
+    # Protocol knobs (dedup rows, local plan, direct done, the tok_done counters, BF16 head rows): the ranks of a
+    # launch may pick different buckets, so every bucket sets the same values.
     stage1 = replace(
         config.fused_stage1,
         dedup_rows=True,
@@ -1577,25 +1569,15 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
         direct_done=8,
         tok_counters=True,
         bf16_head_tokens=4,
-        # GEMM2 keeps the pointers it reads from the dispatch table in SGPRs: every load of its K-loop sat in a
-        # waterfall loop (-1.6..-2.4% at 1-32 tokens, where the GEMM2 K-loop is latency-bound; -0.7..-0.1% at
-        # 64-128). The 64-row tiles of 256-512 tokens spill with it (+5..+7%).
+        # Off from 256 tokens: the 64-row tiles spill with the pointers in SGPRs.
         g2_uniform=bucket <= 128,
     )
     if bucket <= 4:
-        # GEMM1 runs one round of tiles, so its epilogue is on the critical path: the large-input lean epilogue
-        # (8 columns a lane, no serial store waits, fast SiLU) cuts 3% at 1 and 4 tokens (neutral at 8-16).
-        # The combine takes a token once its routes' GEMM2 rows are counted on it, not after every rank's last CTA
-        # publishes its flag: the ticket -> flag -> reduce hops leave the tail (-3% at 1 token, -2.2% at 2 and 4
-        # with the lane-fed scatter it needs; +0.8% at 8, +1.6% at 16, +2.9% at 128 from the per-unit drains).
+        # GEMM1 runs one round of tiles, so its epilogue and the combine's wait are the critical path.
         stage1 = replace(stage1, epi_evec=8, epi_lean=3, g2_epi_lean=2, tok_done=True)
     config = replace(config, fused_stage1=stage1)
     if bucket == 1:
-        # Streaming GEMM1 weight loads, as the larger buckets (-8%). Head pointers in SGPRs: 160 -> 17 waterfall
-        # loops, 244 -> 217 VGPR (-2%; neutral at 4-128 tokens, +4% at 256-512). GEMM2 scatter rows take their ids,
-        # weights and peer bases from lanes (-1.1%; -0.7% at 4 tokens, neutral at 16-128). GEMM1 loads a K-step's A
-        # rows two steps ahead into registers and W1 two steps ahead in a fully unrolled K-loop, one wave a SIMD
-        # (-2.4%; either alone, or W1 ahead in the rolled loop, is slower).
+        # Streamed W1, head pointers in SGPRs, A and W1 two K-steps ahead, one wave a SIMD: latency-bound K-loop.
         return replace(
             config,
             stage1=replace(config.stage1, b_nt=3, waves_per_eu_hint=1),
@@ -1604,18 +1586,17 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             ),
         )
     if bucket == 16:
-        # Half the GEMM1 n-tiles (tile_n 256, -3.5%) and GEMM2 block_n 256 (-3%): longer weight slabs per tile.
+        # Fewer, wider GEMM1 / GEMM2 n-tiles: longer weight slabs per tile.
         return replace(
             config,
             stage1=replace(config.stage1, tile_n=256),
             stage2=replace(config.stage2, block_n=256),
         )
     if bucket == 128:
-        # Half the GEMM1 n-tiles of tile_n 128: each streams a longer W1 slab (-4%).
+        # Fewer, wider GEMM1 n-tiles: each streams a longer W1 slab.
         return replace(config, stage1=replace(config.stage1, tile_n=256))
     if bucket == 512:
-        # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound
-        # GEMM2 scatter starts while GEMM1 still runs (-2.7%; a quarter: +1.1%, neutral to +1.2% at 128 tokens).
+        # Early GEMM2 CTAs: the XGMI-bound GEMM2 scatter starts while GEMM1 still runs.
         return replace(
             config, fused_stage2=replace(config.fused_stage2, early_k=2, early_p=8)
         )
@@ -1630,65 +1611,13 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
     buckets, row stamps, P2P rows), all inside the 32-bit buffer offsets up to 16384 (LargeMRuntime checks them).
     At 1024, 2048 and 4096 the kernel faults with an illegal memory access on gfx950, so those stay staged.
+
+    Knob meanings: FusedStage1Knobs / FusedStage2Knobs; the measurements behind each choice are in the PR.
     """
-    # One payload producer per destination leaves its ~16 MB a ~750 us copy at 2048 tokens a rank;
-    # 12 split the destination's experts (-24%). XCD-affine GEMM2 claims share each W2 slab in one
-    # XCD's L2 across the expert's m-blocks (-5%). 128-byte P2P rows keep each GEMM2 scatter store
-    # off the cache lines its neighbouring rows' stores touch (-1%). An expert just past 128 rows pads a
-    # second m-tile that is mostly padding; it runs 32 rows instead of 128 (-6%). Row scales leave once per
-    # row as whole lines from the m-block's last n-block, not as ten 16-byte partial-line writes (-2.5%).
-    # A tail of at most 16 rows rides on its expert's previous m-tile, sharing its W1 reads (-1.2%; 32
-    # rows spill the K-loop). All waves of the plan CTA plan the 96 experts, not one (-1.4%), and write
-    # each expert's padding rows together (-1%). The GEMM1 epilogue quantizes 8 columns a lane and stores
-    # them as one 8-byte write (-1.4%). A token row goes to each destination once, from the route to its
-    # lowest expert there (sent first), and GEMM1 waits for the row's arrival stamp (-2.8%). A payload
-    # chunk's chunk_done RMW reuses its tile-ready release (-1.8%), and an expert's last chunk skips the
-    # unread payload_ready release and RMW (-1.9%). One wave, not every wave, invalidates the caches once a
-    # GEMM1 tile's rows landed (-1.1%). A chunk's drained peer stores (uncached heap) need no release before its
-    # tile-ready RMW (-1.7%). GEMM1 reads its A operands in inline asm, so a K-step's first read does not wait for
-    # the next step's A copy, which the compiler cannot tell from this step's buffer (-1.5%). GEMM2 drops an
-    # all-padding m-block at its claim instead of after its GEMM1 tile, and issues its A copy on every K-step so
-    # the MFMAs do not wait for the copy two steps ahead (-1.4% together). A payload chunk resolves its routes one
-    # per thread and copies the sent rows with their loads ahead of the stores, so 8 producers a destination
-    # keep up and the other 16 CTAs run GEMM1 from the start (-1.3%; 8 with the row-at-a-time copy: +1.1%).
-    # The plan sizes the payload geometry off its serial path, fences once instead of in every wave, and loads
-    # its inputs in one round (-1%). The token rows of the first payload round (each destination's first 8
-    # experts) cross XGMI while the plan runs, so GEMM1 starts sooner (-2.2%; 32 experts crowd the plan: +5%).
-    # Each Combine wave starts once its own token's rows arrived, not after every rank's GEMM2 (-1.8%): the ranks
-    # that finish GEMM2 before the most loaded one reduce most of their tokens while it still runs.
-    # GEMM2 is XGMI-bound and the links idle once the dispatch is done, while GEMM1 still runs: half the CTAs
-    # leave GEMM1 for GEMM2 after a claim past a quarter of the GEMM1 work, with GEMM2 claiming 8 m-blocks
-    # at a time in all n-blocks, so the early units find their GEMM1 m-tiles done (-7.5%).
-    # Count words carry the launch tag, so the plan spins on them instead of a count_done round, and each route's
-    # histogram RMW is its slot in a per-expert pair-order bucket, so the producers start without the prefix /
-    # cursor pass; warp 1 sizes the geometry while the other waves plan (-1.2%). GEMM1 stages its A scales in K-loop
-    # order, so a K-step reads each row group's scale word with one ds_read_b32 instead of four serial ds_read_u8
-    # and a VALU pack (-1.8%). Early GEMM2 CTAs are picked per XCD, and the GEMM2 epilogue's per-row chain skips
-    # most LDS round trips (readlane row ids, DPP scale max) (-1.2% together). The GEMM1 epilogue quantizes and
-    # stores without scratch-reload store drains and with a v_rcp SiLU, and a GEMM2 unit copies its m-block's
-    # A scales to LDS once instead of two scale loads per K-step (-1.6% together, each alone below 1%).
-    # An expert's GEMM2 tail of at most 16 rows (~40% of the experts have 129-144 rows) rides on its previous
-    # m-block as an 80-row unit instead of running ten 64-row units of its own (-1.4%).
-    # An expert's last GEMM1 m-tile with 33-64 real rows runs 64 rows, not 128 (-4% at 512 tokens a rank,
-    # where most experts have one ~32-row tile; -1.9% at 1024, neutral at 256-384 and 2048).
-    # GEMM1 streams its W1 loads (nt), as the small buckets: -2% at 512 and 1024, where the short and mid
-    # tiles wait on W1, -0.7% at 2048.
-    # A GEMM2 unit whose m-block is its expert's only one streams W2 (nt) as well: no other m-block rereads the
-    # slab from L2 (-5% at 512, -4% at 1024, -0.7% at 2048, where most experts keep cached loads).
-    # With W2 streamed, up to 64 rows an expert (1024 tokens a rank) the early CTAs leave GEMM1 after 6/16 of its
-    # work instead of 4/16 (-2% at 512, -1.4% at 1024; the later start loses 1.2% at 1280-2048, so it stays 4/16
-    # there).
-    # The P2P rows carry offset int8 instead of E4M3 under the same E8M0 scales: relL2 vs the fp32 reference
-    # 0.0583 -> 0.0525 at 512-2048 tokens, at no measurable cost (same bytes; the extra cvt sits off the XGMI bound).
-    # The presend covers 16384 // tokens experts (8..64): about the same rows at every token count, where 8
-    # experts fit 2048 tokens only (-1% at 512, -1.4% at 1024, -0.7% at 256, unchanged at 2048).
-    # Up to 640 tokens a rank each destination gets 12 payload producers, not 8: the GEMM1 tiles that wait on
-    # the dispatch are most of the first round there (-1.2% at 512, -0.8% at 256; neutral at 768-2048).
-    # The launch head is serial up to the first GEMM1 tile: the producers count their routes before the gate
-    # (written through, so group_done needs no L2 writeback), the owner clears its counters while the handshake
-    # travels, and producers read the destination's rows per tile / ready order once (-1% at 256 and 512).
-    # The batched dispatch's token-scale reads are bounded by the scale buffer: a masked load reads its lane at
-    # 2 GiB past an unbounded buffer, which faults wherever nothing is mapped there (EP2 at every token count).
+    # The dispatch is XGMI-bound: more producers, one row per destination, a presend while the plan runs, and early
+    # GEMM2 CTAs keep the links busy; the tail-tile knobs cut padded GEMM rows; the lean / async knobs shorten the
+    # serial chains. fold_tail stays at 16 rows (32 spills the GEMM1 K-loop); the batched dispatch's scale reads are
+    # bounded by the scale buffer (an unbounded masked read faults, e.g. EP2).
     return replace(
         config,
         stage1=replace(config.stage1, b_nt=3),
@@ -1706,7 +1635,7 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
             skip_payload_ready=True,
             one_row_acquire=True,
             no_chunk_release=True,
-            a_asm_reads=True,
+            a_async_lds=True,
             payload_small_blocks=12,
             payload_small_tokens=640,
             lean_plan=True,
@@ -1745,58 +1674,40 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
 def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     """EP2 DeepSeek-V4.1-Flash small-input kernel (192 experts per rank), measured on gfx950 (MTPR 512; uniform, Zipf
     and hot-expert routing)."""
-    # The EP4 tune and its launch protocol (dedup rows, local plan, direct done, the tok_done counters and BF16
-    # head rows), with two changes it needs here: 32-row expert tiles at every bucket (8-16 rows an expert at
-    # 256-512 tokens: a 64-row tile would be mostly padding) and 96 producer CTAs (3 64-expert waves of the
-    # EP4 rule leave no consumers; 32 to 224 measured within 2%). Below 256 tokens nothing else won under every
-    # routing: tok_done at 8 tokens (-6% uniform, +11% hot) and tile_n 256 at 32-64 (-1..-4% uniform, +6..+14%
-    # hot) stay off, and producers, direct_done, block_n, early GEMM2 and FP8-row thresholds measured within
-    # noise or worse.
+    # The EP4 tune and its launch protocol, with 32-row expert tiles at every bucket (few rows an expert: a 64-row
+    # tile would be mostly padding) and 96 producer CTAs (the EP4 rule's 3 64-expert waves leave no consumers).
     config = _tune_v41_flash_ep4_small(config, bucket)
     stage1 = replace(config.stage1, sort_block_m=32, num_dispatch_cu=96)
     stage2 = replace(config.stage2, block_m=32)
     knobs = config.fused_stage1
     if bucket in (256, 512):
-        # Half the GEMM1 n-tiles, each streaming a longer W1 slab, and GEMM2's dispatch-table pointers in SGPRs
-        # as up to 128 tokens (the 32-row tiles leave the registers the EP4 64-row tiles spilled): -3% uniform,
-        # -8% Zipf, -12% hot at 256 tokens.
+        # Wider GEMM1 n-tiles (longer W1 slabs), and GEMM2 pointers in SGPRs: the 32-row tiles do not spill.
         stage1 = replace(stage1, tile_n=256)
         knobs = replace(knobs, g2_uniform=True)
     if bucket == 512:
-        # The 3072 routed rows of uniform routing pass the cached-weight threshold measured on EP8 / EP4, but
-        # each of the 192 experts has ~16 rows, one m-tile: no other tile rereads its weights, so the GEMM
-        # bodies stream them. A hot expert still takes the cached bodies. With the above: -8% uniform, -3% Zipf,
-        # -3.5% hot.
+        # Each of the 192 experts has about one m-tile, so no other tile rereads its weights: stream them.
         knobs = replace(knobs, stream_w=True)
     return replace(config, stage1=stage1, stage2=stage2, fused_stage1=knobs)
 
 
 def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384."""
-    # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs; 64 to 160
-    # measured within 1.5%). The EP4 schedule knobs stay: presend_experts 24
-    # (-2..-6% uniform at 4096-16384 tokens a rank) costs 5..30% under Zipf routing at 3072-6144, early_p 5-6
-    # (-6..-9% at 8192+) costs 3-5% at 3072, and payload_min_blocks, payload_small_*, presend_rows, early_p_mid,
-    # m_group, xcd_chunk and early_k measured within noise or worse.
+    # The EP4 tune with 96 producer CTAs (the EP4 rule's 3 64-expert waves are more than the CUs); its schedule
+    # knobs stay, as the uniform-routing alternatives lose under skewed routing.
     config = _tune_v41_flash_ep4_large(config)
     return replace(config, stage1=replace(config.stage1, num_dispatch_cu=96))
 
 
 def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash small-input kernel (48 experts per rank), measured on gfx950 (8 ranks; uniform,
-    zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off).
+    zipf and all-to-rank-0 routes).
 
-    The EP4 tune (_tune_v41_flash_ep4_small) carries over: 1.2x at 1-2 tokens, 1.05-1.1x at 4-32 and 128 (1.2-1.3x
-    on skewed routes), 1.02-1.06x at 64 and 256-512. Each of its parts pays at EP8 too: without the dedup rows
-    -3..-5%, without the plan built in every CTA -2..-3%, without the written-through plan -1.5..-2%, without the
-    GEMM2 pointers in SGPRs -1%; without tok_done -5..-7% at 1 token and -3..-5% at 2-4 (so the small-input runtime
-    keeps its own payload and combine buffers, as at EP4); the 1-token GEMM1 knobs -9%, the 1-4 token lean
-    epilogue -1..-4%, the 128-token tile_n 256 -3..-16%.
+    The EP4 tune (_tune_v41_flash_ep4_small) carries over, each of its parts included (with tok_done the
+    small-input runtime keeps its own payload and combine buffers, as at EP4); the measurements are in the PR.
     """
     config = _tune_v41_flash_ep4_small(config, bucket)
     if bucket == 4:
-        # The 1-token GEMM1 schedule (head pointers in SGPRs, A and W1 two K-steps ahead, one wave a SIMD) at 4
-        # tokens too, whose grid is one CTA a CU as well (-3.5% uniform, -5% zipf, -8% skewed to one rank).
+        # The 1-token GEMM1 schedule at 4 tokens too, whose grid is one CTA a CU as well.
         return replace(
             config,
             stage1=replace(config.stage1, waves_per_eu_hint=1),
@@ -1805,7 +1716,7 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             ),
         )
     if bucket == 16:
-        # EP4's 256-wide GEMM1 / GEMM2 tiles at 16 tokens: -5% uniform but +14% zipf; keep the 128-wide ones.
+        # EP4's 256-wide GEMM1 / GEMM2 tiles lose under skewed routing here; keep the 128-wide ones.
         return replace(
             config,
             stage1=replace(config.stage1, tile_n=128),
@@ -1820,36 +1731,26 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             stage2=replace(config.stage2, block_n=256),
         )
     if bucket in (32, 64):
-        # Half the GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab (-3% uniform, -10..-18%
-        # skewed, neutral zipf).
+        # Wider GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab.
         return replace(config, stage1=replace(config.stage1, tile_n=256))
     if bucket == 512:
-        # Half the CTAs leave GEMM1 for GEMM2 after 12/16 of their XCD's GEMM1 slice instead of 8/16: twice as many
-        # rows an expert as at EP4 keep GEMM1 longer on the critical path (-2.6% uniform, -3.4% zipf).
+        # Later early-GEMM2 exit than EP4: twice the rows an expert keep GEMM1 longer on the critical path.
         return replace(config, fused_stage2=replace(config.fused_stage2, early_p=12))
     return config
 
 
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
-    uniform, zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off). It serves
-    8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as the EP4 tune.
+    uniform, zipf and all-to-rank-0 routes). It serves 8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as
+    the EP4 tune.
 
     The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
-    per-token combine wait: 1.5-1.8x at 513-2048 tokens a rank and 1.15-1.3x at 4096-16384 on uniform routes,
-    1.15-1.6x up to 2048 on zipf routes (0.96-0.97x at 8192-16384, where the GEMM2 m-blocks of the hot experts
-    dominate), 1.1-1.3x on routes skewed to one rank. Each of its parts pays at EP8 too: without the dedup rows
-    -2..-8% (-20% at 513 zipf tokens), the tail tiles -2..-7%, the lean epilogues -5..-7%, the asm A reads -3..-5%.
+    per-token combine wait; the measurements are in the PR.
     """
     config = _tune_v41_flash_ep4_large(config)
-    # Twice the rows an expert of EP4 make the hot experts of a skewed launch many GEMM2 m-blocks: claimed XCD-affine
-    # in 8-m-block groups, with half the CTAs leaving GEMM1 early, they run on one XCD's CTAs while the others idle.
-    # One claim counter per work shard instead: +15..+30% at 1024-16384 zipf tokens (-11% at 513) and +13..+37%
-    # skewed to one rank, -2% uniform. W1 loads cached (b_nt 0), as the V4-Pro default: the m-tiles of the larger
-    # experts reread the W1 slab from L2 (+4.5% skewed to one rank, +2% zipf, neutral uniform).
-    # The combine waits for every rank's GEMM2 (comb_tok_wait off): the per-token wait gains 1.5-5% at 513-2048
-    # uniform tokens a rank and under 1.6% from 4096 (the prefill chunks), but a runtime whose ranks can end apart
-    # keeps its own route-major payload, 3.9 GiB more per GPU at MTPR 16384.
+    # One claim counter per work shard: XCD-affine claims put a skewed launch's hot experts on one XCD's CTAs.
+    # Cached W1 (b_nt 0): the larger experts' m-tiles reread the W1 slab from L2.
+    # comb_tok_wait off: a runtime whose ranks can end apart keeps its own route-major payload (GiBs per GPU).
     return replace(
         config,
         stage1=replace(config.stage1, b_nt=0),

@@ -9,6 +9,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
     gemm_a8w8_per_token_scale,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -23,17 +24,6 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
-
-
-def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
-    # GPT-OSS-120B attention projections
-    x_vals += [(v, 5120, 2880) for v in (128, 192, 4096, 8000)]  # QKV input projection
-    x_vals += [(v, 2880, 4096) for v in (128, 192, 4096, 8000)]  # output projection
-    return x_vals
 
 
 def generate_gemm_a8w8_per_token_scale_inputs(
@@ -83,7 +73,7 @@ def generate_gemm_a8w8_per_token_scale_inputs(
         for output in [True, False]
         for dtype in ["bf16"]
         for layout in ["TN", "TT", "NN", "NT"]
-        for shape in get_x_vals()
+        for shape in get_shapes()
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output):

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import sys
 import threading
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -30,13 +31,6 @@ AITER_FLYDSL_KERNARG_PRELOAD = bool(
 )
 AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
     os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
-)
-
-# Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
-# kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
-# to enable it.
-AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
@@ -299,10 +293,26 @@ def check_e8m0(
 _get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
-def current_stream_arg():
+def current_raw_stream(device=None) -> int:
+    """Handle of the current stream on ``device`` (default: the current device).
+
+    About 0.1 us, against about 5 us for ``torch.cuda.current_stream()``,
+    which builds a Python stream object on every call.
+    """
+    if device is None:
+        index = torch.cuda.current_device()
+    else:
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
     if _get_current_raw_stream is None:
-        return torch.cuda.current_stream()
-    return fx.Stream(_get_current_raw_stream(torch.cuda.current_device()))
+        return torch.cuda.current_stream(index).cuda_stream
+    return _get_current_raw_stream(index)
+
+
+def current_stream_arg(device=None):
+    """The current stream on ``device`` as a FlyDSL launch argument."""
+    return fx.Stream(current_raw_stream(device))
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):
@@ -337,7 +347,15 @@ def _run_compiled(exe, *args, specialization_key=None):
 
     A specialization key gives a multi-constexpr JitFunction one compiled
     callable per configuration. Factory-style launchers should leave it unset.
+
+    A launcher bound by ``aiter.ops.flydsl.aot_launch`` launches through its
+    ``FlyDSLAotCache`` instead.
     """
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if aot(args, specialization_key):
+            return
+        exe = aot.launcher()
     if env.compile.compile_only:
         # A callable warmed during execution must not dispatch when a later
         # preload switches to compile-only. Preserve it for execution to resume.
@@ -360,8 +378,42 @@ def _run_compiled(exe, *args, specialization_key=None):
         exe._cf_by_specialization[specialization_key] = cf
 
 
-def _preload_compiled(exe, *args):
+def _aot_prebuilding() -> bool:
+    """Whether this process is an AOT prebuild (``aot_cache._prebuilding``);
+    asked only for a bound launcher, so the cache module is loaded."""
+    return sys.modules["aiter.ops.flydsl.aot_cache"]._prebuilding()
+
+
+def _compile_and_keep(exe, *args):
+    """``flyc.compile(exe, *args)`` for a caller that keeps the returned
+    function and calls it directly from then on: launches ``exe`` and returns
+    that function (None under ``COMPILE_ONLY``, which launches nothing).
+
+    For a launcher bound to the AOT cache, a prebuild builds its entry, and
+    another process launches and returns the loaded entry; a key with no
+    entry is compiled on the JIT path as before.
+    """
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if env.compile.compile_only:
+            _run_compiled(exe, *args)
+            return None
+        from ..aot_launch import preload_bound
+
+        kernel = preload_bound(exe, args)
+        if kernel is not None:
+            kernel(*args)
+            return kernel
+        exe = aot.launcher()
+    return _compile_and_run(exe, *args)
+
+
+def _preload_compiled(exe, *args, specialization_key=None):
     """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    ``specialization_key``: the one the launcher is launched with
+    (``_run_compiled``), so that a launcher bound to the AOT cache is
+    preloaded under the key its launches look up.
 
     Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
     Older supported versions provide the same no-dispatch behavior through the
@@ -369,12 +421,41 @@ def _preload_compiled(exe, *args):
     guard executes the launcher and is unsafe for preload callers that pass
     placeholder pointers.
     """
+    # A launcher bound to the AOT cache (aot_launch): a prebuild builds its
+    # entry as a launch does, and another process loads the entry instead of
+    # tracing and returns the loaded function, which takes the launcher's
+    # arguments. A key with no entry is preloaded on the JIT path.
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if _aot_prebuilding():
+            # Builds the entry and runs FlyDSL's compile-only launch, which
+            # returns None, as flyc.compile does under COMPILE_ONLY.
+            _run_compiled(exe, *args, specialization_key=specialization_key)
+            return None
+        from ..aot_launch import preload_bound
+
+        loaded = preload_bound(exe, args, specialization_key)
+        if loaded is not None:
+            return loaded
+        # A factory.lazy() handle is no launcher: build it.
+        exe = aot.launcher()
+
     preload = getattr(exe, "preload", None)
     if callable(preload):
         return preload(*args)
 
+    # Not loaded: this process has no AOT cache to protect.
+    aot_cache = sys.modules.get("aiter.ops.flydsl.aot_cache")
+
     with _PRELOAD_COMPILE_LOCK:
         old_compile_only = os.environ.get("COMPILE_ONLY")
+        # Not a prebuild: a launch of another thread, which sees COMPILE_ONLY
+        # meanwhile, must not build an AOT cache entry in this process. The
+        # flag covers the whole time COMPILE_ONLY is on: set before, reset
+        # after, and to what it was (preloads may nest).
+        was_preloading = getattr(aot_cache, "_preloading", False)
+        if aot_cache is not None:
+            aot_cache._preloading = True
         os.environ["COMPILE_ONLY"] = "1"
         try:
             return flyc.compile(exe, *args)
@@ -383,6 +464,8 @@ def _preload_compiled(exe, *args):
                 os.environ.pop("COMPILE_ONLY", None)
             else:
                 os.environ["COMPILE_ONLY"] = old_compile_only
+            if aot_cache is not None:
+                aot_cache._preloading = was_preloading
 
 
 def _to_raw(v):

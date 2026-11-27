@@ -440,7 +440,7 @@ def _knob_table(config):
 # table.
 # The knob table gained fused_stage1.disp_order and .sync_lean (0 at EP4); the large-input config at MTPR 8192 takes
 # m_group 256, 96 dispatch CUs and b_nt 0.
-_EP4_FUSED_DIGEST = "1211c9861e87f1bbb6bb278cf93a18ab9095815307a9c94dad21ea4747ee8ba5"
+_EP4_FUSED_DIGEST = "f3a65064ebc3e085ec4588ebb22e52e030dbdcc34640360fb2f875c8b36b14cb"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -500,7 +500,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 # Verify buckets 64/128/256 take disp_order 31 and sync_lean 1; bucket 32 takes 256-wide GEMM2 n-blocks; the
 # large-input config drops the GEMM2 fold.
 _V41EP8_FUSED_DIGEST = (
-    "09b2e7521fe31f97138d0487a726d6a8e3027350ae194010d8c2a0cf0d98d169"
+    "f5a0e7657a77f25c59ea78070886a170c2ddca14240db0bf39e75eb7da373ea9"
 )
 
 
@@ -751,7 +751,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
 # The knob table gained fused_stage1.disp_order and .sync_lean (0 at EP2).
-_EP2_FUSED_DIGEST = "794aafe7b6ef639acd117b0f11377cce6c192350ea6d663dc06f532ce4d65576"
+_EP2_FUSED_DIGEST = "0fafa2b4e70902c290c2c4de77c67bdbd2c8a6109c576fc1cfb7d93be2038872"
 
 
 def test_ep2_fused_configs_unchanged():

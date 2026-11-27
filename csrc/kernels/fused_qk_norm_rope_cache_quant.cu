@@ -106,16 +106,6 @@ using mrope_utils::vec_t;
 // kernel, so the two must agree -- it sits immediately after the Q-head TDM ring.
 static constexpr size_t kQScaleGatherBytes = 32;
 
-// HW-native fp8 e4m3 element dtype, selected by the compile target (same idiom as
-// quant_kernels.cu): gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn
-// (max_pos=448). Used as the MX dtype tag for the e8m0 block-scale helpers. Keyed on the
-// arch macro rather than an ad-hoc finfo<>::max() threshold, matching opus::finfo<fp8_t>.
-static constexpr aiter::MxDtype kHwFp8E4m3Dtype =
-#if defined(__gfx942__)
-    aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-    aiter::MxDtype::FP8_E4M3;
-#endif
 
 template <typename Func, typename T>
 __inline__ __device__ T warpReduceSum(Func func, T val)
@@ -4777,7 +4767,7 @@ namespace aiter {
         if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
           // E8M0 block scale via the shared MX helper, RoundUp mode (matches
           // V4-Pro / NV ROUND_UP / torchao RCEIL: dq_scale = ceil_pow2(amax / fp8_max)).
-          constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
+          constexpr MxDtype kMxDt = aiter::kHwFp8MxDtype;
           const E8m0BlockScale s =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(thread_max);
           // v4 nm asm reader reads each tile scale TWICE consecutively
@@ -5449,7 +5439,7 @@ namespace aiter {
           //
           // Measured a real win at T=16384 H=128 G=64.
           thread_max = multithread_reduce_max_dpp<Q_REDUCE>(thread_max);
-          constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
+          constexpr MxDtype kQMxDt = aiter::kHwFp8MxDtype;
           const E8m0BlockScale qs_scale =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(thread_max);
           const float inv_scale = is_nope_thr ? qs_scale.inv_scale() : 1.0f;
@@ -5826,7 +5816,7 @@ namespace aiter {
           const float amax_norm = amax_raw * rms_scale;  // == amax(|x_norm|) over the group
           float factor;
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
+            constexpr MxDtype kMxDt = aiter::kHwFp8MxDtype;
             // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
             const E8m0BlockScale s =
                 fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(
@@ -6004,7 +5994,7 @@ namespace aiter {
 
       if constexpr (Q_QUANT) {
         const float amax_norm = amax_raw * q_rms_scale;  // == amax(|q_norm|) over the group
-        constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
+        constexpr MxDtype kQMxDt = aiter::kHwFp8MxDtype;
         // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
         const E8m0BlockScale qs_scale =
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(

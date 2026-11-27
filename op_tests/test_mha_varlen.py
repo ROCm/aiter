@@ -12,7 +12,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops import mha as mha_ops
 from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
@@ -964,6 +964,7 @@ if __name__ == "__main__":
             (128, 128),
             (160, 160),
             (192, 192),
+            (256, 256),
         ],
         help="""Dimension of query and key. Default is None.
         e.g.: -qk_v 256,256""",
@@ -1028,8 +1029,8 @@ if __name__ == "__main__":
         "--gqa_ratio",
         type=int,
         nargs="+",
-        choices=[1, 8],
-        default=[1, 8],
+        choices=[1, 2, 4, 6, 8],
+        default=[1, 4, 8],
         help="""gqa ratio.
     e.g. -gr 1""",
     )
@@ -1381,6 +1382,7 @@ def _run_opus_group_case(
     d_v,
     window_size_left=-1,
     q_pad=0,
+    sink=None,
 ):
     """Shared body: OPUS group/varlen forward with LSE, per group vs attention_ref.
 
@@ -1394,13 +1396,19 @@ def _run_opus_group_case(
     O and LSE are WRITTEN (q_batch_base / o_batch_base / lse_batch_base all derive from
     seqstart_q_pad), so a kernel that confused the real and physical Q starts would place
     every group's output rows wrong and only this covers it.
+
+    `sink` (fp32 [nheads]) adds a per-head attention sink. It joins every group's
+    softmax denominator, so the LSE reference is logaddexp(no-sink LSE, sink), and a
+    group with no keys gets O = 0 and LSE = sink.
     """
     assert len(seqlens_q) == len(seqlens_kv)
 
     torch.manual_seed(0)
     window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
-    tag = f"opus-d{d_qk}-group" + (
-        f"-win{window_size_left}" if window_size_left >= 0 else ""
+    tag = (
+        f"opus-d{d_qk}-group"
+        + (f"-win{window_size_left}" if window_size_left >= 0 else "")
+        + ("-sink" if sink is not None else "")
     )
 
     def _cumsum(lengths):
@@ -1447,6 +1455,7 @@ def _run_opus_group_case(
             max_seqlen_k=max(seqlens_kv),
             return_lse=True,
             window_size_left=window_size_left,
+            sink=sink,
         )
 
     assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
@@ -1474,15 +1483,22 @@ def _run_opus_group_case(
             assert torch.equal(
                 out[ql:qh], torch.zeros_like(out[ql:qh])
             ), f"group {g} has no keys, out must be exactly 0"
-            assert torch.isneginf(
-                lse[:, ql:qh]
-            ).all(), f"group {g} has no keys, lse must be -inf"
+            if sink is None:
+                assert torch.isneginf(
+                    lse[:, ql:qh]
+                ).all(), f"group {g} has no keys, lse must be -inf"
+            else:
+                opus_check_lse(
+                    f"{tag} g{g} (no keys -> lse = sink)",
+                    lse[:, ql:qh],
+                    sink[:, None].expand(-1, qh - ql),
+                )
             continue
         qg = q[ql:qh].unsqueeze(0)
         kg = k[kl:kh].unsqueeze(0)
         vg = v[kl:kh].unsqueeze(0)
         out_ref, _, _ = attention_ref(
-            qg, kg, vg, causal=causal, window_size=window_size
+            qg, kg, vg, causal=causal, window_size=window_size, sink=sink
         )
         out_pt, _, _ = attention_ref(
             qg,
@@ -1490,6 +1506,7 @@ def _run_opus_group_case(
             vg,
             causal=causal,
             window_size=window_size,
+            sink=sink,
             upcast=False,
             reorder_ops=True,
         )
@@ -1497,11 +1514,10 @@ def _run_opus_group_case(
         diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
         max_diff = max(max_diff, diff)
         assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
-        opus_check_lse(
-            f"{tag} g{g}",
-            lse[:, ql:qh],
-            opus_ref_lse(qg, kg, causal, window_size_left=window_size_left)[0],
-        )
+        lse_ref = opus_ref_lse(qg, kg, causal, window_size_left=window_size_left)[0]
+        if sink is not None:
+            lse_ref = torch.logaddexp(lse_ref, sink[:, None])
+        opus_check_lse(f"{tag} g{g}", lse[:, ql:qh], lse_ref)
     print(f"[{tag}] max diff across groups: {max_diff}")
 
 
@@ -1548,6 +1564,59 @@ def test_fmha_fwd_bf16_opus_d128_group(
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_group_case(
         seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d64_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=64 group/varlen forward with LSE, per group against attention_ref.
+
+    The symmetric kernel one head dim down, on the same group-mode contract matrix
+    as D=128. Env-gated like the dense D=64 path.
+    """
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus D=64 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 64, 64
+    )
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_group_sink(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, d, monkeypatch
+):
+    """OPUS symmetric group/varlen forward with a per-head attention sink.
+
+    Same contract matrix as the no-sink group tests: the sink must reach every group,
+    including the empty-KV ones, which end at O = 0 and LSE = sink. The logits are
+    swept over the heads so both "sink dominates" and "keys dominate" rows occur.
+    """
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    sink = torch.linspace(-4.0, 12.0, nheads, device="cuda", dtype=torch.float32)
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, d, d, sink=sink
     )
 
 
@@ -1773,13 +1842,15 @@ _OPUS_VARLEN_DISPATCH_CASES = [
     ("causal_window", True, 128, "bf16", True, (128, 0, 0), True),
     ("causal_only", True, 128, "bf16", True, (-1, -1, 0), True),
     ("no_mask", True, 128, "bf16", False, (-1, -1, 0), True),
+    ("hdim64_causal", True, 64, "bf16", True, (-1, -1, 0), True),
+    ("hdim64_no_mask", True, 64, "bf16", False, (-1, -1, 0), True),
     # The gate's rejections. Each is a shape the kernel has no instance for, so
     # reaching it would not be a slowdown but a wrong answer or a bad launch.
     ("env_off", False, 128, "bf16", True, (128, 0, 0), False),
     ("window_without_causal", True, 128, "bf16", False, (128, -1, 0), False),
     ("right_window", True, 128, "bf16", True, (128, 64, 0), False),
     ("right_zero_without_causal", True, 128, "bf16", False, (-1, 0, 0), False),
-    ("hdim64", True, 64, "bf16", True, (128, 0, 0), False),
+    ("hdim64_window", True, 64, "bf16", True, (128, 0, 0), False),
     ("fp16", True, 128, "fp16", True, (128, 0, 0), False),
 ]
 
@@ -1842,6 +1913,104 @@ def test_flash_attn_varlen_func_opus_dispatch(
     # rejects a shape is only correct if something else handles it.
     assert out.shape == (total, nheads, hdim)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("windowed", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_varlen_func_opus_sink_dispatch(d, windowed, monkeypatch):
+    """A sink reaches the OPUS symmetric kernel through the public entry point,
+    except together with a window: the sliding-window kernel does not read it, so
+    that call must land on a backend that applies both."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus varlen kernels require gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+
+    seqlens = [256, 192, 320]
+    nheads, nheads_k = 8, 2
+    max_seqlen = max(seqlens)
+    window_size = (128, 0, 0) if windowed else (-1, -1, 0)
+
+    torch.manual_seed(0)
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens)), device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(total, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn_like(k)
+    sink = torch.linspace(-4.0, 12.0, nheads, device="cuda", dtype=torch.float32)
+
+    calls = _opus_varlen_dispatch_record(monkeypatch)
+    with torch.no_grad():
+        out = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            causal=True,
+            window_size=window_size,
+            sink_ptr=sink,
+        )
+
+    expect = 0 if windowed else 1
+    assert (
+        calls["n"] == expect
+    ), f"opus varlen entry called {calls['n']} times, expected {expect}"
+    assert out.shape == (total, nheads, d)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_varlen_func_opus_oversized_kv(d, causal, monkeypatch):
+    """One sequence whose K/V buffer is longer than cu_seqlens_k says, as in vLLM's
+    fixed-size chunked-context workspace. Group mode reads each sequence's length
+    from cu_seqlens, so the stale tail -- NaN here -- must never be attended."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus varlen kernels require gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+
+    seqlen_q, seqlen_kv, buf_kv = 128, 300, 512
+    nheads, nheads_k = 8, 2
+    torch.manual_seed(0)
+    q = torch.randn(seqlen_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(buf_kv, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn_like(k)
+    k[seqlen_kv:] = float("nan")
+    v[seqlen_kv:] = float("nan")
+    sink = torch.linspace(-4.0, 12.0, nheads, device="cuda", dtype=torch.float32)
+    cu_q = torch.tensor([0, seqlen_q], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, seqlen_kv], device="cuda", dtype=torch.int32)
+
+    calls = _opus_varlen_dispatch_record(monkeypatch)
+    with torch.no_grad():
+        out = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            seqlen_q,
+            seqlen_kv,
+            causal=causal,
+            sink_ptr=sink,
+        )
+    assert calls["n"] == 1, "did not route to the OPUS varlen kernel"
+    assert not torch.isnan(out).any(), "attended the stale K/V tail"
+
+    qg = q.unsqueeze(0)
+    kg = k[:seqlen_kv].unsqueeze(0)
+    vg = v[:seqlen_kv].unsqueeze(0)
+    out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal, sink=sink)
+    out_pt, _, _ = attention_ref(
+        qg, kg, vg, causal=causal, sink=sink, upcast=False, reorder_ops=True
+    )
+    tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    diff = (out.unsqueeze(0) - out_ref).abs().max().item()
+    assert diff <= tol, f"diff {diff} > tol {tol}"
 
 
 # ---------------------------------------------------------------------------
