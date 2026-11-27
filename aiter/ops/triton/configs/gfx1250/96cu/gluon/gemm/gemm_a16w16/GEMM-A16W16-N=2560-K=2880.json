@@ -24,7 +24,7 @@
         "BLOCK_K": 256,
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
+        "kernel_type": "compute_bound",
         "waves_per_eu": 1,
         "REGISTER_STORE": 0
     },
