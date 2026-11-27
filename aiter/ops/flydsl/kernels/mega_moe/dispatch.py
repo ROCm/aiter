@@ -428,7 +428,7 @@ def _publish_tile_range(
 # fmt: off
 @flyc.jit
 def emit_direct_fixed_slot_payload(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
+    *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
 ):
@@ -526,7 +526,7 @@ def emit_direct_fixed_slot_payload(
             if lane == fx.Int32(0):
                 weight = weight_buffer[wk]
                 weight_bits = fx.Float32(weight).bitcast(fx.Int32)
-                source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (topk_slot << fx.Int32(24))
+                source_encoding = (rank * fx.Int32(fz_mtpr) + source_token) | (topk_slot << fx.Int32(24))
                 remote_weights = weight_table[destination]
                 remote_srcmap = srcmap_table[destination]
                 ptr_buf_tensor(remote_weights, fx.Int32)[payload_row] = weight_bits
@@ -543,7 +543,7 @@ def emit_direct_fixed_slot_payload(
         )
         if done == fx.Int32(producers_per_group - 1):
             comm_ops.fence_agent_acquire()
-            done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+            done_index = parity * fx.Int32(fz_npes) + rank
             for destination in range_constexpr(fz_npes):
                 if producer_group == fx.Int32(destination % destination_groups):
                     remote_done = source_done_table[fx.Int32(destination)]
@@ -552,7 +552,7 @@ def emit_direct_fixed_slot_payload(
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, rank, fz_tile_m, n_tiles, addr_disp, parity, expected
 ):
     """Finalize local fixed slots as soon as every source publishes this destination."""
     assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
@@ -609,7 +609,7 @@ def emit_direct_fixed_slot_finalize(
 
         if valid_expert:
             if no_overflow:
-                global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
+                global_expert = rank * fx.Int32(fz_epr) + safe_expert
                 payload_base = safe_expert * fx.Int32(fz_cap)
                 for tile in range(fx.Int32(0), num_expert_tiles, 1):
                     metadata_index = metadata_base + tile
@@ -643,7 +643,7 @@ def emit_direct_fixed_slot_finalize(
         comm_ops.fence_system_release()
         for source in range(lane, fz_npes, 64):
             remote_ready = plan_ready_table[source]
-            ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+            ready_index = parity * fx.Int32(fz_npes) + rank
             comm_ops.store_i32_system(remote_ready, ready_index, expected)
     fx.barrier()
 
@@ -710,12 +710,10 @@ def _derive_allgather_offsets(
         group_count_lane = fx.Int32(0)
         group_source_prefix_lane = fx.Int32(0)
         for source in range_constexpr(npes):
-            source_group_count = destination_group_counts[source]
-            if const_expr(source < rank):
-                group_source_prefix_lane = (
-                    group_source_prefix_lane + source_group_count
-                )
-            group_count_lane = group_count_lane + source_group_count
+            group_count_lane = group_count_lane + destination_group_counts[source]
+            group_source_prefix_lane = (rank > fx.Int32(source)).select(
+                group_count_lane, group_source_prefix_lane
+            )
         destination_group_count = fx.Int32(
             fx.rocdl.readfirstlane(T.i32, group_count_lane)
         )
@@ -759,9 +757,10 @@ def _derive_allgather_offsets(
             for source in range_constexpr(npes):
                 source_count = normal_source_counts[source]
                 source_count = valid_expert.select(source_count, fx.Int32(0))
-                if const_expr(source < rank):
-                    normal_source_prefix = normal_source_prefix + source_count
                 normal_count = normal_count + source_count
+                normal_source_prefix = (rank > fx.Int32(source)).select(
+                    normal_count, normal_source_prefix
+                )
             group_rows = (
                 (group_count + destination_tile_m - fx.Int32(1))
                 // destination_tile_m
@@ -954,7 +953,7 @@ def _derive_next_fanout_pairs(
 # fmt: off
 @flyc.jit
 def emit_dispatch_plan(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
+    *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, rank, fz_tile_m, fz_total_experts, addr_disp,
     i32_cur_tok, addr_in_idx, parity, expected,
     dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
     parallel_fanout=False,
@@ -1064,7 +1063,7 @@ def emit_dispatch_plan(
         remote_count_matrix = ptr_buf_tensor(remote_bigcnt, fx.Int32)
         for segment in range(gtid, total_segments, gnt):
             count = local_hist[segment]
-            remote_count_matrix[fx.Int32(fz_rank * total_segments) + segment] = (
+            remote_count_matrix[rank * fx.Int32(total_segments) + segment] = (
                 count
             )
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -1124,18 +1123,20 @@ def emit_dispatch_plan(
             canonical_expert,
         ) = _load_fanout_pair(
             addr_pair_config,
-            fx.Int32(fz_rank),
+            rank,
             parity,
             npes=fz_npes,
         )
         pair_a_group_base = fx.Int32(0)
         pair_b_group_base = fx.Int32(0)
+        expert_base = rank * fx.Int32(fz_epr)
+        group_column = fx.Int32(fz_total_experts) + rank
         for expert_chunk in range_constexpr((fz_epr + 63) // 64):
             local_expert = fx.Int32(expert_chunk * 64) + lane
             valid_expert = local_expert < fx.Int32(fz_epr)
             safe_expert = valid_expert.select(local_expert, fx.Int32(0))
-            ge = fx.Int32(fz_rank * fz_epr + local_expert)
-            safe_ge = fx.Int32(fz_rank * fz_epr) + safe_expert
+            ge = expert_base + local_expert
+            safe_ge = expert_base + safe_expert
             normal_source_counts = []
             normal_count = fx.Int32(0)
             group_source_counts = []
@@ -1164,7 +1165,7 @@ def emit_dispatch_plan(
                 normal_count = normal_count + source_count
                 source_group_count = buf_copy_load(
                     count_matrix,
-                    fx.Int32(source * count_stride + fz_total_experts + fz_rank),
+                    fx.Int32(source * count_stride) + group_column,
                     fx.Int32,
                     cache_modifier=2,
                 )
@@ -1223,7 +1224,7 @@ def emit_dispatch_plan(
                         a_tile_ready,
                         a_tile_expected,
                         count_matrix,
-                        fx.Int32(fz_total_experts + fz_rank),
+                        group_column,
                         group_row_base,
                         group_num_tiles,
                         fz_npes=fz_npes,
@@ -1286,7 +1287,7 @@ def emit_dispatch_plan(
                 for source in range_constexpr(fz_npes):
                     group_count_lane = group_count_lane + buf_copy_load(
                         count_matrix,
-                        fx.Int32(source * count_stride + fz_total_experts + fz_rank),
+                        fx.Int32(source * count_stride) + group_column,
                         fx.Int32,
                         cache_modifier=2,
                     )
@@ -1298,8 +1299,8 @@ def emit_dispatch_plan(
             ) // fx.Int32(fz_tile_m)
             group_padded_rows = group_num_tiles * fx.Int32(fz_tile_m)
             if (lane == fx.Int32(0)) & pair_enabled:
-                pair_a_ge = fx.Int32(fz_rank * fz_epr) + pair_a
-                pair_b_ge = fx.Int32(fz_rank * fz_epr) + pair_b
+                pair_a_ge = expert_base + pair_a
+                pair_b_ge = expert_base + pair_b
                 _store_expert_metadata(
                     a_se,
                     a_trb,
@@ -1336,7 +1337,7 @@ def emit_dispatch_plan(
         comm_ops.fence_system_release()
         for source in range(lane, fz_npes, 64):
             remote_ready = plan_ready_table[source]
-            ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+            ready_index = parity * fx.Int32(fz_npes) + rank
             comm_ops.store_i32_system(remote_ready, ready_index, expected)
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     elif warp == fx.Int32(1):
@@ -1386,7 +1387,7 @@ def emit_dispatch_plan(
     _derive_allgather_offsets(
         addr_disp,
         parity,
-        rank=fz_rank,
+        rank=rank,
         npes=fz_npes,
         epr=fz_epr,
         total_experts=fz_total_experts,
@@ -1563,7 +1564,7 @@ def emit_dispatch_group(
 # fmt: off
 @flyc.jit
 def emit_dispatch_payload(
-    *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
+    *, num_waves, fz_epr, fz_k, fz_mtpr, rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     dispatch_blocks,
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination,
@@ -1733,7 +1734,7 @@ def emit_dispatch_payload(
             )
             topk_slot = group_task.select(fx.Int32(0), topk_slot)
             destination_row = destination_base + row
-            source_key = fx.Int32(fz_rank * fz_mtpr) + source_token
+            source_key = rank * fx.Int32(fz_mtpr) + source_token
 
             def _copy_route_header(route_index, route_row):
                 weight = weight_buffer[route_index]

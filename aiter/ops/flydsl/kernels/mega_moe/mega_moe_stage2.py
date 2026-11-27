@@ -668,7 +668,7 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 # fmt: off
 @aot_factory("mega_moe_stage2")
 @functools.cache
-def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
+def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, npes: int,
     max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,
     BK: int = 256, use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8",
     SBM: int | None = None,
@@ -728,7 +728,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     _comb_inp_nbytes = max_tok * topk * _row_nbytes if comb_inp_nbytes is None else int(comb_inp_nbytes)
     if not 0 < _comb_inp_nbytes < _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError("MegaMoE v2 stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")
-    _expert_offset = rank * experts
     if runtime_pair_skip and fixed_slot_dispatch:
         raise ValueError("runtime pair skipping requires compact dispatch")
     _total_experts = npes * experts
@@ -758,7 +757,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_expert_tile_end: fx.Int64,
         arg_count_matrix: fx.Int64, arg_pair_config: fx.Int64, arg_parity: fx.Int64,
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
-        i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32):
+        i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32, i32_rank: fx.Int32):
     # fmt: on
         tx_i32 = fx.thread_idx.x
         bx_i32 = fx.block_idx.x
@@ -784,12 +783,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             parity_buf = ptr_buf_tensor(arg_parity, fx.Int32)
             active_parity = parity_buf[fx.Int32(0)]
             packed_pair = pair_config[
-                active_parity * fx.Int32(npes) + fx.Int32(rank)
+                active_parity * fx.Int32(npes) + i32_rank
             ]
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             pair_enabled = (packed_pair & fx.Int32(1 << 16)) != fx.Int32(0)
             skip_a = packed_pair & fx.Int32(0xFF)
             skip_b = packed_pair.shrui(fx.Int32(8)) & fx.Int32(0xFF)
+            skip_expert_a = i32_rank * fx.Int32(experts) + skip_a
+            skip_expert_b = i32_rank * fx.Int32(experts) + skip_b
             expert_tile_end = ptr_buf_tensor(arg_expert_tile_end, fx.Int32)
             count_matrix = ptr_buf_tensor(arg_count_matrix, fx.Int32)
             skip_base_a_lane = fx.Int32(0)
@@ -811,7 +812,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     prev_b, fx.Int32(0)
                 )
                 group_count = fx.Int32(0)
-                group_column = fx.Int32(_total_experts + rank)
+                group_column = fx.Int32(_total_experts) + i32_rank
                 for source in range_constexpr(npes):
                     group_count = group_count + count_matrix[
                         fx.Int32(source * _total_segments) + group_column
@@ -869,13 +870,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 expert = eids_buf[m_row // fx.Int32(SBM)]
                 in_a = (
                     pair_enabled
-                    & (expert == fx.Int32(_expert_offset) + skip_a)
+                    & (expert == skip_expert_a)
                     & (m_row >= skip_base_a)
                     & (m_row < skip_base_a + skip_rows)
                 )
                 in_b = (
                     pair_enabled
-                    & (expert == fx.Int32(_expert_offset) + skip_b)
+                    & (expert == skip_expert_b)
                     & (m_row >= skip_base_b)
                     & (m_row < skip_base_b + skip_rows)
                 )
@@ -969,7 +970,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_count_matrix: fx.Int64, arg_pair_config: fx.Int64, arg_parity: fx.Int64,
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_grid_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
-        i32_npad: fx.Int32, stream: fx.Stream):
+        i32_npad: fx.Int32, i32_rank: fx.Int32, stream: fx.Stream):
     # fmt: on
         num_n_blocks = i32_hidden // fx.Int32(BN)
         grid_x = i32_grid_blocks * num_n_blocks
@@ -978,7 +979,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             arg_stids, arg_sweights, arg_trb, arg_expert_tile_end, arg_count_matrix,
             arg_pair_config, arg_parity,
             arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
-            i32_hidden, i32_kpad, i32_npad,
+            i32_hidden, i32_kpad, i32_npad, i32_rank,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch
@@ -1004,7 +1005,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
     """Compile or reuse one fused Stage2 configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
     launch = _get_g2_launch(
-        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk, rank=rank, npes=npes,
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk, npes=npes,
         max_tok=max_tok, recv_cap=recv_cap, comb_inp_nbytes=comb_inp_nbytes, BM=BM, BN=BN, BK=BK,
         use_nt=use_nt, HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX, SBM=SBM, persist=persist,
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
@@ -1021,7 +1022,8 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_expert_tile_end,
         arg_count_matrix, arg_pair_config, arg_parity, arg_p2p, fx.Int32(max_m_blocks),
-        fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
+        fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0),
+        fx.Int32(rank), stream,
     )
 
 
@@ -1039,7 +1041,7 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     """Compile and load one fused Stage2 variant without dispatching it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
     launch = _get_g2_launch(
-        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk, rank=rank, npes=npes,
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk, npes=npes,
         max_tok=max_tok, recv_cap=recv_cap, comb_inp_nbytes=comb_inp_nbytes, BM=BM, BN=BN, BK=BK,
         use_nt=use_nt, HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX, SBM=SBM, persist=persist,
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
@@ -1057,5 +1059,6 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
         arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_expert_tile_end,
         arg_count_matrix, arg_pair_config, arg_parity, arg_p2p, fx.Int32(max_m_blocks),
-        fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
+        fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0),
+        fx.Int32(rank), stream,
     )
