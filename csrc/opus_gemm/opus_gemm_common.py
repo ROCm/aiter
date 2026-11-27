@@ -554,16 +554,22 @@ A16W16_PAIRED_K_TILE_TAGS = frozenset(
 )
 
 
+# A gfx950 kid carries an empty ``arch_prefix`` (the legacy registry) or
+# ``"gfx950"`` (kernels that spell the architecture, such as the 4-wave kids).
+# gfx942 and gfx1250 kids carry their own prefix.
+_GFX950_ARCH_PREFIXES = frozenset({"", "gfx950"})
+
+
 def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
     """Whether a gfx950 kid is only correct when K is a multiple of its B_K.
 
-    True for every gfx950 kid (empty ``arch_prefix``) whose pipeline does not
-    mask the K tail, so a new kernel family is alignment-required until its tag
-    is added to ``A16W16_K_TAIL_MASKED_TAGS``. gfx942 and gfx1250 kids carry
-    their own prefix and are not covered by this rule.
+    True for every gfx950 kid (either ``arch_prefix`` spelling) whose pipeline
+    does not mask the K tail, so a new kernel family is alignment-required until
+    its tag is added to ``A16W16_K_TAIL_MASKED_TAGS``. gfx942 and gfx1250 kids are
+    not covered by this rule.
     """
     return (
-        instance.arch_prefix == ""
+        instance.arch_prefix in _GFX950_ARCH_PREFIXES
         and instance.kernel_tag not in A16W16_K_TAIL_MASKED_TAGS
     )
 
@@ -571,7 +577,8 @@ def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
 def a16w16_requires_even_k_tiles(instance: OpusGemmInstance) -> bool:
     """Whether a gfx950 kid needs an even ceil(K / B_K) of at least 2."""
     return (
-        instance.arch_prefix == "" and instance.kernel_tag in A16W16_PAIRED_K_TILE_TAGS
+        instance.arch_prefix in _GFX950_ARCH_PREFIXES
+        and instance.kernel_tag in A16W16_PAIRED_K_TILE_TAGS
     )
 
 
