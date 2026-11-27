@@ -1,0 +1,10 @@
+{
+    "any": {
+        "BLOCKS": 256,
+        "num_warps": 8,
+        "ONESHOT_MAX_ROWS": 64,
+        "ONESHOT_MAX_BYTES": 110592,
+        "ROUTER_STEPS_FP32": 3,
+        "ROUTER_STEPS_BF16": 6
+    }
+}
