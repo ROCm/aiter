@@ -164,6 +164,99 @@ static float fmha_batch_prefill_v3(const mha_batch_prefill_args& a,
     });
 }
 
+// gfx950 hd128 BF16 page_size=128 LINEAR paged causal asm. Packed Q/O;
+// K/V [N, 128, H, D]. Returns -1 if ineligible.
+static float fmha_batch_prefill_v3_hd128_bf16(const mha_batch_prefill_args& a,
+                                              const ck_tile::stream_config& s,
+                                              const std::string& q_dtype_str,
+                                              mask_enum mask_type,
+                                              bias_enum bias_type,
+                                              bool has_lse,
+                                              quant_scale_enum qscale_type,
+                                              bool use_ext_asm)
+{
+    if(!use_ext_asm)
+        return -1;
+
+    const bool causal = mask_type == mask_enum::mask_bottom_right && a.window_size_left < 0 &&
+                        a.window_size_right == 0;
+
+    if(get_gpu_arch() != "gfx950" || q_dtype_str != "bf16" || a.hdim_q != 128 ||
+       a.hdim_v != 128 || a.page_block_size != 128 ||
+       a.kv_memory_layout != ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT ||
+       a.kv_lookup_table != ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D ||
+       !causal || has_lse || qscale_type != quant_scale_enum::no_scale || a.p_drop > 0.f ||
+       bias_type != bias_enum::no_bias || a.logits_soft_cap > 0.f || a.sink_size > 0 ||
+       a.sink_ptr != nullptr || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0 ||
+       a.kv_indptr == nullptr || a.kv_page_indices == nullptr ||
+       a.kv_last_page_lens == nullptr || a.seqstart_q_ptr == nullptr)
+        return -1;
+
+    const char* knl_name = "bf16_fmha_prefill_gfx950_hd128_ps128";
+    const char* co_name  = "fmha_v3_fwd/fwd_hd128_bf16_causal_paged_ps128.co";
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr =
+        &impl_ptr_map.get_or_create(knl_name, [&]() { return AiterAsmKernel(knl_name, co_name); });
+
+    constexpr int ts_qo = 256;
+    constexpr int bpe   = 2;
+
+    fmha_fwd_v3_args args{};
+
+    int tune_opt = 5;
+    if((a.nhead_q % 8 != 0) || (a.max_seqlen_q > 16384))
+        tune_opt -= 2;
+
+    args.ptr_o            = a.o_ptr;
+    args.ptr_q            = a.q_ptr;
+    args.ptr_k            = a.k_ptr;
+    args.ptr_v            = a.v_ptr;
+    args.ptr_lse          = nullptr;
+    args.scalar           = a.scale_s;
+    args.s_seq_len        = static_cast<unsigned int>(a.max_seqlen_q);
+    args.s_Seqs           = static_cast<unsigned int>(a.stride_q * bpe);
+    args.s_Ts             = static_cast<unsigned int>(ts_qo * a.stride_q * bpe);
+    args.s_Hs             = static_cast<unsigned int>(a.nhead_stride_q * bpe);
+    args.s_Bs             = 0;
+    args.s_gqa            = static_cast<unsigned int>(a.nhead_q / a.nhead_k);
+    args.s_k_Seqs         = static_cast<unsigned int>(a.stride_k * bpe);
+    args.s_k_Hs           = static_cast<unsigned int>(a.nhead_stride_k * bpe);
+    args.s_k_Bs           = static_cast<unsigned int>(a.batch_stride_k * bpe);
+    args.s_opt            = static_cast<unsigned int>(tune_opt);
+    args.s_lse            = 0;
+    args.s_kv_seq_len     = static_cast<unsigned int>(a.seqlen_k);
+    args.s_qk_head_dim    = static_cast<unsigned int>(a.hdim_q);
+    args.s_v_head_dim     = static_cast<unsigned int>(a.hdim_v);
+    args.s_q_head_num     = static_cast<unsigned int>(a.nhead_q);
+    args.s_v_Seqs         = static_cast<unsigned int>(a.stride_v * bpe);
+    args.s_v_Hs           = static_cast<unsigned int>(a.nhead_stride_v * bpe);
+    args.s_v_Bs           = static_cast<unsigned int>(a.batch_stride_v * bpe);
+    args.s_o_Seqs         = static_cast<unsigned int>(a.stride_o * bpe);
+    args.s_o_Hs           = static_cast<unsigned int>(a.nhead_stride_o * bpe);
+    args.s_o_Bs           = 0;
+    args.ptr_qseq         = a.seqstart_q_ptr;
+    args.ptr_kseq         = a.kv_indptr;
+    args.s_lse_Hs         = 0;
+    args.ptr_qseq_padding = a.seqstart_q_ptr;
+    args.ptr_kseq_padding = a.kv_last_page_lens;
+    args.ptr_q_descale    = a.kv_page_indices;
+    args.ptr_k_descale    = nullptr;
+    args.ptr_v_descale    = nullptr;
+
+    const int gdx = a.nhead_q;
+    const int gdy = a.batch;
+    const int gdz = ((a.max_seqlen_q + ts_qo - 1) / ts_qo + 1) / 2;
+    const int bdx = 512;
+    size_t arg_size = sizeof(args);
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr       = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
+    });
+}
+
 float mha_batch_prefill(mha_batch_prefill_args args,
                         const ck_tile::stream_config& stream_config,
                         std::string q_dtype_str,
@@ -179,14 +272,25 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     bool has_dropout = args.p_drop > 0.f;
     bool has_sink    = args.sink_size > 0 || args.sink_ptr != nullptr;
 
-    float t = fmha_batch_prefill_v3(args,
-                                    stream_config,
-                                    q_dtype_str,
-                                    mask_type,
-                                    bias_type,
-                                    has_lse,
-                                    qscale_type,
-                                    use_ext_asm);
+    float t = fmha_batch_prefill_v3_hd128_bf16(args,
+                                               stream_config,
+                                               q_dtype_str,
+                                               mask_type,
+                                               bias_type,
+                                               has_lse,
+                                               qscale_type,
+                                               use_ext_asm);
+    if(t >= 0)
+        return t;
+
+    t = fmha_batch_prefill_v3(args,
+                              stream_config,
+                              q_dtype_str,
+                              mask_type,
+                              bias_type,
+                              has_lse,
+                              qscale_type,
+                              use_ext_asm);
     if(t >= 0)
         return t;
 
