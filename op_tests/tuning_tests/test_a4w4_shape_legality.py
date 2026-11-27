@@ -36,8 +36,10 @@ sys.path.insert(0, str(REPO / "csrc" / "ck_gemm_a4w4_blockscale"))
 
 from aiter.ops import gemm_op_a4w4 as op
 
-# Measured on gfx950 (N = 32..1024): wrong results unless N % tile_N == 0.
-FULL_N_TILE = {(256, 256, 1, 0), (128, 512, 1, 0), (192, 256, 0, 0), (224, 256, 0, 0)}
+# Measured on gfx950 (all 35 bpreshuffle kernels at N = 32..1536, K = 1024 and 5120): only these
+# two give wrong results (relative L2 error 0.3-0.9) unless N % tile_N == 0. The split-K 256x256 and
+# 128x512 kernels and the persistent 256x256 kernel stay at the bf16 split-K noise floor (4e-3).
+FULL_N_TILE = {(192, 256, 0, 0), (224, 256, 0, 0)}
 
 
 class TestPredicates(unittest.TestCase):
@@ -113,7 +115,11 @@ class TestKernelTable(unittest.TestCase):
     def test_loader(self):
         table = op.f4gemm_asm_kernels(str(ASM_CSV))
         self.assertEqual(
-            table["_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"], (512, True)
+            table["_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256E"], (256, True)
+        )
+        self.assertEqual(
+            table["_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"],
+            (512, False),
         )
         self.assertEqual(
             table["_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E"], (128, False)
@@ -130,7 +136,7 @@ class TestKernelTable(unittest.TestCase):
             )
 
     def test_committed_rows_are_legal(self):
-        """Committed CK and ASM rows stay selectable, except the one listed below."""
+        """Every committed CK and ASM row stays selectable."""
         illegal = []
         for path in TUNED_CSVS:
             df = pd.read_csv(path)
@@ -142,11 +148,7 @@ class TestKernelTable(unittest.TestCase):
                     r.kernelName, r.N, r.K, split, str(ASM_CSV)
                 ):
                     illegal.append((path.name, r.M, r.N, r.K, r.kernelName[-8:]))
-        # 128x512 (full_n_tile) tuned at N=800: run time now takes the default kernel
-        self.assertEqual(
-            illegal,
-            [("a4w4_blockscale_tuned_gemm.csv", 16384, 800, 5120, "128x512E")],
-        )
+        self.assertEqual(illegal, [])
 
 
 class TestTunerCandidates(unittest.TestCase):
@@ -214,14 +216,12 @@ class TestTunerCandidates(unittest.TestCase):
         self.assertEqual(ck, set())  # every CK instance has NPerBlock >= 128
         names = {n for n, _ in asm}
         self.assertIn("_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E", names)
-        for tile in ("256x256", "128x512", "192x256", "224x256"):
-            self.assertFalse(
-                [n for n in names if n.endswith(f"_{tile}E") and "_ps" not in n], tile
-            )
-        # the persistent 256x256 kernel handles a partial last tile
-        self.assertIn(
-            "_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE", names
-        )
+        for tile in ("192x256", "224x256"):
+            self.assertFalse([n for n in names if n.endswith(f"_{tile}E")], tile)
+        # the split-K 256x256 and 128x512 kernels and the persistent 256x256 kernel
+        # handle a partial last tile (measured), so they stay candidates
+        for tile in ("256x256", "128x512", "256x256_ps"):
+            self.assertTrue([n for n in names if n.endswith(f"_{tile}E")], tile)
 
     def test_wide_n_keeps_every_candidate(self):
         from gemm_a4w4_blockscale_common import kernels_list

@@ -1,10 +1,10 @@
 # ps: 1 = persistent kernel (grid = min(tiles x K slices, CUs)); reads num_cu (u32) at kernarg offset 372
-# full_n_tile: 1 = only correct when N % tile_N == 0 (measured on gfx950 for N = 32..1024: wrong results at other N); the launcher heuristic and the a4w4 tuner skip it otherwise
+# full_n_tile: 1 = wrong results unless N % tile_N == 0 (gfx950: relative L2 error vs a torch reference 0.3-0.9 at N = 32..1536 with N % tile_N != 0; every other kernel here stays at the bf16 noise floor, 4e-3 with split-K); the launcher heuristic and the a4w4 tuner skip it otherwise
 tile_M,tile_N,splitK,bpreshuffle,ps,full_n_tile,knl_name,co_name
 256,256,0,0,0,0,_ZN5aiter44f4gemm_bf16_per1x32Fp4_noBpreShuffle_256x256E,f4gemm_bf16_per1x32Fp4_noBpreShuffle_256x256.co
-256,256,1,1,0,1,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E,f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256.co
+256,256,1,1,0,0,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E,f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256.co
 256,256,1,1,1,0,_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE,f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_ps.co
-128,512,1,1,0,1,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E,f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512.co
+128,512,1,1,0,0,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E,f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512.co
 192,256,0,1,0,1,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256E,f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256.co
 224,256,0,1,0,1,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_224x256E,f4gemm_bf16_per1x32Fp4_BpreShuffle_224x256.co
 128,128,0,1,0,0,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x128E,f4gemm_bf16_per1x32Fp4_BpreShuffle_128x128.co

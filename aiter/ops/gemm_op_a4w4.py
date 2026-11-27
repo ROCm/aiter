@@ -65,10 +65,15 @@ def a4w4_ck_shape_legal(
     """Whether a CK a4w4 instance with this N tile can run (N, K).
 
     The instances use GemmSpecialization::Default and a preshuffled B (MFMA layout):
-    CK checks neither N % NPerBlock nor N padding for that layout, so a tile wider than
-    N reads rows past the end of B (GPU memory fault at N=96 and N=192). B is
-    preshuffled in 16-row groups (N % 16), and CK requires K % (KBatch * 256), where
-    256 is the instance K tile in elements and KBatch = 2 ** log2_k_split.
+    CK checks neither N % NPerBlock nor N padding for that layout, so the last N tile
+    reads rows past the end of B whenever N % NPerBlock != 0. Whether that read faults
+    depends on what follows B in memory, so this predicate only rejects the tile wider
+    than N (N < NPerBlock, the N=96 tuner fault). Known gap: a partial last tile at
+    N >= NPerBlock still over-reads (an isolated probe faulted every instance at
+    N=192, K=5120, and ran N=224, 288, 800 and 7168 correctly), and the committed rows
+    with N % NPerBlock != 0 (N >= 5120) rely on that slack. B is preshuffled in
+    16-row groups (N % 16), and CK requires K % (KBatch * 256), where 256 is the
+    instance K tile in elements and KBatch = 2 ** log2_k_split.
     """
     return N % 16 == 0 and N >= n_per_block and K % (256 << log2_k_split) == 0
 
@@ -81,8 +86,8 @@ def a4w4_asm_shape_legal(
     N % 16 and K % 64 are what the launcher requires (ps_supported), and K must split
     into 2 ** log2_k_split slices. A kernel flagged full_n_tile in
     hsa/<arch>/f4gemm/f4gemm_bf16_per1x32Fp4.csv gives wrong results for a partial last
-    N tile, so it needs N % tile_n == 0. The other kernels handle N < tile_n (measured
-    on gfx950 for N = 32..1024).
+    N tile, so it needs N % tile_n == 0 (gfx950: 192x256 and 224x256). The other
+    kernels handle N < tile_n (measured on gfx950 for N = 32..1536).
     """
     return (
         N % 16 == 0

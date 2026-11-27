@@ -109,10 +109,17 @@ is ignored with a one-time warning and the default ASM selection runs.
 
 - CK: `N % 16 == 0`, `K % (256 << splitK) == 0`, and `N >= NPerBLOCK`. The instances use
   `GemmSpecialization::Default` with a preshuffled B, and CK checks no N padding for that
-  layout, so a tile wider than N reads past B and faults (for example N=96).
+  layout, so a tile wider than N reads past B and faults (for example N=96). Known gap:
+  a partial last tile at `N >= NPerBLOCK` also reads past B; whether that faults depends on
+  the memory after B (an isolated probe faulted every instance at N=192, K=5120, and ran
+  N=224, 288, 800 and 7168 correctly), so committed rows with `N % NPerBLOCK != 0`
+  (N >= 5120) rely on that slack. Requiring `N % NPerBLOCK == 0` would close it at the cost of
+  those rows and of the tile-384 candidates.
 - ASM: `N % 16 == 0` and `K % 64 == 0`. A kernel with `full_n_tile` set to 1 in
-  `hsa/gfx950/f4gemm/f4gemm_bf16_per1x32Fp4.csv` also needs `N % tile_N == 0`; the C++
-  default selection reads the same flag.
+  `hsa/gfx950/f4gemm/f4gemm_bf16_per1x32Fp4.csv` (192x256 and 224x256, which give wrong
+  results at a partial last N tile) also needs `N % tile_N == 0`; the C++ default selection
+  reads the same flag. The default selection also keeps its earlier 128x512 rule
+  (`N % 512 == 0`), which the flag does not require.
 
 A tuned CK row whose instance is not compiled into the prebuilt `module_gemm_a4w4_blockscale`
 (it only holds the instances of the tuned file used at build time) falls back the same way
