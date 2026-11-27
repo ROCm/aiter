@@ -198,6 +198,15 @@ def minimax_qk_norm_rope(
 
     Unlike the generic qk-norm RoPE kernels, MiniMax normalizes Q across
     num_heads_q * head_dim and K across num_heads_k * head_dim.
+
+    ``qkv`` is a contiguous [num_tokens, q_size + 2 * kv_size] row per token
+    (q_size = num_heads_q * head_dim, kv_size = num_heads_k * head_dim). One
+    workgroup handles one token; a row can have up to 4096 packs of 16 bytes
+    (32768 bf16 / fp16 or 16384 fp32 values), so the Wan 2.x layout of
+    3 x 3072 or 3 x 5120 bf16 values per token fits. ``cos_sin_cache`` is
+    [max_position, rotary_dim] (the cos half, then the sin half) in the qkv
+    dtype or in fp32; the rotation is computed in fp32 either way. A wider
+    row or an unsupported argument raises ``RuntimeError`` before any launch.
     """
     num_tokens = qkv.size(0)
     q_size = num_heads_q * head_dim
