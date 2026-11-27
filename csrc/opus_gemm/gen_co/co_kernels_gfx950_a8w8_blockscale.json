@@ -46,6 +46,8 @@
       "pad_m": false,
       "kid": 0,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -94,6 +96,8 @@
       "pad_m": true,
       "kid": 1,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -142,6 +146,8 @@
       "pad_m": false,
       "kid": 2,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -190,6 +196,8 @@
       "pad_m": true,
       "kid": 3,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -239,6 +247,8 @@
       "pad_m": false,
       "kid": 4,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -288,6 +298,8 @@
       "pad_m": false,
       "kid": 5,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -337,6 +349,8 @@
       "pad_m": false,
       "kid": 6,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -386,6 +400,8 @@
       "pad_m": false,
       "kid": 7,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -435,6 +451,8 @@
       "pad_m": false,
       "kid": 8,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -484,6 +502,8 @@
       "pad_m": false,
       "kid": 9,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -532,6 +552,8 @@
       "pad_m": false,
       "kid": 10,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -580,6 +602,8 @@
       "pad_m": true,
       "kid": 11,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -628,6 +652,8 @@
       "pad_m": false,
       "kid": 12,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -676,6 +702,8 @@
       "pad_m": true,
       "kid": 13,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -725,6 +753,8 @@
       "pad_m": false,
       "kid": 14,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -774,6 +804,8 @@
       "pad_m": false,
       "kid": 15,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -823,6 +855,8 @@
       "pad_m": false,
       "kid": 16,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -872,6 +906,8 @@
       "pad_m": false,
       "kid": 17,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -921,6 +957,8 @@
       "pad_m": false,
       "kid": 18,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -970,6 +1008,8 @@
       "pad_m": false,
       "kid": 19,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1018,6 +1058,8 @@
       "pad_m": false,
       "kid": 20,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1066,6 +1108,8 @@
       "pad_m": true,
       "kid": 21,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1114,6 +1158,8 @@
       "pad_m": false,
       "kid": 22,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1162,6 +1208,8 @@
       "pad_m": true,
       "kid": 23,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1211,6 +1259,8 @@
       "pad_m": false,
       "kid": 24,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1260,6 +1310,8 @@
       "pad_m": false,
       "kid": 25,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1309,6 +1361,8 @@
       "pad_m": false,
       "kid": 26,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1358,6 +1412,8 @@
       "pad_m": false,
       "kid": 27,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1407,6 +1463,8 @@
       "pad_m": false,
       "kid": 28,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1456,6 +1514,8 @@
       "pad_m": false,
       "kid": 29,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1504,6 +1564,8 @@
       "pad_m": false,
       "kid": 30,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1552,6 +1614,8 @@
       "pad_m": true,
       "kid": 31,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1600,6 +1664,8 @@
       "pad_m": false,
       "kid": 32,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1648,6 +1714,8 @@
       "pad_m": true,
       "kid": 33,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1697,6 +1765,8 @@
       "pad_m": false,
       "kid": 34,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1746,6 +1816,8 @@
       "pad_m": false,
       "kid": 35,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1795,6 +1867,8 @@
       "pad_m": false,
       "kid": 36,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1844,6 +1918,8 @@
       "pad_m": false,
       "kid": 37,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1893,6 +1969,8 @@
       "pad_m": false,
       "kid": 38,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     },
     {
@@ -1942,6 +2020,8 @@
       "pad_m": false,
       "kid": 39,
       "wide_output": true,
+      "wide_input": true,
+      "pad_k": true,
       "max_k": null
     }
   ]

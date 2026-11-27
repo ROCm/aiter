@@ -3941,6 +3941,32 @@ def bpreshuffle_workspace_bytes(instance, m, n, k):
     return 4 * split * m * n if split > 1 else 0
 
 
+def _pad_k_supports(instance, k):
+    """A pad_k CO runs a partial last K tile; with a K-contiguous operand, from K = 16."""
+    co = instance.bpreshuffle_co or {}
+    return bool(co.get("pad_k")) and (mxfp8_direction(co) == "TN" or k >= 16)
+
+
+def bpreshuffle_input_extents(instance, m, n, k):
+    """Byte extents of A, B and scaleA that the kernel addresses with 32-bit offsets.
+
+    Each must stay within INT32_MAX; the generated launcher checks the same list.
+    A CO with ``wide_input`` (the a8w8_blockscale_mxfp8 family) addresses A and B from
+    a 64-bit base per tile, or per K tile for an operand stored [K, M] / [K, N], so only
+    that view is limited and A / B may be 4 GiB or larger. Otherwise the whole operand
+    is one view.
+    """
+    co = instance.bpreshuffle_co or {}
+    if not co.get("wide_input"):
+        return [m * k, n * k]
+    a, b = mxfp8_direction(co)
+    return [
+        instance.B_M * k if a == "N" else instance.B_K * m,
+        instance.B_N * k if b == "T" else instance.B_K * n,
+        m * -(-k // 128),
+    ]
+
+
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
     entry = instance.bpreshuffle_entry or {}
     split = entry.get("split_k", 1)
@@ -3952,13 +3978,15 @@ def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
         min(m, n, k) <= 0
         or m % instance.m_align
         or n % 128
-        or k % (split * instance.B_K)
+        or (k % (split * instance.B_K) and not _pad_k_supports(instance, k))
         or n % instance.B_N
         or (instance.max_m is not None and m > instance.max_m)
         or (instance.max_k is not None and k > instance.max_k)
     ):
         return False
-    if max(m * k, n * k) > _INT32_MAX:
+    if not all(
+        extent <= _INT32_MAX for extent in bpreshuffle_input_extents(instance, m, n, k)
+    ):
         return False
     if (
         instance.bpreshuffle_entry is not None

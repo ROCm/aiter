@@ -3196,40 +3196,50 @@ def gen_bmm_mxscale_fused_instance(
     )
 
 
-def _bpreshuffle_arguments(direction="NT"):
+def _bpreshuffle_arguments(direction=None):
     """Host checks / kargs of a bpreshuffle kernel for an "NT", "NN", "TT" or "TN" layout.
 
     The first letter is A, the second B (BLAS op): A T = stored [K,M] (M-contiguous),
-    B T = stored [N,K] (K-contiguous), B N = stored [K,N] (N-contiguous)."""
-    if direction == "NT":
+    B T = stored [N,K] (K-contiguous), B N = stored [K,N] (N-contiguous).
+
+    direction None is the preshuffled-B family (contiguous NT operands); the MXFP8
+    family passes its direction, NT included. kg = ceil(K / 128) is the scale groups: a
+    pad_k CO takes any K (its last K tile may be partial), and the grid setup then
+    requires K >= 16 of a K-contiguous operand. The rows of a K-contiguous MXFP8 operand
+    may be any pitch >= K apart (a [M, K] view of a wider buffer): only K bytes of a row
+    are used, and a pitch that is a multiple of 128 keeps the copies aligned."""
+    if direction is None:
         matrix_check = 'XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(), "matrix layout differs"'
         sfa_stride_check = "x_scale.stride(1) == m"
         sfb_check = ' && w_scale.is_contiguous(), "scale layout differs"'
-        stride_a, stride_b, stride_sfb = "k", "k", "k / 128"
+        stride_a, stride_b, stride_sfb = "k", "k", "kg"
     else:
-        a_strides = ("1", "m") if direction[0] == "T" else ("k", "1")
-        b_strides = ("k", "1") if direction[1] == "T" else ("1", "n")
-        sfb_strides = ("k / 128", "1") if direction[1] == "T" else ("1", "n / 128")
-        stride_a = "m" if direction[0] == "T" else "k"
-        stride_b = "k" if direction[1] == "T" else "n"
-        stride_sfb = "k / 128" if direction[1] == "T" else "n / 128"
+        a_strides = ("1", "m") if direction[0] == "T" else (">= k", "1")
+        b_strides = (">= k", "1") if direction[1] == "T" else ("1", "n")
+        sfb_strides = ("kg", "1") if direction[1] == "T" else ("1", "n / 128")
+        stride_a = "m" if direction[0] == "T" else "XQ.stride(-2)"
+        stride_b = "WQ.stride(-2)" if direction[1] == "T" else "n"
+        stride_sfb = "kg" if direction[1] == "T" else "n / 128"
+        a_check = "== 1" if direction[0] == "T" else ">= k"
+        b_check = ">= k" if direction[1] == "T" else "== 1"
         matrix_check = (
             'Y.is_contiguous(), "matrix shape/output layout differs");\n'
-            f"    AITER_CHECK(XQ.stride(-2) == {a_strides[0]} && XQ.stride(-1) == {a_strides[1]} &&\n"
-            f"                WQ.stride(-2) == {b_strides[0]} && WQ.stride(-1) == {b_strides[1]},\n"
+            f"    AITER_CHECK(XQ.stride(-2) {a_check} && XQ.stride(-1) == {a_strides[1]} &&\n"
+            f"                WQ.stride(-2) {b_check} && WQ.stride(-1) == {b_strides[1]},\n"
             f'                "{direction} CO expects XQ strides ({a_strides[0]}, {a_strides[1]}) and WQ strides ({b_strides[0]}, {b_strides[1]}); got (",\n'
             '                XQ.stride(-2), ", ", XQ.stride(-1), ") and (", WQ.stride(-2), ", ", WQ.stride(-1), ")"'
         )
-        sfa_stride_check = "(k == 128 || x_scale.stride(1) == m)"
+        sfa_stride_check = "(kg == 1 || x_scale.stride(1) == m)"
         sfb_check = (
             " &&\n"
-            f"                (n == 128 || w_scale.stride(0) == {sfb_strides[0]}) && (k == 128 || w_scale.stride(1) == {sfb_strides[1]}),\n"
+            f"                (n == 128 || w_scale.stride(0) == {sfb_strides[0]}) && (kg == 1 || w_scale.stride(1) == {sfb_strides[1]}),\n"
             f'                "{direction} CO expects E8M0 scales: x_scale [M,K/128] with column-major bytes (contiguous, as per_group_quant_hip(transpose_scale=True) emits, or a strides (1,M) view), w_scale [N/128,K/128] strides ({sfb_strides[0]}, {sfb_strides[1]})"'
         )
     return f"""
     AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3) && WQ.dim() == XQ.dim() && Y.dim() == XQ.dim() &&
                 (XQ.dim() == 2 || (XQ.size(0) == 1 && WQ.size(0) == 1 && Y.size(0) == 1)), "requires GEMM batch=1");
     const int64_t m = XQ.size(-2), n = WQ.size(-2), k = XQ.size(-1);
+    const int64_t kg = (k + 127) / 128;
     AITER_CHECK(m > 0 && n > 0 && k > 0 && m <= INT32_MAX && n <= INT32_MAX && k <= INT32_MAX &&
                 WQ.size(-1) == k && Y.size(-2) == m && Y.size(-1) == n &&
                 {matrix_check});
@@ -3237,9 +3247,9 @@ def _bpreshuffle_arguments(direction="NT"):
         return tensor.dtype() == AITER_DTYPE_fp8_e8m0 || tensor.dtype() == AITER_DTYPE_u8;
     }};
     AITER_CHECK(e8m0(x_scale) && e8m0(w_scale) && x_scale.dim() == 2 && w_scale.dim() == 2 &&
-                x_scale.size(0) == m && x_scale.size(1) == k / 128 &&
+                x_scale.size(0) == m && x_scale.size(1) == kg &&
                 (x_scale.is_contiguous() || (x_scale.stride(0) == 1 && {sfa_stride_check})) &&
-                w_scale.size(0) == n / 128 && w_scale.size(1) == k / 128{sfb_check});
+                w_scale.size(0) == n / 128 && w_scale.size(1) == kg{sfb_check});
     opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args{{}};
     args.ptr_a = XQ.data_ptr(); args.ptr_b = WQ.data_ptr(); args.ptr_c = Y.data_ptr();
     args.m = m; args.n = n; args.k = k; args.batch = 1;
@@ -3247,7 +3257,7 @@ def _bpreshuffle_arguments(direction="NT"):
     args.stride_a_batch = m * k; args.stride_b_batch = n * k; args.stride_c_batch = int(uint64_t(m) * n);
     args.ptr_sfa = x_scale.data_ptr(); args.ptr_sfb = w_scale.data_ptr();
     args.stride_sfa = m; args.stride_sfb = {stride_sfb};
-    args.stride_sfa_batch = m * (k / 128); args.stride_sfb_batch = (n / 128) * (k / 128);
+    args.stride_sfa_batch = m * kg; args.stride_sfb_batch = (n / 128) * kg;
 """
 
 
@@ -3279,7 +3289,15 @@ def gen_mxscale_bpreshuffle_instance(
             return
         entry = k.bpreshuffle_co
         symbol = entry["symbol"]
-        grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+        # pad_k COs (MXFP8 NT / NN / TT / TN) run a partial last K tile. A K-contiguous
+        # operand's is rewritten from the last 16 bytes of each row, hence K >= 16.
+        if not entry.get("pad_k"):
+            k_check = f" && k % {k.B_K} == 0"
+        elif mxfp8_direction(entry) == "TN":
+            k_check = ""
+        else:
+            k_check = f" && (k % {k.B_K} == 0 || k >= 16)"
+        grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0{k_check}, "shape is unsupported by this CO");\n'
         # Some COs bake shape-dependent strides into the device code. Enforce
         # their manifest contract here, including for direct exact-kid callers.
         supported_shapes = entry.get("supported_shapes")
@@ -3305,11 +3323,26 @@ def gen_mxscale_bpreshuffle_instance(
             grid_setup += f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
         grid_setup += "    const unsigned dynamic_lds = 0;"
         limit = min(2147483647, k.max_tensor_bytes)
-        conditions = [
-            f"m * k <= {limit}",
-            f"n * k <= {limit}",
-            f"2 * m * n <= {k.max_tensor_bytes}",
-        ]
+        if entry.get("wide_input"):
+            # A / B are addressed per tile (per K tile for [K, M] / [K, N] storage):
+            # only that view and scaleA are limited. See bpreshuffle_input_extents.
+            a, b = mxfp8_direction(entry)
+            conditions = [
+                (
+                    f"{k.B_M} * XQ.stride(-2) <= {limit}"
+                    if a == "N"
+                    else f"{k.B_K} * m <= {limit}"
+                ),
+                (
+                    f"{k.B_N} * WQ.stride(-2) <= {limit}"
+                    if b == "T"
+                    else f"{k.B_K} * n <= {limit}"
+                ),
+                f"m * kg <= {limit}",
+            ]
+        else:
+            conditions = [f"m * k <= {limit}", f"n * k <= {limit}"]
+        conditions.append(f"2 * m * n <= {k.max_tensor_bytes}")
         if k.max_k is not None:
             conditions.append(f"k <= {k.max_k}")
         if entry.get("wide_output"):
@@ -3480,7 +3513,7 @@ struct {alias} : {entry["traits"]} {{}};
         host_header=host_header,
         name=k.name,
         workspace_extra=workspace_extra,
-        arguments=_bpreshuffle_arguments(mxfp8_direction(k.bpreshuffle_co) or "NT"),
+        arguments=_bpreshuffle_arguments(mxfp8_direction(k.bpreshuffle_co)),
         body=body,
     )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), source)

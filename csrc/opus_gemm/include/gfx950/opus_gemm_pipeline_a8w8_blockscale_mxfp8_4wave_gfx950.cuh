@@ -459,20 +459,62 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     const int col = block_n * T::B_N;
     const int batch_id = block_id_z();
 
-    // Global views, each a 64-bit base at this tile and a buffer range ending with its matrix.
+    // Global views. Each has a 64-bit base and a buffer range covering only what is read
+    // through it, so the 32-bit buffer offsets and num_records never span a whole matrix
+    // and A, B and C may each be 4 GiB or larger (GEMM batch is 1).
     // A_T: A [K, M], the tile starts at column row; else A [M, K], at row row.
     // B_T: B [K, N], the tile starts at column col; else B [N, K], at row col.
+    //   K-contiguous ([M, K] / [N, K]): one view per tile, from its first row to its last
+    //   valid one (B_M or the rows left of A, B_N of B). Padded-M rows read zero.
+    //   A_T / B_T ([K, M] / [K, N]): a tile reads its columns of every K row, so the view is
+    //   rebased to each K tile and covers its B_K rows, ending with the last one. Columns
+    //   past M (PAD_M) read the next K row or, past the range, zero; both are padded rows.
+    // K need not be a multiple of B_K: the last K tile is then partial. An A_T / B_T view
+    // of it ends with the last K row, so the rows past K read zero. A K-contiguous
+    // operand's copy of it runs into the next row; fix_tail_tile below rewrites it.
     // scaleB is [K128, N128] (B_T) or [N128, K128].
     // C: the range ends at the tile's last valid row. Padded-M rows fall outside it and their
     // stores are dropped by the hardware, so the epilogue needs no per-store branch.
-    const int64_t a_offset = T::A_T ? int64_t(row) : int64_t(row) * kargs.stride_a;
-    const int64_t b_offset = T::B_T ? int64_t(col) : int64_t(col) * kargs.stride_b;
     const int64_t sfb_offset = T::B_T ? int64_t(col / T::GROUP_N) : int64_t(col / T::GROUP_N) * kargs.stride_sfb;
     const int c_rows = kargs.m - row < T::B_M ? kargs.m - row : T::B_M;
-    auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + int64_t(batch_id) * kargs.stride_a_batch + a_offset,
-        static_cast<unsigned>((T::A_T ? int64_t(kargs.k) : int64_t(kargs.m)) * kargs.stride_a - a_offset));
-    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + int64_t(batch_id) * kargs.stride_b_batch + b_offset,
-        static_cast<unsigned>((T::B_T ? int64_t(kargs.k) : int64_t(kargs.n)) * kargs.stride_b - b_offset));
+    const int loops = (kargs.k + T::B_K - 1) / T::B_K;
+    // Bytes of an A_T / B_T view: B_K rows, or those left in the last K tile.
+    const unsigned k_tail_rows = kargs.k - (loops - 1) * T::B_K;
+    const unsigned a_k_bytes = static_cast<unsigned>(T::B_K) * kargs.stride_a - row;
+    const unsigned b_k_bytes = static_cast<unsigned>(T::B_K) * kargs.stride_b - col;
+    const unsigned a_k_tail_bytes = k_tail_rows * kargs.stride_a - row;
+    const unsigned b_k_tail_bytes = k_tail_rows * kargs.stride_b - col;
+    auto a_k_view_bytes = [&](int tile_k) { return tile_k == loops - 1 ? a_k_tail_bytes : a_k_bytes; };
+    auto b_k_view_bytes = [&](int tile_k) { return tile_k == loops - 1 ? b_k_tail_bytes : b_k_bytes; };
+    auto a_view = [&](int tile_k) {
+        const auto* ptr = reinterpret_cast<const D_A*>(kargs.ptr_a);
+        if constexpr (T::A_T)
+            return make_gmem(ptr + (int64_t(tile_k) * (T::B_K * kargs.stride_a) + row),
+                a_k_view_bytes(tile_k));
+        else
+            return make_gmem(ptr + int64_t(row) * kargs.stride_a, static_cast<unsigned>(c_rows) * kargs.stride_a);
+    };
+    auto b_view = [&](int tile_k) {
+        const auto* ptr = reinterpret_cast<const D_B*>(kargs.ptr_b);
+        if constexpr (T::B_T)
+            return make_gmem(ptr + (int64_t(tile_k) * (T::B_K * kargs.stride_b) + col),
+                b_k_view_bytes(tile_k));
+        else
+            return make_gmem(ptr + int64_t(col) * kargs.stride_b, static_cast<unsigned>(T::B_N) * kargs.stride_b);
+    };
+    // The main loop copies K tile i + 2. An A_T / B_T view of it is stepped by one K tile
+    // per iteration (two scalar adds) instead of rebuilt from the tile index.
+    const D_A* a_future = reinterpret_cast<const D_A*>(kargs.ptr_a) + (int64_t(2) * (T::B_K * kargs.stride_a) + row);
+    const D_B* b_future = reinterpret_cast<const D_B*>(kargs.ptr_b) + (int64_t(2) * (T::B_K * kargs.stride_b) + col);
+    // last: the K tile copied is the last one (the only one that may be partial).
+    auto a_future_view = [&](int tile_k, bool last) {
+        if constexpr (T::A_T) return make_gmem(a_future, last ? a_k_tail_bytes : a_k_bytes);
+        else return a_view(tile_k);
+    };
+    auto b_future_view = [&](int tile_k, bool last) {
+        if constexpr (T::B_T) return make_gmem(b_future, last ? b_k_tail_bytes : b_k_bytes);
+        else return b_view(tile_k);
+    };
     auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) +
         int64_t(batch_id) * kargs.stride_c_batch + int64_t(row) * kargs.stride_c + col,
         static_cast<unsigned>((int64_t(c_rows - 1) * kargs.stride_c + T::B_N) * sizeof(D_C)));
@@ -521,8 +563,9 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     auto u_gb = make_layout_gb<T>(T::B_T ? tr_copy_lane_id : k_copy_lane_id, wave_id_m, wave_id_n, kargs.stride_b);
     auto u_sa = make_layout_sa<T>(wave_id_m, wave_id_n);
     auto u_sb = make_layout_sb<T>(wave_id_m, wave_id_n);
+    // Offsets from a_view(tile_k) / b_view(tile_k), which hold the K tile of A_T / B_T.
     auto ga_offset = [&](int half_tile_m, int tile_k) {
-        if constexpr (T::A_T) return tile_k * T::B_K * kargs.stride_a + half_tile_m * T::HALF_B_M;
+        if constexpr (T::A_T) return half_tile_m * T::HALF_B_M;
         else return half_tile_m * T::HALF_B_M * kargs.stride_a + tile_k * T::B_K;
     };
     // PAD_M: the last K row's columns past M must be visible to the buffer bounds check,
@@ -533,17 +576,71 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     };
     auto ga_soffset = [&](int half_tile_m, int tile_k) { return T::PAD_M ? 0 : ga_offset(half_tile_m, tile_k); };
     auto gb_offset = [&](int half_tile_n, int tile_k) {
-        if constexpr (T::B_T) return tile_k * T::B_K * kargs.stride_b + half_tile_n * T::HALF_B_N;
+        if constexpr (T::B_T) return half_tile_n * T::HALF_B_N;
         else return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
     };
     auto sa_offset = [&](int stage, int half_tile_m) { return (stage * T::H_M + half_tile_m) * smem_a_elem; };
     auto sb_offset = [&](int stage, int half_tile_n) { return (stage * T::H_N + half_tile_n) * smem_b_elem; };
     const auto ga_copy_offsets = layout_to_offsets<T::VEC_A>(u_ga);
     const auto sa_copy_offsets = layout_to_offsets<T::VEC_A>(u_sa);
+    // Partial last K tile of a K-contiguous operand (16 <= K, K % B_K != 0). The LDS DMA
+    // copies 16-byte K chunks, so the chunks at and past K hold the next row (or zero past
+    // the view). Once they have landed, every lane copies its chunk again through a
+    // register: it loads the 16 bytes that end at or before K of its own row, i.e.
+    // tail_shift bytes earlier than its chunk (never past the row, so never past the
+    // operand), and shifts them right by as many bytes, which zero-fills from K on.
+    // tail_shift is 0 for a chunk below K, which is rewritten unchanged.
+    constexpr bool HAS_K_CONTIGUOUS = !T::A_T || !T::B_T;
+    const int k_tail = kargs.k - (loops - 1) * T::B_K;
+    const bool k_partial = k_tail != T::B_K;
+    const int tail_excess = ((lane_id & 7) ^ ((lane_id >> 3) & 3)) * 16 + 16 - k_tail;  // K chunk as k_copy_lane_id
+    const int tail_shift = tail_excess > 0 ? tail_excess : 0;
+    auto shift_tail_chunk = [&](const vector_t<D_A, 16>& chunk) {
+        using u64x2_t = vector_t<unsigned long long, 2>;
+        const auto q = __builtin_bit_cast(u64x2_t, chunk);
+        const unsigned bits = tail_shift >= 16 ? 128u : static_cast<unsigned>(tail_shift) * 8u;
+        const unsigned b = bits & 63u;
+        const unsigned long long carry = (q[1] << 1) << (63u - b);  // q[1] << (64 - b), 0 for b = 0
+        const unsigned long long lo = bits >= 128u ? 0ull : bits >= 64u ? q[1] >> b : (q[0] >> b) | carry;
+        const unsigned long long hi = bits >= 64u ? 0ull : q[1] >> b;
+        return __builtin_bit_cast(vector_t<D_A, 16>, u64x2_t{lo, hi});
+    };
+    // slot_a / slot_b: LDS stage holding the last K tile (half 0), as the copies' base.
+    auto fix_tail_tile = [&](OPUS_LDS_ADDR char* slot_a, OPUS_LDS_ADDR char* slot_b) {
+        const int tile_k = loops - 1;
+        if constexpr (!T::A_T) {
+            auto g_a = a_view(tile_k);
+            auto dst = s_a;
+            dst.ptr = reinterpret_cast<decltype(dst.ptr)>(slot_a);
+            static_for<T::H_M>([&](auto half_i) {
+                constexpr int half = decltype(half_i)::value;
+                static_for<4>([&](auto pass_i) {
+                    constexpr int pass = decltype(pass_i)::value;
+                    const auto chunk = load<16>(g_a, ga_copy_offsets[pass] + ga_offset(half, tile_k) - tail_shift);
+                    store<16>(dst, shift_tail_chunk(chunk), sa_copy_offsets[pass] + sa_offset(0, half) + lane_id * 16);
+                });
+            });
+        }
+        if constexpr (!T::B_T) {
+            const auto gb_copy_offsets = layout_to_offsets<T::VEC_B>(u_gb);
+            const auto sb_copy_offsets = layout_to_offsets<T::VEC_B>(u_sb);
+            auto g_b = b_view(tile_k);
+            auto dst = s_b;
+            dst.ptr = reinterpret_cast<decltype(dst.ptr)>(slot_b);
+            static_for<T::H_N>([&](auto half_i) {
+                constexpr int half = decltype(half_i)::value;
+                static_for<4>([&](auto pass_i) {
+                    constexpr int pass = decltype(pass_i)::value;
+                    const auto chunk = load<16>(g_b, gb_copy_offsets[pass] + gb_offset(half, tile_k) - tail_shift);
+                    store<16>(dst, shift_tail_chunk(chunk), sb_copy_offsets[pass] + sb_offset(0, half) + lane_id * 16);
+                });
+            });
+        }
+    };
     // One B copy pass with its repeat coordinate fixed, leaving one contiguous vector for
     // async_load; the uniform tile offset goes to SOFFSET, so each copy keeps a
     // loop-invariant VGPR address and B's buffer resource stays in SGPRs.
-    auto copy_b_pass = [&](OPUS_LDS_ADDR char* base, auto pass_i, int half, int tile) {
+    auto copy_b_pass = [&](auto& g_b, OPUS_LDS_ADDR char* base, auto pass_i, int half, int tile) {
         constexpr int pass = decltype(pass_i)::value;
         const auto u_gb_copy = make_layout<T::VEC_B>(u_gb.shape(), u_gb.stride(),
             merge_peepholed_tuple(u_gb.coord(), make_tuple(number<pass>{}, underscore{})));
@@ -554,6 +651,8 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     };
     // NN prologue: every 128-row/column quadrant with the complete layouts.
     auto prefetch_tile = [&](int tile, int stage) {
+        auto g_a = a_view(tile);
+        auto g_b = b_view(tile);
         static_for<T::H_M>([&](auto half_i) {
             constexpr int half = decltype(half_i)::value;
             if constexpr (T::PAD_M)
@@ -573,13 +672,16 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
         constexpr int pass = decltype(pass_i)::value;
         // Parts 0..H_M-1 copy the A quadrants, the rest the B quadrants.
         constexpr int half = part < T::H_M ? part : part - T::H_M;
+        auto g_a = a_view(tile);
         if constexpr (part < T::H_M)
             async_load<T::VEC_A>(g_a,
                 reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(s_a.ptr)
                     + sa_copy_offsets[pass] + sa_offset(stage, half)),
                 ga_voffset(ga_copy_offsets[pass], half, tile), ga_soffset(half, tile));
-        else
-            copy_b_pass(s_b.ptr + sb_offset(stage, 0), pass_i, half, tile);
+        else {
+            auto g_b = b_view(tile);
+            copy_b_pass(g_b, s_b.ptr + sb_offset(stage, 0), pass_i, half, tile);
+        }
     };
 
     // LDS -> registers: A / B operand fragment reads.
@@ -653,7 +755,6 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
     // Scales: global -> LDS panel -> registers. Cache the same 64 K128 columns as NT.
     // SFA is packed in VGPRs before publication; consumers read both M/N halves in one
     // LDS pair.
-    const int loops = kargs.k / T::B_K;
     constexpr int scale_panel_mask = T::SCALE_PANEL_K_CAPACITY - 1;
     static_assert((T::SCALE_PANEL_K_CAPACITY & scale_panel_mask) == 0);
     const auto u_gsfa = make_layout_gsfa<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_sfa);
@@ -742,6 +843,13 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
             });
         }
     }
+    if constexpr (HAS_K_CONTIGUOUS) {
+        // K <= 2 * B_K: the prologue copied the partial tile, into stage loops - 1.
+        if (k_partial && loops <= 2) {
+            s_waitcnt_vmcnt(number<0>{});
+            fix_tail_tile(s_a.ptr + sa_offset(loops - 1, 0), s_b.ptr + sb_offset(loops - 1, 0));
+        }
+    }
     fill_scale_panel(0);
 
     static_for<2>([&](auto half_i) {
@@ -765,7 +873,8 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
 
     // Main loop
     // One K128 iteration: MFMA K_i, read K_i+1, and prefetch K_i+2.
-    auto main_loop_iteration = [&](int tile, auto first_tile, auto next_tile, auto later_tile,
+    // last_copy: the K tile this iteration copies (tile + 2) is the last one.
+    auto main_loop_iteration = [&](int tile, auto first_tile, auto next_tile, auto later_tile, bool last_copy,
         OPUS_LDS_ADDR char* __restrict__ read_a,
         OPUS_LDS_ADDR char* __restrict__ read_b,
         OPUS_LDS_ADDR char* __restrict__ write_a,
@@ -783,6 +892,8 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
             constexpr int part = decltype(part_i)::value;
             constexpr int pass = decltype(pass_i)::value;
             constexpr int half = part < T::H_M ? part : part - T::H_M;
+            auto g_a = a_future_view(future_tile, last_copy);
+            auto g_b = b_future_view(future_tile, last_copy);
             if constexpr (NN_SCHEDULE) {
                 // NN: fix the repeat coordinates, leaving one contiguous vector for
                 // async_load; the uniform tile offset goes to SOFFSET (as NT), so each
@@ -814,7 +925,7 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                         + sa_copy_offsets[pass] + sa_offset(0, half)),
                     ga_voffset(ga_copy_offsets[pass], half, future_tile), ga_soffset(half, future_tile));
             else
-                copy_b_pass(write_b, pass_i, half, future_tile);
+                copy_b_pass(g_b, write_b, pass_i, half, future_tile);
         };
         constexpr bool has_next = decltype(next_tile)::value;
         constexpr bool has_later = decltype(later_tile)::value;
@@ -1131,34 +1242,51 @@ __device__ __forceinline__ void opus_gemm_mxfp8_4wave(
                 s_waitcnt_lgkmcnt(number<0>{});
                 if constexpr (has_later) {
                     if (!first_k || loops > 2) s_waitcnt_vmcnt(number<0>{});
+                    if constexpr (HAS_K_CONTIGUOUS) {
+                        if (last_copy && k_partial) {
+                            fix_tail_tile(write_a, write_b);
+                            s_waitcnt_lgkmcnt(number<0>{});
+                        }
+                    }
                 }
                 sync_threads();
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
         stage ^= 1;
+        if constexpr (T::A_T) a_future += T::B_K * kargs.stride_a;
+        if constexpr (T::B_T) b_future += T::B_K * kargs.stride_b;
     };
 
     // Steady tiles read Ki+1 and copy Ki+2. Drain the final two without
     // issuing out-of-range copies; K=128 and K=256 use only these tails.
     // Initialize every C fragment with its first MFMA's literal C=0.
-    main_loop_iteration(0, number<true>{}, number<true>{}, number<true>{},
+    // The iteration that copies the last K tile runs after the steady loop, which then
+    // only copies full ones: its A_T / B_T views keep a loop-invariant size and it has
+    // no partial-tile work.
+    main_loop_iteration(0, number<true>{}, number<true>{}, number<true>{}, loops == 3,
         s_a.ptr + sa_offset(1, 0), s_b.ptr + sb_offset(1, 0),
         s_a.ptr + sa_offset(0, 0), s_b.ptr + sb_offset(0, 0));
     int tile = 1;
 #pragma clang loop unroll_count(2)
-    for (; tile + 2 < loops; ++tile)
-        main_loop_iteration(tile, number<false>{}, number<true>{}, number<true>{},
+    for (; tile + 3 < loops; ++tile)
+        main_loop_iteration(tile, number<false>{}, number<true>{}, number<true>{}, false,
             s_a.ptr + sa_offset(stage ^ 1, 0), s_b.ptr + sb_offset(stage ^ 1, 0),
             s_a.ptr + sa_offset(stage, 0), s_b.ptr + sb_offset(stage, 0));
+    if (tile + 2 < loops) {
+        main_loop_iteration(tile, number<false>{}, number<true>{}, number<true>{}, true,
+            s_a.ptr + sa_offset(stage ^ 1, 0), s_b.ptr + sb_offset(stage ^ 1, 0),
+            s_a.ptr + sa_offset(stage, 0), s_b.ptr + sb_offset(stage, 0));
+        ++tile;
+    }
     if (tile + 1 < loops) {
-        main_loop_iteration(tile, number<false>{}, number<true>{}, number<false>{},
+        main_loop_iteration(tile, number<false>{}, number<true>{}, number<false>{}, false,
             s_a.ptr + sa_offset(stage ^ 1, 0), s_b.ptr + sb_offset(stage ^ 1, 0),
             s_a.ptr + sa_offset(stage, 0), s_b.ptr + sb_offset(stage, 0));
         ++tile;
     }
     if (tile < loops)
-        main_loop_iteration(tile, number<false>{}, number<false>{}, number<false>{},
+        main_loop_iteration(tile, number<false>{}, number<false>{}, number<false>{}, false,
             s_a.ptr + sa_offset(stage ^ 1, 0), s_b.ptr + sb_offset(stage ^ 1, 0),
             s_a.ptr + sa_offset(stage, 0), s_b.ptr + sb_offset(stage, 0));
 
