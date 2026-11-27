@@ -403,7 +403,7 @@ class BenchArgs:
             "-dv": str(effective_dv),
             "--window-size-left": str(window_left),
             "--window-size-right": str(window_right),
-            "-metric": metric.name,
+            "--metric": metric.name,
         }
 
         args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]

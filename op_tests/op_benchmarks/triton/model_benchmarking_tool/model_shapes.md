@@ -98,14 +98,14 @@ count reported by the benchmark against `hq`.
 
 ### Unified Attention (`unified_attention`)
 
-| Field        | Type   | Description |
-|-------------|--------|-------------|
-| `hq`        | int    | Number of query heads. |
-| `hkv`       | int    | Number of key/value heads. |
-| `dqk`       | int    | Query/key head dimension. |
-| `dv`        | int    | Value head dimension. |
-| `block_size`| int    | Optional. KV cache block size. |
-| `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used. |
+| Field            | Type        | Description                                                                                                |
+|------------------|-------------|------------------------------------------------------------------------------------------------------------|
+| `hq`             | int         | Number of query heads.                                                                                     |
+| `hkv`            | int         | Number of key/value heads.                                                                                 |
+| `dqk`            | int         | Query/key head dimension.                                                                                  |
+| `dv`             | int         | Value head dimension.                                                                                      |
+| `block_size`     | int         | Optional. KV cache block size. Omit the key to use `DEFAULT_BLOCK_SIZE` from `bench_unified_attention.py`. |
+| `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used.                                   |
 
 ## Example
 

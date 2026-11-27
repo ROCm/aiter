@@ -1061,6 +1061,15 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     # Large tensors already exceed L2 on their own and gain little from more
     # rotation, so use a floor of 2.
     override_parser_action(parser, action="--rot-bufs-min-pool-len", default=2)
+    # The shared default (1000 kernels per graph, 3 warmup replays and 10 timed
+    # replays) makes a large shape take minutes, and a long replay picks up GPU
+    # stalls that pull the reported mean up. 20 calls, 1 warmup replay and 3
+    # timed replays match a 256 MB rotating pool from a 1.5 MB q/k/v set up
+    # (measured on gfx950). A ~0.2 MB set stays a bit warm. Pass the flags to
+    # override.
+    override_parser_action(parser, action="--graph-kernels-per-graph", default=20)
+    override_parser_action(parser, action="--graph-warmup-replays", default=1)
+    override_parser_action(parser, action="--graph-num-replays", default=3)
     parser.add_argument(
         "-fn",
         type=str,
