@@ -674,7 +674,10 @@ def gemm_a16w16_gfx950_kernel(
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        NUM_XCDS=8,
+        NUM_PIDS_THRESHOLD=256,
+        GROUP_M=param.group_m,
+        GROUP_M_ON_ALL_GRIDS=True,
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
@@ -1260,7 +1263,10 @@ def gemm_a16w16_hti_gfx950_kernel(
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        NUM_XCDS=8,
+        NUM_PIDS_THRESHOLD=256,
+        GROUP_M=param.group_m,
+        GROUP_M_ON_ALL_GRIDS=True,
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
