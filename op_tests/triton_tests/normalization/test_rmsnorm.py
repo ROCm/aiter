@@ -24,14 +24,23 @@ def generate_rmsnorm_inputs(M, N, dtype):
     return x, weight
 
 
-def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    _M, N = x.shape
-    # cast to float32 as the triton kernel
+def torch_rmsnorm(
+    x, g, out_dtype=torch.float16, epsilon=1e-6, bias_in=None, activation=None
+):
+    # act(rmsnorm(x + bias_in) * g) over the last dim, in float32 as the triton
+    # kernel, with one cast to out_dtype after the activation
+    N = x.shape[-1]
     x_f32 = x.float()
+    if bias_in is not None:
+        x_f32 = x_f32 + bias_in.float()
     g_f32 = g.float()
-    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1) * 1 / N)
+    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1, keepdim=True) / N + epsilon)
     rsigma = 1.0 / rms
-    rms_norm_f32 = x_f32 * rsigma.unsqueeze(1) * g_f32
+    rms_norm_f32 = x_f32 * rsigma * g_f32
+    if activation == "silu":
+        rms_norm_f32 = torch.nn.functional.silu(rms_norm_f32)
+    elif activation is not None:
+        raise ValueError(f"no reference for activation {activation!r}")
     rms_norm = rms_norm_f32.to(out_dtype)
     return rms_norm
 
@@ -478,18 +487,6 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
 
 
-def torch_rmsnorm_bias_act(x, g, bias_in, activation, epsilon):
-    # fp32 reference: act(rmsnorm(x + bias_in) * g), one round to the dtype of x
-    x_f32 = x.float()
-    if bias_in is not None:
-        x_f32 = x_f32 + bias_in.float()
-    rsigma = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + epsilon)
-    y = x_f32 * rsigma * g.float()
-    if activation == "silu":
-        y = torch.nn.functional.silu(y)
-    return y.to(x.dtype)
-
-
 def get_bias_act_vals():
     # (rows, C) of the RMSNorm calls of the Wan 2.2 VAE encoder for a 224 x 448 frame
     wan_vae = [
@@ -524,7 +521,7 @@ def test_rmsnorm_bias_activation(M, N, has_bias, activation, in_dtype_str):
     bias_in = torch.randn(N, dtype=dtype, device="cuda") if has_bias else None
     eps = 1e-6
 
-    y_ref = torch_rmsnorm_bias_act(x, weight, bias_in, activation, eps)
+    y_ref = torch_rmsnorm(x, weight, dtype, eps, bias_in=bias_in, activation=activation)
     y = rms_norm(x, weight, eps, bias_in=bias_in, activation=activation)
 
     if dtype == torch.float32:
@@ -551,8 +548,8 @@ def test_rmsnorm_bias_silu_channels_last(B, C, H, W, in_dtype_str):
     y = rms_norm(rows, weight, 1e-6, bias_in=bias_in, activation="silu")
     y = y.view(B, H, W, C).permute(0, 3, 1, 2)
 
-    y_ref = torch_rmsnorm_bias_act(
-        x.permute(0, 2, 3, 1), weight, bias_in, "silu", 1e-6
+    y_ref = torch_rmsnorm(
+        x.permute(0, 2, 3, 1), weight, dtype, 1e-6, bias_in=bias_in, activation="silu"
     ).permute(0, 3, 1, 2)
     torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
 

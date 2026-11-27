@@ -326,17 +326,37 @@ def _should_use_large_m_small_n(M: int, N: int, backward: bool = False) -> bool:
     return N <= 1024 if backward else N <= 2048
 
 
-def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
+def rmsnorm_forward_inference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    bias_in: torch.Tensor | None = None,
+    activation: str | None = None,
+):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    assert bias_in is None or bias_in.shape == (
+        x.shape[1],
+    ), f"bias_in must be ({x.shape[1]},), got {tuple(bias_in.shape)}"
+    # Resolve the name first, so that an unknown name raises KeyError for all M.
+    if activation is not None:
+        _get_activation_from_str(activation)
     x = x.contiguous()
     weight = weight.contiguous()
+    bias_in = bias_in.contiguous() if bias_in is not None else None
     M, N = x.shape
 
     if _should_use_large_m_small_n(M, N):
-        return _rmsnorm_forward_large_m_small_n(x, weight, eps, return_rsigma=False)
+        return _rmsnorm_forward_large_m_small_n(
+            x,
+            weight,
+            eps,
+            return_rsigma=False,
+            bias_in=bias_in,
+            activation=activation,
+        )
     else:
         y, _ = _rmsnorm_forward(
-            x, weight, eps
+            x, weight, eps, bias_in, activation
         )  # always returns rsigma, but we discard it
         return y
 
@@ -404,33 +424,6 @@ class _RMSNorm2dFwdWithAdd(torch.autograd.Function):
         return None, dx, None, None, dg, None, None
 
 
-def _rmsnorm_forward_bias_act(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-    bias_in: torch.Tensor | None,
-    activation: str | None,
-) -> torch.Tensor:
-    assert x.ndim == 2 and weight.shape == (x.shape[1],)
-    assert bias_in is None or bias_in.shape == (
-        x.shape[1],
-    ), f"bias_in must be ({x.shape[1]},), got {tuple(bias_in.shape)}"
-    # Resolve the name first, so that an unknown name raises KeyError for all M.
-    if activation is not None:
-        _get_activation_from_str(activation)
-    if x.stride(1) != 1:
-        x = x.contiguous()
-    weight = weight.contiguous()
-    bias_in = bias_in.contiguous() if bias_in is not None else None
-    M, N = x.shape
-    if _should_use_large_m_small_n(M, N):
-        return _rmsnorm_forward_large_m_small_n(
-            x, weight, epsilon, bias_in=bias_in, activation=activation
-        )
-    y, _ = _rmsnorm_forward(x, weight, epsilon, bias_in, activation)
-    return y
-
-
 def rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -478,7 +471,7 @@ def rms_norm(
         t is not None and t.requires_grad for t in (input, weight, bias_in)
     ):
         raise ValueError("rms_norm with bias_in or activation has no backward")
-    return _rmsnorm_forward_bias_act(input, weight, epsilon, bias_in, activation)
+    return rmsnorm_forward_inference(input, weight, epsilon, bias_in, activation)
 
 
 def rmsnorm2d_fwd_with_add(
