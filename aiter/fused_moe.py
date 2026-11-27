@@ -1770,6 +1770,15 @@ def _fused_moe_impl(
             f"a16w16 block_size_M={block_size_M} does not match kernel tile "
             f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
         )
+    if any(getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale)) and not any(
+        k in _a16w16_kn1 for k in ("pertokenMXfp4Fp8_g1u1_novs_situv2", "_g942")
+    ):
+        raise ValueError(
+            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
+            "(a8w4_gfx942_layout), which only the gfx942 1-stage asm kernel reads, "
+            f"but stage 1 is {_a16w16_kn1 or metadata.stage1}; "
+            "is AITER_SITUV2_A8W4=1 set?"
+        )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if _stage2_override is not None and (
         metadata.run_1stage or metadata.full_impl is not None

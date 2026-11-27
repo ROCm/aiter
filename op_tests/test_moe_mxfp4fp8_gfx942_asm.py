@@ -125,9 +125,9 @@ def test_fmoe_asm_mxfp4fp8(token, model_dim, inter_dim, dtype=dtypes.bf16):
     w1_s8 = shuffle_weight_a8w4_gfx942(w1_s)
     w1_sc8 = shuffle_scale_a8w4_gfx942(w1_sc)
 
-    def run(x, w1, w1_scale, a1_scale=None):
+    def run(x, w1, w1_scale, a1_scale=None, a8w4="1"):
         # fused_moe reads the flag on each call
-        with override_env("AITER_SITUV2_A8W4", "1"):
+        with override_env("AITER_SITUV2_A8W4", a8w4):
             return fused_moe(
                 x,
                 w1,
@@ -172,6 +172,12 @@ def test_fmoe_asm_mxfp4fp8(token, model_dim, inter_dim, dtype=dtypes.bf16):
             assert "a8w4_gfx942_layout" in str(e), e
         else:
             raise AssertionError("asm kernel ran on a W1 that is not relaid")
+    try:
+        run(x, w1_s8, w1_sc8, a8w4="0")
+    except ValueError as e:
+        assert "AITER_SITUV2_A8W4" in str(e), e
+    else:
+        raise AssertionError("a16w4 kernel ran on a relaid W1")
     return ret
 
 
