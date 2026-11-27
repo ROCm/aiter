@@ -65,6 +65,22 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_dsv41_seg_fuse": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/dsv41_seg_fuse_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/dsv41_seg_fuse_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/attention_kernels.cu'",
