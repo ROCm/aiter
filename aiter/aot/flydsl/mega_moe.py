@@ -5,14 +5,16 @@
 
 """AOT pre-compilation for the MegaMoE A8W4 and A4W4 deployment profiles.
 
-Each job builds the runtime's own ``MegaMoEV2`` for one rank of a deployment
-profile and calls its ``preload_aot_bundles()``. The runtime derives the bundle
-plan, sizes its buffers and loads every production Stage1/prepare, Stage2 and
-combine variant itself; inside :func:`aiter.aot.flydsl.dry_run.dry_run` those
-kernels are compiled into the cache instead of launched. mori shmem, through
-which the runtime allocates symmetric buffers and exchanges peer pointers, hands
-out FakeTensors and fake addresses, so no GPU or process group is needed. This
-module only owns the deployment profiles.
+Each job builds the runtime's own ``MegaMoEV2`` for a deployment profile and
+calls its ``preload_aot_bundles()``. The kernels take the rank at launch, so
+rank 0's instance builds the kernels of every rank. The runtime derives the
+bundle plan, sizes its buffers and loads every production Stage1/prepare,
+Stage2 and combine variant itself; inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` those kernels are compiled into the
+cache instead of launched. mori shmem, through which the runtime allocates
+symmetric buffers and exchanges peer pointers, hands out FakeTensors and fake
+addresses, so no GPU or process group is needed. This module only owns the
+deployment profiles.
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so like
 the MoE replay this one runs in a process of its own, started with
@@ -114,8 +116,8 @@ def default_jobs(
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
-    """One job per rank of every (max tokens per rank, experts per rank) pair;
-    rank is a compile-time parameter of the kernels."""
+    """One job per (max tokens per rank, experts per rank, quant); the kernels
+    take the rank at launch, so one job serves every rank."""
     shape_suffix = ""
     if (world_size, topk, model_dim, inter_dim) != (
         WORLD_SIZE,
@@ -129,12 +131,11 @@ def default_jobs(
         {
             "kernel_name": (
                 f"mega_moe_{quant}_mtpr{mtpr}_epr{experts_per_rank}"
-                f"_rank{rank}{shape_suffix}{act_suffix}"
+                f"{shape_suffix}{act_suffix}"
             ),
             "quant": quant,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
-            "rank": rank,
             "world_size": world_size,
             "topk": topk,
             "model_dim": model_dim,
@@ -147,7 +148,6 @@ def default_jobs(
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
         for quant in quants
-        for rank in range(world_size)
     ]
 
 
@@ -256,13 +256,13 @@ def _weights(job: dict, device) -> dict:
 
 
 def compile_one_config(**job):
-    """Build one rank of a profile and leave its production kernels in the cache."""
+    """Build a profile and leave its production kernels in the cache."""
     from aiter.aot.flydsl.dry_run import dry_run
 
     result = {**job, "compile_time": None}
     started = time.time()
     try:
-        device = torch.device("cuda", job["rank"])
+        device = torch.device("cuda", 0)
         with (
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
             _fake_shmem(device),
@@ -271,7 +271,7 @@ def compile_one_config(**job):
             from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
             moe = MegaMoEV2(
-                rank=job["rank"],
+                rank=0,
                 world_size=job["world_size"],
                 model_dim=job["model_dim"],
                 inter_dim=job["inter_dim"],
