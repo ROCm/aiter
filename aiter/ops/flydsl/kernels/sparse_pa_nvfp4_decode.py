@@ -31,6 +31,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_fp8, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     DATA_B,
@@ -65,12 +66,20 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     unit_scale,
     xlane4,
 )
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_select import (
+    CAND_DWORDS,
+    SEL_DWORDS,
+    TMP_DWORDS,
+    first_window,
+    row_top16_prologue,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_copy_load,
     buf_copy_store,
     ptr_buf_tensor,
 )
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 # Cache-policy bit of buffer loads: non-temporal (streaming). The K data is read once, so it
 # streams; V stays cacheable (measured faster than streaming both).
@@ -93,7 +102,7 @@ def _atomic_add(addr_i64, value):
     )
 
 
-def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
+def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g, k_cache=NT):
     """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` returns a page as three
     buffer tensors (4-, 2- and 1-dword units) and ``load_k`` / ``load_v`` read this lane's
     share of its K / V side as raw dwords:
@@ -134,7 +143,7 @@ def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     def load_k(pr):
         raw = []
         for st in range_constexpr(2):
-            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=NT)
+            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=k_cache)
             raw += [kd[i] for i in range_constexpr(4)]
         raw.append(fx.Int32(buf_copy_load(pr[2], k_scale_load)))
         return raw
@@ -167,20 +176,46 @@ def compile_decode(
     topk: int = 16,
     xcds: int = 0,
     late_v: bool = False,
+    select: bool = False,
+    pins: bool = False,
+    quant: bool = False,
 ):
     """Build the decode kernel for ``splits`` workgroups per (row, kv head). ``late_v`` issues
     the next page's V loads after the QK of the page in hand instead of together with its K
     loads: fewer bytes in flight, which pays when several
-    workgroups share a CU."""
+    workgroups share a CU.
+
+    ``select`` makes every workgroup pick its row's top-``topk`` (16) blocks from the fp32
+    index scores ``arg_score`` first (``sparse_pa_nvfp4_select``), store them to
+    ``topk_idx`` (every split of a row stores the same bytes) and attend over them: the
+    scorer -> selector -> attention chain loses its selector launch. ``pins`` also forces
+    the ``init_blocks`` leading / ``local_blocks`` trailing blocks in, as
+    ``topk_per_row_small_k`` does.
+
+    ``quant`` emits the output as o_proj's MXFP8 GEMM input instead of bf16 (row-major e4m3 codes
+    ``[rows, Hq * 128]`` and one e8m0 scale per 32 values ``[rows, Hq * 4]``): each wave of the final
+    merge owns one 32-value group of a head, the group max is one cross-lane max, so the separate
+    activation-quantize launch of the o_proj disappears. Same bytes as quantizing the bf16 output
+    with ATOM's ``quantize_fp8`` (group 32, E8M0 ceil scale, E4M3). Technique source: amd-kernels'
+    MXFP8-output attention decode (``..._mxfp8_select16``); no code shared."""
     require(1 <= topk <= 64, f"topk must be in [1, 64], got {topk}")
     require(1 <= splits <= topk, f"splits must be in [1, topk = {topk}], got {splits}")
     SPLITS, TOPK, XCDS, LATE_V = splits, topk, xcds, late_v
+    SELECT, PINS, QUANT = select, pins, quant
+    require(
+        not quant or NW == 4,
+        "the fused MXFP8 output needs one wave per 32 of the 128 dims",
+    )
+    K_CACHE = 0 if select else NT
+    require(not select or topk == 16, "the in-kernel selection picks the top 16")
     # Split partials need sc1 unless all splits of a row run on one XCD.
     PART_SCOPE = 0 if XCDS else SC1
     name = (
         f"m3_nvfp4_sparse_pa_decode_k{TOPK}_s{SPLITS}"
         + (f"_x{XCDS}" if XCDS else "")
         + ("_lv" if late_v else "")
+        + (("_selp" if pins else "_sel") if select else "")
+        + ("_q8" if quant else "")
     )
 
     @fx.struct
@@ -188,6 +223,11 @@ def compile_decode(
         o: fx.Array[fx.Int32, NW * NDT * 64 * 4, 16]
         ml: fx.Array[fx.Float32, NW * 2 * 64]
         ticket: fx.Array[fx.Int32, 4]
+        if SELECT:
+            # the selection's candidates, running top 16 and scratch
+            cand: fx.Array[fx.Int32, CAND_DWORDS, 16]
+            sel: fx.Array[fx.Int32, SEL_DWORDS, 16]
+            tmp: fx.Array[fx.Int32, TMP_DWORDS, 16]
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -212,6 +252,14 @@ def compile_decode(
         i64_part_bytes: fx.Int64,
         i32_page_byte: fx.Int32,
         f32_c: fx.Float32,  # sm_scale * log2(e)
+        arg_score: fx.Int64,  # select: [Hkv, rows, width] fp32 index scores
+        i64_s_head: fx.Int64,  # their strides over kv heads and rows (elements)
+        i64_s_row: fx.Int64,
+        i32_width: fx.Int32,  # their readable columns per row
+        i32_init: fx.Int32,  # pins: leading / trailing blocks forced in
+        i32_local: fx.Int32,
+        arg_qc: fx.Int64,  # quant: [rows, H * 128] e4m3 codes
+        arg_qs: fx.Int64,  # quant: [rows, H * 4] e8m0 scale bytes
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
@@ -242,23 +290,75 @@ def compile_decode(
         else:
             row, kvh, zz = fx.block_idx.x, fx.block_idx.y, fx.block_idx.z
             row_ok = row < i32_rows
+        if const_expr(SELECT):
+            # The row's first window of scores goes out before its length is known.
+            pre = first_window(
+                tx,
+                arg_score
+                + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                i32_width,
+            )
         req = row // i32_ql
         pos = fx.Int32(seq_p[req]) - i32_ql + row % i32_ql
+        live_blocks = (
+            (pos >= 0).select(pos, fx.Int32(-1)) + BLK
+        ) // BLK  # before row_ok
         pos = row_ok.select(pos, fx.Int32(-1))
         pos = (pos >= 0).select(pos, fx.Int32(-1))  # padding row: sees nothing
         pos = fx.Int32(fx.rocdl.readfirstlane(T.i32, pos))
         req = fx.Int32(fx.rocdl.readfirstlane(T.i32, req))
         self_blk = (pos >= 0).select(pos // BLK, fx.Int32(-1))
 
+        def load_q():
+            # Q does not wait for the ids: the selecting variant loads it under the selection.
+            qr = ptr_buf_tensor(
+                arg_q,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * (D * 2),
+            )
+            head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
+            q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
+            qf = [
+                bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
+                for ks in range_constexpr(NKS)
+            ]
+            return qf
+
+        if const_expr(SELECT):
+            qf = load_q()
+
         # Lane = top-k slot: its block id, the page behind it, and validity.
         slot_ok = lane < TOPK
-        blk = fx.Int32(
-            topk[
-                kvh * i32_topk_hs
-                + row * i32_topk_rs
-                + slot_ok.select(lane, fx.Int32(0))
-            ]
-        )
+        if const_expr(SELECT):
+            # The row's top 16 from its scores, stored where the unfused chain's selector
+            # stores them (padding units redo row 0's: the same bytes).
+            id_row = arg_topk + fx.Int64(kvh * i32_topk_hs + row * i32_topk_rs) * 4
+            row_top16_prologue(
+                tx,
+                arg_score
+                + (fx.Int64(kvh) * i64_s_head + fx.Int64(row) * i64_s_row) * 4,
+                i32_width,
+                pre,
+                live_blocks,
+                i32_init,
+                i32_local,
+                PINS,
+                smem.cand.ptr,
+                smem.sel.ptr,
+                smem.tmp.ptr,
+                id_row,
+            )
+            blk = fx.Int32(smem.tmp.ptr[lane % TOPK])
+        else:
+            blk = fx.Int32(
+                topk[
+                    kvh * i32_topk_hs
+                    + row * i32_topk_rs
+                    + slot_ok.select(lane, fx.Int32(0))
+                ]
+            )
         ok = slot_ok & (blk >= 0) & (blk <= self_blk)
         # A slot that is not valid does not read the table (it may have no columns): its
         # lane loads the first request length instead, which is discarded.
@@ -281,22 +381,13 @@ def compile_decode(
         # The row's offset inside its tail block, relative to this wave's first key: the keys
         # of the tail block past it are masked.
         lim = pos % BLK - w * KPW
-        qr = ptr_buf_tensor(
-            arg_q,
-            fx.Int32,
-            unit_elems=4,
-            unit_stride=1,
-            num_records_bytes=i32_rows * i32_H * (D * 2),
-        )
-        head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
-        q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
-        qf = [
-            bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
-            for ks in range_constexpr(NKS)
-        ]
+        if const_expr(not SELECT):
+            qf = load_q()
 
+        # The selecting variant leaves K cacheable: measured faster with the selection's
+        # latency chain in front (the plain variant keeps streaming K).
         open_page, load_k, load_v = _page_loader(
-            arg_cache, i32_page_byte, kvh, i32_hkv, w, n, g
+            arg_cache, i32_page_byte, kvh, i32_hkv, w, n, g, K_CACHE
         )
         zero4 = Vec.filled(4, 0.0, fx.Float32)
         key_off = [
@@ -442,43 +533,21 @@ def compile_decode(
                 state += b_
             results = yield [fx.as_ir_value(x) for x in state]
 
-        def store_out(acc, inv):
-            outr = ptr_buf_tensor(
-                arg_out,
-                fx.Int32,
-                unit_elems=4,
-                unit_stride=1,
-                num_records_bytes=i32_rows * i32_H * (D * 2),
-            )
-            # Lane (n, g) holds dims [32 g, 32 g + 32) of head n in order.
-            o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + g * 16
-            for e in range_constexpr(4):
-                val = Vec.from_elements(
-                    [
-                        pk_bf16(acc[2 * j][e] * inv, acc[2 * j + 1][e] * inv)
-                        for j in range_constexpr(4)
-                    ],
-                    fx.Int32,
-                )
-                # Masked lanes store at an offset past the buffer end, which drops the write.
-                keep = (n < i32_group) & row_ok
-                buf_copy_store(
-                    outr,
-                    keep.select(o_row + e * 4, fx.Int32(OOB_DWORD)),
-                    val,
-                    unit_elems=4,
-                )
-
-        # Combine the waves' partials in wave 0.
+        # The waves' partials meet in LDS, then ALL four waves combine them: wave w merges the
+        # original lanes (n, g = w), and its lane L takes element e = L // 16 of every d-tile of
+        # that lane (16 w + L % 16). Merging in wave 0 alone left three waves idle behind a
+        # barrier for ~3 us, the longest serial stretch after the page loop. Every sum keeps
+        # the order of the single-wave merge, so the output is bit-identical to it.
+        ml = smem.ml.ptr
+        o_i32 = smem.o.ptr
         o_lds = fx.logical_divide(
             fx.make_view(
-                fx.recast_iter(fx.Int32, smem.o.ptr),
+                fx.recast_iter(fx.Int32, o_i32),
                 fx.make_layout(NW * NDT * 64 * 4, 1),
             ),
             fx.make_layout(4, 1),
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-        ml = smem.ml.ptr
         ml[(w * 2) * 64 + lane] = fx.Float32(results[2])
         ml[(w * 2 + 1) * 64 + lane] = fx.Float32(results[3])
         for dt in range_constexpr(NDT):
@@ -486,111 +555,213 @@ def compile_decode(
             r.store(Vec(results[4 + dt]).bitcast(fx.Int32))
             fx.copy(lds_atom, r, fx.slice(o_lds, (None, (w * NDT + dt) * 64 + lane)))
         fx.gpu.barrier()
-        if w == 0:
-            ms = [fx.Float32(ml[(ww * 2) * 64 + lane]) for ww in range_constexpr(NW)]
-            big = ms[0]
-            for ww in range_constexpr(1, NW):
-                big = maxf_nn(big, ms[ww])
-            big_raw = big
-            big = (big == neg_inf).select(fx.Float32(0.0), big)
-            wt = [fx.Float32(fx.math.exp2(ms[ww] - big)) for ww in range_constexpr(NW)]
-            l_tot = fx.Float32(0.0)
+        ol = w * 16 + n  # the original lane (n, g = w) this lane merges
+        e_ = g  # ... and the element of its d-tiles
+        ms = [fx.Float32(ml[(ww * 2) * 64 + ol]) for ww in range_constexpr(NW)]
+        big = ms[0]
+        for ww in range_constexpr(1, NW):
+            big = maxf_nn(big, ms[ww])
+        big_raw = big
+        big = (big == neg_inf).select(fx.Float32(0.0), big)
+        wt = [fx.Float32(fx.math.exp2(ms[ww] - big)) for ww in range_constexpr(NW)]
+        # The row sum over the four g lanes, in xlane4's order (g0 + g2) + (g1 + g3).
+        xs = []
+        for gg in range_constexpr(4):
+            xg = fx.Float32(0.0)
             for ww in range_constexpr(NW):
-                l_tot = l_tot + fx.Float32(ml[(ww * 2 + 1) * 64 + lane]) * wt[ww]
-            l_tot = xlane4(l_tot, lambda x, y: x + y)
-            acc = [zero4 for _ in range_constexpr(NDT)]
+                xg = xg + fx.Float32(ml[(ww * 2 + 1) * 64 + gg * 16 + n]) * wt[ww]
+            xs.append(xg)
+        l_tot = (xs[0] + xs[2]) + (xs[1] + xs[3])
+        acc = []
+        for dt in range_constexpr(NDT):
+            a_ = fx.Float32(0.0)
             for ww in range_constexpr(NW):
-                wv = Vec.filled(4, wt[ww], fx.Float32)
-                for dt in range_constexpr(NDT):
-                    r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                    fx.copy(
-                        lds_atom,
-                        fx.slice(o_lds, (None, (ww * NDT + dt) * 64 + lane)),
-                        r,
-                    )
-                    acc[dt] = acc[dt] + Vec(r.load()).bitcast(fx.Float32) * wv
-            if const_expr(SPLITS > 1):
-                # Padding workgroups (row_ok false) work on a spare unit, never a real one.
-                tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
-                pr = [
-                    ptr_buf_tensor(
-                        arg_part,
-                        fx.Int32,
-                        unit_elems=u,
-                        unit_stride=1,
-                        num_records_bytes=i64_part_bytes,
-                    )
-                    for u in (4, 2)
-                ]
-                row_f = (tid * SPLITS + zz) * 64 + lane
-                for dt in range_constexpr(NDT):
-                    buf_copy_store(
-                        pr[0],
-                        row_f * PART_F + dt * 4,
-                        acc[dt].bitcast(fx.Int32),
-                        unit_elems=4,
-                        cache_modifier=PART_SCOPE,
-                    )
+                a_ = (
+                    a_
+                    + as_f32(fx.Int32(o_i32[((ww * NDT + dt) * 64 + ol) * 4 + e_]))
+                    * wt[ww]
+                )
+            acc.append(a_)
+
+        outr = ptr_buf_tensor(
+            arg_out,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_rows * i32_H * (D * 2),
+        )
+        # Head n's dims [32 w, 32 w + 32) are four dwords groups; this lane owns group e.
+        o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + w * 16 + e_ * 4
+        # Masked heads and padding rows store at an offset past the buffer end, which drops
+        # the write.
+        keep = (n < i32_group) & row_ok
+
+        if const_expr(QUANT):
+            head = kvh * i32_group + n
+            qcr = ptr_buf_tensor(
+                arg_qc,
+                fx.Int32,
+                unit_elems=2,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * D,
+            )
+            off = (row * i32_H + head) * (D // 4) + w * 8 + e_ * 2
+            qsr = ptr_buf_tensor(
+                arg_qs,
+                fx.Int8,
+                unit_elems=1,
+                num_records_bytes=i32_rows * i32_H * (D // 32),
+            )
+            soff = (row * i32_H + head) * (D // 32) + w
+
+        def store_quant(total, inv):
+            # bf16-rounded values: what the unfused path hands its quantizer
+            words = [
+                pk_bf16(total[2 * j] * inv, total[2 * j + 1] * inv)
+                for j in range_constexpr(4)
+            ]
+            vals = []
+            for j in range_constexpr(4):
+                vals.append(fx.Int32(words[j] << 16).bitcast(fx.Float32))
+                vals.append(fx.Int32(words[j] & fx.Int32(-65536)).bitcast(fx.Float32))
+            amax = fx.Float32(0.0)
+            for v in vals:
+                amax = maxf_nn(amax, fx.Int32(bits(v) & 0x7FFFFFFF).bitcast(fx.Float32))
+            amax = xlane4(amax, maxf_nn)
+            amax = maxf_nn(amax, fx.Float32(1e-10))
+            code = fx.Int32(
+                emit_mx_e8m0_scale(
+                    amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+                )
+            )
+            rcp = fx.Int32(fx.max(fx.Int32(254) - code, 0) << 23).bitcast(fx.Float32)
+            lim = fx.Float32(448.0)
+            q = []
+            for v in vals:
+                x = v * rcp
+                x = fx.arith.minnumf(x, lim, fastmath=fx.arith.FastMathFlags.nnan)
+                x = maxf_nn(x, fx.Float32(-448.0))
+                q.append(x)
+            w0 = emit_f32_to_fp8(q[0], q[1]) | (emit_f32_to_fp8(q[2], q[3]) << 16)
+            w1 = emit_f32_to_fp8(q[4], q[5]) | (emit_f32_to_fp8(q[6], q[7]) << 16)
+            buf_copy_store(
+                qcr,
+                keep.select(off, fx.Int32(OOB_DWORD)),
+                Vec.from_elements([w0, w1], fx.Int32),
+                unit_elems=2,
+            )
+            buf_copy_store(
+                qsr,
+                (keep & (e_ == 0)).select(soff, fx.Int32(OOB_DWORD)),
+                fx.Int8(code),
+                elem=fx.Int8,
+            )
+
+        def store_out(total, inv):
+            if const_expr(QUANT):
+                store_quant(total, inv)
+                return
+            val = Vec.from_elements(
+                [
+                    pk_bf16(total[2 * j] * inv, total[2 * j + 1] * inv)
+                    for j in range_constexpr(4)
+                ],
+                fx.Int32,
+            )
+            buf_copy_store(
+                outr,
+                keep.select(o_row, fx.Int32(OOB_DWORD)),
+                val,
+                unit_elems=4,
+            )
+
+        if const_expr(SPLITS > 1):
+            # Padding workgroups (row_ok false) work on a spare unit, never a real one.
+            tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
+            pr = [
+                ptr_buf_tensor(
+                    arg_part,
+                    fx.Int32,
+                    unit_elems=u,
+                    unit_stride=1,
+                    num_records_bytes=i64_part_bytes,
+                )
+                for u in (4, 2)
+            ]
+            # This split's partial of one (row, kv head): O as [e][lane][d-tile] fp32, then
+            # (max, sum) per lane.
+            blk0 = (tid * SPLITS + zz) * (64 * PART_F)
+            ml_off = blk0 + 4 * 64 * NDT + ol * 2
+            for h in range_constexpr(2):
+                buf_copy_store(
+                    pr[0],
+                    blk0 + (e_ * 64 + ol) * NDT + 4 * h,
+                    Vec.from_elements(
+                        [bits(acc[4 * h + i]) for i in range_constexpr(4)], fx.Int32
+                    ),
+                    unit_elems=4,
+                    cache_modifier=PART_SCOPE,
+                )
+            if e_ == 0:
                 buf_copy_store(
                     pr[1],
-                    row_f * PART_F + NDT * 4,
+                    ml_off,
                     Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
                     unit_elems=2,
                     cache_modifier=PART_SCOPE,
                 )
-                # The partial is stored before the ticket is taken.
-                fx.rocdl.s_waitcnt(vmcnt=0)
+            # Every wave's partial is stored before wave 0 takes the ticket.
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
+            if w == 0:
                 if lane == 0:
                     smem.ticket.ptr[0] = _atomic_add(arg_cnt + fx.Int64(tid) * 4, 1)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
-                if (
-                    fx.Int32(
-                        fx.rocdl.readfirstlane(T.i32, fx.Int32(smem.ticket.ptr[0]))
+            fx.gpu.barrier()
+            if (
+                fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(smem.ticket.ptr[0])))
+                == SPLITS - 1
+            ):
+                part_ml = [
+                    buf_copy_load(
+                        pr[1],
+                        (tid * SPLITS + sp) * (64 * PART_F) + 4 * 64 * NDT + ol * 2,
+                        unit_elems=2,
+                        cache_modifier=PART_SCOPE,
                     )
-                    == SPLITS - 1
-                ):
-                    rows_f = [
-                        (tid * SPLITS + sp) * 64 + lane
-                        for sp in range_constexpr(SPLITS)
-                    ]
-                    mls = [
-                        buf_copy_load(
-                            pr[1],
-                            rf * PART_F + NDT * 4,
-                            unit_elems=2,
+                    for sp in range_constexpr(SPLITS)
+                ]
+                bigs = [as_f32(x[0]) for x in part_ml]
+                top = bigs[0]
+                for sp in range_constexpr(1, SPLITS):
+                    top = maxf_nn(top, bigs[sp])
+                top = (top == neg_inf).select(fx.Float32(0.0), top)
+                ws = [fx.Float32(fx.math.exp2(b - top)) for b in bigs]
+                l_all = fx.Float32(0.0)
+                for sp in range_constexpr(SPLITS):
+                    l_all = l_all + as_f32(part_ml[sp][1]) * ws[sp]
+                inv_all = (l_all > fx.Float32(0.0)).select(
+                    v_scale / l_all, fx.Float32(0.0)
+                )
+                acc_all = [fx.Float32(0.0) for _ in range_constexpr(NDT)]
+                for sp in range_constexpr(SPLITS):
+                    for h in range_constexpr(2):
+                        part = buf_copy_load(
+                            pr[0],
+                            (tid * SPLITS + sp) * (64 * PART_F)
+                            + (e_ * 64 + ol) * NDT
+                            + 4 * h,
+                            unit_elems=4,
                             cache_modifier=PART_SCOPE,
-                        )
-                        for rf in rows_f
-                    ]
-                    bigs = [as_f32(x[0]) for x in mls]
-                    top = bigs[0]
-                    for sp in range_constexpr(1, SPLITS):
-                        top = maxf_nn(top, bigs[sp])
-                    top = (top == neg_inf).select(fx.Float32(0.0), top)
-                    ws = [fx.Float32(fx.math.exp2(b - top)) for b in bigs]
-                    l_all = fx.Float32(0.0)
-                    for sp in range_constexpr(SPLITS):
-                        l_all = l_all + as_f32(mls[sp][1]) * ws[sp]
-                    inv_all = (l_all > fx.Float32(0.0)).select(
-                        v_scale / l_all, fx.Float32(0.0)
-                    )
-                    acc_all = [zero4 for _ in range_constexpr(NDT)]
-                    for sp in range_constexpr(SPLITS):
-                        wv = Vec.filled(4, ws[sp], fx.Float32)
-                        for dt in range_constexpr(NDT):
-                            part = buf_copy_load(
-                                pr[0],
-                                rows_f[sp] * PART_F + dt * 4,
-                                unit_elems=4,
-                                cache_modifier=PART_SCOPE,
-                            ).bitcast(fx.Float32)
-                            acc_all[dt] = acc_all[dt] + part * wv
-                    store_out(acc_all, inv_all)
-                    if lane == 0:
-                        global_i32_ptr(arg_cnt + fx.Int64(tid) * 4)[0] = fx.Int32(0)
-            else:
-                inv = (l_tot > fx.Float32(0.0)).select(v_scale / l_tot, fx.Float32(0.0))
-                store_out(acc, inv)
+                        ).bitcast(fx.Float32)
+                        for i in range_constexpr(4):
+                            acc_all[4 * h + i] = acc_all[4 * h + i] + part[i] * ws[sp]
+                store_out(acc_all, inv_all)
+                if (w == 0) & (lane == 0):
+                    global_i32_ptr(arg_cnt + fx.Int64(tid) * 4)[0] = fx.Int32(0)
+        else:
+            inv = (l_tot > fx.Float32(0.0)).select(v_scale / l_tot, fx.Float32(0.0))
+            store_out(acc, inv)
 
     @flyc.jit
     def launch(
@@ -616,6 +787,14 @@ def compile_decode(
         i32_bt_s: fx.Int32,
         i32_page_b: fx.Int32,
         f32_c: fx.Float32,
+        arg_score: fx.Int64,
+        i64_s_head: fx.Int64,
+        i64_s_row: fx.Int64,
+        i32_width: fx.Int32,
+        i32_init: fx.Int32,
+        i32_local: fx.Int32,
+        arg_qc: fx.Int64,
+        arg_qs: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
@@ -640,6 +819,14 @@ def compile_decode(
             i64_part_bytes,
             i32_page_b,
             f32_c,
+            arg_score,
+            i64_s_head,
+            i64_s_row,
+            i32_width,
+            i32_init,
+            i32_local,
+            arg_qc,
+            arg_qs,
         ).launch(
             grid=(i32_grid_x, 1 if XCDS else i32_hkv, 1 if XCDS else SPLITS),
             block=(64 * NW, 1, 1),
@@ -655,10 +842,19 @@ def compile_decode(
 # host side
 # ---------------------------------------------------------------------------
 @functools.cache
-def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: int):
+def _get_kernel(
+    splits: int,
+    topk: int,
+    xcds: int,
+    late_v: bool,
+    select: bool,
+    pins: bool,
+    quant: bool,
+    device_index: int,
+):
     # device_index only keys the cache: the launcher memoises its compiled handle, which
     # is bound to the device it was compiled on.
-    return compile_decode(splits, topk, xcds, late_v)
+    return compile_decode(splits, topk, xcds, late_v, select, pins, quant)
 
 
 class DecodeWorkspace(NamedTuple):
@@ -747,11 +943,35 @@ def sparse_pa_nvfp4_decode(
     xcds: int | None = None,
     late_v: bool | None = None,
     workspace: DecodeWorkspace | None = None,  # from sparse_pa_nvfp4_decode_alloc
-) -> torch.Tensor:
+    index_score: torch.Tensor | None = None,  # [Hkv, >= rows, width] fp32 block scores
+    index_max_seq_len: (
+        int | None
+    ) = None,  # bound of seq_lens when ``index_score`` is given
+    init_blocks: int = 0,  # ``index_score``: leading blocks forced into the selection
+    local_blocks: int = 0,  # ``index_score``: trailing blocks forced in (outrank the leading)
+    quant_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | None:
     """Row i is query token i % query_len of request i // query_len and attends to
     the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
     be distinct (a selector emits every block once): the kernel attends once per slot,
     so a repeated id would be counted twice.
+
+    With ``index_score`` (the fp32 score rows of an index scorer; only the columns of a
+    row's live blocks are read) the kernel selects each row's top-16 blocks itself
+    (``sparse_pa_nvfp4_select``: descending score, ties to the larger block, NaN on top,
+    pins as ``topk_per_row_small_k``) and ``topk_idx`` is its OUTPUT, written with those ids
+    (-1 past the live count) for a later layer that reuses them. This replaces a selector
+    launch between the scorer and this kernel; ``decode_select_supported`` says where it
+    pays. ``index_max_seq_len`` bounds every ``seq_lens`` entry (``index_score`` must hold
+    that many blocks per row) and ``topk`` must be 16. Rows of up to ``SELECT_BLOCKS`` live
+    blocks (229K tokens) take the one-window selection, longer ones a windowed loop.
+
+    ``quant_out = (codes, scales)`` writes the output as o_proj's MXFP8 GEMM input instead of
+    bf16 (``out`` is then neither read nor written and may be None): ``codes`` fp8 e4m3 / uint8
+    ``[rows, Hq * 128]`` and ``scales`` uint8 / e8m0 ``[rows, Hq * 4]``, contiguous, one E8M0
+    scale per 32 values (ceil of amax / 448, E4M3, RNE, clamp to +-448), the bytes
+    ``quantize_fp8`` of ATOM gives for the bf16 output (finite outputs; NaN / inf are not byte-matched).
+    Returns None then.
 
     gfx950 only. Every operand must be on ``q``'s device and ``sm_scale`` must be finite
     and positive.
@@ -789,10 +1009,75 @@ def sparse_pa_nvfp4_decode(
     rows = q.shape[0]
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
+    select = index_score is not None
+    if select:
+        require(
+            topk == 16,
+            "the in-kernel selection picks 16 blocks: topk_idx [Hkv, rows, 16]",
+        )
+        require(
+            index_max_seq_len is not None and index_max_seq_len > 0,
+            "index_max_seq_len (the bound of seq_lens) is required with index_score",
+        )
+        require(
+            index_score.dtype == torch.float32
+            and index_score.dim() == 3
+            and index_score.shape[0] == hkv
+            and index_score.shape[1] >= rows
+            and index_score.stride(2) == 1
+            and index_score.device == q.device
+            and index_score.data_ptr() % 4 == 0,
+            "index_score must be fp32 [Hkv, >= rows, width] with a unit last stride, on q's device",
+        )
+        require(
+            index_score.shape[2] >= -(-index_max_seq_len // BLK)
+            and (hkv - 1) * index_score.stride(0) + rows * index_score.stride(1)
+            < 2**31,
+            "index_score must cover every live block and keep its offsets below 2**31",
+        )
+        require(init_blocks >= 0 and local_blocks >= 0, "pins must be >= 0")
+        # topk_idx is written here: an expanded (stride 0) or otherwise overlapping layout would make
+        # distinct rows / heads store into the same 16 ids (without index_score it is only read, and a
+        # broadcast view is fine)
+        n_rows = topk_idx.shape[1]
+        require(
+            topk_idx.stride(2) == 1
+            and (n_rows <= 1 or topk_idx.stride(1) >= topk)
+            and (
+                hkv <= 1
+                or topk_idx.stride(0) >= (n_rows - 1) * topk_idx.stride(1) + topk
+            ),
+            "with index_score, topk_idx is written and must not overlap: "
+            "unit last stride, row stride >= 16, head stride past a head's rows",
+        )
+    else:
+        require(
+            index_max_seq_len is None and not init_blocks and not local_blocks,
+            "index_max_seq_len and the pins are for index_score",
+        )
+    quant = quant_out is not None
+    if quant:
+        qc, qs = quant_out
+        require(
+            q.shape[2] == D
+            and qc.element_size() == 1
+            and qs.element_size() == 1
+            and qc.is_contiguous()
+            and qs.is_contiguous()
+            and qc.device == q.device
+            and qs.device == q.device
+            and qc.numel() >= q.shape[0] * q.shape[1] * D
+            and qs.numel() >= q.shape[0] * q.shape[1] * (D // 32)
+            and qc.data_ptr() % 8 == 0,
+            "quant_out needs contiguous one-byte codes [rows, Hq * 128] (8-byte aligned) and scales "
+            "[rows, Hq * 4] on q's device",
+        )
+        if out is None:
+            out = q  # placeholder: the fused-quant kernel never touches the bf16 output
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
-        return out
+        return None if quant else out
     num_heads = q.shape[1]
     group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(
@@ -814,6 +1099,9 @@ def sparse_pa_nvfp4_decode(
         splits = 1
         if rows * hkv <= MAX_SPLIT_ROWS:
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
+            if select:
+                # every split repeats the selection, and 4 reproduces amd-kernels' schedule bit for bit
+                splits = min(splits, 4)
     require(1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]")
     require(
         splits == 1 or rows * hkv <= MAX_SPLIT_ROWS,
@@ -869,9 +1157,19 @@ def sparse_pa_nvfp4_decode(
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:
         grid_x = rows
+    pins = bool(init_blocks or local_blocks)
+    if select:
+        score, s_head, s_row, width = (
+            index_score.data_ptr(),
+            index_score.stride(0),
+            index_score.stride(1),
+            index_score.shape[2],
+        )
+    else:  # placeholders the unfused kernel never reads
+        score, s_head, s_row, width = topk_idx.data_ptr(), 0, 0, 0
     with torch.cuda.device(q.device):
         _run_compiled(
-            _get_kernel(splits, topk, xcds, late_v, dev),
+            _get_kernel(splits, topk, xcds, late_v, select, pins, quant, dev),
             q.data_ptr(),
             kv_cache.data_ptr(),
             topk_idx.data_ptr(),
@@ -894,6 +1192,23 @@ def sparse_pa_nvfp4_decode(
             block_table.stride(0),
             kv_cache.stride(0),
             c,
+            score,
+            s_head,
+            s_row,
+            width,
+            init_blocks,
+            local_blocks,
+            qc.data_ptr() if quant else q.data_ptr(),
+            qs.data_ptr() if quant else q.data_ptr(),
             torch.cuda.current_stream(q.device),
         )
-    return out
+    return None if quant else out
+
+
+SELECT_MAX_ROWS = 256  # decode rows the in-kernel selection was measured to pay at
+
+
+def decode_select_supported(rows: int, topk: int = 16) -> bool:
+    """Whether ``sparse_pa_nvfp4_decode(index_score=...)`` should replace a selector launch
+    for ``rows`` decode rows: the row counts it was measured to pay at."""
+    return topk == 16 and 1 <= rows <= SELECT_MAX_ROWS

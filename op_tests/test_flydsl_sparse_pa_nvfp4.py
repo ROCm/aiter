@@ -23,10 +23,12 @@ import math
 import sys
 import zlib
 
+import numpy as np
 import pandas as pd
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     unit_scale as _unit_scale,
@@ -34,12 +36,15 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
     MAX_SPLIT_ROWS,
     _split_buffers,
+    decode_select_supported,
     sparse_pa_nvfp4_decode,
     sparse_pa_nvfp4_decode_alloc,
 )
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_prefill import (
     sparse_pa_nvfp4_prefill,
 )
+from aiter.ops.flydsl.topk.topk_per_row_small_k import topk_per_row_small_k
+from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 BLK = 128
@@ -1116,8 +1121,10 @@ def perf_pool(hkv, pages, device="cuda"):
     )
 
 
-@benchmark()
-def test_decode_perf(rows, query_len, hkv, group, ctx):
+def perf_decode_inputs(rows, query_len, hkv, group, ctx):
+    """Synthetic decode inputs of ``rows`` rows (``query_len`` per request) at ``ctx`` keys:
+    the shared pool (+ fp64 K / V of its base pages), a random block table, the per-row kv
+    length and tail block, q, the block count and the generator."""
     pool, kd, vd = perf_pool(hkv, max(8192, 16 * rows * 2))
     g = torch.Generator(device="cuda").manual_seed(1)
     reqs = rows // query_len
@@ -1130,6 +1137,12 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
         [torch.arange(ctx - query_len + 1, ctx + 1, device="cuda") for _ in range(reqs)]
     )
     sb = (kv - 1) // BLK
+    q = torch.randn(rows, hkv * group, D, generator=g, device="cuda").bfloat16()
+    return pool, kd, vd, bt, seq, kv, sb, q, nblk, g
+
+
+def perf_decode_topk(hkv, rows, nblk, sb, g):
+    """Random top-k ids per row (the first 15 random live blocks, the tail block last)."""
     sc = torch.rand(hkv, rows, nblk, generator=g, device="cuda")
     sc = torch.where(
         torch.arange(nblk, device="cuda") < sb[None, :, None],
@@ -1140,7 +1153,15 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     v, i = sc.topk(TOPK - 1, dim=-1)
     topk[..., : TOPK - 1] = torch.where(v >= 0, i.int(), torch.full_like(i.int(), -1))
     topk[..., TOPK - 1] = sb.int()[None, :]
-    q = torch.randn(rows, hkv * group, D, generator=g, device="cuda").bfloat16()
+    return topk
+
+
+@benchmark()
+def test_decode_perf(rows, query_len, hkv, group, ctx):
+    pool, kd, vd, bt, seq, kv, sb, q, nblk, g = perf_decode_inputs(
+        rows, query_len, hkv, group, ctx
+    )
+    topk = perf_decode_topk(hkv, rows, nblk, sb, g)
     out = torch.empty_like(q)
     ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
     _, us = run_perftest(
@@ -1251,6 +1272,531 @@ def test_prefill_perf(q_len, hkv, group, ctx):
     }
 
 
+# ---------------------------------------------------------------------------
+# in-kernel index top-16 selection (sparse_pa_nvfp4_decode(index_score=...))
+# (previously a standalone decode-select op_test, consolidated here)
+#
+# Checks, against a torch reference of the selection contract and against the
+# unfused chain (the same kernel fed the reference ids):
+#   * the stored topk_idx equals the reference selection (descending score, ties
+#     to the larger block, NaN above +inf, init_blocks / local_blocks pins, -1
+#     past the live count);
+#   * the attention output is bit-identical to the unfused kernel on those ids.
+# Rows cover the window path (<= 1792 live blocks), the window loop (> 1792) and
+# the exact path (fewer than 16 live blocks, constant / heavily tied rows).
+# ---------------------------------------------------------------------------
+INIT_PIN, LOCAL_PIN = 1e30, 1e29
+
+
+def order_keys(v):
+    """int32 order keys of fp32 ``v`` (numpy): the float's bits with negatives' magnitude bits
+    flipped (so -0.0 sits one step below 0.0), NaN on top."""
+    bits = v.astype(np.float32).view(np.int32)
+    key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    return np.where(np.isnan(v), np.int32(2**31 - 1), key)
+
+
+def reference_ids(scores, live, init_blocks, local_blocks):
+    """[rows, 16] ids of ``scores`` [rows, width] (fp32 cpu), ``live`` blocks per row."""
+    rows = scores.shape[0]
+    out = torch.full((rows, TOPK), -1, dtype=torch.int32)
+    for r in range(rows):
+        n = int(live[r])
+        if n == 0:
+            continue
+        v = scores[r, :n].numpy().astype(np.float32).copy()
+        col = np.arange(n)
+        if init_blocks or local_blocks:
+            v[col < init_blocks] = np.float32(INIT_PIN)
+            v[col >= max(0, n - local_blocks)] = np.float32(LOCAL_PIN)
+        key = order_keys(v).astype(np.int64)
+        sel = np.lexsort((-col, -key))[:TOPK]  # key descending, ties to the larger id
+        out[r, : len(sel)] = torch.from_numpy(sel.astype(np.int32))
+    return out
+
+
+def make_scores(rows, width, live, kind, seed):
+    g = torch.Generator().manual_seed(seed)
+    s = torch.randn(rows, width, generator=g)
+    if kind == "ties":  # many equal scores, including at the 16th place
+        s = (s * 2).round() / 2
+    elif kind == "const":
+        s = torch.zeros(rows, width)
+    elif kind == "special":  # +-inf, NaN, +-0 among live blocks
+        for r in range(rows):
+            n = int(live[r])
+            for j, val in zip(
+                torch.randint(0, max(n, 1), (6,), generator=g).tolist(),
+                [float("inf"), float("-inf"), float("nan"), 0.0, -0.0, float("nan")],
+            ):
+                if j < n:
+                    s[r, j] = val
+    elif (
+        kind == "rising"
+    ):  # scores rise toward the row's end (more windows hold candidates)
+        s = s * 0.1 + torch.arange(width).float() / 64
+    # past the live blocks the scorer writes nothing: leave garbage the kernel must ignore
+    for r in range(rows):
+        s[r, int(live[r]) :] = float("nan") if r % 2 else 1e38
+    return s
+
+
+def run_select_case(
+    name, seq_lens, ql, width, kind, init_blocks=0, local_blocks=0, splits=4, xcds=None
+):
+    c = make_case(seq_lens, [ql] * len(seq_lens), 1, 16, seed=len(name))
+    rows = c["q"].shape[0]
+    live = ((c["row_kv"] + BLK - 1) // BLK).cpu()
+    scores = make_scores(rows, width, live, kind, seed=rows + width)
+    ref = reference_ids(scores, live, init_blocks, local_blocks)
+    topk = torch.full((1, rows, TOPK), -7, dtype=torch.int32, device="cuda")
+    out = torch.zeros_like(c["q"])
+    sparse_pa_nvfp4_decode(
+        c["q"], c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, out,
+        c["k_scale"], c["v_scale"], query_len=ql, splits=splits, xcds=xcds,
+        index_score=scores.cuda().view(1, rows, width),
+        index_max_seq_len=max(seq_lens), init_blocks=init_blocks, local_blocks=local_blocks,
+    )  # fmt: skip
+    ref_out = torch.zeros_like(c["q"])
+    sparse_pa_nvfp4_decode(
+        c["q"], c["cache"], ref.cuda().view(1, rows, TOPK), c["bt"], c["seq_lens"], SM_SCALE,
+        ref_out, c["k_scale"], c["v_scale"], query_len=ql, splits=splits, xcds=xcds,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    ids_ok = torch.equal(topk.cpu()[0], ref)
+    out_ok = torch.equal(out, ref_out)
+    print(
+        f"{'PASS' if ids_ok and out_ok else 'FAIL'}  {name:28s} rows={rows:3d} width={width:5d} "
+        f"splits={splits} xcds={xcds} ids={'ok' if ids_ok else 'MISMATCH'} out={'ok' if out_ok else 'MISMATCH'}"
+    )
+    if not ids_ok:
+        bad = (topk.cpu()[0] != ref).any(1).nonzero().flatten()[:3].tolist()
+        for r in bad:
+            print(
+                "   row",
+                r,
+                "live",
+                int(live[r]),
+                "got",
+                topk.cpu()[0, r].tolist(),
+                "ref",
+                ref[r].tolist(),
+            )
+    return ids_ok and out_ok
+
+
+def check_overlap_rejected():
+    """topk_idx is written when index_score is given: an expanded / overlapping layout is refused,
+    while the same broadcast view stays valid for the read-only call (no index_score).
+    """
+    seq_lens, ql, width = [1000, 700], 1, 64
+    c = make_case(seq_lens, [ql] * 2, 1, 16, seed=3)
+    rows = c["q"].shape[0]
+    # index_score heads must equal topk_idx heads (hkv), so each case pairs the writable
+    # topk_idx with a matching index_score; it must then be refused by the overlap guard
+    # itself (not by the earlier head-count check), so we assert the overlap error.
+    scores1 = torch.randn(1, rows, width, device="cuda")
+    scores2 = torch.randn(2, rows, width, device="cuda")
+    call = lambda topk, score: sparse_pa_nvfp4_decode(
+        c["q"], c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None,
+        c["k_scale"], c["v_scale"], query_len=ql, splits=1,
+        index_score=score, index_max_seq_len=max(seq_lens),
+    )  # fmt: skip
+    ids = torch.zeros(1, 1, TOPK, dtype=torch.int32, device="cuda")
+    heads = torch.zeros(1, rows, TOPK, dtype=torch.int32, device="cuda")
+    ok = True
+    for name, topk, score in (
+        ("rows expanded", ids.expand(1, rows, TOPK), scores1),
+        ("heads expanded", heads.expand(2, rows, TOPK), scores2),
+    ):  # fmt: skip
+        try:
+            call(topk, score)
+            refused = False
+        except ValueError as e:
+            refused = "must not overlap" in str(e)
+        print(f"{'PASS' if refused else 'FAIL'}  overlap refused: {name}")
+        ok &= refused
+    return ok
+
+
+@benchmark()
+def test_select_perf(rows, query_len, ctx, kind, init_blocks=1, local_blocks=2):
+    """One decode step of ``rows`` rows (``query_len`` per request) at ``ctx`` keys, one kv head
+    of 16 q heads, scores of ``kind``: the attention kernel selecting in its own prologue
+    (``fused``) against the scorer -> ``topk_per_row_small_k`` -> attention chain (``unfused``;
+    the scorer is not timed: both start from the same score rows). Both must store the
+    reference ids and give the attention output the reference ids give."""
+    hkv, group = 1, 16
+    pool, _, _, bt, seq, kv, _, q, nblk, _ = perf_decode_inputs(
+        rows, query_len, hkv, group, ctx
+    )
+    width = nblk + 8
+    live = ((kv + BLK - 1) // BLK).cpu()
+    scores = make_scores(rows, width, live, kind, seed=rows + ctx).cuda()
+    ref_ids = reference_ids(scores.cpu(), live, init_blocks, local_blocks).cuda()
+    ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
+    live_dev = live.int().cuda()
+    ids = {n: torch.empty(rows, TOPK, dtype=torch.int32, device="cuda") for n in "fu"}
+    outs = {n: torch.empty_like(q) for n in "fu"}
+
+    def attend(topk, out):
+        sparse_pa_nvfp4_decode(
+            q, pool, topk, bt, seq, SM_SCALE, out, ks, vs, query_len=query_len
+        )
+
+    def fused():
+        sparse_pa_nvfp4_decode(
+            q, pool, ids["f"].view(1, rows, TOPK), bt, seq, SM_SCALE, outs["f"], ks, vs,
+            query_len=query_len, index_score=scores.view(1, rows, width),
+            index_max_seq_len=ctx, init_blocks=init_blocks, local_blocks=local_blocks,
+        )  # fmt: skip
+        return outs["f"], ids["f"]
+
+    def unfused():
+        topk_per_row_small_k(
+            scores, live_dev, ids["u"], TOPK, init_blocks, local_blocks
+        )
+        attend(ids["u"].view(1, rows, TOPK), outs["u"])
+        return outs["u"], ids["u"]
+
+    ref_out = torch.empty_like(q)
+    attend(
+        ref_ids.view(1, rows, TOPK), ref_out
+    )  # the unfused kernel on the reference ids
+    # roofline numerators: the keys the reference ids attend to (every block is full except the
+    # ones holding a row's last key), their pages, the score rows read, and the output written
+    pos = ref_ids.long() * BLK
+    keys = int((kv[:, None] - pos).clamp(0, BLK)[ref_ids >= 0].sum().item())
+    nbytes = (
+        int((ref_ids >= 0).sum().item()) * 2 * PAGE_B
+        + int(live.sum().item()) * 4
+        + 2 * q.numel() * q.element_size()
+    )
+    flops = 4 * group * 128 * keys
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in {"fused": fused, "unfused": unfused}.items():
+        (out, idx), us = run_perftest(fn, num_iters=20, num_warmup=3)
+        exact = torch.equal(idx, ref_ids)
+        if name == "fused":
+            assert exact, "fused: stored ids differ from the reference"
+        else:
+            # topk_per_row_small_k does not break ties at the 16th place toward the larger block
+            # (the in-kernel selection does), so the chain must pick the same scores, not
+            # necessarily the same blocks
+            got = scores.gather(1, idx.long()).sort(dim=1).values
+            want = scores.gather(1, ref_ids.long()).sort(dim=1).values
+            assert torch.equal(got, want), "unfused: selected scores differ"
+        ret[f"{name} ids exact"] = exact
+        err = 0.0
+        if exact:  # the output on the same blocks as the reference ids
+            err = checkAllclose(
+                ref_out.to(torch.float32), out.to(torch.float32), rtol=1e-2, atol=1e-2,
+                msg=f"{name}: attention output on the reference ids",
+            )  # fmt: skip
+            # (not bit-exact here: the selecting kernel caps splits at 4 and the default
+            # split count of the other two can be higher, which reorders the fp32 sums; the
+            # main sweep above checks bit-equality at equal splits)
+            assert err == 0, f"{name}: {err:.2%} of the output differs"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def select_main(argv=None):
+    parser = argparse.ArgumentParser(description="in-kernel top-16 selection tests")
+    parser.add_argument("-r", "--rows", type=int, nargs="*", default=[8, 64, 256])
+    parser.add_argument(
+        "-c", "--ctx", type=int, nargs="*", default=[32768, 175000, 300000]
+    )
+    parser.add_argument("-k", "--kind", nargs="*", default=["random", "ties"])
+    args = parser.parse_args(argv)
+    if get_gfx_runtime() != "gfx950":
+        print("SKIP: gfx950 only")
+        return 0
+    ok = check_overlap_rejected()
+    # (name, seq_lens, query_len, width)
+    shapes = [
+        ("short_ctx", [1, 100, 1500, 2047, 2048, 2049], 1, 64),
+        ("k7_32K", [32768, 20000], 8, 256),
+        ("k7_175K", [175000, 90001, 4097], 8, 2048),
+        ("window_edge", [229376 - 5, 229376, 229376 + 3], 1, 2048),
+        ("loop_300K", [300000, 100000], 4, 4096),
+    ]
+    for name, lens, ql, width in shapes:
+        for kind in ("random", "ties", "const", "special", "rising"):
+            ok &= run_select_case(f"{name}/{kind}", lens, ql, width, kind)
+    for init, local in ((1, 2), (0, 1), (3, 0)):
+        ok &= run_select_case(
+            f"k7_175K/pins{init},{local}", [175000, 90001], 8, 2048, "ties", init, local
+        )
+    for splits, xcds in ((1, None), (2, 8), (4, 8), (8, 8)):
+        ok &= run_select_case(
+            f"k7_175K/s{splits}",
+            [175000, 120000, 33000],
+            8,
+            2048,
+            "random",
+            splits=splits,
+            xcds=xcds,
+        )
+    assert decode_select_supported(8) and not decode_select_supported(512)
+    # 300K rows (width 2352 > one 1792-block window) take the windowed loop; ties put equal scores
+    # at the 16th place. A constant row is left out: it is the documented slow case (see the PR).
+    perf = [
+        test_select_perf(rows, 8, ctx, kind)
+        for rows, ctx, kind in itertools.product(args.rows, args.ctx, args.kind)
+    ]
+    df = pd.DataFrame(perf)
+    aiter.logger.info(
+        "in-kernel selection vs scorer -> small_k -> attention (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    print("ALL PASS" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 o_proj input epilogue (sparse_pa_nvfp4_decode(quant_out=...))
+# (previously a standalone decode-quant op_test, consolidated here)
+#
+# The codes and E8M0 scales must be byte-identical to quantizing the bf16 output
+# of the same kernel (group 32, E8M0 = ceil(amax / 448) exponent, amax floored at
+# 1e-10, E4M3 round-to-nearest-even, clamp +-448: the rule of ATOM's
+# quantize_fp8), for every split count, with and without the in-kernel index
+# selection, at the decode row counts 8..256, with 16 and with 8 query heads per
+# kv head.
+# ---------------------------------------------------------------------------
+def reference_quant(x):
+    """[rows, N] bf16 -> (e4m3 codes [rows, N], e8m0 bytes [rows, N // 32])."""
+    rows, n = x.shape
+    v = x.float().view(rows, n // 32, 32)
+    amax = v.abs().amax(-1).clamp_min(1e-10)
+    bits = (
+        amax * torch.tensor(1.0 / 448.0, dtype=torch.float32, device=x.device)
+    ).view(torch.int32)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    rcp = (((254 - code).clamp_min(0)) << 23).to(torch.int32).view(torch.float32)
+    q = (v * rcp[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q.view(rows, n), code.to(torch.uint8)
+
+
+def run_quant_case(name, seq_lens, ql, splits, select, scale_up=1.0, hkv=1, group=16):
+    c = make_case(seq_lens, [ql] * len(seq_lens), hkv, group, seed=len(name) + splits)
+    rows = c["q"].shape[0]
+    q = c["q"]
+    # scale_up multiplies the attention output (through the post-cache v_scale), so the quantizer sees
+    # tiny / large magnitudes; scaling q would change the softmax instead
+    v_scale = c["v_scale"] * scale_up
+    h = q.shape[1]
+    kw = {"query_len": ql, "splits": splits}
+    topk = c["topk"]
+    if (
+        select
+    ):  # the in-kernel top-16 selection (index_score=): same kernel, quant epilogue behind it
+        width = max(seq_lens) // 128 + 8
+        scores = torch.randn(hkv, rows, width, device=q.device, dtype=torch.float32)
+        kw.update(
+            index_score=scores,
+            index_max_seq_len=max(seq_lens),
+            init_blocks=1,
+            local_blocks=2,
+        )
+        topk = torch.full((hkv, rows, 16), -1, dtype=torch.int32, device=q.device)
+    out = torch.zeros_like(q)
+    sparse_pa_nvfp4_decode(
+        q,
+        c["cache"],
+        topk,
+        c["bt"],
+        c["seq_lens"],
+        SM_SCALE,
+        out,
+        c["k_scale"],
+        v_scale,
+        **kw,
+    )
+    codes = torch.full((rows, h * 128), 0x55, dtype=torch.uint8, device=q.device)
+    scales = torch.full((rows, h * 4), 0xAA, dtype=torch.uint8, device=q.device)
+    r = sparse_pa_nvfp4_decode(
+        q, c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None, c["k_scale"], v_scale,
+        quant_out=(codes, scales), **kw,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    ref_c, ref_s = reference_quant(out.view(rows, -1))
+    ok_c = torch.equal(
+        codes.view(torch.float8_e4m3fn).view(torch.uint8), ref_c.view(torch.uint8)
+    )
+    ok_s = torch.equal(scales, ref_s)
+    ok = r is None and ok_c and ok_s
+    print(
+        f"{'PASS' if ok else 'FAIL'}  {name:26s} rows={rows:3d} group={group} splits={splits} "
+        f"codes={'ok' if ok_c else 'MISMATCH'} scales={'ok' if ok_s else 'MISMATCH'}"
+    )
+    if not ok_c:
+        bad = (codes.view(torch.uint8) != ref_c.view(torch.uint8)).sum().item()
+        print("   mismatching code bytes:", bad)
+    return ok
+
+
+@benchmark()
+def test_quant_perf(rows, query_len, ctx, hkv, group):
+    """One decode step of ``rows`` rows at ``ctx`` keys with random top-16 ids: the attention
+    writing the MXFP8 o_proj input itself (``fused``, ``quant_out``) against the attention writing
+    bf16 followed by the aiter HIP MXFP8 quantize (``unfused``: ``per_1x32_mx_quant_hip``, e8m0
+    scales). The reference is the torch rule on the bf16 output; the codes and e8m0 bytes of both
+    candidates must match it (compared as fp32 values of the codes and of the scale bytes).
+    """
+    pool, _, _, bt, seq, kv, sb, q, nblk, g = perf_decode_inputs(
+        rows, query_len, hkv, group, ctx
+    )
+    topk = perf_decode_topk(hkv, rows, nblk, sb, g)
+    h = hkv * group
+    ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
+    out = torch.empty_like(q)
+    codes = torch.empty(rows, h * 128, dtype=torch.uint8, device="cuda")
+    scales = torch.empty(rows, h * 4, dtype=torch.uint8, device="cuda")
+
+    def attend(o):
+        sparse_pa_nvfp4_decode(
+            q, pool, topk, bt, seq, SM_SCALE, o, ks, vs, query_len=query_len
+        )
+
+    def fused():
+        sparse_pa_nvfp4_decode(
+            q, pool, topk, bt, seq, SM_SCALE, None, ks, vs, query_len=query_len,
+            quant_out=(codes, scales),
+        )  # fmt: skip
+        return codes.view(torch.float8_e4m3fn), scales
+
+    def unfused():
+        attend(out)
+        c, sc = per_1x32_mx_quant_hip(
+            out.view(rows, h * 128), quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        return c.view(torch.float8_e4m3fn), sc.view(torch.uint8)
+
+    attend(out)
+    ref_c, ref_s = reference_quant(out.view(rows, -1))
+    # roofline numerators: keys read through the ids (the tail block is partial), the pages, the
+    # bf16 q read and the MXFP8 output (codes + one scale byte per 32 values) written
+    keys = int(((topk >= 0).sum() * 128 - ((sb + 1) * 128 - kv).sum() * hkv).item())
+    nbytes = (
+        int((topk >= 0).sum().item()) * 2 * PAGE_B
+        + q.numel() * q.element_size()
+        + codes.numel()
+        + scales.numel()
+    )
+    flops = 4 * group * 128 * keys
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in {"fused": fused, "unfused": unfused}.items():
+        (c, sc), us = run_perftest(fn, num_iters=20, num_warmup=3)
+        err = checkAllclose(
+            ref_c.to(torch.float32), c.reshape(rows, -1).to(torch.float32),
+            rtol=0, atol=0, msg=f"{name}: e4m3 codes",
+        )  # fmt: skip
+        err_s = checkAllclose(
+            ref_s.to(torch.float32), sc.reshape(rows, -1).to(torch.float32),
+            rtol=0, atol=0, msg=f"{name}: e8m0 scales",
+        )  # fmt: skip
+        assert err == 0 and err_s == 0, f"{name}: codes {err:.2%} scales {err_s:.2%}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err + err_s
+    return ret
+
+
+def quant_main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="MXFP8 o_proj output (quant_out) tests"
+    )
+    parser.add_argument("-r", "--rows", type=int, nargs="*", default=[8, 64, 256])
+    parser.add_argument("-c", "--ctx", type=int, nargs="*", default=[32768, 175000])
+    parser.add_argument(
+        "-g", "--heads", type=dtypes.str2tuple, nargs="*", default=[(1, 16), (2, 8)],
+        help="(kv heads, q heads per kv head)",
+    )  # fmt: skip
+    args = parser.parse_args(argv)
+    if get_gfx_runtime() != "gfx950":
+        print("SKIP: gfx950 only")
+        return 0
+    ok = True
+    for splits in (1, 2, 4):
+        for name, lens, ql in (
+            ("g1_k7", [175000], 8),
+            ("g2_k7", [175000, 90001], 8),
+            ("g7_k7", [175000, 90001, 4097, 32768, 20000, 100000, 60000], 8),
+            ("g16_k7", [100000 + 777 * i for i in range(16)], 8),
+            ("g32_k7", [60000 + 1111 * i for i in range(32)], 8),
+            ("short", [1, 100, 1500, 2047, 2048, 2049, 129, 130], 1),
+        ):
+            ok &= run_quant_case(f"{name}", lens, ql, splits, False)
+    for splits in (1, 4):
+        ok &= run_quant_case(
+            "g7_k7/select",
+            [175000, 90001, 4097, 32768, 20000, 100000, 60000],
+            8,
+            splits,
+            True,
+        )
+        ok &= run_quant_case(
+            "g16_k7/select", [100000 + 777 * i for i in range(16)], 8, splits, True
+        )
+    for hkv in (2, 4):  # more than one kv head per rank (head = kv head * 16 + lane)
+        ok &= run_quant_case(
+            f"g3_k7/hkv{hkv}", [175000, 90001, 4097], 8, 4, False, hkv=hkv
+        )
+    for sc in (1e-3, 30.0):  # tiny / large magnitudes: scales across the e8m0 range
+        ok &= run_quant_case(
+            f"g7_k7/scale{sc}",
+            [175000, 90001, 4097, 32768, 20000, 100000, 60000],
+            8,
+            4,
+            False,
+            sc,
+        )
+    # group 8 (8 query heads per kv head): only half of a wave's lanes hold a head of the group,
+    # so the masked head stores and the scale stores are on a different lane map than group 16
+    for hkv in (1, 2, 4):
+        for splits in (1, 4):
+            ok &= run_quant_case(
+                f"g7_k7/group8/hkv{hkv}",
+                [175000, 90001, 4097, 32768, 20000, 100000, 60000],
+                8,
+                splits,
+                False,
+                hkv=hkv,
+                group=8,
+            )
+    ok &= run_quant_case("short/group8/hkv2", [1, 100, 1500, 2047, 2048, 2049, 129, 130], 1, 1, False, hkv=2, group=8)  # fmt: skip
+    for splits in (1, 4):
+        ok &= run_quant_case(
+            "g7_k7/group8/select",
+            [175000, 90001, 4097, 32768, 20000, 100000, 60000],
+            8,
+            splits,
+            True,
+            hkv=2,
+            group=8,
+        )
+    ok &= run_quant_case("g7_k7/group8/scale30", [175000, 90001, 4097, 32768, 20000, 100000, 60000], 8, 4, False, 30.0, hkv=2, group=8)  # fmt: skip
+    perf = [
+        test_quant_perf(rows, 8, ctx, hkv, group)
+        for rows, ctx, (hkv, group) in itertools.product(
+            args.rows, args.ctx, args.heads
+        )
+    ]
+    df = pd.DataFrame(perf)
+    aiter.logger.info(
+        "fused quant_out vs attention + MXFP8 quantize (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    print("ALL PASS" if ok else "FAILED")
+    return 0 if ok else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -1317,6 +1863,10 @@ def main(argv=None):
         df = pd.DataFrame(perf)
         aiter.logger.info("prefill perf:\n%s", df.to_markdown(index=False))
         failed += int((~(df["err"] <= REL_L2_TOL)).sum())
+    # The merged-in suites (each runs its own correctness cases and its perf table,
+    # exactly as the former standalone files did on their own __main__).
+    failed += select_main([])
+    failed += quant_main([])
     print("FAILED" if failed else "PASSED", failed)
     return 1 if failed else 0
 

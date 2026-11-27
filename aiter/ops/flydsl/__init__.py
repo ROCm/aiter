@@ -264,6 +264,10 @@ _LAZY_IMPORTS = {
         ".kernels.sparse_pa_nvfp4_decode",
         "sparse_pa_nvfp4_decode_alloc",
     ),
+    "decode_select_supported": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "decode_select_supported",
+    ),
     "sparse_pa_nvfp4_prefill": (
         ".kernels.sparse_pa_nvfp4_prefill",
         "sparse_pa_nvfp4_prefill",
@@ -291,6 +295,7 @@ __all__ = [
     "dcp_lse_combine",
     "dcp_quant_query_gather",
     "dcp_query_gather",
+    "decode_select_supported",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
