@@ -177,12 +177,12 @@ SWITCH_RATIO_MAX = 1.10
 
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
-# Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: one
-# LDS-staged tile and four accumulator tiles. One 16-column WMMA tile per warp
-# (t16x64 nw4) keeps the LDS-staged quant; an even count (t32x64 nw2, t128x128
-# nw2, t64x32 nw1, t160x128 nw2) quantizes from the accumulators. t64x32 nw1
-# has one quant group per tile row; t160x128 has more rows than threads, so
-# its scale rows take a second pass.
+# Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: two
+# LDS-staged tiles and seven accumulator tiles. One 16-column WMMA tile per
+# warp (t16x64 nw4, t32x32 nw2) keeps the LDS-staged quant; an even count
+# quantizes from the accumulators. t64x32 nw1 has one quant group per tile
+# row; t160x128 has more rows than threads, so its scale rows take a second
+# pass.
 FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
