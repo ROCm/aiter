@@ -14,9 +14,11 @@ Each K tile of A, W and both e8m0 scales moves global -> LDS by TDM, then LDS
   per (M tile, K tile) so each K tile is one contiguous TDM run (see
   preshuffle_act_scale; production's m16k4 layout serves the same purpose),
 * m_warp x n_warp waves per workgroup (each owns one sub-tile of the output,
-  every wave issues its share of each of the four TDM copies), num_buffers LDS stages with
-  TDM running num_buffers-1 K tiles ahead of the WMMAs, no split-K, no
-  clusters / multicast; only A's LDS rows are padded (16 B, bank conflicts),
+  every wave issues its share of each of the four TDM copies), num_buffers LDS stages
+  (production's choice of pipeline: with tile_m <= 32 or two stages all of them are
+  in flight and a stage is refilled as soon as its K tile is read, otherwise TDM runs
+  num_buffers-1 K tiles ahead of the WMMAs), no split-K, no clusters / multicast;
+  only A's LDS rows are padded (16 B, bank conflicts),
 * one V_WMMA_SCALE per (16-row M, 32/16-row N) block, two register slots so
   each K step's WMMAs overlap the next step's LDS reads (across K tiles too),
 * bf16 epilogue staged in LDS and written by TDM (no bias, no activation, no
@@ -138,8 +140,11 @@ def build_naive_grouped_gemm(
     AS_LDS = W_LDS + tile_n * W_TILE_BYTES
     WS_LDS = AS_LDS + tile_m * SC_TILE_BYTES
     STAGE_BYTES = WS_LDS + tile_n * SC_TILE_BYTES
-    # Step 0 of tile kt+1 is read while tile kt still owns its stage: >= 2 stages.
+    # One stage would serialize every TDM load with the WMMAs: >= 2 stages.
     NB = min(max(num_buffers, 2), K_TILES)
+    # Production's rule: refilling a stage right after its tile is read wins for
+    # decode tiles and two stages; deeper prefill pipelines issue at the tile top.
+    REFILL_AFTER_READ = tile_m <= 32 or NB <= 2
     # bf16 C tile, reusing the stages; +16 columns spread the ds_store_b128 banks.
     C_PITCH = tile_n + 16
     LDS_BYTES = max(NB * STAGE_BYTES, tile_m * C_PITCH * 2)
@@ -340,18 +345,24 @@ def build_naive_grouped_gemm(
                         scale_b=a_s[wm].load()[0],
                     )
 
-        def compute(kt, next_newer):
+        def compute(kt, refill, next_newer):
             """Tile kt; step ks's WMMAs run while step ks+1 is read from LDS.
 
-            The last step reads step 0 of tile kt+1 instead, after waiting for that
-            tile (`next_newer` = tiles still allowed in flight behind it, None if kt
-            is the last tile); that barrier also releases tile kt's stage.
+            Once every wave has read tile kt, `refill` loads tile kt+NB into its
+            stage. The last step then reads step 0 of tile kt+1, after waiting for
+            that tile (`next_newer` = tiles still allowed in flight behind it, None
+            if kt is the last tile).
             """
             for ks in range_constexpr(K_STEPS):
+                last = ks + 1 == K_STEPS
                 mma_step(slots[ks % 2])
-                if const_expr(ks + 1 < K_STEPS):
+                if const_expr(not last):
                     load_step(slots[(ks + 1) % 2], kt % NB, ks + 1)
-                elif const_expr(next_newer is not None):
+                if const_expr(last and refill):
+                    fx.rocdl.s_wait_dscnt(0)  # TDM does not wait for our LDS reads
+                    fx.barrier()  # ... nor for the other waves'
+                    issue(kt + NB, kt % NB)
+                if const_expr(last and next_newer is not None):
                     wait_oldest(next_newer)
                     load_step(slots[0], (kt + 1) % NB, 0)
 
@@ -360,18 +371,28 @@ def build_naive_grouped_gemm(
                 acc[wm][wn].store(Vec.filled(ACC_LEN, 0.0, fx.Float32))
 
         if has_work:
-            # ---- 4. main loop: TDM runs NB-1 K tiles ahead of the WMMAs ------
-            for t in range_constexpr(max(NB - 1, 1)):  # prologue (NB == 1: K_TILES == 1)
-                issue(t, t)
-            wait_oldest(max(NB - 2, 0))
-            load_step(slots[0], 0, 0)
-            for kt in range(K_TILES - (NB - 1)):  # steady state
-                if const_expr(NB > 1):
+            if const_expr(REFILL_AFTER_READ):
+                # ---- 4. main loop: all NB stages in flight, refilled once read --
+                for t in range_constexpr(NB):  # prologue: fill every stage
+                    issue(t, t)
+                wait_oldest(NB - 1)
+                load_step(slots[0], 0, 0)
+                for kt in range(K_TILES - NB):  # steady state
+                    compute(fx.Int32(kt), True, NB - 1)
+                for j in range_constexpr(NB):  # drain: the last NB tiles
+                    compute(K_TILES - NB + j, False, NB - 2 - j if j < NB - 1 else None)
+            else:
+                # ---- 4. main loop: TDM runs NB-1 K tiles ahead of the WMMAs (NB >= 3)
+                for t in range_constexpr(NB - 1):  # prologue
+                    issue(t, t)
+                wait_oldest(NB - 2)
+                load_step(slots[0], 0, 0)
+                for kt in range(K_TILES - (NB - 1)):  # steady state
                     nxt = fx.Int32(kt) + (NB - 1)
                     issue(nxt, nxt % NB)  # into the stage released last iteration
-                compute(fx.Int32(kt), NB - 2 if NB > 1 else None)
-            for j in range_constexpr(NB - 1):  # drain: the last NB-1 tiles
-                compute(K_TILES - (NB - 1) + j, NB - 3 - j if j < NB - 2 else None)
+                    compute(fx.Int32(kt), False, NB - 2)
+                for j in range_constexpr(NB - 1):  # drain: the last NB-1 tiles
+                    compute(K_TILES - (NB - 1) + j, False, NB - 3 - j if j < NB - 2 else None)
 
             # ---- 5. epilogue: fp32 -> bf16 C tile in LDS, then one TDM store --
             # Accumulator layout: lane l holds output row l % 16; value v holds
