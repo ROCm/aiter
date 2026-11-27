@@ -1,0 +1,22 @@
+{
+    "NUM_WARPS": 8,
+    "NBUF": 4,
+    "CAPW": 504,
+    "TGT_NUM": 24,
+    "RMIN": 64,
+    "SLACK": 256,
+    "CLASSIFY": {
+        "MAX_WIDTH": 4608,
+        "VPT": 8,
+        "MIN_WARPS": 4,
+        "MAX_WARPS": 8,
+        "CAP": 4096,
+        "SAMPLE_MIN_TILES": 4,
+        "SAMPLE_BLOCKS": 8,
+        "HI_NUM": 12,
+        "LO_NUM": 22,
+        "FEW_MAX_LEN": 12288,
+        "FEW_MAX_WIDTH": 12288,
+        "RETRY_MAX_LEN": 16384
+    }
+}
