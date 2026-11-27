@@ -1576,6 +1576,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_m3_tp1_qknorm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/m3_tp1_qknorm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/qknorm_v3.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_qk_norm_rope_cache_quant_shuffle": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_rope_cache_quant_pybind.cu'",

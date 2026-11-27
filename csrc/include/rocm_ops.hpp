@@ -2169,6 +2169,28 @@ namespace py = pybind11;
           py::arg("eps"), \
           py::arg("stream"))
 
+#define M3_TP1_QKNORM_PYBIND              \
+    m.def("m3_tp1_qknorm_v3",             \
+          &aiter::m3_tp1_qknorm_v3,       \
+          py::arg("qkv"),                 \
+          py::arg("q_out"),               \
+          py::arg("index_q_out"),         \
+          py::arg("q_norm_weight"),       \
+          py::arg("k_norm_weight"),       \
+          py::arg("index_q_norm_weight"), \
+          py::arg("index_k_norm_weight"), \
+          py::arg("cos_sin_cache"),       \
+          py::arg("positions"),           \
+          py::arg("slot_mapping"),        \
+          py::arg("index_slot_mapping"),  \
+          py::arg("k_cache"),             \
+          py::arg("v_cache"),             \
+          py::arg("index_cache"),         \
+          py::arg("k_scale"),             \
+          py::arg("v_scale"),             \
+          py::arg("eps"),                 \
+          py::arg("block_size"))
+
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle,              \
