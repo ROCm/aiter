@@ -299,6 +299,7 @@ def _get_varlen_kernel_gfx11(
     softmax_scale: float | None,
     num_waves: int,
     block_n: int,
+    vt_rows: int,
     head_group: int | None,
     token_strides: tuple[int, int, int],
     return_lse: bool,
@@ -314,9 +315,7 @@ def _get_varlen_kernel_gfx11(
         sm_scale=softmax_scale,
         num_waves=num_waves,
         block_n=block_n,
-        # With RoPE in the loop, 2 keys per V transpose write measured faster
-        # than 4 at 64 keys (see _gfx11_varlen_rope_config).
-        vt_rows=2 if rope is not None else (4 if block_n >= 64 else 2),
+        vt_rows=vt_rows,
         head_group=head_group,
         q_token_stride=token_strides[0],
         k_token_stride=token_strides[1],
@@ -376,33 +375,129 @@ def _gfx11_varlen_config(
     num_heads: int,
     head_dim: int,
     batch: int,
-) -> tuple[int, int, int | None]:
-    """(num_waves, block_n, head_group) for the gfx11 kernel on a varlen call.
+    causal: bool,
+) -> tuple[int, int, int | None, int]:
+    """(num_waves, block_n, head_group, vt_rows) for the gfx11 kernel on a
+    varlen call; ``vt_rows`` is the number of keys per LDS write in the V
+    transpose.
 
-    head_dim up to 64, measured on gfx1151 with a 16-head, head_dim-64 ViT
-    (1-16 images of 208-2880 tokens):
+    Causal (decoder prefill), measured on gfx1151 with 14 / 2 heads at head_dim
+    64, 32 / 8 and 16 / 8 heads at head_dim 128 and 8 / 2 heads at head_dim 256,
+    on single and batched prefills of 256-8192 tokens, query chunks over a 2-4x
+    longer prefix and speculative-decode batches (4-8 queries over 2048-4096
+    keys):
 
-    - query tile (16 rows per wave; 128, 192 or 256 rows): the one that pads
-      the longest sequence the least, ties to the larger tile. 192 rows for
-      batches of 572-952 tokens and 128 rows for single sequences of about
-      800-2200 tokens gained 5-30% over the fixed 256-row tile, which stays
-      best for very short sequences.
-    - KV tile: 64 keys when the call has at most four sequences and the longest
-      has 512 tokens or more (few workgroups, each walking a long KV range:
-      5-15% faster than 32 keys), 32 keys otherwise (more resident workgroups).
+    - 128-row query blocks everywhere: under the mask the blocks of one sequence
+      do very different amounts of work, and smaller blocks balance them. The
+      batched rule's 256 rows lost 5-45% on prefills and about 2x on speculative
+      decode, where a 4-row sequence pads to a whole block.
+    - head_dim up to 64: 64 keys, 2 keys per transpose write.
+    - head_dim up to 128: 32 keys. A chunk of queries over a prefix at least
+      twice as long walks a long KV range per block and takes 64 keys with 8-key
+      transpose writes, in 256-row blocks from 512 queries over 4096+ keys,
+      where 128 rows lost 4-8% (single and batched chunks); a 6144+ token
+      prefill takes the same 256-row tile (2%).
+    - head_dim above 128: 32 keys (64 do not fit the LDS at head_dim 256) with
+      8-key transpose writes, 17-33% faster than 2-key writes.
 
-    Other head dims keep the batched rule.
+    Non-causal, head_dim up to 64, measured on gfx1151 with 16-head and
+    12-head head_dim-64 ViTs on the 863 ``cu_seqlens`` patterns of a recorded
+    vLLM video workload (1-16 images of 144-8160 tokens), weighted by call
+    count. The first rule took the query tile of 128 / 192 / 256 rows that pads
+    the longest sequence least (ties to the larger) and 64 keys with 4-key
+    transpose writes for at most four sequences of 512+ tokens, else 32 keys.
+    Every (rows) x (32 / 64 keys) x (2 / 4 transpose keys) combination was then
+    measured on the patterns under 1280 tokens, and a band changes only where
+    one choice beats the first rule on both head counts without losing on any
+    pattern:
+
+    - 128-row blocks with 2-key writes: 32 keys at 193-511 tokens (9% over
+      the first rule), 64 keys at 640-767 tokens (5-6%) and from 1024 tokens
+      (7% up to 1280, 3-3.5% beyond).
+    - the first rule stays up to 192 tokens, at 512-639 and 768-1023 tokens,
+      and at 256-383 tokens with more than four sequences: there its
+      padding-least tile wins, by up to 23% on 3 x 160 tokens, and the other
+      choices lose on some patterns of one head count.
+
+    Whole workload: 3.6% (16 heads) and 3.1% (12 heads) over the first rule,
+    no pattern slower by more than 2.2%.
+
+    Non-causal head_dim 65-72 (the 16 x 72 ViTs of Qwen3-VL 8B+ and Qwen3.5
+    9B+), same patterns and grid, against the batched rule's 256-row / 32-key
+    tile: the larger K / V tiles favour 192 rows where head_dim 64 took 128.
+    Up to 192 tokens and at 384-511 the padding-least tile with 32 keys (50%
+    and 2%); 193-383 tokens 128 rows / 32 keys (32%); 512-767 tokens with at
+    most four sequences the padding-least of 128 / 192 rows with 64 keys, with
+    more sequences 32 keys below 640 and the batched tile above (10%);
+    768-1023 with at most four sequences the padding-least of 192 / 256 rows
+    with 64 keys, else the batched tile (3%); 1024-1279 the padding-least tile
+    with 64 keys for at most four sequences, else 32 (5%); 192 rows / 64 keys
+    at 1280-1535, and up to 2047 for at most four sequences (6%); from there
+    the padding-least of 192 / 256 rows with 64 keys (3%). All with 2-key
+    writes. Whole workload 3.7%, no pattern slower beyond the 2.3% noise
+    between two runs of the same tile.
+
+    Other non-causal head dims keep the batched rule with 2-key writes.
     """
+    if causal:
+        if head_dim <= 64:
+            return 8, 64, None, 2
+        if head_dim <= 128:
+            chunk = max_seqlen_k >= 2 * max_seqlen_q
+            if max_seqlen_k >= 4096 and (
+                max_seqlen_q >= 6144 or (chunk and max_seqlen_q >= 512)
+            ):
+                return 16, 64, None, 8
+            if chunk:
+                return 8, 64, None, 8
+            return 8, 32, None, 2
+        return 8, 32, None, 8
     if head_dim <= 64:
+        mx = max_seqlen_q
+        if (
+            mx <= 192
+            or 512 <= mx < 640
+            or 768 <= mx < 1024
+            or (256 <= mx < 384 and batch > 4)
+        ):
+            # The first rule: the query tile that pads the longest sequence
+            # least, 64 keys for at most four sequences of 512+ tokens.
+            num_waves = min(
+                (8, 12, 16), key=lambda n: (-(-mx // (16 * n)) * 16 * n, -n)
+            )
+            block_n = 64 if batch <= 4 and mx >= 512 else 32
+            return num_waves, block_n, None, 4 if block_n == 64 else 2
+        if mx < 512:
+            return 8, 32, None, 2
+        return 8, 64, None, 2
+    if head_dim <= 72:
+        mx = max_seqlen_q
+        few = batch <= 4
 
-        def padded_rows(num_waves: int) -> tuple[int, int]:
-            rows = 16 * num_waves
-            return -(-max_seqlen_q // rows) * rows, -num_waves
+        def pad_least(cands: tuple[int, ...]) -> int:
+            return min(cands, key=lambda n: (-(-mx // (16 * n)) * 16 * n, -n))
 
-        num_waves = min((8, 12, 16), key=padded_rows)
-        block_n = 64 if batch <= 4 and max_seqlen_q >= 512 else 32
-        return num_waves, block_n, None
-    return _gfx11_config(arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim)
+        if mx <= 192 or 384 <= mx < 512:
+            return pad_least((8, 12, 16)), 32, None, 2
+        if mx < 384:
+            return 8, 32, None, 2
+        if mx < 768:
+            if few:
+                return pad_least((8, 12)), 64, None, 2
+            if mx < 640:
+                return pad_least((8, 12, 16)), 32, None, 2
+            return 16, 32, None, 2
+        if mx < 1024:
+            return (pad_least((12, 16)), 64, None, 2) if few else (16, 32, None, 2)
+        if mx < 1280:
+            return pad_least((8, 12, 16)), 64 if few else 32, None, 2
+        if mx < 1536 or (mx < 2048 and few):
+            return 12, 64, None, 2
+        return pad_least((12, 16)), 64, None, 2
+    num_waves, block_n, head_group = _gfx11_config(
+        arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim
+    )
+    return num_waves, block_n, head_group, 4 if block_n >= 64 else 2
 
 
 def _gfx11_varlen_rope_config(
@@ -641,8 +736,8 @@ def _flydsl_flash_attn_varlen_gfx11(
     (lse fp32 ``[H, total_q]``, flash-attn's varlen convention)."""
     total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.numel() - 1
-    num_waves, block_n, head_group = _gfx11_varlen_config(
-        arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim, batch
+    num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
+        arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim, batch, causal
     )
     # Switching the current device costs several microseconds; a 208-token ViT
     # image takes 13. Only do it when q lives on another device.
@@ -700,6 +795,7 @@ def _flydsl_flash_attn_varlen_gfx11(
             softmax_scale=softmax_scale,
             num_waves=num_waves,
             block_n=block_n,
+            vt_rows=vt_rows,
             head_group=head_group,
             token_strides=token_strides,
             return_lse=return_lse,
@@ -1492,6 +1588,9 @@ def flydsl_flash_attn_varlen_qkv_rope_fwd(
             softmax_scale=softmax_scale,
             num_waves=num_waves,
             block_n=block_n,
+            # With RoPE in the loop, 2 keys per V transpose write measured
+            # faster than 4 at 64 keys (see _gfx11_varlen_rope_config).
+            vt_rows=2,
             head_group=head_group,
             token_strides=(tok, tok, tok),
             return_lse=False,

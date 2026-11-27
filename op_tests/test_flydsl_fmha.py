@@ -993,23 +993,73 @@ def test_flydsl_fmha_gfx11_varlen_falls_through():
 
 
 def test_flydsl_fmha_gfx11_varlen_config():
-    """The query tile pads the longest sequence least (ties to the larger tile);
-    64 keys per KV tile only for one or two long sequences."""
+    """Non-causal, head_dim 64: 128-row blocks with 2-key transpose writes and
+    32 keys at 193-511 tokens, 64 keys at 640-767 and from 1024; the first
+    rule's padding-least tile elsewhere. Causal: 128-row blocks; keys and
+    transpose width by head_dim, 64 keys for a chunk over a longer prefix, 256
+    rows for long chunks and long prefills."""
     config = flydsl_fmha_kernels._gfx11_varlen_config
-    # ViT (16 heads, head_dim 64): 572 -> 3 x 192 rows; 988 -> 8 x 128 = 4 x 256
-    assert config("gfx1151", 572, 572, 16, 64, 8) == (12, 32, None)
-    assert config("gfx1151", 952, 952, 16, 64, 16) == (12, 32, None)
-    assert config("gfx1151", 988, 988, 16, 64, 8) == (16, 32, None)
-    assert config("gfx1151", 208, 208, 16, 64, 1) == (16, 32, None)
-    assert config("gfx1151", 432, 432, 16, 64, 1) == (16, 32, None)
-    assert config("gfx1151", 2880, 2880, 16, 64, 1) == (12, 64, None)
-    assert config("gfx1151", 2880, 2880, 16, 64, 3) == (12, 64, None)
-    assert config("gfx1151", 2160, 2160, 16, 64, 1) == (8, 64, None)
-    assert config("gfx1151", 840, 840, 16, 64, 1) == (8, 64, None)
-    assert config("gfx1151", 2880, 2880, 16, 64, 5) == (12, 32, None)
+    # ViT (16 heads, head_dim 64), from 1024 tokens and at 640-767: 128 / 64
+    assert config("gfx1151", 2880, 2880, 16, 64, 1, False) == (8, 64, None, 2)
+    assert config("gfx1151", 2880, 2880, 16, 64, 5, False) == (8, 64, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 64, 3, False) == (8, 64, None, 2)
+    assert config("gfx1151", 700, 700, 16, 64, 3, False) == (8, 64, None, 2)
+    # 193-511 tokens: 128 rows / 32 keys, except 256-383 with over four sequences
+    assert config("gfx1151", 208, 208, 16, 64, 1, False) == (8, 32, None, 2)
+    assert config("gfx1151", 224, 224, 16, 64, 6, False) == (8, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 64, 3, False) == (8, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 64, 6, False) == (12, 32, None, 2)
+    assert config("gfx1151", 432, 432, 16, 64, 1, False) == (8, 32, None, 2)
+    # the first rule: 160 -> 1 x 192 rows; 572 -> 3 x 192; 988 -> 4 x 256
+    assert config("gfx1151", 160, 160, 16, 64, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 192, 192, 16, 64, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 572, 572, 16, 64, 3, False) == (12, 64, None, 4)
+    assert config("gfx1151", 572, 572, 16, 64, 8, False) == (12, 32, None, 2)
+    assert config("gfx1151", 952, 952, 16, 64, 16, False) == (12, 32, None, 2)
+    assert config("gfx1151", 988, 988, 16, 64, 8, False) == (16, 32, None, 2)
+    assert config("gfx1151", 924, 924, 16, 64, 3, False) == (12, 64, None, 4)
+    assert config("gfx1151", 840, 840, 16, 64, 1, False) == (8, 64, None, 4)
+    # head_dim 72 ViT: 192 rows where head_dim 64 took 128, 64 keys from 512
+    assert config("gfx1151", 160, 160, 16, 72, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 72, 3, False) == (8, 32, None, 2)
+    assert config("gfx1151", 432, 432, 16, 72, 1, False) == (16, 32, None, 2)
+    assert config("gfx1151", 572, 572, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 572, 572, 16, 72, 8, False) == (12, 32, None, 2)
+    assert config("gfx1151", 700, 700, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 700, 700, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 924, 924, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 924, 924, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 72, 3, False) == (16, 64, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 1100, 1100, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1440, 1440, 16, 72, 6, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1728, 1728, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1728, 1728, 16, 72, 6, False) == (12, 64, None, 2)
+    assert config("gfx1151", 2880, 2880, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 8160, 8160, 16, 72, 3, False) == (16, 64, None, 2)
+    # head_dim 80 is not measured: the batched rule
+    assert config("gfx1151", 1000, 1000, 16, 80, 3, False) == (16, 32, None, 2)
     # larger head dims keep the batched rule
-    assert config("gfx1151", 1000, 1000, 8, 128, 1) == (16, 32, None)
-    assert config("gfx1151", 4096, 4096, 12, 128, 1) == (32, 32, 6)
+    assert config("gfx1151", 1000, 1000, 8, 128, 1, False) == (16, 32, None, 2)
+    assert config("gfx1151", 4096, 4096, 12, 128, 1, False) == (32, 32, 6, 2)
+    # causal, head_dim 64 (Qwen2-0.5B class): one config
+    assert config("gfx1151", 512, 512, 14, 64, 1, True) == (8, 64, None, 2)
+    assert config("gfx1151", 4, 2048, 14, 64, 32, True) == (8, 64, None, 2)
+    # causal, head_dim 128: prefill, speculative decode, short and long chunks
+    assert config("gfx1151", 2048, 2048, 32, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 2048, 2560, 32, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 4096, 4096, 16, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 8192, 8192, 32, 128, 1, True) == (16, 64, None, 8)
+    assert config("gfx1151", 4, 2048, 32, 128, 32, True) == (8, 64, None, 8)
+    assert config("gfx1151", 8, 4096, 32, 128, 8, True) == (8, 64, None, 8)
+    assert config("gfx1151", 512, 2048, 16, 128, 1, True) == (8, 64, None, 8)
+    assert config("gfx1151", 1024, 2048, 16, 128, 3, True) == (8, 64, None, 8)
+    assert config("gfx1151", 512, 4096, 32, 128, 4, True) == (16, 64, None, 8)
+    assert config("gfx1151", 1024, 4096, 32, 128, 1, True) == (16, 64, None, 8)
+    assert config("gfx1151", 2048, 8192, 16, 128, 1, True) == (16, 64, None, 8)
+    # causal, head_dim 256 (Qwen3.5 decoder): 64 keys do not fit the LDS
+    assert config("gfx1151", 1280, 1280, 8, 256, 1, True) == (8, 32, None, 8)
+    assert config("gfx1151", 2048, 8192, 8, 256, 1, True) == (8, 32, None, 8)
 
 
 # gfx11 vision attention from the packed qkv projection, RoPE in the kernel
