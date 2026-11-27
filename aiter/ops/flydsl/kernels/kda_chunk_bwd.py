@@ -2008,6 +2008,7 @@ def compile_dhu_mfma(
     transpose_state: bool,
     varlen: bool = False,
     bv: int = BV,
+    num_xcds: int = 8,
 ):
     """``compile_dhu`` with the per-chunk contractions on 16x16x16 bf16 MFMA.
 
@@ -2017,8 +2018,11 @@ def compile_dhu_mfma(
     each from two products so ``scale`` applies after the dot as in Triton.
     The state itself stays fp32 in registers. ``bv`` (16, 32 or 64) is the
     V-block width per workgroup, a tunable (``AITER_CONFIG_KDA_CHUNK_BWD``).
+    Workgroups are renumbered so the V blocks of one state run on one of the
+    ``num_xcds`` XCDs and share its L2 for their common kg / qg / w / g loads.
     """
     assert bv in (16, 32, 64), bv
+    NV = V // bv
     ldb = bv + 4
     KN = _num(k_dtype)
     VN = _num(v_dtype)
@@ -2055,8 +2059,21 @@ def compile_dhu_mfma(
         T: fx.Int32,
         scale: fx.Float32,
     ):
-        i_v = fx.block_idx.x
-        i_bh = fx.block_idx.y
+        # Dispatch puts linear workgroup p on XCD p % num_xcds; remap so each
+        # XCD gets a contiguous range of (state, V block) programs.
+        n_pid = fx.Int32(fx.grid_dim.y) * NV
+        pid = fx.Int32(fx.block_idx.y) * NV + fx.Int32(fx.block_idx.x)
+        per_xcd = (n_pid + (num_xcds - 1)) // num_xcds
+        tall = n_pid % num_xcds
+        tall = (tall == 0).select(fx.Int32(num_xcds), tall)
+        xcd = pid % num_xcds
+        local = pid // num_xcds
+        pid = (xcd < tall).select(
+            xcd * per_xcd + local,
+            tall * per_xcd + (xcd - tall) * (per_xcd - 1) + local,
+        )
+        i_v = pid % NV
+        i_bh = pid // NV
         b = i_bh // H
         h = i_bh % H
         tid = fx.thread_idx.x
