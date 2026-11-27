@@ -574,6 +574,8 @@ def test_triton_unified_attn_3d(
     "seq_lens",
     [
         [(512, 512)],
+        # crosses Q_GEQ_1024 so the large-prefill composite entries are hit
+        [(1234, 1234)],
         [
             (1, 15),
             (12, 133),
@@ -653,9 +655,32 @@ def test_triton_unified_attn(
         backend,
     )
     torch.manual_seed(0)
-    # shuffling only supported for gfx1250 gluon kernels
+    # the 1234-token prefill arm only needs the default block-table size;
+    # the 32768-block variant would allocate a >250 GB fp32 KV cache
+    if max(q for q, _ in seq_lens) > 1024 and num_blocks > 2048:
+        pytest.skip("large-prefill shape only runs with the default block count")
     if shuffled_kv_cache and not use_gluon_2d:
-        pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
+        if DEVICE_ARCH == "gfx942" and backend == "triton":
+            # fp8 pages below 32 are a layout constraint of the shuffled
+            # path (asserted upstream of the kernel)
+            if kv_dtype == e4m3_dtype and q_dtype == e4m3_dtype and block_size < 32:
+                pytest.skip("A8W8 shuffled KV cache requires block_size >= 32")
+            # the shuffled Triton kernels pin TILE_SIZE to the page; at page 64
+            # the stage-2 bf16 d512 prefill entry below Q_GEQ_1024 exceeds the
+            # 64 KiB LDS, and the Triton compiler rejects it at launch
+            oversize = (
+                kv_dtype == torch.bfloat16
+                and head_size == 512
+                and block_size == 64
+                and 1 < max(q for q, _ in seq_lens) < 1024
+            )
+            if oversize:
+                pytest.xfail(
+                    f"shuffled {kv_dtype} d{head_size} page {block_size} "
+                    "exceeds LDS at compile time with the current table"
+                )
+        else:
+            pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
     # shuffle_kv_cache only defines the bf16 and fp8 layouts
     if shuffled_kv_cache and kv_dtype == torch.float16:
         pytest.skip("skip shuffled_kv_cache, fp16 shuffled layout not supported")
