@@ -99,7 +99,7 @@ def test_index_score_prefill_nvfp4(reqs, variant, device):
 
     bq, waves, ring = (int(x) for x in variant.split(":")[:3])
     fold_max = ":fold" in variant
-    pad_lds = variant.endswith(":pad")
+    pad_lds = ":pad" in variant
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device)
     max_block = (int(seq.max()) + 127) // 128
     score = torch.full((1, q.shape[0], max_block), float("nan"), device=device)
@@ -190,7 +190,7 @@ def triton_selection(score, valid_blocks, init_blocks, local_blocks, k=16):
 @pytest.mark.parametrize("pins", [(0, 1), (2, 3), (0, 0)])
 @pytest.mark.parametrize(
     "variant",
-    # chunk_blocks:block_q:waves:ring[:fold][:pad] (the same keys)
+    # chunk_blocks:block_q:waves:ring[:fold][:pad][:s32] (the same keys)
     [
         "256:256:4:4",
         "64:128:2:2",
@@ -201,6 +201,9 @@ def triton_selection(score, valid_blocks, init_blocks, local_blocks, k=16):
         "256:512:8:2:fold",
         "256:512:8:2:fold:pad",
         "1024:256:4:4:pad",
+        "256:256:4:3:fold:pad:s32",
+        "1024:128:2:2:fold:pad:s32",
+        "64:512:8:2:fold:pad:s32",
     ],
 )
 def test_index_topk_prefill_nvfp4(reqs, pins, variant, device):
@@ -212,7 +215,8 @@ def test_index_topk_prefill_nvfp4(reqs, pins, variant, device):
 
     chunk, bq, waves, ring = (int(x) for x in variant.split(":")[:4])
     fold_max = ":fold" in variant
-    pad_lds = variant.endswith(":pad")
+    pad_lds = ":pad" in variant
+    sel32 = variant.endswith(":s32")
     heads = 4
     q, payload, scale, bt, cu, prefix, seq = make(reqs, device, heads=heads, ties=True)
     max_q = max(n for n, _ in reqs)
@@ -226,6 +230,7 @@ def test_index_topk_prefill_nvfp4(reqs, pins, variant, device):
     keys = index_topk_prefill_nvfp4(
         q, payload, scale, bt, cu, seq, prefix, 128**-0.5, max_q, max_block, *pins,
         chunk_blocks=chunk, block_q=bq, waves=waves, ring=ring, fold_max=fold_max, pad_lds=pad_lds,
+        sel32=sel32,
     )  # fmt: skip
     torch.cuda.synchronize()
     assert keys.shape == (heads, q.shape[0], -(-max_block // chunk) * 16)

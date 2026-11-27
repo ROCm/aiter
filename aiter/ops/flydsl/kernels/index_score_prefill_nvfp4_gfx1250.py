@@ -92,7 +92,7 @@ CHUNK_MAX = 32
 
 
 def compile_index_score_prefill_nvfp4(
-    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, pad_lds=False, _probe=""
+    *, block_q=256, waves=8, ring=4, chunk_max=0, select=None, fold_max=False, pad_lds=False, sel32=False, _probe=""
 ):
     """Compile (cached) the scorer: ``block_q`` query rows a CTA (``waves`` waves of
     ``block_q / waves`` rows, a multiple of 16), ``ring`` pages in flight.
@@ -111,6 +111,14 @@ def compile_index_score_prefill_nvfp4(
     the staged scores (128 bytes) and of the select build's lists (128 bytes)
     get 8 bytes of padding too: at 128 bytes, half the banks' period, the 32
     lanes of a pass (a row each) alias.
+
+    ``sel32`` (select build): the selection pass with 32-bit compares only. A
+    64-bit min / max / compare costs about 20 times a 32-bit VALU op on this
+    SIMD (fitted to the 11-27 MI455X runs), and the pass did 16 a step. Blocks
+    are tried in rising order, so a tried block is over every block of the
+    list, and over the list's lowest entry exactly when its score order is not
+    under the lowest's; the lowest entry is the lowest order, then the lowest low
+    word among the places at that order. The same lists.
 
     ``_probe``: debug builds that write wrong scores, for timing only.
     ``_nostore``: no score stores. ``_nosel`` / ``_nosteps`` (select build): no
@@ -152,7 +160,7 @@ def compile_index_score_prefill_nvfp4(
         raise ValueError(
             f"select needs chunk_max = {CHUNK_MAX} and waves of whole {WAVE} rows"
         )
-    key = (block_q, waves, ring, chunk_max, select, fold_max, pad_lds, _probe)
+    key = (block_q, waves, ring, chunk_max, select, fold_max, pad_lds, sel32, _probe)
     if key in _CACHE:
         return _CACHE[key]
     threads = waves * WAVE
@@ -178,6 +186,8 @@ def compile_index_score_prefill_nvfp4(
         name += "_fold"
     if pad_lds:
         name += "_pad"
+    if sel32:
+        name += "_s32"
     if select:
         init_blocks, local_blocks = select
         name = name.replace("score", "topk") + f"_i{init_blocks}_l{local_blocks}"
@@ -340,13 +350,30 @@ def compile_index_score_prefill_nvfp4(
                         fx.Int64,
                     )
 
+                BIG = 0x7FFFFFFF  # over every low word ((block + 1) << 4 | place < 2^20)
+
                 def lowest(rl):
-                    """The lowest entry of row ``rl``'s list."""
+                    """The lowest entry of row ``rl``'s list, as (its score order,
+                    the entry: 64-bit, or with sel32 its low word)."""
+                    if const_expr(sel32):
+                        ws = [
+                            lds_load(list_base + rl * lrow_b + p * 8, fx.Int32, 2)
+                            for p in range_constexpr(TOPK)
+                        ]
+                        order = ws[0][1]
+                        for p in range_constexpr(1, TOPK):
+                            order = fx.min(order, ws[p][1])
+                        word = fx.Int32(BIG)
+                        for p in range_constexpr(TOPK):
+                            word = fx.min(
+                                word, (ws[p][1] == order).select(ws[p][0], fx.Int32(BIG))
+                            )
+                        return order, word
                     low = lds_load(list_base + rl * lrow_b, fx.Int64, 1)[0]
                     for p in range_constexpr(1, TOPK):
                         entry = lds_load(list_base + rl * lrow_b + p * 8, fx.Int64, 1)[0]
                         low = (entry < low).select(entry, low)
-                    return low
+                    return fx.Int32(low >> 32), low
 
                 def low_bits(n):
                     """A mask of the n lowest bits, n in [0, 32]."""
@@ -478,9 +505,9 @@ def compile_index_score_prefill_nvfp4(
                                 + fx.Int64(row_live.select(rl, fx.Int32(0)))
                                 * fx.Int64(stride_s_n)
                             ) * 2
-                            low = lowest(rl)
+                            low_o, low = lowest(rl)
                             # An empty place or a NaN is the lowest order: no floor.
-                            floor = fx.max(fx.Int32(floors[cell]), fx.Int32(low >> 32))
+                            floor = fx.max(fx.Int32(floors[cell]), low_o)
                             # The score of that order (a NaN for no floor: under
                             # no score). A NaN score passes too, to be ordered
                             # against the list.
@@ -549,26 +576,40 @@ def compile_index_score_prefill_nvfp4(
                                     value = (col > own_block - local_blocks).select(
                                         fx.Float32(LOCAL_PIN), value
                                     )
-                                entry = (fx.Int64(_triton_order(value)) << 32) | fx.Int64(
-                                    (col + 1) << 4
-                                )
-                                if has & (entry > low):
+                                e_order = _triton_order(value)
+                                if const_expr(sel32):
+                                    # A tried block is over every block of the list.
+                                    over = e_order >= low_o
+                                else:
+                                    entry = (fx.Int64(e_order) << 32) | fx.Int64((col + 1) << 4)
+                                    over = entry > low
+                                if has & over:
                                     place = fx.Int32(low) & (TOPK - 1)
-                                    lds_store(
-                                        list_base + rl * lrow_b + place * 8,
-                                        fx.Vector.from_elements(
-                                            [entry | fx.Int64(place)], dtype=fx.Int64
-                                        ),
-                                        fx.Int64,
-                                    )
+                                    if const_expr(sel32):
+                                        lds_store(
+                                            list_base + rl * lrow_b + place * 8,
+                                            fx.Vector.from_elements(
+                                                [((col + 1) << 4) | place, e_order],
+                                                dtype=fx.Int32,
+                                            ),
+                                            fx.Int32,
+                                        )
+                                    else:
+                                        lds_store(
+                                            list_base + rl * lrow_b + place * 8,
+                                            fx.Vector.from_elements(
+                                                [entry | fx.Int64(place)], dtype=fx.Int64
+                                            ),
+                                            fx.Int64,
+                                        )
                                     # Only a row that took a place has a new lowest.
-                                    low = lowest(rl)
+                                    low_o, low = lowest(rl)
                             # (A row past the request keeps an empty list.)
                             if const_expr(_probe == "_nosteps"):
                                 # Keeps the header live (the floor cell is in bounds).
                                 floors[cell] = tried
-                            elif fx.Int32(low >> 32) > floor:
-                                floors[cell] = fx.Int32(low >> 32)
+                            elif low_o > floor:
+                                floors[cell] = low_o
                 final = yield [state[0]]
             tdm_ops.tensor_wait(0)
             if const_expr(select):

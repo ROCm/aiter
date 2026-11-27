@@ -139,7 +139,9 @@ def index_score_prefill_nvfp4(
 # The default is the longest power of two in [TOPK_CHUNK_MIN, TOPK_CHUNK_MAX]
 # that still gives each CU TOPK_WORKGROUPS_PER_CU workgroups (a guess: 3-4 are
 # resident, the rest balance the tail), and never so short that a row hands the
-# merge more than TOPK_MERGE_MAX keys. Not measured on a GPU yet.
+# merge more than TOPK_MERGE_MAX keys. On MI455X (11-27) the derived chunk is level
+# with 512 / 1024 at 384K (within run noise); the guesses stand until a sweep says
+# otherwise.
 TOPK_CHUNK_MIN, TOPK_CHUNK_MAX = 32, 1024
 TOPK_WORKGROUPS_PER_CU = 16
 TOPK_MERGE_MAX = 1024
@@ -217,6 +219,7 @@ def index_topk_prefill_nvfp4(
     ring: int = 4,
     fold_max: bool = False,
     pad_lds: bool = False,
+    sel32: bool = False,
     _probe: str = "",
 ) -> torch.Tensor:
     """The prefill scorer and ATOM's top-16 block selection in one launch: the
@@ -257,6 +260,7 @@ def index_topk_prefill_nvfp4(
         select=(init_blocks, local_blocks),
         fold_max=bool(fold_max),
         pad_lds=bool(pad_lds),
+        sel32=bool(sel32),
         _probe=_probe,
     )
     dev = idx_q.device
