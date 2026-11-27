@@ -6,6 +6,7 @@ import torch
 
 import aiter.ops.triton.fusions.attn_res as attn_res_module
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
+from aiter.ops.triton.utils import config_utils
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 # (dtype -> (atol, rtol)) for comparing against the fp32 torch reference.
@@ -345,11 +346,24 @@ def test_attn_res_gate_close_block(B, with_add, dtype):
         N, D, B, dtype, with_add
     )
 
+    # Both on the Triton kernel: only it has close_block, and y must match bit for bit.
     y0, prefix_out0 = attn_res_gate(
-        prefix, block_residual, score_weight, eps, add_hidden, close_block=False
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        close_block=False,
+        backend="triton",
     )
     y1, prefix_out1, block_out = attn_res_gate(
-        prefix, block_residual, score_weight, eps, add_hidden, close_block=True
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        close_block=True,
+        backend="triton",
     )
 
     torch.testing.assert_close(y1, y0, atol=0, rtol=0)
@@ -569,6 +583,11 @@ def test_attn_res_gate_out_quant_all_zero_row(N, close_block):
     assert torch.equal(y_fp8.float(), torch.zeros_like(y_fp8, dtype=torch.float32))
 
 
+def _skip_without_gate_tdm(backend):
+    if backend == "gluon" and attn_res_module._GATE_TDM_KERNEL is None:
+        pytest.skip("the Gluon TDM kernel of attn_res_gate needs gfx1250")
+
+
 def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
     """Every axis attn_res_gate keys its launch cache on, one call per setting.
 
@@ -623,9 +642,10 @@ def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
         ), kwargs
 
 
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("B", [1, 8])
 @pytest.mark.parametrize("N", [1, 128])
-def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
+def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N, backend):
     """The cached launch must resolve to the kernel Triton itself would pick.
 
     attn_res_gate skips Triton's per-launch argument specialization by caching
@@ -635,6 +655,7 @@ def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
     so the module can re-resolve through Triton on every hit and assert it got
     the same object back; this turns that check on across the flag matrix.
     """
+    _skip_without_gate_tdm(backend)
     monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_VERIFY", True)
     D = 256
     dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
@@ -646,16 +667,24 @@ def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
     for args, kwargs in _gate_all_variants(
         prefix, block_residual, score_weight, orw, fp8_dtype
     ):
+        if backend == "gluon" and kwargs.get("close_block"):
+            continue  # close_block always uses the Triton kernel
         # Twice: the first call populates the cache, the second is the hit that
         # the verification actually checks.
-        attn_res_gate(*args, **kwargs)
-        attn_res_gate(*args, **kwargs)
+        attn_res_gate(*args, **kwargs, backend=backend)
+        attn_res_gate(*args, **kwargs, backend=backend)
 
 
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("close_block", [False, True])
 @pytest.mark.parametrize("quant", [False, True])
-def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_block):
+def test_attn_res_gate_launch_cache_bit_identical(
+    monkeypatch, quant, close_block, backend
+):
     """Cached and uncached launches must produce bit-identical results."""
+    _skip_without_gate_tdm(backend)
+    if backend == "gluon" and close_block:
+        pytest.skip("close_block always uses the Triton kernel")
     N, D, B = 64, 256, 3
     dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
     prefix, block_residual, score_weight, add_hidden, _ = generate_attn_res_gate_inputs(
@@ -667,6 +696,7 @@ def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_bloc
         "output_rms_eps": 1e-5,
         "close_block": close_block,
         "out_quant_dtype": fp8_dtype if quant else None,
+        "backend": backend,
     }
 
     def run():
@@ -687,6 +717,30 @@ def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_bloc
 
     for a, b in zip(flat(uncached), flat(cached)):
         torch.testing.assert_close(a.float(), b.float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_attn_res_gate_launch_cache_is_bounded_in_token_count(backend):
+    """Token count must not be a cache axis, or decode would leak an entry a step.
+
+    N reaches the key only through the properties Triton specializes on
+    (16-divisibility, being 1, fitting in i32), not by value.
+    """
+    _skip_without_gate_tdm(backend)
+    D, B = 256, 3
+    dtype = torch.bfloat16
+    attn_res_module._LAUNCH_CACHE.clear()
+    for N in range(17, 49):
+        prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+            N, D, B, dtype, with_add=False
+        )
+        attn_res_gate(prefix, block_residual, score_weight, 1e-6, backend=backend)
+
+    entries = sum(len(v) for v in attn_res_module._LAUNCH_CACHE.values())
+    # N in [17, 48] spans both 16-divisibility classes and two launch-config
+    # buckets (<=64 vs the N<=8 bucket is not reached here), so a handful of
+    # entries is expected -- 32 would mean N leaked in by value.
+    assert entries <= 8, f"launch cache grew to {entries} entries over 32 token counts"
 
 
 @pytest.mark.parametrize("N", [512, 4096])
@@ -718,6 +772,7 @@ def test_attn_res_gate_separate_bl_buckets_match_reference(N, B):
         output_rms_weight=orw,
         output_rms_eps=1e-5,
     )
+    # Pinned to Triton: this tests the SEPARATE BL tiling of attnres_fwd_kernel.
     y, prefix_out, block_out = attn_res_gate(
         prefix,
         block_residual,
@@ -728,6 +783,7 @@ def test_attn_res_gate_separate_bl_buckets_match_reference(N, B):
         output_rms_weight=orw,
         output_rms_eps=1e-5,
         close_block=True,
+        backend="triton",
     )
 
     atol, rtol = _TOL[dtype]
@@ -776,10 +832,19 @@ def test_attn_res_gate_launch_cache_separates_separate_bl_buckets(monkeypatch, N
     # entry rather than compiling fresh.
     other_n = 32768 if N == 16384 else 16384
     other = generate_attn_res_gate_inputs(other_n, D, B, dtype, with_add=False)
-    attn_res_gate(other[0], other[1], other[2], 1e-6, close_block=True)
+    attn_res_gate(
+        other[0], other[1], other[2], 1e-6, close_block=True, backend="triton"
+    )
 
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
+    for _ in range(2):
+        attn_res_gate(
+            prefix,
+            block_residual,
+            score_weight,
+            1e-6,
+            close_block=True,
+            backend="triton",
+        )
 
 
 def test_attn_res_sequence_requires_d_multiple_of_16():
@@ -789,3 +854,377 @@ def test_attn_res_sequence_requires_d_multiple_of_16():
     )
     with pytest.raises(AssertionError, match="multiple of 16"):
         attn_res_fwd(query, residuals, rms_weight, layout="sequence")
+
+
+_requires_gate_tdm = pytest.mark.skipif(
+    attn_res_module._GATE_TDM_KERNEL is None,
+    reason="the Gluon TDM kernel of attn_res_gate needs gfx1250",
+)
+
+# (add count, output RMSNorm, FP8 quant)
+_GATE_TDM_VARIANTS = [
+    (0, False, False),
+    (1, True, False),
+    (2, True, False),
+    (2, True, True),
+]
+
+
+@_requires_gate_tdm
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("variant", _GATE_TDM_VARIANTS)
+@pytest.mark.parametrize("D", [512, 7168])
+@pytest.mark.parametrize("N", [1, 37, 300])
+# B=1..3 is fewer rows than the kernel keeps in flight: pipeline start and drain.
+@pytest.mark.parametrize("B", [1, 2, 3, 8])
+def test_attn_res_gate_gluon_matches_reference(B, N, D, variant, dtype):
+    """The gfx1250 Gluon TDM kernel against the fp32 torch reference."""
+    add_count, onorm, quant = variant
+    eps, out_eps, scale = 1e-6, 1e-5, 0.8
+    fp8_dtype = get_fp8_e4m3_dtype()
+    prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+        generate_attn_res_gate_inputs(
+            N, D, B, dtype, with_add=add_count > 0, with_add2=add_count > 1
+        )
+    )
+    orw = torch.randn(D, dtype=dtype, device="cuda") if onorm else None
+
+    y_ref, prefix_ref = run_torch_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight=orw,
+        output_rms_eps=out_eps,
+        scale=scale,
+    )
+
+    def gate(quant_dtype):
+        return attn_res_gate(
+            prefix,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+            output_rms_weight=orw,
+            output_rms_eps=out_eps,
+            scale=scale,
+            out_quant_dtype=quant_dtype,
+            backend="gluon",
+        )
+
+    y, prefix_out = gate(None)
+    atol, rtol = _TOL[dtype]
+    torch.testing.assert_close(y.float(), y_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(prefix_out.float(), prefix_ref.float(), atol=0, rtol=0)
+    if quant:
+        # Same bound as test_attn_res_gate_out_quant: one e4m3 step of the row's
+        # own unquantized result, plus one scale unit for the fp8-subnormal
+        # elements.
+        (y_fp8, y_scale), _ = gate(fp8_dtype)
+        ref = y.float()
+        err = (_dequant_per_token(y_fp8, y_scale) - ref).abs()
+        assert (err <= ref.abs() * 2**-3 + y_scale.float()).all()
+        torch.testing.assert_close(
+            y_scale,
+            ref.abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max,
+            atol=0.0,
+            rtol=2e-2,
+        )
+
+
+@_requires_gate_tdm
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("D", [257, 258, 259])
+def test_attn_res_gate_gluon_ignores_row_padding(D, dtype):
+    """Partial reduction groups must exclude the padding of aligned rows."""
+    N, B = 3, 3
+    eps, out_eps = 1e-6, 1e-5
+    prefix, residual, weight, hidden, hidden2 = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=True, with_add2=True
+    )
+    storage = torch.full((N, B, 264), float("nan"), dtype=dtype, device="cuda")
+    block = storage[..., :D]
+    block.copy_(residual)
+    onorm = torch.randn(D, dtype=dtype, device="cuda")
+    expected, expected_prefix = run_torch_gate(
+        prefix,
+        block,
+        weight,
+        eps,
+        hidden,
+        hidden2,
+        output_rms_weight=onorm,
+        output_rms_eps=out_eps,
+    )
+
+    actual, actual_prefix = attn_res_gate(
+        prefix,
+        block,
+        weight,
+        eps,
+        hidden,
+        hidden2,
+        output_rms_weight=onorm,
+        output_rms_eps=out_eps,
+        backend="gluon",
+    )
+
+    atol, rtol = _TOL[dtype]
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_prefix, expected_prefix, atol=0, rtol=0)
+
+
+class _GateDispatchTensor(torch.Tensor):
+    """CPU tensor metadata for tests that replace the kernel launch."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+def _gate_dispatch_inputs(N, D=256, B=2, dtype=torch.bfloat16):
+    prefix = torch.empty((N, D), dtype=dtype, device="cpu").as_subclass(
+        _GateDispatchTensor
+    )
+    block = torch.empty((N, B, D), dtype=dtype, device="cpu")
+    weight = torch.empty(D, dtype=dtype, device="cpu")
+    return prefix, block, weight
+
+
+def _record_gate_launches(monkeypatch, arch="gfx1250"):
+    """Record public-wrapper launches without compiling either kernel."""
+    used = []
+    tdm_kernel = object()
+    monkeypatch.setattr(attn_res_module, "_ARCH", arch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", tdm_kernel)
+    config_dir = config_utils.resolve_config_dir(
+        "fusions", "ATTN_RES_GATE_TDM", backend="gluon", arch="gfx1250", cu_num=None
+    )
+    config_table = config_utils.load_config_json(f"{config_dir}/DEFAULT.json")
+
+    def pick_config(tokens):
+        config = config_utils.select_leq_config(config_table, tokens)
+        return config["num_warps"], config["PREFETCH"]
+
+    def record(
+        key,
+        grid_n,
+        argv,
+        tune_kwargs,
+        kernel=attn_res_module.attnres_fwd_kernel,
+        arg_order=attn_res_module._KERNEL_ARG_ORDER,
+    ):
+        used.append(
+            (
+                "gluon" if kernel is tdm_kernel else "triton",
+                dict(zip(arg_order, argv)),
+                tune_kwargs,
+                kernel,
+            )
+        )
+
+    monkeypatch.setattr(attn_res_module, "_pick_gate_tdm_config", pick_config)
+    monkeypatch.setattr(attn_res_module, "_launch_attn_res", record)
+    return used
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"])
+@pytest.mark.parametrize("backend", [None, "triton", "gluon", "arch"])
+@pytest.mark.parametrize("N", [256, 257])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_backend_dispatch(
+    monkeypatch, arch, backend, N, dtype, close_block
+):
+    used = _record_gate_launches(monkeypatch, arch)
+    args = _gate_dispatch_inputs(N, dtype=dtype)
+    supported = arch == "gfx1250" and dtype == torch.bfloat16 and not close_block
+    if backend == "gluon" and not supported:
+        with pytest.raises(RuntimeError, match="Gluon backend"):
+            attn_res_gate(*args, close_block=close_block, backend=backend)
+        assert not used
+        return
+    attn_res_gate(*args, close_block=close_block, backend=backend)
+    expect_gluon = supported and (
+        backend in ("gluon", "arch") or (backend is None and N > 256)
+    )
+    assert [call[0] for call in used] == ["gluon" if expect_gluon else "triton"]
+
+
+@pytest.mark.parametrize(
+    "backend,N,close_block,arch",
+    [
+        ("triton", 257, False, "gfx1250"),
+        (None, 256, False, "gfx1250"),
+        (None, 257, True, "gfx1250"),
+        ("arch", 1, True, "gfx1250"),
+        ("arch", 257, False, "gfx950"),
+        ("arch", 257, False, "gfx1250-strict"),
+    ],
+)
+def test_attn_res_gate_dispatch_skips_tensor_probes(
+    monkeypatch, backend, N, close_block, arch
+):
+    monkeypatch.setattr(attn_res_module, "_ARCH", arch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", object())
+
+    def unexpected_probe(*args):
+        pytest.fail("the scalar dispatch checks must precede tensor checks")
+
+    monkeypatch.setattr(attn_res_module, "_gate_tdm_supports", unexpected_probe)
+    assert not attn_res_module._use_gate_tdm(backend, None, N, 256, close_block)
+
+
+def test_attn_res_gate_rejects_unknown_backend(monkeypatch):
+    used = _record_gate_launches(monkeypatch)
+    with pytest.raises(ValueError, match="Unknown backend"):
+        attn_res_gate(*_gate_dispatch_inputs(8), backend="cuda")
+    assert not used
+
+
+@pytest.mark.parametrize("backend", [None, "arch"])
+def test_attn_res_gate_missing_kernel_falls_back(monkeypatch, backend):
+    used = _record_gate_launches(monkeypatch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", None)
+    attn_res_gate(*_gate_dispatch_inputs(257), backend=backend)
+    assert [call[0] for call in used] == ["triton"]
+
+
+@pytest.mark.parametrize(
+    "case,supported",
+    [
+        ("bf16", True),
+        ("fp16", True),
+        ("fp32", False),
+        ("empty_block", False),
+        ("max_d", True),
+        ("large_d", False),
+        ("hidden_stride", False),
+        ("row_stride", False),
+        ("token_stride", False),
+        ("offset", False),
+        ("aligned_offset", True),
+        ("bank_view", True),
+    ],
+)
+def test_attn_res_gate_tdm_supports_cpu(case, supported):
+    dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(case, torch.bfloat16)
+    D = {"max_d": 8192, "large_d": 8200}.get(case, 256)
+    B = 0 if case == "empty_block" else 2
+    br = torch.empty((2, B, D), dtype=dtype, device="cpu")
+    if case == "hidden_stride":
+        br = br[..., ::2]
+    elif case in ("row_stride", "token_stride"):
+        strides = (2 * D + 8, D + 1, 1) if case == "row_stride" else (2 * D + 1, D, 1)
+        br = torch.empty_strided((2, B, D), strides, dtype=dtype, device="cpu")
+    elif case in ("offset", "aligned_offset"):
+        offset = 1 if case == "offset" else 8
+        br = torch.empty(2 * B * D + offset, dtype=dtype, device="cpu")[offset:].view(
+            2, B, D
+        )
+    elif case == "bank_view":
+        br = torch.empty((2, 8, D), dtype=dtype, device="cpu")[:, :B]
+    assert attn_res_module._gate_tdm_supports(br, br.shape[-1]) is supported
+
+
+@pytest.mark.parametrize("backend", ["triton", "arch"])
+def test_attn_res_gate_preserves_strided_bank(monkeypatch, backend):
+    used = _record_gate_launches(monkeypatch)
+    prefix, _, weight = _gate_dispatch_inputs(257)
+    bank = torch.empty((257, 8, 256), dtype=torch.bfloat16, device="cpu")
+    block = bank[:, :3]
+    attn_res_gate(prefix, block, weight, backend=backend)
+    assert len(used) == 1
+    assert used[0][0] == ("gluon" if backend == "arch" else "triton")
+    args = used[0][1]
+    assert args["res_packed"] is block
+    assert args["res_packed"].data_ptr() == block.data_ptr()
+    assert (args["stride_res_n"], args["stride_res_l"]) == block.stride()[:2]
+
+
+def test_attn_res_gate_rejects_mismatched_hidden_dimension(monkeypatch):
+    used = _record_gate_launches(monkeypatch)
+    prefix, _, weight = _gate_dispatch_inputs(8)
+    block = torch.empty((8, 2, 128), dtype=torch.bfloat16, device="cpu")
+    with pytest.raises(ValueError, match="leading dimensions must match"):
+        attn_res_gate(prefix, block, weight, backend="arch")
+    assert not used
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_arch_configuration_is_batch_invariant(
+    monkeypatch, arch, close_block
+):
+    used = _record_gate_launches(monkeypatch, arch)
+    selected_tokens = []
+    pick_config = attn_res_module._pick_gate_tdm_config
+
+    def record_config(tokens):
+        selected_tokens.append(tokens)
+        return pick_config(tokens)
+
+    monkeypatch.setattr(attn_res_module, "_pick_gate_tdm_config", record_config)
+    for N in (1, 256, 257, 512):
+        attn_res_gate(
+            *_gate_dispatch_inputs(N), backend="arch", close_block=close_block
+        )
+    assert len(used) == 4
+    for backend, args, kwargs, _ in used:
+        assert backend == used[0][0]
+        assert kwargs == used[0][2]
+        if backend == "triton":
+            assert args["BL"] == used[0][1]["BL"]
+            assert args["SEPARATE"] is False
+    if used[0][0] == "gluon":
+        assert selected_tokens == [1, 1, 1, 1]
+
+
+def test_attn_res_gate_arch_bypasses_autotune(monkeypatch):
+    used = _record_gate_launches(monkeypatch, "gfx950")
+    raw_kernel = object()
+
+    class Autotuner:
+        fn = raw_kernel
+
+    monkeypatch.setattr(attn_res_module, "ATTN_RES_TRITON_AUTOTUNE", True)
+    monkeypatch.setattr(attn_res_module, "attnres_fwd_kernel", Autotuner())
+    attn_res_gate(*_gate_dispatch_inputs(257), backend="arch")
+    assert len(used) == 1
+    assert used[0][3] is raw_kernel
+    assert used[0][1]["SEPARATE"] is False
+    warps, stages, bl = attn_res_module._pick_attn_res_packed_config(1, 4)
+    assert used[0][1]["BL"] == bl
+    assert used[0][2]["num_warps"] == warps
+    assert used[0][2]["num_stages"] == stages
+
+
+@pytest.mark.parametrize("case", ["supported", "unaligned_rows", "close_block"])
+def test_attn_res_gate_arch_bf16_batch_invariant(case):
+    """The same BF16 row must not change when the token count changes."""
+    D = 257 if case == "unaligned_rows" else 256
+    prefix, block, weight, hidden, hidden2 = generate_attn_res_gate_inputs(
+        512, D, 3, torch.bfloat16, with_add=True, with_add2=True
+    )
+    onorm = torch.randn(D, dtype=torch.bfloat16, device="cuda")
+    results = []
+    for N in (1, 256, 257, 512):
+        results.append(
+            attn_res_gate(
+                prefix[:N],
+                block[:N],
+                weight,
+                add_hidden=hidden[:N],
+                add_hidden2=hidden2[:N],
+                output_rms_weight=onorm,
+                backend="arch",
+                close_block=case == "close_block",
+            )
+        )
+    for result in results[1:]:
+        for value, expected in zip(result, results[0]):
+            torch.testing.assert_close(value[:1], expected, atol=0, rtol=0)
