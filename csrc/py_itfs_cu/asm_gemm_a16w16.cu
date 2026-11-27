@@ -82,6 +82,9 @@ get_heuristic_kernel(int M,
 
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
+    // The caller asked for no split (splitK 0 or 1, which the Python wrapper pairs with an
+    // empty semaphore). A split-K kernel cannot run then, whatever the heuristic prefers.
+    const bool no_split_requested = splitk == 0 || splitk == 1;
 
     for(const auto& el : *cfgs)
     {
@@ -107,6 +110,18 @@ get_heuristic_kernel(int M,
                         ", bias=",
                         add_bias,
                         ").");
+            // A split-K kernel (splitK == 1) reduces through the semaphore and must run
+            // with splitK >= 2, which needs at least two K blocks. With one K block the
+            // launcher would run it at split 1 and fault (ROCm/aiter#5781).
+            AITER_CHECK(cfg.splitK == 0 || K / cfg.subK >= 2,
+                        __func__,
+                        " The specified split-K kernel ",
+                        el.first,
+                        " needs K >= 2 * subK (K=",
+                        K,
+                        ", subK=",
+                        cfg.subK,
+                        ").");
             selectedKernelName = el.first;
             if(splitk >= 0)
             {
@@ -124,8 +139,11 @@ get_heuristic_kernel(int M,
             }
         }
         // auto select splitk or kernel
+        // A split-K kernel needs splitK >= 2, so it cannot run on a single K block, nor when
+        // the caller asked for no split.
         if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
-           (add_bias == 0 || cfg.bias == 1))
+           (add_bias == 0 || cfg.bias == 1) &&
+           (cfg.splitK == 0 || (K / cfg.subK >= 2 && !no_split_requested)))
         {
             // 1. select splitk
             int split_K = 1;
@@ -252,6 +270,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(split > 1)
     {
         AITER_CHECK(gdx * gdy <= 1024, __func__, " gdx * gdy (", gdx * gdy, ") must be <= 16*64");
+        // The split-K kernels fault (address 0) without a semaphore, one counter per tile.
+        AITER_CHECK(semaphore != nullptr && semaphore->numel() >= static_cast<size_t>(gdx * gdy),
+                    __func__,
+                    " split-K needs a semaphore of at least gdx * gdy (",
+                    gdx * gdy,
+                    ") elements");
     }
     if(split > 1 && semaphore->numel() > 0)
     {
