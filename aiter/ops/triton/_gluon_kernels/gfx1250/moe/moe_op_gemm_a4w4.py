@@ -98,6 +98,17 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
+def _x_scales_copy_layout(block_m, mx_scale_block_k, num_warps, **kwargs):
+    rows_per_warp = min(32, max(1, block_m // num_warps))
+    return gl.BlockedLayout(
+        size_per_thread=[1, mx_scale_block_k],
+        threads_per_warp=[rows_per_warp, 32 // rows_per_warp],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+        **kwargs,
+    )
+
+
 @functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
@@ -234,11 +245,10 @@ def get_moe_a4w4_layouts_prefill(
             ),
         )
 
-    BLOCKED_LAYOUT_X_SCALES = gl.BlockedLayout(
-        size_per_thread=[1, MX_SCALE_BLOCK_K],
-        threads_per_warp=[32, 1],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
+    BLOCKED_LAYOUT_X_SCALES = _x_scales_copy_layout(
+        PACKED_BLOCK_M_X // ctas_per_cga[0],
+        MX_SCALE_BLOCK_K,
+        num_warps,
         cga_layout=CGA_A,
     )
 
@@ -431,11 +441,8 @@ def get_moe_a4w4_layouts_decode(
             ),
         )
 
-    BLOCKED_LAYOUT_X_SCALES = gl.BlockedLayout(
-        size_per_thread=[1, MX_SCALE_BLOCK_K],
-        threads_per_warp=[32, 1],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
+    BLOCKED_LAYOUT_X_SCALES = _x_scales_copy_layout(
+        PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K, num_warps
     )
 
     # shared layouts
