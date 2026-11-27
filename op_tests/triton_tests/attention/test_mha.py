@@ -400,6 +400,128 @@ def test_mha_forward_out_dtype(
     )
 
 
+@pytest.mark.parametrize(
+    "FP8, VARLEN, CAUSAL, HEAD_SZ, OUT_DTYPE, IMPL, STRIDED",
+    [
+        (True, True, True, 256, torch.bfloat16, "default", False),
+        (True, False, False, 128, None, "default", False),
+        (False, True, False, 128, None, "default", True),
+        (False, False, True, 64, torch.float16, "default", False),
+        (False, True, True, 128, None, "dao_ai", False),
+        (False, False, False, 128, None, "dao_ai", True),
+    ],
+)
+def test_mha_forward_out(
+    FP8: bool,
+    VARLEN: bool,
+    CAUSAL: bool,
+    HEAD_SZ: int,
+    OUT_DTYPE: torch.dtype,
+    IMPL: str,
+    STRIDED: bool,
+    dtype=torch.bfloat16,
+):
+    """out= is written in place and matches the allocated output bit for bit."""
+    if FP8 and not is_fp8_avail():
+        pytest.skip(f"FP8 not supported on {get_arch()}")
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS = 2, 256, 8, 2
+    torch.manual_seed(20)
+    q = torch.randn((BATCH, SEQLEN, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    cu_seqlens = None
+    if VARLEN:
+        q, k, v = (x.flatten(0, 1) for x in (q, k, v))
+        cu_seqlens = torch.arange(
+            0, (BATCH + 1) * SEQLEN, SEQLEN, device="cuda", dtype=torch.int32
+        )
+    descales = {}
+    if FP8:
+        fp8_dtype = get_fp8_e4m3_dtype()
+        q, descales["descale_q"] = quantize_fp8_per_bh(q, fp8_dtype, cu_seqlens)
+        k, descales["descale_k"] = quantize_fp8_per_bh(k, fp8_dtype, cu_seqlens)
+        v, descales["descale_v"] = quantize_fp8_per_bh(v, fp8_dtype, cu_seqlens)
+    kwargs = {"implementation": IMPL}
+    if OUT_DTYPE is not None:
+        kwargs["out_dtype"] = OUT_DTYPE
+
+    def forward(**extra):
+        return _flash_attn_forward(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=HEAD_SZ**-0.5,
+            causal=CAUSAL,
+            window_size_left=-1,
+            window_size_right=-1,
+            bias=None,
+            alibi_slopes=None,
+            return_lse=True,
+            return_softmax=False,
+            max_seqlen_q=SEQLEN,
+            max_seqlen_k=SEQLEN,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            **descales,
+            **kwargs,
+            **extra,
+        )[:2]
+
+    ref, ref_lse = forward()
+    if STRIDED:
+        wide = ref.shape[:-1] + (2 * ref.shape[-1],)
+        buf = torch.full(wide, float("nan"), dtype=ref.dtype, device="cuda")
+        buf = buf[..., : ref.shape[-1]]
+        assert not buf.is_contiguous(), "strided case must use a non-contiguous out"
+    else:
+        buf = torch.full_like(ref, float("nan"))
+    res, lse = forward(out=buf)
+    assert res.data_ptr() == buf.data_ptr(), "output was not written into out"
+    assert torch.equal(buf, ref), "out= output differs from the allocated output"
+    assert torch.equal(lse, ref_lse), "softmax_lse changed with out="
+
+    with pytest.raises(ValueError, match="out must be"):
+        forward(out=buf[..., :-1])
+    with pytest.raises(ValueError, match="out must be"):
+        forward(out=buf.to(torch.float32 if ref.dtype != torch.float32 else dtype))
+    if q.dtype == ref.dtype:
+        with pytest.raises(ValueError, match="overlap"):
+            forward(out=q)
+
+
+def test_mha_forward_out_varlen_tail():
+    """The default kernel leaves out rows past cu_seqlens_q[-1] unchanged."""
+    SEQLEN, PAD, NUM_HEADS, HEAD_SZ = 256, 64, 4, 64
+    q = torch.randn(
+        (2 * SEQLEN + PAD, NUM_HEADS, HEAD_SZ), device="cuda", dtype=torch.bfloat16
+    )
+    cu = torch.tensor([0, SEQLEN, 2 * SEQLEN], device="cuda", dtype=torch.int32)
+    out = torch.full_like(q, 7.0)
+    _flash_attn_forward(
+        q,
+        q,
+        q,
+        dropout_p=0.0,
+        softmax_scale=HEAD_SZ**-0.5,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        bias=None,
+        alibi_slopes=None,
+        return_lse=False,
+        return_softmax=False,
+        max_seqlen_q=SEQLEN,
+        max_seqlen_k=SEQLEN,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        implementation="default",
+        out=out,
+    )
+    assert torch.all(out[2 * SEQLEN :] == 7.0), "rows past cu_seqlens_q[-1] changed"
+    assert not torch.any(out[: 2 * SEQLEN] == 7.0), "valid rows were not written"
+
+
 # Short K (fewer than 8 key tiles) runs the one-tile loop; long K, the pipeline.
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (300, 1100)])
 @pytest.mark.parametrize("HEAD_SZ", [53, 64, 96, 128])
