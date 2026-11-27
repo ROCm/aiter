@@ -9,6 +9,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import (
     clamp_gate_up,
@@ -485,6 +486,7 @@ def a16w4_default_shared_tile_n(tile_n, N, *, step):
     return tn
 
 
+@aot_factory("moe_a16wmix_gemm1")
 @functools.cache
 def compile_gemm1_a16w4_port(
     BM=32,

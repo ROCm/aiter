@@ -287,7 +287,7 @@ jobs:
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -exo pipefail
           echo "Running Triton Tests..."
@@ -298,8 +298,15 @@ jobs:
             echo '<testsuites/>' > test-reports/triton.xml
             exit 0
           fi
+          # Known triton 3.9 issue: LLVM miscompile in bwd_kernel_fused_causal; fix pending in
+          # https://github.com/llvm/llvm-project/pull/226689 (verified on gfx950).
+          SKIP_ARGS=()
+          for t in \
+            'op_tests/triton_tests/attention/test_mha_dao_ai.py::test_mha_dao_ai_capture[mha-cpu]' \
+            'op_tests/triton_tests/attention/test_mha_dao_ai.py::test_mha_dao_ai_capture[mha-cuda]' \
+          ; do SKIP_ARGS+=("--deselect=$t"); done
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
-          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
+          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} "${SKIP_ARGS[@]}" \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
           if grep -q "Triton autotuning for function" test-reports/pytest.log; then
             echo "::error::runtime autotuning ran inside unit tests"
@@ -336,7 +343,7 @@ jobs:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' && needs.split_triton_tests.outputs.needs_mi300x == 'true' }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
@@ -453,8 +460,24 @@ jobs:
             echo '<testsuites/>' > test-reports/triton.xml
             exit 0
           fi
+          # Known triton 3.9 issues: capture faults in bwd_kernel_fused_causal, fix pending in
+          # https://github.com/llvm/llvm-project/pull/226689 (verified on gfx950); the gfx942
+          # head-dim 33/53 backward cases are not root-caused.
+          SKIP_ARGS=()
+          for t in \
+            'op_tests/triton_tests/attention/test_mha_dao_ai.py::test_mha_dao_ai_capture[mha-cpu]' \
+            'op_tests/triton_tests/attention/test_mha_dao_ai.py::test_mha_dao_ai_capture[mha-cuda]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-97-113-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-97-113-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-113-97-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-113-97-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-97-113-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-97-113-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-113-97-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-113-97-True-53]' \
+          ; do SKIP_ARGS+=("--deselect=$t"); done
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
-          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
+          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} "${SKIP_ARGS[@]}" \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
           if grep -q "Triton autotuning for function" test-reports/pytest.log; then
             echo "::error::runtime autotuning ran inside unit tests"

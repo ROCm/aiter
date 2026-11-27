@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import math
 
 import pytest
@@ -13,6 +12,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
     batched_gemm_bf16,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def is_gluon_supported():
@@ -89,38 +89,13 @@ def run_triton(
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 4)]
-    x_vals += [
-        (1, 1024, 4096),
-        (32, 1024, 4096),
-        (64, 1024, 4096),
-        (128, 1024, 4096),
-        (256, 1024, 4096),
-        (16384, 1024, 4096),
-    ]
-    x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
-
-
-def minimal_x_vals(num_vals=20):
-    """
-    Returns the num_vals smallest test cases. Useful for generating a subset to quickly test on.
-    """
-    x_vals = get_x_vals()
-    num_ops = [(i, functools.reduce(lambda x, y: x * y, i)) for i in x_vals]
-    sorted_x_vals = sorted(num_ops, key=lambda x: x[1])
-    return [i[0] for i in sorted_x_vals[: min(num_vals, len(sorted_x_vals))]]
-
-
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, output",
     [
         (dtype, b, *shape, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in get_x_vals()
+        for shape in get_shapes(max_size=16384 * 1024 * 4096)
         for output in [True, False]
     ],
 )
@@ -150,7 +125,7 @@ def test_batched_gemm_bf16(dtype, b, m, n, k, output, backend, kernel_type):
         (dtype, b, *shape, layout, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in minimal_x_vals()
+        for shape in get_shapes(max_size=16384 * 1024 * 4096)
         for output in [True, False]
         for layout in ["TT", "NN", "NT"]
     ],
