@@ -943,6 +943,7 @@ def _top_k_per_row_prefill_sampled(
     workspace: torch.Tensor | None = None,
     ragged: bool = True,
     nan_high: bool = False,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -1070,6 +1071,7 @@ def _sampled_run(
     workspace: torch.Tensor | None,
     ragged: bool,
     nan_high: bool,
+    stable: bool = False,
 ) -> None:
     """The sampled launch on arguments already validated."""
     if workspace is None:
@@ -1094,6 +1096,7 @@ def _sampled_run(
         workspace,
         ragged,
         nan_high,
+        stable,
     )
 
 
@@ -1119,6 +1122,11 @@ def top_k_per_row_prefill_sampled(
     # as top_k_per_row_prefill's other paths do. True ranks every NaN above
     # +inf, topk_select's contract. Indices only: values must be None.
     nan_high: bool = False,
+    # Ascending column order, a tie going to the smaller column: what
+    # top_k_per_row_prefill's HIP one-block kernel gives under stable=True,
+    # and with nan_high what topk_select gives under tie='low', where every
+    # NaN is one value.
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (prefill) via the sampled kernels.
 
@@ -1216,6 +1224,7 @@ def top_k_per_row_prefill_sampled(
         workspace,
         ragged,
         nan_high,
+        stable,
     )
 
 

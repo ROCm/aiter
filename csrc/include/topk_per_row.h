@@ -49,7 +49,11 @@ void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
                                    // NaN order: false ranks a negative NaN below -inf, as
                                    // top_k_per_row_prefill does; true ranks every NaN above
                                    // +inf, as topk_select does. Indices only.
-                                   bool nan_high = false);
+                                   bool nan_high = false,
+                                   // Ascending column order with ties to the smaller column,
+                                   // as top_k_per_row_prefill's stable=True and topk_select's
+                                   // tie='low' (with nan_high) give.
+                                   bool stable = false);
 
 int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
 // device_id < 0 asks about the current device.

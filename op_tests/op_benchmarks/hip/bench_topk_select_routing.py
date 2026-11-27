@@ -17,6 +17,9 @@ the two twice with a fresh process each time, then compare the files:
 
     # Time one backend wherever it serves, to refit a rule
     python bench_topk_select_routing.py --grid k2048 --force-backend decode -o d.csv
+
+    # The same calls under tie='low' or deterministic=True
+    python bench_topk_select_routing.py --grid select --tie low -o head_low.csv
 """
 
 from __future__ import annotations
@@ -115,13 +118,13 @@ def _correct(x, idx, ends, k):
     return True
 
 
-def _select_backend(rows, width, k, ragged, dev):
+def _select_backend(rows, width, k, ragged, dev, tie, deterministic):
     """The backend topk_select names for the call, or "" on a tree that names
     it differently."""
     import aiter.ops.topk_select as ts
     from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 
-    args = (rows, width, width, k, wave_size_of(dev), ragged, None, False, True)
+    args = (rows, width, width, k, wave_size_of(dev), ragged, tie, deterministic, True)
     try:
         return ts._choose.__wrapped__(*args, dev, True)
     except TypeError:
@@ -168,13 +171,25 @@ def run(args):
                     if grid["op"] == "select":
                         try:
                             backend = _select_backend(
-                                rows, width, k, ends is not None, dev
+                                rows,
+                                width,
+                                k,
+                                ends is not None,
+                                dev,
+                                args.tie,
+                                args.deterministic,
                             )
                         except RuntimeError:
                             continue  # no backend serves it, as when forced
 
                         fn = functools.partial(
-                            topk_select, x, k, end=ends, output_idx=idx
+                            topk_select,
+                            x,
+                            k,
+                            end=ends,
+                            output_idx=idx,
+                            tie=args.tie,
+                            deterministic=args.deterministic,
                         )
 
                     else:
@@ -304,6 +319,10 @@ def main():
     )
     parser.add_argument(
         "--force-backend", help="time this topk_select backend wherever it serves"
+    )
+    parser.add_argument("--tie", choices=["low"], help="topk_select's tie")
+    parser.add_argument(
+        "--deterministic", action="store_true", help="topk_select's deterministic"
     )
     parser.add_argument("--calls", type=int, default=10, help="calls per graph")
     parser.add_argument(
