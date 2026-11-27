@@ -1,7 +1,8 @@
 """The host side of the GEMM epilogue's Q/K prep (``qk_prep``): the ops a spec's names
 select, the specs it rejects, the gains it folds into the column vectors, its operand
 layouts, its Hadamard and its kernel-name tags. The epilogue itself is checked on gfx950
-by ``op_tests/test_gemm_a8w8_int8_4wave_epilogue.py``.
+by ``op_tests/test_gemm_a8w8_int8_4wave_epilogue.py`` and
+``op_tests/test_gemm_a6w6_host.py``.
 
 These run on CPU.
 """

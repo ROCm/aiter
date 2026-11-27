@@ -21,7 +21,7 @@ from aiter.ops.gemm_op_a6w4 import (
     quant_mxfp4_gemm,
 )
 from aiter.ops.gemm_op_a6w6 import (
-    _default_gemm_a6w6_kernel,
+    _default_gemm_a6w6_asm_kernel,
     gemm_a6w6_asm,
     quant_mxfp6_gemm,
 )
@@ -108,7 +108,7 @@ def test_exact_shape_kernel_matches_generic_kernel(family, shape, candidate_kern
     if family == "a6w6":
         A, A_scale = quant_mxfp6_gemm(x)
         B, B_scale = quant_mxfp6_gemm(weight)
-        baseline = _default_gemm_a6w6_kernel(M, N, K)
+        baseline = _default_gemm_a6w6_asm_kernel(M, N, K)
         launch = gemm_a6w6_asm
     elif family == "a6w4":
         A, A_scale = quant_mxfp6_gemm(x)

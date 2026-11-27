@@ -4,9 +4,9 @@
 """A GEMM epilogue with a compile-time Q/K prep, on the 16x16 MFMA accumulator layout.
 
 ``StoreCRows`` stores a wave's 128x128 tile of C as BF16 rows. Its accumulator source
-(``Int32Source``) says what the host's accumulators hold and which scales they need. It
-can add a bias, apply a Q/K prep (``qk_prep.PrepSpec``) and write per-head and per-column
-maxima. ``WaveTile`` is the accumulator layout: the elements of C that a lane holds.
+(``Int32Source``, ``Fp32Source``) says what the host's accumulators hold and which scales
+they need. It can add a bias, apply a Q/K prep (``qk_prep.PrepSpec``) and write per-head
+and per-column maxima. ``WaveTile`` is the accumulator layout: the elements of C that a lane holds.
 ``mfma_drain`` makes the accumulators of a host's inline-asm MFMAs readable.
 """
 
@@ -125,6 +125,30 @@ class Int32Source:
         )
         row_scale = Vec.filled(WAVE_TILES, Vec(row_scales[i])[r], fx.Float32)
         return acc.to(fx.Float32) * (row_scale * column_scales)
+
+
+class Fp32Source:
+    """FP32 accumulators that a block-scaled MFMA has already scaled: the epilogue applies
+    no scales, and the column operand starts with the bias, or the prep's vectors.
+
+    The loads are stable copies: the host issues them after its last LDS-DMA load has
+    landed, so LLVM's own waits cover them.
+    """
+
+    column_scales = False
+    ROW_LOADS = 0
+
+    def row_loads(self, tile):
+        return []
+
+    def column_load(self, store, element):
+        return lambda: store._load_vec4(store.columns_div, element())
+
+    def values(self, accs, i, r, row_scales, column_scales):
+        """Register ``r`` of MFMA tile row ``i`` over the 8 j tiles."""
+        return Vec.from_elements(
+            [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Float32
+        )
 
 
 class _PrepContext:
@@ -440,9 +464,10 @@ def mfma_drain(accs):
     For a host whose MFMAs are inline asm, which LLVM does not see as MFMAs: it would
     copy an accumulator out of its AGPRs right at the defining asm, so each passes
     through an empty asm placed after the nops. The three ``s_nop 7`` are sized for the
-    INT8 host, whose ``v_mfma_i32_16x16x64_i8`` accumulators the epilogue reads right
-    after the last MFMA. A host with another MFMA, or other work between its last MFMA and
-    the read, sizes its own.
+    two hosts whose accumulators the epilogue reads right after the last MFMA: the INT8
+    host's ``v_mfma_i32_16x16x64_i8`` and the A6W6 host's
+    ``v_mfma_scale_f32_16x16x128_f8f6f4``. A host with another MFMA, or other work between
+    its last MFMA and the read, sizes its own, as the standalone A6W6 kernel does.
     """
     _llvm.inline_asm(
         res=None,
