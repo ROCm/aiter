@@ -1710,10 +1710,22 @@ _V41_FLASH_EP8_SMALL_KNOBS = {
         "fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2},
     },
     16: {"fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2}},
+    # 32 (24..47 rows a rank: nearest_token_bucket) runs the bucket-64 config: 128 dispatch CUs, one wave per EU,
+    # streamed W1 (b_nt 3), the full GEMM2 epilogue. In serving (DeepSeek-V4.1-Flash c128 decode, 4..7 requests a
+    # rank) 64 dispatch CUs / 2 waves per EU / b_nt 1 made 42 rows slower than 48; the outputs are the same.
     32: {
-        "stage1": {"use_tile_resource": True, "num_dispatch_cu": 64, "b_nt": 1},
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 128,
+        },
         "stage2": {"block_n": 256},
-        "fused_stage1": {"en_order": 7, "epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 1},
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
     },
     64: {
         "stage1": {
