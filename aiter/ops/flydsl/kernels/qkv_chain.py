@@ -189,10 +189,11 @@ def _validate(
     ):
         if not (t.dtype == torch.int64 and t.is_contiguous() and t.numel() >= m):
             raise ValueError(f"{name}: needs {m} contiguous int64")
-    if not (k_scale.numel() >= 1 and v_scale.numel() >= 1):
-        raise ValueError(
-            "qkv front: need k_scale.numel() >= 1 and v_scale.numel() >= 1"
-        )
+    for name, t in (("k_scale", k_scale), ("v_scale", v_scale)):
+        # both kernels read the scalar through _gptr(..., T.f32, 4): it must be one f32 (4 bytes),
+        # a bf16 scalar would be a 2-byte read reinterpreted as f32
+        if not (t.dtype == torch.float32 and t.numel() >= 1):
+            raise ValueError(f"qkv front: need {name} float32 with numel() >= 1")
     if not (q_out.dtype == torch.bfloat16 and q_out.is_contiguous()):
         raise ValueError(
             "qkv front: need q_out.dtype == torch.bfloat16 and q_out.is_contiguous()"
@@ -211,21 +212,27 @@ def _validate(
         raise ValueError(
             "qkv front: need index_q_out.dtype == torch.float8_e4m3fn and index_q_out.stride(1) == 1 and index_q_out.stride(0) % 4 == 0"
         )
+    # page stride(0) must cover the whole page footprint: the kernels index pages by ``slot >> 7``, so an
+    # expanded/overlapping page layout (e.g. stride(0) == 0) would make distinct slots alias the same page.
     if not (
-        kv_cache.shape[1:] == (2, 128, 72)
+        kv_cache.dtype == torch.uint8
+        and kv_cache.shape[1:] == (2, 128, 72)
+        and kv_cache.stride(0) >= 2 * 128 * 72
         and kv_cache.stride(1) == 128 * 72
         and kv_cache.stride(3) == 1
     ):
         raise ValueError(
-            "qkv front: need kv_cache.shape[1:] == (2, 128, 72) and kv_cache.stride(1) == 128 * 72 and kv_cache.stride(3) == 1"
+            "qkv front: need uint8 kv_cache, kv_cache.shape[1:] == (2, 128, 72), kv_cache.stride(0) >= 2 * 128 * 72 and kv_cache.stride(1) == 128 * 72 and kv_cache.stride(3) == 1"
         )
     if not (
-        index_cache.shape[1:] == (128, 72)
+        index_cache.dtype == torch.uint8
+        and index_cache.shape[1:] == (128, 72)
+        and index_cache.stride(0) >= 128 * 72
         and index_cache.stride(1) == 72
         and index_cache.stride(2) == 1
     ):
         raise ValueError(
-            "qkv front: need index_cache.shape[1:] == (128, 72) and index_cache.stride(1) == 72 and index_cache.stride(2) == 1"
+            "qkv front: need uint8 index_cache, index_cache.shape[1:] == (128, 72), index_cache.stride(0) >= 128 * 72 and index_cache.stride(1) == 72 and index_cache.stride(2) == 1"
         )
 
 
