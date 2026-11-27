@@ -15,7 +15,11 @@ from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
+from aiter.ops.gemm_op_a16w16 import (
+    _SEMA_SHAPE,
+    _gemm_a16w16_asm,
+    get_semaphore_workspace,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import (
@@ -788,6 +792,8 @@ def test_asm_skinny_m_at_allocation_end():
     without a semaphore, which faults at address 0. The heuristic, which picks
     from the same table, must not pick such a kernel.
     """
+    if not _asm_kernels(False):  # no bf16 asm table on this arch
+        return
     torch.cuda.empty_cache()
     buf = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     n = 1536
@@ -838,6 +844,8 @@ def test_asm_no_split_heuristic_at_large_k():
     small N the heuristic prefers a split-K kernel to fill the CUs, which then
     launched with a null semaphore (ROCm/aiter#5781, address (nil) fault).
     """
+    if not _asm_kernels(False):  # no bf16 asm table on this arch
+        return
     torch.cuda.empty_cache()
     m, n, k = 64, 64, 1 << 20
     x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
@@ -847,6 +855,46 @@ def test_asm_no_split_heuristic_at_large_k():
         for split in (0, 1):
             case = f"large-K {(m, n, k)} splitK={split} heuristic"
             _check_asm_exact(x, w, out, None, bps, split, case)
+
+
+def test_asm_split_k_semaphore_checked():
+    """A split-K launch with a missing or too small semaphore is refused.
+
+    The Python wrapper always passes a full semaphore for splitK > 1, so call
+    the op directly: the launcher must raise before it launches (a split-K
+    kernel without its semaphore faults at address 0), and one counter per
+    tile (gdx * gdy) must be enough.
+    """
+    kernels = _asm_kernels(True)
+    if not kernels:  # no split-K kernels on this arch
+        return
+    k = 256  # four K blocks: a legal split of 2 for every kernel
+    for kn in kernels:
+        bps = bool(kn.bPreshuffle)
+        m, n = 2 * kn.tileM, 2 * kn.tileN
+        tiles = 4  # gdy * gdx
+        x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+        w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+        wk = shuffle_weight(w, layout=(16, 16)) if bps else w
+        out = torch.empty(m, n, dtype=dtypes.fp32, device="cuda")
+        for numel in (0, tiles - 1):
+            sema = torch.zeros(numel, dtype=torch.uint32, device="cuda")
+            try:
+                _gemm_a16w16_asm(x, wk, out, sema, None, 2, kn.knl_name, bps)
+            except RuntimeError as e:
+                assert "split-K needs a semaphore" in str(e), str(e)
+            else:
+                raise AssertionError(
+                    f"asm {kn.knl_name} was launched with {numel} < {tiles} semaphores"
+                )
+        # Exactly one counter per tile is enough, and the result is exact.
+        sema = torch.zeros(tiles, dtype=torch.uint32, device="cuda")
+        out.fill_(float("nan"))
+        _gemm_a16w16_asm(x, wk, out, sema, None, 2, kn.knl_name, bps)
+        ref = F.linear(x.float(), w.float())
+        assert torch.isclose(out, ref, rtol=1e-2, atol=1e-2).all(), kn.knl_name
+        left = int(sema.view(torch.int32).abs().max().item())
+        assert left == 0, f"{kn.knl_name} left its semaphore counters set"
 
 
 parser = argparse.ArgumentParser(
@@ -867,7 +915,8 @@ parser.add_argument(
           or -t compile    # torch.compile with weights/biases in one storage
           or -t asm_4g    # asm with A or out of 4 GiB, and A ending
                           # an allocation with a 1-row last tile or M <= 2,
-                          # and splitK=1 at large K""",
+                          # splitK=1 at large K, and a split-K launch without
+                          # a full semaphore""",
 )
 parser.add_argument(
     "-d",
@@ -961,6 +1010,7 @@ for test in args.test:
         test_asm_last_tile_at_allocation_end()
         test_asm_skinny_m_at_allocation_end()
         test_asm_no_split_heuristic_at_large_k()
+        test_asm_split_k_semaphore_checked()
         test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
