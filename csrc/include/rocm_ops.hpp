@@ -3187,3 +3187,19 @@ namespace py = pybind11;
           py::arg("decode_gate")               = py::none(),                                  \
           py::arg("decode_slot_mapping")       = py::none(),                                  \
           py::arg("decode_positions")          = py::none());
+
+#define FP8_PAGED_MQA_LOGITS_PYBIND      \
+    m.def("fp8_paged_mqa_logits",        \
+          &aiter::fp8_paged_mqa_logits,  \
+          py::arg("out"),                \
+          py::arg("q_fp8"),              \
+          py::arg("kv_cache_fp8"),       \
+          py::arg("weights"),            \
+          py::arg("context_lens"),       \
+          py::arg("block_tables"),       \
+          py::arg("max_model_len"),      \
+          py::arg("ChunkK")       = 0,   \
+          py::arg("SplitKV")      = 0,   \
+          py::arg("num_warps")    = 0,   \
+          py::arg("TotalCuCount") = 256, \
+          py::arg("RowsPerBlock") = 0);
