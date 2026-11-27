@@ -323,6 +323,7 @@ def _ep_setup(
     "do_gather, do_scatter", [(True, False), (False, True), (True, True)]
 )
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op_expert_parallel(
     m,
     n,
@@ -334,11 +335,15 @@ def test_op_expert_parallel(
     do_gather,
     do_scatter,
     apply_swiglu,
+    backend,
 ):
     """Rank-local weights + global routing reproduce the local experts' output;
     non-local gates contribute exactly 0 to the top-k combine."""
-    if not arch_info.is_fp4_avail():
+    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
+    # expert_map on the gluon path is gfx942-only (other arches assert in the wrapper)
+    if backend == "gluon" and arch_info.get_arch() != "gfx942":
+        pytest.skip("gluon expert_map is only supported on gfx942")
 
     x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
         _ep_setup(
@@ -372,7 +377,7 @@ def test_op_expert_parallel(
         None,
         torch.bfloat16,
         apply_swiglu,
-        backend="triton",
+        backend=backend,
         expert_map=expert_map,
         gate_valid=gate_valid,
     )

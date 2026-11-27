@@ -7,6 +7,12 @@ from functools import lru_cache
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_gfx942 as _moe_gemm_a16w4_gluon_gfx942,
+)
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    gfx942_a16w4_layouts,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
 )
@@ -28,7 +34,7 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950", "gfx942")
 
 
 @lru_cache(maxsize=1)
@@ -57,6 +63,21 @@ def can_overflow_int32(tensor: torch.Tensor):
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
+
+
+def _gfx942_gluon_weight_layout_ok(w, w_scales):
+    """The gfx942 Gluon kernel addresses the packed fp4 tile as uint16 with 16-byte vector
+    loads along K and, for K-contiguous scales, 4-byte vectors of e8m0 scales: the base
+    pointers and the per-column / per-expert strides must keep those alignments. Contiguous
+    (E, N, K/2) weights viewed as (E, K/2, N) satisfy this whenever K % 128 == 0; padded or
+    offset views may not, and go to the Triton kernel instead."""
+    if w.data_ptr() % 16 or w.stride(-1) % 16 or w.stride(0) % 16:
+        return False
+    if w_scales.stride(-2) == 1 and (
+        w_scales.data_ptr() % 4 or w_scales.stride(-1) % 4 or w_scales.stride(0) % 4
+    ):
+        return False
+    return True
 
 
 def allocate_output(
@@ -297,6 +318,84 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     return ret
 
 
+def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
+    """Configs for the gfx942 Gluon kernel (v_perm byte-LUT dequant, see
+    _gluon_kernels/gfx942/moe/moe_op_gemm_a16w4.py). The whole BLOCK_K x BLOCK_N bf16
+    B operand is dequantised into VGPRs, so BLOCK_K shrinks as BLOCK_M grows."""
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = get_num_xcds()
+    xcd_swizzle = num_xcds
+    # Launch-config sweep on MI300X (2026-10-22, DeepSeek-V4.1-Flash TP8 decode shapes, microbench vs exact
+    # oracle): the .cg (streaming) cache modifier on the weight loads costs 1.23x on the 3-tile down-proj
+    # (K=384, BLOCK_K=128) and is neutral elsewhere -> default loads for every block_m; the gate-up
+    # projection (K=5120, 20+ tiles) runs 1.32-1.44x faster with BLOCK_K=512 x 8 warps than with
+    # BLOCK_K=256 x 4 warps at block_m <= 32 (same 16 dwords per lane, half the iterations, 70 VGPRs).
+    w_cache_modifier = None
+    num_stages = 1
+    split_k = 1
+
+    # the kernel needs K % BLOCK_K == 0 (no K tail); K is always a multiple of 128 here (checked by
+    # the caller), but TP-sharded intermediate sizes padded to 128 (e.g. 384, 640) are not multiples of 256
+    block_k_decode = 256 if k % 256 == 0 else 128
+    # long-K projections (gate-up: K = hidden size) at decode block sizes: wider K tile, 8 warps
+    gateup_decode = k % 512 == 0 and k >= 2048
+
+    # Swept entries ship in configs/gfx942/gluon/moe/a16w4/DEFAULT.json, keyed like the
+    # Triton table (block_m is the dispatch key, fixed by routing, not a tunable); the
+    # heuristic below generalises them to unkeyed shapes.
+    waves_per_eu = 0
+    tuned = get_moe_dispatch("A16W4", "gfx942", "gluon").get(f"bm{block_m}_n{n}_k{k}")
+    if tuned is not None and k % tuned["block_k"] == 0:
+        block_n = tuned["block_n"]
+        block_k = tuned["block_k"]
+        num_warps = tuned["num_warps"]
+        waves_per_eu = tuned.get("waves_per_eu", 0)
+        w_cache_modifier = tuned.get("w_cache_modifier", None)
+    elif block_m <= 32:
+        block_n = 128
+        block_k = 512 if gateup_decode else block_k_decode
+        num_warps = 8 if gateup_decode else 4
+    elif block_m == 64:
+        block_n = 128
+        block_k = 128
+        num_warps = 8
+    else:
+        block_n = 256
+        block_k = 128
+        num_warps = 8
+
+    if block_m == 16:
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n > 16 * num_warps and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": waves_per_eu,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+
+
+@lru_cache(maxsize=64)
+def _gfx942_layouts_cached(block_m, block_n, block_k, num_warps):
+    return gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps)
+
+
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -446,6 +545,23 @@ def moe_gemm_a16w4(
 
         if get_arch() in ("gfx1250", "gfx1250-strict"):
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
+        elif get_arch() == "gfx942":
+            # Gluon kernel: linear (unswizzled) e8m0 scales, K-contiguous fp4 weights,
+            # K a multiple of the tile, vector-load-aligned strides; everything else
+            # goes to the Triton kernel.
+            config = None
+            if (
+                swizzle_mx_scale is None
+                and w.stride(-2) == 1
+                and K % 128 == 0
+                and _gfx942_gluon_weight_layout_ok(w, w_scales)
+            ):
+                config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
+                if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
+                    config = None
+            if config is None:
+                backend = "triton"
+                config = get_kernel_config_triton(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
             # and K % 256 == 0. Otherwise, fallback to Triton
@@ -499,8 +615,8 @@ def moe_gemm_a16w4(
     )
     if expert_map is not None:
         assert (
-            backend == "triton"
-        ), "expert_map (EP) is only supported on the triton backend"
+            backend == "triton" or get_arch() == "gfx942"
+        ), "expert_map (EP) is only supported on the triton backend and the gfx942 gluon kernel"
         # Non-local experts' output rows are left unwritten (no zero-fill), so the
         # combine must skip their gates -- gate_valid is required to do that.
         assert (
@@ -529,7 +645,64 @@ def moe_gemm_a16w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    if backend == "gluon":
+    if backend == "gluon" and get_arch() == "gfx942":
+        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
+            config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
+        )
+        _moe_gemm_a16w4_gluon_gfx942[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            expert_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            expert_map is not None,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SPLIT_K=config["split_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            SCALE_K_CONTIG=w_scales.stride(1) == 1,
+            LOAD_X=load_x,
+            LOAD_W=load_w,
+            LOAD_S=load_s,
+            MFMA_LAYOUT=mfma_layout,
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif backend == "gluon":
         if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
