@@ -684,3 +684,11 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 16,6656,2560,False,torch.bfloat16,torch.bfloat16,False,False
 24,6656,2560,False,torch.bfloat16,torch.bfloat16,False,False
 32,6656,2560,False,torch.bfloat16,torch.bfloat16,False,False
+48,6656,2560,False,torch.bfloat16,torch.bfloat16,False,False
+128,6656,2560,False,torch.bfloat16,torch.bfloat16,False,False
+24,8192,2560,False,torch.bfloat16,torch.bfloat16,False,False
+48,8192,2560,False,torch.bfloat16,torch.bfloat16,False,False
+128,8192,2560,False,torch.bfloat16,torch.bfloat16,False,False
+24,124160,2560,False,torch.bfloat16,torch.bfloat16,False,False
+48,124160,2560,False,torch.bfloat16,torch.bfloat16,False,False
+8192,124160,2560,False,torch.bfloat16,torch.bfloat16,False,False
