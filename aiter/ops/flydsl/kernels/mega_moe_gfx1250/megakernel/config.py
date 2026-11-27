@@ -28,10 +28,21 @@ from .protocol import (
 #: every rank, so every rank picks the same path.
 SLOTS_TOKENS = 512
 #: With IOD-placed weights (AITER_MOE_LOC) slots runs steps of up to this many
-#: tokens per rank: placed, both claim by IOD domain, and compact's 128-row
-#: tile is faster past it (DSR1 EP4 MoE alone, us/layer, slots by domain /
-#: compact 128-row: 256 tokens 197.0 / 202.3, 512 tokens 258.3 / 243.1).
-SLOTS_TOKENS_PLACED = 256
+#: tokens per rank, by (hidden, inter): placed, slots claims by IOD domain, and
+#: compact's 128-row tile is faster past it. Where it crosses depends on the
+#: model: compact's fixed cost (every expert's weights read once, the dispatch
+#: ahead of the first m-tile) weighs more with more experts per rank and fewer
+#: rows each. EP4, MoE alone, steady state at the power limit, us/layer, slots /
+#: compact:
+#: - DeepSeek-R1 (recorded routing): 128 tokens 129.6 / 145.9, 192 150.9 /
+#:   154.9, 256 173.5 / 159.3, 384 195.0 / 176.8.
+#: - DSV4.1 Flash (uniform routing): 512 tokens 168.5 / 184.4, 768 173.8 /
+#:   189.5, 896 195.6 / 193.5, 1024 203.4 / 195.2.
+SLOTS_TOKENS_PLACED = {
+    (7168, 2048): 192,  # DeepSeek-R1
+    (5120, 2304): 768,  # DSV4.1 Flash
+    None: 256,
+}
 COMPACT_MAX_TOKENS = 8192
 
 #: slots' GEMM tiles: the a4w4 CSV's decode row for this shape family. The
@@ -200,7 +211,12 @@ def slots_tokens(config) -> int:
     ``max_tokens_per_rank``."""
     from ..s1f_ctl import iod_placement_reason
 
-    cap = SLOTS_TOKENS if iod_placement_reason() is None else SLOTS_TOKENS_PLACED
+    if iod_placement_reason() is None:
+        cap = SLOTS_TOKENS
+    else:
+        cap = SLOTS_TOKENS_PLACED.get(
+            (config.hidden_dim, config.geometry.inter_dim), SLOTS_TOKENS_PLACED[None]
+        )
     return min(cap, int(config.geometry.max_tokens_per_rank))
 
 
