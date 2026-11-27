@@ -114,11 +114,8 @@ def _rsrc(base, nbytes):
     )
 
 
-def cand_dwords(strips: int) -> int:
-    """LDS dwords of one row's candidate pairs (``row_top16``'s ``cand``)."""
-    return 2 * (CAP + 8 + 64)
-
-
+# LDS dwords of one row's candidate pairs (``row_top16``'s ``cand``).
+CAND_DWORDS = 2 * (CAP + 8 + 64)
 SEL_DWORDS = 4 * TOPK  # LDS dwords of one row's running top 16 (``sel``)
 
 
@@ -159,7 +156,6 @@ def row_top16(
     # running / window candidates, rank-loop padding, then one discard slot per lane; an overflowing window rebuilds
     # its candidates exactly
     TRASH = CAP + RANK_BLOCK
-    assert cand_dwords(strips) == 2 * (TRASH + 64)
 
     def at(base, i):
         return i if isinstance(base, int) and base == 0 else i + base
@@ -413,6 +409,7 @@ def row_top16(
     )
 
 
+@functools.cache
 def build_topk_per_row_small_k_wave_module(strips: int, full_rows: bool):
     """One window tile (``strips``); the row count, width, ``init`` / ``local`` and strides are launch arguments.
 
@@ -420,7 +417,7 @@ def build_topk_per_row_small_k_wave_module(strips: int, full_rows: bool):
     """
     assert strips in STRIP_TILES
     STRIPS = strips
-    CAND = cand_dwords(STRIPS) // 2
+    CAND = CAND_DWORDS // 2
     name = f"topk_per_row_small_k_wave_s{STRIPS}" + ("_full" if full_rows else "")
 
     @fx.struct
@@ -511,11 +508,6 @@ def build_topk_per_row_small_k_wave_module(strips: int, full_rows: bool):
         }
     }
     return launch
-
-
-build_topk_per_row_small_k_wave_module = functools.cache(
-    build_topk_per_row_small_k_wave_module
-)
 
 
 def wave_strips(width: int) -> int:
