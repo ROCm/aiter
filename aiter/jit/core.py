@@ -2391,6 +2391,26 @@ def _pybind_develop_hooks():
     return _pybind_develop_hooks_cache
 
 
+def _develop_device(args, kwargs, tensor_cls):
+    """Device of the first GPU tensor argument (list elements included), or -1.
+
+    The C++ side guards to that device, so the op needs that device's current
+    stream, as torch ops and the ctypes path use.
+    """
+    for a in (*args, *kwargs.values()) if kwargs else args:
+        if isinstance(a, tensor_cls):
+            device = a.get_device()
+            if device >= 0:
+                return device
+        elif isinstance(a, (list, tuple)):
+            for x in a:
+                if isinstance(x, tensor_cls):
+                    device = x.get_device()
+                    if device >= 0:
+                        return device
+    return -1
+
+
 def _develop_arg(a, convert, tensor_cls):
     """`a` as a develop=True pybind op takes it: a tensor converted, and so is
     every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
@@ -2706,6 +2726,7 @@ def compile_ops(
                             ),
                         )
 
+                    device = _develop_device(args, kwargs, tensor_cls)
                     args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
@@ -2713,7 +2734,9 @@ def compile_ops(
                             for k, v in kwargs.items()
                         }
 
-                    module._set_current_hip_stream(raw_stream(current_device()))
+                    module._set_current_hip_stream(
+                        raw_stream(current_device() if device < 0 else device)
+                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
