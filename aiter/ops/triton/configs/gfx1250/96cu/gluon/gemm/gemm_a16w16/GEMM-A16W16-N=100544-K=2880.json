@@ -56,14 +56,14 @@
         "REGISTER_STORE": 2
     },
     "M_LEQ_128": {
-        "BLOCK_M": 64,
+        "BLOCK_M": 128,
         "BLOCK_N": 128,
-        "BLOCK_K": 128,
-        "NUM_BUFFERS": 2,
-        "num_warps": 2,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
         "kernel_type": "compute_bound",
-        "waves_per_eu": 0,
-        "REGISTER_STORE": 2
+        "waves_per_eu": 1,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_256": {
         "BLOCK_M": 256,
