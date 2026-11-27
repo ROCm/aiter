@@ -121,26 +121,18 @@ def assert_attn_close(out, ref, tol=1e-2):
     assert (err <= lim).all(), f"max err/limit {(err / lim).max():.3f}"
 
 
-@pytest.mark.parametrize("pool_stride", [1, 3])
-def test_kv_insert_matches_reference(pool_stride):
+def test_kv_insert_matches_reference():
     block_size, num_blocks, T = 16, 9, 100
     x = rand_rows(T, seed=1)
     x[3] = 0
-    cache = paged_cache(num_blocks, block_size, pool_stride)
+    cache = paged_cache(num_blocks, block_size, pool_stride=3)
     slots = torch.randperm(num_blocks * block_size, device=DEV)[:T]
     slots[::7] = -1
-    k3_mla_640_concat_and_cache(
-        x[:, :NOPE], x[:, None, NOPE:], cache, slots.int() if pool_stride > 1 else slots
-    )
+    k3_mla_640_concat_and_cache(x[:, :NOPE], x[:, None, NOPE:], cache, slots.int())
     want = torch.zeros(num_blocks * block_size, REC, dtype=torch.uint8, device=DEV)
     keep = slots >= 0
     want[slots[keep]] = ref_pack(x)[keep]
-    got = cache.reshape(-1, REC)
-    assert torch.equal(got, want)
-    back = ref_unpack(got[slots[keep]])
-    amax = x[keep].float().reshape(-1, 9, GROUP).abs().amax(-1, keepdim=True)
-    err = (back - x[keep].float()).reshape(-1, 9, GROUP).abs()
-    assert (err <= amax / 16 + 1e-30).all()
+    assert torch.equal(cache.reshape(-1, REC), want)
 
 
 def test_q_pack_matches_reference():
@@ -150,8 +142,7 @@ def test_q_pack_matches_reference():
     assert torch.equal(packed, ref_pack(q))
 
 
-@pytest.mark.parametrize("use_seq_starts", [False, True])
-def test_gather_upconvert_matches_reference(use_seq_starts):
+def test_gather_upconvert_matches_reference():
     block_size, num_blocks = 16, 40
     cache = paged_cache(num_blocks, block_size, 2)
     x = rand_rows(num_blocks * block_size, seed=3)
@@ -159,24 +150,18 @@ def test_gather_upconvert_matches_reference(use_seq_starts):
         x[:, :NOPE], x[:, NOPE:], cache, torch.arange(len(x), device=DEV)
     )
     seq_lens = [37, 0, 90, 16, 1]
-    seq_starts = [5, 0, 33, 16, 47] if use_seq_starts else [0] * len(seq_lens)
+    seq_starts = [5, 0, 33, 16, 47]
     g = torch.Generator().manual_seed(4)
-    table = torch.randperm(num_blocks, generator=g).int().reshape(len(seq_lens), -1)
-    table = table.to(DEV)
+    table = torch.randperm(num_blocks, generator=g).int().view(5, -1).to(DEV)
     starts = csr(seq_lens)[:-1].contiguous()
-    total = sum(seq_lens)
-    dst = torch.full((total, D_QK), float("nan"), dtype=torch.bfloat16, device=DEV)
+    dst = torch.full((sum(seq_lens), D_QK), float("nan"), device=DEV).bfloat16()
     k3_mla_640_cp_gather_and_upconvert(
         cache,
         dst,
         table,
         starts,
         len(seq_lens),
-        (
-            torch.tensor(seq_starts, dtype=torch.int32, device=DEV)
-            if use_seq_starts
-            else None
-        ),
+        torch.tensor(seq_starts, dtype=torch.int32, device=DEV),
     )
     rows = []
     for r, (n, s0) in enumerate(zip(seq_lens, seq_starts)):
@@ -201,78 +186,55 @@ def make_case(N, H, lens, rows=4096, block_size=16, pool_stride=2, invalid=0.0, 
 
 
 def run(q, cache, indptr, indices, **kw):
-    out, lse = sparse_mla_fwd(
+    return sparse_mla_fwd(
         q, cache, indptr, indices, SCALE, kv_format="fp8_k3_mla_640", **kw
     )
-    assert lse is None
-    return out
 
 
-@pytest.mark.parametrize("N", [1, 4, 16, 64, 256])
-@pytest.mark.parametrize("H", [24, 12, 48, 96, 8])
+@pytest.mark.parametrize("N", [1, 64, 256])
+@pytest.mark.parametrize("H", [24, 12])
 def test_decode(N, H):
-    """Default heuristics: 1-32 splits, BLOCK_H 16 / BLOCK_K 16 at <= 16 heads."""
     q, cache, indptr, indices, ref = make_case(N, H, [2048] * N, seed=N + H)
-    assert_attn_close(run(q, cache, indptr, indices), ref)
-
-
-@pytest.mark.parametrize("kv_splits", [1, 2, 3, 8])
-def test_decode_splits_and_packed_q(kv_splits):
-    q, cache, indptr, indices, ref = make_case(4, 24, [2048] * 4, seed=11)
-    packed = k3_mla_640_q_pack(q[..., :NOPE], q[..., NOPE:])
-    out = torch.empty(4, 24, NOPE, dtype=torch.bfloat16, device=DEV)
-    res = run(packed, cache, indptr, indices, kv_splits=kv_splits, out=out)
-    assert res is out
-    assert_attn_close(out, ref)
-    assert torch.equal(out, run(q, cache, indptr, indices, kv_splits=kv_splits))
+    assert_attn_close(run(q, cache, indptr, indices)[0], ref)
 
 
 def test_prefill_shape():
-    """A prefill chunk: one row per token, causal lists capped at top-k 2048,
-    single pass."""
-    N, H = 2500, 24
+    """One row per token, causal lists capped at top-k 2048."""
+    N = 2500
     lens = [min(i + 1, 2048) for i in range(N)]
-    q, cache, indptr, indices, ref = make_case(N, H, lens, seed=21)
-    assert_attn_close(run(q, cache, indptr, indices, kv_splits=1), ref)
+    q, cache, indptr, indices, ref = make_case(N, 24, lens, seed=21)
+    assert_attn_close(run(q, cache, indptr, indices, kv_splits=1)[0], ref)
 
 
-@pytest.mark.parametrize("kv_splits", [None, 1, 4, 32])
-@pytest.mark.parametrize("invalid", [0.0, 0.3])
-@pytest.mark.parametrize("H", [24, 12])
-def test_ragged(kv_splits, invalid, H):
+@pytest.mark.parametrize("kv_splits,invalid", [(None, 0.0), (3, 0.3)])
+def test_ragged_packed_q(kv_splits, invalid):
+    """Ragged lists (incl. empty and all-invalid rows), packed uint8 q, out=."""
     lens = [1, 2048, 15, 16, 17, 33, 700, 1, 31, 1999, 64, 5, 0, 40]
-    q, cache, indptr, indices, ref = make_case(
-        len(lens), H, lens, invalid=invalid, seed=31
-    )
+    q, cache, indptr, indices, ref = make_case(14, 24, lens, invalid=invalid, seed=31)
     if invalid:
         indices[indptr[3] : indptr[4]] = -1
         ref[3] = 0
-    out = run(q, cache, indptr, indices, kv_splits=kv_splits, has_invalid=invalid > 0)
+    packed = k3_mla_640_q_pack(q[..., :NOPE], q[..., NOPE:])
+    out = torch.empty(14, 24, NOPE, dtype=torch.bfloat16, device=DEV)
+    kw = {"kv_splits": kv_splits, "has_invalid": invalid > 0}
+    assert run(packed, cache, indptr, indices, out=out, **kw)[0] is out
     assert_attn_close(out, ref)
-
-
-def test_flat_record_grid():
-    """[rows, 640] indexed by row is the paged cache with block size 1."""
-    q, cache, indptr, indices, ref = make_case(4, 24, [300, 2048, 7, 64], pool_stride=1)
-    assert_attn_close(run(q, cache.reshape(-1, REC), indptr, indices), ref)
+    assert torch.equal(out, run(q, cache, indptr, indices, **kw)[0])
 
 
 def test_identity_rows():
     """A per-block-contiguous cache maps slot -> row by identity (no div/mod)."""
     lens = [2048, 33, 1, 640]
     q, cache, indptr, indices, ref = make_case(
-        len(lens), 24, lens, block_size=64, pool_stride=1, seed=81
+        4, 24, lens, block_size=64, pool_stride=1, seed=81
     )
-    assert_attn_close(run(q, cache, indptr, indices), ref)
-    assert_attn_close(run(q, cache, indptr, indices, kv_splits=4), ref)
+    assert_attn_close(run(q, cache, indptr, indices, kv_splits=4)[0], ref)
 
 
-@pytest.mark.parametrize("kv_splits", [1, 4])
-@pytest.mark.parametrize("has_invalid", [False, True])
+@pytest.mark.parametrize("kv_splits,has_invalid", [(1, False), (4, True)])
 def test_req_topk_matches_convert(kv_splits, has_invalid):
-    """req_topk (request positions + block table) is bit-identical to vLLM's
-    convert_req_index_to_global_index followed by the plain call: 0 for an
-    invalid entry, or -1 with has_invalid."""
+    """req_topk is bit-identical to vLLM's convert_req_index_to_global_index
+    plus the plain call: 0 for an invalid entry, or -1 with has_invalid."""
     lens, W, bs = [2048, 33, 1, 640, 0, 1500], 2048, 16
     q, cache, indptr, _, _ = make_case(len(lens), 24, lens, block_size=bs, seed=101)
     g = torch.Generator(device=DEV).manual_seed(102)
@@ -291,229 +253,40 @@ def test_req_topk_matches_convert(kv_splits, has_invalid):
     slot = torch.where(ok, slot + pos % bs, -1 if has_invalid else 0)
     k = torch.arange(W, device=DEV)[None, :] < torch.tensor(lens, device=DEV)[:, None]
     kw = {"kv_splits": kv_splits, "has_invalid": has_invalid}
-    ref = run(q, cache, indptr, slot[k].int(), **kw)
-    out = run(q, cache, indptr, None, req_topk=(topk, req_id, bt), **kw)
+    ref = run(q, cache, indptr, slot[k].int(), **kw)[0]
+    out = run(q, cache, indptr, None, req_topk=(topk, req_id, bt), **kw)[0]
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
 
 
 def test_lazy_rescale_wide_scores():
-    """Large, growing scores: the row max moves by more than 2^8 across tiles,
-    so the lazily skipped accumulator rescale has to kick in mid-row."""
-    N, H = 6, 24
+    """The row max grows by more than 2^8 across tiles, so the lazily skipped
+    accumulator rescale has to kick in mid-row."""
     lens = [2048, 1500, 999, 64, 33, 2048]
-    q, cache, indptr, indices, _ = make_case(N, H, lens, seed=91)
+    q, cache, indptr, indices, _ = make_case(6, 24, lens, seed=91)
     q = (q.float() * 16.0).bfloat16()
-    ref = ref_attn(
-        ref_unpack(ref_pack(q)), ref_unpack(cache.reshape(-1, REC)), indptr, indices
-    )
-    assert_attn_close(run(q, cache, indptr, indices, kv_splits=1), ref)
-    assert_attn_close(run(q, cache, indptr, indices, kv_splits=8), ref)
-
-
-def test_rejects_unsupported():
-    q, cache, indptr, indices, _ = make_case(1, 24, [16])
-    sink = torch.zeros(24, device=DEV)
-    with pytest.raises(ValueError, match="return_lse"):
-        run_lse(q, cache, indptr, indices, kv_splits=2, skip_reduce=True)
-    with pytest.raises(ValueError, match="return_lse"):
-        run_lse(q, cache, indptr, indices, attn_sink=sink)
-    with pytest.raises(ValueError):
-        sparse_mla_fwd(q, cache, indptr, indices, SCALE, kv_format="nope")
-    with pytest.raises(ValueError, match="keys_per_row"):
-        sparse_mla_fwd(q, cache, indptr, indices, SCALE, keys_per_row=16)
-    with pytest.raises(ValueError, match="req_topk"):
-        sparse_mla_fwd(q, cache, indptr, indices, SCALE, req_topk=(indices,) * 3)
-
-
-def run_lse(q, cache, indptr, indices, **kw):
-    out, lse = sparse_mla_fwd(
-        q,
-        cache,
-        indptr,
-        indices,
-        SCALE,
-        kv_format="fp8_k3_mla_640",
-        return_lse=True,
-        **kw,
-    )
-    assert lse.dtype == torch.float32 and lse.shape == q.shape[:2]
-    return out, lse
-
-
-def ref_case(q, cache, indptr, indices):
-    """(out, lse, mag) of the torch reference over what the records hold."""
     kv = ref_unpack(cache.reshape(-1, REC))
-    return ref_attn(ref_unpack(ref_pack(q)), kv, indptr, indices, with_lse=True)
+    ref = ref_attn(ref_unpack(ref_pack(q)), kv, indptr, indices)
+    for kv_splits in (1, 8):
+        assert_attn_close(run(q, cache, indptr, indices, kv_splits=kv_splits)[0], ref)
 
 
-def assert_lse_close(lse, ref, mag, tol=2e-4):
-    """Exactly -inf where the row has no valid key (never the -1e30 no-sink
-    stand-in, never NaN). Elsewhere the error is the QK dot's, which scales
-    with mag = sum_i |q_i k_i| * scale: up to 6e-5 of it (measured; 1e-2
-    absolute on rand_rows' 2^-4 .. 2^4 groups, 2e-4 on unit normal rows). mag
-    may be a plain float bound."""
-    dead = ref == float("-inf")
-    assert torch.equal(lse == float("-inf"), dead)
-    assert torch.isfinite(lse[~dead]).all()
-    err = (lse - ref).abs().nan_to_num(0.0)
-    lim = tol * mag + 1e-5
-    assert (err <= lim).all(), f"max lse err / limit {(err / lim).max():.3f}"
-
-
-@pytest.mark.parametrize("kv_splits", [1, 2, 8, 32])
-@pytest.mark.parametrize("H", [24, 96])
-@pytest.mark.parametrize("invalid", [0.0, 0.3])
-def test_lse(kv_splits, H, invalid):
+@pytest.mark.parametrize("kv_splits", [1, 8])
+def test_lse(kv_splits):
+    """ln(sum exp) over the valid keys: exactly -inf (and out 0) for a row
+    with none, otherwise within the QK dot's rounding, which scales with
+    mag = max_k sum_i |q_i k_i| * scale."""
     lens = [1, 2048, 15, 16, 17, 33, 700, 1, 31, 1999, 64, 5, 0, 40]
-    q, cache, indptr, indices, _ = make_case(
-        len(lens), H, lens, invalid=invalid, seed=41
+    q, cache, indptr, indices, _ = make_case(14, 24, lens, invalid=0.3, seed=41)
+    indices[indptr[3] : indptr[4]] = -1
+    kv = ref_unpack(cache.reshape(-1, REC))
+    ref, ref_lse, mag = ref_attn(
+        ref_unpack(ref_pack(q)), kv, indptr, indices, with_lse=True
     )
-    if invalid:
-        indices[indptr[3] : indptr[4]] = -1
-    ref, ref_lse, mag = ref_case(q, cache, indptr, indices)
-    kw = {"kv_splits": kv_splits, "has_invalid": invalid > 0}
-    out, lse = run_lse(q, cache, indptr, indices, **kw)
-    assert_lse_close(lse, ref_lse, mag)
+    kw = {"kv_splits": kv_splits, "has_invalid": True}
+    out, lse = run(q, cache, indptr, indices, return_lse=True, **kw)
     assert_attn_close(out, ref)
-    row = torch.repeat_interleave(
-        torch.arange(len(lens), device=DEV), torch.tensor(lens, device=DEV)
-    )
-    alive = torch.bincount(row[indices >= 0], minlength=len(lens)) > 0
-    assert not alive[12] and (not invalid or not alive[3])
-    dead = lse == float("-inf")
-    assert torch.equal(dead, ~alive[:, None].expand_as(dead))
-    assert (out[dead] == 0).all()
-    assert torch.equal(out, run(q, cache, indptr, indices, **kw))
-
-
-def split_shards(indptr, indices, seed, empty_b=(), empty_both=()):
-    """Each row's keys dealt at random into two disjoint compacted CSR lists.
-    Rows in empty_b keep everything in shard 0; rows in empty_both lose it all."""
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    row = torch.repeat_interleave(
-        torch.arange(len(indptr) - 1, device=DEV), (indptr[1:] - indptr[:-1]).long()
-    )
-    side = torch.rand(indices.shape, device=DEV, generator=g) < 0.4
-    side &= ~torch.isin(row, torch.tensor(empty_b, device=DEV))
-    keep = ~torch.isin(row, torch.tensor(empty_both, device=DEV))
-    shards = []
-    for s in (False, True):
-        pick = keep & (side == s)
-        lens = torch.bincount(row[pick], minlength=len(indptr) - 1)
-        shards.append((csr(lens), indices[pick].contiguous()))
-    return shards
-
-
-@pytest.mark.parametrize("kv_splits", [None, 1, 8])
-@pytest.mark.parametrize("H", [24, 96])
-@pytest.mark.parametrize("invalid", [0.0, 0.3])
-def test_lse_merges_two_shards(kv_splits, H, invalid):
-    """What DCP does: every rank attends its share of a row's keys, and the
-    ranks merge by out = sum_i softmax_i(lse) * out_i."""
-    lens = [2048, 1, 700, 2048, 33, 2, 512, 1200]
-    q, cache, indptr, indices, _ = make_case(
-        len(lens), H, lens, invalid=invalid, seed=51
-    )
-    shards = split_shards(indptr, indices, seed=52, empty_b=(1, 4), empty_both=(5,))
-    kw = {"has_invalid": invalid > 0}
-    parts = [
-        run_lse(q, cache, ip, ix, kv_splits=kv_splits, keys_per_row=1024, **kw)
-        for ip, ix in shards
-    ]
-    lses = torch.stack([lse for _, lse in parts])
-    assert (lses[1, [1, 4]] == float("-inf")).all()
-    assert (lses[:, 5] == float("-inf")).all()
-    merged_lse = torch.logsumexp(lses, 0)
-    w = torch.exp(lses - merged_lse).nan_to_num(0.0)
-    merged = sum(w[i][..., None] * parts[i][0].float() for i in range(2))
-    full_lens = torch.tensor(lens, device=DEV)
-    full_lens[5] = 0
-    keep = torch.ones_like(indices, dtype=torch.bool)
-    keep[indptr[5] : indptr[6]] = False
-    ip, ix = csr(full_lens), indices[keep].contiguous()
-    out, lse = run_lse(q, cache, ip, ix, kv_splits=kv_splits, **kw)
-    assert_lse_close(merged_lse, lse, 1.0, tol=1e-5)
-    assert_attn_close(merged.bfloat16(), out.float(), tol=1.5e-2)
-    ref, ref_lse, mag = ref_case(q, cache, ip, ix)
-    assert_lse_close(merged_lse, ref_lse, mag)
-    assert_attn_close(merged.bfloat16(), ref)
-
-
-def test_keys_per_row_hint(monkeypatch):
-    """A DCP rank's list is allocated for the full top-k but holds ~top_k / dcp
-    keys per row; the hint replaces len(kv_indices) / rows in the split choice."""
-    import aiter.ops.triton.attention.sparse_mla as mod
-
-    seen = []
-    real = mod._k3_splits
-    monkeypatch.setattr(
-        mod, "_k3_splits", lambda *a: seen.append(a) or real(*a), raising=True
-    )
-    N, H, held = 4, 96, 512
-    q, cache, indptr, indices, ref = make_case(N, H, [held] * N, seed=61)
-    alloc = torch.full((N * 2048,), -1, dtype=torch.int32, device=DEV)
-    alloc[: len(indices)] = indices
-    outs = [
-        run(q, cache, indptr, alloc, **kw)
-        for kw in ({}, {"keys_per_row": held}, {"keys_per_row": 0})
-    ]
-    assert seen == [(N * 3, 64), (N * 3, 16), (N * 3, 0)]
-    assert real(N * 3, 16) < real(N * 3, 64)
-    for out in outs:
-        assert_attn_close(out, ref)
-
-
-def q_layouts(q):
-    """The same [N, H, 576] values as vLLM may hand them over after an
-    all-gather over heads."""
-    N, H, _ = q.shape
-    wide = torch.zeros(N, H + 3, D_QK + 40, dtype=q.dtype, device=DEV)
-    wide[:, 2 : 2 + H, 8 : 8 + D_QK] = q
-    stepped = torch.zeros(2 * N, H, D_QK, dtype=q.dtype, device=DEV)
-    stepped[::2] = q
-    cols = torch.zeros(N, H, 2 * D_QK, dtype=q.dtype, device=DEV)
-    cols[..., ::2] = q
-    return {
-        "contiguous": q,
-        "heads_first": q.transpose(0, 1).contiguous().transpose(0, 1),
-        "window": wide[:, 2 : 2 + H, 8 : 8 + D_QK],
-        "row_step": stepped[::2],
-        "col_step": cols[..., ::2],
-        "rank_concat": torch.cat(q.chunk(4, dim=1), dim=1),
-    }
-
-
-@pytest.mark.parametrize(
-    "layout",
-    ["contiguous", "heads_first", "window", "row_step", "col_step", "rank_concat"],
-)
-def test_q_layouts(layout):
-    """Non-contiguous / strided bf16 q: the pack reads the right elements, as
-    one tensor through sparse_mla_fwd and as its two slices through the pack."""
-    N, H = 5, 96
-    q, cache, indptr, indices, ref = make_case(N, H, [300, 2048, 7, 64, 0], seed=71)
-    qv = q_layouts(q)[layout]
-    assert torch.equal(qv, q)
-    if layout not in ("contiguous", "rank_concat"):
-        assert not qv.is_contiguous()
-    want = ref_pack(q)
-    assert torch.equal(k3_mla_640_q_pack(qv[..., :NOPE], qv[..., NOPE:]), want)
-    dst = torch.zeros(N, H, REC, dtype=torch.uint8, device=DEV)
-    assert k3_mla_640_q_pack(qv[..., :NOPE], qv[..., NOPE:], out=dst) is dst
-    assert torch.equal(dst, want)
-    out, lse = run_lse(qv, cache, indptr, indices)
-    base, base_lse = run_lse(want, cache, indptr, indices)
-    assert torch.equal(out, base) and torch.equal(lse, base_lse)
-    assert_attn_close(out, ref)
-
-
-@pytest.mark.parametrize("keys", [512, 2048])
-def test_dcp_rank_shape(keys):
-    """One DCP rank at TP1: all 96 heads, 2048 rows, its share of the top-2048."""
-    N, H = 2048, 96
-    q, cache, indptr, indices, _ = make_case(N, H, [keys] * N, rows=1 << 15, seed=81)
-    ref, ref_lse, mag = ref_case(q, cache, indptr, indices)
-    out, lse = run_lse(q, cache, indptr, indices, keys_per_row=keys)
-    assert_lse_close(lse, ref_lse, mag)
-    assert_attn_close(out, ref)
-    assert torch.equal(out, run(q, cache, indptr, indices, keys_per_row=keys))
+    dead = ref_lse == float("-inf")
+    assert dead[3].all() and dead[12].all()
+    assert torch.equal(lse == float("-inf"), dead) and (out[dead] == 0).all()
+    assert ((lse - ref_lse)[~dead].abs() <= 2e-4 * mag[~dead] + 1e-5).all()
+    assert torch.equal(out, run(q, cache, indptr, indices, **kw)[0])

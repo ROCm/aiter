@@ -492,8 +492,6 @@ def _k3_no_sink(num_heads, device):
     return torch.full((num_heads,), -1e30, dtype=torch.float32, device=device)
 
 
-# Lazy online-softmax rescale threshold (log2 units): the accumulator is only
-# rescaled when a row max grows by more than 2^8.
 _K3_LAZY_TH = 8.0
 
 
