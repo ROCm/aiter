@@ -6895,8 +6895,7 @@ def fused_moe_2stages(
         )
         if _layout_why is not None:
             raise NotImplementedError(
-                "a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: "
-                f"{_layout_why}."
+                "a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: " f"{_layout_why}."
             )
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)

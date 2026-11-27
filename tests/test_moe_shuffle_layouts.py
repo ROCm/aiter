@@ -73,13 +73,13 @@ def test_a16w4_scales_match_generic_preshuffle_and_pad_with_e8m0_one():
             scale = torch.randint(0, 255, (_E * rows, groups), dtype=torch.uint8)
             a16w4 = shuffle_scale_a16w4(scale, _E, False)
             generic = shuffle_scale(scale, _E, is_guinterleave=False)
-            assert torch.equal(a16w4, generic), (
-                f"a16w4 scale != generic scale for {(rows, groups)}"
-            )
+            assert torch.equal(
+                a16w4, generic
+            ), f"a16w4 scale != generic scale for {(rows, groups)}"
             gugu = shuffle_scale_a16w4(scale, _E, True)
-            assert not torch.equal(gugu, generic), (
-                f"GUGU scale collapsed onto the generic preshuffle for {(rows, groups)}"
-            )
+            assert not torch.equal(
+                gugu, generic
+            ), f"GUGU scale collapsed onto the generic preshuffle for {(rows, groups)}"
             # A constant payload makes the 0x7F pad countable after permutation.
             # 384's w2 scale has 12 groups, which both functions pad to 16.
             padded = (groups + 7) // 8 * 8
