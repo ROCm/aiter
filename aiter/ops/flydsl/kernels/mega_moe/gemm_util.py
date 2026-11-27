@@ -41,16 +41,17 @@ def _token_offset(srcmap_word, row_units, token_base):
 class TileScheduler:
     """Per-tile expert / gate-base-row resolver (flat persistent loop + XCD swizzle live in kernel body)."""
 
-    def __init__(self, *, expert_rsrc, inter_dim, expert_offset=0):
+    def __init__(self, *, expert_rsrc, inter_dim, experts_per_rank=0):
         self._expert_rsrc = expert_rsrc
         self._inter_dim = inter_dim
-        # Dispatch emits global expert IDs while W1 is rank-local.
-        self._expert_offset = int(expert_offset)
+        # Dispatch emits global expert IDs while W1 is rank-local: a rank's IDs
+        # modulo its expert count are its W1 indices.
+        self._experts_per_rank = int(experts_per_rank)
 
     def expert_of(self, m_tile_i32):
         g = self._expert_rsrc[m_tile_i32]
-        if const_expr(self._expert_offset != 0):
-            return g - fx.Int32(self._expert_offset)
+        if const_expr(self._experts_per_rank != 0):
+            return g % fx.Int32(self._experts_per_rank)
         return g
 
     def gate_base_row(self, expert_i32):

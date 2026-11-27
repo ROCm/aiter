@@ -1477,7 +1477,7 @@ def derive_stage2_emit_constants(*, model_dim, topk, rank, npes, max_tok, expert
         "lds_weight_off": lds_weight_off, "lds_peer_off": lds_peer_off, "lds_flag_off": lds_flag_off,
         "lds_bytes": lds_bytes, "recv_cap": _recv_cap, "comb_inp_nbytes": _comb_inp_nbytes,
         "row_nbytes": _row_nbytes, "log2_max_tok": max_tok.bit_length() - 1, "mask_max_tok": max_tok - 1,
-        "expert_offset": rank * experts, "N_OUT": model_dim, "NW": NW,
+        "N_OUT": model_dim, "NW": NW,
     }
 
 
@@ -1521,7 +1521,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
     lds_peer_off, lds_flag_off = c["lds_peer_off"], c["lds_flag_off"]
     _recv_cap, _comb_inp_nbytes = c["recv_cap"], c["comb_inp_nbytes"]
     log2_max_tok, mask_max_tok = c["log2_max_tok"], c["mask_max_tok"]
-    _expert_offset, N_OUT = c["expert_offset"], c["N_OUT"]
+    N_OUT = c["N_OUT"]
     p2p_cache_mod = int(p2p_cache_mod)
     scale_stage_nbytes = int(scale_stage_nbytes)
     num_n_blocks_c = N_OUT // BN
@@ -1660,7 +1660,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=_expert_offset, NW=NW, early_b_load=True,
+            experts_per_rank=experts, NW=NW, early_b_load=True,
             a_dma_uniform=a_dma_uniform, a_scale_lds=g2_as_lds, fold_rows=FOLD, fold=fold)
         fold_accs = accm_vecs[BM // 16:]
         accm_vecs = accm_vecs[:BM // 16]
@@ -2482,7 +2482,7 @@ def compile_mega_moe_stage1(
             tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
             m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_k_step_bytes=A_K_STEP_BYTES,
             total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
-            n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
+            n_tiles=N_TILES, experts_per_rank=fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
             evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
@@ -2503,7 +2503,7 @@ def compile_mega_moe_stage1(
                 tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
                 m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_k_step_bytes=A_K_STEP_BYTES,
                 total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
-                n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
+                n_tiles=N_TILES, experts_per_rank=fz_epr, b_cache_modifier=b_cache_modifier,
                 swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
                 evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,

@@ -237,7 +237,7 @@ def gemm2_compute_v2(
     g2_ascale_pf=True,
     g2_b2stage=False,
     g2_deep_a_pipeline=False,
-    expert_offset=0,
+    experts_per_rank=0,
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
@@ -319,8 +319,8 @@ def gemm2_compute_v2(
         else:
             m_row = m_block_idx * BM
             e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
-    if const_expr(expert_offset != 0):
-        e = e - fx.Int32(expert_offset)
+    if const_expr(experts_per_rank != 0):
+        e = fx.Int32(e) % fx.Int32(experts_per_rank)
 
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16

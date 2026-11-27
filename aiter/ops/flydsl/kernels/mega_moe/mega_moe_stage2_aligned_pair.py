@@ -216,7 +216,6 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     if max_tok <= 0 or max_tok & (max_tok - 1):
         raise ValueError("max_tok must be a positive power of two")
     mask_max_tok = max_tok - 1
-    expert_offset = rank * experts
     total_experts = npes * experts
     total_segments = total_experts + npes
     k_bytes = inter_dim // a_pack
@@ -281,8 +280,6 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         pair_enabled = fx.Int32(
             rocdl.readfirstlane(T.i32, pair_enabled_lane)
         )
-        global_a = fx.Int32(expert_offset) + pair_a_rt
-        global_b = fx.Int32(expert_offset) + pair_b_rt
         group_a_lane = fx.Int32(0)
         group_b_lane = fx.Int32(0)
         group_rows_lane = fx.Int32(0)
@@ -371,8 +368,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
                 g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
                 g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
-                expert_offset=expert_offset, explicit_m_row=m_row_a,
-                explicit_n_block=n_block, explicit_expert=global_a)
+                explicit_m_row=m_row_a, explicit_n_block=n_block,
+                explicit_expert=pair_a_rt)
             # fmt: on
 
             _store_accumulator_tile(
@@ -388,8 +385,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
                 g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
                 g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
-                expert_offset=expert_offset, explicit_m_row=m_row_b,
-                explicit_n_block=n_block, explicit_expert=global_b)
+                explicit_m_row=m_row_b, explicit_n_block=n_block,
+                explicit_expert=pair_b_rt)
             _store_accumulator_tile(
                 lds_compute_b, acc_b, wave, lane, BM=BM, BN=BN
             )

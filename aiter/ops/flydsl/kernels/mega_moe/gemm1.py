@@ -308,7 +308,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     out_rsrc, os_rsrc, trb_rsrc, tib_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
-    expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
+    experts_per_rank, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False,
@@ -331,7 +331,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     sched = TileScheduler(
         expert_rsrc=expert_rsrc,
         inter_dim=inter_dim,
-        expert_offset=expert_offset,  # GLOBAL sorted_expert_id -> LOCAL w1 index
+        experts_per_rank=experts_per_rank,
     )
     n_wave_base = wave_id * fx.Int32(n_per_wave)
 
@@ -468,7 +468,7 @@ class _FoldEpilogue:
 # fmt: off
 @functools.cache
 def compile_gemm1(
-    *, model_dim: int, inter_dim: int, expert_offset: int = 0, sort_block_m: int = 32,
+    *, model_dim: int, inter_dim: int, experts_per_rank: int = 0, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, pipe_weights: bool = True,
     mfma_amajor: bool = False, swizzle_a: bool = True, async_a_copy: bool = False,
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, b_cache_modifier: int = 0,
@@ -549,7 +549,7 @@ def compile_gemm1(
             sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves, n_per_wave=n_per_wave,
             wave_id=wave_id, m_repeat=m_repeat, num_acc_n=num_acc_n, a_k_step_bytes=a_k_step_bytes,
             total_threads=total_threads, k_iters=k_iters, a_lds_i32=a_lds_i32, n_tiles=n_tiles,
-            expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
+            experts_per_rank=experts_per_rank, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
             use_tile_resource=use_tile_resource, indirect_input=False,
             a_dtype=a_dtype, out_dtype=out_dtype,
@@ -581,7 +581,7 @@ def compile_gemm1(
 # fmt: off
 def gemm1_kernel(
     out, x, w, scale_x, scale_w, tile_row_base, expert_ids, out_scale, num_valid, stream, *,
-    model_dim: int, inter_dim: int, expert_offset: int = 0, sort_block_m: int = 32,
+    model_dim: int, inter_dim: int, experts_per_rank: int = 0, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 4,
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
@@ -599,7 +599,7 @@ def gemm1_kernel(
     total_work = (num_valid // int(sort_block_m)) * n_tiles
     grid_x = min(total_work, int(num_cu) * int(grid_mult))
     launch = compile_gemm1(
-        model_dim=model_dim, inter_dim=inter_dim, expert_offset=expert_offset,
+        model_dim=model_dim, inter_dim=inter_dim, experts_per_rank=experts_per_rank,
         sort_block_m=sort_block_m, tile_n=tile_n, tile_k=tile_k, num_waves=num_waves,
         pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
