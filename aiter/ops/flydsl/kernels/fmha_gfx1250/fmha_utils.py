@@ -585,12 +585,51 @@ def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio, v_hdim):
 # Causal work grows with the M index, so dispatch the heavy tiles first.
 REVERSE_M_ORDER = True
 
+# Persistent launches: while a persistent kernel traces one decoded work item, the
+# tile coordinates come from that item instead of the hardware block ids. Trace-time
+# only -- set by ``virtual_block`` around the item body, None everywhere else, so the
+# grid-launched kernels trace exactly as before.
+_VBLOCK = None
+
+
+class virtual_block:
+    """``with virtual_block(m_tile=..., kv_head=..., num_heads_kv=...):`` -- the
+    m-tile / kv-head / head-count the helpers below report while tracing the body."""
+
+    def __init__(self, *, m_tile, kv_head, num_heads_kv):
+        self.v = {"m_tile": m_tile, "kv_head": kv_head, "num_heads_kv": num_heads_kv}
+
+    def __enter__(self):
+        global _VBLOCK
+        self.prev = _VBLOCK
+        _VBLOCK = self.v
+        return self
+
+    def __exit__(self, *exc):
+        global _VBLOCK
+        _VBLOCK = self.prev
+        return False
+
 
 def _m_tile_idx():
+    if _VBLOCK is not None:
+        return _VBLOCK["m_tile"]
     x = fx.Int32(gpu.block_id("x"))
     if REVERSE_M_ORDER:
         x = fx.Int32(gpu.grid_dim.x) - 1 - x
     return x
+
+
+def _kv_head_idx():
+    if _VBLOCK is not None:
+        return _VBLOCK["kv_head"]
+    return fx.Int32(gpu.block_id("y"))
+
+
+def _num_heads_kv():
+    if _VBLOCK is not None:
+        return _VBLOCK["num_heads_kv"]
+    return fx.Int32(gpu.grid_dim.y)
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
@@ -602,7 +641,7 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
     plane, with ``q_head_in_group`` the fast axis so the ``% / //`` use the small (often
     power-of-two) ``gqa_ratio``. The num_q_tiles tiles a wave owns are contiguous.
     """
-    kv_head = fx.Int32(gpu.block_id("y"))
+    kv_head = _kv_head_idx()
     warp_row0 = _m_tile_idx() * _block_m(num_q_tiles_per_wave) + warp_idx * (
         num_q_tiles_per_wave * WMMA_M
     )

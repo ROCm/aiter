@@ -5,7 +5,7 @@
 
 Each manager owns the ``global -> LDS (async) -> VGPR (WMMA fragment)`` path for one
 operand (Q, K or V): the LDS layout, the global->LDS copy schedule and the fragment
-read. They are self-contained — a caller passes only the configuration it
+read. They are self-contained â€” a caller passes only the configuration it
 already maintains (hdim, gqa_ratio, kv block width, wave count) through the constructor
 plus the runtime ``warp_idx``/``lane_idx``. Nothing here reads a tiling constant from
 the kernel; the facts intrinsic to the managed layout live below as private constants.
@@ -911,7 +911,7 @@ class QManagerV1:
         )
 
     def _async_load_vram_to_lds(self, gptrs, lds_ptrs):
-        """gfx1250 async 16B global->LDS copy — accepts a batch (equal-length pointer
+        """gfx1250 async 16B global->LDS copy â€” accepts a batch (equal-length pointer
         lists, or scalars for one load). Q uses the plain (non-MCAST) global form."""
         _async_load_to_lds(gptrs, lds_ptrs, cluster=False)
 
@@ -1070,7 +1070,7 @@ class QManagerV1:
                     q_frags_list[qt].append(lo.shuffle(hi, list(range(2 * lo.numel))))
             return q_frags_list
 
-        # Non-fully-resident ring drain — R==1 only (guarded in __init__).
+        # Non-fully-resident ring drain â€” R==1 only (guarded in __init__).
         ds_ptrs = self._q_ds_ptrs[0]
         gptrs = self._q_gptrs[0]
         lds_wr_ptrs = self._q_lds_wr_ptrs[0]
@@ -1868,10 +1868,12 @@ class OManagerV2:
         ptr_lds_warp,  # fx.Int32: byte base of THIS warp's O region (caller-placed)
         o_frags,
         qtile=0,
+        o_iter=None,  # optional runtime global base (replaces get_iter(ptr_O))
     ):
         """Reshape this warp's 16 x v_hdim fp32 accumulator to bf16 and TDM-store it.
         ``o_frags[k]`` is this lane's v8 fp32 for d-tile ``k``, already normalized; rows with
         seq >= q_len are dropped by the TDM extent. Strides in ELEMENTS."""
+        _o_base_iter = o_iter if o_iter is not None else fx.get_iter(ptr_O)
         if len(o_frags) != self.d_tiles:
             raise ValueError(
                 f"expected {self.d_tiles} O frags (v_hdim//{_WMMA_M}); got {len(o_frags)}"
@@ -1917,7 +1919,7 @@ class OManagerV2:
                 + fx.Int64(q_start + base_row) * fx.Int64(stride_o_seq)
                 + fx.Int64(kv_head) * fx.Int64(stride_o_head)
             )
-            gbase = fx.add_offset(fx.get_iter(ptr_O), off)
+            gbase = fx.add_offset(_o_base_iter, off)
             tile = (_WMMA_M, self.padded_row_elems)
             lds_strides = (self.padded_row_elems, 1)
             g_view = fx.Tensor(
@@ -1954,7 +1956,7 @@ class OManagerV2:
                 + fx.Int64(q_start + seq0) * fx.Int64(stride_o_seq)
                 + fx.Int64(head0) * fx.Int64(stride_o_head)
             )
-            gbase = fx.add_offset(fx.get_iter(ptr_O), off)
+            gbase = fx.add_offset(_o_base_iter, off)
             tile = (num_seq, heads_per_tile, self.padded_row_elems)
             lds_strides = (
                 heads_per_tile * self.padded_row_elems,

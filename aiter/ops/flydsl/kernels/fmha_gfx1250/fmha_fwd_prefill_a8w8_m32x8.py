@@ -35,6 +35,7 @@ Target: gfx1250, wave32, 8 waves per threadgroup (256 threads).
 
 import functools
 import math
+import os
 from enum import IntEnum
 
 import flydsl.compiler as flyc
@@ -45,7 +46,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E
@@ -93,10 +94,12 @@ from .fmha_utils import (
     _is_paged_layout_supported,
     _keepalive,
     _kv_drain_depths,
+    _kv_head_idx,
     _lane_id,
     _load_seqlen_pair,
     _load_sink_logit,
     _m_tile_idx,
+    _num_heads_kv,
     _o_manager,
     _o_pack,
     _o_unpack,
@@ -118,6 +121,7 @@ from .fmha_utils import (
     s_buffer_load,
     schedule_bank,
     supports_gqa_ratio,
+    virtual_block,
 )
 
 # ============================================================================
@@ -1286,7 +1290,7 @@ def _attention_core_multi_kv_tiles(
         # Barrier-count filler: re-pairs the two halves' barrier streams.
         _copy_fence(*_kv_drain)
     if has_sink:
-        num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
+        num_heads_q = _num_heads_kv() * fx.Int32(gqa_ratio)
         m_init = [
             _load_sink_logit(ptr_sink, q_head_idx[q_tile_idx], num_heads_q)
             * fx.Float32(LOG2E)
@@ -2031,7 +2035,7 @@ def _attention_core_one_kv_tile(
     rocdl.sched_barrier(0)
 
     if has_sink:
-        num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
+        num_heads_q = _num_heads_kv() * fx.Int32(gqa_ratio)
         m_prev = [
             _load_sink_logit(ptr_sink, q_head_idx[q_tile_idx], num_heads_q)
             * fx.Float32(LOG2E)
@@ -2122,11 +2126,67 @@ def _store_o_lse(
     lse_num_records_bytes,
     stride_lse_seq,
     stride_lse_head,
+    carry_state=False,
+    out_target=None,
 ):
     """Normalize, stage and store O (and optionally LSE) for this wave's num_q_tiles q-tiles.
 
     Shared tail of both compute cores; ``o_lds_warp`` is the caller's choice of which
-    finished KV chunk this wave stages through."""
+    finished KV chunk this wave stages through.
+
+    ``carry_state`` (compile-time): O/LSE already hold a running attention state over
+    other keys (e.g. earlier context chunks). Read it back, fold this launch's partial
+    softmax into it with the standard LSE recombination and write the merged O/LSE in
+    place -- the separate merge_attn_states pass, fused. A row whose old LSE is -inf
+    has no prior state and its old O is never read (it may be uninitialized).
+
+    ``out_target`` (persistent split launch) redirects the O/LSE STORES at runtime: a
+    dict with ``o_iter`` (global base), ``o_base_elems``, ``q_start_o``,
+    ``stride_o_seq``, ``stride_o_head``, ``lse_rsrc``, ``lse_base_elems``,
+    ``stride_lse_seq``, ``stride_lse_head`` -- already selected between the final output
+    and the split workspace by the caller -- plus ``carry_ok`` (runtime bool): a split
+    part goes to the workspace raw, so the old state is folded in only when it holds.
+    The carried state itself is always READ from the final O/LSE."""
+    st_o_iter = None
+    st_o_base = fx.Int32(0)
+    st_q_start = q_start
+    st_stride_o_seq = stride_o_seq
+    st_stride_o_head = stride_o_head
+    st_lse_rsrc = None
+    st_lse_base = lse_base_elems
+    st_stride_lse_seq = stride_lse_seq
+    st_stride_lse_head = stride_lse_head
+    carry_ok = None
+    if out_target is not None:
+        st_o_iter = out_target["o_iter"]
+        st_o_base = out_target["o_base_elems"]
+        st_q_start = out_target["q_start_o"]
+        st_stride_o_seq = out_target["stride_o_seq"]
+        st_stride_o_head = out_target["stride_o_head"]
+        st_lse_rsrc = out_target["lse_rsrc"]
+        st_lse_base = out_target["lse_base_elems"]
+        st_stride_lse_seq = out_target["stride_lse_seq"]
+        st_stride_lse_head = out_target["stride_lse_head"]
+        carry_ok = out_target.get("carry_ok")
+    lse_new_list = None
+    if carry_state:
+        assert return_lse, "carry_state needs the LSE buffer"
+        lse_new_list = []
+        khalf = lane_idx // fx.Int32(
+            WMMA_M
+        )  # which 8-column half of each 16-col d-tile
+        _neg_inf = fx.Float32(float("-inf"))
+        _zero = fx.Float32(0.0)
+        lse_ld_rsrc = buffer_ops.create_buffer_resource(
+            ptr_LSE, num_records_bytes=lse_num_records_bytes
+        )
+        # i64 bound, as in _zero_fill_attention; offsets below are i32 bytes.
+        o_ld_rsrc = buffer_ops.create_buffer_resource(
+            ptr_O,
+            num_records_bytes=fx.Int64(q_start + q_len)
+            * fx.Int64(stride_o_seq)
+            * fx.Int64(2),
+        )
     for q_tile_idx in range(num_q_tiles):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[d_tile_idx] lane l elem si = sum_kv P[q,kv] V[kv, d_tile_idx*16+(l//16)*8+si]
@@ -2134,22 +2194,97 @@ def _store_o_lse(
         # lane pair) to finish softmax. OManager masks rows with seq >= q_len.
         d_final = d_list[q_tile_idx]
         o_final = o_list[q_tile_idx]
-        # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
-        inv_denom = (d_final > fx.Float32(0.0)).select(
-            fx.Float32(1.0) / d_final, fx.Float32(0.0)
-        )
-        if v_descale is not None:
-            inv_denom = inv_denom * v_descale
-        inv_denom_vec = fx.Vector.from_elements([inv_denom], fx.Float32).broadcast_to(8)
-        o_norm = [o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)]
+        if carry_state:
+            m_final = m_list[q_tile_idx]
+            row_ok = seq_idx[q_tile_idx] < q_len
+            lse_off_el = (
+                lse_base_elems
+                + seq_idx[q_tile_idx] * stride_lse_seq
+                + q_head_idx[q_tile_idx] * stride_lse_head
+            )
+            lse_old = fx.Float32(
+                buffer_ops.buffer_load(
+                    lse_ld_rsrc,
+                    lse_off_el,
+                    vec_width=1,
+                    dtype=fx.Float32,
+                    mask=row_ok,
+                    cache_modifier=CARRY_LOAD_CPOL,
+                )
+            )
+            # Everything in log2 units, where m lives.
+            lse_old2 = lse_old * fx.Float32(LOG2E)
+            has_old = lse_old2 > _neg_inf
+            if carry_ok is not None:
+                has_old = has_old & carry_ok
+            has_cur = d_final > _zero
+            lse_cur2 = fx.Float32(has_cur.select(m_final + fx.log2(d_final), _neg_inf))
+            mx = fx.Float32((lse_cur2 > lse_old2).select(lse_cur2, lse_old2))
+            both_empty = mx == _neg_inf
+            safe_mx = fx.Float32(both_empty.select(_zero, mx))
+            a_old = fx.Float32(has_old.select(fx.exp2(lse_old2 - safe_mx), _zero))
+            # Weight of the UNNORMALIZED o_final: O_cur * exp2(lse_cur2 - mx) with
+            # O_cur = o_final / d collapses to o_final * exp2(m - mx).
+            e_cur = fx.Float32(has_cur.select(fx.exp2(m_final - safe_mx), _zero))
+            tot = a_old + e_cur * d_final
+            inv_tot = fx.Float32((tot > _zero).select(fx.Float32(1.0) / tot, _zero))
+            scale_cur = e_cur * inv_tot
+            if v_descale is not None:
+                scale_cur = scale_cur * v_descale
+            scale_old = a_old * inv_tot
+            lse_new_list.append(
+                both_empty.select(
+                    _neg_inf, (safe_mx + fx.log2(tot)) * fx.Float32(1.0 / LOG2E)
+                )
+            )
+            # Old O: this lane's 8 contiguous bf16 per d-tile, one b128 each. Rows with
+            # no prior state (or past q_len) load nothing (OOB -> 0), so garbage never
+            # meets a zero weight as NaN.
+            o_row_el = (
+                (q_start + seq_idx[q_tile_idx]) * stride_o_seq
+                + q_head_idx[q_tile_idx] * stride_o_head
+                + khalf * fx.Int32(8)
+            )
+            ld_ok = row_ok & has_old
+            sc_cur_vec = fx.Vector.from_elements([scale_cur], fx.Float32).broadcast_to(
+                8
+            )
+            sc_old_vec = fx.Vector.from_elements([scale_old], fx.Float32).broadcast_to(
+                8
+            )
+            o_norm = []
+            for d_tile_idx in range(d_tiles):
+                raw = buffer_ops.buffer_load(
+                    o_ld_rsrc,
+                    (o_row_el + fx.Int32(d_tile_idx * WMMA_M)) // fx.Int32(2),
+                    vec_width=4,
+                    dtype=fx.Int32,
+                    mask=ld_ok,
+                    cache_modifier=CARRY_LOAD_CPOL,
+                )
+                o_old = fx.Vector(raw, (4,), fx.Int32).bitcast(O_DTYPE).to(fx.Float32)
+                o_norm.append(o_final[d_tile_idx] * sc_cur_vec + o_old * sc_old_vec)
+        else:
+            # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
+            inv_denom = (d_final > fx.Float32(0.0)).select(
+                fx.Float32(1.0) / d_final, fx.Float32(0.0)
+            )
+            if v_descale is not None:
+                inv_denom = inv_denom * v_descale
+            inv_denom_vec = fx.Vector.from_elements(
+                [inv_denom], fx.Float32
+            ).broadcast_to(8)
+            o_norm = [
+                o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)
+            ]
         if q_tile_idx > 0:
             rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring/DS ops before reuse
         o_mgr.store_o_to_vram(
             ptr_O=ptr_O,
-            o_base_elems=fx.Int32(0),
-            stride_o_seq=stride_o_seq,
-            stride_o_head=stride_o_head,
-            q_start=q_start,
+            o_base_elems=st_o_base,
+            stride_o_seq=st_stride_o_seq,
+            stride_o_head=st_stride_o_head,
+            q_start=st_q_start,
             q_len=q_len,
             kv_head=kv_head,
             block_x=m_tile_idx,
@@ -2158,6 +2293,7 @@ def _store_o_lse(
             ptr_lds_warp=o_lds_warp,
             o_frags=o_norm,
             qtile=q_tile_idx,
+            o_iter=st_o_iter,
         )
 
     # ---- LSE store (optional). LSE = (m_final + log2(d_final)) / LOG2E: m is carried in
@@ -2167,19 +2303,25 @@ def _store_o_lse(
     # seq < q_len; buffer_store redirects mask-drops to byte 0x7FFFFFFF.
     if return_lse:
         khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)
-        lse_rsrc = buffer_ops.create_buffer_resource(
-            ptr_LSE, num_records_bytes=lse_num_records_bytes
-        )
+        if st_lse_rsrc is not None:
+            lse_rsrc = st_lse_rsrc
+        else:
+            lse_rsrc = buffer_ops.create_buffer_resource(
+                ptr_LSE, num_records_bytes=lse_num_records_bytes
+            )
         for q_tile_idx in range(num_q_tiles):
             m_final = m_list[q_tile_idx]
             d_final = d_list[q_tile_idx]
             # fx.log2 lowers to the HW v_log_f32 (base-2), matching m's log2 domain.
-            lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
+            if carry_state:
+                lse_val = lse_new_list[q_tile_idx]
+            else:
+                lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
             lse_mask = khalf0 & (seq_idx[q_tile_idx] < q_len)
             lse_off_el = (
-                lse_base_elems
-                + seq_idx[q_tile_idx] * stride_lse_seq
-                + q_head_idx[q_tile_idx] * stride_lse_head
+                st_lse_base
+                + seq_idx[q_tile_idx] * st_stride_lse_seq
+                + q_head_idx[q_tile_idx] * st_stride_lse_head
             )
             # Pre-mask the offset (OOB rows -> 0x7fffffff) and pass mask=None so the
             # store maps 1:1 to a single buffer_store with masking already SSA-visible.
@@ -2247,6 +2389,8 @@ def _attention_epilogue(
     lse_num_records_bytes,
     q_start,
     q_len,
+    carry_state=False,
+    out_target=None,
 ):
     """The O/LSE tail, traced once per build instead of once per warp type.
 
@@ -2307,6 +2451,8 @@ def _attention_epilogue(
         lse_num_records_bytes=lse_num_records_bytes,
         stride_lse_seq=stride_lse_seq,
         stride_lse_head=stride_lse_head,
+        carry_state=carry_state,
+        out_target=out_target,
     )
 
 
@@ -2333,7 +2479,7 @@ def _zero_fill_attention(
     being the only surviving term. Flat coalesced b128 write, no WMMA layout."""
     BLOCK_M = _block_m(num_q_tiles_per_wave)
     thread_idx = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
-    kv_head = fx.Int32(gpu.block_id("y"))
+    kv_head = _kv_head_idx()
     row0 = _m_tile_idx() * fx.Int32(BLOCK_M)
     g = fx.Int32(gqa_ratio)
     _chunk_elems = 8  # bf16 per b128 store
@@ -2370,7 +2516,7 @@ def _zero_fill_attention(
         seq = packed_row_idx // g
         head = kv_head * g + packed_row_idx % g
         if has_sink:
-            num_heads_q = gpu.grid_dim.y * g
+            num_heads_q = _num_heads_kv() * g
             lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
         else:
             lse_val = fx.Float32(float("-inf"))
@@ -2424,6 +2570,320 @@ def pick_n_block(qk_hdim, v_hdim, kv_dtype):
     )
 
 
+# ============================================================================
+# Persistent split-KV launch ("thd_ps")
+#
+# The varlen grid (m-tiles x heads x batch) leaves most of the GPU idle on the MLA
+# chunked-prefix calls: every request is in the batch, but only the 1-3 whose cached
+# prefix overlaps the chunk have keys, so the work is a few hundred (m-tile, head)
+# units of ~256 KV tiles each on 256 CUs -- 1.1 to 2 rounds, with the second mostly
+# empty -- while thousands of empty or zero-fill workgroups each claim a CU (the LDS
+# footprint is one WG per CU) just to exit.
+#
+# Instead: one WG per CU loops over a work list decoded in-kernel from cu_seqlens.
+# A work item is (batch, m-tile, head, KV part). For a non-causal call each unit's KV
+# range is cut into equal parts so the item count is ~PS_ITEMS_PER_WG per WG; a part
+# writes its normalized O (bf16) and LSE to a workspace slot, and a small merge pass
+# combines the parts by LSE. Units of batches with no keys are zero-fill items.
+# ============================================================================
+
+# Cache policy of the carry_state reads of the running O/LSE (0 = default; 16 = device
+# scope). Kept as a knob: the persistent launch maps units to WGs (and XCDs) per call.
+CARRY_LOAD_CPOL = int(os.environ.get("FMHA_CARRY_LOAD_CPOL", "0"))
+
+PS_MAX_BATCH = (
+    32  # cu_seqlens entries decoded in SGPRs (unrolled); larger batches use the grid
+)
+PS_MAX_PARTS = 16  # most KV parts per unit
+PS_ITEM_OVH_TILES = (
+    6  # per-item fixed cost (prologue + epilogue + fence) in KV-tile units
+)
+PS_MIN_PART_TILES = 16  # never cut a unit's KV below this many n_block tiles
+PS_WS_ITEMS = (
+    4096  # workspace capacity in split items (256 x v_hdim bf16 + 256 fp32 each)
+)
+PS_META_HDR = 8  # int32 header words of the merge table (word 0 = split-unit count)
+PS_META_STRIDE = 8  # int32 words per split-unit entry
+
+
+def _ps_cdiv(a, b):
+    return (a + b - fx.Int32(1)) // b
+
+
+def _ps_cdiv_pow2(a, b_const):
+    """ceil(a / b) for a compile-time power-of-two b, a >= 0 (shift, no division)."""
+    sh = int(b_const).bit_length() - 1
+    assert (1 << sh) == b_const
+    return (a + fx.Int32(b_const - 1)) >> fx.Int32(sh)
+
+
+def _wave_sum(v):
+    """All-lane sum of a per-lane Int32 (wave32 butterfly); uniform result in an SGPR."""
+    for s in (16, 8, 4, 2, 1):
+        v = v + fx.Int32(fx.shuffle_xor(v, s, WAVE_SIZE))
+    return fx.Int32(rocdl.readfirstlane(T.i32, _raw(v)))
+
+
+def _wave_excl_scan(v, lane):
+    """Exclusive prefix sum over lanes (Hillis-Steele with shuffle_up)."""
+    x = v
+    for s in (1, 2, 4, 8, 16):
+        y = fx.Int32(fx.shuffle_up(x, s, WAVE_SIZE))
+        x = x + (lane >= fx.Int32(s)).select(y, fx.Int32(0))
+    return x - v
+
+
+def _ps_lane_geom(*, ptr_cu_q, ptr_cu_k, b, B, H, gqa, block_m, n_block, scalar=False):
+    """Batch ``b``'s (q0, ql, k0, kl, mt, kt, units, attn); ``b`` may be per-lane (VGPR
+    loads) or wave-uniform (scalar loads). Batches >= B read as empty."""
+    valid = b < B
+    nrec = (B + fx.Int32(1)) * fx.Int32(4)
+    rq = buffer_ops.create_buffer_resource(ptr_cu_q, num_records_bytes=nrec)
+    rk = buffer_ops.create_buffer_resource(ptr_cu_k, num_records_bytes=nrec)
+
+    def _ld(r, i):
+        return fx.Int32(
+            buffer_ops.buffer_load(r, i, vec_width=1, dtype=T.i32, is_scalar=scalar)
+        )
+
+    q0 = _ld(rq, b)
+    q1 = _ld(rq, b + fx.Int32(1))
+    k0 = _ld(rk, b)
+    k1 = _ld(rk, b + fx.Int32(1))
+    ql = fx.max(valid.select(q1 - q0, fx.Int32(0)), fx.Int32(0))
+    kl = fx.max(valid.select(k1 - k0, fx.Int32(0)), fx.Int32(0))
+    mt = _ps_cdiv_pow2(ql * fx.Int32(gqa), block_m)
+    kt = _ps_cdiv_pow2(kl, n_block)
+    units = mt * H
+    attn = kt > fx.Int32(0)
+    return {
+        "q0": q0,
+        "ql": ql,
+        "k0": k0,
+        "kl": kl,
+        "mt": mt,
+        "kt": kt,
+        "units": units,
+        "attn": attn,
+    }
+
+
+def _ps_parts(attn, kt, pt):
+    return fx.max(attn.select(_ps_cdiv(kt, pt), fx.Int32(1)), fx.Int32(1))
+
+
+def _ps_setup(
+    *,
+    ptr_cu_q,
+    ptr_cu_k,
+    B,
+    H,
+    G,
+    gqa,
+    block_m,
+    n_block,
+    allow_split,
+    ws_cap,
+    force_pt=None,
+):
+    """Work-list geometry, one lane per batch (B <= 32), every wave redundantly -- so only
+    a few per-lane VGPRs and SGPRs stay live across the item loop.
+
+    A unit is one (batch, m-tile, head). An attention unit (its batch has keys) is cut into
+    ``parts`` equal KV ranges; the items of a batch are ordered (head, m-tile, part) -- a
+    head's m-tiles, which read the same K/V, run in the same round. ``parts`` is chosen
+    per batch as if the batch ran alone: argmin over p of
+    ceil(units*p / G) * (ceil(kt/p) + PS_ITEM_OVH_TILES). Batches are then laid out in
+    decreasing item length, so a partially filled round is topped up with shorter items
+    and round-robin WG w=0 carries the longest item of every round. Units of batches
+    without keys are zero-fill units in their own id space (after all attention items).
+    """
+    lane = _lane_id()
+    e = _ps_lane_geom(
+        ptr_cu_q=ptr_cu_q,
+        ptr_cu_k=ptr_cu_k,
+        b=lane,
+        B=B,
+        H=H,
+        gqa=gqa,
+        block_m=block_m,
+        n_block=n_block,
+    )
+    units, kt, attn = e["units"], e["kt"], e["attn"]
+    a_units = attn.select(units, fx.Int32(0))
+    z_units = attn.select(fx.Int32(0), units)
+    kt1 = fx.max(kt, fx.Int32(1))
+    parts = fx.Int32(1)
+    if allow_split:
+        best = _ps_cdiv(a_units, G) * (kt1 + fx.Int32(PS_ITEM_OVH_TILES))
+        for pp in range(2, PS_MAX_PARTS + 1):
+            tpp_p = _ps_cdiv(kt1, fx.Int32(pp))
+            c = _ps_cdiv(a_units * fx.Int32(pp), G) * (
+                tpp_p + fx.Int32(PS_ITEM_OVH_TILES)
+            )
+            ok = (c < best) & (tpp_p >= fx.Int32(PS_MIN_PART_TILES))
+            parts = ok.select(fx.Int32(pp), parts)
+            best = ok.select(c, best)
+        if force_pt is not None:
+            parts = (force_pt > fx.Int32(0)).select(
+                fx.max(_ps_cdiv(kt1, fx.max(force_pt, fx.Int32(1))), fx.Int32(1)), parts
+            )
+        parts = attn.select(parts, fx.Int32(1))
+        # Workspace overflow: fall back to no split anywhere.
+        n_split = _wave_sum((parts > fx.Int32(1)).select(a_units * parts, fx.Int32(0)))
+        parts = (n_split > ws_cap).select(fx.Int32(1), parts)
+    items = a_units * parts
+    tpp = attn.select(_ps_cdiv(kt1, parts), fx.Int32(-1))
+    valid = lane < B
+    key = valid.select(tpp, fx.Int32(-2))
+    # Rank batches by decreasing item length (ties: lower batch first); item_base is the
+    # exclusive prefix of items in rank order.
+    item_base = fx.Int32(0)
+    for l in range(WAVE_SIZE):
+        kl_ = fx.Int32(fx.shuffle_idx(key, l, WAVE_SIZE))
+        il_ = fx.Int32(fx.shuffle_idx(items, l, WAVE_SIZE))
+        before = (kl_ > key) | ((kl_ == key) & (fx.Int32(l) < lane))
+        item_base = item_base + before.select(il_, fx.Int32(0))
+    split = parts > fx.Int32(1)
+    split_items = split.select(items, fx.Int32(0))
+    split_units = split.select(a_units, fx.Int32(0))
+    return {
+        "N": _wave_sum(items),
+        "ZU": _wave_sum(z_units),
+        "n_split_units": _wave_sum(split_units),
+        "parts": parts,
+        "item_base": item_base,
+        "item_end": item_base + items,
+        "ws_base": _wave_excl_scan(split_items, lane),
+        "unit_base": _wave_excl_scan(split_units, lane),
+        "zero_base": _wave_excl_scan(z_units, lane),
+    }
+
+
+def _ps_find(base_vgpr, x, B):
+    """The batch (lane) owning id ``x`` in a lane-order exclusive-scan id space: the last
+    lane whose base <= x (bases never decrease; an empty batch shares its successor's base
+    and loses to it). Returns (batch, base) as SGPRs."""
+    lane = _lane_id()
+    own = (base_vgpr <= x) & (lane < B)
+    mask = fx.Int32(rocdl.ballot(fx.Int32.ir_type, own))
+    b = fx.Int32(fx.ctpop(mask)) - fx.Int32(1)
+    base = fx.Int32(rocdl.readlane(T.i32, _raw(base_vgpr), _raw(b)))
+    return b, base
+
+
+def _ps_find_range(base_vgpr, end_vgpr, x, B):
+    """The batch (lane) whose [base, end) holds ``x`` (ranges disjoint, any lane order)."""
+    lane = _lane_id()
+    own = (base_vgpr <= x) & (x < end_vgpr) & (lane < B)
+    mask = fx.Int32(rocdl.ballot(fx.Int32.ir_type, own))
+    b = fx.Int32(fx.cttz(mask))
+    base = fx.Int32(rocdl.readlane(T.i32, _raw(base_vgpr), _raw(b)))
+    return b, base
+
+
+def _ps_item(
+    st, it, *, zero, ptr_cu_q, ptr_cu_k, B, H, gqa, block_m, n_block, reverse_m
+):
+    """Decode attention item ``it`` (or zero unit ``it`` when ``zero``)."""
+    if zero:
+        b, base = _ps_find(st["zero_base"], it, B)
+    else:
+        b, base = _ps_find_range(st["item_base"], st["item_end"], it, B)
+    d = _ps_lane_geom(
+        ptr_cu_q=ptr_cu_q,
+        ptr_cu_k=ptr_cu_k,
+        b=b,
+        B=B,
+        H=H,
+        gqa=gqa,
+        block_m=block_m,
+        n_block=n_block,
+        scalar=True,
+    )
+    local = it - base
+    mt = fx.max(d["mt"], fx.Int32(1))
+    if zero:
+        parts = fx.Int32(1)
+    else:
+        parts = fx.Int32(rocdl.readlane(T.i32, _raw(st["parts"]), _raw(b)))
+    unit = local // parts
+    part = local - unit * parts
+    head = unit // mt
+    m_tile = unit - head * mt
+    if reverse_m:  # causal: the heavy (late) m-tiles first
+        m_tile = mt - fx.Int32(1) - m_tile
+    d.update(
+        batch=b,
+        local=local,
+        unit=unit,
+        part=part,
+        head=head,
+        m_tile=m_tile,
+        parts=parts,
+    )
+    if not zero:
+        tpp = _ps_cdiv(fx.max(d["kt"], fx.Int32(1)), parts)
+        d["tile_lo"] = part * tpp
+        d["tile_hi"] = fx.min(d["tile_lo"] + tpp, d["kt"])
+        d["slot"] = (
+            fx.Int32(rocdl.readlane(T.i32, _raw(st["ws_base"]), _raw(b))) + local
+        )
+        d["split_unit"] = (
+            fx.Int32(rocdl.readlane(T.i32, _raw(st["unit_base"]), _raw(b))) + unit
+        )
+    return d
+
+
+@flyc.jit
+def _ps_attention_body(
+    *, core_kwargs, out_target, warp_idx, lds_base, carry_state=False
+):
+    """One work item's prologue / core / epilogue (the grid entry's body, minus the
+    entry checks). LDS is rewritten from scratch, so the caller fences between items."""
+    _epi_state_out = _epi_state_zeros(
+        num_q_tiles_per_wave=core_kwargs["num_q_tiles_per_wave"],
+        v_hdim=core_kwargs["v_hdim"],
+    )
+    _prologue = _attention_prologue(
+        warp_idx=warp_idx,
+        lds_base=lds_base,
+        **{k: core_kwargs[k] for k in _PROLOGUE_KEYS},
+    )
+    if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
+        _epi_state_out = _attention_core_multi_kv_tiles(
+            warp_idx=warp_idx,
+            warp_type=WarpType.LO,
+            lds_base=lds_base,
+            prologue=_prologue,
+            **core_kwargs,
+        )
+    else:
+        _epi_state_out = _attention_core_multi_kv_tiles(
+            warp_idx=warp_idx,
+            warp_type=WarpType.HI,
+            lds_base=lds_base,
+            prologue=_prologue,
+            **core_kwargs,
+        )
+    _attention_epilogue(
+        epi_state=_epi_state_out,
+        rendezvous=True,
+        warp_idx=warp_idx,
+        out_target=out_target,
+        carry_state=carry_state,
+        **{k: core_kwargs[k] for k in _EPILOGUE_KEYS},
+    )
+
+
+def _ps_item_fence():
+    """The next item's prologue rewrites LDS: retire this item's TDM O stores (they read
+    LDS) and every LDS access, then rendezvous."""
+    tdm_ops.tensor_wait(0)
+    rocdl.s_wait_dscnt(0)
+    gpu.barrier()
+
+
 @functools.cache
 def build_fmha_fwd_prefill_a8w8_m32x8(
     *,
@@ -2442,17 +2902,27 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     gqa_ratio: int = 1,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
     page_size: int | None = None,
+    carry_state: bool = False,
 ):
     """Build the m32x8 device kernel for a given layout ("thd" varlen or "bshd" batched)
     plus config; every parameter here is compile-time and baked into the trace.
     ``gqa_ratio`` (= ``nheads_q // nheads_kv``) is among them so the per-lane ``% / //``
     fold to shift/and when it is a power of two.
+
+    ``carry_state`` (thd only, needs ``return_lse``): O/LSE are a running state that
+    this launch updates in place (see ``_store_o_lse``); a batch with no keys leaves
+    its rows untouched instead of zero-filling them.
     """
+    CARRY = bool(carry_state)
+    assert not CARRY or (
+        layout in ("thd", "thd_ps") and return_lse and not has_sink
+    ), "carry_state is thd/thd_ps-only, needs return_lse and no sink"
     assert layout in (
         "thd",
+        "thd_ps",
         "bshd",
         "paged",
-    ), f"layout must be thd|bshd|paged, got {layout!r}"
+    ), f"layout must be thd|thd_ps|bshd|paged, got {layout!r}"
     # qk_hdim (D_qk) is a WMMA_K multiple; v_hdim (D_v) a WMMA_M multiple. Independent.
     assert (
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim in SUPPORTED_V_HDIM
@@ -2685,6 +3155,277 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
 
         return kn_fmha_fwd_prefill_a8w8_m32x8_paged
 
+    if layout == "thd_ps":
+        assert not ONE_KV_TILE, "persistent launch uses the multi-tile core"
+        assert RET_LSE, "persistent launch always writes LSE (the split merge needs it)"
+        BM = _block_m(NUM_Q_TILES)
+        # KV splitting needs a part-local band: non-causal, no window, MHA rows (the
+        # workspace row layout is one head per unit), no sink (folded into the merge
+        # would double-count it).
+        SPLIT_OK = (
+            (not MASK_LEFT) and (not MASK_RIGHT) and GQA_RATIO == 1 and not HAS_SINK
+        )
+
+        @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+        def kn_fmha_fwd_prefill_a8w8_m32x8_thd_ps(
+            ptr_O: fx.Pointer,
+            ptr_Q: fx.Pointer,
+            ptr_K: fx.Pointer,
+            ptr_V: fx.Pointer,
+            ptr_LSE: fx.Pointer,
+            ptr_sink: fx.Pointer,
+            ptr_q_descale: fx.Pointer,
+            ptr_k_descale: fx.Pointer,
+            ptr_v_descale: fx.Pointer,
+            ptr_cu_seqlens_q: fx.Pointer,
+            ptr_cu_seqlens_k: fx.Pointer,
+            ptr_ws_o: fx.Pointer,
+            ptr_ws_lse: fx.Pointer,
+            ptr_ws_meta: fx.Pointer,
+            softmax_scale: fx.Float32,
+            stride_q_seq: fx.Int32,
+            stride_k_seq: fx.Int32,
+            stride_v_seq: fx.Int32,
+            stride_o_seq: fx.Int32,
+            stride_q_head: fx.Int32,
+            stride_k_head: fx.Int32,
+            stride_v_head: fx.Int32,
+            stride_o_head: fx.Int32,
+            stride_lse_seq: fx.Int32,
+            stride_lse_head: fx.Int32,
+            window_left: fx.Int32,
+            window_right: fx.Int32,
+            num_heads_kv: fx.Int32,
+            batch_size: fx.Int32,
+            ws_items_cap: fx.Int32,
+            lse_num_records_bytes: fx.Int32,
+            force_pt: fx.Int32,
+        ):
+            """Persistent varlen THD entry. Non-causal: stream-K -- WG w takes a contiguous
+            range of the virtual tile space, so it holds whole units plus at most two
+            partial ones (its first and last items, written to workspace slots 2w / 2w+1
+            for the merge). Causal: whole units round-robin. Zero-fill units round-robin.
+            """
+            G = fx.Int32(gpu.grid_dim.x)
+            wg = fx.Int32(gpu.block_id("x"))
+            H = num_heads_kv
+            geo = {
+                "ptr_cu_q": ptr_cu_seqlens_q,
+                "ptr_cu_k": ptr_cu_seqlens_k,
+                "B": batch_size,
+                "H": H,
+                "gqa": GQA_RATIO,
+                "block_m": BM,
+                "n_block": N_BLOCK,
+            }
+            st = _ps_setup(
+                G=G,
+                allow_split=SPLIT_OK,
+                ws_cap=ws_items_cap,
+                force_pt=force_pt,
+                **geo,
+            )
+            tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
+
+            if const_expr(HAS_DESCALE):
+                _softmax_scale = softmax_scale * (
+                    _load_descale(ptr_q_descale) * _load_descale(ptr_k_descale)
+                )
+                _v_descale = _load_descale(ptr_v_descale)
+            else:
+                _softmax_scale = softmax_scale
+                _v_descale = None
+
+            o_addr = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_O)))
+            ws_o_addr = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_ws_o)))
+            lse_addr = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_LSE)))
+            ws_lse_addr = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_ws_lse)))
+            ws_lse_bytes = ws_items_cap * fx.Int32(BM * 4)
+            o_ptr_ty = fx.PointerType.get(
+                elem_ty=O_DTYPE.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            )
+            lds_base = _alloc_lds()
+            warp_idx = _warp_id()
+
+            def _core_kw(d, kv_start, kv_len):
+                return {
+                    "qk_hdim": QK_HDIM,
+                    "v_hdim": V_HDIM,
+                    "n_block": N_BLOCK,
+                    "mask_left": MASK_LEFT,
+                    "mask_right": MASK_RIGHT,
+                    "return_lse": RET_LSE,
+                    "has_sink": HAS_SINK,
+                    "gqa_ratio": GQA_RATIO,
+                    "num_q_tiles_per_wave": NUM_Q_TILES,
+                    "ptr_O": ptr_O,
+                    "ptr_Q": ptr_Q,
+                    "ptr_K": ptr_K,
+                    "ptr_V": ptr_V,
+                    "ptr_LSE": ptr_LSE,
+                    "ptr_sink": ptr_sink,
+                    "softmax_scale": _softmax_scale,
+                    "v_descale": _v_descale,
+                    "stride_q_seq": stride_q_seq,
+                    "stride_k_seq": stride_k_seq,
+                    "stride_v_seq": stride_v_seq,
+                    "stride_o_seq": stride_o_seq,
+                    "stride_q_head": stride_q_head,
+                    "stride_k_head": stride_k_head,
+                    "stride_v_head": stride_v_head,
+                    "stride_o_head": stride_o_head,
+                    "stride_lse_seq": stride_lse_seq,
+                    "stride_lse_head": stride_lse_head,
+                    "lse_base_elems": d["q0"] * stride_lse_seq,
+                    "lse_num_records_bytes": lse_num_records_bytes,
+                    "q_start": d["q0"],
+                    "q_len": d["ql"],
+                    "kv_start": kv_start,
+                    "kv_len": kv_len,
+                    "window_left": window_left,
+                    "window_right": window_right,
+                    "q_dtype": Q_ELEM_DTYPE,
+                    "kv_dtype": KV_ELEM_DTYPE,
+                    "paged": None,
+                }
+
+            def _zero_item(d):
+                _zero_fill_attention(
+                    v_hdim=V_HDIM,
+                    gqa_ratio=GQA_RATIO,
+                    num_q_tiles_per_wave=NUM_Q_TILES,
+                    return_lse=RET_LSE,
+                    has_sink=HAS_SINK,
+                    ptr_sink=ptr_sink,
+                    ptr_O=ptr_O,
+                    ptr_LSE=ptr_LSE,
+                    stride_o_seq=stride_o_seq,
+                    stride_o_head=stride_o_head,
+                    stride_lse_seq=stride_lse_seq,
+                    stride_lse_head=stride_lse_head,
+                    lse_num_records_bytes=lse_num_records_bytes,
+                    q_start=d["q0"],
+                    q_len=d["ql"],
+                )
+
+            meta_rsrc = buffer_ops.create_buffer_resource(
+                ptr_ws_meta,
+                num_records_bytes=(
+                    fx.Int32(PS_META_HDR)
+                    + (ws_items_cap // fx.Int32(2)) * fx.Int32(PS_META_STRIDE)
+                )
+                * fx.Int32(4),
+            )
+            if const_expr(SPLIT_OK):
+                hdr_off = ((wg == fx.Int32(0)) & (tid == fx.Int32(0))).select(
+                    fx.Int32(0), fx.Int32(0x7FFFFFFF)
+                )
+                buffer_ops.buffer_store(
+                    st["n_split_units"],
+                    meta_rsrc,
+                    hdr_off,
+                    mask=None,
+                    offset_is_bytes=True,
+                )
+            N = st["N"]
+            # Under carry_state a unit without keys is the merge identity: no zero items.
+            n_items = N if CARRY else N + st["ZU"]
+            n_mine = fx.max(_ps_cdiv(n_items - wg, G), fx.Int32(0))
+            for j in range(fx.Index(0), fx.Index(n_mine), 1):
+                it = wg + fx.Int32(j) * G
+                if it < N:
+                    d = _ps_item(st, it, zero=False, reverse_m=MASK_RIGHT, **geo)
+                    m_tile = d["m_tile"]
+                    kv_lo = d["tile_lo"] * fx.Int32(N_BLOCK)
+                    kv_len = fx.min(d["tile_hi"] * fx.Int32(N_BLOCK), d["kl"]) - kv_lo
+                    if const_expr(SPLIT_OK):
+                        is_ws = d["parts"] > fx.Int32(1)
+                        slot = d["slot"]
+                        out_target = {
+                            "o_iter": fx.inttoptr(
+                                o_ptr_ty, is_ws.select(ws_o_addr, o_addr)
+                            ),
+                            "o_base_elems": is_ws.select(
+                                (slot - m_tile) * fx.Int32(BM * V_HDIM), fx.Int32(0)
+                            ),
+                            "q_start_o": is_ws.select(fx.Int32(0), d["q0"]),
+                            "stride_o_seq": is_ws.select(
+                                fx.Int32(V_HDIM), stride_o_seq
+                            ),
+                            "stride_o_head": is_ws.select(fx.Int32(0), stride_o_head),
+                            "lse_rsrc": buffer_ops.create_buffer_resource_from_addr(
+                                is_ws.select(ws_lse_addr, lse_addr),
+                                num_records_bytes=is_ws.select(
+                                    ws_lse_bytes, lse_num_records_bytes
+                                ),
+                            ),
+                            "lse_base_elems": is_ws.select(
+                                (slot - m_tile) * fx.Int32(BM),
+                                d["q0"] * stride_lse_seq,
+                            ),
+                            "stride_lse_seq": is_ws.select(fx.Int32(1), stride_lse_seq),
+                            "stride_lse_head": is_ws.select(
+                                fx.Int32(0), stride_lse_head
+                            ),
+                            # Under carry the running state is folded into part 0 of a
+                            # split unit (raw parts otherwise); the merge pass then only
+                            # combines parts and never reads the running state.
+                            "carry_ok": (d["parts"] == fx.Int32(1))
+                            | (d["part"] == fx.Int32(0)),
+                        }
+                    else:
+                        out_target = None
+                    with virtual_block(
+                        m_tile=m_tile, kv_head=d["head"], num_heads_kv=H
+                    ):
+                        _ps_attention_body(
+                            core_kwargs=_core_kw(d, d["k0"] + kv_lo, kv_len),
+                            out_target=out_target,
+                            warp_idx=warp_idx,
+                            lds_base=lds_base,
+                            carry_state=CARRY,
+                        )
+                    if const_expr(SPLIT_OK):
+                        # Part 0 of a split unit publishes its merge entry:
+                        # (slot0, parts, out_row0, nrows, head).
+                        ent = fx.Int32(PS_META_HDR) + d["split_unit"] * fx.Int32(
+                            PS_META_STRIDE
+                        )
+                        pub = is_ws & (d["part"] == fx.Int32(0)) & (tid < fx.Int32(5))
+                        val = (tid == fx.Int32(0)).select(
+                            slot,
+                            (tid == fx.Int32(1)).select(
+                                d["parts"],
+                                (tid == fx.Int32(2)).select(
+                                    d["q0"] + m_tile * fx.Int32(BM),
+                                    (tid == fx.Int32(3)).select(
+                                        fx.min(
+                                            fx.Int32(BM),
+                                            d["ql"] - m_tile * fx.Int32(BM),
+                                        ),
+                                        d["head"],
+                                    ),
+                                ),
+                            ),
+                        )
+                        off = pub.select(
+                            (ent + tid) * fx.Int32(4), fx.Int32(0x7FFFFFFF)
+                        )
+                        buffer_ops.buffer_store(
+                            val, meta_rsrc, off, mask=None, offset_is_bytes=True
+                        )
+                    _ps_item_fence()
+                else:
+                    d = _ps_item(st, it - N, zero=True, reverse_m=False, **geo)
+                    with virtual_block(
+                        m_tile=d["m_tile"], kv_head=d["head"], num_heads_kv=H
+                    ):
+                        _zero_item(d)
+
+        return kn_fmha_fwd_prefill_a8w8_m32x8_thd_ps
+
     if layout == "thd":
 
         @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -2836,28 +3577,32 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     epi_state=_epi_state_out,
                     rendezvous=not ONE_KV_TILE,
                     warp_idx=warp_idx,
+                    carry_state=CARRY,
                     **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
                 )
             elif (q_len > fx.Int32(0)) & tile_has_rows:
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 # A tile past the queries has no row to fill, so it skips this too.
-                _zero_fill_attention(
-                    v_hdim=V_HDIM,
-                    gqa_ratio=GQA_RATIO,
-                    num_q_tiles_per_wave=NUM_Q_TILES,
-                    return_lse=RET_LSE,
-                    has_sink=HAS_SINK,
-                    ptr_sink=ptr_sink,
-                    ptr_O=ptr_O,
-                    ptr_LSE=ptr_LSE,
-                    stride_o_seq=stride_o_seq,
-                    stride_o_head=stride_o_head,
-                    stride_lse_seq=stride_lse_seq,
-                    stride_lse_head=stride_lse_head,
-                    lse_num_records_bytes=lse_num_records_bytes,
-                    q_start=q_start,
-                    q_len=q_len,
-                )
+                # Under carry_state an empty KV set is the merge identity: the running
+                # state stays as it is.
+                if const_expr(not CARRY):
+                    _zero_fill_attention(
+                        v_hdim=V_HDIM,
+                        gqa_ratio=GQA_RATIO,
+                        num_q_tiles_per_wave=NUM_Q_TILES,
+                        return_lse=RET_LSE,
+                        has_sink=HAS_SINK,
+                        ptr_sink=ptr_sink,
+                        ptr_O=ptr_O,
+                        ptr_LSE=ptr_LSE,
+                        stride_o_seq=stride_o_seq,
+                        stride_o_head=stride_o_head,
+                        stride_lse_seq=stride_lse_seq,
+                        stride_lse_head=stride_lse_head,
+                        lse_num_records_bytes=lse_num_records_bytes,
+                        q_start=q_start,
+                        q_len=q_len,
+                    )
 
         return kn_fmha_fwd_prefill_a8w8_m32x8_thd
 
@@ -3014,6 +3759,34 @@ def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     return int(max_seqlen_k) <= n_block
 
 
+# XCD balance of the varlen/paged grid (FMHA_ODD_M_TILE_GRID=0 disables it).
+ODD_M_TILE_GRID = os.environ.get("FMHA_ODD_M_TILE_GRID", "1") != "0"
+
+
+def _xcd_balanced_max_seqlen_q(max_seqlen_q, gqa, num_q_tiles_per_wave):
+    """``max_seqlen_q`` as the launcher should size grid x from: rounded up so the
+    m-tile count is odd.
+
+    The dispatcher deals consecutive workgroup ids to the XCDs round-robin, and grid x
+    (the m-tile) is the fastest axis, so the heads of one m-tile sit at ids
+    ``x + grid_x * head``. With an even grid_x they reach only a fraction of the XCDs
+    -- grid_x 4 on 8 XCDs puts every head of a tile on 2 of them. A ragged batch whose
+    sequences own fewer m-tiles than the longest, e.g. a chunked-prefill context chunk
+    whose keys belong to one or two sequences, then ran its real WGs on a quarter of
+    the GPU (measured 2x on a one-tile chunk). An odd tile count is coprime with any
+    power-of-two XCD count, so each tile's heads cover all XCDs; the padding tiles own
+    no rows and exit at the kernel's first-row check. The kernels read max_seqlen_q for
+    the grid only.
+    """
+    if not ODD_M_TILE_GRID:
+        return max_seqlen_q
+    block_m = _block_m(num_q_tiles_per_wave)
+    tiles = -(-int(max_seqlen_q) * int(gqa) // block_m)
+    if tiles == 0 or tiles % 2:
+        return max_seqlen_q
+    return -(-(tiles + 1) * block_m // int(gqa))
+
+
 def _ensure_thd_kernel(
     mask_left: bool,
     mask_right: bool,
@@ -3027,6 +3800,7 @@ def _ensure_thd_kernel(
     q_dtype_str: str = DEFAULT_DTYPE,
     kv_dtype_str: str = DEFAULT_DTYPE,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
+    carry_state: bool = False,
 ):
     key = (
         "thd",
@@ -3042,10 +3816,11 @@ def _ensure_thd_kernel(
         str(kv_dtype_str),
         int(num_q_tiles_per_wave),
         bool(one_kv_tile),
-    )
+    ) + ((True,) if carry_state else ())
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_a8w8_m32x8(
+        carry_state=bool(carry_state),
         layout="thd",
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
@@ -3142,6 +3917,180 @@ def _ensure_thd_kernel(
     }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
+
+
+def _ensure_thd_ps_kernel(
+    mask_left: bool,
+    mask_right: bool,
+    has_sink: bool,
+    has_descale: bool,
+    gqa_ratio: int,
+    qk_hdim: int,
+    v_hdim: int,
+    q_dtype_str: str,
+    kv_dtype_str: str,
+    num_q_tiles_per_wave: int,
+    carry_state: bool = False,
+):
+    key = (
+        "thd_ps",
+        bool(carry_state),
+        bool(mask_left),
+        bool(mask_right),
+        bool(has_sink),
+        bool(has_descale),
+        int(gqa_ratio),
+        int(qk_hdim),
+        int(v_hdim),
+        str(q_dtype_str),
+        str(kv_dtype_str),
+        int(num_q_tiles_per_wave),
+    )
+    if key in _launch_fns:
+        return key
+    kernel = build_fmha_fwd_prefill_a8w8_m32x8(
+        carry_state=bool(carry_state),
+        layout="thd_ps",
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        mask_left=mask_left,
+        mask_right=mask_right,
+        one_kv_tile=False,
+        return_lse=True,
+        has_sink=has_sink,
+        has_descale=has_descale,
+        gqa_ratio=gqa_ratio,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+    )
+
+    @flyc.jit
+    def _launch(
+        ptr_O: fx.Pointer,
+        ptr_Q: fx.Pointer,
+        ptr_K: fx.Pointer,
+        ptr_V: fx.Pointer,
+        ptr_LSE: fx.Pointer,
+        ptr_sink: fx.Pointer,
+        ptr_q_descale: fx.Pointer,
+        ptr_k_descale: fx.Pointer,
+        ptr_v_descale: fx.Pointer,
+        ptr_cu_seqlens_q: fx.Pointer,
+        ptr_cu_seqlens_k: fx.Pointer,
+        ptr_ws_o: fx.Pointer,
+        ptr_ws_lse: fx.Pointer,
+        ptr_ws_meta: fx.Pointer,
+        softmax_scale: fx.Float32,
+        stride_q_seq: fx.Int32,
+        stride_k_seq: fx.Int32,
+        stride_v_seq: fx.Int32,
+        stride_o_seq: fx.Int32,
+        stride_q_head: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_head: fx.Int32,
+        stride_o_head: fx.Int32,
+        stride_lse_seq: fx.Int32,
+        stride_lse_head: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
+        num_heads_kv: fx.Int32,
+        batch_size: fx.Int32,
+        ws_items_cap: fx.Int32,
+        lse_num_records_bytes: fx.Int32,
+        force_pt: fx.Int32,
+        num_wgs: fx.Int32,
+        stream: fx.Stream,
+    ):
+        launcher = kernel(
+            ptr_O,
+            ptr_Q,
+            ptr_K,
+            ptr_V,
+            ptr_LSE,
+            ptr_sink,
+            ptr_q_descale,
+            ptr_k_descale,
+            ptr_v_descale,
+            ptr_cu_seqlens_q,
+            ptr_cu_seqlens_k,
+            ptr_ws_o,
+            ptr_ws_lse,
+            ptr_ws_meta,
+            softmax_scale,
+            stride_q_seq,
+            stride_k_seq,
+            stride_v_seq,
+            stride_o_seq,
+            stride_q_head,
+            stride_k_head,
+            stride_v_head,
+            stride_o_head,
+            stride_lse_seq,
+            stride_lse_head,
+            window_left,
+            window_right,
+            num_heads_kv,
+            batch_size,
+            ws_items_cap,
+            lse_num_records_bytes,
+            force_pt,
+        )
+        launcher.launch(
+            grid=(fx.Index(num_wgs), 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    _launch.compile_hints["llvm_options"] = {
+        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+    }
+    _launch.compile_hints["waves_per_eu"] = 2
+    _launch_fns[key] = _launch
+    return key
+
+
+_ps_workspaces = {}
+
+
+def _ps_workspace(device, v_hdim):
+    """Split workspace, allocated once per device: partial O (bf16), partial LSE (fp32),
+    and the int32 merge table."""
+    key = (device, v_hdim)
+    ws = _ps_workspaces.get(key)
+    if ws is None:
+        bm = _block_m(WMMA_ROW_PER_WAVE)
+        ws = (
+            torch.empty((PS_WS_ITEMS * bm, v_hdim), dtype=TORCH_O_DTYPE, device=device),
+            torch.empty((PS_WS_ITEMS * bm,), dtype=torch.float32, device=device),
+            torch.zeros(
+                (PS_META_HDR + (PS_WS_ITEMS // 2) * PS_META_STRIDE,),
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        _ps_workspaces[key] = ws
+    return ws
+
+
+def _ps_merge(ws, out, lse, num_wgs, block_m, carry_state=False):
+    """Combine the split parts of every split unit by LSE into ``out``/``lse``."""
+    from .fmha_ps_merge import ps_merge
+
+    ws_o, ws_lse, meta = ws
+    ps_merge(
+        ws_o,
+        ws_lse,
+        meta,
+        out,
+        lse,
+        num_programs=4 * num_wgs,
+        block_m=block_m,
+        meta_hdr=PS_META_HDR,
+        meta_stride=PS_META_STRIDE,
+        max_parts=PS_MAX_PARTS,
+        carry_state=carry_state,
+    )
 
 
 def _ensure_paged_kernel(
@@ -3487,8 +4436,17 @@ def flash_attn_varlen_a8w8_m32x8(
     k_descale=None,
     v_descale=None,
     num_q_tiles_per_wave=None,
+    carry_state=False,
+    persistent=None,
 ):
     """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, fp8 or bf8.
+
+    ``carry_state=True``: ``out`` / ``lse`` (both required, ``return_lse`` implied) hold a
+    running attention state of the same queries over OTHER keys -- e.g. the new tokens'
+    causal pass, or earlier context chunks. This launch merges its own partial softmax
+    into them in place (LSE recombination, as merge_attn_states does), so chunked prefill
+    needs no separate merge pass; a sequence with no keys in this launch keeps its rows
+    untouched. A row whose ``lse`` is -inf has no prior state and its ``out`` is not read.
 
     ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
     on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
@@ -3559,6 +4517,24 @@ def flash_attn_varlen_a8w8_m32x8(
     window_left = max(win_left, 0)
     window_right = max(win_right, 0)
 
+    carry_state = bool(carry_state)
+    if carry_state:
+        assert (
+            out is not None and lse is not None
+        ), "carry_state merges into the caller's out/lse"
+        assert not has_sink, "carry_state does not take a sink"
+        assert out.dtype == TORCH_O_DTYPE and tuple(out.shape) == (
+            total_q_tokens,
+            nheads_q,
+            v_hdim,
+        ), f"carry_state out must be [{total_q_tokens}, {nheads_q}, {v_hdim}] bf16"
+        assert out.stride(2) == 1, "carry_state out needs unit stride on head_dim"
+        assert lse.dtype == torch.float32 and tuple(lse.shape) == (
+            nheads_q,
+            total_q_tokens,
+        ), f"carry_state lse must be [{nheads_q}, {total_q_tokens}] fp32"
+        return_lse = True
+
     if out is None:
         out = torch.empty(
             (total_q_tokens, nheads_q, v_hdim),
@@ -3598,6 +4574,87 @@ def flash_attn_varlen_a8w8_m32x8(
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
     one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str)
+    if persistent is None:
+        persistent = os.environ.get("AITER_FMHA_A8W8_PERSISTENT", "1") != "0"
+    if (
+        persistent
+        and not one_kv_tile
+        and batch <= PS_MAX_BATCH
+        and num_q_tiles_per_wave == WMMA_ROW_PER_WAVE
+        and total_q_tokens > 0
+    ):
+        if not return_lse:
+            # The persistent kernel always writes LSE; give it a scratch buffer.
+            lse_ptr = torch.empty(
+                (nheads_q, total_q_tokens), dtype=torch.float32, device=q.device
+            )
+            stride_lse_seq = lse_ptr.stride(1)
+            stride_lse_head = lse_ptr.stride(0)
+        lse_buf = lse_ptr
+        lse_nrec = (
+            (total_q_tokens - 1) * stride_lse_seq + (nheads_q - 1) * stride_lse_head + 1
+        ) * 4
+        key = _ensure_thd_ps_kernel(
+            mask_left,
+            mask_right,
+            has_sink,
+            has_descale,
+            gqa,
+            qk_hdim,
+            v_hdim,
+            q_dtype_str,
+            kv_dtype_str,
+            num_q_tiles_per_wave,
+            carry_state=carry_state,
+        )
+        ws = _ps_workspace(q.device, v_hdim)
+        num_wgs = int(os.environ.get("AITER_FMHA_A8W8_PS_WGS", "0")) or get_cu_num()
+        _run_compiled(
+            _launch_fns[key],
+            out,
+            q,
+            k,
+            v,
+            lse_buf,
+            sink_ptr,
+            qd_ptr,
+            kd_ptr,
+            vd_ptr,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ws[0],
+            ws[1],
+            ws[2],
+            softmax_scale,
+            stride_q_seq,
+            stride_k_seq,
+            stride_v_seq,
+            stride_o_seq,
+            stride_q_head,
+            stride_k_head,
+            stride_v_head,
+            stride_o_head,
+            stride_lse_seq,
+            stride_lse_head,
+            window_left,
+            window_right,
+            nheads_k,
+            batch,
+            PS_WS_ITEMS,
+            lse_nrec,
+            int(os.environ.get("AITER_FMHA_A8W8_PS_FORCE_PT", "0")),
+            num_wgs,
+            torch.cuda.current_stream(),
+        )
+        if not mask_left and not mask_right and gqa == 1 and not has_sink:
+            _ps_merge(ws, out, lse_buf, num_wgs, _block_m(num_q_tiles_per_wave))
+        if return_lse:
+            return out, lse
+        return out
+
+    grid_max_seqlen_q = _xcd_balanced_max_seqlen_q(
+        max_seqlen_q, gqa, num_q_tiles_per_wave
+    )
 
     _ensure_thd_kernel(
         mask_left,
@@ -3612,6 +4669,7 @@ def flash_attn_varlen_a8w8_m32x8(
         q_dtype_str=q_dtype_str,
         kv_dtype_str=kv_dtype_str,
         num_q_tiles_per_wave=num_q_tiles_per_wave,
+        carry_state=carry_state,
     )
 
     _run_compiled(
@@ -3631,6 +4689,7 @@ def flash_attn_varlen_a8w8_m32x8(
                 num_q_tiles_per_wave,
                 one_kv_tile,
             )
+            + ((True,) if carry_state else ())
         ],
         out,
         q,
@@ -3656,7 +4715,7 @@ def flash_attn_varlen_a8w8_m32x8(
         stride_lse_head,
         window_left,
         window_right,
-        max_seqlen_q,
+        grid_max_seqlen_q,
         max_seqlen_k,
         nheads_k,
         batch,
@@ -3888,7 +4947,7 @@ def flash_attn_paged_a8w8_m32x8(
         stride_lse_head,
         window_left,
         window_right,
-        max_seqlen_q,
+        _xcd_balanced_max_seqlen_q(max_seqlen_q, gqa, num_q_tiles_per_wave),
         max_seqlen_k,
         num_page_entries,
         num_pool_rows,
