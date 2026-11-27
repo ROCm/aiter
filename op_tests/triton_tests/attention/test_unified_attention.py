@@ -570,6 +570,111 @@ def test_triton_unified_attn_3d(
     )
 
 
+@pytest.mark.parametrize("num_seqs", [1, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_decode_d512_gfx942(
+    num_seqs: int, dtype: torch.dtype, monkeypatch
+) -> None:
+    """Head-512 decode over an 8k context on gfx942 runs the 3D Triton kernel.
+    bf16 selects the attn_3d entry with waves_per_eu 1, fp8 the one with 2."""
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 attn_3d table")
+    module = sys.modules[unified_attention.__module__]
+    lookup = module.get_unified_attention_config
+    attn_3d_configs = []
+
+    def spy(op, params, *args, **kwargs):
+        config = lookup(op, params, *args, **kwargs)
+        if op == "attn_3d":
+            attn_3d_configs.append(dict(config))
+        return config
+
+    monkeypatch.setattr(module, "get_unified_attention_config", spy)
+    seq_lens = [(1, 8192)] * num_seqs
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=64,
+        head_size=512,
+        num_heads=(32, 4),
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert len(attn_3d_configs) == 1, "decode did not take the 3D Triton path"
+    expected_waves = 1 if dtype == torch.bfloat16 else 2
+    assert attn_3d_configs[0]["waves_per_eu"] == expected_waves, attn_3d_configs[0]
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    atol, rtol = (1.5e-2, 1e-2) if dtype == torch.bfloat16 else (1.5e-1, 1.5e-1)
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output,
+            ref_output,
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn_3d d512 decode output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
