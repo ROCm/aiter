@@ -4595,6 +4595,48 @@ def get_2stage_cfgs(
                 f"separated weight layout; gate_mode={gate_mode.value!r} "
                 "is not supported."
             )
+        _RELU2_SUPPORTED_QUANT_TYPES = (QuantType.No, QuantType.per_1x32)
+        if q_type not in _RELU2_SUPPORTED_QUANT_TYPES:
+            raise NotImplementedError(
+                "ActivationType.Relu2 only supports q_type in "
+                f"{[t.name for t in _RELU2_SUPPORTED_QUANT_TYPES]!r}; "
+                f"q_type={q_type!r} (e.g. per_1x128 FP8 blockscale) has no "
+                "validated ReLU2 kernel instance."
+            )
+        if q_type == QuantType.per_1x32:
+            if q_dtype_w != dtypes.fp4x2:
+                raise NotImplementedError(
+                    "ActivationType.Relu2 CK-Tile path (q_type=per_1x32) only "
+                    f"supports q_dtype_w=fp4x2; q_dtype_w={q_dtype_w!r} is not "
+                    "a validated ReLU2 weight dtype."
+                )
+            _unsupported_reasons = []
+            if use_g1u1:
+                _unsupported_reasons.append("use_g1u1=True (expected False)")
+            if q_dtype_a != dtypes.bf16:
+                _unsupported_reasons.append(f"q_dtype_a={q_dtype_a!r} (expected bf16)")
+            if dtype != dtypes.bf16:
+                _unsupported_reasons.append(f"dtype={dtype!r} (expected bf16)")
+            if has_stage2_scatter:
+                _unsupported_reasons.append("has_stage2_scatter=True (expected False)")
+            if has_activation_scales:
+                _unsupported_reasons.append(
+                    "has_activation_scales=True (expected False)"
+                )
+            if not bool(opus_weights_shuffled):
+                _unsupported_reasons.append(
+                    "opus_weights_shuffled=False (expected True)"
+                )
+            if get_gfx_runtime() != "gfx950":
+                _unsupported_reasons.append(
+                    f"gfx runtime={get_gfx_runtime()!r} (expected gfx950)"
+                )
+            if _unsupported_reasons:
+                raise NotImplementedError(
+                    "ActivationType.Relu2 CK-Tile path (q_type=per_1x32, "
+                    "q_dtype_w=fp4x2) has no validated kernel instance for this "
+                    f"configuration: {', '.join(_unsupported_reasons)}."
+                )
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
