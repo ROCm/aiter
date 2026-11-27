@@ -251,8 +251,12 @@ def gemm2_compute_v2(
     a_scale_lds=False,
     fold_rows=0,
     fold=None,
+    rg0_only=False,
 ):
     """Run GEMM2, optionally using an explicitly selected expert row/tile.
+
+    ``rg0_only``: only the first 16-row group of each 32-row scale chunk runs its MFMAs (the rows past
+    16 of every tile must be padding); the other accumulators stay zero.
 
     ``NW`` is the CTA wave count, ``valid_rows`` bounds the A tile loads to the
     tile's real rows, and ``early_b_load`` (1-stage B path) issues each K-tile's
@@ -599,6 +603,7 @@ def gemm2_compute_v2(
                     mma_atoms,
                     i0=2 * sub,
                     k_halves=kHalves,
+                    **({"single_rg": True, "rg_off": 0} if rg0_only else {}),
                 )
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.

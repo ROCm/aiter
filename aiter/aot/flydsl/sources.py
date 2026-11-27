@@ -272,7 +272,12 @@ AOT_CACHES = {
             "kernels/mega_moe/gemm_util.py",
             "kernels/mega_moe/mega_moe_config.py",
         ),
-        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
+        "env": (
+            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
+            "AITER_MEGA_FUSED_BUCKET_MAP",
+            "AITER_MEGA_FUSED_DRAFT_LAYOUT",
+            "AITER_MEGA_SMALL_M_OVERRIDE",
+        ),
     },
     "mega_moe_small_m_stage1": {
         "sources": (
@@ -291,9 +296,24 @@ AOT_CACHES = {
             "kernels/mega_moe/mega_moe_fused_gemm.py",
             "kernels/mega_moe/mega_moe_stage1.py",
             "kernels/mega_moe/mega_moe_stage2.py",
+            "kernels/mega_moe/shared_expert.py",
             "kernels/mega_moe/weights.py",
+            "kernels/silu_mul_quant_epilogue.py",
         ),
-        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
+        "env": (
+            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
+            "AITER_MEGA_FUSED_BUCKET_MAP",
+            "AITER_MEGA_FUSED_DRAFT_LAYOUT",
+            "AITER_MEGA_SHARED_ADD",
+            "AITER_MEGA_SHARED_IN",
+            "AITER_MEGA_SHARED_IN_OPT",
+            "AITER_MEGA_SMALL_EXPERT_CACHED_W",
+            "AITER_MEGA_SMALL_FP8_ROWS_MIN",
+            "AITER_MEGA_SMALL_G2_B2STAGE",
+            "AITER_MEGA_SMALL_M2",
+            "AITER_MEGA_SMALL_M_OVERRIDE",
+            "AITER_MEGA_SMALL_PROBE",
+        ),
     },
     "mega_moe_large_m_stage1": {
         "sources": (
@@ -315,7 +335,12 @@ AOT_CACHES = {
             "kernels/mega_moe/quant.py",
             "kernels/mega_moe/weights.py",
         ),
-        "env": ("AITER_MEGA_FIXED_SLOT_MAX_MTPR",),
+        "env": (
+            "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
+            "AITER_MEGA_FUSED_BUCKET_MAP",
+            "AITER_MEGA_FUSED_DRAFT_LAYOUT",
+            "AITER_MEGA_SMALL_M_OVERRIDE",
+        ),
     },
     "mega_moe_stage2": {
         "sources": (

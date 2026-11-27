@@ -72,6 +72,41 @@ FUSED_LAYOUTS = frozenset(
         ),
     }
 )
+# Experiment switch (default off: unset leaves FUSED_LAYOUTS, every config and every kernel unchanged).
+# AITER_MEGA_FUSED_DRAFT_LAYOUT=1 admits the DeepSeek-V4.1-Flash DSpark draft MoE (128 routed experts, top-3,
+# V4.1-Flash dims) to the small-input fused kernel: EP8 (16 experts a rank) and its 4-rank proxy (4 x 16).
+# Small-input only: the large-input kernel is never built for these layouts (fused_layout_small_only). Not
+# validated on a GPU. Read once, at import; every rank must set the same value.
+FUSED_DRAFT_LAYOUT = os.environ.get("AITER_MEGA_FUSED_DRAFT_LAYOUT", "0") == "1"
+V41_DRAFT_TOPK = 3
+# (world_size, experts_per_rank, model_dim, inter_dim)
+# (4, 32): the same draft MoE on EP4, 32 experts a rank; matches no EP8 call.
+V41_DRAFT_LAYOUTS = (
+    ((8, 16, 5120, 2304), (4, 16, 5120, 2304), (4, 32, 5120, 2304))
+    if FUSED_DRAFT_LAYOUT
+    else ()
+)
+# (world_size, experts_per_rank) pairs the small-input kernel's direct fixed-slot dispatch additionally accepts.
+EXTRA_FIXED_SLOT_LAYOUTS = tuple((world, epr) for world, epr, _, _ in V41_DRAFT_LAYOUTS)
+if FUSED_DRAFT_LAYOUT:
+    FUSED_LAYOUTS = FUSED_LAYOUTS | {
+        (world, model_dim, inter_dim, world * epr, V41_DRAFT_TOPK)
+        for world, epr, model_dim, inter_dim in V41_DRAFT_LAYOUTS
+    }
+
+
+def fused_layout_small_only(
+    *, world_size: int, model_dim: int, inter_dim: int, experts: int
+) -> bool:
+    """A fused layout served by the small-input kernel only (AITER_MEGA_FUSED_DRAFT_LAYOUT)."""
+    return (
+        world_size,
+        experts // world_size,
+        model_dim,
+        inter_dim,
+    ) in V41_DRAFT_LAYOUTS
+
+
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -311,6 +346,23 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input fused kernel: an expert whose rows span more than one m-tile reads its weights through the cache (the
+    # cached-weight bodies), so its later m-tiles take the W slab from L2 instead of streaming it from HBM again; the
+    # single-tile experts keep the streaming bodies (0: off; 1: GEMM1 / W1; 2: GEMM1 and GEMM2 / W1 and W2). Only the
+    # cache policy of the weight loads changes, so the output is bit-identical and ranks need not agree.
+    expert_cached_w: int = 0
+    # Small-input fused kernel, producer store order (bits; 0: off). 1 (with dedup_rows): a route's token row goes out
+    # while its slot RMW is in flight, not after the RMW returned (the row's place does not depend on the slot).
+    # 2: the producers load the destinations' source-flag pointers before their routes, not behind the done count.
+    # 4: a producer counts itself done without an L2 writeback first (its stores and RMWs went to the uncached
+    # symmetric heap and drained); 8: the last producer's source flags are relaxed system stores (no writeback);
+    # 16: the same for the combine's publisher (its flags to the peers without the L2 invalidate / writeback).
+    # The same stores and flags, so the output is bit-identical and ranks need not agree.
+    disp_order: int = 0
+    # Small-input fused kernel, rank-local flags without an L2 writeback (bits; 0: off). 1: the GEMM2-ready epoch of an
+    # m-tile (its GEMM2 runs on the XCD whose L2 holds it, or its cut parts were each released before they were
+    # counted); 2 (with plan_wt): the plan flag. Bit-identical; ranks need not agree.
+    sync_lean: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1670,6 +1722,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             stage1=replace(config.stage1, tile_n=128),
             stage2=replace(config.stage2, block_n=128),
         )
+    if bucket == 32:
+        # As at 64, and the 256-wide GEMM2 n-blocks of 64 / 128 tokens: serving decode (graph bs 4-7, 24-42 rows a
+        # rank, a skewed expert placement) streams every local expert's W2 once, in half as many units (-1.4..-2.4%).
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
+        )
     if bucket in (32, 64):
         # Wider GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab.
         return replace(config, stage1=replace(config.stage1, tile_n=256))
@@ -1702,6 +1762,11 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
             early_p_mid=0,
             early_xcd=False,
             comb_tok_wait=False,
+            # No GEMM2 fold (an m-block's <= 16-row tail computed by the m-block before it, and the single-CTA NT
+            # loads that go with it): small win on real prefill routes with a skewed expert placement, -0.2..-1.7% at
+            # 16k tokens a rank (2 batches); bit-identical (GEMM1's fold stays).
+            fold_tail=0,
+            nt_single=False,
         ),
     )
 
@@ -1720,7 +1785,15 @@ def _fused_config(
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
         if layout == V41_FLASH_EP4_LAYOUT:
-            return _tune_v41_flash_ep4_large(config)
+            # EP4 only (the EP2 / EP8 large tunes build on _tune_v41_flash_ep4_large): GEMM2 claims walk groups of
+            # 256 m-blocks, all n-blocks of a group before the next, so the CTAs in flight share W2 slabs; 96
+            # dispatch CUs instead of 192; GEMM1 weight loads without the non-temporal hint. Bit-identical.
+            config = _tune_v41_flash_ep4_large(config)
+            return replace(
+                config,
+                stage1=replace(config.stage1, num_dispatch_cu=96, b_nt=0),
+                fused_stage2=replace(config.fused_stage2, m_group=256),
+            )
         if layout == V41_FLASH_EP2_LAYOUT:
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
@@ -1736,8 +1809,78 @@ def _fused_config(
     if layout == V41_FLASH_EP2_LAYOUT:
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
-        return _tune_v41_flash_ep8_small(config, bucket)
+        config = _tune_v41_flash_ep8_small(config, bucket)
+        if bucket in (64, 128, 256):
+            # Serving verify (graph bs 8-63, 48-383 rows a rank): the producers' token rows go out while their slot
+            # RMW is in flight, and the producers, the last producer's source flags and the combine publisher skip
+            # their L2 writebacks (every store they order sits drained in the uncached symmetric heap): -1.7..-2.5%
+            # at 60-150 rows a rank (kro_ep8_v3 decode routing, layers 21 / 10), bit-identical. Not on the draft
+            # layout, which reuses this tune (unmeasured there).
+            config = replace(
+                config,
+                fused_stage1=replace(config.fused_stage1, disp_order=31, sync_lean=1),
+            )
+        return config
+    if layout in V41_DRAFT_LAYOUTS:
+        return _tune_v41_draft_small(config, bucket, world_size)
     return config
+
+
+def _tune_v41_draft_small(
+    config: MegaMoEConfig, bucket: int, world_size: int = 8
+) -> MegaMoEConfig:
+    """DSpark draft MoE (16 experts a rank, top-3) small-input kernel: a starting point, NOT measured.
+
+    The EP8 V4.1-Flash tune and its launch protocol. A draft pass of 160 rows a rank gives each of the 16 local
+    experts ~30 rows: a 32-row tile would split about a third of them in two and stream their weights twice, so the
+    128-token bucket takes the 64-row tile of the 256 one. 16 m-tiles are few units for 512 CTAs: the narrow GEMM1
+    n-tile (128: 36 units an m-tile) and GEMM2 n-block (128: 40 units) keep every CTA busy, and the 128-wide
+    n-block puts the 64-row GEMM2 on the 2-stage weight pipeline; its pointers go to SGPRs (no spill at 256 VGPRs).
+    """
+    if bucket == 32:
+        # The verify layout's 256-wide GEMM2 n-blocks at 32 tokens were measured on verify rows only: the draft keeps
+        # the 64-token tune (GEMM1 tile_n 256, GEMM2 n-blocks as before).
+        config = _tune_v41_flash_ep4_small(config, bucket)
+        config = replace(config, stage1=replace(config.stage1, tile_n=256))
+    else:
+        config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket in (64, 128) and world_size == 8:
+        # 16 experts a rank receive a third of the verify layout's rows: 128 producer CTAs send them as fast as 224
+        # and leave more CTAs to the GEMMs (skewed routes: -2.7..-3.6% at 50-75 draft rows a rank,
+        # -1.8% at 100; bit-identical).
+        config = replace(config, stage1=replace(config.stage1, num_dispatch_cu=128))
+    if bucket < 128:
+        return config
+    if bucket == 128 and world_size == 8:
+        # Measured at EP8 (skewed routes): the verify layout's 32-row tiles and 256-wide GEMM1 /
+        # GEMM2 n-blocks instead: -5.5..-6.1% at 100 draft rows a rank (graph bs 20), -4.2..-4.5% at 120, -2.4..-2.8%
+        # at 145; bit-identical.
+        return config
+    return replace(
+        config,
+        stage1=replace(config.stage1, sort_block_m=64, tile_n=128),
+        stage2=replace(config.stage2, block_m=64, block_n=128),
+        fused_stage1=replace(config.fused_stage1, g2_uniform=True),
+    )
+
+
+def fused_bucket_override(tokens: int, mtpr: int) -> int:
+    """Launch-config bucket forced for a row range of the small-input route:
+    ``AITER_MEGA_FUSED_BUCKET_MAP="161-255:128,..."`` (tokens lo-hi : bucket). 0: none.
+    """
+    spec = os.environ.get("AITER_MEGA_FUSED_BUCKET_MAP", "")
+    if not spec or mtpr > SMALL_M_MAX_MTPR:
+        return 0
+    for item in spec.split(","):
+        rows, bucket = item.split(":")
+        lo, _, hi = rows.partition("-")
+        if int(lo) <= tokens <= int(hi or lo):
+            if int(bucket) not in FUSED_TOKEN_BUCKETS:
+                raise ValueError(
+                    f"AITER_MEGA_FUSED_BUCKET_MAP: {bucket} is not a fused token bucket"
+                )
+            return int(bucket)
+    return 0
 
 
 def select_fused_config(
@@ -1765,11 +1908,52 @@ def select_fused_config(
         raise ValueError(
             f"experts_per_rank must be in [1, 256], got {experts_per_rank}"
         )
-    return _fused_config(
-        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS),
+    bucket = nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS)
+    config = _fused_config(
+        bucket,
         mtpr,
         world_size,
         experts_per_rank,
         model_dim,
         inter_dim,
     )
+    if _SMALL_M_OVERRIDE and mtpr <= SMALL_M_MAX_MTPR:
+        config = _small_m_override(config, bucket)
+    return config
+
+
+# Experiment switch (default off: unset leaves every config, kernel name and cache key unchanged).
+# AITER_MEGA_SMALL_M_OVERRIDE="256:s1.tile_n=256,s2.block_n=128;128+64:fs1.g1_a_ahead=2" replaces fields of the
+# small-input launch config of the listed token buckets ("*": every bucket). Keys: s1.<Stage1Config field>,
+# s2.<Stage2Config field>, fs1.<FusedStage1Knobs field>, fs2.<FusedStage2Knobs field>; values are ints (bools 0/1).
+# Read once, at import. Protocol knobs (dedup_rows, plan_local, direct_done, tok_counters, bf16_head_tokens) must
+# stay equal on every bucket and rank (SmallMRuntime asserts it); every rank must set the same value.
+_SMALL_M_OVERRIDE = os.environ.get("AITER_MEGA_SMALL_M_OVERRIDE", "")
+_SMALL_M_OVERRIDE_SECTIONS = {
+    "s1": "stage1",
+    "s2": "stage2",
+    "fs1": "fused_stage1",
+    "fs2": "fused_stage2",
+}
+
+
+@cache
+def _small_m_override(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    for item in _SMALL_M_OVERRIDE.split(";"):
+        if not item.strip():
+            continue
+        buckets, _, fields = item.partition(":")
+        if buckets.strip() != "*" and bucket not in {
+            int(b) for b in buckets.split("+")
+        }:
+            continue
+        for assign in fields.split(","):
+            path, _, value = assign.partition("=")
+            section, _, field = path.strip().partition(".")
+            name = _SMALL_M_OVERRIDE_SECTIONS[section]
+            sub = getattr(config, name)
+            cast = type(getattr(sub, field))  # bool or int
+            config = replace(
+                config, **{name: replace(sub, **{field: cast(int(value))})}
+            )
+    return config

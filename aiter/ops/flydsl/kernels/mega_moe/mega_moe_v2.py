@@ -31,6 +31,7 @@ from .mega_moe_config import (
     Stage1Config,
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
+    fused_layout_small_only,
     fused_layout_supported,
     large_m_mtprs_for,
     small_m_cu_supported,
@@ -138,6 +139,13 @@ class MegaMoEV2:
             large_m=(
                 fused
                 and large_m_enabled
+                # False for every layout unless AITER_MEGA_FUSED_DRAFT_LAYOUT=1 added small-input-only ones.
+                and not fused_layout_small_only(
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    experts=self.experts,
+                )
                 and self.mtpr
                 in large_m_mtprs_for(
                     world_size=self.world_size,
@@ -1126,7 +1134,7 @@ class MegaMoEV2:
 
     def forward(
         self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
-        max_tokens=None,
+        max_tokens=None, shared_add=None, shared_in=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
         None or False leaves the check off (it costs prefill time); the small-
@@ -1144,6 +1152,46 @@ class MegaMoEV2:
         route took), of which rows past this rank's own are undefined.
         """
         route = self._route(int(x_bf16.shape[0]), max_tokens)
+        if shared_in is not None:
+            # ``shared_in`` (a weights.SharedExpertInput, instead of ``shared_add``): the output is ``routed +
+            # shared expert``. The small-input route computes the shared expert inside its kernel where that kernel
+            # can (SmallMRuntime.shared_in_ready); every other call runs ``shared_in.dense()`` here, on the
+            # caller's stream, and takes the ``shared_add`` path below.
+            if shared_add is not None:
+                raise ValueError("pass either shared_add or shared_in")
+            # An eager call of any route and row count builds what the layer's captured small-input calls need
+            # (a capture cannot build it and would run the dense shared expert for good).
+            for runtime in getattr(self, "_small_m_runtimes", ()):
+                runtime.shared_in_prepare(shared_in)
+            if route[0] == ROUTE_SMALL_M and slice_output:
+                runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(route[1])]
+                if runtime.shared_in_ready(int(x_bf16.shape[0]), shared_in):
+                    check_forward_inputs(
+                        x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+                        topk=self.topk, device=self.dev,
+                    )
+                    with torch.cuda.stream(torch_stream(stream)):
+                        return runtime.forward(x_bf16, wts, topk_ids, slice_output=True, shared_in=shared_in)
+            with torch.cuda.stream(torch_stream(stream)):
+                shared_add = shared_in.dense()
+        if shared_add is not None:
+            # ``shared_add`` (BF16 [rows, model_dim], this call's rows): the output is ``routed + shared_add``. The
+            # small-input route adds it inside its combine and returns ``shared_add`` itself (see
+            # SmallMRuntime.forward); the other routes add it here, as the caller would.
+            if route[0] == ROUTE_SMALL_M and slice_output:
+                check_forward_inputs(
+                    x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+                    topk=self.topk, device=self.dev,
+                )
+                with torch.cuda.stream(torch_stream(stream)):
+                    runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(route[1])]
+                    return runtime.forward(x_bf16, wts, topk_ids, slice_output=True, shared_add=shared_add)
+            out = self._forward_route(
+                route, x_bf16, wts, topk_ids, stream=stream, slice_output=True,
+                mask_invalid_slots=mask_invalid_slots,
+            )
+            with torch.cuda.stream(torch_stream(stream)):
+                return out + shared_add
         return self._forward_route(
             route, x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
             mask_invalid_slots=mask_invalid_slots,

@@ -68,3 +68,64 @@ def check_forward_inputs(x_bf16, wts, topk_ids, *, max_rows, model_dim, topk, de
             # A rank that faults on a foreign pointer would leave its peers waiting.
             raise ValueError(f"x_bf16, wts and topk_ids must be on {device}")
     return rows
+
+
+class SharedExpertInput:
+    """What the small-input kernel needs to compute the model's shared expert itself (``shared_in``), and the
+    way back to the dense launches.
+
+    ``x_fp8`` / ``x_scale``: the group-32 MXFP8 pair of the call's rows (E4M3 ``[rows, model_dim]``, row-major E8M0
+    ``[rows, model_dim / 32]``); ``gate_up`` / ``gate_up_scale``: the ``[gate | up]`` E4M3 weight ``[2 inter,
+    model_dim]`` in the (16, 16) preshuffle with its 32x32-block E8M0 scales; ``down`` / ``down_scale``: the same
+    for ``[model_dim, inter]``. ``dense()`` computes the shared expert's BF16 output the usual way; a route that
+    cannot fuse it calls that instead (``used_dense`` then tells the caller).
+    """
+
+    def __init__(self, x_fp8, x_scale, gate_up, gate_up_scale, down, down_scale, dense):
+        self.x_fp8, self.x_scale = x_fp8, x_scale
+        self.gate_up, self.gate_up_scale, self.down, self.down_scale = (
+            gate_up,
+            gate_up_scale,
+            down,
+            down_scale,
+        )
+        self._dense = dense
+        self.used_dense = False
+
+    def dense(self):
+        self.used_dense = True
+        return self._dense()
+
+    @staticmethod
+    def _readable(sizes) -> bool:
+        return all(
+            t.numel() == n
+            and t.element_size() == 1
+            and t.is_contiguous()
+            and t.data_ptr() % 16 == 0
+            for t, n in sizes
+        )
+
+    def weights_fit(self, model_dim: int, inter_dim: int) -> bool:
+        """Shapes, layout and alignment of the weights the kernel reads (metadata only)."""
+        return self._readable(
+            (
+                (self.gate_up, 2 * inter_dim * model_dim),
+                (self.gate_up_scale, (2 * inter_dim // 32) * (model_dim // 32)),
+                (self.down, model_dim * inter_dim),
+                (self.down_scale, (model_dim // 32) * (inter_dim // 32)),
+            )
+        )
+
+    def fits(self, rows: int, model_dim: int, inter_dim: int) -> bool:
+        """``weights_fit`` and the same for the pair of a ``rows``-row call (metadata only)."""
+        return (
+            rows > 0
+            and self.weights_fit(model_dim, inter_dim)
+            and self._readable(
+                (
+                    (self.x_fp8, rows * model_dim),
+                    (self.x_scale, rows * (model_dim // 32)),
+                )
+            )
+        )
