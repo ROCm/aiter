@@ -250,8 +250,10 @@ def _a16w16(job: dict) -> None:
     weight = _empty(n, k, dtype=dtype)
     if _flag(job["bpreshuffle"]):
         weight.is_shuffled = True
+    # A column slice of a wider activation: its row stride is not K.
+    inp = _empty(m, k + 64, dtype=dtype)[:, :k] if job.get("strided_a") else None
     gemm_a16w16(
-        _empty(m, k, dtype=dtype),
+        _empty(m, k, dtype=dtype) if inp is None else inp,
         weight,
         bias=_empty(n, dtype=dtype) if _flag(job["bias"]) else None,
         otype=otype,
@@ -460,11 +462,15 @@ def _variants(table: Table, job: dict, flydsl: bool) -> list[dict]:
     alike and whose FlyDSL kernels specialize on it, and the fused output
     quant of a batched GEMM. That entry runs FlyDSL at every row, ``flydsl``
     (one the table's own entry runs with FlyDSL) or not; any other row has
-    no variant."""
+    no variant. And the activation's row stride for a BF16 decode row: a row
+    stride other than K builds a kernel of its own (``strided_a``), which a
+    run-only deployment must find cached."""
     if table.caller is _batched_a8w8_mxscale_bpreshuffle:
         return ([{}] if flydsl else []) + [{"fused_quant": True}]
     if not flydsl:
         return []
+    if table.caller is _a16w16 and job["kernel_name"].startswith("flydsl_decode_"):
+        return [{}, {"strided_a": True}] if job["m"] > 1 else [{}]
     if table.caller is _a8w8_blockscale_mxscale_bpreshuffle:
         _, cols = _blocks(job["w_scale_block"], "128x128")
         return [{"x_block": 128 if cols == 128 else 32}]
@@ -589,8 +595,9 @@ def describe(job: dict) -> str:
             "outdtype",
             "bias",
             "bpreshuffle",
+            "strided_a",
         )
-        if job.get(name) not in (None, "", "False")
+        if job.get(name) not in (None, "", "False", False)
     ]
     return f"{job['table']} {job['kernel_name']}  {shape} {' '.join(extra)}".rstrip()
 

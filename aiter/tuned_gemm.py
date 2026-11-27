@@ -44,6 +44,18 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+def is_flydsl_decode_config(config: dict | None) -> bool:
+    """True when a tuned row selects a FlyDSL exact-M decode kernel.
+
+    For callers outside aiter (vLLM) that must not match on libtype labels.
+    """
+    return bool(
+        config
+        and config.get("libtype") == "flydsl"
+        and (config.get("kernelName") or "").startswith("flydsl_decode_")
+    )
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -110,6 +122,38 @@ def is_skinny_default_shape(
     )
 
 
+def _check_flydsl_decode_row(
+    config, M, N, K, gfx, bias, dtype, otype, scaleAB, bpreshuffle
+):
+    """Return the tuned decode row if its kernel fits this call, else None."""
+    gemm_kernels = _get_flydsl_gemm_kernels()
+    name = config["kernelName"]
+    params = gemm_kernels.get_flydsl_decode_kernel_params(name)
+    if params is None:
+        reason = "is not a valid decode kernel name"
+    else:
+        reason = gemm_kernels.check_flydsl_decode_row(
+            params,
+            M,
+            N,
+            K,
+            gfx,
+            bias,
+            eval(dtype),
+            eval(otype),
+            scaleAB,
+            bpreshuffle,
+        )
+    if reason is None:
+        return config
+    logger.warning(
+        "FlyDSL kernel '%s' from tuned config %s; falling back to next candidate.",
+        name,
+        reason,
+    )
+    return None
+
+
 def get_GEMM_A16W16_tuned_config(
     M: int,
     N: int,
@@ -162,7 +206,15 @@ def get_GEMM_A16W16_tuned_config(
             None,
         )
         if config is not None:
-            if config["libtype"] == "flydsl":
+            if is_flydsl_decode_config(config):
+                # Exact-M kernels are never reused for a padded M.
+                if padded_M != M:
+                    config = None
+                else:
+                    config = _check_flydsl_decode_row(
+                        config, M, N, K, gfx, bias, dtype, otype, scaleAB, bpreshuffle
+                    )
+            elif config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
                         config["kernelName"]
@@ -748,6 +800,22 @@ def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
     return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_decode_layout_fallback(
+    kernel_name, a_stride, b_stride, bias_stride, out_stride
+):
+    """Log once per row and layout that a decode row fell back to torch."""
+    logger.warning(
+        "FlyDSL decode row %s does not take this layout (strides A %s, B %s, "
+        "bias %s, out %s); running torch_gemm instead",
+        kernel_name,
+        a_stride,
+        b_stride,
+        bias_stride,
+        out_stride,
+    )
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -765,6 +833,21 @@ def flydsl_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    if is_flydsl_decode_config(config):
+        # The row was picked from shape and dtype only; a layout the decode
+        # kernels do not take goes to torch, as an untuned shape would.
+        if not flydsl_gemm_kernels.decode_layout_supported(inp, weights, bias, out):
+            _warn_decode_layout_fallback(
+                config["kernelName"],
+                tuple(inp.stride()),
+                tuple(weights.stride()),
+                None if bias is None else f"{tuple(bias.stride())} {bias.dtype}",
+                None if out is None else tuple(out.stride()),
+            )
+            return torch_gemm(inp, weights, solidx, bias, otype, config=config, out=out)
+        return flydsl_gemm_kernels.flydsl_decode_gemm(
+            inp, weights, config["kernelName"], bias=bias, out=out
+        )
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
     fused_bias = None
