@@ -77,10 +77,12 @@ def test_pa_decode_plan(
     calls = []
 
     def spy_compile(*args):
-        launch = compile_plan(*args)
+        # The planner launches the factory's lazy handle (AOT cache).
+        launch = compile_plan.lazy(*args)
         calls.append((args, launch))
         return launch
 
+    spy_compile.lazy = spy_compile
     monkeypatch.setattr(planner, "compile_pa_decode_plan", spy_compile)
 
     def check(plan, lengths):

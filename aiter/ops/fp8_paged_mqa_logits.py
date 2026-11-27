@@ -19,7 +19,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx_runtime
 
 MD_NAME = "module_fp8_paged_mqa_logits"
 
@@ -33,8 +33,11 @@ SUPPORTED_KV_BLOCK_SIZES = (1, 64)
 
 def is_supported(num_heads: int, head_dim: int, kv_block_size: int = 1) -> bool:
     """True when this kernel can run this shape/layout on this device."""
+    # The live GPU, not get_gfx(): a multi-arch package (GPU_ARCHS="gfx942;gfx950")
+    # makes get_gfx() report the last listed arch on every device, and the
+    # non-gfx950 device pass of the kernel is a __builtin_trap() stub.
     return (
-        get_gfx() in SUPPORTED_GFX
+        get_gfx_runtime() in SUPPORTED_GFX
         and num_heads == NUM_HEADS
         and head_dim == HEAD_DIM
         and kv_block_size in SUPPORTED_KV_BLOCK_SIZES
@@ -97,7 +100,7 @@ def fp8_paged_mqa_logits(
     context_lens[b, n] for [batch, next_n] ones. The -inf outside it is the
     caller's, exactly as for `deepgemm_fp8_paged_mqa_logits`.
     """
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
             f"fp8_paged_mqa_logits (HIP) supports {SUPPORTED_GFX} only, got {gfx}; "

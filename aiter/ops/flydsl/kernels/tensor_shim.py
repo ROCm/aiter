@@ -33,13 +33,6 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
     os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
 )
 
-# Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
-# kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
-# to enable it.
-AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
-)
-
 _PRELOAD_COMPILE_LOCK = threading.RLock()
 
 
@@ -385,8 +378,42 @@ def _run_compiled(exe, *args, specialization_key=None):
         exe._cf_by_specialization[specialization_key] = cf
 
 
-def _preload_compiled(exe, *args):
+def _aot_prebuilding() -> bool:
+    """Whether this process is an AOT prebuild (``aot_cache._prebuilding``);
+    asked only for a bound launcher, so the cache module is loaded."""
+    return sys.modules["aiter.ops.flydsl.aot_cache"]._prebuilding()
+
+
+def _compile_and_keep(exe, *args):
+    """``flyc.compile(exe, *args)`` for a caller that keeps the returned
+    function and calls it directly from then on: launches ``exe`` and returns
+    that function (None under ``COMPILE_ONLY``, which launches nothing).
+
+    For a launcher bound to the AOT cache, a prebuild builds its entry, and
+    another process launches and returns the loaded entry; a key with no
+    entry is compiled on the JIT path as before.
+    """
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if env.compile.compile_only:
+            _run_compiled(exe, *args)
+            return None
+        from ..aot_launch import preload_bound
+
+        kernel = preload_bound(exe, args)
+        if kernel is not None:
+            kernel(*args)
+            return kernel
+        exe = aot.launcher()
+    return _compile_and_run(exe, *args)
+
+
+def _preload_compiled(exe, *args, specialization_key=None):
     """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    ``specialization_key``: the one the launcher is launched with
+    (``_run_compiled``), so that a launcher bound to the AOT cache is
+    preloaded under the key its launches look up.
 
     Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
     Older supported versions provide the same no-dispatch behavior through the
@@ -394,6 +421,25 @@ def _preload_compiled(exe, *args):
     guard executes the launcher and is unsafe for preload callers that pass
     placeholder pointers.
     """
+    # A launcher bound to the AOT cache (aot_launch): a prebuild builds its
+    # entry as a launch does, and another process loads the entry instead of
+    # tracing and returns the loaded function, which takes the launcher's
+    # arguments. A key with no entry is preloaded on the JIT path.
+    aot = getattr(exe, "_aiter_aot", None)
+    if aot:
+        if _aot_prebuilding():
+            # Builds the entry and runs FlyDSL's compile-only launch, which
+            # returns None, as flyc.compile does under COMPILE_ONLY.
+            _run_compiled(exe, *args, specialization_key=specialization_key)
+            return None
+        from ..aot_launch import preload_bound
+
+        loaded = preload_bound(exe, args, specialization_key)
+        if loaded is not None:
+            return loaded
+        # A factory.lazy() handle is no launcher: build it.
+        exe = aot.launcher()
+
     preload = getattr(exe, "preload", None)
     if callable(preload):
         return preload(*args)

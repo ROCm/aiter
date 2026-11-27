@@ -29,7 +29,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -72,7 +72,7 @@ FLYDSL_SPLIT_KV_SCALES = (1 / 8, 1 / 4, 1 / 3, 1 / 2, 2 / 3, 1, 3 / 2, 2, 3, 4, 
 def flydsl_supported(num_heads, head_dim, kv_block_size, next_n):
     return (
         flydsl_paged_logits is not None
-        and get_gfx() == "gfx950"
+        and get_gfx_runtime() == "gfx950"
         and (num_heads, head_dim, kv_block_size) == (32, 128, FLYDSL_KV_BLOCK_SIZE)
         and 1 <= next_n <= FLYDSL_MAX_NEXT_N
     )
@@ -412,7 +412,7 @@ def test_fp8_paged_mqa_logits(
         + (next_n * total_ctx - batch_size * next_n * (next_n - 1) // 2) * 4
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         # The candidates take the KV cache as an argument: run_perftest deep-copies and
         # rotates it when num_rotate_args is 0 (--cold, enough copies to defeat the
@@ -449,10 +449,9 @@ def test_fp8_paged_mqa_logits(
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "fp8_paged_mqa_logits unsupported on %s; skipping", get_gfx()
-        )
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("fp8_paged_mqa_logits unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(

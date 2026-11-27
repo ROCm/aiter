@@ -1359,77 +1359,34 @@ __global__ void __launch_bounds__(1024, 1) dcp_merge_ll_gfx1250(
 // Lamport one-shot fused allreduce + residual add + RMSNorm (2-byte dtypes)
 // ---------------------------------------------------------------------------
 /*
- * No barrier and no copy-in: every thread owns one 16B pack, pushes it into
- * slot[rank] of each peer's inbox, then polls its own inbox until no half-word
- * is the 0xffff sentinel (a bf16/fp16 NaN; the sender rewrites its own 0xffff
- * to 0x7fff). The epilogue then follows ar_rmsnorm_gfx1250 step by step
- * (rank-order fp32 sum, round to T, add the residual, 32-lane butterfly then a
- * serial sum over the waves of the row), so out and residual_out match it bit
- * for bit, and so do the FP8 out and scale of its per-token quant.
+ * No barrier and no copy-in: every 16B pack of the input is pushed into
+ * slot[rank] of each peer's inbox, and its receiver polls its own inbox until
+ * no half-word is the 0xffff sentinel (a bf16/fp16 NaN; the sender rewrites
+ * its own 0xffff to 0x7fff). The epilogue then follows ar_rmsnorm_gfx1250 step
+ * by step (rank-order fp32 sum, round to T, add the residual, 32-lane butterfly
+ * then a serial sum over the wave groups of the row), so out and residual_out
+ * match it bit for bit, and so do the FP8 out and scale of its per-token quant.
  *
  * Inbox (one IPC buffer per rank, memset to 0xff at init):
  *   inbox[kLamportBuffers][ngpus][slot] of 16B, slot = the most packs a call takes
- * Each wave of 32 packs has its own round counter c (rank-local), which picks
+ * Each group of 32 packs has its own round counters (rank-local), which pick
  * the buffer. Every rank runs the same calls, so the counter of a pack is the
  * same on every rank whatever the row width and block shape of each call, and
  * a pack that sits out a call keeps its counter and its inbox. A peer is at
- * most one round ahead on a pack, so buffer (c+2)%3 is re-armed here and the
- * kernel boundary orders that before my next round's sends.
+ * most one round ahead on a pack, so buffer (c+2)%3 is re-armed in round c and
+ * the kernel boundary orders that before my next round's sends.
  *
- * The grid covers whole rows. The sum of squares of a row is reduced
- *   - row:     one block a row (blockDim = hidden / 8), on chip.
- *   - cluster: the blocks of a row are one workgroup cluster (2 to 16 blocks);
- *              the wave partials go through rank-local memory, ordered by the
- *              cluster barrier (the FP8 amax the same way, after a second
- *              barrier). Spreads a row over more CUs while the rows do not
- *              fill the device.
+ * One block a row receives the row and reduces it on chip; thread t owns packs
+ * t + k * blockDim.x (k < PACKS) of its row. The packs are sent
+ *   - row mode: by that same block, before it polls;
+ *   - split mode: by sender blocks 0 .. senders - 1, ahead of the row blocks in
+ *     the grid. They spread the remote stores over more CUs and also re-arm.
+ *     Senders and receivers count rounds apart (tx and rx counters).
+ * LamportArRms::run picks the mode and PACKS.
  */
-constexpr int kLamportBuffers           = 3;
-constexpr int kLamportWave              = 32;   // = gfx1250 warpSize
-constexpr int kLamportRowMaxThreads     = 1024; // a row is one block: hidden <= 8192
-constexpr int kLamportClusterMaxThreads = 256;
-constexpr int kLamportMaxClusterBlocks  = 16;
-// Rows of at most this many packs stay in one block: splitting them measured
-// no faster at any row count (hidden 2048, TP2/TP4).
-constexpr int kLamportMinClusterRowPacks = 256;
-
-// The cluster path needs a toolchain that knows workgroup clusters: the device
-// side the gfx1250 cluster barrier and cluster memory scope, the host side the
-// cluster launch attribute (neither is in ROCm 7.2). This module is also built
-// for other archs and older ROCm, where the cluster kernel is compiled out and
-// every call takes the block-a-row path.
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
-    __has_builtin(__builtin_amdgcn_s_cluster_barrier) && defined(__MEMORY_SCOPE_CLUSTR)
-#define AITER_GFX1250_HAVE_CLUSTER 1
-#else
-#define AITER_GFX1250_HAVE_CLUSTER 0
-#endif
-
-template <typename V, typename = void>
-struct lamport_has_cluster_dim : std::false_type
-{
-};
-template <typename V>
-struct lamport_has_cluster_dim<V, std::void_t<decltype(std::declval<V&>().clusterDim)>>
-    : std::true_type
-{
-};
-// hipLaunchAttributeValue::clusterDim comes with hipLaunchAttributeClusterDimension
-constexpr bool kLamportClusterLaunch = lamport_has_cluster_dim<hipLaunchAttributeValue>::value;
-
-// Make attr a cluster of x blocks. A template so that the cluster names are
-// dependent and only looked up where the HIP headers have them.
-template <typename Attr>
-inline void lamport_set_cluster_dim(Attr& attr, unsigned x)
-{
-    if constexpr(lamport_has_cluster_dim<decltype(Attr::val)>::value)
-    {
-        attr.id               = decltype(Attr::id)::hipLaunchAttributeClusterDimension;
-        attr.val.clusterDim.x = x;
-        attr.val.clusterDim.y = 1;
-        attr.val.clusterDim.z = 1;
-    }
-}
+constexpr int kLamportBuffers       = 3;
+constexpr int kLamportWave          = 32;   // = gfx1250 warpSize
+constexpr int kLamportRowMaxThreads = 1024; // a row is one block: hidden <= 8192
 
 // slot: the most 16B packs a call takes, a multiple of kLamportWave
 inline constexpr int64_t lamport_ar_rms_buffer_bytes(int ngpus, int64_t slot)
@@ -1502,28 +1459,188 @@ DINLINE lamport_u32x4 lamport_load_b128(const void* src)
 #endif
 }
 
-// MAX_THREADS only bounds the block; blockDim.x is the block size, a multiple
-// of kLamportWave. OutT is T, or an FP8 type: then output gets the per-token
-// quant of ar_rmsnorm_gfx1250, scale_out a scale a row and bf16_output (unless
-// null) the T output.
-template <typename T, typename OutT, int ngpus, int MAX_THREADS, bool CLUSTER>
+// Slot (buf, sender) of an inbox, inbox[buf][sender][slot] of 16B packs. The
+// caller passes uniform values, so the result is in SGPRs.
+DINLINE char* lamport_slot(void* inbox, uint32_t buf, int sender, int ngpus, int slot)
+{
+    return static_cast<char*>(inbox) + (int64_t)(buf * ngpus + sender) * slot * 16;
+}
+
+// Pack `pack` of a slot, as a system-scope 16-byte store or load that bypasses
+// the caches (th:TH_*_BYPASS scope:SCOPE_SYS, cache policy 27), as the Gluon
+// all-reduce: a buffer instruction, the global ones take no temporal hint. The
+// byte offset is from the slot, so it fits an int (a slot is under 2 GiB, see
+// init_lamport_ar_rms; the whole inbox may not be).
+DINLINE void lamport_store_sys(char* slot_base, int pack, lamport_u32x4 v)
+{
+#if AITER_GFX1250_HAVE_B128
+    __builtin_amdgcn_raw_buffer_store_b128(
+        v, __builtin_amdgcn_make_buffer_rsrc(slot_base, 0, 0x7fffffff, 0), pack * 16, 0, 27);
+#else
+    lamport_store_b128(reinterpret_cast<lamport_u32x4*>(slot_base) + pack, v);
+#endif
+}
+
+DINLINE lamport_u32x4 lamport_load_sys(char* slot_base, int pack)
+{
+#if AITER_GFX1250_HAVE_B128
+    return __builtin_amdgcn_raw_buffer_load_b128(
+        __builtin_amdgcn_make_buffer_rsrc(slot_base, 0, 0x7fffffff, 0), pack * 16, 0, 27);
+#else
+    return lamport_load_b128(reinterpret_cast<lamport_u32x4*>(slot_base) + pack);
+#endif
+}
+
+// A block barrier that orders LDS only: __syncthreads() also waits for every
+// outstanding global store of the wave, here the remote sends, whose acks take
+// about one more fabric trip than the peers' data took to arrive.
+DINLINE void lamport_lds_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// Waits for a kernel argument past the preloaded ones (offset 128) to come
+// from memory. A block that sends a row and then polls the inbox gets the
+// peers' data sooner when its first poll waits for this load: TP4 bf16 row of
+// 6144, one block a row, 10.4 -> 7.6 us. An s_sleep of any length does not
+// give the same gain (the load seems to return after the sends left).
+//
+// ATTENTION: offset 128 is hard-coded against the argument list of
+// lamport_ar_rmsnorm_gfx1250 (152 bytes; the 30 preloaded dwords end at byte
+// 120 with send_packs, p5 sits at 128). Adding, removing or reordering its
+// arguments can move offset 128 back into the preloaded dwords (or past the
+// arguments): the wait then costs nothing and the gain above is lost, with no
+// error. Check this first if that kernel slows down after such a change.
+// TODO: derive the offset from the argument layout (a struct mirroring the
+// signature and a static_assert on offsetof(..., p5) == 128).
+DINLINE void lamport_kernarg_wait()
+{
+    const __attribute__((address_space(4))) volatile int* args =
+        (const __attribute__((address_space(4))) volatile int*)
+            __builtin_amdgcn_kernarg_segment_ptr();
+    const int v = args[128 / 4];
+    asm volatile("" ::"s"(v));
+}
+
+// i of lane ^ OFF (wave32) in registers: DPP row_xmask within a row of 16,
+// permlanex16 across the two rows. __shfl_xor goes through ds_bpermute, an
+// LDS round trip per step. A row_xmask lane always reads a lane of its row, so
+// bound_ctrl changes no value; it lets the compiler fold the move into the
+// add or max that uses it (v_add_f32_dpp, v_max_u32_dpp).
+template <int OFF>
+DINLINE int lamport_xor_lane_i(int i)
+{
+#if AITER_GFX1250_HAVE_B128
+    if constexpr(OFF == 16)
+        return __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false);
+    else
+        return __builtin_amdgcn_update_dpp(i, i, 0x160 + OFF, 0xf, 0xf, true); // row_xmask:OFF
+#else
+    return __shfl_xor(i, OFF); // other archs only build the kernel, never run it
+#endif
+}
+
+template <int OFF>
+DINLINE float lamport_xor_lane(float v)
+{
+    return __builtin_bit_cast(float, lamport_xor_lane_i<OFF>(__builtin_bit_cast(int, v)));
+}
+
+// The 32-lane butterfly of block_allreduce_f32 (xor 16, 8, 4, 2, 1), the same
+// adds in the same order; every lane gets the sum.
+DINLINE float lamport_wave_sum(float p)
+{
+    p = p + lamport_xor_lane<16>(p);
+    p = p + lamport_xor_lane<8>(p);
+    p = p + lamport_xor_lane<4>(p);
+    p = p + lamport_xor_lane<2>(p);
+    p = p + lamport_xor_lane<1>(p);
+    return p;
+}
+
+// Max over the wave of non-negative, non-NaN floats as their bits: the bits of
+// such floats order as unsigned integers, and an integer max folds into DPP.
+DINLINE uint32_t lamport_wave_max_bits(uint32_t p)
+{
+#define LAMPORT_MAX_STEP(OFF)                                                     \
+    {                                                                             \
+        const uint32_t q = (uint32_t)lamport_xor_lane_i<OFF>((int)p);             \
+        p                = p > q ? p : q;                                         \
+    }
+    LAMPORT_MAX_STEP(16) LAMPORT_MAX_STEP(8) LAMPORT_MAX_STEP(4) LAMPORT_MAX_STEP(2)
+    LAMPORT_MAX_STEP(1)
+#undef LAMPORT_MAX_STEP
+    return p;
+}
+
+// Sum of the row's wave-group partials in group order, as block_allreduce_f32
+// folds its waves: thread k of the block owns group threadIdx.x / 32 + k *
+// waves of each of its PACKS packs (waves = blockDim.x / 32, passed in: blockDim
+// is a kernel argument load). One barrier: after it every wave adds the
+// partials itself, so no second barrier hands the result around.
+template <int PACKS>
+DINLINE float lamport_row_sum(const float (&v)[PACKS], int row_groups, int waves)
+{
+    __shared__ float partial[32];
+    const int lane = threadIdx.x % kLamportWave;
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        const float p = lamport_wave_sum(v[k]);
+        if(lane == 0)
+            partial[threadIdx.x / kLamportWave + k * waves] = p;
+    }
+    lamport_lds_barrier();
+    // every lane reads the same address (an LDS broadcast) and adds on the
+    // VALU: a readlane loop would queue every wave of the CU on its SALU
+    float r = partial[0];
+    for(int g = 1; g < row_groups; ++g)
+        r += partial[g];
+    return r;
+}
+
+// OutT is T, or an FP8 type: then output gets the per-token quant of
+// ar_rmsnorm_gfx1250, scale_out a scale a row and bf16_output (unless null)
+// the T output. MAX_THREADS only bounds the block; blockDim.x = hidden / 8 /
+// PACKS. SPLIT: the first `senders` blocks send send_packs packs each (see the
+// comment on top); the row blocks follow.
+//
+// Scalar and pointer kernel arguments only, the inboxes one by one: the module
+// preloads the first 30 dwords of the kernel arguments into SGPRs (32 user
+// SGPRs less the kernel argument pointer). Up to 4 GPUs they hold every
+// argument the sends and the epilogue read (p4 .. p7 come after them); an
+// argument past them is a scalar load where it is used, on the critical path.
+template <typename T, typename OutT, int ngpus, int MAX_THREADS, int PACKS, bool SPLIT>
 __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
     const T* __restrict__ input,
     const T* __restrict__ residual_inp,
     T* __restrict__ residual_out,
     OutT* __restrict__ output,
     const T* __restrict__ weight,
-    LamportPeers peers,
-    float* __restrict__ cluster_partials, // [2 * slot / 32], CLUSTER only, rank-local
-    uint32_t* __restrict__ round_counter, // [slot / 32], one a wave of packs, rank-local
+    uint32_t* __restrict__ round_counter, // [2][slot / 32] tx, rx; one a group of 32 packs
     int slot,                             // inbox packs per sender
-    int rank,
+    int rank_gemma,                       // rank, and gemma_norm in bit 8
     int hidden,
-    float eps,
-    bool gemma_norm,
+    int senders, // SPLIT only
+    void* p0,
+    void* p1,
+    void* p2,
+    void* p3,
     float* __restrict__ scale_out, // [rows], FP8 only
-    T* __restrict__ bf16_output)   // FP8 only, may be null
+    T* __restrict__ bf16_output,   // FP8 only, may be null
+    float eps,
+    int send_packs, // SPLIT only, divides the packs of a row
+    void* p4,       // not preloaded from here on
+    void* p5,
+    void* p6,
+    void* p7)
 {
+    // ar_rmsnorm_gfx1250 compiles each square to a rounded multiply and then an
+    // add; a contracted fma would change the sum of squares (and its bits)
+    // depending on how the compiler schedules the PACKS loops.
+#pragma clang fp contract(off)
     static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
     static_assert(MAX_THREADS % kLamportWave == 0, "blocks are whole waves");
     constexpr bool QUANT    = !std::is_same_v<T, OutT>;
@@ -1534,200 +1651,269 @@ __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
         P data;
         lamport_u32x4 i;
     };
+    const int rank        = rank_gemma & 0xff;
+    const bool gemma_norm = (rank_gemma >> 8) & 1;
 
-    // the grid covers whole rows, so every thread owns a pack
-    const int row_packs = hidden / pack_size;
-    const int tid       = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row       = tid / row_packs;
-    const int col       = tid - row * row_packs;
-    // blocks are whole waves, so this is uniform over the wave
-    const int wave       = __builtin_amdgcn_readfirstlane(tid / kLamportWave);
-    const uint32_t round = round_counter[wave];
-    const uint32_t rearm = (round + 2) % kLamportBuffers;
-
-    pack local;
-    local.data = reinterpret_cast<const P*>(input)[tid];
+    // static indices only: a runtime index into the inboxes is a scalar load
+    // in series before each remote store
+    void* const all[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    char* own          = static_cast<char*>(all[0]);
 #pragma unroll
-    for(int j = 0; j < 4; ++j)
-        local.i[j] = lamportCanonicalize(local.i[j]);
+    for(int g = 1; g < ngpus; ++g)
+        own = g == rank ? static_cast<char*>(all[g]) : own;
 
-#pragma unroll
-    for(int i = 1; i < ngpus; ++i)
+    const int row_packs        = hidden / pack_size;
+    uint32_t* const rx_counter = round_counter + slot / kLamportWave;
+    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+
+    if constexpr(SPLIT)
     {
-        P* dst = reinterpret_cast<P*>(peers.ptrs[(rank + i) % ngpus]) +
-                 (round * ngpus + rank) * slot + tid;
-        lamport_store_b128(dst, local.i);
+        if((int)blockIdx.x < senders)
+        {
+            // a sender block: send_packs packs, one a thread; the other waves
+            // of the block (it has the row blocks' size) exit
+            const int t =
+                __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWave) * kLamportWave;
+            if(t >= send_packs)
+                return;
+            const int p          = blockIdx.x * send_packs + threadIdx.x;
+            const int wave       = __builtin_amdgcn_readfirstlane(p / kLamportWave);
+            const uint32_t round = round_counter[wave];
+            pack v;
+            v.data = reinterpret_cast<const P*>(input)[p];
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                v.i[j] = lamportCanonicalize(v.i[j]);
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(all[g], round, rank, ngpus, slot), p, v.i);
+            // re-arm buffer (round + 2) % 3 of this pack here, off the row
+            // blocks: it held the previous call's data, which the previous
+            // kernel consumed, and a peer is at most one round ahead
+            const uint32_t rearm = (round + 2) % kLamportBuffers;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(own, rearm, g, ngpus, slot), p, sentinel);
+            if(threadIdx.x % kLamportWave == 0)
+                round_counter[wave] = (round + 1) % kLamportBuffers;
+            return;
+        }
+    }
+
+    // a row block: thread t owns packs t + k * block of the row
+    const int block = row_packs / PACKS; // = blockDim.x, without a kernel argument load
+    const int row   = SPLIT ? (int)blockIdx.x - senders : (int)blockIdx.x;
+    const int tid0  = row * row_packs + threadIdx.x;
+    int tid[PACKS];
+    uint32_t round[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        tid[k] = tid0 + k * block;
+        // blocks are whole waves, so this is uniform over the wave
+        const int wave = __builtin_amdgcn_readfirstlane(tid[k] / kLamportWave);
+        round[k]       = SPLIT ? rx_counter[wave] : round_counter[wave];
+    }
+
+    pack local[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        local[k].data = reinterpret_cast<const P*>(input)[tid[k]];
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            local[k].i[j] = lamportCanonicalize(local[k].i[j]);
+    }
+
+    if constexpr(!SPLIT)
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(
+                        lamport_slot(all[g], round[k], rank, ngpus, slot), tid[k], local[k].i);
+        }
+        lamport_kernarg_wait();
     }
 
     // local operands of the epilogue, loaded before the wait
-    const P res = reinterpret_cast<const P*>(residual_inp)[tid];
-    const P w   = reinterpret_cast<const P*>(weight)[col];
+    P res[PACKS], w[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        res[k] = reinterpret_cast<const P*>(residual_inp)[tid[k]];
+        w[k]   = reinterpret_cast<const P*>(weight)[tid[k] - row * row_packs];
+    }
 
-    // slot[rank] is never written and stays the sentinel; it is loaded anyway
-    // and masked out, a branch would make every load wait for the previous one
-    const P* inbox = reinterpret_cast<const P*>(peers.ptrs[rank]) + round * ngpus * slot + tid;
-    pack scratch[ngpus];
+    // the peers only, rank + 1 .. rank + ngpus - 1: the slot offsets are
+    // uniform (SGPR), so this costs no extra address math per load
+    pack scratch[PACKS][ngpus - 1];
     bool pending;
     do
     {
         // without the clobber the loads are hoisted out of the loop
         asm volatile("" ::: "memory");
 #pragma unroll
-        for(int g = 0; g < ngpus; ++g)
-            scratch[g].i = lamport_load_b128(inbox + g * slot);
+        for(int k = 0; k < PACKS; ++k)
+#pragma unroll
+            for(int i = 0; i < ngpus - 1; ++i)
+            {
+                const int g     = (rank + 1 + i) % ngpus;
+                scratch[k][i].i =
+                    lamport_load_sys(lamport_slot(own, round[k], g, ngpus, slot), tid[k]);
+            }
         // issue all loads before any mask math
         __builtin_amdgcn_sched_barrier(0);
         uint32_t m = 0;
 #pragma unroll
-        for(int g = 0; g < ngpus; ++g)
-        {
-            uint32_t gm = 0;
+        for(int k = 0; k < PACKS; ++k)
 #pragma unroll
-            for(int j = 0; j < 4; ++j)
-                gm |= lamportSentinelMask(scratch[g].i[j]);
-            m |= g == rank ? 0u : gm;
-        }
+            for(int i = 0; i < ngpus - 1; ++i)
+#pragma unroll
+                for(int j = 0; j < 4; ++j)
+                    m |= lamportSentinelMask(scratch[k][i].i[j]);
         pending = m != 0;
     } while(pending);
 
     // same steps as ar_rmsnorm_gfx1250
-    float x[pack_size] = {};
+    float x[PACKS][pack_size];
+    float square_sum[PACKS];
 #pragma unroll
-    for(int g = 0; g < ngpus; ++g)
+    for(int k = 0; k < PACKS; ++k)
     {
-        const P v = g == rank ? local.data : scratch[g].data;
 #pragma unroll
         for(int j = 0; j < pack_size; ++j)
-            x[j] += upcast_s(v[j]);
-    }
-    P sum;
-    float square_sum = 0.f;
+            x[k][j] = 0.f;
+        // rank order, as ar_rmsnorm_gfx1250: peer g sits at (g - rank - 1) mod ngpus
 #pragma unroll
-    for(int j = 0; j < pack_size; ++j)
-    {
-        x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
-        sum[j] = downcast_s<T>(x[j]);
-        square_sum += x[j] * x[j];
-    }
-    reinterpret_cast<P*>(residual_out)[tid] = sum;
-
-    float inv_rms;
-    if constexpr(CLUSTER)
-    {
-#if AITER_GFX1250_HAVE_CLUSTER
-        // the row is this cluster: publish a partial per wave, then every wave
-        // folds the row's partials in wave order, as block_allreduce_f32 does
-        float part = square_sum;
-        for(int off = kLamportWave / 2; off > 0; off >>= 1)
-            part = part + __shfl_xor(part, off);
-        const int lane = threadIdx.x % kLamportWave;
-        if(lane == 0)
-            __scoped_atomic_store_n(
-                cluster_partials + wave, part, __ATOMIC_RELAXED, __MEMORY_SCOPE_CLUSTR);
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
-        __builtin_amdgcn_s_cluster_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
-        const int row_groups = row_packs / kLamportWave;
-        const float v        = lane < row_groups
-                                   ? __scoped_atomic_load_n(cluster_partials + row * row_groups + lane,
-                                                            __ATOMIC_RELAXED,
-                                                            __MEMORY_SCOPE_CLUSTR)
-                                   : 0.f;
-        float total = __shfl(v, 0);
-        for(int g = 1; g < row_groups; ++g)
-            total += __shfl(v, g);
-        inv_rms = rsqrtf(total / hidden + eps);
-#else
-        // never launched: the host takes this path only with cluster launch
-        __builtin_trap();
-        inv_rms = 0.f;
-#endif
-    }
-    else
-    {
-        inv_rms = rsqrtf(block_allreduce_f32<false>(square_sum) / hidden + eps);
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const int at = (g - rank - 1 + ngpus) % ngpus; // ngpus - 1: this rank
+            P v          = local[k].data;
+#pragma unroll
+            for(int i = 0; i < ngpus - 1; ++i)
+                v = at == i ? scratch[k][i].data : v;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                x[k][j] += upcast_s(v[j]);
+        }
+        P sum;
+        square_sum[k] = 0.f;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            x[k][j] = upcast_s(downcast_s<T>(x[k][j])) + upcast_s(res[k][j]);
+            sum[j]  = downcast_s<T>(x[k][j]);
+            square_sum[k] += x[k][j] * x[k][j];
+        }
+        reinterpret_cast<P*>(residual_out)[tid[k]] = sum;
     }
 
-    P o;
+    // FP8: the row amax, merged by an LDS atomic max after the sum barrier
+    __shared__ uint32_t amax_bits;
+    if constexpr(QUANT)
+        if(threadIdx.x == 0)
+            amax_bits = 0;
+    const int row_groups = row_packs / kLamportWave;
+    const float inv_rms =
+        rsqrtf(lamport_row_sum<PACKS>(square_sum, row_groups, block / kLamportWave) / hidden +
+               eps);
+
+    P o[PACKS];
 #pragma unroll
-    for(int j = 0; j < pack_size; ++j)
+    for(int k = 0; k < PACKS; ++k)
     {
-        const float wj = upcast_s(w[j]) + (gemma_norm ? 1.f : 0.f);
-        o[j]           = downcast_s<T>(x[j] * (inv_rms * wj));
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            const float wj = upcast_s(w[k][j]) + (gemma_norm ? 1.f : 0.f);
+            o[k][j]        = downcast_s<T>(x[k][j] * (inv_rms * wj));
+        }
     }
     if constexpr(!QUANT)
     {
-        reinterpret_cast<P*>(output)[tid] = o;
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+            reinterpret_cast<P*>(output)[tid[k]] = o[k];
     }
     else
     {
         // the steps of ar_rmsnorm_gfx1250 (amax of the T output, scale = amax /
         // max, multiply by rcp(scale), clamp, cvt_pk), so the FP8 paths match bit
-        // for bit. amax starts at 0 and fmaxf drops NaNs, so the order of the row
-        // reduction does not change it.
-        float amax = 0.f;
+        // for bit. amax starts at 0 and fmaxf drops NaNs: it is never negative
+        // nor NaN, so its bits order as unsigned integers (lamport_wave_max_bits)
+        // and the order of the row reduction does not change it.
+        uint32_t a = 0;
 #pragma unroll
-        for(int j = 0; j < pack_size; ++j)
-            amax = fmaxf(amax, fabsf(upcast_s(o[j])));
-        if(bf16_output != nullptr)
-            reinterpret_cast<P*>(bf16_output)[tid] = o;
-        if constexpr(CLUSTER)
+        for(int k = 0; k < PACKS; ++k)
         {
-#if AITER_GFX1250_HAVE_CLUSTER
-            // as the sum of squares, on the second half of cluster_partials
-            float* amax_partials = cluster_partials + slot / kLamportWave;
-            for(int off = kLamportWave / 2; off > 0; off >>= 1)
-                amax = fmaxf(amax, __shfl_xor(amax, off));
-            const int lane = threadIdx.x % kLamportWave;
-            if(lane == 0)
-                __scoped_atomic_store_n(
-                    amax_partials + wave, amax, __ATOMIC_RELAXED, __MEMORY_SCOPE_CLUSTR);
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
-            __builtin_amdgcn_s_cluster_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
-            const int row_groups = row_packs / kLamportWave;
-            amax                 = lane < row_groups
-                                       ? __scoped_atomic_load_n(amax_partials + row * row_groups + lane,
-                                                                __ATOMIC_RELAXED,
-                                                                __MEMORY_SCOPE_CLUSTR)
-                                       : 0.f;
-            for(int off = kLamportWave / 2; off > 0; off >>= 1)
-                amax = fmaxf(amax, __shfl_xor(amax, off));
-#else
-            __builtin_trap();
-#endif
-        }
-        else
-        {
-            amax = block_allreduce_f32<true, true>(amax);
-        }
-        const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
-        const float scale   = amax * (float)(1. / fp8_max);
-        const float inv     = __builtin_amdgcn_rcpf(scale);
-        opus::vector_t<OutT, pack_size> q;
+            float amax = 0.f;
 #pragma unroll
-        for(int j = 0; j < pack_size; j += 2)
-        {
-            const float a = __builtin_amdgcn_fmed3f(upcast_s(o[j]) * inv, -fp8_max, fp8_max);
-            const float b = __builtin_amdgcn_fmed3f(upcast_s(o[j + 1]) * inv, -fp8_max, fp8_max);
-            reinterpret_cast<uint16_t*>(&q)[j / 2] = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+            for(int j = 0; j < pack_size; ++j)
+                amax = fmaxf(amax, fabsf(upcast_s(o[k][j])));
+            const uint32_t b = __builtin_bit_cast(uint32_t, amax);
+            a                = a > b ? a : b;
+            if(bf16_output != nullptr)
+                reinterpret_cast<P*>(bf16_output)[tid[k]] = o[k];
         }
-        reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[tid] = q;
-        if(col == 0)
+        a = lamport_wave_max_bits(a);
+        if(threadIdx.x % kLamportWave == 0)
+            __hip_atomic_fetch_max(
+                &amax_bits, a, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        lamport_lds_barrier();
+        const float row_amax = __builtin_bit_cast(float, amax_bits);
+        const float fp8_max  = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
+        const float scale    = row_amax * (float)(1. / fp8_max);
+        const float inv      = __builtin_amdgcn_rcpf(scale);
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            opus::vector_t<OutT, pack_size> q;
+#pragma unroll
+            for(int j = 0; j < pack_size; j += 2)
+            {
+                const float qa =
+                    __builtin_amdgcn_fmed3f(upcast_s(o[k][j]) * inv, -fp8_max, fp8_max);
+                const float qb =
+                    __builtin_amdgcn_fmed3f(upcast_s(o[k][j + 1]) * inv, -fp8_max, fp8_max);
+                reinterpret_cast<uint16_t*>(&q)[j / 2] =
+                    __builtin_amdgcn_cvt_pk_fp8_f32(qa, qb, 0, false);
+            }
+            reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[tid[k]] = q;
+        }
+        if(threadIdx.x == 0)
             scale_out[row] = scale;
     }
 
-    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
-#pragma unroll
-    for(int i = 1; i < ngpus; ++i)
+    if constexpr(!SPLIT)
     {
-        P* dst = reinterpret_cast<P*>(peers.ptrs[rank]) +
-                 (rearm * ngpus + (rank + i) % ngpus) * slot + tid;
-        lamport_store_b128(dst, sentinel);
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            const uint32_t rearm = (round[k] + 2) % kLamportBuffers;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(own, rearm, g, ngpus, slot), tid[k], sentinel);
+        }
     }
 
     if(threadIdx.x % kLamportWave == 0)
-        round_counter[wave] = (round + 1) % kLamportBuffers;
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            const uint32_t next = (round[k] + 1) % kLamportBuffers;
+            if constexpr(!SPLIT)
+                round_counter[tid[k] / kLamportWave] = next;
+            rx_counter[tid[k] / kLamportWave] = next;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,7 +1940,7 @@ __global__ void __launch_bounds__(BLOCK, 1)
     lamport_ar_1shot_gfx1250(const T* __restrict__ input,
                              const T* __restrict__ other, // ADD only
                              T* __restrict__ output,
-                             uint32_t* __restrict__ round_counter, // [slot / 32], rank-local
+                             uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
                              int slot,                             // inbox packs per sender
                              int rank,
                              int packs, // packs of the call
@@ -1862,7 +2048,11 @@ __global__ void __launch_bounds__(BLOCK, 1)
                                sentinel);
 
     if(threadIdx.x % kLamportWave == 0)
-        round_counter[wave] = (round + 1) % kLamportBuffers;
+    {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        // and rx: a split lamport_ar_rmsnorm_gfx1250 call reads the rx counters
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,7 +2078,7 @@ template <typename T, int ngpus, int BLOCK>
 __global__ void __launch_bounds__(BLOCK, 1)
     lamport_ar_2shot_gfx1250(const T* __restrict__ input,
                              T* __restrict__ output,
-                             uint32_t* __restrict__ round_counter, // [slot / 32], rank-local
+                             uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
                              int slot,  // shared inbox packs per sender
                              int rank,
                              int packs, // packs of the message
@@ -2052,7 +2242,11 @@ __global__ void __launch_bounds__(BLOCK, 1)
                                sentinel);
 
     if(threadIdx.x % kLamportWave == 0)
-        round_counter[wave] = (round + 1) % kLamportBuffers;
+    {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        // and rx: a split lamport_ar_rmsnorm_gfx1250 call reads the rx counters
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2173,7 +2367,7 @@ template <class Codec, int ngpus, int BLOCK, bool DIM0>
 __global__ void __launch_bounds__(BLOCK, 1)
     lamport_ag_gfx1250(const lamport_u32x4* __restrict__ input,
                        lamport_u32x4* __restrict__ output,
-                       uint32_t* __restrict__ round_counter, // [slot / 32], rank-local
+                       uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
                        int slot,                             // inbox packs per sender
                        int rank,
                        int packs,     // 16B packs a rank sends
@@ -2285,7 +2479,11 @@ __global__ void __launch_bounds__(BLOCK, 1)
                                sentinel);
 
     if(threadIdx.x % kLamportWave == 0)
-        round_counter[wave] = (round + 1) % kLamportBuffers;
+    {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        // and rx: a split lamport_ar_rmsnorm_gfx1250 call reads the rx counters
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    }
 }
 
 // The Lamport inbox of a communicator: one per CustomAllreduce, any row width
@@ -2293,53 +2491,35 @@ __global__ void __launch_bounds__(BLOCK, 1)
 struct LamportArRms
 {
     LamportPeers peers{};
-    float* cluster_partials = nullptr; // [2 * slot / 32]: sum of squares, then amax; rank-local
-    uint32_t* d_round       = nullptr; // [slot / 32], rank-local
-    int slot                = 0;       // the most packs a call takes
-    int rank                = 0;
-    int world_size          = 0;
-    int num_cus             = 0;
+    uint32_t* d_round = nullptr; // [2][slot / 32]: tx, then rx counters; rank-local
+    int slot          = 0;       // the most packs a call takes
+    int rank          = 0;
+    int world_size    = 0;
 
     ~LamportArRms()
     {
         if(d_round)
             (void)hipFree(d_round);
-        if(cluster_partials)
-            (void)hipFree(cluster_partials);
     }
 
-    // Block size of a row split over a cluster, or 0 for a block a row. Split
-    // only while the rows leave CUs idle: from rows >= CUs on a block a row
-    // was faster (gfx1250, 256 CUs, rows 256+ at hidden 4096-8192).
-    int cluster_threads(int64_t rows, int row_packs) const
+    // Packs a thread of a row block: the fewest that keep the block at most 256
+    // threads (128 from 257 rows, 64 from 513: more, smaller blocks for big
+    // calls) and divide the row's groups of 32 packs (4x gfx1250, TP2/TP4,
+    // hidden 1024-8192, M 1-2048).
+    static int row_block_packs(int row_packs, int64_t rows)
     {
-        if(!kLamportClusterLaunch || rows >= num_cus || row_packs <= kLamportMinClusterRowPacks)
-            return 0;
-        for(int bs = kLamportClusterMaxThreads; bs >= kLamportWave; bs /= 2)
+        const int most   = rows <= 256 ? 256 : rows <= 512 ? 128 : 64;
+        const int groups = row_packs / kLamportWave;
+        int packs        = 1;
+        for(int p : {1, 2, 4, 8})
         {
-            if(row_packs % bs != 0)
+            if(groups % p != 0)
                 continue;
-            const int blocks = row_packs / bs;
-            return blocks <= kLamportMaxClusterBlocks ? bs : 0;
+            packs = p;
+            if(row_packs / p <= most)
+                break;
         }
-        return 0;
-    }
-
-    // A stream capture drops the cluster dimension of hipLaunchKernelEx (the
-    // node then runs without a cluster and the cluster barrier orders nothing),
-    // so set it again on the node the launch just added.
-    static void set_captured_cluster_dim(hipStream_t stream, const hipLaunchAttribute& attr)
-    {
-        hipStreamCaptureStatus status;
-        const hipGraphNode_t* deps = nullptr;
-        size_t num_deps            = 0;
-        HIP_CALL(hipStreamGetCaptureInfo_v2(
-            stream, &status, nullptr, nullptr, &deps, &num_deps));
-        if(status != hipStreamCaptureStatusActive)
-            return;
-        if(num_deps != 1)
-            throw std::runtime_error("lamport allreduce rmsnorm: cannot find the captured node");
-        HIP_CALL(hipGraphKernelNodeSetAttribute(deps[0], attr.id, &attr.val));
+        return packs;
     }
 
     // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), see
@@ -2373,35 +2553,44 @@ struct LamportArRms
                                      std::to_string((int64_t)slot * 16) + "B");
         if(packs == 0)
             return;
-        const int threads = cluster_threads(rows, row_packs);
+        // Split (sender blocks, then a row block of one pack a thread) while the
+        // call is small: one CU sending and polling a whole row is the limit
+        // there. Rows of up to 1024 values stay in row mode. 4x gfx1250, bf16
+        // and FP8 out: TP4 up to 64 rows, TP2 up to 32K packs (rows x hidden / 8).
+        const bool split =
+            row_packs > 128 && (world_size >= 4 ? rows <= 64 : packs <= 32768);
+        const int packs_per_thread = split ? 1 : row_block_packs(row_packs, rows);
+        const int row_threads      = row_packs / packs_per_thread;
+        // sender blocks of 256 packs, a multiple of 32 that divides the row, so
+        // that no sender block runs past the call
+        int send_packs = std::min(256, row_packs);
+        while(row_packs % send_packs != 0)
+            send_packs -= kLamportWave;
+        const int senders = split ? (int)(packs / send_packs) : 0;
 
 #define LAMPORT_RMS_ARGS                                                                    \
-    input, residual_inp, residual_out, output, weight, peers, cluster_partials, d_round,    \
-        slot, rank, hidden, eps, gemma_norm, scale_out, bf16_out
+    input, residual_inp, residual_out, output, weight, d_round, slot,                       \
+        rank | (gemma_norm ? 0x100 : 0), hidden, senders, peers.ptrs[0], peers.ptrs[1],     \
+        peers.ptrs[2], peers.ptrs[3], scale_out, bf16_out, eps, send_packs, peers.ptrs[4],  \
+        peers.ptrs[5], peers.ptrs[6], peers.ptrs[7]
+#define LAUNCH_LAMPORT_RMS_PK(NG, PK, SPLIT)                                                \
+    lamport_ar_rmsnorm_gfx1250<T, OutT, NG, (kLamportRowMaxThreads / PK + 31) / 32 * 32, PK, \
+                               SPLIT>                                                       \
+        <<<senders + (int)rows, row_threads, 0, stream>>>(LAMPORT_RMS_ARGS)
 #define LAUNCH_LAMPORT_RMS(NG)                                                              \
-    if(threads == 0)                                                                        \
-    {                                                                                       \
-        lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportRowMaxThreads, false>               \
-            <<<(int)rows, row_packs, 0, stream>>>(LAMPORT_RMS_ARGS);                        \
-    }                                                                                       \
-    else if constexpr(kLamportClusterLaunch)                                                \
-    {                                                                                       \
-        hipLaunchAttribute attr{};                                                          \
-        lamport_set_cluster_dim(attr, (unsigned)(row_packs / threads));                     \
-        hipLaunchConfig_t config{};                                                         \
-        config.gridDim  = dim3((unsigned)(packs / threads));                                \
-        config.blockDim = dim3(threads);                                                    \
-        config.stream   = stream;                                                           \
-        config.attrs    = &attr;                                                            \
-        config.numAttrs = 1;                                                                \
-        HIP_CALL(hipLaunchKernelEx(                                                         \
-            &config,                                                                        \
-            lamport_ar_rmsnorm_gfx1250<T, OutT, NG, kLamportClusterMaxThreads, true>,       \
-            LAMPORT_RMS_ARGS));                                                             \
-        set_captured_cluster_dim(stream, attr);                                             \
-    }
+    if(split)                                                                               \
+        LAUNCH_LAMPORT_RMS_PK(NG, 1, true);                                                 \
+    else                                                                                    \
+        switch(packs_per_thread)                                                            \
+        {                                                                                   \
+        case 2: LAUNCH_LAMPORT_RMS_PK(NG, 2, false); break;                                 \
+        case 4: LAUNCH_LAMPORT_RMS_PK(NG, 4, false); break;                                 \
+        case 8: LAUNCH_LAMPORT_RMS_PK(NG, 8, false); break;                                 \
+        default: LAUNCH_LAMPORT_RMS_PK(NG, 1, false); break;                                \
+        }
         DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_RMS);
 #undef LAUNCH_LAMPORT_RMS
+#undef LAUNCH_LAMPORT_RMS_PK
 #undef LAMPORT_RMS_ARGS
     }
 
@@ -3362,10 +3551,6 @@ public:
         state->rank        = rank_;
         state->world_size  = world_size_;
         state->slot        = (int)slot;
-        int device;
-        HIP_CALL(hipGetDevice(&device));
-        HIP_CALL(hipDeviceGetAttribute(
-            &state->num_cus, hipDeviceAttributeMultiprocessorCount, device));
         for(int i = 0; i < world_size_; i++)
             state->peers.ptrs[i] = reinterpret_cast<void*>(all_ptrs[i]);
         HIP_CALL(hipMemset(
@@ -3378,10 +3563,9 @@ public:
                                lamport_two_shot_offset(world_size_, slot),
                            0xff,
                            lamport_two_shot_bytes(world_size_, slot)));
-        HIP_CALL(hipMalloc((void**)&state->d_round, sizeof(uint32_t) * (slot / kLamportWave)));
-        HIP_CALL(hipMemset(state->d_round, 0, sizeof(uint32_t) * (slot / kLamportWave)));
-        HIP_CALL(hipMalloc((void**)&state->cluster_partials,
-                           sizeof(float) * 2 * (slot / kLamportWave)));
+        // tx counters, then rx counters (see lamport_ar_rmsnorm_gfx1250 SPLIT)
+        HIP_CALL(hipMalloc((void**)&state->d_round, sizeof(uint32_t) * 2 * (slot / kLamportWave)));
+        HIP_CALL(hipMemset(state->d_round, 0, sizeof(uint32_t) * 2 * (slot / kLamportWave)));
         HIP_CALL(hipDeviceSynchronize());
         lamport_ = std::move(state);
     }
