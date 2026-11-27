@@ -492,19 +492,27 @@ def _k3_no_sink(num_heads, device):
     return torch.full((num_heads,), -1e30, dtype=torch.float32, device=device)
 
 
+# Lazy online-softmax rescale threshold (log2 units): the accumulator is only
+# rescaled when a row max grows by more than 2^8.
+_K3_LAZY_TH = 8.0
+
+
 @functools.cache
-def _k3_splits(row_programs, row_tiles, block_h):
-    """KV split count with the fewest rounds x (tiles per split + 2)."""
-    programs = get_num_sms() * (64 // block_h)
-    # Enough rows to fill the GPU: no split, no reduce.
-    if row_programs >= 4 * programs:
-        return 1
-    # SOLO mode is faster from here.
-    if block_h == 32 and row_programs >= programs:
-        return 1
+def _k3_splits(row_programs, row_tiles):
+    """KV split count for the one-wave direct kernel (4 resident workgroups per
+    CU): rounds x tiles per split, plus the fp32 partials / reduce per split and
+    a penalty for filling more than half the machine. Fitted on an MI455 decode
+    sweep (1-768 rows, 512-2048 keys, 12/24 heads): 2.6% mean regret."""
+    p = 4 * get_num_sms()
+    t = max(1, row_tiles)
     return min(
-        (s for s in (1, 2, 4, 8, 16, 32) if s == 1 or 2 * s <= row_tiles),
-        key=lambda s: -(-row_programs * s // programs) * (2 - (-row_tiles // s)),
+        (
+            s
+            for s in (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32)
+            if s == 1 or 2 * s <= t
+        ),
+        key=lambda s: -(-row_programs * s // p) * t / s
+        + (10 * s * row_programs + 8 * max(0, row_programs * s - p / 2)) / p,
     )
 
 
@@ -520,10 +528,9 @@ def _forward_k3_640(
     has_invalid=False,
     out=None,
     attn_sink=None,
-    block_h=None,
-    block_k=None,
     return_lse=False,
     keys_per_row=None,
+    req_topk=None,
 ):
     """fp8_k3_mla_640 attention on gfx1250, one kernel for prefill and decode."""
     arch = arch_info.get_arch()
@@ -545,9 +552,7 @@ def _forward_k3_640(
     blk_rows = cache.stride(0) // rec
     rows = (num_blocks - 1) * blk_rows + block_size
     fp8 = torch.float8_e4m3fn
-    q_nope, q_rope = q[..., :nope].view(fp8), q[..., nope : nope + rope].view(fp8)
-    kv_nope = cache[..., :nope].view(fp8)
-    kv_rope = cache[..., nope : nope + rope].view(fp8)
+    q_nope, kv_nope = q[..., :nope].view(fp8), cache[..., :nope].view(fp8)
     out = _check_out(out, q, nope)
     if return_lse and (skip_reduce or attn_sink is not None):
         raise ValueError(
@@ -563,107 +568,96 @@ def _forward_k3_640(
         attn_sink = _k3_no_sink(num_heads, q.device)
     else:
         attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
-    kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
+    if req_topk is None:
+        kv_indices = _as_int32_contiguous_1d(kv_indices)
+        req_id = block_table = kv_indptr
+        topk_stride = bt_stride = max_blocks = 0
+    else:
+        kv_indices, req_id, block_table = req_topk
+        for name, x in zip(("topk", "req_id", "block_table"), req_topk):
+            if x.dtype != torch.int32 or x.stride(-1) != 1:
+                raise ValueError(f"req_topk {name} must be int32, unit last stride")
+        if kv_indices.shape[0] != num_queries or req_id.shape[0] < num_queries:
+            raise ValueError("req_topk topk and req_id must cover the C rows")
+        topk_stride, bt_stride = kv_indices.stride(0), block_table.stride(0)
+        max_blocks = block_table.shape[1]
+        keys_per_row = keys_per_row or kv_indices.shape[1]
 
-    if block_h is None:
-        block_h = 32 if num_heads > 16 else 16
-    block_k = block_k or (16 if block_h == 16 else 32)
+    # 16/32-head workgroups over 32-key tiles. Tiny decode is latency-bound:
+    # two 16-head workgroups per row finish sooner than one 32-head one.
+    block_h = 16 if num_heads <= 16 or (num_heads <= 32 and num_queries <= 8) else 32
+    block_k = 32
     heads_blocks = -(-num_heads // block_h)
     h_padded = heads_blocks * block_h
     if kv_splits is None:
         if keys_per_row is None:
             keys_per_row = -(-kv_indices.shape[0] // max(1, num_queries))
         row_tiles = max(0, int(keys_per_row)) // block_k
-        kv_splits = _k3_splits(num_queries * heads_blocks, row_tiles, block_h)
-    # SOLO: one wave per workgroup.
-    solo = kv_splits == 1 and block_h == 32 and block_k == 32
-    num_warps = 1 if solo else block_h // 16
+        kv_splits = _k3_splits(num_queries * heads_blocks, row_tiles)
     if kv_splits == 1:
         part_m = part_l = part_acc = out
         pm_strides, pa_strides = (0, 0, 0), (0, 0, 0, 0)
     else:
+        # The reduce reads a power-of-two slab of splits; the direct kernel may
+        # launch any count (the reduce masks the rest off).
+        s_pad = 1 << (kv_splits - 1).bit_length()
         part_m = torch.empty(
-            (num_queries, kv_splits, h_padded), dtype=torch.float32, device=q.device
+            (num_queries, s_pad, h_padded), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
         part_acc = torch.empty(
-            (num_queries, kv_splits, h_padded, nope),
+            (num_queries, s_pad, h_padded, nope),
             dtype=torch.float32,
             device=q.device,
         )
         pm_strides, pa_strides = part_m.stride(), part_acc.stride()
     _pa_decode_sparse_fp8_gfx1250[(num_queries, heads_blocks, kv_splits)](
         q_nope,
-        q,
-        q_rope,
         kv_nope,
-        cache,
-        kv_rope,
         kv_indices,
         kv_indptr,
-        None,
-        None,
-        None,
-        None,
-        None,
         part_m,
         part_l,
         part_acc,
         attn_sink,
         out,
-        rows,
+        lse if kv_splits == 1 else None,
         rows,
         blk_rows,
-        1,
         num_blocks * block_size,
-        num_blocks * block_size,
+        req_id,
+        block_table,
+        bt_stride,
+        max_blocks,
+        topk_stride,
         q.stride(0),
         q.stride(1),
-        q.stride(0),
-        q.stride(1),
-        rec,
-        rec,
-        *pm_strides,
         *pm_strides,
         *pa_strides,
         out.stride(0),
         out.stride(1),
         out.stride(2),
         num_heads,
-        nope,
         kv_splits,
         float(softmax_scale),
         BLOCK_H=block_h,
-        BLOCK_D=nope,
         BLOCK_K=block_k,
-        NOPE_DIM=nope,
-        ROPE_DIM=rope,
-        GROUP_SIZE=64,
-        # Q stays in VGPRs only without splits; split-K would spill.
-        Q_IN_VGPR=kv_splits == 1,
-        HAS_INVALID=bool(has_invalid),
-        Q_TDM=True,
-        CTAS_H=1,
         MAIN_BLOCK_SIZE=block_size,
-        EXTRA_BLOCK_SIZE=1,
-        HAS_EXTRA=False,
-        TDM_PARTIALS=False,
-        ROPE_FP8=True,
-        lse_ptr=lse if kv_splits == 1 else None,
+        HAS_INVALID=bool(has_invalid),
         HAS_LSE=return_lse and kv_splits == 1,
-        FUSED_REC=True,
-        TAIL_MASK_ONLY=True,
-        SOLO=solo,
-        num_warps=num_warps,
-        num_stages=2,
+        NBUF=3,
+        LAZY_TH=_K3_LAZY_TH,
+        IDENT_ROWS=blk_rows == block_size,
+        REQ_TOPK=req_topk is not None,
+        num_warps=1,
         waves_per_eu=1,
         num_ctas=1,
     )
     if kv_splits == 1:
         return (out, lse) if return_lse else out
     if skip_reduce:
-        return part_acc, part_m, part_l
+        return part_acc[:, :kv_splits], part_m[:, :kv_splits], part_l[:, :kv_splits]
     _pa_decode_sparse_reduce_gfx1250[(num_queries, num_heads)](
         part_m,
         part_l,
@@ -680,14 +674,16 @@ def _forward_k3_640(
         out.stride(2),
         num_heads,
         nope,
-        kv_splits,
+        s_pad,
         BLOCK_H=1,
         BLOCK_D=nope,
         BLOCK_K=block_k,
         HAS_EXTRA=False,
         lse_ptr=lse,
         HAS_LSE=return_lse,
-        num_warps=4 if kv_splits >= 16 else 1,
+        ALL_SPLITS=True,
+        live_splits=kv_splits,
+        num_warps=4 if s_pad >= 16 else 1,
         waves_per_eu=4,
     )
     return (out, lse) if return_lse else out
@@ -954,6 +950,7 @@ def sparse_mla_fwd(
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
     kv_format: str | None = None,
     keys_per_row: int | None = None,
+    req_topk: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -1070,6 +1067,14 @@ def sparse_mla_fwd(
             default, len(kv_indices) / C, over-splits when the list is
             allocated for more keys than the rows hold (a DCP rank: pass about
             top_k / dcp). A plain int; no device tensor is read for it.
+        req_topk: fp8_k3_mla_640 only, (topk [C, W], req_id [C], block_table
+            [num_reqs, max_blocks]), all int32: fuses vLLM's
+            convert_req_index_to_global_index. Entry k < kv_indptr[c + 1] -
+            kv_indptr[c] of row c is the position topk[c, k] in request
+            req_id[c], read from block block_table[req_id[c], pos // block_size]
+            of kv_buffer; a negative position, or one past the table, reads
+            row 0 as the ROCm convert's 0 does, or with has_invalid is masked as
+            its -1 would be. kv_indices is then unused.
 
     Returns:
         (out, lse), out is
@@ -1090,7 +1095,8 @@ def sparse_mla_fwd(
         rejected = [k for k, v in rejected.items() if v is not None]
         if rejected or (kv_lora_rank, qk_rope_head_dim) != (512, 64):
             raise ValueError(f"fp8_k3_mla_640 is 512 / 64 and does not take {rejected}")
-        _check_index_stream(kv_indptr, kv_indices, num_queries, q.device)
+        indices = kv_indices if req_topk is None else kv_indptr
+        _check_index_stream(kv_indptr, indices, num_queries, q.device)
         res = _forward_k3_640(
             q,
             kv_buffer,
@@ -1104,12 +1110,13 @@ def sparse_mla_fwd(
             attn_sink=attn_sink,
             return_lse=return_lse,
             keys_per_row=keys_per_row,
+            req_topk=req_topk,
         )
         return res if isinstance(res, tuple) else (res, None)
     if kv_format is not None:
         raise ValueError(f"unknown kv_format {kv_format!r}")
-    if keys_per_row is not None:
-        raise ValueError("keys_per_row is an fp8_k3_mla_640 option")
+    if keys_per_row is not None or req_topk is not None:
+        raise ValueError("keys_per_row and req_topk are fp8_k3_mla_640 options")
     fmt = _classify_cache(q, kv_buffer, kv_lora_rank, qk_rope_head_dim, kv_scale)
     _LOGGER.info(
         "SPARSE_MLA_FWD: q=%s kv_buffer=%s %s kv_indices=%s fmt=%s",

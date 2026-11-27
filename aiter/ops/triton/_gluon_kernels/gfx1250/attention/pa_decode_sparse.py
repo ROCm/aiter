@@ -522,6 +522,8 @@ def _pa_decode_sparse_reduce(
     num_warps: gl.constexpr,
     lse_ptr=None,
     HAS_LSE: gl.constexpr = False,
+    ALL_SPLITS: gl.constexpr = False,
+    live_splits=0,
 ):
     """Gluon reduce for pa_decode_sparse: combine KV_SPLITS partials, fold in
     attn_sink, write final output.
@@ -626,6 +628,8 @@ def _pa_decode_sparse_reduce(
     # free to hand us: every segment is then inactive and the output is zero.
     act_num_segments = gl.cdiv(num_tiles, gl.maximum(tiles_per_segment, 1))
     seg_active = offs_k[:, None] < act_num_segments
+    if ALL_SPLITS:  # the caller launched exactly live_splits splits, all used
+        seg_active = offs_k[:, None] < live_splits
     neg_inf = gl.full([KV_SPLITS, BLOCK_H], float("-inf"), gl.float32, layout=L_KH)
     zero_kh = gl.full([KV_SPLITS, BLOCK_H], 0.0, gl.float32, layout=L_KH)
     zero_khd = gl.full([KV_SPLITS, BLOCK_H, BLOCK_D], 0.0, gl.float32, layout=BLK3)

@@ -216,7 +216,7 @@ def test_decode(N, H):
     assert_attn_close(run(q, cache, indptr, indices), ref)
 
 
-@pytest.mark.parametrize("kv_splits", [1, 2, 8])
+@pytest.mark.parametrize("kv_splits", [1, 2, 3, 8])
 def test_decode_splits_and_packed_q(kv_splits):
     q, cache, indptr, indices, ref = make_case(4, 24, [2048] * 4, seed=11)
     packed = k3_mla_640_q_pack(q[..., :NOPE], q[..., NOPE:])
@@ -257,6 +257,59 @@ def test_flat_record_grid():
     assert_attn_close(run(q, cache.reshape(-1, REC), indptr, indices), ref)
 
 
+def test_identity_rows():
+    """A per-block-contiguous cache maps slot -> row by identity (no div/mod)."""
+    lens = [2048, 33, 1, 640]
+    q, cache, indptr, indices, ref = make_case(
+        len(lens), 24, lens, block_size=64, pool_stride=1, seed=81
+    )
+    assert_attn_close(run(q, cache, indptr, indices), ref)
+    assert_attn_close(run(q, cache, indptr, indices, kv_splits=4), ref)
+
+
+@pytest.mark.parametrize("kv_splits", [1, 4])
+@pytest.mark.parametrize("has_invalid", [False, True])
+def test_req_topk_matches_convert(kv_splits, has_invalid):
+    """req_topk (request positions + block table) is bit-identical to vLLM's
+    convert_req_index_to_global_index followed by the plain call: 0 for an
+    invalid entry, or -1 with has_invalid."""
+    lens, W, bs = [2048, 33, 1, 640, 0, 1500], 2048, 16
+    q, cache, indptr, _, _ = make_case(len(lens), 24, lens, block_size=bs, seed=101)
+    g = torch.Generator(device=DEV).manual_seed(102)
+    num_blocks, max_blocks = cache.shape[0], 2048 // bs
+    bt = torch.randperm(num_blocks, device=DEV, generator=g)[: 2 * max_blocks]
+    bt = bt.int().view(2, max_blocks)
+    req_id = torch.tensor([0, 1, 1, 0, 1, 0], dtype=torch.int32, device=DEV)
+    topk = torch.full((len(lens), W), -1, dtype=torch.int32, device=DEV)
+    for c, n in enumerate(lens):
+        topk[c, :n] = torch.randperm(2048, device=DEV, generator=g)[:n].int()
+    topk[0, 5], topk[3, 7] = -1, max_blocks * bs + 3  # invalid inside the count
+    pos = topk.clamp_min(0)
+    blk = pos // bs
+    ok = (topk >= 0) & (blk < max_blocks)
+    slot = bt[req_id[:, None].long(), blk.clamp_max(max_blocks - 1).long()] * bs
+    slot = torch.where(ok, slot + pos % bs, -1 if has_invalid else 0)
+    k = torch.arange(W, device=DEV)[None, :] < torch.tensor(lens, device=DEV)[:, None]
+    kw = {"kv_splits": kv_splits, "has_invalid": has_invalid}
+    ref = run(q, cache, indptr, slot[k].int(), **kw)
+    out = run(q, cache, indptr, None, req_topk=(topk, req_id, bt), **kw)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
+def test_lazy_rescale_wide_scores():
+    """Large, growing scores: the row max moves by more than 2^8 across tiles,
+    so the lazily skipped accumulator rescale has to kick in mid-row."""
+    N, H = 6, 24
+    lens = [2048, 1500, 999, 64, 33, 2048]
+    q, cache, indptr, indices, _ = make_case(N, H, lens, seed=91)
+    q = (q.float() * 16.0).bfloat16()
+    ref = ref_attn(
+        ref_unpack(ref_pack(q)), ref_unpack(cache.reshape(-1, REC)), indptr, indices
+    )
+    assert_attn_close(run(q, cache, indptr, indices, kv_splits=1), ref)
+    assert_attn_close(run(q, cache, indptr, indices, kv_splits=8), ref)
+
+
 def test_rejects_unsupported():
     q, cache, indptr, indices, _ = make_case(1, 24, [16])
     sink = torch.zeros(24, device=DEV)
@@ -268,6 +321,8 @@ def test_rejects_unsupported():
         sparse_mla_fwd(q, cache, indptr, indices, SCALE, kv_format="nope")
     with pytest.raises(ValueError, match="keys_per_row"):
         sparse_mla_fwd(q, cache, indptr, indices, SCALE, keys_per_row=16)
+    with pytest.raises(ValueError, match="req_topk"):
+        sparse_mla_fwd(q, cache, indptr, indices, SCALE, req_topk=(indices,) * 3)
 
 
 def run_lse(q, cache, indptr, indices, **kw):
@@ -402,8 +457,8 @@ def test_keys_per_row_hint(monkeypatch):
         run(q, cache, indptr, alloc, **kw)
         for kw in ({}, {"keys_per_row": held}, {"keys_per_row": 0})
     ]
-    assert seen == [(N * 3, 64, 32), (N * 3, 16, 32), (N * 3, 0, 32)]
-    assert real(N * 3, 16, 32) < real(N * 3, 64, 32)
+    assert seen == [(N * 3, 64), (N * 3, 16), (N * 3, 0)]
+    assert real(N * 3, 16) < real(N * 3, 64)
     for out in outs:
         assert_attn_close(out, ref)
 
