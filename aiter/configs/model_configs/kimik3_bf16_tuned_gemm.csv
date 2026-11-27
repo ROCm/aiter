@@ -1068,3 +1068,4 @@ gfx950,256,8192,4096,1536,False,torch.bfloat16,torch.bfloat16,False,True,asm,0,1
 gfx950,256,10240,4096,1536,False,torch.bfloat16,torch.bfloat16,False,True,asm,0,1,108.353518,_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE,0.0,1189.153996,1180.637919
 gfx950,256,16384,4096,1536,False,torch.bfloat16,torch.bfloat16,False,True,asm,0,1,156.377345,_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE,0.0,1318.339493,1260.619226
 gfx950,256,32768,4096,1536,False,torch.bfloat16,torch.bfloat16,False,True,asm,0,1,331.743568,_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE,0.0,1242.878235,1150.532220
+gfx1250,256,128,163840,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,-1,1,,flydsl_hgemm_abf16_wbf16_bf16_t128x256x128x2_ks1_w4x4x1_bias0_ktail0_gm0_ptdm_gfx1250,,,

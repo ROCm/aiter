@@ -201,6 +201,15 @@ def get_GEMM_A16W16_tuned_config(
                     config = None
             if config is None:
                 continue
+            # TDM launches only on exact gfx1250; borrowed rows must not
+            # replace a strict device's existing fallback.
+            if (
+                borrowed_rows
+                and config["libtype"] == "flydsl"
+                and flydsl_config["policy"] in _get_flydsl_gemm_kernels().TDM_POLICIES
+            ):
+                config = None
+                continue
             # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250
             # OPUS row cannot launch on gfx1250-strict; fall through to the default.
             if borrowed_rows and config["libtype"] == "opus":
