@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+import threading
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -335,6 +336,67 @@ def test_splitk_deterministic(m, n, k, splitK, backend, kernel_name, repeats=20)
     assert err < 0.05
 
 
+def test_splitk_concurrent_graphs(m, n, k, splitK, kernel_name, calls=8, replays=50):
+    """Graphs captured on one stream and replayed concurrently match eager.
+
+    PyTorch captures every graph on its default capture stream. The fused
+    split-K kernel counts arrivals per output tile, so two graphs that share
+    counters corrupt each other when their replays overlap.
+    """
+    scale_n = (n + block_shape[0] - 1) // block_shape[0]
+    scale_k = (k + block_shape[1] - 1) // block_shape[1]
+
+    def make_run(seed):
+        torch.manual_seed(seed)
+        x = (torch.randn((m, k), device="cuda") / 4).to(dtypes.fp8)
+        weight = (torch.randn((n, k), device="cuda") / 4).to(dtypes.fp8)
+        x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+        w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+
+        def run():
+            out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+            return gemm_a8w8_blockscale_ck(
+                x, weight, x_scale, w_scale, out, splitK, kernel_name
+            )
+
+        return run
+
+    runs = [make_run(seed) for seed in (0, 1)]
+    refs = [run().clone() for run in runs]
+    graphs = []
+    for run in runs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs = [run() for _ in range(calls)]
+        graphs.append((graph, outs))
+    torch.cuda.synchronize()
+
+    mismatches = [0, 0]
+
+    def replay(i):
+        stream = torch.cuda.Stream()
+        graph, outs = graphs[i]
+        with torch.cuda.stream(stream):
+            for _ in range(replays):
+                graph.replay()
+                stream.synchronize()
+                mismatches[i] += sum(not torch.equal(o, refs[i]) for o in outs)
+
+    threads = [threading.Thread(target=replay, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(
+        f"test_splitk_concurrent_graphs(m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"mismatching outputs={sum(mismatches)}/{2 * calls * replays}"
+    )
+    assert sum(mismatches) == 0, (
+        f"{kernel_name} splitK={splitK} (m={m}, n={n}, k={k}): "
+        f"{sum(mismatches)} outputs of concurrently replayed graphs differ from eager"
+    )
+
+
 def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     """Verify that splitK > 0 produces the same output as splitK=0 (within fp tolerance).
 
@@ -664,6 +726,7 @@ if get_gfx() == "gfx950":
         (64, 2048, 3072, 3, "cktile", _tile8w),
     ]:
         test_splitk_deterministic(m, n, k, splitK, backend, kernel_name)
+    test_splitk_concurrent_graphs(16, 34816, 5120, 2, _ck16x64)
 
 # Save results from benchmarks
 if args.output:

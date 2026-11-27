@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "gemm_dispatch_utils.h"
 
@@ -65,42 +66,63 @@ struct SplitKCounters
     torch::Tensor holder; // Defined only for per-call counters.
 };
 
-// Zeroed counters for `tiles` tiles. They come from a per-device arena that is
-// allocated and zeroed once, outside of stream capture, with one slot per
-// stream: concurrent launches must not share counters, and a CUDA graph keeps
-// the slot of the stream it was captured on. Without a slot (first call under
-// capture, more than kSlots streams, or more than kSlotTiles tiles), per-call
-// counters are zeroed in the stream instead.
+// Zeroed counters for `tiles` tiles. Launches that can overlap must not share
+// counters, and the counters reset themselves, so a region serves all later
+// calls of its owner. The owner is the stream, or under stream capture the
+// capture: PyTorch captures every graph on one stream, and the graphs can be
+// replayed concurrently on different streams.
+//
+// Regions come from per-device chunks that are zeroed once and never freed
+// (graphs keep pointers into them). HIP cannot allocate during capture, so a
+// chunk is added outside of capture whenever less than half a chunk is free.
+// Without a region (no free space under capture, the chunk budget used up, or
+// more than kMaxTiles tiles), per-call counters are zeroed in the stream.
 inline SplitKCounters splitk_counters(const torch::Tensor& Y, int64_t tiles, hipStream_t stream)
 {
-    constexpr int kSlots         = 16;
-    constexpr int64_t kSlotTiles = 4096;
-    constexpr int64_t kSlotSize  = kSlotTiles * kSplitKCounterStride;
-    struct Arena
+    constexpr int64_t kMaxTiles   = 4096;
+    constexpr int64_t kChunkTiles = 65536; // 8 MB
+    constexpr size_t kMaxChunks   = 32;
+    struct Region
     {
-        uint32_t* base = nullptr;
-        std::map<hipStream_t, int> slots;
+        uint32_t* ptr = nullptr;
+        int64_t tiles = 0;
+    };
+    struct Chunk
+    {
+        uint32_t* ptr;
+        int64_t used;
+    };
+    struct Device
+    {
+        std::vector<Chunk> chunks;
+        // Keyed by stream handle and by capture id.
+        std::map<uint64_t, Region> streams;
+        std::map<uint64_t, Region> captures;
     };
     static std::mutex mu;
-    static std::map<int, Arena> arenas;
+    static std::map<int, Device> devices;
 
-    if(tiles <= kSlotTiles)
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    unsigned long long capture_id  = 0;
+    if(hipStreamGetCaptureInfo(stream, &capture, &capture_id) != hipSuccess)
     {
-        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-        const bool capturing           = hipStreamIsCapturing(stream, &capture) != hipSuccess ||
-                                         capture != hipStreamCaptureStatusNone;
+        (void)hipGetLastError();
+    }
+    else if(tiles <= kMaxTiles)
+    {
+        const bool capturing = capture != hipStreamCaptureStatusNone;
         std::lock_guard<std::mutex> lock(mu);
-        Arena& arena = arenas[Y.get_device()];
-        if(arena.base == nullptr && !capturing)
+        Device& dev = devices[Y.get_device()];
+        if(!capturing && dev.chunks.size() < kMaxChunks &&
+           (dev.chunks.empty() || dev.chunks.back().used > kChunkTiles / 2))
         {
-            // Never freed: CUDA graphs keep pointers into it.
-            const size_t bytes = kSlots * kSlotSize * sizeof(uint32_t);
+            const size_t bytes = kChunkTiles * kSplitKCounterStride * sizeof(uint32_t);
             void* p            = nullptr;
             if(hipMalloc(&p, bytes) == hipSuccess &&
                hipMemsetAsync(p, 0, bytes, stream) == hipSuccess &&
                hipStreamSynchronize(stream) == hipSuccess)
             {
-                arena.base = static_cast<uint32_t*>(p);
+                dev.chunks.push_back({static_cast<uint32_t*>(p), 0});
             }
             else
             {
@@ -108,13 +130,25 @@ inline SplitKCounters splitk_counters(const torch::Tensor& Y, int64_t tiles, hip
                 (void)hipFree(p);
             }
         }
-        if(arena.base != nullptr)
+        auto& regions      = capturing ? dev.captures : dev.streams;
+        const uint64_t key = capturing ? capture_id : reinterpret_cast<uintptr_t>(stream);
+        const auto it      = regions.find(key);
+        if(it != regions.end() && it->second.tiles >= tiles)
+            return {it->second.ptr, {}};
+        // A larger region replaces a smaller one, which stays reserved: launched
+        // kernels and captured nodes still point into it.
+        int64_t size = capturing ? 64 : 256;
+        while(size < tiles)
+            size *= 2;
+        for(Chunk& chunk : dev.chunks)
         {
-            auto it = arena.slots.find(stream);
-            if(it == arena.slots.end() && arena.slots.size() < kSlots)
-                it = arena.slots.emplace(stream, static_cast<int>(arena.slots.size())).first;
-            if(it != arena.slots.end())
-                return {arena.base + it->second * kSlotSize, {}};
+            if(chunk.used + size <= kChunkTiles)
+            {
+                uint32_t* ptr = chunk.ptr + chunk.used * kSplitKCounterStride;
+                chunk.used += size;
+                regions[key] = {ptr, size};
+                return {ptr, {}};
+            }
         }
     }
     auto holder = at::zeros({tiles * kSplitKCounterStride}, Y.options().dtype(at::kInt));
