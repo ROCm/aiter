@@ -30,6 +30,10 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 FP8_TYPE = e4m3_dtype
 FP8_MAX = torch.finfo(FP8_TYPE).max
 
+# vLLM's default KV cache block size (CacheConfig.DEFAULT_BLOCK_SIZE).
+# -block_size 0, the argparse default, means this value. Override with -block_size.
+DEFAULT_BLOCK_SIZE = 64
+
 
 def default_benchmark_configs():
     batch_sizes = [1, 4, 8]
@@ -531,9 +535,7 @@ def run_benchmark(custom, args):
         # (N_CTX_K), not any one entry's random draw, so block_tables stays a
         # consistent shape across the whole rotating pool.
         n_ctx_k_max = max(N_CTX_K) if isinstance(N_CTX_K, list) else N_CTX_K
-        # vLLM's default KV cache block size (CacheConfig.DEFAULT_BLOCK_SIZE) is 64.
-        # Override with -block_size.
-        block_size = args.block_size if args.block_size else 64
+        block_size = args.block_size if args.block_size else DEFAULT_BLOCK_SIZE
         max_num_blocks_per_seq = (n_ctx_k_max + block_size - 1) // block_size
         num_blocks = max(BATCH * max_num_blocks_per_seq, 2048)
 

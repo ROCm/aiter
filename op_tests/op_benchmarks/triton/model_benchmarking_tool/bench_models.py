@@ -543,16 +543,16 @@ class UnifiedAttnKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         shape = self._shape
-        # vLLM's default KV cache block size (CacheConfig.DEFAULT_BLOCK_SIZE) is 64.
-        # Override per shape with a "block_size" key in model_shapes.json.
-        block_size = shape.get("block_size")
-        block_size = int(block_size if block_size is not None else 64)
         sliding_window = shape.get("sliding_window", None)
         args = (
             f"-b {self._batch_size} -hq {shape['hq']} -hk {shape['hkv']} "
             f"-d {shape['dqk']} -dv {shape['dv']} -sq {self._seq_len} -sk {self._seq_len} "
-            f"-block_size {block_size} --metric {self._metric}"
+            f"--metric {self._metric}"
         )
+        # A shape without block_size uses bench_unified_attention's own default.
+        block_size = shape.get("block_size")
+        if block_size is not None:
+            args += f" -block_size {int(block_size)}"
         if sliding_window is not None:
             args += f" -sliding_window {sliding_window}"
         return args
