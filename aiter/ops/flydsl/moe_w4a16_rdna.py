@@ -8,6 +8,8 @@ zero points, packed by ``pack_w4a16_weights``. Activations are bfloat16 or
 float16.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -107,7 +109,7 @@ def _check_route(*tensors) -> None:
 
 def _check_shape(K: int, N: int, group: int) -> None:
     _require(
-        group % 16 == 0 and K % group == 0 and N % TILE_N == 0,
+        group > 0 and group % 16 == 0 and K % group == 0 and N % TILE_N == 0,
         "group size a multiple of 16 dividing K, N a multiple of 64",
     )
 
@@ -115,6 +117,22 @@ def _check_shape(K: int, N: int, group: int) -> None:
 def _overlaps(a: torch.Tensor, b: torch.Tensor, b_bytes: int) -> bool:
     a0, b0 = a.data_ptr(), b.data_ptr()
     return a0 < b0 + b_bytes and b0 < a0 + a.numel() * a.element_size()
+
+
+def _on_input_device(fn):
+    """Run ``fn`` with the device of its first tensor argument current: FlyDSL,
+    Triton and the aiter alignment op launch on the current device."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        tensors = (a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor))
+        t = next(tensors, None)
+        if t is None or not t.is_cuda or t.get_device() == torch.cuda.current_device():
+            return fn(*args, **kwargs)
+        with torch.cuda.device(t.device):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def _launch(launch, *args) -> None:
@@ -126,11 +144,10 @@ def _launch(launch, *args) -> None:
         (t.dtype, t.dim(), t.stride(-1) == 1) for t in tensors
     )
     stream = current_stream_arg(tensors[0].device)
-    # Compile and launch in the context of the tensors' device.
-    with torch.cuda.device(tensors[0].device):
-        _run_compiled(launch, *args, stream, specialization_key=key)
+    _run_compiled(launch, *args, stream, specialization_key=key)
 
 
+@_on_input_device
 def moe_align_block_size_rows(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -163,6 +180,7 @@ def moe_align_block_size_rows(
     return sorted_ids, expert_ids, num_valid
 
 
+@_on_input_device
 def flydsl_rdna_moe_gemm_reduce(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -191,6 +209,8 @@ def flydsl_rdna_moe_gemm_reduce(
     _require(out.size(0) == n_tokens, "one output row per token")
     _require(x.size(0) == expert_ids.numel() == weights.numel(), "routed rows")
     _check_packed(w, coef, out.size(1))
+    if n_tokens == 0:
+        return
     launch = _build_gemm_reduce(
         x.shape[1],
         out.shape[1],
@@ -204,6 +224,7 @@ def flydsl_rdna_moe_gemm_reduce(
     _launch(launch, out, x, w, coef, expert_ids, weights, n_tokens, 32)
 
 
+@_on_input_device
 def flydsl_rdna_moe_gemm(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -247,6 +268,8 @@ def flydsl_rdna_moe_gemm(
     else:
         _require(sorted_ids.numel() == expert_ids.numel() * BLOCK_M, "sorted ids")
         _require(num_valid is not None and num_valid.numel() >= 1, "num_valid")
+    if n_rows == 0:
+        return
     build_args = (
         x.shape[1],
         N,
@@ -309,6 +332,7 @@ def _topk_weighted_sum_kernel(
     )
 
 
+@_on_input_device
 def topk_weighted_sum(
     out: torch.Tensor,
     rows: torch.Tensor,
@@ -363,6 +387,7 @@ def flydsl_rdna_moe_path(
     return "row" if row_lds_bytes(N, group_size) <= lds else "grouped"
 
 
+@_on_input_device
 def flydsl_rdna_moe(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -414,6 +439,8 @@ def flydsl_rdna_moe(
     _require(top_k >= 1, "top_k must be at least 1")
     _require(workspace.numel() >= sum(sizes), "workspace too small")
     _require(w1.size(0) == w2.size(0) == num_experts, "expert count")
+    # The alignment op of the grouped path runs one thread per expert.
+    _require(0 < num_experts <= 1024, "num_experts must be in 1..1024")
     _check_packed(w2, coef2, K)
     _require(not silu_mul or gate_up == 2 * N, "fused SiLU needs gate_up = 2 N")
     # What the GEMM wrappers check again, before GEMM1 runs.

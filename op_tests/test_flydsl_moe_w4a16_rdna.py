@@ -222,7 +222,7 @@ def check_rejects_raw_pointer_misuse():
     cases = (
         ("contiguous", out, strided, ws),
         ("one device", out, x.cpu(), ws),
-        ("dtype", out, x.half(), ws),
+        ("output dtype", out, x.half(), ws.half()),
         ("workspace dtype", out.half(), x.half(), ws),
         ("shape", out[:, :TILE_N].contiguous(), x, ws),
         ("w1/w2_pairs required", out, x, ws),
@@ -266,6 +266,7 @@ def check_rejects_raw_pointer_misuse():
             ),
         ),
         ("one output row", lambda: topk_weighted_sum(out[:1], gate_up, weights)),
+        ("scale shape", lambda: pack_w4a16_weights(q2, s2.transpose(1, 2), None)),
     )
     for msg, call in calls:
         try:
@@ -274,6 +275,20 @@ def check_rejects_raw_pointer_misuse():
             assert msg in str(e), e
         else:
             raise AssertionError(f"accepted: {msg}")
+    # Valid calls: tensors by keyword, and no rows (nothing to launch).
+    topk_weighted_sum(out=out, rows=gate_up, topk_weights=weights)
+    flydsl_rdna_moe_gemm(
+        gate_up[:0],
+        x,
+        w1,
+        c1,
+        None,
+        ids.view(-1)[:0],
+        None,
+        top_k,
+        group,
+        coef_pairs=False,
+    )
 
 
 def main():

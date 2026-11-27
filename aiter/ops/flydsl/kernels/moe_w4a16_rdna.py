@@ -102,6 +102,10 @@ def _require(cond, msg: str) -> None:
 
 def _check_coef(coef: torch.Tensor, K: int, group: int, pairs: bool) -> None:
     _require(coef.dtype == torch.float16, "coefficients are packed float16")
+    _require(
+        group > 0 and group % 16 == 0 and K % group == 0,
+        "group size a multiple of 16 dividing K",
+    )
     stride = _tile_stride(_coef_tile_dwords(K, group, pairs))
     _require(coef.size(-1) * coef.element_size() == stride * 4, "coefficient layout")
 
@@ -216,6 +220,8 @@ def pack_w4a16_weights(
 
     """
     E, N, K = q.shape
+    # [E, N, K // group]; checkpoints often store scales as [K // group, N].
+    _require(scale.dim() == 3 and scale.shape[:2] == q.shape[:2], "scale shape")
     G = scale.shape[2]
     # Values outside a nibble would spill into the neighbouring ones.
     _require(int(q.min()) >= 0 and int(q.max()) <= 15, "q must be in 0..15")
