@@ -52,10 +52,10 @@ from .mega_moe_config import (
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
     fused_bucket_override,
-    fused_layout_small_only,
     fused_layout_supported,
     nearest_token_bucket,
     select_fused_config,
+    shared_in_layout_enabled,
     small_m_cu_supported,
 )
 from .mega_moe_fused_gemm import AddrBuffer, load_at, store_at
@@ -2397,23 +2397,6 @@ def shared_in_opt_env() -> int:
             f"AITER_MEGA_SHARED_IN_OPT={value!r}: 0..31 (bits 1, 2, 4, 8, 16)"
         )
     return int(value)
-
-
-def shared_in_layout_enabled(
-    world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int
-) -> bool:
-    """AITER_MEGA_SHARED_IN for a layout: ``1`` = the target (verify) layers only, ``2`` = also the DSpark
-    draft layers' MoE (the small-input-only layouts; not validated on a GPU). Read per call: tests set it.
-    """
-    value = os.environ.get("AITER_MEGA_SHARED_IN", "0")
-    if value not in ("1", "2"):
-        return False
-    return value == "2" or not fused_layout_small_only(
-        world_size=world_size,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=world_size * experts_per_rank,
-    )
 
 
 def _arg_view(tensor):

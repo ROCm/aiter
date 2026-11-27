@@ -115,7 +115,13 @@ def dense_kernel_ksplit(rows, n, k):
         return None
     if row is None:
         return 0
-    split = str(row.get("kernelName", "")).rpartition("_sk")[2].split("_")[0]
+    name = str(row.get("kernelName", ""))
+    if "_sk" not in name and "mxfp8_8w_" in name:
+        # The 8-wave kernel (mxfp8_gemm_8wave, the tuned choice from about 2k rows on) names a split "_ks<N>" and
+        # none when unsplit; it runs one 16x16x128 scaled MFMA per 128-K step from zero, K ascending.
+        split = name.rpartition("_ks")[2].split("_")[0] if "_ks" in name else "1"
+    else:
+        split = name.rpartition("_sk")[2].split("_")[0]
     return int(split) if split.isdigit() else 0
 
 

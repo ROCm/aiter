@@ -508,6 +508,24 @@ class MegaMoEBundlePlan:
         )
 
 
+def shared_in_layout_enabled(
+    world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int
+) -> bool:
+    """AITER_MEGA_SHARED_IN for a layout: ``1`` = the target (verify) layers only, ``2`` = also the DSpark
+    draft layers' MoE (the small-input-only layouts; not validated on a GPU). Read per call: tests set it.
+    Both routes read it: the small-input kernel's pre-phase and the large-input route's dense chain.
+    """
+    value = os.environ.get("AITER_MEGA_SHARED_IN", "0")
+    if value not in ("1", "2"):
+        return False
+    return value == "2" or not fused_layout_small_only(
+        world_size=world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=world_size * experts_per_rank,
+    )
+
+
 def fused_layout_supported(
     *,
     arch: str,

@@ -1155,7 +1155,8 @@ class MegaMoEV2:
         if shared_in is not None:
             # ``shared_in`` (a weights.SharedExpertInput, instead of ``shared_add``): the output is ``routed +
             # shared expert``. The small-input route computes the shared expert inside its kernel where that kernel
-            # can (SmallMRuntime.shared_in_ready); every other call runs ``shared_in.dense()`` here, on the
+            # can (SmallMRuntime.shared_in_ready), the large-input route adds the routed sum to the shared rows in its
+            # combine (LargeMRuntime.shared_in_ready); every other call runs ``shared_in.dense()`` here, on the
             # caller's stream, and takes the ``shared_add`` path below.
             if shared_add is not None:
                 raise ValueError("pass either shared_add or shared_in")
@@ -1172,6 +1173,12 @@ class MegaMoEV2:
                     )
                     with torch.cuda.stream(torch_stream(stream)):
                         return runtime.forward(x_bf16, wts, topk_ids, slice_output=True, shared_in=shared_in)
+            elif route[0] == ROUTE_LARGE_M and slice_output:
+                # The large-input route runs the shared expert's dense chain on its own MXFP8 rows of x, the down
+                # GEMM into this call's output, and its combine adds the routed sum (LargeMRuntime.shared_in_ready).
+                if self._large_m.shared_in_ready(int(x_bf16.shape[0]), shared_in):
+                    with torch.cuda.stream(torch_stream(stream)):
+                        return self._large_m.forward(x_bf16, wts, topk_ids, slice_output=True, shared_in=shared_in)
             with torch.cuda.stream(torch_stream(stream)):
                 shared_add = shared_in.dense()
         if shared_add is not None:
