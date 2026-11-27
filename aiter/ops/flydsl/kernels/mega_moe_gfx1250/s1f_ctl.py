@@ -255,6 +255,7 @@ class _Stage1Fusion:
         self.precompiled: set = set()
         self._packed_sc = None
         self._plan_lds: dict = {}
+        self._tile_reasons: dict = {}
 
     def arm(self) -> None:
         """Allocate the stage-1 buffers, or record why this instance cannot.
@@ -264,6 +265,8 @@ class _Stage1Fusion:
         """
         self.enabled = False
         self._packed_sc = None
+        # what a tile's verdict and its plan LDS depend on is set here
+        self._plan_lds, self._tile_reasons = {}, {}
         if not read_s1f_mode():
             return
         config = self.d.config
@@ -334,7 +337,19 @@ class _Stage1Fusion:
         }
 
     def tile_reasons(self, align_m: int) -> list:
-        """Why a step aligned to ``align_m`` cannot run the stage-1 kernel."""
+        """Why a step aligned to ``align_m`` cannot run the stage-1 kernel.
+
+        A MoE layer asks several times a step; the answer is fixed once armed,
+        so it is worked out once an alignment.
+        """
+        reasons = self._tile_reasons.get(int(align_m))
+        if reasons is None:
+            reasons = self._find_tile_reasons(int(align_m))
+            self._tile_reasons[int(align_m)] = reasons
+        return list(reasons)
+
+    def _find_tile_reasons(self, align_m: int) -> list:
+        from .compact_plan import PLAN_LDS_BYTES
         from .s1f_stage1 import s1f_flag_m
 
         reasons = []
@@ -352,8 +367,6 @@ class _Stage1Fusion:
         if int(self.d.config.experts_per_rank) > 255:
             reasons.append(f"{self.d.config.experts_per_rank} experts per rank > 255")
         if not reasons:
-            from .compact_plan import PLAN_LDS_BYTES
-
             lds = self.plan_lds_bytes(align_m)
             if lds > PLAN_LDS_BYTES:
                 reasons.append(
@@ -362,11 +375,12 @@ class _Stage1Fusion:
                 )
         return reasons
 
-    def plan_cap(self, align_m: int) -> int:
+    def plan_cap(self) -> int:
         """Rows a stage-1 plan bounds its tables by.
 
         A step runs the stage-1 kernel only while its receive bound is within
-        ``max_recv()``, so its rows fit that bound at the step's alignment. The
+        ``max_recv()``, so its rows fit that bound with each local expert
+        padded to the arena's tile (``_step_for`` aligns no step past it). The
         arena's row count (every rank's ``max_tokens_per_rank`` at full top-k)
         would size the plan's per-m-tile LDS table instead: about 2.1M rows on
         Kimi-K3 EP8 at 16384 tokens a rank, 132K m-tiles of 16 rows, 572 KiB of
@@ -379,7 +393,7 @@ class _Stage1Fusion:
             max_recv=min(int(config.max_recv), int(self.max_recv())),
             topk=config.topk,
             experts_per_rank=config.experts_per_rank,
-            tile_m=max(int(geo.tile_m), int(align_m)),
+            tile_m=int(geo.tile_m),
         )
         return min(int(geo.cap), rows)
 
@@ -398,7 +412,7 @@ class _Stage1Fusion:
                     max_routes=geo.max_routes,
                     plan_blocks=blocks,
                     s1f=True,
-                    compact_cap=self.plan_cap(align_m),
+                    compact_cap=self.plan_cap(),
                     tile_m=s1f_flag_m(align_m),
                 )
                 for blocks in range(1, PLAN_MAX_BLOCKS + 1)

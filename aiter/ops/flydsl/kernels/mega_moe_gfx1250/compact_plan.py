@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import os
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -21,6 +22,7 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import ballot, readfirstlane, readlane, s_nop
 from flydsl.expr.typing import Int32, Int64, T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -274,9 +276,54 @@ def compact_tile_capacity(*, compact_cap: int, tile_m: int) -> int:
     return (int(compact_cap) + int(tile_m) - 1) // int(tile_m)
 
 
-#: LDS one gfx1250 workgroup can allocate (320 KiB). A launch asking for more
-#: fails with hipErrorInvalidValue before the kernel runs.
-PLAN_LDS_BYTES = 320 * 1024
+#: LDS one gfx1250 workgroup can allocate. A launch asking for more fails with
+#: hipErrorInvalidValue before the kernel runs.
+PLAN_LDS_BYTES = get_lds_capacity_bytes("gfx1250")
+
+
+class _PlanGeometry(NamedTuple):
+    segs: int
+    hist_dwords: int
+    row_dwords: int
+    use_sparse: bool
+    route_vec: int
+    chunk_cap: int
+    merge_routes: bool
+    n_chunks: int
+
+
+def _plan_geometry(
+    *, npes: int, experts_per_rank: int, max_routes: int, plan_blocks: int
+) -> _PlanGeometry:
+    """The sizes the plan's LDS tables follow: one source for the kernel and
+    for ``compact_plan_lds_bytes``."""
+    segs = int(npes) * int(experts_per_rank)
+    row_dwords, _, use_sparse = compact_hist_layout(
+        npes=npes, experts_per_rank=experts_per_rank, max_routes=max_routes
+    )
+    if max_routes % 4 == 0:
+        route_vec = 4
+    elif max_routes % 2 == 0:
+        route_vec = 2
+    else:
+        route_vec = 1
+    # Upper bound on one block's chunk; chunks stay route_vec aligned so the
+    # vector loads of every block start on an aligned route.
+    per_block = -(-max_routes // plan_blocks)
+    chunk_cap = -(-per_block // route_vec) * route_vec
+    return _PlanGeometry(
+        segs=segs,
+        # LDS hist/matrix are indexed by segment on every path, so they keep
+        # the dense pitch; row_dwords is only the window row, which on the
+        # sparse path is the shorter packed (nnz, seg|cnt) row.
+        hist_dwords=_align32(segs),
+        row_dwords=row_dwords,
+        use_sparse=use_sparse,
+        route_vec=route_vec,
+        chunk_cap=chunk_cap,
+        merge_routes=chunk_cap <= _LDS_ROUTE_CAP,
+        n_chunks=(segs + WAVE - 1) // WAVE,
+    )
 
 
 def compact_plan_lds_bytes(
@@ -296,38 +343,35 @@ def compact_plan_lds_bytes(
     m-tile of ``compact_cap`` rows, so the plan's LDS follows the row bound it
     is compiled with, not the step it runs.
     """
-    epr = int(experts_per_rank)
-    segs = int(npes) * epr
-    hist_dwords = _align32(segs)
-    max_routes = max(1, int(max_routes))
-    row_dwords, _, use_sparse = compact_hist_layout(
-        npes=npes, experts_per_rank=epr, max_routes=max_routes
+    g = _plan_geometry(
+        npes=npes,
+        experts_per_rank=experts_per_rank,
+        max_routes=max(1, int(max_routes)),
+        plan_blocks=int(plan_blocks),
     )
-    route_vec = 4 if max_routes % 4 == 0 else (2 if max_routes % 2 == 0 else 1)
-    per_block = -(-max_routes // int(plan_blocks))
-    chunk_cap = -(-per_block // route_vec) * route_vec
-    merge_routes = chunk_cap <= _LDS_ROUTE_CAP
     emit_runs = bool(emit_runs) or bool(s1f)
     sizes = [
-        (hist_dwords * 4, 128),
-        (segs * 4, 16),
-        (segs * 4, 16),
-        (int(npes) * hist_dwords * 4, 128),
+        (g.hist_dwords * 4, 128),
+        (g.segs * 4, 16),
+        (g.segs * 4, 16),
+        (int(npes) * g.hist_dwords * 4, 128),
     ]
-    if merge_routes:
-        sizes.append((chunk_cap * 4, 16))
-    if use_sparse:
-        sizes += [(row_dwords * 4, 128), (int(npes) * row_dwords * 4, 128)]
+    if g.merge_routes:
+        sizes.append((g.chunk_cap * 4, 16))
+    if g.use_sparse:
+        sizes += [(g.row_dwords * 4, 128), (int(npes) * g.row_dwords * 4, 128)]
     if emit_runs:
-        n_chunks = (segs + WAVE - 1) // WAVE
-        sizes += [(segs * 4, 16)] * 4 + [(n_chunks * 4, 16), (4 * 4, 16)]
+        sizes += [(g.segs * 4, 16)] * 4 + [(g.n_chunks * 4, 16), (4 * 4, 16)]
         if s1f:
             tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
-            sizes += [(tile_cap * 4, 16), (epr * (int(npes) + 1) * 4, 16)]
-        if merge_routes:
-            sizes.append((chunk_cap * 4, 16))
+            sizes += [
+                (tile_cap * 4, 16),
+                (int(experts_per_rank) * (int(npes) + 1) * 4, 16),
+            ]
+        if g.merge_routes:
+            sizes.append((g.chunk_cap * 4, 16))
             if int(plan_blocks) > 1:
-                sizes += [(segs * 4, 16)] * 2
+                sizes += [(g.segs * 4, 16)] * 2
     off = 0
     for size, align in sizes:
         off = (off + align - 1) // align * align + size
@@ -489,17 +533,15 @@ def compile_tdm_compact_plan(
             f"cap={compact_cap} peers={npes}"
         )
     hist_stride = int(hist_stride)
-    row_dwords, _sparse_cap, use_sparse = compact_hist_layout(
-        npes=npes, experts_per_rank=epr, max_routes=max_routes
+    geom = _plan_geometry(
+        npes=npes, experts_per_rank=epr, max_routes=max_routes, plan_blocks=plan_blocks
     )
+    row_dwords, use_sparse = geom.row_dwords, geom.use_sparse
     if hist_stride != npes * row_dwords:
         raise ValueError(
             f"hist_stride={hist_stride} != npes*row_dwords={npes * row_dwords}"
         )
-    # LDS hist/matrix are indexed by segment on every path, so they keep the
-    # dense pitch; row_dwords is only the window row, which on the sparse path
-    # is the shorter packed (nnz, seg|cnt) row.
-    hist_dwords = _align32(segs)
+    hist_dwords = geom.hist_dwords
     # Dense rows ship (gen16 << 16) | count, so a count must fit 16 bits; one
     # source's count toward an expert is at most its token count. A padded
     # dense row (segs % 32 != 0, e.g. EP4 x 65 experts = 260) is tagged too:
@@ -511,17 +553,11 @@ def compile_tdm_compact_plan(
         and row_dwords % 32 == 0
         and max_routes // max(1, int(topk)) < (1 << 16)
     )
-    if max_routes % 4 == 0:
-        route_vec = 4
-    elif max_routes % 2 == 0:
-        route_vec = 2
-    else:
-        route_vec = 1
-    # Upper bound on one block's chunk; chunks stay route_vec aligned so the
-    # vector loads of every block start on an aligned route.
-    per_block = -(-max_routes // plan_blocks)
-    chunk_cap = -(-per_block // route_vec) * route_vec
-    merge_routes = chunk_cap <= _LDS_ROUTE_CAP
+    route_vec, chunk_cap, merge_routes = (
+        geom.route_vec,
+        geom.chunk_cap,
+        geom.merge_routes,
+    )
     dropped = -1
     write_tok_map = bool(write_tok_map)
     if not write_tok_map and not emit_runs:
@@ -544,7 +580,7 @@ def compile_tdm_compact_plan(
     # inner) or segments for the send offsets / copies: each wave owns
     # pos_per_wave consecutive ones and sums the prefix before them itself
     # (independent LDS loads + one reduction), so no block-wide scan.
-    n_chunks = (segs + WAVE - 1) // WAVE
+    n_chunks = geom.n_chunks
     pos_per_wave = -(-segs // plan_waves)
     tm_pow2 = tile_m & (tile_m - 1) == 0
     rr_pow2 = run_rows & (run_rows - 1) == 0
@@ -565,10 +601,14 @@ def compile_tdm_compact_plan(
         tile_m=tile_m,
     )
     if lds_bytes > PLAN_LDS_BYTES:
+        tiles = (
+            f"{tile_cap} m-tiles of {tile_m} rows for compact_cap={compact_cap}, "
+            if s1f
+            else ""
+        )
         raise ValueError(
             f"compact plan needs {lds_bytes} B of LDS, more than the "
-            f"{PLAN_LDS_BYTES} B a workgroup has: {segs} segments, "
-            f"{tile_cap} m-tiles of {tile_m} rows for compact_cap={compact_cap}, "
+            f"{PLAN_LDS_BYTES} B a workgroup has: {segs} segments, {tiles}"
             f"{plan_blocks} block(s), s1f={s1f}"
         )
 
@@ -822,6 +862,13 @@ def compile_tdm_compact_plan(
                     buffer_store(total, rsrc_runs, RUN_HDR_ROWS)
                     _st(lds_misc, 0, total)
 
+        # Every LDS table is allocated by now, and the size checked against
+        # the workgroup's LDS above must be the allocator's.
+        if smem.allocated_bytes != lds_bytes:
+            raise RuntimeError(
+                f"compact plan allocated {smem.allocated_bytes} B of LDS, but "
+                f"compact_plan_lds_bytes sized it at {lds_bytes} B"
+            )
         # Issued now so the round trip hides behind the tally; the previous
         # plan on this slot finished before this launch, so it is current.
         # Every block reads it before it arrives below, and block 0 advances it
